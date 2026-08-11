@@ -87,7 +87,7 @@ def _load_migration():
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260810100000_provider_directory_terminal_root_retirement_resource_count_repair"
+        "20260810160000_ptg2_legacy_global_projection_queue"
     ]
     migration = _load_capacity_v2_migration()
     assert migration.down_revision == (

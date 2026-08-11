@@ -42,7 +42,9 @@ from process.ptg_parts.ptg2_shared_reuse import (
 from process.ptg_parts.ptg2_shared_source_set import (
     ordered_source_ordinal_digest,
 )
-from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    acquire_ptg2_source_lifecycle_lock,
+)
 from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_evidence,
     validate_provider_identifier_quarantine,
@@ -1332,7 +1334,10 @@ async def _record_candidate_attestation_in_transaction(
 ) -> tuple[dict[str, Any], bytes, datetime.datetime]:
     """Revalidate and persist evidence under the shared lifecycle lock."""
 
-    await acquire_ptg2_lifecycle_lock(session)
+    await acquire_ptg2_source_lifecycle_lock(
+        session,
+        source_key=attestation_target.source_key,
+    )
     attested_at = await _database_timestamp(session)
     evidence = _validated_attestation_evidence(
         report,
@@ -1821,7 +1826,10 @@ async def load_held_candidate_audit_attestation(
     )
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     async with db.transaction() as session:
-        await acquire_ptg2_lifecycle_lock(session)
+        await acquire_ptg2_source_lifecycle_lock(
+            session,
+            source_key=target_by_field["source_key"],
+        )
         identity = await _locked_candidate_identity(
             session,
             schema_name=schema_name,
@@ -1853,6 +1861,14 @@ async def load_held_candidate_audit_attestation(
         )
     if attestation is None:
         return None
+    return _held_attestation_response(attestation)
+
+
+def _held_attestation_response(
+    attestation: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Encode binary digests and UTC timestamps for the audit response."""
+
     return {
         **attestation,
         "report_digest": bytes(attestation["report_digest"]).hex(),

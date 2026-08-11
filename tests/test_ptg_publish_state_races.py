@@ -79,7 +79,9 @@ def _patch_already_published_rerun(monkeypatch):
     )
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(
+        process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock()
+    )
     monkeypatch.setattr(
         process_ptg,
         "_current_source_snapshot_id",
@@ -168,7 +170,9 @@ def test_building_snapshot_collision_fails_closed(monkeypatch):
         }
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(
+        process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock()
+    )
     monkeypatch.setattr(
         process_ptg,
         "_current_source_snapshot_id",
@@ -216,7 +220,9 @@ def test_exact_retry_reenters_main_after_terminal_commit_rollback(
         }
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(
+        process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock()
+    )
     monkeypatch.setattr(
         process_ptg,
         "_current_source_snapshot_id",
@@ -252,7 +258,9 @@ def test_exact_retry_reenters_main_after_terminal_commit_rollback(
 def test_source_pointer_read_failure_leaves_no_building_claim(monkeypatch):
     push = AsyncMock()
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(
+        process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock()
+    )
     monkeypatch.setattr(
         process_ptg,
         "_current_source_snapshot_id",
@@ -302,13 +310,15 @@ def test_source_pointer_compare_and_swap_rejects_stale_candidate(monkeypatch):
     )
 
     assert transaction.entered == 1
-    assert len(executed_statements) == 4
-    assert "pg_advisory_xact_lock" in executed_statements[0][0]
-    assert executed_statements[0][1] == {
-        "publish_lock_key": source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
+    assert len(executed_statements) == 6
+    assert "set_config('lock_timeout'" in executed_statements[0][0]
+    assert "pg_advisory_xact_lock_shared" in executed_statements[1][0]
+    assert executed_statements[1][1] == {
+        "gc_lock_key": source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
     }
-    assert "guard_ptg2_v4_attempt" in executed_statements[1][0]
-    assert "FOR UPDATE OF snapshot" in executed_statements[2][0]
-    assert executed_statements[2][1] == {"snapshot_id": "snap_stale"}
-    assert "IS NOT DISTINCT FROM :previous_snapshot_id" in executed_statements[3][0]
-    assert "DELETE FROM" not in executed_statements[3][0]
+    assert "pg_advisory_xact_lock(" in executed_statements[2][0]
+    assert "guard_ptg2_v4_attempt" in executed_statements[3][0]
+    assert "FOR UPDATE OF snapshot" in executed_statements[4][0]
+    assert executed_statements[4][1] == {"snapshot_id": "snap_stale"}
+    assert "IS NOT DISTINCT FROM :previous_snapshot_id" in executed_statements[5][0]
+    assert "DELETE FROM" not in executed_statements[5][0]

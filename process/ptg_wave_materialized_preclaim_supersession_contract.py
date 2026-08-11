@@ -16,12 +16,15 @@ from process.ptg_wave_state import (
     canonical_json,
     sha256_digest,
 )
+from process.ptg_wave_quarantine_basis import (
+    MATERIALIZED_PRECLAIM_FAILURE_BASIS,
+)
 
 
 SCHEMA_VERSION = (
     "healthporta.ptg-wave.materialized-preclaim-supersession.v1"
 )
-RECOVERY_BASIS = "materialized_preclaim_failure"
+RECOVERY_BASIS = MATERIALIZED_PRECLAIM_FAILURE_BASIS
 
 
 class PTGWaveMaterializedPreclaimConflict(PTGWaveStateConflict):

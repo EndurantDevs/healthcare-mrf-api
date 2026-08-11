@@ -102,27 +102,23 @@ def test_artifact_blob_row_mapping_supports_driver_and_plain_rows():
 @pytest.mark.asyncio
 async def test_delete_artifacts_ignores_blank_snapshot_and_deletes_in_order(monkeypatch):
     fake_db = RecordingDB()
-    ensure_table = AsyncMock()
     monkeypatch.setattr(artifact_blobs, "db", fake_db)
-    monkeypatch.setattr(
-        artifact_blobs,
-        "ensure_ptg2_artifact_blob_table",
-        ensure_table,
-    )
 
     await artifact_blobs.delete_ptg2_artifacts_for_snapshot("   ")
     assert fake_db.session.calls == []
-    assert ensure_table.await_count == 0
 
     await artifact_blobs.delete_ptg2_artifacts_for_snapshot(
         "ptg2:test",
         schema_name="custom",
     )
-    assert ensure_table.await_args.args == ("custom",)
     assert len(fake_db.session.calls) == 3
     assert "guard_ptg2_v4_attempt" in fake_db.session.calls[0][0]
     assert "ptg2_artifact_blob_chunk" in fake_db.session.calls[1][0]
     assert "ptg2_artifact_manifest" in fake_db.session.calls[2][0]
+    assert not any(
+        sql.lstrip().upper().startswith(("CREATE ", "ALTER ", "DROP "))
+        for sql, _params in fake_db.session.calls
+    )
 
 
 def test_artifact_cache_paths_and_validation(monkeypatch, tmp_path):

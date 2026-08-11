@@ -143,43 +143,28 @@ async def _run_interleaving(monkeypatch) -> list[str]:
     connection = _InterleavingConnection(state)
     monkeypatch.setattr(snapshot_cleanup, "db", _FakeDB(connection))
 
-    async def release_unbound(*, schema_name, executor, require_shared):
-        assert schema_name == "mrf"
-        assert executor is connection
-        assert require_shared is True
-        state.events.append("a_cleanup_released_unbound_layouts")
-
-    monkeypatch.setattr(
-        snapshot_cleanup,
-        "release_unbound_ptg2_shared_layouts",
-        release_unbound,
-    )
     publish_task = asyncio.create_task(_publish_b(state))
     await state.b_has_publish_lock.wait()
-    cleanup_task = asyncio.create_task(
+    await asyncio.wait_for(
         snapshot_cleanup._cleanup_old_ptg2_source_tables(
             "source_a",
             {"snap_a"},
             lock_pointer_state=True,
-        )
+        ),
+        timeout=0.1,
     )
-    await state.a_is_waiting.wait()
+    assert not state.a_is_waiting.is_set()
     state.allow_b_commit.set()
-    await asyncio.gather(publish_task, cleanup_task)
+    await publish_task
     return state.events
 
 
-def test_stale_post_publish_cleanup_replans_after_newer_promotion(monkeypatch):
+def test_source_finish_cleanup_never_waits_for_publisher_or_runs_global_gc(monkeypatch):
     monkeypatch.delenv(snapshot_cleanup.PTG2_SOURCE_SNAPSHOT_RETAIN_LINEAGE_ENV, raising=False)
 
     events = asyncio.run(_run_interleaving(monkeypatch))
 
     assert events == [
         "b_acquired_publish_lock",
-        "a_cleanup_waiting_for_publish_lock",
         "b_committed_current_pointer",
-        "a_cleanup_acquired_publish_lock",
-        "a_cleanup_replanned_current_pointer",
-        "a_cleanup_loaded_lineage",
-        "a_cleanup_released_unbound_layouts",
     ]

@@ -208,6 +208,29 @@ def _validate_linkage_ack(
     ack: object,
     key: str | bytes | None,
 ) -> tuple[dict[str, Any], str]:
+    ack, unsigned_ack_map = _validate_linkage_ack_binding(
+        wave,
+        outcomes,
+        ack,
+    )
+    expected_signature = sign_linkage_ack(
+        unsigned_ack_map,
+        key=_linkage_key(key),
+    )
+    if not hmac.compare_digest(ack["signature"], expected_signature):
+        raise PTGWaveOutcomeConflict(
+            "linkage acknowledgement signature is invalid"
+        )
+    return ack, sha256_digest(canonical_json(ack))
+
+
+def _validate_linkage_ack_binding(
+    wave: Any,
+    outcomes: list[Any],
+    ack: object,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate immutable ACK bytes without choosing an HMAC epoch."""
+
     if not isinstance(ack, dict):
         raise PTGWaveOutcomeConflict(
             "linkage acknowledgement must be an object"
@@ -231,14 +254,6 @@ def _validate_linkage_ack(
         for name, field_value in ack.items()
         if name != "signature"
     }
-    expected_signature = sign_linkage_ack(
-        unsigned_ack_map,
-        key=_linkage_key(key),
-    )
-    if not hmac.compare_digest(signature, expected_signature):
-        raise PTGWaveOutcomeConflict(
-            "linkage acknowledgement signature is invalid"
-        )
     if (
         ack["wave_id"] != wave.wave_id
         or ack["wave_digest"] != wave.wave_digest
@@ -253,4 +268,41 @@ def _validate_linkage_ack(
         raise PTGWaveOutcomeConflict(
             "linkage acknowledgement does not cover every exact outcome"
         )
-    return ack, sha256_digest(canonical_json(ack))
+    return {**unsigned_ack_map, "signature": signature}, unsigned_ack_map
+
+
+def _validate_persisted_linkage_ack_replay(
+    wave: Any,
+    outcomes: list[Any],
+    ack: object,
+) -> tuple[dict[str, Any], str]:
+    """Compare an exact stored ACK without reusing its historical HMAC key."""
+
+    validated, _unsigned = _validate_linkage_ack_binding(wave, outcomes, ack)
+    digest = sha256_digest(canonical_json(validated))
+    if (
+        not isinstance(getattr(wave, "linkage_ack", None), dict)
+        or canonical_json(validated) != canonical_json(wave.linkage_ack)
+        or digest != getattr(wave, "linkage_ack_digest", None)
+    ):
+        raise PTGWaveOutcomeConflict(
+            "linkage acknowledgement conflicts with the first receipt"
+        )
+    return validated, digest
+
+
+def _validate_v6_linkage_ack_binding(
+    wave: Any,
+    outcomes: list[Any],
+    ack: object,
+) -> tuple[dict[str, Any], str]:
+    """Bind a V6 ACK without requiring its historical control HMAC key.
+
+    The current bearer token authorizes the HTTP request.  The engine then
+    independently re-derives the complete outcome graph and mapping before it
+    RSA-signs the exact ACK digest.  Revalidating the ACK with the current
+    control token would wedge an ACK durably created before token rotation.
+    """
+
+    validated, _unsigned = _validate_linkage_ack_binding(wave, outcomes, ack)
+    return validated, sha256_digest(canonical_json(validated))

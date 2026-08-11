@@ -24,7 +24,7 @@ def wave_response(
 ) -> dict[str, Any]:
     """Project one durable wave without changing its persisted state."""
 
-    return {
+    response_by_field = {
         "wave_id": wave.wave_id, "request_digest": wave.request_digest,
         "cohort_attestation_digest": wave.cohort_attestation_digest,
         "physical_coordinate_count": wave.physical_coordinate_count,
@@ -56,6 +56,21 @@ def wave_response(
         "cleanup_evidence_digest": wave.cleanup_evidence_digest,
         "resolved_at": wave.resolved_at,
     }
+    if wave.receipt_key_id is not None:
+        response_by_field.update(
+            {
+                "receipt_key_id": wave.receipt_key_id,
+                "receipt_public_modulus_hex": (
+                    wave.receipt_public_modulus_hex
+                ),
+                "receipt_public_exponent": wave.receipt_public_exponent,
+                "linkage_receipt": wave.linkage_receipt,
+                "linkage_receipt_payload_digest": (
+                    wave.linkage_receipt_payload_digest
+                ),
+            }
+        )
+    return response_by_field
 
 
 async def get_import_wave(wave_id: str) -> dict[str, Any] | None:

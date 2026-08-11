@@ -8,13 +8,15 @@ from typing import Any
 
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
-from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_table
 from process.ptg_parts.ptg2_candidate_attestation import (
     CandidateAttestationApprovalConflict,
     parse_candidate_attestation_digest,
 )
 from process.ptg_parts.ptg2_shared_gc import release_unbound_ptg2_shared_layouts
 from process.ptg_parts.snapshot_cleanup import is_shared_snapshot_control_manifest
+from process.ptg_parts.source_snapshot_control_lifecycle import (
+    lock_source_pointer_gc as _lock_source_pointer_gc,
+)
 from process.ptg_parts.source_snapshot_control_policy import (
     SUPPORTED_SHARED_SNAPSHOT_CONTROL_MESSAGE,
     manifest_dict,
@@ -22,7 +24,6 @@ from process.ptg_parts.source_snapshot_control_policy import (
     snapshot_remove_reasons,
 )
 from process.ptg_parts.source_pointers import (
-    PTG2_SOURCE_POINTER_GC_LOCK_KEY,
     PTG2SourcePointerConflict,
     activate_ptg2_source_candidate,
 )
@@ -194,7 +195,6 @@ async def _delete_snapshot_metadata(
     }
     count_by_field["deleted_artifact_chunks"] = 0
     if artifact_ids:
-        await ensure_ptg2_artifact_blob_table(schema)
         count_by_field["deleted_artifact_chunks"] = int(
             await db.status(
                 f"DELETE FROM {_quote_ident(schema)}.ptg2_artifact_blob_chunk "
@@ -249,7 +249,10 @@ async def remove_ptg2_source_snapshot(
         raise ValueError("snapshot_id is required")
     schema = _schema_name()
     async with db.transaction() as session:
-        await _lock_source_pointer_gc(session)
+        await _lock_source_pointer_gc(
+            session,
+            source_key=source_key or f"snapshot_{snapshot_id}",
+        )
         plan = await build_source_snapshot_remove_plan(
             snapshot_id=snapshot_id,
             source_key=source_key,
@@ -305,7 +308,10 @@ async def retire_ptg2_source_snapshot(
         raise ValueError("snapshot_id is required")
     schema = _schema_name()
     async with db.transaction() as session:
-        await _lock_source_pointer_gc(session)
+        await _lock_source_pointer_gc(
+            session,
+            source_key=source_key or f"snapshot_{snapshot_id}",
+        )
         snapshot = await _snapshot_row(schema, snapshot_id)
         manifest_source_key = retirement_manifest_source_key(snapshot, source_key)
         await validate_retirement_shared_layout(
@@ -490,10 +496,3 @@ def _text(statement: str):
     from sqlalchemy import text
 
     return text(statement)
-
-
-async def _lock_source_pointer_gc(session: Any) -> None:
-    await session.execute(
-        _text("SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))"),
-        {"publish_lock_key": PTG2_SOURCE_POINTER_GC_LOCK_KEY},
-    )

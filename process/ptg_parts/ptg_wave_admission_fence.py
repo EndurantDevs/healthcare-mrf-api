@@ -16,6 +16,9 @@ from db.models import (
     PTGImportWaveQuarantine,
     PTGImportWaveSupersession,
 )
+from process.ptg_wave_quarantine_basis import (
+    CAPACITY_RELEASING_QUARANTINE_BASES,
+)
 
 
 PTG_ADMISSION_LOCK_NAME = "import-run-admission:ptg-source-file"
@@ -78,8 +81,9 @@ async def _capacity_owning_waves(executor: Any) -> list[Any]:
         select(PTGImportWaveQuarantine.predecessor_wave_id).where(
             PTGImportWaveQuarantine.predecessor_wave_id
             == PTGImportWave.wave_id,
-            PTGImportWaveQuarantine.recovery_basis
-            == "materialized_preclaim_failure",
+            PTGImportWaveQuarantine.recovery_basis.in_(
+                CAPACITY_RELEASING_QUARANTINE_BASES
+            ),
         )
     )
     return await _all(executor, select(PTGImportWave.wave_id, PTGImportWave.state)
@@ -137,8 +141,9 @@ async def require_wave_admission_capacity(executor: Any) -> None:
         )
         .where(
             PTGImportWaveIntent.run_id == ImportRun.run_id,
-            PTGImportWaveQuarantine.recovery_basis
-            == "materialized_preclaim_failure",
+            PTGImportWaveQuarantine.recovery_basis.in_(
+                CAPACITY_RELEASING_QUARANTINE_BASES
+            ),
         )
     )
     active = await _all(executor, select(ImportRun.run_id).where(

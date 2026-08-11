@@ -24,6 +24,19 @@ class _RecordingTransaction:
         self.statements.append((str(statement), params))
 
 
+def _assert_only_global_retirement_fence(transaction):
+    assert len(transaction.statements) == 2
+    timeout_statement, timeout_params = transaction.statements[0]
+    assert "set_config('lock_timeout'" in timeout_statement
+    assert timeout_params == {
+        "lock_timeout": "500ms",
+        "statement_timeout": "5s",
+    }
+    lock_statement, lock_params = transaction.statements[1]
+    assert "pg_advisory_xact_lock(hashtext(:gc_lock_key))" in lock_statement
+    assert lock_params == {"gc_lock_key": "ptg2_source_pointer_gc_v1"}
+
+
 def _published_snapshot(snapshot_id, serving_index):
     serving_index = {
         "arch_version": "postgres_binary_v3",
@@ -211,8 +224,7 @@ def test_manual_retire_rejects_in_flight_snapshot(monkeypatch, snapshot_status):
             )
         )
 
-    assert len(transaction.statements) == 1
-    assert "pg_advisory_xact_lock" in transaction.statements[0][0]
+    _assert_only_global_retirement_fence(transaction)
 
 
 def test_manual_retire_rejects_legacy_manifest_before_pointer_mutation(monkeypatch):
@@ -240,7 +252,7 @@ def test_manual_retire_rejects_legacy_manifest_before_pointer_mutation(monkeypat
             )
         )
 
-    assert len(transaction.statements) == 1
+    _assert_only_global_retirement_fence(transaction)
 
 
 def test_current_references_include_previous_pointer_columns(monkeypatch):

@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 from process.ptg_parts.ptg2_lifecycle_lock import (
-    PTG2_SOURCE_POINTER_GC_LOCK_KEY,
+    acquire_ptg2_lifecycle_lock,
 )
 
 
@@ -52,10 +52,7 @@ def normalize_plan_digest(expected_plan_digest: str) -> str:
 async def lock_recovery_pointer_state(executor: Any) -> None:
     """Serialize recovery with every PTG source-pointer transition."""
 
-    await executor.status(
-        "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
-        lock_key=PTG2_SOURCE_POINTER_GC_LOCK_KEY,
-    )
+    await acquire_ptg2_lifecycle_lock(executor, statement_timeout="30s")
 
 
 __all__ = [

@@ -1994,25 +1994,43 @@ async def list_pharmacy_access_rankings(request):
 
     scope = _parse_scope(args.get("scope"), default=default_scope)
     as_of = _parse_date_param(args.get("as_of"), "as_of") or datetime.date.today()
-    include_staffing = _is_boolean_parameter_enabled(args.get("include_staffing"), default=False)
-    chain = _canonical_chain(args.get("chain"))
-    total, market_items = await _query_market_summaries(
-        session,
-        _MarketSummaryQuery(
-            scope=scope,
-            sort="access_score",
-            order="desc",
-            as_of=as_of,
-            include_staffing=include_staffing,
-            limit=pagination.limit,
-            offset=pagination.offset,
-            state=(str(state).strip().upper() if state else None),
-            city=(str(city).strip().upper() if city else None),
-            county=(str(county).strip() if county else None),
-            zip_code=zip_code,
-            chain=chain,
-        ),
+    include_staffing = _is_boolean_parameter_enabled(
+        args.get("include_staffing"), default=False
     )
+    chain = _canonical_chain(args.get("chain"))
+    query = _MarketSummaryQuery(
+        scope=scope,
+        sort="access_score",
+        order="desc",
+        as_of=as_of,
+        include_staffing=include_staffing,
+        limit=pagination.limit,
+        offset=pagination.offset,
+        state=(str(state).strip().upper() if state else None),
+        city=(str(city).strip().upper() if city else None),
+        county=(str(county).strip() if county else None),
+        zip_code=zip_code,
+        chain=chain,
+    )
+    total, market_items = await _query_market_summaries(session, query)
+    return _access_ranking_response(
+        pagination,
+        as_of,
+        include_staffing,
+        query,
+        total,
+        market_items,
+    )
+
+
+def _access_ranking_response(
+    pagination,
+    as_of,
+    include_staffing: bool,
+    query: _MarketSummaryQuery,
+    total: int,
+    market_items,
+):
     ranked_markets = []
     for idx, market_item in enumerate(market_items, start=1):
         ranked_market_dict = dict(market_item)
@@ -2021,7 +2039,7 @@ async def list_pharmacy_access_rankings(request):
     return response.json(
         {
             "as_of": as_of.isoformat(),
-            "scope": scope,
+            "scope": query.scope,
             "page": pagination.page,
             "page_size": pagination.limit,
             "limit": pagination.limit,

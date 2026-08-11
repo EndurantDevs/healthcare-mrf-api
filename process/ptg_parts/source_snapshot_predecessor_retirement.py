@@ -9,7 +9,13 @@ import os
 from typing import Any, Mapping
 
 from db.connection import db
-from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    acquire_ptg2_source_lifecycle_lock,
+)
+from process.ptg_parts.ptg2_legacy_global_projection_queue import (
+    drain_legacy_global_projection_queue,
+    mark_legacy_global_projection_dirty,
+)
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.source_snapshot_predecessor_retirement_state import (
     predecessor_retirement_decision,
@@ -24,6 +30,7 @@ from process.ptg_parts.source_snapshot_predecessor_retirement_store import (
 from process.ptg_parts.source_snapshot_predecessor_retirement_types import (
     PTG2PredecessorRetirementConflict,
     PredecessorRetirementContext,
+    PredecessorRetirementDecision,
     PredecessorRetirementRequest,
 )
 from process.ptg_parts.source_snapshot_control_policy import (
@@ -229,7 +236,11 @@ async def _execute_predecessor_retirement(
     control_schema_name: str,
     request: PredecessorRetirementRequest,
 ) -> dict[str, Any]:
-    await acquire_ptg2_lifecycle_lock(session)
+    """Retire one predecessor under its source-local transaction fence."""
+    await acquire_ptg2_source_lifecycle_lock(
+        session,
+        source_key=request.source_key,
+    )
     existing_audit = await load_retirement_audit(
         session,
         schema_name=schema_name,
@@ -256,6 +267,28 @@ async def _execute_predecessor_retirement(
         rollback_pin_mode=request.rollback_pin_mode,
         rollback_owner_id=request.rollback_owner_id,
     )
+    audit_record = await _apply_predecessor_retirement_with_audit(
+        session,
+        schema_name=schema_name,
+        decision=decision,
+        control_schema_name=control_schema_name,
+        context=context,
+        request=request,
+    )
+    return _retirement_report(audit_record, idempotent=False)
+
+
+async def _apply_predecessor_retirement_with_audit(
+    session: Any,
+    *,
+    schema_name: str,
+    control_schema_name: str,
+    context: PredecessorRetirementContext,
+    request: PredecessorRetirementRequest,
+    decision: PredecessorRetirementDecision,
+) -> Mapping[str, Any]:
+    """Validate, mutate, postcheck, and audit one retirement in order."""
+
     await _validate_predecessor_removal_contract(
         session,
         schema_name=schema_name,
@@ -274,13 +307,12 @@ async def _execute_predecessor_retirement(
         control_schema_name=control_schema_name,
         request=request,
     )
-    audit_record = await insert_retirement_audit(
+    return await insert_retirement_audit(
         session,
         schema_name=schema_name,
         request=request,
         decision=decision,
     )
-    return _retirement_report(audit_record, idempotent=False)
 
 
 async def retire_ptg2_source_predecessor(
@@ -309,12 +341,25 @@ async def retire_ptg2_source_predecessor(
     schema_name = resolve_ptg2_schema()
     control_schema_name = _control_schema_name()
     async with db.transaction() as session:
-        return await _execute_predecessor_retirement(
+        report_by_field = await _execute_predecessor_retirement(
             session,
             schema_name=schema_name,
             control_schema_name=control_schema_name,
             request=request,
         )
+        await mark_legacy_global_projection_dirty(
+            session,
+            schema_name=schema_name,
+            source_key=request.source_key,
+        )
+    projection_drain = await drain_legacy_global_projection_queue(
+        max_requests=1,
+        source_key=request.source_key,
+    )
+    report_by_field["global_pointer"] = (
+        "reconciled" if projection_drain.reconciled == 1 else "deferred"
+    )
+    return report_by_field
 
 
 __all__ = [

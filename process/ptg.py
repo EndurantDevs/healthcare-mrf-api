@@ -39,8 +39,6 @@ from db.models import (
     PTG2ImportRun,
     PTG2LocationSet,
     PTG2LocationSetMember,
-    PTG2Plan,
-    PTG2PlanAlias,
     PTG2PlanMonth,
     PTG2PlanRateSet,
     PTG2PriceCodeSet,
@@ -388,6 +386,9 @@ from process.ptg_parts.snapshot_cleanup import (
     _missing_snapshot_serving_resources,
     _snapshot_manifest_table_names,
 )
+from process.ptg_parts.ptg_wave_terminal_snapshot_pin import (
+    insert_ordinary_terminal_snapshot_pin,
+)
 from process.ptg_parts.snapshot_tables import (
     _normalize_source_key,
     _ptg2_snapshot_index_name,
@@ -446,7 +447,15 @@ from process.ptg_parts.source_pointers import (
     _publish_ptg2_source_pointers,
     _source_plan_rows,
 )
+from process.ptg_parts.ptg2_legacy_global_projection_queue import (
+    drain_legacy_global_projection_queue,
+    mark_legacy_global_projection_dirty,
+)
 from process.ptg_parts.source_versions import _record_source_version
+from process.ptg_parts.ptg2_plan_catalog_outbox import (
+    drain_immutable_plan_catalog_outbox,
+    enqueue_immutable_plan_catalog,
+)
 from process.ptg_parts.table_setup import (
     PTG2_MODEL_CLASSES,
     PTG_CONTROL_TABLE_CLASS_NAMES,
@@ -462,6 +471,7 @@ from process.ptg_parts.table_setup import (
     _ensure_ptg2_serving_rate_stage_table,
     _prepare_ptg_tables,
     ensure_ptg2_tables,
+    require_ptg2_runtime_schema_ready,
 )
 from process.ptg_parts.values import (
     _catalog_entry_id,
@@ -807,7 +817,19 @@ async def _push_ptg2_snapshot_preserving_publication(
 
     async with db.transaction() as session:
         if is_snapshot_claim:
-            await _acquire_source_pointer_gc_lock(session)
+            initial_options = (
+                initial_import_run_by_field.get("options")
+                if isinstance(initial_import_run_by_field, dict)
+                else {}
+            )
+            claim_source_key = str(
+                (initial_options or {}).get("source_key")
+                or f"snapshot_{snapshot_attributes['snapshot_id']}"
+            )
+            await _acquire_source_pointer_gc_lock(
+                session,
+                source_key=claim_source_key,
+            )
         snapshot_state = await _store_fenced_snapshot_state(
             session,
             statement,
@@ -885,6 +907,20 @@ async def _push_fenced_ptg2_plan_months(
 ) -> None:
     """Upsert plan-month rows while holding every snapshot fence row."""
 
+    async with db.transaction() as session:
+        await _write_fenced_ptg2_plan_months(
+            session,
+            plan_month_entries=plan_month_entries,
+        )
+
+
+async def _write_fenced_ptg2_plan_months(
+    session: Any,
+    *,
+    plan_month_entries: list[dict[str, Any]],
+) -> None:
+    """Write source-local plan months in an existing bounded unit of work."""
+
     table = PTG2PlanMonth.__table__
     statement = db.insert(table).values(plan_month_entries)
     update_values_by_column = {
@@ -904,15 +940,43 @@ async def _push_fenced_ptg2_plan_months(
             if entry.get("snapshot_id")
         }
     )
+    for snapshot_id in snapshot_ids:
+        await lock_writable_snapshot(
+            session,
+            db,
+            schema_name=schema_name,
+            snapshot_id=snapshot_id,
+        )
+    await statement.status()
+
+
+async def _persist_plan_months_and_catalog_request(
+    *,
+    snapshot_id: str,
+    plan_month_rows: list[dict[str, Any]],
+    plan_rows: list[dict[str, Any]],
+    alias_rows: list[dict[str, Any]],
+) -> str:
+    """Commit local plan scope and its replayable compatibility work together."""
+
     async with db.transaction() as session:
-        for snapshot_id in snapshot_ids:
-            await lock_writable_snapshot(
-                session,
-                db,
-                schema_name=schema_name,
-                snapshot_id=snapshot_id,
-            )
-        await statement.status()
+        await _write_fenced_ptg2_plan_months(
+            session,
+            plan_month_entries=plan_month_rows,
+        )
+        request = await enqueue_immutable_plan_catalog(
+            session,
+            snapshot_id=snapshot_id,
+            plan_rows=plan_rows,
+            alias_rows=alias_rows,
+        )
+    drain = await drain_immutable_plan_catalog_outbox(
+        max_requests=1,
+        request_id=request.request_id,
+    )
+    if drain.persisted:
+        return "persisted"
+    return "deferred"
 
 
 def _ptg2_model_schema_name(cls: Any) -> str:
@@ -2447,7 +2511,7 @@ async def _parse_strict_v3_file(
     arch_version = _ptg2_snapshot_arch_from_env()
     if not _is_postgres_binary_v3_arch(arch_version):
         raise RuntimeError("only postgres_binary_v3 PTG imports are supported")
-    plan_row, alias_rows, plan_month_row = _ptg2_plan_rows(
+    _plan_row, _alias_rows, plan_month_row = _ptg2_plan_rows(
         plan_fields, snapshot_id, import_month
     )
     _source_trace_row, _source_trace_set_row = _ptg2_source_trace_rows(
@@ -2456,9 +2520,6 @@ async def _parse_strict_v3_file(
     source_trace_hash = _source_trace_row["source_trace_hash"]
     source_trace_set_hash = _source_trace_set_row["source_trace_set_hash"]
 
-    await _push_ptg2_objects([plan_row], PTG2Plan, rewrite=True)
-    if alias_rows:
-        await _push_ptg2_objects(alias_rows, PTG2PlanAlias, rewrite=True)
     await _push_ptg2_objects([plan_month_row], PTG2PlanMonth, rewrite=True)
 
     copy_tmp_dir = ptg2_temp_parent()
@@ -3758,7 +3819,7 @@ def _finalize_completion_report(
 async def _persist_completed_ptg2_import_run(
     state: _CompletedImportPersistence,
 ) -> datetime.datetime:
-    """Atomically persist completion and release owned manifest stages."""
+    """Atomically persist completion and any required receipt retention pin."""
 
     if bool(state.snapshot_id) != bool(state.manifest_stage_table):
         raise ValueError(
@@ -3774,7 +3835,7 @@ async def _persist_completed_ptg2_import_run(
             "completion_metrics_pending": True,
         },
     }
-    async with db.transaction():
+    async with db.transaction() as session:
         await _push_ptg2_objects(
             [
                 _completed_import_run_row(
@@ -3787,14 +3848,6 @@ async def _persist_completed_ptg2_import_run(
             rewrite=True,
         )
         state.post_publish_stage_timer.mark("run_state_persistence")
-        if state.manifest_stage_table is not None:
-            assert state.snapshot_id is not None
-            await _drop_ptg2_snapshot_table_names(
-                _ptg2_manifest_stage_table_names(state.manifest_stage_table),
-                snapshot_id=state.snapshot_id,
-                internal_run_id=state.import_run_id,
-            )
-            state.post_publish_stage_timer.mark("manifest_stage_release")
         _finalize_completion_report(state)
         completed_at = _utcnow()
         await _push_ptg2_objects(
@@ -3808,7 +3861,72 @@ async def _persist_completed_ptg2_import_run(
             PTG2ImportRun,
             rewrite=True,
         )
+        if state.snapshot_id is not None:
+            await insert_ordinary_terminal_snapshot_pin(
+                session,
+                schema_name=resolve_ptg2_schema(),
+                snapshot_id=state.snapshot_id,
+                internal_run_id=state.import_run_id,
+                options=state.options,
+            )
     return completed_at
+
+
+async def _has_cleaned_terminal_stages(
+    *,
+    stage_table_names: list[str],
+    snapshot_id: str,
+    internal_run_id: str,
+) -> bool:
+    """Best-effort cleanup; durable stage registration remains on interruption."""
+
+    if not stage_table_names:
+        return True
+    try:
+        await _drop_ptg2_snapshot_table_names(
+            stage_table_names,
+            snapshot_id=snapshot_id,
+            internal_run_id=internal_run_id,
+        )
+    except asyncio.CancelledError:
+        logger.warning(
+            "PTG terminal stage cleanup was cancelled after success; retry deferred"
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "PTG terminal stage cleanup deferred after successful completion",
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+async def _has_cleaned_old_source_state(
+    *,
+    source_key: str,
+    snapshot_id: str,
+) -> bool:
+    """Attempt lineage cleanup without making terminal success depend on GC."""
+
+    try:
+        await _cleanup_old_ptg2_source_tables(
+            source_key,
+            {snapshot_id},
+            lock_pointer_state=True,
+        )
+    except asyncio.CancelledError:
+        logger.warning(
+            "PTG old-source cleanup was cancelled after success; retry deferred"
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "PTG old-source cleanup deferred after successful completion",
+            exc_info=True,
+        )
+        return False
+    return True
 
 
 def _terminal_retry_update_statement(schema: str) -> Any:
@@ -3852,9 +3970,18 @@ def _terminal_retry_update_statement(schema: str) -> Any:
            AND snapshot.snapshot_id = :snapshot_id
            AND snapshot.import_run_id = internal_run.import_run_id
            AND snapshot.status IN (:validated_status, :published_status)
-        RETURNING internal_run.import_run_id
+        RETURNING internal_run.import_run_id, internal_run.options
         """
     )
+
+
+def _terminal_retry_options(terminal_row: Mapping[str, Any]) -> dict[str, Any]:
+    options = terminal_row.get("options")
+    if isinstance(options, str):
+        options = json.loads(options)
+    if not isinstance(options, Mapping):
+        raise RuntimeError("terminal snapshot retry has invalid run options")
+    return dict(options)
 
 
 async def _registered_terminal_stage_names(
@@ -3913,20 +4040,28 @@ async def _finalize_resumed_terminal_attempt(
                 "published_status": PTG2_STATUS_PUBLISHED,
             },
         )
-        if terminal_result.first() is None:
+        terminal_record = terminal_result.first()
+        if terminal_record is None:
             raise RuntimeError("terminal snapshot retry is not finalizable")
+        terminal_row = _row_mapping(terminal_record)
+        await insert_ordinary_terminal_snapshot_pin(
+            session,
+            schema_name=schema_name,
+            snapshot_id=snapshot_id,
+            internal_run_id=internal_run_id,
+            options=_terminal_retry_options(terminal_row),
+        )
         registered_stage_names = await _registered_terminal_stage_names(
             session,
             schema=schema,
             snapshot_id=snapshot_id,
             internal_run_id=internal_run_id,
         )
-        if registered_stage_names:
-            await _drop_ptg2_snapshot_table_names(
-                registered_stage_names,
-                snapshot_id=snapshot_id,
-                internal_run_id=internal_run_id,
-            )
+    await _has_cleaned_terminal_stages(
+        stage_table_names=registered_stage_names,
+        snapshot_id=snapshot_id,
+        internal_run_id=internal_run_id,
+    )
 
 
 async def _heartbeat_ptg2_import_run(import_run_id: str) -> None:
@@ -4780,8 +4915,8 @@ async def _reconcile_serving_snapshot_pointer(
             "current_snapshot_id": current_snapshot_id,
         }
     schema_name = resolve_ptg2_schema()
-    async with db.transaction() as session:
-        await _acquire_source_pointer_gc_lock(session)
+    async def validate_serving_resources(_session: Any) -> None:
+        """Reject published snapshots whose serving resources were cleaned."""
         missing_tables, missing_artifacts = await _missing_snapshot_serving_resources(
             schema_name,
             snapshot_id,
@@ -4793,16 +4928,18 @@ async def _reconcile_serving_snapshot_pointer(
                 "Published PTG snapshot serving resources are missing: "
                 + ", ".join(missing_resources)
             )
-        return await _publish_ptg2_source_pointers(
-            source_key=source_key,
-            snapshot_id=snapshot_id,
-            previous_snapshot_id=(
-                str(previous_snapshot_id) if previous_snapshot_id else None
-            ),
-            import_month=import_month,
-            updated_at=_utcnow(),
-            snapshot_attributes=snapshot_attributes,
-        )
+
+    return await _publish_ptg2_source_pointers(
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        previous_snapshot_id=(
+            str(previous_snapshot_id) if previous_snapshot_id else None
+        ),
+        import_month=import_month,
+        updated_at=_utcnow(),
+        snapshot_attributes=snapshot_attributes,
+        locked_validator=validate_serving_resources,
+    )
 
 
 async def _publish_allowed_current_pointer(
@@ -4818,7 +4955,10 @@ async def _publish_allowed_current_pointer(
     pointer_source_key = _allowed_source_pointer_key(source_key)
     schema_name = resolve_ptg2_schema()
     async with db.transaction() as session:
-        await _acquire_source_pointer_gc_lock(session)
+        await _acquire_source_pointer_gc_lock(
+            session,
+            source_key=source_key,
+        )
         await _compare_and_swap_source_pointer(
             session,
             schema_name=schema_name,
@@ -4849,7 +4989,10 @@ async def _publish_mixed_candidate_current_pointers(
 
     schema_name = resolve_ptg2_schema()
     async with db.transaction() as session:
-        await _acquire_source_pointer_gc_lock(session)
+        await _acquire_source_pointer_gc_lock(
+            session,
+            source_key=source_key,
+        )
         negotiated_pointer_result = (
             await _activate_ptg2_source_candidate_in_transaction(
                 session,
@@ -4859,6 +5002,20 @@ async def _publish_mixed_candidate_current_pointers(
                 expected_current_snapshot_id=previous_snapshot_id,
             )
         )
+        await mark_legacy_global_projection_dirty(
+            session,
+            schema_name=schema_name,
+            source_key=source_key,
+        )
+    projection_drain = await drain_legacy_global_projection_queue(
+        max_requests=1,
+        source_key=source_key,
+    )
+    global_pointer_status = (
+        "reconciled" if projection_drain.reconciled == 1 else "deferred"
+    )
+    if "global_pointer" in negotiated_pointer_result:
+        negotiated_pointer_result["global_pointer"] = global_pointer_status
     allowed_pointer_result = negotiated_pointer_result.get("allowed_amount_pointer")
     if not isinstance(allowed_pointer_result, dict):
         raise RuntimeError(
@@ -5645,18 +5802,27 @@ async def _publish_shared_v3_plan_rows(
     snapshot_id: str,
     import_month: datetime.date,
 ) -> None:
-    """Persist every logical plan that will bind to one physical V3 layout."""
+    """Persist source-local plan months before bounded catalog compatibility."""
 
+    plan_rows: list[dict[str, Any]] = []
+    plan_month_rows: list[dict[str, Any]] = []
+    all_alias_rows: list[dict[str, Any]] = []
     for plan_fields in shared_input_identity.logical_plan_fields_by_scope:
         plan_row, alias_rows, plan_month_row = _ptg2_plan_rows(
             dict(plan_fields),
             snapshot_id,
             import_month,
         )
-        await _push_ptg2_objects([plan_row], PTG2Plan, rewrite=True)
-        if alias_rows:
-            await _push_ptg2_objects(alias_rows, PTG2PlanAlias, rewrite=True)
-        await _push_ptg2_objects([plan_month_row], PTG2PlanMonth, rewrite=True)
+        plan_month_rows.append(plan_month_row)
+        plan_rows.append(plan_row)
+        all_alias_rows.extend(alias_rows)
+    catalog_status = await _persist_plan_months_and_catalog_request(
+        snapshot_id=snapshot_id,
+        plan_month_rows=plan_month_rows,
+        plan_rows=plan_rows,
+        alias_rows=all_alias_rows,
+    )
+    _emit_screen_line(f"PTG2_PLAN_CATALOG\tstatus={catalog_status}")
 
 
 def _is_shared_v3_preflight_eligible(
@@ -6371,13 +6537,6 @@ async def _complete_reused_shared_v3_publication(
         "logical_candidate_and_optional_pointer_cutover"
     )
     state.post_publish_stage_timer.mark("scratch_cleanup")
-    if state.auto_activate:
-        await _cleanup_old_ptg2_source_tables(
-            publication.source_key,
-            {publication.snapshot_id},
-            lock_pointer_state=True,
-        )
-    state.post_publish_stage_timer.mark("old_state_cleanup")
     address_refresh = (
         await _enqueue_address_refresh_after_import(
             source_key=publication.source_key,
@@ -6408,6 +6567,12 @@ async def _complete_reused_shared_v3_publication(
             post_publish_stage_timer=state.post_publish_stage_timer,
         )
     )
+    if state.auto_activate:
+        await _has_cleaned_old_source_state(
+            source_key=publication.source_key,
+            snapshot_id=publication.snapshot_id,
+        )
+    state.post_publish_stage_timer.mark("old_state_cleanup")
     return address_refresh
 
 
@@ -7392,8 +7557,8 @@ async def _main_with_artifact_lease(
     write_live_progress(phase="initializing", pct=1, message="initializing PTG import")
     await ensure_database(test_mode)
     setup_stage_timer.mark("ensure_database")
-    await ensure_ptg2_tables()
-    setup_stage_timer.mark("ensure_ptg2_tables")
+    await require_ptg2_runtime_schema_ready()
+    setup_stage_timer.mark("ptg2_schema_readiness")
     source_import_lock = _ptg2_source_import_lock(source_key_val)
     has_source_import_lock = False
     try:
@@ -7519,17 +7684,6 @@ async def _main_with_artifact_lease(
                 auto_activate=should_auto_activate_candidates,
             )
             if should_auto_activate_candidates:
-                try:
-                    await _cleanup_old_ptg2_source_tables(
-                        source_key_val,
-                        {snapshot_id},
-                        lock_pointer_state=True,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Validated PTG candidate activated, but old-state cleanup failed",
-                        exc_info=True,
-                    )
                 candidate_result["address_refresh"] = (
                     await _enqueue_address_refresh_after_import(
                         source_key=source_key_val,
@@ -7544,6 +7698,11 @@ async def _main_with_artifact_lease(
                 snapshot_state,
                 internal_run_id=import_run_id,
             )
+            if should_auto_activate_candidates:
+                await _has_cleaned_old_source_state(
+                    source_key=source_key_val,
+                    snapshot_id=snapshot_id,
+                )
             write_live_progress(
                 status="succeeded",
                 phase="succeeded",
@@ -8920,13 +9079,6 @@ async def _main_with_artifact_lease(
             total_steps=publish_progress_total,
             message_text="cleaning old PTG source tables",
         )
-        if should_auto_activate_candidates:
-            await _cleanup_old_ptg2_source_tables(
-                source_key_val,
-                {snapshot_id},
-                lock_pointer_state=True,
-            )
-        post_publish_stage_timer.mark("old_state_cleanup")
         _emit_ptg2_publish_progress(
             "address refresh",
             completed_steps=7,
@@ -8979,7 +9131,20 @@ async def _main_with_artifact_lease(
                 post_publish_stage_timer=post_publish_stage_timer,
             )
         )
+        stage_table_names = _ptg2_manifest_stage_table_names(
+            ptg2_manifest_stage_table
+        )
         ptg2_manifest_stage_table = None
+        await _has_cleaned_terminal_stages(
+            stage_table_names=stage_table_names,
+            snapshot_id=snapshot_id,
+            internal_run_id=import_run_id,
+        )
+        if should_auto_activate_candidates:
+            await _has_cleaned_old_source_state(
+                source_key=source_key_val,
+                snapshot_id=snapshot_id,
+            )
         _emit_ptg2_publish_progress(
             "validated",
             completed_steps=8,

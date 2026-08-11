@@ -151,7 +151,9 @@ def install_import_boundary(
     )
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(
+        process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock()
+    )
     monkeypatch.setattr(process_ptg, "_ptg2_source_import_lock", lambda _key: lock)
     monkeypatch.setattr(
         process_ptg,

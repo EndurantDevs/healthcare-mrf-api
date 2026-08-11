@@ -5354,10 +5354,15 @@ def _install_concurrent_layout_mocks(monkeypatch, publish):
 
 
 def _install_concurrent_file_import_mocks(monkeypatch, state):
+    monkeypatch.setattr(
+        process_ptg,
+        "_persist_plan_months_and_catalog_request",
+        AsyncMock(return_value="persisted"),
+    )
     callbacks = _concurrent_file_import_callbacks(state)
     fake_push, fake_toc, downloaded_jobs, process_file, publish, transaction = callbacks
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(
@@ -5468,7 +5473,7 @@ def test_ptg2_main_rolls_back_claim_when_import_run_start_fails(monkeypatch):
         return None
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(
         process_ptg,
         "_current_source_snapshot_id",
@@ -5518,7 +5523,7 @@ def _install_fenced_import_start(monkeypatch, pushed_entries):
         return None
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(
         process_ptg,
         "_current_source_snapshot_id",
@@ -5619,7 +5624,7 @@ def test_ptg2_main_cleans_complete_stage_family_when_stage_creation_fails(monkey
         return None
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(
         process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None)
     )
@@ -5708,7 +5713,7 @@ def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
         )
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(
         process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None)
     )
@@ -6246,7 +6251,7 @@ async def _iter_allowed_only_downloaded_jobs(selected_jobs, **_kwargs):
 
 def _install_allowed_only_import_mocks(monkeypatch, pushed_rows) -> None:
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(
         process_ptg,
         "_current_source_snapshot_id",
@@ -6672,6 +6677,12 @@ def _install_partial_publish_mocks(
 ) -> None:
     """Install one successful and one failed negotiated-file workflow."""
 
+    monkeypatch.setattr(
+        process_ptg,
+        "_persist_plan_months_and_catalog_request",
+        AsyncMock(return_value="persisted"),
+    )
+
     async def fake_push(rows, cls, **_kwargs):
         pushed_rows.extend(
             (getattr(cls, "__name__", str(cls)), import_row) for import_row in rows
@@ -6730,7 +6741,7 @@ def _patch_partial_publish_dependencies(
     """Patch the orchestration boundary for partial-publication behavior."""
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(
         process_ptg,
         "_current_source_snapshot_id",
@@ -6843,7 +6854,7 @@ def test_ptg2_main_marks_failed_when_toc_download_fails(monkeypatch):
         raise RuntimeError("409 public access denied")
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(
         process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None)
     )
@@ -8880,16 +8891,17 @@ def _assert_source_pointer_publication(promotion_result, executed_list):
     assert promotion_result["global_pointer"] == "reconciled"
     assert 'INSERT INTO "mrf".ptg2_current_source_snapshot' in joined
     assert 'UPDATE "mrf".ptg2_snapshot' in joined
-    assert "updated_global_pointer" in joined
-    assert "incumbent.published_at >=" in joined
+    assert "ptg2_legacy_global_pointer_projection_queue" in joined
+    assert "updated_global_pointer" not in joined
     assert (
         'DELETE FROM "mrf".ptg2_current_plan_source WHERE source_key = :source_key'
         in joined
     )
     assert 'INSERT INTO "mrf".ptg2_current_plan_source' in joined
-    assert len(executed_list) == 8
-    assert "guard_ptg2_v4_attempt" in executed_list[1][0]
-    assert "FOR UPDATE OF snapshot" in executed_list[2][0]
+    assert len(executed_list) == 10
+    assert "pg_advisory_xact_lock_shared" in executed_list[1][0]
+    assert "guard_ptg2_v4_attempt" in executed_list[3][0]
+    assert "FOR UPDATE OF snapshot" in executed_list[4][0]
 
 
 def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionally(
@@ -8932,6 +8944,11 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
     monkeypatch.setattr(
         ptg_source_pointers.db, "transaction", lambda: FakeTransaction()
     )
+    monkeypatch.setattr(
+        ptg_source_pointers,
+        "drain_legacy_global_projection_queue",
+        AsyncMock(return_value=SimpleNamespace(reconciled=1)),
+    )
     snapshot_by_field = _build_published_snapshot_fields(import_month, updated_at)
     promotion_result = asyncio.run(
         process_ptg._publish_ptg2_source_pointers(
@@ -8953,8 +8970,9 @@ def test_pointer_stays_on_plan_failure(monkeypatch):
 
     async def fake_source_plan_rows(**_kwargs):
         assert transaction_started_map["value"] is True
-        assert (
-            executed_statements and "pg_advisory_xact_lock" in executed_statements[0][0]
+        assert any(
+            "pg_advisory_xact_lock" in statement
+            for statement, _params in executed_statements
         )
         raise RuntimeError("plan resolution failed")
 
@@ -8996,10 +9014,11 @@ def test_pointer_stays_on_plan_failure(monkeypatch):
         )
 
     assert transaction_started_map["value"] is True
-    assert len(executed_statements) == 3
-    assert "pg_advisory_xact_lock" in executed_statements[0][0]
-    assert executed_statements[0][1] == {
-        "publish_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
+    assert len(executed_statements) == 5
+    assert "set_config('lock_timeout'" in executed_statements[0][0]
+    assert "pg_advisory_xact_lock_shared" in executed_statements[1][0]
+    assert executed_statements[1][1] == {
+        "gc_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
     }
 
 
@@ -9041,14 +9060,15 @@ def test_ptg2_global_publish_is_atomic(monkeypatch):
         "snapshot_id": "snap",
         "global_pointer": "reconciled",
     }
-    assert len(executed_statements) == 5
-    assert "pg_advisory_xact_lock" in executed_statements[0][0]
-    assert "guard_ptg2_v4_attempt" in executed_statements[1][0]
-    assert "FOR UPDATE OF snapshot" in executed_statements[2][0]
-    assert 'UPDATE "mrf".ptg2_snapshot' in executed_statements[3][0]
-    assert 'INSERT INTO "mrf".ptg2_current_snapshot' in executed_statements[4][0]
-    assert executed_statements[0][1] == {
-        "publish_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
+    assert len(executed_statements) == 10
+    assert "set_config('lock_timeout'" in executed_statements[0][0]
+    assert "pg_advisory_xact_lock_shared" in executed_statements[1][0]
+    assert "guard_ptg2_v4_attempt" in executed_statements[3][0]
+    assert "FOR UPDATE OF snapshot" in executed_statements[4][0]
+    assert 'UPDATE "mrf".ptg2_snapshot' in executed_statements[5][0]
+    assert 'INSERT INTO "mrf".ptg2_current_snapshot' in executed_statements[9][0]
+    assert executed_statements[1][1] == {
+        "gc_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
     }
 
 
@@ -9089,10 +9109,11 @@ def test_ptg2_global_snapshot_pointer_rejects_unpublished_snapshot_after_lock(
             )
         )
 
-    assert len(executed_statements) == 3
-    assert "pg_advisory_xact_lock" in executed_statements[0][0]
-    assert "guard_ptg2_v4_attempt" in executed_statements[1][0]
-    assert "FOR UPDATE OF snapshot" in executed_statements[2][0]
+    assert len(executed_statements) == 5
+    assert "set_config('lock_timeout'" in executed_statements[0][0]
+    assert "pg_advisory_xact_lock_shared" in executed_statements[1][0]
+    assert "guard_ptg2_v4_attempt" in executed_statements[3][0]
+    assert "FOR UPDATE OF snapshot" in executed_statements[4][0]
 
 
 def test_manifest_allowlists_location_tables():
@@ -9154,7 +9175,11 @@ def _strict_v3_publication(serving_rates):
 
 def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
     """Install a successful strict V3 publisher and return its async mock."""
-
+    monkeypatch.setattr(
+        process_ptg,
+        "_persist_plan_months_and_catalog_request",
+        AsyncMock(return_value="persisted"),
+    )
     monkeypatch.setattr(
         process_ptg,
         "_should_auto_activate_ptg2_candidates",
@@ -9162,7 +9187,6 @@ def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
     )
     publication = _strict_v3_publication(serving_rates)
     publish = AsyncMock(return_value=publication)
-
     @asynccontextmanager
     async def fake_transaction():
         yield object()
@@ -9921,6 +9945,16 @@ def _install_reused_mixed_publish_mocks(monkeypatch):
     )
     monkeypatch.setattr(
         process_ptg,
+        "mark_legacy_global_projection_dirty",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "drain_legacy_global_projection_queue",
+        AsyncMock(return_value=SimpleNamespace(reconciled=1)),
+    )
+    monkeypatch.setattr(
+        process_ptg,
         "_persist_completed_ptg2_import_run",
         persist_completion,
     )
@@ -10191,11 +10225,16 @@ def _install_source_report_count_mocks(
     publish_source_dictionary,
 ):
     """Install strict mocks for source-level report count reconciliation."""
+    monkeypatch.setattr(
+        process_ptg,
+        "_persist_plan_months_and_catalog_request",
+        AsyncMock(return_value="persisted"),
+    )
     fake_push, fake_downloaded_jobs, fake_process = _source_report_count_callbacks(
         pushed_list
     )
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(
@@ -10312,10 +10351,15 @@ def _deferred_candidate_callbacks(state):
 
 
 def _install_deferred_candidate_mocks(monkeypatch, state):
+    monkeypatch.setattr(
+        process_ptg,
+        "_persist_plan_months_and_catalog_request",
+        AsyncMock(return_value="persisted"),
+    )
     fake_push, fake_downloaded_jobs, fake_process = _deferred_candidate_callbacks(state)
     monkeypatch.delenv("HLTHPRT_PTG2_AUTO_ACTIVATE_CANDIDATES", raising=False)
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(
@@ -10408,6 +10452,7 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
 
 
 def _completion_timing_callbacks(state):
+    """Build callbacks that capture completion timing boundaries."""
     def advance(seconds: float) -> None:
         state.clock_map["seconds"] += seconds
 
@@ -10432,25 +10477,16 @@ def _completion_timing_callbacks(state):
 
     async def fake_process(*_args, **_kwargs):
         advance(10.0)
-        return process_ptg.PTG2FileProcessResult(
-            "in_network",
-            "https://example.test/rates.json.gz",
-            True,
-            summary={
-                "serving_rates": 1,
-                "manifest": {
-                    "copy_files": {},
-                    "source_trace_hash": "a" * 64,
-                },
-                **_empty_provider_identifier_quarantine_scanner_summary(),
-            },
-        )
+        return _completion_process_result()
 
     async def publish_source_pointers(**_kwargs):
         advance(3.0)
 
     async def cleanup_old_source_tables(*_args, **_kwargs):
         advance(5.0)
+        state.completion_events.append(
+            ("old_state_cleanup", state.clock_map["seconds"])
+        )
 
     async def enqueue_address_refresh(**_kwargs):
         advance(7.0)
@@ -10464,6 +10500,24 @@ def _completion_timing_callbacks(state):
         publish_source_pointers,
         cleanup_old_source_tables,
         enqueue_address_refresh,
+    )
+
+
+def _completion_process_result():
+    """Build the deterministic successful file result for timing tests."""
+
+    return process_ptg.PTG2FileProcessResult(
+        "in_network",
+        "https://example.test/rates.json.gz",
+        True,
+        summary={
+            "serving_rates": 1,
+            "manifest": {
+                "copy_files": {},
+                "source_trace_hash": "a" * 64,
+            },
+            **_empty_provider_identifier_quarantine_scanner_summary(),
+        },
     )
 
 
@@ -10505,6 +10559,11 @@ def _install_completion_post_publish_mocks(monkeypatch, state, callbacks):
 
 
 def _install_completion_timing_mocks(monkeypatch, state):
+    monkeypatch.setattr(
+        process_ptg,
+        "_persist_plan_months_and_catalog_request",
+        AsyncMock(return_value="persisted"),
+    )
     callbacks = _completion_timing_callbacks(state)
     (
         advance,
@@ -10521,7 +10580,7 @@ def _install_completion_timing_mocks(monkeypatch, state):
         lambda: state.clock_map["seconds"],
     )
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(
@@ -10567,17 +10626,17 @@ def _assert_completion_timing(import_result, state):
     assert timings[
         "post_publish_logical_candidate_and_optional_pointer_cutover_seconds"
     ] == pytest.approx(3.0)
-    assert timings["post_publish_old_state_cleanup_seconds"] == pytest.approx(5.0)
+    assert "post_publish_old_state_cleanup_seconds" not in timings
     assert timings["post_publish_address_refresh_seconds"] == pytest.approx(7.0)
     assert timings["post_publish_run_state_persistence_seconds"] == pytest.approx(13.0)
-    assert timings["post_publish_seconds"] == pytest.approx(28.0)
-    assert timings["total_seconds"] == pytest.approx(58.0)
+    assert timings["post_publish_seconds"] == pytest.approx(23.0)
+    assert timings["total_seconds"] == pytest.approx(53.0)
     assert final_report["timing_contract"] == {
         "version": 2,
         "total_boundary": "after_required_run_state_persistence",
         "completion_metrics_write_excluded": True,
     }
-    assert import_result["timings"]["total_seconds"] == pytest.approx(58.0)
+    assert import_result["timings"]["total_seconds"] == pytest.approx(53.0)
 
     done_events = [
         event
@@ -10587,14 +10646,78 @@ def _assert_completion_timing(import_result, state):
     assert len(done_events) == 1
     done_total_match = re.search(r"\ttotal_seconds=([0-9.]+)", done_events[0][0])
     assert done_total_match is not None
-    assert float(done_total_match.group(1)) == pytest.approx(58.0)
+    assert float(done_total_match.group(1)) == pytest.approx(53.0)
     completion_labels = [event[0] for event in state.completion_events]
     assert completion_labels.index("validated_write_2") < next(
         index
         for index, label in enumerate(completion_labels)
         if label.startswith("PTG2_IMPORT_DONE")
     )
+    assert completion_labels.index("validated_write_2") < completion_labels.index(
+        "old_state_cleanup"
+    )
     assert done_events[0][1] == pytest.approx(60.0)
+
+
+@pytest.mark.asyncio
+async def test_completed_run_commits_terminal_pin_before_post_success_cleanup(
+    monkeypatch,
+):
+    """Prove terminal visibility pins its manifest before deferred cleanup."""
+    session = object()
+    @asynccontextmanager
+    async def transaction():
+        yield session
+    pushed_rows = []
+
+    async def push(rows, cls, **_kwargs):
+        pushed_rows.extend((cls, row) for row in rows)
+    pin = AsyncMock()
+    stage_drop = AsyncMock()
+    monkeypatch.setattr(process_ptg.db, "transaction", transaction)
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", push)
+    monkeypatch.setattr(
+        process_ptg,
+        "insert_ordinary_terminal_snapshot_pin",
+        pin,
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_drop_ptg2_snapshot_table_names",
+        stage_drop,
+    )
+    monkeypatch.setattr(process_ptg, "_ptg2_monotonic", lambda: 10.0)
+
+    await process_ptg._persist_completed_ptg2_import_run(
+        process_ptg._CompletedImportPersistence(
+            import_run_id="engine-run",
+            import_month=datetime.date(2026, 8, 1),
+            started_at=datetime.datetime(2026, 8, 10),
+            options={
+                "ordinary_cutover_operation_id": "8" * 64,
+                "ordinary_cutover_member_ordinal": 7,
+            },
+            report_payload={},
+            timing_payload={},
+            import_started_monotonic=0.0,
+            post_publish_started_monotonic=5.0,
+            post_publish_stage_timer=process_ptg._StageTimer({}, 5.0),
+            snapshot_id="snapshot-terminal",
+            manifest_stage_table="manifest-stage",
+        )
+    )
+    assert len(pushed_rows) == 2
+    pin.assert_awaited_once_with(
+        session,
+        schema_name=process_ptg.resolve_ptg2_schema(),
+        snapshot_id="snapshot-terminal",
+        internal_run_id="engine-run",
+        options={
+            "ordinary_cutover_operation_id": "8" * 64,
+            "ordinary_cutover_member_ordinal": 7,
+        },
+    )
+    stage_drop.assert_not_awaited()
 
 
 def test_ptg2_completion_timing_ends_after_post_publish_work(monkeypatch):
@@ -10651,9 +10774,12 @@ def _install_failure_cleanup_targets(monkeypatch, abandon, stage_cleanup):
 def _install_ptg2_publish_failure_mocks(monkeypatch):
     """Install one failed-publish path with ordered cleanup observations."""
 
+    monkeypatch.setattr(
+        process_ptg, "_persist_plan_months_and_catalog_request",
+        AsyncMock(return_value="persisted"),
+    )
     pushed_rows = []
     failure_events = []
-
     async def fake_push(rows, cls, **_kwargs):
         pushed_rows.extend((getattr(cls, "__name__", str(cls)), row) for row in rows)
         if (
@@ -10661,7 +10787,6 @@ def _install_ptg2_publish_failure_mocks(monkeypatch):
             and rows[0].get("status") == process_ptg.PTG2_STATUS_FAILED
         ):
             failure_events.append("failure_report_persisted")
-
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
             yield _strict_v3_downloaded_job(job)
@@ -10682,7 +10807,7 @@ def _install_ptg2_publish_failure_mocks(monkeypatch):
         )
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(
@@ -10925,7 +11050,7 @@ def _install_manifest_case_mocks(
     publish_mock = _install_strict_v3_publish_mocks(monkeypatch, serving_rates=222)
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(
         process_ptg,

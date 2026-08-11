@@ -17,6 +17,16 @@ from sqlalchemy import text
 
 from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_layout_candidate import (
+    acquire_layout_digest_lock,
+    delete_layout_build_candidate,
+    insert_layout_build_candidate,
+    mark_layout_build_candidate_cleanup_pending,
+    publish_layout_fingerprint,
+)
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    acquire_ptg2_source_lifecycle_lock,
+)
 from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_BUILD_LEASE_SECONDS_DEFAULT,
     PTG2_V3_BUILD_LEASE_SECONDS_ENV,
@@ -27,7 +37,6 @@ from process.ptg_parts.ptg2_shared_blocks import (
     SharedBlock,
     SharedBlockReference,
     SharedLayoutReservation,
-    delete_shared_layout_dense_rows,
     shared_block_hash,
 )
 from process.ptg_parts.ptg2_tax_identity_source_seal_validation import (
@@ -2132,7 +2141,6 @@ async def _load_v4_layout_reservation(
                 ON root.snapshot_key = layout.snapshot_key
              WHERE fingerprint.semantic_fingerprint = :semantic_fingerprint
              LIMIT 1
-             FOR UPDATE OF layout
             """
         ),
         {"semantic_fingerprint": fingerprint},
@@ -2276,7 +2284,7 @@ async def _existing_v4_reservation(
     schema: str,
     existing: Mapping[str, Any],
     build_token: str,
-) -> SharedLayoutReservation:
+) -> SharedLayoutReservation | None:
     if (
         existing.get("state") == "sealed"
         and existing.get("generation") == PTG2_V4_SHARED_GENERATION
@@ -2295,13 +2303,14 @@ async def _existing_v4_reservation(
         and existing.get("build_token") == str(build_token)
     ):
         return SharedLayoutReservation(int(existing["snapshot_key"]), False, None)
-    raise RuntimeError("matching PTG V4 layout is already owned by another build")
+    return None
 
 
 async def _create_v4_reservation(
     session: Any,
     *,
     schema: str,
+    schema_name: str,
     fingerprint: bytes,
     build_token: str,
     storage_shard_id: int,
@@ -2330,20 +2339,11 @@ async def _create_v4_reservation(
     snapshot_key = reservation_result.scalar()
     if snapshot_key is None:
         raise RuntimeError("PTG V4 layout reservation did not return a key")
-    await session.execute(
-        text(
-            f"""
-            INSERT INTO {schema}.ptg2_v3_layout_fingerprint
-                (semantic_fingerprint, snapshot_key, created_at)
-            VALUES
-                (:semantic_fingerprint, :snapshot_key, :created_at)
-            """
-        ),
-        {
-            "semantic_fingerprint": fingerprint,
-            "snapshot_key": int(snapshot_key),
-            "created_at": _utcnow(),
-        },
+    await insert_layout_build_candidate(
+        session,
+        schema_name=schema_name,
+        snapshot_key=int(snapshot_key),
+        semantic_fingerprint=fingerprint,
     )
     return SharedLayoutReservation(int(snapshot_key), False, None)
 
@@ -2360,9 +2360,9 @@ async def reserve_v4_shared_layout(
 
     schema = _quote_ident(schema_name)
     fingerprint = v4_layout_fingerprint(semantic_fingerprint)
-    await session.execute(
-        text("SELECT pg_advisory_xact_lock(:lock_key)"),
-        {"lock_key": v4_layout_advisory_lock_key(fingerprint)},
+    await acquire_ptg2_source_lifecycle_lock(
+        session,
+        source_key=f"layout_{build_token}",
     )
     existing = await _load_v4_layout_reservation(
         session,
@@ -2370,19 +2370,64 @@ async def reserve_v4_shared_layout(
         fingerprint=fingerprint,
     )
     if existing is not None:
-        return await _existing_v4_reservation(
+        existing_reservation = await _existing_v4_reservation(
             session,
             schema=schema,
             existing=existing,
             build_token=build_token,
         )
+        if existing_reservation is not None:
+            return existing_reservation
+    existing_candidate_key = await _private_v4_candidate_key(
+        session,
+        schema=schema,
+        fingerprint=fingerprint,
+        build_token=build_token,
+    )
+    if existing_candidate_key is not None:
+        return SharedLayoutReservation(existing_candidate_key, False, None)
     return await _create_v4_reservation(
         session,
+        schema_name=schema_name,
         schema=schema,
         fingerprint=fingerprint,
         build_token=build_token,
         storage_shard_id=int(storage_shard_id),
     )
+
+
+async def _private_v4_candidate_key(
+    session: Any,
+    *,
+    schema: str,
+    fingerprint: bytes,
+    build_token: str,
+) -> int | None:
+    """Lock and return this builder's existing private candidate."""
+
+    candidate_result = await session.execute(
+        text(
+            f"""
+            SELECT layout.snapshot_key
+              FROM {schema}.ptg2_layout_build_candidate AS candidate
+              JOIN {schema}.ptg2_v3_snapshot_layout AS layout
+                ON layout.snapshot_key = candidate.snapshot_key
+             WHERE candidate.semantic_fingerprint = :semantic_fingerprint
+               AND layout.generation = :generation
+               AND layout.state = 'building'
+               AND layout.build_token = :build_token
+             LIMIT 1
+             FOR UPDATE OF layout
+            """
+        ),
+        {
+            "semantic_fingerprint": fingerprint,
+            "generation": PTG2_V4_SHARED_GENERATION,
+            "build_token": str(build_token),
+        },
+    )
+    candidate_key = candidate_result.scalar()
+    return int(candidate_key) if candidate_key is not None else None
 
 
 async def lock_v4_layout_map_write(
@@ -3791,9 +3836,10 @@ async def _load_reusable_v4_layout(
     mapping_digest: bytes,
     support_digest: bytes,
 ) -> dict[str, Any] | None:
-    await session.execute(
-        text("SELECT pg_advisory_xact_lock(:lock_key)"),
-        {"lock_key": v4_layout_advisory_lock_key(mapping_digest)},
+    await acquire_layout_digest_lock(
+        session,
+        digest=mapping_digest,
+        purpose="V4 mapping digest",
     )
     reusable_result = await session.execute(
         text(
@@ -3891,52 +3937,21 @@ async def _refresh_reusable_v4_layout(
     )
 
 
-async def _discard_duplicate_v4_layout(
+async def _defer_duplicate_v4_cleanup(
     session: Any,
     *,
     schema_name: str,
-    schema: str,
     snapshot_key: int,
-    build_token: str,
-    reusable_snapshot_key: int,
+    canonical_snapshot_key: int,
 ) -> None:
-    await session.execute(
-        text(
-            f"""
-            UPDATE {schema}.ptg2_v3_layout_fingerprint
-               SET snapshot_key = :reusable_snapshot_key
-             WHERE snapshot_key = :snapshot_key
-            """
-        ),
-        {
-            "reusable_snapshot_key": reusable_snapshot_key,
-            "snapshot_key": snapshot_key,
-        },
-    )
-    await delete_shared_layout_dense_rows(
+    """Persist loser cleanup without touching dense layout relations."""
+
+    await mark_layout_build_candidate_cleanup_pending(
         session,
         schema_name=schema_name,
         snapshot_key=snapshot_key,
+        canonical_snapshot_key=canonical_snapshot_key,
     )
-    delete_result = await session.execute(
-        text(
-            f"""
-            DELETE FROM {schema}.ptg2_v3_snapshot_layout
-             WHERE snapshot_key = :snapshot_key
-               AND generation = :generation
-               AND state = 'building'
-               AND build_token = :build_token
-            RETURNING snapshot_key
-            """
-        ),
-        {
-            "snapshot_key": snapshot_key,
-            "generation": PTG2_V4_SHARED_GENERATION,
-            "build_token": build_token,
-        },
-    )
-    if delete_result.scalar() is None:
-        raise RuntimeError("PTG V4 duplicate build changed before reuse")
 
 
 async def _seal_new_v4_layout(
@@ -4138,15 +4153,22 @@ async def _reuse_v4_layout_if_available(
         schema=state.schema,
         reusable_snapshot_key=reusable_snapshot_key,
     )
-    await _discard_duplicate_v4_layout(
+    canonical_snapshot_key = await publish_layout_fingerprint(
         session,
         schema_name=state.schema_name,
-        schema=state.schema,
         snapshot_key=state.snapshot_key,
-        build_token=state.build_token,
-        reusable_snapshot_key=reusable_snapshot_key,
+        canonical_snapshot_key=reusable_snapshot_key,
+        generation=PTG2_V4_SHARED_GENERATION,
+        mapping_digest=state.summary.map_digest,
+        support_digest=state.support_digest,
     )
-    return reusable_snapshot_key
+    await _defer_duplicate_v4_cleanup(
+        session,
+        schema_name=state.schema_name,
+        snapshot_key=state.snapshot_key,
+        canonical_snapshot_key=canonical_snapshot_key,
+    )
+    return canonical_snapshot_key
 
 
 async def seal_v4_shared_layout(
@@ -4174,6 +4196,10 @@ async def seal_v4_shared_layout(
         summary_batch_rows=summary_batch_rows,
         progress_callback=progress_callback,
     )
+    await acquire_ptg2_source_lifecycle_lock(
+        session,
+        source_key=f"layout_{request.build_token}",
+    )
     state = await _prepare_v4_seal_state(session, request)
     reusable_snapshot_key = await _reuse_v4_layout_if_available(
         session,
@@ -4186,6 +4212,15 @@ async def seal_v4_shared_layout(
             True,
         )
 
+    return await _seal_and_publish_v4_layout(session, state)
+
+
+async def _seal_and_publish_v4_layout(
+    session: Any,
+    state: _V4SealState,
+) -> SealedSharedLayout:
+    """Seal, publish, and release one private V4 candidate atomically."""
+
     await _seal_new_v4_layout(
         session,
         schema=state.schema,
@@ -4196,10 +4231,26 @@ async def seal_v4_shared_layout(
         sealed_manifest=state.sealed_manifest,
         logical_byte_count=state.summary.logical_byte_count,
     )
+    canonical_snapshot_key = await publish_layout_fingerprint(
+        session,
+        schema_name=state.schema_name,
+        snapshot_key=state.snapshot_key,
+        canonical_snapshot_key=state.snapshot_key,
+        generation=PTG2_V4_SHARED_GENERATION,
+        mapping_digest=state.summary.map_digest,
+        support_digest=state.support_digest,
+    )
+    if canonical_snapshot_key != state.snapshot_key:
+        raise RuntimeError("PTG V4 canonical layout changed during isolated seal")
+    await delete_layout_build_candidate(
+        session,
+        schema_name=state.schema_name,
+        snapshot_key=state.snapshot_key,
+    )
     return SealedSharedLayout(
-        state.snapshot_key,
+        canonical_snapshot_key,
         state.summary.map_digest,
-        False,
+        canonical_snapshot_key != state.snapshot_key,
     )
 
 

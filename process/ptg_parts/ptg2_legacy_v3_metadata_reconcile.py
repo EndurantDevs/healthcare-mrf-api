@@ -29,7 +29,7 @@ from process.ptg_parts.ptg2_legacy_v3_operational_absence import (
     load_exact_operational_absence,
 )
 from process.ptg_parts.ptg2_lifecycle_lock import (
-    acquire_ptg2_lifecycle_lock,
+    acquire_ptg2_source_lifecycle_lock,
 )
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.db_tables import _quote_ident
@@ -215,6 +215,10 @@ async def _lock_reconcile_target(
         schema_name=schema_name,
         internal_run_id=internal_run_id,
     )
+    await acquire_ptg2_source_lifecycle_lock(
+        session,
+        source_key=source_file_import_id,
+    )
     await session.execute(
         text(
             "SELECT pg_advisory_xact_lock("
@@ -222,7 +226,6 @@ async def _lock_reconcile_target(
         ),
         {"lock_key": source_attempt_lock_key(source_file_import_id)},
     )
-    await acquire_ptg2_lifecycle_lock(session)
     target_digest = legacy_v3_target_digest(
         snapshot_id=snapshot_id,
         internal_run_id=internal_run_id,

@@ -36,6 +36,25 @@ async def _create_layout_identity_tables(connection, schema: str) -> None:
         )
         """,
         f"""
+        CREATE TABLE {schema}.ptg2_layout_build_candidate (
+            snapshot_key bigint PRIMARY KEY
+                REFERENCES {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
+            semantic_fingerprint bytea NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now()
+        )
+        """,
+        f"""
+        CREATE TABLE {schema}.ptg2_block_build_pin (
+            snapshot_key bigint NOT NULL REFERENCES
+                {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
+            build_token varchar(96) NOT NULL,
+            pin_token varchar(96) NOT NULL,
+            block_hash bytea NOT NULL,
+            lease_until timestamptz NOT NULL,
+            PRIMARY KEY (snapshot_key, pin_token, block_hash)
+        )
+        """,
+        f"""
         CREATE TABLE {schema}.ptg2_v3_snapshot_binding (
             snapshot_id varchar(96) PRIMARY KEY,
             snapshot_key bigint NOT NULL
@@ -118,6 +137,8 @@ async def _create_remaining_shared_tables(connection, schema: str) -> None:
     core_tables = {
         "ptg2_v3_snapshot_layout",
         "ptg2_v3_layout_fingerprint",
+        "ptg2_layout_build_candidate",
+        "ptg2_block_build_pin",
         "ptg2_v3_snapshot_binding",
         "ptg2_v3_snapshot_scope",
         "ptg2_v3_snapshot_plan_scope",

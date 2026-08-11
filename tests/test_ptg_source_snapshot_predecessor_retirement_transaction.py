@@ -21,21 +21,10 @@ from tests.test_ptg_source_snapshot_predecessor_retirement import (
     _snapshot,
     _source_pointer,
 )
-
-
-class _Transaction:
-    def __init__(self):
-        self.session = object()
-        self.entered = 0
-        self.exited = 0
-
-    async def __aenter__(self):
-        self.entered += 1
-        return self.session
-
-    async def __aexit__(self, _exc_type, _exc, _traceback):
-        self.exited += 1
-        return False
+from tests.ptg_source_predecessor_transaction_support import (
+    _Transaction,
+    _projection_queue_fakes,
+)
 
 
 def _request():
@@ -71,8 +60,9 @@ def _install_ordered_operation_fakes(
     decision,
     events,
 ):
-    async def acquire_lock(session):
+    async def acquire_lock(session, *, source_key):
         assert session is transaction.session
+        assert source_key == _coordinates()["source_key"]
         events.append("locked")
 
     async def load_audit(session, **_kwargs):
@@ -128,7 +118,7 @@ def _patch_ordered_operation_fakes(
     monkeypatch.setattr(retirement.db, "transaction", lambda: transaction)
     monkeypatch.setattr(
         retirement,
-        "acquire_ptg2_lifecycle_lock",
+        "acquire_ptg2_source_lifecycle_lock",
         operation_by_name["acquire_lock"],
     )
     monkeypatch.setattr(
@@ -186,6 +176,15 @@ async def test_retirement_locks_validates_mutates_and_audits_atomically(
         decision,
         events,
     )
+    async def mark_projection_dirty(session, **_kwargs):
+        assert session is transaction.session
+        events.append("projection-dirty")
+
+    monkeypatch.setattr(
+        retirement,
+        "mark_legacy_global_projection_dirty",
+        mark_projection_dirty,
+    )
 
     report = await retirement.retire_ptg2_source_predecessor(
         **_coordinates(),
@@ -196,6 +195,7 @@ async def test_retirement_locks_validates_mutates_and_audits_atomically(
 
     assert report["status"] == "retired"
     assert report["idempotent"] is False
+    assert report["global_pointer"] == "reconciled"
     assert events == [
         "locked",
         "audit_loaded",
@@ -204,6 +204,7 @@ async def test_retirement_locks_validates_mutates_and_audits_atomically(
         "mutated",
         "postchecked",
         "audited",
+        "projection-dirty",
     ]
     assert transaction.entered == transaction.exited == 1
 
@@ -218,7 +219,7 @@ async def test_exact_replay_is_write_free_and_key_reuse_conflicts(monkeypatch):
     monkeypatch.setattr(retirement.db, "transaction", lambda: transaction)
     monkeypatch.setattr(
         retirement,
-        "acquire_ptg2_lifecycle_lock",
+        "acquire_ptg2_source_lifecycle_lock",
         AsyncMock(),
     )
     monkeypatch.setattr(
@@ -282,7 +283,7 @@ async def test_stale_conflict_performs_no_mutation_or_audit(monkeypatch):
     monkeypatch.setattr(retirement.db, "transaction", lambda: transaction)
     monkeypatch.setattr(
         retirement,
-        "acquire_ptg2_lifecycle_lock",
+        "acquire_ptg2_source_lifecycle_lock",
         AsyncMock(),
     )
     monkeypatch.setattr(
@@ -403,7 +404,7 @@ def _install_removal_contract_fakes(
     monkeypatch.setattr(retirement.db, "transaction", lambda: transaction)
     monkeypatch.setattr(
         retirement,
-        "acquire_ptg2_lifecycle_lock",
+        "acquire_ptg2_source_lifecycle_lock",
         AsyncMock(),
     )
     monkeypatch.setattr(

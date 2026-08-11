@@ -499,6 +499,33 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
         )
         await database.execute_ddl(
             f"""
+            CREATE TABLE {schema}.ptg2_layout_build_candidate (
+                snapshot_key bigint PRIMARY KEY REFERENCES
+                    {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
+                semantic_fingerprint bytea NOT NULL,
+                cleanup_pending_at timestamptz,
+                canonical_snapshot_key bigint,
+                created_at timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        )
+        await database.execute_ddl(
+            f"""
+            CREATE TABLE {schema}.ptg2_block_build_pin (
+                snapshot_key bigint NOT NULL REFERENCES
+                    {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
+                build_token varchar(96) NOT NULL,
+                pin_token varchar(96) NOT NULL,
+                block_hash bytea NOT NULL,
+                created_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+                heartbeat_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+                lease_until timestamptz NOT NULL,
+                PRIMARY KEY (snapshot_key, pin_token, block_hash)
+            )
+            """
+        )
+        await database.execute_ddl(
+            f"""
             CREATE TABLE {schema}.ptg2_v3_npi_scope (
                 snapshot_key bigint NOT NULL,
                 npi bigint NOT NULL,

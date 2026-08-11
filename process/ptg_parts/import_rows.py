@@ -92,29 +92,9 @@ def _build_provider_set_entry(
     network_names: list[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]] | tuple[None, None]:
     """Build one normalized provider-set entry and metadata row."""
-    group_payloads: list[dict[str, Any]] = []
-    union_npis: set[int] = set()
-    tin_values: set[tuple[str, str]] = set()
-    business_names: list[str] = []
-    for group in provider_groups:
-        tin_info = group.get("tin") or {}
-        normalized_npi = _normalized_npi_list(group.get("npi"))
-        provider_group_hash = _provider_group_identity_hash(tin_info, normalized_npi)
-        tin_type = _normalize_tin_type(tin_info.get("type"))
-        tin_value = _normalize_tin_value(tin_info.get("value"))
-        if tin_type or tin_value:
-            tin_values.add((tin_type, tin_value))
-        if tin_info.get("business_name"):
-            business_names.append(str(tin_info.get("business_name")))
-        union_npis.update(normalized_npi)
-        group_payloads.append(
-            {
-                "provider_group_hash": provider_group_hash,
-                "tin_type": tin_type,
-                "tin_value": tin_value,
-                "npi": normalized_npi,
-            }
-        )
+    group_payloads, union_npis, tin_values, business_names = (
+        _provider_group_summaries(provider_groups)
+    )
     if not group_payloads:
         return None, None
     group_payloads = sorted(group_payloads, key=_canonical_sort_key)
@@ -152,6 +132,33 @@ def _build_provider_set_entry(
         "npi": npi_values,
     }
     return provider_entry_by_field, provider_row_by_field
+
+
+def _provider_group_summaries(provider_groups: list[dict[str, Any]]):
+    group_payloads: list[dict[str, Any]] = []
+    union_npis: set[int] = set()
+    tin_values: set[tuple[str, str]] = set()
+    business_names: list[str] = []
+    for group in provider_groups:
+        tin_info = group.get("tin") or {}
+        normalized_npi = _normalized_npi_list(group.get("npi"))
+        provider_group_hash = _provider_group_identity_hash(tin_info, normalized_npi)
+        tin_type = _normalize_tin_type(tin_info.get("type"))
+        tin_value = _normalize_tin_value(tin_info.get("value"))
+        if tin_type or tin_value:
+            tin_values.add((tin_type, tin_value))
+        if tin_info.get("business_name"):
+            business_names.append(str(tin_info.get("business_name")))
+        union_npis.update(normalized_npi)
+        group_payloads.append(
+            {
+                "provider_group_hash": provider_group_hash,
+                "tin_type": tin_type,
+                "tin_value": tin_value,
+                "npi": normalized_npi,
+            }
+        )
+    return group_payloads, union_npis, tin_values, business_names
 
 
 def _combine_provider_set_entries(

@@ -189,6 +189,28 @@ async def test_v4_tax_stages_are_removed_after_transaction_failure(
     tmp_path,
 ) -> None:
     """A fenced publication failure must not strand token-bearing stages."""
+    status_mock = _install_failing_tax_publication(monkeypatch)
+    with pytest.raises(RuntimeError, match="fenced publication"):
+        await shared_snapshot_publish._publish_v4_dictionaries_and_maps(
+            _failed_tax_stage_compilation(tmp_path),
+            publication_context=shared_snapshot_publish._V4AtomicPublishContext(
+                schema_name="mrf",
+                block_stage="ptg2_v3_block_stage_exact",
+                logical_snapshot_id="synthetic-snapshot",
+                snapshot_key=41,
+                build_token="exact-build",
+            ),
+            compressed_acquisition_bytes=1,
+            empty_npi_tin_only_normalization_count=0,
+        )
+    cleanup_statement = str(status_mock.await_args.args[0])
+    assert "DROP TABLE IF EXISTS" in cleanup_statement
+    assert "ptg2_v4_tax_identity_stage_" in cleanup_statement
+    assert "ptg2_v4_group_tax_identity_stage_" in cleanup_statement
+
+
+def _install_failing_tax_publication(monkeypatch):
+    """Install a fenced V4 tax publication and return cleanup observer."""
 
     @asynccontextmanager
     async def transaction():
@@ -218,28 +240,15 @@ async def test_v4_tax_stages_are_removed_after_transaction_failure(
     )
     monkeypatch.setattr(
         shared_snapshot_publish,
+        "prepare_v4_cas_block_stage",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        shared_snapshot_publish,
         "lock_v4_shared_layout_for_map_write",
         AsyncMock(side_effect=RuntimeError("fenced publication")),
     )
-
-    with pytest.raises(RuntimeError, match="fenced publication"):
-        await shared_snapshot_publish._publish_v4_dictionaries_and_maps(
-            _failed_tax_stage_compilation(tmp_path),
-            publication_context=shared_snapshot_publish._V4AtomicPublishContext(
-                schema_name="mrf",
-                block_stage="ptg2_v3_block_stage_exact",
-                logical_snapshot_id="synthetic-snapshot",
-                snapshot_key=41,
-                build_token="exact-build",
-            ),
-            compressed_acquisition_bytes=1,
-            empty_npi_tin_only_normalization_count=0,
-        )
-
-    cleanup_statement = str(status_mock.await_args.args[0])
-    assert "DROP TABLE IF EXISTS" in cleanup_statement
-    assert "ptg2_v4_tax_identity_stage_" in cleanup_statement
-    assert "ptg2_v4_group_tax_identity_stage_" in cleanup_statement
+    return status_mock
 
 
 @pytest.mark.asyncio

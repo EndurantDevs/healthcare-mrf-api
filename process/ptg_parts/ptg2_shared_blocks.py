@@ -14,6 +14,16 @@ from typing import Any, Iterable, Mapping, Sequence
 from sqlalchemy import text
 
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_layout_candidate import (
+    acquire_layout_digest_lock,
+    delete_layout_build_candidate,
+    insert_layout_build_candidate,
+    mark_layout_build_candidate_cleanup_pending,
+    publish_layout_fingerprint,
+)
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    acquire_ptg2_source_lifecycle_lock,
+)
 from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     lock_writable_snapshot,
 )
@@ -940,9 +950,9 @@ async def reserve_shared_layout(
 
     schema = _quote_ident(schema_name)
     fingerprint = bytes(semantic_fingerprint)
-    await session.execute(
-        text("SELECT pg_advisory_xact_lock(:lock_key)"),
-        {"lock_key": _advisory_lock_key(fingerprint)},
+    await acquire_ptg2_source_lifecycle_lock(
+        session,
+        source_key=f"layout_{build_token}",
     )
     existing_result = await session.execute(
         text(
@@ -954,7 +964,6 @@ async def reserve_shared_layout(
                 ON layout.snapshot_key = fingerprint.snapshot_key
              WHERE fingerprint.semantic_fingerprint = :semantic_fingerprint
              LIMIT 1
-             FOR UPDATE OF layout
             """
         ),
         {"semantic_fingerprint": fingerprint},
@@ -992,7 +1001,31 @@ async def reserve_shared_layout(
             and existing.get("build_token") == str(build_token)
         ):
             return SharedLayoutReservation(int(existing["snapshot_key"]), False, None)
-        raise RuntimeError("matching shared PTG layout is already building or uses another generation")
+    candidate_result = await session.execute(
+        text(
+            f"""
+            SELECT layout.snapshot_key
+              FROM {schema}.ptg2_layout_build_candidate AS candidate
+              JOIN {schema}.ptg2_v3_snapshot_layout AS layout
+                ON layout.snapshot_key = candidate.snapshot_key
+             WHERE candidate.semantic_fingerprint = :semantic_fingerprint
+               AND candidate.cleanup_pending_at IS NULL
+               AND layout.generation = :generation
+               AND layout.state = 'building'
+               AND layout.build_token = :build_token
+             LIMIT 1
+             FOR UPDATE OF layout
+            """
+        ),
+        {
+            "semantic_fingerprint": fingerprint,
+            "generation": PTG2_V3_SHARED_GENERATION,
+            "build_token": str(build_token),
+        },
+    )
+    existing_candidate_key = candidate_result.scalar()
+    if existing_candidate_key is not None:
+        return SharedLayoutReservation(int(existing_candidate_key), False, None)
     reservation_result = await session.execute(
         text(
             f"""
@@ -1017,20 +1050,11 @@ async def reserve_shared_layout(
     snapshot_key = reservation_result.scalar()
     if snapshot_key is None:
         raise RuntimeError("shared PTG layout reservation did not return a key")
-    await session.execute(
-        text(
-            f"""
-            INSERT INTO {schema}.ptg2_v3_layout_fingerprint
-                (semantic_fingerprint, snapshot_key, created_at)
-            VALUES
-                (:semantic_fingerprint, :snapshot_key, :created_at)
-            """
-        ),
-        {
-            "semantic_fingerprint": fingerprint,
-            "snapshot_key": int(snapshot_key),
-            "created_at": _utcnow(),
-        },
+    await insert_layout_build_candidate(
+        session,
+        schema_name=schema_name,
+        snapshot_key=int(snapshot_key),
+        semantic_fingerprint=fingerprint,
     )
     return SharedLayoutReservation(int(snapshot_key), False, None)
 
@@ -1185,6 +1209,10 @@ async def seal_shared_layout(
         )
     )
     schema = _quote_ident(schema_name)
+    await acquire_ptg2_source_lifecycle_lock(
+        session,
+        source_key=f"layout_{build_token}",
+    )
     owner_result = await session.execute(
         text(
             f"""
@@ -1229,9 +1257,10 @@ async def seal_shared_layout(
     expected_digest = bytes(expected_summary.mapping_digest)
     if len(expected_digest) != 32:
         raise RuntimeError("shared PTG mapping summary digest must contain 32 bytes")
-    await session.execute(
-        text("SELECT pg_advisory_xact_lock(:lock_key)"),
-        {"lock_key": _advisory_lock_key(expected_digest)},
+    await acquire_layout_digest_lock(
+        session,
+        digest=expected_digest,
+        purpose="mapping digest",
     )
     reusable_result = await session.execute(
         text(
@@ -1273,39 +1302,26 @@ async def seal_shared_layout(
                 "lease_until": _lease_deadline(sealed=True),
             },
         )
-        await session.execute(
-            text(
-                f"""
-                UPDATE {schema}.ptg2_v3_layout_fingerprint
-                   SET snapshot_key = :reusable_snapshot_key
-                 WHERE snapshot_key = :snapshot_key
-                """
-            ),
-            {
-                "reusable_snapshot_key": int(reusable_snapshot_key),
-                "snapshot_key": int(snapshot_key),
-            },
-        )
-        await delete_shared_layout_dense_rows(
+        canonical_snapshot_key = await publish_layout_fingerprint(
             session,
             schema_name=schema_name,
             snapshot_key=int(snapshot_key),
+            canonical_snapshot_key=int(reusable_snapshot_key),
+            generation=PTG2_V3_SHARED_GENERATION,
+            mapping_digest=expected_digest,
+            support_digest=normalized_support_digest,
         )
-        await session.execute(
-            text(
-                f"""
-                DELETE FROM {schema}.ptg2_v3_snapshot_layout
-                 WHERE snapshot_key = :snapshot_key
-                   AND state = 'building'
-                   AND build_token = :build_token
-                """
-            ),
-            {
-                "snapshot_key": int(snapshot_key),
-                "build_token": str(build_token),
-            },
+        await mark_layout_build_candidate_cleanup_pending(
+            session,
+            schema_name=schema_name,
+            snapshot_key=int(snapshot_key),
+            canonical_snapshot_key=int(canonical_snapshot_key),
         )
-        return SealedSharedLayout(int(reusable_snapshot_key), expected_digest, True)
+        return SealedSharedLayout(
+            int(canonical_snapshot_key),
+            expected_digest,
+            True,
+        )
     update_result = await session.execute(
         text(
             f"""
@@ -1344,7 +1360,25 @@ async def seal_shared_layout(
     )
     if update_result.scalar() is None:
         raise RuntimeError("shared PTG layout was not in the expected building generation")
-    return SealedSharedLayout(int(snapshot_key), expected_digest, False)
+    canonical_snapshot_key = await publish_layout_fingerprint(
+        session,
+        schema_name=schema_name,
+        snapshot_key=int(snapshot_key),
+        canonical_snapshot_key=int(snapshot_key),
+        generation=PTG2_V3_SHARED_GENERATION,
+        mapping_digest=expected_digest,
+        support_digest=normalized_support_digest,
+    )
+    await delete_layout_build_candidate(
+        session,
+        schema_name=schema_name,
+        snapshot_key=int(snapshot_key),
+    )
+    return SealedSharedLayout(
+        int(canonical_snapshot_key),
+        expected_digest,
+        canonical_snapshot_key != int(snapshot_key),
+    )
 
 
 async def bind_snapshot_to_shared_layout(

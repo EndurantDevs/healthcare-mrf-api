@@ -6,7 +6,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from process.ptg_parts import source_pointers, source_snapshot_control
+from process.ptg_parts import (
+    ptg2_lifecycle_lock,
+    source_pointers,
+    source_snapshot_control,
+)
+from tests.ptg_source_snapshot_control_assertions import (
+    assert_source_snapshot_remove_results as _assert_source_snapshot_remove_results,
+)
 
 
 class _RecordingTransaction:
@@ -271,58 +278,6 @@ def test_source_snapshot_remove_plan_accepts_v4_manifest(monkeypatch):
     assert plan["artifact_manifest_ids"] == ["artifact_v4"]
 
 
-def _assert_source_snapshot_remove_results(
-    cleanup_summary,
-    transaction_statements,
-    status_calls,
-) -> None:
-    assert cleanup_summary["executed"] is True
-    assert cleanup_summary["deleted_tables"] == 0
-    assert cleanup_summary["deleted_v3_snapshot_scopes"] == 0
-    assert cleanup_summary["deleted_v3_snapshot_bindings"] == 0
-    assert cleanup_summary["deleted_artifact_chunks"] == 1
-    assert cleanup_summary["deleted_artifact_manifests"] == 1
-    assert cleanup_summary["deleted_snapshots"] == 1
-    assert cleanup_summary["released_shared_layouts"] == 0
-    assert cleanup_summary["queued_shared_block_candidates"] == 0
-    assert cleanup_summary["queued_shared_block_bytes"] == 0
-    assert cleanup_summary["layout_cleanup"] == "not_applicable"
-    assert cleanup_summary["physical_cleanup"] == "not_applicable"
-    assert transaction_statements == [
-        (
-            "SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))",
-            {"publish_lock_key": source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY},
-        )
-    ]
-    assert any("ptg2_artifact_blob_chunk" in call[0] for call in status_calls)
-    assert any(
-        "ptg2_artifact_manifest" in call[0]
-        and call[1]["snapshot_id"] == "snap_old"
-        for call in status_calls
-    )
-    assert any(
-        "ptg2_snapshot" in call[0]
-        and call[1]["snapshot_id"] == "snap_old"
-        for call in status_calls
-    )
-    scope_delete_index = next(
-        index
-        for index, call in enumerate(status_calls)
-        if "ptg2_v3_snapshot_scope" in call[0]
-    )
-    binding_delete_index = next(
-        index
-        for index, call in enumerate(status_calls)
-        if "ptg2_v3_snapshot_binding" in call[0]
-    )
-    snapshot_delete_index = next(
-        index
-        for index, call in enumerate(status_calls)
-        if 'DELETE FROM "mrf".ptg2_snapshot WHERE' in call[0]
-    )
-    assert scope_delete_index < binding_delete_index < snapshot_delete_index
-
-
 def test_remove_ptg2_source_snapshot_deletes_only_v3_metadata(monkeypatch):
     """Verify remove ptg2 source snapshot deletes only v3 metadata."""
     status_calls = []
@@ -391,9 +346,23 @@ def _assert_source_snapshot_retirement_results(
     assert retire_summary["current_references"]["source_keys"] == []
     assert transaction_statements == [
         (
-            "SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))",
-            {"publish_lock_key": source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY},
-        )
+            "SELECT set_config('lock_timeout', :lock_timeout, true), "
+            "set_config('statement_timeout', :statement_timeout, true)",
+            {
+                "lock_timeout": ptg2_lifecycle_lock.PTG2_LIFECYCLE_LOCK_TIMEOUT,
+                "statement_timeout": (
+                    ptg2_lifecycle_lock.PTG2_LIFECYCLE_STATEMENT_TIMEOUT
+                ),
+            },
+        ),
+        (
+            "SELECT pg_advisory_xact_lock(hashtext(:gc_lock_key))",
+            {
+                "gc_lock_key": (
+                    ptg2_lifecycle_lock.PTG2_SOURCE_POINTER_GC_LOCK_KEY
+                )
+            },
+        ),
     ]
     assert len(status_calls) == 2
     assert all(

@@ -8,7 +8,6 @@ transient publish inputs unless local retention is explicitly enabled.
 from __future__ import annotations
 
 import datetime
-import hashlib
 import json
 import os
 import zlib
@@ -21,6 +20,10 @@ from db.connection import db
 from process.ptg_parts.artifacts import resolve_ptg2_artifact_dir, sha256_file
 from process.ptg_parts.canonical import semantic_hash
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_artifact_blob_stream import (
+    _row_mapping,
+    stream_artifact_chunks,
+)
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     lock_writable_snapshot,
@@ -98,41 +101,6 @@ def ptg2_artifact_id_from_uri(uri: str) -> str | None:
 ptg2_artifact_id_from_db_uri = ptg2_artifact_id_from_uri
 
 
-def _row_mapping(row: Any) -> dict[str, Any]:
-    mapping = getattr(row, "_mapping", None)
-    if mapping is not None:
-        return dict(mapping)
-    if isinstance(row, dict):
-        return dict(row)
-    return dict(row)
-
-
-async def ensure_ptg2_artifact_blob_table(schema_name: str | None = None) -> None:
-    """Create the PTG2 artifact chunk table and lookup index when absent."""
-    schema = resolve_ptg2_schema(schema_name)
-    qualified_table = f"{_quote_ident(schema)}.ptg2_artifact_blob_chunk"
-    await db.status(
-        f"""
-        CREATE TABLE IF NOT EXISTS {qualified_table} (
-            artifact_id varchar(96) NOT NULL,
-            chunk_no integer NOT NULL,
-            compression varchar(32),
-            payload bytea NOT NULL,
-            raw_byte_count integer NOT NULL,
-            byte_count integer NOT NULL,
-            created_at timestamp,
-            PRIMARY KEY (artifact_id, chunk_no)
-        );
-        """
-    )
-    await db.status(
-        f"""
-        CREATE INDEX IF NOT EXISTS ptg2_artifact_blob_artifact_idx
-        ON {qualified_table} (artifact_id);
-        """
-    )
-
-
 async def delete_ptg2_artifacts_for_snapshot(
     snapshot_id: str,
     *,
@@ -155,7 +123,6 @@ async def delete_ptg2_artifacts_for_snapshot(
             snapshot_id=snapshot_id,
             internal_run_id=import_run_id,
         )
-        await ensure_ptg2_artifact_blob_table(schema)
         await session.execute(
             text(
                 f"""
@@ -271,7 +238,6 @@ async def store_ptg2_artifact_file(
                 snapshot_id=snapshot_id or "",
                 internal_run_id=import_run_id,
             )
-        await ensure_ptg2_artifact_blob_table(schema)
         await session.execute(
             text(f"DELETE FROM {qualified_chunks} WHERE artifact_id = :artifact_id"),
             {"artifact_id": artifact_id},
@@ -414,38 +380,13 @@ async def materialize_ptg2_artifact_from_db(
     qualified_chunks = f"{_quote_ident(schema)}.ptg2_artifact_blob_chunk"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = cache_path.with_name(f"{cache_path.name}.tmp.{os.getpid()}")
-    digest = hashlib.sha256()
-    total_raw_bytes = 0
-    chunk_count = 0
     try:
-        with tmp_path.open("wb") as out:
-            chunk_stream = await session.stream(
-                text(
-                    f"""
-                    SELECT chunk_no, compression, payload, raw_byte_count
-                      FROM {qualified_chunks}
-                     WHERE artifact_id = :artifact_id
-                     ORDER BY chunk_no
-                    """
-                ),
-                {"artifact_id": artifact_id},
-            )
-            async for chunk_row in chunk_stream:
-                chunk_record_map = _row_mapping(chunk_row)
-                compression = str(chunk_record_map.get("compression") or "none")
-                stored_chunk_bytes = bytes(chunk_record_map.get("payload") or b"")
-                raw_chunk = (
-                    zlib.decompress(stored_chunk_bytes)
-                    if compression == "zlib"
-                    else stored_chunk_bytes
-                )
-                expected_raw = chunk_record_map.get("raw_byte_count")
-                if expected_raw is not None and len(raw_chunk) != int(expected_raw):
-                    raise ValueError(f"artifact chunk raw byte_count mismatch for {artifact_id}:{chunk_count}")
-                out.write(raw_chunk)
-                digest.update(raw_chunk)
-                total_raw_bytes += len(raw_chunk)
-                chunk_count += 1
+        digest, total_raw_bytes, chunk_count = await stream_artifact_chunks(
+            session,
+            qualified_chunks,
+            artifact_id,
+            tmp_path,
+        )
         if chunk_count <= 0:
             raise FileNotFoundError(f"PTG2 artifact has no PostgreSQL chunks: {artifact_id}")
         expected_byte_count = (metadata or {}).get("byte_count")
@@ -462,8 +403,6 @@ async def materialize_ptg2_artifact_from_db(
         tmp_path.unlink(missing_ok=True)
         raise
     return cache_path
-
-
 async def hydrate_ptg2_artifact_entry(
     session,
     entry: Mapping[str, Any],

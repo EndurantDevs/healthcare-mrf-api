@@ -44,7 +44,8 @@ async def _assert_retired_state(
     assert report["status"] == "retired"
     assert report["cleared_source_pointer_count"] == 1
     assert report["cleared_plan_pointer_count"] == 2
-    assert report["cleared_global_pointer_count"] == 1
+    assert report["cleared_global_pointer_count"] == 0
+    assert report["global_pointer"] == "reconciled"
     assert report["deleted_rollback_pin_count"] == 1
     for table in POINTER_TABLES:
         assert all(

@@ -315,8 +315,9 @@ async def test_serving_stage_ensure_tolerates_optional_ddl_failures(
     await table_setup._ensure_ptg2_serving_rate_stage_table("candidate_schema")
 
     assert transaction_events[0] == "BEGIN"
-    assert "pg_advisory_xact_lock" in transaction_events[1]
-    assert "CREATE UNLOGGED TABLE" in transaction_events[2]
+    assert "set_config('lock_timeout'" in transaction_events[1]
+    assert "pg_advisory_xact_lock" in transaction_events[2]
+    assert "CREATE UNLOGGED TABLE" in transaction_events[3]
     assert transaction_events[-1] == "COMMIT"
     assert any("CREATE UNLOGGED TABLE" in statement for statement in seen_statements)
     assert any("ADD COLUMN IF NOT EXISTS confidence" in statement for statement in seen_statements)
@@ -366,8 +367,9 @@ async def test_stage_ddl_acquires_lifecycle_lock_before_locked_helper(
     await getattr(table_setup, entrypoint_name)("candidate_schema")
 
     assert events[0] == "BEGIN"
-    assert "pg_advisory_xact_lock" in events[1]
-    assert events[2:] == ["DDL:candidate_schema", "COMMIT"]
+    assert "set_config('lock_timeout'" in events[1]
+    assert "pg_advisory_xact_lock" in events[2]
+    assert events[3:] == ["DDL:candidate_schema", "COMMIT"]
 
 
 def test_ptg_helpers_cover_money_and_lean_source_guard(

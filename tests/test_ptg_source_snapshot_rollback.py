@@ -4,160 +4,45 @@ from __future__ import annotations
 
 import datetime
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from process.ptg_parts import source_snapshot_rollback as rollback
-from process.ptg_parts import source_snapshot_rollback_state as rollback_state
 from process.ptg_parts.source_snapshot_rollback_types import (
     PTG2SourceSnapshotRollbackConflict,
-    RollbackContext,
-    RollbackDecision,
+)
+from tests.ptg_source_snapshot_rollback_unit_support import (
+    CURRENT_SNAPSHOT,
+    IMPORT_MONTH,
+    ROLLBACK_OWNER,
+    SOURCE_KEY,
+    TARGET_SNAPSHOT,
+    activated_attestation as _activated_attestation,
+    allowed_index as _allowed_index,
+    context as _context,
+    decision as _decision,
+    expected_snapshot as _expected_snapshot,
+    live_plan_pointer as _live_plan_pointer,
+    pin as _pin,
+    serving_manifest as _serving_manifest,
+    snapshot_scope as _snapshot_scope,
+    target_snapshot as _target_snapshot,
 )
 
 
-SOURCE_KEY = "source_a"
-TARGET_SNAPSHOT = "snapshot_a"
-CURRENT_SNAPSHOT = "snapshot_b"
-ROLLBACK_OWNER = "source-a-reference"
-IMPORT_MONTH = datetime.date(2026, 7, 1)
-
-
-def _serving_manifest(*, source_key: str = SOURCE_KEY) -> dict:
-    return {
-        "serving_index": {
-            "source_key": source_key,
-            "arch_version": "postgres_binary_v3",
-            "storage_generation": "shared_blocks_v3",
-        }
-    }
-
-
-def _allowed_index(*, previous_snapshot_id: str | None) -> dict:
-    return {
-        "contract": "ptg2_allowed_amounts_v1",
-        "arch_version": "postgres_binary_v3",
-        "storage": "postgresql",
-        "data_domain": "allowed_amounts",
-        "source_key": SOURCE_KEY,
-        "current_source_key": "source_a_allowed_amounts",
-        "snapshot_scoped": True,
-        "previous_snapshot_id": previous_snapshot_id,
-    }
-
-
-def _target_snapshot() -> dict:
-    return {
-        "snapshot_id": TARGET_SNAPSHOT,
-        "status": "published",
-        "published_at": datetime.datetime(2026, 7, 1, 1, 0),
-        "import_month": IMPORT_MONTH,
-        "manifest": _serving_manifest(),
-        "snapshot_key": 17,
-        "layout_state": "sealed",
-        "layout_generation": "shared_blocks_v3",
-        "mapping_digest": b"m" * 32,
-        "support_digest": b"s" * 32,
-    }
-
-
-def _expected_snapshot(*, allowed_predecessor: object = ...) -> dict:
-    manifest = _serving_manifest()
-    if allowed_predecessor is not ...:
-        manifest["allowed_amount_index"] = _allowed_index(
-            previous_snapshot_id=allowed_predecessor,
-        )
-    return {
-        "snapshot_id": CURRENT_SNAPSHOT,
-        "status": "published",
-        "manifest": manifest,
-    }
-
-
-def _pin(*, owner_id: str = ROLLBACK_OWNER) -> dict:
-    return {
-        "owner_type": "ptg_v4_rollback",
-        "owner_id": owner_id,
-        "snapshot_id": TARGET_SNAPSHOT,
-        "reason": "retained rollback reference",
-    }
-
-
-def _snapshot_scope() -> dict:
-    return {
-        "snapshot_id": TARGET_SNAPSHOT,
-        "plan_id": "plan-1",
-        "plan_market_type": "group",
-        "coverage_scope_id": b"c" * 32,
-    }
-
-
-def _activated_attestation(**overrides) -> dict:
-    attestation_by_field = {
-        **_snapshot_scope(),
-        "snapshot_key": 17,
-        "source_key": SOURCE_KEY,
-        "contract": "ptg2_v3_release_audit_attestation_v3",
-        "activated_at": datetime.datetime(2026, 7, 1, 1, tzinfo=datetime.UTC),
-    }
-    attestation_by_field.update(overrides)
-    return attestation_by_field
-
-
-def _live_plan_pointer(
-    *,
-    snapshot_id: str = CURRENT_SNAPSHOT,
-    previous_snapshot_id: str = TARGET_SNAPSHOT,
-) -> dict:
-    return {
-        "plan_source_key": "current-plan-key",
-        "plan_id": "plan-1",
-        "plan_market_type": "group",
-        "import_month": IMPORT_MONTH,
-        "source_key": SOURCE_KEY,
-        "snapshot_id": snapshot_id,
-        "previous_snapshot_id": previous_snapshot_id,
-    }
-
-
-def _context(**overrides) -> RollbackContext:
-    context_by_field = {
-        "source_pointer_by_field": {
-            "source_key": SOURCE_KEY,
-            "snapshot_id": CURRENT_SNAPSHOT,
-            "previous_snapshot_id": TARGET_SNAPSHOT,
-            "import_month": IMPORT_MONTH,
-        },
-        "target_snapshot_by_field": _target_snapshot(),
-        "expected_snapshot_by_field": _expected_snapshot(),
-        "rollback_pin_by_field": _pin(),
-        "target_snapshot_scope_by_field": _snapshot_scope(),
-        "target_attestation_by_field": _activated_attestation(),
-        "target_plan_scope_records": (
-            {"plan_id": "plan-1", "plan_market_type": "group"},
-        ),
-        "source_plan_pointer_records": (_live_plan_pointer(),),
-        "global_pointer_by_field": {
-            "snapshot_id": CURRENT_SNAPSHOT,
-            "previous_snapshot_id": TARGET_SNAPSHOT,
-            "source_key": SOURCE_KEY,
-        },
-        "allowed_pointer_by_field": {},
-    }
-    context_by_field.update(overrides)
-    return RollbackContext(**context_by_field)
-
-
-def _decision(
-    context: RollbackContext,
-) -> RollbackDecision:
-    return rollback_state.rollback_decision(
-        context,
-        source_key=SOURCE_KEY,
-        snapshot_id=TARGET_SNAPSHOT,
-        expected_current_snapshot_id=CURRENT_SNAPSHOT,
-        rollback_owner_id=ROLLBACK_OWNER,
+@pytest.fixture(autouse=True)
+def _projection_queue_fakes(monkeypatch):
+    monkeypatch.setattr(
+        rollback,
+        "mark_legacy_global_projection_dirty",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        rollback,
+        "drain_legacy_global_projection_queue",
+        AsyncMock(return_value=SimpleNamespace(reconciled=1)),
     )
 
 
@@ -406,16 +291,17 @@ class _Transaction:
         return False
 
 
-@pytest.mark.asyncio
-async def test_rollback_runs_lock_validation_and_pointer_updates_in_one_transaction(
+def _install_atomic_rollback_fakes(
     monkeypatch,
-):
-    transaction = _Transaction()
-    events = []
-    context = _context()
+    transaction,
+    context,
+    events,
+) -> None:
+    """Install transaction-bound rollback operations with ordered evidence."""
 
-    async def acquire_lifecycle_lock(session):
+    async def acquire_lifecycle_lock(session, *, source_key):
         assert session is transaction.session
+        assert source_key == SOURCE_KEY
         events.append("locked")
 
     async def load_context(session, **_kwargs):
@@ -433,15 +319,37 @@ async def test_rollback_runs_lock_validation_and_pointer_updates_in_one_transact
         assert kwargs["decision"].should_reverse_global_pointer is True
         events.append("applied")
 
+    async def mark_projection_dirty(session, **_kwargs):
+        assert session is transaction.session
+        events.append("projection-dirty")
+
     monkeypatch.setattr(rollback.db, "transaction", lambda: transaction)
-    monkeypatch.setattr(
-        rollback,
-        "acquire_ptg2_lifecycle_lock",
-        acquire_lifecycle_lock,
+    collaborator_by_name = {
+        "acquire_ptg2_source_lifecycle_lock": acquire_lifecycle_lock,
+        "load_rollback_context": load_context,
+        "database_utc_timestamp": load_timestamp,
+        "apply_rollback": apply_pointer_changes,
+        "mark_legacy_global_projection_dirty": mark_projection_dirty,
+    }
+    for collaborator_name, collaborator in collaborator_by_name.items():
+        monkeypatch.setattr(rollback, collaborator_name, collaborator)
+
+
+@pytest.mark.asyncio
+async def test_rollback_runs_lock_validation_and_pointer_updates_in_one_transaction(
+    monkeypatch,
+):
+    """Keep lock, validation, pointer writes, and dirty mark in one transaction."""
+
+    transaction = _Transaction()
+    events = []
+    context = _context()
+    _install_atomic_rollback_fakes(
+        monkeypatch,
+        transaction,
+        context,
+        events,
     )
-    monkeypatch.setattr(rollback, "load_rollback_context", load_context)
-    monkeypatch.setattr(rollback, "database_utc_timestamp", load_timestamp)
-    monkeypatch.setattr(rollback, "apply_rollback", apply_pointer_changes)
 
     rollback_report = await rollback.rollback_pinned_ptg2_source_snapshot(
         source_key=SOURCE_KEY,
@@ -453,7 +361,10 @@ async def test_rollback_runs_lock_validation_and_pointer_updates_in_one_transact
     assert rollback_report["status"] == "rolled_back"
     assert rollback_report["idempotent"] is False
     assert rollback_report["rollback_owner_id"] == ROLLBACK_OWNER
-    assert events == ["locked", "loaded", "timestamped", "applied"]
+    assert rollback_report["global_pointer"] == "reconciled"
+    assert events == [
+        "locked", "loaded", "timestamped", "applied", "projection-dirty"
+    ]
     assert transaction.entered == transaction.exited == 1
 
 
@@ -477,7 +388,7 @@ async def test_rollback_exact_retry_performs_no_pointer_writes(monkeypatch):
     monkeypatch.setattr(rollback.db, "transaction", lambda: transaction)
     monkeypatch.setattr(
         rollback,
-        "acquire_ptg2_lifecycle_lock",
+        "acquire_ptg2_source_lifecycle_lock",
         AsyncMock(),
     )
     monkeypatch.setattr(

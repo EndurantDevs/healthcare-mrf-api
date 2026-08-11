@@ -103,6 +103,14 @@ MIGRATION_PATHS = (
     / "alembic"
     / "versions"
     / "20260724100000_ptg2_v4_attempt_fence.py",
+    ROOT
+    / "alembic"
+    / "versions"
+    / "20260810120000_ptg2_layout_build_candidates.py",
+    ROOT
+    / "alembic"
+    / "versions"
+    / "20260810130000_ptg2_block_build_pins.py",
 )
 SCANNER_TEST_PATH = Path(__file__).with_name("test_ptg2_scanner_v3_runs.py")
 SERVING_RECORD = struct.Struct(">16s16s16sI")
@@ -274,8 +282,28 @@ async def _create_shared_schema(schema_name: str) -> None:
 
 
 async def _create_selective_block_schema(schema_name: str) -> None:
+    """Create the selective shared-block PostgreSQL fixture schema."""
     quoted_schema = '"' + schema_name.replace('"', '""') + '"'
     await db.execute_ddl(f"CREATE SCHEMA {quoted_schema}")
+    await _create_selective_block_and_layout_tables(quoted_schema)
+    await _create_selective_pin_and_mapping_tables(quoted_schema)
+    fixture_tables = {
+        "ptg2_v3_snapshot_layout",
+        "ptg2_v3_block",
+        "ptg2_v3_snapshot_block",
+        "ptg2_v3_gc_candidate",
+        "ptg2_block_build_pin",
+    }
+    for table_name in (
+        set(ptg2_shared_gc.PTG2_V3_MIGRATION_OWNED_TABLE_NAMES)
+        - fixture_tables
+    ):
+        await db.execute_ddl(
+            f'CREATE TABLE {quoted_schema}."{table_name}" (snapshot_key bigint)'
+        )
+
+
+async def _create_selective_block_and_layout_tables(quoted_schema: str) -> None:
     await db.execute_ddl(
         f"""
         CREATE TABLE {quoted_schema}.ptg2_v3_block (
@@ -288,6 +316,34 @@ async def _create_selective_block_schema(schema_name: str) -> None:
             stored_byte_count bigint NOT NULL,
             payload bytea NOT NULL,
             created_at timestamp with time zone NOT NULL
+        )
+        """
+    )
+    await db.execute_ddl(
+        f"""
+        CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_layout (
+            snapshot_key bigint PRIMARY KEY,
+            generation varchar(32) NOT NULL,
+            state varchar(16) NOT NULL,
+            build_token varchar(96) NOT NULL
+        )
+        """
+    )
+
+
+async def _create_selective_pin_and_mapping_tables(quoted_schema: str) -> None:
+    await db.execute_ddl(
+        f"""
+        CREATE TABLE {quoted_schema}.ptg2_block_build_pin (
+            snapshot_key bigint NOT NULL REFERENCES
+                {quoted_schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
+            build_token varchar(96) NOT NULL,
+            pin_token varchar(96) NOT NULL,
+            block_hash bytea NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+            heartbeat_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+            lease_until timestamptz NOT NULL,
+            PRIMARY KEY (snapshot_key, pin_token, block_hash)
         )
         """
     )
@@ -318,18 +374,6 @@ async def _create_selective_block_schema(schema_name: str) -> None:
         )
         """
     )
-    fixture_tables = {
-        "ptg2_v3_block",
-        "ptg2_v3_snapshot_block",
-        "ptg2_v3_gc_candidate",
-    }
-    for table_name in (
-        set(ptg2_shared_gc.PTG2_V3_MIGRATION_OWNED_TABLE_NAMES)
-        - fixture_tables
-    ):
-        await db.execute_ddl(
-            f'CREATE TABLE {quoted_schema}."{table_name}" (snapshot_key bigint)'
-        )
 
 
 async def _insert_selective_durable_block(
@@ -454,12 +498,29 @@ async def _stage_null_reuses_before_payload(schema_name: str) -> bytes:
 
 @asynccontextmanager
 async def _selective_block_database(monkeypatch):
+    """Build the disposable database used by selective block tests."""
     schema_name = f"ptg2_selective_{uuid.uuid4().hex[:16]}"
     quoted_schema = '"' + schema_name + '"'
     monkeypatch.setattr(
         ptg2_shared_publish,
         "lock_shared_layout_for_dense_write",
         AsyncMock(),
+    )
+    prepare_v4_cas = ptg2_shared_publish.prepare_v4_cas_block_stage
+    prepare_shared_cas = ptg2_shared_publish.prepare_shared_cas_block_stage
+    prepare_owned_v4_cas, prepare_owned_shared_cas = _owned_cas_preparers(
+        prepare_v4_cas,
+        prepare_shared_cas,
+    )
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "prepare_v4_cas_block_stage",
+        prepare_owned_v4_cas,
+    )
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "prepare_shared_cas_block_stage",
+        prepare_owned_shared_cas,
     )
     await db.disconnect()
     await db.connect()
@@ -469,6 +530,47 @@ async def _selective_block_database(monkeypatch):
     finally:
         await db.status(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
         await db.disconnect()
+
+
+def _owned_cas_preparers(prepare_v4_cas, prepare_shared_cas):
+    """Wrap CAS preparation with deterministic layout ownership rows."""
+
+    async def prepare_owned_shared_cas(**kwargs):
+        schema = '"' + kwargs["schema_name"].replace('"', '""') + '"'
+        await db.status(
+            f"""
+            INSERT INTO {schema}.ptg2_v3_snapshot_layout
+                (snapshot_key, generation, state, build_token)
+            VALUES (:snapshot_key, :generation, 'building', :build_token)
+            ON CONFLICT (snapshot_key) DO UPDATE
+                SET generation = EXCLUDED.generation,
+                    state = EXCLUDED.state,
+                    build_token = EXCLUDED.build_token
+            """,
+            snapshot_key=int(kwargs["snapshot_key"]),
+            generation=str(kwargs["expected_generation"]),
+            build_token=str(kwargs["build_token"]),
+        )
+        return await prepare_shared_cas(**kwargs)
+
+    async def prepare_owned_v4_cas(**kwargs):
+        schema = '"' + kwargs["schema_name"].replace('"', '""') + '"'
+        await db.status(
+            f"""
+            INSERT INTO {schema}.ptg2_v3_snapshot_layout
+                (snapshot_key, generation, state, build_token)
+            VALUES (:snapshot_key, 'shared_blocks_v4', 'building', :build_token)
+            ON CONFLICT (snapshot_key) DO UPDATE
+                SET generation = EXCLUDED.generation,
+                    state = EXCLUDED.state,
+                    build_token = EXCLUDED.build_token
+            """,
+            snapshot_key=int(kwargs["snapshot_key"]),
+            build_token=str(kwargs["build_token"]),
+        )
+        return await prepare_v4_cas(**kwargs)
+
+    return prepare_owned_v4_cas, prepare_owned_shared_cas
 
 
 async def _publish_rebuild_scope_proof_layout(
@@ -945,9 +1047,8 @@ async def test_real_postgres_batched_shared_publish_orders_payload_before_reuses
         assert publication.mapping_count == 4097
         assert publication.unique_block_count == 1
         assert progress_events == [
-            ("reuse_inventory_batches", 1),
-            ("reuse_inventory_batches", 1),
-            ("reuse_protection_batches", 1),
+            ("block_pin_batches", 1),
+            ("durable_cas_batches", 1),
             ("sql_stage_rows", 1),
             ("publish_batches", 1),
             ("sql_stage_rows", 4096),
@@ -967,7 +1068,7 @@ async def test_real_postgres_batched_shared_publish_orders_payload_before_reuses
 async def test_real_postgres_batched_v4_cas_orders_payload_before_reuses(
     monkeypatch,
 ):
-    """The V4 CAS publisher uses the same bounded payload-first contract."""
+    """V4 pins and commits CAS before bounded lock-free validation."""
 
     if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
         pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
@@ -997,9 +1098,8 @@ async def test_real_postgres_batched_v4_cas_orders_payload_before_reuses(
         assert publication.staged_row_count == 4097
         assert publication.unique_block_count == 1
         assert progress_events == [
-            ("reuse_inventory_batches", 1),
-            ("reuse_inventory_batches", 1),
-            ("reuse_protection_batches", 1),
+            ("block_pin_batches", 1),
+            ("durable_cas_batches", 1),
             ("sql_stage_rows", 1),
             ("publish_batches", 1),
             ("sql_stage_rows", 4096),
@@ -1196,62 +1296,46 @@ async def test_real_postgres_selective_copy_fails_if_reused_block_disappears(
         ) == 0
 
 
-def _hold_shared_mapping_upsert(monkeypatch):
-    """Pause mapping after block protection and return its two events."""
+def _hold_shared_mapping_attach(monkeypatch):
+    """Pause snapshot-local mapping after durable pins and CAS are ready."""
 
     mapping_started = asyncio.Event()
     allow_mapping = asyncio.Event()
-    original_mapping_upsert = ptg2_shared_publish._upsert_shared_block_mappings
+    original_mapping_attach = (
+        ptg2_shared_publish._publish_shared_block_stage_batched
+    )
 
-    async def held_mapping_upsert(*args, **kwargs):
+    async def held_mapping_attach(*args, **kwargs):
         mapping_started.set()
         await allow_mapping.wait()
-        return await original_mapping_upsert(*args, **kwargs)
+        return await original_mapping_attach(*args, **kwargs)
 
     monkeypatch.setattr(
         ptg2_shared_publish,
-        "_upsert_shared_block_mappings",
-        held_mapping_upsert,
+        "_publish_shared_block_stage_batched",
+        held_mapping_attach,
     )
     return mapping_started, allow_mapping
 
 
-def _hold_batched_reuse_protection(monkeypatch):
-    """Pause after reuse targets are protected and return its two events."""
+def _hold_v4_after_durable_pins(monkeypatch):
+    """Pause V4 CAS work after every stage hash has a durable GC pin."""
 
-    protection_finished = asyncio.Event()
-    allow_publication = asyncio.Event()
-    original_protection = ptg2_shared_publish._protect_batched_stage_reuses
+    pins_ready = asyncio.Event()
+    allow_cas = asyncio.Event()
+    original_publish = ptg2_shared_publish._publish_v4_durable_cas_batch
 
-    async def held_protection(*args, **kwargs):
-        reuse_hash = await original_protection(*args, **kwargs)
-        protection_finished.set()
-        await allow_publication.wait()
-        return reuse_hash
-
-    monkeypatch.setattr(
-        ptg2_shared_publish,
-        "_protect_batched_stage_reuses",
-        held_protection,
-    )
-    return protection_finished, allow_publication
-
-
-def _synchronize_batched_reuse_protection(monkeypatch):
-    """Release two publishers into reuse protection at the same time."""
-
-    both_started = asyncio.Barrier(2)
-    original_protection = ptg2_shared_publish._protect_batched_stage_reuses
-
-    async def synchronized_protection(*args, **kwargs):
-        await both_started.wait()
-        return await original_protection(*args, **kwargs)
+    async def held_publish(**kwargs):
+        pins_ready.set()
+        await allow_cas.wait()
+        return await original_publish(**kwargs)
 
     monkeypatch.setattr(
         ptg2_shared_publish,
-        "_protect_batched_stage_reuses",
-        synchronized_protection,
+        "_publish_v4_durable_cas_batch",
+        held_publish,
     )
+    return pins_ready, allow_cas
 
 
 async def _stage_reverse_order_reuse_publishers(tmp_path, schema_name: str):
@@ -1349,6 +1433,7 @@ async def _install_selective_v4_map_schema(
     """Add the minimum real packed-map relations to the selective fixture."""
 
     schema = f'"{schema_name}"'
+    await db.execute_ddl(f"DROP TABLE {schema}.ptg2_block_build_pin")
     await db.execute_ddl(f"DROP TABLE {schema}.ptg2_v3_snapshot_layout")
     for ddl_template in (
         _SELECTIVE_V4_LAYOUT_DDL,
@@ -1356,6 +1441,21 @@ async def _install_selective_v4_map_schema(
         _SELECTIVE_V4_MAP_PACK_DDL,
     ):
         await db.execute_ddl(ddl_template.format(schema=schema))
+    await db.execute_ddl(
+        f"""
+        CREATE TABLE {schema}.ptg2_block_build_pin (
+            snapshot_key bigint NOT NULL REFERENCES
+                {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
+            build_token varchar(96) NOT NULL,
+            pin_token varchar(96) NOT NULL,
+            block_hash bytea NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+            heartbeat_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+            lease_until timestamptz NOT NULL,
+            PRIMARY KEY (snapshot_key, pin_token, block_hash)
+        )
+        """
+    )
     await db.status(
         f"""
         INSERT INTO {schema}.ptg2_v3_snapshot_layout
@@ -1474,6 +1574,18 @@ class _ReferenceManifestProof:
     row_count: int
 
 
+@dataclass(frozen=True)
+class _V4FixtureRequest:
+    schema_name: str
+    snapshot_key: int
+    build_token: str
+    reference: SharedBlockReference
+    cas_ready: asyncio.Event | None = None
+    allow_map: asyncio.Event | None = None
+    manifest_proof: _ReferenceManifestProof | None = None
+    expected_block_count: int | None = None
+
+
 async def _publish_v4_fixture(
     *,
     schema_name: str,
@@ -1485,49 +1597,78 @@ async def _publish_v4_fixture(
     manifest_proof: _ReferenceManifestProof | None = None,
     expected_block_count: int | None = None,
 ):
-    """Run the production CAS and packed-map writers in one transaction."""
-
+    """Run durable CAS preparation and the production packed-map transaction."""
+    request = _V4FixtureRequest(
+        schema_name=schema_name,
+        snapshot_key=int(snapshot_key),
+        build_token=build_token,
+        reference=reference,
+        cas_ready=cas_ready,
+        allow_map=allow_map,
+        manifest_proof=manifest_proof,
+        expected_block_count=expected_block_count,
+    )
+    await ptg2_shared_publish.prepare_v4_cas_block_stage(
+        schema_name=request.schema_name,
+        stage_table="block_stage",
+        snapshot_key=request.snapshot_key,
+        build_token=request.build_token,
+        progress_callback=lambda _metric, _amount: None,
+    )
     async with db.transaction() as session:
-        await ptg2_v4_snapshot_maps.lock_v4_shared_layout_for_map_write(
+        return await _publish_v4_fixture_in_session(session, request)
+
+
+async def _publish_v4_fixture_in_session(session, request: _V4FixtureRequest):
+    """Publish CAS rows, the authenticated map, and exact pin release."""
+    await ptg2_v4_snapshot_maps.lock_v4_shared_layout_for_map_write(
+        session,
+        schema_name=request.schema_name,
+        snapshot_key=request.snapshot_key,
+        build_token=request.build_token,
+    )
+    cas_publication = (
+        await ptg2_shared_publish._publish_v4_cas_block_stage_in_session(
             session,
-            schema_name=schema_name,
-            snapshot_key=int(snapshot_key),
-            build_token=build_token,
+            schema_name=request.schema_name,
+            stage_table="block_stage",
+            progress_callback=lambda _metric, _amount: None,
         )
-        cas_publication = (
-            await ptg2_shared_publish._publish_v4_cas_block_stage_in_session(
-                session,
-                schema_name=schema_name,
-                stage_table="block_stage",
-                progress_callback=lambda _metric, _amount: None,
-            )
+    )
+    if request.cas_ready is not None:
+        request.cas_ready.set()
+    if request.allow_map is not None:
+        await request.allow_map.wait()
+    references = (request.reference,)
+    if request.manifest_proof is not None:
+        references = ptg2_shared_snapshot_publish._iter_v4_block_references(
+            request.manifest_proof.path,
+            expected_byte_count=request.manifest_proof.byte_count,
+            expected_sha256=request.manifest_proof.sha256,
+            expected_row_count=request.manifest_proof.row_count,
         )
-        if cas_ready is not None:
-            cas_ready.set()
-        if allow_map is not None:
-            await allow_map.wait()
-        references = (reference,)
-        if manifest_proof is not None:
-            references = ptg2_shared_snapshot_publish._iter_v4_block_references(
-                manifest_proof.path,
-                expected_byte_count=manifest_proof.byte_count,
-                expected_sha256=manifest_proof.sha256,
-                expected_row_count=manifest_proof.row_count,
-            )
-        map_summary = await ptg2_v4_snapshot_maps.publish_v4_snapshot_maps(
-            session,
-            schema_name=schema_name,
-            snapshot_key=int(snapshot_key),
-            build_token=build_token,
-            representation="direct_v1",
-            references=references,
+    map_summary = await ptg2_v4_snapshot_maps.publish_v4_snapshot_maps(
+        session,
+        schema_name=request.schema_name,
+        snapshot_key=request.snapshot_key,
+        build_token=request.build_token,
+        representation="direct_v1",
+        references=references,
+    )
+    if request.expected_block_count is not None:
+        ptg2_shared_snapshot_publish._require_v4_atomic_coordinate_counts(
+            request.expected_block_count,
+            cas_publication,
+            map_summary,
         )
-        if expected_block_count is not None:
-            ptg2_shared_snapshot_publish._require_v4_atomic_coordinate_counts(
-                expected_block_count,
-                cas_publication,
-                map_summary,
-            )
+    deleted_pin_count = await ptg2_shared_publish.delete_shared_block_build_pins(
+        session,
+        schema_name=request.schema_name,
+        snapshot_key=request.snapshot_key,
+        build_token=request.build_token,
+        pin_token="block_stage",
+    )
+    assert deleted_pin_count == cas_publication.unique_block_count
     return cas_publication, map_summary
 
 
@@ -1634,28 +1775,6 @@ def _observe_candidate_cancellation_before_map_validation(
     return cancellation_observed
 
 
-async def _wait_for_failed_enqueue_block(schema_name: str) -> None:
-    """Observe the failed-build candidate writer waiting on CAS locks."""
-
-    query_pattern = f"%{schema_name}%ptg2_v3_gc_candidate%"
-    for _attempt in range(100):
-        waiting_count = await db.scalar(
-            """
-            SELECT COUNT(*)
-              FROM pg_stat_activity
-             WHERE pid <> pg_backend_pid()
-               AND state = 'active'
-               AND wait_event_type = 'Lock'
-               AND query LIKE :query_pattern
-            """,
-            query_pattern=query_pattern,
-        )
-        if int(waiting_count or 0) > 0:
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError("failed V4 enqueue did not reach the CAS lock wait")
-
-
 async def _settle_atomic_test_tasks(
     allow_map: asyncio.Event,
     *tasks: asyncio.Task | None,
@@ -1687,22 +1806,22 @@ async def _selective_block_count(
     )
 
 
-async def _assert_v4_atomic_rollback(
+async def _assert_v4_failed_map_pins(
     quoted_schema: str,
     *,
     new_block_hash: bytes,
     map_block_hashes: tuple[bytes, ...] = (),
 ) -> None:
-    """Prove failed atomic publication left only the original CAS row."""
+    """Prove failed map work rolls back maps but retains pinned durable CAS."""
 
     assert await _selective_relation_count(
         quoted_schema,
         "ptg2_v3_block",
-    ) == 1
+    ) == 2
     assert await _selective_block_count(
         quoted_schema,
         new_block_hash,
-    ) == 0
+    ) == 1
     for map_block_hash in map_block_hashes:
         assert await _selective_block_count(
             quoted_schema,
@@ -1711,7 +1830,11 @@ async def _assert_v4_atomic_rollback(
     assert await _selective_relation_count(
         quoted_schema,
         "ptg2_v3_gc_candidate",
-    ) == 1
+    ) == 0
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_block_build_pin",
+    ) == 2
     assert await _selective_relation_count(
         quoted_schema,
         "ptg2_v4_snapshot_map_root",
@@ -1782,7 +1905,7 @@ async def _stage_v4_manifest_blocks(
 
 
 async def _assert_v4_before_map(quoted_schema: str) -> None:
-    """Prove CAS protection is active before map validation completes."""
+    """Prove durable pins protect CAS before map validation completes."""
 
     assert await _selective_relation_count(
         quoted_schema,
@@ -1791,6 +1914,10 @@ async def _assert_v4_before_map(quoted_schema: str) -> None:
     assert await _selective_relation_count(
         quoted_schema,
         "ptg2_v3_gc_candidate",
+    ) == 0
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_block_build_pin",
     ) == 1
     assert await _selective_relation_count(
         quoted_schema,
@@ -1808,6 +1935,10 @@ async def _assert_v4_after_map(quoted_schema: str) -> None:
     assert await _selective_relation_count(
         quoted_schema,
         "ptg2_v3_gc_candidate",
+    ) == 0
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_block_build_pin",
     ) == 0
     assert await _selective_relation_count(
         quoted_schema,
@@ -1840,8 +1971,8 @@ async def _assert_v4_gc_safe(
     ) == 0
 
 
-async def _assert_v4_mapped_candidate(quoted_schema: str) -> None:
-    """Prove a failed enqueue remains queued until the committed sweep."""
+async def _assert_v4_mapped_candidate_canceled(quoted_schema: str) -> None:
+    """Prove map attachment atomically cancels a concurrent GC candidate."""
 
     assert await _selective_relation_count(
         quoted_schema,
@@ -1854,43 +1985,7 @@ async def _assert_v4_mapped_candidate(quoted_schema: str) -> None:
     assert await _selective_relation_count(
         quoted_schema,
         "ptg2_v3_gc_candidate",
-    ) == 1
-
-
-async def _start_blocked_enqueue(
-    schema_name: str,
-    reference_manifest: Path,
-    cas_ready: asyncio.Event,
-) -> asyncio.Task:
-    """Start and prove one failed-build enqueue is waiting on CAS locks."""
-
-    await asyncio.wait_for(cas_ready.wait(), timeout=3)
-    failed_enqueue = asyncio.create_task(
-        ptg2_shared_snapshot_publish._queue_failed_v4_graph_blocks(
-            schema_name=schema_name,
-            reference_manifest_path=reference_manifest,
-        )
-    )
-    await _wait_for_failed_enqueue_block(schema_name)
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(
-            asyncio.shield(failed_enqueue),
-            timeout=0.2,
-        )
-    return failed_enqueue
-
-
-async def _finish_v4_publish(
-    allow_map: asyncio.Event,
-    publisher: asyncio.Task,
-    failed_enqueue: asyncio.Task,
-):
-    """Commit the map, then consume the unblocked failed-build enqueue."""
-
-    allow_map.set()
-    publication = await asyncio.wait_for(publisher, timeout=3)
-    await asyncio.wait_for(failed_enqueue, timeout=3)
-    return publication
+    ) == 0
 
 
 def _start_gated_v4_publish(
@@ -1957,8 +2052,8 @@ async def test_real_postgres_batched_shared_publish_preprotects_reuses_from_gc(
             (1, b"reuse-before-payload-lane", 1),
             (2, b"new-payload", 1),
         )
-        protection_finished, allow_publication = (
-            _hold_batched_reuse_protection(monkeypatch)
+        protection_finished, allow_publication = _hold_shared_mapping_attach(
+            monkeypatch
         )
         publisher = asyncio.create_task(
             publish_shared_block_stage(
@@ -1970,6 +2065,10 @@ async def test_real_postgres_batched_shared_publish_preprotects_reuses_from_gc(
             )
         )
         await asyncio.wait_for(protection_finished.wait(), timeout=3)
+        assert await _selective_relation_count(
+            quoted_schema,
+            "ptg2_block_build_pin",
+        ) == 2
         swept = await _sweep_selective_blocks_once(schema_name)
         assert swept.selected_hashes == ()
         allow_publication.set()
@@ -1983,6 +2082,117 @@ async def test_real_postgres_batched_shared_publish_preprotects_reuses_from_gc(
             quoted_schema,
             "ptg2_v3_gc_candidate",
         ) == 0
+        assert await _selective_relation_count(
+            quoted_schema,
+            "ptg2_block_build_pin",
+        ) == 0
+
+
+async def _stage_identical_v3_peers(
+    tmp_path,
+    schema_name: str,
+) -> None:
+    block_payload = b"v3-identical-peer"
+    for stage_table in ("block_stage_source0", "block_stage_source1"):
+        await _stage_selective_block_copy(
+            tmp_path,
+            schema_name,
+            (1, block_payload, 1),
+            stage_table=stage_table,
+        )
+
+
+def _gate_v3_source_publication(monkeypatch):
+    source0_ready = asyncio.Event()
+    release_source0 = asyncio.Event()
+    original_attach = ptg2_shared_publish._publish_shared_block_stage_batched
+
+    async def hold_only_source0(*args, **kwargs):
+        if int(kwargs["snapshot_key"]) == 130:
+            source0_ready.set()
+            await release_source0.wait()
+        return await original_attach(*args, **kwargs)
+
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_publish_shared_block_stage_batched",
+        hold_only_source0,
+    )
+    return source0_ready, release_source0
+
+
+async def _assert_v3_peer_publication(
+    schema_name: str,
+    quoted_schema: str,
+) -> None:
+    source1 = await asyncio.wait_for(
+        publish_shared_block_stage(
+            schema_name=schema_name,
+            stage_table="block_stage_source1",
+            snapshot_key=131,
+            build_token="v3-source-1",
+        ),
+        timeout=3,
+    )
+    assert source1.mapping_count == source1.unique_block_count == 1
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_snapshot_block",
+    ) == 1
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_block_build_pin",
+    ) == 1
+
+
+async def _assert_v3_sources_published(source0, quoted_schema: str) -> None:
+    source0_publication = await asyncio.wait_for(source0, timeout=3)
+    assert source0_publication.mapping_count == 1
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_snapshot_block",
+    ) == 2
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_block_build_pin",
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_v3_pinned_source_does_not_block_identical_peer(
+    tmp_path,
+    monkeypatch,
+):
+    """A V3 source paused after durable CAS cannot block an identical peer."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        await _stage_identical_v3_peers(tmp_path, schema_name)
+        source0_ready, release_source0 = _gate_v3_source_publication(
+            monkeypatch
+        )
+        source0 = asyncio.create_task(
+            publish_shared_block_stage(
+                schema_name=schema_name,
+                stage_table="block_stage_source0",
+                snapshot_key=130,
+                build_token="v3-source-0",
+            )
+        )
+        try:
+            await asyncio.wait_for(source0_ready.wait(), timeout=3)
+            await _assert_v3_peer_publication(
+                schema_name,
+                quoted_schema,
+            )
+        finally:
+            release_source0.set()
+        await _assert_v3_sources_published(source0, quoted_schema)
 
 
 @pytest.mark.asyncio
@@ -1990,11 +2200,9 @@ async def test_real_postgres_batched_v4_cas_preprotects_reuses_from_gc(
     tmp_path,
     monkeypatch,
 ):
-    """The V4 CAS publisher protects every reuse before payload batches."""
-
+    """Durable V4 pins protect every reuse before CAS payload batches."""
     if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
         pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
-
     monkeypatch.setattr(
         ptg2_shared_publish,
         "lock_v4_shared_layout_for_map_write",
@@ -2015,9 +2223,7 @@ async def test_real_postgres_batched_v4_cas_preprotects_reuses_from_gc(
             (1, b"v4-reuse-before-payload-lane", 1),
             (2, b"new-v4-payload", 1),
         )
-        protection_finished, allow_publication = (
-            _hold_batched_reuse_protection(monkeypatch)
-        )
+        pins_ready, allow_publication = _hold_v4_after_durable_pins(monkeypatch)
         publisher = asyncio.create_task(
             ptg2_shared_publish._publish_v4_cas_block_stage_compatibility(
                 schema_name=schema_name,
@@ -2027,7 +2233,11 @@ async def test_real_postgres_batched_v4_cas_preprotects_reuses_from_gc(
                 progress_callback=lambda _metric, _amount: None,
             )
         )
-        await asyncio.wait_for(protection_finished.wait(), timeout=3)
+        await asyncio.wait_for(pins_ready.wait(), timeout=3)
+        assert await _selective_relation_count(
+            quoted_schema,
+            "ptg2_block_build_pin",
+        ) == 2
         swept = await _sweep_selective_blocks_once(schema_name)
         assert swept.selected_hashes == ()
         allow_publication.set()
@@ -2041,13 +2251,51 @@ async def test_real_postgres_batched_v4_cas_preprotects_reuses_from_gc(
             quoted_schema,
             "ptg2_v3_gc_candidate",
         ) == 0
+        assert await _selective_relation_count(
+            quoted_schema,
+            "ptg2_block_build_pin",
+        ) == 0
+
+
+async def _assert_failed_v4_map_state(
+    cancellation_observed,
+    quoted_schema: str,
+    new_block_hash: bytes,
+    schema_name: str,
+) -> None:
+    assert cancellation_observed.is_set()
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_block",
+    ) == 2
+    assert await _selective_block_count(
+        quoted_schema,
+        new_block_hash,
+    ) == 1
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_gc_candidate",
+    ) == 0
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_block_build_pin",
+    ) == 2
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v4_snapshot_map_root",
+    ) == 0
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v4_snapshot_map_pack",
+    ) == 0
+    assert (await _sweep_selective_blocks_once(schema_name)).selected_hashes == ()
 
 
 @pytest.mark.asyncio
-async def test_real_postgres_atomic_v4_map_failure_rolls_back_cas_protection(
+async def test_real_postgres_v4_map_failure_retains_durable_cas_protection(
     monkeypatch,
 ):
-    """A post-CAS map failure restores candidates and leaves no map residue."""
+    """A post-CAS map failure leaves durable CAS pinned and no map residue."""
 
     if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
         pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
@@ -2093,10 +2341,11 @@ async def test_real_postgres_atomic_v4_map_failure_rolls_back_cas_protection(
                 reference=invalid_reference,
             )
 
-        assert cancellation_observed.is_set()
-        await _assert_v4_atomic_rollback(
+        await _assert_failed_v4_map_state(
+            cancellation_observed,
             quoted_schema,
-            new_block_hash=new_block_hash,
+            new_block_hash,
+            schema_name,
         )
 
 
@@ -2147,7 +2396,7 @@ async def test_real_postgres_v4_coordinate_mismatch_rolls_back_atomic_publish(
             )
 
         assert len(published_map_blocks) == 1
-        await _assert_v4_atomic_rollback(
+        await _assert_v4_failed_map_pins(
             quoted_schema,
             new_block_hash=new_hash,
             map_block_hashes=tuple(published_map_blocks),
@@ -2206,7 +2455,7 @@ async def test_real_postgres_v4_manifest_auth_failure_rolls_back_atomic_publish(
             1 if manifest_case == "same_row_count_drift" else 0
         )
         assert len(published_map_blocks) == expected_published_packs
-        await _assert_v4_atomic_rollback(
+        await _assert_v4_failed_map_pins(
             quoted_schema,
             new_block_hash=new_hash,
             map_block_hashes=tuple(published_map_blocks),
@@ -2276,12 +2525,37 @@ async def test_real_postgres_v4_cas_precedes_validation_gc_window(
             )
 
 
+async def _queue_failed_candidate_and_assert_pinned(
+    cas_ready: asyncio.Event,
+    schema_name: str,
+    reference_manifest: Path,
+    quoted_schema: str,
+) -> None:
+    await asyncio.wait_for(cas_ready.wait(), timeout=3)
+    await asyncio.wait_for(
+        ptg2_shared_snapshot_publish._queue_failed_v4_graph_blocks(
+            schema_name=schema_name,
+            reference_manifest_path=reference_manifest,
+        ),
+        timeout=3,
+    )
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_gc_candidate",
+    ) == 1
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_block_build_pin",
+    ) == 1
+    assert (await _sweep_selective_blocks_once(schema_name)).selected_hashes == ()
+
+
 @pytest.mark.asyncio
 async def test_real_postgres_atomic_v4_map_wins_failed_enqueue_gc_race(
     tmp_path,
     monkeypatch,
 ):
-    """A late failed enqueue cannot make an atomically mapped block collectible."""
+    """A concurrent failed enqueue cannot make a pinned/map block collectible."""
 
     if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
         pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
@@ -2306,21 +2580,23 @@ async def test_real_postgres_atomic_v4_map_wins_failed_enqueue_gc_race(
             build_token,
             reference,
         )
-        failed_enqueue = None
         try:
-            failed_enqueue = await _start_blocked_enqueue(
+            await _queue_failed_candidate_and_assert_pinned(
+                cas_ready,
                 schema_name,
                 reference_manifest,
-                cas_ready,
+                quoted_schema,
             )
-            publication = await _finish_v4_publish(
-                allow_map, publisher, failed_enqueue
+            allow_map.set()
+            publication = await asyncio.wait_for(
+                publisher,
+                timeout=3,
             )
             cas_publication, map_summary = publication
 
             assert cas_publication.staged_row_count == 1
             assert map_summary.coordinate_count == 1
-            await _assert_v4_mapped_candidate(quoted_schema)
+            await _assert_v4_mapped_candidate_canceled(quoted_schema)
 
             await _assert_v4_gc_safe(
                 schema_name,
@@ -2331,7 +2607,6 @@ async def test_real_postgres_atomic_v4_map_wins_failed_enqueue_gc_race(
             await _settle_atomic_test_tasks(
                 allow_map,
                 publisher,
-                failed_enqueue,
             )
 
 
@@ -2350,8 +2625,6 @@ async def test_real_postgres_batched_publishers_order_overlapping_reuse_locks(
         quoted_schema,
     ):
         await _stage_reverse_order_reuse_publishers(tmp_path, schema_name)
-        _synchronize_batched_reuse_protection(monkeypatch)
-
         async def publish(stage_table: str, snapshot_key: int):
             return await publish_shared_block_stage(
                 schema_name=schema_name,
@@ -2396,7 +2669,7 @@ async def test_real_postgres_reused_block_publish_wins_gc_race_atomically(
             schema_name,
             (1, b"kept", 1),
         )
-        mapping_started, allow_mapping = _hold_shared_mapping_upsert(
+        mapping_started, allow_mapping = _hold_shared_mapping_attach(
             monkeypatch
         )
         publisher = asyncio.create_task(
@@ -2626,11 +2899,6 @@ async def test_real_postgres_v4_candidate_lock_timeout_rolls_back(
         "lock_v4_shared_layout_for_map_write",
         AsyncMock(),
     )
-    monkeypatch.setattr(
-        ptg2_shared_publish,
-        "_SHARED_BLOCK_PUBLISH_LOCK_TIMEOUT_MS",
-        100,
-    )
     async with _selective_block_database(monkeypatch) as (
         schema_name,
         quoted_schema,
@@ -2775,8 +3043,23 @@ async def test_real_postgres_selective_copy_rejects_durable_metadata_conflict(
 
 
 async def _create_shared_block_publish_fixture(schema_name):
+    """Create one deterministic shared-block publication fixture."""
     quoted_schema = f'"{schema_name}"'
     await db.execute_ddl(f"CREATE SCHEMA {quoted_schema}")
+    await _create_shared_block_pin_tables(quoted_schema)
+    await db.status(
+        f"""
+        INSERT INTO {quoted_schema}.ptg2_v3_snapshot_layout
+            (snapshot_key, generation, state, build_token)
+        VALUES
+            (7, 'shared_blocks_v3', 'building', 'build-7'),
+            (8, 'shared_blocks_v3', 'building', 'build-8')
+        """
+    )
+    await _create_shared_mapping_and_gc_tables(quoted_schema)
+
+
+async def _create_shared_block_pin_tables(quoted_schema: str) -> None:
     await db.execute_ddl(
         f"""
         CREATE TABLE {quoted_schema}.ptg2_v3_block (
@@ -2792,6 +3075,34 @@ async def _create_shared_block_publish_fixture(schema_name):
         )
         """
     )
+    await db.execute_ddl(
+        f"""
+        CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_layout (
+            snapshot_key bigint PRIMARY KEY,
+            generation varchar(32) NOT NULL,
+            state varchar(16) NOT NULL,
+            build_token varchar(96) NOT NULL
+        )
+        """
+    )
+    await db.execute_ddl(
+        f"""
+        CREATE TABLE {quoted_schema}.ptg2_block_build_pin (
+            snapshot_key bigint NOT NULL REFERENCES
+                {quoted_schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
+            build_token varchar(96) NOT NULL,
+            pin_token varchar(96) NOT NULL,
+            block_hash bytea NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+            heartbeat_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+            lease_until timestamptz NOT NULL,
+            PRIMARY KEY (snapshot_key, pin_token, block_hash)
+        )
+        """
+    )
+
+
+async def _create_shared_mapping_and_gc_tables(quoted_schema: str) -> None:
     await db.execute_ddl(
         f"""
         CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_block (
@@ -3830,6 +4141,53 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
         assert reused_publication.serving_index["audit_sample"] == (
             publication.serving_index["audit_sample"]
         )
+        cleanup_marker = await db.first(
+            f"""
+            SELECT canonical_snapshot_key,
+                   cleanup_pending_at IS NOT NULL AS cleanup_pending
+              FROM {quoted_schema}.ptg2_layout_build_candidate
+             WHERE snapshot_key = :snapshot_key
+            """,
+            snapshot_key=discarded_snapshot_key,
+        )
+        assert dict(cleanup_marker._mapping) == {
+            "canonical_snapshot_key": publication.snapshot_key,
+            "cleanup_pending": True,
+        }
+        assert (
+            int(
+                await db.scalar(
+                    f"""
+                SELECT COUNT(*)
+                  FROM {quoted_schema}.ptg2_v3_snapshot_layout
+                 WHERE snapshot_key = :snapshot_key
+                """,
+                    snapshot_key=discarded_snapshot_key,
+                )
+                or 0
+            )
+            == 1
+        )
+        released = await ptg2_shared_gc.release_unbound_ptg2_shared_layouts(
+            schema_name=schema_name,
+            building_max_age_seconds=21_600,
+            grace_seconds=0,
+            max_layouts=1,
+            require_shared=True,
+            layout_keys=(discarded_snapshot_key,),
+        )
+        replayed_release = (
+            await ptg2_shared_gc.release_unbound_ptg2_shared_layouts(
+                schema_name=schema_name,
+                building_max_age_seconds=21_600,
+                grace_seconds=0,
+                max_layouts=1,
+                require_shared=True,
+                layout_keys=(discarded_snapshot_key,),
+            )
+        )
+        assert released.logical_layout_count == 1
+        assert replayed_release.logical_layout_count == 0
         assert (
             int(
                 await db.scalar(

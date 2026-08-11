@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib
+import inspect
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -81,24 +82,14 @@ def test_batched_stage_summary_rejects_invalid_batch_proof(flag_index, message):
         )
 
 
-@pytest.mark.asyncio
-async def test_batched_stage_rejects_a_remaining_gc_candidate():
-    """The final candidate intersection is an exact transaction stop gate."""
+def test_batched_stage_attach_has_no_shared_cas_or_gc_lock_path():
+    """Snapshot-local attach cannot regress to the retired shared-row locks."""
 
-    session = SimpleNamespace(
-        execute=AsyncMock(return_value=_OneRowResult((1,)))
-    )
-
-    with pytest.raises(RuntimeError, match="retains a GC candidate"):
-        await ptg2_shared_publish._require_no_batched_stage_gc_candidates(
-            session,
-            schema='"mrf"',
-            reuse_hash='"reuse_hashes"',
-        )
-
-    statement = str(session.execute.await_args.args[0])
-    assert 'FROM "mrf".ptg2_v3_gc_candidate' in statement
-    assert 'JOIN "reuse_hashes" AS reused USING (block_hash)' in statement
+    source = inspect.getsource(ptg2_shared_publish._publish_shared_block_batch)
+    assert "ptg2_v3_gc_candidate" not in source
+    assert "FOR UPDATE" not in source
+    assert not hasattr(ptg2_shared_publish, "_protect_batched_stage_reuses")
+    assert not hasattr(ptg2_shared_publish, "_BATCH_INSERT_BLOCK_SQL")
 
 
 @pytest.mark.parametrize(

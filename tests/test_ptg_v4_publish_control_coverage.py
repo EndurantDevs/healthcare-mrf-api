@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import datetime as dt
-from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -20,12 +19,12 @@ from process.ptg_parts.ptg2_v4_stale_metadata_types import (
 from tests.ptg_v4_publish_control_support import (
     QueryResult,
     ScriptedSession,
-    SourcePublicationSession,
     TransactionDatabase,
     active_stale_context,
     assignment,
+    installed_source_activation_transaction,
     prepared_layout_arguments,
-    source_row,
+    source_session as _source_session,
 )
 
 
@@ -190,19 +189,6 @@ async def test_prepared_layout_guards_schema_and_v4_resource_proof(monkeypatch) 
         )
 
 
-def _source_session(snapshot_id: str, source_assignment, *, plans=None):
-    expected_plans = plans or [{"plan_id": "plan", "plan_market_type": "group"}]
-    return SourcePublicationSession(
-        scope={
-            "plan_id": "plan",
-            "plan_market_type": "group",
-            "coverage_scope_id": b"c" * 32,
-        },
-        plans=expected_plans,
-        sources=[source_row(snapshot_id, source_assignment)],
-    )
-
-
 @pytest.mark.asyncio
 async def test_source_publication_locks_and_preserves_deferred_evidence(
     monkeypatch,
@@ -215,9 +201,13 @@ async def test_source_publication_locks_and_preserves_deferred_evidence(
     lifecycle_lock = AsyncMock()
     writable_lock = AsyncMock()
     monkeypatch.setattr(publication.db, "transaction", database.transaction)
-    monkeypatch.setattr(publication, "acquire_ptg2_lifecycle_lock", lifecycle_lock)
+    monkeypatch.setattr(
+        publication,
+        "acquire_ptg2_source_lifecycle_lock",
+        lifecycle_lock,
+    )
     monkeypatch.setattr(publication, "lock_writable_snapshot", writable_lock)
-    rows = await publication.publish_shared_v3_snapshot_sources(
+    publication_rows = await publication.publish_shared_v3_snapshot_sources(
         schema_name="mrf",
         snapshot_id="snapshot",
         plan_scopes=(
@@ -227,9 +217,12 @@ async def test_source_publication_locks_and_preserves_deferred_evidence(
         coverage_scope_id=b"c" * 32,
         assignments=(deferred_assignment,),
     )
-    assert rows[0]["logical_json_sha256"] is None
-    assert rows[0]["logical_hash_deferred"] is True
-    lifecycle_lock.assert_awaited_once_with(session)
+    assert publication_rows[0]["logical_json_sha256"] is None
+    assert publication_rows[0]["logical_hash_deferred"] is True
+    lifecycle_lock.assert_awaited_once_with(
+        session,
+        source_key="snapshot_snapshot",
+    )
     assert writable_lock.await_args.kwargs["snapshot_id"] == "snapshot"
 
 
@@ -270,7 +263,11 @@ async def test_source_publication_fails_closed_on_conflicting_state(
         }
     database = TransactionDatabase(session)
     monkeypatch.setattr(publication.db, "transaction", database.transaction)
-    monkeypatch.setattr(publication, "acquire_ptg2_lifecycle_lock", AsyncMock())
+    monkeypatch.setattr(
+        publication,
+        "acquire_ptg2_source_lifecycle_lock",
+        AsyncMock(),
+    )
     monkeypatch.setattr(publication, "lock_writable_snapshot", AsyncMock())
     with pytest.raises((ValueError, RuntimeError), match=message):
         await publication.publish_shared_v3_snapshot_sources(
@@ -316,29 +313,27 @@ async def test_source_pointer_cas_covers_noop_success_and_conflict() -> None:
 async def test_source_pointer_wrappers_lock_before_activation(monkeypatch) -> None:
     """Resolve the configured schema and fence the snapshot before activation."""
 
-    session = object()
-    database = TransactionDatabase(session)
-    writable_lock = AsyncMock()
-    activation = AsyncMock(return_value={"status": "promoted"})
-    monkeypatch.setattr(source_pointers, "resolve_ptg2_schema", lambda: "tenant")
-    monkeypatch.setattr(source_pointers.db, "transaction", database.transaction)
-    monkeypatch.setattr(source_pointers, "_acquire_source_pointer_gc_lock", AsyncMock())
-    monkeypatch.setattr(source_pointers, "lock_writable_snapshot", writable_lock)
-    monkeypatch.setattr(
-        source_pointers,
-        "_activate_ptg2_source_candidate_in_transaction",
-        activation,
-    )
-    result = await source_pointers.activate_ptg2_source_candidate(
+    evidence = installed_source_activation_transaction(monkeypatch)
+    activation_result = await source_pointers.activate_ptg2_source_candidate(
         source_key=" Source ",
         snapshot_id=" Snapshot ",
     )
-    assert result == {"status": "promoted"}
-    assert writable_lock.await_args.kwargs == {
+    assert activation_result == {"status": "promoted"}
+    assert evidence.writable_lock.await_args.kwargs == {
         "schema_name": "tenant",
         "snapshot_id": "Snapshot",
     }
-    assert activation.await_args.kwargs["source_key"] == "source"
+    assert evidence.activation.await_args.kwargs["source_key"] == "source"
+    dirty_statement, dirty_parameters = evidence.session.execute.await_args.args
+    assert "ptg2_legacy_global_pointer_projection_queue" in str(dirty_statement)
+    assert dirty_parameters == {"source_key": "source"}
+    assert evidence.events == [
+        "transaction-begin",
+        "activate",
+        "projection-dirty",
+        "transaction-commit",
+        "drain",
+    ]
 
 
 @pytest.mark.asyncio

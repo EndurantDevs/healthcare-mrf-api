@@ -17,8 +17,7 @@ from typing import Any, Iterable
 from db.connection import db
 from process.ptg_parts.allowed_amounts import PTG2_ALLOWED_AMOUNT_CONTRACT
 from process.ptg_parts.db_tables import _quote_ident
-from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_table
-from process.ptg_parts.ptg2_lifecycle_lock import PTG2_SOURCE_POINTER_GC_LOCK_KEY
+from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
 from process.ptg_parts.ptg2_shared_blocks import PTG2_V4_SHARED_GENERATION
 from process.ptg_parts.ptg2_shared_gc import (
     PTG2_V3_MIGRATION_OWNED_TABLE_NAMES,
@@ -634,10 +633,16 @@ def validate_source_gc_plan(
 validate_ptg2_source_snapshot_gc_plan = validate_source_gc_plan
 
 
-async def _lock_ptg2_pointer_state(connection: Any, schema_name: str) -> None:
-    await connection.status(
-        "SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))",
-        publish_lock_key=PTG2_SOURCE_POINTER_GC_LOCK_KEY,
+async def _lock_ptg2_pointer_state(
+    connection: Any,
+    schema_name: str,
+    *,
+    lock_timeout: str,
+) -> None:
+    await acquire_ptg2_lifecycle_lock(
+        connection,
+        lock_timeout=lock_timeout,
+        statement_timeout="30s",
     )
     await connection.status(
         f"""
@@ -745,10 +750,13 @@ async def execute_source_gc_plan(
 ) -> PTG2SourceSnapshotGCPlan:
     """Recompute and execute a bounded cleanup plan in one transaction."""
     schema_name = resolve_ptg2_schema(schema_name)
-    await ensure_ptg2_artifact_blob_table(schema_name)
     async with db.acquire() as connection:
         await connection.status("SELECT set_config('lock_timeout', :lock_timeout, true)", lock_timeout=lock_timeout)
-        await _lock_ptg2_pointer_state(connection, schema_name)
+        await _lock_ptg2_pointer_state(
+            connection,
+            schema_name,
+            lock_timeout=lock_timeout,
+        )
         plan = await build_ptg2_source_snapshot_gc_plan(
             schema_name=schema_name,
             executor=connection,

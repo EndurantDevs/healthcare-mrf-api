@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime
 import importlib
 import json
+import time
 import uuid
 
 import asyncpg
@@ -16,8 +17,11 @@ from process.ptg_parts.ptg2_shared_blocks import PTG2_V4_SHARED_GENERATION
 from process.ptg_parts.ptg2_v4_attempt_registry import (
     manifest_stage_table_names,
 )
-from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
-    register_attempt_stage_tables,
+from tests.ptg2_v4_terminal_stage_atomicity_support import (
+    assert_terminal_pair_state as _assert_terminal_pair_state,
+    drop_test_stages as _drop_test_stages,
+    prepare_terminal_crash_pair as _prepare_terminal_crash_pair,
+    register_test_stage as _register_test_stage,
 )
 from tests.ptg2_v4_stale_metadata_postgres_support import (
     INTERNAL_RUN_ID,
@@ -33,86 +37,6 @@ from tests.ptg2_v4_stale_metadata_postgres_support import (
 
 
 process_ptg = importlib.import_module("process.ptg")
-
-
-async def _drop_test_stages(
-    test_database,
-    stage_table_names,
-    **attempt_coordinate_by_name,
-) -> None:
-    await snapshot_cleanup._drop_ptg2_snapshot_table_names(
-        stage_table_names,
-        executor=test_database,
-        **attempt_coordinate_by_name,
-    )
-
-
-async def _register_test_stage(
-    connection,
-    test_database,
-    schema_name: str,
-    stage_table: str,
-) -> None:
-    await register_attempt_stage_tables(
-        test_database,
-        schema_name=schema_name,
-        snapshot_id=SNAPSHOT_ID,
-        internal_run_id=INTERNAL_RUN_ID,
-        table_names=[stage_table],
-    )
-    await connection.execute(
-        f"CREATE TABLE {quoted(schema_name)}.{quoted(stage_table)} "
-        "(entry_id bigint)"
-    )
-
-
-async def _prepare_terminal_crash_pair(
-    connection,
-    test_database,
-    schema_name: str,
-    stage_table: str,
-) -> None:
-    schema = quoted(schema_name)
-    await seed_ready_pair(connection, schema_name)
-    await connection.execute(
-        f"UPDATE {schema}.ptg2_snapshot "
-        "SET status = 'validated', manifest = '{\"ready\": true}'::json "
-        "WHERE snapshot_id = $1",
-        SNAPSHOT_ID,
-    )
-    await _register_test_stage(
-        connection,
-        test_database,
-        schema_name,
-        stage_table,
-    )
-
-
-async def _assert_terminal_pair_state(
-    connection,
-    schema_name: str,
-    stage_table: str,
-    *,
-    run_status: str,
-    attachment_count: int,
-    stage_exists: bool,
-) -> None:
-    schema = quoted(schema_name)
-    stored_run_status = await connection.fetchval(
-        f"SELECT status FROM {schema}.ptg2_import_run "
-        "WHERE import_run_id = $1",
-        INTERNAL_RUN_ID,
-    )
-    assert stored_run_status == run_status
-    stored_attachment_count = await connection.fetchval(
-        f"SELECT COUNT(*) FROM {schema}.ptg2_v4_attempt_stage"
-    )
-    assert stored_attachment_count == attachment_count
-    stored_stage_name = await connection.fetchval(
-        "SELECT to_regclass($1)",
-        f"{schema}.{quoted(stage_table)}",
-    )
-    assert (stored_stage_name is not None) is stage_exists
 
 
 async def _seed_nonempty_failed_run(connection, schema_name: str) -> None:
@@ -200,32 +124,22 @@ def _raw_terminal_push(
 
 async def _crash_terminal_retry(
     monkeypatch,
-    test_database,
 ) -> None:
-    async def crash_after_drop(
-        stage_table_names,
-        **attempt_coordinate_by_name,
-    ):
-        await _drop_test_stages(
-            test_database,
-            stage_table_names,
-            **attempt_coordinate_by_name,
-        )
-        raise RuntimeError("simulated crash before terminal commit")
+    async def crash_before_drop(*_args, **_kwargs):
+        raise RuntimeError("simulated post-success cleanup interruption")
 
     monkeypatch.setattr(
         process_ptg,
         "_drop_ptg2_snapshot_table_names",
-        crash_after_drop,
+        crash_before_drop,
     )
-    with pytest.raises(RuntimeError, match="before terminal commit"):
-        await process_ptg._finalize_resumed_terminal_attempt(
-            {
-                "snapshot_id": SNAPSHOT_ID,
-                "import_run_id": INTERNAL_RUN_ID,
-            },
-            internal_run_id=INTERNAL_RUN_ID,
-        )
+    await process_ptg._finalize_resumed_terminal_attempt(
+        {
+            "snapshot_id": SNAPSHOT_ID,
+            "import_run_id": INTERNAL_RUN_ID,
+        },
+        internal_run_id=INTERNAL_RUN_ID,
+    )
 
 
 def _install_stage_drop(monkeypatch, test_database) -> None:
@@ -259,7 +173,7 @@ async def _finish_terminal_retry(monkeypatch, test_database) -> None:
 
 @pytest.mark.asyncio
 async def test_terminal_retry_release_is_atomic_and_recoverable(monkeypatch):
-    """Roll back a crashed release, then finish the exact retry."""
+    """Commit terminal state before cleanup and replay retained registration."""
 
     dsn = postgres_dsn()
     schema_name = "ptg_v4_stale_terminal_" + uuid.uuid4().hex[:8]
@@ -276,12 +190,12 @@ async def test_terminal_retry_release_is_atomic_and_recoverable(monkeypatch):
         )
         configure_test_schema(monkeypatch, schema_name)
         monkeypatch.setattr(process_ptg, "db", test_database)
-        await _crash_terminal_retry(monkeypatch, test_database)
+        await _crash_terminal_retry(monkeypatch)
         await _assert_terminal_pair_state(
             connection,
             schema_name,
             stage_table,
-            run_status="running",
+            run_status="validated",
             attachment_count=1,
             stage_exists=True,
         )
@@ -300,6 +214,87 @@ async def test_terminal_retry_release_is_atomic_and_recoverable(monkeypatch):
         await connection.close()
         await test_database.disconnect()
         await drop_stale_schema(dsn, schema_name)
+
+
+@pytest.mark.asyncio
+async def test_held_stage_relation_cannot_delay_terminal_success(monkeypatch):
+    """A blocked DROP defers while the terminal run commits independently."""
+
+    dsn = postgres_dsn()
+    schema_name = "ptg_v4_terminal_drop_bound_" + uuid.uuid4().hex[:8]
+    connection = await asyncpg.connect(dsn)
+    test_database = database_for_dsn(dsn)
+    stage_table = manifest_stage_table_names("source", SNAPSHOT_ID)[0]
+    holder = None
+    try:
+        await create_stale_schema(connection, schema_name)
+        await _prepare_terminal_crash_pair(
+            connection,
+            test_database,
+            schema_name,
+            stage_table,
+        )
+        configure_test_schema(monkeypatch, schema_name)
+        monkeypatch.setattr(process_ptg, "db", test_database)
+        monkeypatch.setattr(snapshot_cleanup, "db", test_database)
+        holder = connection.transaction()
+        await holder.start()
+        await connection.execute(
+            f"LOCK TABLE {quoted(schema_name)}.{quoted(stage_table)} "
+            "IN ACCESS EXCLUSIVE MODE"
+        )
+
+        started = time.monotonic()
+        await process_ptg._finalize_resumed_terminal_attempt(
+            {
+                "snapshot_id": SNAPSHOT_ID,
+                "import_run_id": INTERNAL_RUN_ID,
+            },
+            internal_run_id=INTERNAL_RUN_ID,
+        )
+        assert time.monotonic() - started < 2
+        await _assert_terminal_pair_state(
+            connection,
+            schema_name,
+            stage_table,
+            run_status="validated",
+            attachment_count=1,
+            stage_exists=True,
+        )
+
+        await holder.rollback()
+        holder = None
+        await _finish_terminal_retry_after_stage_unlock(
+            connection,
+            schema_name,
+            stage_table,
+        )
+    finally:
+        if holder is not None:
+            await holder.rollback()
+        await connection.close()
+        await test_database.disconnect()
+        await drop_stale_schema(dsn, schema_name)
+
+
+async def _finish_terminal_retry_after_stage_unlock(
+    connection,
+    schema_name: str,
+    stage_table: str,
+) -> None:
+    """Finish post-success stage cleanup after its relation lock releases."""
+    await process_ptg._finalize_resumed_terminal_attempt(
+        {"snapshot_id": SNAPSHOT_ID, "import_run_id": INTERNAL_RUN_ID},
+        internal_run_id=INTERNAL_RUN_ID,
+    )
+    await _assert_terminal_pair_state(
+        connection,
+        schema_name,
+        stage_table,
+        run_status="validated",
+        attachment_count=0,
+        stage_exists=False,
+    )
 
 
 async def _mark_failed_attempt(

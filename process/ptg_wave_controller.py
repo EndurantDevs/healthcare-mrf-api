@@ -99,6 +99,7 @@ from process.ptg_wave_controller_bundle import (
     load_capacity_owning_wave,
 )
 from process.redis_config import build_redis_settings
+from process.ptg_compatibility_projector import run_ptg_compatibility_projector
 from process import ptg_wave_controller_isolation as _controller_isolation
 from process import ptg_wave_controller_operations as _controller_operations
 from process import ptg_wave_controller_receipts as _controller_receipts
@@ -423,13 +424,28 @@ async def run_ptg_wave_controller(redis: Any, *, image: str, runtime_image: str)
 
 
 async def start_ptg_wave_controller(app: Any) -> None:
-    """Start one controller task only when explicit runtime configuration permits."""
+    """Start bounded Redis resources for the signer and optional controller."""
 
-    if not controller_enabled():
+    if getattr(app.ctx, "ptg_compatibility_projector_task", None) is None:
+        app.ctx.ptg_compatibility_projector_task = asyncio.create_task(
+            run_ptg_compatibility_projector(),
+            name="ptg-compatibility-projector",
+        )
+    controller_is_enabled = controller_enabled()
+    receipt_keyring = getattr(
+        getattr(app, "ctx", None),
+        "ptg_wave_receipt_keyring",
+        None,
+    )
+    if not controller_is_enabled and receipt_keyring is None:
+        return
+    redis = getattr(app.ctx, "ptg_wave_redis", None)
+    if redis is None:
+        redis = await create_pool(build_redis_settings())
+        app.ctx.ptg_wave_redis = redis
+    if not controller_is_enabled:
         return
     image, runtime_image = _controller_runtime_config()
-    redis = await create_pool(build_redis_settings())
-    app.ctx.ptg_wave_redis = redis
     app.ctx.ptg_wave_controller_task = asyncio.create_task(
         run_ptg_wave_controller(redis, image=image, runtime_image=runtime_image),
         name="ptg-exact-wave-controller",
@@ -439,11 +455,15 @@ async def start_ptg_wave_controller(app: Any) -> None:
 async def stop_ptg_wave_controller(app: Any) -> None:
     """Stop the controller task and close its Redis client without touching work."""
 
-    task = getattr(app.ctx, "ptg_wave_controller_task", None)
-    if task is not None:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+    for task_name in (
+        "ptg_wave_controller_task",
+        "ptg_compatibility_projector_task",
+    ):
+        task = getattr(app.ctx, task_name, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
     redis = getattr(app.ctx, "ptg_wave_redis", None)
     if redis is not None:
         close = getattr(redis, "aclose", None) or getattr(redis, "close", None)
@@ -466,6 +486,7 @@ __all__ = [
     "load_capacity_owning_wave",
     "reconcile_ptg_wave_once",
     "restore_wave_manifest",
+    "run_ptg_compatibility_projector",
     "run_ptg_wave_controller",
     "start_ptg_wave_controller",
     "stop_ptg_wave_controller",

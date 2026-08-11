@@ -33,14 +33,10 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SHARED_GENERATION,
     PTG2_V4_SHARED_GENERATION,
 )
-from process.ptg_parts.ptg2_shared_gc import (
-    release_unbound_ptg2_shared_layouts,
-)
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     drop_attempt_stage_tables,
 )
-from process.ptg_parts.source_pointers import PTG2_SOURCE_POINTER_GC_LOCK_KEY
 
 
 PTG2_SOURCE_SNAPSHOT_RETAIN_LINEAGE_ENV = "HLTHPRT_PTG2_SOURCE_SNAPSHOT_RETAIN_LINEAGE"
@@ -834,26 +830,15 @@ async def _cleanup_source_tables(
     source_key: str,
     keep_snapshot_ids: set[str],
 ) -> None:
-    schema_name = resolve_ptg2_schema()
-    all_snapshot_rows = await _all_snapshot_manifest_rows(
-        executor,
-        schema_name=schema_name,
-    )
-    snapshot_rows = [
-        snapshot_row
-        for snapshot_row in all_snapshot_rows
-        if str(_snapshot_serving_index_dict(snapshot_row).get("source_key") or "")
-        == source_key
-        and is_strict_ptg2_v3_shared_blocks_manifest(
-            _snapshot_serving_index_dict(snapshot_row)
-        )
-    ]
-    if snapshot_rows:
-        await release_unbound_ptg2_shared_layouts(
-            schema_name=schema_name,
-            executor=executor,
-            require_shared=True,
-        )
+    """Leave immutable shared storage to the separately fenced GC worker.
+
+    Strict PTG2 snapshots do not own physical source tables.  Scanning every
+    snapshot and releasing shared layouts here made an ordinary source finish
+    perform global garbage collection.  The durable snapshot/binding rows are
+    intentionally retained for the bounded exclusive GC path instead.
+    """
+
+    del executor, source_key, keep_snapshot_ids
 
 
 async def _cleanup_old_ptg2_source_tables(
@@ -862,28 +847,9 @@ async def _cleanup_old_ptg2_source_tables(
     *,
     lock_pointer_state: bool = False,
 ) -> None:
-    if not lock_pointer_state:
-        await _cleanup_source_tables(
-            db,
-            source_key=source_key,
-            keep_snapshot_ids=keep_snapshot_ids,
-        )
-        return
-
-    schema_name = resolve_ptg2_schema()
-    async with db.acquire() as connection:
-        await connection.status(
-            "SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))",
-            publish_lock_key=PTG2_SOURCE_POINTER_GC_LOCK_KEY,
-        )
-        live_snapshot_ids = await _current_source_pointer_snapshot_ids(
-            connection,
-            schema_name=schema_name,
-            source_key=source_key,
-        )
-        authoritative_keep_ids = live_snapshot_ids or set(keep_snapshot_ids)
-        await _cleanup_source_tables(
-            connection,
-            source_key=source_key,
-            keep_snapshot_ids=authoritative_keep_ids,
-        )
+    del lock_pointer_state
+    await _cleanup_source_tables(
+        db,
+        source_key=source_key,
+        keep_snapshot_ids=keep_snapshot_ids,
+    )

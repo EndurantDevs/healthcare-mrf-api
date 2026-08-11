@@ -13,6 +13,7 @@ from db.connection import Database
 from db.migration_ptg2_predecessor_retirement_audit import (
     install_predecessor_retirement_audit,
 )
+from process.ptg_parts import ptg2_legacy_global_projection_queue
 from process.ptg_parts import source_snapshot_control
 from process.ptg_parts import source_snapshot_predecessor_retirement as retirement
 from process.ptg_parts.source_snapshot_predecessor_retirement_types import (
@@ -39,14 +40,16 @@ MRF_TABLE_STATEMENTS = (
         import_month date NOT NULL,
         previous_snapshot_id varchar(96),
         status varchar(32) NOT NULL,
-        manifest jsonb NOT NULL
+        manifest jsonb NOT NULL,
+        published_at timestamptz NOT NULL DEFAULT transaction_timestamp()
     )
     """,
     """
     CREATE TABLE {schema}.ptg2_current_snapshot (
         slot varchar(32) PRIMARY KEY,
         snapshot_id varchar(96),
-        previous_snapshot_id varchar(96)
+        previous_snapshot_id varchar(96),
+        updated_at timestamptz NOT NULL DEFAULT transaction_timestamp()
     )
     """,
     """
@@ -72,7 +75,8 @@ MRF_TABLE_STATEMENTS = (
     CREATE TABLE {schema}.ptg2_current_source_snapshot (
         source_key varchar(96) PRIMARY KEY,
         snapshot_id varchar(96),
-        previous_snapshot_id varchar(96)
+        previous_snapshot_id varchar(96),
+        updated_at timestamptz NOT NULL DEFAULT transaction_timestamp()
     )
     """,
     """
@@ -105,6 +109,18 @@ MRF_TABLE_STATEMENTS = (
     CREATE TABLE {schema}.ptg2_artifact_manifest (
         artifact_id varchar(96) PRIMARY KEY,
         snapshot_id varchar(96)
+    )
+    """,
+    """
+    CREATE TABLE {schema}.ptg2_legacy_global_pointer_projection_queue (
+        source_key varchar(96) PRIMARY KEY,
+        requested_generation bigint NOT NULL DEFAULT 1,
+        applied_generation bigint NOT NULL DEFAULT 0,
+        available_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+        lease_token varchar(64),
+        lease_until timestamptz,
+        created_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+        updated_at timestamptz NOT NULL DEFAULT transaction_timestamp()
     )
     """,
 )
@@ -375,6 +391,7 @@ def configure_operation(
     )
     monkeypatch.setattr(retirement, "db", database)
     monkeypatch.setattr(source_snapshot_control, "db", database)
+    monkeypatch.setattr(ptg2_legacy_global_projection_queue, "db", database)
 
 
 async def drop_schema(database: Database, schema_name: str) -> None:

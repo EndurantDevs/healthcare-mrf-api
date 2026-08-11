@@ -88,7 +88,20 @@ async def _load_layout_record(
             SELECT layout.snapshot_key, layout.generation, layout.state,
                    layout.build_token, layout.created_at, layout.heartbeat_at,
                    layout.lease_until, layout.published_at,
-                   fingerprint.semantic_fingerprint,
+                   COALESCE(
+                       (
+                           SELECT candidate.semantic_fingerprint
+                             FROM {schema}.ptg2_layout_build_candidate AS candidate
+                            WHERE candidate.snapshot_key = layout.snapshot_key
+                       ),
+                       (
+                           SELECT fingerprint.semantic_fingerprint
+                             FROM {schema}.ptg2_v3_layout_fingerprint AS fingerprint
+                            WHERE fingerprint.snapshot_key = layout.snapshot_key
+                            ORDER BY fingerprint.semantic_fingerprint
+                            LIMIT 1
+                       )
+                   ) AS semantic_fingerprint,
                    (
                        SELECT root.state
                          FROM {schema}.ptg2_v4_snapshot_map_root AS root
@@ -100,10 +113,8 @@ async def _load_layout_record(
                         WHERE root.snapshot_key = layout.snapshot_key
                    ) AS representation
               FROM {schema}.ptg2_v3_snapshot_layout AS layout
-              LEFT JOIN {schema}.ptg2_v3_layout_fingerprint AS fingerprint
-                ON fingerprint.snapshot_key = layout.snapshot_key
              WHERE layout.snapshot_key = :snapshot_key
-             LIMIT 2
+             LIMIT 1
             """,
             snapshot_key=snapshot_key,
         )
@@ -158,8 +169,11 @@ async def load_reference_counts(
             (SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_binding
               WHERE snapshot_key = :snapshot_key
                  OR snapshot_id = :snapshot_id) AS bindings,
-            (SELECT COUNT(*) FROM {schema}.ptg2_v3_layout_fingerprint
-              WHERE snapshot_key = :snapshot_key) AS fingerprints,
+            ((SELECT COUNT(*) FROM {schema}.ptg2_layout_build_candidate
+               WHERE snapshot_key = :snapshot_key)
+             +
+             (SELECT COUNT(*) FROM {schema}.ptg2_v3_layout_fingerprint
+               WHERE snapshot_key = :snapshot_key)) AS fingerprints,
             (SELECT COUNT(*) FROM {schema}.ptg2_v3_candidate_audit_attestation
               WHERE snapshot_key = :snapshot_key OR snapshot_id = :snapshot_id)
                 AS attestations,
@@ -251,8 +265,11 @@ async def load_recovery_postconditions(
         SELECT
             (SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_layout
               WHERE snapshot_key = :snapshot_key) AS layouts,
-            (SELECT COUNT(*) FROM {schema}.ptg2_v3_layout_fingerprint
-              WHERE snapshot_key = :snapshot_key) AS fingerprints,
+            ((SELECT COUNT(*) FROM {schema}.ptg2_layout_build_candidate
+               WHERE snapshot_key = :snapshot_key)
+             +
+             (SELECT COUNT(*) FROM {schema}.ptg2_v3_layout_fingerprint
+               WHERE snapshot_key = :snapshot_key)) AS fingerprints,
             (SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block
               WHERE snapshot_key = :snapshot_key) AS mappings,
             (SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_root

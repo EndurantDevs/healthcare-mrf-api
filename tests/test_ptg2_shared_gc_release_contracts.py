@@ -23,6 +23,58 @@ from tests.ptg2_shared_gc_test_support import (
     _patch_v4_abandonment_pipeline,
 )
 
+
+def test_cleanup_pending_layouts_delete_dense_rows_in_restartable_batches():
+    sql = shared_gc._release_layouts_sql("mrf")
+    assert ":dense_batch_rows" in sql
+    assert "ORDER BY payload.ctid" in sql
+    assert "FOR UPDATE OF payload SKIP LOCKED" in sql
+    assert sql.count("ptg2_v3_layout_fingerprint AS fingerprint") >= 1
+    for table_name in shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES:
+        suffix = table_name.removeprefix("ptg2_v3_")
+        assert f"selected_{suffix} AS MATERIALIZED" in sql
+        assert f"deleted_{suffix} AS" in sql
+        assert f'FROM "mrf"."{table_name}" AS remaining' in sql
+
+
+@pytest.mark.asyncio
+async def test_standalone_shared_gc_mutations_take_global_exclusive_fence(
+    monkeypatch,
+):
+    connection = object()
+    events: list[str] = []
+
+    class _StandaloneDB:
+        @asynccontextmanager
+        async def acquire(self):
+            yield connection
+
+    async def acquire_fence(executor):
+        assert executor is connection
+        events.append("exclusive-fence")
+
+    async def has_shared_tables(executor, _schema_name, *, require_shared):
+        assert executor is connection
+        assert require_shared is False
+        events.append("schema-read")
+        return False
+
+    monkeypatch.setattr(shared_gc, "db", _StandaloneDB())
+    monkeypatch.setattr(shared_gc, "acquire_ptg2_lifecycle_lock", acquire_fence)
+    monkeypatch.setattr(shared_gc, "_has_shared_tables", has_shared_tables)
+
+    layouts = await shared_gc.release_unbound_ptg2_shared_layouts()
+    sweep = await shared_gc.sweep_ptg2_shared_blocks()
+
+    assert layouts.tables_available is False
+    assert sweep.tables_available is False
+    assert events == [
+        "exclusive-fence",
+        "schema-read",
+        "exclusive-fence",
+        "schema-read",
+    ]
+
 @pytest.mark.asyncio
 async def test_migration_preflight_requires_candidate_attestation_table():
     executor = _SharedGCExecutor()
@@ -410,39 +462,18 @@ async def test_missing_shared_schema_noops_only_without_manifest_or_binding():
 
 
 @pytest.mark.asyncio
-async def test_normal_snapshot_cleanup_releases_shared_layouts(monkeypatch):
+async def test_normal_snapshot_cleanup_never_runs_global_shared_gc():
     class _CleanupExecutor:
         async def all(self, _statement, **_params):
-            return [
-                {
-                    "snapshot_id": "shared-current",
-                    "status": "published",
-                    "manifest": {
-                        "serving_index": {
-                            "source_key": "source-a",
-                            "storage": "manifest_snapshot",
-                            "arch_version": "postgres_binary_v3",
-                            "storage_generation": "shared_blocks_v3",
-                        }
-                    },
-                }
-            ]
+            raise AssertionError("ordinary source cleanup must not scan snapshots")
 
         async def status(self, _statement, **_params):
-            return 0
+            raise AssertionError("ordinary source cleanup must not mutate shared GC")
 
     executor = _CleanupExecutor()
-    release = AsyncMock(return_value=shared_gc.PTG2SharedLayoutGCStats())
-    monkeypatch.setattr(snapshot_cleanup, "release_unbound_ptg2_shared_layouts", release)
 
     await snapshot_cleanup._cleanup_source_tables(
         executor,
         source_key="source-a",
         keep_snapshot_ids={"shared-current"},
-    )
-
-    release.assert_awaited_once_with(
-        schema_name="mrf",
-        executor=executor,
-        require_shared=True,
     )

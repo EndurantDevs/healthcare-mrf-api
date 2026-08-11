@@ -20,6 +20,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SHARED_GENERATION,
     shared_block_hash,
 )
+from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_MAP_BLOCK_KIND,
@@ -76,6 +77,8 @@ PTG2_PROVIDER_TAX_IDENTITY_TABLE_NAMES = (
 PTG2_V3_MIGRATION_OWNED_TABLE_NAMES = (
     "ptg2_v3_snapshot_layout",
     "ptg2_v3_layout_fingerprint",
+    "ptg2_layout_build_candidate",
+    "ptg2_block_build_pin",
     "ptg2_v3_snapshot_binding",
     "ptg2_v3_snapshot_scope",
     "ptg2_v3_snapshot_plan_scope",
@@ -755,9 +758,21 @@ async def _owned_v4_layout_fingerprint(
     schema = _quote_ident(schema_name)
     fingerprint_rows = await executor.all(
         f"""
-        SELECT semantic_fingerprint
-          FROM {schema}.ptg2_v3_layout_fingerprint
-         WHERE snapshot_key = :snapshot_key
+        SELECT owned.semantic_fingerprint
+          FROM (
+                SELECT candidate.semantic_fingerprint
+                  FROM {schema}.ptg2_layout_build_candidate AS candidate
+                 WHERE candidate.snapshot_key = :snapshot_key
+                UNION ALL
+                SELECT fingerprint.semantic_fingerprint
+                  FROM {schema}.ptg2_v3_layout_fingerprint AS fingerprint
+                 WHERE fingerprint.snapshot_key = :snapshot_key
+                   AND NOT EXISTS (
+                        SELECT 1
+                          FROM {schema}.ptg2_layout_build_candidate AS candidate
+                         WHERE candidate.snapshot_key = :snapshot_key
+                   )
+          ) AS owned
          ORDER BY semantic_fingerprint
          LIMIT 2
         """,
@@ -789,17 +804,40 @@ def _owned_v4_layout_lock_sql(schema: str) -> str:
                     WHERE binding.snapshot_key = layout.snapshot_key
                ) AS is_bound
           FROM {schema}.ptg2_v3_snapshot_layout AS layout
-          JOIN {schema}.ptg2_v3_layout_fingerprint AS fingerprint
-            ON fingerprint.snapshot_key = layout.snapshot_key
-           AND fingerprint.semantic_fingerprint = :semantic_fingerprint
          WHERE layout.snapshot_key = :snapshot_key
            AND layout.generation = :generation
            AND layout.state = 'building'
            AND layout.build_token = ANY(CAST(:owner_tokens AS varchar[]))
+           AND COALESCE(
+                (
+                    SELECT candidate.semantic_fingerprint
+                      FROM {schema}.ptg2_layout_build_candidate AS candidate
+                     WHERE candidate.snapshot_key = layout.snapshot_key
+                ),
+                (
+                    SELECT fingerprint.semantic_fingerprint
+                      FROM {schema}.ptg2_v3_layout_fingerprint AS fingerprint
+                     WHERE fingerprint.snapshot_key = layout.snapshot_key
+                     ORDER BY fingerprint.semantic_fingerprint
+                     LIMIT 1
+                )
+           ) = :semantic_fingerprint
            AND (
                 SELECT COUNT(*)
-                  FROM {schema}.ptg2_v3_layout_fingerprint AS fingerprint_count
-                 WHERE fingerprint_count.snapshot_key = layout.snapshot_key
+                  FROM (
+                        SELECT candidate.semantic_fingerprint
+                          FROM {schema}.ptg2_layout_build_candidate AS candidate
+                         WHERE candidate.snapshot_key = layout.snapshot_key
+                        UNION ALL
+                        SELECT fingerprint.semantic_fingerprint
+                          FROM {schema}.ptg2_v3_layout_fingerprint AS fingerprint
+                         WHERE fingerprint.snapshot_key = layout.snapshot_key
+                           AND NOT EXISTS (
+                                SELECT 1
+                                  FROM {schema}.ptg2_layout_build_candidate AS candidate
+                                 WHERE candidate.snapshot_key = layout.snapshot_key
+                           )
+                  ) AS owned_fingerprint
            ) = 1
          FOR UPDATE OF layout
     """
@@ -1133,11 +1171,28 @@ def _lock_layouts_sql(schema_name: str) -> str:
                 )
                 OR (
                     layout.state = 'building'
-                    AND layout.heartbeat_at
-                        < transaction_timestamp()
-                          - (:building_max_age_seconds * INTERVAL '1 second')
-                    AND COALESCE(layout.lease_until, '-infinity'::timestamptz)
-                        <= transaction_timestamp()
+                    AND (
+                        EXISTS (
+                            SELECT 1
+                              FROM {schema}.ptg2_layout_build_candidate AS candidate
+                             WHERE candidate.snapshot_key = layout.snapshot_key
+                               AND candidate.cleanup_pending_at IS NOT NULL
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM {schema}.ptg2_v3_layout_fingerprint AS fingerprint
+                             WHERE fingerprint.snapshot_key = layout.snapshot_key
+                        )
+                        OR (
+                            layout.heartbeat_at
+                                < transaction_timestamp()
+                                  - (:building_max_age_seconds * INTERVAL '1 second')
+                            AND COALESCE(
+                                    layout.lease_until,
+                                    '-infinity'::timestamptz
+                                ) <= transaction_timestamp()
+                        )
+                    )
                 )
            )
          ORDER BY layout.created_at, layout.snapshot_key
@@ -1150,28 +1205,56 @@ def _dense_layout_delete_fragments(
     schema: str,
     *,
     selected_layout_cte: str = "layout_batch",
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """Return CTEs and dependencies for every unconstrained dense layout table."""
 
     dense_delete_ctes: list[str] = []
     dense_delete_dependencies: list[str] = []
+    dense_empty_guards: list[str] = []
     for table_name in PTG2_V3_DENSE_LAYOUT_TABLES:
-        cte_name = f"deleted_{table_name.removeprefix('ptg2_v3_')}"
+        suffix = table_name.removeprefix("ptg2_v3_")
+        selected_cte = f"selected_{suffix}"
+        deleted_cte = f"deleted_{suffix}"
         dense_delete_ctes.append(
             f"""
-        {cte_name} AS (
+        {selected_cte} AS MATERIALIZED (
+            SELECT bounded.ctid
+              FROM {selected_layout_cte} AS selected
+              CROSS JOIN LATERAL (
+                    SELECT payload.ctid
+                      FROM {schema}.{_quote_ident(table_name)} AS payload
+                     WHERE payload.snapshot_key = selected.snapshot_key
+                     ORDER BY payload.ctid
+                     LIMIT :dense_batch_rows
+                       FOR UPDATE OF payload SKIP LOCKED
+              ) AS bounded
+        ),
+        {deleted_cte} AS (
              DELETE FROM {schema}.{_quote_ident(table_name)} AS payload
-             USING {selected_layout_cte} AS selected
-             WHERE payload.snapshot_key = selected.snapshot_key
+             USING {selected_cte} AS bounded
+             WHERE payload.ctid = bounded.ctid
             RETURNING payload.snapshot_key
         ),"""
         )
         dense_delete_dependencies.append(
-            f"AND (SELECT COUNT(*) FROM {cte_name}) >= 0"
+            f"AND (SELECT COUNT(*) FROM {deleted_cte}) >= 0"
+        )
+        dense_empty_guards.append(
+            f"""AND NOT EXISTS (
+                    SELECT 1
+                      FROM {schema}.{_quote_ident(table_name)} AS remaining
+                     WHERE remaining.snapshot_key = layout.snapshot_key
+                       AND NOT EXISTS (
+                            SELECT 1
+                              FROM {selected_cte} AS selected_row
+                             WHERE selected_row.ctid = remaining.ctid
+                       )
+               )"""
         )
     return (
         "\n".join(dense_delete_ctes),
         "\n               ".join(dense_delete_dependencies),
+        "\n               ".join(dense_empty_guards),
     )
 
 
@@ -1194,11 +1277,28 @@ _RELEASE_LAYOUTS_SQL_TEMPLATE = """
                     )
                     OR (
                         layout.state = 'building'
-                        AND layout.heartbeat_at
-                            < transaction_timestamp()
-                              - (:building_max_age_seconds * INTERVAL '1 second')
-                        AND COALESCE(layout.lease_until, '-infinity'::timestamptz)
-                            <= transaction_timestamp()
+                        AND (
+                            EXISTS (
+                                SELECT 1
+                                  FROM {schema}.ptg2_layout_build_candidate AS candidate
+                                 WHERE candidate.snapshot_key = layout.snapshot_key
+                                   AND candidate.cleanup_pending_at IS NOT NULL
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                  FROM {schema}.ptg2_v3_layout_fingerprint AS fingerprint
+                                 WHERE fingerprint.snapshot_key = layout.snapshot_key
+                            )
+                            OR (
+                                layout.heartbeat_at
+                                    < transaction_timestamp()
+                                      - (:building_max_age_seconds * INTERVAL '1 second')
+                                AND COALESCE(
+                                        layout.lease_until,
+                                        '-infinity'::timestamptz
+                                    ) <= transaction_timestamp()
+                            )
+                        )
                     )
                )
         ),
@@ -1239,6 +1339,7 @@ _RELEASE_LAYOUTS_SQL_TEMPLATE = """
                )
                AND (SELECT COUNT(*) FROM queued_candidates) >= 0
                {dense_dependency_sql}
+               {dense_empty_guard_sql}
             RETURNING layout.snapshot_key
         )
         SELECT (SELECT COUNT(*) FROM deleted_layouts) AS logical_layout_count,
@@ -1256,13 +1357,16 @@ def _release_layouts_sql(schema_name: str) -> str:
     """Build guarded SQL that queues block GC and deletes unbound layouts."""
 
     schema = _quote_ident(schema_name)
-    dense_delete_sql, dense_dependency_sql = _dense_layout_delete_fragments(
-        schema
-    )
+    (
+        dense_delete_sql,
+        dense_dependency_sql,
+        dense_empty_guard_sql,
+    ) = _dense_layout_delete_fragments(schema)
     return _RELEASE_LAYOUTS_SQL_TEMPLATE.format(
         schema=schema,
         dense_delete_sql=dense_delete_sql,
         dense_dependency_sql=dense_dependency_sql,
+        dense_empty_guard_sql=dense_empty_guard_sql,
     )
 
 
@@ -1906,6 +2010,7 @@ async def _release_layouts_ready(
     grace_seconds: int,
     max_layouts: int,
     layout_keys: Sequence[int] | None,
+    dense_batch_rows: int | None = None,
 ) -> PTG2SharedLayoutGCStats:
     locked_rows = await executor.all(
         _lock_layouts_sql(schema_name),
@@ -1934,6 +2039,7 @@ async def _release_layouts_ready(
         building_max_age_seconds=building_max_age_seconds,
         grace_seconds=grace_seconds,
         v4_block_hashes=sorted(v4_block_hashes),
+        dense_batch_rows=_v4_abandonment_batch_rows(dense_batch_rows),
     )
     aggregate_record = _row_mapping(aggregate_records[0]) if aggregate_records else {}
     return PTG2SharedLayoutGCStats(
@@ -1979,6 +2085,7 @@ async def release_unbound_ptg2_shared_layouts(
     if executor is not None and executor is not db:
         return await _run(executor)
     async with db.acquire() as connection:
+        await acquire_ptg2_lifecycle_lock(connection)
         return await _run(connection)
 
 
@@ -1998,6 +2105,19 @@ def _eligible_blocks_sql(schema_name: str, *, lock_rows: bool) -> str:
                 SELECT 1
                   FROM {schema}.ptg2_v3_snapshot_block AS mapping
                  WHERE mapping.block_hash = candidate.block_hash
+           )
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM {schema}.ptg2_block_build_pin AS pin
+                 WHERE pin.block_hash = candidate.block_hash
+                   AND EXISTS (
+                        SELECT 1
+                          FROM {schema}.ptg2_block_build_pin AS live_pin
+                         WHERE live_pin.snapshot_key = pin.snapshot_key
+                           AND live_pin.build_token = pin.build_token
+                           AND live_pin.pin_token = pin.pin_token
+                           AND live_pin.lease_until > transaction_timestamp()
+                   )
            )
          ORDER BY candidate.eligible_at, candidate.block_hash
          LIMIT :max_rows
@@ -2120,6 +2240,19 @@ def _delete_blocks_sql(
                   FROM {schema}.ptg2_v3_snapshot_block AS mapping
                  WHERE mapping.block_hash = block.block_hash
            )
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM {schema}.ptg2_block_build_pin AS pin
+                 WHERE pin.block_hash = block.block_hash
+                   AND EXISTS (
+                        SELECT 1
+                          FROM {schema}.ptg2_block_build_pin AS live_pin
+                         WHERE live_pin.snapshot_key = pin.snapshot_key
+                           AND live_pin.build_token = pin.build_token
+                           AND live_pin.pin_token = pin.pin_token
+                           AND live_pin.lease_until > transaction_timestamp()
+                   )
+           )
            {v4_guard}
         RETURNING block.block_hash, block.stored_byte_count
     """
@@ -2219,9 +2352,10 @@ async def sweep_ptg2_shared_blocks(
             max_rows=row_limit,
         )
 
-    if executor is not None:
+    if executor is not None and executor is not db:
         return await _run(executor)
     async with db.acquire() as connection:
+        await acquire_ptg2_lifecycle_lock(connection)
         return await _run(connection)
 
 

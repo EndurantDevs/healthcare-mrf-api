@@ -850,7 +850,8 @@ jobs:
             tests/test_ptg_wave_recovery_storage_orm_postgres.py \
             tests/test_ptg_wave_materialized_preclaim_storage_postgres.py \
             tests/test_ptg_wave_materialized_preclaim_guard_postgres.py \
-            tests/test_ptg_wave_materialized_preclaim_downgrade_postgres.py
+            tests/test_ptg_wave_materialized_preclaim_downgrade_postgres.py \
+            tests/test_ptg_wave_receipt_authority_migration.py
       - name: Run retained UHC semantic publication PostgreSQL gate
         if: matrix.shard == 'core'
         env:

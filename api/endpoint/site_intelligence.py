@@ -182,6 +182,13 @@ async def _radius_zip_weights(
                 logger.debug("failed to rollback radius ZIP overlap query: %s", rollback_exc)
         return {}, "zip_centroid"
 
+    weights_by_zip = _zip_overlap_weights(zip_overlap_rows)
+    return weights_by_zip, (
+        "zcta_polygon_overlap" if weights_by_zip else "zip_centroid"
+    )
+
+
+def _zip_overlap_weights(zip_overlap_rows) -> dict[str, float]:
     weights_by_zip: dict[str, float] = {}
     for zip_overlap_row in zip_overlap_rows:
         zip_code = str(zip_overlap_row.zip_code or "").strip()
@@ -195,10 +202,7 @@ async def _radius_zip_weights(
         weights_by_zip[zip_code] = max(
             weights_by_zip.get(zip_code, 0.0), min(weight, 1.0)
         )
-
-    return weights_by_zip, (
-        "zcta_polygon_overlap" if weights_by_zip else "zip_centroid"
-    )
+    return weights_by_zip
 
 
 def _haversine_miles(lat1: float, lng1: float, lat2: float, lng2: float) -> float:

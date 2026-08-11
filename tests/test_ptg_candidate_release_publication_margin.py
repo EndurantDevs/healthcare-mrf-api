@@ -76,9 +76,11 @@ def test_rollback_coordinates_and_report_are_explicit():
             should_reverse_global_pointer=False,
             allowed_action="delete",
         ),
+        global_pointer_status="deferred",
     )
     assert report["rollback_owner_id"] == ROLLBACK_OWNER
     assert report["allowed_amount_pointer"]["status"] == "removed"
+    assert report["global_pointer"] == "deferred"
 
 
 def test_rollback_cache_clear_and_row_normalizers(monkeypatch):

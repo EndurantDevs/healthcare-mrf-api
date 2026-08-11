@@ -86,11 +86,6 @@ async def test_source_snapshot_gc_releases_unbound_layout_in_same_transaction(mo
     monkeypatch.setattr(source_snapshot_gc, "db", _DB())
     monkeypatch.setattr(
         source_snapshot_gc,
-        "ensure_ptg2_artifact_blob_table",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        source_snapshot_gc,
         "build_ptg2_source_snapshot_gc_plan",
         AsyncMock(return_value=plan),
     )
@@ -136,11 +131,6 @@ async def test_source_snapshot_gc_skips_layout_release_without_deleted_binding(m
         shared_snapshot_ids=("shared-old",),
     )
     monkeypatch.setattr(source_snapshot_gc, "db", _DB())
-    monkeypatch.setattr(
-        source_snapshot_gc,
-        "ensure_ptg2_artifact_blob_table",
-        AsyncMock(return_value=None),
-    )
     monkeypatch.setattr(
         source_snapshot_gc,
         "build_ptg2_source_snapshot_gc_plan",

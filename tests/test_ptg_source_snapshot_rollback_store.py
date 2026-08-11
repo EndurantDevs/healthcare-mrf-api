@@ -68,7 +68,7 @@ async def test_apply_rollback_mutates_only_pointer_tables():
     assert 'UPDATE "mrf".ptg2_current_source_snapshot' in joined_statements
     assert 'DELETE FROM "mrf".ptg2_current_plan_source' in joined_statements
     assert 'INSERT INTO "mrf".ptg2_current_plan_source' in joined_statements
-    assert 'UPDATE "mrf".ptg2_current_snapshot' in joined_statements
+    assert 'UPDATE "mrf".ptg2_current_snapshot' not in joined_statements
     assert 'UPDATE "mrf".ptg2_snapshot' not in joined_statements
     allowed_params = session.executed_statements[-1][1]
     assert allowed_params["target_snapshot_id"] == "allowed-snapshot-a"

@@ -978,31 +978,19 @@ async def test_dense_write_lock_requires_current_build_token():
 
 @pytest.mark.asyncio
 async def test_seal_locks_ownership_then_rechecks_authoritative_summary(monkeypatch):
+    """Prove sealing rechecks authoritative ownership under its short lock."""
     expected = SharedBlock(
-        "page_v4",
-        7,
-        0,
-        3,
-        "none",
-        9,
-        b"123456789",
+        "page_v4", 7, 0, 3, "none", 9, b"123456789"
     ).reference()
     expected_summary = _mapping_summary([expected])
-    summarize = AsyncMock(return_value=expected_summary)
-    monkeypatch.setattr(
-        shared_blocks_module,
-        "summarize_shared_snapshot_mappings",
-        summarize,
-    )
+    summarize = _patch_shared_seal_dependencies(monkeypatch, expected_summary)
     session = _ScriptedSession(
         [
             _Result(scalar_value=41),
-            _Result(),
             _Result(scalar_value=None),
             _Result(scalar_value=41),
         ]
     )
-
     sealed = await seal_shared_layout(
         session,
         schema_name="mrf",
@@ -1012,7 +1000,6 @@ async def test_seal_locks_ownership_then_rechecks_authoritative_summary(monkeypa
         support_digest=b"s" * 32,
         layout_manifest={"contract": "strict-v3"},
     )
-
     assert sealed.snapshot_key == 41
     ownership_sql = session.calls[0][0]
     assert "ptg2_v3_snapshot_layout" in ownership_sql
@@ -1024,6 +1011,37 @@ async def test_seal_locks_ownership_then_rechecks_authoritative_summary(monkeypa
     )
     update_params = session.calls[-1][1]
     assert update_params["logical_byte_count"] == expected.raw_byte_count
+
+
+def _patch_shared_seal_dependencies(monkeypatch, expected_summary):
+    """Install exact short-seal dependencies and return its summarizer."""
+    summarize = AsyncMock(return_value=expected_summary)
+    monkeypatch.setattr(
+        shared_blocks_module,
+        "summarize_shared_snapshot_mappings",
+        summarize,
+    )
+    monkeypatch.setattr(
+        shared_blocks_module,
+        "acquire_ptg2_source_lifecycle_lock",
+        AsyncMock(return_value="layout_attempt_41"),
+    )
+    monkeypatch.setattr(
+        shared_blocks_module,
+        "acquire_layout_digest_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        shared_blocks_module,
+        "publish_layout_fingerprint",
+        AsyncMock(return_value=41),
+    )
+    monkeypatch.setattr(
+        shared_blocks_module,
+        "delete_layout_build_candidate",
+        AsyncMock(),
+    )
+    return summarize
 
 
 @pytest.mark.asyncio
@@ -1056,6 +1074,11 @@ async def test_seal_rejects_every_authoritative_summary_mismatch(
         "summarize_shared_snapshot_mappings",
         summarize,
     )
+    monkeypatch.setattr(
+        shared_blocks_module,
+        "acquire_ptg2_source_lifecycle_lock",
+        AsyncMock(return_value="layout_attempt_41"),
+    )
     session = _ScriptedSession([_Result(scalar_value=41)])
 
     with pytest.raises(RuntimeError, match=f"summary mismatch for {field_name}"):
@@ -1074,25 +1097,20 @@ async def test_seal_rejects_every_authoritative_summary_mismatch(
 async def test_seal_exact_reuse_does_not_queue_still_referenced_blocks_for_gc(
     monkeypatch,
 ):
+    """Prove exact reuse never queues winner blocks for collection."""
     expected = SharedBlock("page_v4", 7, 0, 1, "none", 1, b"a").reference()
     expected_summary = _mapping_summary([expected])
-    monkeypatch.setattr(
-        shared_blocks_module,
-        "summarize_shared_snapshot_mappings",
-        AsyncMock(return_value=expected_summary),
+    mark_cleanup = _patch_shared_reuse_seal_dependencies(
+        monkeypatch,
+        expected_summary,
     )
     session = _ScriptedSession(
         [
             _Result(scalar_value=41),
-            _Result(),
             _Result(scalar_value=17),
-            _Result(),
-            _Result(),
-            *[_Result() for _ in PTG2_V3_DENSE_LAYOUT_TABLES],
             _Result(),
         ]
     )
-
     sealed = await seal_shared_layout(
         session,
         schema_name="mrf",
@@ -1102,17 +1120,45 @@ async def test_seal_exact_reuse_does_not_queue_still_referenced_blocks_for_gc(
         support_digest=b"s" * 32,
         layout_manifest={"contract": "strict-v3"},
     )
-
     assert sealed.snapshot_key == 17
     assert sealed.reused is True
-    assert not any(
-        "ptg2_v3_gc_candidate" in sql
-        for sql, _params in session.calls
+    assert not any("ptg2_v3_gc_candidate" in sql for sql, _params in session.calls)
+    assert not any("DELETE FROM" in sql for sql, _params in session.calls)
+    mark_cleanup.assert_awaited_once_with(
+        session,
+        schema_name="mrf",
+        snapshot_key=41,
+        canonical_snapshot_key=17,
     )
-    assert any(
-        "DELETE FROM \"mrf\".ptg2_v3_snapshot_layout" in sql
-        for sql, _params in session.calls
+
+
+def _patch_shared_reuse_seal_dependencies(monkeypatch, expected_summary):
+    """Install exact-winner reuse dependencies and return cleanup marker."""
+    monkeypatch.setattr(
+        shared_blocks_module, "summarize_shared_snapshot_mappings",
+        AsyncMock(return_value=expected_summary),
     )
+    monkeypatch.setattr(
+        shared_blocks_module, "acquire_ptg2_source_lifecycle_lock",
+        AsyncMock(return_value="layout_attempt_41"),
+    )
+    monkeypatch.setattr(
+        shared_blocks_module,
+        "acquire_layout_digest_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        shared_blocks_module,
+        "publish_layout_fingerprint",
+        AsyncMock(return_value=17),
+    )
+    mark_cleanup = AsyncMock()
+    monkeypatch.setattr(
+        shared_blocks_module,
+        "mark_layout_build_candidate_cleanup_pending",
+        mark_cleanup,
+    )
+    return mark_cleanup
 
 
 def test_decode_shared_block_payload_is_strict():
@@ -2968,10 +3014,14 @@ async def test_graph_read_once_scope_rejects_a_short_nonfinal_chunk():
 
 
 @pytest.mark.asyncio
-async def test_reservation_reuses_sealed_semantic_layout():
+async def test_reservation_reuses_sealed_semantic_layout(monkeypatch):
+    monkeypatch.setattr(
+        shared_blocks_module,
+        "acquire_ptg2_source_lifecycle_lock",
+        AsyncMock(return_value="layout_second_run"),
+    )
     session = _ScriptedSession(
         [
-            _Result(),
             _Result(
                 rows=[
                     {
@@ -2997,16 +3047,14 @@ async def test_reservation_reuses_sealed_semantic_layout():
     assert reservation.snapshot_key == 17
     assert reservation.reused is True
     assert reservation.layout_manifest == {"rate_count": 11}
-    assert len(session.calls) == 3
-    assert "pg_advisory_xact_lock" in session.calls[0][0]
-    assert "ptg2_v3_layout_fingerprint" in session.calls[1][0]
-    assert "lease_until" in session.calls[2][0]
+    assert len(session.calls) == 2
+    assert "ptg2_v3_layout_fingerprint" in session.calls[0][0]
+    assert "lease_until" in session.calls[1][0]
 
 
 def _building_layout_session(*tail_results):
     return _ScriptedSession(
         [
-            _Result(),
             _Result(
                 rows=[
                     {
@@ -3023,8 +3071,16 @@ def _building_layout_session(*tail_results):
 
 
 @pytest.mark.asyncio
-async def test_reservation_resumes_only_the_same_build_token():
-    """Ensure only the owning build token can resume a building layout."""
+async def test_reservation_resumes_same_token_and_isolates_other_build(
+    monkeypatch,
+):
+    """Resume one owner while another token receives a private candidate."""
+
+    monkeypatch.setattr(
+        shared_blocks_module,
+        "acquire_ptg2_source_lifecycle_lock",
+        AsyncMock(return_value="layout_build"),
+    )
 
     matching = _building_layout_session(
         _Result(scalar_value=23),
@@ -3052,14 +3108,23 @@ async def test_reservation_resumes_only_the_same_build_token():
         for table_name in PTG2_V3_DENSE_LAYOUT_TABLES
     )
 
-    conflicting = _building_layout_session()
-    with pytest.raises(RuntimeError, match="already building"):
-        await reserve_shared_layout(
-            conflicting,
-            schema_name="mrf",
-            semantic_fingerprint=b"t" * 32,
-            build_token="other-run",
-        )
+    conflicting = _building_layout_session(
+        _Result(scalar_value=None),
+        _Result(scalar_value=24),
+        _Result(),
+        _Result(scalar_value=b"t" * 32),
+    )
+    isolated = await reserve_shared_layout(
+        conflicting,
+        schema_name="mrf",
+        semantic_fingerprint=b"t" * 32,
+        build_token="other-run",
+    )
+    assert (isolated.snapshot_key, isolated.reused) == (24, False)
+    assert any(
+        "ptg2_layout_build_candidate" in sql
+        for sql, _params in conflicting.calls
+    )
 
 
 @pytest.mark.asyncio

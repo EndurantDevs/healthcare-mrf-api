@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 from tests.ptg2_v4_coverage_support import (
     AuditCandidate,
     SharedLayoutBuildOwnership,
@@ -10,55 +12,10 @@ from tests.ptg2_v4_coverage_support import (
     _relation_row,
     asynccontextmanager,
     audit,
+    configure_publication_spies,
     pytest,
     snapshot_maps,
 )
-
-def _configure_publication_spies(monkeypatch):
-    lock_calls: list[tuple[int, str]] = []
-    batches: list[tuple[str, tuple[int, ...]]] = []
-
-    async def fake_lock(
-        _session,
-        *,
-        snapshot_key: int,
-        build_token: str,
-        **_kwargs,
-    ):
-        lock_calls.append((snapshot_key, build_token))
-
-    async def fake_npi_batch(_session, *, npi_rows, **_kwargs):
-        batches.append(("npi", tuple(row["npi_key"] for row in npi_rows)))
-
-    async def fake_component_batch(_session, *, component_rows, **_kwargs):
-        keys = tuple(row["component_key"] for row in component_rows)
-        batches.append(("component", keys))
-
-    async def fake_pattern_batch(_session, *, pattern_rows, **_kwargs):
-        keys = tuple(row["pattern_key"] for row in pattern_rows)
-        batches.append(("pattern", keys))
-
-    async def fake_dense(_session, *, expected_count: int, **_kwargs):
-        return expected_count
-
-    monkeypatch.setattr(
-        snapshot_maps,
-        "lock_v4_shared_layout_for_map_write",
-        fake_lock,
-    )
-    monkeypatch.setattr(snapshot_maps, "_publish_v4_npi_batch", fake_npi_batch)
-    monkeypatch.setattr(
-        snapshot_maps,
-        "_publish_v4_component_batch",
-        fake_component_batch,
-    )
-    monkeypatch.setattr(
-        snapshot_maps,
-        "_publish_v4_pattern_batch",
-        fake_pattern_batch,
-    )
-    monkeypatch.setattr(snapshot_maps, "_verify_dense_table_keys", fake_dense)
-    return fake_lock, lock_calls, batches
 
 
 async def _assert_dictionary_publications(lock_calls, batches) -> None:
@@ -171,17 +128,24 @@ async def _assert_relation_publications(monkeypatch, fake_lock) -> None:
 @pytest.mark.asyncio
 async def test_snapshot_publication_helpers_batch_and_verify(monkeypatch) -> None:
     """Publish dictionary and relation batches while enforcing row contracts."""
-    fake_lock, lock_calls, batches = _configure_publication_spies(monkeypatch)
+    fake_lock, lock_calls, batches = configure_publication_spies(monkeypatch)
     await _assert_dictionary_publications(lock_calls, batches)
     await _assert_dictionary_row_rejections()
     await _assert_relation_publications(monkeypatch, fake_lock)
 
 
-async def _assert_reservation_creation() -> None:
-    session = _ScriptedSession(_Result(scalar=17), _Result())
+async def _assert_reservation_creation(monkeypatch) -> None:
+    insert_candidate = AsyncMock()
+    monkeypatch.setattr(
+        snapshot_maps,
+        "insert_layout_build_candidate",
+        insert_candidate,
+    )
+    session = _ScriptedSession(_Result(scalar=17))
     created = await snapshot_maps._create_v4_reservation(
         session,
         schema='"mrf"',
+        schema_name="mrf",
         fingerprint=b"f" * 32,
         build_token="token",
         storage_shard_id=2,
@@ -193,6 +157,7 @@ async def _assert_reservation_creation() -> None:
         await snapshot_maps._create_v4_reservation(
             no_key,
             schema='"mrf"',
+            schema_name="mrf",
             fingerprint=b"f" * 32,
             build_token="token",
             storage_shard_id=2,
@@ -210,13 +175,15 @@ async def _assert_reservation_creation() -> None:
         build_token="token",
     )
     assert (building.snapshot_key, building.reused) == (18, False)
-    with pytest.raises(RuntimeError, match="another build"):
+    assert (
         await snapshot_maps._existing_v4_reservation(
             object(),
             schema='"mrf"',
             existing={"state": "building"},
             build_token="token",
         )
+        is None
+    )
 
 
 async def _assert_public_reservation(monkeypatch) -> None:
@@ -228,6 +195,11 @@ async def _assert_public_reservation(monkeypatch) -> None:
 
     monkeypatch.setattr(snapshot_maps, "_load_v4_layout_reservation", fake_load)
     monkeypatch.setattr(snapshot_maps, "_create_v4_reservation", fake_create)
+    monkeypatch.setattr(
+        snapshot_maps,
+        "acquire_ptg2_source_lifecycle_lock",
+        AsyncMock(return_value="layout_token"),
+    )
     reserve_session = _ScriptedSession(_Result())
     reserved = await snapshot_maps.reserve_v4_shared_layout(
         reserve_session,
@@ -333,7 +305,7 @@ async def _assert_snapshot_binding() -> None:
 @pytest.mark.asyncio
 async def test_snapshot_reservation_root_and_binding_lifecycle(monkeypatch) -> None:
     """Exercise reservation ownership, root initialization, and snapshot binding."""
-    await _assert_reservation_creation()
+    await _assert_reservation_creation(monkeypatch)
     await _assert_public_reservation(monkeypatch)
     await _assert_layout_write_lock()
     await _assert_snapshot_map_root()

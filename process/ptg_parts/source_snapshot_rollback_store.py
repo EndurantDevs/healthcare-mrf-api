@@ -9,6 +9,9 @@ from typing import Any, Mapping
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.source_pointers import _allowed_source_pointer_key
+from process.ptg_parts.source_snapshot_rollback_compatibility import (
+    attempt_legacy_global_pointer_rollback,
+)
 from process.ptg_parts.source_snapshot_rollback_relations import (
     database_utc_timestamp,
     load_target_attestation,
@@ -176,29 +179,6 @@ async def _load_source_plan_pointers(
     )
 
 
-async def _load_global_pointer(
-    session: Any,
-    schema: str,
-) -> dict[str, Any]:
-    return await _one(
-        session,
-        f"""
-        SELECT pointer.snapshot_id, pointer.previous_snapshot_id,
-               current_index.source_key
-          FROM {schema}.ptg2_current_snapshot AS pointer
-          LEFT JOIN LATERAL (
-              SELECT snapshot.manifest->'serving_index'->>'source_key'
-                         AS source_key
-                FROM {schema}.ptg2_snapshot AS snapshot
-               WHERE snapshot.snapshot_id = pointer.snapshot_id
-          ) AS current_index ON TRUE
-         WHERE pointer.slot = 'current'
-         FOR UPDATE OF pointer
-        """,
-        {},
-    )
-
-
 async def _load_allowed_pointer(
     session: Any,
     schema: str,
@@ -265,7 +245,7 @@ async def load_rollback_context(
         source_plan_pointer_records=await _load_source_plan_pointers(
             session, schema, source_key
         ),
-        global_pointer_by_field=await _load_global_pointer(session, schema),
+        global_pointer_by_field={},
         allowed_pointer_by_field=await _load_allowed_pointer(
             session, schema, source_key
         ),
@@ -336,28 +316,6 @@ async def _replace_plan_pointers(
             """
         ),
         pointer_entries,
-    )
-
-
-async def _reverse_global_pointer(
-    session: Any,
-    schema: str,
-    pointer_params_by_name: Mapping[str, Any],
-) -> None:
-    await _require_changed_row(
-        session,
-        f"""
-        UPDATE {schema}.ptg2_current_snapshot
-           SET snapshot_id = :snapshot_id,
-               previous_snapshot_id = :expected_current_snapshot_id,
-               updated_at = :updated_at
-         WHERE slot = 'current'
-           AND snapshot_id = :expected_current_snapshot_id
-           AND previous_snapshot_id = :snapshot_id
-        RETURNING slot
-        """,
-        pointer_params_by_name,
-        failure_message="global pointer changed while rollback was executing",
     )
 
 
@@ -481,8 +439,6 @@ async def apply_rollback(
         source_key=source_key,
         pointer_entries=pointer_entries,
     )
-    if decision.should_reverse_global_pointer:
-        await _reverse_global_pointer(session, schema, pointer_params_by_name)
     await _apply_allowed_decision(
         session,
         schema,

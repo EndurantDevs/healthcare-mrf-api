@@ -314,10 +314,6 @@ def test_execute_gc_deletes_v3_metadata_with_strict_sql_admission(monkeypatch):
     ])
     monkeypatch.setattr(snapshot_gc, "db", _DB(connection))
 
-    async def ensure(_schema_name=None):
-        return None
-
-    monkeypatch.setattr(snapshot_gc, "ensure_ptg2_artifact_blob_table", ensure)
     release = AsyncMock()
     monkeypatch.setattr(
         snapshot_gc,

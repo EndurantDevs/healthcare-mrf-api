@@ -4532,7 +4532,41 @@ def _shard_source_selects(
     doctor_clinician_address_ranges = doctor_clinician_address_ranges or []
     provider_enrollment_ffs_ranges = provider_enrollment_ffs_ranges or []
     sharded_selects: list[str] = []
-    shard_specs = [
+    shard_specs = _source_shard_specs(
+        db_schema,
+        npi_address_ranges,
+        mrf_address_ranges,
+        doctor_clinician_address_ranges,
+        provider_enrollment_ffs_ranges,
+    )
+
+    for select_sql in source_selects:
+        ranges: list[tuple[int, int]] = []
+        where_marker = ""
+        alias = ""
+        for table_marker, source_marker, candidate_where, candidate_alias, candidate_ranges in shard_specs:
+            if table_marker in select_sql and source_marker in select_sql:
+                ranges = candidate_ranges
+                where_marker = candidate_where
+                alias = candidate_alias
+                break
+        if not ranges or not where_marker or where_marker not in select_sql:
+            sharded_selects.append(select_sql)
+            continue
+        for low, high in ranges:
+            predicate = f"{where_marker}\n               AND {alias}.npi >= {low}\n               AND {alias}.npi < {high}"
+            sharded_selects.append(select_sql.replace(where_marker, predicate, 1))
+    return sharded_selects
+
+
+def _source_shard_specs(
+    db_schema: str,
+    npi_address_ranges,
+    mrf_address_ranges,
+    doctor_clinician_address_ranges,
+    provider_enrollment_ffs_ranges,
+):
+    return [
         (
             f"FROM {db_schema}.npi_address AS a",
             "'nppes'::varchar AS address_source",
@@ -4569,24 +4603,6 @@ def _shard_source_selects(
             provider_enrollment_ffs_ranges,
         ),
     ]
-
-    for select_sql in source_selects:
-        ranges: list[tuple[int, int]] = []
-        where_marker = ""
-        alias = ""
-        for table_marker, source_marker, candidate_where, candidate_alias, candidate_ranges in shard_specs:
-            if table_marker in select_sql and source_marker in select_sql:
-                ranges = candidate_ranges
-                where_marker = candidate_where
-                alias = candidate_alias
-                break
-        if not ranges or not where_marker or where_marker not in select_sql:
-            sharded_selects.append(select_sql)
-            continue
-        for low, high in ranges:
-            predicate = f"{where_marker}\n               AND {alias}.npi >= {low}\n               AND {alias}.npi < {high}"
-            sharded_selects.append(select_sql.replace(where_marker, predicate, 1))
-    return sharded_selects
 
 
 async def _npi_table_ranges(db_schema: str, table_name: str, shards: int) -> list[tuple[int, int]]:

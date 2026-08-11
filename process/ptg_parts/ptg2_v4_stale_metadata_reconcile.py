@@ -8,7 +8,9 @@ import re
 from typing import Any, Mapping
 
 from db.connection import db
-from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    acquire_ptg2_source_lifecycle_lock,
+)
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.ptg2_v4_snapshot_maps import PTG2_V4_SHARED_GENERATION
 from process.ptg_parts.ptg2_v4_stale_metadata_authority import (
@@ -155,7 +157,10 @@ async def _lock_stale_target(
 ) -> None:
     """Serialize the lifecycle before loading the existing reviewed fence."""
 
-    await acquire_ptg2_lifecycle_lock(session)
+    await acquire_ptg2_source_lifecycle_lock(
+        session,
+        source_key=f"snapshot_{request.snapshot_id}",
+    )
     await session.execute(
         db.text(
             "SELECT pg_advisory_xact_lock("

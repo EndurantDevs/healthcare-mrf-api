@@ -79,7 +79,21 @@ from process.ptg_parts.ptg2_shared_gc import (
     require_migration_owned_tables,
     resolve_ptg2_schema,
 )
-from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    acquire_ptg2_lifecycle_lock,
+    configure_ptg2_lifecycle_transaction,
+    is_retryable_lifecycle_database_error,
+)
+from process.ptg_parts.ptg2_layout_candidate import (
+    PTG2_LAYOUT_BUILD_CANDIDATE_TABLE,
+)
+from process.ptg_parts.ptg2_block_build_pins import PTG2_BLOCK_BUILD_PIN_TABLE
+from process.ptg_parts.ptg2_plan_catalog_outbox import (
+    PTG2_PLAN_CATALOG_OUTBOX_TABLE,
+)
+from process.ptg_parts.ptg2_legacy_global_projection_queue import (
+    PTG2_LEGACY_GLOBAL_PROJECTION_QUEUE_TABLE,
+)
 from db.ptg2_v4_attempt_schema import (
     ATTEMPT_FENCE_TABLE,
     ATTEMPT_IMPORT_JOB_TABLE,
@@ -121,6 +135,112 @@ PTG2_V4_ATTEMPT_MIGRATION_TABLE_NAMES = (
     ATTEMPT_STAGE_TABLE,
     ATTEMPT_IMPORT_JOB_TABLE,
 )
+PTG2_ARTIFACT_BLOB_TABLE = "ptg2_artifact_blob_chunk"
+_RUNTIME_SCHEMA_CAPABILITY_SQL = (
+    "WITH missing_tables AS ("
+    "SELECT 'table:' || required.table_name AS capability "
+    "FROM unnest(CAST(:table_names AS text[])) AS required(table_name) "
+    "WHERE to_regclass(format('%I.%I', CAST(:schema_name AS text), "
+    "required.table_name)) IS NULL"
+    "), expected_columns(table_name, column_name, udt_name, is_nullable) "
+    "AS (VALUES "
+    "('ptg2_artifact_blob_chunk', 'artifact_id', 'varchar', 'NO'),"
+    "('ptg2_artifact_blob_chunk', 'chunk_no', 'int4', 'NO'),"
+    "('ptg2_artifact_blob_chunk', 'compression', 'varchar', 'YES'),"
+    "('ptg2_artifact_blob_chunk', 'payload', 'bytea', 'NO'),"
+    "('ptg2_artifact_blob_chunk', 'raw_byte_count', 'int4', 'NO'),"
+    "('ptg2_artifact_blob_chunk', 'byte_count', 'int4', 'NO'),"
+    "('ptg2_artifact_blob_chunk', 'created_at', 'timestamp', 'YES')"
+    "), missing_columns AS ("
+    "SELECT 'column:' || expected.table_name || '.' || expected.column_name "
+    "AS capability FROM expected_columns expected "
+    "WHERE to_regclass(format('%I.%I', CAST(:schema_name AS text), "
+    "expected.table_name)) IS NOT NULL AND NOT EXISTS ("
+    "SELECT 1 FROM information_schema.columns actual "
+    "WHERE actual.table_schema = CAST(:schema_name AS text) "
+    "AND actual.table_name = expected.table_name "
+    "AND actual.column_name = expected.column_name "
+    "AND actual.udt_name = expected.udt_name "
+    "AND actual.is_nullable = expected.is_nullable)"
+    "), missing_indexes AS ("
+    "SELECT 'index:ptg2_artifact_blob_artifact_idx' AS capability "
+    "WHERE to_regclass(format('%I.%I', CAST(:schema_name AS text), "
+    "'ptg2_artifact_blob_chunk')) IS NOT NULL AND NOT EXISTS ("
+    "SELECT 1 FROM pg_index index_record "
+    "JOIN pg_class index_relation ON index_relation.oid = index_record.indexrelid "
+    "JOIN pg_class table_relation ON table_relation.oid = index_record.indrelid "
+    "JOIN pg_namespace namespace_record "
+    "ON namespace_record.oid = table_relation.relnamespace "
+    "WHERE namespace_record.nspname = CAST(:schema_name AS text) "
+    "AND table_relation.relname = 'ptg2_artifact_blob_chunk' "
+    "AND index_relation.relname = 'ptg2_artifact_blob_artifact_idx' "
+    "AND index_record.indisvalid AND index_record.indpred IS NULL "
+    "AND index_record.indexprs IS NULL AND ARRAY("
+    "SELECT attribute_record.attname "
+    "FROM unnest(index_record.indkey::smallint[]) WITH ORDINALITY "
+    "AS key_record(attnum, ordinal) JOIN pg_attribute attribute_record "
+    "ON attribute_record.attrelid = table_relation.oid "
+    "AND attribute_record.attnum = key_record.attnum "
+    "WHERE key_record.attnum > 0 ORDER BY key_record.ordinal"
+    ") = ARRAY['artifact_id']::name[])"
+    "), missing_capabilities AS ("
+    "SELECT capability FROM missing_tables UNION ALL "
+    "SELECT capability FROM missing_columns UNION ALL "
+    "SELECT capability FROM missing_indexes) "
+    "SELECT COALESCE(array_agg(capability ORDER BY capability), "
+    "ARRAY[]::text[]) FROM missing_capabilities"
+)
+
+
+class PTG2RuntimeSchemaUnavailable(RuntimeError):
+    """The bounded hot-path schema capability check could not pass."""
+
+    retryable = True
+
+
+async def require_ptg2_runtime_schema_ready() -> None:
+    """Read one bounded catalog capability snapshot without runtime DDL."""
+
+    schema_name = resolve_ptg2_schema()
+    required_table_names = sorted(
+        {
+            *(model.__tablename__ for model in PTG2_MODEL_CLASSES),
+            *PTG2_ALLOWED_AMOUNT_MIGRATION_TABLE_NAMES,
+            *PTG2_V4_ATTEMPT_MIGRATION_TABLE_NAMES,
+            PTG2_LAYOUT_BUILD_CANDIDATE_TABLE,
+            PTG2_BLOCK_BUILD_PIN_TABLE,
+            PTG2_PLAN_CATALOG_OUTBOX_TABLE,
+            PTG2_ARTIFACT_BLOB_TABLE,
+            PTG2_LEGACY_GLOBAL_PROJECTION_QUEUE_TABLE,
+        }
+    )
+    try:
+        async with db.transaction() as session:
+            await configure_ptg2_lifecycle_transaction(
+                session,
+                lock_timeout="100ms",
+                statement_timeout="1s",
+            )
+            missing_result = await session.execute(
+                db.text(_RUNTIME_SCHEMA_CAPABILITY_SQL),
+                {
+                    "schema_name": schema_name,
+                    "table_names": required_table_names,
+                },
+            )
+            missing_capabilities = list(missing_result.scalar_one() or ())
+    except Exception as exc:
+        if not is_retryable_lifecycle_database_error(exc):
+            raise
+        raise PTG2RuntimeSchemaUnavailable(
+            "PTG runtime schema capability read timed out; retry"
+        ) from exc
+    if missing_capabilities:
+        raise PTG2RuntimeSchemaUnavailable(
+            "PTG runtime schema is missing migration-owned capabilities: "
+            + ", ".join(missing_capabilities)
+            + "; run alembic upgrade head"
+        )
 
 
 async def _require_allowed_amount_migration_tables(db_schema: str) -> None:

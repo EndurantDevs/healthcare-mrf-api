@@ -150,9 +150,18 @@ async def _fetch_state_license_summary(session, npi: int, as_of: datetime.date) 
         )
     ).mappings().first()
 
+    return _state_license_summary_from_row(
+        license_summary_row,
+        empty_summary_dict,
+    )
+
+
+def _state_license_summary_from_row(
+    license_summary_row,
+    empty_summary_dict: dict[str, Any],
+) -> dict[str, Any]:
     if not license_summary_row:
         return empty_summary_dict
-
     active_states = sorted(
         {
             str(state).upper()
@@ -267,25 +276,10 @@ async def list_partd_snapshots(request):
     ).offset(pagination.offset).limit(pagination.limit)
 
     snapshot_rows = (await session.execute(data_stmt)).all()
-    snapshot_items = []
-    for snapshot_row in snapshot_rows:
-        mapping = snapshot_row._mapping
-        snapshot_items.append(
-            {
-                "snapshot_id": mapping.get("snapshot_id"),
-                "run_id": mapping.get("run_id"),
-                "source_type": mapping.get("source_type"),
-                "source_url": mapping.get("source_url"),
-                "artifact_name": mapping.get("artifact_name"),
-                "release_date": mapping.get("release_date").isoformat() if mapping.get("release_date") else None,
-                "cutoff_month": mapping.get("cutoff_month").isoformat() if mapping.get("cutoff_month") else None,
-                "status": mapping.get("status"),
-                "row_count_activity": int(mapping.get("row_count_activity") or 0),
-                "row_count_pricing": int(mapping.get("row_count_pricing") or 0),
-                "imported_at": mapping.get("imported_at").isoformat() if mapping.get("imported_at") else None,
-                "metadata": mapping.get("metadata_json") or {},
-            }
-        )
+    snapshot_items = [
+        _partd_snapshot_item(snapshot_row._mapping)
+        for snapshot_row in snapshot_rows
+    ]
 
     return response.json(
         {
@@ -297,6 +291,27 @@ async def list_partd_snapshots(request):
             "items": snapshot_items,
         }
     )
+
+
+def _partd_snapshot_item(mapping) -> dict[str, Any]:
+    """Project one Part D snapshot row into its public response shape."""
+    release_date = mapping.get("release_date")
+    cutoff_month = mapping.get("cutoff_month")
+    imported_at = mapping.get("imported_at")
+    return {
+        "snapshot_id": mapping.get("snapshot_id"),
+        "run_id": mapping.get("run_id"),
+        "source_type": mapping.get("source_type"),
+        "source_url": mapping.get("source_url"),
+        "artifact_name": mapping.get("artifact_name"),
+        "release_date": release_date.isoformat() if release_date else None,
+        "cutoff_month": cutoff_month.isoformat() if cutoff_month else None,
+        "status": mapping.get("status"),
+        "row_count_activity": int(mapping.get("row_count_activity") or 0),
+        "row_count_pricing": int(mapping.get("row_count_pricing") or 0),
+        "imported_at": imported_at.isoformat() if imported_at else None,
+        "metadata": mapping.get("metadata_json") or {},
+    }
 
 
 @blueprint.get("/pharmacies/<npi>/activity")

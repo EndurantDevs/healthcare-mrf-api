@@ -14,6 +14,9 @@ from process.ptg_parts.ptg2_candidate_audit_contract import (
     PTG2_FAST_AUDIT_CONTRACT,
     PTG2_FAST_AUDIT_TOOL_VERSION,
 )
+from process.ptg_parts.ptg2_legacy_global_projection_queue import (
+    PTG2LegacyGlobalProjectionDrain,
+)
 from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_payload,
 )
@@ -501,7 +504,7 @@ def test_record_candidate_attestation_rechecks_freshness_after_lock(monkeypatch)
     )
     monkeypatch.setattr(
         ptg2_candidate_attestation,
-        "acquire_ptg2_lifecycle_lock",
+        "acquire_ptg2_source_lifecycle_lock",
         AsyncMock(),
     )
     monkeypatch.setattr(
@@ -917,7 +920,7 @@ def _install_candidate_attestation_writer(
     )
     monkeypatch.setattr(
         ptg2_candidate_attestation,
-        "acquire_ptg2_lifecycle_lock",
+        "acquire_ptg2_source_lifecycle_lock",
         AsyncMock(),
     )
     monkeypatch.setattr(
@@ -1271,7 +1274,7 @@ def test_writer_cutover_rechecks_contract_under_lock(monkeypatch):
     )
     monkeypatch.setattr(
         ptg2_candidate_attestation,
-        "acquire_ptg2_lifecycle_lock",
+        "acquire_ptg2_source_lifecycle_lock",
         AsyncMock(),
     )
     monkeypatch.setattr(
@@ -1478,10 +1481,16 @@ def test_non_candidate_publication_cannot_rewrite_a_strict_candidate():
 
 
 def _install_generic_candidate_publish_collaborators(monkeypatch):
+    """Install strict candidate-publication collaborators and observers."""
+
     session = object()
     activate = AsyncMock(return_value={"status": "promoted"})
     source_plan_rows = AsyncMock(
         side_effect=AssertionError("legacy path was selected")
+    )
+    mark_projection = AsyncMock()
+    drain_projection = AsyncMock(
+        return_value=PTG2LegacyGlobalProjectionDrain(reconciled=1)
     )
     locked_snapshot = AsyncMock(
         return_value={
@@ -1500,27 +1509,28 @@ def _install_generic_candidate_publish_collaborators(monkeypatch):
         "transaction",
         lambda: _Transaction(session),
     )
-    monkeypatch.setattr(
-        source_pointers,
-        "_acquire_source_pointer_gc_lock",
-        AsyncMock(),
-    )
-    monkeypatch.setattr(
-        source_pointers,
-        "_locked_snapshot_publication_row",
+    collaborator_by_name = {
+        "_acquire_source_pointer_gc_lock": AsyncMock(),
+        "_locked_snapshot_publication_row": locked_snapshot,
+        "_activate_ptg2_source_candidate_in_transaction": activate,
+        "_source_plan_rows": source_plan_rows,
+        "mark_legacy_global_projection_dirty": mark_projection,
+        "drain_legacy_global_projection_queue": drain_projection,
+    }
+    for collaborator_name, collaborator in collaborator_by_name.items():
+        monkeypatch.setattr(
+            source_pointers,
+            collaborator_name,
+            collaborator,
+        )
+    return (
+        session,
         locked_snapshot,
-    )
-    monkeypatch.setattr(
-        source_pointers,
-        "_activate_ptg2_source_candidate_in_transaction",
         activate,
-    )
-    monkeypatch.setattr(
-        source_pointers,
-        "_source_plan_rows",
         source_plan_rows,
+        mark_projection,
+        drain_projection,
     )
-    return session, locked_snapshot, activate, source_plan_rows
 
 
 def test_generic_publish_uses_locked_database_candidate_not_caller_attributes(monkeypatch):
@@ -1530,6 +1540,8 @@ def test_generic_publish_uses_locked_database_candidate_not_caller_attributes(mo
         locked_snapshot,
         activate,
         source_plan_rows,
+        mark_projection,
+        drain_projection,
     ) = _install_generic_candidate_publish_collaborators(
         monkeypatch
     )
@@ -1563,6 +1575,15 @@ def test_generic_publish_uses_locked_database_candidate_not_caller_attributes(mo
         expected_current_snapshot_id="snap_old",
     )
     source_plan_rows.assert_not_awaited()
+    mark_projection.assert_awaited_once_with(
+        session,
+        schema_name="mrf",
+        source_key="source_a",
+    )
+    drain_projection.assert_awaited_once_with(
+        max_requests=1,
+        source_key="source_a",
+    )
 
 
 def test_candidate_metadata_is_reread_from_postgres_under_row_lock():
@@ -1817,7 +1838,7 @@ def _install_reviewed_activation_readers(
     monkeypatch.setattr(
         source_pointers,
         "_acquire_source_pointer_gc_lock",
-        lambda _session: record_event("lock"),
+        lambda _session, **_kwargs: record_event("lock"),
     )
     monkeypatch.setattr(
         source_pointers,
@@ -1855,6 +1876,10 @@ def _install_reviewed_activation_writers(
     compare_and_swap,
     consume,
 ):
+    async def drain_projection(**_kwargs):
+        await record_event("global")
+        return PTG2LegacyGlobalProjectionDrain(reconciled=1)
+
     monkeypatch.setattr(
         source_pointers,
         "_compare_and_swap_source_pointer",
@@ -1867,8 +1892,13 @@ def _install_reviewed_activation_writers(
     )
     monkeypatch.setattr(
         source_pointers,
-        "_reconcile_global_snapshot_pointer",
-        lambda _session, **_kwargs: record_event("global"),
+        "mark_legacy_global_projection_dirty",
+        lambda _session, **_kwargs: record_event("projection_marked"),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "drain_legacy_global_projection_queue",
+        drain_projection,
     )
     monkeypatch.setattr(
         source_pointers,
@@ -1906,9 +1936,10 @@ def _assert_reviewed_activation(
         "verify",
         "source_cas",
         "publish",
-        "global",
         "plan_pointers",
         "consume",
+        "projection_marked",
+        "global",
     ]
     assert cas_calls[0]["allow_already_current"] is False
     assert verification_calls[0]["expected_attestation_digest"] == approval_digest
@@ -2017,7 +2048,7 @@ def _install_mixed_candidate_activation_readers(
     monkeypatch.setattr(
         source_pointers,
         "_acquire_source_pointer_gc_lock",
-        lambda _session: record_event("lock"),
+        lambda _session, **_kwargs: record_event("lock"),
     )
     monkeypatch.setattr(
         source_pointers,
@@ -2051,6 +2082,10 @@ def _install_mixed_candidate_activation_writers(
 ):
     """Install pointer, snapshot, plan, and attestation writers."""
 
+    async def drain_projection(**_kwargs):
+        await record_event("global")
+        return PTG2LegacyGlobalProjectionDrain(reconciled=1)
+
     monkeypatch.setattr(
         source_pointers,
         "_compare_and_swap_source_pointer",
@@ -2063,8 +2098,13 @@ def _install_mixed_candidate_activation_writers(
     )
     monkeypatch.setattr(
         source_pointers,
-        "_reconcile_global_snapshot_pointer",
-        lambda _session, **_kwargs: record_event("global"),
+        "mark_legacy_global_projection_dirty",
+        lambda _session, **_kwargs: record_event("projection_marked"),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "drain_legacy_global_projection_queue",
+        drain_projection,
     )
     monkeypatch.setattr(
         source_pointers,
@@ -2132,9 +2172,10 @@ def test_audited_mixed_candidate_activates_allowed_pointer_in_same_transaction(
         "cas:source_a",
         "cas:source_a_allowed_amounts",
         "publish",
-        "global",
         "plan_pointers",
         "consume",
+        "projection_marked",
+        "global",
     ]
     assert [call["previous_snapshot_id"] for call in cas_calls] == [
         "snap_old",
@@ -2555,7 +2596,7 @@ def _install_v4_attestation_writer(
     )
     monkeypatch.setattr(
         ptg2_candidate_attestation,
-        "acquire_ptg2_lifecycle_lock",
+        "acquire_ptg2_source_lifecycle_lock",
         AsyncMock(),
     )
     monkeypatch.setattr(
