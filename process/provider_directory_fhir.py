@@ -16152,12 +16152,16 @@ def _artifact_dataset_all_source_selection_sql(
     dataset_ref: str,
     source_ref: str,
 ) -> str:
+    """Select every proof-bound alias without amplifying endpoint datasets."""
+
     return f"""
         selected_endpoints AS MATERIALIZED (
-            SELECT dataset.endpoint_id
+            SELECT dataset.endpoint_id,
+                   dataset.publication_metadata_json::jsonb
+                       AS publication_metadata
               FROM ranked_datasets AS dataset
              WHERE dataset.selection_rank = 1
-        ), selected_sources AS MATERIALIZED (
+        ), eligible_sources AS MATERIALIZED (
             SELECT source.source_id,
                    COALESCE(
                        candidate.endpoint_id,
@@ -16177,11 +16181,31 @@ def _artifact_dataset_all_source_selection_sql(
                   dataset_ref,
                   source_ref,
               )}
-             WHERE source.endpoint_id IN (
-                       SELECT endpoint_id FROM selected_endpoints
+             WHERE COALESCE(
+                       candidate.endpoint_id,
+                       published_alias.endpoint_id,
+                       source.endpoint_id
+                   ) IN (SELECT endpoint_id FROM selected_endpoints)
+        ), proof_bound_sources AS MATERIALIZED (
+            SELECT eligible.*
+              FROM eligible_sources AS eligible
+              JOIN selected_endpoints AS selected_endpoint
+                ON selected_endpoint.endpoint_id = eligible.endpoint_id
+             WHERE selected_endpoint.publication_metadata
+                       -> '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'
+                       IS NULL
+                OR selected_endpoint.publication_metadata -> 'source_ids'
+                       @> jsonb_build_array(eligible.source_id)
+        ), selected_sources AS MATERIALIZED (
+            SELECT proof_bound.*
+              FROM proof_bound_sources AS proof_bound
+             WHERE (
+                       SELECT count(DISTINCT endpoint_id)
+                         FROM eligible_sources
+                   ) = (
+                       SELECT count(DISTINCT endpoint_id)
+                         FROM proof_bound_sources
                    )
-                OR candidate.endpoint_id IS NOT NULL
-                OR published_alias.endpoint_id IS NOT NULL
         )
     """
 

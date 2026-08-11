@@ -484,8 +484,9 @@ scope. An artifact-only run with explicit `source_ids` publishes exactly those
 source aliases, while still resolving and fencing the shared immutable endpoint
 dataset. It does not expand the request to sibling rows that happen to carry the
 same `endpoint_id`. An unfiltered artifact publication still selects all source
-aliases, and acquisition may continue to pass its complete endpoint group
-explicitly when every alias is required.
+aliases sealed into each selected dataset's stored content proof. Datasets
+without a stored proof retain the endpoint-wide legacy fallback, and existing
+catalog rows outside the refreshed proof scope are copied forward.
 
 Each endpoint acquisition writes to a non-current
 `provider_directory_endpoint_dataset` candidate. Normalized resources are

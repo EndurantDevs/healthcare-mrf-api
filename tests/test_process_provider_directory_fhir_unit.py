@@ -10887,6 +10887,18 @@ async def test_artifact_dataset_selection_scopes_explicit_and_filters_all_source
     assert "publication_metadata_json::jsonb -> 'source_ids'" in all_sql
 
 
+def test_all_source_selection_sql_binds_stored_proof_scope():
+    """Keep global endpoint aliases inside their stored content proof."""
+
+    sql = importer._provider_directory_artifact_dataset_selection_sql(None)
+
+    assert "proof_bound_sources AS MATERIALIZED" in sql
+    assert (
+        f"-> '{importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'" in sql
+    )
+    assert "count(DISTINCT endpoint_id)" in sql
+
+
 @pytest.mark.asyncio
 async def test_humana_explicit_artifact_selection_rejects_18_alias_expansion(
     monkeypatch,
