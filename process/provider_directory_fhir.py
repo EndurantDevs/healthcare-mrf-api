@@ -69301,6 +69301,56 @@ class ResourceGroupScanRunner:
             fetch_result,
         )
 
+    def _is_reviewed_serial_stop_required(self, resource_type: str) -> bool:
+        """Return whether reviewed traversal must finalize before another cursor."""
+
+        contract = current_version_census_contract(self.source_record)
+        diagnostic = self.diagnostic_by_resource.get(resource_type)
+        if not (
+            contract is not None
+            and contract.is_server_issued_subset_v3
+            and resource_type in contract.resources
+            and isinstance(diagnostic, dict)
+        ):
+            return False
+        error = _clean_text(diagnostic.get("error"))
+        is_terminal_failure = bool(
+            error and error.startswith(CURRENT_VERSION_CENSUS_BLOCKED_ERROR)
+        )
+        return bool(
+            not is_terminal_failure
+            and (
+                not _is_resource_diagnostic_acquisition_complete(diagnostic)
+                or error
+                or diagnostic.get("bounded")
+            )
+        )
+
+    def _warn_reviewed_serial_stop(self, resource_type: str) -> None:
+        """Log bounded evidence before the existing finalizer classifies it."""
+
+        diagnostic = self.diagnostic_by_resource[resource_type]
+        raw_error = _clean_text(diagnostic.get("error")) or "incomplete"
+        error_prefix, separator, error_class = raw_error.partition(":")
+        if error_prefix not in {
+            CURRENT_VERSION_CENSUS_RETRYABLE_ERROR,
+            CURRENT_VERSION_CENSUS_BLOCKED_ERROR,
+        }:
+            safe_error = "incomplete"
+        elif separator and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", error_class):
+            safe_error = f"{error_prefix}:{error_class}"
+        else:
+            safe_error = error_prefix
+        LOGGER.warning(
+            "Provider Directory reviewed serial scan stopped: "
+            "resource_type=%s error=%s pages=%s rows=%s retry_not_before=%s",
+            resource_type,
+            safe_error,
+            diagnostic.get("pages_fetched"),
+            diagnostic.get("rows_fetched"),
+            diagnostic.get("retry_not_before"),
+        )
+
     async def _run_bounded(
         self,
         resource_type: str,
@@ -69396,6 +69446,9 @@ class ResourceGroupScanRunner:
             candidate = await self.import_one(resource_type, report_start=True)
             if candidate is not None:
                 zero_role_result = candidate
+            if self._is_reviewed_serial_stop_required(resource_type):
+                self._warn_reviewed_serial_stop(resource_type)
+                break
         return zero_role_result
 
 
