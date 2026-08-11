@@ -243,6 +243,62 @@ def test_serving_by_provider_set_candidate_roundtrips_and_groups_patterns(tmp_pa
     assert result["gzip_bytes"] > 0
     assert result["source_sha256"] == result["decoded_sha256"]
 
+def test_postgres_binary_candidate_assembles_roundtrip_report(monkeypatch):
+    forward_record_dict = {
+        "source_sha256": "forward",
+        "row_count": 2,
+        "records": ["hidden"],
+    }
+    reverse_record_dict = {
+        "source_sha256": "reverse",
+        "row_count": 2,
+        "records": ["hidden"],
+    }
+    monkeypatch.setattr(
+        harness,
+        "postgres_binary_candidate_table_names",
+        lambda **_kwargs: {"serving_binary": "mrf.research_binary"},
+    )
+    monkeypatch.setattr(
+        harness,
+        "_build_postgres_binary_records",
+        lambda *_args: (
+            forward_record_dict,
+            reverse_record_dict,
+            1.25,
+            "forward",
+            "reverse",
+        ),
+    )
+    monkeypatch.setattr(
+        harness,
+        "_postgres_binary_storage_benchmarks",
+        lambda *_args: (
+            {"source_rows": 2, "artifact_total_bytes": 10, "source_total_bytes": 100},
+            {"by_code_fetch": {"execution_ms": 0.2}},
+        ),
+    )
+
+    analysis_report_dict = harness.analyze_postgres_binary_candidate(
+        env_overrides={},
+        serving_table="mrf.serving",
+        import_run_id="run_1",
+        variant_id="variant_1",
+        include_reverse=True,
+    )
+
+    assert analysis_report_dict["status"] == "passed"
+    assert analysis_report_dict["combined_row_count"] == 4
+    assert analysis_report_dict["reduction_ratio_vs_pg_total"] == 10.0
+    assert analysis_report_dict["forward"] == {
+        "source_sha256": "forward",
+        "row_count": 2,
+    }
+    assert analysis_report_dict["reverse"] == {
+        "source_sha256": "reverse",
+        "row_count": 2,
+    }
+
 def test_local_ptg_cli_full_file_dry_run_omits_max_items(tmp_path, monkeypatch):
     monkeypatch.setenv("HLTHPRT_DB_USER", "tester")
     benchmark_suite_dict = {

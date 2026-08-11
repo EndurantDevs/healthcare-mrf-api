@@ -291,7 +291,6 @@ def _validated_resource_json_rows(
 ) -> tuple[tuple[str, str], ...]:
     canonical_json_by_id: dict[str, str] = {}
     admitted_resource_ids: set[str] = set()
-    ambiguous_resource_count = 0
     for entry_by_field in entries:
         resource_by_field = _entry_practitioner(entry_by_field)
         exact_npis = _exact_resource_npis(resource_by_field)
@@ -305,12 +304,8 @@ def _validated_resource_json_rows(
         if previous_json is not None and previous_json != canonical_json:
             raise UHCFlexPractitionerQueryError("duplicate_resource_conflict")
         canonical_json_by_id[resource_id] = canonical_json
-        if any(resource_npi != requested_npi for resource_npi in exact_npis):
-            ambiguous_resource_count += 1
-        else:
+        if all(resource_npi == requested_npi for resource_npi in exact_npis):
             admitted_resource_ids.add(resource_id)
-    if not admitted_resource_ids and ambiguous_resource_count:
-        raise UHCFlexPractitionerQueryError("cross_npi")
     return tuple((key, canonical_json_by_id[key]) for key in sorted(admitted_resource_ids))
 
 
@@ -375,7 +370,7 @@ def _validate_stored_result_resources(
 
 @dataclass(frozen=True, slots=True, repr=False)
 class UHCFlexPractitionerQueryResult:
-    """Hold a deterministic matched or explicit unmatched response result."""
+    """Hold one deterministic admitted matched or unmatched result."""
 
     requested_npi: int
     outcome: str
@@ -408,7 +403,7 @@ class UHCFlexPractitionerQueryResult:
 
     @property
     def is_unmatched(self) -> bool:
-        """Return whether the exact query produced no Practitioner match."""
+        """Return whether the query produced no admissible exact resource."""
 
         return self.outcome == UHC_FLEX_PRACTITIONER_UNMATCHED
 

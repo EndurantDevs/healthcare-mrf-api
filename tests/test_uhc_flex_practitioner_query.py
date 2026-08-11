@@ -256,7 +256,7 @@ def test_search_bundle_requires_the_exact_us_npi_identifier_system():
     )
 
 
-def test_search_bundle_rejects_a_second_exact_cross_npi_identifier():
+def test_search_bundle_quarantines_an_ambiguous_only_result():
     resource = _practitioner("practitioner-a")
     resource["identifier"].append(
         {
@@ -265,7 +265,37 @@ def test_search_bundle_rejects_a_second_exact_cross_npi_identifier():
         }
     )
 
-    assert _validation_error_code(_search_bundle([resource])) == "cross_npi"
+    response_payload = _search_bundle([resource], total=1)
+    response_payload["entry"][0]["search"] = {"mode": "match"}
+    result = validate_uhc_flex_practitioner_search_bundle(
+        REQUESTED_NPI,
+        response_payload,
+    )
+    empty_result = validate_uhc_flex_practitioner_search_bundle(
+        REQUESTED_NPI,
+        _search_bundle([], total=0),
+    )
+
+    assert result.outcome == UHC_FLEX_PRACTITIONER_UNMATCHED
+    assert result.is_unmatched is True
+    assert result.resource_count == 0
+    assert result.resource_ids == ()
+    assert result.resource_payloads() == ()
+    assert result.resource_sha256_by_id == ()
+    assert result.result_sha256 == empty_result.result_sha256
+
+
+def test_search_bundle_never_ignores_a_foreign_only_sibling():
+    exact_resource = _practitioner("practitioner-a")
+    foreign_resource = _practitioner("practitioner-b", OTHER_NPI)
+
+    for resource_rows in (
+        [exact_resource, foreign_resource],
+        [foreign_resource, exact_resource],
+    ):
+        assert _validation_error_code(
+            _search_bundle(resource_rows, total=2)
+        ) == "cross_npi"
 
 
 def test_search_bundle_keeps_exact_resource_and_omits_ambiguous_sibling():

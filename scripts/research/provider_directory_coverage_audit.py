@@ -4932,7 +4932,12 @@ def _plan_network_context_cte_sql(schema: str) -> str:
               FROM refs
              GROUP BY source_id
         ),
-        distinct_refs AS MATERIALIZED (
+    """ + _plan_network_context_tail_cte_sql(schema)
+
+
+def _plan_network_context_tail_cte_sql(schema: str) -> str:
+    """Build the resolved-network tail of the plan context CTE."""
+    return f"""    distinct_refs AS MATERIALIZED (
             SELECT DISTINCT source_id, ref, ref_resource_id
               FROM refs
         ),
@@ -7144,19 +7149,19 @@ def run_provider_directory_coverage_audit(argv: list[str] | None = None) -> int:
     report = asyncio.run(build_report(args))
     if args.format == "markdown":
         sys.stdout.write(render_markdown(report))
-    elif args.format == "credential-backlog-json":
+    if args.format == "credential-backlog-json":
         json.dump(_credential_backlog_export(report), sys.stdout, indent=2, sort_keys=True, default=str)
         sys.stdout.write("\n")
-    elif args.format == "credential-api-bases-json":
+    if args.format == "credential-api-bases-json":
         json.dump(_credential_api_base_targets_export(report), sys.stdout, indent=2, sort_keys=True, default=str)
         sys.stdout.write("\n")
-    elif args.format == "credential-config-template-json":
+    if args.format == "credential-config-template-json":
         json.dump(_credential_config_template_export(report), sys.stdout, indent=2, sort_keys=True, default=str)
         sys.stdout.write("\n")
-    elif args.format == "credential-priority-json":
+    if args.format == "credential-priority-json":
         json.dump(_credential_priority_export(report), sys.stdout, indent=2, sort_keys=True, default=str)
         sys.stdout.write("\n")
-    else:
+    if args.format == "json":
         json.dump(report, sys.stdout, indent=2, sort_keys=True, default=str)
         sys.stdout.write("\n")
     exit_code = _serving_readiness_exit_code(
