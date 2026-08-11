@@ -20,13 +20,8 @@ from process.address_numeric_grid_alias import (
     _reviewer,
     _statement_timeout,
 )
-from process.address_numeric_grid_alias_support import NumericGridAliasResult
 from process.address_numeric_grid_alias_revoke import _reason, _uuid
-from process.address_strict_source_backfill import (
-    StrictSourceBackfillResult,
-    _target_limit,
-)
-from process import address_numeric_grid_alias_worker
+from process.address_strict_source_backfill import _target_limit
 from process.ext import (
     address_alias_sql,
     address_canon,
@@ -258,7 +253,7 @@ def test_alias_generation_lock_precedes_every_materialization_fence():
     bundled_cutover = inspect.getsource(
         provider_directory._promote_provider_directory_artifact_bundle_transaction
     )
-    resolver = inspect.getsource(address_canon._apply_persisted_numeric_grid_aliases)
+    resolver = inspect.getsource(address_canon._validated_active_alias_state)
     entity_cutover = inspect.getsource(entity_address._run_entity_address_cutover)
 
     assert single_cutover.index("alias_advisory_xact_lock_sql") < single_cutover.index(
@@ -276,16 +271,19 @@ def test_alias_generation_lock_precedes_every_materialization_fence():
 
 
 def test_apply_waits_for_archive_writers_before_reading_reviewed_evidence():
-    source = inspect.getsource(
-        importlib.import_module(
-            "process.address_numeric_grid_alias"
-        ).run_numeric_grid_alias
+    alias_module = importlib.import_module("process.address_numeric_grid_alias")
+    locking_source = inspect.getsource(
+        alias_module._NumericGridAliasRunner._configure_and_lock
+    )
+    review_source = inspect.getsource(
+        alias_module._NumericGridAliasRunner._validate_reviewed_shadow
     )
 
-    assert 'isolation = "READ COMMITTED" if operation == "apply"' in source
-    assert source.index("_archive_lock_key") < source.index(
+    assert '"READ COMMITTED" if execution.operation == "apply"' in locking_source
+    assert locking_source.index("_archive_lock_key") < locking_source.index(
         "alias_advisory_xact_lock_sql"
-    ) < source.index("LOCK TABLE") < source.index("reviewed shadow changed before apply")
+    ) < locking_source.index("LOCK TABLE")
+    assert "reviewed shadow changed before apply" in review_source
 
 
 def test_shadow_review_attribution_is_written_only_on_new_approvals():
@@ -302,7 +300,7 @@ def test_shadow_review_attribution_is_written_only_on_new_approvals():
 
 @pytest.mark.asyncio
 async def test_unified_overlay_generation_and_relation_fence_fail_closed(monkeypatch):
-    selected_overlay = [
+    selected_overlay_queries = [
         "SELECT * FROM mrf.provider_directory_address_overlay AS overlay"
     ]
     read_fence = AsyncMock(return_value=(1, 11))
@@ -311,28 +309,28 @@ async def test_unified_overlay_generation_and_relation_fence_fail_closed(monkeyp
         "_provider_directory_overlay_alias_fence",
         read_fence,
     )
-    context = {"address_alias_generation": 2}
+    fence_context_by_field = {"address_alias_generation": 2}
 
     with pytest.raises(RuntimeError, match="stale address alias generation"):
         await entity_address._capture_provider_directory_overlay_alias_fence(
             "mrf",
-            selected_overlay,
-            context,
+            selected_overlay_queries,
+            fence_context_by_field,
         )
 
     read_fence.return_value = (2, 11)
     await entity_address._capture_provider_directory_overlay_alias_fence(
         "mrf",
-        selected_overlay,
-        context,
+        selected_overlay_queries,
+        fence_context_by_field,
     )
-    assert context["provider_directory_overlay_relation_oid"] == 11
+    assert fence_context_by_field["provider_directory_overlay_relation_oid"] == 11
 
     read_fence.return_value = (2, 12)
     with pytest.raises(RuntimeError, match="overlay changed"):
         await entity_address._assert_provider_directory_overlay_alias_fence(
             "mrf",
-            context,
+            fence_context_by_field,
         )
 
 
@@ -344,16 +342,16 @@ async def test_unified_without_selected_overlay_does_not_require_receipt(monkeyp
         "_provider_directory_overlay_alias_fence",
         read_fence,
     )
-    context = {"address_alias_generation": 2}
+    fence_context_by_field = {"address_alias_generation": 2}
 
     await entity_address._capture_provider_directory_overlay_alias_fence(
         "mrf",
         ["SELECT * FROM mrf.npi_address"],
-        context,
+        fence_context_by_field,
     )
 
     read_fence.assert_not_awaited()
-    assert "provider_directory_overlay_relation_oid" not in context
+    assert "provider_directory_overlay_relation_oid" not in fence_context_by_field
 
 
 @pytest.mark.asyncio
@@ -451,156 +449,9 @@ async def test_overlay_full_rebuild_can_advance_alias_generation_receipt(monkeyp
         build,
     )
 
-    result = await provider_directory.publish_provider_directory_address_overlay("mrf")
+    publish_result = await provider_directory.publish_provider_directory_address_overlay(
+        "mrf"
+    )
 
-    assert result == {"published": True}
+    assert publish_result == {"published": True}
     assert build.await_args.args[5].alias_generation == 2
-
-
-@pytest.mark.asyncio
-async def test_control_worker_forwards_reviewed_alias_inputs_and_progress(monkeypatch):
-    result = NumericGridAliasResult(
-        run_id="00000000-0000-0000-0000-000000000001",
-        mode="shadow",
-        status="sealed",
-        candidate_digest="a" * 64,
-        source_count=3,
-        candidate_sources=2,
-        candidate_rows=2,
-        no_candidate=1,
-        active_skipped=0,
-        eligible=1,
-        ambiguous=1,
-        insufficient_provenance=0,
-        promoted=0,
-        generation=7,
-        sample_rows=[],
-    )
-    run = AsyncMock(return_value=result)
-    cancel = AsyncMock()
-    progress = Mock()
-    monkeypatch.setattr(address_numeric_grid_alias_worker, "run_numeric_grid_alias", run)
-    monkeypatch.setattr(address_numeric_grid_alias_worker, "raise_if_cancelled", cancel)
-    monkeypatch.setattr(address_numeric_grid_alias_worker, "enqueue_live_progress", progress)
-
-    payload = await address_numeric_grid_alias_worker.process_data(
-        {"worker": "synthetic"},
-        {
-            "mode": "shadow",
-            "state_code": "UT",
-            "zip_prefix": "84",
-            "sample_limit": 5,
-            "timeout": "30s",
-        },
-    )
-
-    assert payload == result.__dict__
-    assert run.await_args.kwargs["state_code"] == "UT"
-    assert run.await_args.kwargs["zip_prefix"] == "84"
-    assert run.await_args.kwargs["sample_limit"] == 5
-    assert run.await_args.kwargs["timeout"] == "30s"
-    await run.await_args.kwargs["cancel_check"]()
-    cancel.assert_awaited_once_with(
-        {"worker": "synthetic"},
-        {
-            "mode": "shadow",
-            "state_code": "UT",
-            "zip_prefix": "84",
-            "sample_limit": 5,
-            "timeout": "30s",
-        },
-    )
-    assert progress.call_args.kwargs["run_id"] == result.run_id
-    assert progress.call_args.kwargs["status"] == "succeeded"
-    assert progress.call_args.kwargs["source_count"] == 3
-
-
-@pytest.mark.asyncio
-async def test_control_worker_forwards_strict_source_backfill_inputs(monkeypatch):
-    result = StrictSourceBackfillResult(
-        run_id="00000000-0000-0000-0000-000000000002",
-        status="backfilled",
-        reviewed_shadow_run_id="00000000-0000-0000-0000-000000000001",
-        reviewed_candidate_digest="b" * 64,
-        evidence_digest="c" * 64,
-        target_count=2,
-        evidence_target_count=1,
-        evidence_pair_count=2,
-        updated_target_count=1,
-        source_target_counts={"nppes": 1, "provider_directory_overlay": 1},
-        missing_relations=[],
-        generation=4,
-    )
-    run = AsyncMock(return_value=result)
-    progress = Mock()
-    monkeypatch.setattr(
-        address_numeric_grid_alias_worker,
-        "run_strict_source_backfill",
-        run,
-    )
-    monkeypatch.setattr(address_numeric_grid_alias_worker, "enqueue_live_progress", progress)
-
-    payload = await address_numeric_grid_alias_worker.process_address_strict_source_backfill(
-        {},
-        {
-            "alias_run_id": result.reviewed_shadow_run_id,
-            "expected_candidate_sha256": result.reviewed_candidate_digest,
-            "reviewed_by": "synthetic-reviewer",
-            "max_targets": 12,
-            "timeout": "45s",
-        },
-    )
-
-    assert payload == result.__dict__
-    assert run.await_args.kwargs["alias_run_id"] == result.reviewed_shadow_run_id
-    assert run.await_args.kwargs["max_targets"] == 12
-    assert run.await_args.kwargs["timeout"] == "45s"
-    assert "schema" not in run.await_args.kwargs
-    assert progress.call_args.kwargs["source_target_counts"] == {
-        "nppes": 1,
-        "provider_directory_overlay": 1,
-    }
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("max_targets", (0, 10_001))
-async def test_strict_backfill_worker_rejects_out_of_range_mutation_cap(
-    monkeypatch,
-    max_targets,
-):
-    run = AsyncMock()
-    monkeypatch.setattr(
-        address_numeric_grid_alias_worker,
-        "run_strict_source_backfill",
-        run,
-    )
-
-    with pytest.raises(ValueError, match="max_targets"):
-        await address_numeric_grid_alias_worker.process_address_strict_source_backfill(
-            {},
-            {
-                "alias_run_id": "00000000-0000-0000-0000-000000000001",
-                "expected_candidate_sha256": "a" * 64,
-                "reviewed_by": "synthetic-reviewer",
-                "max_targets": max_targets,
-            },
-        )
-
-    run.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_enqueued_strict_backfill_validates_cap_before_queueing(monkeypatch):
-    create_pool = AsyncMock()
-    monkeypatch.setattr(address_numeric_grid_alias_worker, "create_pool", create_pool)
-
-    with pytest.raises(ValueError, match="max_targets"):
-        await address_numeric_grid_alias_worker.run_address_strict_source_backfill_command(
-            alias_run_id="00000000-0000-0000-0000-000000000001",
-            expected_candidate_sha256="a" * 64,
-            reviewed_by="synthetic-reviewer",
-            max_targets=0,
-            enqueue=True,
-        )
-
-    create_pool.assert_not_awaited()

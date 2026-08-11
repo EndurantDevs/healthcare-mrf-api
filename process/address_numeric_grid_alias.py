@@ -7,283 +7,113 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from typing import Any, Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy import text
 
 from db.models import db
+from process.address_numeric_grid_alias_store import (
+    _alias_state,
+    _approve_shadow_candidates,
+    _insert_run,
+    _load_reviewed_shadow,
+    _mark_failed,
+    _shadow_run,
+)
 from process.address_numeric_grid_alias_support import (
+    NumericGridAliasRequest,
     NumericGridAliasResult,
     _candidate_digest,
-    _candidate_sample,
     _normalize_scope,
     _relation,
     _reviewed_digest,
     _reviewer,
     _statement_timeout,
 )
-from process.ext import address_alias_audit_sql, address_alias_sql
+from process.ext import address_alias_sql
 from process.ext.address_canon import _archive_lock_key, archive_table_name
 
 
-async def _alias_state(session: Any, *, schema: str, lock: bool) -> tuple[int, int, int]:
-    suffix = " FOR UPDATE" if lock else ""
-    row = (
-        await session.execute(
-            text(
-                address_alias_sql.active_alias_generation_sql(schema=schema)
-                .strip()
-                .removesuffix(";")
-                + suffix
-            )
-        )
-    ).first()
-    if row is None:
-        raise RuntimeError("address alias singleton state is missing")
-    schema_version = int(row.schema_version)
-    ruleset_version = int(row.active_ruleset_version)
-    generation = int(row.generation)
-    if schema_version != address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION:
-        raise RuntimeError(f"unsupported address alias schema version: {schema_version}")
-    if ruleset_version != address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION:
-        raise RuntimeError(f"unsupported numeric-grid alias ruleset: {ruleset_version}")
-    return schema_version, ruleset_version, generation
+@dataclass
+class _AliasExecution:
+    request: NumericGridAliasRequest
+    operation: str
+    schema: str
+    state_code: str | None
+    zip_prefix: str | None
+    timeout: str
+    run_id: str
+    shadow_run_id: str | None = None
+    reviewed_digest: str | None = None
+    reviewer: str | None = None
+    archive: str = ""
+    generation: int = 0
+    final_generation: int = 0
+    archive_rows: int = 0
+    source_count: int = 0
+    promoted: int = 0
+    digest: str = ""
+    final_status: str = ""
+    metrics_by_reason: dict[str, int] = field(default_factory=dict)
+    sample_rows: list[dict[str, Any]] = field(default_factory=list)
 
 
-async def _insert_run(
-    *,
-    schema: str,
-    run_id: str,
-    mode: str,
-    state_code: str | None,
-    zip_prefix: str | None,
-    shadow_run_id: str | None,
-    reviewed_digest: str | None,
-    reviewed_by: str | None,
-) -> None:
+def _run_completion_sql(schema: str) -> str:
     runs = _relation(schema, address_alias_sql.ADDRESS_ALIAS_RUN_TABLE)
-    await db.status(
-        f"""
-        INSERT INTO {runs} (
-            run_id, alias_kind, ruleset_version, mode, status,
-            reviewed_shadow_run_id, reviewed_candidate_digest, reviewed_by,
-            scope_state_code, scope_zip_prefix
+    return f"""
+        UPDATE {runs}
+           SET status = :status,
+               candidate_digest = :candidate_digest,
+               archive_row_count = :archive_rows,
+               source_count = :source_count,
+               candidate_source_count = :candidate_sources,
+               candidate_row_count = :candidate_rows,
+               no_candidate_count = :no_candidate,
+               active_skipped_count = :active_skipped,
+               eligible_count = :eligible,
+               ambiguous_count = :ambiguous,
+               insufficient_provenance_count = :insufficient,
+               reason_buckets = CAST(:reason_buckets AS jsonb),
+               sample_rows = CAST(:sample_rows AS jsonb),
+               completed_at = now()
+         WHERE run_id = CAST(:run_id AS uuid);
+    """
+
+
+class _NumericGridAliasRunner:
+    def __init__(self, request: NumericGridAliasRequest) -> None:
+        self.request = request
+        self.execution: _AliasExecution | None = None
+
+    async def execute(self) -> NumericGridAliasResult:
+        """Execute one validated alias workflow request."""
+        operation = address_alias_sql.numeric_grid_alias_mode(self.request.mode)
+        schema = (
+            self.request.schema
+            or os.getenv("HLTHPRT_DB_SCHEMA")
+            or os.getenv("DB_SCHEMA")
+            or "mrf"
         )
-        VALUES (
-            CAST(:run_id AS uuid), :alias_kind, :ruleset_version, :mode, 'running',
-            CAST(:shadow_run_id AS uuid), :reviewed_digest, :reviewed_by,
-            :state_code, :zip_prefix
-        );
-        """,
-        run_id=run_id,
-        alias_kind=address_alias_sql.NUMERIC_GRID_ALIAS_KIND,
-        ruleset_version=address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION,
-        mode=mode,
-        shadow_run_id=shadow_run_id,
-        reviewed_digest=reviewed_digest,
-        reviewed_by=reviewed_by,
-        state_code=state_code,
-        zip_prefix=zip_prefix,
-    )
+        if operation == "off":
+            return await self._off_result(schema)
+        self.execution = await self._prepare_execution(operation, schema)
+        await self._insert_execution_run()
+        try:
+            await self._check_cancelled()
+            async with db.transaction() as session:
+                await self._execute_locked(session)
+            return self._result()
+        except Exception as exc:
+            await _mark_failed(schema, self.execution.run_id, exc)
+            raise
 
-
-async def _mark_failed(schema: str, run_id: str, exc: BaseException) -> str | None:
-    """Mark only a still-running job failed, preserving committed outcomes."""
-    runs = _relation(schema, address_alias_sql.ADDRESS_ALIAS_RUN_TABLE)
-    row = await db.first(
-        f"""
-        WITH marked AS (
-            UPDATE {runs}
-               SET status = 'failed',
-                   error_text = LEFT(:error_text, 4000),
-                   completed_at = now()
-             WHERE run_id = CAST(:run_id AS uuid)
-               AND status = 'running'
-            RETURNING status
-        )
-        SELECT status FROM marked
-        UNION ALL
-        SELECT status
-        FROM {runs}
-        WHERE run_id = CAST(:run_id AS uuid)
-          AND NOT EXISTS (SELECT 1 FROM marked)
-        LIMIT 1;
-        """,
-        run_id=run_id,
-        error_text=str(exc),
-    )
-    return str(row.status) if row is not None else None
-
-
-async def _shadow_run(
-    session: Any,
-    *,
-    schema: str,
-    archive: str,
-    run_id: str,
-    state_code: str | None,
-    zip_prefix: str | None,
-    sample_limit: int,
-    retry_shadow_run_id: str | None,
-) -> tuple[dict[str, int], str, list[dict[str, Any]], int, int]:
-    scope = {
-        "run_id": run_id,
-        "scope_state_code": state_code,
-        "scope_zip_prefix": zip_prefix,
-        "retry_shadow_run_id": retry_shadow_run_id,
-    }
-    archive_rows = int(
-        (await session.execute(text(f"SELECT count(*) FROM {archive};"))).scalar() or 0
-    )
-    source_count = int(
-        (
-            await session.execute(
-                text(
-                    address_alias_sql.numeric_grid_source_count_sql(
-                        schema=schema,
-                        archive=archive,
-                    )
-                ),
-                scope,
-            )
-        ).scalar()
-        or 0
-    )
-    await session.execute(
-        text(
-            address_alias_sql.numeric_grid_candidate_insert_sql(
-                schema=schema,
-                archive=archive,
-            )
-        ),
-        scope,
-    )
-    raw_metrics = (
-        await session.execute(
-            text(address_alias_sql.candidate_metrics_sql(schema=schema)),
-            {"run_id": run_id},
-        )
-    ).scalar() or {}
-    metrics = json.loads(raw_metrics) if isinstance(raw_metrics, str) else dict(raw_metrics)
-    metrics = {str(key): int(value or 0) for key, value in metrics.items()}
-    active_skipped = int(
-        (
-            await session.execute(
-                text(
-                    address_alias_audit_sql.numeric_grid_skipped_source_count_sql(
-                        schema=schema,
-                        archive=archive,
-                    )
-                ),
-                scope,
-            )
-        ).scalar()
-        or 0
-    )
-    candidate_sources = metrics.get("candidate_sources", 0)
-    metrics["active_skipped"] = active_skipped
-    metrics["no_candidate"] = max(
-        source_count - active_skipped - candidate_sources,
-        0,
-    )
-    candidate_rows = (
-        await session.execute(
-            text(address_alias_sql.candidate_rows_sql(schema=schema)),
-            {"run_id": run_id},
-        )
-    ).all()
-    return (
-        metrics,
-        _candidate_digest(candidate_rows),
-        _candidate_sample(candidate_rows, sample_limit),
-        archive_rows,
-        source_count,
-    )
-
-
-async def _load_reviewed_shadow(
-    *,
-    schema: str,
-    shadow_run_id: str,
-    expected_digest: str,
-) -> dict[str, Any]:
-    runs = _relation(schema, address_alias_sql.ADDRESS_ALIAS_RUN_TABLE)
-    row = await db.first(
-        f"""
-        SELECT *
-        FROM {runs}
-        WHERE run_id = CAST(:run_id AS uuid)
-          AND mode = 'shadow';
-        """,
-        run_id=shadow_run_id,
-    )
-    if row is None:
-        raise ValueError("reviewed shadow run was not found")
-    shadow = dict(row._mapping)
-    if shadow.get("status") != "sealed":
-        raise ValueError("reviewed shadow run must be sealed")
-    if shadow.get("candidate_digest") != expected_digest:
-        raise ValueError("reviewed candidate digest does not match the sealed shadow run")
-    return shadow
-
-
-async def _approve_shadow_candidates(
-    session: Any,
-    *,
-    schema: str,
-    shadow_run_id: str,
-    reviewer: str,
-) -> None:
-    candidates = _relation(schema, address_alias_sql.ADDRESS_ALIAS_CANDIDATE_TABLE)
-    runs = _relation(schema, address_alias_sql.ADDRESS_ALIAS_RUN_TABLE)
-    await session.execute(
-        text(
-            f"""
-            WITH approved AS (
-                UPDATE {candidates}
-                   SET review_status = 'approved',
-                       reviewed_by = :reviewed_by,
-                       reviewed_at = now()
-                 WHERE run_id = CAST(:shadow_run_id AS uuid)
-                   AND decision = 'eligible'
-                   AND review_status = 'pending'
-                RETURNING 1
-            )
-            UPDATE {runs}
-               SET reviewed_by = :reviewed_by,
-                   reviewed_at = now()
-             WHERE run_id = CAST(:shadow_run_id AS uuid)
-               AND reviewed_by IS NULL
-               AND reviewed_at IS NULL
-               AND EXISTS (SELECT 1 FROM approved);
-            """
-        ),
-        {"shadow_run_id": shadow_run_id, "reviewed_by": reviewer},
-    )
-
-
-async def run_numeric_grid_alias(
-    *,
-    mode: str = "off",
-    schema: str | None = None,
-    state_code: str | None = None,
-    zip_prefix: str | None = None,
-    alias_run_id: str | None = None,
-    expected_candidate_sha256: str | None = None,
-    reviewed_by: str | None = None,
-    sample_limit: int = 20,
-    timeout: str = "10min",
-    cancel_check: Callable[[], Awaitable[None]] | None = None,
-) -> NumericGridAliasResult:
-    """Run a sealed shadow or apply its exact reviewed candidate set."""
-    operation = address_alias_sql.numeric_grid_alias_mode(mode)
-    db_schema = schema or os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
-    if operation == "off":
+    async def _off_result(self, schema: str) -> NumericGridAliasResult:
         async with db.transaction() as session:
-            _, _, generation = await _alias_state(session, schema=db_schema, lock=False)
+            _, _, generation = await _alias_state(session, schema=schema, lock=False)
         return NumericGridAliasResult(
             run_id=None,
-            mode=operation,
+            mode="off",
             status="off",
             candidate_digest=None,
             source_count=0,
@@ -299,268 +129,331 @@ async def run_numeric_grid_alias(
             sample_rows=[],
         )
 
-    normalized_state, normalized_zip = _normalize_scope(state_code, zip_prefix)
-    normalized_timeout = _statement_timeout(timeout)
-    reviewed_digest = None
-    reviewer = None
-    shadow: dict[str, Any] | None = None
-    if operation == "apply":
-        shadow_run_id = str(alias_run_id or "").strip()
+    async def _prepare_execution(
+        self,
+        operation: str,
+        schema: str,
+    ) -> _AliasExecution:
+        state_code, zip_prefix = _normalize_scope(
+            self.request.state_code,
+            self.request.zip_prefix,
+        )
+        execution = _AliasExecution(
+            request=self.request,
+            operation=operation,
+            schema=schema,
+            state_code=state_code,
+            zip_prefix=zip_prefix,
+            timeout=_statement_timeout(self.request.timeout),
+            run_id=str(uuid.uuid4()),
+        )
+        if operation == "apply":
+            await self._bind_reviewed_shadow(execution)
+        return execution
+
+    async def _bind_reviewed_shadow(self, execution: _AliasExecution) -> None:
+        shadow_run_id = str(self.request.alias_run_id or "").strip()
         try:
             uuid.UUID(shadow_run_id)
         except (ValueError, TypeError):
             raise ValueError("apply requires a valid alias_run_id") from None
-        reviewed_digest = _reviewed_digest(expected_candidate_sha256)
-        reviewer = _reviewer(reviewed_by)
-        shadow = await _load_reviewed_shadow(
-            schema=db_schema,
+        reviewed_digest = _reviewed_digest(self.request.expected_candidate_sha256)
+        shadow_by_field = await _load_reviewed_shadow(
+            schema=execution.schema,
             shadow_run_id=shadow_run_id,
             expected_digest=reviewed_digest,
         )
-        if normalized_state not in {None, shadow.get("scope_state_code")}:
+        if execution.state_code not in {None, shadow_by_field.get("scope_state_code")}:
             raise ValueError("apply state scope differs from the reviewed shadow")
-        if normalized_zip not in {None, shadow.get("scope_zip_prefix")}:
+        if execution.zip_prefix not in {None, shadow_by_field.get("scope_zip_prefix")}:
             raise ValueError("apply ZIP scope differs from the reviewed shadow")
-        normalized_state = shadow.get("scope_state_code")
-        normalized_zip = shadow.get("scope_zip_prefix")
-    else:
-        shadow_run_id = None
+        execution.state_code = shadow_by_field.get("scope_state_code")
+        execution.zip_prefix = shadow_by_field.get("scope_zip_prefix")
+        execution.shadow_run_id = shadow_run_id
+        execution.reviewed_digest = reviewed_digest
+        execution.reviewer = _reviewer(self.request.reviewed_by)
 
-    run_id = str(uuid.uuid4())
-    await _insert_run(
-        schema=db_schema,
-        run_id=run_id,
-        mode=operation,
-        state_code=normalized_state,
-        zip_prefix=normalized_zip,
-        shadow_run_id=shadow_run_id,
-        reviewed_digest=reviewed_digest,
-        reviewed_by=reviewer,
-    )
-    try:
-        if cancel_check:
-            await cancel_check()
-        async with db.transaction() as session:
-            isolation = "READ COMMITTED" if operation == "apply" else "REPEATABLE READ"
-            await session.execute(text(f"SET TRANSACTION ISOLATION LEVEL {isolation};"))
-            await session.execute(
-                text(f"SET LOCAL lock_timeout = '{normalized_timeout}';")
-            )
-            await session.execute(
-                text(f"SET LOCAL statement_timeout = '{normalized_timeout}';")
-            )
-            selected_archive_table = archive_table_name()
-            if operation == "apply":
-                await session.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext(:lock_key));"),
-                    {
-                        "lock_key": _archive_lock_key(
-                            db_schema,
-                            selected_archive_table,
-                            "resolve",
-                        )
-                    },
-                )
-            await session.execute(
-                text(address_alias_sql.alias_advisory_xact_lock_sql()),
-            )
-            if operation == "apply":
-                await session.execute(
-                    text(
-                        f"LOCK TABLE {_relation(db_schema, address_alias_sql.ADDRESS_ALIAS_CANDIDATE_TABLE)} "
-                        "IN SHARE MODE;"
-                    )
-                )
-            _, _, generation = await _alias_state(session, schema=db_schema, lock=True)
-            owned_run = (
-                await session.execute(
-                    text(
-                        f"""
-                        SELECT status
-                        FROM {_relation(db_schema, address_alias_sql.ADDRESS_ALIAS_RUN_TABLE)}
-                        WHERE run_id = CAST(:run_id AS uuid)
-                          AND status = 'running'
-                        FOR UPDATE;
-                        """
-                    ),
-                    {"run_id": run_id},
-                )
-            ).first()
-            if owned_run is None:
-                raise RuntimeError("numeric-grid alias run is no longer running")
-            if operation == "apply":
-                locked_shadow = (
-                    await session.execute(
-                        text(
-                            f"""
-                            SELECT status, candidate_digest
-                            FROM {_relation(db_schema, address_alias_sql.ADDRESS_ALIAS_RUN_TABLE)}
-                            WHERE run_id = CAST(:shadow_run_id AS uuid)
-                              AND mode = 'shadow'
-                            FOR SHARE;
-                            """
-                        ),
-                        {"shadow_run_id": shadow_run_id},
-                    )
-                ).first()
-                if (
-                    locked_shadow is None
-                    or locked_shadow.status != "sealed"
-                    or locked_shadow.candidate_digest != reviewed_digest
-                ):
-                    raise RuntimeError("reviewed shadow changed before apply")
-                revoked_history = (
-                    await session.execute(
-                        text(
-                            address_alias_sql.revoked_shadow_alias_sql(
-                                schema=db_schema,
-                            )
-                        ),
-                        {"shadow_run_id": shadow_run_id},
-                    )
-                ).first()
-                if revoked_history:
-                    raise RuntimeError(
-                        "reviewed shadow contains a revoked alias; run a new shadow "
-                        f"before apply: source={revoked_history.source_address_key}"
-                    )
-                reviewed_candidate_rows = (
-                    await session.execute(
-                        text(
-                            address_alias_sql.candidate_rows_sql(schema=db_schema)
-                            .strip()
-                            .removesuffix(";")
-                            + " FOR SHARE;"
-                        ),
-                        {"run_id": shadow_run_id},
-                    )
-                ).all()
-                if _candidate_digest(reviewed_candidate_rows) != reviewed_digest:
-                    raise RuntimeError(
-                        "reviewed shadow candidate rows no longer match the sealed digest"
-                    )
-            archive = _relation(db_schema, selected_archive_table)
-            metrics, digest, samples, archive_rows, source_count = await _shadow_run(
-                session,
-                schema=db_schema,
-                archive=archive,
-                run_id=run_id,
-                state_code=normalized_state,
-                zip_prefix=normalized_zip,
-                sample_limit=sample_limit,
-                retry_shadow_run_id=shadow_run_id,
-            )
-            if cancel_check:
-                await cancel_check()
-            if operation == "apply" and digest != reviewed_digest:
-                raise RuntimeError("candidate set changed after review; run a new shadow")
+    async def _insert_execution_run(self) -> None:
+        execution = self._required_execution()
+        await _insert_run(
+            schema=execution.schema,
+            run_id=execution.run_id,
+            mode=execution.operation,
+            state_code=execution.state_code,
+            zip_prefix=execution.zip_prefix,
+            shadow_run_id=execution.shadow_run_id,
+            reviewed_digest=execution.reviewed_digest,
+            reviewed_by=execution.reviewer,
+        )
 
-            promoted = 0
-            final_generation = generation
-            if operation == "apply":
-                conflict = (
-                    await session.execute(
-                        text(address_alias_sql.active_alias_conflict_sql(schema=db_schema)),
-                        {"apply_run_id": run_id},
-                    )
-                ).first()
-                if conflict:
-                    raise RuntimeError(
-                        "active alias target conflicts with reviewed candidate: "
-                        f"source={conflict.source_address_key} "
-                        f"active={conflict.active_target_address_key} "
-                        f"candidate={conflict.candidate_target_address_key}"
-                    )
-                await _approve_shadow_candidates(
-                    session,
-                    schema=db_schema,
-                    shadow_run_id=shadow_run_id,
-                    reviewer=reviewer or "",
-                )
-                promotion = (
-                    await session.execute(
-                        text(address_alias_sql.promote_reviewed_aliases_sql(schema=db_schema)),
-                        {
-                            "shadow_run_id": shadow_run_id,
-                            "apply_run_id": run_id,
-                            "candidate_digest": digest,
-                        },
-                    )
-                ).first()
-                promoted = int(promotion.promoted_count or 0)
-                _, _, final_generation = await _alias_state(
-                    session,
-                    schema=db_schema,
-                    lock=False,
-                )
+    async def _execute_locked(self, session: Any) -> None:
+        await self._configure_and_lock(session)
+        await self._lock_owned_run(session)
+        await self._validate_reviewed_shadow(session)
+        await self._collect_candidate_snapshot(session)
+        await self._promote_reviewed_candidates(session)
+        await self._seal_run(session)
 
-            final_status = "applied" if operation == "apply" else "sealed"
-            runs = _relation(db_schema, address_alias_sql.ADDRESS_ALIAS_RUN_TABLE)
-            reason_buckets = {
-                "eligible": metrics.get("eligible", 0),
-                "ambiguous": metrics.get("ambiguous", 0),
-                "no_candidate": metrics.get("no_candidate", 0),
-                "active_skipped": metrics.get("active_skipped", 0),
-                "insufficient_provenance": metrics.get(
-                    "insufficient_provenance",
-                    0,
-                ),
-            }
+    async def _configure_and_lock(self, session: Any) -> None:
+        execution = self._required_execution()
+        isolation = (
+            "READ COMMITTED" if execution.operation == "apply" else "REPEATABLE READ"
+        )
+        await session.execute(text(f"SET TRANSACTION ISOLATION LEVEL {isolation};"))
+        await session.execute(text(f"SET LOCAL lock_timeout = '{execution.timeout}';"))
+        await session.execute(
+            text(f"SET LOCAL statement_timeout = '{execution.timeout}';")
+        )
+        archive_name = archive_table_name()
+        execution.archive = _relation(execution.schema, archive_name)
+        if execution.operation == "apply":
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:lock_key));"),
+                {"lock_key": _archive_lock_key(execution.schema, archive_name, "resolve")},
+            )
+        await session.execute(text(address_alias_sql.alias_advisory_xact_lock_sql()))
+        if execution.operation == "apply":
+            candidates = _relation(
+                execution.schema,
+                address_alias_sql.ADDRESS_ALIAS_CANDIDATE_TABLE,
+            )
+            await session.execute(text(f"LOCK TABLE {candidates} IN SHARE MODE;"))
+        _, _, execution.generation = await _alias_state(
+            session,
+            schema=execution.schema,
+            lock=True,
+        )
+        execution.final_generation = execution.generation
+
+    async def _lock_owned_run(self, session: Any) -> None:
+        execution = self._required_execution()
+        runs = _relation(execution.schema, address_alias_sql.ADDRESS_ALIAS_RUN_TABLE)
+        owned_run = (
             await session.execute(
                 text(
                     f"""
-                    UPDATE {runs}
-                       SET status = :status,
-                           candidate_digest = :candidate_digest,
-                           archive_row_count = :archive_rows,
-                           source_count = :source_count,
-                           candidate_source_count = :candidate_sources,
-                           candidate_row_count = :candidate_rows,
-                           no_candidate_count = :no_candidate,
-                           active_skipped_count = :active_skipped,
-                           eligible_count = :eligible,
-                           ambiguous_count = :ambiguous,
-                           insufficient_provenance_count = :insufficient,
-                           reason_buckets = CAST(:reason_buckets AS jsonb),
-                           sample_rows = CAST(:sample_rows AS jsonb),
-                           completed_at = now()
-                     WHERE run_id = CAST(:run_id AS uuid);
+                    SELECT status
+                    FROM {runs}
+                    WHERE run_id = CAST(:run_id AS uuid)
+                      AND status = 'running'
+                    FOR UPDATE;
                     """
                 ),
+                {"run_id": execution.run_id},
+            )
+        ).first()
+        if owned_run is None:
+            raise RuntimeError("numeric-grid alias run is no longer running")
+
+    async def _validate_reviewed_shadow(self, session: Any) -> None:
+        execution = self._required_execution()
+        if execution.operation != "apply":
+            return
+        runs = _relation(execution.schema, address_alias_sql.ADDRESS_ALIAS_RUN_TABLE)
+        shadow_record = (
+            await session.execute(
+                text(
+                    f"""
+                    SELECT status, candidate_digest
+                    FROM {runs}
+                    WHERE run_id = CAST(:shadow_run_id AS uuid)
+                      AND mode = 'shadow'
+                    FOR SHARE;
+                    """
+                ),
+                {"shadow_run_id": execution.shadow_run_id},
+            )
+        ).first()
+        if (
+            shadow_record is None
+            or shadow_record.status != "sealed"
+            or shadow_record.candidate_digest != execution.reviewed_digest
+        ):
+            raise RuntimeError("reviewed shadow changed before apply")
+        await self._reject_revoked_shadow(session)
+        candidate_records = (
+            await session.execute(
+                text(
+                    address_alias_sql.candidate_rows_sql(schema=execution.schema)
+                    .strip()
+                    .removesuffix(";")
+                    + " FOR SHARE;"
+                ),
+                {"run_id": execution.shadow_run_id},
+            )
+        ).all()
+        if _candidate_digest(candidate_records) != execution.reviewed_digest:
+            raise RuntimeError(
+                "reviewed shadow candidate rows no longer match the sealed digest"
+            )
+
+    async def _reject_revoked_shadow(self, session: Any) -> None:
+        execution = self._required_execution()
+        revoked_record = (
+            await session.execute(
+                text(
+                    address_alias_sql.revoked_shadow_alias_sql(
+                        schema=execution.schema,
+                    )
+                ),
+                {"shadow_run_id": execution.shadow_run_id},
+            )
+        ).first()
+        if revoked_record:
+            raise RuntimeError(
+                "reviewed shadow contains a revoked alias; run a new shadow "
+                f"before apply: source={revoked_record.source_address_key}"
+            )
+
+    async def _collect_candidate_snapshot(self, session: Any) -> None:
+        execution = self._required_execution()
+        (
+            execution.metrics_by_reason,
+            execution.digest,
+            execution.sample_rows,
+            execution.archive_rows,
+            execution.source_count,
+        ) = await _shadow_run(
+            session,
+            schema=execution.schema,
+            archive=execution.archive,
+            run_id=execution.run_id,
+            state_code=execution.state_code,
+            zip_prefix=execution.zip_prefix,
+            sample_limit=execution.request.sample_limit,
+            retry_shadow_run_id=execution.shadow_run_id,
+        )
+        await self._check_cancelled()
+        if (
+            execution.operation == "apply"
+            and execution.digest != execution.reviewed_digest
+        ):
+            raise RuntimeError("candidate set changed after review; run a new shadow")
+
+    async def _promote_reviewed_candidates(self, session: Any) -> None:
+        execution = self._required_execution()
+        if execution.operation != "apply":
+            return
+        conflict_record = (
+            await session.execute(
+                text(
+                    address_alias_sql.active_alias_conflict_sql(
+                        schema=execution.schema
+                    )
+                ),
+                {"apply_run_id": execution.run_id},
+            )
+        ).first()
+        if conflict_record:
+            raise RuntimeError(
+                "active alias target conflicts with reviewed candidate: "
+                f"source={conflict_record.source_address_key} "
+                f"active={conflict_record.active_target_address_key} "
+                f"candidate={conflict_record.candidate_target_address_key}"
+            )
+        await _approve_shadow_candidates(
+            session,
+            schema=execution.schema,
+            shadow_run_id=execution.shadow_run_id or "",
+            reviewer=execution.reviewer or "",
+        )
+        promotion_record = (
+            await session.execute(
+                text(
+                    address_alias_sql.promote_reviewed_aliases_sql(
+                        schema=execution.schema
+                    )
+                ),
                 {
-                    "status": final_status,
-                    "candidate_digest": digest,
-                    "archive_rows": archive_rows,
-                    "source_count": source_count,
-                    "candidate_sources": metrics.get("candidate_sources", 0),
-                    "candidate_rows": metrics.get("candidate_rows", 0),
-                    "no_candidate": metrics.get("no_candidate", 0),
-                    "active_skipped": metrics.get("active_skipped", 0),
-                    "eligible": metrics.get("eligible", 0),
-                    "ambiguous": metrics.get("ambiguous", 0),
-                    "insufficient": metrics.get("insufficient_provenance", 0),
-                    "reason_buckets": json.dumps(reason_buckets, sort_keys=True),
-                    "sample_rows": json.dumps(samples, sort_keys=True),
-                    "run_id": run_id,
+                    "shadow_run_id": execution.shadow_run_id,
+                    "apply_run_id": execution.run_id,
+                    "candidate_digest": execution.digest,
                 },
             )
-        return NumericGridAliasResult(
-            run_id=run_id,
-            mode=operation,
-            status=final_status,
-            candidate_digest=digest,
-            source_count=source_count,
-            candidate_sources=metrics.get("candidate_sources", 0),
-            candidate_rows=metrics.get("candidate_rows", 0),
-            no_candidate=metrics.get("no_candidate", 0),
-            active_skipped=metrics.get("active_skipped", 0),
-            eligible=metrics.get("eligible", 0),
-            ambiguous=metrics.get("ambiguous", 0),
-            insufficient_provenance=metrics.get("insufficient_provenance", 0),
-            promoted=promoted,
-            generation=final_generation,
-            sample_rows=samples,
+        ).first()
+        execution.promoted = int(promotion_record.promoted_count or 0)
+        _, _, execution.final_generation = await _alias_state(
+            session,
+            schema=execution.schema,
+            lock=False,
         )
-    except Exception as exc:
-        await _mark_failed(db_schema, run_id, exc)
-        raise
+
+    async def _seal_run(self, session: Any) -> None:
+        execution = self._required_execution()
+        execution.final_status = (
+            "applied" if execution.operation == "apply" else "sealed"
+        )
+        await session.execute(
+            text(_run_completion_sql(execution.schema)),
+            self._completion_parameters(execution),
+        )
+
+    def _completion_parameters(self, execution: _AliasExecution) -> dict[str, Any]:
+        metric_map = execution.metrics_by_reason
+        reason_map = {
+            reason_name: metric_map.get(reason_name, 0)
+            for reason_name in (
+                "eligible",
+                "ambiguous",
+                "no_candidate",
+                "active_skipped",
+                "insufficient_provenance",
+            )
+        }
+        return {
+            "status": execution.final_status,
+            "candidate_digest": execution.digest,
+            "archive_rows": execution.archive_rows,
+            "source_count": execution.source_count,
+            "candidate_sources": metric_map.get("candidate_sources", 0),
+            "candidate_rows": metric_map.get("candidate_rows", 0),
+            "no_candidate": metric_map.get("no_candidate", 0),
+            "active_skipped": metric_map.get("active_skipped", 0),
+            "eligible": metric_map.get("eligible", 0),
+            "ambiguous": metric_map.get("ambiguous", 0),
+            "insufficient": metric_map.get("insufficient_provenance", 0),
+            "reason_buckets": json.dumps(reason_map, sort_keys=True),
+            "sample_rows": json.dumps(execution.sample_rows, sort_keys=True),
+            "run_id": execution.run_id,
+        }
+
+    async def _check_cancelled(self) -> None:
+        if self.request.cancel_check:
+            await self.request.cancel_check()
+
+    def _result(self) -> NumericGridAliasResult:
+        execution = self._required_execution()
+        metric_map = execution.metrics_by_reason
+        return NumericGridAliasResult(
+            run_id=execution.run_id,
+            mode=execution.operation,
+            status=execution.final_status,
+            candidate_digest=execution.digest,
+            source_count=execution.source_count,
+            candidate_sources=metric_map.get("candidate_sources", 0),
+            candidate_rows=metric_map.get("candidate_rows", 0),
+            no_candidate=metric_map.get("no_candidate", 0),
+            active_skipped=metric_map.get("active_skipped", 0),
+            eligible=metric_map.get("eligible", 0),
+            ambiguous=metric_map.get("ambiguous", 0),
+            insufficient_provenance=metric_map.get("insufficient_provenance", 0),
+            promoted=execution.promoted,
+            generation=execution.final_generation,
+            sample_rows=execution.sample_rows,
+        )
+
+    def _required_execution(self) -> _AliasExecution:
+        if self.execution is None:
+            raise RuntimeError("numeric-grid alias execution was not prepared")
+        return self.execution
+
+
+async def run_numeric_grid_alias(
+    request: NumericGridAliasRequest | None = None,
+    **request_options: Any,
+) -> NumericGridAliasResult:
+    """Run a sealed shadow or apply its exact reviewed candidate set."""
+    if request is not None and request_options:
+        raise TypeError("pass a request object or keyword options, not both")
+    resolved_request = request or NumericGridAliasRequest(**request_options)
+    return await _NumericGridAliasRunner(resolved_request).execute()

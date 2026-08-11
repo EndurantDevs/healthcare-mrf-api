@@ -1,0 +1,165 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+"""Worker-boundary tests for controlled address alias operations."""
+
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+
+from process import address_numeric_grid_alias_worker
+from process.address_numeric_grid_alias_support import NumericGridAliasResult
+from process.address_strict_source_backfill import StrictSourceBackfillResult
+
+
+@pytest.mark.asyncio
+async def test_control_worker_forwards_reviewed_alias_inputs_and_progress(monkeypatch):
+    alias_result = NumericGridAliasResult(
+        run_id="00000000-0000-0000-0000-000000000001",
+        mode="shadow",
+        status="sealed",
+        candidate_digest="a" * 64,
+        source_count=3,
+        candidate_sources=2,
+        candidate_rows=2,
+        no_candidate=1,
+        active_skipped=0,
+        eligible=1,
+        ambiguous=1,
+        insufficient_provenance=0,
+        promoted=0,
+        generation=7,
+        sample_rows=[],
+    )
+    run = AsyncMock(return_value=alias_result)
+    cancel = AsyncMock()
+    progress = Mock()
+    monkeypatch.setattr(address_numeric_grid_alias_worker, "run_numeric_grid_alias", run)
+    monkeypatch.setattr(address_numeric_grid_alias_worker, "raise_if_cancelled", cancel)
+    monkeypatch.setattr(address_numeric_grid_alias_worker, "enqueue_live_progress", progress)
+
+    worker_payload = await address_numeric_grid_alias_worker.process_data(
+        {"worker": "synthetic"},
+        {
+            "mode": "shadow",
+            "state_code": "UT",
+            "zip_prefix": "84",
+            "sample_limit": 5,
+            "timeout": "30s",
+        },
+    )
+
+    assert worker_payload == alias_result.__dict__
+    assert run.await_args.kwargs["state_code"] == "UT"
+    assert run.await_args.kwargs["zip_prefix"] == "84"
+    assert run.await_args.kwargs["sample_limit"] == 5
+    assert run.await_args.kwargs["timeout"] == "30s"
+    await run.await_args.kwargs["cancel_check"]()
+    cancel.assert_awaited_once_with(
+        {"worker": "synthetic"},
+        {
+            "mode": "shadow",
+            "state_code": "UT",
+            "zip_prefix": "84",
+            "sample_limit": 5,
+            "timeout": "30s",
+        },
+    )
+    assert progress.call_args.kwargs["run_id"] == alias_result.run_id
+    assert progress.call_args.kwargs["status"] == "succeeded"
+    assert progress.call_args.kwargs["source_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_control_worker_forwards_strict_source_backfill_inputs(monkeypatch):
+    backfill_result = StrictSourceBackfillResult(
+        run_id="00000000-0000-0000-0000-000000000002",
+        status="backfilled",
+        reviewed_shadow_run_id="00000000-0000-0000-0000-000000000001",
+        reviewed_candidate_digest="b" * 64,
+        evidence_digest="c" * 64,
+        target_count=2,
+        evidence_target_count=1,
+        evidence_pair_count=2,
+        updated_target_count=1,
+        source_target_counts={"nppes": 1, "provider_directory_overlay": 1},
+        missing_relations=[],
+        generation=4,
+    )
+    run = AsyncMock(return_value=backfill_result)
+    progress = Mock()
+    monkeypatch.setattr(
+        address_numeric_grid_alias_worker,
+        "run_strict_source_backfill",
+        run,
+    )
+    monkeypatch.setattr(address_numeric_grid_alias_worker, "enqueue_live_progress", progress)
+
+    worker_payload = (
+        await address_numeric_grid_alias_worker.process_address_strict_source_backfill(
+            {},
+            {
+                "alias_run_id": backfill_result.reviewed_shadow_run_id,
+                "expected_candidate_sha256": backfill_result.reviewed_candidate_digest,
+                "reviewed_by": "synthetic-reviewer",
+                "max_targets": 12,
+                "timeout": "45s",
+            },
+        )
+    )
+
+    assert worker_payload == backfill_result.__dict__
+    assert (
+        run.await_args.kwargs["alias_run_id"]
+        == backfill_result.reviewed_shadow_run_id
+    )
+    assert run.await_args.kwargs["max_targets"] == 12
+    assert run.await_args.kwargs["timeout"] == "45s"
+    assert "schema" not in run.await_args.kwargs
+    assert progress.call_args.kwargs["source_target_counts"] == {
+        "nppes": 1,
+        "provider_directory_overlay": 1,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_targets", (0, 10_001))
+async def test_strict_backfill_worker_rejects_out_of_range_mutation_cap(
+    monkeypatch,
+    max_targets,
+):
+    run = AsyncMock()
+    monkeypatch.setattr(
+        address_numeric_grid_alias_worker,
+        "run_strict_source_backfill",
+        run,
+    )
+
+    with pytest.raises(ValueError, match="max_targets"):
+        await address_numeric_grid_alias_worker.process_address_strict_source_backfill(
+            {},
+            {
+                "alias_run_id": "00000000-0000-0000-0000-000000000001",
+                "expected_candidate_sha256": "a" * 64,
+                "reviewed_by": "synthetic-reviewer",
+                "max_targets": max_targets,
+            },
+        )
+
+    run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enqueued_strict_backfill_validates_cap_before_queueing(monkeypatch):
+    create_pool = AsyncMock()
+    monkeypatch.setattr(address_numeric_grid_alias_worker, "create_pool", create_pool)
+
+    with pytest.raises(ValueError, match="max_targets"):
+        await address_numeric_grid_alias_worker.run_address_strict_source_backfill_command(
+            alias_run_id="00000000-0000-0000-0000-000000000001",
+            expected_candidate_sha256="a" * 64,
+            reviewed_by="synthetic-reviewer",
+            max_targets=0,
+            enqueue=True,
+        )
+
+    create_pool.assert_not_awaited()

@@ -84,7 +84,18 @@ def _relation(schema: str, table: str) -> str:
     return f"{_quote_ident(schema)}.{_quote_ident(table)}"
 
 
+def _qualified_component_sql(expression: str) -> str:
+    if expression in {"NULL", "'US'"} or expression.startswith("COALESCE("):
+        return (
+            expression.replace("country_code", "source.country_code")
+            .replace("state_name", "source.state_name")
+            .replace("state_code", "source.state_code")
+        )
+    return f"source.{_quote_ident(expression)}"
+
+
 def relation_exists_sql() -> str:
+    """Return a bounded relation-presence probe."""
     return "SELECT to_regclass(:qualified_relation) IS NOT NULL;"
 
 
@@ -109,11 +120,13 @@ def address_key_index_exists_sql() -> str:
 
 
 def lock_candidates_sql(*, schema: str) -> str:
+    """Lock reviewed candidate evidence against concurrent mutation."""
     candidates = _relation(schema, address_alias_sql.ADDRESS_ALIAS_CANDIDATE_TABLE)
     return f"LOCK TABLE {candidates} IN SHARE MODE;"
 
 
 def create_reviewed_candidates_sql(*, schema: str) -> str:
+    """Snapshot the sealed candidate rows used by a backfill."""
     candidates = _relation(schema, address_alias_sql.ADDRESS_ALIAS_CANDIDATE_TABLE)
     return f"""
         CREATE TEMP TABLE {REVIEWED_CANDIDATE_TABLE} ON COMMIT DROP AS
@@ -132,6 +145,7 @@ def create_reviewed_candidates_sql(*, schema: str) -> str:
 
 
 def reviewed_candidate_rows_sql() -> str:
+    """Read the frozen candidate snapshot in digest order."""
     return f"""
         SELECT
             source_address_key::text AS source_address_key,
@@ -148,6 +162,7 @@ def reviewed_candidate_rows_sql() -> str:
 
 
 def create_targets_sql(*, archive: str) -> str:
+    """Materialize only current, unmerged reviewed target keys."""
     return f"""
         CREATE TEMP TABLE {TARGET_TABLE} ON COMMIT DROP AS
         SELECT DISTINCT
@@ -162,6 +177,7 @@ def create_targets_sql(*, archive: str) -> str:
 
 
 def drifted_target_count_sql(*, archive: str) -> str:
+    """Count reviewed targets whose archive identity has drifted."""
     return f"""
         SELECT count(*)::bigint
         FROM {REVIEWED_CANDIDATE_TABLE} AS candidate
@@ -176,14 +192,17 @@ def drifted_target_count_sql(*, archive: str) -> str:
 
 
 def create_target_index_sql() -> str:
+    """Index the bounded temporary target set."""
     return f"ALTER TABLE {TARGET_TABLE} ADD PRIMARY KEY (address_key);"
 
 
 def analyze_targets_sql() -> str:
+    """Refresh planner statistics for the temporary targets."""
     return f"ANALYZE {TARGET_TABLE};"
 
 
 def create_evidence_sql() -> str:
+    """Create the deduplicated strict-evidence accumulator."""
     return f"""
         CREATE TEMP TABLE {EVIDENCE_TABLE} (
             target_address_key uuid NOT NULL,
@@ -195,22 +214,16 @@ def create_evidence_sql() -> str:
 
 
 def evidence_insert_sql(*, schema: str, projection: SourceProjection) -> str:
-    source = _relation(schema, projection.table)
+    """Build an exact key-and-identity evidence probe for one source."""
+    source_relation = _relation(schema, projection.table)
     key_expression = (
         "source.address_key = target.address_key::text"
         if projection.stored_key_type == "text"
         else "source.address_key = target.address_key"
     )
 
-    def value(expression: str) -> str:
-        if expression in {"NULL", "'US'"} or expression.startswith("COALESCE("):
-            return expression.replace("country_code", "source.country_code").replace(
-                "state_name", "source.state_name"
-            ).replace("state_code", "source.state_code")
-        return f"source.{_quote_ident(expression)}"
-
     components = ",\n                        ".join(
-        value(expression)
+        _qualified_component_sql(expression)
         for expression in (
             projection.first_line,
             projection.second_line,
@@ -233,7 +246,7 @@ def evidence_insert_sql(*, schema: str, projection: SourceProjection) -> str:
         FROM {TARGET_TABLE} AS target
         WHERE EXISTS (
             SELECT 1
-            FROM {source} AS source
+            FROM {source_relation} AS source
             WHERE {key_expression}
               AND {_quote_ident(schema)}.addr_key_v1(
                         {components}
@@ -247,10 +260,12 @@ def evidence_insert_sql(*, schema: str, projection: SourceProjection) -> str:
 
 
 def target_count_sql() -> str:
+    """Count reviewed targets inside the bounded temporary set."""
     return f"SELECT count(*)::bigint FROM {TARGET_TABLE};"
 
 
 def evidence_rows_sql() -> str:
+    """Read a complete evidence receipt including zero-match targets."""
     return f"""
         SELECT
             target.address_key::text AS target_address_key,
@@ -270,10 +285,12 @@ def evidence_rows_sql() -> str:
 
 
 def evidence_target_count_sql() -> str:
+    """Count targets with at least one strict source observation."""
     return f"SELECT count(DISTINCT target_address_key)::bigint FROM {EVIDENCE_TABLE};"
 
 
 def evidence_metrics_sql() -> str:
+    """Summarize target matches by independent source family."""
     return f"""
         SELECT source_name, count(*)::bigint AS target_count
         FROM {EVIDENCE_TABLE}
@@ -283,10 +300,12 @@ def evidence_metrics_sql() -> str:
 
 
 def evidence_pair_count_sql() -> str:
+    """Count deduplicated target and source-family pairs."""
     return f"SELECT count(*)::bigint FROM {EVIDENCE_TABLE};"
 
 
 def apply_evidence_sql(*, archive: str) -> str:
+    """OR verified strict evidence onto matching archive targets."""
     return f"""
         WITH aggregated AS (
             SELECT

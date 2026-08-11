@@ -762,6 +762,83 @@ def _keyed_temp_table_ddl(keyed_table: str) -> str:
     """
 
 
+_KEYED_RAW_COPY_SQL = """
+    WITH raw AS (
+        SELECT
+            row_number() OVER (ORDER BY ctid) AS rn,
+            ctid::text AS source_ctid,
+            address_key AS staged_address_key,
+            NULLIF(trim(COALESCE({first}, '')), '') AS first_line,
+            NULLIF(trim(COALESCE({second}, '')), '') AS second_line,
+            NULLIF(trim(COALESCE({city}, '')), '') AS city_name,
+            NULLIF(trim(COALESCE({state}, '')), '') AS state_name,
+            NULLIF(trim(COALESCE({zip_code}, '')), '') AS postal_code,
+            {country} AS raw_country_code
+        FROM {staging}
+    ),
+    ranked_stamped AS (
+        SELECT
+            raw.*,
+            row_number() OVER (
+                PARTITION BY staged_address_key
+                ORDER BY
+                    first_line IS NULL,
+                    length(COALESCE(first_line, '')) DESC,
+                    second_line IS NULL,
+                    length(COALESCE(second_line, '')) DESC,
+                    city_name IS NULL,
+                    length(COALESCE(city_name, '')) DESC,
+                    COALESCE(first_line, ''),
+                    COALESCE(second_line, ''),
+                    COALESCE(city_name, ''),
+                    COALESCE(state_name, ''),
+                    COALESCE(postal_code, ''),
+                    rn
+            ) AS key_rank
+        FROM raw
+        WHERE staged_address_key IS NOT NULL
+    ),
+    raw_to_normalize AS (
+        SELECT
+            rn,
+            source_ctid,
+            staged_address_key,
+            first_line,
+            second_line,
+            city_name,
+            state_name,
+            postal_code,
+            raw_country_code
+        FROM ranked_stamped
+        WHERE key_rank = 1
+        UNION ALL
+        SELECT
+            rn,
+            source_ctid,
+            staged_address_key,
+            first_line,
+            second_line,
+            city_name,
+            state_name,
+            postal_code,
+            raw_country_code
+        FROM raw
+        WHERE staged_address_key IS NULL
+    )
+    SELECT
+        rn,
+        source_ctid,
+        staged_address_key,
+        first_line,
+        second_line,
+        city_name,
+        state_name,
+        postal_code,
+        raw_country_code
+    FROM raw_to_normalize
+"""
+
+
 def _keyed_raw_copy_sql(
     *,
     staging: str,
@@ -773,81 +850,15 @@ def _keyed_raw_copy_sql(
     country: str,
 ) -> str:
     """Build SQL that copies normalized staging rows into keyed scratch data."""
-    return f"""
-        WITH raw AS (
-            SELECT
-                row_number() OVER (ORDER BY ctid) AS rn,
-                ctid::text AS source_ctid,
-                address_key AS staged_address_key,
-                NULLIF(trim(COALESCE({first}, '')), '') AS first_line,
-                NULLIF(trim(COALESCE({second}, '')), '') AS second_line,
-                NULLIF(trim(COALESCE({city}, '')), '') AS city_name,
-                NULLIF(trim(COALESCE({state}, '')), '') AS state_name,
-                NULLIF(trim(COALESCE({zip_code}, '')), '') AS postal_code,
-                {country} AS raw_country_code
-            FROM {staging}
-        ),
-        ranked_stamped AS (
-            SELECT
-                raw.*,
-                row_number() OVER (
-                    PARTITION BY staged_address_key
-                    ORDER BY
-                        first_line IS NULL,
-                        length(COALESCE(first_line, '')) DESC,
-                        second_line IS NULL,
-                        length(COALESCE(second_line, '')) DESC,
-                        city_name IS NULL,
-                        length(COALESCE(city_name, '')) DESC,
-                        COALESCE(first_line, ''),
-                        COALESCE(second_line, ''),
-                        COALESCE(city_name, ''),
-                        COALESCE(state_name, ''),
-                        COALESCE(postal_code, ''),
-                        rn
-                ) AS key_rank
-            FROM raw
-            WHERE staged_address_key IS NOT NULL
-        ),
-        raw_to_normalize AS (
-            SELECT
-                rn,
-                source_ctid,
-                staged_address_key,
-                first_line,
-                second_line,
-                city_name,
-                state_name,
-                postal_code,
-                raw_country_code
-            FROM ranked_stamped
-            WHERE key_rank = 1
-            UNION ALL
-            SELECT
-                rn,
-                source_ctid,
-                staged_address_key,
-                first_line,
-                second_line,
-                city_name,
-                state_name,
-                postal_code,
-                raw_country_code
-            FROM raw
-            WHERE staged_address_key IS NULL
-        )
-        SELECT
-            rn,
-            source_ctid,
-            staged_address_key,
-            first_line,
-            second_line,
-            city_name,
-            state_name,
-            postal_code,
-            raw_country_code
-        FROM raw_to_normalize
-    """
+    return _KEYED_RAW_COPY_SQL.format(
+        staging=staging,
+        first=first,
+        second=second,
+        city=city,
+        state=state,
+        zip_code=zip_code,
+        country=country,
+    )
 
 
 def _is_canon_version_match(payload: Mapping[str, Any]) -> bool:
@@ -1815,14 +1826,8 @@ def _is_statement_timeout_error(exc: BaseException) -> bool:
     return "statement timeout" in message or "querycancelederror" in message
 
 
-async def _apply_persisted_numeric_grid_aliases(
-    session: Any,
-    *,
-    schema: str,
-    keyed_table: str,
-    archive: str,
-) -> dict[str, int]:
-    """Project already-approved aliases into the transient effective key set."""
+async def _validated_active_alias_state(session: Any, schema: str) -> Any:
+    """Lock alias promotion and return a supported singleton state row."""
     await session.execute(text(address_alias_sql.alias_advisory_xact_lock_sql()))
     state = (
         await session.execute(
@@ -1832,7 +1837,9 @@ async def _apply_persisted_numeric_grid_aliases(
     if state is None:
         raise RuntimeError("Address alias singleton state is missing")
     if int(state.schema_version) != address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION:
-        raise RuntimeError(f"Unsupported address alias schema version: {state.schema_version}")
+        raise RuntimeError(
+            f"Unsupported address alias schema version: {state.schema_version}"
+        )
     if (
         int(state.active_ruleset_version)
         != address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION
@@ -1840,6 +1847,33 @@ async def _apply_persisted_numeric_grid_aliases(
         raise RuntimeError(
             f"Unsupported numeric-grid alias ruleset: {state.active_ruleset_version}"
         )
+    return state
+
+
+async def _existing_numeric_grid_alias_count(session: Any) -> int:
+    """Count distinct approved source keys materialized in the temp table."""
+    return int(
+        (
+            await session.execute(
+                text(
+                    "SELECT count(DISTINCT source_address_key) "
+                    "FROM address_numeric_grid_existing_aliases;"
+                )
+            )
+        ).scalar()
+        or 0
+    )
+
+
+async def _apply_persisted_numeric_grid_aliases(
+    session: Any,
+    *,
+    schema: str,
+    keyed_table: str,
+    archive: str,
+) -> dict[str, int]:
+    """Project already-approved aliases into the transient effective key set."""
+    state = await _validated_active_alias_state(session, schema)
     await session.execute(
         text("DROP TABLE IF EXISTS pg_temp.address_numeric_grid_existing_aliases;")
     )
@@ -1852,17 +1886,7 @@ async def _apply_persisted_numeric_grid_aliases(
             )
         )
     )
-    existing_count = int(
-        (
-            await session.execute(
-                text(
-                    "SELECT count(DISTINCT source_address_key) "
-                    "FROM address_numeric_grid_existing_aliases;"
-                )
-            )
-        ).scalar()
-        or 0
-    )
+    existing_count = await _existing_numeric_grid_alias_count(session)
     if not existing_count:
         return {
             "numeric_grid_existing_applied": 0,
@@ -2283,10 +2307,10 @@ async def resolve_into_archive(
                 """))
             ).scalar() or {}
             if isinstance(alias_stats_raw, str):
-                completion_stats = json.loads(alias_stats_raw)
+                completion_metric_map = json.loads(alias_stats_raw)
             else:
-                completion_stats = dict(alias_stats_raw)
-            alias_stats_by_kind.update(completion_stats)
+                completion_metric_map = dict(alias_stats_raw)
+            alias_stats_by_kind.update(completion_metric_map)
             completion_alias_rows = int(
                 alias_stats_by_kind.get("completion_aliases") or 0
             )

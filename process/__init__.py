@@ -151,7 +151,7 @@ from process.address_numeric_grid_alias_worker import process_data as process_ad
 from process.address_numeric_grid_alias_worker import (
     process_address_numeric_grid_alias_revoke,
     process_address_strict_source_backfill,
-    run_address_numeric_grid_alias_revoke_command,
+    run_address_alias_revoke_command,
     run_address_strict_source_backfill_command,
 )
 from process.openaddresses import main as initiate_openaddresses
@@ -1839,29 +1839,11 @@ def address_archive_v2_migrate(
 @click.option("--sample-limit", type=int, default=20, show_default=True)
 @click.option("--timeout", default="10min", show_default=True)
 @click.option("--enqueue", is_flag=True, help="Enqueue on arq:AddressArchive.")
-def address_numeric_grid_alias(
-    mode: str,
-    state_code: str | None,
-    zip_prefix: str | None,
-    alias_run_id: str | None,
-    expected_candidate_sha256: str | None,
-    reviewed_by: str | None,
-    sample_limit: int,
-    timeout: str,
-    enqueue: bool,
-):
+def address_numeric_grid_alias(**option_values_by_name):
     """Run the reviewed numeric-grid alias workflow."""
     result = _run(
         initiate_address_numeric_grid_alias(
-            mode=mode,
-            state_code=state_code,
-            zip_prefix=zip_prefix,
-            alias_run_id=alias_run_id,
-            expected_candidate_sha256=expected_candidate_sha256,
-            reviewed_by=reviewed_by,
-            sample_limit=sample_limit,
-            timeout=timeout,
-            enqueue=enqueue,
+            **option_values_by_name,
         )
     )
     if result is not None:
@@ -1924,7 +1906,7 @@ def address_numeric_grid_alias_revoke(
 ):
     """Revoke an active alias without permitting un-revoke."""
     result = _run(
-        run_address_numeric_grid_alias_revoke_command(
+        run_address_alias_revoke_command(
             source_address_key=source_address_key,
             expected_target_address_key=expected_target_address_key,
             reason=reason,

@@ -1024,6 +1024,11 @@ jobs:
           --durations=20
           tests/test_address_canonical_db.py
           tests/test_address_numeric_grid_alias_db.py
+          tests/test_address_numeric_grid_alias_fences_db.py
+          tests/test_address_numeric_grid_alias_lifecycle_db.py
+          tests/test_address_numeric_grid_alias_materialization_db.py
+          tests/test_address_numeric_grid_alias_runtime_db.py
+          tests/test_address_strict_source_backfill_db.py
           tests/test_ptg2_serving_address_evidence_postgres.py
           tests/test_npi_geo_evidence_search_db.py
           tests/test_entity_address_unified_archive_coordinates_db.py

@@ -7,6 +7,7 @@ import hashlib
 import importlib
 import io
 import urllib.error
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -37,7 +38,7 @@ def bulk_identity() -> importer.BulkExportCheckpointIdentity:
 @contextlib.asynccontextmanager
 async def artifact_guard(*_args, **_kwargs):
     """Yield a stable artifact-build fence without database access."""
-    yield "build-fence"
+    yield importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
 
 
 class AsyncContext:
@@ -202,6 +203,17 @@ async def assert_address_publication_edges(monkeypatch) -> None:
         AsyncMock(return_value="prepared"),
     )
     monkeypatch.setattr(importer.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        importer.db,
+        "first",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                schema_version=1,
+                active_ruleset_version=1,
+                generation=3,
+            )
+        ),
+    )
     monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=3))
     publication_outcome = (
         await importer.publish_provider_directory_address_corroboration_table(

@@ -34,7 +34,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping, NamedTuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping, NamedTuple, cast
 
 import aiohttp
 from yarl import URL
@@ -13597,6 +13597,82 @@ async def _best_effort_drop_address_corroboration_stage(stage_ref: str) -> None:
         )
 
 
+async def _capture_address_corroboration_fence(
+    schema: str,
+    relation: str,
+    source_ids: list[str],
+    build_fence: ProviderDirectoryArtifactBuildFence,
+) -> ProviderDirectoryArtifactBuildFence:
+    """Capture alias generation and overlay identity for corroboration build."""
+    alias_generation = await _address_alias_generation(schema)
+    artifact_generation = await _address_alias_artifact_generation(schema, relation)
+    if artifact_generation != alias_generation and source_ids:
+        raise RuntimeError(
+            "address alias generation changed; a full Provider Directory "
+            "address corroboration rebuild is required"
+        )
+    dependency_relation = (
+        _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(
+            PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+            PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+        )
+    )
+    dependency_relation_oid = await _provider_directory_relation_oid(
+        schema,
+        dependency_relation,
+    )
+    if dependency_relation_oid is None:
+        raise RuntimeError("Provider Directory address overlay dependency is missing")
+    if dependency_relation == PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
+        overlay_generation = await _address_alias_artifact_generation(
+            schema,
+            PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+        )
+        if overlay_generation != alias_generation:
+            raise RuntimeError(
+                "Provider Directory address overlay uses a stale address alias generation"
+            )
+    return replace(
+        build_fence,
+        alias_generation=alias_generation,
+        dependency_relation=dependency_relation,
+        dependency_relation_oid=dependency_relation_oid,
+    )
+
+
+async def _build_address_corroboration_stage(
+    schema: str,
+    stage_table: str,
+    stage_ref: str,
+    target_ref: str,
+    select_sql: str,
+    source_ids: list[str],
+    network_catalog_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    """Populate and index a corroboration stage, returning publish metrics."""
+    await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+    copied_existing = await _populate_address_corroboration_stage(
+        schema,
+        stage_ref,
+        target_ref,
+        select_sql,
+        source_ids,
+    )
+    row_count = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
+    await _create_provider_directory_address_corroboration_indexes(
+        schema,
+        stage_table,
+    )
+    await db.status(f"ANALYZE {stage_ref};")
+    return _address_corroboration_publication_metrics(
+        target_ref,
+        row_count,
+        network_catalog_metrics,
+        source_ids,
+        copied_existing,
+    )
+
+
 async def publish_provider_directory_address_corroboration_table(
     db_schema: str | None = None,
     *,
@@ -13615,68 +13691,25 @@ async def publish_provider_directory_address_corroboration_table(
         metrics_override=network_catalog_metrics_override,
     )
     async with _provider_directory_artifact_build_guard(schema, relation) as build_fence:
-        alias_generation = await _address_alias_generation(schema)
-        artifact_generation = await _address_alias_artifact_generation(
+        build_fence = await _capture_address_corroboration_fence(
             schema,
             relation,
-        )
-        if artifact_generation != alias_generation and effective_source_ids:
-            raise RuntimeError(
-                "address alias generation changed; a full Provider Directory "
-                "address corroboration rebuild is required"
-            )
-        dependency_relation = (
-            _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(
-                PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-                PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-            )
-        )
-        dependency_relation_oid = await _provider_directory_relation_oid(
-            schema,
-            dependency_relation,
-        )
-        if dependency_relation_oid is None:
-            raise RuntimeError(
-                "Provider Directory address overlay dependency is missing"
-            )
-        if dependency_relation == PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
-            overlay_generation = await _address_alias_artifact_generation(
-                schema,
-                PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-            )
-            if overlay_generation != alias_generation:
-                raise RuntimeError(
-                    "Provider Directory address overlay uses a stale address alias "
-                    "generation"
-                )
-        build_fence = replace(
+            effective_source_ids,
             build_fence,
-            alias_generation=alias_generation,
-            dependency_relation=dependency_relation,
-            dependency_relation_oid=dependency_relation_oid,
         )
         stage_table = _stage_table_name()
         stage_ref = _qt(schema, stage_table)
         target_ref = _qt(schema, relation)
         select_sql = provider_directory_address_corroboration_select_sql(schema)
         try:
-            await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
-            copied_existing = await _populate_address_corroboration_stage(
+            publish_result = await _build_address_corroboration_stage(
                 schema,
+                stage_table,
                 stage_ref,
                 target_ref,
                 select_sql,
                 effective_source_ids,
-            )
-            row_count = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
-            await _create_provider_directory_address_corroboration_indexes(schema, stage_table)
-            await db.status(f"ANALYZE {stage_ref};")
-            publish_result = _address_corroboration_publication_metrics(
-                target_ref,
-                row_count,
                 network_catalog_metrics,
-                effective_source_ids,
-                copied_existing,
             )
             if defer_cutover:
                 return await _prepared_address_corroboration_result(
@@ -22677,13 +22710,15 @@ async def _publish_provider_directory_dataset_artifacts(
     )
     return await _publish_artifact_bundle_from_fence(
         fence,
-        run_id=run_id,
-        metrics=metrics,
-        source_ids=source_ids,
-        publish_corroboration=publish_corroboration,
-        publish_artifacts_targets=publish_artifacts_targets,
+        ProviderDirectoryArtifactPublishRequest(
+            run_id=run_id,
+            metrics=metrics,
+            source_ids=source_ids,
+            publish_corroboration=publish_corroboration,
+            publish_artifacts_targets=publish_artifacts_targets,
+            full_address_artifact_rebuild=full_address_artifact_rebuild,
+        ),
         artifact_resource_types=artifact_resource_types,
-        full_address_artifact_rebuild=full_address_artifact_rebuild,
     )
 
 
@@ -23043,11 +23078,13 @@ async def _publish_attested_provider_directory_profile_build(
         try:
             return await _publish_artifact_bundle_from_fence(
                 fence,
-                run_id=run_id,
-                metrics=metrics,
-                source_ids=source_ids,
-                publish_corroboration=False,
-                publish_artifacts_targets=publish_targets,
+                ProviderDirectoryArtifactPublishRequest(
+                    run_id=run_id,
+                    metrics=metrics,
+                    source_ids=source_ids,
+                    publish_corroboration=False,
+                    publish_artifacts_targets=publish_targets,
+                ),
                 artifact_resource_types=artifact_resource_types,
                 resource_fence=resource_fence,
             )
@@ -23399,52 +23436,76 @@ async def _refresh_bundle_profile_delta_metrics(
     )
 
 
+@dataclass(frozen=True)
+class ProviderDirectoryArtifactPublishRequest:
+    """Typed inputs shared by Provider Directory artifact publication paths."""
+
+    run_id: str | None
+    metrics: dict[str, Any]
+    source_ids: list[str] | tuple[str, ...] | None
+    publish_corroboration: bool
+    publish_artifacts_targets: set[str] | None
+    seen_table: str | None = None
+    address_key_run_id: str | None = None
+    publish_scope_run_id: str | None | object = _PUBLISH_SCOPE_UNSET
+    full_address_artifact_rebuild: bool = False
+
+    @property
+    def effective_publish_scope_run_id(self) -> str | None:
+        """Return the explicit artifact scope or inherit the control run."""
+        if self.publish_scope_run_id is _PUBLISH_SCOPE_UNSET:
+            return self.run_id
+        return cast(str | None, self.publish_scope_run_id)
+
+    @property
+    def address_artifact_source_ids(
+        self,
+    ) -> list[str] | tuple[str, ...] | None:
+        """Return unscoped sources only for a reviewed full address rebuild."""
+        if self.full_address_artifact_rebuild:
+            return None
+        return self.source_ids
+
+
 async def _publish_artifact_bundle_from_fence(
     fence: ProviderDirectoryArtifactDatasetFence,
+    request: ProviderDirectoryArtifactPublishRequest,
     *,
-    run_id: str | None,
-    metrics: dict[str, Any],
-    source_ids: list[str] | tuple[str, ...] | None,
-    publish_corroboration: bool,
-    publish_artifacts_targets: set[str] | None,
     artifact_resource_types: frozenset[str],
     resource_fence: ProviderDirectoryArtifactDatasetFence | None = None,
-    full_address_artifact_rebuild: bool = False,
 ) -> dict[str, Any]:
     """Build one immutable serving bundle and publish it behind its fence."""
     resource_fence = (
         resource_fence
         or await _provider_directory_profile_resource_scope_fence(
             fence,
-            publish_artifacts_targets,
+            request.publish_artifacts_targets,
         )
     )
     async with _provider_directory_artifact_dataset_scope(
-        run_id=run_id,
-        source_ids=source_ids,
+        run_id=request.run_id,
+        source_ids=request.source_ids,
         fence=fence,
         resource_fence=resource_fence,
-        metrics=metrics,
+        metrics=request.metrics,
         resource_types=artifact_resource_types,
     ):
         async with _provider_directory_artifact_bundle_scope() as artifact_bundle:
-            _attach_artifact_fence_metrics(metrics, fence)
+            _attach_artifact_fence_metrics(request.metrics, fence)
             publish_metrics = await _publish_provider_directory_artifacts(
-                run_id=run_id,
-                metrics=metrics,
-                address_key_run_id=None,
-                publish_scope_run_id=None,
-                source_ids=[dataset.source_id for dataset in fence.datasets],
-                publish_corroboration=publish_corroboration,
-                publish_artifacts_targets=publish_artifacts_targets,
-                full_address_artifact_rebuild=full_address_artifact_rebuild,
+                replace(
+                    request,
+                    address_key_run_id=None,
+                    publish_scope_run_id=None,
+                    source_ids=[dataset.source_id for dataset in fence.datasets],
+                )
             )
             _assert_candidate_artifact_bundle_complete(
                 fence,
                 publish_metrics,
                 artifact_bundle,
-                publish_corroboration=publish_corroboration,
-                publish_artifacts_targets=publish_artifacts_targets,
+                publish_corroboration=request.publish_corroboration,
+                publish_artifacts_targets=request.publish_artifacts_targets,
             )
             promoted_stage_count = await artifact_bundle.promote()
             await _refresh_bundle_profile_delta_metrics(
@@ -23477,14 +23538,16 @@ async def _publish_selected_provider_directory_artifacts(
             publish_artifacts_targets=publish_artifacts_targets,
         )
     return await _publish_provider_directory_artifacts(
-        run_id=run_id,
-        metrics=metrics,
-        seen_table=seen_table,
-        address_key_run_id=run_id,
-        publish_scope_run_id=run_id,
-        source_ids=source_ids,
-        publish_corroboration=publish_corroboration,
-        publish_artifacts_targets=publish_artifacts_targets,
+        ProviderDirectoryArtifactPublishRequest(
+            run_id=run_id,
+            metrics=metrics,
+            seen_table=seen_table,
+            address_key_run_id=run_id,
+            publish_scope_run_id=run_id,
+            source_ids=source_ids,
+            publish_corroboration=publish_corroboration,
+            publish_artifacts_targets=publish_artifacts_targets,
+        )
     )
 
 
@@ -36289,30 +36352,17 @@ async def _publish_provider_directory_profile_target(
 
 
 async def _publish_provider_directory_artifacts(
-    *,
-    run_id: str | None,
-    metrics: dict[str, Any],
-    seen_table: str | None = None,
-    address_key_run_id: str | None = None,
-    publish_scope_run_id: str | None | object = _PUBLISH_SCOPE_UNSET,
-    source_ids: list[str] | tuple[str, ...] | None = None,
-    publish_corroboration: bool = False,
-    publish_artifacts_targets: set[str] | None = None,
-    full_address_artifact_rebuild: bool = False,
+    request: ProviderDirectoryArtifactPublishRequest,
 ) -> dict[str, Any]:
     """Publish provider directory artifacts for provider-directory serving."""
     artifact_bundle = _PROVIDER_DIRECTORY_ARTIFACT_BUNDLE.get()
-    effective_publish_scope_run_id = (
-        run_id if publish_scope_run_id is _PUBLISH_SCOPE_UNSET else publish_scope_run_id
-    )
-    address_artifact_source_ids = (
-        None if full_address_artifact_rebuild else source_ids
-    )
-    metrics["publish_artifacts_targets"] = (
-        sorted(publish_artifacts_targets) if publish_artifacts_targets is not None else "all"
+    request.metrics["publish_artifacts_targets"] = (
+        sorted(request.publish_artifacts_targets)
+        if request.publish_artifacts_targets is not None
+        else "all"
     )
     await _mark_provider_directory_progress(
-        run_id,
+        request.run_id,
         phase="provider-directory publishing artifacts",
         details=_provider_directory_progress_details(
             stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH
@@ -36320,19 +36370,26 @@ async def _publish_provider_directory_artifacts(
         done=0,
         total=7,
         message="publishing Provider Directory address artifacts",
-        metrics=metrics,
+        metrics=request.metrics,
     )
-    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_contacts"):
-        metrics["location_contacts_backfilled"] = await backfill_provider_directory_location_contacts()
+    if is_provider_directory_publish_target_enabled(
+        request.publish_artifacts_targets,
+        "location_contacts",
+    ):
+        request.metrics[
+            "location_contacts_backfilled"
+        ] = await backfill_provider_directory_location_contacts()
         location_contacts_message = (
             "backfilled Provider Directory location contacts; "
-            f"rows={metrics['location_contacts_backfilled'].get('location_contact_rows_updated', 0)}"
+            f"rows={request.metrics['location_contacts_backfilled'].get('location_contact_rows_updated', 0)}"
         )
     else:
-        metrics["location_contacts_backfilled"] = _provider_directory_publish_target_skipped()
+        request.metrics[
+            "location_contacts_backfilled"
+        ] = _provider_directory_publish_target_skipped()
         location_contacts_message = "skipped Provider Directory location contact backfill"
     await _mark_provider_directory_progress(
-        run_id,
+        request.run_id,
         phase="provider-directory publishing artifacts",
         details=_provider_directory_progress_details(
             stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH
@@ -36340,21 +36397,30 @@ async def _publish_provider_directory_artifacts(
         done=1,
         total=7,
         message=location_contacts_message,
-        metrics=metrics,
+        metrics=request.metrics,
     )
-    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_coordinates"):
-        metrics["location_coordinates_backfilled"] = await backfill_provider_directory_location_coordinates(
-            run_id=address_key_run_id, source_ids=source_ids, seen_table=seen_table,
+    if is_provider_directory_publish_target_enabled(
+        request.publish_artifacts_targets,
+        "location_coordinates",
+    ):
+        request.metrics[
+            "location_coordinates_backfilled"
+        ] = await backfill_provider_directory_location_coordinates(
+            run_id=request.address_key_run_id,
+            source_ids=request.source_ids,
+            seen_table=request.seen_table,
         )
         location_coordinates_message = (
             "backfilled Provider Directory location coordinates; "
-            f"rows={metrics['location_coordinates_backfilled']}"
+            f"rows={request.metrics['location_coordinates_backfilled']}"
         )
     else:
-        metrics["location_coordinates_backfilled"] = _provider_directory_publish_target_skipped()
+        request.metrics[
+            "location_coordinates_backfilled"
+        ] = _provider_directory_publish_target_skipped()
         location_coordinates_message = "skipped Provider Directory location coordinate backfill"
     await _mark_provider_directory_progress(
-        run_id,
+        request.run_id,
         phase="provider-directory publishing artifacts",
         details=_provider_directory_progress_details(
             stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH
@@ -36362,12 +36428,15 @@ async def _publish_provider_directory_artifacts(
         done=2,
         total=7,
         message=location_coordinates_message,
-        metrics=metrics,
+        metrics=request.metrics,
     )
-    if seen_table:
-        await _prepare_import_seen_stage_lookup(seen_table)
+    if request.seen_table:
+        await _prepare_import_seen_stage_lookup(request.seen_table)
     should_backfill_resource_id_npis = any(
-        is_provider_directory_publish_target_enabled(publish_artifacts_targets, artifact_target_name)
+        is_provider_directory_publish_target_enabled(
+            request.publish_artifacts_targets,
+            artifact_target_name,
+        )
         for artifact_target_name in (
             "resource_id_npis",
             "location_archive",
@@ -36380,34 +36449,46 @@ async def _publish_provider_directory_artifacts(
     if should_backfill_resource_id_npis and capacity_admission is not None:
         await _assert_no_provider_directory_resource_id_npi_backfill_candidates(
             _schema(),
-            source_ids,
+            request.source_ids,
         )
-        metrics["resource_id_npis_backfilled"] = {
+        request.metrics["resource_id_npis_backfilled"] = {
             "skipped": True,
             "reason": "capacity_admitted_preflight_zero",
         }
     elif should_backfill_resource_id_npis:
-        resource_id_npi_backfill_run_id = address_key_run_id if address_key_run_id is not None else None
-        metrics["resource_id_npis_backfilled"] = await backfill_provider_directory_resource_id_npis(
-            run_id=resource_id_npi_backfill_run_id,
-            source_ids=source_ids,
-            seen_table=seen_table,
+        request.metrics[
+            "resource_id_npis_backfilled"
+        ] = await backfill_provider_directory_resource_id_npis(
+            run_id=request.address_key_run_id,
+            source_ids=request.source_ids,
+            seen_table=request.seen_table,
         )
     else:
-        metrics["resource_id_npis_backfilled"] = _provider_directory_publish_target_skipped()
-    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_address_keys"):
-        metrics["location_address_keys_stamped"] = await publish_provider_directory_location_address_keys(
-            run_id=address_key_run_id, source_ids=source_ids, seen_table=seen_table,
+        request.metrics[
+            "resource_id_npis_backfilled"
+        ] = _provider_directory_publish_target_skipped()
+    if is_provider_directory_publish_target_enabled(
+        request.publish_artifacts_targets,
+        "location_address_keys",
+    ):
+        request.metrics[
+            "location_address_keys_stamped"
+        ] = await publish_provider_directory_location_address_keys(
+            run_id=request.address_key_run_id,
+            source_ids=request.source_ids,
+            seen_table=request.seen_table,
         )
         location_address_keys_message = (
             "stamped Provider Directory location address keys; "
-            f"rows={metrics['location_address_keys_stamped']}"
+            f"rows={request.metrics['location_address_keys_stamped']}"
         )
     else:
-        metrics["location_address_keys_stamped"] = _provider_directory_publish_target_skipped()
+        request.metrics[
+            "location_address_keys_stamped"
+        ] = _provider_directory_publish_target_skipped()
         location_address_keys_message = "skipped Provider Directory location address key stamping"
     await _mark_provider_directory_progress(
-        run_id,
+        request.run_id,
         phase="provider-directory publishing artifacts",
         details=_provider_directory_progress_details(
             stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH
@@ -36415,42 +36496,60 @@ async def _publish_provider_directory_artifacts(
         done=3,
         total=7,
         message=location_address_keys_message,
-        metrics=metrics,
+        metrics=request.metrics,
     )
-    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_archive"):
-        metrics["location_archive"] = await publish_provider_directory_location_archive(
-            run_id=effective_publish_scope_run_id, source_ids=source_ids, seen_table=seen_table,
+    if is_provider_directory_publish_target_enabled(
+        request.publish_artifacts_targets,
+        "location_archive",
+    ):
+        request.metrics[
+            "location_archive"
+        ] = await publish_provider_directory_location_archive(
+            run_id=request.effective_publish_scope_run_id,
+            source_ids=request.source_ids,
+            seen_table=request.seen_table,
         )
     else:
-        metrics["location_archive"] = _provider_directory_publish_target_skipped()
-    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "address_overlay"):
+        request.metrics["location_archive"] = _provider_directory_publish_target_skipped()
+    if is_provider_directory_publish_target_enabled(
+        request.publish_artifacts_targets,
+        "address_overlay",
+    ):
         address_overlay_options_by_name: dict[str, Any] = {
-            "run_id": effective_publish_scope_run_id,
-            "source_ids": address_artifact_source_ids,
+            "run_id": request.effective_publish_scope_run_id,
+            "source_ids": request.address_artifact_source_ids,
         }
         if artifact_bundle is not None:
             address_overlay_options_by_name["defer_cutover"] = True
         address_overlay_result = await publish_provider_directory_address_overlay(
             **address_overlay_options_by_name,
         )
-        metrics["address_overlay"] = _collect_provider_directory_artifact_stage(
+        request.metrics[
+            "address_overlay"
+        ] = _collect_provider_directory_artifact_stage(
             address_overlay_result,
             artifact_bundle,
         )
     else:
-        metrics["address_overlay"] = _provider_directory_publish_target_skipped()
+        request.metrics["address_overlay"] = _provider_directory_publish_target_skipped()
     address_artifact_message = (
         "published Provider Directory locations to address archive; "
-        f"inserted={metrics['location_archive'].get('inserted', 0)} "
-        f"updated={metrics['location_archive'].get('provenance_updates', 0)}"
+        f"inserted={request.metrics['location_archive'].get('inserted', 0)} "
+        f"updated={request.metrics['location_archive'].get('provenance_updates', 0)}"
     )
     if (
-        not is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_archive")
-        and not is_provider_directory_publish_target_enabled(publish_artifacts_targets, "address_overlay")
+        not is_provider_directory_publish_target_enabled(
+            request.publish_artifacts_targets,
+            "location_archive",
+        )
+        and not is_provider_directory_publish_target_enabled(
+            request.publish_artifacts_targets,
+            "address_overlay",
+        )
     ):
         address_artifact_message = "skipped Provider Directory location archive and address overlay publish"
     await _mark_provider_directory_progress(
-        run_id,
+        request.run_id,
         phase="provider-directory publishing artifacts",
         details=_provider_directory_progress_details(
             stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH
@@ -36458,17 +36557,17 @@ async def _publish_provider_directory_artifacts(
         done=4,
         total=7,
         message=address_artifact_message,
-        metrics=metrics,
+        metrics=request.metrics,
     )
-    metrics["profile"], profile_message = (
+    request.metrics["profile"], profile_message = (
         await _publish_provider_directory_profile_target(
-            run_id=run_id,
-            publish_artifacts_targets=publish_artifacts_targets,
+            run_id=request.run_id,
+            publish_artifacts_targets=request.publish_artifacts_targets,
             artifact_bundle=artifact_bundle,
         )
     )
     await _mark_provider_directory_progress(
-        run_id,
+        request.run_id,
         phase="provider-directory publishing artifacts",
         details=_provider_directory_progress_details(
             stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH
@@ -36476,31 +36575,34 @@ async def _publish_provider_directory_artifacts(
         done=5,
         total=7,
         message=profile_message,
-        metrics=metrics,
+        metrics=request.metrics,
     )
-    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "network_catalog"):
+    if is_provider_directory_publish_target_enabled(
+        request.publish_artifacts_targets,
+        "network_catalog",
+    ):
         network_catalog_options_by_name: dict[str, Any] = {
-            "run_id": effective_publish_scope_run_id,
-            "source_ids": source_ids,
+            "run_id": request.effective_publish_scope_run_id,
+            "source_ids": request.source_ids,
         }
         if artifact_bundle is not None:
             network_catalog_options_by_name["defer_cutover"] = True
         network_catalog_result = await publish_provider_directory_network_catalog(
             **network_catalog_options_by_name,
         )
-        metrics["network_catalog"] = _collect_provider_directory_artifact_stage(
+        request.metrics["network_catalog"] = _collect_provider_directory_artifact_stage(
             network_catalog_result,
             artifact_bundle,
         )
         network_catalog_message = (
             "published Provider Directory network catalog; "
-            f"rows={metrics['network_catalog'].get('rows', 0)}"
+            f"rows={request.metrics['network_catalog'].get('rows', 0)}"
         )
     else:
-        metrics["network_catalog"] = _provider_directory_publish_target_skipped()
+        request.metrics["network_catalog"] = _provider_directory_publish_target_skipped()
         network_catalog_message = "skipped Provider Directory network catalog publish"
     await _mark_provider_directory_progress(
-        run_id,
+        request.run_id,
         phase="provider-directory publishing artifacts",
         details=_provider_directory_progress_details(
             stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH
@@ -36508,33 +36610,35 @@ async def _publish_provider_directory_artifacts(
         done=6,
         total=7,
         message=network_catalog_message,
-        metrics=metrics,
+        metrics=request.metrics,
     )
-    metrics["publish_corroboration"] = publish_corroboration
-    if publish_corroboration and is_provider_directory_publish_target_enabled(
-        publish_artifacts_targets,
+    request.metrics["publish_corroboration"] = request.publish_corroboration
+    if request.publish_corroboration and is_provider_directory_publish_target_enabled(
+        request.publish_artifacts_targets,
         "corroboration",
     ):
-        metrics["ptg_corroboration_view_published"] = (
+        request.metrics["ptg_corroboration_view_published"] = (
             await _is_provider_directory_corroboration_artifact_published(
-                source_ids=address_artifact_source_ids,
-                network_catalog_metrics=metrics["network_catalog"],
+                source_ids=request.address_artifact_source_ids,
+                network_catalog_metrics=request.metrics["network_catalog"],
                 artifact_bundle=artifact_bundle,
             )
         )
         message = "published Provider Directory PTG corroboration artifacts"
-    elif publish_corroboration:
-        metrics["ptg_corroboration_view_published"] = False
-        metrics["ptg_corroboration_view_skipped"] = _provider_directory_publish_target_skipped()
+    elif request.publish_corroboration:
+        request.metrics["ptg_corroboration_view_published"] = False
+        request.metrics[
+            "ptg_corroboration_view_skipped"
+        ] = _provider_directory_publish_target_skipped()
         message = "skipped Provider Directory PTG corroboration artifacts"
     else:
-        metrics["ptg_corroboration_view_published"] = False
-        metrics["ptg_corroboration_view_skipped"] = {
+        request.metrics["ptg_corroboration_view_published"] = False
+        request.metrics["ptg_corroboration_view_skipped"] = {
             "reason": "publish_corroboration_disabled",
         }
         message = "skipped Provider Directory PTG corroboration artifacts"
     await _mark_provider_directory_progress(
-        run_id,
+        request.run_id,
         phase="provider-directory publishing artifacts",
         details=_provider_directory_progress_details(
             stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH
@@ -36542,9 +36646,9 @@ async def _publish_provider_directory_artifacts(
         done=7,
         total=7,
         message=message,
-        metrics=metrics,
+        metrics=request.metrics,
     )
-    return metrics
+    return request.metrics
 
 def _location_archive_stage_table_name(run_id: str | None = None) -> str:
     raw = run_id or f"{os.getpid()}_{time.time_ns()}"
@@ -74180,89 +74284,85 @@ async def _normalize_address_overlay_stage_countries(stage_ref: str) -> int:
     )
 
 
-async def _materialize_address_overlay_aliases(
+_ADDRESS_OVERLAY_ALIAS_VIOLATION_SQL = """
+    WITH matching AS (
+        SELECT
+            stage_row.address_key AS source_address_key,
+            active.target_address_key,
+            active.source_identity_key,
+            active.target_identity_key AS recorded_target_identity_key,
+            {quoted_schema}.addr_identity_key_v1(
+                stage_row.first_line,
+                stage_row.second_line,
+                stage_row.city_name,
+                COALESCE(NULLIF(stage_row.state_name, ''), stage_row.state_code),
+                stage_row.postal_code,
+                COALESCE(NULLIF(stage_row.country_code, ''), 'US')
+            ) AS staged_source_identity_key,
+            target.identity_key AS current_target_identity_key,
+            target.address_key AS current_target_address_key
+        FROM {stage_ref} AS stage_row
+        JOIN {aliases} AS active
+          ON active.source_address_key = stage_row.address_key
+         AND active.revoked_at IS NULL
+        LEFT JOIN {archive} AS target
+          ON target.address_key = active.target_address_key
+         AND target.merged_into IS NULL
+    ), violations AS (
+        SELECT
+            CASE
+                WHEN source_identity_key IS DISTINCT FROM staged_source_identity_key
+                    THEN 'source_identity_mismatch'
+                WHEN current_target_address_key IS NULL
+                    THEN 'missing_or_merged_target'
+                WHEN recorded_target_identity_key IS DISTINCT FROM current_target_identity_key
+                    THEN 'target_identity_mismatch'
+                ELSE NULL
+            END AS violation_kind,
+            source_address_key,
+            target_address_key
+        FROM matching
+        UNION ALL
+        SELECT
+            'multi_hop_alias',
+            matching.source_address_key,
+            matching.target_address_key
+        FROM matching
+        JOIN {aliases} AS downstream
+          ON downstream.source_address_key = matching.target_address_key
+         AND downstream.revoked_at IS NULL
+    )
+    SELECT *
+    FROM violations
+    WHERE violation_kind IS NOT NULL
+    ORDER BY violation_kind, source_address_key
+    LIMIT 1;
+"""
+
+
+async def _address_overlay_alias_violation(
     schema: str,
     stage_ref: str,
-) -> dict[str, int]:
-    """Rewrite active alias keys across the complete stage before deduplication."""
-    aliases = _qt(schema, address_alias_sql.ADDRESS_ALIAS_TABLE)
-    archive = _qt(schema, "address_archive_v2")
-    generation = await _address_alias_generation(schema)
-    alias_candidates = int(
-        await db.scalar(
-            f"""
-            SELECT count(*)
-            FROM {stage_ref} AS stage_row
-            JOIN {aliases} AS active
-              ON active.source_address_key = stage_row.address_key
-             AND active.revoked_at IS NULL;
-            """
+    aliases: str,
+    archive: str,
+) -> Any:
+    """Return the first active-alias integrity violation in an overlay stage."""
+    return await db.first(
+        _ADDRESS_OVERLAY_ALIAS_VIOLATION_SQL.format(
+            quoted_schema=_q(schema),
+            stage_ref=stage_ref,
+            aliases=aliases,
+            archive=archive,
         )
-        or 0
     )
-    violation = await db.first(
-        f"""
-        WITH matching AS (
-            SELECT
-                stage_row.address_key AS source_address_key,
-                active.target_address_key,
-                active.source_identity_key,
-                active.target_identity_key AS recorded_target_identity_key,
-                {_q(schema)}.addr_identity_key_v1(
-                    stage_row.first_line,
-                    stage_row.second_line,
-                    stage_row.city_name,
-                    COALESCE(NULLIF(stage_row.state_name, ''), stage_row.state_code),
-                    stage_row.postal_code,
-                    COALESCE(NULLIF(stage_row.country_code, ''), 'US')
-                ) AS staged_source_identity_key,
-                target.identity_key AS current_target_identity_key,
-                target.address_key AS current_target_address_key
-            FROM {stage_ref} AS stage_row
-            JOIN {aliases} AS active
-              ON active.source_address_key = stage_row.address_key
-             AND active.revoked_at IS NULL
-            LEFT JOIN {archive} AS target
-              ON target.address_key = active.target_address_key
-             AND target.merged_into IS NULL
-        ), violations AS (
-            SELECT
-                CASE
-                    WHEN source_identity_key IS DISTINCT FROM staged_source_identity_key
-                        THEN 'source_identity_mismatch'
-                    WHEN current_target_address_key IS NULL
-                        THEN 'missing_or_merged_target'
-                    WHEN recorded_target_identity_key IS DISTINCT FROM current_target_identity_key
-                        THEN 'target_identity_mismatch'
-                    ELSE NULL
-                END AS violation_kind,
-                source_address_key,
-                target_address_key
-            FROM matching
-            UNION ALL
-            SELECT
-                'multi_hop_alias',
-                matching.source_address_key,
-                matching.target_address_key
-            FROM matching
-            JOIN {aliases} AS downstream
-              ON downstream.source_address_key = matching.target_address_key
-             AND downstream.revoked_at IS NULL
-        )
-        SELECT *
-        FROM violations
-        WHERE violation_kind IS NOT NULL
-        ORDER BY violation_kind, source_address_key
-        LIMIT 1;
-        """
-    )
-    if violation:
-        raise RuntimeError(
-            "provider-directory address alias integrity violation: "
-            f"kind={violation.violation_kind} "
-            f"source={violation.source_address_key} "
-            f"target={violation.target_address_key}"
-        )
+
+
+async def _rewrite_address_overlay_alias_rows(
+    stage_ref: str,
+    aliases: str,
+    archive: str,
+) -> tuple[int, int]:
+    """Rewrite active source keys and return materialized and residual counts."""
     aliases_materialized = _coerce_rowcount(
         await db.status(
             f"""
@@ -74290,6 +74390,45 @@ async def _materialize_address_overlay_aliases(
             """
         )
         or 0
+    )
+    return aliases_materialized, residual_source_keys
+
+
+async def _materialize_address_overlay_aliases(
+    schema: str,
+    stage_ref: str,
+) -> dict[str, int]:
+    """Rewrite active alias keys across the complete stage before deduplication."""
+    aliases = _qt(schema, address_alias_sql.ADDRESS_ALIAS_TABLE)
+    archive = _qt(schema, "address_archive_v2")
+    generation = await _address_alias_generation(schema)
+    alias_candidates = int(
+        await db.scalar(
+            f"""
+            SELECT count(*)
+            FROM {stage_ref} AS stage_row
+            JOIN {aliases} AS active
+              ON active.source_address_key = stage_row.address_key
+             AND active.revoked_at IS NULL;
+            """
+        )
+        or 0
+    )
+    violation = await _address_overlay_alias_violation(
+        schema,
+        stage_ref,
+        aliases,
+        archive,
+    )
+    if violation:
+        raise RuntimeError(
+            "provider-directory address alias integrity violation: "
+            f"kind={violation.violation_kind} "
+            f"source={violation.source_address_key} "
+            f"target={violation.target_address_key}"
+        )
+    aliases_materialized, residual_source_keys = (
+        await _rewrite_address_overlay_alias_rows(stage_ref, aliases, archive)
     )
     if residual_source_keys:
         raise RuntimeError(

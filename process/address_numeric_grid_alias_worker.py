@@ -35,7 +35,7 @@ async def process_address_numeric_grid_alias(
     async def _cancel_check() -> None:
         await raise_if_cancelled(ctx, options)
 
-    result = await run_numeric_grid_alias(
+    alias_result = await run_numeric_grid_alias(
         mode=str(options.get("mode") or "off"),
         state_code=options.get("state_code") or None,
         zip_prefix=options.get("zip_prefix") or None,
@@ -46,50 +46,43 @@ async def process_address_numeric_grid_alias(
         timeout=str(options.get("timeout") or "10min"),
         cancel_check=_cancel_check,
     )
-    payload = asdict(result)
+    result_payload = asdict(alias_result)
     enqueue_live_progress(
-        run_id=result.run_id,
+        run_id=alias_result.run_id,
         importer="address-numeric-grid-alias",
         status="succeeded",
         phase="address numeric-grid alias",
         unit="candidate",
-        total=result.candidate_rows,
-        done=result.candidate_rows,
+        total=alias_result.candidate_rows,
+        done=alias_result.candidate_rows,
         pct=100,
-        message=f"numeric-grid alias {result.status}",
+        message=f"numeric-grid alias {alias_result.status}",
         **{
-            key: value
-            for key, value in payload.items()
+            key: field_value
+            for key, field_value in result_payload.items()
             if key not in {"run_id", "status", "sample_rows"}
         },
     )
-    return payload
+    return result_payload
 
 
 async def run_address_numeric_grid_alias_command(
-    *,
-    mode: str = "off",
-    state_code: str | None = None,
-    zip_prefix: str | None = None,
-    alias_run_id: str | None = None,
-    expected_candidate_sha256: str | None = None,
-    reviewed_by: str | None = None,
-    sample_limit: int = 20,
-    timeout: str = "10min",
-    enqueue: bool = False,
+    **option_values_by_name: Any,
 ) -> dict[str, Any] | None:
     """Run inline or enqueue one reviewed alias operation."""
-    task = {
-        "mode": mode,
-        "state_code": state_code,
-        "zip_prefix": zip_prefix,
-        "alias_run_id": alias_run_id,
-        "expected_candidate_sha256": expected_candidate_sha256,
-        "reviewed_by": reviewed_by,
-        "sample_limit": sample_limit,
-        "timeout": timeout,
+    task_options_by_name = {
+        "mode": option_values_by_name.get("mode", "off"),
+        "state_code": option_values_by_name.get("state_code"),
+        "zip_prefix": option_values_by_name.get("zip_prefix"),
+        "alias_run_id": option_values_by_name.get("alias_run_id"),
+        "expected_candidate_sha256": option_values_by_name.get(
+            "expected_candidate_sha256"
+        ),
+        "reviewed_by": option_values_by_name.get("reviewed_by"),
+        "sample_limit": option_values_by_name.get("sample_limit", 20),
+        "timeout": option_values_by_name.get("timeout", "10min"),
     }
-    if enqueue:
+    if bool(option_values_by_name.get("enqueue", False)):
         redis = await create_pool(
             build_redis_settings(),
             job_serializer=serialize_job,
@@ -97,11 +90,11 @@ async def run_address_numeric_grid_alias_command(
         )
         await redis.enqueue_job(
             "process_address_numeric_grid_alias",
-            task,
+            task_options_by_name,
             _queue_name=ADDRESS_ALIAS_QUEUE_NAME,
         )
         return None
-    return await process_address_numeric_grid_alias({}, task)
+    return await process_address_numeric_grid_alias({}, task_options_by_name)
 
 
 process_data = process_address_numeric_grid_alias
@@ -121,7 +114,7 @@ async def process_address_strict_source_backfill(
     configured_max_targets = (
         256 if options.get("max_targets") is None else int(options["max_targets"])
     )
-    result = await run_strict_source_backfill(
+    backfill_result = await run_strict_source_backfill(
         alias_run_id=str(options.get("alias_run_id") or ""),
         expected_candidate_sha256=str(
             options.get("expected_candidate_sha256") or ""
@@ -131,24 +124,24 @@ async def process_address_strict_source_backfill(
         timeout=str(options.get("timeout") or "10min"),
         cancel_check=_cancel_check,
     )
-    payload = asdict(result)
+    result_payload = asdict(backfill_result)
     enqueue_live_progress(
-        run_id=result.run_id,
+        run_id=backfill_result.run_id,
         importer="address-strict-source-backfill",
         status="succeeded",
         phase="address strict source backfill",
         unit="target",
-        total=result.target_count,
-        done=result.target_count,
+        total=backfill_result.target_count,
+        done=backfill_result.target_count,
         pct=100,
         message="strict address source evidence backfilled",
         **{
-            key: value
-            for key, value in payload.items()
+            key: field_value
+            for key, field_value in result_payload.items()
             if key not in {"run_id", "status"}
         },
     )
-    return payload
+    return result_payload
 
 
 async def run_address_strict_source_backfill_command(
@@ -162,7 +155,7 @@ async def run_address_strict_source_backfill_command(
 ) -> dict[str, Any] | None:
     """Run inline or enqueue one target-scoped evidence backfill."""
     validated_max_targets = _target_limit(max_targets)
-    task = {
+    task_options_by_name = {
         "alias_run_id": alias_run_id,
         "expected_candidate_sha256": expected_candidate_sha256,
         "reviewed_by": reviewed_by,
@@ -177,11 +170,11 @@ async def run_address_strict_source_backfill_command(
         )
         await redis.enqueue_job(
             "process_address_strict_source_backfill",
-            task,
+            task_options_by_name,
             _queue_name=ADDRESS_ALIAS_QUEUE_NAME,
         )
         return None
-    return await process_address_strict_source_backfill({}, task)
+    return await process_address_strict_source_backfill({}, task_options_by_name)
 
 
 async def process_address_numeric_grid_alias_revoke(
@@ -191,7 +184,7 @@ async def process_address_numeric_grid_alias_revoke(
     """Process one controlled, one-way alias revocation."""
     options = task if isinstance(task, dict) else {}
     await raise_if_cancelled(ctx, options)
-    result = await revoke_numeric_grid_alias(
+    revoke_result = await revoke_numeric_grid_alias(
         source_address_key=str(options.get("source_address_key") or ""),
         expected_target_address_key=str(
             options.get("expected_target_address_key") or ""
@@ -200,9 +193,9 @@ async def process_address_numeric_grid_alias_revoke(
         reviewed_by=str(options.get("reviewed_by") or ""),
         timeout=str(options.get("timeout") or "30s"),
     )
-    payload = asdict(result)
+    result_payload = asdict(revoke_result)
     enqueue_live_progress(
-        run_id=result.run_id,
+        run_id=revoke_result.run_id,
         importer="address-numeric-grid-alias-revoke",
         status="succeeded",
         phase="address numeric-grid alias revoke",
@@ -211,12 +204,16 @@ async def process_address_numeric_grid_alias_revoke(
         done=1,
         pct=100,
         message="numeric-grid alias revoked; full artifact rebuild required",
-        **{key: value for key, value in payload.items() if key not in {"run_id", "status"}},
+        **{
+            key: field_value
+            for key, field_value in result_payload.items()
+            if key not in {"run_id", "status"}
+        },
     )
-    return payload
+    return result_payload
 
 
-async def run_address_numeric_grid_alias_revoke_command(
+async def run_address_alias_revoke_command(
     *,
     source_address_key: str,
     expected_target_address_key: str,
@@ -226,7 +223,7 @@ async def run_address_numeric_grid_alias_revoke_command(
     enqueue: bool = False,
 ) -> dict[str, Any] | None:
     """Run inline or enqueue one exact alias revocation."""
-    task = {
+    task_options_by_name = {
         "source_address_key": source_address_key,
         "expected_target_address_key": expected_target_address_key,
         "reason": reason,
@@ -241,11 +238,14 @@ async def run_address_numeric_grid_alias_revoke_command(
         )
         await redis.enqueue_job(
             "process_address_numeric_grid_alias_revoke",
-            task,
+            task_options_by_name,
             _queue_name=ADDRESS_ALIAS_QUEUE_NAME,
         )
         return None
-    return await process_address_numeric_grid_alias_revoke({}, task)
+    return await process_address_numeric_grid_alias_revoke(
+        {},
+        task_options_by_name,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

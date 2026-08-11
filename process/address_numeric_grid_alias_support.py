@@ -8,7 +8,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -34,6 +34,20 @@ class NumericGridAliasResult:
     promoted: int
     generation: int
     sample_rows: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class NumericGridAliasRequest:
+    mode: str = "off"
+    schema: str | None = None
+    state_code: str | None = None
+    zip_prefix: str | None = None
+    alias_run_id: str | None = None
+    expected_candidate_sha256: str | None = None
+    reviewed_by: str | None = None
+    sample_limit: int = 20
+    timeout: str = "10min"
+    cancel_check: Callable[[], Awaitable[None]] | None = None
 
 
 def _quote_ident(value: str) -> str:

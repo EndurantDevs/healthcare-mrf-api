@@ -90,16 +90,7 @@ def numeric_grid_source_count_sql(*, schema: str, archive: str) -> str:
     """
 
 
-def numeric_grid_candidate_insert_sql(
-    *,
-    schema: str,
-    archive: str,
-) -> str:
-    """Persist all strict structural candidates for one repeatable-read shadow run."""
-    qschema = _quote_ident(schema)
-    aliases = _relation(schema, ADDRESS_ALIAS_TABLE)
-    candidates = _relation(schema, ADDRESS_ALIAS_CANDIDATE_TABLE)
-    return f"""
+_NUMERIC_GRID_CANDIDATE_INSERT_TEMPLATE = """
         WITH parsed_archive AS MATERIALIZED (
             SELECT
                 archived.address_key,
@@ -250,6 +241,20 @@ def numeric_grid_candidate_insert_sql(
         )
         SELECT count(*)::bigint FROM inserted;
     """
+
+
+def numeric_grid_candidate_insert_sql(
+    *,
+    schema: str,
+    archive: str,
+) -> str:
+    """Persist all strict structural candidates for one repeatable-read shadow run."""
+    return _NUMERIC_GRID_CANDIDATE_INSERT_TEMPLATE.format(
+        qschema=_quote_ident(schema),
+        archive=archive,
+        aliases=_relation(schema, ADDRESS_ALIAS_TABLE),
+        candidates=_relation(schema, ADDRESS_ALIAS_CANDIDATE_TABLE),
+    )
 
 
 def candidate_metrics_sql(*, schema: str) -> str:
