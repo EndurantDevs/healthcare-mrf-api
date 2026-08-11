@@ -67,7 +67,7 @@ def _assert_receipt_columns_match_model(elements) -> None:
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260811120000_provider_directory_reviewed_subset_v5_http410_disposition"
+        "20260811130000_provider_directory_exact_practitioner_resource_order_repair"
     ]
     migration = load_capacity_v2_migration()
     assert migration.down_revision == "20260801010000_uhc_semantic_layout_identity"

@@ -51,6 +51,9 @@ COHORT_PATH = VERSIONS / "20260810050000_provider_directory_uhc_flex_npi_cohort.
 ACQUISITION_PATH = VERSIONS / (
     "20260810060000_provider_directory_uhc_flex_practitioner_acquisition.py"
 )
+RESOURCE_ORDER_REPAIR_PATH = VERSIONS / (
+    "20260811130000_provider_directory_exact_practitioner_resource_order_repair.py"
+)
 WORK_TABLE = "provider_directory_uhc_flex_practitioner_work"
 ACQUISITION_TABLE = "provider_directory_uhc_flex_practitioner_acquisition"
 RESOURCE_TABLE = "provider_directory_uhc_flex_practitioner_resource"
@@ -80,6 +83,33 @@ def _unmatched(npi: int):
     return validate_uhc_flex_practitioner_search_bundle(
         npi,
         {"resourceType": "Bundle", "type": "searchset", "total": 0},
+    )
+
+
+def _matched_mixed_case(npi: int):
+    entries = [
+        {
+            "resource": {
+                "resourceType": "Practitioner",
+                "id": resource_id,
+                "identifier": [
+                    {
+                        "system": "http://hl7.org/fhir/sid/us-npi",
+                        "value": str(npi),
+                    }
+                ],
+            }
+        }
+        for resource_id in ("practitioner-a", "practitioner-A")
+    ]
+    return validate_uhc_flex_practitioner_search_bundle(
+        npi,
+        {
+            "resourceType": "Bundle",
+            "type": "searchset",
+            "total": len(entries),
+            "entry": entries,
+        },
     )
 
 
@@ -346,6 +376,109 @@ async def test_flex_practitioner_acquisition_postgres_lifecycle(monkeypatch) -> 
         await _assert_database_guards(url, schema_name, candidate)
         with pytest.raises(DBAPIError, match="downgrade_blocked"):
             await run_migration(engine, acquisition_migration, "downgrade")
+    finally:
+        await database.disconnect()
+        await drop_schema(engine, schema_name)
+        await engine.dispose()
+
+
+async def _complete_mixed_case_result(database, url, schema_name) -> None:
+    await database.connect()
+    baseline, candidate = _role_identities()
+    await _initialize_roles(database, baseline, candidate)
+    requested_npi = MEMBER_NPIS[0]
+    claim = await claim_uhc_flex_practitioner_work(
+        baseline.acquisition_id,
+        requested_npi=requested_npi,
+        database=database,
+    )
+    assert claim is not None
+    query_result = _matched_mixed_case(requested_npi)
+    assert query_result.resource_ids == (
+        "practitioner-A",
+        "practitioner-a",
+    )
+    await complete_uhc_flex_practitioner_result(
+        claim,
+        query_result,
+        database=database,
+    )
+
+    connection = await connect(url)
+    try:
+        stored = await connection.fetchrow(
+            f"SELECT status, result_sha256, resource_count "
+            f"FROM {quoted(schema_name)}.{WORK_TABLE} "
+            "WHERE acquisition_id = $1 AND npi = $2",
+            baseline.acquisition_id,
+            requested_npi,
+        )
+    finally:
+        await connection.close()
+    assert tuple(stored) == (
+        "matched",
+        query_result.result_sha256,
+        2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_practitioner_result_hash_uses_codepoint_resource_order(
+    monkeypatch,
+) -> None:
+    """Keep PostgreSQL result hashing aligned with Python for mixed-case IDs."""
+
+    url = database_url()
+    schema_name = f"fhir_twin_test_{uuid.uuid4().hex}"
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
+    monkeypatch.setenv("DB_SCHEMA", schema_name)
+    engine = create_async_engine(url.set(drivername="postgresql+asyncpg"))
+    database = _configure_database(monkeypatch, url)
+    try:
+        await _prepare_schema(engine, url, schema_name)
+        connection = await connect(url)
+        try:
+            schema = quoted(schema_name)
+            collation_ref = f"{schema}.exact_practitioner_test_order"
+            await connection.execute(
+                f"CREATE COLLATION {collation_ref} "
+                "(provider = icu, locale = 'en-US')"
+            )
+            await connection.execute(
+                f"ALTER TABLE {schema}.{RESOURCE_TABLE} "
+                "ALTER COLUMN resource_id TYPE varchar(64) "
+                f"COLLATE {collation_ref} USING resource_id::varchar(64)"
+            )
+            locale_order = await connection.fetchval(
+                "SELECT string_agg(resource_id, ',' ORDER BY resource_id) "
+                f"FROM (VALUES ('practitioner-a' COLLATE {collation_ref}), "
+                f"('practitioner-A' COLLATE {collation_ref})) "
+                "AS ordering(resource_id)"
+            )
+        finally:
+            await connection.close()
+        assert locale_order == "practitioner-a,practitioner-A"
+        repair_migration = load_migration(
+            RESOURCE_ORDER_REPAIR_PATH,
+            "exact_practitioner_resource_order_repair",
+        )
+        await run_migration(engine, repair_migration, "upgrade")
+        connection = await connect(url)
+        try:
+            function_definition = await connection.fetchval(
+                "SELECT pg_catalog.pg_get_functiondef("
+                "pg_catalog.to_regprocedure($1));",
+                (
+                    f'{quoted(schema_name)}.'
+                    '"guard_pd_uhc_flex_practitioner_work"()'
+                ),
+            )
+        finally:
+            await connection.close()
+        assert 'ORDER BY resource.resource_id COLLATE pg_catalog."C"' in (
+            function_definition
+        )
+        await _complete_mixed_case_result(database, url, schema_name)
     finally:
         await database.disconnect()
         await drop_schema(engine, schema_name)
