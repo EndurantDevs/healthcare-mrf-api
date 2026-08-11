@@ -303,15 +303,17 @@ async def test_partition_next_count_handles_retry_and_invalid_response(monkeypat
             )
         ),
     )
+    partition_state = last_updated_partition_state()
     observed_count = await importer._observe_next_partition_count(
         {"source_id": "source-1"},
         "Practitioner",
         ProviderDirectoryPractitioner,
         last_updated_partition_config(),
-        last_updated_partition_state(),
+        partition_state,
         last_updated_partition_fetch_options(),
     )
     assert observed_count is retry_fetch_result
+    assert partition_state.pages_fetched == 0
 
     monkeypatch.setattr(
         importer,

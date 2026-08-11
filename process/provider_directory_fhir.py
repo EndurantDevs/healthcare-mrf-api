@@ -52506,7 +52506,6 @@ async def _record_partition_census_fetch(
     count_fetch: LastUpdatedCountFetch,
 ) -> ResourceFetchResult | None:
     field_name = census_request.field_name
-    state.pages_fetched += count_fetch.pages_fetched
     if count_fetch.transient:
         return await _saved_partition_retry_result(
             model,
@@ -52516,6 +52515,7 @@ async def _record_partition_census_fetch(
             f"census_{field_name}:{count_fetch.error or 'transient'}",
             retry_not_before=count_fetch.retry_not_before,
         )
+    state.pages_fetched += count_fetch.pages_fetched
     observed_count = (
         count_fetch.observation.count
         if count_fetch.observation is not None
@@ -52678,7 +52678,6 @@ async def _observe_next_partition_count(
         _last_updated_partition_count_url(state, config, window),
         timeout=fetch_options.timeout,
     )
-    state.pages_fetched += count_fetch.pages_fetched
     if count_fetch.transient:
         return await _saved_partition_retry_result(
             model,
@@ -52688,6 +52687,7 @@ async def _observe_next_partition_count(
             count_fetch.error or "count_fetch_transient",
             retry_not_before=count_fetch.retry_not_before,
         )
+    state.pages_fetched += count_fetch.pages_fetched
     if count_fetch.observation is None:
         raise RuntimeError(
             "provider_directory_last_updated_partition_count_result_invalid"
@@ -52944,10 +52944,8 @@ async def _partition_window_retry_result(
     state: LastUpdatedPartitionState,
     window_fetch: LastUpdatedWindowFetch,
 ) -> ResourceFetchResult:
-    """Persist retryable progress from one incomplete partition window."""
+    """Persist retry state without accepting an incomplete partition window."""
 
-    state.pages_fetched += window_fetch.pages_fetched
-    state.rows_fetched += len(window_fetch.resources)
     return await _saved_partition_retry_result(
         model,
         resource_type,
