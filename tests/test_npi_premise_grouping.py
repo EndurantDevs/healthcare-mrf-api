@@ -4,10 +4,12 @@
 
 from copy import deepcopy
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 import sanic.exceptions
+import yaml
 
 from api.endpoint import npi as npi_module
 from tests.test_npi_location_paging import (
@@ -307,6 +309,28 @@ def test_overlay_query_uses_only_materialized_premise_key():
     assert "NULL::uuid AS premise_key" in compatibility_sql
     assert "CAST(:address_site_key AS uuid) IS NULL" in compatibility_sql
     assert "address_archive_v2" not in current_sql
+
+
+def test_backend_openapi_documents_premise_grouping_and_continuation():
+    document = yaml.safe_load(Path("doc/openapi.yaml").read_text(encoding="utf-8"))
+    operation = document["paths"]["/npi/id/{npi}"]["get"]
+    parameter_by_name = {
+        parameter["name"]: parameter for parameter in operation["parameters"]
+    }
+    grouping_parameter = parameter_by_name["address_grouping"]
+    site_parameter = parameter_by_name["address_site_key"]
+
+    assert grouping_parameter["schema"]["enum"] == ["flat", "premise"]
+    assert grouping_parameter["schema"]["default"] == "flat"
+    assert site_parameter["schema"]["format"] == "uuid"
+
+    schemas = document["components"]["schemas"]
+    group_schema = schemas["NpiAddressGroup"]
+    assert group_schema["properties"]["members"]["maxItems"] == 5
+    pagination = group_schema["properties"]["member_pagination"]
+    assert "flat mode" in pagination["description"]
+    assert "next_offset" in pagination["description"]
+    assert schemas["NpiAddressGroupPagination"]["properties"]["limit"]["maximum"] == 5
 
 
 def test_detail_cache_key_separates_flat_site_and_premise_windows():

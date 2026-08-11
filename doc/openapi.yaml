@@ -2921,6 +2921,27 @@ paths:
             type: string
             format: uuid
           description: Restrict the returned address list and evidence to one canonical address UUID
+        - name: address_site_key
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: |
+            In flat mode, restrict the returned address list to unit-level
+            members of one exact stored premise key. Combine with bounded
+            address_limit and address_offset to continue a premise-group member
+            preview.
+        - name: address_grouping
+          in: query
+          schema:
+            type: string
+            enum: [flat, premise]
+            default: flat
+          description: |
+            Select the address response shape. The default flat mode preserves
+            address_list. Premise mode groups only by exact stored premise keys,
+            preserves unit-level members, limits address_limit to 1 through 5,
+            and cannot be combined with address_key or address_site_key.
         - name: force_address_update
           in: query
           schema:
@@ -2979,13 +3000,19 @@ paths:
           in: query
           schema:
             type: string
-          description: Maximum address_list rows to return; use all, 0, or -1 to return all addresses
+          description: |
+            Flat mode limits address_list rows and accepts all, 0, or -1 for an
+            unbounded response. Premise mode limits groups, defaults to 5, and
+            accepts only integers from 1 through 5.
         - name: address_offset
           in: query
           schema:
             type: integer
             minimum: 0
-          description: Zero-based address_list offset used with address_limit
+          description: |
+            Zero-based address_list offset in flat mode or premise-group offset
+            in premise mode. A group's member_pagination next_offset must be
+            used on a flat address_site_key request, not on the grouped request.
         - name: include_address_total
           in: query
           schema:
@@ -10092,6 +10119,16 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/NpiAddress'
+        address_grouping:
+          type: string
+          enum: [premise]
+          description: Present only when the explicit premise response shape is selected.
+        address_groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/NpiAddressGroup'
+        address_group_pagination:
+          $ref: '#/components/schemas/NpiAddressGroupPagination'
         other_name_list:
           type: array
           items:
@@ -10383,6 +10420,67 @@ components:
         long:
           type: number
       additionalProperties: true
+    NpiAddressGroup:
+      type: object
+      properties:
+        group_key:
+          type: string
+          format: uuid
+          nullable: true
+        grouping_basis:
+          type: string
+          enum: [address_site_key, address_key_fallback, singleton]
+        address_site_key:
+          type: string
+          format: uuid
+          nullable: true
+        address_site_key_status:
+          type: string
+          enum: [available, missing, conflicting]
+        members:
+          type: array
+          maxItems: 5
+          items:
+            $ref: '#/components/schemas/NpiAddress'
+        member_pagination:
+          allOf:
+            - $ref: '#/components/schemas/NpiAddressGroupPagination'
+          description: |
+            Bounded preview metadata. When has_more is true and
+            address_site_key_status is available, continue in flat mode with
+            this address_site_key and member_pagination.next_offset.
+      required:
+        - group_key
+        - grouping_basis
+        - address_site_key
+        - address_site_key_status
+        - members
+        - member_pagination
+      additionalProperties: false
+    NpiAddressGroupPagination:
+      type: object
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 5
+        offset:
+          type: integer
+          minimum: 0
+        returned:
+          type: integer
+          minimum: 0
+        total:
+          type: integer
+          minimum: 0
+        has_more:
+          type: boolean
+        next_offset:
+          type: integer
+          minimum: 0
+          nullable: true
+      required: [limit, offset, returned, total, has_more, next_offset]
+      additionalProperties: false
     NpiOtherName:
       type: object
       properties:
