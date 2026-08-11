@@ -7,16 +7,24 @@ from __future__ import annotations
 import datetime
 import json
 import types
+import uuid
 from unittest.mock import AsyncMock
 
+import api as api_package
 import pytest
+from sanic import Sanic
 from sanic.exceptions import BadRequest, SanicException
 
+from api import control as control_api
+from api import control_wave_routes
 from api import provider_directory_profile_capacity_preflight as preflight_api
 from process import provider_directory_profile_capacity as capacity
 from process import provider_directory_profile_capacity_preflight_contract as contract
 from process import provider_directory_profile_capacity_runtime as capacity_runtime
 from process import provider_directory_profile_runtime_observation as runtime
+from process.provider_directory_profile_capacity_signing_guard_contract import (
+    HEALTHCARE_PREFLIGHT_PATH,
+)
 from tests.provider_directory_profile_capacity_signing_guard_test_support import (
     synthetic_profile_execution,
 )
@@ -108,6 +116,37 @@ async def test_control_api_validates_closed_request_and_returns_receipt(monkeypa
         await preflight_api.control_provider_directory_profile_capacity_preflight(
             http_request
         )
+
+
+@pytest.mark.asyncio
+async def test_signed_capacity_preflight_path_resolves_to_the_control_handler(
+    monkeypatch,
+):
+    skip_startup_check = AsyncMock()
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    monkeypatch.setattr(api_package.db, "init_app", lambda _app: None)
+    monkeypatch.setattr(control_api, "ensure_import_run_table", skip_startup_check)
+    monkeypatch.setattr(
+        control_wave_routes,
+        "assert_nonterminal_receipt_key_coverage",
+        skip_startup_check,
+    )
+    app = Sanic(f"profile-capacity-preflight-path-{uuid.uuid4().hex}")
+    api_package.init_api(app)
+
+    _request_value, route_response = await app.asgi_client.post(
+        HEALTHCARE_PREFLIGHT_PATH,
+        json={},
+        headers={
+            "Authorization": "Bearer secret",
+            "X-Request-ID": "profile-capacity-route-test",
+        },
+    )
+    assert route_response.status == 400
+    assert route_response.json["error"]["code"] == "invalid_request"
+    assert route_response.json["error"]["request_id"] == (
+        "profile-capacity-route-test"
+    )
 
 
 def _install_receipt_only_route_stubs(monkeypatch, writes):
