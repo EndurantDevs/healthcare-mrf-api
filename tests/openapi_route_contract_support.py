@@ -53,6 +53,25 @@ ROUTE_QUERY_PARAM_ADDITIONS = {
         "step_therapy",
         "tier",
     },
+    # The market-list parser is extracted from the decorated route so the
+    # route remains within the readability budget.
+    ("get", "/reports/pharmacies/markets"): {
+        "as_of",
+        "chain",
+        "city",
+        "county",
+        "include_staffing",
+        "limit",
+        "offset",
+        "order",
+        "page",
+        "page_size",
+        "scope",
+        "sort",
+        "start",
+        "state",
+        "zip",
+    },
 }
 ROUTE_QUERY_PARAM_REMOVALS = {
     # Billing search is transport-bound to the canonical path, not aliases.
