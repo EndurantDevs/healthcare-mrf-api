@@ -476,92 +476,100 @@ def max_optional(current: int | None, candidate: int | None) -> int | None:
     return max(current, candidate)
 
 
+def _large_in_network_fixture(case: dict[str, Any]) -> dict[str, Any]:
+    rate_count = int(case.get("negotiated_rates") or 64)
+    billing_code_count = max(int(case.get("billing_codes") or 1), 1)
+    provider_set_count = max(int(case.get("provider_sets") or 1), 1)
+    price_reuse_mod = int(case.get("price_reuse_mod") or 0)
+    provider_cycle_divisor = max(price_reuse_mod, 1)
+    additional_information = None
+    if int(case.get("additional_information_bytes") or 0) > 0:
+        additional_information = "x" * int(case.get("additional_information_bytes") or 0)
+    in_network_items = []
+    for code_index in range(billing_code_count):
+        start = (rate_count * code_index) // billing_code_count
+        end = (rate_count * (code_index + 1)) // billing_code_count
+        negotiated_rates = []
+        for index in range(start, end):
+            price_index = index % price_reuse_mod if price_reuse_mod > 0 else index
+            provider_ref_id = 7 + ((index // provider_cycle_divisor) % provider_set_count)
+            negotiated_rates.append(
+                {
+                    "provider_references": [provider_ref_id],
+                    "negotiated_prices": [
+                        {
+                            "negotiated_type": "negotiated",
+                            "negotiated_rate": 100 + price_index,
+                            "service_code": ["11"],
+                            "billing_class": "professional",
+                            **(
+                                {"additional_information": additional_information}
+                                if additional_information is not None
+                                else {}
+                            ),
+                        }
+                    ],
+                }
+            )
+        in_network_items.append(
+            {
+                "billing_code_type": "CPT",
+                "billing_code": f"{99213 + code_index}",
+                "name": f"Fixture service {code_index + 1}",
+                "negotiated_rates": negotiated_rates,
+            }
+        )
+    return {
+        "provider_references": [
+            {
+                "provider_group_id": 7 + provider_index,
+                "provider_groups": [
+                    {
+                        "npi": [] if case.get("omit_provider_npis") else [1234567890 + provider_index],
+                        "tin": {"type": "ein", "value": f"12-34567{provider_index % 10}"},
+                    }
+                ],
+            }
+            for provider_index in range(provider_set_count)
+        ],
+        "in_network": in_network_items,
+    }
+
+
+def _duplicate_serving_fixture() -> dict[str, Any]:
+    return {
+        "provider_references": [
+            {
+                "provider_group_id": 7,
+                "provider_groups": [{"npi": [1234567890], "tin": {"type": "ein", "value": "12-3456789"}}],
+            }
+        ],
+        "in_network": [
+            {
+                "billing_code_type": "CPT",
+                "billing_code": "99213",
+                "negotiated_rates": [
+                    {
+                        "provider_references": [7],
+                        "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
+                    },
+                    {
+                        "provider_references": [7],
+                        "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
+                    },
+                ],
+            }
+        ],
+    }
+
+
 def build_fixture_payload(case: dict[str, Any]) -> dict[str, Any]:
     """Build the synthetic MRF payload used by scanner benchmarks."""
     fixture = str(case.get("fixture") or "large_in_network")
     if fixture == "large_in_network":
-        rate_count = int(case.get("negotiated_rates") or 64)
-        billing_code_count = max(int(case.get("billing_codes") or 1), 1)
-        provider_set_count = max(int(case.get("provider_sets") or 1), 1)
-        price_reuse_mod = int(case.get("price_reuse_mod") or 0)
-        provider_cycle_divisor = max(price_reuse_mod, 1)
-        additional_information = None
-        if int(case.get("additional_information_bytes") or 0) > 0:
-            additional_information = "x" * int(case.get("additional_information_bytes") or 0)
-        in_network_items = []
-        for code_index in range(billing_code_count):
-            start = (rate_count * code_index) // billing_code_count
-            end = (rate_count * (code_index + 1)) // billing_code_count
-            negotiated_rates = []
-            for index in range(start, end):
-                price_index = index % price_reuse_mod if price_reuse_mod > 0 else index
-                provider_ref_id = 7 + ((index // provider_cycle_divisor) % provider_set_count)
-                negotiated_rates.append(
-                    {
-                        "provider_references": [provider_ref_id],
-                        "negotiated_prices": [
-                            {
-                                "negotiated_type": "negotiated",
-                                "negotiated_rate": 100 + price_index,
-                                "service_code": ["11"],
-                                "billing_class": "professional",
-                                **(
-                                    {"additional_information": additional_information}
-                                    if additional_information is not None
-                                    else {}
-                                ),
-                            }
-                        ],
-                    }
-                )
-            in_network_items.append(
-                {
-                    "billing_code_type": "CPT",
-                    "billing_code": f"{99213 + code_index}",
-                    "name": f"Fixture service {code_index + 1}",
-                    "negotiated_rates": negotiated_rates,
-                }
-            )
-        return {
-            "provider_references": [
-                {
-                    "provider_group_id": 7 + provider_index,
-                    "provider_groups": [
-                        {
-                            "npi": [] if case.get("omit_provider_npis") else [1234567890 + provider_index],
-                            "tin": {"type": "ein", "value": f"12-34567{provider_index % 10}"},
-                        }
-                    ],
-                }
-                for provider_index in range(provider_set_count)
-            ],
-            "in_network": in_network_items,
-        }
+        return _large_in_network_fixture(case)
     if fixture == "duplicate_serving":
-        return {
-            "provider_references": [
-                {
-                    "provider_group_id": 7,
-                    "provider_groups": [{"npi": [1234567890], "tin": {"type": "ein", "value": "12-3456789"}}],
-                }
-            ],
-            "in_network": [
-                {
-                    "billing_code_type": "CPT",
-                    "billing_code": "99213",
-                    "negotiated_rates": [
-                        {
-                            "provider_references": [7],
-                            "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
-                        },
-                        {
-                            "provider_references": [7],
-                            "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
-                        },
-                    ],
-                }
-            ],
-        }
+        return _duplicate_serving_fixture()
     raise ValueError(f"unsupported fixture: {fixture}")
 
 
@@ -1344,33 +1352,12 @@ def run_api_latency_probe(
     }
 
 
-def verify_local_import_against_original(
-    *,
-    env_overrides: dict[str, str],
-    original_path: Path,
-    import_run_id: str,
+def _local_import_table_context(
+    env_overrides: dict[str, str], serving_index: dict[str, Any]
 ) -> dict[str, Any]:
-    """Verify imported rows against the original fixture payload."""
-    expected = expected_original_file_summary(original_path)
-    schema_name = validate_identifier(env_overrides["HLTHPRT_DB_SCHEMA"])
-    run_payload = psql_json(
-        env_overrides,
-        "SELECT row_to_json(t) FROM ("
-        "SELECT import_run_id, status, report "
-        f"FROM {schema_name}.ptg2_import_run "
-        f"WHERE import_run_id = '{sql_literal(import_run_id)}'"
-        ") AS t;",
-    )
-    report = run_payload.get("report") or {}
-    serving_index = report.get("serving_index") or {}
     serving_table = serving_index_table(serving_index, "table", "serving_table")
     serving_table_exists = pg_table_exists(env_overrides, serving_table)
     binary_manifest = serving_index.get("serving_binary") if isinstance(serving_index.get("serving_binary"), dict) else {}
-    serving_rows_sql = (
-        f"(SELECT count(*) FROM {serving_table})"
-        if serving_table_exists
-        else str(int((binary_manifest or {}).get("row_count") or 0))
-    )
     price_atom_table = _serving_index_table_or_none(serving_index, "price_atom_table")
     provider_group_member_table = serving_index_table(
         serving_index,
@@ -1399,6 +1386,27 @@ def verify_local_import_against_original(
         "additional_information",
     }
     can_digest_price_atoms = bool(price_atom_table) and digest_columns.issubset(price_atom_columns)
+    return {
+        "serving_table": serving_table,
+        "serving_table_exists": serving_table_exists,
+        "binary_manifest": binary_manifest,
+        "price_atom_table": price_atom_table,
+        "provider_group_member_table": provider_group_member_table,
+        "can_digest_price_atoms": can_digest_price_atoms,
+    }
+
+
+def _local_import_db_counts(
+    env_overrides: dict[str, str], table_context: dict[str, Any]
+) -> dict[str, Any]:
+    serving_table = table_context["serving_table"]
+    binary_manifest = table_context["binary_manifest"]
+    serving_rows_sql = (
+        f"(SELECT count(*) FROM {serving_table})"
+        if table_context["serving_table_exists"]
+        else str(int((binary_manifest or {}).get("row_count") or 0))
+    )
+    price_atom_table = table_context["price_atom_table"]
     price_atoms_v3 = binary_manifest.get("price_atoms_v3") if isinstance(binary_manifest, dict) else {}
     price_atoms_v3 = price_atoms_v3 if isinstance(price_atoms_v3, dict) else {}
     price_atom_rows_sql = (
@@ -1406,6 +1414,7 @@ def verify_local_import_against_original(
         if price_atom_table
         else str(int(price_atoms_v3.get("atom_count") or 0))
     )
+    can_digest_price_atoms = table_context["can_digest_price_atoms"]
     price_atom_digest_sql = (
         "'price_atom_digest', (SELECT md5(COALESCE(string_agg(line, E'\\n' ORDER BY line) || E'\\n', '')) "
         "FROM (SELECT "
@@ -1421,7 +1430,8 @@ def verify_local_import_against_original(
         if can_digest_price_atoms
         else "'price_atom_digest', NULL"
     )
-    db_counts = psql_json(
+    provider_group_member_table = table_context["provider_group_member_table"]
+    return psql_json(
         env_overrides,
         "SELECT json_build_object("
         f"'serving_rows', {serving_rows_sql}, "
@@ -1431,6 +1441,30 @@ def verify_local_import_against_original(
         f"{price_atom_digest_sql}"
         ") AS payload;",
     )
+
+
+def verify_local_import_against_original(
+    *,
+    env_overrides: dict[str, str],
+    original_path: Path,
+    import_run_id: str,
+) -> dict[str, Any]:
+    """Verify imported rows against the original fixture payload."""
+    expected = expected_original_file_summary(original_path)
+    schema_name = validate_identifier(env_overrides["HLTHPRT_DB_SCHEMA"])
+    run_payload = psql_json(
+        env_overrides,
+        "SELECT row_to_json(t) FROM ("
+        "SELECT import_run_id, status, report "
+        f"FROM {schema_name}.ptg2_import_run "
+        f"WHERE import_run_id = '{sql_literal(import_run_id)}'"
+        ") AS t;",
+    )
+    report = run_payload.get("report") or {}
+    serving_index = report.get("serving_index") or {}
+    table_context = _local_import_table_context(env_overrides, serving_index)
+    db_counts = _local_import_db_counts(env_overrides, table_context)
+    can_digest_price_atoms = table_context["can_digest_price_atoms"]
     skipped_checks = []
     if not can_digest_price_atoms:
         skipped_checks.append("price_atom_digest")
@@ -1455,10 +1489,10 @@ def verify_local_import_against_original(
         "db": db_counts,
         "skipped_checks": skipped_checks,
         "tables": {
-            "serving": serving_table,
-            "serving_exists": serving_table_exists,
-            "price_atom": price_atom_table,
-            "provider_group_member": provider_group_member_table,
+            "serving": table_context["serving_table"],
+            "serving_exists": table_context["serving_table_exists"],
+            "price_atom": table_context["price_atom_table"],
+            "provider_group_member": table_context["provider_group_member_table"],
         },
         "checks": checks_by_name,
     }
@@ -2817,15 +2851,9 @@ def analyze_postgres_posting_candidate(
     }
 
 
-def analyze_local_serving_sidecar_candidate(
-    *,
-    env_overrides: dict[str, str],
-    import_run_id: str,
-    variant_id: str,
-    output_dir: Path,
-    max_rows: int,
-) -> dict[str, Any]:
-    """Analyze storage and lookup behavior for the local sidecar candidate."""
+def _local_sidecar_storage(
+    env_overrides: dict[str, str], import_run_id: str
+) -> tuple[str, dict[str, Any]]:
     schema_name = validate_identifier(env_overrides["HLTHPRT_DB_SCHEMA"])
     run_payload = psql_json(
         env_overrides,
@@ -2850,15 +2878,15 @@ def analyze_local_serving_sidecar_candidate(
         f"'total_bytes', pg_total_relation_size(to_regclass('{sql_literal(serving_table)}'))"
         ") AS payload;",
     )
-    row_count = int(storage.get("row_count") or 0)
-    if row_count > max_rows:
-        return {
-            "status": "skipped",
-            "reason": "row_limit",
-            "max_rows": max_rows,
-            "serving_table": serving_table,
-            "storage": storage,
-        }
+    return serving_table, storage
+
+
+def _optional_postgres_sidecars(
+    env_overrides: dict[str, str],
+    serving_table: str,
+    import_run_id: str,
+    variant_id: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     postgres_posting_candidate = None
     if bool(str(env_overrides.get("HLTHPRT_PTG2_RESEARCH_POSTGRES_POSTING") or "").strip()):
         postgres_posting_candidate = analyze_postgres_posting_candidate(
@@ -2883,6 +2911,12 @@ def analyze_local_serving_sidecar_candidate(
                 ).strip()
             ),
         )
+    return postgres_posting_candidate, postgres_binary_candidate
+
+
+def _write_local_sidecars(
+    env_overrides: dict[str, str], serving_table: str, output_dir: Path
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     sql_by_code = (
         "SELECT code_key, provider_set_key, provider_count, price_set_global_id_128 "
         f"FROM {serving_table} "
@@ -2903,6 +2937,15 @@ def analyze_local_serving_sidecar_candidate(
             psql_copy_lines(env_overrides, sql_by_provider_set),
             output_dir / "serving_by_provider_set_v1.ptg2sbp",
         )
+    return candidate, reverse_candidate
+
+
+def _local_sidecar_analysis(
+    storage: dict[str, Any],
+    serving_table: str,
+    candidate: dict[str, Any],
+    reverse_candidate: dict[str, Any] | None,
+) -> dict[str, Any]:
     total_bytes = int(storage.get("total_bytes") or 0)
     artifact_bytes = int(candidate.get("artifact_bytes") or 0)
     gzip_bytes = int(candidate.get("gzip_bytes") or 0)
@@ -2952,6 +2995,37 @@ def analyze_local_serving_sidecar_candidate(
                 ),
             }
         )
+    return analysis_by_section
+
+
+def analyze_local_serving_sidecar_candidate(
+    *,
+    env_overrides: dict[str, str],
+    import_run_id: str,
+    variant_id: str,
+    output_dir: Path,
+    max_rows: int,
+) -> dict[str, Any]:
+    """Analyze storage and lookup behavior for the local sidecar candidate."""
+    serving_table, storage = _local_sidecar_storage(env_overrides, import_run_id)
+    row_count = int(storage.get("row_count") or 0)
+    if row_count > max_rows:
+        return {
+            "status": "skipped",
+            "reason": "row_limit",
+            "max_rows": max_rows,
+            "serving_table": serving_table,
+            "storage": storage,
+        }
+    postgres_posting_candidate, postgres_binary_candidate = _optional_postgres_sidecars(
+        env_overrides, serving_table, import_run_id, variant_id
+    )
+    candidate, reverse_candidate = _write_local_sidecars(
+        env_overrides, serving_table, output_dir
+    )
+    analysis_by_section = _local_sidecar_analysis(
+        storage, serving_table, candidate, reverse_candidate
+    )
     if postgres_posting_candidate is not None:
         analysis_by_section["postgres_posting_candidate"] = postgres_posting_candidate
         analysis_by_section["preferred_candidate"] = "postgres_posting"
@@ -2962,9 +3036,7 @@ def analyze_local_serving_sidecar_candidate(
         analysis_by_section["preferred_candidate"] = "postgres_binary"
         if postgres_binary_candidate.get("status") == "failed":
             analysis_by_section["status"] = "failed"
-    return {
-        **analysis_by_section,
-    }
+    return analysis_by_section
 
 
 def _published_serving_binary_storage_sql(table_name: str) -> str:
@@ -3268,21 +3340,12 @@ def digest_lines(lines: list[str]) -> str:
     return digest.hexdigest()
 
 
-def run_local_ptg_cli(
-    *,
+def _local_ptg_environment(
     case: dict[str, Any],
     variant: dict[str, Any],
     suite: dict[str, Any],
-    output_root: Path,
-    dry_run: bool = False,
-) -> RunResult:
-    """Run one fixture through the local PTG command."""
-    case_id = str(case["id"])
-    variant_id = str(variant["id"])
-    run_dir = output_root / case_id / variant_id
-    fixture_dir = run_dir / "http_fixture"
-    artifact_dir = run_dir / "artifacts"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir: Path,
+) -> dict[str, str]:
     environment_by_name = {
         "PYTHONPATH": ".",
         "HLTHPRT_LOG_CFG": "logging.yaml",
@@ -3309,7 +3372,22 @@ def run_local_ptg_cli(
     if "HLTHPRT_DB_PASSWORD" in os.environ or case.get("db_password") is not None:
         environment_by_name["HLTHPRT_DB_PASSWORD"] = str(case.get("db_password") or os.getenv("HLTHPRT_DB_PASSWORD") or "")
     environment_by_name.update(env_for_variant(case, variant))
+    return environment_by_name
 
+
+def _prepare_local_ptg_run(
+    case: dict[str, Any],
+    variant: dict[str, Any],
+    suite: dict[str, Any],
+    output_root: Path,
+) -> dict[str, Any]:
+    case_id = str(case["id"])
+    variant_id = str(variant["id"])
+    run_dir = output_root / case_id / variant_id
+    fixture_dir = run_dir / "http_fixture"
+    artifact_dir = run_dir / "artifacts"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    environment_by_name = _local_ptg_environment(case, variant, suite, artifact_dir)
     plan_id = str(case.get("plan_id") or "LOCAL-PTG2-SMOKE")
     plan_market_type = str(case.get("plan_market_type") or "group")
     import_id = str(case.get("import_id") or f"{case_id}-{variant_id}-{dt.datetime.now(dt.UTC).strftime('%Y%m%d%H%M%S')}")
@@ -3340,28 +3418,23 @@ def run_local_ptg_cli(
         command_args.extend(["--max-items", str(case.get("max_items") or 5)])
     elif case.get("max_items") is not None:
         raise ValueError("local_ptg_cli full_file=true cannot be combined with max_items")
-    if dry_run:
-        write_ptg_toc_fixture(case, fixture_dir, base_url="http://127.0.0.1:<auto>")
-        return RunResult(
-            case_id=case_id,
-            variant_id=variant_id,
-            kind="local_ptg_cli",
-            status="dry_run",
-            command=command_args,
-            env_overrides=environment_by_name,
-            import_run={"fixture_dir": str(fixture_dir), "artifact_dir": str(artifact_dir)},
-        )
-    scanner = Path(environment_by_name["HLTHPRT_PTG2_RUST_SCANNER_BIN"])
-    if not scanner.exists():
-        return RunResult(
-            case_id=case_id,
-            variant_id=variant_id,
-            kind="local_ptg_cli",
-            status="skipped",
-            command=command_args,
-            env_overrides=environment_by_name,
-            error=f"scanner binary not found: {scanner}",
-        )
+    return {
+        "case_id": case_id,
+        "variant_id": variant_id,
+        "run_dir": run_dir,
+        "fixture_dir": fixture_dir,
+        "artifact_dir": artifact_dir,
+        "environment": environment_by_name,
+        "command_args": command_args,
+    }
+
+
+def _execute_local_ptg_run(
+    case: dict[str, Any], run_context: dict[str, Any]
+) -> dict[str, Any]:
+    fixture_dir = run_context["fixture_dir"]
+    environment_by_name = run_context["environment"]
+    command_args = list(run_context["command_args"])
     with LocalFixtureServer(fixture_dir) as server:
         write_ptg_toc_fixture(case, fixture_dir, base_url=server.base_url)
         command_args = [part if part != "http://127.0.0.1:<auto>/index.json" else f"{server.base_url}/index.json" for part in command_args]
@@ -3372,96 +3445,187 @@ def run_local_ptg_cli(
     copy_file_accounting = copy_file_accounting_from_summary(serving_summary)
     scanner_summary = serving_summary.get("scanner") if isinstance(serving_summary.get("scanner"), dict) else {}
     status = "succeeded" if completed.returncode == 0 and (import_done or {}).get("status") == "validated" else "failed"
-    verification = None
-    storage_summary_dict = None
-    api_latency = None
-    serving_index_checks = None
-    import_run_id = str((import_done or {}).get("import_run_id") or "")
-    serving_index_payload: dict[str, Any] | None = None
+    return {
+        "command_args": command_args,
+        "completed": completed,
+        "elapsed": elapsed,
+        "memory": memory,
+        "combined": combined,
+        "import_done": import_done,
+        "copy_file_accounting": copy_file_accounting,
+        "scanner_summary": scanner_summary,
+        "status": status,
+        "verification": None,
+        "storage": None,
+        "api_latency": None,
+        "serving_index_checks": None,
+        "import_run_id": str((import_done or {}).get("import_run_id") or ""),
+        "serving_index_payload": None,
+    }
+
+
+def _check_local_ptg_correctness(
+    case: dict[str, Any],
+    variant: dict[str, Any],
+    run_context: dict[str, Any],
+    run_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    status = run_evidence["status"]
+    environment_by_name = run_context["environment"]
+    import_run_id = run_evidence["import_run_id"]
     if status == "succeeded" and case.get("verify_original"):
-        verification = verify_local_import_against_original(
+        run_evidence["verification"] = verify_local_import_against_original(
             env_overrides=environment_by_name,
-            original_path=fixture_dir / "rates.json.gz",
+            original_path=run_context["fixture_dir"] / "rates.json.gz",
             import_run_id=import_run_id,
         )
-        if verification.get("status") != "passed":
+        if run_evidence["verification"].get("status") != "passed":
             status = "failed"
     if status == "succeeded" and _is_serving_storage_probe_enabled(case, variant):
-        storage_summary_dict = analyze_local_serving_sidecar_candidate(
+        run_evidence["storage"] = analyze_local_serving_sidecar_candidate(
             env_overrides=environment_by_name,
             import_run_id=import_run_id,
-            variant_id=variant_id,
-            output_dir=run_dir / "serving_sidecar_candidate",
+            variant_id=run_context["variant_id"],
+            output_dir=run_context["run_dir"] / "serving_sidecar_candidate",
             max_rows=int(variant.get("serving_sidecar_max_rows") or case.get("serving_sidecar_max_rows") or 2_000_000),
         )
-        if storage_summary_dict.get("status") == "failed":
+        if run_evidence["storage"].get("status") == "failed":
             status = "failed"
     expectations = serving_index_expectations_for(case, variant)
     if status == "succeeded" and expectations:
-        serving_index_payload = import_run_serving_index(env_overrides=environment_by_name, import_run_id=import_run_id)
-        serving_index_checks = check_serving_index_expectations(
+        run_evidence["serving_index_payload"] = import_run_serving_index(
+            env_overrides=environment_by_name, import_run_id=import_run_id
+        )
+        run_evidence["serving_index_checks"] = check_serving_index_expectations(
             environment_by_name,
-            serving_index_payload,
+            run_evidence["serving_index_payload"],
             expectations,
         )
-        if serving_index_checks.get("status") != "passed":
+        if run_evidence["serving_index_checks"].get("status") != "passed":
             status = "failed"
-    if status == "succeeded" and storage_summary_dict is None:
-        if serving_index_payload is None:
-            serving_index_payload = import_run_serving_index(env_overrides=environment_by_name, import_run_id=import_run_id)
+    run_evidence["status"] = status
+    return run_evidence
+
+
+def _complete_local_ptg_evidence(
+    case: dict[str, Any],
+    variant: dict[str, Any],
+    run_context: dict[str, Any],
+    run_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    status = run_evidence["status"]
+    environment_by_name = run_context["environment"]
+    import_run_id = run_evidence["import_run_id"]
+    if status == "succeeded" and run_evidence["storage"] is None:
+        if run_evidence["serving_index_payload"] is None:
+            run_evidence["serving_index_payload"] = import_run_serving_index(
+                env_overrides=environment_by_name, import_run_id=import_run_id
+            )
         published_storage = analyze_published_serving_binary_storage(
             env_overrides=environment_by_name,
-            serving_index=serving_index_payload,
+            serving_index=run_evidence["serving_index_payload"],
         )
         if published_storage.get("status") == "passed":
-            storage_summary_dict = published_storage
+            run_evidence["storage"] = published_storage
     if status == "succeeded":
-        if serving_index_payload is None:
-            serving_index_payload = import_run_serving_index(env_overrides=environment_by_name, import_run_id=import_run_id)
-        if serving_index_payload:
+        if run_evidence["serving_index_payload"] is None:
+            run_evidence["serving_index_payload"] = import_run_serving_index(
+                env_overrides=environment_by_name, import_run_id=import_run_id
+            )
+        if run_evidence["serving_index_payload"]:
             snapshot_footprint = analyze_snapshot_postgres_footprint(
                 env_overrides=environment_by_name,
-                serving_index=serving_index_payload,
-                snapshot_id=str((import_done or {}).get("snapshot_id") or ""),
+                serving_index=run_evidence["serving_index_payload"],
+                snapshot_id=str((run_evidence["import_done"] or {}).get("snapshot_id") or ""),
             )
-            if storage_summary_dict is None:
-                storage_summary_dict = {"status": "passed"}
-            storage_summary_dict["snapshot_footprint"] = snapshot_footprint
+            if run_evidence["storage"] is None:
+                run_evidence["storage"] = {"status": "passed"}
+            run_evidence["storage"]["snapshot_footprint"] = snapshot_footprint
     if status == "succeeded" and _is_api_latency_probe_enabled(case, variant):
-        api_latency = run_api_latency_probe(
+        run_evidence["api_latency"] = run_api_latency_probe(
             env_overrides=environment_by_name,
-            snapshot_id=str((import_done or {}).get("snapshot_id") or ""),
+            snapshot_id=str((run_evidence["import_done"] or {}).get("snapshot_id") or ""),
             case=case,
             variant=variant,
         )
-        if api_latency.get("status") != "passed":
-            status = "failed"
+        if run_evidence["api_latency"].get("status") != "passed":
+            run_evidence["status"] = "failed"
+    return run_evidence
+
+
+def _local_ptg_run_result(
+    run_context: dict[str, Any], run_evidence: dict[str, Any]
+) -> RunResult:
+    completed = run_evidence["completed"]
+    status = run_evidence["status"]
+    scanner_summary = run_evidence["scanner_summary"]
     return RunResult(
-        case_id=case_id,
-        variant_id=variant_id,
+        case_id=run_context["case_id"],
+        variant_id=run_context["variant_id"],
         kind="local_ptg_cli",
         status=status,
-        command=command_args,
-        env_overrides=environment_by_name,
-        elapsed_seconds=elapsed,
+        command=run_evidence["command_args"],
+        env_overrides=run_context["environment"],
+        elapsed_seconds=run_evidence["elapsed"],
         returncode=completed.returncode,
-        progress=parse_scanner_progress(combined),
+        progress=parse_scanner_progress(run_evidence["combined"]),
         scanner_config=scanner_summary.get("config") if isinstance(scanner_summary, dict) else None,
         scanner_summary=scanner_summary.get("summary") if isinstance(scanner_summary, dict) else None,
-        dedupe_summary=parse_dedupe_summary(combined),
-        memory=memory,
+        dedupe_summary=parse_dedupe_summary(run_evidence["combined"]),
+        memory=run_evidence["memory"],
         import_run={
-            "import_done": import_done or {},
-            "fixture_dir": str(fixture_dir),
-            "artifact_dir": str(artifact_dir),
-            "verification": verification or {},
-            "storage": storage_summary_dict or {},
-            "serving_index_checks": serving_index_checks or {},
-            "api_latency": api_latency or {},
-            "copy_file_accounting": copy_file_accounting,
+            "import_done": run_evidence["import_done"] or {},
+            "fixture_dir": str(run_context["fixture_dir"]),
+            "artifact_dir": str(run_context["artifact_dir"]),
+            "verification": run_evidence["verification"] or {},
+            "storage": run_evidence["storage"] or {},
+            "serving_index_checks": run_evidence["serving_index_checks"] or {},
+            "api_latency": run_evidence["api_latency"] or {},
+            "copy_file_accounting": run_evidence["copy_file_accounting"],
         },
         error=completed.stderr.decode("utf-8", errors="replace") if status != "succeeded" else None,
     )
+
+
+def run_local_ptg_cli(
+    *,
+    case: dict[str, Any],
+    variant: dict[str, Any],
+    suite: dict[str, Any],
+    output_root: Path,
+    dry_run: bool = False,
+) -> RunResult:
+    """Run one fixture through the local PTG command."""
+    run_context = _prepare_local_ptg_run(case, variant, suite, output_root)
+    if dry_run:
+        write_ptg_toc_fixture(case, run_context["fixture_dir"], base_url="http://127.0.0.1:<auto>")
+        return RunResult(
+            case_id=run_context["case_id"],
+            variant_id=run_context["variant_id"],
+            kind="local_ptg_cli",
+            status="dry_run",
+            command=run_context["command_args"],
+            env_overrides=run_context["environment"],
+            import_run={
+                "fixture_dir": str(run_context["fixture_dir"]),
+                "artifact_dir": str(run_context["artifact_dir"]),
+            },
+        )
+    scanner = Path(run_context["environment"]["HLTHPRT_PTG2_RUST_SCANNER_BIN"])
+    if not scanner.exists():
+        return RunResult(
+            case_id=run_context["case_id"],
+            variant_id=run_context["variant_id"],
+            kind="local_ptg_cli",
+            status="skipped",
+            command=run_context["command_args"],
+            env_overrides=run_context["environment"],
+            error=f"scanner binary not found: {scanner}",
+        )
+    run_evidence = _execute_local_ptg_run(case, run_context)
+    _check_local_ptg_correctness(case, variant, run_context, run_evidence)
+    _complete_local_ptg_evidence(case, variant, run_context, run_evidence)
+    return _local_ptg_run_result(run_context, run_evidence)
 
 
 def run_suite(
@@ -4318,52 +4482,15 @@ def format_bytes(value: Any) -> str:
     return str(value)
 
 
-def format_storage_analysis(storage_result: dict[str, Any]) -> str:
-    """Format candidate storage measurements for the experiment report."""
-    import_run = storage_result.get("import_run") or {}
-    storage = import_run.get("storage") if isinstance(import_run, dict) else None
-    if not isinstance(storage, dict) or not storage:
-        return ""
-    if storage.get("status") == "skipped":
-        return f"skipped<br>{storage.get('reason')}<br>rows={((storage.get('storage') or {}).get('row_count'))}"
+def _append_sidecar_storage_parts(
+    parts: list[str], storage: dict[str, Any]
+) -> None:
     table = storage.get("storage") if isinstance(storage.get("storage"), dict) else {}
     candidate = storage.get("candidate") if isinstance(storage.get("candidate"), dict) else {}
     reverse_candidate = storage.get("reverse_candidate") if isinstance(storage.get("reverse_candidate"), dict) else {}
     combined_candidate = (
         storage.get("combined_candidate") if isinstance(storage.get("combined_candidate"), dict) else candidate
     )
-    postgres_candidate = (
-        storage.get("postgres_posting_candidate")
-        if isinstance(storage.get("postgres_posting_candidate"), dict)
-        else {}
-    )
-    postgres_storage = (
-        postgres_candidate.get("storage") if isinstance(postgres_candidate.get("storage"), dict) else {}
-    )
-    postgres_binary_candidate = (
-        storage.get("postgres_binary_candidate")
-        if isinstance(storage.get("postgres_binary_candidate"), dict)
-        else {}
-    )
-    postgres_binary_storage = (
-        postgres_binary_candidate.get("storage")
-        if isinstance(postgres_binary_candidate.get("storage"), dict)
-        else {}
-    )
-    postgres_binary_snapshot = (
-        storage.get("postgres_binary_snapshot")
-        if isinstance(storage.get("postgres_binary_snapshot"), dict)
-        else {}
-    )
-    postgres_binary_snapshot_storage = (
-        postgres_binary_snapshot.get("storage")
-        if isinstance(postgres_binary_snapshot.get("storage"), dict)
-        else {}
-    )
-    snapshot_footprint = (
-        storage.get("snapshot_footprint") if isinstance(storage.get("snapshot_footprint"), dict) else {}
-    )
-    parts = [str(storage.get("status") or "unknown")]
     if table.get("total_bytes") is not None:
         parts.append(f"pg={format_bytes(table.get('total_bytes'))}")
     if candidate.get("artifact_bytes") is not None:
@@ -4388,6 +4515,19 @@ def format_storage_analysis(storage_result: dict[str, Any]) -> str:
         parts.append(f"ratio={storage.get('reduction_ratio_vs_pg_total')}x")
     if storage.get("gzip_reduction_ratio_vs_pg_total") is not None:
         parts.append(f"gzip_ratio={storage.get('gzip_reduction_ratio_vs_pg_total')}x")
+
+
+def _append_postgres_posting_parts(
+    parts: list[str], storage: dict[str, Any]
+) -> None:
+    postgres_candidate = (
+        storage.get("postgres_posting_candidate")
+        if isinstance(storage.get("postgres_posting_candidate"), dict)
+        else {}
+    )
+    postgres_storage = (
+        postgres_candidate.get("storage") if isinstance(postgres_candidate.get("storage"), dict) else {}
+    )
     if postgres_storage.get("candidate_total_bytes") is not None:
         parts.append(f"pg_posting={format_bytes(postgres_storage.get('candidate_total_bytes'))}")
     if postgres_candidate.get("reduction_ratio_vs_pg_total") is not None:
@@ -4403,6 +4543,31 @@ def format_storage_analysis(storage_result: dict[str, Any]) -> str:
                 timing_parts.append(f"{name}={benchmark_result.get('execution_ms')}ms")
         if timing_parts:
             parts.append("pg_posting_timings=" + ",".join(timing_parts))
+
+
+def _append_postgres_binary_parts(
+    parts: list[str], storage: dict[str, Any]
+) -> None:
+    postgres_binary_candidate = (
+        storage.get("postgres_binary_candidate")
+        if isinstance(storage.get("postgres_binary_candidate"), dict)
+        else {}
+    )
+    postgres_binary_storage = (
+        postgres_binary_candidate.get("storage")
+        if isinstance(postgres_binary_candidate.get("storage"), dict)
+        else {}
+    )
+    postgres_binary_snapshot = (
+        storage.get("postgres_binary_snapshot")
+        if isinstance(storage.get("postgres_binary_snapshot"), dict)
+        else {}
+    )
+    postgres_binary_snapshot_storage = (
+        postgres_binary_snapshot.get("storage")
+        if isinstance(postgres_binary_snapshot.get("storage"), dict)
+        else {}
+    )
     if postgres_binary_storage.get("artifact_total_bytes") is not None:
         parts.append(f"pg_binary={format_bytes(postgres_binary_storage.get('artifact_total_bytes'))}")
     if postgres_binary_storage.get("artifact_payload_bytes") is not None:
@@ -4436,6 +4601,18 @@ def format_storage_analysis(storage_result: dict[str, Any]) -> str:
                 timing_parts.append(f"{name}={benchmark_result.get('execution_ms')}ms")
         if timing_parts:
             parts.append("pg_binary_timings=" + ",".join(timing_parts))
+
+
+def _append_snapshot_storage_parts(
+    parts: list[str], storage: dict[str, Any]
+) -> None:
+    snapshot_footprint = (
+        storage.get("snapshot_footprint") if isinstance(storage.get("snapshot_footprint"), dict) else {}
+    )
+    candidate = storage.get("candidate") if isinstance(storage.get("candidate"), dict) else {}
+    combined_candidate = (
+        storage.get("combined_candidate") if isinstance(storage.get("combined_candidate"), dict) else candidate
+    )
     if snapshot_footprint.get("total_logical_bytes") is not None:
         parts.append(f"snapshot_total={format_bytes(snapshot_footprint.get('total_logical_bytes'))}")
     if snapshot_footprint.get("table_total_bytes") is not None:
@@ -4457,6 +4634,21 @@ def format_storage_analysis(storage_result: dict[str, Any]) -> str:
         parts.append("snapshot_top=" + ",".join(rendered_components))
     if combined_candidate.get("roundtrip") is not None:
         parts.append(f"roundtrip={combined_candidate.get('roundtrip')}")
+
+
+def format_storage_analysis(storage_result: dict[str, Any]) -> str:
+    """Format candidate storage measurements for the experiment report."""
+    import_run = storage_result.get("import_run") or {}
+    storage = import_run.get("storage") if isinstance(import_run, dict) else None
+    if not isinstance(storage, dict) or not storage:
+        return ""
+    if storage.get("status") == "skipped":
+        return f"skipped<br>{storage.get('reason')}<br>rows={((storage.get('storage') or {}).get('row_count'))}"
+    parts = [str(storage.get("status") or "unknown")]
+    _append_sidecar_storage_parts(parts, storage)
+    _append_postgres_posting_parts(parts, storage)
+    _append_postgres_binary_parts(parts, storage)
+    _append_snapshot_storage_parts(parts, storage)
     return "<br>".join(parts)
 
 
