@@ -1924,6 +1924,7 @@ class LastUpdatedPartitionFetchOptions:
     cancel_task: dict[str, Any] | None
     deadline_seconds: int
     pagination_checkpoint: PaginationCheckpointContext | None
+    deferred_materialization: bool = False
 
 
 @dataclass(frozen=True)
@@ -53167,18 +53168,26 @@ async def _completed_partition_fetch_result(
     row_batch_handler = fetch_options.row_batch_handler
     run_id = fetch_options.run_id
     assert row_batch_handler is not None and run_id is not None
-    _streamed_count, rows_written = (
-        await _stream_last_updated_partition_staged_rows(
-        state.context,
-        source_record,
-        resource_type,
-        model,
-        state.plan,
-        run_id=run_id,
-        row_batch_handler=row_batch_handler,
-        row_batch_size=fetch_options.row_batch_size,
-    )
-    )
+    if (
+        fetch_options.deferred_materialization
+        and resource_type == "PractitionerRole"
+    ):
+        # ponytail: PractitionerRole only; widen after callback side effects
+        # are proven absent.
+        rows_written = proof_counts.staged_candidate_count
+    else:
+        _streamed_count, rows_written = (
+            await _stream_last_updated_partition_staged_rows(
+                state.context,
+                source_record,
+                resource_type,
+                model,
+                state.plan,
+                run_id=run_id,
+                row_batch_handler=row_batch_handler,
+                row_batch_size=fetch_options.row_batch_size,
+            )
+        )
     return ResourceFetchResult(
         model=model,
         rows=[],
@@ -54134,6 +54143,7 @@ async def _fetch_resource_rows(
     ),
     deadline_seconds: int = 0,
     pagination_checkpoint: PaginationCheckpointContext | None = None,
+    deferred_materialization: bool = False,
 ) -> ResourceFetchResult | None:
     """Fetch resource rows for provider-directory ingestion."""
     model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
@@ -54175,6 +54185,7 @@ async def _fetch_resource_rows(
                     cancel_task=cancel_task,
                     deadline_seconds=deadline_seconds,
                     pagination_checkpoint=pagination_checkpoint,
+                    deferred_materialization=deferred_materialization,
                 ),
             )
         if partition_config_error != "resource_not_opted_in":
@@ -69250,6 +69261,7 @@ class ResourceGroupScanRunner:
             pagination_checkpoint=source_record_by_field.get(
                 "_pagination_checkpoint_context"
             ),
+            deferred_materialization=self.options.deferred_materialization,
         )
 
     async def record(
