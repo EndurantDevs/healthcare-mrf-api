@@ -56,8 +56,8 @@ class CaseResult:
         }
 
 
-def _fixture_resources() -> list[dict[str, Any]]:
-    """Return the linked Plan-Net fixture used by parser completeness checks."""
+def _fixture_core_resources() -> list[dict[str, Any]]:
+    """Return the fixture plan, practitioner, and location resources."""
     return [
         {
             "resourceType": "InsurancePlan",
@@ -105,6 +105,12 @@ def _fixture_resources() -> list[dict[str, Any]]:
                 "country": "US",
             },
         },
+    ]
+
+
+def _fixture_link_resources() -> list[dict[str, Any]]:
+    """Return the fixture role, service, and endpoint resources."""
+    return [
         {
             "resourceType": "PractitionerRole",
             "id": "role-1",
@@ -161,6 +167,11 @@ def _fixture_resources() -> list[dict[str, Any]]:
             "payloadMimeType": ["application/fhir+json"],
         },
     ]
+
+
+def _fixture_resources() -> list[dict[str, Any]]:
+    """Return the linked Plan-Net fixture used by parser completeness checks."""
+    return [*_fixture_core_resources(), *_fixture_link_resources()]
 
 
 def _parse_fixture_resources(importer: Any) -> list[tuple[type, dict[str, Any]] | None]:

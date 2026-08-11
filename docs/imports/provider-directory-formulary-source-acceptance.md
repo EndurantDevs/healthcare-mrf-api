@@ -71,9 +71,13 @@ The Flex slice is acceptable only when all of the following are true:
    failed or missing results block completion.
 3. Requests are exact identifier searches. Broad collection scans, inferred
    offsets, comma-OR batches, and the generic probe importer are not used.
-4. Every returned resource is a Practitioner carrying the requested canonical
-   NPI; pagination, cap overflow, cross-NPI rows, or conflicting duplicate IDs
-   fail closed.
+4. Every admitted resource is a Practitioner carrying only the requested
+   canonical NPI. A valid resource carrying the requested NPI plus another NPI
+   is quarantined; pagination, cap overflow, foreign-only rows, or conflicting
+   duplicate IDs fail closed. If every valid resource is quarantined, the query
+   records `unmatched` and retains no payload; twin proof intentionally compares
+   admitted semantic output and does not distinguish that result from an empty
+   searchset.
 5. Two fresh complete cohort acquisitions produce the same immutable semantic
    dataset proof before any publication decision.
 6. Dataset metadata states `cohort_complete=true`,
