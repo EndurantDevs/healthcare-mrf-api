@@ -65871,12 +65871,8 @@ def _endpoint_dataset_hash_page_sql(
     cursor_filter = ""
     if has_cursor:
         cursor_filter = """
-           AND (
-                resource_type > :after_resource_type
-                OR (
-                    resource_type = :after_resource_type
-                    AND resource_id > :after_resource_id
-                )
+           AND (dataset_id, resource_type, resource_id) > (
+                :dataset_id, :after_resource_type, :after_resource_id
            )
         """
     payload_projection = (
