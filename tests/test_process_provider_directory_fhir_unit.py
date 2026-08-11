@@ -10893,10 +10893,27 @@ def test_all_source_selection_sql_binds_stored_proof_scope():
     sql = importer._provider_directory_artifact_dataset_selection_sql(None)
 
     assert "proof_bound_sources AS MATERIALIZED" in sql
-    assert (
-        f"-> '{importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'" in sql
-    )
+    assert "selected_endpoint.content_proof_present = false" in sql
+    assert "selected_endpoint.publication_source_ids" in sql
     assert "count(DISTINCT endpoint_id)" in sql
+
+
+def test_artifact_dataset_selection_projects_only_bounded_dataset_fields():
+    """Keep raw publication proofs on the database side of the resolver."""
+
+    sql = importer._provider_directory_artifact_dataset_selection_sql(None)
+    projection_sql = importer._artifact_dataset_projection_sql()
+
+    assert "SELECT dataset.*" not in sql
+    assert "SELECT dataset_options.*" not in sql
+    assert "publication_metadata_fields" in projection_sql
+    assert "publication_metadata_hash" in projection_sql
+    assert "content_proof_valid" in projection_sql
+    assert "completion_proof_cutoff" in projection_sql
+    assert "provider_directory_subset_payload_sha256" in sql
+    assert "provider_directory_subset_content_proof_valid" in sql
+    assert "dataset.publication_metadata_json" not in projection_sql
+    assert "dataset.completion_proof_json" not in projection_sql
 
 
 @pytest.mark.asyncio
@@ -11163,6 +11180,105 @@ def test_artifact_dataset_legacy_metadata_uses_current_source_profile():
         publish_artifacts_targets={"location_archive"},
         publish_corroboration=False,
     )
+
+
+def test_artifact_dataset_accepts_bounded_server_proof_projection(monkeypatch):
+    metadata_hash = "a" * 64
+    raw_proof_validator = Mock(
+        side_effect=AssertionError("raw proof crossed the SQL boundary")
+    )
+    monkeypatch.setattr(
+        importer,
+        "validate_stored_dataset_proof_metadata",
+        raw_proof_validator,
+    )
+    dataset = importer._provider_directory_artifact_dataset_from_row(
+        {
+            "source_id": "source_a",
+            "endpoint_id": "endpoint_1",
+            "source_record_json": _artifact_source_record(
+                "source_a",
+                ("InsurancePlan",),
+            ),
+            "dataset_id": "dataset_current",
+            "evidence_run_id": "acquisition_root",
+            "selected_resources": ["InsurancePlan"],
+            "recorded_expected_resources": ["InsurancePlan"],
+            "dataset_hash": "b" * 64,
+            "resource_count": 4,
+            "publication_metadata_json": {
+                "source_ids": ["source_a"],
+                "selected_resources": ["InsurancePlan"],
+                "resource_hash_contract": (
+                    importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+                ),
+                "semantic_projection_as_of": "2026-08-09",
+                "proof_resource_scope": [
+                    "InsurancePlan",
+                    "Location",
+                    "Organization",
+                ],
+            },
+            "publication_metadata_hash": metadata_hash,
+            "content_proof_present": True,
+            "content_proof_valid": True,
+            "content_proof_resources": [
+                "InsurancePlan",
+                "Location",
+                "Organization",
+            ],
+        }
+    )
+
+    assert dataset is not None
+    assert dataset.artifact_resources == (
+        "InsurancePlan",
+        "Location",
+        "Organization",
+    )
+    assert dataset.publication_metadata_hash == metadata_hash
+    raw_proof_validator.assert_not_called()
+
+
+@pytest.mark.parametrize("proof_valid", [False, None])
+def test_artifact_dataset_rejects_invalid_server_proof_marker(proof_valid):
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="artifact_content_proof_invalid",
+    ):
+        importer._provider_directory_artifact_dataset_from_row(
+            {
+                "source_id": "source_a",
+                "endpoint_id": "endpoint_1",
+                "source_record_json": _artifact_source_record(
+                    "source_a", ("Location",)
+                ),
+                "dataset_id": "dataset_current",
+                "evidence_run_id": "acquisition_root",
+                "selected_resources": ["Location"],
+                "publication_metadata_json": {},
+                "content_proof_valid": proof_valid,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata_hash",
+    [None, False, "", "A" * 64, "a" * 63],
+)
+def test_artifact_dataset_rejects_invalid_server_metadata_hash(metadata_hash):
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="publication_metadata_hash_invalid",
+    ):
+        importer._artifact_dataset_state_from_row(
+            {
+                "publication_metadata_json": {},
+                "publication_metadata_hash": metadata_hash,
+            },
+            "dataset_current",
+            "endpoint_1",
+        )
 
 
 def _artifact_proof_metadata(

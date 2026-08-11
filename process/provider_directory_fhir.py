@@ -199,9 +199,12 @@ from process.uhc_provider_quarantine_contract import (
     provider_quarantine_rejected_totals,
 )
 from process.provider_directory_proof_store import (
+    PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID,
     PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY,
     PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY,
     PROVIDER_DIRECTORY_PROOF_SHARD_TABLE,
+    PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID,
+    PROVIDER_DIRECTORY_SEMANTIC_CONTENT_V4_PROOF_CONTRACT_ID,
     ProviderDirectoryProofStoreError,
     ProviderDirectoryStoredProofOptions,
     build_dataset_proof_record,
@@ -15987,12 +15990,387 @@ def _artifact_candidate_eligibility_ctes(dataset_ref: str) -> str:
     """
 
 
+def _artifact_bounded_publication_metadata_sql(metadata: str) -> str:
+    """Project only top-level fields consumed after database admission."""
+
+    metadata_keys = (
+        "source_ids",
+        "selected_resources",
+        "expected_resources",
+        RESOURCE_HASH_CONTRACT_METADATA_KEY,
+        SEMANTIC_PROJECTION_AS_OF_METADATA_KEY,
+        PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY,
+        PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY,
+        TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY,
+        TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY,
+        REVIEWED_ROOT_POLICY_METADATA_KEY,
+        "source_id",
+        "dataset_id",
+        "endpoint_id",
+        "acquisition_root_run_id",
+        "source_authority_id",
+        "cohort_complete",
+        "endpoint_collection_complete",
+        "endpoint_complete",
+        "admission_id",
+        "operation_key",
+        "publication_contract_id",
+        "publication_kind",
+        "rooted_graph_complete",
+        "resource_counts",
+        "root_variant",
+        "root_source_id",
+        "root_endpoint_id",
+        "acquisition_source_id",
+        "acquisition_endpoint_id",
+        "practitioner_origin_source_id",
+        "practitioner_origin_endpoint_id",
+    )
+    return "\n               || ".join(
+        f"""CASE
+                   WHEN {metadata} ? '{metadata_key}' THEN
+                       jsonb_build_object(
+                           '{metadata_key}',
+                           {metadata} -> '{metadata_key}'
+                       )
+                   ELSE '{{}}'::jsonb
+               END"""
+        for metadata_key in metadata_keys
+    )
+
+
+def _artifact_content_proof_resources_sql(metadata: str) -> str:
+    """Return only the bounded resource keyset from an admitted proof."""
+
+    content_proof = (
+        f"{metadata} -> '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'"
+    )
+    return f"""
+        CASE
+            WHEN jsonb_typeof({content_proof} -> 'resource_counts') = 'object'
+            THEN (
+                SELECT COALESCE(
+                           jsonb_agg(resource_type ORDER BY resource_type),
+                           '[]'::jsonb
+                       )
+                  FROM jsonb_object_keys(
+                           {content_proof} -> 'resource_counts'
+                       ) AS proof_resource(resource_type)
+            )
+            ELSE NULL
+        END
+    """
+
+
+def _artifact_legacy_content_proof_valid_sql(
+    metadata: str,
+    proof: str,
+    evidence_run_id: str,
+    *,
+    selected_resources: str | None = None,
+    resource_hashes: str | None = None,
+    resource_counts: str | None = None,
+) -> str:
+    """Validate one legacy proof entirely inside PostgreSQL."""
+
+    legacy_validator = _qt(
+        _schema(), "provider_directory_subset_content_proof_valid"
+    )
+    expected_source_ids = _artifact_normalized_text_scope_sql(
+        f"{metadata} -> 'source_ids'"
+    )
+    expected_selected_resources = _artifact_normalized_text_scope_sql(
+        selected_resources or f"{metadata} -> 'selected_resources'"
+    )
+    expected_resource_hashes = resource_hashes or f"{proof} -> 'resource_hashes'"
+    expected_resource_counts = resource_counts or f"{proof} -> 'resource_counts'"
+    return f"""
+        {legacy_validator}(
+            {proof},
+            dataset.dataset_id,
+            dataset.endpoint_id,
+            {evidence_run_id},
+            {expected_source_ids},
+            {expected_selected_resources},
+            dataset.dataset_hash,
+            dataset.resource_count,
+            {expected_resource_hashes},
+            {expected_resource_counts}
+        ) IS TRUE
+    """
+
+
+def _artifact_normalized_text_scope_sql(raw_scope: str) -> str:
+    """Normalize one JSON string array like proof finalization does."""
+
+    return f"""
+        CASE
+            WHEN jsonb_typeof({raw_scope}) <> 'array' THEN '[]'::jsonb
+            WHEN EXISTS (
+                SELECT 1
+                  FROM jsonb_array_elements({raw_scope}) AS raw_scope_item(value)
+                 WHERE jsonb_typeof(raw_scope_item.value) <> 'string'
+            ) THEN '[]'::jsonb
+            ELSE (
+                SELECT COALESCE(
+                           jsonb_agg(scope_value ORDER BY scope_value),
+                           '[]'::jsonb
+                       )
+                  FROM (
+                      SELECT DISTINCT btrim(raw_scope_item.value) AS scope_value
+                        FROM jsonb_array_elements_text({raw_scope})
+                             AS raw_scope_item(value)
+                       WHERE btrim(raw_scope_item.value) <> ''
+                  ) AS normalized_scope
+            )
+        END
+    """
+
+
+def _artifact_semantic_legacy_proof_sql(proof: str) -> str:
+    """Project semantic proof bytes into the deployed shard validator shape."""
+
+    canonical_sha256 = _qt(
+        _schema(), "provider_directory_subset_canonical_sha256"
+    )
+    legacy_unsigned = f"""
+        (
+            {proof} - ARRAY[
+                'proof_resource_scope',
+                'resource_hash_contract',
+                'semantic_projection_as_of',
+                'semantic_union',
+                'proof_sha256'
+            ]::text[]
+            || jsonb_build_object(
+                   'contract_id',
+                   '{PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID}',
+                   'selected_resources',
+                   {proof} -> 'proof_resource_scope'
+               )
+        )
+    """
+    return f"""(
+        WITH legacy_unsigned AS MATERIALIZED (
+            SELECT {legacy_unsigned} AS proof
+        )
+        SELECT legacy_unsigned.proof
+               || jsonb_build_object(
+                      'proof_sha256',
+                      {canonical_sha256}(legacy_unsigned.proof)
+                  )
+          FROM legacy_unsigned
+    )"""
+
+
+def _artifact_semantic_union_valid_sql(proof: str) -> str:
+    """Validate the bounded semantic-only aggregate fields."""
+
+    semantic_union = f"({proof} -> 'semantic_union')"
+    semantic_fields = (
+        "'added_name_count', 'collision_identities', "
+        "'observation_variants', 'union_name_count'"
+    )
+    return f"""
+        CASE
+            WHEN jsonb_typeof({semantic_union}) = 'object' THEN
+                {semantic_union} ?& ARRAY[{semantic_fields}]::text[]
+                AND {semantic_union} - ARRAY[{semantic_fields}]::text[] =
+                    '{{}}'::jsonb
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM jsonb_each({semantic_union})
+                           AS semantic_metric(field_name, field_value)
+                     WHERE jsonb_typeof(field_value) <> 'number'
+                        OR field_value #>> '{{}}' !~ '^(0|[1-9][0-9]*)$'
+                )
+            ELSE false
+        END
+    """
+
+
+def _artifact_semantic_scope_valid_sql(metadata: str, proof: str) -> str:
+    """Validate the canonical date and selected-resource subset."""
+
+    projection_date = f"{proof} ->> 'semantic_projection_as_of'"
+    selected_resources = _artifact_normalized_text_scope_sql(
+        f"{metadata} -> 'selected_resources'"
+    )
+    proof_resource_scope = _artifact_normalized_text_scope_sql(
+        f"{proof} -> 'proof_resource_scope'"
+    )
+    return f"""
+        CASE
+            WHEN {projection_date} ~
+                 '^[0-9]{{4}}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$'
+            THEN pg_catalog.pg_input_is_valid({projection_date}, 'date')
+            ELSE false
+        END
+        AND ({proof_resource_scope}) @> ({selected_resources})
+    """
+
+
+def _artifact_semantic_content_proof_valid_sql(
+    metadata: str,
+    proof: str,
+    evidence_run_id: str,
+    hash_contract: str,
+) -> str:
+    """Validate one semantic proof entirely inside PostgreSQL."""
+
+    canonical_sha256 = _qt(
+        _schema(), "provider_directory_subset_canonical_sha256"
+    )
+    legacy_proof = _artifact_semantic_legacy_proof_sql(proof)
+    full_shards_valid = _artifact_legacy_content_proof_valid_sql(
+        metadata,
+        legacy_proof,
+        evidence_run_id,
+        selected_resources=f"{proof} -> 'proof_resource_scope'",
+        resource_hashes=f"{proof} -> 'resource_hashes'",
+        resource_counts=f"{proof} -> 'resource_counts'",
+    )
+    semantic_union_valid = _artifact_semantic_union_valid_sql(proof)
+    semantic_scope_valid = _artifact_semantic_scope_valid_sql(metadata, proof)
+    selected_resources = _artifact_normalized_text_scope_sql(
+        f"{metadata} -> 'selected_resources'"
+    )
+    return f"""
+        jsonb_typeof({proof}) = 'object'
+        AND {proof} -> 'complete' = 'true'::jsonb
+        AND {proof} ->> 'dataset_id' = dataset.dataset_id
+        AND {proof} ->> 'endpoint_id' = dataset.endpoint_id
+        AND {proof} ->> 'acquisition_root_run_id' = {evidence_run_id}
+        AND {proof} -> 'selected_resources' = ({selected_resources})
+        AND {proof} ->> 'dataset_hash' = dataset.dataset_hash
+        AND {proof} -> 'resource_count' = to_jsonb(dataset.resource_count)
+        AND jsonb_typeof({proof} -> 'resource_hashes') = 'object'
+        AND jsonb_typeof({proof} -> 'resource_counts') = 'object'
+        AND {proof} ->> 'resource_hash_contract' = ({hash_contract})
+        AND {proof} -> 'semantic_projection_as_of' =
+            {metadata} -> 'semantic_projection_as_of'
+        AND {proof} -> 'proof_resource_scope' =
+            {metadata} -> 'proof_resource_scope'
+        AND ({semantic_scope_valid})
+        AND ({semantic_union_valid})
+        AND {proof} ->> 'proof_sha256' ~ '^[0-9a-f]{{64}}$'
+        AND {canonical_sha256}({proof} - 'proof_sha256') =
+            {proof} ->> 'proof_sha256'
+        AND ({full_shards_valid})
+    """
+
+
+def _artifact_content_proof_valid_sql(metadata: str) -> str:
+    """Validate one full stored proof without returning its shard array."""
+
+    proof = f"({metadata} -> '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}')"
+    hash_contract = _artifact_normalized_resource_hash_contract_sql(metadata)
+    evidence_run_id = (
+        "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)"
+    )
+    legacy_valid = _artifact_legacy_content_proof_valid_sql(
+        metadata,
+        proof,
+        evidence_run_id,
+    )
+    semantic_valid = _artifact_semantic_content_proof_valid_sql(
+        metadata,
+        proof,
+        evidence_run_id,
+        hash_contract,
+    )
+    return f"""
+        CASE
+            WHEN NOT ({metadata} ? '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}')
+            THEN true
+            WHEN NOT (({proof} ->> 'dataset_hash' ~ '^[0-9a-f]{{64}}$') IS TRUE)
+            THEN false
+            WHEN {proof} ->> 'contract_id' =
+                 '{PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID}'
+                 AND ({hash_contract}) IN (
+                     '{LEGACY_RESOURCE_HASH_CONTRACT}',
+                     '{TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT}'
+                 )
+            THEN ({legacy_valid})
+            WHEN (
+                    ({hash_contract}) =
+                        '{SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT}'
+                AND {proof} ->> 'contract_id' =
+                    '{PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID}'
+            ) OR (
+                    ({hash_contract}) =
+                        '{SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT}'
+                AND {proof} ->> 'contract_id' =
+                    '{PROVIDER_DIRECTORY_SEMANTIC_CONTENT_V4_PROOF_CONTRACT_ID}'
+            )
+            THEN ({semantic_valid})
+            ELSE false
+        END
+    """
+
+
+def _artifact_dataset_option_projection_sql(metadata: str) -> str:
+    """Return the explicit bounded dataset-option projection."""
+
+    bounded_metadata = _artifact_bounded_publication_metadata_sql(metadata)
+    content_proof_resources = _artifact_content_proof_resources_sql(metadata)
+    content_proof_valid = _artifact_content_proof_valid_sql(metadata)
+    metadata_hash = _qt(
+        _schema(), "provider_directory_subset_payload_sha256"
+    )
+    return f"""
+        dataset.dataset_id,
+        dataset.endpoint_id,
+        dataset.import_run_id,
+        dataset.acquisition_root_run_id,
+        dataset.previous_dataset_id,
+        dataset.dataset_hash,
+        dataset.status,
+        dataset.is_current,
+        dataset.resource_count,
+        dataset.superseded_at,
+        dataset.validated_at,
+        dataset.completion_proof_required_version,
+        dataset.completion_proof_sha256,
+        {metadata} -> 'source_ids' AS publication_source_ids,
+        COALESCE(
+            {metadata} -> 'selected_resources',
+            '[]'::jsonb
+        ) AS selected_resources,
+        {metadata} -> 'expected_resources' AS recorded_expected_resources,
+        ({bounded_metadata}) AS publication_metadata_fields,
+        {metadata_hash}({metadata}) AS publication_metadata_hash,
+        dataset.completion_proof_json ->> 'cutoff' AS completion_proof_cutoff,
+        {metadata} ? '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'
+            AS content_proof_present,
+        ({content_proof_valid}) AS content_proof_valid,
+        ({content_proof_resources}) AS content_proof_resources,
+        count(*) FILTER (
+            WHERE dataset.is_current = true
+              AND dataset.status = :published_status
+              AND dataset.superseded_at IS NULL
+        ) OVER (PARTITION BY dataset.endpoint_id) AS current_dataset_count,
+        max(dataset.dataset_id) FILTER (
+            WHERE dataset.is_current = true
+              AND dataset.status = :published_status
+              AND dataset.superseded_at IS NULL
+        ) OVER (PARTITION BY dataset.endpoint_id) AS current_dataset_id,
+        count(*) FILTER (
+            WHERE dataset.is_current = false
+              AND dataset.status = :validated_status
+              AND dataset.superseded_at IS NULL
+        ) OVER (PARTITION BY dataset.endpoint_id) AS validated_candidate_count
+    """
+
+
 def _artifact_dataset_options_cte(
     dataset_ref: str,
     source_ref: str | None = None,
     *,
     scope_endpoint_ids: bool = False,
 ) -> str:
+    """Select only current or admitted candidate rows with bounded output."""
+
     validated_candidate_gate = (
         _artifact_reviewed_candidate_eligibility_sql(dataset_ref, source_ref)
         if source_ref
@@ -16004,28 +16382,21 @@ def _artifact_dataset_options_cte(
         if scope_endpoint_ids
         else ""
     )
+    metadata = "publication.full_metadata_jsonb"
+    option_projection = _artifact_dataset_option_projection_sql(metadata)
     return f"""
         dataset_options AS MATERIALIZED (
-        SELECT dataset.*,
-               count(*) FILTER (
-                   WHERE dataset.is_current = true
-                     AND dataset.status = :published_status
-                     AND dataset.superseded_at IS NULL
-               ) OVER (PARTITION BY dataset.endpoint_id)
-                   AS current_dataset_count,
-               max(dataset.dataset_id) FILTER (
-                   WHERE dataset.is_current = true
-                     AND dataset.status = :published_status
-                     AND dataset.superseded_at IS NULL
-               ) OVER (PARTITION BY dataset.endpoint_id)
-                   AS current_dataset_id,
-               count(*) FILTER (
-                   WHERE dataset.is_current = false
-                     AND dataset.status = :validated_status
-                     AND dataset.superseded_at IS NULL
-               ) OVER (PARTITION BY dataset.endpoint_id)
-                   AS validated_candidate_count
+        SELECT {option_projection}
           FROM {dataset_ref} AS dataset
+          CROSS JOIN LATERAL (
+               SELECT CASE
+                          WHEN jsonb_typeof(
+                                   dataset.publication_metadata_json::jsonb
+                               ) = 'object'
+                          THEN dataset.publication_metadata_json::jsonb
+                          ELSE '{{}}'::jsonb
+                      END AS full_metadata_jsonb
+          ) AS publication
          WHERE {endpoint_scope}(
             (
                     dataset.is_current = true
@@ -16045,7 +16416,31 @@ def _artifact_dataset_options_cte(
 def _artifact_dataset_ranking_cte() -> str:
     return """
         ranked_datasets AS MATERIALIZED (
-        SELECT dataset_options.*,
+        SELECT dataset_options.dataset_id,
+               dataset_options.endpoint_id,
+               dataset_options.import_run_id,
+               dataset_options.acquisition_root_run_id,
+               dataset_options.previous_dataset_id,
+               dataset_options.dataset_hash,
+               dataset_options.status,
+               dataset_options.is_current,
+               dataset_options.resource_count,
+               dataset_options.superseded_at,
+               dataset_options.validated_at,
+               dataset_options.completion_proof_required_version,
+               dataset_options.completion_proof_sha256,
+               dataset_options.publication_source_ids,
+               dataset_options.selected_resources,
+               dataset_options.recorded_expected_resources,
+               dataset_options.publication_metadata_fields,
+               dataset_options.publication_metadata_hash,
+               dataset_options.completion_proof_cutoff,
+               dataset_options.content_proof_present,
+               dataset_options.content_proof_valid,
+               dataset_options.content_proof_resources,
+               dataset_options.current_dataset_count,
+               dataset_options.current_dataset_id,
+               dataset_options.validated_candidate_count,
                row_number() OVER (
                    PARTITION BY dataset_options.endpoint_id
                    ORDER BY
@@ -16085,12 +16480,8 @@ def _artifact_dataset_projection_sql() -> str:
                    dataset.acquisition_root_run_id,
                    dataset.import_run_id
                ) AS evidence_run_id,
-               COALESCE(
-                   dataset.publication_metadata_json::jsonb -> 'selected_resources',
-                   '[]'::jsonb
-               ) AS selected_resources,
-               dataset.publication_metadata_json::jsonb -> 'expected_resources'
-                   AS recorded_expected_resources,
+               dataset.selected_resources,
+               dataset.recorded_expected_resources,
                dataset.status,
                dataset.is_current,
                dataset.previous_dataset_id,
@@ -16098,9 +16489,14 @@ def _artifact_dataset_projection_sql() -> str:
                dataset.resource_count,
                dataset.validated_at,
                dataset.completion_proof_required_version,
-               dataset.completion_proof_json,
                dataset.completion_proof_sha256,
-               dataset.publication_metadata_json,
+               dataset.completion_proof_cutoff,
+               dataset.publication_metadata_fields
+                   AS publication_metadata_json,
+               dataset.publication_metadata_hash,
+               dataset.content_proof_present,
+               dataset.content_proof_valid,
+               dataset.content_proof_resources,
                dataset.current_dataset_count,
                dataset.current_dataset_id,
                dataset.validated_candidate_count,
@@ -16157,8 +16553,8 @@ def _artifact_dataset_all_source_selection_sql(
     return f"""
         selected_endpoints AS MATERIALIZED (
             SELECT dataset.endpoint_id,
-                   dataset.publication_metadata_json::jsonb
-                       AS publication_metadata
+                   dataset.publication_source_ids,
+                   dataset.content_proof_present
               FROM ranked_datasets AS dataset
              WHERE dataset.selection_rank = 1
         ), eligible_sources AS MATERIALIZED (
@@ -16191,10 +16587,8 @@ def _artifact_dataset_all_source_selection_sql(
               FROM eligible_sources AS eligible
               JOIN selected_endpoints AS selected_endpoint
                 ON selected_endpoint.endpoint_id = eligible.endpoint_id
-             WHERE selected_endpoint.publication_metadata
-                       -> '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'
-                       IS NULL
-                OR selected_endpoint.publication_metadata -> 'source_ids'
+             WHERE selected_endpoint.content_proof_present = false
+                OR selected_endpoint.publication_source_ids
                        @> jsonb_build_array(eligible.source_id)
         ), selected_sources AS MATERIALIZED (
             SELECT proof_bound.*
@@ -16219,7 +16613,7 @@ def _artifact_validated_candidate_alias_join_sql() -> str:
          AND candidate.status = :validated_status
          AND candidate.superseded_at IS NULL
          AND COALESCE(
-                 candidate.publication_metadata_json::jsonb -> 'source_ids',
+                 candidate.publication_source_ids,
                  '[]'::jsonb
              ) @> jsonb_build_array(source.source_id)
     """
@@ -16554,6 +16948,87 @@ def _artifact_standard_retained_resources(
     )
 
 
+def _artifact_projected_retained_resources(
+    dataset_row_map: Mapping[str, Any],
+    *,
+    source_id: str,
+    endpoint_id: str,
+    dataset_id: str,
+    evidence_run_id: str,
+    selected_resources: tuple[str, ...],
+    publication_metadata: dict[str, Any],
+    dataset_scoped_ready: bool,
+) -> tuple[str, ...]:
+    """Validate the bounded resource summary of a DB-admitted proof."""
+
+    content_proof_present = dataset_row_map.get("content_proof_present")
+    if (
+        content_proof_present is False
+        or is_uhc_flex_profile_source(source_id)
+        or source_id == UHC_RETAINED_SOURCE_ID
+    ):
+        return _artifact_dataset_retained_resources(
+            source_id=source_id,
+            endpoint_id=endpoint_id,
+            dataset_id=dataset_id,
+            evidence_run_id=evidence_run_id,
+            selected_resources=selected_resources,
+            publication_metadata=publication_metadata,
+            dataset_scoped_ready=dataset_scoped_ready,
+        )
+    if content_proof_present is not True:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_content_proof_invalid:" + dataset_id
+        )
+    proof_identity = _artifact_content_proof_identity(
+        publication_metadata,
+        selected_resources,
+        dataset_id,
+    )
+    _artifact_content_proof_source_ids(
+        publication_metadata,
+        source_id,
+        dataset_id,
+    )
+    return _artifact_projected_content_proof_resources(
+        dataset_row_map,
+        dataset_id=dataset_id,
+        selected_resources=selected_resources,
+        proof_resource_scope=proof_identity.proof_resource_scope,
+    )
+
+
+def _artifact_projected_content_proof_resources(
+    dataset_row_map: Mapping[str, Any],
+    *,
+    dataset_id: str,
+    selected_resources: tuple[str, ...],
+    proof_resource_scope: tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    """Validate the bounded resource keyset projected by PostgreSQL."""
+
+    try:
+        retained_resources = _artifact_dataset_resource_profile(
+            dataset_row_map.get("content_proof_resources"),
+            dataset_id=dataset_id,
+            field_name="content_proof_resources",
+        )
+    except RuntimeError as error:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_content_proof_invalid:" + dataset_id
+        ) from error
+    if not set(selected_resources).issubset(retained_resources) or (
+        proof_resource_scope is not None
+        and not set(retained_resources).issubset(
+            proof_resource_scope
+        )
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_content_proof_invalid:" + dataset_id
+        )
+    return retained_resources
+
+
 def _artifact_dataset_row_verification_fields(
     dataset_row_map: Mapping[str, Any],
     source_record: dict[str, Any],
@@ -16564,9 +17039,6 @@ def _artifact_dataset_row_verification_fields(
 ) -> dict[str, Any]:
     """Build verification fields from one already-validated dataset row."""
 
-    completion_proof = _json_object(
-        dataset_row_map.get("completion_proof_json")
-    )
     return _artifact_dataset_verification_fields(
         source_record,
         publication_metadata,
@@ -16579,7 +17051,9 @@ def _artifact_dataset_row_verification_fields(
         completion_proof_required_version=selection_state[
             "completion_proof_required_version"
         ],
-        completion_proof_cutoff=_clean_text(completion_proof.get("cutoff")),
+        completion_proof_cutoff=selection_state[
+            "completion_proof_cutoff"
+        ],
     )
 
 
@@ -16627,23 +17101,40 @@ def _artifact_retained_resources_from_row(
     is_dataset_scoped_ready = (
         dataset_row_map.get("dataset_scoped_ready") is True
     )
-    retained_resources = _artifact_dataset_retained_resources(
-        source_id=source_id,
-        endpoint_id=value_by_name["endpoint_id"] or "",
-        dataset_id=dataset_id,
-        evidence_run_id=evidence_run_id,
-        selected_resources=selected_resources,
-        publication_metadata=publication_metadata,
-        dataset_scoped_ready=is_dataset_scoped_ready,
-    )
-    _validate_artifact_finalized_content_proof(
-        dataset_row_map,
-        publication_metadata,
-        evidence_run_id,
-        dataset_id,
-        source_id=source_id,
-        dataset_scoped_ready=is_dataset_scoped_ready,
-    )
+    if "content_proof_valid" in dataset_row_map:
+        if dataset_row_map.get("content_proof_valid") is not True:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_artifact_content_proof_invalid:"
+                + dataset_id
+            )
+        retained_resources = _artifact_projected_retained_resources(
+            dataset_row_map,
+            source_id=source_id,
+            endpoint_id=value_by_name["endpoint_id"] or "",
+            dataset_id=dataset_id,
+            evidence_run_id=evidence_run_id,
+            selected_resources=selected_resources,
+            publication_metadata=publication_metadata,
+            dataset_scoped_ready=is_dataset_scoped_ready,
+        )
+    else:
+        retained_resources = _artifact_dataset_retained_resources(
+            source_id=source_id,
+            endpoint_id=value_by_name["endpoint_id"] or "",
+            dataset_id=dataset_id,
+            evidence_run_id=evidence_run_id,
+            selected_resources=selected_resources,
+            publication_metadata=publication_metadata,
+            dataset_scoped_ready=is_dataset_scoped_ready,
+        )
+        _validate_artifact_finalized_content_proof(
+            dataset_row_map,
+            publication_metadata,
+            evidence_run_id,
+            dataset_id,
+            source_id=source_id,
+            dataset_scoped_ready=is_dataset_scoped_ready,
+        )
     return retained_resources
 
 
@@ -17396,14 +17887,39 @@ def _artifact_candidate_proof_fields(
     return dataset_hash, validated_at, publication_metadata
 
 
+def _artifact_publication_metadata_hash_from_row(
+    dataset_row_map: Mapping[str, Any],
+    publication_metadata: Mapping[str, Any],
+) -> str:
+    """Require an exact server digest or hash one legacy direct row."""
+
+    if "publication_metadata_hash" not in dataset_row_map:
+        return _identity_hash(publication_metadata)
+    metadata_hash = dataset_row_map.get("publication_metadata_hash")
+    if (
+        type(metadata_hash) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", metadata_hash) is None
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_publication_metadata_hash_invalid"
+        )
+    return metadata_hash
+
+
 def _artifact_completion_state_from_row(
     dataset_row_map: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Return the direct completion marker and proof identity fields."""
 
     marker = dataset_row_map.get("completion_proof_required_version")
-    completion_proof = _json_object(
-        dataset_row_map.get("completion_proof_json")
+    completion_proof_cutoff = (
+        _clean_text(dataset_row_map.get("completion_proof_cutoff"))
+        if "completion_proof_cutoff" in dataset_row_map
+        else _clean_text(
+            _json_object(dataset_row_map.get("completion_proof_json")).get(
+                "cutoff"
+            )
+        )
     )
     return {
         "completion_proof_required_version": (
@@ -17412,7 +17928,7 @@ def _artifact_completion_state_from_row(
         "completion_proof_sha256": _clean_text(
             dataset_row_map.get("completion_proof_sha256")
         ),
-        "completion_proof_cutoff": _clean_text(completion_proof.get("cutoff")),
+        "completion_proof_cutoff": completion_proof_cutoff,
     }
 
 
@@ -17488,7 +18004,10 @@ def _artifact_dataset_state_from_row(
             else None
         ),
         "validated_at": validated_at,
-        "publication_metadata_hash": _identity_hash(publication_metadata),
+        "publication_metadata_hash": _artifact_publication_metadata_hash_from_row(
+            dataset_row_map,
+            publication_metadata,
+        ),
         **_artifact_dataset_scoped_state_from_row(dataset_row_map),
         **_artifact_completion_state_from_row(dataset_row_map),
     }
@@ -20170,11 +20689,13 @@ def _assert_locked_artifact_source_contract(
         )
 
 
-def _artifact_fence_dataset_rows_sql(*, for_update: bool) -> str:
-    dataset_ref = _unscoped_qt(
-        _schema(),
-        ProviderDirectoryEndpointDataset.__tablename__,
-    )
+def _artifact_fence_dataset_sql_parts(
+    dataset_ref: str,
+    *,
+    for_update: bool,
+) -> tuple[str, str, str]:
+    """Return scope, incumbent identity, and lock clauses for one fence."""
+
     if for_update:
         scope_sql = (
             "dataset.dataset_id = ANY(CAST(:dataset_ids AS varchar[]))"
@@ -20197,6 +20718,23 @@ def _artifact_fence_dataset_rows_sql(*, for_update: bool) -> str:
         )
         current_ids_sql = ""
         lock_sql = ""
+    return scope_sql, current_ids_sql, lock_sql
+
+
+def _artifact_fence_dataset_rows_sql(*, for_update: bool) -> str:
+    """Return the exact dataset identity projection used by both fences."""
+
+    dataset_ref = _unscoped_qt(
+        _schema(),
+        ProviderDirectoryEndpointDataset.__tablename__,
+    )
+    metadata_hash = _unscoped_qt(
+        _schema(), "provider_directory_subset_payload_sha256"
+    )
+    scope_sql, current_ids_sql, lock_sql = _artifact_fence_dataset_sql_parts(
+        dataset_ref,
+        for_update=for_update,
+    )
     return f"""
         SELECT dataset.dataset_id,
                dataset.endpoint_id,
@@ -20213,7 +20751,15 @@ def _artifact_fence_dataset_rows_sql(*, for_update: bool) -> str:
                dataset.completion_proof_required_version,
                dataset.completion_proof_sha256,
                {current_ids_sql}
-               dataset.publication_metadata_json
+               {metadata_hash}(
+                   CASE
+                       WHEN jsonb_typeof(
+                                dataset.publication_metadata_json::jsonb
+                            ) = 'object'
+                       THEN dataset.publication_metadata_json::jsonb
+                       ELSE '{{}}'::jsonb
+                   END
+               ) AS publication_metadata_hash
           FROM {dataset_ref} AS dataset
          WHERE {scope_sql}
          ORDER BY dataset.dataset_id
@@ -20343,8 +20889,9 @@ def _artifact_fence_dataset_row_identity(
             else None
         ),
         str(validated_at) if validated_at is not None else None,
-        _identity_hash(
-            _json_object(dataset_row_map.get("publication_metadata_json"))
+        _artifact_publication_metadata_hash_from_row(
+            dataset_row_map,
+            _json_object(dataset_row_map.get("publication_metadata_json")),
         ),
         dataset_row_map.get("completion_proof_required_version"),
         _clean_text(dataset_row_map.get("completion_proof_sha256")),
