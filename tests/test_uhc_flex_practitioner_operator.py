@@ -31,6 +31,14 @@ def _disable_all_gates(monkeypatch) -> None:
         monkeypatch.delenv(gate_name, raising=False)
 
 
+def _allow_retired_operation_internals(monkeypatch) -> None:
+    monkeypatch.setattr(
+        operator,
+        "require_uhc_flex_practitioner_operator_gate",
+        lambda _: None,
+    )
+
+
 @pytest.mark.parametrize("phase", tuple(GATE_BY_PHASE))
 def test_each_operator_phase_is_default_off(monkeypatch, phase) -> None:
     _disable_all_gates(monkeypatch)
@@ -41,21 +49,33 @@ def test_each_operator_phase_is_default_off(monkeypatch, phase) -> None:
     assert caught.value.code == "disabled"
 
 
-@pytest.mark.parametrize("phase", tuple(GATE_BY_PHASE))
-def test_each_operator_phase_requires_only_its_exact_gate(
-    monkeypatch,
-    phase,
-) -> None:
+@pytest.mark.parametrize("phase", ("sync-cohort", "publish-admitted"))
+def test_active_phase_requires_only_its_exact_gate(monkeypatch, phase) -> None:
     _disable_all_gates(monkeypatch)
     monkeypatch.setenv(GATE_BY_PHASE[phase], "true")
 
     operator.require_uhc_flex_practitioner_operator_gate(phase)
 
-    different_phase = next(
-        candidate for candidate in GATE_BY_PHASE if candidate != phase
-    )
+
+@pytest.mark.asyncio
+async def test_retired_direct_acquisition_ignores_legacy_enable_gate(
+    monkeypatch,
+) -> None:
+    _disable_all_gates(monkeypatch)
+    monkeypatch.setenv(operator.ACQUISITION_ENABLED_ENV, "true")
+
     with pytest.raises(operator.UHCFlexPractitionerOperatorError) as caught:
-        operator.require_uhc_flex_practitioner_operator_gate(different_phase)
+        await operator.acquire_admit_uhc_flex_practitioner_operation(
+            operation_key=OPERATION_KEY,
+            semantic_projection_as_of="2026-08-10",
+            concurrency=4,
+            max_attempts=3,
+            lease_seconds=300,
+            retry_base_seconds=1.0,
+            max_retry_seconds=60.0,
+            database=object(),
+        )
+
     assert caught.value.code == "disabled"
 
 
@@ -189,6 +209,7 @@ async def test_acquisition_forwards_resume_identity_and_bounds(monkeypatch) -> N
 
     _disable_all_gates(monkeypatch)
     monkeypatch.setenv(operator.ACQUISITION_ENABLED_ENV, "true")
+    _allow_retired_operation_internals(monkeypatch)
     module_name = "process.uhc_flex_practitioner_acquisition"
     phase_module, _config_type, operation_calls = _acquisition_phase_module()
     monkeypatch.setitem(__import__("sys").modules, module_name, phase_module)

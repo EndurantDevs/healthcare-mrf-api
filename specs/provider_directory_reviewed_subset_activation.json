@@ -1,7 +1,11 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "importer": "provider-directory-fhir",
   "operation": "reviewed-subset-source-state-sync",
-  "desired_candidate_status": "pending_two_matching_reviewed_subset_acquisitions",
+  "desired_candidate_status": "pending_reviewed_subset_acquisition",
+  "root_policy": {
+    "policy_version": "provider-directory-reviewed-root-policy-v1",
+    "required_root_count": 1
+  },
   "evidence": null
 }

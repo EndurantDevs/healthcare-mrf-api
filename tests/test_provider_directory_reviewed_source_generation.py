@@ -22,7 +22,6 @@ from process.provider_directory_fhir_census_contract import (
 )
 from process.provider_directory_fhir_root_policy import (
     REVIEWED_ROOT_POLICY_METADATA_KEY,
-    ReviewedRootPolicy,
 )
 
 
@@ -82,7 +81,6 @@ def _bound_reviewed_subset_source() -> dict:
     entry = _manual_entry()
     seed_row = manual_catalog.reviewed_manual_census_seed_rows(
         entry["source_ids"][0],
-        root_policy=ReviewedRootPolicy(1),
     )[0]
     source_record = importer._source_row_from_seed(seed_row)
     request = current_version_census_request(

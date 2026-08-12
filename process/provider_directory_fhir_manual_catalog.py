@@ -25,11 +25,9 @@ from process.provider_directory_fhir_census_contract import (
     SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
 )
 from process.provider_directory_fhir_manual_seed import (
-    MANUAL_SOURCE_PENDING_STATUS,
     MANUAL_SOURCE_VERIFICATION_CAMPAIGN_FIELD,
     manual_seed_metadata,
 )
-from process.provider_directory_fhir_root_policy import ReviewedRootPolicy
 
 
 DEFAULT_MANUAL_SOURCE_MANIFEST = Path(__file__).resolve().parents[1] / (
@@ -373,7 +371,6 @@ def _validated_manual_entry(
 
 def _manual_seed_row(
     entry: Mapping[str, Any],
-    root_policy: ReviewedRootPolicy | None = None,
 ) -> dict[str, Any]:
     """Build one deterministic dormant seed and guard its opaque identity."""
 
@@ -399,7 +396,6 @@ def _manual_seed_row(
             resources,
             page_count,
             canonical_base,
-            root_policy,
         ),
     }
     if _stable_seed_source_id(seed_row_by_field) != entry["source_id"]:
@@ -411,7 +407,6 @@ def reviewed_manual_census_seed_rows(
     requested_source_id: str,
     *,
     manifest_path: Path = DEFAULT_MANUAL_SOURCE_MANIFEST,
-    root_policy: ReviewedRootPolicy | None = None,
 ) -> list[dict[str, Any]]:
     """Return the sole local reviewed seed bound to an opaque source ID."""
 
@@ -422,7 +417,7 @@ def reviewed_manual_census_seed_rows(
     manifest = _load_manifest(manifest_path)
     raw_entry = _manual_entry_for_source(manifest, source_id)
     entry = _validated_manual_entry(raw_entry, source_id)
-    return [_manual_seed_row(entry, root_policy)]
+    return [_manual_seed_row(entry)]
 
 
 def reviewed_manual_census_source_id(

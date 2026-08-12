@@ -391,6 +391,9 @@ def run_command(arguments: Sequence[str] | None = None) -> int:
         _print_error(gate_error)
         return 1
     parsed_arguments = _parser().parse_args(raw_arguments)
+    if parsed_arguments.command == "acquire":
+        _print_error("disabled")
+        return 1
     try:
         rendered_result = asyncio.run(_run_operator(parsed_arguments))
     except asyncio.CancelledError as error:

@@ -123,6 +123,156 @@ def test_policy_status_controls_reviewed_root_requirement(
     )
 
 
+@pytest.mark.parametrize(
+    "source_row",
+    (
+        _source_row(importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING, CAMPAIGN_ID),
+        _source_row(importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED, CAMPAIGN_ID),
+        _source_row(
+            importer.PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_PENDING,
+            CAMPAIGN_ID,
+        ),
+        _source_row(
+            importer.PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED,
+            CAMPAIGN_ID,
+        ),
+        _source_row(
+            importer.PROVIDER_DIRECTORY_ROOT_POLICY_PENDING,
+            CAMPAIGN_ID,
+            2,
+        ),
+        _source_row(
+            importer.PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED,
+            CAMPAIGN_ID,
+            2,
+        ),
+    ),
+)
+def test_legacy_or_policy_two_profiles_are_marked_deprecated(source_row):
+    profile = importer._source_group_reviewed_root_policy_profile([source_row])
+
+    assert profile.is_deprecated_multi_root_profile is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_row",
+    (
+        _source_row(importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING, CAMPAIGN_ID),
+        _source_row(importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED, CAMPAIGN_ID),
+        _source_row(
+            importer.PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_PENDING,
+            CAMPAIGN_ID,
+        ),
+        _source_row(
+            importer.PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED,
+            CAMPAIGN_ID,
+        ),
+        _source_row(
+            importer.PROVIDER_DIRECTORY_ROOT_POLICY_PENDING,
+            CAMPAIGN_ID,
+            2,
+        ),
+        _source_row(
+            importer.PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED,
+            CAMPAIGN_ID,
+            2,
+        ),
+    ),
+)
+async def test_deprecated_profiles_cannot_start_or_resume_acquisition(
+    monkeypatch,
+    source_row,
+):
+    profile = importer._source_group_reviewed_root_policy_profile([source_row])
+    monkeypatch.setattr(importer, "_endpoint_dataset_state", AsyncMock(return_value={}))
+    resumable = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_select_resumable_endpoint_dataset_candidate",
+        resumable,
+    )
+
+    with pytest.raises(RuntimeError, match="single_root_required"):
+        await importer._select_endpoint_dataset_candidate(
+            "endpoint_1",
+            ("Organization",),
+            verification_profile=profile,
+            run_id="root_candidate",
+            retry_of_run_id=None,
+            pagination_root_run_id=None,
+            checkpoint_context=None,
+        )
+
+    resumable.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_row",
+    (
+        _source_row(importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED, CAMPAIGN_ID),
+        _source_row(
+            importer.PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED,
+            CAMPAIGN_ID,
+            2,
+        ),
+    ),
+)
+async def test_deprecated_profiles_replay_exact_finalized_selection(
+    monkeypatch,
+    source_row,
+):
+    profile = importer._source_group_reviewed_root_policy_profile([source_row])
+    finalized = importer.EndpointDatasetCandidateSelection(
+        dataset_id="dataset_candidate",
+        acquisition_root_run_id="root_candidate",
+        previous_dataset_id="dataset_current",
+        reused_from_checkpoint=False,
+        already_validated=True,
+    )
+    monkeypatch.setattr(importer, "_endpoint_dataset_state", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        importer,
+        "_existing_endpoint_dataset_finalized_selection",
+        lambda *_args: finalized,
+    )
+    resumable = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_select_resumable_endpoint_dataset_candidate",
+        resumable,
+    )
+
+    selected = await importer._select_endpoint_dataset_candidate(
+        "endpoint_1",
+        ("Organization",),
+        verification_profile=profile,
+        run_id="root_candidate",
+        retry_of_run_id=None,
+        pagination_root_run_id=None,
+        checkpoint_context=None,
+    )
+
+    assert selected.already_validated is True
+    resumable.assert_not_awaited()
+
+
+def test_historical_verified_policy_two_profile_remains_readable():
+    profile = importer._source_group_reviewed_root_policy_profile(
+        [
+            _source_row(
+                importer.PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED,
+                CAMPAIGN_ID,
+                2,
+            )
+        ]
+    )
+
+    assert profile.is_twin_root_required is False
+    assert profile.reviewed_root_policy == importer.ReviewedRootPolicy(2)
+
+
 def test_policy_status_rejects_alias_root_count_drift():
     with pytest.raises(RuntimeError, match="verification_profile_ambiguous"):
         importer._source_group_reviewed_root_policy_profile(

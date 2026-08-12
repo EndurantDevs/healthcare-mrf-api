@@ -161,7 +161,6 @@ from process.provider_directory_fhir_subset_identity import (
     subset_activation_source_contract_payload,
 )
 from process.provider_directory_fhir_root_policy import (
-    DEFAULT_REQUIRED_ROOT_COUNT,
     POLICY_PENDING_STATUS as PROVIDER_DIRECTORY_ROOT_POLICY_PENDING,
     POLICY_VERIFIED_STATUS as PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED,
     REVIEWED_ROOT_POLICY_METADATA_KEY,
@@ -1588,8 +1587,6 @@ PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY = (
 PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY = (
     "provider_directory_configured_endpoint_id"
 )
-MICHIGAN_VERIFICATION_CAMPAIGN_ID = "provider-directory-michigan-2026-07-19-v1"
-SCAN_VERIFICATION_CAMPAIGN_ID = "provider-directory-scan-2026-07-19-v1"
 REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID = {
     "cms-sma-iowa-reviewed-candidate": "provider-directory-iowa-2026-07-19-v1",
     "cms-sma-pennsylvania-reviewed-candidate": (
@@ -2292,6 +2289,7 @@ class EndpointDatasetVerificationProfile:
     campaign_id: str | None = None
     source_scope_hash: str | None = None
     reviewed_root_policy: ReviewedRootPolicy | None = None
+    is_deprecated_multi_root_profile: bool = False
 
 
 @dataclass(frozen=True)
@@ -4997,10 +4995,26 @@ def _verification_profile_from_key(
             else True
         )
     )
+    is_deprecated_multi_root_profile = bool(
+        status
+        in {
+            PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
+            PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
+            PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_PENDING,
+            PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED,
+        }
+        or (
+            reviewed_root_policy is not None
+            and reviewed_root_policy.is_twin_root_required
+        )
+    )
     return EndpointDatasetVerificationProfile(
         is_twin_root_required=is_twin_root_required,
         campaign_id=campaign_id,
         reviewed_root_policy=reviewed_root_policy,
+        is_deprecated_multi_root_profile=(
+            is_deprecated_multi_root_profile
+        ),
     )
 
 
@@ -6270,7 +6284,7 @@ def _michigan_provider_directory_override(
                 "InteropStation relays Michigan's directory, but the public MHB FHIR "
                 "upstream is the canonical endpoint for metadata and resource probes. "
                 "Candidate acquisition follows its advertised opaque cursor with durable "
-                "checkpoints; publication still requires two matching exhaustive roots."
+                "checkpoints; one complete acquisition is sufficient for review."
             ),
             "provider_directory_previous_api_base": _clean_text(
                 source_row.get("api_base")
@@ -6288,12 +6302,6 @@ def _michigan_provider_directory_override(
             "provider_directory_fully_enumerable_resources": supported_resources,
             "provider_directory_coverage_mode": "full",
             "provider_directory_acquisition_enabled": True,
-            "provider_directory_candidate_status": (
-                "pending_two_matching_exhaustive_acquisitions"
-            ),
-            PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY: (
-                MICHIGAN_VERIFICATION_CAMPAIGN_ID
-            ),
         },
     }
 
@@ -6623,12 +6631,6 @@ def _scan_provider_directory_override(
             "provider_directory_coverage_mode": "probe_only",
             "provider_directory_fully_enumerable_resources": [],
             "provider_directory_acquisition_enabled": True,
-            "provider_directory_candidate_status": (
-                "pending_two_matching_exhaustive_acquisitions"
-            ),
-            PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY: (
-                SCAN_VERIFICATION_CAMPAIGN_ID
-            ),
             "provider_directory_expected_nonempty_resources": list(
                 SCAN_EXPECTED_NONEMPTY_RESOURCES
             ),
@@ -40003,6 +40005,113 @@ def _preserved_source_reviewed_root_policy_sql(
     )
 
 
+def _pending_policy_generation_reset_expression(
+    target_metadata: Any,
+    incoming_metadata: Any,
+) -> Any:
+    """Recognize one explicit unactivated policy-two to policy-one reset."""
+
+    campaign_key = literal(
+        PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
+    )
+    status_key = literal("provider_directory_candidate_status")
+    policy_key = literal(REVIEWED_ROOT_POLICY_METADATA_KEY)
+    target_campaign = target_metadata.op("->>")(campaign_key)
+    incoming_campaign = incoming_metadata.op("->>")(campaign_key)
+    def _policy(required_root_count: int) -> Any:
+        return func.jsonb_build_object(
+            literal("policy_version"),
+            literal(REVIEWED_ROOT_POLICY_VERSION),
+            literal("required_root_count"),
+            literal(required_root_count),
+        )
+    return and_(
+        func.nullif(target_campaign, literal("")).isnot(None),
+        func.nullif(incoming_campaign, literal("")).isnot(None),
+        incoming_campaign.is_distinct_from(target_campaign),
+        target_metadata.op("->>")(status_key)
+        == literal(PROVIDER_DIRECTORY_ROOT_POLICY_PENDING),
+        target_metadata.op("->")(policy_key) == _policy(2),
+        incoming_metadata.op("->>")(status_key)
+        == literal(PROVIDER_DIRECTORY_ROOT_POLICY_PENDING),
+        incoming_metadata.op("->")(policy_key) == _policy(1),
+        target_metadata.op("?")(
+            literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY)
+        )
+        == literal(False),
+        target_metadata.op("?")(
+            literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2)
+        )
+        == literal(False),
+        incoming_metadata.op("?")(
+            literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY)
+        )
+        == literal(False),
+        incoming_metadata.op("?")(
+            literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2)
+        )
+        == literal(False),
+    )
+
+
+def _pending_policy_generation_reset_sql(
+    target_metadata: str,
+    incoming_metadata: str,
+) -> str:
+    """Render COPY-upsert parity for the closed pending reset."""
+
+    campaign_key = PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
+    status_key = "provider_directory_candidate_status"
+    policy_key = REVIEWED_ROOT_POLICY_METADATA_KEY
+    activation_key = REVIEWED_SUBSET_ACTIVATION_METADATA_KEY
+    activation_key_v2 = REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2
+    def _policy(required_root_count: int) -> str:
+        return (
+            "pg_catalog.jsonb_build_object("
+            f"'policy_version', '{REVIEWED_ROOT_POLICY_VERSION}', "
+            f"'required_root_count', {required_root_count})"
+        )
+    return (
+        f"NULLIF({target_metadata} ->> '{campaign_key}', '') IS NOT NULL "
+        f"AND NULLIF({incoming_metadata} ->> '{campaign_key}', '') "
+        "IS NOT NULL "
+        f"AND {incoming_metadata} ->> '{campaign_key}' IS DISTINCT FROM "
+        f"{target_metadata} ->> '{campaign_key}' "
+        f"AND {target_metadata} ->> '{status_key}' = "
+        f"'{PROVIDER_DIRECTORY_ROOT_POLICY_PENDING}' "
+        f"AND {target_metadata} -> '{policy_key}' = {_policy(2)} "
+        f"AND {incoming_metadata} ->> '{status_key}' = "
+        f"'{PROVIDER_DIRECTORY_ROOT_POLICY_PENDING}' "
+        f"AND {incoming_metadata} -> '{policy_key}' = {_policy(1)} "
+        f"AND NOT ({target_metadata} ? '{activation_key}') "
+        f"AND NOT ({target_metadata} ? '{activation_key_v2}') "
+        f"AND NOT ({incoming_metadata} ? '{activation_key}') "
+        f"AND NOT ({incoming_metadata} ? '{activation_key_v2}')"
+    )
+
+
+def _source_generation_metadata_without_state_expression(metadata: Any) -> Any:
+    """Remove only mutable reviewed-generation state before a closed reset."""
+
+    return (
+        metadata.op("-")(literal("provider_directory_candidate_status"))
+        .op("-")(literal(REVIEWED_ROOT_POLICY_METADATA_KEY))
+        .op("-")(literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY))
+        .op("-")(literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2))
+    )
+
+
+def _source_generation_metadata_without_state_sql(metadata: str) -> str:
+    """Render the reviewed-generation state scrub for COPY upserts."""
+
+    return (
+        f"(({metadata}) - 'provider_directory_candidate_status' "
+        f"- '{REVIEWED_ROOT_POLICY_METADATA_KEY}' "
+        f"- '{REVIEWED_SUBSET_ACTIVATION_METADATA_KEY}' "
+        f"- '{REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2}')"
+    )
+
+
 def _source_metadata_update_expression(table, excluded_value):
     target_metadata = func.coalesce(
         table.c.metadata_json.cast(JSONB), func.jsonb_build_object()
@@ -40010,15 +40119,28 @@ def _source_metadata_update_expression(table, excluded_value):
     incoming_metadata = func.coalesce(
         excluded_value.cast(JSONB), func.jsonb_build_object()
     )
+    generation_reset = _pending_policy_generation_reset_expression(
+        target_metadata,
+        incoming_metadata,
+    )
     policy_preserved_metadata = (
         _preserved_source_reviewed_root_policy_expression(
             target_metadata,
             target_metadata.op("||")(incoming_metadata),
         )
     )
-    effective_metadata = _preserved_source_activation_expression(
+    preserved_metadata = _preserved_source_activation_expression(
         target_metadata,
         policy_preserved_metadata,
+    )
+    effective_metadata = case(
+        (
+            generation_reset,
+            _source_generation_metadata_without_state_expression(
+                target_metadata
+            ).op("||")(incoming_metadata),
+        ),
+        else_=preserved_metadata,
     )
     return case(
         (
@@ -40087,17 +40209,22 @@ def _source_metadata_update_sql(
     target_metadata = (
         f"COALESCE({target_prefix}.{quoted}::jsonb, '{{}}'::jsonb)"
     )
-    merged_metadata = (
-        f"{target_metadata} || "
+    incoming_metadata = (
         f"COALESCE({incoming_prefix}.{quoted}::jsonb, '{{}}'::jsonb)"
     )
+    merged_metadata = f"{target_metadata} || {incoming_metadata}"
     policy_preserved_metadata = _preserved_source_reviewed_root_policy_sql(
         target_metadata,
         merged_metadata,
     )
-    effective_metadata = _preserved_source_activation_sql(
+    preserved_metadata = _preserved_source_activation_sql(
         target_metadata,
         policy_preserved_metadata,
+    )
+    effective_metadata = (
+        f"CASE WHEN {_pending_policy_generation_reset_sql(target_metadata, incoming_metadata)} "
+        f"THEN {_source_generation_metadata_without_state_sql(target_metadata)} "
+        f"|| {incoming_metadata} ELSE {preserved_metadata} END"
     )
     return (
         "CASE WHEN COALESCE("
@@ -42051,7 +42178,7 @@ class _ReviewedCandidateSeed:
     requires_registration: bool = False
     acquisition_enabled: bool = True
     acquisition_blocked_reason: str | None = None
-    candidate_status: str = PROVIDER_DIRECTORY_TWIN_ROOT_PENDING
+    candidate_status: str | None = None
     last_updated_partition_resources: dict[str, Any] | None = None
 
 
@@ -42087,10 +42214,13 @@ def _reviewed_candidate_metadata(candidate: _ReviewedCandidateSeed) -> dict[str,
                 "provider_directory_fully_enumerable_resources": list(candidate.resources),
                 "provider_directory_coverage_mode": "full",
                 "provider_directory_acquisition_enabled": True,
-                "provider_directory_candidate_status": candidate.candidate_status,
                 PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY: campaign_id,
             }
         )
+        if candidate.candidate_status is not None:
+            metadata["provider_directory_candidate_status"] = (
+                candidate.candidate_status
+            )
         return metadata
     metadata.update(
         {
@@ -42112,7 +42242,7 @@ def _reviewed_candidate_metadata(candidate: _ReviewedCandidateSeed) -> dict[str,
 
 def _reviewed_candidate_row(candidate: _ReviewedCandidateSeed) -> dict[str, Any]:
     acquisition_summary = (
-        "pending two matching exhaustive acquisitions"
+        "with historical review evidence"
         if candidate.acquisition_enabled
         else "with acquisition blocked by an incomplete census contract"
     )
@@ -64131,6 +64261,7 @@ def _verification_terminal_endpoint_dataset_selection(
         requires_twin_root_verification=requires_twin_root_verification,
         verification_campaign_id=verification_campaign_id,
         verification_source_scope_hash=verification_source_scope_hash,
+        allow_promoted_twin_replay=True,
     )
     _assert_terminal_endpoint_dataset_proof(
         existing_dataset_map,
@@ -64388,6 +64519,10 @@ async def _select_endpoint_dataset_candidate(
             finalized_selection,
             existing_dataset_map,
             selected_resources,
+        )
+    if verification_profile.is_deprecated_multi_root_profile:
+        raise RuntimeError(
+            "provider_directory_reviewed_root_policy_single_root_required"
         )
     resumable_selection = await _select_resumable_endpoint_dataset_candidate(
         existing_dataset_map,
@@ -65102,6 +65237,9 @@ def _endpoint_dataset_verification_profile(
         campaign_id=verification_campaign_id,
         source_scope_hash=verification_source_scope_hash,
         reviewed_root_policy=source_profile.reviewed_root_policy,
+        is_deprecated_multi_root_profile=(
+            source_profile.is_deprecated_multi_root_profile
+        ),
     )
 
 
@@ -73982,11 +74120,14 @@ async def process_provider_directory_fhir_data(
         reviewed_root_policy = (
             reviewed_root_policy_from_document(root_policy_document)
             if root_policy_document is not None
-            else None
+            else ReviewedRootPolicy(1)
         )
+        if reviewed_root_policy.is_twin_root_required:
+            raise ValueError(
+                "provider_directory_reviewed_root_policy_single_root_required"
+            )
         reviewed_census_seed_rows = reviewed_manual_census_seed_rows(
             census_request.source_id,
-            root_policy=reviewed_root_policy,
         )
     elif task.get("provider_directory_reviewed_root_policy") is not None:
         raise ValueError(
@@ -74649,7 +74790,6 @@ class _ProviderDirectoryFhirCommandOptions:
     provider_directory_pagination_root_run_id: str | None = None
     provider_directory_acquisition_strategy: str | None = None
     provider_directory_census_cutoff: str | None = None
-    provider_directory_reviewed_root_count: int = DEFAULT_REQUIRED_ROOT_COUNT
     source_ids: list[str] | tuple[str, ...] | str | None = None
     limit: int | None = None
     source_query: str | None = None
@@ -74706,20 +74846,13 @@ async def run_provider_directory_fhir_command(
         "context": {"test_mode": options.test_mode}
     }
     command_options = asdict(options)
-    required_root_count = command_options.pop(
-        "provider_directory_reviewed_root_count"
-    )
     task_by_field = _apply_provider_directory_refresh_preset(command_options)
     if (
         options.provider_directory_acquisition_strategy
         == "server-issued-traversal-subset"
     ):
         task_by_field["provider_directory_reviewed_root_policy"] = (
-            ReviewedRootPolicy(required_root_count).document()
-        )
-    elif required_root_count != DEFAULT_REQUIRED_ROOT_COUNT:
-        raise ValueError(
-            "provider_directory_reviewed_root_policy_scope_invalid"
+            ReviewedRootPolicy(1).document()
         )
     validate_uhc_official_file_admission(task_by_field, test_mode=options.test_mode)
     census_request = current_version_census_request(

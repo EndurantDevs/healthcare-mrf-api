@@ -13,12 +13,10 @@ import pytest
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
-def test_reviewed_sources_use_distinct_nonempty_campaigns():
-    campaign_ids = [
-        importer.MICHIGAN_VERIFICATION_CAMPAIGN_ID,
-        importer.SCAN_VERIFICATION_CAMPAIGN_ID,
-        *importer.REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID.values(),
-    ]
+def test_historically_reviewed_sources_keep_distinct_nonempty_campaigns():
+    campaign_ids = list(
+        importer.REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID.values()
+    )
 
     assert all(campaign_ids)
     assert len(campaign_ids) == len(set(campaign_ids))

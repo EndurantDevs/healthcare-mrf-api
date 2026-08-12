@@ -80,7 +80,11 @@ def _legacy_current() -> ExactCurrentDataset:
     )
 
 
-def test_three_exact_lowercase_gates_are_mutually_exclusive(
+def _allow_retired_operation_internals(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(operator, "require_rooted_graph_operator_gate", lambda _: None)
+
+
+def test_active_gates_are_exact_and_retired_acquisition_stays_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gate_by_phase = {
@@ -89,14 +93,20 @@ def test_three_exact_lowercase_gates_are_mutually_exclusive(
         "publish": contract.PUBLICATION_ENABLED_ENV,
     }
     assert contract.OPERATOR_PHASES == tuple(gate_by_phase)
-    for phase, gate_name in gate_by_phase.items():
+    for phase in ("register", "publish"):
+        gate_name = gate_by_phase[phase]
         _enable_only(monkeypatch, gate_name)
         contract.require_rooted_graph_operator_gate(phase)
 
     _enable_only(monkeypatch, contract.ACQUISITION_ENABLED_ENV)
-    monkeypatch.setenv(contract.ACQUISITION_ENABLED_ENV, "TRUE")
     with pytest.raises(contract.ProviderDirectoryRootedGraphOperatorError) as disabled:
         contract.require_rooted_graph_operator_gate("acquire")
+    assert disabled.value.code == "disabled"
+
+    _enable_only(monkeypatch, contract.REGISTRATION_ENABLED_ENV)
+    monkeypatch.setenv(contract.REGISTRATION_ENABLED_ENV, "TRUE")
+    with pytest.raises(contract.ProviderDirectoryRootedGraphOperatorError) as disabled:
+        contract.require_rooted_graph_operator_gate("register")
     assert disabled.value.code == "disabled"
 
     monkeypatch.setenv(contract.REGISTRATION_ENABLED_ENV, "true")
@@ -104,6 +114,27 @@ def test_three_exact_lowercase_gates_are_mutually_exclusive(
     with pytest.raises(contract.ProviderDirectoryRootedGraphOperatorError) as conflict:
         contract.require_rooted_graph_operator_gate("register")
     assert conflict.value.code == "gate_conflict"
+
+
+@pytest.mark.asyncio
+async def test_retired_direct_acquisition_ignores_legacy_enable_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_only(monkeypatch, contract.ACQUISITION_ENABLED_ENV)
+
+    with pytest.raises(contract.ProviderDirectoryRootedGraphOperatorError) as caught:
+        await operator.acquire_admit_rooted_graph_operation(
+            operation_key=OPERATION_KEY,
+            concurrency=4,
+            max_attempts=3,
+            lease_seconds=300,
+            retry_base_seconds=1.0,
+            max_retry_seconds=60.0,
+            root_timeout_seconds=604_800.0,
+            database=object(),
+        )
+
+    assert caught.value.code == "disabled"
 
 
 def test_operator_contract_is_closed_and_json_serialization_fails_closed() -> None:
@@ -155,6 +186,7 @@ async def test_invalid_operation_key_fails_before_database(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable_only(monkeypatch, contract.ACQUISITION_ENABLED_ENV)
+    _allow_retired_operation_internals(monkeypatch)
 
     async def database_reached(_database: Any) -> Any:
         pytest.fail("invalid operation key reached database")
@@ -204,6 +236,7 @@ async def test_invalid_controls_fail_before_current_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable_only(monkeypatch, contract.ACQUISITION_ENABLED_ENV)
+    _allow_retired_operation_internals(monkeypatch)
 
     async def reject_selection(_database: Any) -> Any:
         pytest.fail("invalid controls reached current-dataset selection")
@@ -375,6 +408,7 @@ async def test_acquisition_replays_deterministically_and_never_publishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable_only(monkeypatch, contract.ACQUISITION_ENABLED_ENV)
+    _allow_retired_operation_internals(monkeypatch)
     current = _legacy_current()
 
     async def select(_database: Any) -> ExactCurrentDataset:
@@ -415,6 +449,7 @@ async def test_acquisition_preserves_cancellation_before_admission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable_only(monkeypatch, contract.ACQUISITION_ENABLED_ENV)
+    _allow_retired_operation_internals(monkeypatch)
 
     async def select(_database: Any) -> ExactCurrentDataset:
         return _legacy_current()

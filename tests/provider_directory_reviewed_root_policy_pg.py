@@ -9,7 +9,6 @@ import importlib.util
 import json
 from pathlib import Path
 
-from process import provider_directory_fhir_subset_activation as activation
 from process import provider_directory_fhir_subset_activation_selection as selection
 from tests.provider_directory_effective_endpoint_pg_cases import (
     _load_effective_endpoint_migration,
@@ -23,6 +22,9 @@ from tests.provider_directory_fhir_subset_activation_support import (
 from tests.provider_directory_reviewed_subset_activation_pg_support import (
     flush_deferred_fixture_events,
     load_activation_migration,
+)
+from tests.provider_directory_pending_policy_reset_pg import (
+    prove_pending_policy_two_campaign_reset,
 )
 from tests.provider_directory_reviewed_subset_activation_pg_upsert import (
     prove_policy_catalog_upserts_preserve_activation,
@@ -385,6 +387,7 @@ async def prove_single_root_policy_lifecycle(monkeypatch) -> None:
         _subset_migration, activation_migration = (
             await _install_policy_predecessors(scenario)
         )
+        await prove_pending_policy_two_campaign_reset(scenario)
         source_record, dataset_rows, evidence = single_root_activation_inputs()
         dataset_row = dataset_rows[0]
         await _insert_policy_source(scenario, source_record)

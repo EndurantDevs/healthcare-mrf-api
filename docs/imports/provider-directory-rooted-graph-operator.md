@@ -1,12 +1,15 @@
 # Rooted Provider Directory graph operator
 
-This packaged one-shot operator registers, acquires, or publishes one reviewed
-rooted Provider Directory graph. It is manual-only, has no scheduler or control
-worker registration, and does not activate a public API or Profile dispatch.
+This packaged one-shot operator can register one reviewed rooted Provider
+Directory graph source or publish one exact historical admission. It is
+manual-only, has no scheduler or control worker registration, and does not
+activate a public API or Profile dispatch.
 
-The three phases have separate default-off gates. Exactly one gate must equal
-lowercase `true`; uppercase values and multiple enabled gates fail closed. Run
-each phase in a separate one-shot Job.
+Registration and historical exact-selector publication remain available behind
+their separate default-off gates. The legacy `acquire` twin phase remains
+packaged for CLI compatibility but always returns
+`{"code":"disabled","status":"error"}` with exit code 1 after argument
+validation, even if its old gate is set to `true`.
 
 ## Register the dormant source
 
@@ -23,17 +26,10 @@ Registration inserts the closed source and endpoint registry rows or validates
 their exact replay. It performs no FHIR acquisition and no publication. Record
 the canonical JSON receipt before enabling a later phase.
 
-## Derive, acquire, compare, and admit twins
+## Retired acquisition contract
 
-```console
-HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_REGISTRATION_ENABLED=false \
-HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_ENABLED=true \
-HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_ENABLED=false \
-  /opt/venv/bin/python -B \
-  /opt/scripts/smoke/provider_directory_rooted_graph_operator.py \
-  acquire \
-  --operation-key 64_LOWERCASE_HEX_CHARACTERS
-```
+This section describes historical v1 receipts only. No new rooted acquisition
+or admission can be launched through this command.
 
 The operation key is a required nonsecret campaign key. The exact current root,
 closed operator contract, and key deterministically derive one dataset intent
@@ -54,7 +50,7 @@ Optional bounded controls are `--concurrency` (1-16), `--max-attempts` (1-8),
 `--root-timeout-seconds` (at most 2592000). Cross-field runtime validation also
 requires the retry base not exceed the maximum.
 
-## Publish one exact admitted receipt
+## Publish one exact historical admitted receipt
 
 ```console
 HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_REGISTRATION_ENABLED=false \
@@ -65,6 +61,9 @@ HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_ENABLED=true \
   publish \
   --publication-acquisition-id pdrga_48_LOWERCASE_HEX_CHARACTERS
 ```
+
+This command publishes or exactly replays only an already-admitted historical
+candidate. It cannot create a new acquisition or admission.
 
 Publication accepts only the exact candidate acquisition identifier emitted by
 the admission receipt. There is no source-wide scan, `latest` lookup, dataset
@@ -113,6 +112,10 @@ generation derived from the new official cohort may supersede that known stale
 row under the shared publication lock; foreign or dual-current rows still fail
 closed. Rooted acquisition can resume only from that newly ready generation,
 so Profile never combines a stale official cohort with a newer rooted graph.
+
+Do not schedule or run the retired acquisition phase. Use the standard
+single-root Provider Directory importer for future acquisition and admission.
+Historical exact-selector publication remains manual and default-off.
 
 SIGINT and SIGTERM cancel active work, drain owned tasks, disconnect the
 database, and exit with 130 or 143. Output is canonical JSON only and error

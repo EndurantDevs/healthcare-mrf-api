@@ -307,6 +307,22 @@ def _policy_incoming_metadata(note: str) -> dict[str, object]:
     }
 
 
+def _pending_policy_metadata(
+    campaign_id: str,
+    required_root_count: int,
+    note: str,
+) -> dict[str, object]:
+    return {
+        "provider_directory_candidate_status": POLICY_PENDING_STATUS,
+        "provider_directory_verification_campaign_id": campaign_id,
+        REVIEWED_ROOT_POLICY_METADATA_KEY: reviewed_root_policy_document(
+            required_root_count
+        ),
+        "provider_directory_acquisition_enabled": True,
+        "ordinary_catalog_note": note,
+    }
+
+
 async def _assert_policy_marker_and_note(
     scenario,
     marker_by_field,
@@ -359,5 +375,30 @@ async def prove_policy_catalog_upserts_preserve_activation(
         "provider_directory_reviewed_subset_activation_transition_invalid",
         drift_sql,
         *drift_parameters,
+    )
+    await _assert_policy_marker_and_note(scenario, marker_by_field, "copy-path")
+
+    next_campaign = marker_by_field["verification_campaign_id"] + "-next"
+    reset_metadata = _pending_policy_metadata(
+        next_campaign,
+        1,
+        "activated-reset",
+    )
+    reset_sql, reset_parameters = _values_upsert_sql(
+        scenario,
+        note="activated-reset-values",
+        incoming_metadata=reset_metadata,
+    )
+    await expect_postgres_error(
+        scenario.connection,
+        "provider_directory_reviewed_subset_activation_transition_invalid",
+        reset_sql,
+        *reset_parameters,
+    )
+    await expect_postgres_error(
+        scenario.connection,
+        "provider_directory_reviewed_subset_activation_transition_invalid",
+        _copy_upsert_sql(scenario),
+        json.dumps(reset_metadata, sort_keys=True),
     )
     await _assert_policy_marker_and_note(scenario, marker_by_field, "copy-path")

@@ -11,7 +11,7 @@ import pytest
 from process import provider_directory_fhir_subset_identity as subset_identity
 from process.provider_directory_fhir_subset_completion import canonical_sha256
 from process.provider_directory_fhir_root_policy import (
-    DEFAULT_REQUIRED_ROOT_COUNT,
+    LEGACY_REQUIRED_ROOT_COUNT,
     LEGACY_PENDING_STATUS,
     POLICY_PENDING_STATUS,
     REVIEWED_ROOT_POLICY_METADATA_KEY,
@@ -33,7 +33,7 @@ def _metadata(required_root_count: object) -> dict[str, object]:
 def test_legacy_reviewed_status_defaults_to_two_roots():
     policy = reviewed_root_policy_for_status({}, LEGACY_PENDING_STATUS)
 
-    assert policy == ReviewedRootPolicy(DEFAULT_REQUIRED_ROOT_COUNT)
+    assert policy == ReviewedRootPolicy(LEGACY_REQUIRED_ROOT_COUNT)
     assert policy.is_twin_root_required is True
 
 

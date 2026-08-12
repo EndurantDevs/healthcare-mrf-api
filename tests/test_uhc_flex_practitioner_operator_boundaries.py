@@ -49,6 +49,14 @@ def _enable_only(monkeypatch, selected_gate: str) -> None:
         )
 
 
+def _allow_retired_operation_internals(monkeypatch) -> None:
+    monkeypatch.setattr(
+        operator,
+        "require_uhc_flex_practitioner_operator_gate",
+        lambda _: None,
+    )
+
+
 def test_invalid_phase_and_unserializable_receipt_fail_closed(monkeypatch) -> None:
     _enable_only(monkeypatch, operator.COHORT_ENABLED_ENV)
     with pytest.raises(operator.UHCFlexPractitionerOperatorError) as phase_error:
@@ -148,6 +156,7 @@ def _acquisition_failure_module(phase_failure: BaseException | None) -> ModuleTy
 
 async def _run_acquisition_failure(monkeypatch, phase_failure):
     _enable_only(monkeypatch, operator.ACQUISITION_ENABLED_ENV)
+    _allow_retired_operation_internals(monkeypatch)
     module_name = "process.uhc_flex_practitioner_acquisition"
     monkeypatch.setitem(
         sys.modules,
