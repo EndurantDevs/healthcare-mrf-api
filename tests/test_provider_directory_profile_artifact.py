@@ -492,6 +492,30 @@ def test_cutover_dataset_lock_scope_and_wal_count_are_exact():
     assert "WHERE dataset.endpoint_id = ANY" not in lock_sql
 
 
+@pytest.mark.asyncio
+async def test_unlocked_dataset_fence_uses_one_database_snapshot():
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (
+            importer.ProviderDirectoryArtifactDataset(
+                source_id="source-a",
+                endpoint_id="endpoint-a",
+                dataset_id="dataset-a",
+                evidence_run_id="run-a",
+                normalized_receipt_present=True,
+            ),
+        )
+    )
+    executor = SimpleNamespace(all=AsyncMock(return_value=[]))
+
+    await importer._artifact_fence_dataset_rows(
+        fence,
+        executor,
+        for_update=False,
+    )
+
+    executor.all.assert_awaited_once()
+
+
 def _artifact_projection_fence():
     """Return two deliberately reverse-ordered artifact datasets."""
     return importer.ProviderDirectoryArtifactDatasetFence(

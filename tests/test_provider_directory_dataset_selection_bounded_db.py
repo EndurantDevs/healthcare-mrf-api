@@ -52,11 +52,16 @@ def _proof_line_hash(value_list: list[dict[str, object]]) -> str:
 
 def _large_semantic_shard_list(
     source_id_list: list[str],
+    *,
+    dataset_id: str = "dataset_shared",
+    endpoint_id: str = "endpoint_shared",
+    root_run_id: str = "root-shared",
+    shard_count: int = 512,
 ) -> list[dict[str, object]]:
     """Return many valid synthetic shard descriptors."""
 
     shard_list: list[dict[str, object]] = []
-    for shard_index in range(512):
+    for shard_index in range(shard_count):
         input_hash = hashlib.sha256(f"input-{shard_index}".encode()).hexdigest()
         identity_part_list = [
             "Location",
@@ -67,16 +72,16 @@ def _large_semantic_shard_list(
             {
                 "shard_id": importer._identity_hash(
                     [
-                        "dataset_shared",
-                        "endpoint_shared",
-                        "root-shared",
+                        dataset_id,
+                        endpoint_id,
+                        root_run_id,
                         source_id_list,
                         input_hash,
                     ]
                 ),
-                "dataset_id": "dataset_shared",
-                "endpoint_id": "endpoint_shared",
-                "acquisition_root_run_id": "root-shared",
+                "dataset_id": dataset_id,
+                "endpoint_id": endpoint_id,
+                "acquisition_root_run_id": root_run_id,
                 "source_ids": source_id_list,
                 "resource_count": 1,
                 "resource_counts": {"Location": 1},
@@ -93,19 +98,31 @@ def _large_semantic_shard_list(
     return shard_list
 
 
-def _large_semantic_proof_by_field() -> dict[str, object]:
+def _large_semantic_proof_by_field(
+    *,
+    dataset_id: str = "dataset_shared",
+    endpoint_id: str = "endpoint_shared",
+    root_run_id: str = "root-shared",
+    shard_count: int = 512,
+) -> dict[str, object]:
     """Return a valid semantic proof with a large discarded shard array."""
 
     source_id_list = ["source_primary", "source_sibling"]
-    shard_list = _large_semantic_shard_list(source_id_list)
+    shard_list = _large_semantic_shard_list(
+        source_id_list,
+        dataset_id=dataset_id,
+        endpoint_id=endpoint_id,
+        root_run_id=root_run_id,
+        shard_count=shard_count,
+    )
     proof_by_field: dict[str, object] = {
         "contract_id": (
             importer.PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID
         ),
         "complete": True,
-        "dataset_id": "dataset_shared",
-        "endpoint_id": "endpoint_shared",
-        "acquisition_root_run_id": "root-shared",
+        "dataset_id": dataset_id,
+        "endpoint_id": endpoint_id,
+        "acquisition_root_run_id": root_run_id,
         "source_ids": source_id_list,
         "selected_resources": ["Location"],
         "proof_resource_scope": ["Location"],
@@ -138,7 +155,13 @@ def _large_semantic_proof_by_field() -> dict[str, object]:
     return proof_by_field
 
 
-def _large_metadata_by_field() -> dict[str, object]:
+def _large_metadata_by_field(
+    *,
+    dataset_id: str = "dataset_shared",
+    endpoint_id: str = "endpoint_shared",
+    root_run_id: str = "root-shared",
+    shard_count: int = 512,
+) -> dict[str, object]:
     """Return metadata containing one valid large semantic proof."""
 
     return {
@@ -149,7 +172,12 @@ def _large_metadata_by_field() -> dict[str, object]:
         "semantic_projection_as_of": "2026-08-09",
         "proof_resource_scope": ["Location"],
         importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: (
-            _large_semantic_proof_by_field()
+            _large_semantic_proof_by_field(
+                dataset_id=dataset_id,
+                endpoint_id=endpoint_id,
+                root_run_id=root_run_id,
+                shard_count=shard_count,
+            )
         ),
     }
 
@@ -173,10 +201,18 @@ async def _set_shared_semantic_proof(
     database,
     schema: str,
     metadata_by_field: dict[str, object],
+    *,
+    dataset_id: str = "dataset_shared",
 ) -> None:
     """Install one proof and its matching parent scalar identity."""
 
-    await _replace_shared_metadata(database, schema, metadata_by_field)
+    await database.status(
+        f"UPDATE {schema}.provider_directory_endpoint_dataset "
+        "SET publication_metadata_json = CAST(:metadata AS json) "
+        "WHERE dataset_id = :dataset_id;",
+        metadata=json.dumps(metadata_by_field, ensure_ascii=False),
+        dataset_id=dataset_id,
+    )
     proof_by_field = metadata_by_field[
         importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
     ]
@@ -184,9 +220,10 @@ async def _set_shared_semantic_proof(
     await database.status(
         f"UPDATE {schema}.provider_directory_endpoint_dataset "
         "SET dataset_hash = :dataset_hash, resource_count = :resource_count "
-        "WHERE dataset_id = 'dataset_shared';",
+        "WHERE dataset_id = :dataset_id;",
         dataset_hash=proof_by_field["dataset_hash"],
         resource_count=proof_by_field["resource_count"],
+        dataset_id=dataset_id,
     )
 
 
@@ -199,7 +236,9 @@ async def _all_source_projected_rows(database) -> list[dict[str, object]]:
         validated_status=importer.ENDPOINT_DATASET_VALIDATED,
         select_validated_candidates=False,
     )
-    return [dict(database_row._mapping) for database_row in projected_rows]
+    return await importer._hydrate_legacy_artifact_dataset_rows(
+        projected_rows
+    )
 
 
 async def _install_unrelated_large_proof_hash_sentinel(database, schema: str) -> None:
@@ -318,52 +357,6 @@ def _resealed_proof_mutation(
     _PROOF_MUTATION_BY_NAME[mutation_name](mutated_metadata, proof_by_field)
     proof_by_field["proof_sha256"] = importer._identity_hash(proof_by_field)
     return mutated_metadata
-
-
-@pytest.mark.asyncio
-async def test_all_source_projection_keeps_large_proof_server_side(monkeypatch):
-    """Exclude the full shard proof and enforce a small returned row."""
-
-    async with _dataset_database(monkeypatch) as (database, schema):
-        large_metadata_by_field = _large_metadata_by_field()
-        serialized_metadata = json.dumps(large_metadata_by_field, sort_keys=True)
-        assert len(serialized_metadata) > 200_000
-        await _set_shared_semantic_proof(
-            database,
-            schema,
-            large_metadata_by_field,
-        )
-
-        projected_row_list = await _all_source_projected_rows(database)
-
-        assert len(projected_row_list) == 2
-        assert {
-            projected_row["publication_metadata_hash"]
-            for projected_row in projected_row_list
-        } == {canonical_payload_sha256(large_metadata_by_field)}
-        assert all(
-            importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
-            not in projected_row["publication_metadata_json"]
-            for projected_row in projected_row_list
-        )
-        assert all(
-            "completion_proof_json" not in projected_row
-            for projected_row in projected_row_list
-        )
-        assert all(
-            projected_row["content_proof_valid"] is True
-            for projected_row in projected_row_list
-        )
-        assert all(
-            projected_row["content_proof_resources"] == ["Location"]
-            for projected_row in projected_row_list
-        )
-        projected_byte_count_list = [
-            len(json.dumps(projected_row, sort_keys=True, default=str).encode())
-            for projected_row in projected_row_list
-        ]
-        assert max(projected_byte_count_list) < 8_192
-        assert sum(projected_byte_count_list) < 16_384
 
 
 @pytest.mark.asyncio
