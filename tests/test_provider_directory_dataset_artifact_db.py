@@ -361,6 +361,22 @@ async def test_real_postgres_dataset_scope_keeps_explicit_sources_and_cleans(mon
 
 
 @pytest.mark.asyncio
+async def test_dataset_selection_projects_exact_evidence_run_fallback(monkeypatch):
+    async with _dataset_database(monkeypatch) as (database, schema):
+        resolve = importer._resolve_provider_directory_artifact_datasets
+        root_fence = await resolve(["source_primary"])
+        assert root_fence.datasets[0].evidence_run_id == "root-shared"
+
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset "
+            "SET acquisition_root_run_id = NULL "
+            "WHERE dataset_id = 'dataset_shared';"
+        )
+        fallback_fence = await resolve(["source_primary"])
+        assert fallback_fence.datasets[0].evidence_run_id == "run-shared"
+
+
+@pytest.mark.asyncio
 async def test_real_postgres_scope_materializes_a_proven_linked_family(
     monkeypatch,
 ):

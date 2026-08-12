@@ -211,6 +211,8 @@ async def install_subset_canonical_functions(database, schema: str) -> None:
         migration._canonical_json_runtime_fence_sql(),
         migration._canonical_json_function_sql(schema),
         migration._canonical_sha256_function_sql(schema),
+        migration._payload_canonical_json_function_sql(schema),
+        migration._payload_sha256_function_sql(schema),
         migration._content_proof_valid_function_sql(schema),
     ):
         await database.status(statement)
