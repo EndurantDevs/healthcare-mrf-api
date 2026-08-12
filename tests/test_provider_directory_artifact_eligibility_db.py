@@ -176,6 +176,23 @@ def _matched_metadata() -> dict[str, object]:
     }
 
 
+def _ordinary_metadata() -> dict[str, object]:
+    return {
+        "source_ids": ["source_a", "source_b"],
+        "selected_resources": ["Organization", "Practitioner"],
+        "expected_resources": ["Organization", "Practitioner"],
+        "requires_twin_root_verification": False,
+        importer.TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: CAMPAIGN_ID,
+        importer.TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: SOURCE_SCOPE_HASH,
+        "dataset_hash": DATASET_HASH,
+        "resource_count": RESOURCE_COUNT,
+        "completion_proof_v1": {
+            importer.TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: CAMPAIGN_ID,
+            importer.TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: SOURCE_SCOPE_HASH,
+        },
+    }
+
+
 async def _insert_sources(database: Database, schema: str) -> None:
     metadata = json.dumps(_source_metadata())
     await database.status(

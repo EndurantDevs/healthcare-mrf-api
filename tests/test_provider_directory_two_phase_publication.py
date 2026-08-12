@@ -21,6 +21,9 @@ from tests.test_provider_directory_dataset_artifact_db import (
     _dataset_database,
     _insert_validated_shared_dataset,
 )
+from tests.provider_directory_dataset_artifact_pg_support import (
+    seal_validated_dataset,
+)
 
 
 @contextlib.contextmanager
@@ -118,6 +121,7 @@ async def _insert_second_validated_endpoint(database, schema: str) -> None:
         payload_hash="8" * 64,
         payload=json.dumps({"status": "active", "name": "Clinic Z"}),
     )
+    await seal_validated_dataset(database, schema, "dataset_z_candidate")
 
 
 async def _artifact_bundle_stages(

@@ -11,6 +11,9 @@ from tests.test_provider_directory_artifact_cutover import (
     importer,
 )
 from tests.test_provider_directory_dataset_artifact_db import _dataset_database
+from tests.provider_directory_dataset_artifact_pg_support import (
+    seal_validated_dataset,
+)
 from tests.test_provider_directory_two_phase_publication import (
     _active_dataset_fence,
     _artifact_bundle_stages,
@@ -77,8 +80,6 @@ async def _insert_graphql_candidate(database, schema: str) -> None:
             }
         ),
     )
-
-
 async def _resolvable_source_dataset_id(database, schema: str) -> str | None:
     return await database.scalar(
         f"""
@@ -129,6 +130,11 @@ async def test_contract_identity_cutover_preserves_published_evidence(monkeypatc
     """Keep old evidence resolvable until the replacement publishes atomically."""
     async with _dataset_database(monkeypatch) as (database, schema):
         await _insert_graphql_candidate(database, schema)
+        await seal_validated_dataset(
+            database,
+            schema,
+            "dataset_graphql_candidate",
+        )
         assert await _resolvable_source_dataset_id(database, schema) == (
             "dataset_shared"
         )

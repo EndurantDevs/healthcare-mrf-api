@@ -16208,7 +16208,6 @@ def _artifact_candidate_eligibility_metadata_columns() -> str:
         {TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY} text,
         {metadata_key} jsonb,
         {REVIEWED_ROOT_POLICY_METADATA_KEY} jsonb,
-        {PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY} jsonb,
         {ADMISSION_GENERIC_PROOF_SUMMARY_KEY} jsonb,
         source_ids jsonb,
         dataset_hash text,
@@ -16272,11 +16271,29 @@ def _artifact_optional_metadata_fields_sql() -> str:
     )
 
 
+def _artifact_optional_content_proof_sql() -> str:
+    """Restore legacy subset proof only when no receipt admitted it."""
+
+    proof_key = PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
+    return f"""
+        CASE
+            WHEN candidate.content_proof_admitted IS NOT TRUE
+             AND candidate.completion_proof_required_version IS NOT NULL
+             AND candidate.full_metadata_jsonb ? '{proof_key}'
+            THEN jsonb_build_object(
+                     '{proof_key}', candidate.full_metadata_jsonb -> '{proof_key}'
+                 )
+            ELSE '{{}}'::jsonb
+        END
+    """
+
+
 def _artifact_candidate_eligibility_ctes(dataset_ref: str) -> str:
     """Parse large candidate proofs once and retain only eligibility fields."""
     metadata_key = TWIN_ROOT_VERIFICATION_METADATA_KEY
     metadata_columns = _artifact_candidate_eligibility_metadata_columns()
     optional_metadata_sql = _artifact_optional_metadata_fields_sql()
+    optional_content_proof_sql = _artifact_optional_content_proof_sql()
     safe_metadata = _artifact_safe_publication_metadata_sql()
     content_proof_admitted = _artifact_content_proof_admitted_marker_sql(
         safe_metadata
@@ -16315,7 +16332,8 @@ def _artifact_candidate_eligibility_ctes(dataset_ref: str) -> str:
                        - '{metadata_key}'
                        - '{REVIEWED_ROOT_POLICY_METADATA_KEY}'
                        - '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'
-               ) || {optional_metadata_sql} AS eligibility_metadata_jsonb
+               ) || {optional_metadata_sql}
+                 || {optional_content_proof_sql} AS eligibility_metadata_jsonb
           FROM artifact_candidate_json AS candidate
           CROSS JOIN LATERAL jsonb_to_record(
                CASE
@@ -21897,10 +21915,7 @@ async def _artifact_eligible_validated_ids(
 ) -> dict[str, list[str]]:
     if not fence.should_select_validated_candidates:
         return {}
-    selected_endpoint_ids = sorted(
-        {dataset.endpoint_id for dataset in fence.datasets}
-    )
-    if not selected_endpoint_ids:
+    if not fence.locked_source_ids:
         return {}
     dataset_ref = _unscoped_qt(
         _schema(),
@@ -21910,21 +21925,14 @@ async def _artifact_eligible_validated_ids(
         _schema(),
         ProviderDirectorySource.__tablename__,
     )
-    reviewed_candidate_gate = _artifact_reviewed_candidate_eligibility_sql(
-        dataset_ref,
-        source_ref,
-        metadata="dataset.eligibility_metadata_jsonb",
-        content_proof_admitted="dataset.content_proof_admitted",
-    )
     option_rows = await executor.all(
         f"""
-        WITH {_artifact_candidate_eligibility_ctes(dataset_ref)}
-        SELECT dataset.endpoint_id, dataset.dataset_id
-          FROM artifact_candidate_metadata AS dataset
-         WHERE {reviewed_candidate_gate}
-         ORDER BY dataset.endpoint_id, dataset.dataset_id;
+        WITH {_artifact_explicit_candidate_ids_ctes(dataset_ref, source_ref)}
+        SELECT endpoint_id, dataset_id
+          FROM eligible_candidate_ids
+         ORDER BY endpoint_id, dataset_id;
         """,
-        endpoint_ids=selected_endpoint_ids,
+        source_ids=fence.locked_source_ids,
         validated_status=ENDPOINT_DATASET_VALIDATED,
     )
     eligible_ids_by_endpoint: dict[str, list[str]] = {}
@@ -22110,6 +22118,7 @@ def _assert_locked_artifact_fence_datasets(
     eligible_ids_by_endpoint: dict[str, list[str]] | None = None,
 ) -> None:
     """Reverify selected datasets, candidates, and expected incumbents."""
+    _assert_artifact_candidate_universe(fence, eligible_ids_by_endpoint)
     dataset_rows_by_id = _locked_dataset_rows_by_id(locked_dataset_rows)
     _assert_validated_publication_candidate_fence(fence, dataset_rows_by_id)
     rows_by_endpoint_id: dict[str, list[dict[str, Any]]] = {}
@@ -22163,6 +22172,33 @@ def _assert_locked_artifact_fence_datasets(
             raise ProviderDirectoryArtifactBuildStale(
                 "provider_directory_endpoint_dataset_metadata_changed"
             )
+
+
+def _assert_artifact_candidate_universe(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    eligible_ids_by_endpoint: dict[str, list[str]] | None,
+) -> None:
+    """Require the complete source-bound candidate set to remain exact."""
+
+    if (
+        not fence.should_select_validated_candidates
+        or eligible_ids_by_endpoint is None
+    ):
+        return
+    expected_candidate_ids = {
+        (dataset.endpoint_id, dataset.dataset_id)
+        for dataset in fence.locked_alias_datasets
+        if dataset.promote_on_cutover
+    }
+    actual_candidate_ids = {
+        (endpoint_id, dataset_id)
+        for endpoint_id, dataset_ids in eligible_ids_by_endpoint.items()
+        for dataset_id in dataset_ids
+    }
+    if actual_candidate_ids != expected_candidate_ids:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_endpoint_dataset_candidate_changed"
+        )
 
 
 def _assert_locked_artifact_endpoint_state(

@@ -94,6 +94,7 @@ async def test_verified_gate_allows_ordinary_refresh_with_matched_anchor(
             resource_count=eligibility.RESOURCE_COUNT,
             metadata=json.dumps(eligibility._ordinary_metadata()),
         )
+        await eligibility._seal_core_datasets(database, schema)
         options = await eligibility._artifact_options(database, schema)
         assert eligibility._option_ids(options) == [
             "dataset_current",

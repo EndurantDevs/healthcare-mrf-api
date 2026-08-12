@@ -17,6 +17,7 @@ async def insert_validated_shared_dataset(
     *,
     dataset_id: str = "dataset_candidate",
     root_run_id: str = "root-candidate",
+    seal: bool = True,
 ) -> None:
     """Insert one validated candidate and its single resource."""
 
@@ -63,4 +64,38 @@ async def insert_validated_shared_dataset(
             "state_code": "TX",
             "postal_code": "78702",
         }),
+    )
+    if seal:
+        await seal_validated_dataset(database, schema, dataset_id)
+
+
+async def seal_validated_dataset(
+    database: Database,
+    schema: str,
+    dataset_id: str,
+    *,
+    resource_types: tuple[str, ...] = ("Location",),
+) -> None:
+    """Install one shape-valid test receipt for cutover-only fixtures."""
+
+    await database.status(
+        f"""
+        UPDATE {schema}.provider_directory_endpoint_dataset
+           SET publication_metadata_summary_json = publication_metadata_json,
+               content_proof_admission_version = {importer.ADMISSION_SEAL_VERSION},
+               content_proof_admission_kind = '{importer.ADMISSION_KIND_GENERIC}',
+               content_proof_admission_sha256 = repeat('a', 64),
+               content_proof_resource_types = CAST(:resource_types AS varchar[]),
+               publication_metadata_sha256 =
+                   {schema}.provider_directory_endpoint_dataset_admission_metadata_sha256(
+                       publication_metadata_json,
+                       {importer.ADMISSION_SEAL_VERSION}::smallint,
+                       '{importer.ADMISSION_KIND_GENERIC}'::text,
+                       repeat('a', 64),
+                       CAST(:resource_types AS varchar[])
+                   )
+         WHERE dataset_id = :dataset_id;
+        """,
+        dataset_id=dataset_id,
+        resource_types=list(resource_types),
     )

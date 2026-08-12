@@ -162,7 +162,7 @@ def _out_of_scope_receipt_metadata() -> dict[str, object]:
 
 
 async def _install_receipt_candidate(database, schema: str) -> None:
-    await _insert_validated_shared_dataset(database, schema)
+    await _insert_validated_shared_dataset(database, schema, seal=False)
     await _set_shared_semantic_proof(
         database,
         schema,
@@ -338,7 +338,7 @@ async def test_sealed_selection_ignores_untrusted_receipt_resources(
     monkeypatch,
 ):
     async with _dataset_database(monkeypatch) as (database, schema):
-        await _insert_validated_shared_dataset(database, schema)
+        await _insert_validated_shared_dataset(database, schema, seal=False)
         await _set_shared_semantic_proof(
             database,
             schema,
@@ -427,7 +427,7 @@ async def test_normalized_receipt_does_not_reopen_audit_shards(monkeypatch):
 @pytest.mark.asyncio
 async def test_partial_receipt_uses_legacy_validation(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
-        await _insert_validated_shared_dataset(database, schema)
+        await _insert_validated_shared_dataset(database, schema, seal=False)
         metadata = _large_metadata_with_normalized_receipt()
         metadata.pop(
             importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY

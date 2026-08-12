@@ -461,20 +461,11 @@ async def test_artifact_candidate_selection_covers_empty_and_valid_rows():
         "endpoint-a": ["candidate-a"]
     }
     selection_sql = executor.all.await_args.args[0]
-    endpoint_scope = "dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))"
     normalized_sql = " ".join(selection_sql.split())
-    scoped_candidate_filter = (
-        "WHERE dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[])) "
-        "AND dataset.is_current = false "
-        "AND dataset.status = :validated_status "
-        "AND dataset.superseded_at IS NULL"
-    )
-    assert scoped_candidate_filter in normalized_sql
-    assert selection_sql.count(endpoint_scope) == 1
-    assert "FROM artifact_candidate_metadata AS dataset" in normalized_sql
-    assert "jsonb_to_record" in normalized_sql
-    assert "dataset.eligibility_metadata_jsonb" in normalized_sql
-    assert executor.all.await_args.kwargs["endpoint_ids"] == ["endpoint-a"]
+    assert "candidate_source_ids AS MATERIALIZED" in normalized_sql
+    assert "eligible_candidate_ids AS MATERIALIZED" in normalized_sql
+    assert "FROM eligible_candidate_ids" in normalized_sql
+    assert executor.all.await_args.kwargs["source_ids"] == ["source-a"]
 
 
 def test_complete_artifact_stage_bundle_matches_expected_relation():
