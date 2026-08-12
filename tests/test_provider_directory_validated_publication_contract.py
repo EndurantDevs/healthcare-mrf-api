@@ -172,6 +172,53 @@ def test_request_contract_is_closed_and_first_publication_is_explicit():
         validated_publication_candidate_from_params(params)
 
 
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    (
+        ("source_id", " source-a"),
+        ("dataset_hash", "B" * 64),
+        ("validated_at", ""),
+        ("validated_at", "not-a-timestamp"),
+        ("validated_at", None),
+        ("validated_at", dt.datetime(2026, 8, 11)),
+    ),
+)
+def test_candidate_rejects_noncanonical_identity(
+    field_name,
+    field_value,
+):
+    payload = _candidate_payload()
+    payload[field_name] = field_value
+
+    with pytest.raises(ValueError, match="identity_invalid"):
+        ValidatedPublicationCandidate.from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("updates", "reason"),
+    (
+        ({"publish_artifacts_targets": ""}, "target_set_invalid"),
+        ({"publish_artifacts_targets": None}, "target_set_invalid"),
+        ({"source_ids": []}, "source_scope_invalid"),
+        ({"publish_artifacts_only": False}, "publication_mode_invalid"),
+        ({"publish_corroboration": True}, "corroboration_mode_invalid"),
+        (
+            {"provider_directory_profile_generation": 1},
+            "profile_mode_invalid",
+        ),
+        ({"retry_of_run_id": "run-parent"}, "acquisition_mode_invalid"),
+        ({"full_refresh": True}, "incompatible_mode"),
+        ({"refresh_preset": "monthly-full"}, "preset_mode_invalid"),
+    ),
+)
+def test_request_contract_rejects_incompatible_modes(updates, reason):
+    params = _publication_params()
+    params.update(updates)
+
+    with pytest.raises(ValueError, match=reason):
+        validated_publication_candidate_from_params(params)
+
+
 @pytest.mark.asyncio
 async def test_control_admission_rejects_a_mixed_proof_pair():
     with pytest.raises(ValueError, match="completion_proof_pair_invalid"):
