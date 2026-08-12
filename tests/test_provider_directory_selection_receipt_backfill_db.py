@@ -61,6 +61,7 @@ async def _install_repairable_current(database, schema: str, *, short: int = 0):
 @pytest.mark.asyncio
 async def test_backfill_dry_run_apply_and_idempotent_replay(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
+        monkeypatch.setenv("DB_SCHEMA", schema)
         metadata = await _install_repairable_current(database, schema)
 
         dry_run = await backfill.backfill_provider_directory_selection_receipt(
@@ -122,6 +123,7 @@ async def test_backfill_dry_run_apply_and_idempotent_replay(monkeypatch):
 @pytest.mark.asyncio
 async def test_backfill_rejects_retained_count_drift(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
+        monkeypatch.setenv("DB_SCHEMA", schema)
         await _install_repairable_current(database, schema, short=1)
 
         with pytest.raises(
@@ -137,6 +139,7 @@ async def test_backfill_rejects_retained_count_drift(monkeypatch):
 @pytest.mark.asyncio
 async def test_backfill_rejects_unproven_retained_resource_type(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
+        monkeypatch.setenv("DB_SCHEMA", schema)
         await _install_repairable_current(database, schema)
         await database.status(
             f"INSERT INTO {schema}.provider_directory_dataset_resource ("
@@ -158,6 +161,7 @@ async def test_backfill_rejects_unproven_retained_resource_type(monkeypatch):
 @pytest.mark.asyncio
 async def test_backfill_rejects_invalid_or_conflicting_receipt(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
+        monkeypatch.setenv("DB_SCHEMA", schema)
         await _install_repairable_current(database, schema)
         await database.status(
             f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
@@ -179,6 +183,7 @@ async def test_backfill_rejects_invalid_or_conflicting_receipt(monkeypatch):
 @pytest.mark.asyncio
 async def test_backfill_rejects_any_admission_seal_state(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
+        monkeypatch.setenv("DB_SCHEMA", schema)
         metadata = await _install_repairable_current(database, schema)
         await database.status(
             f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
@@ -202,6 +207,7 @@ async def test_backfill_rejects_any_admission_seal_state(monkeypatch):
 @pytest.mark.asyncio
 async def test_backfill_rejects_source_summary_drift(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
+        monkeypatch.setenv("DB_SCHEMA", schema)
         await _install_repairable_current(database, schema)
         await database.status(
             f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
@@ -229,6 +235,44 @@ async def test_backfill_rejects_invalid_dataset_id(dataset_id):
         match="dataset_id_invalid",
     ):
         await backfill.backfill_provider_directory_selection_receipt(dataset_id)
+
+
+@pytest.mark.parametrize(
+    ("runtime_schema", "legacy_schema"),
+    [("mrf", "other"), ("invalid-name", None)],
+)
+def test_backfill_rejects_invalid_schema(monkeypatch, runtime_schema, legacy_schema):
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", runtime_schema)
+    if legacy_schema is None:
+        monkeypatch.delenv("DB_SCHEMA", raising=False)
+    else:
+        monkeypatch.setenv("DB_SCHEMA", legacy_schema)
+
+    with pytest.raises(
+        backfill.ProviderDirectorySelectionReceiptBackfillError,
+        match="schema_invalid",
+    ):
+        backfill._schema()
+
+
+@pytest.mark.parametrize("raw_metadata", ["{", []])
+def test_backfill_rejects_invalid_json_object(raw_metadata):
+    with pytest.raises(
+        backfill.ProviderDirectorySelectionReceiptBackfillError,
+        match="metadata_invalid",
+    ):
+        backfill._json_object(raw_metadata)
+
+
+@pytest.mark.asyncio
+async def test_backfill_rejects_invalid_retained_summary():
+    with pytest.raises(
+        backfill.ProviderDirectorySelectionReceiptBackfillError,
+        match="metadata_invalid",
+    ):
+        await backfill._require_retained_resource_counts(
+            AsyncMock(), '"mrf"."resource"', "dataset-synthetic", {}
+        )
 
 
 def test_backfill_sql_projects_only_bounded_metadata():
