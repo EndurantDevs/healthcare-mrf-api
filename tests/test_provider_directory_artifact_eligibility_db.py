@@ -309,7 +309,7 @@ async def _artifact_options(
             f'{schema}.provider_directory_endpoint_dataset',
             f'{schema}.provider_directory_source',
         )}
-        SELECT dataset_id, status, validated_candidate_count
+        SELECT dataset_id, evidence_run_id, status, validated_candidate_count
           FROM dataset_options
          WHERE endpoint_id = :endpoint_id
          ORDER BY dataset_id;
@@ -442,6 +442,13 @@ async def test_verified_gate_keeps_incumbent_and_exact_matched_candidate(
             "dataset_current",
             "dataset_exact_matched",
         ]
+        assert {
+            option_row["dataset_id"]: option_row["evidence_run_id"]
+            for option_row in artifact_option_rows
+        } == {
+            "dataset_current": "root_current",
+            "dataset_exact_matched": "root_matched",
+        }
         assert {
             int(option_row["validated_candidate_count"])
             for option_row in artifact_option_rows

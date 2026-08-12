@@ -10912,6 +10912,9 @@ def test_artifact_dataset_selection_projects_only_bounded_dataset_fields():
     assert "completion_proof_cutoff" in projection_sql
     assert "provider_directory_subset_payload_sha256" in sql
     assert "provider_directory_subset_content_proof_valid" in sql
+    assert "dataset_options.import_run_id" not in sql
+    assert "dataset_options.acquisition_root_run_id" not in sql
+    assert "dataset.evidence_run_id" in projection_sql
     assert "dataset.publication_metadata_json" not in projection_sql
     assert "dataset.completion_proof_json" not in projection_sql
 

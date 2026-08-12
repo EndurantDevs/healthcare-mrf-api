@@ -14618,7 +14618,11 @@ def _provider_directory_artifact_dataset_selection_sql(
             source_ref,
         )
     )
-    options_sql = _artifact_dataset_options_cte(dataset_ref, source_ref)
+    options_sql = _artifact_dataset_options_cte(
+        dataset_ref,
+        source_ref,
+        project_artifact_fields=True,
+    )
     ranking_sql = _artifact_dataset_ranking_cte()
     projection_sql = _artifact_dataset_projection_sql()
     return f"""
@@ -16260,14 +16264,14 @@ def _artifact_semantic_content_proof_valid_sql(
     """
 
 
-def _artifact_content_proof_valid_sql(metadata: str) -> str:
+def _artifact_content_proof_valid_sql(
+    metadata: str,
+    evidence_run_id: str,
+) -> str:
     """Validate one full stored proof without returning its shard array."""
 
     proof = f"({metadata} -> '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}')"
     hash_contract = _artifact_normalized_resource_hash_contract_sql(metadata)
-    evidence_run_id = (
-        "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)"
-    )
     legacy_valid = _artifact_legacy_content_proof_valid_sql(
         metadata,
         proof,
@@ -16314,15 +16318,20 @@ def _artifact_dataset_option_projection_sql(metadata: str) -> str:
 
     bounded_metadata = _artifact_bounded_publication_metadata_sql(metadata)
     content_proof_resources = _artifact_content_proof_resources_sql(metadata)
-    content_proof_valid = _artifact_content_proof_valid_sql(metadata)
+    evidence_run_id = (
+        "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)"
+    )
+    content_proof_valid = _artifact_content_proof_valid_sql(
+        metadata,
+        evidence_run_id,
+    )
     metadata_hash = _qt(
         _schema(), "provider_directory_subset_payload_sha256"
     )
     return f"""
         dataset.dataset_id,
         dataset.endpoint_id,
-        dataset.import_run_id,
-        dataset.acquisition_root_run_id,
+        {evidence_run_id} AS evidence_run_id,
         dataset.previous_dataset_id,
         dataset.dataset_hash,
         dataset.status,
@@ -16344,23 +16353,43 @@ def _artifact_dataset_option_projection_sql(metadata: str) -> str:
         {metadata} ? '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'
             AS content_proof_present,
         ({content_proof_valid}) AS content_proof_valid,
-        ({content_proof_resources}) AS content_proof_resources,
-        count(*) FILTER (
-            WHERE dataset.is_current = true
-              AND dataset.status = :published_status
-              AND dataset.superseded_at IS NULL
-        ) OVER (PARTITION BY dataset.endpoint_id) AS current_dataset_count,
-        max(dataset.dataset_id) FILTER (
-            WHERE dataset.is_current = true
-              AND dataset.status = :published_status
-              AND dataset.superseded_at IS NULL
-        ) OVER (PARTITION BY dataset.endpoint_id) AS current_dataset_id,
-        count(*) FILTER (
-            WHERE dataset.is_current = false
-              AND dataset.status = :validated_status
-              AND dataset.superseded_at IS NULL
-        ) OVER (PARTITION BY dataset.endpoint_id) AS validated_candidate_count
+        ({content_proof_resources}) AS content_proof_resources
     """
+
+
+def _artifact_dataset_option_projection_parts(
+    project_artifact_fields: bool,
+) -> tuple[str, str]:
+    """Return the projection and join needed by one resolver mode."""
+
+    if not project_artifact_fields:
+        return (
+            """
+        dataset.dataset_id,
+        dataset.endpoint_id,
+        dataset.acquisition_root_run_id AS evidence_run_id,
+        dataset.status,
+        dataset.is_current,
+        dataset.superseded_at
+        """,
+            "",
+        )
+    return (
+        _artifact_dataset_option_projection_sql(
+            "publication.full_metadata_jsonb"
+        ),
+        """
+          CROSS JOIN LATERAL (
+               SELECT CASE
+                          WHEN jsonb_typeof(
+                                   dataset.publication_metadata_json::jsonb
+                               ) = 'object'
+                          THEN dataset.publication_metadata_json::jsonb
+                          ELSE '{}'::jsonb
+                      END AS full_metadata_jsonb
+          ) AS publication
+        """,
+    )
 
 
 def _artifact_dataset_options_cte(
@@ -16368,9 +16397,9 @@ def _artifact_dataset_options_cte(
     source_ref: str | None = None,
     *,
     scope_endpoint_ids: bool = False,
+    project_artifact_fields: bool = False,
 ) -> str:
     """Select only current or admitted candidate rows with bounded output."""
-
     validated_candidate_gate = (
         _artifact_reviewed_candidate_eligibility_sql(dataset_ref, source_ref)
         if source_ref
@@ -16378,25 +16407,34 @@ def _artifact_dataset_options_cte(
     )
     endpoint_scope = (
         "dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))\n"
-        "           AND "
-        if scope_endpoint_ids
-        else ""
+        "           AND " if scope_endpoint_ids else ""
     )
-    metadata = "publication.full_metadata_jsonb"
-    option_projection = _artifact_dataset_option_projection_sql(metadata)
+    option_projection, publication_lateral = (
+        _artifact_dataset_option_projection_parts(project_artifact_fields)
+    )
     return f"""
         dataset_options AS MATERIALIZED (
-        SELECT {option_projection}
+        SELECT {option_projection},
+               count(*) FILTER (
+                   WHERE dataset.is_current = true
+                     AND dataset.status = :published_status
+                     AND dataset.superseded_at IS NULL
+               ) OVER (PARTITION BY dataset.endpoint_id)
+                   AS current_dataset_count,
+               max(dataset.dataset_id) FILTER (
+                   WHERE dataset.is_current = true
+                     AND dataset.status = :published_status
+                     AND dataset.superseded_at IS NULL
+               ) OVER (PARTITION BY dataset.endpoint_id)
+                   AS current_dataset_id,
+               count(*) FILTER (
+                   WHERE dataset.is_current = false
+                     AND dataset.status = :validated_status
+                     AND dataset.superseded_at IS NULL
+               ) OVER (PARTITION BY dataset.endpoint_id)
+                   AS validated_candidate_count
           FROM {dataset_ref} AS dataset
-          CROSS JOIN LATERAL (
-               SELECT CASE
-                          WHEN jsonb_typeof(
-                                   dataset.publication_metadata_json::jsonb
-                               ) = 'object'
-                          THEN dataset.publication_metadata_json::jsonb
-                          ELSE '{{}}'::jsonb
-                      END AS full_metadata_jsonb
-          ) AS publication
+          {publication_lateral}
          WHERE {endpoint_scope}(
             (
                     dataset.is_current = true
@@ -16418,8 +16456,7 @@ def _artifact_dataset_ranking_cte() -> str:
         ranked_datasets AS MATERIALIZED (
         SELECT dataset_options.dataset_id,
                dataset_options.endpoint_id,
-               dataset_options.import_run_id,
-               dataset_options.acquisition_root_run_id,
+               dataset_options.evidence_run_id,
                dataset_options.previous_dataset_id,
                dataset_options.dataset_hash,
                dataset_options.status,
@@ -16476,10 +16513,7 @@ def _artifact_dataset_projection_sql() -> str:
                selected.reconcile_source_alias_on_cutover,
                selected.source_record_json,
                dataset.dataset_id,
-               COALESCE(
-                   dataset.acquisition_root_run_id,
-                   dataset.import_run_id
-               ) AS evidence_run_id,
+               dataset.evidence_run_id,
                dataset.selected_resources,
                dataset.recorded_expected_resources,
                dataset.status,
