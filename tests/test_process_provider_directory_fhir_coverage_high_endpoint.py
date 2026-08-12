@@ -12,6 +12,10 @@ from tests.provider_directory_fhir_coverage_high_support import (
     importer,
     pagination_checkpoint_context,
 )
+from tests.test_provider_directory_dataset_selection_receipt_db import (
+    _large_metadata_with_normalized_receipt,
+    _receipt_candidate_and_proof,
+)
 
 
 V2_HASH_CONTRACT = importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
@@ -327,6 +331,119 @@ async def test_dataset_content_and_twin_admission_guards(monkeypatch):
             endpoint_dataset_candidate(),
             "baseline-1",
             {},
+        )
+
+
+@pytest.mark.asyncio
+async def test_dataset_storage_rejects_invalid_admission_seal():
+    connection = SimpleNamespace(status=AsyncMock(return_value="UPDATE 0"))
+    metadata_by_field = {
+        importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: []
+    }
+    with pytest.raises(RuntimeError, match="admission_seal_invalid"):
+        await importer._store_validated_endpoint_dataset(
+            connection,
+            endpoint_dataset_candidate(),
+            None,
+            "e" * 64,
+            1,
+            metadata_by_field,
+        )
+    with pytest.raises(RuntimeError, match="admission_seal_invalid"):
+        await importer._store_baseline_payload_retirement(
+            connection,
+            endpoint_dataset_candidate(),
+            "baseline-1",
+            metadata_by_field,
+        )
+
+
+@pytest.mark.asyncio
+async def test_normalized_receipt_selection_uses_compact_seal_fields():
+    candidate, content_proof = _receipt_candidate_and_proof()
+    metadata = _large_metadata_with_normalized_receipt()
+    proof = content_proof.proof_metadata
+    assert isinstance(proof, dict)
+    dataset_by_field = {
+        "dataset_hash": content_proof.dataset_hash,
+        "resource_count": content_proof.resource_count,
+        "content_proof_resources": ["Location"],
+        "content_proof_contract_id": proof["contract_id"],
+        "content_proof_sha256": proof["proof_sha256"],
+        "normalized_receipt_present": True,
+    }
+
+    assert importer._artifact_normalized_receipt_resources(
+        dataset_by_field,
+        source_id=candidate.source_ids[0],
+        endpoint_id=candidate.endpoint_id,
+        dataset_id=candidate.dataset_id,
+        evidence_run_id=candidate.acquisition_root_run_id,
+        selected_resources=candidate.selected_resources,
+        publication_metadata=metadata,
+    ) == ("Location",)
+    assert len(
+        importer._artifact_publication_metadata_hash_from_row(
+            dataset_by_field,
+            metadata,
+        )
+    ) == 64
+
+    base_cte = importer._artifact_fence_dataset_base_cte(
+        "dataset_table",
+        scope_sql="true",
+        current_ids_sql="",
+        lock_sql="FOR UPDATE",
+    )
+    detail_ctes = importer._artifact_fence_dataset_detail_ctes()
+    legacy_sql = importer._artifact_legacy_dataset_projection_sql()
+    assert "selected_metadata_jsonb" in base_cte
+    assert "normalized_receipts" in detail_ctes
+    assert "dataset_ids" in legacy_sql
+
+    connection = SimpleNamespace(status=AsyncMock(return_value="UPDATE 1"))
+    await importer._store_baseline_payload_retirement(
+        connection,
+        candidate,
+        "baseline-1",
+        metadata,
+    )
+    assert connection.status.await_args.kwargs[
+        "content_proof_admission_kind"
+    ] == "generic"
+
+
+@pytest.mark.asyncio
+async def test_profile_delta_metrics_bind_serving_totals(monkeypatch):
+    build = SimpleNamespace(
+        schema="mrf",
+        affected_npi_stage="affected_npi",
+        serving_state=SimpleNamespace(evidence_rows=10, profile_rows=20),
+        source_ids=("source_primary",),
+        removed_source_ids=("source_retired",),
+    )
+    monkeypatch.setattr(
+        importer.db,
+        "scalar",
+        AsyncMock(side_effect=[2, 1, 3]),
+    )
+    metrics_by_field = {"evidence_rows": 4, "profile_rows": 5}
+
+    await importer._attach_profile_delta_metrics(build, metrics_by_field)
+
+    assert metrics_by_field == {
+        "evidence_rows": 12,
+        "selected_evidence_rows": 12,
+        "profile_rows": 24,
+        "evidence_inserted": 4,
+        "evidence_deleted": 2,
+        "profile_inserted": 5,
+        "profile_deleted": 1,
+        "affected_npi_rows": 3,
+    }
+    with pytest.raises(RuntimeError, match="delta_identity_missing"):
+        importer._profile_delta_metric_refs(
+            SimpleNamespace(affected_npi_stage=None)
         )
 
 
