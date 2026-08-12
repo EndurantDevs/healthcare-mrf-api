@@ -269,6 +269,27 @@ async def test_full_selection_rejects_multiple_validated_candidates(monkeypatch)
                 should_select_validated_candidates=True,
             )
 
+@pytest.mark.asyncio
+async def test_explicit_selection_rejects_same_endpoint_unrelated_candidate(
+    monkeypatch,
+):
+    async with _dataset_database(monkeypatch) as (database, schema):
+        await _insert_validated_shared_dataset(database, schema, seal=False)
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset "
+            "SET publication_metadata_json = CAST(jsonb_set("
+            "publication_metadata_json::jsonb, '{source_ids}', "
+            "'[\"source_sibling\"]'::jsonb) AS json) "
+            "WHERE dataset_id = 'dataset_candidate';"
+        )
+
+        fence = await importer._resolve_provider_directory_artifact_datasets(
+            ["source_primary"],
+            should_select_validated_candidates=True,
+        )
+        assert fence.dataset_id_by_endpoint_id == {"endpoint_shared": "dataset_shared"}
+        assert fence.promotion_datasets == []
+
 
 @pytest.mark.asyncio
 async def test_candidate_fence_rejects_root_change(monkeypatch):

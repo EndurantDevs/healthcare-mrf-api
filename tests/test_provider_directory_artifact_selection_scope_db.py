@@ -64,6 +64,7 @@ async def _insert_endpoint_scope_probe_rows(database, schema: str) -> None:
         dataset_hash=DATASET_HASH,
         published=importer.ENDPOINT_DATASET_PUBLISHED,
     )
+    await _insert_unrelated_validated_rows(database, schema)
     await database.status(
         f"""
         INSERT INTO {schema}.provider_directory_endpoint_dataset (
@@ -82,6 +83,29 @@ async def _insert_endpoint_scope_probe_rows(database, schema: str) -> None:
     )
     await database.status(
         f"ANALYZE {schema}.provider_directory_endpoint_dataset;"
+    )
+
+
+async def _insert_unrelated_validated_rows(database, schema: str) -> None:
+    """Add validated rows that must stay outside explicit endpoint scans."""
+
+    await database.status(
+        f"""
+        INSERT INTO {schema}.provider_directory_endpoint_dataset (
+            dataset_id, endpoint_id, status, is_current,
+            publication_metadata_json
+        )
+        SELECT 'unrelated-validated-' || sequence_id,
+               'unrelated-validated-' || sequence_id,
+               :validated, false,
+               jsonb_build_object(
+                   'source_ids',
+                   jsonb_build_array('unrelated-validated-' || sequence_id),
+                   'synthetic_padding', repeat('x', 8192)
+               )
+          FROM generate_series(1, 2000) AS sequence_id;
+        """,
+        validated=importer.ENDPOINT_DATASET_VALIDATED,
     )
 
 

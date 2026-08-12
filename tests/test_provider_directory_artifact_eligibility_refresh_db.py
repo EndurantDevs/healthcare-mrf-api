@@ -12,6 +12,34 @@ from tests import test_provider_directory_artifact_eligibility_db as eligibility
 importer = eligibility.importer
 
 
+async def _make_matched_anchor_legacy_proof_oversized(
+    database,
+    schema: str,
+) -> None:
+    await database.status(
+        f"""
+        UPDATE {schema}.provider_directory_endpoint_dataset
+           SET publication_metadata_json = jsonb_set(
+                   publication_metadata_json,
+                   '{{{importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}}}',
+                   jsonb_build_object(
+                       'shards', (
+                           SELECT jsonb_agg(sequence_id)
+                             FROM generate_series(1, 1025) AS sequence_id
+                       )
+                   )
+               ),
+               publication_metadata_summary_json = NULL,
+               publication_metadata_sha256 = NULL,
+               content_proof_admission_version = NULL,
+               content_proof_admission_kind = NULL,
+               content_proof_admission_sha256 = NULL,
+               content_proof_resource_types = NULL
+         WHERE dataset_id = 'dataset_exact_matched';
+        """
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("alias_endpoint_id", "alias_metadata"),
@@ -54,13 +82,10 @@ async def test_verified_gate_rejects_unproven_configured_or_serving_alias(
 
 
 @pytest.mark.asyncio
-async def test_verified_gate_allows_ordinary_refresh_with_matched_anchor(
-    monkeypatch,
-):
-    async with eligibility._candidate_database(monkeypatch) as (
-        database,
-        schema,
-    ):
+async def test_verified_gate_allows_ordinary_refresh_with_matched_anchor(monkeypatch):
+    """Bound the related anchor before admitting an ordinary refresh."""
+
+    async with eligibility._candidate_database(monkeypatch) as (database, schema):
         verified_metadata = eligibility._source_metadata(
             status=importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
         )
@@ -100,6 +125,10 @@ async def test_verified_gate_allows_ordinary_refresh_with_matched_anchor(
             "dataset_current",
             "dataset_ordinary_refresh",
         ]
+        await _make_matched_anchor_legacy_proof_oversized(database, schema)
+        assert eligibility._option_ids(
+            await eligibility._artifact_options(database, schema)
+        ) == ["dataset_current"]
         await eligibility._set_source_metadata(
             database,
             schema,

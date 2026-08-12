@@ -13215,6 +13215,8 @@ class _EndpointDatasetPromotionHarness:
     async def all(self, _sql, **params):
         if "provider_directory_bulk_acquisition_checkpoint" in _sql:
             return []
+        if "provider_directory_source" in _sql:
+            return [{"source_id": source_id} for source_id in params["source_ids"]]
         if "provider_directory_dataset_proof_shard" in _sql:
             return [
                 row

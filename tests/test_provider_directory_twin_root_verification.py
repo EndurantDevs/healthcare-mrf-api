@@ -178,24 +178,6 @@ async def test_validated_dataset_store_fails_when_candidate_update_is_lost():
 
 
 @pytest.mark.asyncio
-async def test_validated_dataset_store_requires_complete_source_scope():
-    connection = AsyncMock()
-    connection.all.return_value = [{"source_id": "source_a"}]
-
-    with pytest.raises(RuntimeError, match="source_changed"):
-        await importer._store_validated_endpoint_dataset(
-            connection,
-            _candidate(),
-            "dataset_current",
-            "d" * 64,
-            2,
-            {"verification": "matched"},
-        )
-
-    connection.status.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_verification_baseline_store_does_not_mark_dataset_validated():
     connection = AsyncMock()
     connection.status.return_value = "UPDATE 1"

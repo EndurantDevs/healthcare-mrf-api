@@ -1063,6 +1063,7 @@ jobs:
           tests/test_provider_directory_twin_root_storage_db.py
           tests/test_provider_directory_artifact_eligibility_db.py
           tests/test_provider_directory_artifact_eligibility_contracts_db.py
+          tests/test_provider_directory_artifact_single_root_eligibility_db.py
           tests/test_provider_directory_artifact_eligibility_refresh_db.py
           tests/test_provider_directory_artifact_proof_scope_db.py
           tests/test_provider_directory_artifact_scope_bulk_load_db.py
