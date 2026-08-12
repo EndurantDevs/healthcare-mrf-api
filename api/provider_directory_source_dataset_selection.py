@@ -78,6 +78,7 @@ def _source_scope_dataset_statement(
             dataset_model.endpoint_id.label("endpoint_id"),
             dataset_model.dataset_id.label("dataset_id"),
             dataset_model.acquisition_root_run_id.label("acquisition_root_run_id"),
+            dataset_model.previous_dataset_id.label("previous_dataset_id"),
             dataset_model.dataset_hash.label("dataset_hash"),
             dataset_model.status.label("status"),
             dataset_model.is_current.label("is_current"),
