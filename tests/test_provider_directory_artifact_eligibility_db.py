@@ -60,10 +60,24 @@ async def _create_tables(database: Database, schema: str) -> None:
             resource_count bigint NOT NULL DEFAULT 0,
             superseded_at timestamp,
             publication_metadata_json jsonb,
+            publication_metadata_summary_json jsonb,
+            publication_metadata_sha256 varchar(64),
+            content_proof_admission_version smallint,
+            content_proof_admission_kind varchar(32),
+            content_proof_admission_sha256 varchar(64),
+            content_proof_resource_types varchar(64)[],
             completion_proof_required_version integer,
             completion_proof_json jsonb,
             completion_proof_sha256 varchar(64)
         );
+        """
+    )
+    await database.status(
+        f"""
+        CREATE FUNCTION {schema}.provider_directory_endpoint_dataset_admission_metadata_sha256(
+            jsonb, smallint, text, text, varchar[]
+        ) RETURNS varchar LANGUAGE sql IMMUTABLE AS
+            'SELECT repeat(''0'', 64)::varchar';
         """
     )
     await database.status(

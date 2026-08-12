@@ -30,6 +30,12 @@ GUARD_MIGRATION_PATH = (
     / "versions"
     / "20260807100000_provider_directory_endpoint_dataset_guard.py"
 )
+ADMISSION_SEAL_MIGRATION_PATH = (
+    ROOT
+    / "alembic"
+    / "versions"
+    / "20260812010000_provider_directory_endpoint_dataset_admission_seal.py"
+)
 POSTGRES_DSN_ENV = "HLTHPRT_TIN_NPI_CONNECTOR_POSTGRES_DSN"
 TEST_DATABASE_PATTERN = re.compile(r"(?:^|[_-])test(?:[_-]|$)", re.IGNORECASE)
 ORGANIZATION_ROWS = (
@@ -63,6 +69,17 @@ def load_guard_migration():
     module_spec = importlib.util.spec_from_file_location(
         "provider_directory_endpoint_dataset_guard_postgres_migration",
         GUARD_MIGRATION_PATH,
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    migration = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(migration)
+    return migration
+
+
+def load_admission_seal_migration():
+    module_spec = importlib.util.spec_from_file_location(
+        "provider_directory_endpoint_dataset_admission_seal_postgres_migration",
+        ADMISSION_SEAL_MIGRATION_PATH,
     )
     assert module_spec is not None and module_spec.loader is not None
     migration = importlib.util.module_from_spec(module_spec)

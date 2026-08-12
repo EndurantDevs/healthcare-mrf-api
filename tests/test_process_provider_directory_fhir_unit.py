@@ -10955,7 +10955,9 @@ async def test_artifact_dataset_selection_scopes_explicit_and_filters_all_source
     assert "ranked_datasets AS MATERIALIZED" in all_sql
     assert "validated_candidate_count" in all_sql
     assert "dataset.superseded_at IS NULL" in all_sql
-    assert "publication_metadata_json::jsonb -> 'source_ids'" in all_sql
+    assert "publication_metadata_summary_json" in all_sql
+    assert "content_proof_admission_version" in all_sql
+    assert "octet_length(" in all_sql
 
 
 def test_explicit_artifact_selection_sql_scopes_dataset_reads():
@@ -11009,6 +11011,10 @@ def test_artifact_dataset_selection_projects_only_bounded_dataset_fields():
     """Keep raw publication proofs on the database side of the resolver."""
 
     sql = importer._provider_directory_artifact_dataset_selection_sql(None)
+    candidate_sql = importer._provider_directory_artifact_dataset_selection_sql(
+        None,
+        should_select_validated_candidates=True,
+    )
     projection_sql = importer._artifact_dataset_projection_sql()
 
     assert "SELECT dataset.*" not in sql
@@ -11024,6 +11030,7 @@ def test_artifact_dataset_selection_projects_only_bounded_dataset_fields():
     assert "dataset.evidence_run_id" in projection_sql
     assert "dataset.publication_metadata_json" not in projection_sql
     assert "dataset.completion_proof_json" not in projection_sql
+    assert len(candidate_sql) < 500_000
 
 
 @pytest.mark.asyncio

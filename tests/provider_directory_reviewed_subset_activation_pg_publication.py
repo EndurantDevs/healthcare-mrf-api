@@ -30,6 +30,9 @@ from tests.provider_directory_reviewed_root_policy_pg import (
     _load_policy_migration,
     _run_upgrade_with_context,
 )
+from tests.tin_npi_connector_postgres_support import (
+    load_admission_seal_migration,
+)
 from tests.provider_directory_subset_completion_pg_setup import (
     load_abandonment_migration,
     load_payload_guard_repair_migration,
@@ -78,6 +81,7 @@ async def _publication_scenario(monkeypatch, *, require_eligibility: bool):
                 load_abandonment_migration(),
                 _load_effective_endpoint_migration(),
                 _load_policy_migration(),
+                load_admission_seal_migration(),
             ):
                 await _run_upgrade_with_context(scenario, successor)
         activation_database = _runtime_database()

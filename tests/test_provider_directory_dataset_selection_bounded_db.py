@@ -12,8 +12,14 @@ import pytest
 from api.provider_directory_source_catalog_outcomes import (
     _canonical_validated_datasets_by_source_id,
 )
+from process.provider_directory_admission_seal import (
+    admission_seal_from_validated_metadata,
+)
 from process.provider_directory_fhir_subset_canonical import (
     canonical_payload_sha256,
+)
+from process.uhc_canonical_proof import (
+    UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY,
 )
 from tests.test_provider_directory_dataset_artifact_db import (
     _dataset_database,
@@ -52,11 +58,16 @@ def _proof_line_hash(value_list: list[dict[str, object]]) -> str:
 
 def _large_semantic_shard_list(
     source_id_list: list[str],
+    shard_count: int = 512,
+    *,
+    dataset_id: str = "dataset_shared",
+    endpoint_id: str = "endpoint_shared",
+    root_run_id: str = "root-shared",
 ) -> list[dict[str, object]]:
     """Return many valid synthetic shard descriptors."""
 
     shard_list: list[dict[str, object]] = []
-    for shard_index in range(512):
+    for shard_index in range(shard_count):
         input_hash = hashlib.sha256(f"input-{shard_index}".encode()).hexdigest()
         identity_part_list = [
             "Location",
@@ -67,16 +78,16 @@ def _large_semantic_shard_list(
             {
                 "shard_id": importer._identity_hash(
                     [
-                        "dataset_shared",
-                        "endpoint_shared",
-                        "root-shared",
+                        dataset_id,
+                        endpoint_id,
+                        root_run_id,
                         source_id_list,
                         input_hash,
                     ]
                 ),
-                "dataset_id": "dataset_shared",
-                "endpoint_id": "endpoint_shared",
-                "acquisition_root_run_id": "root-shared",
+                "dataset_id": dataset_id,
+                "endpoint_id": endpoint_id,
+                "acquisition_root_run_id": root_run_id,
                 "source_ids": source_id_list,
                 "resource_count": 1,
                 "resource_counts": {"Location": 1},
@@ -93,19 +104,32 @@ def _large_semantic_shard_list(
     return shard_list
 
 
-def _large_semantic_proof_by_field() -> dict[str, object]:
+def _large_semantic_proof_by_field(
+    shard_count: int = 512,
+    *,
+    dataset_id: str = "dataset_shared",
+    endpoint_id: str = "endpoint_shared",
+    root_run_id: str = "root-shared",
+    source_id_list: list[str] | None = None,
+) -> dict[str, object]:
     """Return a valid semantic proof with a large discarded shard array."""
 
-    source_id_list = ["source_primary", "source_sibling"]
-    shard_list = _large_semantic_shard_list(source_id_list)
+    source_id_list = source_id_list or ["source_primary", "source_sibling"]
+    shard_list = _large_semantic_shard_list(
+        source_id_list,
+        shard_count,
+        dataset_id=dataset_id,
+        endpoint_id=endpoint_id,
+        root_run_id=root_run_id,
+    )
     proof_by_field: dict[str, object] = {
         "contract_id": (
             importer.PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID
         ),
         "complete": True,
-        "dataset_id": "dataset_shared",
-        "endpoint_id": "endpoint_shared",
-        "acquisition_root_run_id": "root-shared",
+        "dataset_id": dataset_id,
+        "endpoint_id": endpoint_id,
+        "acquisition_root_run_id": root_run_id,
         "source_ids": source_id_list,
         "selected_resources": ["Location"],
         "proof_resource_scope": ["Location"],
@@ -138,18 +162,25 @@ def _large_semantic_proof_by_field() -> dict[str, object]:
     return proof_by_field
 
 
-def _large_metadata_by_field() -> dict[str, object]:
+def _large_metadata_by_field(
+    shard_count: int = 512,
+    **proof_identity: object,
+) -> dict[str, object]:
     """Return metadata containing one valid large semantic proof."""
 
     return {
-        "source_ids": ["source_primary", "source_sibling"],
+        "source_ids": proof_identity.get("source_id_list")
+        or ["source_primary", "source_sibling"],
         "selected_resources": ["Location"],
         "expected_resources": ["Location"],
         "resource_hash_contract": importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
         "semantic_projection_as_of": "2026-08-09",
         "proof_resource_scope": ["Location"],
         importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: (
-            _large_semantic_proof_by_field()
+            _large_semantic_proof_by_field(
+                shard_count,
+                **proof_identity,
+            )
         ),
     }
 
@@ -364,6 +395,153 @@ async def test_all_source_projection_keeps_large_proof_server_side(monkeypatch):
         ]
         assert max(projected_byte_count_list) < 8_192
         assert sum(projected_byte_count_list) < 16_384
+
+
+@pytest.mark.asyncio
+async def test_sealed_canonical_proof_uses_bounded_receipt_over_legacy_cap(
+    monkeypatch,
+):
+    """Treat a sealed non-generic proof as valid without opening its body."""
+
+    async with _dataset_database(monkeypatch) as (database, schema):
+        metadata_by_field = {
+            "source_ids": ["source_primary", "source_sibling"],
+            "selected_resources": ["Location"],
+            "expected_resources": ["Location"],
+            UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY: {
+                "proof_sha256": "a" * 64,
+                "resource_counts": {"Location": 1},
+                "synthetic_large_body": "x" * 1_100_000,
+            },
+        }
+        receipt = admission_seal_from_validated_metadata(metadata_by_field)
+        assert receipt is not None
+        assert receipt.admission_kind == "uhc_canonical"
+        assert len(json.dumps(metadata_by_field).encode()) > 1024 * 1024
+        await database.status(
+            f"""
+            UPDATE {schema}.provider_directory_endpoint_dataset
+               SET publication_metadata_json = CAST(:metadata AS json),
+                   publication_metadata_summary_json = CAST(:summary AS jsonb),
+                   publication_metadata_sha256 = :metadata_sha256,
+                   content_proof_admission_version = :admission_version,
+                   content_proof_admission_kind = :admission_kind,
+                   content_proof_admission_sha256 = :proof_sha256,
+                   content_proof_resource_types = CAST(:resource_types AS varchar[])
+             WHERE dataset_id = 'dataset_shared';
+            """,
+            metadata=json.dumps(metadata_by_field),
+            summary=json.dumps(receipt.metadata_summary),
+            metadata_sha256=receipt.metadata_sha256,
+            admission_version=receipt.admission_version,
+            admission_kind=receipt.admission_kind,
+            proof_sha256=receipt.proof_sha256,
+            resource_types=list(receipt.resource_types),
+        )
+        await database.status(
+            f"""
+            CREATE FUNCTION {schema}.fail_if_metadata_is_opened()
+            RETURNS jsonb LANGUAGE plpgsql VOLATILE AS $function$
+            BEGIN
+                RAISE EXCEPTION 'sealed metadata was opened';
+            END
+            $function$;
+            """
+        )
+        legacy_bounded_sql = importer._artifact_legacy_metadata_is_bounded_sql(
+            f"{schema}.fail_if_metadata_is_opened()",
+            "dataset",
+        )
+        assert await database.scalar(
+            f"""
+            SELECT ({legacy_bounded_sql})
+              FROM {schema}.provider_directory_endpoint_dataset AS dataset
+             WHERE dataset_id = 'dataset_shared';
+            """
+        ) is False
+
+        projected_row_list = await _all_source_projected_rows(database)
+
+        assert len(projected_row_list) == 2
+        assert all(
+            projected_row["publication_metadata_hash"]
+            == receipt.metadata_sha256
+            for projected_row in projected_row_list
+        )
+        assert all(
+            UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY
+            not in projected_row["publication_metadata_json"]
+            for projected_row in projected_row_list
+        )
+        assert all(
+            projected_row["content_proof_present"] is False
+            and projected_row["content_proof_valid"] is True
+            and projected_row["content_proof_resources"] is None
+            for projected_row in projected_row_list
+        )
+
+
+@pytest.mark.asyncio
+async def test_final_publish_uses_sealed_summary_over_legacy_cap(monkeypatch):
+    """Publish a sealed generic candidate without reopening its shard array."""
+
+    async with _dataset_database(monkeypatch) as (database, schema):
+        await _insert_validated_shared_dataset(database, schema)
+        metadata_by_field = _large_metadata_by_field(
+            2_048,
+            dataset_id="dataset_candidate",
+            endpoint_id="endpoint_shared",
+            root_run_id="root-candidate",
+        )
+        serialized_metadata = json.dumps(metadata_by_field)
+        assert len(serialized_metadata.encode()) > 1024 * 1024
+        receipt = admission_seal_from_validated_metadata(metadata_by_field)
+        assert receipt is not None
+        await database.status(
+            f"""
+            UPDATE {schema}.provider_directory_endpoint_dataset
+               SET publication_metadata_json = CAST(:metadata AS json),
+                   publication_metadata_summary_json = CAST(:summary AS jsonb),
+                   publication_metadata_sha256 = :metadata_sha256,
+                   content_proof_admission_version = :admission_version,
+                   content_proof_admission_kind = :admission_kind,
+                   content_proof_admission_sha256 = :proof_sha256,
+                   content_proof_resource_types = CAST(:resource_types AS varchar[]),
+                   dataset_hash = :dataset_hash,
+                   resource_count = :resource_count
+             WHERE dataset_id = 'dataset_candidate';
+            """,
+            metadata=serialized_metadata,
+            summary=json.dumps(receipt.metadata_summary),
+            metadata_sha256=receipt.metadata_sha256,
+            admission_version=receipt.admission_version,
+            admission_kind=receipt.admission_kind,
+            proof_sha256=receipt.proof_sha256,
+            resource_types=list(receipt.resource_types),
+            dataset_hash="e" * 64,
+            resource_count=2_048,
+        )
+        candidate = importer.ProviderDirectoryArtifactDataset(
+            source_id="source_primary",
+            endpoint_id="endpoint_shared",
+            serving_endpoint_id="endpoint_shared",
+            dataset_id="dataset_candidate",
+            evidence_run_id="root-candidate",
+            expected_incumbent_dataset_id="dataset_shared",
+            status=importer.ENDPOINT_DATASET_VALIDATED,
+            is_current=False,
+            dataset_hash="e" * 64,
+            resource_count=2_048,
+            promote_on_cutover=True,
+        )
+
+        await importer._publish_validated_artifact_dataset(candidate)
+
+        published_status = await database.scalar(
+            f"SELECT status FROM {schema}.provider_directory_endpoint_dataset "
+            "WHERE dataset_id = 'dataset_candidate';"
+        )
+        assert published_status == importer.ENDPOINT_DATASET_PUBLISHED
 
 
 @pytest.mark.asyncio
