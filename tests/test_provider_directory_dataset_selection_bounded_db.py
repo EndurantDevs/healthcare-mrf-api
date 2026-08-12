@@ -9,6 +9,10 @@ import json
 
 import pytest
 
+from api import provider_directory_source_outcomes as source_outcomes
+from tests.test_provider_directory_source_local_outcomes import (
+    _outcome_selection_schema,
+)
 from api.provider_directory_source_catalog_outcomes import (
     _canonical_validated_datasets_by_source_id,
 )
@@ -407,3 +411,70 @@ async def test_all_source_projection_keeps_large_proof_server_side(monkeypatch):
         ]
         assert max(projected_byte_count_list) < 8_192
         assert sum(projected_byte_count_list) < 16_384
+
+
+async def _catalog_candidate_rows(database, statement):
+    return (await database.execute(statement)).mappings().all()
+
+
+@pytest.mark.asyncio
+async def test_catalog_selector_uses_only_digest_valid_summary(monkeypatch):
+    """Reject raw, receipt, and tampered metadata before ranking it."""
+
+    async with _outcome_selection_schema(monkeypatch) as (database, schema):
+        statement = source_outcomes._current_published_dataset_statement(
+            {("source-validated",)}
+        ).execution_options(schema_translate_map={"mrf": schema})
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
+            "publication_metadata_summary_json = NULL, "
+            "publication_metadata_sha256 = NULL, "
+            "content_proof_admission_version = NULL, "
+            "content_proof_admission_kind = NULL, "
+            "content_proof_admission_sha256 = NULL, "
+            "content_proof_resource_types = NULL, "
+            "artifact_selection_receipt_json = jsonb_build_object("
+            "'source_ids', jsonb_build_array('source-validated')), "
+            "publication_metadata_json = jsonb_build_object("
+            "'source_ids', jsonb_build_array('source-validated'), "
+            "'raw_proof', repeat('x', 2 * 1024 * 1024)) "
+            "WHERE dataset_id = 'validated-candidate';"
+        )
+        raw_rows = await _catalog_candidate_rows(database, statement)
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
+            "publication_metadata_summary_json = jsonb_build_object("
+            "'source_ids', jsonb_build_array('source-validated'), "
+            "'selected_resources', jsonb_build_array('Practitioner')), "
+            "publication_metadata_sha256 = repeat('a', 64), "
+            "content_proof_admission_version = 1, "
+            "content_proof_admission_kind = 'generic', "
+            "content_proof_admission_sha256 = repeat('b', 64), "
+            "content_proof_resource_types = ARRAY['Practitioner'] "
+            "WHERE dataset_id = 'validated-candidate';"
+        )
+        tampered_rows = await _catalog_candidate_rows(database, statement)
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
+            "publication_metadata_sha256 = "
+            f'"{schema}".'
+            "provider_directory_endpoint_dataset_admission_metadata_sha256("
+            "publication_metadata_summary_json, "
+            "content_proof_admission_version, content_proof_admission_kind, "
+            "content_proof_admission_sha256, content_proof_resource_types) "
+            "WHERE dataset_id = 'validated-candidate';"
+        )
+        sealed_rows = await _catalog_candidate_rows(database, statement)
+
+    assert [dataset_row["dataset_id"] for dataset_row in raw_rows] == [
+        "validated-incumbent"
+    ]
+    assert [dataset_row["dataset_id"] for dataset_row in tampered_rows] == [
+        "validated-incumbent"
+    ]
+    assert [dataset_row["dataset_id"] for dataset_row in sealed_rows] == [
+        "validated-candidate"
+    ]
+    assert sealed_rows[0]["publication_metadata"]["source_ids"] == [
+        "source-validated"
+    ]
