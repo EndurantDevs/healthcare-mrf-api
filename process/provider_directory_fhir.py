@@ -60386,7 +60386,7 @@ def _is_reviewed_partition_generation_exact(
     }
     if (
         expected_metadata.get("provider_directory_candidate_status")
-        != PROVIDER_DIRECTORY_TWIN_ROOT_PENDING
+        != PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
         or expected_metadata.get(LAST_UPDATED_PARTITION_METADATA_KEY)
         != expected_partition_by_field
         or any(
