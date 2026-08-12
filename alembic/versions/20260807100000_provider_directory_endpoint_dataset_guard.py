@@ -35,6 +35,12 @@ ENDPOINT_DATASET_FORWARD_COMPATIBLE_COLUMNS = (
     "completion_proof_required_version",
     "completion_proof_json",
     "completion_proof_sha256",
+    "publication_metadata_summary_json",
+    "publication_metadata_sha256",
+    "content_proof_admission_version",
+    "content_proof_admission_kind",
+    "content_proof_admission_sha256",
+    "content_proof_resource_types",
 )
 
 

@@ -10,7 +10,9 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from db.connection import Database
-from tests import provider_directory_subset_completion_pg_setup as subset_setup
+from tests.provider_directory_dataset_serving_relations_pg_setup import (
+    create_serving_relation_tables,
+)
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -25,65 +27,6 @@ async def _require_disposable_postgres(database: Database) -> None:
     if "test" not in database_name.lower():
         pytest.skip("dataset serving relation tests need a test database")
 
-
-async def _create_tables(database: Database, schema: str) -> None:
-    await database.status(f"CREATE TABLE {schema}.provider_directory_source (source_id varchar(64) PRIMARY KEY, org_name varchar(256) NOT NULL, endpoint_id varchar(64), canonical_api_base text, metadata_json jsonb);")
-    await database.status(
-        f"CREATE TABLE {schema}.provider_directory_endpoint_dataset ("
-        "dataset_id varchar(96) PRIMARY KEY, "
-        "endpoint_id varchar(64) NOT NULL, "
-        "acquisition_root_run_id varchar(64), "
-        "import_run_id varchar(64) NOT NULL, "
-        "previous_dataset_id varchar(96), "
-        "dataset_hash varchar(64), "
-        "resource_count bigint, "
-        "status varchar(32) NOT NULL DEFAULT 'published', "
-        "is_current boolean NOT NULL DEFAULT true, "
-        "superseded_at timestamptz, "
-        "publication_metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb, "
-        "completion_proof_required_version integer, "
-        "completion_proof_json jsonb, "
-        "completion_proof_sha256 varchar(64)"
-        ");"
-    )
-    await subset_setup.install_subset_canonical_functions(database, schema)
-    await database.status(
-        f"CREATE TABLE {schema}.provider_directory_dataset_resource ("
-        "dataset_id varchar(96) NOT NULL, "
-        "resource_type varchar(64) NOT NULL, "
-        "resource_id varchar(256) NOT NULL, "
-        "payload_hash varchar(64) NOT NULL, "
-        "payload_json jsonb NOT NULL, "
-        "acquired_resource_sha256 varchar(64), "
-        "PRIMARY KEY (dataset_id, resource_type, resource_id)"
-        ");"
-    )
-    await database.status(
-        f"CREATE TABLE {schema}.provider_directory_dataset_insurance_plan ("
-        "dataset_id varchar(96) NOT NULL, "
-        "resource_id varchar(256) NOT NULL, "
-        "payload_hash varchar(64) NOT NULL, "
-        "payload_json jsonb NOT NULL, "
-        "PRIMARY KEY (dataset_id, resource_id)"
-        ");"
-    )
-    await database.status(
-        f"CREATE TABLE {schema}.provider_directory_dataset_network_plan ("
-        "dataset_id varchar(96) NOT NULL, "
-        "network_resource_id varchar(256) NOT NULL, "
-        "insurance_plan_resource_id varchar(256) NOT NULL, "
-        "PRIMARY KEY (dataset_id, network_resource_id, insurance_plan_resource_id)"
-        ");"
-    )
-    await database.status(
-        f"CREATE TABLE {schema}.provider_directory_dataset_affiliation_organization ("
-        "dataset_id varchar(96) NOT NULL, "
-        "participating_organization_resource_id varchar(256) NOT NULL, "
-        "affiliation_resource_id varchar(256) NOT NULL, "
-        "PRIMARY KEY (dataset_id, participating_organization_resource_id, "
-        "affiliation_resource_id)"
-        ");"
-    )
 
 async def _insert_resource(
     database: Database,
@@ -229,7 +172,7 @@ async def _dataset_database(monkeypatch):
         await _require_disposable_postgres(database)
         await database.status(f"CREATE SCHEMA {schema};")
         is_schema_created = True
-        await _create_tables(database, schema)
+        await create_serving_relation_tables(database, schema)
         await _insert_fixtures(database, schema)
         yield database, schema
     except Exception:

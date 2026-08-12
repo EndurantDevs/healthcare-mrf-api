@@ -11,6 +11,9 @@ import pytest
 from api.provider_directory_source_catalog_outcomes import (
     _canonical_validated_datasets_by_source_id,
 )
+from process.provider_directory_admission_seal import (
+    backfill_provider_directory_admission_seal,
+)
 from tests.test_provider_directory_dataset_artifact_db import (
     _dataset_database,
     _insert_validated_shared_dataset,
@@ -166,6 +169,10 @@ async def _install_receipt_candidate(database, schema: str) -> None:
         _large_metadata_with_normalized_receipt(),
         dataset_id="dataset_candidate",
     )
+    await backfill_provider_directory_admission_seal(
+        "dataset_candidate",
+        database=database,
+    )
 
 
 async def _install_current_receipt(database, schema: str) -> None:
@@ -209,6 +216,10 @@ async def _install_current_receipt(database, schema: str) -> None:
             {},
             {importer.SOURCE_SUMMARY_METADATA_KEY: summary},
         ),
+    )
+    await backfill_provider_directory_admission_seal(
+        "dataset_shared",
+        database=database,
     )
 
 
@@ -323,7 +334,7 @@ async def test_normalized_receipt_bounds_selected_large_current(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_normalized_receipt_rejects_resource_outside_proof_scope(
+async def test_sealed_selection_ignores_untrusted_receipt_resources(
     monkeypatch,
 ):
     async with _dataset_database(monkeypatch) as (database, schema):
@@ -334,39 +345,40 @@ async def test_normalized_receipt_rejects_resource_outside_proof_scope(
             _out_of_scope_receipt_metadata(),
             dataset_id="dataset_candidate",
         )
+        await backfill_provider_directory_admission_seal(
+            "dataset_candidate",
+            database=database,
+        )
 
-        with pytest.raises(importer.ProviderDirectoryArtifactBuildStale):
-            await importer._resolve_provider_directory_artifact_datasets(
-                ["source_primary"],
-                should_select_validated_candidates=True,
-            )
+        fence = await importer._resolve_provider_directory_artifact_datasets(
+            ["source_primary"],
+            should_select_validated_candidates=True,
+        )
+
+        assert fence.datasets[0].artifact_resources == ("Location",)
+        assert fence.datasets[0].normalized_receipt_present is False
 
 
 def _receipt_tamper_sql(schema: str, mutation: str) -> str:
-    proof_key = importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
-    path_and_value = {
+    mutation_sql = {
         "summary": (
-            f"{importer.SOURCE_SUMMARY_METADATA_KEY},summary_sha256",
-            "to_jsonb(repeat('0', 64))",
+            "publication_metadata_summary_json = jsonb_set("
+            "publication_metadata_summary_json, "
+            f"'{{{importer.SOURCE_SUMMARY_METADATA_KEY},summary_sha256}}', "
+            "to_jsonb(repeat('0', 64)))"
         ),
         "outcome": (
-            f"{importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY},resource_count",
-            "to_jsonb(999)",
+            "publication_metadata_summary_json = jsonb_set("
+            "publication_metadata_summary_json, "
+            f"'{{{importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY},resource_count}}', "
+            "to_jsonb(999))"
         ),
-        "proof_sha": (
-            f"{proof_key},proof_sha256",
-            f"to_jsonb(' '::text || (publication_metadata_json::jsonb #>> '{{{proof_key},proof_sha256}}'))",
-        ),
-        "proof_contract": (
-            f"{proof_key},contract_id",
-            f"to_jsonb(' '::text || (publication_metadata_json::jsonb #>> '{{{proof_key},contract_id}}'))",
-        ),
+        "proof_sha": "content_proof_admission_sha256 = repeat('0', 64)",
+        "proof_contract": "content_proof_admission_kind = 'tampered'",
     }[mutation]
-    path, value = path_and_value
     return (
         f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
-        "publication_metadata_json = CAST(jsonb_set("
-        f"publication_metadata_json::jsonb, '{{{path}}}', {value}) AS json) "
+        f"{mutation_sql} "
         "WHERE dataset_id = 'dataset_candidate';"
     )
 

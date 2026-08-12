@@ -16,6 +16,9 @@ from db.connection import Database
 from tests.provider_directory_subset_completion_pg_setup import (
     install_subset_canonical_functions,
 )
+from tests.provider_directory_dataset_artifact_pg_support import (
+    insert_validated_shared_dataset as _insert_validated_shared_dataset,
+)
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -63,7 +66,13 @@ async def _create_artifact_tables(database: Database, schema: str) -> None:
         "created_at timestamp, "
         "validated_at timestamp, "
         "published_at timestamp, "
-        "publication_metadata_json json, "
+        "publication_metadata_json jsonb, "
+        "publication_metadata_summary_json jsonb, "
+        "publication_metadata_sha256 varchar(64), "
+        "content_proof_admission_version smallint, "
+        "content_proof_admission_kind varchar(32), "
+        "content_proof_admission_sha256 varchar(64), "
+        "content_proof_resource_types varchar(64)[], "
         "completion_proof_required_version integer, "
         "completion_proof_json jsonb, "
         "completion_proof_sha256 varchar(64)"
@@ -81,6 +90,44 @@ async def _create_artifact_tables(database: Database, schema: str) -> None:
         ");"
     )
     await install_subset_canonical_functions(database, schema)
+    await _install_admission_seal_fixture_contract(database, schema)
+    await _create_artifact_scope_tables(database, schema)
+
+
+async def _install_admission_seal_fixture_contract(
+    database: Database,
+    schema: str,
+) -> None:
+    """Install the current bounded receipt digest in full-schema fixtures."""
+
+    await database.status(
+        f"""
+        CREATE FUNCTION {schema}.provider_directory_endpoint_dataset_admission_metadata_sha256(
+            metadata_summary jsonb,
+            admission_version smallint,
+            admission_kind text,
+            proof_sha256 text,
+            resource_types varchar[]
+        ) RETURNS varchar
+        LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $function$
+            SELECT {schema}.provider_directory_subset_payload_sha256(
+                jsonb_build_object(
+                    'contract', 'provider-directory-admission-seal-v1',
+                    'metadata_summary', metadata_summary,
+                    'admission_version', admission_version,
+                    'admission_kind', admission_kind,
+                    'proof_sha256', proof_sha256,
+                    'resource_types', to_jsonb(resource_types)
+                )
+            )::varchar
+        $function$;
+        """
+    )
+
+
+async def _create_artifact_scope_tables(database: Database, schema: str) -> None:
+    """Install artifact scope tables after the current dataset schema."""
+
     for model in (importer.ProviderDirectorySource, *importer.RESOURCE_MODELS):
         await database.status(
             importer._provider_directory_artifact_scope_table_sql(
@@ -239,67 +286,6 @@ async def _insert_next_shared_dataset(database: Database, schema: str) -> None:
         ":published_status, false, now(), CAST(:metadata AS json));",
         published_status=importer.ENDPOINT_DATASET_PUBLISHED,
         metadata=_dataset_metadata(["Location"]),
-    )
-
-
-async def _insert_validated_shared_dataset(
-    database: Database,
-    schema: str,
-    *,
-    dataset_id: str = "dataset_candidate",
-    root_run_id: str = "root-candidate",
-) -> None:
-    metadata = json.dumps(
-        {
-            "acquisition_root_run_id": root_run_id,
-            "selected_resources": ["Location"],
-            "expected_resources": ["Location"],
-            "source_ids": ["source_primary", "source_sibling"],
-            "resource_diagnostics": {
-                "Location": {
-                    "complete": True,
-                    "bounded": False,
-                    "error": None,
-                    "next_url_remaining": False,
-                }
-            },
-        }
-    )
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_endpoint_dataset ("
-        "dataset_id, endpoint_id, import_run_id, acquisition_root_run_id, "
-        "previous_dataset_id, dataset_hash, status, is_current, "
-        "resource_count, validated_at, publication_metadata_json"
-        ") VALUES ("
-        ":dataset_id, 'endpoint_shared', 'run-candidate', :root_run_id, "
-        "'dataset_shared', :dataset_hash, :validated_status, false, "
-        "1, now(), CAST(:metadata AS json)"
-        ");",
-        dataset_id=dataset_id,
-        root_run_id=root_run_id,
-        dataset_hash="e" * 64,
-        validated_status=importer.ENDPOINT_DATASET_VALIDATED,
-        metadata=metadata,
-    )
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_dataset_resource ("
-        "dataset_id, resource_type, resource_id, payload_hash, payload_json"
-        ") VALUES ("
-        ":dataset_id, 'Location', 'location-candidate', :payload_hash, "
-        "CAST(:payload_json AS json)"
-        ");",
-        dataset_id=dataset_id,
-        payload_hash="f" * 64,
-        payload_json=json.dumps(
-            {
-                "status": "active",
-                "name": "Candidate Clinic",
-                "first_line": "2 Scope Way",
-                "city_name": "Austin",
-                "state_code": "TX",
-                "postal_code": "78702",
-            }
-        ),
     )
 
 

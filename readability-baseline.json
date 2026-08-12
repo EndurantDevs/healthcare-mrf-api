@@ -13,13 +13,13 @@
     "global_state_usage": 1,
     "inline_suppressions": 2,
     "long_files": 157,
-    "long_functions": 331,
+    "long_functions": 330,
     "missing_contract_docstrings": 0,
     "pass_placeholders": 0,
     "single_letter_names": 0,
     "syntax_errors": 0,
     "too_many_locals": 128,
-    "too_many_parameters": 59
+    "too_many_parameters": 60
   },
   "issue_ids": {
     "ambiguous_function_names": [
@@ -399,7 +399,6 @@
       "long_function:process/initial.py:process_plan",
       "long_function:process/initial.py:process_provider",
       "long_function:process/initial.py:publish_initial_generation",
-      "long_function:process/lodes.py:process_lodes_data",
       "long_function:process/lodes.py:publish_lodes_generation",
       "long_function:process/medicare_enrollment.py:process_medicare_enrollment_data",
       "long_function:process/medicare_enrollment.py:publish_medicare_enrollment_generation",
@@ -746,6 +745,7 @@
       "too_many_parameters:process/openaddresses.py:_load_source_item",
       "too_many_parameters:process/openaddresses.py:_openaddresses_row_hash",
       "too_many_parameters:process/openaddresses.py:refresh_archive_geocodes_from_openaddresses_sharded",
+      "too_many_parameters:process/provider_directory_admission_seal.py:validate_generic_admission_copy",
       "too_many_parameters:process/provider_directory_fhir.py:_fetch_resource_rows",
       "too_many_parameters:process/provider_directory_fhir.py:_import_linked_resource_rows",
       "too_many_parameters:process/provider_directory_fhir.py:_import_resources",

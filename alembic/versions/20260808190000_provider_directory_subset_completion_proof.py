@@ -165,6 +165,18 @@ _SUBSET_ENDPOINT_DATASET_COLUMNS = _LEGACY_ENDPOINT_DATASET_COLUMNS + (
     "completion_proof_json",
     "completion_proof_sha256",
 )
+_ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS = (
+    "publication_metadata_summary_json",
+    "publication_metadata_sha256",
+    "content_proof_admission_version",
+    "content_proof_admission_kind",
+    "content_proof_admission_sha256",
+    "content_proof_resource_types",
+)
+_CURRENT_ENDPOINT_DATASET_COLUMNS = (
+    _SUBSET_ENDPOINT_DATASET_COLUMNS
+    + _ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS
+)
 _LEGACY_DATASET_RESOURCE_COLUMNS = (
     "dataset_id",
     "resource_type",
@@ -222,21 +234,22 @@ def _relation_schema_fence_sql(
     relation: str,
     expected_columns: tuple[str, ...],
     *,
-    compatible_columns: tuple[str, ...] | None = None,
+    compatible_columns: tuple[tuple[str, ...], ...] = (),
 ) -> str:
     relation_ref = _qf(schema, relation)
     expected_array = ", ".join(
         _ql(column) for column in sorted(expected_columns)
     )
-    compatible_clause = ""
-    if compatible_columns is not None:
+    compatible_clauses = []
+    for compatible_shape in compatible_columns:
         compatible_array = ", ".join(
-            _ql(column) for column in sorted(compatible_columns)
+            _ql(column) for column in sorted(compatible_shape)
         )
-        compatible_clause = (
+        compatible_clauses.append(
             "\n           AND observed_columns IS DISTINCT FROM "
             f"ARRAY[{compatible_array}]::text[]"
         )
+    compatible_clause = "".join(compatible_clauses)
     return f"""
     DO $migration$
     DECLARE
@@ -4139,7 +4152,10 @@ def upgrade() -> None:
             schema,
             _ENDPOINT_DATASET,
             _LEGACY_ENDPOINT_DATASET_COLUMNS,
-            compatible_columns=_SUBSET_ENDPOINT_DATASET_COLUMNS,
+            compatible_columns=(
+                _SUBSET_ENDPOINT_DATASET_COLUMNS,
+                _CURRENT_ENDPOINT_DATASET_COLUMNS,
+            ),
         )
     )
     op.execute(
@@ -4147,7 +4163,7 @@ def upgrade() -> None:
             schema,
             _DATASET_RESOURCE,
             _LEGACY_DATASET_RESOURCE_COLUMNS,
-            compatible_columns=_SUBSET_DATASET_RESOURCE_COLUMNS,
+            compatible_columns=(_SUBSET_DATASET_RESOURCE_COLUMNS,),
         )
     )
     op.execute(_guard_trigger_shape_fence_sql(schema))
@@ -4264,6 +4280,7 @@ def upgrade() -> None:
             schema,
             _ENDPOINT_DATASET,
             _SUBSET_ENDPOINT_DATASET_COLUMNS,
+            compatible_columns=(_CURRENT_ENDPOINT_DATASET_COLUMNS,),
         )
     )
     op.execute(

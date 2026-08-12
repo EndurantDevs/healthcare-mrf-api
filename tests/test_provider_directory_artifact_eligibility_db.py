@@ -60,10 +60,24 @@ async def _create_tables(database: Database, schema: str) -> None:
             resource_count bigint NOT NULL DEFAULT 0,
             superseded_at timestamp,
             publication_metadata_json jsonb,
+            publication_metadata_summary_json jsonb,
+            publication_metadata_sha256 varchar(64),
+            content_proof_admission_version smallint,
+            content_proof_admission_kind varchar(32),
+            content_proof_admission_sha256 varchar(64),
+            content_proof_resource_types varchar(64)[],
             completion_proof_required_version integer,
             completion_proof_json jsonb,
             completion_proof_sha256 varchar(64)
         );
+        """
+    )
+    await database.status(
+        f"""
+        CREATE FUNCTION {schema}.provider_directory_endpoint_dataset_admission_metadata_sha256(
+            jsonb, smallint, text, text, varchar[]
+        ) RETURNS varchar LANGUAGE sql IMMUTABLE AS
+            'SELECT repeat(''0'', 64)::varchar';
         """
     )
     await database.status(
@@ -74,6 +88,13 @@ async def _create_tables(database: Database, schema: str) -> None:
             metadata_json jsonb
         );
         """
+    )
+    await database.status(
+        f"CREATE INDEX pd_endpoint_dataset_admission_source_ids_idx "
+        f"ON {schema}.provider_directory_endpoint_dataset USING gin "
+        "((publication_metadata_summary_json -> 'source_ids')) "
+        "WHERE status = 'validated' AND is_current = false "
+        "AND superseded_at IS NULL;"
     )
     await install_subset_canonical_functions(database, schema)
 
@@ -155,61 +176,6 @@ def _matched_metadata() -> dict[str, object]:
     }
 
 
-def _ordinary_metadata() -> dict[str, object]:
-    return {
-        "source_ids": ["source_a", "source_b"],
-        "selected_resources": ["Organization", "Practitioner"],
-        "expected_resources": ["Organization", "Practitioner"],
-        "requires_twin_root_verification": False,
-        importer.TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: CAMPAIGN_ID,
-        importer.TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: SOURCE_SCOPE_HASH,
-        "dataset_hash": DATASET_HASH,
-        "resource_count": RESOURCE_COUNT,
-        "completion_proof_v1": {
-            importer.TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: CAMPAIGN_ID,
-            importer.TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: (
-                SOURCE_SCOPE_HASH
-            ),
-        },
-    }
-
-
-def _metadata_with_hash_identity(
-    metadata: dict[str, object],
-    resource_hash_contract: str,
-) -> dict[str, object]:
-    updated_metadata = copy.deepcopy(metadata)
-    updated_metadata[importer.RESOURCE_HASH_CONTRACT_METADATA_KEY] = (
-        resource_hash_contract
-    )
-    if (
-        resource_hash_contract
-        == importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-    ):
-        proof_resource_types = list(
-            importer._provider_directory_proof_resource_scope(
-                updated_metadata["selected_resources"]
-            )
-        )
-        semantic_projection_as_of = "2026-08-09"
-        updated_metadata[
-            importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
-        ] = proof_resource_types
-        updated_metadata[
-            importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY
-        ] = semantic_projection_as_of
-        proof = updated_metadata[
-            importer.TWIN_ROOT_VERIFICATION_METADATA_KEY
-        ]["proof"]
-        proof[
-            importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
-        ] = proof_resource_types
-        proof[importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY] = (
-            semantic_projection_as_of
-        )
-    return updated_metadata
-
-
 async def _insert_sources(database: Database, schema: str) -> None:
     metadata = json.dumps(_source_metadata())
     await database.status(
@@ -225,7 +191,7 @@ async def _insert_sources(database: Database, schema: str) -> None:
     )
 
 
-async def _insert_core_datasets(database: Database, schema: str) -> None:
+def _candidate_metadata_variants() -> tuple[dict[str, object], ...]:
     matched_metadata = _matched_metadata()
     wrong_campaign_metadata = copy.deepcopy(matched_metadata)
     wrong_campaign_metadata[
@@ -238,6 +204,21 @@ async def _insert_core_datasets(database: Database, schema: str) -> None:
     missing_source_ids_metadata.pop("source_ids")
     nonarray_source_ids_metadata = copy.deepcopy(matched_metadata)
     nonarray_source_ids_metadata["source_ids"] = {"source_a": True}
+    return (
+        matched_metadata,
+        wrong_campaign_metadata,
+        missing_source_ids_metadata,
+        nonarray_source_ids_metadata,
+    )
+
+
+async def _insert_core_datasets(database: Database, schema: str) -> None:
+    (
+        matched_metadata,
+        wrong_campaign_metadata,
+        missing_source_ids_metadata,
+        nonarray_source_ids_metadata,
+    ) = _candidate_metadata_variants()
     await database.status(
         f"""
         INSERT INTO {schema}.provider_directory_endpoint_dataset (
@@ -277,6 +258,22 @@ async def _insert_core_datasets(database: Database, schema: str) -> None:
         wrong_metadata=json.dumps(wrong_campaign_metadata),
         missing_metadata=json.dumps(missing_source_ids_metadata),
         nonarray_metadata=json.dumps(nonarray_source_ids_metadata),
+    )
+    await _seal_core_datasets(database, schema)
+
+
+async def _seal_core_datasets(database: Database, schema: str) -> None:
+    await database.status(
+        f"""
+        UPDATE {schema}.provider_directory_endpoint_dataset
+           SET publication_metadata_summary_json = publication_metadata_json,
+               publication_metadata_sha256 = repeat('0', 64),
+               content_proof_admission_version = {importer.ADMISSION_SEAL_VERSION},
+               content_proof_admission_kind = '{importer.ADMISSION_KIND_GENERIC}',
+               content_proof_admission_sha256 = repeat('a', 64),
+               content_proof_resource_types = ARRAY['Organization', 'Practitioner']::varchar[]
+         WHERE is_current = false;
+        """
     )
 
 
@@ -362,7 +359,8 @@ async def _set_twin_metadata(
         await database.status(
             f"""
             UPDATE {schema}.provider_directory_endpoint_dataset
-               SET publication_metadata_json = CAST(:metadata AS jsonb)
+               SET publication_metadata_json = CAST(:metadata AS jsonb),
+                   publication_metadata_summary_json = CAST(:metadata AS jsonb)
              WHERE dataset_id = :dataset_id;
             """,
             dataset_id=dataset_id,
@@ -467,7 +465,12 @@ async def test_verified_gate_keeps_incumbent_and_exact_matched_candidate(
                    publication_metadata_json,
                    '{{{importer.TWIN_ROOT_VERIFICATION_METADATA_KEY},proof,resource_hashes,Organization}}',
                    '"tampered"'::jsonb
-               )
+               ),
+                   publication_metadata_summary_json = jsonb_set(
+                       publication_metadata_summary_json,
+                       '{{{importer.TWIN_ROOT_VERIFICATION_METADATA_KEY},proof,resource_hashes,Organization}}',
+                       '"tampered"'::jsonb
+                   )
              WHERE dataset_id = 'dataset_baseline';
             """
         )

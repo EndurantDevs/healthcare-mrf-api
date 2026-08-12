@@ -2696,7 +2696,7 @@ async def _assert_dataset_fence_lock_contract(dataset, status):
     ):
         await importer._record_current_dataset_serving_relation_proof(
             dataset,
-            "network_plan_proof",
+            importer.PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY,
             {"complete": True},
         )
 
@@ -2752,22 +2752,7 @@ async def test_dataset_fence_helpers_lock_record_and_aggregate_proof(
     scoped_fence = importer._artifact_fence_for_dataset(fence, "dataset-a")
     assert scoped_fence.datasets == fence.datasets
     assert scoped_fence.promotion_aliases == fence.promotion_aliases
-    with pytest.raises(
-        RuntimeError,
-        match="dataset_endpoint_ambiguous",
-    ):
-        importer._unique_artifact_datasets(
-            importer.ProviderDirectoryArtifactDatasetFence(
-                (
-                    dataset,
-                    importer.replace(
-                        dataset,
-                        source_id="source-c",
-                        endpoint_id="endpoint-b",
-                    ),
-                )
-            )
-        )
+    _assert_ambiguous_dataset_endpoint_rejected(dataset)
 
     executor = SimpleNamespace(scalar=AsyncMock())
     await importer._lock_dataset_serving_relation_build(
@@ -2782,13 +2767,40 @@ async def test_dataset_fence_helpers_lock_record_and_aggregate_proof(
     monkeypatch.setattr(importer.db, "status", status)
     await importer._record_current_dataset_serving_relation_proof(
         dataset,
-        "network_plan_proof",
+        importer.PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY,
         {"complete": True},
     )
     assert json.loads(status.await_args.kwargs["proof_json"]) == {
         "complete": True
     }
+    status.reset_mock()
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="endpoint_dataset_metadata_key_invalid",
+    ):
+        await importer._record_current_dataset_publication_proof(
+            dataset,
+            "unreviewed_additive_key",
+            {"complete": True},
+        )
+    status.assert_not_awaited()
     await _assert_dataset_fence_lock_contract(dataset, status)
+
+
+def _assert_ambiguous_dataset_endpoint_rejected(dataset) -> None:
+    with pytest.raises(RuntimeError, match="dataset_endpoint_ambiguous"):
+        importer._unique_artifact_datasets(
+            importer.ProviderDirectoryArtifactDatasetFence(
+                (
+                    dataset,
+                    importer.replace(
+                        dataset,
+                        source_id="source-c",
+                        endpoint_id="endpoint-b",
+                    ),
+                )
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -3381,7 +3393,10 @@ async def test_artifact_dataset_promotion_parses_compact_metadata_once(
         in publish_sql
     )
     assert "jsonb_to_record" in publish_sql
-    assert publish_sql.count("publication_metadata_json::jsonb") == 1
+    assert "publication_metadata_summary_json" in publish_sql
+    assert "content_proof_admission_version" in publish_sql
+    assert "octet_length(" in publish_sql
+    assert "__SAFE_PUBLICATION_METADATA__" not in publish_sql
     assert "candidate.eligibility_metadata_jsonb" in publish_sql
     assert "candidate.uhc_publication_present" in publish_sql
     assert "COALESCE(" in publish_sql
