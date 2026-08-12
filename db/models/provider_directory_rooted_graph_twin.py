@@ -9,6 +9,7 @@ import os
 from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column
 from sqlalchemy import ForeignKeyConstraint, PrimaryKeyConstraint, String
 from sqlalchemy import TIMESTAMP, UniqueConstraint, text
+from sqlalchemy.dialects.postgresql import JSONB
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -164,9 +165,19 @@ class ProviderDirectoryRootedGraphTwinAdmission(Base, JSONOutputMixin):
         ),
         CheckConstraint(
             "admission_id ~ '^pdrgad_[0-9a-f]{48}$' AND "
-            "admission_contract_id = "
+            f"storage_contract_id = '{_STORAGE_CONTRACT}' AND "
+            "((admission_contract_id = "
             "'healthporta.provider-directory.rooted-graph-matched-admission.v1' "
-            f"AND storage_contract_id = '{_STORAGE_CONTRACT}' "
+            "AND attempt_id IS NOT NULL AND comparison_acquisition_id IS NOT NULL "
+            "AND reviewed_root_policy_json IS NULL "
+            "AND acquisition_operation_key IS NULL) OR "
+            "(admission_contract_id = "
+            "'healthporta.provider-directory.rooted-graph-single-root-admission.v1' "
+            "AND attempt_id IS NULL AND comparison_acquisition_id IS NULL "
+            "AND reviewed_root_policy_json = CAST("
+            "'{\"policy_version\":\"provider-directory-reviewed-root-policy-v1\","
+            "\"required_root_count\"\\:1}' AS jsonb) "
+            "AND acquisition_operation_key ~ '^[0-9a-f]{64}$')) "
             "AND publication_authority IS TRUE",
             name="pd_rooted_graph_twin_admission_check",
         ),
@@ -177,9 +188,11 @@ class ProviderDirectoryRootedGraphTwinAdmission(Base, JSONOutputMixin):
     admission_id = Column(String(55), nullable=False)
     admission_contract_id = Column(String(96), nullable=False)
     storage_contract_id = Column(String(96), nullable=False)
-    attempt_id = Column(String(55), nullable=False)
+    attempt_id = Column(String(55))
     publication_acquisition_id = Column(String(54), nullable=False)
-    comparison_acquisition_id = Column(String(54), nullable=False)
+    comparison_acquisition_id = Column(String(54))
+    reviewed_root_policy_json = Column(JSONB)
+    acquisition_operation_key = Column(String(64))
     publication_run_id = Column(String(54), nullable=False)
     dataset_intent_id = Column(String(54), nullable=False)
     scope_id = Column(String(54), nullable=False)

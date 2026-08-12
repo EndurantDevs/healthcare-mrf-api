@@ -34,6 +34,10 @@ from process.uhc_flex_practitioner_store_contract import (
     COHORT_PATTERN,
     INTENT_PATTERN,
 )
+from process.uhc_flex_practitioner_single_root_contract import (
+    UHCFlexPractitionerAdmission,
+    UHCFlexPractitionerSingleRootAdmission,
+)
 from process.uhc_flex_practitioner_twin_store_contract import (
     ADMISSION_PATTERN,
     canonical_semantic_projection_as_of,
@@ -210,13 +214,16 @@ class UHCFlexPractitionerDatasetIdentity:
 
 
 def build_uhc_flex_practitioner_dataset_identity(
-    admission: UHCFlexPractitionerTwinAdmission,
+    admission: UHCFlexPractitionerAdmission,
     *,
     endpoint_id: str | None = None,
 ) -> UHCFlexPractitionerDatasetIdentity:
     """Derive the sole dataset identity authorized by one matched admission."""
 
-    if type(admission) is not UHCFlexPractitionerTwinAdmission:
+    if type(admission) not in {
+        UHCFlexPractitionerTwinAdmission,
+        UHCFlexPractitionerSingleRootAdmission,
+    }:
         raise ValueError("Flex Practitioner admission is invalid")
     selected_endpoint_id = (
         endpoint_id
@@ -267,13 +274,16 @@ def build_uhc_flex_practitioner_dataset_identity(
 
 def uhc_flex_practitioner_publication_metadata(
     identity: UHCFlexPractitionerDatasetIdentity,
-    admission: UHCFlexPractitionerTwinAdmission,
+    admission: UHCFlexPractitionerAdmission,
 ) -> dict[str, Any]:
     """Return the exact closed metadata object checked by PostgreSQL."""
 
     if (
         type(identity) is not UHCFlexPractitionerDatasetIdentity
-        or type(admission) is not UHCFlexPractitionerTwinAdmission
+        or type(admission) not in {
+            UHCFlexPractitionerTwinAdmission,
+            UHCFlexPractitionerSingleRootAdmission,
+        }
         or identity.admission_id != admission.admission_id
         or identity.candidate_acquisition_id != admission.candidate_acquisition_id
         or identity.cohort_id != admission.cohort_id
@@ -285,12 +295,10 @@ def uhc_flex_practitioner_publication_metadata(
         or identity.source_id != admission.source_id
     ):
         raise ValueError("Flex Practitioner publication identity is invalid")
-    return {
+    metadata = {
         "acquisition_root_run_id": identity.acquisition_root_run_id,
         "admission_contract_id": admission.admission_contract_id,
         "admission_id": admission.admission_id,
-        "baseline_acquisition_id": admission.baseline_acquisition_id,
-        "baseline_run_id": admission.baseline_run_id,
         "candidate_acquisition_id": admission.candidate_acquisition_id,
         "candidate_run_id": admission.candidate_run_id,
         "cohort_complete": True,
@@ -316,6 +324,14 @@ def uhc_flex_practitioner_publication_metadata(
         "storage_contract_id": admission.storage_contract_id,
         "terminal_set_sha256": admission.terminal_set_sha256,
     }
+    if type(admission) is UHCFlexPractitionerTwinAdmission:
+        metadata["baseline_acquisition_id"] = admission.baseline_acquisition_id
+        metadata["baseline_run_id"] = admission.baseline_run_id
+    else:
+        metadata["provider_directory_reviewed_root_policy_v1"] = (
+            admission.reviewed_root_policy_json
+        )
+    return metadata
 
 
 @dataclass(frozen=True, slots=True)

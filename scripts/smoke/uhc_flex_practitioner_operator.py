@@ -172,6 +172,11 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("sync-cohort", allow_abbrev=False)
     acquisition = commands.add_parser("acquire-admit", allow_abbrev=False)
     _add_acquisition_arguments(acquisition)
+    single_root = commands.add_parser(
+        "acquire-admit-single-root",
+        allow_abbrev=False,
+    )
+    _add_acquisition_arguments(single_root)
     publication = commands.add_parser(
         "publish-admitted",
         allow_abbrev=False,
@@ -273,6 +278,21 @@ async def _execute_operation(
         )
 
         return await acquire_admit_uhc_flex_practitioner_operation(
+            operation_key=parsed_arguments.operation_key,
+            semantic_projection_as_of=parsed_arguments.semantic_projection_as_of,
+            concurrency=parsed_arguments.concurrency,
+            max_attempts=parsed_arguments.max_attempts,
+            lease_seconds=parsed_arguments.lease_seconds,
+            retry_base_seconds=parsed_arguments.retry_base_seconds,
+            max_retry_seconds=parsed_arguments.max_retry_seconds,
+            database=database,
+        )
+    if parsed_arguments.command == "acquire-admit-single-root":
+        from process.uhc_flex_practitioner_operator import (
+            acquire_uhc_flex_single_root_operation,
+        )
+
+        return await acquire_uhc_flex_single_root_operation(
             operation_key=parsed_arguments.operation_key,
             semantic_projection_as_of=parsed_arguments.semantic_projection_as_of,
             concurrency=parsed_arguments.concurrency,

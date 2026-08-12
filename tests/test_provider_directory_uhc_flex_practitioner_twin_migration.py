@@ -7,6 +7,8 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateTable
 
 from db.models import ProviderDirectoryUHCFlexPractitionerTwinAdmission
 from db.models import ProviderDirectoryUHCFlexPractitionerTwinAttempt
@@ -158,6 +160,14 @@ def test_models_bind_attempt_roots_and_candidate_authority() -> None:
         "datetime"
     ).date
     assert admission.c.candidate_acquisition_id.unique is None
+    compiled_admission = str(
+        CreateTable(admission).compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    assert '"required_root_count":1' in compiled_admission
+    assert '"required_root_count"NULL' not in compiled_admission
 
 
 def test_acquisition_terminal_roots_are_comparable_across_distinct_runs() -> None:

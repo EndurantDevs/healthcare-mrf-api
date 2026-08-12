@@ -5,8 +5,9 @@ issuing one exact `Practitioner?identifier=<NPI>` query per member of a sealed
 official NPI cohort. It never traverses the generic Flex endpoint, accepts no
 source URL or resource-type selector, and makes no endpoint-completeness claim.
 
-`sync-cohort` and historical exact-selector publication remain available behind
-their separate default-off gates. The legacy `acquire-admit` twin phase remains
+`sync-cohort`, reviewed single-root acquisition, and exact-selector publication
+remain available behind separate default-off gates. The legacy `acquire-admit`
+twin phase remains
 packaged for CLI compatibility but always returns
 `{"code":"disabled","status":"error"}` with exit code 1 after argument
 validation, even if its old gate is set to `true`.
@@ -28,6 +29,22 @@ sanitized JSON receipt. `cohort_created=true` means the immutable cohort was
 created. Repeating the command against the same official dataset returns the
 same cohort with `cohort_created=false`; this is the supported cohort status
 check. No NPI values are emitted.
+
+## Acquire and admit one reviewed root
+
+```console
+HLTHPRT_UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ACQUISITION_ENABLED=true \
+  /opt/venv/bin/python -B \
+  /opt/scripts/smoke/uhc_flex_practitioner_operator.py \
+  acquire-admit-single-root \
+  --operation-key 64_LOWERCASE_HEX_CHARACTERS \
+  --semantic-projection-as-of YYYY-MM-DD
+```
+
+The command acquires one candidate root for the sealed official cohort and
+admits it under the reviewed single-root policy. Admission rechecks the exact
+current official dataset and cohort. Repeating the same inputs replays the same
+authority; it does not publish.
 
 ## Retired acquire/admit contract
 
@@ -54,7 +71,7 @@ runtime contract additionally requires the retry base not exceed the maximum.
 SIGINT and SIGTERM cancel workers, release/drain their work, disconnect the
 database, and exit with 130 or 143. Rerun the same command to resume.
 
-## Publish one admitted historical candidate
+## Publish one admitted candidate
 
 ```console
 HLTHPRT_UHC_FLEX_PRACTITIONER_COHORT_ENABLED=false \
@@ -66,8 +83,9 @@ HLTHPRT_UHC_FLEX_PRACTITIONER_PUBLICATION_ENABLED=true \
   --candidate-acquisition-id pdufpa_48_LOWERCASE_HEX_CHARACTERS
 ```
 
-This command publishes or exactly replays only an already-admitted historical
-candidate. It cannot create a new acquisition or admission.
+This command publishes or exactly replays only an already-admitted candidate,
+including a reviewed single-root admission. It cannot create a new acquisition
+or admission.
 
 Publication accepts only the candidate acquisition identifier from a matched
 admission. It revalidates the admission and materialized content under the
@@ -118,6 +136,5 @@ The production controller must submit the embedded standard global Profile
 follow-up after verifying the published dataset receipt. Do not infer Profile
 serving readiness from this operator's publication result.
 
-Do not schedule or run the retired acquisition phase. Use the standard
-single-root Provider Directory importer for future acquisition and admission.
-Historical exact-selector publication remains manual and default-off.
+Do not schedule or run the retired twin phase. Reviewed single-root acquisition
+and exact-selector publication remain manual and default-off.

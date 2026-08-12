@@ -327,6 +327,8 @@ def test_metadata_is_canonical_across_reordered_resource_counts() -> None:
     encoded = canonical_json(metadata)
     assert canonical_json(json.loads(encoded)) == encoded
     assert json.loads(encoded)["resource_counts"] == resource_counts()
+    assert "provider_directory_reviewed_root_policy_v1" not in metadata
+    assert "acquisition_operation_key" not in metadata
 
 
 @pytest.mark.parametrize(

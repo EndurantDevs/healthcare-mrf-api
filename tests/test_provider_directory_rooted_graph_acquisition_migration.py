@@ -257,7 +257,7 @@ def test_migration_and_model_pin_the_current_graph_contract() -> None:
     )
 
 
-def test_all_model_checks_exactly_match_migration_adoption_checks() -> None:
+def test_predecessor_model_checks_exactly_match_migration_adoption_checks() -> None:
     migration_items = _migration_table_items()
     models = (
         ProviderDirectoryRootedGraphAcquisition,
@@ -265,19 +265,17 @@ def test_all_model_checks_exactly_match_migration_adoption_checks() -> None:
         ProviderDirectoryRootedGraphResource,
         ProviderDirectoryRootedGraphEdge,
         ProviderDirectoryRootedGraphTwinAttempt,
-        ProviderDirectoryRootedGraphTwinAdmission,
-        ProviderDirectoryRootedGraphDataset,
         ProviderDirectoryRootedGraphDatasetResource,
     )
 
-    assert set(migration_items) == {model.__tablename__ for model in models}
+    assert {model.__tablename__ for model in models} < set(migration_items)
     for model in models:
         assert _named_checks(model.__table__.constraints) == _named_checks(
             migration_items[model.__tablename__]
         )
 
 
-def test_all_model_columns_and_keys_exactly_match_migration_tables() -> None:
+def test_predecessor_model_columns_and_keys_exactly_match_migration_tables() -> None:
     migration_items = _migration_table_items()
     models = (
         ProviderDirectoryRootedGraphAcquisition,
@@ -285,8 +283,6 @@ def test_all_model_columns_and_keys_exactly_match_migration_tables() -> None:
         ProviderDirectoryRootedGraphResource,
         ProviderDirectoryRootedGraphEdge,
         ProviderDirectoryRootedGraphTwinAttempt,
-        ProviderDirectoryRootedGraphTwinAdmission,
-        ProviderDirectoryRootedGraphDataset,
         ProviderDirectoryRootedGraphDatasetResource,
     )
 

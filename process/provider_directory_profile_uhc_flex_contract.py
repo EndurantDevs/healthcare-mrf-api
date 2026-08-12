@@ -16,6 +16,10 @@ from process.provider_directory_dataset_scoped_publication import (
 from process.provider_directory_resource_hash import (
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
 )
+from process.provider_directory_fhir_root_policy import (
+    REVIEWED_ROOT_POLICY_METADATA_KEY,
+    ReviewedRootPolicy,
+)
 from process.provider_directory_rooted_graph_publication import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_RESOURCES,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID,
@@ -23,6 +27,13 @@ from process.provider_directory_rooted_graph_publication import (
 )
 from process.provider_directory_rooted_graph_source_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+)
+from process.provider_directory_rooted_graph_store_contract import ACQUISITION_PATTERN
+from process.provider_directory_rooted_graph_twin_contract import (
+    ADMISSION_PATTERN,
+    ATTEMPT_PATTERN,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ADMISSION_CONTRACT_ID,
 )
 from process.uhc_flex_official_cohort_contract import (
     UHC_FLEX_OFFICIAL_AUTHORITY_ID,
@@ -34,6 +45,12 @@ from process.uhc_flex_practitioner_publication import (
 )
 from process.uhc_flex_practitioner_registration import (
     uhc_flex_practitioner_endpoint_identity,
+)
+from process.uhc_flex_practitioner_single_root_contract import (
+    UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
+)
+from process.uhc_flex_practitioner_twin_store_contract import (
+    UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID,
 )
 
 
@@ -197,6 +214,75 @@ def _is_rooted_resource_counts_valid(resource_counts: object) -> bool:
     )
 
 
+def _is_flex_admission_metadata_valid(
+    publication_metadata: Mapping[str, Any],
+) -> bool:
+    admission_contract_id = publication_metadata.get("admission_contract_id")
+    if admission_contract_id == UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID:
+        return bool(
+            _clean_text(publication_metadata.get("baseline_acquisition_id"))
+            and _clean_text(publication_metadata.get("baseline_run_id"))
+            and REVIEWED_ROOT_POLICY_METADATA_KEY not in publication_metadata
+        )
+    if (
+        admission_contract_id
+        == UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID
+    ):
+        return bool(
+            "baseline_acquisition_id" not in publication_metadata
+            and "baseline_run_id" not in publication_metadata
+            and publication_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
+            == ReviewedRootPolicy(1).document()
+        )
+    return False
+
+
+def _is_rooted_admission_metadata_valid(
+    publication_metadata: Mapping[str, Any],
+) -> bool:
+    admission_id = _clean_text(publication_metadata.get("admission_id")) or ""
+    publication_id = (
+        _clean_text(publication_metadata.get("publication_acquisition_id")) or ""
+    )
+    contract_id = publication_metadata.get("admission_contract_id")
+    if (
+        ADMISSION_PATTERN.fullmatch(admission_id) is None
+        or ACQUISITION_PATTERN.fullmatch(publication_id) is None
+    ):
+        return False
+    if contract_id == PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ADMISSION_CONTRACT_ID:
+        return bool(
+            ATTEMPT_PATTERN.fullmatch(
+                _clean_text(publication_metadata.get("attempt_id")) or ""
+            )
+            is not None
+            and ACQUISITION_PATTERN.fullmatch(
+                _clean_text(
+                    publication_metadata.get("comparison_acquisition_id")
+                )
+                or ""
+            )
+            is not None
+            and REVIEWED_ROOT_POLICY_METADATA_KEY not in publication_metadata
+            and "acquisition_operation_key" not in publication_metadata
+        )
+    return bool(
+        contract_id
+        == PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID
+        and "attempt_id" in publication_metadata
+        and publication_metadata["attempt_id"] is None
+        and "comparison_acquisition_id" in publication_metadata
+        and publication_metadata["comparison_acquisition_id"] is None
+        and publication_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
+        == ReviewedRootPolicy(1).document()
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            _clean_text(publication_metadata.get("acquisition_operation_key")) or "",
+        )
+        is not None
+    )
+
+
 def is_uhc_flex_publication_metadata_valid(
     publication_metadata: Mapping[str, Any],
     *,
@@ -239,9 +325,10 @@ def is_uhc_flex_publication_metadata_valid(
     if not is_common_metadata_valid:
         return False
     if variant == LEGACY_PRACTITIONER_VARIANT:
-        return (
+        return bool(
             publication_metadata.get("publication_contract_id")
             == UHC_FLEX_PRACTITIONER_DATASET_PUBLICATION_CONTRACT_ID
+            and _is_flex_admission_metadata_valid(publication_metadata)
         )
     resource_counts = publication_metadata.get("resource_counts")
     return bool(
@@ -251,6 +338,7 @@ def is_uhc_flex_publication_metadata_valid(
         and publication_metadata.get("publication_kind")
         == PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND
         and publication_metadata.get("rooted_graph_complete") is True
+        and _is_rooted_admission_metadata_valid(publication_metadata)
         and _is_rooted_resource_counts_valid(resource_counts)
         and _is_rooted_publication_lineage_valid(publication_metadata)
     )

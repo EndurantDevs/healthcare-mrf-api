@@ -510,10 +510,35 @@ jobs:
               operation_output=$(env \
                 -u HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_REGISTRATION_ENABLED \
                 -u HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_ENABLED \
+                -u HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ACQUISITION_ENABLED \
                 -u HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_ENABLED \
                 /opt/venv/bin/python -B \
                 /opt/scripts/smoke/provider_directory_rooted_graph_operator.py \
-                register 2>&1)
+                acquire-single-root \
+                --operation-key \
+                aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+                2>&1)
+              operation_status=$?
+              set -e
+              test "$operation_status" -eq 1
+              operation_last_line=$(printf "%s\n" "$operation_output" | tail -n 1)
+              test "$operation_last_line" = '\''{"code":"disabled","status":"error"}'\''
+            '
+      - name: Prove exact-cohort Provider operator is packaged and dormant
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --entrypoint /bin/sh \
+            healthcare-mrf-api:ptg-v4-gate \
+            -ec '
+              set +e
+              operation_output=$(env \
+                -u HLTHPRT_UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ACQUISITION_ENABLED \
+                /opt/venv/bin/python -B \
+                /opt/scripts/smoke/uhc_flex_practitioner_operator.py \
+                acquire-admit-single-root \
+                --operation-key \
+                aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+                --semantic-projection-as-of 2026-08-12 2>&1)
               operation_status=$?
               set -e
               test "$operation_status" -eq 1
@@ -1022,6 +1047,7 @@ jobs:
           tests/test_provider_directory_uhc_flex_practitioner_publication_postgres.py
           tests/test_provider_directory_rooted_graph_adoption_postgres.py
           tests/test_provider_directory_rooted_graph_acquisition_postgres.py
+          tests/test_provider_directory_rooted_graph_single_root_postgres.py
           tests/test_provider_directory_rooted_graph_publication_guards_postgres.py
           tests/test_provider_directory_rooted_graph_publication_postgres.py
       - name: Run bounded Provider Directory selection DB tests

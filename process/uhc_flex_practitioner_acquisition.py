@@ -51,6 +51,14 @@ from process.uhc_flex_practitioner_registration import (
     uhc_flex_practitioner_endpoint_identity,
     UHCFlexPractitionerRegistrationResult,
 )
+from process.uhc_flex_practitioner_single_root_contract import (
+    build_single_root_context,
+    build_single_root_receipt,
+    is_exact_single_root_admission,
+    UHCFlexPractitionerSingleRootAdmission,
+    UHCFlexPractitionerSingleRootContext,
+    UHCFlexPractitionerSingleRootReceipt,
+)
 from process.uhc_flex_practitioner_store import (
     build_uhc_flex_practitioner_acquisition_identity,
     UHCFlexPractitionerAcquisitionIdentity,
@@ -289,6 +297,40 @@ async def _admit_root_pair(
     return admission
 
 
+async def _admit_single_root(
+    context: UHCFlexPractitionerSingleRootContext,
+    candidate: UHCFlexPractitionerAcquisitionSummary,
+    *,
+    dependencies: UHCFlexPractitionerAcquisitionDependencies,
+    database: Any,
+) -> UHCFlexPractitionerSingleRootAdmission:
+    locked_context = _AcquisitionContext(
+        registration=context.registration, cohort=context.cohort,
+        dataset_intent_id=context.dataset_intent_id,
+        identity_by_role={"candidate": context.candidate_identity},
+        semantic_projection_as_of=context.semantic_projection_as_of,
+        operation_key=context.operation_key,
+    )
+    admit_single_root = dependencies.admit_single_root
+    if admit_single_root is None:
+        from process.uhc_flex_practitioner_twin_store import (
+            admit_uhc_flex_practitioner_single_root as admit_single_root,
+        )
+    async with database.transaction():
+        await _revalidate_locked_inputs(
+            locked_context, dependencies=dependencies, database=database
+        )
+        admission = await admit_single_root(
+            candidate.acquisition_id,
+            semantic_projection_as_of=context.semantic_projection_as_of,
+            operation_key=context.operation_key,
+            database=database,
+        )
+    if not is_exact_single_root_admission(context, candidate, admission):
+        raise UHCFlexPractitionerAcquisitionError("state")
+    return admission
+
+
 def _build_receipt(
     context: _AcquisitionContext,
     baseline: UHCFlexPractitionerAcquisitionSummary,
@@ -381,6 +423,62 @@ async def acquire_uhc_flex_practitioner_twins(
         baseline_elapsed,
         candidate,
         candidate_elapsed,
+        admission,
+        elapsed_seconds,
+    )
+
+
+async def acquire_uhc_flex_single_root(
+    *,
+    operation_key: str,
+    semantic_projection_as_of: str,
+    config: UHCFlexPractitionerAcquisitionConfig = UHCFlexPractitionerAcquisitionConfig(),
+    database: Any = db,
+    dependencies: UHCFlexPractitionerAcquisitionDependencies | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> UHCFlexPractitionerSingleRootReceipt:
+    """Acquire and admit one reviewed candidate without creating a twin."""
+
+    projection_date, runtime_dependencies = _validated_runtime_inputs(
+        operation_key,
+        semantic_projection_as_of,
+        config,
+        dependencies,
+    )
+    started_at = runtime_dependencies.monotonic()
+    registration = _validate_registration(await runtime_dependencies.register_source(database=database))
+    cohort = _validated_cohort_sync(await runtime_dependencies.sync_cohort(database=database))
+    context = build_single_root_context(
+        registration, cohort, projection_date, operation_key
+    )
+    created_count = await runtime_dependencies.initialize_root(
+        context.candidate_identity,
+        database=database,
+    )
+    if type(created_count) is not int or created_count not in {0, 1}:
+        raise UHCFlexPractitionerAcquisitionError("state")
+    candidate, candidate_elapsed = await _run_root(
+        context.candidate_identity,
+        config=config,
+        dependencies=runtime_dependencies,
+        database=database,
+        progress_callback=progress_callback,
+    )
+    admission = await _admit_single_root(
+        context,
+        candidate,
+        dependencies=runtime_dependencies,
+        database=database,
+    )
+    elapsed_seconds = runtime_dependencies.monotonic() - started_at
+    _strict_nonnegative_seconds(elapsed_seconds, "total timing")
+    return build_single_root_receipt(
+        context,
+        _root_receipt(
+            context.candidate_identity,
+            candidate,
+            candidate_elapsed,
+        ),
         admission,
         elapsed_seconds,
     )

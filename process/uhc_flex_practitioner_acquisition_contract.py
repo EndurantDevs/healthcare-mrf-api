@@ -283,6 +283,7 @@ class UHCFlexPractitionerAcquisitionDependencies:
     session_scope: Callable[[int], Any]
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     monotonic: Callable[[], float] = time.monotonic
+    admit_single_root: Callable[..., Awaitable[Any]] | None = None
 
 
 _PUBLIC_MODULE = "process.uhc_flex_practitioner_acquisition"

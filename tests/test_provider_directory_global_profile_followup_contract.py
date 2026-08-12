@@ -166,11 +166,13 @@ def test_manual_clis_expose_publication_but_no_profile_dispatch_phase() -> None:
     assert _cli_command_names(rooted_cli._parser()) == {
         "register",
         "acquire",
+        "acquire-single-root",
         "publish",
     }
     assert _cli_command_names(legacy_cli._parser()) == {
         "sync-cohort",
         "acquire-admit",
+        "acquire-admit-single-root",
         "publish-admitted",
     }
 

@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import UTC, datetime
 
 import pytest
 
 from process import provider_directory_rooted_graph_twin_store as twin_store
+from process.provider_directory_fhir_root_policy import (
+    REVIEWED_ROOT_POLICY_METADATA_KEY,
+)
+from process.provider_directory_rooted_graph_single_root_contract import (
+    derive_single_root_identity,
+)
+from process.provider_directory_rooted_graph_publication import (
+    build_provider_directory_rooted_graph_dataset_identity,
+    provider_directory_rooted_graph_publication_metadata,
+)
 from process.provider_directory_rooted_graph_twin_contract import (
     build_provider_directory_rooted_graph_twin_admission,
     build_provider_directory_rooted_graph_twin_attempt,
@@ -15,6 +25,7 @@ from process.provider_directory_rooted_graph_twin_contract import (
 )
 from tests.provider_directory_rooted_graph_publication_test_support import (
     exact_current,
+    resource_counts,
     sealed_roots,
 )
 
@@ -151,7 +162,7 @@ async def test_insert_and_read_helpers_bound_exact_persisted_records() -> None:
         first_rows=(_record(attempt), _record(admission), None)
     )
     await twin_store._insert_attempt(database, attempt)
-    await twin_store._insert_admission(database, admission)
+    await twin_store._insert_authority(database, admission)
     assert len(database.status_calls) == 2
     assert await twin_store._read_attempt(database, attempt.attempt_id) == attempt
     assert (
@@ -215,7 +226,7 @@ async def _exercise_admission(monkeypatch, *, current, roots):
     monkeypatch.setattr(twin_store, "_lock_roots", lock_roots)
     monkeypatch.setattr(twin_store, "_insert_attempt", insert_attempt)
     monkeypatch.setattr(twin_store, "_read_attempt", read_attempt)
-    monkeypatch.setattr(twin_store, "_insert_admission", insert_admission)
+    monkeypatch.setattr(twin_store, "_insert_authority", insert_admission)
     monkeypatch.setattr(twin_store, "_read_admission", read_admission)
     database = _ScriptedDatabase(scalars=(recorded_at,))
     return await twin_store.admit_provider_directory_rooted_graph_twins(
@@ -291,4 +302,81 @@ async def test_required_admission_rebuilds_or_maps_missing_evidence(
         await twin_store.require_provider_directory_rooted_graph_admission(
             admission.publication_acquisition_id,
             database=_ScriptedDatabase(),
+        )
+
+
+def _single_root_candidate(current, operation_key):
+    """Project one deterministic identity onto synthetic sealed proof."""
+
+    identity = derive_single_root_identity(current, operation_key=operation_key)
+    proof = sealed_roots()[1]
+    return type(proof)(
+        **{
+            field.name: (
+                getattr(identity.candidate, field.name)
+                if hasattr(identity.candidate, field.name)
+                else getattr(proof, field.name)
+            )
+            for field in fields(proof)
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_root_admission_rederives_identity_and_publishes_metadata(
+    monkeypatch,
+) -> None:
+    """Bind admission, metadata, and stale-seal rejection to one identity."""
+
+    operation_key = "f" * 64
+    current = exact_current()
+    candidate = _single_root_candidate(current, operation_key)
+    locked_roots = [candidate]
+    stored_by_kind: dict[str, object] = {}
+
+    async def lock_current(_database):
+        return current
+
+    async def lock_root(_database, _acquisition_id):
+        return locked_roots[0]
+
+    async def insert_admission(_database, admission):
+        stored_by_kind["admission"] = admission
+
+    async def read_admission(_database, _acquisition_id):
+        return stored_by_kind["admission"]
+
+    monkeypatch.setattr(twin_store, "_lock_logical_current", lock_current)
+    monkeypatch.setattr(twin_store, "_lock_single_root", lock_root)
+    monkeypatch.setattr(twin_store, "_insert_authority", insert_admission)
+    monkeypatch.setattr(twin_store, "_read_admission", read_admission)
+    recorded_at = datetime(2026, 8, 10, 12, tzinfo=UTC)
+    admission = await twin_store.admit_rooted_graph_single_root(
+        candidate.acquisition_id,
+        acquisition_operation_key=operation_key,
+        database=_ScriptedDatabase(scalars=(recorded_at,)),
+    )
+
+    assert admission.attempt_id is None
+    assert admission.comparison_acquisition_id is None
+    assert admission.acquisition_operation_key == operation_key
+    identity = build_provider_directory_rooted_graph_dataset_identity(
+        admission,
+        current,
+    )
+    metadata = provider_directory_rooted_graph_publication_metadata(
+        identity,
+        admission,
+        previous_dataset_id=current.dataset_id,
+        resource_counts=resource_counts(),
+    )
+    assert metadata[REVIEWED_ROOT_POLICY_METADATA_KEY]["required_root_count"] == 1
+    assert metadata["acquisition_operation_key"] == operation_key
+
+    locked_roots[0] = replace(candidate, run_id="pdrgr_" + "0" * 48)
+    with pytest.raises(ProviderDirectoryRootedGraphTwinError, match="identity"):
+        await twin_store.admit_rooted_graph_single_root(
+            candidate.acquisition_id,
+            acquisition_operation_key=operation_key,
+            database=_ScriptedDatabase(scalars=(recorded_at,)),
         )

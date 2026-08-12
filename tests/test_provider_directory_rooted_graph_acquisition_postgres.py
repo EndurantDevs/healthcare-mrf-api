@@ -86,6 +86,11 @@ MIGRATION_PATH = (
     / "alembic/versions"
     / ("20260811020000_provider_directory_rooted_graph_acquisition.py")
 )
+SINGLE_ROOT_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic/versions"
+    / ("20260812030000_provider_directory_specialized_single_root_admission.py")
+)
 
 
 def _load_legacy_migrations(label_prefix: str):

@@ -17,11 +17,20 @@ from process.provider_directory_global_profile_followup_contract import (
 
 COHORT_ENABLED_ENV = "HLTHPRT_UHC_FLEX_PRACTITIONER_COHORT_ENABLED"
 ACQUISITION_ENABLED_ENV = "HLTHPRT_UHC_FLEX_PRACTITIONER_ACQUISITION_ENABLED"
+SINGLE_ROOT_ACQUISITION_ENABLED_ENV = (
+    "HLTHPRT_UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ACQUISITION_ENABLED"
+)
 PUBLICATION_ENABLED_ENV = "HLTHPRT_UHC_FLEX_PRACTITIONER_PUBLICATION_ENABLED"
-OPERATOR_PHASES = ("sync-cohort", "acquire-admit", "publish-admitted")
+OPERATOR_PHASES = (
+    "sync-cohort",
+    "acquire-admit",
+    "acquire-admit-single-root",
+    "publish-admitted",
+)
 _GATE_BY_PHASE = {
     "sync-cohort": COHORT_ENABLED_ENV,
     "acquire-admit": ACQUISITION_ENABLED_ENV,
+    "acquire-admit-single-root": SINGLE_ROOT_ACQUISITION_ENABLED_ENV,
     "publish-admitted": PUBLICATION_ENABLED_ENV,
 }
 _PRESERVED_ERROR_CODES = frozenset(
@@ -163,6 +172,34 @@ def _acquisition_result_json(receipt: Any) -> str:
     )
 
 
+def _single_root_acquisition_result_json(receipt: Any) -> str:
+    return _json_text(
+        {
+            "admission_id": receipt.admission_id,
+            "candidate": _root_payload(receipt.candidate),
+            "cohort_id": receipt.cohort_id,
+            "dataset_intent_id": receipt.dataset_intent_id,
+            "elapsed_seconds": receipt.elapsed_seconds,
+            "expected_npi_count": receipt.expected_npi_count,
+            "official_content_proof_sha256": (
+                receipt.official_content_proof_sha256
+            ),
+            "official_dataset_hash": receipt.official_dataset_hash,
+            "official_dataset_id": receipt.official_dataset_id,
+            "operation_key": receipt.operation_key,
+            "profile_delta_dispatch": {
+                "operator_command_available": False,
+                "status": "not_applicable_before_publication",
+            },
+            "provider_directory_reviewed_root_policy_v1": (
+                receipt.reviewed_root_policy_json
+            ),
+            "semantic_projection_as_of": receipt.semantic_projection_as_of,
+            "status": "admitted",
+        }
+    )
+
+
 def _publication_result_json(publication_result: Any) -> str:
     dataset_readiness = publication_result.readiness
     return _json_text(
@@ -281,6 +318,56 @@ async def acquire_admit_uhc_flex_practitioner_operation(
         raise _operation_error(error, "acquisition") from None
 
 
+async def acquire_uhc_flex_single_root_operation(
+    *,
+    operation_key: str,
+    semantic_projection_as_of: str,
+    concurrency: int,
+    max_attempts: int,
+    lease_seconds: int,
+    retry_base_seconds: float,
+    max_retry_seconds: float,
+    database: Any,
+) -> str:
+    """Acquire and admit one explicit reviewed candidate root."""
+
+    require_uhc_flex_practitioner_operator_gate("acquire-admit-single-root")
+    try:
+        from process.uhc_flex_practitioner_acquisition import (
+            acquire_uhc_flex_single_root,
+            UHCFlexPractitionerAcquisitionConfig,
+        )
+        from process.uhc_flex_practitioner_single_root_contract import (
+            UHCFlexPractitionerSingleRootReceipt,
+        )
+
+        config = UHCFlexPractitionerAcquisitionConfig(
+            enabled=True,
+            concurrency=concurrency,
+            max_attempts=max_attempts,
+            lease_seconds=lease_seconds,
+            retry_base_seconds=retry_base_seconds,
+            max_retry_seconds=max_retry_seconds,
+        )
+        receipt = await acquire_uhc_flex_single_root(
+            operation_key=operation_key,
+            semantic_projection_as_of=semantic_projection_as_of,
+            config=config,
+            database=database,
+        )
+        if type(receipt) is not UHCFlexPractitionerSingleRootReceipt:
+            raise UHCFlexPractitionerOperatorError("evidence")
+        return _single_root_acquisition_result_json(receipt)
+    except (asyncio.CancelledError, TimeoutError):
+        raise
+    except UHCFlexPractitionerOperatorError:
+        raise
+    except (TypeError, ValueError):
+        raise UHCFlexPractitionerOperatorError("invalid_request") from None
+    except Exception as error:
+        raise _operation_error(error, "acquisition") from None
+
+
 async def publish_admitted_uhc_flex_practitioner_operation(
     *,
     candidate_acquisition_id: str,
@@ -319,8 +406,10 @@ __all__ = (
     "COHORT_ENABLED_ENV",
     "OPERATOR_PHASES",
     "PUBLICATION_ENABLED_ENV",
+    "SINGLE_ROOT_ACQUISITION_ENABLED_ENV",
     "UHCFlexPractitionerOperatorError",
     "acquire_admit_uhc_flex_practitioner_operation",
+    "acquire_uhc_flex_single_root_operation",
     "publish_admitted_uhc_flex_practitioner_operation",
     "require_uhc_flex_practitioner_operator_gate",
     "sync_uhc_flex_practitioner_cohort_operation",

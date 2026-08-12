@@ -167,6 +167,7 @@ def test_provider_directory_enrichment_postgres_proofs_run_exactly_once() -> Non
         "tests/test_provider_directory_uhc_flex_practitioner_publication_postgres.py",
         "tests/test_provider_directory_rooted_graph_adoption_postgres.py",
         "tests/test_provider_directory_rooted_graph_acquisition_postgres.py",
+        "tests/test_provider_directory_rooted_graph_single_root_postgres.py",
         "tests/test_provider_directory_rooted_graph_publication_guards_postgres.py",
         "tests/test_provider_directory_rooted_graph_publication_postgres.py",
     )
@@ -210,8 +211,28 @@ def test_container_proves_rooted_graph_operator_is_packaged_and_dormant() -> Non
     for gate_name in (
         "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_REGISTRATION_ENABLED",
         "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_ENABLED",
+        "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ACQUISITION_ENABLED",
         "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_ENABLED",
     ):
         assert f"-u {gate_name}" in operator_step
+    assert 'test "$operation_status" -eq 1' in operator_step
+    assert "acquire-single-root" in operator_step
+    assert '{"code":"disabled","status":"error"}' in operator_step
+
+
+def test_container_proves_exact_cohort_operator_is_packaged_and_dormant() -> None:
+    workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    operator_step = workflow.split(
+        "      - name: Prove exact-cohort Provider operator is packaged and dormant\n",
+        1,
+    )[1].split("      - name:", 1)[0]
+
+    assert "/opt/scripts/smoke/uhc_flex_practitioner_operator.py" in operator_step
+    assert "HLTHPRT_UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ACQUISITION_ENABLED" in (
+        operator_step
+    )
+    assert "acquire-admit-single-root" in operator_step
     assert 'test "$operation_status" -eq 1' in operator_step
     assert '{"code":"disabled","status":"error"}' in operator_step

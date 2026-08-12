@@ -42,6 +42,7 @@ def _disable_all_gates(monkeypatch) -> None:
     for gate_name in (
         operation.COHORT_ENABLED_ENV,
         operation.ACQUISITION_ENABLED_ENV,
+        operation.SINGLE_ROOT_ACQUISITION_ENABLED_ENV,
         operation.PUBLICATION_ENABLED_ENV,
     ):
         monkeypatch.delenv(gate_name, raising=False)
@@ -75,7 +76,6 @@ def _acquisition_arguments() -> list[str]:
 def test_help_is_runtime_free_and_exposes_no_broad_scan(monkeypatch, capsys):
     script_module = _script_module()
     _forbid_runtime_imports(monkeypatch)
-
     with pytest.raises(SystemExit) as caught:
         script_module.run_command(["--help"])
 
@@ -84,6 +84,7 @@ def test_help_is_runtime_free_and_exposes_no_broad_scan(monkeypatch, capsys):
     assert captured.err == ""
     assert "sync-cohort" in captured.out
     assert "acquire-admit" in captured.out
+    assert "acquire-admit-single-root" in captured.out
     assert "publish-admitted" in captured.out
     for forbidden_control in (
         "--source-id",

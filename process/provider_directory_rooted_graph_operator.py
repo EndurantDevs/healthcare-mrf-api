@@ -19,15 +19,22 @@ from process.provider_directory_rooted_graph_operator_contract import (
     _operation_error,
     ACQUISITION_ENABLED_ENV,
     build_rooted_graph_operator_identities,
+    build_rooted_graph_single_root_identity,
     OPERATOR_PHASES,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_ID,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256,
     PUBLICATION_ENABLED_ENV,
     ProviderDirectoryRootedGraphOperatorError,
     ProviderDirectoryRootedGraphOperatorIdentities,
+    RootedGraphSingleIdentity,
     REGISTRATION_ENABLED_ENV,
+    SINGLE_ROOT_ACQUISITION_ENABLED_ENV,
+    SINGLE_ROOT_ACQUISITION_PHASE,
     require_rooted_graph_operator_gate,
     rooted_graph_operator_contract_payload,
+)
+from process.provider_directory_rooted_graph_single_root_contract import (
+    single_root_operation_payload,
 )
 
 
@@ -152,6 +159,22 @@ class _AcquisitionControls:
     root_timeout_seconds: float
 
 
+def _acquisition_config(controls: _AcquisitionControls) -> Any:
+    from process.provider_directory_rooted_graph_acquisition import (
+        ProviderDirectoryRootedGraphAcquisitionConfig,
+    )
+
+    return ProviderDirectoryRootedGraphAcquisitionConfig(
+        enabled=True,
+        concurrency=controls.concurrency,
+        max_attempts=controls.max_attempts,
+        lease_seconds=controls.lease_seconds,
+        retry_base_seconds=controls.retry_base_seconds,
+        max_retry_seconds=controls.max_retry_seconds,
+        root_timeout_seconds=controls.root_timeout_seconds,
+    )
+
+
 def _require_acquisition_receipt(
     receipt: Any,
     identities: ProviderDirectoryRootedGraphOperatorIdentities,
@@ -200,7 +223,6 @@ async def _run_acquisition_phase(
 
     from process.provider_directory_rooted_graph_acquisition import (
         acquire_provider_directory_rooted_graph_twins,
-        ProviderDirectoryRootedGraphAcquisitionConfig,
         ProviderDirectoryRootedGraphAcquisitionReceipt,
     )
     from process.provider_directory_rooted_graph_twin_store import (
@@ -208,15 +230,7 @@ async def _run_acquisition_phase(
         ProviderDirectoryRootedGraphTwinAdmission,
     )
 
-    config = ProviderDirectoryRootedGraphAcquisitionConfig(
-        enabled=True,
-        concurrency=controls.concurrency,
-        max_attempts=controls.max_attempts,
-        lease_seconds=controls.lease_seconds,
-        retry_base_seconds=controls.retry_base_seconds,
-        max_retry_seconds=controls.max_retry_seconds,
-        root_timeout_seconds=controls.root_timeout_seconds,
-    )
+    config = _acquisition_config(controls)
     current = await _select_exact_current_root(database)
     identities = build_rooted_graph_operator_identities(
         current,
@@ -276,6 +290,98 @@ async def acquire_admit_rooted_graph_operation(
             root_timeout_seconds=root_timeout_seconds,
         )
         return await _run_acquisition_phase(
+            exact_operation_key,
+            controls,
+            database,
+        )
+    except (asyncio.CancelledError, TimeoutError):
+        raise
+    except ProviderDirectoryRootedGraphOperatorError:
+        raise
+    except (TypeError, ValueError):
+        raise ProviderDirectoryRootedGraphOperatorError("invalid_request") from None
+    except Exception as error:
+        raise _operation_error(error, "acquisition") from None
+
+
+async def _run_single_root_acquisition_phase(
+    operation_key: str,
+    controls: _AcquisitionControls,
+    database: Any,
+) -> str:
+    """Acquire and admit one exact candidate under reviewed policy one."""
+
+    from process.provider_directory_rooted_graph_acquisition import (
+        acquire_rooted_graph_single_root,
+        ProviderDirectoryRootedGraphRootReceipt,
+    )
+    from process.provider_directory_rooted_graph_twin_store import (
+        admit_rooted_graph_single_root,
+        ProviderDirectoryRootedGraphTwinAdmission,
+    )
+
+    config = _acquisition_config(controls)
+    current = await _select_exact_current_root(database)
+    identity = build_rooted_graph_single_root_identity(
+        current,
+        operation_key=operation_key,
+    )
+    receipt = await acquire_rooted_graph_single_root(
+        identity.candidate,
+        config=config,
+        database=database,
+    )
+    if (
+        type(receipt) is not ProviderDirectoryRootedGraphRootReceipt
+        or receipt.acquisition_role != "candidate"
+        or receipt.acquisition_id != identity.candidate.acquisition_id
+        or receipt.run_id != identity.candidate.run_id
+    ):
+        raise ProviderDirectoryRootedGraphOperatorError("evidence")
+    admission = await admit_rooted_graph_single_root(
+        receipt.acquisition_id,
+        acquisition_operation_key=operation_key,
+        database=database,
+    )
+    if (
+        type(admission) is not ProviderDirectoryRootedGraphTwinAdmission
+        or admission.publication_acquisition_id != receipt.acquisition_id
+        or admission.attempt_id is not None
+        or admission.comparison_acquisition_id is not None
+        or admission.acquisition_operation_key != operation_key
+        or admission.publication_authority is not True
+    ):
+        raise ProviderDirectoryRootedGraphOperatorError("admission")
+    return _canonical_json(
+        single_root_operation_payload(current, receipt, admission, operation_key)
+    )
+
+
+async def acquire_single_root_operation(
+    *,
+    operation_key: str,
+    concurrency: int,
+    max_attempts: int,
+    lease_seconds: int,
+    retry_base_seconds: float,
+    max_retry_seconds: float,
+    root_timeout_seconds: float,
+    database: Any,
+) -> str:
+    """Acquire and admit one policy-one candidate; never publish."""
+
+    require_rooted_graph_operator_gate(SINGLE_ROOT_ACQUISITION_PHASE)
+    try:
+        exact_operation_key = _exact_operation_key(operation_key)
+        controls = _AcquisitionControls(
+            concurrency=concurrency,
+            max_attempts=max_attempts,
+            lease_seconds=lease_seconds,
+            retry_base_seconds=retry_base_seconds,
+            max_retry_seconds=max_retry_seconds,
+            root_timeout_seconds=root_timeout_seconds,
+        )
+        return await _run_single_root_acquisition_phase(
             exact_operation_key,
             controls,
             database,
@@ -373,9 +479,14 @@ __all__ = (
     "PUBLICATION_ENABLED_ENV",
     "ProviderDirectoryRootedGraphOperatorError",
     "ProviderDirectoryRootedGraphOperatorIdentities",
+    "RootedGraphSingleIdentity",
     "REGISTRATION_ENABLED_ENV",
+    "SINGLE_ROOT_ACQUISITION_ENABLED_ENV",
+    "SINGLE_ROOT_ACQUISITION_PHASE",
     "acquire_admit_rooted_graph_operation",
+    "acquire_single_root_operation",
     "build_rooted_graph_operator_identities",
+    "build_rooted_graph_single_root_identity",
     "publish_admitted_rooted_graph_operation",
     "register_rooted_graph_source_operation",
     "require_rooted_graph_operator_gate",

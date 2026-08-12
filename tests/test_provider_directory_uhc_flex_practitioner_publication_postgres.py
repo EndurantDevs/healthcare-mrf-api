@@ -76,6 +76,9 @@ PUBLICATION_PATH = VERSIONS / (
 ROOTED_PUBLICATION_PATH = VERSIONS / (
     "20260811020000_provider_directory_rooted_graph_acquisition.py"
 )
+SINGLE_ROOT_PATH = VERSIONS / (
+    "20260812030000_provider_directory_specialized_single_root_admission.py"
+)
 PROJECTION_DATE = "2026-08-10"
 SOURCE_ID = "pdfhir_1ceb7c0986c320b7eb924881"
 ENDPOINT_ID = "ad53a7446514ed65b3a8ea7ab68ceb9a1ef85bf6c04fcb882219ecb50928bab5"
@@ -236,6 +239,10 @@ async def _publication_test_scope(monkeypatch):
         ROOTED_PUBLICATION_PATH,
         "flex_publication_rooted",
     )
+    single_root_migration = load_migration(
+        SINGLE_ROOT_PATH,
+        "flex_publication_single_root",
+    )
     try:
         await _prepare_publication_schema(
             engine,
@@ -251,6 +258,7 @@ async def _publication_test_scope(monkeypatch):
         finally:
             await connection.close()
         await run_migration(engine, rooted_migration, "upgrade")
+        await run_migration(engine, single_root_migration, "upgrade")
         await database.connect()
         yield url, schema, database, engine, migrations[3]
     finally:

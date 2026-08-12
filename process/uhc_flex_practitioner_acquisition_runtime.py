@@ -78,6 +78,7 @@ def default_dependencies() -> UHCFlexPractitionerAcquisitionDependencies:
     # The admission store follows this orchestrator's prerequisite contracts.
     # Resolve it lazily so importing this dormant module cannot activate work.
     from process.uhc_flex_practitioner_twin_store import (
+        admit_uhc_flex_practitioner_single_root,
         admit_uhc_flex_practitioner_twins,
     )
 
@@ -93,6 +94,7 @@ def default_dependencies() -> UHCFlexPractitionerAcquisitionDependencies:
         seal_root=seal_uhc_flex_practitioner_acquisition,
         admit_twins=admit_uhc_flex_practitioner_twins,
         session_scope=default_session_scope,
+        admit_single_root=admit_uhc_flex_practitioner_single_root,
     )
 
 
