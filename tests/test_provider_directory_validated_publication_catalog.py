@@ -209,3 +209,124 @@ async def test_catalog_exposes_first_publication_only_without_current(
         catalog
     )
     assert "validated_publication_candidate" not in drifted["items"][0]
+
+
+def _legacy_incumbent_fixture(monkeypatch, **incumbent_overrides):
+    candidate_row = _catalog_dataset_rows(False)[1]
+    candidate = catalog_outcomes.outcomes._current_dataset_from_row(
+        candidate_row,
+        {(SOURCE_ID,)},
+    )
+    assert candidate is not None
+    monkeypatch.setattr(
+        catalog_outcomes.outcomes,
+        "_current_published_dataset_by_source_ids",
+        AsyncMock(return_value={(SOURCE_ID,): candidate}),
+    )
+    monkeypatch.setattr(
+        catalog_outcomes,
+        "_profile_current_dataset_by_source_ids",
+        AsyncMock(return_value={}),
+    )
+    incumbent_row = _dataset_row(
+        endpoint_id=ENDPOINT_ID,
+        dataset_id=CURRENT_DATASET_ID,
+        acquisition_root_run_id="root-current",
+        dataset_hash="a" * 64,
+        publication_metadata=None,
+        current_source_ids=None,
+    )
+    incumbent_row.update(incumbent_overrides)
+    execute = AsyncMock(
+        return_value=_MappingResult([incumbent_row])
+    )
+    monkeypatch.setattr(catalog_outcomes.db, "execute", execute)
+    monkeypatch.setattr(
+        catalog_outcomes,
+        "_canonical_validated_datasets_by_source_id",
+        AsyncMock(
+            return_value={
+                SOURCE_ID: _canonical_publication_dataset(None, None, False)
+            }
+        ),
+    )
+    catalog = deepcopy(_catalog(source_ids=(SOURCE_ID,)))
+    catalog["items"][0]["classification"] = "acquisition"
+    return catalog, execute
+
+
+@pytest.mark.asyncio
+async def test_catalog_uses_scalar_identity_for_legacy_unsealed_incumbent(
+    monkeypatch,
+):
+    """Use an exact scalar incumbent without reading its legacy proof."""
+
+    catalog, execute = _legacy_incumbent_fixture(monkeypatch)
+
+    enriched = await catalog_outcomes.enrich_provider_directory_source_catalog(
+        catalog
+    )
+
+    assert enriched["items"][0]["validated_publication_candidate"] == (
+        _candidate_payload(
+            completion_proof_required_version=None,
+            completion_proof_sha256=None,
+        )
+    )
+    assert enriched["items"][0]["current_outcome_summary"] == {
+        "dataset_id": CURRENT_DATASET_ID,
+        "status": "published",
+        "is_current": True,
+        "endpoint_id": ENDPOINT_ID,
+        "acquisition_root_run_id": "root-current",
+        "dataset_hash": "a" * 64,
+    }
+    incumbent_sql = str(execute.await_args.args[0])
+    for raw_relation in (
+        "publication_metadata_json",
+        "publication_metadata_summary_json",
+        "artifact_selection_receipt_json",
+        "provider_directory_dataset_resource",
+    ):
+        assert raw_relation not in incumbent_sql
+    for state_fence in (
+        "status =",
+        "is_current IS true",
+        "published_at IS NOT NULL",
+        "superseded_at IS NULL",
+    ):
+        assert state_fence in incumbent_sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    (
+        ("endpoint_id", "different-endpoint"),
+        ("dataset_id", "different-dataset"),
+        ("status", "superseded"),
+        ("is_current", False),
+        ("published_at", None),
+        ("superseded_at", dt.datetime(2026, 8, 12, tzinfo=dt.UTC)),
+        ("dataset_hash", "not-a-hash"),
+        ("acquisition_root_run_id", None),
+    ),
+)
+async def test_catalog_rejects_drifted_legacy_incumbent(
+    monkeypatch,
+    field_name,
+    field_value,
+):
+    """Reject scalar incumbents whose identity or serving state drifted."""
+
+    catalog, _ = _legacy_incumbent_fixture(
+        monkeypatch,
+        **{field_name: field_value},
+    )
+
+    enriched = await catalog_outcomes.enrich_provider_directory_source_catalog(
+        catalog
+    )
+
+    assert "current_outcome_summary" not in enriched["items"][0]
+    assert "validated_publication_candidate" not in enriched["items"][0]
