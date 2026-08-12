@@ -18,6 +18,7 @@ from tests.test_provider_directory_two_phase_publication import (
 
 
 async def _insert_graphql_candidate(database, schema: str) -> None:
+    """Insert a replacement on the source's configured endpoint."""
     candidate_metadata = json.dumps(
         {
             "acquisition_root_run_id": "root-graphql-candidate",
@@ -37,6 +38,12 @@ async def _insert_graphql_candidate(database, schema: str) -> None:
     await database.status(
         f"INSERT INTO {schema}.provider_directory_api_endpoint (endpoint_id) "
         "VALUES ('endpoint_graphql');"
+    )
+    await database.status(
+        f"UPDATE {schema}.provider_directory_source SET metadata_json = "
+        "metadata_json::jsonb || CAST(:metadata AS jsonb) "
+        "WHERE source_id = 'source_primary';",
+        metadata=json.dumps({"provider_directory_configured_endpoint_id": "endpoint_graphql"}),
     )
     await database.status(
         f"INSERT INTO {schema}.provider_directory_endpoint_dataset ("
