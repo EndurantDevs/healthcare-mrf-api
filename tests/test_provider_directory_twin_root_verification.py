@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import importlib
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -192,6 +193,84 @@ async def test_verification_baseline_store_does_not_mark_dataset_validated():
         importer.ENDPOINT_DATASET_VERIFICATION_BASELINE
     )
     assert connection.status.await_args.kwargs["marks_validated"] is False
+
+
+@pytest.mark.asyncio
+async def test_dataset_writers_wrap_invalid_admission_seals(monkeypatch):
+    def reject_seal(_metadata):
+        raise importer.AdmissionSealError("invalid")
+
+    monkeypatch.setattr(
+        importer,
+        "admission_seal_from_validated_metadata",
+        reject_seal,
+    )
+    candidate = _candidate()
+
+    with pytest.raises(RuntimeError, match="admission_seal_invalid"):
+        await importer._store_validated_endpoint_dataset(
+            AsyncMock(),
+            candidate,
+            candidate.previous_dataset_id,
+            "d" * 64,
+            2,
+            {"verification": "matched"},
+        )
+    with pytest.raises(RuntimeError, match="admission_seal_invalid"):
+        await importer._store_baseline_payload_retirement(
+            AsyncMock(),
+            candidate,
+            "dataset_baseline",
+            {"verification": "matched"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_baseline_retirement_uses_bounded_admission_receipt(monkeypatch):
+    seal = SimpleNamespace(
+        metadata_summary={"verification": "matched"},
+        metadata_sha256="a" * 64,
+        admission_version=1,
+        admission_kind="generic",
+        proof_sha256="b" * 64,
+        resource_types=("Organization",),
+    )
+    monkeypatch.setattr(
+        importer,
+        "admission_seal_from_validated_metadata",
+        lambda _metadata: seal,
+    )
+    connection = AsyncMock()
+    connection.status.return_value = "UPDATE 1"
+
+    await importer._store_baseline_payload_retirement(
+        connection,
+        _candidate(),
+        "dataset_baseline",
+        {"verification": "matched"},
+    )
+
+    query = connection.status.await_args.args[0]
+    assert "SET publication_metadata_summary_json" in query
+    assert "SET publication_metadata_json" not in query
+    assert connection.status.await_args.kwargs["publication_metadata_sha256"] == (
+        "a" * 64
+    )
+
+    monkeypatch.setattr(
+        importer,
+        "admission_seal_from_validated_metadata",
+        lambda _metadata: None,
+    )
+    connection = AsyncMock()
+    connection.status.return_value = "UPDATE 1"
+    await importer._store_baseline_payload_retirement(
+        connection,
+        _candidate(),
+        "dataset_baseline",
+        {"verification": "matched"},
+    )
+    assert "SET publication_metadata_json" in connection.status.await_args.args[0]
 
 
 @pytest.mark.asyncio
