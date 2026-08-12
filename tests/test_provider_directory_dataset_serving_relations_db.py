@@ -335,8 +335,6 @@ async def test_real_postgres_builds_normalized_relations_and_preserves_other_dat
         _assert_affiliation_edges(affiliation_proof, affiliation_edge_rows)
         await _assert_dataset_b_sentinels(database, schema)
 
-
-
 async def _build_baseline_dataset_a_relations(database: Database, schema: str):
     async with database.acquire() as connection:
         await importer._build_provider_directory_dataset_network_plan(

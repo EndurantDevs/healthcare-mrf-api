@@ -74,6 +74,14 @@ def test_selection_receipt_rejects_oversized_bounded_metadata():
         importer._artifact_selection_receipt(metadata)
 
 
+def test_selection_receipt_rejects_invalid_proof_identity():
+    metadata = _large_metadata_with_normalized_receipt()
+    metadata[importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY] = {}
+
+    with pytest.raises(RuntimeError, match="artifact_selection_receipt_invalid"):
+        importer._artifact_selection_receipt(metadata)
+
+
 @pytest.mark.asyncio
 async def test_validated_store_writes_compact_receipt_atomically():
     candidate, content_proof = _receipt_candidate_and_proof()

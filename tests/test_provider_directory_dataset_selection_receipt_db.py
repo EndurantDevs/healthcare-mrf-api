@@ -357,6 +357,18 @@ async def test_current_repair_records_one_guarded_receipt(monkeypatch):
         )
         assert stored_receipt == importer._artifact_selection_receipt(metadata)
 
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset "
+            "SET status = 'validated' WHERE dataset_id = 'dataset_shared';"
+        )
+        with pytest.raises(
+            importer.ProviderDirectoryArtifactBuildStale,
+            match="provider_directory_endpoint_dataset_metadata_changed",
+        ):
+            await importer._record_current_dataset_selection_receipt(
+                fence.datasets[0], metadata
+            )
+
 
 @pytest.mark.asyncio
 async def test_normalized_receipt_rejects_resource_outside_proof_scope(
