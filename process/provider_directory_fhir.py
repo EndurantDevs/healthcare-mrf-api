@@ -63993,13 +63993,13 @@ def _locked_endpoint_verification_state_sql(dataset_ref: str) -> str:
                dataset.dataset_hash, dataset.resource_count,
                CASE
                    WHEN CAST(:include_twin_states AS boolean)
-                   THEN dataset.publication_metadata_json
+                   THEN dataset.publication_metadata_json::jsonb
                    ELSE NULL::jsonb
                END AS publication_metadata_json,
                completion_proof_required_version,
                CASE
                    WHEN CAST(:include_twin_states AS boolean)
-                   THEN dataset.completion_proof_json
+                   THEN dataset.completion_proof_json::jsonb
                    ELSE NULL::jsonb
                END AS completion_proof_json,
                completion_proof_sha256,

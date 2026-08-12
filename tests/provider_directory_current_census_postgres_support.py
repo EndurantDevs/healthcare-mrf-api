@@ -25,6 +25,10 @@ from process.provider_directory_proof_store import (
     PROVIDER_DIRECTORY_PROOF_SHARD_TABLE,
     ensure_dataset_proof_shard_table,
 )
+from tests.provider_directory_subset_completion_pg_setup import install_subset_canonical_functions
+from tests.test_provider_directory_dataset_artifact_db import (
+    _install_admission_seal_fixture_contract,
+)
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -129,10 +133,7 @@ def practitioner_bundle(
     }
 
 
-async def _create_endpoint_tables(
-    database: Database,
-    schema: str,
-) -> None:
+async def _create_endpoint_tables(database: Database, schema: str) -> None:
     await database.status(
         f"""
         CREATE TABLE "{schema}".provider_directory_api_endpoint (
@@ -190,10 +191,7 @@ async def _create_endpoint_tables(
     )
 
 
-async def _create_checkpoint_table(
-    database: Database,
-    schema: str,
-) -> None:
+async def _create_checkpoint_table(database: Database, schema: str) -> None:
     await database.status(
         f"""
         CREATE TABLE "{schema}".provider_directory_pagination_checkpoint (
@@ -310,6 +308,8 @@ async def _create_census_tables(
     seed_dataset: bool,
 ) -> None:
     await _create_endpoint_tables(database, schema)
+    await install_subset_canonical_functions(database, schema)
+    await _install_admission_seal_fixture_contract(database, schema)
     await _create_checkpoint_table(database, schema)
     await _create_bulk_checkpoint_table(database, schema)
     await _seed_endpoint_dataset(database, schema)
