@@ -13,6 +13,7 @@ import sys
 
 import pytest
 
+from process import provider_directory_admission_seal as seal
 from process.provider_directory_admission_seal import (
     ADMISSION_GENERIC_PROOF_SUMMARY_KEY,
     ADMISSION_METADATA_SUMMARY_MAX_BYTES,
@@ -52,6 +53,56 @@ def _binary_copy_payload(payload: bytes, path: Path) -> None:
         + payload
         + struct.pack("!h", -1)
     )
+
+
+def _admit_with(**proof_updates: object):
+    metadata = _large_metadata_by_field(1)
+    assert isinstance(proof := metadata["provider_directory_content_proof_v1"], dict)
+    proof.update(proof_updates)
+    return admission_seal_from_validated_metadata(metadata)
+
+
+@pytest.mark.parametrize(
+    ("call", "error"),
+    [
+        (lambda: seal._require_ascii_canonical_json({1: None}), "proof_shape"),
+        (lambda: seal._require_ascii_canonical_json(1.5), "proof_shape"),
+        (lambda: seal._normalized_resource_types(None), "resource_types"),
+        (lambda: seal._normalized_resource_types({"": 1}), "resource_types"),
+        (lambda: seal._bounded_metadata_summary({"bad": object()}), "metadata_summary"),
+        (lambda: _admit_with(dataset_hash="x"), "proof_summary"),
+        (lambda: _admit_with(shards=[None]), "shard_summary"),
+        (lambda: _admit_with(shards=[{}]), "shard_summary"),
+        (lambda: _admit_with(shards=[]), "shard_summary"),
+        (lambda: _admit_with(resource_count=2), "shard_summary"),
+        (lambda: _admit_with(proof_sha256="x"), "proof_receipt"),
+        (lambda: admission_seal_from_validated_metadata(None), "metadata_invalid"),
+    ],
+)
+def test_validated_receipt_boundaries_fail_closed(call, error):
+    """Reject malformed receipt fields at their owning validators."""
+    with pytest.raises(AdmissionSealError, match=error):
+        call()
+    assert admission_seal_from_validated_metadata({}) is None
+
+
+def test_streaming_copy_rejects_trailer_drift(tmp_path: Path):
+    """Reject a missing terminator or bytes after the terminator."""
+    copy_path = tmp_path / "metadata.copy"
+    _binary_copy(_large_metadata_by_field(1), copy_path)
+    valid_copy = copy_path.read_bytes()
+    validation_by_field = {
+        "dataset_id": "dataset_shared",
+        "endpoint_id": "endpoint_shared",
+        "evidence_run_id": "root-shared",
+        "dataset_hash": "e" * 64,
+        "resource_count": 1,
+        "scratch_directory": tmp_path,
+    }
+    for invalid_copy in (valid_copy[:-2] + b"\0\0", valid_copy + b"x"):
+        copy_path.write_bytes(invalid_copy)
+        with pytest.raises(AdmissionSealError, match="copy_trailer_invalid"):
+            validate_generic_admission_copy(copy_path, **validation_by_field)
 
 
 def test_validated_metadata_receipt_excludes_raw_proof_and_binds_summary():

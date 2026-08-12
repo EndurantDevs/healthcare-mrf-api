@@ -16,8 +16,8 @@ from tests.test_provider_directory_artifact_eligibility_db import (
     _baseline_metadata,
     _candidate_database,
     _matched_metadata,
-    _metadata_with_hash_identity,
     _option_ids,
+    _seal_core_datasets,
     _set_all_source_profiles,
     _set_source_metadata,
     _set_twin_metadata,
@@ -26,6 +26,44 @@ from tests.test_provider_directory_artifact_eligibility_db import (
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
+
+
+def _metadata_with_hash_identity(
+    metadata: dict[str, object],
+    resource_hash_contract: str,
+) -> dict[str, object]:
+    """Attach the exact resource-hash lineage used by this contract matrix."""
+
+    updated_metadata = copy.deepcopy(metadata)
+    updated_metadata[importer.RESOURCE_HASH_CONTRACT_METADATA_KEY] = (
+        resource_hash_contract
+    )
+    if (
+        resource_hash_contract
+        == importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ):
+        proof_resource_types = list(
+            importer._provider_directory_proof_resource_scope(
+                updated_metadata["selected_resources"]
+            )
+        )
+        semantic_projection_as_of = "2026-08-09"
+        updated_metadata[
+            importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+        ] = proof_resource_types
+        updated_metadata[importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY] = (
+            semantic_projection_as_of
+        )
+        proof = updated_metadata[importer.TWIN_ROOT_VERIFICATION_METADATA_KEY][
+            "proof"
+        ]
+        proof[importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY] = (
+            proof_resource_types
+        )
+        proof[importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY] = (
+            semantic_projection_as_of
+        )
+    return updated_metadata
 
 
 async def _assert_metadata_case(
@@ -368,6 +406,7 @@ async def test_genuine_established_candidate_keeps_profile_absent_path(
                 }
             ),
         )
+        await _seal_core_datasets(database, schema)
         options = await _artifact_options(
             database,
             schema,

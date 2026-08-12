@@ -6,9 +6,12 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+import db.models as db_models
 from process.provider_directory_admission_seal import (
     AdmissionSealError,
     backfill_provider_directory_admission_seal,
@@ -27,6 +30,7 @@ from tests.uhc_final_publication_test_support import final_publication_fixture
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
+backfill = importlib.import_module("process.provider_directory_admission_backfill")
 
 
 @pytest.mark.asyncio
@@ -76,6 +80,137 @@ async def test_backfill_streams_full_proof_and_is_idempotent(monkeypatch):
             "status": "already_sealed",
             "admission_kind": "generic",
         }
+        monkeypatch.setattr(db_models, "db", database)
+        with pytest.raises(AdmissionSealError, match="dataset_missing"):
+            await backfill_provider_directory_admission_seal("dataset_missing")
+
+
+def _unsealed_locked_row(**updates):
+    row_by_field = {
+        "status": importer.ENDPOINT_DATASET_PUBLISHED,
+        "completion_proof_required_version": None,
+        "completion_resource_hashes": None,
+        "completion_resource_counts": None,
+        "raw_metadata_bytes": 1,
+        "evidence_run_id": "root",
+        "dataset_hash": "e" * 64,
+        "resource_count": 1,
+    }
+    row_by_field.update(updates)
+    return row_by_field
+
+
+@pytest.mark.parametrize(
+    ("updates", "error"),
+    [
+        ({"status": "incomplete"}, "status_invalid"),
+        ({"completion_proof_required_version": 2}, "completion_summary_invalid"),
+        ({"raw_metadata_bytes": 0}, "metadata_size_invalid"),
+        (
+            {"raw_metadata_bytes": backfill.ADMISSION_RAW_METADATA_MAX_BYTES + 1},
+            "metadata_size_invalid",
+        ),
+        ({"evidence_run_id": None}, "parent_identity_invalid"),
+        ({"dataset_hash": None}, "parent_identity_invalid"),
+        ({"resource_count": True}, "parent_identity_invalid"),
+        ({"resource_count": "1"}, "parent_identity_invalid"),
+    ],
+)
+def test_backfill_rejects_invalid_locked_row(updates, error):
+    """Reject each unsafe legacy-row boundary before streaming metadata."""
+
+    with pytest.raises(AdmissionSealError, match=error):
+        backfill._validated_row_metadata_size(_unsealed_locked_row(**updates))
+
+
+def test_backfill_rejects_partial_seal():
+    """Never treat a partially written admission receipt as reusable."""
+
+    dataset_row = dict.fromkeys(backfill._SEAL_FIELDS)
+    dataset_row["publication_metadata_summary_json"] = {}
+    with pytest.raises(AdmissionSealError, match="partial_seal"):
+        backfill._existing_seal_result("dataset", dataset_row)
+
+
+def test_backfill_rejects_invalid_schema(monkeypatch):
+    """Keep the dynamic schema identifier outside generated SQL."""
+
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "invalid-schema")
+    with pytest.raises(AdmissionSealError, match="schema_invalid"):
+        backfill._qualified_dataset_table()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dataset_id", ["", " dataset", "dataset "])
+async def test_backfill_rejects_invalid_dataset_id(dataset_id):
+    """Reject blank or whitespace-shifted dataset identities."""
+
+    with pytest.raises(AdmissionSealError, match="dataset_id_invalid"):
+        await backfill_provider_directory_admission_seal(dataset_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "copy_status", "error"),
+    [
+        (b"x" * 133, "COPY 1", "copy_size_invalid"),
+        (b"x", "COPY 0", "copy_lost"),
+    ],
+)
+async def test_backfill_rejects_invalid_copy(
+    monkeypatch,
+    tmp_path,
+    payload,
+    copy_status,
+    error,
+):
+    """Fail closed when bounded COPY output grows or loses its source row."""
+
+    async def copy_from_query(*_args, output, **_kwargs):
+        await output(payload)
+        return copy_status
+
+    monkeypatch.setattr(backfill, "ADMISSION_RAW_METADATA_MAX_BYTES", 4)
+    connection = SimpleNamespace(copy_from_query=copy_from_query)
+    dataset_row_by_field = {
+        "dataset_id": "dataset",
+        "row_ctid": "(0,1)",
+        "row_xmin": "1",
+    }
+    with pytest.raises(AdmissionSealError, match=error):
+        await backfill._copy_metadata(
+            connection,
+            '"mrf"."provider_directory_endpoint_dataset"',
+            dataset_row_by_field,
+            tmp_path,
+        )
+
+
+@pytest.mark.asyncio
+async def test_backfill_rejects_lost_seal_update():
+    """Reject a seal write whose row-version fence no longer matches."""
+
+    connection = SimpleNamespace(execute=AsyncMock(return_value="UPDATE 0"))
+    dataset_row_by_field = {
+        "dataset_id": "dataset",
+        "row_ctid": "(0,1)",
+        "row_xmin": "1",
+    }
+    seal = SimpleNamespace(
+        metadata_summary={},
+        metadata_sha256="a" * 64,
+        admission_version=1,
+        admission_kind="generic",
+        proof_sha256="b" * 64,
+        resource_types=("Location",),
+    )
+    with pytest.raises(AdmissionSealError, match="backfill_lost"):
+        await backfill._store_seal(
+            connection,
+            '"mrf"."provider_directory_endpoint_dataset"',
+            dataset_row_by_field,
+            seal,
+        )
 
 
 @pytest.mark.asyncio
