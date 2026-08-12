@@ -2468,7 +2468,13 @@ async def test_artifact_promotion_identity_recovers_only_exact_cutover(
     )
 
 
-async def _assert_dataset_cutover_row_contract(dataset, fence, incumbent_superseded, monkeypatch):
+async def _assert_dataset_cutover_row_contract(
+    dataset,
+    fence,
+    incumbent_superseded,
+    selected_row_by_field,
+    monkeypatch,
+):
     """Assert dataset cutover row contract."""
     monkeypatch.setattr(
         importer,
@@ -2479,23 +2485,17 @@ async def _assert_dataset_cutover_row_contract(dataset, fence, incumbent_superse
         fence
     )
     incumbent_superseded.return_value = True
-    source_endpoint_cutover = (
-        importer._is_artifact_source_endpoint_cutover_committed
-    )
-    aliases_committed = AsyncMock(return_value=True)
-    monkeypatch.setattr(
-        importer,
-        "_is_artifact_source_endpoint_cutover_committed",
-        aliases_committed,
-    )
-    assert await importer._is_provider_directory_dataset_cutover_committed(
+    selected_row_by_field["fence_source_endpoint_tuples"] = [
+        ["source_b", "endpoint_a"]
+    ]
+    assert not await importer._is_provider_directory_dataset_cutover_committed(
         fence
     )
-    aliases_committed.assert_awaited_once_with(fence)
-    monkeypatch.setattr(
-        importer,
-        "_is_artifact_source_endpoint_cutover_committed",
-        source_endpoint_cutover,
+    selected_row_by_field["fence_source_endpoint_tuples"] = [
+        ["source_a", "endpoint_a"]
+    ]
+    assert await importer._is_provider_directory_dataset_cutover_committed(
+        fence
     )
 
     source_rows = AsyncMock(
@@ -2578,7 +2578,9 @@ async def test_dataset_cutover_commit_requires_exact_rows_and_aliases(
     )
     current_ids.return_value = [dataset.dataset_id]
     incumbent_superseded = Mock(return_value=False)
-    await _assert_dataset_cutover_row_contract(dataset, fence, incumbent_superseded, monkeypatch)
+    await _assert_dataset_cutover_row_contract(
+        dataset, fence, incumbent_superseded, selected_row_by_field, monkeypatch
+    )
 
 
 def test_artifact_incumbent_supersession_contract():

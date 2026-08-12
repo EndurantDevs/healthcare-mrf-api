@@ -21432,9 +21432,7 @@ def _artifact_fence_dataset_rows_sql(*, for_update: bool) -> str:
     )
     detail_ctes = _artifact_fence_dataset_detail_ctes()
     source_endpoint_sql = _artifact_fence_source_endpoints_sql(source_ref)
-    projected_current_ids = (
-        "dataset.locked_current_dataset_ids," if for_update else ""
-    )
+    projected_current_ids = "dataset.locked_current_dataset_ids," if for_update else ""
     return f"""
         WITH {base_cte}, {detail_ctes}
         SELECT dataset.dataset_id,

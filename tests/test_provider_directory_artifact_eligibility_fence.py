@@ -110,9 +110,12 @@ def test_candidate_eligibility_projection_is_compact_and_fail_closed():
         "expected_resources jsonb",
         f"{importer.TWIN_ROOT_VERIFICATION_METADATA_KEY} jsonb",
         f"{importer.REVIEWED_ROOT_POLICY_METADATA_KEY} jsonb",
-        f"{importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY} jsonb",
     ):
         assert field_name in projection_sql
+    assert (
+        f"{importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY} jsonb"
+        not in projection_sql
+    )
     assert (
         f"? '{importer.REVIEWED_ROOT_POLICY_METADATA_KEY}'"
         in projection_sql
@@ -120,6 +123,9 @@ def test_candidate_eligibility_projection_is_compact_and_fail_closed():
     assert (
         f"? '{importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'"
         in projection_sql
+    )
+    assert "candidate.completion_proof_required_version IS NOT NULL" in (
+        projection_sql
     )
     assert "full_metadata_jsonb IS NULL" in projection_sql
     assert "jsonb_typeof(candidate.full_metadata_jsonb) = 'object'" in (
