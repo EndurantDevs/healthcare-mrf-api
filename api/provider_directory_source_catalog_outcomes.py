@@ -15,6 +15,8 @@ from api.provider_directory_rooted_fhir_publication import (
     ROOTED_FHIR_SOURCE_ID_GROUP,
 )
 from api.provider_directory_source_dataset_selection import (
+    _current_dataset_identities_by_id,
+    _dataset_identity,
     _source_local_current_published_dataset_statement,
 )
 from db.models import db
@@ -24,6 +26,7 @@ from process.provider_directory_rooted_graph_publication_facade import (
 from process.provider_directory_validated_publication_contract import (
     AUTOMATIC_VALIDATED_PUBLICATION_POLICY,
     AUTOMATIC_VALIDATED_PUBLICATION_ROLE,
+    ProviderDirectoryDatasetIdentity,
     ValidatedPublicationCandidate,
     canonical_utc_timestamp,
     validated_publication_source_status,
@@ -162,7 +165,7 @@ async def _canonical_validated_datasets_by_source_id(
 def _validated_publication_contract_from_outcomes(
     source_id: str,
     candidate_dataset: outcomes._CurrentPublishedDataset,
-    incumbent_dataset: outcomes._CurrentPublishedDataset | None,
+    incumbent_identity: ProviderDirectoryDatasetIdentity | None,
     canonical_dataset: Any,
 ) -> ValidatedPublicationCandidate | None:
     """Parse the observed candidate and expected current through the schema."""
@@ -186,15 +189,8 @@ def _validated_publication_contract_from_outcomes(
             canonical_dataset.verification_source_scope_hash
         ),
         "expected_current": (
-            {
-                "endpoint_id": incumbent_dataset.endpoint_id,
-                "dataset_id": incumbent_dataset.dataset_id,
-                "dataset_hash": incumbent_dataset.dataset_hash,
-                "acquisition_root_run_id": (
-                    incumbent_dataset.acquisition_root_run_id
-                ),
-            }
-            if incumbent_dataset is not None
+            incumbent_identity.to_payload()
+            if incumbent_identity is not None
             else None
         ),
     }
@@ -207,7 +203,7 @@ def _validated_publication_contract_from_outcomes(
 def _validated_publication_candidate_payload(
     source_id: str,
     candidate_dataset: outcomes._CurrentPublishedDataset,
-    incumbent_dataset: outcomes._CurrentPublishedDataset | None,
+    incumbent_identity: ProviderDirectoryDatasetIdentity | None,
     canonical_dataset: Any,
 ) -> dict[str, Any] | None:
     """Return a closed candidate identity only when every fence agrees."""
@@ -215,7 +211,7 @@ def _validated_publication_candidate_payload(
     publication_candidate = _validated_publication_contract_from_outcomes(
         source_id,
         candidate_dataset,
-        incumbent_dataset,
+        incumbent_identity,
         canonical_dataset,
     )
     if publication_candidate is None:
@@ -255,12 +251,7 @@ def _validated_publication_candidate_payload(
         or canonical_dataset.reviewed_root_policy is not None
     ):
         return None
-    if (expected_current is None) != (incumbent_dataset is None):
-        return None
-    if incumbent_dataset is not None and (
-        incumbent_dataset.status != "published"
-        or incumbent_dataset.is_current is not True
-    ):
+    if expected_current != incumbent_identity:
         return None
     return publication_candidate.to_payload()
 
@@ -296,11 +287,45 @@ def _automatic_publication_source_ids(
     return sorted(automatic_source_ids)
 
 
+async def _legacy_current_identities_by_source_ids(
+    dataset_by_source_ids: Mapping[
+        tuple[str, ...], outcomes._CurrentPublishedDataset
+    ],
+    current_dataset_by_source_ids: Mapping[
+        tuple[str, ...], outcomes._CurrentPublishedDataset
+    ],
+    canonical_dataset_by_source_id: Mapping[str, Any],
+) -> dict[tuple[str, ...], ProviderDirectoryDatasetIdentity]:
+    """Bind sealed candidates to scalar identities of legacy incumbents."""
+
+    candidates_by_source_ids = {
+        source_ids: dataset
+        for source_ids, dataset in dataset_by_source_ids.items()
+        if source_ids not in current_dataset_by_source_ids
+        and len(source_ids) == 1
+        and source_ids[0] in canonical_dataset_by_source_id
+        and dataset.previous_dataset_id is not None
+    }
+    identities_by_id = await _current_dataset_identities_by_id(
+        {
+            dataset.previous_dataset_id
+            for dataset in candidates_by_source_ids.values()
+        }
+    )
+    return {
+        source_ids: identity
+        for source_ids, dataset in candidates_by_source_ids.items()
+        if (identity := identities_by_id.get(dataset.previous_dataset_id))
+        is not None
+        and identity.endpoint_id == dataset.endpoint_id
+    }
+
+
 def _catalog_validated_publication_candidate(
     catalog_entry: Mapping[str, Any],
     source_ids: tuple[str, ...] | None,
     candidate_dataset: outcomes._CurrentPublishedDataset | None,
-    incumbent_dataset: outcomes._CurrentPublishedDataset | None,
+    incumbent_identity: ProviderDirectoryDatasetIdentity | None,
     canonical_dataset_by_source_id: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     if (
@@ -319,7 +344,7 @@ def _catalog_validated_publication_candidate(
     return _validated_publication_candidate_payload(
         source_ids[0],
         candidate_dataset,
-        incumbent_dataset,
+        incumbent_identity,
         canonical_dataset,
     )
 
@@ -354,6 +379,9 @@ def _enriched_catalog_entry(
     current_dataset_by_source_ids: Mapping[
         tuple[str, ...], outcomes._CurrentPublishedDataset
     ],
+    legacy_current_identity_by_source_ids: Mapping[
+        tuple[str, ...], ProviderDirectoryDatasetIdentity
+    ],
     canonical_dataset_by_source_id: Mapping[str, Any],
     rooted_summary: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -369,6 +397,9 @@ def _enriched_catalog_entry(
             dataset
         )
     current_dataset = current_dataset_by_source_ids.get(source_ids or ())
+    legacy_current_identity = legacy_current_identity_by_source_ids.get(
+        source_ids or ()
+    )
     if current_dataset is not None:
         enriched_entry_map["current_outcome_summary"] = (
             _current_outcome_summary(current_dataset)
@@ -377,10 +408,16 @@ def _enriched_catalog_entry(
         catalog_entry,
         source_ids,
         dataset,
-        current_dataset,
+        _dataset_identity(current_dataset) or legacy_current_identity,
         canonical_dataset_by_source_id,
     )
     if candidate_payload_map is not None:
+        if current_dataset is None and legacy_current_identity is not None:
+            enriched_entry_map["current_outcome_summary"] = {
+                **legacy_current_identity.to_payload(),
+                "status": "published",
+                "is_current": True,
+            }
         enriched_entry_map["validated_publication_candidate"] = (
             candidate_payload_map
         )
@@ -418,12 +455,20 @@ async def enrich_provider_directory_source_catalog(
     current_dataset_by_source_ids = await _profile_current_dataset_by_source_ids(
         source_id_groups
     )
+    automatic_source_ids = _automatic_publication_source_ids(
+        catalog_items,
+        dataset_by_source_ids,
+    )
     canonical_dataset_by_source_id = (
         await _canonical_validated_datasets_by_source_id(
-            _automatic_publication_source_ids(
-                catalog_items,
-                dataset_by_source_ids,
-            )
+            automatic_source_ids
+        )
+    )
+    legacy_current_identity_by_source_ids = (
+        await _legacy_current_identities_by_source_ids(
+            dataset_by_source_ids,
+            current_dataset_by_source_ids,
+            canonical_dataset_by_source_id,
         )
     )
     rooted_summary = (
@@ -437,6 +482,7 @@ async def enrich_provider_directory_source_catalog(
             catalog_entry,
             dataset_by_source_ids,
             current_dataset_by_source_ids,
+            legacy_current_identity_by_source_ids,
             canonical_dataset_by_source_id,
             rooted_summary,
         )

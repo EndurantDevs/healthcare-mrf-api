@@ -5,11 +5,14 @@
 from sqlalchemy import and_, case, cast, func, or_, select, true, union_all
 from sqlalchemy.dialects.postgresql import JSONB
 
-from db.models import ProviderDirectoryEndpointDataset, ProviderDirectorySource
+from db.models import ProviderDirectoryEndpointDataset, ProviderDirectorySource, db
 from process.provider_directory_admission_seal import (
     ADMISSION_KIND_GENERIC,
     ADMISSION_KIND_UHC_CANONICAL,
     ADMISSION_SEAL_VERSION,
+)
+from process.provider_directory_validated_publication_contract import (
+    ProviderDirectoryDatasetIdentity,
 )
 
 _ADMISSION_SCHEMA = ProviderDirectoryEndpointDataset.__table__.schema
@@ -183,3 +186,74 @@ def _source_local_current_published_dataset_statement(source_id_groups):
         source_id_groups,
         current_published_only=True,
     )
+
+
+def _current_dataset_identity_statement(dataset_ids):
+    """Select only the scalar CAS identity of exact current datasets."""
+
+    dataset_model = ProviderDirectoryEndpointDataset
+    return select(
+        dataset_model.endpoint_id,
+        dataset_model.dataset_id,
+        dataset_model.acquisition_root_run_id,
+        dataset_model.dataset_hash,
+        dataset_model.status,
+        dataset_model.is_current,
+        dataset_model.published_at,
+        dataset_model.superseded_at,
+    ).where(
+        dataset_model.dataset_id.in_(sorted(dataset_ids)),
+        _current_published_dataset_predicate(dataset_model),
+    )
+
+
+async def _current_dataset_identities_by_id(dataset_ids):
+    """Read exact current identities and recheck their serving state."""
+
+    if not dataset_ids:
+        return {}
+    query_result = await db.execute(
+        _current_dataset_identity_statement(dataset_ids)
+    )
+    identities_by_id = {}
+    for dataset_record in query_result.mappings().all():
+        try:
+            identity = ProviderDirectoryDatasetIdentity.from_payload(
+                {
+                    "endpoint_id": dataset_record.get("endpoint_id"),
+                    "dataset_id": dataset_record.get("dataset_id"),
+                    "dataset_hash": dataset_record.get("dataset_hash"),
+                    "acquisition_root_run_id": dataset_record.get(
+                        "acquisition_root_run_id"
+                    ),
+                }
+            )
+        except ValueError:
+            continue
+        if (
+            identity is not None
+            and dataset_record.get("status") == "published"
+            and dataset_record.get("is_current") is True
+            and dataset_record.get("published_at") is not None
+            and dataset_record.get("superseded_at") is None
+        ):
+            identities_by_id[identity.dataset_id] = identity
+    return identities_by_id
+
+
+def _dataset_identity(dataset):
+    """Parse one selected dataset's scalar CAS identity."""
+
+    if dataset is None:
+        return None
+    try:
+        return ProviderDirectoryDatasetIdentity.from_payload(
+            {
+                "endpoint_id": dataset.endpoint_id,
+                "dataset_id": dataset.dataset_id,
+                "dataset_hash": dataset.dataset_hash,
+                "acquisition_root_run_id": dataset.acquisition_root_run_id,
+            }
+        )
+    except ValueError:
+        return None
