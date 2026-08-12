@@ -112,6 +112,12 @@ async def _create_dataset_table(database: Database, schema: str) -> None:
             published_at timestamp,
             superseded_at timestamp,
             publication_metadata_json jsonb,
+            publication_metadata_summary_json jsonb,
+            publication_metadata_sha256 varchar(64),
+            content_proof_admission_version smallint,
+            content_proof_admission_kind varchar(32),
+            content_proof_admission_sha256 varchar(64),
+            content_proof_resource_types varchar(64)[],
             completion_proof_required_version integer,
             completion_proof_json jsonb,
             completion_proof_sha256 varchar(64)
@@ -125,6 +131,14 @@ async def _create_dataset_table(database: Database, schema: str) -> None:
             endpoint_id varchar(64),
             metadata_json jsonb
         );
+        """
+    )
+    await database.status(
+        f"""
+        CREATE FUNCTION {schema}.provider_directory_endpoint_dataset_admission_metadata_sha256(
+            jsonb, smallint, text, text, varchar[]
+        ) RETURNS varchar LANGUAGE sql IMMUTABLE AS
+            'SELECT repeat(''0'', 64)::varchar';
         """
     )
 
@@ -381,6 +395,18 @@ async def _artifact_option_ids(database: Database, schema: str) -> list[str]:
         baseline=importer.ENDPOINT_DATASET_VERIFICATION_BASELINE,
         validated=importer.ENDPOINT_DATASET_VALIDATED,
         mismatch=importer.ENDPOINT_DATASET_VERIFICATION_MISMATCH,
+    )
+    await database.status(
+        f"""
+        UPDATE {schema}.provider_directory_endpoint_dataset
+           SET publication_metadata_summary_json = '{{}}'::jsonb,
+               publication_metadata_sha256 = repeat('0', 64),
+               content_proof_admission_version = 1,
+               content_proof_admission_kind = 'generic',
+               content_proof_admission_sha256 = repeat('a', 64),
+               content_proof_resource_types = ARRAY['Location']::varchar[]
+         WHERE dataset_id = 'artifact_validated';
+        """
     )
     option_rows = await database.all(
         f"""

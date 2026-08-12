@@ -34,15 +34,15 @@ async def test_backfill_streams_full_proof_and_is_idempotent(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
         metadata = _large_metadata_by_field(64)
         await _set_shared_semantic_proof(database, schema, metadata)
-        result = await backfill_provider_directory_admission_seal(
+        backfill_status_by_field = await backfill_provider_directory_admission_seal(
             "dataset_shared",
             database=database,
         )
 
-        assert result["status"] == "sealed"
-        assert result["admission_kind"] == "generic"
-        assert result["resource_types"] == ["Location"]
-        row = await database.first(
+        assert backfill_status_by_field["status"] == "sealed"
+        assert backfill_status_by_field["admission_kind"] == "generic"
+        assert backfill_status_by_field["resource_types"] == ["Location"]
+        dataset_record = await database.first(
             f"""
             SELECT publication_metadata_summary_json,
                    publication_metadata_sha256,
@@ -54,8 +54,8 @@ async def test_backfill_streams_full_proof_and_is_idempotent(monkeypatch):
              WHERE dataset_id = 'dataset_shared'
             """
         )
-        assert row is not None
-        row_map = row._mapping
+        assert dataset_record is not None
+        row_map = dataset_record._mapping
         assert row_map["content_proof_admission_version"] == 1
         assert row_map["content_proof_admission_kind"] == "generic"
         assert row_map["content_proof_resource_types"] == ["Location"]
@@ -80,6 +80,8 @@ async def test_backfill_streams_full_proof_and_is_idempotent(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sealed_followup_reads_do_not_return_large_raw_proof(monkeypatch):
+    """Read and update only bounded summaries after a row is sealed."""
+
     async with _dataset_database(monkeypatch) as (database, schema):
         metadata = _large_metadata_by_field(2048)
         await _set_shared_semantic_proof(database, schema, metadata)
@@ -92,70 +94,72 @@ async def test_sealed_followup_reads_do_not_return_large_raw_proof(monkeypatch):
             "dataset_shared",
             database=database,
         )
+        await _assert_bounded_followup_projections(database)
+        await _assert_additive_proof_preserves_raw_metadata(database, schema)
 
-        summary_row = await database.first(
-            importer._artifact_source_summary_candidate_sql(),
-            dataset_id="dataset_shared",
-            endpoint_id="endpoint_shared",
-            evidence_run_id="root-shared",
-            previous_dataset_id=None,
-            dataset_hash="e" * 64,
-            is_current=True,
-            expected_status=importer.ENDPOINT_DATASET_PUBLISHED,
-        )
-        profile_row = await importer._current_profile_dataset_map("source_primary")
-        assert summary_row is not None
-        for projected in (
-            dict(summary_row._mapping)["publication_metadata_json"],
-            profile_row["publication_metadata_json"],
-        ):
-            assert "provider_directory_content_proof_v1" not in projected
-            assert projected["source_ids"] == [
-                "source_primary",
-                "source_sibling",
-            ]
 
-        raw_before = await database.first(
-            f"SELECT md5(publication_metadata_json::text) AS digest, "
-            f"octet_length(publication_metadata_json::text) AS byte_count "
-            f"FROM {schema}.provider_directory_endpoint_dataset "
-            "WHERE dataset_id = 'dataset_shared'"
-        )
-        fence = await importer._resolve_provider_directory_artifact_datasets(
-            ["source_primary"]
-        )
-        dataset = next(
-            item
-            for item in fence.datasets
-            if item.dataset_id == "dataset_shared"
-        )
-        await importer._record_current_dataset_publication_proof(
-            dataset,
-            importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY,
-            {"verified": True},
-        )
-        raw_after = await database.first(
-            f"SELECT md5(publication_metadata_json::text) AS digest, "
-            f"octet_length(publication_metadata_json::text) AS byte_count, "
-            "publication_metadata_summary_json -> "
-            "'outcome_resource_counts_v1' AS additive_proof, "
-            "publication_metadata_sha256 = "
-            f"{schema}.provider_directory_endpoint_dataset_admission_metadata_sha256("
-            "publication_metadata_summary_json, "
-            "content_proof_admission_version, "
-            "content_proof_admission_kind, "
-            "content_proof_admission_sha256, "
-            "content_proof_resource_types) AS digest_valid "
-            f"FROM {schema}.provider_directory_endpoint_dataset "
-            "WHERE dataset_id = 'dataset_shared'"
-        )
-        assert raw_before is not None and raw_after is not None
-        assert raw_after._mapping["digest"] == raw_before._mapping["digest"]
-        assert raw_after._mapping["byte_count"] == (
-            raw_before._mapping["byte_count"]
-        )
-        assert raw_after._mapping["additive_proof"] == {"verified": True}
-        assert raw_after._mapping["digest_valid"] is True
+async def _assert_bounded_followup_projections(database) -> None:
+    summary_row = await database.first(
+        importer._artifact_source_summary_candidate_sql(),
+        dataset_id="dataset_shared",
+        endpoint_id="endpoint_shared",
+        evidence_run_id="root-shared",
+        previous_dataset_id=None,
+        dataset_hash="e" * 64,
+        is_current=True,
+        expected_status=importer.ENDPOINT_DATASET_PUBLISHED,
+    )
+    profile_row = await importer._current_profile_dataset_map("source_primary")
+    assert summary_row is not None
+    for projected_metadata in (
+        dict(summary_row._mapping)["publication_metadata_json"],
+        profile_row["publication_metadata_json"],
+    ):
+        assert "provider_directory_content_proof_v1" not in projected_metadata
+        assert projected_metadata["source_ids"] == [
+            "source_primary",
+            "source_sibling",
+        ]
+
+
+async def _assert_additive_proof_preserves_raw_metadata(database, schema: str) -> None:
+    raw_before = await database.first(
+        f"SELECT md5(publication_metadata_json::text) AS digest, "
+        f"octet_length(publication_metadata_json::text) AS byte_count "
+        f"FROM {schema}.provider_directory_endpoint_dataset "
+        "WHERE dataset_id = 'dataset_shared'"
+    )
+    fence = await importer._resolve_provider_directory_artifact_datasets(
+        ["source_primary"]
+    )
+    dataset = next(
+        candidate_dataset
+        for candidate_dataset in fence.datasets
+        if candidate_dataset.dataset_id == "dataset_shared"
+    )
+    await importer._record_current_dataset_publication_proof(
+        dataset,
+        importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY,
+        {"verified": True},
+    )
+    raw_after = await database.first(
+        f"SELECT md5(publication_metadata_json::text) AS digest, "
+        f"octet_length(publication_metadata_json::text) AS byte_count, "
+        "publication_metadata_summary_json -> "
+        "'outcome_resource_counts_v1' AS additive_proof, "
+        "publication_metadata_sha256 = "
+        f"{schema}.provider_directory_endpoint_dataset_admission_metadata_sha256("
+        "publication_metadata_summary_json, content_proof_admission_version, "
+        "content_proof_admission_kind, content_proof_admission_sha256, "
+        "content_proof_resource_types) AS digest_valid "
+        f"FROM {schema}.provider_directory_endpoint_dataset "
+        "WHERE dataset_id = 'dataset_shared'"
+    )
+    assert raw_before is not None and raw_after is not None
+    assert raw_after._mapping["digest"] == raw_before._mapping["digest"]
+    assert raw_after._mapping["byte_count"] == raw_before._mapping["byte_count"]
+    assert raw_after._mapping["additive_proof"] == {"verified": True}
+    assert raw_after._mapping["digest_valid"] is True
 
 
 @pytest.mark.asyncio
@@ -185,10 +189,14 @@ async def test_backfill_binds_completion_resource_summary(monkeypatch):
         proof = metadata["provider_directory_content_proof_v1"]
         assert isinstance(proof, dict)
         proof["resource_hashes"] = {"Location": "a" * 64}
-        unsigned = dict(proof)
-        unsigned.pop("proof_sha256")
+        unsigned_proof_by_field = dict(proof)
+        unsigned_proof_by_field.pop("proof_sha256")
         proof["proof_sha256"] = hashlib.sha256(
-            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+            json.dumps(
+                unsigned_proof_by_field,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
         ).hexdigest()
         await _set_shared_semantic_proof(database, schema, metadata)
         await database.status(
@@ -249,13 +257,13 @@ async def test_backfill_validates_bounded_legacy_canonical_proof(monkeypatch):
             resource_count=state["resource_count"],
         )
 
-        result = await backfill_provider_directory_admission_seal(
+        backfill_status_by_field = await backfill_provider_directory_admission_seal(
             "dataset_shared",
             database=database,
         )
 
-        assert result["status"] == "sealed"
-        assert result["admission_kind"] == "uhc_canonical"
+        assert backfill_status_by_field["status"] == "sealed"
+        assert backfill_status_by_field["admission_kind"] == "uhc_canonical"
         assert await database.scalar(
             f"SELECT content_proof_admission_kind "
             f"FROM {schema}.provider_directory_endpoint_dataset "

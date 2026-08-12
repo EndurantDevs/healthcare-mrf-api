@@ -220,7 +220,7 @@ async def test_global_artifact_scope_is_sealed_proof_bound(monkeypatch):
         await _create_tables(database, schema)
         await _insert_fixture(database, schema)
         proof_sha256 = "a" * 64
-        summary = {
+        summary_by_field = {
             "source_ids": ["source_a"],
             "selected_resources": ["Location"],
             "expected_resources": ["Location"],
@@ -249,7 +249,7 @@ async def test_global_artifact_scope_is_sealed_proof_bound(monkeypatch):
                            ARRAY['Location']::varchar[]
                        );
             """,
-            summary=json.dumps(summary),
+            summary=json.dumps(summary_by_field),
             admission_version=importer.ADMISSION_SEAL_VERSION,
             admission_kind=importer.ADMISSION_KIND_GENERIC,
             proof_sha256=proof_sha256,
@@ -279,56 +279,12 @@ async def test_global_artifact_scope_preserves_cross_endpoint_candidate(
     try:
         await _create_tables(database, schema)
         await _insert_fixture(database, schema)
-        await database.status(
-            f"""
-            DELETE FROM {schema}.provider_directory_source
-             WHERE source_id = 'source_b';
-            """
-        )
-        await database.status(
-            f"""
-            INSERT INTO {schema}.provider_directory_endpoint_dataset (
-                dataset_id, endpoint_id, acquisition_root_run_id, dataset_hash,
-                status, is_current, resource_count, publication_metadata_json
-            ) VALUES (
-                'dataset_b', 'endpoint_b', 'root_b', repeat('c', 64),
-                '{importer.ENDPOINT_DATASET_VALIDATED}', false, 1,
-                jsonb_build_object(
-                    'source_ids', jsonb_build_array('source_a'),
-                    'selected_resources', jsonb_build_array('Location'),
-                    'expected_resources', jsonb_build_array('Location'),
-                    '{importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}',
-                    jsonb_build_object('contract_id', 'content-proof.v1')
-                )
-            );
-            """
-        )
+        await _install_cross_endpoint_candidate(database, schema)
         assert await _selected_rows(
             database,
             select_validated_candidates=True,
         ) == [("source_a", "endpoint_a", "dataset_a")]
-        await database.status(
-            f"""
-            UPDATE {schema}.provider_directory_endpoint_dataset
-               SET publication_metadata_summary_json =
-                       publication_metadata_json,
-                   content_proof_admission_version =
-                       {importer.ADMISSION_SEAL_VERSION},
-                   content_proof_admission_kind =
-                       '{importer.ADMISSION_KIND_GENERIC}',
-                   content_proof_admission_sha256 = repeat('a', 64),
-                   content_proof_resource_types = ARRAY['Location']::varchar[],
-                   publication_metadata_sha256 =
-                       {schema}.provider_directory_endpoint_dataset_admission_metadata_sha256(
-                           publication_metadata_json,
-                           {importer.ADMISSION_SEAL_VERSION}::smallint,
-                           '{importer.ADMISSION_KIND_GENERIC}'::text,
-                           repeat('a', 64),
-                           ARRAY['Location']::varchar[]
-                       )
-             WHERE dataset_id = 'dataset_b';
-            """
-        )
+        await _seal_cross_endpoint_candidate(database, schema)
         assert await _selected_rows(
             database,
             select_validated_candidates=True,
@@ -345,12 +301,53 @@ async def test_global_artifact_scope_preserves_cross_endpoint_candidate(
         )
         assert [
             (
-                str(row._mapping["source_id"]),
-                str(row._mapping["endpoint_id"]),
-                str(row._mapping["dataset_id"]),
+                str(selected_record._mapping["source_id"]),
+                str(selected_record._mapping["endpoint_id"]),
+                str(selected_record._mapping["dataset_id"]),
             )
-            for row in explicit_rows
+            for selected_record in explicit_rows
         ] == [("source_a", "endpoint_b", "dataset_b")]
     finally:
         await database.status(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
         await database.disconnect()
+
+
+async def _install_cross_endpoint_candidate(database: Database, schema: str) -> None:
+    await database.status(
+        f"DELETE FROM {schema}.provider_directory_source "
+        "WHERE source_id = 'source_b';"
+    )
+    await database.status(
+        f"""INSERT INTO {schema}.provider_directory_endpoint_dataset (
+            dataset_id, endpoint_id, acquisition_root_run_id, dataset_hash,
+            status, is_current, resource_count, publication_metadata_json
+        ) VALUES (
+            'dataset_b', 'endpoint_b', 'root_b', repeat('c', 64),
+            '{importer.ENDPOINT_DATASET_VALIDATED}', false, 1,
+            jsonb_build_object(
+                'source_ids', jsonb_build_array('source_a'),
+                'selected_resources', jsonb_build_array('Location'),
+                'expected_resources', jsonb_build_array('Location'),
+                '{importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}',
+                jsonb_build_object('contract_id', 'content-proof.v1')
+            )
+        );"""
+    )
+
+
+async def _seal_cross_endpoint_candidate(database: Database, schema: str) -> None:
+    await database.status(
+        f"""UPDATE {schema}.provider_directory_endpoint_dataset
+           SET publication_metadata_summary_json = publication_metadata_json,
+               content_proof_admission_version = {importer.ADMISSION_SEAL_VERSION},
+               content_proof_admission_kind = '{importer.ADMISSION_KIND_GENERIC}',
+               content_proof_admission_sha256 = repeat('a', 64),
+               content_proof_resource_types = ARRAY['Location']::varchar[],
+               publication_metadata_sha256 =
+                   {schema}.provider_directory_endpoint_dataset_admission_metadata_sha256(
+                       publication_metadata_json,
+                       {importer.ADMISSION_SEAL_VERSION}::smallint,
+                       '{importer.ADMISSION_KIND_GENERIC}'::text,
+                       repeat('a', 64), ARRAY['Location']::varchar[])
+         WHERE dataset_id = 'dataset_b';"""
+    )

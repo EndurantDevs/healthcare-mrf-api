@@ -36,18 +36,18 @@ def _peak_rss_bytes() -> int:
 )
 def test_168275_shard_copy_revalidates_below_two_gib(tmp_path: Path):
     metadata = _large_metadata_by_field(_SHARD_COUNT)
-    payload = json.dumps(metadata, separators=(",", ":")).encode()
-    payload_bytes = len(payload)
+    proof_payload = json.dumps(metadata, separators=(",", ":")).encode()
+    payload_bytes = len(proof_payload)
     assert 100 * 1024 * 1024 < payload_bytes < 256 * 1024 * 1024
     copy_path = tmp_path / "metadata.copy"
     with copy_path.open("wb") as output:
         output.write(_COPY_SIGNATURE)
         output.write(struct.pack("!ii", 0, 0))
         output.write(struct.pack("!h", 1))
-        output.write(struct.pack("!i", len(payload)))
-        output.write(payload)
+        output.write(struct.pack("!i", len(proof_payload)))
+        output.write(proof_payload)
         output.write(struct.pack("!h", -1))
-    del payload
+    del proof_payload
 
     receipt = validate_generic_admission_copy(
         copy_path,

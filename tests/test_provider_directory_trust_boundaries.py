@@ -2742,22 +2742,7 @@ async def test_dataset_fence_helpers_lock_record_and_aggregate_proof(
     scoped_fence = importer._artifact_fence_for_dataset(fence, "dataset-a")
     assert scoped_fence.datasets == fence.datasets
     assert scoped_fence.promotion_aliases == fence.promotion_aliases
-    with pytest.raises(
-        RuntimeError,
-        match="dataset_endpoint_ambiguous",
-    ):
-        importer._unique_artifact_datasets(
-            importer.ProviderDirectoryArtifactDatasetFence(
-                (
-                    dataset,
-                    importer.replace(
-                        dataset,
-                        source_id="source-c",
-                        endpoint_id="endpoint-b",
-                    ),
-                )
-            )
-        )
+    _assert_ambiguous_dataset_endpoint_rejected(dataset)
 
     executor = SimpleNamespace(scalar=AsyncMock())
     await importer._lock_dataset_serving_relation_build(
@@ -2790,6 +2775,22 @@ async def test_dataset_fence_helpers_lock_record_and_aggregate_proof(
         )
     status.assert_not_awaited()
     await _assert_dataset_fence_lock_contract(dataset, status)
+
+
+def _assert_ambiguous_dataset_endpoint_rejected(dataset) -> None:
+    with pytest.raises(RuntimeError, match="dataset_endpoint_ambiguous"):
+        importer._unique_artifact_datasets(
+            importer.ProviderDirectoryArtifactDatasetFence(
+                (
+                    dataset,
+                    importer.replace(
+                        dataset,
+                        source_id="source-c",
+                        endpoint_id="endpoint-b",
+                    ),
+                )
+            )
+        )
 
 
 @pytest.mark.asyncio
