@@ -107,6 +107,42 @@ async def abandon_materialized_preclaim_wave(
         )
 
 
+async def get_materialized_preclaim_abandonment(
+    wave_id: object,
+) -> dict[str, Any] | None:
+    """Return one validated persisted legacy abandonment without mutation."""
+
+    normalized_wave_id = _identity(wave_id, "wave ID")
+    quarantine = (
+        await db.execute(
+            select(PTGImportWaveQuarantine).where(
+                PTGImportWaveQuarantine.predecessor_wave_id
+                == normalized_wave_id
+            )
+        )
+    ).scalar_one_or_none()
+    if quarantine is None:
+        return None
+    if (
+        getattr(quarantine, "reason", None) != QUARANTINE_REASON
+        or getattr(quarantine, "recovery_basis", None) != QUARANTINE_REASON
+    ):
+        raise PTGWaveMaterializedPreclaimConflict(
+            "wave is already quarantined by another recovery"
+        )
+    cutover_id = _identity(getattr(quarantine, "cutover_id", None), "cutover ID")
+    proof = _validated_existing_legacy_proof(
+        quarantine,
+        wave_id=normalized_wave_id,
+        cutover_id=cutover_id,
+    )
+    return {
+        "wave_id": normalized_wave_id,
+        "cutover_id": cutover_id,
+        "recovery_evidence": proof,
+    }
+
+
 def _normalized_abandonment_request(
     wave_id: object,
     cutover_or_request: object,
@@ -251,6 +287,28 @@ def _existing_legacy_response(
     wave_id: str,
     cutover_id: str,
 ) -> dict[str, Any]:
+    proof = _validated_existing_legacy_proof(
+        quarantine,
+        wave_id=wave_id,
+        cutover_id=cutover_id,
+    )
+    return _legacy_response(
+        wave_id=wave_id,
+        cutover_id=cutover_id,
+        proof=proof,
+        proof_digest=proof["proof_digest"],
+        created=False,
+    )
+
+
+def _validated_existing_legacy_proof(
+    quarantine: Any,
+    *,
+    wave_id: str,
+    cutover_id: str,
+) -> dict[str, Any]:
+    """Validate the exact stored proof shared by GET and POST replay."""
+
     if (
         getattr(quarantine, "reason", None) != QUARANTINE_REASON
         or getattr(quarantine, "recovery_basis", None) != QUARANTINE_REASON
@@ -265,17 +323,22 @@ def _existing_legacy_response(
         successor_wave_id=cutover_id,
     )
     proof_digest = getattr(quarantine, "recovery_evidence_sha256", None)
-    if proof_digest != proof["proof_digest"]:
-        raise PTGWaveMaterializedPreclaimConflict(
-            "stored abandonment proof digest is invalid"
-        )
-    return _legacy_response(
-        wave_id=wave_id,
-        cutover_id=cutover_id,
-        proof=proof,
-        proof_digest=proof_digest,
-        created=False,
+    canonical = canonical_json(
+        {
+            field_name: field_value
+            for field_name, field_value in proof.items()
+            if field_name != "proof_digest"
+        }
     )
+    if (
+        proof_digest != proof["proof_digest"]
+        or getattr(quarantine, "recovery_evidence_canonical", None)
+        != canonical
+    ):
+        raise PTGWaveMaterializedPreclaimConflict(
+            "stored abandonment proof metadata is invalid"
+        )
+    return proof
 
 
 def _existing_v12_response(
@@ -426,4 +489,7 @@ def _identity(value: object, name: str) -> str:
     return value
 
 
-__all__ = ["abandon_materialized_preclaim_wave"]
+__all__ = [
+    "abandon_materialized_preclaim_wave",
+    "get_materialized_preclaim_abandonment",
+]

@@ -15,6 +15,7 @@ from api.control_import_waves import (
 )
 from api.control_import_wave_abandonment import (
     abandon_materialized_preclaim_wave,
+    get_materialized_preclaim_abandonment,
 )
 from api.control_wave_linkage_route import control_record_import_wave_linkage
 from process.ptg_parts.ptg_wave_admission_fence import PTGWaveCapacityConflict
@@ -357,6 +358,26 @@ async def control_abandon_materialized_preclaim_wave(
     return response.json(abandonment_result, status=201 if created else 200, default=str)
 
 
+async def control_get_materialized_preclaim_abandonment(
+    request,
+    wave_id: str,
+):
+    """Return one persisted legacy abandonment proof without mutation."""
+
+    require_control_auth(request)
+    if request.args:
+        raise BadRequest("materialized abandonment query fields are not exact")
+    try:
+        proof = await get_materialized_preclaim_abandonment(wave_id)
+    except PTGWaveMaterializedPreclaimConflict as exc:
+        raise SanicException(str(exc), status_code=409) from exc
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    if proof is None:
+        raise NotFound("materialized abandonment proof not found")
+    return response.json(proof, default=str)
+
+
 async def control_issue_ordinary_terminal_receipt(
     request,
     wave_id: str,
@@ -466,6 +487,9 @@ def register_control_wave_routes(blueprint):
     blueprint.post(
         "/import-waves/<wave_id>/materialized-preclaim-abandonment"
     )(control_abandon_materialized_preclaim_wave)
+    blueprint.get(
+        "/import-waves/<wave_id>/materialized-preclaim-abandonment"
+    )(control_get_materialized_preclaim_abandonment)
     blueprint.post(
         "/import-waves/<wave_id>/ordinary-terminal-receipts"
     )(control_issue_ordinary_terminal_receipt)

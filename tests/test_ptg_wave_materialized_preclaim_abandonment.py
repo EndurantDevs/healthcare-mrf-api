@@ -53,11 +53,19 @@ class _Session:
 
 
 def _stored_quarantine(proof: dict, *, cutover_id="successor-wave"):
+    canonical = abandonment.canonical_json(
+        {
+            field_name: field_value
+            for field_name, field_value in proof.items()
+            if field_name != "proof_digest"
+        }
+    )
     return SimpleNamespace(
         reason="materialized_preclaim_failure",
         recovery_basis="materialized_preclaim_failure",
         cutover_id=cutover_id,
         recovery_evidence=proof,
+        recovery_evidence_canonical=canonical,
         recovery_evidence_sha256=proof["proof_digest"],
     )
 
@@ -226,12 +234,58 @@ async def test_exact_replay_rejects_a_stored_digest_mismatch(monkeypatch):
 
     with pytest.raises(
         PTGWaveMaterializedPreclaimConflict,
-        match="stored abandonment proof digest",
+        match="stored abandonment proof metadata",
     ):
         await abandonment.abandon_materialized_preclaim_wave(
             "materialized-wave",
             "successor-wave",
             redis=object(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_abandonment_proof_get_is_exact_and_read_only(monkeypatch):
+    proof = _attest()
+    session = _Session(_stored_quarantine(proof))
+    execute = AsyncMock(side_effect=session.execute)
+    monkeypatch.setattr(abandonment.db, "execute", execute)
+
+    assert await abandonment.get_materialized_preclaim_abandonment(
+        "materialized-wave"
+    ) == {
+        "wave_id": "materialized-wave",
+        "cutover_id": "successor-wave",
+        "recovery_evidence": proof,
+    }
+    execute.assert_awaited_once()
+    assert session.added == []
+    assert session.flush_count == 0
+
+    session.existing = None
+    assert await abandonment.get_materialized_preclaim_abandonment(
+        "materialized-wave"
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_abandonment_proof_get_rejects_another_quarantine_family(
+    monkeypatch,
+):
+    session = _Session(
+        SimpleNamespace(
+            reason="another-recovery",
+            recovery_basis="another-recovery",
+            cutover_id=None,
+        )
+    )
+    monkeypatch.setattr(abandonment.db, "execute", session.execute)
+
+    with pytest.raises(
+        PTGWaveMaterializedPreclaimConflict,
+        match="another recovery",
+    ):
+        await abandonment.get_materialized_preclaim_abandonment(
+            "materialized-wave"
         )
 
 
@@ -312,6 +366,9 @@ async def test_control_route_is_exact_authenticated_and_idempotent(monkeypatch):
     assert ("POST", path) in [
         (method, route) for method, route, _handler in registered_routes
     ]
+    assert ("GET", path) in [
+        (method, route) for method, route, _handler in registered_routes
+    ]
 
     monkeypatch.setattr(routes, "require_control_auth", lambda _request: None)
     service = AsyncMock(return_value=({"created": True}, True))
@@ -331,6 +388,19 @@ async def test_control_route_is_exact_authenticated_and_idempotent(monkeypatch):
         redis="redis",
         receipt_keyring=None,
     )
+
+    proof_service = AsyncMock(return_value={"wave_id": "materialized-wave"})
+    monkeypatch.setattr(
+        routes,
+        "get_materialized_preclaim_abandonment",
+        proof_service,
+    )
+    proof_response = await routes.control_get_materialized_preclaim_abandonment(
+        SimpleNamespace(args={}),
+        "materialized-wave",
+    )
+    assert proof_response.status == 200
+    proof_service.assert_awaited_once_with("materialized-wave")
 
     for request_body in ({}, {"cutover_id": "x", "extra": True}, []):
         with pytest.raises(BadRequest):
