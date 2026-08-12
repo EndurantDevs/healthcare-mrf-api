@@ -41,6 +41,7 @@ async def _create_tables(database: Database, schema: str) -> None:
         "is_current boolean NOT NULL DEFAULT true, "
         "superseded_at timestamptz, "
         "publication_metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb, "
+        "artifact_selection_receipt_json jsonb, "
         "completion_proof_required_version integer, "
         "completion_proof_json jsonb, "
         "completion_proof_sha256 varchar(64)"
