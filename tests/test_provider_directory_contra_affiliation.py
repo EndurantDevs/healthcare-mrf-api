@@ -1,25 +1,16 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import importlib
-import importlib.util
 import json
 from pathlib import Path
 
 import pytest
 
 from db.models.system import ProviderDirectoryOrganizationAffiliation
-
-
-_DB_FIXTURE_PATH = Path(__file__).with_name(
-    "test_provider_directory_dataset_serving_relations_db.py"
+from tests import (
+    test_provider_directory_dataset_serving_relations_db as db_fixtures,
 )
-_DB_FIXTURE_SPEC = importlib.util.spec_from_file_location(
-    "db_fixtures",
-    _DB_FIXTURE_PATH,
-)
-db_fixtures = importlib.util.module_from_spec(_DB_FIXTURE_SPEC)
-assert _DB_FIXTURE_SPEC.loader is not None
-_DB_FIXTURE_SPEC.loader.exec_module(db_fixtures)
+
 
 _FHIR_FIXTURE_PATH = Path(__file__).parent / "fixtures" / (
     "provider_directory_contra_affiliations.json"
