@@ -69247,6 +69247,41 @@ def _admission_seal_parameters(
     }
 
 
+async def _lock_validated_candidate_sources(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+) -> None:
+    """Serialize candidate admission with source-scoped artifact cutover."""
+
+    source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
+    expected_source_ids = tuple(sorted(set(candidate.source_ids)))
+    source_rows = await connection.all(
+        f"""
+        SELECT source.source_id
+          FROM {source_ref} AS source
+         WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
+         ORDER BY source.source_id
+         FOR NO KEY UPDATE OF source;
+        """,
+        source_ids=list(expected_source_ids),
+    )
+    locked_source_ids = tuple(
+        source_id
+        for source_row in source_rows
+        if (
+            source_id := _clean_text(
+                _pagination_checkpoint_row_mapping(source_row).get(
+                    "source_id"
+                )
+            )
+        )
+    )
+    if locked_source_ids != expected_source_ids:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_source_changed"
+        )
+
+
 async def _store_validated_endpoint_dataset(
     connection: Any,
     candidate: EndpointDatasetCandidate,
@@ -69277,6 +69312,8 @@ async def _store_validated_endpoint_dataset(
         raise RuntimeError(
             "provider_directory_endpoint_dataset_admission_seal_invalid"
         ) from error
+    if status == ENDPOINT_DATASET_VALIDATED:
+        await _lock_validated_candidate_sources(connection, candidate)
     query_parameters_by_name = {
         "previous_dataset_id": previous_dataset_id,
         "dataset_hash": dataset_hash,
