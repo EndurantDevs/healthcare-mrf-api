@@ -13,6 +13,7 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql import ClauseElement, Executable
 
 from api import provider_directory_source_outcomes as outcomes
+from api import provider_directory_source_dataset_selection as selection
 from api.provider_directory_source_dataset_selection import (
     _source_local_current_published_dataset_statement,
 )
@@ -79,14 +80,32 @@ async def _create_outcome_selection_tables(
     await database.status(
         f"CREATE TABLE {schema}.provider_directory_endpoint_dataset ("
         "dataset_id varchar(96) PRIMARY KEY, endpoint_id varchar(64) NOT NULL, "
-        "acquisition_root_run_id varchar(64), dataset_hash varchar(64), "
+        "acquisition_root_run_id varchar(64), previous_dataset_id varchar(96), "
+        "dataset_hash varchar(64), "
         "status varchar(32) NOT NULL, is_current boolean NOT NULL, "
         "validated_at timestamp, published_at timestamp, superseded_at timestamp, "
-        "resource_count bigint NOT NULL, publication_metadata_json json);"
+        "resource_count bigint NOT NULL, publication_metadata_json jsonb, "
+        "publication_metadata_summary_json jsonb, "
+        "publication_metadata_sha256 varchar(64), "
+        "content_proof_admission_version smallint, "
+        "content_proof_admission_kind varchar(32), "
+        "content_proof_admission_sha256 varchar(64), "
+        "content_proof_resource_types varchar(64)[], "
+        "artifact_selection_receipt_json jsonb);"
     )
     await database.status(
         f"CREATE INDEX provider_directory_endpoint_dataset_endpoint_idx "
         f"ON {schema}.provider_directory_endpoint_dataset (endpoint_id);"
+    )
+    await database.status(
+        f"CREATE FUNCTION {schema}."
+        "provider_directory_endpoint_dataset_admission_metadata_sha256("
+        "metadata_summary jsonb, admission_version smallint, "
+        "admission_kind text, proof_sha256 text, resource_types varchar[]) "
+        "RETURNS varchar LANGUAGE sql IMMUTABLE STRICT AS $$ "
+        "SELECT encode(sha256(convert_to(jsonb_build_array("
+        "metadata_summary, admission_version, admission_kind, proof_sha256, "
+        "to_jsonb(resource_types))::text, 'UTF8')), 'hex')::varchar $$;"
     )
 
 
@@ -145,7 +164,7 @@ async def _insert_outcome_dataset(
         ":dataset_id, :endpoint_id, :root_run_id, :dataset_hash, :status, "
         ":is_current, CAST(:validated_at AS timestamp), "
         "CAST(:published_at AS timestamp), CAST(:superseded_at AS timestamp), "
-        "1, CAST(:metadata AS json));",
+        "1, CAST(:metadata AS jsonb));",
         dataset_id=dataset_id,
         endpoint_id=endpoint_id,
         root_run_id="root-" + dataset_id,
@@ -213,7 +232,7 @@ async def _seed_outcome_selection_datasets(
         "status, is_current, validated_at, published_at, superseded_at, "
         "resource_count, publication_metadata_json) VALUES ("
         "'multi-current', 'endpoint-multi', 'root-multi', :dataset_hash, "
-        "'published', true, now(), now(), NULL, 1, CAST(:metadata AS json));",
+        "'published', true, now(), now(), NULL, 1, CAST(:metadata AS jsonb));",
         dataset_hash="a" * 64,
         metadata=json.dumps({
             "source_ids": ["source-multi-b", "source-multi-a"],
@@ -238,16 +257,40 @@ async def _seed_outcome_selection_datasets(
     )
 
 
+async def _seal_outcome_selection_datasets(database: Database, schema: str) -> None:
+    digest = (
+        f'"{schema}".'
+        "provider_directory_endpoint_dataset_admission_metadata_sha256"
+    )
+    proof_sha256 = "b" * 64
+    await database.status(
+        f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
+        "publication_metadata_summary_json = publication_metadata_json, "
+        "content_proof_admission_version = 1, "
+        "content_proof_admission_kind = 'generic', "
+        "content_proof_admission_sha256 = :stored_proof_sha256, "
+        "content_proof_resource_types = ARRAY[]::varchar[], "
+        f"publication_metadata_sha256 = {digest}("
+        "publication_metadata_json, 1::smallint, 'generic'::text, "
+        "CAST(:digest_proof_sha256 AS text), ARRAY[]::varchar[]) "
+        "WHERE dataset_id NOT LIKE 'unrequested-%';",
+        stored_proof_sha256=proof_sha256,
+        digest_proof_sha256=proof_sha256,
+    )
+
+
 @asynccontextmanager
-async def _outcome_selection_schema():
+async def _outcome_selection_schema(monkeypatch):
     database = await _disposable_outcome_database()
     schema = f"provider_directory_outcomes_{uuid.uuid4().hex[:12]}"
     is_created = False
     try:
+        monkeypatch.setattr(selection, "_ADMISSION_SCHEMA", schema)
         await _create_outcome_selection_tables(database, schema)
         is_created = True
         await _insert_outcome_selection_sources(database, schema)
         await _seed_outcome_selection_datasets(database, schema)
+        await _seal_outcome_selection_datasets(database, schema)
         yield database, schema
     finally:
         if is_created:
@@ -262,11 +305,18 @@ def _plan_nodes(plan_map):
 
 
 def test_source_local_query_is_bounded_ranked_and_metadata_only():
-    statement = outcomes._current_published_dataset_statement({SOURCE_IDS})
+    source_id_groups = {SOURCE_IDS} | {
+        (f"synthetic-source-{index}",) for index in range(39)
+    }
+    statement = outcomes._current_published_dataset_statement(source_id_groups)
     selected_sql = str(statement)
     bound_values = statement.compile().params.values()
 
     assert "provider_directory_endpoint_dataset" in selected_sql
+    assert "publication_metadata_json" not in selected_sql
+    assert "publication_metadata_summary_json" in selected_sql
+    assert "artifact_selection_receipt_json" not in selected_sql
+    assert "admission_metadata_sha256" in selected_sql
     assert "provider_directory_dataset_resource" not in selected_sql
     assert "provider_directory_api_endpoint" not in selected_sql
     assert "provider_directory_source" in selected_sql
@@ -274,9 +324,10 @@ def test_source_local_query_is_bounded_ranked_and_metadata_only():
     assert "array_agg" in selected_sql.lower()
     assert "jsonb_array_length" in selected_sql.lower()
     assert "CASE WHEN" in selected_sql
-    assert selected_sql.count("@>") == 2
+    assert selected_sql.count("@>") == 2 * len(source_id_groups)
     assert "ORDER BY" in selected_sql
     assert "LIMIT" in selected_sql
+    assert selected_sql.count("LIMIT") == 40
     assert any(value == list(SOURCE_IDS) for value in bound_values)
     assert "resource_count" in selected_sql
     assert "superseded_at" in selected_sql
@@ -284,7 +335,10 @@ def test_source_local_query_is_bounded_ranked_and_metadata_only():
 
 
 def test_current_source_local_query_uses_exact_profile_publication_state():
-    statement = _source_local_current_published_dataset_statement({SOURCE_IDS})
+    source_id_groups = {SOURCE_IDS} | {
+        (f"synthetic-source-{index}",) for index in range(39)
+    }
+    statement = _source_local_current_published_dataset_statement(source_id_groups)
     selected_sql = str(statement)
     bound_values = statement.compile().params.values()
 
@@ -294,6 +348,10 @@ def test_current_source_local_query_uses_exact_profile_publication_state():
     assert "superseded_at IS NULL" in selected_sql
     assert "validated_at IS NOT NULL" not in selected_sql
     assert "LIMIT" in selected_sql
+    assert selected_sql.count("LIMIT") == 40
+    assert "publication_metadata_json" not in selected_sql
+    assert "artifact_selection_receipt_json" not in selected_sql
+    assert "admission_metadata_sha256" in selected_sql
     assert "provider_directory_dataset_resource" not in selected_sql
     assert "published" in bound_values
 
@@ -383,17 +441,17 @@ async def test_superseded_outcome_keeps_historic_state_truthful(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ranked_selector_is_bounded_on_disposable_postgres():
+async def test_ranked_selector_is_bounded_on_disposable_postgres(monkeypatch):
     source_id_groups = {
         ("source-published",),
         ("source-reassigned",),
         ("source-validated",),
         ("source-multi-a", "source-multi-b"),
-    }
-    statement = outcomes._current_published_dataset_statement(
-        source_id_groups
-    )
-    async with _outcome_selection_schema() as (database, schema):
+    } | {(f"synthetic-source-{index}",) for index in range(36)}
+    async with _outcome_selection_schema(monkeypatch) as (database, schema):
+        statement = outcomes._current_published_dataset_statement(
+            source_id_groups
+        )
         translated_statement = statement.execution_options(
             schema_translate_map={"mrf": schema}
         )
@@ -409,23 +467,23 @@ async def test_ranked_selector_is_bounded_on_disposable_postgres():
         explain_result = await database.execute(
             _PostgresExplain(translated_statement)
         )
+        current_explain_result = await database.execute(
+            _PostgresExplain(current_statement)
+        )
 
-    assert [row_map["dataset_id"] for row_map in selected_row_maps] == [
-        "multi-current",
-        "published-current",
-        "reassigned-current",
-        "validated-candidate",
-    ]
-    assert len(selected_row_maps) == len(source_id_groups)
-    assert [row_map["dataset_id"] for row_map in current_row_maps] == [
-        "multi-current",
-        "published-current",
-        "reassigned-current",
-        "validated-incumbent",
-    ]
-    plan_map = explain_result.scalars().one()[0]["Plan"]
-    plan_node_maps = list(_plan_nodes(plan_map))
-    assert plan_map["Plan Rows"] <= len(source_id_groups)
+    selected_ids = [row_map["dataset_id"] for row_map in selected_row_maps]
+    assert selected_ids == ["multi-current", "published-current",
+                            "reassigned-current", "validated-candidate"]
+    assert len(selected_row_maps) == 4
+    current_ids = [row_map["dataset_id"] for row_map in current_row_maps]
+    assert current_ids == ["multi-current", "published-current",
+                           "reassigned-current", "validated-incumbent"]
+    plan_maps = (
+        explain_result.scalars().one()[0]["Plan"],
+        current_explain_result.scalars().one()[0]["Plan"],
+    )
+    plan_node_maps = [node for plan in plan_maps for node in _plan_nodes(plan)]
+    assert all(plan["Plan Rows"] <= len(source_id_groups) for plan in plan_maps)
     assert any(
         node_map.get("Index Name")
         == "provider_directory_endpoint_dataset_endpoint_idx"

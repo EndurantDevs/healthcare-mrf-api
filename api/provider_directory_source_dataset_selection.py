@@ -2,17 +2,51 @@
 
 """Bounded dataset selection for Provider Directory source scopes."""
 
-from sqlalchemy import and_, case, cast, func, or_, select, union_all
+from sqlalchemy import and_, case, cast, func, or_, select, true, union_all
 from sqlalchemy.dialects.postgresql import JSONB
 
 from db.models import ProviderDirectoryEndpointDataset, ProviderDirectorySource
+from process.provider_directory_admission_seal import (
+    ADMISSION_KIND_GENERIC,
+    ADMISSION_KIND_UHC_CANONICAL,
+    ADMISSION_SEAL_VERSION,
+)
+
+_ADMISSION_SCHEMA = ProviderDirectoryEndpointDataset.__table__.schema
 
 
-def _exact_source_scope_predicate(dataset_model, source_ids):
-    metadata_source_ids = cast(
-        dataset_model.publication_metadata_json,
-        JSONB,
-    ).op("->")("source_ids")
+def _catalog_publication_metadata(dataset_model):
+    """Return compact admitted metadata without opening the raw proof JSON."""
+
+    digest = getattr(
+        getattr(func, _ADMISSION_SCHEMA),
+        "provider_directory_endpoint_dataset_admission_metadata_sha256",
+    )
+    sealed = and_(
+        dataset_model.content_proof_admission_version == ADMISSION_SEAL_VERSION,
+        dataset_model.content_proof_admission_kind.in_(
+            (ADMISSION_KIND_GENERIC, ADMISSION_KIND_UHC_CANONICAL)
+        ),
+        dataset_model.content_proof_admission_sha256.op("~")(r"^[0-9a-f]{64}$"),
+        func.jsonb_typeof(dataset_model.publication_metadata_summary_json)
+        == "object",
+        dataset_model.publication_metadata_sha256
+        == digest(
+            dataset_model.publication_metadata_summary_json,
+            dataset_model.content_proof_admission_version,
+            dataset_model.content_proof_admission_kind,
+            dataset_model.content_proof_admission_sha256,
+            dataset_model.content_proof_resource_types,
+        ),
+    )
+    return case(
+        (sealed, dataset_model.publication_metadata_summary_json),
+        else_=cast(None, JSONB),
+    )
+
+
+def _exact_source_scope_predicate(publication_metadata, source_ids):
+    metadata_source_ids = publication_metadata.op("->")("source_ids")
     requested_source_ids = cast(list(source_ids), JSONB)
     return and_(
         case(
@@ -66,6 +100,12 @@ def _source_scope_dataset_statement(
 ):
     dataset_model = ProviderDirectoryEndpointDataset
     source_model = ProviderDirectorySource
+    catalog_metadata = select(
+        _catalog_publication_metadata(dataset_model).label(
+            "publication_metadata"
+        )
+    ).correlate(dataset_model).lateral("catalog_metadata")
+    publication_metadata = catalog_metadata.c.publication_metadata
     bound_endpoint_ids = (
         select(source_model.endpoint_id)
         .where(source_model.source_id.in_(source_ids),
@@ -86,12 +126,13 @@ def _source_scope_dataset_statement(
             dataset_model.published_at.label("published_at"),
             dataset_model.superseded_at.label("superseded_at"),
             dataset_model.resource_count.label("resource_count"),
-            dataset_model.publication_metadata_json.label("publication_metadata"),
+            publication_metadata.label("publication_metadata"),
             current_source_ids.label("current_source_ids"),
         )
+        .join(catalog_metadata, true())
         .where(
             dataset_model.endpoint_id.in_(bound_endpoint_ids),
-            _exact_source_scope_predicate(dataset_model, source_ids),
+            _exact_source_scope_predicate(publication_metadata, source_ids),
             dataset_model.resource_count >= 0,
             _current_published_dataset_predicate(dataset_model)
             if current_published_only
