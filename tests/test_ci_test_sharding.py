@@ -167,6 +167,7 @@ def test_provider_directory_enrichment_postgres_proofs_run_exactly_once() -> Non
         "tests/test_provider_directory_uhc_flex_practitioner_publication_postgres.py",
         "tests/test_provider_directory_rooted_graph_adoption_postgres.py",
         "tests/test_provider_directory_rooted_graph_acquisition_postgres.py",
+        "tests/test_provider_directory_rooted_graph_single_root_postgres.py",
         "tests/test_provider_directory_rooted_graph_publication_guards_postgres.py",
         "tests/test_provider_directory_rooted_graph_publication_postgres.py",
     )

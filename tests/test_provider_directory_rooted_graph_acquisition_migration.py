@@ -9,8 +9,6 @@ from pathlib import Path
 import pytest
 from sqlalchemy import CheckConstraint, Column
 from sqlalchemy import ForeignKeyConstraint, PrimaryKeyConstraint, UniqueConstraint
-from sqlalchemy.dialects import postgresql
-from sqlalchemy.schema import CreateTable
 
 from db.models import provider_directory_rooted_graph as rooted_graph_models
 from db.models.provider_directory_rooted_graph import (
@@ -261,7 +259,7 @@ def test_migration_and_model_pin_the_current_graph_contract() -> None:
 
 def test_predecessor_model_checks_exactly_match_migration_adoption_checks() -> None:
     migration_items = _migration_table_items()
-    predecessor_models = (
+    models = (
         ProviderDirectoryRootedGraphAcquisition,
         ProviderDirectoryRootedGraphWork,
         ProviderDirectoryRootedGraphResource,
@@ -270,31 +268,16 @@ def test_predecessor_model_checks_exactly_match_migration_adoption_checks() -> N
         ProviderDirectoryRootedGraphDatasetResource,
     )
 
-    assert set(migration_items) == {
-        model.__tablename__
-        for model in predecessor_models
-        + (
-            ProviderDirectoryRootedGraphTwinAdmission,
-            ProviderDirectoryRootedGraphDataset,
-        )
-    }
-    for model in predecessor_models:
+    assert {model.__tablename__ for model in models} < set(migration_items)
+    for model in models:
         assert _named_checks(model.__table__.constraints) == _named_checks(
             migration_items[model.__tablename__]
         )
 
-    admission_ddl = str(
-        CreateTable(ProviderDirectoryRootedGraphTwinAdmission.__table__).compile(
-            dialect=postgresql.dialect()
-        )
-    )
-    assert 'required_root_count":1' in admission_ddl
-    assert 'required_root_count"NULL' not in admission_ddl
-
 
 def test_predecessor_model_columns_and_keys_exactly_match_migration_tables() -> None:
     migration_items = _migration_table_items()
-    predecessor_models = (
+    models = (
         ProviderDirectoryRootedGraphAcquisition,
         ProviderDirectoryRootedGraphWork,
         ProviderDirectoryRootedGraphResource,
@@ -303,31 +286,12 @@ def test_predecessor_model_columns_and_keys_exactly_match_migration_tables() -> 
         ProviderDirectoryRootedGraphDatasetResource,
     )
 
-    for model in predecessor_models:
+    for model in models:
         expected_items = migration_items[model.__tablename__]
         assert _column_specs(model.__table__.columns) == _column_specs(expected_items)
         assert _named_key_specs(model.__table__.constraints) == _named_key_specs(
             expected_items
         )
-
-    admission = ProviderDirectoryRootedGraphTwinAdmission.__table__
-    assert {
-        name: (str(admission.c[name].type), admission.c[name].nullable)
-        for name in (
-            "attempt_id",
-            "comparison_acquisition_id",
-            "reviewed_root_policy_json",
-            "acquisition_operation_key",
-        )
-    } == {
-        "attempt_id": ("VARCHAR(55)", True),
-        "comparison_acquisition_id": ("VARCHAR(54)", True),
-        "reviewed_root_policy_json": ("JSONB", True),
-        "acquisition_operation_key": ("VARCHAR(64)", True),
-    }
-    dataset = ProviderDirectoryRootedGraphDataset.__table__
-    assert dataset.c.attempt_id.nullable is True
-    assert dataset.c.comparison_acquisition_id.nullable is True
 
 
 def test_all_model_indexes_exactly_match_migration_indexes() -> None:

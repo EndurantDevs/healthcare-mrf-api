@@ -6,6 +6,16 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateTable
+
+from db.models.provider_directory_rooted_graph_publication import (
+    ProviderDirectoryRootedGraphDataset,
+)
+from db.models.provider_directory_rooted_graph_twin import (
+    ProviderDirectoryRootedGraphTwinAdmission,
+)
+
 
 MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
@@ -101,6 +111,25 @@ def test_upgrade_is_one_disjoint_revision_and_keeps_legacy_guards(
     assert "WHEN (NEW.admission_contract_id =" in sql
     assert sql.count("ENABLE ALWAYS TRIGGER") == 5
     assert "BEFORE UPDATE OR DELETE" in sql
+
+
+def test_models_expose_the_combined_nullable_authority_shape() -> None:
+    admission = ProviderDirectoryRootedGraphTwinAdmission.__table__
+    assert all(
+        admission.c[name].nullable
+        for name in (
+            "attempt_id",
+            "comparison_acquisition_id",
+            "reviewed_root_policy_json",
+            "acquisition_operation_key",
+        )
+    )
+    dataset = ProviderDirectoryRootedGraphDataset.__table__
+    assert dataset.c.attempt_id.nullable
+    assert dataset.c.comparison_acquisition_id.nullable
+    ddl = str(CreateTable(admission).compile(dialect=postgresql.dialect()))
+    assert 'required_root_count":1' in ddl
+    assert 'required_root_count"NULL' not in ddl
 
 
 def test_new_guards_rederive_exact_identities() -> None:

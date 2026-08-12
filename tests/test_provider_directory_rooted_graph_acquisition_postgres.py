@@ -27,19 +27,9 @@ from process.provider_directory_rooted_graph_store import (
 from process.provider_directory_rooted_graph_result_contract import (
     build_provider_directory_rooted_graph_query_result,
 )
-from process.provider_directory_rooted_graph_registration import (
-    register_provider_directory_rooted_graph_source,
-)
-from process.provider_directory_rooted_graph_single_root_contract import (
-    derive_single_root_identity,
-)
 from process.provider_directory_rooted_graph_store_contract import (
     ProviderDirectoryRootedGraphStoreError,
     build_provider_directory_rooted_graph_work_spec,
-)
-from process.provider_directory_rooted_graph_twin_store import (
-    admit_rooted_graph_single_root,
-    ProviderDirectoryRootedGraphTwinError,
 )
 from tests.provider_directory_rooted_graph_pg_assertions import (
     assert_separate_registration_is_rejected as _assert_separate_registration_is_rejected,
@@ -68,9 +58,6 @@ from tests.provider_directory_rooted_graph_pg_support import (
     resources_for_kind as _resources_for_kind,
 )
 from tests.provider_directory_rooted_graph_pg_support import work_rows as _work_rows
-from tests.provider_directory_rooted_graph_rotation_pg_support import (
-    publish_legacy_root as _publish_legacy_root,
-)
 from tests.formulary_fhir_twin_admission_pg_support import connect
 from tests.formulary_fhir_twin_admission_pg_support import database_url
 from tests.formulary_fhir_twin_admission_pg_support import drop_schema
@@ -98,16 +85,6 @@ MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
     / "alembic/versions"
     / ("20260811020000_provider_directory_rooted_graph_acquisition.py")
-)
-SINGLE_ROOT_MIGRATION_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "alembic/versions"
-    / "20260812030000_provider_directory_specialized_single_root_admission.py"
-)
-CANONICAL_JSON_MIGRATION_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "alembic/versions"
-    / "20260810110000_ptg_wave_receipt_authority.py"
 )
 
 
@@ -480,82 +457,5 @@ async def test_rooted_graph_migration_upgrades_and_empty_downgrades(
         finally:
             await connection.close()
     finally:
-        await drop_schema(engine, schema_name)
-        await engine.dispose()
-
-
-@pytest.mark.asyncio
-async def test_reviewed_single_root_admits_replays_and_rejects_stale_current(
-    monkeypatch,
-) -> None:
-    """Bind one real candidate admission to the exact current dataset."""
-
-    url = database_url()
-    schema_name = f"fhir_twin_test_{uuid.uuid4().hex}"
-    schema = quoted(schema_name)
-    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
-    monkeypatch.setenv("DB_SCHEMA", schema_name)
-    engine = create_async_engine(url.set(drivername="postgresql+asyncpg"))
-    database = _configure_database(monkeypatch, url)
-    migration = load_migration(MIGRATION_PATH, "rooted_graph_single_root_base")
-    single_root_migration = load_migration(
-        SINGLE_ROOT_MIGRATION_PATH,
-        "rooted_graph_single_root_admission",
-    )
-    canonical_json_migration = load_migration(
-        CANONICAL_JSON_MIGRATION_PATH,
-        "rooted_graph_single_root_canonical_json",
-    )
-    canonical_json_migration.install = lambda: (
-        canonical_json_migration._install_receipt_verification_functions(schema_name)
-    )
-    legacy_migrations = _load_legacy_migrations("rooted_graph_single_root_legacy")
-    try:
-        await _prepare_publication_schema(
-            engine,
-            url,
-            schema_name,
-            schema,
-            legacy_migrations,
-        )
-        connection = await connect(url)
-        try:
-            await _extend_publication_foundation(connection, schema_name)
-        finally:
-            await connection.close()
-        await database.connect()
-        await register_provider_directory_rooted_graph_source(database=database)
-        await run_migration(engine, migration, "upgrade")
-        await run_migration(engine, canonical_json_migration, "install")
-        await run_migration(engine, single_root_migration, "upgrade")
-
-        current = await _publish_legacy_root(database)
-        operation_key = "7" * 64
-        identity = derive_single_root_identity(current, operation_key=operation_key)
-        sealed = await _complete_success(database, identity.candidate)
-        admission = await admit_rooted_graph_single_root(
-            identity.candidate.acquisition_id,
-            acquisition_operation_key=operation_key,
-            database=database,
-        )
-        replay = await admit_rooted_graph_single_root(
-            identity.candidate.acquisition_id,
-            acquisition_operation_key=operation_key,
-            database=database,
-        )
-        assert admission == replay
-        assert admission.rooted_graph_sha256 == sealed.rooted_graph_sha256
-
-        rotated = await _publish_legacy_root(database, "2" * 64)
-        assert rotated.dataset_id != current.dataset_id
-        with pytest.raises(ProviderDirectoryRootedGraphTwinError) as stale:
-            await admit_rooted_graph_single_root(
-                identity.candidate.acquisition_id,
-                acquisition_operation_key=operation_key,
-                database=database,
-            )
-        assert stale.value.code == "stale"
-    finally:
-        await database.disconnect()
         await drop_schema(engine, schema_name)
         await engine.dispose()
