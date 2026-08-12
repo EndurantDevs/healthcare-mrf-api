@@ -21,6 +21,12 @@ MIGRATION_PATH = (
     / "versions"
     / "20260710003000_provider_directory_endpoint_datasets.py"
 )
+RECEIPT_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic"
+    / "versions"
+    / "20260812010000_provider_directory_artifact_selection_receipt.py"
+)
 
 
 def _primary_key_columns(model):
@@ -34,6 +40,17 @@ def _foreign_key(column):
 
 def _load_migration():
     spec = importlib.util.spec_from_file_location("provider_directory_endpoint_datasets_migration", MIGRATION_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_receipt_migration():
+    spec = importlib.util.spec_from_file_location(
+        "provider_directory_artifact_selection_receipt_migration",
+        RECEIPT_MIGRATION_PATH,
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -121,6 +138,10 @@ def test_dataset_models_preserve_publication_and_resource_identity_contracts():
         ProviderDirectoryEndpointDataset.__table__.c.completion_proof_json.type,
         postgresql.JSONB,
     )
+    assert isinstance(
+        ProviderDirectoryEndpointDataset.__table__.c.artifact_selection_receipt_json.type,
+        postgresql.JSONB,
+    )
 
     current_index = next(
         index
@@ -133,6 +154,31 @@ def test_dataset_models_preserve_publication_and_resource_identity_contracts():
         "unique": True,
         "where": "is_current = true",
     }
+
+
+def test_receipt_migration_adds_one_nullable_jsonb_column(monkeypatch):
+    migration = _load_receipt_migration()
+    added_columns = []
+    monkeypatch.setattr(
+        migration,
+        "add_column_if_missing",
+        lambda _op, table_name, column, **options: added_columns.append(
+            (table_name, column, options)
+        ),
+    )
+
+    migration.upgrade()
+
+    assert migration.down_revision == (
+        "20260811140000_ptg_v12_provider_publication_merge"
+    )
+    assert len(added_columns) == 1
+    table_name, column, options = added_columns[0]
+    assert table_name == "provider_directory_endpoint_dataset"
+    assert column.name == "artifact_selection_receipt_json"
+    assert isinstance(column.type, postgresql.JSONB)
+    assert column.nullable is True
+    assert options == {"schema": "mrf"}
 
 
 def test_source_endpoint_link_is_nullable_indexed_and_set_null_on_delete():
@@ -154,6 +200,7 @@ def _assert_revision_model_columns(recorder, models_by_table):
     later_columns_by_table = {
         "provider_directory_endpoint_dataset": {
             "acquisition_root_run_id",
+            "artifact_selection_receipt_json",
             "completion_proof_required_version",
             "completion_proof_json",
             "completion_proof_sha256",

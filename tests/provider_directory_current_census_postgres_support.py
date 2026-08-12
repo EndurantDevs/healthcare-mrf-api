@@ -161,6 +161,7 @@ async def _create_endpoint_tables(
             published_at timestamp,
             superseded_at timestamp,
             publication_metadata_json jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+            artifact_selection_receipt_json jsonb,
             completion_proof_required_version integer,
             completion_proof_json jsonb,
             completion_proof_sha256 varchar(64)

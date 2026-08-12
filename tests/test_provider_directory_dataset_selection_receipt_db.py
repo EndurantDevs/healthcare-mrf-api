@@ -160,15 +160,33 @@ def _out_of_scope_receipt_metadata() -> dict[str, object]:
 
 async def _install_receipt_candidate(database, schema: str) -> None:
     await _insert_validated_shared_dataset(database, schema)
+    metadata = _large_metadata_with_normalized_receipt()
     await _set_shared_semantic_proof(
         database,
         schema,
-        _large_metadata_with_normalized_receipt(),
+        metadata,
         dataset_id="dataset_candidate",
+    )
+    await _set_selection_receipt(
+        database, schema, metadata, dataset_id="dataset_candidate"
     )
 
 
-async def _install_current_receipt(database, schema: str) -> None:
+async def _set_selection_receipt(
+    database, schema: str, metadata, *, dataset_id: str
+) -> None:
+    receipt = importer._artifact_selection_receipt(metadata)
+    assert receipt is not None
+    await database.status(
+        f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
+        "artifact_selection_receipt_json = CAST(:receipt_json AS jsonb) "
+        "WHERE dataset_id = :dataset_id;",
+        receipt_json=json.dumps(receipt, sort_keys=True),
+        dataset_id=dataset_id,
+    )
+
+
+def _current_receipt_metadata() -> dict[str, object]:
     candidate = importer.EndpointDatasetCandidate(
         endpoint_id="endpoint_shared",
         dataset_id="dataset_shared",
@@ -197,61 +215,56 @@ async def _install_current_receipt(database, schema: str) -> None:
     summary = importer._build_endpoint_dataset_source_summary(
         candidate, content_proof, _ZERO_SUMMARY_COUNTS, "root-shared"
     )
+    receipt_metadata = importer._dataset_validation_metadata(
+        candidate,
+        {},
+        content_proof,
+        {},
+        {},
+        {},
+        {importer.SOURCE_SUMMARY_METADATA_KEY: summary},
+    )
+    return receipt_metadata
+
+
+async def _install_current_receipt(database, schema: str) -> None:
+    receipt_metadata = _current_receipt_metadata()
     await _set_shared_semantic_proof(
         database,
         schema,
-        importer._dataset_validation_metadata(
-            candidate,
-            {},
-            content_proof,
-            {},
-            {},
-            {},
-            {importer.SOURCE_SUMMARY_METADATA_KEY: summary},
-        ),
+        receipt_metadata,
+    )
+    await _set_selection_receipt(
+        database, schema, receipt_metadata, dataset_id="dataset_shared"
     )
 
 
-def test_validation_metadata_builds_exact_selection_receipt():
-    candidate, content_proof = _receipt_candidate_and_proof()
-    metadata = _large_metadata_with_normalized_receipt()
-    summary = metadata[importer.SOURCE_SUMMARY_METADATA_KEY]
-
-    assert summary["resource_hashes"] == content_proof.resource_hashes
-    assert summary["resource_counts"] == content_proof.resource_counts
-    assert metadata[
-        importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY
-    ] == importer._outcome_resource_count_proof(candidate, content_proof)
-    assert metadata[
-        importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
-    ]["proof_sha256"] == content_proof.proof_metadata["proof_sha256"]
-
-
-def test_validation_metadata_rejects_mismatched_selection_receipt():
-    candidate, content_proof = _receipt_candidate_and_proof()
-    mismatched_proof = importer.EndpointDatasetContentProof(
-        dataset_hash=content_proof.dataset_hash,
-        resource_count=content_proof.resource_count,
-        resource_hashes={"Location": "0" * 64},
-        resource_counts=content_proof.resource_counts,
+def test_non_null_receipt_is_authoritative_and_fail_closed():
+    sql = importer._provider_directory_artifact_dataset_selection_sql(
+        ["source_primary"]
     )
-    summary = importer._build_endpoint_dataset_source_summary(
-        candidate,
-        mismatched_proof,
-        _ZERO_SUMMARY_COUNTS,
-        "root-candidate",
-    )
+    assert "dataset.artifact_selection_receipt_json IS NOT NULL" in sql
+    assert "selected.receipt_stored" in sql
+    assert "selected.receipt_jsonb" in sql
 
-    with pytest.raises(importer.ProviderDirectorySourceSummaryError):
-        importer._dataset_validation_metadata(
-            candidate,
-            {},
-            content_proof,
-            {},
-            {},
-            {},
-            {importer.SOURCE_SUMMARY_METADATA_KEY: summary},
+
+@pytest.mark.asyncio
+async def test_non_null_malformed_receipt_never_uses_legacy_proof(monkeypatch):
+    async with _dataset_database(monkeypatch) as (database, schema):
+        await _install_current_receipt(database, schema)
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
+            "artifact_selection_receipt_json = '{}'::jsonb "
+            "WHERE dataset_id = 'dataset_shared';"
         )
+        await _install_selected_hash_sentinel(database, schema)
+        await _install_selected_validator_sentinel(database, schema)
+
+        with pytest.raises(importer.ProviderDirectoryArtifactBuildStale):
+            await importer._resolve_provider_directory_artifact_datasets(
+                ["source_primary"],
+                should_select_validated_candidates=False,
+            )
 
 
 @pytest.mark.asyncio
@@ -323,16 +336,55 @@ async def test_normalized_receipt_bounds_selected_large_current(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_current_repair_records_one_guarded_receipt(monkeypatch):
+    async with _dataset_database(monkeypatch) as (database, schema):
+        metadata = _current_receipt_metadata()
+        await _set_shared_semantic_proof(database, schema, metadata)
+        fence = await importer._resolve_provider_directory_artifact_datasets(
+            ["source_primary"],
+            should_select_validated_candidates=False,
+        )
+
+        await importer._record_current_dataset_selection_receipt(
+            fence.datasets[0],
+            metadata,
+        )
+
+        stored_receipt = await database.scalar(
+            f"SELECT artifact_selection_receipt_json FROM {schema}."
+            "provider_directory_endpoint_dataset "
+            "WHERE dataset_id = 'dataset_shared';"
+        )
+        assert stored_receipt == importer._artifact_selection_receipt(metadata)
+
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset "
+            "SET status = 'validated' WHERE dataset_id = 'dataset_shared';"
+        )
+        with pytest.raises(
+            importer.ProviderDirectoryArtifactBuildStale,
+            match="provider_directory_endpoint_dataset_metadata_changed",
+        ):
+            await importer._record_current_dataset_selection_receipt(
+                fence.datasets[0], metadata
+            )
+
+
+@pytest.mark.asyncio
 async def test_normalized_receipt_rejects_resource_outside_proof_scope(
     monkeypatch,
 ):
     async with _dataset_database(monkeypatch) as (database, schema):
         await _insert_validated_shared_dataset(database, schema)
+        metadata = _out_of_scope_receipt_metadata()
         await _set_shared_semantic_proof(
             database,
             schema,
-            _out_of_scope_receipt_metadata(),
+            metadata,
             dataset_id="dataset_candidate",
+        )
+        await _set_selection_receipt(
+            database, schema, metadata, dataset_id="dataset_candidate"
         )
 
         with pytest.raises(importer.ProviderDirectoryArtifactBuildStale):
@@ -355,18 +407,18 @@ def _receipt_tamper_sql(schema: str, mutation: str) -> str:
         ),
         "proof_sha": (
             f"{proof_key},proof_sha256",
-            f"to_jsonb(' '::text || (publication_metadata_json::jsonb #>> '{{{proof_key},proof_sha256}}'))",
+            f"to_jsonb(' '::text || (artifact_selection_receipt_json #>> '{{{proof_key},proof_sha256}}'))",
         ),
         "proof_contract": (
             f"{proof_key},contract_id",
-            f"to_jsonb(' '::text || (publication_metadata_json::jsonb #>> '{{{proof_key},contract_id}}'))",
+            f"to_jsonb(' '::text || (artifact_selection_receipt_json #>> '{{{proof_key},contract_id}}'))",
         ),
     }[mutation]
     path, value = path_and_value
     return (
         f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
-        "publication_metadata_json = CAST(jsonb_set("
-        f"publication_metadata_json::jsonb, '{{{path}}}', {value}) AS json) "
+        "artifact_selection_receipt_json = jsonb_set("
+        f"artifact_selection_receipt_json, '{{{path}}}', {value}) "
         "WHERE dataset_id = 'dataset_candidate';"
     )
 

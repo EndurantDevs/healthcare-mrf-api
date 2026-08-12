@@ -165,6 +165,9 @@ _SUBSET_ENDPOINT_DATASET_COLUMNS = _LEGACY_ENDPOINT_DATASET_COLUMNS + (
     "completion_proof_json",
     "completion_proof_sha256",
 )
+_RECEIPT_ENDPOINT_DATASET_COLUMNS = _SUBSET_ENDPOINT_DATASET_COLUMNS + (
+    "artifact_selection_receipt_json",
+)
 _LEGACY_DATASET_RESOURCE_COLUMNS = (
     "dataset_id",
     "resource_type",
@@ -223,18 +226,20 @@ def _relation_schema_fence_sql(
     expected_columns: tuple[str, ...],
     *,
     compatible_columns: tuple[str, ...] | None = None,
+    additional_compatible_columns: tuple[str, ...] | None = None,
 ) -> str:
     relation_ref = _qf(schema, relation)
     expected_array = ", ".join(
         _ql(column) for column in sorted(expected_columns)
     )
     compatible_clause = ""
-    if compatible_columns is not None:
-        compatible_array = ", ".join(
-            _ql(column) for column in sorted(compatible_columns)
-        )
+    for compatible in (compatible_columns, additional_compatible_columns):
+        if compatible is None:
+            continue
+        compatible_array = ", ".join(_ql(column) for column in sorted(compatible))
         compatible_clause = (
-            "\n           AND observed_columns IS DISTINCT FROM "
+            compatible_clause
+            + "\n           AND observed_columns IS DISTINCT FROM "
             f"ARRAY[{compatible_array}]::text[]"
         )
     return f"""
@@ -4140,6 +4145,7 @@ def upgrade() -> None:
             _ENDPOINT_DATASET,
             _LEGACY_ENDPOINT_DATASET_COLUMNS,
             compatible_columns=_SUBSET_ENDPOINT_DATASET_COLUMNS,
+            additional_compatible_columns=_RECEIPT_ENDPOINT_DATASET_COLUMNS,
         )
     )
     op.execute(
@@ -4264,6 +4270,7 @@ def upgrade() -> None:
             schema,
             _ENDPOINT_DATASET,
             _SUBSET_ENDPOINT_DATASET_COLUMNS,
+            compatible_columns=_RECEIPT_ENDPOINT_DATASET_COLUMNS,
         )
     )
     op.execute(

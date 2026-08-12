@@ -1609,6 +1609,41 @@ PROVIDER_DIRECTORY_FHIR_SOURCE_SUMMARY_SEMANTIC_CONTRACT_ID = (
 PROVIDER_DIRECTORY_ARTIFACT_SELECTION_RECEIPT_CONTRACT_ID = (
     "healthporta.provider-directory.artifact-selection-receipt.v1"
 )
+PROVIDER_DIRECTORY_ARTIFACT_SELECTION_RECEIPT_MAX_BYTES = 64 * 1024
+_ARTIFACT_SELECTION_RECEIPT_METADATA_KEYS = (
+    "source_ids",
+    "selected_resources",
+    "expected_resources",
+    RESOURCE_HASH_CONTRACT_METADATA_KEY,
+    SEMANTIC_PROJECTION_AS_OF_METADATA_KEY,
+    PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY,
+    PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY,
+    SOURCE_SUMMARY_METADATA_KEY,
+    "verification_campaign_id",
+    "verification_source_scope_hash",
+    REVIEWED_ROOT_POLICY_METADATA_KEY,
+    "source_id",
+    "dataset_id",
+    "endpoint_id",
+    "acquisition_root_run_id",
+    "source_authority_id",
+    "cohort_complete",
+    "endpoint_collection_complete",
+    "endpoint_complete",
+    "admission_id",
+    "operation_key",
+    "publication_contract_id",
+    "publication_kind",
+    "rooted_graph_complete",
+    "resource_counts",
+    "root_variant",
+    "root_source_id",
+    "root_endpoint_id",
+    "acquisition_source_id",
+    "acquisition_endpoint_id",
+    "practitioner_origin_source_id",
+    "practitioner_origin_endpoint_id",
+)
 TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY = "verification_campaign_id"
 TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY = "verification_source_scope_hash"
 TWIN_ROOT_VERIFICATION_ROLE_KEY = "verification_role"
@@ -16100,40 +16135,6 @@ def _artifact_candidate_eligibility_cte_sql(
 def _artifact_bounded_publication_metadata_sql(metadata: str) -> str:
     """Project only top-level fields consumed after database admission."""
 
-    metadata_keys = (
-        "source_ids",
-        "selected_resources",
-        "expected_resources",
-        RESOURCE_HASH_CONTRACT_METADATA_KEY,
-        SEMANTIC_PROJECTION_AS_OF_METADATA_KEY,
-        PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY,
-        PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY,
-        SOURCE_SUMMARY_METADATA_KEY,
-        TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY,
-        TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY,
-        REVIEWED_ROOT_POLICY_METADATA_KEY,
-        "source_id",
-        "dataset_id",
-        "endpoint_id",
-        "acquisition_root_run_id",
-        "source_authority_id",
-        "cohort_complete",
-        "endpoint_collection_complete",
-        "endpoint_complete",
-        "admission_id",
-        "operation_key",
-        "publication_contract_id",
-        "publication_kind",
-        "rooted_graph_complete",
-        "resource_counts",
-        "root_variant",
-        "root_source_id",
-        "root_endpoint_id",
-        "acquisition_source_id",
-        "acquisition_endpoint_id",
-        "practitioner_origin_source_id",
-        "practitioner_origin_endpoint_id",
-    )
     return "\n               || ".join(
         f"""CASE
                    WHEN {metadata} ? '{metadata_key}' THEN
@@ -16143,8 +16144,60 @@ def _artifact_bounded_publication_metadata_sql(metadata: str) -> str:
                        )
                    ELSE '{{}}'::jsonb
                END"""
-        for metadata_key in metadata_keys
+        for metadata_key in _ARTIFACT_SELECTION_RECEIPT_METADATA_KEYS
     )
+
+
+def _artifact_selection_receipt(
+    publication_metadata: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return the compact write-validated FHIR selection receipt."""
+
+    source_summary = publication_metadata.get(SOURCE_SUMMARY_METADATA_KEY)
+    if not isinstance(source_summary, Mapping) or source_summary.get(
+        "semantic_contract_id"
+    ) != SOURCE_SUMMARY_FHIR_SEMANTIC_CONTRACT_ID:
+        return None
+    outcome = publication_metadata.get(
+        PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY
+    )
+    content_proof = publication_metadata.get(
+        PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
+    )
+    if not isinstance(outcome, Mapping) or not isinstance(
+        content_proof, Mapping
+    ):
+        return None
+    contract_id = content_proof.get("contract_id")
+    proof_sha256 = content_proof.get("proof_sha256")
+    if (
+        content_proof.get("complete") is not True
+        or type(contract_id) is not str
+        or contract_id != contract_id.strip()
+        or not contract_id
+        or type(proof_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", proof_sha256) is None
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_selection_receipt_invalid"
+        )
+    receipt_by_field = {
+        key: publication_metadata[key]
+        for key in _ARTIFACT_SELECTION_RECEIPT_METADATA_KEYS
+        if key in publication_metadata
+    }
+    receipt_by_field[PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY] = {
+        "complete": True,
+        "contract_id": contract_id,
+        "proof_sha256": proof_sha256,
+    }
+    if len(
+        json.dumps(receipt_by_field, sort_keys=True, default=_json_default).encode()
+    ) > PROVIDER_DIRECTORY_ARTIFACT_SELECTION_RECEIPT_MAX_BYTES:
+        raise RuntimeError(
+            "provider_directory_artifact_selection_receipt_too_large"
+        )
+    return receipt_by_field
 
 
 def _artifact_content_proof_resources_sql(metadata: str) -> str:
@@ -16828,8 +16881,8 @@ def _artifact_published_alias_scope_ctes(
     """
 
 
-def _artifact_selected_dataset_json_ctes(dataset_ref: str) -> str:
-    """Load the exact selected rows and their publication metadata once."""
+def _artifact_selected_dataset_receipt_ctes(dataset_ref: str) -> str:
+    """Load only compact receipts for exact selected rows."""
 
     return f"""
         selected_dataset_ids AS MATERIALIZED (
@@ -16843,16 +16896,18 @@ def _artifact_selected_dataset_json_ctes(dataset_ref: str) -> str:
                AND ranked.selection_rank = 1
              WHERE ranked.dataset_id IS NOT NULL
              GROUP BY ranked.dataset_id
-        ), selected_dataset_json AS MATERIALIZED (
+        ), selected_dataset_receipts AS MATERIALIZED (
             SELECT selected.dataset_id,
                    selected.force_legacy_proof,
                    CASE
                        WHEN jsonb_typeof(
-                                dataset.publication_metadata_json::jsonb
+                                dataset.artifact_selection_receipt_json
                             ) = 'object'
-                       THEN dataset.publication_metadata_json::jsonb
+                       THEN dataset.artifact_selection_receipt_json
                        ELSE '{{}}'::jsonb
-                   END AS full_metadata_jsonb
+                   END AS receipt_jsonb,
+                   dataset.artifact_selection_receipt_json IS NOT NULL
+                       AS receipt_stored
               FROM selected_dataset_ids AS selected
               JOIN {dataset_ref} AS dataset
                 ON dataset.dataset_id = selected.dataset_id
@@ -16861,28 +16916,26 @@ def _artifact_selected_dataset_json_ctes(dataset_ref: str) -> str:
 
 
 def _artifact_selected_dataset_metadata_cte() -> str:
-    """Strip the large shard payload from exact selected rows."""
+    """Project one stored compact receipt without reopening proof shards."""
 
     proof_key = PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
-    full_metadata = "selected.full_metadata_jsonb"
+    receipt = "selected.receipt_jsonb"
     return f"""
         selected_dataset_metadata AS MATERIALIZED (
             SELECT selected.dataset_id,
-                   ({full_metadata} - '{proof_key}')
+                   ({receipt} - '{proof_key}')
                        AS bounded_source_metadata_jsonb,
-                   ({full_metadata} ? '{proof_key}')
+                   ({receipt} ? '{proof_key}')
                        AS content_proof_present,
-                   {full_metadata} -> '{proof_key}' ->> 'contract_id'
+                   {receipt} -> '{proof_key}' ->> 'contract_id'
                        AS content_proof_contract_id,
-                   {full_metadata} -> '{proof_key}' ->> 'proof_sha256'
+                   {receipt} -> '{proof_key}' ->> 'proof_sha256'
                        AS content_proof_sha256,
                    (
                        selected.force_legacy_proof IS NOT TRUE
-                       AND (
-                           {_artifact_normalized_receipt_state_sql(full_metadata)}
-                       )
+                       AND selected.receipt_stored
                    ) AS normalized_receipt_present
-              FROM selected_dataset_json AS selected
+              FROM selected_dataset_receipts AS selected
         )
     """
 
@@ -16900,7 +16953,7 @@ def _artifact_selected_dataset_projection_ctes(dataset_ref: str) -> str:
         content_proof_sha256_sql="selected.content_proof_sha256",
     )
     return f"""
-        {_artifact_selected_dataset_json_ctes(dataset_ref)},
+        {_artifact_selected_dataset_receipt_ctes(dataset_ref)},
         {_artifact_selected_dataset_metadata_cte()},
         ranked_datasets AS MATERIALIZED (
             SELECT {option_projection},
@@ -17048,9 +17101,9 @@ def _artifact_selected_endpoint_bindings_cte(dataset_ref: str) -> str:
         selected_endpoints AS MATERIALIZED (
             SELECT ranked.endpoint_id,
                    ranked.dataset_id,
-                   publication.full_metadata_jsonb -> 'source_ids'
+                   publication.selection_metadata_jsonb -> 'source_ids'
                        AS publication_source_ids,
-                   publication.full_metadata_jsonb
+                   publication.selection_metadata_jsonb
                        ? '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'
                        AS content_proof_present
               FROM ranked_dataset_ids AS ranked
@@ -17058,12 +17111,21 @@ def _artifact_selected_endpoint_bindings_cte(dataset_ref: str) -> str:
                 ON dataset.dataset_id = ranked.dataset_id
               CROSS JOIN LATERAL (
                    SELECT CASE
+                              WHEN dataset.artifact_selection_receipt_json
+                                   IS NOT NULL
+                              THEN CASE
+                                       WHEN jsonb_typeof(
+                                           dataset.artifact_selection_receipt_json
+                                       ) = 'object'
+                                       THEN dataset.artifact_selection_receipt_json
+                                       ELSE '{{}}'::jsonb
+                                   END
                               WHEN jsonb_typeof(
                                    dataset.publication_metadata_json::jsonb
                               ) = 'object'
                               THEN dataset.publication_metadata_json::jsonb
                               ELSE '{{}}'::jsonb
-                          END AS full_metadata_jsonb
+                          END AS selection_metadata_jsonb
               ) AS publication
              WHERE ranked.selection_rank = 1
                AND ranked.endpoint_id IN (
@@ -18944,7 +19006,11 @@ async def _hydrate_legacy_artifact_dataset_rows(
     for dataset_row_map in row_maps:
         dataset_id = _clean_text(dataset_row_map.get("dataset_id"))
         if dataset_id in details_by_id:
-            dataset_row_map.update(details_by_id[dataset_id])
+            legacy_detail = details_by_id[dataset_id]
+            dataset_row_map.update(legacy_detail)
+            dataset_row_map["publication_metadata_json"] = (
+                legacy_detail["publication_metadata_fields"]
+            )
     return row_maps
 
 
@@ -21481,7 +21547,6 @@ def _artifact_fence_dataset_base_cte(
 ) -> str:
     """Lock and materialize one exact tuple version for all fence details."""
 
-    proof_key = PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
     return f"""
         fence_datasets AS MATERIALIZED (
             SELECT dataset.dataset_id,
@@ -21501,7 +21566,20 @@ def _artifact_fence_dataset_base_cte(
                    {current_ids_sql}
                    CASE
                        WHEN dataset.dataset_id = ANY(
-                                CAST(:selected_dataset_ids AS varchar[])
+                                CAST(:normalized_dataset_ids AS varchar[])
+                            )
+                       THEN CASE
+                                WHEN jsonb_typeof(
+                                    dataset.artifact_selection_receipt_json
+                                ) = 'object'
+                                THEN dataset.artifact_selection_receipt_json
+                                ELSE '{{}}'::jsonb
+                            END
+                       ELSE NULL::jsonb
+                   END AS selected_receipt_jsonb,
+                   CASE
+                       WHEN dataset.dataset_id = ANY(
+                                CAST(:legacy_dataset_ids AS varchar[])
                             )
                        THEN CASE
                                 WHEN jsonb_typeof(
@@ -21539,26 +21617,26 @@ def _artifact_fence_source_endpoints_sql(source_ref: str) -> str:
 def _artifact_fence_dataset_detail_ctes() -> str:
     """Build exact receipt and legacy details inside the fence snapshot."""
 
-    full_metadata = "selected.selected_metadata_jsonb"
+    receipt_metadata = "selected.selected_receipt_jsonb"
     compact_metadata = "receipt.bounded_source_metadata_jsonb"
     bounded_metadata = _artifact_bounded_publication_metadata_sql(
         compact_metadata
     )
-    receipt_state = _artifact_normalized_receipt_state_sql(full_metadata)
+    receipt_state = _artifact_normalized_receipt_state_sql(receipt_metadata)
     metadata_hash = _artifact_publication_metadata_hash_sql(
         "selected.selected_metadata_jsonb"
     )
     return f"""
         receipt_dataset_metadata AS MATERIALIZED (
             SELECT selected.dataset_id,
-                   ({full_metadata}
+                   ({receipt_metadata}
                        - '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}')
                        AS bounded_source_metadata_jsonb,
                    ({receipt_state}) AS normalized_receipt_present,
-                   {full_metadata}
+                   {receipt_metadata}
                        -> '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'
                        ->> 'contract_id' AS content_proof_contract_id,
-                   {full_metadata}
+                   {receipt_metadata}
                        -> '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'
                        ->> 'proof_sha256' AS content_proof_sha256
               FROM fence_datasets AS selected
@@ -21626,9 +21704,6 @@ async def _artifact_fence_dataset_rows(
 ) -> list[Any]:
     selected_datasets = _unique_artifact_datasets(fence)
     query_params_by_name: dict[str, Any] = {
-        "selected_dataset_ids": sorted(
-            dataset.dataset_id for dataset in selected_datasets
-        ),
         "normalized_dataset_ids": sorted(
             dataset.dataset_id
             for dataset in selected_datasets
@@ -23364,6 +23439,48 @@ async def _record_current_dataset_publication_proof(
         )
 
 
+async def _record_current_dataset_selection_receipt(
+    dataset: ProviderDirectoryArtifactDataset,
+    publication_metadata: Mapping[str, Any],
+) -> None:
+    """Store one compact receipt under the exact locked dataset identity."""
+
+    receipt = _artifact_selection_receipt(publication_metadata)
+    if receipt is None:
+        return
+    dataset_ref = _qt(
+        _schema(),
+        ProviderDirectoryEndpointDataset.__tablename__,
+    )
+    updated = await db.status(
+        f"""
+        UPDATE {dataset_ref}
+           SET artifact_selection_receipt_json = CAST(:receipt_json AS jsonb)
+         WHERE dataset_id = :dataset_id
+           AND endpoint_id = :endpoint_id
+           AND COALESCE(acquisition_root_run_id, import_run_id)
+               IS NOT DISTINCT FROM :evidence_run_id
+           AND previous_dataset_id IS NOT DISTINCT FROM :previous_dataset_id
+           AND dataset_hash IS NOT DISTINCT FROM :dataset_hash
+           AND is_current = :is_current
+           AND status = :expected_status
+           AND superseded_at IS NULL;
+        """,
+        receipt_json=json.dumps(receipt, sort_keys=True, default=_json_default),
+        dataset_id=dataset.dataset_id,
+        endpoint_id=dataset.endpoint_id,
+        evidence_run_id=dataset.evidence_run_id,
+        previous_dataset_id=dataset.previous_dataset_id,
+        dataset_hash=dataset.dataset_hash,
+        is_current=dataset.is_current,
+        expected_status=dataset.status,
+    )
+    if _coerce_rowcount(updated) != 1:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_endpoint_dataset_metadata_changed"
+        )
+
+
 def _artifact_dataset_source_summary_source_ids(
     publication_metadata: dict[str, Any],
     dataset: ProviderDirectoryArtifactDataset,
@@ -23874,6 +23991,10 @@ async def _refresh_current_artifact_dataset_source_summary(
         relation_proof_by_name,
     )
     if source_summary is not None:
+        await _record_current_dataset_selection_receipt(
+            dataset,
+            publication_metadata,
+        )
         return source_summary
     content_proof = await _artifact_content_proof(
         dataset,
@@ -23881,11 +24002,15 @@ async def _refresh_current_artifact_dataset_source_summary(
         publication_metadata,
     )
     _assert_artifact_dataset_content_proof(dataset, content_proof)
+    outcome_proof = _outcome_resource_count_proof(candidate, content_proof)
     await _record_current_dataset_publication_proof(
         dataset,
         PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY,
-        _outcome_resource_count_proof(candidate, content_proof),
+        outcome_proof,
     )
+    publication_metadata[
+        PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY
+    ] = outcome_proof
     source_summary = await _endpoint_dataset_source_summary(
         db,
         candidate,
@@ -23900,6 +24025,11 @@ async def _refresh_current_artifact_dataset_source_summary(
         dataset,
         SOURCE_SUMMARY_METADATA_KEY,
         source_summary,
+    )
+    publication_metadata[SOURCE_SUMMARY_METADATA_KEY] = source_summary
+    await _record_current_dataset_selection_receipt(
+        dataset,
+        publication_metadata,
     )
     return source_summary
 
@@ -68967,6 +69097,8 @@ def _store_validated_endpoint_dataset_sql() -> str:
                validated_at = CASE WHEN :marks_validated THEN now() ELSE NULL END,
                published_at = NULL, superseded_at = NULL,
                publication_metadata_json = CAST(:publication_metadata_json AS jsonb),
+               artifact_selection_receipt_json =
+                   CAST(:artifact_selection_receipt_json AS jsonb),
                completion_proof_json = CAST(:completion_proof_json AS jsonb),
                completion_proof_sha256 = :completion_proof_sha256
          WHERE dataset_id = :dataset_id AND endpoint_id = :endpoint_id
@@ -69003,6 +69135,7 @@ async def _store_validated_endpoint_dataset(
             completion_proof_pair,
         )
     )
+    selection_receipt = _artifact_selection_receipt(metadata)
     validated_count = await connection.status(
         _store_validated_endpoint_dataset_sql(),
         previous_dataset_id=previous_dataset_id,
@@ -69013,6 +69146,15 @@ async def _store_validated_endpoint_dataset(
             metadata,
             sort_keys=True,
             default=_json_default,
+        ),
+        artifact_selection_receipt_json=(
+            json.dumps(
+                selection_receipt,
+                sort_keys=True,
+                default=_json_default,
+            )
+            if selection_receipt is not None
+            else None
         ),
         completion_proof_json=serialized_completion_proof,
         completion_proof_sha256=completion_proof_sha256,

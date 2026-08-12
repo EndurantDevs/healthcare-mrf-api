@@ -1229,6 +1229,7 @@ class ProviderDirectoryEndpointDataset(Base, JSONOutputMixin):
     published_at = Column(TIMESTAMP)
     superseded_at = Column(TIMESTAMP)
     publication_metadata_json = Column(JSON)
+    artifact_selection_receipt_json = Column(JSONB)
     completion_proof_required_version = Column(Integer)
     completion_proof_json = Column(JSONB)
     completion_proof_sha256 = Column(String(64))

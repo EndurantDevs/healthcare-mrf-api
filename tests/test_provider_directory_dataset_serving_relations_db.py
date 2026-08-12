@@ -41,6 +41,7 @@ async def _create_tables(database: Database, schema: str) -> None:
         "is_current boolean NOT NULL DEFAULT true, "
         "superseded_at timestamptz, "
         "publication_metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb, "
+        "artifact_selection_receipt_json jsonb, "
         "completion_proof_required_version integer, "
         "completion_proof_json jsonb, "
         "completion_proof_sha256 varchar(64)"
@@ -333,8 +334,6 @@ async def test_real_postgres_builds_normalized_relations_and_preserves_other_dat
         _assert_network_edges(network_proof, network_edge_rows)
         _assert_affiliation_edges(affiliation_proof, affiliation_edge_rows)
         await _assert_dataset_b_sentinels(database, schema)
-
-
 
 async def _build_baseline_dataset_a_relations(database: Database, schema: str):
     async with database.acquire() as connection:
