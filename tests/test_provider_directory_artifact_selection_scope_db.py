@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import pytest
 
+from api.provider_directory_source_catalog_outcomes import (
+    _canonical_validated_datasets_by_source_id,
+)
 from tests.test_provider_directory_artifact_eligibility_db import (
     DATASET_HASH,
     ENDPOINT_ID,
@@ -156,10 +159,31 @@ async def test_requested_sources_bound_artifact_dataset_scans(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_global_current_selection_skips_validated_candidates(monkeypatch):
-    """Do not hash candidates when global selection keeps current data."""
+async def test_global_current_selection_hashes_only_bound_current_data(monkeypatch):
+    """Do not hash candidates or current datasets outside the source graph."""
     async with _dataset_database(monkeypatch) as (database, schema):
         await _insert_validated_shared_dataset(database, schema)
+        await database.status(
+            f"INSERT INTO {schema}.provider_directory_api_endpoint "
+            "(endpoint_id) VALUES ('endpoint_current_probe');"
+        )
+        await database.status(
+            f"""
+            INSERT INTO {schema}.provider_directory_endpoint_dataset (
+                dataset_id, endpoint_id, acquisition_root_run_id, dataset_hash,
+                status, is_current, resource_count, published_at,
+                publication_metadata_json
+            ) VALUES (
+                'dataset_current_probe', 'endpoint_current_probe',
+                'root_current_probe', repeat('f', 64), :published, true, 1,
+                now(), jsonb_build_object(
+                    'source_ids', jsonb_build_array('source_current_probe'),
+                    'unselected_current_probe', true
+                )
+            );
+            """,
+            published=importer.ENDPOINT_DATASET_PUBLISHED,
+        )
         await database.status(
             f"UPDATE {schema}.provider_directory_endpoint_dataset "
             "SET publication_metadata_json = CAST(publication_metadata_json::jsonb "
@@ -172,9 +196,11 @@ async def test_global_current_selection_skips_validated_candidates(monkeypatch):
         )
         await database.status(
             f"""CREATE FUNCTION {schema}.provider_directory_subset_payload_sha256(candidate jsonb)
-            RETURNS text LANGUAGE plpgsql VOLATILE STRICT AS $function$ BEGIN
-                IF candidate ? 'unselected_candidate_probe' THEN RAISE EXCEPTION
-                    'unselected_validated_candidate_evaluated'; END IF;
+            RETURNS text LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE
+            AS $function$ BEGIN
+                IF candidate ?| ARRAY[
+                    'unselected_candidate_probe', 'unselected_current_probe'
+                ] THEN RAISE EXCEPTION 'unselected_dataset_evaluated'; END IF;
                 RETURN {schema}.provider_directory_subset_payload_sha256_original(candidate);
             END; $function$;"""
         )
@@ -188,3 +214,42 @@ async def test_global_current_selection_skips_validated_candidates(monkeypatch):
         assert {dataset.dataset_id for dataset in fence.datasets} == {
             "dataset_shared"
         }
+
+
+@pytest.mark.asyncio
+async def test_candidate_catalog_skips_unselected_current_dataset(
+    monkeypatch,
+):
+    """Do not hash the incumbent when catalog selection keeps its candidate."""
+
+    async with _dataset_database(monkeypatch) as (database, schema):
+        await _insert_validated_shared_dataset(database, schema)
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset "
+            "SET publication_metadata_json = CAST(publication_metadata_json::jsonb "
+            "|| jsonb_build_object('unselected_current_probe', true) AS json) "
+            "WHERE dataset_id = 'dataset_shared';"
+        )
+        await database.status(
+            f"ALTER FUNCTION {schema}.provider_directory_subset_payload_sha256(jsonb) "
+            "RENAME TO provider_directory_subset_payload_sha256_original;"
+        )
+        await database.status(
+            f"""CREATE FUNCTION {schema}.provider_directory_subset_payload_sha256(candidate jsonb)
+            RETURNS text LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE
+            AS $function$ BEGIN
+                IF candidate ? 'unselected_current_probe' THEN RAISE EXCEPTION
+                    'unselected_current_dataset_evaluated'; END IF;
+                RETURN {schema}.provider_directory_subset_payload_sha256_original(candidate);
+            END; $function$;"""
+        )
+
+        selected = await _canonical_validated_datasets_by_source_id(
+            ["source_primary"]
+        )
+
+        assert selected["source_primary"].dataset_id == "dataset_candidate"
+        assert (
+            selected["source_primary"].expected_incumbent_dataset_id
+            == "dataset_shared"
+        )

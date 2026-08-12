@@ -10966,7 +10966,11 @@ def test_explicit_artifact_selection_sql_scopes_dataset_reads():
     all_sql = importer._provider_directory_artifact_dataset_selection_sql(None)
 
     assert "requested_endpoint_ids AS MATERIALIZED" in explicit_sql
-    assert explicit_sql.count("FROM requested_endpoint_ids") == 2
+    assert "ranked_dataset_ids AS MATERIALIZED" in explicit_sql
+    assert "selected_dataset_ids AS MATERIALIZED" in explicit_sql
+    assert explicit_sql.index("selected_dataset_ids AS MATERIALIZED") < (
+        explicit_sql.index("provider_directory_subset_payload_sha256")
+    )
     assert "requested_endpoint_ids AS MATERIALIZED" not in all_sql
 
 
