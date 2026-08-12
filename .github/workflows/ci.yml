@@ -995,6 +995,7 @@ jobs:
           timeout --foreground 295s python -m pytest -q
           tests/test_tin_npi_connector_postgres.py
           tests/test_provider_directory_endpoint_dataset_admission_seal_migration.py
+          tests/test_provider_directory_endpoint_dataset_admission_seal_migration_postgres.py
           tests/test_provider_directory_subset_completion_postgres.py
           tests/test_provider_directory_fhir_terminal_atomicity_postgres.py
           tests/test_provider_directory_reviewed_subset_bounded_drift_postgres.py
@@ -1040,6 +1041,7 @@ jobs:
           tests/test_provider_directory_artifact_selection_scope_db.py
           tests/test_provider_directory_dataset_selection_bounded_db.py
           tests/test_provider_directory_dataset_selection_receipt_db.py
+          tests/test_provider_directory_dataset_selection_sealed_db.py
           tests/test_provider_directory_admission_seal_backfill_db.py
           tests/test_provider_directory_dataset_artifact_cutover_db.py
           tests/test_provider_directory_dataset_artifact_concurrency_db.py
