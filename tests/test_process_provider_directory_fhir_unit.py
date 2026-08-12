@@ -2954,8 +2954,7 @@ def test_reviewed_candidate_statuses_match_current_acquisition_state():
     }
 
     verified_status = importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
-    pending_status = importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING
-    assert status_by_base[importer.DEVOTED_PROVIDER_DIRECTORY_BASE] == pending_status
+    assert status_by_base[importer.DEVOTED_PROVIDER_DIRECTORY_BASE] == verified_status
     assert status_by_base[importer.SIMPRA_PROVIDER_DIRECTORY_BASE] == verified_status
     assert (
         status_by_base[importer.SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE]

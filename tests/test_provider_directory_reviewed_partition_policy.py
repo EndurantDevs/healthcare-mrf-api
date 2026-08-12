@@ -49,7 +49,7 @@ def _without_partition_policy(source_record):
     return legacy_record
 
 
-def test_reviewed_role_partition_policy_is_fixed_and_pending():
+def test_reviewed_role_partition_policy_is_fixed_and_verified():
     seed_row = _partitioned_reviewed_seed_row()
     metadata = seed_row["metadata_json"]
 
@@ -58,7 +58,7 @@ def test_reviewed_role_partition_policy_is_fixed_and_pending():
         "resources": EXPECTED_ROLE_PARTITION,
     }
     assert metadata["provider_directory_candidate_status"] == (
-        importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING
+        importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
     )
     assert (
         metadata[importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY]
@@ -270,7 +270,10 @@ async def test_persisted_partition_generation_matches_exact_upsert(monkeypatch):
 @pytest.mark.parametrize(
     ("drift_field", "drift_value"),
     (
-        ("provider_directory_candidate_status", "verified"),
+        (
+            "provider_directory_candidate_status",
+            importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
+        ),
         ("provider_directory_verification_campaign_id", "older-campaign"),
         ("provider_directory_reviewed_subset_activation_v2", {}),
         ("endpoint_id", "other-endpoint"),

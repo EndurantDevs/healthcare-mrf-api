@@ -32,6 +32,9 @@ from process.provider_directory_fhir_census_contract import (
 from process.provider_directory_refresh_preset import (
     apply_provider_directory_refresh_preset,
 )
+from process.provider_directory_validated_publication_contract import (
+    validated_publication_candidate_from_params,
+)
 from process.uhc_provider_file_admission import (
     validate_uhc_official_file_admission,
 )
@@ -2050,6 +2053,9 @@ async def create_import_run(
         effective_params_by_name,
     )
     if importer == "provider-directory-fhir":
+        validated_publication_candidate_from_params(
+            effective_params_by_name
+        )
         validate_uhc_official_file_admission(effective_params_by_name)
     normalized_params_by_name = (
         normalize_protected_frozen_rate_params(effective_params_by_name)

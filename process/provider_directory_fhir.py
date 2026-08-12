@@ -149,6 +149,12 @@ from process.provider_directory_fhir_subset_completion import (
     validate_subset_completion_proof_pair,
     validate_subset_replay_evidence_pair,
 )
+from process.provider_directory_validated_publication_contract import (
+    ValidatedPublicationCandidate,
+    canonical_utc_timestamp,
+    validated_publication_candidate_from_params,
+    validated_publication_source_status,
+)
 from process.provider_directory_fhir_subset_identity import (
     is_reviewed_subset_profile,
     server_issued_subset_source_scope_payload,
@@ -14452,6 +14458,7 @@ class ProviderDirectoryArtifactDatasetFence:
     datasets: tuple[ProviderDirectoryArtifactDataset, ...]
     should_select_validated_candidates: bool = False
     promotion_aliases: tuple[ProviderDirectoryArtifactDataset, ...] = ()
+    validated_publication_candidate: ValidatedPublicationCandidate | None = None
 
     @property
     def dataset_id_by_endpoint_id(self) -> dict[str, str]:
@@ -21008,6 +21015,68 @@ def _locked_dataset_rows_by_id(
     }
 
 
+def _assert_validated_publication_candidate_fence(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    dataset_rows_by_id: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Bind one automatic request to its candidate and current incumbent."""
+
+    candidate = fence.validated_publication_candidate
+    if candidate is None:
+        return
+    stale_reason = "provider_directory_validated_publication_fence_changed"
+    if len(fence.datasets) != 1:
+        raise ProviderDirectoryArtifactBuildStale(stale_reason)
+    dataset = fence.datasets[0]
+    expected_current = candidate.expected_current
+    expected_current_dataset_id = expected_current.dataset_id if expected_current else None
+    if (
+        not fence.should_select_validated_candidates
+        or not dataset.promote_on_cutover
+        or dataset.source_id != candidate.source_id
+        or dataset.endpoint_id != candidate.endpoint_id
+        or dataset.dataset_id != candidate.dataset_id
+        or dataset.dataset_hash != candidate.dataset_hash
+        or dataset.evidence_run_id != candidate.acquisition_root_run_id
+        or canonical_utc_timestamp(dataset.validated_at) != candidate.validated_at
+        or dataset.previous_dataset_id != expected_current_dataset_id
+        or dataset.expected_incumbent_dataset_id != expected_current_dataset_id
+        or dataset.status != ENDPOINT_DATASET_VALIDATED
+        or dataset.is_current is not False
+        or dataset.completion_proof_required_version
+        != candidate.completion_proof_required_version
+        or dataset.completion_proof_sha256
+        != candidate.completion_proof_sha256
+        or dataset.verification_source_status
+        != validated_publication_source_status(candidate)
+        or dataset.verification_campaign_id
+        != candidate.verification_campaign_id
+        or dataset.verification_source_scope_hash
+        != candidate.verification_source_scope_sha256
+        or dataset.verification_source_ids != (candidate.source_id,)
+        or dataset.reviewed_root_policy is not None
+    ):
+        raise ProviderDirectoryArtifactBuildStale(stale_reason)
+    if expected_current is None:
+        return
+    incumbent = dataset_rows_by_id.get(expected_current.dataset_id)
+    if (
+        incumbent is None
+        or _clean_text(incumbent.get("endpoint_id"))
+        != expected_current.endpoint_id
+        or _clean_text(incumbent.get("dataset_hash"))
+        != expected_current.dataset_hash
+        or _clean_text(incumbent.get("acquisition_root_run_id"))
+        != expected_current.acquisition_root_run_id
+        or _clean_text(incumbent.get("status"))
+        != ENDPOINT_DATASET_PUBLISHED
+        or incumbent.get("is_current") is not True
+        or incumbent.get("published_at") is None
+        or incumbent.get("superseded_at") is not None
+    ):
+        raise ProviderDirectoryArtifactBuildStale(stale_reason)
+
+
 def _assert_locked_artifact_fence_datasets(
     fence: ProviderDirectoryArtifactDatasetFence,
     locked_dataset_rows: list[Any],
@@ -21015,6 +21084,7 @@ def _assert_locked_artifact_fence_datasets(
 ) -> None:
     """Reverify selected datasets, candidates, and expected incumbents."""
     dataset_rows_by_id = _locked_dataset_rows_by_id(locked_dataset_rows)
+    _assert_validated_publication_candidate_fence(fence, dataset_rows_by_id)
     rows_by_endpoint_id: dict[str, list[dict[str, Any]]] = {}
     current_ids_by_endpoint_id: dict[str, list[str]] = {}
     for dataset_row_map in dataset_rows_by_id.values():
@@ -22427,6 +22497,12 @@ def _artifact_fence_for_dataset(
             for alias in fence.promotion_aliases
             if alias.dataset_id == dataset_id
         ),
+        validated_publication_candidate=(
+            fence.validated_publication_candidate
+            if fence.validated_publication_candidate is not None
+            and fence.validated_publication_candidate.dataset_id == dataset_id
+            else None
+        ),
     )
 
 
@@ -23228,6 +23304,7 @@ def _artifact_fence_selection_identity(
     """Return immutable selection fields that relation-proof refresh may not alter."""
     return (
         fence.should_select_validated_candidates,
+        fence.validated_publication_candidate,
         tuple(
             sorted(
                 (
@@ -23276,6 +23353,7 @@ async def _publish_provider_directory_dataset_artifacts(
     publish_artifacts_targets: set[str] | None,
     require_complete_global_profile_fence: bool = False,
     full_address_artifact_rebuild: bool = False,
+    validated_publication_candidate: ValidatedPublicationCandidate | None = None,
 ) -> dict[str, Any]:
     """Build one selected dataset bundle and atomically publish its pointers."""
     if require_complete_global_profile_fence and not (
@@ -23294,9 +23372,7 @@ async def _publish_provider_directory_dataset_artifacts(
         raise RuntimeError(
             "provider_directory_profile_global_fence_required"
         )
-    should_select_validated_candidates = (
-        _should_select_validated_artifacts(publish_artifacts_targets)
-    )
+    should_select_validated_candidates = _should_select_validated_artifacts(publish_artifacts_targets)
     fence = await _prepare_artifact_publication_fence(
         source_ids,
         run_id=run_id,
@@ -23304,6 +23380,7 @@ async def _publish_provider_directory_dataset_artifacts(
         publish_artifacts_targets=publish_artifacts_targets,
         publish_corroboration=publish_corroboration,
         should_select_validated_candidates=should_select_validated_candidates,
+        validated_publication_candidate=validated_publication_candidate,
     )
     if _is_dataset_relation_only_artifact_target(publish_artifacts_targets):
         metrics["publish_artifacts_targets"] = sorted(
@@ -23756,6 +23833,20 @@ async def _publish_attested_provider_directory_profile(
     return published_metrics_by_name
 
 
+async def _bind_validated_publication_candidate(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    candidate: ValidatedPublicationCandidate | None,
+) -> ProviderDirectoryArtifactDatasetFence:
+    if candidate is None:
+        return fence
+    bound_fence = replace(
+        fence,
+        validated_publication_candidate=candidate,
+    )
+    await _verify_provider_directory_artifact_dataset_fence(bound_fence)
+    return bound_fence
+
+
 async def _prepare_artifact_publication_fence(
     source_ids: list[str] | tuple[str, ...] | None,
     *,
@@ -23764,10 +23855,15 @@ async def _prepare_artifact_publication_fence(
     publish_artifacts_targets: set[str] | None,
     publish_corroboration: bool,
     should_select_validated_candidates: bool,
+    validated_publication_candidate: ValidatedPublicationCandidate | None = None,
 ) -> ProviderDirectoryArtifactDatasetFence:
     fence = await _resolve_provider_directory_artifact_datasets(
         source_ids,
         should_select_validated_candidates=should_select_validated_candidates,
+    )
+    fence = await _bind_validated_publication_candidate(
+        fence,
+        validated_publication_candidate,
     )
     _assert_provider_directory_artifact_target_dependencies(
         fence,
@@ -23783,6 +23879,10 @@ async def _prepare_artifact_publication_fence(
     refreshed_fence = await _resolve_provider_directory_artifact_datasets(
         source_ids,
         should_select_validated_candidates=should_select_validated_candidates,
+    )
+    refreshed_fence = await _bind_validated_publication_candidate(
+        refreshed_fence,
+        validated_publication_candidate,
     )
     _assert_artifact_fence_selection_unchanged(fence, refreshed_fence)
     return refreshed_fence
@@ -40973,7 +41073,7 @@ def _reviewed_provider_directory_candidate_seed_rows(
             source_url="https://www.devoted.com/developers/",
             resources=PUBLIC_DIRECTORY_SEVEN_RESOURCES,
             expected_nonempty_resources=PUBLIC_DIRECTORY_SEVEN_RESOURCES,
-            candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
+            candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
             last_updated_partition_resources=(
                 REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES
             ),
@@ -60286,7 +60386,7 @@ def _is_reviewed_partition_generation_exact(
     }
     if (
         expected_metadata.get("provider_directory_candidate_status")
-        != PROVIDER_DIRECTORY_TWIN_ROOT_PENDING
+        != PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
         or expected_metadata.get(LAST_UPDATED_PARTITION_METADATA_KEY)
         != expected_partition_by_field
         or any(
@@ -72244,6 +72344,9 @@ async def process_provider_directory_fhir_data(
 ) -> dict[str, Any]:
     """Run provider-directory discovery, import, and publication."""
     task = _apply_provider_directory_refresh_preset(task or {})
+    validated_publication_candidate = (
+        validated_publication_candidate_from_params(task)
+    )
     census_request = current_version_census_request(
         task,
         allowed_resources=DEFAULT_RESOURCES,
@@ -72634,6 +72737,9 @@ async def process_provider_directory_fhir_data(
                 full_address_artifact_rebuild=full_address_artifact_rebuild,
                 require_complete_global_profile_fence=bool(
                     task.get("require_complete_global_profile_fence")
+                ),
+                validated_publication_candidate=(
+                    validated_publication_candidate
                 ),
             )
         else:

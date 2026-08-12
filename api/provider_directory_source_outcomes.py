@@ -39,6 +39,7 @@ class _CurrentPublishedDataset:
     endpoint_id: str
     dataset_id: str
     acquisition_root_run_id: str | None
+    previous_dataset_id: str | None
     dataset_hash: str | None
     status: str
     is_current: bool
@@ -170,6 +171,9 @@ def _current_dataset_from_row(
         dataset_id=dataset_id,
         acquisition_root_run_id=_clean_text(
             dataset_record.get("acquisition_root_run_id")
+        ),
+        previous_dataset_id=_clean_text(
+            dataset_record.get("previous_dataset_id")
         ),
         dataset_hash=_clean_text(dataset_record.get("dataset_hash")),
         status=state[0],
