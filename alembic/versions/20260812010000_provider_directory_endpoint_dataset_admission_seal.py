@@ -319,12 +319,66 @@ def _add_columns_sql(schema: str) -> str:
     table = _qf(schema, _TABLE)
     return f"""
     ALTER TABLE {table}
-        ADD COLUMN publication_metadata_summary_json jsonb,
-        ADD COLUMN publication_metadata_sha256 varchar(64),
-        ADD COLUMN content_proof_admission_version smallint,
-        ADD COLUMN content_proof_admission_kind varchar(32),
-        ADD COLUMN content_proof_admission_sha256 varchar(64),
-        ADD COLUMN content_proof_resource_types varchar(64)[];
+        ADD COLUMN IF NOT EXISTS publication_metadata_summary_json jsonb,
+        ADD COLUMN IF NOT EXISTS publication_metadata_sha256 varchar(64),
+        ADD COLUMN IF NOT EXISTS content_proof_admission_version smallint,
+        ADD COLUMN IF NOT EXISTS content_proof_admission_kind varchar(32),
+        ADD COLUMN IF NOT EXISTS content_proof_admission_sha256 varchar(64),
+        ADD COLUMN IF NOT EXISTS content_proof_resource_types varchar(64)[];
+    """
+
+
+def _column_adoption_fence_sql(schema: str) -> str:
+    """Allow either no receipt columns or the exact nullable ORM surface."""
+
+    table = _qf(schema, _TABLE)
+    expected_rows = ",\n            ".join(
+        f"({_ql(column_name)}, {_ql(type_name)})"
+        for column_name, type_name in (
+            ("publication_metadata_summary_json", "jsonb"),
+            ("publication_metadata_sha256", "character varying(64)"),
+            ("content_proof_admission_version", "smallint"),
+            ("content_proof_admission_kind", "character varying(32)"),
+            ("content_proof_admission_sha256", "character varying(64)"),
+            ("content_proof_resource_types", "character varying(64)[]"),
+        )
+    )
+    return f"""
+    DO $migration$
+    DECLARE
+        present_columns bigint;
+        matching_columns bigint;
+    BEGIN
+        SELECT pg_catalog.count(attribute.attname),
+               pg_catalog.count(attribute.attname) FILTER (
+                   WHERE pg_catalog.format_type(
+                             attribute.atttypid,
+                             attribute.atttypmod
+                         ) = expected.type_name
+                     AND attribute.attnotnull IS FALSE
+                     AND attribute.attgenerated = ''
+                     AND default_value.adbin IS NULL
+               )
+          INTO present_columns, matching_columns
+          FROM (VALUES
+            {expected_rows}
+          ) AS expected(column_name, type_name)
+          LEFT JOIN pg_catalog.pg_attribute AS attribute
+            ON attribute.attrelid = {_ql(table)}::regclass
+           AND attribute.attname = expected.column_name
+           AND attribute.attnum > 0
+           AND NOT attribute.attisdropped
+          LEFT JOIN pg_catalog.pg_attrdef AS default_value
+            ON default_value.adrelid = attribute.attrelid
+           AND default_value.adnum = attribute.attnum;
+        IF present_columns NOT IN (0, {len(_SEAL_COLUMNS)})
+           OR matching_columns <> present_columns THEN
+            RAISE EXCEPTION
+                'provider_directory_endpoint_dataset_admission_columns_changed'
+                USING ERRCODE = '55000';
+        END IF;
+    END;
+    $migration$;
     """
 
 
@@ -734,6 +788,7 @@ def upgrade() -> None:
     replay_guard = _qf(schema, _REPLAY_GUARD_FUNCTION)
     op.execute(_runtime_fence_sql(schema))
     op.execute(_legacy_surface_fence_sql(schema, scoped=False))
+    op.execute(_column_adoption_fence_sql(schema))
     op.execute(_add_columns_sql(schema))
     op.execute(
         f"CREATE INDEX {_q(_SOURCE_IDS_INDEX)} ON {table} USING gin "

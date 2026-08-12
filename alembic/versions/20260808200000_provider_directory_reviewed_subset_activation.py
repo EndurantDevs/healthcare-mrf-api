@@ -1351,6 +1351,9 @@ def _predecessor_shape_fences(schema: str) -> None:
             schema,
             _ENDPOINT_DATASET,
             previous._SUBSET_ENDPOINT_DATASET_COLUMNS,
+            compatible_columns=(
+                previous._CURRENT_ENDPOINT_DATASET_COLUMNS,
+            ),
         )
     )
     op.execute(
