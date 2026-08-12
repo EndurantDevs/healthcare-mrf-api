@@ -306,7 +306,51 @@ async def test_global_artifact_scope_preserves_cross_endpoint_candidate(
         assert await _selected_rows(
             database,
             select_validated_candidates=True,
+        ) == [("source_a", "endpoint_a", "dataset_a")]
+        await database.status(
+            f"""
+            UPDATE {schema}.provider_directory_endpoint_dataset
+               SET publication_metadata_summary_json =
+                       publication_metadata_json,
+                   content_proof_admission_version =
+                       {importer.ADMISSION_SEAL_VERSION},
+                   content_proof_admission_kind =
+                       '{importer.ADMISSION_KIND_GENERIC}',
+                   content_proof_admission_sha256 = repeat('a', 64),
+                   content_proof_resource_types = ARRAY['Location']::varchar[],
+                   publication_metadata_sha256 =
+                       {schema}.provider_directory_endpoint_dataset_admission_metadata_sha256(
+                           publication_metadata_json,
+                           {importer.ADMISSION_SEAL_VERSION}::smallint,
+                           '{importer.ADMISSION_KIND_GENERIC}'::text,
+                           repeat('a', 64),
+                           ARRAY['Location']::varchar[]
+                       )
+             WHERE dataset_id = 'dataset_b';
+            """
+        )
+        assert await _selected_rows(
+            database,
+            select_validated_candidates=True,
         ) == [("source_a", "endpoint_b", "dataset_b")]
+        explicit_rows = await database.all(
+            importer._provider_directory_artifact_dataset_selection_sql(
+                ["source_a"],
+                should_select_validated_candidates=True,
+            ),
+            published_status=importer.ENDPOINT_DATASET_PUBLISHED,
+            validated_status=importer.ENDPOINT_DATASET_VALIDATED,
+            select_validated_candidates=True,
+            source_ids=["source_a"],
+        )
+        assert [
+            (
+                str(row._mapping["source_id"]),
+                str(row._mapping["endpoint_id"]),
+                str(row._mapping["dataset_id"]),
+            )
+            for row in explicit_rows
+        ] == [("source_a", "endpoint_b", "dataset_b")]
     finally:
         await database.status(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
         await database.disconnect()

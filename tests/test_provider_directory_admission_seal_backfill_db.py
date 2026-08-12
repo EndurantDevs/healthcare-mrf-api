@@ -23,6 +23,7 @@ from tests.test_provider_directory_dataset_selection_bounded_db import (
     _large_metadata_by_field,
     _set_shared_semantic_proof,
 )
+from tests.uhc_final_publication_test_support import final_publication_fixture
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -130,14 +131,14 @@ async def test_sealed_followup_reads_do_not_return_large_raw_proof(monkeypatch):
         )
         await importer._record_current_dataset_publication_proof(
             dataset,
-            "synthetic_additive_proof",
+            importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY,
             {"verified": True},
         )
         raw_after = await database.first(
             f"SELECT md5(publication_metadata_json::text) AS digest, "
             f"octet_length(publication_metadata_json::text) AS byte_count, "
             "publication_metadata_summary_json -> "
-            "'synthetic_additive_proof' AS additive_proof, "
+            "'outcome_resource_counts_v1' AS additive_proof, "
             "publication_metadata_sha256 = "
             f"{schema}.provider_directory_endpoint_dataset_admission_metadata_sha256("
             "publication_metadata_summary_json, "
@@ -230,32 +231,33 @@ async def test_backfill_binds_completion_resource_summary(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_backfill_rejects_unsupported_legacy_canonical_proof(monkeypatch):
+async def test_backfill_validates_bounded_legacy_canonical_proof(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
-        metadata = {
-            "source_ids": ["source_primary", "source_sibling"],
-            "selected_resources": ["Location"],
-            UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY: {
-                "proof_sha256": "a" * 64,
-                "resource_counts": {"Location": 1},
-            },
-        }
+        state, _expectation = final_publication_fixture(
+            dataset_id="dataset_shared",
+            endpoint_id="endpoint_shared",
+            acquisition_root_run_id="root-shared",
+        )
+        metadata = state["publication_metadata_json"]
         await database.status(
             f"UPDATE {schema}.provider_directory_endpoint_dataset "
             "SET publication_metadata_json = CAST(:metadata AS jsonb), "
-            "dataset_hash = :dataset_hash, resource_count = 1 "
+            "dataset_hash = :dataset_hash, resource_count = :resource_count "
             "WHERE dataset_id = 'dataset_shared';",
             metadata=json.dumps(metadata),
-            dataset_hash="e" * 64,
+            dataset_hash=state["dataset_hash"],
+            resource_count=state["resource_count"],
         )
 
-        with pytest.raises(AdmissionSealError, match="uhc_backfill_unsupported"):
-            await backfill_provider_directory_admission_seal(
-                "dataset_shared",
-                database=database,
-            )
+        result = await backfill_provider_directory_admission_seal(
+            "dataset_shared",
+            database=database,
+        )
+
+        assert result["status"] == "sealed"
+        assert result["admission_kind"] == "uhc_canonical"
         assert await database.scalar(
-            f"SELECT content_proof_admission_sha256 IS NULL "
+            f"SELECT content_proof_admission_kind "
             f"FROM {schema}.provider_directory_endpoint_dataset "
             "WHERE dataset_id = 'dataset_shared'"
-        ) is True
+        ) == "uhc_canonical"

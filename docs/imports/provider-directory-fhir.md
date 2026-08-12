@@ -482,16 +482,11 @@ spools PostgreSQL binary COPY bytes and descriptor frames to private temporary
 files, fully revalidates every descriptor and aggregate, recomputes the shard
 set and canonical proof digests, then performs one locked `ctid`/`xmin` CAS.
 An already sealed row is an idempotent success. Partial receipts, changed rows,
-oversized metadata, invalid proofs, and unsupported legacy proof kinds fail
-closed. Retries require the same exact dataset id; a failed transaction leaves
-the row unsealed.
-
-Legacy canonical-provider proofs are intentionally unsupported by this M1
-backfill command: they fail closed rather than trusting an embedded receipt.
-Their existing read compatibility is retained only below the same 1 MiB
-metadata ceiling, while new terminal writes store a receipt after application
-validation. Streaming revalidation and backfill for those legacy rows is a
-required follow-up before any M2 required-receipt cutover.
+oversized metadata, invalid proofs, and unsupported proof kinds fail closed.
+Retries require the same exact dataset id; a failed transaction leaves the row
+unsealed. Legacy canonical proofs are admitted only when their complete proof
+and publication contract fit the bounded 1 MiB capture and pass the existing
+canonical, source-summary, outcome, and lineage validators.
 
 The application proof validator is the admission authority for new terminal
 writes. Database triggers enforce receipt shape, digest consistency, bounded

@@ -2686,7 +2686,7 @@ async def _assert_dataset_fence_lock_contract(dataset, status):
     ):
         await importer._record_current_dataset_serving_relation_proof(
             dataset,
-            "network_plan_proof",
+            importer.PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY,
             {"complete": True},
         )
 
@@ -2772,12 +2772,23 @@ async def test_dataset_fence_helpers_lock_record_and_aggregate_proof(
     monkeypatch.setattr(importer.db, "status", status)
     await importer._record_current_dataset_serving_relation_proof(
         dataset,
-        "network_plan_proof",
+        importer.PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY,
         {"complete": True},
     )
     assert json.loads(status.await_args.kwargs["proof_json"]) == {
         "complete": True
     }
+    status.reset_mock()
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="endpoint_dataset_metadata_key_invalid",
+    ):
+        await importer._record_current_dataset_publication_proof(
+            dataset,
+            "unreviewed_additive_key",
+            {"complete": True},
+        )
+    status.assert_not_awaited()
     await _assert_dataset_fence_lock_contract(dataset, status)
 
 

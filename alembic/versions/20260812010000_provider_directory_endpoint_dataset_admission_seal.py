@@ -34,6 +34,7 @@ _TRUNCATE_FUNCTION = (
     "guard_provider_directory_endpoint_dataset_admission_truncate"
 )
 _GUARD_TRIGGER = "provider_directory_endpoint_dataset_admission_seal_guard"
+_SOURCE_IDS_INDEX = "pd_endpoint_dataset_admission_source_ids_idx"
 _RAW_GUARD_TRIGGER = (
     "provider_directory_endpoint_dataset_admission_raw_guard"
 )
@@ -734,6 +735,12 @@ def upgrade() -> None:
     op.execute(_runtime_fence_sql(schema))
     op.execute(_legacy_surface_fence_sql(schema, scoped=False))
     op.execute(_add_columns_sql(schema))
+    op.execute(
+        f"CREATE INDEX {_q(_SOURCE_IDS_INDEX)} ON {table} USING gin "
+        "((publication_metadata_summary_json -> 'source_ids')) "
+        "WHERE status = 'validated' AND is_current = false "
+        "AND superseded_at IS NULL;"
+    )
     op.execute(_digest_function_sql(schema))
     op.execute(_guard_function_sql(schema))
     op.execute(_truncate_function_sql(schema))
@@ -775,6 +782,7 @@ def downgrade() -> None:
         op.execute(statement)
     op.execute(f"DROP FUNCTION {truncate_guard}();")
     op.execute(f"DROP FUNCTION {guard}();")
+    op.execute(f"DROP INDEX {_qf(schema, _SOURCE_IDS_INDEX)};")
     op.execute(
         f"DROP FUNCTION {digest}"
         "(jsonb, smallint, text, text, varchar[]);"

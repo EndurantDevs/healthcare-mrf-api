@@ -43,6 +43,13 @@ from process.provider_directory_resource_hash import (
 )
 from process.uhc_canonical_proof import (
     UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY,
+    UhcCanonicalProofError,
+    validate_uhc_canonical_content_proof,
+)
+from process.uhc_final_publication_contract import (
+    UhcFinalPublicationError,
+    UhcFinalPublicationExpectation,
+    validate_uhc_final_publication,
 )
 
 
@@ -613,7 +620,11 @@ class _GenericProofStream:
             key = self.pending_key
             self.pending_key = None
             if key == UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY:
-                raise AdmissionSealError("provider_directory_admission_uhc_backfill_unsupported")
+                self.capture = _Capture()
+                self.capture_target = ("root", key)
+                if self.capture.feed(event, value):
+                    self._store_capture()
+                return
             if key == PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY:
                 if event != "start_map":
                     raise AdmissionSealError("provider_directory_admission_proof_invalid")
@@ -706,6 +717,61 @@ class _GenericProofStream:
         self.descriptor_file.close()
         if not self.complete or self.mode != "root":
             raise AdmissionSealError("provider_directory_admission_metadata_incomplete")
+        if UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY in self.seen_root_keys:
+            if PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY in self.seen_root_keys:
+                raise AdmissionSealError(
+                    "provider_directory_admission_proof_kind_invalid"
+                )
+            try:
+                proof = validate_uhc_canonical_content_proof(
+                    self.metadata.get(UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY),
+                    dataset_id=dataset_id,
+                    endpoint_id=endpoint_id,
+                    acquisition_root_run_id=evidence_run_id,
+                )
+                validate_uhc_final_publication(
+                    {
+                        "source_id": proof["source_id"],
+                        "dataset_id": dataset_id,
+                        "endpoint_id": endpoint_id,
+                        "acquisition_root_run_id": evidence_run_id,
+                        "status": "published",
+                        "is_current": True,
+                        "dataset_hash": dataset_hash,
+                        "resource_count": resource_count,
+                        "publication_metadata_json": self.metadata,
+                    },
+                    UhcFinalPublicationExpectation(
+                        source_id=proof["source_id"],
+                        dataset_id=dataset_id,
+                        endpoint_id=endpoint_id,
+                        acquisition_root_run_id=evidence_run_id,
+                        selected_resources=tuple(sorted(proof["resource_counts"])),
+                        semantic_contract_id=proof["semantic_contract_id"],
+                        catalog_set_sha256=proof["catalog_set_sha256"],
+                    ),
+                )
+            except (UhcCanonicalProofError, UhcFinalPublicationError) as error:
+                raise AdmissionSealError(
+                    "provider_directory_admission_uhc_proof_invalid"
+                ) from error
+            if (
+                proof.get("dataset_hash") != dataset_hash
+                or proof.get("resource_count") != resource_count
+                or expected_resource_hashes is not None
+                and proof.get("resource_hashes") != expected_resource_hashes
+                or expected_resource_counts is not None
+                and proof.get("resource_counts") != expected_resource_counts
+            ):
+                raise AdmissionSealError(
+                    "provider_directory_admission_completion_summary_invalid"
+                )
+            return _receipt(
+                self.metadata,
+                admission_kind=ADMISSION_KIND_UHC_CANONICAL,
+                proof_sha256=proof.get("proof_sha256"),
+                resource_counts=proof.get("resource_counts"),
+            )
         contract_id = self.proof_header.get("contract_id")
         expected_fields = (
             _LEGACY_PROOF_FIELDS

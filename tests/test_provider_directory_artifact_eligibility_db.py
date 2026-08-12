@@ -89,6 +89,13 @@ async def _create_tables(database: Database, schema: str) -> None:
         );
         """
     )
+    await database.status(
+        f"CREATE INDEX pd_endpoint_dataset_admission_source_ids_idx "
+        f"ON {schema}.provider_directory_endpoint_dataset USING gin "
+        "((publication_metadata_summary_json -> 'source_ids')) "
+        "WHERE status = 'validated' AND is_current = false "
+        "AND superseded_at IS NULL;"
+    )
     await install_subset_canonical_functions(database, schema)
 
 
@@ -292,6 +299,21 @@ async def _insert_core_datasets(database: Database, schema: str) -> None:
         missing_metadata=json.dumps(missing_source_ids_metadata),
         nonarray_metadata=json.dumps(nonarray_source_ids_metadata),
     )
+    await database.status(
+        f"""
+        UPDATE {schema}.provider_directory_endpoint_dataset
+           SET publication_metadata_summary_json = publication_metadata_json,
+               publication_metadata_sha256 = repeat('0', 64),
+               content_proof_admission_version =
+                   {importer.ADMISSION_SEAL_VERSION},
+               content_proof_admission_kind =
+                   '{importer.ADMISSION_KIND_GENERIC}',
+               content_proof_admission_sha256 = repeat('a', 64),
+               content_proof_resource_types =
+                   ARRAY['Organization', 'Practitioner']::varchar[]
+         WHERE is_current = false;
+        """
+    )
 
 
 @contextlib.asynccontextmanager
@@ -376,7 +398,8 @@ async def _set_twin_metadata(
         await database.status(
             f"""
             UPDATE {schema}.provider_directory_endpoint_dataset
-               SET publication_metadata_json = CAST(:metadata AS jsonb)
+               SET publication_metadata_json = CAST(:metadata AS jsonb),
+                   publication_metadata_summary_json = CAST(:metadata AS jsonb)
              WHERE dataset_id = :dataset_id;
             """,
             dataset_id=dataset_id,
@@ -481,7 +504,12 @@ async def test_verified_gate_keeps_incumbent_and_exact_matched_candidate(
                    publication_metadata_json,
                    '{{{importer.TWIN_ROOT_VERIFICATION_METADATA_KEY},proof,resource_hashes,Organization}}',
                    '"tampered"'::jsonb
-               )
+               ),
+                   publication_metadata_summary_json = jsonb_set(
+                       publication_metadata_summary_json,
+                       '{{{importer.TWIN_ROOT_VERIFICATION_METADATA_KEY},proof,resource_hashes,Organization}}',
+                       '"tampered"'::jsonb
+                   )
              WHERE dataset_id = 'dataset_baseline';
             """
         )

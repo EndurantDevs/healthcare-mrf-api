@@ -28,6 +28,7 @@ from tests.test_provider_directory_dataset_selection_bounded_db import (
     _large_metadata_by_field,
     _proof_line_hash,
 )
+from tests.uhc_final_publication_test_support import final_publication_fixture
 
 
 _COPY_SIGNATURE = b"PGCOPY\n\xff\r\n\x00"
@@ -751,23 +752,63 @@ def test_streaming_copy_requires_exact_private_copy_header(
         )
 
 
-def test_streaming_copy_rejects_legacy_canonical_proof(tmp_path: Path):
-    metadata = _large_metadata_by_field(2)
-    metadata.pop("provider_directory_content_proof_v1")
-    metadata["uhc_canonical_content_proof_v1"] = {
-        "proof_sha256": "a" * 64,
-    }
+def test_streaming_copy_validates_bounded_legacy_canonical_proof(tmp_path: Path):
+    state, _expectation = final_publication_fixture(
+        dataset_id="dataset_shared",
+        endpoint_id="endpoint_shared",
+        acquisition_root_run_id="root-shared",
+    )
+    metadata = state["publication_metadata_json"]
     copy_path = tmp_path / "metadata.copy"
     _binary_copy(metadata, copy_path)
 
-    with pytest.raises(AdmissionSealError, match="uhc_backfill_unsupported"):
+    receipt = validate_generic_admission_copy(
+        copy_path,
+        dataset_id="dataset_shared",
+        endpoint_id="endpoint_shared",
+        evidence_run_id="root-shared",
+        dataset_hash=state["dataset_hash"],
+        resource_count=state["resource_count"],
+        scratch_directory=tmp_path,
+    )
+
+    assert receipt.admission_kind == "uhc_canonical"
+    assert receipt.proof_sha256 == metadata[
+        "uhc_canonical_content_proof_v1"
+    ]["proof_sha256"]
+    assert "uhc_canonical_content_proof_v1" not in receipt.metadata_summary
+
+
+@pytest.mark.parametrize(
+    ("field_name", "changed_value"),
+    [
+        ("source_ids", ["tampered-source"]),
+        ("selected_resources", ["Organization"]),
+    ],
+)
+def test_streaming_copy_rejects_canonical_root_lineage_change(
+    tmp_path: Path,
+    field_name: str,
+    changed_value: list[str],
+):
+    state, _expectation = final_publication_fixture(
+        dataset_id="dataset_shared",
+        endpoint_id="endpoint_shared",
+        acquisition_root_run_id="root-shared",
+    )
+    metadata = state["publication_metadata_json"]
+    metadata[field_name] = changed_value
+    copy_path = tmp_path / "metadata.copy"
+    _binary_copy(metadata, copy_path)
+
+    with pytest.raises(AdmissionSealError, match="uhc_proof_invalid"):
         validate_generic_admission_copy(
             copy_path,
             dataset_id="dataset_shared",
             endpoint_id="endpoint_shared",
             evidence_run_id="root-shared",
-            dataset_hash="e" * 64,
-            resource_count=2,
+            dataset_hash=state["dataset_hash"],
+            resource_count=state["resource_count"],
             scratch_directory=tmp_path,
         )
 

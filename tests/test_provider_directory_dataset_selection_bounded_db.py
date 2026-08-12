@@ -14,6 +14,7 @@ from api.provider_directory_source_catalog_outcomes import (
 )
 from process.provider_directory_admission_seal import (
     admission_seal_from_validated_metadata,
+    backfill_provider_directory_admission_seal,
 )
 from process.provider_directory_fhir_subset_canonical import (
     canonical_payload_sha256,
@@ -549,6 +550,27 @@ async def test_explicit_selection_does_not_evaluate_unrelated_metadata(monkeypat
     """Scope the candidate-aware catalog path before full proof work."""
     async with _dataset_database(monkeypatch) as (database, schema):
         await _insert_validated_shared_dataset(database, schema)
+        metadata_by_field = _large_metadata_by_field(
+            2,
+            dataset_id="dataset_candidate",
+            endpoint_id="endpoint_shared",
+            root_run_id="root-candidate",
+        )
+        await database.status(
+            f"""
+            UPDATE {schema}.provider_directory_endpoint_dataset
+               SET publication_metadata_json = CAST(:metadata AS json),
+                   dataset_hash = :dataset_hash,
+                   resource_count = 2
+             WHERE dataset_id = 'dataset_candidate';
+            """,
+            metadata=json.dumps(metadata_by_field),
+            dataset_hash="e" * 64,
+        )
+        await backfill_provider_directory_admission_seal(
+            "dataset_candidate",
+            database=database,
+        )
         await _install_unrelated_large_proof_hash_sentinel(database, schema)
         selected = await _canonical_validated_datasets_by_source_id(
             ["source_primary"]

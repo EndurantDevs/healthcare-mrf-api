@@ -72,11 +72,20 @@ def test_upgrade_is_nullable_bounded_and_application_trusted(monkeypatch) -> Non
     assert migration.down_revision == (
         "20260811140000_ptg_v12_provider_publication_merge"
     )
-    assert len(statements) == 41
+    assert len(statements) == 42
     for column_name in migration._SEAL_COLUMNS:
         assert f"ADD COLUMN {column_name}" in sql
     assert "ADD COLUMN publication_metadata_summary_json jsonb" in sql
     assert "ADD COLUMN content_proof_resource_types varchar(64)[]" in sql
+    assert (
+        "CREATE INDEX \"pd_endpoint_dataset_admission_source_ids_idx\""
+        in sql
+    )
+    assert "USING gin ((publication_metadata_summary_json -> 'source_ids'))" in sql
+    assert (
+        "WHERE status = 'validated' AND is_current = false "
+        "AND superseded_at IS NULL"
+    ) in sql
     add_columns_statement = next(
         statement for statement in statements
         if "ADD COLUMN publication_metadata_summary_json" in statement
@@ -128,10 +137,12 @@ def test_upgrade_is_nullable_bounded_and_application_trusted(monkeypatch) -> Non
 def test_downgrade_removes_only_the_m1_receipt_surface(monkeypatch) -> None:
     migration, statements, sql = _capture(monkeypatch, "downgrade")
 
-    assert len(statements) == 31
+    assert len(statements) == 32
     assert sql.count("DROP TRIGGER") == 10
     assert sql.count("DROP FUNCTION") == 4
     assert sql.count("DROP COLUMN") == len(migration._SEAL_COLUMNS)
+    assert 'DROP INDEX "admission_seal_contract".' \
+        '"pd_endpoint_dataset_admission_source_ids_idx"' in sql
     assert "provider_directory_endpoint_dataset_admission_downgrade_blocked" in sql
     assert "ADD CONSTRAINT \"pd_endpoint_dataset_subset_replay_evidence_check\"" in sql
     assert "UPDATE OF" not in " ".join(
