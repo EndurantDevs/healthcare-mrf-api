@@ -230,6 +230,7 @@ from process.provider_directory_admission_seal import (
     ADMISSION_LEGACY_SHARD_MAX_COUNT,
     ADMISSION_SEAL_VERSION,
     AdmissionSealError,
+    ProviderDirectoryAdmissionSeal,
     admission_seal_from_validated_metadata,
 )
 from process.provider_directory_organization_hash import (
@@ -15538,13 +15539,11 @@ def _artifact_ordinary_proof_sql(metadata: str) -> str:
     """
 
 
-def _artifact_matched_anchor_sql(
-    dataset_ref: str,
-    metadata: str,
-    *,
-    use_admission_seals: bool = False,
-) -> str:
-    anchor_metadata_join = ""
+def _artifact_anchor_metadata(
+    use_admission_seals: bool,
+) -> tuple[str, str, str]:
+    """Return the matching metadata expression and admission-seal guard."""
+
     anchor_metadata = (
         "matched_anchor.publication_metadata_summary_json"
         if use_admission_seals
@@ -15554,6 +15553,43 @@ def _artifact_matched_anchor_sql(
         f"AND ({_artifact_admission_seal_valid_sql('matched_anchor')})"
         if use_admission_seals
         else ""
+    )
+    return "", anchor_metadata, anchor_seal
+
+
+def _artifact_anchor_baseline_proof_sql(
+    dataset_ref: str,
+    anchor_metadata: str,
+    anchor_verification: str,
+    use_admission_seals: bool,
+) -> str:
+    """Build the exact baseline predicate for one matching anchor."""
+
+    return _artifact_baseline_proof_sql(
+        dataset_ref,
+        anchor_metadata,
+        anchor_verification,
+        options=_ArtifactBaselineProofOptions(
+            dataset_ref=dataset_ref,
+            metadata=anchor_metadata,
+            verification=anchor_verification,
+            candidate_alias="matched_anchor",
+            baseline_alias="anchor_baseline",
+            use_admission_seals=use_admission_seals,
+        ),
+    )
+
+
+def _artifact_matched_anchor_sql(
+    dataset_ref: str,
+    metadata: str,
+    *,
+    use_admission_seals: bool = False,
+) -> str:
+    """Require one matching admitted candidate and its exact baseline."""
+
+    anchor_metadata_join, anchor_metadata, anchor_seal = _artifact_anchor_metadata(
+        use_admission_seals
     )
     anchor_verification = (
         f"{anchor_metadata} -> '{TWIN_ROOT_VERIFICATION_METADATA_KEY}'"
@@ -15565,13 +15601,11 @@ def _artifact_matched_anchor_sql(
         anchor_proof,
         "matched_anchor",
     )
-    baseline_proof_sql = _artifact_baseline_proof_sql(
+    baseline_proof_sql = _artifact_anchor_baseline_proof_sql(
         dataset_ref,
         anchor_metadata,
         anchor_verification,
-        candidate_alias="matched_anchor",
-        baseline_alias="anchor_baseline",
-        use_admission_seals=use_admission_seals,
+        use_admission_seals,
     )
     return f"""
         EXISTS (
@@ -15667,6 +15701,19 @@ class _ArtifactBaselineProofFragments:
     exact_proof_sql: str
 
 
+@dataclass(frozen=True, slots=True)
+class _ArtifactBaselineProofOptions:
+    dataset_ref: str
+    metadata: str
+    verification: str
+    candidate_alias: str = "dataset"
+    baseline_alias: str = "verification_baseline"
+    completion_proof_required_version: int | None = None
+    reviewed_root_count: int | None = None
+    require_reviewed_root_policy_absent: bool = False
+    use_admission_seals: bool = False
+
+
 def _artifact_baseline_exists_sql(
     fragments: _ArtifactBaselineProofFragments,
 ) -> str:
@@ -15729,79 +15776,93 @@ def _artifact_baseline_hash_identity_sql(
     """
 
 
+def _artifact_baseline_metadata(
+    options: _ArtifactBaselineProofOptions,
+) -> tuple[str, str, str]:
+    """Return baseline metadata, its optional join, and the seal guard."""
+
+    baseline_metadata = (
+        f"{options.baseline_alias}.publication_metadata_summary_json"
+        if options.use_admission_seals
+        else f"{options.baseline_alias}.publication_metadata_json::jsonb"
+    )
+    baseline_metadata_join = ""
+    baseline_seal = (
+        f"({_artifact_admission_seal_valid_sql(options.baseline_alias)})"
+        if options.use_admission_seals
+        else ""
+    )
+    return baseline_metadata, baseline_metadata_join, baseline_seal
+
+
+def _artifact_baseline_policy_guard_sql(
+    options: _ArtifactBaselineProofOptions,
+    baseline_metadata: str,
+    baseline_seal: str,
+) -> str:
+    """Combine baseline policy with the admission seal when required."""
+
+    baseline_policy = _artifact_baseline_policy_sql(
+        baseline_metadata,
+        options.reviewed_root_count,
+        options.require_reviewed_root_policy_absent,
+    )
+    return (
+        " AND ".join((baseline_seal, baseline_policy))
+        if options.use_admission_seals
+        else baseline_policy
+    )
+
+
 def _artifact_baseline_proof_fragments(
-    dataset_ref: str,
-    metadata: str,
-    verification: str,
-    candidate_alias: str,
-    baseline_alias: str,
-    completion_proof_required_version: int | None,
-    reviewed_root_count: int | None,
-    require_reviewed_root_policy_absent: bool,
-    use_admission_seals: bool,
+    options: _ArtifactBaselineProofOptions,
 ) -> _ArtifactBaselineProofFragments:
     """Build the independently testable baseline-proof SQL fragments."""
 
-    baseline_metadata = (
-        f"{baseline_alias}.publication_metadata_summary_json"
-        if use_admission_seals
-        else f"{baseline_alias}.publication_metadata_json::jsonb"
+    baseline_metadata, baseline_metadata_join, baseline_seal = (
+        _artifact_baseline_metadata(options)
     )
-    baseline_metadata_join = ""
     baseline_verification = (
         f"{baseline_metadata} -> '{TWIN_ROOT_VERIFICATION_METADATA_KEY}'"
     )
-    candidate_proof = f"{verification} -> 'proof'"
+    candidate_proof = f"{options.verification} -> 'proof'"
     baseline_proof = f"{baseline_verification} -> 'proof'"
     return _ArtifactBaselineProofFragments(
-        dataset_ref=dataset_ref,
-        metadata=metadata,
-        verification=verification,
-        candidate_alias=candidate_alias,
-        baseline_alias=baseline_alias,
+        dataset_ref=options.dataset_ref,
+        metadata=options.metadata,
+        verification=options.verification,
+        candidate_alias=options.candidate_alias,
+        baseline_alias=options.baseline_alias,
         baseline_metadata=baseline_metadata,
         baseline_metadata_join=baseline_metadata_join,
         completion_marker_sql=_artifact_completion_marker_sql(
-            candidate_alias,
-            baseline_alias,
-            completion_proof_required_version,
+            options.candidate_alias,
+            options.baseline_alias,
+            options.completion_proof_required_version,
         ),
-        baseline_policy_sql=" AND ".join(
-            (
-                f"({_artifact_admission_seal_valid_sql(baseline_alias)})",
-                _artifact_baseline_policy_sql(
-                    baseline_metadata,
-                    reviewed_root_count,
-                    require_reviewed_root_policy_absent,
-                ),
-            )
-            if use_admission_seals
-            else (
-                _artifact_baseline_policy_sql(
-                    baseline_metadata,
-                    reviewed_root_count,
-                    require_reviewed_root_policy_absent,
-                ),
-            )
+        baseline_policy_sql=_artifact_baseline_policy_guard_sql(
+            options,
+            baseline_metadata,
+            baseline_seal,
         ),
         baseline_contract_sql=_artifact_baseline_contract_sql(
-            baseline_alias,
+            options.baseline_alias,
             baseline_metadata,
             baseline_verification,
             baseline_proof,
             completion_proof_required_version=(
-                completion_proof_required_version
+                options.completion_proof_required_version
             ),
         ),
         hash_identity_sql=_artifact_baseline_hash_identity_sql(
-            metadata,
+            options.metadata,
             baseline_metadata,
         ),
         exact_proof_sql=_artifact_twin_proof_equality_sql(
             candidate_proof,
             baseline_proof,
             include_subset_completion=(
-                completion_proof_required_version
+                options.completion_proof_required_version
                 == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
             ),
         ),
@@ -15813,26 +15874,16 @@ def _artifact_baseline_proof_sql(
     metadata: str,
     verification: str,
     *,
-    candidate_alias: str = "dataset",
-    baseline_alias: str = "verification_baseline",
-    completion_proof_required_version: int | None = None,
-    reviewed_root_count: int | None = None,
-    require_reviewed_root_policy_absent: bool = False,
-    use_admission_seals: bool = False,
+    options: _ArtifactBaselineProofOptions | None = None,
 ) -> str:
     """Require an immutable baseline whose full proof matches the candidate."""
+    proof_options = options or _ArtifactBaselineProofOptions(
+        dataset_ref=dataset_ref,
+        metadata=metadata,
+        verification=verification,
+    )
     return _artifact_baseline_exists_sql(
-        _artifact_baseline_proof_fragments(
-            dataset_ref,
-            metadata,
-            verification,
-            candidate_alias,
-            baseline_alias,
-            completion_proof_required_version,
-            reviewed_root_count,
-            require_reviewed_root_policy_absent,
-            use_admission_seals,
-        )
+        _artifact_baseline_proof_fragments(proof_options)
     )
 
 
@@ -15900,10 +15951,17 @@ def _artifact_subset_twin_branch_sql(
         dataset_ref,
         metadata,
         verification,
-        completion_proof_required_version=SERVER_ISSUED_SUBSET_REQUIRED_VERSION,
-        reviewed_root_count=reviewed_root_count,
-        require_reviewed_root_policy_absent=is_legacy,
-        use_admission_seals=use_admission_seals,
+        options=_ArtifactBaselineProofOptions(
+            dataset_ref=dataset_ref,
+            metadata=metadata,
+            verification=verification,
+            completion_proof_required_version=(
+                SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+            ),
+            reviewed_root_count=reviewed_root_count,
+            require_reviewed_root_policy_absent=is_legacy,
+            use_admission_seals=use_admission_seals,
+        ),
     )
     matched_proof_sql = f"""
         {_artifact_matched_proof_sql(metadata, verification, proof)}
@@ -16015,6 +16073,41 @@ def _artifact_subset_candidate_eligibility_sql(
     """
 
 
+def _artifact_candidate_proof_sqls(
+    dataset_ref: str,
+    source_ref: str,
+    metadata: str,
+    content_proof_admitted: str | None,
+) -> tuple[str, str, str]:
+    """Return matched, baseline, and subset candidate proof predicates."""
+
+    verification = f"{metadata} -> '{TWIN_ROOT_VERIFICATION_METADATA_KEY}'"
+    proof = f"{verification} -> 'proof'"
+    use_admission_seals = content_proof_admitted is not None
+    return (
+        _artifact_matched_proof_sql(metadata, verification, proof),
+        _artifact_baseline_proof_sql(
+            dataset_ref,
+            metadata,
+            verification,
+            options=_ArtifactBaselineProofOptions(
+                dataset_ref=dataset_ref,
+                metadata=metadata,
+                verification=verification,
+                use_admission_seals=use_admission_seals,
+            ),
+        ),
+        _artifact_subset_candidate_eligibility_sql(
+            dataset_ref,
+            source_ref,
+            metadata,
+            verification,
+            proof,
+            content_proof_admitted,
+        ),
+    )
+
+
 def _artifact_reviewed_candidate_eligibility_sql(
     dataset_ref: str,
     source_ref: str,
@@ -16025,24 +16118,13 @@ def _artifact_reviewed_candidate_eligibility_sql(
     """Return legacy and v3 twin-proof eligibility alternatives."""
 
     use_admission_seals = content_proof_admitted is not None
-    verification = f"{metadata} -> '{TWIN_ROOT_VERIFICATION_METADATA_KEY}'"
-    proof = f"{verification} -> 'proof'"
-    matched_proof_sql = _artifact_matched_proof_sql(
-        metadata, verification, proof
-    )
-    baseline_proof_sql = _artifact_baseline_proof_sql(
-        dataset_ref,
-        metadata,
-        verification,
-        use_admission_seals=use_admission_seals,
-    )
-    subset_eligibility_sql = _artifact_subset_candidate_eligibility_sql(
-        dataset_ref,
-        source_ref,
-        metadata,
-        verification,
-        proof,
-        content_proof_admitted,
+    matched_proof_sql, baseline_proof_sql, subset_eligibility_sql = (
+        _artifact_candidate_proof_sqls(
+            dataset_ref,
+            source_ref,
+            metadata,
+            content_proof_admitted,
+        )
     )
     return f"""
         (
@@ -16657,16 +16739,9 @@ def _artifact_dataset_option_projection_sql(
 
     bounded_metadata = _artifact_bounded_publication_metadata_sql(metadata)
     content_proof_resources = _artifact_content_proof_resources_sql(metadata)
-    evidence_run_id = (
-        "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)"
-    )
-    content_proof_valid = _artifact_content_proof_valid_sql(
-        metadata,
-        evidence_run_id,
-    )
-    metadata_hash = _qt(
-        _schema(), "provider_directory_subset_payload_sha256"
-    )
+    evidence_run_id = "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)"
+    content_proof_valid = _artifact_content_proof_valid_sql(metadata, evidence_run_id)
+    metadata_hash = _qt(_schema(), "provider_directory_subset_payload_sha256")
     return f"""
         dataset.dataset_id,
         dataset.endpoint_id,
@@ -16751,6 +16826,47 @@ def _artifact_dataset_option_projection_parts(
     )
 
 
+def _artifact_candidate_option_sql(
+    dataset_ref: str,
+    source_ref: str | None,
+    include_validated_candidates: bool,
+    use_eligible_candidate_ids: bool,
+) -> tuple[str, str]:
+    """Return candidate-only joins and eligibility without raw proof output."""
+
+    if not include_validated_candidates:
+        return "", ""
+    if use_eligible_candidate_ids:
+        return (
+            "",
+            " OR dataset.dataset_id IN "
+            "(SELECT dataset_id FROM eligible_candidate_ids)",
+        )
+    candidate_metadata = "dataset.publication_metadata_summary_json"
+    candidate_admission = _artifact_content_proof_admitted_marker_sql(
+        candidate_metadata
+    )
+    eligibility = (
+        _artifact_reviewed_candidate_eligibility_sql(
+            dataset_ref,
+            source_ref,
+            metadata=candidate_metadata,
+            content_proof_admitted=candidate_admission,
+        )
+        if source_ref
+        else "true"
+    )
+    candidate_clause = f""" OR CASE
+                WHEN dataset.is_current = false
+                 AND dataset.status = :validated_status
+                 AND dataset.superseded_at IS NULL
+                THEN {eligibility}
+                 AND ({_artifact_admission_seal_shape_valid_sql()})
+                ELSE false
+            END"""
+    return "", candidate_clause
+
+
 def _artifact_dataset_options_cte(
     dataset_ref: str, source_ref: str | None = None,
     *,
@@ -16760,28 +16876,13 @@ def _artifact_dataset_options_cte(
     use_eligible_candidate_ids: bool = False,
 ) -> str:
     """Select current rows and, when requested, admitted candidates."""
-    candidate_metadata = "dataset.publication_metadata_summary_json"
-    candidate_admission = _artifact_content_proof_admitted_marker_sql(
-        candidate_metadata
-    )
-    validated_candidate_clause = (
-        " OR dataset.dataset_id IN (SELECT dataset_id FROM eligible_candidate_ids)"
-        if include_validated_candidates and use_eligible_candidate_ids
-        else f""" OR CASE
-                WHEN dataset.is_current = false
-                 AND dataset.status = :validated_status
-                 AND dataset.superseded_at IS NULL
-                THEN {(
-                    _artifact_reviewed_candidate_eligibility_sql(
-                        dataset_ref,
-                        source_ref,
-                        metadata=candidate_metadata,
-                        content_proof_admitted=candidate_admission,
-                    ) if source_ref else "true"
-                )}
-                 AND ({_artifact_admission_seal_shape_valid_sql()})
-                ELSE false
-            END""" if include_validated_candidates else ""
+    candidate_lateral, validated_candidate_clause = (
+        _artifact_candidate_option_sql(
+            dataset_ref,
+            source_ref,
+            include_validated_candidates,
+            use_eligible_candidate_ids,
+        )
     )
     endpoint_scope = _artifact_dataset_endpoint_scope_sql(
         scope_endpoint_ids=scope_endpoint_ids,
@@ -23039,6 +23140,101 @@ async def _record_current_dataset_serving_relation_proof(
     )
 
 
+def _artifact_publication_identity_sql() -> str:
+    """Return the immutable dataset identity used by additive proof writes."""
+
+    return """
+           dataset.dataset_id = :dataset_id
+           AND dataset.endpoint_id = :endpoint_id
+           AND COALESCE(
+                   dataset.acquisition_root_run_id,
+                   dataset.import_run_id
+               ) IS NOT DISTINCT FROM :evidence_run_id
+           AND dataset.previous_dataset_id IS NOT DISTINCT FROM
+               :previous_dataset_id
+           AND dataset.dataset_hash IS NOT DISTINCT FROM :dataset_hash
+           AND dataset.is_current = :is_current
+           AND dataset.status = :expected_status
+           AND dataset.superseded_at IS NULL
+    """
+
+
+def _artifact_publication_parameters(
+    dataset: ProviderDirectoryArtifactDataset,
+    proof: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the exact identity and proof bind parameters."""
+
+    return {
+        "proof_json": json.dumps(proof, sort_keys=True, default=_json_default),
+        "dataset_id": dataset.dataset_id,
+        "endpoint_id": dataset.endpoint_id,
+        "evidence_run_id": dataset.evidence_run_id,
+        "previous_dataset_id": dataset.previous_dataset_id,
+        "dataset_hash": dataset.dataset_hash,
+        "is_current": dataset.is_current,
+        "expected_status": dataset.status,
+    }
+
+
+def _sealed_publication_proof_sql(
+    dataset_ref: str,
+    metadata_digest: str,
+    metadata_key: str,
+    identity: str,
+) -> str:
+    """Return the bounded sealed-summary proof update."""
+
+    seal_valid = _artifact_admission_seal_shape_valid_sql("dataset")
+    return f"""
+        UPDATE {dataset_ref} AS dataset
+           SET publication_metadata_summary_json = jsonb_set(
+                   dataset.publication_metadata_summary_json,
+                   '{{{metadata_key}}}', CAST(:proof_json AS jsonb), true
+               ),
+               publication_metadata_sha256 = {metadata_digest}(
+                   jsonb_set(
+                       dataset.publication_metadata_summary_json,
+                       '{{{metadata_key}}}', CAST(:proof_json AS jsonb), true
+                   ),
+                   dataset.content_proof_admission_version,
+                   dataset.content_proof_admission_kind,
+                   dataset.content_proof_admission_sha256,
+                   dataset.content_proof_resource_types
+               )
+         WHERE {identity}
+           AND ({seal_valid});
+    """
+
+
+def _legacy_publication_proof_sql(
+    dataset_ref: str,
+    metadata_key: str,
+    identity: str,
+) -> str:
+    """Return the capped legacy raw-metadata proof update."""
+
+    safe_metadata = _artifact_safe_publication_metadata_sql("dataset")
+    legacy_bounded = _artifact_legacy_metadata_is_bounded_sql(
+        safe_metadata, "dataset"
+    )
+    return f"""
+        UPDATE {dataset_ref} AS dataset
+           SET publication_metadata_json = jsonb_set(
+                   {safe_metadata},
+                   '{{{metadata_key}}}', CAST(:proof_json AS jsonb), true
+               )
+         WHERE {identity}
+           AND dataset.publication_metadata_summary_json IS NULL
+           AND dataset.publication_metadata_sha256 IS NULL
+           AND dataset.content_proof_admission_version IS NULL
+           AND dataset.content_proof_admission_kind IS NULL
+           AND dataset.content_proof_admission_sha256 IS NULL
+           AND dataset.content_proof_resource_types IS NULL
+           AND ({legacy_bounded});
+    """
+
+
 async def _record_current_dataset_publication_proof(
     dataset: ProviderDirectoryArtifactDataset,
     metadata_key: str,
@@ -23057,87 +23253,19 @@ async def _record_current_dataset_publication_proof(
         _schema(),
         "provider_directory_endpoint_dataset_admission_metadata_sha256",
     )
-    seal_valid = _artifact_admission_seal_shape_valid_sql("dataset")
-    safe_metadata = _artifact_safe_publication_metadata_sql("dataset")
-    legacy_bounded = _artifact_legacy_metadata_is_bounded_sql(
-        safe_metadata,
-        "dataset",
-    )
-    identity = """
-           dataset.dataset_id = :dataset_id
-           AND dataset.endpoint_id = :endpoint_id
-           AND COALESCE(
-                   dataset.acquisition_root_run_id,
-                   dataset.import_run_id
-               ) IS NOT DISTINCT FROM :evidence_run_id
-           AND dataset.previous_dataset_id IS NOT DISTINCT FROM
-               :previous_dataset_id
-           AND dataset.dataset_hash IS NOT DISTINCT FROM :dataset_hash
-           AND dataset.is_current = :is_current
-           AND dataset.status = :expected_status
-           AND dataset.superseded_at IS NULL
-    """
-    parameters = {
-        "proof_json": json.dumps(
-            proof,
-            sort_keys=True,
-            default=_json_default,
-        ),
-        "dataset_id": dataset.dataset_id,
-        "endpoint_id": dataset.endpoint_id,
-        "evidence_run_id": dataset.evidence_run_id,
-        "previous_dataset_id": dataset.previous_dataset_id,
-        "dataset_hash": dataset.dataset_hash,
-        "is_current": dataset.is_current,
-        "expected_status": dataset.status,
-    }
+    identity = _artifact_publication_identity_sql()
+    query_parameters_by_name = _artifact_publication_parameters(dataset, proof)
     updated = await db.status(
-        f"""
-        UPDATE {dataset_ref} AS dataset
-           SET publication_metadata_summary_json = jsonb_set(
-                   dataset.publication_metadata_summary_json,
-                   '{{{metadata_key}}}',
-                   CAST(:proof_json AS jsonb),
-                   true
-               ),
-               publication_metadata_sha256 = {metadata_digest}(
-                   jsonb_set(
-                       dataset.publication_metadata_summary_json,
-                       '{{{metadata_key}}}',
-                       CAST(:proof_json AS jsonb),
-                       true
-                   ),
-                   dataset.content_proof_admission_version,
-                   dataset.content_proof_admission_kind,
-                   dataset.content_proof_admission_sha256,
-                   dataset.content_proof_resource_types
-               )
-         WHERE {identity}
-           AND ({seal_valid});
-        """,
-        **parameters,
+        _sealed_publication_proof_sql(
+            dataset_ref, metadata_digest, metadata_key, identity
+        ),
+        **query_parameters_by_name,
     )
     if _coerce_rowcount(updated) == 1:
         return
     updated = await db.status(
-        f"""
-        UPDATE {dataset_ref} AS dataset
-           SET publication_metadata_json = jsonb_set(
-                   {safe_metadata},
-                   '{{{metadata_key}}}',
-                   CAST(:proof_json AS jsonb),
-                   true
-               )
-         WHERE {identity}
-           AND dataset.publication_metadata_summary_json IS NULL
-           AND dataset.publication_metadata_sha256 IS NULL
-           AND dataset.content_proof_admission_version IS NULL
-           AND dataset.content_proof_admission_kind IS NULL
-           AND dataset.content_proof_admission_sha256 IS NULL
-           AND dataset.content_proof_resource_types IS NULL
-           AND ({legacy_bounded});
-        """,
-        **parameters,
+        _legacy_publication_proof_sql(dataset_ref, metadata_key, identity),
+        **query_parameters_by_name,
     )
     if _coerce_rowcount(updated) != 1:
         raise ProviderDirectoryArtifactBuildStale(
@@ -68640,6 +68768,34 @@ def _store_validated_endpoint_dataset_sql() -> str:
     """
 
 
+def _admission_seal_parameters(
+    admission_seal: ProviderDirectoryAdmissionSeal | None,
+) -> dict[str, Any]:
+    """Return nullable fixed-size receipt bind parameters."""
+
+    if admission_seal is None:
+        return {
+            "publication_metadata_summary_json": None,
+            "publication_metadata_sha256": None,
+            "content_proof_admission_version": None,
+            "content_proof_admission_kind": None,
+            "content_proof_admission_sha256": None,
+            "content_proof_resource_types": None,
+        }
+    return {
+        "publication_metadata_summary_json": json.dumps(
+            admission_seal.metadata_summary,
+            sort_keys=True,
+            ensure_ascii=False,
+        ),
+        "publication_metadata_sha256": admission_seal.metadata_sha256,
+        "content_proof_admission_version": admission_seal.admission_version,
+        "content_proof_admission_kind": admission_seal.admission_kind,
+        "content_proof_admission_sha256": admission_seal.proof_sha256,
+        "content_proof_resource_types": list(admission_seal.resource_types),
+    }
+
+
 async def _store_validated_endpoint_dataset(
     connection: Any,
     candidate: EndpointDatasetCandidate,
@@ -68670,61 +68826,29 @@ async def _store_validated_endpoint_dataset(
         raise RuntimeError(
             "provider_directory_endpoint_dataset_admission_seal_invalid"
         ) from error
-    validated_count = await connection.status(
-        _store_validated_endpoint_dataset_sql(),
-        previous_dataset_id=previous_dataset_id,
-        dataset_hash=dataset_hash,
-        status=status,
-        resource_count=resource_count,
-        publication_metadata_json=json.dumps(
-            metadata,
-            sort_keys=True,
-            default=_json_default,
+    query_parameters_by_name = {
+        "previous_dataset_id": previous_dataset_id,
+        "dataset_hash": dataset_hash,
+        "status": status,
+        "resource_count": resource_count,
+        "publication_metadata_json": json.dumps(
+            metadata, sort_keys=True, default=_json_default
         ),
-        publication_metadata_summary_json=(
-            json.dumps(
-                admission_seal.metadata_summary,
-                sort_keys=True,
-                ensure_ascii=False,
-            )
-            if admission_seal is not None
-            else None
-        ),
-        publication_metadata_sha256=(
-            admission_seal.metadata_sha256
-            if admission_seal is not None
-            else None
-        ),
-        content_proof_admission_version=(
-            admission_seal.admission_version
-            if admission_seal is not None
-            else None
-        ),
-        content_proof_admission_kind=(
-            admission_seal.admission_kind
-            if admission_seal is not None
-            else None
-        ),
-        content_proof_admission_sha256=(
-            admission_seal.proof_sha256
-            if admission_seal is not None
-            else None
-        ),
-        content_proof_resource_types=(
-            list(admission_seal.resource_types)
-            if admission_seal is not None
-            else None
-        ),
-        completion_proof_json=serialized_completion_proof,
-        completion_proof_sha256=completion_proof_sha256,
-        completion_proof_required_version=(
+        **_admission_seal_parameters(admission_seal),
+        "completion_proof_json": serialized_completion_proof,
+        "completion_proof_sha256": completion_proof_sha256,
+        "completion_proof_required_version": (
             candidate.completion_proof_required_version
         ),
-        dataset_id=candidate.dataset_id,
-        endpoint_id=candidate.endpoint_id,
-        acquisition_root_run_id=candidate.acquisition_root_run_id,
-        marks_validated=status == ENDPOINT_DATASET_VALIDATED,
-        immutable_statuses=list(IMMUTABLE_ENDPOINT_DATASET_STATUSES),
+        "dataset_id": candidate.dataset_id,
+        "endpoint_id": candidate.endpoint_id,
+        "acquisition_root_run_id": candidate.acquisition_root_run_id,
+        "marks_validated": status == ENDPOINT_DATASET_VALIDATED,
+        "immutable_statuses": list(IMMUTABLE_ENDPOINT_DATASET_STATUSES),
+    }
+    validated_count = await connection.status(
+        _store_validated_endpoint_dataset_sql(),
+        **query_parameters_by_name,
     )
     if _coerce_rowcount(validated_count) <= 0:
         raise RuntimeError("provider_directory_endpoint_dataset_validation_lost")
@@ -69039,25 +69163,10 @@ def _record_baseline_payload_retirement(
     }
 
 
-async def _store_baseline_payload_retirement(
-    connection: Any,
-    candidate: EndpointDatasetCandidate,
-    baseline_dataset_id: str,
-    metadata: dict[str, Any],
-) -> None:
-    try:
-        admission_seal = admission_seal_from_validated_metadata(
-            metadata
-        )
-    except AdmissionSealError as error:
-        raise RuntimeError(
-            "provider_directory_endpoint_dataset_admission_seal_invalid"
-        ) from error
-    dataset_ref = _qt(
-        _schema(),
-        ProviderDirectoryEndpointDataset.__tablename__,
-    )
-    metadata_identity = f"""
+def _baseline_retirement_identity_sql() -> str:
+    """Return the exact candidate identity for baseline retirement evidence."""
+
+    return f"""
            dataset_id = :dataset_id
            AND endpoint_id = :endpoint_id
            AND status = :validated_status
@@ -69068,34 +69177,23 @@ async def _store_baseline_payload_retirement(
                ) ->> '{TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY}'
                = :baseline_dataset_id
     """
-    parameters = {
-        "publication_metadata_json": json.dumps(
-            metadata,
-            sort_keys=True,
-            default=_json_default,
-        ),
-        "dataset_id": candidate.dataset_id,
-        "endpoint_id": candidate.endpoint_id,
-        "validated_status": ENDPOINT_DATASET_VALIDATED,
-        "baseline_dataset_id": baseline_dataset_id,
-    }
-    if admission_seal is None:
-        updated_status = await connection.status(
-            f"""
+
+
+def _baseline_retirement_update_sql(
+    dataset_ref: str,
+    metadata_identity: str,
+    use_admission_seal: bool,
+) -> str:
+    """Return the sealed-summary or capped legacy retirement update."""
+
+    if not use_admission_seal:
+        return f"""
             UPDATE {dataset_ref}
                SET publication_metadata_json =
                        CAST(:publication_metadata_json AS jsonb)
              WHERE {metadata_identity};
-            """,
-            **parameters,
-        )
-        if _coerce_rowcount(updated_status) <= 0:
-            raise RuntimeError(
-                "provider_directory_endpoint_dataset_baseline_payload_retirement_lost"
-            )
-        return
-    updated_status = await connection.status(
-        f"""
+        """
+    return f"""
         UPDATE {dataset_ref}
            SET publication_metadata_summary_json =
                    CAST(:publication_metadata_summary_json AS jsonb),
@@ -69108,17 +69206,50 @@ async def _store_baseline_payload_retirement(
                content_proof_resource_types =
                    CAST(:content_proof_resource_types AS varchar[])
          WHERE {metadata_identity};
-        """,
-        publication_metadata_summary_json=json.dumps(
-            admission_seal.metadata_summary,
+    """
+
+
+async def _store_baseline_payload_retirement(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    baseline_dataset_id: str,
+    metadata: dict[str, Any],
+) -> None:
+    """Persist bounded retirement evidence on the validated candidate."""
+
+    try:
+        admission_seal = admission_seal_from_validated_metadata(
+            metadata
+        )
+    except AdmissionSealError as error:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_admission_seal_invalid"
+        ) from error
+    dataset_ref = _qt(
+        _schema(),
+        ProviderDirectoryEndpointDataset.__tablename__,
+    )
+    metadata_identity = _baseline_retirement_identity_sql()
+    query_parameters_by_name = {
+        "publication_metadata_json": json.dumps(
+            metadata,
             sort_keys=True,
+            default=_json_default,
         ),
-        publication_metadata_sha256=admission_seal.metadata_sha256,
-        content_proof_admission_version=admission_seal.admission_version,
-        content_proof_admission_kind=admission_seal.admission_kind,
-        content_proof_admission_sha256=admission_seal.proof_sha256,
-        content_proof_resource_types=list(admission_seal.resource_types),
-        **parameters,
+        "dataset_id": candidate.dataset_id,
+        "endpoint_id": candidate.endpoint_id,
+        "validated_status": ENDPOINT_DATASET_VALIDATED,
+        "baseline_dataset_id": baseline_dataset_id,
+    }
+    if admission_seal is not None:
+        query_parameters_by_name.update(_admission_seal_parameters(admission_seal))
+    updated_status = await connection.status(
+        _baseline_retirement_update_sql(
+            dataset_ref,
+            metadata_identity,
+            admission_seal is not None,
+        ),
+        **query_parameters_by_name,
     )
     if _coerce_rowcount(updated_status) <= 0:
         raise RuntimeError(
