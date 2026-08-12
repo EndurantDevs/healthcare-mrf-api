@@ -295,7 +295,7 @@ def test_backfill_rejects_invalid_receipt_structure():
 async def test_backfill_rejects_lost_receipt_update():
     connection = AsyncMock()
     connection.execute.return_value = "UPDATE 0"
-    dataset = {
+    dataset_by_field = {
         "dataset_id": "dataset-synthetic",
         "row_ctid": "(1,1)",
         "row_xmin": "1",
@@ -311,7 +311,9 @@ async def test_backfill_rejects_lost_receipt_update():
         backfill.ProviderDirectorySelectionReceiptBackfillError,
         match="backfill_lost",
     ):
-        await backfill._store_receipt(connection, '"mrf"."dataset"', dataset, {})
+        await backfill._store_receipt(
+            connection, '"mrf"."dataset"', dataset_by_field, {}
+        )
 
 
 @pytest.mark.asyncio
