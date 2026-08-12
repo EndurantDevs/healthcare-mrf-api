@@ -29,6 +29,7 @@ from tests.provider_directory_subset_completion_pg_setup import (
 )
 from tests.tin_npi_connector_postgres_support import (
     asyncpg,
+    install_admission_seal_terminal_predecessors,
     load_admission_seal_migration,
 )
 
@@ -401,6 +402,10 @@ async def prove_effective_endpoint_activation_and_publication(monkeypatch):
                 _load_root_policy_migration(),
                 "upgrade",
                 scenario.connection,
+            )
+            await install_admission_seal_terminal_predecessors(
+                scenario.connection,
+                scenario.quoted_schema,
             )
             await run_subset_migration(
                 load_admission_seal_migration(),
