@@ -56,6 +56,7 @@ from tests.test_provider_directory_rooted_graph_acquisition_postgres import (
     LEGACY_PUBLICATION_PATH,
     LEGACY_TWIN_PATH,
     MIGRATION_PATH,
+    SINGLE_ROOT_MIGRATION_PATH,
 )
 from tests.provider_directory_rooted_graph_pg_assertions import (
     assert_missing_terminal_witnesses,
@@ -81,6 +82,10 @@ async def _lifecycle_scope(monkeypatch):
     monkeypatch.setenv("DB_SCHEMA", schema_name)
     engine = create_async_engine(url.set(drivername="postgresql+asyncpg"))
     migration = load_migration(MIGRATION_PATH, "rooted_graph_lifecycle_migration")
+    single_root_migration = load_migration(
+        SINGLE_ROOT_MIGRATION_PATH,
+        "rooted_graph_lifecycle_single_root",
+    )
     legacy_migrations = _load_legacy_migrations("rooted_graph_lifecycle_legacy")
     database = _configure_database(monkeypatch, url)
     connection = None
@@ -96,6 +101,7 @@ async def _lifecycle_scope(monkeypatch):
         )
         assert registration.endpoint_created and registration.source_created
         await run_migration(engine, migration, "upgrade")
+        await run_migration(engine, single_root_migration, "upgrade")
         replay = await register_provider_directory_rooted_graph_source(
             database=database
         )
