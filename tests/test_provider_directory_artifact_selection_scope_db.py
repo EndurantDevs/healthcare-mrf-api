@@ -100,8 +100,7 @@ async def _insert_unrelated_validated_rows(database, schema: str) -> None:
                :validated, false,
                jsonb_build_object(
                    'source_ids',
-                   jsonb_build_array('unrelated-validated-' || sequence_id),
-                   'synthetic_padding', repeat('x', 8192)
+                   jsonb_build_array('unrelated-validated-' || sequence_id)
                )
           FROM generate_series(1, 2000) AS sequence_id;
         """,
