@@ -16738,8 +16738,16 @@ def _artifact_candidate_option_sql(
 ) -> tuple[str, str]:
     """Return candidate-only joins and eligibility without raw proof output."""
 
-    if not include_validated_candidates or source_ref is None:
+    if not include_validated_candidates:
         return "", ""
+    if source_ref is None:
+        return "", """ OR CASE
+                WHEN dataset.is_current = false
+                 AND dataset.status = :validated_status
+                 AND dataset.superseded_at IS NULL
+                THEN true
+                ELSE false
+            END"""
     candidate_metadata = "publication.full_metadata_jsonb"
     candidate_admission = "admission.content_proof_admitted"
     candidate_lateral = f"""
