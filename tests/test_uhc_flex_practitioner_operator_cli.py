@@ -218,12 +218,23 @@ async def test_execute_dispatches_only_the_selected_exact_phase(
     assert calls == [{**expected_values, "database": database}]
 
 
+@pytest.mark.parametrize(
+    ("arguments", "enabled_gate"),
+    (
+        (["sync-cohort"], None),
+        (_acquisition_arguments(), operation.ACQUISITION_ENABLED_ENV),
+    ),
+)
 def test_disabled_phase_fails_before_database_import(
     monkeypatch,
     capsys,
+    arguments,
+    enabled_gate,
 ) -> None:
     script_module = _script_module()
     _disable_all_gates(monkeypatch)
+    if enabled_gate is not None:
+        monkeypatch.setenv(enabled_gate, "true")
     original_import = builtins.__import__
 
     def guarded_import(module_name, *args, **kwargs):
@@ -233,7 +244,7 @@ def test_disabled_phase_fails_before_database_import(
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
 
-    exit_code = script_module.run_command(["sync-cohort"])
+    exit_code = script_module.run_command(arguments)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -241,17 +252,23 @@ def test_disabled_phase_fails_before_database_import(
     assert captured.err == '{"code":"disabled","status":"error"}\n'
 
 
-def test_success_prints_only_the_sanitized_receipt(monkeypatch, capsys) -> None:
+def test_historical_publication_prints_only_the_sanitized_receipt(
+    monkeypatch,
+    capsys,
+) -> None:
     script_module = _script_module()
-    safe_receipt = '{"cohort_id":"pdufc_safe","status":"sealed"}'
+    safe_receipt = '{"dataset_id":"pdufpd_safe","status":"published"}'
+    monkeypatch.setenv(operation.PUBLICATION_ENABLED_ENV, "true")
 
     async def run_operation(parsed_arguments):
-        assert parsed_arguments.command == "sync-cohort"
+        assert parsed_arguments.command == "publish-admitted"
         return safe_receipt
 
     monkeypatch.setattr(script_module, "_run_operation", run_operation)
 
-    exit_code = script_module.run_command(["sync-cohort"])
+    exit_code = script_module.run_command(
+        ["publish-admitted", "--candidate-acquisition-id", CANDIDATE_ACQUISITION_ID]
+    )
 
     captured = capsys.readouterr()
     assert exit_code == 0

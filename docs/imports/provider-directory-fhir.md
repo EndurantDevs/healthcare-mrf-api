@@ -190,22 +190,22 @@ response clears prior transient diagnostics, while an exhausted response
 records one final redacted diagnostic with aggregate request elapsed time and
 the number of requests actually reissued.
 
-Each completed root retains sealed, token-inclusive replay commitments that
-prove its source-issued continuation chain. A separate root-neutral completion
+Each completed acquisition retains sealed, token-inclusive replay commitments that
+prove its source-issued continuation chain. A separate completion
 proof binds continuation query shape and offset geometry, ordered raw acquired
 resource hashes, transport-neutral projected content hashes, and dataset
-counts and hashes without retaining URLs, tokens, or root identifiers. Each
-campaign snapshots an immutable required root count. One root is explicit
-reduced assurance; two roots remain the standard default and must match on the
-entire root-neutral proof. Publication stays off until the configured root
-policy and the separate artifact review both pass.
+counts and hashes without retaining URLs, tokens, or root identifiers. Every
+new campaign uses the immutable one-root policy. One successful exhaustive
+acquisition is sufficient; a failed acquisition is retried through its normal
+checkpoint lineage. Publication stays off until the completion proof and the
+separate artifact review both pass.
 
 Direct database publication and source-catalog mutations use PostgreSQL
 `READ COMMITTED` isolation. The reviewed-subset persistence guards fail closed at other
 isolation levels so a stale transaction snapshot cannot bypass the final
 source and sole-alias check.
 
-After the configured root policy is satisfied, use the separate
+After the acquisition proof is satisfied, use the separate
 [reviewed subset state-sync runbook](provider-directory-reviewed-subset-activation.md)
 to review the neutral desired-state evidence and activate the source. The
 selector-free state sync is default-off and does not publish a dataset.
@@ -239,8 +239,7 @@ PROVIDER_DIRECTORY_MANUAL_RESOURCES="$(jq -r '.resources | join(",")' \
 PROVIDER_DIRECTORY_MANUAL_PAGE_COUNT="$(jq -r \
   '.manual_current_version_census.page_count' <<<"$MANUAL_ENTRY_JSON")"
 PROVIDER_DIRECTORY_CENSUS_CUTOFF="<timezone-aware-ISO-8601-cutoff>"
-PROVIDER_DIRECTORY_CENSUS_RUN_ID="<globally-unique-first-root-run-id>"
-PROVIDER_DIRECTORY_REVIEWED_ROOT_COUNT="<1-or-2>"
+PROVIDER_DIRECTORY_CENSUS_RUN_ID="<globally-unique-run-id>"
 ```
 
 Launch the acquisition only from the worker CLI. Do not add a seed database,
@@ -252,7 +251,6 @@ python main.py start provider-directory-fhir \
   --run-id "$PROVIDER_DIRECTORY_CENSUS_RUN_ID" \
   --acquisition-strategy server-issued-traversal-subset \
   --census-cutoff "$PROVIDER_DIRECTORY_CENSUS_CUTOFF" \
-  --reviewed-root-count "$PROVIDER_DIRECTORY_REVIEWED_ROOT_COUNT" \
   --source-id "$PROVIDER_DIRECTORY_MANUAL_SOURCE_ID" \
   --resources "$PROVIDER_DIRECTORY_MANUAL_RESOURCES" \
   --import-resources \
@@ -274,18 +272,14 @@ python main.py start provider-directory-fhir \
   --defer-typed-materialization
 ```
 
-A successful traversal remains non-current and non-published. Under explicit
-root count 1 it becomes the sole validated candidate without twin evidence.
-Under root count 2, Root A is retained as the immutable verification baseline;
-run the same command with a distinct fresh Root B ID and identical cutoff and
-policy. Do not pass retry or pagination-root arguments for either fresh root.
-Root B must carry separately valid replay evidence and match Root A's entire
-root-neutral proof. A transient retry in either policy must use a new `--run-id` plus
+A successful traversal remains non-current and non-published and becomes the
+sole validated candidate without twin evidence. A transient retry must use a
+new `--run-id` plus
 `--retry-of-run-id <previous-run-id>` and
 `--pagination-root-run-id <original-root-run-id>`; it resumes the original root
-and is not a second root. A terminal HTTP 410 root is abandoned and never
-retried. Publication, Profile admission, and API verification remain separate
-reviewed operations after the configured root-policy gate passes.
+lineage. A terminal HTTP 410 root is abandoned and never retried. Publication,
+Profile admission, and API verification remain separate reviewed operations
+after the acquisition proof passes.
 
 ## Source
 
@@ -511,56 +505,19 @@ remote rows once rather than multiplying them by the alias count. Existing
 historical alias copies are intentionally not deleted by this change; their
 cleanup is a separate migration.
 
-Sources whose metadata sets `provider_directory_candidate_status` to
-`pending_two_matching_exhaustive_acquisitions` use automatic twin-root
-verification. The first complete exhaustive root is retained as the immutable,
-non-current `verification_baseline`. It stores completion diagnostics plus the
-ordered overall and per-resource hashes and counts, but it is not selectable
-for artifacts and does not build serving relations.
+Historical twin-root statuses, policy-two documents, baselines, mismatches,
+and proof metadata remain readable for audit and replay of already-finalized
+records. They are not rewritten or aliased. A pending legacy twin status or any
+policy-two source is rejected before a new endpoint candidate can initialize.
 
-Exactly one distinct second root may run against a compatible baseline. It
-becomes the sole `validated` candidate only when endpoint identity, source
-aliases, selected and expected resources, overall content, and every
-per-resource proof match exactly; serving relations are built only in that
-validating transaction. A mismatch is retained as terminal
-`verification_mismatch` evidence, remains non-publishable, and fails the run.
-Concurrent roots, a third root, multiple baselines, or incompatible proof are
-rejected. In-progress retries remain bound to their original acquisition root
-and persisted verification requirement. Each pending source must also set a
-nonempty `provider_directory_verification_campaign_id`, identical across every
-alias for that endpoint group. Admission persists that campaign, the acquisition
-source-scope hash, and either `baseline_candidate` or `verification_candidate`.
-A verification candidate is paired to the exact baseline `dataset_id` while the
-endpoint is locked; a failed attempt that was never paired cannot later be
-mistaken for a terminal successor.
-
-Baseline and mismatch finalization are replayable. If the process commits one
-of those immutable states and then loses checkpoint cleanup, an exact-root retry
-validates the persisted proof, retries cleanup, and either returns the recorded
-baseline success or re-raises the recorded mismatch. It never reopens network
-acquisition. After an exact second root is transactionally validated, the
-duplicate `provider_directory_dataset_resource` rows owned by its baseline are
-deleted. The immutable baseline row retains its hash, count, diagnostics, and
-per-resource proof, while the matched successor records the deleted-row count.
-Mismatch evidence does not retire baseline payload.
-
-The campaign ID is the explicit reset boundary. Deconfiguring and later
-re-adding a reviewed candidate must bump this value; old immutable proof remains
-for audit but is ignored by the new generation. Active `acquiring` or
-`incomplete` roots still block across generations. Promotion must replace the
-pending status with
-`verified_two_matching_exhaustive_acquisitions` and retain the exact campaign
-ID; omitting the status is unsafe because source metadata merges can retain the
-old pending value. This is an explicit rollout step; acquisition never changes
-source configuration automatically:
-
-1. Deploy the pending status and a distinct per-source campaign ID.
-2. Run both the baseline root and the exact matching verification root with
-   `publish_after_acquisition=false`.
-3. In a follow-up seed/configuration PR, change only the status to
-   `verified_two_matching_exhaustive_acquisitions`, retaining the campaign ID.
-4. Sync discovery for every alias, then publish the artifact and promote the
-   validated dataset.
+New sources omit legacy twin status or use
+`pending_reviewed_subset_acquisition` with `required_root_count=1`. One
+successful exhaustive acquisition becomes the validated candidate. Failed
+work retries through the same acquisition root and checkpoints; it does not
+create a comparison root. A new generation uses a new campaign ID while old
+immutable proof remains historical evidence. Only an unactivated pending
+policy-two generation may be replaced in place by an explicit new policy-one
+campaign; activated and published generations stay immutable.
 
 Candidate promotion requires the complete non-Profile serving bundle. Profile
 publication remains a separate global operation governed by its selection and
@@ -569,19 +526,14 @@ non-Profile bundle atomically installs its serving relations and changes the
 current dataset/source pointers; it does not claim that the Profile serving
 generation has been applied.
 
-The exact matched dataset remains nonpromotable while its registry status is
-pending, including after the second root succeeds. Do not publish it until the
-VERIFIED registry PR is deployed and discovery has synced every alias. While
-source configuration remains pending, another acquisition is correctly rejected
-as a third root; there is no hidden pending-to-verified transition. Artifact
-ranking accepts a reviewed candidate only when its
-persisted pairing, campaign/scope, matched result, empty mismatch list, and
-hash/count proof are exact. Unknown statuses, missing or mixed campaign IDs, and
-cross-generation retries fail closed. Any pagination strategy, resource profile,
-page-count cap, acquisition-enabled or coverage mode, partition configuration,
-alias scope, resource endpoint, credential descriptor, or other acquisition-
-contract change on the same endpoint requires an intentional campaign-ID bump.
-Never reuse an earlier campaign's baseline after one of these changes. Artifact
+The validated dataset remains nonpromotable until its reviewed registry state
+is deployed and discovery has synced every alias. Artifact ranking accepts a
+reviewed candidate only when its campaign, scope, and hash/count proof are
+exact. Unknown statuses, missing or mixed campaign IDs, and cross-generation
+retries fail closed. Any pagination strategy, resource profile, page-count cap,
+acquisition-enabled or coverage mode, partition configuration, alias scope,
+resource endpoint, credential descriptor, or other acquisition-contract change
+on the same endpoint requires an intentional campaign-ID bump. Artifact
 eligibility also requires each attached reviewed
 source's configured acquisition endpoint to remain the proven endpoint; its
 serving `endpoint_id` may still point at the incumbent until atomic cutover.

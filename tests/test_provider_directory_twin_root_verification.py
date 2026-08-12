@@ -195,23 +195,15 @@ async def test_verification_baseline_store_does_not_mark_dataset_validated():
 
 
 @pytest.mark.asyncio
-async def test_pending_candidate_requires_a_root_run(monkeypatch):
+async def test_legacy_pending_candidate_cannot_start_acquisition(monkeypatch):
     monkeypatch.setattr(
         importer,
-        "_select_endpoint_dataset_candidate",
-        AsyncMock(
-            return_value=importer.EndpointDatasetCandidateSelection(
-                dataset_id="dataset_candidate",
-                acquisition_root_run_id=None,
-                previous_dataset_id=None,
-                reused_from_checkpoint=False,
-                resource_hash_contract=importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
-            )
-        ),
+        "_endpoint_dataset_state",
+        AsyncMock(return_value={}),
     )
     ensure_candidate = AsyncMock()
     monkeypatch.setattr(importer, "_ensure_endpoint_dataset_candidate", ensure_candidate)
-    with pytest.raises(RuntimeError, match="verification_root_required"):
+    with pytest.raises(RuntimeError, match="single_root_required"):
         await importer._prepare_endpoint_dataset_candidate(
             [
                 {

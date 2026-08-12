@@ -81,12 +81,9 @@ def test_command_wrapper_preserves_public_reflection_contract():
         **options.__annotations__,
         "return": "dict[str, Any]",
     }
-    assert len(command_signature.parameters) == 56
+    assert len(command_signature.parameters) == 55
     assert "resource_scan_concurrency" in command_signature.parameters
-    assert (
-        "provider_directory_reviewed_root_count"
-        in command_signature.parameters
-    )
+    assert "provider_directory_reviewed_root_count" not in command_signature.parameters
     assert command_signature.parameters == options_signature.parameters
     assert command_signature.return_annotation == "dict[str, Any]"
     assert command.__annotations__ == expected_annotation_map
@@ -2974,10 +2971,9 @@ def test_reviewed_candidate_seeds_have_stable_ids_and_acquisition_controls():
             assert metadata["provider_directory_coverage_mode"] == "full"
             assert metadata["provider_directory_acquisition_enabled"] is True
             assert metadata["provider_directory_fully_enumerable_resources"]
-            assert metadata["provider_directory_candidate_status"] in {
-                importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
-                importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
-            }
+            assert metadata["provider_directory_candidate_status"] == (
+                importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
+            )
             assert importer._resource_acquisition_blocked_reason(source_row) is None
 
     el_dorado_source = source_by_base[
@@ -2994,6 +2990,10 @@ def test_reviewed_candidate_seeds_have_stable_ids_and_acquisition_controls():
 
 def test_reviewed_candidate_statuses_match_current_acquisition_state():
     """Track reviewed status against each candidate's current evidence."""
+    assert (
+        importer._ReviewedCandidateSeed.__dataclass_fields__["candidate_status"].default
+        is None
+    )
     source_rows = [
         importer._source_row_from_seed(seed_row)
         for seed_row in importer._reviewed_provider_directory_candidate_seed_rows()
@@ -4414,6 +4414,11 @@ def test_source_row_from_seed_overrides_scan_developer_portal_base():
     assert source_record["metadata_json"]["provider_directory_coverage_mode"] == "probe_only"
     assert source_record["metadata_json"]["provider_directory_fully_enumerable_resources"] == []
     assert source_record["metadata_json"]["provider_directory_acquisition_enabled"] is True
+    assert "provider_directory_candidate_status" not in source_record["metadata_json"]
+    assert (
+        importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
+        not in source_record["metadata_json"]
+    )
     _assert_scan_partition_contract(source_record)
     assert importer._resource_acquisition_blocked_reason(
         source_record,
@@ -6352,7 +6357,7 @@ def test_provider_directory_cli_refresh_preset_leaves_defaults_unset_for_preset(
     assert calls[0]["full_refresh"] is None
     assert calls[0]["publish_after_acquisition"] is False
     assert calls[0]["defer_typed_materialization"] is False
-    assert calls[0]["provider_directory_reviewed_root_count"] == 2
+    assert "provider_directory_reviewed_root_count" not in calls[0]
     assert calls[0]["seed_only"] is True
     assert calls[0]["probe"] is False
 
@@ -6399,24 +6404,7 @@ def test_provider_directory_cli_preserves_absent_source_scope(monkeypatch):
     assert calls[0]["source_ids"] is None
 
 
-def test_provider_directory_cli_forwards_reviewed_root_count(monkeypatch):
-    calls = []
-
-    def fake_initiate_provider_directory_fhir(**kwargs):
-        calls.append(kwargs)
-        return "provider-directory-fhir-task"
-
-    monkeypatch.setattr(
-        process_cli,
-        "initiate_provider_directory_fhir",
-        fake_initiate_provider_directory_fhir,
-    )
-    monkeypatch.setattr(
-        process_cli,
-        "_run",
-        lambda task: calls.append({"run": task}),
-    )
-
+def test_provider_directory_cli_removes_reviewed_root_count():
     cli_result = CliRunner().invoke(
         process_cli.provider_directory_fhir,
         [
@@ -6427,18 +6415,9 @@ def test_provider_directory_cli_forwards_reviewed_root_count(monkeypatch):
         ],
     )
 
-    assert cli_result.exit_code == 0, cli_result.output
-    assert calls[0]["provider_directory_reviewed_root_count"] == 1
-
-
-def test_provider_directory_cli_rejects_invalid_reviewed_root_count():
-    cli_result = CliRunner().invoke(
-        process_cli.provider_directory_fhir,
-        ["--reviewed-root-count", "3"],
-    )
-
     assert cli_result.exit_code == 2
-    assert "not in the range 1<=x<=2" in cli_result.output
+    assert "No such option" in cli_result.output
+    assert "--reviewed-root-count" in cli_result.output
 
 
 def test_provider_directory_cli_routes_uhc_through_normal_import(monkeypatch):
@@ -17153,9 +17132,8 @@ def test_michigan_candidate_allows_only_verified_resources_and_records_page_caps
     )
     assert metadata["provider_directory_coverage_mode"] == "full"
     assert metadata["provider_directory_acquisition_enabled"] is True
-    assert metadata["provider_directory_candidate_status"] == (
-        "pending_two_matching_exhaustive_acquisitions"
-    )
+    assert "provider_directory_candidate_status" not in metadata
+    assert importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY not in metadata
     assert metadata["provider_directory_resource_page_count_caps"] == {
         resource_type: 25 if resource_type == "PractitionerRole" else 100
         for resource_type in sorted(importer.MICHIGAN_SUPPORTED_RESOURCES)

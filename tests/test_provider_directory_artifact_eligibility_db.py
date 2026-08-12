@@ -59,6 +59,7 @@ async def _create_tables(database: Database, schema: str) -> None:
             is_current boolean NOT NULL DEFAULT false,
             resource_count bigint NOT NULL DEFAULT 0,
             superseded_at timestamp,
+            created_at timestamp,
             publication_metadata_json jsonb,
             completion_proof_required_version integer,
             completion_proof_json jsonb,
@@ -372,10 +373,12 @@ async def _set_twin_metadata(
 
 async def _compact_candidate_ids(
     database: Database,
+    endpoint_id: str = ENDPOINT_ID,
+    source_id: str = "source_a",
 ) -> list[str]:
     current_dataset = importer.ProviderDirectoryArtifactDataset(
-        source_id="source_a",
-        endpoint_id=ENDPOINT_ID,
+        source_id=source_id,
+        endpoint_id=endpoint_id,
         serving_endpoint_id=SERVING_ENDPOINT_ID,
         dataset_id="dataset_current",
         evidence_run_id="root_current",
@@ -391,7 +394,7 @@ async def _compact_candidate_ids(
         fence,
         database,
     )
-    return eligible_ids_by_endpoint.get(ENDPOINT_ID, [])
+    return eligible_ids_by_endpoint.get(endpoint_id, [])
 
 
 async def _assert_candidate_eligibility(

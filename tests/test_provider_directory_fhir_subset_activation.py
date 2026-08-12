@@ -128,9 +128,11 @@ def test_checked_in_manifest_is_valid_and_operator_is_default_off(
 ):
     manifest = activation.reviewed_subset_activation_manifest()
 
-    assert manifest.desired_candidate_status in {
-        activation.PENDING_STATUS,
-        activation.VERIFIED_STATUS,
+    assert manifest.desired_candidate_status == "pending_reviewed_subset_acquisition"
+    assert manifest.root_policy is not None
+    assert manifest.root_policy.document() == {
+        "policy_version": "provider-directory-reviewed-root-policy-v1",
+        "required_root_count": 1,
     }
     assert (manifest.evidence is not None) is manifest.is_verified
     if manifest.is_verified:

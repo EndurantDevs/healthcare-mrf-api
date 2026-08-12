@@ -35,7 +35,7 @@ def _enable_only(monkeypatch: pytest.MonkeyPatch, selected: str) -> None:
         )
 
 
-def test_dormant_gate_precedes_parser_database_and_network_imports(
+def test_retired_acquisition_parses_before_database_and_network_imports(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -45,11 +45,6 @@ def test_dormant_gate_precedes_parser_database_and_network_imports(
         cli.PUBLICATION_ENABLED_ENV,
     ):
         monkeypatch.delenv(gate_name, raising=False)
-    monkeypatch.setattr(
-        cli,
-        "_parser",
-        lambda: pytest.fail("disabled command reached parser"),
-    )
     original_import = builtins.__import__
 
     def reject_runtime_import(name: str, *args: Any, **kwargs: Any) -> Any:
@@ -59,7 +54,7 @@ def test_dormant_gate_precedes_parser_database_and_network_imports(
 
     monkeypatch.setattr(builtins, "__import__", reject_runtime_import)
 
-    exit_code = cli.run_command(["acquire", "--operation-key", "private-invalid-value"])
+    exit_code = cli.run_command(["acquire", "--operation-key", OPERATION_KEY])
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -74,23 +69,34 @@ def test_cli_gate_constants_match_closed_contract() -> None:
     assert cli.PUBLICATION_ENABLED_ENV == contract.PUBLICATION_ENABLED_ENV
 
 
-def test_cli_conflicting_gates_fail_before_parser(
+def test_cli_conflicting_registration_gates_fail_after_parse(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv(cli.REGISTRATION_ENABLED_ENV, "true")
     monkeypatch.setenv(cli.ACQUISITION_ENABLED_ENV, "true")
     monkeypatch.setenv(cli.PUBLICATION_ENABLED_ENV, "false")
-    monkeypatch.setattr(
-        cli,
-        "_parser",
-        lambda: pytest.fail("conflicting gates reached parser"),
-    )
-
     assert cli.run_command(["register"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == '{"code":"gate_conflict","status":"error"}\n'
+
+
+def test_acquisition_stays_disabled_after_parse(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _enable_only(monkeypatch, cli.ACQUISITION_ENABLED_ENV)
+
+    async def reject_runtime(_arguments: argparse.Namespace) -> str:
+        pytest.fail("disabled twin phase reached runtime")
+
+    monkeypatch.setattr(cli, "_run_operator", reject_runtime)
+
+    assert cli.run_command(["acquire", "--operation-key", OPERATION_KEY]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == '{"code":"disabled","status":"error"}\n'
 
 
 @pytest.mark.parametrize(
@@ -182,7 +188,7 @@ class _Database:
 async def test_cancellation_drains_database_and_restores_signals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _enable_only(monkeypatch, cli.ACQUISITION_ENABLED_ENV)
+    _enable_only(monkeypatch, cli.REGISTRATION_ENABLED_ENV)
     registration = _Registration()
     database = _Database()
 
@@ -196,7 +202,7 @@ async def test_cancellation_drains_database_and_restores_signals(
         raise asyncio.CancelledError(signal.SIGTERM)
 
     monkeypatch.setattr(cli, "_execute_selected_phase", canceled)
-    arguments = cli._parser().parse_args(["acquire", "--operation-key", OPERATION_KEY])
+    arguments = cli._parser().parse_args(["register"])
 
     with pytest.raises(asyncio.CancelledError) as caught:
         await cli._run_operator(arguments, database=database)

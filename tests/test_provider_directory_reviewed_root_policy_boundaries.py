@@ -192,6 +192,21 @@ def test_persisted_policy_and_finalized_replay_boundaries():
             _policy_two_candidate(), {}, "validated"
         )
     )
+    baseline = twin._baseline_map(twin._candidate())
+    selection = importer._verification_terminal_endpoint_dataset_selection(
+        baseline,
+        "dataset_baseline",
+        "endpoint_1",
+        "root_baseline",
+        requires_twin_root_verification=False,
+        verification_campaign_id="reviewed-candidates-v1",
+        verification_source_scope_hash="scope-v1",
+    )
+    assert selection is not None
+    assert selection.verification_terminal_status == (
+        importer.ENDPOINT_DATASET_VERIFICATION_BASELINE
+    )
+    assert selection.requires_twin_root_verification is True
 
 
 @pytest.mark.asyncio
@@ -210,16 +225,66 @@ async def test_command_injects_policy_and_rejects_wrong_scope(monkeypatch):
 
     assert await importer.run_provider_directory_fhir_command(
         provider_directory_acquisition_strategy="server-issued-traversal-subset",
-        provider_directory_reviewed_root_count=1,
     ) == {"ok": True}
     task_by_field = process_data.await_args.args[1]
     assert task_by_field["provider_directory_reviewed_root_policy"] == (
         ReviewedRootPolicy(1).document()
     )
-    with pytest.raises(ValueError, match="policy_scope_invalid"):
+    with pytest.raises(TypeError, match="provider_directory_reviewed_root_count"):
         await importer.run_provider_directory_fhir_command(
             provider_directory_reviewed_root_count=1
         )
+
+
+@pytest.mark.asyncio
+async def test_manual_runtime_defaults_to_one_root_and_rejects_policy_two(
+    monkeypatch,
+):
+    request = SimpleNamespace(
+        resources=("Organization",),
+        source_id="synthetic-source",
+    )
+    monkeypatch.setattr(
+        importer, "_apply_provider_directory_refresh_preset", lambda fields: fields
+    )
+    monkeypatch.setattr(
+        importer, "validate_uhc_official_file_admission", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        importer, "current_version_census_request", lambda *_args, **_kwargs: request
+    )
+    monkeypatch.setattr(
+        importer, "validate_current_version_census_runtime", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        importer, "_validate_current_version_census_lineage", lambda *_args: None
+    )
+    ensure_database = AsyncMock()
+    monkeypatch.setattr(importer, "ensure_database", ensure_database)
+
+    class BoundaryReached(Exception):
+        pass
+
+    def capture_seed(_source_id):
+        raise BoundaryReached
+
+    monkeypatch.setattr(importer, "reviewed_manual_census_seed_rows", capture_seed)
+    with pytest.raises(BoundaryReached):
+        await importer.process_provider_directory_fhir_data(
+            {"context": {"test_mode": True}},
+            {"test_mode": True},
+        )
+    with pytest.raises(ValueError, match="single_root_required"):
+        await importer.process_provider_directory_fhir_data(
+            {"context": {"test_mode": True}},
+            {
+                "test_mode": True,
+                "provider_directory_reviewed_root_policy": (
+                    ReviewedRootPolicy(2).document()
+                ),
+            },
+        )
+    ensure_database.assert_not_awaited()
 
 
 @pytest.mark.asyncio
