@@ -139,10 +139,7 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
         "tests/test_provider_directory_reviewed_subset_terminal_window_postgres.py",
     ):
         _assert_single_lifecycle_test(workflow, lifecycle_step, test_path)
-    bounded_selection_step = workflow.split(
-        "      - name: Run bounded Provider Directory selection DB tests\n",
-        1,
-    )[1].split("      - name:", 1)[0]
+    bounded_selection_step = workflow.split("      - name: Run bounded Provider Directory selection DB tests\n", 1)[1].split("      - name:", 1)[0]
     _assert_single_lifecycle_test(
         workflow,
         bounded_selection_step,
