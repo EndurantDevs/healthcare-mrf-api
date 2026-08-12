@@ -14625,16 +14625,75 @@ def _provider_directory_artifact_dataset_selection_sql(
             source_ref,
         )
     )
+    endpoint_scope_sql = (
+        _artifact_dataset_explicit_endpoint_scope_sql(dataset_ref, source_ref)
+        if source_ids
+        else ""
+    )
     options_sql = _artifact_dataset_options_cte(
         dataset_ref,
         source_ref,
+        scope_artifact_endpoints=bool(source_ids),
         project_artifact_fields=True,
     )
     ranking_sql = _artifact_dataset_ranking_cte()
     projection_sql = _artifact_dataset_projection_sql()
     return f"""
-        WITH {options_sql}, {ranking_sql}, {selection_sql}
+        WITH {endpoint_scope_sql}{options_sql}, {ranking_sql}, {selection_sql}
         {projection_sql}
+    """
+
+
+def _artifact_dataset_explicit_endpoint_scope_sql(
+    dataset_ref: str,
+    source_ref: str,
+) -> str:
+    """Bound heavy proof work to endpoints relevant to requested aliases."""
+
+    configured_endpoint_key = (
+        PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY
+    )
+    return f"""
+        requested_sources AS MATERIALIZED (
+            SELECT source.*
+              FROM {source_ref} AS source
+             WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
+        ), artifact_endpoint_scope AS MATERIALIZED (
+            SELECT source.endpoint_id
+              FROM requested_sources AS source
+             WHERE source.endpoint_id IS NOT NULL
+            UNION
+            SELECT NULLIF(
+                       source.metadata_json::jsonb
+                           ->> '{configured_endpoint_key}',
+                       ''
+                   )
+              FROM requested_sources AS source
+             WHERE NULLIF(
+                       source.metadata_json::jsonb
+                           ->> '{configured_endpoint_key}',
+                       ''
+                   ) IS NOT NULL
+            UNION
+            SELECT candidate.endpoint_id
+              FROM {dataset_ref} AS candidate
+              JOIN requested_sources AS source
+                ON COALESCE(
+                       (candidate.publication_metadata_json
+                           -> 'source_ids')::jsonb,
+                       '[]'::jsonb
+                   ) @> jsonb_build_array(source.source_id)
+             WHERE CAST(:select_validated_candidates AS boolean)
+               AND candidate.is_current = false
+               AND candidate.status = :validated_status
+               AND candidate.superseded_at IS NULL
+        ), artifact_scoped_datasets AS MATERIALIZED (
+            SELECT dataset.*
+              FROM {dataset_ref} AS dataset
+             WHERE dataset.endpoint_id IN (
+                       SELECT endpoint_id FROM artifact_endpoint_scope
+                   )
+        ),
     """
 
 
@@ -16404,18 +16463,32 @@ def _artifact_dataset_options_cte(
     source_ref: str | None = None,
     *,
     scope_endpoint_ids: bool = False,
+    scope_artifact_endpoints: bool = False,
     project_artifact_fields: bool = False,
 ) -> str:
     """Select only current or admitted candidate rows with bounded output."""
+    if scope_endpoint_ids and scope_artifact_endpoints:
+        raise ValueError("provider_directory_artifact_endpoint_scope_ambiguous")
+    dataset_source = (
+        "artifact_scoped_datasets" if scope_artifact_endpoints else dataset_ref
+    )
     validated_candidate_gate = (
         _artifact_reviewed_candidate_eligibility_sql(dataset_ref, source_ref)
         if source_ref
         else "true"
     )
-    endpoint_scope = (
-        "dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))\n"
-        "           AND " if scope_endpoint_ids else ""
-    )
+    endpoint_scope = ""
+    if scope_endpoint_ids:
+        endpoint_scope = (
+            "dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))\n"
+            "           AND "
+        )
+    elif scope_artifact_endpoints:
+        endpoint_scope = (
+            "dataset.endpoint_id IN "
+            "(SELECT endpoint_id FROM artifact_endpoint_scope)\n"
+            "           AND "
+        )
     option_projection, publication_lateral = (
         _artifact_dataset_option_projection_parts(project_artifact_fields)
     )
@@ -16440,7 +16513,7 @@ def _artifact_dataset_options_cte(
                      AND dataset.superseded_at IS NULL
                ) OVER (PARTITION BY dataset.endpoint_id)
                    AS validated_candidate_count
-          FROM {dataset_ref} AS dataset
+          FROM {dataset_source} AS dataset
           {publication_lateral}
          WHERE {endpoint_scope}(
             (
@@ -16574,13 +16647,13 @@ def _artifact_dataset_explicit_selection_sql(
                        AND published_alias.endpoint_id IS NOT NULL
                    ) AS reconcile_source_alias_on_cutover,
                    to_jsonb(source) AS source_record_json
-              FROM {source_ref} AS source
+              FROM requested_sources AS source
               {_artifact_validated_candidate_alias_join_sql()}
               {_artifact_published_alias_reconciliation_join_sql(
                   dataset_ref,
                   source_ref,
+                  scope_artifact_endpoints=True,
               )}
-             WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
         )
     """
 
@@ -16663,6 +16736,8 @@ def _artifact_validated_candidate_alias_join_sql() -> str:
 def _artifact_published_alias_reconciliation_join_sql(
     dataset_ref: str,
     source_ref: str,
+    *,
+    scope_artifact_endpoints: bool = False,
 ) -> str:
     """Match a proven publication only when its serving alias is orphaned."""
 
@@ -16670,10 +16745,15 @@ def _artifact_published_alias_reconciliation_join_sql(
         dataset_ref,
         source_ref,
     )
+    dataset_source = (
+        "artifact_scoped_datasets"
+        if scope_artifact_endpoints
+        else dataset_ref
+    )
     return f"""
         LEFT JOIN (
             SELECT dataset.endpoint_id
-              FROM {dataset_ref} AS dataset
+              FROM {dataset_source} AS dataset
              WHERE dataset.is_current = true
                AND dataset.status = :published_status
                AND dataset.published_at IS NOT NULL
