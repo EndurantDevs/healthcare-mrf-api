@@ -112,6 +112,12 @@ async def _create_dataset_table(database: Database, schema: str) -> None:
             published_at timestamp,
             superseded_at timestamp,
             publication_metadata_json jsonb,
+            publication_metadata_summary_json jsonb,
+            publication_metadata_sha256 varchar(64),
+            content_proof_admission_version smallint,
+            content_proof_admission_kind varchar(32),
+            content_proof_admission_sha256 varchar(64),
+            content_proof_resource_types varchar[],
             completion_proof_required_version integer,
             completion_proof_json jsonb,
             completion_proof_sha256 varchar(64)
