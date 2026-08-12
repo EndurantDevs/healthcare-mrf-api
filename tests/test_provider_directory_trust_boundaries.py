@@ -2522,6 +2522,14 @@ async def _assert_dataset_cutover_row_contract(
     )
 
 
+def test_fence_source_endpoint_tuples_rejects_missing_or_malformed_rows():
+    assert importer._fence_source_endpoint_tuples([]) == ()
+    assert importer._fence_source_endpoint_tuples([{}]) == ()
+    assert importer._fence_source_endpoint_tuples(
+        [{"fence_source_endpoint_tuples": [["source_a"]]}]
+    ) == ()
+
+
 @pytest.mark.asyncio
 async def test_dataset_cutover_commit_requires_exact_rows_and_aliases(
     monkeypatch,
