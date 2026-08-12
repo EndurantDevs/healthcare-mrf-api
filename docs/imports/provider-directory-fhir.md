@@ -488,6 +488,15 @@ aliases sealed into each selected dataset's stored content proof. Datasets
 without a stored proof retain the endpoint-wide legacy fallback, and existing
 catalog rows outside the refreshed proof scope are copied forward.
 
+For ordinary FHIR datasets, validation writes
+`artifact-selection-receipt.v1`: the self-hashed source summary and exact
+outcome counts are derived from the fully validated content proof in the same
+repeatable-read transaction. Resolver selection and its lock fence treat that
+bounded receipt plus the stored proof contract and SHA as authoritative. The
+proof shard array remains audit and replay evidence and is intentionally not
+reopened on every resolver read; any receipt or bound scalar drift fails the
+fence.
+
 Each endpoint acquisition writes to a non-current
 `provider_directory_endpoint_dataset` candidate. Normalized resources are
 stored once per `(dataset_id, resource_type, resource_id)` in

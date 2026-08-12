@@ -10800,6 +10800,14 @@ def _artifact_source_record(
     }
 
 
+def _stub_artifact_dataset_hydration(monkeypatch) -> None:
+    monkeypatch.setattr(
+        importer,
+        "_hydrate_legacy_artifact_dataset_rows",
+        AsyncMock(side_effect=lambda dataset_rows: dataset_rows),
+    )
+
+
 @contextlib.asynccontextmanager
 async def _recording_transaction(events: list[str]):
     events.append("transaction-enter")
@@ -10848,6 +10856,7 @@ def _stub_artifact_scope_lifecycle(monkeypatch) -> None:
 async def test_artifact_dataset_selection_is_current_published_isolates_failed_sources(
     monkeypatch,
 ):
+    _stub_artifact_dataset_hydration(monkeypatch)
     lookup = AsyncMock(
         return_value=[
             {
@@ -10902,6 +10911,7 @@ async def test_artifact_dataset_selection_scopes_explicit_and_filters_all_source
     monkeypatch,
 ):
     """Keep explicit selection ordered while global selection stays complete."""
+    _stub_artifact_dataset_hydration(monkeypatch)
     lookup = AsyncMock(
         return_value=[
             {
@@ -10969,7 +10979,7 @@ def test_explicit_artifact_selection_sql_scopes_dataset_reads():
     assert "ranked_dataset_ids AS MATERIALIZED" in explicit_sql
     assert "selected_dataset_ids AS MATERIALIZED" in explicit_sql
     assert explicit_sql.index("selected_dataset_ids AS MATERIALIZED") < (
-        explicit_sql.index("provider_directory_subset_payload_sha256")
+        explicit_sql.index("selected_dataset_json AS MATERIALIZED")
     )
     assert "requested_endpoint_ids AS MATERIALIZED" not in all_sql
 
@@ -11010,6 +11020,7 @@ def test_artifact_dataset_selection_projects_only_bounded_dataset_fields():
 
     sql = importer._provider_directory_artifact_dataset_selection_sql(None)
     projection_sql = importer._artifact_dataset_projection_sql()
+    legacy_sql = importer._artifact_legacy_dataset_projection_sql()
 
     assert "SELECT dataset.*" not in sql
     assert "SELECT dataset_options.*" not in sql
@@ -11017,8 +11028,10 @@ def test_artifact_dataset_selection_projects_only_bounded_dataset_fields():
     assert "publication_metadata_hash" in projection_sql
     assert "content_proof_valid" in projection_sql
     assert "completion_proof_cutoff" in projection_sql
-    assert "provider_directory_subset_payload_sha256" in sql
+    assert "provider_directory_subset_payload_sha256" not in sql
     assert "provider_directory_subset_content_proof_valid" in sql
+    assert "provider_directory_subset_payload_sha256" in legacy_sql
+    assert "provider_directory_subset_content_proof_valid" in legacy_sql
     assert "dataset_options.import_run_id" not in sql
     assert "dataset_options.acquisition_root_run_id" not in sql
     assert "dataset.evidence_run_id" in projection_sql
@@ -11030,6 +11043,7 @@ def test_artifact_dataset_selection_projects_only_bounded_dataset_fields():
 async def test_humana_explicit_artifact_selection_rejects_18_alias_expansion(
     monkeypatch,
 ):
+    _stub_artifact_dataset_hydration(monkeypatch)
     canonical_source_id = "pdfhir_00a3d35311756763d420b0d6"
     endpoint_id = "endpoint_humana"
     dataset_rows = [
@@ -11106,6 +11120,7 @@ def _artifact_selection_row(
 async def test_full_artifact_selection_prefers_validated_and_falls_back_to_current(
     monkeypatch,
 ):
+    _stub_artifact_dataset_hydration(monkeypatch)
     lookup = AsyncMock(
         return_value=[
             _artifact_selection_row(
@@ -11154,6 +11169,7 @@ async def test_full_artifact_selection_prefers_validated_and_falls_back_to_curre
 
 @pytest.mark.asyncio
 async def test_targeted_artifact_selection_remains_current_only(monkeypatch):
+    _stub_artifact_dataset_hydration(monkeypatch)
     lookup = AsyncMock(
         return_value=[
             _artifact_selection_row(
