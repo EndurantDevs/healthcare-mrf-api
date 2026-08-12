@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+from datetime import datetime
 
 import pytest
 
@@ -412,7 +413,13 @@ async def _insert_policy_two_dataset(
         dataset_hash=explicit_policy_row["dataset_hash"],
         status=explicit_policy_row["status"],
         resource_count=explicit_policy_row["resource_count"],
-        validated_at=explicit_policy_row["validated_at"],
+        validated_at=(
+            datetime.fromisoformat(
+                explicit_policy_row["validated_at"]
+            ).replace(tzinfo=None)
+            if explicit_policy_row["validated_at"]
+            else None
+        ),
         metadata=json.dumps(explicit_policy_row["publication_metadata_json"]),
         required_version=explicit_policy_row["completion_proof_required_version"],
         completion_proof=json.dumps(explicit_policy_row["completion_proof_json"]),
@@ -422,17 +429,21 @@ async def _insert_policy_two_dataset(
 
 
 async def _insert_policy_two_subset_pair(
-    database: Database,
+    candidate_store: Database,
     schema: str,
 ) -> tuple[dict[str, object], dict[str, object]]:
+    await candidate_store.status(
+        f"ALTER TABLE {schema}.provider_directory_endpoint_dataset "
+        "ADD COLUMN import_run_id varchar(64), ADD COLUMN previous_dataset_id varchar(96), "
+        "ADD COLUMN validated_at timestamp, "
+        "ADD COLUMN published_at timestamp;"
+    )
     source_record, dataset_rows, _evidence = activation_inputs()
     policy_document = importer.ReviewedRootPolicy(2).document()
     source_metadata = copy.deepcopy(source_record["metadata_json"])
-    source_metadata["provider_directory_candidate_status"] = (
-        importer.PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED
-    )
+    source_metadata["provider_directory_candidate_status"] = importer.PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED
     source_metadata[importer.REVIEWED_ROOT_POLICY_METADATA_KEY] = policy_document
-    await database.status(
+    await candidate_store.status(
         f"""
         INSERT INTO {schema}.provider_directory_source (
             source_id, endpoint_id, metadata_json
@@ -442,11 +453,9 @@ async def _insert_policy_two_subset_pair(
         endpoint_id=source_record["endpoint_id"],
         metadata=json.dumps(source_metadata),
     )
-    inserted_rows = [
-        await _insert_policy_two_dataset(database, schema, row, policy_document)
-        for row in dataset_rows
-    ]
-    return source_record, inserted_rows[1]
+    for dataset_row in dataset_rows:
+        candidate = await _insert_policy_two_dataset(candidate_store, schema, dataset_row, policy_document)
+    return source_record, candidate
 
 
 @pytest.mark.asyncio

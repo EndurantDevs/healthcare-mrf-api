@@ -386,13 +386,13 @@ def run_command(arguments: Sequence[str] | None = None) -> int:
     """Run one gated phase with canonical JSON-only output."""
 
     raw_arguments = _raw_arguments(arguments)
-    parsed_arguments = _parser().parse_args(raw_arguments)
-    if parsed_arguments.command == "acquire":
-        _print_error("disabled")
-        return 1
     gate_error = _preflight_gate(raw_arguments)
     if gate_error is not None:
         _print_error(gate_error)
+        return 1
+    parsed_arguments = _parser().parse_args(raw_arguments)
+    if parsed_arguments.command == "acquire":
+        _print_error("disabled")
         return 1
     try:
         rendered_result = asyncio.run(_run_operator(parsed_arguments))

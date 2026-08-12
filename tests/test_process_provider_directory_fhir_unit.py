@@ -6416,7 +6416,8 @@ def test_provider_directory_cli_removes_reviewed_root_count():
     )
 
     assert cli_result.exit_code == 2
-    assert "No such option: --reviewed-root-count" in cli_result.output
+    assert "No such option" in cli_result.output
+    assert "--reviewed-root-count" in cli_result.output
 
 
 def test_provider_directory_cli_routes_uhc_through_normal_import(monkeypatch):
