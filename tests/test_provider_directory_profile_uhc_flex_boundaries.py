@@ -18,7 +18,11 @@ from process.provider_directory_dataset_scoped_publication import (
     LEGACY_PRACTITIONER_VARIANT,
     ROOTED_COMBINED_VARIANT,
 )
+from process.provider_directory_fhir_root_policy import ReviewedRootPolicy
 from process.uhc_flex_practitioner_contract import UHC_FLEX_PRACTITIONER_SOURCE_ID
+from process.uhc_flex_practitioner_single_root_contract import (
+    UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
+)
 from tests.test_provider_directory_profile_uhc_flex import (
     _artifact_dataset_row,
     _catalog,
@@ -59,6 +63,48 @@ def test_json_and_metadata_helpers_fail_closed() -> None:
         endpoint_id=metadata["endpoint_id"],
         evidence_run_id=metadata["acquisition_root_run_id"],
     )
+
+
+def test_flex_metadata_requires_disjoint_admission_evidence() -> None:
+    twin_metadata_by_field = _flex_metadata()
+    single_metadata_by_field = dict(twin_metadata_by_field)
+    single_metadata_by_field["admission_contract_id"] = (
+        UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID
+    )
+    single_metadata_by_field.pop("baseline_acquisition_id")
+    single_metadata_by_field.pop("baseline_run_id")
+    single_metadata_by_field["provider_directory_reviewed_root_policy_v1"] = (
+        ReviewedRootPolicy(1).document()
+    )
+    for metadata_by_field in (twin_metadata_by_field, single_metadata_by_field):
+        assert flex_profile.is_uhc_flex_publication_metadata_valid(
+            metadata_by_field,
+            dataset_id=metadata_by_field["dataset_id"],
+            endpoint_id=metadata_by_field["endpoint_id"],
+            evidence_run_id=metadata_by_field["acquisition_root_run_id"],
+        )
+
+    mutated_metadata_records = (
+        {**twin_metadata_by_field, "provider_directory_reviewed_root_policy_v1": None},
+        {
+            key: field_value
+            for key, field_value in twin_metadata_by_field.items()
+            if key != "baseline_run_id"
+        },
+        {**single_metadata_by_field, "baseline_acquisition_id": "pdufpa_" + "0" * 48},
+        {
+            **single_metadata_by_field,
+            "provider_directory_reviewed_root_policy_v1": ReviewedRootPolicy(2).document(),
+        },
+        {**twin_metadata_by_field, "admission_contract_id": "unknown"},
+    )
+    for metadata_record in mutated_metadata_records:
+        assert not flex_profile.is_uhc_flex_publication_metadata_valid(
+            metadata_record,
+            dataset_id=metadata_record["dataset_id"],
+            endpoint_id=metadata_record["endpoint_id"],
+            evidence_run_id=metadata_record["acquisition_root_run_id"],
+        )
 
 
 @pytest.mark.asyncio

@@ -5,12 +5,21 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
+from dataclasses import replace
 
 import pytest
 
 from process import uhc_flex_practitioner_acquisition as acquisition
 from process.uhc_flex_practitioner_store import (
     UHCFlexPractitionerStoreError,
+)
+from process.uhc_flex_practitioner_single_root_contract import (
+    build_single_root_admission,
+    UHC_FLEX_PRACTITIONER_SINGLE_ROOT_POLICY,
+)
+from process.uhc_flex_practitioner_twin_identity import (
+    build_uhc_flex_practitioner_dataset_intent_id,
 )
 from process.uhc_flex_practitioner_transport import (
     UHCFlexPractitionerTransportError,
@@ -20,6 +29,8 @@ from tests.uhc_flex_practitioner_acquisition_test_support import (
     AcquisitionHarness,
     enabled_config,
     MEMBER_NPIS,
+    OPERATION_KEY,
+    PROJECTION_DATE,
 )
 
 
@@ -53,6 +64,51 @@ async def test_deterministic_identities_resume_and_admission_ordering():
         str(npi) not in repr(progress)
         for progress in harness.progress
         for npi in harness.npis
+    )
+
+
+@pytest.mark.asyncio
+async def test_reviewed_single_root_runs_only_one_distinct_candidate():
+    harness = AcquisitionHarness()
+    harness.session_serial = 1
+
+    async def admit_single_root(candidate_acquisition_id, **coordinates):
+        harness.events.append("admit_single_root")
+        return build_single_root_admission(
+            harness.sealed_root(candidate_acquisition_id),
+            semantic_projection_as_of=coordinates["semantic_projection_as_of"],
+            operation_key=coordinates["operation_key"],
+            admitted_at=dt.datetime(2026, 8, 10, tzinfo=dt.UTC),
+        )
+
+    dependencies = replace(
+        harness.dependencies(),
+        admit_single_root=admit_single_root,
+    )
+    receipt = await acquisition.acquire_uhc_flex_single_root(
+        operation_key=OPERATION_KEY,
+        semantic_projection_as_of=PROJECTION_DATE,
+        config=enabled_config(concurrency=2),
+        database=harness.database,
+        dependencies=dependencies,
+        progress_callback=harness.progress_callback,
+    )
+
+    assert {identity.acquisition_role for identity in harness.identities.values()} == {
+        "candidate"
+    }
+    assert "initialize:baseline" not in harness.events
+    assert "admit" not in harness.events
+    assert harness.events.index("seal:candidate") < harness.events.index(
+        "admit_single_root"
+    )
+    assert receipt.reviewed_root_policy_json == (
+        UHC_FLEX_PRACTITIONER_SINGLE_ROOT_POLICY.document()
+    )
+    assert receipt.dataset_intent_id != build_uhc_flex_practitioner_dataset_intent_id(
+        receipt.cohort_id,
+        PROJECTION_DATE,
+        OPERATION_KEY,
     )
 
 

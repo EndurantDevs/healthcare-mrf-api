@@ -22,6 +22,7 @@ CANDIDATE_ACQUISITION_ID = "pdufpa_" + "b" * 48
 GATE_BY_PHASE = {
     "sync-cohort": operator.COHORT_ENABLED_ENV,
     "acquire-admit": operator.ACQUISITION_ENABLED_ENV,
+    "acquire-admit-single-root": operator.SINGLE_ROOT_ACQUISITION_ENABLED_ENV,
     "publish-admitted": operator.PUBLICATION_ENABLED_ENV,
 }
 
@@ -49,7 +50,9 @@ def test_each_operator_phase_is_default_off(monkeypatch, phase) -> None:
     assert caught.value.code == "disabled"
 
 
-@pytest.mark.parametrize("phase", ("sync-cohort", "publish-admitted"))
+@pytest.mark.parametrize(
+    "phase", ("sync-cohort", "acquire-admit-single-root", "publish-admitted")
+)
 def test_active_phase_requires_only_its_exact_gate(monkeypatch, phase) -> None:
     _disable_all_gates(monkeypatch)
     monkeypatch.setenv(GATE_BY_PHASE[phase], "true")

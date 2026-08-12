@@ -34,8 +34,8 @@ from process.uhc_flex_practitioner_publication import (
 from process.uhc_flex_practitioner_result_store import (
     read_uhc_flex_practitioner_resource_page,
 )
-from process.uhc_flex_practitioner_twin_store_contract import (
-    UHCFlexPractitionerTwinAdmission,
+from process.uhc_flex_practitioner_single_root_contract import (
+    UHCFlexPractitionerAdmission,
 )
 
 
@@ -91,7 +91,7 @@ async def _insert_materialized_page(
 async def _materialize_candidate(
     database: Any,
     identity: UHCFlexPractitionerDatasetIdentity,
-    admission: UHCFlexPractitionerTwinAdmission,
+    admission: UHCFlexPractitionerAdmission,
     batch_size: int,
 ) -> int:
     after_npi = 0
@@ -208,7 +208,7 @@ async def _semantic_dataset_proof(
 async def _validate_candidate(
     database: Any,
     identity: UHCFlexPractitionerDatasetIdentity,
-    admission: UHCFlexPractitionerTwinAdmission,
+    admission: UHCFlexPractitionerAdmission,
     batch_size: int,
 ) -> str:
     dataset_hash, resource_count = await _semantic_dataset_proof(

@@ -13,6 +13,10 @@ from process.provider_directory_dataset_scoped_publication import (
     LEGACY_PRACTITIONER_VARIANT,
     ROOTED_COMBINED_VARIANT,
 )
+from process.provider_directory_fhir_root_policy import (
+    REVIEWED_ROOT_POLICY_METADATA_KEY,
+    ReviewedRootPolicy,
+)
 from process.provider_directory_resource_hash import (
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
 )
@@ -34,6 +38,12 @@ from process.uhc_flex_practitioner_publication import (
 )
 from process.uhc_flex_practitioner_registration import (
     uhc_flex_practitioner_endpoint_identity,
+)
+from process.uhc_flex_practitioner_single_root_contract import (
+    UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
+)
+from process.uhc_flex_practitioner_twin_store_contract import (
+    UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID,
 )
 
 
@@ -197,6 +207,29 @@ def _is_rooted_resource_counts_valid(resource_counts: object) -> bool:
     )
 
 
+def _is_flex_admission_metadata_valid(
+    publication_metadata: Mapping[str, Any],
+) -> bool:
+    admission_contract_id = publication_metadata.get("admission_contract_id")
+    if admission_contract_id == UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID:
+        return bool(
+            _clean_text(publication_metadata.get("baseline_acquisition_id"))
+            and _clean_text(publication_metadata.get("baseline_run_id"))
+            and REVIEWED_ROOT_POLICY_METADATA_KEY not in publication_metadata
+        )
+    if (
+        admission_contract_id
+        == UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID
+    ):
+        return bool(
+            "baseline_acquisition_id" not in publication_metadata
+            and "baseline_run_id" not in publication_metadata
+            and publication_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
+            == ReviewedRootPolicy(1).document()
+        )
+    return False
+
+
 def is_uhc_flex_publication_metadata_valid(
     publication_metadata: Mapping[str, Any],
     *,
@@ -239,9 +272,10 @@ def is_uhc_flex_publication_metadata_valid(
     if not is_common_metadata_valid:
         return False
     if variant == LEGACY_PRACTITIONER_VARIANT:
-        return (
+        return bool(
             publication_metadata.get("publication_contract_id")
             == UHC_FLEX_PRACTITIONER_DATASET_PUBLICATION_CONTRACT_ID
+            and _is_flex_admission_metadata_valid(publication_metadata)
         )
     resource_counts = publication_metadata.get("resource_counts")
     return bool(

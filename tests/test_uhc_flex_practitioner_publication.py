@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from datetime import timezone
 import hashlib
@@ -21,11 +22,19 @@ from process.uhc_flex_practitioner_materialization import (
     materialize_uhc_flex_practitioner_stored_resource,
 )
 from process.uhc_flex_practitioner_publication import (
+    _canonical_json,
     build_uhc_flex_practitioner_dataset_identity,
     uhc_flex_practitioner_publication_metadata,
     UHCFlexPractitionerDatasetReadiness,
 )
+from process.uhc_flex_practitioner_single_root_contract import (
+    build_single_root_admission,
+    single_root_dataset_intent_id,
+    single_root_run_id,
+    UHC_FLEX_PRACTITIONER_SINGLE_ROOT_POLICY,
+)
 from process.uhc_flex_practitioner_store_contract import (
+    _acquisition_id,
     UHCFlexPractitionerResourceRow,
     UHC_FLEX_PRACTITIONER_ACQUISITION_CONTRACT_ID,
 )
@@ -107,6 +116,52 @@ def test_dataset_identity_and_metadata_bind_the_exact_admission() -> None:
     assert metadata["cohort_complete"] is True
     assert metadata["endpoint_collection_complete"] is False
     assert metadata["endpoint_complete"] is False
+    assert hashlib.sha256(_canonical_json(metadata).encode()).hexdigest() == (
+        "9307e25e748aa46ac9bbef2a800c73bed8d084982aef0ddc6fdef9ff74edb02b"
+    )
+
+
+def test_single_root_metadata_omits_twin_coordinates() -> None:
+    intent_id = single_root_dataset_intent_id(
+        COHORT_ID, PROJECTION_DATE, OPERATION_KEY
+    )
+    candidate = UHCFlexPractitionerSealedRoot(
+        acquisition_id=_acquisition_id(
+            cohort_id=COHORT_ID,
+            acquisition_role="candidate",
+            run_id=single_root_run_id(intent_id),
+            dataset_intent_id=intent_id,
+            expected_npi_count=2,
+        ),
+        cohort_id=COHORT_ID,
+        acquisition_role="candidate",
+        source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
+        connector_id=UHC_FLEX_PRACTITIONER_CONNECTOR_ID,
+        query_contract_id=UHC_FLEX_PRACTITIONER_QUERY_CONTRACT_ID,
+        storage_contract_id=UHC_FLEX_PRACTITIONER_ACQUISITION_CONTRACT_ID,
+        run_id=single_root_run_id(intent_id),
+        dataset_intent_id=intent_id,
+        expected_npi_count=2,
+        resource_count=1,
+        terminal_set_sha256="c" * 64,
+    )
+    admission = build_single_root_admission(
+        candidate,
+        semantic_projection_as_of=PROJECTION_DATE,
+        operation_key=OPERATION_KEY,
+        admitted_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
+    )
+    metadata = uhc_flex_practitioner_publication_metadata(
+        build_uhc_flex_practitioner_dataset_identity(admission), admission
+    )
+
+    assert "baseline_acquisition_id" not in metadata
+    assert "baseline_run_id" not in metadata
+    assert metadata["provider_directory_reviewed_root_policy_v1"] == (
+        UHC_FLEX_PRACTITIONER_SINGLE_ROOT_POLICY.document()
+    )
+    with pytest.raises(ValueError, match="single-root admission"):
+        replace(admission, admission_id="pdufpad_" + "f" * 48)
 
 
 def test_stored_resource_facade_revalidates_and_materializes_one_row() -> None:

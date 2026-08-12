@@ -49,6 +49,11 @@ from process.uhc_flex_practitioner_publication_materialization import (
     _materialize_candidate,
     _validate_candidate,
 )
+from process.uhc_flex_practitioner_single_root_contract import (
+    UHCFlexPractitionerAdmission,
+    UHCFlexPractitionerSingleRootAdmission,
+    UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
+)
 from process.uhc_flex_practitioner_twin_store import (
     require_uhc_flex_practitioner_admission,
 )
@@ -186,7 +191,7 @@ async def _locked_current_dataset(
 async def _insert_parent_header(
     database: Any,
     identity: UHCFlexPractitionerDatasetIdentity,
-    admission: UHCFlexPractitionerTwinAdmission,
+    admission: UHCFlexPractitionerAdmission,
     previous_dataset_id: str | None,
     metadata_json: str,
 ) -> None:
@@ -221,7 +226,7 @@ async def _insert_parent_header(
 async def _insert_dedicated_header(
     database: Any,
     identity: UHCFlexPractitionerDatasetIdentity,
-    admission: UHCFlexPractitionerTwinAdmission,
+    admission: UHCFlexPractitionerAdmission,
     previous_dataset_id: str | None,
 ) -> None:
     inserted = await database.status(
@@ -274,7 +279,7 @@ async def _insert_dedicated_header(
 async def _insert_building_headers(
     database: Any,
     identity: UHCFlexPractitionerDatasetIdentity,
-    admission: UHCFlexPractitionerTwinAdmission,
+    admission: UHCFlexPractitionerAdmission,
     previous_dataset_id: str | None,
 ) -> None:
     metadata_json = _canonical_json(
@@ -337,11 +342,18 @@ def _is_expected_admission(
     admission: object,
     candidate_acquisition_id: str,
 ) -> bool:
-    return bool(
+    has_expected_contract = (
         type(admission) is UHCFlexPractitionerTwinAdmission
-        and admission.candidate_acquisition_id == candidate_acquisition_id
         and admission.admission_contract_id
         == UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID
+    ) or (
+        type(admission) is UHCFlexPractitionerSingleRootAdmission
+        and admission.admission_contract_id
+        == UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID
+    )
+    return bool(
+        has_expected_contract
+        and admission.candidate_acquisition_id == candidate_acquisition_id
         and admission.source_id == UHC_FLEX_PRACTITIONER_SOURCE_ID
         and admission.connector_id == UHC_FLEX_PRACTITIONER_CONNECTOR_ID
         and admission.query_contract_id == UHC_FLEX_PRACTITIONER_QUERY_CONTRACT_ID
@@ -353,7 +365,7 @@ async def _lock_admission(
     database: Any,
     candidate_acquisition_id: str,
     endpoint_id: str,
-) -> UHCFlexPractitionerTwinAdmission:
+) -> UHCFlexPractitionerAdmission:
     await database.scalar(
         "SELECT pg_catalog.pg_advisory_xact_lock("
         "pg_catalog.hashtextextended(:lock_identity, 0));",
@@ -385,7 +397,7 @@ async def _lock_admission(
 
 async def _publish_admitted_dataset(
     database: Any,
-    admission: UHCFlexPractitionerTwinAdmission,
+    admission: UHCFlexPractitionerAdmission,
     endpoint_id: str,
     batch_size: int,
 ) -> UHCFlexPractitionerPublicationResult:

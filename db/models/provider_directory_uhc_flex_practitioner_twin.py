@@ -17,6 +17,7 @@ from sqlalchemy import String
 from sqlalchemy import TIMESTAMP
 from sqlalchemy import UniqueConstraint
 from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import JSONB
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -44,6 +45,14 @@ _ATTEMPT_CONTRACT = (
 )
 _ADMISSION_CONTRACT = (
     "healthporta.provider-directory.uhc-flex-practitioner-matched-admission.v1"
+)
+_SINGLE_ROOT_ADMISSION_CONTRACT = (
+    "healthporta.provider-directory.uhc-flex-practitioner-"
+    "reviewed-single-root-admission.v1"
+)
+_SINGLE_ROOT_POLICY = (
+    "'{\"policy_version\":\"provider-directory-reviewed-root-policy-v1\","
+    "\"required_root_count\"\\:1}'::jsonb"
 )
 
 
@@ -137,7 +146,7 @@ class UHCFlexPractitionerTwinAttemptModel(Base, JSONOutputMixin):
 
 
 class UHCFlexPractitionerTwinAdmissionModel(Base, JSONOutputMixin):
-    """Immutable publication authority keyed to one matched candidate."""
+    """Immutable twin or reviewed single-root publication authority."""
 
     __tablename__ = "provider_directory_uhc_flex_practitioner_twin_admission"
     __main_table__ = __tablename__
@@ -170,16 +179,22 @@ class UHCFlexPractitionerTwinAdmissionModel(Base, JSONOutputMixin):
             name="pd_uhc_flex_practitioner_admission_candidate_fkey",
         ),
         CheckConstraint(
-            f"admission_contract_id = '{_ADMISSION_CONTRACT}' AND "
             "admission_id ~ '^pdufpad_[0-9a-f]{48}$' AND "
             "operation_key ~ '^[0-9a-f]{64}$' AND "
             "semantic_projection_as_of BETWEEN DATE '0001-01-01' "
-            "AND DATE '9999-12-31' AND "
+            "AND DATE '9999-12-31' AND expected_npi_count > 0 AND "
+            "resource_count >= 0 AND terminal_set_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND publication_authority IS TRUE AND (("
+            f"admission_contract_id = '{_ADMISSION_CONTRACT}' AND "
+            "attempt_id IS NOT NULL AND baseline_acquisition_id IS NOT NULL "
+            "AND baseline_run_id IS NOT NULL AND "
             "baseline_acquisition_id <> candidate_acquisition_id AND "
             "baseline_run_id <> candidate_run_id AND "
-            "expected_npi_count > 0 AND resource_count >= 0 AND "
-            "terminal_set_sha256 ~ '^[0-9a-f]{64}$' AND "
-            "publication_authority IS TRUE",
+            "reviewed_root_policy_json IS NULL) OR ("
+            f"admission_contract_id = '{_SINGLE_ROOT_ADMISSION_CONTRACT}' AND "
+            "attempt_id IS NULL AND baseline_acquisition_id IS NULL AND "
+            "baseline_run_id IS NULL AND reviewed_root_policy_json = "
+            f"{_SINGLE_ROOT_POLICY}))",
             name="pd_uhc_flex_practitioner_twin_admission_check",
         ),
         {"schema": _SCHEMA, "extend_existing": True},
@@ -190,8 +205,8 @@ class UHCFlexPractitionerTwinAdmissionModel(Base, JSONOutputMixin):
     admission_contract_id = Column(String(96), nullable=False)
     semantic_projection_as_of = Column(Date, nullable=False)
     operation_key = Column(String(64), nullable=False)
-    attempt_id = Column(String(56), nullable=False)
-    baseline_acquisition_id = Column(String(55), nullable=False)
+    attempt_id = Column(String(56))
+    baseline_acquisition_id = Column(String(55))
     candidate_acquisition_id = Column(String(55), nullable=False)
     cohort_id = Column(String(54), nullable=False)
     dataset_intent_id = Column(String(55), nullable=False)
@@ -199,12 +214,13 @@ class UHCFlexPractitionerTwinAdmissionModel(Base, JSONOutputMixin):
     connector_id = Column(String(64), nullable=False)
     query_contract_id = Column(String(96), nullable=False)
     storage_contract_id = Column(String(96), nullable=False)
-    baseline_run_id = Column(String(55), nullable=False)
+    baseline_run_id = Column(String(55))
     candidate_run_id = Column(String(55), nullable=False)
     expected_npi_count = Column(BigInteger, nullable=False)
     terminal_set_sha256 = Column(String(64), nullable=False)
     resource_count = Column(BigInteger, nullable=False)
     publication_authority = Column(Boolean, nullable=False)
+    reviewed_root_policy_json = Column(JSONB)
     admitted_at = Column(
         TIMESTAMP(timezone=True),
         nullable=False,

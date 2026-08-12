@@ -8,12 +8,22 @@ from contextlib import asynccontextmanager
 import copy
 from dataclasses import fields, replace
 from datetime import date
+from datetime import timedelta
+import json
+from types import SimpleNamespace
 
 import pytest
 
 from process import uhc_flex_practitioner_twin_identity as twin_identity
 from process import uhc_flex_practitioner_twin_store as twin_store
 from process import uhc_flex_practitioner_twin_store_contract as twin_contract
+from process.uhc_flex_practitioner_single_root_contract import (
+    build_single_root_admission,
+    single_root_dataset_intent_id,
+    single_root_run_id,
+)
+from process.uhc_flex_practitioner_store_contract import _acquisition_id
+from tests.provider_directory_uhc_flex_npi_cohort_pg_support import cohort_fixture
 from tests.test_uhc_flex_practitioner_twin_store_contract import (
     _root,
     OPERATION_KEY,
@@ -34,8 +44,12 @@ def _field_map(value) -> dict[str, object]:
 
 
 class _Database:
-    def __init__(self, *, all_rows=()) -> None:
+    def __init__(self, *, all_rows=(), first_rows=()) -> None:
         self.all_rows = list(all_rows)
+        self.all_calls = []
+        self.first_rows = list(first_rows)
+        self.first_calls = []
+        self.status_calls = []
 
     @asynccontextmanager
     async def transaction(self):
@@ -44,8 +58,16 @@ class _Database:
     async def scalar(self, _statement, **_parameters):
         return TIMESTAMP
 
-    async def all(self, _statement, **_parameters):
+    async def first(self, statement, **parameters):
+        self.first_calls.append((statement, parameters))
+        return self.first_rows.pop(0) if self.first_rows else None
+
+    async def all(self, statement, **parameters):
+        self.all_calls.append((statement, parameters))
         return self.all_rows
+
+    async def status(self, statement, **parameters):
+        self.status_calls.append((statement, parameters))
 
 
 def _sealed_database_row(root):
@@ -60,6 +82,47 @@ def _sealed_database_row(root):
         "endpoint_complete": False,
         "sealed_at": TIMESTAMP,
     }
+
+
+def _single_root(cohort_id: str, expected_npi_count: int):
+    intent_id = single_root_dataset_intent_id(
+        cohort_id,
+        PROJECTION_DATE,
+        OPERATION_KEY,
+    )
+    run_id = single_root_run_id(intent_id)
+    return replace(
+        _root("candidate", cohort_id=cohort_id),
+        acquisition_id=_acquisition_id(
+            cohort_id=cohort_id,
+            acquisition_role="candidate",
+            run_id=run_id,
+            dataset_intent_id=intent_id,
+            expected_npi_count=expected_npi_count,
+        ),
+        dataset_intent_id=intent_id,
+        expected_npi_count=expected_npi_count,
+        run_id=run_id,
+    )
+
+
+def _single_root_lock_row():
+    cohort = cohort_fixture()
+    candidate = _single_root(cohort.cohort_id, cohort.npi_count)
+    snapshot = SimpleNamespace(
+        endpoint_id=cohort.official_endpoint_id,
+        dataset_id=cohort.official_dataset_id,
+        acquisition_root_run_id=cohort.official_acquisition_root_run_id,
+        dataset_hash=cohort.official_dataset_hash,
+        content_proof_sha256=cohort.official_content_proof_sha256,
+        practitioner_resource_count=cohort.practitioner_resource_count,
+    )
+    return (
+        candidate,
+        _sealed_database_row(candidate),
+        _field_map(cohort),
+        snapshot,
+    )
 
 
 def _attempt_and_admission():
@@ -176,6 +239,109 @@ async def test_twin_store_lock_and_public_require_input_boundaries():
             semantic_projection_as_of=PROJECTION_DATE,
             operation_key=None,
         )
+
+
+@pytest.mark.asyncio
+async def test_single_root_lock_revalidates_current_official_dataset(monkeypatch):
+    candidate, candidate_row, cohort_row, snapshot = _single_root_lock_row()
+    database = _Database(first_rows=(candidate_row, cohort_row))
+
+    async def current_snapshot(_database):
+        assert _database is database
+        return snapshot
+
+    monkeypatch.setattr(
+        twin_store.official_cohort,
+        "_current_official_snapshot",
+        current_snapshot,
+    )
+
+    assert await twin_store._lock_single_root(
+        database,
+        candidate.acquisition_id,
+    ) == candidate
+    assert len(database.first_calls) == 2
+    assert "provider_directory_uhc_flex_practitioner_acquisition" in (
+        database.first_calls[0][0]
+    )
+    assert "FOR SHARE" in database.first_calls[0][0]
+    assert database.first_calls[0][1] == {
+        "candidate_acquisition_id": candidate.acquisition_id,
+    }
+    assert "provider_directory_uhc_flex_npi_cohort" in database.first_calls[1][0]
+    assert "FOR SHARE" in database.first_calls[1][0]
+    assert database.first_calls[1][1] == {"cohort_id": candidate.cohort_id}
+
+    drifted_snapshot = SimpleNamespace(**vars(snapshot))
+    drifted_snapshot.content_proof_sha256 = "0" * 64
+
+    async def drifted_current_snapshot(_database):
+        return drifted_snapshot
+
+    monkeypatch.setattr(
+        twin_store.official_cohort,
+        "_current_official_snapshot",
+        drifted_current_snapshot,
+    )
+    with pytest.raises(twin_contract.UHCFlexPractitionerTwinStoreError):
+        await twin_store._lock_single_root(
+            _Database(first_rows=(candidate_row, cohort_row)),
+            candidate.acquisition_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_single_root_admission_replay_returns_stored_identity(monkeypatch):
+    cohort = cohort_fixture()
+    candidate = _single_root(cohort.cohort_id, cohort.npi_count)
+    stored_admission = build_single_root_admission(
+        candidate,
+        semantic_projection_as_of=PROJECTION_DATE,
+        operation_key=OPERATION_KEY,
+        admitted_at=TIMESTAMP - timedelta(minutes=1),
+    )
+
+    async def lock_single_root(*_args, **_kwargs):
+        return candidate
+
+    async def no_write(*_args, **_kwargs):
+        return None
+
+    async def read_admission(*_args, **_kwargs):
+        return stored_admission
+
+    monkeypatch.setattr(twin_store, "_lock_single_root", lock_single_root)
+    monkeypatch.setattr(twin_store, "_insert_admission", no_write)
+    monkeypatch.setattr(twin_store, "_read_admission", read_admission)
+
+    replay = await twin_store.admit_uhc_flex_practitioner_single_root(
+        candidate.acquisition_id,
+        semantic_projection_as_of=PROJECTION_DATE,
+        operation_key=OPERATION_KEY,
+        database=_Database(),
+    )
+
+    assert replay is stored_admission
+
+
+@pytest.mark.asyncio
+async def test_single_root_admission_serializes_jsonb_policy() -> None:
+    cohort = cohort_fixture()
+    admission = build_single_root_admission(
+        _single_root(cohort.cohort_id, cohort.npi_count),
+        semantic_projection_as_of=PROJECTION_DATE,
+        operation_key=OPERATION_KEY,
+        admitted_at=TIMESTAMP,
+    )
+    database = _Database()
+
+    await twin_store._insert_admission(database, admission)
+
+    statement, parameters = database.status_calls[0]
+    assert "CAST(:reviewed_root_policy_json AS jsonb)" in statement
+    assert json.loads(parameters["reviewed_root_policy_json"]) == (
+        admission.reviewed_root_policy_json
+    )
 
 
 @pytest.mark.asyncio

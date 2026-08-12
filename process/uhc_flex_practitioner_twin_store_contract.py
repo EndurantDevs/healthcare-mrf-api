@@ -444,6 +444,7 @@ def _is_valid_admission(admission: object) -> bool:
         and admitted_at.tzinfo is not None
         and getattr(admission, "admission_contract_id", None)
         == UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID
+        and getattr(admission, "reviewed_root_policy_json", None) is None
     )
 
 
@@ -471,6 +472,7 @@ class UHCFlexPractitionerTwinAdmission:
     publication_authority: bool
     admitted_at: datetime
     admission_contract_id: str = UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID
+    reviewed_root_policy_json: None = None
 
     def __post_init__(self) -> None:
         if not _is_valid_admission(self):
