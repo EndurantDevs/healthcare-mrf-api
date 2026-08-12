@@ -464,3 +464,10 @@ from tests.provider_directory_admission_seal_lineage_cases import (
     test_streaming_copy_requires_string_root_scope_items,
     test_terminal_writer_stores_complete_nullable_receipt_tuple,
 )
+from tests.provider_directory_admission_backfill_coverage_support import (
+    test_backfill_rejects_copy_overrun_and_lost_row,
+    test_backfill_rejects_invalid_id_and_uses_default_database,
+    test_backfill_rejects_invalid_legacy_rows,
+    test_backfill_rejects_invalid_schema_and_partial_seal,
+    test_backfill_rejects_lost_update_and_missing_dataset,
+)
