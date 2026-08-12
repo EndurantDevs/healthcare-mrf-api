@@ -14617,34 +14617,53 @@ def _provider_directory_artifact_dataset_selection_sql(
     """Select one immutable dataset per endpoint with explicit fallback rules."""
     source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
     dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
-    selection_dataset_ref = "artifact_dataset_scope" if source_ids else dataset_ref
+    is_explicit_selection = source_ids is not None
     selection_sql = (
-        _artifact_dataset_explicit_selection_sql(selection_dataset_ref, source_ref)
-        if source_ids
+        _artifact_dataset_explicit_selection_sql(dataset_ref, source_ref)
+        if is_explicit_selection
         else _artifact_dataset_all_source_selection_sql(
             dataset_ref,
             source_ref,
         )
     )
-    endpoint_scope_sql = (
-        _artifact_dataset_explicit_endpoint_scope_ctes(
-            dataset_ref,
-            source_ref,
-            include_validated_candidates=should_select_validated_candidates,
-        )
-        if source_ids
-        else ""
-    )
     options_sql = _artifact_dataset_options_cte(
-        selection_dataset_ref,
+        dataset_ref,
         source_ref,
+        scope_requested_endpoint_ids=is_explicit_selection,
         project_artifact_fields=True,
     )
     ranking_sql = _artifact_dataset_ranking_cte()
     projection_sql = _artifact_dataset_projection_sql()
+    requested_endpoint_ids_sql = (
+        f"{_artifact_requested_endpoint_ids_cte(source_ref)}, "
+        if is_explicit_selection
+        else ""
+    )
     return f"""
-        WITH {endpoint_scope_sql}{options_sql}, {ranking_sql}, {selection_sql}
+        WITH {requested_endpoint_ids_sql}{options_sql}, {ranking_sql}, {selection_sql}
         {projection_sql}
+    """
+
+
+def _artifact_requested_endpoint_ids_cte(source_ref: str) -> str:
+    """Select serving and configured endpoints for requested sources."""
+
+    configured_endpoint = (
+        "NULLIF(source.metadata_json::jsonb ->> "
+        f"'{PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY}', '')"
+    )
+    return f"""
+        requested_endpoint_ids AS MATERIALIZED (
+            SELECT source.endpoint_id
+              FROM {source_ref} AS source
+             WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
+               AND source.endpoint_id IS NOT NULL
+            UNION
+            SELECT {configured_endpoint}
+              FROM {source_ref} AS source
+             WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
+               AND {configured_endpoint} IS NOT NULL
+        )
     """
 
 
@@ -16409,73 +16428,12 @@ def _artifact_dataset_option_projection_parts(
     )
 
 
-def _artifact_dataset_explicit_endpoint_scope_ctes(
-    dataset_ref: str, source_ref: str, *,
-    include_validated_candidates: bool,
-) -> str:
-    """Resolve the endpoint superset before evaluating stored proof payloads."""
-
-    candidate_cte = ""
-    candidate_scope = ""
-    if include_validated_candidates:
-        candidate_cte = f"""
-        validated_candidate_aliases AS MATERIALIZED (
-            SELECT dataset.endpoint_id,
-                   COALESCE(
-                       dataset.publication_metadata_json::jsonb -> 'source_ids',
-                       '[]'::jsonb
-                   ) AS publication_source_ids
-              FROM {dataset_ref} AS dataset
-             WHERE dataset.is_current = false
-               AND dataset.status = :validated_status
-               AND dataset.superseded_at IS NULL
-        ),
-        """
-        candidate_scope = """
-            UNION
-            SELECT candidate.endpoint_id
-              FROM validated_candidate_aliases AS candidate
-              JOIN requested_source_scope AS requested
-                ON candidate.publication_source_ids
-                       @> jsonb_build_array(requested.source_id)
-        """
-    return f"""
-        requested_source_scope AS MATERIALIZED (
-            SELECT source.source_id,
-                   source.endpoint_id AS serving_endpoint_id,
-                   NULLIF(
-                       source.metadata_json::jsonb
-                           ->> '{PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY}',
-                       ''
-                   ) AS configured_endpoint_id
-              FROM {source_ref} AS source
-             WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
-        ),
-        {candidate_cte}artifact_endpoint_scope AS MATERIALIZED (
-            SELECT requested.serving_endpoint_id AS endpoint_id
-              FROM requested_source_scope AS requested
-             WHERE requested.serving_endpoint_id IS NOT NULL
-            UNION
-            SELECT requested.configured_endpoint_id
-              FROM requested_source_scope AS requested
-             WHERE requested.configured_endpoint_id IS NOT NULL
-            {candidate_scope}
-        ),
-        artifact_dataset_scope AS MATERIALIZED (
-            SELECT dataset.*
-              FROM {dataset_ref} AS dataset
-             WHERE dataset.endpoint_id = ANY(
-                       ARRAY(SELECT endpoint_id FROM artifact_endpoint_scope)
-                   )
-        ),
-        """
-
-
 def _artifact_dataset_options_cte(
     dataset_ref: str,
     source_ref: str | None = None,
     *,
     scope_endpoint_ids: bool = False,
+    scope_requested_endpoint_ids: bool = False,
     project_artifact_fields: bool = False,
 ) -> str:
     """Select only current or admitted candidate rows with bounded output."""
@@ -16484,9 +16442,9 @@ def _artifact_dataset_options_cte(
         if source_ref
         else "true"
     )
-    endpoint_scope = (
-        "dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))\n"
-        "           AND " if scope_endpoint_ids else ""
+    endpoint_scope = _artifact_dataset_endpoint_scope_sql(
+        scope_endpoint_ids=scope_endpoint_ids,
+        scope_requested_endpoint_ids=scope_requested_endpoint_ids,
     )
     option_projection, publication_lateral = (
         _artifact_dataset_option_projection_parts(project_artifact_fields)
@@ -16528,6 +16486,27 @@ def _artifact_dataset_options_cte(
          )
         )
     """
+
+
+def _artifact_dataset_endpoint_scope_sql(
+    *,
+    scope_endpoint_ids: bool,
+    scope_requested_endpoint_ids: bool,
+) -> str:
+    """Return the selected endpoint predicate for dataset options."""
+
+    if scope_endpoint_ids:
+        return (
+            "dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))\n"
+            "           AND "
+        )
+    if scope_requested_endpoint_ids:
+        return (
+            "dataset.endpoint_id IN ("
+            "SELECT endpoint_id FROM requested_endpoint_ids)\n"
+            "           AND "
+        )
+    return ""
 
 
 def _artifact_dataset_ranking_cte() -> str:
@@ -16651,6 +16630,7 @@ def _artifact_dataset_explicit_selection_sql(
               {_artifact_published_alias_reconciliation_join_sql(
                   dataset_ref,
                   source_ref,
+                  scope_requested_endpoint_ids=True,
               )}
              WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
         )
@@ -16735,6 +16715,8 @@ def _artifact_validated_candidate_alias_join_sql() -> str:
 def _artifact_published_alias_reconciliation_join_sql(
     dataset_ref: str,
     source_ref: str,
+    *,
+    scope_requested_endpoint_ids: bool = False,
 ) -> str:
     """Match a proven publication only when its serving alias is orphaned."""
 
@@ -16742,11 +16724,17 @@ def _artifact_published_alias_reconciliation_join_sql(
         dataset_ref,
         source_ref,
     )
+    endpoint_scope = (
+        "dataset.endpoint_id IN (SELECT endpoint_id "
+        "FROM requested_endpoint_ids) AND "
+        if scope_requested_endpoint_ids
+        else ""
+    )
     return f"""
         LEFT JOIN (
             SELECT dataset.endpoint_id
               FROM {dataset_ref} AS dataset
-             WHERE dataset.is_current = true
+             WHERE {endpoint_scope}dataset.is_current = true
                AND dataset.status = :published_status
                AND dataset.published_at IS NOT NULL
                AND dataset.superseded_at IS NULL
@@ -18384,10 +18372,13 @@ async def _resolve_provider_directory_artifact_datasets(
     *,
     should_select_validated_candidates: bool = False,
 ) -> ProviderDirectoryArtifactDatasetFence:
+    is_explicit_selection = source_ids is not None
     cleaned_source_ids = _clean_source_id_list(source_ids)
+    if is_explicit_selection and not cleaned_source_ids:
+        raise RuntimeError("provider_directory_artifact_source_ids_empty")
     dataset_rows = await db.all(
         _provider_directory_artifact_dataset_selection_sql(
-            cleaned_source_ids,
+            cleaned_source_ids if is_explicit_selection else None,
             should_select_validated_candidates=(
                 should_select_validated_candidates
             ),
@@ -18395,7 +18386,11 @@ async def _resolve_provider_directory_artifact_datasets(
         published_status=ENDPOINT_DATASET_PUBLISHED,
         validated_status=ENDPOINT_DATASET_VALIDATED,
         select_validated_candidates=should_select_validated_candidates,
-        **({"source_ids": cleaned_source_ids} if cleaned_source_ids else {}),
+        **(
+            {"source_ids": cleaned_source_ids}
+            if is_explicit_selection
+            else {}
+        ),
     )
     dataset_rows = await annotate_uhc_flex_profile_dataset_readiness(
         dataset_rows,
@@ -23428,6 +23423,7 @@ async def _publish_provider_directory_dataset_artifacts(
     validated_publication_candidate: ValidatedPublicationCandidate | None = None,
 ) -> dict[str, Any]:
     """Build one selected dataset bundle and atomically publish its pointers."""
+    source_ids = None if require_complete_global_profile_fence and source_ids == [] else source_ids
     if require_complete_global_profile_fence and not (
         is_provider_directory_publish_target_enabled(
             publish_artifacts_targets,
@@ -72457,14 +72453,10 @@ async def process_provider_directory_fhir_data(
     )
     endpoint_scope_input = _clean_text(task.get("provider_directory_endpoint_scope"))
     provider_directory_endpoint_scope = endpoint_scope_input.rstrip("/") if endpoint_scope_input else None
-    requested_source_ids = (
-        [census_request.source_id]
-        if census_request is not None
-        else _clean_source_id_list(
-            task.get("source_ids")
-            or task.get("source_id")
-            or task.get("provider_directory_source_ids")
-            or task.get("provider_directory_source_id")
+    requested_source_ids, has_explicit_source_scope = (
+        _provider_directory_artifact_publication_source_scope(
+            task,
+            census_request,
         )
     )
     dataset_followup_only = bool(task.get("dataset_followup_only", False))
@@ -72794,6 +72786,9 @@ async def process_provider_directory_fhir_data(
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
         return metrics_by_key
     if publish_artifacts_only:
+        publication_source_ids = (
+            requested_source_ids if has_explicit_source_scope else None
+        )
         publish_metric_by_name = {
             "publish_artifacts": True,
             "publish_artifacts_only": True,
@@ -72803,7 +72798,7 @@ async def process_provider_directory_fhir_data(
             publish_metric_by_name = await _publish_provider_directory_dataset_artifacts(
                 run_id=run_id,
                 metrics=publish_metric_by_name,
-                source_ids=requested_source_ids,
+                source_ids=publication_source_ids,
                 publish_corroboration=should_publish_corroboration,
                 publish_artifacts_targets=publish_artifacts_targets,
                 full_address_artifact_rebuild=full_address_artifact_rebuild,
@@ -73462,6 +73457,10 @@ async def run_provider_directory_fhir_command(
         task_by_field,
         allowed_resources=DEFAULT_RESOURCES,
     )
+    _provider_directory_artifact_publication_source_scope(
+        task_by_field,
+        census_request,
+    )
     if census_request is None:
         await startup(runtime_context_by_key)
     try:
@@ -73501,6 +73500,52 @@ def _clean_source_id_list(raw_source_ids: Any) -> list[str]:
         seen_source_ids.add(source_id_text)
         cleaned_source_ids.append(source_id_text)
     return cleaned_source_ids
+
+
+_PROVIDER_DIRECTORY_SOURCE_SCOPE_FIELDS = (
+    "source_ids",
+    "source_id",
+    "provider_directory_source_ids",
+    "provider_directory_source_id",
+)
+
+
+def _provider_directory_artifact_publication_source_scope(
+    task: dict[str, Any],
+    census_request: Any,
+) -> tuple[list[str], bool]:
+    """Resolve artifact source scope and reject empty explicit selectors."""
+
+    requested_source_ids = (
+        [census_request.source_id]
+        if census_request is not None
+        else _clean_source_id_list(
+            task.get("source_ids")
+            or task.get("source_id")
+            or task.get("provider_directory_source_ids")
+            or task.get("provider_directory_source_id")
+        )
+    )
+    has_explicit_source_scope = census_request is not None or any(
+        task.get(field_name) is not None
+        for field_name in _PROVIDER_DIRECTORY_SOURCE_SCOPE_FIELDS
+    )
+    is_exact_global_profile_scope = (
+        task.get("require_complete_global_profile_fence") is True
+        and task.get("source_ids") == []
+        and all(
+            task.get(field_name) is None
+            for field_name in _PROVIDER_DIRECTORY_SOURCE_SCOPE_FIELDS[1:]
+        )
+    )
+    if (
+        task.get("publish_artifacts_only") is True
+        and has_explicit_source_scope
+        and not requested_source_ids
+        and not is_exact_global_profile_scope
+    ):
+        raise RuntimeError("provider_directory_artifact_source_ids_empty")
+    return requested_source_ids, has_explicit_source_scope
 
 
 def _scope_source_rows(

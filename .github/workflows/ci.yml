@@ -1052,6 +1052,7 @@ jobs:
           tests/test_provider_directory_dataset_serving_relations_db.py
           tests/test_provider_directory_contra_affiliation.py
           tests/test_provider_directory_dataset_artifact_db.py
+          tests/test_provider_directory_artifact_selection_scope_db.py
           tests/test_provider_directory_dataset_selection_bounded_db.py
           tests/test_provider_directory_dataset_artifact_cutover_db.py
           tests/test_provider_directory_dataset_artifact_concurrency_db.py

@@ -927,6 +927,58 @@ async def test_global_profile_fence_rejects_explicit_source_scope(monkeypatch):
     artifact_prepare.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_global_profile_publish_normalizes_empty_scope_to_none(monkeypatch):
+    artifact_prepare = AsyncMock(
+        return_value=importer.ProviderDirectoryArtifactDatasetFence(())
+    )
+    artifact_publish = AsyncMock(return_value={"profile": {"profile_rows": 0}})
+    monkeypatch.setattr(
+        importer,
+        "_prepare_artifact_publication_fence",
+        artifact_prepare,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_publish_artifact_bundle_from_fence",
+        artifact_publish,
+    )
+
+    result = await importer._publish_provider_directory_dataset_artifacts(
+        run_id="global-publish",
+        metrics={},
+        source_ids=[],
+        publish_corroboration=False,
+        publish_artifacts_targets={"profile"},
+        require_complete_global_profile_fence=True,
+    )
+
+    assert result == {"profile": {"profile_rows": 0}}
+    assert artifact_prepare.await_args.args[0] is None
+    assert artifact_publish.await_args.args[1].source_ids is None
+
+
+@pytest.mark.asyncio
+async def test_artifact_publish_rejects_blank_explicit_scope(monkeypatch):
+    lookup = AsyncMock()
+    monkeypatch.setattr(importer.db, "all", lookup)
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_artifact_source_ids_empty",
+    ):
+        await importer._publish_provider_directory_dataset_artifacts(
+            run_id="explicit-publish",
+            metrics={},
+            source_ids=[" "],
+            publish_corroboration=False,
+            publish_artifacts_targets={"profile"},
+            require_complete_global_profile_fence=True,
+        )
+
+    lookup.assert_not_awaited()
+
+
 def _uhc_source_local_candidate_fence():
     """Build the candidate and publication fence for source-local promotion."""
     candidate = importer.EndpointDatasetCandidate(
@@ -6328,6 +6380,25 @@ def test_provider_directory_cli_forwards_deferred_materialization(monkeypatch):
     assert calls[0]["defer_typed_materialization"] is True
 
 
+def test_provider_directory_cli_preserves_absent_source_scope(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        process_cli,
+        "initiate_provider_directory_fhir",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    monkeypatch.setattr(process_cli, "_run", lambda _task: None)
+
+    cli_result = CliRunner().invoke(
+        process_cli.provider_directory_fhir,
+        ["--publish-artifacts-only"],
+    )
+
+    assert cli_result.exit_code == 0, cli_result.output
+    assert calls[0]["source_ids"] is None
+
+
 def test_provider_directory_cli_forwards_reviewed_root_count(monkeypatch):
     calls = []
 
@@ -10830,6 +10901,7 @@ async def test_artifact_dataset_selection_is_current_published_isolates_failed_s
 async def test_artifact_dataset_selection_scopes_explicit_and_filters_all_source_publish(
     monkeypatch,
 ):
+    """Keep explicit selection ordered while global selection stays complete."""
     lookup = AsyncMock(
         return_value=[
             {
@@ -10886,6 +10958,38 @@ async def test_artifact_dataset_selection_scopes_explicit_and_filters_all_source
     assert "publication_metadata_json::jsonb -> 'source_ids'" in all_sql
 
 
+def test_explicit_artifact_selection_sql_scopes_dataset_reads():
+    """Scope both explicit dataset reads before proof projection."""
+    explicit_sql = importer._provider_directory_artifact_dataset_selection_sql(
+        ["source_a"]
+    )
+    all_sql = importer._provider_directory_artifact_dataset_selection_sql(None)
+
+    assert "requested_endpoint_ids AS MATERIALIZED" in explicit_sql
+    assert explicit_sql.count("FROM requested_endpoint_ids") == 2
+    assert "requested_endpoint_ids AS MATERIALIZED" not in all_sql
+
+
+@pytest.mark.asyncio
+async def test_artifact_dataset_selection_rejects_empty_explicit_scope(monkeypatch):
+    lookup = AsyncMock()
+    monkeypatch.setattr(importer.db, "all", lookup)
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_artifact_source_ids_empty",
+    ):
+        await importer._resolve_provider_directory_artifact_datasets([" "])
+
+    lookup.assert_not_awaited()
+    empty_scope_sql = importer._provider_directory_artifact_dataset_selection_sql(
+        []
+    )
+    assert "requested_endpoint_ids AS MATERIALIZED" in empty_scope_sql
+    assert "selected_sources AS MATERIALIZED" in empty_scope_sql
+    assert "selected_endpoints AS MATERIALIZED" not in empty_scope_sql
+
+
 def test_all_source_selection_sql_binds_stored_proof_scope():
     """Keep global endpoint aliases inside their stored content proof."""
 
@@ -10916,25 +11020,6 @@ def test_artifact_dataset_selection_projects_only_bounded_dataset_fields():
     assert "dataset.evidence_run_id" in projection_sql
     assert "dataset.publication_metadata_json" not in projection_sql
     assert "dataset.completion_proof_json" not in projection_sql
-
-
-def test_explicit_artifact_selection_scopes_heavy_dataset_evaluation():
-    published_sql = importer._provider_directory_artifact_dataset_selection_sql(
-        ["source_a"]
-    )
-    candidate_sql = importer._provider_directory_artifact_dataset_selection_sql(
-        ["source_a"],
-        should_select_validated_candidates=True,
-    )
-
-    for sql in (published_sql, candidate_sql):
-        assert "requested_source_scope AS MATERIALIZED" in sql
-        assert "artifact_endpoint_scope AS MATERIALIZED" in sql
-        assert "artifact_dataset_scope AS MATERIALIZED" in sql
-        assert sql.count("FROM artifact_dataset_scope AS dataset") == 2
-    assert "validated_candidate_aliases AS MATERIALIZED" not in published_sql
-    assert "validated_candidate_aliases AS MATERIALIZED" in candidate_sql
-    assert "candidate.publication_source_ids" in candidate_sql
 
 
 @pytest.mark.asyncio
@@ -15413,6 +15498,84 @@ async def test_main_forwards_publish_artifact_targets(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_main_publish_without_source_selector_is_global(monkeypatch):
+    publish = AsyncMock(return_value={"published": True})
+    monkeypatch.setattr(importer, "startup", AsyncMock())
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "_publish_provider_directory_dataset_artifacts",
+        publish,
+    )
+    monkeypatch.setattr(importer, "shutdown", AsyncMock())
+
+    result = await importer.main(
+        test_mode=True,
+        publish_artifacts_only=True,
+    )
+
+    assert result == {"published": True}
+    assert publish.await_args.kwargs["source_ids"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_scope_by_field",
+    (
+        {"source_ids": []},
+        {"source_ids": [" "]},
+        {"source_ids": " "},
+    ),
+)
+async def test_main_publish_rejects_empty_explicit_source_scope(
+    monkeypatch,
+    source_scope_by_field,
+):
+    startup = AsyncMock()
+    lookup = AsyncMock()
+    monkeypatch.setattr(importer, "startup", startup)
+    monkeypatch.setattr(importer, "shutdown", AsyncMock())
+    monkeypatch.setattr(importer.db, "all", lookup)
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_artifact_source_ids_empty",
+    ):
+        await importer.main(
+            test_mode=True,
+            publish_artifacts_only=True,
+            **source_scope_by_field,
+        )
+
+    startup.assert_not_awaited()
+    lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publish_rejects_mixed_global_profile_source_scope(monkeypatch):
+    ensure_database = AsyncMock()
+    monkeypatch.setattr(importer, "ensure_database", ensure_database)
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_artifact_source_ids_empty",
+    ):
+        await importer.process_data(
+            {"context": {}},
+            {
+                "publish_artifacts_only": True,
+                "publish_artifacts_targets": ["profile"],
+                "source_ids": [],
+                "source_id": " ",
+                "require_complete_global_profile_fence": True,
+            },
+        )
+
+    ensure_database.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_full_address_rebuild_is_global_and_forced_through_public_flow(monkeypatch):
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
@@ -15434,7 +15597,7 @@ async def test_full_address_rebuild_is_global_and_forced_through_public_flow(mon
     )
 
     assert result == {"published": True}
-    assert publish.await_args.kwargs["source_ids"] == []
+    assert publish.await_args.kwargs["source_ids"] is None
     assert publish.await_args.kwargs["full_address_artifact_rebuild"] is True
     assert publish.await_args.kwargs["publish_corroboration"] is True
     assert {
