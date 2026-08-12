@@ -14617,23 +14617,33 @@ def _provider_directory_artifact_dataset_selection_sql(
     """Select one immutable dataset per endpoint with explicit fallback rules."""
     source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
     dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
+    selection_dataset_ref = "artifact_dataset_scope" if source_ids else dataset_ref
     selection_sql = (
-        _artifact_dataset_explicit_selection_sql(dataset_ref, source_ref)
+        _artifact_dataset_explicit_selection_sql(selection_dataset_ref, source_ref)
         if source_ids
         else _artifact_dataset_all_source_selection_sql(
             dataset_ref,
             source_ref,
         )
     )
+    endpoint_scope_sql = (
+        _artifact_dataset_explicit_endpoint_scope_ctes(
+            dataset_ref,
+            source_ref,
+            include_validated_candidates=should_select_validated_candidates,
+        )
+        if source_ids
+        else ""
+    )
     options_sql = _artifact_dataset_options_cte(
-        dataset_ref,
+        selection_dataset_ref,
         source_ref,
         project_artifact_fields=True,
     )
     ranking_sql = _artifact_dataset_ranking_cte()
     projection_sql = _artifact_dataset_projection_sql()
     return f"""
-        WITH {options_sql}, {ranking_sql}, {selection_sql}
+        WITH {endpoint_scope_sql}{options_sql}, {ranking_sql}, {selection_sql}
         {projection_sql}
     """
 
@@ -16397,6 +16407,68 @@ def _artifact_dataset_option_projection_parts(
           ) AS publication
         """,
     )
+
+
+def _artifact_dataset_explicit_endpoint_scope_ctes(
+    dataset_ref: str, source_ref: str, *,
+    include_validated_candidates: bool,
+) -> str:
+    """Resolve the endpoint superset before evaluating stored proof payloads."""
+
+    candidate_cte = ""
+    candidate_scope = ""
+    if include_validated_candidates:
+        candidate_cte = f"""
+        validated_candidate_aliases AS MATERIALIZED (
+            SELECT dataset.endpoint_id,
+                   COALESCE(
+                       dataset.publication_metadata_json::jsonb -> 'source_ids',
+                       '[]'::jsonb
+                   ) AS publication_source_ids
+              FROM {dataset_ref} AS dataset
+             WHERE dataset.is_current = false
+               AND dataset.status = :validated_status
+               AND dataset.superseded_at IS NULL
+        ),
+        """
+        candidate_scope = """
+            UNION
+            SELECT candidate.endpoint_id
+              FROM validated_candidate_aliases AS candidate
+              JOIN requested_source_scope AS requested
+                ON candidate.publication_source_ids
+                       @> jsonb_build_array(requested.source_id)
+        """
+    return f"""
+        requested_source_scope AS MATERIALIZED (
+            SELECT source.source_id,
+                   source.endpoint_id AS serving_endpoint_id,
+                   NULLIF(
+                       source.metadata_json::jsonb
+                           ->> '{PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY}',
+                       ''
+                   ) AS configured_endpoint_id
+              FROM {source_ref} AS source
+             WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
+        ),
+        {candidate_cte}artifact_endpoint_scope AS MATERIALIZED (
+            SELECT requested.serving_endpoint_id AS endpoint_id
+              FROM requested_source_scope AS requested
+             WHERE requested.serving_endpoint_id IS NOT NULL
+            UNION
+            SELECT requested.configured_endpoint_id
+              FROM requested_source_scope AS requested
+             WHERE requested.configured_endpoint_id IS NOT NULL
+            {candidate_scope}
+        ),
+        artifact_dataset_scope AS MATERIALIZED (
+            SELECT dataset.*
+              FROM {dataset_ref} AS dataset
+             WHERE dataset.endpoint_id = ANY(
+                       ARRAY(SELECT endpoint_id FROM artifact_endpoint_scope)
+                   )
+        ),
+        """
 
 
 def _artifact_dataset_options_cte(

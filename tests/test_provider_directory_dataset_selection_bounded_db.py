@@ -198,6 +198,58 @@ async def _all_source_projected_rows(database) -> list[dict[str, object]]:
     return [dict(database_row._mapping) for database_row in projected_rows]
 
 
+async def _install_unrelated_metadata_evaluation_sentinel(database, schema: str) -> None:
+    """Fail if exact-source selection evaluates an unrelated metadata row."""
+
+    await database.status(
+        f"INSERT INTO {schema}.provider_directory_api_endpoint (endpoint_id) "
+        "VALUES ('endpoint_unrelated');"
+    )
+    await database.status(
+        f"INSERT INTO {schema}.provider_directory_endpoint_dataset ("
+        "dataset_id, endpoint_id, import_run_id, acquisition_root_run_id, "
+        "dataset_hash, status, is_current, resource_count, published_at, "
+        "publication_metadata_json"
+        ") VALUES ("
+        "'dataset_unrelated', 'endpoint_unrelated', 'run-unrelated', "
+        "'root-unrelated', :dataset_hash, :published_status, true, 0, now(), "
+        "CAST(:metadata AS json)"
+        ");",
+        dataset_hash="b" * 64,
+        published_status=importer.ENDPOINT_DATASET_PUBLISHED,
+        metadata=json.dumps({"reject_if_evaluated": True, "selected_resources": []}),
+    )
+    await database.status(
+        f"""
+        CREATE FUNCTION {schema}.reject_unrelated_metadata(endpoint_id varchar, candidate json)
+        RETURNS json LANGUAGE plpgsql VOLATILE STRICT
+        AS $function$
+        BEGIN
+            IF endpoint_id = 'endpoint_unrelated' THEN RAISE EXCEPTION
+                'unrelated_metadata_evaluated'; END IF;
+            RETURN candidate;
+        END;
+        $function$;
+        """
+    )
+    await database.status(
+        f"ALTER TABLE {schema}.provider_directory_endpoint_dataset "
+        "RENAME TO provider_directory_endpoint_dataset_storage;"
+    )
+    await database.status(
+        f"ALTER TABLE {schema}.provider_directory_endpoint_dataset_storage "
+        "RENAME COLUMN publication_metadata_json TO stored_publication_metadata_json;"
+    )
+    await database.status(
+        f"CREATE VIEW {schema}.provider_directory_endpoint_dataset AS "
+        "SELECT stored.*, "
+        f"{schema}.reject_unrelated_metadata("
+        "stored.endpoint_id, stored.stored_publication_metadata_json) "
+        "AS publication_metadata_json "
+        f"FROM {schema}.provider_directory_endpoint_dataset_storage AS stored;"
+    )
+
+
 def _replace_with_legacy_contract(proof_by_field: dict[str, object]) -> None:
     """Make a sealed proof disagree with its semantic parent contract."""
 
@@ -320,6 +372,23 @@ async def test_all_source_projection_keeps_large_proof_server_side(monkeypatch):
         ]
         assert max(projected_byte_count_list) < 8_192
         assert sum(projected_byte_count_list) < 16_384
+
+
+@pytest.mark.asyncio
+async def test_explicit_selection_does_not_evaluate_unrelated_metadata(monkeypatch):
+    """Scope endpoints before hashing or validating stored proof metadata."""
+
+    async with _dataset_database(monkeypatch) as (database, schema):
+        await _install_unrelated_metadata_evaluation_sentinel(database, schema)
+
+        fence = await importer._resolve_provider_directory_artifact_datasets(
+            ["source_primary"]
+        )
+
+        assert fence.source_ids == ["source_primary"]
+        assert [dataset.dataset_id for dataset in fence.datasets] == [
+            "dataset_shared"
+        ]
 
 
 @pytest.mark.asyncio
