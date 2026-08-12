@@ -36,6 +36,14 @@ ENDPOINT_DATASET_FORWARD_COMPATIBLE_COLUMNS = (
     "completion_proof_json",
     "completion_proof_sha256",
 )
+ENDPOINT_DATASET_ADMISSION_COLUMNS = (
+    "publication_metadata_summary_json",
+    "publication_metadata_sha256",
+    "content_proof_admission_version",
+    "content_proof_admission_kind",
+    "content_proof_admission_sha256",
+    "content_proof_resource_types",
+)
 
 
 def _schema() -> str:
@@ -69,11 +77,20 @@ def _endpoint_dataset_schema_fence_sql(schema: str) -> str:
         + ENDPOINT_DATASET_IMMUTABLE_COLUMNS
         + ENDPOINT_DATASET_FORWARD_COMPATIBLE_COLUMNS
     )
+    expected_admission_columns = sorted(
+        ENDPOINT_DATASET_MUTABLE_COLUMNS
+        + ENDPOINT_DATASET_IMMUTABLE_COLUMNS
+        + ENDPOINT_DATASET_FORWARD_COMPATIBLE_COLUMNS
+        + ENDPOINT_DATASET_ADMISSION_COLUMNS
+    )
     legacy_array = ", ".join(
         f"'{column}'" for column in expected_legacy_columns
     )
     current_array = ", ".join(
         f"'{column}'" for column in expected_current_columns
+    )
+    admission_array = ", ".join(
+        f"'{column}'" for column in expected_admission_columns
     )
     dataset_ref = _qf(schema, "provider_directory_endpoint_dataset")
     return f"""
@@ -89,7 +106,9 @@ def _endpoint_dataset_schema_fence_sql(schema: str) -> str:
            AND NOT attribute.attisdropped;
         IF observed_columns IS DISTINCT FROM ARRAY[{legacy_array}]::text[]
            AND observed_columns IS DISTINCT FROM
-                ARRAY[{current_array}]::text[] THEN
+                ARRAY[{current_array}]::text[]
+           AND observed_columns IS DISTINCT FROM
+                ARRAY[{admission_array}]::text[] THEN
             RAISE EXCEPTION
                 'provider_directory_endpoint_dataset_guard_schema_changed'
                 USING ERRCODE = '55000';

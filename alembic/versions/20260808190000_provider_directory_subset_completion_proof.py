@@ -165,6 +165,14 @@ _SUBSET_ENDPOINT_DATASET_COLUMNS = _LEGACY_ENDPOINT_DATASET_COLUMNS + (
     "completion_proof_json",
     "completion_proof_sha256",
 )
+_ADMISSION_ENDPOINT_DATASET_COLUMNS = _SUBSET_ENDPOINT_DATASET_COLUMNS + (
+    "publication_metadata_summary_json",
+    "publication_metadata_sha256",
+    "content_proof_admission_version",
+    "content_proof_admission_kind",
+    "content_proof_admission_sha256",
+    "content_proof_resource_types",
+)
 _LEGACY_DATASET_RESOURCE_COLUMNS = (
     "dataset_id",
     "resource_type",
@@ -228,15 +236,18 @@ def _relation_schema_fence_sql(
     expected_array = ", ".join(
         _ql(column) for column in sorted(expected_columns)
     )
-    compatible_clause = ""
+    compatible_shapes = []
     if compatible_columns is not None:
-        compatible_array = ", ".join(
-            _ql(column) for column in sorted(compatible_columns)
-        )
-        compatible_clause = (
-            "\n           AND observed_columns IS DISTINCT FROM "
-            f"ARRAY[{compatible_array}]::text[]"
-        )
+        compatible_shapes.append(compatible_columns)
+    if relation == _ENDPOINT_DATASET:
+        compatible_shapes.append(_ADMISSION_ENDPOINT_DATASET_COLUMNS)
+    compatible_clause = "".join(
+        "\n           AND observed_columns IS DISTINCT FROM "
+        "ARRAY["
+        + ", ".join(_ql(column) for column in sorted(column_names))
+        + "]::text[]"
+        for column_names in compatible_shapes
+    )
     return f"""
     DO $migration$
     DECLARE

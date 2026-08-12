@@ -32,16 +32,18 @@ def test_upgrade_is_nullable_bounded_and_application_trusted(monkeypatch) -> Non
     assert migration.down_revision == (
         "20260811140000_ptg_v12_provider_publication_merge"
     )
-    assert len(statements) == 41
+    assert len(statements) == 43
     for column_name in migration._SEAL_COLUMNS:
-        assert f"ADD COLUMN {column_name}" in sql
-    assert "ADD COLUMN publication_metadata_summary_json jsonb" in sql
-    assert "ADD COLUMN content_proof_resource_types varchar(64)[]" in sql
+        assert f"ADD COLUMN IF NOT EXISTS {column_name}" in sql
+    assert "ADD COLUMN IF NOT EXISTS publication_metadata_summary_json jsonb" in sql
+    assert "ADD COLUMN IF NOT EXISTS content_proof_resource_types varchar(64)[]" in sql
     add_columns_statement = next(
         statement for statement in statements
-        if "ADD COLUMN publication_metadata_summary_json" in statement
+        if "ADD COLUMN IF NOT EXISTS publication_metadata_summary_json" in statement
     )
     assert "NOT NULL" not in add_columns_statement
+    assert "provider_directory_endpoint_dataset_admission_column_shape_invalid" in sql
+    assert "provider_directory_endpoint_dataset_admission_adoption_data_invalid" in sql
     assert "provider_directory_subset_payload_sha256" in sql
     assert "ptg_wave_canonical_json_ascii_v1" not in sql
     assert "provider-directory-admission-seal-v1" in sql

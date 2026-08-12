@@ -318,12 +318,79 @@ def _add_columns_sql(schema: str) -> str:
     table = _qf(schema, _TABLE)
     return f"""
     ALTER TABLE {table}
-        ADD COLUMN publication_metadata_summary_json jsonb,
-        ADD COLUMN publication_metadata_sha256 varchar(64),
-        ADD COLUMN content_proof_admission_version smallint,
-        ADD COLUMN content_proof_admission_kind varchar(32),
-        ADD COLUMN content_proof_admission_sha256 varchar(64),
-        ADD COLUMN content_proof_resource_types varchar(64)[];
+        ADD COLUMN IF NOT EXISTS publication_metadata_summary_json jsonb,
+        ADD COLUMN IF NOT EXISTS publication_metadata_sha256 varchar(64),
+        ADD COLUMN IF NOT EXISTS content_proof_admission_version smallint,
+        ADD COLUMN IF NOT EXISTS content_proof_admission_kind varchar(32),
+        ADD COLUMN IF NOT EXISTS content_proof_admission_sha256 varchar(64),
+        ADD COLUMN IF NOT EXISTS content_proof_resource_types varchar(64)[];
+    """
+
+
+def _seal_column_shape_fence_sql(schema: str) -> str:
+    table = _qf(schema, _TABLE)
+    expected_rows = ",\n                ".join(
+        f"({_ql(column_name)}, {_ql(column_type)})"
+        for column_name, column_type in (
+            ("publication_metadata_summary_json", "jsonb"),
+            ("publication_metadata_sha256", "character varying(64)"),
+            ("content_proof_admission_version", "smallint"),
+            ("content_proof_admission_kind", "character varying(32)"),
+            ("content_proof_admission_sha256", "character varying(64)"),
+            ("content_proof_resource_types", "character varying(64)[]"),
+        )
+    )
+    return f"""
+    DO $migration$
+    DECLARE
+        invalid_columns bigint;
+    BEGIN
+        SELECT pg_catalog.count(*)
+          INTO invalid_columns
+          FROM (VALUES
+                {expected_rows}
+          ) AS expected(column_name, column_type)
+          LEFT JOIN pg_catalog.pg_attribute AS attribute
+            ON attribute.attrelid = {_ql(table)}::regclass
+           AND attribute.attname = expected.column_name
+           AND attribute.attnum > 0
+           AND NOT attribute.attisdropped
+          LEFT JOIN pg_catalog.pg_attrdef AS column_default
+            ON column_default.adrelid = attribute.attrelid
+           AND column_default.adnum = attribute.attnum
+         WHERE attribute.attname IS NULL
+            OR pg_catalog.format_type(
+                   attribute.atttypid,
+                   attribute.atttypmod
+               ) IS DISTINCT FROM expected.column_type
+            OR attribute.attnotnull
+            OR column_default.oid IS NOT NULL;
+        IF invalid_columns <> 0 THEN
+            RAISE EXCEPTION
+                'provider_directory_endpoint_dataset_admission_column_shape_invalid'
+                USING ERRCODE = '55000';
+        END IF;
+    END;
+    $migration$;
+    """
+
+
+def _adopted_receipt_data_fence_sql(schema: str) -> str:
+    table = _qf(schema, _TABLE)
+    populated = " OR ".join(
+        f"dataset.{_q(column_name)} IS NOT NULL"
+        for column_name in _SEAL_COLUMNS
+    )
+    return f"""
+    DO $migration$
+    BEGIN
+        IF EXISTS (SELECT 1 FROM {table} AS dataset WHERE {populated}) THEN
+            RAISE EXCEPTION
+                'provider_directory_endpoint_dataset_admission_adoption_data_invalid'
+                USING ERRCODE = '55000';
+        END IF;
+    END;
+    $migration$;
     """
 
 
@@ -734,6 +801,8 @@ def upgrade() -> None:
     op.execute(_runtime_fence_sql(schema))
     op.execute(_legacy_surface_fence_sql(schema, scoped=False))
     op.execute(_add_columns_sql(schema))
+    op.execute(_seal_column_shape_fence_sql(schema))
+    op.execute(_adopted_receipt_data_fence_sql(schema))
     op.execute(_digest_function_sql(schema))
     op.execute(_guard_function_sql(schema))
     op.execute(_truncate_function_sql(schema))

@@ -62,6 +62,40 @@ async def _install_and_verify_upgrade(
     await _assert_receipt_only_update_is_scoped(connection, schema)
 
 
+async def _assert_precreated_column_adoption(
+    connection,
+    schema: str,
+    migration,
+    proof_migration,
+) -> None:
+    """Adopt exact nullable ORM columns and reject preexisting receipt data."""
+
+    table = f'"{schema}".provider_directory_endpoint_dataset'
+    await connection.execute(f'CREATE SCHEMA "{schema}"')
+    await _install_legacy_dataset_surface(connection, schema, migration)
+    await connection.execute(proof_migration._payload_canonical_json_function_sql(schema))
+    await connection.execute(proof_migration._payload_sha256_function_sql(schema))
+    await connection.execute(migration._add_columns_sql(schema))
+    await _run_migration(migration, "upgrade", connection)
+    await _assert_catalog_contract(connection, schema)
+    await connection.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+    await connection.execute(f'CREATE SCHEMA "{schema}"')
+    await _install_legacy_dataset_surface(connection, schema, migration)
+    await connection.execute(proof_migration._payload_canonical_json_function_sql(schema))
+    await connection.execute(proof_migration._payload_sha256_function_sql(schema))
+    await connection.execute(migration._add_columns_sql(schema))
+    await connection.execute(
+        f"INSERT INTO {table} (dataset_id, publication_metadata_summary_json) "
+        "VALUES ('dataset_presealed', '{}'::jsonb)"
+    )
+    with pytest.raises(
+        asyncpg.PostgresError,
+        match="provider_directory_endpoint_dataset_admission_adoption_data_invalid",
+    ):
+        await _run_migration(migration, "upgrade", connection)
+
+
 async def _assert_digest_and_sealed_mutations(connection, schema: str) -> None:
     """Verify digest parity, insert one seal, and exercise immutable guards."""
 
@@ -160,6 +194,20 @@ async def run_postgres_contract(monkeypatch) -> None:
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     monkeypatch.delenv("DB_SCHEMA", raising=False)
     try:
+        adoption_schema = schema + "_adopted"
+        monkeypatch.setenv("HLTHPRT_DB_SCHEMA", adoption_schema)
+        try:
+            await _assert_precreated_column_adoption(
+                connection,
+                adoption_schema,
+                migration,
+                proof_migration,
+            )
+        finally:
+            await connection.execute(
+                f'DROP SCHEMA IF EXISTS "{adoption_schema}" CASCADE'
+            )
+            monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
         await _install_and_verify_upgrade(
             connection, schema, migration, proof_migration
         )

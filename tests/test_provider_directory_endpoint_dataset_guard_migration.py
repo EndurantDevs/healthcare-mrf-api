@@ -100,7 +100,15 @@ def test_guard_column_contract_matches_the_endpoint_dataset_model(monkeypatch):
         "completion_proof_json",
         "completion_proof_sha256",
     }
-    assert normalized_sql.count("observed_columns IS DISTINCT FROM") == 2
+    assert set(migration.ENDPOINT_DATASET_ADMISSION_COLUMNS) == {
+        "publication_metadata_summary_json",
+        "publication_metadata_sha256",
+        "content_proof_admission_version",
+        "content_proof_admission_kind",
+        "content_proof_admission_sha256",
+        "content_proof_resource_types",
+    }
+    assert normalized_sql.count("observed_columns IS DISTINCT FROM") == 3
     assert "provider_directory_endpoint_dataset_guard_schema_changed" in (
         normalized_sql
     )
