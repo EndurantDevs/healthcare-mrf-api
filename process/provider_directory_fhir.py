@@ -1420,6 +1420,7 @@ CURRENT_VERSION_CENSUS_RETRY_WAIT_TARGETS_SECONDS = (300.0, 899.0)
 CURRENT_VERSION_CENSUS_RETRY_WAIT_BUDGET_SECONDS = 900.0
 CURRENT_VERSION_CENSUS_RETRY_AFTER_MAX_SECONDS = 600.0
 REST_PAGINATION_COOLDOWN_RETRY_CAP = 2
+REST_PAGINATION_COOLDOWN_FALLBACK_SECONDS = 1.0
 MOLINA_QUOTA_RESET_GRACE_SECONDS = 60
 MOLINA_QUOTA_DURATION_PATTERN = re.compile(
     r"\breplenished\s+in\s+(\d{1,3}):(\d{2}):(\d{2})\b",
@@ -43977,6 +43978,7 @@ def _transient_source_retry_not_before(
     *,
     retry_count: int,
     max_delay_seconds: float | None = 600.0,
+    fallback_seconds: float = SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS,
     now_utc: datetime.datetime | None = None,
 ) -> str | None:
     """Return a generic defer time after a terminal transient fetch."""
@@ -43995,7 +43997,7 @@ def _transient_source_retry_not_before(
         retry_after_seconds
         if retry_after_seconds is not None
         else max(
-            SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS,
+            fallback_seconds,
             _source_fetch_retry_delay_seconds(retry_count),
         )
     )
@@ -44551,7 +44553,7 @@ def _rest_pagination_cooldown_delay_seconds(
     retry_after_seconds = _source_retry_after_seconds(fhir_payload)
     if retry_after_seconds is not None:
         return retry_after_seconds
-    return float(SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS)
+    return REST_PAGINATION_COOLDOWN_FALLBACK_SECONDS
 
 
 async def _retry_rest_pagination_after_cooldown(
@@ -57437,6 +57439,11 @@ async def _fetch_resource_rows(
                     retry_count=int((fetch_diagnostic or {}).get("retry_count") or 0),
                     max_delay_seconds=(
                         None if is_current_version_census_enabled else 600.0
+                    ),
+                    fallback_seconds=(
+                        REST_PAGINATION_COOLDOWN_FALLBACK_SECONDS
+                        if is_pagination_cooldown_exhausted
+                        else SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS
                     ),
                 ) or checkpoint_non_bundle_retry_at
                 current_error = error or f"http_{status_code}"

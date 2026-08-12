@@ -8308,6 +8308,14 @@ def test_terminal_transient_response_uses_bounded_fallback(status_code):
         retry_count=2,
         now_utc=current_time,
     ) == "2026-07-12T12:05:00Z"
+    assert importer._transient_source_retry_not_before(
+        status_code,
+        {"diagnostics": "private-response"},
+        None,
+        retry_count=2,
+        fallback_seconds=1.0,
+        now_utc=current_time,
+    ) == "2026-07-12T12:00:01Z"
 
 
 @pytest.mark.asyncio
@@ -25309,7 +25317,16 @@ async def test_checkpoint_page_423_cooldown_retries_exact_url_and_recovers(monke
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_transport_timeout_uses_300_second_cooldown(monkeypatch):
+@pytest.mark.parametrize(
+    ("status_code", "fhir_payload", "fetch_error"),
+    [(423, {}, None), (None, None, "TimeoutError: timed out")],
+)
+async def test_checkpoint_cooldown_fallback_uses_one_second(
+    monkeypatch,
+    status_code,
+    fhir_payload,
+    fetch_error,
+):
     checkpoint_url = "https://payer.example/fhir/Location?_getpages=timeout-token"
     fetch_source_json = AsyncMock(
         return_value=(200, {"resourceType": "Bundle", "entry": []}, None, 5)
@@ -25321,16 +25338,16 @@ async def test_checkpoint_transport_timeout_uses_300_second_cooldown(monkeypatch
     cooldown_result = await importer._retry_rest_pagination_after_cooldown(
         {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
         checkpoint_url,
-        (None, None, "TimeoutError: timed out", 9),
+        (status_code, fhir_payload, fetch_error, 9),
         timeout=3,
         deadline_at=None,
     )
 
     assert cooldown_result.fetch_result[0] == 200
     assert cooldown_result.retries == 1
-    assert cooldown_result.wait_seconds == 300.0
+    assert cooldown_result.wait_seconds == 1.0
     assert cooldown_result.recovered is True
-    sleep_mock.assert_awaited_once_with(300.0)
+    sleep_mock.assert_awaited_once_with(1.0)
     fetch_source_json.assert_awaited_once_with(
         {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
         checkpoint_url,
@@ -25377,7 +25394,7 @@ async def test_checkpoint_423_cooldown_exhaustion_preserves_resume_checkpoint(
         f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?"
         "_getpages=locked-token&_count=100"
     )
-    locked_response = (423, {importer.SOURCE_RETRY_AFTER_FIELD: "1"}, None, 5)
+    locked_response = (423, {}, None, 5)
     responses = [locked_response] * 3
     request_urls, saved_checkpoints, load_checkpoint, fetch_source_json, save_checkpoint = (
         _cooldown_checkpoint_callbacks(resume_url, responses)
@@ -25397,6 +25414,12 @@ async def test_checkpoint_423_cooldown_exhaustion_preserves_resume_checkpoint(
         clear_checkpoint,
     )
     monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
+    transient_retry_not_before = Mock(return_value="2026-07-12T12:00:01Z")
+    monkeypatch.setattr(
+        importer,
+        "_transient_source_retry_not_before",
+        transient_retry_not_before,
+    )
 
     fetch_result = await _fetch_checkpointed_cigna_practitioners()
 
@@ -25409,8 +25432,10 @@ async def test_checkpoint_423_cooldown_exhaustion_preserves_resume_checkpoint(
     assert fetch_result.pagination_cooldown_retries == 2
     assert fetch_result.pagination_cooldown_wait_seconds == 2.0
     assert fetch_result.is_pagination_cooldown_exhausted is True
+    assert fetch_result.retry_not_before == "2026-07-12T12:00:01Z"
     assert request_urls == [resume_url, resume_url, resume_url]
     assert [call.args[0] for call in sleep_mock.await_args_list] == [1.0, 1.0]
+    assert transient_retry_not_before.call_args.kwargs["fallback_seconds"] == 1.0
     assert saved_checkpoints == []
     clear_checkpoint.assert_not_awaited()
 
