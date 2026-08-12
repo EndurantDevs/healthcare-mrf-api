@@ -327,56 +327,48 @@ async def test_all_source_projection_keeps_large_proof_server_side(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_catalog_candidate_does_not_evaluate_unrelated_large_proof(
-    monkeypatch,
-):
-    """Keep the targeted catalog lookup out of unrelated dataset proofs."""
-
+async def test_catalog_candidate_does_not_evaluate_unrelated_large_proof(monkeypatch):
+    """Skip unrelated proof work for one targeted catalog lookup."""
     async with _dataset_database(monkeypatch) as (database, schema):
         await _insert_validated_shared_dataset(database, schema)
         metadata_by_field = _large_metadata_by_field()
         metadata_by_field["source_ids"] = ["source_unrelated"]
         metadata_by_field["unrelated_probe"] = True
         await database.status(
-            f"ALTER FUNCTION {schema}.provider_directory_subset_payload_sha256(jsonb) "
-            "RENAME TO provider_directory_subset_payload_sha256_original;"
+            f"ALTER FUNCTION {schema}.provider_directory_subset_payload_sha256"
+            "(jsonb) RENAME TO provider_directory_subset_payload_sha256_original;"
         )
         await database.status(
             f"""
-            CREATE FUNCTION {schema}.provider_directory_subset_payload_sha256(
-                candidate jsonb
-            ) RETURNS text
-            LANGUAGE plpgsql
+            CREATE FUNCTION {schema}.provider_directory_subset_payload_sha256(candidate jsonb)
+            RETURNS text LANGUAGE plpgsql
             AS $function$
             BEGIN
                 IF candidate ? 'unrelated_probe' THEN
                     RAISE EXCEPTION 'unrelated_provider_directory_dataset_evaluated';
                 END IF;
-                RETURN {schema}.provider_directory_subset_payload_sha256_original(
-                    candidate
-                );
+                RETURN {schema}.provider_directory_subset_payload_sha256_original(candidate);
             END;
             $function$;
             """
         )
         await database.status(
-            f"INSERT INTO {schema}.provider_directory_api_endpoint "
-            "(endpoint_id) VALUES ('endpoint_unrelated');"
+            f"INSERT INTO {schema}.provider_directory_api_endpoint (endpoint_id) "
+            "VALUES ('endpoint_unrelated');"
         )
         await database.status(
             f"""
             INSERT INTO {schema}.provider_directory_endpoint_dataset (
-                dataset_id, endpoint_id, import_run_id,
-                acquisition_root_run_id, dataset_hash, status, is_current,
-                resource_count, validated_at, published_at,
-                publication_metadata_json
+                dataset_id, endpoint_id, import_run_id, acquisition_root_run_id,
+                dataset_hash, status, is_current, resource_count, validated_at,
+                published_at, publication_metadata_json
             ) VALUES (
-                'dataset_unrelated', 'endpoint_unrelated', 'run-unrelated',
-                'root-unrelated', repeat('9', 64), :published_status, true,
-                1, NULL, now(), CAST(:metadata AS json)
+                'dataset_unrelated', 'endpoint_unrelated', 'run-unrelated', 'root-unrelated',
+                repeat('9', 64), :published_status, true, 1, NULL, now(),
+                CAST(:metadata AS json)
             ), (
-                'dataset_unrelated_candidate', 'endpoint_unrelated',
-                'run-unrelated-candidate', 'root-unrelated-candidate',
+                'dataset_unrelated_candidate', 'endpoint_unrelated', 'run-unrelated-candidate',
+                'root-unrelated-candidate',
                 repeat('8', 64), :validated_status, false, 1, now(), NULL,
                 CAST(:metadata AS json)
             );
@@ -385,27 +377,16 @@ async def test_catalog_candidate_does_not_evaluate_unrelated_large_proof(
             validated_status=importer.ENDPOINT_DATASET_VALIDATED,
             metadata=json.dumps(metadata_by_field),
         )
-
-        selection_sql = (
-            importer._provider_directory_artifact_dataset_selection_sql(
-                ["source_primary"],
-                should_select_validated_candidates=True,
-            )
+        selection_sql = importer._provider_directory_artifact_dataset_selection_sql(
+            ["source_primary"], should_select_validated_candidates=True
         )
         assert "artifact_scoped_datasets AS MATERIALIZED" in selection_sql
-        assert selection_sql.count(
-            "FROM artifact_scoped_datasets AS dataset"
-        ) == 2
+        assert selection_sql.count("FROM artifact_scoped_datasets AS dataset") == 2
 
-        selected_by_source_id = (
-            await _canonical_validated_datasets_by_source_id(
-                ["source_primary"]
-            )
+        selected_by_source_id = await _canonical_validated_datasets_by_source_id(
+            ["source_primary"]
         )
-
-        assert selected_by_source_id["source_primary"].dataset_id == (
-            "dataset_candidate"
-        )
+        assert selected_by_source_id["source_primary"].dataset_id == "dataset_candidate"
 
 
 @pytest.mark.asyncio

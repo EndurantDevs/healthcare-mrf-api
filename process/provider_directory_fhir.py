@@ -16469,29 +16469,17 @@ def _artifact_dataset_options_cte(
     """Select only current or admitted candidate rows with bounded output."""
     if scope_endpoint_ids and scope_artifact_endpoints:
         raise ValueError("provider_directory_artifact_endpoint_scope_ambiguous")
-    dataset_source = (
-        "artifact_scoped_datasets" if scope_artifact_endpoints else dataset_ref
-    )
+    dataset_source = "artifact_scoped_datasets" if scope_artifact_endpoints else dataset_ref
     validated_candidate_gate = (
         _artifact_reviewed_candidate_eligibility_sql(dataset_ref, source_ref)
-        if source_ref
-        else "true"
+        if source_ref else "true"
     )
     endpoint_scope = ""
     if scope_endpoint_ids:
-        endpoint_scope = (
-            "dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))\n"
-            "           AND "
-        )
+        endpoint_scope = "dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))\n           AND "
     elif scope_artifact_endpoints:
-        endpoint_scope = (
-            "dataset.endpoint_id IN "
-            "(SELECT endpoint_id FROM artifact_endpoint_scope)\n"
-            "           AND "
-        )
-    option_projection, publication_lateral = (
-        _artifact_dataset_option_projection_parts(project_artifact_fields)
-    )
+        endpoint_scope = "dataset.endpoint_id IN (SELECT endpoint_id FROM artifact_endpoint_scope)\n           AND "
+    option_projection, publication_lateral = _artifact_dataset_option_projection_parts(project_artifact_fields)
     return f"""
         dataset_options AS MATERIALIZED (
         SELECT {option_projection},
