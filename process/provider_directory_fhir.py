@@ -14631,6 +14631,7 @@ def _provider_directory_artifact_dataset_selection_sql(
         source_ref,
         scope_requested_endpoint_ids=is_explicit_selection,
         project_artifact_fields=True,
+        include_validated_candidates=should_select_validated_candidates,
     )
     ranking_sql = _artifact_dataset_ranking_cte()
     projection_sql = _artifact_dataset_projection_sql()
@@ -16434,13 +16435,20 @@ def _artifact_dataset_options_cte(
     *,
     scope_endpoint_ids: bool = False,
     scope_requested_endpoint_ids: bool = False,
-    project_artifact_fields: bool = False,
+    project_artifact_fields: bool = False, include_validated_candidates: bool = True,
 ) -> str:
-    """Select only current or admitted candidate rows with bounded output."""
-    validated_candidate_gate = (
-        _artifact_reviewed_candidate_eligibility_sql(dataset_ref, source_ref)
-        if source_ref
-        else "true"
+    """Select current rows and, when requested, admitted candidates."""
+    validated_candidate_clause = (
+        f""" OR (
+                    dataset.is_current = false
+                AND dataset.status = :validated_status
+                AND dataset.superseded_at IS NULL
+                AND {(
+                    _artifact_reviewed_candidate_eligibility_sql(
+                        dataset_ref, source_ref
+                    ) if source_ref else "true"
+                )}
+            )""" if include_validated_candidates else ""
     )
     endpoint_scope = _artifact_dataset_endpoint_scope_sql(
         scope_endpoint_ids=scope_endpoint_ids,
@@ -16477,12 +16485,7 @@ def _artifact_dataset_options_cte(
                     dataset.is_current = true
                 AND dataset.status = :published_status
                 AND dataset.superseded_at IS NULL
-            ) OR (
-                    dataset.is_current = false
-                AND dataset.status = :validated_status
-                AND dataset.superseded_at IS NULL
-                AND {validated_candidate_gate}
-            )
+            ){validated_candidate_clause}
          )
         )
     """

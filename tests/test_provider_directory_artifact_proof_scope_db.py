@@ -119,7 +119,10 @@ async def _selected_rows(
     select_validated_candidates: bool = False,
 ) -> list[tuple[str, str, str]]:
     rows = await database.all(
-        importer._provider_directory_artifact_dataset_selection_sql(None),
+        importer._provider_directory_artifact_dataset_selection_sql(
+            None,
+            should_select_validated_candidates=select_validated_candidates,
+        ),
         published_status=importer.ENDPOINT_DATASET_PUBLISHED,
         validated_status=importer.ENDPOINT_DATASET_VALIDATED,
         select_validated_candidates=select_validated_candidates,

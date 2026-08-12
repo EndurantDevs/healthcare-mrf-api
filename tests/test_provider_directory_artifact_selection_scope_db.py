@@ -13,6 +13,10 @@ from tests.test_provider_directory_artifact_eligibility_db import (
     _set_all_source_profiles,
     importer,
 )
+from tests.test_provider_directory_dataset_artifact_db import (
+    _dataset_database,
+    _insert_validated_shared_dataset,
+)
 
 
 async def _insert_endpoint_scope_probe_rows(database, schema: str) -> None:
@@ -149,3 +153,38 @@ async def test_requested_sources_bound_artifact_dataset_scans(monkeypatch):
         }
         plan = explain_entry_list[0]._mapping["QUERY PLAN"][0]["Plan"]
         _assert_bounded_plan(plan)
+
+
+@pytest.mark.asyncio
+async def test_global_current_selection_skips_validated_candidates(monkeypatch):
+    """Do not hash candidates when global selection keeps current data."""
+    async with _dataset_database(monkeypatch) as (database, schema):
+        await _insert_validated_shared_dataset(database, schema)
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset "
+            "SET publication_metadata_json = CAST(publication_metadata_json::jsonb "
+            "|| jsonb_build_object('unselected_candidate_probe', true) AS json) "
+            "WHERE dataset_id = 'dataset_candidate';"
+        )
+        await database.status(
+            f"ALTER FUNCTION {schema}.provider_directory_subset_payload_sha256(jsonb) "
+            "RENAME TO provider_directory_subset_payload_sha256_original;"
+        )
+        await database.status(
+            f"""CREATE FUNCTION {schema}.provider_directory_subset_payload_sha256(candidate jsonb)
+            RETURNS text LANGUAGE plpgsql VOLATILE STRICT AS $function$ BEGIN
+                IF candidate ? 'unselected_candidate_probe' THEN RAISE EXCEPTION
+                    'unselected_validated_candidate_evaluated'; END IF;
+                RETURN {schema}.provider_directory_subset_payload_sha256_original(candidate);
+            END; $function$;"""
+        )
+
+        fence = await importer._resolve_provider_directory_artifact_datasets(
+            None,
+            should_select_validated_candidates=False,
+        )
+
+        assert fence.source_ids == ["source_primary", "source_sibling"]
+        assert {dataset.dataset_id for dataset in fence.datasets} == {
+            "dataset_shared"
+        }
