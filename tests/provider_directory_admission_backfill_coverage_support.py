@@ -21,8 +21,8 @@ backfill = importlib.import_module(
 )
 
 
-def _dataset_row(**overrides):
-    row = {
+def _dataset_by_field(**overrides):
+    dataset_by_field = {
         "status": "validated",
         "completion_proof_required_version": None,
         "completion_resource_hashes": None,
@@ -33,8 +33,8 @@ def _dataset_row(**overrides):
         "resource_count": 1,
         **dict.fromkeys(backfill._SEAL_FIELDS),
     }
-    row.update(overrides)
-    return row
+    dataset_by_field.update(overrides)
+    return dataset_by_field
 
 
 def test_backfill_rejects_invalid_schema_and_partial_seal(monkeypatch):
@@ -44,7 +44,7 @@ def test_backfill_rejects_invalid_schema_and_partial_seal(monkeypatch):
 
     with pytest.raises(AdmissionSealError, match="partial_seal"):
         backfill._existing_seal_result(
-            _dataset_row(publication_metadata_sha256="a" * 64),
+            _dataset_by_field(publication_metadata_sha256="a" * 64),
             "dataset_shared",
         )
 
@@ -59,7 +59,7 @@ def test_backfill_rejects_invalid_schema_and_partial_seal(monkeypatch):
 )
 def test_backfill_rejects_invalid_legacy_rows(overrides, marker):
     with pytest.raises(AdmissionSealError, match=marker):
-        backfill._validated_row_inputs(_dataset_row(**overrides))
+        backfill._validated_row_inputs(_dataset_by_field(**overrides))
 
 
 class _CopyConnection:
