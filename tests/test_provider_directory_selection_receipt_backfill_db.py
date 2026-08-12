@@ -275,6 +275,62 @@ async def test_backfill_rejects_invalid_retained_summary():
         )
 
 
+def test_backfill_rejects_invalid_current_row():
+    with pytest.raises(
+        backfill.ProviderDirectorySelectionReceiptBackfillError,
+        match="dataset_state_invalid",
+    ):
+        backfill._validated_current_row({})
+
+
+def test_backfill_rejects_invalid_receipt_structure():
+    with pytest.raises(
+        backfill.ProviderDirectorySelectionReceiptBackfillError,
+        match="metadata_invalid",
+    ):
+        backfill._validated_receipt({"bounded_publication_metadata_json": {}})
+
+
+@pytest.mark.asyncio
+async def test_backfill_rejects_lost_receipt_update():
+    connection = AsyncMock()
+    connection.execute.return_value = "UPDATE 0"
+    dataset = {
+        "dataset_id": "dataset-synthetic",
+        "row_ctid": "(1,1)",
+        "row_xmin": "1",
+        "endpoint_id": "endpoint-synthetic",
+        "evidence_run_id": "run-synthetic",
+        "previous_dataset_id": None,
+        "dataset_hash": "a" * 64,
+        "resource_count": 1,
+        "status": "published",
+    }
+
+    with pytest.raises(
+        backfill.ProviderDirectorySelectionReceiptBackfillError,
+        match="backfill_lost",
+    ):
+        await backfill._store_receipt(connection, '"mrf"."dataset"', dataset, {})
+
+
+@pytest.mark.asyncio
+async def test_backfill_rejects_missing_dataset():
+    connection = AsyncMock()
+    connection.fetchrow.return_value = None
+
+    with pytest.raises(
+        backfill.ProviderDirectorySelectionReceiptBackfillError,
+        match="dataset_missing",
+    ):
+        await backfill._load_dataset_by_field(
+            connection,
+            '"mrf"."dataset"',
+            "dataset-synthetic",
+            lock=False,
+        )
+
+
 def test_backfill_sql_projects_only_bounded_metadata():
     sql = backfill._dataset_row_sql('"mrf"."dataset"', lock=False)
 
