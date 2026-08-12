@@ -98,6 +98,9 @@ from process.provider_directory_fhir import (
 from process.provider_directory_admission_seal import (
     backfill_provider_directory_admission_seal,
 )
+from process.provider_directory_selection_receipt_backfill import (
+    backfill_provider_directory_selection_receipt,
+)
 from process.provider_directory_fhir_census_contract import (
     acquisition_strategy_values as provider_directory_acquisition_strategy_values,
 )
@@ -1563,6 +1566,38 @@ def provider_directory_admission_backfill(dataset_id: str):
     )
 
 
+@click.command(
+    help="Validate or store one compact Provider Directory selection receipt"
+)
+@click.option(
+    "--dataset-id",
+    required=True,
+    help="Exact current published dataset id to validate.",
+)
+@click.option(
+    "--apply",
+    is_flag=True,
+    help="Store the validated receipt; omitted is read-only.",
+)
+def provider_directory_selection_receipt_backfill(
+    dataset_id: str,
+    apply: bool,
+):
+    """Validate one bounded receipt, then optionally store it."""
+
+    click.echo(
+        json.dumps(
+            _run(
+                backfill_provider_directory_selection_receipt(
+                    dataset_id,
+                    apply=apply,
+                )
+            ),
+            sort_keys=True,
+        )
+    )
+
+
 @click.command(help="Finish provider quality import for a queued run id")
 @click.option("--import-id", required=True, help="Import id/date suffix used for staging tables.")
 @click.option("--run-id", required=True, help="Run id emitted by `start provider-quality`.")
@@ -2061,6 +2096,10 @@ process_group.add_command(provider_directory_fhir, name="provider-directory-fhir
 process_group.add_command(
     provider_directory_admission_backfill,
     name="provider-directory-admission-backfill",
+)
+process_group.add_command(
+    provider_directory_selection_receipt_backfill,
+    name="provider-directory-selection-receipt-backfill",
 )
 process_group.add_command(partd_formulary_network, name="partd-formulary-network")
 process_group.add_command(pharmacy_license, name="pharmacy-license")
