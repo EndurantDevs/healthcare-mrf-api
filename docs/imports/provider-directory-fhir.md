@@ -196,9 +196,10 @@ proof binds continuation query shape and offset geometry, ordered raw acquired
 resource hashes, transport-neutral projected content hashes, and dataset
 counts and hashes without retaining URLs, tokens, or root identifiers. Every
 new campaign uses the immutable one-root policy. One successful exhaustive
-acquisition is sufficient; a failed acquisition is retried through its normal
-checkpoint lineage. Publication stays off until the completion proof and the
-separate artifact review both pass.
+acquisition is sufficient. A failed root is never resumed: follow the
+terminal-disposition procedure below, then start a fresh campaign with a new
+cutoff, campaign identity, and root. Publication stays off until the completion
+proof and the separate artifact review both pass.
 
 Direct database publication and source-catalog mutations use PostgreSQL
 `READ COMMITTED` isolation. The reviewed-subset persistence guards fail closed at other
@@ -225,7 +226,7 @@ any failed root as proof under a different profile; seal it first, then start a
 fresh campaign with a new cutoff, campaign identity, and root.
 
 Resolve the single reviewed manual entry from the manifest and freeze one
-timezone-aware cutoff for the acquisition pair:
+timezone-aware cutoff for the acquisition:
 
 ```bash
 MANUAL_ENTRY_JSON="$(jq -cer \
@@ -273,13 +274,13 @@ python main.py start provider-directory-fhir \
 ```
 
 A successful traversal remains non-current and non-published and becomes the
-sole validated candidate without twin evidence. A transient retry must use a
-new `--run-id` plus
-`--retry-of-run-id <previous-run-id>` and
-`--pagination-root-run-id <original-root-run-id>`; it resumes the original root
-lineage. A terminal HTTP 410 root is abandoned and never retried. Publication,
-Profile admission, and API verification remain separate reviewed operations
-after the acquisition proof passes.
+sole validated candidate without twin evidence. A failed traversal follows the
+terminal-disposition procedure above; recovery starts a fresh campaign with a
+new cutoff, campaign identity, and root. Do not pass `--retry-of-run-id` or
+`--pagination-root-run-id` for this fresh run. A terminal HTTP 410 root is
+abandoned and never retried. Publication, Profile admission, and API
+verification remain separate reviewed operations after the acquisition proof
+passes.
 
 ## Source
 
@@ -552,10 +553,11 @@ policy-two source is rejected before a new endpoint candidate can initialize.
 
 New sources omit legacy twin status or use
 `pending_reviewed_subset_acquisition` with `required_root_count=1`. One
-successful exhaustive acquisition becomes the validated candidate. Failed
-work retries through the same acquisition root and checkpoints; it does not
-create a comparison root. A new generation uses a new campaign ID while old
-immutable proof remains historical evidence. Only an unactivated pending
+successful exhaustive acquisition becomes the validated candidate. Failed work
+is retained as immutable evidence; after terminal disposition, recovery starts
+a fresh campaign with a new cutoff and root. It does not adopt failed-root
+checkpoints or create a comparison root. A new generation uses a new campaign
+ID while old immutable proof remains historical evidence. Only an unactivated
 policy-two generation may be replaced in place by an explicit new policy-one
 campaign; activated and published generations stay immutable.
 
@@ -1169,7 +1171,7 @@ This admits only a fresh, candidate-bound, exact-source lineage with no retry
 parent, one anonymous pinned session, one reviewed start URL, unbounded
 streaming, and no retained in-memory rows. It does not add a source-base
 allowlist and does not enable current-version v2 scans. Use the same setting
-for every fresh root required by the campaign policy. The overlap changes only
+for the campaign's single fresh root. The overlap changes only
 request timing: the next
 validated source-issued GET may run while the current page's rows, proof shard,
 and checkpoint are committed, but it is never parsed or consumed before that

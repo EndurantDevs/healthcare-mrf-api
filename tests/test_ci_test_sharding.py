@@ -131,6 +131,7 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
         "tests/test_provider_directory_subset_completion_postgres.py" in lifecycle_step
     )
     for test_path in (
+        "tests/test_provider_directory_endpoint_dataset_admission_seal_migration_postgres.py",
         "tests/test_provider_directory_terminal_root_retirement_postgres.py",
         "tests/test_provider_directory_terminal_root_retirement_repair_postgres.py",
         "tests/test_provider_directory_terminal_root_retirement_v2_postgres.py",
@@ -138,6 +139,15 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
         "tests/test_provider_directory_reviewed_subset_terminal_window_postgres.py",
     ):
         _assert_single_lifecycle_test(workflow, lifecycle_step, test_path)
+    bounded_selection_step = workflow.split(
+        "      - name: Run bounded Provider Directory selection DB tests\n",
+        1,
+    )[1].split("      - name:", 1)[0]
+    _assert_single_lifecycle_test(
+        workflow,
+        bounded_selection_step,
+        "tests/test_provider_directory_dataset_selection_sealed_db.py",
+    )
     for workflow_line in workflow.splitlines():
         if (
             "python -m pytest" in workflow_line
