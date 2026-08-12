@@ -220,7 +220,7 @@ async def test_global_artifact_scope_is_sealed_proof_bound(monkeypatch):
         await _create_tables(database, schema)
         await _insert_fixture(database, schema)
         proof_sha256 = "a" * 64
-        summary = {
+        summary_by_field = {
             "source_ids": ["source_a"],
             "selected_resources": ["Location"],
             "expected_resources": ["Location"],
@@ -249,7 +249,7 @@ async def test_global_artifact_scope_is_sealed_proof_bound(monkeypatch):
                            ARRAY['Location']::varchar[]
                        );
             """,
-            summary=json.dumps(summary),
+            summary=json.dumps(summary_by_field),
             admission_version=importer.ADMISSION_SEAL_VERSION,
             admission_kind=importer.ADMISSION_KIND_GENERIC,
             proof_sha256=proof_sha256,

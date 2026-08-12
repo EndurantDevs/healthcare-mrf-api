@@ -382,6 +382,63 @@ async def _prove_configured_collision_rejected(scenario) -> None:
     )
 
 
+async def _prove_activation_and_atomic_publication(
+    monkeypatch,
+    scenario,
+    activation_migration,
+    evidence_pairs,
+    activation_database,
+    publication_database,
+) -> None:
+    """Prove migration, activation, rollback, publication, and replay."""
+
+    effective_migration = _load_effective_endpoint_migration()
+    await _split_source_endpoint_identity(scenario, effective_migration)
+    await _install_effective_endpoint_migration(scenario, effective_migration)
+    async with scenario.connection.transaction():
+        await run_subset_migration(
+            _load_root_policy_migration(),
+            "upgrade",
+            scenario.connection,
+        )
+        await install_admission_seal_terminal_predecessors(
+            scenario.connection,
+            scenario.quoted_schema,
+        )
+        await run_subset_migration(
+            load_admission_seal_migration(),
+            "upgrade",
+            scenario.connection,
+        )
+    activation_result = await activation.sync_reviewed_subset_verified_state(
+        database=activation_database
+    )
+    assert activation_result.activated is True
+    assert await _source_endpoint(scenario, "synthetic-source") == (
+        _SERVING_ENDPOINT_ID
+    )
+    assert await is_activation_valid(scenario, activation_migration) is True
+    await _prove_configured_collision_rejected(scenario)
+    await _prove_partial_publication_rejected(scenario)
+    fence = await _artifact_fence(scenario, evidence_pairs)
+    await _promote_with_rollback_probe(
+        monkeypatch,
+        scenario,
+        publication_database,
+        fence,
+    )
+    await _promote_atomically(monkeypatch, publication_database, fence)
+    assert await _source_endpoint(scenario, "synthetic-source") == "endpoint-a"
+    assert await _source_endpoint(
+        scenario, "synthetic-serving-sibling"
+    ) == _SERVING_ENDPOINT_ID
+    assert await is_activation_valid(scenario, activation_migration) is True
+    replay = await activation.sync_reviewed_subset_verified_state(
+        database=activation_database
+    )
+    assert replay.is_already_applied is True
+
+
 async def prove_effective_endpoint_activation_and_publication(monkeypatch):
     """Prove split identity through activation and atomic publication."""
 
@@ -391,58 +448,14 @@ async def prove_effective_endpoint_activation_and_publication(monkeypatch):
     activation_database = _runtime_database()
     publication_database = _runtime_database()
     try:
-        effective_migration = _load_effective_endpoint_migration()
-        await _split_source_endpoint_identity(scenario, effective_migration)
-        await _install_effective_endpoint_migration(
-            scenario,
-            effective_migration,
-        )
-        async with scenario.connection.transaction():
-            await run_subset_migration(
-                _load_root_policy_migration(),
-                "upgrade",
-                scenario.connection,
-            )
-            await install_admission_seal_terminal_predecessors(
-                scenario.connection,
-                scenario.quoted_schema,
-            )
-            await run_subset_migration(
-                load_admission_seal_migration(),
-                "upgrade",
-                scenario.connection,
-            )
-        activation_result = await activation.sync_reviewed_subset_verified_state(
-            database=activation_database
-        )
-        assert activation_result.activated is True
-        assert await _source_endpoint(scenario, "synthetic-source") == (
-            _SERVING_ENDPOINT_ID
-        )
-        assert await is_activation_valid(scenario, activation_migration) is True
-        await _prove_configured_collision_rejected(scenario)
-        await _prove_partial_publication_rejected(scenario)
-        fence = await _artifact_fence(scenario, evidence_pairs)
-        await _promote_with_rollback_probe(
+        await _prove_activation_and_atomic_publication(
             monkeypatch,
             scenario,
+            activation_migration,
+            evidence_pairs,
+            activation_database,
             publication_database,
-            fence,
         )
-        await _promote_atomically(
-            monkeypatch,
-            publication_database,
-            fence,
-        )
-        assert await _source_endpoint(scenario, "synthetic-source") == "endpoint-a"
-        assert await _source_endpoint(
-            scenario, "synthetic-serving-sibling"
-        ) == _SERVING_ENDPOINT_ID
-        assert await is_activation_valid(scenario, activation_migration) is True
-        replay = await activation.sync_reviewed_subset_verified_state(
-            database=activation_database
-        )
-        assert replay.is_already_applied is True
     finally:
         with suppress(Exception):
             await activation_database.disconnect()
