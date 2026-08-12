@@ -228,6 +228,32 @@ async def _assert_v5_seal_and_replay(
     assert await _immutable_fingerprints(scenario) == immutable_before
 
 
+async def _assert_replay_ignores_source_campaign(
+    scenario,
+    database,
+) -> None:
+    """Keep sealed evidence replayable after source campaign rotation."""
+
+    async with scenario.connection.transaction():
+        rotated_campaign = await scenario.connection.fetchval(
+            f"""
+            UPDATE {scenario.quoted_schema}.provider_directory_source
+               SET metadata_json = pg_catalog.jsonb_set(
+                       metadata_json::jsonb,
+                       '{{provider_directory_verification_campaign_id}}',
+                       pg_catalog.to_jsonb($1::text),
+                       false
+                   )
+             WHERE source_id = 'source-a'
+         RETURNING metadata_json::jsonb
+                       ->> 'provider_directory_verification_campaign_id'
+            """,
+            "synthetic-successor-campaign",
+        )
+    assert rotated_campaign == "synthetic-successor-campaign"
+    assert not (await sync_v5_terminal_disposition(database, "source-a")).disposed
+
+
 async def _assert_v3_downgrade_is_blocked(
     scenario,
     migration,
@@ -276,6 +302,7 @@ async def test_v5_http410_guard_rollback_seal_replay_and_downgrade_fence(
             database,
             immutable_before,
         )
+        await _assert_replay_ignores_source_campaign(scenario, database)
         await _assert_v3_downgrade_is_blocked(scenario, migration)
         assert await _object_identity_by_kind(scenario, direct) == before_identity
     finally:
