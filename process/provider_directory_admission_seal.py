@@ -409,7 +409,8 @@ def validate_generic_admission_copy(
     dataset_hash: str,
     resource_count: int,
     scratch_directory: Path,
-    **completion_summaries: Any,
+    expected_resource_hashes: Mapping[str, Any] | None = None,
+    expected_resource_counts: Mapping[str, Any] | None = None,
 ) -> ProviderDirectoryAdmissionSeal:
     """Fully validate one raw-COPY proof with bounded Python memory."""
 
@@ -425,7 +426,10 @@ def validate_generic_admission_copy(
         dataset_hash=dataset_hash,
         resource_count=resource_count,
         scratch_directory=scratch_directory,
-        completion_summaries=completion_summaries,
+        completion_summaries={
+            "expected_resource_hashes": expected_resource_hashes,
+            "expected_resource_counts": expected_resource_counts,
+        },
     )
 
 
