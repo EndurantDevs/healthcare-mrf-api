@@ -15,6 +15,9 @@ from db.connection import Database
 from tests.provider_directory_subset_completion_pg_setup import (
     install_subset_canonical_functions,
 )
+from tests.test_provider_directory_dataset_artifact_db import (
+    _install_admission_seal_fixture_contract,
+)
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -57,6 +60,12 @@ async def _create_tables(database: Database, schema: str) -> None:
             published_at timestamp,
             superseded_at timestamp,
             publication_metadata_json jsonb,
+            publication_metadata_summary_json jsonb,
+            publication_metadata_sha256 varchar(64),
+            content_proof_admission_version smallint,
+            content_proof_admission_kind varchar(32),
+            content_proof_admission_sha256 varchar(64),
+            content_proof_resource_types varchar(64)[],
             completion_proof_required_version integer,
             completion_proof_json jsonb,
             completion_proof_sha256 varchar(64)
@@ -73,6 +82,7 @@ async def _create_tables(database: Database, schema: str) -> None:
         """
     )
     await install_subset_canonical_functions(database, schema)
+    await _install_admission_seal_fixture_contract(database, schema)
 
 
 async def _insert_fixture(database: Database, schema: str) -> None:
@@ -194,6 +204,64 @@ async def test_global_artifact_scope_is_proof_bound(monkeypatch):
             """
         )
         assert await _selected_rows(database) == []
+    finally:
+        await database.status(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+        await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_global_artifact_scope_is_sealed_proof_bound(monkeypatch):
+    """Keep a generic admission receipt bound to its source aliases."""
+
+    schema = f"provider_directory_artifact_scope_{uuid.uuid4().hex[:12]}"
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+    database = await _database()
+    try:
+        await _create_tables(database, schema)
+        await _insert_fixture(database, schema)
+        proof_sha256 = "a" * 64
+        summary = {
+            "source_ids": ["source_a"],
+            "selected_resources": ["Location"],
+            "expected_resources": ["Location"],
+            importer.ADMISSION_GENERIC_PROOF_SUMMARY_KEY: {
+                "contract_id": "healthporta.provider-directory.content-proof.v1",
+                "proof_sha256": proof_sha256,
+            },
+        }
+        await database.status(
+            f"""
+            UPDATE {schema}.provider_directory_endpoint_dataset
+               SET publication_metadata_summary_json = CAST(:summary AS jsonb),
+                   content_proof_admission_version =
+                       CAST(:admission_version AS smallint),
+                   content_proof_admission_kind =
+                       CAST(:admission_kind AS varchar),
+                   content_proof_admission_sha256 =
+                       CAST(:proof_sha256 AS varchar),
+                   content_proof_resource_types = ARRAY['Location']::varchar[],
+                   publication_metadata_sha256 =
+                       {schema}.provider_directory_endpoint_dataset_admission_metadata_sha256(
+                           CAST(:summary AS jsonb),
+                           CAST(:admission_version AS smallint),
+                           CAST(:admission_kind AS text),
+                           CAST(:proof_sha256 AS text),
+                           ARRAY['Location']::varchar[]
+                       );
+            """,
+            summary=json.dumps(summary),
+            admission_version=importer.ADMISSION_SEAL_VERSION,
+            admission_kind=importer.ADMISSION_KIND_GENERIC,
+            proof_sha256=proof_sha256,
+        )
+        assert await database.scalar(
+            f"SELECT ({importer._artifact_admission_seal_valid_sql('dataset')}) "
+            f"FROM {schema}.provider_directory_endpoint_dataset AS dataset"
+        ) is True
+
+        assert await _selected_rows(database) == [
+            ("source_a", "endpoint_a", "dataset_a")
+        ]
     finally:
         await database.status(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
         await database.disconnect()

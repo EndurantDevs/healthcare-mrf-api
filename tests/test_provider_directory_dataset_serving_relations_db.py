@@ -41,12 +41,40 @@ async def _create_tables(database: Database, schema: str) -> None:
         "is_current boolean NOT NULL DEFAULT true, "
         "superseded_at timestamptz, "
         "publication_metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb, "
+        "publication_metadata_summary_json jsonb, "
+        "publication_metadata_sha256 varchar(64), "
+        "content_proof_admission_version smallint, "
+        "content_proof_admission_kind varchar(32), "
+        "content_proof_admission_sha256 varchar(64), "
+        "content_proof_resource_types varchar(64)[], "
         "completion_proof_required_version integer, "
         "completion_proof_json jsonb, "
         "completion_proof_sha256 varchar(64)"
         ");"
     )
     await subset_setup.install_subset_canonical_functions(database, schema)
+    await database.status(
+        f"""
+        CREATE FUNCTION {schema}.provider_directory_endpoint_dataset_admission_metadata_sha256(
+            metadata_summary jsonb,
+            admission_version smallint,
+            admission_kind text,
+            proof_sha256 text,
+            resource_types varchar[]
+        ) RETURNS varchar LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $function$
+            SELECT {schema}.provider_directory_subset_payload_sha256(
+                jsonb_build_object(
+                    'contract', 'provider-directory-admission-seal-v1',
+                    'metadata_summary', metadata_summary,
+                    'admission_version', admission_version,
+                    'admission_kind', admission_kind,
+                    'proof_sha256', proof_sha256,
+                    'resource_types', to_jsonb(resource_types)
+                )
+            )::varchar
+        $function$;
+        """
+    )
     await database.status(
         f"CREATE TABLE {schema}.provider_directory_dataset_resource ("
         "dataset_id varchar(96) NOT NULL, "

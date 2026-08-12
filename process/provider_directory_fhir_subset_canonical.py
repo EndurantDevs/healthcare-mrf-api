@@ -109,7 +109,7 @@ def canonical_sha256(value: Any) -> str:
 
 def _canonical_payload_number(value: int | float) -> str:
     try:
-        numeric_value = Decimal(str(value))
+        numeric_value = Decimal(value) if type(value) is int else Decimal(str(value))
     except InvalidOperation as exc:
         raise ValueError(
             "provider_directory_subset_payload_number_invalid"
@@ -118,7 +118,8 @@ def _canonical_payload_number(value: int | float) -> str:
         raise ValueError("provider_directory_subset_payload_number_invalid")
     if numeric_value.is_zero():
         return "0"
-    return format(numeric_value.normalize(), "f")
+    canonical = format(numeric_value, "f")
+    return canonical.rstrip("0").rstrip(".") if "." in canonical else canonical
 
 
 def canonical_payload_json(value: Any) -> str:

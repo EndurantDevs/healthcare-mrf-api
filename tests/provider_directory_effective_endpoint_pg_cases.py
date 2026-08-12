@@ -27,7 +27,10 @@ from tests.provider_directory_subset_completion_pg_setup import (
     load_payload_guard_repair_migration,
     run_subset_migration,
 )
-from tests.tin_npi_connector_postgres_support import asyncpg
+from tests.tin_npi_connector_postgres_support import (
+    asyncpg,
+    load_admission_seal_migration,
+)
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -396,6 +399,11 @@ async def prove_effective_endpoint_activation_and_publication(monkeypatch):
         async with scenario.connection.transaction():
             await run_subset_migration(
                 _load_root_policy_migration(),
+                "upgrade",
+                scenario.connection,
+            )
+            await run_subset_migration(
+                load_admission_seal_migration(),
                 "upgrade",
                 scenario.connection,
             )

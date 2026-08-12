@@ -3371,7 +3371,10 @@ async def test_artifact_dataset_promotion_parses_compact_metadata_once(
         in publish_sql
     )
     assert "jsonb_to_record" in publish_sql
-    assert publish_sql.count("publication_metadata_json::jsonb") == 1
+    assert "publication_metadata_summary_json" in publish_sql
+    assert "content_proof_admission_version" in publish_sql
+    assert "octet_length(" in publish_sql
+    assert "__SAFE_PUBLICATION_METADATA__" not in publish_sql
     assert "candidate.eligibility_metadata_jsonb" in publish_sql
     assert "candidate.uhc_publication_present" in publish_sql
     assert "COALESCE(" in publish_sql

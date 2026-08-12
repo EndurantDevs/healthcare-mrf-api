@@ -63,7 +63,13 @@ async def _create_artifact_tables(database: Database, schema: str) -> None:
         "created_at timestamp, "
         "validated_at timestamp, "
         "published_at timestamp, "
-        "publication_metadata_json json, "
+        "publication_metadata_json jsonb, "
+        "publication_metadata_summary_json jsonb, "
+        "publication_metadata_sha256 varchar(64), "
+        "content_proof_admission_version smallint, "
+        "content_proof_admission_kind varchar(32), "
+        "content_proof_admission_sha256 varchar(64), "
+        "content_proof_resource_types varchar(64)[], "
         "completion_proof_required_version integer, "
         "completion_proof_json jsonb, "
         "completion_proof_sha256 varchar(64)"
@@ -81,6 +87,44 @@ async def _create_artifact_tables(database: Database, schema: str) -> None:
         ");"
     )
     await install_subset_canonical_functions(database, schema)
+    await _install_admission_seal_fixture_contract(database, schema)
+    await _create_artifact_scope_tables(database, schema)
+
+
+async def _install_admission_seal_fixture_contract(
+    database: Database,
+    schema: str,
+) -> None:
+    """Install the current bounded receipt digest in full-schema fixtures."""
+
+    await database.status(
+        f"""
+        CREATE FUNCTION {schema}.provider_directory_endpoint_dataset_admission_metadata_sha256(
+            metadata_summary jsonb,
+            admission_version smallint,
+            admission_kind text,
+            proof_sha256 text,
+            resource_types varchar[]
+        ) RETURNS varchar
+        LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $function$
+            SELECT {schema}.provider_directory_subset_payload_sha256(
+                jsonb_build_object(
+                    'contract', 'provider-directory-admission-seal-v1',
+                    'metadata_summary', metadata_summary,
+                    'admission_version', admission_version,
+                    'admission_kind', admission_kind,
+                    'proof_sha256', proof_sha256,
+                    'resource_types', to_jsonb(resource_types)
+                )
+            )::varchar
+        $function$;
+        """
+    )
+
+
+async def _create_artifact_scope_tables(database: Database, schema: str) -> None:
+    """Install artifact scope tables after the current dataset schema."""
+
     for model in (importer.ProviderDirectorySource, *importer.RESOURCE_MODELS):
         await database.status(
             importer._provider_directory_artifact_scope_table_sql(

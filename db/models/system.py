@@ -18,11 +18,12 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     PrimaryKeyConstraint,
+    SmallInteger,
     String,
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -1228,7 +1229,13 @@ class ProviderDirectoryEndpointDataset(Base, JSONOutputMixin):
     validated_at = Column(TIMESTAMP)
     published_at = Column(TIMESTAMP)
     superseded_at = Column(TIMESTAMP)
-    publication_metadata_json = Column(JSON)
+    publication_metadata_json = Column(JSONB)
+    publication_metadata_summary_json = Column(JSONB)
+    publication_metadata_sha256 = Column(String(64))
+    content_proof_admission_version = Column(SmallInteger)
+    content_proof_admission_kind = Column(String(32))
+    content_proof_admission_sha256 = Column(String(64))
+    content_proof_resource_types = Column(ARRAY(String(64)))
     completion_proof_required_version = Column(Integer)
     completion_proof_json = Column(JSONB)
     completion_proof_sha256 = Column(String(64))
