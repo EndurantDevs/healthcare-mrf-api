@@ -7,9 +7,13 @@ from __future__ import annotations
 from contextlib import suppress
 import importlib
 import importlib.util
+import json
 from pathlib import Path
 
 from process import provider_directory_fhir_subset_activation as activation
+from process.provider_directory_admission_seal import (
+    admission_seal_from_validated_metadata,
+)
 from tests.provider_directory_fhir_subset_abandonment_pg_support import (
     create_abandonment_relations,
 )
@@ -382,6 +386,59 @@ async def _prove_configured_collision_rejected(scenario) -> None:
     )
 
 
+async def _install_publication_migrations(scenario) -> None:
+    async with scenario.connection.transaction():
+        await run_subset_migration(
+            _load_root_policy_migration(),
+            "upgrade",
+            scenario.connection,
+        )
+        await install_admission_seal_terminal_predecessors(
+            scenario.connection,
+            scenario.quoted_schema,
+        )
+        await run_subset_migration(
+            load_admission_seal_migration(),
+            "upgrade",
+            scenario.connection,
+        )
+        await _seal_activation_datasets(scenario)
+
+
+async def _seal_activation_datasets(scenario) -> None:
+    metadata_rows = await scenario.connection.fetch(
+        f"SELECT dataset_id, publication_metadata_json::text AS metadata FROM "
+        f"{scenario.quoted_schema}.provider_directory_endpoint_dataset "
+        "WHERE dataset_id = ANY($1::varchar[]) ORDER BY dataset_id",
+        ["dataset-matched", "dataset-subset"],
+    )
+    assert len(metadata_rows) == 2
+    for metadata_row in metadata_rows:
+        receipt = admission_seal_from_validated_metadata(
+            json.loads(metadata_row["metadata"])
+        )
+        assert receipt is not None
+        await scenario.connection.execute(
+            f"""
+            UPDATE {scenario.quoted_schema}.provider_directory_endpoint_dataset
+               SET publication_metadata_summary_json = $1::jsonb,
+                   publication_metadata_sha256 = $2,
+                   content_proof_admission_version = $3,
+                   content_proof_admission_kind = $4,
+                   content_proof_admission_sha256 = $5,
+                   content_proof_resource_types = $6::varchar[]
+             WHERE dataset_id = $7
+            """,
+            json.dumps(receipt.metadata_summary),
+            receipt.metadata_sha256,
+            receipt.admission_version,
+            receipt.admission_kind,
+            receipt.proof_sha256,
+            list(receipt.resource_types),
+            metadata_row["dataset_id"],
+        )
+
+
 async def prove_effective_endpoint_activation_and_publication(monkeypatch):
     """Prove split identity through activation and atomic publication."""
 
@@ -397,21 +454,7 @@ async def prove_effective_endpoint_activation_and_publication(monkeypatch):
             scenario,
             effective_migration,
         )
-        async with scenario.connection.transaction():
-            await run_subset_migration(
-                _load_root_policy_migration(),
-                "upgrade",
-                scenario.connection,
-            )
-            await install_admission_seal_terminal_predecessors(
-                scenario.connection,
-                scenario.quoted_schema,
-            )
-            await run_subset_migration(
-                load_admission_seal_migration(),
-                "upgrade",
-                scenario.connection,
-            )
+        await _install_publication_migrations(scenario)
         activation_result = await activation.sync_reviewed_subset_verified_state(
             database=activation_database
         )

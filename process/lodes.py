@@ -436,6 +436,44 @@ async def _process_lodes_state(
         return 0
 
 
+async def _process_lodes_batch(
+    client,
+    states,
+    crosswalk: dict[str, str],
+    stage_cls,
+    batch_size: int,
+) -> tuple[int, dict[str, int], list[str]]:
+    total_zctas = 0
+    year_by_processed_state: dict[str, int] = {}
+    skipped_states: list[str] = []
+    for state in states:
+        resolved_year = await _resolve_state_year(
+            client,
+            state,
+            LODES_TARGET_YEAR,
+            LODES_MIN_YEAR,
+        )
+        if resolved_year is None:
+            skipped_states.append(state)
+            logger.warning(
+                "LODES %s: no available WAC year between %s and %s; state skipped",
+                state,
+                LODES_MIN_YEAR,
+                LODES_TARGET_YEAR,
+            )
+            continue
+        year_by_processed_state[state] = resolved_year
+        total_zctas += await _process_lodes_state(
+            client=client,
+            state=state,
+            year=resolved_year,
+            crosswalk=crosswalk,
+            stage_cls=stage_cls,
+            batch_size=batch_size,
+        )
+    return total_zctas, year_by_processed_state, skipped_states
+
+
 async def process_lodes_data(ctx, task=None):
     """Process one queued LODES import task."""
     task = task or {}
@@ -475,31 +513,15 @@ async def process_lodes_data(ctx, task=None):
             )
 
         states = TEST_STATES if test_mode else ALL_STATES
-        total_zctas = 0
-        year_by_processed_state: dict[str, int] = {}
-        skipped_states: list[str] = []
-
-        for state in states:
-            resolved_year = await _resolve_state_year(client, state, LODES_TARGET_YEAR, LODES_MIN_YEAR)
-            if resolved_year is None:
-                skipped_states.append(state)
-                logger.warning(
-                    "LODES %s: no available WAC year between %s and %s; state skipped",
-                    state,
-                    LODES_MIN_YEAR,
-                    LODES_TARGET_YEAR,
-                )
-                continue
-
-            year_by_processed_state[state] = resolved_year
-            total_zctas += await _process_lodes_state(
-                client=client,
-                state=state,
-                year=resolved_year,
-                crosswalk=crosswalk,
-                stage_cls=stage_cls,
-                batch_size=batch_size,
+        total_zctas, year_by_processed_state, skipped_states = (
+            await _process_lodes_batch(
+                client,
+                states,
+                crosswalk,
+                stage_cls,
+                batch_size,
             )
+        )
     finally:
         await client.close()
 
