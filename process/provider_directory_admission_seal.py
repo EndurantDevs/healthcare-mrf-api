@@ -1102,12 +1102,11 @@ async def backfill_provider_directory_admission_seal(
                 )
                 copy_path = Path(copy_file.name)
                 os.chmod(copy_path, 0o600)
-                copied_bytes = 0
-
                 async def spool_copy(data: bytes) -> None:
-                    nonlocal copied_bytes
-                    copied_bytes += len(data)
-                    if copied_bytes > ADMISSION_RAW_METADATA_MAX_BYTES + 128:
+                    if (
+                        copy_file.tell() + len(data)
+                        > ADMISSION_RAW_METADATA_MAX_BYTES + 128
+                    ):
                         raise AdmissionSealError(
                             "provider_directory_admission_copy_size_invalid"
                         )

@@ -87,6 +87,43 @@ def load_admission_seal_migration():
     return migration
 
 
+async def install_admission_seal_terminal_predecessors(
+    connection,
+    quoted_schema: str,
+) -> None:
+    """Complete the reduced fixture's exact pre-admission trigger surface."""
+
+    table = f"{quoted_schema}.provider_directory_endpoint_dataset"
+    await connection.execute(
+        f"""
+        CREATE CONSTRAINT TRIGGER
+            pd_subset_terminal_disposition_dataset_consistency_guard
+        AFTER UPDATE ON {table}
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION
+            {quoted_schema}.guard_provider_directory_subset_abandonment_dataset();
+        ALTER TABLE {table} ENABLE ALWAYS TRIGGER
+            pd_subset_terminal_disposition_dataset_consistency_guard;
+
+        CREATE FUNCTION
+            {quoted_schema}.guard_provider_directory_terminal_root_retirement_parent()
+        RETURNS trigger LANGUAGE plpgsql AS $function$
+        BEGIN
+            IF TG_OP = 'DELETE' THEN
+                RETURN OLD;
+            END IF;
+            RETURN NEW;
+        END;
+        $function$;
+        CREATE TRIGGER pd_trr_dataset_row
+        BEFORE INSERT OR DELETE OR UPDATE ON {table}
+        FOR EACH ROW EXECUTE FUNCTION
+            {quoted_schema}.guard_provider_directory_terminal_root_retirement_parent();
+        ALTER TABLE {table} ENABLE ALWAYS TRIGGER pd_trr_dataset_row;
+        """
+    )
+
+
 async def open_test_connection():
     database_dsn = os.getenv(POSTGRES_DSN_ENV)
     if not database_dsn:
