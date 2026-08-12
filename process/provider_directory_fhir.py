@@ -63988,20 +63988,35 @@ def _locked_endpoint_verification_state_sql(dataset_ref: str) -> str:
     baseline_count_sql = _endpoint_verification_baseline_count_sql(dataset_ref)
     state_filter_sql = _locked_endpoint_verification_filter_sql(dataset_ref)
     return f"""
-        SELECT dataset_id, endpoint_id, acquisition_root_run_id, status,
-               dataset_hash, resource_count, publication_metadata_json,
+        SELECT dataset.dataset_id, dataset.endpoint_id,
+               dataset.acquisition_root_run_id, dataset.status,
+               dataset.dataset_hash, dataset.resource_count,
+               CASE
+                   WHEN CAST(:include_twin_states AS boolean)
+                   THEN dataset.publication_metadata_json::jsonb
+                   ELSE NULL::jsonb
+               END AS publication_metadata_json,
                completion_proof_required_version,
-               completion_proof_json, completion_proof_sha256,
-               ({baseline_count_sql}) AS verification_baseline_count
-          FROM {dataset_ref} AS state
-         WHERE state.endpoint_id = :endpoint_id
-           AND state.dataset_id <> :dataset_id
+               CASE
+                   WHEN CAST(:include_twin_states AS boolean)
+                   THEN dataset.completion_proof_json::jsonb
+                   ELSE NULL::jsonb
+               END AS completion_proof_json,
+               completion_proof_sha256,
+               CASE
+                   WHEN CAST(:include_twin_states AS boolean)
+                   THEN ({baseline_count_sql})
+                   ELSE 0::bigint
+               END AS verification_baseline_count
+          FROM {dataset_ref} AS dataset
+         WHERE dataset.endpoint_id = :endpoint_id
+           AND dataset.dataset_id <> :dataset_id
            AND ({state_filter_sql})
          ORDER BY CASE
-                    WHEN state.status = :verification_baseline_status
+                    WHEN dataset.status = :verification_baseline_status
                     THEN 1 ELSE 0
                   END,
-                  state.created_at
+                  dataset.created_at
          LIMIT 1
          FOR UPDATE;
         """
@@ -64026,50 +64041,92 @@ def _endpoint_verification_baseline_count_sql(dataset_ref: str) -> str:
 
 def _locked_endpoint_verification_filter_sql(dataset_ref: str) -> str:
     terminal_successor_sql = _terminal_twin_successor_filter_sql(dataset_ref)
+    validated_candidate_sql = _validated_endpoint_candidate_blocks_admission_sql()
     return f"""
         (
-            state.is_current = false
-        AND state.status = ANY(CAST(:endpoint_wide_statuses AS varchar[]))
+            dataset.is_current = false
+        AND dataset.status = ANY(CAST(:endpoint_wide_statuses AS varchar[]))
         )
         OR (
-            NOT CAST(:include_twin_states AS boolean)
-        AND state.is_current = false
-        AND state.status = ANY(CAST(:non_twin_statuses AS varchar[]))
+            CASE
+                WHEN NOT CAST(:include_twin_states AS boolean)
+                 AND dataset.is_current = false
+                 AND dataset.status = ANY(
+                         CAST(:non_twin_statuses AS varchar[])
+                     )
+                THEN ({validated_candidate_sql})
+                ELSE false
+            END
         )
         OR (
-            CAST(:include_twin_states AS boolean)
-        AND state.publication_metadata_json::jsonb
-                ->> '{TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY}'
-                = :verification_campaign_id
-        AND state.publication_metadata_json::jsonb
-                ->> '{TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY}'
-                = :verification_source_scope_hash
-        AND (
-            (
-                state.is_current = false
-            AND state.status = ANY(
-                CAST(:twin_generation_statuses AS varchar[])
-            )
-            )
-            OR ({terminal_successor_sql})
+            CASE
+                WHEN CAST(:include_twin_states AS boolean) THEN (
+                    dataset.publication_metadata_json::jsonb
+                        ->> '{TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY}'
+                        = :verification_campaign_id
+                    AND dataset.publication_metadata_json::jsonb
+                        ->> '{TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY}'
+                        = :verification_source_scope_hash
+                    AND (
+                        (
+                            dataset.is_current = false
+                        AND dataset.status = ANY(
+                            CAST(:twin_generation_statuses AS varchar[])
+                        )
+                        )
+                        OR ({terminal_successor_sql})
+                    )
+                )
+                ELSE false
+            END
         )
-        )
+    """
+
+
+def _validated_endpoint_candidate_blocks_admission_sql() -> str:
+    """Ignore only an immutable bounded legacy proof proven invalid."""
+
+    metadata = "legacy_candidate.metadata"
+    proof_valid = _artifact_content_proof_valid_sql(
+        metadata,
+        "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)",
+    )
+    return f"""
+        CASE
+            WHEN ({_artifact_admission_seal_shape_valid_sql()}) THEN true
+            WHEN NOT ({_artifact_admission_seal_absent_sql()})
+              OR dataset.artifact_selection_receipt_json IS NOT NULL
+            THEN true
+            ELSE (
+                WITH legacy_candidate AS MATERIALIZED (
+                    SELECT {_artifact_safe_publication_metadata_sql()}
+                               AS metadata
+                )
+                SELECT CASE
+                    WHEN legacy_candidate.metadata IS NULL THEN true
+                    WHEN NOT ({_artifact_legacy_metadata_is_bounded_sql(metadata)})
+                    THEN true
+                    ELSE ({proof_valid}) IS TRUE
+                END
+                  FROM legacy_candidate
+            )
+        END
     """
 
 
 def _terminal_twin_successor_filter_sql(dataset_ref: str) -> str:
     return f"""
-        state.status = ANY(CAST(:terminal_successor_statuses AS varchar[]))
-        AND state.publication_metadata_json::jsonb
+        dataset.status = ANY(CAST(:terminal_successor_statuses AS varchar[]))
+        AND dataset.publication_metadata_json::jsonb
                 ->> '{TWIN_ROOT_VERIFICATION_ROLE_KEY}'
                 = :verification_candidate_role
         AND EXISTS (
             SELECT 1
               FROM {dataset_ref} AS terminal_baseline
              WHERE terminal_baseline.dataset_id =
-                   state.publication_metadata_json::jsonb
+                   dataset.publication_metadata_json::jsonb
                      ->> '{TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY}'
-               AND terminal_baseline.endpoint_id = state.endpoint_id
+               AND terminal_baseline.endpoint_id = dataset.endpoint_id
                AND terminal_baseline.is_current = false
                AND terminal_baseline.status = :verification_baseline_status
                AND terminal_baseline.publication_metadata_json::jsonb

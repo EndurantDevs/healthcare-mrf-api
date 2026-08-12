@@ -11,6 +11,9 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from db.connection import Database
+from tests.provider_directory_subset_completion_pg_setup import (
+    install_subset_canonical_functions,
+)
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -101,6 +104,7 @@ async def _create_dataset_table(database: Database, schema: str) -> None:
         CREATE TABLE {schema}.provider_directory_endpoint_dataset (
             dataset_id varchar(96) PRIMARY KEY,
             endpoint_id varchar(64) NOT NULL,
+            import_run_id varchar(64),
             acquisition_root_run_id varchar(64),
             previous_dataset_id varchar(96),
             dataset_hash varchar(64),
@@ -134,6 +138,7 @@ async def _create_dataset_table(database: Database, schema: str) -> None:
         );
         """
     )
+    await install_subset_canonical_functions(database, schema)
     await database.status(
         f"""
         CREATE FUNCTION {schema}.provider_directory_endpoint_dataset_admission_metadata_sha256(

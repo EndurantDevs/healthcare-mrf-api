@@ -22,15 +22,133 @@ from tests.test_provider_directory_dataset_artifact_db import (
     _insert_validated_shared_dataset,
     importer,
 )
+from tests.provider_directory_dataset_artifact_pg_support import (
+    seal_validated_dataset as _seal_validated_dataset,
+)
 from tests.test_provider_directory_dataset_selection_bounded_db import (
     _HASH_CASES,
     _all_source_projected_rows,
     _install_unrelated_large_proof_hash_sentinel,
     _large_metadata_by_field,
+    _proof_line_hash,
     _replace_shared_metadata,
     _resealed_proof_mutation,
     _set_shared_semantic_proof,
 )
+
+
+def _fresh_acquisition_candidate():
+    return importer.EndpointDatasetCandidate(
+        endpoint_id="endpoint_shared",
+        dataset_id="dataset_fresh",
+        acquisition_root_run_id="root-fresh",
+        source_ids=("source_primary",),
+        selected_resources=("Location",),
+        expected_resources=("Location",),
+        import_run_id="run-fresh",
+        previous_dataset_id="dataset_shared",
+        resource_hash_contract=(
+            importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+        ),
+    )
+
+
+async def _invalidate_legacy_candidate_proof(database, schema: str) -> None:
+    metadata = _large_metadata_by_field(
+        1,
+        dataset_id="dataset_legacy_invalid",
+        root_run_id="root-legacy-invalid",
+    )
+    proof = metadata[importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY]
+    proof["shards"][0]["resource_count"] = 2
+    proof["shards"][0]["resource_counts"] = {"Location": 2}
+    proof["shard_set_sha256"] = _proof_line_hash(proof["shards"])
+    proof.pop("proof_sha256")
+    proof["proof_sha256"] = importer._identity_hash(proof)
+    await _set_shared_semantic_proof(
+        database,
+        schema,
+        metadata,
+        dataset_id="dataset_legacy_invalid",
+    )
+
+
+async def _assert_sealed_metadata_closed(
+    database,
+    schema: str,
+) -> None:
+    await _install_metadata_open_sentinel(database, schema)
+    predicate = importer._validated_endpoint_candidate_blocks_admission_sql()
+    assert await database.scalar(
+        f"""
+        WITH raw_metadata AS MATERIALIZED (
+            SELECT {schema}.fail_if_metadata_is_opened() AS metadata
+        )
+        SELECT ({predicate})
+          FROM (
+              SELECT 'dataset_legacy_invalid'::varchar AS dataset_id,
+                     'endpoint_shared'::varchar AS endpoint_id,
+                     'root-legacy-invalid'::varchar AS acquisition_root_run_id,
+                     NULL::varchar AS import_run_id,
+                     repeat('e', 64)::varchar AS dataset_hash,
+                     1::bigint AS resource_count,
+                     (SELECT metadata FROM raw_metadata)
+                         AS publication_metadata_json,
+                     NULL::jsonb AS artifact_selection_receipt_json,
+                     '{{}}'::jsonb AS publication_metadata_summary_json,
+                     {schema}.provider_directory_endpoint_dataset_admission_metadata_sha256(
+                         '{{}}'::jsonb, 1::smallint, 'generic'::text,
+                         repeat('a', 64), ARRAY['Location']::varchar[]
+                     ) AS publication_metadata_sha256,
+                     1::smallint AS content_proof_admission_version,
+                     'generic'::varchar AS content_proof_admission_kind,
+                     repeat('a', 64)::varchar AS content_proof_admission_sha256,
+                     ARRAY['Location']::varchar[] AS content_proof_resource_types
+          ) AS dataset;
+        """
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_invalid_validated_candidate_does_not_block_fresh_acquisition(
+    monkeypatch,
+):
+    """Ignore a proven-invalid legacy proof but retain valid blockers."""
+
+    async with _dataset_database(monkeypatch) as (database, schema):
+        await _insert_validated_shared_dataset(
+            database,
+            schema,
+            dataset_id="dataset_legacy_invalid",
+            root_run_id="root-legacy-invalid",
+            seal=False,
+        )
+        candidate = _fresh_acquisition_candidate()
+        async with database.acquire() as connection:
+            with pytest.raises(RuntimeError, match="active_conflict"):
+                await importer._assert_no_conflicting_endpoint_candidate(
+                    connection, candidate
+                )
+
+        await _invalidate_legacy_candidate_proof(database, schema)
+        async with database.acquire() as connection:
+            assert await importer._assert_no_conflicting_endpoint_candidate(
+                connection, candidate
+            ) == candidate
+
+        await _seal_validated_dataset(
+            database, schema, "dataset_legacy_invalid"
+        )
+        await _assert_sealed_metadata_closed(database, schema)
+        async with database.acquire() as connection:
+            locked = await importer._locked_endpoint_verification_state(
+                connection, candidate
+            )
+            assert locked["publication_metadata_json"] is None
+            with pytest.raises(RuntimeError, match="active_conflict"):
+                await importer._assert_no_conflicting_endpoint_candidate(
+                    connection, candidate
+                )
 
 
 @pytest.mark.asyncio

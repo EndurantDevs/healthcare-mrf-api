@@ -18,6 +18,7 @@ from process.provider_directory_fhir_census_execution import (
 from tests.provider_directory_subset_completion_pg_setup import (
     insert_subset_candidate,
     insert_valid_subset_resources,
+    load_migration as load_subset_migration,
     replace_subset_source,
 )
 from tests.provider_directory_subset_completion_pg_support import (
@@ -25,7 +26,10 @@ from tests.provider_directory_subset_completion_pg_support import (
     VALID_SOURCE_SCOPE_SHA256,
     valid_source_metadata,
 )
-from tests.tin_npi_connector_postgres_support import POSTGRES_DSN_ENV
+from tests.tin_npi_connector_postgres_support import (
+    load_admission_seal_migration,
+    POSTGRES_DSN_ENV,
+)
 
 CANONICAL_API_BASE = "https://directory.example.test/fhir"
 DATASET_ID = "dataset-abandoned"
@@ -37,6 +41,19 @@ SOURCE_ID = "synthetic-source"
 VERIFICATION_CAMPAIGN_ID = valid_source_metadata(
     "pending_two_matching_reviewed_subset_acquisitions"
 )["provider_directory_verification_campaign_id"]
+
+
+async def install_admission_query_surface(scenario) -> None:
+    """Install current admission readers in the historical fixture."""
+
+    subset = load_subset_migration()
+    admission = load_admission_seal_migration()
+    for statement in (
+        subset._content_proof_valid_function_sql(scenario.schema),
+        admission._add_columns_sql(scenario.schema),
+        admission._digest_function_sql(scenario.schema),
+    ):
+        await scenario.connection.execute(statement)
 
 
 def guard_handoff_context(importer):

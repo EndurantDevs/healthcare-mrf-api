@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 """Real-PostgreSQL lifecycle proof for reviewed subset abandonment."""
-
 from __future__ import annotations
 
 import asyncio
@@ -25,6 +24,7 @@ from tests.provider_directory_fhir_subset_abandonment_pg_support import (
     close_abandonment_scenario,
     create_abandonment_relations,
     guard_handoff_context,
+    install_admission_query_surface,
     retained_evidence_snapshot,
     runtime_database,
     seed_expired_root,
@@ -229,6 +229,7 @@ async def _install_guard_handoff_scenario(scenario) -> None:
     await _install_abandonment_predecessors(scenario)
     await seed_expired_root(scenario)
     async with scenario.connection.transaction():
+        await install_admission_query_surface(scenario)
         await run_subset_migration(
             load_abandonment_migration(),
             "upgrade",
