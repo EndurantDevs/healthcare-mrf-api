@@ -1513,7 +1513,7 @@ def provider_directory_fhir(
             provider_directory_reviewed_root_count=(
                 provider_directory_reviewed_root_count
             ),
-            source_ids=list(source_id),
+            source_ids=list(source_id) if source_id else None,
             limit=limit,
             source_query=source_query,
             refresh_preset=refresh_preset,
