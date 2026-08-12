@@ -113,6 +113,71 @@ async def test_reviewed_single_root_runs_only_one_distinct_candidate():
 
 
 @pytest.mark.asyncio
+async def test_reviewed_single_root_uses_the_production_admitter(monkeypatch):
+    from process import uhc_flex_practitioner_twin_store as twin_store
+
+    harness = AcquisitionHarness()
+    harness.session_serial = 1
+
+    async def admit(candidate_acquisition_id, **coordinates):
+        return build_single_root_admission(
+            harness.sealed_root(candidate_acquisition_id),
+            semantic_projection_as_of=coordinates["semantic_projection_as_of"],
+            operation_key=coordinates["operation_key"],
+            admitted_at=dt.datetime(2026, 8, 10, tzinfo=dt.UTC),
+        )
+
+    monkeypatch.setattr(
+        twin_store, "admit_uhc_flex_practitioner_single_root", admit
+    )
+    receipt = await acquisition.acquire_uhc_flex_single_root(
+        operation_key=OPERATION_KEY,
+        semantic_projection_as_of=PROJECTION_DATE,
+        config=enabled_config(concurrency=2),
+        database=harness.database,
+        dependencies=harness.dependencies(),
+    )
+
+    assert receipt.admission_id.startswith("pdufpad_")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ("initialize", "admission"))
+async def test_reviewed_single_root_rejects_impossible_runtime_state(failure):
+    harness = AcquisitionHarness()
+    harness.session_serial = 1
+
+    async def invalid_initialize(*_args, **_kwargs):
+        return 2
+
+    async def invalid_admission(*_args, **_kwargs):
+        return object()
+
+    dependencies = harness.dependencies()
+    dependencies = replace(
+        dependencies,
+        initialize_root=(
+            invalid_initialize
+            if failure == "initialize"
+            else dependencies.initialize_root
+        ),
+        admit_single_root=(
+            invalid_admission if failure == "admission" else None
+        ),
+    )
+    with pytest.raises(acquisition.UHCFlexPractitionerAcquisitionError) as caught:
+        await acquisition.acquire_uhc_flex_single_root(
+            operation_key=OPERATION_KEY,
+            semantic_projection_as_of=PROJECTION_DATE,
+            config=enabled_config(concurrency=2),
+            database=harness.database,
+            dependencies=dependencies,
+        )
+
+    assert caught.value.code == "state"
+
+
+@pytest.mark.asyncio
 async def test_runtime_concurrency_and_connection_limit_are_hard_bounded():
     harness = AcquisitionHarness(npi_count=8)
     harness.fetch_barrier_target = 3

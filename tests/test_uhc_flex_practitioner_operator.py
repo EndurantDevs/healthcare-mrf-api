@@ -254,6 +254,140 @@ async def test_acquisition_forwards_resume_identity_and_bounds(monkeypatch) -> N
     )
 
 
+def _single_root_phase_modules(acquisition_result=None):
+    phase_module = ModuleType("process.uhc_flex_practitioner_acquisition")
+    contract_module = ModuleType("process.uhc_flex_practitioner_single_root_contract")
+    operation_calls = []
+
+    class Config:
+        def __init__(self, **config_by_field) -> None:
+            self.config_by_field = config_by_field
+
+    class Receipt:
+        operation_key = OPERATION_KEY
+        semantic_projection_as_of = "2026-08-10"
+        cohort_id = "pdufc_" + "2" * 48
+        official_dataset_id = "pdd_" + "3" * 48
+        official_dataset_hash = "4" * 64
+        official_content_proof_sha256 = "5" * 64
+        dataset_intent_id = "pdufdi_" + "6" * 48
+        expected_npi_count = 9
+        candidate = _root("candidate", "8")
+        admission_id = "pdufpad_" + "a" * 48
+        reviewed_root_policy_json = {"required_root_count": 1}
+        elapsed_seconds = 5.0
+
+    async def acquire_single_root(**keyword_arguments):
+        operation_calls.append(keyword_arguments)
+        if isinstance(acquisition_result, BaseException):
+            raise acquisition_result
+        return Receipt() if acquisition_result is None else acquisition_result
+
+    phase_module.UHCFlexPractitionerAcquisitionConfig = Config
+    phase_module.acquire_uhc_flex_single_root = acquire_single_root
+    contract_module.UHCFlexPractitionerSingleRootReceipt = Receipt
+    return phase_module, contract_module, operation_calls
+
+
+def _install_single_root_phase(monkeypatch, acquisition_result=None):
+    phase_module, contract_module, operation_calls = _single_root_phase_modules(
+        acquisition_result
+    )
+    modules = __import__("sys").modules
+    monkeypatch.setitem(modules, phase_module.__name__, phase_module)
+    monkeypatch.setitem(modules, contract_module.__name__, contract_module)
+    return operation_calls
+
+
+@pytest.mark.asyncio
+async def test_single_root_acquisition_forwards_bounds_and_returns_policy(
+    monkeypatch,
+) -> None:
+    _disable_all_gates(monkeypatch)
+    monkeypatch.setenv(operator.SINGLE_ROOT_ACQUISITION_ENABLED_ENV, "true")
+    calls = _install_single_root_phase(monkeypatch)
+    database = object()
+
+    rendered = await operator.acquire_uhc_flex_single_root_operation(
+        operation_key=OPERATION_KEY,
+        semantic_projection_as_of="2026-08-10",
+        concurrency=6,
+        max_attempts=4,
+        lease_seconds=600,
+        retry_base_seconds=2.0,
+        max_retry_seconds=30.0,
+        database=database,
+    )
+
+    assert calls[0]["database"] is database
+    assert calls[0]["config"].config_by_field["concurrency"] == 6
+    receipt = json.loads(rendered)
+    assert receipt["status"] == "admitted"
+    assert receipt["candidate"]["acquisition_id"].startswith("pdufpa_")
+    assert receipt["provider_directory_reviewed_root_policy_v1"] == {
+        "required_root_count": 1
+    }
+
+
+@pytest.mark.asyncio
+async def test_single_root_acquisition_rejects_wrong_receipt(monkeypatch) -> None:
+    _disable_all_gates(monkeypatch)
+    monkeypatch.setenv(operator.SINGLE_ROOT_ACQUISITION_ENABLED_ENV, "true")
+    _install_single_root_phase(monkeypatch, object())
+
+    with pytest.raises(operator.UHCFlexPractitionerOperatorError) as caught:
+        await operator.acquire_uhc_flex_single_root_operation(
+            operation_key=OPERATION_KEY,
+            semantic_projection_as_of="2026-08-10",
+            concurrency=4,
+            max_attempts=3,
+            lease_seconds=300,
+            retry_base_seconds=1.0,
+            max_retry_seconds=60.0,
+            database=object(),
+        )
+
+    assert caught.value.code == "evidence"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_type", "expected_code"),
+    (
+        (asyncio.CancelledError(), asyncio.CancelledError, None),
+        (TimeoutError(), TimeoutError, None),
+        (
+            operator.UHCFlexPractitionerOperatorError("state"),
+            operator.UHCFlexPractitionerOperatorError,
+            "state",
+        ),
+        (ValueError(), operator.UHCFlexPractitionerOperatorError, "invalid_request"),
+        (RuntimeError(), operator.UHCFlexPractitionerOperatorError, "acquisition"),
+    ),
+)
+async def test_single_root_acquisition_normalizes_only_safe_errors(
+    monkeypatch, error, expected_type, expected_code
+) -> None:
+    _disable_all_gates(monkeypatch)
+    monkeypatch.setenv(operator.SINGLE_ROOT_ACQUISITION_ENABLED_ENV, "true")
+    _install_single_root_phase(monkeypatch, error)
+
+    with pytest.raises(expected_type) as caught:
+        await operator.acquire_uhc_flex_single_root_operation(
+            operation_key=OPERATION_KEY,
+            semantic_projection_as_of="2026-08-10",
+            concurrency=4,
+            max_attempts=3,
+            lease_seconds=300,
+            retry_base_seconds=1.0,
+            max_retry_seconds=60.0,
+            database=object(),
+        )
+
+    if expected_code is not None:
+        assert caught.value.code == expected_code
+
+
 def _assert_external_profile_followup(receipt_by_field: dict[str, Any]) -> None:
     """Prove the receipt remains dormant and matches the closed controller shape."""
 

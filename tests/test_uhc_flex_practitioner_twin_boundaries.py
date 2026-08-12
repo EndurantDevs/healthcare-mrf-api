@@ -21,6 +21,8 @@ from process.uhc_flex_practitioner_single_root_contract import (
     build_single_root_admission,
     single_root_dataset_intent_id,
     single_root_run_id,
+    UHCFlexPractitionerSingleRootError,
+    UHCFlexPractitionerSingleRootReceipt,
 )
 from process.uhc_flex_practitioner_store_contract import _acquisition_id
 from tests.provider_directory_uhc_flex_npi_cohort_pg_support import cohort_fixture
@@ -178,6 +180,47 @@ def test_twin_identity_and_contract_fail_closed_on_malformed_coordinates():
         )
 
 
+def test_single_root_contract_rejects_invalid_coordinates_and_receipts():
+    bounded_error = UHCFlexPractitionerSingleRootError("private")
+    assert bounded_error.code == "state"
+    assert "private" not in str(bounded_error)
+    cohort = cohort_fixture()
+    candidate = _single_root(cohort.cohort_id, cohort.npi_count)
+
+    with pytest.raises(ValueError):
+        single_root_dataset_intent_id("invalid", PROJECTION_DATE, OPERATION_KEY)
+    with pytest.raises(ValueError):
+        single_root_run_id("invalid")
+    with pytest.raises(UHCFlexPractitionerSingleRootError) as caught:
+        build_single_root_admission(
+            _mutated(candidate, acquisition_role="baseline"),
+            semantic_projection_as_of=PROJECTION_DATE,
+            operation_key=OPERATION_KEY,
+            admitted_at=TIMESTAMP,
+        )
+    assert caught.value.code == "identity"
+
+    with pytest.raises(ValueError):
+        UHCFlexPractitionerSingleRootReceipt(
+            operation_key=OPERATION_KEY,
+            semantic_projection_as_of=PROJECTION_DATE,
+            source_id="invalid",
+            endpoint_id="0" * 64,
+            cohort_id=cohort.cohort_id,
+            official_dataset_id="dataset",
+            official_dataset_hash="0" * 64,
+            official_content_proof_sha256="1" * 64,
+            dataset_intent_id=single_root_dataset_intent_id(
+                cohort.cohort_id, PROJECTION_DATE, OPERATION_KEY
+            ),
+            expected_npi_count=cohort.npi_count,
+            candidate=object(),
+            admission_id="pdufpad_" + "2" * 48,
+            reviewed_root_policy_json={},
+            elapsed_seconds=0.0,
+        )
+
+
 def test_twin_store_row_and_exact_replay_validation_boundaries():
     attempt, admission = _attempt_and_admission()
     assert twin_store._date_text(date.fromisoformat(PROJECTION_DATE)) == PROJECTION_DATE
@@ -322,6 +365,37 @@ async def test_single_root_admission_replay_returns_stored_identity(monkeypatch)
     )
 
     assert replay is stored_admission
+
+
+@pytest.mark.asyncio
+async def test_single_root_store_normalizes_contract_value_errors(monkeypatch):
+    cohort = cohort_fixture()
+    candidate = _single_root(cohort.cohort_id, cohort.npi_count)
+    admission = build_single_root_admission(
+        candidate,
+        semantic_projection_as_of=PROJECTION_DATE,
+        operation_key=OPERATION_KEY,
+        admitted_at=TIMESTAMP,
+    )
+
+    async def lock_single_root(*_args, **_kwargs):
+        return candidate
+
+    monkeypatch.setattr(twin_store, "_lock_single_root", lock_single_root)
+    with pytest.raises(twin_contract.UHCFlexPractitionerTwinStoreError) as admit_error:
+        await twin_store.admit_uhc_flex_practitioner_single_root(
+            candidate.acquisition_id,
+            semantic_projection_as_of=PROJECTION_DATE,
+            operation_key="invalid",
+            database=_Database(),
+        )
+    assert admit_error.value.code == "identity"
+
+    with pytest.raises(twin_contract.UHCFlexPractitionerTwinStoreError) as read_error:
+        await twin_store._rebuild_single_root_admission(
+            _Database(), admission, PROJECTION_DATE, "invalid"
+        )
+    assert read_error.value.code == "identity"
 
 
 @pytest.mark.asyncio
