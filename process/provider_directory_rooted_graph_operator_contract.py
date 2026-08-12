@@ -11,16 +11,32 @@ import os
 import re
 from typing import Any
 
+from process.provider_directory_rooted_graph_single_root_contract import (
+    RootedGraphSingleIdentity,
+    SINGLE_ROOT_OPERATOR_CONTRACT_SHA256,
+    derive_single_root_identity,
+)
+
 
 REGISTRATION_ENABLED_ENV = (
     "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_REGISTRATION_ENABLED"
 )
 ACQUISITION_ENABLED_ENV = "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_ENABLED"
+SINGLE_ROOT_ACQUISITION_ENABLED_ENV = (
+    "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ACQUISITION_ENABLED"
+)
 PUBLICATION_ENABLED_ENV = "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_ENABLED"
-OPERATOR_PHASES = ("register", "acquire", "publish")
+SINGLE_ROOT_ACQUISITION_PHASE = "acquire-single-root"
+OPERATOR_PHASES = (
+    "register",
+    "acquire",
+    SINGLE_ROOT_ACQUISITION_PHASE,
+    "publish",
+)
 _GATE_BY_PHASE = {
     "register": REGISTRATION_ENABLED_ENV,
     "acquire": ACQUISITION_ENABLED_ENV,
+    SINGLE_ROOT_ACQUISITION_PHASE: SINGLE_ROOT_ACQUISITION_ENABLED_ENV,
     "publish": PUBLICATION_ENABLED_ENV,
 }
 PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_ID = (
@@ -111,6 +127,30 @@ def _canonical_json(document: object) -> str:
 PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256 = hashlib.sha256(
     _canonical_json(_OPERATOR_CONTRACT_PAYLOAD).encode("utf-8")
 ).hexdigest()
+PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_OPERATOR_CONTRACT_ID = (
+    "healthporta.provider-directory.rooted-graph-single-root-manual-operator.v1"
+)
+_SINGLE_ROOT_OPERATOR_CONTRACT_PAYLOAD = {
+    "acquisition": "deterministic-single-candidate-exact-current-root",
+    "admission": "exact-sealed-candidate-still-current-reviewed-policy-one",
+    "command": SINGLE_ROOT_ACQUISITION_PHASE,
+    "contract_id": PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_OPERATOR_CONTRACT_ID,
+    "gate": SINGLE_ROOT_ACQUISITION_ENABLED_ENV,
+    "operation_key": "required-exact-lowercase-sha256-resume-selector",
+    "reviewed_root_policy": {
+        "policy_version": "provider-directory-reviewed-root-policy-v1",
+        "required_root_count": 1,
+    },
+    "scheduling": "none",
+}
+PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_OPERATOR_CONTRACT_SHA256 = hashlib.sha256(
+    _canonical_json(_SINGLE_ROOT_OPERATOR_CONTRACT_PAYLOAD).encode("utf-8")
+).hexdigest()
+if (
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_OPERATOR_CONTRACT_SHA256
+    != SINGLE_ROOT_OPERATOR_CONTRACT_SHA256
+):
+    raise RuntimeError("provider_directory_rooted_graph_single_root_contract_invalid")
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -151,6 +191,12 @@ def rooted_graph_operator_contract_payload() -> dict[str, Any]:
     """Return a fresh copy of the closed manual-operation contract."""
 
     return json.loads(_canonical_json(_OPERATOR_CONTRACT_PAYLOAD))
+
+
+def single_root_operator_contract_payload() -> dict[str, Any]:
+    """Return a fresh copy of the distinct policy-one operator contract."""
+
+    return json.loads(_canonical_json(_SINGLE_ROOT_OPERATOR_CONTRACT_PAYLOAD))
 
 
 def require_rooted_graph_operator_gate(phase: str) -> None:
@@ -323,6 +369,20 @@ def build_rooted_graph_operator_identities(
     )
 
 
+def build_rooted_graph_single_root_identity(
+    current: Any,
+    *,
+    operation_key: str,
+) -> RootedGraphSingleIdentity:
+    """Derive one stable candidate identity under the policy-one contract."""
+
+    exact_operation_key = _exact_operation_key(operation_key)
+    return derive_single_root_identity(
+        current,
+        operation_key=exact_operation_key,
+    )
+
+
 def _operation_error(error: Exception, default_code: str) -> Exception:
     code = getattr(error, "code", None)
     if type(code) is str and code in _PRESERVED_ERROR_CODES:
@@ -335,11 +395,18 @@ __all__ = (
     "OPERATOR_PHASES",
     "PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_ID",
     "PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256",
+    "PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_OPERATOR_CONTRACT_ID",
+    "PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_OPERATOR_CONTRACT_SHA256",
     "PUBLICATION_ENABLED_ENV",
     "ProviderDirectoryRootedGraphOperatorError",
     "ProviderDirectoryRootedGraphOperatorIdentities",
+    "RootedGraphSingleIdentity",
     "REGISTRATION_ENABLED_ENV",
+    "SINGLE_ROOT_ACQUISITION_ENABLED_ENV",
+    "SINGLE_ROOT_ACQUISITION_PHASE",
     "build_rooted_graph_operator_identities",
+    "build_rooted_graph_single_root_identity",
     "require_rooted_graph_operator_gate",
     "rooted_graph_operator_contract_payload",
+    "single_root_operator_contract_payload",
 )

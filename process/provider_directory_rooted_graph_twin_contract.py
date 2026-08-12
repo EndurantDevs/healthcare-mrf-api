@@ -472,12 +472,15 @@ build_provider_directory_rooted_graph_twin_attempt = build_rooted_graph_twin_att
 
 
 from process.provider_directory_rooted_graph_twin_admission_contract import (
+    build_rooted_graph_single_root_admission,
     build_provider_directory_rooted_graph_twin_admission,
     ProviderDirectoryRootedGraphTwinAdmission,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
 )
 
 
 __all__ = (
+    "build_rooted_graph_single_root_admission",
     "build_provider_directory_rooted_graph_twin_admission",
     "build_provider_directory_rooted_graph_twin_attempt",
     "ProviderDirectoryRootedGraphSealedRoot",
@@ -485,5 +488,6 @@ __all__ = (
     "ProviderDirectoryRootedGraphTwinAttempt",
     "ProviderDirectoryRootedGraphTwinError",
     "PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ADMISSION_CONTRACT_ID",
+    "PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID",
     "PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ATTEMPT_CONTRACT_ID",
 )

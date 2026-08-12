@@ -209,7 +209,7 @@ async def test_twin_admission_rejects_a_missing_persisted_admission(
     monkeypatch.setattr(twin_store, "_lock_roots", lock_roots)
     monkeypatch.setattr(twin_store, "_insert_attempt", insert_attempt)
     monkeypatch.setattr(twin_store, "_read_attempt", read_attempt)
-    monkeypatch.setattr(twin_store, "_insert_admission", ignore_insert)
+    monkeypatch.setattr(twin_store, "_insert_authority", ignore_insert)
     monkeypatch.setattr(twin_store, "_read_admission", missing_admission)
     monkeypatch.setattr(twin_store, "_require_exact", lambda *_arguments: None)
     database = _ScriptedDatabase(scalars=(datetime(2026, 8, 10, tzinfo=UTC),))

@@ -27,6 +27,7 @@ def _enable_only(monkeypatch: pytest.MonkeyPatch, selected: str) -> None:
     for gate_name in (
         cli.REGISTRATION_ENABLED_ENV,
         cli.ACQUISITION_ENABLED_ENV,
+        cli.SINGLE_ROOT_ACQUISITION_ENABLED_ENV,
         cli.PUBLICATION_ENABLED_ENV,
     ):
         monkeypatch.setenv(
@@ -42,6 +43,7 @@ def test_retired_acquisition_parses_before_database_and_network_imports(
     for gate_name in (
         cli.REGISTRATION_ENABLED_ENV,
         cli.ACQUISITION_ENABLED_ENV,
+        cli.SINGLE_ROOT_ACQUISITION_ENABLED_ENV,
         cli.PUBLICATION_ENABLED_ENV,
     ):
         monkeypatch.delenv(gate_name, raising=False)
@@ -66,6 +68,10 @@ def test_retired_acquisition_parses_before_database_and_network_imports(
 def test_cli_gate_constants_match_closed_contract() -> None:
     assert cli.REGISTRATION_ENABLED_ENV == contract.REGISTRATION_ENABLED_ENV
     assert cli.ACQUISITION_ENABLED_ENV == contract.ACQUISITION_ENABLED_ENV
+    assert (
+        cli.SINGLE_ROOT_ACQUISITION_ENABLED_ENV
+        == contract.SINGLE_ROOT_ACQUISITION_ENABLED_ENV
+    )
     assert cli.PUBLICATION_ENABLED_ENV == contract.PUBLICATION_ENABLED_ENV
 
 
@@ -139,6 +145,9 @@ def test_parser_requires_resume_key_and_exact_publication_receipt() -> None:
     acquisition = cli._parser().parse_args(
         ["acquire", "--operation-key", OPERATION_KEY]
     )
+    single_root = cli._parser().parse_args(
+        ["acquire-single-root", "--operation-key", OPERATION_KEY]
+    )
     publication = cli._parser().parse_args(
         [
             "publish",
@@ -148,6 +157,7 @@ def test_parser_requires_resume_key_and_exact_publication_receipt() -> None:
     )
 
     assert acquisition.operation_key == OPERATION_KEY
+    assert single_root.operation_key == OPERATION_KEY
     assert acquisition.lease_seconds == 300
     assert publication.publication_acquisition_id == PUBLICATION_ACQUISITION_ID
     assert publication.batch_size == 4096
@@ -278,6 +288,9 @@ def test_operator_is_packaged_but_not_scheduled_or_publicly_activated() -> None:
         assert "provider_directory_rooted_graph_operator" not in activation_source_text
         assert contract.REGISTRATION_ENABLED_ENV not in activation_source_text
         assert contract.ACQUISITION_ENABLED_ENV not in activation_source_text
+        assert contract.SINGLE_ROOT_ACQUISITION_ENABLED_ENV not in (
+            activation_source_text
+        )
         assert contract.PUBLICATION_ENABLED_ENV not in activation_source_text
 
     operator_source = operator_path.read_text(encoding="utf-8")

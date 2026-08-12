@@ -18,6 +18,9 @@ from process.provider_directory_rooted_graph_source_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
 )
+from process.provider_directory_rooted_graph_twin_contract import (
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ADMISSION_CONTRACT_ID,
+)
 from process.uhc_flex_practitioner_contract import UHC_FLEX_PRACTITIONER_SOURCE_ID
 from process.uhc_flex_practitioner_twin_store_contract import (
     UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID,
@@ -65,7 +68,13 @@ def _rooted_metadata(*, projection: str = "2026-08-09") -> dict[str, object]:
         "acquisition_root_run_id": "pdrgpr_" + "8" * 48,
         "acquisition_source_id": PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
         "acquisition_endpoint_id": GRAPH_ENDPOINT_ID,
-        "admission_id": "pdrgta_" + "7" * 48,
+        "admission_contract_id": (
+            PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ADMISSION_CONTRACT_ID
+        ),
+        "admission_id": "pdrgad_" + "7" * 48,
+        "attempt_id": "pdrgat_" + "a" * 48,
+        "comparison_acquisition_id": "pdrga_" + "b" * 48,
+        "publication_acquisition_id": "pdrga_" + "c" * 48,
         "cohort_complete": True,
         "dataset_id": GRAPH_DATASET_ID,
         "endpoint_collection_complete": False,

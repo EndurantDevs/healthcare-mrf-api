@@ -26,10 +26,14 @@ REGISTRATION_ENABLED_ENV = (
     "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_REGISTRATION_ENABLED"
 )
 ACQUISITION_ENABLED_ENV = "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_ENABLED"
+SINGLE_ROOT_ACQUISITION_ENABLED_ENV = (
+    "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ACQUISITION_ENABLED"
+)
 PUBLICATION_ENABLED_ENV = "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_ENABLED"
 _GATE_BY_COMMAND = {
     "register": REGISTRATION_ENABLED_ENV,
     "acquire": ACQUISITION_ENABLED_ENV,
+    "acquire-single-root": SINGLE_ROOT_ACQUISITION_ENABLED_ENV,
     "publish": PUBLICATION_ENABLED_ENV,
 }
 _SIGNALS = (signal.SIGTERM, signal.SIGINT)
@@ -117,11 +121,11 @@ def _bounded_float(raw_value: str, minimum: float, maximum: float) -> float:
     return parsed
 
 
-def _add_acquisition_arguments(commands: Any) -> None:
+def _add_acquisition_arguments(commands: Any, command: str = "acquire") -> None:
     """Add bounded controls and the required stable resume selector."""
 
     acquisition = commands.add_parser(
-        "acquire",
+        command,
         add_help=False,
         allow_abbrev=False,
     )
@@ -197,6 +201,7 @@ def _parser() -> argparse.ArgumentParser:
         allow_abbrev=False,
     )
     _add_acquisition_arguments(commands)
+    _add_acquisition_arguments(commands, "acquire-single-root")
     _add_publication_arguments(commands)
     return parser
 
@@ -306,6 +311,21 @@ async def _execute_selected_phase(
         )
 
         return await acquire_admit_rooted_graph_operation(
+            operation_key=arguments.operation_key,
+            concurrency=arguments.concurrency,
+            max_attempts=arguments.max_attempts,
+            lease_seconds=arguments.lease_seconds,
+            retry_base_seconds=arguments.retry_base_seconds,
+            max_retry_seconds=arguments.max_retry_seconds,
+            root_timeout_seconds=arguments.root_timeout_seconds,
+            database=database,
+        )
+    if arguments.command == "acquire-single-root":
+        from process.provider_directory_rooted_graph_operator import (
+            acquire_single_root_operation,
+        )
+
+        return await acquire_single_root_operation(
             operation_key=arguments.operation_key,
             concurrency=arguments.concurrency,
             max_attempts=arguments.max_attempts,

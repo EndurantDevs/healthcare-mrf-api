@@ -297,7 +297,40 @@ async def acquire_provider_directory_rooted_graph_twins(
     )
 
 
+async def acquire_rooted_graph_single_root(
+    candidate_identity: ProviderDirectoryRootedGraphAcquisitionIdentity,
+    *,
+    config: ProviderDirectoryRootedGraphAcquisitionConfig = (
+        ProviderDirectoryRootedGraphAcquisitionConfig()
+    ),
+    database: Any = db,
+    dependencies: ProviderDirectoryRootedGraphAcquisitionDependencies | None = None,
+) -> ProviderDirectoryRootedGraphRootReceipt:
+    """Acquire and seal one candidate root; return evidence, never authority."""
+
+    if (
+        type(candidate_identity) is not ProviderDirectoryRootedGraphAcquisitionIdentity
+        or candidate_identity.acquisition_role != "candidate"
+    ):
+        raise ValueError("provider_directory_rooted_graph_single_root_invalid")
+    runtime = _runtime_dependencies(config, dependencies)
+    summary, elapsed_seconds, expected_source = await _acquire_root(
+        candidate_identity,
+        config=config,
+        dependencies=runtime,
+        database=database,
+    )
+    await _require_sealed_roots(
+        (candidate_identity,),
+        dependencies=runtime,
+        database=database,
+        expected_source=expected_source,
+    )
+    return _root_receipt(candidate_identity, summary, elapsed_seconds)
+
+
 __all__ = (
+    "acquire_rooted_graph_single_root",
     "acquire_provider_directory_rooted_graph_twins",
     "ProviderDirectoryRootedGraphAcquisitionConfig",
     "ProviderDirectoryRootedGraphAcquisitionDependencies",

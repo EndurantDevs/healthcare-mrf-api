@@ -41,6 +41,7 @@ def _enable_only(monkeypatch: pytest.MonkeyPatch, selected: str) -> None:
     for gate_name in (
         contract.REGISTRATION_ENABLED_ENV,
         contract.ACQUISITION_ENABLED_ENV,
+        contract.SINGLE_ROOT_ACQUISITION_ENABLED_ENV,
         contract.PUBLICATION_ENABLED_ENV,
     ):
         monkeypatch.setenv(
@@ -90,10 +91,13 @@ def test_active_gates_are_exact_and_retired_acquisition_stays_closed(
     gate_by_phase = {
         "register": contract.REGISTRATION_ENABLED_ENV,
         "acquire": contract.ACQUISITION_ENABLED_ENV,
+        contract.SINGLE_ROOT_ACQUISITION_PHASE: (
+            contract.SINGLE_ROOT_ACQUISITION_ENABLED_ENV
+        ),
         "publish": contract.PUBLICATION_ENABLED_ENV,
     }
     assert contract.OPERATOR_PHASES == tuple(gate_by_phase)
-    for phase in ("register", "publish"):
+    for phase in ("register", contract.SINGLE_ROOT_ACQUISITION_PHASE, "publish"):
         gate_name = gate_by_phase[phase]
         _enable_only(monkeypatch, gate_name)
         contract.require_rooted_graph_operator_gate(phase)
