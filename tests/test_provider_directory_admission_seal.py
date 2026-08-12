@@ -471,3 +471,10 @@ from tests.provider_directory_admission_backfill_coverage_support import (
     test_backfill_rejects_invalid_schema_and_partial_seal,
     test_backfill_rejects_lost_update_and_missing_dataset,
 )
+
+from tests.provider_directory_admission_seal_edge_cases import (
+    test_admission_copy_rejects_remaining_framing_failures,
+    test_admission_seal_rejects_remaining_invalid_shapes,
+    test_admission_stream_rejects_remaining_invalid_events,
+    test_admission_validation_rejects_remaining_summary_and_lineage_failures,
+)
