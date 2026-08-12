@@ -9,7 +9,6 @@ import importlib.util
 import json
 from pathlib import Path
 
-from process import provider_directory_fhir_subset_activation as activation
 from process import provider_directory_fhir_subset_activation_selection as selection
 from tests.provider_directory_effective_endpoint_pg_cases import (
     _load_effective_endpoint_migration,
@@ -24,8 +23,10 @@ from tests.provider_directory_reviewed_subset_activation_pg_support import (
     flush_deferred_fixture_events,
     load_activation_migration,
 )
-from tests.provider_directory_reviewed_subset_activation_pg_upsert import (
+from tests.provider_directory_pending_policy_reset_pg import (
     prove_pending_policy_two_campaign_reset,
+)
+from tests.provider_directory_reviewed_subset_activation_pg_upsert import (
     prove_policy_catalog_upserts_preserve_activation,
 )
 from tests.provider_directory_subset_completion_pg_setup import (

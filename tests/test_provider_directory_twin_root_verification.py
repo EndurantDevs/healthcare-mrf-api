@@ -252,26 +252,6 @@ def test_baseline_proof_rejects_invalid_or_inconsistent_evidence(mutation):
         importer._twin_root_baseline_proof(baseline)
 
 
-def test_historical_twin_baseline_replays_under_single_root_profile():
-    baseline = _baseline_map(_candidate())
-
-    selection = importer._verification_terminal_endpoint_dataset_selection(
-        baseline,
-        "dataset_baseline",
-        "endpoint_1",
-        "root_baseline",
-        requires_twin_root_verification=False,
-        verification_campaign_id="reviewed-candidates-v1",
-        verification_source_scope_hash="scope-v1",
-    )
-
-    assert selection is not None
-    assert selection.verification_terminal_status == (
-        importer.ENDPOINT_DATASET_VERIFICATION_BASELINE
-    )
-    assert selection.requires_twin_root_verification is True
-
-
 def test_compatible_baseline_is_exact_and_from_a_distinct_root():
     candidate = _candidate()
     baseline = _baseline_map(candidate)

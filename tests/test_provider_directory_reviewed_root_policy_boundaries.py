@@ -192,6 +192,21 @@ def test_persisted_policy_and_finalized_replay_boundaries():
             _policy_two_candidate(), {}, "validated"
         )
     )
+    baseline = twin._baseline_map(twin._candidate())
+    selection = importer._verification_terminal_endpoint_dataset_selection(
+        baseline,
+        "dataset_baseline",
+        "endpoint_1",
+        "root_baseline",
+        requires_twin_root_verification=False,
+        verification_campaign_id="reviewed-candidates-v1",
+        verification_source_scope_hash="scope-v1",
+    )
+    assert selection is not None
+    assert selection.verification_terminal_status == (
+        importer.ENDPOINT_DATASET_VERIFICATION_BASELINE
+    )
+    assert selection.requires_twin_root_verification is True
 
 
 @pytest.mark.asyncio

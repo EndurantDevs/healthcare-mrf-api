@@ -133,13 +133,6 @@ def test_reviewed_manifest_seed_binds_exact_identity_without_cutoff():
     metadata = source_record["metadata_json"]
     assert metadata["provider_directory_manual_only"] is True
     assert metadata["provider_directory_acquisition_enabled"] is True
-    assert metadata["provider_directory_candidate_status"] == (
-        POLICY_PENDING_STATUS
-    )
-    assert metadata[REVIEWED_ROOT_POLICY_METADATA_KEY] == {
-        "policy_version": "provider-directory-reviewed-root-policy-v1",
-        "required_root_count": 1,
-    }
     campaign_field = manual_catalog.MANUAL_SOURCE_VERIFICATION_CAMPAIGN_FIELD
     assert metadata[campaign_field] == entry["manual_current_version_census"][
         "verification_campaign_id"

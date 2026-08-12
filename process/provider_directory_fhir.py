@@ -39652,7 +39652,7 @@ def _pending_policy_generation_reset_expression(
     policy_key = literal(REVIEWED_ROOT_POLICY_METADATA_KEY)
     target_campaign = target_metadata.op("->>")(campaign_key)
     incoming_campaign = incoming_metadata.op("->>")(campaign_key)
-    def policy(required_root_count: int) -> Any:
+    def _policy(required_root_count: int) -> Any:
         return func.jsonb_build_object(
             literal("policy_version"),
             literal(REVIEWED_ROOT_POLICY_VERSION),
@@ -39665,10 +39665,10 @@ def _pending_policy_generation_reset_expression(
         incoming_campaign.is_distinct_from(target_campaign),
         target_metadata.op("->>")(status_key)
         == literal(PROVIDER_DIRECTORY_ROOT_POLICY_PENDING),
-        target_metadata.op("->")(policy_key) == policy(2),
+        target_metadata.op("->")(policy_key) == _policy(2),
         incoming_metadata.op("->>")(status_key)
         == literal(PROVIDER_DIRECTORY_ROOT_POLICY_PENDING),
-        incoming_metadata.op("->")(policy_key) == policy(1),
+        incoming_metadata.op("->")(policy_key) == _policy(1),
         target_metadata.op("?")(
             literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY)
         )
@@ -39699,7 +39699,7 @@ def _pending_policy_generation_reset_sql(
     policy_key = REVIEWED_ROOT_POLICY_METADATA_KEY
     activation_key = REVIEWED_SUBSET_ACTIVATION_METADATA_KEY
     activation_key_v2 = REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2
-    def policy(required_root_count: int) -> str:
+    def _policy(required_root_count: int) -> str:
         return (
             "pg_catalog.jsonb_build_object("
             f"'policy_version', '{REVIEWED_ROOT_POLICY_VERSION}', "
@@ -39713,10 +39713,10 @@ def _pending_policy_generation_reset_sql(
         f"{target_metadata} ->> '{campaign_key}' "
         f"AND {target_metadata} ->> '{status_key}' = "
         f"'{PROVIDER_DIRECTORY_ROOT_POLICY_PENDING}' "
-        f"AND {target_metadata} -> '{policy_key}' = {policy(2)} "
+        f"AND {target_metadata} -> '{policy_key}' = {_policy(2)} "
         f"AND {incoming_metadata} ->> '{status_key}' = "
         f"'{PROVIDER_DIRECTORY_ROOT_POLICY_PENDING}' "
-        f"AND {incoming_metadata} -> '{policy_key}' = {policy(1)} "
+        f"AND {incoming_metadata} -> '{policy_key}' = {_policy(1)} "
         f"AND NOT ({target_metadata} ? '{activation_key}') "
         f"AND NOT ({target_metadata} ? '{activation_key_v2}') "
         f"AND NOT ({incoming_metadata} ? '{activation_key}') "
