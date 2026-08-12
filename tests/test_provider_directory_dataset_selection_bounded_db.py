@@ -9,11 +9,15 @@ import json
 
 import pytest
 
+from api.provider_directory_source_catalog_outcomes import (
+    _canonical_validated_datasets_by_source_id,
+)
 from process.provider_directory_fhir_subset_canonical import (
     canonical_payload_sha256,
 )
 from tests.test_provider_directory_dataset_artifact_db import (
     _dataset_database,
+    _insert_validated_shared_dataset,
     importer,
 )
 
@@ -198,6 +202,46 @@ async def _all_source_projected_rows(database) -> list[dict[str, object]]:
     return [dict(database_row._mapping) for database_row in projected_rows]
 
 
+async def _install_unrelated_large_proof_hash_sentinel(database, schema: str) -> None:
+    """Fail if exact-source selection hashes an unrelated large proof."""
+    metadata_by_field = _large_metadata_by_field()
+    metadata_by_field.update(source_ids=["source_unrelated"], unrelated_probe=True)
+    await database.status(
+        f"ALTER FUNCTION {schema}.provider_directory_subset_payload_sha256(jsonb) "
+        "RENAME TO provider_directory_subset_payload_sha256_original;"
+    )
+    await database.status(
+        f"""CREATE FUNCTION {schema}.provider_directory_subset_payload_sha256(candidate jsonb)
+        RETURNS text LANGUAGE plpgsql AS $function$ BEGIN
+            IF candidate ? 'unrelated_probe' THEN RAISE EXCEPTION
+                'unrelated_provider_directory_dataset_evaluated'; END IF;
+            RETURN {schema}.provider_directory_subset_payload_sha256_original(candidate);
+        END; $function$;"""
+    )
+    await database.status(
+        f"INSERT INTO {schema}.provider_directory_api_endpoint (endpoint_id) "
+        "VALUES ('endpoint_unrelated');"
+    )
+    await database.status(
+        f"INSERT INTO {schema}.provider_directory_endpoint_dataset ("
+        "dataset_id, endpoint_id, import_run_id, acquisition_root_run_id, "
+        "dataset_hash, status, is_current, resource_count, validated_at, published_at, "
+        "publication_metadata_json"
+        ") VALUES ("
+        "'dataset_unrelated', 'endpoint_unrelated', 'run-unrelated', "
+        "'root-unrelated', repeat('9', 64), :published_status, true, 1, NULL, now(), "
+        "CAST(:metadata AS json)"
+        "), ("
+        "'dataset_unrelated_candidate', 'endpoint_unrelated', 'run-unrelated-candidate', "
+        "'root-unrelated-candidate', repeat('8', 64), :validated_status, false, 1, now(), NULL, "
+        "CAST(:metadata AS json)"
+        ");",
+        published_status=importer.ENDPOINT_DATASET_PUBLISHED,
+        validated_status=importer.ENDPOINT_DATASET_VALIDATED,
+        metadata=json.dumps(metadata_by_field),
+    )
+
+
 def _replace_with_legacy_contract(proof_by_field: dict[str, object]) -> None:
     """Make a sealed proof disagree with its semantic parent contract."""
 
@@ -320,6 +364,18 @@ async def test_all_source_projection_keeps_large_proof_server_side(monkeypatch):
         ]
         assert max(projected_byte_count_list) < 8_192
         assert sum(projected_byte_count_list) < 16_384
+
+
+@pytest.mark.asyncio
+async def test_explicit_selection_does_not_evaluate_unrelated_metadata(monkeypatch):
+    """Scope the candidate-aware catalog path before full proof work."""
+    async with _dataset_database(monkeypatch) as (database, schema):
+        await _insert_validated_shared_dataset(database, schema)
+        await _install_unrelated_large_proof_hash_sentinel(database, schema)
+        selected = await _canonical_validated_datasets_by_source_id(
+            ["source_primary"]
+        )
+        assert selected["source_primary"].dataset_id == "dataset_candidate"
 
 
 @pytest.mark.asyncio
