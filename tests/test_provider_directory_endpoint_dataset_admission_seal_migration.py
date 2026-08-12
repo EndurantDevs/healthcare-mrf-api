@@ -108,6 +108,12 @@ def _assert_exact_column_adoption(
     assert "attribute.attnotnull IS FALSE" in adoption_fence
     assert "attribute.attgenerated = ''" in adoption_fence
     assert "default_value.adbin IS NULL" in adoption_fence
+    assert "adopted_columns_populated" in adoption_fence
+    assert "content_proof_admission_version IS NOT NULL" in adoption_fence
+    assert (
+        "provider_directory_endpoint_dataset_admission_columns_populated"
+        in adoption_fence
+    )
     assert all(type_name in adoption_fence for type_name in (
         "jsonb", "character varying(64)", "smallint",
         "character varying(32)", "character varying(64)[]",

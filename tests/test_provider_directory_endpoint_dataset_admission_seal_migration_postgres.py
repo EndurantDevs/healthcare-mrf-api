@@ -92,10 +92,36 @@ async def _upgrade_legacy_surface(
         proof_migration._payload_canonical_json_function_sql(schema)
     )
     await connection.execute(proof_migration._payload_sha256_function_sql(schema))
+    await _assert_populated_adoption_rejected(connection, schema, migration)
     await _run_migration(migration, "upgrade", connection)
     await _assert_catalog_contract(connection, schema)
     await _assert_legacy_surface_contract(connection, schema, migration, scoped=True)
     await _assert_receipt_only_update_is_scoped(connection, schema)
+
+
+async def _assert_populated_adoption_rejected(
+    connection,
+    schema: str,
+    migration,
+) -> None:
+    """Reject pre-migration receipt values that no prior guard validated."""
+
+    table = f'"{schema}".provider_directory_endpoint_dataset'
+    await connection.execute(migration._add_columns_sql(schema))
+    await connection.execute(
+        f"INSERT INTO {table} (dataset_id, content_proof_admission_version) "
+        "VALUES ('dataset_partial_adoption', 1)"
+    )
+    with pytest.raises(
+        asyncpg.PostgresError,
+        match=(
+            "provider_directory_endpoint_dataset_admission_columns_populated"
+        ),
+    ):
+        await _run_migration(migration, "upgrade", connection)
+    await connection.execute(
+        f"DELETE FROM {table} WHERE dataset_id = 'dataset_partial_adoption'"
+    )
 
 
 async def _insert_digest_verified_seal(connection, schema: str) -> None:

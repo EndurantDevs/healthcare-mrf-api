@@ -348,6 +348,7 @@ def _column_adoption_fence_sql(schema: str) -> str:
     DECLARE
         present_columns bigint;
         matching_columns bigint;
+        adopted_columns_populated boolean := FALSE;
     BEGIN
         SELECT pg_catalog.count(attribute.attname),
                pg_catalog.count(attribute.attname) FILTER (
@@ -376,6 +377,22 @@ def _column_adoption_fence_sql(schema: str) -> str:
             RAISE EXCEPTION
                 'provider_directory_endpoint_dataset_admission_columns_changed'
                 USING ERRCODE = '55000';
+        END IF;
+        IF present_columns = {len(_SEAL_COLUMNS)} THEN
+            EXECUTE 'SELECT pg_catalog.bool_or('
+                 || 'publication_metadata_summary_json IS NOT NULL OR '
+                 || 'publication_metadata_sha256 IS NOT NULL OR '
+                 || 'content_proof_admission_version IS NOT NULL OR '
+                 || 'content_proof_admission_kind IS NOT NULL OR '
+                 || 'content_proof_admission_sha256 IS NOT NULL OR '
+                 || 'content_proof_resource_types IS NOT NULL) '
+                 || 'FROM {table}'
+               INTO adopted_columns_populated;
+            IF adopted_columns_populated IS TRUE THEN
+                RAISE EXCEPTION
+                    'provider_directory_endpoint_dataset_admission_columns_populated'
+                    USING ERRCODE = '55000';
+            END IF;
         END IF;
     END;
     $migration$;
