@@ -167,6 +167,7 @@ async def _create_endpoint_tables(
             content_proof_admission_kind varchar(32),
             content_proof_admission_sha256 varchar(64),
             content_proof_resource_types varchar(64)[],
+            artifact_selection_receipt_json jsonb,
             completion_proof_required_version integer,
             completion_proof_json jsonb,
             completion_proof_sha256 varchar(64)

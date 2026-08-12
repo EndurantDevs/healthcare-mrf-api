@@ -60,6 +60,7 @@ async def _create_tables(database: Database, schema: str) -> None:
             published_at timestamp,
             superseded_at timestamp,
             publication_metadata_json jsonb,
+            artifact_selection_receipt_json jsonb,
             publication_metadata_summary_json jsonb,
             publication_metadata_sha256 varchar(64),
             content_proof_admission_version smallint,

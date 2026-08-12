@@ -1352,7 +1352,9 @@ def _predecessor_shape_fences(schema: str) -> None:
             _ENDPOINT_DATASET,
             previous._SUBSET_ENDPOINT_DATASET_COLUMNS,
             compatible_columns=(
-                previous._CURRENT_ENDPOINT_DATASET_COLUMNS,
+                previous._RECEIPT_ENDPOINT_DATASET_COLUMNS,
+                previous._ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS,
+                previous._COMBINED_ENDPOINT_DATASET_COLUMNS,
             ),
         )
     )

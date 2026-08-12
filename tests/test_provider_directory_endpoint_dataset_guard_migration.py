@@ -84,6 +84,7 @@ def test_guard_column_contract_matches_the_endpoint_dataset_model(monkeypatch):
         "content_proof_admission_kind",
         "content_proof_admission_sha256",
         "content_proof_resource_types",
+        "artifact_selection_receipt_json",
         "completion_proof_required_version",
         "completion_proof_json",
         "completion_proof_sha256",
@@ -106,7 +107,17 @@ def test_guard_column_contract_matches_the_endpoint_dataset_model(monkeypatch):
         "completion_proof_json",
         "completion_proof_sha256",
     }
-    assert normalized_sql.count("observed_columns IS DISTINCT FROM") == 2
+    assert set(migration.ENDPOINT_DATASET_RECEIPT_COMPATIBLE_COLUMNS) == {
+        "completion_proof_required_version",
+        "completion_proof_json",
+        "completion_proof_sha256",
+        "artifact_selection_receipt_json",
+    }
+    assert set(migration.ENDPOINT_DATASET_COMBINED_COMPATIBLE_COLUMNS) == {
+        *migration.ENDPOINT_DATASET_FORWARD_COMPATIBLE_COLUMNS,
+        "artifact_selection_receipt_json",
+    }
+    assert normalized_sql.count("observed_columns IS DISTINCT FROM") == 4
     assert "provider_directory_endpoint_dataset_guard_schema_changed" in (
         normalized_sql
     )

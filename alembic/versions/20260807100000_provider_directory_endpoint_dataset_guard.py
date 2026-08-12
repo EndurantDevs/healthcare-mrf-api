@@ -42,6 +42,16 @@ ENDPOINT_DATASET_FORWARD_COMPATIBLE_COLUMNS = (
     "content_proof_admission_sha256",
     "content_proof_resource_types",
 )
+ENDPOINT_DATASET_RECEIPT_COMPATIBLE_COLUMNS = (
+    "completion_proof_required_version",
+    "completion_proof_json",
+    "completion_proof_sha256",
+    "artifact_selection_receipt_json",
+)
+ENDPOINT_DATASET_COMBINED_COMPATIBLE_COLUMNS = (
+    ENDPOINT_DATASET_FORWARD_COMPATIBLE_COLUMNS
+    + ("artifact_selection_receipt_json",)
+)
 
 
 def _schema() -> str:
@@ -75,11 +85,27 @@ def _endpoint_dataset_schema_fence_sql(schema: str) -> str:
         + ENDPOINT_DATASET_IMMUTABLE_COLUMNS
         + ENDPOINT_DATASET_FORWARD_COMPATIBLE_COLUMNS
     )
+    expected_receipt_columns = sorted(
+        ENDPOINT_DATASET_MUTABLE_COLUMNS
+        + ENDPOINT_DATASET_IMMUTABLE_COLUMNS
+        + ENDPOINT_DATASET_RECEIPT_COMPATIBLE_COLUMNS
+    )
+    expected_combined_columns = sorted(
+        ENDPOINT_DATASET_MUTABLE_COLUMNS
+        + ENDPOINT_DATASET_IMMUTABLE_COLUMNS
+        + ENDPOINT_DATASET_COMBINED_COMPATIBLE_COLUMNS
+    )
     legacy_array = ", ".join(
         f"'{column}'" for column in expected_legacy_columns
     )
     current_array = ", ".join(
         f"'{column}'" for column in expected_current_columns
+    )
+    receipt_array = ", ".join(
+        f"'{column}'" for column in expected_receipt_columns
+    )
+    combined_array = ", ".join(
+        f"'{column}'" for column in expected_combined_columns
     )
     dataset_ref = _qf(schema, "provider_directory_endpoint_dataset")
     return f"""
@@ -95,7 +121,11 @@ def _endpoint_dataset_schema_fence_sql(schema: str) -> str:
            AND NOT attribute.attisdropped;
         IF observed_columns IS DISTINCT FROM ARRAY[{legacy_array}]::text[]
            AND observed_columns IS DISTINCT FROM
-                ARRAY[{current_array}]::text[] THEN
+                ARRAY[{current_array}]::text[]
+           AND observed_columns IS DISTINCT FROM
+                ARRAY[{receipt_array}]::text[]
+           AND observed_columns IS DISTINCT FROM
+                ARRAY[{combined_array}]::text[] THEN
             RAISE EXCEPTION
                 'provider_directory_endpoint_dataset_guard_schema_changed'
                 USING ERRCODE = '55000';

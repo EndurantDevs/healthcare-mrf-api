@@ -258,12 +258,6 @@ async def _assert_bounded_followup_projections(database) -> None:
 
 
 async def _assert_additive_proof_preserves_raw_metadata(database, schema: str) -> None:
-    raw_before = await database.first(
-        f"SELECT md5(publication_metadata_json::text) AS digest, "
-        f"octet_length(publication_metadata_json::text) AS byte_count "
-        f"FROM {schema}.provider_directory_endpoint_dataset "
-        "WHERE dataset_id = 'dataset_shared'"
-    )
     fence = await importer._resolve_provider_directory_artifact_datasets(
         ["source_primary"]
     )
@@ -271,6 +265,18 @@ async def _assert_additive_proof_preserves_raw_metadata(database, schema: str) -
         candidate_dataset
         for candidate_dataset in fence.datasets
         if candidate_dataset.dataset_id == "dataset_shared"
+    )
+    await database.status(
+        f"UPDATE {schema}.provider_directory_endpoint_dataset "
+        "SET artifact_selection_receipt_json = CAST(:receipt AS jsonb) "
+        "WHERE dataset_id = 'dataset_shared'",
+        receipt=json.dumps({"stale": True}),
+    )
+    raw_before = await database.first(
+        f"SELECT md5(publication_metadata_json::text) AS digest, "
+        f"octet_length(publication_metadata_json::text) AS byte_count "
+        f"FROM {schema}.provider_directory_endpoint_dataset "
+        "WHERE dataset_id = 'dataset_shared'"
     )
     await importer._record_current_dataset_publication_proof(
         dataset,
@@ -287,6 +293,8 @@ async def _assert_additive_proof_preserves_raw_metadata(database, schema: str) -
         "publication_metadata_summary_json, content_proof_admission_version, "
         "content_proof_admission_kind, content_proof_admission_sha256, "
         "content_proof_resource_types) AS digest_valid "
+        ", artifact_selection_receipt_json IS NULL "
+        "AS selection_receipt_invalidated "
         f"FROM {schema}.provider_directory_endpoint_dataset "
         "WHERE dataset_id = 'dataset_shared'"
     )
@@ -295,6 +303,7 @@ async def _assert_additive_proof_preserves_raw_metadata(database, schema: str) -
     assert raw_after._mapping["byte_count"] == raw_before._mapping["byte_count"]
     assert raw_after._mapping["additive_proof"] == {"verified": True}
     assert raw_after._mapping["digest_valid"] is True
+    assert raw_after._mapping["selection_receipt_invalidated"] is True
 
 
 @pytest.mark.asyncio

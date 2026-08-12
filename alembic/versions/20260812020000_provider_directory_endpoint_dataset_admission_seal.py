@@ -1,7 +1,7 @@
 """Add bounded admission receipts for Provider Directory endpoint datasets.
 
-Revision ID: 20260812010000_provider_directory_endpoint_dataset_admission_seal
-Revises: 20260811140000_ptg_v12_provider_publication_merge
+Revision ID: 20260812020000_provider_directory_endpoint_dataset_admission_seal
+Revises: 20260812010000_provider_directory_artifact_selection_receipt
 
 The application terminal validator is the admission authority.  These nullable
 receipts prevent accidental stale or partial writes; they are not cryptographic
@@ -19,8 +19,8 @@ from types import ModuleType
 from alembic import op
 
 
-revision = "20260812010000_provider_directory_endpoint_dataset_admission_seal"
-down_revision = "20260811140000_ptg_v12_provider_publication_merge"
+revision = "20260812020000_provider_directory_endpoint_dataset_admission_seal"
+down_revision = "20260812010000_provider_directory_artifact_selection_receipt"
 branch_labels = None
 depends_on = None
 

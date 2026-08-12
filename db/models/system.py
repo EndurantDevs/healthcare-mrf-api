@@ -1236,6 +1236,7 @@ class ProviderDirectoryEndpointDataset(Base, JSONOutputMixin):
     content_proof_admission_kind = Column(String(32))
     content_proof_admission_sha256 = Column(String(64))
     content_proof_resource_types = Column(ARRAY(String(64)))
+    artifact_selection_receipt_json = Column(JSONB)
     completion_proof_required_version = Column(Integer)
     completion_proof_json = Column(JSONB)
     completion_proof_sha256 = Column(String(64))

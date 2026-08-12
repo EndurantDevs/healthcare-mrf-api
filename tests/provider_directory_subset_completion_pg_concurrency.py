@@ -60,6 +60,10 @@ async def create_committed_subset_schema(monkeypatch):
             "upgrade",
             connection,
         )
+        await connection.execute(
+            f'ALTER TABLE "{schema}".provider_directory_endpoint_dataset '
+            "ADD COLUMN artifact_selection_receipt_json jsonb"
+        )
     return scenario
 
 

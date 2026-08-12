@@ -165,7 +165,7 @@ _SUBSET_ENDPOINT_DATASET_COLUMNS = _LEGACY_ENDPOINT_DATASET_COLUMNS + (
     "completion_proof_json",
     "completion_proof_sha256",
 )
-_ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS = (
+_ADMISSION_SEAL_COLUMNS = (
     "publication_metadata_summary_json",
     "publication_metadata_sha256",
     "content_proof_admission_version",
@@ -173,9 +173,16 @@ _ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS = (
     "content_proof_admission_sha256",
     "content_proof_resource_types",
 )
-_CURRENT_ENDPOINT_DATASET_COLUMNS = (
+_ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS = (
     _SUBSET_ENDPOINT_DATASET_COLUMNS
-    + _ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS
+    + _ADMISSION_SEAL_COLUMNS
+)
+_RECEIPT_ENDPOINT_DATASET_COLUMNS = _SUBSET_ENDPOINT_DATASET_COLUMNS + (
+    "artifact_selection_receipt_json",
+)
+_COMBINED_ENDPOINT_DATASET_COLUMNS = (
+    _ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS
+    + ("artifact_selection_receipt_json",)
 )
 _LEGACY_DATASET_RESOURCE_COLUMNS = (
     "dataset_id",
@@ -4154,7 +4161,9 @@ def upgrade() -> None:
             _LEGACY_ENDPOINT_DATASET_COLUMNS,
             compatible_columns=(
                 _SUBSET_ENDPOINT_DATASET_COLUMNS,
-                _CURRENT_ENDPOINT_DATASET_COLUMNS,
+                _RECEIPT_ENDPOINT_DATASET_COLUMNS,
+                _ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS,
+                _COMBINED_ENDPOINT_DATASET_COLUMNS,
             ),
         )
     )
@@ -4280,7 +4289,11 @@ def upgrade() -> None:
             schema,
             _ENDPOINT_DATASET,
             _SUBSET_ENDPOINT_DATASET_COLUMNS,
-            compatible_columns=(_CURRENT_ENDPOINT_DATASET_COLUMNS,),
+            compatible_columns=(
+                _RECEIPT_ENDPOINT_DATASET_COLUMNS,
+                _ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS,
+                _COMBINED_ENDPOINT_DATASET_COLUMNS,
+            ),
         )
     )
     op.execute(

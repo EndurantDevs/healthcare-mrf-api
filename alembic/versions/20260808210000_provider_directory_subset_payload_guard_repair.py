@@ -49,7 +49,9 @@ def _shape_fence_sqls(schema: str) -> tuple[str, ...]:
             subset._ENDPOINT_DATASET,
             subset._SUBSET_ENDPOINT_DATASET_COLUMNS,
             compatible_columns=(
-                subset._CURRENT_ENDPOINT_DATASET_COLUMNS,
+                subset._RECEIPT_ENDPOINT_DATASET_COLUMNS,
+                subset._ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS,
+                subset._COMBINED_ENDPOINT_DATASET_COLUMNS,
             ),
         ),
         subset._relation_schema_fence_sql(

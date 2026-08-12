@@ -47,6 +47,7 @@ def _source_metadata(resources: list[str]) -> str:
 
 
 async def _create_artifact_tables(database: Database, schema: str) -> None:
+    """Create one disposable schema with the exact resolver columns."""
     await database.status(
         f"CREATE TABLE {schema}.provider_directory_api_endpoint "
         "(endpoint_id varchar(64) PRIMARY KEY);"
@@ -67,6 +68,7 @@ async def _create_artifact_tables(database: Database, schema: str) -> None:
         "validated_at timestamp, "
         "published_at timestamp, "
         "publication_metadata_json jsonb, "
+        "artifact_selection_receipt_json jsonb, "
         "publication_metadata_summary_json jsonb, "
         "publication_metadata_sha256 varchar(64), "
         "content_proof_admission_version smallint, "
@@ -131,9 +133,7 @@ async def _create_artifact_scope_tables(database: Database, schema: str) -> None
     for model in (importer.ProviderDirectorySource, *importer.RESOURCE_MODELS):
         await database.status(
             importer._provider_directory_artifact_scope_table_sql(
-                model,
-                schema,
-                model.__tablename__,
+                model, schema, model.__tablename__,
             )
         )
         for statement in importer._artifact_scope_pk_sql(

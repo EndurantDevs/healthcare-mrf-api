@@ -10957,8 +10957,14 @@ def test_explicit_artifact_selection_sql_scopes_dataset_reads():
     assert "ranked_dataset_ids AS MATERIALIZED" in explicit_sql
     assert "selected_dataset_ids AS MATERIALIZED" in explicit_sql
     assert explicit_sql.index("selected_dataset_ids AS MATERIALIZED") < (
-        explicit_sql.index("provider_directory_subset_payload_sha256")
+        explicit_sql.index("selected_dataset_receipts AS MATERIALIZED")
     )
+    selected_receipt_sql = explicit_sql[
+        explicit_sql.index("selected_dataset_receipts AS MATERIALIZED") :
+        explicit_sql.index("selected_dataset_metadata AS MATERIALIZED")
+    ]
+    assert "artifact_selection_receipt_json" in selected_receipt_sql
+    assert "publication_metadata_json" not in selected_receipt_sql
     assert "requested_endpoint_ids AS MATERIALIZED" not in all_sql
 
 

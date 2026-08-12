@@ -34,7 +34,7 @@ ADMISSION_SEAL_MIGRATION_PATH = (
     ROOT
     / "alembic"
     / "versions"
-    / "20260812010000_provider_directory_endpoint_dataset_admission_seal.py"
+    / "20260812020000_provider_directory_endpoint_dataset_admission_seal.py"
 )
 POSTGRES_DSN_ENV = "HLTHPRT_TIN_NPI_CONNECTOR_POSTGRES_DSN"
 TEST_DATABASE_PATTERN = re.compile(r"(?:^|[_-])test(?:[_-]|$)", re.IGNORECASE)

@@ -24,7 +24,7 @@ MIGRATION_PATH = (
     ROOT
     / "alembic"
     / "versions"
-    / "20260812010000_provider_directory_endpoint_dataset_admission_seal.py"
+    / "20260812020000_provider_directory_endpoint_dataset_admission_seal.py"
 )
 PROOF_MIGRATION_PATH = (
     ROOT
@@ -72,10 +72,10 @@ def test_upgrade_is_nullable_bounded_and_application_trusted(monkeypatch) -> Non
 
 def _assert_upgrade_identity(migration, statements: list[str]) -> None:
     assert migration.revision == (
-        "20260812010000_provider_directory_endpoint_dataset_admission_seal"
+        "20260812020000_provider_directory_endpoint_dataset_admission_seal"
     )
     assert migration.down_revision == (
-        "20260811140000_ptg_v12_provider_publication_merge"
+        "20260812010000_provider_directory_artifact_selection_receipt"
     )
     assert len(statements) == 43
 
