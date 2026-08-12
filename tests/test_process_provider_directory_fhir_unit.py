@@ -10918,6 +10918,25 @@ def test_artifact_dataset_selection_projects_only_bounded_dataset_fields():
     assert "dataset.completion_proof_json" not in projection_sql
 
 
+def test_explicit_artifact_selection_scopes_heavy_dataset_evaluation():
+    published_sql = importer._provider_directory_artifact_dataset_selection_sql(
+        ["source_a"]
+    )
+    candidate_sql = importer._provider_directory_artifact_dataset_selection_sql(
+        ["source_a"],
+        should_select_validated_candidates=True,
+    )
+
+    for sql in (published_sql, candidate_sql):
+        assert "requested_source_scope AS MATERIALIZED" in sql
+        assert "artifact_endpoint_scope AS MATERIALIZED" in sql
+        assert "artifact_dataset_scope AS MATERIALIZED" in sql
+        assert sql.count("FROM artifact_dataset_scope AS dataset") == 2
+    assert "validated_candidate_aliases AS MATERIALIZED" not in published_sql
+    assert "validated_candidate_aliases AS MATERIALIZED" in candidate_sql
+    assert "candidate.publication_source_ids" in candidate_sql
+
+
 @pytest.mark.asyncio
 async def test_humana_explicit_artifact_selection_rejects_18_alias_expansion(
     monkeypatch,
