@@ -38,6 +38,9 @@ from tests.test_provider_directory_profile_uhc_flex import (
 from process.provider_directory_rooted_graph_source_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
 )
+from process.provider_directory_rooted_graph_twin_contract import (
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
+)
 
 
 def test_json_and_metadata_helpers_fail_closed() -> None:
@@ -182,6 +185,42 @@ def test_rooted_metadata_accepts_legacy_distinct_or_rooted_equal_lineage() -> No
         endpoint_id=GRAPH_ENDPOINT_ID,
         evidence_run_id=metadata["acquisition_root_run_id"],
     )
+
+
+def test_rooted_metadata_requires_disjoint_admission_evidence() -> None:
+    twin_metadata_by_field = _rooted_metadata()
+    for field_name in (
+        "provider_directory_reviewed_root_policy_v1",
+        "acquisition_operation_key",
+    ):
+        assert not flex_profile.is_uhc_flex_publication_metadata_valid(
+            {**twin_metadata_by_field, field_name: None},
+            dataset_id=GRAPH_DATASET_ID,
+            endpoint_id=GRAPH_ENDPOINT_ID,
+            evidence_run_id=twin_metadata_by_field["acquisition_root_run_id"],
+        )
+
+    single_metadata_by_field = {
+        **twin_metadata_by_field,
+        "admission_contract_id": (
+            PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID
+        ),
+        "attempt_id": None,
+        "comparison_acquisition_id": None,
+        "provider_directory_reviewed_root_policy_v1": (
+            ReviewedRootPolicy(1).document()
+        ),
+        "acquisition_operation_key": "a" * 64,
+    }
+    for field_name in ("attempt_id", "comparison_acquisition_id"):
+        incomplete_metadata_by_field = dict(single_metadata_by_field)
+        incomplete_metadata_by_field.pop(field_name)
+        assert not flex_profile.is_uhc_flex_publication_metadata_valid(
+            incomplete_metadata_by_field,
+            dataset_id=GRAPH_DATASET_ID,
+            endpoint_id=GRAPH_ENDPOINT_ID,
+            evidence_run_id=single_metadata_by_field["acquisition_root_run_id"],
+        )
 
 
 def test_rooted_metadata_roundtrip_uses_exact_unordered_family_set() -> None:

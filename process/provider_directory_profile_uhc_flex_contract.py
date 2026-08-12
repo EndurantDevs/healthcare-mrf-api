@@ -263,14 +263,16 @@ def _is_rooted_admission_metadata_valid(
                 or ""
             )
             is not None
-            and publication_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY) is None
-            and publication_metadata.get("acquisition_operation_key") is None
+            and REVIEWED_ROOT_POLICY_METADATA_KEY not in publication_metadata
+            and "acquisition_operation_key" not in publication_metadata
         )
     return bool(
         contract_id
         == PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID
-        and publication_metadata.get("attempt_id") is None
-        and publication_metadata.get("comparison_acquisition_id") is None
+        and "attempt_id" in publication_metadata
+        and publication_metadata["attempt_id"] is None
+        and "comparison_acquisition_id" in publication_metadata
+        and publication_metadata["comparison_acquisition_id"] is None
         and publication_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
         == ReviewedRootPolicy(1).document()
         and re.fullmatch(
