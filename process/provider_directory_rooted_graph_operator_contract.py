@@ -159,6 +159,8 @@ def require_rooted_graph_operator_gate(phase: str) -> None:
     expected_gate = _GATE_BY_PHASE.get(phase)
     if expected_gate is None:
         raise ProviderDirectoryRootedGraphOperatorError("invalid_request")
+    if phase == "acquire":
+        raise ProviderDirectoryRootedGraphOperatorError("disabled")
     enabled_gates = {
         gate_name
         for gate_name in _GATE_BY_PHASE.values()

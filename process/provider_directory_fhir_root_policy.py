@@ -12,7 +12,7 @@ REVIEWED_ROOT_POLICY_METADATA_KEY = (
     "provider_directory_reviewed_root_policy_v1"
 )
 REVIEWED_ROOT_POLICY_VERSION = "provider-directory-reviewed-root-policy-v1"
-DEFAULT_REQUIRED_ROOT_COUNT = 2
+LEGACY_REQUIRED_ROOT_COUNT = 2
 ALLOWED_REQUIRED_ROOT_COUNTS = frozenset({1, 2})
 
 LEGACY_PENDING_STATUS = "pending_two_matching_reviewed_subset_acquisitions"
@@ -115,7 +115,7 @@ def reviewed_root_policy_for_status(
             raise ValueError(
                 "provider_directory_reviewed_root_policy_status_mismatch"
             )
-        return ReviewedRootPolicy(DEFAULT_REQUIRED_ROOT_COUNT)
+        return ReviewedRootPolicy(LEGACY_REQUIRED_ROOT_COUNT)
     if status in POLICY_REVIEWED_STATUSES:
         if explicit_policy is None:
             raise ValueError(

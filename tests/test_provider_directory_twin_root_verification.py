@@ -195,23 +195,15 @@ async def test_verification_baseline_store_does_not_mark_dataset_validated():
 
 
 @pytest.mark.asyncio
-async def test_pending_candidate_requires_a_root_run(monkeypatch):
+async def test_legacy_pending_candidate_cannot_start_acquisition(monkeypatch):
     monkeypatch.setattr(
         importer,
-        "_select_endpoint_dataset_candidate",
-        AsyncMock(
-            return_value=importer.EndpointDatasetCandidateSelection(
-                dataset_id="dataset_candidate",
-                acquisition_root_run_id=None,
-                previous_dataset_id=None,
-                reused_from_checkpoint=False,
-                resource_hash_contract=importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
-            )
-        ),
+        "_endpoint_dataset_state",
+        AsyncMock(return_value={}),
     )
     ensure_candidate = AsyncMock()
     monkeypatch.setattr(importer, "_ensure_endpoint_dataset_candidate", ensure_candidate)
-    with pytest.raises(RuntimeError, match="verification_root_required"):
+    with pytest.raises(RuntimeError, match="single_root_required"):
         await importer._prepare_endpoint_dataset_candidate(
             [
                 {
@@ -258,6 +250,26 @@ def test_baseline_proof_rejects_invalid_or_inconsistent_evidence(mutation):
     mutation(baseline)
     with pytest.raises(RuntimeError, match="verification_baseline_invalid"):
         importer._twin_root_baseline_proof(baseline)
+
+
+def test_historical_twin_baseline_replays_under_single_root_profile():
+    baseline = _baseline_map(_candidate())
+
+    selection = importer._verification_terminal_endpoint_dataset_selection(
+        baseline,
+        "dataset_baseline",
+        "endpoint_1",
+        "root_baseline",
+        requires_twin_root_verification=False,
+        verification_campaign_id="reviewed-candidates-v1",
+        verification_source_scope_hash="scope-v1",
+    )
+
+    assert selection is not None
+    assert selection.verification_terminal_status == (
+        importer.ENDPOINT_DATASET_VERIFICATION_BASELINE
+    )
+    assert selection.requires_twin_root_verification is True
 
 
 def test_compatible_baseline_is_exact_and_from_a_distinct_root():

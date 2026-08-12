@@ -143,7 +143,7 @@ def _add_acquisition_arguments(parser: argparse.ArgumentParser) -> None:
         required=True,
         type=_projection_date,
         metavar="YYYY-MM-DD",
-        help="Exact semantic projection date for both independent roots.",
+        help="Legacy semantic projection date retained for argument validation.",
     )
     parser.add_argument("--concurrency", type=_concurrency, default=4)
     parser.add_argument("--max-attempts", type=_max_attempts, default=3)
@@ -164,8 +164,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = RedactedArgumentParser(
         allow_abbrev=False,
         description=(
-            "Seal an official Practitioner NPI cohort, acquire and admit its "
-            "exact Flex twins, or publish one admitted candidate."
+            "Seal an official Practitioner NPI cohort or publish one exact "
+            "historical admission; legacy acquisition remains disabled."
         ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
@@ -355,6 +355,9 @@ def run_command(arguments: Sequence[str] | None = None) -> int:
     """Run one gated phase with deterministic JSON-only output."""
 
     parsed_arguments = _parser().parse_args(arguments)
+    if parsed_arguments.command == "acquire-admit":
+        _print_error("disabled")
+        return 1
     try:
         rendered_result = asyncio.run(_run_operation(parsed_arguments))
     except asyncio.CancelledError as error:

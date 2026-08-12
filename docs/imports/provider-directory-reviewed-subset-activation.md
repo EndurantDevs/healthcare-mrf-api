@@ -2,7 +2,7 @@
 
 The selector-free activation subcommand is the only supported way to move the
 fixed reviewed Provider Directory source from pending review to verified
-review under its immutable root-count policy. It is default-off, changes no
+review under its immutable one-root policy. It is default-off, changes no
 dataset state, and does not publish or make a dataset current. The separately
 gated terminal operators below seal exact proofless failed datasets without
 activating or publishing them.
@@ -12,8 +12,8 @@ activating or publishing them.
 The checked-in
 [`provider_directory_reviewed_subset_activation.json`](../../specs/provider_directory_reviewed_subset_activation.json)
 is the sole authorization input. It starts in the pending state with `null`
-evidence. After the configured number of acquisition roots have satisfied the
-policy, a normal pull request may change it to the verified state with exactly
+evidence. After one complete acquisition has satisfied the policy, a normal
+pull request may change it to the verified state with exactly
 these neutral evidence fields:
 
 - `source_contract_sha256`
@@ -25,11 +25,11 @@ An explicit-policy manifest also carries the closed `root_policy` object at
 top level. The cutoff is canonical UTC with microseconds and a trailing `Z`.
 The manifest must not contain source, endpoint, root, dataset, URL, token, or
 provider identifiers. Review must bind the four values to the retained
-root-neutral proof and confirm that each root has separately valid replay and
-coverage evidence. The PR follows ordinary review, CI, merge, post-merge CI,
+completion proof and confirm that the root has valid replay and coverage
+evidence. The PR follows ordinary review, CI, merge, post-merge CI,
 image, migration, GitOps, and workload-readiness gates before the sync is run.
 
-After all roots required by the policy are sealed, render the complete neutral
+After the required root is sealed, render the complete neutral
 manifest from one read-only repeatable-read database snapshot. The command
 accepts no source, endpoint, root, dataset, campaign, or cutoff selector:
 
@@ -42,7 +42,7 @@ accepts no source, endpoint, root, dataset, campaign, or cutoff selector:
 Its single JSON result is ready to replace the checked-in manifest. It contains
 only the fixed manifest fields and the four neutral evidence values; private
 source, endpoint, dataset, and root identities are never rendered. Reviewers
-must still compare the result with both retained roots and follow the ordinary
+must still compare the result with the retained root and follow the ordinary
 pull-request and release gates above. Rendering evidence is read-only and does
 not enable activation or publication.
 
@@ -74,9 +74,9 @@ database marker and its retained proof still validate. Evidence or state drift
 fails closed without a partial status change.
 
 Activation changes only the source candidate status, a closed private database
-marker, and `updated_at`. The private marker binds the selected candidate and,
-when required, its baseline, but those identities never enter the checked-in
-manifest or operator output. Ordinary source catalog upserts preserve the
+marker, and `updated_at`. The private marker binds the selected candidate;
+historical markers may also retain their baseline. Those identities never enter
+the checked-in manifest or operator output. Ordinary source catalog upserts preserve the
 verified marker and status while PostgreSQL rejects fixed-contract drift.
 
 ## Abandon an expired acquisition root
@@ -113,10 +113,9 @@ activation.
 Abandonment does not publish, delete, reset, or reuse the old root. Its rows,
 proof shards, checkpoints, cursor commitments, and failed Job evidence remain
 immutable for audit. Continue only with genuinely fresh acquisition roots and
-no retry or pagination-root arguments. Every root required by the next campaign
-must use the same newly frozen cutoff, root-count policy, and reviewed transport
-profile. A two-root campaign still requires distinct roots with independently
-matching terminal proofs.
+no retry or pagination-root arguments. The next campaign uses one fresh root,
+one newly frozen cutoff, the required one-root policy, and the reviewed
+transport profile.
 
 ## Seal an exact mixed terminal root
 

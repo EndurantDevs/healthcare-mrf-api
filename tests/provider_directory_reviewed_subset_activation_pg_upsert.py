@@ -307,6 +307,151 @@ def _policy_incoming_metadata(note: str) -> dict[str, object]:
     }
 
 
+def _pending_policy_metadata(
+    campaign_id: str,
+    required_root_count: int,
+    note: str,
+) -> dict[str, object]:
+    return {
+        "provider_directory_candidate_status": POLICY_PENDING_STATUS,
+        "provider_directory_verification_campaign_id": campaign_id,
+        REVIEWED_ROOT_POLICY_METADATA_KEY: reviewed_root_policy_document(
+            required_root_count
+        ),
+        "provider_directory_acquisition_enabled": True,
+        "ordinary_catalog_note": note,
+    }
+
+
+async def _insert_pending_policy_source(
+    scenario,
+    *,
+    source_id: str,
+    endpoint_id: str,
+    metadata: dict[str, object],
+) -> None:
+    await scenario.connection.execute(
+        f"""
+        INSERT INTO {scenario.quoted_schema}.provider_directory_api_endpoint (
+            endpoint_id
+        ) VALUES ($1)
+        """,
+        endpoint_id,
+    )
+    await scenario.connection.execute(
+        f"""
+        INSERT INTO {scenario.quoted_schema}.provider_directory_source (
+            source_id, endpoint_id, canonical_api_base,
+            requires_registration, requires_api_key, auth_type,
+            metadata_json, updated_at
+        ) VALUES (
+            $1, $2, 'https://directory.example.test/fhir',
+            false, false, 'none', $3::jsonb,
+            pg_catalog.transaction_timestamp()
+        )
+        """,
+        source_id,
+        endpoint_id,
+        json.dumps(metadata, sort_keys=True),
+    )
+
+
+async def _source_metadata(scenario, source_id: str) -> dict[str, object]:
+    raw_metadata = await scenario.connection.fetchval(
+        f"""
+        SELECT metadata_json::text
+          FROM {scenario.quoted_schema}.provider_directory_source
+         WHERE source_id = $1
+        """,
+        source_id,
+    )
+    return json.loads(raw_metadata)
+
+
+async def prove_pending_policy_two_campaign_reset(scenario) -> None:
+    """Reset only an unactivated pending policy-two generation."""
+
+    old_campaign = "reviewed-campaign-policy-two-v1"
+    new_campaign = "reviewed-campaign-policy-one-v2"
+    cases = (
+        ("policy-reset-values", "endpoint-policy-reset-values", "values"),
+        ("policy-reset-copy", "endpoint-policy-reset-copy", "copy"),
+    )
+    for source_id, endpoint_id, upsert_path in cases:
+        await _insert_pending_policy_source(
+            scenario,
+            source_id=source_id,
+            endpoint_id=endpoint_id,
+            metadata=_pending_policy_metadata(old_campaign, 2, "old"),
+        )
+        incoming = _pending_policy_metadata(
+            new_campaign,
+            1,
+            f"{upsert_path}-path",
+        )
+        if upsert_path == "values":
+            sql, parameters = _values_upsert_sql(
+                scenario,
+                note="values-path",
+                source_id=source_id,
+                endpoint_id=endpoint_id,
+                incoming_metadata=incoming,
+            )
+            await scenario.connection.execute(sql, *parameters)
+        else:
+            await scenario.connection.execute(
+                _copy_upsert_sql(
+                    scenario,
+                    source_id=source_id,
+                    endpoint_id=endpoint_id,
+                ),
+                json.dumps(incoming, sort_keys=True),
+            )
+        metadata = await _source_metadata(scenario, source_id)
+        assert metadata["provider_directory_verification_campaign_id"] == (
+            new_campaign
+        )
+        assert metadata["provider_directory_candidate_status"] == (
+            POLICY_PENDING_STATUS
+        )
+        assert metadata[REVIEWED_ROOT_POLICY_METADATA_KEY] == (
+            reviewed_root_policy_document(1)
+        )
+        assert ACTIVATION_METADATA_KEY not in metadata
+        assert ACTIVATION_METADATA_KEY_V2 not in metadata
+
+    same_campaign_source = "policy-preserve-same-campaign"
+    same_campaign_endpoint = "endpoint-policy-preserve-same-campaign"
+    await _insert_pending_policy_source(
+        scenario,
+        source_id=same_campaign_source,
+        endpoint_id=same_campaign_endpoint,
+        metadata=_pending_policy_metadata(old_campaign, 2, "old"),
+    )
+    sql, parameters = _values_upsert_sql(
+        scenario,
+        note="same-campaign",
+        source_id=same_campaign_source,
+        endpoint_id=same_campaign_endpoint,
+        incoming_metadata=_pending_policy_metadata(
+            old_campaign,
+            1,
+            "same-campaign",
+        ),
+    )
+    await scenario.connection.execute(sql, *parameters)
+    same_campaign_metadata = await _source_metadata(
+        scenario,
+        same_campaign_source,
+    )
+    assert same_campaign_metadata[REVIEWED_ROOT_POLICY_METADATA_KEY] == (
+        reviewed_root_policy_document(2)
+    )
+    assert same_campaign_metadata["provider_directory_candidate_status"] == (
+        POLICY_PENDING_STATUS
+    )
+
+
 async def _assert_policy_marker_and_note(
     scenario,
     marker_by_field,
@@ -359,5 +504,30 @@ async def prove_policy_catalog_upserts_preserve_activation(
         "provider_directory_reviewed_subset_activation_transition_invalid",
         drift_sql,
         *drift_parameters,
+    )
+    await _assert_policy_marker_and_note(scenario, marker_by_field, "copy-path")
+
+    next_campaign = marker_by_field["verification_campaign_id"] + "-next"
+    reset_metadata = _pending_policy_metadata(
+        next_campaign,
+        1,
+        "activated-reset",
+    )
+    reset_sql, reset_parameters = _values_upsert_sql(
+        scenario,
+        note="activated-reset-values",
+        incoming_metadata=reset_metadata,
+    )
+    await expect_postgres_error(
+        scenario.connection,
+        "provider_directory_reviewed_subset_activation_transition_invalid",
+        reset_sql,
+        *reset_parameters,
+    )
+    await expect_postgres_error(
+        scenario.connection,
+        "provider_directory_reviewed_subset_activation_transition_invalid",
+        _copy_upsert_sql(scenario),
+        json.dumps(reset_metadata, sort_keys=True),
     )
     await _assert_policy_marker_and_note(scenario, marker_by_field, "copy-path")

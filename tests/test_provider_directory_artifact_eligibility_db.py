@@ -18,6 +18,9 @@ from tests.provider_directory_subset_completion_pg_setup import (
 from tests.provider_directory_artifact_eligibility_support import (
     content_proof as _content_proof,
 )
+from tests.provider_directory_fhir_subset_activation_support import (
+    activation_inputs,
+)
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -53,12 +56,17 @@ async def _create_tables(database: Database, schema: str) -> None:
         CREATE TABLE {schema}.provider_directory_endpoint_dataset (
             dataset_id varchar(96) PRIMARY KEY,
             endpoint_id varchar(64) NOT NULL,
+            import_run_id varchar(64),
             acquisition_root_run_id varchar(64),
+            previous_dataset_id varchar(96),
             dataset_hash varchar(64),
             status varchar(32) NOT NULL,
             is_current boolean NOT NULL DEFAULT false,
             resource_count bigint NOT NULL DEFAULT 0,
             superseded_at timestamp,
+            created_at timestamp,
+            validated_at timestamp,
+            published_at timestamp,
             publication_metadata_json jsonb,
             completion_proof_required_version integer,
             completion_proof_json jsonb,
@@ -372,10 +380,12 @@ async def _set_twin_metadata(
 
 async def _compact_candidate_ids(
     database: Database,
+    endpoint_id: str = ENDPOINT_ID,
+    source_id: str = "source_a",
 ) -> list[str]:
     current_dataset = importer.ProviderDirectoryArtifactDataset(
-        source_id="source_a",
-        endpoint_id=ENDPOINT_ID,
+        source_id=source_id,
+        endpoint_id=endpoint_id,
         serving_endpoint_id=SERVING_ENDPOINT_ID,
         dataset_id="dataset_current",
         evidence_run_id="root_current",
@@ -391,7 +401,7 @@ async def _compact_candidate_ids(
         fence,
         database,
     )
-    return eligible_ids_by_endpoint.get(ENDPOINT_ID, [])
+    return eligible_ids_by_endpoint.get(endpoint_id, [])
 
 
 async def _assert_candidate_eligibility(
@@ -474,3 +484,116 @@ async def test_verified_gate_keeps_incumbent_and_exact_matched_candidate(
         assert _option_ids(await _artifact_options(database, schema)) == [
             "dataset_current"
         ]
+
+
+async def _insert_policy_two_subset_pair(
+    database: Database,
+    schema: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    source_record, dataset_rows, _evidence = activation_inputs()
+    policy_document = importer.ReviewedRootPolicy(2).document()
+    source_metadata = copy.deepcopy(source_record["metadata_json"])
+    source_metadata["provider_directory_candidate_status"] = (
+        importer.PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED
+    )
+    source_metadata[importer.REVIEWED_ROOT_POLICY_METADATA_KEY] = policy_document
+    await database.status(
+        f"""
+        INSERT INTO {schema}.provider_directory_source (
+            source_id, endpoint_id, metadata_json
+        ) VALUES (:source_id, :endpoint_id, CAST(:metadata AS jsonb));
+        """,
+        source_id=source_record["source_id"],
+        endpoint_id=source_record["endpoint_id"],
+        metadata=json.dumps(source_metadata),
+    )
+    inserted_rows = []
+    for dataset_row in dataset_rows:
+        explicit_policy_row = copy.deepcopy(dataset_row)
+        explicit_policy_row["publication_metadata_json"][
+            importer.REVIEWED_ROOT_POLICY_METADATA_KEY
+        ] = policy_document
+        await database.status(
+            f"""
+            INSERT INTO {schema}.provider_directory_endpoint_dataset (
+                dataset_id, endpoint_id, import_run_id,
+                acquisition_root_run_id, previous_dataset_id, dataset_hash,
+                status, is_current, resource_count, validated_at,
+                publication_metadata_json,
+                completion_proof_required_version, completion_proof_json,
+                completion_proof_sha256
+            ) VALUES (
+                :dataset_id, :endpoint_id, :root_run_id,
+                :root_run_id, NULL, :dataset_hash,
+                :status, false, :resource_count, :validated_at,
+                CAST(:metadata AS jsonb), :required_version,
+                CAST(:completion_proof AS jsonb), :completion_sha256
+            );
+            """,
+            dataset_id=explicit_policy_row["dataset_id"],
+            endpoint_id=explicit_policy_row["endpoint_id"],
+            root_run_id=explicit_policy_row["acquisition_root_run_id"],
+            dataset_hash=explicit_policy_row["dataset_hash"],
+            status=explicit_policy_row["status"],
+            resource_count=explicit_policy_row["resource_count"],
+            validated_at=explicit_policy_row["validated_at"],
+            metadata=json.dumps(explicit_policy_row["publication_metadata_json"]),
+            required_version=explicit_policy_row[
+                "completion_proof_required_version"
+            ],
+            completion_proof=json.dumps(
+                explicit_policy_row["completion_proof_json"]
+            ),
+            completion_sha256=explicit_policy_row["completion_proof_sha256"],
+        )
+        inserted_rows.append(explicit_policy_row)
+    return source_record, inserted_rows[1]
+
+
+@pytest.mark.asyncio
+async def test_explicit_policy_two_candidate_remains_eligible_and_publishable(
+    monkeypatch,
+):
+    async with _candidate_database(monkeypatch) as (database, schema):
+        source_record, candidate_row = await _insert_policy_two_subset_pair(
+            database,
+            schema,
+        )
+        endpoint_id = candidate_row["endpoint_id"]
+        candidate_id = candidate_row["dataset_id"]
+        assert _option_ids(await _artifact_options(database, schema, endpoint_id)) == [
+            candidate_id
+        ]
+        assert await _compact_candidate_ids(
+            database,
+            endpoint_id,
+            source_record["source_id"],
+        ) == [candidate_id]
+
+        monkeypatch.setattr(importer, "db", database)
+        await importer._publish_validated_artifact_dataset(
+            importer.ProviderDirectoryArtifactDataset(
+                source_id=source_record["source_id"],
+                endpoint_id=endpoint_id,
+                dataset_id=candidate_id,
+                evidence_run_id=candidate_row["acquisition_root_run_id"],
+                status=importer.ENDPOINT_DATASET_VALIDATED,
+                is_current=False,
+                dataset_hash=candidate_row["dataset_hash"],
+                resource_count=candidate_row["resource_count"],
+                reviewed_root_policy=importer.ReviewedRootPolicy(2),
+                completion_proof_required_version=3,
+            )
+        )
+        published = await database.first(
+            f"""
+            SELECT status, is_current, published_at
+              FROM {schema}.provider_directory_endpoint_dataset
+             WHERE dataset_id = :dataset_id;
+            """,
+            dataset_id=candidate_id,
+        )
+        assert published is not None
+        assert published._mapping["status"] == importer.ENDPOINT_DATASET_PUBLISHED
+        assert published._mapping["is_current"] is True
+        assert published._mapping["published_at"] is not None

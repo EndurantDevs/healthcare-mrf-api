@@ -28,7 +28,6 @@ from process.provider_directory_fhir_census_contract import (
 from process.provider_directory_fhir_root_policy import (
     POLICY_PENDING_STATUS,
     REVIEWED_ROOT_POLICY_METADATA_KEY,
-    ReviewedRootPolicy,
 )
 
 
@@ -135,8 +134,16 @@ def test_reviewed_manifest_seed_binds_exact_identity_without_cutoff():
     assert metadata["provider_directory_manual_only"] is True
     assert metadata["provider_directory_acquisition_enabled"] is True
     assert metadata["provider_directory_candidate_status"] == (
-        manual_catalog.MANUAL_SOURCE_PENDING_STATUS
+        POLICY_PENDING_STATUS
     )
+    assert metadata[REVIEWED_ROOT_POLICY_METADATA_KEY] == {
+        "policy_version": "provider-directory-reviewed-root-policy-v1",
+        "required_root_count": 1,
+    }
+    campaign_field = manual_catalog.MANUAL_SOURCE_VERIFICATION_CAMPAIGN_FIELD
+    assert metadata[campaign_field] == entry["manual_current_version_census"][
+        "verification_campaign_id"
+    ]
     assert metadata["provider_directory_supported_resources"] == entry["resources"]
     assert metadata["provider_directory_fully_enumerable_resources"] == []
     assert metadata["provider_directory_server_issued_subset_resources"] == (
@@ -173,12 +180,10 @@ def test_reviewed_manifest_seed_binds_exact_identity_without_cutoff():
     ]["start_urls"]
 
 
-@pytest.mark.parametrize("required_root_count", (1, 2))
-def test_reviewed_seed_persists_explicit_root_policy(required_root_count):
+def test_reviewed_seed_persists_single_root_policy():
     entry = _manual_entry()
     seed_row = manual_catalog.reviewed_manual_census_seed_rows(
         entry["source_ids"][0],
-        root_policy=ReviewedRootPolicy(required_root_count),
     )[0]
 
     metadata = seed_row["metadata_json"]
@@ -187,8 +192,18 @@ def test_reviewed_seed_persists_explicit_root_policy(required_root_count):
     )
     assert metadata[REVIEWED_ROOT_POLICY_METADATA_KEY] == {
         "policy_version": "provider-directory-reviewed-root-policy-v1",
-        "required_root_count": required_root_count,
+        "required_root_count": 1,
     }
+
+
+def test_reviewed_seed_policy_cannot_be_overridden():
+    entry = _manual_entry()
+
+    with pytest.raises(TypeError, match="root_policy"):
+        manual_catalog.reviewed_manual_census_seed_rows(
+            entry["source_ids"][0],
+            root_policy=object(),
+        )
 
 
 def test_reviewed_manual_source_resolves_without_runtime_selector():

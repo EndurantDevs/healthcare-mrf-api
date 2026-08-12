@@ -26,7 +26,6 @@ from process.provider_directory_fhir_root_policy import (
 )
 
 
-MANUAL_SOURCE_PENDING_STATUS = "pending_two_matching_reviewed_subset_acquisitions"
 MANUAL_SOURCE_VERIFICATION_CAMPAIGN_FIELD = (
     "provider_directory_verification_campaign_id"
 )
@@ -37,7 +36,6 @@ def manual_seed_metadata(
     resources: tuple[str, ...],
     page_count: int,
     canonical_base: str,
-    root_policy: ReviewedRootPolicy | None,
 ) -> dict[str, Any]:
     """Project the reviewed subset identity into dormant source metadata."""
 
@@ -58,11 +56,6 @@ def manual_seed_metadata(
         },
         "provider_directory_coverage_mode": SERVER_ISSUED_SUBSET_SEMANTICS,
         "provider_directory_acquisition_enabled": True,
-        "provider_directory_candidate_status": (
-            POLICY_PENDING_STATUS
-            if root_policy is not None
-            else MANUAL_SOURCE_PENDING_STATUS
-        ),
         MANUAL_SOURCE_VERIFICATION_CAMPAIGN_FIELD: entry[
             "verification_campaign_id"
         ],
@@ -84,8 +77,10 @@ def manual_seed_metadata(
         ],
         CURRENT_VERSION_CENSUS_START_URLS_FIELD: dict(entry["start_urls"]),
     }
-    if root_policy is not None:
-        metadata_by_field[REVIEWED_ROOT_POLICY_METADATA_KEY] = (
-            root_policy.document()
-        )
+    metadata_by_field["provider_directory_candidate_status"] = (
+        POLICY_PENDING_STATUS
+    )
+    metadata_by_field[REVIEWED_ROOT_POLICY_METADATA_KEY] = (
+        ReviewedRootPolicy(1).document()
+    )
     return metadata_by_field

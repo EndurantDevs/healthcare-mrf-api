@@ -135,6 +135,7 @@ def test_artifact_profile_rejects_subset_identity_and_unknown_marker():
     metadata["provider_directory_candidate_status"] = (
         importer.PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED
     )
+    metadata.pop(importer.REVIEWED_ROOT_POLICY_METADATA_KEY)
     campaign = metadata[
         importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
     ]

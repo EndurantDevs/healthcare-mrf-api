@@ -25,6 +25,7 @@ from tests.provider_directory_reviewed_subset_activation_pg_support import (
     load_activation_migration,
 )
 from tests.provider_directory_reviewed_subset_activation_pg_upsert import (
+    prove_pending_policy_two_campaign_reset,
     prove_policy_catalog_upserts_preserve_activation,
 )
 from tests.provider_directory_subset_completion_pg_setup import (
@@ -385,6 +386,7 @@ async def prove_single_root_policy_lifecycle(monkeypatch) -> None:
         _subset_migration, activation_migration = (
             await _install_policy_predecessors(scenario)
         )
+        await prove_pending_policy_two_campaign_reset(scenario)
         source_record, dataset_rows, evidence = single_root_activation_inputs()
         dataset_row = dataset_rows[0]
         await _insert_policy_source(scenario, source_record)

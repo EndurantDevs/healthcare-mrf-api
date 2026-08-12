@@ -233,6 +233,7 @@ async def test_acquisition_error_taxonomy(
     expected_code: str,
 ) -> None:
     _enable_only(monkeypatch, contract.ACQUISITION_ENABLED_ENV)
+    monkeypatch.setattr(operator, "require_rooted_graph_operator_gate", lambda _: None)
 
     async def fail(*_args: Any, **_kwargs: Any) -> str:
         raise raised_error

@@ -25,9 +25,6 @@ from process.provider_directory_fhir_census_contract import (
     CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD,
     current_version_census_request,
 )
-from process.provider_directory_fhir_root_policy import (
-    ReviewedRootPolicy,
-)
 from process.provider_directory_fhir_subset_profiles import (
     SERVER_ISSUED_SUBSET_BOUNDED_COMPLETION_SCOPES,
     SERVER_ISSUED_SUBSET_BOUNDED_STRATEGY_VERSION,
@@ -96,7 +93,6 @@ def _reviewed_v5_source() -> dict:
     source_id = manual_catalog.reviewed_manual_census_source_id()
     seed_row = manual_catalog.reviewed_manual_census_seed_rows(
         source_id,
-        root_policy=ReviewedRootPolicy(1),
     )[0]
     source_record = importer._source_row_from_seed(seed_row)
     resources = list(seed_row["metadata_json"][

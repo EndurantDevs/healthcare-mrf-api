@@ -83,6 +83,8 @@ def require_uhc_flex_practitioner_operator_gate(phase: str) -> None:
     expected_gate = _GATE_BY_PHASE.get(phase)
     if expected_gate is None:
         raise UHCFlexPractitionerOperatorError("invalid_request")
+    if phase == "acquire-admit":
+        raise UHCFlexPractitionerOperatorError("disabled")
     enabled_gates = {
         gate_name for gate_name in _GATE_BY_PHASE.values() if _is_enabled(gate_name)
     }
