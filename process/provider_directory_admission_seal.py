@@ -22,6 +22,8 @@ from process.provider_directory_fhir_subset_canonical import (
 )
 from process.provider_directory_proof_store import (
     PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY,
+    PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID,
+    PROVIDER_DIRECTORY_SEMANTIC_CONTENT_V4_PROOF_CONTRACT_ID,
 )
 from process.uhc_canonical_proof import (
     UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY,
@@ -51,6 +53,12 @@ _PROOF_KEYS = frozenset(
     {
         PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY,
         UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY,
+    }
+)
+_SEMANTIC_PROOF_CONTRACT_IDS = frozenset(
+    {
+        PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID,
+        PROVIDER_DIRECTORY_SEMANTIC_CONTENT_V4_PROOF_CONTRACT_ID,
     }
 )
 _LEGACY_PROOF_FIELDS = frozenset(
@@ -274,10 +282,10 @@ def _validated_descriptor_counts(
     return descriptor_count, descriptor_counts
 
 
-def _require_exact_generic_descriptor_aggregates(
+def _require_generic_descriptor_coverage(
     proof: Mapping[str, Any],
 ) -> None:
-    """Retain the deployed SQL admission aggregate contract for new seals."""
+    """Require shard occurrences to cover every finalized identity."""
 
     shards = proof.get("shards")
     resource_count = proof.get("resource_count")
@@ -310,8 +318,18 @@ def _require_exact_generic_descriptor_aggregates(
             observed_counts_by_resource[resource_type] = (
                 observed_counts_by_resource.get(resource_type, 0) + count
             )
-    if observed_count != resource_count or any(
-        observed_counts_by_resource.get(resource_type, 0) != finalized_count
+    is_semantic_proof = (
+        proof.get("contract_id") in _SEMANTIC_PROOF_CONTRACT_IDS
+    )
+    if (
+        observed_count < resource_count
+        if is_semantic_proof
+        else observed_count != resource_count
+    ) or any(
+        observed_counts_by_resource.get(resource_type, 0) < finalized_count
+        if is_semantic_proof
+        else observed_counts_by_resource.get(resource_type, 0)
+        != finalized_count
         for resource_type, finalized_count in resource_counts.items()
     ):
         raise AdmissionSealError(
@@ -386,7 +404,7 @@ def admission_seal_from_validated_metadata(
         else ADMISSION_KIND_UHC_CANONICAL
     )
     if admission_kind == ADMISSION_KIND_GENERIC:
-        _require_exact_generic_descriptor_aggregates(proof)
+        _require_generic_descriptor_coverage(proof)
     return _receipt(
         metadata,
         admission_kind=admission_kind,
