@@ -252,11 +252,67 @@ async def test_locked_fence_ignores_ineligible_old_generation_candidate():
         ["candidate_endpoint", "serving_endpoint_old"],
     )
     eligibility_sql = executor.all.await_args_list[-1].args[0]
-    assert "artifact_candidate_metadata" in eligibility_sql
-    assert "jsonb_to_record" in eligibility_sql
-    assert "dataset.eligibility_metadata_jsonb" in eligibility_sql
-    assert executor.all.await_args_list[-1].kwargs["endpoint_ids"] == [
-        "candidate_endpoint"
+    assert "candidate_source_ids AS MATERIALIZED" in eligibility_sql
+    assert "eligible_candidate_ids AS MATERIALIZED" in eligibility_sql
+    assert "publication_metadata_summary_json" in eligibility_sql
+    assert executor.all.await_args_list[-1].kwargs["source_ids"] == [
+        "source_a"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_locked_fence_rejects_cross_endpoint_candidate_drift():
+    """Reject a new candidate for any source alias held by the fence."""
+
+    candidate = _promotion_dataset()
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (candidate,),
+        should_select_validated_candidates=True,
+    )
+    executor = _executor(
+        [
+            {"endpoint_id": "candidate_endpoint"},
+            {"endpoint_id": "serving_endpoint_old"},
+        ],
+        [_source_row("serving_endpoint_old")],
+        [
+            _dataset_row(
+                "dataset_current",
+                "root_current",
+                importer.ENDPOINT_DATASET_PUBLISHED,
+                True,
+            ),
+            _dataset_row(
+                "dataset_v2_exact",
+                "root_v2_exact",
+                importer.ENDPOINT_DATASET_VALIDATED,
+                False,
+                "dataset_current",
+            ),
+        ],
+        [
+            {
+                "endpoint_id": "candidate_endpoint",
+                "dataset_id": "dataset_v2_exact",
+            },
+            {
+                "endpoint_id": "other_endpoint",
+                "dataset_id": "dataset_other",
+            },
+        ],
+    )
+
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="endpoint_dataset_candidate_changed",
+    ):
+        await importer._lock_and_verify_artifact_dataset_fence(
+            fence,
+            executor,
+        )
+
+    assert executor.all.await_args_list[-1].kwargs["source_ids"] == [
+        "source_a"
     ]
 
 

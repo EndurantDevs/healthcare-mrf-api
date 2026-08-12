@@ -10,6 +10,9 @@ import importlib
 
 from process import provider_directory_fhir_subset_activation as activation
 from process import provider_directory_fhir_subset_activation_store as store
+from process.provider_directory_admission_seal import (
+    backfill_provider_directory_admission_seal,
+)
 from tests.provider_directory_reviewed_subset_activation_pg_concurrency import (
     _close_scenario,
     _create_activation_scenario,
@@ -29,6 +32,10 @@ from tests.provider_directory_effective_endpoint_pg_cases import (
 from tests.provider_directory_reviewed_root_policy_pg import (
     _load_policy_migration,
     _run_upgrade_with_context,
+)
+from tests.tin_npi_connector_postgres_support import (
+    install_admission_seal_terminal_predecessors,
+    load_admission_seal_migration,
 )
 from tests.provider_directory_subset_completion_pg_setup import (
     load_abandonment_migration,
@@ -80,8 +87,21 @@ async def _publication_scenario(monkeypatch, *, require_eligibility: bool):
                 _load_policy_migration(),
             ):
                 await _run_upgrade_with_context(scenario, successor)
+            await install_admission_seal_terminal_predecessors(
+                scenario.connection,
+                scenario.quoted_schema,
+            )
+            await _run_upgrade_with_context(
+                scenario,
+                load_admission_seal_migration(),
+            )
         activation_database = _runtime_database()
         publication_database = _runtime_database()
+        for dataset_id in ("dataset-subset", "dataset-matched"):
+            await backfill_provider_directory_admission_seal(
+                dataset_id,
+                database=publication_database,
+            )
         fence = _artifact_publication_fence(
             activation_evidence(evidence_pairs),
             require_candidate_eligibility=require_eligibility,

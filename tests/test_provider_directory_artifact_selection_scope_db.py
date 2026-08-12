@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from api.provider_directory_source_catalog_outcomes import (
@@ -19,6 +21,12 @@ from tests.test_provider_directory_artifact_eligibility_db import (
 from tests.test_provider_directory_dataset_artifact_db import (
     _dataset_database,
     _insert_validated_shared_dataset,
+)
+from tests.test_provider_directory_dataset_selection_bounded_db import (
+    _large_metadata_by_field,
+)
+from process.provider_directory_admission_seal import (
+    backfill_provider_directory_admission_seal,
 )
 
 
@@ -45,16 +53,18 @@ async def _insert_endpoint_scope_probe_rows(database, schema: str) -> None:
         f"""
         INSERT INTO {schema}.provider_directory_endpoint_dataset (
             dataset_id, endpoint_id, acquisition_root_run_id, dataset_hash,
-            status, is_current, resource_count, publication_metadata_json
+            status, is_current, resource_count, published_at,
+            publication_metadata_json
         ) VALUES (
             'dataset_plain', 'serving_plain', 'root_plain', :dataset_hash,
-            :validated, false, 1,
+            :published, true, 1, now(),
             '{{"source_ids":["source_plain"]}}'::jsonb
         );
         """,
         dataset_hash=DATASET_HASH,
-        validated=importer.ENDPOINT_DATASET_VALIDATED,
+        published=importer.ENDPOINT_DATASET_PUBLISHED,
     )
+    await _insert_unrelated_validated_rows(database, schema)
     await database.status(
         f"""
         INSERT INTO {schema}.provider_directory_endpoint_dataset (
@@ -73,6 +83,28 @@ async def _insert_endpoint_scope_probe_rows(database, schema: str) -> None:
     )
     await database.status(
         f"ANALYZE {schema}.provider_directory_endpoint_dataset;"
+    )
+
+
+async def _insert_unrelated_validated_rows(database, schema: str) -> None:
+    """Add validated rows that must stay outside explicit endpoint scans."""
+
+    await database.status(
+        f"""
+        INSERT INTO {schema}.provider_directory_endpoint_dataset (
+            dataset_id, endpoint_id, status, is_current,
+            publication_metadata_json
+        )
+        SELECT 'unrelated-validated-' || sequence_id,
+               'unrelated-validated-' || sequence_id,
+               :validated, false,
+               jsonb_build_object(
+                   'source_ids',
+                   jsonb_build_array('unrelated-validated-' || sequence_id)
+               )
+          FROM generate_series(1, 2000) AS sequence_id;
+        """,
+        validated=importer.ENDPOINT_DATASET_VALIDATED,
     )
 
 
@@ -224,6 +256,27 @@ async def test_candidate_catalog_skips_unselected_current_dataset(
 
     async with _dataset_database(monkeypatch) as (database, schema):
         await _insert_validated_shared_dataset(database, schema)
+        metadata_by_field = _large_metadata_by_field(
+            2,
+            dataset_id="dataset_candidate",
+            endpoint_id="endpoint_shared",
+            root_run_id="root-candidate",
+        )
+        await database.status(
+            f"""
+            UPDATE {schema}.provider_directory_endpoint_dataset
+               SET publication_metadata_json = CAST(:metadata AS jsonb),
+                   dataset_hash = :dataset_hash,
+                   resource_count = 2
+             WHERE dataset_id = 'dataset_candidate';
+            """,
+            metadata=json.dumps(metadata_by_field),
+            dataset_hash="e" * 64,
+        )
+        await backfill_provider_directory_admission_seal(
+            "dataset_candidate",
+            database=database,
+        )
         await database.status(
             f"UPDATE {schema}.provider_directory_endpoint_dataset "
             "SET publication_metadata_json = CAST(publication_metadata_json::jsonb "

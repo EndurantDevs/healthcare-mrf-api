@@ -83,10 +83,13 @@ def test_selection_receipt_rejects_invalid_proof_identity():
 
 
 @pytest.mark.asyncio
-async def test_validated_store_writes_compact_receipt_atomically():
+async def test_validated_store_writes_receipt_and_seal_atomically():
     candidate, content_proof = _receipt_candidate_and_proof()
     metadata = _large_metadata_with_normalized_receipt()
     connection = AsyncMock()
+    connection.all.return_value = [
+        {"source_id": source_id} for source_id in sorted(candidate.source_ids)
+    ]
     connection.status.return_value = "UPDATE 1"
 
     await importer._store_validated_endpoint_dataset(
@@ -100,14 +103,29 @@ async def test_validated_store_writes_compact_receipt_atomically():
     )
 
     query = connection.status.await_args.args[0]
-    stored_receipt = json.loads(
-        connection.status.await_args.kwargs[
-            "artifact_selection_receipt_json"
-        ]
-    )
+    parameters = connection.status.await_args.kwargs
+    stored_receipt = json.loads(parameters["artifact_selection_receipt_json"])
     assert "publication_metadata_json" in query
     assert "artifact_selection_receipt_json" in query
+    assert "publication_metadata_summary_json" in query
+    assert "publication_metadata_sha256" in query
+    assert "content_proof_admission_version" in query
+    assert "content_proof_admission_kind" in query
+    assert "content_proof_admission_sha256" in query
+    assert "content_proof_resource_types" in query
     assert stored_receipt == importer._artifact_selection_receipt(metadata)
+    assert json.loads(parameters["publication_metadata_summary_json"])
+    assert parameters["publication_metadata_sha256"]
+    assert parameters["content_proof_admission_version"] == (
+        importer.ADMISSION_SEAL_VERSION
+    )
+    assert parameters["content_proof_admission_kind"] == (
+        importer.ADMISSION_KIND_GENERIC
+    )
+    assert parameters["content_proof_admission_sha256"] == (
+        content_proof.proof_metadata["proof_sha256"]
+    )
+    assert parameters["content_proof_resource_types"] == ["Location"]
     assert "shards" not in stored_receipt[
         importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
     ]

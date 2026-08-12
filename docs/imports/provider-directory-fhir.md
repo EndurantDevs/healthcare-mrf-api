@@ -451,6 +451,46 @@ best effort.
 
 ### Endpoint dataset publication
 
+#### Fixed-size dataset admission receipts (M1)
+
+Finalized datasets that carry a generic or canonical content proof now also
+write a nullable version-1 admission receipt. The receipt stores the proof
+kind and validated proof digest, a sorted bounded resource-family summary, and
+a digest of proof-excluded top-level publication metadata. Artifact selection
+uses those fixed-size fields and never opens the raw shard arrays for a sealed
+row. Unsealed legacy rows retain a fail-closed compatibility path only while
+their metadata is at most 1 MiB and their generic proof has at most 1,024
+shards; larger unsealed rows are not selectable.
+
+This is the expand/backfill phase only. The columns remain nullable and this
+release does not add a required-seal or `NOT NULL` cutover. Backfill exactly one
+finalized generic dataset per repeatable-read transaction:
+
+```bash
+python main.py start provider-directory-admission-backfill \
+  --dataset-id synthetic-dataset-id
+```
+
+The command checks the raw JSON byte length before export (hard limit 256 MiB),
+spools PostgreSQL binary COPY bytes and descriptor frames to private temporary
+files, fully revalidates every descriptor and aggregate, recomputes the shard
+set and canonical proof digests, then performs one locked `ctid`/`xmin` CAS.
+An already sealed row is an idempotent success. Partial receipts, changed rows,
+oversized metadata, invalid proofs, and unsupported proof kinds fail closed.
+Retries require the same exact dataset id; a failed transaction leaves the row
+unsealed. Legacy canonical proofs are admitted only when their complete proof
+and publication contract fit the bounded 1 MiB capture and pass the existing
+canonical, source-summary, outcome, and lineage validators.
+
+The application proof validator is the admission authority for new terminal
+writes. Database triggers enforce receipt shape, digest consistency, bounded
+fields, and stale-update rejection, but do not claim cryptographic protection
+against a hostile table owner. Direct same-owner writes are outside this
+contract. Rollback keeps the raw publication metadata authoritative: stop the
+backfill/read cutover first, deploy the previous application, then downgrade
+the nullable-column migration. A later M2 may require receipts only after every
+eligible legacy row has been independently revalidated.
+
 `provider_directory_source` remains the plan/source alias catalog, but each
 row with an importable API base also points to a deterministic
 `provider_directory_api_endpoint`. The endpoint identity is the same identity

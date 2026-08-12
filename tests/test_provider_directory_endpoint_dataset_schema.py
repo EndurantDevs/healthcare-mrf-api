@@ -121,6 +121,10 @@ def test_dataset_models_preserve_publication_and_resource_identity_contracts():
     resource_dataset_fk = _foreign_key(ProviderDirectoryDatasetResource.__table__.c.dataset_id)
 
     assert _primary_key_columns(ProviderDirectoryEndpointDataset) == ("dataset_id",)
+    assert isinstance(
+        ProviderDirectoryEndpointDataset.__table__.c.publication_metadata_json.type,
+        postgresql.JSONB,
+    )
     assert dataset_endpoint_fk.target_fullname == (
         f"{endpoint_schema}.provider_directory_api_endpoint.endpoint_id"
     )
@@ -200,6 +204,12 @@ def _assert_revision_model_columns(recorder, models_by_table):
     later_columns_by_table = {
         "provider_directory_endpoint_dataset": {
             "acquisition_root_run_id",
+            "publication_metadata_summary_json",
+            "publication_metadata_sha256",
+            "content_proof_admission_version",
+            "content_proof_admission_kind",
+            "content_proof_admission_sha256",
+            "content_proof_resource_types",
             "artifact_selection_receipt_json",
             "completion_proof_required_version",
             "completion_proof_json",

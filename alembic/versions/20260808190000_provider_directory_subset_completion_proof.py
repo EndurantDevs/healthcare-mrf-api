@@ -165,8 +165,24 @@ _SUBSET_ENDPOINT_DATASET_COLUMNS = _LEGACY_ENDPOINT_DATASET_COLUMNS + (
     "completion_proof_json",
     "completion_proof_sha256",
 )
+_ADMISSION_SEAL_COLUMNS = (
+    "publication_metadata_summary_json",
+    "publication_metadata_sha256",
+    "content_proof_admission_version",
+    "content_proof_admission_kind",
+    "content_proof_admission_sha256",
+    "content_proof_resource_types",
+)
+_ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS = (
+    _SUBSET_ENDPOINT_DATASET_COLUMNS
+    + _ADMISSION_SEAL_COLUMNS
+)
 _RECEIPT_ENDPOINT_DATASET_COLUMNS = _SUBSET_ENDPOINT_DATASET_COLUMNS + (
     "artifact_selection_receipt_json",
+)
+_COMBINED_ENDPOINT_DATASET_COLUMNS = (
+    _ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS
+    + ("artifact_selection_receipt_json",)
 )
 _LEGACY_DATASET_RESOURCE_COLUMNS = (
     "dataset_id",
@@ -225,23 +241,22 @@ def _relation_schema_fence_sql(
     relation: str,
     expected_columns: tuple[str, ...],
     *,
-    compatible_columns: tuple[str, ...] | None = None,
-    additional_compatible_columns: tuple[str, ...] | None = None,
+    compatible_columns: tuple[tuple[str, ...], ...] = (),
 ) -> str:
     relation_ref = _qf(schema, relation)
     expected_array = ", ".join(
         _ql(column) for column in sorted(expected_columns)
     )
-    compatible_clause = ""
-    for compatible in (compatible_columns, additional_compatible_columns):
-        if compatible is None:
-            continue
-        compatible_array = ", ".join(_ql(column) for column in sorted(compatible))
-        compatible_clause = (
-            compatible_clause
-            + "\n           AND observed_columns IS DISTINCT FROM "
+    compatible_clauses = []
+    for compatible_shape in compatible_columns:
+        compatible_array = ", ".join(
+            _ql(column) for column in sorted(compatible_shape)
+        )
+        compatible_clauses.append(
+            "\n           AND observed_columns IS DISTINCT FROM "
             f"ARRAY[{compatible_array}]::text[]"
         )
+    compatible_clause = "".join(compatible_clauses)
     return f"""
     DO $migration$
     DECLARE
@@ -4144,8 +4159,12 @@ def upgrade() -> None:
             schema,
             _ENDPOINT_DATASET,
             _LEGACY_ENDPOINT_DATASET_COLUMNS,
-            compatible_columns=_SUBSET_ENDPOINT_DATASET_COLUMNS,
-            additional_compatible_columns=_RECEIPT_ENDPOINT_DATASET_COLUMNS,
+            compatible_columns=(
+                _SUBSET_ENDPOINT_DATASET_COLUMNS,
+                _RECEIPT_ENDPOINT_DATASET_COLUMNS,
+                _ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS,
+                _COMBINED_ENDPOINT_DATASET_COLUMNS,
+            ),
         )
     )
     op.execute(
@@ -4153,7 +4172,7 @@ def upgrade() -> None:
             schema,
             _DATASET_RESOURCE,
             _LEGACY_DATASET_RESOURCE_COLUMNS,
-            compatible_columns=_SUBSET_DATASET_RESOURCE_COLUMNS,
+            compatible_columns=(_SUBSET_DATASET_RESOURCE_COLUMNS,),
         )
     )
     op.execute(_guard_trigger_shape_fence_sql(schema))
@@ -4270,7 +4289,11 @@ def upgrade() -> None:
             schema,
             _ENDPOINT_DATASET,
             _SUBSET_ENDPOINT_DATASET_COLUMNS,
-            compatible_columns=_RECEIPT_ENDPOINT_DATASET_COLUMNS,
+            compatible_columns=(
+                _RECEIPT_ENDPOINT_DATASET_COLUMNS,
+                _ADMISSION_SEAL_ENDPOINT_DATASET_COLUMNS,
+                _COMBINED_ENDPOINT_DATASET_COLUMNS,
+            ),
         )
     )
     op.execute(

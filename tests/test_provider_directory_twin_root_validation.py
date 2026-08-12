@@ -189,6 +189,8 @@ class _ValidationHarness:
     async def all(self, sql, **params):
         if "provider_directory_bulk_acquisition_checkpoint" in sql:
             return []
+        if "provider_directory_source" in sql:
+            return [{"source_id": source_id} for source_id in params["source_ids"]]
         after = (
             params.get("after_resource_type", ""),
             params.get("after_resource_id", ""),

@@ -10944,7 +10944,6 @@ async def test_artifact_dataset_selection_scopes_explicit_and_filters_all_source
     assert "ranked_datasets AS MATERIALIZED" in all_sql
     assert "validated_candidate_count" in all_sql
     assert "dataset.superseded_at IS NULL" in all_sql
-    assert "publication_metadata_json::jsonb -> 'source_ids'" in all_sql
 
 
 def test_explicit_artifact_selection_sql_scopes_dataset_reads():
@@ -10962,7 +10961,7 @@ def test_explicit_artifact_selection_sql_scopes_dataset_reads():
     )
     selected_receipt_sql = explicit_sql[
         explicit_sql.index("selected_dataset_receipts AS MATERIALIZED") :
-        explicit_sql.index("ranked_datasets AS MATERIALIZED")
+        explicit_sql.index("selected_dataset_metadata AS MATERIALIZED")
     ]
     assert "artifact_selection_receipt_json" in selected_receipt_sql
     assert "publication_metadata_json" not in selected_receipt_sql
@@ -11004,8 +11003,11 @@ def test_artifact_dataset_selection_projects_only_bounded_dataset_fields():
     """Keep raw publication proofs on the database side of the resolver."""
 
     sql = importer._provider_directory_artifact_dataset_selection_sql(None)
+    candidate_sql = importer._provider_directory_artifact_dataset_selection_sql(
+        None,
+        should_select_validated_candidates=True,
+    )
     projection_sql = importer._artifact_dataset_projection_sql()
-    legacy_sql = importer._artifact_legacy_dataset_projection_sql()
 
     assert "SELECT dataset.*" not in sql
     assert "SELECT dataset_options.*" not in sql
@@ -11013,15 +11015,17 @@ def test_artifact_dataset_selection_projects_only_bounded_dataset_fields():
     assert "publication_metadata_hash" in projection_sql
     assert "content_proof_valid" in projection_sql
     assert "completion_proof_cutoff" in projection_sql
-    assert "provider_directory_subset_payload_sha256" not in sql
+    assert "publication_metadata_summary_json" in sql
+    assert "content_proof_admission_version" in sql
+    assert "octet_length(" in sql
+    assert "provider_directory_subset_payload_sha256" in sql
     assert "provider_directory_subset_content_proof_valid" in sql
-    assert "provider_directory_subset_payload_sha256" in legacy_sql
-    assert "provider_directory_subset_content_proof_valid" in legacy_sql
     assert "dataset_options.import_run_id" not in sql
     assert "dataset_options.acquisition_root_run_id" not in sql
     assert "dataset.evidence_run_id" in projection_sql
     assert "dataset.publication_metadata_json" not in projection_sql
     assert "dataset.completion_proof_json" not in projection_sql
+    assert len(candidate_sql) < 500_000
 
 
 @pytest.mark.asyncio
@@ -13217,6 +13221,8 @@ class _EndpointDatasetPromotionHarness:
     async def all(self, _sql, **params):
         if "provider_directory_bulk_acquisition_checkpoint" in _sql:
             return []
+        if "provider_directory_source" in _sql:
+            return [{"source_id": source_id} for source_id in params["source_ids"]]
         if "provider_directory_dataset_proof_shard" in _sql:
             return [
                 row

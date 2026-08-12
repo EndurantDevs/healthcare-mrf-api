@@ -230,7 +230,10 @@ async def test_targeted_backfill_uses_full_locked_dataset_source_ids():
 
     assert candidate.source_ids == ("source-a", "source-b")
     assert publication_metadata["source_ids"] == ["source-b", "source-a"]
-    assert "superseded_at IS NULL" in executor.first.await_args.args[0]
+    selection_sql = executor.first.await_args.args[0]
+    assert "superseded_at IS NULL" in selection_sql
+    assert "publication_metadata_summary_json" in selection_sql
+    assert "AS publication_metadata_json" in selection_sql
 
 
 @pytest.mark.parametrize(

@@ -95,6 +95,9 @@ from process.provider_directory_fhir import (
     shutdown as provider_directory_fhir_shutdown,
     startup as provider_directory_fhir_startup,
 )
+from process.provider_directory_admission_seal import (
+    backfill_provider_directory_admission_seal,
+)
 from process.provider_directory_fhir_census_contract import (
     acquisition_strategy_values as provider_directory_acquisition_strategy_values,
 )
@@ -1543,6 +1546,23 @@ def provider_directory_fhir(
     )
 
 
+@click.command(help="Backfill one fixed-size Provider Directory dataset receipt")
+@click.option(
+    "--dataset-id",
+    required=True,
+    help="Exact finalized dataset id to lock, stream-validate, and seal.",
+)
+def provider_directory_admission_backfill(dataset_id: str):
+    """Revalidate and seal one legacy row in one database transaction."""
+
+    click.echo(
+        json.dumps(
+            _run(backfill_provider_directory_admission_seal(dataset_id)),
+            sort_keys=True,
+        )
+    )
+
+
 @click.command(help="Finish provider quality import for a queued run id")
 @click.option("--import-id", required=True, help="Import id/date suffix used for staging tables.")
 @click.option("--run-id", required=True, help="Run id emitted by `start provider-quality`.")
@@ -2038,6 +2058,10 @@ process_group.add_command(claims_procedures, name="claims-procedures")
 process_group.add_command(drug_claims, name="drug-claims")
 process_group.add_command(provider_quality, name="provider-quality")
 process_group.add_command(provider_directory_fhir, name="provider-directory-fhir")
+process_group.add_command(
+    provider_directory_admission_backfill,
+    name="provider-directory-admission-backfill",
+)
 process_group.add_command(partd_formulary_network, name="partd-formulary-network")
 process_group.add_command(pharmacy_license, name="pharmacy-license")
 process_group.add_command(florida_mqa_profile, name="florida-mqa-profile")

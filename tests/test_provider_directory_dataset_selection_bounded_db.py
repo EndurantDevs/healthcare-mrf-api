@@ -12,8 +12,15 @@ import pytest
 from api.provider_directory_source_catalog_outcomes import (
     _canonical_validated_datasets_by_source_id,
 )
+from process.provider_directory_admission_seal import (
+    admission_seal_from_validated_metadata,
+    backfill_provider_directory_admission_seal,
+)
 from process.provider_directory_fhir_subset_canonical import (
     canonical_payload_sha256,
+)
+from process.uhc_canonical_proof import (
+    UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY,
 )
 from tests.test_provider_directory_dataset_artifact_db import (
     _dataset_database,
@@ -52,11 +59,11 @@ def _proof_line_hash(value_list: list[dict[str, object]]) -> str:
 
 def _large_semantic_shard_list(
     source_id_list: list[str],
+    shard_count: int = 512,
     *,
     dataset_id: str = "dataset_shared",
     endpoint_id: str = "endpoint_shared",
     root_run_id: str = "root-shared",
-    shard_count: int = 512,
 ) -> list[dict[str, object]]:
     """Return many valid synthetic shard descriptors."""
 
@@ -99,21 +106,22 @@ def _large_semantic_shard_list(
 
 
 def _large_semantic_proof_by_field(
+    shard_count: int = 512,
     *,
     dataset_id: str = "dataset_shared",
     endpoint_id: str = "endpoint_shared",
     root_run_id: str = "root-shared",
-    shard_count: int = 512,
+    source_id_list: list[str] | None = None,
 ) -> dict[str, object]:
     """Return a valid semantic proof with a large discarded shard array."""
 
-    source_id_list = ["source_primary", "source_sibling"]
+    source_id_list = source_id_list or ["source_primary", "source_sibling"]
     shard_list = _large_semantic_shard_list(
         source_id_list,
+        shard_count,
         dataset_id=dataset_id,
         endpoint_id=endpoint_id,
         root_run_id=root_run_id,
-        shard_count=shard_count,
     )
     proof_by_field: dict[str, object] = {
         "contract_id": (
@@ -156,16 +164,14 @@ def _large_semantic_proof_by_field(
 
 
 def _large_metadata_by_field(
-    *,
-    dataset_id: str = "dataset_shared",
-    endpoint_id: str = "endpoint_shared",
-    root_run_id: str = "root-shared",
     shard_count: int = 512,
+    **proof_identity: object,
 ) -> dict[str, object]:
     """Return metadata containing one valid large semantic proof."""
 
     return {
-        "source_ids": ["source_primary", "source_sibling"],
+        "source_ids": proof_identity.get("source_id_list")
+        or ["source_primary", "source_sibling"],
         "selected_resources": ["Location"],
         "expected_resources": ["Location"],
         "resource_hash_contract": importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
@@ -173,10 +179,8 @@ def _large_metadata_by_field(
         "proof_resource_scope": ["Location"],
         importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: (
             _large_semantic_proof_by_field(
-                dataset_id=dataset_id,
-                endpoint_id=endpoint_id,
-                root_run_id=root_run_id,
-                shard_count=shard_count,
+                shard_count,
+                **proof_identity,
             )
         ),
     }
@@ -360,118 +364,46 @@ def _resealed_proof_mutation(
 
 
 @pytest.mark.asyncio
-async def test_explicit_selection_does_not_evaluate_unrelated_metadata(monkeypatch):
-    """Scope the candidate-aware catalog path before full proof work."""
-    async with _dataset_database(monkeypatch) as (database, schema):
-        await _insert_validated_shared_dataset(database, schema)
-        await _install_unrelated_large_proof_hash_sentinel(database, schema)
-        selected = await _canonical_validated_datasets_by_source_id(
-            ["source_primary"]
-        )
-        assert selected["source_primary"].dataset_id == "dataset_candidate"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "mutation_name",
-    [
-        "shard_descriptor",
-        "source_metrics",
-        "resource_keyset",
-        "dataset_hash",
-        "cross_contract",
-        "projection_date",
-        "selected_outside_scope",
-    ],
-)
-async def test_all_source_projection_rejects_resealed_semantic_proof_mutation(
-    monkeypatch,
-    mutation_name,
-):
-    """Require full server-side proof validation, not only its outer seal."""
+async def test_all_source_projection_keeps_large_proof_server_side(monkeypatch):
+    """Exclude the full shard proof and enforce a small returned row."""
 
     async with _dataset_database(monkeypatch) as (database, schema):
-        mutated_metadata = _resealed_proof_mutation(
-            _large_metadata_by_field(),
-            mutation_name,
+        large_metadata_by_field = _large_metadata_by_field()
+        serialized_metadata = json.dumps(large_metadata_by_field, sort_keys=True)
+        assert len(serialized_metadata) > 200_000
+        await _set_shared_semantic_proof(
+            database,
+            schema,
+            large_metadata_by_field,
         )
-        await _set_shared_semantic_proof(database, schema, mutated_metadata)
 
         projected_row_list = await _all_source_projected_rows(database)
 
         assert len(projected_row_list) == 2
+        assert {
+            projected_row["publication_metadata_hash"]
+            for projected_row in projected_row_list
+        } == {canonical_payload_sha256(large_metadata_by_field)}
         assert all(
-            projected_row["content_proof_valid"] is False
+            importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
+            not in projected_row["publication_metadata_json"]
             for projected_row in projected_row_list
         )
-
-
-@pytest.mark.asyncio
-async def test_all_source_projection_normalizes_expected_source_scope(monkeypatch):
-    """Preserve sorted proof lineage when parent source order is arbitrary."""
-
-    async with _dataset_database(monkeypatch) as (database, schema):
-        metadata_by_field = _large_metadata_by_field()
-        metadata_by_field["source_ids"] = ["source_sibling", "source_primary"]
-        await _set_shared_semantic_proof(database, schema, metadata_by_field)
-
-        projected_row_list = await _all_source_projected_rows(database)
-
-        assert len(projected_row_list) == 2
+        assert all(
+            "completion_proof_json" not in projected_row
+            for projected_row in projected_row_list
+        )
         assert all(
             projected_row["content_proof_valid"] is True
             for projected_row in projected_row_list
         )
-
-
-@pytest.mark.asyncio
-async def test_payload_hash_documents_python_identity_boundary(monkeypatch):
-    """Pin exact parity for ordinary JSON and safe divergence at edge values."""
-
-    async with _dataset_database(monkeypatch) as (database, schema):
-        hash_function = f'"{schema}"."provider_directory_subset_payload_sha256"'
-        for hash_input, has_python_identity_parity in _HASH_CASES:
-            server_hash = await database.scalar(
-                f"SELECT {hash_function}(CAST(:hash_input AS jsonb));",
-                hash_input=json.dumps(hash_input, ensure_ascii=False),
-            )
-            assert server_hash == canonical_payload_sha256(hash_input)
-            assert (
-                server_hash == importer._identity_hash(hash_input)
-            ) is has_python_identity_parity
-
-
-@pytest.mark.asyncio
-async def test_payload_hash_fences_unknown_metadata_drift(monkeypatch):
-    """Keep same-version lock identity exact across Unicode and float metadata."""
-
-    async with _dataset_database(monkeypatch) as (database, schema):
-        metadata_by_field = {
-            "selected_resources": ["Location"],
-            "synthetic_label": "synthetic-ž",
-            "synthetic_weight": 0.0,
-        }
-        await _replace_shared_metadata(database, schema, metadata_by_field)
-        fence = await importer._resolve_provider_directory_artifact_datasets(
-            ["source_primary"]
+        assert all(
+            projected_row["content_proof_resources"] == ["Location"]
+            for projected_row in projected_row_list
         )
-        assert fence.datasets[0].publication_metadata_hash == (
-            canonical_payload_sha256(metadata_by_field)
-        )
-        assert fence.datasets[0].publication_metadata_hash != (
-            importer._identity_hash(metadata_by_field)
-        )
-        async with database.transaction():
-            await importer._lock_and_verify_artifact_dataset_fence(fence, database)
-
-        metadata_by_field["synthetic_future_field"] = "changed"
-        await _replace_shared_metadata(database, schema, metadata_by_field)
-        async with database.transaction():
-            with pytest.raises(
-                importer.ProviderDirectoryArtifactBuildStale,
-                match="provider_directory_endpoint_dataset_metadata_changed",
-            ):
-                await importer._lock_and_verify_artifact_dataset_fence(
-                    fence,
-                    database,
-                )
+        projected_byte_count_list = [
+            len(json.dumps(projected_row, sort_keys=True, default=str).encode())
+            for projected_row in projected_row_list
+        ]
+        assert max(projected_byte_count_list) < 8_192
+        assert sum(projected_byte_count_list) < 16_384

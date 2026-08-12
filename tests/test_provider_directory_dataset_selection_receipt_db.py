@@ -11,6 +11,9 @@ import pytest
 from api.provider_directory_source_catalog_outcomes import (
     _canonical_validated_datasets_by_source_id,
 )
+from process.provider_directory_admission_seal import (
+    backfill_provider_directory_admission_seal,
+)
 from tests.test_provider_directory_dataset_artifact_db import (
     _dataset_database,
     _insert_validated_shared_dataset,
@@ -132,40 +135,18 @@ async def _install_selected_validator_sentinel(database, schema: str) -> None:
     )
 
 
-def _out_of_scope_receipt_metadata() -> dict[str, object]:
-    metadata = _large_metadata_with_normalized_receipt()
-    candidate, content_proof = _receipt_candidate_and_proof()
-    expanded_proof = importer.EndpointDatasetContentProof(
-        dataset_hash=content_proof.dataset_hash,
-        resource_count=content_proof.resource_count,
-        resource_hashes={
-            **content_proof.resource_hashes,
-            "Practitioner": "0" * 64,
-        },
-        resource_counts={**content_proof.resource_counts, "Practitioner": 0},
-    )
-    metadata[importer.SOURCE_SUMMARY_METADATA_KEY] = (
-        importer._build_endpoint_dataset_source_summary(
-            candidate,
-            expanded_proof,
-            _ZERO_SUMMARY_COUNTS,
-            "root-candidate",
-        )
-    )
-    metadata[
-        importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY
-    ] = importer._outcome_resource_count_proof(candidate, expanded_proof)
-    return metadata
-
-
 async def _install_receipt_candidate(database, schema: str) -> None:
-    await _insert_validated_shared_dataset(database, schema)
+    await _insert_validated_shared_dataset(database, schema, seal=False)
     metadata = _large_metadata_with_normalized_receipt()
     await _set_shared_semantic_proof(
         database,
         schema,
         metadata,
         dataset_id="dataset_candidate",
+    )
+    await backfill_provider_directory_admission_seal(
+        "dataset_candidate",
+        database=database,
     )
     await _set_selection_receipt(
         database, schema, metadata, dataset_id="dataset_candidate"
@@ -315,7 +296,7 @@ async def test_normalized_receipt_bounds_selected_large_proof(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_normalized_receipt_bounds_selected_large_current(monkeypatch):
+async def test_receipt_only_current_bounds_selected_large_proof(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
         await _install_current_receipt(database, schema)
         await _install_selected_hash_sentinel(database, schema)
@@ -336,18 +317,44 @@ async def test_normalized_receipt_bounds_selected_large_current(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_sealed_selection_rejects_contradictory_receipt_resources(monkeypatch):
+    async with _dataset_database(monkeypatch) as (database, schema):
+        await _insert_validated_shared_dataset(database, schema, seal=False)
+        metadata = _large_metadata_with_normalized_receipt()
+        await _set_shared_semantic_proof(
+            database, schema, metadata, dataset_id="dataset_candidate"
+        )
+        await backfill_provider_directory_admission_seal(
+            "dataset_candidate", database=database
+        )
+        await _set_selection_receipt(
+            database, schema, metadata, dataset_id="dataset_candidate"
+        )
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
+            "artifact_selection_receipt_json = jsonb_set("
+            "artifact_selection_receipt_json, "
+            f"'{{{importer.SOURCE_SUMMARY_METADATA_KEY},resource_counts,Practitioner}}', "
+            "'0'::jsonb) WHERE dataset_id = 'dataset_candidate';"
+        )
+
+        with pytest.raises(importer.ProviderDirectoryArtifactBuildStale):
+            await importer._resolve_provider_directory_artifact_datasets(
+                ["source_primary"], should_select_validated_candidates=True
+            )
+
+
+@pytest.mark.asyncio
 async def test_current_repair_records_one_guarded_receipt(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
         metadata = _current_receipt_metadata()
         await _set_shared_semantic_proof(database, schema, metadata)
         fence = await importer._resolve_provider_directory_artifact_datasets(
-            ["source_primary"],
-            should_select_validated_candidates=False,
+            ["source_primary"], should_select_validated_candidates=False
         )
 
         await importer._record_current_dataset_selection_receipt(
-            fence.datasets[0],
-            metadata,
+            fence.datasets[0], metadata
         )
 
         stored_receipt = await database.scalar(
@@ -371,27 +378,23 @@ async def test_current_repair_records_one_guarded_receipt(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_normalized_receipt_rejects_resource_outside_proof_scope(
-    monkeypatch,
-):
+async def test_receipt_only_candidate_remains_ineligible(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
-        await _insert_validated_shared_dataset(database, schema)
-        metadata = _out_of_scope_receipt_metadata()
+        await _insert_validated_shared_dataset(database, schema, seal=False)
+        metadata = _large_metadata_with_normalized_receipt()
         await _set_shared_semantic_proof(
-            database,
-            schema,
-            metadata,
-            dataset_id="dataset_candidate",
+            database, schema, metadata, dataset_id="dataset_candidate"
         )
         await _set_selection_receipt(
             database, schema, metadata, dataset_id="dataset_candidate"
         )
 
-        with pytest.raises(importer.ProviderDirectoryArtifactBuildStale):
-            await importer._resolve_provider_directory_artifact_datasets(
-                ["source_primary"],
-                should_select_validated_candidates=True,
-            )
+        fence = await importer._resolve_provider_directory_artifact_datasets(
+            ["source_primary"], should_select_validated_candidates=True
+        )
+
+        assert fence.datasets[0].dataset_id == "dataset_shared"
+        assert fence.datasets[0].promote_on_cutover is False
 
 
 def _receipt_tamper_sql(schema: str, mutation: str) -> str:
@@ -467,7 +470,7 @@ async def test_normalized_receipt_does_not_reopen_audit_shards(monkeypatch):
 @pytest.mark.asyncio
 async def test_partial_receipt_uses_legacy_validation(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
-        await _insert_validated_shared_dataset(database, schema)
+        await _insert_validated_shared_dataset(database, schema, seal=False)
         metadata = _large_metadata_with_normalized_receipt()
         metadata.pop(
             importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY

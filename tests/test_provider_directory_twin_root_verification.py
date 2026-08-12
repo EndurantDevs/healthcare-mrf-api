@@ -156,6 +156,10 @@ def test_failed_candidate_requires_fresh_root_after_checkpoint_generation_change
 async def test_validated_dataset_store_fails_when_candidate_update_is_lost():
     connection = AsyncMock()
     connection.status.return_value = "UPDATE 0"
+    connection.all.return_value = [
+        {"source_id": "source_a"},
+        {"source_id": "source_b"},
+    ]
     candidate = _candidate()
 
     with pytest.raises(RuntimeError, match="validation_lost"):
@@ -170,6 +174,7 @@ async def test_validated_dataset_store_fails_when_candidate_update_is_lost():
         )
 
     assert connection.status.await_args.kwargs["marks_validated"] is True
+    assert "FOR NO KEY UPDATE OF source" in connection.all.await_args.args[0]
 
 
 @pytest.mark.asyncio

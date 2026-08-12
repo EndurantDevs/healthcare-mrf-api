@@ -16,6 +16,9 @@ import pytest
 
 from api.endpoint import npi as npi_endpoint
 from process import provider_directory_profile as profile
+from process.provider_directory_admission_seal import (
+    admission_seal_from_validated_metadata,
+)
 from process.provider_directory_source_summary import (
     SOURCE_SUMMARY_CONTRACT_ID,
     SOURCE_SUMMARY_CONTRACT_VERSION,
@@ -1374,23 +1377,36 @@ async def _insert_publish_gate_candidate(
     metadata: dict[str, object],
 ) -> None:
     """Insert one validated dataset fixture for the publication gate."""
+    receipt = admission_seal_from_validated_metadata(metadata)
+    assert receipt is not None
     await database.status(
         f"""
         INSERT INTO {schema}.provider_directory_endpoint_dataset (
             dataset_id, endpoint_id, acquisition_root_run_id,
             import_run_id, previous_dataset_id, dataset_hash,
             resource_count, status, is_current, validated_at,
-            publication_metadata_json
+            publication_metadata_json, publication_metadata_summary_json,
+            publication_metadata_sha256, content_proof_admission_version,
+            content_proof_admission_kind, content_proof_admission_sha256,
+            content_proof_resource_types
         ) VALUES (
             :dataset_id, 'endpoint-a', 'gate-root', 'gate-root',
             :previous_dataset_id, :dataset_hash, 10, 'validated', false,
-            now(), CAST(:metadata AS jsonb)
+            now(), CAST(:metadata AS jsonb), CAST(:summary AS jsonb),
+            :metadata_sha256, :admission_version, :admission_kind,
+            :proof_sha256, CAST(:resource_types AS varchar[])
         )
         """,
         dataset_id=dataset_id,
         previous_dataset_id=previous_dataset_id,
         dataset_hash=dataset_hash,
         metadata=json.dumps(metadata, sort_keys=True),
+        summary=json.dumps(receipt.metadata_summary, sort_keys=True),
+        metadata_sha256=receipt.metadata_sha256,
+        admission_version=receipt.admission_version,
+        admission_kind=receipt.admission_kind,
+        proof_sha256=receipt.proof_sha256,
+        resource_types=list(receipt.resource_types),
     )
 
 

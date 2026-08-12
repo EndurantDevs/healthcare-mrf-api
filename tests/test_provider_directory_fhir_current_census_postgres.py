@@ -280,6 +280,23 @@ async def _run_outer_import(
     )
 
 
+async def _seed_validation_source(
+    database: Any,
+    schema: str,
+    source_record: dict[str, Any],
+) -> None:
+    await database.status(
+        f'CREATE TABLE "{schema}".provider_directory_source ('
+        'source_id varchar(64) PRIMARY KEY, endpoint_id varchar(64));'
+    )
+    await database.status(
+        f'INSERT INTO "{schema}".provider_directory_source '
+        '(source_id, endpoint_id) VALUES (:source_id, :endpoint_id);',
+        source_id=source_record["source_id"],
+        endpoint_id=source_record["endpoint_id"],
+    )
+
+
 async def _run_outer_resumable_phase(
     monkeypatch: pytest.MonkeyPatch,
     source_record: dict[str, Any],
@@ -445,6 +462,7 @@ async def test_postgres_outer_lifecycle_resumes_acquiring_census_candidate(
     )
 
     async with census_database(monkeypatch, seed_dataset=False) as (database, schema):
+        await _seed_validation_source(database, schema, source_record)
         await _run_outer_resumable_phase(
             monkeypatch, source_record, database, schema, count_url, start_url, dataset_id
         )

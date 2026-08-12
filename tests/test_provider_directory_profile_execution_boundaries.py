@@ -390,6 +390,11 @@ async def test_current_profile_dataset_map_covers_absent_and_present_rows(
     assert await importer._current_profile_dataset_map("pdfhir_payer") == (
         _published_dataset_state()
     )
+    assert all(
+        "publication_metadata_summary_json" in call.args[0]
+        and "AS publication_metadata_json" in call.args[0]
+        for call in first.await_args_list
+    )
 
 
 @pytest.mark.asyncio
