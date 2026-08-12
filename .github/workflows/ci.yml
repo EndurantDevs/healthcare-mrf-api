@@ -1067,6 +1067,7 @@ jobs:
           tests/test_provider_directory_artifact_selection_scope_db.py
           tests/test_provider_directory_dataset_selection_bounded_db.py
           tests/test_provider_directory_dataset_selection_receipt_db.py
+          tests/test_provider_directory_selection_receipt_backfill_db.py
           tests/test_provider_directory_dataset_selection_sealed_db.py
           tests/test_provider_directory_admission_seal_backfill_db.py
           tests/test_provider_directory_dataset_artifact_cutover_db.py
