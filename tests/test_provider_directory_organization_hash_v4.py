@@ -12,6 +12,9 @@ import pytest
 
 from db.models import ProviderDirectoryOrganization
 from process import provider_directory_proof_store as proof_store
+from process.provider_directory_admission_seal import (
+    admission_seal_from_validated_metadata,
+)
 from process.provider_directory_organization_hash import (
     canonical_organization_payload,
     merge_organization_semantic_payloads,
@@ -21,6 +24,7 @@ from process.provider_directory_organization_hash import (
     organization_semantic_payload_sha256,
 )
 from process.provider_directory_proof_store import (
+    PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY,
     PROVIDER_DIRECTORY_SEMANTIC_CONTENT_V4_PROOF_CONTRACT_ID,
     ProviderDirectoryProofStoreError,
     ProviderDirectoryStoredProofOptions,
@@ -447,6 +451,22 @@ async def test_v4_sealed_proof_binds_union_and_contract() -> None:
                 expected_semantic_projection_as_of="2026-08-10",
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_v4_union_proof_admits_deduplicated_shards() -> None:
+    """Admit a validated semantic union with duplicate observations."""
+
+    stored_proof, _merged_hash = await _stored_v4_union_proof()
+    proof = stored_proof.metadata
+
+    assert sum(shard["resource_count"] for shard in proof["shards"]) == 2
+    assert proof["resource_count"] == 1
+    receipt = admission_seal_from_validated_metadata(
+        {PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: proof}
+    )
+    assert receipt is not None
+    assert receipt.proof_sha256 == proof["proof_sha256"]
 
 
 def test_v4_model_exposes_retained_primary_variants() -> None:

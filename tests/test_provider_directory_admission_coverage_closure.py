@@ -14,6 +14,9 @@ from process.provider_directory_admission_seal import (
     AdmissionSealError,
     admission_seal_from_validated_metadata,
 )
+from process.provider_directory_proof_store import (
+    PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID,
+)
 from tests.test_provider_directory_dataset_selection_bounded_db import (
     _large_metadata_by_field,
 )
@@ -162,3 +165,20 @@ def test_finished_stream_rejects_incomplete_proof(tmp_path: Path):
             )
     finally:
         stream.close()
+
+
+def test_legacy_receipt_rejects_descriptor_overcoverage() -> None:
+    metadata = _large_metadata_by_field(1)
+    proof = metadata["provider_directory_content_proof_v1"]
+    proof["contract_id"] = PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID
+    for field_name in (
+        "proof_resource_scope",
+        "resource_hash_contract",
+        "semantic_projection_as_of",
+        "semantic_union",
+    ):
+        proof.pop(field_name)
+    proof["shards"].append(dict(proof["shards"][0]))
+
+    with pytest.raises(AdmissionSealError, match="shard_summary"):
+        admission_seal_from_validated_metadata(metadata)
