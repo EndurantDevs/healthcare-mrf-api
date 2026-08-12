@@ -419,6 +419,41 @@ async def test_control_route_is_exact_authenticated_and_idempotent(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_abandonment_proof_get_maps_fail_closed_results(monkeypatch):
+    monkeypatch.setattr(routes, "require_control_auth", lambda _request: None)
+    proof_service = AsyncMock()
+    monkeypatch.setattr(
+        routes,
+        "get_materialized_preclaim_abandonment",
+        proof_service,
+    )
+    with pytest.raises(BadRequest):
+        await routes.control_get_materialized_preclaim_abandonment(
+            SimpleNamespace(args={"unexpected": "value"}),
+            "materialized-wave",
+        )
+    for error, status_code in (
+        (PTGWaveMaterializedPreclaimConflict("unsafe"), 409),
+        (ValueError("invalid"), 400),
+    ):
+        proof_service.side_effect = error
+        with pytest.raises(SanicException) as exc_info:
+            await routes.control_get_materialized_preclaim_abandonment(
+                SimpleNamespace(args={}),
+                "materialized-wave",
+            )
+        assert exc_info.value.status_code == status_code
+    proof_service.side_effect = None
+    proof_service.return_value = None
+    with pytest.raises(SanicException) as exc_info:
+        await routes.control_get_materialized_preclaim_abandonment(
+            SimpleNamespace(args={}),
+            "materialized-wave",
+        )
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_ordinary_capacity_is_blocked_before_and_clear_after(monkeypatch):
     monkeypatch.setattr(
         fence,
