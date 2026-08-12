@@ -532,6 +532,24 @@ proof shard array remains audit and replay evidence and is intentionally not
 reopened on every resolver read; any receipt or bound scalar drift fails the
 fence.
 
+A reviewed legacy current row can receive only that compact selection receipt
+without relaxing or replacing the admission-seal validator. Validation is the
+default and is read-only:
+
+```bash
+python main.py start provider-directory-selection-receipt-backfill \
+  --dataset-id synthetic-dataset-id
+```
+
+Add `--apply` only after the validation result is accepted. The command
+requires an unsealed current published row, validates the bounded FHIR source
+summary, exact outcome, proof identity, parent scalars, and complete retained
+resource-count keyset in one repeatable-read transaction, then stores only the
+receipt with a locked identity CAS. Existing admission fields, raw proof bytes,
+and resources are never changed. A retry of the exact stored receipt is an
+idempotent success; conflicting receipts, any admission state, count drift, or
+row drift fail closed.
+
 Each endpoint acquisition writes to a non-current
 `provider_directory_endpoint_dataset` candidate. Normalized resources are
 stored once per `(dataset_id, resource_type, resource_id)` in
