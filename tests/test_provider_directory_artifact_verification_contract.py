@@ -20,18 +20,16 @@ def test_historically_reviewed_sources_keep_distinct_nonempty_campaigns():
 
     assert all(campaign_ids)
     assert len(campaign_ids) == len(set(campaign_ids))
-    enabled_rows = [
+    reviewed_rows = [
         row
         for row in importer._reviewed_provider_directory_candidate_seed_rows()
-        if row["metadata_json"].get(
-            "provider_directory_acquisition_enabled"
-        )
+        if "provider_directory_candidate_status" in row["metadata_json"]
     ]
     assert {
         row["id"]: row["metadata_json"][
             importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
         ]
-        for row in enabled_rows
+        for row in reviewed_rows
     } == importer.REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID
 
 

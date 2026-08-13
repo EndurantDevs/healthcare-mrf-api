@@ -28,6 +28,24 @@ from process.provider_directory_fhir_root_policy import (
 from tests.tin_npi_connector_postgres_support import expect_postgres_error
 
 
+LEGACY_PARTITION_CAMPAIGN_ID = (
+    "provider-directory-reviewed-practitioner-role-partition-2026-08-17-v3"
+)
+PARTITION_RESOURCES = {
+    "PractitionerRole": {
+        "start": "1900-01-01T00:00:00Z",
+        "end": "2026-08-17T00:00:00Z",
+        "ceiling": 3000,
+        "minimum_width_seconds": 1,
+        "boundary_precision_seconds": 1,
+        "page_count": 1000,
+        "maximum_pages_per_window": 4,
+        "volatile_metadata_paths": [],
+    }
+}
+LEGACY_AUDIT_RECEIPT = {"sha256": "a" * 64}
+
+
 def _source_table(schema_name: str) -> Table:
     """Model the reduced PostgreSQL fixture for expression compilation."""
 
@@ -133,35 +151,28 @@ def _copy_upsert_sql(
 
 
 def _legacy_exhaustive_generation(note: str) -> dict[str, object]:
-    return {
-        "provider_directory_candidate_status": (
-            "verified_two_matching_exhaustive_acquisitions"
-        ),
-        "provider_directory_verification_campaign_id": "reviewed-campaign-v1",
-        "ordinary_catalog_note": note,
-    }
+    metadata = _partition_generation(note)
+    metadata.update(
+        {
+            "provider_directory_candidate_status": (
+                "verified_two_matching_exhaustive_acquisitions"
+            ),
+            "provider_directory_verification_campaign_id": (
+                LEGACY_PARTITION_CAMPAIGN_ID
+            ),
+            "legacy_audit_receipt": LEGACY_AUDIT_RECEIPT,
+        }
+    )
+    return metadata
 
 
 def _partition_generation(note: str) -> dict[str, object]:
     return {
-        "provider_directory_candidate_status": (
-            "pending_two_matching_exhaustive_acquisitions"
-        ),
-        "provider_directory_verification_campaign_id": "reviewed-campaign-v2",
+        "provider_directory_override": "reviewed_candidate_acquisition",
+        "provider_directory_acquisition_enabled": True,
         "provider_directory_last_updated_partition_acquisition": {
             "enabled": True,
-            "resources": {
-                "PractitionerRole": {
-                    "start": "1900-01-01T00:00:00Z",
-                    "end": "2026-08-11T00:00:00Z",
-                    "ceiling": 3000,
-                    "minimum_width_seconds": 1,
-                    "boundary_precision_seconds": 1,
-                    "page_count": 1000,
-                    "maximum_pages_per_window": 3,
-                    "volatile_metadata_paths": [],
-                }
-            },
+            "resources": PARTITION_RESOURCES,
         },
         "ordinary_catalog_note": note,
     }
@@ -171,6 +182,7 @@ async def _insert_legacy_generation(
     scenario,
     source_id: str,
     endpoint_id: str,
+    metadata: dict[str, object] | None = None,
 ) -> None:
     await scenario.connection.execute(
         f"""
@@ -182,7 +194,10 @@ async def _insert_legacy_generation(
         """,
         source_id,
         endpoint_id,
-        json.dumps(_legacy_exhaustive_generation("legacy"), sort_keys=True),
+        json.dumps(
+            metadata or _legacy_exhaustive_generation("legacy"),
+            sort_keys=True,
+        ),
     )
 
 
@@ -200,14 +215,72 @@ async def _assert_partition_generation(
         source_id,
     )
     metadata = json.loads(raw_metadata)
-    assert metadata == _partition_generation(expected_note)
+    assert metadata == {
+        **_partition_generation(expected_note),
+        "legacy_audit_receipt": LEGACY_AUDIT_RECEIPT,
+    }
     assert REVIEWED_ROOT_POLICY_METADATA_KEY not in metadata
     assert ACTIVATION_METADATA_KEY not in metadata
     assert ACTIVATION_METADATA_KEY_V2 not in metadata
 
 
+async def _assert_legacy_generation(
+    scenario,
+    source_id: str,
+    campaign_id: str,
+) -> None:
+    metadata = json.loads(
+        await scenario.connection.fetchval(
+            f"""
+            SELECT metadata_json::text
+              FROM {scenario.quoted_schema}.provider_directory_source
+             WHERE source_id = $1
+            """,
+            source_id,
+        )
+    )
+    assert metadata["provider_directory_candidate_status"] == (
+        "verified_two_matching_exhaustive_acquisitions"
+    )
+    assert metadata["provider_directory_verification_campaign_id"] == campaign_id
+
+
+async def _prove_partition_reset_requires_exact_campaign(scenario) -> None:
+    metadata = _legacy_exhaustive_generation("legacy")
+    metadata["provider_directory_verification_campaign_id"] = "other-campaign"
+    for mode in ("values", "copy"):
+        await _insert_legacy_generation(
+            scenario,
+            f"campaign-drift-{mode}",
+            f"endpoint-campaign-drift-{mode}",
+            metadata,
+        )
+    statement, parameters = _values_upsert_sql(
+        scenario,
+        note="campaign-drift",
+        source_id="campaign-drift-values",
+        endpoint_id="endpoint-campaign-drift-values",
+        incoming_metadata=_partition_generation("campaign-drift"),
+    )
+    copy_sql = _copy_upsert_sql(
+        scenario,
+        source_id="campaign-drift-copy",
+        endpoint_id="endpoint-campaign-drift-copy",
+    )
+    copy_parameters = json.dumps(_partition_generation("campaign-drift"), sort_keys=True)
+    for _ in range(2):
+        await scenario.connection.execute(statement, *parameters)
+        await scenario.connection.execute(copy_sql, copy_parameters)
+    for mode in ("values", "copy"):
+        await _assert_legacy_generation(
+            scenario,
+            f"campaign-drift-{mode}",
+            "other-campaign",
+        )
+
+
 async def prove_unprotected_generation_replacement(scenario) -> None:
-    """Replace one legacy exhaustive campaign through both upsert paths."""
+    """Retire one exact legacy partition profile through both upsert paths."""
 
     values_source = "legacy-values-source"
     copy_source = "legacy-copy-source"
@@ -228,15 +301,15 @@ async def prove_unprotected_generation_replacement(scenario) -> None:
         endpoint_id="endpoint-generation-values",
         incoming_metadata=_partition_generation("values-path"),
     )
-    await scenario.connection.execute(values_sql, *values_parameters)
-    await scenario.connection.execute(
-        _copy_upsert_sql(
-            scenario,
-            source_id=copy_source,
-            endpoint_id="endpoint-generation-copy",
-        ),
-        json.dumps(_partition_generation("copy-path"), sort_keys=True),
+    copy_sql = _copy_upsert_sql(
+        scenario,
+        source_id=copy_source,
+        endpoint_id="endpoint-generation-copy",
     )
+    copy_parameters = json.dumps(_partition_generation("copy-path"), sort_keys=True)
+    for _ in range(2):
+        await scenario.connection.execute(values_sql, *values_parameters)
+        await scenario.connection.execute(copy_sql, copy_parameters)
     await _assert_partition_generation(
         scenario,
         values_source,
@@ -247,6 +320,7 @@ async def prove_unprotected_generation_replacement(scenario) -> None:
         copy_source,
         "copy-path",
     )
+    await _prove_partition_reset_requires_exact_campaign(scenario)
 
 
 async def _assert_marker_and_note(

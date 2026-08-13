@@ -1611,17 +1611,12 @@ REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID = {
     "san-mateo-county-bhrs-reviewed-candidate": (
         "provider-directory-san-mateo-2026-07-19-v1"
     ),
-    "devoted-health-reviewed-candidate": (
-        "provider-directory-reviewed-practitioner-role-partition-2026-08-17-v3"
-    ),
     "simpra-advantage-reviewed-candidate": (
         "provider-directory-simpra-2026-07-19-v1"
     ),
 }
-REVIEWED_PRACTITIONER_ROLE_PARTITION_CAMPAIGN_ID = (
-    REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID[
-        "devoted-health-reviewed-candidate"
-    ]
+LEGACY_REVIEWED_PARTITION_CAMPAIGN_ID = (
+    "provider-directory-reviewed-practitioner-role-partition-2026-08-17-v3"
 )
 TWIN_ROOT_VERIFICATION_METADATA_KEY = "twin_root_verification_v1"
 SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY = (
@@ -41847,11 +41842,123 @@ def _pending_policy_generation_reset_sql(
     )
 
 
+def _ordinary_partition_generation_reset_expression(
+    target_metadata: Any,
+    incoming_metadata: Any,
+) -> Any:
+    """Retire one legacy review profile without changing its transport."""
+
+    status_key = "provider_directory_candidate_status"
+    campaign_key = PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
+    expected_partition = literal(
+        json.dumps(
+            {
+                "enabled": True,
+                "resources": REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES,
+            },
+            sort_keys=True,
+        )
+    ).cast(JSONB)
+    protected_keys = (
+        REVIEWED_ROOT_POLICY_METADATA_KEY,
+        REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,
+        REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2,
+    )
+    return and_(
+        target_metadata.op("->>")(literal(status_key))
+        == literal(PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED),
+        target_metadata.op("->>")(literal(campaign_key))
+        == literal(LEGACY_REVIEWED_PARTITION_CAMPAIGN_ID),
+        *(
+            metadata.op("->>")(literal("provider_directory_override"))
+            == literal("reviewed_candidate_acquisition")
+            for metadata in (target_metadata, incoming_metadata)
+        ),
+        *(
+            metadata.op("->>")(
+                literal("provider_directory_acquisition_enabled")
+            )
+            == literal("true")
+            for metadata in (target_metadata, incoming_metadata)
+        ),
+        *(
+            metadata.op("->")(literal(LAST_UPDATED_PARTITION_METADATA_KEY))
+            == expected_partition
+            for metadata in (target_metadata, incoming_metadata)
+        ),
+        *(
+            metadata.op("?")(literal(key)) == literal(False)
+            for metadata, keys in (
+                (target_metadata, protected_keys),
+                (incoming_metadata, (status_key, campaign_key, *protected_keys)),
+            )
+            for key in keys
+        ),
+    )
+
+
+def _ordinary_partition_generation_reset_sql(
+    target_metadata: str,
+    incoming_metadata: str,
+) -> str:
+    """Render COPY-upsert parity for the ordinary partition reset."""
+
+    expected_partition = json.dumps(
+        {
+            "enabled": True,
+            "resources": REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES,
+        },
+        sort_keys=True,
+    )
+    expected_partition = _sql_string_literal(expected_partition)
+    protected_keys = (
+        REVIEWED_ROOT_POLICY_METADATA_KEY,
+        REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,
+        REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2,
+    )
+    protected_absence = " AND ".join(
+        f"NOT ({metadata} ? '{key}')"
+        for metadata, keys in (
+            (target_metadata, protected_keys),
+            (
+                incoming_metadata,
+                (
+                    "provider_directory_candidate_status",
+                    PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY,
+                    *protected_keys,
+                ),
+            ),
+        )
+        for key in keys
+    )
+    return " AND ".join(
+        (
+            f"{target_metadata} ->> 'provider_directory_candidate_status' = "
+            f"'{PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED}'",
+            f"{target_metadata} ->> "
+            f"'{PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY}' = "
+            f"'{LEGACY_REVIEWED_PARTITION_CAMPAIGN_ID}'",
+            *(f"{metadata} ->> 'provider_directory_override' = "
+              "'reviewed_candidate_acquisition'"
+              for metadata in (target_metadata, incoming_metadata)),
+            *(f"{metadata} ->> 'provider_directory_acquisition_enabled' = 'true'"
+              for metadata in (target_metadata, incoming_metadata)),
+            *(f"{metadata} -> '{LAST_UPDATED_PARTITION_METADATA_KEY}' = "
+              f"{expected_partition}::jsonb"
+              for metadata in (target_metadata, incoming_metadata)),
+            protected_absence,
+        )
+    )
+
+
 def _source_generation_metadata_without_state_expression(metadata: Any) -> Any:
     """Remove only mutable reviewed-generation state before a closed reset."""
 
     return (
         metadata.op("-")(literal("provider_directory_candidate_status"))
+        .op("-")(
+            literal(PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY)
+        )
         .op("-")(literal(REVIEWED_ROOT_POLICY_METADATA_KEY))
         .op("-")(literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY))
         .op("-")(literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2))
@@ -41863,6 +41970,7 @@ def _source_generation_metadata_without_state_sql(metadata: str) -> str:
 
     return (
         f"(({metadata}) - 'provider_directory_candidate_status' "
+        f"- '{PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY}' "
         f"- '{REVIEWED_ROOT_POLICY_METADATA_KEY}' "
         f"- '{REVIEWED_SUBSET_ACTIVATION_METADATA_KEY}' "
         f"- '{REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2}')"
@@ -41876,9 +41984,15 @@ def _source_metadata_update_expression(table, excluded_value):
     incoming_metadata = func.coalesce(
         excluded_value.cast(JSONB), func.jsonb_build_object()
     )
-    generation_reset = _pending_policy_generation_reset_expression(
-        target_metadata,
-        incoming_metadata,
+    generation_reset = or_(
+        _pending_policy_generation_reset_expression(
+            target_metadata,
+            incoming_metadata,
+        ),
+        _ordinary_partition_generation_reset_expression(
+            target_metadata,
+            incoming_metadata,
+        ),
     )
     policy_preserved_metadata = (
         _preserved_source_reviewed_root_policy_expression(
@@ -41979,7 +42093,9 @@ def _source_metadata_update_sql(
         policy_preserved_metadata,
     )
     effective_metadata = (
-        f"CASE WHEN {_pending_policy_generation_reset_sql(target_metadata, incoming_metadata)} "
+        "CASE WHEN ("
+        f"{_pending_policy_generation_reset_sql(target_metadata, incoming_metadata)}) OR ("
+        f"{_ordinary_partition_generation_reset_sql(target_metadata, incoming_metadata)}) "
         f"THEN {_source_generation_metadata_without_state_sql(target_metadata)} "
         f"|| {incoming_metadata} ELSE {preserved_metadata} END"
     )
@@ -43940,6 +44056,7 @@ class _ReviewedCandidateSeed:
 
 
 def _reviewed_candidate_metadata(candidate: _ReviewedCandidateSeed) -> dict[str, Any]:
+    """Build one reviewed seed profile and reject ambiguous enabled states."""
     metadata = {
         "provider_directory_override": "reviewed_candidate_acquisition",
         "provider_directory_confirmed_base": candidate.api_base,
@@ -43956,28 +44073,30 @@ def _reviewed_candidate_metadata(candidate: _ReviewedCandidateSeed) -> dict[str,
     if candidate.last_updated_partition_resources is not None:
         metadata[LAST_UPDATED_PARTITION_METADATA_KEY] = {
             "enabled": True,
-            "resources": copy.deepcopy(
-                candidate.last_updated_partition_resources
-            ),
+            "resources": copy.deepcopy(candidate.last_updated_partition_resources),
         }
     if candidate.acquisition_enabled:
-        campaign_id = REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID.get(
-            candidate.row_id
-        )
-        if not campaign_id:
-            raise RuntimeError("provider_directory_reviewed_candidate_campaign_missing")
         metadata.update(
             {
                 "provider_directory_fully_enumerable_resources": list(candidate.resources),
                 "provider_directory_coverage_mode": "full",
                 "provider_directory_acquisition_enabled": True,
-                PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY: campaign_id,
             }
         )
-        if candidate.candidate_status is not None:
-            metadata["provider_directory_candidate_status"] = (
-                candidate.candidate_status
-            )
+        if candidate.candidate_status is None:
+            if (
+                candidate.last_updated_partition_resources
+                != REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES
+            ):
+                raise RuntimeError("provider_directory_reviewed_candidate_campaign_missing")
+            return metadata
+        campaign_id = REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID.get(
+            candidate.row_id
+        )
+        if not campaign_id:
+            raise RuntimeError("provider_directory_reviewed_candidate_campaign_missing")
+        metadata[PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY] = campaign_id
+        metadata["provider_directory_candidate_status"] = candidate.candidate_status
         return metadata
     metadata.update(
         {
@@ -44117,7 +44236,6 @@ def _reviewed_provider_directory_candidate_seed_rows(
             source_url="https://www.devoted.com/developers/",
             resources=PUBLIC_DIRECTORY_SEVEN_RESOURCES,
             expected_nonempty_resources=PUBLIC_DIRECTORY_SEVEN_RESOURCES,
-            candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
             last_updated_partition_resources=(
                 REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES
             ),
@@ -63435,13 +63553,13 @@ def _is_reviewed_partition_generation_exact(
         "resources": REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES,
     }
     if (
-        expected_metadata.get("provider_directory_candidate_status")
-        != PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
-        or expected_metadata.get(LAST_UPDATED_PARTITION_METADATA_KEY)
+        expected_metadata.get(LAST_UPDATED_PARTITION_METADATA_KEY)
         != expected_partition_by_field
         or any(
             key in expected_metadata
             for key in (
+                "provider_directory_candidate_status",
+                PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY,
                 REVIEWED_ROOT_POLICY_METADATA_KEY,
                 REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,
                 REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2,
@@ -63472,9 +63590,12 @@ async def _assert_persisted_reviewed_partition_generations(
         source_record
         for source_record in source_rows
         if _source_metadata(source_record).get(
-            PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
+            LAST_UPDATED_PARTITION_METADATA_KEY
         )
-        == REVIEWED_PRACTITIONER_ROLE_PARTITION_CAMPAIGN_ID
+        == {
+            "enabled": True,
+            "resources": REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES,
+        }
     ]
     for expected_source in expected_sources:
         persisted_rows = await db.all(
