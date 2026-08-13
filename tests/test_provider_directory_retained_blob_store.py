@@ -297,6 +297,27 @@ def test_opened_blob_reads_once_and_verifies_unchanged_path(
         opened_blob.verify_and_close()
 
 
+def test_opened_blob_skips_duplicate_digest_after_verified_read(
+    retained_artifact_test_root: Path,
+    monkeypatch,
+) -> None:
+    artifact_bytes = b"already-verified retained bytes\n"
+    artifact_sha256, _blob_path = write_retained_artifact_blob(
+        retained_artifact_test_root, artifact_bytes
+    )
+    opened_blob = _open_retained_artifact_blob(
+        artifact_sha256,
+        len(artifact_bytes),
+    )
+    assert opened_blob.read_at(len(artifact_bytes), 0) == artifact_bytes
+    monkeypatch.setattr(
+        blob_store.hashlib,
+        "file_digest",
+        lambda *_args, **_kwargs: pytest.fail("duplicate content digest"),
+    )
+    opened_blob.verify_and_close(content_digest_verified=True)
+
+
 @pytest.mark.parametrize(
     "mutation_kind",
     ("rewrite", "truncate", "replace", "unlink"),
