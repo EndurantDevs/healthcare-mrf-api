@@ -1176,7 +1176,7 @@ EOF
         pip-audit --version
         PGPASSWORD=postgres psql --host postgres --port 5432 --username postgres --dbname ptg2_v3_lifecycle_test_ci_runner --tuples-only --no-align --command "show server_version"
         PGPASSWORD=postgres psql --host postgres --port 5432 --username postgres --dbname ptg2_v3_lifecycle_test_ci_runner --tuples-only --no-align --command "select postgis_full_version()"
-        python - <<'PY'
+        python - <<PY
 import asyncio
 from redis.asyncio import Redis
 
@@ -1184,7 +1184,7 @@ from redis.asyncio import Redis
 async def main() -> None:
     redis = Redis.from_url("redis://redis:6379", decode_responses=True)
     info = await redis.info(section="server")
-    print(f"redis {info['redis_version']}")
+    print("redis " + info["redis_version"])
     await redis.aclose()
 
 

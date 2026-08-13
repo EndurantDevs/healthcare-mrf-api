@@ -139,6 +139,14 @@ def test_local_all_records_the_native_libc_version() -> None:
     assert "platform.libc()" not in script
 
 
+def test_local_all_records_redis_version_inside_the_quoted_runner() -> None:
+    script = PREPUSH.read_text(encoding="utf-8")
+
+    assert "python - <<PY" in script
+    assert 'print("redis " + info["redis_version"])' in script
+    assert "python - <<'PY'\nimport asyncio\nfrom redis.asyncio" not in script
+
+
 def test_native_python_lock_is_complete_and_hashed() -> None:
     lock_input = PYTHON_LOCK_INPUT.read_text(encoding="utf-8")
     lock = PYTHON_LOCK.read_text(encoding="utf-8")
