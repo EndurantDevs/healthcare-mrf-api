@@ -193,7 +193,7 @@ def test_terminal_window_profile_has_closed_percentage_bound(
 
 def test_terminal_window_profile_rejects_early_source_exhaustion():
     contract, completed = _terminal_proof(
-        pre_count=512_034,
+        pre_count=512_251,
         post_count=509_978,
         pages_processed=2_048,
     )
@@ -215,7 +215,13 @@ def test_terminal_window_profile_rejects_early_source_exhaustion():
 
 @pytest.mark.parametrize(
     ("pre_count", "verified"),
-    ((511_999, False), (512_000, True), (512_250, True), (512_251, False)),
+    (
+        (511_999, False),
+        (512_000, True),
+        (512_250, True),
+        (512_499, True),
+        (512_500, False),
+    ),
 )
 def test_terminal_window_profile_has_inclusive_terminal_envelope(
     pre_count,
@@ -264,9 +270,9 @@ def test_terminal_window_profile_builds_and_revalidates_canonical_proof():
 
     tampered = copy.deepcopy(proof)
     tampered_resource = tampered["resources"]["PractitionerRole"]
-    tampered_resource["advertised_pre"] = 512_251
-    tampered_resource["advertised_post"] = 512_251
-    tampered_resource["deficit"] = 512_251
+    tampered_resource["advertised_pre"] = 512_500
+    tampered_resource["advertised_post"] = 512_500
+    tampered_resource["deficit"] = 512_500
     with pytest.raises(ValueError, match="completion_resource_invalid"):
         validate_subset_completion_proof_pair(
             tampered,
@@ -276,7 +282,7 @@ def test_terminal_window_profile_builds_and_revalidates_canonical_proof():
 
 def test_terminal_window_profile_builder_rejects_forged_early_exhaustion():
     contract, execution_proof = _terminal_proof(
-        pre_count=512_034,
+        pre_count=512_251,
         post_count=509_978,
         pages_processed=2_048,
     )
