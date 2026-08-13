@@ -47,6 +47,7 @@ SAFE_ERROR_CODES = frozenset(
         "progress",
         "publication",
         "replay",
+        "root_retryable",
         "root_unsealable",
         "source_drift",
         "state",
@@ -390,8 +391,9 @@ def run_command(arguments: Sequence[str] | None = None) -> int:
         _print_error("timeout")
         return 1
     except Exception as error:
-        _print_error(_operation_error_code(error))
-        return 1
+        error_code = _operation_error_code(error)
+        _print_error(error_code)
+        return 75 if error_code == "root_retryable" else 1
     print(rendered_result)
     return 0
 

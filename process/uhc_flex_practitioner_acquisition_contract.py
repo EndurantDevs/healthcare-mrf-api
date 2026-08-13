@@ -52,6 +52,7 @@ class UHCFlexPractitionerAcquisitionError(RuntimeError):
         message_by_code = {
             "disabled": "Flex Practitioner acquisition is disabled",
             "progress": "Flex Practitioner aggregate progress callback failed",
+            "root_retryable": "Flex Practitioner acquisition root is retryable",
             "root_unsealable": "Flex Practitioner acquisition root cannot be sealed",
             "source_drift": "Flex Practitioner exact source changed during acquisition",
             "cohort_drift": "Flex Practitioner official cohort changed during acquisition",

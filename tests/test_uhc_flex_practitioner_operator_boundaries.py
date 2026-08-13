@@ -70,7 +70,7 @@ def test_invalid_phase_and_unserializable_receipt_fail_closed(monkeypatch) -> No
 
 def test_internal_error_normalization_preserves_only_closed_codes() -> None:
     class StableError(RuntimeError):
-        code = "busy"
+        code = "root_retryable"
 
     stable_error = StableError("private detail")
     normalized_stable = operator._operation_error(stable_error, "publication")
@@ -83,7 +83,7 @@ def test_internal_error_normalization_preserves_only_closed_codes() -> None:
         normalized_stable,
         operator.UHCFlexPractitionerOperatorError,
     )
-    assert normalized_stable.code == "busy"
+    assert normalized_stable.code == "root_retryable"
     assert "private" not in str(normalized_stable)
     assert isinstance(
         normalized_unknown,

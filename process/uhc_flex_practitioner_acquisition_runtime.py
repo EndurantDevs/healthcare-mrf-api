@@ -42,6 +42,7 @@ from process.uhc_flex_practitioner_store import (
     seal_uhc_flex_practitioner_acquisition,
     UHCFlexPractitionerAcquisitionIdentity,
     UHCFlexPractitionerAcquisitionSummary,
+    UHCFlexPractitionerStoreError,
     UHCFlexPractitionerWorkClaim,
 )
 from process.uhc_flex_practitioner_transport import (
@@ -274,25 +275,26 @@ class _RootRunner:
 
         claim: UHCFlexPractitionerWorkClaim | None = None
         try:
-            await self.dependencies.sleep(delay_seconds)
-            async with self._claim_lock:
-                claim = await self.dependencies.claim_work(
-                    self.identity.acquisition_id,
-                    requested_npi=requested_npi,
-                    lease_seconds=self.config.lease_seconds,
-                    database=self.database,
-                )
-        finally:
-            self._finish_delayed_retry()
-        if claim is not None:
             try:
+                await self.dependencies.sleep(delay_seconds)
+                async with self._claim_lock:
+                    claim = await self.dependencies.claim_work(
+                        self.identity.acquisition_id,
+                        requested_npi=requested_npi,
+                        lease_seconds=self.config.lease_seconds,
+                        database=self.database,
+                    )
+            finally:
+                self._finish_delayed_retry()
+            if claim is not None:
                 if type(claim) is not UHCFlexPractitionerWorkClaim:
                     raise UHCFlexPractitionerAcquisitionError("state")
                 await self._record_claim()
-            except asyncio.CancelledError:
+            return claim
+        except asyncio.CancelledError:
+            if claim is not None:
                 await self.release_for_cancellation(claim)
-                raise
-        return claim
+            raise
 
     async def release_for_cancellation(
         self,
@@ -358,16 +360,33 @@ class _RootRunner:
             raise
         await self._record_terminal("error")
 
+    async def release_final_retryable(self, claim: UHCFlexPractitionerWorkClaim) -> None:
+        """Stop new claims and release the final retryable lease if still owned."""
+
+        async with self._claim_lock:
+            self._no_delayed_retries.clear()
+            try:
+                await drain_operation(
+                    self.dependencies.release_work(
+                        claim,
+                        database=self.database,
+                    ),
+                    preserve_cancellation=True,
+                )
+            except UHCFlexPractitionerStoreError as error:
+                if error.code != "lease_lost":
+                    raise
+            else:
+                await self._record_retry()
+
     async def process_claim(
         self,
         session: Any,
         claim: UHCFlexPractitionerWorkClaim,
+        invocation_attempt: int = 1,
     ) -> tuple[int, float] | None:
         """Fetch and terminalize a claim or return its retry request."""
 
-        if claim.attempt > self.config.max_attempts:
-            await self.terminal_error(claim, "retry_exhausted")
-            raise UHCFlexPractitionerAcquisitionError("root_unsealable")
         try:
             query_result = await self.dependencies.fetch(
                 session,
@@ -377,18 +396,17 @@ class _RootRunner:
             await self.release_for_cancellation(claim)
             raise
         except UHCFlexPractitionerTransportError as error:
-            if error.retryable and claim.attempt < self.config.max_attempts:
-                retry_delay = self.retry_delay(error, claim.attempt)
-                await self.release_for_retry(claim)
-                return claim.requested_npi, retry_delay
+            if error.retryable:
+                if invocation_attempt < self.config.max_attempts:
+                    retry_delay = self.retry_delay(error, invocation_attempt)
+                    await self.release_for_retry(claim)
+                    return claim.requested_npi, retry_delay
+                await self.release_final_retryable(claim)
+                raise UHCFlexPractitionerAcquisitionError("root_retryable")
             terminal_code = (
-                "retry_exhausted"
-                if error.retryable
-                else (
-                    f"response_validation_{error.validation_code}"
-                    if error.validation_code is not None
-                    else error.code
-                )
+                f"response_validation_{error.validation_code}"
+                if error.validation_code is not None
+                else error.code
             )
             await self.terminal_error(claim, terminal_code)
             raise UHCFlexPractitionerAcquisitionError("root_unsealable")
@@ -411,18 +429,25 @@ class _RootRunner:
         """Consume exact cohort claims until the root has no remaining work."""
 
         retry_request: tuple[int, float] | None = None
+        invocation_attempt = 1
         while True:
             if retry_request is None:
                 claim = await self.claim()
+                invocation_attempt = 1
             else:
                 requested_npi, delay_seconds = retry_request
                 claim = await self.claim_retry(requested_npi, delay_seconds)
                 retry_request = None
                 if claim is None:
                     continue
+                invocation_attempt += 1
             if claim is None:
                 return
-            retry_request = await self.process_claim(session, claim)
+            retry_request = await self.process_claim(
+                session,
+                claim,
+                invocation_attempt,
+            )
 
 
 async def gather_worker_cleanup(tasks: list[asyncio.Task[None]]) -> None:

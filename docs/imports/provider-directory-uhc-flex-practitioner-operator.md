@@ -44,7 +44,9 @@ HLTHPRT_UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ACQUISITION_ENABLED=true \
 The command acquires one candidate root for the sealed official cohort and
 admits it under the reviewed single-root policy. Admission rechecks the exact
 current official dataset and cohort. Repeating the same inputs replays the same
-authority; it does not publish.
+authority; it does not publish. Exhausted retryable transport work is released
+for a same-key invocation and exits with bounded code 75; an already expired or
+reclaimed lease remains same-key reclaimable. Other failures still exit 1.
 
 ## Retired acquire/admit contract
 
