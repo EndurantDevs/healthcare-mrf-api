@@ -91,6 +91,9 @@ def test_public_evidence_coverage_scope_is_ratcheted() -> None:
     workflow = (repository_root / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
     )
+    prepush = (repository_root / "scripts" / "ci" / "prepush").read_text(
+        encoding="utf-8"
+    )
 
     assert "    public_evidence\n" in coverage_config
     assert "    public_evidence/*.py\n" in coverage_config
@@ -99,4 +102,5 @@ def test_public_evidence_coverage_scope_is_ratcheted() -> None:
     assert "public_evidence/*.py" in python_scope["include"]
     assert "public_evidence/**/*.py" in python_scope["include"]
     assert workflow.count("--cov=public_evidence") == 3
-    assert "compileall api process db public_evidence scripts main.py" in workflow
+    assert "run: scripts/ci/prepush quality" in workflow
+    assert "compileall api process db public_evidence scripts main.py" in prepush

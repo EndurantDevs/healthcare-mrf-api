@@ -37,7 +37,9 @@ async def test_observed_provider_directory_endpoint_returns_retained_candidate_r
                 "dataset_created_at": "2026-08-13T08:00:00Z",
                 "resource_type": "Practitioner",
                 "resource_id": "practitioner_a",
-                "payload_json": {"npi": npi, "full_name": "Example Provider"},
+                "payload_json": json.dumps(
+                    {"npi": npi, "full_name": "Example Provider"}
+                ),
             }
         ]
     )
@@ -74,6 +76,16 @@ async def test_observed_provider_directory_endpoint_returns_retained_candidate_r
     assert "resource.payload_json::jsonb ->> 'npi' = :npi" in sql
     assert "ROW_NUMBER() OVER" in sql
     assert "WHERE recency_rank = 1" in sql
+
+
+@pytest.mark.asyncio
+async def test_observed_provider_directory_omits_unusable_payloads(monkeypatch):
+    execute = AsyncMock(
+        return_value=_Result([{"payload_json": None}, {"payload_json": "{not-json"}])
+    )
+    monkeypatch.setattr(npi_module, "_execute_stmt", execute)
+
+    assert await npi_module._fetch_provider_directory_observations(1588616783) == []
 
 
 @pytest.mark.asyncio

@@ -57,6 +57,7 @@ def test_query_normalizers_cover_absence_invalidity_and_human_fallbacks(
 
     assert npi._normalize_text_filter(" ", param_name="name") is None
     assert npi._normalize_state_filter(None) is None
+    assert npi._normalize_state_filter("ca") == "CA"
     with pytest.raises(npi.sanic.exceptions.InvalidUsage):
         npi._normalize_state_filter("x")
     assert npi._normalize_ccn_filter(None) is None

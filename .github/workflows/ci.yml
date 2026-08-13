@@ -90,43 +90,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
-      - name: Compile service modules
-        run: python -m compileall api process db public_evidence scripts main.py
-      - name: Provider Directory runtime contract
-        run: python scripts/smoke/provider_directory_runtime_contract.py
-      - name: Check Provider Directory support documentation
-        run: python scripts/generate_provider_directory_support_docs.py --check
-      - name: Check readability CI policy
-        run: bash tests/test_ci_readability_policy.sh
-      - name: Readability budget
+      - name: Repository pre-push quality gate
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           READABILITY_ZERO_GROWTH_APPROVED: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'readability-zero-growth-approved') }}
-        run: |
-          if [ -n "$BASE_SHA" ]; then
-            git show "$BASE_SHA:readability-baseline.json" > "$RUNNER_TEMP/readability-base.json"
-            required_reduction_percent=1
-            if git diff --quiet "$BASE_SHA" HEAD -- \
-              main.py \
-              ':(glob)api/**/*.py' \
-              ':(glob)db/**/*.py' \
-              ':(glob)process/**/*.py' \
-              ':(glob)public_evidence/**/*.py' \
-              ':(glob)service/**/*.py'; then
-              required_reduction_percent=0
-            elif [ "$READABILITY_ZERO_GROWTH_APPROVED" = "true" ]; then
-              required_reduction_percent=0
-            fi
-            python scripts/readability_budget.py \
-              --ratchet-baseline "$RUNNER_TEMP/readability-base.json" \
-              --required-reduction-percent "$required_reduction_percent"
-          else
-            python scripts/readability_budget.py
-          fi
-      - name: Guard request-time external calls
-        run: python scripts/ci/request_time_external_call_guard.py
-      - name: Coverage forecast contracts
-        run: timeout --foreground 295s python -m pytest -q tests/test_coverage_forecast.py tests/test_ci_coverage_forecast.py
+        run: scripts/ci/prepush quality
 
   python-tests:
     name: python test suite (${{ matrix.shard-index }}/4)

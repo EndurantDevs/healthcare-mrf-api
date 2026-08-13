@@ -18,22 +18,27 @@ COMMENT_NOISE_FIXTURE = "# return" + " result"
 
 
 def test_ci_readability_ratchet_requires_python_debt_reduction():
-    workflow_text = (
-        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
-    ).read_text(encoding="utf-8")
+    repository_root = Path(__file__).resolve().parents[1]
+    workflow_text = (repository_root / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    prepush_text = (repository_root / "scripts" / "ci" / "prepush").read_text(
+        encoding="utf-8"
+    )
 
     assert "types: [opened, synchronize, reopened, labeled, unlabeled]" in workflow_text
-    assert 'git diff --quiet "$BASE_SHA" HEAD -- \\' in workflow_text
+    assert "run: scripts/ci/prepush quality" in workflow_text
+    assert 'git diff --quiet "$BASE_SHA" HEAD -- \\' in prepush_text
     for source_root in ("api", "db", "process", "service"):
-        assert f"':(glob){source_root}/**/*.py'" in workflow_text
-    assert "required_reduction_percent=1" in workflow_text
+        assert f"':(glob){source_root}/**/*.py'" in prepush_text
+    assert "required_reduction_percent=1" in prepush_text
     assert (
         "contains(github.event.pull_request.labels.*.name, "
         "'readability-zero-growth-approved')"
     ) in workflow_text
-    assert 'elif [ "$READABILITY_ZERO_GROWTH_APPROVED" = "true" ]; then' in workflow_text
-    assert workflow_text.count("required_reduction_percent=0") == 2
-    assert '--required-reduction-percent "$required_reduction_percent"' in workflow_text
+    assert 'elif [ "${READABILITY_ZERO_GROWTH_APPROVED:-false}" = "true" ]; then' in prepush_text
+    assert prepush_text.count("required_reduction_percent=0") == 2
+    assert '--required-reduction-percent "$required_reduction_percent"' in prepush_text
 
 
 def _write_config(repo_root: Path) -> None:
