@@ -311,7 +311,19 @@ def _validate_worker_selection(
         return
     persisted_importer = str(outer_run.get("importer") or "").strip()
     persisted_status = str(outer_run.get("status") or "").strip().lower()
-    required_role = "finish" if persisted_status == "finalizing" else "start"
+    metrics = outer_run.get("metrics")
+    required_role = (
+        "finish"
+        if persisted_status == "finalizing"
+        or (
+            persisted_status == "running"
+            and persisted_importer != "ptg"
+            and isinstance(metrics, Mapping)
+            and type(metrics.get("total_chunks")) is int
+            and metrics["total_chunks"] >= 0
+        )
+        else "start"
+    )
     if (
         not persisted_importer
         or persisted_importer not in worker_selection.allowed_importers

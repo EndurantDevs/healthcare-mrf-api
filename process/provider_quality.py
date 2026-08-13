@@ -806,13 +806,14 @@ async def _materialize_quality_rows_cohort(classes: dict[str, type], schema: str
 
     await db.status(_cohort_sql_phase_1_build_features(ctx))
 
-    for year in PROVIDER_QUALITY_YEAR_WINDOW:
-        await db.status(
-            _cohort_sql_phase_2_lsh_shard(ctx),
-            year=year,
-            shard_id=0,
-            shard_count=1,
-        )
+    if ctx["feature_procedure_bucket_col"]:
+        for year in PROVIDER_QUALITY_YEAR_WINDOW:
+            await db.status(
+                _cohort_sql_phase_2_lsh_shard(ctx),
+                year=year,
+                shard_id=0,
+                shard_count=1,
+            )
 
     phase_3_sql = _cohort_sql_phase_3_procedure_bucket(ctx)
     if phase_3_sql:
@@ -1645,17 +1646,25 @@ async def _materialize_quality_rows_sharded(
         await db.status(f"TRUNCATE TABLE {schema}.{context['score_table']};")
         await db.status(_cohort_sql_phase_1_build_features(context))
         await _ensure_materialize_indexes(classes, schema, "PricingProviderQualityFeature")
-        await _enqueue_materialize_phase_shards(
-            redis,
-            run_id=run_id,
-            phase=MAT_PHASE_2_BUILD_LSH_SHARDED,
-            years=years,
-            shard_count=PROVIDER_QUALITY_LSH_SHARDS,
-            stage_suffix=stage_suffix,
-            schema=schema,
-            test_mode=test_mode,
-            job_name="provider_quality_materialize_lsh_shard",
-        )
+        if context["feature_procedure_bucket_col"]:
+            await _enqueue_materialize_phase_shards(
+                redis,
+                run_id=run_id,
+                phase=MAT_PHASE_2_BUILD_LSH_SHARDED,
+                years=years,
+                shard_count=PROVIDER_QUALITY_LSH_SHARDS,
+                stage_suffix=stage_suffix,
+                schema=schema,
+                test_mode=test_mode,
+                job_name="provider_quality_materialize_lsh_shard",
+            )
+        else:
+            await _set_materialize_phase(
+                redis,
+                run_id,
+                MAT_PHASE_3_UPDATE_PROCEDURE_BUCKET,
+                total=0,
+            )
         raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
 
     if phase == MAT_PHASE_2_BUILD_LSH_SHARDED:

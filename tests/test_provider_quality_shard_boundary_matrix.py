@@ -336,6 +336,7 @@ def _patch_materialize_state_machine(monkeypatch, phase: str) -> dict[str, Async
                 "measure_table": "measure",
                 "domain_table": "domain",
                 "score_table": "score",
+                "feature_procedure_bucket_col": None,
             }
         ),
     )
@@ -397,6 +398,35 @@ async def test_materialize_state_machine_finishes_score_phase(monkeypatch) -> No
         ANY,
         "run",
         provider_quality.MAT_PHASE_DONE,
+        total=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_materialize_state_machine_skips_lsh_without_procedure_bucket(
+    monkeypatch,
+) -> None:
+    calls_by_name = _patch_materialize_state_machine(
+        monkeypatch,
+        provider_quality.MAT_PHASE_1_BUILD_FEATURES,
+    )
+
+    with pytest.raises(provider_quality.Retry):
+        await provider_quality._materialize_quality_rows_sharded(
+            object(),
+            classes={},
+            schema="mrf",
+            run_id="run",
+            stage_suffix="stage",
+            test_mode=True,
+            manifest={"year": 2024},
+        )
+
+    calls_by_name["enqueue"].assert_not_awaited()
+    calls_by_name["set_phase"].assert_awaited_with(
+        ANY,
+        "run",
+        provider_quality.MAT_PHASE_3_UPDATE_PROCEDURE_BUCKET,
         total=0,
     )
 

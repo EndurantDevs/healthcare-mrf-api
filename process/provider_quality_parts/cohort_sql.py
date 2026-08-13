@@ -463,6 +463,11 @@ def _cohort_sql_phase_4_peer_targets(ctx: dict[str, Any]) -> str:
     qpp_table = ctx["qpp_table"]
     svi_table = ctx["svi_table"]
     feature_table = ctx["feature_table"]
+    cohort_level_values = (
+        "('L0'), ('L1'), ('L2'), ('L3')"
+        if ctx["feature_procedure_bucket_col"]
+        else "('L1'), ('L2'), ('L3')"
+    )
     peer_target_table = ctx["peer_target_table"]
     return f"""
         INSERT INTO {schema}.{peer_target_table}
@@ -580,7 +585,7 @@ def _cohort_sql_phase_4_peer_targets(ctx: dict[str, Any]) -> str:
             FROM provider_featured p
             CROSS JOIN benchmark_modes bm
             CROSS JOIN (VALUES ('national'), ('state'), ('zip')) AS gs(geography_scope)
-            CROSS JOIN (VALUES ('L0'), ('L1'), ('L2'), ('L3')) AS lv(cohort_level)
+            CROSS JOIN (VALUES {cohort_level_values}) AS lv(cohort_level)
             WHERE (
                 (bm.benchmark_mode = 'zip' AND gs.geography_scope IN ('zip', 'state', 'national'))
                 OR (bm.benchmark_mode = 'state' AND gs.geography_scope IN ('state', 'national'))
@@ -638,6 +643,11 @@ def _cohort_sql_phase_5_measure_shard(ctx: dict[str, Any]) -> str:
     svi_table = ctx["svi_table"]
     feature_table = ctx["feature_table"]
     peer_target_table = ctx["peer_target_table"]
+    procedure_bucket_guard = (
+        "TRUE"
+        if ctx["feature_procedure_bucket_col"]
+        else f"{ctx['peer_cohort_level_expr']} <> 'L0'"
+    )
     return f"""
         WITH deleted AS (
             DELETE FROM {schema}.{ctx["measure_table"]} d
@@ -773,6 +783,7 @@ def _cohort_sql_phase_5_measure_shard(ctx: dict[str, Any]) -> str:
             JOIN {schema}.{peer_target_table} t
               ON t.{ctx["peer_target_year_col"]} = p.year
              AND {ctx["peer_benchmark_mode_expr"]} = bm.benchmark_mode
+             AND {procedure_bucket_guard}
              AND (
                     ({ctx["peer_scope_expr"]} = 'zip' AND bm.benchmark_mode = 'zip' AND p.resolved_zip5 IS NOT NULL AND {ctx["peer_geo_value_expr"]} = p.resolved_zip5)
                     OR (
