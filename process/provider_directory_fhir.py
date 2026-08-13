@@ -150,6 +150,8 @@ from process.provider_directory_fhir_subset_completion import (
     validate_subset_replay_evidence_pair,
 )
 from process.provider_directory_validated_publication_contract import (
+    AUTOMATIC_GENERIC_ADMISSION_PUBLICATION_POLICY,
+    AUTOMATIC_VALIDATED_PUBLICATION_POLICY,
     ValidatedPublicationCandidate,
     canonical_utc_timestamp,
     validated_publication_candidate_from_params,
@@ -14433,7 +14435,10 @@ class ProviderDirectoryArtifactDataset:
     resource_count: int | None = None
     validated_at: str | None = None
     publication_metadata_hash: str | None = None
+    content_proof_admission_sha256: str | None = None
     normalized_receipt_present: bool = False
+    generic_admission_sealed: bool = False
+    artifact_selection_receipt_present: bool = False
     completion_proof_required_version: int | None = None
     completion_proof_sha256: str | None = None
     completion_proof_cutoff: str | None = None
@@ -16475,8 +16480,62 @@ def _artifact_bounded_publication_metadata_sql(metadata: str) -> str:
     )
 
 
+def _sealed_artifact_selection_receipt_proof(
+    publication_metadata: Mapping[str, Any],
+    proof_sha256: str,
+) -> dict[str, Any]:
+    """Rebuild the proof stub from one digest-bound generic admission summary."""
+
+    proof_summary = publication_metadata.get(
+        ADMISSION_GENERIC_PROOF_SUMMARY_KEY
+    )
+    source_summary = publication_metadata.get(SOURCE_SUMMARY_METADATA_KEY)
+    outcome = publication_metadata.get(
+        PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY
+    )
+    if (
+        not isinstance(proof_summary, Mapping)
+        or not isinstance(source_summary, Mapping)
+        or not isinstance(outcome, Mapping)
+        or re.fullmatch(r"[0-9a-f]{64}", proof_sha256) is None
+        or source_summary.get("dataset_hash")
+        != proof_summary.get("dataset_hash")
+        or source_summary.get("total_resources")
+        != proof_summary.get("resource_count")
+        or source_summary.get("resource_hashes")
+        != proof_summary.get("resource_hashes")
+        or source_summary.get("resource_counts")
+        != proof_summary.get("resource_counts")
+        or outcome.get("resource_count")
+        != proof_summary.get("resource_count")
+        or outcome.get("resource_counts")
+        != proof_summary.get("resource_counts")
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_selection_receipt_invalid"
+        )
+    contract_id = {
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT: (
+            PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID
+        ),
+        SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT: (
+            PROVIDER_DIRECTORY_SEMANTIC_CONTENT_V4_PROOF_CONTRACT_ID
+        ),
+    }.get(
+        publication_metadata.get(RESOURCE_HASH_CONTRACT_METADATA_KEY),
+        PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID,
+    )
+    return {
+        "complete": True,
+        "contract_id": contract_id,
+        "proof_sha256": proof_sha256,
+    }
+
+
 def _artifact_selection_receipt(
     publication_metadata: Mapping[str, Any],
+    *,
+    sealed_proof_sha256: str | None = None,
 ) -> dict[str, Any] | None:
     """Return the compact write-validated FHIR selection receipt."""
 
@@ -16491,9 +16550,14 @@ def _artifact_selection_receipt(
     content_proof = publication_metadata.get(
         PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
     )
-    if not isinstance(outcome, Mapping) or not isinstance(
-        content_proof, Mapping
-    ):
+    if not isinstance(outcome, Mapping):
+        return None
+    if content_proof is None and sealed_proof_sha256 is not None:
+        content_proof = _sealed_artifact_selection_receipt_proof(
+            publication_metadata,
+            sealed_proof_sha256,
+        )
+    if not isinstance(content_proof, Mapping):
         return None
     contract_id = content_proof.get("contract_id")
     proof_sha256 = content_proof.get("proof_sha256")
@@ -17161,6 +17225,11 @@ def _artifact_dataset_option_projection_sql(
             WHEN {options.legacy_bounded} THEN {metadata_hash}({metadata})
             ELSE NULL
         END AS publication_metadata_hash,
+        dataset.content_proof_admission_sha256,
+        (({options.content_proof_sealed}) AND ({options.seal_consistent}))
+            AS generic_admission_sealed,
+        dataset.artifact_selection_receipt_json IS NOT NULL
+            AS artifact_selection_receipt_present,
         dataset.completion_proof_json ->> 'cutoff' AS completion_proof_cutoff,
 {proof_projection}
     """
@@ -17680,6 +17749,9 @@ def _artifact_dataset_projection_sql() -> str:
                dataset.publication_metadata_fields
                    AS publication_metadata_json,
                dataset.publication_metadata_hash,
+               dataset.content_proof_admission_sha256,
+               dataset.generic_admission_sealed,
+               dataset.artifact_selection_receipt_present,
                dataset.content_proof_present,
                dataset.normalized_receipt_present,
                dataset.content_proof_contract_id,
@@ -19327,6 +19399,30 @@ def _artifact_dataset_scoped_state_from_row(
     }
 
 
+def _artifact_dataset_authority_state_from_row(
+    dataset_row_map: Mapping[str, Any],
+    publication_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "publication_metadata_hash": _artifact_publication_metadata_hash_from_row(
+            dataset_row_map,
+            publication_metadata,
+        ),
+        "content_proof_admission_sha256": _clean_text(
+            dataset_row_map.get("content_proof_admission_sha256")
+        ),
+        "normalized_receipt_present": (
+            dataset_row_map.get("normalized_receipt_present") is True
+        ),
+        "generic_admission_sealed": (
+            dataset_row_map.get("generic_admission_sealed") is True
+        ),
+        "artifact_selection_receipt_present": (
+            dataset_row_map.get("artifact_selection_receipt_present") is True
+        ),
+    }
+
+
 def _artifact_dataset_state_from_row(
     dataset_row_map: dict[str, Any],
     dataset_id: str,
@@ -19372,12 +19468,9 @@ def _artifact_dataset_state_from_row(
             else None
         ),
         "validated_at": validated_at,
-        "publication_metadata_hash": _artifact_publication_metadata_hash_from_row(
+        **_artifact_dataset_authority_state_from_row(
             dataset_row_map,
             publication_metadata,
-        ),
-        "normalized_receipt_present": (
-            dataset_row_map.get("normalized_receipt_present") is True
         ),
         **_artifact_dataset_scoped_state_from_row(dataset_row_map),
         **_artifact_completion_state_from_row(dataset_row_map),
@@ -22217,6 +22310,11 @@ def _artifact_fence_dataset_projection_sql(
                    WHEN ({legacy_bounded}) THEN ({metadata_hash})
                    ELSE NULL::text
                END AS publication_metadata_hash,
+               dataset.content_proof_admission_sha256,
+               (({fragments_by_name['generic_seal']})
+                    AND ({seal_consistent})) AS generic_admission_sealed,
+               dataset.artifact_selection_receipt_json IS NOT NULL
+                   AS artifact_selection_receipt_present,
                ({source_endpoint_sql}) AS fence_source_endpoint_tuples,
                dataset.dataset_id AS fence_dataset_id
           FROM fence_datasets AS dataset
@@ -22262,6 +22360,7 @@ def _artifact_fence_dataset_rows_sql(*, for_update: bool) -> str:
         "receipt_state": _artifact_normalized_receipt_state_sql(receipt_json),
         "receipt_json": receipt_json,
         "seal_shape": _artifact_admission_seal_shape_valid_sql(),
+        "generic_seal": _artifact_admission_seal_valid_sql(),
         "seal_consistent": _artifact_seal_receipt_consistent_sql(),
         "legacy_bounded": _artifact_legacy_metadata_is_bounded_sql(
             safe_metadata
@@ -22610,6 +22709,100 @@ def _locked_dataset_rows_by_id(
     }
 
 
+def _is_validated_publication_identity_exact(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    dataset: ProviderDirectoryArtifactDataset,
+    candidate: ValidatedPublicationCandidate,
+    expected_current_dataset_id: str | None,
+) -> bool:
+    return bool(
+        fence.should_select_validated_candidates
+        and dataset.promote_on_cutover
+        and dataset.source_id == candidate.source_id
+        and dataset.endpoint_id == candidate.endpoint_id
+        and dataset.dataset_id == candidate.dataset_id
+        and dataset.dataset_hash == candidate.dataset_hash
+        and dataset.evidence_run_id == candidate.acquisition_root_run_id
+        and canonical_utc_timestamp(dataset.validated_at) == candidate.validated_at
+        and dataset.previous_dataset_id == expected_current_dataset_id
+        and dataset.expected_incumbent_dataset_id
+        == expected_current_dataset_id
+        and dataset.status == ENDPOINT_DATASET_VALIDATED
+        and dataset.is_current is False
+        and dataset.verification_source_ids == (candidate.source_id,)
+        and dataset.reviewed_root_policy is None
+    )
+
+
+def _is_validated_publication_authority_exact(
+    dataset: ProviderDirectoryArtifactDataset,
+    candidate: ValidatedPublicationCandidate,
+    locked_dataset_row: Mapping[str, Any],
+) -> bool:
+    if candidate.automatic_publication_policy == (
+        AUTOMATIC_VALIDATED_PUBLICATION_POLICY
+    ):
+        return bool(
+            dataset.completion_proof_required_version
+            == candidate.completion_proof_required_version
+            and dataset.completion_proof_sha256
+            == candidate.completion_proof_sha256
+            and dataset.verification_source_status
+            == validated_publication_source_status(candidate)
+            and dataset.verification_campaign_id
+            == candidate.verification_campaign_id
+            and dataset.verification_source_scope_hash
+            == candidate.verification_source_scope_sha256
+        )
+    if candidate.automatic_publication_policy != (
+        AUTOMATIC_GENERIC_ADMISSION_PUBLICATION_POLICY
+    ):
+        return False
+    return bool(
+        candidate.expected_current is not None
+        and dataset.content_proof_admission_sha256
+        == candidate.content_proof_admission_sha256
+        and dataset.generic_admission_sealed is True
+        and dataset.artifact_selection_receipt_present is True
+        and dataset.completion_proof_required_version is None
+        and dataset.completion_proof_sha256 is None
+        and dataset.completion_proof_cutoff is None
+        and dataset.verification_source_status is None
+        and dataset.verification_campaign_id is None
+        and dataset.verification_source_scope_hash is None
+        and _clean_text(
+            locked_dataset_row.get("content_proof_admission_sha256")
+        )
+        == candidate.content_proof_admission_sha256
+        and locked_dataset_row.get("generic_admission_sealed") is True
+        and locked_dataset_row.get("artifact_selection_receipt_present")
+        is True
+    )
+
+
+def _is_validated_publication_incumbent_exact(
+    expected_current: Any,
+    dataset_rows_by_id: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    if expected_current is None:
+        return True
+    incumbent = dataset_rows_by_id.get(expected_current.dataset_id)
+    return bool(
+        incumbent is not None
+        and _clean_text(incumbent.get("endpoint_id"))
+        == expected_current.endpoint_id
+        and _clean_text(incumbent.get("dataset_hash"))
+        == expected_current.dataset_hash
+        and _clean_text(incumbent.get("acquisition_root_run_id"))
+        == expected_current.acquisition_root_run_id
+        and _clean_text(incumbent.get("status"))
+        == ENDPOINT_DATASET_PUBLISHED
+        and incumbent.get("is_current") is True
+        and incumbent.get("published_at") is not None
+        and incumbent.get("superseded_at") is None
+    )
+
+
 def _assert_validated_publication_candidate_fence(
     fence: ProviderDirectoryArtifactDatasetFence,
     dataset_rows_by_id: Mapping[str, Mapping[str, Any]],
@@ -22623,51 +22816,29 @@ def _assert_validated_publication_candidate_fence(
     if len(fence.datasets) != 1:
         raise ProviderDirectoryArtifactBuildStale(stale_reason)
     dataset = fence.datasets[0]
-    expected_current = candidate.expected_current
-    expected_current_dataset_id = expected_current.dataset_id if expected_current else None
-    if (
-        not fence.should_select_validated_candidates
-        or not dataset.promote_on_cutover
-        or dataset.source_id != candidate.source_id
-        or dataset.endpoint_id != candidate.endpoint_id
-        or dataset.dataset_id != candidate.dataset_id
-        or dataset.dataset_hash != candidate.dataset_hash
-        or dataset.evidence_run_id != candidate.acquisition_root_run_id
-        or canonical_utc_timestamp(dataset.validated_at) != candidate.validated_at
-        or dataset.previous_dataset_id != expected_current_dataset_id
-        or dataset.expected_incumbent_dataset_id != expected_current_dataset_id
-        or dataset.status != ENDPOINT_DATASET_VALIDATED
-        or dataset.is_current is not False
-        or dataset.completion_proof_required_version
-        != candidate.completion_proof_required_version
-        or dataset.completion_proof_sha256
-        != candidate.completion_proof_sha256
-        or dataset.verification_source_status
-        != validated_publication_source_status(candidate)
-        or dataset.verification_campaign_id
-        != candidate.verification_campaign_id
-        or dataset.verification_source_scope_hash
-        != candidate.verification_source_scope_sha256
-        or dataset.verification_source_ids != (candidate.source_id,)
-        or dataset.reviewed_root_policy is not None
-    ):
+    locked_dataset_row = dataset_rows_by_id.get(dataset.dataset_id)
+    if locked_dataset_row is None:
         raise ProviderDirectoryArtifactBuildStale(stale_reason)
-    if expected_current is None:
-        return
-    incumbent = dataset_rows_by_id.get(expected_current.dataset_id)
+    expected_current = candidate.expected_current
+    expected_dataset_id = (
+        expected_current.dataset_id if expected_current is not None else None
+    )
     if (
-        incumbent is None
-        or _clean_text(incumbent.get("endpoint_id"))
-        != expected_current.endpoint_id
-        or _clean_text(incumbent.get("dataset_hash"))
-        != expected_current.dataset_hash
-        or _clean_text(incumbent.get("acquisition_root_run_id"))
-        != expected_current.acquisition_root_run_id
-        or _clean_text(incumbent.get("status"))
-        != ENDPOINT_DATASET_PUBLISHED
-        or incumbent.get("is_current") is not True
-        or incumbent.get("published_at") is None
-        or incumbent.get("superseded_at") is not None
+        not _is_validated_publication_identity_exact(
+            fence,
+            dataset,
+            candidate,
+            expected_dataset_id,
+        )
+        or not _is_validated_publication_authority_exact(
+            dataset,
+            candidate,
+            locked_dataset_row,
+        )
+        or not _is_validated_publication_incumbent_exact(
+            expected_current,
+            dataset_rows_by_id,
+        )
     ):
         raise ProviderDirectoryArtifactBuildStale(stale_reason)
 
@@ -24285,21 +24456,8 @@ async def _record_current_dataset_publication_proof(
         )
 
 
-async def _record_current_dataset_selection_receipt(
-    dataset: ProviderDirectoryArtifactDataset,
-    publication_metadata: Mapping[str, Any],
-) -> None:
-    """Store one compact receipt under the exact locked dataset identity."""
-
-    receipt = _artifact_selection_receipt(publication_metadata)
-    if receipt is None:
-        return
-    dataset_ref = _qt(
-        _schema(),
-        ProviderDirectoryEndpointDataset.__tablename__,
-    )
-    updated = await db.status(
-        f"""
+def _artifact_selection_receipt_update_sql(dataset_ref: str) -> str:
+    return f"""
         UPDATE {dataset_ref}
            SET artifact_selection_receipt_json = CAST(:receipt_json AS jsonb)
          WHERE dataset_id = :dataset_id
@@ -24310,8 +24468,49 @@ async def _record_current_dataset_selection_receipt(
            AND dataset_hash IS NOT DISTINCT FROM :dataset_hash
            AND is_current = :is_current
            AND status = :expected_status
-           AND superseded_at IS NULL;
-        """,
+           AND superseded_at IS NULL
+           AND (
+               CAST(:sealed_proof_sha256 AS varchar) IS NULL
+               OR (
+                   content_proof_admission_kind = :generic_admission_kind
+                   AND content_proof_admission_sha256
+                       = CAST(:sealed_proof_sha256 AS varchar)
+               )
+           );
+    """
+
+
+async def _record_current_dataset_selection_receipt(
+    dataset: ProviderDirectoryArtifactDataset,
+    publication_metadata: Mapping[str, Any],
+) -> None:
+    """Store one compact receipt under the exact locked dataset identity."""
+
+    sealed_proof_sha256 = (
+        dataset.content_proof_admission_sha256
+        if dataset.generic_admission_sealed
+        else None
+    )
+    if dataset.generic_admission_sealed and sealed_proof_sha256 is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_selection_receipt_invalid"
+        )
+    receipt = _artifact_selection_receipt(
+        publication_metadata,
+        sealed_proof_sha256=sealed_proof_sha256,
+    )
+    if receipt is None:
+        if sealed_proof_sha256 is not None:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_artifact_selection_receipt_invalid"
+            )
+        return
+    dataset_ref = _qt(
+        _schema(),
+        ProviderDirectoryEndpointDataset.__tablename__,
+    )
+    updated = await db.status(
+        _artifact_selection_receipt_update_sql(dataset_ref),
         receipt_json=json.dumps(receipt, sort_keys=True, default=_json_default),
         dataset_id=dataset.dataset_id,
         endpoint_id=dataset.endpoint_id,
@@ -24320,6 +24519,8 @@ async def _record_current_dataset_selection_receipt(
         dataset_hash=dataset.dataset_hash,
         is_current=dataset.is_current,
         expected_status=dataset.status,
+        sealed_proof_sha256=sealed_proof_sha256,
+        generic_admission_kind=ADMISSION_KIND_GENERIC,
     )
     if _coerce_rowcount(updated) != 1:
         raise ProviderDirectoryArtifactBuildStale(

@@ -17,6 +17,9 @@ from process.provider_directory_fhir_subset_completion import (
 
 VALIDATED_PUBLICATION_CANDIDATE_FIELD = "validated_publication_candidate"
 AUTOMATIC_VALIDATED_PUBLICATION_POLICY = "automatic_after_verified_twin_v1"
+AUTOMATIC_GENERIC_ADMISSION_PUBLICATION_POLICY = (
+    "automatic_after_generic_admission_seal_v1"
+)
 AUTOMATIC_VALIDATED_PUBLICATION_ROLE = "verification_candidate"
 AUTOMATIC_VALIDATED_PUBLICATION_EXHAUSTIVE_SOURCE_STATUS = (
     "verified_two_matching_exhaustive_acquisitions"
@@ -36,7 +39,7 @@ VALIDATED_PUBLICATION_NON_PROFILE_TARGETS = (
     "network_catalog",
 )
 
-_CANDIDATE_FIELDS = frozenset(
+_CANDIDATE_COMMON_FIELDS = frozenset(
     {
         "source_id",
         "endpoint_id",
@@ -45,12 +48,19 @@ _CANDIDATE_FIELDS = frozenset(
         "acquisition_root_run_id",
         "validated_at",
         "automatic_publication_policy",
+        "expected_current",
+    }
+)
+_CANDIDATE_TWIN_FIELDS = _CANDIDATE_COMMON_FIELDS | frozenset(
+    {
         "completion_proof_required_version",
         "completion_proof_sha256",
         "verification_campaign_id",
         "verification_source_scope_sha256",
-        "expected_current",
     }
+)
+_CANDIDATE_GENERIC_FIELDS = _CANDIDATE_COMMON_FIELDS | frozenset(
+    {"content_proof_admission_sha256"}
 )
 _DATASET_IDENTITY_FIELDS = frozenset(
     {
@@ -240,6 +250,75 @@ class ProviderDirectoryDatasetIdentity:
         }
 
 
+def _candidate_common_values(
+    candidate_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "source_id": _strict_identity_text(
+            candidate_payload.get("source_id"), "source_id", 64
+        ),
+        "endpoint_id": _strict_identity_text(
+            candidate_payload.get("endpoint_id"), "endpoint_id", 64
+        ),
+        "dataset_id": _strict_identity_text(
+            candidate_payload.get("dataset_id"), "dataset_id", 96
+        ),
+        "dataset_hash": _strict_hash(
+            candidate_payload.get("dataset_hash"), "dataset_hash"
+        ),
+        "acquisition_root_run_id": _strict_identity_text(
+            candidate_payload.get("acquisition_root_run_id"),
+            "acquisition_root_run_id",
+            64,
+        ),
+        "validated_at": _strict_timestamp(candidate_payload.get("validated_at")),
+        "expected_current": ProviderDirectoryDatasetIdentity.from_payload(
+            candidate_payload["expected_current"]
+        ),
+    }
+
+
+def _candidate_policy_values(
+    candidate_payload: Mapping[str, Any],
+) -> tuple[str, frozenset[str], dict[str, Any]]:
+    automatic_policy = _strict_identity_text(
+        candidate_payload.get("automatic_publication_policy"),
+        "automatic_publication_policy",
+        64,
+    )
+    if automatic_policy == AUTOMATIC_VALIDATED_PUBLICATION_POLICY:
+        return automatic_policy, _CANDIDATE_TWIN_FIELDS, {
+            "completion_proof_required_version": candidate_payload.get(
+                "completion_proof_required_version"
+            ),
+            "completion_proof_sha256": candidate_payload.get(
+                "completion_proof_sha256"
+            ),
+            "verification_campaign_id": _strict_identity_text(
+                candidate_payload.get("verification_campaign_id"),
+                "verification_campaign_id",
+                160,
+            ),
+            "verification_source_scope_sha256": _strict_hash(
+                candidate_payload.get("verification_source_scope_sha256"),
+                "verification_source_scope_sha256",
+            ),
+            "content_proof_admission_sha256": None,
+        }
+    if automatic_policy == AUTOMATIC_GENERIC_ADMISSION_PUBLICATION_POLICY:
+        return automatic_policy, _CANDIDATE_GENERIC_FIELDS, {
+            "completion_proof_required_version": None,
+            "completion_proof_sha256": None,
+            "verification_campaign_id": None,
+            "verification_source_scope_sha256": None,
+            "content_proof_admission_sha256": _strict_hash(
+                candidate_payload.get("content_proof_admission_sha256"),
+                "content_proof_admission_sha256",
+            ),
+        }
+    raise _invalid("automatic_policy_invalid")
+
+
 @dataclass(frozen=True)
 class ValidatedPublicationCandidate:
     """Observed candidate and expected current identity echoed by a client."""
@@ -253,8 +332,9 @@ class ValidatedPublicationCandidate:
     automatic_publication_policy: str
     completion_proof_required_version: int | None
     completion_proof_sha256: str | None
-    verification_campaign_id: str
-    verification_source_scope_sha256: str
+    verification_campaign_id: str | None
+    verification_source_scope_sha256: str | None
+    content_proof_admission_sha256: str | None
     expected_current: ProviderDirectoryDatasetIdentity | None
 
     @classmethod
@@ -264,66 +344,38 @@ class ValidatedPublicationCandidate:
     ) -> "ValidatedPublicationCandidate":
         """Parse one exact validated publication candidate identity."""
 
-        if (
-            not isinstance(candidate_payload, Mapping)
-            or set(candidate_payload) != _CANDIDATE_FIELDS
-        ):
+        if not isinstance(candidate_payload, Mapping):
             raise _invalid("schema_invalid")
-        candidate = cls(
-            source_id=_strict_identity_text(
-                candidate_payload.get("source_id"), "source_id", 64
-            ),
-            endpoint_id=_strict_identity_text(
-                candidate_payload.get("endpoint_id"), "endpoint_id", 64
-            ),
-            dataset_id=_strict_identity_text(
-                candidate_payload.get("dataset_id"), "dataset_id", 96
-            ),
-            dataset_hash=_strict_hash(
-                candidate_payload.get("dataset_hash"), "dataset_hash"
-            ),
-            acquisition_root_run_id=_strict_identity_text(
-                candidate_payload.get("acquisition_root_run_id"),
-                "acquisition_root_run_id",
-                64,
-            ),
-            validated_at=_strict_timestamp(
-                candidate_payload.get("validated_at")
-            ),
-            automatic_publication_policy=_strict_identity_text(
-                candidate_payload.get("automatic_publication_policy"),
-                "automatic_publication_policy",
-                64,
-            ),
-            completion_proof_required_version=candidate_payload.get(
-                "completion_proof_required_version"
-            ),
-            completion_proof_sha256=candidate_payload.get(
-                "completion_proof_sha256"
-            ),
-            verification_campaign_id=_strict_identity_text(
-                candidate_payload.get("verification_campaign_id"),
-                "verification_campaign_id",
-                160,
-            ),
-            verification_source_scope_sha256=_strict_hash(
-                candidate_payload.get("verification_source_scope_sha256"),
-                "verification_source_scope_sha256",
-            ),
-            expected_current=ProviderDirectoryDatasetIdentity.from_payload(
-                candidate_payload["expected_current"]
-            ),
+        automatic_policy, expected_fields, policy_values_by_field = (
+            _candidate_policy_values(candidate_payload)
         )
+        if set(candidate_payload) != expected_fields:
+            raise _invalid("schema_invalid")
+        candidate_by_field = {
+            **_candidate_common_values(candidate_payload),
+            "automatic_publication_policy": automatic_policy,
+            **policy_values_by_field,
+        }
+        candidate = cls(**candidate_by_field)
         candidate._assert_exact_payload(candidate_payload)
         return candidate
 
     def _assert_exact_payload(self, candidate_payload: Mapping[str, Any]) -> None:
         if (
             self.automatic_publication_policy
-            != AUTOMATIC_VALIDATED_PUBLICATION_POLICY
+            == AUTOMATIC_VALIDATED_PUBLICATION_POLICY
+        ):
+            validated_publication_source_status(self)
+        elif self.automatic_publication_policy != (
+            AUTOMATIC_GENERIC_ADMISSION_PUBLICATION_POLICY
         ):
             raise _invalid("automatic_policy_invalid")
-        validated_publication_source_status(self)
+        if (
+            self.automatic_publication_policy
+            == AUTOMATIC_GENERIC_ADMISSION_PUBLICATION_POLICY
+            and self.expected_current is None
+        ):
+            raise _invalid("expected_current_required")
         if self.expected_current is not None:
             if self.expected_current.endpoint_id != self.endpoint_id:
                 raise _invalid("expected_current_endpoint_mismatch")
@@ -335,7 +387,7 @@ class ValidatedPublicationCandidate:
     def to_payload(self) -> dict[str, Any]:
         """Return the closed candidate and expected current identity payload."""
 
-        return {
+        candidate_by_field = {
             "source_id": self.source_id,
             "endpoint_id": self.endpoint_id,
             "dataset_id": self.dataset_id,
@@ -343,20 +395,31 @@ class ValidatedPublicationCandidate:
             "acquisition_root_run_id": self.acquisition_root_run_id,
             "validated_at": self.validated_at,
             "automatic_publication_policy": self.automatic_publication_policy,
-            "completion_proof_required_version": (
-                self.completion_proof_required_version
-            ),
-            "completion_proof_sha256": self.completion_proof_sha256,
-            "verification_campaign_id": self.verification_campaign_id,
-            "verification_source_scope_sha256": (
-                self.verification_source_scope_sha256
-            ),
             "expected_current": (
                 self.expected_current.to_payload()
                 if self.expected_current is not None
                 else None
             ),
         }
+        if (
+            self.automatic_publication_policy
+            == AUTOMATIC_VALIDATED_PUBLICATION_POLICY
+        ):
+            candidate_by_field.update(
+                completion_proof_required_version=(
+                    self.completion_proof_required_version
+                ),
+                completion_proof_sha256=self.completion_proof_sha256,
+                verification_campaign_id=self.verification_campaign_id,
+                verification_source_scope_sha256=(
+                    self.verification_source_scope_sha256
+                ),
+            )
+        else:
+            candidate_by_field["content_proof_admission_sha256"] = (
+                self.content_proof_admission_sha256
+            )
+        return candidate_by_field
 
 
 def validated_publication_source_status(
@@ -364,6 +427,11 @@ def validated_publication_source_status(
 ) -> str:
     """Derive the sole allowed source status from the exact proof pair."""
 
+    if (
+        candidate.automatic_publication_policy
+        != AUTOMATIC_VALIDATED_PUBLICATION_POLICY
+    ):
+        raise _invalid("source_status_invalid")
     return _source_status_for_proof_pair(
         candidate.completion_proof_required_version,
         candidate.completion_proof_sha256,

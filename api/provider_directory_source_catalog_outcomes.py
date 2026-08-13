@@ -24,12 +24,11 @@ from process.provider_directory_rooted_graph_publication_facade import (
     load_provider_directory_rooted_graph_dataset_readiness,
 )
 from process.provider_directory_validated_publication_contract import (
-    AUTOMATIC_VALIDATED_PUBLICATION_POLICY,
     AUTOMATIC_VALIDATED_PUBLICATION_ROLE,
     ProviderDirectoryDatasetIdentity,
-    ValidatedPublicationCandidate,
-    canonical_utc_timestamp,
-    validated_publication_source_status,
+)
+from process.provider_directory_validated_publication_catalog import (
+    validated_publication_candidate_payload,
 )
 
 
@@ -162,100 +161,6 @@ async def _canonical_validated_datasets_by_source_id(
     }
 
 
-def _validated_publication_contract_from_outcomes(
-    source_id: str,
-    candidate_dataset: outcomes._CurrentPublishedDataset,
-    incumbent_identity: ProviderDirectoryDatasetIdentity | None,
-    canonical_dataset: Any,
-) -> ValidatedPublicationCandidate | None:
-    """Parse the observed candidate and expected current through the schema."""
-
-    candidate_payload_map = {
-        "source_id": source_id,
-        "endpoint_id": candidate_dataset.endpoint_id,
-        "dataset_id": candidate_dataset.dataset_id,
-        "dataset_hash": candidate_dataset.dataset_hash,
-        "acquisition_root_run_id": candidate_dataset.acquisition_root_run_id,
-        "validated_at": canonical_utc_timestamp(candidate_dataset.validated_at),
-        "automatic_publication_policy": (
-            AUTOMATIC_VALIDATED_PUBLICATION_POLICY
-        ),
-        "completion_proof_required_version": (
-            canonical_dataset.completion_proof_required_version
-        ),
-        "completion_proof_sha256": canonical_dataset.completion_proof_sha256,
-        "verification_campaign_id": canonical_dataset.verification_campaign_id,
-        "verification_source_scope_sha256": (
-            canonical_dataset.verification_source_scope_hash
-        ),
-        "expected_current": (
-            incumbent_identity.to_payload()
-            if incumbent_identity is not None
-            else None
-        ),
-    }
-    try:
-        return ValidatedPublicationCandidate.from_payload(candidate_payload_map)
-    except ValueError:
-        return None
-
-
-def _validated_publication_candidate_payload(
-    source_id: str,
-    candidate_dataset: outcomes._CurrentPublishedDataset,
-    incumbent_identity: ProviderDirectoryDatasetIdentity | None,
-    canonical_dataset: Any,
-) -> dict[str, Any] | None:
-    """Return a closed candidate identity only when every fence agrees."""
-
-    publication_candidate = _validated_publication_contract_from_outcomes(
-        source_id,
-        candidate_dataset,
-        incumbent_identity,
-        canonical_dataset,
-    )
-    if publication_candidate is None:
-        return None
-    expected_current = publication_candidate.expected_current
-    expected_current_dataset_id = (
-        expected_current.dataset_id if expected_current else None
-    )
-    if (
-        candidate_dataset.source_ids != (source_id,)
-        or candidate_dataset.status != "validated"
-        or candidate_dataset.is_current is not False
-        or candidate_dataset.previous_dataset_id != expected_current_dataset_id
-        or canonical_dataset.source_id != source_id
-        or canonical_dataset.endpoint_id != publication_candidate.endpoint_id
-        or canonical_dataset.dataset_id != publication_candidate.dataset_id
-        or canonical_dataset.dataset_hash != publication_candidate.dataset_hash
-        or canonical_dataset.evidence_run_id
-        != publication_candidate.acquisition_root_run_id
-        or canonical_utc_timestamp(canonical_dataset.validated_at)
-        != publication_candidate.validated_at
-        or canonical_dataset.status != "validated"
-        or canonical_dataset.is_current is not False
-        or canonical_dataset.expected_incumbent_dataset_id
-        != expected_current_dataset_id
-        or canonical_dataset.completion_proof_required_version
-        != publication_candidate.completion_proof_required_version
-        or canonical_dataset.completion_proof_sha256
-        != publication_candidate.completion_proof_sha256
-        or canonical_dataset.verification_source_status
-        != validated_publication_source_status(publication_candidate)
-        or canonical_dataset.verification_campaign_id
-        != publication_candidate.verification_campaign_id
-        or canonical_dataset.verification_source_scope_hash
-        != publication_candidate.verification_source_scope_sha256
-        or canonical_dataset.verification_source_ids != (source_id,)
-        or canonical_dataset.reviewed_root_policy is not None
-    ):
-        return None
-    if expected_current != incumbent_identity:
-        return None
-    return publication_candidate.to_payload()
-
-
 def _automatic_publication_source_ids(
     catalog_items: list[dict[str, Any]],
     dataset_by_source_ids: Mapping[
@@ -276,12 +181,24 @@ def _automatic_publication_source_ids(
             and dataset is not None
             and dataset.status == "validated"
             and dataset.is_current is False
-            and dataset.publication_metadata.get(
-                "requires_twin_root_verification"
+            and (
+                (
+                    dataset.publication_metadata.get(
+                        "requires_twin_root_verification"
+                    )
+                    is True
+                    and dataset.publication_metadata.get("verification_role")
+                    == AUTOMATIC_VALIDATED_PUBLICATION_ROLE
+                )
+                or (
+                    dataset.publication_metadata.get(
+                        "requires_twin_root_verification"
+                    )
+                    is not True
+                    and dataset.publication_metadata.get("verification_role")
+                    is None
+                )
             )
-            is True
-            and dataset.publication_metadata.get("verification_role")
-            == AUTOMATIC_VALIDATED_PUBLICATION_ROLE
         ):
             automatic_source_ids.add(source_ids[0])
     return sorted(automatic_source_ids)
@@ -341,7 +258,7 @@ def _catalog_validated_publication_candidate(
     canonical_dataset = canonical_dataset_by_source_id.get(source_ids[0])
     if canonical_dataset is None:
         return None
-    return _validated_publication_candidate_payload(
+    return validated_publication_candidate_payload(
         source_ids[0],
         candidate_dataset,
         incumbent_identity,
