@@ -5755,6 +5755,157 @@ async def test_location_address_fast_worker_ranges_use_contiguous_pk_boundaries(
     assert [call.kwargs["row_offset"] for call in importer.db.first.await_args_list] == [3, 6]
 
 
+@pytest.mark.asyncio
+async def test_location_scope_identity_guards(monkeypatch):
+    """Require complete and exact ownership before native Location work."""
+
+    identities = AsyncMock(return_value={})
+    cleanup = AsyncMock()
+    monkeypatch.setattr(importer, "_artifact_scope_relation_identities", identities)
+    monkeypatch.setattr(importer, "_drain_artifact_scope_cleanup", cleanup)
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="artifact_scope_identity_missing",
+    ):
+        async with importer._yield_artifact_dataset_scope(
+            "mrf",
+            object(),
+            object(),
+            {"provider_directory_location": "location_scope"},
+            ["location_scope"],
+        ):
+            pytest.fail("incomplete artifact scope unexpectedly yielded")
+    cleanup.assert_awaited_once_with("mrf", ["location_scope"])
+
+    relation_token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
+        {"provider_directory_location": "location_scope"}
+    )
+    oid_token = importer._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.set(
+        {"provider_directory_location": 41}
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_capacity_admission",
+        lambda: None,
+    )
+    try:
+        identities.return_value = {"location_scope": (41, "r", "u")}
+        assert await importer._owned_unlogged_location_artifact_scope("mrf") == (
+            "location_scope",
+            41,
+        )
+        identities.return_value = {"location_scope": (42, "r", "u")}
+        with pytest.raises(
+            importer.ProviderDirectoryArtifactBuildStale,
+            match="location_address_scope_invalid",
+        ):
+            await importer._owned_unlogged_location_artifact_scope("mrf")
+    finally:
+        importer._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.reset(oid_token)
+        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(relation_token)
+
+
+def test_location_key_helper_guards():
+    """Cover compact native result and cursor contract failures."""
+
+    assert importer._location_canonical_fields(
+        {"address_key": "key", "state_code": "TX", "city_norm": "austin"}
+    ) == {"address_key": "key", "state_code": "TX", "city_norm": "austin"}
+    with pytest.raises(RuntimeError, match="native_count_mismatch"):
+        importer._location_key_copy_records([], [("key", "TX", "austin")])
+    with pytest.raises(RuntimeError, match="native_cursor_invalid"):
+        importer._next_location_key_cursor(
+            [_native_location_address_row()],
+            ("source_a", "loc-1"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_location_key_stage_guards(monkeypatch):
+    """Reject invalid range boundaries, COPY counts, and drivers."""
+
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=2))
+    monkeypatch.setattr(
+        importer.db,
+        "first",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                _mapping={"source_id": None, "resource_id": "loc-1"}
+            )
+        ),
+    )
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="worker_boundary_missing",
+    ):
+        await importer._location_key_worker_ranges("mrf", "location_scope", 2)
+
+    build = SimpleNamespace(
+        schema="mrf",
+        stage_table="location_sidecar",
+        native_module=SimpleNamespace(
+            canonicalize_location_batch=lambda _rows: [("key", "TX", "austin")]
+        ),
+    )
+    with pytest.raises(RuntimeError, match="copy_count_mismatch"):
+        await importer._copy_location_key_batch(
+            build,
+            AsyncMock(return_value="COPY 0"),
+            [_native_location_address_row()],
+        )
+
+    @contextlib.asynccontextmanager
+    async def acquire():
+        yield SimpleNamespace(
+            raw_connection=SimpleNamespace(driver_connection=SimpleNamespace())
+        )
+
+    monkeypatch.setattr(importer.db, "acquire", acquire)
+    with pytest.raises(RuntimeError, match="copy_unavailable"):
+        await importer._stage_location_key_range(build, (None, None))
+
+
+@pytest.mark.asyncio
+async def test_location_key_replacement_guards(monkeypatch):
+    """Reject stale, truncated, and incomplete Location replacements."""
+
+    build = SimpleNamespace(
+        schema="mrf",
+        old_table="location_scope",
+        old_oid=41,
+        stage_table="location_sidecar",
+        replacement_table="location_replacement",
+    )
+    monkeypatch.setattr(
+        importer,
+        "_artifact_scope_relation_identities",
+        AsyncMock(return_value={"location_scope": (42, "r", "u")}),
+    )
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="location_address_scope_changed",
+    ):
+        await importer._assert_location_scope(build)
+
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=1))
+    with pytest.raises(RuntimeError, match="replacement_count_mismatch"):
+        await importer._cutover_location_replacement(build, 2)
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield
+
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_capacity_transaction",
+        transaction,
+    )
+    monkeypatch.setattr(importer, "_assert_location_scope", AsyncMock())
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(side_effect=[2, 1]))
+    with pytest.raises(RuntimeError, match="sidecar_count_mismatch"):
+        await importer._replace_location_scope(build, 2)
+
+
 def test_location_address_fast_change_matches_sql_null_and_empty_semantics():
     base = _native_location_address_row()._mapping
     canonical_by_field = {
