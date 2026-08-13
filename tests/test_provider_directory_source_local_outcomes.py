@@ -121,6 +121,7 @@ async def _insert_outcome_selection_sources(
         "('source-reassigned', 'endpoint-new'), "
         "('source-multi-a', 'endpoint-multi'), "
         "('source-multi-b', 'endpoint-multi'), "
+        "('source-shared', 'endpoint-published'), "
         "('source-unrequested', 'endpoint-unrequested');"
     )
     await database.status(
@@ -315,6 +316,7 @@ def test_source_local_query_is_bounded_ranked_and_metadata_only():
     assert "provider_directory_endpoint_dataset" in selected_sql
     assert "publication_metadata_json" not in selected_sql
     assert "publication_metadata_summary_json" in selected_sql
+    assert "jsonb_build_object" not in selected_sql
     assert "artifact_selection_receipt_json" not in selected_sql
     assert "admission_metadata_sha256" in selected_sql
     assert "provider_directory_dataset_resource" not in selected_sql
@@ -352,6 +354,7 @@ def test_current_source_local_query_uses_exact_profile_publication_state():
     assert "publication_metadata_json" not in selected_sql
     assert "artifact_selection_receipt_json" not in selected_sql
     assert "admission_metadata_sha256" in selected_sql
+    assert "jsonb_build_object" in selected_sql
     assert "provider_directory_dataset_resource" not in selected_sql
     assert "published" in bound_values
 
@@ -447,6 +450,7 @@ async def test_ranked_selector_is_bounded_on_disposable_postgres(monkeypatch):
         ("source-reassigned",),
         ("source-validated",),
         ("source-multi-a", "source-multi-b"),
+        ("source-shared",),
     } | {(f"synthetic-source-{index}",) for index in range(36)}
     async with _outcome_selection_schema(monkeypatch) as (database, schema):
         statement = outcomes._current_published_dataset_statement(
@@ -457,6 +461,16 @@ async def test_ranked_selector_is_bounded_on_disposable_postgres(monkeypatch):
         )
         query_result = await database.execute(translated_statement)
         selected_row_maps = query_result.mappings().all()
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
+            "publication_metadata_summary_json = NULL, "
+            "publication_metadata_sha256 = NULL, "
+            "content_proof_admission_version = NULL, "
+            "content_proof_admission_kind = NULL, "
+            "content_proof_admission_sha256 = NULL, "
+            "content_proof_resource_types = NULL "
+            "WHERE dataset_id = 'published-current';"
+        )
         current_statement = (
             _source_local_current_published_dataset_statement(
                 source_id_groups
@@ -464,6 +478,13 @@ async def test_ranked_selector_is_bounded_on_disposable_postgres(monkeypatch):
         )
         current_result = await database.execute(current_statement)
         current_row_maps = current_result.mappings().all()
+        await database.status(
+            f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
+            "content_proof_admission_sha256 = 'tampered' "
+            "WHERE dataset_id = 'reassigned-current';"
+        )
+        tampered_current_result = await database.execute(current_statement)
+        tampered_current_row_maps = tampered_current_result.mappings().all()
         explain_result = await database.execute(
             _PostgresExplain(translated_statement)
         )
@@ -476,8 +497,11 @@ async def test_ranked_selector_is_bounded_on_disposable_postgres(monkeypatch):
                             "reassigned-current", "validated-candidate"]
     assert len(selected_row_maps) == 4
     current_ids = [row_map["dataset_id"] for row_map in current_row_maps]
-    assert current_ids == ["multi-current", "published-current",
-                           "reassigned-current", "validated-incumbent"]
+    assert current_ids == ["multi-current", "reassigned-current",
+                           "validated-incumbent"]
+    assert [row_map["dataset_id"] for row_map in tampered_current_row_maps] == [
+        "multi-current", "validated-incumbent"
+    ]
     plan_maps = (
         explain_result.scalars().one()[0]["Plan"],
         current_explain_result.scalars().one()[0]["Plan"],

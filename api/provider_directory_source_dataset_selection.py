@@ -100,13 +100,38 @@ def _source_scope_dataset_statement(
     current_source_ids,
     *,
     current_published_only=False,
+    other_profile_source_ids=(),
 ):
     dataset_model = ProviderDirectoryEndpointDataset
     source_model = ProviderDirectorySource
-    catalog_metadata = select(
-        _catalog_publication_metadata(dataset_model).label(
-            "publication_metadata"
+    admitted_metadata = _catalog_publication_metadata(dataset_model)
+    # Legacy current parents predate admission seals; the locked Profile
+    # attestation independently revalidates their raw source scope.
+    publication_metadata = (
+        case(
+            (func.jsonb_typeof(admitted_metadata) == "object", admitted_metadata),
+            (
+                and_(
+                    dataset_model.publication_metadata_summary_json.is_(None),
+                    dataset_model.publication_metadata_sha256.is_(None),
+                    dataset_model.content_proof_admission_version.is_(None),
+                    dataset_model.content_proof_admission_kind.is_(None),
+                    dataset_model.content_proof_admission_sha256.is_(None),
+                    dataset_model.content_proof_resource_types.is_(None),
+                    ~select(source_model.source_id).where(
+                        source_model.endpoint_id == dataset_model.endpoint_id,
+                        source_model.source_id.in_(other_profile_source_ids),
+                    ).correlate(dataset_model).exists(),
+                ),
+                func.jsonb_build_object("source_ids", cast(list(source_ids), JSONB)),
+            ),
+            else_=cast(None, JSONB),
         )
+        if current_published_only
+        else admitted_metadata
+    )
+    catalog_metadata = select(
+        publication_metadata.label("publication_metadata")
     ).correlate(dataset_model).lateral("catalog_metadata")
     publication_metadata = catalog_metadata.c.publication_metadata
     bound_endpoint_ids = (
@@ -166,11 +191,19 @@ def _source_local_dataset_statement(
         .correlate(dataset_model)
         .scalar_subquery()
     )
+    profile_source_ids = {
+        source_id
+        for source_ids in source_id_groups
+        for source_id in source_ids
+    }
     scope_statements = [
         _source_scope_dataset_statement(
             source_ids,
             current_source_ids,
             current_published_only=current_published_only,
+            other_profile_source_ids=tuple(
+                sorted(profile_source_ids.difference(source_ids))
+            ),
         )
         for source_ids in sorted(source_id_groups)
     ]
