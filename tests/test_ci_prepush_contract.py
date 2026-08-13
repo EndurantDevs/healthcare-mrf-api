@@ -99,6 +99,14 @@ def test_local_all_exit_cleanup_state_outlives_run_all() -> None:
         assert not re.search(rf"^  local {variable}(?:=|$)", script, re.M)
 
 
+def test_local_all_propagates_reviewed_readability_approval() -> None:
+    script = PREPUSH.read_text(encoding="utf-8")
+
+    assert "readability_zero_growth_approved=${READABILITY_ZERO_GROWTH_APPROVED:-false}" in script
+    assert "readability_zero_growth_approved=$readability_zero_growth_approved" in script
+    assert '--env READABILITY_ZERO_GROWTH_APPROVED="$readability_zero_growth_approved"' in script
+
+
 def test_native_python_lock_is_complete_and_hashed() -> None:
     lock_input = PYTHON_LOCK_INPUT.read_text(encoding="utf-8")
     lock = PYTHON_LOCK.read_text(encoding="utf-8")
