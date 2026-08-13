@@ -989,11 +989,11 @@ run_all() {
   fi
 
   local suffix=${BASHPID:-$$}
-  local network="healthcare-prepush-${suffix}"
-  local postgres_container="healthcare-prepush-postgres-${suffix}"
-  local redis_container="healthcare-prepush-redis-${suffix}"
+  network="healthcare-prepush-${suffix}"
+  postgres_container="healthcare-prepush-postgres-${suffix}"
+  redis_container="healthcare-prepush-redis-${suffix}"
   local container_image="healthcare-mrf-api:prepush-${candidate_sha:0:12}-${suffix}"
-  local artifacts=${PREPUSH_RECEIPT_DIR:-}
+  artifacts=${PREPUSH_RECEIPT_DIR:-}
   local git_common_dir
   local python_lock_input_sha256
   local python_lock_sha256

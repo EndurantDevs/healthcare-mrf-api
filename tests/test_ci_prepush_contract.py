@@ -92,13 +92,14 @@ def test_local_all_freezes_candidate_and_preserves_external_receipt() -> None:
     assert 'linux/x86_64' in script
 
 
-def test_every_mode_uses_one_hashed_native_python_lock() -> None:
-    workflow = WORKFLOW.read_text(encoding="utf-8")
+def test_local_all_exit_cleanup_state_outlives_run_all() -> None:
     script = PREPUSH.read_text(encoding="utf-8")
-    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-    installer = PYTHON_LOCK_INSTALLER.read_text(encoding="utf-8")
-    generator = PYTHON_LOCK_GENERATOR.read_text(encoding="utf-8")
-    validator = PYTHON_LOCK_VALIDATOR.read_text(encoding="utf-8")
+    for variable in ("network", "postgres_container", "redis_container", "artifacts"):
+        assert re.search(rf"^  {variable}=", script, re.M)
+        assert not re.search(rf"^  local {variable}(?:=|$)", script, re.M)
+
+
+def test_native_python_lock_is_complete_and_hashed() -> None:
     lock_input = PYTHON_LOCK_INPUT.read_text(encoding="utf-8")
     lock = PYTHON_LOCK.read_text(encoding="utf-8")
     lock_lines = lock.splitlines()
@@ -130,6 +131,12 @@ def test_every_mode_uses_one_hashed_native_python_lock() -> None:
         )
         assert re.search(r"--hash=sha256:[0-9a-f]{64}", block)
 
+
+def test_every_python_mode_uses_the_exact_lock() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    script = PREPUSH.read_text(encoding="utf-8")
+    installer = PYTHON_LOCK_INSTALLER.read_text(encoding="utf-8")
+    validator = PYTHON_LOCK_VALIDATOR.read_text(encoding="utf-8")
     for function in (
         "run_quality",
         "run_python_main",
@@ -171,6 +178,11 @@ def test_every_mode_uses_one_hashed_native_python_lock() -> None:
     assert 'PYTHON_VERSION: "3.14.6"' in workflow
     assert workflow.count("cache-dependency-path: requirements-ci.lock") == 5
     assert "actions/setup-python@" not in _job(workflow, "container-package")
+
+
+def test_container_and_lock_generator_use_exact_inputs() -> None:
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    generator = PYTHON_LOCK_GENERATOR.read_text(encoding="utf-8")
     assert (
         "rust:1.97.1-slim-trixie@sha256:"
         "fc0648ac2962539be80bd424729a20fd80f7b64bfba7e90bbd642aed6c697c5a"
