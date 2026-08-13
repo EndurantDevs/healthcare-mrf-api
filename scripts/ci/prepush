@@ -198,6 +198,8 @@ run_python_coverage() {
     --capacity-artifacts "${PREPUSH_CAPACITY_ARTIFACTS:-coverage-data/capacity}" \
     --postgres-artifacts "${PREPUSH_POSTGRES_ARTIFACTS:-coverage-data/postgres}" \
     --output "$(artifact_path test-coverage-forecast-python.json)"
+  require_margin "$(artifact_path test-coverage-forecast-python.json)" python lines 5
+  require_margin "$(artifact_path test-coverage-forecast-python.json)" python branches 5
 }
 
 run_api_contract() {
@@ -233,6 +235,7 @@ run_rust() {
     --base "$COVERAGE_BASE_SHA" \
     --artifacts "$rust_artifacts" \
     --output "$(artifact_path test-coverage-forecast-rust.json)"
+  require_margin "$(artifact_path test-coverage-forecast-rust.json)" rust functions 2
   cargo install cargo-audit --version 0.22.2 --locked
   (cd support/ptg2_scanner && cargo audit)
   cargo build --release --bins --manifest-path support/ptg2_scanner/Cargo.toml
@@ -542,12 +545,14 @@ create_test_database() {
 run_core_postgres() {
   local dsn=$1
   HLTHPRT_PROVIDER_DIRECTORY_MIGRATION_POSTGRES_DSN=$dsn \
+  HLTHPRT_OBSERVED_NPI_INDEX_MIGRATION_POSTGRES_DSN=$dsn \
   HLTHPRT_MRF_FILE_CURSOR_MIGRATION_POSTGRES_DSN=$dsn \
   HLTHPRT_FHIR_FORMULARY_MIGRATION_POSTGRES_DSN=$dsn \
   HLTHPRT_PUBLIC_EVIDENCE_STORAGE_POSTGRES_DSN=$dsn \
   HLTHPRT_PUBLIC_EVIDENCE_RECORD_PARITY_POSTGRES_DSN=$dsn \
     timeout --foreground 295s python -m pytest -q \
     tests/test_provider_directory_migration_adoption_postgres.py \
+    tests/test_provider_directory_observed_npi_index_migration.py \
     tests/test_provider_directory_caresource_census_db.py \
     tests/test_provider_directory_fhir_current_census_postgres.py \
     tests/test_provider_directory_fhir_current_census_terminal_postgres.py \
@@ -1194,9 +1199,6 @@ PY
       sha256sum requirements.txt requirements-dev.txt requirements-ci.in requirements-ci.lock scripts/ci/install_python_lock support/ptg2_scanner/Cargo.lock test-coverage-baseline.json > /artifacts/input-sha256.txt
     '
 
-  require_margin "$artifacts/test-coverage-forecast-python.json" python lines 5
-  require_margin "$artifacts/test-coverage-forecast-python.json" python branches 5
-  require_margin "$artifacts/test-coverage-forecast-rust.json" rust functions 2
   PREPUSH_SKIP_AUDIT=1 GITHUB_EVENT_NAME=push GITHUB_SHA="$candidate_sha" run_security
   assert_candidate_unchanged "$candidate_sha"
   printf 'gate=security-semgrep passed\n' >> "$artifacts/receipt.txt"

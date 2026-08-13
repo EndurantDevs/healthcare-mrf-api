@@ -265,7 +265,7 @@ def test_duplicate_and_provider_inverted_detection_cover_nested_shapes() -> None
     assert manifest._manifest_provider_inverted_entry({}, {"artifact": "invalid"}) is None
 
 
-def test_sidecar_paths_resolve_local_manifest_and_fallback(
+def test_sidecar_paths_resolve_local_manifest(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -289,26 +289,6 @@ def test_sidecar_paths_resolve_local_manifest_and_fallback(
         {"path": "absent"},
         {"manifest_uri": f"file://{manifest_path}"},
     ) == Path("absent")
-
-    assert manifest._ptg2_manifest_serving_sidecar_dir(
-        artifacts={"direct": {"path": str(absolute_path)}},
-        source_key="source",
-        snapshot_id="snapshot",
-    ) == tmp_path
-    assert manifest._ptg2_manifest_serving_sidecar_dir(
-        artifacts={"direct": "invalid", "sidecars": [{"path": str(relative_path)}]},
-        source_key="source",
-        snapshot_id="snapshot",
-    ) == tmp_path
-    fallback = tmp_path / "fallback"
-    monkeypatch.setattr(manifest, "resolve_ptg2_artifact_dir", lambda: fallback)
-    fallback_path = manifest._ptg2_manifest_serving_sidecar_dir(
-        artifacts={"sidecars": ["invalid"]},
-        source_key="source",
-        snapshot_id="snapshot",
-    )
-    assert str(fallback_path).startswith(str(fallback / "serving"))
-
 
 def test_v3_layout_guard_rejects_nonlean_serving(monkeypatch) -> None:
     """Require lean provider-key serving only for PostgreSQL V3 snapshots."""

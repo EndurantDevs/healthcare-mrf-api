@@ -53,9 +53,10 @@ def test_local_all_pins_ci_images_inputs_and_safety_margins() -> None:
     assert "--platform linux/amd64" in script
     assert "for shard in 0 1 2 3" in script
     assert "for shard in core provider-directory provider-profile" in script
-    assert 'require_margin "$artifacts/test-coverage-forecast-python.json" python lines 5' in script
-    assert 'require_margin "$artifacts/test-coverage-forecast-python.json" python branches 5' in script
-    assert 'require_margin "$artifacts/test-coverage-forecast-rust.json" rust functions 2' in script
+    assert 'require_margin "$(artifact_path test-coverage-forecast-python.json)" python lines 5' in script
+    assert 'require_margin "$(artifact_path test-coverage-forecast-python.json)" python branches 5' in script
+    assert 'require_margin "$(artifact_path test-coverage-forecast-rust.json)" rust functions 2' in script
+    assert script.count("require_margin \"") == 3
     assert 'all requires a clean, committed candidate' in script
     assert 'status=passed' in script
 

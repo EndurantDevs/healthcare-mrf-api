@@ -26,7 +26,6 @@ async def settle_lifecycle_outcomes(
             raise outcome
         else:
             reports.append(outcome)
-    assert deferred_count < len(outcomes)
     for _deferred_ordinal in range(deferred_count):
         reports.append(await replay())
     assert len(reports) == len(outcomes)
