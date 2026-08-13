@@ -5665,6 +5665,469 @@ def test_address_key_batch_sql_scopes_to_seen_stage():
     assert "LIMIT CAST(:batch_size AS integer)" in sql
 
 
+def test_location_address_key_fast_batch_sql_resolves_before_native_canon():
+    token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
+        {"provider_directory_location": "provider_directory_location_artifact_scope_test"}
+    )
+    try:
+        sql = importer._location_key_fast_batch_sql(
+            "mrf",
+            run_id="run_1",
+            source_ids=["source_a"],
+            seen_table="provider_directory_import_seen_stage_test",
+        )
+    finally:
+        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(token)
+
+    assert 'FROM "mrf"."provider_directory_location_artifact_scope_test" AS loc_src' in sql
+    assert 'LEFT JOIN "mrf"."geo_zip_lookup" AS geo' in sql
+    assert 'FROM "mrf"."provider_directory_import_seen_stage_test" AS seen' in sql
+    assert "WHEN '42' THEN 'PA'" in sql
+    assert "'840'" in sql
+    assert '"mrf".addr_zip5_norm_v1' in sql
+    assert '"mrf".addr_state_code_v1' not in sql
+    assert '"mrf".addr_city_norm_v1' not in sql
+    assert "hashtextextended" not in sql
+    assert ":worker_start_source_id" in sql
+    assert ":worker_start_resource_id" in sql
+    assert ":worker_end_source_id" in sql
+    assert ":worker_end_resource_id" in sql
+    assert "effective_country" in sql
+    assert "resolved_state" in sql
+    assert "resolved_city" in sql
+    assert "addr_key_v1(" not in sql
+
+
+def _native_location_address_row(**overrides):
+    values_by_field = {
+        "source_id": "source_a",
+        "resource_id": "loc-1",
+        "first_line": "123 Main Street",
+        "second_line": "Suite 2",
+        "resolved_city": "Austin",
+        "resolved_state": "TX",
+        "postal_code": "78701-1234",
+        "effective_country": "US",
+        "computed_zip5": "78701",
+        "computed_state_code": "TX",
+        "computed_city_norm": "austin",
+        "restored_city_name": None,
+        "restored_state_name": None,
+        "normalized_country": "US",
+        "restore_state_name": False,
+        "old_address_key": None,
+        "old_zip5": None,
+        "old_city_name": "Austin",
+        "old_state_name": "TX",
+        "old_state_code": None,
+        "old_city_norm": None,
+        "old_country_code": None,
+    }
+    values_by_field.update(overrides)
+    return SimpleNamespace(_mapping=values_by_field)
+
+
+@pytest.mark.asyncio
+async def test_location_address_fast_worker_ranges_use_contiguous_pk_boundaries(monkeypatch):
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=9))
+    monkeypatch.setattr(
+        importer.db,
+        "first",
+        AsyncMock(
+            side_effect=[
+                SimpleNamespace(_mapping={"source_id": "source-b", "resource_id": "loc-3"}),
+                SimpleNamespace(_mapping={"source_id": "source-c", "resource_id": "loc-6"}),
+            ]
+        ),
+    )
+
+    ranges = await importer._location_key_worker_ranges(
+        "mrf",
+        "provider_directory_location_artifact_scope_test",
+        3,
+    )
+
+    assert ranges == [
+        (None, ("source-b", "loc-3")),
+        (("source-b", "loc-3"), ("source-c", "loc-6")),
+        (("source-c", "loc-6"), None),
+    ]
+    assert [call.kwargs["row_offset"] for call in importer.db.first.await_args_list] == [3, 6]
+
+
+@pytest.mark.asyncio
+async def test_location_scope_identity_guards(monkeypatch):
+    """Require complete and exact ownership before native Location work."""
+
+    identities = AsyncMock(return_value={})
+    cleanup = AsyncMock()
+    monkeypatch.setattr(importer, "_artifact_scope_relation_identities", identities)
+    monkeypatch.setattr(importer, "_drain_artifact_scope_cleanup", cleanup)
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="artifact_scope_identity_missing",
+    ):
+        async with importer._yield_artifact_dataset_scope(
+            "mrf",
+            object(),
+            object(),
+            {"provider_directory_location": "location_scope"},
+            ["location_scope"],
+        ):
+            pytest.fail("incomplete artifact scope unexpectedly yielded")
+    cleanup.assert_awaited_once_with("mrf", ["location_scope"])
+
+    relation_token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
+        {"provider_directory_location": "location_scope"}
+    )
+    oid_token = importer._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.set(
+        {"provider_directory_location": 41}
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_capacity_admission",
+        lambda: None,
+    )
+    try:
+        identities.return_value = {"location_scope": (41, "r", "u")}
+        assert await importer._owned_unlogged_location_artifact_scope("mrf") == (
+            "location_scope",
+            41,
+        )
+        identities.return_value = {"location_scope": (42, "r", "u")}
+        with pytest.raises(
+            importer.ProviderDirectoryArtifactBuildStale,
+            match="location_address_scope_invalid",
+        ):
+            await importer._owned_unlogged_location_artifact_scope("mrf")
+    finally:
+        importer._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.reset(oid_token)
+        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(relation_token)
+
+
+def test_location_key_helper_guards():
+    """Cover compact native result and cursor contract failures."""
+
+    assert importer._location_canonical_fields(
+        {"address_key": "key", "state_code": "TX", "city_norm": "austin"}
+    ) == {"address_key": "key", "state_code": "TX", "city_norm": "austin"}
+    with pytest.raises(RuntimeError, match="native_count_mismatch"):
+        importer._location_key_copy_records([], [("key", "TX", "austin")])
+    with pytest.raises(RuntimeError, match="native_cursor_invalid"):
+        importer._next_location_key_cursor(
+            [_native_location_address_row()],
+            ("source_a", "loc-1"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_location_key_stage_guards(monkeypatch):
+    """Reject invalid range boundaries, COPY counts, and drivers."""
+
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=2))
+    monkeypatch.setattr(
+        importer.db,
+        "first",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                _mapping={"source_id": None, "resource_id": "loc-1"}
+            )
+        ),
+    )
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="worker_boundary_missing",
+    ):
+        await importer._location_key_worker_ranges("mrf", "location_scope", 2)
+
+    build = SimpleNamespace(
+        schema="mrf",
+        stage_table="location_sidecar",
+        native_module=SimpleNamespace(
+            canonicalize_location_batch=lambda _rows: [("key", "TX", "austin")]
+        ),
+    )
+    with pytest.raises(RuntimeError, match="copy_count_mismatch"):
+        await importer._copy_location_key_batch(
+            build,
+            AsyncMock(return_value="COPY 0"),
+            [_native_location_address_row()],
+        )
+
+    @contextlib.asynccontextmanager
+    async def acquire():
+        yield SimpleNamespace(
+            raw_connection=SimpleNamespace(driver_connection=SimpleNamespace())
+        )
+
+    monkeypatch.setattr(importer.db, "acquire", acquire)
+    with pytest.raises(RuntimeError, match="copy_unavailable"):
+        await importer._stage_location_key_range(build, (None, None))
+
+
+@pytest.mark.asyncio
+async def test_location_key_replacement_guards(monkeypatch):
+    """Reject stale, truncated, and incomplete Location replacements."""
+
+    build = SimpleNamespace(
+        schema="mrf",
+        old_table="location_scope",
+        old_oid=41,
+        stage_table="location_sidecar",
+        replacement_table="location_replacement",
+    )
+    monkeypatch.setattr(
+        importer,
+        "_artifact_scope_relation_identities",
+        AsyncMock(return_value={"location_scope": (42, "r", "u")}),
+    )
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="location_address_scope_changed",
+    ):
+        await importer._assert_location_scope(build)
+
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=1))
+    with pytest.raises(RuntimeError, match="replacement_count_mismatch"):
+        await importer._cutover_location_replacement(build, 2)
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield
+
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_capacity_transaction",
+        transaction,
+    )
+    monkeypatch.setattr(importer, "_assert_location_scope", AsyncMock())
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(side_effect=[2, 1]))
+    with pytest.raises(RuntimeError, match="sidecar_count_mismatch"):
+        await importer._replace_location_scope(build, 2)
+
+
+def test_location_address_fast_change_matches_sql_null_and_empty_semantics():
+    base = _native_location_address_row()._mapping
+    canonical_by_field = {
+        "address_key": "11111111-1111-1111-1111-111111111111",
+        "zip5": "78701",
+        "state_code": "TX",
+        "city_norm": "austin",
+    }
+
+    assert importer._has_location_key_change(
+        {**base, "old_address_key": canonical_by_field["address_key"], "old_zip5": "78701", "old_state_code": "TX", "old_city_norm": "austin", "old_country_code": "US"},
+        canonical_by_field,
+        restored_city_name="",
+        restored_state_name=None,
+        normalized_country="US",
+    ) is True
+    assert importer._has_location_key_change(
+        {**base, "old_address_key": canonical_by_field["address_key"], "old_zip5": "78701", "old_state_code": "TX", "old_city_norm": "austin", "old_country_code": "US"},
+        canonical_by_field,
+        restored_city_name=None,
+        restored_state_name=None,
+        normalized_country="US",
+    ) is False
+    assert importer._has_location_key_change(
+        base,
+        {**canonical_by_field, "address_key": None},
+        restored_city_name="",
+        restored_state_name="TX",
+        normalized_country="US",
+    ) is False
+
+
+def _install_native_location_test(monkeypatch, worker_connection, status, scalar, canonicalizer):
+    """Install the minimal native Location publication test boundary."""
+
+    @contextlib.asynccontextmanager
+    async def acquire():
+        yield worker_connection
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield
+
+    monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer.address_fast, "_fast_module", lambda: SimpleNamespace(canonicalize_location_batch=canonicalizer))
+    monkeypatch.setattr(importer, "_provider_directory_artifact_scope_workers", lambda: 1)
+    monkeypatch.setattr(importer, "_location_key_worker_ranges", AsyncMock(return_value=[(None, None)]))
+    monkeypatch.setattr(importer, "_owned_unlogged_location_artifact_scope", AsyncMock(return_value=("provider_directory_location_artifact_scope_test", 41)))
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_transaction", transaction)
+    monkeypatch.setattr(importer, "_artifact_scope_relation_identities", AsyncMock(return_value={"provider_directory_location_artifact_scope_test": (41, "r", "u")}))
+    monkeypatch.setattr(importer.db, "acquire", acquire)
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(importer.db, "scalar", scalar)
+    monkeypatch.setattr(importer.db, "first", AsyncMock())
+    monkeypatch.setattr(importer, "_stage_table_name", lambda: "pd_stage_native_test")
+
+
+def _assert_native_location_replacement(copy_records, worker_connection, status):
+    """Require exact sidecar COPY and private-scope replacement statements."""
+
+    assert worker_connection.all.await_args_list[0].kwargs["batch_size"] == 250000
+    copy_records.assert_awaited_once_with(
+        "pd_stage_native_test_location_address",
+        schema_name="mrf",
+        columns=importer._LOCATION_ADDRESS_KEY_FAST_STAGE_COLUMNS,
+        records=[(
+            "source_a", "loc-1",
+            "11111111-1111-1111-1111-111111111111", "78701",
+            "TX", "austin", None, None, "US", True,
+        )],
+    )
+    statements = [call.args[0] for call in status.await_args_list]
+    insert_sql = next(sql for sql in statements if sql.lstrip().startswith("INSERT INTO"))
+    assert 'LEFT JOIN "mrf"."pd_stage_native_test_location_address"' in insert_sql
+    assert "keyed.eligible_change IS TRUE" in insert_sql
+    assert 'ANALYZE "mrf"."pd_stage_native_test_location_replacement";' in statements
+    assert 'DROP TABLE "mrf"."provider_directory_location_artifact_scope_test";' in statements
+    assert any('RENAME TO "provider_directory_location_artifact_scope_test"' in sql for sql in statements)
+
+
+@pytest.mark.asyncio
+async def test_location_address_keys_native_sidecar_replaces_complete_private_scope(monkeypatch):
+    """Publish exact native keys by replacing only the private Location scope."""
+
+    location_rows = [_native_location_address_row()]
+    copy_records = AsyncMock(return_value="COPY 1")
+    worker_connection = SimpleNamespace(
+        all=AsyncMock(side_effect=[location_rows, []]),
+        raw_connection=SimpleNamespace(driver_connection=SimpleNamespace(copy_records_to_table=copy_records)),
+    )
+
+    status = AsyncMock()
+    scalar = AsyncMock(side_effect=[2, 1, 2])
+    observed_native_rows = []
+
+    def canonicalize_location_batch(address_rows):
+        observed_native_rows.extend(address_rows)
+        return [
+            ("11111111-1111-1111-1111-111111111111", "TX", "austin")
+        ]
+
+    _install_native_location_test(
+        monkeypatch, worker_connection, status, scalar,
+        canonicalize_location_batch,
+    )
+    token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
+        {"provider_directory_location": "provider_directory_location_artifact_scope_test"}
+    )
+    try:
+        stamped = await importer.publish_provider_directory_location_address_keys(
+            "mrf",
+            run_id="run_1",
+            source_ids=["source_a"],
+            batch_size=1,
+        )
+    finally:
+        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(token)
+
+    assert stamped == 1
+    assert observed_native_rows == [
+        ("123 Main Street", "Suite 2", "Austin", "TX", "78701-1234", "US")
+    ]
+    _assert_native_location_replacement(copy_records, worker_connection, status)
+    importer.db.first.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_location_address_keys_native_failure_does_not_fallback_to_sql(monkeypatch):
+    connection = SimpleNamespace(
+        all=AsyncMock(return_value=[_native_location_address_row()]),
+        raw_connection=SimpleNamespace(
+            driver_connection=SimpleNamespace(copy_records_to_table=AsyncMock())
+        ),
+    )
+
+    @contextlib.asynccontextmanager
+    async def acquire():
+        yield connection
+
+    native_module = SimpleNamespace(
+        canonicalize_location_batch=lambda _rows: [("invalid",)]
+    )
+    fallback = AsyncMock()
+    monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer.address_fast, "_fast_module", lambda: native_module)
+    monkeypatch.setattr(importer, "_provider_directory_artifact_scope_workers", lambda: 1)
+    monkeypatch.setattr(
+        importer,
+        "_location_key_worker_ranges",
+        AsyncMock(return_value=[(None, None)]),
+    )
+    monkeypatch.setattr(importer, "_owned_unlogged_location_artifact_scope", AsyncMock(return_value=("provider_directory_location_artifact_scope_test", 41)))
+    monkeypatch.setattr(importer.db, "acquire", acquire)
+    monkeypatch.setattr(importer.db, "status", AsyncMock())
+    monkeypatch.setattr(importer.db, "first", fallback)
+    token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
+        {"provider_directory_location": "provider_directory_location_artifact_scope_test"}
+    )
+    try:
+        with pytest.raises(RuntimeError, match="native_row_invalid"):
+            await importer.publish_provider_directory_location_address_keys("mrf", batch_size=1)
+    finally:
+        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(token)
+
+    connection.raw_connection.driver_connection.copy_records_to_table.assert_not_awaited()
+    fallback.assert_not_awaited()
+
+
+def test_location_address_keys_native_accepts_spaced_foreign_country():
+    rows = [
+        _native_location_address_row(
+            effective_country="UNITED KINGDOM",
+            normalized_country="UNITED KINGDOM",
+        )
+    ]
+
+    records, changed = importer._location_key_copy_records(
+        rows,
+        [(None, None, "london")],
+    )
+
+    assert changed == 0
+    assert records[0][2] is None
+    assert records[0][8] == "UNITED KINGDOM"
+
+
+@pytest.mark.asyncio
+async def test_location_address_auxiliary_cleanup_drains_repeated_cancellation(monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    observations = []
+
+    async def drop_tables(schema, table_names):
+        observations.append((schema, list(table_names)))
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(importer, "_drop_artifact_scope_tables", drop_tables)
+    cleanup = asyncio.create_task(
+        importer._drain_artifact_scope_cleanup(
+            "mrf",
+            ["pd_stage_test_location_address", "pd_stage_test_location_replacement"],
+        )
+    )
+    await started.wait()
+    cleanup.cancel()
+    await asyncio.sleep(0)
+    cleanup.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await cleanup
+    assert observations == [
+        (
+            "mrf",
+            ["pd_stage_test_location_address", "pd_stage_test_location_replacement"],
+        )
+    ]
+
+
 @pytest.mark.asyncio
 async def test_publish_provider_directory_location_address_keys_batches_without_seen_table(monkeypatch):
     class Row:

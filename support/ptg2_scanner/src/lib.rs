@@ -67,8 +67,9 @@ mod python_api {
     use pyo3::exceptions::{PyRuntimeError, PyValueError};
     use pyo3::prelude::*;
     use pyo3::types::{PyBytes, PyDict, PyList};
-    use rayon::prelude::*;
+    use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
     use serde_json::Value;
+    use std::sync::OnceLock;
 
     type AddressRow = (
         Option<String>,
@@ -79,6 +80,25 @@ mod python_api {
         Option<String>,
     );
     type ContactRow = (Option<String>, Option<String>, Option<String>);
+    type LocationCanonicalRow = (Option<String>, Option<String>, Option<String>);
+    static LOCATION_CANON_POOL: OnceLock<ThreadPool> = OnceLock::new();
+
+    fn location_canon_pool() -> PyResult<&'static ThreadPool> {
+        if let Some(pool) = LOCATION_CANON_POOL.get() {
+            return Ok(pool);
+        }
+        let pool = match ThreadPoolBuilder::new().num_threads(4).build() {
+            Ok(pool) => pool,
+            Err(error) => return Err(PyRuntimeError::new_err(error.to_string())),
+        };
+        let _ = LOCATION_CANON_POOL.set(pool);
+        match LOCATION_CANON_POOL.get() {
+            Some(pool) => Ok(pool),
+            None => Err(PyRuntimeError::new_err(
+                "Location canonicalizer pool unavailable",
+            )),
+        }
+    }
 
     #[pyfunction]
     fn canonicalize_batch(py: Python<'_>, rows: Vec<AddressRow>) -> PyResult<Py<PyList>> {
@@ -101,6 +121,35 @@ mod python_api {
             list.append(canonical_to_dict(py, &item)?)?;
         }
         Ok(list.into())
+    }
+
+    #[pyfunction]
+    fn canonicalize_location_batch(
+        py: Python<'_>,
+        rows: Vec<AddressRow>,
+    ) -> PyResult<Vec<LocationCanonicalRow>> {
+        let pool = location_canon_pool()?;
+        Ok(py.detach(|| {
+            pool.install(|| {
+                rows.par_iter()
+                    .map(|row| {
+                        let canonical = canonicalize_address(
+                            row.0.as_deref(),
+                            row.1.as_deref(),
+                            row.2.as_deref(),
+                            row.3.as_deref(),
+                            row.4.as_deref(),
+                            row.5.as_deref(),
+                        );
+                        (
+                            canonical.address_key,
+                            canonical.state_code,
+                            canonical.city_norm,
+                        )
+                    })
+                    .collect()
+            })
+        }))
     }
 
     #[pyfunction]
@@ -181,6 +230,7 @@ mod python_api {
     #[pymodule]
     fn ptg2_address_canon(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(canonicalize_batch, m)?)?;
+        m.add_function(wrap_pyfunction!(canonicalize_location_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canonicalize_contact_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canon_version, m)?)?;
         m.add_function(wrap_pyfunction!(intersect_sorted_u32_py, m)?)?;
@@ -210,6 +260,22 @@ mod python_api {
                 .unwrap();
                 assert_eq!(addresses.bind(py).len(), 1);
 
+                let locations = canonicalize_location_batch(
+                    py,
+                    vec![(
+                        Some("123 Main Street".to_owned()),
+                        Some("Suite 2".to_owned()),
+                        Some("Austin".to_owned()),
+                        Some("TX".to_owned()),
+                        Some("78701".to_owned()),
+                        Some("US".to_owned()),
+                    )],
+                )
+                .unwrap();
+                assert_eq!(locations.len(), 1);
+                assert!(locations[0].0.is_some());
+                assert!(canonicalize_location_batch(py, vec![]).unwrap().is_empty());
+
                 let contacts = canonicalize_contact_batch(
                     py,
                     vec![(
@@ -228,10 +294,17 @@ mod python_api {
                 let module = PyModule::new(py, "ptg2_address_canon").unwrap();
                 ptg2_address_canon(&module).unwrap();
                 assert!(module.hasattr("canonicalize_batch").unwrap());
+                assert!(module.hasattr("canonicalize_location_batch").unwrap());
                 assert!(module.hasattr("canonicalize_contact_batch").unwrap());
                 assert!(module.hasattr("canon_version").unwrap());
                 assert!(module.hasattr("intersect_sorted_u32").unwrap());
                 assert!(module.hasattr("ptg2_decode_u32_le").unwrap());
+                let empty_locations = module
+                    .getattr("canonicalize_location_batch")
+                    .unwrap()
+                    .call1((Vec::<AddressRow>::new(),))
+                    .unwrap();
+                assert_eq!(empty_locations.len().unwrap(), 0);
 
                 assert_eq!(
                     intersect_sorted_u32_py(vec![1, 3, 5], vec![2, 3, 5]).unwrap(),
