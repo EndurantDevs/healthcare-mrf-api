@@ -337,6 +337,7 @@ from process.provider_directory_profile_capacity_attestation import (
     verify_database_capacity_lease,
 )
 from process.provider_directory_profile_capacity_preflight_contract import (
+    CAPACITY_AUTHORITY_PROJECTION_CONTRACT_ID,
     CAPACITY_CONTROL_PLANE_RECEIPT_SHA256_FIELD,
     CAPACITY_PREFLIGHT_CONTRACT_ID,
     CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID,
@@ -346,6 +347,7 @@ from process.provider_directory_profile_capacity_preflight_contract import (
     CAPACITY_SERVING_PREFLIGHT_DIGEST_DOMAIN,
     ProviderDirectoryProfileCapacityPreflightError,
     ProviderDirectoryProfileCapacityPreflightRequest,
+    ProfileCapacityAuthorityProjectionRequest,
     assert_preflight_expiry,
     canonical_capacity_limits_payload,
     capacity_limits_sha256,
@@ -31058,7 +31060,10 @@ async def _profile_capacity_preflight_fences(
 
 
 async def _profile_capacity_preflight_geometry(
-    request: ProviderDirectoryProfileCapacityPreflightRequest,
+    request: (
+        ProviderDirectoryProfileCapacityPreflightRequest
+        | ProfileCapacityAuthorityProjectionRequest
+    ),
     source_ids: list[str],
     serving: _ProfileCapacityPreflightServing,
 ) -> tuple[_ProfileAdmissionWorkload, _ProfileAdmissionGeometry]:
@@ -31085,6 +31090,96 @@ async def _profile_capacity_preflight_geometry(
     )
     _assert_admission_lock_projection(geometry_state.control_wal_projection)
     return workload, geometry_state
+
+
+def _profile_capacity_authority_projection(
+    request: ProfileCapacityAuthorityProjectionRequest,
+    workload: _ProfileAdmissionWorkload,
+    geometry_state: _ProfileAdmissionGeometry,
+    runtime_observation: Mapping[str, Any],
+    serving: _ProfileCapacityPreflightServing,
+) -> dict[str, Any]:
+    """Return deterministic geometry without creating signing state."""
+
+    geometry = geometry_state.geometry
+    projection_by_field = {
+        "contract_id": CAPACITY_AUTHORITY_PROJECTION_CONTRACT_ID,
+        "request_contract_id": request.request_payload["contract_id"],
+        "request_sha256": request.request_sha256,
+        "profile_execution_identity": profile_execution_identity_payload(request),
+        "capacity_limits": workload.limits_payload,
+        "capacity_limits_sha256": workload.limits_sha256,
+        "capacity_geometry_hash": profile_capacity.capacity_geometry_hash(geometry),
+        "capacity_geometry": profile_capacity.capacity_geometry_payload(geometry),
+        "required_reservation_bytes_by_storage_class": (
+            geometry.reservation_bytes_by_storage_class
+        ),
+        "artifact_scope_projection": {
+            "projected_rows": workload.artifact_projection.projected_rows,
+            "projected_logical_bytes": (
+                workload.artifact_projection.projected_logical_bytes
+            ),
+            "projection_hash": workload.artifact_projection.projection_hash,
+        },
+        "runtime_observation": dict(runtime_observation),
+        "serving_generation_preflight": serving.payload,
+        "serving_generation_preflight_sha256": serving.payload_sha256,
+    }
+    projection_by_field["authority_projection_sha256"] = preflight_domain_sha256(
+        CAPACITY_AUTHORITY_PROJECTION_CONTRACT_ID,
+        projection_by_field,
+    )
+    return projection_by_field
+
+
+async def provider_directory_profile_capacity_authority_projection(
+    request: ProfileCapacityAuthorityProjectionRequest,
+) -> dict[str, Any]:
+    """Project exact capacity authority without writing or consuming state."""
+
+    if not isinstance(
+        request,
+        ProfileCapacityAuthorityProjectionRequest,
+    ):
+        raise ProviderDirectoryProfileCapacityPreflightError(
+            "provider_directory_profile_capacity_preflight_"
+            "authority_projection_request_invalid"
+        )
+    execution = request.execution
+    catalog = _provider_directory_profile_selection_catalog()
+    source_ids = [pair["source_id"] for pair in execution.attestation.pairs]
+    execution_token = _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
+        execution
+    )
+    try:
+        async with db.transaction():
+            await db.status(
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY;"
+            )
+            await assert_profile_selection_current_in_transaction(
+                execution.attestation,
+                catalog,
+            )
+            serving = await _profile_capacity_preflight_serving(_schema())
+            workload, geometry_state = await _profile_capacity_preflight_geometry(
+                request,
+                source_ids,
+                serving,
+            )
+            runtime_observation = await observe_profile_runtime()
+            assert_runtime_observation_matches_geometry(
+                runtime_observation,
+                geometry_state.geometry,
+            )
+            return _profile_capacity_authority_projection(
+                request,
+                workload,
+                geometry_state,
+                runtime_observation,
+                serving,
+            )
+    finally:
+        _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.reset(execution_token)
 
 
 def _profile_capacity_receipt_issued_at(
