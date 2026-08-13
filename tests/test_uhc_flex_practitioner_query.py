@@ -403,6 +403,11 @@ def test_http_retry_classification_is_bounded(
             "terminal",
             False,
         ),
+        (
+            UHCFlexPractitionerQueryError("total_mismatch"),
+            "retryable",
+            True,
+        ),
         (RuntimeError("secret"), "terminal", False),
         ("not-an-exception", "invalid", False),
     ],
