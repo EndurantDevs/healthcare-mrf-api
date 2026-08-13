@@ -167,6 +167,18 @@ PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS = {
     "group_plan_array",
 }
 PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY = "provider_directory_sources"
+_PROVIDER_DIRECTORY_OBSERVED_RESOURCE_TYPES = (
+    "Practitioner",
+    "PractitionerRole",
+)
+_PROVIDER_DIRECTORY_OBSERVED_DATASET_STATUSES = (
+    "acquiring",
+    "incomplete",
+    "failed",
+    "acquisition_abandoned",
+    "validated",
+)
+_PROVIDER_DIRECTORY_OBSERVED_RESOURCE_LIMIT = 32
 UHC_PROVIDER_FILE_ADDRESS_STATUS = "payer_directory_candidate"
 PROVIDER_DIRECTORY_PROFILE_SERVING_GENERATION_TABLE = (
     "provider_directory_profile_serving_generation"
@@ -5481,6 +5493,91 @@ async def _fetch_provider_directory_profile_map(
         profile_query_result,
         include_evidence=include_evidence,
     )
+
+
+def _provider_directory_observations_sql(schema: str) -> str:
+    """Select the newest bounded, non-certified retained row per resource."""
+    statuses = ", ".join(
+        f"'{status}'" for status in _PROVIDER_DIRECTORY_OBSERVED_DATASET_STATUSES
+    )
+    resource_types = ", ".join(
+        f"'{resource_type}'"
+        for resource_type in _PROVIDER_DIRECTORY_OBSERVED_RESOURCE_TYPES
+    )
+    return f"""
+        WITH observed_datasets AS MATERIALIZED (
+            SELECT source.source_id,
+                   COALESCE(source.canonical_api_base, source.api_base) AS api_base,
+                   dataset.dataset_id,
+                   dataset.acquisition_root_run_id,
+                   dataset.status AS dataset_status,
+                   dataset.created_at AS dataset_created_at
+              FROM {schema}.provider_directory_source AS source
+              JOIN {schema}.provider_directory_endpoint_dataset AS dataset
+                ON dataset.endpoint_id = source.endpoint_id
+             WHERE dataset.is_current IS FALSE
+               AND dataset.superseded_at IS NULL
+               AND dataset.status IN ({statuses})
+        ), matching_observations AS MATERIALIZED (
+            SELECT observed.source_id, observed.api_base, observed.dataset_id,
+                   observed.acquisition_root_run_id, observed.dataset_status,
+                   observed.dataset_created_at, resource.resource_type,
+                   resource.resource_id, resource.payload_json::jsonb AS payload_json,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY observed.source_id,
+                                    resource.resource_type,
+                                    resource.resource_id
+                       ORDER BY observed.dataset_created_at DESC NULLS LAST,
+                                observed.dataset_id DESC
+                   ) AS recency_rank
+              FROM observed_datasets AS observed
+              JOIN {schema}.provider_directory_dataset_resource AS resource
+                ON resource.dataset_id = observed.dataset_id
+             WHERE resource.resource_type IN ({resource_types})
+               AND resource.payload_json::jsonb ->> 'npi' = :npi
+        )
+        SELECT source_id, api_base, dataset_id, acquisition_root_run_id,
+               dataset_status, dataset_created_at, resource_type, resource_id,
+               payload_json
+          FROM matching_observations
+         WHERE recency_rank = 1
+         ORDER BY dataset_created_at DESC NULLS LAST,
+                  source_id, resource_type, resource_id
+         LIMIT {_PROVIDER_DIRECTORY_OBSERVED_RESOURCE_LIMIT};
+    """
+
+
+async def _fetch_provider_directory_observations(
+    npi: int,
+    *,
+    session: Any = None,
+) -> list[dict[str, Any]]:
+    """Return retained candidate rows without treating them as published facts."""
+    query_result = await _execute_stmt(
+        text(_provider_directory_observations_sql(_runtime_db_schema())),
+        session=session,
+        params={"npi": str(npi)},
+    )
+    observations: list[dict[str, Any]] = []
+    for observation_row in query_result.all():
+        mapping = getattr(observation_row, "_mapping", observation_row)
+        observation_payload = _provider_directory_profile_json(mapping.get("payload_json"))
+        if observation_payload is None:
+            continue
+        observations.append(
+            {
+                "source_id": mapping.get("source_id"),
+                "api_base": mapping.get("api_base"),
+                "dataset_id": mapping.get("dataset_id"),
+                "acquisition_root_run_id": mapping.get("acquisition_root_run_id"),
+                "dataset_status": mapping.get("dataset_status"),
+                "dataset_created_at": mapping.get("dataset_created_at"),
+                "resource_type": mapping.get("resource_type"),
+                "resource_id": mapping.get("resource_id"),
+                "resource": observation_payload,
+            }
+        )
+    return observations
 
 
 def _is_unified_address_serving_requested() -> bool:
@@ -10964,6 +11061,32 @@ async def get_provider_profile(request, npi):
             profile_by_key,
             query,
         )
+    )
+
+
+@blueprint.get("/id/<npi>/provider-directory-observations")
+async def get_provider_directory_observations(request, npi):
+    """Return retained, non-certified Provider Directory observations for one NPI."""
+    if not profile_artifact.is_valid_npi(npi):
+        return response.json(
+            {
+                "error": "invalid_npi",
+                "message": "npi must be a valid 10-digit National Provider Identifier",
+            },
+            status=400,
+        )
+    normalized_npi = int(npi)
+    return response.json(
+        {
+            "npi": normalized_npi,
+            "completeness": "best_effort",
+            "certified": False,
+            "observations": await _fetch_provider_directory_observations(
+                normalized_npi,
+                session=_request_session(request),
+            ),
+        },
+        default=str,
     )
 
 

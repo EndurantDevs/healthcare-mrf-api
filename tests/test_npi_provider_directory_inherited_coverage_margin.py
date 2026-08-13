@@ -42,6 +42,29 @@ def test_npi_detail_cache_disabled_and_expired(monkeypatch):
     assert "expired" not in npi_module._NPI_DETAIL_RESPONSE_CACHE
 
 
+def test_npi_detail_cacheability_respects_refresh_and_geocode():
+    assert not npi_module._is_npi_detail_response_cacheable(
+        {},
+        force_address_update=True,
+        sync_geocode=True,
+    )
+    assert npi_module._is_npi_detail_response_cacheable(
+        {},
+        force_address_update=False,
+        sync_geocode=False,
+    )
+    assert npi_module._is_npi_detail_response_cacheable(
+        {"address_list": [{"lat": 1}]},
+        force_address_update=False,
+        sync_geocode=True,
+    )
+    assert not npi_module._is_npi_detail_response_cacheable(
+        {"address_list": [{}]},
+        force_address_update=False,
+        sync_geocode=True,
+    )
+
+
 def test_bounded_fhir_codings_skip_invalid_and_empty_values():
     result = npi_module._bounded_provider_directory_fhir_codings(
         [

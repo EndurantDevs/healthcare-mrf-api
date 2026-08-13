@@ -57,6 +57,7 @@ def test_query_normalizers_cover_absence_invalidity_and_human_fallbacks(
 
     assert npi._normalize_text_filter(" ", param_name="name") is None
     assert npi._normalize_state_filter(None) is None
+    assert npi._normalize_state_filter("ca") == "CA"
     with pytest.raises(npi.sanic.exceptions.InvalidUsage):
         npi._normalize_state_filter("x")
     assert npi._normalize_ccn_filter(None) is None
@@ -77,6 +78,16 @@ def test_query_normalizers_cover_absence_invalidity_and_human_fallbacks(
         }
     ) == "Alex Example"
     assert npi._provider_display_name_from_mapping({}) == "Unknown"
+
+
+def test_optional_bounded_int_rejects_non_numeric_values():
+    with pytest.raises(npi.sanic.exceptions.InvalidUsage, match="must be an integer"):
+        npi._parse_optional_bounded_int(
+            "not-a-number",
+            param_name="page",
+            minimum=1,
+            maximum=10,
+        )
 
 
 @pytest.mark.asyncio

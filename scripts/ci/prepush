@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Run the repository's shared pre-push quality gate.
+set -euo pipefail
+
+python_bin="${PYTHON_BIN:-python}"
+
+case "${1:-quality}" in
+  quality)
+    "$python_bin" -m compileall api process db public_evidence scripts main.py
+    "$python_bin" scripts/smoke/provider_directory_runtime_contract.py
+    "$python_bin" scripts/generate_provider_directory_support_docs.py --check
+    bash tests/test_ci_readability_policy.sh
+
+    if [ -n "${BASE_SHA:-}" ]; then
+      baseline_path="$(mktemp "${TMPDIR:-/tmp}/healthcare-readability-base.XXXXXX")"
+      git show "$BASE_SHA:readability-baseline.json" > "$baseline_path"
+      required_reduction_percent=1
+      if git diff --quiet "$BASE_SHA" HEAD -- \
+        main.py \
+        ':(glob)api/**/*.py' \
+        ':(glob)db/**/*.py' \
+        ':(glob)process/**/*.py' \
+        ':(glob)public_evidence/**/*.py' \
+        ':(glob)service/**/*.py'; then
+        required_reduction_percent=0
+      elif [ "${READABILITY_ZERO_GROWTH_APPROVED:-false}" = "true" ]; then
+        required_reduction_percent=0
+      fi
+      "$python_bin" scripts/readability_budget.py \
+        --ratchet-baseline "$baseline_path" \
+        --required-reduction-percent "$required_reduction_percent"
+    else
+      "$python_bin" scripts/readability_budget.py
+    fi
+
+    "$python_bin" scripts/ci/request_time_external_call_guard.py
+    timeout --foreground 295s "$python_bin" -m pytest -q \
+      tests/test_coverage_forecast.py tests/test_ci_coverage_forecast.py
+    ;;
+  *)
+    echo "usage: $0 [quality]" >&2
+    exit 2
+    ;;
+esac
