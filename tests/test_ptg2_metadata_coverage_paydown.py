@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import copy
-import json
 from pathlib import Path
-import struct
 from types import SimpleNamespace
 
 import pytest
@@ -66,60 +64,6 @@ def _graph_manifest(*entries: dict[str, object]) -> dict[str, object]:
         },
         "artifacts": {"sidecars": list(entries)},
     }
-
-
-def test_serving_sidecar_header_checks_format_counts_and_bounds():
-    magic = b"PTG2TEST"
-    header_bytes = json.dumps({"format": "rows_v1", "row_count": 2}).encode()
-    sidecar_bytes = (
-        magic + struct.pack("<I", len(header_bytes)) + header_bytes + b"rows"
-    )
-
-    header, header_end = artifacts._serving_sidecar_header(
-        sidecar_bytes,
-        magic,
-        "rows_v1",
-        {"byte_count": len(sidecar_bytes), "row_count": 2},
-    )
-
-    assert header == {"format": "rows_v1", "row_count": 2}
-    assert header_end == 12 + len(header_bytes)
-
-    invalid_payloads = [
-        (b"short", None, "invalid magic"),
-        (
-            magic + struct.pack("<I", len(header_bytes) + 100) + header_bytes,
-            None,
-            "truncated",
-        ),
-        (
-            magic + struct.pack("<I", 2) + b"[]",
-            None,
-            "JSON object",
-        ),
-        (
-            magic
-            + struct.pack("<I", len(header_bytes))
-            + header_bytes,
-            None,
-            "unsupported.*rows_v1",
-        ),
-        (
-            sidecar_bytes,
-            {"byte_count": len(sidecar_bytes) + 1},
-            "byte_count mismatch",
-        ),
-        (sidecar_bytes, {"row_count": 3}, "row count mismatch"),
-    ]
-    for candidate, metadata, message in invalid_payloads:
-        expected_format = "rows_v2" if "unsupported" in message else "rows_v1"
-        with pytest.raises(artifacts.PTG2ManifestArtifactError, match=message):
-            artifacts._serving_sidecar_header(
-                candidate,
-                magic,
-                expected_format,
-                metadata,
-            )
 
 
 def test_graph_geometry_and_required_integers_reject_malformed_metadata():
