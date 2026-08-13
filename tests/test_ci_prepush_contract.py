@@ -60,6 +60,16 @@ def test_local_all_pins_ci_images_inputs_and_safety_margins() -> None:
     assert 'status=passed' in script
 
 
+def test_local_all_matches_hosted_family_environment_boundaries() -> None:
+    script = PREPUSH.read_text(encoding="utf-8")
+
+    assert "export HOME=/artifacts/home" in script
+    assert "--env HLTHPRT_DB_DRIVER=asyncpg" not in script
+    assert "--env HLTHPRT_REDIS_ADDRESS=redis://redis:6379" not in script
+    assert "HLTHPRT_REDIS_ADDRESS=redis://redis:6379 gate redis redis" in script
+    assert "HLTHPRT_DB_HOST=postgres" in script
+
+
 def test_dispatcher_exposes_only_repository_ci_modes() -> None:
     script = PREPUSH.read_text(encoding="utf-8")
     for mode in (

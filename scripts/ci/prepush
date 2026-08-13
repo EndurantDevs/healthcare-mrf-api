@@ -1099,15 +1099,6 @@ EOF
     --env BASE_SHA="$base_sha" \
     --env GITHUB_EVENT_NAME=push \
     --env GITHUB_SHA="$candidate_sha" \
-    --env HLTHPRT_DB_DRIVER=asyncpg \
-    --env HLTHPRT_DB_HOST=postgres \
-    --env HLTHPRT_DB_PORT=5432 \
-    --env HLTHPRT_DB_USER=postgres \
-    --env HLTHPRT_DB_PASSWORD=postgres \
-    --env HLTHPRT_DB_DATABASE=ptg2_v3_lifecycle_test_ci_runner \
-    --env HLTHPRT_DB_SCHEMA=mrf \
-    --env DB_SCHEMA=mrf \
-    --env HLTHPRT_REDIS_ADDRESS=redis://redis:6379 \
     --env PREPUSH_ARTIFACT_ROOT=/artifacts \
     --env PREPUSH_MAIN_ARTIFACTS=/artifacts/coverage-data/main \
     --env PREPUSH_CAPACITY_ARTIFACTS=/artifacts/coverage-data/capacity \
@@ -1117,7 +1108,7 @@ EOF
     "$arc_image" \
     bash -lc '
       set -euo pipefail
-      export HOME=/tmp/home
+      export HOME=/artifacts/home
       export CARGO_HOME=/tmp/cargo
       export RUSTUP_HOME=/tmp/rustup
       export PATH=/tmp/venv/bin:/tmp/cargo/bin:/usr/local/cargo/bin:$PATH
@@ -1153,11 +1144,19 @@ EOF
       gate capacity capacity
       cp /artifacts/.coverage.capacity /artifacts/.coverage-provenance.capacity.json /artifacts/coverage-data/capacity/
       gate api-contract api-contract
-      gate redis redis
+      HLTHPRT_REDIS_ADDRESS=redis://redis:6379 gate redis redis
       PREPUSH_SKIP_SEMGREP=1 gate security-audit security
       for shard in core provider-directory provider-profile; do
         PGPASSWORD=postgres dropdb --if-exists --host postgres --port 5432 --username postgres ptg2_v3_lifecycle_test_ci_runner
         PGPASSWORD=postgres createdb --host postgres --port 5432 --username postgres ptg2_v3_lifecycle_test_ci_runner
+        HLTHPRT_DB_DRIVER=asyncpg \
+        HLTHPRT_DB_HOST=postgres \
+        HLTHPRT_DB_PORT=5432 \
+        HLTHPRT_DB_USER=postgres \
+        HLTHPRT_DB_PASSWORD=postgres \
+        HLTHPRT_DB_DATABASE=ptg2_v3_lifecycle_test_ci_runner \
+        HLTHPRT_DB_SCHEMA=mrf \
+        DB_SCHEMA=mrf \
         HLTHPRT_REDIS_ADDRESS=redis://127.0.0.1:6379 \
           gate "postgres-$shard" postgres "$shard"
         cp "/artifacts/.coverage.postgres.${shard}" "/artifacts/.coverage-provenance.postgres.${shard}.json" /artifacts/coverage-data/postgres/
