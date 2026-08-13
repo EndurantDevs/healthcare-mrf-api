@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from process import uhc_provider_file_catalog_artifacts as artifacts
 from process import uhc_provider_file_catalog_types as catalog_types
+from process.formulary_fhir.source_artifact_contract import SourceArtifactIdentity
 from process.formulary_fhir import uhc_drug_transport as drug_transport
 from tests.uhc_provider_file_catalog_test_data import live_catalog_payloads
 
@@ -227,6 +229,196 @@ async def test_drug_stream_accepts_validated_redirect():
     )
 
     assert (digest, byte_count) == (hashlib.sha256(raw_bytes).hexdigest(), 4)
+
+
+def _external_drug_identity() -> SourceArtifactIdentity:
+    file_name = "drug-00.json"
+    return SourceArtifactIdentity(
+        source_id="official-formulary",
+        source_file_set_sha256="a" * 64,
+        source_file_id="b" * 64,
+        raw_listing_projection_sha256="c" * 64,
+        family="cs",
+        file_name=file_name,
+        source_url=(
+            "https://legacy.providerlookuponline.com/files/" f"{file_name}"
+        ),
+        catalog_modified_at="2026-08-10T00:00:00Z",
+        catalog_entry_sha256="d" * 64,
+        expected_byte_count=4,
+    )
+
+
+async def _stream_drug(session: _Session, identity: SourceArtifactIdentity):
+    return await drug_transport.stream_uhc_drug_response(
+        session,
+        identity,
+        io.BytesIO(),
+        max_bytes=100,
+        cancel_check=None,
+    )
+
+
+def _redirected_drug_session(
+    identity: SourceArtifactIdentity,
+    location: str,
+    *,
+    status: int = 302,
+) -> _Session:
+    return _Session(
+        [
+            _Response(
+                status=status,
+                headers={"Location": location},
+                url=identity.source_url,
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_drug_stream_upgrades_exact_http_sibling_without_requesting_it():
+    identity = _external_drug_identity()
+    unsafe_redirect = "http://www.providerlookuponline.com/moved"
+    mirror_url = (
+        "https://www.providerlookuponline.com/files/" f"{identity.file_name}"
+    )
+    raw_bytes = b"[{}]"
+    session = _Session(
+        [
+            _Response(
+                status=302,
+                headers={"Location": unsafe_redirect},
+                url=identity.source_url,
+            ),
+            _Response(
+                chunks=[raw_bytes],
+                headers={"Content-Length": str(len(raw_bytes))},
+                url=mirror_url,
+                content_length=len(raw_bytes),
+            ),
+        ]
+    )
+
+    digest, byte_count = await _stream_drug(session, identity)
+
+    requested_urls = [request_url for request_url, _options in session.requests]
+    assert (digest, byte_count) == (hashlib.sha256(raw_bytes).hexdigest(), 4)
+    assert requested_urls == [identity.source_url, mirror_url]
+    assert unsafe_redirect not in requested_urls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_redirect",
+    [
+        "http://mirror.example.invalid/moved",
+        "https://www.providerlookuponline.com/moved",
+        "http://www.providerlookuponline.com:80/moved",
+        "http://www.providerlookuponline.com:8080/moved",
+        "http://www.providerlookuponline.com/moved?token=invalid",
+        "http://www.providerlookuponline.com/moved#fragment",
+        "http://user@www.providerlookuponline.com/moved",
+        " http://www.providerlookuponline.com/moved ",
+    ],
+)
+async def test_drug_stream_rejects_other_http_redirects(unsafe_redirect):
+    identity = _external_drug_identity()
+    session = _redirected_drug_session(identity, unsafe_redirect)
+
+    with pytest.raises(
+        drug_transport.UHCDrugArtifactAcquisitionError,
+        match="redirect",
+    ):
+        await _stream_drug(session, identity)
+
+    assert [request_url for request_url, _options in session.requests] == [
+        identity.source_url
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_response", ["status", "basename"])
+async def test_drug_stream_rejects_unreviewed_signal(invalid_response):
+    identity = _external_drug_identity()
+    if invalid_response == "basename":
+        identity = replace(
+            identity,
+            source_url="https://legacy.providerlookuponline.com/files/other.json",
+        )
+    session = _redirected_drug_session(
+        identity,
+        "http://www.providerlookuponline.com/moved",
+        status=301 if invalid_response == "status" else 302,
+    )
+
+    with pytest.raises(
+        drug_transport.UHCDrugArtifactAcquisitionError,
+        match="redirect",
+    ):
+        await _stream_drug(session, identity)
+
+    assert len(session.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mirror_response", ["redirect", "wrong-url"])
+async def test_drug_stream_rejects_mirror_response_change(mirror_response):
+    identity = _external_drug_identity()
+    mirror_url = (
+        "https://www.providerlookuponline.com/files/" f"{identity.file_name}"
+    )
+    if mirror_response == "redirect":
+        response = _Response(
+            status=302,
+            headers={"Location": identity.source_url},
+            url=mirror_url,
+        )
+    else:
+        response = _Response(
+            chunks=[b"[{}]"],
+            url=mirror_url + ".changed",
+            content_length=4,
+        )
+    session = _redirected_drug_session(
+        identity,
+        "http://www.providerlookuponline.com/moved",
+    )
+    session.responses.append(response)
+
+    with pytest.raises(
+        drug_transport.UHCDrugArtifactAcquisitionError,
+        match="redirect",
+    ):
+        await _stream_drug(session, identity)
+
+    assert len(session.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_drug_stream_keeps_direct_trusted_https_request_unchanged():
+    source_url = catalog_types.CATALOG_URLS["cs"]
+    raw_bytes = b"[{}]"
+    session = _Session(
+        [
+            _Response(
+                chunks=[raw_bytes],
+                url=source_url,
+                content_length=len(raw_bytes),
+            )
+        ]
+    )
+
+    digest, byte_count = await drug_transport.stream_uhc_drug_response(
+        session,
+        SimpleNamespace(source_url=source_url, expected_byte_count=len(raw_bytes)),
+        io.BytesIO(),
+        max_bytes=100,
+        cancel_check=None,
+    )
+
+    assert (digest, byte_count) == (hashlib.sha256(raw_bytes).hexdigest(), 4)
+    assert [request_url for request_url, _options in session.requests] == [source_url]
 
 
 @pytest.mark.asyncio
