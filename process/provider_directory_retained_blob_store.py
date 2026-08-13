@@ -238,13 +238,21 @@ class _OpenedArtifactBlob:
         except OSError as error:
             raise RetainedArtifactError("retained_blob_read_failed") from error
 
-    def verify_and_close(self) -> None:
+    def verify_and_close(self, *, content_digest_verified: bool = False) -> None:
         """Reopen the directory chain, verify every inode, and close."""
 
         if self._descriptor < 0:
             raise RetainedArtifactError("retained_blob_reader_closed")
         fresh_descriptors: list[int] = []
         try:
+            if not content_digest_verified:
+                with os.fdopen(os.dup(self._descriptor), "rb") as retained_blob:
+                    retained_digest = hashlib.file_digest(
+                        retained_blob,
+                        "sha256",
+                    ).hexdigest()
+                    if retained_digest != self._leaf_name:
+                        raise RetainedArtifactError("retained_blob_identity_changed")
             fresh_descriptors, fresh_identities = _open_directory_chain(
                 self._directory_components
             )
@@ -334,7 +342,7 @@ class _RetainedArtifactBlobReader:
                 or self._digest.hexdigest() != self._artifact_sha256
             ):
                 raise RetainedArtifactError("retained_blob_digest_mismatch")
-            self._opened_blob.verify_and_close()
+            self._opened_blob.verify_and_close(content_digest_verified=True)
         except BaseException:
             self._opened_blob.abort()
             raise

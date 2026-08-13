@@ -8,6 +8,7 @@ import yaml
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+PREPUSH = Path(__file__).resolve().parents[1] / "scripts/ci/prepush"
 ARC_RUNNER_EXPRESSION = (
     "${{ (github.event_name == 'push' || "
     "github.event_name == 'workflow_dispatch') && "
@@ -39,18 +40,6 @@ HOSTED_JOBS = {
     "worker-queue-smoke",
     "address-canonical-db-tests",
 }
-COMMIT_POLICY_SCRIPT = """if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-  python3 scripts/check_commit_messages.py --event "$GITHUB_EVENT_PATH"
-else
-  if [[ ! "$COVERAGE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "COVERAGE_BASE_SHA must be an exact commit SHA" >&2
-    exit 2
-  fi
-  python3 scripts/check_commit_messages.py --range "$COVERAGE_BASE_SHA..HEAD"
-fi
-"""
-
-
 def _values_for_key(value: object, key: str) -> list[object]:
     matches: list[object] = []
     if isinstance(value, dict):
@@ -119,6 +108,7 @@ def test_arc_jobs_use_the_pinned_image_toolchain() -> None:
 
 def test_commit_policy_uses_git_for_protected_main_without_event_file() -> None:
     document, _ = _documents()
+    prepush = PREPUSH.read_text(encoding="utf-8")
 
     assert document["env"]["COVERAGE_BASE_SHA"] == COVERAGE_BASE_EXPRESSION
     for name in ("public-hygiene", "python-quality"):
@@ -128,5 +118,9 @@ def test_commit_policy_uses_git_for_protected_main_without_event_file() -> None:
             "persist-credentials": False,
             "fetch-depth": 0,
         }
-        policy = next(step for step in steps if step.get("name") == "Commit message policy")
-        assert policy["run"] == COMMIT_POLICY_SCRIPT
+        policy = next(step for step in steps if step.get("name") == "Run shared pre-push gate")
+        assert policy["run"] == f"scripts/ci/prepush {'hygiene' if name == 'public-hygiene' else 'quality'}"
+    assert 'if [ "${GITHUB_EVENT_NAME:-}" = pull_request ]; then' in prepush
+    assert 'python3 scripts/check_commit_messages.py --event "$GITHUB_EVENT_PATH"' in prepush
+    assert '[[ ! "${COVERAGE_BASE_SHA:-}" =~ ^[0-9a-f]{40}$ ]]' in prepush
+    assert 'python3 scripts/check_commit_messages.py --range "$COVERAGE_BASE_SHA..HEAD"' in prepush

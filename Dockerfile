@@ -1,14 +1,27 @@
-FROM rust:1-slim-trixie AS ptg2-scanner-builder
+FROM docker.io/library/rust:1.97.1-slim-trixie@sha256:fc0648ac2962539be80bd424729a20fd80f7b64bfba7e90bbd642aed6c697c5a AS ptg2-scanner-builder
 
 ARG TARGETARCH
 ARG PTG2_SCANNER_RUSTFLAGS_AMD64="-C target-cpu=x86-64-v3"
 
 WORKDIR /build
+COPY requirements.txt requirements-dev.txt requirements-ci.in requirements-ci.lock /build/
+COPY scripts/ci/validate_python_lock_inputs /build/scripts/ci/validate_python_lock_inputs
 COPY support/ptg2_scanner/ /build/support/ptg2_scanner/
 COPY process/ext/address_pub28.py /build/process/ext/address_pub28.py
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-pip \
-    && python3 -m pip install --break-system-packages --no-cache-dir "maturin>=1.14,<2" \
+    && python3 /build/scripts/ci/validate_python_lock_inputs /build \
+    && grep '^maturin==1\.14\.1 --hash=sha256:' /build/requirements-ci.lock > /tmp/maturin.lock \
+    && test "$(wc -l < /tmp/maturin.lock)" -eq 1 \
+    && python3 -m pip install \
+        --break-system-packages \
+        --no-cache-dir \
+        --no-deps \
+        --only-binary=:all: \
+        --require-hashes \
+        -r /tmp/maturin.lock \
+    && python3 -m pip check \
+    && rm -f /tmp/maturin.lock \
     && rm -rf /var/lib/apt/lists/*
 RUN if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
         RUSTFLAGS="${PTG2_SCANNER_RUSTFLAGS_AMD64}" cargo build --release --bins --manifest-path /build/support/ptg2_scanner/Cargo.toml; \
@@ -22,12 +35,12 @@ RUN cd /build/support/ptg2_scanner \
         python3 -m maturin build --release --features python-extension --out /build/wheels; \
     fi
 
-FROM python:3.14-slim-trixie
+FROM docker.io/library/python:3.14.6-slim-trixie@sha256:b921fe7e7522f828d45197a47656ec465a9b15689b27fa8e1fba2864fca5b967
 
 #
 WORKDIR /wheels
-ADD ./requirements.txt /wheels
-ADD ./requirements-dev.txt /wheels
+COPY requirements.txt requirements-dev.txt requirements-ci.in requirements-ci.lock /wheels/
+COPY scripts/ci/install_python_lock scripts/ci/validate_python_lock_inputs /wheels/scripts/ci/
 
 WORKDIR /opt
 RUN apt-get update \
@@ -35,8 +48,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc g++ pkg-config libgdal-dev nginx git curl parallel "${LIBAIO_PKG}" \
     && python3 -m venv venv \
     && . venv/bin/activate \
-    && pip install --no-compile --upgrade pip \
-    && pip install --no-compile -r /wheels/requirements-dev.txt -f /wheels \
+    && PREPUSH_PIP_REPORT=/tmp/python-lock-install-report.json /wheels/scripts/ci/install_python_lock \
     && test -x /opt/venv/bin/rapidgzip \
     && ln -sf /opt/venv/bin/rapidgzip /usr/local/bin/rapidgzip \
     && install -d -o nobody -g nogroup -m 755 /run /var/log/nginx \
@@ -47,6 +59,7 @@ RUN apt-get update \
         /var/lib/nginx/uwsgi \
         /var/lib/nginx/scgi \
     && rm -rf /wheels \
+    && rm -f /tmp/python-lock-install-report.json \
     && rm -rf /root/.cache/pip/* \
     && find . -name '*.pyc' -delete \
     && apt-get autoremove -y \
@@ -125,7 +138,8 @@ COPY --from=ptg2-scanner-builder \
     /opt/support/ptg2_scanner/target/release/uhc_semantic_facts
 COPY --from=ptg2-scanner-builder /build/wheels/ /tmp/ptg2-address-canon-wheels/
 RUN . /opt/venv/bin/activate \
-    && pip install --no-compile /tmp/ptg2-address-canon-wheels/*.whl \
+    && pip install --no-compile --no-deps /tmp/ptg2-address-canon-wheels/*.whl \
+    && python -m pip check \
     && rm -rf /tmp/ptg2-address-canon-wheels
 COPY logging.yaml main.py alembic.ini /opt/
 

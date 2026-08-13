@@ -1,44 +1,1242 @@
 #!/usr/bin/env bash
-# Run the repository's shared pre-push quality gate.
 set -euo pipefail
 
-python_bin="${PYTHON_BIN:-python}"
+repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$repository_root"
 
-case "${1:-quality}" in
-  quality)
-    "$python_bin" -m compileall api process db public_evidence scripts main.py
-    "$python_bin" scripts/smoke/provider_directory_runtime_contract.py
-    "$python_bin" scripts/generate_provider_directory_support_docs.py --check
-    bash tests/test_ci_readability_policy.sh
+arc_image='ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c'
+postgres_image='postgis/postgis:18-3.6@sha256:0aacdfb9dda40942d424785c3ccabeffe31da9cc9e26b0dfd93b222b31462871'
+redis_image='redis:7@sha256:e9b2e45ecd47fbb69b877cf8d045d5cccaaaed52524b6e098b4abe8212994f73'
+semgrep_image='returntocorp/semgrep-agent@sha256:50140e658095736c7f9d2c12c1e8a98b13f044b773dc79aa98e83b8117dbf096'
+container_rust_image='docker.io/library/rust:1.97.1-slim-trixie@sha256:fc0648ac2962539be80bd424729a20fd80f7b64bfba7e90bbd642aed6c697c5a'
+container_python_image='docker.io/library/python:3.14.6-slim-trixie@sha256:b921fe7e7522f828d45197a47656ec465a9b15689b27fa8e1fba2864fca5b967'
 
-    if [ -n "${BASE_SHA:-}" ]; then
-      baseline_path="$(mktemp "${TMPDIR:-/tmp}/healthcare-readability-base.XXXXXX")"
-      git show "$BASE_SHA:readability-baseline.json" > "$baseline_path"
-      required_reduction_percent=1
-      if git diff --quiet "$BASE_SHA" HEAD -- \
-        main.py \
-        ':(glob)api/**/*.py' \
-        ':(glob)db/**/*.py' \
-        ':(glob)process/**/*.py' \
-        ':(glob)public_evidence/**/*.py' \
-        ':(glob)service/**/*.py'; then
-        required_reduction_percent=0
-      elif [ "${READABILITY_ZERO_GROWTH_APPROVED:-false}" = "true" ]; then
-        required_reduction_percent=0
-      fi
-      "$python_bin" scripts/readability_budget.py \
-        --ratchet-baseline "$baseline_path" \
-        --required-reduction-percent "$required_reduction_percent"
-    else
-      "$python_bin" scripts/readability_budget.py
-    fi
+capacity_test_paths=${CAPACITY_TEST_PATHS:-$'tests/test_ptg2_capacity_evidence.py\ntests/test_ptg2_v3_bounded_readers.py\ntests/test_ptg2_v3_capacity_gate.py\ntests/test_ptg2_v3_capacity_gate_adversarial.py\ntests/test_ptg2_v3_capacity_resources.py'}
+artifact_root=${PREPUSH_ARTIFACT_ROOT:-.}
 
-    "$python_bin" scripts/ci/request_time_external_call_guard.py
-    timeout --foreground 295s "$python_bin" -m pytest -q \
-      tests/test_coverage_forecast.py tests/test_ci_coverage_forecast.py
-    ;;
-  *)
-    echo "usage: $0 [quality]" >&2
+artifact_path() {
+  if [ "$artifact_root" = . ]; then
+    printf '%s\n' "$1"
+  else
+    printf '%s/%s\n' "${artifact_root%/}" "$1"
+  fi
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/ci/prepush MODE [ARG]
+
+MODE is one of:
+  all BASE_SHA
+  hygiene
+  quality
+  python-main 0|1|2|3
+  capacity
+  python-coverage
+  api-contract
+  rust
+  container-package
+  security
+  redis
+  postgres core|provider-directory|provider-profile
+EOF
+  exit 2
+}
+
+prepare_python_environment() {
+  if [ "${PREPUSH_DEPS_READY:-0}" = 1 ]; then
+    return
+  fi
+  if [ "${PREPUSH_PYTHON_ENV_READY:-0}" = 1 ]; then
+    return
+  fi
+  python_environment_root=$(mktemp -d "${RUNNER_TEMP:-/tmp}/healthcare-prepush-python.XXXXXX")
+  python -m venv "$python_environment_root/venv"
+  export VIRTUAL_ENV="$python_environment_root/venv"
+  export PATH="$VIRTUAL_ENV/bin:$PATH"
+  unset PYTHONHOME || true
+  export PREPUSH_PYTHON_ENV_READY=1
+  cleanup_python_environment() {
+    rm -rf -- "$python_environment_root"
+  }
+  trap cleanup_python_environment EXIT
+}
+
+install_python_dependencies() {
+  if [ "${PREPUSH_DEPS_READY:-0}" = 1 ]; then
+    return
+  fi
+  prepare_python_environment
+  scripts/ci/install_python_lock
+}
+
+require_base_sha() {
+  if [[ ! "${COVERAGE_BASE_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "COVERAGE_BASE_SHA must be an exact commit SHA" >&2
     exit 2
-    ;;
+  fi
+}
+
+commit_message_policy() {
+  if [ "${GITHUB_EVENT_NAME:-}" = pull_request ]; then
+    python3 scripts/check_commit_messages.py --event "$GITHUB_EVENT_PATH"
+  else
+    require_base_sha
+    python3 scripts/check_commit_messages.py --range "$COVERAGE_BASE_SHA..HEAD"
+  fi
+}
+
+run_hygiene() {
+  commit_message_policy
+  python3 tests/test_public_hygiene.py
+  python3 scripts/ci/public_hygiene.py
+}
+
+run_quality() {
+  commit_message_policy
+  install_python_dependencies
+  python -m compileall api process db public_evidence scripts main.py
+  python scripts/smoke/provider_directory_runtime_contract.py
+  python scripts/generate_provider_directory_support_docs.py --check
+  bash tests/test_ci_readability_policy.sh
+
+  if [ -n "${BASE_SHA:-}" ]; then
+    git show "$BASE_SHA:readability-baseline.json" > "${RUNNER_TEMP:-/tmp}/readability-base.json"
+    required_reduction_percent=1
+    if git diff --quiet "$BASE_SHA" HEAD -- \
+      main.py \
+      ':(glob)api/**/*.py' \
+      ':(glob)db/**/*.py' \
+      ':(glob)process/**/*.py' \
+      ':(glob)public_evidence/**/*.py' \
+      ':(glob)service/**/*.py'; then
+      required_reduction_percent=0
+    elif [ "${READABILITY_ZERO_GROWTH_APPROVED:-false}" = true ]; then
+      required_reduction_percent=0
+    fi
+    python scripts/readability_budget.py \
+      --ratchet-baseline "${RUNNER_TEMP:-/tmp}/readability-base.json" \
+      --required-reduction-percent "$required_reduction_percent"
+  else
+    python scripts/readability_budget.py
+  fi
+
+  python scripts/ci/request_time_external_call_guard.py
+  timeout --foreground 295s python -m pytest -q \
+    tests/test_coverage_forecast.py \
+    tests/test_ci_coverage_forecast.py \
+    tests/test_ci_prepush_contract.py
+}
+
+run_python_main() {
+  local shard=${1:-}
+  case "$shard" in 0|1|2|3) ;; *) usage ;; esac
+  if [ "${PREPUSH_DEPS_READY:-0}" = 1 ]; then
+    cargo build --locked --bins --manifest-path support/ptg2_scanner/Cargo.toml
+  else
+    prepare_python_environment
+    install_python_dependencies &
+    local pip_pid=$!
+    cargo build --locked --bins --manifest-path support/ptg2_scanner/Cargo.toml &
+    local cargo_pid=$!
+    wait "$pip_pid"
+    wait "$cargo_pid"
+  fi
+
+  mapfile -t capacity_tests <<< "$capacity_test_paths"
+  local collection_args=()
+  local test_path
+  for test_path in "${capacity_tests[@]}"; do
+    collection_args+=(--ignore "$test_path")
+  done
+  local shard_file="${RUNNER_TEMP:-/tmp}/python-test-shard-${shard}.txt"
+  python scripts/ci/shard_pytest_nodeids.py \
+    --shard-count 4 \
+    --shard-index "$shard" \
+    --output "$shard_file" \
+    -- "${collection_args[@]}"
+  export COVERAGE_FILE=${COVERAGE_FILE:-$(artifact_path ".coverage.main.${shard}")}
+  timeout --foreground 295s python -m pytest -q -n 1 --dist loadscope --durations=20 \
+    --cov-config=test-coverage.ini \
+    --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main \
+    --cov-branch --cov-report= \
+    @"$shard_file"
+  require_base_sha
+  timeout --foreground 295s python scripts/coverage_forecast.py write-shard-provenance \
+    --base "$COVERAGE_BASE_SHA" \
+    --kind main \
+    --shard "$shard" \
+    --coverage "$COVERAGE_FILE" \
+    --output "$(artifact_path ".coverage-provenance.main.${shard}.json")"
+}
+
+run_capacity() {
+  install_python_dependencies
+  mapfile -t capacity_tests <<< "$capacity_test_paths"
+  export COVERAGE_FILE=${COVERAGE_FILE:-$(artifact_path .coverage.capacity)}
+  timeout --foreground 295s python -m pytest -q -n 4 --dist load --durations=20 \
+    --cov-config=test-coverage.ini \
+    --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main \
+    --cov-branch --cov-report= \
+    "${capacity_tests[@]}"
+  require_base_sha
+  timeout --foreground 295s python scripts/coverage_forecast.py write-shard-provenance \
+    --base "$COVERAGE_BASE_SHA" \
+    --kind capacity \
+    --shard capacity \
+    --coverage "$COVERAGE_FILE" \
+    --output "$(artifact_path .coverage-provenance.capacity.json)"
+}
+
+run_python_coverage() {
+  install_python_dependencies
+  require_base_sha
+  timeout --foreground 295s python scripts/coverage_ratchet.py --self-test
+  timeout --foreground 295s python scripts/coverage_forecast.py forecast-python \
+    --base "$COVERAGE_BASE_SHA" \
+    --main-artifacts "${PREPUSH_MAIN_ARTIFACTS:-coverage-data/main}" \
+    --capacity-artifacts "${PREPUSH_CAPACITY_ARTIFACTS:-coverage-data/capacity}" \
+    --postgres-artifacts "${PREPUSH_POSTGRES_ARTIFACTS:-coverage-data/postgres}" \
+    --output "$(artifact_path test-coverage-forecast-python.json)"
+}
+
+run_api_contract() {
+  install_python_dependencies
+  timeout --foreground 295s python -m pytest -q \
+    tests/test_openapi_spec.py \
+    tests/test_formulary_fhir_openapi.py \
+    tests/test_api_init_and_utils.py \
+    tests/test_healthcheck.py
+}
+
+run_rust() {
+  local rust_artifacts
+  rust_artifacts=$(artifact_path coverage-artifacts/rust)
+  install_python_dependencies
+  cargo fmt --manifest-path support/ptg2_scanner/Cargo.toml -- --check
+  cargo clippy --manifest-path support/ptg2_scanner/Cargo.toml --all-targets -- -D warnings
+  mkdir -p "$rust_artifacts"
+  cargo install cargo-llvm-cov --version 0.8.7 --locked
+  timeout --foreground 295s cargo llvm-cov --manifest-path support/ptg2_scanner/Cargo.toml \
+    --all-targets --features python --json --summary-only \
+    --output-path "$rust_artifacts/test-coverage-rust.json"
+  require_base_sha
+  timeout --foreground 295s python scripts/coverage_forecast.py write-report-provenance \
+    --base "$COVERAGE_BASE_SHA" \
+    --report-name rust \
+    --report "$rust_artifacts/test-coverage-rust.json" \
+    --output "$rust_artifacts/coverage-provenance-rust.json" \
+    --cargo-llvm-cov-version "$(cargo llvm-cov --version | awk '{print $2}')" \
+    --rust-version "$(rustc --version | awk '{print $2}')"
+  timeout --foreground 295s python scripts/coverage_ratchet.py --self-test
+  timeout --foreground 295s python scripts/coverage_forecast.py forecast-rust \
+    --base "$COVERAGE_BASE_SHA" \
+    --artifacts "$rust_artifacts" \
+    --output "$(artifact_path test-coverage-forecast-rust.json)"
+  cargo install cargo-audit --version 0.22.2 --locked
+  (cd support/ptg2_scanner && cargo audit)
+  cargo build --release --bins --manifest-path support/ptg2_scanner/Cargo.toml
+  HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_NATIVE_TEST_BIN="$repository_root/support/ptg2_scanner/target/release/ptg2_scanner" \
+  HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_NATIVE_BIN="$repository_root/support/ptg2_scanner/target/release/ptg2_scanner" \
+    timeout --foreground 295s python -m pytest -q \
+      tests/test_provider_directory_projection_native_copy.py \
+      tests/test_provider_directory_projection_native_cli_parity.py \
+      tests/test_provider_directory_projection_native_copy_adversarial.py
+  (
+    local wheel_directory
+    wheel_directory=$(mktemp -d "${RUNNER_TEMP:-/tmp}/healthcare-ptg2-wheel.XXXXXX")
+    trap 'rm -rf -- "$wheel_directory"' EXIT
+    cd support/ptg2_scanner
+    python -m maturin build --release --features python-extension --out "$wheel_directory"
+    shopt -s nullglob
+    local wheels=("$wheel_directory"/*.whl)
+    [ "${#wheels[@]}" -eq 1 ]
+    if [ "$artifact_root" != . ]; then
+      printf '%s  %s\n' \
+        "$(sha256sum "${wheels[0]}" | awk '{print $1}')" \
+        "$(basename "${wheels[0]}")" \
+        > "$(artifact_path ptg2-address-canon-wheel.sha256)"
+    fi
+    python -m pip install --no-deps "${wheels[0]}"
+    python -m pip check
+  )
+  timeout --foreground 295s python -m pytest -q tests/test_address_canon_pyo3.py
+  (
+    local tmp
+    tmp=$(mktemp -d)
+    trap 'rm -rf -- "$tmp"' EXIT
+    support/ptg2_scanner/target/release/ptg2_scanner --canon-version \
+      | python -c 'import json,sys; payload=json.load(sys.stdin); assert payload["ruleset_version"] == 4, payload'
+    printf "1\t(0,1)\t\\N\t123 Main St\tSuite 2\tAustin\tTX\t78701\tUS\n" > "$tmp/raw.copy"
+    support/ptg2_scanner/target/release/ptg2_scanner \
+      --address-canonicalize-copy "$tmp/raw.copy" "$tmp/keyed.copy"
+    test -s "$tmp/keyed.copy"
+  )
+}
+
+run_container_package() {
+  local source_commit=${GITHUB_SHA:-$(git rev-parse HEAD)}
+  local image=${PREPUSH_CONTAINER_IMAGE:-healthcare-mrf-api:ptg-v4-gate}
+  docker build \
+    --platform linux/amd64 \
+    --build-arg "HLTHPRT_SOURCE_COMMIT=${source_commit}" \
+    --tag "$image" \
+    .
+  if docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+    "$image" \
+    | grep -q '^HLTHPRT_SOURCE_COMMIT='; then
+    exit 1
+  fi
+  docker run --rm --platform linux/amd64 \
+    --entrypoint /bin/sh \
+    "$image" \
+    -ec '
+      test "$(cat /opt/healthporta/build-identity/healthcare-source-commit)" = "$1"
+      test "$(stat -c "%u:%g:%a:%h:%s" /opt/healthporta/build-identity/healthcare-source-commit)" = "0:0:444:1:41"
+    ' sh "$source_commit"
+  docker run --rm --platform linux/amd64 \
+    --entrypoint /bin/sh \
+    "$image" \
+    -ec '
+      test -x /opt/support/ptg2_scanner/target/release/ptg2_scanner
+      test -x /opt/support/ptg2_scanner/target/release/ptg2_provider_graph_v4
+      /opt/venv/bin/python -c "import ptg2_address_canon as m; assert hasattr(m, '\''intersect_sorted_u32'\''); assert hasattr(m, '\''ptg2_decode_u32_le'\'')"
+      /opt/venv/bin/python -B -c "import public_evidence; import process.npi"
+    '
+  docker run --rm --platform linux/amd64 \
+    --entrypoint /bin/sh \
+    "$image" \
+    -ec '
+      set +e
+      operation_output=$(env \
+        -u HLTHPRT_FHIR_FORMULARY_REVIEWED_ACQUISITION_ENABLED \
+        -u HLTHPRT_FHIR_FORMULARY_REVIEWED_PUBLICATION_ENABLED \
+        /opt/venv/bin/python -B \
+        /opt/scripts/smoke/formulary_fhir_reviewed_operator.py \
+        acquire-twins --cutoff 2026-01-01T00:00:00Z 2>&1)
+      operation_status=$?
+      set -e
+      test "$operation_status" -eq 1
+      operation_last_line=$(printf "%s\n" "$operation_output" | tail -n 1)
+      test "$operation_last_line" = '\''{"code":"disabled","status":"error"}'\''
+    '
+  docker run --rm --platform linux/amd64 \
+    --entrypoint /bin/sh \
+    "$image" \
+    -ec '
+      set +e
+      operation_output=$(env \
+        -u HLTHPRT_UHC_FORMULARY_ACQUISITION_ENABLED \
+        -u HLTHPRT_UHC_FORMULARY_PUBLICATION_ENABLED \
+        /opt/venv/bin/python -B \
+        /opt/scripts/smoke/uhc_formulary_operator.py \
+        acquire-admit \
+        --raw-set-sha256 \
+        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        2>&1)
+      operation_status=$?
+      set -e
+      test "$operation_status" -eq 1
+      operation_last_line=$(printf "%s\n" "$operation_output" | tail -n 1)
+      test "$operation_last_line" = '\''{"code":"disabled","status":"error"}'\''
+    '
+  docker run --rm --platform linux/amd64 \
+    --entrypoint /bin/sh \
+    "$image" \
+    -ec '
+      set +e
+      operation_output=$(env \
+        -u HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_REGISTRATION_ENABLED \
+        -u HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_ENABLED \
+        -u HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ACQUISITION_ENABLED \
+        -u HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_ENABLED \
+        /opt/venv/bin/python -B \
+        /opt/scripts/smoke/provider_directory_rooted_graph_operator.py \
+        acquire-single-root \
+        --operation-key \
+        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        2>&1)
+      operation_status=$?
+      set -e
+      test "$operation_status" -eq 1
+      operation_last_line=$(printf "%s\n" "$operation_output" | tail -n 1)
+      test "$operation_last_line" = '\''{"code":"disabled","status":"error"}'\''
+    '
+  docker run --rm --platform linux/amd64 \
+    --entrypoint /bin/sh \
+    "$image" \
+    -ec '
+      set +e
+      operation_output=$(env \
+        -u HLTHPRT_UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ACQUISITION_ENABLED \
+        /opt/venv/bin/python -B \
+        /opt/scripts/smoke/uhc_flex_practitioner_operator.py \
+        acquire-admit-single-root \
+        --operation-key \
+        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        --semantic-projection-as-of 2026-08-12 2>&1)
+      operation_status=$?
+      set -e
+      test "$operation_status" -eq 1
+      operation_last_line=$(printf "%s\n" "$operation_output" | tail -n 1)
+      test "$operation_last_line" = '\''{"code":"disabled","status":"error"}'\''
+    '
+  docker run --rm --platform linux/amd64 \
+    --entrypoint /bin/sh \
+    "$image" \
+    -ec '
+      for operation in \
+        sync-verified-state \
+        abandon-expired-root \
+        seal-terminal-root \
+        seal-direct-v4-terminal-root \
+        seal-direct-v5-http410-root; do
+        set +e
+        operation_output=$(env \
+          -u HLTHPRT_PROVIDER_DIRECTORY_SUBSET_STATE_SYNC_ENABLED \
+          -u HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_ABANDONMENT_ENABLED \
+          -u HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_TERMINAL_DISPOSITION_ENABLED \
+          -u HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V4_TERMINAL_DISPOSITION_ENABLED \
+          -u HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_ENABLED \
+          /opt/venv/bin/python -B \
+          /opt/scripts/smoke/provider_directory_fhir_reviewed_subset_state.py \
+          "$operation" 2>&1)
+        operation_status=$?
+        set -e
+        test "$operation_status" -eq 1
+        test "$operation_output" = '\''{"code":"disabled","status":"error"}'\''
+      done
+    '
+  docker run --rm --platform linux/amd64 \
+    --entrypoint /bin/sh \
+    "$image" \
+    -ec '
+      set +e
+      operation_output=$(env \
+        -u HLTHPRT_PROVIDER_DIRECTORY_TERMINAL_ROOT_RETIREMENT_ENABLED \
+        /opt/venv/bin/python -B \
+        /opt/scripts/smoke/provider_directory_terminal_root_retirement.py \
+        2>&1)
+      operation_status=$?
+      set -e
+      test "$operation_status" -eq 1
+      test "$operation_output" = '\''{"code":"disabled","status":"error"}'\''
+    '
+}
+
+run_security() {
+  if [ "${PREPUSH_SKIP_AUDIT:-0}" != 1 ]; then
+    install_python_dependencies
+    python -m pip_audit --disable-pip --require-hashes -r requirements-ci.lock
+  fi
+  if [ "${PREPUSH_SKIP_SEMGREP:-0}" != 1 ]; then
+    local security_git_common_dir
+    security_git_common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
+    local event_args=(--env GITHUB_EVENT_PATH)
+    if [ -f "${GITHUB_EVENT_PATH:-}" ]; then
+      event_args=(
+        --volume "$GITHUB_EVENT_PATH:/github/event.json:ro"
+        --env GITHUB_EVENT_PATH=/github/event.json
+      )
+    fi
+    docker run --rm --platform linux/amd64 \
+      --user "$(id -u):$(id -g)" \
+      --volume "$repository_root:/src" \
+      --volume "$security_git_common_dir:$security_git_common_dir" \
+      --workdir /src \
+      --env HOME=/tmp \
+      --env GITHUB_ACTIONS \
+      --env GITHUB_API_URL \
+      --env GITHUB_SERVER_URL \
+      --env GITHUB_REPOSITORY \
+      --env GITHUB_REF \
+      --env GITHUB_HEAD_REF \
+      --env GITHUB_BASE_REF \
+      --env GITHUB_RUN_ID \
+      --env GITHUB_TOKEN \
+      --env INPUT_CONFIG=.semgrep.yml \
+      --env GITHUB_WORKSPACE=/src \
+      --env GITHUB_EVENT_NAME="${GITHUB_EVENT_NAME:-push}" \
+      --env GITHUB_SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}" \
+      "${event_args[@]}" \
+      "$semgrep_image"
+  fi
+}
+
+run_redis() {
+  install_python_dependencies
+  python - <<'PY'
+import asyncio
+import os
+from urllib.parse import urlparse
+
+from redis.asyncio import Redis
+
+
+async def main() -> None:
+    address = urlparse(os.environ.get("HLTHPRT_REDIS_ADDRESS", "redis://127.0.0.1:6379"))
+    redis = Redis(
+        host=address.hostname or "127.0.0.1",
+        port=address.port or 6379,
+        decode_responses=True,
+    )
+    await redis.rpush("arq:ci-smoke", "healthporta-ci")
+    assert await redis.llen("arq:ci-smoke") == 1
+    await redis.delete("arq:ci-smoke")
+    await redis.aclose()
+
+
+asyncio.run(main())
+PY
+  timeout --foreground 295s python -m pytest -q \
+    tests/test_control_workers.py \
+    tests/test_control_imports_api.py \
+    tests/test_control_cancel.py
+}
+
+prepare_postgres() {
+  python - <<'PY'
+import asyncio
+import os
+
+import asyncpg
+
+
+async def main() -> None:
+    conn = await asyncpg.connect(
+        host=os.environ["HLTHPRT_DB_HOST"],
+        port=int(os.environ["HLTHPRT_DB_PORT"]),
+        user=os.environ["HLTHPRT_DB_USER"],
+        password=os.environ["HLTHPRT_DB_PASSWORD"],
+        database=os.environ["HLTHPRT_DB_DATABASE"],
+    )
+    await conn.execute("CREATE EXTENSION IF NOT EXISTS postgis")
+    await conn.execute('CREATE SCHEMA IF NOT EXISTS "mrf"')
+    await conn.close()
+
+
+asyncio.run(main())
+PY
+  alembic stamp 20260610143000_address_checksums_bigint
+  alembic upgrade head
+}
+
+drop_test_database() {
+  PGPASSWORD="$HLTHPRT_DB_PASSWORD" dropdb --if-exists \
+    --host "$HLTHPRT_DB_HOST" \
+    --port "$HLTHPRT_DB_PORT" \
+    --username "$HLTHPRT_DB_USER" \
+    "$1"
+}
+
+create_test_database() {
+  local database=$1
+  drop_test_database "$database"
+  PGPASSWORD="$HLTHPRT_DB_PASSWORD" createdb \
+    --host "$HLTHPRT_DB_HOST" \
+    --port "$HLTHPRT_DB_PORT" \
+    --username "$HLTHPRT_DB_USER" \
+    "$database"
+}
+
+run_core_postgres() {
+  local dsn=$1
+  HLTHPRT_PROVIDER_DIRECTORY_MIGRATION_POSTGRES_DSN=$dsn \
+  HLTHPRT_MRF_FILE_CURSOR_MIGRATION_POSTGRES_DSN=$dsn \
+  HLTHPRT_FHIR_FORMULARY_MIGRATION_POSTGRES_DSN=$dsn \
+  HLTHPRT_PUBLIC_EVIDENCE_STORAGE_POSTGRES_DSN=$dsn \
+  HLTHPRT_PUBLIC_EVIDENCE_RECORD_PARITY_POSTGRES_DSN=$dsn \
+    timeout --foreground 295s python -m pytest -q \
+    tests/test_provider_directory_migration_adoption_postgres.py \
+    tests/test_provider_directory_caresource_census_db.py \
+    tests/test_provider_directory_fhir_current_census_postgres.py \
+    tests/test_provider_directory_fhir_current_census_terminal_postgres.py \
+    tests/test_provider_directory_fhir_current_census_atomicity_postgres.py \
+    tests/test_mrf_file_source_cursor_migration.py \
+    tests/test_public_evidence_storage_catalog_postgres.py \
+    tests/test_public_evidence_storage_interval_postgres.py \
+    tests/test_public_evidence_storage_nulls_postgres.py \
+    tests/test_public_evidence_storage_postgres.py \
+    tests/test_public_evidence_reference_roots_postgres.py \
+    tests/test_public_evidence_record_postgres_parity.py \
+    tests/test_public_evidence_npi_enumeration_postgres.py \
+    tests/test_public_evidence_npi_enumeration_catalog_postgres.py \
+    tests/test_public_evidence_npi_enumeration_adversarial_postgres.py \
+    tests/test_public_evidence_nppes_registry_admission_postgres.py \
+    tests/test_public_evidence_nppes_registry_admission_adversarial_postgres.py \
+    tests/test_public_evidence_nppes_lifecycle_postgres.py \
+    tests/test_npi_canonical_publication_postgres.py \
+    tests/test_npi_canonical_publication_rotation_postgres.py \
+    tests/test_formulary_fhir_storage_postgres.py \
+    tests/test_formulary_fhir_source_artifact_postgres.py \
+    tests/test_formulary_fhir_uhc_receipt_postgres.py \
+    tests/test_uhc_drug_acquisition_lease_postgres.py \
+    tests/test_uhc_drug_vertical_postgres.py \
+    tests/test_formulary_fhir_twin_admission_postgres.py \
+    tests/test_formulary_fhir_twin_repository_postgres.py \
+    tests/test_formulary_fhir_reviewed_operator_postgres.py \
+    tests/test_formulary_fhir_repository_postgres.py \
+    tests/test_formulary_fhir_synchronizer_postgres.py \
+    tests/test_formulary_fhir_manual_worker_postgres.py \
+    tests/test_formulary_fhir_reviewed_source_postgres.py \
+    tests/test_formulary_fhir_synthetic_canary_postgres.py \
+    tests/test_formulary_fhir_synthetic_seed_publisher_postgres.py \
+    tests/test_formulary_fhir_serving_postgres.py \
+    tests/test_formulary_fhir_serving_index_postgres.py \
+    tests/test_formulary_fhir_collections_postgres.py
+
+  HLTHPRT_PTG2_V3_LIFECYCLE_POSTGRES_DSN=$dsn \
+  HLTHPRT_PTG2_ROLLBACK_POSTGRES_DSN=$dsn \
+    timeout --foreground 295s python -m pytest -q \
+      tests/test_ptg2_v3_migrated_lifecycle_postgres.py \
+      tests/test_ptg_source_snapshot_rollback_postgres.py
+  HLTHPRT_PTG2_ATTESTATION_COMPAT_POSTGRES_TEST=1 \
+    timeout --foreground 295s python -m pytest -q \
+      tests/test_ptg2_attestation_contract_compat_postgres.py \
+      tests/test_ptg2_candidate_v4_attestation_postgres.py
+  HLTHPRT_MRF_DISCOVERY_CHECKPOINT_POSTGRES_DSN=$dsn \
+    timeout --foreground 295s python -m pytest -q tests/test_mrf_discovery_checkpoints_postgres.py
+
+  local database=control_imports_test_ci_runner
+  create_test_database "$database"
+  if ! HLTHPRT_DB_DATABASE=$database \
+    PGPASSWORD="$HLTHPRT_DB_PASSWORD" \
+    timeout --foreground 295s python -m pytest -q \
+    tests/test_control_imports_db.py \
+    tests/test_control_npi_db.py \
+    tests/test_control_import_attempt_fence_db.py; then
+    drop_test_database "$database"
+    return 1
+  fi
+  drop_test_database "$database"
+
+  database=uhc_retained_admission_test_ci_runner
+  create_test_database "$database"
+  if ! HLTHPRT_UHC_RETAINED_ADMISSION_POSTGRES_DSN="${dsn%/*}/$database" \
+  HLTHPRT_PTG2_RUST_SCANNER_BIN="$repository_root/support/ptg2_scanner/target/debug/ptg2_scanner" \
+  PGPASSWORD="$HLTHPRT_DB_PASSWORD" \
+    timeout --foreground 295s python -m pytest -q \
+      tests/test_uhc_retained_admission_postgres.py \
+      tests/test_uhc_retained_admission_concurrency_postgres.py; then
+    drop_test_database "$database"
+    return 1
+  fi
+  drop_test_database "$database"
+
+  database=ptg_frozen_binding_test_ci_runner
+  create_test_database "$database"
+  if ! HLTHPRT_PTG_FROZEN_BINDING_POSTGRES_DSN="${dsn%/*}/$database" \
+    PGPASSWORD="$HLTHPRT_DB_PASSWORD" \
+    timeout --foreground 295s python -m pytest -q tests/test_ptg_frozen_binding_postgres.py; then
+    drop_test_database "$database"
+    return 1
+  fi
+  drop_test_database "$database"
+
+  database=ptg_import_wave_recovery_test_ci_runner
+  create_test_database "$database"
+  if ! HLTHPRT_PTG_IMPORT_WAVE_RECOVERY_POSTGRES_DSN="${dsn%/*}/$database" \
+    PGPASSWORD="$HLTHPRT_DB_PASSWORD" \
+    timeout --foreground 295s python -m pytest -q \
+      tests/test_ptg_wave_recovery_storage_postgres.py \
+      tests/test_ptg_wave_recovery_storage_orm_postgres.py \
+      tests/test_ptg_wave_materialized_preclaim_storage_postgres.py \
+      tests/test_ptg_wave_materialized_preclaim_guard_postgres.py \
+      tests/test_ptg_wave_materialized_preclaim_downgrade_postgres.py \
+      tests/test_ptg_wave_receipt_authority_migration.py \
+      tests/test_ptg2_block_build_pins_postgres.py \
+      tests/test_ptg2_block_pin_heartbeat_postgres.py \
+      tests/test_ptg2_layout_candidate_postgres.py \
+      tests/test_ptg2_legacy_global_projection_postgres.py \
+      tests/test_ptg2_lifecycle_hol_postgres.py \
+      tests/test_ptg2_plan_catalog_hol_postgres.py \
+      tests/test_ptg2_terminal_review_migrations_postgres.py \
+      tests/test_ptg_wave_ordinary_terminal_receipt_postgres.py \
+      tests/test_ptg_wave_terminal_snapshot_pin_postgres.py; then
+    drop_test_database "$database"
+    return 1
+  fi
+  drop_test_database "$database"
+
+  database=uhc_semantic_test_ci_runner
+  create_test_database "$database"
+  if ! HLTHPRT_DB_DATABASE=$database \
+    HLTHPRT_UHC_SEMANTIC_POSTGRES_DSN="${dsn%/*}/$database" \
+    PGPASSWORD="$HLTHPRT_DB_PASSWORD" \
+    timeout --foreground 295s python -m pytest -q \
+      tests/test_uhc_semantic_build_postgres.py \
+      tests/test_uhc_semantic_build_lifecycle.py \
+      tests/test_uhc_retained_dataset_postgres.py; then
+    drop_test_database "$database"
+    return 1
+  fi
+  drop_test_database "$database"
+
+  HLTHPRT_PTG2_AUDIT_BATCH_POSTGRES_TEST=1 \
+  HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1 \
+    timeout --foreground 295s python -m pytest -q \
+      tests/test_ptg2_candidate_audit_batch_postgres.py \
+      tests/test_ptg2_shared_graph_postgres.py \
+      tests/test_ptg2_shared_price_postgres.py \
+      tests/test_ptg2_shared_snapshot_publish_postgres.py
+
+  HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST=1 \
+  HLTHPRT_PTG2_V4_MIGRATION_POSTGRES_DSN=$dsn \
+  HLTHPRT_PTG2_V4_TAXONOMY_POSTGRES_DSN=$dsn \
+  HLTHPRT_PTG2_TAX_IDENTITY_POSTGRES_DSN=$dsn \
+  HLTHPRT_PTG2_TAX_IDENTITY_SOURCE_POSTGRES_DSN=$dsn \
+  HLTHPRT_PTG2_RAW_TIN_VAULT_POSTGRES_DSN=$dsn \
+  HLTHPRT_PTG2_PROVIDER_GRAPH_V4_BIN="$repository_root/support/ptg2_scanner/target/debug/ptg2_provider_graph_v4" \
+    timeout --foreground 295s python -m pytest -q \
+      tests/test_ptg2_v4_migration_postgres.py \
+      tests/test_ptg2_v4_taxonomy_candidates_postgres.py \
+      tests/test_ptg2_v4_taxonomy_candidates_lifecycle.py \
+      tests/test_ptg2_provider_tax_identity_postgres.py \
+      tests/test_ptg2_tax_identity_source_migration_postgres.py \
+      tests/test_ptg2_tax_identity_source_projection_postgres.py \
+      tests/test_ptg2_tax_identity_source_preflight_postgres.py \
+      tests/test_ptg2_tax_identity_source_stage_seal_postgres.py \
+      tests/test_ptg2_tax_identity_source_seal_race_postgres.py \
+      tests/test_ptg2_tax_identity_publication_postgres.py \
+      tests/test_ptg2_raw_tin_vault_postgres.py \
+      tests/test_ptg2_v4_snapshot_maps.py \
+      tests/test_ptg2_v4_postgres_e2e.py \
+      tests/test_ptg2_v4_stale_metadata_reconcile_postgres.py \
+      tests/test_ptg2_v4_stale_metadata_optional_postgres.py \
+      tests/test_ptg2_v4_attempt_registry_postgres.py \
+      tests/test_ptg2_v4_attempt_stage_regression_postgres.py \
+      tests/test_ptg2_v4_attempt_entry_atomicity_postgres.py \
+      tests/test_ptg2_v4_terminal_stage_atomicity_postgres.py \
+      tests/test_ptg2_v4_stale_metadata_plan_drift_postgres.py \
+      tests/test_ptg2_v4_stale_metadata_json_postgres.py \
+      tests/test_ptg2_v4_stale_metadata_fence_postgres.py \
+      tests/test_ptg2_v4_import_job_postgres.py \
+      tests/test_ptg2_v4_attempt_migration_adoption_postgres.py \
+      tests/test_ptg2_v4_attempt_migration_downgrade_postgres.py \
+      tests/test_ptg2_v4_attempt_model_autogenerate_postgres.py \
+      tests/test_ptg2_legacy_v3_metadata_reconcile_postgres.py \
+      tests/test_ptg2_legacy_v3_migration_postgres.py \
+      tests/test_ptg2_legacy_v3_v4_compat_postgres.py \
+      tests/test_ptg_source_attempt_action_postgres.py
+
+  HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1 \
+    timeout --foreground 295s python -m pytest -q \
+      tests/test_ptg2_shared_gc.py \
+      tests/test_ptg2_shared_gc_postgres.py \
+      tests/test_ptg2_legacy_orphan_optional_postgres.py \
+      tests/test_ptg2_stage_ddl_savepoints_postgres.py \
+      tests/test_ptg2_legacy_orphan_sweeper_postgres.py \
+      tests/test_ptg2_legacy_orphan_safety_postgres.py \
+      tests/test_ptg2_legacy_orphan_window_postgres.py \
+      tests/test_ptg2_source_snapshot_gc_postgres.py \
+      tests/test_ptg_source_snapshot_predecessor_retirement_postgres.py \
+      tests/test_ptg_source_snapshot_predecessor_retirement_concurrency_postgres.py \
+      tests/test_ptg_source_snapshot_predecessor_retirement_absent_pin_postgres.py \
+      tests/test_ptg_source_snapshot_removal_v3.py \
+      tests/test_ptg_source_snapshot_removal_v4.py
+  HLTHPRT_PTG2_CROSS_PLAN_POSTGRES_TEST=1 \
+    timeout --foreground 295s python -m pytest -q tests/test_ptg2_v3_cross_plan_reuse.py
+}
+
+run_provider_directory_postgres() {
+  local dsn=$1
+  HLTHPRT_TIN_NPI_CONNECTOR_POSTGRES_DSN=$dsn \
+    timeout --foreground 295s python -m pytest -q \
+      tests/test_tin_npi_connector_postgres.py \
+      tests/test_provider_directory_endpoint_dataset_admission_seal_migration.py \
+      tests/test_provider_directory_endpoint_dataset_admission_seal_migration_postgres.py \
+      tests/test_provider_directory_subset_completion_postgres.py \
+      tests/test_provider_directory_fhir_terminal_atomicity_postgres.py \
+      tests/test_provider_directory_reviewed_subset_bounded_drift_postgres.py \
+      tests/test_provider_directory_reviewed_subset_terminal_window_postgres.py \
+      tests/test_provider_directory_reviewed_subset_terminal_window_lock_postgres.py \
+      tests/test_provider_directory_reviewed_source_generation_postgres.py \
+      tests/test_provider_directory_reviewed_subset_terminal_disposition_postgres.py \
+      tests/test_provider_directory_reviewed_subset_direct_v4_disposition_postgres.py \
+      tests/test_provider_directory_reviewed_subset_v5_http410_disposition_postgres.py \
+      tests/test_provider_directory_terminal_root_retirement_postgres.py \
+      tests/test_provider_directory_terminal_root_retirement_repair_postgres.py \
+      tests/test_provider_directory_terminal_root_retirement_v2_postgres.py \
+      tests/test_provider_directory_terminal_root_retirement_v2_topology_postgres.py
+
+  HLTHPRT_FHIR_FORMULARY_MIGRATION_POSTGRES_DSN=$dsn \
+    timeout --foreground 295s python -m pytest -q \
+      tests/test_uhc_flex_practitioner_registration_postgres.py \
+      tests/test_provider_directory_uhc_flex_npi_cohort_postgres.py \
+      tests/test_provider_directory_uhc_flex_practitioner_acquisition_postgres.py \
+      tests/test_provider_directory_uhc_flex_practitioner_twin_postgres.py \
+      tests/test_provider_directory_uhc_flex_practitioner_publication_postgres.py \
+      tests/test_provider_directory_rooted_graph_adoption_postgres.py \
+      tests/test_provider_directory_rooted_graph_acquisition_postgres.py \
+      tests/test_provider_directory_rooted_graph_single_root_postgres.py \
+      tests/test_provider_directory_rooted_graph_publication_guards_postgres.py \
+      tests/test_provider_directory_rooted_graph_publication_postgres.py
+
+  local common_env=(
+    "HLTHPRT_RETAINED_ARTIFACT_POSTGRES_DSN=$dsn"
+    "HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_POSTGRES_DSN=$dsn"
+    "HLTHPRT_UHC_ORGANIZATION_EVIDENCE_POSTGRES_DSN=$dsn"
+    "HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_NATIVE_BIN=$repository_root/support/ptg2_scanner/target/debug/ptg2_scanner"
+    "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_ALLOW_SCHEMA_TESTS=1"
+  )
+  env "${common_env[@]}" timeout --foreground 295s python -m pytest -q \
+    -o asyncio_default_test_loop_scope=session \
+    -o asyncio_default_fixture_loop_scope=session \
+    --durations=20 \
+    tests/test_provider_directory_dataset_artifact_db.py \
+    tests/test_provider_directory_artifact_selection_scope_db.py \
+    tests/test_provider_directory_dataset_selection_bounded_db.py \
+    tests/test_provider_directory_dataset_selection_receipt_db.py \
+    tests/test_provider_directory_selection_receipt_backfill_db.py \
+    tests/test_provider_directory_dataset_selection_sealed_db.py \
+    tests/test_provider_directory_admission_seal_backfill_db.py \
+    tests/test_provider_directory_dataset_artifact_cutover_db.py \
+    tests/test_provider_directory_dataset_artifact_concurrency_db.py \
+    tests/test_provider_directory_twin_root_verification_db.py \
+    tests/test_provider_directory_twin_root_storage_db.py \
+    tests/test_provider_directory_artifact_eligibility_db.py \
+    tests/test_provider_directory_artifact_eligibility_contracts_db.py \
+    tests/test_provider_directory_artifact_single_root_eligibility_db.py \
+    tests/test_provider_directory_artifact_eligibility_refresh_db.py \
+    tests/test_provider_directory_artifact_proof_scope_db.py \
+    tests/test_provider_directory_artifact_scope_bulk_load_db.py
+
+  env "${common_env[@]}" timeout --foreground 295s python -m pytest -q \
+    -o asyncio_default_test_loop_scope=session \
+    -o asyncio_default_fixture_loop_scope=session \
+    --durations=20 \
+    tests/test_address_canonical_db.py \
+    tests/test_address_format_db.py \
+    tests/test_address_formatted_serving_db.py \
+    tests/test_address_numeric_grid_alias_db.py \
+    tests/test_address_numeric_grid_alias_fences_db.py \
+    tests/test_address_numeric_grid_alias_lifecycle_db.py \
+    tests/test_address_numeric_grid_alias_materialization_db.py \
+    tests/test_address_numeric_grid_alias_runtime_db.py \
+    tests/test_address_strict_source_backfill_db.py \
+    tests/test_ptg2_serving_address_evidence_postgres.py \
+    tests/test_npi_geo_evidence_search_db.py \
+    tests/test_entity_address_unified_archive_coordinates_db.py \
+    tests/test_npi_phone_evidence_search_db.py \
+    tests/test_npi_provider_directory_role_evidence_db.py \
+    tests/test_provider_directory_dataset_serving_relations_db.py \
+    tests/test_provider_directory_contra_affiliation.py \
+    tests/test_provider_directory_dataset_rehydrate_db.py \
+    tests/test_provider_directory_proof_store_db.py \
+    tests/test_provider_directory_content_proof_keyset_db.py \
+    tests/test_provider_directory_dataset_resource_mutation_fence_db.py \
+    tests/test_provider_directory_semantic_proof_v3_db.py \
+    tests/test_provider_directory_semantic_proof_v3_fences_db.py \
+    tests/test_provider_directory_semantic_candidate_proof_v3_db.py \
+    tests/test_provider_directory_organization_union_v4_db.py \
+    tests/test_provider_directory_organization_candidate_proof_v4_db.py \
+    tests/test_provider_directory_organization_partition_v4_db.py \
+    tests/test_provider_directory_organization_partition_v4_fences_db.py \
+    tests/test_provider_directory_two_phase_publication.py \
+    tests/test_provider_directory_contract_identity_cutover.py \
+    tests/test_provider_directory_retry_cleanup.py \
+    tests/test_provider_directory_artifact_cutover_reconciliation.py \
+    tests/test_provider_directory_retained_campaign_contract.py \
+    tests/test_provider_directory_retained_private_locator_contract.py \
+    tests/test_provider_directory_retained_contract_keys.py \
+    tests/test_provider_directory_retained_private_key_binding.py \
+    tests/test_provider_directory_retained_sealed_contract.py \
+    tests/test_provider_directory_retained_source_neutrality.py \
+    tests/test_provider_directory_retained_blob_store.py \
+    tests/test_provider_directory_retained_reader_postgres.py \
+    tests/test_provider_directory_retained_reader_parallel_postgres.py \
+    tests/test_provider_directory_retained_reader_close_races_postgres.py \
+    tests/test_provider_directory_retained_core_postgres.py \
+    tests/test_provider_directory_retained_core_state_guards.py \
+    tests/test_provider_directory_retained_seal_claim_guards.py \
+    tests/test_provider_directory_retained_binding_guards.py \
+    tests/test_provider_directory_retained_root_ledger_guards.py \
+    tests/test_provider_directory_retained_retry_gc_guards.py \
+    tests/test_provider_directory_retained_key_fence_status.py \
+    tests/test_provider_directory_projection_foundation_postgres.py \
+    tests/test_provider_directory_projection_child_read_postgres.py \
+    tests/test_provider_directory_projection_child_read_cleanup_postgres.py \
+    tests/test_provider_directory_projection_materializer_postgres.py \
+    tests/test_provider_directory_projection_materializer_census_postgres.py \
+    tests/test_provider_directory_projection_decoded_census_migration_postgres.py \
+    tests/test_uhc_organization_evidence_schema.py
+}
+
+run_provider_profile_postgres() {
+  local dsn=$1
+  HLTHPRT_PROVIDER_DIRECTORY_PROFILE_POSTGRES_DSN=$dsn \
+  HLTHPRT_PROVIDER_DIRECTORY_PROFILE_ALLOW_SCHEMA_TESTS=1 \
+    timeout --foreground 295s python -m pytest -q \
+      -o asyncio_default_test_loop_scope=session \
+      -o asyncio_default_fixture_loop_scope=session \
+      --durations=20 \
+      tests/test_provider_directory_profile_affiliations_db.py \
+      tests/test_provider_directory_profile_artifact.py::test_profile_npi_sql_predicate_matches_python_in_postgresql \
+      tests/test_provider_directory_profile_artifact_capacity_postgres.py \
+      tests/test_provider_directory_profile_artifact_postgres.py \
+      tests/test_provider_directory_profile_artifact_recovery_postgres.py \
+      tests/test_provider_directory_profile_capacity_adoption_postgres.py \
+      tests/test_provider_directory_profile_capacity_attestation_postgres.py \
+      tests/test_provider_directory_profile_capacity_attestation_schema.py \
+      tests/test_provider_directory_profile_capacity_preflight_postgres.py \
+      tests/test_provider_directory_profile_capacity_runtime.py \
+      tests/test_provider_directory_profile_delta_db.py \
+      tests/test_provider_directory_profile_delta_downgrade_postgres.py \
+      tests/test_provider_directory_profile_delta_storage_postgres.py \
+      tests/test_provider_directory_profile_replay_postgres.py \
+      tests/test_provider_directory_profile_selection_db.py \
+      tests/test_provider_directory_profile_trust_db.py \
+      tests/test_provider_directory_profile_uhc_flex_postgres.py \
+      tests/test_npi_provider_directory_profile_postgres.py
+}
+
+run_postgres() {
+  local shard=${1:-}
+  case "$shard" in core|provider-directory|provider-profile) ;; *) usage ;; esac
+  if [ "${PREPUSH_DEPS_READY:-0}" = 1 ]; then
+    cargo build --manifest-path support/ptg2_scanner/Cargo.toml
+  else
+    prepare_python_environment
+    install_python_dependencies &
+    local pip_pid=$!
+    cargo build --manifest-path support/ptg2_scanner/Cargo.toml &
+    local cargo_pid=$!
+    wait "$pip_pid"
+    wait "$cargo_pid"
+  fi
+
+  export HLTHPRT_DB_DRIVER=${HLTHPRT_DB_DRIVER:-asyncpg}
+  export HLTHPRT_DB_HOST=${HLTHPRT_DB_HOST:-127.0.0.1}
+  export HLTHPRT_DB_PORT=${HLTHPRT_DB_PORT:-5432}
+  export HLTHPRT_DB_USER=${HLTHPRT_DB_USER:-postgres}
+  export HLTHPRT_DB_PASSWORD=${HLTHPRT_DB_PASSWORD:-postgres}
+  export HLTHPRT_DB_DATABASE=${HLTHPRT_DB_DATABASE:-ptg2_v3_lifecycle_test_ci_runner}
+  export HLTHPRT_DB_SCHEMA=${HLTHPRT_DB_SCHEMA:-mrf}
+  export DB_SCHEMA=${DB_SCHEMA:-mrf}
+  export HLTHPRT_REDIS_ADDRESS=${HLTHPRT_REDIS_ADDRESS:-redis://127.0.0.1:6379}
+  export PYTEST_ADDOPTS=${PYTEST_ADDOPTS:-'--cov-config=test-coverage.ini --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main --cov-branch --cov-report= --cov-append'}
+  export COVERAGE_FILE=${COVERAGE_FILE:-$(artifact_path ".coverage.postgres.${shard}")}
+
+  prepare_postgres
+  local dsn="postgresql://${HLTHPRT_DB_USER}:${HLTHPRT_DB_PASSWORD}@${HLTHPRT_DB_HOST}:${HLTHPRT_DB_PORT}/${HLTHPRT_DB_DATABASE}"
+  case "$shard" in
+    core) run_core_postgres "$dsn" ;;
+    provider-directory) run_provider_directory_postgres "$dsn" ;;
+    provider-profile) run_provider_profile_postgres "$dsn" ;;
+  esac
+
+  require_base_sha
+  timeout --foreground 295s python scripts/coverage_forecast.py write-shard-provenance \
+    --base "$COVERAGE_BASE_SHA" \
+    --kind postgres \
+    --shard "$shard" \
+    --coverage "$COVERAGE_FILE" \
+    --output "$(artifact_path ".coverage-provenance.postgres.${shard}.json")"
+}
+
+assert_candidate_unchanged() {
+  local candidate_sha=$1
+  if [ "$(git rev-parse HEAD)" != "$candidate_sha" ] \
+    || ! git diff --quiet \
+    || ! git diff --cached --quiet \
+    || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+    echo "candidate changed while the pre-push gate was running" >&2
+    exit 1
+  fi
+}
+
+require_margin() {
+  local forecast=$1
+  local report=$2
+  local metric=$3
+  local minimum=$4
+  python3 - "$forecast" "$report" "$metric" "$minimum" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+forecast_path, report, metric, minimum_text = sys.argv[1:]
+payload = json.loads(Path(forecast_path).read_text(encoding="utf-8"))
+margin = payload["reports"][report]["metrics"][metric]["margin"]
+minimum = int(minimum_text)
+if not isinstance(margin, int) or isinstance(margin, bool) or margin < minimum:
+    raise SystemExit(
+        f"{report} {metric} coverage margin is {margin}; pre-push requires at least {minimum}"
+    )
+PY
+}
+
+run_all() {
+  local base_sha=${1:-}
+  if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "all requires an exact 40-character BASE_SHA" >&2
+    usage
+  fi
+  git cat-file -e "${base_sha}^{commit}"
+  command -v docker >/dev/null
+
+  local candidate_sha
+  candidate_sha=$(git rev-parse HEAD)
+  if ! git diff --quiet || ! git diff --cached --quiet \
+    || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+    echo "all requires a clean, committed candidate" >&2
+    exit 2
+  fi
+  if ! git merge-base --is-ancestor "$base_sha" "$candidate_sha"; then
+    echo "BASE_SHA must be an ancestor of the candidate" >&2
+    exit 2
+  fi
+
+  local suffix=${BASHPID:-$$}
+  network="healthcare-prepush-${suffix}"
+  postgres_container="healthcare-prepush-postgres-${suffix}"
+  redis_container="healthcare-prepush-redis-${suffix}"
+  local container_image="healthcare-mrf-api:prepush-${candidate_sha:0:12}-${suffix}"
+  artifacts=${PREPUSH_RECEIPT_DIR:-}
+  local git_common_dir
+  local python_lock_input_sha256
+  local python_lock_sha256
+  local readability_zero_growth_approved=${READABILITY_ZERO_GROWTH_APPROVED:-false}
+  python_lock_input_sha256=$(sha256sum requirements-ci.in | awk '{print $1}')
+  python_lock_sha256=$(sha256sum requirements-ci.lock | awk '{print $1}')
+  if [ -z "$artifacts" ]; then
+    artifacts=$(mktemp -d "${TMPDIR:-/tmp}/healthcare-prepush-receipt.XXXXXX")
+  else
+    mkdir -p "$artifacts"
+    artifacts=$(cd "$artifacts" && pwd)
+    if [[ "$artifacts/" == "$repository_root/"* ]]; then
+      echo "PREPUSH_RECEIPT_DIR must be outside the repository" >&2
+      exit 2
+    fi
+    if [ -n "$(find "$artifacts" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+      echo "PREPUSH_RECEIPT_DIR must be empty" >&2
+      exit 2
+    fi
+  fi
+  git_common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
+  printf 'pre-push receipt: %s\n' "$artifacts"
+  cat > "$artifacts/receipt.txt" <<EOF
+status=running
+candidate_sha=$candidate_sha
+base_sha=$base_sha
+arc_image=$arc_image
+postgres_image=$postgres_image
+redis_image=$redis_image
+semgrep_image=$semgrep_image
+container_image_tag=$container_image
+container_rust_image=$container_rust_image
+container_python_image=$container_python_image
+python_version=3.14.6
+python_lock_input_sha256=$python_lock_input_sha256
+python_lock_sha256=$python_lock_sha256
+pip_version=26.1.2
+rust_toolchain=1.97.1
+cargo_llvm_cov_version=0.8.7
+cargo_audit_version=0.22.2
+pip_audit_version=2.10.1
+python_coverage_version=7.15.4
+python_line_margin_minimum=5
+python_branch_margin_minimum=5
+rust_function_margin_minimum=2
+readability_zero_growth_approved=$readability_zero_growth_approved
+command=scripts/ci/prepush all $base_sha
+EOF
+  cleanup_all() {
+    local cleanup_status=$?
+    docker rm --force "$postgres_container" "$redis_container" >/dev/null 2>&1 || true
+    docker network rm "$network" >/dev/null 2>&1 || true
+    if [ "$cleanup_status" -ne 0 ]; then
+      printf 'status=failed\n' >> "$artifacts/receipt.txt"
+    fi
+    return "$cleanup_status"
+  }
+  trap cleanup_all EXIT
+
+  if [ "$(docker info --format '{{.OSType}}/{{.Architecture}}')" != linux/x86_64 ]; then
+    echo "all requires a native Linux/amd64 Docker engine; emulation is not accepted" >&2
+    exit 2
+  fi
+
+  docker network create "$network" >/dev/null
+  docker run --detach --rm --platform linux/amd64 \
+    --name "$postgres_container" \
+    --network "$network" \
+    --network-alias postgres \
+    --env POSTGRES_PASSWORD=postgres \
+    --env POSTGRES_DB=ptg2_v3_lifecycle_test_ci_runner \
+    "$postgres_image" >/dev/null
+  docker run --detach --rm --platform linux/amd64 \
+    --name "$redis_container" \
+    --network "$network" \
+    --network-alias redis \
+    "$redis_image" >/dev/null
+
+  local ready=0
+  local attempt
+  for attempt in {1..60}; do
+    if docker exec "$postgres_container" \
+      pg_isready -U postgres -d ptg2_v3_lifecycle_test_ci_runner >/dev/null 2>&1 \
+      && docker exec "$redis_container" redis-cli ping 2>/dev/null | grep -qx PONG; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$ready" != 1 ]; then
+    echo "pinned PostgreSQL and Redis services did not become ready" >&2
+    exit 1
+  fi
+
+  docker run --rm --platform linux/amd64 \
+    --user "$(id -u):$(id -g)" \
+    --network "$network" \
+    --volume "$repository_root:/workspace" \
+    --volume "$git_common_dir:$git_common_dir" \
+    --volume "$artifacts:/artifacts" \
+    --workdir /workspace \
+    --env COVERAGE_BASE_SHA="$base_sha" \
+    --env BASE_SHA="$base_sha" \
+    --env GITHUB_EVENT_NAME=push \
+    --env GITHUB_SHA="$candidate_sha" \
+    --env PREPUSH_ARTIFACT_ROOT=/artifacts \
+    --env PREPUSH_MAIN_ARTIFACTS=/artifacts/coverage-data/main \
+    --env PREPUSH_CAPACITY_ARTIFACTS=/artifacts/coverage-data/capacity \
+    --env PREPUSH_POSTGRES_ARTIFACTS=/artifacts/coverage-data/postgres \
+    --env PREPUSH_PIP_REPORT=/artifacts/python-lock-install-report.json \
+    --env READABILITY_ZERO_GROWTH_APPROVED="$readability_zero_growth_approved" \
+    "$arc_image" \
+    bash -lc '
+      set -euo pipefail
+      export HOME=/artifacts/home
+      export CARGO_HOME=/tmp/cargo
+      export RUSTUP_HOME=/tmp/rustup
+      export PATH=/tmp/venv/bin:/tmp/cargo/bin:/usr/local/cargo/bin:$PATH
+      mkdir -p "$HOME" "$CARGO_HOME" "$RUSTUP_HOME" /artifacts/coverage-data/{main,capacity,postgres}
+      cp -R /usr/local/rustup/. "$RUSTUP_HOME/"
+      python -m venv /tmp/venv
+      scripts/ci/install_python_lock
+      python -m pip freeze --all > /artifacts/python-locked-versions.txt
+      rustup component add rustfmt clippy llvm-tools-preview
+      git config --global --add safe.directory /workspace
+      export PREPUSH_DEPS_READY=1
+
+      gate() {
+        local name=$1
+        shift
+        scripts/ci/prepush "$@"
+        if [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ] \
+          || ! git diff --quiet \
+          || ! git diff --cached --quiet \
+          || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+          echo "candidate changed during gate: $name" >&2
+          exit 1
+        fi
+        printf "gate=%s passed\n" "$name" >> /artifacts/receipt.txt
+      }
+
+      gate hygiene hygiene
+      gate quality quality
+      for shard in 0 1 2 3; do
+        gate "python-main-$shard" python-main "$shard"
+        cp "/artifacts/.coverage.main.${shard}" "/artifacts/.coverage-provenance.main.${shard}.json" /artifacts/coverage-data/main/
+      done
+      gate capacity capacity
+      cp /artifacts/.coverage.capacity /artifacts/.coverage-provenance.capacity.json /artifacts/coverage-data/capacity/
+      gate api-contract api-contract
+      HLTHPRT_REDIS_ADDRESS=redis://redis:6379 gate redis redis
+      PREPUSH_SKIP_SEMGREP=1 gate security-audit security
+      for shard in core provider-directory provider-profile; do
+        PGPASSWORD=postgres dropdb --if-exists --host postgres --port 5432 --username postgres ptg2_v3_lifecycle_test_ci_runner
+        PGPASSWORD=postgres createdb --host postgres --port 5432 --username postgres ptg2_v3_lifecycle_test_ci_runner
+        HLTHPRT_DB_DRIVER=asyncpg \
+        HLTHPRT_DB_HOST=postgres \
+        HLTHPRT_DB_PORT=5432 \
+        HLTHPRT_DB_USER=postgres \
+        HLTHPRT_DB_PASSWORD=postgres \
+        HLTHPRT_DB_DATABASE=ptg2_v3_lifecycle_test_ci_runner \
+        HLTHPRT_DB_SCHEMA=mrf \
+        DB_SCHEMA=mrf \
+        HLTHPRT_REDIS_ADDRESS=redis://127.0.0.1:6379 \
+          gate "postgres-$shard" postgres "$shard"
+        cp "/artifacts/.coverage.postgres.${shard}" "/artifacts/.coverage-provenance.postgres.${shard}.json" /artifacts/coverage-data/postgres/
+      done
+      gate python-coverage python-coverage
+      gate rust rust
+      {
+        python --version
+        python -m pip --version
+        python -c '"'"'import platform, sys; print(f"python_cache_tag={sys.implementation.cache_tag}"); print(f"platform={platform.platform()}"); print(f"machine={platform.machine()}"); print(f"libc={platform.libc_ver()}")'"'"'
+        cargo --version
+        rustc --version
+        cargo llvm-cov --version
+        cargo audit --version
+        psql --version
+        python -m coverage --version
+        pip-audit --version
+        PGPASSWORD=postgres psql --host postgres --port 5432 --username postgres --dbname ptg2_v3_lifecycle_test_ci_runner --tuples-only --no-align --command "show server_version"
+        PGPASSWORD=postgres psql --host postgres --port 5432 --username postgres --dbname ptg2_v3_lifecycle_test_ci_runner --tuples-only --no-align --command "select postgis_full_version()"
+        python - <<PY
+import asyncio
+from redis.asyncio import Redis
+
+
+async def main() -> None:
+    redis = Redis.from_url("redis://redis:6379", decode_responses=True)
+    info = await redis.info(section="server")
+    print("redis " + info["redis_version"])
+    await redis.aclose()
+
+
+asyncio.run(main())
+PY
+      } > /artifacts/tool-versions.txt
+      sha256sum requirements.txt requirements-dev.txt requirements-ci.in requirements-ci.lock scripts/ci/install_python_lock support/ptg2_scanner/Cargo.lock test-coverage-baseline.json > /artifacts/input-sha256.txt
+    '
+
+  require_margin "$artifacts/test-coverage-forecast-python.json" python lines 5
+  require_margin "$artifacts/test-coverage-forecast-python.json" python branches 5
+  require_margin "$artifacts/test-coverage-forecast-rust.json" rust functions 2
+  PREPUSH_SKIP_AUDIT=1 GITHUB_EVENT_NAME=push GITHUB_SHA="$candidate_sha" run_security
+  assert_candidate_unchanged "$candidate_sha"
+  printf 'gate=security-semgrep passed\n' >> "$artifacts/receipt.txt"
+  PREPUSH_CONTAINER_IMAGE="$container_image" GITHUB_SHA="$candidate_sha" run_container_package
+  assert_candidate_unchanged "$candidate_sha"
+  printf 'gate=container-package passed\n' >> "$artifacts/receipt.txt"
+  local container_image_id
+  container_image_id=$(docker image inspect --format '{{.Id}}' "$container_image")
+  printf '%s\n' "$container_image_id" > "$artifacts/container-image-id.txt"
+  docker version > "$artifacts/docker-version.txt"
+  cat >> "$artifacts/receipt.txt" <<EOF
+status=passed
+completed_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+python_forecast=$artifacts/test-coverage-forecast-python.json
+rust_forecast=$artifacts/test-coverage-forecast-rust.json
+python_locked_versions=$artifacts/python-locked-versions.txt
+python_locked_versions_sha256=$(sha256sum "$artifacts/python-locked-versions.txt" | awk '{print $1}')
+python_install_report=$artifacts/python-lock-install-report.json
+python_install_report_sha256=$(sha256sum "$artifacts/python-lock-install-report.json" | awk '{print $1}')
+ptg2_wheel_evidence=$artifacts/ptg2-address-canon-wheel.sha256
+ptg2_wheel_sha256=$(awk '{print $1}' "$artifacts/ptg2-address-canon-wheel.sha256")
+container_image_id=$container_image_id
+container_image_id_evidence=$artifacts/container-image-id.txt
+EOF
+  cleanup_all
+  trap - EXIT
+}
+
+case "${1:-}" in
+  all) [ "$#" -eq 2 ] || usage; run_all "$2" ;;
+  hygiene) [ "$#" -eq 1 ] || usage; run_hygiene ;;
+  quality) [ "$#" -eq 1 ] || usage; run_quality ;;
+  python-main) [ "$#" -eq 2 ] || usage; run_python_main "$2" ;;
+  capacity) [ "$#" -eq 1 ] || usage; run_capacity ;;
+  python-coverage) [ "$#" -eq 1 ] || usage; run_python_coverage ;;
+  api-contract) [ "$#" -eq 1 ] || usage; run_api_contract ;;
+  rust) [ "$#" -eq 1 ] || usage; run_rust ;;
+  container-package) [ "$#" -eq 1 ] || usage; run_container_package ;;
+  security) [ "$#" -eq 1 ] || usage; run_security ;;
+  redis) [ "$#" -eq 1 ] || usage; run_redis ;;
+  postgres) [ "$#" -eq 2 ] || usage; run_postgres "$2" ;;
+  *) usage ;;
 esac

@@ -66,14 +66,14 @@ def test_snapshot_model_declares_the_attempt_run_index() -> None:
 
 
 def test_ci_runs_attempt_and_legacy_guard_postgres_tests() -> None:
-    workflow_text = (
-        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+    prepush_text = (
+        Path(__file__).resolve().parents[1] / "scripts" / "ci" / "prepush"
     ).read_text()
-    packed_v4_gate = workflow_text.split(
-        "- name: Run packed PTG V4 PostgreSQL publication gate",
+    packed_v4_gate = prepush_text.split(
+        "HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST=1",
         maxsplit=1,
     )[1].split(
-        "- name: Run strict shared PTG PostgreSQL GC and removal tests",
+        "HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1",
         maxsplit=1,
     )[0]
     assert "tests/test_ptg2_v4_attempt_stage_regression_postgres.py" in (
@@ -107,14 +107,14 @@ def test_ci_runs_attempt_and_legacy_guard_postgres_tests() -> None:
 
 
 def test_ci_runs_split_shared_gc_postgres_tests() -> None:
-    workflow_text = (
-        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+    prepush_text = (
+        Path(__file__).resolve().parents[1] / "scripts" / "ci" / "prepush"
     ).read_text()
-    shared_gc_gate = workflow_text.split(
-        "- name: Run strict shared PTG PostgreSQL GC and removal tests",
+    shared_gc_gate = prepush_text.split(
+        "HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1",
         maxsplit=1,
     )[1].split(
-        "- name: Run strict shared PTG PostgreSQL cross-plan reuse tests",
+        "HLTHPRT_PTG2_CROSS_PLAN_POSTGRES_TEST=1",
         maxsplit=1,
     )[0]
     assert "tests/test_ptg2_shared_gc_postgres.py" in shared_gc_gate

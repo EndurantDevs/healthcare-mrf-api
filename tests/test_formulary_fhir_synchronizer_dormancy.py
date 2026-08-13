@@ -120,13 +120,13 @@ def test_synthetic_canary_is_absent_from_all_runtime_entrypoints():
 
 
 def test_synthetic_canary_postgres_proof_and_fixtures_are_packaged():
-    workflow_source = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+    prepush_source = (ROOT / "scripts" / "ci" / "prepush").read_text(
         encoding="utf-8"
     )
     dockerfile_source = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     fixture_directory = ROOT / "scripts" / "smoke" / "fixtures" / "formulary_fhir"
 
-    assert "tests/test_formulary_fhir_synthetic_canary_postgres.py" in workflow_source
+    assert "tests/test_formulary_fhir_synthetic_canary_postgres.py" in prepush_source
     assert "COPY scripts/ /opt/scripts/" in dockerfile_source
     assert (fixture_directory / "coverage_plan.json").is_file()
     assert (fixture_directory / "medication_a.json").is_file()
@@ -186,13 +186,13 @@ def test_synthetic_seed_publisher_has_no_runtime_or_deployment_reachability():
             not in runtime_source
         )
 
-    workflow_source = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+    prepush_source = (ROOT / "scripts" / "ci" / "prepush").read_text(
         encoding="utf-8"
     )
     dockerfile_source = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert (
         "tests/test_formulary_fhir_synthetic_seed_publisher_postgres.py"
-        in workflow_source
+        in prepush_source
     )
     assert "COPY process/ /opt/process/" in dockerfile_source
     assert "COPY scripts/ /opt/scripts/" in dockerfile_source
@@ -242,7 +242,7 @@ def test_reviewed_operator_modules_are_separated_and_dormant():
 
 def test_reviewed_operator_library_and_script_paths_are_packaged():
     dockerfile_source = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    workflow_source = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+    prepush_source = (ROOT / "scripts" / "ci" / "prepush").read_text(
         encoding="utf-8"
     )
     operator_script = (
@@ -255,9 +255,9 @@ def test_reviewed_operator_library_and_script_paths_are_packaged():
     assert operator_script.is_file()
     assert "COPY process/ /opt/process/" in dockerfile_source
     assert "COPY scripts/ /opt/scripts/" in dockerfile_source
-    assert str(operator_script.relative_to(ROOT)) in workflow_source
+    assert str(operator_script.relative_to(ROOT)) in prepush_source
     assert "tests/test_formulary_fhir_reviewed_operator_postgres.py" in (
-        workflow_source
+        prepush_source
     )
 
 
@@ -335,7 +335,7 @@ def test_uhc_operator_library_and_script_are_packaged_and_gated_in_ci():
     """The image contains the one-shot operator and proves it disabled."""
 
     dockerfile_source = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    workflow_source = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+    prepush_source = (ROOT / "scripts" / "ci" / "prepush").read_text(
         encoding="utf-8"
     )
     operator_script = ROOT / "scripts" / "smoke" / "uhc_formulary_operator.py"
@@ -343,6 +343,6 @@ def test_uhc_operator_library_and_script_are_packaged_and_gated_in_ci():
     assert operator_script.is_file()
     assert "COPY process/ /opt/process/" in dockerfile_source
     assert "COPY scripts/ /opt/scripts/" in dockerfile_source
-    assert str(operator_script.relative_to(ROOT)) in workflow_source
-    assert "HLTHPRT_UHC_FORMULARY_ACQUISITION_ENABLED" in workflow_source
-    assert "HLTHPRT_UHC_FORMULARY_PUBLICATION_ENABLED" in workflow_source
+    assert str(operator_script.relative_to(ROOT)) in prepush_source
+    assert "HLTHPRT_UHC_FORMULARY_ACQUISITION_ENABLED" in prepush_source
+    assert "HLTHPRT_UHC_FORMULARY_PUBLICATION_ENABLED" in prepush_source

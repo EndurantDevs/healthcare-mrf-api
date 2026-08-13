@@ -80,13 +80,13 @@ def test_operator_is_packaged_and_absent_from_ordinary_runtime_paths():
             assert forbidden_runtime_name not in runtime_source
 
     dockerfile_source = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    workflow_source = (ROOT / ".github/workflows/ci.yml").read_text(
+    prepush_source = (ROOT / "scripts/ci/prepush").read_text(
         encoding="utf-8"
     )
     assert "COPY process/ /opt/process/" in dockerfile_source
     assert "COPY scripts/ /opt/scripts/" in dockerfile_source
     assert "COPY specs/ /opt/specs/" in dockerfile_source
-    assert str(SCRIPT_PATH.relative_to(ROOT)) in workflow_source
+    assert str(SCRIPT_PATH.relative_to(ROOT)) in prepush_source
 
 
 def test_runbook_binds_neutral_review_and_separate_publication():
