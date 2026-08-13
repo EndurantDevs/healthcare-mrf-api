@@ -82,14 +82,14 @@ def test_cli_collects_and_assigns_each_temporary_test_once(tmp_path: Path) -> No
 
 
 def _assert_single_lifecycle_test(
-    workflow: str,
+    prepush: str,
     lifecycle_step: str,
     test_path: str,
 ) -> None:
     """Require one owned PostgreSQL test path in the lifecycle command."""
 
     assert test_path in lifecycle_step
-    assert workflow.count(test_path) == 1
+    assert prepush.count(test_path) == 1
 
 
 def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> None:
@@ -98,10 +98,13 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
     workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
     )
+    prepush = (REPOSITORY_ROOT / "scripts" / "ci" / "prepush").read_text(
+        encoding="utf-8"
+    )
 
     assert "shard-index: [0, 1, 2, 3]" in workflow
-    assert "--shard-count 4" in workflow
-    assert "scripts/ci/shard_pytest_nodeids.py" in workflow
+    assert "--shard-count 4" in prepush
+    assert "scripts/ci/shard_pytest_nodeids.py" in prepush
     assert "mrf-python-coverage-main-${{ matrix.shard-index }}" in workflow
     assert "pattern: mrf-python-coverage-main-*" in workflow
     assert (
@@ -112,19 +115,17 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
     ) in workflow
     assert "mrf-python-coverage-postgres-${{ matrix.shard }}" in workflow
     assert "pattern: mrf-python-coverage-postgres-*" in workflow
-    assert "if: matrix.shard == 'core'" in workflow
-    assert "if: matrix.shard == 'provider-directory'" in workflow
-    assert "python -m pytest -q -n 1 --dist loadscope" in workflow
+    assert 'scripts/ci/prepush postgres "${{ matrix.shard }}"' in workflow
+    assert "python -m pytest -q -n 1 --dist loadscope" in prepush
     assert (
         "cargo build --locked --bins --manifest-path "
         "support/ptg2_scanner/Cargo.toml &"
-    ) in workflow
-    assert "timeout --foreground 295s python -m pytest" in workflow
-    assert "timeout --foreground 295s cargo llvm-cov" in workflow
-    lifecycle_step = workflow.split(
-        "      - name: Run TIN-to-NPI connector PostgreSQL lifecycle gate\n",
-        1,
-    )[1].split("      - name:", 1)[0]
+    ) in prepush
+    assert "timeout --foreground 295s python -m pytest" in prepush
+    assert "timeout --foreground 295s cargo llvm-cov" in prepush
+    lifecycle_step = prepush.split("run_provider_directory_postgres() {", 1)[1].split(
+        "run_provider_profile_postgres() {", 1
+    )[0]
     assert "timeout --foreground 295s python -m pytest -q" in lifecycle_step
     assert "tests/test_tin_npi_connector_postgres.py" in lifecycle_step
     assert (
@@ -138,14 +139,14 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
         "tests/test_provider_directory_terminal_root_retirement_v2_topology_postgres.py",
         "tests/test_provider_directory_reviewed_subset_terminal_window_postgres.py",
     ):
-        _assert_single_lifecycle_test(workflow, lifecycle_step, test_path)
-    bounded_selection_step = workflow.split("      - name: Run bounded Provider Directory selection DB tests\n", 1)[1].split("      - name:", 1)[0]
+        _assert_single_lifecycle_test(prepush, lifecycle_step, test_path)
+    bounded_selection_step = lifecycle_step
     _assert_single_lifecycle_test(
-        workflow,
+        prepush,
         bounded_selection_step,
         "tests/test_provider_directory_dataset_selection_sealed_db.py",
     )
-    for workflow_line in workflow.splitlines():
+    for workflow_line in prepush.splitlines():
         if (
             "python -m pytest" in workflow_line
             or "cargo llvm-cov --manifest-path" in workflow_line
@@ -157,6 +158,9 @@ def test_provider_directory_enrichment_postgres_proofs_run_exactly_once() -> Non
     """Keep the lifecycle and Profile database proofs in their owned shards."""
 
     workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    prepush = (REPOSITORY_ROOT / "scripts" / "ci" / "prepush").read_text(
         encoding="utf-8"
     )
     lifecycle_tests = (
@@ -175,21 +179,18 @@ def test_provider_directory_enrichment_postgres_proofs_run_exactly_once() -> Non
         "tests/test_provider_directory_profile_capacity_adoption_postgres.py",
         "tests/test_provider_directory_profile_uhc_flex_postgres.py",
     )
-    lifecycle_step = workflow.split(
-        "      - name: Run exact Provider Directory enrichment PostgreSQL "
-        "lifecycle gate\n",
-        1,
-    )[1].split("      - name:", 1)[0]
-    profile_step = workflow.split(
-        "      - name: Run bounded Provider Directory Profile PostgreSQL gates\n",
-        1,
-    )[1].split("      - name:", 1)[0]
+    lifecycle_step = prepush.split("run_provider_directory_postgres() {", 1)[1].split(
+        "run_provider_profile_postgres() {", 1
+    )[0]
+    profile_step = prepush.split("run_provider_profile_postgres() {", 1)[1].split(
+        "run_postgres() {", 1
+    )[0]
 
-    assert "if: matrix.shard == 'provider-directory'" in lifecycle_step
-    assert "HLTHPRT_FHIR_FORMULARY_MIGRATION_POSTGRES_DSN:" in lifecycle_step
-    assert "if: matrix.shard == 'provider-profile'" in profile_step
+    assert 'scripts/ci/prepush postgres "${{ matrix.shard }}"' in workflow
+    assert "HLTHPRT_FHIR_FORMULARY_MIGRATION_POSTGRES_DSN=$dsn" in lifecycle_step
+    assert "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_POSTGRES_DSN=$dsn" in profile_step
     for test_path in (*lifecycle_tests, *profile_tests):
-        assert workflow.count(test_path) == 1
+        assert prepush.count(test_path) == 1
     for test_path in lifecycle_tests:
         assert test_path in lifecycle_step
     for test_path in profile_tests:
@@ -197,13 +198,10 @@ def test_provider_directory_enrichment_postgres_proofs_run_exactly_once() -> Non
 
 
 def test_container_proves_rooted_graph_operator_is_packaged_and_dormant() -> None:
-    workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+    prepush = (REPOSITORY_ROOT / "scripts" / "ci" / "prepush").read_text(
         encoding="utf-8"
     )
-    operator_step = workflow.split(
-        "      - name: Prove rooted Provider graph operator is packaged and dormant\n",
-        1,
-    )[1].split("      - name:", 1)[0]
+    operator_step = prepush.split("run_container_package() {", 1)[1]
 
     assert "/opt/scripts/smoke/provider_directory_rooted_graph_operator.py" in (
         operator_step
@@ -221,13 +219,10 @@ def test_container_proves_rooted_graph_operator_is_packaged_and_dormant() -> Non
 
 
 def test_container_proves_exact_cohort_operator_is_packaged_and_dormant() -> None:
-    workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+    prepush = (REPOSITORY_ROOT / "scripts" / "ci" / "prepush").read_text(
         encoding="utf-8"
     )
-    operator_step = workflow.split(
-        "      - name: Prove exact-cohort Provider operator is packaged and dormant\n",
-        1,
-    )[1].split("      - name:", 1)[0]
+    operator_step = prepush.split("run_container_package() {", 1)[1]
 
     assert "/opt/scripts/smoke/uhc_flex_practitioner_operator.py" in operator_step
     assert "HLTHPRT_UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ACQUISITION_ENABLED" in (
