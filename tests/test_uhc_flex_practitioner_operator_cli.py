@@ -281,17 +281,14 @@ def test_historical_publication_prints_only_the_sanitized_receipt(
     ("raised_error", "expected_code", "expected_exit"),
     [
         (TimeoutError("private timeout"), "timeout", 1),
+        (operation.UHCFlexPractitionerOperatorError("root_retryable"), "root_retryable", 75),
         (RuntimeError("private token=secret"), "failed", 1),
         (asyncio.CancelledError(signal.SIGINT), "canceled", 130),
         (asyncio.CancelledError(signal.SIGTERM), "canceled", 143),
     ],
 )
 def test_failures_are_sanitized(
-    monkeypatch,
-    capsys,
-    raised_error,
-    expected_code,
-    expected_exit,
+    monkeypatch, capsys, raised_error, expected_code, expected_exit
 ) -> None:
     script_module = _script_module()
 

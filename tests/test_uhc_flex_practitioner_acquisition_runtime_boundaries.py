@@ -13,6 +13,7 @@ import pytest
 from process import uhc_flex_practitioner_acquisition as acquisition
 from process import uhc_flex_practitioner_acquisition_runtime as runtime
 from process.uhc_flex_practitioner_store import (
+    UHCFlexPractitionerStoreError,
     UHCFlexPractitionerWorkClaim,
 )
 from process.uhc_flex_practitioner_transport import (
@@ -207,6 +208,32 @@ async def test_runner_cancellation_releases_claim_and_retry_claim():
 
 
 @pytest.mark.asyncio
+async def test_retry_claim_cancellation_after_claim_releases_exact_lease():
+    runner, harness, _context = await _runner_fixture()
+    exit_entered = asyncio.Event()
+
+    class CancelableLockExit:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_error):
+            exit_entered.set()
+            await asyncio.Future()
+
+    runner._claim_lock = CancelableLockExit()
+    runner._delayed_retry_count = 1
+    runner._no_delayed_retries.clear()
+    claim_task = asyncio.create_task(runner.claim_retry(1000000004, 0.0))
+    await exit_entered.wait()
+    claim_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await claim_task
+    assert not harness.active
+    assert harness.pending[runner.identity.acquisition_id] == [1000000004]
+
+
+@pytest.mark.asyncio
 async def test_runner_terminal_and_result_cancellation_release_claims():
     for operation_name in ("complete_error", "complete_result"):
         runner, harness, _context = await _runner_fixture()
@@ -238,7 +265,7 @@ async def test_runner_terminal_and_result_cancellation_release_claims():
 
 
 @pytest.mark.asyncio
-async def test_claim_beyond_attempt_bound_is_terminal_and_unsealable():
+async def test_persisted_attempt_count_does_not_exhaust_new_invocation():
     runner, harness, _context = await _runner_fixture(max_attempts=1)
     claim = await harness.claim_work(
         runner.identity.acquisition_id,
@@ -247,9 +274,51 @@ async def test_claim_beyond_attempt_bound_is_terminal_and_unsealable():
     )
     claim = _mutated(claim, attempt=2)
     harness.active[(claim.acquisition_id, claim.requested_npi)] = claim
-    with pytest.raises(acquisition.UHCFlexPractitionerAcquisitionError) as error_info:
+    async with harness.session_scope(1) as session:
+        assert await runner.process_claim(session, claim) is None
+    assert set(harness.terminal[claim.acquisition_id]) == {claim.requested_npi}
+
+
+@pytest.mark.asyncio
+async def test_final_retryable_lease_is_pending_or_expired_reclaimable():
+    runner, harness, _context = await _runner_fixture(max_attempts=1)
+    claim = await harness.claim_work(
+        runner.identity.acquisition_id,
+        lease_seconds=runner.config.lease_seconds,
+        database=harness.database,
+    )
+
+    async def retryable_failure(*_args, **_kwargs):
+        raise UHCFlexPractitionerTransportError(
+            "transport_timeout",
+            retryable=True,
+        )
+
+    async def expired_release(*_args, **_kwargs):
+        raise UHCFlexPractitionerStoreError("lease_lost")
+
+    runner.dependencies = replace(
+        runner.dependencies,
+        fetch=retryable_failure,
+        release_work=expired_release,
+    )
+    with pytest.raises(acquisition.UHCFlexPractitionerAcquisitionError) as caught:
         await runner.process_claim(object(), claim)
-    assert error_info.value.code == "root_unsealable"
+
+    assert caught.value.code == "root_retryable"
+    claim_key = (claim.acquisition_id, claim.requested_npi)
+    assert harness.active[claim_key] == claim
+    harness.active.pop(claim_key)
+    harness.pending[claim.acquisition_id].append(claim.requested_npi)
+    reclaimed = await harness.claim_work(
+        claim.acquisition_id,
+        requested_npi=claim.requested_npi,
+        lease_seconds=runner.config.lease_seconds,
+        database=harness.database,
+    )
+    assert reclaimed is not None
+    assert reclaimed.attempt == claim.attempt + 1
+    assert reclaimed.lease_token != claim.lease_token
 
 
 @pytest.mark.asyncio

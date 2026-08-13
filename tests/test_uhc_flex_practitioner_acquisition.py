@@ -225,20 +225,98 @@ async def test_transient_failure_releases_before_bounded_retry_after_sleep():
 
 
 @pytest.mark.asyncio
-async def test_nonretryable_and_exhausted_transport_failures_are_terminal_safe():
+async def test_final_retryable_failure_releases_and_same_key_resumes():
+    harness = AcquisitionHarness()
+    for call_number in (1, 2):
+        harness.fetch_failures[("baseline", MEMBER_NPIS[1], call_number)] = (
+            UHCFlexPractitionerTransportError(
+                "transport_timeout",
+                retryable=True,
+            )
+        )
+
+    with pytest.raises(
+        acquisition.UHCFlexPractitionerAcquisitionError
+    ) as error_info:
+        await acquire_with_harness(
+            harness,
+            config=enabled_config(concurrency=1, max_attempts=2),
+        )
+
+    baseline_id = next(iter(harness.identities))
+    assert error_info.value.code == "root_retryable"
+    assert harness.pending[baseline_id] == [MEMBER_NPIS[1]]
+    assert not harness.active
+    assert set(harness.terminal[baseline_id]) == {MEMBER_NPIS[0]}
+    assert harness.fetch_calls[("baseline", MEMBER_NPIS[0])] == 1
+    assert harness.attempts[(baseline_id, MEMBER_NPIS[1])] == 2
+
+    harness.session_serial = 0
+    receipt = await acquire_with_harness(
+        harness,
+        config=enabled_config(concurrency=1, max_attempts=2),
+    )
+
+    assert receipt.baseline.matched_count == 1
+    assert harness.fetch_calls[("baseline", MEMBER_NPIS[0])] == 1
+    assert harness.attempts[(baseline_id, MEMBER_NPIS[1])] == 3
+
+
+@pytest.mark.asyncio
+async def test_final_retryable_cancels_sibling_leases_and_same_key_resumes():
+    harness = AcquisitionHarness()
+    sibling_fetch_entered = asyncio.Event()
+
+    async def fail_or_block(_session, requested_npi):
+        if requested_npi == MEMBER_NPIS[0]:
+            sibling_fetch_entered.set()
+            await asyncio.Future()
+        await sibling_fetch_entered.wait()
+        raise UHCFlexPractitionerTransportError(
+            "transport_timeout",
+            retryable=True,
+        )
+
+    with pytest.raises(
+        acquisition.UHCFlexPractitionerAcquisitionError
+    ) as error_info:
+        await acquisition.acquire_uhc_flex_practitioner_twins(
+            operation_key=OPERATION_KEY,
+            semantic_projection_as_of=PROJECTION_DATE,
+            config=enabled_config(concurrency=2, max_attempts=1),
+            database=harness.database,
+            dependencies=replace(harness.dependencies(), fetch=fail_or_block),
+        )
+
+    baseline_id = next(
+        identity.acquisition_id
+        for identity in harness.identities.values()
+        if identity.acquisition_role == "baseline"
+    )
+    assert error_info.value.code == "root_retryable"
+    assert harness.pending[baseline_id] == list(harness.npis)
+    assert not harness.active
+    assert not harness.terminal[baseline_id]
+    assert not any(event.startswith("error:") for event in harness.events)
+
+    harness.session_serial = 0
+    receipt = await acquire_with_harness(
+        harness,
+        config=enabled_config(concurrency=2, max_attempts=1),
+    )
+    assert receipt.expected_npi_count == len(harness.npis)
+    assert all(
+        harness.attempts[(baseline_id, npi)] == 2 for npi in harness.npis
+    )
+
+
+@pytest.mark.asyncio
+async def test_nonretryable_transport_failures_are_terminal_safe():
     for planned_error, expected_code, max_attempts in (
         (
             UHCFlexPractitionerTransportError("http_terminal"),
             "http_terminal",
             3,
-        ),
-        (
-            UHCFlexPractitionerTransportError(
-                "transport_timeout",
-                retryable=True,
-            ),
-            "retry_exhausted",
-            1,
         ),
         (
             UHCFlexPractitionerTransportError("response_validation", validation_code="cross_npi"),
