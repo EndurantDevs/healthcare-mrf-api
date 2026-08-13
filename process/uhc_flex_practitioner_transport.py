@@ -28,6 +28,7 @@ from process.uhc_flex_practitioner_contract import (
 from process.uhc_flex_practitioner_query import (
     UHCFlexPractitionerQueryError,
     UHCFlexPractitionerQueryResult,
+    classify_uhc_flex_practitioner_exception,
     classify_uhc_flex_practitioner_http_status,
     uhc_flex_practitioner_query_url,
     validate_uhc_flex_practitioner_search_bundle,
@@ -482,13 +483,13 @@ async def fetch_uhc_flex_practitioner(
     except UHCFlexPractitionerQueryError as error:
         raise UHCFlexPractitionerTransportError(
             "response_validation",
+            retryable=classify_uhc_flex_practitioner_exception(error).is_retryable,
             validation_code=error.code,
         ) from None
     except _TransportCallbackError:
         raise UHCFlexPractitionerTransportError("callback_failed") from None
     except (aiohttp.ClientPayloadError, aiohttp.ServerDisconnectedError, EOFError):
-        raise UHCFlexPractitionerTransportError(
-            "payload_truncated", retryable=True) from None
+        raise UHCFlexPractitionerTransportError("payload_truncated", retryable=True) from None
     except (asyncio.TimeoutError, TimeoutError):
         raise UHCFlexPractitionerTransportError(
             "transport_timeout", retryable=True) from None

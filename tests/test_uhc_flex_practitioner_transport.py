@@ -384,6 +384,21 @@ async def test_bundle_validation_failure_is_terminal_and_retains_no_npi():
 
 
 @pytest.mark.asyncio
+async def test_bundle_total_mismatch_is_retryable_and_retains_no_payload():
+    response_payload = _bundle()
+    response_payload["total"] = 1
+
+    error = await _transport_error(
+        _Session(_response_from_body(response_payload))
+    )
+
+    assert error.code == "response_validation"
+    assert error.validation_code == "total_mismatch"
+    assert error.is_retryable is True
+    assert str(REQUESTED_NPI) not in str(error)
+
+
+@pytest.mark.asyncio
 async def test_cancel_before_request_and_during_stream_is_cooperative():
     before_session = _Session(_response_from_body(_bundle()))
 

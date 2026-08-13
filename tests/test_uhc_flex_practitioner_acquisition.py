@@ -113,6 +113,109 @@ async def test_reviewed_single_root_runs_only_one_distinct_candidate():
 
 
 @pytest.mark.asyncio
+async def test_reviewed_single_root_resumes_retryable_work_without_reinitializing():
+    harness = AcquisitionHarness()
+    harness.session_serial = 1
+    monotonic = iter((0.0, 10.0, 20.0, 100.0, 110.0, 120.0, 130.0)).__next__
+    for call_number in (1, 2):
+        harness.fetch_failures[("candidate", MEMBER_NPIS[0], call_number)] = (
+            UHCFlexPractitionerTransportError("transport_timeout", retryable=True)
+        )
+
+    async def admit_single_root(candidate_acquisition_id, **coordinates):
+        return build_single_root_admission(
+            harness.sealed_root(candidate_acquisition_id),
+            semantic_projection_as_of=coordinates["semantic_projection_as_of"],
+            operation_key=coordinates["operation_key"],
+            admitted_at=dt.datetime(2026, 8, 10, tzinfo=dt.UTC),
+        )
+
+    receipt = await acquisition.acquire_uhc_flex_single_root(
+        operation_key=OPERATION_KEY,
+        semantic_projection_as_of=PROJECTION_DATE,
+        config=enabled_config(concurrency=1, max_attempts=2),
+        database=harness.database,
+        dependencies=replace(
+            harness.dependencies(),
+            admit_single_root=admit_single_root,
+            monotonic=monotonic,
+        ),
+    )
+
+    assert harness.events.count("initialize:candidate") == 1
+    assert sum(event.startswith("session_exit:") for event in harness.events) == 2
+    assert harness.sleep_delays == [1.0, 60.0]
+    assert harness.attempts[(receipt.candidate.acquisition_id, MEMBER_NPIS[0])] == 3
+    assert (receipt.candidate.elapsed_seconds, receipt.elapsed_seconds) == (110.0, 130.0)
+
+
+@pytest.mark.asyncio
+async def test_reviewed_single_root_cancellation_interrupts_resume_cooldown():
+    harness = AcquisitionHarness(npi_count=1)
+    harness.session_serial = 1
+    harness.fetch_failures[("candidate", MEMBER_NPIS[0], 1)] = (
+        UHCFlexPractitionerTransportError("transport_timeout", retryable=True)
+    )
+    cooldown_started = asyncio.Event()
+
+    async def sleep(delay_seconds):
+        harness.sleep_delays.append(delay_seconds)
+        cooldown_started.set()
+        await asyncio.Future()
+
+    acquisition_task = asyncio.create_task(
+        acquisition.acquire_uhc_flex_single_root(
+            operation_key=OPERATION_KEY,
+            semantic_projection_as_of=PROJECTION_DATE,
+            config=enabled_config(concurrency=1, max_attempts=1),
+            database=harness.database,
+            dependencies=replace(harness.dependencies(), sleep=sleep),
+        )
+    )
+    await cooldown_started.wait()
+    acquisition_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition_task
+
+    acquisition_id = next(iter(harness.identities))
+    assert harness.events.count("initialize:candidate") == 1
+    assert len(harness.sessions) == 1
+    assert harness.sleep_delays == [60.0]
+    assert harness.pending[acquisition_id] == [MEMBER_NPIS[0]]
+    assert not harness.active
+    assert not harness.admissions
+
+
+@pytest.mark.asyncio
+async def test_reviewed_single_root_keeps_nonretryable_failures_terminal():
+    harness = AcquisitionHarness(npi_count=1)
+    harness.session_serial = 1
+    harness.fetch_failures[("candidate", MEMBER_NPIS[0], 1)] = (
+        UHCFlexPractitionerTransportError(
+            "response_validation",
+            validation_code="cross_npi",
+        )
+    )
+
+    with pytest.raises(acquisition.UHCFlexPractitionerAcquisitionError) as error_info:
+        await acquisition.acquire_uhc_flex_single_root(
+            operation_key=OPERATION_KEY,
+            semantic_projection_as_of=PROJECTION_DATE,
+            config=enabled_config(concurrency=1),
+            database=harness.database,
+            dependencies=harness.dependencies(),
+        )
+
+    acquisition_id = next(iter(harness.identities))
+    assert error_info.value.code == "root_unsealable"
+    assert harness.events.count("initialize:candidate") == 1
+    assert len(harness.sessions) == 1
+    assert harness.sleep_delays == []
+    assert harness.terminal[acquisition_id][MEMBER_NPIS[0]][0] == "error"
+
+
+@pytest.mark.asyncio
 async def test_reviewed_single_root_uses_the_production_admitter(monkeypatch):
     from process import uhc_flex_practitioner_twin_store as twin_store
 

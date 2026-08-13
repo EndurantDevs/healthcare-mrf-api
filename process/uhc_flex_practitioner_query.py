@@ -145,7 +145,7 @@ def classify_uhc_flex_practitioner_http_status(
 def classify_uhc_flex_practitioner_exception(
     error: object,
 ) -> UHCFlexPractitionerRetryDecision:
-    """Retry only built-in timeout and connection failure families."""
+    """Retry transient transport failures and one inconsistent Bundle total."""
 
     if isinstance(error, (TimeoutError, ConnectionError)):
         return UHCFlexPractitionerRetryDecision(
@@ -154,7 +154,7 @@ def classify_uhc_flex_practitioner_exception(
         )
     if isinstance(error, UHCFlexPractitionerQueryError):
         return UHCFlexPractitionerRetryDecision(
-            "terminal",
+            "retryable" if error.code == "total_mismatch" else "terminal",
             "response_validation",
         )
     if isinstance(error, BaseException):

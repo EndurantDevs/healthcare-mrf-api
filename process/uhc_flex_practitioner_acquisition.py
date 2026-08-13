@@ -17,10 +17,8 @@ from process.uhc_flex_official_cohort_store import (
     UHCFlexOfficialCohortSyncResult,
 )
 from process.uhc_flex_practitioner_acquisition_contract import (
-    PROGRESS_PHASES,
     ProgressCallback,
     ROOT_ROLES,
-    RUN_PATTERN,
     SHA256_PATTERN,
     strict_nonnegative_seconds,
     UHCFlexPractitionerAcquisitionConfig,
@@ -36,12 +34,8 @@ from process.uhc_flex_practitioner_acquisition_contract import (
     UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_RETRY_SECONDS,
 )
 from process.uhc_flex_practitioner_acquisition_runtime import (
-    _AggregateCounters,
-    _RootRunner,
     default_dependencies,
     default_session_scope,
-    drain_operation,
-    gather_worker_cleanup,
     run_root,
 )
 from process.uhc_flex_practitioner_contract import (
@@ -75,13 +69,9 @@ from process.uhc_flex_practitioner_twin_store_contract import (
 
 _ROOT_ROLES = ROOT_ROLES
 _SHA256_PATTERN = SHA256_PATTERN
-_RUN_PATTERN = RUN_PATTERN
-_PROGRESS_PHASES = PROGRESS_PHASES
 _strict_nonnegative_seconds = strict_nonnegative_seconds
 _default_session_scope = default_session_scope
 _default_dependencies = default_dependencies
-_drain_operation = drain_operation
-_gather_worker_cleanup = gather_worker_cleanup
 _run_root = run_root
 
 
@@ -440,10 +430,7 @@ async def acquire_uhc_flex_single_root(
     """Acquire and admit one reviewed candidate without creating a twin."""
 
     projection_date, runtime_dependencies = _validated_runtime_inputs(
-        operation_key,
-        semantic_projection_as_of,
-        config,
-        dependencies,
+        operation_key, semantic_projection_as_of, config, dependencies
     )
     started_at = runtime_dependencies.monotonic()
     registration = _validate_registration(await runtime_dependencies.register_source(database=database))
@@ -452,18 +439,27 @@ async def acquire_uhc_flex_single_root(
         registration, cohort, projection_date, operation_key
     )
     created_count = await runtime_dependencies.initialize_root(
-        context.candidate_identity,
-        database=database,
+        context.candidate_identity, database=database
     )
     if type(created_count) is not int or created_count not in {0, 1}:
         raise UHCFlexPractitionerAcquisitionError("state")
-    candidate, candidate_elapsed = await _run_root(
-        context.candidate_identity,
-        config=config,
-        dependencies=runtime_dependencies,
-        database=database,
-        progress_callback=progress_callback,
-    )
+    candidate_started_at = runtime_dependencies.monotonic()
+    while True:
+        try:
+            candidate, _ = await _run_root(
+                context.candidate_identity,
+                config=config,
+                dependencies=runtime_dependencies,
+                database=database,
+                progress_callback=progress_callback,
+            )
+            break
+        except UHCFlexPractitionerAcquisitionError as error:
+            if error.code != "root_retryable":
+                raise
+            await runtime_dependencies.sleep(UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_RETRY_SECONDS)
+    candidate_elapsed = runtime_dependencies.monotonic() - candidate_started_at
+    _strict_nonnegative_seconds(candidate_elapsed, "root timing")
     admission = await _admit_single_root(
         context,
         candidate,
