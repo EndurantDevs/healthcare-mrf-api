@@ -165,6 +165,12 @@ def test_conflicting_duplicate_resource_ids_fail_closed():
     assert _validation_error_code(_search_bundle([first, second])) == (
         "duplicate_resource_conflict"
     )
+    malformed = _practitioner("practitioner-a")
+    malformed["identifier"][0]["value"] = None
+    for resource_rows in ([first, malformed], [malformed, first]):
+        assert _validation_error_code(_search_bundle(resource_rows)) == (
+            "duplicate_resource_conflict"
+        )
 
 
 @pytest.mark.parametrize(
@@ -213,6 +219,18 @@ def test_conflicting_duplicate_resource_ids_fail_closed():
             "requested_npi_missing",
         ),
         (
+            _search_bundle(
+                [
+                    {
+                        "resourceType": "Practitioner",
+                        "id": "practitioner-a",
+                        "identifier": [None],
+                    }
+                ]
+            ),
+            "payload_invalid",
+        ),
+        (
             _search_bundle([_practitioner("practitioner-a", OTHER_NPI)]),
             "cross_npi",
         ),
@@ -254,6 +272,60 @@ def test_search_bundle_requires_the_exact_us_npi_identifier_system():
     assert _validation_error_code(_search_bundle([resource])) == (
         "requested_npi_missing"
     )
+
+
+def test_search_bundle_quarantines_malformed_npi_only_with_an_exact_sibling():
+    exact_resource = _practitioner("practitioner-a")
+    malformed_resource = _practitioner("practitioner-b")
+    malformed_resource["identifier"][0]["value"] = None
+    expected_result = validate_uhc_flex_practitioner_search_bundle(
+        REQUESTED_NPI,
+        _search_bundle([exact_resource], total=1),
+    )
+
+    for resource_rows in (
+        [exact_resource, malformed_resource],
+        [malformed_resource, exact_resource],
+    ):
+        result = validate_uhc_flex_practitioner_search_bundle(
+            REQUESTED_NPI,
+            _search_bundle(resource_rows, total=2),
+        )
+
+        assert result.resource_count == 1
+        assert result.resource_ids == ("practitioner-a",)
+        assert result.resource_payloads() == (exact_resource,)
+        assert result.resource_sha256_by_id == expected_result.resource_sha256_by_id
+        assert result.result_sha256 == expected_result.result_sha256
+
+    assert _validation_error_code(_search_bundle([malformed_resource])) == (
+        "resource_npi_invalid"
+    )
+
+
+@pytest.mark.parametrize("foreign_identifier_position", [0, 1])
+@pytest.mark.parametrize("is_malformed_entry_first", [False, True])
+def test_search_bundle_rejects_foreign_npi_in_malformed_sibling(
+    foreign_identifier_position,
+    is_malformed_entry_first,
+):
+    malformed_resource = _practitioner("practitioner-b")
+    malformed_resource["identifier"][0]["value"] = None
+    foreign_identifier_by_field = {
+        "system": UHC_FLEX_OFFICIAL_NPI_SYSTEM,
+        "value": str(OTHER_NPI),
+    }
+    malformed_resource["identifier"].insert(
+        foreign_identifier_position,
+        foreign_identifier_by_field,
+    )
+
+    exact_resource = _practitioner("practitioner-a")
+    entries = [malformed_resource, exact_resource]
+    if not is_malformed_entry_first:
+        entries.reverse()
+
+    assert _validation_error_code(_search_bundle(entries)) == "cross_npi"
 
 
 def test_search_bundle_quarantines_an_ambiguous_only_result():

@@ -54,11 +54,11 @@ from process.formulary_fhir.uhc_drug_payload import UHCDrugPayloadError
 from process.formulary_fhir.uhc_drug_payload import (
     uhc_drug_object_array_item_count,
 )
+from process.formulary_fhir.uhc_drug_redirect_transport import validated_drug_get
 from process.provider_directory_retained_artifact_base import RetainedArtifactError
 from process.provider_directory_retained_blob_staging import (
     prepare_retained_artifact_staging_directory,
 )
-from process.uhc_provider_file_catalog_artifacts import _validated_get
 from process.uhc_provider_file_catalog_contract import UHCFileCatalogError
 from process.uhc_provider_file_catalog_contract import trusted_public_https_url
 
@@ -206,7 +206,7 @@ async def stream_uhc_drug_response(
 
     source_url = _validated_source_url(identity)
     try:
-        async with _validated_get(session, source_url) as response:
+        async with validated_drug_get(session, source_url, identity) as response:
             declared_length = _declared_response_length(
                 response,
                 identity,
