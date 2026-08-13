@@ -11,13 +11,67 @@ import pytest
 
 from process import provider_directory_retained_blob_install_support as install_io
 from process import provider_directory_retained_blob_producer as blob_producer
+from process import provider_directory_retained_blob_store as blob_store
 from process.provider_directory_retained_artifact_contract import RetainedArtifactError
 from process.provider_directory_retained_blob_producer import (
     install_retained_artifact_blob,
 )
+from process.provider_directory_retained_blob_store import (
+    _open_retained_artifact_blob,
+)
+from tests.provider_directory_retained_reader_support import (
+    write_retained_artifact_blob,
+)
 
 
 pytest_plugins = ("tests.provider_directory_retained_reader_fixtures",)
+
+
+def test_opened_blob_skips_duplicate_digest_after_verified_read(
+    retained_artifact_test_root: Path,
+    monkeypatch,
+) -> None:
+    artifact_bytes = b"already-verified retained bytes\n"
+    artifact_sha256, _blob_path = write_retained_artifact_blob(
+        retained_artifact_test_root, artifact_bytes
+    )
+    opened_blob = _open_retained_artifact_blob(
+        artifact_sha256,
+        len(artifact_bytes),
+    )
+    assert opened_blob.read_at(len(artifact_bytes), 0) == artifact_bytes
+    monkeypatch.setattr(
+        blob_store.hashlib,
+        "file_digest",
+        lambda *_args, **_kwargs: pytest.fail("duplicate content digest"),
+    )
+    opened_blob.verify_and_close(content_digest_verified=True)
+
+
+def test_opened_blob_detects_leaf_replacement_during_digest(
+    retained_artifact_test_root: Path,
+    monkeypatch,
+) -> None:
+    artifact_bytes = b"digest-race-bound\n"
+    artifact_sha256, blob_path = write_retained_artifact_blob(
+        retained_artifact_test_root, artifact_bytes
+    )
+    opened_blob = _open_retained_artifact_blob(
+        artifact_sha256,
+        len(artifact_bytes),
+    )
+    original_file_digest = blob_store.hashlib.file_digest
+
+    def replace_after_digest(*args, **kwargs):
+        digest = original_file_digest(*args, **kwargs)
+        replacement = blob_path.with_name(f"{blob_path.name}.replacement")
+        replacement.write_bytes(b"X" * len(artifact_bytes))
+        os.replace(replacement, blob_path)
+        return digest
+
+    monkeypatch.setattr(blob_store.hashlib, "file_digest", replace_after_digest)
+    with pytest.raises(RetainedArtifactError, match="identity_changed"):
+        opened_blob.verify_and_close()
 
 
 def test_existing_target_file_sync_failure_is_wrapped(
