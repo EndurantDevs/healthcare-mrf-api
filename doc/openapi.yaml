@@ -2881,6 +2881,35 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ProviderProfileGenerationConflict'
+  /npi/id/{npi}/provider-directory-observations:
+    get:
+      operationId: getNpiIdNpiProviderDirectoryObservations
+      summary: Retrieve retained best-effort Provider Directory observations
+      description: |
+        Returns the newest normalized FHIR observation for each retained
+        resource across non-published acquisitions. This is an explicit
+        best-effort view: it is not a certified or published Provider Directory
+        dataset and must not be used as proof of complete network coverage.
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[1-9][0-9]{9}$'
+      responses:
+        '200':
+          description: Retained non-certified Practitioner and PractitionerRole observations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderDirectoryObservationResponse'
+        '400':
+          description: Invalid NPI
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /npi/plans_by_npi/{npi}:
     get:
       operationId: getNpiPlansByNpiNpi
@@ -10265,6 +10294,60 @@ components:
             $ref: '#/components/schemas/ProviderDirectoryProfileSource'
         facts:
           $ref: '#/components/schemas/ProviderDirectoryProfileFacts'
+      additionalProperties: false
+    ProviderDirectoryObservationResponse:
+      type: object
+      required: [npi, completeness, certified, observations]
+      properties:
+        npi:
+          type: integer
+        completeness:
+          type: string
+          enum: [best_effort]
+        certified:
+          type: boolean
+          enum: [false]
+        observations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderDirectoryObservation'
+      additionalProperties: false
+    ProviderDirectoryObservation:
+      type: object
+      required:
+        - source_id
+        - dataset_id
+        - dataset_status
+        - resource_type
+        - resource_id
+        - resource
+      properties:
+        source_id:
+          type: string
+        api_base:
+          type: string
+          format: uri
+          nullable: true
+        dataset_id:
+          type: string
+        acquisition_root_run_id:
+          type: string
+          nullable: true
+        dataset_status:
+          type: string
+        dataset_created_at:
+          type: string
+          format: date-time
+          nullable: true
+        resource_type:
+          type: string
+          enum: [Practitioner, PractitionerRole]
+        resource_id:
+          type: string
+        resource:
+          type: object
+          description: Normalized retained FHIR observation; shape depends on resource_type.
+          additionalProperties: true
       additionalProperties: false
     ProviderDirectoryProfileFactCategory:
       type: object
