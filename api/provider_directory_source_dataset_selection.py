@@ -95,40 +95,51 @@ def _current_published_dataset_predicate(dataset_model):
     )
 
 
-def _source_scope_dataset_statement(
+def _scope_publication_metadata(
+    dataset_model,
+    source_model,
     source_ids,
-    current_source_ids,
+    other_profile_source_ids,
     *,
-    current_published_only=False,
+    current_published_only,
+):
+    admitted_metadata = _catalog_publication_metadata(dataset_model)
+    if not current_published_only:
+        return admitted_metadata
+    unsealed_legacy_current = and_(
+        dataset_model.publication_metadata_summary_json.is_(None),
+        dataset_model.publication_metadata_sha256.is_(None),
+        dataset_model.content_proof_admission_version.is_(None),
+        dataset_model.content_proof_admission_kind.is_(None),
+        dataset_model.content_proof_admission_sha256.is_(None),
+        dataset_model.content_proof_resource_types.is_(None),
+        ~select(source_model.source_id).where(
+            source_model.endpoint_id == dataset_model.endpoint_id,
+            source_model.source_id.in_(other_profile_source_ids),
+        ).correlate(dataset_model).exists(),
+    )
+    return case(
+        (func.jsonb_typeof(admitted_metadata) == "object", admitted_metadata),
+        (
+            unsealed_legacy_current,
+            func.jsonb_build_object("source_ids", cast(list(source_ids), JSONB)),
+        ),
+        else_=cast(None, JSONB),
+    )
+
+
+def _source_scope_dataset_statement(
+    source_ids, current_source_ids, *, current_published_only=False,
     other_profile_source_ids=(),
 ):
-    dataset_model = ProviderDirectoryEndpointDataset
-    source_model = ProviderDirectorySource
-    admitted_metadata = _catalog_publication_metadata(dataset_model)
-    # Legacy current parents predate admission seals; the locked Profile
-    # attestation independently revalidates their raw source scope.
-    publication_metadata = (
-        case(
-            (func.jsonb_typeof(admitted_metadata) == "object", admitted_metadata),
-            (
-                and_(
-                    dataset_model.publication_metadata_summary_json.is_(None),
-                    dataset_model.publication_metadata_sha256.is_(None),
-                    dataset_model.content_proof_admission_version.is_(None),
-                    dataset_model.content_proof_admission_kind.is_(None),
-                    dataset_model.content_proof_admission_sha256.is_(None),
-                    dataset_model.content_proof_resource_types.is_(None),
-                    ~select(source_model.source_id).where(
-                        source_model.endpoint_id == dataset_model.endpoint_id,
-                        source_model.source_id.in_(other_profile_source_ids),
-                    ).correlate(dataset_model).exists(),
-                ),
-                func.jsonb_build_object("source_ids", cast(list(source_ids), JSONB)),
-            ),
-            else_=cast(None, JSONB),
-        )
-        if current_published_only
-        else admitted_metadata
+    """Select one bounded dataset while retaining valid legacy incumbents."""
+    dataset_model, source_model = ProviderDirectoryEndpointDataset, ProviderDirectorySource
+    publication_metadata = _scope_publication_metadata(
+        dataset_model,
+        source_model,
+        source_ids,
+        other_profile_source_ids,
+        current_published_only=current_published_only,
     )
     catalog_metadata = select(
         publication_metadata.label("publication_metadata")

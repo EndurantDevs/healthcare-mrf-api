@@ -445,80 +445,56 @@ async def test_superseded_outcome_keeps_historic_state_truthful(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ranked_selector_is_bounded_on_disposable_postgres(monkeypatch):
-    source_id_groups = {
-        ("source-published",),
-        ("source-reassigned",),
-        ("source-validated",),
-        ("source-multi-a", "source-multi-b"),
-        ("source-shared",),
-    } | {(f"synthetic-source-{index}",) for index in range(36)}
+    source_id_groups = {("source-published",), ("source-reassigned",),
+                        ("source-validated",), ("source-shared",),
+                        ("source-multi-a", "source-multi-b")} | {
+        (f"synthetic-source-{index}",) for index in range(36)
+    }
     async with _outcome_selection_schema(monkeypatch) as (database, schema):
         statement = outcomes._current_published_dataset_statement(
             source_id_groups
         )
-        translated_statement = statement.execution_options(
-            schema_translate_map={"mrf": schema}
-        )
+        translated_statement = statement.execution_options(schema_translate_map={"mrf": schema})
         query_result = await database.execute(translated_statement)
         selected_row_maps = query_result.mappings().all()
         await database.status(
-            f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
-            "publication_metadata_summary_json = NULL, "
-            "publication_metadata_sha256 = NULL, "
-            "content_proof_admission_version = NULL, "
-            "content_proof_admission_kind = NULL, "
-            "content_proof_admission_sha256 = NULL, "
+            f"UPDATE {schema}.provider_directory_endpoint_dataset SET publication_metadata_summary_json = NULL, "
+            "publication_metadata_sha256 = NULL, content_proof_admission_version = NULL, "
+            "content_proof_admission_kind = NULL, content_proof_admission_sha256 = NULL, "
             "content_proof_resource_types = NULL "
             "WHERE dataset_id = 'published-current';"
         )
-        current_statement = (
-            _source_local_current_published_dataset_statement(
-                source_id_groups
-            ).execution_options(schema_translate_map={"mrf": schema})
+        current_statement = _source_local_current_published_dataset_statement(
+            source_id_groups).execution_options(
+            schema_translate_map={"mrf": schema}
         )
         current_result = await database.execute(current_statement)
         current_row_maps = current_result.mappings().all()
         await database.status(
-            f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
-            "content_proof_admission_sha256 = 'tampered' "
+            f"UPDATE {schema}.provider_directory_endpoint_dataset "
+            "SET content_proof_admission_sha256 = 'tampered' "
             "WHERE dataset_id = 'reassigned-current';"
         )
-        tampered_current_result = await database.execute(current_statement)
-        tampered_current_row_maps = tampered_current_result.mappings().all()
-        explain_result = await database.execute(
-            _PostgresExplain(translated_statement)
-        )
-        current_explain_result = await database.execute(
-            _PostgresExplain(current_statement)
-        )
+        tampered_result = await database.execute(current_statement)
+        tampered_row_maps = tampered_result.mappings().all()
+        explain_result = await database.execute(_PostgresExplain(translated_statement))
+        current_explain = await database.execute(_PostgresExplain(current_statement))
 
     selected_ids = [row_map["dataset_id"] for row_map in selected_row_maps]
     assert selected_ids == ["multi-current", "published-current",
                             "reassigned-current", "validated-candidate"]
     assert len(selected_row_maps) == 4
-    current_ids = [row_map["dataset_id"] for row_map in current_row_maps]
-    assert current_ids == ["multi-current", "reassigned-current",
-                           "validated-incumbent"]
-    assert [row_map["dataset_id"] for row_map in tampered_current_row_maps] == [
-        "multi-current", "validated-incumbent"
+    assert [row_map["dataset_id"] for row_map in current_row_maps] == [
+        "multi-current", "reassigned-current", "validated-incumbent"
     ]
-    plan_maps = (
-        explain_result.scalars().one()[0]["Plan"],
-        current_explain_result.scalars().one()[0]["Plan"],
-    )
+    assert [row_map["dataset_id"] for row_map in tampered_row_maps] == [
+        "multi-current", "validated-incumbent"]
+    plan_maps = (explain_result.scalars().one()[0]["Plan"],
+                 current_explain.scalars().one()[0]["Plan"])
     plan_node_maps = [node for plan in plan_maps for node in _plan_nodes(plan)]
     assert all(plan["Plan Rows"] <= len(source_id_groups) for plan in plan_maps)
-    assert any(
-        node_map.get("Index Name")
-        == "provider_directory_endpoint_dataset_endpoint_idx"
-        for node_map in plan_node_maps
-    )
-    assert any(
-        node_map.get("Index Name") == "provider_directory_source_pkey"
-        for node_map in plan_node_maps
-    )
-    assert all(
-        node_map.get("Relation Name")
-        != "provider_directory_dataset_resource"
-        for node_map in plan_node_maps
-    )
+    index_names = {node.get("Index Name") for node in plan_node_maps}
+    assert "provider_directory_endpoint_dataset_endpoint_idx" in index_names
+    assert "provider_directory_source_pkey" in index_names
+    assert all(node.get("Relation Name") != "provider_directory_dataset_resource"
+               for node in plan_node_maps)
