@@ -11026,6 +11026,36 @@ components:
         has_more:
           type: boolean
       additionalProperties: false
+    ProviderProfessionalSummary:
+      type: object
+      required: [label, text, authorship, basis]
+      properties:
+        label:
+          type: string
+          enum: [Generated professional summary]
+        text:
+          type: string
+          description: |
+            Deterministic prose assembled from the cited public structured
+            facts. It is not written or approved by the provider.
+        authorship:
+          type: string
+          enum: [generated_from_structured_source_data]
+        basis:
+          type: array
+          minItems: 1
+          maxItems: 6
+          items:
+            type: object
+            required: [category, item_id]
+            properties:
+              category:
+                $ref: '#/components/schemas/ProviderProfileCategory'
+              item_id:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+            additionalProperties: false
+      additionalProperties: false
     ProviderProfileDocument:
       type: object
       required:
@@ -11070,6 +11100,8 @@ components:
             own source dates. This differs from publication time, is null only
             during the pre-adoption fallback, and is omitted when no Provider
             Directory profile contributes.
+        professional_summary:
+          $ref: '#/components/schemas/ProviderProfessionalSummary'
         categories:
           type: object
           additionalProperties:

@@ -119,6 +119,7 @@ def _qualification_display(value: Mapping[str, Any]) -> str:
 
 
 def license_number(value: Mapping[str, Any]) -> str | None:
+    """Return an exact LN identifier value without guessing from other fields."""
     for identifier in value.get("identifiers") or []:
         if not isinstance(identifier, Mapping):
             continue

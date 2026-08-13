@@ -23,9 +23,12 @@ from api.provider_profile_composer_parts import (
     _initialize_composed_profile,
     _merge_fhir_profile_facts,
     _paginate_profile_category,
-    _public_fhir_fact,
 )
 from db.models import ProviderProfileProjection, db
+from api.provider_profile_public_facts import (
+    _professional_summary,
+    _public_fhir_fact,
+)
 from process.florida_mqa_profile import PROFILE_SCHEMA_VERSION
 
 
@@ -91,6 +94,10 @@ def compose_provider_profile(
         requested_categories,
         include_sensitive,
     )
+    profile.pop("professional_summary", None)
+    professional_summary = _professional_summary(profile, page_category)
+    if professional_summary is not None:
+        profile["professional_summary"] = professional_summary
     _paginate_profile_category(profile, page_category, page_limit, page_offset)
     _deduplicate_profile_sources(profile)
     return profile

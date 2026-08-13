@@ -457,6 +457,23 @@ def test_provider_profile_endpoint_documents_compact_and_paged_contracts():
     assert schemas["ProviderProfileDocument"]["properties"]["composer_version"][
         "example"
     ] == "provider-profile-composer/v5"
+    summary = schemas["ProviderProfessionalSummary"]
+    assert summary["additionalProperties"] is False
+    assert summary["required"] == ["label", "text", "authorship", "basis"]
+    assert summary["properties"]["label"]["enum"] == [
+        "Generated professional summary"
+    ]
+    assert summary["properties"]["authorship"]["enum"] == [
+        "generated_from_structured_source_data"
+    ]
+    basis_item = summary["properties"]["basis"]["items"]
+    assert basis_item["additionalProperties"] is False
+    assert basis_item["required"] == ["category", "item_id"]
+    document = schemas["ProviderProfileDocument"]
+    assert "professional_summary" not in document["required"]
+    assert document["properties"]["professional_summary"] == {
+        "$ref": "#/components/schemas/ProviderProfessionalSummary"
+    }
 
 
 def test_npi_near_documents_exact_cursor_page_identity():
