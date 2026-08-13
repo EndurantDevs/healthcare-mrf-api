@@ -186,7 +186,7 @@ class _RetainedArtifactByteStream:
     async def _finish_verified_read(self) -> None:
         if self._digest.hexdigest() != self._expected_sha256:
             raise RetainedArtifactError("retained_blob_digest_mismatch")
-        self._opened_blob.verify_and_close()
+        self._opened_blob.verify_and_close(content_digest_verified=True)
         await self._reader._stream_completed(
             self,
             self._artifact,
