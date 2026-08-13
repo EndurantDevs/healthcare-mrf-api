@@ -59,7 +59,7 @@ def _index_is_expected(schema: str) -> bool:
         ),
         {"schema": schema, "index_name": INDEX_NAME},
     ).mappings().one_or_none()
-    if row is None or row["is_valid"] is not True:
+    if row is None or not bool(row["is_valid"]):
         return False
     key_one = _normalized_sql(row["key_one"])
     key_two = _normalized_sql(row["key_two"])
@@ -67,8 +67,8 @@ def _index_is_expected(schema: str) -> bool:
     predicate = _normalized_sql(row["predicate"])
     return (
         "payload_json" in key_one
-        and "jsonb" in key_one
         and "npi" in key_one
+        and "->>" in key_one
         and key_two == "dataset_id"
         and key_three == "resource_type"
         and "resource_type" in predicate
