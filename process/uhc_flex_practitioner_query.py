@@ -291,9 +291,16 @@ def _validated_resource_json_rows(
 ) -> tuple[tuple[str, str], ...]:
     canonical_json_by_id: dict[str, str] = {}
     admitted_resource_ids: set[str] = set()
+    malformed_npi_error: UHCFlexPractitionerQueryError | None = None
     for entry_by_field in entries:
         resource_by_field = _entry_practitioner(entry_by_field)
-        exact_npis = _exact_resource_npis(resource_by_field)
+        try:
+            exact_npis = _exact_resource_npis(resource_by_field)
+        except UHCFlexPractitionerQueryError as error:
+            if error.code != "resource_npi_invalid":
+                raise
+            malformed_npi_error = error
+            continue
         if not exact_npis:
             raise UHCFlexPractitionerQueryError("requested_npi_missing")
         if requested_npi not in exact_npis:
@@ -306,6 +313,8 @@ def _validated_resource_json_rows(
         canonical_json_by_id[resource_id] = canonical_json
         if all(resource_npi == requested_npi for resource_npi in exact_npis):
             admitted_resource_ids.add(resource_id)
+    if not admitted_resource_ids and malformed_npi_error is not None:
+        raise malformed_npi_error
     return tuple((key, canonical_json_by_id[key]) for key in sorted(admitted_resource_ids))
 
 
@@ -457,10 +466,7 @@ def validate_uhc_flex_practitioner_search_bundle(
     _reject_next_link(response_payload)
     entries = _bundle_entries(response_payload)
     _validate_bundle_total(response_payload, len(entries))
-    resource_json_rows = _validated_resource_json_rows(
-        entries,
-        canonical_npi,
-    )
+    resource_json_rows = _validated_resource_json_rows(entries, canonical_npi)
     outcome = (
         UHC_FLEX_PRACTITIONER_MATCHED
         if resource_json_rows
