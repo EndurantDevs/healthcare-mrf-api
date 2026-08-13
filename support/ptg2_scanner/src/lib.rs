@@ -87,14 +87,17 @@ mod python_api {
         if let Some(pool) = LOCATION_CANON_POOL.get() {
             return Ok(pool);
         }
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let pool = match ThreadPoolBuilder::new().num_threads(4).build() {
+            Ok(pool) => pool,
+            Err(error) => return Err(PyRuntimeError::new_err(error.to_string())),
+        };
         let _ = LOCATION_CANON_POOL.set(pool);
-        LOCATION_CANON_POOL
-            .get()
-            .ok_or_else(|| PyRuntimeError::new_err("Location canonicalizer pool unavailable"))
+        match LOCATION_CANON_POOL.get() {
+            Some(pool) => Ok(pool),
+            None => Err(PyRuntimeError::new_err(
+                "Location canonicalizer pool unavailable",
+            )),
+        }
     }
 
     #[pyfunction]
@@ -257,6 +260,22 @@ mod python_api {
                 .unwrap();
                 assert_eq!(addresses.bind(py).len(), 1);
 
+                let locations = canonicalize_location_batch(
+                    py,
+                    vec![(
+                        Some("123 Main Street".to_owned()),
+                        Some("Suite 2".to_owned()),
+                        Some("Austin".to_owned()),
+                        Some("TX".to_owned()),
+                        Some("78701".to_owned()),
+                        Some("US".to_owned()),
+                    )],
+                )
+                .unwrap();
+                assert_eq!(locations.len(), 1);
+                assert!(locations[0].0.is_some());
+                assert!(canonicalize_location_batch(py, vec![]).unwrap().is_empty());
+
                 let contacts = canonicalize_contact_batch(
                     py,
                     vec![(
@@ -280,6 +299,12 @@ mod python_api {
                 assert!(module.hasattr("canon_version").unwrap());
                 assert!(module.hasattr("intersect_sorted_u32").unwrap());
                 assert!(module.hasattr("ptg2_decode_u32_le").unwrap());
+                let empty_locations = module
+                    .getattr("canonicalize_location_batch")
+                    .unwrap()
+                    .call1((Vec::<AddressRow>::new(),))
+                    .unwrap();
+                assert_eq!(empty_locations.len().unwrap(), 0);
 
                 assert_eq!(
                     intersect_sorted_u32_py(vec![1, 3, 5], vec![2, 3, 5]).unwrap(),
