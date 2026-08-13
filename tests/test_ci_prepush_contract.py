@@ -62,12 +62,27 @@ def test_local_all_pins_ci_images_inputs_and_safety_margins() -> None:
 
 def test_local_all_matches_hosted_family_environment_boundaries() -> None:
     script = PREPUSH.read_text(encoding="utf-8")
+    run_all = script.split("run_all() {", 1)[1]
+    container_arguments = run_all.split(
+        "docker run --rm --platform linux/amd64", 1
+    )[1].split('    "$arc_image"', 1)[0]
 
     assert "export HOME=/artifacts/home" in script
-    assert "--env HLTHPRT_DB_DRIVER=asyncpg" not in script
-    assert "--env HLTHPRT_REDIS_ADDRESS=redis://redis:6379" not in script
+    for environment_name in (
+        "HLTHPRT_DB_DRIVER",
+        "HLTHPRT_DB_HOST",
+        "HLTHPRT_DB_PORT",
+        "HLTHPRT_DB_USER",
+        "HLTHPRT_DB_PASSWORD",
+        "HLTHPRT_DB_DATABASE",
+        "HLTHPRT_DB_SCHEMA",
+        "DB_SCHEMA",
+        "HLTHPRT_REDIS_ADDRESS",
+    ):
+        assert environment_name not in container_arguments
     assert "HLTHPRT_REDIS_ADDRESS=redis://redis:6379 gate redis redis" in script
     assert "HLTHPRT_DB_HOST=postgres" in script
+    assert "HLTHPRT_REDIS_ADDRESS=redis://127.0.0.1" in script
 
 
 def test_dispatcher_exposes_only_repository_ci_modes() -> None:
