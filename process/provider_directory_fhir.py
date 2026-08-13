@@ -86,7 +86,7 @@ from process.control_lifecycle import (
     suppress_control_run_heartbeat_persistence,
 )
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
-from process.ext import address_alias_sql
+from process.ext import address_alias_sql, address_fast
 from process.ext.address_canon import resolve_into_archive
 from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
 from process.ext.utils import ensure_database
@@ -915,6 +915,12 @@ _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES: contextvars.ContextVar[dict[str
         default={},
     )
 )
+_PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS: contextvars.ContextVar[
+    dict[str, int]
+] = contextvars.ContextVar(
+    "provider_directory_artifact_owned_relation_oids",
+    default={},
+)
 _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE: contextvars.ContextVar[Any | None] = (
     contextvars.ContextVar(
         "provider_directory_artifact_dataset_fence",
@@ -959,6 +965,7 @@ DEFAULT_BULK_EXPORT_MAX_POLLS = 120
 DEFAULT_BULK_EXPORT_POLL_SECONDS = 5
 DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_LOCATION_ADDRESS_KEY_BATCH_SIZE = 50000
+DEFAULT_LOCATION_ADDRESS_KEY_NATIVE_BATCH_SIZE = 250000
 DEFAULT_LOCATION_COORDINATE_BATCH_SIZE = 50000
 PUBLISH_CORROBORATION_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PUBLISH_CORROBORATION"
 OAUTH_TOKEN_EXPIRY_SKEW_SECONDS = 60
@@ -14132,8 +14139,13 @@ def provider_directory_location_address_key_sql(
             {source_alias}.first_line,
             {source_alias}.second_line,
             {source_alias}.city_name,
+            {source_alias}.state_name,
+            {source_alias}.state_code,
             {source_alias}.postal_code,
+            {source_alias}.zip5,
+            {source_alias}.city_norm,
             {source_alias}.country_code,
+            {source_alias}.address_key,
             {qschema}.addr_zip5_norm_v1({source_alias}.postal_code)::varchar AS source_zip5,
             {normalized_country_expr} AS normalized_country,
             {raw_state_expr} AS raw_state,
@@ -14216,126 +14228,175 @@ def provider_directory_location_address_key_sql(
     """
 
 
-def provider_directory_address_key_batch_sql(
-    db_schema: str | None = None,
-    *,
-    restore_state_from_zip: bool = True,
-    run_id: str | None = None,
-    source_ids: list[str] | tuple[str, ...] | None = None,
-    seen_table: str | None = None,
-) -> str:
-    """Stamp a bounded keyset batch of FHIR Location rows with address keys."""
+def _location_worker_clauses(source_alias: str) -> tuple[str, str]:
+    """Return inclusive-start and exclusive-end worker bounds."""
 
-    schema = db_schema or _schema()
-    qschema = _q(schema)
-    location_ref = _qt(schema, "provider_directory_location")
-    source_alias = "loc_src"
-    raw_state_expr = f"COALESCE(NULLIF({source_alias}.state_name, ''), {source_alias}.state_code)"
-    normalized_state_expr = _state_fips_restore_sql(raw_state_expr)
-    normalized_country_expr = _country_restore_sql(f"{source_alias}.country_code")
-    needs_country_normalization_expr = (
-        f"(NULLIF({normalized_country_expr}, '') IS NOT NULL "
-        f"AND {source_alias}.country_code IS DISTINCT FROM {normalized_country_expr})"
+    return (
+        f"""(
+            CAST(:worker_start_source_id AS varchar) IS NULL
+            OR ({source_alias}.source_id, {source_alias}.resource_id) >=
+               (CAST(:worker_start_source_id AS varchar),
+                CAST(:worker_start_resource_id AS varchar))
+        )""",
+        f"""(
+            CAST(:worker_end_source_id AS varchar) IS NULL
+            OR ({source_alias}.source_id, {source_alias}.resource_id) <
+               (CAST(:worker_end_source_id AS varchar),
+                CAST(:worker_end_resource_id AS varchar))
+        )""",
     )
-    zip_state_select = "geo.state::varchar" if restore_state_from_zip else "NULL::varchar"
-    zip_city_select = "geo.city::varchar" if restore_state_from_zip else "NULL::varchar"
-    zip_state_join = (
-        f"""
-          LEFT JOIN {_qt(schema, "geo_zip_lookup")} AS geo
-            ON geo.zip_code = normalized.source_zip5
-        """
-        if restore_state_from_zip
-        else ""
+
+
+def _location_seen_clause(
+    schema: str,
+    seen_table: str,
+    run_id: str | None,
+    source_alias: str,
+) -> str:
+    """Return the optional run-owned seen-table predicate."""
+
+    seen_run_filter = (
+        "AND seen.run_id = CAST(:run_id AS varchar)" if run_id is not None else ""
     )
-    needs_work_clauses = [
-        f"{source_alias}.address_key IS NULL",
-        f"{source_alias}.zip5 IS NULL",
-        f"{source_alias}.city_name IS NULL",
-        f"{source_alias}.state_code IS NULL",
-        f"{source_alias}.city_norm IS NULL",
-        f"{raw_state_expr} ~ '^[0-9]{{1,2}}$'",
-        needs_country_normalization_expr,
-    ]
-    scope_clauses: list[str] = []
+    return f"""EXISTS (
+        SELECT 1
+          FROM {_qt(schema, seen_table)} AS seen
+         WHERE seen.resource_type = 'Location'
+           {seen_run_filter}
+           AND seen.source_id = {source_alias}.source_id
+           AND seen.resource_id = {source_alias}.resource_id
+    )"""
+
+
+def _location_scope_clauses(
+    schema: str,
+    source_alias: str,
+    run_id: str | None,
+    source_ids: list[str] | tuple[str, ...] | None,
+    seen_table: str | None,
+    worker_range: bool,
+) -> list[str]:
+    """Return run, source, worker, and keyset predicates."""
+
+    clauses: list[str] = []
     if run_id is not None and not seen_table:
-        scope_clauses.append(f"{source_alias}.last_seen_run_id = CAST(:run_id AS varchar)")
+        clauses.append(f"{source_alias}.last_seen_run_id = CAST(:run_id AS varchar)")
     if source_ids:
-        scope_clauses.append(f"{source_alias}.source_id = ANY(CAST(:source_ids AS varchar[]))")
+        clauses.append(f"{source_alias}.source_id = ANY(CAST(:source_ids AS varchar[]))")
     if seen_table:
-        seen_ref = _qt(schema, seen_table)
-        seen_run_filter = "AND seen.run_id = CAST(:run_id AS varchar)" if run_id is not None else ""
-        scope_clauses.append(
-            f"""EXISTS (
-                SELECT 1
-                  FROM {seen_ref} AS seen
-                 WHERE seen.resource_type = 'Location'
-                   {seen_run_filter}
-                   AND seen.source_id = {source_alias}.source_id
-                   AND seen.resource_id = {source_alias}.resource_id
-            )"""
-        )
-    scope_clauses.append(
+        clauses.append(_location_seen_clause(schema, seen_table, run_id, source_alias))
+    if worker_range:
+        clauses.extend(_location_worker_clauses(source_alias))
+    clauses.append(
         f"""(
             CAST(:after_source_id AS varchar) IS NULL
             OR ({source_alias}.source_id, {source_alias}.resource_id)
                 > (CAST(:after_source_id AS varchar), CAST(:after_resource_id AS varchar))
         )"""
     )
-    where_clauses = [f"({' OR '.join(needs_work_clauses)})", *scope_clauses]
-    where_sql = " AND ".join(where_clauses)
+    return clauses
+
+
+def _location_candidates_cte(
+    schema: str,
+    where_sql: str,
+    raw_state_sql: str,
+    normalized_state_sql: str,
+    normalized_country_sql: str,
+) -> str:
+    """Return the bounded Location candidate CTE."""
+
+    qschema = _q(schema)
     return f"""
     WITH candidates AS MATERIALIZED (
-        SELECT
-            {source_alias}.source_id,
-            {source_alias}.resource_id,
-            {source_alias}.first_line,
-            {source_alias}.second_line,
-            {source_alias}.city_name,
-            {source_alias}.postal_code,
-            {source_alias}.country_code,
-            {qschema}.addr_zip5_norm_v1({source_alias}.postal_code)::varchar AS source_zip5,
-            {normalized_country_expr} AS normalized_country,
-            {raw_state_expr} AS raw_state,
-            {normalized_state_expr} AS normalized_state
-          FROM {location_ref} AS {source_alias}
+        SELECT loc_src.source_id, loc_src.resource_id,
+               loc_src.first_line, loc_src.second_line,
+               loc_src.city_name, loc_src.state_name, loc_src.state_code,
+               loc_src.postal_code, loc_src.zip5, loc_src.city_norm,
+               loc_src.country_code, loc_src.address_key,
+               {qschema}.addr_zip5_norm_v1(loc_src.postal_code)::varchar AS source_zip5,
+               {normalized_country_sql} AS normalized_country,
+               {raw_state_sql} AS raw_state,
+               {normalized_state_sql} AS normalized_state
+          FROM {_qt(schema, "provider_directory_location")} AS loc_src
          WHERE {where_sql}
-         ORDER BY {source_alias}.source_id,
-                  {source_alias}.resource_id
+         ORDER BY loc_src.source_id, loc_src.resource_id
          LIMIT CAST(:batch_size AS integer)
-    ),
-    normalized AS (
-        SELECT * FROM candidates
-    ),
+    )
+    """
+
+
+def _location_resolved_ctes(schema: str, restore_state_from_zip: bool) -> str:
+    """Return ZIP-enriched Location resolution CTEs."""
+
+    zip_state_sql = "geo.state::varchar" if restore_state_from_zip else "NULL::varchar"
+    zip_city_sql = "geo.city::varchar" if restore_state_from_zip else "NULL::varchar"
+    zip_join_sql = (
+        f"LEFT JOIN {_qt(schema, 'geo_zip_lookup')} AS geo "
+        "ON geo.zip_code = normalized.source_zip5"
+        if restore_state_from_zip
+        else ""
+    )
+    return f""",
+    normalized AS (SELECT * FROM candidates),
     resolved AS (
-        SELECT
-            normalized.*,
-            CASE
-                WHEN NULLIF(BTRIM(COALESCE(normalized.normalized_state::varchar, '')), '') IS NULL
-                    THEN {zip_state_select}
-                ELSE NULL::varchar
-            END AS zip_restored_state,
-            CASE
-                WHEN NULLIF(BTRIM(COALESCE(normalized.city_name::varchar, '')), '') IS NULL
-                    THEN {zip_city_select}
-                ELSE NULL::varchar
-            END AS zip_restored_city,
-            COALESCE(NULLIF(BTRIM(normalized.normalized_state::varchar), ''), {zip_state_select}) AS resolved_state,
-            COALESCE(NULLIF(BTRIM(normalized.city_name::varchar), ''), {zip_city_select}) AS resolved_city
-          FROM normalized
-          {zip_state_join}
-    ),
-    keyed AS (
-        SELECT
-            source_id,
-            resource_id,
-            {qschema}.addr_key_v1(
-                first_line,
-                second_line,
-                resolved_city,
-                resolved_state,
-                postal_code,
-                COALESCE(NULLIF(normalized_country, ''), 'US')
-            ) AS computed_address_key,
+        SELECT normalized.*,
+               CASE WHEN NULLIF(BTRIM(COALESCE(normalized.normalized_state::varchar, '')), '') IS NULL
+                    THEN {zip_state_sql} ELSE NULL::varchar END AS zip_restored_state,
+               CASE WHEN NULLIF(BTRIM(COALESCE(normalized.city_name::varchar, '')), '') IS NULL
+                    THEN {zip_city_sql} ELSE NULL::varchar END AS zip_restored_city,
+               COALESCE(NULLIF(BTRIM(normalized.normalized_state::varchar), ''), {zip_state_sql}) AS resolved_state,
+               COALESCE(NULLIF(BTRIM(normalized.city_name::varchar), ''), {zip_city_sql}) AS resolved_city
+          FROM normalized {zip_join_sql}
+    )
+    """
+
+
+def _location_key_batch_ctes(
+    schema: str,
+    *,
+    restore_state_from_zip: bool,
+    run_id: str | None,
+    source_ids: list[str] | tuple[str, ...] | None,
+    seen_table: str | None,
+    worker_range: bool = False,
+) -> str:
+    """Build the shared resolved keyset CTEs for SQL and native stamping."""
+
+    raw_state_sql = "COALESCE(NULLIF(loc_src.state_name, ''), loc_src.state_code)"
+    normalized_state_sql = _state_fips_restore_sql(raw_state_sql)
+    normalized_country_sql = _country_restore_sql("loc_src.country_code")
+    needs_work_clauses = [
+        f"loc_src.{field} IS NULL"
+        for field in ("address_key", "zip5", "city_name", "state_code", "city_norm")
+    ]
+    needs_work_clauses.extend(
+        (
+            f"{raw_state_sql} ~ '^[0-9]{{1,2}}$'",
+            f"(NULLIF({normalized_country_sql}, '') IS NOT NULL AND "
+            f"loc_src.country_code IS DISTINCT FROM {normalized_country_sql})",
+        )
+    )
+    scope = _location_scope_clauses(
+        schema, "loc_src", run_id, source_ids, seen_table, worker_range
+    )
+    where_sql = " AND ".join(
+        [f"({' OR '.join(needs_work_clauses)})", *scope]
+    )
+    return _location_candidates_cte(
+        schema,
+        where_sql,
+        raw_state_sql,
+        normalized_state_sql,
+        normalized_country_sql,
+    ) + _location_resolved_ctes(schema, restore_state_from_zip)
+
+
+def _location_resolved_fields_sql(schema: str) -> str:
+    """Return fields whose SQL values must match the native canonicalizer."""
+
+    qschema = _q(schema)
+    return f"""
             source_zip5 AS computed_zip5,
             {qschema}.addr_state_code_v1(resolved_state)::varchar AS computed_state_code,
             {qschema}.addr_city_norm_v1(resolved_city)::varchar AS computed_city_norm,
@@ -14354,6 +14415,45 @@ def provider_directory_address_key_batch_sql(
                 ELSE NULL::varchar
             END AS restored_state_name,
             normalized_country
+    """
+
+
+def provider_directory_address_key_batch_sql(
+    db_schema: str | None = None,
+    *,
+    restore_state_from_zip: bool = True,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+    seen_table: str | None = None,
+) -> str:
+    """Stamp a bounded keyset batch of FHIR Location rows with address keys."""
+
+    schema = db_schema or _schema()
+    qschema = _q(schema)
+    location_ref = _qt(schema, "provider_directory_location")
+    resolved_ctes = _location_key_batch_ctes(
+        schema,
+        restore_state_from_zip=restore_state_from_zip,
+        run_id=run_id,
+        source_ids=source_ids,
+        seen_table=seen_table,
+    )
+    resolved_fields = _location_resolved_fields_sql(schema)
+    return f"""
+    {resolved_ctes},
+    keyed AS (
+        SELECT
+            source_id,
+            resource_id,
+            {qschema}.addr_key_v1(
+                first_line,
+                second_line,
+                resolved_city,
+                resolved_state,
+                postal_code,
+                COALESCE(NULLIF(normalized_country, ''), 'US')
+            ) AS computed_address_key,
+            {resolved_fields}
           FROM resolved
     ),
     updated AS (
@@ -14395,6 +14495,62 @@ def provider_directory_address_key_batch_sql(
 provider_directory_location_address_key_batch_sql = (
     provider_directory_address_key_batch_sql
 )
+
+
+def _location_fast_fields_sql() -> str:
+    """Return SQL-resolved fields consumed by native Location canon."""
+
+    return r"""
+        source_id, resource_id, first_line, second_line,
+        resolved_city, resolved_state, postal_code,
+        COALESCE(NULLIF(normalized_country, ''), 'US')::varchar AS effective_country,
+        source_zip5 AS computed_zip5,
+        CASE
+            WHEN NULLIF(BTRIM(COALESCE(city_name::varchar, '')), '') IS NULL
+             AND zip_restored_city IS NOT NULL
+                THEN zip_restored_city::varchar
+            ELSE NULL::varchar
+        END AS restored_city_name,
+        (
+            raw_state ~ '^[0-9]{1,2}$'
+            OR (
+                NULLIF(BTRIM(COALESCE(raw_state::varchar, '')), '') IS NULL
+                AND zip_restored_state IS NOT NULL
+            )
+        ) AS restore_state_name,
+        normalized_country,
+        address_key AS old_address_key, zip5 AS old_zip5,
+        city_name AS old_city_name, state_name AS old_state_name,
+        state_code AS old_state_code, city_norm AS old_city_norm,
+        country_code AS old_country_code
+    """
+
+
+def _location_key_fast_batch_sql(
+    db_schema: str | None = None,
+    *,
+    restore_state_from_zip: bool = True,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+    seen_table: str | None = None,
+) -> str:
+    """Select one resolved Location batch for native address canonicalization."""
+
+    schema = db_schema or _schema()
+    resolved_ctes = _location_key_batch_ctes(
+        schema,
+        restore_state_from_zip=restore_state_from_zip,
+        run_id=run_id,
+        source_ids=source_ids,
+        seen_table=seen_table,
+        worker_range=True,
+    )
+    return (
+        resolved_ctes
+        + "\nSELECT "
+        + _location_fast_fields_sql()
+        + " FROM resolved ORDER BY source_id, resource_id;"
+    )
 
 
 async def _has_address_canon_functions(db_schema: str) -> bool:
@@ -23121,10 +23277,14 @@ def _artifact_scope_tokens(
     fence: ProviderDirectoryArtifactDatasetFence,
     resource_fence: ProviderDirectoryArtifactDatasetFence,
     relation_overrides: Mapping[str, str],
+    relation_oids: Mapping[str, int],
 ) -> Iterator[None]:
     """Install and restore artifact-scope context variables together."""
     relation_token = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
         dict(relation_overrides)
+    )
+    oid_token = _PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.set(
+        dict(relation_oids)
     )
     fence_token = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(fence)
     resource_scope_token = (
@@ -23135,6 +23295,7 @@ def _artifact_scope_tokens(
     try:
         yield
     finally:
+        _PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.reset(oid_token)
         _PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS.reset(
             resource_scope_token
         )
@@ -23152,10 +23313,22 @@ async def _yield_artifact_dataset_scope(
 ) -> AsyncIterator[ProviderDirectoryArtifactDatasetFence]:
     """Yield one scoped artifact fence and always drain its scratch tables."""
     try:
+        identities = await _artifact_scope_relation_identities(
+            schema,
+            relation_overrides.values(),
+        )
+        if set(identities) != set(relation_overrides.values()):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_artifact_scope_identity_missing"
+            )
         with _artifact_scope_tokens(
             fence,
             resource_fence,
             relation_overrides,
+            {
+                base_name: identities[relation_name][0]
+                for base_name, relation_name in relation_overrides.items()
+            },
         ):
             yield fence
     except BaseException as scope_error:
@@ -23703,6 +23876,33 @@ async def _artifact_scope_relation_identities(
     }
 
 
+async def _owned_unlogged_location_artifact_scope(
+    schema: str,
+) -> tuple[str, int] | None:
+    """Return the exact current-run private Location scope, if any."""
+
+    relation_name = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(
+        ProviderDirectoryLocation.__tablename__
+    )
+    expected_oid = _PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.get().get(
+        ProviderDirectoryLocation.__tablename__
+    )
+    if (
+        not relation_name
+        or expected_oid is None
+        or _provider_directory_profile_capacity_admission() is not None
+    ):
+        return None
+    identity = (await _artifact_scope_relation_identities(schema, [relation_name])).get(
+        relation_name
+    )
+    if identity != (expected_oid, "r", "u"):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_location_address_scope_invalid"
+        )
+    return relation_name, expected_oid
+
+
 async def _assert_artifact_scope_recovery_unreferenced(
     schema: str,
     relation_oids: list[int],
@@ -24172,19 +24372,568 @@ async def _drop_artifact_scope_tables(
                 raise
 
 
-async def publish_provider_directory_location_address_keys(
-    db_schema: str | None = None,
+_LOCATION_ADDRESS_KEY_FAST_STAGE_COLUMNS = (
+    "source_id",
+    "resource_id",
+    "computed_address_key",
+    "computed_zip5",
+    "computed_state_code",
+    "computed_city_norm",
+    "restored_city_name",
+    "restored_state_name",
+    "normalized_country",
+    "eligible_change",
+)
+
+
+async def _location_key_worker_ranges(
+    schema: str,
+    table_name: str,
+    worker_count: int,
+) -> list[
+    tuple[
+        tuple[str, str] | None,
+        tuple[str, str] | None,
+    ]
+]:
+    """Split the private Location PK into contiguous worker ranges."""
+
+    table_ref = _unscoped_qt(schema, table_name)
+    row_count = int(await db.scalar(f"SELECT count(*) FROM {table_ref};") or 0)
+    bounded_workers = min(max(worker_count, 1), max(row_count, 1))
+    boundaries: list[tuple[str, str]] = []
+    for worker_index in range(1, bounded_workers):
+        boundary_row = await db.first(
+            f"""
+            SELECT source_id::varchar AS source_id,
+                   resource_id::varchar AS resource_id
+              FROM {table_ref}
+             ORDER BY source_id, resource_id
+             OFFSET CAST(:row_offset AS bigint)
+             LIMIT 1;
+            """,
+            row_offset=row_count * worker_index // bounded_workers,
+        )
+        boundary = _pagination_checkpoint_row_mapping(boundary_row)
+        source_id = _clean_text(boundary.get("source_id"))
+        resource_id = _clean_text(boundary.get("resource_id"))
+        if source_id is None or resource_id is None:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_location_address_worker_boundary_missing"
+            )
+        boundaries.append((source_id, resource_id))
+    starts = [None, *boundaries]
+    ends = [*boundaries, None]
+    return list(zip(starts, ends, strict=True))
+
+
+def _sql_coalesce(new_value: Any, old_value: Any) -> Any:
+    """Return the Python equivalent of SQL COALESCE for one value."""
+
+    return old_value if new_value is None else new_value
+
+
+def _has_location_key_change(
+    location_by_field: Mapping[str, Any],
+    canonical_by_field: Mapping[str, Any],
     *,
-    run_id: str | None = None,
-    source_ids: list[str] | tuple[str, ...] | None = None,
-    seen_table: str | None = None,
-    batch_size: int | None = None,
+    restored_city_name: str | None,
+    restored_state_name: str | None,
+    normalized_country: str | None,
+) -> bool:
+    """Match the SQL keyset updater's exact eligible-change predicate."""
+
+    address_key = _clean_text(canonical_by_field.get("address_key"))
+    if address_key is None:
+        return False
+    new_values = (
+        ("old_address_key", address_key),
+        ("old_zip5", _sql_coalesce(canonical_by_field.get("zip5"), location_by_field.get("old_zip5"))),
+        ("old_city_name", _sql_coalesce(restored_city_name, location_by_field.get("old_city_name"))),
+        ("old_state_name", _sql_coalesce(restored_state_name, location_by_field.get("old_state_name"))),
+        ("old_state_code", _sql_coalesce(canonical_by_field.get("state_code"), location_by_field.get("old_state_code"))),
+        ("old_city_norm", _sql_coalesce(canonical_by_field.get("city_norm"), location_by_field.get("old_city_norm"))),
+        ("old_country_code", _sql_coalesce(normalized_country, location_by_field.get("old_country_code"))),
+    )
+    return any(
+        location_by_field.get(old_field) != new_value
+        for old_field, new_value in new_values
+    )
+
+
+def _location_canonical_fields(canonical_values: Any) -> dict[str, Any]:
+    """Normalize one compact native result into named fields."""
+
+    if isinstance(canonical_values, Mapping):
+        return {
+            field: canonical_values.get(field)
+            for field in ("address_key", "state_code", "city_norm")
+        }
+    try:
+        address_key, state_code, city_norm = canonical_values
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "provider_directory_location_address_native_row_invalid"
+        ) from exc
+    return {
+        "address_key": address_key,
+        "state_code": state_code,
+        "city_norm": city_norm,
+    }
+
+
+def _build_location_key_record(
+    location_row: Any,
+    canonical_values: Any,
+) -> tuple[tuple[Any, ...], bool]:
+    """Build one native Location sidecar record."""
+
+    row_by_field = (
+        location_row._mapping
+        if hasattr(location_row, "_mapping")
+        else dict(location_row)
+    )
+    canonical_by_field = _location_canonical_fields(canonical_values)
+    canonical_by_field["zip5"] = row_by_field.get("computed_zip5")
+    address_key = canonical_by_field["address_key"]
+    state_code = canonical_by_field["state_code"]
+    city_norm = canonical_by_field["city_norm"]
+    normalized_country = row_by_field.get("normalized_country")
+    restored_city_name = row_by_field.get("restored_city_name")
+    restored_state_name = (
+        _clean_text(state_code)
+        if row_by_field.get("restore_state_name") is True
+        else None
+    )
+    has_change = _has_location_key_change(
+        row_by_field,
+        canonical_by_field,
+        restored_city_name=restored_city_name,
+        restored_state_name=restored_state_name,
+        normalized_country=normalized_country,
+    )
+    return (
+        str(row_by_field["source_id"]),
+        str(row_by_field["resource_id"]),
+        _clean_text(address_key),
+        _clean_text(row_by_field.get("computed_zip5")),
+        _clean_text(state_code),
+        _clean_text(city_norm),
+        restored_city_name,
+        restored_state_name,
+        normalized_country,
+        has_change,
+    ), has_change
+
+
+def _location_key_copy_records(
+    location_rows: list[Any],
+    canonical_rows: list[Any],
+) -> tuple[list[tuple[Any, ...]], int]:
+    """Build one stable native COPY batch and count exact changed rows."""
+
+    if len(canonical_rows) != len(location_rows):
+        raise RuntimeError("provider_directory_location_address_native_count_mismatch")
+    record_pairs = [
+        _build_location_key_record(location_row, canonical_values)
+        for location_row, canonical_values in zip(
+            location_rows, canonical_rows, strict=True
+        )
+    ]
+    return (
+        [record for record, _has_change in record_pairs],
+        sum(has_change for _record, has_change in record_pairs),
+    )
+
+
+@dataclass(frozen=True)
+class _LocationKeyBuild:
+    """Bound one native Location scratch replacement."""
+
+    schema: str
+    native_module: Any
+    old_table: str
+    old_oid: int
+    stage_table: str
+    replacement_table: str
+    select_sql: str
+    params_by_name: Mapping[str, Any]
+    batch_size: int
+
+
+def _new_location_key_build(
+    schema: str,
+    native_module: Any,
+    owned_scope: tuple[str, int],
+    *,
+    restore_state_from_zip: bool,
+    run_id: str | None,
+    source_ids: list[str] | tuple[str, ...] | None,
+    seen_table: str | None,
+    batch_size: int,
+) -> _LocationKeyBuild:
+    """Create one immutable native Location build context."""
+
+    params_by_name: dict[str, Any] = {}
+    if run_id is not None:
+        params_by_name["run_id"] = run_id
+    if source_ids:
+        params_by_name["source_ids"] = list(source_ids)
+    old_table, old_oid = owned_scope
+    auxiliary_token = _stage_table_name()
+    return _LocationKeyBuild(
+        schema,
+        native_module,
+        old_table,
+        old_oid,
+        _bounded_identifier(auxiliary_token + "_location_address"),
+        _bounded_identifier(auxiliary_token + "_location_replacement"),
+        _location_key_fast_batch_sql(
+            schema,
+            restore_state_from_zip=restore_state_from_zip,
+            run_id=run_id,
+            source_ids=source_ids,
+            seen_table=seen_table,
+        ),
+        params_by_name,
+        batch_size,
+    )
+
+
+async def _create_location_key_stage(build: _LocationKeyBuild) -> None:
+    """Create the compact unlogged Location sidecar."""
+
+    await db.status(
+        f"""
+        CREATE UNLOGGED TABLE {_unscoped_qt(build.schema, build.stage_table)} (
+            source_id varchar(64) NOT NULL,
+            resource_id varchar(256) NOT NULL,
+            computed_address_key text,
+            computed_zip5 varchar(5),
+            computed_state_code varchar(2),
+            computed_city_norm text,
+            restored_city_name text,
+            restored_state_name text,
+            normalized_country text,
+            eligible_change boolean NOT NULL
+        );
+        """
+    )
+
+
+def _location_key_inputs(location_rows: list[Any]) -> list[tuple[Any, ...]]:
+    """Project SQL-resolved rows into the compact native input."""
+
+    return [
+        tuple(row_by_field.get(field) for field in (
+            "first_line", "second_line", "resolved_city",
+            "resolved_state", "postal_code", "effective_country",
+        ))
+        for location_row in location_rows
+        for row_by_field in [
+            location_row._mapping
+            if hasattr(location_row, "_mapping")
+            else dict(location_row)
+        ]
+    ]
+
+
+def _location_key_query_params(
+    build: _LocationKeyBuild,
+    worker_range: tuple[tuple[str, str] | None, tuple[str, str] | None],
+    cursor: tuple[str | None, str | None],
+) -> dict[str, Any]:
+    """Return one worker's range and keyset parameters."""
+
+    worker_start, worker_end = worker_range
+    return {
+        **build.params_by_name,
+        "worker_start_source_id": worker_start[0] if worker_start else None,
+        "worker_start_resource_id": worker_start[1] if worker_start else None,
+        "worker_end_source_id": worker_end[0] if worker_end else None,
+        "worker_end_resource_id": worker_end[1] if worker_end else None,
+        "after_source_id": cursor[0],
+        "after_resource_id": cursor[1],
+        "batch_size": build.batch_size,
+    }
+
+
+async def _copy_location_key_batch(
+    build: _LocationKeyBuild,
+    copy_method: Any,
+    location_rows: list[Any],
+) -> tuple[int, int]:
+    """Canonicalize and COPY one resolved Location batch."""
+
+    canonical_rows = await asyncio.to_thread(
+        build.native_module.canonicalize_location_batch,
+        _location_key_inputs(location_rows),
+    )
+    copy_records, changed_count = _location_key_copy_records(
+        location_rows, list(canonical_rows)
+    )
+    copy_status = await copy_method(
+        build.stage_table,
+        schema_name=build.schema,
+        columns=_LOCATION_ADDRESS_KEY_FAST_STAGE_COLUMNS,
+        records=copy_records,
+    )
+    if copy_status != f"COPY {len(copy_records)}":
+        raise RuntimeError("provider_directory_location_address_copy_count_mismatch")
+    return len(copy_records), changed_count
+
+
+def _next_location_key_cursor(
+    location_rows: list[Any],
+    cursor: tuple[str | None, str | None],
+) -> tuple[str, str]:
+    """Advance one Location worker's strict keyset cursor."""
+
+    last_location = location_rows[-1]
+    last_by_field = (
+        last_location._mapping
+        if hasattr(last_location, "_mapping")
+        else dict(last_location)
+    )
+    next_cursor = (
+        _clean_text(last_by_field.get("source_id")),
+        _clean_text(last_by_field.get("resource_id")),
+    )
+    if None in next_cursor or next_cursor == cursor:
+        raise RuntimeError("provider_directory_location_address_native_cursor_invalid")
+    return cast(tuple[str, str], next_cursor)
+
+
+async def _stage_location_key_range(
+    build: _LocationKeyBuild,
+    worker_range: tuple[tuple[str, str] | None, tuple[str, str] | None],
+) -> tuple[int, int]:
+    """Stage one contiguous Location key range."""
+
+    cursor: tuple[str | None, str | None] = (None, None)
+    candidate_count = 0
+    changed_count = 0
+    async with db.acquire() as connection:
+        driver = getattr(
+            connection.raw_connection,
+            "driver_connection",
+            connection.raw_connection,
+        )
+        copy_method = getattr(driver, "copy_records_to_table", None)
+        if copy_method is None:
+            raise RuntimeError("provider_directory_location_address_copy_unavailable")
+        while True:
+            location_rows = list(
+                await connection.all(
+                    build.select_sql,
+                    **_location_key_query_params(build, worker_range, cursor),
+                )
+            )
+            if not location_rows:
+                return candidate_count, changed_count
+            batch_candidates, batch_changes = await _copy_location_key_batch(
+                build, copy_method, location_rows
+            )
+            candidate_count += batch_candidates
+            changed_count += batch_changes
+            cursor = _next_location_key_cursor(location_rows, cursor)
+
+
+def _location_replacement_column_sql(column_name: str) -> str:
+    """Return one replacement projection with exact SQL update semantics."""
+
+    keyed_by_column = {
+        "address_key": "keyed.computed_address_key",
+        "zip5": "COALESCE(keyed.computed_zip5, loc.zip5)",
+        "city_name": "COALESCE(keyed.restored_city_name, loc.city_name)",
+        "state_name": "COALESCE(keyed.restored_state_name, loc.state_name)",
+        "state_code": "COALESCE(keyed.computed_state_code, loc.state_code)",
+        "city_norm": "COALESCE(keyed.computed_city_norm, loc.city_norm)",
+        "country_code": "COALESCE(keyed.normalized_country, loc.country_code)",
+        "updated_at": "now()",
+    }
+    if column_name not in keyed_by_column:
+        return f"loc.{_q(column_name)}"
+    return (
+        "CASE WHEN keyed.eligible_change IS TRUE THEN "
+        f"{keyed_by_column[column_name]} ELSE loc.{_q(column_name)} END"
+    )
+
+
+async def _populate_location_replacement(build: _LocationKeyBuild) -> None:
+    """Populate and index the full private Location replacement."""
+
+    await db.status(
+        f"CREATE UNIQUE INDEX {_q(_bounded_identifier(build.stage_table + '_pk'))} "
+        f"ON {_unscoped_qt(build.schema, build.stage_table)} (source_id, resource_id);"
+    )
+    await db.status(
+        _provider_directory_artifact_scope_table_sql(
+            ProviderDirectoryLocation, build.schema, build.replacement_table
+        )
+    )
+    column_names = [
+        column.name for column in ProviderDirectoryLocation.__table__.columns
+    ]
+    await db.status(
+        f"INSERT INTO {_unscoped_qt(build.schema, build.replacement_table)} "
+        f"({', '.join(_q(name) for name in column_names)}) SELECT "
+        f"{', '.join(_location_replacement_column_sql(name) for name in column_names)} "
+        f"FROM {_unscoped_qt(build.schema, build.old_table)} AS loc "
+        f"LEFT JOIN {_unscoped_qt(build.schema, build.stage_table)} AS keyed "
+        "USING (source_id, resource_id);"
+    )
+    await _build_artifact_scope_pk(
+        ProviderDirectoryLocation, build.schema, build.replacement_table
+    )
+    await db.status(
+        f"ANALYZE {_unscoped_qt(build.schema, build.replacement_table)};"
+    )
+
+
+async def _assert_location_scope(build: _LocationKeyBuild) -> None:
+    """Require the original private Location heap identity."""
+
+    identity = (
+        await _artifact_scope_relation_identities(build.schema, [build.old_table])
+    ).get(build.old_table)
+    if identity != (build.old_oid, "r", "u"):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_location_address_scope_changed"
+        )
+
+
+async def _cutover_location_replacement(
+    build: _LocationKeyBuild,
+    original_count: int,
+) -> None:
+    """Validate and atomically install the private replacement."""
+
+    replacement_count = int(
+        await db.scalar(
+            f"SELECT count(*) FROM "
+            f"{_unscoped_qt(build.schema, build.replacement_table)};"
+        ) or 0
+    )
+    if replacement_count != original_count:
+        raise RuntimeError(
+            "provider_directory_location_address_replacement_count_mismatch"
+        )
+    await db.status(
+        f"LOCK TABLE {_unscoped_qt(build.schema, build.old_table)} "
+        "IN ACCESS EXCLUSIVE MODE;"
+    )
+    await _assert_location_scope(build)
+    await db.status(f"DROP TABLE {_unscoped_qt(build.schema, build.old_table)};")
+    await db.status(
+        f"ALTER TABLE {_unscoped_qt(build.schema, build.replacement_table)} "
+        f"RENAME TO {_q(build.old_table)};"
+    )
+
+
+async def _replace_location_scope(
+    build: _LocationKeyBuild,
+    candidate_count: int,
+) -> None:
+    """Replace the exact private Location scope in one transaction."""
+
+    async with _provider_directory_profile_capacity_transaction():
+        await _assert_location_scope(build)
+        original_count = int(
+            await db.scalar(
+                f"SELECT count(*) FROM {_unscoped_qt(build.schema, build.old_table)};"
+            ) or 0
+        )
+        staged_count = int(
+            await db.scalar(
+                f"SELECT count(*) FROM {_unscoped_qt(build.schema, build.stage_table)};"
+            ) or 0
+        )
+        if staged_count != candidate_count:
+            raise RuntimeError(
+                "provider_directory_location_address_sidecar_count_mismatch"
+            )
+        await _populate_location_replacement(build)
+        await _cutover_location_replacement(build, original_count)
+
+
+async def _publish_location_keys_fast(
+    schema: str,
+    native_module: Any,
+    owned_scope: tuple[str, int],
+    *,
+    restore_state_from_zip: bool,
+    run_id: str | None,
+    source_ids: list[str] | tuple[str, ...] | None,
+    seen_table: str | None,
+    batch_size: int,
 ) -> int:
-    """Publish provider directory location address keys for provider-directory serving."""
-    schema = db_schema or _schema()
-    if not await _has_address_canon_functions(schema):
-        return 0
-    restore_state_from_zip = await _is_table_present(schema, "geo_zip_lookup")
+    """Build one native-keyed sidecar and replace private Location scratch."""
+
+    build = _new_location_key_build(
+        schema, native_module, owned_scope,
+        restore_state_from_zip=restore_state_from_zip,
+        run_id=run_id, source_ids=source_ids,
+        seen_table=seen_table, batch_size=batch_size,
+    )
+    worker_ranges = await _location_key_worker_ranges(
+        build.schema,
+        build.old_table,
+        _provider_directory_artifact_scope_workers(),
+    )
+    try:
+        await _create_location_key_stage(build)
+        worker_counts = await _gather_provider_directory_profile_tasks(
+            [
+                asyncio.create_task(_stage_location_key_range(build, worker_range))
+                for worker_range in worker_ranges
+            ]
+        )
+        candidate_count = sum(counts[0] for counts in worker_counts)
+        changed_count = sum(counts[1] for counts in worker_counts)
+        if candidate_count:
+            await _replace_location_scope(build, candidate_count)
+        return changed_count
+    finally:
+        await _drain_artifact_scope_cleanup(
+            build.schema,
+            [build.stage_table, build.replacement_table],
+        )
+
+
+async def _location_key_sql_batch(
+    sql: str,
+    params_by_name: Mapping[str, Any],
+    cursor: tuple[str | None, str | None],
+    batch_size: int,
+) -> dict[str, Any]:
+    """Execute one established SQL Location-key batch."""
+
+    batch_row = await db.first(
+        sql,
+        **params_by_name,
+        after_source_id=cursor[0],
+        after_resource_id=cursor[1],
+        batch_size=batch_size,
+    )
+    return (
+        dict(batch_row._mapping)
+        if hasattr(batch_row, "_mapping")
+        else dict(batch_row or {})
+    )
+
+
+async def _publish_location_keys_sql(
+    schema: str,
+    *,
+    restore_state_from_zip: bool,
+    run_id: str | None,
+    source_ids: list[str] | tuple[str, ...] | None,
+    seen_table: str | None,
+    batch_size: int,
+) -> int:
+    """Run the established fail-closed SQL keyset implementation."""
+
     params_by_name: dict[str, Any] = {}
     if run_id is not None:
         params_by_name["run_id"] = run_id
@@ -24193,7 +24942,6 @@ async def publish_provider_directory_location_address_keys(
     total_updated = 0
     after_source_id: str | None = None
     after_resource_id: str | None = None
-    bounded_batch_size = max(int(batch_size or _location_address_key_batch_size()), 1)
     sql = provider_directory_location_address_key_batch_sql(
         schema,
         restore_state_from_zip=restore_state_from_zip,
@@ -24202,17 +24950,11 @@ async def publish_provider_directory_location_address_keys(
         seen_table=seen_table,
     )
     while True:
-        result_row = await db.first(
+        result_by_field = await _location_key_sql_batch(
             sql,
-            **params_by_name,
-            after_source_id=after_source_id,
-            after_resource_id=after_resource_id,
-            batch_size=bounded_batch_size,
-        )
-        result_by_field = (
-            result_row._mapping
-            if hasattr(result_row, "_mapping")
-            else dict(result_row or {})
+            params_by_name,
+            (after_source_id, after_resource_id),
+            batch_size,
         )
         candidate_rows = int(result_by_field.get("candidate_rows") or 0)
         updated_rows = int(result_by_field.get("updated_rows") or 0)
@@ -24228,6 +24970,46 @@ async def publish_provider_directory_location_address_keys(
         after_source_id = next_source_id
         after_resource_id = next_resource_id
     return total_updated
+
+
+async def publish_provider_directory_location_address_keys(
+    db_schema: str | None = None,
+    *,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+    seen_table: str | None = None,
+    batch_size: int | None = None,
+) -> int:
+    """Publish provider directory location address keys for provider-directory serving."""
+    schema = db_schema or _schema()
+    if not await _has_address_canon_functions(schema):
+        return 0
+    restore_state_from_zip = await _is_table_present(schema, "geo_zip_lookup")
+    bounded_batch_size = max(int(batch_size or _location_address_key_batch_size()), 1)
+    native_module = address_fast._fast_module()
+    owned_scope = await _owned_unlogged_location_artifact_scope(schema)
+    if native_module is not None and owned_scope is not None:
+        return await _publish_location_keys_fast(
+            schema,
+            native_module,
+            owned_scope,
+            restore_state_from_zip=restore_state_from_zip,
+            run_id=run_id,
+            source_ids=source_ids,
+            seen_table=seen_table,
+            batch_size=max(
+                bounded_batch_size,
+                DEFAULT_LOCATION_ADDRESS_KEY_NATIVE_BATCH_SIZE,
+            ),
+        )
+    return await _publish_location_keys_sql(
+        schema,
+        restore_state_from_zip=restore_state_from_zip,
+        run_id=run_id,
+        source_ids=source_ids,
+        seen_table=seen_table,
+        batch_size=bounded_batch_size,
+    )
 
 
 async def backfill_provider_directory_resource_id_npis(

@@ -59,6 +59,26 @@ def test_pyo3_address_canonical_golden_corpus_matches_frozen_expected_values():
         assert result["premise_key"] == case["expected_premise_key"], case["id"]
 
 
+def test_pyo3_location_batch_matches_full_canonicalizer():
+    rows = [
+        tuple(case.get(key) for key in ("first_line", "second_line", "city", "state", "zip", "country"))
+        for case in _golden_cases()
+    ]
+    rows.append(("10 Downing Street", None, "London", None, "SW1A 2AA", "United Kingdom"))
+
+    full = ptg2_address_canon.canonicalize_batch(rows)
+    compact = ptg2_address_canon.canonicalize_location_batch(rows)
+
+    assert compact == [
+        (
+            row["address_key"],
+            row["state_code"],
+            row["city_norm"],
+        )
+        for row in full
+    ]
+
+
 def test_pyo3_contact_canonical_batch_normalizes_us_and_international_values():
     if not hasattr(ptg2_address_canon, "canonicalize_contact_batch"):
         pytest.skip("installed ptg2_address_canon module does not include contact canonicalizer")
