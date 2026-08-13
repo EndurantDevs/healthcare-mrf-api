@@ -2932,11 +2932,10 @@ def test_health_partners_plans_supplemental_source_is_queryable_by_org():
 
 
 def test_reviewed_candidate_seeds_have_stable_ids_and_acquisition_controls():
+    """Keep reviewed seed identities and runnable controls explicit."""
+
     seed_rows = importer._reviewed_provider_directory_candidate_seed_rows()
-    source_rows = [
-        importer._source_row_from_seed(seed_record)
-        for seed_record in seed_rows
-    ]
+    source_rows = list(map(importer._source_row_from_seed, seed_rows))
     source_by_base = {
         source_row["canonical_api_base"]: source_row for source_row in source_rows
     }
@@ -2971,9 +2970,15 @@ def test_reviewed_candidate_seeds_have_stable_ids_and_acquisition_controls():
             assert metadata["provider_directory_coverage_mode"] == "full"
             assert metadata["provider_directory_acquisition_enabled"] is True
             assert metadata["provider_directory_fully_enumerable_resources"]
-            assert metadata["provider_directory_candidate_status"] == (
-                importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
+            expected_status = (
+                None
+                if importer.LAST_UPDATED_PARTITION_METADATA_KEY in metadata
+                else importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
             )
+            assert metadata.get("provider_directory_candidate_status") == expected_status
+            assert (
+                importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY in metadata
+            ) is (expected_status is not None)
             assert importer._resource_acquisition_blocked_reason(source_row) is None
 
     el_dorado_source = source_by_base[
@@ -3006,7 +3011,7 @@ def test_reviewed_candidate_statuses_match_current_acquisition_state():
     }
 
     verified_status = importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
-    assert status_by_base[importer.DEVOTED_PROVIDER_DIRECTORY_BASE] == verified_status
+    assert status_by_base[importer.DEVOTED_PROVIDER_DIRECTORY_BASE] is None
     assert status_by_base[importer.SIMPRA_PROVIDER_DIRECTORY_BASE] == verified_status
     assert (
         status_by_base[importer.SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE]
@@ -3088,6 +3093,21 @@ def test_reviewed_candidate_rejects_missing_verification_campaign(monkeypatch):
         match="provider_directory_reviewed_candidate_campaign_missing",
     ):
         importer._reviewed_provider_directory_candidate_seed_rows()
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_reviewed_candidate_campaign_missing",
+    ):
+        importer._reviewed_candidate_metadata(
+            importer._ReviewedCandidateSeed(
+                row_id="synthetic-enabled-source",
+                org_name="Synthetic Organization",
+                plan_name="Synthetic Directory",
+                api_base="https://directory.example.test/fhir",
+                source_url="https://directory.example.test",
+                resources=("Practitioner",),
+                expected_nonempty_resources=("Practitioner",),
+            )
+        )
 
 
 def test_iowa_reviewed_candidate_current_expected_nonempty_contract():

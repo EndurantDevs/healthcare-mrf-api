@@ -49,7 +49,7 @@ def _without_partition_policy(source_record):
     return legacy_record
 
 
-def test_reviewed_role_partition_policy_is_fixed_and_verified():
+def test_reviewed_role_partition_policy_is_fixed_and_ordinary():
     seed_row = _partitioned_reviewed_seed_row()
     metadata = seed_row["metadata_json"]
 
@@ -57,12 +57,20 @@ def test_reviewed_role_partition_policy_is_fixed_and_verified():
         "enabled": True,
         "resources": EXPECTED_ROLE_PARTITION,
     }
-    assert metadata["provider_directory_candidate_status"] == (
-        importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
-    )
+    source_record = _partitioned_source_record()
+    assert "provider_directory_candidate_status" not in metadata
     assert (
-        metadata[importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY]
-        == EXPECTED_CAMPAIGN
+        importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
+        not in metadata
+    )
+    assert importer.REVIEWED_ROOT_POLICY_METADATA_KEY not in metadata
+    assert importer.REVIEWED_SUBSET_ACTIVATION_METADATA_KEY not in metadata
+    assert importer.REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2 not in metadata
+    assert importer._reviewed_source_profile_key(source_record) == (
+        None,
+        None,
+        None,
+        False,
     )
 
 
@@ -272,7 +280,7 @@ async def test_persisted_partition_generation_matches_exact_upsert(monkeypatch):
     (
         (
             "provider_directory_candidate_status",
-            importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
+            importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
         ),
         ("provider_directory_verification_campaign_id", "older-campaign"),
         ("provider_directory_reviewed_subset_activation_v2", {}),
@@ -327,16 +335,20 @@ async def test_partition_generation_rejects_protected_expected_metadata(
 
 
 @pytest.mark.asyncio
-async def test_partition_generation_readback_skips_other_campaigns(
+async def test_partition_generation_readback_rejects_other_campaigns(
     monkeypatch,
 ):
     source_record = _attached_partition_source_record()
     source_record["metadata_json"][
         importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
     ] = "other-campaign"
-    query = AsyncMock()
+    query = AsyncMock(return_value=[copy.deepcopy(source_record)])
     monkeypatch.setattr(importer.db, "all", query)
 
-    await importer._assert_persisted_reviewed_partition_generations([source_record])
-
-    query.assert_not_awaited()
+    with pytest.raises(
+        RuntimeError,
+        match="reviewed_partition_generation_persistence_mismatch",
+    ):
+        await importer._assert_persisted_reviewed_partition_generations(
+            [source_record]
+        )
