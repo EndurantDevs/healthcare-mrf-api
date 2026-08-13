@@ -1166,7 +1166,7 @@ EOF
       {
         python --version
         python -m pip --version
-        python -c '"'"'import platform, sys; print(f"python_cache_tag={sys.implementation.cache_tag}"); print(f"platform={platform.platform()}"); print(f"machine={platform.machine()}"); print(f"libc={platform.libc()}")'"'"'
+        python -c '"'"'import platform, sys; print(f"python_cache_tag={sys.implementation.cache_tag}"); print(f"platform={platform.platform()}"); print(f"machine={platform.machine()}"); print(f"libc={platform.libc_ver()}")'"'"'
         cargo --version
         rustc --version
         cargo llvm-cov --version

@@ -132,6 +132,13 @@ def test_local_all_propagates_reviewed_readability_approval() -> None:
     assert '--env READABILITY_ZERO_GROWTH_APPROVED="$readability_zero_growth_approved"' in script
 
 
+def test_local_all_records_the_native_libc_version() -> None:
+    script = PREPUSH.read_text(encoding="utf-8")
+
+    assert "platform.libc_ver()" in script
+    assert "platform.libc()" not in script
+
+
 def test_native_python_lock_is_complete_and_hashed() -> None:
     lock_input = PYTHON_LOCK_INPUT.read_text(encoding="utf-8")
     lock = PYTHON_LOCK.read_text(encoding="utf-8")
