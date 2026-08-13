@@ -198,11 +198,14 @@ def _resource_id(resource_by_field: dict[str, Any]) -> str:
     return resource_id
 
 
-def _exact_resource_npis(resource_by_field: dict[str, Any]) -> tuple[int, ...]:
+def _exact_resource_npis(
+    resource_by_field: dict[str, Any],
+) -> tuple[tuple[int, ...], bool]:
     identifiers = resource_by_field.get("identifier")
     if type(identifiers) is not list:
         raise UHCFlexPractitionerQueryError("requested_npi_missing")
     exact_npis: list[int] = []
+    has_malformed_npi = False
     for identifier_by_field in identifiers:
         if type(identifier_by_field) is not dict:
             raise UHCFlexPractitionerQueryError("payload_invalid")
@@ -210,23 +213,23 @@ def _exact_resource_npis(resource_by_field: dict[str, Any]) -> tuple[int, ...]:
             continue
         raw_npi = identifier_by_field.get("value")
         if type(raw_npi) is not str or not re.fullmatch(r"[0-9]{10}", raw_npi):
-            raise UHCFlexPractitionerQueryError("resource_npi_invalid")
+            has_malformed_npi = True
+            continue
         try:
             exact_npis.append(canonical_uhc_flex_npi(int(raw_npi)))
         except ValueError:
-            raise UHCFlexPractitionerQueryError("resource_npi_invalid") from None
-    return tuple(exact_npis)
+            has_malformed_npi = True
+    return tuple(exact_npis), has_malformed_npi
 
 
-def _validate_resource_npi(
-    resource_by_field: dict[str, Any],
-    requested_npi: int,
-) -> None:
-    exact_npis = _exact_resource_npis(resource_by_field)
-    if not exact_npis:
+def _validate_resource_npi(resource_by_field: dict[str, Any], requested_npi: int) -> None:
+    exact_npis, has_malformed_npi = _exact_resource_npis(resource_by_field)
+    if not exact_npis and not has_malformed_npi:
         raise UHCFlexPractitionerQueryError("requested_npi_missing")
     if any(resource_npi != requested_npi for resource_npi in exact_npis):
         raise UHCFlexPractitionerQueryError("cross_npi")
+    if has_malformed_npi:
+        raise UHCFlexPractitionerQueryError("resource_npi_invalid")
 
 
 def _bundle_entries(bundle_by_field: dict[str, Any]) -> list[dict[str, Any]]:
@@ -291,19 +294,15 @@ def _validated_resource_json_rows(
 ) -> tuple[tuple[str, str], ...]:
     canonical_json_by_id: dict[str, str] = {}
     admitted_resource_ids: set[str] = set()
-    malformed_npi_error: UHCFlexPractitionerQueryError | None = None
+    has_malformed_npi_sibling = False
     for entry_by_field in entries:
         resource_by_field = _entry_practitioner(entry_by_field)
-        try:
-            exact_npis = _exact_resource_npis(resource_by_field)
-        except UHCFlexPractitionerQueryError as error:
-            if error.code != "resource_npi_invalid":
-                raise
-            malformed_npi_error = error
-            continue
-        if not exact_npis:
+        exact_npis, has_malformed_npi = _exact_resource_npis(resource_by_field)
+        if has_malformed_npi and any(npi != requested_npi for npi in exact_npis):
+            raise UHCFlexPractitionerQueryError("cross_npi")
+        if not exact_npis and not has_malformed_npi:
             raise UHCFlexPractitionerQueryError("requested_npi_missing")
-        if requested_npi not in exact_npis:
+        if requested_npi not in exact_npis and not has_malformed_npi:
             raise UHCFlexPractitionerQueryError("cross_npi")
         resource_id = _resource_id(resource_by_field)
         canonical_json = _canonical_resource_json(resource_by_field)
@@ -311,10 +310,13 @@ def _validated_resource_json_rows(
         if previous_json is not None and previous_json != canonical_json:
             raise UHCFlexPractitionerQueryError("duplicate_resource_conflict")
         canonical_json_by_id[resource_id] = canonical_json
+        if has_malformed_npi:
+            has_malformed_npi_sibling = True
+            continue
         if all(resource_npi == requested_npi for resource_npi in exact_npis):
             admitted_resource_ids.add(resource_id)
-    if not admitted_resource_ids and malformed_npi_error is not None:
-        raise malformed_npi_error
+    if not admitted_resource_ids and has_malformed_npi_sibling:
+        raise UHCFlexPractitionerQueryError("resource_npi_invalid")
     return tuple((key, canonical_json_by_id[key]) for key in sorted(admitted_resource_ids))
 
 
