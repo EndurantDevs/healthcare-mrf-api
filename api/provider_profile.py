@@ -23,6 +23,7 @@ from api.provider_profile_composer_parts import (
     _initialize_composed_profile,
     _merge_fhir_profile_facts,
     _paginate_profile_category,
+    _public_fhir_fact,
 )
 from db.models import ProviderProfileProjection, db
 from process.florida_mqa_profile import PROFILE_SCHEMA_VERSION
@@ -178,16 +179,17 @@ def _filtered_fhir_fact_group(
 ) -> dict[str, Any] | None:
     """Filter one FHIR evidence group to facts present on the public page."""
     group = fact_group if isinstance(fact_group, Mapping) else {}
-    profile_items = [
-        profile_item
-        for profile_item in group.get("items", [])
-        if isinstance(profile_item, Mapping)
-        and (
-            str(fact_type),
-            evidence_value_key(str(fact_type), profile_item.get("value")),
-        )
-        in returned_fhir_keys
-    ]
+    profile_items = []
+    for profile_item in group.get("items", []):
+        if not isinstance(profile_item, Mapping):
+            continue
+        value = profile_item.get("value")
+        public_fact_type, _category = _public_fhir_fact(str(fact_type), value)
+        if (
+            public_fact_type,
+            evidence_value_key(public_fact_type, value),
+        ) in returned_fhir_keys:
+            profile_items.append(profile_item)
     if not profile_items:
         return None
     filtered_group_by_field = dict(group)

@@ -11042,7 +11042,7 @@ components:
           enum: [provider-profile/v1]
         composer_version:
           type: string
-          example: provider-profile-composer/v4
+          example: provider-profile-composer/v5
         npi:
           type: integer
           minimum: 1000000000

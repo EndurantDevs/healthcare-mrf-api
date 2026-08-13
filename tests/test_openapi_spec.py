@@ -456,7 +456,7 @@ def test_provider_profile_endpoint_documents_compact_and_paged_contracts():
     assert "never contains serialized JSON" in display_description
     assert schemas["ProviderProfileDocument"]["properties"]["composer_version"][
         "example"
-    ] == "provider-profile-composer/v4"
+    ] == "provider-profile-composer/v5"
 
 
 def test_npi_near_documents_exact_cursor_page_identity():
