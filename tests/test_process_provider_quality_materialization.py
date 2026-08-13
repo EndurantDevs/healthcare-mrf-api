@@ -81,7 +81,7 @@ async def test_materialize_query_contains_state_benchmark_and_extra_measures(mon
 
 
 @pytest.mark.asyncio
-async def test_materialize_cohort_query_contains_lsh_and_fallback_rules(monkeypatch):
+async def test_materialize_cohort_query_skips_unusable_lsh_and_l0(monkeypatch):
     statements: list[str] = []
 
     async def _fake_status(statement: str, *args, **kwargs):
@@ -103,11 +103,13 @@ async def test_materialize_cohort_query_contains_lsh_and_fallback_rules(monkeypa
     assert "unified_address_choice AS (" in materialize_sql
     assert "npi_address_choice AS (" in materialize_sql
     assert "FROM mrf.doctor_clinician_address" not in materialize_sql
-    assert "signatures AS (" in materialize_sql
-    assert "bands AS (" in materialize_sql
+    assert "signatures AS (" not in materialize_sql
+    assert "bands AS (" not in materialize_sql
     assert "cohort_expanded AS (" in materialize_sql
     assert "benchmark_modes AS (" in materialize_sql
-    assert "VALUES ('L0'), ('L1'), ('L2'), ('L3')" in materialize_sql
+    assert "VALUES ('L1'), ('L2'), ('L3')" in materialize_sql
+    assert "VALUES ('L0'), ('L1'), ('L2'), ('L3')" not in materialize_sql
+    assert "<> 'L0'" in materialize_sql
     assert "bm.benchmark_mode" in materialize_sql
     assert "AND LOWER(COALESCE(t.benchmark_mode, 'national')) = bm.benchmark_mode" in materialize_sql
     assert "COALESCE(c.procedure_bucket, 'bucket:none')::varchar AS procedure_bucket" in materialize_sql
