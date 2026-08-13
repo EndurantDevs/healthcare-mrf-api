@@ -5559,10 +5559,10 @@ async def _fetch_provider_directory_observations(
         params={"npi": str(npi)},
     )
     observations: list[dict[str, Any]] = []
-    for row in query_result.all():
-        mapping = getattr(row, "_mapping", row)
-        payload = _provider_directory_profile_json(mapping.get("payload_json"))
-        if payload is None:
+    for observation_row in query_result.all():
+        mapping = getattr(observation_row, "_mapping", observation_row)
+        observation_payload = _provider_directory_profile_json(mapping.get("payload_json"))
+        if observation_payload is None:
             continue
         observations.append(
             {
@@ -5574,7 +5574,7 @@ async def _fetch_provider_directory_observations(
                 "dataset_created_at": mapping.get("dataset_created_at"),
                 "resource_type": mapping.get("resource_type"),
                 "resource_id": mapping.get("resource_id"),
-                "resource": payload,
+                "resource": observation_payload,
             }
         )
     return observations
