@@ -39,16 +39,18 @@ _ZERO_SUMMARY_COUNTS = {
 }
 
 
-def _receipt_candidate_and_proof():
+def _receipt_candidate_and_proof(
+    dataset_id="dataset_candidate", root_run_id="root-candidate"
+):
     metadata = _large_metadata_by_field(
-        dataset_id="dataset_candidate",
-        root_run_id="root-candidate",
+        dataset_id=dataset_id,
+        root_run_id=root_run_id,
     )
     proof = metadata[importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY]
     candidate = importer.EndpointDatasetCandidate(
         endpoint_id="endpoint_shared",
-        dataset_id="dataset_candidate",
-        acquisition_root_run_id="root-candidate",
+        dataset_id=dataset_id,
+        acquisition_root_run_id=root_run_id,
         source_ids=("source_primary", "source_sibling"),
         selected_resources=("Location",),
         expected_resources=("Location",),
@@ -71,13 +73,15 @@ def _receipt_candidate_and_proof():
     return candidate, content_proof
 
 
-def _large_metadata_with_normalized_receipt() -> dict[str, object]:
-    candidate, content_proof = _receipt_candidate_and_proof()
+def _large_metadata_with_normalized_receipt(
+    dataset_id="dataset_candidate", root_run_id="root-candidate"
+) -> dict[str, object]:
+    candidate, content_proof = _receipt_candidate_and_proof(dataset_id, root_run_id)
     summary = importer._build_endpoint_dataset_source_summary(
         candidate,
         content_proof,
         _ZERO_SUMMARY_COUNTS,
-        "root-candidate",
+        root_run_id,
     )
     return importer._dataset_validation_metadata(
         candidate,
@@ -135,21 +139,25 @@ async def _install_selected_validator_sentinel(database, schema: str) -> None:
     )
 
 
-async def _install_receipt_candidate(database, schema: str) -> None:
-    await _insert_validated_shared_dataset(database, schema, seal=False)
-    metadata = _large_metadata_with_normalized_receipt()
+async def _install_receipt_candidate(
+    database, schema: str, dataset_id="dataset_candidate", root_run_id="root-candidate"
+) -> None:
+    await _insert_validated_shared_dataset(
+        database, schema, dataset_id=dataset_id, root_run_id=root_run_id, seal=False
+    )
+    metadata = _large_metadata_with_normalized_receipt(dataset_id, root_run_id)
     await _set_shared_semantic_proof(
         database,
         schema,
         metadata,
-        dataset_id="dataset_candidate",
+        dataset_id=dataset_id,
     )
     await backfill_provider_directory_admission_seal(
-        "dataset_candidate",
+        dataset_id,
         database=database,
     )
     await _set_selection_receipt(
-        database, schema, metadata, dataset_id="dataset_candidate"
+        database, schema, metadata, dataset_id=dataset_id
     )
 
 

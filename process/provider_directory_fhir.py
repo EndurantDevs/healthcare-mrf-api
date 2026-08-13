@@ -14811,6 +14811,29 @@ def _artifact_explicit_candidate_ids_ctes(
     )
     return f"""
         {_artifact_requested_candidate_endpoint_ids_cte(source_ref)},
+        {_artifact_candidate_universe_ctes(
+            dataset_ref,
+            source_ref,
+            metadata=metadata,
+            source_ids=source_ids,
+            safe_source_ids=safe_source_ids,
+            eligibility=eligibility,
+        )}
+    """
+
+
+def _artifact_candidate_universe_ctes(
+    dataset_ref: str,
+    source_ref: str,
+    *,
+    metadata: str,
+    source_ids: str,
+    safe_source_ids: str,
+    eligibility: str,
+) -> str:
+    """Build the bounded candidates before applying generic preference."""
+
+    return f"""
         candidate_source_ids AS MATERIALIZED (
             SELECT dataset.dataset_id, dataset.endpoint_id
               FROM {dataset_ref} AS dataset
@@ -14829,8 +14852,20 @@ def _artifact_explicit_candidate_ids_ctes(
                AND dataset.status = :validated_status
                AND dataset.superseded_at IS NULL
                AND NOT ({_artifact_admission_seal_shape_valid_sql()})
-        ), eligible_candidate_ids AS MATERIALIZED (
-            SELECT dataset.dataset_id, dataset.endpoint_id
+        ), eligible_candidates AS MATERIALIZED (
+            SELECT dataset.dataset_id,
+                   dataset.endpoint_id,
+                   ({safe_source_ids}) AS publication_source_ids,
+                   ({_artifact_profile_absence_sql(
+                       source_ref,
+                       metadata,
+                   )}) AS generic_profile_absent,
+                   ({_artifact_admission_seal_absent_sql()}) AS legacy_candidate,
+                   (
+                       ({_artifact_admission_seal_valid_sql()})
+                       AND ({_artifact_seal_receipt_consistent_sql()})
+                       AND dataset.artifact_selection_receipt_json IS NOT NULL
+                   ) AS sealed_generic_authority
               FROM candidate_source_ids AS candidate
               JOIN {dataset_ref} AS dataset
                 ON dataset.dataset_id = candidate.dataset_id
@@ -14843,6 +14878,36 @@ def _artifact_explicit_candidate_ids_ctes(
                AND jsonb_array_length({safe_source_ids}) > 0
                AND ({safe_source_ids}) ?| CAST(:source_ids AS text[])
                AND ({eligibility})
+        ), {_artifact_preferred_candidate_ids_cte()}
+    """
+
+
+def _artifact_preferred_candidate_ids_cte() -> str:
+    """Let exact sealed generic authority replace its legacy predecessor."""
+
+    return """
+        eligible_candidate_ids AS MATERIALIZED (
+            SELECT candidate.dataset_id, candidate.endpoint_id
+              FROM eligible_candidates AS candidate
+             WHERE candidate.generic_profile_absent IS NOT TRUE
+                OR candidate.sealed_generic_authority IS TRUE
+                OR candidate.legacy_candidate IS NOT TRUE
+                OR NOT EXISTS (
+                    SELECT 1
+                      FROM eligible_candidates AS sealed
+                     WHERE sealed.endpoint_id = candidate.endpoint_id
+                       AND sealed.generic_profile_absent IS TRUE
+                       AND sealed.sealed_generic_authority IS TRUE
+                       AND jsonb_array_length(
+                               sealed.publication_source_ids
+                           ) = jsonb_array_length(
+                               candidate.publication_source_ids
+                           )
+                       AND sealed.publication_source_ids
+                               @> candidate.publication_source_ids
+                       AND candidate.publication_source_ids
+                               @> sealed.publication_source_ids
+                )
         )
     """
 

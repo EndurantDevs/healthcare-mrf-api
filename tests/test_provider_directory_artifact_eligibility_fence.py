@@ -200,6 +200,27 @@ def test_reviewed_candidate_sql_has_closed_single_root_policy_branch():
     assert "twin_state' = 'not_required'" in eligibility_sql
 
 
+def test_candidate_universe_prefers_exact_sealed_generic_authority():
+    eligibility_sql = " ".join(
+        importer._artifact_explicit_candidate_ids_ctes(
+            "dataset_table",
+            "source_table",
+        ).split()
+    )
+
+    assert "eligible_candidates AS MATERIALIZED" in eligibility_sql
+    assert "sealed_generic_authority" in eligibility_sql
+    assert "legacy_candidate" in eligibility_sql
+    assert "num_nonnulls(" in eligibility_sql
+    assert "artifact_selection_receipt_json IS NOT NULL" in eligibility_sql
+    assert "sealed.publication_source_ids @> candidate.publication_source_ids" in (
+        eligibility_sql
+    )
+    assert "candidate.publication_source_ids @> sealed.publication_source_ids" in (
+        eligibility_sql
+    )
+
+
 @pytest.mark.asyncio
 async def test_locked_fence_ignores_ineligible_old_generation_candidate():
     """Lock only the exact reviewed candidate after endpoint serialization."""
