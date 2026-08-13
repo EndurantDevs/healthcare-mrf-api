@@ -378,6 +378,32 @@ def test_opened_blob_detects_ancestor_replacement_with_real_directory(
         parked_directory.rename(blob_directory)
 
 
+def test_opened_blob_detects_leaf_replacement_during_digest(
+    retained_artifact_test_root: Path,
+    monkeypatch,
+) -> None:
+    artifact_bytes = b"digest-race-bound\n"
+    artifact_sha256, blob_path = write_retained_artifact_blob(
+        retained_artifact_test_root, artifact_bytes
+    )
+    opened_blob = _open_retained_artifact_blob(
+        artifact_sha256,
+        len(artifact_bytes),
+    )
+    original_file_digest = blob_store.hashlib.file_digest
+
+    def replace_after_digest(*args, **kwargs):
+        digest = original_file_digest(*args, **kwargs)
+        replacement = blob_path.with_name(f"{blob_path.name}.replacement")
+        replacement.write_bytes(b"X" * len(artifact_bytes))
+        os.replace(replacement, blob_path)
+        return digest
+
+    monkeypatch.setattr(blob_store.hashlib, "file_digest", replace_after_digest)
+    with pytest.raises(RetainedArtifactError, match="identity_changed"):
+        opened_blob.verify_and_close()
+
+
 def test_open_blob_rejects_wrong_size_missing_file_and_platform_guard(
     retained_artifact_test_root: Path,
     monkeypatch,

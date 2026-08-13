@@ -245,6 +245,14 @@ class _OpenedArtifactBlob:
             raise RetainedArtifactError("retained_blob_reader_closed")
         fresh_descriptors: list[int] = []
         try:
+            if not content_digest_verified:
+                with os.fdopen(os.dup(self._descriptor), "rb") as retained_blob:
+                    retained_digest = hashlib.file_digest(
+                        retained_blob,
+                        "sha256",
+                    ).hexdigest()
+                    if retained_digest != self._leaf_name:
+                        raise RetainedArtifactError("retained_blob_identity_changed")
             fresh_descriptors, fresh_identities = _open_directory_chain(
                 self._directory_components
             )
@@ -267,14 +275,6 @@ class _OpenedArtifactBlob:
                 == self._file_identity
             ):
                 raise RetainedArtifactError("retained_blob_identity_changed")
-            if not content_digest_verified:
-                with os.fdopen(os.dup(self._descriptor), "rb") as retained_blob:
-                    retained_digest = hashlib.file_digest(
-                        retained_blob,
-                        "sha256",
-                    ).hexdigest()
-                    if retained_digest != self._leaf_name:
-                        raise RetainedArtifactError("retained_blob_identity_changed")
         except OSError as error:
             raise RetainedArtifactError("retained_blob_identity_changed") from error
         finally:
