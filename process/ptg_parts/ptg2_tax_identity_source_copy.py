@@ -117,6 +117,7 @@ def _open_anonymous_projection_copy(scratch_parent: Path) -> BinaryIO:
         scratch_descriptor, scratch_identity = _open_scratch_parent(scratch_parent)
         copy_file = tempfile.TemporaryFile(
             mode="w+b",
+            buffering=0,
             prefix=".ptg2-tax-source-",
             dir=scratch_parent,
         )
