@@ -33,6 +33,12 @@ CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID = (
 CAPACITY_PREFLIGHT_CONTRACT_ID = (
     "healthporta.provider-directory-profile-capacity-preflight.v3"
 )
+CAPACITY_AUTHORITY_PROJECTION_REQUEST_CONTRACT_ID = (
+    "healthporta.provider-directory-profile-capacity-authority-projection-request.v1"
+)
+CAPACITY_AUTHORITY_PROJECTION_CONTRACT_ID = (
+    "healthporta.provider-directory-profile-capacity-authority-projection.v1"
+)
 CAPACITY_SIGNING_GUARD_REQUEST_CONTRACT_ID = (
     "healthporta.provider-directory-profile-capacity-signing-guard-request.v1"
 )
@@ -61,6 +67,13 @@ _REQUEST_FIELDS = frozenset(
         "profile_execution",
         "provider_directory_profile_capacity_limits",
         "signing_guard",
+    }
+)
+_AUTHORITY_PROJECTION_REQUEST_FIELDS = frozenset(
+    {
+        "contract_id",
+        "profile_execution",
+        "provider_directory_profile_capacity_limits",
     }
 )
 _EXECUTION_FIELDS = frozenset(
@@ -102,6 +115,19 @@ class ProviderDirectoryProfileCapacityPreflightRequest:
     request_nonce: str
     control_plane_receipt_sha256: str
     expires_at: datetime.datetime
+    request_payload: dict[str, Any]
+    request_sha256: str
+
+
+@dataclass(frozen=True)
+class ProfileCapacityAuthorityProjectionRequest:
+    """Validated execution and reviewed limits for one read-only projection."""
+
+    execution: ProviderDirectoryProfileExecution
+    execution_payload: dict[str, Any]
+    limits: ProviderDirectoryProfileCapacityLimits
+    limits_payload: dict[str, Any]
+    limits_sha256: str
     request_payload: dict[str, Any]
     request_sha256: str
 
@@ -322,6 +348,56 @@ def validated_capacity_preflight_request(
     )
 
 
+def validated_capacity_authority_projection_request(
+    raw_request: Any,
+) -> ProfileCapacityAuthorityProjectionRequest:
+    """Validate one closed, receipt-free authority projection request."""
+
+    request_map = dict(
+        _exact_mapping(
+            raw_request,
+            _AUTHORITY_PROJECTION_REQUEST_FIELDS,
+            reason="authority_projection_request_fields_invalid",
+        )
+    )
+    if (
+        request_map.get("contract_id")
+        != CAPACITY_AUTHORITY_PROJECTION_REQUEST_CONTRACT_ID
+    ):
+        raise ProviderDirectoryProfileCapacityPreflightError(
+            "provider_directory_profile_capacity_preflight_"
+            "authority_projection_request_contract_invalid"
+        )
+    execution, execution_payload = _validated_execution_payload(
+        request_map["profile_execution"]
+    )
+    limits, limits_payload, limits_digest = _validated_limits_payload(
+        request_map["provider_directory_profile_capacity_limits"]
+    )
+    normalized_by_field = {
+        "contract_id": CAPACITY_AUTHORITY_PROJECTION_REQUEST_CONTRACT_ID,
+        "profile_execution": execution_payload,
+        "provider_directory_profile_capacity_limits": limits_payload,
+    }
+    if request_map != normalized_by_field:
+        raise ProviderDirectoryProfileCapacityPreflightError(
+            "provider_directory_profile_capacity_preflight_"
+            "authority_projection_request_not_canonical"
+        )
+    return ProfileCapacityAuthorityProjectionRequest(
+        execution=execution,
+        execution_payload=execution_payload,
+        limits=limits,
+        limits_payload=limits_payload,
+        limits_sha256=limits_digest,
+        request_payload=normalized_by_field,
+        request_sha256=preflight_domain_sha256(
+            CAPACITY_AUTHORITY_PROJECTION_REQUEST_CONTRACT_ID,
+            normalized_by_field,
+        ),
+    )
+
+
 def assert_preflight_expiry(
     request: ProviderDirectoryProfileCapacityPreflightRequest,
     *,
@@ -342,7 +418,10 @@ def assert_preflight_expiry(
 
 
 def profile_execution_identity_payload(
-    request: ProviderDirectoryProfileCapacityPreflightRequest,
+    request: (
+        ProviderDirectoryProfileCapacityPreflightRequest
+        | ProfileCapacityAuthorityProjectionRequest
+    ),
 ) -> dict[str, Any]:
     """Return the exact v6/source-delta identity exposed to the signer."""
 
@@ -377,6 +456,8 @@ def utc_second_text(value: datetime.datetime) -> str:
 
 
 __all__ = (
+    "CAPACITY_AUTHORITY_PROJECTION_CONTRACT_ID",
+    "CAPACITY_AUTHORITY_PROJECTION_REQUEST_CONTRACT_ID",
     "CAPACITY_CONTROL_PLANE_RECEIPT_SHA256_FIELD",
     "CAPACITY_LIMITS_DIGEST_DOMAIN",
     "CAPACITY_PREFLIGHT_CONTRACT_ID",
@@ -388,6 +469,7 @@ __all__ = (
     "CAPACITY_SIGNING_GUARD_REQUEST_CONTRACT_ID",
     "ProviderDirectoryProfileCapacityPreflightError",
     "ProviderDirectoryProfileCapacityPreflightRequest",
+    "ProfileCapacityAuthorityProjectionRequest",
     "assert_preflight_expiry",
     "canonical_capacity_limits_payload",
     "canonical_preflight_json",
@@ -396,4 +478,5 @@ __all__ = (
     "profile_execution_identity_payload",
     "utc_second_text",
     "validated_capacity_preflight_request",
+    "validated_capacity_authority_projection_request",
 )

@@ -867,6 +867,27 @@ the byte-identical unconsumed request returns the byte-identical receipt;
 reusing its nonce with different input, replaying it after expiry or
 consumption, or observing database/serving-state drift fails closed.
 
+Before authority provisioning, the authenticated endpoint
+`POST /control/provider-directory/profile-capacity-authority-projection`
+accepts the smaller closed
+`healthporta.provider-directory-profile-capacity-authority-projection-request.v1`
+request containing only that execution and limits document. It computes the
+same execution identity, geometry, storage-class reservation, artifact-scope,
+runtime, and serving facts in a `SERIALIZABLE READ ONLY` transaction and
+returns the self-hashed
+`healthporta.provider-directory-profile-capacity-authority-projection.v1`
+response. It never creates, replays, or consumes a capacity receipt and does
+not accept a signing guard, lease, signature, trust document, or private key.
+
+This projection route requires the ordinary control bearer token and a direct
+loopback peer socket. It reads `request.conn_info.peername`, accepts IPv4 or
+IPv6 loopback, ignores forwarding headers, and fails closed when the peer is
+missing or malformed. Operators must call it through direct in-pod loopback
+transport; the route must not be exposed through a Service, ingress, sidecar,
+or other loopback reverse proxy. Its response is a review input, not capacity
+authorization, and becomes stale when the selected Profile, database,
+runtime, serving generation, or reviewed limits change.
+
 First-generation Profile execution requires
 `provider-directory-database-capacity-lease-v3`. Its Ed25519-signed body
 contains `signing_preflight_guard` and
