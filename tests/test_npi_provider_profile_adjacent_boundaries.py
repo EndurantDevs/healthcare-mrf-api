@@ -80,6 +80,16 @@ def test_query_normalizers_cover_absence_invalidity_and_human_fallbacks(
     assert npi._provider_display_name_from_mapping({}) == "Unknown"
 
 
+def test_optional_bounded_int_rejects_non_numeric_values():
+    with pytest.raises(npi.sanic.exceptions.InvalidUsage, match="must be an integer"):
+        npi._parse_optional_bounded_int(
+            "not-a-number",
+            param_name="page",
+            minimum=1,
+            maximum=10,
+        )
+
+
 @pytest.mark.asyncio
 async def test_classification_lookups_handle_empty_cache_and_row_variants(
     monkeypatch,
