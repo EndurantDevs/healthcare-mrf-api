@@ -1,0 +1,3 @@
+-r requirements-dev.txt
+pip==26.1.2
+pip-audit==2.10.1

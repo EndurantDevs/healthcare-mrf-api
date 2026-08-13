@@ -8,6 +8,8 @@ arc_image='ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218
 postgres_image='postgis/postgis:18-3.6@sha256:0aacdfb9dda40942d424785c3ccabeffe31da9cc9e26b0dfd93b222b31462871'
 redis_image='redis:7@sha256:e9b2e45ecd47fbb69b877cf8d045d5cccaaaed52524b6e098b4abe8212994f73'
 semgrep_image='returntocorp/semgrep-agent@sha256:50140e658095736c7f9d2c12c1e8a98b13f044b773dc79aa98e83b8117dbf096'
+container_rust_image='docker.io/library/rust:1.97.1-slim-trixie@sha256:fc0648ac2962539be80bd424729a20fd80f7b64bfba7e90bbd642aed6c697c5a'
+container_python_image='docker.io/library/python:3.14.6-slim-trixie@sha256:b921fe7e7522f828d45197a47656ec465a9b15689b27fa8e1fba2864fca5b967'
 
 capacity_test_paths=${CAPACITY_TEST_PATHS:-$'tests/test_ptg2_capacity_evidence.py\ntests/test_ptg2_v3_bounded_readers.py\ntests/test_ptg2_v3_capacity_gate.py\ntests/test_ptg2_v3_capacity_gate_adversarial.py\ntests/test_ptg2_v3_capacity_resources.py'}
 artifact_root=${PREPUSH_ARTIFACT_ROOT:-.}
@@ -41,12 +43,31 @@ EOF
   exit 2
 }
 
+prepare_python_environment() {
+  if [ "${PREPUSH_DEPS_READY:-0}" = 1 ]; then
+    return
+  fi
+  if [ "${PREPUSH_PYTHON_ENV_READY:-0}" = 1 ]; then
+    return
+  fi
+  python_environment_root=$(mktemp -d "${RUNNER_TEMP:-/tmp}/healthcare-prepush-python.XXXXXX")
+  python -m venv "$python_environment_root/venv"
+  export VIRTUAL_ENV="$python_environment_root/venv"
+  export PATH="$VIRTUAL_ENV/bin:$PATH"
+  unset PYTHONHOME || true
+  export PREPUSH_PYTHON_ENV_READY=1
+  cleanup_python_environment() {
+    rm -rf -- "$python_environment_root"
+  }
+  trap cleanup_python_environment EXIT
+}
+
 install_python_dependencies() {
   if [ "${PREPUSH_DEPS_READY:-0}" = 1 ]; then
     return
   fi
-  python -m pip install --upgrade pip
-  python -m pip install -r requirements-dev.txt
+  prepare_python_environment
+  scripts/ci/install_python_lock
 }
 
 require_base_sha() {
@@ -113,10 +134,8 @@ run_python_main() {
   if [ "${PREPUSH_DEPS_READY:-0}" = 1 ]; then
     cargo build --locked --bins --manifest-path support/ptg2_scanner/Cargo.toml
   else
-    (
-      python -m pip install --upgrade pip
-      python -m pip install -r requirements-dev.txt
-    ) &
+    prepare_python_environment
+    install_python_dependencies &
     local pip_pid=$!
     cargo build --locked --bins --manifest-path support/ptg2_scanner/Cargo.toml &
     local cargo_pid=$!
@@ -170,7 +189,7 @@ run_capacity() {
 }
 
 run_python_coverage() {
-  python -m pip install coverage==7.15.4
+  install_python_dependencies
   require_base_sha
   timeout --foreground 295s python scripts/coverage_ratchet.py --self-test
   timeout --foreground 295s python scripts/coverage_forecast.py forecast-python \
@@ -224,9 +243,22 @@ run_rust() {
       tests/test_provider_directory_projection_native_cli_parity.py \
       tests/test_provider_directory_projection_native_copy_adversarial.py
   (
+    local wheel_directory
+    wheel_directory=$(mktemp -d "${RUNNER_TEMP:-/tmp}/healthcare-ptg2-wheel.XXXXXX")
+    trap 'rm -rf -- "$wheel_directory"' EXIT
     cd support/ptg2_scanner
-    python -m maturin build --release --features python-extension --out target/wheels
-    python -m pip install target/wheels/*.whl
+    python -m maturin build --release --features python-extension --out "$wheel_directory"
+    shopt -s nullglob
+    local wheels=("$wheel_directory"/*.whl)
+    [ "${#wheels[@]}" -eq 1 ]
+    if [ "$artifact_root" != . ]; then
+      printf '%s  %s\n' \
+        "$(sha256sum "${wheels[0]}" | awk '{print $1}')" \
+        "$(basename "${wheels[0]}")" \
+        > "$(artifact_path ptg2-address-canon-wheel.sha256)"
+    fi
+    python -m pip install --no-deps "${wheels[0]}"
+    python -m pip check
   )
   timeout --foreground 295s python -m pytest -q tests/test_address_canon_pyo3.py
   (
@@ -244,26 +276,27 @@ run_rust() {
 
 run_container_package() {
   local source_commit=${GITHUB_SHA:-$(git rev-parse HEAD)}
+  local image=${PREPUSH_CONTAINER_IMAGE:-healthcare-mrf-api:ptg-v4-gate}
   docker build \
     --platform linux/amd64 \
     --build-arg "HLTHPRT_SOURCE_COMMIT=${source_commit}" \
-    --tag healthcare-mrf-api:ptg-v4-gate \
+    --tag "$image" \
     .
   if docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
-    healthcare-mrf-api:ptg-v4-gate \
+    "$image" \
     | grep -q '^HLTHPRT_SOURCE_COMMIT='; then
     exit 1
   fi
   docker run --rm --platform linux/amd64 \
     --entrypoint /bin/sh \
-    healthcare-mrf-api:ptg-v4-gate \
+    "$image" \
     -ec '
       test "$(cat /opt/healthporta/build-identity/healthcare-source-commit)" = "$1"
       test "$(stat -c "%u:%g:%a:%h:%s" /opt/healthporta/build-identity/healthcare-source-commit)" = "0:0:444:1:41"
     ' sh "$source_commit"
   docker run --rm --platform linux/amd64 \
     --entrypoint /bin/sh \
-    healthcare-mrf-api:ptg-v4-gate \
+    "$image" \
     -ec '
       test -x /opt/support/ptg2_scanner/target/release/ptg2_scanner
       test -x /opt/support/ptg2_scanner/target/release/ptg2_provider_graph_v4
@@ -272,7 +305,7 @@ run_container_package() {
     '
   docker run --rm --platform linux/amd64 \
     --entrypoint /bin/sh \
-    healthcare-mrf-api:ptg-v4-gate \
+    "$image" \
     -ec '
       set +e
       operation_output=$(env \
@@ -289,7 +322,7 @@ run_container_package() {
     '
   docker run --rm --platform linux/amd64 \
     --entrypoint /bin/sh \
-    healthcare-mrf-api:ptg-v4-gate \
+    "$image" \
     -ec '
       set +e
       operation_output=$(env \
@@ -309,7 +342,7 @@ run_container_package() {
     '
   docker run --rm --platform linux/amd64 \
     --entrypoint /bin/sh \
-    healthcare-mrf-api:ptg-v4-gate \
+    "$image" \
     -ec '
       set +e
       operation_output=$(env \
@@ -331,7 +364,7 @@ run_container_package() {
     '
   docker run --rm --platform linux/amd64 \
     --entrypoint /bin/sh \
-    healthcare-mrf-api:ptg-v4-gate \
+    "$image" \
     -ec '
       set +e
       operation_output=$(env \
@@ -350,7 +383,7 @@ run_container_package() {
     '
   docker run --rm --platform linux/amd64 \
     --entrypoint /bin/sh \
-    healthcare-mrf-api:ptg-v4-gate \
+    "$image" \
     -ec '
       for operation in \
         sync-verified-state \
@@ -376,7 +409,7 @@ run_container_package() {
     '
   docker run --rm --platform linux/amd64 \
     --entrypoint /bin/sh \
-    healthcare-mrf-api:ptg-v4-gate \
+    "$image" \
     -ec '
       set +e
       operation_output=$(env \
@@ -393,10 +426,8 @@ run_container_package() {
 
 run_security() {
   if [ "${PREPUSH_SKIP_AUDIT:-0}" != 1 ]; then
-    python -m pip install --upgrade pip
-    python -m pip install pip-audit==2.10.1
-    pip-audit -r requirements.txt
-    pip-audit -r requirements-dev.txt
+    install_python_dependencies
+    python -m pip_audit --disable-pip --require-hashes -r requirements-ci.lock
   fi
   if [ "${PREPUSH_SKIP_SEMGREP:-0}" != 1 ]; then
     local security_git_common_dir
@@ -865,10 +896,8 @@ run_postgres() {
   if [ "${PREPUSH_DEPS_READY:-0}" = 1 ]; then
     cargo build --manifest-path support/ptg2_scanner/Cargo.toml
   else
-    (
-      python -m pip install --upgrade pip
-      python -m pip install -r requirements-dev.txt
-    ) &
+    prepare_python_environment
+    install_python_dependencies &
     local pip_pid=$!
     cargo build --manifest-path support/ptg2_scanner/Cargo.toml &
     local cargo_pid=$!
@@ -963,8 +992,13 @@ run_all() {
   local network="healthcare-prepush-${suffix}"
   local postgres_container="healthcare-prepush-postgres-${suffix}"
   local redis_container="healthcare-prepush-redis-${suffix}"
+  local container_image="healthcare-mrf-api:prepush-${candidate_sha:0:12}-${suffix}"
   local artifacts=${PREPUSH_RECEIPT_DIR:-}
   local git_common_dir
+  local python_lock_input_sha256
+  local python_lock_sha256
+  python_lock_input_sha256=$(sha256sum requirements-ci.in | awk '{print $1}')
+  python_lock_sha256=$(sha256sum requirements-ci.lock | awk '{print $1}')
   if [ -z "$artifacts" ]; then
     artifacts=$(mktemp -d "${TMPDIR:-/tmp}/healthcare-prepush-receipt.XXXXXX")
   else
@@ -989,7 +1023,13 @@ arc_image=$arc_image
 postgres_image=$postgres_image
 redis_image=$redis_image
 semgrep_image=$semgrep_image
-python_version=3.14
+container_image_tag=$container_image
+container_rust_image=$container_rust_image
+container_python_image=$container_python_image
+python_version=3.14.6
+python_lock_input_sha256=$python_lock_input_sha256
+python_lock_sha256=$python_lock_sha256
+pip_version=26.1.2
 rust_toolchain=1.97.1
 cargo_llvm_cov_version=0.8.7
 cargo_audit_version=0.22.2
@@ -1070,6 +1110,7 @@ EOF
     --env PREPUSH_MAIN_ARTIFACTS=/artifacts/coverage-data/main \
     --env PREPUSH_CAPACITY_ARTIFACTS=/artifacts/coverage-data/capacity \
     --env PREPUSH_POSTGRES_ARTIFACTS=/artifacts/coverage-data/postgres \
+    --env PREPUSH_PIP_REPORT=/artifacts/python-lock-install-report.json \
     "$arc_image" \
     bash -lc '
       set -euo pipefail
@@ -1080,8 +1121,8 @@ EOF
       mkdir -p "$HOME" "$CARGO_HOME" "$RUSTUP_HOME" /artifacts/coverage-data/{main,capacity,postgres}
       cp -R /usr/local/rustup/. "$RUSTUP_HOME/"
       python -m venv /tmp/venv
-      python -m pip install --upgrade pip
-      python -m pip install -r requirements-dev.txt
+      scripts/ci/install_python_lock
+      python -m pip freeze --all > /artifacts/python-locked-versions.txt
       rustup component add rustfmt clippy llvm-tools-preview
       git config --global --add safe.directory /workspace
       export PREPUSH_DEPS_READY=1
@@ -1122,6 +1163,8 @@ EOF
       gate rust rust
       {
         python --version
+        python -m pip --version
+        python -c '"'"'import platform, sys; print(f"python_cache_tag={sys.implementation.cache_tag}"); print(f"platform={platform.platform()}"); print(f"machine={platform.machine()}"); print(f"libc={platform.libc()}")'"'"'
         cargo --version
         rustc --version
         cargo llvm-cov --version
@@ -1146,7 +1189,7 @@ async def main() -> None:
 asyncio.run(main())
 PY
       } > /artifacts/tool-versions.txt
-      sha256sum requirements.txt requirements-dev.txt support/ptg2_scanner/Cargo.lock test-coverage-baseline.json > /artifacts/input-sha256.txt
+      sha256sum requirements.txt requirements-dev.txt requirements-ci.in requirements-ci.lock scripts/ci/install_python_lock support/ptg2_scanner/Cargo.lock test-coverage-baseline.json > /artifacts/input-sha256.txt
     '
 
   require_margin "$artifacts/test-coverage-forecast-python.json" python lines 5
@@ -1155,15 +1198,26 @@ PY
   PREPUSH_SKIP_AUDIT=1 GITHUB_EVENT_NAME=push GITHUB_SHA="$candidate_sha" run_security
   assert_candidate_unchanged "$candidate_sha"
   printf 'gate=security-semgrep passed\n' >> "$artifacts/receipt.txt"
-  GITHUB_SHA="$candidate_sha" run_container_package
+  PREPUSH_CONTAINER_IMAGE="$container_image" GITHUB_SHA="$candidate_sha" run_container_package
   assert_candidate_unchanged "$candidate_sha"
   printf 'gate=container-package passed\n' >> "$artifacts/receipt.txt"
+  local container_image_id
+  container_image_id=$(docker image inspect --format '{{.Id}}' "$container_image")
+  printf '%s\n' "$container_image_id" > "$artifacts/container-image-id.txt"
   docker version > "$artifacts/docker-version.txt"
   cat >> "$artifacts/receipt.txt" <<EOF
 status=passed
 completed_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 python_forecast=$artifacts/test-coverage-forecast-python.json
 rust_forecast=$artifacts/test-coverage-forecast-rust.json
+python_locked_versions=$artifacts/python-locked-versions.txt
+python_locked_versions_sha256=$(sha256sum "$artifacts/python-locked-versions.txt" | awk '{print $1}')
+python_install_report=$artifacts/python-lock-install-report.json
+python_install_report_sha256=$(sha256sum "$artifacts/python-lock-install-report.json" | awk '{print $1}')
+ptg2_wheel_evidence=$artifacts/ptg2-address-canon-wheel.sha256
+ptg2_wheel_sha256=$(awk '{print $1}' "$artifacts/ptg2-address-canon-wheel.sha256")
+container_image_id=$container_image_id
+container_image_id_evidence=$artifacts/container-image-id.txt
 EOF
   cleanup_all
   trap - EXIT

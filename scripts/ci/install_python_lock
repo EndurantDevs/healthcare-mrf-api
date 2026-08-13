@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$repository_root"
+
+python scripts/ci/validate_python_lock_inputs
+
+python - <<'PY'
+import platform
+
+
+actual = (platform.python_version(), platform.system(), platform.machine())
+expected = ("3.14.6", "Linux", "x86_64")
+if actual != expected:
+    raise SystemExit(
+        "requirements-ci.lock targets CPython 3.14.6 on Linux x86_64; "
+        f"found {actual[0]} on {actual[1]} {actual[2]}. "
+        "Run scripts/ci/prepush all on a native Linux/amd64 Docker engine."
+    )
+PY
+
+report=${PREPUSH_PIP_REPORT:-${RUNNER_TEMP:-/tmp}/healthcare-python-lock-install.json}
+mkdir -p "$(dirname "$report")"
+python -m pip install \
+  --force-reinstall \
+  --no-compile \
+  --only-binary=:all: \
+  --report "$report" \
+  --require-hashes \
+  -r requirements-ci.lock
+python -m pip check
+test "$(python -m pip --version | awk '{print $2}')" = 26.1.2
+python - "$report" <<'PY'
+import json
+from pathlib import Path
+import re
+import sys
+
+
+normalize = lambda name: re.sub(r"[-_.]+", "-", name).lower()
+lock_names = {
+    normalize(line.split("==", 1)[0])
+    for line in Path("requirements-ci.lock").read_text(encoding="utf-8").splitlines()
+    if line and not line.startswith(("#", "--"))
+}
+report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+report_names = {
+    normalize(str(item.get("metadata", {}).get("name", "")))
+    for item in report.get("install", [])
+}
+if report_names != lock_names or len(report.get("install", [])) != len(lock_names):
+    raise SystemExit("pip install report does not match the complete lock")
+PY
