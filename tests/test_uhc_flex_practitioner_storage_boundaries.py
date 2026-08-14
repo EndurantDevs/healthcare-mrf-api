@@ -162,6 +162,31 @@ async def test_store_operation_inputs_and_stale_lease_outcomes_fail_closed():
             identity.acquisition_id,
             requested_npi=1,
         )
+    for operation in (
+        store.claim_uhc_flex_practitioner_work(
+            identity.acquisition_id,
+            lease_seconds=29,
+        ),
+        store.heartbeat_uhc_flex_practitioner_work(claim, lease_seconds=29),
+    ):
+        with pytest.raises(ValueError):
+            await operation
+
+    with pytest.raises(store_contract.UHCFlexPractitionerStoreError) as error_info:
+        await store.heartbeat_uhc_flex_practitioner_work(
+            claim,
+            database=_Database(status_counts=(0,)),
+        )
+    assert error_info.value.code == "lease_lost"
+
+    assert store._claim_from_row(None) is None
+    with pytest.raises(store_contract.UHCFlexPractitionerStoreError):
+        store._claim_from_row({"acquisition_id": "invalid"})
+
+
+@pytest.mark.asyncio
+async def test_claim_rejects_invalid_fresh_only_selection():
+    identity = _identity()
     for excluded_npis in (
         [NPI],
         (NPI, NPI),
@@ -186,26 +211,6 @@ async def test_store_operation_inputs_and_stale_lease_outcomes_fail_closed():
                 requested_npi=requested_npi,
                 fresh_only=fresh_only,
             )
-    for operation in (
-        store.claim_uhc_flex_practitioner_work(
-            identity.acquisition_id,
-            lease_seconds=29,
-        ),
-        store.heartbeat_uhc_flex_practitioner_work(claim, lease_seconds=29),
-    ):
-        with pytest.raises(ValueError):
-            await operation
-
-    with pytest.raises(store_contract.UHCFlexPractitionerStoreError) as error_info:
-        await store.heartbeat_uhc_flex_practitioner_work(
-            claim,
-            database=_Database(status_counts=(0,)),
-        )
-    assert error_info.value.code == "lease_lost"
-
-    assert store._claim_from_row(None) is None
-    with pytest.raises(store_contract.UHCFlexPractitionerStoreError):
-        store._claim_from_row({"acquisition_id": "invalid"})
 
 
 @pytest.mark.asyncio
