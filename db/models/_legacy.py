@@ -5375,6 +5375,8 @@ class PricingProviderQualityMeasure(Base, JSONOutputMixin):
     evidence_n = Column(Integer)
     peer_group = Column(String(128))
     cohort_level = Column(String(32))
+    cohort_geography_scope = Column(String(16))
+    cohort_geography_value = Column(String(128))
     cohort_specialty_key = Column(String(128))
     cohort_taxonomy_code = Column(String(32))
     cohort_procedure_bucket = Column(String(64))
