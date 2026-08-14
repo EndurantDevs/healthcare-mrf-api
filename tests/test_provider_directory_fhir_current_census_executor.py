@@ -302,6 +302,7 @@ async def test_command_census_preflight_runs_before_startup(monkeypatch):
     async def record_process(_runtime_context, task_by_field):
         event_names.append("process")
         assert task_by_field["provider_directory_census_cutoff"] == CUTOFF
+        assert task_by_field["restart_expired_current_census_slice"] is False
         return {"ok": True}
 
     async def record_shutdown(_runtime_context):
@@ -318,6 +319,7 @@ async def test_command_census_preflight_runs_before_startup(monkeypatch):
         "source_ids": ["synthetic-source"],
         "resources": "Organization",
         "import_resources": True,
+        "restart_expired_current_census_slice": False,
     }
 
     assert await importer.run_provider_directory_fhir_command(

@@ -281,10 +281,14 @@ traversal may use one direct retry with `--retry-of-run-id` and
 `--pagination-root-run-id` to reuse its exact candidate and completed
 checkpoints. It may clear and re-fetch only a resource whose opaque cursor or
 terminal census proof is invalid; all other completed resource slices remain
-unchanged. A terminally disposed or otherwise ineligible root instead requires
-a fresh campaign with a new cutoff, campaign identity, and root. Publication,
-Profile admission, and API verification remain separate reviewed operations
-after the acquisition proof passes.
+unchanged. If that slice has already been reset and the same logical retry is
+continued in a replacement execution, pass
+`--no-restart-expired-current-census-slice`; another expired cursor then fails
+closed without deleting the retained slice or its proof shards. A terminally
+disposed or otherwise ineligible root instead requires a fresh campaign with a
+new cutoff, campaign identity, and root. Publication, Profile admission, and
+API verification remain separate reviewed operations after the acquisition
+proof passes.
 
 ## Source
 
@@ -658,7 +662,10 @@ an independent row while failed-root evidence remains available for audit.
 For a current-version census, a direct retry resets an expired continuation or
 terminally drifted resource slice once, re-establishes its pre-count proof, and
 re-fetches that slice from its canonical start URL. It never treats the failed
-slice as complete or alters the other completed resource slices.
+slice as complete or alters the other completed resource slices. A replacement
+execution after that reset must use
+`--no-restart-expired-current-census-slice` to preserve the active slice if its
+new cursor also expires.
 Failed-root checkpoint retention is intentionally conservative: cleanup must
 first prove that the endpoint candidate is neither current nor
 active/incomplete and that no orchestrated run in the root lineage is live.

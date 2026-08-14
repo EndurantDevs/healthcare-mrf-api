@@ -267,6 +267,7 @@ def test_runtime_requires_unbounded_serial_unpublished_controls():
     "task_override",
     (
         {"probe": "true"},
+        {"restart_expired_current_census_slice": "false"},
         {"source_concurrency": True},
         {"run_id": 123},
     ),

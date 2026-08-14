@@ -1281,6 +1281,15 @@ def provider_enrichment(test: bool):
     help="Immutable acquisition root shared by an exact census retry.",
 )
 @click.option(
+    "--restart-expired-current-census-slice/--no-restart-expired-current-census-slice",
+    default=True,
+    show_default=True,
+    help=(
+        "Allow a direct current-census retry to reset one expired resource "
+        "slice; disable after that reset for a guarded continuation."
+    ),
+)
+@click.option(
     "--acquisition-strategy",
     "provider_directory_acquisition_strategy",
     type=click.Choice(provider_directory_acquisition_strategy_values()),
@@ -1442,6 +1451,7 @@ def provider_directory_fhir(
     run_id: str | None,
     retry_of_run_id: str | None,
     provider_directory_pagination_root_run_id: str | None,
+    restart_expired_current_census_slice: bool,
     provider_directory_acquisition_strategy: str,
     provider_directory_census_cutoff: str | None,
     source_id: tuple[str, ...],
@@ -1499,6 +1509,9 @@ def provider_directory_fhir(
             retry_of_run_id=retry_of_run_id,
             provider_directory_pagination_root_run_id=(
                 provider_directory_pagination_root_run_id
+            ),
+            restart_expired_current_census_slice=(
+                restart_expired_current_census_slice
             ),
             provider_directory_acquisition_strategy=(
                 provider_directory_acquisition_strategy

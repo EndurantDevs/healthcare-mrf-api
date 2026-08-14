@@ -81,7 +81,7 @@ def test_command_wrapper_preserves_public_reflection_contract():
         **options.__annotations__,
         "return": "dict[str, Any]",
     }
-    assert len(command_signature.parameters) == 55
+    assert len(command_signature.parameters) == 56
     assert "resource_scan_concurrency" in command_signature.parameters
     assert "provider_directory_reviewed_root_count" not in command_signature.parameters
     assert command_signature.parameters == options_signature.parameters
@@ -6861,11 +6861,16 @@ def test_provider_directory_cli_forwards_deferred_materialization(monkeypatch):
 
     cli_result = CliRunner().invoke(
         process_cli.provider_directory_fhir,
-        ["--import-resources", "--defer-typed-materialization"],
+        [
+            "--import-resources",
+            "--defer-typed-materialization",
+            "--no-restart-expired-current-census-slice",
+        ],
     )
 
     assert cli_result.exit_code == 0, cli_result.output
     assert calls[0]["defer_typed_materialization"] is True
+    assert calls[0]["restart_expired_current_census_slice"] is False
 
 
 def test_provider_directory_cli_preserves_absent_source_scope(monkeypatch):
@@ -16825,7 +16830,10 @@ async def test_checkpoint_retry_keeps_exact_source_after_transient_probe_rejecti
 
     metrics = await importer.process_data(
         {"context": {}},
-        _checkpoint_retry_task(requested_source_id),
+        {
+            **_checkpoint_retry_task(requested_source_id),
+            "restart_expired_current_census_slice": False,
+        },
     )
 
     assert metrics["source_import_sources_selected_checkpoint_retry"] == 1
@@ -16833,6 +16841,13 @@ async def test_checkpoint_retry_keeps_exact_source_after_transient_probe_rejecti
     import_resources.assert_awaited_once()
     assert import_resources.await_args.args[0][0]["source_id"] == requested_source_id
     assert import_resources.await_args.kwargs["require_complete_resources"] is True
+    assert (
+        import_resources.await_args.kwargs[
+            "restart_expired_current_census_slice"
+        ]
+        is False
+    )
+    assert metrics["restart_expired_current_census_slice"] is False
 
 
 @pytest.mark.asyncio
