@@ -109,17 +109,113 @@ async def test_materialize_cohort_query_skips_unusable_lsh_and_l0(monkeypatch):
     assert "benchmark_modes AS (" in materialize_sql
     assert "VALUES ('L1'), ('L2'), ('L3')" in materialize_sql
     assert "VALUES ('L0'), ('L1'), ('L2'), ('L3')" not in materialize_sql
-    assert "<> 'L0'" in materialize_sql
-    assert "bm.benchmark_mode" in materialize_sql
-    assert "AND LOWER(COALESCE(t.benchmark_mode, 'national')) = bm.benchmark_mode" in materialize_sql
+    assert "('L1'::varchar, 2), ('L2'::varchar, 3), ('L3'::varchar, 4)" in materialize_sql
+    assert "('L0'::varchar, 1)" not in materialize_sql
+    assert "bs.benchmark_mode" in materialize_sql
+    assert "provider_target_keys AS MATERIALIZED (" in materialize_sql
+    assert "AND t.benchmark_mode = pk.benchmark_mode" in materialize_sql
+    assert "AND t.geography_scope = pk.geography_scope" in materialize_sql
+    assert "AND t.geography_value = pk.match_geography_value" in materialize_sql
+    assert "AND t.cohort_level = pk.cohort_level" in materialize_sql
+    assert "AND t.specialty_key = pk.match_specialty" in materialize_sql
+    assert "AND t.taxonomy_code = pk.match_taxonomy" in materialize_sql
+    assert "AND t.procedure_bucket = pk.match_procedure_bucket" in materialize_sql
     assert "COALESCE(c.procedure_bucket, 'bucket:none')::varchar AS procedure_bucket" in materialize_sql
     assert "COALESCE(c.specialty, 'unknown')::varchar AS specialty" in materialize_sql
     assert "COALESCE(c.taxonomy, 'unknown')::varchar AS taxonomy" in materialize_sql
     assert "ON cm.npi = b.npi" in materialize_sql
     assert "ON cm.npi = c.npi" in materialize_sql
-    assert "WHEN bm.benchmark_mode = 'zip'" in materialize_sql
-    assert "({peer_scope_expr} = 'zip'" not in materialize_sql
+    assert "('zip'::varchar, 'zip'::varchar, 1)" in materialize_sql
+    assert "WHEN bm.benchmark_mode = 'zip'" not in materialize_sql
+    assert "t.geography_scope = 'zip' AND" not in materialize_sql
+    assert "COALESCE(t.specialty_key" not in materialize_sql
+    assert "COALESCE(t.taxonomy_code" not in materialize_sql
+    assert "COALESCE(t.procedure_bucket" not in materialize_sql
     assert "CASE WHEN c.threshold_met THEN 0 ELSE 1 END" in materialize_sql
+
+
+@pytest.mark.asyncio
+async def test_measure_shard_keeps_exact_l0_procedure_keys():
+    async def is_table_present(_schema: str, _table: str) -> bool:
+        return False
+
+    classes = provider_quality._staging_classes("stage_test", "mrf")
+    feature = classes["PricingProviderQualityFeature"]
+    feature_columns = [column.name for column in feature.__table__.columns]
+    feature_columns.append("procedure_bucket")
+    classes["PricingProviderQualityFeature"] = type(
+        "FeatureWithProcedureBucket",
+        (),
+        {
+            "__tablename__": feature.__tablename__,
+            "__table__": SimpleNamespace(
+                columns=tuple(SimpleNamespace(name=column) for column in feature_columns)
+            ),
+        },
+    )
+
+    ctx = await provider_quality_cohort_context._build_cohort_materialization_context(
+        classes,
+        "mrf",
+        table_exists=is_table_present,
+    )
+    measure_sql = provider_quality._cohort_sql_phase_5_measure_shard(ctx)
+
+    assert "('L0'::varchar, 1), ('L1'::varchar, 2)" in measure_sql
+    assert "WHEN lv.cohort_level = 'L0' THEN p.procedure_bucket" in measure_sql
+    assert "AND t.specialty_key = pk.match_specialty" in measure_sql
+    assert "AND t.taxonomy_code = pk.match_taxonomy" in measure_sql
+    assert "AND t.procedure_bucket = pk.match_procedure_bucket" in measure_sql
+
+
+@pytest.mark.asyncio
+async def test_measure_shard_supports_peer_model_without_benchmark_mode():
+    async def is_table_present(_schema: str, _table: str) -> bool:
+        return False
+
+    classes = provider_quality._staging_classes("stage_test", "mrf")
+    peer = classes["PricingProviderQualityPeerTarget"]
+    classes["PricingProviderQualityPeerTarget"] = type(
+        "PeerWithoutBenchmarkMode",
+        (),
+        {
+            "__tablename__": peer.__tablename__,
+            "__table__": SimpleNamespace(
+                columns=tuple(
+                    SimpleNamespace(name=column.name)
+                    for column in peer.__table__.columns
+                    if column.name != "benchmark_mode"
+                )
+            ),
+        },
+    )
+
+    ctx = await provider_quality_cohort_context._build_cohort_materialization_context(
+        classes,
+        "mrf",
+        table_exists=is_table_present,
+    )
+    measure_sql = provider_quality._cohort_sql_phase_5_measure_shard(ctx)
+
+    assert "AND pk.benchmark_mode = pk.benchmark_mode" in measure_sql
+
+
+def test_peer_target_staging_uses_only_exact_lookup_index():
+    peer = provider_quality._staging_classes("stage_test", "mrf")[
+        "PricingProviderQualityPeerTarget"
+    ]
+
+    assert peer.__my_index_elements__ == [
+        "year",
+        "benchmark_mode",
+        "geography_scope",
+        "geography_value",
+        "cohort_level",
+        "specialty_key",
+        "taxonomy_code",
+        "procedure_bucket",
+    ]
+    assert peer.__my_additional_indexes__ == []
 
 
 @pytest.mark.asyncio

@@ -254,9 +254,9 @@ async def _build_cohort_materialization_context(
 
     peer_scope_expr = f"t.{peer_target_geo_scope_col}"
     peer_benchmark_mode_expr = (
-        f"LOWER(COALESCE(t.{peer_target_benchmark_mode_col}, 'national'))"
+        f"t.{peer_target_benchmark_mode_col}"
         if peer_target_benchmark_mode_col
-        else "bm.benchmark_mode"
+        else "pk.benchmark_mode"
     )
     peer_geo_value_expr = f"t.{peer_target_geo_value_col}"
     peer_cohort_level_expr = f"t.{peer_target_cohort_level_col}"
@@ -281,10 +281,6 @@ async def _build_cohort_materialization_context(
         if peer_target_procedure_bucket_col
         else "'bucket:none'::varchar"
     )
-    peer_specialty_match = f"COALESCE({peer_specialty_expr}, 'unknown') = COALESCE(p.specialty, 'unknown')"
-    peer_taxonomy_match = f"COALESCE({peer_taxonomy_expr}, 'unknown') = COALESCE(p.taxonomy, 'unknown')"
-    peer_procedure_bucket_match = f"COALESCE({peer_procedure_bucket_expr}, 'bucket:none') = COALESCE(p.procedure_bucket, 'bucket:none')"
-
     measure_optional_pairs = _optional_column_pairs(
         measure_columns,
         (
@@ -483,6 +479,7 @@ async def _build_cohort_materialization_context(
 
     benchmark_modes = _benchmark_modes_for_materialization(PROVIDER_QUALITY_BENCHMARK_MODE)
     benchmark_mode_values = ",\n                ".join(f"('{mode}'::varchar)" for mode in benchmark_modes)
+    benchmark_mode_list_sql = ", ".join(f"'{mode}'" for mode in benchmark_modes)
 
     if rx_agg_table_exists:
         provider_rx_cte = f"""
@@ -578,11 +575,9 @@ async def _build_cohort_materialization_context(
         "peer_taxonomy_expr": peer_taxonomy_expr,
         "peer_classification_expr": peer_classification_expr,
         "peer_procedure_bucket_expr": peer_procedure_bucket_expr,
-        "peer_specialty_match": peer_specialty_match,
-        "peer_taxonomy_match": peer_taxonomy_match,
-        "peer_procedure_bucket_match": peer_procedure_bucket_match,
         "provider_rx_cte": provider_rx_cte,
         "benchmark_mode_values": benchmark_mode_values,
+        "benchmark_mode_list_sql": benchmark_mode_list_sql,
         "measure_meta_sources": measure_metadata_source_by_alias,
         "score_optional_pairs": score_optional_pairs,
         "npi_table_exists": npi_table_exists,
