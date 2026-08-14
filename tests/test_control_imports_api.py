@@ -643,7 +643,66 @@ def test_openaddresses_adapter_preserves_parallel_load_params():
         "backfill_zip_prefix_length": 2,
         "zip_restore_concurrency": 6,
         "zip_restore_shards": 48,
+        "control_import_id": "oa_dev_20260619",
     }
+
+
+def test_openaddresses_adapter_stamps_stable_default_and_retry_import_identity():
+    adapter = control_imports._SINGLE_JOB_ADAPTERS["openaddresses"]
+    default_payload = control_imports._adapter_payload(
+        adapter,
+        {"run_id": "run_openaddresses", "importer": "openaddresses", "family": "geo"},
+        {},
+    )
+    retry_payload = control_imports._adapter_payload(
+        adapter,
+        {
+            "run_id": "run_retry",
+            "importer": "openaddresses",
+            "family": "geo",
+            "import_id": "run_openaddresses",
+        },
+        {},
+    )
+
+    assert default_payload["task"]["control_import_id"] == "run_openaddresses"
+    assert retry_payload["task"]["control_import_id"] == "run_openaddresses"
+
+
+@pytest.mark.asyncio
+async def test_create_openaddresses_run_persists_default_import_identity(monkeypatch):
+    enqueued_rows = []
+
+    async def no_active_importer(_importer):
+        return None
+
+    async def admit(*_args, **_kwargs):
+        return None
+
+    async def enqueue(source_row):
+        enqueued_rows.append(source_row)
+        return {
+            "status": "queued",
+            "phase_detail": "enqueued",
+            "heartbeat_at": source_row["heartbeat_at"],
+            "progress": {"message": "queued"},
+            "metrics": {},
+            "error": None,
+        }
+
+    fake_database = types.SimpleNamespace(execute=AsyncMock())
+    monkeypatch.setattr(control_imports, "find_earliest_active_run_by_importer", no_active_importer)
+    monkeypatch.setattr(control_imports, "_admit_import_row", admit)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    monkeypatch.setattr(control_imports, "db", fake_database)
+
+    created_run, created = await control_imports.create_import_run(
+        {"run_id": "run_openaddresses", "importer": "openaddresses", "params": {}}
+    )
+
+    assert created is True
+    assert created_run["import_id"] == "run_openaddresses"
+    assert enqueued_rows[0]["import_id"] == "run_openaddresses"
 
 
 def test_mrf_adapter_preserves_chunking_params():

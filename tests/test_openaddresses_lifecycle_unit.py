@@ -1,6 +1,7 @@
 import importlib
 import asyncio
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -25,22 +26,56 @@ async def test_openaddresses_task_import_id_controls_stage_suffix():
 
 
 @pytest.mark.asyncio
+async def test_openaddresses_rejects_conflicting_explicit_import_id_aliases():
+    with pytest.raises(ValueError, match="Conflicting OpenAddresses import identities"):
+        await openaddresses.process_data(
+            {"context": {}, "import_date": "startup"},
+            {
+                "run_id": "control-run-a",
+                "import_id": "explicit-run-b",
+                "stage_suffix": "explicit-run-c",
+            },
+        )
+
+    with pytest.raises(ValueError, match="Conflicting OpenAddresses import identities"):
+        await openaddresses.process_data(
+            {"context": {}, "import_date": "startup"},
+            {"import_id": "explicit-run-b", "control_import_id": "control-run-c"},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task", [{"run_id": "---"}, {"import_id": "///"}])
+async def test_openaddresses_rejects_empty_normalized_import_id(task):
+    with pytest.raises(ValueError, match="Invalid OpenAddresses import identity"):
+        await openaddresses.process_data(
+            {"context": {}, "import_date": "startup"},
+            task,
+        )
+
+
+@pytest.mark.asyncio
 async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(monkeypatch):
     """Verify openaddresses shutdown uses job import id from shared context."""
     seen_by_field = {}
+    create_indexes = AsyncMock()
+    complete_generation = AsyncMock()
 
     async def fake_ensure_database(_test_mode):
         return None
 
     async def is_table_present(schema, table_name):
-        seen_by_field["table_exists"] = (schema, table_name)
-        return True
+        if table_name == "openaddresses_geocode_oadev20260619":
+            seen_by_field["table_exists"] = (schema, table_name)
+            return True
+        return False
 
-    async def fake_create_indexes(table_name, schema):
-        seen_by_field["create_indexes"] = (schema, table_name)
-    async def fake_refresh_archive_geocodes_sharded(**_kwargs):
+    async def published_generations(_schema):
+        return []
+
+    async def refresh_archive_geocodes(**_kwargs):
         return openaddresses.OpenAddressesBackfillStats(exact_updates=0, fuzzy_updates=0, relaxed_updates=0)
-    async def fake_restore_zip5_from_tiger(**_kwargs):
+    async def restore_zip_codes(**_kwargs):
         return openaddresses.OpenAddressesZipRestoreStats()
     class FakeTransaction:
         async def __aenter__(self):
@@ -60,17 +95,11 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
             return FakeTransaction()
     monkeypatch.setattr(openaddresses, "ensure_database", fake_ensure_database)
     monkeypatch.setattr(openaddresses, "_is_table_present", is_table_present)
-    monkeypatch.setattr(openaddresses, "_create_indexes", fake_create_indexes)
-    monkeypatch.setattr(
-        openaddresses,
-        "refresh_archive_geocodes_from_openaddresses_sharded",
-        fake_refresh_archive_geocodes_sharded,
-    )
-    monkeypatch.setattr(
-        openaddresses,
-        "restore_openaddresses_zips",
-        fake_restore_zip5_from_tiger,
-    )
+    monkeypatch.setattr(openaddresses, "_published_recovery_generations", published_generations)
+    monkeypatch.setattr(openaddresses, "_create_indexes", create_indexes)
+    monkeypatch.setattr(openaddresses, "refresh_archive_geocodes_from_openaddresses_sharded", refresh_archive_geocodes)
+    monkeypatch.setattr(openaddresses, "restore_openaddresses_zips", restore_zip_codes)
+    monkeypatch.setattr(openaddresses, "_complete_published_generation", complete_generation)
     monkeypatch.setattr(openaddresses, "db", FakeDb())
     monkeypatch.setattr(openaddresses, "print_time_info", lambda _started_at: None)
     await openaddresses.shutdown(
@@ -84,7 +113,8 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
         }
     )
     assert seen_by_field["table_exists"] == ("mrf", "openaddresses_geocode_oadev20260619")
-    assert seen_by_field["create_indexes"] == ("mrf", "openaddresses_geocode_oadev20260619")
+    create_indexes.assert_awaited_once_with("openaddresses_geocode_oadev20260619", "mrf")
+    assert complete_generation.await_args.kwargs["import_id"] == "oadev20260619"
 
 
 @pytest.mark.asyncio
@@ -97,8 +127,20 @@ async def test_openaddresses_shutdown_is_idempotent_after_stage_publish(monkeypa
     async def is_table_present(_schema, table_name):
         return table_name == openaddresses.OpenAddressesGeocode.__main_table__
 
+    async def published_generations(_schema):
+        return []
+
+    async def relation_comment(_schema, _table_name):
+        return openaddresses._completed_generation_marker_comment("oadev20260619", 41)
+
+    async def relation_oid(_schema, _table_name):
+        return 41
+
     monkeypatch.setattr(openaddresses, "ensure_database", fake_ensure_database)
     monkeypatch.setattr(openaddresses, "_is_table_present", is_table_present)
+    monkeypatch.setattr(openaddresses, "_published_recovery_generations", published_generations)
+    monkeypatch.setattr(openaddresses, "_relation_comment", relation_comment)
+    monkeypatch.setattr(openaddresses, "_relation_oid", relation_oid)
 
     await openaddresses.shutdown(
         {
