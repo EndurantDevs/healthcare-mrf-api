@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
@@ -75,6 +76,89 @@ def _retry_clock(monkeypatch):
     monkeypatch.setattr(importer.time, "monotonic", lambda: clock.value)
     monkeypatch.setattr(importer.asyncio, "sleep", sleep)
     return clock, sleep
+
+
+def test_census_direct_retry_restarts_an_expired_cursor():
+    cursor_url = f"{BASE}?_getpages=opaque&_getpagesoffset=250&_count=250"
+    resume_state = importer.PaginationResumeState(
+        next_url=cursor_url,
+        pages_processed=1,
+        rows_processed=250,
+        recent_url_hashes=(),
+        resumed=True,
+    )
+
+    assert not importer._should_restart_expired_pagination_checkpoint(
+        status_code=410,
+        fetch_error=None,
+        request_url=cursor_url,
+        resume_state=resume_state,
+        has_restart_attempted=False,
+        is_current_version_census=True,
+    )
+    assert importer._should_restart_expired_pagination_checkpoint(
+        status_code=410,
+        fetch_error=None,
+        request_url=cursor_url,
+        resume_state=resume_state,
+        has_restart_attempted=False,
+        is_current_version_census=True,
+        allow_current_version_census_restart=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_retry_restarts_only_terminal_drifted_census_checkpoint(
+    monkeypatch,
+):
+    context = importer.PaginationCheckpointContext(
+        canonical_api_base=BASE,
+        source_scope_hash="a" * 64,
+        source_ids=("synthetic-source",),
+        owner_run_id="retry-run",
+        acquisition_root_run_id="root-run",
+        retry_of_run_id="failed-run",
+        dataset_id="dataset-1",
+        lineage_verified=True,
+    )
+    checkpoint_by_field = {
+        "dataset_id": "dataset-1",
+        "source_ids": ["synthetic-source"],
+        "acquisition_root_run_id": "root-run",
+        "owner_run_id": "failed-run",
+        "state": importer.PAGINATION_CHECKPOINT_ACTIVE,
+        "next_url": None,
+        "pages_processed": 2,
+        "rows_processed": 500,
+        "completeness_json": {"failure": "census_drift"},
+    }
+    start_url = f"{BASE}/Organization?_count=250"
+    reset = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_fetch_pagination_checkpoint",
+        AsyncMock(return_value=checkpoint_by_field),
+    )
+    monkeypatch.setattr(importer, "_reset_pagination_checkpoint", reset)
+
+    resume = await importer._load_or_initialize_pagination_checkpoint(
+        context,
+        "Organization",
+        start_url,
+        allow_terminal_census_restart=True,
+    )
+
+    assert resume == importer.PaginationResumeState(
+        next_url=start_url,
+        pages_processed=0,
+        rows_processed=0,
+        recent_url_hashes=(),
+    )
+    reset.assert_awaited_once()
+    assert not importer._can_restart_terminal_census_checkpoint(
+        checkpoint_by_field,
+        replace(context, lineage_verified=False),
+    )
 
 
 @pytest.mark.asyncio

@@ -72,6 +72,12 @@ def test_scratch_root_rejects_wrong_type_temporary_child_or_symlink(
 
     durable_parent = tmp_path / "durable"
     durable_parent.mkdir(mode=0o700)
+    insecure_root = durable_parent / "insecure"
+    insecure_root.mkdir(mode=0o700)
+    insecure_root.chmod(0o755)
+    with pytest.raises(NppesPublicEvidenceArchiveError):
+        scratch._validated_scratch_root(insecure_root)
+
     symlink_target = durable_parent / "target"
     symlink_target.mkdir(mode=0o700)
     symlink = durable_parent / "scratch-link"
