@@ -907,6 +907,9 @@ US_STATE_FIPS_TO_ABBR = {
 US_STATE_ABBRS = tuple(US_STATE_FIPS_TO_ABBR[fips] for fips in sorted(US_STATE_FIPS_TO_ABBR))
 PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_JSON"
 PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_FILE"
+PROVIDER_DIRECTORY_PROFILE_CLONE_CAPACITY_OBSERVATION_ENV = (
+    "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CLONE_CAPACITY_OBSERVATION"
+)
 _PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "provider_directory_credentials_file_override",
     default=None,
@@ -12970,44 +12973,43 @@ async def _apply_provider_directory_profile_delta(
     locked_state = await _profile_delta_locked_state(profile_delta)
     if locked_state is None:
         return
+    relations, counts_by_name = locked_state.relations, locked_state.counts_by_name
     capacity_admission = _provider_directory_profile_capacity_admission()
     capacity_forecast = await _prepare_profile_delta_capacity(
         profile_delta,
-        locked_state.counts_by_name,
+        counts_by_name,
         locked_state.serving_state,
         capacity_admission,
         pending_commit_items,
     )
-    target_wal_start_lsn = await _profile_delta_target_wal_start_lsn()
-    await _apply_profile_delta_target_rows(
-        profile_delta,
-        locked_state.relations,
-        locked_state.counts_by_name,
-    )
-    target_bytes = await _profile_delta_target_bytes_after(
-        capacity_forecast,
-        locked_state.relations,
-    )
-    cutover_actual_by_field = await _profile_delta_cutover_actual(
-        capacity_forecast,
-        target_wal_start_lsn,
-        target_bytes,
-    )
-    await _update_profile_delta_serving_generation(
-        profile_delta,
-        locked_state.counts_by_name,
-        capacity_forecast,
-    )
+    cutover_actual_by_field: dict[str, Any] = {}
+    async with _observe_profile_capacity_wave(
+        "target",
+        {
+            "evidence_target": relations.evidence_target,
+            "profile_target": relations.profile_target,
+        },
+        coordinate_by_field={"wave": 1},
+        target_actuals_by_field=cutover_actual_by_field,
+    ):
+        target_wal_start_lsn = await _profile_delta_target_wal_start_lsn()
+        await _apply_profile_delta_target_rows(profile_delta, relations, counts_by_name)
+        target_bytes = await _profile_delta_target_bytes_after(capacity_forecast, relations)
+        cutover_actual_by_field.update(
+            await _profile_delta_cutover_actual(
+                capacity_forecast,
+                target_wal_start_lsn,
+                target_bytes,
+            )
+        )
+    await _update_profile_delta_serving_generation(profile_delta, counts_by_name, capacity_forecast)
     await _insert_profile_delta_receipt(
         profile_delta,
         locked_state.receipt_ref,
-        locked_state.counts_by_name,
+        counts_by_name,
         cutover_actual_by_field,
     )
-    await _validate_profile_delta_final_wal(
-        capacity_admission,
-        capacity_forecast,
-    )
+    await _validate_profile_delta_final_wal(capacity_admission, capacity_forecast)
 
 
 async def _remove_provider_directory_profile_delta_stages(
@@ -24182,27 +24184,39 @@ async def _materialize_artifact_resource_waves(
     )
     wave_width = max(resolved_worker_count, 1)
     for wave_start in range(0, len(plan.resource_scope_jobs), wave_width):
-        wave_jobs = plan.resource_scope_jobs[
-            wave_start : wave_start + wave_width
-        ]
-        await _gather_provider_directory_profile_tasks(
-            [
-                asyncio.create_task(
-                    _materialize_provider_directory_artifact_resource_scope(
-                        schema,
-                        scope_table,
-                        model,
-                        fence,
-                        resource_types,
-                        batch_size=batch_size,
-                        projection=projection_by_table.get(
-                            model.__tablename__
-                        ),
-                    )
+        wave_jobs = plan.resource_scope_jobs[wave_start : wave_start + wave_width]
+        async with _observe_profile_capacity_wave(
+            "artifact",
+            {
+                table_name: _qt(schema, relation_name)
+                for table_name, relation_name in sorted(
+                    plan.relation_by_table.items()
                 )
-                for model, scope_table in wave_jobs
-            ]
-        )
+            },
+            coordinate_by_field={
+                "wave": (wave_start // wave_width) + 1,
+                "job_start": wave_start,
+                "job_end": wave_start + len(wave_jobs),
+            },
+        ):
+            await _gather_provider_directory_profile_tasks(
+                [
+                    asyncio.create_task(
+                        _materialize_provider_directory_artifact_resource_scope(
+                            schema,
+                            scope_table,
+                            model,
+                            fence,
+                            resource_types,
+                            batch_size=batch_size,
+                            projection=projection_by_table.get(
+                                model.__tablename__
+                            ),
+                        )
+                    )
+                    for model, scope_table in wave_jobs
+                ]
+            )
         if projection is not None:
             await _assert_provider_directory_artifact_scope_observed_capacity(
                 schema,
@@ -24238,14 +24252,19 @@ async def _materialize_artifact_scope_payload(
         if projection is not None
         else {}
     )
-    await _materialize_provider_directory_artifact_source_scope(
-        schema,
-        plan.source_table,
-        [dataset.source_id for dataset in fence.datasets],
-        projection=projection_by_table.get(
-            ProviderDirectorySource.__tablename__
-        ),
-    )
+    async with _observe_profile_capacity_wave(
+        "artifact",
+        {ProviderDirectorySource.__tablename__: _qt(schema, plan.source_table)},
+        coordinate_by_field={"wave": 0},
+    ):
+        await _materialize_provider_directory_artifact_source_scope(
+            schema,
+            plan.source_table,
+            [dataset.source_id for dataset in fence.datasets],
+            projection=projection_by_table.get(
+                ProviderDirectorySource.__tablename__
+            ),
+        )
     if projection is not None:
         await _assert_provider_directory_artifact_scope_observed_capacity(
             schema,
@@ -31325,6 +31344,227 @@ def _provider_directory_profile_capacity_admission(
     return admission
 
 
+async def _profile_capacity_observation_sample(
+    relation_refs_by_name: Mapping[str, str],
+    *,
+    wal_start_lsn: str | None = None,
+) -> dict[str, Any]:
+    """Read clone-local WAL, delayed temp, and relation counters once."""
+    wal_lsn = await _profile_delta_target_wal_start_lsn()
+    wal_bytes = int(
+        await db.scalar(
+            "SELECT pg_wal_lsn_diff(CAST(CAST(:wal_lsn AS text) AS pg_lsn), "
+            "CAST(CAST(:wal_start_lsn AS text) AS pg_lsn))::bigint;",
+            wal_lsn=wal_lsn,
+            wal_start_lsn=wal_start_lsn or wal_lsn,
+        )
+        or 0
+    )
+    temp_bytes = await _provider_directory_profile_temp_bytes()
+    if temp_bytes is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_temp_observation_missing"
+        )
+    relation_bytes = await _provider_directory_profile_capacity_relation_bytes(
+        relation_refs_by_name.values()
+    )
+    if wal_bytes < 0:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_observation_invalid"
+        )
+    return {
+        "wal_lsn": wal_lsn,
+        "wal_bytes": wal_bytes,
+        "temp_bytes": temp_bytes,
+        "relation_bytes": {"total": relation_bytes},
+    }
+
+
+_PROFILE_CAPACITY_TARGET_ACTUAL_FIELDS = (
+    "cutover_actual_hash",
+    "cutover_wal_bytes",
+    "target_wal_start_lsn",
+    "wal_observed_lsn",
+    "evidence_target_bytes_before",
+    "evidence_target_bytes_after",
+    "evidence_target_growth_bytes",
+    "profile_target_bytes_before",
+    "profile_target_bytes_after",
+    "profile_target_growth_bytes",
+)
+
+
+def _profile_capacity_observation_measurement(
+    before: Mapping[str, Any] | None,
+    after: Mapping[str, Any] | None,
+    target_actuals_by_field: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if target_actuals_by_field is not None:
+        if not set(_PROFILE_CAPACITY_TARGET_ACTUAL_FIELDS).issubset(
+            target_actuals_by_field
+        ):
+            return None
+        return {
+            "measurement_status": "partial",
+            "temp_observation": {
+                "status": "unavailable_transaction_local_stats",
+                "before": None, "after": None, "observed_delta": None,
+            },
+            "cutover_actual": {
+                name: target_actuals_by_field[name]
+                for name in _PROFILE_CAPACITY_TARGET_ACTUAL_FIELDS
+            },
+        }
+    if before is None or after is None:
+        return None
+    before_relations = before["relation_bytes"]
+    after_relations = after["relation_bytes"]
+    return {
+        "measurement_status": "partial",
+        "wal_observation": {
+            "before_lsn": before["wal_lsn"],
+            "after_lsn": after["wal_lsn"],
+            "bytes": after["wal_bytes"],
+        },
+        "temp_observation": {
+            "status": "delayed_database_aggregate",
+            "before": before["temp_bytes"],
+            "after": after["temp_bytes"],
+            "observed_delta": after["temp_bytes"] - before["temp_bytes"],
+        },
+        "relation_observation": {
+            "before": dict(before_relations),
+            "after": dict(after_relations),
+            "growth": {
+                name: after_relations[name] - before_relations[name]
+                for name in sorted(before_relations)
+            },
+        },
+    }
+
+
+def _emit_profile_capacity_observation(
+    phase: str,
+    coordinate_by_field: Mapping[str, Any],
+    before: Mapping[str, Any] | None,
+    after: Mapping[str, Any] | None,
+    elapsed_seconds: float,
+    failure: BaseException | None,
+    observation_failure: BaseException | None,
+    target_actuals_by_field: Mapping[str, Any] | None,
+) -> None:
+    """Emit one canonical record without changing the observed operation."""
+    admission = _provider_directory_profile_capacity_admission()
+    observation_by_field: dict[str, Any] = {
+        "contract_id": (
+            "healthporta.provider-directory-profile-clone-capacity-"
+            "observation.v1"
+        ),
+        "phase": phase,
+        "coordinate": dict(coordinate_by_field),
+        "status": "failed" if failure is not None else "succeeded",
+        "elapsed_seconds": round(max(elapsed_seconds, 0.0), 6),
+        "identity": (
+            {"build_id": admission.build_id, "run_id": admission.run_id}
+            if admission is not None
+            else {}
+        ),
+    }
+    measurement = (
+        None
+        if failure is not None
+        else _profile_capacity_observation_measurement(
+            before, after, target_actuals_by_field
+        )
+    )
+    if measurement is not None:
+        observation_by_field.update(measurement)
+    else:
+        observation_by_field["measurement_status"] = "incomplete"
+    if failure is not None:
+        observation_by_field["failure_type"] = type(failure).__name__
+    elif target_actuals_by_field is not None and measurement is None:
+        observation_failure = RuntimeError(
+            "provider_directory_profile_target_actual_missing"
+        )
+    if observation_failure is not None:
+        observation_by_field["observation_failure_type"] = type(
+            observation_failure
+        ).__name__
+    LOGGER.info(
+        json.dumps(
+            observation_by_field,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    )
+
+
+@contextlib.asynccontextmanager
+async def _observe_profile_capacity_wave(
+    phase: str,
+    relation_refs_by_name: Mapping[str, str],
+    *,
+    coordinate_by_field: Mapping[str, Any],
+    target_actuals_by_field: Mapping[str, Any] | None = None,
+) -> AsyncIterator[None]:
+    """Passively log one disposable-clone write wave."""
+    if os.getenv(PROVIDER_DIRECTORY_PROFILE_CLONE_CAPACITY_OBSERVATION_ENV) != "1":
+        yield
+        return
+    before = after = None
+    observation_failure: BaseException | None = None
+    if target_actuals_by_field is None:
+        try:
+            before = await _profile_capacity_observation_sample(relation_refs_by_name)
+        except Exception as exc:
+            observation_failure = exc
+            LOGGER.warning(
+                "Provider Directory Profile clone capacity observation failed",
+                exc_info=True,
+            )
+    started_at = time.monotonic()
+    failure: BaseException | None = None
+    try:
+        yield
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        elapsed_seconds = time.monotonic() - started_at
+        if failure is None and before is not None:
+            try:
+                after = await _profile_capacity_observation_sample(
+                    relation_refs_by_name,
+                    wal_start_lsn=str(before["wal_lsn"]),
+                )
+            except Exception as exc:
+                observation_failure = exc
+                LOGGER.warning(
+                    "Provider Directory Profile clone capacity observation "
+                    "failed",
+                    exc_info=True,
+                )
+        try:
+            _emit_profile_capacity_observation(
+                phase,
+                coordinate_by_field,
+                before,
+                after,
+                elapsed_seconds,
+                failure,
+                observation_failure,
+                target_actuals_by_field,
+            )
+        except Exception:
+            LOGGER.warning(
+                "Provider Directory Profile clone capacity record failed",
+                exc_info=True,
+            )
+
+
 async def _profile_capacity_remaining_ms(
     admission: _ProviderDirectoryProfileCapacityAdmission,
 ) -> int:
@@ -38140,20 +38380,32 @@ async def _run_profile_evidence_window(
     ],
 ) -> list[Any]:
     """Execute all fact coordinates in one admitted evidence wave."""
-    return await _gather_provider_directory_profile_tasks(
-        [
-            asyncio.create_task(
-                _execute_profile_evidence_batch(
-                    build,
-                    batch,
-                    copy_evidence_sql,
-                    evidence_sql_refs_by_name,
-                    projection_by_batch.get(window_batch_number),
-                )
+    async with _observe_profile_capacity_wave(
+        "evidence",
+        {
+            "evidence_stage": _provider_directory_profile_build_ref(
+                build, build.evidence_stage
             )
-            for window_batch_number, batch in window_coordinates
-        ]
-    )
+        },
+        coordinate_by_field={
+            "batch_start": window_coordinates[0][0],
+            "batch_end": window_coordinates[-1][0] + 1,
+        },
+    ):
+        return await _gather_provider_directory_profile_tasks(
+            [
+                asyncio.create_task(
+                    _execute_profile_evidence_batch(
+                        build,
+                        batch,
+                        copy_evidence_sql,
+                        evidence_sql_refs_by_name,
+                        projection_by_batch.get(window_batch_number),
+                    )
+                )
+                for window_batch_number, batch in window_coordinates
+            ]
+        )
 
 
 async def _initialize_profile_evidence_plan(
@@ -38587,17 +38839,22 @@ async def _populate_affected_npi_stage(
         build,
         build.evidence_stage,
     )
-    inserted_count = await _populate_affected_npi_sources(
-        build,
-        affected_ref,
-        evidence_target_ref,
-    )
-    inserted_count += await _populate_affected_npi_delta(
-        build,
-        affected_ref,
-        evidence_stage_ref,
-    )
-    await _analyze_affected_npi_stage(build, affected_ref)
+    async with _observe_profile_capacity_wave(
+        "affected_npi",
+        {"affected_npi_stage": affected_ref},
+        coordinate_by_field={"wave": 1},
+    ):
+        inserted_count = await _populate_affected_npi_sources(
+            build,
+            affected_ref,
+            evidence_target_ref,
+        )
+        inserted_count += await _populate_affected_npi_delta(
+            build,
+            affected_ref,
+            evidence_stage_ref,
+        )
+        await _analyze_affected_npi_stage(build, affected_ref)
     return inserted_count
 
 
@@ -39117,30 +39374,38 @@ async def _populate_provider_directory_profile_compact_stage(
                     ),
                 )
             )
-            affected_rows_by_batch = (
-                await _gather_provider_directory_profile_tasks(
-                    [
-                        asyncio.create_task(
-                            _execute_provider_directory_profile_compact_batch(
-                                build,
-                                batch,
-                                copy_profiles_sql=context.copy_profiles_sql,
-                                profile_insert_sql=context.profile_insert_sql,
-                                profile_sql_args_by_name=(
-                                    context.profile_sql_args_by_name
-                                ),
-                                profile_params_by_name=(
-                                    context.profile_params_by_name
-                                ),
-                                projection=projection_by_batch.get(
-                                    window_batch_number
-                                ),
+            async with _observe_profile_capacity_wave(
+                "compact",
+                {"profile_stage": context.profile_stage_ref},
+                coordinate_by_field={
+                    "batch_start": batch_number,
+                    "batch_end": window_end,
+                },
+            ):
+                affected_rows_by_batch = (
+                    await _gather_provider_directory_profile_tasks(
+                        [
+                            asyncio.create_task(
+                                _execute_provider_directory_profile_compact_batch(
+                                    build,
+                                    batch,
+                                    copy_profiles_sql=context.copy_profiles_sql,
+                                    profile_insert_sql=context.profile_insert_sql,
+                                    profile_sql_args_by_name=(
+                                        context.profile_sql_args_by_name
+                                    ),
+                                    profile_params_by_name=(
+                                        context.profile_params_by_name
+                                    ),
+                                    projection=projection_by_batch.get(
+                                        window_batch_number
+                                    ),
+                                )
                             )
-                        )
-                        for window_batch_number, batch in window_coordinates
-                    ]
+                            for window_batch_number, batch in window_coordinates
+                        ]
+                    )
                 )
-            )
             for (
                 window_batch_number,
                 batch,
