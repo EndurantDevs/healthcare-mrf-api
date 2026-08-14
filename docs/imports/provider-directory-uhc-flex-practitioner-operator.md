@@ -122,8 +122,9 @@ GLOBAL_PROFILE_FOLLOWUP_JSON="$(
 )"
 ```
 
-POST the exact `GLOBAL_PROFILE_FOLLOWUP_JSON` bytes unchanged to import-control
-at `/v1/provider-directory/profile-followup`, with its bearer token and the
+POST the exact `GLOBAL_PROFILE_FOLLOWUP_JSON` bytes unchanged to the
+authenticated external Profile controller at `/v1/provider-directory/profile-followup`,
+with its bearer token and the
 standard `destructive-action-v1` actor, request-ID, timestamp, and signature
 headers. HTTP 201 records a new durable observation; HTTP 200 is its exact
 idempotent replay. Preserve the complete response as the separate controller
