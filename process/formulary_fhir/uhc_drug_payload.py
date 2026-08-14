@@ -131,17 +131,29 @@ def _has_surrogate_escape(
     input_file: BinaryIO,
     cancel_check: Callable[[], None] | None,
 ) -> bool:
-    start_offset = input_file.tell()
     overlap = b""
+    has_surrogate_escape = False
+    while source_chunk := input_file.read(1_048_576):
+        if cancel_check is not None:
+            cancel_check()
+        lowered_chunk = (overlap + source_chunk).lower()
+        if any(prefix in lowered_chunk for prefix in _SURROGATE_ESCAPE_PREFIXES):
+            has_surrogate_escape = True
+        overlap = lowered_chunk[-3:]
+    return has_surrogate_escape
+
+
+def _seekable_surrogate_escape(
+    input_file: BinaryIO,
+    cancel_check: Callable[[], None] | None,
+) -> bool | None:
     try:
-        while source_chunk := input_file.read(1_048_576):
-            if cancel_check is not None:
-                cancel_check()
-            lowered_chunk = (overlap + source_chunk).lower()
-            if any(prefix in lowered_chunk for prefix in _SURROGATE_ESCAPE_PREFIXES):
-                return True
-            overlap = lowered_chunk[-3:]
-        return False
+        start_offset = input_file.tell()
+        input_file.seek(start_offset)
+    except (AttributeError, OSError):
+        return None
+    try:
+        return _has_surrogate_escape(input_file, cancel_check)
     finally:
         input_file.seek(start_offset)
 
@@ -150,13 +162,16 @@ def count_uhc_drug_stream_items(
     input_file: BinaryIO,
     *,
     cancel_check: Callable[[], None] | None = None,
+    has_surrogate_escape: bool | None = None,
 ) -> int:
     """Validate one stream and return its exact nonzero top-level item count."""
 
     if cancel_check is not None:
         cancel_check()
+    if has_surrogate_escape is None:
+        has_surrogate_escape = _seekable_surrogate_escape(input_file, cancel_check)
     parser_backend = (
-        strict_ijson if _has_surrogate_escape(input_file, cancel_check) else ijson
+        strict_ijson if has_surrogate_escape is not False else ijson
     )
     parser = iter(parser_backend.basic_parse(input_file, use_float=False))
     try:
@@ -184,6 +199,23 @@ def count_uhc_drug_stream_items(
     return item_count
 
 
+def count_reopenable_uhc_drug_stream_items(
+    open_input: Callable[[], Any],
+    *,
+    cancel_check: Callable[[], None] | None = None,
+) -> int:
+    """Validate one reopenable stream without buffering retained bytes."""
+
+    with open_input() as scan_file:
+        has_surrogate_escape = _has_surrogate_escape(scan_file, cancel_check)
+    with open_input() as input_file:
+        return count_uhc_drug_stream_items(
+            input_file,
+            cancel_check=cancel_check,
+            has_surrogate_escape=has_surrogate_escape,
+        )
+
+
 def uhc_drug_object_array_item_count(
     source_path: Path,
     *,
@@ -205,6 +237,7 @@ __all__ = (
     "MAX_JSON_RECORD_BYTES",
     "MAX_JSON_SCALAR_BYTES",
     "UHCDrugPayloadError",
+    "count_reopenable_uhc_drug_stream_items",
     "count_uhc_drug_stream_items",
     "uhc_drug_object_array_item_count",
 )

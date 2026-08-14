@@ -11,7 +11,9 @@ from process.formulary_fhir.source_artifact_contract import SourceArtifactIdenti
 from process.formulary_fhir.source_artifact_contract import VerifiedSourceArtifact
 from process.formulary_fhir.source_artifacts import open_verified_source_artifact
 from process.formulary_fhir.uhc_drug_payload import UHCDrugPayloadError
-from process.formulary_fhir.uhc_drug_payload import count_uhc_drug_stream_items
+from process.formulary_fhir.uhc_drug_payload import (
+    count_reopenable_uhc_drug_stream_items,
+)
 from process.formulary_fhir.uhc_drug_spool import UHCDrugNormalizationError
 from process.formulary_fhir.uhc_drug_spool import normalized_uhc_drug_source_records
 from process.formulary_fhir.uhc_drug_transport_contract import UHCDrugArtifactAcquisitionError
@@ -25,10 +27,10 @@ def _validate_uhc_drug_artifact(
     """Apply the exact structural and normalization contract to one artifact."""
 
     try:
-        with open_input() as validation_file:
-            expected_count = count_uhc_drug_stream_items(
-                validation_file, cancel_check=cancel_check
-            )
+        expected_count = count_reopenable_uhc_drug_stream_items(
+            open_input,
+            cancel_check=cancel_check,
+        )
         with open_input() as input_file:
             observed_count = sum(
                 1

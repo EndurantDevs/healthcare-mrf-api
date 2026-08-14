@@ -31,7 +31,9 @@ from process.formulary_fhir.uhc_drug_normalization import (
     normalized_uhc_drug_memberships,
 )
 from process.formulary_fhir.uhc_drug_payload import UHCDrugPayloadError
-from process.formulary_fhir.uhc_drug_payload import count_uhc_drug_stream_items
+from process.formulary_fhir.uhc_drug_payload import (
+    count_reopenable_uhc_drug_stream_items,
+)
 from process.formulary_fhir.uhc_drug_parser_contract import UHCDrugSpoolEvidence
 from process.formulary_fhir.uhc_drug_spool_contract import artifact_proof_rows
 from process.formulary_fhir.uhc_drug_spool_contract import spool_evidence_payload
@@ -289,11 +291,10 @@ def _consume_artifact(
     try:
         if cancel_check is not None:
             cancel_check()
-        with open_verified_source_artifact(artifact) as validation_file:
-            expected_record_count = count_uhc_drug_stream_items(
-                validation_file,
-                cancel_check=cancel_check,
-            )
+        expected_record_count = count_reopenable_uhc_drug_stream_items(
+            lambda: open_verified_source_artifact(artifact),
+            cancel_check=cancel_check,
+        )
         with open_verified_source_artifact(artifact) as input_file:
             observed_record_count = _consume_source_records(
                 connection,

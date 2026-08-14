@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,18 @@ INVALID_SCALAR_PAYLOADS = (
 )
 
 
+class _NonseekableBytes:
+    def __init__(self, content: bytes) -> None:
+        self._stream = BytesIO(content)
+
+    def read(self, byte_count: int = -1) -> bytes:
+        return self._stream.read(byte_count)
+
+    @property
+    def is_complete(self) -> bool:
+        return self._stream.tell() == len(self._stream.getbuffer())
+
+
 def test_payload_accepts_complete_object_array(tmp_path: Path) -> None:
     source_path = tmp_path / "drugs.json"
     source_path.write_bytes(
@@ -27,6 +41,21 @@ def test_payload_accepts_complete_object_array(tmp_path: Path) -> None:
     )
 
     assert uhc_drug_object_array_item_count(source_path) == 3
+
+
+def test_payload_reopens_nonseekable_retained_stream_for_surrogate_scan() -> None:
+    opened_inputs = []
+    content = b'[{"emoji":"\\ud83d\\ude00"}]' + (b" " * 1_048_576)
+
+    @contextmanager
+    def open_input():
+        input_file = _NonseekableBytes(content)
+        opened_inputs.append(input_file)
+        yield input_file
+        assert input_file.is_complete
+
+    assert payload.count_reopenable_uhc_drug_stream_items(open_input) == 1
+    assert len(opened_inputs) == 2
 
 
 @pytest.mark.parametrize(

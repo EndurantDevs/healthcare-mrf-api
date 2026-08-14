@@ -255,7 +255,11 @@ def test_artifact_record_census_and_spool_metadata_are_recomputed(
         yield io.BytesIO(b"[{}]")
 
     monkeypatch.setattr(spool, "open_verified_source_artifact", open_bytes)
-    monkeypatch.setattr(spool, "count_uhc_drug_stream_items", lambda *_a, **_k: 2)
+    monkeypatch.setattr(
+        spool,
+        "count_reopenable_uhc_drug_stream_items",
+        lambda *_a, **_k: 2,
+    )
     monkeypatch.setattr(spool, "_consume_source_records", lambda *_a, **_k: 1)
     connection = sqlite3.connect(":memory:")
     try:
