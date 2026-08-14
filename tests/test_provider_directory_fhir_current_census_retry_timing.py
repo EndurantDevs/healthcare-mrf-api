@@ -74,7 +74,7 @@ def _advancing_sleep(monkeypatch, clock):
 
 
 @pytest.mark.parametrize(
-    ("retry_after", "retry_index", "elapsed_seconds", "expected"),
+    ("retry_after", "retry_index", "waited_seconds", "expected"),
     [
         (None, 0, 0.0, 1.0),
         ("invalid", 0, 0.0, 1.0),
@@ -86,10 +86,10 @@ def _advancing_sleep(monkeypatch, clock):
         ("2", 1, 1.0, None),
     ],
 )
-def test_retry_after_delta_and_absolute_budget_boundaries(
+def test_retry_after_delta_and_wait_budget_boundaries(
     retry_after,
     retry_index,
-    elapsed_seconds,
+    waited_seconds,
     expected,
 ):
     response_by_field = (
@@ -97,14 +97,11 @@ def test_retry_after_delta_and_absolute_budget_boundaries(
         if retry_after is not None
         else None
     )
-    retry_started_at = 100.0
-
     assert (
         importer._current_version_census_retry_delay_seconds(
             response_by_field,
             retry_index=retry_index,
-            retry_started_at=retry_started_at,
-            now_monotonic=retry_started_at + elapsed_seconds,
+            retry_waited_seconds=waited_seconds,
         )
         == expected
     )
@@ -125,8 +122,7 @@ def test_retry_after_http_date_obeys_schedule_and_budget():
         importer._current_version_census_retry_delay_seconds(
             {importer.SOURCE_RETRY_AFTER_FIELD: allowed_retry_after},
             retry_index=0,
-            retry_started_at=0.0,
-            now_monotonic=0.0,
+            retry_waited_seconds=0.0,
             now_utc=current_time,
         )
         == 2.0
@@ -135,8 +131,7 @@ def test_retry_after_http_date_obeys_schedule_and_budget():
         importer._current_version_census_retry_delay_seconds(
             {importer.SOURCE_RETRY_AFTER_FIELD: refused_retry_after},
             retry_index=0,
-            retry_started_at=0.0,
-            now_monotonic=0.0,
+            retry_waited_seconds=0.0,
             now_utc=current_time,
         )
         is None
@@ -155,7 +150,7 @@ def test_retry_after_http_date_obeys_schedule_and_budget():
 
 
 @pytest.mark.asyncio
-async def test_request_duration_is_included_in_absolute_retry_targets(monkeypatch):
+async def test_request_duration_does_not_change_retry_wait_targets(monkeypatch):
     source_record = _source_record()
     clock = _fake_clock(monkeypatch)
     sleep = _advancing_sleep(monkeypatch, clock)
@@ -182,25 +177,52 @@ async def test_request_duration_is_included_in_absolute_retry_targets(monkeypatc
     assert fetch_result[3] == 300
     assert retry_count == 2
     assert attempt.await_count == 3
-    assert [sleep_call.args[0] for sleep_call in sleep.await_args_list] == pytest.approx(
-        [0.9, 0.9]
+    assert sleep.await_args_list == [call(1.0), call(1.0)]
+
+
+@pytest.mark.asyncio
+async def test_slow_timeout_does_not_consume_retry_wait_budget(monkeypatch):
+    source_record = _source_record()
+    clock = _fake_clock(monkeypatch)
+    sleep = _advancing_sleep(monkeypatch, clock)
+    responses = [
+        (None, None, "SocketTimeoutError", 60_000),
+        (None, None, "SocketTimeoutError", 60_000),
+        (200, {"resourceType": "Bundle", "type": "searchset"}, None, 100),
+    ]
+
+    def complete_attempt(*_args, **_kwargs):
+        clock.value += 60.0
+        return responses.pop(0)
+
+    attempt = AsyncMock(side_effect=complete_attempt)
+    monkeypatch.setattr(importer, "_fetch_current_version_census_json_once", attempt)
+
+    fetch_result, retry_count = await importer._fetch_current_version_census_json(
+        source_record,
+        _request_url(),
+        timeout=60,
     )
+
+    assert fetch_result[0] == 200
+    assert fetch_result[3] == 120_100
+    assert retry_count == 2
+    assert attempt.await_count == 3
+    assert sleep.await_args_list == [call(1.0), call(1.0)]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("second_wake_at", "expected_attempts", "expected_retries"),
+    "second_wake_at",
     [
-        pytest.param(2.999, 3, 2, id="before-deadline"),
-        pytest.param(3.0, 2, 1, id="at-deadline"),
-        pytest.param(3.1, 2, 1, id="overslept-deadline"),
+        pytest.param(2.999, id="before-old-deadline"),
+        pytest.param(3.0, id="at-old-deadline"),
+        pytest.param(3.1, id="after-old-deadline"),
     ],
 )
-async def test_post_sleep_deadline_blocks_late_reissue(
+async def test_wall_clock_oversleep_does_not_consume_wait_budget(
     monkeypatch,
     second_wake_at,
-    expected_attempts,
-    expected_retries,
 ):
     source_record = _source_record()
     clock = _fake_clock(monkeypatch)
@@ -228,17 +250,11 @@ async def test_post_sleep_deadline_blocks_late_reissue(
         timeout=3,
     )
 
-    assert attempt.await_count == expected_attempts
-    assert retry_count == expected_retries
+    assert attempt.await_count == 3
+    assert retry_count == 2
     assert sleep.await_args_list == [call(1.0), call(1.0)]
-    assert fetch_result[0] == (200 if expected_attempts == 3 else 503)
-    if expected_attempts == 3:
-        assert importer.SOURCE_FETCH_DIAGNOSTIC_FIELD not in source_record
-    else:
-        assert (
-            source_record[importer.SOURCE_FETCH_DIAGNOSTIC_FIELD]["retry_count"]
-            == expected_retries
-        )
+    assert fetch_result[0] == 200
+    assert importer.SOURCE_FETCH_DIAGNOSTIC_FIELD not in source_record
 
 
 @pytest.mark.asyncio

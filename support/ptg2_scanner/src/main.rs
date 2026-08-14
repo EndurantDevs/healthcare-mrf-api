@@ -33079,7 +33079,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_finalizer_accepts_multiple_dictionary_shards_for_one_source() {
+    fn v3_finalizer_accepts_multiple_dictionary_and_provider_metadata_shards_for_one_source() {
         let base = std::env::temp_dir().join(format!(
             "ptg2-direct-v3-finalizer-code-shards-{}",
             std::process::id()
@@ -33108,11 +33108,24 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(second_entry);
+        let first_metadata = payload["provider_set_metadata_files"][0].clone();
+        let first_metadata_path = PathBuf::from(first_metadata["path"].as_str().unwrap());
+        let second_metadata_path =
+            first_metadata_path.with_file_name("0-provider-metadata-shard.ready");
+        std::fs::copy(&first_metadata_path, &second_metadata_path).unwrap();
+        let mut second_metadata = first_metadata;
+        second_metadata["path"] = json!(second_metadata_path);
+        payload["provider_set_metadata_files"]
+            .as_array_mut()
+            .unwrap()
+            .push(second_metadata);
         complete_v3_finalizer_test_manifest_contracts(&mut payload);
         std::fs::write(&manifest, serde_json::to_vec(&payload).unwrap()).unwrap();
 
         let inputs = load_v3_finalizer_inputs(std::slice::from_ref(&manifest)).unwrap();
         assert_eq!(inputs.code_dictionaries.len(), 2);
+        assert_eq!(inputs.provider_metadata[0].path, second_metadata_path);
+        assert_eq!(inputs.provider_metadata[1].path, first_metadata_path);
         let (codes, source_rows, source_bytes) =
             load_v3_code_dictionary(&inputs.code_dictionaries).unwrap();
         assert_eq!(codes.len(), 1);
