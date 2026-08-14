@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from api.provider_profile import PROFILE_COMPOSER_VERSION, compose_provider_profile
+from api.provider_profile import (
+    PROFILE_COMPOSER_VERSION,
+    compose_provider_profile,
+)
 from api.provider_profile_display import display_value
 
 
@@ -282,7 +285,7 @@ def test_composer_formats_fhir_facts_for_people():
     )
 
     assert profile is not None
-    assert PROFILE_COMPOSER_VERSION == "provider-profile-composer/v4"
+    assert PROFILE_COMPOSER_VERSION == "provider-profile-composer/v5"
     assert profile["composer_version"] == PROFILE_COMPOSER_VERSION
     expected_displays_by_category = {
         "certifications": ["Doctor of Medicine (MD)"],

@@ -12,34 +12,14 @@ from typing import Any, Iterable, Mapping
 from api.provider_language import language_identity
 from api.provider_language_merge import fhir_support_count
 from api.provider_profile_display import display_value
+from api.provider_profile_public_facts import (
+    _FHIR_CATEGORY_BY_FACT,
+    _public_fhir_fact,
+)
 from process.florida_mqa_profile import PROFILE_SCHEMA_VERSION, STANDARD_CATEGORIES
 from process.provider_profile_reported_range import normalize_projected_state_facts
 
-_FHIR_CATEGORY_BY_FACT = {
-    "name": "identity",
-    "administrative_gender": "demographics",
-    "age": "demographics",
-    "contact": "contact",
-    "endpoint": "contact",
-    "language": "languages",
-    "years_of_practice": "professional_experience",
-    "taxonomy_qualification": "specialties",
-    "qualification": "certifications",
-    "qualification_detail": "certifications",
-    "credential": "certifications",
-    "specialty": "specialties",
-    "role": "services",
-    "role_identifier": "services",
-    "role_context": "services",
-    "service": "services",
-    "organization": "organizations",
-    "affiliation": "affiliations",
-    "plan_membership": "network_participation",
-    "new_patient_acceptance": "accepting_patients",
-    "telehealth": "telehealth",
-    "accepting_medicaid": "network_participation",
-}
-PROFILE_COMPOSER_VERSION = "provider-profile-composer/v4"
+PROFILE_COMPOSER_VERSION = "provider-profile-composer/v5"
 
 
 def _empty_profile(npi: int) -> dict[str, Any]:
@@ -273,9 +253,12 @@ def _merge_fhir_fact_group(
     profile_items: list[Any],
 ) -> None:
     """Merge one materialized FHIR fact group into a profile category."""
-    publication_target["_source_reported_total"] = int(
-        publication_target.get("_source_reported_total", 0)
-    ) + int(fact_group.get("total") or len(profile_items))
+    if fact_group.get("_total_unknown"):
+        publication_target["_source_total_unknown"] = True
+    else:
+        publication_target["_source_reported_total"] = int(
+            publication_target.get("_source_reported_total", 0)
+        ) + int(fact_group.get("total") or len(profile_items))
     publication_target["_source_materialized_count"] = int(
         publication_target.get("_source_materialized_count", 0)
     ) + len(profile_items)
@@ -309,12 +292,46 @@ def _merge_fhir_profile_facts(
     if not isinstance(fhir_facts, Mapping):
         return
     for fact_type, fact_group in fhir_facts.items():
-        category = _FHIR_CATEGORY_BY_FACT.get(str(fact_type), "services")
+        normalized_fact_type = str(fact_type)
+        category = _FHIR_CATEGORY_BY_FACT.get(normalized_fact_type, "services")
         group = fact_group if isinstance(fact_group, Mapping) else {}
         profile_items = group.get("items", [])
-        if isinstance(profile_items, list):
+        if not isinstance(profile_items, list):
+            continue
+        if normalized_fact_type not in {
+            "qualification",
+            "taxonomy_qualification",
+            "qualification_detail",
+        } or not profile_items:
+            _merge_fhir_fact_group(categories[category], fact_type, group, profile_items)
+            continue
+        profile_items_by_public_fact: dict[tuple[str, str], list[Any]] = {}
+        for profile_item in profile_items:
+            fact_value = (
+                profile_item.get("value")
+                if isinstance(profile_item, Mapping)
+                else None
+            )
+            public_fact = _public_fhir_fact(normalized_fact_type, fact_value)
+            profile_items_by_public_fact.setdefault(public_fact, []).append(profile_item)
+        source_total = int(group.get("total") or len(profile_items))
+        is_partition_complete = (
+            not group.get("truncated") and source_total == len(profile_items)
+        )
+        for (
+            public_fact_type,
+            public_category,
+        ), partition_profile_items in profile_items_by_public_fact.items():
+            partition_group = (
+                {"total": len(partition_profile_items), "truncated": False}
+                if is_partition_complete
+                else {"truncated": True, "_total_unknown": True}
+            )
             _merge_fhir_fact_group(
-                categories[category], fact_type, group, profile_items
+                categories[public_category],
+                public_fact_type,
+                partition_group,
+                partition_profile_items,
             )
 
 
@@ -392,13 +409,15 @@ def _finalize_category_group(
     group["returned"] = len(group["items"])
     group["truncated"] = bool(group.pop("_source_truncated", False))
     source_reported_total = group.pop("_source_reported_total", None)
+    source_total_unknown = bool(group.pop("_source_total_unknown", False))
     source_materialized_count = int(group.pop("_source_materialized_count", 0))
     has_unmaterialized_items = (
         source_reported_total is not None
         and int(source_reported_total) > source_materialized_count
     )
-    if has_unmaterialized_items or (
-        source_reported_total is not None and group["truncated"]
+    if not source_total_unknown and (
+        has_unmaterialized_items
+        or (source_reported_total is not None and group["truncated"])
     ):
         group["source_reported_total"] = int(source_reported_total)
 

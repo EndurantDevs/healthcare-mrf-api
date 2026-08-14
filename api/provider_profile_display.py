@@ -118,6 +118,29 @@ def _qualification_display(value: Mapping[str, Any]) -> str:
     return f"Qualification issued by {issuer}" if issuer else ""
 
 
+def license_number(value: Mapping[str, Any]) -> str | None:
+    """Return an exact LN identifier value without guessing from other fields."""
+    for identifier in value.get("identifiers") or []:
+        if not isinstance(identifier, Mapping):
+            continue
+        if any(
+            isinstance(coding, Mapping)
+            and coding.get("system")
+            == "http://terminology.hl7.org/CodeSystem/v2-0203"
+            and coding.get("code") == "LN"
+            for coding in identifier.get("type_codes") or []
+        ):
+            return _text(identifier.get("value"))
+    return None
+
+
+def _license_display(value: Mapping[str, Any]) -> str:
+    number = license_number(value)
+    if number is not None:
+        return f"License number: {number}" if number else "License"
+    return ""
+
+
 def _acceptance_display(value: Any) -> str:
     codes = _labels_from_codes(value)
     labels = [
@@ -279,6 +302,9 @@ def display_value(fact_type: str, fact_value: Any) -> str:
         "qualification": _qualification_display,
         "taxonomy_qualification": _qualification_display,
         "qualification_detail": _qualification_display,
+        "license": _license_display,
+        "area_of_expertise": _qualification_display,
+        "board_certification": _qualification_display,
         "role_context": _role_context_display,
         "service": _service_display,
         "endpoint": _endpoint_display,

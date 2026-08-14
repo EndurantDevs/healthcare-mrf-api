@@ -25,6 +25,10 @@ from api.provider_profile_composer_parts import (
     _paginate_profile_category,
 )
 from db.models import ProviderProfileProjection, db
+from api.provider_profile_public_facts import (
+    _professional_summary,
+    _public_fhir_fact,
+)
 from process.florida_mqa_profile import PROFILE_SCHEMA_VERSION
 
 
@@ -90,6 +94,10 @@ def compose_provider_profile(
         requested_categories,
         include_sensitive,
     )
+    profile.pop("professional_summary", None)
+    professional_summary = _professional_summary(profile, page_category)
+    if professional_summary is not None:
+        profile["professional_summary"] = professional_summary
     _paginate_profile_category(profile, page_category, page_limit, page_offset)
     _deduplicate_profile_sources(profile)
     return profile
@@ -178,16 +186,17 @@ def _filtered_fhir_fact_group(
 ) -> dict[str, Any] | None:
     """Filter one FHIR evidence group to facts present on the public page."""
     group = fact_group if isinstance(fact_group, Mapping) else {}
-    profile_items = [
-        profile_item
-        for profile_item in group.get("items", [])
-        if isinstance(profile_item, Mapping)
-        and (
-            str(fact_type),
-            evidence_value_key(str(fact_type), profile_item.get("value")),
-        )
-        in returned_fhir_keys
-    ]
+    profile_items = []
+    for profile_item in group.get("items", []):
+        if not isinstance(profile_item, Mapping):
+            continue
+        value = profile_item.get("value")
+        public_fact_type, _category = _public_fhir_fact(str(fact_type), value)
+        if (
+            public_fact_type,
+            evidence_value_key(public_fact_type, value),
+        ) in returned_fhir_keys:
+            profile_items.append(profile_item)
     if not profile_items:
         return None
     filtered_group_by_field = dict(group)
