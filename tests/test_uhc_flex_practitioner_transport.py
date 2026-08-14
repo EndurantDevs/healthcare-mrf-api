@@ -371,16 +371,17 @@ async def test_json_parser_rejects_duplicates_nonfinite_trailing_and_non_object(
 
 
 @pytest.mark.asyncio
-async def test_bundle_validation_failure_is_terminal_and_retains_no_npi():
+async def test_foreign_npi_resource_is_quarantined_as_unmatched():
     response = _response_from_body(_bundle([_practitioner(npi=OTHER_NPI)]))
 
-    error = await _transport_error(_Session(response))
+    result = await transport.fetch_uhc_flex_practitioner(
+        _Session(response),
+        REQUESTED_NPI,
+    )
 
-    assert error.code == "response_validation"
-    assert error.validation_code == "cross_npi"
-    assert error.is_retryable is False
-    assert str(REQUESTED_NPI) not in str(error)
-    assert str(OTHER_NPI) not in str(error)
+    assert result.is_unmatched is True
+    assert result.resource_count == 0
+    assert result.resource_payloads() == ()
 
 
 @pytest.mark.asyncio

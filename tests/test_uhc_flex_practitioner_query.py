@@ -168,9 +168,11 @@ def test_conflicting_duplicate_resource_ids_fail_closed():
     malformed = _practitioner("practitioner-a")
     malformed["identifier"][0]["value"] = None
     for resource_rows in ([first, malformed], [malformed, first]):
-        assert _validation_error_code(_search_bundle(resource_rows)) == (
-            "duplicate_resource_conflict"
+        result = validate_uhc_flex_practitioner_search_bundle(
+            REQUESTED_NPI,
+            _search_bundle(resource_rows),
         )
+        assert result.resource_payloads() == (first,)
 
 
 @pytest.mark.parametrize(
@@ -207,34 +209,6 @@ def test_conflicting_duplicate_resource_ids_fail_closed():
             "practitioner_required",
         ),
         (
-            _search_bundle(
-                [
-                    {
-                        "resourceType": "Practitioner",
-                        "id": "practitioner-a",
-                        "identifier": [],
-                    }
-                ]
-            ),
-            "requested_npi_missing",
-        ),
-        (
-            _search_bundle(
-                [
-                    {
-                        "resourceType": "Practitioner",
-                        "id": "practitioner-a",
-                        "identifier": [None],
-                    }
-                ]
-            ),
-            "payload_invalid",
-        ),
-        (
-            _search_bundle([_practitioner("practitioner-a", OTHER_NPI)]),
-            "cross_npi",
-        ),
-        (
             _search_bundle([_practitioner("not/valid")]),
             "resource_id_invalid",
         ),
@@ -269,12 +243,29 @@ def test_search_bundle_requires_the_exact_us_npi_identifier_system():
     resource = _practitioner("practitioner-a")
     resource["identifier"][0]["system"] = "https://example.test/npi"
 
-    assert _validation_error_code(_search_bundle([resource])) == (
-        "requested_npi_missing"
+    result = validate_uhc_flex_practitioner_search_bundle(
+        REQUESTED_NPI,
+        _search_bundle([resource], total=1),
+    )
+    assert result.outcome == UHC_FLEX_PRACTITIONER_UNMATCHED
+    assert result.resource_count == 0
+
+
+@pytest.mark.parametrize("identifiers", [[], [None]])
+def test_search_bundle_quarantines_resources_without_a_valid_npi(identifiers):
+    resource = _practitioner("practitioner-a")
+    resource["identifier"] = identifiers
+
+    result = validate_uhc_flex_practitioner_search_bundle(
+        REQUESTED_NPI,
+        _search_bundle([resource], total=1),
     )
 
+    assert result.outcome == UHC_FLEX_PRACTITIONER_UNMATCHED
+    assert result.resource_count == 0
 
-def test_search_bundle_quarantines_malformed_npi_only_with_an_exact_sibling():
+
+def test_search_bundle_quarantines_malformed_npi_with_or_without_exact_sibling():
     exact_resource = _practitioner("practitioner-a")
     malformed_resource = _practitioner("practitioner-b")
     malformed_resource["identifier"][0]["value"] = None
@@ -298,14 +289,17 @@ def test_search_bundle_quarantines_malformed_npi_only_with_an_exact_sibling():
         assert result.resource_sha256_by_id == expected_result.resource_sha256_by_id
         assert result.result_sha256 == expected_result.result_sha256
 
-    assert _validation_error_code(_search_bundle([malformed_resource])) == (
-        "resource_npi_invalid"
+    result = validate_uhc_flex_practitioner_search_bundle(
+        REQUESTED_NPI,
+        _search_bundle([malformed_resource], total=1),
     )
+    assert result.outcome == UHC_FLEX_PRACTITIONER_UNMATCHED
+    assert result.resource_count == 0
 
 
 @pytest.mark.parametrize("foreign_identifier_position", [0, 1])
 @pytest.mark.parametrize("is_malformed_entry_first", [False, True])
-def test_search_bundle_rejects_foreign_npi_in_malformed_sibling(
+def test_search_bundle_quarantines_foreign_npi_in_malformed_sibling(
     foreign_identifier_position,
     is_malformed_entry_first,
 ):
@@ -325,7 +319,12 @@ def test_search_bundle_rejects_foreign_npi_in_malformed_sibling(
     if not is_malformed_entry_first:
         entries.reverse()
 
-    assert _validation_error_code(_search_bundle(entries)) == "cross_npi"
+    result = validate_uhc_flex_practitioner_search_bundle(
+        REQUESTED_NPI,
+        _search_bundle(entries, total=2),
+    )
+    assert result.outcome == UHC_FLEX_PRACTITIONER_MATCHED
+    assert result.resource_ids == ("practitioner-a",)
 
 
 def test_search_bundle_quarantines_an_ambiguous_only_result():
@@ -357,7 +356,7 @@ def test_search_bundle_quarantines_an_ambiguous_only_result():
     assert result.result_sha256 == empty_result.result_sha256
 
 
-def test_search_bundle_never_ignores_a_foreign_only_sibling():
+def test_search_bundle_quarantines_a_foreign_only_sibling():
     exact_resource = _practitioner("practitioner-a")
     foreign_resource = _practitioner("practitioner-b", OTHER_NPI)
 
@@ -365,9 +364,19 @@ def test_search_bundle_never_ignores_a_foreign_only_sibling():
         [exact_resource, foreign_resource],
         [foreign_resource, exact_resource],
     ):
-        assert _validation_error_code(
-            _search_bundle(resource_rows, total=2)
-        ) == "cross_npi"
+        result = validate_uhc_flex_practitioner_search_bundle(
+            REQUESTED_NPI,
+            _search_bundle(resource_rows, total=2),
+        )
+        assert result.outcome == UHC_FLEX_PRACTITIONER_MATCHED
+        assert result.resource_ids == ("practitioner-a",)
+
+    foreign_only = validate_uhc_flex_practitioner_search_bundle(
+        REQUESTED_NPI,
+        _search_bundle([foreign_resource], total=1),
+    )
+    assert foreign_only.outcome == UHC_FLEX_PRACTITIONER_UNMATCHED
+    assert foreign_only.resource_count == 0
 
 
 def test_search_bundle_keeps_exact_resource_and_omits_ambiguous_sibling():
@@ -389,12 +398,11 @@ def test_search_bundle_keeps_exact_resource_and_omits_ambiguous_sibling():
     assert result.resource_ids == ("practitioner-a",)
 
     conflicting_resource_map = dict(ambiguous_resource, id="practitioner-a")
-    assert (
-        _validation_error_code(
-            _search_bundle([exact_resource, conflicting_resource_map], total=2)
-        )
-        == "duplicate_resource_conflict"
+    result = validate_uhc_flex_practitioner_search_bundle(
+        REQUESTED_NPI,
+        _search_bundle([exact_resource, conflicting_resource_map], total=2),
     )
+    assert result.resource_payloads() == (exact_resource,)
 
 
 def test_search_bundle_rejects_entry_or_total_above_the_fixed_cap():
@@ -412,7 +420,12 @@ def test_search_bundle_rejects_entry_or_total_above_the_fixed_cap():
 
 
 def test_query_error_does_not_echo_npi_or_response_payload():
-    response_payload = _search_bundle([_practitioner("practitioner-a", OTHER_NPI)])
+    response_payload = _search_bundle(
+        [
+            _practitioner("practitioner-a", active=True),
+            _practitioner("practitioner-a", active=False),
+        ]
+    )
 
     with pytest.raises(UHCFlexPractitionerQueryError) as error_info:
         validate_uhc_flex_practitioner_search_bundle(

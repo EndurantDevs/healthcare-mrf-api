@@ -294,29 +294,26 @@ def _validated_resource_json_rows(
 ) -> tuple[tuple[str, str], ...]:
     canonical_json_by_id: dict[str, str] = {}
     admitted_resource_ids: set[str] = set()
-    has_malformed_npi_sibling = False
     for entry_by_field in entries:
         resource_by_field = _entry_practitioner(entry_by_field)
-        exact_npis, has_malformed_npi = _exact_resource_npis(resource_by_field)
-        if has_malformed_npi and any(npi != requested_npi for npi in exact_npis):
-            raise UHCFlexPractitionerQueryError("cross_npi")
-        if not exact_npis and not has_malformed_npi:
-            raise UHCFlexPractitionerQueryError("requested_npi_missing")
-        if requested_npi not in exact_npis and not has_malformed_npi:
-            raise UHCFlexPractitionerQueryError("cross_npi")
+        try:
+            _validate_resource_npi(resource_by_field, requested_npi)
+        except UHCFlexPractitionerQueryError as error:
+            if error.code not in {
+                "cross_npi",
+                "payload_invalid",
+                "requested_npi_missing",
+                "resource_npi_invalid",
+            }:
+                raise
+            continue
         resource_id = _resource_id(resource_by_field)
         canonical_json = _canonical_resource_json(resource_by_field)
         previous_json = canonical_json_by_id.get(resource_id)
         if previous_json is not None and previous_json != canonical_json:
             raise UHCFlexPractitionerQueryError("duplicate_resource_conflict")
         canonical_json_by_id[resource_id] = canonical_json
-        if has_malformed_npi:
-            has_malformed_npi_sibling = True
-            continue
-        if all(resource_npi == requested_npi for resource_npi in exact_npis):
-            admitted_resource_ids.add(resource_id)
-    if not admitted_resource_ids and has_malformed_npi_sibling:
-        raise UHCFlexPractitionerQueryError("resource_npi_invalid")
+        admitted_resource_ids.add(resource_id)
     return tuple((key, canonical_json_by_id[key]) for key in sorted(admitted_resource_ids))
 
 
