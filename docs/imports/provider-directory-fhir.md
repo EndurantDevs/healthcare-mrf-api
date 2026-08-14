@@ -176,19 +176,18 @@ provider-directory resource does not exist.
 Each reviewed current-version request has one fixed transport policy: at most
 three attempts against the identical URL, with redirects disabled and encoded
 query bytes preserved. Only transport failures and HTTP 500, 502, 503, or 504
-are retried. HTTP 423 and 429 stop inline retries and return durable defer
-metadata; HTTP 410, authentication and other client responses, and semantic
-failures in an HTTP 200 response also stop immediately. Retry requests target
-300 and 899 seconds after the first request starts, approximately t+5 and t+15
-minutes, and request time counts against that schedule. The strict absolute
-deadline is 900 seconds; waking at or after it suppresses the next request. A
-valid delta-seconds or HTTP-date `Retry-After` can extend a wait within that
-deadline when it is no more than 600 seconds. A longer boundary stops inline
-retries and is returned as durable retry metadata without truncation or an
-early request. This policy has no environment or CLI override. A recovered
-response clears prior transient diagnostics, while an exhausted response
-records one final redacted diagnostic with aggregate request elapsed time and
-the number of requests actually reissued.
+and HTTP 423 are retried. HTTP 429 returns durable defer metadata; HTTP 410,
+authentication and other client responses, and semantic failures in an HTTP
+200 response stop immediately. Retry waits target one and two seconds of
+cumulative sleeping, within a strict three-second wait budget. Request time is
+not charged to that wait budget, so a slow request can still use the remaining
+bounded attempts. A valid delta-seconds or HTTP-date `Retry-After` can extend a
+wait only when it is no more than three seconds and still fits that budget. A
+longer boundary stops inline retries and is returned as durable retry metadata
+without truncation or an early request. This schedule has no environment or
+CLI override. A recovered response clears prior transient diagnostics, while
+an exhausted response records one final redacted diagnostic with aggregate
+request elapsed time and the number of requests actually reissued.
 
 Each completed acquisition retains sealed, token-inclusive replay commitments that
 prove its source-issued continuation chain. A separate completion

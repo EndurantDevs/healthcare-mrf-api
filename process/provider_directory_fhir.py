@@ -45899,21 +45899,16 @@ def _current_version_census_retry_delay_seconds(
     fhir_payload: dict[str, Any] | None,
     *,
     retry_index: int,
-    retry_started_at: float,
-    now_monotonic: float,
+    retry_waited_seconds: float,
     now_utc: datetime.datetime | None = None,
 ) -> float | None:
-    """Return the next fixed-schedule delay, or defer beyond the wait budget."""
-    retry_target_at = (
-        retry_started_at
-        + CURRENT_VERSION_CENSUS_RETRY_WAIT_TARGETS_SECONDS[retry_index]
-    )
-    retry_deadline_at = (
-        retry_started_at + CURRENT_VERSION_CENSUS_RETRY_WAIT_BUDGET_SECONDS
-    )
+    """Return the next fixed-schedule delay without charging request time."""
+    retry_target_seconds = CURRENT_VERSION_CENSUS_RETRY_WAIT_TARGETS_SECONDS[
+        retry_index
+    ]
     nominal_delay_seconds = max(
         0.0,
-        retry_target_at - now_monotonic,
+        retry_target_seconds - retry_waited_seconds,
     )
     retry_after_seconds = _source_retry_after_seconds(
         fhir_payload,
@@ -45929,7 +45924,10 @@ def _current_version_census_retry_delay_seconds(
         nominal_delay_seconds,
         retry_after_seconds if retry_after_seconds is not None else 0.0,
     )
-    if now_monotonic + delay_seconds >= retry_deadline_at:
+    if (
+        retry_waited_seconds + delay_seconds
+        >= CURRENT_VERSION_CENSUS_RETRY_WAIT_BUDGET_SECONDS
+    ):
         return None
     return delay_seconds
 
@@ -45944,10 +45942,7 @@ async def _fetch_current_version_census_json(
     int,
 ]:
     """Fetch one reviewed URL on a fixed, bounded transient-retry schedule."""
-    retry_started_at = time.monotonic()
-    retry_deadline_at = (
-        retry_started_at + CURRENT_VERSION_CENSUS_RETRY_WAIT_BUDGET_SECONDS
-    )
+    retry_waited_seconds = 0.0
     total_elapsed_ms = 0
     retry_count = 0
     fetch_result = (None, None, "request_not_attempted", 0)
@@ -45973,14 +45968,12 @@ async def _fetch_current_version_census_json(
             delay_seconds = _current_version_census_retry_delay_seconds(
                 fetch_result[1],
                 retry_index=attempt_index,
-                retry_started_at=retry_started_at,
-                now_monotonic=time.monotonic(),
+                retry_waited_seconds=retry_waited_seconds,
             )
             if delay_seconds is None:
                 break
             await asyncio.sleep(delay_seconds)
-            if time.monotonic() >= retry_deadline_at:
-                break
+            retry_waited_seconds += delay_seconds
             retry_count += 1
     _record_terminal_source_fetch_diagnostic(
         source_record,
