@@ -347,6 +347,31 @@ async def test_cohort_context_projects_only_available_measure_metadata():
 
 
 @pytest.mark.asyncio
+async def test_staging_measure_propagates_geography_to_published_score():
+    async def is_table_present(_schema: str, _table: str) -> bool:
+        return False
+
+    classes = provider_quality._staging_classes("stage_test", "mrf")
+    context = await provider_quality_cohort_context._build_cohort_materialization_context(
+        classes,
+        "mrf",
+        table_exists=is_table_present,
+    )
+    score_sql = provider_quality._cohort_sql_phase_7_score_shard(context)
+
+    assert "cohort_geography_scope" in context["measure_insert_cols_sql"]
+    assert "s.selected_geography_scope" in context["measure_select_cols_sql"]
+    assert "cohort_geography_value" in context["measure_insert_cols_sql"]
+    assert "s.selected_geography_value" in context["measure_select_cols_sql"]
+    assert "MAX(m.cohort_geography_scope) AS selected_geography_scope" in score_sql
+    assert "MAX(m.cohort_geography_value) AS selected_geography_value" in score_sql
+    assert "cohort_geography_scope" in context["score_insert_cols_sql"]
+    assert "cm.selected_geography_scope" in context["score_select_cols_sql"]
+    assert "cohort_geography_value" in context["score_insert_cols_sql"]
+    assert "cm.selected_geography_value" in context["score_select_cols_sql"]
+
+
+@pytest.mark.asyncio
 async def test_measure_shard_limits_rx_cte_to_provider_base():
     async def is_table_existing(_schema: str, table: str) -> bool:
         return table == "pricing_provider_prescription"
