@@ -35,8 +35,13 @@ def _mutated(value, **changes):
     return changed
 
 
-async def _runner_fixture(*, progress_callback=None, **config_changes):
-    harness = AcquisitionHarness(npi_count=1)
+async def _runner_fixture(
+    *,
+    progress_callback=None,
+    npi_count=1,
+    **config_changes,
+):
+    harness = AcquisitionHarness(npi_count=npi_count)
     context = await acquisition._initialize_context(
         operation_key=OPERATION_KEY,
         projection_date=PROJECTION_DATE,
@@ -87,6 +92,27 @@ async def test_drain_operation_preserves_or_suppresses_outer_cancellation():
     with pytest.raises(RuntimeError, match="bounded"):
         await runtime.drain_operation(failure(), preserve_cancellation=False)
 
+    entered = asyncio.Event()
+    released = asyncio.Event()
+
+    async def failure_after_cancellation():
+        entered.set()
+        await released.wait()
+        raise UHCFlexPractitionerStoreError("lease_lost")
+
+    task = asyncio.create_task(
+        runtime.drain_operation(
+            failure_after_cancellation(),
+            preserve_cancellation=True,
+        )
+    )
+    await entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    released.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
 
 @pytest.mark.asyncio
 async def test_runner_callback_claim_and_retry_failure_boundaries():
@@ -94,8 +120,6 @@ async def test_runner_callback_claim_and_retry_failure_boundaries():
     await runner.emit("root_started")
     with pytest.raises(acquisition.UHCFlexPractitionerAcquisitionError):
         await runner._record_terminal("invalid")
-    with pytest.raises(acquisition.UHCFlexPractitionerAcquisitionError):
-        runner._finish_delayed_retry()
 
     progress_list = []
     runner.progress_callback = progress_list.append
@@ -139,20 +163,17 @@ async def test_runner_callback_claim_and_retry_failure_boundaries():
     runner.dependencies = replace(runner.dependencies, release_work=release_failure)
     with pytest.raises(RuntimeError, match="release"):
         await runner.release_for_retry(claim)
-    assert runner._delayed_retry_count == 0
     await runner.release_for_cancellation(claim)
 
 
 @pytest.mark.asyncio
-async def test_runner_delayed_retry_race_and_invalid_retry_claim():
+async def test_runner_claim_lock_and_invalid_retry_claim():
     runner, _harness, _context = await _runner_fixture()
     await runner._claim_lock.acquire()
     claim_task = asyncio.create_task(runner.claim())
     await asyncio.sleep(0)
-    runner._no_delayed_retries.clear()
+    assert not claim_task.done()
     runner._claim_lock.release()
-    await asyncio.sleep(0)
-    runner._no_delayed_retries.set()
     assert type(await claim_task) is UHCFlexPractitionerWorkClaim
 
     runner, _harness, _context = await _runner_fixture()
@@ -161,8 +182,6 @@ async def test_runner_delayed_retry_race_and_invalid_retry_claim():
         return object()
 
     runner.dependencies = replace(runner.dependencies, claim_work=invalid_claim)
-    runner._delayed_retry_count = 1
-    runner._no_delayed_retries.clear()
     with pytest.raises(acquisition.UHCFlexPractitionerAcquisitionError):
         await runner.claim_retry(1000000004, 0.0)
 
@@ -172,10 +191,7 @@ async def test_runner_delayed_retry_race_and_invalid_retry_claim():
         return None
 
     runner.dependencies = replace(runner.dependencies, claim_work=missing_claim)
-    runner._delayed_retry_count = 2
-    runner._no_delayed_retries.clear()
     assert await runner.claim_retry(1000000004, 0.0) is None
-    assert runner._delayed_retry_count == 1
 
 
 @pytest.mark.asyncio
@@ -197,8 +213,6 @@ async def test_runner_cancellation_releases_claim_and_retry_claim():
         runner.dependencies = replace(runner.dependencies, claim_work=return_claim)
         runner._record_claim = cancel_record
         if retry_claim:
-            runner._delayed_retry_count = 1
-            runner._no_delayed_retries.clear()
             operation = runner.claim_retry(claim.requested_npi, 0.0)
         else:
             operation = runner.claim()
@@ -221,8 +235,6 @@ async def test_retry_claim_cancellation_after_claim_releases_exact_lease():
             await asyncio.Future()
 
     runner._claim_lock = CancelableLockExit()
-    runner._delayed_retry_count = 1
-    runner._no_delayed_retries.clear()
     claim_task = asyncio.create_task(runner.claim_retry(1000000004, 0.0))
     await exit_entered.wait()
     claim_task.cancel()

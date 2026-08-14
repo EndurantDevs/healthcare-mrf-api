@@ -116,10 +116,11 @@ async def drain_operation(
                 cancellation = error
         except BaseException:
             break
-    operation_result = operation_task.result()
     if cancellation is not None and preserve_cancellation:
+        if not operation_task.cancelled():
+            operation_task.exception()
         raise cancellation
-    return operation_result
+    return operation_task.result()
 
 
 @dataclass(slots=True)
@@ -149,9 +150,8 @@ class _RootRunner:
         self.progress_callback = progress_callback
         self.counters = _AggregateCounters()
         self._claim_lock = asyncio.Lock()
-        self._no_delayed_retries = asyncio.Event()
-        self._no_delayed_retries.set()
-        self._delayed_retry_count = 0
+        self._delayed_retry_npis: set[int] = set()
+        self._fresh_work_exhausted = False
 
     async def emit(self, phase: str) -> None:
         """Emit one aggregate-only progress observation."""
@@ -213,36 +213,30 @@ class _RootRunner:
         await self.emit("root_sealed")
 
     async def claim(self) -> UHCFlexPractitionerWorkClaim | None:
-        """Claim the next member after all delayed retries finish."""
-
-        while True:
-            await self._no_delayed_retries.wait()
-            claim: UHCFlexPractitionerWorkClaim | None = None
-            try:
-                async with self._claim_lock:
-                    if not self._no_delayed_retries.is_set():
-                        continue
+        """Claim the next available member."""
+        claim: UHCFlexPractitionerWorkClaim | None = None
+        try:
+            async with self._claim_lock:
+                fresh_modes = (False,) if self._fresh_work_exhausted else (True, False)
+                for fresh_only in fresh_modes:
                     claim = await self.dependencies.claim_work(
                         self.identity.acquisition_id,
-                        lease_seconds=self.config.lease_seconds,
+                        excluded_npis=tuple(sorted(self._delayed_retry_npis)),
+                        fresh_only=fresh_only, lease_seconds=self.config.lease_seconds,
                         database=self.database,
                     )
-                if claim is not None:
-                    if type(claim) is not UHCFlexPractitionerWorkClaim:
-                        raise UHCFlexPractitionerAcquisitionError("state")
-                    await self._record_claim()
-                return claim
-            except asyncio.CancelledError:
-                if claim is not None:
-                    await self.release_for_cancellation(claim)
-                raise
-
-    def _finish_delayed_retry(self) -> None:
-        self._delayed_retry_count -= 1
-        if self._delayed_retry_count < 0:
-            raise UHCFlexPractitionerAcquisitionError("state")
-        if self._delayed_retry_count == 0:
-            self._no_delayed_retries.set()
+                    if claim is not None or fresh_only is False:
+                        break
+                    self._fresh_work_exhausted = True
+            if claim is not None:
+                if type(claim) is not UHCFlexPractitionerWorkClaim:
+                    raise UHCFlexPractitionerAcquisitionError("state")
+                await self._record_claim()
+            return claim
+        except asyncio.CancelledError:
+            if claim is not None:
+                await self.release_for_cancellation(claim)
+            raise
 
     async def release_for_retry(
         self,
@@ -251,8 +245,7 @@ class _RootRunner:
         """Release a transiently failed claim before its retry delay."""
 
         async with self._claim_lock:
-            self._delayed_retry_count += 1
-            self._no_delayed_retries.clear()
+            self._delayed_retry_npis.add(claim.requested_npi)
             try:
                 await drain_operation(
                     self.dependencies.release_work(
@@ -262,7 +255,7 @@ class _RootRunner:
                     preserve_cancellation=True,
                 )
             except BaseException:
-                self._finish_delayed_retry()
+                self._delayed_retry_npis.discard(claim.requested_npi)
                 raise
         await self._record_retry()
 
@@ -275,17 +268,12 @@ class _RootRunner:
 
         claim: UHCFlexPractitionerWorkClaim | None = None
         try:
-            try:
-                await self.dependencies.sleep(delay_seconds)
-                async with self._claim_lock:
-                    claim = await self.dependencies.claim_work(
-                        self.identity.acquisition_id,
-                        requested_npi=requested_npi,
-                        lease_seconds=self.config.lease_seconds,
-                        database=self.database,
-                    )
-            finally:
-                self._finish_delayed_retry()
+            await self.dependencies.sleep(delay_seconds)
+            async with self._claim_lock:
+                claim = await self.dependencies.claim_work(
+                    self.identity.acquisition_id, requested_npi=requested_npi,
+                    lease_seconds=self.config.lease_seconds, database=self.database,
+                )
             if claim is not None:
                 if type(claim) is not UHCFlexPractitionerWorkClaim:
                     raise UHCFlexPractitionerAcquisitionError("state")
@@ -295,6 +283,8 @@ class _RootRunner:
             if claim is not None:
                 await self.release_for_cancellation(claim)
             raise
+        finally:
+            self._delayed_retry_npis.discard(requested_npi)
 
     async def release_for_cancellation(
         self,
@@ -361,10 +351,10 @@ class _RootRunner:
         await self._record_terminal("error")
 
     async def release_final_retryable(self, claim: UHCFlexPractitionerWorkClaim) -> None:
-        """Stop new claims and release the final retryable lease if still owned."""
+        """Release the final retryable lease if it is still owned."""
 
         async with self._claim_lock:
-            self._no_delayed_retries.clear()
+            self._delayed_retry_npis.add(claim.requested_npi)
             try:
                 await drain_operation(
                     self.dependencies.release_work(
@@ -373,8 +363,9 @@ class _RootRunner:
                     ),
                     preserve_cancellation=True,
                 )
-            except UHCFlexPractitionerStoreError as error:
-                if error.code != "lease_lost":
+            except BaseException as error:
+                if not isinstance(error, UHCFlexPractitionerStoreError) or error.code != "lease_lost":
+                    self._delayed_retry_npis.discard(claim.requested_npi)
                     raise
             else:
                 await self._record_retry()
@@ -443,11 +434,20 @@ class _RootRunner:
                 invocation_attempt += 1
             if claim is None:
                 return
-            retry_request = await self.process_claim(
-                session,
-                claim,
-                invocation_attempt,
-            )
+            try:
+                retry_request = await self.process_claim(
+                    session,
+                    claim,
+                    invocation_attempt,
+                )
+            except UHCFlexPractitionerAcquisitionError as error:
+                if error.code != "root_retryable":
+                    raise
+                try:
+                    await self.dependencies.sleep(UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_RETRY_SECONDS)
+                finally:
+                    self._delayed_retry_npis.discard(claim.requested_npi)
+                retry_request = None
 
 
 async def gather_worker_cleanup(tasks: list[asyncio.Task[None]]) -> None:

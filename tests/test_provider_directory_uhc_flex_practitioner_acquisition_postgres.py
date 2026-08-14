@@ -380,8 +380,6 @@ async def test_flex_practitioner_acquisition_postgres_lifecycle(monkeypatch) -> 
         await database.disconnect()
         await drop_schema(engine, schema_name)
         await engine.dispose()
-
-
 async def _complete_mixed_case_result(database, url, schema_name) -> None:
     await database.connect()
     baseline, candidate = _role_identities()

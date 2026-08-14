@@ -8,6 +8,9 @@ import secrets
 from typing import Any
 
 from db.connection import db
+from process.uhc_flex_practitioner_acquisition_contract import (
+    UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_CONCURRENCY,
+)
 from process.uhc_flex_official_cohort_contract import canonical_uhc_flex_npi
 from process.uhc_flex_practitioner_result_store import (
     complete_uhc_flex_practitioner_error,
@@ -167,59 +170,113 @@ def _claim_from_row(database_row: Any) -> UHCFlexPractitionerWorkClaim | None:
         raise UHCFlexPractitionerStoreError("state") from error
 
 
+def _validate_claim_selection(
+    requested_npi: int | None,
+    excluded_npis: tuple[int, ...],
+    fresh_only: bool | None,
+) -> None:
+    if requested_npi is not None:
+        canonical_uhc_flex_npi(requested_npi)
+    if (
+        type(excluded_npis) is not tuple
+        or len(excluded_npis) > UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_CONCURRENCY
+        or len(set(excluded_npis)) != len(excluded_npis)
+        or requested_npi is not None and excluded_npis
+        or fresh_only is not None and type(fresh_only) is not bool
+        or requested_npi is not None and fresh_only is not None
+    ):
+        raise ValueError("Flex Practitioner claim selection is invalid")
+    for excluded_npi in excluded_npis:
+        canonical_uhc_flex_npi(excluded_npi)
+
+
+def _uhc_flex_practitioner_claim_sql(
+    fresh_filter: str,
+    excluded_filter: str,
+) -> str:
+    return f"""
+        WITH candidate AS (
+            SELECT work.acquisition_id, work.npi
+              FROM {table_ref(WORK_TABLE)} AS work
+              JOIN {table_ref(ACQUISITION_TABLE)} AS acquisition
+                ON acquisition.acquisition_id = work.acquisition_id
+             WHERE work.acquisition_id = :acquisition_id
+               AND acquisition.status = 'building'
+               AND (CAST(:requested_npi AS bigint) IS NULL
+                    OR work.npi = CAST(:requested_npi AS bigint))
+               {excluded_filter}
+               AND (work.status = 'pending' OR (
+                   work.status = 'leased'
+                   AND work.lease_expires_at <= clock_timestamp()
+               ))
+               {fresh_filter}
+             ORDER BY work.npi
+             FOR UPDATE OF work SKIP LOCKED LIMIT 1
+        )
+        UPDATE {table_ref(WORK_TABLE)} AS work
+           SET status = 'leased', attempt_count = work.attempt_count + 1,
+               lease_token = :lease_token,
+               lease_expires_at = transaction_timestamp()
+                   + make_interval(secs => :lease_seconds),
+               lease_heartbeat_at = transaction_timestamp(),
+               result_sha256 = NULL, resource_count = NULL,
+               error_code = NULL, terminal_record_sha256 = NULL,
+               terminal_at = NULL, updated_at = transaction_timestamp()
+          FROM candidate
+         WHERE work.acquisition_id = candidate.acquisition_id
+           AND work.npi = candidate.npi
+        RETURNING work.*;
+    """
+
+
 async def claim_uhc_flex_practitioner_work(
     acquisition_id: str,
     *,
     requested_npi: int | None = None,
+    excluded_npis: tuple[int, ...] = (),
+    fresh_only: bool | None = None,
     lease_seconds: int = 300,
     database: Any = db,
 ) -> UHCFlexPractitionerWorkClaim | None:
     """Claim one pending or expired NPI generation with SKIP LOCKED."""
 
     strict_identifier(acquisition_id, ACQUISITION_PATTERN, "acquisition ID")
-    if requested_npi is not None:
-        canonical_uhc_flex_npi(requested_npi)
+    _validate_claim_selection(requested_npi, excluded_npis, fresh_only)
     if type(lease_seconds) is not int or not 30 <= lease_seconds <= 3600:
         raise ValueError("Flex Practitioner lease seconds are invalid")
     lease_token = secrets.token_hex(32)
+    if requested_npi is not None or fresh_only is False:
+        fresh_filters = ("",)
+    elif fresh_only is True:
+        fresh_filters = ("AND work.attempt_count = 0",)
+    else:
+        fresh_filters = ("AND work.attempt_count = 0", "")
+    excluded_filter = (
+        "AND work.npi <> ALL(CAST(:excluded_npis AS bigint[]))"
+        if excluded_npis
+        else ""
+    )
+    claim_parameter_by_name: dict[str, Any] = {
+        "acquisition_id": acquisition_id,
+        "requested_npi": requested_npi,
+        "lease_token": lease_token,
+        "lease_seconds": lease_seconds,
+    }
+    if excluded_npis:
+        claim_parameter_by_name["excluded_npis"] = list(excluded_npis)
+    database_row = None
     async with database.transaction():
         await set_store_action(database, "claim", acquisition_id, lease_token)
-        database_row = await database.first(
-            f"""
-            WITH candidate AS (
-                SELECT work.acquisition_id, work.npi
-                  FROM {table_ref(WORK_TABLE)} AS work
-                  JOIN {table_ref(ACQUISITION_TABLE)} AS acquisition
-                    ON acquisition.acquisition_id = work.acquisition_id
-                 WHERE work.acquisition_id = :acquisition_id
-                   AND acquisition.status = 'building'
-                   AND (CAST(:requested_npi AS bigint) IS NULL
-                        OR work.npi = CAST(:requested_npi AS bigint))
-                   AND (work.status = 'pending' OR (
-                       work.status = 'leased'
-                       AND work.lease_expires_at <= clock_timestamp()
-                   ))
-                 ORDER BY work.npi FOR UPDATE OF work SKIP LOCKED LIMIT 1
+        for fresh_filter in fresh_filters:
+            database_row = await database.first(
+                _uhc_flex_practitioner_claim_sql(
+                    fresh_filter,
+                    excluded_filter,
+                ),
+                **claim_parameter_by_name,
             )
-            UPDATE {table_ref(WORK_TABLE)} AS work
-               SET status = 'leased', attempt_count = work.attempt_count + 1,
-                   lease_token = :lease_token,
-                   lease_expires_at = transaction_timestamp()
-                       + make_interval(secs => :lease_seconds),
-                   lease_heartbeat_at = transaction_timestamp(),
-                   result_sha256 = NULL, resource_count = NULL,
-                   error_code = NULL, terminal_record_sha256 = NULL,
-                   terminal_at = NULL, updated_at = transaction_timestamp()
-              FROM candidate
-             WHERE work.acquisition_id = candidate.acquisition_id
-               AND work.npi = candidate.npi
-            RETURNING work.*;
-            """,
-            acquisition_id=acquisition_id,
-            requested_npi=requested_npi,
-            lease_token=lease_token,
-            lease_seconds=lease_seconds,
-        )
+            if database_row is not None:
+                break
     return _claim_from_row(database_row)
 
 

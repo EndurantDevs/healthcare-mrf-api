@@ -185,6 +185,35 @@ async def test_store_operation_inputs_and_stale_lease_outcomes_fail_closed():
 
 
 @pytest.mark.asyncio
+async def test_claim_rejects_invalid_fresh_only_selection():
+    identity = _identity()
+    for excluded_npis in (
+        [NPI],
+        (NPI, NPI),
+        tuple(1000000000 + index for index in range(17)),
+        (1,),
+    ):
+        with pytest.raises(ValueError):
+            await store.claim_uhc_flex_practitioner_work(
+                identity.acquisition_id,
+                excluded_npis=excluded_npis,
+            )
+    with pytest.raises(ValueError):
+        await store.claim_uhc_flex_practitioner_work(
+            identity.acquisition_id,
+            requested_npi=NPI,
+            excluded_npis=(NPI,),
+        )
+    for requested_npi, fresh_only in ((None, 1), (NPI, True)):
+        with pytest.raises(ValueError):
+            await store.claim_uhc_flex_practitioner_work(
+                identity.acquisition_id,
+                requested_npi=requested_npi,
+                fresh_only=fresh_only,
+            )
+
+
+@pytest.mark.asyncio
 async def test_initialize_rejects_an_inexact_workset():
     identity = _identity()
     header = _header_row(identity)
