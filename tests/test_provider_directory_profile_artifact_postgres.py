@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 import importlib
+import json
+import logging
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -21,6 +24,26 @@ from tests.provider_directory_profile_artifact_pg_support import (
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
+
+_TARGET_ACTUAL_BY_FIELD = {
+    **dict.fromkeys(importer._PROFILE_CAPACITY_TARGET_ACTUAL_FIELDS, 4_096),
+    "cutover_actual_hash": "a" * 64,
+    "target_wal_start_lsn": "0/20", "wal_observed_lsn": "0/1020",
+}
+
+
+def _artifact_wave_plan(fixture):
+    models = (importer.ProviderDirectoryPractitionerRole, importer.ProviderDirectoryOrganizationAffiliation)
+    return importer._ArtifactScopeMaterializationPlan(
+        source_table=fixture.relation_by_table[
+            importer.ProviderDirectorySource.__tablename__
+        ],
+        created_tables=[],
+        relation_by_table=fixture.relation_by_table,
+        resource_scope_jobs=tuple((model, fixture.relation_by_table[model.__tablename__]) for model in models),
+        model_by_table_name={model.__tablename__: model for model in models},
+    )
+
 
 @pytest.mark.asyncio
 async def test_pg18_artifact_preflights_layout_before_two_worker_dml(
@@ -183,3 +206,59 @@ async def test_pg18_stage_storage_fingerprint_detects_dropped_index(
 
         assert before != after
         assert len(before) == len(after) == 64
+
+
+@pytest.mark.asyncio
+async def test_pg18_clone_capacity_wave_and_target_actual_reuse(
+    monkeypatch,
+    caplog,
+):
+    async with _artifact_fixture(monkeypatch) as fixture:
+        monkeypatch.setenv(
+            importer.PROVIDER_DIRECTORY_PROFILE_CLONE_CAPACITY_OBSERVATION_ENV,
+            "1",
+        )
+        caplog.set_level(logging.INFO, logger=importer.__name__)
+        await importer._materialize_artifact_resource_waves(
+            fixture.schema,
+            _artifact_wave_plan(fixture),
+            fixture.fence,
+            frozenset({"PractitionerRole", "OrganizationAffiliation"}),
+            None,
+            {},
+            1,
+            2,
+        )
+        target_sampler = AsyncMock(side_effect=AssertionError("unexpected target sample"))
+        monkeypatch.setattr(importer, "_profile_capacity_observation_sample", target_sampler)
+        async with importer._observe_profile_capacity_wave(
+            "target",
+            {},
+            coordinate_by_field={"wave": 1},
+            target_actuals_by_field=_TARGET_ACTUAL_BY_FIELD,
+        ):
+            await fixture.database.scalar("SELECT 1;")
+        target_sampler.assert_not_awaited()
+
+        observations = [
+            json.loads(log_record.message)
+            for log_record in caplog.records
+            if "profile-clone-capacity-observation.v1" in log_record.message
+        ]
+        artifact, target_observation_by_field = observations
+        assert artifact["wal_observation"]["bytes"] > 0
+        assert all(
+            artifact["relation_observation"]["after"][name]
+            >= artifact["relation_observation"]["before"][name]
+            for name in artifact["relation_observation"]["after"]
+        )
+        assert artifact["temp_observation"]["status"] == (
+            "delayed_database_aggregate"
+        )
+        assert target_observation_by_field["cutover_actual"] == (
+            _TARGET_ACTUAL_BY_FIELD
+        )
+        assert target_observation_by_field["temp_observation"]["before"] is None
+        assert target_observation_by_field["temp_observation"]["status"] == (
+            "unavailable_transaction_local_stats"
+        )
