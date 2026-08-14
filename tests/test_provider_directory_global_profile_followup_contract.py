@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,19 @@ def test_descriptor_binds_publication_idempotency_and_global_strategy() -> None:
         ),
         "profile_strategy_version": PROFILE_STRATEGY_VERSION,
     }
+
+
+def test_descriptor_matches_the_cross_repository_golden_bytes() -> None:
+    expected = json.dumps(
+        _descriptor(),
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n"
+
+    assert (
+        ROOT
+        / "tests/fixtures/provider_directory_global_profile_followup_v1.json"
+    ).read_text(encoding="utf-8") == expected
 
 
 @pytest.mark.parametrize(

@@ -109,15 +109,19 @@ GLOBAL_PROFILE_FOLLOWUP_JSON="$(
 )"
 ```
 
-Submit `GLOBAL_PROFILE_FOLLOWUP_JSON` unchanged to the existing external global
-Profile controller. The closed controller payload binds the exact source,
+POST the exact `GLOBAL_PROFILE_FOLLOWUP_JSON` bytes unchanged to import-control
+at `/v1/provider-directory/profile-followup`, with its bearer token and the
+standard `destructive-action-v1` actor, request-ID, timestamp, and signature
+headers. HTTP 201 records a new durable observation; HTTP 200 is its exact
+idempotent replay. Preserve the complete response as the separate controller
+receipt. The closed controller payload binds the exact source,
 dataset, acquisition root, idempotency key, and complete-global-fence
 parameters. Its enclosing dispatch receipt separately records
 `external_followup_contract_id` and `profile_strategy_version`; those sibling
 metadata fields are not part of the controller payload. This extraction does
 not dispatch anything, and the rooted operator has no Profile-dispatch command.
-Record the controller receipt separately. Do not infer global serving readiness
-from the source-local publication receipt.
+Do not infer global serving readiness from either the source-local publication
+receipt or the controller observation receipt.
 
 Every rooted generation retains a recursive lineage to one exact legacy Flex
 Practitioner cohort and its corporate official-file dataset. If that official
