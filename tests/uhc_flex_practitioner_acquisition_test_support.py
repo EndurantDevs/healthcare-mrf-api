@@ -184,14 +184,28 @@ class AcquisitionHarness:
         acquisition_id,
         *,
         requested_npi=None,
+        excluded_npis=(),
+        fresh_only=None,
         lease_seconds,
         database,
     ):
         pending = self.pending[acquisition_id]
         if requested_npi is None:
-            if not pending:
+            eligible_npis = [
+                npi for npi in pending if npi not in excluded_npis
+            ]
+            if not eligible_npis:
                 return None
-            npi = pending.pop(0)
+            fresh_npis = [
+                npi
+                for npi in eligible_npis
+                if self.attempts.get((acquisition_id, npi), 0) == 0
+            ]
+            candidates = fresh_npis if fresh_only is True else fresh_npis or eligible_npis
+            if not candidates:
+                return None
+            npi = min(candidates)
+            pending.remove(npi)
         else:
             if requested_npi not in pending:
                 return None

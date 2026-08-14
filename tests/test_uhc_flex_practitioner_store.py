@@ -15,6 +15,7 @@ from process.uhc_flex_practitioner_store import (
     _canonical_resource_rows,
     _terminal_record_sha256,
     build_uhc_flex_practitioner_acquisition_identity,
+    claim_uhc_flex_practitioner_work,
     release_uhc_flex_practitioner_work,
     UHCFlexPractitionerAcquisitionIdentity,
     UHCFlexPractitionerAcquisitionSummary,
@@ -49,6 +50,10 @@ class _ReleaseDatabase:
     async def status(self, statement: str, **parameters):
         self.statements.append((statement, parameters))
         return self.updated_count
+
+    async def first(self, statement: str, **parameters):
+        self.statements.append((statement, parameters))
+        return None
 
 
 def _identity(role: str = "baseline") -> UHCFlexPractitionerAcquisitionIdentity:
@@ -287,3 +292,42 @@ async def test_release_is_exact_token_fenced_and_stale_safe() -> None:
             database=_ReleaseDatabase(0),
         )
     assert stale_error.value.code == "lease_lost"
+
+
+@pytest.mark.asyncio
+async def test_general_claim_prefers_fresh_and_requested_claim_stays_exact() -> None:
+    identity = _identity()
+    database = _ReleaseDatabase(0)
+
+    assert await claim_uhc_flex_practitioner_work(
+        identity.acquisition_id,
+        excluded_npis=(NPI,),
+        database=database,
+    ) is None
+    general_claim_statements = database.statements[-2:]
+    assert "AND work.attempt_count = 0" in general_claim_statements[0][0]
+    assert "AND work.attempt_count = 0" not in general_claim_statements[1][0]
+    general_sql, general_parameters = general_claim_statements[-1]
+    assert "work.npi <> ALL(CAST(:excluded_npis AS bigint[]))" in general_sql
+    assert "ORDER BY work.npi" in general_sql
+    assert general_parameters["excluded_npis"] == [NPI]
+
+    database.statements.clear()
+    assert await claim_uhc_flex_practitioner_work(
+        identity.acquisition_id,
+        fresh_only=True,
+        database=database,
+    ) is None
+    assert len(database.statements) == 2
+    assert "AND work.attempt_count = 0" in database.statements[-1][0]
+
+    assert await claim_uhc_flex_practitioner_work(
+        identity.acquisition_id,
+        requested_npi=NPI,
+        database=database,
+    ) is None
+    exact_sql, exact_parameters = database.statements[-1]
+    assert "ORDER BY work.npi" in exact_sql
+    assert "work.attempt_count = 0" not in exact_sql
+    assert "excluded_npis" not in exact_parameters
+    assert exact_parameters["requested_npi"] == NPI

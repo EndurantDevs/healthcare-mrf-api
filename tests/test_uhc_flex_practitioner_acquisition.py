@@ -31,6 +31,7 @@ from tests.uhc_flex_practitioner_acquisition_test_support import (
     MEMBER_NPIS,
     OPERATION_KEY,
     PROJECTION_DATE,
+    query_result_fixture,
 )
 
 
@@ -143,10 +144,10 @@ async def test_reviewed_single_root_resumes_retryable_work_without_reinitializin
     )
 
     assert harness.events.count("initialize:candidate") == 1
-    assert sum(event.startswith("session_exit:") for event in harness.events) == 2
+    assert sum(event.startswith("session_exit:") for event in harness.events) == 1
     assert harness.sleep_delays == [1.0, 60.0]
     assert harness.attempts[(receipt.candidate.acquisition_id, MEMBER_NPIS[0])] == 3
-    assert (receipt.candidate.elapsed_seconds, receipt.elapsed_seconds) == (110.0, 130.0)
+    assert (receipt.candidate.elapsed_seconds, receipt.elapsed_seconds) == (100.0, 120.0)
 
 
 @pytest.mark.asyncio
@@ -328,89 +329,86 @@ async def test_transient_failure_releases_before_bounded_retry_after_sleep():
 
 
 @pytest.mark.asyncio
-async def test_final_retryable_failure_releases_and_same_key_resumes():
+async def test_final_retryable_failure_resumes_same_worker_and_root():
     harness = AcquisitionHarness()
+    retryable_failure = UHCFlexPractitionerTransportError("transport_timeout", retryable=True)
     for call_number in (1, 2):
-        harness.fetch_failures[("baseline", MEMBER_NPIS[1], call_number)] = (
-            UHCFlexPractitionerTransportError(
-                "transport_timeout",
-                retryable=True,
-            )
-        )
+        harness.fetch_failures[("baseline", MEMBER_NPIS[1], call_number)] = retryable_failure
 
-    with pytest.raises(
-        acquisition.UHCFlexPractitionerAcquisitionError
-    ) as error_info:
-        await acquire_with_harness(
-            harness,
-            config=enabled_config(concurrency=1, max_attempts=2),
-        )
-
-    baseline_id = next(iter(harness.identities))
-    assert error_info.value.code == "root_retryable"
-    assert harness.pending[baseline_id] == [MEMBER_NPIS[1]]
-    assert not harness.active
-    assert set(harness.terminal[baseline_id]) == {MEMBER_NPIS[0]}
-    assert harness.fetch_calls[("baseline", MEMBER_NPIS[0])] == 1
-    assert harness.attempts[(baseline_id, MEMBER_NPIS[1])] == 2
-
-    harness.session_serial = 0
     receipt = await acquire_with_harness(
         harness,
         config=enabled_config(concurrency=1, max_attempts=2),
     )
-
-    assert receipt.baseline.matched_count == 1
+    baseline_id = receipt.baseline.acquisition_id
+    assert not harness.pending[baseline_id]
+    assert not harness.active
+    assert set(harness.terminal[baseline_id]) == set(harness.npis)
     assert harness.fetch_calls[("baseline", MEMBER_NPIS[0])] == 1
     assert harness.attempts[(baseline_id, MEMBER_NPIS[1])] == 3
+    assert harness.sleep_delays == [1.0, 60.0]
 
 
 @pytest.mark.asyncio
-async def test_final_retryable_cancels_sibling_leases_and_same_key_resumes():
-    harness = AcquisitionHarness()
+async def test_final_retryable_cools_only_its_worker_while_sibling_finishes_work():
+    """Keep fresh work moving while one worker owns the bounded cooldown."""
+    harness = AcquisitionHarness(npi_count=3)
+    retry_npi, sibling_npi, remaining_npi = harness.npis
     sibling_fetch_entered = asyncio.Event()
+    cooldown_started = asyncio.Event()
+    cooldown_finished = asyncio.Event()
+    fresh_work_finished = asyncio.Event()
+    retry_call_list = []
 
-    async def fail_or_block(_session, requested_npi):
-        if requested_npi == MEMBER_NPIS[0]:
+    async def fetch(_session, requested_npi):
+        if requested_npi == retry_npi:
+            retry_call_list.append(requested_npi)
+            if len(retry_call_list) == 1:
+                await sibling_fetch_entered.wait()
+                raise UHCFlexPractitionerTransportError("transport_timeout", retryable=True)
+        elif requested_npi == sibling_npi:
             sibling_fetch_entered.set()
-            await asyncio.Future()
-        await sibling_fetch_entered.wait()
-        raise UHCFlexPractitionerTransportError(
-            "transport_timeout",
-            retryable=True,
-        )
+            await cooldown_started.wait()
+        return query_result_fixture(requested_npi)
 
-    with pytest.raises(
-        acquisition.UHCFlexPractitionerAcquisitionError
-    ) as error_info:
-        await acquisition.acquire_uhc_flex_practitioner_twins(
-            operation_key=OPERATION_KEY,
-            semantic_projection_as_of=PROJECTION_DATE,
+    async def sleep(delay_seconds):
+        harness.sleep_delays.append(delay_seconds)
+        cooldown_started.set()
+        await cooldown_finished.wait()
+
+    async def complete_result(claim, query_result, *, database):
+        await harness.complete_result(claim, query_result, database=database)
+        terminal = harness.terminal[claim.acquisition_id]
+        if sibling_npi in terminal and remaining_npi in terminal:
+            fresh_work_finished.set()
+
+    dependencies = replace(
+        harness.dependencies(), fetch=fetch, sleep=sleep, complete_result=complete_result
+    )
+    context = await acquisition._initialize_context(
+        operation_key=OPERATION_KEY,
+        projection_date=PROJECTION_DATE,
+        dependencies=dependencies,
+        database=harness.database,
+    )
+    root_task = asyncio.create_task(
+        acquisition._run_root(
+            context.identity_by_role["baseline"],
             config=enabled_config(concurrency=2, max_attempts=1),
+            dependencies=dependencies,
             database=harness.database,
-            dependencies=replace(harness.dependencies(), fetch=fail_or_block),
+            progress_callback=None,
         )
-
-    baseline_id = next(
-        identity.acquisition_id
-        for identity in harness.identities.values()
-        if identity.acquisition_role == "baseline"
     )
-    assert error_info.value.code == "root_retryable"
-    assert harness.pending[baseline_id] == list(harness.npis)
-    assert not harness.active
-    assert not harness.terminal[baseline_id]
+
+    await asyncio.wait_for(cooldown_started.wait(), timeout=0.5)
+    await asyncio.wait_for(fresh_work_finished.wait(), timeout=0.5)
+    assert not root_task.done()
     assert not any(event.startswith("error:") for event in harness.events)
-
-    harness.session_serial = 0
-    receipt = await acquire_with_harness(
-        harness,
-        config=enabled_config(concurrency=2, max_attempts=1),
-    )
-    assert receipt.expected_npi_count == len(harness.npis)
-    assert all(
-        harness.attempts[(baseline_id, npi)] == 2 for npi in harness.npis
-    )
+    cooldown_finished.set()
+    summary, _elapsed_seconds = await asyncio.wait_for(root_task, timeout=0.5)
+    assert summary.error_count == 0
+    assert len(retry_call_list) == 2
+    assert harness.sleep_delays == [60.0]
 
 
 @pytest.mark.asyncio
