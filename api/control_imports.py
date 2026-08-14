@@ -341,6 +341,7 @@ _CONTROL_HIDDEN_PARAM_NAMES_BY_IMPORTER = {
             "provider_directory_acquisition_strategy",
             "provider_directory_census_cutoff",
             "provider_directory_pagination_root_run_id",
+            "restart_expired_current_census_slice",
             "retry_of_run_id",
         }
     ),

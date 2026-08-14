@@ -137,6 +137,7 @@ def test_control_registry_hides_cli_only_census_and_lineage_params():
         "provider_directory_acquisition_strategy",
         "provider_directory_census_cutoff",
         "provider_directory_pagination_root_run_id",
+        "restart_expired_current_census_slice",
         "retry_of_run_id",
     }
     provider_cli_param_names = {

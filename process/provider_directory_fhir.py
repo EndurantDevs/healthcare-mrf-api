@@ -2056,6 +2056,7 @@ class PaginationCheckpointContext:
     endpoint_id: str | None = None
     dataset_id: str | None = None
     lineage_verified: bool = False
+    restart_expired_current_census_slice: bool = True
 
     def __post_init__(self) -> None:
         if not self.acquisition_root_run_id.strip():
@@ -58950,6 +58951,7 @@ async def _fetch_resource_rows(
                         ),
                         allow_current_version_census_restart=bool(
                             checkpoint_context.retry_of_run_id
+                            and checkpoint_context.restart_expired_current_census_slice
                         ),
                     )
                 ):
@@ -64177,6 +64179,7 @@ def _pagination_checkpoint_context(
     run_id: str | None,
     retry_of_run_id: str | None,
     pagination_root_run_id: str | None = None,
+    restart_expired_current_census_slice: bool = True,
 ) -> PaginationCheckpointContext | None:
     """Build the durable acquisition identity for one checkpointed source group."""
     scope_identity = _pagination_checkpoint_scope_identity(
@@ -64197,6 +64200,7 @@ def _pagination_checkpoint_context(
         owner_run_id=run_id,
         retry_of_run_id=retry_of_run_id,
         acquisition_root_run_id=acquisition_root_run_id,
+        restart_expired_current_census_slice=restart_expired_current_census_slice,
     )
 
 
@@ -72948,6 +72952,7 @@ async def _prepare_resource_import_source_group(
     retry_of_run_id: str | None,
     pagination_root_run_id: str | None,
     is_checkpointing_enabled: bool,
+    restart_expired_current_census_slice: bool = True,
 ) -> tuple[list[dict[str, Any]], EndpointDatasetCandidate | None]:
     checkpoint_context = _resource_group_pagination_checkpoint_context(
         source_records,
@@ -72955,11 +72960,9 @@ async def _prepare_resource_import_source_group(
         retry_of_run_id=retry_of_run_id,
         pagination_root_run_id=pagination_root_run_id,
         is_checkpointing_enabled=is_checkpointing_enabled,
+        restart_expired_current_census_slice=restart_expired_current_census_slice,
     )
-    dataset_resources = _endpoint_dataset_selected_resources(
-        source_records,
-        resources,
-    )
+    dataset_resources = _endpoint_dataset_selected_resources(source_records, resources)
     candidate = await _prepare_endpoint_dataset_candidate(
         source_records,
         dataset_resources,
@@ -73007,6 +73010,7 @@ def _resource_group_pagination_checkpoint_context(
     retry_of_run_id: str | None,
     pagination_root_run_id: str | None,
     is_checkpointing_enabled: bool,
+    restart_expired_current_census_slice: bool = True,
 ) -> PaginationCheckpointContext | None:
     if not is_checkpointing_enabled:
         return None
@@ -73023,6 +73027,7 @@ def _resource_group_pagination_checkpoint_context(
         run_id=run_id,
         retry_of_run_id=retry_of_run_id,
         pagination_root_run_id=pagination_root_run_id,
+        restart_expired_current_census_slice=restart_expired_current_census_slice,
     )
 
 
@@ -74034,6 +74039,7 @@ async def _import_resources(
     pagination_resume_required: set[str] | None = None,
     provider_directory_endpoint_scope: str | None = None,
     require_complete_resources: bool = False,
+    restart_expired_current_census_slice: bool = True,
 ) -> dict[str, int]:
     """Import resources into the provider-directory snapshot."""
     if defer_typed_materialization:
@@ -74676,15 +74682,14 @@ async def _import_resources(
         group_resume_required = set() if pagination_resume_required is not None else None
         if _is_validated_uhc_official_source_group(source_records):
             return await import_one_group(source_records, group_resume_required)
-        prepared_source_records, candidate = (
-            await _prepare_resource_import_source_group(
-                source_records,
-                resources,
-                run_id=run_id,
-                retry_of_run_id=retry_of_run_id,
-                pagination_root_run_id=pagination_root_run_id,
-                is_checkpointing_enabled=is_pagination_checkpointing_enabled,
-            )
+        prepared_source_records, candidate = await _prepare_resource_import_source_group(
+            source_records,
+            resources,
+            run_id=run_id,
+            retry_of_run_id=retry_of_run_id,
+            pagination_root_run_id=pagination_root_run_id,
+            is_checkpointing_enabled=is_pagination_checkpointing_enabled,
+            restart_expired_current_census_slice=restart_expired_current_census_slice,
         )
         prepared_source_lists[0] = prepared_source_records
         if _is_finalized_endpoint_dataset_candidate(candidate):
@@ -74743,6 +74748,7 @@ async def _import_resources(
                         retry_of_run_id=retry_of_run_id,
                         pagination_root_run_id=pagination_root_run_id,
                         is_checkpointing_enabled=is_pagination_checkpointing_enabled,
+                        restart_expired_current_census_slice=restart_expired_current_census_slice,
                     )
                 )
                 async with _pagination_checkpoint_worker_guard(
@@ -76156,6 +76162,10 @@ async def process_provider_directory_fhir_data(
     pagination_root_run_id = _clean_text(
         task.get("provider_directory_pagination_root_run_id")
     )
+    restart_expired_current_census_slice = task.get(
+        "restart_expired_current_census_slice",
+        True,
+    )
     endpoint_scope_input = _clean_text(task.get("provider_directory_endpoint_scope"))
     provider_directory_endpoint_scope = endpoint_scope_input.rstrip("/") if endpoint_scope_input else None
     requested_source_ids, has_explicit_source_scope = (
@@ -76709,6 +76719,9 @@ async def process_provider_directory_fhir_data(
             "defer_typed_materialization": should_defer_typed_materialization,
             "retry_of_run_id": retry_of_run_id,
             "provider_directory_pagination_root_run_id": pagination_root_run_id,
+            "restart_expired_current_census_slice": (
+                restart_expired_current_census_slice
+            ),
             "provider_directory_endpoint_scope": provider_directory_endpoint_scope,
             "credential_config_file_configured": bool(credential_config_file),
             "current_version_census_identity": (
@@ -76903,6 +76916,9 @@ async def process_provider_directory_fhir_data(
                         and resource_limit <= 0
                         and page_limit <= 0
                     ),
+                    restart_expired_current_census_slice=(
+                        restart_expired_current_census_slice
+                    ),
                 )
             if retry_not_before_by_resource:
                 metrics_by_key["provider_directory_retry_not_before_by_resource"] = dict(
@@ -77086,6 +77102,7 @@ class _ProviderDirectoryFhirCommandOptions:
     run_id: str | None = None
     retry_of_run_id: str | None = None
     provider_directory_pagination_root_run_id: str | None = None
+    restart_expired_current_census_slice: bool = True
     provider_directory_acquisition_strategy: str | None = None
     provider_directory_census_cutoff: str | None = None
     source_ids: list[str] | tuple[str, ...] | str | None = None

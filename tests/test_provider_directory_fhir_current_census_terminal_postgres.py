@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -120,3 +121,55 @@ async def test_postgres_direct_retry_restarts_expired_exact_census_cursor(
             start_url,
             count_url,
         )
+
+
+@pytest.mark.asyncio
+async def test_postgres_guarded_retry_preserves_expired_census_slice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = census_contract()
+    source_by_field = census_source_record(contract)
+    start_url = importer._resource_start_url(source_by_field, RESOURCE_TYPE, page_count=1)
+    assert start_url is not None
+    count_url = current_version_census_count_url(start_url)
+
+    async with census_database(monkeypatch) as (database, schema):
+        initial_checkpoint = await _run_initial_interrupted_phase(
+            monkeypatch,
+            source_by_field,
+            database,
+            schema,
+            start_url,
+            count_url,
+            contract,
+        )
+        requested_urls: list[str] = []
+        monkeypatch.setattr(
+            importer, "_fetch_source_json", fetch_sequence([(410, None, None, 1)], requested_urls)
+        )
+
+        fetch_result = await fetch_practitioners(
+            source_by_field,
+            replace(
+                checkpoint_context(
+                    source_by_field,
+                    owner_run_id="run-current-census-retry-guarded",
+                    retry_of_run_id=ROOT_RUN_ID,
+                ),
+                restart_expired_current_census_slice=False,
+            ),
+        )
+        checkpoint_by_field = await checkpoint_record(database, schema)
+
+        assert requested_urls == [NEXT_URL]
+        assert fetch_result.error == f"{importer.CURRENT_VERSION_CENSUS_BLOCKED_ERROR}:http_410"
+        assert fetch_result.pages_fetched == 1
+        assert fetch_result.rows_fetched == 1
+        assert checkpoint_by_field["created_at"] == initial_checkpoint["created_at"]
+        assert checkpoint_by_field["next_url"] == initial_checkpoint["next_url"]
+        assert checkpoint_by_field["pages_processed"] == 1
+        assert checkpoint_by_field["rows_processed"] == 1
+        assert checkpoint_by_field["owner_run_id"] == "run-current-census-retry-guarded"
+        assert checkpoint_by_field["retry_of_run_id"] == ROOT_RUN_ID
+        assert await candidate_resource_ids(database, schema) == ["practitioner-1"]
+        assert await proof_shard_counts(database, schema) == (1, 1)

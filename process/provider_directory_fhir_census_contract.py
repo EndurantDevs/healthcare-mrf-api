@@ -58,6 +58,7 @@ _CURRENT_VERSION_CENSUS_BOOLEAN_TASK_FIELDS = frozenset(
         "publish_artifacts",
         "publish_artifacts_only",
         "publish_corroboration",
+        "restart_expired_current_census_slice",
         "seed_only",
         "stale_cleanup",
         "test",
