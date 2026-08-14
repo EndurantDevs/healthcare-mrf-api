@@ -137,7 +137,7 @@ async def test_503_recovery_reuses_exact_no_redirect_url_and_clears_diagnostic(
             preserve_url_bytes=True,
         ),
     ]
-    sleep.assert_awaited_once_with(300.0)
+    sleep.assert_awaited_once_with(1.0)
     assert importer.SOURCE_FETCH_DIAGNOSTIC_FIELD not in source_record
 
 
@@ -171,7 +171,7 @@ async def test_retryable_http_exhaustion_is_fixed_and_redacted(
     assert all(
         attempt_call.args[1] == request_url for attempt_call in attempt.await_args_list
     )
-    assert sleep.await_args_list == [call(300.0), call(599.0)]
+    assert sleep.await_args_list == [call(1.0), call(1.0)]
     generic_attempts.assert_not_called()
     recorder.assert_called_once()
     diagnostic = source_record[importer.SOURCE_FETCH_DIAGNOSTIC_FIELD]
@@ -182,14 +182,10 @@ async def test_retryable_http_exhaustion_is_fixed_and_redacted(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_code", [423, 429])
-async def test_locked_and_rate_limited_responses_defer_without_inline_retry(
-    monkeypatch,
-    status_code,
-):
+async def test_locked_response_retries_after_one_second(monkeypatch):
     source_record = _source_record()
-    response_by_field = {importer.SOURCE_RETRY_AFTER_FIELD: "600"}
-    attempt = AsyncMock(return_value=(status_code, response_by_field, None, 7))
+    response_by_field = {}
+    attempt = AsyncMock(return_value=(423, response_by_field, None, 7))
     _clock, sleep = _retry_clock(monkeypatch)
     monkeypatch.setattr(importer, "_fetch_current_version_census_json_once", attempt)
 
@@ -199,7 +195,27 @@ async def test_locked_and_rate_limited_responses_defer_without_inline_retry(
         timeout=3,
     )
 
-    assert fetch_result == (status_code, response_by_field, None, 7)
+    assert fetch_result == (423, response_by_field, None, 21)
+    assert retry_count == 2
+    assert attempt.await_count == 3
+    assert sleep.await_args_list == [call(1.0), call(1.0)]
+    assert source_record[importer.SOURCE_FETCH_DIAGNOSTIC_FIELD]["retry_count"] == 2
+
+
+async def test_rate_limited_response_defers_without_inline_retry(monkeypatch):
+    source_record = _source_record()
+    response_by_field = {importer.SOURCE_RETRY_AFTER_FIELD: "600"}
+    attempt = AsyncMock(return_value=(429, response_by_field, None, 7))
+    _clock, sleep = _retry_clock(monkeypatch)
+    monkeypatch.setattr(importer, "_fetch_current_version_census_json_once", attempt)
+
+    fetch_result, retry_count = await importer._fetch_current_version_census_json(
+        source_record,
+        _request_url(),
+        timeout=3,
+    )
+
+    assert fetch_result == (429, response_by_field, None, 7)
     assert retry_count == 0
     attempt.assert_awaited_once()
     sleep.assert_not_awaited()
@@ -222,7 +238,7 @@ async def test_transport_error_exhaustion_records_aggregate_diagnostic(monkeypat
     assert result == (None, None, "TimeoutError", 15)
     assert retry_count == 2
     assert attempt.await_count == 3
-    assert sleep.await_args_list == [call(300.0), call(599.0)]
+    assert sleep.await_args_list == [call(1.0), call(1.0)]
     assert (
         source_record[importer.SOURCE_FETCH_DIAGNOSTIC_FIELD]["response_class"]
         == "transient_transport_error"

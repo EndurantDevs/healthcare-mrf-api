@@ -33,14 +33,14 @@ UTC = datetime.timezone.utc
 VALIDATION_TIME = datetime.datetime(2026, 7, 30, 12, 0, 2, tzinfo=UTC)
 PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
 GOLDEN_ATTESTATION_ID = (
-    "4a49783f680e5bcc67cf41767c78ff39" "81bffd856f15f214ba17106859a30732"
+    "e326bb5d87e63e715adaa0968748893d" "a8277081800e63f5290f709d899f88d4"
 )
 GOLDEN_SIGNATURE = (
-    "j-w7o1DaKRKRuwgwxfLyZQ4xeFuzqreV78m36OxdYnYqVY"
-    "-hUv9vnJpWgqrZbxa2okagLNVwAkSgysGi7e1UBg"
+    "gLHEu3l7A1yClz1up2J9RDQeRlh6zFCglDZM9h_S5XiW9xL"
+    "clofPJ2_wHd0_F02_8Aqa5XE1RXqYIVPd8lvHDg"
 )
 GOLDEN_CANONICAL_BODY_SHA256 = (
-    "394643630b6fbe32e0113569ca3c32a0" "4ae08e0b9e57e499aacb8f64219e235c"
+    "e5758f8b28977cf1704476b9231e9539" "7cdd82c24d32322c296193fac71b2ccd"
 )
 GOLDEN_SIGNING_PREFLIGHT_GUARD_SHA256 = (
     "936d1324312013cd91c1b0a1a6e5179" "b152d3a3671c65c204775f7cb4abeb4f6"
@@ -167,7 +167,7 @@ def test_golden_vector_verifies_exact_canonical_schema_and_signature():
         PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION
     )
     assert verified.runtime_witness_sha256 == (
-        "3326ac3bc2ee4743acfb1f31d0b144fe" "dccd25cb509609d8c6eaf1e6a7bf0266"
+        "d406bfb2d2d9c28596fbffa91925a530" "a9b94f34888101370a18a7bc22444ac5"
     )
     assert verified.deployment_witness.preflight_transport == (
         "kubectl_exec_loopback_8080"
@@ -178,7 +178,7 @@ def test_golden_vector_verifies_exact_canonical_schema_and_signature():
         "wal": 150_000_000_000,
     }
     assert verified.lease_digest == (
-        "67c42c021c6bbcac4c7a5a45180d506c" "53c88d38854e4d0edabfd43fc35ce92b"
+        "89c36c0333a8a11d6b446caa84ff41eb" "b6dc73270708542f01a478c57bfe0739"
     )
     assert verified.public_key_fingerprint == (
         "05549452c2988321a6d9e7daa9a7704b" "f150aa556ea2ddb9c45c8fe92dc7f643"

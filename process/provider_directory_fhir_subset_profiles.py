@@ -164,7 +164,7 @@ def is_advertised_pre_in_terminal_window(
     advertised_pre: Any,
     terminal_geometry: Any,
 ) -> bool:
-    """Return whether one pre-count is bracketed by terminal offsets."""
+    """Return whether one pre-count is within one terminal logical page."""
 
     if type(advertised_pre) is not int or not isinstance(
         terminal_geometry,
@@ -173,8 +173,11 @@ def is_advertised_pre_in_terminal_window(
         return False
     terminal_start = terminal_geometry.get("terminal_page_start_offset")
     terminal_end = terminal_geometry.get("logical_window_end_offset")
+    page_count = terminal_geometry.get("page_count")
     return bool(
         type(terminal_start) is int
         and type(terminal_end) is int
-        and terminal_start <= advertised_pre <= terminal_end
+        and type(page_count) is int
+        and page_count > 0
+        and terminal_start <= advertised_pre < terminal_end + page_count
     )

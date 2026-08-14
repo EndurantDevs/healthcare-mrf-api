@@ -1426,10 +1426,10 @@ MAX_RESOURCE_SCAN_CONCURRENCY = 3
 SOURCE_HTTP_KEEPALIVE_SECONDS = 60.0
 SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS = 300
 SOURCE_TRANSIENT_HTTP_STATUSES = frozenset({423, 429, 500, 502, 503, 504})
-CURRENT_VERSION_CENSUS_RETRYABLE_HTTP_STATUSES = frozenset({500, 502, 503, 504})
-CURRENT_VERSION_CENSUS_RETRY_WAIT_TARGETS_SECONDS = (300.0, 899.0)
-CURRENT_VERSION_CENSUS_RETRY_WAIT_BUDGET_SECONDS = 900.0
-CURRENT_VERSION_CENSUS_RETRY_AFTER_MAX_SECONDS = 600.0
+CURRENT_VERSION_CENSUS_RETRYABLE_HTTP_STATUSES = frozenset({423, 500, 502, 503, 504})
+CURRENT_VERSION_CENSUS_RETRY_WAIT_TARGETS_SECONDS = (1.0, 2.0)
+CURRENT_VERSION_CENSUS_RETRY_WAIT_BUDGET_SECONDS = 3.0
+CURRENT_VERSION_CENSUS_RETRY_AFTER_MAX_SECONDS = 3.0
 REST_PAGINATION_COOLDOWN_RETRY_CAP = 2
 REST_PAGINATION_COOLDOWN_FALLBACK_SECONDS = 1.0
 MOLINA_QUOTA_RESET_GRACE_SECONDS = 60
@@ -54126,6 +54126,7 @@ def _last_updated_partition_retry_not_before(
     fetch_error: str | None,
     *,
     max_delay_seconds: float | None = 600.0,
+    fallback_seconds: float = SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS,
 ) -> str | None:
     diagnostic = _terminal_source_fetch_diagnostic(
         source_record,
@@ -54141,6 +54142,7 @@ def _last_updated_partition_retry_not_before(
         fetch_error,
         retry_count=int(diagnostic.get("retry_count") or 0),
         max_delay_seconds=max_delay_seconds,
+        fallback_seconds=fallback_seconds,
     )
 
 
@@ -57500,6 +57502,11 @@ async def _fetch_current_version_census_count(
                     response_payload,
                     fetch_error,
                     max_delay_seconds=None,
+                    fallback_seconds=(
+                        REST_PAGINATION_COOLDOWN_FALLBACK_SECONDS
+                        if status_code != 429
+                        else SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS
+                    ),
                 )
                 if is_transient
                 else None
@@ -58703,7 +58710,13 @@ async def _fetch_resource_rows(
                     ),
                     fallback_seconds=(
                         REST_PAGINATION_COOLDOWN_FALLBACK_SECONDS
-                        if is_pagination_cooldown_exhausted
+                        if (
+                            is_pagination_cooldown_exhausted
+                            or (
+                                is_current_version_census_enabled
+                                and status_code != 429
+                            )
+                        )
                         else SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS
                     ),
                 ) or checkpoint_non_bundle_retry_at

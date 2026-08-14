@@ -88,7 +88,7 @@ def _load_migration():
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260813010000_provider_directory_observed_npi_index"
+        "20260814000000_provider_directory_reviewed_subset_terminal_tail_tolerance"
     ]
     migration = _load_capacity_v2_migration()
     assert migration.down_revision == (

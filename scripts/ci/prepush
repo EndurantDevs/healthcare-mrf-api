@@ -754,6 +754,7 @@ run_provider_directory_postgres() {
       tests/test_provider_directory_fhir_terminal_atomicity_postgres.py \
       tests/test_provider_directory_reviewed_subset_bounded_drift_postgres.py \
       tests/test_provider_directory_reviewed_subset_terminal_window_postgres.py \
+      tests/test_provider_directory_reviewed_subset_terminal_tail_postgres.py \
       tests/test_provider_directory_reviewed_subset_terminal_window_lock_postgres.py \
       tests/test_provider_directory_reviewed_source_generation_postgres.py \
       tests/test_provider_directory_reviewed_subset_terminal_disposition_postgres.py \

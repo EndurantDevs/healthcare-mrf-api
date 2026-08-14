@@ -79,8 +79,6 @@ MIGRATION_PATH = MIGRATION_DIRECTORY / (
 DIRECT_DISPOSITION_MIGRATION_PATH = MIGRATION_DIRECTORY / (
     "20260810110000_provider_directory_reviewed_subset_direct_v4_disposition.py"
 )
-
-
 def _load_migration(path, module_name):
     module_spec = importlib.util.spec_from_file_location(module_name, path)
     assert module_spec is not None and module_spec.loader is not None

@@ -13,6 +13,11 @@ MIGRATION_PATH = (
     / "alembic/versions"
     / "20260810130000_provider_directory_reviewed_subset_terminal_window.py"
 )
+TAIL_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic/versions"
+    / "20260814000000_provider_directory_reviewed_subset_terminal_tail_tolerance.py"
+)
 
 
 def _load_migration():
@@ -46,6 +51,30 @@ def _capture(monkeypatch, operation):
         " ".join(statement.split()) for statement in recorder.statements
     ]
     return migration, statements
+
+
+def _load_tail_migration():
+    module_spec = importlib.util.spec_from_file_location(
+        "provider_directory_reviewed_subset_terminal_tail_migration",
+        TAIL_MIGRATION_PATH,
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    migration = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(migration)
+    return migration
+
+
+def _capture_tail(monkeypatch, operation):
+    migration = _load_tail_migration()
+    recorder = _Recorder()
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "terminal_window_test")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    monkeypatch.setattr(migration, "op", recorder)
+    terminal = migration._terminal()
+    monkeypatch.setattr(terminal, "op", recorder)
+    monkeypatch.setattr(terminal._bounded(), "op", recorder)
+    getattr(migration, operation)()
+    return migration, [" ".join(statement.split()) for statement in recorder.statements]
 
 
 def test_upgrade_replaces_only_profile_objects_without_evidence_dml(
@@ -132,3 +161,39 @@ def test_profile_adoption_fence_switches_from_v4_to_v5():
     assert "traversal-subset-v5" not in before_sql
     assert "traversal-subset-v5" in after_sql
     assert "IS DISTINCT FROM TRUE" in after_sql
+
+
+def test_tail_upgrade_replaces_only_the_v5_proof_function(monkeypatch):
+    migration, statements = _capture_tail(monkeypatch, "upgrade")
+    normalized_sql = " ".join(statements)
+
+    assert migration.revision == (
+        "20260814000000_provider_directory_reviewed_subset_terminal_tail_tolerance"
+    )
+    assert migration.down_revision == "20260813010000_provider_directory_observed_npi_index"
+    replacements = [
+        statement
+        for statement in statements
+        if statement.startswith("CREATE OR REPLACE FUNCTION")
+    ]
+    assert len(replacements) == 1
+    assert "OR advertised_pre >=" in replacements[0]
+    assert "+ page_count" in replacements[0]
+    assert "terminal_tail_shape_changed" in normalized_sql
+    assert not any(
+        statement.startswith(("INSERT ", "UPDATE ", "DELETE "))
+        for statement in statements
+    )
+
+
+def test_tail_downgrade_fences_only_stored_tail_evidence(monkeypatch):
+    _migration, statements = _capture_tail(monkeypatch, "downgrade")
+    normalized_sql = " ".join(statements)
+
+    fence_position = normalized_sql.index("terminal_tail_downgrade_blocked")
+    replacement_position = normalized_sql.index("CREATE OR REPLACE FUNCTION")
+    assert fence_position < replacement_position
+    assert "jsonb_each" in normalized_sql
+    assert "advertised_pre" in normalized_sql
+    assert "logical_window_end_offset" in normalized_sql
+    assert "OR advertised_pre >" in normalized_sql

@@ -76,16 +76,14 @@ def _advancing_sleep(monkeypatch, clock):
 @pytest.mark.parametrize(
     ("retry_after", "retry_index", "elapsed_seconds", "expected"),
     [
-        (None, 0, 0.0, 300.0),
-        ("invalid", 0, 0.0, 300.0),
-        ("0", 0, 0.0, 300.0),
-        ("450", 0, 0.0, 450.0),
-        ("600", 0, 0.0, 600.0),
-        ("601", 0, 0.0, None),
-        ("900", 0, 0.0, None),
-        (None, 1, 600.0, 299.0),
-        ("250", 1, 600.0, 299.0),
-        ("300", 1, 600.0, None),
+        (None, 0, 0.0, 1.0),
+        ("invalid", 0, 0.0, 1.0),
+        ("0", 0, 0.0, 1.0),
+        ("2", 0, 0.0, 2.0),
+        ("3", 0, 0.0, None),
+        ("4", 0, 0.0, None),
+        (None, 1, 1.0, 1.0),
+        ("2", 1, 1.0, None),
     ],
 )
 def test_retry_after_delta_and_absolute_budget_boundaries(
@@ -115,11 +113,11 @@ def test_retry_after_delta_and_absolute_budget_boundaries(
 def test_retry_after_http_date_obeys_schedule_and_budget():
     current_time = datetime.datetime(2026, 8, 10, 12, 0, tzinfo=datetime.UTC)
     allowed_retry_after = email.utils.format_datetime(
-        current_time + datetime.timedelta(seconds=600),
+        current_time + datetime.timedelta(seconds=2),
         usegmt=True,
     )
     refused_retry_after = email.utils.format_datetime(
-        current_time + datetime.timedelta(seconds=601),
+        current_time + datetime.timedelta(seconds=4),
         usegmt=True,
     )
 
@@ -131,7 +129,7 @@ def test_retry_after_http_date_obeys_schedule_and_budget():
             now_monotonic=0.0,
             now_utc=current_time,
         )
-        == 600.0
+        == 2.0
     )
     assert (
         importer._current_version_census_retry_delay_seconds(
@@ -152,7 +150,7 @@ def test_retry_after_http_date_obeys_schedule_and_budget():
             max_delay_seconds=None,
             now_utc=current_time,
         )
-        == "2026-08-10T12:10:01Z"
+        == "2026-08-10T12:00:04Z"
     )
 
 
@@ -162,13 +160,13 @@ async def test_request_duration_is_included_in_absolute_retry_targets(monkeypatc
     clock = _fake_clock(monkeypatch)
     sleep = _advancing_sleep(monkeypatch, clock)
     responses = [
-        (503, {}, None, 120_000),
-        (503, {}, None, 120_000),
-        (200, {"resourceType": "Bundle", "type": "searchset"}, None, 120_000),
+        (503, {}, None, 100),
+        (503, {}, None, 100),
+        (200, {"resourceType": "Bundle", "type": "searchset"}, None, 100),
     ]
 
     def complete_attempt(*_args, **_kwargs):
-        clock.value += 120.0
+        clock.value += 0.1
         return responses.pop(0)
 
     attempt = AsyncMock(side_effect=complete_attempt)
@@ -177,23 +175,25 @@ async def test_request_duration_is_included_in_absolute_retry_targets(monkeypatc
     fetch_result, retry_count = await importer._fetch_current_version_census_json(
         source_record,
         _request_url(),
-        timeout=180,
+        timeout=3,
     )
 
     assert fetch_result[0] == 200
-    assert fetch_result[3] == 360_000
+    assert fetch_result[3] == 300
     assert retry_count == 2
     assert attempt.await_count == 3
-    assert sleep.await_args_list == [call(180.0), call(479.0)]
+    assert [sleep_call.args[0] for sleep_call in sleep.await_args_list] == pytest.approx(
+        [0.9, 0.9]
+    )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("second_wake_at", "expected_attempts", "expected_retries"),
     [
-        pytest.param(899.999, 3, 2, id="before-deadline"),
-        pytest.param(900.0, 2, 1, id="at-deadline"),
-        pytest.param(900.1, 2, 1, id="overslept-deadline"),
+        pytest.param(2.999, 3, 2, id="before-deadline"),
+        pytest.param(3.0, 2, 1, id="at-deadline"),
+        pytest.param(3.1, 2, 1, id="overslept-deadline"),
     ],
 )
 async def test_post_sleep_deadline_blocks_late_reissue(
@@ -204,7 +204,7 @@ async def test_post_sleep_deadline_blocks_late_reissue(
 ):
     source_record = _source_record()
     clock = _fake_clock(monkeypatch)
-    wake_times = iter((300.0, second_wake_at))
+    wake_times = iter((1.0, second_wake_at))
     sleep = AsyncMock(
         side_effect=lambda _seconds: setattr(
             clock,
@@ -230,7 +230,7 @@ async def test_post_sleep_deadline_blocks_late_reissue(
 
     assert attempt.await_count == expected_attempts
     assert retry_count == expected_retries
-    assert sleep.await_args_list == [call(300.0), call(599.0)]
+    assert sleep.await_args_list == [call(1.0), call(1.0)]
     assert fetch_result[0] == (200 if expected_attempts == 3 else 503)
     if expected_attempts == 3:
         assert importer.SOURCE_FETCH_DIAGNOSTIC_FIELD not in source_record
@@ -358,6 +358,29 @@ async def test_current_count_failure_preserves_the_full_durable_defer(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_current_count_transient_fallback_is_one_second(monkeypatch):
+    source_record = _source_record()
+    fetch = AsyncMock(return_value=(503, {}, None, 7))
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch)
+    started_at = datetime.datetime.now(datetime.UTC)
+
+    count_fetch = await importer._fetch_current_version_census_count(
+        source_record,
+        _request_url(),
+        timeout=3,
+    )
+
+    retry_at = datetime.datetime.fromisoformat(
+        count_fetch.retry_not_before.replace("Z", "+00:00")
+    )
+    assert count_fetch.count is None
+    assert count_fetch.transient is True
+    assert started_at <= retry_at
+    assert retry_at <= started_at + datetime.timedelta(seconds=2)
+    fetch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_cancellation_during_retry_wait_propagates(monkeypatch):
     source_record = _source_record()
     _fake_clock(monkeypatch)
@@ -376,5 +399,5 @@ async def test_cancellation_during_retry_wait_propagates(monkeypatch):
         )
 
     attempt.assert_awaited_once()
-    sleep.assert_awaited_once_with(300.0)
+    sleep.assert_awaited_once_with(1.0)
     recorder.assert_not_called()
