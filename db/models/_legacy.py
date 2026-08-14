@@ -5291,16 +5291,7 @@ class PricingProviderQualityPeerTarget(Base, JSONOutputMixin):
         "taxonomy_code",
         "procedure_bucket",
     ]
-    __my_additional_indexes__ = [
-        {
-            "index_elements": ("year", "benchmark_mode", "geography_scope", "geography_value", "cohort_level"),
-            "name": "pricing_quality_peer_target_year_mode_geo_cohort_idx",
-        },
-        {
-            "index_elements": ("year", "benchmark_mode", "cohort_level", "specialty_key", "taxonomy_code", "procedure_bucket"),
-            "name": "pricing_quality_peer_target_year_mode_cohort_target_idx",
-        },
-    ]
+    __my_additional_indexes__ = []
 
     year = Column(Integer, nullable=False)
     benchmark_mode = Column(String(32), nullable=False)

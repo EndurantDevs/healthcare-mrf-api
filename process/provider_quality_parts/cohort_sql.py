@@ -643,10 +643,10 @@ def _cohort_sql_phase_5_measure_shard(ctx: dict[str, Any]) -> str:
     svi_table = ctx["svi_table"]
     feature_table = ctx["feature_table"]
     peer_target_table = ctx["peer_target_table"]
-    procedure_bucket_guard = (
-        "TRUE"
+    cohort_level_values = (
+        "('L0'::varchar, 1), ('L1'::varchar, 2), ('L2'::varchar, 3), ('L3'::varchar, 4)"
         if ctx["feature_procedure_bucket_col"]
-        else f"{ctx['peer_cohort_level_expr']} <> 'L0'"
+        else "('L1'::varchar, 2), ('L2'::varchar, 3), ('L3'::varchar, 4)"
     )
     return f"""
         WITH deleted AS (
@@ -725,18 +725,60 @@ def _cohort_sql_phase_5_measure_shard(ctx: dict[str, Any]) -> str:
               ON f.{ctx["feature_npi_col"]} = p.npi
              AND f.{ctx["feature_year_col"]} = p.year
         ),
-        benchmark_modes AS (
-            SELECT v.benchmark_mode
-            FROM (
-                VALUES
-                {ctx["benchmark_mode_values"]}
-            ) AS v(benchmark_mode)
+        benchmark_scopes AS (
+            SELECT *
+            FROM (VALUES
+                ('zip'::varchar, 'zip'::varchar, 1),
+                ('zip'::varchar, 'state'::varchar, 2),
+                ('zip'::varchar, 'national'::varchar, 3),
+                ('state'::varchar, 'state'::varchar, 1),
+                ('state'::varchar, 'national'::varchar, 2),
+                ('national'::varchar, 'national'::varchar, 1)
+            ) AS v(benchmark_mode, geography_scope, geography_rank)
+            WHERE v.benchmark_mode IN ({ctx["benchmark_mode_list_sql"]})
         ),
-        target_candidates AS (
+        cohort_levels AS (
+            SELECT *
+            FROM (VALUES {cohort_level_values}) AS v(cohort_level, level_rank)
+        ),
+        provider_target_keys AS MATERIALIZED (
             SELECT
                 p.npi,
                 p.year,
-                bm.benchmark_mode,
+                bs.benchmark_mode,
+                bs.geography_scope,
+                bs.geography_rank,
+                CASE
+                    WHEN bs.geography_scope = 'zip' THEN p.resolved_zip5
+                    WHEN bs.geography_scope = 'state' THEN p.resolved_state_key
+                    ELSE 'US'
+                END::varchar AS match_geography_value,
+                lv.cohort_level,
+                lv.level_rank,
+                CASE
+                    WHEN lv.cohort_level IN ('L0', 'L1', 'L2') THEN p.specialty
+                    ELSE 'unknown'
+                END::varchar AS match_specialty,
+                CASE
+                    WHEN lv.cohort_level IN ('L0', 'L1') THEN p.taxonomy
+                    ELSE 'unknown'
+                END::varchar AS match_taxonomy,
+                CASE
+                    WHEN lv.cohort_level = 'L0' THEN p.procedure_bucket
+                    ELSE 'bucket:none'
+                END::varchar AS match_procedure_bucket
+            FROM provider_featured p
+            CROSS JOIN benchmark_scopes bs
+            CROSS JOIN cohort_levels lv
+            WHERE bs.geography_scope = 'national'
+               OR (bs.geography_scope = 'state' AND p.resolved_state_key IS NOT NULL)
+               OR (bs.geography_scope = 'zip' AND p.resolved_zip5 IS NOT NULL)
+        ),
+        target_candidates AS (
+            SELECT
+                pk.npi,
+                pk.year,
+                pk.benchmark_mode,
                 ({ctx["peer_scope_expr"]})::varchar AS selected_geography_scope,
                 ({ctx["peer_geo_value_expr"]})::varchar AS selected_geography_value,
                 ({ctx["peer_cohort_level_expr"]})::varchar AS selected_cohort_level,
@@ -750,56 +792,23 @@ def _cohort_sql_phase_5_measure_shard(ctx: dict[str, Any]) -> str:
                 t.{ctx["peer_target_effect_col"]}::float8 AS target_effectiveness,
                 t.{ctx["peer_target_qpp_cost_col"]}::float8 AS target_qpp_cost,
                 t.{ctx["peer_target_rx_appropr_col"]}::float8 AS target_rx_appropriateness,
-                CASE
-                    WHEN bm.benchmark_mode = 'zip' THEN
-                        CASE
-                            WHEN {ctx["peer_scope_expr"]} = 'zip' THEN 1
-                            WHEN {ctx["peer_scope_expr"]} = 'state' THEN 2
-                            WHEN {ctx["peer_scope_expr"]} = 'national' THEN 3
-                            ELSE 9
-                        END
-                    WHEN bm.benchmark_mode = 'state' THEN
-                        CASE
-                            WHEN {ctx["peer_scope_expr"]} = 'state' THEN 1
-                            WHEN {ctx["peer_scope_expr"]} = 'national' THEN 2
-                            ELSE 9
-                        END
-                    ELSE
-                        CASE WHEN {ctx["peer_scope_expr"]} = 'national' THEN 1 ELSE 9 END
-                END AS geography_rank,
-                CASE
-                    WHEN {ctx["peer_cohort_level_expr"]} = 'L0' THEN 1
-                    WHEN {ctx["peer_cohort_level_expr"]} = 'L1' THEN 2
-                    WHEN {ctx["peer_cohort_level_expr"]} = 'L2' THEN 3
-                    ELSE 4
-                END AS level_rank,
+                pk.geography_rank,
+                pk.level_rank,
                 CASE
                     WHEN {ctx["peer_scope_expr"]} = 'zip' THEN ({ctx["peer_peer_n_expr"]}) >= {PROVIDER_QUALITY_ZIP_MIN_PEER_N}
                     WHEN {ctx["peer_scope_expr"]} = 'state' THEN ({ctx["peer_peer_n_expr"]}) >= {PROVIDER_QUALITY_MIN_STATE_PEER_N}
                     ELSE ({ctx["peer_peer_n_expr"]}) >= {PROVIDER_QUALITY_NATIONAL_MIN_PEER_N}
                 END AS threshold_met
-            FROM provider_featured p
-            CROSS JOIN benchmark_modes bm
+            FROM provider_target_keys pk
             JOIN {schema}.{peer_target_table} t
-              ON t.{ctx["peer_target_year_col"]} = p.year
-             AND {ctx["peer_benchmark_mode_expr"]} = bm.benchmark_mode
-             AND {procedure_bucket_guard}
-             AND (
-                    ({ctx["peer_scope_expr"]} = 'zip' AND bm.benchmark_mode = 'zip' AND p.resolved_zip5 IS NOT NULL AND {ctx["peer_geo_value_expr"]} = p.resolved_zip5)
-                    OR (
-                        {ctx["peer_scope_expr"]} = 'state'
-                        AND bm.benchmark_mode IN ('zip', 'state')
-                        AND p.resolved_state_key IS NOT NULL
-                        AND UPPER({ctx["peer_geo_value_expr"]}) = p.resolved_state_key
-                    )
-                    OR ({ctx["peer_scope_expr"]} = 'national' AND bm.benchmark_mode IN ('zip', 'state', 'national'))
-                )
-             AND (
-                    ({ctx["peer_cohort_level_expr"]} = 'L0' AND {ctx["peer_specialty_match"]} AND {ctx["peer_taxonomy_match"]} AND {ctx["peer_procedure_bucket_match"]})
-                    OR ({ctx["peer_cohort_level_expr"]} = 'L1' AND {ctx["peer_specialty_match"]} AND {ctx["peer_taxonomy_match"]})
-                    OR ({ctx["peer_cohort_level_expr"]} = 'L2' AND {ctx["peer_specialty_match"]})
-                    OR ({ctx["peer_cohort_level_expr"]} = 'L3')
-                )
+              ON t.{ctx["peer_target_year_col"]} = pk.year
+             AND {ctx["peer_benchmark_mode_expr"]} = pk.benchmark_mode
+             AND {ctx["peer_scope_expr"]} = pk.geography_scope
+             AND {ctx["peer_geo_value_expr"]} = pk.match_geography_value
+             AND {ctx["peer_cohort_level_expr"]} = pk.cohort_level
+             AND {ctx["peer_specialty_expr"]} = pk.match_specialty
+             AND {ctx["peer_taxonomy_expr"]} = pk.match_taxonomy
+             AND {ctx["peer_procedure_bucket_expr"]} = pk.match_procedure_bucket
         ),
         target_selected AS (
             SELECT DISTINCT ON (c.npi, c.year, c.benchmark_mode)
