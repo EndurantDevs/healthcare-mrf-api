@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterator
 
 import ijson
+from ijson.backends import python as strict_ijson
 
 
 class UHCDrugPayloadError(ValueError):
@@ -17,6 +18,10 @@ class UHCDrugPayloadError(ValueError):
 MAX_JSON_NESTING_DEPTH = 32
 MAX_JSON_RECORD_BYTES = 67_108_864
 MAX_JSON_SCALAR_BYTES = 1_048_576
+_SOURCE_JSON_ERRORS = (ijson.JSONError, ValueError, ArithmeticError, SystemError)
+_SURROGATE_ESCAPE_PREFIXES = tuple(
+    f"\\ud{suffix}".encode() for suffix in "89abcdef"
+)
 
 
 def _is_root_array_item_start(event_name: str) -> bool:
@@ -79,7 +84,10 @@ def _json_event_bytes(event_name: str, event_value: object) -> int:
             raise UHCDrugPayloadError("JSON scalar is too large")
         return scalar_byte_count + 2
     if event_name in {"number", "boolean", "null"}:
-        return len(str(event_value).encode("utf-8")) + 1
+        try:
+            return len(str(event_value).encode("utf-8")) + 1
+        except (ValueError, ArithmeticError, SystemError):
+            raise UHCDrugPayloadError("JSON scalar is invalid") from None
     return 1
 
 
@@ -90,23 +98,52 @@ def _object_array_item_count(
     item_count = 0
     item_byte_count = 0
     container_keys: list[set[str] | None] = [None]
-    for event_index, (event_name, event_value) in enumerate(parser, start=1):
-        if cancel_check is not None and event_index % 1_024 == 0:
+    event_index = 0
+    while True:
+        if cancel_check is not None and event_index > 0 and event_index % 1_024 == 0:
             cancel_check()
-        if len(container_keys) == 1:
-            if not _is_root_array_item_start(event_name):
-                return item_count
-            item_count += 1
-            item_byte_count = _json_event_bytes(event_name, event_value)
-            container_keys.append(set())
-            continue
-        item_byte_count += _json_event_bytes(event_name, event_value)
-        if item_byte_count > MAX_JSON_RECORD_BYTES:
-            raise UHCDrugPayloadError("JSON record is too large")
-        _apply_container_event(container_keys, event_name, event_value)
-        if len(container_keys) > MAX_JSON_NESTING_DEPTH:
-            raise UHCDrugPayloadError("JSON nesting is invalid")
+        try:
+            event_name, event_value = next(parser)
+            event_index += 1
+            if len(container_keys) == 1:
+                if not _is_root_array_item_start(event_name):
+                    return item_count
+                item_count += 1
+                item_byte_count = _json_event_bytes(event_name, event_value)
+                container_keys.append(set())
+                continue
+            item_byte_count += _json_event_bytes(event_name, event_value)
+            if item_byte_count > MAX_JSON_RECORD_BYTES:
+                raise UHCDrugPayloadError("JSON record is too large")
+            _apply_container_event(container_keys, event_name, event_value)
+            if len(container_keys) > MAX_JSON_NESTING_DEPTH:
+                raise UHCDrugPayloadError("JSON nesting is invalid")
+        except StopIteration:
+            break
+        except UHCDrugPayloadError:
+            raise
+        except _SOURCE_JSON_ERRORS:
+            raise UHCDrugPayloadError("UHC drug JSON structure is invalid") from None
     raise UHCDrugPayloadError("root array is incomplete")
+
+
+def _has_surrogate_escape(
+    input_file: BinaryIO,
+    cancel_check: Callable[[], None] | None,
+) -> bool:
+    start_offset = input_file.tell()
+    overlap = b""
+    try:
+        while source_chunk := input_file.read(1_048_576):
+            if cancel_check is not None:
+                cancel_check()
+            lowered_chunk = (overlap + source_chunk).lower()
+            if any(prefix in lowered_chunk for prefix in _SURROGATE_ESCAPE_PREFIXES):
+                return True
+            overlap = lowered_chunk[-3:]
+        return False
+    finally:
+        input_file.seek(start_offset)
 
 
 def count_uhc_drug_stream_items(
@@ -116,19 +153,30 @@ def count_uhc_drug_stream_items(
 ) -> int:
     """Validate one stream and return its exact nonzero top-level item count."""
 
+    if cancel_check is not None:
+        cancel_check()
+    parser_backend = (
+        strict_ijson if _has_surrogate_escape(input_file, cancel_check) else ijson
+    )
+    parser = iter(parser_backend.basic_parse(input_file, use_float=False))
     try:
-        parser = iter(ijson.basic_parse(input_file, use_float=False))
         first_event, _first_value = next(parser)
-        if first_event != "start_array":
-            raise UHCDrugPayloadError("root is not an array")
-        if cancel_check is not None:
-            cancel_check()
-        item_count = _object_array_item_count(parser, cancel_check)
-        sentinel = object()
-        if next(parser, sentinel) is not sentinel:
-            raise UHCDrugPayloadError("trailing JSON value is invalid")
-    except (StopIteration, ValueError, ijson.JSONError):
+    except StopIteration:
         raise UHCDrugPayloadError("UHC drug JSON structure is invalid") from None
+    except _SOURCE_JSON_ERRORS:
+        raise UHCDrugPayloadError("UHC drug JSON structure is invalid") from None
+    if first_event != "start_array":
+        raise UHCDrugPayloadError("UHC drug JSON structure is invalid")
+    try:
+        item_count = _object_array_item_count(parser, cancel_check)
+    except UHCDrugPayloadError:
+        raise UHCDrugPayloadError("UHC drug JSON structure is invalid") from None
+    try:
+        trailing_event = next(parser, None)
+    except _SOURCE_JSON_ERRORS:
+        raise UHCDrugPayloadError("UHC drug JSON structure is invalid") from None
+    if trailing_event is not None:
+        raise UHCDrugPayloadError("UHC drug JSON structure is invalid")
     if item_count <= 0:
         raise UHCDrugPayloadError("UHC drug JSON structure is invalid")
     if cancel_check is not None:

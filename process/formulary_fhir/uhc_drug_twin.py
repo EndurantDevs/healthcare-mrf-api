@@ -18,6 +18,9 @@ from db.models import db
 from process.formulary_fhir.async_safety import cancellable_to_thread
 from process.formulary_fhir.async_safety import drain_operation
 import process.formulary_fhir.manual_lock as manual_lock
+from process.formulary_fhir.uhc_drug_acquisition import (
+    UHCDrugArtifactAcquisitionResult,
+)
 from process.formulary_fhir.repository import FHIRFormularyRepository
 from process.formulary_fhir.repository_admission import admit_verified_twins
 from process.formulary_fhir.repository_admission_types import TwinAdmissionResult
@@ -29,7 +32,10 @@ from process.formulary_fhir.source_artifact_contract import (
     VerifiedSourceArtifactSet,
 )
 from process.formulary_fhir.source_artifacts import (
-    load_complete_source_artifact_set,
+    load_selected_source_artifact_set,
+)
+from process.formulary_fhir.source_artifacts import (
+    load_source_artifact_identities,
 )
 from process.formulary_fhir.uhc_drug_parser_contract import UHCDrugSpoolEvidence
 from process.formulary_fhir.uhc_drug_spool import materialize_uhc_drug_spool
@@ -209,11 +215,18 @@ async def _materialize_independent_spools(
 async def _require_artifacts_unchanged(
     request: _TwinRequest,
 ) -> None:
-    identities = tuple(
-        artifact.identity for artifact in request.artifacts.artifacts
+    identities = await load_source_artifact_identities(
+        request.artifacts.source_id,
+        request.artifacts.source_file_set_sha256,
+        database=request.database,
     )
-    current_artifacts = await load_complete_source_artifact_set(
+    selected_source_file_ids = tuple(
+        artifact.identity.source_file_id
+        for artifact in request.artifacts.artifacts
+    )
+    current_artifacts = await load_selected_source_artifact_set(
         identities,
+        selected_source_file_ids=selected_source_file_ids,
         database=request.database,
     )
     if current_artifacts != request.artifacts:
@@ -360,9 +373,15 @@ async def verify_uhc_drug_twins(
 
 async def _verify_and_record_under_lease(
     request: _TwinRequest,
-    source_observation_sha256: str,
+    acquisition: UHCDrugArtifactAcquisitionResult,
 ) -> UHCDrugRecordedAdmission:
     """Build, admit, and durably record before releasing the source lease."""
+
+    if (
+        type(acquisition) is not UHCDrugArtifactAcquisitionResult
+        or acquisition.artifacts != request.artifacts
+    ):
+        raise ValueError("UHC drug artifact acquisition result is invalid")
 
     from process.formulary_fhir.uhc_drug_receipt import (
         _record_receipt_under_lease,
@@ -379,8 +398,7 @@ async def _verify_and_record_under_lease(
         )
         receipt = await drain_operation(
             _record_receipt_under_lease(
-                source_observation_sha256=source_observation_sha256,
-                artifacts=request.artifacts,
+                acquisition=acquisition,
                 twin_result=twin_result,
                 database=request.database,
             ),
@@ -391,8 +409,7 @@ async def _verify_and_record_under_lease(
 
 async def verify_and_record_uhc_drug_twins(
     *,
-    source_observation_sha256: str,
-    artifacts: VerifiedSourceArtifactSet,
+    acquisition: UHCDrugArtifactAcquisitionResult,
     baseline_run_id: str,
     candidate_run_id: str,
     cutoff: dt.datetime,
@@ -402,12 +419,10 @@ async def verify_and_record_uhc_drug_twins(
 ) -> UHCDrugRecordedAdmission:
     """Independently build, admit, and record one restart-safe receipt."""
 
-    observation_hash = strict_hash(
-        source_observation_sha256,
-        "source observation hash",
-    )
+    if type(acquisition) is not UHCDrugArtifactAcquisitionResult:
+        raise ValueError("UHC drug artifact acquisition result is invalid")
     request = _validated_twin_request(
-        artifacts,
+        acquisition.artifacts,
         baseline_run_id,
         candidate_run_id,
         cutoff,
@@ -424,7 +439,7 @@ async def verify_and_record_uhc_drug_twins(
         async with asyncio.timeout(UHC_DRUG_TWIN_TIMEOUT_SECONDS):
             return await _verify_and_record_under_lease(
                 request,
-                observation_hash,
+                acquisition,
             )
 
 

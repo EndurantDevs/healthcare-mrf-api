@@ -382,9 +382,10 @@ async def verify_root_and_insert_receipt(
 async def assert_receipt_catalog(
     connection: asyncpg.Connection,
     schema_name: str,
+    *,
+    selected: bool = False,
 ) -> None:
     """Prove exact hardened functions and always-on receipt triggers."""
-
     routine_entries = await connection.fetch(
         "SELECT routine.proname, routine.prosecdef, routine.proconfig, "
         "routine.provolatile::text, "
@@ -394,17 +395,21 @@ async def assert_receipt_catalog(
         "ON namespace.oid = routine.pronamespace "
         "WHERE namespace.nspname = $1 AND routine.proname IN "
         "('guard_fhir_formulary_uhc_admission_receipt', "
-        "'fhir_formulary_source_artifact_set_sha256')",
+        "'fhir_formulary_source_artifact_set_sha256', "
+        "'fhir_formulary_source_artifact_selection_sha256')",
         schema_name,
     )
     routines_by_name = {
         routine_entry["proname"]: routine_entry
         for routine_entry in routine_entries
     }
-    assert set(routines_by_name) == {
+    expected_routines = {
         "guard_fhir_formulary_uhc_admission_receipt",
         "fhir_formulary_source_artifact_set_sha256",
     }
+    if selected:
+        expected_routines.add("fhir_formulary_source_artifact_selection_sha256")
+    assert set(routines_by_name) == expected_routines
     assert all(entry["prosecdef"] for entry in routines_by_name.values())
     assert all(
         entry["proconfig"] == ["search_path=pg_catalog"]
@@ -414,6 +419,10 @@ async def assert_receipt_catalog(
     assert routines_by_name[
         "fhir_formulary_source_artifact_set_sha256"
     ]["provolatile"] == "s"
+    if selected:
+        assert routines_by_name[
+            "fhir_formulary_source_artifact_selection_sha256"
+        ]["provolatile"] == "s"
     trigger_entries = await connection.fetch(
         "SELECT trigger.tgname, trigger.tgenabled::text FROM pg_trigger "
         "AS trigger JOIN pg_class AS relation "

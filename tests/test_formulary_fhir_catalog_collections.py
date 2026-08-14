@@ -30,6 +30,13 @@ ENVIRONMENT = {
     serving.FHIR_FORMULARY_SERVING_ENABLED_ENV: "true",
     cursor.FHIR_FORMULARY_CURSOR_KEY_ENV: CURSOR_KEY,
 }
+NO_COVERAGE = {
+    "coverage_required": False,
+    "coverage_expected_artifact_count": None,
+    "coverage_receipt_expected_artifact_count": None,
+    "coverage_included_artifact_count": None,
+    "coverage_missing_artifact_count": None,
+}
 
 
 def _detail_record(formulary_id: str, **changes):
@@ -43,6 +50,7 @@ def _detail_record(formulary_id: str, **changes):
         "last_updated": LAST_UPDATED,
         "as_of": AS_OF,
         "published_at": PUBLISHED_AT,
+        **NO_COVERAGE,
         "source_id": "private-source",
         "dataset_id": "private-dataset",
         "run_id": "private-run",
@@ -122,7 +130,7 @@ def _catalog_evidence(published_at=PUBLISHED_AT):
                 "published_at": published_at,
             },
         ),
-        ({"dataset_id": "dataset-a", "list_count": 2},),
+        ({"dataset_id": "dataset-a", "list_count": 2, **NO_COVERAGE},),
     )
 
 
@@ -200,6 +208,7 @@ async def test_collection_page_uses_snapshot_and_hides_private_rows():
             "last_updated": "2026-08-07T05:00:00Z",
             "as_of": "2026-08-08T00:00:00Z",
             "published_at": "2026-08-08T06:00:00Z",
+            "coverage": None,
         }
     ]
     rendered_response = json.dumps(response_by_field, sort_keys=True)
@@ -273,6 +282,7 @@ async def test_alias_page_is_parent_scoped_opaque_and_cursor_paginated():
             "formulary_id": FORMULARY_A,
             "generation": 1,
             "published_at": PUBLISHED_AT,
+            **NO_COVERAGE,
         },
     )
     alias_rows = (
@@ -310,6 +320,7 @@ async def test_alias_page_is_parent_scoped_opaque_and_cursor_paginated():
                 "formulary_id": FORMULARY_A,
                 "alias_id": ALIAS_A,
                 "drug_count": 3,
+                "coverage": None,
             }
         ],
         "next_cursor": page.next_cursor,
@@ -327,6 +338,7 @@ async def test_alias_cursor_rejects_same_timestamp_new_generation_before_page_re
             "formulary_id": FORMULARY_A,
             "generation": 1,
             "published_at": PUBLISHED_AT,
+            **NO_COVERAGE,
         },
     )
     alias_rows = (
@@ -348,6 +360,7 @@ async def test_alias_cursor_rejects_same_timestamp_new_generation_before_page_re
             "formulary_id": FORMULARY_A,
             "generation": 2,
             "published_at": PUBLISHED_AT,
+            **NO_COVERAGE,
         },
     )
     changed_session = _ScriptedSession((), changed_context)

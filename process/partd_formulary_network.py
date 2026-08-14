@@ -1448,6 +1448,48 @@ def _safe_file_name(name: str) -> str:
     return safe or "partd_file"
 
 
+def _extract_archive_members(
+    archive_path: Path,
+    archive_label: str,
+    workdir: Path,
+    counter: int,
+) -> tuple[list[tuple[Path, str]], list[tuple[Path, str]], int]:
+    extracted_files: list[tuple[Path, str]] = []
+    nested_archives: list[tuple[Path, str]] = []
+    with zipfile.ZipFile(archive_path) as archive:
+        for member_name in archive.namelist():
+            if member_name.endswith("/"):
+                continue
+            member_basename = Path(member_name).name
+            if not member_basename:
+                continue
+            logical_name = f"{archive_label}/{member_name}"
+            suffix = Path(member_basename).suffix.lower()
+            member_lower = member_name.lower()
+            is_relevant = any(
+                token in member_lower
+                for token in (
+                    "pharmacy network",
+                    "pricing file",
+                    "basic drugs formulary",
+                    "plan information file",
+                )
+            )
+            if suffix in {".zip", ".txt", ".csv"} and not is_relevant:
+                continue
+            counter += 1
+            out_path = workdir / f"{counter:08d}_{_safe_file_name(member_basename)}"
+            with archive.open(member_name, "r") as src, out_path.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+            if suffix == ".zip":
+                nested_archives.append((out_path, logical_name))
+            elif suffix in {".txt", ".csv"}:
+                extracted_files.append((out_path, logical_name))
+            else:
+                out_path.unlink(missing_ok=True)
+    return extracted_files, nested_archives, counter
+
+
 def _extract_data_files(zip_path: Path, workdir: Path) -> list[tuple[Path, str]]:
     extracted_files: list[tuple[Path, str]] = []
     pending_archives: list[tuple[Path, str]] = [(zip_path, zip_path.name)]
@@ -1455,38 +1497,14 @@ def _extract_data_files(zip_path: Path, workdir: Path) -> list[tuple[Path, str]]
 
     while pending_archives:
         current_zip_path, zip_label = pending_archives.pop(0)
-        with zipfile.ZipFile(current_zip_path) as archive:
-            for member_name in archive.namelist():
-                if member_name.endswith("/"):
-                    continue
-                member_basename = Path(member_name).name
-                if not member_basename:
-                    continue
-                logical_name = f"{zip_label}/{member_name}"
-                suffix = Path(member_basename).suffix.lower()
-                member_lower = member_name.lower()
-                is_relevant = any(
-                    token in member_lower
-                    for token in (
-                        "pharmacy network",
-                        "pricing file",
-                        "basic drugs formulary",
-                        "plan information file",
-                    )
-                )
-                if suffix in {".zip", ".txt", ".csv"} and not is_relevant:
-                    continue
-                counter += 1
-                out_name = f"{counter:08d}_{_safe_file_name(member_basename)}"
-                out_path = workdir / out_name
-                with archive.open(member_name, "r") as src, out_path.open("wb") as dst:
-                    shutil.copyfileobj(src, dst)
-                if suffix == ".zip":
-                    pending_archives.append((out_path, logical_name))
-                elif suffix in {".txt", ".csv"}:
-                    extracted_files.append((out_path, logical_name))
-                else:
-                    out_path.unlink(missing_ok=True)
+        extracted, nested, counter = _extract_archive_members(
+            current_zip_path,
+            zip_label,
+            workdir,
+            counter,
+        )
+        extracted_files.extend(extracted)
+        pending_archives.extend(nested)
         if current_zip_path != zip_path:
             current_zip_path.unlink(missing_ok=True)
 
@@ -1688,24 +1706,11 @@ def _activity_row_from_source(
         "source_type": source_type,
     }
 
-def _pricing_rows_from_source(
-    source_row: dict[str, Any],
-    *,
-    snapshot_id: str,
-    source_type: str,
-    default_date: datetime.date,
-    plan_to_formulary: dict[tuple[str, str, str], str],
-    formulary_ndc_to_rxnorm: dict[tuple[str, str], str],
-) -> list[dict[str, Any]]:
-    """Normalize one source row into medication cost rows."""
-    source_field_map = _row_index(source_row)
-    contract_id, plan_component, segment_id, plan_id = _extract_plan_fields(
-        source_field_map
-    )
 
-    year = _to_int(
-        _row_value(source_field_map, "year", "contractyear", "planyear")
-    )
+def _pricing_period_fields(
+    source_field_map: dict[str, Any],
+    default_date: datetime.date,
+) -> dict[str, Any]:
     effective_from = _parse_date(
         _row_value(
             source_field_map,
@@ -1716,14 +1721,28 @@ def _pricing_rows_from_source(
             "snapshotmonth",
         )
     ) or default_date
-    effective_to = _parse_date(
-        _row_value(source_field_map, "effectiveto", "enddate")
-    )
-    days_supply = (
-        _to_int(_row_value(source_field_map, "dayssupply", "supplydays", "days"))
-        or 0
-    )
+    return {
+        "year": _to_int(
+            _row_value(source_field_map, "year", "contractyear", "planyear")
+        ) or effective_from.year,
+        "days_supply": _to_int(
+            _row_value(source_field_map, "dayssupply", "supplydays", "days")
+        ) or 0,
+        "effective_from": effective_from,
+        "effective_to": _parse_date(
+            _row_value(source_field_map, "effectiveto", "enddate")
+        ),
+    }
 
+
+def _pricing_code_fields(
+    source_field_map: dict[str, Any],
+    contract_id: str,
+    plan_component: str,
+    segment_id: str,
+    plan_to_formulary: dict[tuple[str, str, str], str],
+    formulary_ndc_to_rxnorm: dict[tuple[str, str], str],
+) -> dict[str, str | None] | None:
     rxnorm_id = _normalize_code_digits(
         _row_value(source_field_map, "rxnorm", "rxnormid", "rxcui")
     )
@@ -1743,18 +1762,78 @@ def _pricing_rows_from_source(
             rxnorm_id = formulary_ndc_to_rxnorm.get((formulary_id, ndc11))
         if not rxnorm_id:
             rxnorm_id = formulary_ndc_to_rxnorm.get(("*", ndc11))
-    code_system = None
-    code = None
-    normalized_code = None
     if ndc11:
-        code_system = "NDC"
-        code = ndc11
-        normalized_code = ndc11
-    elif rxnorm_id:
-        code_system = "RXNORM"
-        code = rxnorm_id
-        normalized_code = rxnorm_id
-    else:
+        return {"code_system": "NDC", "code": ndc11, "rxnorm_id": rxnorm_id, "ndc11": ndc11}
+    if rxnorm_id:
+        return {"code_system": "RXNORM", "code": rxnorm_id, "rxnorm_id": rxnorm_id, "ndc11": None}
+    return None
+
+
+def _pricing_cost_row(
+    source_field_map: dict[str, Any],
+    snapshot_id: str,
+    source_type: str,
+    plan_id: str,
+    period_fields: dict[str, Any],
+    code_fields: dict[str, str | None],
+    cost_type: str,
+    amount: float,
+) -> dict[str, Any]:
+    days_supply = period_fields["days_supply"]
+    normalized_cost_type = f"{cost_type}_days_{days_supply}" if days_supply else cost_type
+    code = str(code_fields["code"])
+    rxnorm_id = code_fields["rxnorm_id"]
+    ndc11 = code_fields["ndc11"]
+    return {
+        "snapshot_id": snapshot_id,
+        "plan_id": plan_id[:32],
+        "year": period_fields["year"],
+        "code_system": code_fields["code_system"],
+        "code": code[:64],
+        "normalized_code": code[:64],
+        "rxnorm_id": rxnorm_id[:32] if rxnorm_id else None,
+        "ndc11": ndc11[:16] if ndc11 else None,
+        "days_supply": days_supply,
+        "drug_name": _row_value(
+            source_field_map, "drugname", "rxname", "genericname", "brandname"
+        ),
+        "tier": _row_value(source_field_map, "tier", "drugtier"),
+        "pharmacy_type": _row_value(source_field_map, "pharmacytype", "networktype"),
+        "mail_order": _to_bool(
+            _row_value(source_field_map, "mailorder", "ismailorder", "mailorderflag")
+        ),
+        "cost_type": normalized_cost_type[:64],
+        "cost_amount": amount,
+        "effective_from": period_fields["effective_from"],
+        "effective_to": period_fields["effective_to"],
+        "source_type": source_type,
+    }
+
+
+def _pricing_rows_from_source(
+    source_row: dict[str, Any],
+    *,
+    snapshot_id: str,
+    source_type: str,
+    default_date: datetime.date,
+    plan_to_formulary: dict[tuple[str, str, str], str],
+    formulary_ndc_to_rxnorm: dict[tuple[str, str], str],
+) -> list[dict[str, Any]]:
+    """Normalize one source row into medication cost rows."""
+    source_field_map = _row_index(source_row)
+    contract_id, plan_component, segment_id, plan_id = _extract_plan_fields(
+        source_field_map
+    )
+    period_fields = _pricing_period_fields(source_field_map, default_date)
+    code_fields = _pricing_code_fields(
+        source_field_map,
+        contract_id,
+        plan_component,
+        segment_id,
+        plan_to_formulary,
+        formulary_ndc_to_rxnorm,
+    )
+    if code_fields is None:
         return []
 
     cost_fields = _match_cost_fields(source_row)
@@ -1764,46 +1843,19 @@ def _pricing_rows_from_source(
             cost_fields = [("unit_cost", unit_cost)]
     if not cost_fields:
         return []
-
-    pricing_rows: list[dict[str, Any]] = []
-    for cost_type, amount in cost_fields:
-        normalized_cost_type = cost_type
-        if days_supply:
-            normalized_cost_type = f"{cost_type}_days_{days_supply}"
-        pricing_rows.append(
-            {
-                "snapshot_id": snapshot_id,
-                "plan_id": plan_id[:32],
-                "year": year or effective_from.year,
-                "code_system": code_system,
-                "code": code[:64],
-                "normalized_code": normalized_code[:64] if normalized_code else None,
-                "rxnorm_id": rxnorm_id[:32] if rxnorm_id else None,
-                "ndc11": ndc11[:16] if ndc11 else None,
-                "days_supply": days_supply,
-                "drug_name": _row_value(
-                    source_field_map, "drugname", "rxname", "genericname", "brandname"
-                ),
-                "tier": _row_value(source_field_map, "tier", "drugtier"),
-                "pharmacy_type": _row_value(
-                    source_field_map, "pharmacytype", "networktype"
-                ),
-                "mail_order": _to_bool(
-                    _row_value(
-                        source_field_map,
-                        "mailorder",
-                        "ismailorder",
-                        "mailorderflag",
-                    )
-                ),
-                "cost_type": normalized_cost_type[:64],
-                "cost_amount": amount,
-                "effective_from": effective_from,
-                "effective_to": effective_to,
-                "source_type": source_type,
-            }
+    return [
+        _pricing_cost_row(
+            source_field_map,
+            snapshot_id,
+            source_type,
+            plan_id,
+            period_fields,
+            code_fields,
+            cost_type,
+            amount,
         )
-    return pricing_rows
+        for cost_type, amount in cost_fields
+    ]
 
 async def _flush_batches(
     activity_batch_rows: list[dict[str, Any]],

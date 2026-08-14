@@ -10,13 +10,12 @@ import os
 import re
 from typing import Any, Mapping
 
-from sqlalchemy import and_, bindparam, select, text
+from sqlalchemy import bindparam, select, text
 
-from db.models import FHIRFormularyCoveragePlan
-from db.models import FHIRFormularyCoveragePlanVersion
-from db.models import FHIRFormularyCurrent
-from db.models import FHIRFormularyDataset
-from db.models import FHIRFormularyDatasetCoveragePlan
+from api.formulary_fhir_catalog_sql import CURRENT_PLAN_FROM
+from api.formulary_fhir_catalog_sql import CURRENT_PLAN_PREDICATES
+from api.formulary_fhir_catalog_sql import DETAIL_COLUMNS
+from api.formulary_fhir_catalog_sql import plan
 
 
 FHIR_FORMULARY_SERVING_ENABLED_ENV = "HLTHPRT_FHIR_FORMULARY_SERVING_ENABLED"
@@ -45,6 +44,16 @@ class FHIRFormularyServingUnavailableError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class PublicFHIRFormularyCoverage:
+    """Aggregate official-artifact coverage without source identity."""
+
+    status: str
+    expected_artifact_count: int
+    included_artifact_count: int
+    missing_artifact_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class PublicFHIRFormularyDetail:
     """Allowlisted current-plan fields without source or generation identity."""
 
@@ -57,69 +66,15 @@ class PublicFHIRFormularyDetail:
     last_updated: dt.datetime
     as_of: dt.datetime
     published_at: dt.datetime
+    coverage: PublicFHIRFormularyCoverage | None = None
 
-
-_current = FHIRFormularyCurrent.__table__
-_dataset = FHIRFormularyDataset.__table__
-_dataset_plan = FHIRFormularyDatasetCoveragePlan.__table__
-_plan = FHIRFormularyCoveragePlan.__table__
-_version = FHIRFormularyCoveragePlanVersion.__table__
 
 _DETAIL_STATEMENT = (
-    select(
-        _plan.c.public_id.label("formulary_id"),
-        _version.c.status,
-        _version.c.title,
-        _version.c.name,
-        _version.c.period_start,
-        _version.c.period_end,
-        _version.c.upstream_last_updated.label("last_updated"),
-        _dataset.c.cutoff_at.label("as_of"),
-        _current.c.published_at,
-    )
-    .select_from(
-        _current.join(
-            _dataset,
-            and_(
-                _dataset.c.source_id == _current.c.source_id,
-                _dataset.c.dataset_id == _current.c.dataset_id,
-            ),
-        )
-        .join(
-            _dataset_plan,
-            and_(
-                _dataset_plan.c.source_id == _dataset.c.source_id,
-                _dataset_plan.c.dataset_id == _dataset.c.dataset_id,
-            ),
-        )
-        .join(
-            _plan,
-            and_(
-                _plan.c.source_id == _dataset_plan.c.source_id,
-                _plan.c.public_id == _dataset_plan.c.public_id,
-            ),
-        )
-        .join(
-            _version,
-            and_(
-                _version.c.public_id == _dataset_plan.c.public_id,
-                _version.c.coverage_version_id
-                == _dataset_plan.c.coverage_version_id,
-            ),
-        )
-    )
+    select(*DETAIL_COLUMNS)
+    .select_from(CURRENT_PLAN_FROM)
     .where(
-        _plan.c.public_id == bindparam("public_id"),
-        _dataset.c.status == "published",
-        _dataset.c.verified_at.is_not(None),
-        _dataset.c.failed_at.is_(None),
-        _dataset.c.error_json.is_(None),
-        _dataset.c.published_at == _current.c.published_at,
-        _current.c.generation > 0,
-        _dataset.c.coverage_hash.is_not(None),
-        _dataset.c.membership_hash.is_not(None),
-        _dataset.c.publish_requested != _dataset.c.seed_eligible,
-        _version.c.upstream_last_updated.is_not(None),
+        *CURRENT_PLAN_PREDICATES,
+        plan.c.public_id == bindparam("public_id"),
     )
     .limit(2)
 )
@@ -165,6 +120,97 @@ def _optional_text(value: object, maximum_length: int) -> str | None:
     return value
 
 
+def validate_public_fhir_formulary_coverage(
+    coverage: object,
+) -> PublicFHIRFormularyCoverage | None:
+    """Require one arithmetically complete aggregate, or not-applicable null."""
+
+    if coverage is None:
+        return None
+    if type(coverage) is not PublicFHIRFormularyCoverage:
+        raise FHIRFormularyServingUnavailableError(
+            "FHIR formulary coverage evidence is invalid"
+        )
+    expected = coverage.expected_artifact_count
+    included = coverage.included_artifact_count
+    missing = coverage.missing_artifact_count
+    expected_status = "complete" if missing == 0 else "partial"
+    if (
+        type(expected) is not int
+        or type(included) is not int
+        or type(missing) is not int
+        or expected <= 0
+        or not 1 <= included <= expected
+        or missing != expected - included
+        or coverage.status != expected_status
+    ):
+        raise FHIRFormularyServingUnavailableError(
+            "FHIR formulary coverage evidence is invalid"
+        )
+    return coverage
+
+
+def _coverage_from_record(
+    coverage_record: Mapping[str, Any],
+) -> PublicFHIRFormularyCoverage | None:
+    coverage_required = coverage_record.get("coverage_required")
+    expected = coverage_record.get("coverage_expected_artifact_count")
+    receipt_expected = coverage_record.get(
+        "coverage_receipt_expected_artifact_count"
+    )
+    included = coverage_record.get("coverage_included_artifact_count")
+    missing = coverage_record.get("coverage_missing_artifact_count")
+    if type(coverage_required) is not bool:
+        raise FHIRFormularyServingUnavailableError(
+            "FHIR formulary coverage evidence is invalid"
+        )
+    if not coverage_required:
+        if any(
+            coverage_field is not None
+            for coverage_field in (expected, receipt_expected, included, missing)
+        ):
+            raise FHIRFormularyServingUnavailableError(
+                "FHIR formulary coverage evidence is invalid"
+            )
+        return None
+    if (
+        type(expected) is not int
+        or type(receipt_expected) is not int
+        or expected != receipt_expected
+    ):
+        raise FHIRFormularyServingUnavailableError(
+            "FHIR formulary coverage evidence is invalid"
+        )
+    return validate_public_fhir_formulary_coverage(
+        PublicFHIRFormularyCoverage(
+            status="complete" if missing == 0 else "partial",
+            expected_artifact_count=expected,
+            included_artifact_count=included,
+            missing_artifact_count=missing,
+        )
+    )
+
+
+def public_fhir_formulary_coverage_payload(
+    coverage: PublicFHIRFormularyCoverage | None,
+) -> dict[str, object] | None:
+    """Serialize one source-hidden official-artifact aggregate."""
+
+    validated_coverage = validate_public_fhir_formulary_coverage(coverage)
+    if validated_coverage is None:
+        return None
+    return {
+        "status": validated_coverage.status,
+        "expected_artifact_count": (
+            validated_coverage.expected_artifact_count
+        ),
+        "included_artifact_count": (
+            validated_coverage.included_artifact_count
+        ),
+        "missing_artifact_count": validated_coverage.missing_artifact_count,
+    }
+
+
 def _detail_from_record(record: Mapping[str, Any]) -> PublicFHIRFormularyDetail:
     formulary_id = record.get("formulary_id")
     if (
@@ -184,6 +230,11 @@ def _detail_from_record(record: Mapping[str, Any]) -> PublicFHIRFormularyDetail:
         last_updated=_required_timestamp(record.get("last_updated")),
         as_of=_required_timestamp(record.get("as_of")),
         published_at=_required_timestamp(record.get("published_at")),
+        coverage=(
+            validate_public_fhir_formulary_coverage(record.get("coverage"))
+            if "coverage" in record
+            else _coverage_from_record(record)
+        ),
     )
 
 
@@ -244,6 +295,7 @@ def public_fhir_formulary_payload(
             "last_updated": detail.last_updated,
             "as_of": detail.as_of,
             "published_at": detail.published_at,
+            "coverage": detail.coverage,
         }
     )
     period_by_field = None
@@ -272,6 +324,9 @@ def public_fhir_formulary_payload(
         "last_updated": _timestamp_text(validated_detail.last_updated),
         "as_of": _timestamp_text(validated_detail.as_of),
         "published_at": _timestamp_text(validated_detail.published_at),
+        "coverage": public_fhir_formulary_coverage_payload(
+            validated_detail.coverage
+        ),
     }
 
 
@@ -283,8 +338,11 @@ __all__ = (
     "FHIRFormularyInvalidRequestError",
     "FHIRFormularyNotFoundError",
     "FHIRFormularyServingUnavailableError",
+    "PublicFHIRFormularyCoverage",
     "PublicFHIRFormularyDetail",
     "is_fhir_formulary_serving_enabled",
+    "public_fhir_formulary_coverage_payload",
     "public_fhir_formulary_payload",
     "read_current_fhir_formulary",
+    "validate_public_fhir_formulary_coverage",
 )

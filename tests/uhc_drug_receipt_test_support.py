@@ -11,9 +11,19 @@ from process.formulary_fhir.repository_shared import DatasetRef
 from process.formulary_fhir.repository_shared import DatasetVerification
 from process.formulary_fhir.source import EnabledSourceBinding
 from process.formulary_fhir.source import LIBRARY_ONLY_LAUNCH_MODE
+from process.formulary_fhir.source_artifact_contract import (
+    VerifiedSourceArtifactSet,
+)
+from process.formulary_fhir.source_artifact_contract import artifact_set_sha256
+from process.formulary_fhir.uhc_drug_acquisition import (
+    UHCDrugArtifactAcquisitionResult,
+)
 from process.formulary_fhir.uhc_drug_parser_contract import UHCDrugSpoolEvidence
 from process.formulary_fhir.uhc_drug_receipt import UHCDrugAdmissionReceipt
 from process.formulary_fhir.uhc_drug_receipt import uhc_drug_receipt_id
+from process.formulary_fhir.uhc_drug_receipt_store import (
+    UHC_DRUG_PARTIAL_EXCLUSION_CODE,
+)
 from process.formulary_fhir.uhc_drug_sync_contract import (
     UHCDrugSynchronizationResult,
 )
@@ -43,19 +53,22 @@ def source_binding() -> EnabledSourceBinding:
 
 
 def _spool_evidence(artifacts) -> UHCDrugSpoolEvidence:
+    file_count = len(artifacts.artifacts)
     return UHCDrugSpoolEvidence(
         source_id=artifacts.source_id,
         source_file_set_sha256=artifacts.source_file_set_sha256,
         artifact_set_sha256=artifacts.artifact_set_sha256,
         spool_content_sha256="9" * 64,
-        file_count=48,
-        raw_record_count=48,
-        raw_plan_entry_count=48,
+        file_count=file_count,
+        raw_record_count=file_count,
+        raw_plan_entry_count=file_count,
         plan_count=2,
         medication_membership_count=5,
         duplicate_count=0,
         superseded_count=0,
         max_last_updated_at=CUTOFF,
+        expected_file_count=48,
+        excluded_file_count=48 - file_count,
     )
 
 
@@ -106,10 +119,22 @@ def _twin_admission(
     )
 
 
-def admitted_twin():
+def admitted_twin(*, selected_file_count: int = 48):
     """Build one internally consistent admitted twin and artifact set."""
 
-    artifacts, _bodies_by_name = artifact_set()
+    if not 1 <= selected_file_count <= 48:
+        raise ValueError("selected file count is invalid")
+    full_artifacts, _bodies_by_name = artifact_set()
+    selected_artifacts = full_artifacts.artifacts[:selected_file_count]
+    artifacts = VerifiedSourceArtifactSet(
+        source_id=full_artifacts.source_id,
+        source_file_set_sha256=full_artifacts.source_file_set_sha256,
+        raw_listing_projection_sha256=(
+            full_artifacts.raw_listing_projection_sha256
+        ),
+        artifacts=selected_artifacts,
+        artifact_set_sha256=artifact_set_sha256(selected_artifacts),
+    )
     evidence = _spool_evidence(artifacts)
     contract_hash = uhc_drug_sync_contract_hash(
         source_binding(),
@@ -155,6 +180,41 @@ def admitted_twin():
     return UHCDrugTwinResult(admission, baseline_result, candidate_result), artifacts
 
 
+def artifact_acquisition_result(
+    artifacts: VerifiedSourceArtifactSet,
+    *,
+    observation_sha256: str = OBSERVATION_SHA256,
+    downloaded_file_count: int = 0,
+    downloaded_byte_count: int = 0,
+) -> UHCDrugArtifactAcquisitionResult:
+    """Bind one selected artifact set to its canonical omitted complement."""
+
+    full_artifacts, _bodies_by_name = artifact_set()
+    selected_ids = {
+        artifact.identity.source_file_id for artifact in artifacts.artifacts
+    }
+    excluded_ids = tuple(
+        artifact.identity.source_file_id
+        for artifact in full_artifacts.artifacts
+        if artifact.identity.source_file_id not in selected_ids
+    )
+    file_count = len(artifacts.artifacts)
+    return UHCDrugArtifactAcquisitionResult(
+        source_id=artifacts.source_id,
+        source_observation_sha256=observation_sha256,
+        source_file_set_sha256=artifacts.source_file_set_sha256,
+        artifact_set_sha256=artifacts.artifact_set_sha256,
+        file_count=file_count,
+        downloaded_file_count=downloaded_file_count,
+        reused_file_count=file_count - downloaded_file_count,
+        downloaded_byte_count=downloaded_byte_count,
+        artifacts=artifacts,
+        expected_file_count=48,
+        excluded_file_count=48 - file_count,
+        excluded_source_file_ids=excluded_ids,
+    )
+
+
 def admission_receipt(
     twin_result: UHCDrugTwinResult,
     *,
@@ -164,6 +224,16 @@ def admission_receipt(
 
     admission = twin_result.admission
     evidence = twin_result.candidate.evidence
+    full_artifacts, _bodies_by_name = artifact_set()
+    selected_ids = tuple(
+        artifact.identity.source_file_id
+        for artifact in full_artifacts.artifacts[: evidence.file_count]
+    )
+    exclusion_code = (
+        None
+        if evidence.is_coverage_complete
+        else UHC_DRUG_PARTIAL_EXCLUSION_CODE
+    )
     receipt_id = uhc_drug_receipt_id(
         admission.source_id,
         admission.candidate_dataset_id,
@@ -171,6 +241,8 @@ def admission_receipt(
         evidence.source_file_set_sha256,
         evidence.artifact_set_sha256,
         evidence.spool_content_sha256,
+        selected_source_file_ids_value=selected_ids,
+        exclusion_code=exclusion_code,
     )
     return UHCDrugAdmissionReceipt(
         receipt_id=receipt_id,
@@ -178,6 +250,10 @@ def admission_receipt(
         artifact_set_sha256=evidence.artifact_set_sha256,
         admission=admission,
         evidence=evidence,
+        selected_source_file_ids=selected_ids,
+        expected_file_count=evidence.expected_file_count,
+        excluded_file_count=evidence.excluded_file_count,
+        exclusion_code=exclusion_code,
         recorded_at=max(ADMITTED_AT, admission.admitted_at) + dt.timedelta(seconds=1),
     )
 
@@ -188,5 +264,6 @@ __all__ = (
     "OBSERVATION_SHA256",
     "admission_receipt",
     "admitted_twin",
+    "artifact_acquisition_result",
     "source_binding",
 )

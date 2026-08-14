@@ -27,6 +27,10 @@ SPOOL_EVIDENCE_FIELDS = frozenset(
         "superseded_count",
     }
 )
+PARTIAL_SPOOL_EVIDENCE_FIELDS = SPOOL_EVIDENCE_FIELDS | {
+    "excluded_file_count",
+    "expected_file_count",
+}
 SPOOL_ARTIFACT_PROOF_FIELDS = frozenset(
     {
         "artifact_sha256",
@@ -64,7 +68,7 @@ def spool_evidence_payload(
 
     if type(evidence) is not UHCDrugSpoolEvidence:
         raise ValueError("UHC drug spool evidence is invalid")
-    return {
+    payload = {
         "artifact_set_sha256": evidence.artifact_set_sha256,
         "duplicate_count": evidence.duplicate_count,
         "file_count": evidence.file_count,
@@ -77,11 +81,20 @@ def spool_evidence_payload(
         "source_id": evidence.source_id,
         "superseded_count": evidence.superseded_count,
     }
+    if not evidence.is_coverage_complete:
+        payload.update(
+            {
+                "excluded_file_count": evidence.excluded_file_count,
+                "expected_file_count": evidence.expected_file_count,
+            }
+        )
+    return payload
 
 
 __all__ = (
     "SPOOL_ARTIFACT_PROOF_FIELDS",
     "SPOOL_EVIDENCE_FIELDS",
+    "PARTIAL_SPOOL_EVIDENCE_FIELDS",
     "artifact_proof_rows",
     "spool_evidence_payload",
 )

@@ -25,6 +25,13 @@ ENABLED_ENVIRONMENT = {
     serving.FHIR_FORMULARY_SERVING_ENABLED_ENV: "true",
     cursor.FHIR_FORMULARY_CURSOR_KEY_ENV: CURSOR_KEY,
 }
+NO_COVERAGE = {
+    "coverage_required": False,
+    "coverage_expected_artifact_count": None,
+    "coverage_receipt_expected_artifact_count": None,
+    "coverage_included_artifact_count": None,
+    "coverage_missing_artifact_count": None,
+}
 
 
 def _detail_record(formulary_id: str):
@@ -38,6 +45,7 @@ def _detail_record(formulary_id: str):
         "last_updated": PUBLISHED_AT,
         "as_of": PUBLISHED_AT,
         "published_at": PUBLISHED_AT,
+        **NO_COVERAGE,
     }
 
 

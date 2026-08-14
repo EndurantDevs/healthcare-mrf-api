@@ -180,7 +180,6 @@ def _canonical_resource_json(resource_by_field: dict[str, Any]) -> str:
         ):
             raise ValueError
     except (
-        MemoryError,
         OverflowError,
         RecursionError,
         TypeError,
@@ -232,7 +231,7 @@ def _validate_resource_npi(resource_by_field: dict[str, Any], requested_npi: int
         raise UHCFlexPractitionerQueryError("resource_npi_invalid")
 
 
-def _bundle_entries(bundle_by_field: dict[str, Any]) -> list[dict[str, Any]]:
+def _bundle_entries(bundle_by_field: dict[str, Any]) -> list[Any]:
     if "entry" not in bundle_by_field:
         return []
     raw_entries = bundle_by_field["entry"]
@@ -240,8 +239,6 @@ def _bundle_entries(bundle_by_field: dict[str, Any]) -> list[dict[str, Any]]:
         raise UHCFlexPractitionerQueryError("entry_invalid")
     if len(raw_entries) > UHC_FLEX_PRACTITIONER_QUERY_COUNT:
         raise UHCFlexPractitionerQueryError("result_cap_exceeded")
-    if any(type(entry_by_field) is not dict for entry_by_field in raw_entries):
-        raise UHCFlexPractitionerQueryError("entry_invalid")
     return raw_entries
 
 
@@ -276,7 +273,9 @@ def _validate_bundle_total(
         raise UHCFlexPractitionerQueryError("total_mismatch")
 
 
-def _entry_practitioner(entry_by_field: dict[str, Any]) -> dict[str, Any]:
+def _entry_practitioner(entry_by_field: object) -> dict[str, Any]:
+    if type(entry_by_field) is not dict:
+        raise UHCFlexPractitionerQueryError("entry_invalid")
     resource_by_field = entry_by_field.get("resource")
     if type(resource_by_field) is not dict:
         raise UHCFlexPractitionerQueryError("entry_invalid")
@@ -289,32 +288,28 @@ def _entry_practitioner(entry_by_field: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validated_resource_json_rows(
-    entries: list[dict[str, Any]],
+    entries: list[Any],
     requested_npi: int,
 ) -> tuple[tuple[str, str], ...]:
     canonical_json_by_id: dict[str, str] = {}
-    admitted_resource_ids: set[str] = set()
+    conflicting_resource_ids: set[str] = set()
     for entry_by_field in entries:
-        resource_by_field = _entry_practitioner(entry_by_field)
         try:
+            resource_by_field = _entry_practitioner(entry_by_field)
             _validate_resource_npi(resource_by_field, requested_npi)
-        except UHCFlexPractitionerQueryError as error:
-            if error.code not in {
-                "cross_npi",
-                "payload_invalid",
-                "requested_npi_missing",
-                "resource_npi_invalid",
-            }:
-                raise
+            resource_id = _resource_id(resource_by_field)
+            canonical_json = _canonical_resource_json(resource_by_field)
+        except UHCFlexPractitionerQueryError:
             continue
-        resource_id = _resource_id(resource_by_field)
-        canonical_json = _canonical_resource_json(resource_by_field)
+        if resource_id in conflicting_resource_ids:
+            continue
         previous_json = canonical_json_by_id.get(resource_id)
         if previous_json is not None and previous_json != canonical_json:
-            raise UHCFlexPractitionerQueryError("duplicate_resource_conflict")
+            del canonical_json_by_id[resource_id]
+            conflicting_resource_ids.add(resource_id)
+            continue
         canonical_json_by_id[resource_id] = canonical_json
-        admitted_resource_ids.add(resource_id)
-    return tuple((key, canonical_json_by_id[key]) for key in sorted(admitted_resource_ids))
+    return tuple(sorted(canonical_json_by_id.items()))
 
 
 def _query_result_sha256(

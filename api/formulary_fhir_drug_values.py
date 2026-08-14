@@ -12,9 +12,12 @@ from api.formulary_fhir_catalog import FHIR_FORMULARY_ALIAS_ID_PATTERN
 from api.formulary_fhir_serving import FHIR_FORMULARY_PUBLIC_ID_PATTERN
 from api.formulary_fhir_serving import FHIRFormularyInvalidRequestError
 from api.formulary_fhir_serving import FHIRFormularyServingUnavailableError
+from api.formulary_fhir_serving import PublicFHIRFormularyCoverage
 from api.formulary_fhir_serving import _optional_text
 from api.formulary_fhir_serving import _required_timestamp
 from api.formulary_fhir_serving import _timestamp_text
+from api.formulary_fhir_serving import public_fhir_formulary_coverage_payload
+from api.formulary_fhir_serving import validate_public_fhir_formulary_coverage
 
 
 FHIR_FORMULARY_DRUG_ID_PATTERN = re.compile(r"^ffm_[0-9a-f]{48}$")
@@ -90,6 +93,7 @@ class CurrentFHIRFormularyAliasContext:
     alias_version_id: str
     generation: int
     published_at: dt.datetime
+    coverage: PublicFHIRFormularyCoverage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +121,7 @@ class PublicFHIRFormularyDrug:
     step_therapy: bool | None
     quantity_limit: bool | None
     alternatives: PublicFHIRFormularyAlternatives
+    coverage: PublicFHIRFormularyCoverage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +223,7 @@ def validate_public_fhir_formulary_drug(
         alternatives=validate_public_fhir_formulary_alternatives(
             drug.alternatives
         ),
+        coverage=validate_public_fhir_formulary_coverage(drug.coverage),
     )
 
 
@@ -245,6 +251,9 @@ def public_fhir_formulary_drug_payload(
             "resolved_drug_ids": list(alternatives.resolved_drug_ids),
             "unresolved_count": alternatives.unresolved_count,
         },
+        "coverage": public_fhir_formulary_coverage_payload(
+            validated_drug.coverage
+        ),
     }
 
 

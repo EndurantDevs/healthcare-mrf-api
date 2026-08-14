@@ -27,6 +27,13 @@ ENABLED_ENVIRONMENT = {
     serving.FHIR_FORMULARY_SERVING_ENABLED_ENV: "true",
     cursor.FHIR_FORMULARY_CURSOR_KEY_ENV: CURSOR_KEY,
 }
+NO_COVERAGE = {
+    "coverage_required": False,
+    "coverage_expected_artifact_count": None,
+    "coverage_receipt_expected_artifact_count": None,
+    "coverage_included_artifact_count": None,
+    "coverage_missing_artifact_count": None,
+}
 EMPTY_FILTERS = drug_values.FHIRFormularyDrugFilters()
 
 
@@ -39,6 +46,7 @@ def _context_record(**changes):
         "alias_version_id": ALIAS_VERSION_ID,
         "generation": 1,
         "published_at": PUBLISHED_AT,
+        **NO_COVERAGE,
     }
     context_by_field.update(changes)
     return context_by_field

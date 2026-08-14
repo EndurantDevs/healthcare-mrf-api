@@ -288,6 +288,29 @@ def test_artifact_record_census_and_spool_metadata_are_recomputed(
         spool._spool_evidence(CountConnection(), artifacts, census, None)
 
 
+@pytest.mark.parametrize("local_error", [TypeError("type bug"), KeyError("key bug")])
+def test_source_record_generator_preserves_local_normalizer_failures(
+    monkeypatch,
+    local_error,
+) -> None:
+    artifacts, _bodies = artifact_set()
+    input_file = io.BytesIO(json.dumps([source_record()]).encode())
+    monkeypatch.setattr(
+        spool,
+        "normalized_uhc_drug_memberships",
+        lambda *_arguments: (_ for _ in ()).throw(local_error),
+    )
+
+    with pytest.raises(type(local_error)):
+        tuple(
+            spool.normalized_uhc_drug_source_records(
+                artifacts.artifacts[0],
+                input_file,
+                None,
+            )
+        )
+
+
 def test_materializer_removes_destination_when_connect_fails(
     monkeypatch,
     tmp_path,

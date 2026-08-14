@@ -42,6 +42,11 @@ def _formulary_detail():
             "last_updated": PUBLISHED_AT,
             "as_of": PUBLISHED_AT,
             "published_at": PUBLISHED_AT,
+            "coverage_required": False,
+            "coverage_expected_artifact_count": None,
+            "coverage_receipt_expected_artifact_count": None,
+            "coverage_included_artifact_count": None,
+            "coverage_missing_artifact_count": None,
         }
     )
 

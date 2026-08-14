@@ -47,6 +47,14 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVING_INDEX_PATH = ROOT / "alembic" / "versions" / (
     "20260808160000_fhir_formulary_serving_index.py"
 )
+COVERAGE_MIGRATION_PATHS = tuple(
+    ROOT / "alembic" / "versions" / migration_name
+    for migration_name in (
+        "20260810030000_fhir_formulary_source_artifact.py",
+        "20260810040000_fhir_formulary_uhc_admission_receipt.py",
+        "20260814010000_fhir_formulary_uhc_selected_receipt.py",
+    )
+)
 FIRST_CUTOFF = dt.datetime(2026, 8, 7, 6, tzinfo=dt.UTC)
 PENDING_CUTOFF = dt.datetime(2026, 8, 7, 7, tzinfo=dt.UTC)
 PLAN_ALIASES = (
@@ -331,6 +339,16 @@ async def _prepare_published_graph(
         schema_name,
         migration_engine,
     )
+    for index, migration_path in enumerate(COVERAGE_MIGRATION_PATHS):
+        coverage_migration = load_migration(
+            migration_path,
+            f"formulary_collections_coverage_{index}",
+        )
+        await _run_migration_action(
+            migration_engine,
+            coverage_migration,
+            "upgrade",
+        )
     serving_migration = load_migration(
         SERVING_INDEX_PATH,
         "formulary_collections_serving_index",

@@ -24,8 +24,10 @@ from tests.uhc_drug_receipt_test_support import source_binding
 PUBLISHED_AT = ADMITTED_AT + dt.timedelta(minutes=1)
 
 
-def _publication_inputs():
-    twin_result, artifacts = admitted_twin()
+def _publication_inputs(*, selected_file_count: int = 48):
+    twin_result, artifacts = admitted_twin(
+        selected_file_count=selected_file_count
+    )
     receipt = admission_receipt(twin_result)
     admission = receipt.admission
     candidate = DatasetRef(
@@ -226,3 +228,31 @@ async def test_publication_replay_returns_same_generation(monkeypatch):
         publication_inputs.candidate,
         publication_inputs.candidate,
     ]
+
+
+@pytest.mark.asyncio
+async def test_partial_receipt_publishes_only_its_selected_candidate(monkeypatch):
+    """Receipt-only publication treats a reproduced partial root like any admission."""
+
+    publication_inputs = _publication_inputs(selected_file_count=1)
+    receipt = publication_inputs.receipt
+    publication = PublicationResult(
+        receipt.source_id,
+        receipt.candidate_dataset_id,
+        1,
+        PUBLISHED_AT,
+    )
+    repository = _Repository(publication)
+    _install_release_boundaries(monkeypatch, publication_inputs, [])
+
+    observed = await release.publish_admitted_uhc_drug_candidate(
+        receipt_id=receipt.receipt_id,
+        database=object(),
+        repository=repository,
+    )
+
+    assert receipt.expected_file_count == 48
+    assert receipt.excluded_file_count == 47
+    assert receipt.is_coverage_complete is False
+    assert observed == publication
+    assert repository.published_candidates == [publication_inputs.candidate]

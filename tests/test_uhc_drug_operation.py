@@ -7,7 +7,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -19,6 +18,7 @@ from process.formulary_fhir.uhc_drug_receipt import UHCDrugRecordedAdmission
 import process.formulary_fhir.uhc_drug_publish_operation as publish_operation
 from tests.uhc_drug_receipt_test_support import admission_receipt
 from tests.uhc_drug_receipt_test_support import admitted_twin
+from tests.uhc_drug_receipt_test_support import artifact_acquisition_result
 
 
 PAST_CUTOFF = dt.datetime(2026, 8, 9, 12, tzinfo=dt.UTC)
@@ -43,15 +43,11 @@ def _acquisition_fixture():
     twin_result, artifacts = admitted_twin()
     receipt = admission_receipt(twin_result)
     admission = twin_result.admission
-    acquisition = SimpleNamespace(
-        source_observation_sha256=receipt.source_observation_sha256,
-        source_file_set_sha256=artifacts.source_file_set_sha256,
-        artifact_set_sha256=artifacts.artifact_set_sha256,
-        file_count=48,
+    acquisition = artifact_acquisition_result(
+        artifacts,
+        observation_sha256=receipt.source_observation_sha256,
         downloaded_file_count=7,
-        reused_file_count=41,
         downloaded_byte_count=12345,
-        artifacts=artifacts,
     )
     identities = operation.UHCDrugRunIdentities(
         admission.baseline_run_id,
@@ -233,9 +229,10 @@ async def test_acquisition_returns_full_receipt_bound_evidence(
     receipt = recorded.receipt
     admission = recorded.twin_result.admission
 
+    database = object()
     operation_result = await acquire_operation.acquire_and_admit_uhc_drugs(
         raw_set_sha256="a" * 64,
-        database=object(),
+        database=database,
     )
     response_by_field = json.loads(
         operation.admission_result_json(operation_result)
@@ -252,6 +249,46 @@ async def test_acquisition_returns_full_receipt_bound_evidence(
     assert response_by_field["downloaded_file_count"] == 7
     assert response_by_field["reused_file_count"] == 41
     assert response_by_field["downloaded_byte_count"] == 12345
+    assert response_by_field["coverage"] == {
+        "status": "complete",
+        "expected_artifact_count": 48,
+        "included_artifact_count": 48,
+        "missing_artifact_count": 0,
+    }
+    acquire_operation.verify_and_record_uhc_drug_twins.assert_awaited_once_with(
+        acquisition=acquisition,
+        baseline_run_id=identities.baseline_run_id,
+        candidate_run_id=identities.candidate_run_id,
+        cutoff=identities.cutoff_at,
+        work_directory=operation.uhc_drug_work_directory(),
+        database=database,
+    )
+
+
+def test_partial_receipt_output_reports_only_aggregate_coverage() -> None:
+    """A selected receipt is truthful without exposing omitted identities."""
+
+    twin_result, _artifacts = admitted_twin(selected_file_count=47)
+    receipt = admission_receipt(twin_result)
+    evidence = operation.receipt_operation_evidence(receipt)
+    result = operation.UHCDrugAdmissionOperationResult(
+        evidence=evidence,
+        downloaded_file_count=1,
+        reused_file_count=46,
+        downloaded_byte_count=123,
+    )
+
+    response_by_field = json.loads(operation.admission_result_json(result))
+
+    assert response_by_field["file_count"] == 47
+    assert response_by_field["coverage"] == {
+        "status": "partial",
+        "expected_artifact_count": 48,
+        "included_artifact_count": 47,
+        "missing_artifact_count": 1,
+    }
+    assert "selected_source_file_ids" not in response_by_field
+    assert "exclusion_code" not in response_by_field
 
 
 @pytest.mark.asyncio

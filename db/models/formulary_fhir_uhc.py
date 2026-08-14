@@ -14,6 +14,7 @@ from sqlalchemy import String
 from sqlalchemy import TIMESTAMP
 from sqlalchemy import text
 from sqlalchemy import UniqueConstraint
+from sqlalchemy.dialects.postgresql import ARRAY
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -29,6 +30,7 @@ class FHIRFormularyUHCAdmissionReceipt(Base, JSONOutputMixin):
 
     __tablename__ = "fhir_formulary_uhc_admission_receipt"
     __main_table__ = __tablename__
+    EXCLUDE_FIELDS = ("selected_source_file_ids",)
     __table_args__ = _table_args(
         PrimaryKeyConstraint("receipt_id"),
         UniqueConstraint(
@@ -78,7 +80,13 @@ class FHIRFormularyUHCAdmissionReceipt(Base, JSONOutputMixin):
             "source_file_set_sha256 ~ '^[0-9a-f]{64}$' AND "
             "artifact_set_sha256 ~ '^[0-9a-f]{64}$' AND "
             "spool_content_sha256 ~ '^[0-9a-f]{64}$' AND "
-            "file_count = 48 AND raw_record_count > 0 AND "
+            "expected_file_count = 48 AND file_count BETWEEN 1 AND 48 AND "
+            "excluded_file_count = expected_file_count - file_count AND "
+            "cardinality(selected_source_file_ids) = file_count AND "
+            "((excluded_file_count = 0 AND exclusion_code IS NULL) OR "
+            "(excluded_file_count > 0 AND "
+            "exclusion_code = 'not_selected')) AND "
+            "raw_record_count > 0 AND "
             "raw_plan_entry_count > 0 AND plan_count > 0 AND "
             "medication_membership_count > 0 AND duplicate_count >= 0 AND "
             "superseded_count >= 0 AND isfinite(max_last_updated_at) AND "
@@ -98,6 +106,18 @@ class FHIRFormularyUHCAdmissionReceipt(Base, JSONOutputMixin):
     candidate_dataset_id = Column(String(64), nullable=False)
     spool_content_sha256 = Column(String(64), nullable=False)
     file_count = Column(Integer, nullable=False)
+    expected_file_count = Column(
+        Integer,
+        server_default=text("48"),
+        nullable=False,
+    )
+    excluded_file_count = Column(
+        Integer,
+        server_default=text("0"),
+        nullable=False,
+    )
+    selected_source_file_ids = Column(ARRAY(String(64)), nullable=False)
+    exclusion_code = Column(String(32))
     raw_record_count = Column(BigInteger, nullable=False)
     raw_plan_entry_count = Column(BigInteger, nullable=False)
     plan_count = Column(BigInteger, nullable=False)

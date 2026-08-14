@@ -11,12 +11,14 @@ from process.formulary_fhir.repository_admission import ADMISSION_COLUMNS
 from process.formulary_fhir.repository_admission_types import TwinAdmissionResult
 from process.formulary_fhir.repository_admission_types import result_from_row
 from process.formulary_fhir.repository_shared import row_mapping
+from process.formulary_fhir.repository_shared import strict_hash
 from process.formulary_fhir.repository_shared import strict_text
 from process.formulary_fhir.repository_shared import table_name
 from process.formulary_fhir.uhc_drug_parser_contract import UHCDrugSpoolEvidence
 
 
 UHC_DRUG_RECEIPT_ID_PATTERN = re.compile(r"ffur_[0-9a-f]{48}\Z")
+UHC_DRUG_PARTIAL_EXCLUSION_CODE = "not_selected"
 
 _RECEIPT_COLUMNS = (
     "receipt_id",
@@ -27,6 +29,10 @@ _RECEIPT_COLUMNS = (
     "candidate_dataset_id",
     "spool_content_sha256",
     "file_count",
+    "expected_file_count",
+    "excluded_file_count",
+    "selected_source_file_ids",
+    "exclusion_code",
     "raw_record_count",
     "raw_plan_entry_count",
     "plan_count",
@@ -36,6 +42,22 @@ _RECEIPT_COLUMNS = (
     "max_last_updated_at",
     "recorded_at",
 )
+
+
+def selected_source_file_ids(selected_ids: object) -> tuple[str, ...]:
+    """Normalize one private canonical artifact selection from storage."""
+
+    if type(selected_ids) is list:
+        selected_ids = tuple(selected_ids)
+    if (
+        type(selected_ids) is not tuple
+        or not 1 <= len(selected_ids) <= 48
+        or len(set(selected_ids)) != len(selected_ids)
+    ):
+        raise ValueError("UHC drug receipt artifact selection is invalid")
+    for source_file_id in selected_ids:
+        strict_hash(source_file_id, "receipt source file id")
+    return selected_ids
 
 
 class UHCDrugReceiptStoreError(RuntimeError):
@@ -119,20 +141,27 @@ async def insert_uhc_receipt(
     admission: TwinAdmissionResult,
     evidence: UHCDrugSpoolEvidence,
     *,
+    selected_source_file_ids_value: tuple[str, ...],
+    exclusion_code: str | None,
     database: Any,
 ) -> None:
     """Insert one receipt if absent; semantic readback resolves conflicts."""
 
+    selected_ids = selected_source_file_ids(selected_source_file_ids_value)
     await database.status(
         f"INSERT INTO {table_name('fhir_formulary_uhc_admission_receipt')} ("
         "receipt_id, source_id, source_observation_sha256, "
         "source_file_set_sha256, artifact_set_sha256, candidate_dataset_id, "
-        "spool_content_sha256, file_count, raw_record_count, "
+        "spool_content_sha256, file_count, expected_file_count, "
+        "excluded_file_count, selected_source_file_ids, exclusion_code, "
+        "raw_record_count, "
         "raw_plan_entry_count, plan_count, medication_membership_count, "
         "duplicate_count, superseded_count, max_last_updated_at) VALUES ("
         ":receipt_id, :source_id, :source_observation_sha256, "
         ":source_file_set_sha256, :artifact_set_sha256, "
         ":candidate_dataset_id, :spool_content_sha256, :file_count, "
+        ":expected_file_count, :excluded_file_count, "
+        ":selected_source_file_ids, :exclusion_code, "
         ":raw_record_count, :raw_plan_entry_count, :plan_count, "
         ":medication_membership_count, :duplicate_count, :superseded_count, "
         ":max_last_updated_at) ON CONFLICT DO NOTHING;",
@@ -144,6 +173,10 @@ async def insert_uhc_receipt(
         candidate_dataset_id=admission.candidate_dataset_id,
         spool_content_sha256=evidence.spool_content_sha256,
         file_count=evidence.file_count,
+        expected_file_count=evidence.expected_file_count,
+        excluded_file_count=evidence.excluded_file_count,
+        selected_source_file_ids=selected_ids,
+        exclusion_code=exclusion_code,
         raw_record_count=evidence.raw_record_count,
         raw_plan_entry_count=evidence.raw_plan_entry_count,
         plan_count=evidence.plan_count,
@@ -158,6 +191,8 @@ __all__ = (
     "insert_uhc_receipt",
     "load_uhc_receipt_admission",
     "load_uhc_receipt_row",
+    "selected_source_file_ids",
     "validate_uhc_drug_receipt_id",
+    "UHC_DRUG_PARTIAL_EXCLUSION_CODE",
     "UHCDrugReceiptStoreError",
 )

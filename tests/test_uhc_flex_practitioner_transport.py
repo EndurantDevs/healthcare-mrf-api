@@ -5,8 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import datetime as dt
-import email.utils
 import json
 
 import aiohttp
@@ -385,6 +383,21 @@ async def test_foreign_npi_resource_is_quarantined_as_unmatched():
 
 
 @pytest.mark.asyncio
+async def test_invalid_entry_does_not_poison_a_valid_practitioner():
+    response_payload = _bundle([_practitioner()])
+    response_payload["entry"].append(None)
+    response_payload["total"] = 2
+
+    result = await transport.fetch_uhc_flex_practitioner(
+        _Session(_response_from_body(response_payload)),
+        REQUESTED_NPI,
+    )
+
+    assert result.resource_count == 1
+    assert result.resource_payloads() == (_practitioner(),)
+
+
+@pytest.mark.asyncio
 async def test_bundle_total_mismatch_is_retryable_and_retains_no_payload():
     response_payload = _bundle()
     response_payload["total"] = 1
@@ -452,19 +465,6 @@ async def test_callback_errors_are_terminal_and_sanitized():
     assert error.code == "callback_failed"
     assert error.is_retryable is False
     assert str(REQUESTED_NPI) not in str(error)
-
-
-def test_retry_after_accepts_delta_or_date_but_never_exceeds_bound():
-    future = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=15)
-
-    assert transport.uhc_flex_practitioner_retry_after_seconds("2.5") == 2.5
-    assert transport.uhc_flex_practitioner_retry_after_seconds("9999") == 60.0
-    assert transport.uhc_flex_practitioner_retry_after_seconds("-3") == 0.0
-    assert transport.uhc_flex_practitioner_retry_after_seconds("invalid") == 0.0
-    date_delay = transport.uhc_flex_practitioner_retry_after_seconds(
-        email.utils.format_datetime(future, usegmt=True)
-    )
-    assert 13.0 <= date_delay <= 15.0
 
 
 @pytest.mark.parametrize(

@@ -28,13 +28,18 @@ from api.formulary_fhir_serving import FHIRFormularyCursorConflictError
 from api.formulary_fhir_serving import FHIRFormularyInvalidRequestError
 from api.formulary_fhir_serving import FHIRFormularyNotFoundError
 from api.formulary_fhir_serving import FHIRFormularyServingUnavailableError
+from api.formulary_fhir_serving import PublicFHIRFormularyCoverage
+from api.formulary_fhir_serving import _coverage_from_record
 from api.formulary_fhir_serving import _required_timestamp
 from api.formulary_fhir_serving import _timestamp_text
 from api.formulary_fhir_serving import _READ_TRANSACTION_SQL
 from api.formulary_fhir_serving import is_fhir_formulary_serving_enabled
+
+
 MAX_FHIR_FORMULARY_ALTERNATIVES_PER_DRUG = 100
 _UPSTREAM_ID_PATTERN = re.compile(r"[A-Za-z0-9.-]{1,64}\Z")
 _ALIAS_VERSION_ID_PATTERN = re.compile(r"ffav_[0-9a-f]{48}\Z")
+
 
 def _records(result: Any) -> tuple[Mapping[str, Any], ...]:
     return tuple(result.mappings().all())
@@ -75,6 +80,7 @@ def _context_from_record(
         alias_version_id=alias_version_id,
         generation=generation,
         published_at=_required_timestamp(context_record.get("published_at")),
+        coverage=_coverage_from_record(context_record),
     )
 
 
@@ -98,27 +104,34 @@ async def _current_alias_context(
     return _context_from_record(context_records[0])
 
 
-def _drug_record_values(record: Mapping[str, Any]) -> tuple[str, PublicFHIRFormularyDrug]:
-    upstream_id = record.get("upstream_medication_id")
-    if type(upstream_id) is not str or _UPSTREAM_ID_PATTERN.fullmatch(upstream_id) is None:
+def _drug_record_values(
+    medication_record: Mapping[str, Any],
+    coverage: PublicFHIRFormularyCoverage | None = None,
+) -> tuple[str, PublicFHIRFormularyDrug]:
+    upstream_id = medication_record.get("upstream_medication_id")
+    if (
+        type(upstream_id) is not str
+        or _UPSTREAM_ID_PATTERN.fullmatch(upstream_id) is None
+    ):
         raise FHIRFormularyServingUnavailableError(
             "FHIR formulary medication ownership is invalid"
         )
     return upstream_id, validate_public_fhir_formulary_drug(
         PublicFHIRFormularyDrug(
-            formulary_id=record.get("formulary_id"),
-            alias_id=record.get("alias_id"),
-            drug_id=record.get("drug_id"),
-            status=record.get("status"),
-            name=record.get("name"),
-            rxnorm_id=record.get("rxnorm_id"),
-            ndc11=record.get("ndc11"),
-            last_updated=record.get("last_updated"),
-            tier=record.get("tier"),
-            prior_authorization=record.get("prior_authorization"),
-            step_therapy=record.get("step_therapy"),
-            quantity_limit=record.get("quantity_limit"),
+            formulary_id=medication_record.get("formulary_id"),
+            alias_id=medication_record.get("alias_id"),
+            drug_id=medication_record.get("drug_id"),
+            status=medication_record.get("status"),
+            name=medication_record.get("name"),
+            rxnorm_id=medication_record.get("rxnorm_id"),
+            ndc11=medication_record.get("ndc11"),
+            last_updated=medication_record.get("last_updated"),
+            tier=medication_record.get("tier"),
+            prior_authorization=medication_record.get("prior_authorization"),
+            step_therapy=medication_record.get("step_therapy"),
+            quantity_limit=medication_record.get("quantity_limit"),
             alternatives=PublicFHIRFormularyAlternatives((), 0),
+            coverage=coverage,
         )
     )
 
@@ -139,14 +152,18 @@ def _alternatives_by_drug_id(
                 "FHIR formulary alternative ownership is invalid"
             )
         total_by_drug_id[owner_drug_id] += 1
-        if total_by_drug_id[owner_drug_id] > MAX_FHIR_FORMULARY_ALTERNATIVES_PER_DRUG:
+        if (
+            total_by_drug_id[owner_drug_id]
+            > MAX_FHIR_FORMULARY_ALTERNATIVES_PER_DRUG
+        ):
             raise FHIRFormularyServingUnavailableError(
                 "FHIR formulary alternative fanout exceeds its bound"
             )
         if resolved:
             if (
                 type(target_drug_id) is not str
-                or FHIR_FORMULARY_DRUG_ID_PATTERN.fullmatch(target_drug_id) is None
+                or FHIR_FORMULARY_DRUG_ID_PATTERN.fullmatch(target_drug_id)
+                is None
             ):
                 raise FHIRFormularyServingUnavailableError(
                     "FHIR formulary resolved alternative is invalid"
@@ -172,9 +189,12 @@ async def _hydrate_drugs(
     formulary_id: str,
     alias_id: str,
     medication_rows: tuple[Mapping[str, Any], ...],
+    *,
+    coverage: PublicFHIRFormularyCoverage | None = None,
 ) -> tuple[PublicFHIRFormularyDrug, ...]:
     raw_values = tuple(
-        _drug_record_values(medication_row) for medication_row in medication_rows
+        _drug_record_values(medication_row, coverage)
+        for medication_row in medication_rows
     )
     visible_ids = tuple(drug.drug_id for _upstream_id, drug in raw_values)
     if visible_ids != tuple(sorted(set(visible_ids))):
@@ -190,22 +210,19 @@ async def _hydrate_drugs(
                     "public_id": formulary_id,
                     "alias_id": alias_id,
                     "owner_drug_ids": list(visible_ids),
-                    "alternative_limit": (
-                        len(visible_ids)
-                        * MAX_FHIR_FORMULARY_ALTERNATIVES_PER_DRUG
-                        + 1
-                    ),
+                    "alternative_limit": len(visible_ids)
+                    * MAX_FHIR_FORMULARY_ALTERNATIVES_PER_DRUG
+                    + 1,
                 },
             )
         )
-    if len(alternative_records) > len(visible_ids) * MAX_FHIR_FORMULARY_ALTERNATIVES_PER_DRUG:
+    if len(alternative_records) > (
+        len(visible_ids) * MAX_FHIR_FORMULARY_ALTERNATIVES_PER_DRUG
+    ):
         raise FHIRFormularyServingUnavailableError(
             "FHIR formulary alternative fanout exceeds its bound"
         )
-    alternatives_by_id = _alternatives_by_drug_id(
-        alternative_records,
-        visible_ids,
-    )
+    alternatives_by_id = _alternatives_by_drug_id(alternative_records, visible_ids)
     return tuple(
         PublicFHIRFormularyDrug(
             formulary_id=drug.formulary_id,
@@ -221,6 +238,7 @@ async def _hydrate_drugs(
             step_therapy=drug.step_therapy,
             quantity_limit=drug.quantity_limit,
             alternatives=alternatives_by_id[drug.drug_id],
+            coverage=drug.coverage,
         )
         for _upstream_id, drug in raw_values
     )
@@ -310,6 +328,7 @@ async def _read_drug_page(
             public_id,
             public_alias_id,
             medication_rows[:page_size],
+            coverage=context.coverage,
         )
     return current_marker, medication_rows, visible_drugs
 
@@ -388,7 +407,11 @@ async def read_current_fhir_formulary_drug(
     filters = FHIRFormularyDrugFilters()
     async with session.begin():
         await session.execute(_READ_TRANSACTION_SQL)
-        await _current_alias_context(session, public_id, public_alias_id)
+        context = await _current_alias_context(
+            session,
+            public_id,
+            public_alias_id,
+        )
         medication_rows = _records(
             await session.execute(
                 drug_statement(filters, exact_drug_id=drug_id),
@@ -412,6 +435,7 @@ async def read_current_fhir_formulary_drug(
             public_id,
             public_alias_id,
             medication_rows,
+            coverage=context.coverage,
         )
     return hydrated_drugs[0]
 

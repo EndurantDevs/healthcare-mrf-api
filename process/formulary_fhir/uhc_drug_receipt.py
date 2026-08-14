@@ -11,36 +11,28 @@ from typing import Any
 from db.models import db
 import process.formulary_fhir.manual_lock as manual_lock
 from process.formulary_fhir.repository_admission_types import TwinAdmissionResult
-from process.formulary_fhir.repository_shared import DatasetRef
-from process.formulary_fhir.repository_shared import stable_id
-from process.formulary_fhir.repository_shared import strict_hash
-from process.formulary_fhir.repository_shared import utc_timestamp
-from process.formulary_fhir.source import EnabledSourceBinding
-from process.formulary_fhir.source import require_source_unchanged
-from process.formulary_fhir.source_artifact_contract import (
-    VerifiedSourceArtifactSet,
-)
+from process.formulary_fhir.repository_shared import DatasetRef, stable_id, strict_hash, utc_timestamp
+from process.formulary_fhir.source import EnabledSourceBinding, require_source_unchanged
+from process.formulary_fhir.source_artifact_contract import VerifiedSourceArtifactSet
 from process.formulary_fhir.source_artifacts import (
     load_complete_source_artifact_set,
-)
-from process.formulary_fhir.source_artifacts import (
+    load_selected_source_artifact_set,
+    load_source_artifact_identities,
     reopen_source_artifact_set,
 )
-from process.formulary_fhir.uhc_drug_receipt_store import insert_uhc_receipt
+from process.formulary_fhir.uhc_drug_acquisition import UHCDrugArtifactAcquisitionResult
 from process.formulary_fhir.uhc_drug_receipt_store import (
+    UHC_DRUG_PARTIAL_EXCLUSION_CODE,
+    insert_uhc_receipt,
     load_uhc_receipt_admission,
-)
-from process.formulary_fhir.uhc_drug_receipt_store import load_uhc_receipt_row
-from process.formulary_fhir.uhc_drug_receipt_store import (
+    load_uhc_receipt_row,
+    selected_source_file_ids,
     validate_uhc_drug_receipt_id,
 )
 from process.formulary_fhir.uhc_drug_parser_contract import UHCDrugSpoolEvidence
-from process.formulary_fhir.uhc_drug_sync_contract import (
-    uhc_drug_sync_contract_hash,
-)
+from process.formulary_fhir.uhc_drug_sync_contract import uhc_drug_sync_contract_hash
 from process.formulary_fhir.uhc_drug_twin import UHCDrugTwinResult
-from process.formulary_fhir.uhc_source import register_uhc_formulary_source
-from process.formulary_fhir.uhc_source import UHC_FORMULARY_SOURCE_ID
+from process.formulary_fhir.uhc_source import register_uhc_formulary_source, UHC_FORMULARY_SOURCE_ID
 
 
 UHC_DRUG_RECEIPT_LOCK_WAIT_SECONDS = 5.0
@@ -54,17 +46,36 @@ def uhc_drug_receipt_id(
     source_file_set_sha256: str,
     artifact_set_sha256: str,
     spool_content_sha256: str,
+    *,
+    selected_source_file_ids_value: tuple[str, ...] | None = None,
+    exclusion_code: str | None = None,
 ) -> str:
     """Derive the one stable receipt identity for exact admitted evidence."""
 
-    return stable_id(
-        "ffur_",
-        source_id,
+    identity_parts = (
         candidate_dataset_id,
         strict_hash(source_observation_sha256, "source observation hash"),
         strict_hash(source_file_set_sha256, "source file set hash"),
         strict_hash(artifact_set_sha256, "artifact set hash"),
         strict_hash(spool_content_sha256, "spool content hash"),
+    )
+    if selected_source_file_ids_value is None:
+        if exclusion_code is not None:
+            raise ValueError("UHC drug receipt artifact selection is invalid")
+        return stable_id("ffur_", source_id, *identity_parts)
+    selected_ids = selected_source_file_ids(selected_source_file_ids_value)
+    if len(selected_ids) == 48:
+        if exclusion_code is not None:
+            raise ValueError("UHC drug receipt artifact selection is invalid")
+        return stable_id("ffur_", source_id, *identity_parts)
+    if exclusion_code != UHC_DRUG_PARTIAL_EXCLUSION_CODE:
+        raise ValueError("UHC drug receipt artifact selection is invalid")
+    return stable_id(
+        "ffur_",
+        source_id,
+        *identity_parts,
+        ",".join(selected_ids),
+        exclusion_code,
     )
 
 
@@ -77,18 +88,39 @@ class UHCDrugAdmissionReceipt:
     artifact_set_sha256: str = field(repr=False)
     admission: TwinAdmissionResult = field(repr=False)
     evidence: UHCDrugSpoolEvidence = field(repr=False)
+    selected_source_file_ids: tuple[str, ...] = field(repr=False)
+    expected_file_count: int
+    excluded_file_count: int
+    exclusion_code: str | None = field(repr=False)
     recorded_at: dt.datetime
 
     def __post_init__(self) -> None:
         admission = self.admission
         evidence = self.evidence
+        selected_ids = selected_source_file_ids(
+            self.selected_source_file_ids
+        )
         if not (
             type(admission) is TwinAdmissionResult
             and type(evidence) is UHCDrugSpoolEvidence
             and admission.source_id == UHC_FORMULARY_SOURCE_ID
             and evidence.source_id == admission.source_id
             and evidence.artifact_set_sha256 == self.artifact_set_sha256
-            and evidence.file_count == 48
+            and len(selected_ids) == evidence.file_count
+            and self.expected_file_count == evidence.expected_file_count == 48
+            and self.excluded_file_count == evidence.excluded_file_count
+            and self.excluded_file_count == 48 - evidence.file_count
+            and (
+                (
+                    self.excluded_file_count == 0
+                    and self.exclusion_code is None
+                )
+                or (
+                    self.excluded_file_count > 0
+                    and self.exclusion_code
+                    == UHC_DRUG_PARTIAL_EXCLUSION_CODE
+                )
+            )
             and evidence.plan_count == admission.verification.list_count
             and evidence.plan_count == admission.verification.alias_count
             and evidence.medication_membership_count
@@ -109,6 +141,8 @@ class UHCDrugAdmissionReceipt:
             evidence.source_file_set_sha256,
             self.artifact_set_sha256,
             evidence.spool_content_sha256,
+            selected_source_file_ids_value=selected_ids,
+            exclusion_code=self.exclusion_code,
         )
         if self.receipt_id != expected_receipt_id:
             raise ValueError("UHC drug admission receipt is inconsistent")
@@ -116,14 +150,17 @@ class UHCDrugAdmissionReceipt:
     @property
     def source_id(self) -> str:
         """Return the admitted source owner."""
-
         return self.admission.source_id
 
     @property
     def candidate_dataset_id(self) -> str:
         """Return the admitted requested dataset."""
-
         return self.admission.candidate_dataset_id
+
+    @property
+    def is_coverage_complete(self) -> bool:
+        """Return whether the receipt selected the complete 48-file census."""
+        return self.excluded_file_count == 0
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -147,6 +184,11 @@ class UHCDrugPublicationInputs:
             == self.receipt.evidence.source_file_set_sha256
             and self.artifacts.artifact_set_sha256
             == self.receipt.artifact_set_sha256
+            and tuple(
+                artifact.identity.source_file_id
+                for artifact in self.artifacts.artifacts
+            )
+            == self.receipt.selected_source_file_ids
             and self.candidate.dataset_id == admission.candidate_dataset_id
             and self.candidate.intent == "requested"
             and self.candidate.status == "verified"
@@ -205,6 +247,8 @@ def _evidence_from_row(receipt_by_field: dict[str, Any]) -> UHCDrugSpoolEvidence
             receipt_by_field.get("max_last_updated_at"),
             "stored maximum update timestamp",
         ),
+        expected_file_count=receipt_by_field.get("expected_file_count"),
+        excluded_file_count=receipt_by_field.get("excluded_file_count"),
     )
 
 
@@ -233,6 +277,12 @@ async def load_uhc_drug_admission_receipt(
             artifact_set_sha256=receipt_by_field.get("artifact_set_sha256"),
             admission=admission,
             evidence=_evidence_from_row(receipt_by_field),
+            selected_source_file_ids=selected_source_file_ids(
+                receipt_by_field.get("selected_source_file_ids")
+            ),
+            expected_file_count=receipt_by_field.get("expected_file_count"),
+            excluded_file_count=receipt_by_field.get("excluded_file_count"),
+            exclusion_code=receipt_by_field.get("exclusion_code"),
             recorded_at=utc_timestamp(
                 receipt_by_field.get("recorded_at"),
                 "stored receipt timestamp",
@@ -269,30 +319,55 @@ def _require_record_contract(
         raise RuntimeError("UHC drug admission receipt contract is inconsistent")
 
 
+async def _current_receipt_artifacts(
+    artifacts: VerifiedSourceArtifactSet, evidence: UHCDrugSpoolEvidence,
+    selected_ids: tuple[str, ...], excluded_source_file_ids: tuple[str, ...],
+    *, database: Any,
+) -> tuple[VerifiedSourceArtifactSet, str | None]:
+    if evidence.is_coverage_complete:
+        if excluded_source_file_ids:
+            raise RuntimeError("UHC drug admission receipt selection changed")
+        current_artifacts = await load_complete_source_artifact_set(
+            tuple(artifact.identity for artifact in artifacts.artifacts), database=database
+        )
+        return current_artifacts, None
+    full_identities = await load_source_artifact_identities(
+        artifacts.source_id, artifacts.source_file_set_sha256, database=database
+    )
+    selected_id_set = set(selected_ids)
+    current_excluded_source_file_ids = tuple(
+        identity.source_file_id for identity in full_identities
+        if identity.source_file_id not in selected_id_set
+    )
+    if current_excluded_source_file_ids != excluded_source_file_ids:
+        raise RuntimeError("UHC drug admission receipt selection changed")
+    current_artifacts = await load_selected_source_artifact_set(
+        full_identities,
+        selected_source_file_ids=selected_ids,
+        require_unselected_pending=False,
+        database=database,
+    )
+    return current_artifacts, UHC_DRUG_PARTIAL_EXCLUSION_CODE
+
 async def _record_receipt_under_lease(
-    *,
-    source_observation_sha256: str,
-    artifacts: VerifiedSourceArtifactSet,
+    *, acquisition: UHCDrugArtifactAcquisitionResult,
     twin_result: UHCDrugTwinResult,
     database: Any,
 ) -> UHCDrugAdmissionReceipt:
     """Record exact UHC evidence while the caller owns the source lease."""
-
-    observation_hash = strict_hash(
-        source_observation_sha256,
-        "source observation hash",
-    )
+    observation_hash = acquisition.source_observation_sha256
+    artifacts = acquisition.artifacts
     binding = await register_uhc_formulary_source(database=database)
-    current_artifacts = await load_complete_source_artifact_set(
-        tuple(artifact.identity for artifact in artifacts.artifacts),
+    selected_ids = tuple(artifact.identity.source_file_id for artifact in artifacts.artifacts)
+    current_artifacts, exclusion_code = await _current_receipt_artifacts(
+        artifacts, twin_result.candidate.evidence, selected_ids,
+        acquisition.excluded_source_file_ids,
         database=database,
     )
     if current_artifacts != artifacts:
         raise RuntimeError("UHC drug admission receipt artifacts changed")
     stored_admission = await load_uhc_receipt_admission(
-        twin_result.admission.source_id,
-        twin_result.admission.candidate_dataset_id,
-        database=database,
+        twin_result.admission.source_id, twin_result.admission.candidate_dataset_id, database=database
     )
     if stored_admission != twin_result.admission:
         raise RuntimeError("UHC drug admission receipt admission changed")
@@ -306,12 +381,16 @@ async def _record_receipt_under_lease(
             twin_result.candidate.evidence.source_file_set_sha256,
             twin_result.candidate.evidence.artifact_set_sha256,
             twin_result.candidate.evidence.spool_content_sha256,
+            selected_source_file_ids_value=selected_ids,
+            exclusion_code=exclusion_code,
         )
         await insert_uhc_receipt(
             receipt_id,
             observation_hash,
             twin_result.admission,
             twin_result.candidate.evidence,
+            selected_source_file_ids_value=selected_ids,
+            exclusion_code=exclusion_code,
             database=database,
         )
         stored_receipt = await load_uhc_drug_admission_receipt(
@@ -331,16 +410,12 @@ async def _record_receipt_under_lease(
 
 
 async def record_uhc_drug_admission_receipt(
-    *,
-    source_observation_sha256: str,
-    artifacts: VerifiedSourceArtifactSet,
-    twin_result: UHCDrugTwinResult,
+    *, acquisition: UHCDrugArtifactAcquisitionResult, twin_result: UHCDrugTwinResult,
     database: Any = db,
 ) -> UHCDrugAdmissionReceipt:
     """Persist or replay one exact receipt under a fresh source lease."""
-
     if (
-        type(artifacts) is not VerifiedSourceArtifactSet
+        type(acquisition) is not UHCDrugArtifactAcquisitionResult
         or type(twin_result) is not UHCDrugTwinResult
     ):
         raise ValueError("UHC drug admission receipt input is invalid")
@@ -351,10 +426,7 @@ async def record_uhc_drug_admission_receipt(
         retry_seconds=UHC_DRUG_RECEIPT_LOCK_RETRY_SECONDS,
     ):
         return await _record_receipt_under_lease(
-            source_observation_sha256=source_observation_sha256,
-            artifacts=artifacts,
-            twin_result=twin_result,
-            database=database,
+            acquisition=acquisition, twin_result=twin_result, database=database
         )
 
 
@@ -371,13 +443,29 @@ async def reconstruct_uhc_drug_publication_inputs(
         database=database,
     )
     binding = await register_uhc_formulary_source(database=database)
-    artifacts = await reopen_source_artifact_set(
-        receipt.source_id,
-        receipt.evidence.source_file_set_sha256,
-        receipt.artifact_set_sha256,
-        database=database,
-        cancel_check=cancel_check,
-    )
+    if receipt.is_coverage_complete:
+        artifacts = await reopen_source_artifact_set(
+            receipt.source_id,
+            receipt.evidence.source_file_set_sha256,
+            receipt.artifact_set_sha256,
+            database=database,
+            cancel_check=cancel_check,
+        )
+    else:
+        full_identities = await load_source_artifact_identities(
+            receipt.source_id,
+            receipt.evidence.source_file_set_sha256,
+            database=database,
+        )
+        artifacts = await load_selected_source_artifact_set(
+            full_identities,
+            selected_source_file_ids=receipt.selected_source_file_ids,
+            require_unselected_pending=False,
+            database=database,
+            cancel_check=cancel_check,
+        )
+        if artifacts.artifact_set_sha256 != receipt.artifact_set_sha256:
+            raise RuntimeError("UHC drug publication receipt artifacts changed")
     expected_contract_hash = uhc_drug_sync_contract_hash(
         binding,
         artifacts,
