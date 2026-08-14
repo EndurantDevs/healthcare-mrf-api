@@ -1,6 +1,6 @@
 {
   "issue_counts": {
-    "ambiguous_function_names": 5,
+    "ambiguous_function_names": 4,
     "ambiguous_variable_names": 0,
     "boolean_name_mismatch": 0,
     "builtin_shadowing": 0,
@@ -13,21 +13,20 @@
     "global_state_usage": 1,
     "inline_suppressions": 2,
     "long_files": 156,
-    "long_functions": 317,
+    "long_functions": 316,
     "missing_contract_docstrings": 0,
     "pass_placeholders": 0,
     "single_letter_names": 0,
     "syntax_errors": 0,
-    "too_many_locals": 122,
-    "too_many_parameters": 59
+    "too_many_locals": 121,
+    "too_many_parameters": 54
   },
   "issue_ids": {
     "ambiguous_function_names": [
       "ambiguous_function_name:process/npi.py:process_data",
       "ambiguous_function_name:process/npi.py:shutdown",
       "ambiguous_function_name:process/openaddresses.py:process_data",
-      "ambiguous_function_name:process/openaddresses.py:shutdown",
-      "ambiguous_function_name:process/partd_formulary_network.py:main"
+      "ambiguous_function_name:process/openaddresses.py:shutdown"
     ],
     "ambiguous_variable_names": [],
     "boolean_name_mismatch": [],
@@ -340,7 +339,6 @@
       "long_function:api/ptg2_tables.py:snapshot_serving_tables",
       "long_function:api/ptg2_v4_graph.py:_load_physical_blocks",
       "long_function:api/ptg2_v4_graph.py:_load_v4_heavy_bitmap_payloads",
-      "long_function:process/__init__.py:provider_directory_fhir",
       "long_function:process/attributes.py:finalize_attribute_tables",
       "long_function:process/attributes.py:process_prices",
       "long_function:process/claims_pricing.py:_collect_cost_level_diagnostics",
@@ -618,7 +616,6 @@
       "too_many_locals:api/ptg2_serving.py:_strict_cost_provider_expansion_selection",
       "too_many_locals:api/ptg2_tables.py:_strict_v3_manifest_fields",
       "too_many_locals:api/ptg2_tables.py:snapshot_serving_tables",
-      "too_many_locals:process/__init__.py:provider_directory_fhir",
       "too_many_locals:process/entity_address_unified.py:_facility_anchor_npi_candidate_sql",
       "too_many_locals:process/entity_address_unified.py:_inference_sql",
       "too_many_locals:process/entity_address_unified.py:_source_selects",
@@ -697,11 +694,6 @@
       "too_many_parameters:api/endpoint/pricing.py:_build_dynamic_zip_peer_stats",
       "too_many_parameters:api/endpoint/pricing.py:_build_provider_quality_response_payload",
       "too_many_parameters:api/endpoint/reports.py:_build_market_sql",
-      "too_many_parameters:process/__init__.py:entity_address_unified",
-      "too_many_parameters:process/__init__.py:mrf_source_discovery_command",
-      "too_many_parameters:process/__init__.py:openaddresses",
-      "too_many_parameters:process/__init__.py:provider_directory_fhir",
-      "too_many_parameters:process/__init__.py:ptg",
       "too_many_parameters:process/control_lifecycle.py:mark_control_run",
       "too_many_parameters:process/entity_address_unified.py:_address_checksum_expr",
       "too_many_parameters:process/entity_address_unified.py:_facility_anchor_npi_candidate_sql",

@@ -287,7 +287,8 @@ async def _seed_validation_source(
 ) -> None:
     await database.status(
         f'CREATE TABLE "{schema}".provider_directory_source ('
-        'source_id varchar(64) PRIMARY KEY, endpoint_id varchar(64));'
+        'source_id varchar(64) PRIMARY KEY, endpoint_id varchar(64), '
+        "metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb);"
     )
     await database.status(
         f'INSERT INTO "{schema}".provider_directory_source '
