@@ -12,13 +12,13 @@
     "function_name_shape": 0,
     "global_state_usage": 0,
     "inline_suppressions": 2,
-    "long_files": 156,
-    "long_functions": 316,
+    "long_files": 157,
+    "long_functions": 315,
     "missing_contract_docstrings": 0,
     "pass_placeholders": 0,
     "single_letter_names": 0,
     "syntax_errors": 0,
-    "too_many_locals": 121,
+    "too_many_locals": 120,
     "too_many_parameters": 54
   },
   "issue_ids": {
