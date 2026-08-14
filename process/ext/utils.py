@@ -1072,16 +1072,21 @@ async def push_objects(
 
         def _table_schema_name():
             schema_name = getattr(cls.__table__, "schema", None)
-            if schema_name is None:
-                table_args = getattr(cls, "__table_args__", None)
-                if isinstance(table_args, dict):
-                    schema_name = table_args.get("schema")
-                elif isinstance(table_args, (tuple, list)):
-                    for arg in table_args:
-                        if isinstance(arg, dict) and "schema" in arg:
-                            schema_name = arg["schema"]
-                            break
-            return schema_name
+            if schema_name is not None:
+                return schema_name
+            table_args = getattr(cls, "__table_args__", None)
+            if isinstance(table_args, dict):
+                return table_args.get("schema")
+            if isinstance(table_args, (tuple, list)):
+                return next(
+                    (
+                        arg["schema"]
+                        for arg in table_args
+                        if isinstance(arg, dict) and "schema" in arg
+                    ),
+                    None,
+                )
+            return None
 
         def _chunk_records(sequence):
             chunk_size = ROWS_PER_INSERT or 1000
@@ -1276,6 +1281,16 @@ import logging
 from sqlalchemy import or_
 
 
+def _parse_datetime_text(datetime_text: str):
+    try:
+        return datetime.datetime.fromisoformat(datetime_text)
+    except ValueError:
+        try:
+            return parse_date(datetime_text)
+        except (ValueError, TypeError):
+            return None
+
+
 def _coerce_datetime(raw_datetime):
     if isinstance(raw_datetime, datetime.datetime):
         return raw_datetime
@@ -1284,13 +1299,7 @@ def _coerce_datetime(raw_datetime):
         if type_tag == "datetime":
             iso_value = raw_datetime.get("value")
             if isinstance(iso_value, str):
-                try:
-                    return datetime.datetime.fromisoformat(iso_value)
-                except ValueError:
-                    try:
-                        return parse_date(iso_value)
-                    except (ValueError, TypeError):
-                        return None
+                return _parse_datetime_text(iso_value)
         if type_tag == "repr":
             return _coerce_datetime(raw_datetime.get("repr"))
         # silently ignore other tagged dicts
@@ -1298,13 +1307,7 @@ def _coerce_datetime(raw_datetime):
             return _coerce_datetime(raw_datetime.get("value"))
         return None
     if isinstance(raw_datetime, str):
-        try:
-            return datetime.datetime.fromisoformat(raw_datetime)
-        except ValueError:
-            try:
-                return parse_date(raw_datetime)
-            except (ValueError, TypeError):
-                return None
+        return _parse_datetime_text(raw_datetime)
     return None
 
 

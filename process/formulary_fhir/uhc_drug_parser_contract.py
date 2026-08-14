@@ -101,7 +101,7 @@ class UHCDrugPlanKey:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class UHCDrugSpoolEvidence:
-    """Summarize one complete 48-artifact normalization spool."""
+    """Summarize every validated artifact selected from the 48-file census."""
 
     source_id: str
     source_file_set_sha256: str = field(repr=False)
@@ -115,6 +115,8 @@ class UHCDrugSpoolEvidence:
     duplicate_count: int
     superseded_count: int
     max_last_updated_at: dt.datetime | None
+    expected_file_count: int = 48
+    excluded_file_count: int = 0
 
     def __post_init__(self) -> None:
         strict_text(self.source_id, "source id", 64)
@@ -132,10 +134,18 @@ class UHCDrugSpoolEvidence:
             self.medication_membership_count,
             self.duplicate_count,
             self.superseded_count,
+            self.expected_file_count,
+            self.excluded_file_count,
         )
         if any(type(count) is not int or count < 0 for count in counts):
             raise ValueError("UHC drug spool counts are invalid")
-        if self.file_count != 48 or self.plan_count <= 0:
+        if (
+            self.expected_file_count != 48
+            or not 1 <= self.file_count <= self.expected_file_count
+            or self.file_count + self.excluded_file_count
+            != self.expected_file_count
+            or self.plan_count <= 0
+        ):
             raise ValueError("UHC drug spool census is incomplete")
         if self.max_last_updated_at is not None:
             normalized_timestamp = utc_timestamp(
@@ -148,6 +158,18 @@ class UHCDrugSpoolEvidence:
                 != normalized_timestamp.isoformat()
             ):
                 raise ValueError("UHC drug maximum update timestamp is invalid")
+
+    @property
+    def is_coverage_complete(self) -> bool:
+        """Return whether all advertised artifacts contributed data."""
+
+        return self.excluded_file_count == 0
+
+    @property
+    def coverage_status(self) -> str:
+        """Return the source-hidden public coverage classification."""
+
+        return "complete" if self.is_coverage_complete else "partial"
 
     def __repr__(self) -> str:
         return (

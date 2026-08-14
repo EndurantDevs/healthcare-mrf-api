@@ -5,6 +5,7 @@
 from sqlalchemy import and_, bindparam, select
 
 from api.formulary_fhir_catalog_sql import ALIAS_PAGE_FROM
+from api.formulary_fhir_catalog_sql import COVERAGE_COLUMNS
 from api.formulary_fhir_catalog_sql import CURRENT_PLAN_PREDICATES
 from api.formulary_fhir_catalog_sql import alias
 from api.formulary_fhir_catalog_sql import alias_version
@@ -31,6 +32,7 @@ ALIAS_CONTEXT_STATEMENT = (
         alias_version.c.alias_version_id,
         current.c.generation,
         current.c.published_at,
+        *COVERAGE_COLUMNS,
     )
     .select_from(ALIAS_PAGE_FROM)
     .where(

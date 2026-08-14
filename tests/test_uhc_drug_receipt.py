@@ -16,8 +16,10 @@ from process.formulary_fhir.uhc_drug_receipt import uhc_drug_receipt_id
 from tests.uhc_drug_receipt_test_support import ADMITTED_AT
 from tests.uhc_drug_receipt_test_support import admission_receipt
 from tests.uhc_drug_receipt_test_support import admitted_twin
+from tests.uhc_drug_receipt_test_support import artifact_acquisition_result
 from tests.uhc_drug_receipt_test_support import OBSERVATION_SHA256
 from tests.uhc_drug_receipt_test_support import source_binding
+from tests.uhc_drug_parser_test_support import artifact_set
 
 
 def _receipt_row(receipt: UHCDrugAdmissionReceipt) -> dict:
@@ -32,6 +34,10 @@ def _receipt_row(receipt: UHCDrugAdmissionReceipt) -> dict:
         "candidate_dataset_id": admission.candidate_dataset_id,
         "spool_content_sha256": evidence.spool_content_sha256,
         "file_count": evidence.file_count,
+        "expected_file_count": receipt.expected_file_count,
+        "excluded_file_count": receipt.excluded_file_count,
+        "selected_source_file_ids": list(receipt.selected_source_file_ids),
+        "exclusion_code": receipt.exclusion_code,
         "raw_record_count": evidence.raw_record_count,
         "raw_plan_entry_count": evidence.raw_plan_entry_count,
         "plan_count": evidence.plan_count,
@@ -137,8 +143,7 @@ async def test_record_receipt_inserts_exact_values_and_replays(monkeypatch) -> N
     )
 
     observed = await receipt_module._record_receipt_under_lease(
-        source_observation_sha256=OBSERVATION_SHA256,
-        artifacts=artifacts,
+        acquisition=artifact_acquisition_result(artifacts),
         twin_result=twin_result,
         database=database,
     )
@@ -147,6 +152,10 @@ async def test_record_receipt_inserts_exact_values_and_replays(monkeypatch) -> N
     assert database.insert_values is not None
     assert database.insert_values["receipt_id"] == expected.receipt_id
     assert database.insert_values["file_count"] == 48
+    assert database.insert_values["expected_file_count"] == 48
+    assert database.insert_values["excluded_file_count"] == 0
+    assert len(database.insert_values["selected_source_file_ids"]) == 48
+    assert database.insert_values["exclusion_code"] is None
     assert database.insert_values["plan_count"] == 2
     assert database.insert_values["medication_membership_count"] == 5
 
@@ -185,8 +194,7 @@ async def test_record_receipt_rejects_conflicting_candidate(monkeypatch) -> None
 
     with pytest.raises(RuntimeError, match="receipt changed"):
         await receipt_module._record_receipt_under_lease(
-            source_observation_sha256=OBSERVATION_SHA256,
-            artifacts=artifacts,
+            acquisition=artifact_acquisition_result(artifacts),
             twin_result=twin_result,
             database=database,
         )
@@ -240,6 +248,65 @@ async def test_reconstruct_rehashes_artifacts_and_contract(monkeypatch) -> None:
         cancel_check=None,
     )
     source_fence.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_partial_reconstruct_replays_selected_rows_after_recovery(
+    monkeypatch,
+) -> None:
+    """Later verification of omitted rows cannot redefine a partial receipt."""
+
+    twin_result, artifacts = admitted_twin(selected_file_count=47)
+    expected = admission_receipt(twin_result)
+    full_artifacts, _bodies_by_name = artifact_set()
+    full_identities = tuple(
+        artifact.identity for artifact in full_artifacts.artifacts
+    )
+    full_loader = AsyncMock(return_value=full_identities)
+    selected_loader = AsyncMock(return_value=artifacts)
+    complete_reopener = AsyncMock()
+    monkeypatch.setattr(
+        receipt_module,
+        "load_uhc_drug_admission_receipt",
+        AsyncMock(return_value=expected),
+    )
+    monkeypatch.setattr(
+        receipt_module,
+        "register_uhc_formulary_source",
+        AsyncMock(return_value=source_binding()),
+    )
+    monkeypatch.setattr(
+        receipt_module,
+        "load_source_artifact_identities",
+        full_loader,
+    )
+    monkeypatch.setattr(
+        receipt_module,
+        "load_selected_source_artifact_set",
+        selected_loader,
+    )
+    monkeypatch.setattr(
+        receipt_module,
+        "reopen_source_artifact_set",
+        complete_reopener,
+    )
+    monkeypatch.setattr(receipt_module, "require_source_unchanged", AsyncMock())
+
+    reconstructed = await receipt_module.reconstruct_uhc_drug_publication_inputs(
+        receipt_id=expected.receipt_id,
+        database=object(),
+    )
+
+    assert reconstructed.receipt is expected
+    assert reconstructed.artifacts is artifacts
+    complete_reopener.assert_not_awaited()
+    selected_loader.assert_awaited_once_with(
+        full_identities,
+        selected_source_file_ids=expected.selected_source_file_ids,
+        require_unselected_pending=False,
+        database=ANY,
+        cancel_check=None,
+    )
 
 
 @pytest.mark.asyncio

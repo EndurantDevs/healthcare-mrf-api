@@ -95,7 +95,7 @@ def test_query_requires_exact_current_publication_evidence_and_is_bounded():
         "LIMIT",
     ):
         assert required_fragment in normalized_sql
-    assert "fhir_formulary_source" not in normalized_sql
+    assert "JOIN mrf.fhir_formulary_source AS" not in normalized_sql
     assert " OFFSET " not in normalized_sql
     assert " FOR UPDATE" not in normalized_sql
 
@@ -104,7 +104,6 @@ def test_query_selects_no_internal_ownership_or_hash_fields():
     normalized_sql = _compiled_sql().split(" FROM ", 1)[0]
 
     for forbidden_field in (
-        "source_id",
         "dataset_id",
         "run_id",
         "generation",
@@ -116,6 +115,30 @@ def test_query_selects_no_internal_ownership_or_hash_fields():
         "metadata_json",
     ):
         assert forbidden_field not in normalized_sql
+    assert " AS source_id" not in normalized_sql
+
+
+def test_query_binds_coverage_to_exact_current_dataset_receipt_and_header():
+    normalized_sql = _compiled_sql()
+
+    for required_fragment in (
+        "LEFT OUTER JOIN mrf.fhir_formulary_uhc_admission_receipt",
+        "fhir_formulary_uhc_admission_receipt.source_id = "
+        "mrf.fhir_formulary_dataset.source_id",
+        "fhir_formulary_uhc_admission_receipt.candidate_dataset_id = "
+        "mrf.fhir_formulary_dataset.dataset_id",
+        "LEFT OUTER JOIN mrf.fhir_formulary_source_artifact_set",
+        "fhir_formulary_source_artifact_set.source_id = "
+        "mrf.fhir_formulary_uhc_admission_receipt.source_id",
+        "fhir_formulary_source_artifact_set.source_file_set_sha256 = "
+        "mrf.fhir_formulary_uhc_admission_receipt.source_file_set_sha256",
+        " AS coverage_required",
+        " AS coverage_expected_artifact_count",
+        " AS coverage_receipt_expected_artifact_count",
+        " AS coverage_included_artifact_count",
+        " AS coverage_missing_artifact_count",
+    ):
+        assert required_fragment in normalized_sql
 
 
 @pytest.mark.asyncio
@@ -144,6 +167,7 @@ async def test_endpoint_returns_private_allowlisted_success(monkeypatch):
         "last_updated",
         "as_of",
         "published_at",
+        "coverage",
     }
 
 

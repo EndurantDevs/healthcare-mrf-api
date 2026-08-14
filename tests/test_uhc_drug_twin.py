@@ -23,6 +23,7 @@ from process.formulary_fhir.uhc_drug_sync_contract import (
 )
 from process.formulary_fhir.uhc_drug_receipt import UHCDrugRecordedAdmission
 from tests.uhc_drug_receipt_test_support import admission_receipt
+from tests.uhc_drug_receipt_test_support import artifact_acquisition_result
 from tests.test_uhc_drug_sync import _binding
 from tests.uhc_drug_parser_test_support import artifact_set
 from tests.uhc_drug_parser_test_support import install_artifact_reader
@@ -204,6 +205,7 @@ async def test_recorded_twin_writes_receipt_before_lease_exit(
         candidate,
     )
     expected_receipt = admission_receipt(twin_result)
+    acquisition = artifact_acquisition_result(artifacts)
     events: list[str] = []
 
     @asynccontextmanager
@@ -212,7 +214,8 @@ async def test_recorded_twin_writes_receipt_before_lease_exit(
         yield
         events.append("lease-exit")
 
-    async def build_and_record(_request, _observation_hash):
+    async def build_and_record(_request, observed_acquisition):
+        assert observed_acquisition is acquisition
         events.append("receipt-recorded")
         return UHCDrugRecordedAdmission(twin_result, expected_receipt)
 
@@ -220,8 +223,7 @@ async def test_recorded_twin_writes_receipt_before_lease_exit(
     monkeypatch.setattr(twin, "_verify_and_record_under_lease", build_and_record)
 
     observed = await twin.verify_and_record_uhc_drug_twins(
-        source_observation_sha256=expected_receipt.source_observation_sha256,
-        artifacts=artifacts,
+        acquisition=acquisition,
         baseline_run_id=baseline.dataset.run_id,
         candidate_run_id=candidate.dataset.run_id,
         cutoff=candidate.dataset.cutoff_at,
@@ -261,6 +263,7 @@ async def test_internal_recording_reuses_admission_after_crash(
         candidate,
     )
     expected_receipt = admission_receipt(twin_result)
+    acquisition = artifact_acquisition_result(artifacts)
     request = twin._validated_twin_request(
         artifacts,
         baseline.dataset.run_id,
@@ -281,14 +284,13 @@ async def test_internal_recording_reuses_admission_after_crash(
 
     observed = await twin._verify_and_record_under_lease(
         request,
-        expected_receipt.source_observation_sha256,
+        acquisition,
     )
 
     assert observed == UHCDrugRecordedAdmission(twin_result, expected_receipt)
     build.assert_awaited_once()
     receipt_writer.assert_awaited_once_with(
-        source_observation_sha256=expected_receipt.source_observation_sha256,
-        artifacts=artifacts,
+        acquisition=acquisition,
         twin_result=twin_result,
         database=request.database,
     )

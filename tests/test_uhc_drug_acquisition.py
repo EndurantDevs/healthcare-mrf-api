@@ -6,6 +6,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import io
+import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -28,17 +29,21 @@ from process.formulary_fhir.source_artifact_contract import (
     VerifiedSourceArtifactSet,
 )
 from process.formulary_fhir.source_artifact_contract import artifact_set_sha256
+from tests.uhc_drug_parser_test_support import source_record
 
 
 SOURCE_ID = "uhc-official-formulary-mrf"
 FILE_SET = "a" * 64
 PROJECTION = "b" * 64
 VERIFIED_AT = dt.datetime(2026, 8, 10, tzinfo=dt.UTC)
+VALID_BODY = json.dumps(
+    [source_record()], sort_keys=True, separators=(",", ":")
+).encode()
 
 pytest_plugins = ("tests.provider_directory_retained_reader_fixtures",)
 
 
-def _identity(index: int, body: bytes = b"[{}]") -> SourceArtifactIdentity:
+def _identity(index: int, body: bytes = VALID_BODY) -> SourceArtifactIdentity:
     family = "cs" if index < 24 else "ifp"
     file_name = f"drug-{index:02d}.json"
     return SourceArtifactIdentity(
@@ -59,7 +64,7 @@ def _identity(index: int, body: bytes = b"[{}]") -> SourceArtifactIdentity:
 
 def _verified_set(
     identities: tuple[SourceArtifactIdentity, ...],
-    body: bytes = b"[{}]",
+    body: bytes = VALID_BODY,
 ) -> VerifiedSourceArtifactSet:
     artifacts = tuple(
         VerifiedSourceArtifact(
@@ -145,14 +150,10 @@ def _install_acquisition_mocks(
     *,
     bind: AsyncMock | None = None,
 ) -> None:
-    source_binding = SimpleNamespace(
-        source_id=SOURCE_ID,
-        configuration_hash="9" * 64,
-    )
-    registration = SimpleNamespace(
-        identities=identities,
-        source_observation_sha256="c" * 64,
-    )
+    """Install the source, lease, registry, and retained-artifact test doubles."""
+
+    source_binding = SimpleNamespace(source_id=SOURCE_ID, configuration_hash="9" * 64)
+    registration = SimpleNamespace(identities=identities, source_observation_sha256="c" * 64)
     claim = acquisition.UHCDrugSourceAcquisitionClaim(
         source_id=SOURCE_ID,
         lease_generation=1,
@@ -193,6 +194,9 @@ def _install_acquisition_mocks(
         "load_complete_source_artifact_set",
         AsyncMock(return_value=verified_artifacts),
     )
+    monkeypatch.setattr(
+        acquisition, "validate_retained_uhc_drug_artifact", lambda *_args, **_kwargs: 1
+    )
     if bind is not None:
         monkeypatch.setattr(transport, "bind_verified_source_artifact", bind)
 
@@ -217,8 +221,8 @@ async def test_acquisition_downloads_pending_once_and_reuses_verified(
         {
             identity.source_url: _Response(
                 identity.source_url,
-                (b"[", b"{}", b"]"),
-                declared_length=4,
+                (VALID_BODY,),
+                declared_length=len(VALID_BODY),
             )
             for identity in pending_identities
         }
@@ -244,7 +248,7 @@ async def test_acquisition_downloads_pending_once_and_reuses_verified(
     assert acquisition_result.source_observation_sha256 == "c" * 64
     assert acquisition_result.downloaded_file_count == 2
     assert acquisition_result.reused_file_count == 46
-    assert acquisition_result.downloaded_byte_count == 8
+    assert acquisition_result.downloaded_byte_count == 2 * len(VALID_BODY)
     assert set(session.requested_urls) == {
         identity.source_url for identity in pending_identities
     }
@@ -300,7 +304,7 @@ async def test_stream_rejects_transport_identity_and_length_mismatch(
     response_by_field = dict(response_by_field)
     response = _Response(
         response_by_field.pop("url", identity.source_url),
-        (b"[{}]",),
+        (VALID_BODY,),
         **response_by_field,
     )
     session = _Session({identity.source_url: response})
@@ -434,7 +438,7 @@ async def test_pending_cleanup_drains_repeated_outer_cancellation() -> None:
     release_cleanup = asyncio.Event()
     cleanup_finished = asyncio.Event()
 
-    async def sibling() -> tuple[int, str, str]:
+    async def sibling() -> tuple[int, str, str, str, bool]:
         sibling_started.set()
         try:
             await asyncio.Event().wait()
@@ -442,7 +446,7 @@ async def test_pending_cleanup_drains_repeated_outer_cancellation() -> None:
             cleanup_started.set()
             await release_cleanup.wait()
             cleanup_finished.set()
-        return 0, "cs", "never.json"
+        return 0, "cs", "never.json", "never", False
 
     sibling_task = asyncio.create_task(sibling())
     supervisor = asyncio.create_task(
@@ -467,15 +471,15 @@ async def test_pending_failure_drains_siblings_and_retains_sanitized_evidence() 
     sibling_started = asyncio.Event()
     sibling_finished = asyncio.Event()
 
-    async def failing() -> tuple[int, str, str]:
+    async def failing() -> tuple[int, str, str, str, bool]:
         await sibling_started.wait()
         raise RuntimeError("private identity and URL must not escape")
 
-    async def sibling() -> tuple[int, str, str]:
+    async def sibling() -> tuple[int, str, str, str, bool]:
         sibling_started.set()
         await asyncio.sleep(0)
         sibling_finished.set()
-        return 4, "cs", "retained.json"
+        return 4, "cs", "retained.json", "retained", False
 
     tasks = (asyncio.create_task(failing()), asyncio.create_task(sibling()))
     with pytest.raises(

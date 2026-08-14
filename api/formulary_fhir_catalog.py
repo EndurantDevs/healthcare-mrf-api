@@ -24,13 +24,17 @@ from api.formulary_fhir_serving import FHIRFormularyCursorConflictError
 from api.formulary_fhir_serving import FHIRFormularyInvalidRequestError
 from api.formulary_fhir_serving import FHIRFormularyNotFoundError
 from api.formulary_fhir_serving import FHIRFormularyServingUnavailableError
+from api.formulary_fhir_serving import PublicFHIRFormularyCoverage
 from api.formulary_fhir_serving import PublicFHIRFormularyDetail
+from api.formulary_fhir_serving import _coverage_from_record
 from api.formulary_fhir_serving import _detail_from_record
 from api.formulary_fhir_serving import _required_timestamp
 from api.formulary_fhir_serving import _timestamp_text
 from api.formulary_fhir_serving import _READ_TRANSACTION_SQL
 from api.formulary_fhir_serving import is_fhir_formulary_serving_enabled
+from api.formulary_fhir_serving import public_fhir_formulary_coverage_payload
 from api.formulary_fhir_serving import public_fhir_formulary_payload
+from api.formulary_fhir_serving import validate_public_fhir_formulary_coverage
 
 
 FHIR_FORMULARY_ALIAS_ID_PATTERN = re.compile(r"^ffa_[0-9a-f]{48}$")
@@ -45,6 +49,7 @@ class PublicFHIRFormularyPage:
     items: tuple[PublicFHIRFormularyDetail, ...]
     next_cursor: str | None
 
+
 @dataclass(frozen=True, slots=True)
 class PublicFHIRFormularyAlias:
     """One opaque current DrugPlan alias without its upstream identifier."""
@@ -52,6 +57,7 @@ class PublicFHIRFormularyAlias:
     formulary_id: str
     alias_id: str
     drug_count: int
+    coverage: PublicFHIRFormularyCoverage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +66,7 @@ class PublicFHIRFormularyAliasPage:
 
     items: tuple[PublicFHIRFormularyAlias, ...]
     next_cursor: str | None
+
 
 def _validated_limit(limit: object) -> int:
     if type(limit) is not int or not 1 <= limit <= MAX_FHIR_FORMULARY_PAGE_SIZE:
@@ -89,6 +96,7 @@ def _expected_dataset_counts(
             raise FHIRFormularyServingUnavailableError(
                 "FHIR formulary catalog evidence is invalid"
             )
+        _coverage_from_record(dataset_record)
         expected_by_dataset[dataset_id] = list_count
     return expected_by_dataset
 
@@ -253,7 +261,10 @@ async def read_current_fhir_formularies(
     )
 
 
-def _alias_from_record(record: Mapping[str, Any]) -> PublicFHIRFormularyAlias:
+def _alias_from_record(
+    record: Mapping[str, Any],
+    coverage: PublicFHIRFormularyCoverage | None = None,
+) -> PublicFHIRFormularyAlias:
     formulary_id = record.get("formulary_id")
     alias_id = record.get("alias_id")
     drug_count = record.get("drug_count")
@@ -272,10 +283,14 @@ def _alias_from_record(record: Mapping[str, Any]) -> PublicFHIRFormularyAlias:
         formulary_id=formulary_id,
         alias_id=alias_id,
         drug_count=drug_count,
+        coverage=validate_public_fhir_formulary_coverage(coverage),
     )
 
 
-async def _current_formulary_marker(session: Any, formulary_id: str) -> str:
+async def _current_formulary_marker(
+    session: Any,
+    formulary_id: str,
+) -> tuple[str, PublicFHIRFormularyCoverage | None]:
     context_records = _records(
         await session.execute(
             FORMULARY_CONTEXT_STATEMENT,
@@ -289,10 +304,13 @@ async def _current_formulary_marker(session: Any, formulary_id: str) -> str:
             "FHIR formulary current evidence is ambiguous"
         )
     context_record = context_records[0]
-    return current_fhir_formulary_marker(
-        context_record.get("dataset_id"),
-        context_record.get("generation"),
-        context_record.get("published_at"),
+    return (
+        current_fhir_formulary_marker(
+            context_record.get("dataset_id"),
+            context_record.get("generation"),
+            context_record.get("published_at"),
+        ),
+        _coverage_from_record(context_record),
     )
 
 
@@ -306,7 +324,10 @@ async def _read_alias_page_rows(
 ):
     async with session.begin():
         await session.execute(_READ_TRANSACTION_SQL)
-        current_marker = await _current_formulary_marker(session, formulary_id)
+        current_marker, coverage = await _current_formulary_marker(
+            session,
+            formulary_id,
+        )
         _require_current_marker(cursor_marker, current_marker)
         page_rows = _records(
             await session.execute(
@@ -318,7 +339,7 @@ async def _read_alias_page_rows(
                 },
             )
         )
-    return current_marker, page_rows
+    return current_marker, coverage, page_rows
 
 
 def _alias_page_from_rows(
@@ -328,12 +349,16 @@ def _alias_page_from_rows(
     current_marker: str,
     scope_by_field: dict[str, object],
     environment: Mapping[str, str] | None,
+    coverage: PublicFHIRFormularyCoverage | None = None,
 ) -> PublicFHIRFormularyAliasPage:
     if len(page_rows) > page_size + 1:
         raise FHIRFormularyServingUnavailableError(
             "FHIR formulary alias page evidence exceeds its bound"
-        )
-    aliases = tuple(_alias_from_record(row) for row in page_rows[:page_size])
+    )
+    aliases = tuple(
+        _alias_from_record(page_record, coverage)
+        for page_record in page_rows[:page_size]
+    )
     alias_ids = tuple(alias_detail.alias_id for alias_detail in aliases)
     if alias_ids != tuple(sorted(set(alias_ids))):
         raise FHIRFormularyServingUnavailableError(
@@ -380,7 +405,7 @@ async def read_current_fhir_formulary_aliases(
         id_pattern=FHIR_FORMULARY_ALIAS_ID_PATTERN,
         environment=environment,
     )
-    current_marker, page_rows = await _read_alias_page_rows(
+    current_marker, coverage, page_rows = await _read_alias_page_rows(
         session,
         formulary_id=formulary_id,
         last_id=last_id,
@@ -393,6 +418,7 @@ async def read_current_fhir_formulary_aliases(
         current_marker=current_marker,
         scope_by_field=scope_by_field,
         environment=environment,
+        coverage=coverage,
     )
 
 
@@ -465,7 +491,8 @@ def public_fhir_formulary_alias_page_payload(
                     "formulary_id": alias_detail.formulary_id,
                     "alias_id": alias_detail.alias_id,
                     "drug_count": alias_detail.drug_count,
-                }
+                },
+                alias_detail.coverage,
             )
         )
     validated_aliases = tuple(validated_aliases)
@@ -480,6 +507,9 @@ def public_fhir_formulary_alias_page_payload(
                 "formulary_id": alias_detail.formulary_id,
                 "alias_id": alias_detail.alias_id,
                 "drug_count": alias_detail.drug_count,
+                "coverage": public_fhir_formulary_coverage_payload(
+                    alias_detail.coverage
+                ),
             }
             for alias_detail in validated_aliases
         ],

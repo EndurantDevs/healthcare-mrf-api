@@ -53,10 +53,15 @@ def install_postflight_drift_mocks(
     monkeypatch.setattr(
         acquisition,
         "acquire_pending_uhc_drug_artifacts",
-        AsyncMock(return_value=0),
+        AsyncMock(return_value=(0, ())),
     )
     monkeypatch.setattr(
         acquisition,
         "load_complete_source_artifact_set",
         AsyncMock(return_value=exact_artifacts),
+    )
+    monkeypatch.setattr(
+        acquisition,
+        "validate_retained_uhc_drug_artifact",
+        lambda *_arguments, **_keywords: 1,
     )

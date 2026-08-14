@@ -388,7 +388,16 @@ async def test_twin_artifact_and_contract_drift_fail_closed(monkeypatch) -> None
     request = SimpleNamespace(artifacts=artifacts, database=object(), cutoff_at=CUTOFF)
     monkeypatch.setattr(
         twin,
-        "load_complete_source_artifact_set",
+        "load_source_artifact_identities",
+        AsyncMock(
+            return_value=tuple(
+                artifact.identity for artifact in artifacts.artifacts
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        twin,
+        "load_selected_source_artifact_set",
         AsyncMock(
             return_value=replace(
                 artifacts,

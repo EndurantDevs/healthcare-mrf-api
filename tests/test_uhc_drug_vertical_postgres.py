@@ -43,6 +43,9 @@ VERSIONS = Path(FOUNDATION_PATH).parent
 ARTIFACT_PATH = VERSIONS / ("20260810030000_fhir_formulary_source_artifact.py")
 RECEIPT_PATH = VERSIONS / ("20260810040000_fhir_formulary_uhc_admission_receipt.py")
 LEASE_PATH = VERSIONS / ("20260811030000_fhir_formulary_source_acquisition_lease.py")
+SELECTED_RECEIPT_PATH = VERSIONS / (
+    "20260814010000_fhir_formulary_uhc_selected_receipt.py"
+)
 MIGRATION_PATHS = (
     FOUNDATION_PATH,
     ATTEMPT_PATH,
@@ -51,6 +54,7 @@ MIGRATION_PATHS = (
     ARTIFACT_PATH,
     RECEIPT_PATH,
     LEASE_PATH,
+    SELECTED_RECEIPT_PATH,
 )
 
 

@@ -23,6 +23,7 @@ DETAIL_FIELDS = {
     "last_updated",
     "as_of",
     "published_at",
+    "coverage",
 }
 FORBIDDEN_PUBLIC_FIELDS = {
     "source_id",
@@ -96,6 +97,34 @@ def test_fhir_formulary_detail_and_period_are_closed_and_fully_required():
             "maxLength": 40,
             "nullable": True,
         }
+
+
+def test_fhir_formulary_coverage_is_closed_nullable_and_arithmetic_bounded():
+    schemas = _specification()["components"]["schemas"]
+    coverage = schemas["FHIRFormularyCoverage"]
+
+    assert coverage["type"] == "object"
+    assert coverage["nullable"] is True
+    assert coverage["additionalProperties"] is False
+    assert set(coverage["required"]) == {
+        "status",
+        "expected_artifact_count",
+        "included_artifact_count",
+        "missing_artifact_count",
+    }
+    assert coverage["properties"]["status"]["enum"] == [
+        "complete",
+        "partial",
+    ]
+    for field_name in (
+        "expected_artifact_count",
+        "included_artifact_count",
+    ):
+        assert coverage["properties"][field_name]["minimum"] == 1
+    assert coverage["properties"]["missing_artifact_count"]["minimum"] == 0
+    assert schemas["FHIRFormularyDetail"]["properties"]["coverage"] == {
+        "$ref": "#/components/schemas/FHIRFormularyCoverage"
+    }
 
 
 def test_fhir_formulary_detail_exposes_only_allowlisted_public_fields():

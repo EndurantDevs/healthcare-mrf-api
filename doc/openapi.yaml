@@ -9031,11 +9031,35 @@ components:
           format: date-time
           maxLength: 40
           nullable: true
+    FHIRFormularyCoverage:
+      type: object
+      nullable: true
+      additionalProperties: false
+      description: |
+        Aggregate official-artifact coverage for the exact current dataset.
+        Null means the source has no receipt-scoped official artifact census.
+      required:
+        [status, expected_artifact_count, included_artifact_count,
+         missing_artifact_count]
+      properties:
+        status:
+          type: string
+          enum: [complete, partial]
+        expected_artifact_count:
+          type: integer
+          minimum: 1
+        included_artifact_count:
+          type: integer
+          minimum: 1
+        missing_artifact_count:
+          type: integer
+          minimum: 0
     FHIRFormularyDetail:
       type: object
       additionalProperties: false
       required:
-        [formulary_id, status, title, name, period, last_updated, as_of, published_at]
+        [formulary_id, status, title, name, period, last_updated, as_of,
+         published_at, coverage]
       properties:
         formulary_id:
           type: string
@@ -9068,6 +9092,8 @@ components:
           type: string
           format: date-time
           maxLength: 40
+        coverage:
+          $ref: '#/components/schemas/FHIRFormularyCoverage'
     FHIRFormularyPage:
       type: object
       additionalProperties: false
@@ -9086,7 +9112,7 @@ components:
     FHIRFormularyAlias:
       type: object
       additionalProperties: false
-      required: [formulary_id, alias_id, drug_count]
+      required: [formulary_id, alias_id, drug_count, coverage]
       properties:
         formulary_id:
           type: string
@@ -9101,6 +9127,8 @@ components:
         drug_count:
           type: integer
           minimum: 0
+        coverage:
+          $ref: '#/components/schemas/FHIRFormularyCoverage'
     FHIRFormularyAliasPage:
       type: object
       additionalProperties: false
@@ -9143,7 +9171,7 @@ components:
       required:
         [formulary_id, alias_id, drug_id, status, name, rxnorm_id, ndc11,
          last_updated, tier, prior_authorization, step_therapy, quantity_limit,
-         alternatives]
+         alternatives, coverage]
       properties:
         formulary_id:
           type: string
@@ -9195,6 +9223,8 @@ components:
           nullable: true
         alternatives:
           $ref: '#/components/schemas/FHIRFormularyAlternatives'
+        coverage:
+          $ref: '#/components/schemas/FHIRFormularyCoverage'
     FHIRFormularyDrugPage:
       type: object
       additionalProperties: false

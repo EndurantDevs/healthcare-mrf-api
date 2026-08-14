@@ -53,6 +53,8 @@ def _validate_hashes(evidence: "UHCDrugReceiptOperationEvidence") -> None:
 def _validate_counts(evidence: "UHCDrugReceiptOperationEvidence") -> None:
     counts = (
         evidence.file_count,
+        evidence.expected_file_count,
+        evidence.excluded_file_count,
         evidence.raw_record_count,
         evidence.raw_plan_entry_count,
         evidence.plan_count,
@@ -62,7 +64,10 @@ def _validate_counts(evidence: "UHCDrugReceiptOperationEvidence") -> None:
     )
     if not (
         all(type(count) is int and count >= 0 for count in counts)
-        and evidence.file_count == 48
+        and evidence.expected_file_count == 48
+        and 1 <= evidence.file_count <= evidence.expected_file_count
+        and evidence.excluded_file_count
+        == evidence.expected_file_count - evidence.file_count
         and evidence.raw_record_count > 0
         and evidence.raw_plan_entry_count > 0
         and evidence.plan_count > 0
@@ -113,6 +118,8 @@ class UHCDrugReceiptOperationEvidence:
     predecessor_dataset_id: str | None
     cutoff_at: dt.datetime
     file_count: int
+    expected_file_count: int
+    excluded_file_count: int
     raw_record_count: int
     raw_plan_entry_count: int
     plan_count: int
@@ -132,6 +139,12 @@ class UHCDrugReceiptOperationEvidence:
         _validate_hashes(self)
         _validate_counts(self)
         _validate_timestamps(self)
+
+    @property
+    def coverage_status(self) -> str:
+        """Return the aggregate artifact-coverage classification."""
+
+        return "complete" if self.excluded_file_count == 0 else "partial"
 
 
 def receipt_operation_evidence(
@@ -161,6 +174,8 @@ def receipt_operation_evidence(
         predecessor_dataset_id=admission.predecessor_dataset_id,
         cutoff_at=admission.cutoff_at,
         file_count=spool_evidence.file_count,
+        expected_file_count=receipt.expected_file_count,
+        excluded_file_count=receipt.excluded_file_count,
         raw_record_count=spool_evidence.raw_record_count,
         raw_plan_entry_count=spool_evidence.raw_plan_entry_count,
         plan_count=spool_evidence.plan_count,
@@ -203,6 +218,12 @@ def receipt_operation_payload(
         "candidate_dataset_id": receipt_evidence.candidate_dataset_id,
         "candidate_run_id": receipt_evidence.candidate_run_id,
         "coverage_hash": receipt_evidence.coverage_hash,
+        "coverage": {
+            "status": receipt_evidence.coverage_status,
+            "expected_artifact_count": receipt_evidence.expected_file_count,
+            "included_artifact_count": receipt_evidence.file_count,
+            "missing_artifact_count": receipt_evidence.excluded_file_count,
+        },
         "cutoff": _utc_text(receipt_evidence.cutoff_at),
         "duplicate_count": receipt_evidence.duplicate_count,
         "file_count": receipt_evidence.file_count,

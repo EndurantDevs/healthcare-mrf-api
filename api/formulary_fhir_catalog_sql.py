@@ -2,7 +2,7 @@
 
 """Source-qualified SQL statements for current FHIR formulary pages."""
 
-from sqlalchemy import and_, bindparam, select
+from sqlalchemy import and_, bindparam, case, select
 
 from db.models import FHIRFormularyAlias
 from db.models import FHIRFormularyAliasVersion
@@ -12,6 +12,9 @@ from db.models import FHIRFormularyCurrent
 from db.models import FHIRFormularyDataset
 from db.models import FHIRFormularyDatasetAlias
 from db.models import FHIRFormularyDatasetCoveragePlan
+from db.models import FHIRFormularySourceArtifactSet
+from db.models import FHIRFormularyUHCAdmissionReceipt
+from process.formulary_fhir.uhc_source import UHC_FORMULARY_SOURCE_ID
 
 
 current = FHIRFormularyCurrent.__table__
@@ -22,8 +25,10 @@ version = FHIRFormularyCoveragePlanVersion.__table__
 dataset_alias = FHIRFormularyDatasetAlias.__table__
 alias = FHIRFormularyAlias.__table__
 alias_version = FHIRFormularyAliasVersion.__table__
+artifact_set = FHIRFormularySourceArtifactSet.__table__
+uhc_receipt = FHIRFormularyUHCAdmissionReceipt.__table__
 
-CURRENT_PLAN_FROM = (
+CURRENT_DATASET_FROM = (
     current.join(
         dataset,
         and_(
@@ -31,7 +36,40 @@ CURRENT_PLAN_FROM = (
             dataset.c.dataset_id == current.c.dataset_id,
         ),
     )
-    .join(
+    .outerjoin(
+        uhc_receipt,
+        and_(
+            uhc_receipt.c.source_id == dataset.c.source_id,
+            uhc_receipt.c.candidate_dataset_id == dataset.c.dataset_id,
+        ),
+    )
+    .outerjoin(
+        artifact_set,
+        and_(
+            artifact_set.c.source_id == uhc_receipt.c.source_id,
+            artifact_set.c.source_file_set_sha256
+            == uhc_receipt.c.source_file_set_sha256,
+        ),
+    )
+)
+COVERAGE_COLUMNS = (
+    case(
+        (current.c.source_id == UHC_FORMULARY_SOURCE_ID, True),
+        else_=False,
+    ).label("coverage_required"),
+    artifact_set.c.expected_file_count.label(
+        "coverage_expected_artifact_count"
+    ),
+    uhc_receipt.c.expected_file_count.label(
+        "coverage_receipt_expected_artifact_count"
+    ),
+    uhc_receipt.c.file_count.label("coverage_included_artifact_count"),
+    uhc_receipt.c.excluded_file_count.label(
+        "coverage_missing_artifact_count"
+    ),
+)
+CURRENT_PLAN_FROM = (
+    CURRENT_DATASET_FROM.join(
         dataset_plan,
         and_(
             dataset_plan.c.source_id == dataset.c.source_id,
@@ -76,6 +114,7 @@ DETAIL_COLUMNS = (
     version.c.upstream_last_updated.label("last_updated"),
     dataset.c.cutoff_at.label("as_of"),
     current.c.published_at,
+    *COVERAGE_COLUMNS,
 )
 
 CATALOG_MARKER_STATEMENT = (
@@ -89,16 +128,8 @@ CATALOG_MARKER_STATEMENT = (
     .order_by(plan.c.public_id)
 )
 CURRENT_DATASET_COUNTS_STATEMENT = (
-    select(dataset.c.dataset_id, dataset.c.list_count)
-    .select_from(
-        current.join(
-            dataset,
-            and_(
-                dataset.c.source_id == current.c.source_id,
-                dataset.c.dataset_id == current.c.dataset_id,
-            ),
-        )
-    )
+    select(dataset.c.dataset_id, dataset.c.list_count, *COVERAGE_COLUMNS)
+    .select_from(CURRENT_DATASET_FROM)
     .where(*CURRENT_DATASET_PREDICATES)
     .order_by(dataset.c.dataset_id)
 )
@@ -118,6 +149,7 @@ FORMULARY_CONTEXT_STATEMENT = (
         plan.c.public_id.label("formulary_id"),
         current.c.generation,
         current.c.published_at,
+        *COVERAGE_COLUMNS,
     )
     .select_from(CURRENT_PLAN_FROM)
     .where(
@@ -172,8 +204,11 @@ __all__ = (
     "ALIAS_PAGE_FROM",
     "ALIAS_PAGE_STATEMENT",
     "CATALOG_MARKER_STATEMENT",
+    "COVERAGE_COLUMNS",
+    "CURRENT_DATASET_FROM",
     "CURRENT_DATASET_COUNTS_STATEMENT",
     "CURRENT_PLAN_PREDICATES",
+    "DETAIL_COLUMNS",
     "FORMULARY_CONTEXT_STATEMENT",
     "FORMULARY_PAGE_STATEMENT",
     "alias",

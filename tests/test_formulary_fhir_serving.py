@@ -29,6 +29,11 @@ def _detail_record(**changes):
         "last_updated": LAST_UPDATED,
         "as_of": AS_OF,
         "published_at": PUBLISHED_AT,
+        "coverage_required": False,
+        "coverage_expected_artifact_count": None,
+        "coverage_receipt_expected_artifact_count": None,
+        "coverage_included_artifact_count": None,
+        "coverage_missing_artifact_count": None,
     }
     record_by_field.update(changes)
     return record_by_field
@@ -149,6 +154,7 @@ async def test_detail_uses_one_read_only_snapshot_and_allowlisted_payload():
         "last_updated": "2026-08-05T00:00:00Z",
         "as_of": "2026-08-06T00:00:00Z",
         "published_at": "2026-08-07T19:00:00Z",
+        "coverage": None,
     }
     assert session.events == [
         "begin",
@@ -201,6 +207,71 @@ async def test_optional_text_fields_remain_explicit_nulls():
     assert response_by_field["status"] is None
     assert response_by_field["title"] is None
     assert response_by_field["name"] is None
+
+
+@pytest.mark.asyncio
+async def test_partial_receipt_coverage_is_exposed_as_exact_aggregate():
+    session = _Session(
+        [
+            _detail_record(
+                coverage_required=True,
+                coverage_expected_artifact_count=48,
+                coverage_receipt_expected_artifact_count=48,
+                coverage_included_artifact_count=17,
+                coverage_missing_artifact_count=31,
+            )
+        ]
+    )
+
+    detail = await serving.read_current_fhir_formulary(
+        session,
+        FORMULARY_ID,
+        environment=ENABLED,
+    )
+
+    assert serving.public_fhir_formulary_payload(detail)["coverage"] == {
+        "status": "partial",
+        "expected_artifact_count": 48,
+        "included_artifact_count": 17,
+        "missing_artifact_count": 31,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "coverage_changes",
+    (
+        {
+            "coverage_required": True,
+            "coverage_expected_artifact_count": None,
+        },
+        {
+            "coverage_required": True,
+            "coverage_expected_artifact_count": 48,
+            "coverage_receipt_expected_artifact_count": 48,
+            "coverage_included_artifact_count": 17,
+            "coverage_missing_artifact_count": 30,
+        },
+        {
+            "coverage_required": True,
+            "coverage_expected_artifact_count": 48,
+            "coverage_receipt_expected_artifact_count": 47,
+            "coverage_included_artifact_count": 47,
+            "coverage_missing_artifact_count": 1,
+        },
+    ),
+)
+async def test_missing_or_inconsistent_uhc_receipt_coverage_fails_closed(
+    coverage_changes,
+):
+    session = _Session([_detail_record(**coverage_changes)])
+
+    with pytest.raises(serving.FHIRFormularyServingUnavailableError):
+        await serving.read_current_fhir_formulary(
+            session,
+            FORMULARY_ID,
+            environment=ENABLED,
+        )
 
 
 @pytest.mark.asyncio

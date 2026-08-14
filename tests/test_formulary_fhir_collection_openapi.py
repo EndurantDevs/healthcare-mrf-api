@@ -187,7 +187,12 @@ def test_collection_payload_schemas_are_closed_bounded_and_source_hidden():
     schemas = _specification()["components"]["schemas"]
     expected_fields_by_schema = {
         "FHIRFormularyPage": {"items", "next_cursor"},
-        "FHIRFormularyAlias": {"formulary_id", "alias_id", "drug_count"},
+        "FHIRFormularyAlias": {
+            "formulary_id",
+            "alias_id",
+            "drug_count",
+            "coverage",
+        },
         "FHIRFormularyAliasPage": {"items", "next_cursor"},
         "FHIRFormularyAlternatives": {
             "resolved_drug_ids",
@@ -207,6 +212,7 @@ def test_collection_payload_schemas_are_closed_bounded_and_source_hidden():
             "step_therapy",
             "quantity_limit",
             "alternatives",
+            "coverage",
         },
         "FHIRFormularyDrugPage": {"items", "next_cursor"},
     }

@@ -350,7 +350,7 @@ async def test_one_bad_file_does_not_starve_successes_and_retry_is_bounded() -> 
                 retryable=True,
             )
         retained_names.add(file_name)
-        return 4, "cs", file_name
+        return 4, "cs", file_name, file_name, False
 
     first_tasks = (
         asyncio.create_task(acquire("bad.json", fail=True)),
@@ -375,11 +375,11 @@ async def test_one_bad_file_does_not_starve_successes_and_retry_is_bounded() -> 
     assert "private upstream detail" not in str(caught.value)
     assert {progress_row[3] for progress_row in progress_rows} == retained_names
 
-    retry_bytes = await transport._complete_pending_tasks(
+    retry_result = await transport._complete_pending_tasks(
         (asyncio.create_task(acquire("bad.json")),),
         progress_callback=None,
     )
-    assert retry_bytes == 4
+    assert retry_result == (4, ())
     assert attempted_names.count("bad.json") == 2
     assert attempted_names.count("good-a.json") == 1
     assert attempted_names.count("good-b.json") == 1
@@ -387,21 +387,35 @@ async def test_one_bad_file_does_not_starve_successes_and_retry_is_bounded() -> 
 
 
 @pytest.mark.asyncio
+async def test_unmarked_nonretryable_failure_is_processing_evidence() -> None:
+    async def fail():
+        raise transport.UHCDrugArtifactAcquisitionError("private local detail")
+
+    with pytest.raises(transport.UHCDrugArtifactAcquisitionError) as caught:
+        await transport._complete_pending_tasks(
+            (asyncio.create_task(fail()),),
+            progress_callback=None,
+        )
+
+    assert caught.value.failure_evidence == ("artifact_processing",)
+
+
+@pytest.mark.asyncio
 async def test_lease_loss_is_preserved_and_cancels_pending_transport() -> None:
     sibling_started = asyncio.Event()
     sibling_cleaned = asyncio.Event()
 
-    async def lease_lost() -> tuple[int, str, str]:
+    async def lease_lost() -> tuple[int, str, str, str, bool]:
         await sibling_started.wait()
         raise UHCDrugSourceAcquisitionLeaseError("lease_lost")
 
-    async def sibling() -> tuple[int, str, str]:
+    async def sibling() -> tuple[int, str, str, str, bool]:
         sibling_started.set()
         try:
             await asyncio.Event().wait()
         finally:
             sibling_cleaned.set()
-        return 0, "cs", "never.json"
+        return 0, "cs", "never.json", "never", False
 
     tasks = (
         asyncio.create_task(lease_lost()),

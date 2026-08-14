@@ -367,6 +367,88 @@ async def load_complete_source_artifact_set(
     )
 
 
+def _selected_artifact_rows(
+    database_rows: list[dict[str, Any]],
+    selected_ids: set[str],
+    *,
+    require_unselected_pending: bool,
+) -> tuple[dict[str, Any], ...]:
+    selected_rows = []
+    for database_row in database_rows:
+        status = database_row.get("status")
+        if database_row.get("source_file_id") in selected_ids:
+            if status != "verified":
+                raise RuntimeError("FHIR formulary selected artifact is unavailable")
+            selected_rows.append(database_row)
+        elif status not in {"pending", "verified"} or (
+            require_unselected_pending and status != "pending"
+        ):
+            raise RuntimeError("FHIR formulary source artifact selection changed")
+    return tuple(selected_rows)
+
+
+async def load_selected_source_artifact_set(
+    identities: tuple[SourceArtifactIdentity, ...],
+    *,
+    selected_source_file_ids: tuple[str, ...],
+    require_unselected_pending: bool = False,
+    database: Any = db,
+    cancel_check: Callable[[], Any] | None = None,
+) -> VerifiedSourceArtifactSet:
+    """Load one deterministic verified subset from a complete registered census."""
+
+    expected_identities = validated_identity_set(identities)
+    if (
+        type(selected_source_file_ids) is not tuple
+        or not selected_source_file_ids
+        or type(require_unselected_pending) is not bool
+    ):
+        raise ValueError("FHIR formulary source artifact selection is invalid")
+    selected_ids = set(selected_source_file_ids)
+    canonical_selected_ids = tuple(
+        identity.source_file_id
+        for identity in expected_identities
+        if identity.source_file_id in selected_ids
+    )
+    if (
+        len(selected_ids) != len(selected_source_file_ids)
+        or canonical_selected_ids != selected_source_file_ids
+    ):
+        raise ValueError("FHIR formulary source artifact selection is invalid")
+    first_identity = expected_identities[0]
+    await _require_set_header(database, expected_identities)
+    database_rows = await _artifact_records_for_set(
+        database,
+        first_identity.source_id,
+        first_identity.source_file_set_sha256,
+    )
+    _require_exact_rows(database_rows, expected_identities)
+    selected_rows = _selected_artifact_rows(
+        database_rows, selected_ids, require_unselected_pending=require_unselected_pending
+    )
+    artifacts = tuple(
+        sorted(
+            (artifact_from_row(database_row) for database_row in selected_rows),
+            key=artifact_sort_key,
+        )
+    )
+    for artifact in artifacts:
+        await _invoke_cancel_check(cancel_check)
+        await cancellable_to_thread(
+            _verify_retained_source_artifact,
+            artifact.artifact_sha256,
+            artifact.artifact_byte_count,
+        )
+    await _invoke_cancel_check(cancel_check)
+    return VerifiedSourceArtifactSet(
+        source_id=first_identity.source_id,
+        source_file_set_sha256=first_identity.source_file_set_sha256,
+        raw_listing_projection_sha256=first_identity.raw_listing_projection_sha256,
+        artifacts=artifacts,
+        artifact_set_sha256=artifact_set_sha256(artifacts),
+    )
+
+
 async def reopen_source_artifact_set(
     source_id: str,
     source_file_set_sha256: str,
@@ -404,6 +486,7 @@ __all__ = (
     "artifact_set_sha256",
     "bind_verified_source_artifact",
     "load_complete_source_artifact_set",
+    "load_selected_source_artifact_set",
     "reopen_source_artifact_set",
     "load_source_artifact_identities",
     "open_verified_source_artifact",

@@ -28,10 +28,13 @@ HLTHPRT_UHC_FORMULARY_WORK_DIRECTORY=/work/uhc-formulary \
 ```
 
 The work directory must already exist, resolve without symlinks, belong to the
-runtime UID, and grant no group or other permissions. Acquisition fails closed
-unless all 48 advertised files download as nonempty top-level JSON object
-arrays and match the retained identity contract. A source URL that returns an
-error document is not skipped and no partial catalog can be admitted.
+runtime UID, and grant no group or other permissions. The catalog still must
+prove all 48 advertised identities. Each file selected for a run must download
+as a nonempty top-level JSON object array and match the retained identity
+contract. An invalid, rejected, or temporarily unavailable source artifact is
+excluded from that run and contributes no records. Local processing,
+configuration, claim/cancellation failure, or an empty validated selection
+aborts the run.
 
 After artifact verification, the operator derives one canonical cutoff from
 the latest immutable artifact verification timestamp. It independently builds
@@ -39,10 +42,11 @@ two private SQLite spools, writes two full repository roots, admits their exact
 PostgreSQL graph match, and records a durable UHC admission receipt. Admission
 does not advance the current formulary pointer.
 
-The JSON result contains only bounded counts, opaque run/dataset/receipt IDs,
-timestamps, and content hashes. It contains no drug, plan, NPI, or URL values.
-An interrupted run is retried with the same selector; verified artifacts and
-completed immutable checkpoints are reused.
+The JSON result contains only bounded counts, aggregate coverage, opaque
+run/dataset/receipt IDs, timestamps, and content hashes. It contains no drug,
+plan, NPI, omitted artifact identity, or URL values. An interrupted run is
+retried with the same selector; verified artifacts and completed immutable
+checkpoints are reused.
 
 ## Publish one receipt
 
@@ -59,9 +63,10 @@ HLTHPRT_UHC_FORMULARY_PUBLICATION_ENABLED=true \
 
 The publication path imports no downloader or network client. Under a fresh
 source lease it reloads the receipt, generic twin admission, exact 48-row
-artifact ledger, and retained bytes; recomputes their contract; and only then
-uses the existing atomic repository publisher. Missing or corrupt retained
-bytes, source drift, admission drift, or predecessor drift leave the pointer
+advertised ledger, the receipt's private selected artifact IDs, and their
+retained bytes; recomputes their contract; and only then uses the existing
+atomic repository publisher. Missing or corrupt selected bytes, selection or
+source drift, admission drift, or predecessor drift leave the pointer
 unchanged. Exact replay returns the original generation and timestamp.
 
 ## Runtime boundary and acceptance
@@ -72,7 +77,9 @@ set to lowercase `true`. Record the exact image digest, migration head, retained
 observation hash, receipt, counts, content roots, pointer before/after, storage
 reserve, and Job/Pod outcome. A green library test or an admitted receipt is not
 publication proof, and publication is not proof that every upstream file was
-available unless the retained receipt proves the complete 24+24 census.
+available unless the retained receipt reports complete coverage. A partial
+receipt must report the exact aggregate expected, validated, and excluded
+counts without exposing the omitted source identity.
 
 The cross-source decisions and binary gates are maintained in
 [Provider-directory and formulary source acceptance](provider-directory-formulary-source-acceptance.md).

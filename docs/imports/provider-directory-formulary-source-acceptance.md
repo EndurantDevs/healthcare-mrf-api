@@ -19,10 +19,13 @@ reset cannot silently broaden or weaken the result.
   independent payer source in Profile evidence.
 - Drug identity is derived from the already-retained IFP and Community & State
   listing bytes. The adapter must not fetch either listing again.
-- The drug catalog is exactly 24 IFP plus 24 Community & State files. Missing,
-  non-JSON, malformed, or conflicting files block admission; 47 of 48 is not a
-  complete publication. One normalized source URL cannot identify two files or
-  appear in both families.
+- The advertised drug catalog remains exactly 24 IFP plus 24 Community & State
+  identities. Each selected artifact must pass the unchanged transport, byte,
+  and full JSON-array validation. An invalid, rejected, or temporarily
+  unavailable source artifact is excluded from that run; it is never parsed or
+  admitted. Local processing, configuration, claim/cancellation failure, or an
+  empty validated selection still blocks admission. One
+  normalized source URL cannot identify two files or appear in both families.
 - One durable source-scoped acquisition claim covers the retained listing
   snapshot and every drug-file HTTP request. Its monotonic generation, random
   token, expiry, heartbeat, and fenced release admit only one live claimant to
@@ -33,9 +36,10 @@ reset cannot silently broaden or weaken the result.
 - Drug bytes use the existing content-addressed retained store. Independent
   normalization roots and retries reopen those bytes rather than redownload or
   duplicate them. A per-file failure does not cancel successful siblings: the
-  bounded task set drains, verified artifacts and sanitized aggregate failure
-  evidence are retained, and the run still fails before parsing or admission.
-  The next attempt requests only identities that remain unresolved.
+  bounded task set drains and verified artifacts are retained. Source rejection
+  or temporary unavailability is represented by the run's exact private
+  selection and public aggregate coverage; internal or local failure still
+  aborts. The next attempt requests only identities that remain unresolved.
 - Drug records publish only through the immutable `formulary_fhir` repository.
   The adapter must not invoke the legacy formulary importer or write legacy
   plan-drug relations.
@@ -49,14 +53,16 @@ The drug slice is acceptable only when all of the following are true:
 
 1. The retained observation proves exactly 24+24 drug identities with 48
    distinct normalized source URLs.
-2. Every retained file passes the real-source schema and resource-bound census.
+2. Every selected retained file passes the real-source schema and
+   resource-bound census; excluded identities contribute no bytes or records.
 3. One fenced acquisition generation covers catalog snapshot and HTTP work.
-   Acquisition, retry, and both roots use the same artifact set; a partial
-   failure drains all siblings and retry performs zero network requests for
-   already verified files.
-4. Both full repository roots match and PostgreSQL records one exact admission.
-5. A durable receipt binds the listing observation, artifact set, spool proof,
-   repository graph, and source configuration.
+   Acquisition, retry, and both roots use the same exact nonempty selected
+   artifact set; failed siblings drain and retry performs zero network requests
+   for already verified files.
+4. Both repository roots match and PostgreSQL records one exact admission.
+5. A durable receipt binds the complete listing observation, private selected
+   artifact IDs, aggregate coverage, artifact set, spool proof, repository
+   graph, and source configuration.
 6. A fresh process can publish from the receipt alone; exact replay keeps one
    generation and the original publication timestamp.
 7. Missing or corrupt retained bytes, source drift, admission drift, or pointer
@@ -72,12 +78,14 @@ The Flex slice is acceptable only when all of the following are true:
 3. Requests are exact identifier searches. Broad collection scans, inferred
    offsets, comma-OR batches, and the generic probe importer are not used.
 4. Every admitted resource is a Practitioner carrying only the requested
-   canonical NPI. A valid resource carrying the requested NPI plus another NPI
-   is quarantined; pagination, cap overflow, foreign-only rows, or conflicting
-   duplicate IDs fail closed. If every valid resource is quarantined, the query
-   records `unmatched` and retains no payload; twin proof intentionally compares
-   admitted semantic output and does not distinguish that result from an empty
-   searchset.
+   canonical NPI. A resource missing it, mixing it with another NPI, or carrying
+   malformed same-system identifiers is quarantined before ID and duplicate
+   processing. Invalid sibling entries and conflicting duplicate IDs are
+   quarantined while unrelated clean rows continue; pagination, cap overflow,
+   or invalid bundle structure still fail closed. If every resource is
+   quarantined, the query records `unmatched` and retains no payload; twin proof
+   intentionally compares admitted semantic output and does not distinguish
+   that result from an empty searchset.
 5. Two fresh complete cohort acquisitions produce the same immutable semantic
    dataset proof before any publication decision.
 6. Dataset metadata states `cohort_complete=true`,

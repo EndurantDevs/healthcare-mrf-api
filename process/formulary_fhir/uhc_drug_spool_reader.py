@@ -23,6 +23,9 @@ from process.formulary_fhir.uhc_drug_parser_contract import UHCDrugSpoolEvidence
 from process.formulary_fhir.uhc_drug_parser_contract import uhc_drug_plan_alias
 from process.formulary_fhir.uhc_drug_spool_contract import artifact_proof_rows
 from process.formulary_fhir.uhc_drug_spool_contract import (
+    PARTIAL_SPOOL_EVIDENCE_FIELDS,
+)
+from process.formulary_fhir.uhc_drug_spool_contract import (
     SPOOL_ARTIFACT_PROOF_FIELDS,
 )
 from process.formulary_fhir.uhc_drug_spool_contract import SPOOL_EVIDENCE_FIELDS
@@ -227,7 +230,8 @@ def _verified_spool_metadata_records(
     artifact_proof_by_index = decode_spool_json(metadata_rows[0][1], list)
     expected_artifact_proof_rows = list(artifact_proof_rows(artifact_set))
     if (
-        set(evidence_by_field) != SPOOL_EVIDENCE_FIELDS
+        set(evidence_by_field)
+        not in {SPOOL_EVIDENCE_FIELDS, PARTIAL_SPOOL_EVIDENCE_FIELDS}
         or evidence_by_field != spool_evidence_payload(evidence)
         or artifact_proof_by_index != expected_artifact_proof_rows
         or any(

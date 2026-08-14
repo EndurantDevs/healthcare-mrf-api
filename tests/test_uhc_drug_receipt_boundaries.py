@@ -20,6 +20,7 @@ import process.formulary_fhir.uhc_drug_release as release_module
 from tests.test_uhc_drug_receipt import _receipt_row
 from tests.uhc_drug_receipt_test_support import admission_receipt
 from tests.uhc_drug_receipt_test_support import admitted_twin
+from tests.uhc_drug_receipt_test_support import artifact_acquisition_result
 from tests.uhc_drug_receipt_test_support import OBSERVATION_SHA256
 from tests.uhc_drug_receipt_test_support import source_binding
 
@@ -133,6 +134,7 @@ async def test_record_rechecks_artifacts_and_admission_under_lease(
     """Receipt recording rejects retained-set or stored-admission drift."""
 
     twin_result, artifacts = admitted_twin()
+    acquisition = artifact_acquisition_result(artifacts)
     monkeypatch.setattr(
         receipt_module,
         "register_uhc_formulary_source",
@@ -147,8 +149,7 @@ async def test_record_rechecks_artifacts_and_admission_under_lease(
 
     with pytest.raises(RuntimeError, match="artifacts changed"):
         await receipt_module._record_receipt_under_lease(
-            source_observation_sha256=OBSERVATION_SHA256,
-            artifacts=artifacts,
+            acquisition=acquisition,
             twin_result=twin_result,
             database=object(),
         )
@@ -161,8 +162,7 @@ async def test_record_rechecks_artifacts_and_admission_under_lease(
     )
     with pytest.raises(RuntimeError, match="admission changed"):
         await receipt_module._record_receipt_under_lease(
-            source_observation_sha256=OBSERVATION_SHA256,
-            artifacts=artifacts,
+            acquisition=acquisition,
             twin_result=twin_result,
             database=object(),
         )
@@ -175,6 +175,7 @@ async def test_record_wrapper_validates_inputs_and_uses_source_lease(
     """Only exact artifact and twin types reach the leased recorder."""
 
     twin_result, artifacts = admitted_twin()
+    acquisition = artifact_acquisition_result(artifacts)
     expected = admission_receipt(twin_result)
     monkeypatch.setattr(
         receipt_module.manual_lock,
@@ -186,22 +187,19 @@ async def test_record_wrapper_validates_inputs_and_uses_source_lease(
 
     with pytest.raises(ValueError, match="input is invalid"):
         await receipt_module.record_uhc_drug_admission_receipt(
-            source_observation_sha256=OBSERVATION_SHA256,
-            artifacts=object(),
+            acquisition=object(),
             twin_result=twin_result,
             database=object(),
         )
     with pytest.raises(ValueError, match="input is invalid"):
         await receipt_module.record_uhc_drug_admission_receipt(
-            source_observation_sha256=OBSERVATION_SHA256,
-            artifacts=artifacts,
+            acquisition=acquisition,
             twin_result=object(),
             database=object(),
         )
 
     observed = await receipt_module.record_uhc_drug_admission_receipt(
-        source_observation_sha256=OBSERVATION_SHA256,
-        artifacts=artifacts,
+        acquisition=acquisition,
         twin_result=twin_result,
         database=object(),
     )

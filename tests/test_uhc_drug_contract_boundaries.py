@@ -156,6 +156,29 @@ def test_spool_contract_rejects_counts_and_accepts_unknown_update_time() -> None
         )
 
 
+def test_spool_contract_reports_partial_artifact_coverage() -> None:
+    artifacts, _bodies = artifact_set()
+    partial = parser_contract.UHCDrugSpoolEvidence(
+        source_id=artifacts.source_id,
+        source_file_set_sha256=artifacts.source_file_set_sha256,
+        artifact_set_sha256="c" * 64,
+        spool_content_sha256="d" * 64,
+        file_count=47,
+        raw_record_count=47,
+        raw_plan_entry_count=47,
+        plan_count=2,
+        medication_membership_count=2,
+        duplicate_count=45,
+        superseded_count=0,
+        max_last_updated_at=None,
+        expected_file_count=48,
+        excluded_file_count=1,
+    )
+
+    assert partial.is_coverage_complete is False
+    assert partial.coverage_status == "partial"
+
+
 def test_payload_private_boundaries_reject_malformed_event_streams(
     monkeypatch,
 ) -> None:
@@ -217,6 +240,8 @@ def test_payload_rejects_trailing_root_value(monkeypatch) -> None:
         "not-a-date",
         "2026-08-10T00:00:00",
         "2026-08-10T01:00:00+01:00",
+        "0001-01-01T00:00:00+14:00",
+        "9999-12-31T23:59:59-14:00",
     ],
 )
 def test_normalization_rejects_noncanonical_catalog_timestamps(timestamp) -> None:
@@ -242,6 +267,8 @@ def test_normalization_accepts_date_and_rejects_invalid_record_timestamps() -> N
     for raw_timestamp in (
         "2026-02-30",
         "2026-08-10T00:00:00",
+        "0001-01-01T00:00:00+14:00",
+        "9999-12-31T23:59:59-14:00",
     ):
         with pytest.raises(normalization.UHCDrugNormalizationError):
             normalization._record_timestamp(raw_timestamp, fallback)

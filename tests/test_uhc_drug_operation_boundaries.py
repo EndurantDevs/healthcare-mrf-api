@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
@@ -125,11 +126,9 @@ def test_serializers_reject_wrong_types_and_forged_publication() -> None:
 
 def test_acquisition_result_rejects_cross_receipt_drift(monkeypatch) -> None:
     acquisition, identities, recorded = _acquisition_fixture()
-    changed_acquisition = SimpleNamespace(
-        **{
-            **acquisition.__dict__,
-            "source_observation_sha256": "e" * 64,
-        }
+    changed_acquisition = replace(
+        acquisition,
+        source_observation_sha256="e" * 64,
     )
     with pytest.raises(operation.UHCDrugOperationError) as mismatch_error:
         acquire_operation._admission_result(

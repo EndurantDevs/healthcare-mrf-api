@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 from types import SimpleNamespace
 import uuid
 
@@ -29,6 +30,9 @@ from tests.test_formulary_fhir_storage_postgres import TABLE_NAMES
 from tests.test_formulary_fhir_synthetic_seed_publisher_postgres import (
     _prepare_schema as _prepare_seed_schema,
 )
+from tests.formulary_fhir_twin_admission_pg_support import ADMISSION_PATH
+from tests.formulary_fhir_twin_admission_pg_support import ATTEMPT_PATH
+from tests.formulary_fhir_twin_admission_pg_support import load_migration
 
 
 SOURCE_A = "source-alpha"
@@ -45,6 +49,14 @@ AS_OF = dt.datetime(2026, 8, 6, 11, tzinfo=dt.UTC)
 VERIFIED_AT = dt.datetime(2026, 8, 7, 18, tzinfo=dt.UTC)
 PUBLISHED_AT = dt.datetime(2026, 8, 7, 19, tzinfo=dt.UTC)
 PERIOD_START = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+VERSIONS = Path(ATTEMPT_PATH).parent
+DEPENDENT_MIGRATION_PATHS = (
+    ATTEMPT_PATH,
+    ADMISSION_PATH,
+    VERSIONS / "20260810030000_fhir_formulary_source_artifact.py",
+    VERSIONS / "20260810040000_fhir_formulary_uhc_admission_receipt.py",
+    VERSIONS / "20260814010000_fhir_formulary_uhc_selected_receipt.py",
+)
 DATASET_ROWS = (
     (
         "dataset-a-current",
@@ -104,12 +116,22 @@ DATASET_ROWS = (
 )
 
 
+async def _upgrade_dependent_schema(engine) -> None:
+    migrations = tuple(
+        load_migration(path, f"fhir_serving_{index}")
+        for index, path in enumerate(DEPENDENT_MIGRATION_PATHS)
+    )
+    for migration in migrations:
+        await _run_migration_action(engine, migration, "upgrade")
+
+
 async def _create_migrated_schema(engine, schema_name: str) -> None:
     async with engine.begin() as engine_connection:
         await engine_connection.exec_driver_sql(
             f"CREATE SCHEMA {_quoted(schema_name)}"
         )
     await _run_migration_action(engine, _load_migration(), "upgrade")
+    await _upgrade_dependent_schema(engine)
 
 
 async def _insert_sources(connection, schema_name: str) -> None:
@@ -284,6 +306,7 @@ async def _assert_current_detail(session_factory):
         "last_updated": "2026-08-05T10:00:00Z",
         "as_of": "2026-08-06T11:00:00Z",
         "published_at": "2026-08-07T19:00:00Z",
+        "coverage": None,
     }
     return current_response
 
@@ -335,6 +358,7 @@ async def test_verified_seed_publication_serves_with_source_disabled(monkeypatch
             schema_name,
             migration_engine,
         )
+        await _upgrade_dependent_schema(migration_engine)
         publication = await publish_synthetic_seed()
         monkeypatch.setenv(serving.FHIR_FORMULARY_SERVING_ENABLED_ENV, "true")
         connection = await _connect(database_url)
@@ -351,6 +375,7 @@ async def test_verified_seed_publication_serves_with_source_disabled(monkeypatch
             "last_updated": "2026-08-01T12:00:00Z",
             "as_of": "2026-08-06T00:00:00Z",
             "published_at": _utc_text(publication.published_at),
+            "coverage": None,
         }
         assert publication.dataset_id == expected_evidence()["dataset_id"]
         assert await connection.fetchval(

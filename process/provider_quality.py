@@ -352,27 +352,31 @@ async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str,
     return staging_model_by_name, db_schema
 
 
+async def _write_bounded_csv_response(response, path: str, max_bytes: int) -> None:
+    downloaded = 0
+    async with async_open(path, "wb+") as afp:
+        async for chunk in response.content.iter_chunked(1024 * 1024):
+            if not chunk:
+                break
+            remaining = max_bytes - downloaded
+            if remaining <= 0:
+                break
+            chunk = chunk if len(chunk) <= remaining else chunk[:remaining]
+            await afp.write(chunk)
+            downloaded += len(chunk)
+            if downloaded >= max_bytes:
+                break
+
+
 async def _download_csv_head(url: str, path: str, max_bytes: int) -> None:
     client = await get_http_client()
-    downloaded = 0
     async with client:
         async with client.get(
             url,
             timeout=aiohttp.ClientTimeout(total=600, connect=60, sock_read=600),
         ) as response:
             response.raise_for_status()
-            async with async_open(path, "wb+") as afp:
-                async for chunk in response.content.iter_chunked(1024 * 1024):
-                    if not chunk:
-                        break
-                    remaining = max_bytes - downloaded
-                    if remaining <= 0:
-                        break
-                    data = chunk if len(chunk) <= remaining else chunk[:remaining]
-                    await afp.write(data)
-                    downloaded += len(data)
-                    if downloaded >= max_bytes:
-                        break
+            await _write_bounded_csv_response(response, path, max_bytes)
 
 
 def _qpp_url_for_year(year: int) -> str:
@@ -499,6 +503,22 @@ def _provider_quality_chunk_descriptor(
     }
 
 
+def _write_provider_quality_chunk(
+    dataset_key: str,
+    chunks_dir: Path,
+    header: str,
+    chunk_rows: list[str],
+    chunk_index: int,
+) -> dict[str, Any]:
+    """Write one provider-quality chunk and return its descriptor."""
+
+    chunk_path = chunks_dir / f"chunk_{chunk_index:05d}.csv"
+    with open(chunk_path, "w", encoding="utf-8", newline="") as out:
+        out.write(header)
+        out.writelines(chunk_rows)
+    return _provider_quality_chunk_descriptor(dataset_key, chunk_index, chunk_path)
+
+
 async def _split_source_into_chunks(
     dataset_key: str,
     source_path: str,
@@ -523,27 +543,6 @@ async def _split_source_into_chunks(
         row_number = 0
         accepted = 0
 
-        def flush_chunk() -> None:
-            """Write the active provider-quality chunk to disk."""
-
-            nonlocal chunk_rows, chunk_bytes, chunk_index
-            if not chunk_rows:
-                return
-            chunk_path = chunks_dir / f"chunk_{chunk_index:05d}.csv"
-            with open(chunk_path, "w", encoding="utf-8", newline="") as out:
-                out.write(header)
-                out.writelines(chunk_rows)
-            chunks.append(
-                _provider_quality_chunk_descriptor(
-                    dataset_key,
-                    chunk_index,
-                    chunk_path,
-                )
-            )
-            chunk_rows = []
-            chunk_bytes = 0
-            chunk_index += 1
-
         for line in src:
             row_number += 1
             if test_mode:
@@ -556,8 +555,20 @@ async def _split_source_into_chunks(
             chunk_bytes += len(line.encode("utf-8", errors="ignore"))
             accepted += 1
             if chunk_bytes >= PROVIDER_QUALITY_CHUNK_TARGET_BYTES:
-                flush_chunk()
-        flush_chunk()
+                chunks.append(
+                    _write_provider_quality_chunk(
+                        dataset_key, chunks_dir, header, chunk_rows, chunk_index
+                    )
+                )
+                chunk_rows = []
+                chunk_bytes = 0
+                chunk_index += 1
+        if chunk_rows:
+            chunks.append(
+                _write_provider_quality_chunk(
+                    dataset_key, chunks_dir, header, chunk_rows, chunk_index
+                )
+            )
     return chunks
 
 
@@ -569,6 +580,24 @@ def _extract_qpp_score(row: dict[str, Any], *keys: str) -> float | None:
             cleaned = cleaned[:-1]
         value = cleaned
     return _to_float(value)
+
+
+def _missing_svi_zcta_example(svi_csv_fields: dict[str, Any]) -> str:
+    zcta_field_by_name = {
+        "FIPS": svi_csv_fields.get("FIPS"),
+        "LOCATION": svi_csv_fields.get("LOCATION"),
+        "ZCTA": svi_csv_fields.get("ZCTA"),
+        "ZCTA5": svi_csv_fields.get("ZCTA5"),
+        "ZIP": svi_csv_fields.get("ZIP"),
+    }
+    present_zcta_field_by_name = {
+        key: field_value
+        for key, field_value in zcta_field_by_name.items()
+        if field_value not in (None, "")
+    }
+    if not present_zcta_field_by_name:
+        present_zcta_field_by_name = {"keys": list(svi_csv_fields.keys())[:6]}
+    return json.dumps(present_zcta_field_by_name, ensure_ascii=True)[:220]
 
 
 async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mode: bool) -> None:
@@ -717,21 +746,9 @@ async def _load_svi_rows(path: str, svi_cls: type, reporting_year: int, test_mod
             if not zcta:
                 skipped_missing_zcta += 1
                 if len(missing_zcta_examples) < 3:
-                    missing_zcta_field_by_name = {
-                        "FIPS": svi_csv_fields.get("FIPS"),
-                        "LOCATION": svi_csv_fields.get("LOCATION"),
-                        "ZCTA": svi_csv_fields.get("ZCTA"),
-                        "ZCTA5": svi_csv_fields.get("ZCTA5"),
-                        "ZIP": svi_csv_fields.get("ZIP"),
-                    }
-                    present_zcta_field_by_name = {
-                        key: field_value
-                        for key, field_value in missing_zcta_field_by_name.items()
-                        if field_value not in (None, "")
-                    }
-                    if not present_zcta_field_by_name:
-                        present_zcta_field_by_name = {"keys": list(svi_csv_fields.keys())[:6]}
-                    missing_zcta_examples.append(json.dumps(present_zcta_field_by_name, ensure_ascii=True)[:220])
+                    missing_zcta_examples.append(
+                        _missing_svi_zcta_example(svi_csv_fields)
+                    )
                 continue
             year = _to_int(_pick_first(svi_csv_fields, "year", "Year"))
             year = max(year or reporting_year, 2013)

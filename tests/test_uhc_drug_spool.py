@@ -10,6 +10,7 @@ import os
 import pytest
 
 import process.formulary_fhir.uhc_drug_spool as spool
+from process.formulary_fhir.source_artifact_contract import artifact_set_sha256
 from process.formulary_fhir.async_safety import CooperativeThreadCancellation
 from process.formulary_fhir.uhc_drug_normalization import (
     normalized_uhc_drug_memberships,
@@ -59,6 +60,32 @@ def test_spool_streams_exact_set_and_merges_identical_provenance(
         10,
         tzinfo=dt.UTC,
     )
+
+
+def test_spool_streams_every_selected_artifact_and_reports_partial_coverage(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    artifacts, bodies = artifact_set()
+    selected = artifacts.artifacts[1:]
+    partial_artifacts = type(artifacts)(
+        source_id=artifacts.source_id,
+        source_file_set_sha256=artifacts.source_file_set_sha256,
+        raw_listing_projection_sha256=artifacts.raw_listing_projection_sha256,
+        artifacts=selected,
+        artifact_set_sha256=artifact_set_sha256(selected),
+    )
+    install_artifact_reader(monkeypatch, spool, bodies)
+
+    evidence = spool.materialize_uhc_drug_spool(
+        partial_artifacts,
+        spool_path=tmp_path / "partial.sqlite",
+    )
+
+    assert evidence.file_count == 47
+    assert evidence.expected_file_count == 48
+    assert evidence.excluded_file_count == 1
+    assert evidence.is_coverage_complete is False
 
 
 def test_spool_expands_years_and_preserves_unknown_fields(
@@ -153,6 +180,7 @@ def test_spool_rejects_symlinked_destination_before_creation(
         lambda row: row["plans"][0].update({"prior_authorization": 1}),
         lambda row: row["plans"][0].update({"years": []}),
         lambda row: row["plans"][0].update({"plan_id": " padded "}),
+        lambda row: row["plans"][0].update({"plan_id_type": "invalid type"}),
     ],
 )
 def test_spool_rejects_noncontract_source_shapes(

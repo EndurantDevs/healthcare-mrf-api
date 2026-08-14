@@ -150,6 +150,45 @@ def _result_scalar(result):
     return first
 
 
+def _normalize_plan_variant(raw_variant):
+    if raw_variant is None:
+        return None
+    if isinstance(raw_variant, (list, tuple)):
+        if not raw_variant:
+            return None
+        normalized_variant = raw_variant[0]
+    elif isinstance(raw_variant, str):
+        normalized_variant = raw_variant.strip()
+        if normalized_variant.startswith("(") and normalized_variant.endswith(")"):
+            normalized_variant = normalized_variant[1:-1].strip()
+            if normalized_variant.endswith(","):
+                normalized_variant = normalized_variant[:-1]
+            if (
+                normalized_variant.startswith("'")
+                and normalized_variant.endswith("'")
+            ) or (
+                normalized_variant.startswith('"')
+                and normalized_variant.endswith('"')
+            ):
+                normalized_variant = normalized_variant[1:-1]
+    else:
+        normalized_variant = raw_variant
+    normalized_text = str(normalized_variant).strip()
+    return normalized_text or None
+
+
+def _unique_plan_variants(raw_variants):
+    seen_variants = set()
+    ordered_variants = []
+    for raw_variant in raw_variants:
+        normalized_variant = _normalize_plan_variant(raw_variant)
+        if normalized_variant is None or normalized_variant in seen_variants:
+            continue
+        seen_variants.add(normalized_variant)
+        ordered_variants.append(normalized_variant)
+    return ordered_variants
+
+
 
 
 def _plan_level_plan_id_column(table):
@@ -1249,36 +1288,7 @@ async def get_plan(request, plan_id, year=None, variant=None):
 
     variant_result = await session.execute(variant_stmt)
 
-    def _unique(values):
-        seen_values = set()
-        ordered_values = []
-        for value in values:
-            if value is None:
-                continue
-            if isinstance(value, (list, tuple)):
-                if not value:
-                    continue
-                value = value[0]
-            elif isinstance(value, str):
-                trimmed = value.strip()
-                if trimmed.startswith("(") and trimmed.endswith(")"):
-                    trimmed = trimmed[1:-1].strip()
-                    if trimmed.endswith(","):
-                        trimmed = trimmed[:-1]
-                    if (trimmed.startswith("'") and trimmed.endswith("'")) or (
-                        trimmed.startswith('"') and trimmed.endswith('"')
-                    ):
-                        trimmed = trimmed[1:-1]
-                    value = trimmed
-                else:
-                    value = trimmed
-            normalized = str(value).strip()
-            if normalized and normalized not in seen_values:
-                seen_values.add(normalized)
-                ordered_values.append(normalized)
-        return ordered_values
-
-    variants = _unique(
+    variants = _unique_plan_variants(
         [
             variant_row[0]
             if isinstance(variant_row, (list, tuple))
@@ -1291,7 +1301,7 @@ async def get_plan(request, plan_id, year=None, variant=None):
     plan_data["plan_benefits"] = {}
 
     def _normalize_single(value):
-        cleaned = _unique([value])
+        cleaned = _unique_plan_variants([value])
         return cleaned[0] if cleaned else None
 
     plan_attr_stmt = select(plan_attributes_table).where(
@@ -1369,7 +1379,7 @@ async def get_plan(request, plan_id, year=None, variant=None):
             )
         ).order_by(plan_attributes_table.c.full_plan_id.asc())
         fallback_result = await session.execute(fallback_stmt)
-        variants = _unique(
+        variants = _unique_plan_variants(
             [
                 fallback_row[0]
                 if isinstance(fallback_row, (list, tuple))
@@ -1378,7 +1388,7 @@ async def get_plan(request, plan_id, year=None, variant=None):
             ]
         )
 
-    variants = _unique(variants)
+    variants = _unique_plan_variants(variants)
     plan_data["variants"] = variants
 
     active_variant = _normalize_single(variant) if variant else (variants[0] if variants else None)

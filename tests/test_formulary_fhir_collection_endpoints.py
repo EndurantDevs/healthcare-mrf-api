@@ -4,16 +4,23 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from api.endpoint import formulary_fhir as endpoint
+from api.formulary_fhir_catalog import PublicFHIRFormularyAlias
 from api.formulary_fhir_catalog import PublicFHIRFormularyAliasPage
 from api.formulary_fhir_catalog import PublicFHIRFormularyPage
+from api.formulary_fhir_drug_values import PublicFHIRFormularyAlternatives
+from api.formulary_fhir_drug_values import PublicFHIRFormularyDrug
 from api.formulary_fhir_drug_values import PublicFHIRFormularyDrugPage
 from api.formulary_fhir_serving import FHIRFormularyCursorConflictError
+from api.formulary_fhir_serving import PublicFHIRFormularyCoverage
+from api.formulary_fhir_serving import PublicFHIRFormularyDetail
 
 
 FORMULARY_ID = "fhir_at4rcuzsyttz7txu3xtoxsa734"
@@ -60,6 +67,127 @@ def _request(*, arguments=None, session=None):
 
 def _payload(http_response):
     return json.loads(http_response.body)
+
+
+def _partial_coverage_entities():
+    coverage = PublicFHIRFormularyCoverage(
+        status="partial",
+        expected_artifact_count=48,
+        included_artifact_count=17,
+        missing_artifact_count=31,
+    )
+    observed_at = dt.datetime(2026, 8, 14, tzinfo=dt.UTC)
+    detail = PublicFHIRFormularyDetail(
+        formulary_id=FORMULARY_ID,
+        status="current",
+        title="Synthetic Coverage Plan",
+        name="Synthetic Formulary",
+        period_start=None,
+        period_end=None,
+        last_updated=observed_at,
+        as_of=observed_at,
+        published_at=observed_at,
+        coverage=coverage,
+    )
+    alias = PublicFHIRFormularyAlias(
+        formulary_id=FORMULARY_ID,
+        alias_id=ALIAS_ID,
+        drug_count=1,
+        coverage=coverage,
+    )
+    drug = PublicFHIRFormularyDrug(
+        formulary_id=FORMULARY_ID,
+        alias_id=ALIAS_ID,
+        drug_id=DRUG_ID,
+        status="active",
+        name="Synthetic Medication",
+        rxnorm_id=None,
+        ndc11=None,
+        last_updated=observed_at,
+        tier=None,
+        prior_authorization=None,
+        step_therapy=None,
+        quantity_limit=None,
+        alternatives=PublicFHIRFormularyAlternatives((), 0),
+        coverage=coverage,
+    )
+    return detail, alias, drug
+
+
+def _install_partial_coverage_readers(monkeypatch, detail, alias, drug):
+    return_value_by_reader = {
+        "read_current_fhir_formularies": PublicFHIRFormularyPage((detail,), None),
+        "read_current_fhir_formulary": detail,
+        "read_current_fhir_formulary_aliases": PublicFHIRFormularyAliasPage(
+            (alias,), None
+        ),
+        "read_current_fhir_formulary_drug_page": PublicFHIRFormularyDrugPage(
+            (drug,), None
+        ),
+        "read_current_fhir_formulary_drug": drug,
+    }
+    for reader_name, return_value in return_value_by_reader.items():
+        monkeypatch.setattr(
+            endpoint,
+            reader_name,
+            AsyncMock(return_value=return_value),
+        )
+
+
+@pytest.mark.asyncio
+async def test_all_success_routes_expose_the_same_partial_coverage(monkeypatch):
+    detail, alias, drug = _partial_coverage_entities()
+    _install_partial_coverage_readers(monkeypatch, detail, alias, drug)
+
+    responses_and_item_selectors = (
+        (await endpoint.get_current_formularies(_request()), "items"),
+        (
+            await endpoint.get_current_formulary_detail(
+                _request(),
+                FORMULARY_ID,
+            ),
+            None,
+        ),
+        (
+            await endpoint.get_current_formulary_aliases(
+                _request(),
+                FORMULARY_ID,
+            ),
+            "items",
+        ),
+        (
+            await endpoint.get_current_formulary_drugs(
+                _request(),
+                FORMULARY_ID,
+                ALIAS_ID,
+            ),
+            "items",
+        ),
+        (
+            await endpoint.get_current_formulary_drug_detail(
+                _request(),
+                FORMULARY_ID,
+                ALIAS_ID,
+                DRUG_ID,
+            ),
+            None,
+        ),
+    )
+    expected_coverage_by_field = {
+        "status": "partial",
+        "expected_artifact_count": 48,
+        "included_artifact_count": 17,
+        "missing_artifact_count": 31,
+    }
+    for response, item_selector in responses_and_item_selectors:
+        assert response.status == 200
+        response_payload = _payload(response)
+        response_item = (
+            response_payload
+            if item_selector is None
+            else response_payload[item_selector][0]
+        )
+        assert response_item["coverage"] == expected_coverage_by_field
 
 
 @pytest.mark.asyncio

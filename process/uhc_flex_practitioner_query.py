@@ -180,7 +180,6 @@ def _canonical_resource_json(resource_by_field: dict[str, Any]) -> str:
         ):
             raise ValueError
     except (
-        MemoryError,
         OverflowError,
         RecursionError,
         TypeError,
@@ -232,7 +231,7 @@ def _validate_resource_npi(resource_by_field: dict[str, Any], requested_npi: int
         raise UHCFlexPractitionerQueryError("resource_npi_invalid")
 
 
-def _bundle_entries(bundle_by_field: dict[str, Any]) -> list[dict[str, Any]]:
+def _bundle_entries(bundle_by_field: dict[str, Any]) -> list[Any]:
     if "entry" not in bundle_by_field:
         return []
     raw_entries = bundle_by_field["entry"]
@@ -240,8 +239,6 @@ def _bundle_entries(bundle_by_field: dict[str, Any]) -> list[dict[str, Any]]:
         raise UHCFlexPractitionerQueryError("entry_invalid")
     if len(raw_entries) > UHC_FLEX_PRACTITIONER_QUERY_COUNT:
         raise UHCFlexPractitionerQueryError("result_cap_exceeded")
-    if any(type(entry_by_field) is not dict for entry_by_field in raw_entries):
-        raise UHCFlexPractitionerQueryError("entry_invalid")
     return raw_entries
 
 
@@ -276,7 +273,9 @@ def _validate_bundle_total(
         raise UHCFlexPractitionerQueryError("total_mismatch")
 
 
-def _entry_practitioner(entry_by_field: dict[str, Any]) -> dict[str, Any]:
+def _entry_practitioner(entry_by_field: object) -> dict[str, Any]:
+    if type(entry_by_field) is not dict:
+        raise UHCFlexPractitionerQueryError("entry_invalid")
     resource_by_field = entry_by_field.get("resource")
     if type(resource_by_field) is not dict:
         raise UHCFlexPractitionerQueryError("entry_invalid")
@@ -289,35 +288,28 @@ def _entry_practitioner(entry_by_field: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validated_resource_json_rows(
-    entries: list[dict[str, Any]],
+    entries: list[Any],
     requested_npi: int,
 ) -> tuple[tuple[str, str], ...]:
     canonical_json_by_id: dict[str, str] = {}
-    admitted_resource_ids: set[str] = set()
-    has_malformed_npi_sibling = False
+    conflicting_resource_ids: set[str] = set()
     for entry_by_field in entries:
-        resource_by_field = _entry_practitioner(entry_by_field)
-        exact_npis, has_malformed_npi = _exact_resource_npis(resource_by_field)
-        if has_malformed_npi and any(npi != requested_npi for npi in exact_npis):
-            raise UHCFlexPractitionerQueryError("cross_npi")
-        if not exact_npis and not has_malformed_npi:
-            raise UHCFlexPractitionerQueryError("requested_npi_missing")
-        if requested_npi not in exact_npis and not has_malformed_npi:
-            raise UHCFlexPractitionerQueryError("cross_npi")
-        resource_id = _resource_id(resource_by_field)
-        canonical_json = _canonical_resource_json(resource_by_field)
+        try:
+            resource_by_field = _entry_practitioner(entry_by_field)
+            _validate_resource_npi(resource_by_field, requested_npi)
+            resource_id = _resource_id(resource_by_field)
+            canonical_json = _canonical_resource_json(resource_by_field)
+        except UHCFlexPractitionerQueryError:
+            continue
+        if resource_id in conflicting_resource_ids:
+            continue
         previous_json = canonical_json_by_id.get(resource_id)
         if previous_json is not None and previous_json != canonical_json:
-            raise UHCFlexPractitionerQueryError("duplicate_resource_conflict")
-        canonical_json_by_id[resource_id] = canonical_json
-        if has_malformed_npi:
-            has_malformed_npi_sibling = True
+            del canonical_json_by_id[resource_id]
+            conflicting_resource_ids.add(resource_id)
             continue
-        if all(resource_npi == requested_npi for resource_npi in exact_npis):
-            admitted_resource_ids.add(resource_id)
-    if not admitted_resource_ids and has_malformed_npi_sibling:
-        raise UHCFlexPractitionerQueryError("resource_npi_invalid")
-    return tuple((key, canonical_json_by_id[key]) for key in sorted(admitted_resource_ids))
+        canonical_json_by_id[resource_id] = canonical_json
+    return tuple(sorted(canonical_json_by_id.items()))
 
 
 def _query_result_sha256(

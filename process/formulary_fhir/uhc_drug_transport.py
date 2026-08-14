@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import os
 from pathlib import Path
 import shutil
@@ -19,9 +18,6 @@ from process.formulary_fhir.async_safety import cancellable_to_thread
 from process.formulary_fhir.async_safety import drain_operation
 from process.formulary_fhir.source_artifact_contract import SourceArtifactIdentity
 from process.formulary_fhir.source_artifacts import bind_verified_source_artifact
-from process.formulary_fhir.uhc_drug_acquisition_lease import (
-    UHCDrugSourceAcquisitionLeaseError,
-)
 from process.formulary_fhir.uhc_drug_transport_contract import CancelCheck
 from process.formulary_fhir.uhc_drug_transport_contract import ClaimCheck
 from process.formulary_fhir.uhc_drug_transport_contract import (
@@ -55,6 +51,10 @@ from process.formulary_fhir.uhc_drug_payload import (
     uhc_drug_object_array_item_count,
 )
 from process.formulary_fhir.uhc_drug_redirect_transport import validated_drug_get
+from process.formulary_fhir.uhc_drug_staged_validation import validate_staged_uhc_drug_artifact
+from process.formulary_fhir.uhc_drug_transport_tasks import _complete_pending_tasks
+from process.formulary_fhir.uhc_drug_transport_tasks import _invoke
+from process.formulary_fhir.uhc_drug_transport_tasks import _join_cancelled_tasks
 from process.provider_directory_retained_artifact_base import RetainedArtifactError
 from process.provider_directory_retained_blob_staging import (
     prepare_retained_artifact_staging_directory,
@@ -72,12 +72,11 @@ def _download_directory() -> Path:
         ) from None
 
 
-async def _invoke(callback: Callable[..., Any] | None, *args: Any) -> None:
-    if callback is None:
-        return
-    callback_result = callback(*args)
-    if inspect.isawaitable(callback_result):
-        await callback_result
+def _artifact_rejection(message: str) -> UHCDrugArtifactAcquisitionError:
+    return UHCDrugArtifactAcquisitionError(
+        message,
+        failure_evidence=("artifact_rejected",),
+    )
 
 
 async def _shielded_to_thread(operation: Any, *args: Any) -> Any:
@@ -121,17 +120,17 @@ def _declared_response_length(
             retryable=True,
         )
     if response.status != 200 or str(response.url) != source_url:
-        raise UHCDrugArtifactAcquisitionError(
+        raise _artifact_rejection(
             "UHC drug artifact did not return its exact reviewed URL"
         )
     content_encoding = response.headers.get("Content-Encoding", "").strip().lower()
     if content_encoding not in {"", "identity"}:
-        raise UHCDrugArtifactAcquisitionError(
+        raise _artifact_rejection(
             "UHC drug artifact uses unsupported content encoding"
         )
     declared_length = response.content_length
     if declared_length is not None and not 0 < declared_length <= max_bytes:
-        raise UHCDrugArtifactAcquisitionError(
+        raise _artifact_rejection(
             "UHC drug artifact declared byte count is invalid"
         )
     if (
@@ -139,7 +138,7 @@ def _declared_response_length(
         and identity.expected_byte_count is not None
         and declared_length != identity.expected_byte_count
     ):
-        raise UHCDrugArtifactAcquisitionError(
+        raise _artifact_rejection(
             "UHC drug artifact declared byte count changed"
         )
     return declared_length
@@ -160,7 +159,7 @@ async def _download_response_body(
             continue
         downloaded_byte_count += len(response_chunk)
         if downloaded_byte_count > max_bytes:
-            raise UHCDrugArtifactAcquisitionError(
+            raise _artifact_rejection(
                 "UHC drug artifact exceeded its byte limit"
             )
         content_digest.update(response_chunk)
@@ -189,7 +188,7 @@ def _require_complete_response(
             "UHC drug artifact response was truncated or empty",
             retryable=True,
         )
-    raise UHCDrugArtifactAcquisitionError(
+    raise _artifact_rejection(
         "UHC drug artifact byte count is inconsistent"
     )
 
@@ -220,7 +219,7 @@ async def stream_uhc_drug_response(
                 cancel_check=cancel_check,
             )
     except UHCFileCatalogError:
-        raise UHCDrugArtifactAcquisitionError(
+        raise _artifact_rejection(
             "Drug artifact redirect is invalid"
         ) from None
     _require_complete_response(
@@ -244,7 +243,7 @@ def validate_uhc_drug_object_array(
             cancel_check=cancel_check,
         )
     except UHCDrugPayloadError:
-        raise UHCDrugArtifactAcquisitionError(
+        raise _artifact_rejection(
             "UHC drug artifact JSON structure is invalid"
         ) from None
 
@@ -283,7 +282,13 @@ async def _download_to_stage(
                 asyncio.to_thread(_flush_and_sync, output_file),
                 preserve_cancellation=True,
             )
-        await _shielded_to_thread(validate_uhc_drug_object_array, temporary_path)
+        await _shielded_to_thread(
+            validate_staged_uhc_drug_artifact,
+            temporary_path,
+            identity,
+            artifact_sha256,
+            artifact_byte_count,
+        )
         return temporary_path, artifact_sha256, artifact_byte_count
     except (aiohttp.ClientError, asyncio.TimeoutError):
         if temporary_path is not None:
@@ -307,16 +312,29 @@ async def _acquire_identity(
     cancel_check: CancelCheck | None,
     claim_check: ClaimCheck,
     max_bytes: int,
-) -> tuple[int, str, str]:
+) -> tuple[int, str, str, str, bool]:
     async with semaphore:
         await _invoke(cancel_check)
         await claim_check()
-        staged_path, artifact_sha256, artifact_byte_count = await _download_to_stage(
-            session,
-            identity,
-            max_bytes=max_bytes,
-            cancel_check=cancel_check,
-        )
+        try:
+            staged_path, artifact_sha256, artifact_byte_count = (
+                await _download_to_stage(
+                    session,
+                    identity,
+                    max_bytes=max_bytes,
+                    cancel_check=cancel_check,
+                )
+            )
+        except UHCDrugArtifactAcquisitionError as error:
+            if not error.retryable and error.failure_evidence != ("artifact_rejected",):
+                raise
+            return (
+                0,
+                identity.family,
+                identity.file_name,
+                identity.source_file_id,
+                True,
+            )
         try:
             await _invoke(cancel_check)
             await claim_check()
@@ -330,7 +348,13 @@ async def _acquire_identity(
             )
         finally:
             staged_path.unlink(missing_ok=True)
-        return artifact_byte_count, identity.family, identity.file_name
+        return (
+            artifact_byte_count,
+            identity.family,
+            identity.file_name,
+            identity.source_file_id,
+            False,
+        )
 
 
 def _preflight_pending_artifacts(
@@ -368,67 +392,6 @@ def _preflight_pending_artifacts(
         )
 
 
-async def _complete_pending_tasks(
-    tasks: tuple[asyncio.Task[tuple[int, str, str]], ...],
-    *,
-    progress_callback: ProgressCallback | None,
-) -> int:
-    downloaded_byte_count = 0
-    failure_evidence_entries: list[str] = []
-    try:
-        for settled_count, completed_task in enumerate(
-            asyncio.as_completed(tasks),
-            start=1,
-        ):
-            try:
-                artifact_bytes, family, file_name = await completed_task
-            except asyncio.CancelledError:
-                raise
-            except UHCDrugSourceAcquisitionLeaseError:
-                raise
-            except UHCDrugArtifactAcquisitionError as error:
-                failure_evidence_entries.append(
-                    "retryable_transport" if error.retryable else "artifact_rejected"
-                )
-                continue
-            except Exception:
-                failure_evidence_entries.append("artifact_processing")
-                continue
-            downloaded_byte_count += artifact_bytes
-            await _invoke(
-                progress_callback,
-                settled_count,
-                len(tasks),
-                family,
-                file_name,
-            )
-    except BaseException:
-        for pending_task in tasks:
-            pending_task.cancel()
-        await drain_operation(
-            _join_cancelled_tasks(tasks),
-            preserve_cancellation=False,
-        )
-        raise
-    if failure_evidence_entries:
-        immutable_evidence_entries = tuple(failure_evidence_entries)
-        raise UHCDrugArtifactAcquisitionError(
-            "UHC drug artifact set acquisition is incomplete",
-            retryable=all(
-                evidence == "retryable_transport"
-                for evidence in immutable_evidence_entries
-            ),
-            failure_evidence=immutable_evidence_entries,
-        )
-    return downloaded_byte_count
-
-
-async def _join_cancelled_tasks(
-    tasks: tuple[asyncio.Task[tuple[int, str, str]], ...],
-) -> None:
-    await asyncio.gather(*tasks, return_exceptions=True)
-
-
 async def acquire_pending_uhc_drug_artifacts(
     pending_artifacts: tuple[SourceArtifactIdentity, ...],
     *,
@@ -437,11 +400,11 @@ async def acquire_pending_uhc_drug_artifacts(
     cancel_check: CancelCheck | None,
     claim_check: ClaimCheck,
     progress_callback: ProgressCallback | None,
-) -> int:
+) -> tuple[int, tuple[str, ...]]:
     """Acquire, validate, and bind only unresolved exact source identities."""
 
     if not pending_artifacts:
-        return 0
+        return 0, ()
     concurrency = uhc_drug_download_concurrency()
     max_file_bytes = _positive_environment_integer(
         "HLTHPRT_UHC_FORMULARY_FILE_MAX_BYTES",
@@ -493,5 +456,6 @@ __all__ = (
     "default_uhc_drug_session_factory",
     "stream_uhc_drug_response",
     "uhc_drug_download_concurrency",
+    "validate_staged_uhc_drug_artifact",
     "validate_uhc_drug_object_array",
 )

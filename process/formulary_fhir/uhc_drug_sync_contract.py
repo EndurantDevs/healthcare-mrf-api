@@ -39,6 +39,9 @@ from process.formulary_fhir.uhc_source import UHC_FORMULARY_SOURCE_ID
 
 
 UHC_DRUG_SYNC_CONTRACT = "uhc-official-formulary-repository-sync-v1"
+UHC_DRUG_PARTIAL_SYNC_CONTRACT = (
+    "uhc-official-formulary-repository-sync-partial-v1"
+)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -123,6 +126,8 @@ def validate_uhc_drug_sync_inputs(
         != artifacts.source_file_set_sha256
         or evidence.artifact_set_sha256 != artifacts.artifact_set_sha256
         or evidence.file_count != len(artifacts.artifacts)
+        or evidence.expected_file_count != 48
+        or evidence.excluded_file_count != 48 - len(artifacts.artifacts)
         or evidence.max_last_updated_at is None
         or evidence.max_last_updated_at > normalized_cutoff
         or any(
@@ -138,7 +143,7 @@ def validate_uhc_drug_sync_inputs(
         )
         for family in ("cs", "ifp")
     }
-    if family_count_by_name != {"cs": 24, "ifp": 24}:
+    if any(count > 24 for count in family_count_by_name.values()):
         raise ValueError("UHC drug artifact census is incomplete")
     if any(
         _canonical_catalog_timestamp(artifact.identity.catalog_modified_at)
@@ -157,29 +162,37 @@ def uhc_drug_sync_contract_hash(
 ) -> str:
     """Hash every source, parser, projection, and exact-census input."""
 
-    normalized_cutoff = validate_uhc_drug_sync_inputs(
-        binding,
-        artifacts,
-        evidence,
-        cutoff_at,
+    normalized_cutoff = validate_uhc_drug_sync_inputs(binding, artifacts, evidence, cutoff_at)
+    sync_contract = (
+        UHC_DRUG_SYNC_CONTRACT
+        if evidence.is_coverage_complete
+        else UHC_DRUG_PARTIAL_SYNC_CONTRACT
     )
+    evidence_by_field = {
+        "duplicate_count": evidence.duplicate_count,
+        "file_count": evidence.file_count,
+        "max_last_updated_at": utc_timestamp(
+            evidence.max_last_updated_at,
+            "UHC drug maximum update timestamp",
+        ).isoformat(),
+        "medication_membership_count": evidence.medication_membership_count,
+        "plan_count": evidence.plan_count,
+        "raw_plan_entry_count": evidence.raw_plan_entry_count,
+        "raw_record_count": evidence.raw_record_count,
+        "spool_content_sha256": evidence.spool_content_sha256,
+        "superseded_count": evidence.superseded_count,
+    }
+    if not evidence.is_coverage_complete:
+        evidence_by_field.update(
+            {
+                "excluded_file_count": evidence.excluded_file_count,
+                "expected_file_count": evidence.expected_file_count,
+            }
+        )
     contract_by_field = {
         "artifact_set_sha256": artifacts.artifact_set_sha256,
         "cutoff_at": normalized_cutoff.isoformat(),
-        "evidence": {
-            "duplicate_count": evidence.duplicate_count,
-            "file_count": evidence.file_count,
-            "max_last_updated_at": utc_timestamp(
-                evidence.max_last_updated_at,
-                "UHC drug maximum update timestamp",
-            ).isoformat(),
-            "medication_membership_count": evidence.medication_membership_count,
-            "plan_count": evidence.plan_count,
-            "raw_plan_entry_count": evidence.raw_plan_entry_count,
-            "raw_record_count": evidence.raw_record_count,
-            "spool_content_sha256": evidence.spool_content_sha256,
-            "superseded_count": evidence.superseded_count,
-        },
+        "evidence": evidence_by_field,
         "medication_projection_contract": MEDICATION_PROJECTION_CONTRACT,
         "plan_alias_domain": PLAN_ALIAS_DOMAIN,
         "plan_projection_contract": PLAN_PROJECTION_CONTRACT,
@@ -190,10 +203,10 @@ def uhc_drug_sync_contract_hash(
         "source_file_set_sha256": artifacts.source_file_set_sha256,
         "source_id": binding.source_id,
         "spool_contract": SPOOL_CONTRACT,
-        "sync_contract": UHC_DRUG_SYNC_CONTRACT,
+        "sync_contract": sync_contract,
     }
     digest = hashlib.sha256()
-    digest.update(UHC_DRUG_SYNC_CONTRACT.encode("ascii"))
+    digest.update(sync_contract.encode("ascii"))
     digest.update(b"\n")
     digest.update(json_text(contract_by_field).encode("utf-8"))
     return digest.hexdigest()
@@ -378,6 +391,7 @@ def validate_uhc_drug_run_id(run_id: str) -> str:
 
 __all__ = (
     "UHC_DRUG_SYNC_CONTRACT",
+    "UHC_DRUG_PARTIAL_SYNC_CONTRACT",
     "UHCDrugMembershipProof",
     "UHCDrugSynchronizationResult",
     "require_exact_alias_write",

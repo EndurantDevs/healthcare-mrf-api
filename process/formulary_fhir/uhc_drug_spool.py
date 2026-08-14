@@ -11,7 +11,7 @@ import sqlite3
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Iterator
 
 import ijson
 
@@ -31,7 +31,9 @@ from process.formulary_fhir.uhc_drug_normalization import (
     normalized_uhc_drug_memberships,
 )
 from process.formulary_fhir.uhc_drug_payload import UHCDrugPayloadError
-from process.formulary_fhir.uhc_drug_payload import count_uhc_drug_stream_items
+from process.formulary_fhir.uhc_drug_payload import (
+    count_reopenable_uhc_drug_stream_items,
+)
 from process.formulary_fhir.uhc_drug_parser_contract import UHCDrugSpoolEvidence
 from process.formulary_fhir.uhc_drug_spool_contract import artifact_proof_rows
 from process.formulary_fhir.uhc_drug_spool_contract import spool_evidence_payload
@@ -106,7 +108,7 @@ def _validated_artifact_set(
     if (
         type(artifact_set) is not VerifiedSourceArtifactSet
         or artifact_set.source_id != UHC_FORMULARY_SOURCE_ID
-        or len(artifact_set.artifacts) != 48
+        or not 1 <= len(artifact_set.artifacts) <= 48
     ):
         raise UHCDrugNormalizationError("UHC drug artifact set is invalid")
     family_count_by_name = {
@@ -115,7 +117,7 @@ def _validated_artifact_set(
         )
         for family in ("cs", "ifp")
     }
-    if family_count_by_name != {"cs": 24, "ifp": 24}:
+    if any(count > 24 for count in family_count_by_name.values()):
         raise UHCDrugNormalizationError("UHC drug artifact census is incomplete")
     return artifact_set
 
@@ -173,7 +175,7 @@ def _evidence_payload(
 ) -> dict[str, object]:
     if census.maximum_updated_at is None:
         raise RuntimeError("UHC drug spool timestamp census is empty")
-    return {
+    evidence_by_field = {
         "artifact_set_sha256": artifact_set.artifact_set_sha256,
         "duplicate_count": census.duplicate_count,
         "file_count": len(artifact_set.artifacts),
@@ -186,6 +188,14 @@ def _evidence_payload(
         "source_id": artifact_set.source_id,
         "superseded_count": census.superseded_count,
     }
+    if len(artifact_set.artifacts) != 48:
+        evidence_by_field.update(
+            {
+                "excluded_file_count": 48 - len(artifact_set.artifacts),
+                "expected_file_count": 48,
+            }
+        )
+    return evidence_by_field
 
 
 def _install_spool_metadata(
@@ -228,6 +238,25 @@ def _observe_normalized_memberships(
         census.observe(membership, duplicate_delta, superseded_delta)
 
 
+def normalized_uhc_drug_source_records(
+    artifact: object,
+    input_file: object,
+    cancel_check: Callable[[], None] | None,
+) -> Iterator[tuple[dict[str, Any], tuple[NormalizedUHCDrugMembership, ...]]]:
+    """Yield every source record with the exact normalized memberships."""
+
+    source_records = ijson.items(input_file, "item", use_float=False)
+    for record_ordinal, source_record in enumerate(source_records, start=1):
+        if cancel_check is not None:
+            cancel_check()
+        normalized_memberships = normalized_uhc_drug_memberships(
+            source_record,
+            artifact,
+            record_ordinal,
+        )
+        yield source_record, normalized_memberships
+
+
 def _consume_source_records(
     connection: sqlite3.Connection,
     artifact: object,
@@ -236,18 +265,14 @@ def _consume_source_records(
     cancel_check: Callable[[], None] | None,
 ) -> int:
     observed_record_count = 0
-    source_records = ijson.items(input_file, "item", use_float=False)
-    for record_ordinal, source_record in enumerate(source_records, start=1):
-        if cancel_check is not None:
-            cancel_check()
+    for source_record, normalized_memberships in normalized_uhc_drug_source_records(
+        artifact,
+        input_file,
+        cancel_check,
+    ):
         observed_record_count += 1
         census.raw_record_count += 1
         census.raw_plan_entry_count += len(source_record["plans"])
-        normalized_memberships = normalized_uhc_drug_memberships(
-            source_record,
-            artifact,
-            record_ordinal,
-        )
         _observe_normalized_memberships(
             connection,
             normalized_memberships,
@@ -266,11 +291,10 @@ def _consume_artifact(
     try:
         if cancel_check is not None:
             cancel_check()
-        with open_verified_source_artifact(artifact) as validation_file:
-            expected_record_count = count_uhc_drug_stream_items(
-                validation_file,
-                cancel_check=cancel_check,
-            )
+        expected_record_count = count_reopenable_uhc_drug_stream_items(
+            lambda: open_verified_source_artifact(artifact),
+            cancel_check=cancel_check,
+        )
         with open_verified_source_artifact(artifact) as input_file:
             observed_record_count = _consume_source_records(
                 connection,
@@ -283,7 +307,7 @@ def _consume_artifact(
             raise UHCDrugNormalizationError(
                 "UHC drug retained JSON record census changed"
             )
-    except (ijson.JSONError, KeyError, TypeError, UHCDrugPayloadError):
+    except (ijson.JSONError, UHCDrugPayloadError):
         raise UHCDrugNormalizationError(
             "UHC drug retained JSON is invalid"
         ) from None
@@ -321,6 +345,8 @@ def _spool_evidence(
         duplicate_count=census.duplicate_count,
         superseded_count=census.superseded_count,
         max_last_updated_at=census.maximum_updated_at,
+        expected_file_count=48,
+        excluded_file_count=48 - len(artifact_set.artifacts),
     )
     if spool_evidence_payload(evidence) != evidence_by_field:
         raise RuntimeError("UHC drug spool evidence metadata is inconsistent")
@@ -372,4 +398,5 @@ __all__ = (
     "SPOOL_CONTRACT",
     "UHCDrugNormalizationError",
     "materialize_uhc_drug_spool",
+    "normalized_uhc_drug_source_records",
 )

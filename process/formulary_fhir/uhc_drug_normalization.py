@@ -12,6 +12,7 @@ from typing import Any
 from process.formulary_fhir.identity import fhir_json_snapshot
 from process.formulary_fhir.repository_shared import json_text
 from process.formulary_fhir.source_artifact_contract import VerifiedSourceArtifact
+from process.formulary_fhir.uhc_drug_parser_contract import PLAN_TYPE_PATTERN
 from process.formulary_fhir.uhc_drug_parser_contract import UHCDrugPlanKey
 from process.formulary_fhir.uhc_drug_parser_contract import uhc_drug_plan_alias
 
@@ -108,19 +109,24 @@ def _catalog_timestamp(raw_timestamp: object) -> dt.datetime:
         ) from None
     if parsed_timestamp.tzinfo is None or parsed_timestamp.utcoffset() is None:
         raise UHCDrugNormalizationError("UHC drug catalog timestamp is invalid")
-    normalized_timestamp = parsed_timestamp.astimezone(dt.UTC)
+    try:
+        normalized_timestamp = parsed_timestamp.astimezone(dt.UTC)
+    except (OverflowError, ValueError):
+        raise UHCDrugNormalizationError(
+            "UHC drug catalog timestamp is invalid"
+        ) from None
     if normalized_timestamp.isoformat().replace("+00:00", "Z") != timestamp_text:
         raise UHCDrugNormalizationError("UHC drug catalog timestamp is invalid")
     return normalized_timestamp
 
 
 def _record_timestamp(
-    value: object,
+    raw_timestamp: object,
     fallback_timestamp: dt.datetime,
 ) -> tuple[dt.datetime, str]:
-    if value is None:
+    if raw_timestamp is None:
         return fallback_timestamp, "artifact.catalog_modified_at"
-    timestamp_text = _source_text(value, "last updated date", 40)
+    timestamp_text = _source_text(raw_timestamp, "last updated date", 40)
     try:
         if len(timestamp_text) == 10:
             parsed_date = dt.date.fromisoformat(timestamp_text)
@@ -141,7 +147,13 @@ def _record_timestamp(
         raise UHCDrugNormalizationError(
             "UHC drug last updated date is invalid"
         )
-    return parsed_timestamp.astimezone(dt.UTC), "record.last_updated_on"
+    try:
+        normalized_timestamp = parsed_timestamp.astimezone(dt.UTC)
+    except (OverflowError, ValueError):
+        raise UHCDrugNormalizationError(
+            "UHC drug last updated date is invalid"
+        ) from None
+    return normalized_timestamp, "record.last_updated_on"
 
 
 def _json_extension(
@@ -269,12 +281,15 @@ def _validated_plan(plan_by_field: dict[str, Any]) -> _PlanNormalization:
         MAX_PLAN_FIELDS
     ):
         raise UHCDrugNormalizationError("UHC drug plan fields are invalid")
+    plan_id_type = _source_text(
+        plan_by_field.get("plan_id_type"),
+        "plan id type",
+        64,
+    )
+    if not PLAN_TYPE_PATTERN.fullmatch(plan_id_type):
+        raise UHCDrugNormalizationError("UHC drug plan id type is invalid")
     return _PlanNormalization(
-        plan_id_type=_source_text(
-            plan_by_field.get("plan_id_type"),
-            "plan id type",
-            64,
-        ),
+        plan_id_type=plan_id_type,
         plan_id=_source_text(plan_by_field.get("plan_id"), "plan id", 256),
         drug_tier=_source_text(
             plan_by_field.get("drug_tier"),

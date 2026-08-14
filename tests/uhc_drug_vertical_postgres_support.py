@@ -264,8 +264,7 @@ async def acquire_recorded_twins(
         cutoff,
     )
     recorded = await verify_and_record_uhc_drug_twins(
-        source_observation_sha256=acquisition.source_observation_sha256,
-        artifacts=acquisition.artifacts,
+        acquisition=acquisition,
         baseline_run_id=run_ids.baseline_run_id,
         candidate_run_id=run_ids.candidate_run_id,
         cutoff=cutoff,
