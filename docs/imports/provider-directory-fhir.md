@@ -196,10 +196,12 @@ proof binds continuation query shape and offset geometry, ordered raw acquired
 resource hashes, transport-neutral projected content hashes, and dataset
 counts and hashes without retaining URLs, tokens, or root identifiers. Every
 new campaign uses the immutable one-root policy. One successful exhaustive
-acquisition is sufficient. A failed root is never resumed: follow the
-terminal-disposition procedure below, then start a fresh campaign with a new
-cutoff, campaign identity, and root. Publication stays off until the completion
-proof and the separate artifact review both pass.
+acquisition is sufficient. A failed root is never accepted as evidence. A
+retry-eligible immediate predecessor may be retried under the same root only to
+repair its retained checkpoints; otherwise follow the terminal-disposition
+procedure below, then start a fresh campaign with a new cutoff, campaign
+identity, and root. Publication stays off until the completion proof and the
+separate artifact review both pass.
 
 Direct database publication and source-catalog mutations use PostgreSQL
 `READ COMMITTED` isolation. The reviewed-subset persistence guards fail closed at other
@@ -274,13 +276,15 @@ python main.py start provider-directory-fhir \
 ```
 
 A successful traversal remains non-current and non-published and becomes the
-sole validated candidate without twin evidence. A failed traversal follows the
-terminal-disposition procedure above; recovery starts a fresh campaign with a
-new cutoff, campaign identity, and root. Do not pass `--retry-of-run-id` or
-`--pagination-root-run-id` for this fresh run. A terminal HTTP 410 root is
-abandoned and never retried. Publication, Profile admission, and API
-verification remain separate reviewed operations after the acquisition proof
-passes.
+sole validated candidate without twin evidence. A retry-eligible failed
+traversal may use one direct retry with `--retry-of-run-id` and
+`--pagination-root-run-id` to reuse its exact candidate and completed
+checkpoints. It may clear and re-fetch only a resource whose opaque cursor or
+terminal census proof is invalid; all other completed resource slices remain
+unchanged. A terminally disposed or otherwise ineligible root instead requires
+a fresh campaign with a new cutoff, campaign identity, and root. Publication,
+Profile admission, and API verification remain separate reviewed operations
+after the acquisition proof passes.
 
 ## Source
 
@@ -651,6 +655,10 @@ REST pagination checkpoints are keyed by canonical API base, resource type,
 source scope, and acquisition root. A direct retry may adopt only its immediate
 predecessor's row within the same root and candidate; a guarded fresh root gets
 an independent row while failed-root evidence remains available for audit.
+For a current-version census, a direct retry resets an expired continuation or
+terminally drifted resource slice once, re-establishes its pre-count proof, and
+re-fetches that slice from its canonical start URL. It never treats the failed
+slice as complete or alters the other completed resource slices.
 Failed-root checkpoint retention is intentionally conservative: cleanup must
 first prove that the endpoint candidate is neither current nor
 active/incomplete and that no orchestrated run in the root lineage is live.

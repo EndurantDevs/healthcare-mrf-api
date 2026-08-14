@@ -117,16 +117,57 @@ async def _assert_terminal_page_rolled_back(
     return checkpoint
 
 
+async def _retry_terminal_drifted_page(
+    monkeypatch: pytest.MonkeyPatch,
+    source_record: dict[str, Any],
+    database: Any,
+    schema: str,
+    start_url: str,
+    count_url: str,
+    owner_run_id: str,
+):
+    await database.status(
+        f'UPDATE "{schema}".provider_directory_pagination_checkpoint '
+        "SET next_url = NULL;"
+    )
+    recovery_urls: list[str] = []
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        fetch_sequence(
+            [
+                (200, _count_bundle(2), None, 1),
+                (200, practitioner_bundle("practitioner-1", next_url=NEXT_URL), None, 1),
+                (200, practitioner_bundle("practitioner-2"), None, 1),
+                (200, _count_bundle(2), None, 1),
+            ],
+            recovery_urls,
+        ),
+    )
+    recovery = await fetch_practitioners(
+        source_record,
+        checkpoint_context(
+            source_record,
+            owner_run_id="run-current-census-recovery",
+            retry_of_run_id=owner_run_id,
+        ),
+    )
+    return (
+        recovery_urls,
+        recovery,
+        await checkpoint_record(database, schema),
+        await candidate_resource_ids(database, schema),
+        await proof_shard_counts(database, schema),
+    )
+
+
 @pytest.mark.asyncio
-async def test_rejected_proof_rolls_back_page_before_observation(
+async def test_terminal_census_drift_is_retained_then_replaced_by_direct_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Retain a rejected proof without advancing its page or checkpoint."""
-
+    """Retain drift evidence, then replace only that resource on direct retry."""
     source_record = census_source_record(census_contract())
-    start_url = importer._resource_start_url(
-        source_record, RESOURCE_TYPE, page_count=1
-    )
+    start_url = importer._resource_start_url(source_record, RESOURCE_TYPE, page_count=1)
     assert start_url is not None
     count_url = current_version_census_count_url(start_url)
     owner_run_id = "run-current-census-rejected-terminal"
@@ -146,6 +187,21 @@ async def test_rejected_proof_rolls_back_page_before_observation(
         checkpoint = await _assert_terminal_page_rolled_back(
             database, schema, owner_run_id=owner_run_id
         )
+        (
+            recovery_urls,
+            recovery,
+            recovered_checkpoint,
+            recovered_ids,
+            recovered_proof_counts,
+        ) = await _retry_terminal_drifted_page(
+            monkeypatch,
+            source_record,
+            database,
+            schema,
+            start_url,
+            count_url,
+            owner_run_id,
+        )
 
     assert requested_urls == [NEXT_URL, count_url]
     assert fetch_result.complete is False
@@ -159,6 +215,13 @@ async def test_rejected_proof_rolls_back_page_before_observation(
     assert completeness["post_count"] == 1
     assert completeness["processed_rows"] == 2
     assert completeness["unique_candidate_rows"] == 2
+    assert recovery_urls == [count_url, start_url, NEXT_URL, count_url]
+    assert recovery.complete is True
+    assert recovered_checkpoint["state"] == importer.PAGINATION_CHECKPOINT_COMPLETE
+    assert recovered_checkpoint["owner_run_id"] == "run-current-census-recovery"
+    assert recovered_checkpoint["retry_of_run_id"] == owner_run_id
+    assert recovered_ids == ["practitioner-1", "practitioner-2"]
+    assert recovered_proof_counts == (2, 2)
 
 
 @pytest.mark.asyncio

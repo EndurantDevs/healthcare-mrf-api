@@ -252,26 +252,44 @@ async def test_census_source_fetch_uses_pinned_no_redirect_transport(monkeypatch
     )
 
 
-def test_census_resume_never_restarts_an_expired_cursor():
-    cursor_url = (
-        f"{BASE}?_getpages=opaque&_getpagesoffset=250&_count=250"
+@pytest.mark.asyncio
+async def test_direct_retry_enables_terminal_census_checkpoint_restart(monkeypatch):
+    context = importer.PaginationCheckpointContext(
+        canonical_api_base=BASE,
+        source_scope_hash="a" * 64,
+        source_ids=("synthetic-source",),
+        owner_run_id="retry-run",
+        acquisition_root_run_id="root-run",
+        retry_of_run_id="failed-run",
+        dataset_id="dataset-1",
     )
-    resume_state = importer.PaginationResumeState(
-        next_url=cursor_url,
-        pages_processed=1,
-        rows_processed=250,
-        recent_url_hashes=(),
-        resumed=True,
+    load_checkpoint = AsyncMock(
+        side_effect=RuntimeError("stop-after-checkpoint-options")
+    )
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        load_checkpoint,
     )
 
-    assert not importer._should_restart_expired_pagination_checkpoint(
-        status_code=410,
-        fetch_error=None,
-        request_url=cursor_url,
-        resume_state=resume_state,
-        has_restart_attempted=False,
-        is_current_version_census=True,
-    )
+    with pytest.raises(RuntimeError, match="stop-after-checkpoint-options"):
+        await importer._fetch_resource_rows(
+            _source_record(),
+            "Organization",
+            per_resource_limit=0,
+            page_limit=0,
+            page_count=250,
+            timeout=3,
+            run_id="retry-run",
+            row_batch_handler=AsyncMock(return_value=0),
+            row_batch_size=100,
+            retain_rows=False,
+            pagination_checkpoint=context,
+        )
+
+    assert load_checkpoint.await_args.kwargs == {
+        "allow_terminal_census_restart": True
+    }
 
 
 @pytest.mark.asyncio

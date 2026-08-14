@@ -53323,18 +53323,39 @@ def _should_restart_expired_pagination_checkpoint(
     resume_state: PaginationResumeState | None,
     has_restart_attempted: bool,
     is_current_version_census: bool = False,
+    allow_current_version_census_restart: bool = False,
 ) -> bool:
     is_expired_status = status_code in {400, 404, 410} or (
         status_code == 403 and _is_humana_continuation_token_url(request_url)
     )
     return bool(
-        not is_current_version_census
+        (not is_current_version_census or allow_current_version_census_restart)
         and resume_state
         and resume_state.resumed
         and not has_restart_attempted
         and fetch_error is None
         and is_expired_status
         and _has_fhir_continuation_query(request_url)
+    )
+
+
+def _can_restart_terminal_census_checkpoint(
+    checkpoint: dict[str, Any],
+    context: PaginationCheckpointContext,
+) -> bool:
+    """Allow one direct retry to replace a terminally drifted resource slice."""
+
+    completeness = _json_object(checkpoint.get("completeness_json"))
+    return bool(
+        context.retry_of_run_id
+        and context.lineage_verified
+        and context.dataset_id
+        and _has_matching_pagination_checkpoint_identity(checkpoint, context)
+        and checkpoint.get("state") == PAGINATION_CHECKPOINT_ACTIVE
+        and not _clean_text(checkpoint.get("next_url"))
+        and int(checkpoint.get("pages_processed") or 0) > 0
+        and int(checkpoint.get("rows_processed") or 0) > 0
+        and completeness.get("failure") == "census_drift"
     )
 
 
@@ -58448,16 +58469,6 @@ async def _fetch_resource_rows(
         )
         else None
     )
-    checkpoint_start_url = start_urls[0] if checkpoint_context else None
-    resume_state = (
-        await _load_or_initialize_pagination_checkpoint(
-            checkpoint_context,
-            resource_type,
-            checkpoint_start_url,
-        )
-        if checkpoint_context and checkpoint_start_url
-        else None
-    )
     is_caresource_census_enabled = _is_caresource_opaque_cursor_census(
         source_record,
         checkpoint_context,
@@ -58466,6 +58477,25 @@ async def _fetch_resource_rows(
         source_record,
         checkpoint_context,
     )
+    checkpoint_start_url = start_urls[0] if checkpoint_context else None
+    resume_state = None
+    if checkpoint_context and checkpoint_start_url:
+        if (
+            is_current_version_census_enabled
+            and checkpoint_context.retry_of_run_id
+        ):
+            resume_state = await _load_or_initialize_pagination_checkpoint(
+                checkpoint_context,
+                resource_type,
+                checkpoint_start_url,
+                allow_terminal_census_restart=True,
+            )
+        else:
+            resume_state = await _load_or_initialize_pagination_checkpoint(
+                checkpoint_context,
+                resource_type,
+                checkpoint_start_url,
+            )
     current_version_page_count = (
         _current_version_census_page_count(checkpoint_start_url)
         if is_current_version_census_enabled and checkpoint_start_url
@@ -58918,6 +58948,9 @@ async def _fetch_resource_rows(
                         is_current_version_census=(
                             is_current_version_census_enabled
                         ),
+                        allow_current_version_census_restart=bool(
+                            checkpoint_context.retry_of_run_id
+                        ),
                     )
                 ):
                     await _reset_pagination_checkpoint(
@@ -58947,6 +58980,22 @@ async def _fetch_resource_rows(
                         if isinstance(prepared_census, ResourceFetchResult):
                             return prepared_census
                         caresource_proof_by_field = prepared_census
+                    if is_current_version_census_enabled:
+                        prepared_census = (
+                            await _prepare_current_version_pre_census(
+                                source_record,
+                                resource_type,
+                                model,
+                                checkpoint_context,
+                                resume_state,
+                                checkpoint_start_url,
+                                timeout=resource_timeout,
+                                cancellation=resource_import_cancellation,
+                            )
+                        )
+                        if isinstance(prepared_census, ResourceFetchResult):
+                            return prepared_census
+                        current_version_proof_by_field = prepared_census
                     retained_resource_rows.clear()
                     pending_rows.clear()
                     rows_fetched = 0
@@ -67922,12 +67971,23 @@ async def _restart_empty_pagination_checkpoint(
         )
 
 
+def _fresh_pagination_resume_state(start_url: str) -> PaginationResumeState:
+    return PaginationResumeState(
+        next_url=start_url,
+        pages_processed=0,
+        rows_processed=0,
+        recent_url_hashes=(),
+    )
+
+
 async def _load_or_initialize_pagination_checkpoint(
     context: PaginationCheckpointContext,
     resource_type: str,
     start_url: str,
+    *,
+    allow_terminal_census_restart: bool = False,
 ) -> PaginationResumeState:
-    """Resume verified lineage and restart only empty incompatible scans."""
+    """Resume verified lineage and replace only a direct-retry drifted slice."""
     start_url_hash = hashlib.sha256(start_url.encode("utf-8")).hexdigest()
     checkpoint = await _fetch_pagination_checkpoint(context, resource_type)
     resume_state = _compatible_pagination_resume_state(
@@ -67946,6 +68006,20 @@ async def _load_or_initialize_pagination_checkpoint(
                 start_url_hash,
             )
         return resume_state
+    if (
+        allow_terminal_census_restart
+        and _can_restart_terminal_census_checkpoint(
+            checkpoint,
+            context,
+        )
+    ):
+        await _reset_pagination_checkpoint(
+            context,
+            resource_type,
+            start_url,
+            start_url_hash,
+        )
+        return _fresh_pagination_resume_state(start_url)
     if checkpoint and _can_reset_empty_pagination_checkpoint(checkpoint, context):
         await _restart_empty_pagination_checkpoint(
             context,
@@ -67954,12 +68028,7 @@ async def _load_or_initialize_pagination_checkpoint(
             start_url_hash,
             checkpoint,
         )
-        return PaginationResumeState(
-            next_url=start_url,
-            pages_processed=0,
-            rows_processed=0,
-            recent_url_hashes=(),
-        )
+        return _fresh_pagination_resume_state(start_url)
     if checkpoint:
         raise RuntimeError("provider_directory_pagination_checkpoint_lineage_conflict")
     if context.retry_of_run_id and not context.lineage_verified:
@@ -67970,12 +68039,7 @@ async def _load_or_initialize_pagination_checkpoint(
         start_url,
         start_url_hash,
     )
-    return PaginationResumeState(
-        next_url=start_url,
-        pages_processed=0,
-        rows_processed=0,
-        recent_url_hashes=(),
-    )
+    return _fresh_pagination_resume_state(start_url)
 
 
 async def _save_pagination_checkpoint(
