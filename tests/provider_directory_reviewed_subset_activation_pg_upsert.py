@@ -279,6 +279,33 @@ async def _prove_partition_reset_requires_exact_campaign(scenario) -> None:
         )
 
 
+async def _prove_retired_generation_replay(
+    scenario, values_source, copy_source, copy_sql
+) -> None:
+    """Preserve exact retired replays but not a different campaign."""
+
+    metadata = _legacy_exhaustive_generation("stale-replay")
+    metadata.pop("legacy_audit_receipt")
+    for campaign in (LEGACY_PARTITION_CAMPAIGN_ID, "other-campaign"):
+        metadata["provider_directory_verification_campaign_id"] = campaign
+        values_sql, parameters = _values_upsert_sql(
+            scenario,
+            note="stale-replay",
+            source_id=values_source,
+            endpoint_id="endpoint-generation-values",
+            incoming_metadata=metadata,
+        )
+        for _ in range(2):
+            await scenario.connection.execute(values_sql, *parameters)
+            await scenario.connection.execute(copy_sql, json.dumps(metadata))
+        is_retired = campaign == LEGACY_PARTITION_CAMPAIGN_ID
+        assertion = _assert_partition_generation if is_retired else _assert_legacy_generation
+        expected = "values-path" if is_retired else campaign
+        await assertion(scenario, values_source, expected)
+        expected = "copy-path" if is_retired else campaign
+        await assertion(scenario, copy_source, expected)
+
+
 async def prove_unprotected_generation_replacement(scenario) -> None:
     """Retire one exact legacy partition profile through both upsert paths."""
 
@@ -310,15 +337,10 @@ async def prove_unprotected_generation_replacement(scenario) -> None:
     for _ in range(2):
         await scenario.connection.execute(values_sql, *values_parameters)
         await scenario.connection.execute(copy_sql, copy_parameters)
-    await _assert_partition_generation(
-        scenario,
-        values_source,
-        "values-path",
-    )
-    await _assert_partition_generation(
-        scenario,
-        copy_source,
-        "copy-path",
+    await _assert_partition_generation(scenario, values_source, "values-path")
+    await _assert_partition_generation(scenario, copy_source, "copy-path")
+    await _prove_retired_generation_replay(
+        scenario, values_source, copy_source, copy_sql
     )
     await _prove_partition_reset_requires_exact_campaign(scenario)
 

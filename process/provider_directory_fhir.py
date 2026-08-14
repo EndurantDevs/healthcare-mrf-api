@@ -16471,6 +16471,15 @@ def _artifact_candidate_proof_sqls(
     )
 
 
+def _artifact_campaign_is_active_sql(metadata: str) -> str:
+    """Permanently exclude the retired reviewed partition generation."""
+
+    return (
+        f"{metadata} ->> '{TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY}' "
+        f"IS DISTINCT FROM '{LEGACY_REVIEWED_PARTITION_CAMPAIGN_ID}'"
+    )
+
+
 def _artifact_reviewed_candidate_eligibility_sql(
     dataset_ref: str,
     source_ref: str,
@@ -16492,11 +16501,11 @@ def _artifact_reviewed_candidate_eligibility_sql(
             use_admission_seals,
         )
     )
-    metadata_admission_gate = _artifact_candidate_metadata_gate_sql(
-        metadata, content_proof_admitted
-    )
     return f"""
-        {metadata_admission_gate}(
+        {_artifact_campaign_is_active_sql(metadata)}
+        AND {_artifact_candidate_metadata_gate_sql(
+            metadata, content_proof_admitted
+        )}(
             (
                 dataset.completion_proof_required_version IS NULL
                 AND dataset.completion_proof_json IS NULL
@@ -42260,6 +42269,10 @@ def _source_metadata_update_expression(table, excluded_value):
             incoming_metadata,
         ),
     )
+    retired_replay = _ordinary_partition_generation_reset_expression(
+        incoming_metadata,
+        target_metadata,
+    )
     policy_preserved_metadata = (
         _preserved_source_reviewed_root_policy_expression(
             target_metadata,
@@ -42279,7 +42292,7 @@ def _source_metadata_update_expression(table, excluded_value):
         ),
         else_=preserved_metadata,
     )
-    return case(
+    update = case(
         (
             func.coalesce(
                 incoming_metadata.op("->>")(
@@ -42294,6 +42307,7 @@ def _source_metadata_update_expression(table, excluded_value):
         ),
         else_=effective_metadata,
     )
+    return case((retired_replay, target_metadata), else_=update)
 
 
 def _effective_update_expression(table, statement, column: str):
@@ -42358,20 +42372,28 @@ def _source_metadata_update_sql(
         target_metadata,
         policy_preserved_metadata,
     )
+    retired_replay = _ordinary_partition_generation_reset_sql(
+        incoming_metadata,
+        target_metadata,
+    )
+    generation_reset = (
+        f"({_pending_policy_generation_reset_sql(target_metadata, incoming_metadata)}) "
+        "OR ("
+        f"{_ordinary_partition_generation_reset_sql(target_metadata, incoming_metadata)})"
+    )
     effective_metadata = (
-        "CASE WHEN ("
-        f"{_pending_policy_generation_reset_sql(target_metadata, incoming_metadata)}) OR ("
-        f"{_ordinary_partition_generation_reset_sql(target_metadata, incoming_metadata)}) "
+        f"CASE WHEN {generation_reset} "
         f"THEN {_source_generation_metadata_without_state_sql(target_metadata)} "
         f"|| {incoming_metadata} ELSE {preserved_metadata} END"
     )
     return (
-        "CASE WHEN COALESCE("
+        f"CASE WHEN ({retired_replay}) THEN {target_metadata} "
+        "ELSE CASE WHEN COALESCE("
         f"{incoming_prefix}.{quoted}::jsonb ->> "
         "'provider_directory_acquisition_enabled', 'false') = 'true' "
         f"THEN ({effective_metadata}) - "
         "'provider_directory_acquisition_blocked_reason' "
-        f"ELSE {effective_metadata} END"
+        f"ELSE {effective_metadata} END END"
     )
 
 
@@ -65636,7 +65658,9 @@ def _endpoint_verification_baseline_count_sql(dataset_ref: str) -> str:
 
 def _locked_endpoint_verification_filter_sql(dataset_ref: str) -> str:
     terminal_successor_sql = _terminal_twin_successor_filter_sql(dataset_ref)
-    validated_candidate_sql = _validated_endpoint_candidate_blocks_admission_sql()
+    validated_candidate_sql = _validated_endpoint_candidate_blocks_admission_sql(
+        dataset_ref
+    )
     return f"""
         (
             dataset.is_current = false
@@ -65678,16 +65702,188 @@ def _locked_endpoint_verification_filter_sql(dataset_ref: str) -> str:
     """
 
 
-def _validated_endpoint_candidate_blocks_admission_sql() -> str:
-    """Ignore only an immutable bounded legacy proof proven invalid."""
+def _is_ordinary_endpoint_candidate(candidate: EndpointDatasetCandidate) -> bool:
+    """Require a fresh singleton candidate with no reviewed profile state."""
 
+    return bool(
+        len(candidate.source_ids) == 1
+        and candidate.expected_resources
+        and candidate.previous_dataset_id
+        and not candidate.requires_twin_root_verification
+        and not candidate.already_validated
+        and not candidate.already_published
+        and all(
+            value is None
+            for value in (
+                candidate.reviewed_root_policy,
+                candidate.verification_campaign_id,
+                candidate.verification_source_scope_hash,
+                candidate.verification_role,
+                candidate.verification_baseline_dataset_id,
+                candidate.verification_terminal_status,
+                candidate.verification_terminal_metadata,
+                candidate.validated_metadata,
+                candidate.published_metadata,
+                candidate.completion_proof_required_version,
+                candidate.subset_contract,
+            )
+        )
+    )
+
+
+def _retired_partition_source_contract_sql(source_metadata: str) -> str:
+    """Require the exact ordinary successor profile for the retired source."""
+
+    expected_partition = _sql_string_literal(
+        json.dumps(
+            {
+                "enabled": True,
+                "resources": REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES,
+            },
+            sort_keys=True,
+        )
+    )
+    expected_resources = "to_jsonb(CAST(:candidate_expected_resources AS varchar[]))"
+    absent_keys = (
+        "provider_directory_candidate_status",
+        PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY,
+        REVIEWED_ROOT_POLICY_METADATA_KEY,
+        REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,
+        REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2,
+    )
+    resource_contract = " AND ".join(
+        f"({source_metadata} -> '{key}') @> {expected_resources} AND "
+        f"{expected_resources} @> ({source_metadata} -> '{key}')"
+        for key in (
+            "provider_directory_supported_resources",
+            "provider_directory_fully_enumerable_resources",
+        )
+    )
+    return f"""
+        {source_metadata} ->> 'provider_directory_override' =
+            'reviewed_candidate_acquisition'
+        AND {source_metadata} -> 'provider_directory_acquisition_enabled' =
+            'true'::jsonb
+        AND {source_metadata} ->> 'provider_directory_coverage_mode' = 'full'
+        AND {source_metadata} -> '{LAST_UPDATED_PARTITION_METADATA_KEY}' =
+            {expected_partition}::jsonb
+        AND {resource_contract}
+        AND {' AND '.join(f"NOT ({source_metadata} ? '{key}')" for key in absent_keys)}
+    """
+
+
+def _retired_partition_source_profile_sql(source_ref: str, metadata: str) -> str:
+    """Bind the retired evidence to one exact ordinary source alias."""
+
+    source_metadata = "retired_source.metadata_json::jsonb"
+    configured_endpoint = (
+        f"NULLIF({source_metadata} ->> "
+        f"'{PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY}', '')"
+    )
+    alias_configured_endpoint = (
+        "NULLIF(endpoint_alias.metadata_json::jsonb ->> "
+        f"'{PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY}', '')"
+    )
+    return f"""
+        EXISTS (
+            SELECT 1
+              FROM {source_ref} AS retired_source
+             WHERE retired_source.source_id = :candidate_source_id
+               AND {metadata} -> 'source_ids' = jsonb_build_array(:candidate_source_id)
+               AND retired_source.endpoint_id = dataset.endpoint_id
+               AND {configured_endpoint} = dataset.endpoint_id
+               AND ({_retired_partition_source_contract_sql(source_metadata)})
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM {source_ref} AS endpoint_alias
+                     WHERE endpoint_alias.source_id <> retired_source.source_id
+                       AND (
+                            endpoint_alias.endpoint_id = dataset.endpoint_id
+                            OR {alias_configured_endpoint} = dataset.endpoint_id
+                       )
+               )
+        )
+    """
+
+
+def _retired_partition_predecessor_sql(dataset_ref: str) -> str:
+    """Bind the fresh and retained candidates to valid endpoint history."""
+
+    current_status = ENDPOINT_DATASET_PUBLISHED
+    return f"""
+        EXISTS (
+            SELECT 1 FROM {dataset_ref} AS current_incumbent
+             WHERE current_incumbent.endpoint_id = dataset.endpoint_id
+               AND current_incumbent.dataset_id = :expected_previous_dataset_id
+               AND current_incumbent.status = '{current_status}'
+               AND current_incumbent.is_current = true
+               AND current_incumbent.published_at IS NOT NULL
+               AND current_incumbent.superseded_at IS NULL
+        )
+        AND EXISTS (
+            SELECT 1 FROM {dataset_ref} AS stale_predecessor
+             WHERE stale_predecessor.endpoint_id = dataset.endpoint_id
+               AND stale_predecessor.dataset_id = dataset.previous_dataset_id
+               AND stale_predecessor.published_at IS NOT NULL
+               AND (
+                    (stale_predecessor.status = '{current_status}'
+                     AND stale_predecessor.is_current = true
+                     AND stale_predecessor.superseded_at IS NULL)
+                    OR (stale_predecessor.status = '{ENDPOINT_DATASET_SUPERSEDED}'
+                        AND stale_predecessor.is_current = false
+                        AND stale_predecessor.superseded_at IS NOT NULL
+                        AND stale_predecessor.superseded_at >= stale_predecessor.published_at)
+               )
+        )
+    """
+
+
+def _retired_partition_candidate_nonblocking_sql(dataset_ref: str) -> str:
+    """Recognize one obsolete twin generation after its source reset."""
+
+    metadata = "dataset.publication_metadata_json::jsonb"
+    source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
+    return f"""
+        CAST(:ordinary_candidate AS boolean)
+        AND dataset.completion_proof_required_version IS NULL
+        AND dataset.completion_proof_json IS NULL
+        AND dataset.completion_proof_sha256 IS NULL
+        AND dataset.validated_at IS NOT NULL
+        AND dataset.published_at IS NULL
+        AND dataset.superseded_at IS NULL
+        AND {metadata} ->> '{TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY}' =
+            '{LEGACY_REVIEWED_PARTITION_CAMPAIGN_ID}'
+        AND {metadata} -> 'requires_twin_root_verification' = 'true'::jsonb
+        AND {metadata} ->> '{TWIN_ROOT_VERIFICATION_ROLE_KEY}' =
+            '{TWIN_ROOT_VERIFICATION_CANDIDATE_ROLE}'
+        AND NULLIF(
+            {metadata} ->> '{TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY}', ''
+        ) IS NOT NULL
+        AND NOT ({metadata} ? '{REVIEWED_ROOT_POLICY_METADATA_KEY}')
+        AND ({_retired_partition_predecessor_sql(dataset_ref)})
+        AND ({_retired_partition_source_profile_sql(source_ref, metadata)})
+    """
+
+
+def _validated_endpoint_candidate_blocks_admission_sql(
+    dataset_ref: str | None = None,
+) -> str:
+    """Ignore only proven-invalid or exactly retired legacy evidence."""
+
+    dataset_ref = dataset_ref or _qt(
+        _schema(), ProviderDirectoryEndpointDataset.__tablename__
+    )
     metadata = "legacy_candidate.metadata"
     proof_valid = _artifact_content_proof_valid_sql(
         metadata,
         "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)",
     )
+    retired_partition = _retired_partition_candidate_nonblocking_sql(
+        dataset_ref
+    )
     return f"""
         CASE
+            WHEN ({retired_partition}) THEN false
             WHEN ({_artifact_admission_seal_shape_valid_sql()}) THEN true
             WHEN NOT ({_artifact_admission_seal_absent_sql()})
               OR dataset.artifact_selection_receipt_json IS NOT NULL
@@ -65752,6 +65948,12 @@ async def _locked_endpoint_verification_state(
             candidate.verification_source_scope_hash or ""
         ),
         verification_candidate_role=TWIN_ROOT_VERIFICATION_CANDIDATE_ROLE,
+        ordinary_candidate=_is_ordinary_endpoint_candidate(candidate),
+        candidate_source_id=(
+            candidate.source_ids[0] if len(candidate.source_ids) == 1 else ""
+        ),
+        candidate_expected_resources=sorted(candidate.expected_resources),
+        expected_previous_dataset_id=candidate.previous_dataset_id or "",
         endpoint_wide_statuses=[
             ENDPOINT_DATASET_ACQUIRING,
             ENDPOINT_DATASET_INCOMPLETE,

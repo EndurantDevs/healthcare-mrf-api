@@ -90,8 +90,15 @@ async def _assert_sealed_metadata_closed(
                      'endpoint_shared'::varchar AS endpoint_id,
                      'root-legacy-invalid'::varchar AS acquisition_root_run_id,
                      NULL::varchar AS import_run_id,
+                     NULL::varchar AS previous_dataset_id,
                      repeat('e', 64)::varchar AS dataset_hash,
                      1::bigint AS resource_count,
+                     NULL::integer AS completion_proof_required_version,
+                     NULL::jsonb AS completion_proof_json,
+                     NULL::varchar AS completion_proof_sha256,
+                     NULL::timestamptz AS validated_at,
+                     NULL::timestamptz AS published_at,
+                     NULL::timestamptz AS superseded_at,
                      (SELECT metadata FROM raw_metadata)
                          AS publication_metadata_json,
                      NULL::jsonb AS artifact_selection_receipt_json,
@@ -105,7 +112,11 @@ async def _assert_sealed_metadata_closed(
                      repeat('a', 64)::varchar AS content_proof_admission_sha256,
                      ARRAY['Location']::varchar[] AS content_proof_resource_types
           ) AS dataset;
-        """
+        """,
+        ordinary_candidate=False,
+        candidate_source_id="",
+        candidate_expected_resources=[],
+        expected_previous_dataset_id="",
     ) is True
 
 

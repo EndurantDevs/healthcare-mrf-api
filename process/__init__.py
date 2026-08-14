@@ -1028,56 +1028,24 @@ def npi():
     hidden=True,
 )
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
-def ptg(
-    toc_url: tuple[str, ...],
-    toc_list: str | None,
-    in_network_url: str | None,
-    allowed_url: str | None,
-    provider_ref_url: str | None,
-    import_id: str | None,
-    source_key: str | None,
-    import_month: str | None = None,
-    max_files: int | None = None,
-    max_items: int | None = None,
-    plan_id: tuple[str, ...] = (),
-    plan_name_contains: tuple[str, ...] = (),
-    plan_market_type: tuple[str, ...] = (),
-    file_url_contains: tuple[str, ...] = (),
-    reuse_raw_artifacts: bool = True,
-    keep_partial_artifacts: bool | None = None,
-    keep_artifacts_on_failure: bool = False,
-    _full_rebuild_token: str | None = None,
-    test: bool = False,
-):
+def ptg(**options):
     """Run a filtered Transparency in Coverage import."""
-    if _full_rebuild_token is not None:
+    if options.pop("_full_rebuild_token", None) is not None:
         raise click.UsageError(
             "controlled PTG rebuilds must be requested through import control"
         )
-    should_keep_partial_artifacts = keep_partial_artifacts
-    if keep_artifacts_on_failure:
-        should_keep_partial_artifacts = True
-    _run(
-        initiate_ptg(
-            test_mode=test,
-            toc_urls=list(toc_url),
-            toc_list=toc_list,
-            in_network_url=in_network_url,
-            allowed_url=allowed_url,
-            provider_ref_url=provider_ref_url,
-            import_id=import_id,
-            source_key=source_key,
-            import_month=import_month,
-            max_files=max_files,
-            max_items=max_items,
-            plan_ids=list(plan_id),
-            plan_name_contains=list(plan_name_contains),
-            plan_market_types=list(plan_market_type),
-            file_url_contains=list(file_url_contains),
-            reuse_raw_artifacts=reuse_raw_artifacts,
-            keep_partial_artifacts=should_keep_partial_artifacts,
-        )
-    )
+    if options.pop("keep_artifacts_on_failure", False):
+        options["keep_partial_artifacts"] = True
+    options["test_mode"] = options.pop("test")
+    for source_name, target_name in (
+        ("toc_url", "toc_urls"),
+        ("plan_id", "plan_ids"),
+        ("plan_market_type", "plan_market_types"),
+    ):
+        options[target_name] = list(options.pop(source_name))
+    options["plan_name_contains"] = list(options["plan_name_contains"])
+    options["file_url_contains"] = list(options["file_url_contains"])
+    _run(initiate_ptg(**options))
 
 
 @click.command(help="Audit and activate one validated strict-V3 PTG candidate")
@@ -1441,125 +1409,14 @@ def provider_enrichment(test: bool):
 )
 @click.option("--concurrency", type=int, help="Concurrent source metadata probes.")
 @click.option("--timeout", type=int, help="Per-request timeout in seconds.")
-def provider_directory_fhir(
-    test: bool,
-    seed_db_path: str | None,
-    seed_db_url: str | None,
-    retest_results_path: str | None,
-    retest_results_url: str | None,
-    credential_config_file: str | None,
-    run_id: str | None,
-    retry_of_run_id: str | None,
-    provider_directory_pagination_root_run_id: str | None,
-    restart_expired_current_census_slice: bool,
-    provider_directory_acquisition_strategy: str,
-    provider_directory_census_cutoff: str | None,
-    source_id: tuple[str, ...],
-    limit: int | None,
-    source_query: str | None,
-    refresh_preset: str | None,
-    include_supplemental_catalogs: bool | None,
-    seed_only: bool,
-    no_probe: bool,
-    import_resources: bool,
-    uhc_catalog_set_sha256: str | None,
-    dataset_rehydrate_only: bool,
-    rehydrate_dataset_id: str | None,
-    rehydrate_acquisition_root_run_id: str | None,
-    rehydrate_resource: tuple[str, ...],
-    rehydrate_batch_size: int | None,
-    canonical_backfill_only: bool,
-    contact_backfill_only: bool,
-    dataset_followup_only: bool,
-    publish_artifacts_only: bool,
-    full_address_artifact_rebuild: bool,
-    publish_artifacts_targets: str | None,
-    publish_corroboration: bool | None,
-    full_refresh: bool,
-    stale_cleanup: bool | None,
-    publish_artifacts: bool | None,
-    publish_after_acquisition: bool,
-    open_only: bool,
-    include_auth_required: bool,
-    resources: str | None,
-    resource_limit: int | None,
-    resource_deadline_seconds: int | None,
-    linked_resource_limit: int | None,
-    linked_resource_deadline_seconds: int | None,
-    page_limit: int | None,
-    page_count: int | None,
-    stream_batch_size: int | None,
-    defer_typed_materialization: bool,
-    bulk_export: bool | None,
-    source_concurrency: int | None,
-    resource_scan_concurrency: int | None,
-    concurrency: int | None,
-    timeout: int | None,
-):
+def provider_directory_fhir(**options):
     """Run a configured Provider Directory FHIR refresh."""
-    _run(
-        initiate_provider_directory_fhir(
-            test_mode=test,
-            seed_db_path=seed_db_path,
-            seed_db_url=seed_db_url,
-            retest_results_path=retest_results_path,
-            retest_results_url=retest_results_url,
-            credential_config_file=credential_config_file,
-            run_id=run_id,
-            retry_of_run_id=retry_of_run_id,
-            provider_directory_pagination_root_run_id=(
-                provider_directory_pagination_root_run_id
-            ),
-            restart_expired_current_census_slice=(
-                restart_expired_current_census_slice
-            ),
-            provider_directory_acquisition_strategy=(
-                provider_directory_acquisition_strategy
-            ),
-            provider_directory_census_cutoff=provider_directory_census_cutoff,
-            source_ids=list(source_id) if source_id else None,
-            limit=limit,
-            source_query=source_query,
-            refresh_preset=refresh_preset,
-            include_supplemental_catalogs=include_supplemental_catalogs,
-            seed_only=seed_only,
-            probe=not no_probe,
-            import_resources=import_resources,
-            uhc_catalog_set_sha256=uhc_catalog_set_sha256,
-            dataset_rehydrate_only=dataset_rehydrate_only,
-            rehydrate_dataset_id=rehydrate_dataset_id,
-            rehydrate_acquisition_root_run_id=rehydrate_acquisition_root_run_id,
-            rehydrate_resources=list(rehydrate_resource),
-            rehydrate_batch_size=rehydrate_batch_size,
-            canonical_backfill_only=canonical_backfill_only,
-            contact_backfill_only=contact_backfill_only,
-            dataset_followup_only=dataset_followup_only,
-            publish_artifacts_only=publish_artifacts_only,
-            full_address_artifact_rebuild=full_address_artifact_rebuild,
-            publish_artifacts_targets=publish_artifacts_targets,
-            publish_corroboration=publish_corroboration,
-            full_refresh=full_refresh,
-            stale_cleanup=stale_cleanup,
-            publish_artifacts=publish_artifacts,
-            publish_after_acquisition=publish_after_acquisition,
-            open_only=open_only,
-            include_auth_required=include_auth_required,
-            resources=resources,
-            resource_limit=resource_limit,
-            resource_deadline_seconds=resource_deadline_seconds,
-            linked_resource_limit=linked_resource_limit,
-            linked_resource_deadline_seconds=linked_resource_deadline_seconds,
-            page_limit=page_limit,
-            page_count=page_count,
-            stream_batch_size=stream_batch_size,
-            defer_typed_materialization=defer_typed_materialization,
-            bulk_export=bulk_export,
-            source_concurrency=source_concurrency,
-            resource_scan_concurrency=resource_scan_concurrency,
-            concurrency=concurrency,
-            timeout=timeout,
-        )
-    )
+    options["test_mode"] = options.pop("test")
+    source_ids = options.pop("source_id")
+    options["source_ids"] = list(source_ids) if source_ids else None
+    options["probe"] = not options.pop("no_probe")
+    options["rehydrate_resources"] = list(options.pop("rehydrate_resource"))
+    _run(initiate_provider_directory_fhir(**options))
 
 
 @click.command(help="Backfill one fixed-size Provider Directory dataset receipt")
@@ -1729,41 +1586,15 @@ def pharmacy_economics(test: bool):
     type=int,
     help="Provider Directory source IDs per partial-refresh load unit; use 0 to disable source batching.",
 )
-def entity_address_unified(
-    test: bool,
-    limit_per_source: int | None,
-    publish: bool | None,
-    refresh_mode: str,
-    serving_only_refresh: bool | None,
-    provider_directory_run_id: str | None,
-    provider_directory_source_id: tuple[str, ...],
-    provider_directory_dataset_id: str | None,
-    provider_directory_partial_scope: str | None,
-    provider_directory_source_batch_size: int | None,
-):
+def entity_address_unified(**options):
     """Materialize the unified entity-address dataset."""
-    _run(
-        initiate_entity_address_unified(
-            test_mode=test,
-            limit_per_source=limit_per_source,
-            publish=publish,
-            refresh_mode=refresh_mode,
-            serving_only_refresh=serving_only_refresh,
-            provider_directory_run_id=provider_directory_run_id,
-            provider_directory_source_ids=list(provider_directory_source_id),
-            provider_directory_partial_scope=provider_directory_partial_scope,
-            provider_directory_source_batch_size=provider_directory_source_batch_size,
-            **(
-                {
-                    "provider_directory_dataset_id": (
-                        provider_directory_dataset_id
-                    )
-                }
-                if provider_directory_dataset_id is not None
-                else {}
-            ),
-        )
+    options["test_mode"] = options.pop("test")
+    options["provider_directory_source_ids"] = list(
+        options.pop("provider_directory_source_id")
     )
+    if options["provider_directory_dataset_id"] is None:
+        options.pop("provider_directory_dataset_id")
+    _run(initiate_entity_address_unified(**options))
 
 
 @click.command(help="Run OpenAddresses US geocode cache refresh and address archive backfill")
@@ -1790,59 +1621,10 @@ def entity_address_unified(
 @click.option("--backfill-match-modes", help="Comma-separated archive backfill phases: exact,fuzzy,relaxed.")
 @click.option("--zip-restore-concurrency", type=int, help="Number of OpenAddresses ZIP restore shards to process concurrently.")
 @click.option("--zip-restore-shards", type=int, help="Number of OpenAddresses ZIP recovery buckets to stage.")
-def openaddresses(
-    test: bool,
-    backfill_only: bool,
-    load_only: bool,
-    publish_only: bool,
-    resume_stage: bool,
-    import_id: str | None,
-    local_files: tuple[str, ...],
-    batch_size: int | None,
-    source_concurrency: int | None,
-    max_files: int | None,
-    start_index: int | None,
-    end_index: int | None,
-    start_source: str | None,
-    min_rows: int | None,
-    test_file_limit: int | None,
-    test_row_limit: int | None,
-    backfill_state_code: str | None,
-    backfill_zip_prefix: str | None,
-    backfill_concurrency: int | None,
-    backfill_zip_prefix_length: int | None,
-    backfill_match_modes: str | None,
-    zip_restore_concurrency: int | None,
-    zip_restore_shards: int | None,
-):
+def openaddresses(**options):
     """Refresh the US OpenAddresses cache and archive coordinates."""
-    _run(
-        initiate_openaddresses(
-            test_mode=test,
-            backfill_only=backfill_only,
-            load_only=load_only,
-            publish_only=publish_only,
-            resume_stage=resume_stage,
-            import_id=import_id,
-            local_files=local_files,
-            batch_size=batch_size,
-            source_concurrency=source_concurrency,
-            max_files=max_files,
-            start_index=start_index,
-            end_index=end_index,
-            start_source=start_source,
-            min_rows=min_rows,
-            test_file_limit=test_file_limit,
-            test_row_limit=test_row_limit,
-            backfill_state_code=backfill_state_code,
-            backfill_zip_prefix=backfill_zip_prefix,
-            backfill_concurrency=backfill_concurrency,
-            backfill_zip_prefix_length=backfill_zip_prefix_length,
-            backfill_match_modes=backfill_match_modes,
-            zip_restore_concurrency=zip_restore_concurrency,
-            zip_restore_shards=zip_restore_shards,
-        )
-    )
+    options["test_mode"] = options.pop("test")
+    _run(initiate_openaddresses(**options))
 
 
 @click.command(help="Run one-time legacy address archive to canonical v2 migration")
@@ -2014,45 +1796,17 @@ def address_numeric_grid_alias_revoke(
 @click.option("--concurrency", type=int, default=None, help="Maximum concurrent URL checks/TOC fetches. Defaults to 10.")
 @click.option("--crawl-target-limit", type=int, help="Maximum resolved TOC targets to crawl after platform expansion.")
 @click.option("--test", is_flag=True, help="Use the local curated master list sample and avoid external network checks.")
-def mrf_source_discovery_command(
-    provider: str | None,
-    limit: int | None,
-    source_entity_types: str | None,
-    source_payer_query: str | None,
-    dry_run: bool,
-    check_urls: bool,
-    crawl: bool,
-    probe_files: bool,
-    file_probe_limit: int | None,
-    file_probe_types: str | None,
-    file_probe_entity_types: str | None,
-    file_probe_payer_query: str | None,
-    max_toc_bytes: int | None,
-    concurrency: int | None,
-    crawl_target_limit: int | None,
-    test: bool,
-):
+def mrf_source_discovery_command(**options):
     """Discover, crawl, and synchronize configured MRF sources."""
-    _run(
-        initiate_mrf_source_discovery(
-            test_mode=test,
-            provider=provider,
-            limit=limit,
-            source_entity_types=source_entity_types,
-            source_payer_query=source_payer_query,
-            dry_run=dry_run,
-            check_urls=check_urls,
-            crawl=crawl,
-            probe_files=probe_files,
-            file_probe_limit=file_probe_limit or None,
-            file_probe_types=file_probe_types,
-            file_probe_entity_types=file_probe_entity_types,
-            file_probe_payer_query=file_probe_payer_query,
-            max_toc_bytes=max_toc_bytes or None,
-            concurrency=concurrency or None,
-            crawl_target_limit=crawl_target_limit or None,
-        )
-    )
+    options["test_mode"] = options.pop("test")
+    for field_name in (
+        "file_probe_limit",
+        "max_toc_bytes",
+        "concurrency",
+        "crawl_target_limit",
+    ):
+        options[field_name] = options[field_name] or None
+    _run(initiate_mrf_source_discovery(**options))
 
 
 @click.command(help="Finish CMS Part D formulary + pharmacy network import for a queued run id")
