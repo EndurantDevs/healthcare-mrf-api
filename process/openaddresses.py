@@ -13,6 +13,8 @@ import logging
 import os
 import re
 import tempfile
+import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -24,6 +26,7 @@ from arq import create_pool
 from db.models import OpenAddressesGeocode, OpenAddressesZipRecovery, db
 from process.control_cancel import raise_if_cancelled
 from process.ext import address_canon
+from process.ext.address_fast import canonicalize_batch as canonicalize_address_batch
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info, push_objects
 from process.live_progress import enqueue_live_progress
 from process.redis_config import build_redis_settings
@@ -53,6 +56,8 @@ BACKFILL_MATCH_MODES = frozenset({"exact", "fuzzy", "relaxed"})
 RETRYABLE_DOWNLOAD_STATUSES = {429, 500, 502, 503, 504}
 POSTGRES_IDENTIFIER_MAX_LENGTH = 63
 HOUSE_NUMBER_RE = re.compile(r"^\s*([0-9]+[a-zA-Z]?)\b")
+PUBLISHED_RECOVERY_MARKER_PREFIX = "openaddresses:published-recovery:v1:"
+COMPLETED_GENERATION_MARKER_PREFIX = "openaddresses:completed-generation:v1:"
 
 
 @dataclass(frozen=True)
@@ -213,6 +218,13 @@ def _normalize_import_id(raw: str | None) -> str:
         if cleaned:
             return cleaned[:32]
     return datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+
+
+def _explicit_import_id(raw: Any) -> str:
+    cleaned = "".join(ch for ch in str(raw or "") if ch.isalnum())
+    if not cleaned:
+        raise ValueError(f"Invalid OpenAddresses import identity: {raw!r}")
+    return cleaned[:32]
 
 
 def _archived_identifier(name: str, suffix: str = "_old") -> str:
@@ -642,6 +654,7 @@ def _record_from_feature_parts(
     source_name: str | None,
     data_id: int | None,
     job_id: int | None,
+    defer_canonical: bool = False,
 ) -> dict[str, Any] | None:
     """Shape one validated OpenAddresses feature record."""
     house_number = feature_parts_by_name["house_number"]
@@ -654,8 +667,8 @@ def _record_from_feature_parts(
     lat = feature_parts_by_name["lat"]
     lon = feature_parts_by_name["lon"]
     first_line = f"{house_number} {street_name}"
-    identity_key = address_canon.identity_key_v1(first_line, unit, city, state, zip5, "US")
-    address_key = address_canon.address_key_v1(first_line, unit, city, state, zip5, "US")
+    identity_key = None if defer_canonical else address_canon.identity_key_v1(first_line, unit, city, state, zip5, "US")
+    address_key = None if defer_canonical else address_canon.address_key_v1(first_line, unit, city, state, zip5, "US")
     formatted_address = _format_address(first_line=first_line, unit=unit, city=city, state=state, zip5=zip5)
     feature_id = feature_parts_by_name["feature_id"]
     row_hash = _openaddresses_row_hash(
@@ -702,6 +715,7 @@ def _record_from_feature(
     data_id: int | None,
     job_id: int | None,
     updated: Any,
+    defer_canonical: bool = False,
 ) -> dict[str, Any] | None:
     """Convert one GeoJSON feature into an import record."""
     feature_parts_by_name, reason = _feature_parts(
@@ -716,6 +730,7 @@ def _record_from_feature(
         source_name=source_name,
         data_id=data_id,
         job_id=job_id,
+        defer_canonical=defer_canonical,
     )
 
 
@@ -859,6 +874,7 @@ def _feature_import_records(
     job_id: int | None,
     updated: Any,
     restore_shards: int,
+    defer_canonical: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
     """Return the accepted row or ZIP recovery row for one feature."""
     address_record = _record_from_feature(
@@ -867,6 +883,7 @@ def _feature_import_records(
         data_id=data_id,
         job_id=job_id,
         updated=updated,
+        defer_canonical=defer_canonical,
     )
     if address_record:
         return address_record, None, None
@@ -879,6 +896,52 @@ def _feature_import_records(
         restore_shards=restore_shards,
     )
     return None, recovery_record, rejection_reason
+
+
+def _attach_canonical_keys(address_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not address_rows:
+        return []
+    canonical_rows = canonicalize_address_batch(
+        (
+            f"{address_row['house_number']} {address_row['street_name']}",
+            address_row["unit"],
+            address_row["city_name"],
+            address_row["state_code"],
+            address_row["zip5"],
+            "US",
+        )
+        for address_row in address_rows
+    )
+    if len(canonical_rows) != len(address_rows):
+        raise RuntimeError(
+            "OpenAddresses canonical batch result count mismatch: "
+            f"expected {len(address_rows)}, got {len(canonical_rows)}"
+        )
+    canonical_keys: list[tuple[str, uuid.UUID]] = []
+    for index, canonical_row in enumerate(canonical_rows):
+        if not isinstance(canonical_row, Mapping):
+            raise RuntimeError(f"OpenAddresses canonical batch result {index} is not a mapping")
+        identity_key = canonical_row.get("identity_key")
+        address_key = canonical_row.get("address_key")
+        if not isinstance(identity_key, str) or not identity_key.strip():
+            raise RuntimeError(f"OpenAddresses canonical batch result {index} has no identity_key")
+        if not isinstance(address_key, str) or not address_key.strip():
+            raise RuntimeError(f"OpenAddresses canonical batch result {index} has no address_key")
+        try:
+            parsed_address_key = uuid.UUID(address_key)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"OpenAddresses canonical batch result {index} has an invalid address_key"
+            ) from exc
+        if address_canon.key_from_identity(identity_key) != parsed_address_key:
+            raise RuntimeError(
+                f"OpenAddresses canonical batch result {index} has inconsistent keys"
+            )
+        canonical_keys.append((identity_key, parsed_address_key))
+    return [
+        {**address_row, "identity_key": identity_key, "address_key": address_key}
+        for address_row, (identity_key, address_key) in zip(address_rows, canonical_keys)
+    ]
 
 
 def _iter_record_batches(
@@ -906,6 +969,7 @@ def _iter_record_batches(
             job_id=job_id,
             updated=updated,
             restore_shards=restore_shards,
+            defer_canonical=True,
         )
         if address_record:
             address_rows.append(address_record)
@@ -919,7 +983,7 @@ def _iter_record_batches(
         if len(address_rows) >= batch_size or len(zip_recovery_rows) >= batch_size:
             yield _RecordBatch(
                 processed=processed,
-                rows=address_rows,
+                rows=_attach_canonical_keys(address_rows),
                 zip_recovery_rows=zip_recovery_rows,
                 rejection_counts=rejection_counts_by_reason,
             )
@@ -931,7 +995,7 @@ def _iter_record_batches(
     if address_rows or zip_recovery_rows or processed:
         yield _RecordBatch(
             processed=processed,
-            rows=address_rows,
+            rows=_attach_canonical_keys(address_rows),
             zip_recovery_rows=zip_recovery_rows,
             rejection_counts=rejection_counts_by_reason,
         )
@@ -1592,6 +1656,187 @@ def _zip_recovery_table_name(stage_table: str) -> str:
     prefix = f"{OPENADDRESSES_TABLE}_"
     suffix = stage_table[len(prefix):] if stage_table.startswith(prefix) else stage_table
     return _bounded_identifier(f"{OpenAddressesZipRecovery.__tablename__}_{suffix}")
+
+
+def _published_zip_recovery_table_name(recovery_table: str) -> str:
+    return _bounded_identifier(f"{recovery_table}_published")
+
+
+def _published_recovery_marker_comment(import_id: str, live_oid: int) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9]{1,32}", import_id or ""):
+        raise ValueError(f"Invalid OpenAddresses marker import id: {import_id!r}")
+    if int(live_oid or 0) <= 0:
+        raise ValueError(f"Invalid OpenAddresses marker live OID: {live_oid!r}")
+    return f"{PUBLISHED_RECOVERY_MARKER_PREFIX}{import_id}:{int(live_oid)}"
+
+
+def _completed_generation_marker_comment(import_id: str, live_oid: int) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9]{1,32}", import_id or ""):
+        raise ValueError(f"Invalid OpenAddresses completion import id: {import_id!r}")
+    if int(live_oid or 0) <= 0:
+        raise ValueError(f"Invalid OpenAddresses completion live OID: {live_oid!r}")
+    return f"{COMPLETED_GENERATION_MARKER_PREFIX}{import_id}:{int(live_oid)}"
+
+
+async def _relation_oid(schema: str, table_name: str) -> int | None:
+    return await db.scalar(
+        "SELECT CAST(to_regclass(:relation) AS oid);",
+        relation=_qtable(schema, table_name),
+    )
+
+
+async def _relation_comment(schema: str, table_name: str) -> str | None:
+    return await db.scalar(
+        "SELECT obj_description(CAST(to_regclass(:relation) AS oid), 'pg_class');",
+        relation=_qtable(schema, table_name),
+    )
+
+
+async def _completed_generation(schema: str, live_table: str) -> dict[str, Any] | None:
+    comment = await _relation_comment(schema, live_table)
+    if not isinstance(comment, str) or not comment.startswith(COMPLETED_GENERATION_MARKER_PREFIX):
+        return None
+    payload = comment.removeprefix(COMPLETED_GENERATION_MARKER_PREFIX)
+    import_id, separator, raw_live_oid = payload.rpartition(":")
+    if not separator or not raw_live_oid.isdigit():
+        raise RuntimeError("OpenAddresses completed-generation marker is malformed.")
+    live_oid = int(raw_live_oid)
+    if comment != _completed_generation_marker_comment(import_id, live_oid):
+        raise RuntimeError("OpenAddresses completed-generation marker is malformed.")
+    current_live_oid = await _relation_oid(schema, live_table)
+    if current_live_oid is None or int(current_live_oid) != live_oid:
+        raise RuntimeError("OpenAddresses completed-generation marker is stale.")
+    return {"import_id": import_id, "live_oid": live_oid}
+
+
+async def _published_recovery_generations(schema: str) -> list[dict[str, Any]]:
+    database_rows = await db.all(
+        """
+        SELECT tables.relname AS table_name,
+               obj_description(tables.oid, 'pg_class') AS marker_comment
+          FROM pg_catalog.pg_class AS tables
+          JOIN pg_catalog.pg_namespace AS schemas ON schemas.oid = tables.relnamespace
+         WHERE schemas.nspname = :schema
+           AND tables.relkind IN ('r', 'p')
+           AND obj_description(tables.oid, 'pg_class') LIKE :marker_prefix
+         ORDER BY tables.relname;
+        """,
+        schema=schema,
+        marker_prefix=f"{PUBLISHED_RECOVERY_MARKER_PREFIX}%",
+    )
+    generations = []
+    for database_row in database_rows or []:
+        marker_by_field = _row_mapping(database_row)
+        comment = str(marker_by_field["marker_comment"] or "")
+        marker_payload = comment.removeprefix(PUBLISHED_RECOVERY_MARKER_PREFIX)
+        import_id, separator, raw_live_oid = marker_payload.rpartition(":")
+        if not separator or not raw_live_oid.isdigit():
+            raise RuntimeError("OpenAddresses published-recovery marker is malformed.")
+        live_oid = int(raw_live_oid)
+        if comment != _published_recovery_marker_comment(import_id, live_oid):
+            raise RuntimeError("OpenAddresses published-recovery marker is malformed.")
+        generations.append(
+            {
+                "table_name": str(marker_by_field["table_name"]),
+                "import_id": import_id,
+                "live_oid": live_oid,
+            }
+        )
+    return generations
+
+
+async def _is_owned_postpublish_generation_ready(
+    *,
+    schema: str,
+    import_id: str,
+    stage_table: str,
+    recovery_table: str,
+    marker_table: str,
+    live_table: str,
+) -> bool:
+    generations = await _published_recovery_generations(schema)
+    marker_present = await _is_table_present(schema, marker_table)
+    if not generations and not marker_present:
+        return False
+    if len(generations) != 1:
+        raise RuntimeError("OpenAddresses published-recovery marker state is ambiguous.")
+    generation = generations[0]
+    if generation["table_name"] != marker_table or generation["import_id"] != import_id:
+        raise RuntimeError("Another OpenAddresses published generation requires recovery.")
+    if not marker_present:
+        raise RuntimeError("OpenAddresses published-recovery marker state is ambiguous.")
+    if await _is_table_present(schema, stage_table) or await _is_table_present(schema, recovery_table):
+        raise RuntimeError("OpenAddresses published generation conflicts with staging state.")
+    live_oid = await _relation_oid(schema, live_table)
+    if live_oid is None or int(live_oid) != generation["live_oid"]:
+        raise RuntimeError("OpenAddresses published-recovery marker is stale.")
+    return True
+
+
+async def _publication_retry_state(
+    *,
+    schema: str,
+    import_id: str,
+    stage_table: str,
+    recovery_table: str,
+    marker_table: str,
+    live_table: str,
+) -> str | None:
+    completed = await _completed_generation(schema, live_table)
+    pending = await _is_owned_postpublish_generation_ready(
+        schema=schema,
+        import_id=import_id,
+        stage_table=stage_table,
+        recovery_table=recovery_table,
+        marker_table=marker_table,
+        live_table=live_table,
+    )
+    if pending and completed:
+        raise RuntimeError("OpenAddresses publication state is ambiguous: pending and completed evidence coexist.")
+    if pending:
+        return "pending"
+    if not completed or completed["import_id"] != import_id:
+        return None
+    if (
+        await _is_table_present(schema, stage_table)
+        or await _is_table_present(schema, recovery_table)
+        or await _is_table_present(schema, marker_table)
+    ):
+        raise RuntimeError("OpenAddresses completed generation conflicts with staging state.")
+    return "completed"
+
+
+async def _complete_published_generation(
+    *,
+    schema: str,
+    import_id: str,
+    stage_table: str,
+    recovery_table: str,
+    marker_table: str,
+    live_table: str,
+) -> None:
+    async with db.transaction():
+        await db.status(f"LOCK TABLE {_qtable(schema, live_table)} IN ACCESS EXCLUSIVE MODE;")
+        if not await _is_owned_postpublish_generation_ready(
+            schema=schema,
+            import_id=import_id,
+            stage_table=stage_table,
+            recovery_table=recovery_table,
+            marker_table=marker_table,
+            live_table=live_table,
+        ):
+            raise RuntimeError("OpenAddresses published generation lost its recovery marker.")
+        existing_comment = await _relation_comment(schema, live_table)
+        if existing_comment is not None:
+            raise RuntimeError(
+                "OpenAddresses live relation already has a comment; preserving it instead of overwriting it."
+            )
+        live_oid = await _relation_oid(schema, live_table)
+        completion_comment = _completed_generation_marker_comment(import_id, live_oid)
+        await db.status(
+            f"COMMENT ON TABLE {_qtable(schema, live_table)} IS '{completion_comment}';"
+        )
+        await db.status(f"DROP TABLE {_qtable(schema, marker_table)};")
 
 
 async def _create_zip_recovery_indexes(table_name: str, schema: str) -> None:
@@ -2750,9 +2995,19 @@ async def process_data(ctx, task=None):  # pragma: no cover
     ctx.setdefault("context", {})
     if "test_mode" in task:
         ctx["context"]["test_mode"] = bool(task.get("test_mode"))
-    task_import_id = task.get("import_id") or task.get("stage_suffix")
+    explicit_import_id = task.get("import_id")
+    stage_suffix = task.get("stage_suffix")
+    control_import_id = task.get("control_import_id")
+    if explicit_import_id and stage_suffix:
+        if _explicit_import_id(explicit_import_id) != _explicit_import_id(stage_suffix):
+            raise ValueError("Conflicting OpenAddresses import identities.")
+    requested_import_id = explicit_import_id or stage_suffix
+    if requested_import_id and control_import_id:
+        if _explicit_import_id(requested_import_id) != _explicit_import_id(control_import_id):
+            raise ValueError("Conflicting OpenAddresses import identities.")
+    task_import_id = requested_import_id or control_import_id or task.get("run_id")
     if task_import_id:
-        ctx["import_date"] = _normalize_import_id(task_import_id)
+        ctx["import_date"] = _explicit_import_id(task_import_id)
     ctx["context"]["import_date"] = ctx["import_date"]
     if _is_task_or_env_flag_enabled(
         task,
@@ -2839,6 +3094,32 @@ async def process_data(ctx, task=None):  # pragma: no cover
     stage_cls = make_class(OpenAddressesGeocode, import_date)
     recovery_cls = make_class(OpenAddressesZipRecovery, import_date)
     schema = _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
+    stage_table = stage_cls.__tablename__
+    recovery_table = recovery_cls.__tablename__
+    marker_table = _published_zip_recovery_table_name(recovery_table)
+    retry_state = await _publication_retry_state(
+        schema=schema,
+        import_id=import_date,
+        stage_table=stage_table,
+        recovery_table=recovery_table,
+        marker_table=marker_table,
+        live_table=OpenAddressesGeocode.__main_table__,
+    )
+    if retry_state:
+        if ctx["context"].get("load_only"):
+            raise RuntimeError("OpenAddresses post-publish recovery cannot run in load-only mode.")
+        ctx["context"]["openaddresses_stage_published"] = True
+        ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
+        print(
+            "OpenAddresses retry: "
+            + (
+                "resuming owned post-publish generation"
+                if retry_state == "pending"
+                else "owned generation already completed"
+            ),
+            flush=True,
+        )
+        return
     await _prepare_stage_table(
         stage_cls,
         schema,
@@ -2904,61 +3185,98 @@ async def shutdown(ctx):  # pragma: no cover
     recovery_cls = make_class(OpenAddressesZipRecovery, import_date)
     stage_table = stage_cls.__tablename__
     recovery_table = recovery_cls.__tablename__
-    if not await _is_table_present(schema, stage_table):
-        if context.get("openaddresses_stage_published") and await _is_table_present(
-            schema,
-            OpenAddressesGeocode.__main_table__,
-        ):
-            logger.warning(
-                "Skipping repeated OpenAddresses shutdown: staging table %s.%s was already published.",
-                schema,
-                stage_table,
-            )
-            return
-        raise RuntimeError(f"OpenAddresses staging table {schema}.{stage_table} is missing.")
-
-    zip_restore_stats = await restore_openaddresses_zips(
+    published_recovery_table = _published_zip_recovery_table_name(recovery_table)
+    live_table = OpenAddressesGeocode.__main_table__
+    archived_table = _archived_identifier(live_table)
+    retry_state = await _publication_retry_state(
         schema=schema,
+        import_id=import_date,
         stage_table=stage_table,
         recovery_table=recovery_table,
-        concurrency=int(
-            context.get("zip_restore_concurrency")
-            or _env_positive_int(
-                "HLTHPRT_OPENADDRESSES_ZIP_RESTORE_CONCURRENCY",
-                DEFAULT_ZIP_RESTORE_CONCURRENCY,
-            )
-        ),
-        run_id=_progress_run_id(ctx, {}),
+        marker_table=published_recovery_table,
+        live_table=live_table,
     )
-
-    stage_rows = int(
-        await db.scalar(f"SELECT COUNT(*) FROM {_qtable(schema, stage_table)};")
-        or 0
-    )
-    min_rows = int(context.get("min_rows") or _env_positive_int("HLTHPRT_OPENADDRESSES_MIN_ROWS", DEFAULT_MIN_ROWS))
-    if context.get("test_mode"):
-        print(f"OpenAddresses test mode: staged rows={stage_rows:,}")
-    elif stage_rows < min_rows:
-        raise RuntimeError(
-            f"OpenAddresses stage row count {stage_rows:,} is below minimum {min_rows:,}; aborting publish."
+    if retry_state == "completed":
+        context["openaddresses_stage_published"] = True
+        logger.warning(
+            "Skipping repeated OpenAddresses shutdown: generation %s is durably complete.",
+            import_date,
         )
-    null_zip_rows = int(
-        await db.scalar(f"SELECT COUNT(*) FROM {_qtable(schema, stage_table)} WHERE zip5 IS NULL;")
-        or 0
-    )
-    if null_zip_rows:
-        raise RuntimeError(f"OpenAddresses stage contains {null_zip_rows:,} rows with null zip5; aborting publish.")
+        return
+    stage_present = await _is_table_present(schema, stage_table)
+    should_resume_post_publish = retry_state == "pending"
+    if not stage_present:
+        if should_resume_post_publish:
+            context["openaddresses_stage_published"] = True
+            logger.warning(
+                "Resuming OpenAddresses post-publish work for %s.%s.",
+                schema,
+                live_table,
+            )
+        else:
+            raise RuntimeError(f"OpenAddresses staging table {schema}.{stage_table} is missing.")
 
-    await _create_indexes(stage_table, schema)
-    await db.execute_ddl(f"ANALYZE {_qtable(schema, stage_table)};")
+    if should_resume_post_publish:
+        stage_rows = int(
+            await db.scalar(f"SELECT COUNT(*) FROM {_qtable(schema, live_table)};") or 0
+        )
+    else:
+        zip_restore_stats = await restore_openaddresses_zips(
+            schema=schema,
+            stage_table=stage_table,
+            recovery_table=recovery_table,
+            concurrency=int(
+                context.get("zip_restore_concurrency")
+                or _env_positive_int(
+                    "HLTHPRT_OPENADDRESSES_ZIP_RESTORE_CONCURRENCY",
+                    DEFAULT_ZIP_RESTORE_CONCURRENCY,
+                )
+            ),
+            run_id=_progress_run_id(ctx, {}),
+        )
+        context["zip_restore"] = {
+            "candidates": zip_restore_stats.candidates,
+            "restored": zip_restore_stats.restored,
+            "discarded": zip_restore_stats.discarded,
+            "shards": zip_restore_stats.shards,
+        }
 
-    async with db.transaction():
-        live_table = OpenAddressesGeocode.__main_table__
-        archived = _archived_identifier(live_table)
-        await db.status(f"DROP TABLE IF EXISTS {_qtable(schema, archived)};")
-        await db.status(f"ALTER TABLE IF EXISTS {_qtable(schema, live_table)} RENAME TO {_quote_ident(archived)};")
-        await db.status(f"ALTER TABLE {_qtable(schema, stage_table)} RENAME TO {_quote_ident(live_table)};")
-    context["openaddresses_stage_published"] = True
+        stage_rows = int(
+            await db.scalar(f"SELECT COUNT(*) FROM {_qtable(schema, stage_table)};")
+            or 0
+        )
+        min_rows = int(context.get("min_rows") or _env_positive_int("HLTHPRT_OPENADDRESSES_MIN_ROWS", DEFAULT_MIN_ROWS))
+        if context.get("test_mode"):
+            print(f"OpenAddresses test mode: staged rows={stage_rows:,}")
+        elif stage_rows < min_rows:
+            raise RuntimeError(
+                f"OpenAddresses stage row count {stage_rows:,} is below minimum {min_rows:,}; aborting publish."
+            )
+        null_zip_rows = int(
+            await db.scalar(f"SELECT COUNT(*) FROM {_qtable(schema, stage_table)} WHERE zip5 IS NULL;")
+            or 0
+        )
+        if null_zip_rows:
+            raise RuntimeError(f"OpenAddresses stage contains {null_zip_rows:,} rows with null zip5; aborting publish.")
+
+        await _create_indexes(stage_table, schema)
+        await db.execute_ddl(f"ANALYZE {_qtable(schema, stage_table)};")
+        stage_oid = await _relation_oid(schema, stage_table)
+        marker_comment = _published_recovery_marker_comment(import_date, stage_oid)
+
+        async with db.transaction():
+            await db.status(f"DROP TABLE IF EXISTS {_qtable(schema, archived_table)};")
+            await db.status(f"ALTER TABLE IF EXISTS {_qtable(schema, live_table)} RENAME TO {_quote_ident(archived_table)};")
+            await db.status(f"ALTER TABLE {_qtable(schema, stage_table)} RENAME TO {_quote_ident(live_table)};")
+            await db.status(
+                f"ALTER TABLE {_qtable(schema, recovery_table)} "
+                f"RENAME TO {_quote_ident(published_recovery_table)};"
+            )
+            await db.status(
+                f"COMMENT ON TABLE {_qtable(schema, published_recovery_table)} "
+                f"IS '{marker_comment}';"
+            )
+        context["openaddresses_stage_published"] = True
 
     stats = await refresh_archive_geocodes_from_openaddresses_sharded(
         schema=schema,
@@ -2969,17 +3287,19 @@ async def shutdown(ctx):  # pragma: no cover
         "fuzzy_updates": stats.fuzzy_updates,
         "relaxed_updates": stats.relaxed_updates,
     }
-    context["zip_restore"] = {
-        "candidates": zip_restore_stats.candidates,
-        "restored": zip_restore_stats.restored,
-        "discarded": zip_restore_stats.discarded,
-        "shards": zip_restore_stats.shards,
-    }
-    await db.status(f"DROP TABLE IF EXISTS {_qtable(schema, recovery_table)};")
+    await _complete_published_generation(
+        schema=schema,
+        import_id=import_date,
+        stage_table=stage_table,
+        recovery_table=recovery_table,
+        marker_table=published_recovery_table,
+        live_table=live_table,
+    )
+    zip_restore = context.get("zip_restore") or {}
     print(
         "OpenAddresses publish/backfill complete: "
         f"rows={stage_rows:,} exact={stats.exact_updates:,} fuzzy={stats.fuzzy_updates:,} "
-        f"relaxed={stats.relaxed_updates:,} zip_restored={zip_restore_stats.restored:,}"
+        f"relaxed={stats.relaxed_updates:,} zip_restored={int(zip_restore.get('restored') or 0):,}"
     )
     print_time_info(context.get("start"))
 
@@ -3005,6 +3325,15 @@ async def main(
             for key, value in params.items()
             if value is not None and value is not False and value != "" and value != () and value != []
         }
+    )
+    requested_import_id = payload.get("import_id") or payload.get("stage_suffix")
+    requested_import_id = requested_import_id or os.getenv(
+        "HLTHPRT_IMPORT_ID_OVERRIDE"
+    )
+    payload["import_id"] = (
+        _normalize_import_id(requested_import_id)
+        if requested_import_id
+        else uuid.uuid4().hex
     )
     await redis.enqueue_job("process_data", payload, _queue_name=OPENADDRESSES_QUEUE_NAME)
 

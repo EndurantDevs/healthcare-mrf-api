@@ -2134,6 +2134,14 @@ async def create_import_run(
         else {},
         run_id=run_id,
     )
+    import_id = request_payload_map.get("import_id")
+    if importer == "openaddresses":
+        import_id = (
+            import_id
+            or normalized_params_by_name.get("import_id")
+            or normalized_params_by_name.get("stage_suffix")
+            or run_id
+        )
     import_run_values_by_name = {
         "run_id": run_id,
         "engine": ENGINE_NAME,
@@ -2158,7 +2166,7 @@ async def create_import_run(
         "metrics": {},
         "error": None,
         "snapshot_id": None,
-        "import_id": request_payload_map.get("import_id"),
+        "import_id": import_id,
         "retry_of_run_id": retry_of_run_id,
     }
     try:
@@ -2510,6 +2518,13 @@ def _control_wrapped_adapter_payload(
     """Build a control-wrapped task payload with retry lineage."""
 
     task_payload_map = {"test_mode": test_mode, **params}
+    if import_run_values_by_name.get("importer") == "openaddresses":
+        task_payload_map["control_import_id"] = (
+            import_run_values_by_name.get("import_id")
+            or task_payload_map.get("import_id")
+            or task_payload_map.get("stage_suffix")
+            or import_run_values_by_name["run_id"]
+        )
     task_lineage_fields = _TASK_LINEAGE_FIELDS_BY_IMPORTER.get(
         str(import_run_values_by_name.get("importer") or ""),
         (),

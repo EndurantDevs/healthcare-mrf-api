@@ -782,6 +782,7 @@ run_provider_directory_postgres() {
     "HLTHPRT_RETAINED_ARTIFACT_POSTGRES_DSN=$dsn"
     "HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_POSTGRES_DSN=$dsn"
     "HLTHPRT_UHC_ORGANIZATION_EVIDENCE_POSTGRES_DSN=$dsn"
+    "HLTHPRT_OPENADDRESSES_BATCH_POSTGRES_DSN=$dsn"
     "HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_NATIVE_BIN=$repository_root/support/ptg2_scanner/target/debug/ptg2_scanner"
     "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_ALLOW_SCHEMA_TESTS=1"
   )
@@ -812,6 +813,7 @@ run_provider_directory_postgres() {
     -o asyncio_default_fixture_loop_scope=session \
     --durations=20 \
     tests/test_address_canonical_db.py \
+    tests/test_openaddresses_native_batch_postgres.py \
     tests/test_address_format_db.py \
     tests/test_address_formatted_serving_db.py \
     tests/test_address_numeric_grid_alias_db.py \
