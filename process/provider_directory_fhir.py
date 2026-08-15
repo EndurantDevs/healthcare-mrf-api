@@ -1629,6 +1629,12 @@ SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_SHA256_KEY = (
     "server_issued_subset_replay_evidence_sha256"
 )
 SERVER_ISSUED_SUBSET_COVERAGE_KEY = "server_issued_subset_coverage"
+PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_KEY = (
+    "provider_directory_subset_admission_summary_v1"
+)
+PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_CONTRACT = (
+    "healthporta.provider-directory.subset-admission-summary.v1"
+)
 _SERVER_ISSUED_SUBSET_INTERNAL_REPLAY_KEY = (
     "_server_issued_subset_replay_evidence"
 )
@@ -15291,6 +15297,41 @@ def _artifact_twin_proof_equality_sql(
     return f"{required_field_sql}\n               AND {optional_field_sql}"
 
 
+def _artifact_subset_admission_summary_sql(metadata: str) -> str:
+    return (
+        f"{metadata} -> "
+        f"'{PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_KEY}'"
+    )
+
+
+def _artifact_subset_completion_proof_authority_sql(
+    dataset_alias: str,
+    metadata: str,
+) -> str:
+    """Use the sealed compact proof without detoasting the raw pair."""
+
+    summary = _artifact_subset_admission_summary_sql(metadata)
+    return (
+        f"CASE WHEN {metadata} ? "
+        f"'{PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_KEY}' "
+        f"THEN {summary} -> 'completion_proof' "
+        f"ELSE {dataset_alias}.completion_proof_json END"
+    )
+
+
+def _artifact_raw_completion_proof_sql(
+    dataset_alias: str,
+    metadata: str,
+) -> str:
+    """Hide raw completion vectors once a compact authority is present."""
+
+    return (
+        f"CASE WHEN {metadata} ? "
+        f"'{PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_KEY}' "
+        f"THEN NULL::jsonb ELSE {dataset_alias}.completion_proof_json END"
+    )
+
+
 def _artifact_subset_parent_pair_sql(sql_by_field: Mapping[str, str]) -> str:
     """Return atomic parent proof, replay, and fixed coverage predicates."""
 
@@ -15418,13 +15459,48 @@ def _artifact_stored_content_proof_sql(
     """
 
 
-def _artifact_subset_single_root_proof_sql(
+def _artifact_compact_subset_proof_sql(
+    dataset_alias: str,
+    metadata: str,
+    stored_proof: str,
+) -> str:
+    """Bind one sealed compact proof without reading raw completion JSON."""
+
+    summary = _artifact_subset_admission_summary_sql(metadata)
+    proof = f"{summary} -> 'completion_proof'"
+    replay = f"{summary} -> 'replay_evidence'"
+    return " AND ".join(
+        (
+            f"{dataset_alias}.completion_proof_required_version = "
+            f"{SERVER_ISSUED_SUBSET_REQUIRED_VERSION}",
+            f"jsonb_typeof({proof}) = 'object'",
+            f"jsonb_typeof({proof} -> 'dataset') = 'object'",
+            f"jsonb_typeof({replay}) = 'object'",
+            f"{summary} ->> 'raw_metadata_sha256' ~ '^[0-9a-f]{{64}}$'",
+            f"{proof} ->> 'proof_sha256' ~ '^[0-9a-f]{{64}}$'",
+            f"{replay} ->> 'proof_sha256' ~ '^[0-9a-f]{{64}}$'",
+            f"{proof} ->> 'proof_sha256' = "
+            f"{dataset_alias}.completion_proof_sha256",
+            f"{proof} ->> 'cutoff' = {metadata} -> "
+            f"'{SERVER_ISSUED_SUBSET_COVERAGE_KEY}' ->> 'cutoff'",
+            f"{proof} -> 'dataset' @> jsonb_build_object("
+            f"'hash', {dataset_alias}.dataset_hash, "
+            f"'count', {dataset_alias}.resource_count, "
+            f"'resource_hashes', {stored_proof} -> 'resource_hashes', "
+            f"'resource_counts', {stored_proof} -> 'resource_counts')",
+            f"{replay} ->> 'proof_sha256' = {metadata} ->> "
+            f"'{SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_SHA256_KEY}'",
+        )
+    )
+
+
+def _artifact_legacy_subset_proof_sql(
     dataset_alias: str,
     metadata: str,
     stored_proof: str,
     admitted_marker: str | None = None,
 ) -> str:
-    """Bind one direct completion/replay/coverage/content proof set."""
+    """Bind the original direct completion/replay/content proof set."""
 
     sql_by_field = {
         "dataset": dataset_alias,
@@ -15461,6 +15537,41 @@ def _artifact_subset_single_root_proof_sql(
     return "\n        AND ".join(
         fragment.strip() for fragment in fragments
     )
+
+
+def _artifact_subset_single_root_proof_sql(
+    dataset_alias: str,
+    metadata: str,
+    stored_proof: str,
+    admitted_marker: str | None = None,
+) -> str:
+    """Choose the compact or original single-root proof authority."""
+
+    legacy_sql = _artifact_legacy_subset_proof_sql(
+        dataset_alias,
+        metadata,
+        stored_proof,
+        admitted_marker,
+    )
+    summary = _artifact_subset_admission_summary_sql(metadata)
+    compact_sql = _artifact_compact_subset_proof_sql(
+        dataset_alias,
+        metadata,
+        f"{metadata} -> '{ADMISSION_GENERIC_PROOF_SUMMARY_KEY}'",
+    )
+    compact_admitted = (
+        f"{admitted_marker} IS TRUE"
+        if admitted_marker is not None
+        else "false"
+    )
+    return f"""CASE
+        WHEN {compact_admitted}
+         AND jsonb_typeof({summary}) = 'object'
+        THEN ({compact_sql})
+        WHEN {metadata} ? '{PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_KEY}'
+        THEN false
+        ELSE ({legacy_sql})
+    END"""
 
 
 def _artifact_subset_parent_diagnostics_sql(
@@ -15685,6 +15796,7 @@ def _artifact_subset_source_urls_sql(
 def _artifact_subset_source_identity_sql(
     source_metadata: str,
     dataset_alias: str = "dataset",
+    completion_proof: str | None = None,
 ) -> str:
     """Bind the reviewed source's fixed v3 identity to its parent proof."""
 
@@ -15695,7 +15807,7 @@ def _artifact_subset_source_identity_sql(
     fragments = (
         _artifact_subset_source_fixed_sql(
             source_metadata,
-            f"{dataset_alias}.completion_proof_json",
+            completion_proof or f"{dataset_alias}.completion_proof_json",
         ),
         _artifact_subset_source_resources_sql(
             source_metadata, allowed_resources_sql
@@ -15801,6 +15913,7 @@ def _artifact_source_contract_sql(
     require_subset_identity: bool = False,
     reviewed_root_count: int | None = None,
     require_reviewed_root_policy_absent: bool = False,
+    subset_completion_proof: str | None = None,
 ) -> str:
     """Require every attached source to retain its reviewed status and scope."""
 
@@ -15811,7 +15924,8 @@ def _artifact_source_contract_sql(
     )
     subset_source_identity_sql = (
         _artifact_subset_source_identity_sql(
-            "current_source.metadata_json::jsonb"
+            "current_source.metadata_json::jsonb",
+            completion_proof=subset_completion_proof,
         )
         if require_subset_identity
         else "true"
@@ -16351,6 +16465,40 @@ def _artifact_subset_twin_branch_sql(
     """
 
 
+def _artifact_single_root_coverage_sql(metadata: str) -> str:
+    """Require the exact reviewed resource map and no twin state."""
+
+    coverage = f"{metadata} -> '{SERVER_ISSUED_SUBSET_COVERAGE_KEY}'"
+    allowed_resources_sql = ", ".join(
+        f"'{resource_type}'"
+        for resource_type in SERVER_ISSUED_SUBSET_RESOURCE_TYPES
+    )
+    return f"""
+        {coverage} ->> 'twin_state' = 'not_required'
+        AND CASE
+                WHEN jsonb_typeof({coverage} -> 'resources') = 'object'
+                THEN {coverage} -> 'resources'
+                         ?& ARRAY[{allowed_resources_sql}]::text[]
+                 AND (
+                    SELECT count(*)
+                      FROM jsonb_object_keys({coverage} -> 'resources')
+                 ) = 7
+                 AND NOT EXISTS (
+                    SELECT 1
+                      FROM jsonb_each({coverage} -> 'resources')
+                           AS covered_resource(
+                               resource_type,
+                               resource_coverage
+                           )
+                     WHERE resource_coverage ->> 'twin_state'
+                               <> 'not_required'
+                        OR resource_coverage ->> 'twin_state' IS NULL
+                )
+                ELSE false
+            END
+    """
+
+
 def _artifact_subset_single_branch_sql(
     source_ref: str,
     metadata: str,
@@ -16366,7 +16514,6 @@ def _artifact_subset_single_branch_sql(
         if content_proof_admitted is not None
         else raw_content_proof
     )
-    coverage = f"{metadata} -> '{SERVER_ISSUED_SUBSET_COVERAGE_KEY}'"
     return f"""
         {_artifact_reviewed_root_policy_sql(metadata, 1)}
         AND {metadata} -> 'requires_twin_root_verification' = 'false'::jsonb
@@ -16379,18 +16526,17 @@ def _artifact_subset_single_branch_sql(
             PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED,
             require_subset_identity=True,
             reviewed_root_count=1,
+            subset_completion_proof=(
+                _artifact_subset_completion_proof_authority_sql(
+                    "dataset",
+                    metadata,
+                )
+            ),
         )}
         AND {_artifact_subset_single_root_proof_sql(
             "dataset", metadata, content_proof, content_proof_admitted
         )}
-        AND {coverage} ->> 'twin_state' = 'not_required'
-        AND NOT EXISTS (
-            SELECT 1
-              FROM jsonb_each({coverage} -> 'resources')
-                   AS covered_resource(resource_type, resource_coverage)
-             WHERE resource_coverage ->> 'twin_state' <> 'not_required'
-                OR resource_coverage ->> 'twin_state' IS NULL
-        )
+        AND {_artifact_single_root_coverage_sql(metadata)}
     """
 
 
@@ -16431,7 +16577,12 @@ def _artifact_subset_candidate_eligibility_sql(
         content_proof_admitted,
     )
     return f"""
-        (({legacy_twin_sql}) OR ({policy_twin_sql}) OR ({policy_single_sql}))
+        ({policy_single_sql}) OR CASE
+            WHEN {metadata} ?
+                 '{PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_KEY}'
+            THEN false
+            ELSE (({legacy_twin_sql}) OR ({policy_twin_sql}))
+        END
     """
 
 
@@ -16562,6 +16713,7 @@ def _artifact_candidate_eligibility_metadata_columns() -> str:
         {SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY} jsonb,
         {SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_SHA256_KEY} text,
         {SERVER_ISSUED_SUBSET_COVERAGE_KEY} jsonb,
+        {PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_KEY} jsonb,
         selected_resources jsonb,
         expected_resources jsonb
     """
@@ -16653,7 +16805,7 @@ def _artifact_candidate_eligibility_ctes(dataset_ref: str) -> str:
                dataset.dataset_hash,
                dataset.resource_count,
                dataset.completion_proof_required_version,
-               dataset.completion_proof_json,
+               {_artifact_raw_completion_proof_sql('dataset', 'dataset.publication_metadata_summary_json')} AS completion_proof_json,
                dataset.completion_proof_sha256,
                {safe_metadata} AS full_metadata_jsonb,
                {content_proof_admitted} AS content_proof_admitted,
@@ -17460,7 +17612,9 @@ def _artifact_dataset_option_projection_sql(
             AS generic_admission_sealed,
         dataset.artifact_selection_receipt_json IS NOT NULL
             AS artifact_selection_receipt_present,
-        dataset.completion_proof_json ->> 'cutoff' AS completion_proof_cutoff,
+        ({_artifact_subset_completion_proof_authority_sql(
+            'dataset', metadata
+        )}) ->> 'cutoff' AS completion_proof_cutoff,
 {proof_projection}
     """
 
@@ -71940,8 +72094,10 @@ async def _store_validated_endpoint_dataset(
         )
     )
     try:
-        admission_seal = admission_seal_from_validated_metadata(metadata)
-    except AdmissionSealError as error:
+        admission_seal = admission_seal_from_validated_metadata(
+            _subset_admission_seal_metadata(metadata, completion_proof_pair)
+        )
+    except (AdmissionSealError, RuntimeError) as error:
         raise RuntimeError(
             "provider_directory_endpoint_dataset_admission_seal_invalid"
         ) from error
@@ -72342,9 +72498,9 @@ async def _store_baseline_payload_retirement(
 
     try:
         admission_seal = admission_seal_from_validated_metadata(
-            metadata
+            _subset_admission_seal_metadata(metadata)
         )
-    except AdmissionSealError as error:
+    except (AdmissionSealError, RuntimeError) as error:
         raise RuntimeError(
             "provider_directory_endpoint_dataset_admission_seal_invalid"
         ) from error
@@ -72565,6 +72721,192 @@ def _subset_replay_metadata(
     }
 
 
+def _compact_subset_completion_proof(
+    completion_proof: Mapping[str, Any],
+    completion_sha256: str,
+) -> dict[str, Any]:
+    """Keep the fixed completion identity; coverage binds resource geometry."""
+
+    return {
+        **{
+            key: completion_proof[key]
+            for key in (
+                "strategy_version",
+                "completion_scopes",
+                "campaign_id",
+                "cutoff",
+                "page_count",
+            )
+        },
+        "proof_sha256": completion_sha256,
+        "dataset": {
+            key: completion_proof["dataset"][key]
+            for key in (
+                "hash",
+                "count",
+                "resource_hashes",
+                "resource_counts",
+            )
+        },
+    }
+
+
+def _compact_subset_replay_evidence(
+    _replay_evidence: Mapping[str, Any],
+    replay_sha256: str,
+) -> dict[str, Any]:
+    """Keep the validated replay and completion commitments."""
+
+    return {"proof_sha256": replay_sha256}
+
+
+def _subset_admission_raw_metadata_sha256(
+    metadata: Mapping[str, Any],
+) -> str:
+    """Bind every proof-excluded raw field without retaining its vectors."""
+
+    raw_metadata_by_key = {
+        key: metadata_value
+        for key, metadata_value in metadata.items()
+        if key
+        not in {
+            PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_KEY,
+            PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY,
+            UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY,
+        }
+    }
+    return subset_canonical_sha256(
+        {
+            "contract": PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_CONTRACT,
+            "metadata": raw_metadata_by_key,
+        }
+    )
+
+
+def _subset_admission_summary_projection(
+    metadata: Mapping[str, Any],
+    completion_proof: Mapping[str, Any],
+    completion_sha256: str,
+) -> dict[str, Any]:
+    """Build one bounded selection authority after full proof validation."""
+
+    try:
+        validated_completion, validated_completion_sha256 = (
+            validate_subset_completion_proof_pair(
+                completion_proof,
+                completion_sha256,
+            )
+        )
+        replay_evidence, replay_sha256 = validate_subset_replay_evidence_pair(
+            metadata.get(SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY),
+            metadata.get(SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_SHA256_KEY),
+            validated_completion,
+            validated_completion_sha256,
+        )
+        _validate_subset_dataset_coverage(
+            metadata,
+            validated_completion,
+            validated_completion_sha256,
+        )
+    except ValueError as error:
+        raise RuntimeError(
+            "provider_directory_subset_admission_summary_invalid"
+        ) from error
+    if PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_KEY in metadata:
+        raise RuntimeError(
+            "provider_directory_subset_admission_summary_reserved"
+        )
+    return {
+        "raw_metadata_sha256": _subset_admission_raw_metadata_sha256(metadata),
+        "completion_proof": _compact_subset_completion_proof(
+            validated_completion,
+            validated_completion_sha256,
+        ),
+        "replay_evidence": _compact_subset_replay_evidence(
+            replay_evidence,
+            replay_sha256,
+        ),
+    }
+
+
+def _subset_admission_seal_metadata(
+    metadata: Mapping[str, Any],
+    completion_proof_pair: tuple[
+        Mapping[str, Any] | None,
+        str | None,
+    ] | None = None,
+) -> dict[str, Any]:
+    """Return the bounded seal input while leaving raw metadata untouched."""
+
+    if PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_KEY not in metadata:
+        return dict(metadata)
+    projection = metadata[PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_KEY]
+    completion_proof, completion_sha256 = completion_proof_pair or (None, None)
+    raw_metadata_by_key = dict(metadata)
+    raw_metadata_by_key.pop(PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_KEY)
+    if (
+        not isinstance(projection, Mapping)
+        or not isinstance(completion_proof, Mapping)
+        or not completion_sha256
+    ):
+        raise RuntimeError(
+            "provider_directory_subset_admission_summary_invalid"
+        )
+    expected_projection = _subset_admission_summary_projection(
+        raw_metadata_by_key,
+        completion_proof,
+        completion_sha256,
+    )
+    if projection != expected_projection:
+        raise RuntimeError(
+            "provider_directory_subset_admission_summary_invalid"
+        )
+    bounded_metadata_by_key = {
+        key: metadata_value
+        for key, metadata_value in raw_metadata_by_key.items()
+        if key
+        not in {
+            "completion_proof_v1",
+            "resource_diagnostics",
+            SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY,
+        }
+    }
+    bounded_metadata_by_key[PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_KEY] = (
+        expected_projection
+    )
+    return bounded_metadata_by_key
+
+
+def _with_subset_admission_summary(
+    metadata: dict[str, Any],
+    candidate: EndpointDatasetCandidate,
+    content_proof: EndpointDatasetContentProof,
+) -> dict[str, Any]:
+    """Attach the compact authority only for reviewed single-root subsets."""
+
+    if (
+        candidate.completion_proof_required_version
+        != SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        or candidate.reviewed_root_policy is None
+        or candidate.reviewed_root_policy.is_twin_root_required
+    ):
+        return metadata
+    completion_proof = content_proof.completion_proof
+    completion_sha256 = content_proof.completion_proof_sha256
+    if not isinstance(completion_proof, Mapping) or not completion_sha256:
+        raise RuntimeError(
+            "provider_directory_subset_admission_summary_invalid"
+        )
+    metadata[PROVIDER_DIRECTORY_SUBSET_ADMISSION_SUMMARY_KEY] = (
+        _subset_admission_summary_projection(
+            metadata,
+            completion_proof,
+            completion_sha256,
+        )
+    )
+    return metadata
+
+
 async def _endpoint_dataset_source_summary_metadata(
     connection: Any,
     candidate: EndpointDatasetCandidate,
@@ -72765,7 +73107,7 @@ def _dataset_validation_metadata(
         relation_proof_by_name,
         verification_metadata,
     )
-    return _endpoint_dataset_publication_metadata(
+    metadata = _endpoint_dataset_publication_metadata(
         candidate,
         diagnostics,
         dataset_hash=content_proof.dataset_hash,
@@ -72783,6 +73125,7 @@ def _dataset_validation_metadata(
         **replay_metadata,
         **coverage_metadata,
     )
+    return _with_subset_admission_summary(metadata, candidate, content_proof)
 
 
 def _subset_resource_coverage_map(

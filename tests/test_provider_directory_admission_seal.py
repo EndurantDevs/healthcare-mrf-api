@@ -21,9 +21,7 @@ from process.provider_directory_admission_seal import (
     admission_seal_from_validated_metadata,
     validate_generic_admission_copy,
 )
-from process.provider_directory_fhir_subset_canonical import (
-    canonical_payload_sha256,
-)
+from process.provider_directory_fhir_subset_canonical import canonical_payload_sha256
 importer = importlib.import_module("process.provider_directory_fhir")
 from tests.test_provider_directory_dataset_selection_bounded_db import (
     _large_metadata_by_field,
