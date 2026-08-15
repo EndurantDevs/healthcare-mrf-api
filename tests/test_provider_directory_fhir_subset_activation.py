@@ -128,19 +128,21 @@ def test_checked_in_manifest_is_valid_and_operator_is_default_off(
 ):
     manifest = activation.reviewed_subset_activation_manifest()
 
-    assert manifest.desired_candidate_status == "pending_reviewed_subset_acquisition"
+    assert manifest.desired_candidate_status == "verified_reviewed_subset_acquisition"
     assert manifest.root_policy is not None
     assert manifest.root_policy.document() == {
         "policy_version": "provider-directory-reviewed-root-policy-v1",
         "required_root_count": 1,
     }
-    assert (manifest.evidence is not None) is manifest.is_verified
-    if manifest.is_verified:
-        assert manifest.require_verified_evidence() is manifest.evidence
-    else:
-        with pytest.raises(activation.ReviewedSubsetActivationError) as error:
-            manifest.require_verified_evidence()
-        assert error.value.code == "disabled"
+    assert manifest.is_verified is True
+    evidence = manifest.require_verified_evidence()
+    assert evidence is manifest.evidence
+    assert evidence.evidence_document() == {
+        "source_contract_sha256": "ea51f29b9bf598eccab0699dc0501a22b364812fbc2743dd44e6f82fdfd903e2",
+        "cutoff": "2026-08-13T07:35:37.000000Z",
+        "verification_source_scope_sha256": "2506e5be9186db81e7886d410ae9cee000820cbe05bd57d88c7388ae1cbc10b8",
+        "completion_proof_sha256": "231655277caa3fb4a4193140ce57303cc599dd5e4acf595bd501bce0f780fec9",
+    }
 
     monkeypatch.delenv(activation.STATE_SYNC_ENABLED_ENV, raising=False)
     with pytest.raises(activation.ReviewedSubsetActivationError) as error:

@@ -146,10 +146,12 @@ def _catalog_publication_fixture(
         (None, None),
     ),
 )
+@pytest.mark.parametrize("classification", ("acquisition", "bulk_acquisition"))
 async def test_catalog_exposes_only_an_exact_proven_pair(
     monkeypatch,
     proof_version,
     proof_sha256,
+    classification,
 ):
     catalog, canonical_dataset, resolve_candidate = (
         _catalog_publication_fixture(
@@ -158,6 +160,7 @@ async def test_catalog_exposes_only_an_exact_proven_pair(
             proof_sha256,
         )
     )
+    catalog["items"][0]["classification"] = classification
 
     enriched = await catalog_outcomes.enrich_provider_directory_source_catalog(
         catalog

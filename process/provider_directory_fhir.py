@@ -156,11 +156,20 @@ from process.provider_directory_fhir_subset_completion import (
 )
 from process.provider_directory_validated_publication_contract import (
     AUTOMATIC_GENERIC_ADMISSION_PUBLICATION_POLICY,
+    AUTOMATIC_GENERIC_BOOTSTRAP_PUBLICATION_POLICY,
+    AUTOMATIC_REVIEWED_SINGLE_ROOT_PUBLICATION_POLICY,
+    AUTOMATIC_REVIEWED_TWIN_ROOT_PUBLICATION_POLICY,
     AUTOMATIC_VALIDATED_PUBLICATION_POLICY,
     ValidatedPublicationCandidate,
     canonical_utc_timestamp,
     validated_publication_candidate_from_params,
     validated_publication_source_status,
+)
+from process.provider_directory_validated_publication_policies import (
+    REVIEWED_PUBLICATION_POLICIES,
+)
+from process.provider_directory_publication_catalog_authority import (
+    bootstrap_catalog_authority,
 )
 from process.provider_directory_fhir_subset_identity import (
     is_reviewed_subset_profile,
@@ -22391,7 +22400,53 @@ async def _lock_and_verify_artifact_dataset_fence(
         locked_dataset_rows,
         eligible_ids_by_endpoint,
     )
+    await _assert_reviewed_activation_ready(
+        fence,
+        query_executor,
+    )
     await _assert_uhc_flex_profile_fence_ready(fence, query_executor)
+
+
+async def _assert_reviewed_activation_ready(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    executor: Any,
+) -> None:
+    """Recheck reviewed activation while source and dataset rows are locked."""
+
+    candidate = getattr(fence, "validated_publication_candidate", None)
+    if candidate is None:
+        return
+    legacy_reviewed = bool(
+        candidate.automatic_publication_policy
+        == AUTOMATIC_VALIDATED_PUBLICATION_POLICY
+        and len(fence.datasets) == 1
+        and fence.datasets[0].reviewed_root_policy is None
+        and fence.datasets[0].verification_source_status
+        == PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED
+        and fence.datasets[0].completion_proof_required_version
+        == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+    )
+    if (
+        candidate.automatic_publication_policy
+        not in REVIEWED_PUBLICATION_POLICIES
+        and not legacy_reviewed
+    ):
+        return
+    if (
+        await executor.scalar(
+            "SELECT "
+            + _qt(
+                _schema(),
+                "provider_directory_reviewed_subset_activation_valid",
+            )
+            + "(:source_id);",
+            source_id=candidate.source_id,
+        )
+        is not True
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_reviewed_subset_activation_changed"
+        )
 
 
 async def _assert_uhc_flex_profile_fence_ready(
@@ -23119,36 +23174,102 @@ def _is_validated_publication_identity_exact(
         and dataset.status == ENDPOINT_DATASET_VALIDATED
         and dataset.is_current is False
         and dataset.verification_source_ids == (candidate.source_id,)
-        and dataset.reviewed_root_policy is None
+        and dataset.reviewed_root_policy
+        == {
+            AUTOMATIC_REVIEWED_SINGLE_ROOT_PUBLICATION_POLICY: ReviewedRootPolicy(1),
+            AUTOMATIC_REVIEWED_TWIN_ROOT_PUBLICATION_POLICY: ReviewedRootPolicy(2),
+        }.get(candidate.automatic_publication_policy)
     )
 
 
-def _is_validated_publication_authority_exact(
+def _is_reviewed_publication_authority_exact(
     dataset: ProviderDirectoryArtifactDataset,
     candidate: ValidatedPublicationCandidate,
     locked_dataset_row: Mapping[str, Any],
 ) -> bool:
+    proof_is_exact = bool(
+        dataset.completion_proof_required_version
+        == candidate.completion_proof_required_version
+        and dataset.completion_proof_sha256
+        == candidate.completion_proof_sha256
+        and dataset.verification_source_status
+        == PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED
+        and dataset.verification_campaign_id
+        == candidate.verification_campaign_id
+        and dataset.verification_source_scope_hash
+        == candidate.verification_source_scope_sha256
+    )
     if candidate.automatic_publication_policy == (
-        AUTOMATIC_VALIDATED_PUBLICATION_POLICY
+        AUTOMATIC_REVIEWED_TWIN_ROOT_PUBLICATION_POLICY
+    ):
+        return proof_is_exact and candidate.content_proof_admission_sha256 is None
+    return bool(
+        proof_is_exact
+        and candidate.automatic_publication_policy
+        == AUTOMATIC_REVIEWED_SINGLE_ROOT_PUBLICATION_POLICY
+        and dataset.content_proof_admission_sha256
+        == candidate.content_proof_admission_sha256
+        and dataset.generic_admission_sealed is True
+        and dataset.artifact_selection_receipt_present is True
+        and _clean_text(
+            locked_dataset_row.get("content_proof_admission_sha256")
+        )
+        == candidate.content_proof_admission_sha256
+        and locked_dataset_row.get("generic_admission_sealed") is True
+        and locked_dataset_row.get("artifact_selection_receipt_present")
+        is True
+    )
+
+
+def _is_legacy_twin_publication_authority_exact(
+    dataset: ProviderDirectoryArtifactDataset,
+    candidate: ValidatedPublicationCandidate,
+) -> bool:
+    expected_source_status = validated_publication_source_status(candidate)
+    return bool(
+        dataset.completion_proof_required_version
+        == candidate.completion_proof_required_version
+        and dataset.completion_proof_sha256
+        == candidate.completion_proof_sha256
+        and dataset.verification_source_status == expected_source_status
+        and dataset.verification_campaign_id == candidate.verification_campaign_id
+        and dataset.verification_source_scope_hash
+        == candidate.verification_source_scope_sha256
+    )
+
+
+def _is_generic_catalog_authority_exact(
+    candidate: ValidatedPublicationCandidate,
+) -> bool:
+    if candidate.automatic_publication_policy == (
+        AUTOMATIC_GENERIC_ADMISSION_PUBLICATION_POLICY
     ):
         return bool(
-            dataset.completion_proof_required_version
-            == candidate.completion_proof_required_version
-            and dataset.completion_proof_sha256
-            == candidate.completion_proof_sha256
-            and dataset.verification_source_status
-            == validated_publication_source_status(candidate)
-            and dataset.verification_campaign_id
-            == candidate.verification_campaign_id
-            and dataset.verification_source_scope_hash
-            == candidate.verification_source_scope_sha256
+            candidate.expected_current is not None
+            and candidate.source_catalog_entry_id is None
+            and candidate.source_catalog_digest_sha256 is None
         )
     if candidate.automatic_publication_policy != (
-        AUTOMATIC_GENERIC_ADMISSION_PUBLICATION_POLICY
+        AUTOMATIC_GENERIC_BOOTSTRAP_PUBLICATION_POLICY
     ):
         return False
     return bool(
-        candidate.expected_current is not None
+        candidate.expected_current is None
+        and bootstrap_catalog_authority(candidate.source_id)
+        == (
+            candidate.source_catalog_entry_id,
+            candidate.source_catalog_digest_sha256,
+        )
+    )
+
+
+def _is_generic_publication_authority_exact(
+    dataset: ProviderDirectoryArtifactDataset,
+    candidate: ValidatedPublicationCandidate,
+    locked_dataset_row: Mapping[str, Any],
+) -> bool:
+    return bool(
+        _is_generic_catalog_authority_exact(candidate)
         and dataset.content_proof_admission_sha256
         == candidate.content_proof_admission_sha256
         and dataset.generic_admission_sealed is True
@@ -23166,6 +23287,30 @@ def _is_validated_publication_authority_exact(
         and locked_dataset_row.get("generic_admission_sealed") is True
         and locked_dataset_row.get("artifact_selection_receipt_present")
         is True
+    )
+
+
+def _is_validated_publication_authority_exact(
+    dataset: ProviderDirectoryArtifactDataset,
+    candidate: ValidatedPublicationCandidate,
+    locked_dataset_row: Mapping[str, Any],
+) -> bool:
+    """Recheck the exact policy authority against locked candidate state."""
+
+    if candidate.automatic_publication_policy == (
+        AUTOMATIC_VALIDATED_PUBLICATION_POLICY
+    ):
+        return _is_legacy_twin_publication_authority_exact(dataset, candidate)
+    if candidate.automatic_publication_policy in REVIEWED_PUBLICATION_POLICIES:
+        return _is_reviewed_publication_authority_exact(
+            dataset,
+            candidate,
+            locked_dataset_row,
+        )
+    return _is_generic_publication_authority_exact(
+        dataset,
+        candidate,
+        locked_dataset_row,
     )
 
 

@@ -6,12 +6,19 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 import importlib
+
+import pytest
 
 from process import provider_directory_fhir_subset_activation as activation
 from process import provider_directory_fhir_subset_activation_store as store
 from process.provider_directory_admission_seal import (
     backfill_provider_directory_admission_seal,
+)
+from process.provider_directory_validated_publication_contract import (
+    AUTOMATIC_REVIEWED_SINGLE_ROOT_PUBLICATION_POLICY,
+    ValidatedPublicationCandidate,
 )
 from tests.provider_directory_reviewed_subset_activation_pg_concurrency import (
     _close_scenario,
@@ -68,6 +75,41 @@ def _artifact_publication_fence(
         (candidate,),
         should_select_validated_candidates=require_candidate_eligibility,
     )
+
+
+def _reviewed_activation_fence(fence):
+    candidate = ValidatedPublicationCandidate.from_payload(
+        {
+            "source_id": "synthetic-source",
+            "endpoint_id": "endpoint-a",
+            "dataset_id": "dataset-matched",
+            "dataset_hash": "a" * 64,
+            "acquisition_root_run_id": "root-matched",
+            "validated_at": "2026-08-13T00:00:00+00:00",
+            "automatic_publication_policy": (
+                AUTOMATIC_REVIEWED_SINGLE_ROOT_PUBLICATION_POLICY
+            ),
+            "completion_proof_required_version": 3,
+            "completion_proof_sha256": (
+                fence.datasets[0].completion_proof_sha256
+            ),
+            "verification_campaign_id": "reviewed-campaign",
+            "verification_source_scope_sha256": "c" * 64,
+            "content_proof_admission_sha256": "b" * 64,
+            "expected_current": None,
+        }
+    )
+    return replace(fence, validated_publication_candidate=candidate)
+
+
+async def _assert_pending_reviewed_activation(fence, database):
+    reviewed_fence = _reviewed_activation_fence(fence)
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale):
+        await importer._assert_reviewed_activation_ready(
+            reviewed_fence,
+            database,
+        )
+    return reviewed_fence
 
 
 @asynccontextmanager
@@ -185,6 +227,10 @@ async def _activation_first_serializes_publication(monkeypatch) -> None:
         patch, scenario, migration, activation_db, publication_db, fence = (
             race_inputs
         )
+        reviewed_fence = await _assert_pending_reviewed_activation(
+            fence,
+            publication_db,
+        )
         activated = asyncio.Event()
         release = asyncio.Event()
         original_activate = store._activate_source
@@ -223,6 +269,10 @@ async def _activation_first_serializes_publication(monkeypatch) -> None:
             assert activation_result.activated is True
             await asyncio.wait_for(publication_task, timeout=5)
             assert await is_activation_valid(scenario, migration) is True
+            await importer._assert_reviewed_activation_ready(
+                reviewed_fence,
+                publication_db,
+            )
         finally:
             release.set()
             await _cancel_tasks(activation_task, publication_task)

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -15,6 +14,9 @@ from api.provider_directory_rooted_fhir_publication import (
     ROOTED_FHIR_PUBLICATION_FIELD,
 )
 from process import provider_directory_profile as profile_artifact
+from process.provider_directory_publication_catalog_authority import (
+    canonical_manifest_digest,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,15 +36,6 @@ PUBLIC_ENTRY_FIELDS = (
 )
 
 
-def _json_digest(value: Any) -> str:
-    encoded = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def _public_catalog_entry(
     raw_entry: dict[str, Any],
     support_by_entry: dict[str, Any],
@@ -55,9 +48,20 @@ def _public_catalog_entry(
     source_ids = catalog_entry_by_field.get("source_ids")
     if (
         not isinstance(catalog_entry_by_field.get("entry_id"), str)
+        or not catalog_entry_by_field["entry_id"]
+        or catalog_entry_by_field["entry_id"]
+        != catalog_entry_by_field["entry_id"].strip()
+        or len(catalog_entry_by_field["entry_id"]) > 160
         or not isinstance(source_ids, list)
         or not source_ids
-        or not all(isinstance(source_id, str) for source_id in source_ids)
+        or not all(
+            isinstance(source_id, str)
+            and source_id
+            and source_id == source_id.strip()
+            and len(source_id) <= 96
+            for source_id in source_ids
+        )
+        or len(source_ids) != len(set(source_ids))
     ):
         raise RuntimeError("provider_directory_source_manifest_invalid")
     is_runnable = catalog_entry_by_field["classification"] in RUNNABLE_CLASSIFICATIONS
@@ -99,6 +103,40 @@ def _nonrunnable_profile_source_ids(
     )
 
 
+def _validated_catalog_items(
+    raw_entries: list[Any],
+    support_by_entry: dict[str, Any],
+    profile_source_ids: set[str],
+) -> tuple[list[dict[str, Any]], set[str]]:
+    catalog_items: list[dict[str, Any]] = []
+    runnable_source_ids: set[str] = set()
+    seen_entry_ids: set[str] = set()
+    seen_source_ids: set[str] = set()
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            raise RuntimeError("provider_directory_source_manifest_invalid")
+        catalog_entry_by_field, source_ids, is_runnable = _public_catalog_entry(
+            raw_entry,
+            support_by_entry,
+        )
+        entry_id = catalog_entry_by_field["entry_id"]
+        if entry_id in seen_entry_ids or seen_source_ids.intersection(source_ids):
+            raise RuntimeError("provider_directory_source_manifest_invalid")
+        seen_entry_ids.add(entry_id)
+        seen_source_ids.update(source_ids)
+        if is_runnable:
+            runnable_source_ids.update(source_ids)
+        catalog_entry_by_field["profile_enabled"] = all(
+            source_id in profile_source_ids for source_id in source_ids
+        )
+        if is_rooted_fhir_catalog_entry(catalog_entry_by_field):
+            catalog_entry_by_field[ROOTED_FHIR_PUBLICATION_FIELD] = (
+                unavailable_rooted_fhir_publication()
+            )
+        catalog_items.append(catalog_entry_by_field)
+    return catalog_items, runnable_source_ids
+
+
 def provider_directory_source_catalog(
     manifest_path: Path = DEFAULT_MANIFEST,
 ) -> dict[str, Any]:
@@ -122,32 +160,18 @@ def provider_directory_source_catalog(
         if isinstance(support_documentation, dict)
         else {}
     )
-    runnable_source_ids: set[str] = set()
-    catalog_items: list[dict[str, Any]] = []
-    for raw_entry in manifest["entries"]:
-        if not isinstance(raw_entry, dict):
-            raise RuntimeError("provider_directory_source_manifest_invalid")
-        catalog_entry_by_field, source_ids, is_runnable = _public_catalog_entry(
-            raw_entry,
-            support_by_entry,
-        )
-        if is_runnable:
-            runnable_source_ids.update(source_ids)
-        catalog_entry_by_field["profile_enabled"] = all(
-            source_id in profile_source_ids for source_id in source_ids
-        )
-        if is_rooted_fhir_catalog_entry(catalog_entry_by_field):
-            catalog_entry_by_field[ROOTED_FHIR_PUBLICATION_FIELD] = (
-                unavailable_rooted_fhir_publication()
-            )
-        catalog_items.append(catalog_entry_by_field)
+    catalog_items, runnable_source_ids = _validated_catalog_items(
+        manifest["entries"],
+        support_by_entry,
+        profile_source_ids,
+    )
 
     if runnable_source_ids | nonrunnable_profile_source_ids != profile_source_ids:
         raise RuntimeError("provider_directory_profile_source_catalog_drift")
     return {
         "schema_version": 1,
         "campaign_id": manifest.get("campaign_id"),
-        "catalog_digest": _json_digest(manifest),
+        "catalog_digest": canonical_manifest_digest(manifest),
         "entry_count": len(catalog_items),
         "runnable_count": sum(
             bool(catalog_entry_by_field["runnable"])
