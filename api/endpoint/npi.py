@@ -62,7 +62,12 @@ from db.models import (AddressArchive, EntityAddressUnified, Issuer,
                        ProviderDirectoryOrganizationAffiliation,
                        ProviderDirectoryPractitionerRole,
                        ProviderDirectorySource, db)
-from process.ext.address_format import ADDRESS_FORMAT_SOURCE, ADDRESS_FORMAT_VERSION
+from process.ext.address_format import (
+    ADDRESS_FORMAT_FUNCTION,
+    ADDRESS_FORMAT_SOURCE,
+    ADDRESS_FORMAT_VERSION,
+    render_formatted_address_v2,
+)
 from process.ext.contact_canon import canonicalize_one as canonicalize_contact_one
 from process.ext.utils import download_it
 from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
@@ -292,8 +297,35 @@ def _attach_public_address_site_key(target: dict[str, Any], source: Mapping[str,
         target.setdefault(PUBLIC_ADDRESS_SITE_KEY, premise_key)
 
 
+def _render_public_formatted_address(value: dict[str, Any]) -> None:
+    component_keys = (
+        "first_line",
+        "second_line",
+        "city_name",
+        "state_name",
+        "postal_code",
+    )
+    if "formatted_address" not in value and not any(
+        key in value for key in component_keys
+    ):
+        return
+    value["formatted_address"] = render_formatted_address_v2(
+        value.get("first_line"),
+        value.get("second_line"),
+        value.get("city_name"),
+        value.get("state_name"),
+        value.get("postal_code"),
+        value.get("country_code"),
+    )
+    if "formatted_address_version" in value:
+        value["formatted_address_version"] = ADDRESS_FORMAT_VERSION
+    if "formatted_address_source" in value:
+        value["formatted_address_source"] = ADDRESS_FORMAT_SOURCE
+
+
 def _redact_internal_address_fields(value: Any) -> Any:
     if isinstance(value, dict):
+        _render_public_formatted_address(value)
         _attach_public_address_site_key(value, value)
         for key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
             value.pop(key, None)
@@ -1499,6 +1531,7 @@ def _finalize_public_provider_address(
     suppress_conflicting_site_key: bool = False,
 ) -> dict[str, Any]:
     """Remove serving internals while preserving the full public member row."""
+    _render_public_formatted_address(address)
     if (
         suppress_conflicting_site_key
         and address.get("_address_site_key_status") == "conflicting"
@@ -8980,7 +9013,14 @@ async def list_providers(request):
                 b.last_update_date,
                 c.date_added,
                 c.postal_code,
-                c.formatted_address
+                {_runtime_db_schema()}.{ADDRESS_FORMAT_FUNCTION}(
+                    c.first_line,
+                    c.second_line,
+                    c.city_name,
+                    c.state_name,
+                    c.postal_code,
+                    c.country_code
+                ) AS formatted_address
             FROM mrf.npi AS b
             JOIN {address_table_sql} AS c ON c.npi = b.npi AND c.type = 'primary'
             WHERE b.npi = ANY(:page_npis)
@@ -11350,7 +11390,7 @@ async def get_npi(request, npi):
                 "country_code": address.get("country_code") or "US",
             }
             archive_sql = f"""
-                SELECT long, lat, formatted_address, place_id, geo_source
+                SELECT long, lat, place_id, geo_source
                   FROM {db_schema}.{archive_table}
                  WHERE address_key = {db_schema}.addr_key_v1(
                     :first_line, :second_line, :city_name, :state_name, :postal_code, :country_code
@@ -11372,7 +11412,6 @@ async def get_npi(request, npi):
                 return SimpleNamespace(
                     long=coordinate_map["long"],
                     lat=coordinate_map["lat"],
-                    formatted_address=coordinate_map["formatted_address"],
                     place_id=coordinate_map["place_id"],
                     geo_source=coordinate_map.get("geo_source"),
                 )
@@ -11399,7 +11438,6 @@ async def get_npi(request, npi):
                 return SimpleNamespace(
                     long=coordinate_data["long"],
                     lat=coordinate_data["lat"],
-                    formatted_address=coordinate_data["formatted_address"],
                     place_id=coordinate_data["place_id"],
                     geo_source=coordinate_data["geo_source"],
                     geocode_source=coordinate_data["geocode_source"],
@@ -11411,7 +11449,6 @@ async def get_npi(request, npi):
         address,
         long,
         lat,
-        formatted_address,
         place_id,
         geo_source=None,
         geocode_source=None,
@@ -11419,6 +11456,10 @@ async def get_npi(request, npi):
     ):
         """Persist geocoding coordinates and provenance for one address."""
         checksum = address["checksum"]
+        npi_value = address.get("npi") or npi
+        address_type = address.get("type")
+        if npi_value is None:
+            return
         geo_source = str(geo_source).strip().lower() if geo_source else None
         if geo_source not in {"mapbox", "google", "tiger", "manual", "openaddresses"}:
             geo_source = "google" if place_id else None
@@ -11428,22 +11469,50 @@ async def get_npi(request, npi):
             geocode_source = "api_geocode"
         if not geocode_quality:
             geocode_quality = "unknown"
-        await (
+        address_renderer = getattr(
+            getattr(func, db_schema),
+            ADDRESS_FORMAT_FUNCTION,
+        )
+        address_update = (
             db.update(NPIAddress)
             .where(NPIAddress.checksum == checksum)
+            .where(NPIAddress.npi == npi_value)
             .values(
                 long=long,
                 lat=lat,
-                formatted_address=formatted_address,
+                formatted_address=address_renderer(
+                    NPIAddress.first_line,
+                    NPIAddress.second_line,
+                    NPIAddress.city_name,
+                    NPIAddress.state_name,
+                    NPIAddress.postal_code,
+                    NPIAddress.country_code,
+                ),
                 place_id=place_id,
             )
-            .status()
         )
-        address_record = await db.scalar(select(NPIAddress).where(NPIAddress.checksum == checksum))
+        if address_type is not None:
+            address_update = address_update.where(
+                NPIAddress.type == address_type
+            )
+        await address_update.status()
+        address_record_stmt = (
+            select(NPIAddress)
+            .where(NPIAddress.checksum == checksum)
+            .where(NPIAddress.npi == npi_value)
+        )
+        if address_type is not None:
+            address_record_stmt = address_record_stmt.where(
+                NPIAddress.type == address_type
+            )
+        address_record = await db.scalar(address_record_stmt)
         if address_record is None:
             return
         archive_table = await _v2_archive_table()
         if archive_table:
+            address_type_predicate = (
+                "AND type = :address_type" if address_type is not None else ""
+            )
             await db.status(
                 f"""
                 INSERT INTO {db_schema}.{archive_table} (
@@ -11473,7 +11542,7 @@ async def get_npi(request, npi):
                     {db_schema}.addr_country_code_v1(COALESCE(NULLIF(country_code, ''), 'US')),
                     first_line, second_line, city_name, state_name, postal_code,
                     telephone_number, fax_number,
-                    {db_schema}.addr_formatted_address_v1(
+                    {db_schema}.{ADDRESS_FORMAT_FUNCTION}(
                         first_line, second_line, city_name, state_name,
                         postal_code, COALESCE(NULLIF(country_code, ''), 'US')
                     ),
@@ -11486,8 +11555,10 @@ async def get_npi(request, npi):
                         {db_schema}.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, COALESCE(NULLIF(country_code, ''), 'US'))
                     )
                         *
-                      FROM {db_schema}.npi_address
+                     FROM {db_schema}.npi_address
                      WHERE checksum = :checksum
+                       AND npi = :npi
+                       {address_type_predicate}
                        AND {db_schema}.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, COALESCE(NULLIF(country_code, ''), 'US')) IS NOT NULL
                      ORDER BY
                         {db_schema}.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, COALESCE(NULLIF(country_code, ''), 'US')),
@@ -11496,7 +11567,7 @@ async def get_npi(request, npi):
                         npi
                   ) source
                 ON CONFLICT (address_key) DO UPDATE SET
-                    formatted_address = {db_schema}.addr_formatted_address_v1(
+                    formatted_address = {db_schema}.{ADDRESS_FORMAT_FUNCTION}(
                         {db_schema}.{archive_table}.first_line,
                         {db_schema}.{archive_table}.second_line,
                         {db_schema}.{archive_table}.city_name,
@@ -11518,6 +11589,8 @@ async def get_npi(request, npi):
                     last_seen_at = now();
                 """,
                 checksum=checksum,
+                npi=npi_value,
+                address_type=address_type,
                 geo_source=geo_source,
                 geocode_source=geocode_source,
                 geocode_quality=geocode_quality,
@@ -11529,12 +11602,14 @@ async def get_npi(request, npi):
             column.key: getattr(address_record, column.key, None)
             for column in AddressArchive.__table__.columns
         }
-
-        # long = long,
-        # lat = lat,
-        # formatted_address = formatted_address,
-        # place_id = place_id
-        #         del obj['checksum']
+        archive_value_map["formatted_address"] = render_formatted_address_v2(
+            archive_value_map.get("first_line"),
+            archive_value_map.get("second_line"),
+            archive_value_map.get("city_name"),
+            archive_value_map.get("state_name"),
+            archive_value_map.get("postal_code"),
+            archive_value_map.get("country_code"),
+        )
         try:
             await (
                 db.insert(AddressArchive)
@@ -11550,6 +11625,14 @@ async def get_npi(request, npi):
 
     async def _update_address(address_by_field):
         """Geocode one address when it does not already have coordinates."""
+        address_by_field["formatted_address"] = render_formatted_address_v2(
+            address_by_field.get("first_line"),
+            address_by_field.get("second_line"),
+            address_by_field.get("city_name"),
+            address_by_field.get("state_name"),
+            address_by_field.get("postal_code"),
+            address_by_field.get("country_code"),
+        )
         if address_by_field.get("lat"):
             return address_by_field
         postal_code = address_by_field.get("postal_code")
@@ -11582,7 +11665,6 @@ async def get_npi(request, npi):
         if should_force_address_update:
             address_by_field["long"] = None
             address_by_field["lat"] = None
-            address_by_field["formatted_address"] = None
             address_by_field["place_id"] = None
 
         if not address_by_field["lat"]:
@@ -11629,7 +11711,6 @@ async def get_npi(request, npi):
                 if stored_coordinates:
                     address_by_field["long"] = stored_coordinates.long
                     address_by_field["lat"] = stored_coordinates.lat
-                    address_by_field["formatted_address"] = stored_coordinates.formatted_address
                     address_by_field["place_id"] = stored_coordinates.place_id
                     address_by_field["geo_source"] = getattr(stored_coordinates, "geo_source", None) or (
                         "google" if stored_coordinates.place_id else None
@@ -11645,7 +11726,6 @@ async def get_npi(request, npi):
                     if openaddresses_coordinates:
                         address_by_field["long"] = openaddresses_coordinates.long
                         address_by_field["lat"] = openaddresses_coordinates.lat
-                        address_by_field["formatted_address"] = openaddresses_coordinates.formatted_address
                         address_by_field["place_id"] = openaddresses_coordinates.place_id
                         address_by_field["geo_source"] = openaddresses_coordinates.geo_source
                         address_by_field["geocode_source"] = openaddresses_coordinates.geocode_source
@@ -11679,10 +11759,6 @@ async def get_npi(request, npi):
                     if geo_data.get("features", []):
                         address_by_field["long"] = geo_data["features"][0]["geometry"]["coordinates"][0]
                         address_by_field["lat"] = geo_data["features"][0]["geometry"]["coordinates"][1]
-                        address_by_field["formatted_address"] = (
-                            geo_data["features"][0].get("matching_place_name")
-                            or geo_data["features"][0]["place_name"]
-                        )
                         address_by_field["place_id"] = None
                         address_by_field["geo_source"] = "mapbox"
                 except Exception as exc:
@@ -11715,7 +11791,6 @@ async def get_npi(request, npi):
                     if geo_data.get("results", []):
                         address_by_field["long"] = geo_data["results"][0]["geometry"]["location"]["lng"]
                         address_by_field["lat"] = geo_data["results"][0]["geometry"]["location"]["lat"]
-                        address_by_field["formatted_address"] = geo_data["results"][0]["formatted_address"]
                         address_by_field["place_id"] = geo_data["results"][0]["place_id"]
                         address_by_field["geo_source"] = "google"
                 except Exception as exc:
@@ -11727,7 +11802,6 @@ async def get_npi(request, npi):
                         address_by_field,
                         address_by_field["long"],
                         address_by_field["lat"],
-                        address_by_field["formatted_address"],
                         address_by_field["place_id"],
                         address_by_field.get("geo_source"),
                         address_by_field.get("geocode_source"),

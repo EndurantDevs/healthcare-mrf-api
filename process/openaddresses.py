@@ -509,7 +509,6 @@ def exact_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> str:
                 state_code, zip5, house_number, street_match_key,
                 avg(lat)::numeric(11,8) AS lat,
                 avg(long)::numeric(11,8) AS long,
-                min(formatted_address) AS formatted_address,
                 min(feature_id) AS place_id,
                 count(*) AS row_count,
                 NULLIF(max(NULLIF(accuracy, '')), '') AS accuracy
@@ -530,7 +529,7 @@ def exact_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> str:
                 )
         )
         SELECT
-            long, lat, formatted_address, place_id,
+            long, lat, place_id,
             'openaddresses' AS geo_source,
             'openaddresses_exact' AS geocode_source,
             COALESCE(accuracy, 'unknown') AS geocode_quality
@@ -548,7 +547,6 @@ def fuzzy_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> str:
                 state_code, zip5, house_number, street_match_key,
                 avg(lat)::numeric(11,8) AS lat,
                 avg(long)::numeric(11,8) AS long,
-                min(formatted_address) AS formatted_address,
                 min(feature_id) AS place_id,
                 count(*) AS row_count,
                 NULLIF(max(NULLIF(accuracy, '')), '') AS accuracy
@@ -579,7 +577,7 @@ def fuzzy_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> str:
               FROM scored
         )
         SELECT
-            long, lat, formatted_address, place_id,
+            long, lat, place_id,
             'openaddresses' AS geo_source,
             'openaddresses_fuzzy_zip' AS geocode_source,
             COALESCE(accuracy, 'strict_fuzzy') AS geocode_quality
@@ -604,7 +602,6 @@ def relaxed_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> st
                 street_match_key,
                 avg(lat)::numeric(11,8) AS lat,
                 avg(long)::numeric(11,8) AS long,
-                min(formatted_address) AS formatted_address,
                 min(feature_id) AS place_id,
                 count(*) AS row_count,
                 NULLIF(max(NULLIF(accuracy, '')), '') AS accuracy
@@ -637,7 +634,7 @@ def relaxed_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> st
               FROM scored
         )
         SELECT
-            long, lat, formatted_address, place_id,
+            long, lat, place_id,
             'openaddresses' AS geo_source,
             'openaddresses_relaxed_city_zip' AS geocode_source,
             COALESCE(accuracy, 'relaxed_city_zip') AS geocode_quality
@@ -2314,7 +2311,6 @@ def _openaddresses_grouped_cte(
             street_match_key,
             avg(lat)::numeric(11,8) AS lat,
             avg(long)::numeric(11,8) AS long,
-            min(formatted_address) AS formatted_address,
             min(feature_id) AS place_id,
             count(*) AS row_count,
             NULLIF(max(NULLIF(accuracy, '')), '') AS accuracy
@@ -2354,7 +2350,6 @@ def _openaddresses_city_grouped_cte(
             street_match_key,
             avg(lat)::numeric(11,8) AS lat,
             avg(long)::numeric(11,8) AS long,
-            min(formatted_address) AS formatted_address,
             min(feature_id) AS place_id,
             count(*) AS row_count,
             NULLIF(max(NULLIF(accuracy, '')), '') AS accuracy
@@ -2367,7 +2362,6 @@ def _openaddresses_city_grouped_cte(
                   street_match_key,
                   lat,
                   long,
-                  formatted_address,
                   feature_id,
                   accuracy
                 FROM {table}
@@ -2734,7 +2728,6 @@ async def refresh_archive_geocodes_from_openaddresses(
                     missing.address_key,
                     avg(oa.lat)::numeric(11,8) AS lat,
                     avg(oa.long)::numeric(11,8) AS long,
-                    min(oa.formatted_address) AS formatted_address,
                     min(oa.feature_id) AS place_id,
                     NULLIF(max(NULLIF(oa.accuracy, '')), '') AS accuracy
                   FROM missing
@@ -2763,7 +2756,6 @@ async def refresh_archive_geocodes_from_openaddresses(
             UPDATE {archive} AS archive
                SET lat = winners.lat,
                    long = winners.long,
-                   formatted_address = COALESCE(archive.formatted_address, winners.formatted_address),
                    place_id = COALESCE(archive.place_id, winners.place_id),
                    geo_source = 'openaddresses'::{_quote_ident(schema)}.address_archive_geo_source,
                    geocode_source = 'openaddresses_exact_city',
@@ -2787,7 +2779,6 @@ async def refresh_archive_geocodes_from_openaddresses(
                     missing.address_key,
                     avg(oa.lat)::numeric(11,8) AS lat,
                     avg(oa.long)::numeric(11,8) AS long,
-                    min(oa.formatted_address) AS formatted_address,
                     min(oa.feature_id) AS place_id,
                     NULLIF(max(NULLIF(oa.accuracy, '')), '') AS accuracy
                   FROM missing
@@ -2814,7 +2805,6 @@ async def refresh_archive_geocodes_from_openaddresses(
             UPDATE {archive} AS archive
                SET lat = winners.lat,
                    long = winners.long,
-                   formatted_address = COALESCE(archive.formatted_address, winners.formatted_address),
                    place_id = COALESCE(archive.place_id, winners.place_id),
                    geo_source = 'openaddresses'::{_quote_ident(schema)}.address_archive_geo_source,
                    geocode_source = 'openaddresses_exact',
@@ -2841,7 +2831,6 @@ async def refresh_archive_geocodes_from_openaddresses(
                     missing.address_key,
                     avg(oa.lat)::numeric(11,8) AS lat,
                     avg(oa.long)::numeric(11,8) AS long,
-                    min(oa.formatted_address) AS formatted_address,
                     min(oa.feature_id) AS place_id,
                     NULLIF(max(NULLIF(oa.accuracy, '')), '') AS accuracy,
                     count(*) AS row_count,
@@ -2873,11 +2862,11 @@ async def refresh_archive_geocodes_from_openaddresses(
                     *,
                     row_number() OVER (
                         PARTITION BY address_key
-                        ORDER BY score DESC, row_count ASC, formatted_address
+                        ORDER BY score DESC, row_count ASC, place_id
                     ) AS rn,
                     lead(score) OVER (
                         PARTITION BY address_key
-                        ORDER BY score DESC, row_count ASC, formatted_address
+                        ORDER BY score DESC, row_count ASC, place_id
                     ) AS next_score
                   FROM scored
             ),
@@ -2890,7 +2879,6 @@ async def refresh_archive_geocodes_from_openaddresses(
             UPDATE {archive} AS archive
                SET lat = winners.lat,
                    long = winners.long,
-                   formatted_address = COALESCE(archive.formatted_address, winners.formatted_address),
                    place_id = COALESCE(archive.place_id, winners.place_id),
                    geo_source = 'openaddresses'::{_quote_ident(schema)}.address_archive_geo_source,
                    geocode_source = 'openaddresses_fuzzy_zip',
@@ -2916,7 +2904,6 @@ async def refresh_archive_geocodes_from_openaddresses(
                     missing.address_key,
                     avg(oa.lat)::numeric(11,8) AS lat,
                     avg(oa.long)::numeric(11,8) AS long,
-                    min(oa.formatted_address) AS formatted_address,
                     min(oa.feature_id) AS place_id,
                     NULLIF(max(NULLIF(oa.accuracy, '')), '') AS accuracy,
                     count(*) AS row_count,
@@ -2950,11 +2937,11 @@ async def refresh_archive_geocodes_from_openaddresses(
                     *,
                     row_number() OVER (
                         PARTITION BY address_key
-                        ORDER BY score DESC, row_count ASC, formatted_address
+                        ORDER BY score DESC, row_count ASC, place_id
                     ) AS rn,
                     lead(score) OVER (
                         PARTITION BY address_key
-                        ORDER BY score DESC, row_count ASC, formatted_address
+                        ORDER BY score DESC, row_count ASC, place_id
                     ) AS next_score
                   FROM scored
             ),
@@ -2967,7 +2954,6 @@ async def refresh_archive_geocodes_from_openaddresses(
             UPDATE {archive} AS archive
                SET lat = winners.lat,
                    long = winners.long,
-                   formatted_address = COALESCE(archive.formatted_address, winners.formatted_address),
                    place_id = COALESCE(archive.place_id, winners.place_id),
                    geo_source = 'openaddresses'::{_quote_ident(schema)}.address_archive_geo_source,
                    geocode_source = 'openaddresses_relaxed_city_zip',

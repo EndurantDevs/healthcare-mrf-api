@@ -24,7 +24,7 @@ def test_archive_refresh_sql_is_keyset_bounded_and_offline(monkeypatch) -> None:
     assert "ORDER BY address_key" in sql
     assert "LIMIT :batch_size" in sql
     assert '"mrf"."address_archive_custom"' in sql
-    assert '"mrf".addr_formatted_address_v1' in sql
+    assert '"mrf".addr_formatted_address_v2' in sql
     assert "formatted_address_version = :renderer_version" in sql
     assert "formatted_address_source = :renderer_source" in sql
     assert "geocode" not in sql.lower()
@@ -97,7 +97,7 @@ async def test_archive_refresh_advances_stable_keyset_batches(monkeypatch) -> No
         scanned=3,
         updated=2,
         batches=2,
-        renderer_version=1,
+        renderer_version=2,
     )
     assert database_first.await_count == 3
     assert database_first.await_args_list[1].kwargs["after_address_key"].endswith(
@@ -146,7 +146,7 @@ async def test_control_worker_reports_archive_refresh_result(monkeypatch) -> Non
         scanned=5,
         updated=4,
         batches=2,
-        renderer_version=1,
+        renderer_version=2,
     )
     async def _refresh_archive(**options_by_name):
         await options_by_name["cancel_check"]()
@@ -181,7 +181,7 @@ async def test_control_worker_reports_archive_refresh_result(monkeypatch) -> Non
         "scanned": 5,
         "updated": 4,
         "batches": 2,
-        "renderer_version": 1,
+        "renderer_version": 2,
     }
     assert refresh_archive.await_args.kwargs["batch_size"] == 50
     cancel_check.assert_awaited_once()
@@ -201,7 +201,7 @@ async def test_command_runs_inline_or_enqueues_exact_worker(monkeypatch) -> None
         "scanned": 1,
         "updated": 1,
         "batches": 1,
-        "renderer_version": 1,
+        "renderer_version": 2,
     }
     process_refresh = AsyncMock(return_value=inline_result_by_field)
     monkeypatch.setattr(

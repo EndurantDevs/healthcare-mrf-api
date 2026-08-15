@@ -15428,6 +15428,7 @@ def test_provider_directory_openaddresses_archive_backfill_sql_is_exact_and_guar
     assert "archive.lat IS NULL" in sql
     assert "archive.long IS NULL" in sql
     assert "geocode_source = 'openaddresses_address_key'" in sql
+    assert "formatted_address" not in sql
 
 
 @pytest.mark.asyncio

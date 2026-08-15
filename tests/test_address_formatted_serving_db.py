@@ -3,7 +3,9 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import importlib
+import importlib.util
 import os
+from pathlib import Path
 import uuid
 
 import pytest
@@ -12,7 +14,25 @@ from db.connection import Database
 
 
 directory = importlib.import_module("process.provider_directory_fhir")
-unified = importlib.import_module("process.entity_address_unified")
+ROOT = Path(__file__).resolve().parents[1]
+FOUNDATION_MIGRATION_PATH = (
+    ROOT / "alembic/versions/20260611100000_address_canonical_foundation.py"
+)
+V2_MIGRATION_PATH = (
+    ROOT
+    / "alembic/versions/20260815010000_address_formatted_display_v2.py"
+)
+
+
+def _load_migration(path: Path, name: str):
+    module_spec = importlib.util.spec_from_file_location(
+        name,
+        path,
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    migration = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(migration)
+    return migration
 
 
 def _require_disposable_postgres() -> None:
@@ -34,26 +54,44 @@ async def _temporary_schema() -> AsyncIterator[tuple[Database, str]]:
         await database.disconnect()
 
 
+async def _install_renderer_functions(database: Database, schema_name: str) -> None:
+    foundation = _load_migration(
+        FOUNDATION_MIGRATION_PATH,
+        "address_formatted_serving_foundation",
+    )
+    migration = _load_migration(
+        V2_MIGRATION_PATH,
+        "address_formatted_serving_v2_migration",
+    )
+    assert database.engine is not None
+    async with database.engine.begin() as connection:
+        await connection.run_sync(
+            lambda sync_connection: foundation._exec_sql_batch(
+                sync_connection,
+                foundation._create_functions_sql(schema_name),
+            )
+        )
+    await database.status(migration._humanize_component_function_sql(schema_name))
+    await database.status(migration._formatted_address_function_sql(schema_name))
+
+
 @pytest.mark.asyncio
-async def test_overlay_stage_hydration_copies_one_archive_label(monkeypatch):
+async def test_overlay_stage_renders_its_own_components(monkeypatch) -> None:
+    """Render the selected overlay row instead of copying an archive label."""
     address_key = "00000000-0000-0000-0000-000000000123"
     async with _temporary_schema() as (database, schema_name):
         monkeypatch.setattr(directory, "db", database)
-        await database.status(
-            f"""
-            CREATE TABLE "{schema_name}".address_archive_v2 (
-                address_key uuid PRIMARY KEY,
-                formatted_address varchar,
-                formatted_address_version smallint,
-                formatted_address_source varchar(32),
-                merged_into uuid
-            );
-            """
-        )
+        await _install_renderer_functions(database, schema_name)
         await database.status(
             f"""
             CREATE TABLE "{schema_name}".provider_directory_address_overlay (
                 address_key uuid NOT NULL,
+                first_line varchar,
+                second_line varchar,
+                city_name varchar,
+                state_name varchar,
+                postal_code varchar,
+                country_code varchar,
                 formatted_address varchar,
                 formatted_address_version smallint,
                 formatted_address_source varchar(32)
@@ -62,14 +100,13 @@ async def test_overlay_stage_hydration_copies_one_archive_label(monkeypatch):
         )
         await database.status(
             f"""
-            INSERT INTO "{schema_name}".address_archive_v2 VALUES
-                ('{address_key}', '123 Main St, Example, NY 10001', 1, 'canonical_v1', NULL);
-            """
-        )
-        await database.status(
-            f"""
-            INSERT INTO "{schema_name}".provider_directory_address_overlay VALUES
-                ('{address_key}', 'stale label', NULL, NULL);
+            INSERT INTO "{schema_name}".provider_directory_address_overlay
+            VALUES (
+                '{address_key}', '4007 Clarksville Pike Suite 301',
+                'Ste 301', 'NASHVILLE', 'TN', '37218', 'US',
+                '4007 CLARKSVILLE PIKE, 101, NASHVILLE, TN 37218',
+                NULL, NULL
+            );
             """
         )
 
@@ -82,40 +119,8 @@ async def test_overlay_stage_hydration_copies_one_archive_label(monkeypatch):
         )
 
         assert changed_rows == 1
-        assert hydrated_overlay_record.formatted_address == "123 Main St, Example, NY 10001"
-        assert hydrated_overlay_record.formatted_address_version == 1
-        assert hydrated_overlay_record.formatted_address_source == "canonical_v1"
-
-
-@pytest.mark.asyncio
-async def test_archive_label_wins_as_one_coherent_aggregate():
-    async with _temporary_schema() as (database, _schema_name):
-        aggregate_record = await database.first(
-            f"""
-            WITH formatted_rows (
-                formatted_address,
-                formatted_address_version,
-                formatted_address_source,
-                source_priority,
-                updated_at,
-                source_record_id
-            ) AS (
-                VALUES
-                    ('legacy label'::varchar, NULL::smallint, NULL::varchar,
-                     1, '2026-08-11'::timestamp, 'legacy'::varchar),
-                    ('canonical label'::varchar, 1::smallint, 'canonical_v1'::varchar,
-                     9, '2026-01-01'::timestamp, 'archive'::varchar),
-                    (NULL::varchar, NULL::smallint, NULL::varchar,
-                     0, '2026-08-12'::timestamp, 'empty'::varchar)
-            )
-            SELECT
-                {unified._formatted_address_aggregate("formatted_address")},
-                {unified._formatted_address_aggregate("formatted_address_version", "smallint")},
-                {unified._formatted_address_aggregate("formatted_address_source")}
-              FROM formatted_rows;
-            """
+        assert hydrated_overlay_record.formatted_address == (
+            "4007 Clarksville Pike, Suite 301, Nashville, TN 37218"
         )
-
-        assert aggregate_record.formatted_address == "canonical label"
-        assert aggregate_record.formatted_address_version == 1
-        assert aggregate_record.formatted_address_source == "canonical_v1"
+        assert hydrated_overlay_record.formatted_address_version == 2
+        assert hydrated_overlay_record.formatted_address_source == "canonical_v2"

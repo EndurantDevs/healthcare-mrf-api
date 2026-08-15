@@ -37,12 +37,7 @@ def test_overlay_schema_separates_source_and_archive_columns():
 
 
 @pytest.mark.asyncio
-async def test_overlay_stage_hydrates_formatted_metadata_from_archive(monkeypatch):
-    monkeypatch.setattr(
-        directory,
-        "_is_table_present",
-        AsyncMock(return_value=True),
-    )
+async def test_overlay_stage_renders_from_its_own_components(monkeypatch):
     status = AsyncMock(return_value="UPDATE 3")
     monkeypatch.setattr(directory.db, "status", status)
 
@@ -53,23 +48,30 @@ async def test_overlay_stage_hydrates_formatted_metadata_from_archive(monkeypatc
 
     assert changed_rows == 3
     hydrate_sql = status.await_args.args[0]
-    assert 'FROM "mrf"."address_archive_v2" AS archive' in hydrate_sql
-    assert "archive.address_key = stage_row.address_key" in hydrate_sql
-    assert "archive.merged_into IS NULL" in hydrate_sql
-    assert "formatted_address = archive.formatted_address" in hydrate_sql
-    assert "formatted_address_version = archive.formatted_address_version" in hydrate_sql
-    assert "formatted_address_source = archive.formatted_address_source" in hydrate_sql
+    assert '"mrf".addr_formatted_address_v2(' in hydrate_sql
+    for component in (
+        "first_line",
+        "second_line",
+        "city_name",
+        "state_name",
+        "postal_code",
+        "country_code",
+    ):
+        assert f"stage_row.{component}" in hydrate_sql
+    assert "formatted_address_version = 2" in hydrate_sql
+    assert "formatted_address_source = 'canonical_v2'" in hydrate_sql
+    assert "address_archive_v2" not in hydrate_sql
     assert "IS DISTINCT FROM ROW" in hydrate_sql
 
 
 @pytest.mark.asyncio
-async def test_overlay_stage_skips_hydration_without_archive(monkeypatch):
+async def test_overlay_stage_rendering_does_not_require_archive(monkeypatch):
     monkeypatch.setattr(
         directory,
         "_is_table_present",
         AsyncMock(return_value=False),
     )
-    status = AsyncMock()
+    status = AsyncMock(return_value="UPDATE 2")
     monkeypatch.setattr(directory.db, "status", status)
 
     changed_rows = await directory._backfill_address_overlay_stage_formatted_addresses(
@@ -77,8 +79,8 @@ async def test_overlay_stage_skips_hydration_without_archive(monkeypatch):
         '"mrf"."overlay_stage"',
     )
 
-    assert changed_rows == 0
-    status.assert_not_awaited()
+    assert changed_rows == 2
+    status.assert_awaited_once()
 
 
 def _record_overlay_event(events, name, value):
@@ -155,38 +157,50 @@ async def test_overlay_population_hydrates_after_alias_rewrite(monkeypatch):
     assert metrics["archive_formatted_address_backfill_rows"] == 2
 
 
-def test_unified_archive_enrichment_carries_formatted_metadata():
+def test_unified_archive_enrichment_never_copies_formatted_labels():
     enrichment_sql = unified._enrich_raw_stage_sql(
         "mrf",
         "entity_address_unified_stage_raw",
     )
 
-    assert "a.formatted_address::varchar AS archive_formatted_address" in enrichment_sql
-    assert "a.formatted_address_version::smallint" in enrichment_sql
-    assert "a.formatted_address_source::varchar" in enrichment_sql
-    assert "formatted_address = COALESCE(k.archive_formatted_address" in enrichment_sql
-    assert "formatted_address_version = CASE" in enrichment_sql
-    assert "formatted_address_source = CASE" in enrichment_sql
+    assert "archive_formatted_address" not in enrichment_sql
+    assert "formatted_address =" not in enrichment_sql
+    assert "formatted_address_version =" not in enrichment_sql
+    assert "formatted_address_source =" not in enrichment_sql
 
 
-def test_unified_aggregation_prefers_archive_formatted_label():
+def test_unified_aggregation_renders_selected_components_locally():
+    raw_load_sql = unified._insert_raw_from_source_sql(
+        "mrf",
+        "entity_address_unified_stage_raw",
+        "SELECT * FROM mrf.source_address",
+    )
     aggregate_sql = unified._materialize_from_raw_sql(
         "mrf",
         "entity_address_unified_stage",
         "entity_address_unified_stage_raw",
     )
-    archive_precedence = (
-        "ORDER BY (formatted_address IS NULL), "
-        "((formatted_address_version IS NULL) AND "
-        "(formatted_address_source IS NULL)), "
-        "formatted_address_version DESC NULLS LAST, source_priority ASC"
+    insert_columns = aggregate_sql.split("WITH aggregated AS", 1)[0]
+
+    assert "addr_formatted_address_v2(" not in raw_load_sql
+    assert "TRIM(formatted_address)" not in raw_load_sql
+    assert "NULL::varchar AS formatted_address" in raw_load_sql
+    assert "NULL::smallint AS formatted_address_version" in raw_load_sql
+    assert " AS formatted_address" not in insert_columns
+    assert "mrf.addr_formatted_address_v2(" in aggregate_sql
+    assert "2::smallint AS formatted_address_version" in aggregate_sql
+    assert "'canonical_v2'::varchar AS formatted_address_source" in aggregate_sql
+
+
+def test_unified_generation_receipt_fences_formatted_address_version():
+    expected_version = (
+        f"address_archive_v2:v2+fmt-v{unified.ADDRESS_FORMAT_VERSION}"
     )
 
-    assert archive_precedence in aggregate_sql
-    assert "formatted_address_version," in aggregate_sql
-    assert "formatted_address_source," in aggregate_sql
-    assert ")[1]::smallint AS formatted_address_version" in aggregate_sql
-    assert ")[1]::varchar AS formatted_address_source" in aggregate_sql
+    assert unified.BASE_ADDRESS_VERSION == expected_version
+    assert unified.ALIAS_BASE_ADDRESS_VERSION_PREFIX == (
+        f"{expected_version}+alias-v1:g"
+    )
 
 
 def test_overlay_source_and_api_select_only_persisted_label():
@@ -207,3 +221,78 @@ def test_overlay_api_falls_back_when_formatted_column_is_absent():
 
     assert "NULL::varchar AS formatted_address" in serving_sql
     assert "MAX(NULLIF(BTRIM(formatted_address), ''))" not in serving_sql
+
+
+def test_public_address_finalizer_rejects_an_external_sibling_unit_label():
+    public_address = npi._finalize_public_provider_address(
+        {
+            "first_line": "4007 Clarksville Pike Suite 301",
+            "second_line": "Ste 301",
+            "city_name": "NASHVILLE",
+            "state_name": "TN",
+            "postal_code": "37218",
+            "country_code": "US",
+            "formatted_address": (
+                "4007 CLARKSVILLE PIKE, 101, NASHVILLE, TN 37218"
+            ),
+            "formatted_address_version": None,
+            "formatted_address_source": None,
+        },
+        include_sources=False,
+        include_evidence=False,
+    )
+
+    assert public_address["formatted_address"] == (
+        "4007 Clarksville Pike, Suite 301, Nashville, TN 37218"
+    )
+    assert "101" not in public_address["formatted_address"]
+    assert "United States" not in public_address["formatted_address"]
+    assert public_address["formatted_address_version"] == 2
+    assert public_address["formatted_address_source"] == "canonical_v2"
+
+
+def test_public_address_finalizer_suppresses_conflicting_site_keys():
+    public_address = npi._finalize_public_provider_address(
+        {
+            "first_line": "100 MAIN ST",
+            "city_name": "CITY",
+            "state_name": "MO",
+            "postal_code": "64055",
+            "country_code": "US",
+            "premise_key": "site-a",
+            "address_site_key": "site-a",
+            "_address_site_key_status": "conflicting",
+        },
+        include_sources=False,
+        include_evidence=False,
+        suppress_conflicting_site_key=True,
+    )
+
+    assert public_address["formatted_address"] == (
+        "100 Main Street, City, MO 64055"
+    )
+    assert "premise_key" not in public_address
+    assert "address_site_key" not in public_address
+
+
+def test_shared_public_redaction_renders_every_nested_address_locally():
+    payload = {
+        "address_list": [
+            {
+                "first_line": "3800 S WHITNEY AVE",
+                "city_name": "INDEPENDENCE",
+                "state_name": "MO",
+                "postal_code": "64055",
+                "country_code": "US",
+                "formatted_address": "external label",
+            },
+            {"formatted_address": "external-only label"},
+        ]
+    }
+
+    npi._redact_internal_address_fields(payload)
+
+    assert payload["address_list"][0]["formatted_address"] == (
+        "3800 South Whitney Avenue, Independence, MO 64055"
+    )
+    assert payload["address_list"][1]["formatted_address"] is None

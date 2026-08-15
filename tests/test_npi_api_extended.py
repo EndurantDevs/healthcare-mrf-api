@@ -852,6 +852,19 @@ class FakeInsert:
         return None
 
 
+def _assert_locally_rendered_address(insert, external_label):
+    rendered_address = insert.response_body["formatted_address"]
+    assert rendered_address == npi_module.render_formatted_address_v2(
+        insert.response_body.get("first_line"),
+        insert.response_body.get("second_line"),
+        insert.response_body.get("city_name"),
+        insert.response_body.get("state_name"),
+        insert.response_body.get("postal_code"),
+        insert.response_body.get("country_code"),
+    )
+    assert rendered_address != external_label
+
+
 def _make_address_row():
     data = {}
     for column in AddressArchive.__table__.columns:
@@ -945,6 +958,7 @@ async def test_get_npi_geocode_mapbox(monkeypatch):
     assert response_body["address_list"][0]["geo_source"] == "mapbox"
     await app.tasks[0]
     assert hasattr(insert, "response_body")
+    _assert_locally_rendered_address(insert, "Chicago, IL")
 
 
 @pytest.mark.asyncio
@@ -1067,6 +1081,7 @@ async def test_get_npi_geocode_google(monkeypatch):
     assert response_body["address_list"][0]["geo_source"] == "google"
     await app.tasks[0]
     assert hasattr(insert, "response_body")
+    _assert_locally_rendered_address(insert, "Chicago, IL")
 
 
 @pytest.mark.asyncio
@@ -2125,7 +2140,7 @@ async def test_get_npi_address_geocode_paths(monkeypatch):
     response = await npi_module.get_npi(request, '123')
     response_body = json.loads(response.body)
     assert response_body['do_business_as'] == ['Existing DBA']
-    assert response_body['address_list'][0]['formatted_address'] == 'Match Address'
+    assert response_body['address_list'][0]['formatted_address'] == '10 Main Street, Town, IL 12345'
 
 
 @pytest.mark.asyncio
@@ -2491,14 +2506,62 @@ async def test_get_npi_v2_archive_geocodeless_row_falls_back_to_legacy(monkeypat
     assert response_body['address_list'][0]['lat'] == 41.0
 
 
+class _V2GeocodeWriteDB:
+    def __init__(self):
+        self.status_sql = []
+        self.status_kwargs = []
+        self.update_criteria = []
+        self.update_values = {}
+
+    async def scalar(self, query, **_kwargs):
+        if isinstance(query, str):
+            if 'to_regclass' in query:
+                return 'mrf.address_archive_v2'
+            if 'information_schema.columns' in query:
+                return True
+            if 'to_regprocedure' in query:
+                return 'mrf.addr_key_v1(text,text,text,text,text,text)'
+            raise AssertionError(query)
+        return types.SimpleNamespace()
+
+    async def first(self, *_args, **_kwargs):
+        return _make_v2_archive_row(lat=45.0)
+
+    def update(self, *_args, **_kwargs):
+        recording_db = self
+
+        class RecordingUpdate:
+            def where(self, criterion):
+                recording_db.update_criteria.append(str(criterion))
+                return self
+
+            def values(self, **values):
+                recording_db.update_values.update(values)
+                return self
+
+            async def status(self):
+                return None
+
+        return RecordingUpdate()
+
+    def insert(self, *_args, **_kwargs):
+        raise AssertionError('legacy AddressArchive insert should not run during v2 cutover')
+
+    async def status(self, sql, **_kwargs):
+        self.status_sql.append(sql)
+        self.status_kwargs.append(_kwargs)
+        return 1
+
+
 def _assert_v2_geocode_upsert(fake_db):
     """Assert exact deduplication and source-preserving v2 archive SQL."""
     upsert_sql = "\n".join(fake_db.status_sql)
     for expected_sql in (
         "INSERT INTO mrf.address_archive_v2", "SELECT DISTINCT ON",
         "ON CONFLICT (address_key) DO UPDATE", "WHERE checksum = :checksum",
+        "AND npi = :npi", "AND type = :address_type",
         "LEFT(mrf.addr_state_code_v1(state_name), 32)",
-        "mrf.addr_formatted_address_v1(",
+        "mrf.addr_formatted_address_v2(",
         "formatted_address_version = EXCLUDED.formatted_address_version",
         "formatted_address_source = EXCLUDED.formatted_address_source",
         "geo_source, geocode_source, geocode_quality",
@@ -2507,6 +2570,8 @@ def _assert_v2_geocode_upsert(fake_db):
     ):
         assert expected_sql in upsert_sql
     assert fake_db.status_kwargs[-1]["geo_source"] == "google"
+    assert fake_db.status_kwargs[-1]["npi"] == 1518379601
+    assert fake_db.status_kwargs[-1]["address_type"] == "primary"
 
 
 @pytest.mark.asyncio
@@ -2519,37 +2584,7 @@ async def test_get_npi_v2_archive_geocode_write_uses_deduped_key_upsert(monkeypa
     )
     monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
 
-    class FakeDB:
-        def __init__(self):
-            self.status_sql = []
-            self.status_kwargs = []
-
-        async def scalar(self, query, **_kwargs):
-            if isinstance(query, str):
-                if 'to_regclass' in query:
-                    return 'mrf.address_archive_v2'
-                if 'information_schema.columns' in query:
-                    return True
-                if 'to_regprocedure' in query:
-                    return 'mrf.addr_key_v1(text,text,text,text,text,text)'
-                raise AssertionError(query)
-            return types.SimpleNamespace()
-
-        async def first(self, *_args, **_kwargs):
-            return _make_v2_archive_row(lat=45.0)
-
-        def update(self, *_args, **_kwargs):
-            return FakeUpdate()
-
-        def insert(self, *_args, **_kwargs):
-            raise AssertionError('legacy AddressArchive insert should not run during v2 cutover')
-
-        async def status(self, sql, **_kwargs):
-            self.status_sql.append(sql)
-            self.status_kwargs.append(_kwargs)
-            return 1
-
-    fake_db = FakeDB()
+    fake_db = _V2GeocodeWriteDB()
     monkeypatch.setattr(npi_module, 'db', fake_db)
 
     async def fail_download(*_args, **_kwargs):  # pragma: no cover - guard
@@ -2569,6 +2604,11 @@ async def test_get_npi_v2_archive_geocode_write_uses_deduped_key_upsert(monkeypa
     await app.tasks[0]
 
     _assert_v2_geocode_upsert(fake_db)
+    assert any("npi_address.npi" in criterion for criterion in fake_db.update_criteria)
+    assert any("npi_address.type" in criterion for criterion in fake_db.update_criteria)
+    assert "mrf.addr_formatted_address_v2(" in str(
+        fake_db.update_values["formatted_address"]
+    )
 
 
 @pytest.mark.asyncio

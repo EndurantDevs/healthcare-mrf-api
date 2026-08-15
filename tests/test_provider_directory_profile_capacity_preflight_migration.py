@@ -67,7 +67,7 @@ def _assert_receipt_columns_match_model(elements) -> None:
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260814010000_fhir_formulary_uhc_selected_receipt"
+        "20260815010000_address_formatted_display_v2"
     ]
     migration = load_capacity_v2_migration()
     assert migration.down_revision == "20260801010000_uhc_semantic_layout_identity"

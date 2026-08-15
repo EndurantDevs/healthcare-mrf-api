@@ -27,7 +27,11 @@ from sqlalchemy import text
 
 from db.models import db
 from process.ext import address_alias_sql
-from process.ext.address_format import ADDRESS_FORMAT_SOURCE, ADDRESS_FORMAT_VERSION
+from process.ext.address_format import (
+    ADDRESS_FORMAT_FUNCTION,
+    ADDRESS_FORMAT_SOURCE,
+    ADDRESS_FORMAT_VERSION,
+)
 from process.ext.address_pub28 import (
     PUB28_DIRECTIONAL_MAP,
     PUB28_INVALID_UNIT_VALUES,
@@ -2026,7 +2030,7 @@ async def resolve_into_archive(
     staging = _qtable(schema, staging_table)
     archive = _qtable(schema, archive_table)
     qschema = _quote_ident(schema)
-    formatted_renderer = f"{qschema}.addr_formatted_address_v1"
+    formatted_renderer = f"{qschema}.{ADDRESS_FORMAT_FUNCTION}"
     keyed_table_name = "address_archive_resolve_keyed"
     keyed_table = _quote_ident("address_archive_resolve_keyed")
     keyed_temp_table = f"pg_temp.{keyed_table}"
@@ -2787,7 +2791,7 @@ async def migrate_legacy_archive_to_v2(
     schema = schema or _schema_name()
     archive_table = archive_table or archive_table_name()
     qschema = _quote_ident(schema)
-    formatted_renderer = f"{qschema}.addr_formatted_address_v1"
+    formatted_renderer = f"{qschema}.{ADDRESS_FORMAT_FUNCTION}"
     geo_source_type = f"{qschema}.{_quote_ident('address_archive_geo_source')}"
     legacy = _qtable(schema, legacy_table)
     archive = _qtable(schema, archive_table)
