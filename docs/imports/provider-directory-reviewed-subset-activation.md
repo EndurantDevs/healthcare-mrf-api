@@ -11,10 +11,11 @@ activating or publishing them.
 
 The checked-in
 [`provider_directory_reviewed_subset_activation.json`](../../specs/provider_directory_reviewed_subset_activation.json)
-is the sole authorization input. It starts in the pending state with `null`
-evidence. After one complete acquisition has satisfied the policy, a normal
-pull request may change it to the verified state with exactly
-these neutral evidence fields:
+is the sole authorization input. A new reviewed generation starts in the
+pending state with `null` evidence. After one complete acquisition has satisfied
+the policy, a normal pull request may change it to the verified state with
+exactly these neutral evidence fields. The current checked-in manifest is that
+reviewed, evidence-bound verified state:
 
 - `source_contract_sha256`
 - `cutoff`
@@ -61,7 +62,14 @@ HLTHPRT_PROVIDER_DIRECTORY_SUBSET_STATE_SYNC_ENABLED=true \
 
 Before launch, verify the exact source commit, image manifest and runtime
 configuration digests, GitOps revision, migration head, workload readiness,
-Python 3.14 runtime, and the checked-in manifest. The transaction runs only at
+Python 3.14 runtime, and the checked-in manifest. Keep automatic publication
+and its scheduler held until activation and the resulting catalog candidate
+have both been verified. Deploy and verify the downstream consumer first with
+publication held, then deploy this producer, activate, and verify the exact
+catalog candidate before releasing the scheduler. Do not roll back the consumer
+while this producer can emit the reviewed policy. Rerun `render-neutral-evidence`
+from that exact image and stop if its output differs from the checked-in
+manifest. The transaction runs only at
 `READ COMMITTED`, locks the exact proof generation and sole source alias, and
 revalidates the complete source, root-policy, completion, replay, and coverage
 contract in PostgreSQL before changing state.
@@ -217,4 +225,5 @@ The activation migration is deliberately one-way while any verified state or
 activation marker exists. Downgrade fails closed until an independently
 reviewed recovery operation has removed that state; the operator itself has no
 deactivation command. Do not bypass the guard with direct source-status or
-marker updates.
+marker updates. A later reviewed acquisition requires a separately reviewed,
+versioned generation-rotation operation; activation does not authorize one.

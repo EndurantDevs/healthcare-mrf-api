@@ -67,6 +67,42 @@ def _catalog_manifest(entries: list[object]) -> dict[str, object]:
             ("pdfhir_other",),
             "provider_directory_profile_source_catalog_drift",
         ),
+        (
+            _catalog_manifest(
+                [
+                    {
+                        "entry_id": "duplicate",
+                        "classification": "probe_only",
+                        "source_ids": ["pdfhir_one"],
+                    },
+                    {
+                        "entry_id": "duplicate",
+                        "classification": "probe_only",
+                        "source_ids": ["pdfhir_two"],
+                    },
+                ]
+            ),
+            (),
+            "provider_directory_source_manifest_invalid",
+        ),
+        (
+            _catalog_manifest(
+                [
+                    {
+                        "entry_id": "one",
+                        "classification": "probe_only",
+                        "source_ids": ["pdfhir_duplicate"],
+                    },
+                    {
+                        "entry_id": "two",
+                        "classification": "probe_only",
+                        "source_ids": ["pdfhir_duplicate"],
+                    },
+                ]
+            ),
+            (),
+            "provider_directory_source_manifest_invalid",
+        ),
     ],
 )
 def test_source_catalog_rejects_invalid_or_profile_drifted_manifests(

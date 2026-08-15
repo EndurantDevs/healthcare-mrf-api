@@ -8,6 +8,14 @@ from collections.abc import Mapping
 from typing import Any
 
 from api import provider_directory_source_outcomes as outcomes
+from api.provider_directory_reviewed_publication import (
+    reviewed_publication_context,
+)
+from api.provider_directory_source_catalog_projection import (
+    canonical_identity_text,
+    catalog_source_id_groups,
+    current_outcome_summary,
+)
 from api.provider_directory_rooted_fhir_publication import (
     is_rooted_fhir_catalog_entry,
     rooted_fhir_publication_summary,
@@ -19,6 +27,7 @@ from api.provider_directory_source_dataset_selection import (
     _dataset_identity,
     _source_local_current_published_dataset_statement,
 )
+from api.provider_directory_sources import RUNNABLE_CLASSIFICATIONS
 from db.models import db
 from process.provider_directory_rooted_graph_publication_facade import (
     load_provider_directory_rooted_graph_dataset_readiness,
@@ -27,18 +36,13 @@ from process.provider_directory_validated_publication_contract import (
     AUTOMATIC_VALIDATED_PUBLICATION_ROLE,
     ProviderDirectoryDatasetIdentity,
 )
+from process.provider_directory_fhir_root_policy import (
+    LEGACY_VERIFIED_STATUS,
+    ReviewedRootPolicy,
+)
 from process.provider_directory_validated_publication_catalog import (
     validated_publication_candidate_payload,
 )
-
-
-def _canonical_identity_text(value: Any, *, limit: int) -> str | None:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text or text != value or len(text) > limit:
-        return None
-    return text
 
 
 def _profile_current_dataset_from_row(
@@ -51,11 +55,11 @@ def _profile_current_dataset_from_row(
         dataset_record,
         expected_source_id_groups,
     )
-    dataset_hash = _canonical_identity_text(
+    dataset_hash = canonical_identity_text(
         dataset_record.get("dataset_hash"),
         limit=64,
     )
-    root_run_id = _canonical_identity_text(
+    root_run_id = canonical_identity_text(
         dataset_record.get("acquisition_root_run_id"),
         limit=64,
     )
@@ -63,9 +67,9 @@ def _profile_current_dataset_from_row(
         dataset is None
         or dataset.status != "published"
         or dataset.is_current is not True
-        or _canonical_identity_text(dataset_record.get("endpoint_id"), limit=128)
+        or canonical_identity_text(dataset_record.get("endpoint_id"), limit=128)
         != dataset.endpoint_id
-        or _canonical_identity_text(dataset_record.get("dataset_id"), limit=128)
+        or canonical_identity_text(dataset_record.get("dataset_id"), limit=128)
         != dataset.dataset_id
         or root_run_id != dataset.acquisition_root_run_id
         or root_run_id is None
@@ -107,34 +111,6 @@ async def _profile_current_dataset_by_source_ids(
     return selected_by_source_ids
 
 
-def _catalog_source_id_groups(
-    catalog_items: list[dict[str, Any]],
-) -> set[tuple[str, ...]]:
-    return {
-        source_ids
-        for catalog_entry in catalog_items
-        if (
-            source_ids := outcomes._normalized_text_tuple(
-                catalog_entry.get("source_ids")
-            )
-        )
-        is not None
-    }
-
-
-def _current_outcome_summary(
-    dataset: outcomes._CurrentPublishedDataset,
-) -> dict[str, Any]:
-    """Expose the published incumbent plus its authoritative lineage identity."""
-
-    return {
-        **outcomes._outcome_summary(dataset),
-        "endpoint_id": dataset.endpoint_id,
-        "acquisition_root_run_id": dataset.acquisition_root_run_id,
-        "dataset_hash": dataset.dataset_hash,
-    }
-
-
 async def _canonical_validated_datasets_by_source_id(
     source_ids: list[str],
 ) -> dict[str, Any]:
@@ -144,21 +120,53 @@ async def _canonical_validated_datasets_by_source_id(
         return {}
 
     from process.provider_directory_fhir import (
+        _qt,
         _resolve_provider_directory_artifact_datasets,
+        _schema,
     )
 
-    try:
-        fence = await _resolve_provider_directory_artifact_datasets(
-            source_ids,
-            should_select_validated_candidates=True,
-        )
-    except RuntimeError:
-        return {}
-    return {
-        dataset.source_id: dataset
-        for dataset in fence.datasets
-        if dataset.promote_on_cutover
-    }
+    dataset_by_source_id: dict[str, Any] = {}
+    for source_id in source_ids:
+        try:
+            fence = await _resolve_provider_directory_artifact_datasets(
+                [source_id],
+                should_select_validated_candidates=True,
+            )
+        except RuntimeError:
+            continue
+        for dataset in fence.datasets:
+            if (
+                dataset.source_id != source_id
+                or not dataset.promote_on_cutover
+            ):
+                continue
+            is_reviewed_activation = bool(
+                dataset.reviewed_root_policy
+                in {ReviewedRootPolicy(1), ReviewedRootPolicy(2)}
+                or (
+                    dataset.reviewed_root_policy is None
+                    and dataset.verification_source_status
+                    == LEGACY_VERIFIED_STATUS
+                    and dataset.completion_proof_required_version == 3
+                )
+            )
+            if is_reviewed_activation:
+                try:
+                    activation_valid = await db.scalar(
+                        "SELECT "
+                        + _qt(
+                            _schema(),
+                            "provider_directory_reviewed_subset_activation_valid",
+                        )
+                        + "(:source_id);",
+                        source_id=source_id,
+                    )
+                except Exception:
+                    continue
+                if activation_valid is not True:
+                    continue
+            dataset_by_source_id[dataset.source_id] = dataset
+    return dataset_by_source_id
 
 
 def _automatic_publication_source_ids(
@@ -173,30 +181,46 @@ def _automatic_publication_source_ids(
             catalog_entry.get("source_ids")
         )
         dataset = dataset_by_source_ids.get(source_ids or ())
-        if (
+        is_runnable_acquisition = bool(
             catalog_entry.get("runnable") is True
-            and catalog_entry.get("classification") == "acquisition"
-            and source_ids is not None
+            and catalog_entry.get("classification") in RUNNABLE_CLASSIFICATIONS
+        )
+        is_reviewed_manual = bool(
+            catalog_entry.get("runnable") is False
+            and catalog_entry.get("classification") == "manual_acquisition"
+        )
+        if (
+            source_ids is not None
             and len(source_ids) == 1
-            and dataset is not None
-            and dataset.status == "validated"
-            and dataset.is_current is False
             and (
-                (
-                    dataset.publication_metadata.get(
-                        "requires_twin_root_verification"
-                    )
-                    is True
-                    and dataset.publication_metadata.get("verification_role")
-                    == AUTOMATIC_VALIDATED_PUBLICATION_ROLE
-                )
+                is_reviewed_manual
                 or (
-                    dataset.publication_metadata.get(
-                        "requires_twin_root_verification"
+                    is_runnable_acquisition
+                    and dataset is not None
+                    and dataset.status == "validated"
+                    and dataset.is_current is False
+                    and (
+                        (
+                            dataset.publication_metadata.get(
+                                "requires_twin_root_verification"
+                            )
+                            is True
+                            and dataset.publication_metadata.get(
+                                "verification_role"
+                            )
+                            == AUTOMATIC_VALIDATED_PUBLICATION_ROLE
+                        )
+                        or (
+                            dataset.publication_metadata.get(
+                                "requires_twin_root_verification"
+                            )
+                            is not True
+                            and dataset.publication_metadata.get(
+                                "verification_role"
+                            )
+                            is None
+                        )
                     )
-                    is not True
-                    and dataset.publication_metadata.get("verification_role")
-                    is None
                 )
             )
         ):
@@ -246,9 +270,7 @@ def _catalog_validated_publication_candidate(
     canonical_dataset_by_source_id: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     if (
-        catalog_entry.get("runnable") is not True
-        or catalog_entry.get("classification") != "acquisition"
-        or source_ids is None
+        source_ids is None
         or len(source_ids) != 1
         or candidate_dataset is None
         or candidate_dataset.status != "validated"
@@ -258,11 +280,36 @@ def _catalog_validated_publication_candidate(
     canonical_dataset = canonical_dataset_by_source_id.get(source_ids[0])
     if canonical_dataset is None:
         return None
+    is_runnable_acquisition = bool(
+        catalog_entry.get("runnable") is True
+        and catalog_entry.get("classification") in RUNNABLE_CLASSIFICATIONS
+        and canonical_dataset.reviewed_root_policy is None
+    )
+    is_manual_legacy_reviewed = bool(
+        catalog_entry.get("runnable") is False
+        and catalog_entry.get("classification") == "manual_acquisition"
+        and canonical_dataset.reviewed_root_policy is None
+        and canonical_dataset.verification_source_status
+        == LEGACY_VERIFIED_STATUS
+        and canonical_dataset.completion_proof_required_version == 3
+    )
+    is_reviewed_manual = bool(
+        catalog_entry.get("runnable") is False
+        and catalog_entry.get("classification") == "manual_acquisition"
+        and (
+            canonical_dataset.reviewed_root_policy
+            in {ReviewedRootPolicy(1), ReviewedRootPolicy(2)}
+            or is_manual_legacy_reviewed
+        )
+    )
+    if not (is_runnable_acquisition or is_reviewed_manual):
+        return None
     return validated_publication_candidate_payload(
         source_ids[0],
         candidate_dataset,
         incumbent_identity,
         canonical_dataset,
+        manual_legacy_reviewed=is_manual_legacy_reviewed,
     )
 
 
@@ -288,6 +335,43 @@ async def _rooted_summary_for_catalog(
     )
 
 
+def _publication_candidate_context(
+    catalog_entry,
+    source_ids,
+    dataset,
+    current_dataset,
+    legacy_current_identity,
+    canonical_dataset,
+    canonical_dataset_by_source_id,
+):
+    candidate_dataset, candidate_incumbent, reviewed_dataset = (
+        reviewed_publication_context(
+            catalog_entry,
+            source_ids,
+            canonical_dataset,
+            dataset,
+            _dataset_identity(current_dataset),
+            legacy_current_identity,
+        )
+        if canonical_dataset is not None
+        else (
+            dataset,
+            _dataset_identity(current_dataset) or legacy_current_identity,
+            None,
+        )
+    )
+    return (
+        _catalog_validated_publication_candidate(
+            catalog_entry,
+            source_ids,
+            candidate_dataset,
+            candidate_incumbent,
+            canonical_dataset_by_source_id,
+        ),
+        reviewed_dataset,
+    )
+
+
 def _enriched_catalog_entry(
     catalog_entry: Mapping[str, Any],
     dataset_by_source_ids: Mapping[
@@ -305,30 +389,35 @@ def _enriched_catalog_entry(
     """Attach every proven outcome to one catalog entry."""
 
     enriched_entry_map = dict(catalog_entry)
-    source_ids = outcomes._normalized_text_tuple(
-        catalog_entry.get("source_ids")
-    )
+    source_ids = outcomes._normalized_text_tuple(catalog_entry.get("source_ids"))
     dataset = dataset_by_source_ids.get(source_ids or ())
-    if dataset is not None:
-        enriched_entry_map["outcome_summary"] = outcomes._outcome_summary(
-            dataset
-        )
-    current_dataset = current_dataset_by_source_ids.get(source_ids or ())
-    legacy_current_identity = legacy_current_identity_by_source_ids.get(
-        source_ids or ()
+    canonical_dataset = (
+        canonical_dataset_by_source_id.get(source_ids[0])
+        if source_ids is not None and len(source_ids) == 1
+        else None
     )
+    if dataset is not None:
+        enriched_entry_map["outcome_summary"] = outcomes._outcome_summary(dataset)
+    current_dataset = current_dataset_by_source_ids.get(source_ids or ())
+    legacy_current_identity = legacy_current_identity_by_source_ids.get(source_ids or ())
     if current_dataset is not None:
         enriched_entry_map["current_outcome_summary"] = (
-            _current_outcome_summary(current_dataset)
+            current_outcome_summary(current_dataset)
         )
-    candidate_payload_map = _catalog_validated_publication_candidate(
+    candidate_payload_map, reviewed_candidate_dataset = _publication_candidate_context(
         catalog_entry,
         source_ids,
         dataset,
-        _dataset_identity(current_dataset) or legacy_current_identity,
+        current_dataset,
+        legacy_current_identity,
+        canonical_dataset,
         canonical_dataset_by_source_id,
     )
     if candidate_payload_map is not None:
+        if reviewed_candidate_dataset is not None:
+            enriched_entry_map["outcome_summary"] = outcomes._outcome_summary(
+                reviewed_candidate_dataset
+            )
         if current_dataset is None and legacy_current_identity is not None:
             enriched_entry_map["current_outcome_summary"] = {
                 **legacy_current_identity.to_payload(),
@@ -338,10 +427,7 @@ def _enriched_catalog_entry(
         enriched_entry_map["validated_publication_candidate"] = (
             candidate_payload_map
         )
-    if (
-        rooted_summary is not None
-        and is_rooted_fhir_catalog_entry(catalog_entry)
-    ):
+    if rooted_summary is not None and is_rooted_fhir_catalog_entry(catalog_entry):
         enriched_entry_map[ROOTED_FHIR_PUBLICATION_FIELD] = rooted_summary
     return enriched_entry_map
 
@@ -359,7 +445,7 @@ async def enrich_provider_directory_source_catalog(
         for catalog_entry in raw_items
         if isinstance(catalog_entry, Mapping)
     ]
-    source_id_groups = _catalog_source_id_groups(catalog_items)
+    source_id_groups = catalog_source_id_groups(catalog_items)
     has_rooted_fhir_entry = any(
         is_rooted_fhir_catalog_entry(catalog_entry)
         for catalog_entry in catalog_items

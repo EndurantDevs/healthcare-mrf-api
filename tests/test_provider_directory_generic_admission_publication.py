@@ -9,8 +9,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import provider_directory_source_catalog_outcomes as catalog_outcomes
+from process import provider_directory_validated_publication_catalog as publication_catalog
 from process.provider_directory_validated_publication_contract import (
     AUTOMATIC_GENERIC_ADMISSION_PUBLICATION_POLICY,
+    AUTOMATIC_GENERIC_BOOTSTRAP_PUBLICATION_POLICY,
     ValidatedPublicationCandidate,
 )
 from tests.test_provider_directory_source_outcomes import (
@@ -43,10 +45,12 @@ importer = importlib.import_module("process.provider_directory_fhir")
 
 PUBLICATION_METADATA_HASH = "e" * 64
 ADMISSION_SHA256 = "c" * 64
+CATALOG_ENTRY_ID = "example-directory"
+CATALOG_DIGEST = "d" * 64
 
 
 def _generic_candidate_map(*, first_publication=False):
-    return {
+    candidate_map = {
         "source_id": SOURCE_ID,
         "endpoint_id": ENDPOINT_ID,
         "dataset_id": CANDIDATE_ID,
@@ -54,7 +58,9 @@ def _generic_candidate_map(*, first_publication=False):
         "acquisition_root_run_id": CANDIDATE_ROOT,
         "validated_at": VALIDATED_AT,
         "automatic_publication_policy": (
-            AUTOMATIC_GENERIC_ADMISSION_PUBLICATION_POLICY
+            AUTOMATIC_GENERIC_BOOTSTRAP_PUBLICATION_POLICY
+            if first_publication
+            else AUTOMATIC_GENERIC_ADMISSION_PUBLICATION_POLICY
         ),
         "content_proof_admission_sha256": ADMISSION_SHA256,
         "expected_current": (
@@ -68,6 +74,12 @@ def _generic_candidate_map(*, first_publication=False):
             }
         ),
     }
+    if first_publication:
+        candidate_map.update(
+            source_catalog_entry_id=CATALOG_ENTRY_ID,
+            source_catalog_digest_sha256=CATALOG_DIGEST,
+        )
+    return candidate_map
 
 
 def _generic_canonical_dataset():
@@ -97,6 +109,15 @@ def _generic_canonical_dataset():
 
 
 def _generic_catalog_fixture(monkeypatch):
+    monkeypatch.setattr(
+        publication_catalog,
+        "bootstrap_catalog_authority",
+        lambda source_id: (
+            (CATALOG_ENTRY_ID, CATALOG_DIGEST)
+            if source_id == SOURCE_ID
+            else None
+        ),
+    )
     dataset_rows = _catalog_dataset_rows(False)
     dataset_rows[1]["publication_metadata"] = _metadata(source_ids=(SOURCE_ID,))
     execute = AsyncMock(return_value=_MappingResult(dataset_rows))
@@ -117,8 +138,11 @@ def _generic_publication_fence(
     *,
     publication_metadata_hash=PUBLICATION_METADATA_HASH,
     admission_sha256=ADMISSION_SHA256,
+    first_publication=False,
 ):
-    candidate = ValidatedPublicationCandidate.from_payload(_generic_candidate_map())
+    candidate = ValidatedPublicationCandidate.from_payload(
+        _generic_candidate_map(first_publication=first_publication)
+    )
     dataset = importer.ProviderDirectoryArtifactDataset(
         source_id=SOURCE_ID,
         endpoint_id=ENDPOINT_ID,
@@ -126,8 +150,10 @@ def _generic_publication_fence(
         evidence_run_id=CANDIDATE_ROOT,
         status=importer.ENDPOINT_DATASET_VALIDATED,
         is_current=False,
-        previous_dataset_id=CURRENT_DATASET_ID,
-        expected_incumbent_dataset_id=CURRENT_DATASET_ID,
+        previous_dataset_id=None if first_publication else CURRENT_DATASET_ID,
+        expected_incumbent_dataset_id=(
+            None if first_publication else CURRENT_DATASET_ID
+        ),
         promote_on_cutover=True,
         dataset_hash=CANDIDATE_HASH,
         validated_at=VALIDATED_AT,
@@ -211,7 +237,7 @@ def _sealed_refresh_context():
     return dataset, candidate, seal, relation_proof_by_name
 
 
-def test_generic_policy_is_closed_digest_bound_and_requires_incumbent():
+def test_generic_policies_are_closed_and_bind_incumbent_state():
     candidate_by_field = _generic_candidate_map()
 
     assert (
@@ -225,10 +251,6 @@ def test_generic_policy_is_closed_digest_bound_and_requires_incumbent():
     with pytest.raises(ValueError, match="identity_invalid"):
         ValidatedPublicationCandidate.from_payload(
             {**candidate_by_field, "content_proof_admission_sha256": "C" * 64}
-        )
-    with pytest.raises(ValueError, match="expected_current_required"):
-        ValidatedPublicationCandidate.from_payload(
-            _generic_candidate_map(first_publication=True)
         )
 
 
@@ -386,10 +408,15 @@ async def test_sealed_refresh_rejects_missing_admission_sha(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_catalog_exposes_exact_generic_admission_candidate(monkeypatch):
+@pytest.mark.parametrize("classification", ("acquisition", "bulk_acquisition"))
+async def test_catalog_exposes_exact_generic_admission_candidate(
+    monkeypatch,
+    classification,
+):
     catalog_map, canonical_dataset, _, _, resolve_candidate = _generic_catalog_fixture(
         monkeypatch
     )
+    catalog_map["items"][0]["classification"] = classification
 
     enriched_catalog = await catalog_outcomes.enrich_provider_directory_source_catalog(
         catalog_map
@@ -428,22 +455,6 @@ async def test_catalog_rejects_generic_authority_drift(
 ):
     catalog_map, canonical_dataset, _, _, _ = _generic_catalog_fixture(monkeypatch)
     setattr(canonical_dataset, field_name, drifted_value)
-
-    enriched_catalog = await catalog_outcomes.enrich_provider_directory_source_catalog(
-        catalog_map
-    )
-
-    assert "validated_publication_candidate" not in enriched_catalog["items"][0]
-
-
-@pytest.mark.asyncio
-async def test_catalog_rejects_generic_first_publication(monkeypatch):
-    catalog_map, canonical_dataset, dataset_rows, execute, _ = _generic_catalog_fixture(
-        monkeypatch
-    )
-    canonical_dataset.expected_incumbent_dataset_id = None
-    dataset_rows[1]["previous_dataset_id"] = None
-    execute.return_value = _MappingResult([dataset_rows[1]])
 
     enriched_catalog = await catalog_outcomes.enrich_provider_directory_source_catalog(
         catalog_map
