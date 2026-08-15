@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import stat
@@ -13,7 +14,6 @@ import pytest
 from process import provider_directory_retained_blob_install_support as install_io
 from process import provider_directory_retained_blob_producer as blob_producer
 from process.provider_directory_retained_artifact_contract import RetainedArtifactError
-
 
 pytest_plugins = ("tests.provider_directory_retained_reader_fixtures",)
 
@@ -262,3 +262,59 @@ def test_otmpfile_creation_fails_closed_without_flag(
             install_io._create_temporary_blob(target, artifact_sha256)
     finally:
         target.close()
+
+
+def test_enotsup_fallback_publishes_and_removes_named_partial(
+    monkeypatch,
+    retained_artifact_test_root: Path,
+) -> None:
+    """ENOTSUP uses a secure named partial and removes it after publication."""
+    artifact_bytes = b"named fallback\n"
+    artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+    source_path = retained_artifact_test_root / "named-fallback-source"
+    source_path.write_bytes(artifact_bytes)
+    blob_path = retained_artifact_test_root.joinpath(
+        *install_io.retained_artifact_blob_components(artifact_sha256)
+    )
+    assert not blob_path.exists()
+    original_open = install_io.os.open
+    named_open_by_field = {}
+
+    monkeypatch.setattr(
+        install_io,
+        "_TMPFILE_FLAG",
+        getattr(os, "O_TMPFILE", 0x40000000),
+    )
+    monkeypatch.setattr(
+        blob_producer,
+        "_create_temporary_blob",
+        install_io._create_temporary_blob,
+    )
+
+    def fail_otmpfile(path, flags, mode=0o777, **kwargs):
+        if flags & install_io._TMPFILE_FLAG == install_io._TMPFILE_FLAG:
+            raise OSError(errno.ENOTSUP, "fixture filesystem lacks O_TMPFILE")
+        if flags & os.O_CREAT and path.endswith(".partial"):
+            named_open_by_field.update(
+                path=path,
+                flags=flags,
+                mode=mode,
+                kwargs=kwargs,
+            )
+        return original_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(install_io.os, "open", fail_otmpfile)
+    blob_producer.install_retained_artifact_blob(
+        source_path,
+        artifact_sha256=artifact_sha256,
+        artifact_byte_count=len(artifact_bytes),
+    )
+
+    assert blob_path.read_bytes() == artifact_bytes
+    assert list(blob_path.parent.glob("*.partial")) == []
+    assert named_open_by_field["path"].endswith(".partial")
+    required_flags = os.O_CREAT | os.O_EXCL | install_io._NOFOLLOW_FLAG
+    assert named_open_by_field["flags"] & required_flags == required_flags
+    assert named_open_by_field["mode"] == 0o600
+    assert set(named_open_by_field["kwargs"]) == {"dir_fd"}
+    assert isinstance(named_open_by_field["kwargs"]["dir_fd"], int)

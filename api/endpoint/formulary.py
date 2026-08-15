@@ -217,57 +217,18 @@ def _hydrate_formulary_row(row) -> Dict[str, Any]:
     }
 
 
-@blueprint.get("/ids")
-async def list_formularies(request):
-    """List filtered formularies with plan, issuer, and pagination metadata."""
-
-    session = _get_session(request)
-
-    args = request.args
-    # Explicit access keeps route/query introspection in sync with OpenAPI.
-    args.get("page")
-    args.get("page_size")
-    pagination = parse_pagination(
-        args,
-        default_limit=DEFAULT_PAGE_SIZE,
-        max_limit=MAX_PAGE_SIZE,
-        default_page=1,
-        allow_offset=True,
-        allow_start=True,
-        allow_page_size=True,
-    )
-    page = pagination.page
-    page_size = pagination.limit
-    offset = pagination.offset
-
+def _formulary_listing_statements(args, offset: int, page_size: int):
     plan_table = Plan.__table__
     issuer_table = Issuer.__table__
     plan_drug_table = PlanDrugRaw.__table__
     plan_drug_stats_table = PlanDrugStats.__table__
-
     base_from = (
         plan_table.join(issuer_table, plan_table.c.issuer_id == issuer_table.c.issuer_id)
         .outerjoin(plan_drug_table, plan_drug_table.c.plan_id == plan_table.c.plan_id)
         .outerjoin(plan_drug_stats_table, plan_drug_stats_table.c.plan_id == plan_table.c.plan_id)
     )
-
-    issuer_arg = args.get("issuer_id")
-    plan_arg = args.get("plan_id")
-    state_arg = args.get("state")
-    year_arg = args.get("year")
-    drug_arg = args.get("drug")
-
-    filters_by_name = {
-        "issuer_id": issuer_arg,
-        "plan_id": plan_arg,
-        "state": state_arg,
-        "year": year_arg,
-        "drug": drug_arg,
-    }
-
-    filters = _plan_filters(plan_table, plan_drug_table, filters_by_name)
+    filters = _plan_filters(plan_table, plan_drug_table, args)
     filter_condition = and_(*filters) if filters else None
-
     distinct_stmt = (
         select(plan_table.c.plan_id, plan_table.c.year)
         .select_from(base_from)
@@ -275,29 +236,19 @@ async def list_formularies(request):
     )
     if filter_condition is not None:
         distinct_stmt = distinct_stmt.where(filter_condition)
-
-    count_result = await session.execute(
-        select(func.count()).select_from(distinct_stmt.subquery())
-    )
-    total = count_result.scalar() or 0
-
-    data_stmt = (
-        select(
-            plan_table.c.plan_id,
-            plan_table.c.year,
-            plan_table.c.marketing_name,
-            plan_table.c.state,
-            plan_table.c.issuer_id,
-            issuer_table.c.issuer_name,
-            issuer_table.c.issuer_marketing_name,
-            func.coalesce(plan_drug_stats_table.c.total_drugs, 0).label("drug_count"),
-            plan_drug_stats_table.c.last_updated_on.label("last_updated"),
-        )
-        .select_from(base_from)
-    )
+    data_stmt = select(
+        plan_table.c.plan_id,
+        plan_table.c.year,
+        plan_table.c.marketing_name,
+        plan_table.c.state,
+        plan_table.c.issuer_id,
+        issuer_table.c.issuer_name,
+        issuer_table.c.issuer_marketing_name,
+        func.coalesce(plan_drug_stats_table.c.total_drugs, 0).label("drug_count"),
+        plan_drug_stats_table.c.last_updated_on.label("last_updated"),
+    ).select_from(base_from)
     if filter_condition is not None:
         data_stmt = data_stmt.where(filter_condition)
-
     data_stmt = (
         data_stmt.group_by(
             plan_table.c.plan_id,
@@ -314,7 +265,207 @@ async def list_formularies(request):
         .offset(offset)
         .limit(page_size)
     )
+    return distinct_stmt, data_stmt
 
+
+def _drug_coverage_details(mapping) -> Dict[str, Any]:
+    return {
+        "drug_name": mapping["drug_name"],
+        "drug_tier": mapping["drug_tier"],
+        "drug_tier_slug": normalize_drug_tier_slug(mapping["drug_tier"]),
+        "prior_authorization": mapping["prior_authorization"],
+        "step_therapy": mapping["step_therapy"],
+        "quantity_limit": mapping["quantity_limit"],
+    }
+
+
+def _pharmacy_types_statement(plan_id: str, year: int):
+    plan_formulary_table = PlanFormulary.__table__
+    return (
+        select(func.distinct(plan_formulary_table.c.pharmacy_type))
+        .where(
+            and_(
+                plan_formulary_table.c.plan_id == plan_id,
+                plan_formulary_table.c.year == year,
+            )
+        )
+        .order_by(plan_formulary_table.c.pharmacy_type)
+    )
+
+
+def _formulary_summary_statements(plan_id: str, year: int):
+    stats_table = PlanDrugStats.__table__
+    tier_table = PlanDrugTierStats.__table__
+    formulary_table = PlanFormulary.__table__
+    stats_stmt = select(
+        func.coalesce(stats_table.c.total_drugs, 0).label("total_drugs"),
+        func.coalesce(stats_table.c.auth_required, 0).label("auth_required"),
+        func.coalesce(stats_table.c.auth_not_required, 0).label("auth_not_required"),
+        func.coalesce(stats_table.c.step_required, 0).label("step_required"),
+        func.coalesce(stats_table.c.step_not_required, 0).label("step_not_required"),
+        func.coalesce(stats_table.c.quantity_limit, 0).label("quantity_limit"),
+        func.coalesce(stats_table.c.quantity_no_limit, 0).label("quantity_no_limit"),
+    ).where(stats_table.c.plan_id == plan_id)
+    tier_stmt = select(tier_table.c.drug_tier, tier_table.c.drug_count).where(
+        tier_table.c.plan_id == plan_id
+    )
+    pharmacy_stmt = (
+        select(formulary_table.c.pharmacy_type, func.count())
+        .where(
+            and_(
+                formulary_table.c.plan_id == plan_id,
+                formulary_table.c.year == year,
+            )
+        )
+        .group_by(formulary_table.c.pharmacy_type)
+    )
+    return stats_stmt, tier_stmt, pharmacy_stmt
+
+
+def _cross_formulary_drug_statement(args, rxnorm_id: str):
+    plan_table = Plan.__table__
+    plan_drug_table = PlanDrugRaw.__table__
+    issuer_table = Issuer.__table__
+    filters = [plan_drug_table.c.rxnorm_id == rxnorm_id]
+    if args.get("year"):
+        year = _parse_positive_int(args.get("year"), "year")
+        if year is not None:
+            filters.append(plan_table.c.year == year)
+    if args.get("state"):
+        filters.append(plan_table.c.state == args.get("state").upper())
+    if args.get("issuer_id"):
+        issuer_id = _parse_positive_int(args.get("issuer_id"), "issuer_id")
+        if issuer_id is not None:
+            filters.append(plan_table.c.issuer_id == issuer_id)
+    return (
+        select(
+            plan_table.c.plan_id,
+            plan_table.c.year,
+            plan_table.c.marketing_name,
+            plan_table.c.state,
+            plan_table.c.issuer_id,
+            issuer_table.c.issuer_name,
+            plan_drug_table.c.drug_tier,
+            plan_drug_table.c.prior_authorization,
+            plan_drug_table.c.step_therapy,
+            plan_drug_table.c.quantity_limit,
+        )
+        .select_from(
+            plan_drug_table.join(plan_table, plan_table.c.plan_id == plan_drug_table.c.plan_id).join(
+                issuer_table, plan_table.c.issuer_id == issuer_table.c.issuer_id
+            )
+        )
+        .where(and_(*filters))
+        .order_by(plan_table.c.plan_id.asc(), plan_table.c.year.asc())
+    )
+
+
+def _formulary_statistics_filter(args, plan_table):
+    filters: List[Any] = []
+    if args.get("year"):
+        year = _parse_positive_int(args.get("year"), "year")
+        if year is not None:
+            filters.append(plan_table.c.year == year)
+    if args.get("state"):
+        filters.append(plan_table.c.state == args.get("state").upper())
+    if args.get("issuer_id"):
+        issuer_id = _parse_positive_int(args.get("issuer_id"), "issuer_id")
+        if issuer_id is not None:
+            filters.append(plan_table.c.issuer_id == issuer_id)
+    return and_(*filters) if filters else None
+
+
+def _formulary_statistics_statements(args):
+    plan_table = Plan.__table__
+    issuer_table = Issuer.__table__
+    stats_table = PlanDrugStats.__table__
+    tier_table = PlanDrugTierStats.__table__
+    filter_condition = _formulary_statistics_filter(args, plan_table)
+    stats_from = plan_table.join(stats_table, stats_table.c.plan_id == plan_table.c.plan_id)
+    issuer_from = stats_from.join(issuer_table, plan_table.c.issuer_id == issuer_table.c.issuer_id)
+    tier_from = plan_table.join(tier_table, tier_table.c.plan_id == plan_table.c.plan_id)
+    top_issuers_stmt = (
+        select(
+            issuer_table.c.issuer_id,
+            issuer_table.c.issuer_name,
+            func.coalesce(func.sum(stats_table.c.total_drugs), 0).label("drug_count"),
+        )
+        .select_from(issuer_from)
+        .group_by(issuer_table.c.issuer_id, issuer_table.c.issuer_name)
+        .order_by(func.sum(stats_table.c.total_drugs).desc())
+        .limit(5)
+    )
+    tier_stmt = (
+        select(
+            tier_table.c.drug_tier,
+            func.coalesce(func.sum(tier_table.c.drug_count), 0),
+        )
+        .select_from(tier_from)
+        .group_by(tier_table.c.drug_tier)
+    )
+    total_drugs_stmt = select(
+        func.coalesce(func.sum(stats_table.c.total_drugs), 0).label("total_drugs"),
+        func.coalesce(func.sum(stats_table.c.auth_required), 0).label("auth_required"),
+        func.coalesce(func.sum(stats_table.c.auth_not_required), 0).label("auth_not_required"),
+    ).select_from(stats_from)
+    distinct_stmt = select(plan_table.c.plan_id, plan_table.c.year).select_from(plan_table).distinct()
+    if filter_condition is not None:
+        top_issuers_stmt = top_issuers_stmt.where(filter_condition)
+        tier_stmt = tier_stmt.where(filter_condition)
+        total_drugs_stmt = total_drugs_stmt.where(filter_condition)
+        distinct_stmt = distinct_stmt.where(filter_condition)
+    total_formulary_stmt = select(func.count()).select_from(distinct_stmt.subquery())
+    return top_issuers_stmt, tier_stmt, total_drugs_stmt, total_formulary_stmt
+
+
+async def _resolve_plan_year(session, plan_id: str, year_param: Optional[str]) -> int:
+    plan_table = Plan.__table__
+    if year_param:
+        year = _parse_positive_int(year_param, "year")
+        if year is None:
+            raise InvalidUsage("Parameter 'year' must be provided when specified")
+    else:
+        max_year_stmt = select(func.max(plan_table.c.year)).where(plan_table.c.plan_id == plan_id)
+        year = (await session.execute(max_year_stmt)).scalar()
+        if year is None:
+            raise NotFound("Plan not found")
+    if not await _has_formulary(session, plan_id, year):
+        raise NotFound("Plan not found")
+    return year
+
+
+@blueprint.get("/ids")
+async def list_formularies(request):
+    """List filtered formularies with plan, issuer, and pagination metadata."""
+
+    session = _get_session(request)
+
+    args = request.args
+    # Explicit access keeps route/query introspection in sync with OpenAPI.
+    args.get("page")
+    args.get("page_size")
+    args.get("issuer_id")
+    args.get("plan_id")
+    args.get("state")
+    args.get("year")
+    args.get("drug")
+    pagination = parse_pagination(
+        args,
+        default_limit=DEFAULT_PAGE_SIZE,
+        max_limit=MAX_PAGE_SIZE,
+        default_page=1,
+        allow_offset=True,
+        allow_start=True,
+        allow_page_size=True,
+    )
+    page = pagination.page
+    page_size = pagination.limit
+    offset = pagination.offset
+    distinct_stmt, data_stmt = _formulary_listing_statements(args, offset, page_size)
+    count_result = await session.execute(
+        select(func.count()).select_from(distinct_stmt.subquery())
+    )
+    total = count_result.scalar() or 0
     formulary_result = await session.execute(data_stmt)
     formulary_items = [
         _hydrate_formulary_row(formulary_row)
@@ -610,30 +761,14 @@ async def get_formulary_drug(request, formulary_id, rxnorm_id):
     last_updated = mapping["last_updated_on"]
     if last_updated is not None:
         last_updated = last_updated.isoformat()
-
-    plan_formulary_table = PlanFormulary.__table__
-    pharmacy_stmt = (
-        select(func.distinct(plan_formulary_table.c.pharmacy_type))
-        .where(
-            and_(
-                plan_formulary_table.c.plan_id == plan_id,
-                plan_formulary_table.c.year == year,
-            )
-        )
-        .order_by(plan_formulary_table.c.pharmacy_type)
-    )
+    pharmacy_stmt = _pharmacy_types_statement(plan_id, year)
     pharmacy_types = await _collect_distinct_strings(session, pharmacy_stmt)
 
     drug_payload_by_field = {
         "formulary_id": formulary_id,
         "formulary_uri": _encode_formulary_path(plan_id, year),
         "rxnorm_id": mapping["rxnorm_id"],
-        "drug_name": mapping["drug_name"],
-        "drug_tier": mapping["drug_tier"],
-        "drug_tier_slug": normalize_drug_tier_slug(mapping["drug_tier"]),
-        "prior_authorization": mapping["prior_authorization"],
-        "step_therapy": mapping["step_therapy"],
-        "quantity_limit": mapping["quantity_limit"],
+        **_drug_coverage_details(mapping),
         "available_pharmacy_types": pharmacy_types,
         "last_updated": last_updated,
         "linked_plans": [
@@ -656,22 +791,7 @@ async def get_formulary_summary(request, formulary_id):
     if not await _has_formulary(session, plan_id, year):
         raise NotFound("Unknown formulary identifier")
 
-    plan_drug_stats_table = PlanDrugStats.__table__
-    plan_drug_tier_stats_table = PlanDrugTierStats.__table__
-    plan_formulary_table = PlanFormulary.__table__
-
-    stats_stmt = (
-        select(
-            func.coalesce(plan_drug_stats_table.c.total_drugs, 0).label("total_drugs"),
-            func.coalesce(plan_drug_stats_table.c.auth_required, 0).label("auth_required"),
-            func.coalesce(plan_drug_stats_table.c.auth_not_required, 0).label("auth_not_required"),
-            func.coalesce(plan_drug_stats_table.c.step_required, 0).label("step_required"),
-            func.coalesce(plan_drug_stats_table.c.step_not_required, 0).label("step_not_required"),
-            func.coalesce(plan_drug_stats_table.c.quantity_limit, 0).label("quantity_limit"),
-            func.coalesce(plan_drug_stats_table.c.quantity_no_limit, 0).label("quantity_no_limit"),
-        )
-        .where(plan_drug_stats_table.c.plan_id == plan_id)
-    )
+    stats_stmt, tier_stmt, pharmacy_stmt = _formulary_summary_statements(plan_id, year)
     stats_result = await session.execute(stats_stmt)
     stats_row = stats_result.first()
     stats_mapping = getattr(stats_row, "_mapping", {}) if stats_row else {}
@@ -690,28 +810,11 @@ async def get_formulary_summary(request, formulary_id):
         "no_limit": int(stats_mapping.get("quantity_no_limit") or 0),
     }
 
-    tier_stmt = (
-        select(
-            plan_drug_tier_stats_table.c.drug_tier,
-            plan_drug_tier_stats_table.c.drug_count,
-        )
-        .where(plan_drug_tier_stats_table.c.plan_id == plan_id)
-    )
     tier_rows = (await session.execute(tier_stmt)).all()
     tier_breakdown = _build_tier_breakdown(
         [(tier_row[0], tier_row[1]) for tier_row in tier_rows]
     )
 
-    pharmacy_stmt = (
-        select(plan_formulary_table.c.pharmacy_type, func.count())
-        .where(
-            and_(
-                plan_formulary_table.c.plan_id == plan_id,
-                plan_formulary_table.c.year == year,
-            )
-        )
-        .group_by(plan_formulary_table.c.pharmacy_type)
-    )
     pharmacy_rows = (await session.execute(pharmacy_stmt)).all()
     pharmacy_counts = _build_pharmacy_breakdown(
         [(pharmacy_row[0], pharmacy_row[1]) for pharmacy_row in pharmacy_rows]
@@ -737,48 +840,11 @@ async def cross_formulary_drug(request, rxnorm_id):
 
     session = _get_session(request)
     args = request.args
-
-    plan_table = Plan.__table__
-    plan_drug_table = PlanDrugRaw.__table__
-    issuer_table = Issuer.__table__
-
-    filters = [plan_drug_table.c.rxnorm_id == rxnorm_id]
-
-    if args.get("year"):
-        year = _parse_positive_int(args.get("year"), "year")
-        if year is not None:
-            filters.append(plan_table.c.year == year)
-
-    if args.get("state"):
-        filters.append(plan_table.c.state == args.get("state").upper())
-
-    if args.get("issuer_id"):
-        issuer_id = _parse_positive_int(args.get("issuer_id"), "issuer_id")
-        if issuer_id is not None:
-            filters.append(plan_table.c.issuer_id == issuer_id)
-
-    stmt = (
-        select(
-            plan_table.c.plan_id,
-            plan_table.c.year,
-            plan_table.c.marketing_name,
-            plan_table.c.state,
-            plan_table.c.issuer_id,
-            issuer_table.c.issuer_name,
-            plan_drug_table.c.drug_tier,
-            plan_drug_table.c.prior_authorization,
-            plan_drug_table.c.step_therapy,
-            plan_drug_table.c.quantity_limit,
-        )
-        .select_from(
-            plan_drug_table.join(plan_table, plan_table.c.plan_id == plan_drug_table.c.plan_id).join(
-                issuer_table, plan_table.c.issuer_id == issuer_table.c.issuer_id
-            )
-        )
-        .where(and_(*filters))
-        .order_by(plan_table.c.plan_id.asc(), plan_table.c.year.asc())
-    )
-
+    # Explicit access keeps route/query introspection in sync with OpenAPI.
+    args.get("year")
+    args.get("state")
+    args.get("issuer_id")
+    stmt = _cross_formulary_drug_statement(args, rxnorm_id)
     formulary_result = await session.execute(stmt)
     formulary_rows = formulary_result.all()
     if not formulary_rows:
@@ -816,81 +882,12 @@ async def formulary_statistics(request):
 
     session = _get_session(request)
     args = request.args
-
-    plan_table = Plan.__table__
-    issuer_table = Issuer.__table__
-    plan_drug_stats_table = PlanDrugStats.__table__
-    plan_drug_tier_stats_table = PlanDrugTierStats.__table__
-
-    filters: List[Any] = []
-    if args.get("year"):
-        year = _parse_positive_int(args.get("year"), "year")
-        if year is not None:
-            filters.append(plan_table.c.year == year)
-
-    if args.get("state"):
-        filters.append(plan_table.c.state == args.get("state").upper())
-
-    if args.get("issuer_id"):
-        issuer_id = _parse_positive_int(args.get("issuer_id"), "issuer_id")
-        if issuer_id is not None:
-            filters.append(plan_table.c.issuer_id == issuer_id)
-
-    filter_condition = and_(*filters) if filters else None
-
-    stats_from = plan_table.join(
-        plan_drug_stats_table, plan_drug_stats_table.c.plan_id == plan_table.c.plan_id
-    )
-    issuer_from = stats_from.join(issuer_table, plan_table.c.issuer_id == issuer_table.c.issuer_id)
-    tier_from = plan_table.join(
-        plan_drug_tier_stats_table, plan_drug_tier_stats_table.c.plan_id == plan_table.c.plan_id
-    )
-
-    top_issuers_stmt = (
-        select(
-            issuer_table.c.issuer_id,
-            issuer_table.c.issuer_name,
-            func.coalesce(func.sum(plan_drug_stats_table.c.total_drugs), 0).label("drug_count"),
-        )
-        .select_from(issuer_from)
-        .group_by(issuer_table.c.issuer_id, issuer_table.c.issuer_name)
-        .order_by(func.sum(plan_drug_stats_table.c.total_drugs).desc())
-        .limit(5)
-    )
-    if filter_condition is not None:
-        top_issuers_stmt = top_issuers_stmt.where(filter_condition)
-
-    tier_stmt = (
-        select(
-            plan_drug_tier_stats_table.c.drug_tier,
-            func.coalesce(func.sum(plan_drug_tier_stats_table.c.drug_count), 0),
-        )
-        .select_from(tier_from)
-        .group_by(plan_drug_tier_stats_table.c.drug_tier)
-    )
-    if filter_condition is not None:
-        tier_stmt = tier_stmt.where(filter_condition)
-
-    total_drugs_stmt = (
-        select(
-            func.coalesce(func.sum(plan_drug_stats_table.c.total_drugs), 0).label("total_drugs"),
-            func.coalesce(func.sum(plan_drug_stats_table.c.auth_required), 0).label("auth_required"),
-            func.coalesce(func.sum(plan_drug_stats_table.c.auth_not_required), 0).label("auth_not_required"),
-        )
-        .select_from(stats_from)
-    )
-    if filter_condition is not None:
-        total_drugs_stmt = total_drugs_stmt.where(filter_condition)
-
-    distinct_formulary_stmt = (
-        select(plan_table.c.plan_id, plan_table.c.year)
-        .select_from(plan_table)
-        .distinct()
-    )
-    if filter_condition is not None:
-        distinct_formulary_stmt = distinct_formulary_stmt.where(filter_condition)
-
-    total_formulary_stmt = select(func.count()).select_from(distinct_formulary_stmt.subquery())
+    # Explicit access keeps route/query introspection in sync with OpenAPI.
+    args.get("year")
+    args.get("state")
+    args.get("issuer_id")
+    statements = _formulary_statistics_statements(args)
+    top_issuers_stmt, tier_stmt, total_drugs_stmt, total_formulary_stmt = statements
 
     top_issuers = []
     for issuer_row in (await session.execute(top_issuers_stmt)).all():
@@ -935,31 +932,8 @@ async def check_plan_drug(request, plan_id, rxnorm_id):
     """Return whether a plan covers a drug for the requested or latest year."""
 
     session = _get_session(request)
-    plan_table = Plan.__table__
     plan_drug_table = PlanDrugRaw.__table__
-
-    year_param = request.args.get("year")
-    if year_param:
-        year = _parse_positive_int(year_param, "year")
-        if year is None:
-            raise InvalidUsage("Parameter 'year' must be provided when specified")
-    else:
-        max_year_stmt = (
-            select(func.max(plan_table.c.year))
-            .where(plan_table.c.plan_id == plan_id)
-        )
-        max_year_result = await session.execute(max_year_stmt)
-        year = max_year_result.scalar()
-        if year is None:
-            raise NotFound("Plan not found")
-
-    plan_exists_stmt = (
-        select(func.count())
-        .select_from(plan_table)
-        .where(and_(plan_table.c.plan_id == plan_id, plan_table.c.year == year))
-    )
-    if not (await session.execute(plan_exists_stmt)).scalar():
-        raise NotFound("Plan not found")
+    year = await _resolve_plan_year(session, plan_id, request.args.get("year"))
 
     drug_stmt = (
         select(
@@ -991,12 +965,7 @@ async def check_plan_drug(request, plan_id, rxnorm_id):
         if last_updated is not None:
             last_updated = last_updated.isoformat()
         coverage_details_by_field = {
-            "drug_name": mapping["drug_name"],
-            "drug_tier": mapping["drug_tier"],
-            "drug_tier_slug": normalize_drug_tier_slug(mapping["drug_tier"]),
-            "prior_authorization": mapping["prior_authorization"],
-            "step_therapy": mapping["step_therapy"],
-            "quantity_limit": mapping["quantity_limit"],
+            **_drug_coverage_details(mapping),
             "last_updated": last_updated,
         }
 
