@@ -444,6 +444,11 @@ async def list_formularies(request):
     # Explicit access keeps route/query introspection in sync with OpenAPI.
     args.get("page")
     args.get("page_size")
+    args.get("issuer_id")
+    args.get("plan_id")
+    args.get("state")
+    args.get("year")
+    args.get("drug")
     pagination = parse_pagination(
         args,
         default_limit=DEFAULT_PAGE_SIZE,
@@ -835,6 +840,10 @@ async def cross_formulary_drug(request, rxnorm_id):
 
     session = _get_session(request)
     args = request.args
+    # Explicit access keeps route/query introspection in sync with OpenAPI.
+    args.get("year")
+    args.get("state")
+    args.get("issuer_id")
     stmt = _cross_formulary_drug_statement(args, rxnorm_id)
     formulary_result = await session.execute(stmt)
     formulary_rows = formulary_result.all()
@@ -873,6 +882,10 @@ async def formulary_statistics(request):
 
     session = _get_session(request)
     args = request.args
+    # Explicit access keeps route/query introspection in sync with OpenAPI.
+    args.get("year")
+    args.get("state")
+    args.get("issuer_id")
     statements = _formulary_statistics_statements(args)
     top_issuers_stmt, tier_stmt, total_drugs_stmt, total_formulary_stmt = statements
 
