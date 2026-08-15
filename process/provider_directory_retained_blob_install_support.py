@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 import sys
@@ -24,11 +25,11 @@ from process.provider_directory_retained_blob_store import (
     retained_artifact_blob_components,
 )
 
-
-_NONBLOCK_FLAG = getattr(os, "O_NONBLOCK", 0)
 _TMPFILE_FLAG = getattr(os, "O_TMPFILE", None)
+_INSTALL_UNAVAILABLE = "retained_blob_install_unavailable"
+_CLEANUP_FAILED = "retained_blob_temporary_cleanup_failed"
+_TEMPORARY_IDENTITY_CHANGED = "retained_blob_temporary_identity_changed"
 _DIR_FD_OPERATIONS = (os.link, os.mkdir, os.open, os.stat, os.unlink)
-_PROC_SELF_FD_DIRECTORY = "/proc/self/fd"
 
 
 def _combine_secondary_errors(
@@ -41,7 +42,7 @@ def _combine_secondary_errors(
             primary_error.add_note(nested_note)
 
 
-def _raise_combined_errors(errors: list[RetainedArtifactError]) -> None:
+def _raise_combined_errors(errors: list[BaseException]) -> None:
     if not errors:
         return
     primary_error = errors[0]
@@ -157,9 +158,28 @@ class _BlobInstallTarget:
 @dataclass
 class _TemporaryBlob:
     descriptor: int
+    named_entry: tuple[int, str, tuple[int, int] | None] | None = None
 
     def close(self) -> None:
-        """Close the temporary write descriptor once."""
+        """Close and remove the temporary write inode once."""
+        cleanup_errors: list[BaseException] = []
+        if self.named_entry is not None:
+            try:
+                parent_descriptor, leaf_name, inode_identity = self.named_entry
+                named_identity = _named_inode_identity(parent_descriptor, leaf_name)
+                if named_identity not in (None, inode_identity):
+                    raise RetainedArtifactError(_TEMPORARY_IDENTITY_CHANGED)
+                if named_identity is not None:
+                    try:
+                        os.unlink(leaf_name, dir_fd=parent_descriptor)
+                    except FileNotFoundError:
+                        self.named_entry = None
+                    except OSError as error:
+                        raise RetainedArtifactError(_CLEANUP_FAILED) from error
+                _sync_directory(parent_descriptor)
+                self.named_entry = None
+            except BaseException as error:
+                cleanup_errors.append(error)
         if self.descriptor >= 0:
             descriptor = self.descriptor
             self.descriptor = -1
@@ -168,7 +188,8 @@ class _TemporaryBlob:
                 "retained_blob_temporary_close_failed",
             )
             if close_error is not None:
-                raise close_error
+                cleanup_errors.append(close_error)
+        _raise_combined_errors(cleanup_errors)
 
 
 def _require_descriptor_install_platform() -> None:
@@ -183,7 +204,7 @@ def _require_install_platform() -> None:
     if not sys.platform.startswith("linux") or _TMPFILE_FLAG is None:
         raise RetainedArtifactError("retained_blob_install_unavailable")
     try:
-        proc_fd_state = os.stat(_PROC_SELF_FD_DIRECTORY)
+        proc_fd_state = os.stat("/proc/self/fd")
     except OSError as error:
         raise RetainedArtifactError("retained_blob_install_unavailable") from error
     if not stat.S_ISDIR(proc_fd_state.st_mode):
@@ -202,7 +223,7 @@ def _link_open_descriptor(
         raise RetainedArtifactError(
             "retained_blob_publish_identity_unavailable"
         ) from error
-    source_descriptor_path = f"{_PROC_SELF_FD_DIRECTORY}/{source_descriptor}"
+    source_descriptor_path = f"/proc/self/fd/{source_descriptor}"
     try:
         os.link(
             source_descriptor_path,
@@ -347,7 +368,7 @@ def _open_source(source_path: str | os.PathLike[str]) -> _OpenedFile:
     try:
         descriptor = os.open(
             leaf_name,
-            _CLOSE_FLAGS | _NOFOLLOW_FLAG | _NONBLOCK_FLAG,
+            _CLOSE_FLAGS | _NOFOLLOW_FLAG | getattr(os, "O_NONBLOCK", 0),
             dir_fd=descriptors[-1],
         )
         _file_identity(os.fstat(descriptor))
@@ -432,24 +453,41 @@ def _named_inode_identity(
 
 
 def _create_temporary_blob(
-    target: _BlobInstallTarget,
+    install_target: _BlobInstallTarget,
     artifact_sha256: str,
 ) -> _TemporaryBlob:
-    del artifact_sha256
     if _TMPFILE_FLAG is None:
         raise RetainedArtifactError("retained_blob_install_unavailable")
+    parent_descriptor = install_target.directory_chain.parent_descriptor
+    safety_flags = getattr(os, "O_CLOEXEC", 0) | _NOFOLLOW_FLAG
     try:
         descriptor = os.open(
             ".",
-            os.O_RDWR
-            | _TMPFILE_FLAG
-            | getattr(os, "O_CLOEXEC", 0)
-            | _NOFOLLOW_FLAG,
+            os.O_RDWR | _TMPFILE_FLAG | safety_flags,
             0o600,
-            dir_fd=target.directory_chain.parent_descriptor,
+            dir_fd=parent_descriptor,
         )
     except OSError as error:
-        raise RetainedArtifactError("retained_blob_install_unavailable") from error
+        if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+            raise RetainedArtifactError("retained_blob_install_unavailable") from error
+        leaf_name = f".{artifact_sha256}.{os.urandom(16).hex()}.partial"
+        try:
+            descriptor = os.open(
+                leaf_name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | safety_flags,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+        except OSError as fallback_error:
+            raise RetainedArtifactError(_INSTALL_UNAVAILABLE) from fallback_error
+        temporary = _TemporaryBlob(descriptor, (parent_descriptor, leaf_name, None))
+        try:
+            inode_identity = _inode_identity(os.fstat(descriptor))
+            temporary.named_entry = (parent_descriptor, leaf_name, inode_identity)
+        except BaseException as primary_error:
+            _close_after_error(primary_error, temporary.close)
+            raise
+        return temporary
     return _TemporaryBlob(descriptor=descriptor)
 
 
