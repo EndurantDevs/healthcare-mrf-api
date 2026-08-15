@@ -50,6 +50,7 @@ from scripts.research import provider_directory_fhir_harness as harness
 from process.provider_directory_proof_store import build_dataset_proof_shard
 from process.provider_directory_resource_hash import LEGACY_RESOURCE_HASH_CONTRACT
 from tests.provider_directory_fhir_subset_completion_support import (
+    build_completed_execution_proof,
     build_subset_contract,
 )
 
@@ -32728,6 +32729,103 @@ async def test_fetch_resource_rows_returns_complete_checkpoint(monkeypatch):
     assert fetch_result is not None
     assert fetch_result.complete is True
     assert fetch_result.rows_fetched == 9
+
+
+def _completed_subset_fetch_context(monkeypatch):
+    """Configure one complete checkpoint for every reviewed resource."""
+
+    contract = build_subset_contract()
+    source_by_field = {
+        "source_id": contract.source_id,
+        "api_base": "https://directory.example.test/fhir",
+        "canonical_api_base": "https://directory.example.test/fhir",
+        importer.CURRENT_VERSION_CENSUS_CONTRACT_FIELD: contract,
+    }
+    checkpoint = importer.PaginationCheckpointContext(
+        canonical_api_base=source_by_field["canonical_api_base"],
+        source_scope_hash="1" * 64,
+        source_ids=(contract.source_id,),
+        owner_run_id="run-current",
+        acquisition_root_run_id="run-root",
+        retry_of_run_id="run-parent",
+        endpoint_id="endpoint-a",
+        dataset_id="dataset-a",
+        lineage_verified=True,
+    )
+
+    async def load_checkpoint(_context, resource_type, _start_url, **_kwargs):
+        proof = build_completed_execution_proof(contract, resource_type)
+        return importer.PaginationResumeState(
+            next_url=None,
+            pages_processed=3,
+            rows_processed=1,
+            recent_url_hashes=(),
+            resumed=True,
+            complete=True,
+            completeness=proof,
+        )
+
+    monkeypatch.setattr(
+        importer,
+        "_partitioned_resource_start_urls",
+        lambda _source, resource_type, **_kwargs: [
+            contract.start_url(resource_type, contract.page_count)
+        ],
+    )
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        load_checkpoint,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_caresource_unique_candidate_count",
+        AsyncMock(return_value=1),
+    )
+    source_fetch = AsyncMock(
+        side_effect=AssertionError("complete checkpoint fetched source")
+    )
+    row_handler = AsyncMock(
+        side_effect=AssertionError("complete checkpoint rewrote rows")
+    )
+    monkeypatch.setattr(importer, "_fetch_source_json", source_fetch)
+    return contract, source_by_field, checkpoint, source_fetch, row_handler
+
+
+@pytest.mark.asyncio
+async def test_reviewed_subset_complete_checkpoints_skip_all_source_fetches(
+    monkeypatch,
+):
+    """Reuse all seven terminal checkpoints without issuing source requests."""
+
+    (
+        contract,
+        source_by_field,
+        checkpoint,
+        source_fetch,
+        row_handler,
+    ) = _completed_subset_fetch_context(monkeypatch)
+
+    for resource_type in contract.resources:
+        fetch_result = await importer._fetch_resource_rows(
+            source_by_field,
+            resource_type,
+            per_resource_limit=0,
+            page_limit=0,
+            page_count=contract.page_count,
+            timeout=60,
+            run_id="run-current",
+            row_batch_handler=row_handler,
+            retain_rows=False,
+            pagination_checkpoint=checkpoint,
+        )
+        assert fetch_result is not None
+        assert fetch_result.complete is True
+        assert fetch_result.fetch_mode == importer.SERVER_ISSUED_SUBSET_FETCH_MODE
+        assert fetch_result.rows_fetched == 1
+        assert fetch_result.fetch_diagnostic["verified"] is True
+    source_fetch.assert_not_awaited()
+    row_handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio
