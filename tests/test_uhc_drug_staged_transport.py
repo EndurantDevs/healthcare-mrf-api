@@ -2,13 +2,18 @@
 
 import asyncio
 import hashlib
+import io
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
+import process.formulary_fhir.uhc_drug_spool as spool
+import process.formulary_fhir.uhc_drug_staged_validation as staged_validation
 import process.formulary_fhir.uhc_drug_transport as transport
 from tests.test_uhc_drug_transport_boundaries import _identity
+from tests.uhc_drug_parser_test_support import artifact_set
 from tests.uhc_drug_parser_test_support import source_record
 
 
@@ -43,6 +48,54 @@ def test_stage_semantics_reject_source_data_but_preserve_local_io(tmp_path) -> N
         transport.validate_staged_uhc_drug_artifact(
             tmp_path / "missing.json", identity, artifact_sha256, len(invalid_body)
         )
+
+
+def test_staged_and_retained_validation_apply_spool_merge_semantics(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    conflicting_record = source_record()
+    conflicting_record["plans"].append(
+        {**conflicting_record["plans"][0], "drug_tier": "Conflicting tier"}
+    )
+    artifacts, bodies_by_name = artifact_set({0: [conflicting_record]})
+    artifact = artifacts.artifacts[0]
+    body = bodies_by_name[artifact.identity.file_name]
+    source_path = tmp_path / artifact.identity.file_name
+    source_path.write_bytes(body)
+
+    @contextmanager
+    def open_retained(_artifact):
+        yield io.BytesIO(body)
+
+    monkeypatch.setattr(
+        staged_validation,
+        "open_verified_source_artifact",
+        open_retained,
+    )
+    validations = (
+        lambda: staged_validation.validate_staged_uhc_drug_artifact(
+            source_path,
+            artifact.identity,
+            artifact.artifact_sha256,
+            artifact.artifact_byte_count,
+        ),
+        lambda: staged_validation.validate_retained_uhc_drug_artifact(artifact),
+    )
+    for validate in validations:
+        with pytest.raises(transport.UHCDrugArtifactAcquisitionError) as caught:
+            validate()
+        assert caught.value.failure_evidence == ("artifact_rejected",)
+
+    monkeypatch.setattr(
+        spool.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("synthetic local spool failure")
+        ),
+    )
+    with pytest.raises(OSError, match="local spool failure"):
+        validations[0]()
 
 
 @pytest.mark.parametrize("invalid_body", INVALID_SCALAR_PAYLOADS)
