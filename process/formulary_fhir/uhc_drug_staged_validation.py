@@ -3,7 +3,10 @@
 """Semantic validation for one staged UHC formulary artifact."""
 
 import datetime as dt
+import sqlite3
+import tempfile
 from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +17,10 @@ from process.formulary_fhir.uhc_drug_payload import UHCDrugPayloadError
 from process.formulary_fhir.uhc_drug_payload import (
     count_reopenable_uhc_drug_stream_items,
 )
+from process.formulary_fhir.uhc_drug_spool import _consume_source_records
+from process.formulary_fhir.uhc_drug_spool import _create_spool
+from process.formulary_fhir.uhc_drug_spool import _SpoolCensus
 from process.formulary_fhir.uhc_drug_spool import UHCDrugNormalizationError
-from process.formulary_fhir.uhc_drug_spool import normalized_uhc_drug_source_records
 from process.formulary_fhir.uhc_drug_transport_contract import UHCDrugArtifactAcquisitionError
 
 
@@ -31,13 +36,21 @@ def _validate_uhc_drug_artifact(
             open_input,
             cancel_check=cancel_check,
         )
-        with open_input() as input_file:
-            observed_count = sum(
-                1
-                for _source_record, _memberships in normalized_uhc_drug_source_records(
-                    artifact, input_file, cancel_check
-                )
-            )
+        with tempfile.TemporaryDirectory(
+            prefix="uhc-drug-artifact-validation-"
+        ) as temporary_directory:
+            with closing(
+                sqlite3.connect(Path(temporary_directory) / "artifact.sqlite3")
+            ) as connection:
+                _create_spool(connection)
+                with open_input() as input_file:
+                    observed_count = _consume_source_records(
+                        connection,
+                        artifact,
+                        input_file,
+                        _SpoolCensus(),
+                        cancel_check,
+                    )
         if observed_count != expected_count:
             raise UHCDrugNormalizationError("UHC drug artifact record census changed")
     except (UHCDrugNormalizationError, UHCDrugPayloadError):
