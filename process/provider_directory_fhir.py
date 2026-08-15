@@ -88,6 +88,11 @@ from process.control_lifecycle import (
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.ext import address_alias_sql, address_fast
 from process.ext.address_canon import resolve_into_archive
+from process.ext.address_format import (
+    ADDRESS_FORMAT_FUNCTION,
+    ADDRESS_FORMAT_SOURCE,
+    ADDRESS_FORMAT_VERSION,
+)
 from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
 from process.ext.utils import ensure_database
 from process.provider_directory_endpoint_admission import (
@@ -40868,7 +40873,6 @@ def _provider_directory_openaddresses_archive_backfill_sql(schema: str, stage_ta
               JOIN LATERAL (
                     SELECT avg(oa.lat)::numeric(11,8) AS lat,
                            avg(oa.long)::numeric(11,8) AS long,
-                           min(oa.formatted_address) AS formatted_address,
                            min(oa.feature_id) AS place_id,
                            NULLIF(max(NULLIF(oa.accuracy, '')), '') AS accuracy
                       FROM {openaddresses_ref} AS oa
@@ -40889,7 +40893,6 @@ def _provider_directory_openaddresses_archive_backfill_sql(schema: str, stage_ta
         UPDATE {archive_ref} AS archive
            SET lat = winners.lat,
                long = winners.long,
-               formatted_address = COALESCE(archive.formatted_address, winners.formatted_address),
                place_id = COALESCE(archive.place_id, winners.place_id),
                geo_source = 'openaddresses'::{geo_source_type},
                geocode_source = 'openaddresses_address_key',
@@ -79784,28 +79787,38 @@ async def _backfill_address_overlay_stage_formatted_addresses(
     schema: str,
     stage_ref: str,
 ) -> int:
-    """Hydrate the complete overlay stage from persisted archive labels."""
-    if not await _is_table_present(schema, "address_archive_v2"):
-        return 0
+    """Render every staged label from that row's structured components."""
+    renderer = f"{_q(schema)}.{ADDRESS_FORMAT_FUNCTION}"
     return _coerce_rowcount(
         await db.status(
             f"""
             UPDATE {stage_ref} AS stage_row
-               SET formatted_address = archive.formatted_address,
-                   formatted_address_version = archive.formatted_address_version,
-                   formatted_address_source = archive.formatted_address_source
-              FROM {_qt(schema, "address_archive_v2")} AS archive
+               SET formatted_address = {renderer}(
+                       stage_row.first_line,
+                       stage_row.second_line,
+                       stage_row.city_name,
+                       stage_row.state_name,
+                       stage_row.postal_code,
+                       stage_row.country_code
+                   ),
+                   formatted_address_version = {ADDRESS_FORMAT_VERSION},
+                   formatted_address_source = '{ADDRESS_FORMAT_SOURCE}'
              WHERE stage_row.address_key IS NOT NULL
-               AND archive.address_key = stage_row.address_key
-               AND archive.merged_into IS NULL
                AND ROW(
                        stage_row.formatted_address,
                        stage_row.formatted_address_version,
                        stage_row.formatted_address_source
                    ) IS DISTINCT FROM ROW(
-                       archive.formatted_address,
-                       archive.formatted_address_version,
-                       archive.formatted_address_source
+                       {renderer}(
+                           stage_row.first_line,
+                           stage_row.second_line,
+                           stage_row.city_name,
+                           stage_row.state_name,
+                           stage_row.postal_code,
+                           stage_row.country_code
+                       ),
+                       {ADDRESS_FORMAT_VERSION},
+                       '{ADDRESS_FORMAT_SOURCE}'
                    );
             """
         )

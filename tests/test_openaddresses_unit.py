@@ -11,6 +11,45 @@ openaddresses = importlib.import_module("process.openaddresses")
 control_imports = importlib.import_module("api.control_imports")
 
 
+@pytest.mark.parametrize(
+    ("properties", "reason"),
+    (
+        (None, "not_dict"),
+        ({"street": "Main Street", "region": "MO", "postcode": "64055"}, "missing_house_number"),
+        (
+            {"number": "100", "region": "MO", "postcode": "64055"},
+            "missing_street",
+        ),
+        (
+            {
+                "number": "100",
+                "street": "---",
+                "region": "MO",
+                "postcode": "64055",
+            },
+            "missing_street_match_key",
+        ),
+        (
+            {"number": "100", "street": "Main Street", "postcode": "64055"},
+            "missing_state",
+        ),
+    ),
+)
+def test_feature_import_records_report_invalid_components(properties, reason):
+    feature = [] if properties is None else {
+        "properties": properties,
+        "geometry": {"type": "Point", "coordinates": [-94.5, 39.0]},
+    }
+    assert openaddresses._feature_import_records(
+        feature,
+        source_name=None,
+        data_id=None,
+        job_id=None,
+        updated=None,
+        restore_shards=1,
+    ) == (None, None, reason)
+
+
 def test_openaddresses_record_uses_us_source_state_and_canonical_keys():
     feature_by_field = {
         "type": "Feature",
@@ -213,6 +252,7 @@ def test_openaddresses_backfill_source_contains_city_scoped_exact_phase():
     assert "openaddresses_exact_city" in sql_text
     assert "missing.city_norm IS NOT NULL" in sql_text
     assert "addr_city_norm_v1(oa.city_name)" in sql_text
+    assert "formatted_address" not in sql_text
 
 
 def test_openaddresses_backfill_match_modes_parser():

@@ -10,11 +10,14 @@ from unittest.mock import Mock
 from sqlalchemy import SmallInteger, String, Text
 
 from db.models import AddressArchiveV2, EntityAddressUnified
+from process.ext import address_format
 from process.ext.address_format import (
+    ADDRESS_FORMAT_FUNCTION,
     ADDRESS_FORMAT_MAX_LENGTH,
     ADDRESS_FORMAT_SOURCE,
     ADDRESS_FORMAT_VERSION,
     render_formatted_address_v1,
+    render_formatted_address_v2,
 )
 
 
@@ -22,6 +25,10 @@ ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = (
     ROOT
     / "alembic/versions/20260811110000_address_formatted_display.py"
+)
+V2_MIGRATION_PATH = (
+    ROOT
+    / "alembic/versions/20260815010000_address_formatted_display_v2.py"
 )
 
 
@@ -36,21 +43,39 @@ def _load_migration():
     return migration
 
 
+def _load_v2_migration():
+    module_spec = importlib.util.spec_from_file_location(
+        "address_formatted_display_v2_migration",
+        V2_MIGRATION_PATH,
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    migration = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(migration)
+    return migration
+
+
 def _normalized_sql(value: object) -> str:
     return " ".join(str(value).split())
 
 
 def test_renderer_has_a_stable_versioned_contract() -> None:
-    assert ADDRESS_FORMAT_VERSION == 1
-    assert ADDRESS_FORMAT_SOURCE == "canonical_v1"
+    assert ADDRESS_FORMAT_VERSION == 2
+    assert ADDRESS_FORMAT_SOURCE == "canonical_v2"
+    assert ADDRESS_FORMAT_FUNCTION == "addr_formatted_address_v2"
     assert ADDRESS_FORMAT_MAX_LENGTH == 1024
-    assert tuple(inspect.signature(render_formatted_address_v1).parameters) == (
+    expected_parameters = (
         "first_line",
         "second_line",
         "city_name",
         "state_name",
         "postal_code",
         "country_code",
+    )
+    assert tuple(inspect.signature(render_formatted_address_v1).parameters) == (
+        expected_parameters
+    )
+    assert tuple(inspect.signature(render_formatted_address_v2).parameters) == (
+        expected_parameters
     )
 
 
@@ -296,3 +321,61 @@ def test_migration_downgrade_removes_only_display_contract(monkeypatch) -> None:
     assert "DROP COLUMN IF EXISTS formatted_address_version" in sql
     assert "DROP COLUMN IF EXISTS formatted_address_source" in sql
     assert "DROP COLUMN IF EXISTS formatted_address" in sql
+
+
+def test_v2_migration_is_schema_only_and_preserves_v1(monkeypatch) -> None:
+    migration = _load_v2_migration()
+    operation = Mock()
+    operation.execute = Mock()
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "display_contract")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    monkeypatch.setattr(migration, "op", operation)
+
+    migration.upgrade()
+
+    sql = " ".join(
+        _normalized_sql(call.args[0])
+        for call in operation.execute.call_args_list
+    )
+    assert migration.revision == "20260815010000_address_formatted_display_v2"
+    assert migration.down_revision == "20260814010000_fhir_formulary_uhc_selected_receipt"
+    assert 'FUNCTION "display_contract"."addr_humanize_component_v2"' in sql
+    assert 'FUNCTION "display_contract"."addr_formatted_address_v2"' in sql
+    assert "IMMUTABLE" in sql
+    assert "PARALLEL SAFE" in sql
+    assert "UPDATE " not in sql.upper()
+    assert "INSERT " not in sql.upper()
+    assert "addr_formatted_address_v1" not in sql
+
+
+def test_v2_migration_downgrade_removes_only_v2_functions(monkeypatch) -> None:
+    migration = _load_v2_migration()
+    operation = Mock()
+    operation.execute = Mock()
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "display_contract")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    monkeypatch.setattr(migration, "op", operation)
+
+    migration.downgrade()
+
+    sql = " ".join(
+        _normalized_sql(call.args[0])
+        for call in operation.execute.call_args_list
+    )
+    assert 'DROP FUNCTION IF EXISTS "display_contract"."addr_formatted_address_v2"' in sql
+    assert 'DROP FUNCTION IF EXISTS "display_contract"."addr_humanize_component_v2"' in sql
+    assert "addr_formatted_address_v1" not in sql
+    assert "DROP COLUMN" not in sql
+
+
+def test_v2_sql_and_python_use_the_same_curated_suffix_aliases() -> None:
+    migration_sql = _load_v2_migration()._humanize_component_function_sql(
+        "display_contract"
+    )
+
+    for alias, canonical_suffix in address_format.PUB28_STREET_SUFFIX_MAP.items():
+        display = address_format._STREET_SUFFIX_DISPLAY.get(
+            canonical_suffix.upper()
+        )
+        if display is not None:
+            assert f"WHEN '{alias.upper()}' THEN '{display}'" in migration_sql

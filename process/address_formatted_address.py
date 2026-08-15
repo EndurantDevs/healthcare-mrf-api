@@ -12,7 +12,11 @@ from arq import create_pool
 from db.models import db
 from process.control_cancel import raise_if_cancelled
 from process.ext.address_canon import archive_table_name, _quote_ident, _schema_name
-from process.ext.address_format import ADDRESS_FORMAT_SOURCE, ADDRESS_FORMAT_VERSION
+from process.ext.address_format import (
+    ADDRESS_FORMAT_FUNCTION,
+    ADDRESS_FORMAT_SOURCE,
+    ADDRESS_FORMAT_VERSION,
+)
 from process.live_progress import enqueue_live_progress
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
@@ -46,7 +50,7 @@ def _validated_batch_size(batch_size: int) -> int:
 def _archive_format_batch_sql(schema: str) -> str:
     qschema = _quote_ident(schema)
     archive = f"{qschema}.{_quote_ident(archive_table_name())}"
-    renderer = f"{qschema}.addr_formatted_address_v1"
+    renderer = f"{qschema}.{ADDRESS_FORMAT_FUNCTION}"
     return f"""
         WITH batch AS MATERIALIZED (
             SELECT address_key

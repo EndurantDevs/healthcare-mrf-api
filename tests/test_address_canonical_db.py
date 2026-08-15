@@ -748,10 +748,10 @@ async def _assert_legacy_archive_output(schema: str) -> None:
     )
     assert winner is not None
     assert winner.formatted_address == (
-        "123 MAIN ST STE 200, MIAMI, Florida 33156-2814"
+        "123 Main Street, Suite 200, Miami, Florida 33156-2814"
     )
-    assert int(winner.formatted_address_version) == 1
-    assert winner.formatted_address_source == "canonical_v1"
+    assert int(winner.formatted_address_version) == 2
+    assert winner.formatted_address_source == "canonical_v2"
     assert str(winner.place_id) == "place-new"
     assert int(winner.source_bits) & 1 == 1
     assert int(winner.display_priority) == 0
@@ -1415,16 +1415,16 @@ async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_k
     assert source_row["formatted_address"] == (
         "10 Market Street, Suite 5, Boston, MA 02108"
     )
-    assert source_row["formatted_address_version"] == 1
-    assert source_row["formatted_address_source"] == "canonical_v1"
+    assert source_row["formatted_address_version"] == 2
+    assert source_row["formatted_address_source"] == "canonical_v2"
     assert source_row["address_key"] == str(
         address_canon.address_key_v1("10 Market Street", "Suite 5", "Boston", "MA", "02108", "US")
     )
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_chunked_raw_load_stamps_canonical_formatted_address_metadata():
-    """Verify chunked raw loading renders and versions display labels offline."""
+async def test_chunked_raw_load_defers_formatted_address_rendering():
+    """Verify raw loading defers display work until component aggregation."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     raw_table = "entity_address_unified_display_raw_fixture"
@@ -1456,11 +1456,9 @@ async def test_chunked_raw_load_stamps_canonical_formatted_address_metadata():
         """
     )
 
-    assert raw_row.formatted_address == (
-        "10 Market Street, Suite 5, Boston, MA 02108"
-    )
-    assert raw_row.formatted_address_version == 1
-    assert raw_row.formatted_address_source == "canonical_v1"
+    assert raw_row.formatted_address is None
+    assert raw_row.formatted_address_version is None
+    assert raw_row.formatted_address_source is None
 
 
 @pytest.mark.asyncio(loop_scope="session")

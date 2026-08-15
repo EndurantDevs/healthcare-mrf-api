@@ -311,11 +311,13 @@ provider endpoint latency contract.
 
 ## Versioned Formatted Addresses
 
-Revision `20260811110000_address_formatted_display` installs the immutable,
-parallel-safe `addr_formatted_address_v1(...)` renderer and nullable display
-metadata on `address_archive_v2`, `provider_directory_address_overlay`, and
-`entity_address_unified`. The migration is schema-only: it does not rewrite the
-archive while holding the migration lock.
+Revision `20260811110000_address_formatted_display` retains the historical v1
+contract. Revision `20260815010000_address_formatted_display_v2` adds the
+immutable, parallel-safe `addr_formatted_address_v2(...)` renderer. V2 renders
+only from the row's structured components, applies human display casing,
+expands common US directions and street suffixes, normalizes repeated unit
+lines, formats ZIP+4, and omits the default US country. Both migrations are
+schema-only and do not rewrite serving data while holding the migration lock.
 
 After the migration and worker restart, materialize existing archive labels as
 a bounded offline job:
@@ -325,14 +327,15 @@ python main.py start address-formatted-address --batch-size 10000
 ```
 
 The job advances by `address_key`, is safe to retry, and reports scanned,
-updated, and batch counts. It writes `formatted_address_version = 1` and
-`formatted_address_source = 'canonical_v1'`; it performs no geocoding, fuzzy
+updated, and batch counts. It writes `formatted_address_version = 2` and
+`formatted_address_source = 'canonical_v2'`; it performs no geocoding, fuzzy
 matching, or network calls. `HLTHPRT_ADDRESS_ARCHIVE_TABLE` may select a
 different unqualified archive table name. Invalid or schema-qualified values
 fail closed.
 
 Next rebuild the complete Provider Directory address artifacts and unified
-addresses so both serving tables copy the stored label and metadata:
+addresses. Overlay and unified labels are rendered from each output row's own
+components; archive premise and coordinate fields remain reusable:
 
 ```bash
 python main.py start provider-directory-fhir \
@@ -342,9 +345,11 @@ python main.py start provider-directory-fhir \
 python main.py start entity-address-unified
 ```
 
-Provider requests are stored-only by default. They do not render or geocode a
-missing display label. Explicit legacy geocode flags remain compatibility-only
-and are disabled on the public provider routes.
+Provider requests are stored-only by default. The public serializer rerenders
+the label from the returned row as a final coherence guard. Explicit legacy
+geocode flags remain compatibility-only and are disabled on the public provider
+routes. When enabled, geocoders may provide coordinates and place IDs but their
+display labels are never persisted or returned.
 
 Verify completion before the serving canary:
 
@@ -357,16 +362,32 @@ WHERE merged_into IS NULL
 SELECT count(*) AS archive_stale_display_version
 FROM mrf.address_archive_v2
 WHERE merged_into IS NULL
-  AND formatted_address IS NOT NULL
   AND (
-      formatted_address_version IS DISTINCT FROM 1
-      OR formatted_address_source IS DISTINCT FROM 'canonical_v1'
+      formatted_address IS DISTINCT FROM mrf.addr_formatted_address_v2(
+          first_line, second_line, city_name, state_name, postal_code,
+          country_code
+      )
+      OR formatted_address_version IS DISTINCT FROM 2
+      OR formatted_address_source IS DISTINCT FROM 'canonical_v2'
   );
 
-SELECT count(*) AS unified_missing_display
+SELECT count(*) AS overlay_stale_or_incoherent_display
+FROM mrf.provider_directory_address_overlay
+WHERE formatted_address IS DISTINCT FROM mrf.addr_formatted_address_v2(
+          first_line, second_line, city_name, state_name, postal_code,
+          country_code
+      )
+   OR formatted_address_version IS DISTINCT FROM 2
+   OR formatted_address_source IS DISTINCT FROM 'canonical_v2';
+
+SELECT count(*) AS unified_stale_or_incoherent_display
 FROM mrf.entity_address_unified
-WHERE address_key IS NOT NULL
-  AND formatted_address IS NULL;
+WHERE formatted_address IS DISTINCT FROM mrf.addr_formatted_address_v2(
+          first_line, second_line, city_name, state_name, postal_code,
+          country_code
+      )
+   OR formatted_address_version IS DISTINCT FROM 2
+   OR formatted_address_source IS DISTINCT FROM 'canonical_v2';
 ```
 
 Review any remaining rows before publication. Component-empty archive rows may

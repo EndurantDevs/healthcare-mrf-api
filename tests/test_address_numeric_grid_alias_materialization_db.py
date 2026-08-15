@@ -155,7 +155,7 @@ _UNIFIED_ALIAS_SOURCE_SQL = """
         ARRAY[]::varchar[] AS ptg_plan_array,
         ARRAY[]::varchar[] AS ptg_source_array,
         ARRAY[]::varchar[] AS group_plan_array,
-        'address_archive_v2:v2'::varchar AS base_address_version,
+        'address_archive_v2:v2+fmt-v2'::varchar AS base_address_version,
         '1548 E 4500'::varchar AS first_line,
         'Suite 202'::varchar AS second_line,
         'Example City'::varchar AS city_name,

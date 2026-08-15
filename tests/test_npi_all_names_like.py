@@ -146,10 +146,12 @@ async def test_get_all_sitemap_mode_allows_20000_limit(monkeypatch):
         def __init__(self):
             self.calls = 0
             self.last_params = None
+            self.last_sql = None
 
-        async def all(self, _sql, **params):
+        async def all(self, sql, **params):
             self.calls += 1
             self.last_params = params
+            self.last_sql = str(sql)
             return []
 
     conn = SitemapConnection()
@@ -177,6 +179,8 @@ async def test_get_all_sitemap_mode_allows_20000_limit(monkeypatch):
     assert response_body["limit"] == 20000
     assert conn.calls == 1
     assert len(conn.last_params["page_npis"]) == 20000
+    assert "mrf.addr_formatted_address_v2(" in conn.last_sql
+    assert "c.formatted_address" not in conn.last_sql
 
 
 @pytest.mark.asyncio

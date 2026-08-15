@@ -1585,7 +1585,7 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     assert "ORDER BY candidate.priority" in legacy_enrich_sql
     assert "SET address_key = k.address_key" in enrich_sql
     assert "premise_key = k.premise_key" in enrich_sql
-    assert "formatted_address = COALESCE(k.archive_formatted_address, r.formatted_address)" in enrich_sql
+    assert "archive_formatted_address" not in enrich_sql
     assert "lat = COALESCE(k.archive_lat, r.lat)" in enrich_sql
     assert "long = COALESCE(k.archive_long, r.long)" in enrich_sql
     assert "place_id = COALESCE(k.archive_place_id, r.place_id)" in enrich_sql
@@ -1640,7 +1640,7 @@ def test_entity_address_unified_retains_provider_directory_record_ids_when_aggre
         ],
     )
 
-    assert "addr_formatted_address_v1(" in direct_sql
+    assert "addr_formatted_address_v2(" in direct_sql
     assert "formatted_address_version" in direct_sql
     assert "formatted_address_source" in direct_sql
 

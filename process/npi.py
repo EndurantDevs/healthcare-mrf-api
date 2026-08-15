@@ -37,6 +37,7 @@ from process.ext.address_canon import (
     stamp_address_keys,
 )
 from process.ext.address_fast import canonicalize_batch as canonicalize_address_batch
+from process.ext.address_format import ADDRESS_FORMAT_FUNCTION
 from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
 from process.ext.utils import (download_it, download_it_and_save,
                                ensure_database, make_class, my_init_db,
@@ -2288,12 +2289,17 @@ async def shutdown(ctx):  # pragma: no cover
         use_canonical_archive: bool,
     ):
         async def _run_geo_update():
+            formatted_address_sql = (
+                f"{db_schema}.{ADDRESS_FORMAT_FUNCTION}("
+                "a.first_line, a.second_line, a.city_name, a.state_name, "
+                "a.postal_code, a.country_code)"
+            )
             if use_canonical_archive and await has_table_column(
                 archive_source,
                 "address_key",
             ):
                 await db.status(
-                    f"UPDATE {db_schema}.{staged_address_model.__tablename__} as a SET formatted_address = b.formatted_address, "
+                    f"UPDATE {db_schema}.{staged_address_model.__tablename__} as a SET formatted_address = {formatted_address_sql}, "
                     f"lat = b.lat, long = b.long, place_id = b.place_id "
                     f"FROM {db_schema}.{archive_source} as b "
                     f"WHERE a.address_key IS NOT NULL AND a.address_key = b.address_key"
@@ -2301,7 +2307,7 @@ async def shutdown(ctx):  # pragma: no cover
                 )
                 if await has_table("address_checksum_map"):
                     await db.status(
-                        f"UPDATE {db_schema}.{staged_address_model.__tablename__} as a SET formatted_address = b.formatted_address, "
+                        f"UPDATE {db_schema}.{staged_address_model.__tablename__} as a SET formatted_address = {formatted_address_sql}, "
                         f"lat = b.lat, long = b.long, place_id = b.place_id "
                         f"FROM {db_schema}.address_checksum_map as m "
                         f"JOIN {db_schema}.{archive_source} as b ON b.address_key = m.address_key "
@@ -2310,7 +2316,7 @@ async def shutdown(ctx):  # pragma: no cover
                     )
             else:
                 await db.status(
-                    f"UPDATE {db_schema}.{staged_address_model.__tablename__} as a SET formatted_address = b.formatted_address, "
+                    f"UPDATE {db_schema}.{staged_address_model.__tablename__} as a SET formatted_address = {formatted_address_sql}, "
                     f"lat = b.lat, long = b.long, place_id = b.place_id "
                     f"FROM {db_schema}.{archive_source} as b WHERE a.checksum = b.checksum"
                 )

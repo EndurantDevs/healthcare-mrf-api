@@ -29,7 +29,11 @@ from db.models import (
 )
 from process.control_lifecycle import mark_control_run
 from process.ext import address_alias_sql
-from process.ext.address_format import ADDRESS_FORMAT_SOURCE, ADDRESS_FORMAT_VERSION
+from process.ext.address_format import (
+    ADDRESS_FORMAT_FUNCTION,
+    ADDRESS_FORMAT_SOURCE,
+    ADDRESS_FORMAT_VERSION,
+)
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
 from process.live_progress import enqueue_live_progress
 from process import provider_directory_profile as profile_artifact
@@ -100,7 +104,7 @@ ENTITY_ADDRESS_REFRESH_MODES = {
     ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL,
 }
 ARCHIVE_IDENTITY_VERSION = "v2"
-BASE_ADDRESS_VERSION = "address_archive_v2:v2"
+BASE_ADDRESS_VERSION = f"address_archive_v2:v2+fmt-v{ADDRESS_FORMAT_VERSION}"
 ALIAS_BASE_ADDRESS_VERSION_PREFIX = f"{BASE_ADDRESS_VERSION}+alias-v1:g"
 ARCHIVE_COORDINATE_EPSILON_DEGREES = "0.0000001"
 SUPPORT_TABLE_MODELS = (
@@ -5023,9 +5027,6 @@ def _enrich_raw_stage_sql(
             "NULLIF(upper(left(a.state_code, 2)), '') AS archive_state_code, "
             "a.city_norm AS archive_city_norm, "
             "NULL::varchar AS archive_county_fips, "
-            "a.formatted_address::varchar AS archive_formatted_address, "
-            "a.formatted_address_version::smallint AS archive_formatted_address_version, "
-            "a.formatted_address_source::varchar AS archive_formatted_address_source, "
             "a.lat::numeric AS archive_lat, "
             "a.long::numeric AS archive_long, "
             "a.place_id::varchar AS archive_place_id"
@@ -5064,9 +5065,6 @@ def _enrich_raw_stage_sql(
             "NULL::varchar AS archive_state_code, "
             "NULL::varchar AS archive_city_norm, "
             "NULL::varchar AS archive_county_fips, "
-            "NULL::varchar AS archive_formatted_address, "
-            "NULL::smallint AS archive_formatted_address_version, "
-            "NULL::varchar AS archive_formatted_address_source, "
             "NULL::numeric AS archive_lat, "
             "NULL::numeric AS archive_long, "
             "NULL::varchar AS archive_place_id"
@@ -5117,9 +5115,6 @@ def _enrich_raw_stage_sql(
             premise_key,
             archive_identity_version,
             address_precision,
-            archive_formatted_address,
-            archive_formatted_address_version,
-            archive_formatted_address_source,
             archive_lat,
             archive_long,
             archive_place_id,
@@ -5155,17 +5150,6 @@ def _enrich_raw_stage_sql(
            address_source_mask = k.address_source_mask,
            address_role_id = k.address_role_id,
            location_confidence_id = k.location_confidence_id,
-           formatted_address = COALESCE(k.archive_formatted_address, r.formatted_address),
-           formatted_address_version = CASE
-               WHEN k.archive_formatted_address IS NOT NULL
-                   THEN k.archive_formatted_address_version
-               ELSE r.formatted_address_version
-           END,
-           formatted_address_source = CASE
-               WHEN k.archive_formatted_address IS NOT NULL
-                   THEN k.archive_formatted_address_source
-               ELSE r.formatted_address_source
-           END,
            lat = COALESCE(k.archive_lat, r.lat),
            long = COALESCE(k.archive_long, r.long),
            place_id = COALESCE(k.archive_place_id, r.place_id),
@@ -5542,24 +5526,6 @@ def _same_provider_field_aggregate(column_name: str, sql_type: str = "varchar") 
     return (
         f"(ARRAY_AGG({column_name} ORDER BY ({column_name} IS NULL), "
         f"source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::{sql_type} AS {column_name}"
-    )
-
-
-def _formatted_address_aggregate(
-    column_name: str,
-    sql_type: str = "varchar",
-) -> str:
-    """Select one coherent archive label field before legacy source values."""
-    field_order = (
-        "(formatted_address IS NULL), "
-        "((formatted_address_version IS NULL) AND "
-        "(formatted_address_source IS NULL)), "
-        "formatted_address_version DESC NULLS LAST, source_priority ASC, "
-        "updated_at DESC NULLS LAST, source_record_id ASC"
-    )
-    return (
-        f"(ARRAY_AGG({column_name} ORDER BY {field_order}))[1]::{sql_type} "
-        f"AS {column_name}"
     )
 
 
@@ -6082,7 +6048,6 @@ def _insert_raw_from_source_sql(
             {_contact_extension_expr("telephone_number")}::varchar AS phone_extension,
             {_canonical_contact_number_expr("fax_number", "country_code")}::varchar AS fax_number_digits,
             {_contact_extension_expr("fax_number")}::varchar AS fax_extension,
-            NULLIF(TRIM(formatted_address), '')::varchar AS formatted_address,
             lat::numeric AS lat,
             long::numeric AS long,
             date_added::date AS date_added,
@@ -6127,7 +6092,6 @@ def _insert_raw_from_source_sql(
             phone_extension,
             fax_number_digits,
             fax_extension,
-            formatted_address,
             lat,
             long,
             date_added,
@@ -6180,16 +6144,9 @@ def _insert_raw_from_source_sql(
         phone_extension,
         fax_number_digits,
         fax_extension,
-        {db_schema}.addr_formatted_address_v1(
-            first_line,
-            second_line,
-            city_name,
-            state_name,
-            postal_code,
-            country_code
-        ) AS formatted_address,
-        {ADDRESS_FORMAT_VERSION}::smallint AS formatted_address_version,
-        '{ADDRESS_FORMAT_SOURCE}'::varchar AS formatted_address_source,
+        NULL::varchar AS formatted_address,
+        NULL::smallint AS formatted_address_version,
+        NULL::varchar AS formatted_address_source,
         lat,
         long,
         date_added,
@@ -6438,9 +6395,6 @@ def _materialize_from_raw_sql(
             (ARRAY_AGG(phone_extension ORDER BY (phone_extension IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::varchar AS phone_extension,
             (ARRAY_AGG(fax_number_digits ORDER BY (fax_number_digits IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::varchar AS fax_number_digits,
             (ARRAY_AGG(fax_extension ORDER BY (fax_extension IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::varchar AS fax_extension,
-            {_formatted_address_aggregate("formatted_address")},
-            {_formatted_address_aggregate("formatted_address_version", "smallint")},
-            {_formatted_address_aggregate("formatted_address_source")},
             (ARRAY_AGG(lat ORDER BY (lat IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::numeric AS lat,
             (ARRAY_AGG(long ORDER BY (long IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::numeric AS long,
             MAX(date_added)::date AS date_added,
@@ -6514,9 +6468,16 @@ def _materialize_from_raw_sql(
         phone_extension,
         fax_number_digits,
         fax_extension,
-        formatted_address,
-        formatted_address_version,
-        formatted_address_source,
+        {db_schema}.{ADDRESS_FORMAT_FUNCTION}(
+            first_line,
+            second_line,
+            city_name,
+            state_name,
+            postal_code,
+            country_code
+        ) AS formatted_address,
+        {ADDRESS_FORMAT_VERSION}::smallint AS formatted_address_version,
+        '{ADDRESS_FORMAT_SOURCE}'::varchar AS formatted_address_source,
         lat,
         long,
         date_added,
@@ -6615,7 +6576,6 @@ def _materialize_sql(
             {_contact_extension_expr("telephone_number")}::varchar AS phone_extension,
             {_canonical_contact_number_expr("fax_number", "country_code")}::varchar AS fax_number_digits,
             {_contact_extension_expr("fax_number")}::varchar AS fax_extension,
-            NULLIF(TRIM(formatted_address), '')::varchar AS formatted_address,
             lat::numeric AS lat,
             long::numeric AS long,
             date_added::date AS date_added,
@@ -6654,7 +6614,6 @@ def _materialize_sql(
             phone_extension,
             fax_number_digits,
             fax_extension,
-            formatted_address,
             lat,
             long,
             date_added,
@@ -6718,7 +6677,6 @@ def _materialize_sql(
             (ARRAY_AGG(phone_extension ORDER BY (phone_extension IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::varchar AS phone_extension,
             (ARRAY_AGG(fax_number_digits ORDER BY (fax_number_digits IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::varchar AS fax_number_digits,
             (ARRAY_AGG(fax_extension ORDER BY (fax_extension IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::varchar AS fax_extension,
-            (ARRAY_AGG(formatted_address ORDER BY (formatted_address IS NULL), source_priority ASC, LENGTH(COALESCE(formatted_address, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS formatted_address,
             (ARRAY_AGG(lat ORDER BY (lat IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::numeric AS lat,
             (ARRAY_AGG(long ORDER BY (long IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::numeric AS long,
             MAX(date_added)::date AS date_added,
@@ -6762,7 +6720,7 @@ def _materialize_sql(
         phone_extension,
         fax_number_digits,
         fax_extension,
-        {db_schema}.addr_formatted_address_v1(
+        {db_schema}.{ADDRESS_FORMAT_FUNCTION}(
             first_line,
             second_line,
             city_name,
