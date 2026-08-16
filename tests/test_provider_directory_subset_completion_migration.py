@@ -17,12 +17,27 @@ MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
     / "alembic/versions/20260808190000_provider_directory_subset_completion_proof.py"
 )
+PUBLICATION_GUARD_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic/versions/20260816010000_provider_directory_terminal_publication_guard.py"
+)
 
 
 def _load_migration():
     spec = importlib.util.spec_from_file_location(
         "provider_directory_subset_completion_migration",
         MIGRATION_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    return migration
+
+
+def _load_publication_guard_migration():
+    spec = importlib.util.spec_from_file_location(
+        "provider_directory_terminal_publication_guard_migration",
+        PUBLICATION_GUARD_MIGRATION_PATH,
     )
     assert spec is not None and spec.loader is not None
     migration = importlib.util.module_from_spec(spec)
@@ -172,3 +187,90 @@ def test_downgrade_is_fail_closed_and_restores_legacy_guards(monkeypatch):
         "completion_proof_required_version",
     ]
     assert len(recorder.dropped_constraints) == len(migration._PARENT_CHECKS) + 1
+
+
+def _render_publication_guards(migration):
+    subset = migration._subset()
+    old_guard = migration._subset_guard_sql(
+        "subset_publication_test",
+        transition_only=False,
+    )
+    new_guard = migration._subset_guard_sql(
+        "subset_publication_test",
+        transition_only=True,
+    )
+    dataset_content = subset._subset_dataset_content_sql(
+        "subset_publication_test"
+    )
+    old_fragment = subset._subset_dataset_content_guard_sql(
+        dataset_content,
+        terminal_content_transition_only=False,
+    )
+    new_fragment = subset._subset_dataset_content_guard_sql(
+        dataset_content,
+        terminal_content_transition_only=True,
+    )
+    assert new_guard.count(new_fragment) == 1
+    assert new_guard.replace(new_fragment, old_fragment) == old_guard
+    return old_guard, new_guard
+
+
+def _record_publication_guard_action(monkeypatch, migration, action):
+    recorder = _Recorder()
+    monkeypatch.setattr(migration, "op", recorder)
+    getattr(migration, action)()
+    return recorder
+
+
+def _assert_publication_upgrade_contract(migration, upgrade, new_guard):
+    subset = migration._subset()
+    assert migration.revision == (
+        "20260816010000_provider_directory_terminal_publication_guard"
+    )
+    assert migration.down_revision == (
+        "20260815010000_address_formatted_display_v2"
+    )
+    assert upgrade.statements[0].startswith("LOCK TABLE")
+    assert "provider_directory_endpoint_dataset" in upgrade.statements[0]
+    assert "provider_directory_dataset_resource" in upgrade.statements[0]
+    assert "provider_directory_source" in upgrade.statements[0]
+    assert subset._dataset_resource_guard_sql(
+        "subset_publication_test", subset_aware=True
+    ) in upgrade.statements
+    assert new_guard in upgrade.statements
+    upgrade_sql = "\n".join(upgrade.statements)
+    assert "artifact_selection_receipt_json" in upgrade_sql
+    assert "content_proof_admission_version" in upgrade_sql
+    assert "provider_directory_subset_completion_schema_changed" in upgrade_sql
+    assert "provider_directory_endpoint_dataset_admission_legacy_surface_changed" in (
+        upgrade_sql
+    )
+    assert "tin_npi_connector_endpoint_dataset_guard_function_changed" in (
+        upgrade_sql
+    )
+    assert any(
+        "tin_npi_connector_dataset_resource_guard_changed" in statement
+        for statement in upgrade.statements
+    )
+    assert "provider_directory_rooted_graph" not in upgrade_sql
+
+
+def test_terminal_publication_guard_only_skips_sealed_content_rescan(monkeypatch):
+    """Change only the content check on terminal publication transitions."""
+
+    migration = _load_publication_guard_migration()
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "subset_publication_test")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    old_guard, new_guard = _render_publication_guards(migration)
+    upgrade = _record_publication_guard_action(
+        monkeypatch, migration, "upgrade"
+    )
+    _assert_publication_upgrade_contract(migration, upgrade, new_guard)
+    downgrade = _record_publication_guard_action(
+        monkeypatch, migration, "downgrade"
+    )
+    assert migration._subset()._dataset_resource_guard_sql(
+        "subset_publication_test", subset_aware=True
+    ) in downgrade.statements
+    assert old_guard in downgrade.statements
+    assert len(upgrade.statements) == len(downgrade.statements)

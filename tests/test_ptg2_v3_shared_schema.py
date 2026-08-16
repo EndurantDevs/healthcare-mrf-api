@@ -153,7 +153,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260815010000_address_formatted_display_v2"
+        "20260816010000_provider_directory_terminal_publication_guard"
     ]
 
 
