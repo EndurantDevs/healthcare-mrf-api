@@ -3373,6 +3373,31 @@ def _drop_subset_published_source_guard(schema: str) -> None:
     op.execute(f"DROP FUNCTION {guard_ref}();")
 
 
+def _subset_dataset_content_guard_sql(
+    dataset_content_sql: str,
+    *,
+    terminal_content_transition_only: bool,
+) -> str:
+    content_check_sql = f"""IF ({dataset_content_sql}) IS DISTINCT FROM TRUE THEN
+                RAISE EXCEPTION
+                    'provider_directory_subset_dataset_content_invalid'
+                    USING ERRCODE = '55000';
+            END IF;"""
+    if terminal_content_transition_only:
+        return f"""IF NEW.completion_proof_required_version = 3
+           AND OLD.status NOT IN ({_TERMINAL_STATUSES_SQL})
+           AND NEW.status IN ({_TERMINAL_STATUSES_SQL}) THEN
+            {content_check_sql}
+        END IF;"""
+    return f"""IF NEW.completion_proof_required_version = 3
+           AND NEW.status IN ({_TERMINAL_STATUSES_SQL})
+           AND ({dataset_content_sql}) IS DISTINCT FROM TRUE THEN
+            RAISE EXCEPTION
+                'provider_directory_subset_dataset_content_invalid'
+                USING ERRCODE = '55000';
+        END IF;"""
+
+
 def _subset_endpoint_dataset_guard_sql(
     schema: str,
     *,
@@ -3380,6 +3405,7 @@ def _subset_endpoint_dataset_guard_sql(
     reviewed_root_policy_aware: bool = False,
     reviewed_subset_profile_aware: bool = False,
     reviewed_subset_terminal_window_profile_aware: bool = False,
+    terminal_content_transition_only: bool = False,
 ) -> str:
     guard_ref = _qf(schema, _ENDPOINT_DATASET_GUARD)
     source_ref = _qf(schema, _SOURCE)
@@ -3445,6 +3471,10 @@ def _subset_endpoint_dataset_guard_sql(
         else f"({matched_twin_sql})"
     )
     dataset_content_sql = _subset_dataset_content_sql(schema)
+    dataset_content_guard_sql = _subset_dataset_content_guard_sql(
+        dataset_content_sql,
+        terminal_content_transition_only=terminal_content_transition_only,
+    )
     return f"""
     CREATE OR REPLACE FUNCTION {guard_ref}()
     RETURNS trigger
@@ -3562,13 +3592,7 @@ def _subset_endpoint_dataset_guard_sql(
                 USING ERRCODE = '55000';
         END IF;
 
-        IF NEW.completion_proof_required_version = 3
-           AND NEW.status IN ({_TERMINAL_STATUSES_SQL})
-           AND ({dataset_content_sql}) IS DISTINCT FROM TRUE THEN
-            RAISE EXCEPTION
-                'provider_directory_subset_dataset_content_invalid'
-                USING ERRCODE = '55000';
-        END IF;
+        {dataset_content_guard_sql}
 
         IF NEW.completion_proof_required_version = 3
            AND NEW.status IN ({_TERMINAL_STATUSES_SQL})

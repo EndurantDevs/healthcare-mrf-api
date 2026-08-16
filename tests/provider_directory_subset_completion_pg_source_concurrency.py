@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from tests.provider_directory_fhir_subset_abandonment_pg_support import (
+    create_abandonment_relations,
+)
 
 from tests.provider_directory_subset_completion_pg_concurrency import (
     create_committed_subset_schema,
@@ -15,6 +18,7 @@ from tests.provider_directory_subset_completion_pg_setup import (
     insert_subset_candidate,
     insert_valid_subset_resources,
     replace_subset_source,
+    run_subset_migration,
 )
 from tests.provider_directory_subset_completion_pg_support import (
     terminal_metadata,
@@ -24,6 +28,8 @@ from tests.provider_directory_subset_completion_pg_support import (
 )
 from tests.tin_npi_connector_postgres_support import (
     asyncpg,
+    install_admission_seal_terminal_predecessors,
+    load_admission_seal_migration,
     open_test_connection,
 )
 
@@ -66,9 +72,95 @@ def _source_mutation_sql(scenario, mutation_kind):
     """
 
 
-async def _create_validated_scenario(monkeypatch):
+async def _create_validated_scenario(monkeypatch, publication_migration=None):
+    """Create one sealed baseline and one validated publication candidate."""
+
     scenario = await create_committed_subset_schema(monkeypatch)
+    if publication_migration is not None:
+        await install_current_scoped_publication_surface(
+            scenario, publication_migration
+        )
+        await _configure_current_test_source(scenario)
+    else:
+        await replace_subset_source(scenario, _VERIFIED_STATUS)
+    trigger_rows = await _relation_trigger_states(
+        scenario, "provider_directory_endpoint_dataset"
+    )
+    await _set_relation_triggers_enabled(
+        scenario, "provider_directory_endpoint_dataset", trigger_rows, enabled=False
+    )
+    await _seed_validated_subset_pair(scenario)
+    await _set_relation_triggers_enabled(
+        scenario, "provider_directory_endpoint_dataset", trigger_rows, enabled=True
+    )
+    return scenario
+
+
+async def _relation_trigger_states(scenario, relation_name):
+    return await scenario.connection.fetch(
+        """
+        SELECT trigger_row.tgname, trigger_row.tgenabled::text AS tgenabled
+          FROM pg_catalog.pg_trigger AS trigger_row
+         WHERE trigger_row.tgrelid = $1::regclass
+           AND trigger_row.tgisinternal IS FALSE
+        """,
+        f"{scenario.schema}.{relation_name}",
+    )
+
+
+async def _set_relation_triggers_enabled(
+    scenario, relation_name, trigger_rows, *, enabled
+):
+    table = f'{scenario.quoted_schema}."{relation_name}"'
+    enable_clause_by_state = {
+        "A": "ENABLE ALWAYS",
+        "O": "ENABLE",
+        "R": "ENABLE REPLICA",
+    }
+    for trigger_row in trigger_rows:
+        trigger_name = str(trigger_row["tgname"]).replace('"', '""')
+        clause = "DISABLE"
+        if enabled:
+            state = str(trigger_row["tgenabled"])
+            clause = enable_clause_by_state.get(state)
+            if clause is None:
+                continue
+        await scenario.connection.execute(
+            f'ALTER TABLE {table} {clause} TRIGGER "{trigger_name}"'
+        )
+
+
+async def _configure_current_test_source(scenario):
+    trigger_rows = await _relation_trigger_states(
+        scenario, "provider_directory_source"
+    )
+    await _set_relation_triggers_enabled(
+        scenario, "provider_directory_source", trigger_rows, enabled=False
+    )
     await replace_subset_source(scenario, _VERIFIED_STATUS)
+    await scenario.connection.execute(
+        f"""
+        UPDATE {scenario.quoted_schema}.provider_directory_source
+           SET metadata_json = pg_catalog.jsonb_set(
+                   metadata_json::jsonb,
+                   '{{provider_directory_reviewed_subset_activation_v1}}',
+                   '{{
+                     "baseline": {{"dataset_id": "dataset-subset"}},
+                     "candidate": {{
+                       "dataset_id": "dataset-source-race-candidate"
+                     }}
+                   }}'::jsonb,
+                   true
+               )
+         WHERE source_id = 'synthetic-source'
+        """
+    )
+    await _set_relation_triggers_enabled(
+        scenario, "provider_directory_source", trigger_rows, enabled=True
+    )
+
+
+async def _seed_validated_subset_pair(scenario):
     evidence_pairs = valid_evidence_pairs()
     proof, proof_sha, replay, replay_sha = evidence_pairs
     await insert_subset_candidate(scenario)
@@ -105,7 +197,42 @@ async def _create_validated_scenario(monkeypatch):
             proof, proof_sha, candidate_metadata, "validated"
         ),
     )
-    return scenario
+
+
+async def install_current_scoped_publication_surface(
+    scenario,
+    publication_migration,
+):
+    """Install the scoped legacy/admission endpoint trigger surface."""
+
+    await create_abandonment_relations(scenario)
+    successor_files = (
+        "20260808200000_provider_directory_reviewed_subset_activation.py",
+        "20260808210000_provider_directory_subset_payload_guard_repair.py",
+        "20260809000000_provider_directory_subset_abandonment.py",
+        "20260809010000_provider_directory_effective_endpoint_identity.py",
+        "20260809030000_provider_directory_reviewed_root_policy.py",
+    )
+    async with scenario.connection.transaction():
+        for filename in successor_files:
+            migration = publication_migration._load_sibling(
+                filename,
+                "_publication_surface_" + filename.removesuffix(".py"),
+            )
+            await run_subset_migration(
+                migration,
+                "upgrade",
+                scenario.connection,
+            )
+        await install_admission_seal_terminal_predecessors(
+            scenario.connection,
+            scenario.quoted_schema,
+        )
+        await run_subset_migration(
+            load_admission_seal_migration(),
+            "upgrade",
+            scenario.connection,
+        )
 
 
 async def _assert_postgres_marker(task, marker):

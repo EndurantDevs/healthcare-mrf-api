@@ -13,6 +13,9 @@ from tests.provider_directory_subset_completion_pg_concurrency import (
     prove_concurrent_baseline_generation_is_unique,
 )
 from tests.provider_directory_subset_completion_pg_source_concurrency import (
+    _close_race_scenario,
+    _create_validated_scenario,
+    _publish_sql,
     prove_publication_source_mutations_are_serialized,
 )
 from tests.provider_directory_subset_completion_pg_evidence_cases import (
@@ -71,7 +74,13 @@ from tests.provider_directory_fhir_subset_abandonment_pg_cases import (
 from tests.provider_directory_effective_endpoint_pg_cases import (
     prove_effective_endpoint_activation_and_publication,
 )
-from tests.tin_npi_connector_postgres_support import TransactionalSchema
+from tests.tin_npi_connector_postgres_support import (
+    TransactionalSchema,
+    open_test_connection,
+)
+from tests.test_provider_directory_subset_completion_migration import (
+    _load_publication_guard_migration,
+)
 
 
 @pytest.mark.asyncio
@@ -181,6 +190,73 @@ async def test_subset_publication_source_mutations_are_serialized(monkeypatch):
     """Prove publication and source drift cannot race the sealed predicate."""
 
     await prove_publication_source_mutations_are_serialized(monkeypatch)
+
+
+async def _apply_publication_guard_migration(scenario, migration, action):
+    async with scenario.connection.transaction():
+        await run_subset_migration(migration, action, scenario.connection)
+
+
+async def _lock_subset_children(blocker, scenario):
+    await blocker.execute(
+        f"LOCK TABLE {scenario.quoted_schema}."
+        "provider_directory_dataset_resource IN ACCESS EXCLUSIVE MODE"
+    )
+
+
+async def _candidate_has_publication_state(scenario, status, is_current):
+    return await scenario.connection.fetchval(
+        f"SELECT status = $1 AND is_current = $2 "
+        f"FROM {scenario.quoted_schema}.provider_directory_endpoint_dataset "
+        "WHERE dataset_id = 'dataset-source-race-candidate'",
+        status, is_current,
+    )
+
+
+async def _prove_predecessor_guard_rescans(scenario, blocker):
+    async with blocker.transaction():
+        await _lock_subset_children(blocker, scenario)
+        with pytest.raises(asyncpg.QueryCanceledError):
+            async with scenario.connection.transaction():
+                await scenario.connection.execute(
+                    "SET LOCAL statement_timeout = '250ms'"
+                )
+                await scenario.connection.execute(_publish_sql(scenario))
+    assert await _candidate_has_publication_state(scenario, "validated", False)
+
+
+async def _prove_publication_skips_child_rescan(scenario, blocker):
+    async with blocker.transaction():
+        await _lock_subset_children(blocker, scenario)
+        async with scenario.connection.transaction():
+            await scenario.connection.execute("SET LOCAL statement_timeout = '1s'")
+            await scenario.connection.execute(_publish_sql(scenario))
+    assert await _candidate_has_publication_state(scenario, "published", True)
+
+
+@pytest.mark.asyncio
+async def test_terminal_publication_does_not_rescan_sealed_children(
+    monkeypatch,
+):
+    """Publish within one second while sealed child rows are inaccessible."""
+
+    publication_migration = _load_publication_guard_migration()
+    scenario = await _create_validated_scenario(monkeypatch, publication_migration)
+    blocker = await open_test_connection()
+    try:
+        for action in ("upgrade", "downgrade"):
+            await _apply_publication_guard_migration(
+                scenario, publication_migration, action
+            )
+        await _prove_predecessor_guard_rescans(scenario, blocker)
+        await _apply_publication_guard_migration(
+            scenario, publication_migration, "upgrade"
+        )
+        await prove_child_content_binding(scenario, valid_evidence_pairs())
+        await prove_terminal_parent_and_child_sealing(scenario)
+        await _prove_publication_skips_child_rescan(scenario, blocker)
+    finally:
+        await _close_race_scenario(scenario, blocker)
 
 
 @pytest.mark.asyncio
