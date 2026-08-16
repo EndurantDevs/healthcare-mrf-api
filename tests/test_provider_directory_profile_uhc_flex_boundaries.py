@@ -362,7 +362,7 @@ async def test_readiness_annotation_only_loads_exact_flex_dataset(
     }
     missing_dataset_row_by_field = {
         "source_id": UHC_FLEX_PRACTITIONER_SOURCE_ID,
-        "dataset_id": " ",
+        "dataset_id": "ordinary-dataset",
     }
     ready_dataset_row = _artifact_dataset_row()
     readiness_loader = AsyncMock(return_value=_readiness_record())

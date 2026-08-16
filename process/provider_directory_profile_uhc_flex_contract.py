@@ -55,9 +55,9 @@ from process.uhc_flex_practitioner_twin_store_contract import (
 
 
 UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS = (
-    "provider_directory_dataset_affiliation_organization",
     "provider_directory_dataset_insurance_plan",
     "provider_directory_dataset_network_plan",
+    "provider_directory_dataset_affiliation_organization",
     "provider_directory_dataset_resource",
     "provider_directory_rooted_graph_acquisition",
     "provider_directory_rooted_graph_dataset",

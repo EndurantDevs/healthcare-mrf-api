@@ -39,6 +39,12 @@ async def test_snapshot_database_queries_lock_all_selection_relations(monkeypatc
     assert advisory_call.kwargs["lock_identity"].endswith(
         "pdfhir_1ceb7c0986c320b7eb924881"
     )
+    relation_lock_sql = status.await_args_list[-1].args[0]
+    assert (
+        relation_lock_sql.index("provider_directory_dataset_insurance_plan")
+        < relation_lock_sql.index("provider_directory_dataset_network_plan")
+        < relation_lock_sql.index("provider_directory_dataset_affiliation_organization")
+    )
     assert all_rows.await_count == 2
 
 
