@@ -194,11 +194,6 @@ async def _assert_unified_alias_materialization(
             _UNIFIED_ALIAS_SOURCE_SQL.format(source_key=source_key),
         )
     )
-    await entity_address_unified._validate_raw_alias_integrity(
-        schema,
-        raw_table,
-        is_address_canon_available=True,
-    )
     await db.status(
         entity_address_unified._enrich_raw_stage_sql(
             schema,
@@ -206,6 +201,11 @@ async def _assert_unified_alias_materialization(
             archive_available=True,
             is_address_canon_available=True,
         )
+    )
+    await entity_address_unified._validate_raw_alias_integrity(
+        schema,
+        raw_table,
+        is_address_canon_available=True,
     )
     unified_row = await db.first(
         f"""

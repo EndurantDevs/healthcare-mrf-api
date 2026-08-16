@@ -66,6 +66,78 @@ def test_heartbeat_preserves_old_importer_progress():
     assert merged_by_field["phase"] == "entity-address-unified enriching raw"
 
 
+def test_alias_shard_progress_replaces_phase_without_regressing_outer_pct():
+    previous_by_field = {
+        "source": "entity-address-unified-sql-progress",
+        "unit": "sources",
+        "done": 257,
+        "total": 258,
+        "pct": 99.6,
+        "phase": "entity-address-unified loading sources",
+        "message": "loaded 257/258 sources",
+    }
+    incoming_by_field = {
+        "source": "entity-address-unified-sql-progress",
+        "unit": "shards",
+        "done": 0,
+        "total": 64,
+        "stage_id": "entity-address-unified-alias-integrity",
+        "stage_pct": 0.0,
+        "phase": "entity-address-unified validating aliases",
+        "message": "validating 64 alias-integrity shards",
+    }
+
+    live_progress._merge_previous_progress(
+        incoming_by_field,
+        previous_by_field,
+        now=dt.datetime.now(dt.UTC),
+    )
+
+    assert incoming_by_field["phase"] == "entity-address-unified validating aliases"
+    assert incoming_by_field["done"] == 0
+    assert incoming_by_field["total"] == 64
+    assert incoming_by_field["pct"] == 99.6
+
+
+def test_alias_shard_progress_rejects_delayed_completion():
+    previous_by_field = {
+        "source": "entity-address-unified-sql-progress",
+        "unit": "shards",
+        "done": 2,
+        "total": 4,
+        "pct": 99.6,
+        "stage_id": "entity-address-unified-alias-integrity",
+        "stage_pct": 50.0,
+        "elapsed_seconds": 10.0,
+        "eta_seconds": 10.0,
+        "phase": "entity-address-unified validating aliases",
+        "message": "validated 2/4 alias-integrity shards",
+    }
+    delayed_by_field = {
+        "source": "entity-address-unified-sql-progress",
+        "unit": "shards",
+        "done": 1,
+        "total": 4,
+        "stage_id": "entity-address-unified-alias-integrity",
+        "stage_pct": 25.0,
+        "elapsed_seconds": 6.0,
+        "eta_seconds": 18.0,
+        "phase": "entity-address-unified validating aliases",
+        "message": "validated 1/4 alias-integrity shards",
+    }
+
+    live_progress._merge_previous_progress(
+        delayed_by_field,
+        previous_by_field,
+        now=dt.datetime.now(dt.UTC),
+    )
+
+    assert delayed_by_field["done"] == 2
+    assert delayed_by_field["stage_pct"] == 50.0
+    assert delayed_by_field["elapsed_seconds"] == 10.0
+    assert delayed_by_field["eta_seconds"] == 10.0
+
+
 def test_nested_profile_progress_replaces_outer_publish_snapshot():
     """Accept exact inner batch state inside the monotonic outer envelope."""
     previous_by_field = {

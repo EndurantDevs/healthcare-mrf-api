@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import importlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -161,6 +163,7 @@ async def test_overlay_materialization_rejects_residual_source_keys(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_unified_raw_stage_rejects_alias_integrity_violation(monkeypatch):
+    context_by_field = {}
     violation = SimpleNamespace(
         violation_kind="multi_hop_alias",
         source_address_key="source-key",
@@ -177,7 +180,168 @@ async def test_unified_raw_stage_rejects_alias_integrity_violation(monkeypatch):
             "mrf",
             "entity_address_unified_raw_stage",
             is_address_canon_available=True,
+            context=context_by_field,
         )
+    assert context_by_field["phase_timings"][
+        "entity-address-unified validating aliases"
+    ]["count"] == 1
+
+
+def _assert_alias_integrity_progress(progress_events):
+    progress_events = sorted(progress_events, key=lambda event: event["done"])
+    expected_progress = [
+        (0, 4, 0.0),
+        (1, 4, 25.0),
+        (2, 4, 50.0),
+        (3, 4, 75.0),
+        (4, 4, 100.0),
+    ]
+    assert [
+        (event["done"], event["total"], event["stage_pct"])
+        for event in progress_events
+    ] == expected_progress
+    assert all("pct" not in event for event in progress_events)
+    assert {event["stage_id"] for event in progress_events} == {
+        "entity-address-unified-alias-integrity"
+    }
+    assert progress_events[1]["elapsed_seconds"] >= 0
+    assert progress_events[1]["eta_seconds"] >= 0
+    assert progress_events[-1]["eta_seconds"] == 0
+
+
+def _blocking_progress_capture(*, final_only):
+    progress_events = []
+    progress_started = threading.Event()
+    release_progress = threading.Event()
+
+    def capture_progress(**payload):
+        progress_events.append(payload)
+        if payload["done"] and (not final_only or payload["done"] == payload["total"]):
+            progress_started.set()
+            release_progress.wait(timeout=2)
+
+    return progress_events, progress_started, release_progress, capture_progress
+
+
+@pytest.mark.asyncio
+async def test_unified_raw_alias_integrity_shards_are_bounded_and_deterministic(monkeypatch):
+    later = SimpleNamespace(
+        violation_kind="source_identity_mismatch",
+        source_address_key="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        target_address_key="cccccccc-cccc-cccc-cccc-cccccccccccc",
+    )
+    earlier = SimpleNamespace(
+        violation_kind="source_identity_mismatch",
+        source_address_key="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        target_address_key="dddddddd-dddd-dddd-dddd-dddddddddddd",
+    )
+    violations = iter([None, later, earlier, None])
+    concurrency_by_field = {"active": 0, "max": 0}
+
+    async def first_result(_statement):
+        concurrency_by_field["active"] += 1
+        concurrency_by_field["max"] = max(
+            concurrency_by_field["max"], concurrency_by_field["active"]
+        )
+        await asyncio.sleep(0.001)
+        concurrency_by_field["active"] -= 1
+        return next(violations)
+
+    first = AsyncMock(side_effect=first_result)
+    progress_events, progress_started, release_progress, capture_progress = (
+        _blocking_progress_capture(final_only=True)
+    )
+    monkeypatch.setattr(entity_address_unified.db, "first", first)
+    monkeypatch.setattr(entity_address_unified, "write_live_progress", capture_progress)
+
+    validation = asyncio.create_task(
+        entity_address_unified._validate_raw_alias_integrity(
+            "mrf",
+            "entity_address_unified_raw_stage",
+            is_address_canon_available=True,
+            checksum_ranges=[(-4, -2), (-2, 0), (0, 2), (2, 4)],
+            concurrency=2,
+            run_id="run_alias",
+        )
+    )
+    assert await asyncio.to_thread(progress_started.wait, 2)
+    assert not validation.done()
+    release_progress.set()
+    with pytest.raises(RuntimeError, match=f"source={earlier.source_address_key}"):
+        await validation
+
+    assert first.await_count == 4
+    statements = [str(call.args[0]) for call in first.await_args_list]
+    assert "raw.checksum >= -4 AND raw.checksum < -2" in statements[0]
+    assert "raw.checksum >= 2 AND raw.checksum < 4" in statements[-1]
+    assert all("mrf.addr_key_v1(raw.first_line" in statement for statement in statements)
+    assert all(
+        "active.source_address_key IN" in statement
+        for statement in statements
+    )
+    assert concurrency_by_field["max"] == 2
+    _assert_alias_integrity_progress(progress_events)
+
+
+@pytest.mark.asyncio
+async def test_unified_raw_alias_integrity_drains_shards_before_database_error(monkeypatch):
+    completed_statements = []
+    progress_events, progress_started, release_progress, capture_progress = (
+        _blocking_progress_capture(final_only=False)
+    )
+
+    async def first_result(statement):
+        if "raw.checksum >= -4 AND raw.checksum < -2" in statement:
+            raise RuntimeError("synthetic database failure")
+        await asyncio.sleep(0.01)
+        completed_statements.append(statement)
+        return None
+
+    monkeypatch.setattr(
+        entity_address_unified.db,
+        "first",
+        AsyncMock(side_effect=first_result),
+    )
+
+    monkeypatch.setattr(entity_address_unified, "write_live_progress", capture_progress)
+
+    validation = asyncio.create_task(
+        entity_address_unified._validate_raw_alias_integrity(
+            "mrf",
+            "entity_address_unified_raw_stage",
+            is_address_canon_available=True,
+            checksum_ranges=[(-4, -2), (-2, 0), (0, 2), (2, 4)],
+            concurrency=4,
+            run_id="run_alias",
+        )
+    )
+    assert await asyncio.to_thread(progress_started.wait, 2)
+    assert not validation.done()
+    release_progress.set()
+    with pytest.raises(RuntimeError, match="synthetic database failure"):
+        await validation
+
+    assert len(completed_statements) == 3
+    assert len(progress_events) == 4
+
+
+@pytest.mark.asyncio
+async def test_reused_raw_alias_integrity_without_checksum_index_uses_one_query(monkeypatch):
+    has_table = AsyncMock(return_value=False)
+    monkeypatch.setattr(entity_address_unified, "_has_table", has_table)
+
+    checksum_ranges = await entity_address_unified._raw_alias_integrity_checksum_ranges(
+        "mrf",
+        "entity_address_unified_raw_stage",
+        [(-4, -2), (-2, 0), (0, 2), (2, 4)],
+        is_raw_stage_reused=True,
+    )
+
+    assert checksum_ranges == []
+    has_table.assert_awaited_once_with(
+        "mrf",
+        "entity_address_unified_raw_stage_idx_checksum",
+    )
 
 
 def test_unified_address_key_expression_supports_missing_canon():
