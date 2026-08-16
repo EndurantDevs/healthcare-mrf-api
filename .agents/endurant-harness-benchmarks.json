@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "benchmarks": {
+    "entity-address-alias-integrity": {
+      "command": {
+        "argv": [
+          "python3",
+          "-m",
+          "tests.entity_address_alias_integrity_benchmark"
+        ],
+        "timeout": 900,
+        "env": {
+          "DB_SCHEMA": "mrf",
+          "HLTHPRT_DB_DATABASE": "alias_integrity_test",
+          "HLTHPRT_DB_DRIVER": "asyncpg",
+          "HLTHPRT_DB_HOST": "alias-benchmark-postgres",
+          "HLTHPRT_DB_PASSWORD": "postgres",
+          "HLTHPRT_DB_POOL_MAX_SIZE": "32",
+          "HLTHPRT_DB_POOL_MIN_SIZE": "1",
+          "HLTHPRT_DB_PORT": "5432",
+          "HLTHPRT_DB_SCHEMA": "mrf",
+          "HLTHPRT_DB_USER": "postgres",
+          "HLTHPRT_ENTITY_ADDRESS_ALIAS_BENCHMARK_ROWS": "10000",
+          "PYTHONDONTWRITEBYTECODE": "1"
+        },
+        "evidence": "integration"
+      },
+      "source_files": [
+        "process/entity_address_unified.py"
+      ],
+      "workload_files": [
+        "tests/entity_address_alias_integrity_benchmark.py",
+        "tests/test_address_numeric_grid_alias_db.py",
+        "alembic/versions/20260611100000_address_canonical_foundation.py",
+        "alembic/versions/20260811100000_address_numeric_grid_alias.py",
+        "alembic/versions/20260816020000_address_evidence_alias.py",
+        "db/connection.py",
+        "process/ext/address_alias_sql.py",
+        "process/ext/address_format.py",
+        "process/ext/address_pub28.py",
+        "requirements-ci.lock"
+      ],
+      "correctness_keys": [
+        "clean_rows",
+        "deterministic_first_violation",
+        "enriched_digest",
+        "forced_failure_cleanup"
+      ],
+      "metric_schema": {
+        "alias_integrity_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "pipeline_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        }
+      },
+      "primary_metric": "pipeline_seconds",
+      "minimum_improvement_fraction": 0.3
+    }
+  }
+}
