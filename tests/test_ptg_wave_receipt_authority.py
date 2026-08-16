@@ -437,11 +437,7 @@ async def test_startup_accepts_rows_returned_by_sqlalchemy(monkeypatch):
         ).one()
     assert not isinstance(row, (list, tuple))
     session = _CoverageSession([[row], [row], []])
-    monkeypatch.setattr(
-        db,
-        "session",
-        lambda: _CoverageSessionContext(session),
-    )
+    monkeypatch.setattr(db, "session", lambda: _CoverageSessionContext(session))
 
     await assert_nonterminal_receipt_key_coverage(keyring=signer)
 
@@ -467,9 +463,11 @@ async def test_startup_retains_signer_for_each_abandoned_member_without_receipt(
         signing_by_key_id={},
         public_by_key_id={public_epoch.key_id: public_epoch},
     )
-    blocked_session = _CoverageSession(
-        [pinned_rows, [], [public_epoch.key_id]]
-    )
+    empty_session = _CoverageSession([[], [], []])
+    monkeypatch.setattr(db, "session", lambda: _CoverageSessionContext(empty_session))
+    await assert_nonterminal_receipt_key_coverage(keyring=public_only)
+
+    blocked_session = _CoverageSession([pinned_rows, [], [public_epoch.key_id]])
     monkeypatch.setattr(
         db,
         "session",
