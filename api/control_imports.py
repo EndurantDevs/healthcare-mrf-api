@@ -129,6 +129,7 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "payload": "control_wrapped",
         "target_module": "process.nucc",
         "target_function": "process_data",
+        "run_shutdown": True,
     },
     "code-sets": {
         "queue": "arq:CodeSets",
@@ -219,6 +220,7 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "payload": "control_wrapped",
         "target_module": "process.cms_doctors",
         "target_function": "process_data",
+        "run_shutdown": True,
     },
     "facility-anchors": {
         "queue": "arq:FacilityAnchors",
@@ -241,6 +243,7 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "payload": "control_wrapped",
         "target_module": "process.provider_enrichment",
         "target_function": "process_data",
+        "run_shutdown": True,
     },
     "provider-directory-fhir": {
         "queue": "arq:ProviderDirectoryFHIR",

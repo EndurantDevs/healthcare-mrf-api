@@ -34,6 +34,24 @@ _SHUTDOWN_METRICS_BY_NAME = {
     "preserve_control_run_finished_at": True,
 }
 
+_ADDRESS_SHUTDOWN_RESULT_BY_NAME = {
+    "address_resolve": {
+        "reason_buckets": {
+            "canonical_materializer_rust": 1,
+            "canonical_materializer_sql": 0,
+            "canonical_materialized_key_rows": 123,
+        }
+    },
+    "terminal_progress": {
+        "unit": "rows",
+        "done": 123,
+        "total": 123,
+        "pct": 100,
+        "message": "succeeded",
+        "phase": "provider-enrichment published",
+    },
+}
+
 
 def _assert_shutdown_terminal_metrics(terminal):
     metrics_by_name = terminal["metrics"]
@@ -54,6 +72,10 @@ def _assert_shutdown_terminal_metrics(terminal):
     }
     assert metrics_by_name["stage_index_timings"][0]["index"] == "primary_npi"
     assert terminal["progress"]["done"] == 123
+    assert terminal["progress"]["phase"] == "provider-enrichment published"
+    assert terminal["metrics"]["address_resolve"] == _ADDRESS_SHUTDOWN_RESULT_BY_NAME[
+        "address_resolve"
+    ]
     assert terminal["preserve_finished_at"] is True
 
 
@@ -288,6 +310,7 @@ async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
     async def fake_shutdown(ctx):
         calls.append(("shutdown", dict(ctx.get("context") or {}), None))
         ctx.setdefault("context", {}).update(_SHUTDOWN_METRICS_BY_NAME)
+        return _ADDRESS_SHUTDOWN_RESULT_BY_NAME
 
     class FakeModule:
         process_data = staticmethod(fake_target)

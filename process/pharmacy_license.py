@@ -1660,6 +1660,57 @@ async def _load_rows_from_socrata_source(
     )
 
 
+async def _fetch_ny_rosa_page(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    api_key: str,
+    *,
+    query_term: str,
+    page_number: int,
+    page_size: int,
+) -> tuple[Any, str | None, str | None]:
+    """Fetch and parse one New York ROSA response page."""
+    query_parameters_by_name = {
+        "name": query_term,
+        "pageNumber": str(page_number),
+        "pageSize": str(page_size),
+        "sortBy": "registrationNumber",
+        "sortDirection": "asc",
+    }
+    query_url = f"{base_url}?{urlencode(query_parameters_by_name)}"
+    try:
+        final_url, _content_type, raw = await _fetch_bytes(
+            session,
+            query_url,
+            max_bytes=PHARM_LICENSE_MAX_DOWNLOAD_BYTES,
+            headers={"x-oapi-key": api_key},
+        )
+    except Exception as exc:
+        return None, None, f"adapter_fetch_failed:{exc}"
+
+    try:
+        response_payload = json.loads(_decode_text(raw))
+    except Exception as exc:
+        return None, final_url, f"adapter_parse_failed:{exc}"
+    return response_payload.get("content"), final_url, None
+
+
+def _add_ny_rosa_page_rows(
+    rows_by_registration: dict[str, dict[str, Any]],
+    page_rows: list[Any],
+) -> None:
+    """Add unique registration records from one ROSA page up to the row bound."""
+    for license_record in page_rows:
+        if not isinstance(license_record, dict):
+            continue
+        registration = _safe_text(license_record.get("registrationNumber"))
+        if not registration or registration in rows_by_registration:
+            continue
+        rows_by_registration[registration] = _map_ny_rosa_row(license_record)
+        if len(rows_by_registration) >= PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
+            break
+
+
 async def _load_rows_from_ny_rosa_source(
     session: aiohttp.ClientSession,
     state_source: StateSource,
@@ -1689,46 +1740,24 @@ async def _load_rows_from_ny_rosa_source(
             break
         page_number = 0
         while page_number < page_limit and len(rows_by_registration) < PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
-            query_parameters_by_name = {
-                "name": term,
-                "pageNumber": str(page_number),
-                "pageSize": str(page_size),
-                "sortBy": "registrationNumber",
-                "sortDirection": "asc",
-            }
-            query_url = f"{base_url}?{urlencode(query_parameters_by_name)}"
-            try:
-                final_url, _content_type, raw = await _fetch_bytes(
-                    session,
-                    query_url,
-                    max_bytes=PHARM_LICENSE_MAX_DOWNLOAD_BYTES,
-                    headers={"x-oapi-key": api_key},
-                )
-            except Exception as exc:
-                return [], final_url, metadata, f"adapter_fetch_failed:{exc}"
-            requests_made += 1
-            pages_fetched += 1
-
-            try:
-                response_payload = json.loads(_decode_text(raw))
-            except Exception as exc:
-                return [], final_url, metadata, f"adapter_parse_failed:{exc}"
-
-            page_rows = response_payload.get("content")
+            page_rows, page_final_url, error = await _fetch_ny_rosa_page(
+                session,
+                base_url,
+                api_key,
+                query_term=term,
+                page_number=page_number,
+                page_size=page_size,
+            )
+            if page_final_url is not None:
+                final_url = page_final_url
+                requests_made += 1
+                pages_fetched += 1
+            if error is not None:
+                return [], final_url, metadata, error
             if not isinstance(page_rows, list) or not page_rows:
                 break
 
-            for license_record in page_rows:
-                if not isinstance(license_record, dict):
-                    continue
-                registration = _safe_text(license_record.get("registrationNumber"))
-                if not registration:
-                    continue
-                if registration in rows_by_registration:
-                    continue
-                rows_by_registration[registration] = _map_ny_rosa_row(license_record)
-                if len(rows_by_registration) >= PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
-                    break
+            _add_ny_rosa_page_rows(rows_by_registration, page_rows)
 
             if len(page_rows) < page_size:
                 break

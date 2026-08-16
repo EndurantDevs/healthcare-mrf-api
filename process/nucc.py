@@ -279,8 +279,10 @@ async def startup(ctx):
 
 async def publish_nucc_generation(ctx):
     """Finalize the NUCC run and release worker resources."""
-    import_date = ctx['import_date']
     context = ctx.get("context") or {}
+    if not context.get("run"):
+        return
+    import_date = ctx['import_date']
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
     await ensure_database(bool(context.get("test_mode")))
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
@@ -314,22 +316,25 @@ async def publish_nucc_generation(ctx):
                             f"{db_schema}.{table_model.__tablename__}_idx_primary RENAME TO "
                             f"{table}_idx_primary;")
 
+    terminal_progress_by_name = {
+        "unit": "rows",
+        "done": stage_rows,
+        "total": stage_rows,
+        "pct": 100,
+        "message": "succeeded",
+        "phase": "nucc published",
+    }
+    terminal_metrics_by_name = {"rows": stage_rows}
     await mark_control_run(
         run_id,
         status="succeeded",
         phase_detail="nucc published",
         progress_message="succeeded",
-        progress={
-            "unit": "rows",
-            "done": stage_rows,
-            "total": stage_rows,
-            "pct": 100,
-            "message": "succeeded",
-            "phase": "nucc published",
-        },
-        metrics={"rows": stage_rows},
+        progress=terminal_progress_by_name,
+        metrics=terminal_metrics_by_name,
     )
     print_time_info(ctx['context']['start'])
+    return {**terminal_metrics_by_name, "terminal_progress": terminal_progress_by_name}
 
 
 shutdown = publish_nucc_generation

@@ -92,6 +92,57 @@ CENSUS_PROFILE_FIELDS = (
     "provider_density_per_1000",
 )
 
+CENSUS_PROFILE_COLUMNS = (
+    geo_census_table.c.total_population,
+    geo_census_table.c.median_household_income,
+    geo_census_table.c.bachelors_degree_or_higher_pct,
+    geo_census_table.c.employment_rate_pct,
+    geo_census_table.c.total_housing_units,
+    geo_census_table.c.without_health_insurance_pct,
+    geo_census_table.c.total_employer_establishments,
+    geo_census_table.c.business_employment,
+    geo_census_table.c.business_payroll_annual_k,
+    geo_census_table.c.total_households,
+    geo_census_table.c.hispanic_or_latino,
+    geo_census_table.c.hispanic_or_latino_pct,
+    geo_census_table.c.poverty_rate_pct,
+    geo_census_table.c.median_age,
+    geo_census_table.c.unemployment_rate_pct,
+    geo_census_table.c.labor_force_participation_pct,
+    geo_census_table.c.vacancy_rate_pct,
+    geo_census_table.c.median_home_value,
+    geo_census_table.c.median_gross_rent,
+    geo_census_table.c.commute_mean_minutes,
+    geo_census_table.c.commute_mode_drove_alone_pct,
+    geo_census_table.c.commute_mode_carpool_pct,
+    geo_census_table.c.commute_mode_public_transit_pct,
+    geo_census_table.c.commute_mode_walked_pct,
+    geo_census_table.c.commute_mode_worked_from_home_pct,
+    geo_census_table.c.broadband_access_pct,
+    geo_census_table.c.race_white_alone,
+    geo_census_table.c.race_black_or_african_american_alone,
+    geo_census_table.c.race_american_indian_and_alaska_native_alone,
+    geo_census_table.c.race_asian_alone,
+    geo_census_table.c.race_native_hawaiian_and_other_pacific_islander_alone,
+    geo_census_table.c.race_some_other_race_alone,
+    geo_census_table.c.race_two_or_more_races,
+    geo_census_table.c.race_white_alone_pct,
+    geo_census_table.c.race_black_or_african_american_alone_pct,
+    geo_census_table.c.race_american_indian_and_alaska_native_alone_pct,
+    geo_census_table.c.race_asian_alone_pct,
+    geo_census_table.c.race_native_hawaiian_and_other_pacific_islander_alone_pct,
+    geo_census_table.c.race_some_other_race_alone_pct,
+    geo_census_table.c.race_two_or_more_races_pct,
+    geo_census_table.c.acs_white_alone_pct,
+    geo_census_table.c.acs_black_or_african_american_alone_pct,
+    geo_census_table.c.acs_american_indian_and_alaska_native_alone_pct,
+    geo_census_table.c.acs_asian_alone_pct,
+    geo_census_table.c.acs_native_hawaiian_and_other_pacific_islander_alone_pct,
+    geo_census_table.c.acs_some_other_race_alone_pct,
+    geo_census_table.c.acs_two_or_more_races_pct,
+    geo_census_table.c.acs_hispanic_or_latino_pct,
+)
+
 
 def _get_session(request):
     session = getattr(request.ctx, "sa_session", None)
@@ -263,56 +314,7 @@ async def _lookup_census_profile(session, zip_code):
     """Return census, SVI, and provider-density data for a ZIP when available."""
 
     stmt = (
-        select(
-            geo_census_table.c.total_population,
-            geo_census_table.c.median_household_income,
-            geo_census_table.c.bachelors_degree_or_higher_pct,
-            geo_census_table.c.employment_rate_pct,
-            geo_census_table.c.total_housing_units,
-            geo_census_table.c.without_health_insurance_pct,
-            geo_census_table.c.total_employer_establishments,
-            geo_census_table.c.business_employment,
-            geo_census_table.c.business_payroll_annual_k,
-            geo_census_table.c.total_households,
-            geo_census_table.c.hispanic_or_latino,
-            geo_census_table.c.hispanic_or_latino_pct,
-            geo_census_table.c.poverty_rate_pct,
-            geo_census_table.c.median_age,
-            geo_census_table.c.unemployment_rate_pct,
-            geo_census_table.c.labor_force_participation_pct,
-            geo_census_table.c.vacancy_rate_pct,
-            geo_census_table.c.median_home_value,
-            geo_census_table.c.median_gross_rent,
-            geo_census_table.c.commute_mean_minutes,
-            geo_census_table.c.commute_mode_drove_alone_pct,
-            geo_census_table.c.commute_mode_carpool_pct,
-            geo_census_table.c.commute_mode_public_transit_pct,
-            geo_census_table.c.commute_mode_walked_pct,
-            geo_census_table.c.commute_mode_worked_from_home_pct,
-            geo_census_table.c.broadband_access_pct,
-            geo_census_table.c.race_white_alone,
-            geo_census_table.c.race_black_or_african_american_alone,
-            geo_census_table.c.race_american_indian_and_alaska_native_alone,
-            geo_census_table.c.race_asian_alone,
-            geo_census_table.c.race_native_hawaiian_and_other_pacific_islander_alone,
-            geo_census_table.c.race_some_other_race_alone,
-            geo_census_table.c.race_two_or_more_races,
-            geo_census_table.c.race_white_alone_pct,
-            geo_census_table.c.race_black_or_african_american_alone_pct,
-            geo_census_table.c.race_american_indian_and_alaska_native_alone_pct,
-            geo_census_table.c.race_asian_alone_pct,
-            geo_census_table.c.race_native_hawaiian_and_other_pacific_islander_alone_pct,
-            geo_census_table.c.race_some_other_race_alone_pct,
-            geo_census_table.c.race_two_or_more_races_pct,
-            geo_census_table.c.acs_white_alone_pct,
-            geo_census_table.c.acs_black_or_african_american_alone_pct,
-            geo_census_table.c.acs_american_indian_and_alaska_native_alone_pct,
-            geo_census_table.c.acs_asian_alone_pct,
-            geo_census_table.c.acs_native_hawaiian_and_other_pacific_islander_alone_pct,
-            geo_census_table.c.acs_some_other_race_alone_pct,
-            geo_census_table.c.acs_two_or_more_races_pct,
-            geo_census_table.c.acs_hispanic_or_latino_pct,
-        )
+        select(*CENSUS_PROFILE_COLUMNS)
         .where(geo_census_table.c.zip_code == zip_code)
     )
     try:
@@ -742,6 +744,46 @@ async def list_geo_states(request):
     )
 
 
+async def _query_state_city_items(session, state, offset, limit):
+    city_statement = (
+        select(
+            geo_zip_table.c.city.label("city"),
+            geo_zip_table.c.state.label("state"),
+            func.count(geo_zip_table.c.zip_code).label("zip_count"),
+            func.sum(func.coalesce(geo_zip_table.c.population, 0)).label("population"),
+            func.avg(geo_zip_table.c.latitude).label("avg_lat"),
+            func.avg(geo_zip_table.c.longitude).label("avg_long"),
+        )
+        .where(geo_zip_table.c.state == state)
+        .group_by(geo_zip_table.c.city, geo_zip_table.c.state)
+        .order_by(
+            func.sum(func.coalesce(geo_zip_table.c.population, 0)).desc(),
+            geo_zip_table.c.city.asc(),
+        )
+        .offset(offset)
+        .limit(limit)
+    )
+    city_result = await session.execute(city_statement)
+    city_rows = [
+        _row_mapping(city_row)
+        for city_row in city_result.all()
+        if _row_mapping(city_row)
+    ]
+    city_items = []
+    for city_row in city_rows:
+        city_items.append(
+            {
+                "city": city_row.get("city"),
+                "state": city_row.get("state"),
+                "zip_count": int(city_row.get("zip_count") or 0),
+                "population": int(city_row.get("population") or 0),
+                "avg_lat": city_row.get("avg_lat"),
+                "avg_long": city_row.get("avg_long"),
+            }
+        )
+    return city_items
+
+
 @blueprint.get('/state/<state>/cities', name='get_top_cities_by_state')
 async def get_top_cities_by_state(request, state):
     """List paginated city aggregates for a two-letter state code."""
@@ -776,46 +818,9 @@ async def get_top_cities_by_state(request, state):
     total_result = await session.execute(total_stmt)
     total = int(total_result.scalar() or 0)
 
-    stmt = (
-        select(
-            geo_zip_table.c.city.label("city"),
-            geo_zip_table.c.state.label("state"),
-            func.count(geo_zip_table.c.zip_code).label("zip_count"),
-            func.sum(func.coalesce(geo_zip_table.c.population, 0)).label("population"),
-            func.avg(geo_zip_table.c.latitude).label("avg_lat"),
-            func.avg(geo_zip_table.c.longitude).label("avg_long"),
-        )
-        .where(geo_zip_table.c.state == state)
-        .group_by(geo_zip_table.c.city, geo_zip_table.c.state)
-        .order_by(
-            func.sum(func.coalesce(geo_zip_table.c.population, 0)).desc(),
-            geo_zip_table.c.city.asc(),
-        )
-        .offset(offset)
-        .limit(limit)
-    )
-
-    city_result = await session.execute(stmt)
-    city_rows = [
-        _row_mapping(city_row)
-        for city_row in city_result.all()
-        if _row_mapping(city_row)
-    ]
-    if not city_rows:
+    city_items = await _query_state_city_items(session, state, offset, limit)
+    if not city_items:
         return response.json({"error": "Not found"}, status=404)
-
-    city_items = []
-    for city_row in city_rows:
-        city_items.append(
-            {
-                "city": city_row.get("city"),
-                "state": city_row.get("state"),
-                "zip_count": int(city_row.get("zip_count") or 0),
-                "population": int(city_row.get("population") or 0),
-                "avg_lat": city_row.get("avg_lat"),
-                "avg_long": city_row.get("avg_long"),
-            }
-        )
 
     return response.json(
         {

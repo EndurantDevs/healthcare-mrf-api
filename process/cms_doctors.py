@@ -38,6 +38,14 @@ DEFAULT_DOCTORS_DATASET_ID = os.getenv("HLTHPRT_CMS_DOCTORS_DATASET_ID", "mj5m-p
 DEFAULT_BATCH_SIZE = 10_000
 DEFAULT_MIN_ROWS = 10_000
 DEFAULT_TEST_ROWS = 5000
+CMS_DOCTORS_ADDRESS_FIELDS = {
+    "first_line": "address_line1",
+    "second_line": "address_line2",
+    "city": "city",
+    "state": "state",
+    "zip": "zip_code",
+    "country": "'US'",
+}
 
 
 def _stage_index_name(stage_table: str, index_name: str) -> str:
@@ -350,68 +358,32 @@ async def startup(ctx):
     logger.info("CMS Doctors startup ready: schema=%s import_date=%s", db_schema, import_date)
 
 
-async def publish_cms_doctors_generation(ctx):
-    """Publish a completed CMS Doctors stage or record its terminal failure."""
+async def _resolve_cms_doctors_addresses(ctx, stage_cls, db_schema: str):
+    if not source_enabled("cms_doctors"):
+        return None
 
-    import_date = ctx.get("import_date")
-    context = ctx.get("context") or {}
-    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
+    async def _cancel_check():
+        await raise_if_cancelled(ctx, {})
 
-    if not context.get("run"):
-        logger.info("No CMS Doctors jobs ran; skipping shutdown.")
-        return
+    await stamp_address_keys(
+        stage_cls.__tablename__,
+        CMS_DOCTORS_ADDRESS_FIELDS,
+        schema=db_schema,
+        cancel_check=_cancel_check,
+    )
+    address_stats = await resolve_into_archive(
+        stage_cls.__tablename__,
+        CMS_DOCTORS_ADDRESS_FIELDS,
+        source_bit=2,
+        priority=1,
+        schema=db_schema,
+        cancel_check=_cancel_check,
+    )
+    logger.info("CMS Doctors canonical address resolve complete: %s", address_stats)
+    return address_stats
 
-    await ensure_database(bool(context.get("test_mode")))
 
-    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
-    stage_cls = make_class(DoctorClinicianAddress, import_date)
-
-    stage_rows = int(await db.scalar(
-        f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};"
-    ) or 0)
-
-    if context.get("test_mode"):
-        logger.info("CMS Doctors test mode: staged rows=%d", stage_rows)
-    elif stage_rows < DEFAULT_MIN_ROWS:
-        raise RuntimeError(
-            f"CMS Doctors stage row count {stage_rows} below minimum {DEFAULT_MIN_ROWS}; aborting."
-        )
-
-    address_stats = None
-    if source_enabled("cms_doctors"):
-        async def _cancel_check():
-            await raise_if_cancelled(ctx, {})
-
-        await stamp_address_keys(
-            stage_cls.__tablename__,
-            {
-                "first_line": "address_line1",
-                "second_line": "address_line2",
-                "city": "city",
-                "state": "state",
-                "zip": "zip_code",
-                "country": "'US'",
-            },
-            schema=db_schema,
-            cancel_check=_cancel_check,
-        )
-        address_stats = await resolve_into_archive(
-            stage_cls.__tablename__,
-            {
-                "first_line": "address_line1",
-                "second_line": "address_line2",
-                "city": "city",
-                "state": "state",
-                "zip": "zip_code",
-                "country": "'US'",
-            },
-            source_bit=2,
-            priority=1,
-            schema=db_schema,
-            cancel_check=_cancel_check,
-        )
-        logger.info("CMS Doctors canonical address resolve complete: %s", address_stats)
-
+async def _publish_cms_doctors_stage(stage_cls, db_schema: str) -> None:
     async with db.transaction():
         table = DoctorClinicianAddress.__main_table__
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
@@ -446,18 +418,59 @@ async def publish_cms_doctors_generation(ctx):
                     f"RENAME TO {old_live_name};"
                 )
 
+
+async def publish_cms_doctors_generation(ctx):
+    """Publish a completed CMS Doctors stage or record its terminal failure."""
+    import_date = ctx.get("import_date")
+    context = ctx.get("context") or {}
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
+    if not context.get("run"):
+        logger.info("No CMS Doctors jobs ran; skipping shutdown.")
+        return
+
+    await ensure_database(bool(context.get("test_mode")))
+    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    stage_cls = make_class(DoctorClinicianAddress, import_date)
+    stage_rows = int(
+        await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};")
+        or 0
+    )
+    if context.get("test_mode"):
+        logger.info("CMS Doctors test mode: staged rows=%d", stage_rows)
+    elif stage_rows < DEFAULT_MIN_ROWS:
+        raise RuntimeError(
+            f"CMS Doctors stage row count {stage_rows} below minimum {DEFAULT_MIN_ROWS}; aborting."
+        )
+
+    address_stats = await _resolve_cms_doctors_addresses(ctx, stage_cls, db_schema)
+    await _publish_cms_doctors_stage(stage_cls, db_schema)
+
     logger.info("CMS Doctors publish complete: %d rows", stage_rows)
     print_time_info(context.get("start"))
+    terminal_progress_by_name = {
+        "unit": "rows",
+        "done": stage_rows,
+        "total": stage_rows,
+        "pct": 100,
+        "message": "succeeded",
+        "phase": "cms-doctors published",
+    }
+    terminal_metrics_by_name = {
+        "rows": stage_rows,
+        **({"address_resolve": address_stats.__dict__} if address_stats else {}),
+    }
     await mark_control_run(
         run_id,
         status="succeeded",
         phase_detail="cms-doctors published",
         progress_message="succeeded",
-        metrics={
-            "rows": stage_rows,
-            **({"address_resolve": address_stats.__dict__} if address_stats else {}),
-        },
+        progress=terminal_progress_by_name,
+        metrics=terminal_metrics_by_name,
     )
+    return {
+        **terminal_metrics_by_name,
+        "terminal_progress": terminal_progress_by_name,
+    }
 
 
 shutdown = publish_cms_doctors_generation
