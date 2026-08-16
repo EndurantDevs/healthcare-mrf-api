@@ -2354,7 +2354,7 @@ async def _complete_provider_enrichment_run(
     stage_count_by_table: dict[str, int],
     summary_rows: int,
     address_stat_by_source: dict[str, Any],
-) -> None:
+) -> dict[str, Any]:
     audit = context.get("audit", {})
     metrics_by_name = {
         "stage_rows": stage_count_by_table,
@@ -2367,21 +2367,23 @@ async def _complete_provider_enrichment_run(
     }
     if address_stat_by_source:
         metrics_by_name["address_resolve"] = address_stat_by_source
+    progress_by_name = {
+        "unit": "tables",
+        "done": len(PROCESSING_CLASSES),
+        "total": len(PROCESSING_CLASSES),
+        "pct": 100,
+        "message": "succeeded",
+        "phase": "provider-enrichment published",
+    }
     await mark_control_run(
         run_id,
         status="succeeded",
         phase_detail="provider-enrichment published",
         progress_message="succeeded",
-        progress={
-            "unit": "tables",
-            "done": len(PROCESSING_CLASSES),
-            "total": len(PROCESSING_CLASSES),
-            "pct": 100,
-            "message": "succeeded",
-            "phase": "provider-enrichment published",
-        },
+        progress=progress_by_name,
         metrics=metrics_by_name,
     )
+    return {**metrics_by_name, "terminal_progress": progress_by_name}
 
 
 async def _materialize_provider_enrichment_summary(
@@ -2455,7 +2457,7 @@ async def publish_provider_enrichment_tables(
     run_id = str(
         context.get("control_run_id") or ctx.get("control_run_id") or ""
     ).strip()
-    await _complete_provider_enrichment_run(
+    terminal_result = await _complete_provider_enrichment_run(
         run_id,
         context,
         stage_count_by_table,
@@ -2463,6 +2465,7 @@ async def publish_provider_enrichment_tables(
         address_stat_by_source,
     )
     print_time_info(context.get("start"))
+    return terminal_result
 
 
 shutdown = publish_provider_enrichment_tables

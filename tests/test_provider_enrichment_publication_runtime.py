@@ -206,7 +206,7 @@ async def test_complete_run_reports_optional_address_stats(monkeypatch, address_
         }
     }
 
-    await enrichment._complete_provider_enrichment_run(
+    terminal_result = await enrichment._complete_provider_enrichment_run(
         "run-enrichment",
         context_map,
         {"hospital": 4},
@@ -221,6 +221,10 @@ async def test_complete_run_reports_optional_address_stats(monkeypatch, address_
     assert metrics_by_name["rows_accepted"] == 4
     assert metrics_by_name["rows_dropped_missing_npi"] == 1
     assert ("address_resolve" in metrics_by_name) is bool(address_stats_by_source)
+    assert terminal_result == {
+        **metrics_by_name,
+        "terminal_progress": mark_run.await_args.kwargs["progress"],
+    }
 
 
 @pytest.mark.asyncio
@@ -241,6 +245,10 @@ def _install_publish_orchestration(monkeypatch, event_names):
         event_names.append(name)
         return returned_value
 
+    terminal_receipt_by_field = {
+        "address_resolve": {"hospital": {"resolved": 4}},
+        "terminal_progress": {"phase": "provider-enrichment published"},
+    }
     step_fields = (
         ("ensure_database", "ensure", None),
         ("_provider_enrichment_staging_tables", "staging", {"hospital": SimpleNamespace()}),
@@ -250,19 +258,20 @@ def _install_publish_orchestration(monkeypatch, event_names):
         ("_create_provider_enrichment_indexes", "indexes", None),
         ("_refresh_all_enrichment_statistics", "statistics", None),
         ("_publish_provider_enrichment_tables", "publish", None),
-        ("_complete_provider_enrichment_run", "complete", None),
+        ("_complete_provider_enrichment_run", "complete", terminal_receipt_by_field),
     )
     for attribute_name, event_name, returned_value in step_fields:
         async def step(*_args, _name=event_name, _value=returned_value, **_kwargs):
             return await async_event(_name, _value)
 
         monkeypatch.setattr(enrichment, attribute_name, step)
+    return terminal_receipt_by_field
 
 
 @pytest.mark.asyncio
 async def test_shutdown_publishes_in_exact_orchestration_order(monkeypatch):
     event_names = []
-    _install_publish_orchestration(monkeypatch, event_names)
+    terminal_receipt = _install_publish_orchestration(monkeypatch, event_names)
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "provider_test")
     monkeypatch.setattr(
         enrichment,
@@ -280,7 +289,7 @@ async def test_shutdown_publishes_in_exact_orchestration_order(monkeypatch):
         },
     }
 
-    await enrichment.shutdown(worker_context_map)
+    terminal_result = await enrichment.shutdown(worker_context_map)
 
     assert event_names == [
         "ensure",
@@ -294,3 +303,4 @@ async def test_shutdown_publishes_in_exact_orchestration_order(monkeypatch):
         "complete",
         "time:started-at",
     ]
+    assert terminal_result == terminal_receipt

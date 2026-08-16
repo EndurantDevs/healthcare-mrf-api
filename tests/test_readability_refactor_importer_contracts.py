@@ -367,7 +367,14 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
         __tablename__="doctor_stage",
         __my_additional_indexes__=({"name": "site", "index_elements": ("state",)},),
     )
-    address_stats = SimpleNamespace(scanned=4)
+    address_stats = SimpleNamespace(
+        scanned=4,
+        reason_buckets={
+            "canonical_materializer_rust": 1,
+            "canonical_materializer_sql": 0,
+            "canonical_materialized_key_rows": 4,
+        },
+    )
     monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
     monkeypatch.setattr(cms_doctors, "make_class", lambda *_args: stage)
     monkeypatch.setattr(cms_doctors.db, "scalar", AsyncMock(return_value=4))
@@ -380,14 +387,20 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     monkeypatch.setattr(cms_doctors, "mark_control_run", marked)
     monkeypatch.setattr(cms_doctors, "print_time_info", lambda _value: None)
 
-    await cms_doctors.publish_cms_doctors_generation(
+    terminal_result = await cms_doctors.publish_cms_doctors_generation(
         {"import_date": "run", "context": {"run": 1, "test_mode": True, "control_run_id": "control", "start": "started"}}
     )
 
     sql_statement_list = [call.args[0] for call in status.await_args_list]
     assert any("doctor_clinician_address_old" in statement for statement in sql_statement_list)
     assert any("doctor_stage_idx_site" in statement for statement in sql_statement_list)
-    assert marked.await_args.kwargs["metrics"] == {"rows": 4, "address_resolve": {"scanned": 4}}
+    assert terminal_result["address_resolve"] == address_stats.__dict__
+    assert terminal_result["terminal_progress"]["phase"] == "cms-doctors published"
+    assert marked.await_args.kwargs["metrics"] == {
+        "rows": 4,
+        "address_resolve": address_stats.__dict__,
+    }
+    assert marked.await_args.kwargs["progress"] == terminal_result["terminal_progress"]
 
 
 @pytest.mark.asyncio
@@ -483,4 +496,3 @@ async def test_cms_startup_and_entrypoint_build_stage_and_enqueue_exact_task(mon
     pool.enqueue_job.assert_awaited_once_with(
         "process_data", {"test_mode": True}, _queue_name=cms_doctors.CMS_DOCTORS_QUEUE_NAME
     )
-

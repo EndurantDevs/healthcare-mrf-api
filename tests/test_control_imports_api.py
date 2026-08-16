@@ -388,6 +388,13 @@ def test_control_wrapped_publish_importers_request_shutdown():
         == "https://raw.githubusercontent.com/hltiunn/provider-directory-db/main/data/retest_results.json"
     )
     assert npi_payload["run_shutdown"] is True
+    for importer in ("nucc", "cms-doctors", "provider-enrichment"):
+        shutdown_payload_by_field = control_imports._adapter_payload(
+            control_imports._SINGLE_JOB_ADAPTERS[importer],
+            {"run_id": f"run_{importer}", "importer": importer},
+            {},
+        )
+        assert shutdown_payload_by_field["run_shutdown"] is True
 
 
 def test_provider_directory_adapter_scopes_retry_lineage():

@@ -477,22 +477,13 @@ async def startup(ctx):
     )
 
 
-async def publish_medicare_enrollment_generation(ctx):
-    """Publish a completed Medicare enrollment import."""
-    import_date = ctx.get("import_date")
-    context = ctx.get("context") or {}
-    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
-
-    if not context.get("run"):
-        logger.info("No Medicare Enrollment jobs ran; skipping shutdown.")
-        return
-
-    await ensure_database(bool(context.get("test_mode")))
-
-    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
-    county_stage_cls = make_class(MedicareEnrollmentCountyStats, import_date)
-    zip_stage_cls = make_class(MedicareEnrollmentStats, import_date)
-
+async def _validate_medicare_enrollment_stage_counts(
+    db_schema: str,
+    county_stage_cls,
+    zip_stage_cls,
+    context: dict,
+) -> tuple[int, int, int, float]:
+    """Count staged rows and reject incomplete production generations."""
     county_stage_rows = int(
         await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{county_stage_cls.__tablename__};") or 0
     )
@@ -531,6 +522,34 @@ async def publish_medicare_enrollment_generation(ctx):
             "Medicare Enrollment unmatched county ratio "
             f"{unmatched_ratio:.3f} above maximum {max_unmatched_ratio:.2f}; aborting."
         )
+
+    return county_stage_rows, zip_stage_rows, unmatched_counties, unmatched_ratio
+
+
+async def publish_medicare_enrollment_generation(ctx):
+    """Publish a completed Medicare enrollment import."""
+    import_date = ctx.get("import_date")
+    context = ctx.get("context") or {}
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
+
+    if not context.get("run"):
+        logger.info("No Medicare Enrollment jobs ran; skipping shutdown.")
+        return
+
+    await ensure_database(bool(context.get("test_mode")))
+
+    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
+    county_stage_cls = make_class(MedicareEnrollmentCountyStats, import_date)
+    zip_stage_cls = make_class(MedicareEnrollmentStats, import_date)
+
+    county_stage_rows, zip_stage_rows, unmatched_counties, unmatched_ratio = (
+        await _validate_medicare_enrollment_stage_counts(
+            db_schema,
+            county_stage_cls,
+            zip_stage_cls,
+            context,
+        )
+    )
 
     async with db.transaction():
         await _publish_stage_table(db_schema, MedicareEnrollmentCountyStats, county_stage_cls)

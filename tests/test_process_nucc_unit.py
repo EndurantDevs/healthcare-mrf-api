@@ -149,8 +149,10 @@ async def test_shutdown_rotates_tables(monkeypatch, nucc_module):
 
     status_calls = []
     monkeypatch.setattr(nucc_module.db, "status", AsyncMock(side_effect=lambda stmt: status_calls.append(stmt)))
+    monkeypatch.setattr(nucc_module.db, "scalar", AsyncMock(return_value=7))
     monkeypatch.setattr(nucc_module.db, "execute_ddl", AsyncMock())
     monkeypatch.setattr(nucc_module, "ensure_database", AsyncMock())
+    monkeypatch.setattr(nucc_module, "mark_control_run", AsyncMock())
 
     @asynccontextmanager
     async def fake_tx():
@@ -168,14 +170,23 @@ async def test_shutdown_rotates_tables(monkeypatch, nucc_module):
     shutdown_context_map = {
         "import_date": "20260102",
         "context": {
+            "run": 1,
+            "control_run_id": "run-nucc",
             "start": datetime.datetime.utcnow() - datetime.timedelta(seconds=5)
         },
     }
 
-    await nucc_module.shutdown(shutdown_context_map)
+    terminal_result = await nucc_module.shutdown(shutdown_context_map)
 
     assert status_calls
     assert captured_time_by_name["start"]
+    assert terminal_result["rows"] == 7
+    assert terminal_result["terminal_progress"]["phase"] == "nucc published"
+    assert nucc_module.mark_control_run.await_args.kwargs["metrics"] == {"rows": 7}
+    status_count = len(status_calls)
+    shutdown_context_map["context"]["run"] = 0
+    await nucc_module.shutdown(shutdown_context_map)
+    assert len(status_calls) == status_count
 
 
 @pytest.mark.asyncio
