@@ -21,24 +21,24 @@ provider_directory_fhir = importlib.import_module("process.provider_directory_fh
         (entity_address_unified, None, "singleton state is missing"),
         (
             entity_address_unified,
-            SimpleNamespace(schema_version=2, active_ruleset_version=1, generation=0),
+            SimpleNamespace(schema_version=3, active_ruleset_version=1, generation=0),
             "unsupported address alias schema version",
         ),
         (
             entity_address_unified,
-            SimpleNamespace(schema_version=1, active_ruleset_version=2, generation=0),
-            "unsupported numeric-grid alias ruleset",
+            SimpleNamespace(schema_version=2, active_ruleset_version=2, generation=0),
+            "unsupported address alias ruleset",
         ),
         (provider_directory_fhir, None, "singleton state is missing"),
         (
             provider_directory_fhir,
-            SimpleNamespace(schema_version=2, active_ruleset_version=1, generation=0),
+            SimpleNamespace(schema_version=3, active_ruleset_version=1, generation=0),
             "unsupported address alias schema version",
         ),
         (
             provider_directory_fhir,
-            SimpleNamespace(schema_version=1, active_ruleset_version=2, generation=0),
-            "unsupported numeric-grid alias ruleset",
+            SimpleNamespace(schema_version=2, active_ruleset_version=2, generation=0),
+            "unsupported address alias ruleset",
         ),
     ),
 )

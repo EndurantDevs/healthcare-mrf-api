@@ -12,9 +12,12 @@ ADDRESS_ALIAS_STATE_TABLE = "address_alias_state_v1"
 ADDRESS_ALIAS_RUN_TABLE = "address_alias_run_v1"
 ADDRESS_ALIAS_CANDIDATE_TABLE = "address_alias_candidate_v1"
 ADDRESS_ALIAS_ARTIFACT_STATE_TABLE = "address_alias_artifact_state_v1"
-ADDRESS_ALIAS_SCHEMA_VERSION = 1
+ADDRESS_ALIAS_SCHEMA_VERSION = 2
+ADDRESS_ALIAS_RULESET_VERSION = 1
 NUMERIC_GRID_ALIAS_KIND = "numeric_grid_direction_v1"
 NUMERIC_GRID_ALIAS_RULESET_VERSION = 1
+EVIDENCE_ADDRESS_MATCH_ALIAS_KIND = "evidence_gated_address_match_v1"
+EVIDENCE_ADDRESS_MATCH_RULESET_VERSION = 1
 NUMERIC_GRID_ALIAS_MODES = frozenset({"off", "shadow", "apply"})
 ADDRESS_ALIAS_ADVISORY_LOCK_KEY = "address_numeric_grid_alias_v1"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -27,6 +30,19 @@ def numeric_grid_alias_mode(value: str | None) -> str:
         choices = ", ".join(sorted(NUMERIC_GRID_ALIAS_MODES))
         raise ValueError(f"mode must be one of: {choices}")
     return normalized
+
+
+def alias_ruleset(alias_kind: str | None) -> int:
+    """Return the supported ruleset for one closed alias policy."""
+    normalized = str(alias_kind or "").strip()
+    version_by_kind = {
+        NUMERIC_GRID_ALIAS_KIND: NUMERIC_GRID_ALIAS_RULESET_VERSION,
+        EVIDENCE_ADDRESS_MATCH_ALIAS_KIND: EVIDENCE_ADDRESS_MATCH_RULESET_VERSION,
+    }
+    try:
+        return version_by_kind[normalized]
+    except KeyError:
+        raise ValueError(f"unsupported alias_kind: {normalized or '<empty>'}") from None
 
 
 def _quote_ident(value: str) -> str:
@@ -257,54 +273,16 @@ def numeric_grid_candidate_insert_sql(
     )
 
 
-def candidate_metrics_sql(*, schema: str) -> str:
-    """Return source-level candidate counts for one durable run."""
-    candidates = _relation(schema, ADDRESS_ALIAS_CANDIDATE_TABLE)
-    return f"""
-        SELECT jsonb_build_object(
-            'candidate_rows', count(*),
-            'candidate_sources', count(DISTINCT source_address_key),
-            'eligible', count(DISTINCT source_address_key)
-                FILTER (WHERE decision = 'eligible'),
-            'ambiguous', count(DISTINCT source_address_key)
-                FILTER (WHERE decision = 'ambiguous'),
-            'insufficient_provenance', count(DISTINCT source_address_key)
-                FILTER (WHERE decision = 'insufficient_provenance')
-        )
-        FROM {candidates}
-        WHERE run_id = CAST(:run_id AS uuid);
-    """
-
-
-def candidate_rows_sql(*, schema: str) -> str:
-    """Stream deterministic candidate rows for digesting or review."""
-    candidates = _relation(schema, ADDRESS_ALIAS_CANDIDATE_TABLE)
-    return f"""
-        SELECT
-            source_address_key::text AS source_address_key,
-            source_identity_key,
-            target_address_key::text AS target_address_key,
-            target_identity_key,
-            candidate_count,
-            target_strict_source_bits,
-            target_strict_source_count,
-            decision
-        FROM {candidates}
-        WHERE run_id = CAST(:run_id AS uuid)
-        ORDER BY source_address_key, target_address_key;
-    """
-
-
-def existing_numeric_grid_aliases_sql(
+def existing_address_aliases_sql(
     *,
     schema: str,
     keyed_table: str,
     archive: str,
 ) -> str:
-    """Materialize active aliases matching strict staged keys."""
+    """Materialize every supported active alias matching strict staged keys."""
     aliases = _relation(schema, ADDRESS_ALIAS_TABLE)
     return f"""
-        CREATE TEMP TABLE address_numeric_grid_existing_aliases ON COMMIT DROP AS
+        CREATE TEMP TABLE address_existing_aliases ON COMMIT DROP AS
         SELECT
             keyed.rn,
             keyed.computed_address_key AS source_address_key,
@@ -329,8 +307,6 @@ def existing_numeric_grid_aliases_sql(
         FROM {keyed_table} AS keyed
         JOIN {aliases} AS active
           ON active.source_address_key = keyed.computed_address_key
-         AND active.alias_kind = '{NUMERIC_GRID_ALIAS_KIND}'
-         AND active.ruleset_version = {NUMERIC_GRID_ALIAS_RULESET_VERSION}
          AND active.revoked_at IS NULL
         LEFT JOIN {archive} AS target
           ON target.address_key = active.target_address_key
@@ -338,7 +314,7 @@ def existing_numeric_grid_aliases_sql(
     """
 
 
-def existing_numeric_grid_alias_violation_sql(*, schema: str) -> str:
+def existing_address_alias_violation_sql(*, schema: str) -> str:
     """Reject identity drift, missing targets, and multi-hop active aliases."""
     aliases = _relation(schema, ADDRESS_ALIAS_TABLE)
     return f"""
@@ -357,13 +333,13 @@ def existing_numeric_grid_alias_violation_sql(*, schema: str) -> str:
                 END::text AS violation_kind,
                 existing.source_address_key,
                 existing.target_address_key
-            FROM address_numeric_grid_existing_aliases AS existing
+            FROM address_existing_aliases AS existing
             UNION ALL
             SELECT
                 'multi_hop_alias'::text,
                 existing.source_address_key,
                 existing.target_address_key
-            FROM address_numeric_grid_existing_aliases AS existing
+            FROM address_existing_aliases AS existing
             JOIN {aliases} AS downstream
               ON downstream.source_address_key = existing.target_address_key
              AND downstream.revoked_at IS NULL
@@ -395,7 +371,7 @@ def update_existing_alias_keyed_rows_sql(*, keyed_table: str) -> str:
                city_name = aliases.target_city_name,
                state_name = aliases.target_state_name,
                postal_code = aliases.target_postal_code
-          FROM address_numeric_grid_existing_aliases AS aliases
+          FROM address_existing_aliases AS aliases
          WHERE keyed.rn = aliases.rn;
     """
 
@@ -459,8 +435,8 @@ def promote_reviewed_aliases_sql(*, schema: str) -> str:
                 candidate.source_identity_key,
                 candidate.target_address_key,
                 candidate.target_identity_key,
-                '{NUMERIC_GRID_ALIAS_KIND}',
-                {NUMERIC_GRID_ALIAS_RULESET_VERSION},
+                CAST(:alias_kind AS varchar),
+                CAST(:ruleset_version AS smallint),
                 candidate.target_strict_source_bits,
                 candidate.target_strict_source_count,
                 candidate.candidate_count,
@@ -474,6 +450,12 @@ def promote_reviewed_aliases_sql(*, schema: str) -> str:
              AND reviewed.target_address_key = candidate.target_address_key
              AND reviewed.source_identity_key = candidate.source_identity_key
              AND reviewed.target_identity_key = candidate.target_identity_key
+             AND reviewed.match_rule IS NOT DISTINCT FROM candidate.match_rule
+             AND reviewed.match_classification IS NOT DISTINCT FROM
+                 candidate.match_classification
+             AND reviewed.evidence_npi IS NOT DISTINCT FROM candidate.evidence_npi
+             AND reviewed.evidence_npi_count IS NOT DISTINCT FROM
+                 candidate.evidence_npi_count
              AND reviewed.review_status = 'approved'
             WHERE candidate.run_id = CAST(:apply_run_id AS uuid)
               AND candidate.decision = 'eligible'

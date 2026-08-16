@@ -177,14 +177,20 @@ class _StrictSourceBackfillRunner:
     async def _insert_execution_run(self) -> None:
         execution = self._required_execution()
         await _insert_run(
-            schema=execution.schema,
-            run_id=execution.run_id,
-            mode="backfill",
-            state_code=execution.shadow_by_field.get("scope_state_code"),
-            zip_prefix=execution.shadow_by_field.get("scope_zip_prefix"),
-            shadow_run_id=execution.shadow_run_id,
-            reviewed_digest=execution.reviewed_digest,
-            reviewed_by=execution.reviewer,
+            run_by_field={
+                "schema": execution.schema,
+                "run_id": execution.run_id,
+                "mode": "backfill",
+                "state_code": execution.shadow_by_field.get("scope_state_code"),
+                "zip_prefix": execution.shadow_by_field.get("scope_zip_prefix"),
+                "shadow_run_id": execution.shadow_run_id,
+                "reviewed_digest": execution.reviewed_digest,
+                "reviewed_by": execution.reviewer,
+                "alias_kind": address_alias_sql.NUMERIC_GRID_ALIAS_KIND,
+                "ruleset_version": (
+                    address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION
+                ),
+            },
         )
 
     async def _execute_locked(self, session: Any) -> None:

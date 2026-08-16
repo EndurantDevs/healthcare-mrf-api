@@ -1681,7 +1681,16 @@ def address_formatted_address(batch_size: int, enqueue: bool):
         click.echo(json.dumps(result, sort_keys=True, default=str))
 
 
-@click.command(help="Discover or apply reviewed numeric-grid address aliases")
+@click.command(help="Discover or apply reviewed address aliases")
+@click.option(
+    "--alias-kind",
+    type=click.Choice(
+        ["numeric_grid_direction_v1", "evidence_gated_address_match_v1"],
+        case_sensitive=True,
+    ),
+    default="numeric_grid_direction_v1",
+    show_default=True,
+)
 @click.option(
     "--mode",
     type=click.Choice(["off", "shadow", "apply"], case_sensitive=False),
@@ -1700,7 +1709,7 @@ def address_formatted_address(batch_size: int, enqueue: bool):
 @click.option("--timeout", default="10min", show_default=True)
 @click.option("--enqueue", is_flag=True, help="Enqueue on arq:AddressArchive.")
 def address_numeric_grid_alias(**option_values_by_name):
-    """Run the reviewed numeric-grid alias workflow."""
+    """Run the reviewed address alias workflow."""
     result = _run(
         initiate_address_numeric_grid_alias(
             **option_values_by_name,
@@ -1750,6 +1759,15 @@ def address_strict_source_backfill(
 
 
 @click.command(help="Revoke one exact active numeric-grid address alias")
+@click.option(
+    "--alias-kind",
+    type=click.Choice(
+        ["numeric_grid_direction_v1", "evidence_gated_address_match_v1"],
+        case_sensitive=True,
+    ),
+    default="numeric_grid_direction_v1",
+    show_default=True,
+)
 @click.option("--source-address-key", required=True)
 @click.option("--expected-target-address-key", required=True)
 @click.option("--reason", required=True)
@@ -1763,6 +1781,7 @@ def address_numeric_grid_alias_revoke(
     reviewed_by: str,
     timeout: str,
     enqueue: bool,
+    alias_kind: str,
 ):
     """Revoke an active alias without permitting un-revoke."""
     result = _run(
@@ -1773,6 +1792,7 @@ def address_numeric_grid_alias_revoke(
             reviewed_by=reviewed_by,
             timeout=timeout,
             enqueue=enqueue,
+            alias_kind=alias_kind,
         )
     )
     if result is not None:

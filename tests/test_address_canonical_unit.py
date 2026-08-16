@@ -101,42 +101,15 @@ def test_sql_street_alias_helpers_keep_original_next_token_context():
     assert "SELECT token, ord, next_token\n          FROM marked" in completion_sql
 
 
-def test_resolve_materialization_carries_source_ctid_for_completion_aliases():
-    ddl = address_canon._keyed_temp_table_ddl("address_archive_resolve_keyed")
-    raw_copy_sql = address_canon._keyed_raw_copy_sql(
-        staging="mrf.test_stage",
-        first="first_line",
-        second="second_line",
-        city="city_name",
-        state="state_name",
-        zip_code="postal_code",
-        country="country_code",
+def test_archive_resolver_has_no_unreviewed_completion_alias_path():
+    source = inspect.getsource(address_canon.resolve_into_archive)
+
+    assert "_completion_alias_sql" not in source
+    assert "address_completion_aliases" not in source
+    assert "_apply_persisted_address_aliases" in source
+    assert source.index("_has_rust_materialized_keys") < source.index(
+        "_apply_persisted_address_aliases"
     )
-    alias_sql = address_canon._completion_alias_sql(
-        schema="mrf",
-        keyed_table="address_archive_resolve_keyed",
-        archive="mrf.address_archive_v2",
-    )
-
-    assert "source_ctid" in address_canon.KEYED_COPY_COLUMNS
-    assert "source_ctid text" in ddl
-    assert "ctid::text AS source_ctid" in raw_copy_sql
-    assert "address_completion_aliases" in alias_sql
-    assert "addr_street_completion_norm_v1" in alias_sql
-    assert "source_keys AS MATERIALIZED" in alias_sql
-    assert "archive_key_scope AS MATERIALIZED" in alias_sql
-    assert "archive_prefilter AS MATERIALIZED" in alias_sql
-    assert "AND (suffix_token IS NULL OR direction_token IS NULL)" in alias_sql
-    assert "HAVING count(DISTINCT target_address_key) = 1" in alias_sql
-    assert "source_ctid" in alias_sql
-
-
-def test_completion_alias_timeout_detector_matches_asyncpg_message():
-    exc = RuntimeError("asyncpg.exceptions.QueryCanceledError: canceling statement due to statement timeout")
-
-    assert address_canon.ADDRESS_COMPLETION_ALIAS_TIMEOUT_ENV == "HLTHPRT_ADDRESS_COMPLETION_ALIAS_TIMEOUT"
-    assert address_canon._is_statement_timeout_error(exc)
-    assert not address_canon._is_statement_timeout_error(RuntimeError("duplicate key value violates unique constraint"))
 
 
 def test_unit_is_delivery_point_not_premise_identity():

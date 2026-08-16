@@ -11,7 +11,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from arq import create_pool
 from sqlalchemy.dialects import postgresql
@@ -2340,31 +2340,39 @@ def _npi_entity_subtype_expr(alias: str = "n") -> str:
     )
 
 
+_ADDRESS_CHECKSUM_EXPRESSIONS_BY_FIELD = {
+    "entity_type": "entity_type",
+    "entity_id": "entity_id",
+    "type": "type",
+    "first_line": "first_line",
+    "second_line": "second_line",
+    "city_name": "city_name",
+    "state_name": "state_name",
+    "postal_code": "postal_code",
+    "country_code": "country_code",
+    "telephone_number": "telephone_number",
+}
+
+
 def _address_checksum_expr(
-    *,
-    entity_type_expr: str = "entity_type",
-    entity_id_expr: str = "entity_id",
-    type_expr: str = "type",
-    first_line_expr: str = "first_line",
-    second_line_expr: str = "second_line",
-    city_name_expr: str = "city_name",
-    state_name_expr: str = "state_name",
-    postal_code_expr: str = "postal_code",
-    country_code_expr: str = "country_code",
-    telephone_number_expr: str = "telephone_number",
+    expressions_by_field: Mapping[str, str] | None = None,
 ) -> str:
+    expression_by_field = {
+        **_ADDRESS_CHECKSUM_EXPRESSIONS_BY_FIELD,
+        **dict(expressions_by_field or {}),
+    }
     return (
         "(('x' || substr(md5(lower(concat_ws('|', "
-        f"COALESCE({entity_type_expr}, ''), "
-        f"COALESCE({entity_id_expr}, ''), "
-        f"COALESCE({type_expr}, ''), "
-        f"COALESCE({first_line_expr}, ''), "
-        f"COALESCE({second_line_expr}, ''), "
-        f"COALESCE({city_name_expr}, ''), "
-        f"COALESCE({state_name_expr}, ''), "
-        f"COALESCE({postal_code_expr}, ''), "
-        f"COALESCE({country_code_expr}, ''), "
-        f"COALESCE({telephone_number_expr}, '')"
+        f"COALESCE({expression_by_field['entity_type']}, ''), "
+        f"COALESCE({expression_by_field['entity_id']}, ''), "
+        f"COALESCE({expression_by_field['type']}, ''), "
+        f"COALESCE({expression_by_field['first_line']}, ''), "
+        f"COALESCE({expression_by_field['second_line']}, ''), "
+        f"COALESCE({expression_by_field['city_name']}, ''), "
+        f"COALESCE({expression_by_field['state_name']}, ''), "
+        f"COALESCE({expression_by_field['postal_code']}, ''), "
+        f"COALESCE({expression_by_field['country_code']}, ''), "
+        f"COALESCE({expression_by_field['telephone_number']}, '')"
         "))), 1, 8))::bit(32)::int)"
     )
 
@@ -2618,38 +2626,55 @@ def _address_role_id_expr(expr: str) -> str:
     )
 
 
+_LOCATION_KEY_EXPRESSIONS_BY_FIELD = {
+    "entity_type": "entity_type",
+    "entity_id": "entity_id",
+    "npi": "npi",
+    "inferred_npi": "inferred_npi",
+    "address_role_id": "address_role_id",
+    "row_origin": "row_origin",
+    "address_key": "address_key",
+    "source_id": "source_id",
+    "source_record_id": "source_record_id",
+    "zip5": "zip5",
+    "state_code": "state_code",
+    "city_norm": "city_norm",
+}
+
+
 def _location_key_expr(
-    *,
-    entity_type: str = "entity_type",
-    entity_id: str = "entity_id",
-    npi: str = "npi",
-    inferred_npi: str = "inferred_npi",
-    address_role_id: str = "address_role_id",
-    row_origin: str = "row_origin",
-    address_key: str = "address_key",
-    source_id: str = "source_id",
-    source_record_id: str = "source_record_id",
-    zip5: str = "zip5",
-    state_code: str = "state_code",
-    city_norm: str = "city_norm",
+    expressions_by_field: Mapping[str, str] | None = None,
 ) -> str:
+    expression_by_field = {
+        **_LOCATION_KEY_EXPRESSIONS_BY_FIELD,
+        **dict(expressions_by_field or {}),
+    }
     identity = (
         "CASE WHEN "
-        f"{address_key} IS NOT NULL THEN concat_ws('|', "
+        f"{expression_by_field['address_key']} IS NOT NULL THEN concat_ws('|', "
         "'v1', "
-        f"COALESCE({entity_type}, ''), COALESCE({entity_id}, ''), "
-        f"COALESCE({npi}::text, ''), COALESCE({inferred_npi}::text, ''), "
+        f"COALESCE({expression_by_field['entity_type']}, ''), "
+        f"COALESCE({expression_by_field['entity_id']}, ''), "
+        f"COALESCE({expression_by_field['npi']}::text, ''), "
+        f"COALESCE({expression_by_field['inferred_npi']}::text, ''), "
         "''::text, "
-        f"COALESCE({address_role_id}::text, ''), COALESCE({row_origin}, ''), "
-        f"COALESCE({address_key}::text, '')) "
+        f"COALESCE({expression_by_field['address_role_id']}::text, ''), "
+        f"COALESCE({expression_by_field['row_origin']}, ''), "
+        f"COALESCE({expression_by_field['address_key']}::text, '')) "
         "ELSE concat_ws('|', "
         "'v1', 'fallback', "
-        f"COALESCE({entity_type}, ''), COALESCE({entity_id}, ''), "
-        f"COALESCE({npi}::text, ''), COALESCE({inferred_npi}::text, ''), "
+        f"COALESCE({expression_by_field['entity_type']}, ''), "
+        f"COALESCE({expression_by_field['entity_id']}, ''), "
+        f"COALESCE({expression_by_field['npi']}::text, ''), "
+        f"COALESCE({expression_by_field['inferred_npi']}::text, ''), "
         "''::text, "
-        f"COALESCE({address_role_id}::text, ''), COALESCE({row_origin}, ''), "
-        f"COALESCE({source_id}::text, ''), COALESCE({source_record_id}, ''), "
-        f"COALESCE({zip5}, ''), COALESCE({state_code}, ''), COALESCE({city_norm}, '')) END"
+        f"COALESCE({expression_by_field['address_role_id']}::text, ''), "
+        f"COALESCE({expression_by_field['row_origin']}, ''), "
+        f"COALESCE({expression_by_field['source_id']}::text, ''), "
+        f"COALESCE({expression_by_field['source_record_id']}, ''), "
+        f"COALESCE({expression_by_field['zip5']}, ''), "
+        f"COALESCE({expression_by_field['state_code']}, ''), "
+        f"COALESCE({expression_by_field['city_norm']}, '')) END"
     )
     return f"encode(sha256(convert_to(({identity}), 'UTF8')), 'hex')"
 
@@ -4815,10 +4840,10 @@ async def _address_alias_generation(db_schema: str) -> int:
         raise RuntimeError(f"unsupported address alias schema version: {row.schema_version}")
     if (
         int(row.active_ruleset_version)
-        != address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION
+        != address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION
     ):
         raise RuntimeError(
-            f"unsupported numeric-grid alias ruleset: {row.active_ruleset_version}"
+            f"unsupported address alias ruleset: {row.active_ruleset_version}"
         )
     return int(row.generation)
 
@@ -5166,20 +5191,20 @@ def _enrich_raw_stage_sql(
                     WHERE singleton = true
                )
            ),
-           location_key = {_location_key_expr(
-               entity_type='r.entity_type',
-               entity_id='r.entity_id',
-               npi='r.npi',
-               inferred_npi='r.inferred_npi',
-               address_role_id='k.address_role_id',
-               row_origin='k.row_origin',
-               address_key='k.address_key',
-               source_id='k.source_id',
-               source_record_id='r.source_record_id',
-               zip5='k.zip5',
-               state_code='k.state_code',
-               city_norm='k.city_norm',
-           )}
+           location_key = {_location_key_expr({
+               'entity_type': 'r.entity_type',
+               'entity_id': 'r.entity_id',
+               'npi': 'r.npi',
+               'inferred_npi': 'r.inferred_npi',
+               'address_role_id': 'k.address_role_id',
+               'row_origin': 'k.row_origin',
+               'address_key': 'k.address_key',
+               'source_id': 'k.source_id',
+               'source_record_id': 'r.source_record_id',
+               'zip5': 'k.zip5',
+               'state_code': 'k.state_code',
+               'city_norm': 'k.city_norm',
+           })}
       FROM keyed k
      WHERE r.ctid = k.row_id;
     """
@@ -6101,15 +6126,15 @@ def _insert_raw_from_source_sql(
             source_record_id,
             updated_at,
             address_key,
-            {_address_checksum_expr(
-                first_line_expr=_alnum_norm_expr("first_line"),
-                second_line_expr=_alnum_norm_expr("second_line"),
-                city_name_expr=_alnum_norm_expr("city_name"),
-                state_name_expr=_state_norm_expr("state_name"),
-                postal_code_expr=_zip5_norm_expr("postal_code"),
-                country_code_expr=_state_norm_expr("country_code"),
-                telephone_number_expr=_phone_norm_expr("telephone_number"),
-            )} AS checksum
+            {_address_checksum_expr({
+                "first_line": _alnum_norm_expr("first_line"),
+                "second_line": _alnum_norm_expr("second_line"),
+                "city_name": _alnum_norm_expr("city_name"),
+                "state_name": _state_norm_expr("state_name"),
+                "postal_code": _zip5_norm_expr("postal_code"),
+                "country_code": _state_norm_expr("country_code"),
+                "telephone_number": _phone_norm_expr("telephone_number"),
+            })} AS checksum
           FROM sanitized
     )
     SELECT
@@ -6623,29 +6648,29 @@ def _materialize_sql(
             source_record_id,
             updated_at,
             address_key,
-            {_location_key_expr(
-                entity_type="entity_type",
-                entity_id="entity_id",
-                npi="npi",
-                inferred_npi="inferred_npi",
-                address_role_id=_address_role_id_expr("type"),
-                row_origin="'base'",
-                address_key="address_key",
-                source_id=_source_id_expr("address_source"),
-                source_record_id="source_record_id",
-                zip5=_zip5_norm_expr("postal_code"),
-                state_code=_state_norm_expr("state_name"),
-                city_norm=_alnum_norm_expr("city_name"),
-            )} AS location_key,
-            {_address_checksum_expr(
-                first_line_expr=_alnum_norm_expr("first_line"),
-                second_line_expr=_alnum_norm_expr("second_line"),
-                city_name_expr=_alnum_norm_expr("city_name"),
-                state_name_expr=_state_norm_expr("state_name"),
-                postal_code_expr=_zip5_norm_expr("postal_code"),
-                country_code_expr=_state_norm_expr("country_code"),
-                telephone_number_expr=_phone_norm_expr("telephone_number"),
-            )} AS checksum
+            {_location_key_expr({
+                "entity_type": "entity_type",
+                "entity_id": "entity_id",
+                "npi": "npi",
+                "inferred_npi": "inferred_npi",
+                "address_role_id": _address_role_id_expr("type"),
+                "row_origin": "'base'",
+                "address_key": "address_key",
+                "source_id": _source_id_expr("address_source"),
+                "source_record_id": "source_record_id",
+                "zip5": _zip5_norm_expr("postal_code"),
+                "state_code": _state_norm_expr("state_name"),
+                "city_norm": _alnum_norm_expr("city_name"),
+            })} AS location_key,
+            {_address_checksum_expr({
+                "first_line": _alnum_norm_expr("first_line"),
+                "second_line": _alnum_norm_expr("second_line"),
+                "city_name": _alnum_norm_expr("city_name"),
+                "state_name": _state_norm_expr("state_name"),
+                "postal_code": _zip5_norm_expr("postal_code"),
+                "country_code": _state_norm_expr("country_code"),
+                "telephone_number": _phone_norm_expr("telephone_number"),
+            })} AS checksum
           FROM sanitized
     ),
     aggregated AS (
@@ -7583,19 +7608,39 @@ def _facility_anchor_npi_candidate_sql(
     stage_table: str,
     *,
     source_run_id: str,
-    include_hospital_enrollment: bool = False,
-    include_fqhc_enrollment: bool = False,
-    include_npi_address_key: bool = False,
-    include_npi_registry: bool = False,
-    include_npi_taxonomy: bool = False,
-    include_nucc_taxonomy: bool = False,
-    include_npi_other_identifier: bool = False,
-    include_provider_additional_npi: bool = False,
-    include_facility_anchor: bool = False,
+    candidate_options_by_name: Mapping[str, bool] | None = None,
     candidate_shards: int = 1,
     candidate_shard: int | None = None,
 ) -> str:
     """Build ranked facility-to-NPI candidate materialization SQL."""
+    candidate_options_by_name = dict(candidate_options_by_name or {})
+    include_hospital_enrollment = candidate_options_by_name.get(
+        "include_hospital_enrollment", False
+    )
+    include_fqhc_enrollment = candidate_options_by_name.get(
+        "include_fqhc_enrollment", False
+    )
+    include_npi_address_key = candidate_options_by_name.get(
+        "include_npi_address_key", False
+    )
+    include_npi_registry = candidate_options_by_name.get(
+        "include_npi_registry", False
+    )
+    include_npi_taxonomy = candidate_options_by_name.get(
+        "include_npi_taxonomy", False
+    )
+    include_nucc_taxonomy = candidate_options_by_name.get(
+        "include_nucc_taxonomy", False
+    )
+    include_npi_other_identifier = candidate_options_by_name.get(
+        "include_npi_other_identifier", False
+    )
+    include_provider_additional_npi = candidate_options_by_name.get(
+        "include_provider_additional_npi", False
+    )
+    include_facility_anchor = candidate_options_by_name.get(
+        "include_facility_anchor", False
+    )
     candidate_limit = _env_int("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_LIMIT", 25, minimum=1)
     shard_filter = _location_key_shard_filter_sql(
         "t.location_key",
@@ -8609,8 +8654,7 @@ def _support_stage_statements(
             DEFAULT_FACILITY_CANDIDATE_SHARDS,
             minimum=1,
         )
-        facility_candidate_option_map = dict(
-            source_run_id=source_run_id,
+        facility_candidate_options_by_name = dict(
             include_hospital_enrollment=available.get("provider_enrollment_hospital", False),
             include_fqhc_enrollment=available.get("provider_enrollment_fqhc", False),
             include_npi_address_key=(
@@ -8646,9 +8690,10 @@ def _support_stage_statements(
                         db_schema,
                         stage_table_map[FacilityAnchorNPICandidate],
                         stage_table,
+                        source_run_id=source_run_id,
+                        candidate_options_by_name=facility_candidate_options_by_name,
                         candidate_shards=facility_candidate_shards,
                         candidate_shard=shard,
-                        **facility_candidate_option_map,
                     ),
                 )
             )
@@ -8888,15 +8933,30 @@ def _inference_sql(
     db_schema: str,
     stage_table: str,
     *,
-    include_hospital_enrollment: bool,
-    include_fqhc_enrollment: bool,
-    include_facility_override: bool = False,
-    include_npi_other_identifier: bool = False,
-    include_name_fallback: bool = False,
-    include_nppes_name_inference: bool = False,
-    include_nppes_broad_inference: bool = False,
+    inference_options_by_name: Mapping[str, bool],
 ) -> str:
     """Build deterministic facility NPI inference SQL."""
+    include_hospital_enrollment = inference_options_by_name.get(
+        "include_hospital_enrollment", False
+    )
+    include_fqhc_enrollment = inference_options_by_name.get(
+        "include_fqhc_enrollment", False
+    )
+    include_facility_override = inference_options_by_name.get(
+        "include_facility_override", False
+    )
+    include_npi_other_identifier = inference_options_by_name.get(
+        "include_npi_other_identifier", False
+    )
+    include_name_fallback = inference_options_by_name.get(
+        "include_name_fallback", False
+    )
+    include_nppes_name_inference = inference_options_by_name.get(
+        "include_nppes_name_inference", False
+    )
+    include_nppes_broad_inference = inference_options_by_name.get(
+        "include_nppes_broad_inference", False
+    )
     def norm_text_sql(expr: str) -> str:
         """Normalize text for generated SQL comparisons."""
         return f"regexp_replace(LOWER(COALESCE({expr}, '')), '[^a-z0-9]', '', 'g')"
@@ -11774,22 +11834,28 @@ async def process_entity_address_unified_data(ctx, task=None):
             _inference_sql(
                 db_schema,
                 stage_table,
-                include_hospital_enrollment=available_relation_map.get("provider_enrollment_hospital", False),
-                include_fqhc_enrollment=available_relation_map.get("provider_enrollment_fqhc", False),
-                include_facility_override=include_facility_override,
-                include_npi_other_identifier=include_npi_other_identifier,
-                include_name_fallback=_is_env_enabled(
-                    "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NAME_FALLBACK_INFERENCE",
-                    False,
-                ),
-                include_nppes_name_inference=_is_env_enabled(
-                    "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_NAME_INFERENCE",
-                    False,
-                ),
-                include_nppes_broad_inference=_is_env_enabled(
-                    "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_BROAD_INFERENCE",
-                    False,
-                ),
+                inference_options_by_name={
+                    "include_hospital_enrollment": available_relation_map.get(
+                        "provider_enrollment_hospital", False
+                    ),
+                    "include_fqhc_enrollment": available_relation_map.get(
+                        "provider_enrollment_fqhc", False
+                    ),
+                    "include_facility_override": include_facility_override,
+                    "include_npi_other_identifier": include_npi_other_identifier,
+                    "include_name_fallback": _is_env_enabled(
+                        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NAME_FALLBACK_INFERENCE",
+                        False,
+                    ),
+                    "include_nppes_name_inference": _is_env_enabled(
+                        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_NAME_INFERENCE",
+                        False,
+                    ),
+                    "include_nppes_broad_inference": _is_env_enabled(
+                        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_BROAD_INFERENCE",
+                        False,
+                    ),
+                },
             ),
             context=context,
             run_id=run_id,

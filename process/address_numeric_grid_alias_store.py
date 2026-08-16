@@ -15,7 +15,64 @@ from process.address_numeric_grid_alias_support import (
     _candidate_sample,
     _relation,
 )
-from process.ext import address_alias_audit_sql, address_alias_sql
+from process.ext import (
+    address_alias_audit_sql,
+    address_alias_snapshot_sql,
+    address_alias_sql,
+    address_evidence_alias_sql,
+)
+
+
+def _run_completion_sql(schema: str) -> str:
+    runs = _relation(schema, address_alias_sql.ADDRESS_ALIAS_RUN_TABLE)
+    return f"""
+        UPDATE {runs}
+           SET status = :status,
+               candidate_digest = :candidate_digest,
+               archive_row_count = :archive_rows,
+               source_count = :source_count,
+               candidate_source_count = :candidate_sources,
+               candidate_row_count = :candidate_rows,
+               no_candidate_count = :no_candidate,
+               active_skipped_count = :active_skipped,
+               eligible_count = :eligible,
+               ambiguous_count = :ambiguous,
+               insufficient_provenance_count = :insufficient,
+               reason_buckets = CAST(:reason_buckets AS jsonb),
+               sample_rows = CAST(:sample_rows AS jsonb),
+               completed_at = now()
+         WHERE run_id = CAST(:run_id AS uuid);
+    """
+
+
+def _completion_parameters(execution: Any) -> dict[str, Any]:
+    metric_map = execution.metrics_by_reason
+    reason_map = {
+        reason_name: metric_map.get(reason_name, 0)
+        for reason_name in (
+            "eligible",
+            "ambiguous",
+            "no_candidate",
+            "active_skipped",
+            "insufficient_provenance",
+        )
+    }
+    return {
+        "status": execution.final_status,
+        "candidate_digest": execution.digest,
+        "archive_rows": execution.archive_rows,
+        "source_count": execution.source_count,
+        "candidate_sources": metric_map.get("candidate_sources", 0),
+        "candidate_rows": metric_map.get("candidate_rows", 0),
+        "no_candidate": metric_map.get("no_candidate", 0),
+        "active_skipped": metric_map.get("active_skipped", 0),
+        "eligible": metric_map.get("eligible", 0),
+        "ambiguous": metric_map.get("ambiguous", 0),
+        "insufficient": metric_map.get("insufficient_provenance", 0),
+        "reason_buckets": json.dumps(reason_map, sort_keys=True),
+        "sample_rows": json.dumps(execution.sample_rows, sort_keys=True),
+        "run_id": execution.run_id,
+    }
 
 
 async def _alias_state(
@@ -42,23 +99,21 @@ async def _alias_state(
     generation = int(state_record.generation)
     if schema_version != address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION:
         raise RuntimeError(f"unsupported address alias schema version: {schema_version}")
-    if ruleset_version != address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION:
-        raise RuntimeError(f"unsupported numeric-grid alias ruleset: {ruleset_version}")
+    if ruleset_version != address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION:
+        raise RuntimeError(f"unsupported address alias ruleset: {ruleset_version}")
     return schema_version, ruleset_version, generation
 
 
 async def _insert_run(
     *,
-    schema: str,
-    run_id: str,
-    mode: str,
-    state_code: str | None,
-    zip_prefix: str | None,
-    shadow_run_id: str | None,
-    reviewed_digest: str | None,
-    reviewed_by: str | None,
+    run_by_field: dict[str, Any],
 ) -> None:
-    runs = _relation(schema, address_alias_sql.ADDRESS_ALIAS_RUN_TABLE)
+    runs = _relation(
+        str(run_by_field["schema"]),
+        address_alias_sql.ADDRESS_ALIAS_RUN_TABLE,
+    )
+    parameters_by_name = dict(run_by_field)
+    parameters_by_name.pop("schema")
     await db.status(
         f"""
         INSERT INTO {runs} (
@@ -72,15 +127,7 @@ async def _insert_run(
             :state_code, :zip_prefix
         );
         """,
-        run_id=run_id,
-        alias_kind=address_alias_sql.NUMERIC_GRID_ALIAS_KIND,
-        ruleset_version=address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION,
-        mode=mode,
-        shadow_run_id=shadow_run_id,
-        reviewed_digest=reviewed_digest,
-        reviewed_by=reviewed_by,
-        state_code=state_code,
-        zip_prefix=zip_prefix,
+        **parameters_by_name,
     )
 
 
@@ -112,27 +159,13 @@ async def _mark_failed(schema: str, run_id: str, exc: BaseException) -> str | No
     return str(status_record.status) if status_record is not None else None
 
 
-def _candidate_scope_by_field(
-    *,
-    run_id: str,
-    state_code: str | None,
-    zip_prefix: str | None,
-    retry_shadow_run_id: str | None,
-) -> dict[str, str | None]:
-    return {
-        "run_id": run_id,
-        "scope_state_code": state_code,
-        "scope_zip_prefix": zip_prefix,
-        "retry_shadow_run_id": retry_shadow_run_id,
-    }
-
-
 async def _archive_source_counts(
     session: Any,
     *,
     schema: str,
     archive: str,
     scope_by_field: dict[str, str | None],
+    alias_kind: str,
 ) -> tuple[int, int]:
     archive_rows = int(
         (await session.execute(text(f"SELECT count(*) FROM {archive};"))).scalar() or 0
@@ -141,10 +174,12 @@ async def _archive_source_counts(
         (
             await session.execute(
                 text(
-                    address_alias_sql.numeric_grid_source_count_sql(
-                        schema=schema,
-                        archive=archive,
-                    )
+                    (
+                        address_evidence_alias_sql.evidence_source_count_sql
+                        if alias_kind
+                        == address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND
+                        else address_alias_sql.numeric_grid_source_count_sql
+                    )(schema=schema, archive=archive)
                 ),
                 scope_by_field,
             )
@@ -162,10 +197,11 @@ async def _candidate_metrics_by_reason(
     run_id: str,
     source_count: int,
     scope_by_field: dict[str, str | None],
+    alias_kind: str,
 ) -> dict[str, int]:
     raw_metric_map = (
         await session.execute(
-            text(address_alias_sql.candidate_metrics_sql(schema=schema)),
+            text(address_alias_snapshot_sql.candidate_metrics_sql(schema=schema)),
             {"run_id": run_id},
         )
     ).scalar() or {}
@@ -182,10 +218,12 @@ async def _candidate_metrics_by_reason(
         (
             await session.execute(
                 text(
-                    address_alias_audit_sql.numeric_grid_skipped_source_count_sql(
-                        schema=schema,
-                        archive=archive,
-                    )
+                    (
+                        address_evidence_alias_sql.evidence_skipped_source_count_sql
+                        if alias_kind
+                        == address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND
+                        else address_alias_audit_sql.numeric_grid_skipped_source_count_sql
+                    )(schema=schema, archive=archive)
                 ),
                 scope_by_field,
             )
@@ -206,31 +244,26 @@ async def _shadow_run(
     *,
     schema: str,
     archive: str,
-    run_id: str,
-    state_code: str | None,
-    zip_prefix: str | None,
+    scope_by_field: dict[str, str | None],
     sample_limit: int,
-    retry_shadow_run_id: str | None,
+    alias_kind: str = address_alias_sql.NUMERIC_GRID_ALIAS_KIND,
 ) -> tuple[dict[str, int], str, list[dict[str, Any]], int, int]:
     """Persist and summarize one deterministic candidate snapshot."""
-    scope_by_field = _candidate_scope_by_field(
-        run_id=run_id,
-        state_code=state_code,
-        zip_prefix=zip_prefix,
-        retry_shadow_run_id=retry_shadow_run_id,
-    )
+    run_id = str(scope_by_field["run_id"])
     archive_rows, source_count = await _archive_source_counts(
         session,
         schema=schema,
         archive=archive,
         scope_by_field=scope_by_field,
+        alias_kind=alias_kind,
     )
     await session.execute(
         text(
-            address_alias_sql.numeric_grid_candidate_insert_sql(
-                schema=schema,
-                archive=archive,
-            )
+            (
+                address_evidence_alias_sql.evidence_candidate_insert_sql
+                if alias_kind == address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND
+                else address_alias_sql.numeric_grid_candidate_insert_sql
+            )(schema=schema, archive=archive)
         ),
         scope_by_field,
     )
@@ -241,10 +274,18 @@ async def _shadow_run(
         run_id=run_id,
         source_count=source_count,
         scope_by_field=scope_by_field,
+        alias_kind=alias_kind,
     )
     candidate_records = (
         await session.execute(
-            text(address_alias_sql.candidate_rows_sql(schema=schema)),
+            text(
+                (
+                    address_alias_snapshot_sql.evidence_candidate_rows_sql
+                    if alias_kind
+                    == address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND
+                    else address_alias_snapshot_sql.candidate_rows_sql
+                )(schema=schema)
+            ),
             {"run_id": run_id},
         )
     ).all()
@@ -262,6 +303,8 @@ async def _load_reviewed_shadow(
     schema: str,
     shadow_run_id: str,
     expected_digest: str,
+    alias_kind: str = address_alias_sql.NUMERIC_GRID_ALIAS_KIND,
+    ruleset_version: int = address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION,
 ) -> dict[str, Any]:
     runs = _relation(schema, address_alias_sql.ADDRESS_ALIAS_RUN_TABLE)
     shadow_record = await db.first(
@@ -280,6 +323,10 @@ async def _load_reviewed_shadow(
         raise ValueError("reviewed shadow run must be sealed")
     if shadow_by_field.get("candidate_digest") != expected_digest:
         raise ValueError("reviewed candidate digest does not match the sealed shadow run")
+    if shadow_by_field.get("alias_kind") != alias_kind:
+        raise ValueError("reviewed shadow alias kind differs from the requested policy")
+    if int(shadow_by_field.get("ruleset_version") or 0) != ruleset_version:
+        raise ValueError("reviewed shadow ruleset differs from the requested policy")
     return shadow_by_field
 
 

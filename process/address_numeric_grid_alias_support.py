@@ -34,6 +34,7 @@ class NumericGridAliasResult:
     promoted: int
     generation: int
     sample_rows: list[dict[str, Any]]
+    alias_kind: str = "numeric_grid_direction_v1"
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class NumericGridAliasRequest:
     sample_limit: int = 20
     timeout: str = "10min"
     cancel_check: Callable[[], Awaitable[None]] | None = None
+    alias_kind: str = "numeric_grid_direction_v1"
 
 
 def _quote_ident(value: str) -> str:

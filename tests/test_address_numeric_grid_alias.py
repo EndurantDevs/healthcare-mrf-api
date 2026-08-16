@@ -38,12 +38,28 @@ MIGRATION_PATH = (
     / "alembic/versions"
     / "20260811100000_address_numeric_grid_alias.py"
 )
+EVIDENCE_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic/versions"
+    / "20260816020000_address_evidence_alias.py"
+)
 
 
 def _load_migration():
     module_spec = importlib.util.spec_from_file_location(
         "address_numeric_grid_alias_migration",
         MIGRATION_PATH,
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    migration = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(migration)
+    return migration
+
+
+def _load_evidence_migration():
+    module_spec = importlib.util.spec_from_file_location(
+        "address_evidence_alias_migration",
+        EVIDENCE_MIGRATION_PATH,
     )
     assert module_spec is not None and module_spec.loader is not None
     migration = importlib.util.module_from_spec(module_spec)
@@ -93,6 +109,26 @@ def test_candidate_sql_requires_exact_unit_and_geography_and_counts_ambiguity_fi
     assert "retried.shadow_run_id = CAST(:retry_shadow_run_id AS uuid)" in sql
     assert "similarity(" not in sql.lower()
     assert "levenshtein" not in sql.lower()
+
+
+
+def test_alias_kind_policy_is_closed_and_persisted_materialization_is_generic():
+    assert address_alias_sql.alias_ruleset(
+        address_alias_sql.NUMERIC_GRID_ALIAS_KIND
+    ) == 1
+    assert address_alias_sql.alias_ruleset(
+        address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND
+    ) == 1
+    with pytest.raises(ValueError, match="alias_kind"):
+        address_alias_sql.alias_ruleset("fuzzy_address_v1")
+
+    sql = address_alias_sql.existing_address_aliases_sql(
+        schema="mrf",
+        keyed_table="address_archive_resolve_keyed",
+        archive="mrf.address_archive_v2",
+    )
+    assert "active.revoked_at IS NULL" in sql
+    assert "active.alias_kind =" not in sql
 
 
 @pytest.mark.parametrize("mode", ["off", "shadow", "apply", " SHADOW "])
@@ -217,6 +253,8 @@ def test_migration_creates_durable_review_and_generation_contract(monkeypatch):
     assert len(alias_statements) > 10
     assert recorder.statements[1:] == list(alias_statements)
     assert all(statement.rstrip().endswith(";") for statement in alias_statements)
+
+
 
 
 def test_request_path_never_joins_the_offline_alias_table():

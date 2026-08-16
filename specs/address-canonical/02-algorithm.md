@@ -196,11 +196,9 @@ rename swap — the helper never hardcodes the table name.
 -- 0) stamp keys onto the staged rows, set-based, sharded if large:
 UPDATE {staging} SET address_key = mrf.addr_key_v1(first_line, second_line, city, state, zip, country);
 
--- 0b) repair only observed unique siblings:
--- - missing ZIP: same street+unit+city+state+country and one keyed sibling ZIP
--- - missing suffix/directional: same unit+state+ZIP+completion norm and one
---   higher-specificity sibling
--- Ambiguous clusters remain split/null-keyed and are counted.
+-- 0b) restore missing ZIP only from explicit coordinate evidence.
+-- Missing suffixes and directions remain distinct unless an offline reviewed
+-- address_alias_v1 decision projects an effective target after key materialization.
 
 -- A) register unknown addresses (the strainer: dedupe staging first, then one pass):
 INSERT INTO {archive} (address_key, identity_key, ...normalized..., ...display..., source_bits)

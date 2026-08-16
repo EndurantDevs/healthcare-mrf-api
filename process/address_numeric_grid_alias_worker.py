@@ -19,6 +19,7 @@ from process.control_cancel import raise_if_cancelled
 from process.live_progress import enqueue_live_progress
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
+from process.ext import address_alias_sql
 
 
 ADDRESS_ALIAS_QUEUE_NAME = "arq:AddressArchive"
@@ -44,18 +45,21 @@ async def process_address_numeric_grid_alias(
         sample_limit=int(options.get("sample_limit") or 20),
         timeout=str(options.get("timeout") or "10min"),
         cancel_check=_cancel_check,
+        alias_kind=str(
+            options.get("alias_kind") or address_alias_sql.NUMERIC_GRID_ALIAS_KIND
+        ),
     )
     result_payload = asdict(alias_result)
     enqueue_live_progress(
         run_id=alias_result.run_id,
         importer="address-numeric-grid-alias",
         status="succeeded",
-        phase="address numeric-grid alias",
+        phase="address alias",
         unit="candidate",
         total=alias_result.candidate_rows,
         done=alias_result.candidate_rows,
         pct=100,
-        message=f"numeric-grid alias {alias_result.status}",
+        message=f"{alias_result.alias_kind} {alias_result.status}",
         **{
             key: field_value
             for key, field_value in result_payload.items()
@@ -80,6 +84,10 @@ async def run_address_numeric_grid_alias_command(
         "reviewed_by": option_values_by_name.get("reviewed_by"),
         "sample_limit": option_values_by_name.get("sample_limit", 20),
         "timeout": option_values_by_name.get("timeout", "10min"),
+        "alias_kind": option_values_by_name.get(
+            "alias_kind",
+            address_alias_sql.NUMERIC_GRID_ALIAS_KIND,
+        ),
     }
     if bool(option_values_by_name.get("enqueue", False)):
         redis = await create_pool(
@@ -191,18 +199,23 @@ async def process_address_numeric_grid_alias_revoke(
         reason=str(options.get("reason") or ""),
         reviewed_by=str(options.get("reviewed_by") or ""),
         timeout=str(options.get("timeout") or "30s"),
+        alias_kind=str(
+            options.get("alias_kind") or address_alias_sql.NUMERIC_GRID_ALIAS_KIND
+        ),
     )
     result_payload = asdict(revoke_result)
     enqueue_live_progress(
         run_id=revoke_result.run_id,
         importer="address-numeric-grid-alias-revoke",
         status="succeeded",
-        phase="address numeric-grid alias revoke",
+        phase="address alias revoke",
         unit="alias",
         total=1,
         done=1,
         pct=100,
-        message="numeric-grid alias revoked; full artifact rebuild required",
+        message=(
+            f"{revoke_result.alias_kind} revoked; full artifact rebuild required"
+        ),
         **{
             key: field_value
             for key, field_value in result_payload.items()
@@ -220,6 +233,7 @@ async def run_address_alias_revoke_command(
     reviewed_by: str,
     timeout: str = "30s",
     enqueue: bool = False,
+    alias_kind: str = address_alias_sql.NUMERIC_GRID_ALIAS_KIND,
 ) -> dict[str, Any] | None:
     """Run inline or enqueue one exact alias revocation."""
     task_options_by_name = {
@@ -228,6 +242,7 @@ async def run_address_alias_revoke_command(
         "reason": reason,
         "reviewed_by": reviewed_by,
         "timeout": timeout,
+        "alias_kind": alias_kind,
     }
     if enqueue:
         redis = await create_pool(

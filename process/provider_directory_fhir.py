@@ -14438,6 +14438,42 @@ def _location_resolved_fields_sql(schema: str) -> str:
     """
 
 
+def _location_key_batch_update_sql(location_ref: str) -> str:
+    return f"""updated AS (
+        UPDATE {location_ref} AS loc
+           SET address_key = keyed.computed_address_key::text,
+               zip5 = COALESCE(keyed.computed_zip5, loc.zip5),
+               city_name = COALESCE(keyed.restored_city_name, loc.city_name),
+               state_name = COALESCE(keyed.restored_state_name, loc.state_name),
+               state_code = COALESCE(keyed.computed_state_code, loc.state_code),
+               city_norm = COALESCE(keyed.computed_city_norm, loc.city_norm),
+               country_code = COALESCE(keyed.normalized_country, loc.country_code),
+               updated_at = now()
+          FROM keyed
+         WHERE loc.source_id = keyed.source_id
+           AND loc.resource_id = keyed.resource_id
+           AND keyed.computed_address_key IS NOT NULL
+           AND (
+                loc.address_key IS DISTINCT FROM keyed.computed_address_key::text
+             OR loc.zip5 IS DISTINCT FROM COALESCE(keyed.computed_zip5, loc.zip5)
+             OR loc.city_name IS DISTINCT FROM COALESCE(keyed.restored_city_name, loc.city_name)
+             OR loc.state_name IS DISTINCT FROM COALESCE(keyed.restored_state_name, loc.state_name)
+             OR loc.state_code IS DISTINCT FROM COALESCE(keyed.computed_state_code, loc.state_code)
+             OR loc.city_norm IS DISTINCT FROM COALESCE(keyed.computed_city_norm, loc.city_norm)
+             OR loc.country_code IS DISTINCT FROM COALESCE(keyed.normalized_country, loc.country_code)
+           )
+         RETURNING loc.source_id,
+                   loc.resource_id
+    )
+    SELECT
+        (SELECT COUNT(*) FROM candidates)::bigint AS candidate_rows,
+        (SELECT COUNT(*) FROM updated)::bigint AS updated_rows,
+        (SELECT source_id FROM candidates ORDER BY source_id DESC, resource_id DESC LIMIT 1)::varchar
+            AS last_source_id,
+        (SELECT resource_id FROM candidates ORDER BY source_id DESC, resource_id DESC LIMIT 1)::varchar
+            AS last_resource_id;"""
+
+
 def provider_directory_address_key_batch_sql(
     db_schema: str | None = None,
     *,
@@ -14476,39 +14512,7 @@ def provider_directory_address_key_batch_sql(
             {resolved_fields}
           FROM resolved
     ),
-    updated AS (
-        UPDATE {location_ref} AS loc
-           SET address_key = keyed.computed_address_key::text,
-               zip5 = COALESCE(keyed.computed_zip5, loc.zip5),
-               city_name = COALESCE(keyed.restored_city_name, loc.city_name),
-               state_name = COALESCE(keyed.restored_state_name, loc.state_name),
-               state_code = COALESCE(keyed.computed_state_code, loc.state_code),
-               city_norm = COALESCE(keyed.computed_city_norm, loc.city_norm),
-               country_code = COALESCE(keyed.normalized_country, loc.country_code),
-               updated_at = now()
-          FROM keyed
-         WHERE loc.source_id = keyed.source_id
-           AND loc.resource_id = keyed.resource_id
-           AND keyed.computed_address_key IS NOT NULL
-           AND (
-                loc.address_key IS DISTINCT FROM keyed.computed_address_key::text
-             OR loc.zip5 IS DISTINCT FROM COALESCE(keyed.computed_zip5, loc.zip5)
-             OR loc.city_name IS DISTINCT FROM COALESCE(keyed.restored_city_name, loc.city_name)
-             OR loc.state_name IS DISTINCT FROM COALESCE(keyed.restored_state_name, loc.state_name)
-             OR loc.state_code IS DISTINCT FROM COALESCE(keyed.computed_state_code, loc.state_code)
-             OR loc.city_norm IS DISTINCT FROM COALESCE(keyed.computed_city_norm, loc.city_norm)
-             OR loc.country_code IS DISTINCT FROM COALESCE(keyed.normalized_country, loc.country_code)
-           )
-         RETURNING loc.source_id,
-                   loc.resource_id
-    )
-    SELECT
-        (SELECT COUNT(*) FROM candidates)::bigint AS candidate_rows,
-        (SELECT COUNT(*) FROM updated)::bigint AS updated_rows,
-        (SELECT source_id FROM candidates ORDER BY source_id DESC, resource_id DESC LIMIT 1)::varchar
-            AS last_source_id,
-        (SELECT resource_id FROM candidates ORDER BY source_id DESC, resource_id DESC LIMIT 1)::varchar
-            AS last_resource_id;
+    {_location_key_batch_update_sql(location_ref)}
     """
 
 
@@ -78003,10 +78007,10 @@ async def _address_alias_generation(schema: str) -> int:
         raise RuntimeError(f"unsupported address alias schema version: {row.schema_version}")
     if (
         int(row.active_ruleset_version)
-        != address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION
+        != address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION
     ):
         raise RuntimeError(
-            f"unsupported numeric-grid alias ruleset: {row.active_ruleset_version}"
+            f"unsupported address alias ruleset: {row.active_ruleset_version}"
         )
     return int(row.generation)
 

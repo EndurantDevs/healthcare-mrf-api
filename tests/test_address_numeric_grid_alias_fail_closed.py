@@ -49,8 +49,8 @@ def test_alias_sql_and_runtime_values_reject_unsafe_inputs():
     ("state_record", "error_message"),
     (
         (None, "singleton state is missing"),
-        (SimpleNamespace(schema_version=2, active_ruleset_version=1, generation=0), "schema version"),
-        (SimpleNamespace(schema_version=1, active_ruleset_version=2, generation=0), "ruleset"),
+        (SimpleNamespace(schema_version=3, active_ruleset_version=1, generation=0), "schema version"),
+        (SimpleNamespace(schema_version=2, active_ruleset_version=2, generation=0), "ruleset"),
     ),
 )
 async def test_alias_state_rejects_missing_or_unknown_contracts(
@@ -170,7 +170,12 @@ async def test_alias_runner_rejects_mutated_candidate_rows_and_active_conflict()
     runner = await _prepared_alias_runner("apply")
     runner.execution.shadow_run_id = "00000000-0000-0000-0000-000000000001"
     runner.execution.reviewed_digest = "a" * 64
-    valid_shadow = SimpleNamespace(status="sealed", candidate_digest="a" * 64)
+    valid_shadow = SimpleNamespace(
+        status="sealed",
+        candidate_digest="a" * 64,
+        alias_kind=runner.execution.alias_kind,
+        ruleset_version=runner.execution.ruleset_version,
+    )
     session = Mock()
     session.execute = AsyncMock(
         side_effect=(

@@ -86,6 +86,7 @@ def _assert_alias_importer_contracts(importer_by_name):
         "alias_run_id",
         "expected_candidate_sha256",
         "reviewed_by",
+        "alias_kind",
     }
     assert importer_by_name["address-strict-source-backfill"]["family"] == "provider"
     assert (
@@ -116,6 +117,7 @@ def _assert_alias_importer_contracts(importer_by_name):
         "expected_target_address_key",
         "reason",
         "reviewed_by",
+        "alias_kind",
     }
 
 

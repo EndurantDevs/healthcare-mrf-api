@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -16,9 +15,11 @@ from db.models import db
 from process.address_numeric_grid_alias_store import (
     _alias_state,
     _approve_shadow_candidates,
+    _completion_parameters,
     _insert_run,
     _load_reviewed_shadow,
     _mark_failed,
+    _run_completion_sql,
     _shadow_run,
 )
 from process.address_numeric_grid_alias_support import (
@@ -31,7 +32,11 @@ from process.address_numeric_grid_alias_support import (
     _reviewer,
     _statement_timeout,
 )
-from process.ext import address_alias_sql
+from process.ext import (
+    address_alias_snapshot_sql,
+    address_alias_sql,
+    address_evidence_alias_sql,
+)
 from process.ext.address_canon import _archive_lock_key, archive_table_name
 
 
@@ -44,6 +49,8 @@ class _AliasExecution:
     zip_prefix: str | None
     timeout: str
     run_id: str
+    alias_kind: str
+    ruleset_version: int
     shadow_run_id: str | None = None
     reviewed_digest: str | None = None
     reviewer: str | None = None
@@ -59,28 +66,6 @@ class _AliasExecution:
     sample_rows: list[dict[str, Any]] = field(default_factory=list)
 
 
-def _run_completion_sql(schema: str) -> str:
-    runs = _relation(schema, address_alias_sql.ADDRESS_ALIAS_RUN_TABLE)
-    return f"""
-        UPDATE {runs}
-           SET status = :status,
-               candidate_digest = :candidate_digest,
-               archive_row_count = :archive_rows,
-               source_count = :source_count,
-               candidate_source_count = :candidate_sources,
-               candidate_row_count = :candidate_rows,
-               no_candidate_count = :no_candidate,
-               active_skipped_count = :active_skipped,
-               eligible_count = :eligible,
-               ambiguous_count = :ambiguous,
-               insufficient_provenance_count = :insufficient,
-               reason_buckets = CAST(:reason_buckets AS jsonb),
-               sample_rows = CAST(:sample_rows AS jsonb),
-               completed_at = now()
-         WHERE run_id = CAST(:run_id AS uuid);
-    """
-
-
 class _NumericGridAliasRunner:
     def __init__(self, request: NumericGridAliasRequest) -> None:
         self.request = request
@@ -89,6 +74,8 @@ class _NumericGridAliasRunner:
     async def execute(self) -> NumericGridAliasResult:
         """Execute one validated alias workflow request."""
         operation = address_alias_sql.numeric_grid_alias_mode(self.request.mode)
+        alias_kind = str(self.request.alias_kind or "").strip()
+        ruleset_version = address_alias_sql.alias_ruleset(alias_kind)
         schema = (
             self.request.schema
             or os.getenv("HLTHPRT_DB_SCHEMA")
@@ -96,8 +83,13 @@ class _NumericGridAliasRunner:
             or "mrf"
         )
         if operation == "off":
-            return await self._off_result(schema)
-        self.execution = await self._prepare_execution(operation, schema)
+            return await self._off_result(schema, alias_kind)
+        self.execution = await self._prepare_execution(
+            operation,
+            schema,
+            alias_kind,
+            ruleset_version,
+        )
         await self._insert_execution_run()
         try:
             await self._check_cancelled()
@@ -108,7 +100,11 @@ class _NumericGridAliasRunner:
             await _mark_failed(schema, self.execution.run_id, exc)
             raise
 
-    async def _off_result(self, schema: str) -> NumericGridAliasResult:
+    async def _off_result(
+        self,
+        schema: str,
+        alias_kind: str,
+    ) -> NumericGridAliasResult:
         async with db.transaction() as session:
             _, _, generation = await _alias_state(session, schema=schema, lock=False)
         return NumericGridAliasResult(
@@ -127,12 +123,15 @@ class _NumericGridAliasRunner:
             promoted=0,
             generation=generation,
             sample_rows=[],
+            alias_kind=alias_kind,
         )
 
     async def _prepare_execution(
         self,
         operation: str,
         schema: str,
+        alias_kind: str = address_alias_sql.NUMERIC_GRID_ALIAS_KIND,
+        ruleset_version: int = address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION,
     ) -> _AliasExecution:
         state_code, zip_prefix = _normalize_scope(
             self.request.state_code,
@@ -146,6 +145,8 @@ class _NumericGridAliasRunner:
             zip_prefix=zip_prefix,
             timeout=_statement_timeout(self.request.timeout),
             run_id=str(uuid.uuid4()),
+            alias_kind=alias_kind,
+            ruleset_version=ruleset_version,
         )
         if operation == "apply":
             await self._bind_reviewed_shadow(execution)
@@ -162,6 +163,8 @@ class _NumericGridAliasRunner:
             schema=execution.schema,
             shadow_run_id=shadow_run_id,
             expected_digest=reviewed_digest,
+            alias_kind=execution.alias_kind,
+            ruleset_version=execution.ruleset_version,
         )
         if execution.state_code not in {None, shadow_by_field.get("scope_state_code")}:
             raise ValueError("apply state scope differs from the reviewed shadow")
@@ -176,14 +179,18 @@ class _NumericGridAliasRunner:
     async def _insert_execution_run(self) -> None:
         execution = self._required_execution()
         await _insert_run(
-            schema=execution.schema,
-            run_id=execution.run_id,
-            mode=execution.operation,
-            state_code=execution.state_code,
-            zip_prefix=execution.zip_prefix,
-            shadow_run_id=execution.shadow_run_id,
-            reviewed_digest=execution.reviewed_digest,
-            reviewed_by=execution.reviewer,
+            run_by_field={
+                "schema": execution.schema,
+                "run_id": execution.run_id,
+                "mode": execution.operation,
+                "state_code": execution.state_code,
+                "zip_prefix": execution.zip_prefix,
+                "shadow_run_id": execution.shadow_run_id,
+                "reviewed_digest": execution.reviewed_digest,
+                "reviewed_by": execution.reviewer,
+                "alias_kind": execution.alias_kind,
+                "ruleset_version": execution.ruleset_version,
+            },
         )
 
     async def _execute_locked(self, session: Any) -> None:
@@ -243,9 +250,10 @@ class _NumericGridAliasRunner:
             )
         ).first()
         if owned_run is None:
-            raise RuntimeError("numeric-grid alias run is no longer running")
+            raise RuntimeError("address alias run is no longer running")
 
     async def _validate_reviewed_shadow(self, session: Any) -> None:
+        """Recheck the reviewed policy, digest, and revocation fences."""
         execution = self._required_execution()
         if execution.operation != "apply":
             return
@@ -254,7 +262,7 @@ class _NumericGridAliasRunner:
             await session.execute(
                 text(
                     f"""
-                    SELECT status, candidate_digest
+                    SELECT status, candidate_digest, alias_kind, ruleset_version
                     FROM {runs}
                     WHERE run_id = CAST(:shadow_run_id AS uuid)
                       AND mode = 'shadow'
@@ -268,13 +276,20 @@ class _NumericGridAliasRunner:
             shadow_record is None
             or shadow_record.status != "sealed"
             or shadow_record.candidate_digest != execution.reviewed_digest
+            or shadow_record.alias_kind != execution.alias_kind
+            or int(shadow_record.ruleset_version) != execution.ruleset_version
         ):
             raise RuntimeError("reviewed shadow changed before apply")
         await self._reject_revoked_shadow(session)
         candidate_records = (
             await session.execute(
                 text(
-                    address_alias_sql.candidate_rows_sql(schema=execution.schema)
+                    (
+                        address_alias_snapshot_sql.evidence_candidate_rows_sql
+                        if execution.alias_kind
+                        == address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND
+                        else address_alias_snapshot_sql.candidate_rows_sql
+                    )(schema=execution.schema)
                     .strip()
                     .removesuffix(";")
                     + " FOR SHARE;"
@@ -307,6 +322,25 @@ class _NumericGridAliasRunner:
 
     async def _collect_candidate_snapshot(self, session: Any) -> None:
         execution = self._required_execution()
+        if execution.alias_kind == address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND:
+            stale_rows = int(
+                (
+                    await session.execute(
+                        text(
+                            address_evidence_alias_sql.evidence_input_stale_count_sql(
+                                schema=execution.schema
+                            )
+                        ),
+                        {"alias_generation": execution.generation},
+                    )
+                ).scalar()
+                or 0
+            )
+            if stale_rows:
+                raise RuntimeError(
+                    "evidence alias discovery requires a current full "
+                    "entity-address-unified rebuild"
+                )
         (
             execution.metrics_by_reason,
             execution.digest,
@@ -317,11 +351,14 @@ class _NumericGridAliasRunner:
             session,
             schema=execution.schema,
             archive=execution.archive,
-            run_id=execution.run_id,
-            state_code=execution.state_code,
-            zip_prefix=execution.zip_prefix,
+            scope_by_field={
+                "run_id": execution.run_id,
+                "scope_state_code": execution.state_code,
+                "scope_zip_prefix": execution.zip_prefix,
+                "retry_shadow_run_id": execution.shadow_run_id,
+            },
             sample_limit=execution.request.sample_limit,
-            retry_shadow_run_id=execution.shadow_run_id,
+            alias_kind=execution.alias_kind,
         )
         await self._check_cancelled()
         if (
@@ -368,6 +405,8 @@ class _NumericGridAliasRunner:
                     "shadow_run_id": execution.shadow_run_id,
                     "apply_run_id": execution.run_id,
                     "candidate_digest": execution.digest,
+                    "alias_kind": execution.alias_kind,
+                    "ruleset_version": execution.ruleset_version,
                 },
             )
         ).first()
@@ -385,37 +424,8 @@ class _NumericGridAliasRunner:
         )
         await session.execute(
             text(_run_completion_sql(execution.schema)),
-            self._completion_parameters(execution),
+            _completion_parameters(execution),
         )
-
-    def _completion_parameters(self, execution: _AliasExecution) -> dict[str, Any]:
-        metric_map = execution.metrics_by_reason
-        reason_map = {
-            reason_name: metric_map.get(reason_name, 0)
-            for reason_name in (
-                "eligible",
-                "ambiguous",
-                "no_candidate",
-                "active_skipped",
-                "insufficient_provenance",
-            )
-        }
-        return {
-            "status": execution.final_status,
-            "candidate_digest": execution.digest,
-            "archive_rows": execution.archive_rows,
-            "source_count": execution.source_count,
-            "candidate_sources": metric_map.get("candidate_sources", 0),
-            "candidate_rows": metric_map.get("candidate_rows", 0),
-            "no_candidate": metric_map.get("no_candidate", 0),
-            "active_skipped": metric_map.get("active_skipped", 0),
-            "eligible": metric_map.get("eligible", 0),
-            "ambiguous": metric_map.get("ambiguous", 0),
-            "insufficient": metric_map.get("insufficient_provenance", 0),
-            "reason_buckets": json.dumps(reason_map, sort_keys=True),
-            "sample_rows": json.dumps(execution.sample_rows, sort_keys=True),
-            "run_id": execution.run_id,
-        }
 
     async def _check_cancelled(self) -> None:
         if self.request.cancel_check:
@@ -440,11 +450,12 @@ class _NumericGridAliasRunner:
             promoted=execution.promoted,
             generation=execution.final_generation,
             sample_rows=execution.sample_rows,
+            alias_kind=execution.alias_kind,
         )
 
     def _required_execution(self) -> _AliasExecution:
         if self.execution is None:
-            raise RuntimeError("numeric-grid alias execution was not prepared")
+            raise RuntimeError("address alias execution was not prepared")
         return self.execution
 
 

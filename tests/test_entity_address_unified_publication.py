@@ -68,7 +68,7 @@ class _RecordingDB:
     async def first(self, statement, **_params):
         if "address_alias_state_v1" in statement:
             return SimpleNamespace(
-                schema_version=1,
+                schema_version=2,
                 active_ruleset_version=1,
                 generation=0,
             )

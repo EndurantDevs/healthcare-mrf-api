@@ -119,7 +119,7 @@ async def _seed_serving_fence_state(
         f"""
         INSERT INTO "{schema}".address_alias_state_v1
             (singleton, schema_version, active_ruleset_version, generation)
-        VALUES (true, 1, 1, :generation);
+        VALUES (true, 2, 1, :generation);
         """,
         generation=generation,
     )

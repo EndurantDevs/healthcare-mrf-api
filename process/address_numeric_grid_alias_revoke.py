@@ -30,6 +30,7 @@ class NumericGridAliasRevokeResult:
     revoked_reason: str
     revoked_by: str
     generation: int
+    alias_kind: str = address_alias_sql.NUMERIC_GRID_ALIAS_KIND
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,8 @@ class _RevokeContext:
     reviewer: str
     timeout: str
     run_id: str
+    alias_kind: str
+    ruleset_version: int
 
 
 def _uuid(value: str | None, *, name: str) -> str:
@@ -66,6 +69,8 @@ async def _lock_active_alias(
     source_key: str,
     target_key: str,
     timeout: str,
+    alias_kind: str = address_alias_sql.NUMERIC_GRID_ALIAS_KIND,
+    ruleset_version: int = address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION,
 ) -> None:
     await session.execute(text(f"SET LOCAL lock_timeout = '{timeout}';"))
     await session.execute(text(f"SET LOCAL statement_timeout = '{timeout}';"))
@@ -78,15 +83,21 @@ async def _lock_active_alias(
                 SELECT source_address_key::text, target_address_key::text
                 FROM {aliases}
                 WHERE source_address_key = CAST(:source_key AS uuid)
+                  AND alias_kind = :alias_kind
+                  AND ruleset_version = :ruleset_version
                   AND revoked_at IS NULL
                 FOR UPDATE;
                 """
             ),
-            {"source_key": source_key},
+            {
+                "source_key": source_key,
+                "alias_kind": alias_kind,
+                "ruleset_version": ruleset_version,
+            },
         )
     ).first()
     if active_alias is None:
-        raise RuntimeError("active numeric-grid alias was not found")
+        raise RuntimeError("active address alias was not found")
     if str(active_alias.target_address_key) != target_key:
         raise RuntimeError(
             "active alias target differs from expected target: "
@@ -102,6 +113,8 @@ async def _revoke_alias_row(
     revoke_reason: str,
     reviewer: str,
     run_id: str,
+    alias_kind: str,
+    ruleset_version: int,
 ) -> None:
     await session.execute(
         text(
@@ -113,6 +126,8 @@ async def _revoke_alias_row(
                    revoke_run_id = CAST(:run_id AS uuid),
                    updated_at = now()
              WHERE source_address_key = CAST(:source_key AS uuid)
+               AND alias_kind = :alias_kind
+               AND ruleset_version = :ruleset_version
                AND revoked_at IS NULL;
             """
         ),
@@ -121,6 +136,8 @@ async def _revoke_alias_row(
             "reason": revoke_reason,
             "reviewed_by": reviewer,
             "run_id": run_id,
+            "alias_kind": alias_kind,
+            "ruleset_version": ruleset_version,
         },
     )
 
@@ -158,7 +175,10 @@ async def _prepare_revoke_context(
     reviewed_by: str,
     schema: str | None,
     timeout: str,
+    alias_kind: str,
 ) -> _RevokeContext:
+    normalized_alias_kind = str(alias_kind or "").strip()
+    ruleset_version = address_alias_sql.alias_ruleset(normalized_alias_kind)
     context = _RevokeContext(
         schema=schema
         or os.getenv("HLTHPRT_DB_SCHEMA")
@@ -173,16 +193,22 @@ async def _prepare_revoke_context(
         reviewer=_reviewer(reviewed_by),
         timeout=_statement_timeout(timeout),
         run_id=str(uuid.uuid4()),
+        alias_kind=normalized_alias_kind,
+        ruleset_version=ruleset_version,
     )
     await _insert_run(
-        schema=context.schema,
-        run_id=context.run_id,
-        mode="revoke",
-        state_code=None,
-        zip_prefix=None,
-        shadow_run_id=None,
-        reviewed_digest=None,
-        reviewed_by=context.reviewer,
+        run_by_field={
+            "schema": context.schema,
+            "run_id": context.run_id,
+            "mode": "revoke",
+            "state_code": None,
+            "zip_prefix": None,
+            "shadow_run_id": None,
+            "reviewed_digest": None,
+            "reviewed_by": context.reviewer,
+            "alias_kind": context.alias_kind,
+            "ruleset_version": context.ruleset_version,
+        },
     )
     return context
 
@@ -198,6 +224,8 @@ async def _execute_revoke(context: _RevokeContext) -> NumericGridAliasRevokeResu
             source_key=context.source_key,
             target_key=context.target_key,
             timeout=context.timeout,
+            alias_kind=context.alias_kind,
+            ruleset_version=context.ruleset_version,
         )
         await _revoke_alias_row(
             session,
@@ -206,6 +234,8 @@ async def _execute_revoke(context: _RevokeContext) -> NumericGridAliasRevokeResu
             revoke_reason=context.reason,
             reviewer=context.reviewer,
             run_id=context.run_id,
+            alias_kind=context.alias_kind,
+            ruleset_version=context.ruleset_version,
         )
         _, _, generation = await _alias_state(
             session,
@@ -230,6 +260,7 @@ async def _execute_revoke(context: _RevokeContext) -> NumericGridAliasRevokeResu
         revoked_reason=context.reason,
         revoked_by=context.reviewer,
         generation=generation,
+        alias_kind=context.alias_kind,
     )
 
 
@@ -241,6 +272,7 @@ async def revoke_numeric_grid_alias(
     reviewed_by: str,
     schema: str | None = None,
     timeout: str = "30s",
+    alias_kind: str = address_alias_sql.NUMERIC_GRID_ALIAS_KIND,
 ) -> NumericGridAliasRevokeResult:
     """Revoke exactly one active alias and advance the active-set generation."""
     context = await _prepare_revoke_context(
@@ -250,6 +282,7 @@ async def revoke_numeric_grid_alias(
         reviewed_by=reviewed_by,
         schema=schema,
         timeout=timeout,
+        alias_kind=alias_kind,
     )
     try:
         return await _execute_revoke(context)
