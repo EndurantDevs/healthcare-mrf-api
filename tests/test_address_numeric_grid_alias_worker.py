@@ -30,6 +30,7 @@ async def test_control_worker_forwards_reviewed_alias_inputs_and_progress(monkey
         promoted=0,
         generation=7,
         sample_rows=[],
+        alias_kind="evidence_gated_address_match_v1",
     )
     run = AsyncMock(return_value=alias_result)
     cancel = AsyncMock()
@@ -46,6 +47,7 @@ async def test_control_worker_forwards_reviewed_alias_inputs_and_progress(monkey
             "zip_prefix": "84",
             "sample_limit": 5,
             "timeout": "30s",
+            "alias_kind": "evidence_gated_address_match_v1",
         },
     )
 
@@ -54,6 +56,7 @@ async def test_control_worker_forwards_reviewed_alias_inputs_and_progress(monkey
     assert run.await_args.kwargs["zip_prefix"] == "84"
     assert run.await_args.kwargs["sample_limit"] == 5
     assert run.await_args.kwargs["timeout"] == "30s"
+    assert run.await_args.kwargs["alias_kind"] == "evidence_gated_address_match_v1"
     await run.await_args.kwargs["cancel_check"]()
     cancel.assert_awaited_once_with(
         {"worker": "synthetic"},
@@ -63,6 +66,7 @@ async def test_control_worker_forwards_reviewed_alias_inputs_and_progress(monkey
             "zip_prefix": "84",
             "sample_limit": 5,
             "timeout": "30s",
+            "alias_kind": "evidence_gated_address_match_v1",
         },
     )
     assert progress.call_args.kwargs["run_id"] == alias_result.run_id
@@ -187,20 +191,30 @@ async def test_alias_command_runs_inline_and_enqueues(monkeypatch):
         await address_numeric_grid_alias_worker.run_address_numeric_grid_alias_command(
             mode="shadow",
             sample_limit=4,
+            alias_kind="evidence_gated_address_match_v1",
         )
     )
     queued_result = (
         await address_numeric_grid_alias_worker.run_address_numeric_grid_alias_command(
             mode="apply",
+            alias_kind="evidence_gated_address_match_v1",
             enqueue=True,
         )
     )
 
     assert inline_result == {"status": "sealed"}
     assert process_alias.await_args.args[1]["sample_limit"] == 4
+    assert (
+        process_alias.await_args.args[1]["alias_kind"]
+        == "evidence_gated_address_match_v1"
+    )
     assert queued_result is None
     create_pool.assert_awaited_once()
     assert queue.enqueue_job.await_args.args[0] == "process_address_numeric_grid_alias"
+    assert (
+        queue.enqueue_job.await_args.args[1]["alias_kind"]
+        == "evidence_gated_address_match_v1"
+    )
 
 
 @pytest.mark.asyncio
@@ -276,6 +290,7 @@ async def test_backfill_worker_uses_default_mutation_cap(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_revoke_worker_and_command_paths(monkeypatch):
+    """Evidence alias kind survives inline, queued, and revoke adapters."""
     revoke_result = NumericGridAliasRevokeResult(
         run_id="00000000-0000-0000-0000-000000000003",
         status="revoked",
@@ -284,6 +299,7 @@ async def test_revoke_worker_and_command_paths(monkeypatch):
         revoked_reason="synthetic rollback",
         revoked_by="synthetic-reviewer",
         generation=5,
+        alias_kind="evidence_gated_address_match_v1",
     )
     revoke_alias = AsyncMock(return_value=revoke_result)
     progress = Mock()
@@ -303,9 +319,13 @@ async def test_revoke_worker_and_command_paths(monkeypatch):
         "expected_target_address_key": revoke_result.target_address_key,
         "reason": revoke_result.revoked_reason,
         "reviewed_by": revoke_result.revoked_by,
+        "alias_kind": "evidence_gated_address_match_v1",
     }
 
     worker_payload = await _run_revoke_worker(revoke_result, progress)
+    assert revoke_alias.await_args.kwargs["alias_kind"] == (
+        "evidence_gated_address_match_v1"
+    )
     process_revoke = AsyncMock(return_value=revoke_result.__dict__)
     monkeypatch.setattr(
         address_numeric_grid_alias_worker,
@@ -325,6 +345,9 @@ async def test_revoke_worker_and_command_paths(monkeypatch):
     assert queued_result is None
     create_pool.assert_awaited_once()
     assert queue.enqueue_job.await_args.args[0] == "process_address_numeric_grid_alias_revoke"
+    assert queue.enqueue_job.await_args.args[1]["alias_kind"] == (
+        "evidence_gated_address_match_v1"
+    )
 
 
 async def _run_revoke_worker(revoke_result, progress):
@@ -336,6 +359,7 @@ async def _run_revoke_worker(revoke_result, progress):
                 "expected_target_address_key": revoke_result.target_address_key,
                 "reason": revoke_result.revoked_reason,
                 "reviewed_by": revoke_result.revoked_by,
+                "alias_kind": "evidence_gated_address_match_v1",
             },
         )
     )

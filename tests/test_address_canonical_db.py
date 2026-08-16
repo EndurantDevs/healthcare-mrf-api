@@ -59,6 +59,11 @@ async def _archive_v2_rows(schema):
 
 
 def _resolve_stats_projection(stats):
+    reason_counts_by_name = {
+        key: value
+        for key, value in stats.reason_buckets.items()
+        if not key.startswith("canonical_materializer_")
+    }
     return {
         "staged": stats.staged,
         "distinct_keys": stats.distinct_keys,
@@ -67,7 +72,7 @@ def _resolve_stats_projection(stats):
         "null_key_rows": stats.null_key_rows,
         "eligible_key_rows": stats.eligible_key_rows,
         "eligible_null_key_rows": stats.eligible_null_key_rows,
-        "reason_buckets": stats.reason_buckets,
+        "reason_buckets": reason_counts_by_name,
         "gate_violations": stats.gate_violations,
     }
 
@@ -182,6 +187,12 @@ async def test_address_sql_is_parallel_safe():
     assert await db.scalar(f"SELECT {schema}.addr_zip5_norm_v1('2138');") == "02138"
     assert await db.scalar(f"SELECT {schema}.addr_country_code_v1('canada');") == "CANADA"
     assert await db.scalar(f"SELECT {schema}.addr_country_code_v1('Usa');") == "US"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_address_sql_pub28_street_normalization():
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('11 Noreste Turnpike', '');") == "11netpke"
     assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('12 County Underpass', '');") == "12countyupas"
     assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('100 Florida Ave Fl 2', '');") == "100floridaave"
@@ -231,6 +242,12 @@ async def test_address_sql_is_parallel_safe():
     assert await db.scalar(
         f"SELECT {schema}.addr_street_norm_v1('209 S HOUSTON AVE DEPT', 'DEPARTMENT');"
     ) == "209shoustonavedeptdepartment"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_address_sql_duplicate_unit_identity():
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     assert await db.scalar(
         f"""
         SELECT {schema}.addr_identity_key_v1(
@@ -270,6 +287,12 @@ async def test_address_sql_is_parallel_safe():
     assert await db.scalar(
         f"SELECT {schema}.addr_identity_key_v1('123 Main St 1st Fl', '1st Floor', 'Austin', 'TX', '78701', 'US');"
     ) == "v2|123mainst|fl1||TX|78701|US|street"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_address_sql_building_unit_identity():
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     assert await db.scalar(
         f"""
         SELECT {schema}.addr_identity_key_v1(
@@ -299,6 +322,12 @@ async def test_address_sql_is_parallel_safe():
     assert await db.scalar(
         f"SELECT {schema}.addr_unit_norm_v1('7281 E EARLL DR STE 1 BLDG A', 'Ste 1 Bldg A');"
     ) == "bldga"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_address_sql_office_unit_identity():
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     assert await db.scalar(
         f"""
         SELECT {schema}.addr_identity_key_v1(
@@ -328,6 +357,12 @@ async def test_address_sql_is_parallel_safe():
     assert await db.scalar(
         f"SELECT {schema}.addr_unit_norm_v1('1623 3rd Ave Ste 201 Ofc 5', 'Ste 201 Ofc 5');"
     ) == "ofc5"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_address_sql_unit_token_normalization():
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     assert await db.scalar(f"SELECT {schema}.addr_unit_norm_v1('100 Main Street Basement', '');") == "bsmt"
     assert await db.scalar(f"SELECT {schema}.addr_unit_norm_v1('100 Main Street', 'Penthouse');") == "ph"
     assert await db.scalar(f"SELECT {schema}.addr_unit_norm_v1('123 Main St Ste 200', 'Apt 5');") == "apt5"
@@ -350,6 +385,12 @@ async def test_address_sql_is_parallel_safe():
         )
         == "27drmellichampdr"
     )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_address_sql_identity_edge_cases():
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     assert (
         await db.scalar(
             f"""
@@ -604,6 +645,15 @@ async def test_rust_materialized_resolve_matches_sql_resolve(monkeypatch):
     )
     rust_rows = await _archive_v2_rows(schema)
 
+    assert sql_stats.reason_buckets["canonical_materializer_rust"] == 0
+    assert sql_stats.reason_buckets["canonical_materializer_sql"] == 1
+    assert rust_stats.reason_buckets["canonical_materializer_rust"] == 1
+    assert rust_stats.reason_buckets["canonical_materializer_sql"] == 0
+    assert (
+        rust_stats.reason_buckets["canonical_materialized_key_rows"]
+        == sql_stats.reason_buckets["canonical_materialized_key_rows"]
+        == 5
+    )
     assert _resolve_stats_projection(rust_stats) == _resolve_stats_projection(sql_stats)
     assert rust_rows == sql_rows
 
@@ -1071,8 +1121,8 @@ async def _completion_alias_keys(schema, stage_table):
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_resolve_aliases_missing_suffix_and_direction_only_when_unique(monkeypatch):
-    """Verify resolve aliases missing suffix and direction only when unique."""
+async def test_resolve_does_not_apply_unreviewed_completion_aliases(monkeypatch):
+    """Only reviewed persisted aliases may change an effective address key."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     stage_table = "address_canon_stage_completion_alias_test"
@@ -1106,13 +1156,11 @@ async def test_resolve_aliases_missing_suffix_and_direction_only_when_unique(mon
         ambiguous_alias,
         ambiguous_archive_key,
     ) = await _completion_alias_keys(schema, stage_table)
-    assert holcombe_alias == holcombe_target
-    assert directional_alias == directional_target
+    assert holcombe_alias is None
+    assert directional_alias is None
     assert ambiguous_alias is None
     assert ambiguous_archive_key == ambiguous_original
-    assert stats.reason_buckets["completion_aliases"] == 2
-    assert stats.reason_buckets["completion_suffix_aliases"] == 1
-    assert stats.reason_buckets["completion_directional_aliases"] == 1
+    assert "completion_aliases" not in stats.reason_buckets
 
 
 @pytest.mark.asyncio(loop_scope="session")

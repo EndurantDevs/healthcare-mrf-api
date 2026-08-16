@@ -5,9 +5,7 @@
 from dataclasses import dataclass
 
 from tests.test_address_numeric_grid_alias_db import (
-    ROOT,
     _insert_archive_address,
-    _load_module,
     _mark_failed,
     _requires_test_database,
     asyncpg,
@@ -16,6 +14,9 @@ from tests.test_address_numeric_grid_alias_db import (
     pytest,
     run_numeric_grid_alias,
     run_strict_source_backfill,
+)
+from tests.test_address_numeric_grid_alias_runtime_db import (
+    _create_alias_probe_schema,
 )
 
 
@@ -40,25 +41,9 @@ async def _connect_probe_database():
 
 async def _create_backfill_schema(schema: str) -> None:
     """Create canonical and alias relations in an isolated probe schema."""
-    foundation = _load_module(
-        ROOT / "alembic/versions/20260611100000_address_canonical_foundation.py",
-        "address_alias_backfill_foundation",
-    )
-    migration = _load_module(
-        ROOT / "alembic/versions/20260811100000_address_numeric_grid_alias.py",
-        "address_alias_backfill_migration",
-    )
     connection = await _connect_probe_database()
     try:
-        await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
-        await connection.execute(f'CREATE SCHEMA "{schema}";')
-        await connection.execute(foundation._create_functions_sql(schema))
-        await connection.execute(foundation._create_archive_sql(schema))
-        await connection.execute(migration._numeric_grid_function_sql(schema))
-        for statement in migration._split_sql_statements(
-            migration._alias_schema_sql(schema)
-        ):
-            await connection.execute(statement)
+        await _create_alias_probe_schema(connection, schema, "backfill")
     finally:
         await connection.close()
 

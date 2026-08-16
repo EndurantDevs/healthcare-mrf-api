@@ -127,13 +127,10 @@ until `HLTHPRT_ADDRESS_CANON_SOURCES` is set.
   enabled importer that leaves a street+state+ZIP row without `address_key`
   emits a live warning event; `gate_sample_rows` carries bounded multi-source
   rows for the manual eyeball review.
-- Resolve performs conservative sibling repairs before archive writes:
-  missing suffix/directional rows are keyed only when the completion-normalized
-  cluster has one higher-specificity sibling. Missing ZIP rows are not inferred
-  from street/line normalization or archive sibling matches; they remain
-  null-keyed unless an explicit coordinate-based ZIP restore step resolves them.
-  Ambiguous clusters remain split or null-keyed and are reported in
-  `ResolveStats.reason_buckets`.
+- Resolve never infers a missing direction or suffix. Relaxed equivalence is
+  applied only from active, reviewed `address_alias_v1` rows after canonical
+  keys are materialized. Missing ZIP rows remain null-keyed unless an explicit
+  coordinate-based ZIP restore step resolves them.
 - Do not point `HLTHPRT_ADDRESS_ARCHIVE_TABLE` at the live legacy
   `address_archive` until the Phase 3 migration and verification steps are done.
 - `HLTHPRT_ADDRESS_ARCHIVE_CUTOVER` (default **off**) gates the Phase 4 reader
@@ -145,7 +142,24 @@ until `HLTHPRT_ADDRESS_CANON_SOURCES` is set.
   archive without geocodes. With the flag off, behavior is identical to
   legacy even when the v2 table exists.
 
-## Reviewed Numeric-Grid Aliases
+## Reviewed Address Aliases
+
+The shared workflow supports two closed policy kinds:
+
+- `numeric_grid_direction_v1` is the existing numeric-grid structural rule.
+- `evidence_gated_address_match_v1` discovers exact address equivalences from
+  current provider-serving evidence. It requires one valid shared NPI, country,
+  state, exact ZIP5, one globally unique target key, and at least two strict
+  target source bits. It permits candidate-confirmed bare/spaced units, unit
+  punctuation, direction relocation, and a one-sided terminal suffix. Missing
+  directions, descriptive second lines, route-number reinterpretation,
+  conflicting markers, ambiguous targets, and `premise_only` results are never
+  eligible.
+
+Both policies preserve `identity_key`, `premise_key`, `address_key`, and the
+canonical ruleset version. Rust remains the preferred import materializer;
+reviewed aliases are projected only after Rust or PostgreSQL has produced the
+same canonical keys.
 
 Numeric-grid repair is an offline, generic structural rule. It is not fuzzy
 matching and it is not state-specific. Optional state and ZIP scopes only bound
@@ -166,6 +180,12 @@ terminal run state immutable and require revocation instead of deletion, but a
 database owner can bypass row triggers (including with `TRUNCATE`). Database
 owner access is therefore an explicit trusted operational boundary.
 
+Before the first evidence-gated shadow after deploying the schema-2 migration,
+run the full Provider Directory address-artifact rebuild and then the full
+unified-address rebuild from step 5. The migration advances the alias
+generation, so pre-deploy serving artifacts fail the evidence fence by design.
+Numeric-grid shadows do not depend on this serving-evidence preflight.
+
 1. Seal an initial shadow. The command prints JSON containing the immutable
    `run_id`, `candidate_digest`, counts, and bounded samples.
 
@@ -176,7 +196,22 @@ owner access is therefore an explicit trusted operational boundary.
      --zip-prefix 75
    ```
 
-2. If target provenance is missing because the strict column was introduced
+   For evidence-gated comparison, use the same workflow with the explicit
+   policy kind:
+
+   ```bash
+   python main.py start address-numeric-grid-alias \
+     --alias-kind evidence_gated_address_match_v1 \
+     --mode shadow
+   ```
+
+   Evidence shadows fail closed unless every current unified-address row was
+   built at the active alias generation. The schema-2 upgrade advances that
+   generation once, so complete the two rebuilds in step 5 immediately after
+   deployment and again after every activation or revocation before starting
+   another shadow.
+
+2. For numeric-grid shadows only, if target provenance is missing because the strict column was introduced
    after existing imports, attest only the candidate targets from that exact
    shadow. The stored source `address_key` is used solely as an indexed
    prefilter; both key and identity are recomputed from raw source components.
@@ -207,8 +242,9 @@ owner access is therefore an explicit trusted operational boundary.
    lineage flag. Re-enable that source only after a source-observed postal-code
    marker is persisted before restoration.
 
-3. Run a new shadow with the same scope. Review this new run—not the first
-   one—because its digest snapshots the attested target bitmasks.
+3. Run a new shadow with the same scope and alias kind. Review this new
+   run—not the first one—because its digest snapshots the attested target
+   bitmasks and evidence fields.
 
    ```sql
    SELECT
@@ -232,6 +268,10 @@ owner access is therefore an explicit trusted operational boundary.
        candidate_count,
        target_strict_source_bits,
        target_strict_source_count,
+       match_rule,
+       match_classification,
+       evidence_npi,
+       evidence_npi_count,
        decision
    FROM mrf.address_alias_candidate_v1
    WHERE run_id = '<new-shadow-run-id>'::uuid
@@ -248,6 +288,15 @@ owner access is therefore an explicit trusted operational boundary.
      --expected-candidate-sha256 <new-exact-digest> \
      --reviewed-by <operator>
    ```
+
+   Include `--alias-kind evidence_gated_address_match_v1` when applying an
+   evidence-gated shadow; apply rejects a kind mismatch.
+
+   On dev, submit the shadow and apply through the deployment control API with importer
+   `address-numeric-grid-alias`, node `local_mrf`, and the equivalent `params`
+   (`alias_kind`, `mode`, then the sealed `alias_run_id`,
+   `expected_candidate_sha256`, and `reviewed_by`). Preserve distinct
+   idempotency keys and the exact terminal receipts.
 
 5. An activation changes the alias generation. Rebuild the full Provider
    Directory address artifact set and then run a full unified-address rebuild.
@@ -268,6 +317,46 @@ owner access is therefore an explicit trusted operational boundary.
    corroboration artifacts to replace all source partitions at the new alias
    generation. The `addresses` target includes both network-catalog and
    corroboration artifacts; partial or source-scoped rebuilds fail closed.
+
+   On dev, dispatch every mutation through the deployment control API; do not invoke the
+   CLI directly in an application pod. Post to `http://127.0.0.1:8095/v1/runs`
+   from the control deployment with its bearer token. The minimum
+   post-activation sequence is:
+
+   ```json
+   {"importer":"provider-directory-fhir","node_id":"local_mrf","params":{"publish_artifacts_only":true,"publish_artifacts_targets":"addresses","full_address_artifact_rebuild":true},"idempotency_key":"address-alias-g<GEN>-provider-directory-addresses-attempt<N>","triggered_by":"manual","actor":"devops"}
+   ```
+
+   Wait for that exact run to reach terminal `succeeded`, then submit:
+
+   ```json
+   {"importer":"entity-address-unified","node_id":"local_mrf","params":{"refresh_mode":"full","publish":true,"serving_only_refresh":true},"idempotency_key":"address-alias-g<GEN>-entity-address-full-attempt<N>","triggered_by":"manual","actor":"devops"}
+   ```
+
+   Use `serving_only_refresh: false` when acceptance requires a comprehensive
+   rebuild of unified support/provenance tables, not only the minimum serving
+   refresh. Preserve each returned `run_id`; ensure its worker through
+   `POST /v1/runs/<run_id>/workers/ensure`, and poll the exact run. Proceed only
+   from terminal `succeeded`; `failed`, `canceled`, and `dead_letter` abort the
+   chain. A `409` response or a completed Kubernetes Job is not proof of import
+   success.
+
+   A deliberately complete address-source re-import is broader than alias
+   activation. Serialize `geo`, `nucc`, `cms-doctors`, `facility-anchors`,
+   `provider-enrichment`, `npi`, `mrf`, `partd-formulary-network`, and
+   `pharmacy-license`, each with `params: {}`, through the same control API;
+   then run the two artifact jobs above with `serving_only_refresh: false`.
+   Do not routinely append `address-archive-v2-migrate`: it is the one-time
+   legacy-to-v2 copy, not a source refresh. A full external Provider Directory
+   acquisition is also a separate freshness operation; artifact-only rebuilds
+   use the currently published dataset without fetching it.
+
+   Every canonical writer must report exactly one selected materializer in
+   `address_resolve.reason_buckets` (or its captured worker log):
+   `canonical_materializer_rust=1` and `canonical_materializer_sql=0` is the
+   expected fast path, while `canonical_materialized_key_rows` records the row
+   count. SQL fallback remains correct but must be explained in the release
+   receipt before continuing.
 
    Verify that the overlay receipt equals the active generation and neither
    serving artifact retains an active source key:
@@ -290,20 +379,57 @@ owner access is therefore an explicit trusted operational boundary.
    JOIN mrf.address_alias_v1 AS alias
      ON alias.source_address_key = unified.address_key
     AND alias.revoked_at IS NULL;
+
+   SELECT count(*) AS bad_active_alias_targets
+   FROM mrf.address_alias_v1 AS alias
+   LEFT JOIN mrf.address_archive_v2 AS target
+     ON target.address_key = alias.target_address_key
+    AND target.merged_into IS NULL
+   WHERE alias.revoked_at IS NULL
+     AND target.address_key IS NULL;
+
+   SELECT count(*) AS unified_stale_alias_generation
+   FROM mrf.entity_address_unified AS unified
+   CROSS JOIN mrf.address_alias_state_v1 AS state
+   WHERE state.singleton
+     AND unified.base_address_version IS DISTINCT FROM
+         'address_archive_v2:v2+fmt-v2+alias-v1:g' || state.generation::text;
    ```
+
+   All residual/staleness counts must be zero. Retain the publication receipts,
+   active generation, deployed source SHA/image digest, migration head, run
+   requests, terminal responses, worker exit/restart evidence, and materializer
+   metrics.
+
+   Finally, retain before/after canaries for three reviewed alias NPIs. Require
+   `/api/v1/healthcheck/ready`, then verify `/api/v1/npi/all`,
+   `/api/v1/npi/id/<NPI>`, `/api/v1/npi/id/<NPI>/full_taxonomy`, and
+   `/api/v1/npi/match-candidates?address_key=<target>&include_sources=1&include_evidence=1`.
+   The target key must serve the expected NPI and the active source key must not
+   remain a distinct candidate. Also retain ZIP and national responses from
+   `/api/v1/pricing/providers/<NPI>/score`. Public `address_key` fields are
+   expected; internal alias rows, candidate digests, and source identity keys
+   are not.
 
 Revocation is one-way and also changes the generation. It requires the exact
 active source and expected target keys, an operator, and a reason. A revoked
 shadow cannot be reapplied; create a new shadow for any future decision. After
-revocation, repeat both full artifact rebuilds above.
+revocation, repeat both full artifact rebuilds above. Revocation stops future
+alias projection, but it does not subtract ordinary `source_bits` already
+projected into an archive target. Reconstruct the archive from raw source
+lineage if exact historical provenance rollback is required; the two derived
+artifact rebuilds do not perform that reconstruction.
 
 ```bash
 python main.py start address-numeric-grid-alias-revoke \
+  --alias-kind evidence_gated_address_match_v1 \
   --source-address-key <source-uuid> \
   --expected-target-address-key <target-uuid> \
   --reason "reviewed rollback" \
   --reviewed-by <operator>
 ```
+
+Omit `--alias-kind` only for the default numeric-grid policy.
 
 No public request joins `address_alias_v1`; active mappings are consumed only
 while building archive, overlay, and unified artifacts. This preserves the

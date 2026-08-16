@@ -69,7 +69,7 @@ async def _temporary_schema():
         f"""
         INSERT INTO {schema}.address_alias_state_v1 (
             singleton, schema_version, active_ruleset_version, generation
-        ) VALUES (true, 1, 1, 0);
+        ) VALUES (true, 2, 1, 0);
         """
     )
     try:

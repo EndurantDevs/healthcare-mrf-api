@@ -166,8 +166,7 @@ def test_unified_address_stage_sql_uses_bigint_checksum():
     inference_sql = entity_address_unified._inference_sql(
         "mrf",
         "entity_address_unified_stage",
-        include_hospital_enrollment=False,
-        include_fqhc_enrollment=False,
+        inference_options_by_name={},
     )
 
     assert "checksum bigint NOT NULL" in raw_sql
@@ -377,10 +376,12 @@ def test_entity_address_facility_anchor_uses_source_npi_and_ccn_inference():
     inference_sql = entity_address_unified._inference_sql(
         "mrf",
         "entity_address_unified_stage",
-        include_hospital_enrollment=True,
-        include_fqhc_enrollment=True,
-        include_facility_override=True,
-        include_npi_other_identifier=True,
+        inference_options_by_name={
+            "include_hospital_enrollment": True,
+            "include_fqhc_enrollment": True,
+            "include_facility_override": True,
+            "include_npi_other_identifier": True,
+        },
     )
 
     for fragment in _FACILITY_SOURCE_SQL_FRAGMENTS:

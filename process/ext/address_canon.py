@@ -47,7 +47,6 @@ from process.ptg_parts.rust_scanner import _ptg2_rust_scanner_binary
 logger = logging.getLogger(__name__)
 
 ADDRESS_CANON_RUST_MATERIALIZE_ENV = "HLTHPRT_ADDRESS_CANON_RUST_MATERIALIZE"
-ADDRESS_COMPLETION_ALIAS_TIMEOUT_ENV = "HLTHPRT_ADDRESS_COMPLETION_ALIAS_TIMEOUT"
 ADDRESS_ZIP_RESTORE_ENABLED_ENV = "HLTHPRT_ADDRESS_CANON_ZIP_RESTORE_ENABLED"
 ADDRESS_ZIP_RESTORE_CONCURRENCY_ENV = "HLTHPRT_ADDRESS_CANON_ZIP_RESTORE_CONCURRENCY"
 ADDRESS_ZIP_RESTORE_REQUIRED_ENV = "HLTHPRT_ADDRESS_CANON_ZIP_RESTORE_REQUIRED"
@@ -1460,11 +1459,7 @@ def _zip_restore_sql(
     *,
     schema: str,
     staging_table: str,
-    zip_column: str,
-    latitude_column: str,
-    longitude_column: str,
-    state_expr: str,
-    country_expr: str,
+    restore_by_field: Mapping[str, str],
     shards: int,
     has_address_key: bool,
     only_null_address_key: bool,
@@ -1472,9 +1467,9 @@ def _zip_restore_sql(
     """Build the state-checked coordinate-to-ZIP restoration statement."""
     qschema = _quote_ident(schema)
     qtable = _qtable(schema, staging_table)
-    qzip = _quote_ident(zip_column)
-    qlat = _quote_ident(latitude_column)
-    qlon = _quote_ident(longitude_column)
+    qzip = _quote_ident(restore_by_field["zip_column"])
+    qlat = _quote_ident(restore_by_field["latitude_column"])
+    qlon = _quote_ident(restore_by_field["longitude_column"])
     source_filters = [
         f"NULLIF(trim(COALESCE(s.{qzip}::text, '')), '') IS NULL",
         f"s.{qlat} IS NOT NULL",
@@ -1496,8 +1491,8 @@ def _zip_restore_sql(
         qtable,
         qlat,
         qlon,
-        state_expr,
-        country_expr,
+        restore_by_field["state_expr"],
+        restore_by_field["country_expr"],
         source_where,
     )
     return f"""
@@ -1604,11 +1599,13 @@ async def restore_missing_zip_from_tiger_zcta(
                 _zip_restore_sql(
                     schema=schema,
                     staging_table=staging_table,
-                    zip_column=zip_column,
-                    latitude_column=latitude_column,
-                    longitude_column=longitude_column,
-                    state_expr=state_expr,
-                    country_expr=country_expr,
+                    restore_by_field={
+                        "zip_column": zip_column,
+                        "latitude_column": latitude_column,
+                        "longitude_column": longitude_column,
+                        "state_expr": state_expr,
+                        "country_expr": country_expr,
+                    },
                     shards=shards,
                     has_address_key=has_address_key,
                     only_null_address_key=only_null_address_key,
@@ -1644,213 +1641,6 @@ async def _select_canonical_archive_table(schema: str, requested: str) -> str:
     return requested
 
 
-def _completion_alias_sql(
-    *,
-    schema: str,
-    keyed_table: str,
-    archive: str,
-) -> str:
-    """Build conservative street completion aliases for archive resolution."""
-    qschema = _quote_ident(schema)
-    return f"""
-        CREATE TEMP TABLE address_completion_aliases ON COMMIT DROP AS
-        WITH source_rows AS MATERIALIZED (
-            SELECT
-                rn,
-                source_ctid,
-                address_key AS source_address_key,
-                COALESCE(unit_norm, '') AS unit_norm,
-                state_code,
-                zip5,
-                COALESCE(country_code, 'US') AS country_code,
-                {qschema}.addr_street_completion_norm_v1(first_line, second_line) AS completion_norm,
-                {qschema}.addr_street_suffix_token_v1(first_line, second_line) AS suffix_token,
-                {qschema}.addr_street_direction_token_v1(first_line, second_line) AS direction_token
-            FROM {keyed_table}
-            WHERE address_key IS NOT NULL
-              AND identity_key IS NOT NULL
-              AND split_part(identity_key, '|', 8) = 'street'
-              AND state_code IS NOT NULL
-              AND zip5 IS NOT NULL
-        ),
-        source_ranked AS MATERIALIZED (
-            SELECT
-                *,
-                CASE WHEN suffix_token IS NOT NULL THEN 1 ELSE 0 END
-              + CASE WHEN direction_token IS NOT NULL THEN 1 ELSE 0 END AS completion_rank
-            FROM source_rows
-            WHERE completion_norm IS NOT NULL
-              AND (suffix_token IS NULL OR direction_token IS NULL)
-        ),
-        source_keys AS MATERIALIZED (
-            SELECT DISTINCT completion_norm, unit_norm, state_code, zip5, country_code
-            FROM source_ranked
-        ),
-        archive_key_scope AS MATERIALIZED (
-            SELECT DISTINCT unit_norm, state_code, zip5, country_code
-            FROM source_keys
-        ),
-        archive_prefilter AS MATERIALIZED (
-            SELECT
-                archived.address_key,
-                archived.identity_key,
-                archived.premise_key,
-                archived.line1_norm,
-                archived.unit_norm,
-                archived.city_norm,
-                archived.state_code,
-                archived.zip5,
-                archived.zip4,
-                archived.country_code,
-                archived.first_line,
-                archived.second_line,
-                archived.city_name,
-                archived.state_name,
-                archived.postal_code
-            FROM {archive} AS archived
-            JOIN archive_key_scope
-              ON COALESCE(archived.unit_norm, '') = archive_key_scope.unit_norm
-             AND archived.state_code = archive_key_scope.state_code
-             AND archived.zip5 = archive_key_scope.zip5
-             AND COALESCE(archived.country_code, 'US') = archive_key_scope.country_code
-            WHERE archived.address_key IS NOT NULL
-              AND archived.identity_key IS NOT NULL
-              AND COALESCE(archived.precision, split_part(archived.identity_key, '|', 8)) = 'street'
-              AND archived.merged_into IS NULL
-              AND archived.state_code IS NOT NULL
-              AND archived.zip5 IS NOT NULL
-        ),
-        target_rows AS MATERIALIZED (
-            SELECT
-                0 AS target_source_rank,
-                address_key AS target_address_key,
-                identity_key AS target_identity_key,
-                premise_key AS target_premise_key,
-                line1_norm AS target_line1_norm,
-                COALESCE(unit_norm, '') AS target_unit_norm,
-                city_norm AS target_city_norm,
-                state_code AS target_state_code,
-                zip5 AS target_zip5,
-                zip4 AS target_zip4,
-                COALESCE(country_code, 'US') AS target_country_code,
-                first_line AS target_first_line,
-                second_line AS target_second_line,
-                city_name AS target_city_name,
-                state_name AS target_state_name,
-                postal_code AS target_postal_code,
-                COALESCE(unit_norm, '') AS unit_norm,
-                state_code,
-                zip5,
-                COALESCE(country_code, 'US') AS country_code,
-                {qschema}.addr_street_completion_norm_v1(first_line, second_line) AS completion_norm,
-                {qschema}.addr_street_suffix_token_v1(first_line, second_line) AS suffix_token,
-                {qschema}.addr_street_direction_token_v1(first_line, second_line) AS direction_token
-            FROM {keyed_table}
-            WHERE address_key IS NOT NULL
-              AND identity_key IS NOT NULL
-              AND split_part(identity_key, '|', 8) = 'street'
-              AND state_code IS NOT NULL
-              AND zip5 IS NOT NULL
-            UNION ALL
-            SELECT
-                1 AS target_source_rank,
-                archived.address_key AS target_address_key,
-                archived.identity_key AS target_identity_key,
-                archived.premise_key AS target_premise_key,
-                archived.line1_norm AS target_line1_norm,
-                COALESCE(archived.unit_norm, '') AS target_unit_norm,
-                archived.city_norm AS target_city_norm,
-                archived.state_code AS target_state_code,
-                archived.zip5 AS target_zip5,
-                archived.zip4 AS target_zip4,
-                COALESCE(archived.country_code, 'US') AS target_country_code,
-                archived.first_line AS target_first_line,
-                archived.second_line AS target_second_line,
-                archived.city_name AS target_city_name,
-                archived.state_name AS target_state_name,
-                archived.postal_code AS target_postal_code,
-                COALESCE(archived.unit_norm, '') AS unit_norm,
-                archived.state_code,
-                archived.zip5,
-                COALESCE(archived.country_code, 'US') AS country_code,
-                source_keys.completion_norm,
-                {qschema}.addr_street_suffix_token_v1(archived.first_line, archived.second_line) AS suffix_token,
-                {qschema}.addr_street_direction_token_v1(archived.first_line, archived.second_line) AS direction_token
-            FROM archive_prefilter AS archived
-            JOIN source_keys
-              ON COALESCE(archived.unit_norm, '') = source_keys.unit_norm
-             AND archived.state_code = source_keys.state_code
-             AND archived.zip5 = source_keys.zip5
-             AND COALESCE(archived.country_code, 'US') = source_keys.country_code
-             AND {qschema}.addr_street_completion_norm_v1(archived.first_line, archived.second_line)
-                 = source_keys.completion_norm
-        ),
-        target_ranked AS MATERIALIZED (
-            SELECT
-                *,
-                CASE WHEN suffix_token IS NOT NULL THEN 1 ELSE 0 END
-              + CASE WHEN direction_token IS NOT NULL THEN 1 ELSE 0 END AS completion_rank
-            FROM target_rows
-            WHERE completion_norm IS NOT NULL
-        ),
-        candidates AS (
-            SELECT
-                s.rn,
-                s.source_ctid,
-                s.source_address_key,
-                t.target_address_key,
-                t.target_identity_key,
-                t.target_premise_key,
-                t.target_line1_norm,
-                t.target_unit_norm,
-                t.target_city_norm,
-                t.target_state_code,
-                t.target_zip5,
-                t.target_zip4,
-                t.target_country_code,
-                t.target_first_line,
-                t.target_second_line,
-                t.target_city_name,
-                t.target_state_name,
-                t.target_postal_code,
-                t.completion_rank AS target_completion_rank,
-                t.target_source_rank,
-                (s.suffix_token IS NULL AND t.suffix_token IS NOT NULL) AS filled_suffix,
-                (s.direction_token IS NULL AND t.direction_token IS NOT NULL) AS filled_direction
-            FROM source_ranked AS s
-            JOIN target_ranked AS t
-              ON t.completion_norm = s.completion_norm
-             AND t.unit_norm = s.unit_norm
-             AND t.state_code = s.state_code
-             AND t.zip5 = s.zip5
-             AND t.country_code = s.country_code
-             AND t.target_address_key IS DISTINCT FROM s.source_address_key
-             AND t.completion_rank > s.completion_rank
-            WHERE (s.suffix_token IS NULL AND t.suffix_token IS NOT NULL)
-               OR (s.direction_token IS NULL AND t.direction_token IS NOT NULL)
-        ),
-        unique_candidates AS (
-            SELECT
-                rn,
-                bool_or(filled_suffix) AS filled_suffix,
-                bool_or(filled_direction) AS filled_direction
-            FROM candidates
-            GROUP BY rn
-            HAVING count(DISTINCT target_address_key) = 1
-        )
-        SELECT DISTINCT ON (c.rn)
-            c.*
-        FROM candidates AS c
-        JOIN unique_candidates AS u USING (rn)
-        ORDER BY c.rn, c.target_completion_rank DESC, c.target_source_rank, c.target_address_key;
-    """
-
-
-def _is_statement_timeout_error(exc: BaseException) -> bool:
-    message = str(exc).lower()
-    return "statement timeout" in message or "querycancelederror" in message
-
-
 async def _validated_active_alias_state(session: Any, schema: str) -> Any:
     """Lock alias promotion and return a supported singleton state row."""
     await session.execute(text(address_alias_sql.alias_advisory_xact_lock_sql()))
@@ -1867,22 +1657,22 @@ async def _validated_active_alias_state(session: Any, schema: str) -> Any:
         )
     if (
         int(state.active_ruleset_version)
-        != address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION
+        != address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION
     ):
         raise RuntimeError(
-            f"Unsupported numeric-grid alias ruleset: {state.active_ruleset_version}"
+            f"Unsupported address alias ruleset: {state.active_ruleset_version}"
         )
     return state
 
 
-async def _existing_numeric_grid_alias_count(session: Any) -> int:
+async def _existing_address_alias_count(session: Any) -> int:
     """Count distinct approved source keys materialized in the temp table."""
     return int(
         (
             await session.execute(
                 text(
                     "SELECT count(DISTINCT source_address_key) "
-                    "FROM address_numeric_grid_existing_aliases;"
+                    "FROM address_existing_aliases;"
                 )
             )
         ).scalar()
@@ -1890,7 +1680,7 @@ async def _existing_numeric_grid_alias_count(session: Any) -> int:
     )
 
 
-async def _apply_persisted_numeric_grid_aliases(
+async def _apply_persisted_address_aliases(
     session: Any,
     *,
     schema: str,
@@ -1900,28 +1690,28 @@ async def _apply_persisted_numeric_grid_aliases(
     """Project already-approved aliases into the transient effective key set."""
     state = await _validated_active_alias_state(session, schema)
     await session.execute(
-        text("DROP TABLE IF EXISTS pg_temp.address_numeric_grid_existing_aliases;")
+        text("DROP TABLE IF EXISTS pg_temp.address_existing_aliases;")
     )
     await session.execute(
         text(
-            address_alias_sql.existing_numeric_grid_aliases_sql(
+            address_alias_sql.existing_address_aliases_sql(
                 schema=schema,
                 keyed_table=keyed_table,
                 archive=archive,
             )
         )
     )
-    existing_count = await _existing_numeric_grid_alias_count(session)
+    existing_count = await _existing_address_alias_count(session)
     if not existing_count:
         return {
-            "numeric_grid_existing_applied": 0,
+            "persisted_aliases_applied": 0,
             "address_alias_generation": int(state.generation),
         }
 
     violation = (
         await session.execute(
             text(
-                address_alias_sql.existing_numeric_grid_alias_violation_sql(
+                address_alias_sql.existing_address_alias_violation_sql(
                     schema=schema,
                 )
             )
@@ -1929,7 +1719,7 @@ async def _apply_persisted_numeric_grid_aliases(
     ).first()
     if violation:
         raise RuntimeError(
-            "Persisted numeric-grid alias integrity violation: "
+            "Persisted address alias integrity violation: "
             f"kind={violation.violation_kind} "
             f"source={violation.source_address_key} "
             f"target={violation.target_address_key}"
@@ -1942,7 +1732,7 @@ async def _apply_persisted_numeric_grid_aliases(
         )
     )
     return {
-        "numeric_grid_existing_applied": existing_count,
+        "persisted_aliases_applied": existing_count,
         "address_alias_generation": int(state.generation),
     }
 
@@ -2307,98 +2097,12 @@ async def resolve_into_archive(
             staging_table=staging,
             strict_source_predicate=strict_source_predicate,
         )
-        alias_stats_by_kind = await _apply_persisted_numeric_grid_aliases(
+        alias_stats_by_kind = await _apply_persisted_address_aliases(
             session,
             schema=schema,
             keyed_table=keyed_table,
             archive=archive,
         )
-        completion_alias_rows = 0
-        await session.execute(text("SAVEPOINT address_completion_alias_repair;"))
-        completion_alias_timeout = os.getenv(ADDRESS_COMPLETION_ALIAS_TIMEOUT_ENV, "2min")
-        try:
-            await session.execute(
-                text(f"SET LOCAL statement_timeout = '{_setting_value(completion_alias_timeout)}';")
-            )
-            await session.execute(text("DROP TABLE IF EXISTS pg_temp.address_completion_aliases;"))
-            await session.execute(text(_completion_alias_sql(schema=schema, keyed_table=keyed_table, archive=archive)))
-            alias_stats_raw = (
-                await session.execute(text("""
-                    SELECT jsonb_build_object(
-                        'completion_aliases', count(*),
-                        'completion_suffix_aliases', count(*) FILTER (WHERE filled_suffix),
-                        'completion_directional_aliases', count(*) FILTER (WHERE filled_direction)
-                    )
-                    FROM address_completion_aliases;
-                """))
-            ).scalar() or {}
-            if isinstance(alias_stats_raw, str):
-                completion_metric_map = json.loads(alias_stats_raw)
-            else:
-                completion_metric_map = dict(alias_stats_raw)
-            alias_stats_by_kind.update(completion_metric_map)
-            completion_alias_rows = int(
-                alias_stats_by_kind.get("completion_aliases") or 0
-            )
-            if completion_alias_rows:
-                await session.execute(text(f"""
-                    UPDATE {keyed_table} AS keyed
-                       SET address_key = aliases.target_address_key,
-                           identity_key = aliases.target_identity_key,
-                           premise_key = aliases.target_premise_key,
-                           line1_norm = aliases.target_line1_norm,
-                           unit_norm = aliases.target_unit_norm,
-                           city_norm = aliases.target_city_norm,
-                           state_code = aliases.target_state_code,
-                           zip5 = aliases.target_zip5,
-                           zip4 = aliases.target_zip4,
-                           country_code = aliases.target_country_code,
-                           first_line = aliases.target_first_line,
-                           second_line = aliases.target_second_line,
-                           city_name = aliases.target_city_name,
-                           state_name = aliases.target_state_name,
-                           postal_code = aliases.target_postal_code
-                      FROM address_completion_aliases AS aliases
-                     WHERE keyed.rn = aliases.rn;
-                """))
-                await session.execute(text(f"""
-                    UPDATE {staging} AS target
-                       SET address_key = aliases.target_address_key
-                      FROM address_completion_aliases AS aliases
-                     WHERE (
-                               target.ctid::text = aliases.source_ctid
-                               OR (
-                                   aliases.source_address_key IS NOT NULL
-                                   AND target.address_key = aliases.source_address_key
-                               )
-                           )
-                       AND target.address_key IS DISTINCT FROM aliases.target_address_key;
-                """))
-            await session.execute(text("RELEASE SAVEPOINT address_completion_alias_repair;"))
-            await session.execute(text(f"SET LOCAL statement_timeout = '{_setting_value(timeout)}';"))
-        except Exception as exc:
-            try:
-                await session.execute(text("ROLLBACK TO SAVEPOINT address_completion_alias_repair;"))
-                await session.execute(text("RELEASE SAVEPOINT address_completion_alias_repair;"))
-                await session.execute(text(f"SET LOCAL statement_timeout = '{_setting_value(timeout)}';"))
-            except Exception:
-                logger.exception("Failed to roll back address completion alias savepoint")
-                raise
-            if not _is_statement_timeout_error(exc):
-                raise
-            alias_stats_by_kind.update({
-                "completion_aliases": 0,
-                "completion_alias_repair_skipped": 1,
-            })
-            logger.warning("Skipping address completion alias repair after statement timeout: %s", exc)
-            _emit_progress(
-                phase="address archive resolve",
-                unit="row",
-                total=staged,
-                done=0,
-                pct=15,
-                message="skipped slow completion alias repair",
-            )
         _emit_progress(
             phase="address archive resolve",
             unit="row",
@@ -2407,9 +2111,8 @@ async def resolve_into_archive(
             pct=20,
             message="materialized deduplicated canonical address keys",
             keyed_rows=keyed_rows,
-            completion_aliases=completion_alias_rows,
-            numeric_grid_aliases=int(
-                alias_stats_by_kind.get("numeric_grid_existing_applied") or 0
+            persisted_aliases=int(
+                alias_stats_by_kind.get("persisted_aliases_applied") or 0
             ),
         )
         await session.execute(text(f"CREATE INDEX ON {keyed_table} (address_key) WHERE address_key IS NOT NULL;"))
@@ -2447,6 +2150,13 @@ async def resolve_into_archive(
             str(key): int(metric_value or 0)
             for key, metric_value in alias_stats_by_kind.items()
         })
+        reason_buckets_by_reason.update(
+            {
+                "canonical_materializer_rust": int(rust_materialized),
+                "canonical_materializer_sql": int(not rust_materialized),
+                "canonical_materialized_key_rows": keyed_rows,
+            }
+        )
         distinct_keys = int((
             await session.execute(text(f"SELECT count(*) FROM ({dedup_cte}) d;"))
         ).scalar() or 0)

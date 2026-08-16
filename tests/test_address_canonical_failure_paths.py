@@ -140,11 +140,13 @@ def test_zip_restore_sql_scopes_keyed_rows_and_multiple_shards():
     sql = address_canon._zip_restore_sql(
         schema="mrf",
         staging_table="stage",
-        zip_column="postal_code",
-        latitude_column="latitude",
-        longitude_column="longitude",
-        state_expr="state_name",
-        country_expr="country_code",
+        restore_by_field={
+            "zip_column": "postal_code",
+            "latitude_column": "latitude",
+            "longitude_column": "longitude",
+            "state_expr": "state_name",
+            "country_expr": "country_code",
+        },
         shards=2,
         has_address_key=True,
         only_null_address_key=True,
@@ -222,8 +224,8 @@ async def test_rust_version_mismatch_and_missing_copy_support_fall_back(monkeypa
     ("state_record", "error_message"),
     (
         (None, "singleton state is missing"),
-        (SimpleNamespace(schema_version=2, active_ruleset_version=1), "schema version"),
-        (SimpleNamespace(schema_version=1, active_ruleset_version=2), "ruleset"),
+        (SimpleNamespace(schema_version=3, active_ruleset_version=1), "schema version"),
+        (SimpleNamespace(schema_version=2, active_ruleset_version=2), "ruleset"),
     ),
 )
 async def test_archive_alias_state_rejects_missing_or_unknown_contracts(

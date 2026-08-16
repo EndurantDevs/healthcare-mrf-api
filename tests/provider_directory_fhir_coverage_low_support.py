@@ -208,8 +208,8 @@ async def assert_address_publication_edges(monkeypatch) -> None:
         "first",
         AsyncMock(
             return_value=SimpleNamespace(
-                schema_version=1,
-                active_ruleset_version=1,
+                schema_version=importer.address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION,
+                active_ruleset_version=importer.address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION,
                 generation=3,
             )
         ),

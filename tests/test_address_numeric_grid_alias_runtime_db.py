@@ -21,8 +21,6 @@ from tests.test_address_numeric_grid_alias_db import (
     stamp_address_keys,
     suppress,
 )
-
-
 async def _connect_runtime_database():
     """Open a disposable PostgreSQL connection for runtime probes."""
     return await asyncpg.connect(
@@ -34,11 +32,27 @@ async def _connect_runtime_database():
     )
 
 
-async def _create_alias_probe_schema(
-    connection,
-    schema: str,
-    module_suffix: str,
-) -> None:
+_PUBLIC_EVIDENCE_NPI_SQL = """
+    CREATE FUNCTION "{schema}".public_evidence_npi_valid(candidate_npi text)
+    RETURNS boolean LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    SET search_path = pg_catalog AS $function$
+        SELECT CASE WHEN candidate_npi ~ '^[0-9]{{10}}$' THEN
+            CASE WHEN candidate_npi::bigint BETWEEN 1000000000 AND 2999999999
+            THEN mod(24 + (
+                SELECT sum(CASE
+                    WHEN ordinal < 10 AND mod(ordinal, 2) = 1
+                    THEN digit * 2 - CASE WHEN digit >= 5 THEN 9 ELSE 0 END
+                    ELSE digit END)
+                FROM unnest(string_to_array(candidate_npi, NULL))
+                    WITH ORDINALITY AS item(value, ordinal)
+                CROSS JOIN LATERAL (SELECT value::integer AS digit) AS parsed
+            ), 10) = 0 ELSE false END
+        ELSE false END;
+    $function$;
+"""
+
+
+async def _create_alias_probe_schema(connection, schema: str, module_suffix: str) -> None:
     """Create canonical functions, archive, and alias schema for a probe."""
     foundation = _load_module(
         ROOT / "alembic/versions/20260611100000_address_canonical_foundation.py",
@@ -48,15 +62,54 @@ async def _create_alias_probe_schema(
         ROOT / "alembic/versions/20260811100000_address_numeric_grid_alias.py",
         f"address_alias_{module_suffix}_migration",
     )
+    evidence_migration = _load_module(
+        ROOT / "alembic/versions/20260816020000_address_evidence_alias.py",
+        f"address_alias_{module_suffix}_evidence_migration",
+    )
+    formatted_migration = _load_module(
+        ROOT / "alembic/versions/20260815010000_address_formatted_display_v2.py",
+        f"address_alias_{module_suffix}_formatted_migration",
+    )
     await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
     await connection.execute(f'CREATE SCHEMA "{schema}";')
     await connection.execute(foundation._create_functions_sql(schema))
     await connection.execute(foundation._create_archive_sql(schema))
+    await connection.execute(
+        formatted_migration._humanize_component_function_sql(schema)
+    )
+    await connection.execute(
+        formatted_migration._formatted_address_function_sql(schema)
+    )
+    await connection.execute(
+        f"""
+        ALTER TABLE "{schema}".address_archive_v2
+            ADD COLUMN formatted_address_version smallint,
+            ADD COLUMN formatted_address_source varchar(64);
+        """
+    )
     await connection.execute(migration._numeric_grid_function_sql(schema))
     for statement in migration._split_sql_statements(
         migration._alias_schema_sql(schema)
     ):
         await connection.execute(statement)
+    await connection.execute(_PUBLIC_EVIDENCE_NPI_SQL.format(schema=schema))
+    for statement in evidence_migration._upgrade_statements(schema):
+        await connection.execute(statement)
+    await connection.execute(
+        f"""
+        CREATE TABLE "{schema}".entity_address_unified (
+            location_key text PRIMARY KEY,
+            npi bigint,
+            inferred_npi bigint,
+            type varchar(32) NOT NULL,
+            address_key uuid,
+            address_sources varchar[] NOT NULL DEFAULT '{{}}',
+            formatted_address text,
+            base_address_version varchar(64) NOT NULL DEFAULT
+                'address_archive_v2:v2+fmt-v2+alias-v1:g1'
+        );
+        """
+    )
 
 
 def _plan_nodes(value):
@@ -324,6 +377,10 @@ async def test_apply_rereads_archive_after_waiting_for_resolver_lock():
             transaction,
             apply_task,
         )
+
+
+
+
 
 
 _PARTD_FIELD_MAP = {
