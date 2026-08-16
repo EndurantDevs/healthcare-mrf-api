@@ -64,7 +64,7 @@ async def _load_all_pinned_receipt_rows(
     select: Any,
     wave_model: Any,
 ) -> list[Any]:
-    return (
+    rows = (
         await session.execute(
             select(
                 wave_model.receipt_key_id,
@@ -75,6 +75,7 @@ async def _load_all_pinned_receipt_rows(
             .distinct()
         )
     ).all()
+    return [tuple(row) for row in rows]
 
 
 async def _load_nonterminal_pinned_receipt_rows(
@@ -85,7 +86,7 @@ async def _load_nonterminal_pinned_receipt_rows(
     quarantine_model: Any,
     terminal_states: tuple[str, ...],
 ) -> list[Any]:
-    return (
+    rows = (
         await session.execute(
             select(
                 wave_model.receipt_key_id,
@@ -105,6 +106,7 @@ async def _load_nonterminal_pinned_receipt_rows(
             .distinct()
         )
     ).all()
+    return [tuple(row) for row in rows]
 
 
 async def _load_pending_ordinary_key_ids(

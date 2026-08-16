@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 
 import pytest
+from sqlalchemy import create_engine, literal, select
+from sqlalchemy.dialects import postgresql
 
 from process.ptg_wave_receipt_authority import (
     ABANDONMENT_RECEIPT_SCHEMA,
@@ -47,9 +49,6 @@ from tests.ptg_wave_receipt_authority_assertions import (
     build_rotating_and_historical_keyrings,
     pinned_receipt_epoch_rows,
 )
-from sqlalchemy.dialects import postgresql
-
-
 ROOT = Path(__file__).resolve().parents[1]
 FIXED_KEY = EPHEMERAL_RECEIPT_PRIVATE_KEY
 SHARED_FIXTURE = ROOT / "tests" / "fixtures" / (
@@ -422,6 +421,28 @@ class _CoverageSessionContext:
 
 
 @pytest.mark.asyncio
+async def test_startup_accepts_rows_returned_by_sqlalchemy(monkeypatch):
+    from db.models import db
+
+    _configure_active(monkeypatch, "epoch-active", FIXED_KEY)
+    signer = PTGWaveReceiptKeyring.from_environment()
+    public_epoch = signer.public_by_key_id["epoch-active"]
+    with create_engine("sqlite://").connect() as connection:
+        row = connection.execute(
+            select(
+                literal(public_epoch.key_id),
+                literal(public_epoch.rsa_modulus),
+                literal(public_epoch.rsa_exponent),
+            )
+        ).one()
+    assert not isinstance(row, (list, tuple))
+    session = _CoverageSession([[row], [row], []])
+    monkeypatch.setattr(db, "session", lambda: _CoverageSessionContext(session))
+
+    await assert_nonterminal_receipt_key_coverage(keyring=signer)
+
+
+@pytest.mark.asyncio
 async def test_startup_retains_signer_for_each_abandoned_member_without_receipt(
     monkeypatch,
 ):
@@ -442,9 +463,11 @@ async def test_startup_retains_signer_for_each_abandoned_member_without_receipt(
         signing_by_key_id={},
         public_by_key_id={public_epoch.key_id: public_epoch},
     )
-    blocked_session = _CoverageSession(
-        [pinned_rows, [], [public_epoch.key_id]]
-    )
+    empty_session = _CoverageSession([[], [], []])
+    monkeypatch.setattr(db, "session", lambda: _CoverageSessionContext(empty_session))
+    await assert_nonterminal_receipt_key_coverage(keyring=public_only)
+
+    blocked_session = _CoverageSession([pinned_rows, [], [public_epoch.key_id]])
     monkeypatch.setattr(
         db,
         "session",
