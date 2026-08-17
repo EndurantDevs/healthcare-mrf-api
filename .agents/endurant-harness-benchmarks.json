@@ -21,6 +21,8 @@
           "HLTHPRT_DB_SCHEMA": "mrf",
           "HLTHPRT_DB_USER": "postgres",
           "HLTHPRT_ENTITY_ADDRESS_ALIAS_BENCHMARK_ROWS": "10000",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENRICH_CONCURRENCY": "24",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENRICH_SHARDS": "64",
           "PYTHONDONTWRITEBYTECODE": "1"
         },
         "evidence": "integration"

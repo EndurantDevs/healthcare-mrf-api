@@ -282,41 +282,41 @@ async def _prepare_raw_pipeline(
         )
     )
 
-
 async def _measure_alias_integrity(
-    schema: str,
-    table_name: str,
-    expected_violation: str | None,
+    schema: str, table_name: str, expected_violation: str | None
 ) -> tuple[float, str | None]:
     integrity_started = time.perf_counter()
-    validator_options_by_name = {}
-    if "checksum_ranges" in inspect.signature(
-        entity_address_unified._validate_raw_alias_integrity
-    ).parameters:
-        validator_options_by_name = {
-            "checksum_ranges": entity_address_unified._integer_ranges(
-                -(2**31), 2**31 - 1, 64
-            ),
-            "concurrency": 24,
-        }
-    try:
-        await entity_address_unified._validate_raw_alias_integrity(
-            schema,
-            table_name,
-            is_address_canon_available=True,
-            **validator_options_by_name,
+    validator = entity_address_unified._validate_raw_alias_integrity
+    validator_options_by_name = {"is_address_canon_available": True}
+    if "checksum_ranges" in inspect.signature(validator).parameters:
+        enrich_shards = entity_address_unified._env_int(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENRICH_SHARDS",
+            entity_address_unified.DEFAULT_ENRICH_SHARDS,
+            1,
         )
+        validator_options_by_name.update(
+            checksum_ranges=(
+                entity_address_unified._integer_ranges(-(2**31), 2**31 - 1, enrich_shards)
+                if enrich_shards > 1 else None
+            ),
+            concurrency=min(
+                entity_address_unified._env_int(
+                    "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENRICH_CONCURRENCY",
+                    entity_address_unified.DEFAULT_ENRICH_CONCURRENCY,
+                    1,
+                ),
+                enrich_shards,
+            ),
+        )
+    try:
+        await validator(schema, table_name, **validator_options_by_name)
     except RuntimeError as error:
-        integrity_seconds = time.perf_counter() - integrity_started
-        if expected_violation is None or f"kind={expected_violation}" not in str(
-            error
-        ):
+        if expected_violation is None or f"kind={expected_violation}" not in str(error):
             raise
-        return integrity_seconds, expected_violation
-    integrity_seconds = time.perf_counter() - integrity_started
+        return time.perf_counter() - integrity_started, expected_violation
     if expected_violation is not None:
         raise AssertionError(f"expected alias violation {expected_violation}")
-    return integrity_seconds, None
+    return time.perf_counter() - integrity_started, None
 
 
 async def _run_pipeline(
