@@ -195,6 +195,7 @@ def _has_valid_published_outputs(
     live_table_names: list[str],
     row_count: int,
     marker_relation_by_table: dict[str, dict[str, object]],
+    old_relation_by_table: dict[str, dict[str, object]],
 ) -> bool:
     row_count_by_table = published_snapshot_by_field["rows"]
     relation_by_table = published_snapshot_by_field["relations"]
@@ -210,7 +211,9 @@ def _has_valid_published_outputs(
         for state in index_state_by_table.values()
     )
     return all(
-        marker_relation_by_table[table_name]["oid"]
+        old_relation_by_table[table_name]["oid"]
+        == marker_relation_by_table[table_name]["oid"]
+        and old_relation_by_table[table_name]["oid"]
         != relation_by_table[table_name]["oid"]
         for table_name in live_table_names
     )
@@ -241,6 +244,7 @@ async def _run_success_case(
         live_table_names,
         row_count,
         marker_relation_by_table,
+        old_relation_by_table,
     )
     assert has_valid_atomic_swap
     stage_residue = await _artifact_residue(
