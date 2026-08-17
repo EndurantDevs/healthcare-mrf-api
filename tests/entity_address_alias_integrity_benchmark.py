@@ -697,6 +697,7 @@ async def _published_snapshot(
     rows: dict[str, int] = {}
     digests: dict[str, str] = {}
     relations: dict[str, dict[str, object]] = {}
+    indexes: dict[str, dict[str, object]] = {}
     for table_name in table_names:
         relation = await _relation_identity(database, schema, table_name)
         assert relation is not None
@@ -705,7 +706,33 @@ async def _published_snapshot(
         )
         digests[table_name] = await _table_digest(database, schema, table_name)
         relations[table_name] = relation
-    return {"rows": rows, "digests": digests, "relations": relations}
+        index_state = await database.first(
+            """
+            SELECT count(*)::bigint AS index_count,
+                   COALESCE(
+                       bool_and(ix.indisvalid AND ix.indisready AND ix.indislive),
+                       FALSE
+                   ) AS valid_ready_live
+              FROM pg_catalog.pg_index AS ix
+              JOIN pg_catalog.pg_class AS tbl ON tbl.oid = ix.indrelid
+              JOIN pg_catalog.pg_namespace AS ns ON ns.oid = tbl.relnamespace
+             WHERE ns.nspname = :schema
+               AND tbl.relname = :table_name;
+            """,
+            schema=schema,
+            table_name=table_name,
+        )
+        assert index_state is not None
+        indexes[table_name] = {
+            "count": int(index_state.index_count),
+            "valid_ready_live": bool(index_state.valid_ready_live),
+        }
+    return {
+        "rows": rows,
+        "digests": digests,
+        "relations": relations,
+        "indexes": indexes,
+    }
 
 
 async def _drop_relations(
@@ -729,17 +756,6 @@ def _phase_seconds(context: dict, *fragments: str) -> float:
         ),
         6,
     )
-
-
-async def _private_artifact_names(runtime_module, import_date: str) -> list[str]:
-    stage_names = _stage_table_names(runtime_module, import_date)
-    stage_main = stage_names[0]
-    return [
-        *stage_names,
-        runtime_module._raw_stage_table_name(stage_main),
-        runtime_module._evidence_stage_table_name(stage_main),
-        *(f"{table}_old" for table in _published_table_names(runtime_module)),
-    ]
 
 
 async def _residue_count(
@@ -796,7 +812,6 @@ async def _run_production_lifecycle(
         await runtime_module.process_data(
             ctx,
             {
-                "test_mode": True,
                 "publish": True,
                 "refresh_mode": "full",
                 "serving_only_refresh": False,
@@ -839,24 +854,29 @@ async def _run_failure_containment(
     row_count: int,
     connection,
 ) -> dict[str, object]:
-    live_table = runtime_module.EntityAddressUnified.__main_table__
-    before = await _relation_identity(database, schema, live_table)
-    assert before is not None
-    original_validator = runtime_module._validate_raw_alias_integrity
-
-    async def _fail_after_validator(*args, **kwargs):
-        await original_validator(*args, **kwargs)
-        raise RuntimeError("synthetic alias fence failure")
-
-    runtime_module._validate_raw_alias_integrity = _fail_after_validator
+    live_tables = _published_table_names(runtime_module)
+    before = await _published_snapshot(database, schema, live_tables)
+    await database.status(
+        f"""
+        UPDATE {schema}.mrf_address
+           SET first_line = '2000 Bravo Road',
+               address_key = {schema}.addr_key_v1(
+                   '2000 Bravo Road', NULL, 'Example City', 'TX', '75001', 'US'
+               )
+         WHERE checksum = 1;
+        """
+    )
     failure_ctx: dict[str, object] = {}
+    private_artifacts_pre_teardown_count = -1
+    benchmark_teardown_residue = -1
+    after = None
+    old_swaps_absent = False
     try:
         await runtime_module.startup(failure_ctx)
         try:
             await runtime_module.process_data(
                 failure_ctx,
                 {
-                    "test_mode": True,
                     "publish": True,
                     "refresh_mode": "full",
                     "serving_only_refresh": False,
@@ -864,12 +884,23 @@ async def _run_failure_containment(
                 },
             )
         except RuntimeError as error:
-            if str(error) != "synthetic alias fence failure":
+            if "kind=source_identity_mismatch" not in str(error):
                 raise
         else:
-            raise AssertionError("synthetic production validator failure did not run")
+            raise AssertionError("bad alias did not fail production validation")
+
+        import_date = str(failure_ctx["import_date"])
+        private_artifacts_pre_teardown_count = await _artifact_residue(
+            database, schema, runtime_module, import_date
+        )
+        after = await _published_snapshot(database, schema, live_tables)
+        old_swaps_absent = True
+        for table_name in live_tables:
+            if await _relation_identity(database, schema, f"{table_name}_old") is not None:
+                old_swaps_absent = False
+                break
     finally:
-        try:
+        if failure_ctx.get("import_date"):
             import_date = str(failure_ctx["import_date"])
             stage_names = _stage_table_names(runtime_module, import_date)
             await runtime_module._drop_stage_artifacts(
@@ -886,12 +917,11 @@ async def _run_failure_containment(
             await database.status(
                 f"DROP TABLE IF EXISTS {schema}.{runtime_module._evidence_stage_table_name(stage_names[0])};"
             )
-        finally:
-            runtime_module._validate_raw_alias_integrity = original_validator
+            benchmark_teardown_residue = await _artifact_residue(
+                database, schema, runtime_module, import_date
+            )
 
-    after = await _relation_identity(database, schema, live_table)
-    private_names = await _private_artifact_names(runtime_module, str(failure_ctx["import_date"]))
-    residue = await _residue_count(database, schema, private_names)
+    assert after is not None
     active_sessions = await connection.fetchval(
         """
         SELECT count(*)
@@ -904,11 +934,14 @@ async def _run_failure_containment(
         f"%{schema}%",
     )
     return {
-        "live_unchanged": after is not None and after["oid"] == before["oid"],
-        "old_swap_absent": await _relation_identity(database, schema, f"{live_table}_old") is None,
-        "private_artifacts_cleaned": residue == 0,
+        "live_outputs_unchanged": all(
+            before[field] == after[field]
+            for field in ("rows", "digests", "relations")
+        ),
+        "old_swaps_absent": old_swaps_absent,
+        "private_artifacts_pre_teardown_count": private_artifacts_pre_teardown_count,
+        "benchmark_teardown_zero": benchmark_teardown_residue == 0,
         "drained_sessions": int(active_sessions or 0) == 0,
-        "residue_count": residue,
     }
 
 
@@ -946,7 +979,7 @@ def _production_env(schema: str) -> dict[str, str]:
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_EVIDENCE_STAGE": "true",
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEEP_RAW_STAGE": "false",
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE": "all",
-        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE": "none",
+        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE": "all",
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_NETWORK_BRIDGE": "false",
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_CODE_BRIDGES": "true",
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_FACILITY_CANDIDATES": "false",
@@ -996,13 +1029,19 @@ async def _benchmark() -> dict[str, object]:
         output_rows = published["rows"]
         output_digests = published["digests"]
         output_relations = published["relations"]
+        output_indexes = published["indexes"]
         assert isinstance(output_rows, dict)
         assert isinstance(output_digests, dict)
         assert isinstance(output_relations, dict)
+        assert isinstance(output_indexes, dict)
         assert output_rows[live_table_names[0]] == row_count
         assert output_rows["entity_address_evidence"] > 0
         assert all(
             relation["persistence"] == "p" for relation in output_relations.values()
+        )
+        assert all(
+            state["count"] > 0 and state["valid_ready_live"]
+            for state in output_indexes.values()
         )
         old_after_swap = {
             table_name: await _relation_identity(
@@ -1039,12 +1078,13 @@ async def _benchmark() -> dict[str, object]:
         assert all(
             failure[key]
             for key in (
-                "live_unchanged",
-                "old_swap_absent",
-                "private_artifacts_cleaned",
+                "live_outputs_unchanged",
+                "old_swaps_absent",
+                "benchmark_teardown_zero",
                 "drained_sessions",
             )
         )
+        assert failure["private_artifacts_pre_teardown_count"] > 0
 
         event_by_field = {
             "schema_version": 1,
@@ -1064,14 +1104,20 @@ async def _benchmark() -> dict[str, object]:
                     table_name: output_relations[table_name]["persistence"]
                     for table_name in live_table_names
                 },
+                "published_index_state": output_indexes,
                 "atomic_swap_oids_valid": atomic_swap_oids_valid,
                 "stage_artifacts_cleaned": stage_residue == 0,
                 "deterministic_first_violation": deterministic_first,
                 "violation_tuples": violation_tuples,
-                "failure_live_unchanged": failure["live_unchanged"],
-                "failure_no_old_swap": failure["old_swap_absent"],
-                "failure_private_artifacts_cleaned": failure[
-                    "private_artifacts_cleaned"
+                "failure_live_outputs_unchanged": failure[
+                    "live_outputs_unchanged"
+                ],
+                "failure_old_swaps_absent": failure["old_swaps_absent"],
+                "failure_private_artifacts_pre_teardown_count": failure[
+                    "private_artifacts_pre_teardown_count"
+                ],
+                "failure_benchmark_teardown_zero": failure[
+                    "benchmark_teardown_zero"
                 ],
                 "failure_drained_sessions": failure["drained_sessions"],
             },
