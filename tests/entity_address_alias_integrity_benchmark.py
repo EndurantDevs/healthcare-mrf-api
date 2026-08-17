@@ -794,16 +794,15 @@ async def _run_production_lifecycle(
     row_count: int,
 ) -> tuple[dict, float, float, float]:
     ctx: dict = {}
-    alias_seconds = 0.0
+    alias_timings: list[float] = []
     original_validator = runtime_module._validate_raw_alias_integrity
 
     async def _timed_validator(*args, **kwargs):
-        nonlocal alias_seconds
         started = time.perf_counter()
         try:
             return await original_validator(*args, **kwargs)
         finally:
-            alias_seconds += time.perf_counter() - started
+            alias_timings.append(time.perf_counter() - started)
 
     runtime_module._validate_raw_alias_integrity = _timed_validator
     started = time.perf_counter()
@@ -823,7 +822,7 @@ async def _run_production_lifecycle(
         shutdown_seconds = time.perf_counter() - shutdown_started
     finally:
         runtime_module._validate_raw_alias_integrity = original_validator
-    return ctx, time.perf_counter() - started, shutdown_seconds, alias_seconds
+    return ctx, time.perf_counter() - started, shutdown_seconds, sum(alias_timings)
 
 
 async def _artifact_residue(
