@@ -21,8 +21,25 @@
           "HLTHPRT_DB_SCHEMA": "mrf",
           "HLTHPRT_DB_USER": "postgres",
           "HLTHPRT_ENTITY_ADDRESS_ALIAS_BENCHMARK_ROWS": "10000",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_MIN_ROWS": "1",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SOURCE_TABLE_SHARDS": "1",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_AGGREGATE_SHARDS": "32",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_AGGREGATE_CONCURRENCY": "8",
           "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENRICH_CONCURRENCY": "24",
           "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENRICH_SHARDS": "64",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_EVIDENCE_SHARDS": "4",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_EVIDENCE_CONCURRENCY": "2",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_INLINE_SOURCE_EVIDENCE": "false",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_STAGE": "true",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_RAW_STAGE": "true",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_EVIDENCE_STAGE": "true",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEEP_RAW_STAGE": "false",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE": "all",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE": "none",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_NETWORK_BRIDGE": "false",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_CODE_BRIDGES": "true",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_FACILITY_CANDIDATES": "false",
+          "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_INFERENCE": "false",
           "PYTHONDONTWRITEBYTECODE": "1"
         },
         "evidence": "integration"
@@ -35,21 +52,60 @@
         "tests/test_address_numeric_grid_alias_db.py",
         "alembic/versions/20260611100000_address_canonical_foundation.py",
         "alembic/versions/20260811100000_address_numeric_grid_alias.py",
+        "alembic/versions/20260815010000_address_formatted_display_v2.py",
         "alembic/versions/20260816020000_address_evidence_alias.py",
         "db/connection.py",
         "process/ext/address_alias_sql.py",
         "process/ext/address_format.py",
         "process/ext/address_pub28.py",
+        "process/ext/utils.py",
+        "db/models/__init__.py",
+        "db/models/_legacy.py",
         "requirements-ci.lock"
       ],
       "correctness_keys": [
         "clean_rows",
+        "main_output_digest",
+        "main_output_rows",
+        "support_output_digests",
+        "support_output_rows",
+        "output_persistence",
+        "atomic_swap_oids_valid",
+        "stage_artifacts_cleaned",
         "deterministic_first_violation",
-        "enriched_digest",
-        "forced_failure_cleanup"
+        "violation_tuples",
+        "failure_live_unchanged",
+        "failure_no_old_swap",
+        "failure_private_artifacts_cleaned",
+        "failure_drained_sessions"
       ],
       "metric_schema": {
         "alias_integrity_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "aggregate_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "evidence_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "support_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "index_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "shutdown_seconds": {
           "type": "number",
           "unit": "seconds",
           "direction": "lower"
