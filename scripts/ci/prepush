@@ -647,6 +647,8 @@ run_core_postgres() {
       tests/test_ptg_wave_recovery_storage_orm_postgres.py \
       tests/test_ptg_wave_materialized_preclaim_storage_postgres.py \
       tests/test_ptg_wave_materialized_preclaim_guard_postgres.py \
+      tests/test_ptg_wave_v13_post_ready_guard_migration.py \
+      tests/test_ptg_wave_v13_post_ready_guard_postgres.py \
       tests/test_ptg_wave_materialized_preclaim_downgrade_postgres.py \
       tests/test_ptg_wave_receipt_authority_migration.py \
       tests/test_ptg2_block_build_pins_postgres.py \

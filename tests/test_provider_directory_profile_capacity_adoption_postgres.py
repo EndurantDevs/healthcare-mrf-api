@@ -288,7 +288,7 @@ async def test_runtime_observation_reads_migrated_postgres_snapshot(monkeypatch)
     )
     expected_heads = set(ScriptDirectory.from_config(Config("alembic.ini")).get_heads())
     assert expected_heads == {
-        "20260816020000_address_evidence_alias"
+        "202608170001_ptg_v13_post_ready_failure_guard"
     }
     async with _delta_database(monkeypatch) as (database, schema):
         monkeypatch.setenv("DB_SCHEMA", schema)
