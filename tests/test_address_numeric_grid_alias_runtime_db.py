@@ -4,6 +4,7 @@
 
 from tests.test_address_numeric_grid_alias_db import (
     ROOT,
+    _PUBLIC_EVIDENCE_NPI_SQL,
     _insert_archive_address,
     _load_module,
     _requires_test_database,
@@ -30,27 +31,6 @@ async def _connect_runtime_database():
         port=int(os.getenv("HLTHPRT_DB_PORT", "5432")),
         database=os.getenv("HLTHPRT_DB_DATABASE"),
     )
-
-
-_PUBLIC_EVIDENCE_NPI_SQL = """
-    CREATE FUNCTION "{schema}".public_evidence_npi_valid(candidate_npi text)
-    RETURNS boolean LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
-    SET search_path = pg_catalog AS $function$
-        SELECT CASE WHEN candidate_npi ~ '^[0-9]{{10}}$' THEN
-            CASE WHEN candidate_npi::bigint BETWEEN 1000000000 AND 2999999999
-            THEN mod(24 + (
-                SELECT sum(CASE
-                    WHEN ordinal < 10 AND mod(ordinal, 2) = 1
-                    THEN digit * 2 - CASE WHEN digit >= 5 THEN 9 ELSE 0 END
-                    ELSE digit END)
-                FROM unnest(string_to_array(candidate_npi, NULL))
-                    WITH ORDINALITY AS item(value, ordinal)
-                CROSS JOIN LATERAL (SELECT value::integer AS digit) AS parsed
-            ), 10) = 0 ELSE false END
-        ELSE false END;
-    $function$;
-"""
-
 
 async def _create_alias_probe_schema(connection, schema: str, module_suffix: str) -> None:
     """Create canonical functions, archive, and alias schema for a probe."""

@@ -36,6 +36,25 @@ provider_directory = __import__(
 
 ROOT = Path(__file__).resolve().parents[1]
 
+_PUBLIC_EVIDENCE_NPI_SQL = """
+    CREATE FUNCTION "{schema}".public_evidence_npi_valid(candidate_npi text)
+    RETURNS boolean LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    SET search_path = pg_catalog AS $function$
+        SELECT CASE WHEN candidate_npi ~ '^[0-9]{{10}}$' THEN
+            CASE WHEN candidate_npi::bigint BETWEEN 1000000000 AND 2999999999
+            THEN mod(24 + (
+                SELECT sum(CASE
+                    WHEN ordinal < 10 AND mod(ordinal, 2) = 1
+                    THEN digit * 2 - CASE WHEN digit >= 5 THEN 9 ELSE 0 END
+                    ELSE digit END)
+                FROM unnest(string_to_array(candidate_npi, NULL))
+                    WITH ORDINALITY AS item(value, ordinal)
+                CROSS JOIN LATERAL (SELECT value::integer AS digit) AS parsed
+            ), 10) = 0 ELSE false END
+        ELSE false END;
+    $function$;
+"""
+
 
 def _load_module(path: Path, name: str):
     spec = importlib.util.spec_from_file_location(name, path)

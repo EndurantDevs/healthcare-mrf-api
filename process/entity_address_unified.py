@@ -35,7 +35,7 @@ from process.ext.address_format import (
     ADDRESS_FORMAT_VERSION,
 )
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
-from process.live_progress import enqueue_live_progress
+from process.live_progress import enqueue_live_progress, write_live_progress
 from process import provider_directory_profile as profile_artifact
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
@@ -4921,7 +4921,19 @@ async def _assert_provider_directory_overlay_alias_fence(
 
 
 _RAW_ALIAS_INTEGRITY_SQL = """
-    WITH matching AS (
+    WITH raw_candidates AS (
+        SELECT DISTINCT
+            raw.address_key,
+            raw.address_source,
+            raw.first_line,
+            raw.second_line,
+            raw.city_name,
+            raw.state_name,
+            raw.postal_code,
+            raw.country_code
+        FROM {db_schema}.{raw_table} AS raw
+        {checksum_where}
+    ), matching AS (
         SELECT
             active.source_address_key,
             active.target_address_key,
@@ -4937,7 +4949,7 @@ _RAW_ALIAS_INTEGRITY_SQL = """
             ) AS current_source_identity_key,
             target.identity_key AS current_target_identity_key,
             target.address_key AS current_target_address_key
-        FROM {db_schema}.{raw_table} AS raw
+        FROM raw_candidates AS raw
         JOIN {db_schema}.{alias_table} AS active
           ON active.source_address_key IN (
                 raw.address_key,
@@ -4979,27 +4991,174 @@ _RAW_ALIAS_INTEGRITY_SQL = """
 """
 
 
+@dataclass
+class _AliasIntegrityProgress:
+    run_id: str | None
+    total: int
+    started: float
+    completed: int = 0
+
+
+async def _report_raw_alias_integrity_progress(
+    progress: _AliasIntegrityProgress,
+    *,
+    is_completed: bool,
+) -> None:
+    """Emit phase-local progress for the sharded raw-alias fence."""
+    if not progress.run_id or progress.total <= 1:
+        return
+    if not is_completed:
+        await asyncio.to_thread(
+            write_live_progress,
+            run_id=progress.run_id,
+            importer="entity-address-unified",
+            status="running",
+            phase="entity-address-unified validating aliases",
+            stage_id="entity-address-unified-alias-integrity",
+            stage_pct=0.0,
+            unit="shards",
+            done=0,
+            total=progress.total,
+            elapsed_seconds=0.0,
+            message=f"validating {progress.total} alias-integrity shards",
+        )
+        return
+    progress.completed += 1
+    elapsed_seconds = time.monotonic() - progress.started
+    remaining_shards = progress.total - progress.completed
+    await asyncio.to_thread(
+        write_live_progress,
+        run_id=progress.run_id,
+        importer="entity-address-unified",
+        status="running",
+        phase="entity-address-unified validating aliases",
+        stage_id="entity-address-unified-alias-integrity",
+        stage_pct=(progress.completed / progress.total) * 100.0,
+        unit="shards",
+        done=progress.completed,
+        total=progress.total,
+        elapsed_seconds=elapsed_seconds,
+        eta_seconds=remaining_shards * elapsed_seconds / progress.completed,
+        message=(
+            f"validated {progress.completed}/{progress.total} "
+            "alias-integrity shards"
+        ),
+    )
+
+
+async def _raw_alias_integrity_violation_for_range(
+    db_schema: str,
+    raw_table: str,
+    computed_address_key: str,
+    checksum_range: tuple[int | None, int | None],
+    semaphore: asyncio.Semaphore,
+    progress: _AliasIntegrityProgress,
+):
+    """Return one range's first alias violation and report its completion."""
+    checksum_min, checksum_max = checksum_range
+    checksum_where = ""
+    if checksum_min is not None and checksum_max is not None:
+        checksum_where = (
+            f"WHERE raw.checksum >= {int(checksum_min)} "
+            f"AND raw.checksum < {int(checksum_max)}"
+        )
+    async with semaphore:
+        violation = await db.first(
+            _RAW_ALIAS_INTEGRITY_SQL.format(
+                db_schema=db_schema,
+                raw_table=raw_table,
+                alias_table=address_alias_sql.ADDRESS_ALIAS_TABLE,
+                computed_address_key=computed_address_key,
+                checksum_where=checksum_where,
+            )
+        )
+    await _report_raw_alias_integrity_progress(progress, is_completed=True)
+    return violation
+
+
+def _first_raw_alias_integrity_violation(shard_outcomes):
+    """Propagate database failures or select the deterministic first violation."""
+    for shard_outcome in shard_outcomes:
+        if isinstance(shard_outcome, BaseException):
+            raise shard_outcome
+    return min(
+        (shard_outcome for shard_outcome in shard_outcomes if shard_outcome is not None),
+        key=lambda violation_row: (
+            str(violation_row.violation_kind),
+            str(violation_row.source_address_key),
+            str(violation_row.target_address_key),
+        ),
+        default=None,
+    )
+
+
+async def _raw_alias_integrity_checksum_ranges(
+    db_schema: str,
+    raw_table: str,
+    checksum_ranges: list[tuple[int, int]],
+    *,
+    is_raw_stage_reused: bool,
+) -> list[tuple[int, int]]:
+    """Avoid repeated heap scans when a reused stage lacks its shard index."""
+    if not is_raw_stage_reused or not checksum_ranges:
+        return checksum_ranges
+    has_checksum_index = await _has_table(
+        db_schema,
+        f"{raw_table}_idx_checksum",
+    )
+    return checksum_ranges if has_checksum_index else []
+
+
 async def _validate_raw_alias_integrity(
     db_schema: str,
     raw_table: str,
     *,
     is_address_canon_available: bool,
+    checksum_ranges: list[tuple[int, int]] | None = None,
+    concurrency: int = 1,
+    context: dict | None = None,
+    run_id: str | None = None,
 ) -> None:
-    """Fail before enrichment when an active alias no longer matches raw identity."""
+    """Fail when an active alias no longer matches enriched raw identity."""
+    shard_ranges = checksum_ranges or [(None, None)]
+    started = time.monotonic()
+    progress = _AliasIntegrityProgress(
+        run_id=run_id,
+        total=len(shard_ranges),
+        started=started,
+    )
     computed_address_key = _address_key_expr(
         db_schema,
         is_address_canon_available,
         address_source="raw.address_source",
         table_alias="raw",
     )
-    violation = await db.first(
-        _RAW_ALIAS_INTEGRITY_SQL.format(
-            db_schema=db_schema,
-            raw_table=raw_table,
-            alias_table=address_alias_sql.ADDRESS_ALIAS_TABLE,
-            computed_address_key=computed_address_key,
-        )
+    await _report_raw_alias_integrity_progress(progress, is_completed=False)
+    semaphore = asyncio.Semaphore(
+        max(1, min(int(concurrency), len(shard_ranges)))
     )
+    shard_outcomes = await asyncio.gather(
+        *(
+            _raw_alias_integrity_violation_for_range(
+                db_schema,
+                raw_table,
+                computed_address_key,
+                checksum_range,
+                semaphore,
+                progress,
+            )
+            for checksum_range in shard_ranges
+        ),
+        return_exceptions=True,
+    )
+    violation = _first_raw_alias_integrity_violation(shard_outcomes)
+    if context is not None:
+        _record_phase_timing(
+            context,
+            "entity-address-unified validating aliases",
+            time.monotonic() - started,
+            None,
+        )
     if violation:
         raise RuntimeError(
             "entity-address-unified alias integrity violation: "
@@ -11372,10 +11531,14 @@ async def process_entity_address_unified_data(ctx, task=None):
             enrich_shards,
         )
         context["enrich_concurrency"] = enrich_concurrency
+        checksum_ranges = (
+            _integer_ranges(-(2**31), 2**31 - 1, enrich_shards)
+            if enrich_shards > 1
+            else []
+        )
         raw_table = _raw_stage_table_name(stage_table)
         use_unlogged_raw = _is_env_enabled("HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_RAW_STAGE", True)
         should_reuse_raw_stage = _is_env_enabled("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE", False)
-
         if should_reuse_raw_stage:
             if not await _has_table(db_schema, raw_table):
                 raise RuntimeError(
@@ -11505,8 +11668,6 @@ async def process_entity_address_unified_data(ctx, task=None):
                 enrich_sem = asyncio.Semaphore(enrich_concurrency)
                 enrich_progress_lock = asyncio.Lock()
                 enrich_progress_map = {"enriched_shards": 0}
-                checksum_ranges = _integer_ranges(-(2**31), 2**31 - 1, enrich_shards)
-
                 async def _enrich_shard(checksum_min: int, checksum_max: int) -> None:
                     # Progress is held in enrich_progress_map to avoid nonlocal state.
                     async with enrich_sem:
@@ -11571,10 +11732,20 @@ async def process_entity_address_unified_data(ctx, task=None):
                     emit_start=True,
                     emit_done=True,
                 )
+        alias_integrity_checksum_ranges = await _raw_alias_integrity_checksum_ranges(
+            db_schema,
+            raw_table,
+            checksum_ranges,
+            is_raw_stage_reused=should_reuse_raw_stage,
+        )
         await _validate_raw_alias_integrity(
             db_schema,
             raw_table,
             is_address_canon_available=is_address_canon_available,
+            checksum_ranges=alias_integrity_checksum_ranges or None,
+            concurrency=enrich_concurrency,
+            context=context,
+            run_id=run_id,
         )
         await _run_sql_phase(
             f"DROP INDEX IF EXISTS {db_schema}.{raw_table}_idx_group_key;",
