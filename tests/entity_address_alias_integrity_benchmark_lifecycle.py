@@ -68,13 +68,13 @@ async def _table_digest(database: Database, schema: str, table_name: str) -> str
                 (to_jsonb(record) - ARRAY[
                     'updated_at', 'last_seen_at', 'observed_at',
                     'first_seen_at', 'geocoded_at', 'created_at',
-                    'published_at', 'retired_at'
+                    'published_at', 'retired_at', 'evidence_id'
                 ])::text,
                 E'\\n' ORDER BY (
                     to_jsonb(record) - ARRAY[
                         'updated_at', 'last_seen_at', 'observed_at',
                         'first_seen_at', 'geocoded_at', 'created_at',
-                        'published_at', 'retired_at'
+                        'published_at', 'retired_at', 'evidence_id'
                     ]
                 )::text
             ),
