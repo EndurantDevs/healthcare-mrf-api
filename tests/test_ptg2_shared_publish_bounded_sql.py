@@ -48,7 +48,10 @@ from tests.ptg2_shared_publish_test_support import (
 async def test_shared_block_stage_returns_only_bounded_sql_aggregates(monkeypatch):
     """The publication result is built only from bounded SQL aggregates."""
 
-    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock())
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=_OneRowResult((1,))),
+        scalar=AsyncMock(),
+    )
 
     @asynccontextmanager
     async def transaction():
