@@ -49,7 +49,6 @@
       ],
       "workload_files": [
         "tests/entity_address_alias_integrity_benchmark.py",
-        "tests/test_address_numeric_grid_alias_db.py",
         "alembic/versions/20260611100000_address_canonical_foundation.py",
         "alembic/versions/20260811100000_address_numeric_grid_alias.py",
         "alembic/versions/20260815010000_address_formatted_display_v2.py",
