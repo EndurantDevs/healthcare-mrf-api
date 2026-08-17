@@ -120,6 +120,13 @@ async def _assert_live_heartbeat_protection(
 ) -> None:
     """Prove one refreshed group anchor protects all sibling pins."""
 
+    async with sessions.begin() as session:
+        await session.execute(
+            text(
+                f"UPDATE {schema}.ptg2_block_build_pin "
+                "SET lease_until = transaction_timestamp() - interval '1 second'"
+            )
+        )
     lease = build_pins.SharedBlockBuildPinLease(
         schema_name=schema_name,
         snapshot_key=1,
@@ -127,6 +134,14 @@ async def _assert_live_heartbeat_protection(
         pin_token="attempt-a",
     )
     await lease.start()
+    lease.require_live()
+    async with sessions() as observer:
+        assert await observer.scalar(
+            text(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_block_build_pin "
+                "WHERE lease_until > transaction_timestamp()"
+            )
+        ) == 1
     await asyncio.sleep(1.2)
     lease.require_live()
     async with sessions() as observer:
@@ -139,6 +154,23 @@ async def _assert_live_heartbeat_protection(
     assert live_count == 1
     assert await _eligible_hashes(sessions, schema_name) == set()
     await lease.close()
+
+
+async def _assert_start_rejects_lost_owner(schema_name: str) -> None:
+    """Starting a heartbeat without its durable pin must fail synchronously."""
+
+    lease = build_pins.SharedBlockBuildPinLease(
+        schema_name=schema_name,
+        snapshot_key=1,
+        build_token="build-a",
+        pin_token="attempt-a",
+    )
+    try:
+        with pytest.raises(RuntimeError, match="heartbeat lost ownership"):
+            await lease.start()
+    finally:
+        if lease._task is not None:
+            await lease.close()
 
 
 async def _assert_expiry_replay_and_attach(
@@ -219,6 +251,7 @@ async def test_live_group_heartbeat_protects_expired_siblings_until_attach(
         schema,
         hashes,
     )
+    await _assert_start_rejects_lost_owner(schema_name)
 
     async with engine.begin() as connection:
         await connection.execute(text(f"DROP SCHEMA {schema} CASCADE"))

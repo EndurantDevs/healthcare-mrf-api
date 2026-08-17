@@ -24,6 +24,7 @@ from db.models import (
     PTG2V4SnapshotMapRoot,
 )
 from process.ptg_parts import (
+    ptg2_block_build_pins,
     ptg2_shared_gc,
     ptg2_shared_publish,
     ptg2_v4_snapshot_maps,
@@ -1411,6 +1412,7 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
                 block_hash=cas_block.block_hash,
                 payload=cas_block.payload,
             )
+        monkeypatch.setattr(ptg2_block_build_pins, "db", database)
         monkeypatch.setattr(ptg2_shared_publish, "db", database)
         cas_publication = await _publish_v4_cas_block_stage_compatibility(
             schema_name=schema_name,

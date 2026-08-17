@@ -75,6 +75,8 @@ async def test_v4_source_projection_shares_atomic_graph_transaction(
 
     assert atomic_fixture.publication_events == [
         ("begin", atomic_fixture.session),
+        ("commit", atomic_fixture.session),
+        ("begin", atomic_fixture.session),
         ("source-stage", atomic_fixture.session),
         ("physical-layout-lock", atomic_fixture.session),
         ("merged-tax-groups", atomic_fixture.session),
@@ -212,9 +214,11 @@ async def test_v4_tax_stages_are_removed_after_transaction_failure(
 def _install_failing_tax_publication(monkeypatch):
     """Install a fenced V4 tax publication and return cleanup observer."""
 
+    session = _AtomicSourceSession()
+
     @asynccontextmanager
     async def transaction():
-        yield object()
+        yield session
 
     status_mock = AsyncMock()
     monkeypatch.setattr(shared_snapshot_publish.db, "status", status_mock)

@@ -204,6 +204,7 @@ class SharedBlockBuildPinLease:
     async def start(self) -> None:
         """Start the sole heartbeat task for this exact pin token."""
 
+        await self._renew_once()
         self._task = asyncio.create_task(self._run())
 
     def require_live(self) -> None:

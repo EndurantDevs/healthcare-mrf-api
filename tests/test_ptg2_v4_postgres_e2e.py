@@ -37,6 +37,7 @@ from db.migration_ptg2_frozen_source_file_binding import (
 )
 from process.ptg_parts import (
     frozen_rate_binding_store,
+    ptg2_block_build_pins,
     ptg2_shared_publish,
     ptg2_tax_identity_source_observations,
     ptg2_tax_identity_source_preflight,
@@ -1839,6 +1840,7 @@ async def _connect_pattern_v4_database(state, monkeypatch):
     state.schema = _quoted(state.schema_name)
     state.database = Database()
     await state.database.connect()
+    monkeypatch.setattr(ptg2_block_build_pins, "db", state.database)
     monkeypatch.setattr(ptg2_shared_publish, "db", state.database)
     monkeypatch.setattr(snapshot_publish, "db", state.database)
     _isolate_graph_caches(monkeypatch)
@@ -2474,6 +2476,7 @@ def _configure_frozen_e2e_database(
 ) -> None:
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
     monkeypatch.setenv("DB_SCHEMA", schema_name)
+    monkeypatch.setattr(ptg2_block_build_pins, "db", database)
     monkeypatch.setattr(ptg2_shared_publish, "db", database)
     monkeypatch.setattr(snapshot_publish, "db", database)
     monkeypatch.setattr(frozen_rate_binding_store, "db", database)
@@ -2761,6 +2764,7 @@ def _bind_source_local_database(monkeypatch, database: Database) -> None:
     """Bind every source-local publisher module to one test database."""
 
     for module in (
+        ptg2_block_build_pins,
         ptg2_shared_publish,
         snapshot_publish,
         ptg2_tax_identity_source_observations,
@@ -3351,6 +3355,7 @@ async def test_v4_direct_layout_publishes_only_exact_direct_relations_on_postgre
     schema = _quoted(schema_name)
     database = Database()
     await database.connect()
+    monkeypatch.setattr(ptg2_block_build_pins, "db", database)
     monkeypatch.setattr(ptg2_shared_publish, "db", database)
     monkeypatch.setattr(snapshot_publish, "db", database)
     _isolate_graph_caches(monkeypatch)

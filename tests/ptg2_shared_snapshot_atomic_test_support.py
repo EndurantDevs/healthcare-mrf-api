@@ -150,6 +150,9 @@ class _AtomicSourceResult:
     def one(self):
         return ()
 
+    def scalar(self):
+        return 1
+
 
 class _AtomicSourceSession:
     async def execute(self, *_args, **_kwargs):
