@@ -24,7 +24,7 @@
         "evidence": "integration"
       },
       "source_files": [
-        "process/provider_directory_fhir.py"
+        "tests/fixtures/provider_directory_scoped_address_format_source.sha256"
       ],
       "workload_files": [
         "tests/provider_directory_scoped_address_format_benchmark.py",
