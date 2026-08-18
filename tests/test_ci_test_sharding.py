@@ -92,6 +92,18 @@ def _assert_single_lifecycle_test(
     assert prepush.count(test_path) == 1
 
 
+def test_v13_terminal_compat_postgres_runs_exactly_once() -> None:
+    prepush = (REPOSITORY_ROOT / "scripts" / "ci" / "prepush").read_text(
+        encoding="utf-8"
+    )
+    core_step = prepush.split("run_core_postgres() {", 1)[1].split(
+        "run_provider_directory_postgres() {", 1
+    )[0]
+    _assert_single_lifecycle_test(
+        prepush, core_step, "tests/test_ptg_wave_v13_terminal_compat_postgres.py"
+    )
+
+
 def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> None:
     """Keep coverage artifacts, lifecycle proofs, and command deadlines closed."""
 

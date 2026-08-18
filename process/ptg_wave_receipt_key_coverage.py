@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from process.ptg_wave_quarantine_basis import (
+    V12_PRISTINE_MATERIALIZED_CUTOVER_BASIS,
+    V13_POST_READY_UNRELEASED_FAILURE_CUTOVER_BASIS,
+)
+
 
 async def assert_nonterminal_receipt_key_coverage(*, keyring: Any = None) -> None:
     """Check persisted pins without importing ORM state into pure tooling."""
@@ -126,8 +131,12 @@ async def _load_pending_ordinary_key_ids(
                 quarantine_model.predecessor_wave_id == wave_model.wave_id,
             )
             .where(
-                quarantine_model.recovery_basis
-                == "v12_pristine_materialized_cutover",
+                quarantine_model.recovery_basis.in_(
+                    (
+                        V12_PRISTINE_MATERIALIZED_CUTOVER_BASIS,
+                        V13_POST_READY_UNRELEASED_FAILURE_CUTOVER_BASIS,
+                    )
+                ),
                 exists(
                     select(intent_model.ordinal).where(
                         intent_model.wave_id == wave_model.wave_id,

@@ -26,6 +26,18 @@ _NULL_BASIS_LEGACY_REASON = "legacy_uncertain_slots_waiting_pre_receipt"
 _LEGACY_BASIS = "materialized_preclaim_failure"
 _V12_BASIS = "v12_pristine_materialized_cutover"
 _V13_BASIS = "v13_post_ready_unreleased_failure_cutover"
+_ORDINARY_TERMINAL_GUARD = "ptg_wave_ordinary_terminal_receipt_guard"
+_ORDINARY_TERMINAL_V12_PREDICATE = (
+    f"OR retired.reason IS DISTINCT FROM '{_V12_BASIS}'\n"
+    f"               OR retired.recovery_basis IS DISTINCT FROM '{_V12_BASIS}'"
+)
+_ORDINARY_TERMINAL_V13_PREDICATE = (
+    "OR retired.reason IS DISTINCT FROM retired.recovery_basis\n"
+    "               OR retired.recovery_basis IS NULL\n"
+    "               OR retired.recovery_basis NOT IN (\n"
+    f"                    '{_V12_BASIS}', '{_V13_BASIS}'\n"
+    "               )"
+)
 _V12_PROOF = "healthporta.ptg-wave.v12-pristine-materialized-abandonment-proof.v1"
 _V13_PROOF = (
     "healthporta.ptg-wave.v13-post-ready-unreleased-failure-"
@@ -69,6 +81,46 @@ def _qt(schema: str, table: str) -> str:
 
 def _literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _replace_ordinary_terminal_receipt_guard(
+    *,
+    schema: str,
+    old_predicate: str,
+    new_predicate: str,
+) -> None:
+    """Patch the installed V12 guard only when its body is exact."""
+
+    signature = f"{_qt(schema, _ORDINARY_TERMINAL_GUARD)}()"
+    op.execute(
+        f"""
+        DO $migration$
+        DECLARE
+            definition text;
+            old_fragment constant text := {_literal(old_predicate)};
+            new_fragment constant text := {_literal(new_predicate)};
+        BEGIN
+            SELECT pg_catalog.pg_get_functiondef(
+                pg_catalog.to_regprocedure({_literal(signature)})
+            ) INTO definition;
+            IF definition IS NULL
+               OR pg_catalog.length(definition)
+                    - pg_catalog.length(pg_catalog.replace(
+                        definition, old_fragment, ''
+                    ))
+                    <> pg_catalog.length(old_fragment)
+               OR pg_catalog.strpos(definition, new_fragment) <> 0 THEN
+                RAISE EXCEPTION
+                    'PTG_WAVE_ORDINARY_TERMINAL_GUARD_PATCH_PRECONDITION_FAILED'
+                    USING ERRCODE = 'P0001';
+            END IF;
+            EXECUTE pg_catalog.replace(
+                definition, old_fragment, new_fragment
+            );
+        END;
+        $migration$
+        """
+    )
 
 
 def _expected_admission_sql(alias: str) -> str:
@@ -1163,9 +1215,18 @@ def upgrade() -> None:
     event = _qt(schema, "ptg_source_attempt_event")
     op.execute("SET LOCAL lock_timeout = '5s'")
     op.execute(
+        "SELECT pg_catalog.pg_advisory_xact_lock("
+        f"pg_catalog.hashtextextended({_literal(_ADMISSION_LOCK)}, 0))"
+    )
+    op.execute(
         f"LOCK TABLE {wave}, {quarantine}, {supersession}, {rollback}, "
         f"{intent}, {claim}, {outcome}, {run}, {event} "
         "IN SHARE ROW EXCLUSIVE MODE"
+    )
+    _replace_ordinary_terminal_receipt_guard(
+        schema=schema,
+        old_predicate=_ORDINARY_TERMINAL_V12_PREDICATE,
+        new_predicate=_ORDINARY_TERMINAL_V13_PREDICATE,
     )
     _replace_quarantine_constraints(schema=schema, include_v13=True)
     _install_v13_abandonment_guard(schema)
@@ -1180,6 +1241,10 @@ def downgrade() -> None:
     wave = _qt(schema, "ptg_import_wave")
     quarantine = _qt(schema, "ptg_import_wave_quarantine")
     op.execute("SET LOCAL lock_timeout = '5s'")
+    op.execute(
+        "SELECT pg_catalog.pg_advisory_xact_lock("
+        f"pg_catalog.hashtextextended({_literal(_ADMISSION_LOCK)}, 0))"
+    )
     op.execute(
         f"LOCK TABLE {wave}, {quarantine} IN ACCESS EXCLUSIVE MODE"
     )
@@ -1197,6 +1262,11 @@ def downgrade() -> None:
         END;
         $$
         """
+    )
+    _replace_ordinary_terminal_receipt_guard(
+        schema=schema,
+        old_predicate=_ORDINARY_TERMINAL_V13_PREDICATE,
+        new_predicate=_ORDINARY_TERMINAL_V12_PREDICATE,
     )
     for table_name in (
         "ptg_import_wave_intent",
