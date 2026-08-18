@@ -75,14 +75,9 @@ async def _install_renderer_functions(database: Database, schema_name: str) -> N
     await database.status(migration._formatted_address_function_sql(schema_name))
 
 
-@pytest.mark.asyncio
-async def test_overlay_stage_renders_its_own_components(monkeypatch) -> None:
-    """Render only the refreshed source instead of rescanning copied rows."""
-    async with _temporary_schema() as (database, schema_name):
-        monkeypatch.setattr(directory, "db", database)
-        await _install_renderer_functions(database, schema_name)
-        await database.status(
-            f"""
+async def _seed_scoped_overlay(database: Database, schema_name: str) -> None:
+    await database.status(
+        f"""
             CREATE TABLE "{schema_name}".provider_directory_address_overlay (
                 address_key uuid NOT NULL,
                 source_id varchar NOT NULL,
@@ -96,10 +91,10 @@ async def test_overlay_stage_renders_its_own_components(monkeypatch) -> None:
                 formatted_address_version smallint,
                 formatted_address_source varchar(32)
             );
-            """
-        )
-        await database.status(
-            f"""
+        """
+    )
+    await database.status(
+        f"""
             INSERT INTO "{schema_name}".provider_directory_address_overlay (
                 address_key, source_id, first_line, second_line, city_name,
                 state_name, postal_code, country_code, formatted_address,
@@ -117,8 +112,17 @@ async def test_overlay_stage_renders_its_own_components(monkeypatch) -> None:
                 'Ste 301', 'NASHVILLE', 'TN', '37218', 'US',
                 'COPIED LABEL', NULL, NULL
             );
-            """
-        )
+        """
+    )
+
+
+@pytest.mark.asyncio
+async def test_overlay_stage_renders_its_own_components(monkeypatch) -> None:
+    """Render only the refreshed source instead of rescanning copied rows."""
+    async with _temporary_schema() as (database, schema_name):
+        monkeypatch.setattr(directory, "db", database)
+        await _install_renderer_functions(database, schema_name)
+        await _seed_scoped_overlay(database, schema_name)
 
         changed_rows = await directory._backfill_address_overlay_stage_formatted_addresses(
             schema_name,

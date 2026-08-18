@@ -5,8 +5,7 @@
       "command": {
         "argv": [
           "python3",
-          "-m",
-          "tests.provider_directory_scoped_address_format_benchmark"
+          ".agents/provider_directory_scoped_address_format_benchmark.py"
         ],
         "timeout": 180,
         "env": {
@@ -27,7 +26,7 @@
         "tests/fixtures/provider_directory_scoped_address_format_source.sha256"
       ],
       "workload_files": [
-        "tests/provider_directory_scoped_address_format_benchmark.py",
+        ".agents/provider_directory_scoped_address_format_benchmark.py",
         "tests/test_address_formatted_serving_db.py",
         "alembic/versions/20260611100000_address_canonical_foundation.py",
         "alembic/versions/20260815010000_address_formatted_display_v2.py",

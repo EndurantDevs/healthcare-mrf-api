@@ -12,8 +12,11 @@ import json
 import os
 from pathlib import Path
 from statistics import fmean
+import sys
 import time
 import uuid
+
+sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from db.connection import Database
 from tests.test_address_formatted_serving_db import _install_renderer_functions
@@ -32,8 +35,8 @@ def _inputs() -> str:
     if "test" not in os.getenv("HLTHPRT_DB_DATABASE", "").lower():
         raise RuntimeError("HLTHPRT_DB_DATABASE must identify a test database")
     expected_source_sha = (
-        Path(__file__).parent
-        / "fixtures/provider_directory_scoped_address_format_source.sha256"
+        Path(__file__).parents[1]
+        / "tests/fixtures/provider_directory_scoped_address_format_source.sha256"
     ).read_text(encoding="utf-8").strip()
     actual_source_sha = hashlib.sha256(Path(directory.__file__).read_bytes()).hexdigest()
     if actual_source_sha != expected_source_sha:

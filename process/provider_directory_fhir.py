@@ -79643,9 +79643,7 @@ async def _populate_address_overlay_stage(
     countries_normalized = await _normalize_address_overlay_stage_countries(stage_ref)
     alias_metrics = await _materialize_address_overlay_aliases(schema, stage_ref)
     archive_metrics = await _hydrate_address_overlay_stage_from_archive(
-        schema,
-        stage_ref,
-        source_ids=source_ids,
+        schema, stage_ref, source_ids=source_ids
     )
     duplicates_removed = await _dedupe_address_overlay_stage(
         stage_ref,
