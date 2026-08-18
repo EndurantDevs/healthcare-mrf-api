@@ -62,6 +62,8 @@ async def test_overlay_stage_renders_from_its_own_components(monkeypatch):
     assert "formatted_address_source = 'canonical_v2'" in hydrate_sql
     assert "address_archive_v2" not in hydrate_sql
     assert "IS DISTINCT FROM ROW" in hydrate_sql
+    assert "formatted_source_ids" not in hydrate_sql
+    assert status.await_args.kwargs == {}
 
 
 @pytest.mark.asyncio
@@ -81,6 +83,25 @@ async def test_overlay_stage_rendering_does_not_require_archive(monkeypatch):
 
     assert changed_rows == 2
     status.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_overlay_stage_rendering_scopes_selected_sources(monkeypatch):
+    status = AsyncMock(return_value="UPDATE 1")
+    monkeypatch.setattr(directory.db, "status", status)
+
+    changed_rows = await directory._backfill_address_overlay_stage_formatted_addresses(
+        "mrf",
+        '"mrf"."overlay_stage"',
+        source_ids=["source-a"],
+    )
+
+    assert changed_rows == 1
+    assert (
+        "stage_row.source_id = ANY(CAST(:formatted_source_ids AS varchar[]))"
+        in status.await_args.args[0]
+    )
+    assert status.await_args.kwargs == {"formatted_source_ids": ["source-a"]}
 
 
 def _record_overlay_event(events, name, value):
@@ -155,6 +176,8 @@ async def test_overlay_population_hydrates_after_alias_rewrite(monkeypatch):
     assert events == ["aliases", "premise", "formatted", "coordinates", "dedupe"]
     assert metrics["archive_premise_key_backfill_rows"] == 1
     assert metrics["archive_formatted_address_backfill_rows"] == 2
+    formatted = directory._backfill_address_overlay_stage_formatted_addresses
+    assert formatted.await_args.kwargs == {"source_ids": []}
 
 
 def test_unified_archive_enrichment_never_copies_formatted_labels():
