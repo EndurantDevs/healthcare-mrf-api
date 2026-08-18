@@ -31,6 +31,38 @@ env:
     tests/test_ptg2_v3_capacity_resources.py
 
 jobs:
+  exact-prepush:
+    name: exact local pre-push gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - name: Run exact local pre-push gate
+        env:
+          PREPUSH_RECEIPT_DIR: ${{ runner.temp }}/healthcare-prepush-receipt
+        run: scripts/ci/prepush all "$COVERAGE_BASE_SHA"
+      - name: Upload exact pre-push receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: healthcare-mrf-exact-prepush-receipt
+          path: |
+            ${{ runner.temp }}/healthcare-prepush-receipt/receipt.txt
+            ${{ runner.temp }}/healthcare-prepush-receipt/tool-versions.txt
+            ${{ runner.temp }}/healthcare-prepush-receipt/input-sha256.txt
+            ${{ runner.temp }}/healthcare-prepush-receipt/container-image-id.txt
+            ${{ runner.temp }}/healthcare-prepush-receipt/python-lock-install-report.json
+            ${{ runner.temp }}/healthcare-prepush-receipt/python-locked-versions.txt
+            ${{ runner.temp }}/healthcare-prepush-receipt/ptg2-address-canon-wheel.sha256
+            ${{ runner.temp }}/healthcare-prepush-receipt/test-coverage-forecast-python.json
+            ${{ runner.temp }}/healthcare-prepush-receipt/test-coverage-forecast-rust.json
+          if-no-files-found: ignore
+          retention-days: 14
+
   public-hygiene:
     name: public hygiene
     runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}

@@ -1566,6 +1566,10 @@ paths:
     post:
       operationId: postPlanPriceBulk
       summary: Retrieve price rows for multiple plans
+      x-monitoring:
+        safe: true
+        request_body:
+          plan_ids: [monitoring-no-match]
       requestBody:
         required: true
         content:
