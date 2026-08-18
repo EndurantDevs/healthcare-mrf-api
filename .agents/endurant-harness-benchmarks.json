@@ -57,9 +57,14 @@
           "type": "number",
           "unit": "seconds",
           "direction": "lower"
+        },
+        "publication_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
         }
       },
-      "primary_metric": "pipeline_seconds",
+      "primary_metric": "publication_seconds",
       "minimum_improvement_fraction": 0.1
     },
     "entity-address-alias-integrity": {

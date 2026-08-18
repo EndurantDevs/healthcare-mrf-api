@@ -69,6 +69,7 @@ async def _run() -> None:
 
         started = time.monotonic()
         fence = await _resolve_candidate_fence(monkeypatch, database)
+        publication_started = 0.0
         async with database.transaction():
             with monkeypatch.context() as patch:
                 patch.setattr(importer, "db", database)
@@ -78,9 +79,11 @@ async def _run() -> None:
                     fence,
                     database,
                 )
+                publication_started = time.monotonic()
                 await importer._promote_provider_directory_artifact_datasets(
                     fence
                 )
+        publication_seconds = time.monotonic() - publication_started
         pipeline_seconds = time.monotonic() - started
 
         row = await scenario.connection.fetchrow(
@@ -104,7 +107,10 @@ async def _run() -> None:
                 "source_endpoint": source_endpoint,
                 "output_digest": output_digest,
             },
-            "metrics": {"pipeline_seconds": pipeline_seconds},
+            "metrics": {
+                "pipeline_seconds": pipeline_seconds,
+                "publication_seconds": publication_seconds,
+            },
         }
         Path(event_path).write_text(
             json.dumps(event, sort_keys=True) + "\n",
