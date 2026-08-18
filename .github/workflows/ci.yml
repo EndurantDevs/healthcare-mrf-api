@@ -71,7 +71,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         shard-index: [0, 1, 2, 3]
     env:
@@ -131,8 +131,15 @@ jobs:
   test-coverage:
     name: test coverage ratchet
     needs:
+      - public-hygiene
+      - python-quality
       - python-tests
       - capacity-evidence
+      - api-contract
+      - rust-scanner
+      - container-package
+      - security
+      - worker-queue-smoke
       - address-canonical-db-tests
     runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
@@ -288,7 +295,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         shard:
           - core

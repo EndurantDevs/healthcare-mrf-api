@@ -80,6 +80,17 @@ def test_arc_route_is_trusted_main_only_with_a_hosted_fallback() -> None:
         assert "HEALTHCARE_MRF_CI_RUNNER" not in yaml.safe_dump(job)
 
 
+def test_matrices_fail_fast_and_coverage_waits_for_every_root_job() -> None:
+    document, _ = _documents()
+    jobs = document["jobs"]
+
+    for name in ("python-tests", "address-canonical-db-tests"):
+        assert jobs[name]["strategy"]["fail-fast"] is True
+    assert set(jobs["test-coverage"]["needs"]) == {
+        name for name, job in jobs.items() if "needs" not in job
+    }
+
+
 def test_arc_jobs_are_secretless_and_privilege_free() -> None:
     document, _ = _documents()
 
