@@ -10,6 +10,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+from statistics import fmean
 import time
 
 import pytest
@@ -51,8 +52,9 @@ def _inputs() -> str:
     return event_path
 
 
-async def _run() -> None:
-    event_path = _inputs()
+async def _measure_once() -> dict[str, object]:
+    """Publish one isolated candidate and return correctness plus timings."""
+
     monkeypatch = pytest.MonkeyPatch()
     scenario = await TransactionalSchema.create(monkeypatch)
     database = None
@@ -67,42 +69,13 @@ async def _run() -> None:
         await scenario.transaction.commit()
         database = _runtime_database()
 
-        started = time.monotonic()
-        fence = await _resolve_candidate_fence(monkeypatch, database)
-        dataset_publication = {"calls": 0, "seconds": 0.0}
-        publish_dataset = importer._publish_validated_artifact_dataset
-
-        async def timed_publish_dataset(*args, **kwargs):
-            dataset_publication["calls"] += 1
-            dataset_started = time.monotonic()
-            try:
-                return await publish_dataset(*args, **kwargs)
-            finally:
-                dataset_publication["seconds"] += time.monotonic() - dataset_started
-
-        publication_started = 0.0
-        async with database.transaction():
-            with monkeypatch.context() as patch:
-                patch.setattr(importer, "db", database)
-                patch.setattr(
-                    importer,
-                    "_publish_validated_artifact_dataset",
-                    timed_publish_dataset,
-                )
-                await database.status("SET LOCAL lock_timeout = '500ms';")
-                await database.status("SET LOCAL statement_timeout = '30s';")
-                await importer._lock_and_verify_artifact_dataset_fence(
-                    fence,
-                    database,
-                )
-                publication_started = time.monotonic()
-                await importer._promote_provider_directory_artifact_datasets(
-                    fence
-                )
-        publication_seconds = time.monotonic() - publication_started
-        pipeline_seconds = time.monotonic() - started
-
-        row = await scenario.connection.fetchrow(
+        (
+            publication_calls,
+            dataset_publication_seconds,
+            pipeline_seconds,
+            publication_seconds,
+        ) = await _publish_candidate(monkeypatch, database)
+        dataset_record = await scenario.connection.fetchrow(
             f"""
             SELECT dataset_id, dataset_hash, resource_count, status, is_current
               FROM {scenario.quoted_schema}.provider_directory_endpoint_dataset
@@ -110,33 +83,96 @@ async def _run() -> None:
             """
         )
         source_endpoint = await _source_endpoint(scenario, "synthetic-source")
-        output = dict(row)
-        output["source_endpoint"] = source_endpoint
+        output_dict = dict(dataset_record)
+        output_dict["source_endpoint"] = source_endpoint
         output_digest = hashlib.sha256(
-            json.dumps(output, sort_keys=True, separators=(",", ":")).encode()
+            json.dumps(
+                output_dict, sort_keys=True, separators=(",", ":")
+            ).encode()
         ).hexdigest()
-        event = {
+        return {
             "schema_version": 1,
             "correctness": {
-                "dataset_status": row["status"],
-                "dataset_publication_calls": dataset_publication["calls"],
-                "is_current": row["is_current"],
+                "dataset_status": dataset_record["status"],
+                "dataset_publication_calls": publication_calls,
+                "is_current": dataset_record["is_current"],
                 "source_endpoint": source_endpoint,
                 "output_digest": output_digest,
             },
             "metrics": {
-                "dataset_publication_seconds": dataset_publication["seconds"],
+                "dataset_publication_seconds": dataset_publication_seconds,
                 "pipeline_seconds": pipeline_seconds,
                 "publication_seconds": publication_seconds,
             },
         }
-        Path(event_path).write_text(
-            json.dumps(event, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
     finally:
         monkeypatch.undo()
         await _close_scenario(scenario, database)
+
+
+async def _publish_candidate(monkeypatch, database) -> tuple[int, float, float, float]:
+    """Run the production publication transaction and capture its timings."""
+
+    started = time.monotonic()
+    fence = await _resolve_candidate_fence(monkeypatch, database)
+    publication_durations = []
+    publish_dataset = importer._publish_validated_artifact_dataset
+
+    async def timed_publish_dataset(*args, **kwargs):
+        dataset_started = time.monotonic()
+        try:
+            return await publish_dataset(*args, **kwargs)
+        finally:
+            publication_durations.append(time.monotonic() - dataset_started)
+
+    publication_started = 0.0
+    async with database.transaction():
+        with monkeypatch.context() as patch:
+            patch.setattr(importer, "db", database)
+            patch.setattr(
+                importer,
+                "_publish_validated_artifact_dataset",
+                timed_publish_dataset,
+            )
+            await database.status("SET LOCAL lock_timeout = '500ms';")
+            await database.status("SET LOCAL statement_timeout = '30s';")
+            await importer._lock_and_verify_artifact_dataset_fence(
+                fence,
+                database,
+            )
+            publication_started = time.monotonic()
+            await importer._promote_provider_directory_artifact_datasets(fence)
+    publication_seconds = time.monotonic() - publication_started
+    pipeline_seconds = time.monotonic() - started
+    return (
+        len(publication_durations),
+        sum(publication_durations),
+        pipeline_seconds,
+        publication_seconds,
+    )
+
+
+async def _run() -> None:
+    event_path = _inputs()
+    samples = [await _measure_once() for _ in range(11)]
+    correctness = samples[0]["correctness"]
+    if any(sample["correctness"] != correctness for sample in samples[1:]):
+        raise RuntimeError("benchmark correctness changed between samples")
+    metric_map = {
+        name: fmean(
+            sorted(sample["metrics"][name] for sample in samples)[1:-1]
+        )
+        for name in samples[0]["metrics"]
+    }
+    payload = {
+        "schema_version": 1,
+        "correctness": correctness,
+        "metrics": metric_map,
+    }
+    Path(event_path).write_text(
+        json.dumps(payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":
