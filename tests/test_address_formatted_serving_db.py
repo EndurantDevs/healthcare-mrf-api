@@ -77,8 +77,7 @@ async def _install_renderer_functions(database: Database, schema_name: str) -> N
 
 @pytest.mark.asyncio
 async def test_overlay_stage_renders_its_own_components(monkeypatch) -> None:
-    """Render the selected overlay row instead of copying an archive label."""
-    address_key = "00000000-0000-0000-0000-000000000123"
+    """Render only the refreshed source instead of rescanning copied rows."""
     async with _temporary_schema() as (database, schema_name):
         monkeypatch.setattr(directory, "db", database)
         await _install_renderer_functions(database, schema_name)
@@ -86,6 +85,7 @@ async def test_overlay_stage_renders_its_own_components(monkeypatch) -> None:
             f"""
             CREATE TABLE "{schema_name}".provider_directory_address_overlay (
                 address_key uuid NOT NULL,
+                source_id varchar NOT NULL,
                 first_line varchar,
                 second_line varchar,
                 city_name varchar,
@@ -100,12 +100,22 @@ async def test_overlay_stage_renders_its_own_components(monkeypatch) -> None:
         )
         await database.status(
             f"""
-            INSERT INTO "{schema_name}".provider_directory_address_overlay
+            INSERT INTO "{schema_name}".provider_directory_address_overlay (
+                address_key, source_id, first_line, second_line, city_name,
+                state_name, postal_code, country_code, formatted_address,
+                formatted_address_version, formatted_address_source
+            )
             VALUES (
-                '{address_key}', '4007 Clarksville Pike Suite 301',
+                '00000000-0000-0000-0000-000000000123', 'selected-source',
+                '4007 Clarksville Pike Suite 301',
                 'Ste 301', 'NASHVILLE', 'TN', '37218', 'US',
                 '4007 CLARKSVILLE PIKE, 101, NASHVILLE, TN 37218',
                 NULL, NULL
+            ), (
+                '00000000-0000-0000-0000-000000000124', 'copied-source',
+                '4007 Clarksville Pike Suite 301',
+                'Ste 301', 'NASHVILLE', 'TN', '37218', 'US',
+                'COPIED LABEL', NULL, NULL
             );
             """
         )
@@ -113,14 +123,20 @@ async def test_overlay_stage_renders_its_own_components(monkeypatch) -> None:
         changed_rows = await directory._backfill_address_overlay_stage_formatted_addresses(
             schema_name,
             f'"{schema_name}"."provider_directory_address_overlay"',
+            source_ids=["selected-source"],
         )
-        hydrated_overlay_record = await database.first(
-            f'SELECT * FROM "{schema_name}".provider_directory_address_overlay;'
+        overlay_records = await database.all(
+            f'SELECT * FROM "{schema_name}".provider_directory_address_overlay '
+            "ORDER BY source_id DESC;"
         )
 
         assert changed_rows == 1
-        assert hydrated_overlay_record.formatted_address == (
+        selected_record, copied_record = overlay_records
+        assert selected_record.formatted_address == (
             "4007 Clarksville Pike, Suite 301, Nashville, TN 37218"
         )
-        assert hydrated_overlay_record.formatted_address_version == 2
-        assert hydrated_overlay_record.formatted_address_source == "canonical_v2"
+        assert selected_record.formatted_address_version == 2
+        assert selected_record.formatted_address_source == "canonical_v2"
+        assert copied_record.formatted_address == "COPIED LABEL"
+        assert copied_record.formatted_address_version is None
+        assert copied_record.formatted_address_source is None

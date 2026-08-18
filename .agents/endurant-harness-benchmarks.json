@@ -1,6 +1,66 @@
 {
   "schema_version": 1,
   "benchmarks": {
+    "provider-directory-scoped-address-format": {
+      "command": {
+        "argv": [
+          "python3",
+          "-m",
+          "tests.provider_directory_scoped_address_format_benchmark"
+        ],
+        "timeout": 180,
+        "env": {
+          "HLTHPRT_ADDRESS_OVERLAY_BENCHMARK_ROWS": "10000",
+          "HLTHPRT_DB_DATABASE": "provider_directory_publication_test",
+          "HLTHPRT_DB_DRIVER": "asyncpg",
+          "HLTHPRT_DB_HOST": "127.0.0.1",
+          "HLTHPRT_DB_PASSWORD": "postgres",
+          "HLTHPRT_DB_POOL_MAX_SIZE": "4",
+          "HLTHPRT_DB_POOL_MIN_SIZE": "1",
+          "HLTHPRT_DB_PORT": "55439",
+          "HLTHPRT_DB_USER": "postgres",
+          "PYTHONDONTWRITEBYTECODE": "1"
+        },
+        "evidence": "integration"
+      },
+      "source_files": [
+        "process/provider_directory_fhir.py"
+      ],
+      "workload_files": [
+        "tests/provider_directory_scoped_address_format_benchmark.py",
+        "tests/test_address_formatted_serving_db.py",
+        "alembic/versions/20260611100000_address_canonical_foundation.py",
+        "alembic/versions/20260815010000_address_formatted_display_v2.py",
+        "db/connection.py",
+        "process/ext/address_format.py",
+        "process/ext/utils.py",
+        "requirements-ci.lock"
+      ],
+      "correctness_keys": [
+        "row_count",
+        "copied_rows",
+        "updated_rows",
+        "output_digest",
+        "output_persistence",
+        "atomic_swap",
+        "failure_target_unchanged",
+        "private_artifacts_cleaned"
+      ],
+      "metric_schema": {
+        "format_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "pipeline_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        }
+      },
+      "primary_metric": "pipeline_seconds",
+      "minimum_improvement_fraction": 0.3
+    },
     "provider-directory-terminal-publication": {
       "command": {
         "argv": [
