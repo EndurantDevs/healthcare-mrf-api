@@ -21,6 +21,7 @@ from process.ptg_wave_ordinary_terminal_contract import (
 )
 from process.ptg_wave_quarantine_basis import (
     V12_PRISTINE_MATERIALIZED_CUTOVER_BASIS,
+    V13_POST_READY_UNRELEASED_FAILURE_CUTOVER_BASIS,
 )
 from process.ptg_wave_receipt_authority import (
     ABANDONMENT_RECEIPT_SCHEMA,
@@ -28,7 +29,11 @@ from process.ptg_wave_receipt_authority import (
 )
 from process.ptg_wave_receipt_contract import ordinary_cutover_id
 from process.ptg_wave_v12_pristine_abandonment import (
-    abandonment_receipt_payload,
+    abandonment_receipt_payload as v12_abandonment_receipt_payload,
+)
+from process.ptg_wave_v13_post_ready_abandonment import (
+    abandonment_receipt_payload as v13_abandonment_receipt_payload,
+    validate_v13_abandonment_proof,
 )
 
 
@@ -59,27 +64,41 @@ def _validated_abandonment(
     wave: Any,
     key_id: str,
 ) -> dict[str, Any]:
+    recovery_basis = getattr(quarantine, "recovery_basis", None)
     if (
         quarantine is None
-        or getattr(quarantine, "reason", None)
-        != V12_PRISTINE_MATERIALIZED_CUTOVER_BASIS
-        or getattr(quarantine, "recovery_basis", None)
-        != V12_PRISTINE_MATERIALIZED_CUTOVER_BASIS
+        or getattr(quarantine, "reason", None) != recovery_basis
+        or recovery_basis not in {
+            V12_PRISTINE_MATERIALIZED_CUTOVER_BASIS,
+            V13_POST_READY_UNRELEASED_FAILURE_CUTOVER_BASIS,
+        }
         or getattr(quarantine, "predecessor_wave_id", None) != wave.wave_id
         or getattr(quarantine, "cutover_id", None)
         != ordinary_cutover_id(wave.wave_id)
         or getattr(quarantine, "receipt_key_id", None) != key_id
     ):
         raise PTGWaveOrdinaryTerminalConflict(
-            "ordinary terminal receipt requires signed V12 abandonment"
+            "ordinary terminal receipt requires signed V12 abandonment or "
+            "V13 abandonment"
         )
     try:
-        abandonment_payload = abandonment_receipt_payload(
-            getattr(quarantine, "recovery_evidence", None)
-        )
+        recovery_evidence = getattr(quarantine, "recovery_evidence", None)
+        if recovery_basis == V12_PRISTINE_MATERIALIZED_CUTOVER_BASIS:
+            abandonment_payload = v12_abandonment_receipt_payload(
+                recovery_evidence
+            )
+        else:
+            validate_v13_abandonment_proof(
+                recovery_evidence,
+                operation_id=wave.wave_id,
+                cutover_id=ordinary_cutover_id(wave.wave_id),
+            )
+            abandonment_payload = v13_abandonment_receipt_payload(
+                recovery_evidence
+            )
     except Exception as exc:
         raise PTGWaveOrdinaryTerminalConflict(
-            "stored V12 abandonment proof is invalid"
+            "stored abandonment proof is invalid"
         ) from exc
     receipt = getattr(quarantine, "abandonment_receipt", None)
     if (
@@ -95,7 +114,7 @@ def _validated_abandonment(
         )
     ):
         raise PTGWaveOrdinaryTerminalConflict(
-            "stored V12 abandonment receipt is invalid"
+            "stored abandonment receipt is invalid"
         )
     return abandonment_payload
 

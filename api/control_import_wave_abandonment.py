@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import select
 
+from api.control_import_wave_v13_abandonment import (
+    _identity,
+    _receipt_datetime,
+    existing_v13_response,
+    get_v13_post_ready_abandonment,
+    normalize_abandonment_request,
+    persist_v13_abandonment,
+)
 from api.control_import_wave_supersession import _as_aware_utc
 from db.models import PTGImportWaveQuarantine, db
 from process.ptg_parts.ptg_wave_admission_fence import (
@@ -23,20 +30,15 @@ from process.ptg_wave_materialized_preclaim_supersession_runtime import (
 )
 from process.ptg_wave_receipt_authority import (
     ABANDONMENT_RECEIPT_SCHEMA,
-    PTGWaveReceiptAuthorityError,
     PTGWaveReceiptKeyring,
     canonical_receipt_timestamp,
-    require_receipt_key_id,
 )
 from process.ptg_wave_receipt_process_authority import (
     require_process_receipt_keyring,
 )
 from process.ptg_wave_receipt_contract import (
     ABANDONMENT_REQUEST_SCHEMA,
-    PTGWaveReceiptContractError,
     V12_QUARANTINE_REASON,
-    ordinary_cutover_id,
-    validate_receipt_admission,
 )
 from process.ptg_wave_state import canonical_json
 from process.ptg_wave_v12_pristine_abandonment import (
@@ -59,52 +61,103 @@ async def abandon_materialized_preclaim_wave(
     """Atomically quarantine one all-unclaimed wave without a successor.
 
     Legacy callers pass the cutover ID string and retain the original proof
-    and response. Fresh V12 callers pass the exact signed-admission request
-    and receive the persisted asymmetric receipt envelope directly.
+    and response.  Fresh V12 and V13 callers pass their exact signed-admission
+    request and receive the persisted asymmetric receipt envelope directly.
     """
 
-    normalized_wave_id, v12_request, normalized_cutover_id = (
-        _normalized_abandonment_request(wave_id, cutover_or_request)
+    normalized_wave_id, fresh_request, normalized_cutover_id = (
+        normalize_abandonment_request(wave_id, cutover_or_request)
     )
 
     async with db.transaction() as session:
         await acquire_ptg_admission_lock(session)
         existing = await _locked_quarantine(session, normalized_wave_id)
         if existing is not None:
-            if v12_request is not None:
-                return _existing_v12_response(
-                    existing,
-                    request=v12_request,
-                    receipt_keyring=receipt_keyring,
-                ), False
-            return _existing_legacy_response(
+            response = _existing_abandonment_response(
                 existing,
+                fresh_request=fresh_request,
                 wave_id=normalized_wave_id,
                 cutover_id=normalized_cutover_id,
-            ), False
-        cutover_owner = await _locked_cutover_owner(
-            session,
-            normalized_cutover_id,
-        )
-        if cutover_owner is not None:
-            raise PTGWaveMaterializedPreclaimConflict(
-                "cutover ID is already bound to another wave"
-            )
-        if v12_request is not None:
-            return await _persist_v12_abandonment(
-                session,
-                normalized_wave_id,
-                v12_request,
-                redis=redis,
                 receipt_keyring=receipt_keyring,
-                receipt_issued_at=receipt_issued_at,
             )
-        return await _persist_legacy_abandonment(
+            return response, False
+        return await _persist_new_abandonment(
             session,
             normalized_wave_id,
             normalized_cutover_id,
+            fresh_request,
+            redis=redis,
+            receipt_keyring=receipt_keyring,
+            receipt_issued_at=receipt_issued_at,
+        )
+
+
+def _existing_abandonment_response(
+    existing: Any,
+    *,
+    fresh_request: dict[str, Any] | None,
+    wave_id: str,
+    cutover_id: str,
+    receipt_keyring: PTGWaveReceiptKeyring | None,
+) -> dict[str, Any]:
+    if fresh_request is None:
+        return _existing_legacy_response(
+            existing,
+            wave_id=wave_id,
+            cutover_id=cutover_id,
+        )
+    if fresh_request["schema"] == ABANDONMENT_REQUEST_SCHEMA:
+        return _existing_v12_response(
+            existing,
+            request=fresh_request,
+            receipt_keyring=receipt_keyring,
+        )
+    return existing_v13_response(
+        existing,
+        request=fresh_request,
+        receipt_keyring=receipt_keyring,
+    )
+
+
+async def _persist_new_abandonment(
+    session: Any,
+    wave_id: str,
+    cutover_id: str,
+    fresh_request: dict[str, Any] | None,
+    *,
+    redis: Any,
+    receipt_keyring: PTGWaveReceiptKeyring | None,
+    receipt_issued_at: dt.datetime | str | None,
+) -> tuple[dict[str, Any], bool]:
+    cutover_owner = await _locked_cutover_owner(session, cutover_id)
+    if cutover_owner is not None:
+        raise PTGWaveMaterializedPreclaimConflict(
+            "cutover ID is already bound to another wave"
+        )
+    if fresh_request is None:
+        return await _persist_legacy_abandonment(
+            session,
+            wave_id,
+            cutover_id,
             redis=redis,
         )
+    if fresh_request["schema"] == ABANDONMENT_REQUEST_SCHEMA:
+        return await _persist_v12_abandonment(
+            session,
+            wave_id,
+            fresh_request,
+            redis=redis,
+            receipt_keyring=receipt_keyring,
+            receipt_issued_at=receipt_issued_at,
+        )
+    return await persist_v13_abandonment(
+        session,
+        wave_id,
+        fresh_request,
+        redis=redis,
+        receipt_keyring=receipt_keyring,
+        receipt_issued_at=receipt_issued_at,
+    )
 
 
 async def get_materialized_preclaim_abandonment(
@@ -141,25 +194,6 @@ async def get_materialized_preclaim_abandonment(
         "cutover_id": cutover_id,
         "recovery_evidence": proof,
     }
-
-
-def _normalized_abandonment_request(
-    wave_id: object,
-    cutover_or_request: object,
-) -> tuple[str, dict[str, Any] | None, str]:
-    """Normalize legacy and V12 abandonment coordinates."""
-
-    normalized_wave_id = _identity(wave_id, "wave ID")
-    if isinstance(cutover_or_request, Mapping):
-        request_by_field = _v12_request_identity(
-            cutover_or_request,
-            wave_id=normalized_wave_id,
-        )
-        return normalized_wave_id, request_by_field, request_by_field["cutover_id"]
-    normalized_cutover_id = _identity(cutover_or_request, "cutover ID")
-    if normalized_cutover_id == normalized_wave_id:
-        raise ValueError("cutover ID must differ from the wave ID")
-    return normalized_wave_id, None, normalized_cutover_id
 
 
 async def _locked_quarantine(session: Any, wave_id: str) -> Any | None:
@@ -428,68 +462,8 @@ def _legacy_response(
     }
 
 
-def _v12_request_identity(
-    request_by_field: Mapping[str, Any],
-    *,
-    wave_id: str,
-) -> dict[str, Any]:
-    expected_fields = {
-        "schema",
-        "key_id",
-        "operation_id",
-        "cutover_id",
-        "admission",
-    }
-    if set(request_by_field) != expected_fields:
-        raise PTGWaveReceiptContractError(
-            "V12 abandonment request fields are invalid"
-        )
-    admission = validate_receipt_admission(request_by_field.get("admission"))
-    try:
-        key_id = require_receipt_key_id(
-            request_by_field.get("key_id"),
-            "V12 abandonment request key ID",
-        )
-    except PTGWaveReceiptAuthorityError as exc:
-        raise PTGWaveReceiptContractError(str(exc)) from exc
-    if (
-        request_by_field.get("schema") != ABANDONMENT_REQUEST_SCHEMA
-        or request_by_field.get("operation_id") != wave_id
-        or admission["wave_id"] != wave_id
-        or request_by_field.get("cutover_id") != ordinary_cutover_id(wave_id)
-        or key_id != admission["receipt_key_id"]
-    ):
-        raise PTGWaveReceiptContractError(
-            "V12 abandonment request identity is invalid"
-        )
-    return {
-        "schema": ABANDONMENT_REQUEST_SCHEMA,
-        "key_id": key_id,
-        "operation_id": wave_id,
-        "cutover_id": request_by_field["cutover_id"],
-        "admission": admission,
-    }
-
-
-def _receipt_datetime(value: str) -> dt.datetime:
-    return dt.datetime.strptime(
-        canonical_receipt_timestamp(value),
-        "%Y-%m-%dT%H:%M:%S.%fZ",
-    ).replace(tzinfo=dt.UTC)
-
-
-def _identity(value: object, name: str) -> str:
-    if (
-        type(value) is not str
-        or not value
-        or value != value.strip()
-        or len(value) > 64
-    ):
-        raise ValueError(f"{name} is invalid")
-    return value
-
-
 __all__ = [
     "abandon_materialized_preclaim_wave",
     "get_materialized_preclaim_abandonment",
+    "get_v13_post_ready_abandonment",
 ]

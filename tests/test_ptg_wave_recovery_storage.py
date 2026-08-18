@@ -185,6 +185,16 @@ def test_models_bind_immutable_predecessor_and_successor_contracts():
             "ptg_import_wave_quarantine_reason_check",
         ).sqltext
     )
+    assert (
+        "recovery_basis IS NULL AND reason IN ("
+        "'legacy_uncertain_slots_waiting_pre_receipt', "
+        "'materialized_preclaim_failure')"
+    ) in str(
+        _constraint(
+            PTGImportWaveQuarantine,
+            "ptg_import_wave_quarantine_abandonment_evidence_check",
+        ).sqltext
+    )
     successor_fk = _constraint(
         PTGImportWaveSupersession,
         "ptg_import_wave_supersession_successor_wave_fkey",

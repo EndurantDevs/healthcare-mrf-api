@@ -6,6 +6,7 @@ from sanic import response
 from sanic.exceptions import BadRequest, NotFound, SanicException
 
 from api.control_auth import require_control_auth
+from api.control_wave_route_registration import register_control_wave_routes
 from api.control_import_waves import (
     ImportWaveConflict,
     MAX_ATTESTATION_CANONICAL_BYTES,
@@ -16,6 +17,7 @@ from api.control_import_waves import (
 from api.control_import_wave_abandonment import (
     abandon_materialized_preclaim_wave,
     get_materialized_preclaim_abandonment,
+    get_v13_post_ready_abandonment,
 )
 from api.control_wave_linkage_route import control_record_import_wave_linkage
 from process.ptg_parts.ptg_wave_admission_fence import PTGWaveCapacityConflict
@@ -48,6 +50,9 @@ from process.ptg_wave_receipt_process_authority import (
 from process.ptg_wave_receipt_contract import (
     ABANDONMENT_REQUEST_SCHEMA,
     PTGWaveReceiptContractError,
+)
+from process.ptg_wave_v13_post_ready_abandonment import (
+    V13_ABANDONMENT_REQUEST_SCHEMA,
 )
 from process.ptg_wave_preclaim_supersession import (
     PTGWavePreclaimSupersessionConflict,
@@ -327,12 +332,13 @@ async def control_abandon_materialized_preclaim_wave(
         frozenset(v12_fields),
     }:
         raise BadRequest(
-            "request must contain only cutover_id or the exact V12 fields"
+            "request must contain only cutover_id or the exact V12/V13 fields"
         )
     if payload_fields == frozenset(v12_fields) and (
-        request_payload.get("schema") != ABANDONMENT_REQUEST_SCHEMA
+        request_payload.get("schema")
+        not in {ABANDONMENT_REQUEST_SCHEMA, V13_ABANDONMENT_REQUEST_SCHEMA}
     ):
-        raise BadRequest("V12 abandonment request schema is unsupported")
+        raise BadRequest("abandonment request schema is unsupported")
     try:
         abandonment_result, created = await abandon_materialized_preclaim_wave(
             wave_id,
@@ -376,6 +382,31 @@ async def control_get_materialized_preclaim_abandonment(
     if proof is None:
         raise NotFound("materialized abandonment proof not found")
     return response.json(proof, default=str)
+
+
+async def control_get_v13_abandonment(
+    request,
+    wave_id: str,
+):
+    """Return one verified V13 receipt without re-observing or mutating."""
+
+    require_control_auth(request)
+    if request.args:
+        raise BadRequest("V13 abandonment query fields are not exact")
+    try:
+        receipt = await get_v13_post_ready_abandonment(
+            wave_id,
+            receipt_keyring=_require_request_receipt_keyring(request),
+        )
+    except PTGWaveReceiptAuthorityError as exc:
+        raise SanicException(str(exc), status_code=503) from exc
+    except PTGWaveMaterializedPreclaimConflict as exc:
+        raise SanicException(str(exc), status_code=409) from exc
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    if receipt is None:
+        raise NotFound("V13 post-ready abandonment receipt not found")
+    return response.json(receipt, default=str)
 
 
 async def control_issue_ordinary_terminal_receipt(
@@ -451,49 +482,6 @@ def _require_request_receipt_keyring(request):
     return require_process_receipt_keyring(
         _request_receipt_keyring(request)
     )
-
-
-def register_control_wave_routes(blueprint):
-    """Register exact-wave endpoints and controller lifecycle hooks."""
-
-    blueprint.listener("before_server_start")(
-        control_initialize_ptg_wave_receipt_authority
-    )
-    blueprint.listener("after_server_start")(control_start_ptg_wave_controller)
-    blueprint.listener("before_server_stop")(control_stop_ptg_wave_controller)
-    blueprint.post("/import-waves")(control_admit_import_wave)
-    blueprint.get("/import-waves/<wave_id>")(control_get_import_wave)
-    blueprint.get("/import-wave-receipt-key-epochs")(
-        control_get_receipt_key_epochs
-    )
-    blueprint.get("/import-waves/<wave_id>/outcomes")(
-        control_get_import_wave_outcomes
-    )
-    blueprint.post("/import-waves/<wave_id>/linkage-ack")(
-        control_record_import_wave_linkage
-    )
-    blueprint.get("/import-waves/<wave_id>/proof")(
-        control_get_import_wave_proof
-    )
-    blueprint.get(
-        "/import-waves/<wave_id>/logical-preclaim-supersession"
-    )(control_get_logical_preclaim_supersession)
-    blueprint.get(
-        "/import-waves/<wave_id>/admission-rollback-supersession"
-    )(control_get_admission_rollback_supersession)
-    blueprint.get(
-        "/import-waves/<wave_id>/materialized-preclaim-supersession"
-    )(control_get_materialized_preclaim_supersession)
-    blueprint.post(
-        "/import-waves/<wave_id>/materialized-preclaim-abandonment"
-    )(control_abandon_materialized_preclaim_wave)
-    blueprint.get(
-        "/import-waves/<wave_id>/materialized-preclaim-abandonment"
-    )(control_get_materialized_preclaim_abandonment)
-    blueprint.post(
-        "/import-waves/<wave_id>/ordinary-terminal-receipts"
-    )(control_issue_ordinary_terminal_receipt)
-    return blueprint
 
 
 __all__ = ["register_control_wave_routes"]

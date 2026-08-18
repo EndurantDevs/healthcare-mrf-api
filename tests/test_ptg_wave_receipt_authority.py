@@ -447,7 +447,6 @@ async def test_startup_retains_signer_for_each_abandoned_member_without_receipt(
     monkeypatch,
 ):
     from db.models import db
-
     _configure_active(monkeypatch, "epoch-abandoned", FIXED_KEY)
     signer = PTGWaveReceiptKeyring.from_environment()
     public_epoch = signer.public_by_key_id["epoch-abandoned"]
@@ -466,25 +465,26 @@ async def test_startup_retains_signer_for_each_abandoned_member_without_receipt(
     empty_session = _CoverageSession([[], [], []])
     monkeypatch.setattr(db, "session", lambda: _CoverageSessionContext(empty_session))
     await assert_nonterminal_receipt_key_coverage(keyring=public_only)
-
     blocked_session = _CoverageSession([pinned_rows, [], [public_epoch.key_id]])
     monkeypatch.setattr(
         db,
         "session",
         lambda: _CoverageSessionContext(blocked_session),
     )
-
     with pytest.raises(
         PTGWaveReceiptAuthorityError,
         match="unavailable for signing",
     ):
         await assert_nonterminal_receipt_key_coverage(keyring=public_only)
 
-    pending_query = str(
-        blocked_session.statements[2].compile(dialect=postgresql.dialect())
-    )
+    pending_query = str(blocked_session.statements[2].compile(
+        dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+    ))
     assert "ptg_import_wave_intent" in pending_query
     assert "ptg_import_wave_ordinary_terminal_receipt" in pending_query
+    assert "v12_pristine_materialized_cutover" in pending_query
+    assert "v13_post_ready_unreleased_failure_cutover" in pending_query
+    assert "materialized_preclaim_failure" not in pending_query
     assert "import_run" not in pending_query.replace(
         "ptg_import_wave_ordinary_terminal_receipt", ""
     )
