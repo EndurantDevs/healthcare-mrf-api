@@ -79642,7 +79642,11 @@ async def _populate_address_overlay_stage(
     inserted = sum(inserted_by_component.values())
     countries_normalized = await _normalize_address_overlay_stage_countries(stage_ref)
     alias_metrics = await _materialize_address_overlay_aliases(schema, stage_ref)
-    archive_metrics = await _hydrate_address_overlay_stage_from_archive(schema, stage_ref)
+    archive_metrics = await _hydrate_address_overlay_stage_from_archive(
+        schema,
+        stage_ref,
+        source_ids=source_ids,
+    )
     duplicates_removed = await _dedupe_address_overlay_stage(
         stage_ref,
         source_ids=source_ids,
@@ -79943,9 +79947,17 @@ async def _backfill_address_overlay_stage_premise_keys(
 async def _backfill_address_overlay_stage_formatted_addresses(
     schema: str,
     stage_ref: str,
+    *,
+    source_ids: list[str] | tuple[str, ...] | None = None,
 ) -> int:
-    """Render every staged label from that row's structured components."""
+    """Render scoped staged labels from each row's structured components."""
     renderer = f"{_q(schema)}.{ADDRESS_FORMAT_FUNCTION}"
+    cleaned_source_ids = _clean_source_id_list(source_ids)
+    source_scope = (
+        "AND stage_row.source_id = ANY(CAST(:formatted_source_ids AS varchar[]))"
+        if cleaned_source_ids
+        else ""
+    )
     return _coerce_rowcount(
         await db.status(
             f"""
@@ -79961,6 +79973,7 @@ async def _backfill_address_overlay_stage_formatted_addresses(
                    formatted_address_version = {ADDRESS_FORMAT_VERSION},
                    formatted_address_source = '{ADDRESS_FORMAT_SOURCE}'
              WHERE stage_row.address_key IS NOT NULL
+               {source_scope}
                AND ROW(
                        stage_row.formatted_address,
                        stage_row.formatted_address_version,
@@ -79977,7 +79990,12 @@ async def _backfill_address_overlay_stage_formatted_addresses(
                        {ADDRESS_FORMAT_VERSION},
                        '{ADDRESS_FORMAT_SOURCE}'
                    );
-            """
+            """,
+            **(
+                {"formatted_source_ids": cleaned_source_ids}
+                if cleaned_source_ids
+                else {}
+            ),
         )
     )
 
@@ -79985,6 +80003,8 @@ async def _backfill_address_overlay_stage_formatted_addresses(
 async def _hydrate_address_overlay_stage_from_archive(
     schema: str,
     stage_ref: str,
+    *,
+    source_ids: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, int]:
     """Hydrate archive-backed premise, label, and coordinate fields."""
     premise_rows = await _backfill_address_overlay_stage_premise_keys(
@@ -79994,6 +80014,7 @@ async def _hydrate_address_overlay_stage_from_archive(
     formatted_rows = await _backfill_address_overlay_stage_formatted_addresses(
         schema,
         stage_ref,
+        source_ids=source_ids,
     )
     coordinate_rows = await _backfill_address_overlay_stage_coordinates(
         schema,
