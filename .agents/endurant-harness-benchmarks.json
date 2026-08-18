@@ -26,7 +26,6 @@
         "evidence": "integration"
       },
       "source_files": [
-        "process/provider_directory_fhir.py",
         "alembic/versions/20260818020000_provider_directory_terminal_publication_compact_guard.py"
       ],
       "workload_files": [
