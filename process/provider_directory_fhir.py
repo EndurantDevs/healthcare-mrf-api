@@ -9785,7 +9785,9 @@ async def _verify_active_profile_selection_at_cutover() -> None:
 async def _cutover_provider_directory_artifact_sources(
     fence: ProviderDirectoryArtifactDatasetFence,
 ) -> None:
-    source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
+    source_ref = _unscoped_qt(
+        _schema(), ProviderDirectorySource.__tablename__
+    )
     for dataset in fence.locked_alias_datasets:
         serving_endpoint_id = (
             dataset.serving_endpoint_id or dataset.endpoint_id

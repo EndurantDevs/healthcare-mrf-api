@@ -271,11 +271,25 @@ async def test_reviewed_artifact_alias_cutover_requires_configured_cas(
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status)
 
-    await importer._cutover_provider_directory_artifact_sources(
-        importer.ProviderDirectoryArtifactDatasetFence((reviewed_dataset,))
+    relation_token = (
+        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
+            {"provider_directory_source": "private_source_scope"}
+        )
     )
+    try:
+        await importer._cutover_provider_directory_artifact_sources(
+            importer.ProviderDirectoryArtifactDatasetFence(
+                (reviewed_dataset,)
+            )
+        )
+    finally:
+        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(
+            relation_token
+        )
 
     statement = status.await_args.args[0]
+    assert '"mrf"."provider_directory_source"' in statement
+    assert '"mrf"."private_source_scope"' not in statement
     assert subset_identity.CONFIGURED_ENDPOINT_ID_METADATA_FIELD in statement
     assert status.await_args.kwargs["endpoint_id"] == "candidate_endpoint"
     assert status.await_args.kwargs["serving_endpoint_id"] == (
