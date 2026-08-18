@@ -1,6 +1,68 @@
 {
   "schema_version": 1,
   "benchmarks": {
+    "provider-directory-terminal-publication": {
+      "command": {
+        "argv": [
+          "python3",
+          "-m",
+          "tests.provider_directory_terminal_publication_benchmark"
+        ],
+        "timeout": 180,
+        "env": {
+          "DB_SCHEMA": "mrf",
+          "HLTHPRT_DB_DATABASE": "provider_directory_publication_test",
+          "HLTHPRT_DB_DRIVER": "asyncpg",
+          "HLTHPRT_DB_HOST": "127.0.0.1",
+          "HLTHPRT_DB_PASSWORD": "postgres",
+          "HLTHPRT_DB_POOL_MAX_SIZE": "4",
+          "HLTHPRT_DB_POOL_MIN_SIZE": "1",
+          "HLTHPRT_DB_PORT": "55439",
+          "HLTHPRT_DB_SCHEMA": "mrf",
+          "HLTHPRT_DB_USER": "postgres",
+          "HLTHPRT_TIN_NPI_CONNECTOR_POSTGRES_DSN": "postgresql://postgres:postgres@127.0.0.1:55439/provider_directory_publication_test",
+          "PYTHONDONTWRITEBYTECODE": "1"
+        },
+        "evidence": "integration"
+      },
+      "source_files": [
+        "process/provider_directory_fhir.py",
+        "alembic/versions/20260818020000_provider_directory_terminal_publication_compact_guard.py"
+      ],
+      "workload_files": [
+        "tests/provider_directory_terminal_publication_benchmark.py",
+        "tests/provider_directory_effective_endpoint_pg_cases.py",
+        "tests/provider_directory_fhir_subset_activation_support.py",
+        "tests/provider_directory_reviewed_root_policy_pg.py",
+        "tests/provider_directory_reviewed_subset_activation_pg_concurrency.py",
+        "tests/provider_directory_reviewed_subset_activation_pg_support.py",
+        "tests/provider_directory_subset_completion_pg_setup.py",
+        "tests/provider_directory_subset_completion_pg_source_concurrency.py",
+        "tests/test_provider_directory_terminal_publication_compact_guard_db.py",
+        "tests/test_provider_directory_terminal_publication_compact_guard_migration.py",
+        "tests/test_provider_directory_subset_completion_migration.py",
+        "tests/tin_npi_connector_postgres_support.py",
+        "alembic/versions/20260812010000_provider_directory_artifact_selection_receipt.py",
+        "alembic/versions/20260812020000_provider_directory_endpoint_dataset_admission_seal.py",
+        "alembic/versions/20260816010000_provider_directory_terminal_publication_guard.py",
+        "requirements-ci.lock"
+      ],
+      "correctness_keys": [
+        "dataset_status",
+        "is_current",
+        "source_endpoint",
+        "output_digest"
+      ],
+      "metric_schema": {
+        "pipeline_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        }
+      },
+      "primary_metric": "pipeline_seconds",
+      "minimum_improvement_fraction": 0.1
+    },
     "entity-address-alias-integrity": {
       "command": {
         "argv": [
