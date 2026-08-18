@@ -69,18 +69,16 @@ async def _run() -> None:
 
         started = time.monotonic()
         fence = await _resolve_candidate_fence(monkeypatch, database)
-        dataset_publication_calls = 0
-        dataset_publication_seconds = 0.0
+        dataset_publication = {"calls": 0, "seconds": 0.0}
         publish_dataset = importer._publish_validated_artifact_dataset
 
         async def timed_publish_dataset(*args, **kwargs):
-            nonlocal dataset_publication_calls, dataset_publication_seconds
-            dataset_publication_calls += 1
+            dataset_publication["calls"] += 1
             dataset_started = time.monotonic()
             try:
                 return await publish_dataset(*args, **kwargs)
             finally:
-                dataset_publication_seconds += time.monotonic() - dataset_started
+                dataset_publication["seconds"] += time.monotonic() - dataset_started
 
         publication_started = 0.0
         async with database.transaction():
@@ -121,13 +119,13 @@ async def _run() -> None:
             "schema_version": 1,
             "correctness": {
                 "dataset_status": row["status"],
-                "dataset_publication_calls": dataset_publication_calls,
+                "dataset_publication_calls": dataset_publication["calls"],
                 "is_current": row["is_current"],
                 "source_endpoint": source_endpoint,
                 "output_digest": output_digest,
             },
             "metrics": {
-                "dataset_publication_seconds": dataset_publication_seconds,
+                "dataset_publication_seconds": dataset_publication["seconds"],
                 "pipeline_seconds": pipeline_seconds,
                 "publication_seconds": publication_seconds,
             },
