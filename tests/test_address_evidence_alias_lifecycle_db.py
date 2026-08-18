@@ -2,10 +2,12 @@
 
 """Reviewed evidence alias activation and revocation lifecycle."""
 
+import tempfile
 from unittest.mock import AsyncMock
 
 import pytest
 
+from process import address_evidence_alias_native
 from process.address_numeric_grid_alias import run_numeric_grid_alias
 from process.address_numeric_grid_alias_revoke import revoke_numeric_grid_alias
 from process.ext import address_canon
@@ -18,7 +20,6 @@ from tests.test_address_numeric_grid_alias_runtime_db import (
     _requires_test_database,
     db,
 )
-
 
 _ALIAS_KIND = "evidence_gated_address_match_v1"
 _STAGE = "evidence_alias_resolve_stage"
@@ -397,6 +398,26 @@ async def _assert_revoked_projection(schema, key_by_case) -> None:
     assert target_provenance.source_bits & 16 == 0
 
 
+async def _materialize_evidence_alias_parity_case(monkeypatch, connection, materializer, schema):
+    monkeypatch.setenv(
+        "HLTHPRT_ADDRESS_EVIDENCE_ALIAS_NATIVE", str(materializer == "rust").lower()
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_ADDRESS_EVIDENCE_ALIAS_SCRATCH_DIR", tempfile.gettempdir()
+    )
+    await _create_alias_probe_schema(connection, schema, "evidence")
+    key_by_case = await _seed_archive_matrix(schema)
+    await _seed_visible_matrix(schema, key_by_case)
+    shadow = await _shadow_and_assert_matrix(schema, key_by_case)
+    await _apply_and_assert_alias(schema, key_by_case, shadow)
+    monkeypatch.setenv(
+        address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV,
+        str(materializer == "rust").lower(),
+    )
+    projection = await _assert_alias_projection(schema, key_by_case)
+    return shadow, projection
+
+
 @pytest.mark.asyncio(loop_scope="session")
 async def test_evidence_alias_shadow_apply_resolve_and_revoke(monkeypatch):
     """Reviewed evidence aliases preserve identities and reversible projection."""
@@ -427,30 +448,49 @@ async def test_evidence_alias_rust_materialization_matches_sql(monkeypatch):
 
     rust_run = AsyncMock(wraps=address_canon._run_rust_address_canonicalizer)
     monkeypatch.setattr(address_canon, "_run_rust_address_canonicalizer", rust_run)
+    native_evidence_run = AsyncMock(wraps=address_evidence_alias_native._run_scanner)
+    monkeypatch.setattr(
+        address_evidence_alias_native,
+        "_run_scanner",
+        native_evidence_run,
+    )
     connection = await _connect_runtime_database()
     projection_by_materializer = {}
+    shadow_by_materializer = {}
     schema_by_materializer = {
         "sql": "address_evidence_alias_parity_sql",
         "rust": "address_evidence_alias_parity_rust",
     }
     try:
         for materializer, schema in schema_by_materializer.items():
-            await _create_alias_probe_schema(connection, schema, "evidence")
-            key_by_case = await _seed_archive_matrix(schema)
-            await _seed_visible_matrix(schema, key_by_case)
-            shadow = await _shadow_and_assert_matrix(schema, key_by_case)
-            await _apply_and_assert_alias(schema, key_by_case, shadow)
-            monkeypatch.setenv(
-                address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV,
-                str(materializer == "rust").lower(),
-            )
-            projection_by_materializer[materializer] = await _assert_alias_projection(
+            shadow, projection = await _materialize_evidence_alias_parity_case(
+                monkeypatch,
+                connection,
+                materializer,
                 schema,
-                key_by_case,
             )
+            shadow_by_materializer[materializer] = shadow
+            projection_by_materializer[materializer] = projection
         assert rust_run.await_count == 1
+        assert native_evidence_run.await_count == 2
+        assert [len(call.args[2]) for call in native_evidence_run.await_args_list] == [6, 6]
         assert projection_by_materializer["rust"]["materializer"] == "rust"
         assert projection_by_materializer["sql"]["materializer"] == "sql"
+        for field in (
+            "candidate_digest",
+            "source_count",
+            "candidate_sources",
+            "candidate_rows",
+            "no_candidate",
+            "active_skipped",
+            "eligible",
+            "ambiguous",
+            "insufficient_provenance",
+            "sample_rows",
+        ):
+            assert getattr(shadow_by_materializer["rust"], field) == getattr(
+                shadow_by_materializer["sql"], field
+            )
         for projection in projection_by_materializer.values():
             projection.pop("materializer")
         assert projection_by_materializer["rust"] == projection_by_materializer["sql"]

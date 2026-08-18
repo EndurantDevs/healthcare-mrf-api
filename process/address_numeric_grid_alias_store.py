@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
 from sqlalchemy import text
 
 from db.models import db
+from process.address_evidence_alias_native import try_native_evidence_shadow
 from process.address_numeric_grid_alias_support import (
     _candidate_digest,
     _candidate_sample,
@@ -131,11 +133,16 @@ async def _insert_run(
     )
 
 
-async def _mark_failed(schema: str, run_id: str, exc: BaseException) -> str | None:
+async def _mark_failed(
+    schema: str,
+    run_id: str,
+    exc: BaseException,
+    *,
+    deadline_monotonic: float | None = None,
+) -> str | None:
     """Mark only a still-running job failed, preserving committed outcomes."""
     runs = _relation(schema, address_alias_sql.ADDRESS_ALIAS_RUN_TABLE)
-    status_record = await db.first(
-        f"""
+    statement = f"""
         WITH marked AS (
             UPDATE {runs}
                SET status = 'failed',
@@ -152,10 +159,27 @@ async def _mark_failed(schema: str, run_id: str, exc: BaseException) -> str | No
         WHERE run_id = CAST(:run_id AS uuid)
           AND NOT EXISTS (SELECT 1 FROM marked)
         LIMIT 1;
-        """,
-        run_id=run_id,
-        error_text=str(exc),
-    )
+        """
+    failure_parameters_by_name = {"run_id": run_id, "error_text": str(exc)}
+    if deadline_monotonic is None:
+        status_record = await db.first(statement, **failure_parameters_by_name)
+        return str(status_record.status) if status_record is not None else None
+
+    remaining_seconds = deadline_monotonic - asyncio.get_running_loop().time()
+    if remaining_seconds <= 0:
+        raise TimeoutError("address alias lifecycle deadline elapsed before failure marking")
+    timeout_milliseconds = max(1, int(remaining_seconds * 1000))
+    async with asyncio.timeout(remaining_seconds):
+        async with db.transaction() as session:
+            await session.execute(
+                text(f"SET LOCAL lock_timeout = '{timeout_milliseconds}ms';")
+            )
+            await session.execute(
+                text(f"SET LOCAL statement_timeout = '{timeout_milliseconds}ms';")
+            )
+            status_record = (
+                await session.execute(text(statement), failure_parameters_by_name)
+            ).first()
     return str(status_record.status) if status_record is not None else None
 
 
@@ -198,6 +222,7 @@ async def _candidate_metrics_by_reason(
     source_count: int,
     scope_by_field: dict[str, str | None],
     alias_kind: str,
+    active_skipped_override: int | None = None,
 ) -> dict[str, int]:
     raw_metric_map = (
         await session.execute(
@@ -214,22 +239,24 @@ async def _candidate_metrics_by_reason(
         str(metric_name): int(metric_count or 0)
         for metric_name, metric_count in decoded_metric_map.items()
     }
-    active_skipped = int(
-        (
-            await session.execute(
-                text(
-                    (
-                        address_evidence_alias_sql.evidence_skipped_source_count_sql
-                        if alias_kind
-                        == address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND
-                        else address_alias_audit_sql.numeric_grid_skipped_source_count_sql
-                    )(schema=schema, archive=archive)
-                ),
-                scope_by_field,
-            )
-        ).scalar()
-        or 0
-    )
+    active_skipped = active_skipped_override
+    if active_skipped is None:
+        active_skipped = int(
+            (
+                await session.execute(
+                    text(
+                        (
+                            address_evidence_alias_sql.evidence_skipped_source_count_sql
+                            if alias_kind
+                            == address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND
+                            else address_alias_audit_sql.numeric_grid_skipped_source_count_sql
+                        )(schema=schema, archive=archive)
+                    ),
+                    scope_by_field,
+                )
+            ).scalar()
+            or 0
+        )
     candidate_sources = metrics_by_reason.get("candidate_sources", 0)
     metrics_by_reason["active_skipped"] = active_skipped
     metrics_by_reason["no_candidate"] = max(
@@ -237,6 +264,55 @@ async def _candidate_metrics_by_reason(
         0,
     )
     return metrics_by_reason
+
+
+async def _materialize_candidate_snapshot(
+    session: Any,
+    *,
+    schema: str,
+    archive: str,
+    scope_by_field: dict[str, str | None],
+    alias_kind: str,
+    cleanup_deadline_monotonic: float | None = None,
+) -> tuple[int, int, int | None]:
+    run_id = str(scope_by_field["run_id"])
+    native_summary = None
+    if alias_kind == address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND:
+        native_summary = await try_native_evidence_shadow(
+            session,
+            schema=schema,
+            archive=archive,
+            run_id=run_id,
+            state_code=scope_by_field["scope_state_code"],
+            zip_prefix=scope_by_field["scope_zip_prefix"],
+            retry_shadow_run_id=scope_by_field["retry_shadow_run_id"],
+            cleanup_deadline_monotonic=cleanup_deadline_monotonic,
+        )
+    if native_summary is None:
+        archive_rows, source_count = await _archive_source_counts(
+            session,
+            schema=schema,
+            archive=archive,
+            scope_by_field=scope_by_field,
+            alias_kind=alias_kind,
+        )
+        await session.execute(
+            text(
+                (
+                    address_evidence_alias_sql.evidence_candidate_insert_sql
+                    if alias_kind == address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND
+                    else address_alias_sql.numeric_grid_candidate_insert_sql
+                )(schema=schema, archive=archive)
+            ),
+            scope_by_field,
+        )
+    else:
+        archive_rows = int(native_summary["archive_rows"])
+        source_count = int(native_summary["source_count"])
+    active_skipped_override = (
+        int(native_summary["active_skipped"]) if native_summary is not None else None
+    )
+    return archive_rows, source_count, active_skipped_override
 
 
 async def _shadow_run(
@@ -247,25 +323,19 @@ async def _shadow_run(
     scope_by_field: dict[str, str | None],
     sample_limit: int,
     alias_kind: str = address_alias_sql.NUMERIC_GRID_ALIAS_KIND,
+    cleanup_deadline_monotonic: float | None = None,
 ) -> tuple[dict[str, int], str, list[dict[str, Any]], int, int]:
     """Persist and summarize one deterministic candidate snapshot."""
     run_id = str(scope_by_field["run_id"])
-    archive_rows, source_count = await _archive_source_counts(
-        session,
-        schema=schema,
-        archive=archive,
-        scope_by_field=scope_by_field,
-        alias_kind=alias_kind,
-    )
-    await session.execute(
-        text(
-            (
-                address_evidence_alias_sql.evidence_candidate_insert_sql
-                if alias_kind == address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND
-                else address_alias_sql.numeric_grid_candidate_insert_sql
-            )(schema=schema, archive=archive)
-        ),
-        scope_by_field,
+    archive_rows, source_count, active_skipped_override = (
+        await _materialize_candidate_snapshot(
+            session,
+            schema=schema,
+            archive=archive,
+            scope_by_field=scope_by_field,
+            alias_kind=alias_kind,
+            cleanup_deadline_monotonic=cleanup_deadline_monotonic,
+        )
     )
     metrics_by_reason = await _candidate_metrics_by_reason(
         session,
@@ -275,6 +345,7 @@ async def _shadow_run(
         source_count=source_count,
         scope_by_field=scope_by_field,
         alias_kind=alias_kind,
+        active_skipped_override=active_skipped_override,
     )
     candidate_records = (
         await session.execute(

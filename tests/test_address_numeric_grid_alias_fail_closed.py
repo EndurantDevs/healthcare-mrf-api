@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -15,6 +17,7 @@ from process.ext import address_alias_sql, address_strict_source_backfill_sql
 
 
 alias_workflow = importlib.import_module("process.address_numeric_grid_alias")
+alias_execution = importlib.import_module("process.address_numeric_grid_alias_execution")
 alias_revoke = importlib.import_module("process.address_numeric_grid_alias_revoke")
 alias_store = importlib.import_module("process.address_numeric_grid_alias_store")
 alias_support = importlib.import_module("process.address_numeric_grid_alias_support")
@@ -29,7 +32,7 @@ def _query_result(*, first=None, rows=(), scalar=None):
     return query_result
 
 
-def test_alias_sql_and_runtime_values_reject_unsafe_inputs():
+def test_alias_sql_and_runtime_values_reject_unsafe_inputs(monkeypatch):
     with pytest.raises(ValueError, match="mode must be one of"):
         address_alias_sql.numeric_grid_alias_mode("fuzzy")
     with pytest.raises(ValueError, match="Invalid SQL identifier"):
@@ -42,6 +45,9 @@ def test_alias_sql_and_runtime_values_reject_unsafe_inputs():
         alias_support._quote_ident("unsafe-name")
     with pytest.raises(ValueError, match="positive PostgreSQL duration"):
         alias_support._statement_timeout("eventually")
+    monkeypatch.setattr(alias_support, "_statement_timeout", lambda _value: "1fortnight")
+    with pytest.raises(AssertionError, match="supported suffix"):
+        alias_support._statement_timeout_seconds("1s")
 
 
 @pytest.mark.asyncio
@@ -107,6 +113,20 @@ async def test_alias_runner_rejects_ambiguous_requests_and_unprepared_state():
     with pytest.raises(ValueError, match="valid alias_run_id"):
         await apply_runner._prepare_execution("apply", "mrf")
 
+    evidence_runner = alias_workflow._NumericGridAliasRunner(
+        NumericGridAliasRequest(
+            mode="shadow",
+            timeout="10min",
+            alias_kind=address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND,
+        )
+    )
+    evidence_execution = await evidence_runner._prepare_execution(
+        "shadow",
+        "mrf",
+        address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND,
+    )
+    assert evidence_execution.timeout == "2min"
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -140,6 +160,27 @@ async def test_apply_rejects_scope_changes_after_review(
         await alias_workflow._NumericGridAliasRunner(request)._prepare_execution(
             "apply", "mrf"
         )
+
+
+@pytest.mark.asyncio
+async def test_apply_canonicalizes_the_reviewed_shadow_uuid(monkeypatch):
+    load_shadow = AsyncMock(
+        return_value={"scope_state_code": None, "scope_zip_prefix": None}
+    )
+    monkeypatch.setattr(alias_workflow, "_load_reviewed_shadow", load_shadow)
+    runner = alias_workflow._NumericGridAliasRunner(
+        NumericGridAliasRequest(
+            mode="apply",
+            alias_run_id="{00000000-0000-0000-0000-0000000000AA}",
+            expected_candidate_sha256="a" * 64,
+            reviewed_by="synthetic-reviewer",
+        )
+    )
+
+    execution = await runner._prepare_execution("apply", "mrf")
+
+    assert execution.shadow_run_id == "00000000-0000-0000-0000-0000000000aa"
+    assert load_shadow.await_args.kwargs["shadow_run_id"] == execution.shadow_run_id
 
 
 async def _prepared_alias_runner(operation="shadow"):
@@ -207,6 +248,145 @@ async def test_alias_runner_invokes_requested_cancellation_check():
     await runner._check_cancelled()
 
     cancel_check.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_evidence_alias_timeout_bounds_the_whole_transaction(monkeypatch):
+    runner = alias_workflow._NumericGridAliasRunner(
+        NumericGridAliasRequest(
+            mode="shadow",
+            timeout="1ms",
+            alias_kind=address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND,
+        )
+    )
+    monkeypatch.setattr(runner, "_insert_execution_run", AsyncMock())
+    monkeypatch.setattr(alias_workflow, "_mark_failed", AsyncMock())
+
+    async def wait_forever():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "_execute_transaction", wait_forever)
+
+    with pytest.raises(TimeoutError):
+        await runner.execute()
+    alias_workflow._mark_failed.assert_awaited_once()
+    deadline = alias_workflow._mark_failed.await_args.kwargs["deadline_monotonic"]
+    assert 0 < deadline - asyncio.get_running_loop().time() <= 120
+
+
+@pytest.mark.asyncio
+async def test_default_evidence_alias_deadline_reserves_terminal_cleanup(monkeypatch):
+    captured_seconds = []
+
+    class Deadline:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_exc_info):
+            return False
+
+    monkeypatch.setattr(
+        alias_execution.asyncio,
+        "timeout",
+        lambda seconds: captured_seconds.append(seconds) or Deadline(),
+    )
+    runner = alias_workflow._NumericGridAliasRunner(
+        NumericGridAliasRequest(
+            mode="shadow",
+            alias_kind=address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND,
+        )
+    )
+    monkeypatch.setattr(runner, "_insert_execution_run", AsyncMock())
+    monkeypatch.setattr(runner, "_execute_transaction", AsyncMock())
+
+    await runner.execute()
+
+    assert len(captured_seconds) == 1
+    assert 0 < captured_seconds[0] <= 100.0
+    assert runner._lifecycle_deadline_monotonic is not None
+    assert runner._cleanup_deadline_monotonic is not None
+    assert (
+        runner._cleanup_deadline_monotonic
+        <= runner._lifecycle_deadline_monotonic - 10.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_alias_run_is_marked_failed_before_reraising(monkeypatch):
+    runner = alias_workflow._NumericGridAliasRunner(
+        NumericGridAliasRequest(
+            mode="shadow",
+            alias_kind=address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND,
+        )
+    )
+    monkeypatch.setattr(runner, "_insert_execution_run", AsyncMock())
+    monkeypatch.setattr(
+        runner,
+        "_execute_transaction",
+        AsyncMock(side_effect=asyncio.CancelledError),
+    )
+    mark_failed = AsyncMock()
+    monkeypatch.setattr(alias_workflow, "_mark_failed", mark_failed)
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner.execute()
+
+    mark_failed.assert_awaited_once()
+    assert str(mark_failed.await_args.args[2]) == "address alias task cancelled"
+    assert mark_failed.await_args.kwargs["deadline_monotonic"] == (
+        runner._lifecycle_deadline_monotonic
+    )
+
+
+@pytest.mark.asyncio
+async def test_deadline_bound_failure_marker_limits_pool_and_database_waits(monkeypatch):
+    session = Mock()
+    session.execute = AsyncMock(
+        side_effect=(
+            _query_result(),
+            _query_result(),
+            _query_result(first=SimpleNamespace(status="failed")),
+        )
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(alias_store.db, "transaction", transaction)
+    status = await alias_store._mark_failed(
+        "mrf",
+        "00000000-0000-0000-0000-000000000001",
+        RuntimeError("synthetic failure"),
+        deadline_monotonic=asyncio.get_running_loop().time() + 1,
+    )
+
+    assert status == "failed"
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert "SET LOCAL lock_timeout" in statements[0]
+    assert "SET LOCAL statement_timeout" in statements[1]
+    assert "ms'" in statements[0]
+    assert "ms'" in statements[1]
+
+
+@pytest.mark.asyncio
+async def test_deadline_bound_failure_marker_times_out_during_pool_acquisition(
+    monkeypatch,
+):
+    @asynccontextmanager
+    async def blocked_transaction():
+        await asyncio.Event().wait()
+        yield Mock()
+
+    monkeypatch.setattr(alias_store.db, "transaction", blocked_transaction)
+
+    with pytest.raises(TimeoutError):
+        await alias_store._mark_failed(
+            "mrf",
+            "00000000-0000-0000-0000-000000000001",
+            RuntimeError("synthetic failure"),
+            deadline_monotonic=asyncio.get_running_loop().time() + 0.05,
+        )
 
 
 @pytest.mark.asyncio

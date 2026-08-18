@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,6 +21,7 @@ from process.address_numeric_grid_alias_store import (
     _run_completion_sql,
     _shadow_run,
 )
+from process.address_numeric_grid_alias_execution import run_validated_alias_workflow
 from process.address_numeric_grid_alias_support import (
     NumericGridAliasRequest,
     NumericGridAliasResult,
@@ -31,6 +31,7 @@ from process.address_numeric_grid_alias_support import (
     _reviewed_digest,
     _reviewer,
     _statement_timeout,
+    _statement_timeout_seconds,
 )
 from process.ext import (
     address_alias_snapshot_sql,
@@ -38,6 +39,8 @@ from process.ext import (
     address_evidence_alias_sql,
 )
 from process.ext.address_canon import _archive_lock_key, archive_table_name
+
+_EVIDENCE_ALIAS_MAX_TIMEOUT = "2min"
 
 
 @dataclass
@@ -70,20 +73,29 @@ class _NumericGridAliasRunner:
     def __init__(self, request: NumericGridAliasRequest) -> None:
         self.request = request
         self.execution: _AliasExecution | None = None
+        self._lifecycle_deadline_monotonic: float | None = None
+        self._cleanup_deadline_monotonic: float | None = None
 
     async def execute(self) -> NumericGridAliasResult:
         """Execute one validated alias workflow request."""
-        operation = address_alias_sql.numeric_grid_alias_mode(self.request.mode)
-        alias_kind = str(self.request.alias_kind or "").strip()
-        ruleset_version = address_alias_sql.alias_ruleset(alias_kind)
-        schema = (
-            self.request.schema
-            or os.getenv("HLTHPRT_DB_SCHEMA")
-            or os.getenv("DB_SCHEMA")
-            or "mrf"
+        return await run_validated_alias_workflow(self)
+
+    async def _mark_execution_failed(self, schema: str, exc: BaseException) -> None:
+        execution = self._required_execution()
+        await _mark_failed(
+            schema,
+            execution.run_id,
+            exc,
+            deadline_monotonic=self._lifecycle_deadline_monotonic,
         )
-        if operation == "off":
-            return await self._off_result(schema, alias_kind)
+
+    async def _prepare_and_execute(
+        self,
+        operation: str,
+        schema: str,
+        alias_kind: str,
+        ruleset_version: int,
+    ) -> None:
         self.execution = await self._prepare_execution(
             operation,
             schema,
@@ -91,14 +103,12 @@ class _NumericGridAliasRunner:
             ruleset_version,
         )
         await self._insert_execution_run()
-        try:
-            await self._check_cancelled()
-            async with db.transaction() as session:
-                await self._execute_locked(session)
-            return self._result()
-        except Exception as exc:
-            await _mark_failed(schema, self.execution.run_id, exc)
-            raise
+        await self._execute_transaction()
+
+    async def _execute_transaction(self) -> None:
+        await self._check_cancelled()
+        async with db.transaction() as session:
+            await self._execute_locked(session)
 
     async def _off_result(
         self,
@@ -137,13 +147,20 @@ class _NumericGridAliasRunner:
             self.request.state_code,
             self.request.zip_prefix,
         )
+        timeout = _statement_timeout(self.request.timeout)
+        if (
+            alias_kind == address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND
+            and _statement_timeout_seconds(timeout)
+            > _statement_timeout_seconds(_EVIDENCE_ALIAS_MAX_TIMEOUT)
+        ):
+            timeout = _EVIDENCE_ALIAS_MAX_TIMEOUT
         execution = _AliasExecution(
             request=self.request,
             operation=operation,
             schema=schema,
             state_code=state_code,
             zip_prefix=zip_prefix,
-            timeout=_statement_timeout(self.request.timeout),
+            timeout=timeout,
             run_id=str(uuid.uuid4()),
             alias_kind=alias_kind,
             ruleset_version=ruleset_version,
@@ -155,7 +172,7 @@ class _NumericGridAliasRunner:
     async def _bind_reviewed_shadow(self, execution: _AliasExecution) -> None:
         shadow_run_id = str(self.request.alias_run_id or "").strip()
         try:
-            uuid.UUID(shadow_run_id)
+            shadow_run_id = str(uuid.UUID(shadow_run_id))
         except (ValueError, TypeError):
             raise ValueError("apply requires a valid alias_run_id") from None
         reviewed_digest = _reviewed_digest(self.request.expected_candidate_sha256)
@@ -359,6 +376,7 @@ class _NumericGridAliasRunner:
             },
             sample_limit=execution.request.sample_limit,
             alias_kind=execution.alias_kind,
+            cleanup_deadline_monotonic=self._cleanup_deadline_monotonic,
         )
         await self._check_cancelled()
         if (

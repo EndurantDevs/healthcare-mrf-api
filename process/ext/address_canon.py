@@ -1057,17 +1057,16 @@ def _resolve_gate_violations(
     return tuple(violations)
 
 
-async def stamp_address_keys(
+async def _prepare_address_key_stamp(
     staging_table: str,
     field_map: Mapping[str, str],
     *,
-    schema: str | None = None,
-    shards: int = 8,
-    cancel_check: Callable[[], Awaitable[None]] | None = None,
-    update_existing: bool = True,
-    honor_env_override: bool = True,
-) -> int:
-    """Stamp canonical address keys onto a staging table in bounded shards."""
+    schema: str | None,
+    shards: int,
+    cancel_check: Callable[[], Awaitable[None]] | None,
+    update_existing: bool,
+    honor_env_override: bool,
+) -> tuple[str, int, int]:
     schema = schema or _schema_name()
     override_shards = os.getenv("HLTHPRT_ADDRESS_CANON_STAMP_SHARDS")
     if honor_env_override and override_shards:
@@ -1090,7 +1089,126 @@ async def stamp_address_keys(
         cancel_check=cancel_check,
         only_null_address_key=True,
     )
+    return schema, shards, stamp_concurrency
+
+
+async def _stamp_address_key_shard(
+    shard: int,
+    *,
+    schema: str,
+    staging_table: str,
+    field_map: Mapping[str, str],
+    shards: int,
+    update_existing: bool,
+) -> int:
     first, second, city, state, zip_code, country = _address_sql(schema, field_map)
+    source_filters = []
+    if not update_existing:
+        source_filters.append("address_key IS NULL")
+    if shards > 1:
+        source_filters.append(
+            "mod(abs(hashtext(ctid::text)::bigint), :shards) = :shard"
+        )
+    source_filter = f"WHERE {' AND '.join(source_filters)}" if source_filters else ""
+    update_filter = (
+        "target.address_key IS DISTINCT FROM stamped.computed_address_key"
+        if update_existing
+        else "target.address_key IS NULL AND stamped.computed_address_key IS NOT NULL"
+    )
+    return await db.status(
+        f"""
+        WITH stamped AS (
+            SELECT ctid,
+                   {_quote_ident(schema)}.addr_key_v1(
+                        {first}, {second}, {city}, {state}, {zip_code}, {country}
+                   ) AS computed_address_key
+              FROM {_qtable(schema, staging_table)}
+             {source_filter}
+        )
+        UPDATE {_qtable(schema, staging_table)} AS target
+           SET address_key = stamped.computed_address_key
+          FROM stamped
+         WHERE target.ctid = stamped.ctid
+           AND {update_filter};
+        """,
+        shards=shards,
+        shard=shard,
+    )
+
+
+async def _has_stamp_address_key_work(
+    schema: str,
+    staging_table: str,
+    field_map: Mapping[str, str],
+    shards: int,
+) -> bool:
+    first, second, city, state, zip_code, country = _address_sql(schema, field_map)
+    has_keyable_null_address_key = bool(
+        await db.scalar(
+            _keyable_null_address_key_exists_sql(
+                schema=schema,
+                table=staging_table,
+                first=first,
+                second=second,
+                city=city,
+                state=state,
+                zip_code=zip_code,
+                country=country,
+            )
+        )
+    )
+    if has_keyable_null_address_key:
+        return True
+    _emit_progress(
+        phase="address key stamping",
+        unit="shard",
+        total=shards,
+        done=shards,
+        pct=100,
+        message="no keyable address rows need stamping",
+    )
+    return False
+
+
+async def _record_stamp_progress(
+    progress_lock: asyncio.Lock,
+    progress_by_metric: dict[str, int],
+    rowcount: Any,
+    shards: int,
+) -> None:
+    async with progress_lock:
+        progress_by_metric["updated"] += int(rowcount or 0)
+        progress_by_metric["completed"] += 1
+        _emit_progress(
+            phase="address key stamping",
+            unit="shard",
+            total=shards,
+            done=progress_by_metric["completed"],
+            pct=(progress_by_metric["completed"] / shards) * 100.0,
+            message="stamping canonical address keys",
+        )
+
+
+async def stamp_address_keys(
+    staging_table: str,
+    field_map: Mapping[str, str],
+    *,
+    schema: str | None = None,
+    shards: int = 8,
+    cancel_check: Callable[[], Awaitable[None]] | None = None,
+    update_existing: bool = True,
+    honor_env_override: bool = True,
+) -> int:
+    """Stamp canonical address keys onto a staging table in bounded shards."""
+    schema, shards, stamp_concurrency = await _prepare_address_key_stamp(
+        staging_table,
+        field_map,
+        schema=schema,
+        shards=shards,
+        cancel_check=cancel_check,
+        update_existing=update_existing,
+        honor_env_override=honor_env_override,
+    )
     progress_by_metric = {"completed": 0, "updated": 0}
     semaphore = asyncio.Semaphore(stamp_concurrency)
     progress_lock = asyncio.Lock()
@@ -1103,82 +1221,230 @@ async def stamp_address_keys(
         message="stamping canonical address keys",
     )
     if not update_existing:
-        has_keyable_null_address_key = bool(
-            await db.scalar(
-                _keyable_null_address_key_exists_sql(
-                    schema=schema,
-                    table=staging_table,
-                    first=first,
-                    second=second,
-                    city=city,
-                    state=state,
-                    zip_code=zip_code,
-                    country=country,
-                )
-            )
-        )
-        if not has_keyable_null_address_key:
-            _emit_progress(
-                phase="address key stamping",
-                unit="shard",
-                total=shards,
-                done=shards,
-                pct=100,
-                message="no keyable address rows need stamping",
-            )
+        if not await _has_stamp_address_key_work(
+            schema,
+            staging_table,
+            field_map,
+            shards,
+        ):
             return 0
 
     async def _stamp_shard(shard: int) -> None:
         async with semaphore:
             if cancel_check:
                 await cancel_check()
-            source_filters = []
-            if not update_existing:
-                source_filters.append("address_key IS NULL")
-            if shards > 1:
-                source_filters.append(
-                    "mod(abs(hashtext(ctid::text)::bigint), :shards) = :shard"
-                )
-            source_filter = f"WHERE {' AND '.join(source_filters)}" if source_filters else ""
-            update_filter = (
-                "target.address_key IS DISTINCT FROM stamped.computed_address_key"
-                if update_existing
-                else "target.address_key IS NULL AND stamped.computed_address_key IS NOT NULL"
-            )
-            rowcount = await db.status(
-                f"""
-                WITH stamped AS (
-                    SELECT ctid,
-                           {_quote_ident(schema)}.addr_key_v1(
-                                {first}, {second}, {city}, {state}, {zip_code}, {country}
-                           ) AS computed_address_key
-                      FROM {_qtable(schema, staging_table)}
-                     {source_filter}
-                )
-                UPDATE {_qtable(schema, staging_table)} AS target
-                   SET address_key = stamped.computed_address_key
-                  FROM stamped
-                 WHERE target.ctid = stamped.ctid
-                   AND {update_filter};
-                """,
+            rowcount = await _stamp_address_key_shard(
+                shard,
+                schema=schema,
+                staging_table=staging_table,
+                field_map=field_map,
                 shards=shards,
-                shard=shard,
+                update_existing=update_existing,
             )
-            async with progress_lock:
-                progress_by_metric["updated"] += int(rowcount or 0)
-                progress_by_metric["completed"] += 1
-                _emit_progress(
-                    phase="address key stamping",
-                    unit="shard",
-                    total=shards,
-                    done=progress_by_metric["completed"],
-                    pct=(progress_by_metric["completed"] / shards) * 100.0,
-                    message="stamping canonical address keys",
-                )
+            await _record_stamp_progress(progress_lock, progress_by_metric, rowcount, shards)
             await asyncio.sleep(0)
 
     await asyncio.gather(*(_stamp_shard(shard) for shard in range(shards)))
     return progress_by_metric["updated"]
+
+
+def _child_address_propagation_settings(
+    schema: str | None,
+    shards: int,
+) -> tuple[str, int, int]:
+    schema = schema or _schema_name()
+    override_shards = os.getenv("HLTHPRT_ADDRESS_CANON_STAMP_SHARDS")
+    if override_shards:
+        shards = int(override_shards)
+        if shards <= 0:
+            raise ValueError("HLTHPRT_ADDRESS_CANON_STAMP_SHARDS must be a positive integer")
+    shards = max(int(shards or 1), 1)
+    stamp_concurrency = int(os.getenv("HLTHPRT_ADDRESS_CANON_STAMP_CONCURRENCY", "1"))
+    if stamp_concurrency <= 0:
+        raise ValueError("HLTHPRT_ADDRESS_CANON_STAMP_CONCURRENCY must be a positive integer")
+    return schema, shards, min(stamp_concurrency, shards)
+
+
+def _emit_child_address_propagation_start(shards: int) -> None:
+    _emit_progress(
+        phase="address key propagation",
+        unit="shard",
+        total=shards,
+        done=0,
+        pct=0,
+        message="propagating canonical address keys",
+    )
+
+
+async def _has_child_address_key_to_propagate(
+    child: str,
+    parent: str,
+    same_address: str,
+) -> bool:
+    return bool(
+        await db.scalar(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {child} AS child
+                  JOIN {parent} AS parent
+                    ON child.npi = parent.npi
+                   AND child.type = parent.type
+                   AND child.checksum = parent.checksum
+                 WHERE child.address_key IS NULL
+                   AND parent.address_key IS NOT NULL
+                   AND ({same_address})
+                 LIMIT 1
+            );
+            """
+        )
+    )
+
+
+async def _create_child_address_key_pending(
+    session: Any,
+    child: str,
+    parent: str,
+    shards: int,
+    shard: int,
+) -> str:
+    pending_table = _quote_ident("address_key_propagation_pending")
+    same_address = """
+                   child.first_line IS NOT DISTINCT FROM parent.first_line
+               AND child.second_line IS NOT DISTINCT FROM parent.second_line
+               AND child.city_name IS NOT DISTINCT FROM parent.city_name
+               AND child.state_name IS NOT DISTINCT FROM parent.state_name
+               AND child.postal_code IS NOT DISTINCT FROM parent.postal_code
+               AND COALESCE(NULLIF(child.country_code, ''), 'US')
+                   IS NOT DISTINCT FROM COALESCE(NULLIF(parent.country_code, ''), 'US')
+    """
+    shard_filter = ""
+    if shards > 1:
+        shard_filter = "AND mod(abs(hashtext(child.ctid::text)::bigint), :shards) = :shard"
+    parameter_map = {"shards": shards, "shard": shard}
+    await session.execute(text(f"DROP TABLE IF EXISTS pg_temp.{pending_table};"))
+    await session.execute(
+        text(
+            f"""
+            CREATE TEMP TABLE {pending_table} ON COMMIT DROP AS
+            SELECT child.ctid AS child_ctid,
+                   NULL::uuid AS address_key,
+                   TRUE AS clear_key
+              FROM {child} AS child
+              JOIN {parent} AS parent
+                ON child.npi = parent.npi
+               AND child.type = parent.type
+               AND child.checksum = parent.checksum
+             WHERE child.address_key IS NOT NULL
+               AND NOT ({same_address})
+             {shard_filter}
+            UNION ALL
+            SELECT child.ctid AS child_ctid,
+                   parent.address_key AS address_key,
+                   FALSE AS clear_key
+              FROM {child} AS child
+              JOIN {parent} AS parent
+                ON child.npi = parent.npi
+               AND child.type = parent.type
+               AND child.checksum = parent.checksum
+             WHERE parent.address_key IS NOT NULL
+               AND (
+                    child.address_key IS NULL
+                    OR child.address_key IS DISTINCT FROM parent.address_key
+               )
+               AND {same_address}
+             {shard_filter};
+            """
+        ),
+        parameter_map,
+    )
+    return pending_table
+
+
+async def _apply_child_address_key_pending(
+    session: Any,
+    child: str,
+    pending_table: str,
+) -> tuple[Any, Any]:
+    cleared = (
+        await session.execute(
+            text(
+                f"""
+                WITH cleared AS (
+                    UPDATE {child} AS child
+                       SET address_key = NULL
+                      FROM {pending_table} AS pending
+                     WHERE pending.clear_key
+                       AND child.ctid = pending.child_ctid
+                    RETURNING 1
+                )
+                SELECT count(*) FROM cleared;
+                """
+            )
+        )
+    ).scalar()
+    propagated = (
+        await session.execute(
+            text(
+                f"""
+                WITH propagated AS (
+                    UPDATE {child} AS child
+                       SET address_key = pending.address_key
+                      FROM {pending_table} AS pending
+                     WHERE NOT pending.clear_key
+                       AND pending.address_key IS NOT NULL
+                       AND child.ctid = pending.child_ctid
+                    RETURNING 1
+                )
+                SELECT count(*) FROM propagated;
+                """
+            )
+        )
+    ).scalar()
+    return cleared, propagated
+
+
+async def _propagate_child_address_key_shard(
+    shard: int,
+    *,
+    child: str,
+    parent: str,
+    shards: int,
+    cancel_check: Callable[[], Awaitable[None]] | None,
+    semaphore: asyncio.Semaphore,
+    progress_lock: asyncio.Lock,
+    progress_by_metric: dict[str, int],
+) -> None:
+    """Propagate parent keys for one deterministic child-row shard."""
+    async with semaphore:
+        if cancel_check:
+            await cancel_check()
+        async with db.transaction() as session:
+            pending_table = await _create_child_address_key_pending(
+                session,
+                child,
+                parent,
+                shards,
+                shard,
+            )
+            await session.execute(text(f"CREATE INDEX ON {pending_table} (child_ctid);"))
+            cleared, propagated = await _apply_child_address_key_pending(
+                session,
+                child,
+                pending_table,
+            )
+        async with progress_lock:
+            progress_by_metric["updated"] += int(cleared or 0) + int(propagated or 0)
+            progress_by_metric["completed"] += 1
+            _emit_progress(
+                phase="address key propagation",
+                unit="shard",
+                total=shards,
+                done=progress_by_metric["completed"],
+                pct=(progress_by_metric["completed"] / shards) * 100.0,
+                message="propagating canonical address keys",
+            )
+        await asyncio.sleep(0)
 
 
 async def propagate_child_address_keys(
@@ -1191,17 +1457,7 @@ async def propagate_child_address_keys(
     skip_when_child_fully_keyed: bool = False,
 ) -> int:
     """Copy address keys from an aggregate address table to child evidence rows."""
-    schema = schema or _schema_name()
-    override_shards = os.getenv("HLTHPRT_ADDRESS_CANON_STAMP_SHARDS")
-    if override_shards:
-        shards = int(override_shards)
-        if shards <= 0:
-            raise ValueError("HLTHPRT_ADDRESS_CANON_STAMP_SHARDS must be a positive integer")
-    shards = max(int(shards or 1), 1)
-    stamp_concurrency = int(os.getenv("HLTHPRT_ADDRESS_CANON_STAMP_CONCURRENCY", "1"))
-    if stamp_concurrency <= 0:
-        raise ValueError("HLTHPRT_ADDRESS_CANON_STAMP_CONCURRENCY must be a positive integer")
-    stamp_concurrency = min(stamp_concurrency, shards)
+    schema, shards, stamp_concurrency = _child_address_propagation_settings(schema, shards)
     progress_by_metric = {"completed": 0, "updated": 0}
     semaphore = asyncio.Semaphore(stamp_concurrency)
     progress_lock = asyncio.Lock()
@@ -1214,34 +1470,14 @@ async def propagate_child_address_keys(
                AND COALESCE(NULLIF(child.country_code, ''), 'US')
                    IS NOT DISTINCT FROM COALESCE(NULLIF(parent.country_code, ''), 'US')
     """
-    _emit_progress(
-        phase="address key propagation",
-        unit="shard",
-        total=shards,
-        done=0,
-        pct=0,
-        message="propagating canonical address keys",
-    )
+    _emit_child_address_propagation_start(shards)
     child = _qtable(schema, child_table)
     parent = _qtable(schema, parent_table)
     if skip_when_child_fully_keyed:
-        has_child_key_to_propagate = bool(
-            await db.scalar(
-                f"""
-                SELECT EXISTS (
-                    SELECT 1
-                      FROM {child} AS child
-                      JOIN {parent} AS parent
-                        ON child.npi = parent.npi
-                       AND child.type = parent.type
-                       AND child.checksum = parent.checksum
-                     WHERE child.address_key IS NULL
-                       AND parent.address_key IS NOT NULL
-                       AND ({same_address})
-                     LIMIT 1
-                );
-                """
-            )
+        has_child_key_to_propagate = await _has_child_address_key_to_propagate(
+            child,
+            parent,
+            same_address,
         )
         if not has_child_key_to_propagate:
             _emit_progress(
@@ -1254,107 +1490,21 @@ async def propagate_child_address_keys(
             )
             return 0
 
-    async def _propagate_shard(shard: int) -> None:
-        """Propagate parent keys for one deterministic child-row shard."""
-        async with semaphore:
-            if cancel_check:
-                await cancel_check()
-            shard_filter = ""
-            if shards > 1:
-                shard_filter = (
-                    "AND mod(abs(hashtext(child.ctid::text)::bigint), :shards) = :shard"
-                )
-            pending_table = _quote_ident("address_key_propagation_pending")
-            parameter_map = {"shards": shards, "shard": shard}
-            async with db.transaction() as session:
-                await session.execute(text(f"DROP TABLE IF EXISTS pg_temp.{pending_table};"))
-                await session.execute(
-                    text(
-                        f"""
-                        CREATE TEMP TABLE {pending_table} ON COMMIT DROP AS
-                        SELECT child.ctid AS child_ctid,
-                               NULL::uuid AS address_key,
-                               TRUE AS clear_key
-                          FROM {child} AS child
-                          JOIN {parent} AS parent
-                            ON child.npi = parent.npi
-                           AND child.type = parent.type
-                           AND child.checksum = parent.checksum
-                         WHERE child.address_key IS NOT NULL
-                           AND NOT ({same_address})
-                         {shard_filter}
-                        UNION ALL
-                        SELECT child.ctid AS child_ctid,
-                               parent.address_key AS address_key,
-                               FALSE AS clear_key
-                          FROM {child} AS child
-                          JOIN {parent} AS parent
-                            ON child.npi = parent.npi
-                           AND child.type = parent.type
-                           AND child.checksum = parent.checksum
-                         WHERE parent.address_key IS NOT NULL
-                           AND (
-                                child.address_key IS NULL
-                                OR child.address_key IS DISTINCT FROM parent.address_key
-                           )
-                           AND {same_address}
-                         {shard_filter};
-                        """
-                    ),
-                    parameter_map,
-                )
-                await session.execute(text(f"CREATE INDEX ON {pending_table} (child_ctid);"))
-                cleared = (
-                    await session.execute(
-                        text(
-                            f"""
-                            WITH cleared AS (
-                                UPDATE {child} AS child
-                                   SET address_key = NULL
-                                  FROM {pending_table} AS pending
-                                 WHERE pending.clear_key
-                                   AND child.ctid = pending.child_ctid
-                                RETURNING 1
-                            )
-                            SELECT count(*) FROM cleared;
-                            """
-                        )
-                    )
-                ).scalar()
-                propagated = (
-                    await session.execute(
-                        text(
-                            f"""
-                            WITH propagated AS (
-                                UPDATE {child} AS child
-                                   SET address_key = pending.address_key
-                                  FROM {pending_table} AS pending
-                                 WHERE NOT pending.clear_key
-                                   AND pending.address_key IS NOT NULL
-                                   AND child.ctid = pending.child_ctid
-                                RETURNING 1
-                            )
-                            SELECT count(*) FROM propagated;
-                            """
-                        )
-                    )
-                ).scalar()
-            async with progress_lock:
-                progress_by_metric["updated"] += int(cleared or 0) + int(
-                    propagated or 0
-                )
-                progress_by_metric["completed"] += 1
-                _emit_progress(
-                    phase="address key propagation",
-                    unit="shard",
-                    total=shards,
-                    done=progress_by_metric["completed"],
-                    pct=(progress_by_metric["completed"] / shards) * 100.0,
-                    message="propagating canonical address keys",
-                )
-            await asyncio.sleep(0)
-
-    await asyncio.gather(*(_propagate_shard(shard) for shard in range(shards)))
+    await asyncio.gather(
+        *(
+            _propagate_child_address_key_shard(
+                shard,
+                child=child,
+                parent=parent,
+                shards=shards,
+                cancel_check=cancel_check,
+                semaphore=semaphore,
+                progress_lock=progress_lock,
+                progress_by_metric=progress_by_metric,
+            )
+            for shard in range(shards)
+        )
+    )
     return progress_by_metric["updated"]
 
 
@@ -1511,6 +1661,193 @@ def _zip_restore_sql(
     """
 
 
+async def _has_usable_zip_restore_dependencies(
+    session: Any,
+    schema: str,
+    staging_table: str,
+) -> bool:
+    if await _has_zip_restore_dependencies(session, schema):
+        return True
+    message = "TIGER ZCTA or geo_zip_lookup is unavailable for address ZIP restore"
+    if _is_env_enabled(ADDRESS_ZIP_RESTORE_REQUIRED_ENV, default=False):
+        raise RuntimeError(message)
+    logger.info("%s; skipping %s.%s", message, schema, staging_table)
+    return False
+
+
+async def _prepare_zip_restore(
+    staging_table: str,
+    field_map: Mapping[str, str],
+    *,
+    schema: str | None,
+    shards: int,
+    concurrency: int | None,
+) -> tuple[str, str, int, int, str, str, bool] | None:
+    """Validate ZIP restore inputs and return their runtime fields."""
+    if not _is_env_enabled(ADDRESS_ZIP_RESTORE_ENABLED_ENV, default=True):
+        return None
+    if not hasattr(db, "transaction"):
+        return None
+    schema = schema or _schema_name()
+    zip_column = _simple_column_name(field_map.get("zip"))
+    if zip_column is None:
+        return None
+    env_shards = os.getenv(ADDRESS_ZIP_RESTORE_SHARDS_ENV)
+    if env_shards not in (None, ""):
+        shards = int(env_shards)
+    shards = int(shards or 1)
+    if shards <= 0:
+        raise ValueError(f"{ADDRESS_ZIP_RESTORE_SHARDS_ENV} must be a positive integer")
+    shards = max(shards, 1)
+    if concurrency is None:
+        concurrency = _positive_env_int(ADDRESS_ZIP_RESTORE_CONCURRENCY_ENV, min(shards, 4))
+    concurrency = min(max(int(concurrency or 1), 1), shards)
+
+    async with db.transaction() as session:
+        if not await _has_session_table(session, schema, staging_table):
+            return None
+        if not await _has_session_table_column(session, schema, staging_table, zip_column):
+            return None
+        latitude_column = await _first_existing_column_in_session(
+            session,
+            schema,
+            staging_table,
+            _LATITUDE_COLUMN_CANDIDATES,
+        )
+        longitude_column = await _first_existing_column_in_session(
+            session,
+            schema,
+            staging_table,
+            _LONGITUDE_COLUMN_CANDIDATES,
+        )
+        if latitude_column is None or longitude_column is None:
+            return None
+        has_address_key = await _has_session_table_column(session, schema, staging_table, "address_key")
+        if not await _has_usable_zip_restore_dependencies(session, schema, staging_table):
+            return None
+    return (
+        schema,
+        zip_column,
+        shards,
+        concurrency,
+        latitude_column,
+        longitude_column,
+        has_address_key,
+    )
+
+
+async def _restore_missing_zip_shard(
+    shard: int,
+    *,
+    schema: str,
+    staging_table: str,
+    restore_by_field: Mapping[str, str],
+    shards: int,
+    has_address_key: bool,
+    only_null_address_key: bool,
+) -> Any:
+    return await db.status(
+        _zip_restore_sql(
+            schema=schema,
+            staging_table=staging_table,
+            restore_by_field=restore_by_field,
+            shards=shards,
+            has_address_key=has_address_key,
+            only_null_address_key=only_null_address_key,
+        ),
+        shards=shards,
+        shard=shard,
+    )
+
+
+async def _record_zip_restore_progress(
+    progress_lock: asyncio.Lock,
+    progress_by_metric: dict[str, int],
+    rowcount: Any,
+    shards: int,
+) -> None:
+    async with progress_lock:
+        progress_by_metric["restored"] += int(rowcount or 0)
+        progress_by_metric["completed"] += 1
+        _emit_progress(
+            phase="address ZIP restore",
+            unit="shard",
+            total=shards,
+            done=progress_by_metric["completed"],
+            pct=(progress_by_metric["completed"] / shards) * 100.0,
+            message="restoring missing source ZIPs from coordinates",
+        )
+
+
+def _emit_zip_restore_start(shards: int) -> None:
+    _emit_progress(
+        phase="address ZIP restore",
+        unit="shard",
+        total=shards,
+        done=0,
+        pct=0,
+        message="restoring missing source ZIPs from coordinates",
+    )
+
+
+async def _restore_zip_shards(
+    staging_table: str,
+    field_map: Mapping[str, str],
+    prepared: tuple[str, str, int, int, str, str, bool],
+    *,
+    cancel_check: Callable[[], Awaitable[None]] | None,
+    only_null_address_key: bool,
+) -> int:
+    """Restore ZIPs across bounded shards and report progress."""
+    (
+        schema,
+        zip_column,
+        shards,
+        concurrency,
+        latitude_column,
+        longitude_column,
+        has_address_key,
+    ) = prepared
+    _emit_zip_restore_start(shards)
+    state_expr = _expr(field_map, "state")
+    country_expr = _expr(field_map, "country", "'US'")
+    semaphore = asyncio.Semaphore(concurrency)
+    progress_lock = asyncio.Lock()
+    progress_by_metric = {"completed": 0, "restored": 0}
+
+    async def _restore_shard(shard: int) -> None:
+        async with semaphore:
+            if cancel_check:
+                await cancel_check()
+            rowcount = await _restore_missing_zip_shard(
+                shard,
+                schema=schema,
+                staging_table=staging_table,
+                restore_by_field={
+                    "zip_column": zip_column,
+                    "latitude_column": latitude_column,
+                    "longitude_column": longitude_column,
+                    "state_expr": state_expr,
+                    "country_expr": country_expr,
+                },
+                shards=shards,
+                has_address_key=has_address_key,
+                only_null_address_key=only_null_address_key,
+            )
+            await _record_zip_restore_progress(
+                progress_lock,
+                progress_by_metric,
+                rowcount,
+                shards,
+            )
+            await asyncio.sleep(0)
+
+    await asyncio.gather(*(_restore_shard(shard) for shard in range(shards)))
+    restored = progress_by_metric["restored"]
+    logger.info("Restored %d missing ZIPs for %s.%s from coordinates.", restored, schema, staging_table)
+    return restored
+
+
 async def restore_missing_zip_from_tiger_zcta(
     staging_table: str,
     field_map: Mapping[str, str],
@@ -1528,108 +1865,22 @@ async def restore_missing_zip_from_tiger_zcta(
     present, avoiding silent archive identity rewrites.
     """
 
-    if not _is_env_enabled(ADDRESS_ZIP_RESTORE_ENABLED_ENV, default=True):
-        return 0
-    if not hasattr(db, "transaction"):
-        return 0
-    schema = schema or _schema_name()
-    zip_column = _simple_column_name(field_map.get("zip"))
-    if zip_column is None:
-        return 0
-
-    env_shards = os.getenv(ADDRESS_ZIP_RESTORE_SHARDS_ENV)
-    if env_shards not in (None, ""):
-        shards = int(env_shards)
-    shards = int(shards or 1)
-    if shards <= 0:
-        raise ValueError(f"{ADDRESS_ZIP_RESTORE_SHARDS_ENV} must be a positive integer")
-    shards = max(shards, 1)
-    if concurrency is None:
-        concurrency = _positive_env_int(ADDRESS_ZIP_RESTORE_CONCURRENCY_ENV, min(shards, 4))
-    concurrency = min(max(int(concurrency or 1), 1), shards)
-
-    async with db.transaction() as session:
-        if not await _has_session_table(session, schema, staging_table):
-            return 0
-        if not await _has_session_table_column(session, schema, staging_table, zip_column):
-            return 0
-        latitude_column = await _first_existing_column_in_session(
-            session,
-            schema,
-            staging_table,
-            _LATITUDE_COLUMN_CANDIDATES,
-        )
-        longitude_column = await _first_existing_column_in_session(
-            session,
-            schema,
-            staging_table,
-            _LONGITUDE_COLUMN_CANDIDATES,
-        )
-        if latitude_column is None or longitude_column is None:
-            return 0
-        has_address_key = await _has_session_table_column(session, schema, staging_table, "address_key")
-        dependencies_available = await _has_zip_restore_dependencies(session, schema)
-
-    if not dependencies_available:
-        message = "TIGER ZCTA or geo_zip_lookup is unavailable for address ZIP restore"
-        if _is_env_enabled(ADDRESS_ZIP_RESTORE_REQUIRED_ENV, default=False):
-            raise RuntimeError(message)
-        logger.info("%s; skipping %s.%s", message, schema, staging_table)
-        return 0
-
-    _emit_progress(
-        phase="address ZIP restore",
-        unit="shard",
-        total=shards,
-        done=0,
-        pct=0,
-        message="restoring missing source ZIPs from coordinates",
+    prepared = await _prepare_zip_restore(
+        staging_table,
+        field_map,
+        schema=schema,
+        shards=shards,
+        concurrency=concurrency,
     )
-    state_expr = _expr(field_map, "state")
-    country_expr = _expr(field_map, "country", "'US'")
-    semaphore = asyncio.Semaphore(concurrency)
-    progress_lock = asyncio.Lock()
-    progress_by_metric = {"completed": 0, "restored": 0}
-
-    async def _restore_shard(shard: int) -> None:
-        async with semaphore:
-            if cancel_check:
-                await cancel_check()
-            rowcount = await db.status(
-                _zip_restore_sql(
-                    schema=schema,
-                    staging_table=staging_table,
-                    restore_by_field={
-                        "zip_column": zip_column,
-                        "latitude_column": latitude_column,
-                        "longitude_column": longitude_column,
-                        "state_expr": state_expr,
-                        "country_expr": country_expr,
-                    },
-                    shards=shards,
-                    has_address_key=has_address_key,
-                    only_null_address_key=only_null_address_key,
-                ),
-                shards=shards,
-                shard=shard,
-            )
-            async with progress_lock:
-                progress_by_metric["restored"] += int(rowcount or 0)
-                progress_by_metric["completed"] += 1
-                _emit_progress(
-                    phase="address ZIP restore",
-                    unit="shard",
-                    total=shards,
-                    done=progress_by_metric["completed"],
-                    pct=(progress_by_metric["completed"] / shards) * 100.0,
-                    message="restoring missing source ZIPs from coordinates",
-                )
-            await asyncio.sleep(0)
-
-    await asyncio.gather(*(_restore_shard(shard) for shard in range(shards)))
-    restored = progress_by_metric["restored"]
-    logger.info("Restored %d missing ZIPs for %s.%s from coordinates.", restored, schema, staging_table)
-    return restored
+    if prepared is None:
+        return 0
+    return await _restore_zip_shards(
+        staging_table,
+        field_map,
+        prepared,
+        cancel_check=cancel_check,
+        only_null_address_key=only_null_address_key,
+    )
 
 
 async def _select_canonical_archive_table(schema: str, requested: str) -> str:
