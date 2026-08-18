@@ -20,7 +20,8 @@
           "HLTHPRT_DB_PORT": "55439",
           "HLTHPRT_DB_SCHEMA": "mrf",
           "HLTHPRT_DB_USER": "postgres",
-          "HLTHPRT_TIN_NPI_CONNECTOR_POSTGRES_DSN": "postgresql://postgres:postgres@127.0.0.1:55439/provider_directory_publication_test",
+          "HLTHPRT_TIN_NPI_CONNECTOR_POSTGRES_DSN": "postgresql://postgres@127.0.0.1:55439/provider_directory_publication_test",
+          "PGPASSWORD": "postgres",
           "PYTHONDONTWRITEBYTECODE": "1"
         },
         "evidence": "integration"
