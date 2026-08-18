@@ -360,6 +360,15 @@ fn canonical_address_and_version_cli_emit_production_contracts() {
     let payload: serde_json::Value = serde_json::from_slice(&version.stdout).unwrap();
     assert_eq!(payload["identity_version"], 2);
     assert_eq!(payload["pub28_sha256"].as_str().unwrap().len(), 64);
+    let evidence_version = scanner()
+        .arg("--address-evidence-alias-version")
+        .output()
+        .unwrap();
+    assert!(evidence_version.status.success());
+    assert_eq!(
+        String::from_utf8(evidence_version.stdout).unwrap().trim(),
+        "address_evidence_alias_native_v1"
+    );
 
     let invalid_input = temporary.path().join("invalid-addresses.copy");
     fs::write(&invalid_input, "too\tfew\n").unwrap();
@@ -391,6 +400,7 @@ fn finalizer_and_merge_cli_reject_incomplete_requests() {
 fn scanner_mode_dispatch_rejects_every_missing_or_extra_coordinate() {
     for arguments in [
         vec!["--canon-version", "extra"],
+        vec!["--address-evidence-alias-version", "extra"],
         vec!["--compact-serving"],
         vec!["--serving-binary-copy-from-key-copy-stdio"],
         vec!["--merge-manifest-copy", "manifest_serving"],

@@ -96,6 +96,15 @@ def _statement_timeout(value: str) -> str:
     return normalized
 
 
+def _statement_timeout_seconds(value: str) -> float:
+    """Convert one already-supported PostgreSQL duration to wall seconds."""
+    normalized = _statement_timeout(value)
+    for suffix, multiplier in (("min", 60.0), ("ms", 0.001), ("h", 3600.0), ("s", 1.0)):
+        if normalized.endswith(suffix):
+            return int(normalized[: -len(suffix)]) * multiplier
+    raise AssertionError("validated timeout has no supported suffix")
+
+
 def _candidate_digest(rows: list[Any]) -> str:
     digest = hashlib.sha256()
     for row in rows:

@@ -19,6 +19,7 @@ from process.address_numeric_grid_alias import (
     _reviewed_digest,
     _reviewer,
     _statement_timeout,
+    _statement_timeout_seconds,
 )
 from process.address_numeric_grid_alias_revoke import _reason, _uuid
 from process.address_strict_source_backfill import _target_limit
@@ -139,6 +140,8 @@ def test_alias_mode_accepts_only_controlled_values(mode):
 def test_alias_scope_and_apply_inputs_fail_closed():
     assert _normalize_scope("tx", "787") == ("TX", "787")
     assert _statement_timeout("15s") == "15s"
+    assert _statement_timeout_seconds("2min") == 120
+    assert _statement_timeout_seconds("250ms") == 0.25
     with pytest.raises(ValueError, match="state_code"):
         _normalize_scope("Texas", None)
     with pytest.raises(ValueError, match="zip_prefix"):

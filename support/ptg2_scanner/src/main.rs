@@ -10,6 +10,9 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use memchr::{memchr2, memchr3};
 use ptg2_scanner::address_canon::{canon_version_json, canonicalize_copy_file};
+use ptg2_scanner::address_evidence_alias::{
+    derive_evidence_alias_candidates, ADDRESS_EVIDENCE_ALIAS_NATIVE_CONTRACT,
+};
 use ptg2_scanner::config::{
     env_bool, env_usize, env_usize_allow_zero, progress_interval, split_interval,
     DEFAULT_COMPACT_COPY_ROTATE_BYTES, DEFAULT_COMPACT_RUST_WORKERS,
@@ -37988,6 +37991,16 @@ fn run_cli() -> io::Result<()> {
         println!("{}", canon_version_json());
         return Ok(());
     }
+    if first_arg == "--address-evidence-alias-version" {
+        if args.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --address-evidence-alias-version",
+            ));
+        }
+        println!("{ADDRESS_EVIDENCE_ALIAS_NATIVE_CONTRACT}");
+        return Ok(());
+    }
     if first_arg == "--compact-serving" {
         let compact_path = args.next().ok_or_else(|| {
             io::Error::new(
@@ -38094,6 +38107,23 @@ fn run_cli() -> io::Result<()> {
             ));
         }
         return canonicalize_copy_file(Path::new(&input_path), Path::new(&output_path));
+    }
+    if first_arg == "--address-evidence-alias-copy" {
+        let values: Vec<String> = args.collect();
+        if values.len() != 6 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --address-evidence-alias-copy <archive_path> <membership_path> <aliases_path> <config_path> <output_path> <summary_path>",
+            ));
+        }
+        return derive_evidence_alias_candidates(
+            Path::new(&values[0]),
+            Path::new(&values[1]),
+            Path::new(&values[2]),
+            Path::new(&values[3]),
+            Path::new(&values[4]),
+            Path::new(&values[5]),
+        );
     }
     let arrays: Vec<String> = args.collect();
     if arrays.is_empty() {

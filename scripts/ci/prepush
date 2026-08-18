@@ -791,6 +791,7 @@ run_provider_directory_postgres() {
     "HLTHPRT_UHC_ORGANIZATION_EVIDENCE_POSTGRES_DSN=$dsn"
     "HLTHPRT_OPENADDRESSES_BATCH_POSTGRES_DSN=$dsn"
     "HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_NATIVE_BIN=$repository_root/support/ptg2_scanner/target/debug/ptg2_scanner"
+    "HLTHPRT_PTG2_RUST_SCANNER_BIN=$repository_root/support/ptg2_scanner/target/debug/ptg2_scanner"
     "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_ALLOW_SCHEMA_TESTS=1"
   )
   env "${common_env[@]}" timeout --foreground 295s python -m pytest -q \

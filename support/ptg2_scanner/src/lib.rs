@@ -1,6 +1,7 @@
 //! Library modules for the PTG2 scanner binaries.
 
 pub mod address_canon;
+pub mod address_evidence_alias;
 pub mod config;
 pub mod contact_canon;
 pub mod copy_format;
