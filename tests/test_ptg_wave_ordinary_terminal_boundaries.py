@@ -19,6 +19,9 @@ from process.ptg_wave_ordinary_terminal_receipt import (
     ordinary_terminal_receipt_payload,
 )
 from process.ptg_wave_receipt_authority import PTGWaveReceiptAuthorityError
+from process.ptg_wave_quarantine_basis import (
+    V12_PRISTINE_MATERIALIZED_CUTOVER_BASIS,
+)
 from tests.ptg_wave_ordinary_terminal_receipt_support import (
     ISSUED_AT,
     OPERATION_ID,
@@ -26,6 +29,7 @@ from tests.ptg_wave_ordinary_terminal_receipt_support import (
     TerminalTransaction,
     keyring,
     ordinary_result,
+    v13_ordinary_result,
 )
 
 
@@ -113,6 +117,25 @@ def test_terminal_payload_rejects_durable_state_boundary_matrix(
     mutation(terminal_state)
 
     with pytest.raises(PTGWaveOrdinaryTerminalConflict, match=message):
+        ordinary_terminal_receipt_payload(**terminal_state)
+
+
+@pytest.mark.parametrize("field_name", ("reason", "recovery_basis"))
+def test_terminal_payload_rejects_cross_family_abandonment_drift(
+    monkeypatch,
+    field_name,
+):
+    terminal_state = v13_ordinary_result(monkeypatch)
+    setattr(
+        terminal_state["quarantine"],
+        field_name,
+        V12_PRISTINE_MATERIALIZED_CUTOVER_BASIS,
+    )
+
+    with pytest.raises(
+        PTGWaveOrdinaryTerminalConflict,
+        match="signed V12 abandonment or V13 abandonment",
+    ):
         ordinary_terminal_receipt_payload(**terminal_state)
 
 

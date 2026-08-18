@@ -41,6 +41,10 @@ from tests.ptg_wave_receipt_test_keys import (
     EPHEMERAL_RECEIPT_PRIVATE_KEY,
     EPHEMERAL_RECEIPT_PUBLIC_MODULUS,
 )
+from tests.ptg_wave_v13_post_ready_boundary_support import (
+    stored_v13_quarantine,
+)
+from tests.ptg_wave_v13_post_ready_guard_support import v13_proof
 from tests.ptg_wave_supersession_fixtures import recovery_proofs
 from tests.control_import_waves_test_support import (
     KEY as _KEY,
@@ -330,6 +334,33 @@ def ordinary_result(monkeypatch):
         "wave": wave, "intent": intents[0], "quarantine": quarantine,
         "run": run, "engine_run": engine_run, "engine_snapshot": snapshot,
     }
+
+
+def v13_ordinary_result(monkeypatch):
+    """Replace the ordinary-result quarantine with exact signed V13 evidence."""
+
+    state = ordinary_result(monkeypatch)
+    admission = admission_receipt_mapping(state["wave"], (state["intent"],))
+    job_receipt_mapping = {
+        "wave_digest": admission["wave_digest"],
+        "job_uid": "synthetic-v13-job-uid",
+        "manifest_identity": "1" * 64,
+        "config_identity": "2" * 64,
+        "pinned_image_reference": "registry.invalid/ptg@sha256:" + "3" * 64,
+        "pinned_image_digest": "3" * 64,
+        "runtime_image_identity": "sha256:" + "4" * 64,
+    }
+    proof = v13_proof(admission, job_receipt_mapping)
+    state["quarantine"] = stored_v13_quarantine(
+        proof,
+        {
+            "operation_id": OPERATION_ID,
+            "cutover_id": ordinary_cutover_id(OPERATION_ID),
+            "key_id": state["request"]["key_id"],
+        },
+        keyring(monkeypatch),
+    )
+    return state
 
 
 def _ordinary_run_maps(

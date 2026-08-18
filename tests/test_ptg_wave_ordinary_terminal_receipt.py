@@ -93,6 +93,7 @@ from tests.ptg_wave_ordinary_terminal_receipt_support import (
     direct_v6_boundary as _direct_v6_boundary,
     keyring as _keyring,
     ordinary_result as _ordinary_result,
+    v13_ordinary_result as _v13_ordinary_result,
 )
 
 
@@ -204,13 +205,18 @@ def test_request_and_digest_domains_are_frozen(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state_factory",
+    (_ordinary_result, _v13_ordinary_result),
+)
 async def test_issue_reads_one_member_and_replays_exact_receipt(
     monkeypatch,
+    state_factory,
 ):
     """Prove issuance reads one member and replays the stored envelope."""
     from process import ptg_wave_ordinary_terminal_receipt as terminal_module
 
-    state = _ordinary_result(monkeypatch)
+    state = state_factory(monkeypatch)
     first_session = _QueuedTerminalSession(
         [
             None,
