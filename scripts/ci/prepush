@@ -753,6 +753,9 @@ run_provider_directory_postgres() {
       tests/test_tin_npi_connector_postgres.py \
       tests/test_provider_directory_endpoint_dataset_admission_seal_migration.py \
       tests/test_provider_directory_endpoint_dataset_admission_seal_migration_postgres.py \
+      tests/test_provider_directory_publication_budget_postgres.py \
+      tests/test_provider_directory_terminal_publication_compact_guard_migration.py \
+      tests/test_provider_directory_terminal_publication_compact_guard_db.py \
       tests/test_provider_directory_subset_completion_postgres.py \
       tests/test_provider_directory_fhir_terminal_atomicity_postgres.py \
       tests/test_provider_directory_reviewed_subset_bounded_drift_postgres.py \

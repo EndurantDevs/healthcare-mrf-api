@@ -3031,7 +3031,7 @@ def test_artifact_transaction_timeout_budget_is_phase_specific():
 
 
 def test_artifact_cutover_timeout_tightens_without_extending(monkeypatch):
-    """Shorten a candidate wall for the live phase without extending it."""
+    """Shorten ordinary walls but retain the candidate publication budget."""
     class Timeout:
         def __init__(self, deadline):
             self.deadline = deadline
@@ -3059,6 +3059,16 @@ def test_artifact_cutover_timeout_tightens_without_extending(monkeypatch):
         current_timeout
     )
     assert current_timeout.rescheduled_to is None
+    candidate_fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (),
+        should_select_validated_candidates=True,
+    )
+    candidate_timeout = Timeout(112.0)
+    importer._tighten_provider_directory_artifact_cutover_timeout(
+        candidate_timeout,
+        candidate_fence,
+    )
+    assert candidate_timeout.rescheduled_to is None
     importer._tighten_provider_directory_artifact_cutover_timeout(None)
 
 
@@ -3082,7 +3092,7 @@ async def test_artifact_cutover_timeout_reschedule_is_enforced(
 
 @pytest.mark.asyncio
 async def test_candidate_fence_budget_precedes_cutover(monkeypatch):
-    """Use the wider metadata budget only before live serving-table work."""
+    """Retain the metadata budget through candidate publication."""
     events = []
 
     async def status(sql, **_params):
@@ -3110,7 +3120,7 @@ async def test_candidate_fence_budget_precedes_cutover(monkeypatch):
         f"'{importer.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}';",
         "verify-fence",
         "SET LOCAL statement_timeout = "
-        f"'{importer.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';",
+        f"'{importer.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}';",
     ]
 
     events.clear()
@@ -3206,12 +3216,12 @@ async def test_candidate_bundle_restores_budget_before_table_lock(
     fence_budget = next(
         index for index, event in enumerate(events) if "8s" in event
     )
-    live_budget = next(
-        index for index, event in enumerate(events) if "1000ms" in event
+    retained_budget = max(
+        index for index, event in enumerate(events) if "8s" in event
     )
     assert fence_budget < events.index("verify-fence")
-    assert events.index("verify-fence") < live_budget
-    assert live_budget < events.index("lock-tables")
+    assert events.index("verify-fence") < retained_budget
+    assert retained_budget < events.index("lock-tables")
 
 
 @pytest.mark.asyncio

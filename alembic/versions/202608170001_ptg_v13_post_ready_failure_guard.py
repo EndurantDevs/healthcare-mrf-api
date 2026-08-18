@@ -1,7 +1,7 @@
 """Fence V13 post-ready, unreleased failed PTG waves.
 
 Revision ID: 202608170001_ptg_v13_post_ready_failure_guard
-Revises: 20260816020000_address_evidence_alias
+Revises: 20260818020000_provider_directory_terminal_publication_compact_guard
 
 V13 is intentionally a healthcare-only Alembic revision.  It introduces no
 storage shape: it admits one additional, signed quarantine evidence family,
@@ -16,7 +16,9 @@ from alembic import op
 
 
 revision = "202608170001_ptg_v13_post_ready_failure_guard"
-down_revision = "20260816020000_address_evidence_alias"
+down_revision = (
+    "20260818020000_provider_directory_terminal_publication_compact_guard"
+)
 branch_labels = None
 depends_on = None
 

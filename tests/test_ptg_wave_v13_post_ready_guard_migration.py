@@ -56,7 +56,9 @@ def test_v13_guard_migration_has_its_own_healthcare_head(monkeypatch):
         if statement.startswith("LOCK TABLE")
     )
 
-    assert migration.down_revision == "20260816020000_address_evidence_alias"
+    assert migration.down_revision == (
+        "20260818020000_provider_directory_terminal_publication_compact_guard"
+    )
     assert "ptg_import_wave_v13_abandonment_guard" in sql
     assert "ptg_import_wave_v13_abandoned_child_guard" in sql
     assert "ptg_import_wave_v13_abandoned_run_guard" in sql
