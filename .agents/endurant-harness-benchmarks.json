@@ -48,11 +48,17 @@
       ],
       "correctness_keys": [
         "dataset_status",
+        "dataset_publication_calls",
         "is_current",
         "source_endpoint",
         "output_digest"
       ],
       "metric_schema": {
+        "dataset_publication_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
         "pipeline_seconds": {
           "type": "number",
           "unit": "seconds",
@@ -64,7 +70,7 @@
           "direction": "lower"
         }
       },
-      "primary_metric": "publication_seconds",
+      "primary_metric": "dataset_publication_seconds",
       "minimum_improvement_fraction": 0.1
     },
     "entity-address-alias-integrity": {
