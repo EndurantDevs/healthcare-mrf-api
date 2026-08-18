@@ -10122,7 +10122,8 @@ async def _promote_provider_directory_artifact_stage_transaction(
                 active_fence,
             )
         _tighten_provider_directory_artifact_cutover_timeout(
-            cutover_timeout
+            cutover_timeout,
+            active_fence,
         )
         await _assert_provider_directory_artifact_build_fence(prepared_stage)
         await _lock_provider_directory_artifact_tables(
@@ -13179,9 +13180,14 @@ def _provider_directory_artifact_transaction_timeout_seconds(
 
 def _tighten_provider_directory_artifact_cutover_timeout(
     cutover_timeout: asyncio.Timeout | None,
+    dataset_fence: ProviderDirectoryArtifactDatasetFence | None = None,
 ) -> None:
-    """Restore the short live-cutover wall after candidate validation."""
-    if cutover_timeout is None:
+    """Restore the short wall unless a validated candidate must publish."""
+    if (
+        cutover_timeout is None
+        or dataset_fence is not None
+        and dataset_fence.should_select_validated_candidates
+    ):
         return
     current_deadline = cutover_timeout.when()
     live_deadline = (
@@ -13295,7 +13301,8 @@ async def _apply_locked_provider_directory_artifact_bundle(
         )
     if profile_delta is None:
         _tighten_provider_directory_artifact_cutover_timeout(
-            cutover_timeout
+            cutover_timeout,
+            active_fence,
         )
     for stage in ordered_stages:
         await _assert_provider_directory_artifact_build_fence(stage)
@@ -22507,7 +22514,7 @@ async def _lock_artifact_cutover_fence(
     if use_candidate_budget:
         await db.status(
             "SET LOCAL statement_timeout = "
-            f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';"
+            f"'{PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}';"
         )
 
 
@@ -76264,7 +76271,8 @@ async def _publish_validated_uhc_dataset(
                 )
                 await _lock_artifact_cutover_fence(fence)
                 _tighten_provider_directory_artifact_cutover_timeout(
-                    cutover_timeout
+                    cutover_timeout,
+                    fence,
                 )
                 await _promote_provider_directory_artifact_datasets(fence)
     except Exception as promotion_error:
