@@ -28,6 +28,17 @@ pub struct CanonicalAddress {
     pub country_code: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AddressEvidenceFeatures {
+    pub street: Option<String>,
+    pub unit: String,
+    pub direction: Option<String>,
+    pub suffix: Option<String>,
+    pub directionless: Option<String>,
+    pub suffixless: Option<String>,
+    pub completion: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct Pub28Tables {
     suffix: HashMap<String, String>,
@@ -37,6 +48,7 @@ struct Pub28Tables {
     unit_no_range: HashSet<String>,
     invalid_unit_values: HashSet<String>,
     unit_keys_by_len: Vec<String>,
+    unit_prefixes_by_len: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +79,9 @@ fn load_pub28_tables() -> Pub28Tables {
     let invalid_unit_values = parse_py_set(PUB28_SOURCE, "PUB28_INVALID_UNIT_VALUES");
     let mut unit_keys_by_len: Vec<String> = unit.keys().cloned().collect();
     unit_keys_by_len.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    let mut unit_prefixes_by_len: Vec<String> = unit.values().cloned().collect();
+    unit_prefixes_by_len.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    unit_prefixes_by_len.dedup();
     Pub28Tables {
         suffix,
         directional,
@@ -75,6 +90,7 @@ fn load_pub28_tables() -> Pub28Tables {
         unit_no_range,
         invalid_unit_values,
         unit_keys_by_len,
+        unit_prefixes_by_len,
     }
 }
 
@@ -820,6 +836,38 @@ fn street_token_is_suffix(value: &str) -> bool {
     tables().suffix.contains_key(&token)
 }
 
+pub(crate) fn address_evidence_token_is_directional(value: &str) -> bool {
+    tables().directional.contains_key(&ascii_alnum_lower(value))
+}
+
+pub(crate) fn address_evidence_token_is_suffix(value: &str) -> bool {
+    street_token_is_suffix(value)
+}
+
+pub(crate) fn address_evidence_unit_prefix(value: &str) -> Option<String> {
+    unit_prefix(value)
+}
+
+pub(crate) fn address_evidence_unit_parts(value: &str) -> Option<(&str, &str)> {
+    tables().unit_prefixes_by_len.iter().find_map(|prefix| {
+        value
+            .strip_prefix(prefix)
+            .filter(|tail| !tail.is_empty())
+            .map(|tail| (prefix.as_str(), tail))
+    })
+}
+
+pub(crate) fn address_evidence_route_marker(value: &str) -> bool {
+    let token = ascii_alnum_lower(value);
+    matches!(
+        token.as_str(),
+        "route" | "rte" | "interstate" | "us" | "sr" | "sh" | "cr" | "i" | "fm"
+    ) || tables()
+        .suffix
+        .get(&token)
+        .is_some_and(|mapped| mapped == "hwy")
+}
+
 fn street_token_norm_context(token: &str, next_token: Option<&str>) -> String {
     let cleaned = ascii_alnum_lower(token);
     if cleaned.is_empty() {
@@ -864,7 +912,7 @@ fn replace_po_box(raw: &str) -> String {
     out.join(" ")
 }
 
-fn street_norm(line1: Option<&str>, line2: Option<&str>) -> Option<String> {
+fn street_tokens(line1: Option<&str>, line2: Option<&str>) -> Vec<String> {
     let raw = replace_po_box(&unit_decision(line1, line2).street_text);
     let mut tokens = Vec::new();
     let mut token = String::new();
@@ -879,17 +927,116 @@ fn street_norm(line1: Option<&str>, line2: Option<&str>) -> Option<String> {
     if !token.is_empty() {
         tokens.push(token);
     }
+    tokens
+}
+
+fn normalized_tokens(tokens: &[String]) -> Vec<String> {
+    (0..tokens.len())
+        .map(|idx| street_token_norm_context(&tokens[idx], tokens.get(idx + 1).map(String::as_str)))
+        .collect()
+}
+
+fn house_number_token(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let digit_count = bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    digit_count > 0
+        && (digit_count == bytes.len()
+            || (digit_count + 1 == bytes.len() && bytes[digit_count].is_ascii_alphabetic()))
+}
+
+fn edge_direction_index(tokens: &[String]) -> Option<usize> {
+    if tokens
+        .first()
+        .is_some_and(|token| address_evidence_token_is_directional(token))
+    {
+        return Some(0);
+    }
+    if tokens.len() >= 2
+        && house_number_token(&ascii_alnum_lower(&tokens[0]))
+        && address_evidence_token_is_directional(&tokens[1])
+    {
+        return Some(1);
+    }
+    tokens
+        .last()
+        .filter(|token| address_evidence_token_is_directional(token))
+        .map(|_| tokens.len() - 1)
+}
+
+fn street_norm(line1: Option<&str>, line2: Option<&str>) -> Option<String> {
+    let tokens = street_tokens(line1, line2);
     let mut out = String::new();
-    for idx in 0..tokens.len() {
-        out.push_str(&street_token_norm_context(
-            &tokens[idx],
-            tokens.get(idx + 1).map(|value| value.as_str()),
-        ));
+    for token in normalized_tokens(&tokens) {
+        out.push_str(&token);
     }
     if out.is_empty() {
         None
     } else {
         Some(out)
+    }
+}
+
+fn nonempty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+pub(crate) fn address_evidence_features(
+    line1: Option<&str>,
+    line2: Option<&str>,
+) -> AddressEvidenceFeatures {
+    let tokens = street_tokens(line1, line2);
+    let normalized = normalized_tokens(&tokens);
+    let direction_index = edge_direction_index(&tokens);
+    let suffix_index = (tokens.len() >= 2 && street_token_is_suffix(&tokens[tokens.len() - 1]))
+        .then(|| tokens.len() - 1);
+    let retained_count = tokens.len() - usize::from(direction_index.is_some());
+    let completion_suffix_index = (retained_count >= 2)
+        .then(|| {
+            (0..tokens.len())
+                .rfind(|index| Some(*index) != direction_index)
+                .filter(|index| street_token_is_suffix(&tokens[*index]))
+        })
+        .flatten();
+    let direction = direction_index.map(|index| street_token_norm(&tokens[index]));
+    let suffix = suffix_index.map(|index| street_token_norm(&tokens[index]));
+    let directionless_tokens: Vec<String> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != direction_index)
+        .map(|(_, token)| token.clone())
+        .collect();
+    let directionless = nonempty(normalized_tokens(&directionless_tokens).concat());
+    let suffixless = nonempty(
+        tokens
+            .iter()
+            .enumerate()
+            .take(suffix_index.unwrap_or(tokens.len()))
+            .map(|(index, token)| {
+                street_token_norm_context(token, tokens.get(index + 1).map(String::as_str))
+            })
+            .collect::<String>(),
+    );
+    let completion = nonempty(
+        normalized
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                Some(*index) != direction_index && Some(*index) != completion_suffix_index
+            })
+            .map(|(_, token)| token.as_str())
+            .collect(),
+    );
+    AddressEvidenceFeatures {
+        street: nonempty(normalized.concat()),
+        unit: unit_norm(line1, line2),
+        direction,
+        suffix,
+        directionless,
+        suffixless,
+        completion,
     }
 }
 
@@ -1038,7 +1185,7 @@ pub fn canonicalize_address(
     }
 }
 
-fn decode_copy_field(value: &str) -> Option<String> {
+pub(crate) fn decode_copy_field(value: &str) -> Option<String> {
     if value == "\\N" {
         return None;
     }
@@ -1050,9 +1197,12 @@ fn decode_copy_field(value: &str) -> Option<String> {
             continue;
         }
         match chars.next() {
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000c}'),
             Some('t') => out.push('\t'),
             Some('n') => out.push('\n'),
             Some('r') => out.push('\r'),
+            Some('v') => out.push('\u{000b}'),
             Some('\\') => out.push('\\'),
             Some(other) => out.push(other),
             None => out.push('\\'),
@@ -1202,6 +1352,14 @@ mod tests {
         assert_eq!(fields[1], "(0,1)");
         assert_eq!(fields[3], "3e3ea29f-8c26-17ba-dcc8-74424e66fd32");
         assert_eq!(fields[5], "v2|27drmellichampdr|ste100||SC|29910|US|street");
+    }
+
+    #[test]
+    fn decodes_postgres_copy_control_escapes() {
+        assert_eq!(
+            decode_copy_field(r"a\b\f\v\t\n\r\\"),
+            Some("a\u{0008}\u{000c}\u{000b}\t\n\r\\".to_owned()),
+        );
     }
 
     #[test]
