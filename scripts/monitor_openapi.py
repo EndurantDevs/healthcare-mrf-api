@@ -19,11 +19,31 @@ from typing import Any
 
 import yaml
 
+if __package__:
+    from .monitor_openapi_policy import EXCLUDED_MONITORING_OPERATIONS
+    from .monitor_openapi_schema import (
+        query_text,
+        smallest_pagination_value,
+        validate_schema_value,
+    )
+else:
+    from monitor_openapi_policy import EXCLUDED_MONITORING_OPERATIONS
+    from monitor_openapi_schema import (
+        query_text,
+        smallest_pagination_value,
+        validate_schema_value,
+    )
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OPENAPI_PATH = ROOT / "doc" / "openapi.yaml"
 HTTP_METHODS = {"delete", "get", "head", "options", "patch", "post", "put", "trace"}
-AUTOMATIC_SAFE_METHODS = {"get", "head"}
+PAGINATION_MINIMUM_BY_NAME = dict(
+    limit=1, offset=0, page=0, page_size=1, per_page=1, results_per_page=1
+)
+MAX_RESPONSE_BYTES = 65_536
+MAX_REQUEST_BYTES = 16_384
+MAX_REPORTED_FAILURES = 20
 
 
 @dataclass(frozen=True)
@@ -32,7 +52,9 @@ class ProbeCase:
     method: str
     path: str
     expected_statuses: tuple[int, ...]
+    max_latency_ms: int
     body: dict[str, Any] | None = None
+    required_json: tuple[tuple[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -60,54 +82,30 @@ def resolve_parameter(spec: dict[str, Any], parameter: dict[str, Any]) -> dict[s
     return spec["components"]["parameters"][str(reference)[len(prefix) :]]
 
 
-def parameter_value(parameter: dict[str, Any]) -> Any:
-    """Return a documented value or a deterministic synthetic no-match value."""
-    if parameter.get("in") == "query" and str(parameter.get("name") or "").lower() in {
-        "limit",
-        "page_size",
-        "per_page",
-    }:
-        return max(1, int((parameter.get("schema") or {}).get("minimum", 1)))
-    if "example" in parameter:
-        return parameter["example"]
-    examples = parameter.get("examples") or {}
-    if examples:
-        first = next(iter(examples.values()))
-        return first.get("value") if isinstance(first, dict) and "value" in first else first
-    schema = parameter.get("schema") or {}
-    for key in ("example", "default"):
-        if key in schema:
-            return schema[key]
-    if schema.get("enum"):
-        return schema["enum"][0]
-    if schema.get("type") == "boolean":
-        return False
-    if schema.get("type") in {"integer", "number"}:
-        return schema.get("minimum", 1)
-    if schema.get("format") == "date":
-        return "2026-01-01"
-    if schema.get("type") == "array":
-        return []
-    return "monitoring-no-match"
-
-
 def operation_cases(spec: dict[str, Any]) -> list[ProbeCase]:
-    """Build one bounded request for every safe operation in the contract."""
+    """Build only explicitly reviewed cases and reject policy drift."""
     cases: list[ProbeCase] = []
+    documented_operation_ids: set[str] = set()
     for path, path_item in sorted((spec.get("paths") or {}).items()):
         shared_parameters = path_item.get("parameters") or []
         for method, operation in sorted(path_item.items()):
             if method not in HTTP_METHODS:
                 continue
+            operation_id = str(operation.get("operationId") or "").strip()
+            if not operation_id or operation_id in documented_operation_ids:
+                raise ValueError(f"{method.upper()} {path} needs a unique operationId")
+            documented_operation_ids.add(operation_id)
             monitoring = operation.get("x-monitoring") or {}
-            is_safe = method in AUTOMATIC_SAFE_METHODS or monitoring.get("safe") is True
-            excluded_reason = str(monitoring.get("excluded_reason") or "").strip()
-            if not is_safe:
-                if excluded_reason:
-                    continue
-                raise ValueError(
-                    f"{method.upper()} {path} must set x-monitoring.safe or x-monitoring.excluded_reason"
-                )
+            if operation_id in EXCLUDED_MONITORING_OPERATIONS:
+                if monitoring:
+                    raise ValueError(f"{operation_id} has conflicting monitoring policies")
+                if not EXCLUDED_MONITORING_OPERATIONS[operation_id].strip():
+                    raise ValueError(f"{operation_id} has an empty monitoring exclusion")
+                continue
+            if not monitoring:
+                raise ValueError(f"{method.upper()} {path} has no explicit monitoring policy")
+            if monitoring.get("safe") is not True:
+                raise ValueError(f"{operation_id} monitoring policy is not explicitly safe")
             cases.append(
                 build_case(
                     spec,
@@ -118,6 +116,9 @@ def operation_cases(spec: dict[str, Any]) -> list[ProbeCase]:
                     monitoring,
                 )
             )
+    stale_policy_ids = set(EXCLUDED_MONITORING_OPERATIONS) - documented_operation_ids
+    if stale_policy_ids:
+        raise ValueError(f"monitoring policy refers to absent operation: {min(stale_policy_ids)}")
     if not cases:
         raise ValueError("OpenAPI contract has no safe monitoring cases")
     return cases
@@ -131,26 +132,10 @@ def build_case(
     raw_parameters: list[dict[str, Any]],
     monitoring: dict[str, Any],
 ) -> ProbeCase:
-    """Materialize a URL path, required query values, and optional request body."""
-    query_pairs: list[tuple[str, str]] = []
-    rendered_path = path
-    for raw_parameter in raw_parameters:
-        parameter = resolve_parameter(spec, raw_parameter)
-        parameter_example = parameter_value(parameter)
-        name = str(parameter.get("name") or "")
-        location = parameter.get("in")
-        if location == "path":
-            rendered_path = rendered_path.replace(
-                "{" + name + "}", urllib.parse.quote(str(parameter_example), safe="")
-            )
-        elif location == "query" and (
-            parameter.get("required") or _has_documented_value(parameter)
-        ):
-            query_pairs.append((name, _query_text(parameter_example)))
-    if "{" in rendered_path or "}" in rendered_path:
-        raise ValueError(f"unresolved path parameter for {method.upper()} {path}")
-    if query_pairs:
-        rendered_path = f"{rendered_path}?{urllib.parse.urlencode(query_pairs)}"
+    """Materialize one schema-valid bounded request."""
+    rendered_path = _render_case_path(
+        spec, path, method, raw_parameters, monitoring.get("parameters") or {}
+    )
     documented_statuses = {
         int(status)
         for status in (operation.get("responses") or {})
@@ -161,70 +146,208 @@ def build_case(
     )
     if not expected_statuses:
         raise ValueError(f"{method.upper()} {path} has no successful monitoring status")
-    body = monitoring.get("request_body")
+    body = _validated_request_body(path, method, operation, monitoring)
+    max_latency_ms = monitoring.get("max_latency_ms")
+    if (
+        isinstance(max_latency_ms, bool)
+        or not isinstance(max_latency_ms, int)
+        or max_latency_ms <= 0
+    ):
+        raise ValueError(f"{operation.get('operationId')} needs a positive max_latency_ms")
+    required_json = monitoring.get("required_json") or {}
+    if not isinstance(required_json, dict):
+        raise ValueError("required_json must be an object")
     return ProbeCase(
-        operation_id=str(operation.get("operationId") or f"{method}_{path}"),
+        operation_id=str(operation.get("operationId")),
         method=method.upper(),
         path=rendered_path,
         expected_statuses=expected_statuses,
+        max_latency_ms=max_latency_ms,
         body=body,
+        required_json=tuple(sorted(required_json.items())),
     )
 
 
-def _has_documented_value(parameter: dict[str, Any]) -> bool:
-    schema = parameter.get("schema") or {}
-    return bool(
-        "example" in parameter
-        or parameter.get("examples")
-        or "example" in schema
-        or "default" in schema
-    )
+def _render_case_path(
+    spec: dict[str, Any],
+    path: str,
+    method: str,
+    raw_parameters: list[dict[str, Any]],
+    configured_parameters: dict[str, Any],
+) -> str:
+    """Render and validate one case's path and query parameters."""
+    query_pairs: list[tuple[str, str]] = []
+    rendered_path = path
+    if not isinstance(configured_parameters, dict):
+        raise ValueError("monitoring parameters must be an object")
+    declared_parameter_names: set[str] = set()
+    declared_parameter_keys: set[tuple[Any, str]] = set()
+    for raw_parameter in raw_parameters:
+        parameter = resolve_parameter(spec, raw_parameter)
+        name = str(parameter.get("name") or "")
+        location = parameter.get("in")
+        parameter_key = (location, name)
+        if not name or parameter_key in declared_parameter_keys:
+            raise ValueError(f"{method.upper()} {path} has an invalid parameter declaration")
+        declared_parameter_names.add(name)
+        declared_parameter_keys.add(parameter_key)
+        if name in configured_parameters:
+            parameter_value = configured_parameters[name]
+        elif location == "query" and name.lower() in PAGINATION_MINIMUM_BY_NAME:
+            parameter_value = smallest_pagination_value(
+                PAGINATION_MINIMUM_BY_NAME[name.lower()], parameter.get("schema") or {}
+            )
+        elif location == "path" or parameter.get("required"):
+            raise ValueError(
+                f"{method.upper()} {path} needs an explicit monitoring value for {name}"
+            )
+        else:
+            continue
+        validate_schema_value(parameter_value, parameter.get("schema") or {}, name)
+        if location == "path":
+            rendered_path = rendered_path.replace(
+                "{" + name + "}", urllib.parse.quote(str(parameter_value), safe="")
+            )
+        elif location == "query":
+            query_pairs.append((name, query_text(parameter_value)))
+    unknown_parameters = set(configured_parameters) - declared_parameter_names
+    if unknown_parameters:
+        raise ValueError(f"monitoring policy has unknown parameter: {min(unknown_parameters)}")
+    if "{" in rendered_path or "}" in rendered_path:
+        raise ValueError(f"unresolved path parameter for {method.upper()} {path}")
+    if query_pairs:
+        rendered_path = f"{rendered_path}?{urllib.parse.urlencode(query_pairs)}"
+    return rendered_path
 
 
-def _query_text(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, list):
-        return ",".join(str(item) for item in value)
-    return str(value)
+def _validated_request_body(
+    path: str,
+    method: str,
+    operation: dict[str, Any],
+    monitoring: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return a schema-valid JSON request body when the case declares one."""
+    body = monitoring.get("request_body")
+    request_body = operation.get("requestBody") or {}
+    if request_body.get("required") and body is None:
+        raise ValueError(f"{method.upper()} {path} needs an explicit monitoring request body")
+    if body is not None:
+        body_schema = (
+            (request_body.get("content") or {})
+            .get("application/json", {})
+            .get("schema", {})
+        )
+        if not body_schema:
+            raise ValueError(f"{method.upper()} {path} has no JSON request body schema")
+        validate_schema_value(body, body_schema, "request_body")
+    return body
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Return redirect responses to the caller instead of following them."""
+
+    def redirect_request(self, *_args, **_kwargs):
+        """Reject redirects so credentials cannot leave the configured origin."""
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(NoRedirectHandler())
+
+
+def request_url(base_url: str, case_path: str) -> str:
+    """Return a URL whose origin is exactly the configured service origin."""
+    parsed_base = urllib.parse.urlsplit(base_url)
+    if (
+        parsed_base.scheme not in {"http", "https"}
+        or not parsed_base.netloc
+        or parsed_base.query
+        or parsed_base.fragment
+        or not case_path.startswith("/")
+        or case_path.startswith("//")
+    ):
+        raise ValueError("monitor case path must stay on the configured origin")
+    url = base_url.rstrip("/") + case_path
+    parsed_url = urllib.parse.urlsplit(url)
+    if (parsed_url.scheme, parsed_url.netloc) != (parsed_base.scheme, parsed_base.netloc):
+        raise ValueError("monitor case path must stay on the configured origin")
+    return url
+
+
+def _open_request(request: urllib.request.Request, timeout: float):
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+
+
+def _json_path_value(payload: Any, path: str) -> Any:
+    value = payload
+    for key in path.split("."):
+        if not isinstance(value, dict) or key not in value:
+            raise ValueError("missing required JSON field")
+        value = value[key]
+    return value
 
 
 def execute_case(
-    case: ProbeCase,
+    probe_case: ProbeCase,
     *,
     base_url: str,
-    api_key: str,
     timeout: float,
 ) -> ProbeResult:
-    """Execute one request without retaining response bodies."""
-    body = None if case.body is None else json.dumps(case.body).encode("utf-8")
+    """Execute one same-origin request and validate its bounded JSON response."""
+    body = (
+        None
+        if probe_case.body is None
+        else json.dumps(probe_case.body).encode("utf-8")
+    )
+    if body is not None and len(body) > MAX_REQUEST_BYTES:
+        raise ValueError("monitor request body is too large")
     headers_by_name = {"Accept": "application/json", "User-Agent": "HealthPortaMonitor/1.0"}
     if body is not None:
         headers_by_name["Content-Type"] = "application/json"
-    if api_key:
-        headers_by_name["Authorization"] = f"Bearer {api_key}"
     request = urllib.request.Request(
-        base_url.rstrip("/") + case.path,
+        request_url(base_url, probe_case.path),
         data=body,
         headers=headers_by_name,
-        method=case.method,
+        method=probe_case.method,
     )
     started = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            response.read(1)
+        with _open_request(request, timeout) as response:
             status = response.status
-            error = None
+            content_type = str(response.headers.get("Content-Type", "")).lower()
+            response_body = response.read(MAX_RESPONSE_BYTES + 1)
+            error = _response_error(
+                response_body, content_type, probe_case.required_json
+            )
     except urllib.error.HTTPError as exc:
         status = exc.code
-        error = None
+        error = "redirect" if 300 <= status < 400 else None
         exc.close()
     except (OSError, TimeoutError, urllib.error.URLError) as exc:
         status = None
         error = type(exc).__name__
     elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
-    is_healthy = status is not None and status < 500 and status in case.expected_statuses
-    return ProbeResult(case.operation_id, status, elapsed_ms, is_healthy, error)
+    is_healthy = status in probe_case.expected_statuses and error is None
+    return ProbeResult(probe_case.operation_id, status, elapsed_ms, is_healthy, error)
+
+
+def _response_error(
+    response_body: bytes,
+    content_type: str,
+    required_json: tuple[tuple[str, Any], ...],
+) -> str | None:
+    """Return a bounded response-validation error, if any."""
+    if "application/json" not in content_type and "+json" not in content_type:
+        return "invalid_content_type"
+    if len(response_body) > MAX_RESPONSE_BYTES:
+        return "response_too_large"
+    try:
+        payload = json.loads(response_body)
+        for path, expected_value in required_json:
+            if _json_path_value(payload, path) != expected_value:
+                raise ValueError("unexpected required JSON value")
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return "invalid_json"
+    return None
 
 
 def percentile_95(values: list[int]) -> int:
@@ -239,10 +362,8 @@ def run_cases(
     cases: list[ProbeCase],
     *,
     base_url: str,
-    api_key: str,
     timeout: float,
     workers: int,
-    max_p95_ms: int,
 ) -> dict[str, Any]:
     """Run all cases and return a redacted aggregate result."""
     if workers < 1 or timeout <= 0:
@@ -253,41 +374,77 @@ def run_cases(
                 lambda case: execute_case(
                     case,
                     base_url=base_url,
-                    api_key=api_key,
                     timeout=timeout,
                 ),
                 cases,
             )
         )
     p95_ms = percentile_95([probe_result.elapsed_ms for probe_result in probe_results])
-    failures = [asdict(probe_result) for probe_result in probe_results if not probe_result.ok]
-    is_latency_within_limit = max_p95_ms <= 0 or p95_ms <= max_p95_ms
+    failures = []
+    for case, probe_result in zip(cases, probe_results):
+        is_response_failed = not probe_result.ok
+        is_latency_failed = probe_result.elapsed_ms > case.max_latency_ms
+        if not is_response_failed and not is_latency_failed:
+            continue
+        failure = asdict(probe_result)
+        failure["max_latency_ms"] = case.max_latency_ms
+        if is_response_failed and is_latency_failed:
+            failure["reason"] = "response+latency"
+        elif is_response_failed:
+            failure["reason"] = "response"
+        else:
+            failure["reason"] = "latency"
+        failures.append(failure)
+    reported_failures = failures[:MAX_REPORTED_FAILURES]
     return {
-        "ok": not failures and is_latency_within_limit,
+        "ok": not failures,
         "operation_count": len(cases),
         "failure_count": len(failures),
         "p95_ms": p95_ms,
-        "max_p95_ms": max_p95_ms,
-        "failures": failures[:20],
+        "failures": reported_failures,
+        "truncated_failure_count": len(failures) - len(reported_failures),
     }
+
+
+def push_message(summary: dict[str, Any]) -> str:
+    """Return a bounded message that identifies the first failing operation."""
+    message = (
+        f"operations={summary['operation_count']} failures={summary['failure_count']} "
+        f"p95_ms={summary['p95_ms']}"
+    )
+    failures = summary.get("failures") or []
+    if failures:
+        first_failure = failures[0]
+        message += (
+            f" first={first_failure['operation_id']}:{first_failure['reason']}:"
+            f"{first_failure['status']} elapsed_ms={first_failure['elapsed_ms']}"
+            f" budget_ms={first_failure['max_latency_ms']}"
+        )
+        additional_failures = max(0, int(summary["failure_count"]) - 1)
+        if additional_failures:
+            message += f" additional_failures={additional_failures}"
+    return message
 
 
 def push_summary(push_url: str, summary: dict[str, Any]) -> None:
     """Publish the aggregate outcome to an Uptime Kuma Push monitor."""
     parsed_url = urllib.parse.urlsplit(push_url)
-    if parsed_url.query or parsed_url.fragment:
+    if (
+        parsed_url.scheme not in {"http", "https"}
+        or not parsed_url.netloc
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
         raise ValueError("Kuma push URL must not contain a query or fragment")
     state = "up" if summary["ok"] else "down"
-    message = (
-        f"operations={summary['operation_count']} failures={summary['failure_count']} "
-        f"p95_ms={summary['p95_ms']}"
-    )
+    message = push_message(summary)
     separator = "&" if "?" in push_url else "?"
     url = push_url + separator + urllib.parse.urlencode(
         {"status": state, "msg": message, "ping": summary["p95_ms"]}
     )
     try:
-        with urllib.request.urlopen(url, timeout=10) as response:
+        request = urllib.request.Request(url, method="GET")
+        with _open_request(request, 10) as response:
             if response.status >= 300:
                 raise RuntimeError("Kuma push failed")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -301,11 +458,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--openapi", type=Path, default=DEFAULT_OPENAPI_PATH)
     parser.add_argument("--base-url", default=os.getenv("MONITOR_BASE_URL", ""))
-    parser.add_argument("--api-key", default=os.getenv("MONITOR_API_KEY", ""))
     parser.add_argument("--push-url", default=os.getenv("KUMA_PUSH_URL", ""))
     parser.add_argument("--timeout", type=float, default=2.0)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--max-p95-ms", type=int, default=0)
     parser.add_argument("--check", action="store_true")
     return parser.parse_args()
 
@@ -313,19 +468,21 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     """Run contract validation or the bounded live probe."""
     args = parse_args()
-    cases = operation_cases(load_spec(args.openapi))
+    probe_cases = operation_cases(load_spec(args.openapi))
     if args.check:
-        print(json.dumps({"safe_operation_count": len(cases)}, sort_keys=True))
+        check_counts_by_name = {
+            "excluded_operation_count": len(EXCLUDED_MONITORING_OPERATIONS),
+            "safe_operation_count": len(probe_cases),
+        }
+        print(json.dumps(check_counts_by_name, sort_keys=True))
         return 0
     if not args.base_url:
         raise SystemExit("--base-url or MONITOR_BASE_URL is required")
     summary = run_cases(
-        cases,
+        probe_cases,
         base_url=args.base_url,
-        api_key=args.api_key,
         timeout=args.timeout,
         workers=args.workers,
-        max_p95_ms=args.max_p95_ms,
     )
     print(json.dumps(summary, sort_keys=True))
     if args.push_url:
