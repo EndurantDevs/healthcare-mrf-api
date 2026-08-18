@@ -123,7 +123,7 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
         "  address-canonical-db-tests:\n"
         "    name: postgres18 postgis tests (${{ matrix.shard }})\n"
         "    runs-on: ubuntu-latest\n"
-        "    timeout-minutes: 10"
+        "    timeout-minutes: 15"
     ) in workflow
     assert "mrf-python-coverage-postgres-${{ matrix.shard }}" in workflow
     assert "pattern: mrf-python-coverage-postgres-*" in workflow
