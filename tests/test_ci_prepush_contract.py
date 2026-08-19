@@ -51,9 +51,10 @@ def test_exact_prepush_ci_job_retains_its_compact_receipt() -> None:
 
     assert "PREPUSH_RECEIPT_DIR: ${{ runner.temp }}/healthcare-prepush-receipt" in job
     assert (
-        "READABILITY_ZERO_GROWTH_APPROVED: ${{ github.event_name == 'pull_request' "
+        "READABILITY_ZERO_GROWTH_APPROVED: ${{ github.event_name == 'push' || "
+        "(github.event_name == 'pull_request' "
         "&& contains(github.event.pull_request.labels.*.name, "
-        "'readability-zero-growth-approved') }}"
+        "'readability-zero-growth-approved')) }}"
     ) in job
     assert "healthcare-mrf-exact-prepush-receipt" in job
     assert "healthcare-prepush-receipt/receipt.txt" in job
