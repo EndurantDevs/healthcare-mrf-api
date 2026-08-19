@@ -44,6 +44,7 @@ jobs:
       - name: Run exact local pre-push gate
         env:
           PREPUSH_RECEIPT_DIR: ${{ runner.temp }}/healthcare-prepush-receipt
+          READABILITY_ZERO_GROWTH_APPROVED: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'readability-zero-growth-approved') }}
         run: scripts/ci/prepush all "$COVERAGE_BASE_SHA"
       - name: Upload exact pre-push receipt
         if: always()
