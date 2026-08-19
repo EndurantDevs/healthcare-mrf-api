@@ -4,27 +4,8 @@
 from scripts import monitor_openapi, monitor_openapi_policy
 
 
-def test_monitor_cases_cover_every_openapi_operation() -> None:
-    openapi_spec = monitor_openapi.load_spec(monitor_openapi.DEFAULT_OPENAPI_PATH)
-    cases = monitor_openapi.operation_cases(openapi_spec)
-    operation_ids = {
-        operation["operationId"]
-        for path_item in openapi_spec["paths"].values()
-        for method, operation in path_item.items()
-        if method in monitor_openapi.HTTP_METHODS
-    }
-
-    safe_operation_ids = {case.operation_id for case in cases}
-    assert safe_operation_ids | set(monitor_openapi.EXCLUDED_MONITORING_OPERATIONS) == operation_ids
-    assert not safe_operation_ids & set(monitor_openapi.EXCLUDED_MONITORING_OPERATIONS)
-    exclusion_reasons = set(monitor_openapi.EXCLUDED_MONITORING_OPERATIONS.values())
-    assert len(exclusion_reasons) == 2
-    assert all(reason.startswith("reviewed: ") for reason in exclusion_reasons)
-    assert not (
-        set(monitor_openapi_policy._STABLE_CANARY_REQUIRED_OPERATIONS)
-        & set(monitor_openapi_policy._BOUNDED_DEFAULT_REQUIRED_OPERATIONS)
-    )
-    assert safe_operation_ids == {
+EXPECTED_MONITORED_OPERATION_IDS = frozenset(
+    {
         "getClinicalClinicalAreas",
         "getClinicalConcepts",
         "getClinicalConditions",
@@ -57,6 +38,30 @@ def test_monitor_cases_cover_every_openapi_operation() -> None:
         "getReadiness",
         "postPlanPriceBulk",
     }
+)
+
+
+def test_monitor_cases_cover_every_openapi_operation() -> None:
+    openapi_spec = monitor_openapi.load_spec(monitor_openapi.DEFAULT_OPENAPI_PATH)
+    cases = monitor_openapi.operation_cases(openapi_spec)
+    operation_ids = {
+        operation["operationId"]
+        for path_item in openapi_spec["paths"].values()
+        for method, operation in path_item.items()
+        if method in monitor_openapi.HTTP_METHODS
+    }
+
+    safe_operation_ids = {case.operation_id for case in cases}
+    assert safe_operation_ids | set(monitor_openapi.EXCLUDED_MONITORING_OPERATIONS) == operation_ids
+    assert not safe_operation_ids & set(monitor_openapi.EXCLUDED_MONITORING_OPERATIONS)
+    exclusion_reasons = set(monitor_openapi.EXCLUDED_MONITORING_OPERATIONS.values())
+    assert len(exclusion_reasons) == 2
+    assert all(reason.startswith("reviewed: ") for reason in exclusion_reasons)
+    assert not (
+        set(monitor_openapi_policy._STABLE_CANARY_REQUIRED_OPERATIONS)
+        & set(monitor_openapi_policy._BOUNDED_DEFAULT_REQUIRED_OPERATIONS)
+    )
+    assert safe_operation_ids == EXPECTED_MONITORED_OPERATION_IDS
     bulk_case = next(case for case in cases if case.operation_id == "postPlanPriceBulk")
     assert bulk_case.method == "POST"
     assert bulk_case.body == {"plan_ids": ["monitoring-no-match"]}
