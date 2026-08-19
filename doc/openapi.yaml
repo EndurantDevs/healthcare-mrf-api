@@ -25,6 +25,11 @@ paths:
     get:
       operationId: getHealthcheck
       summary: Health check and release metadata
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
+        required_json:
+          database.status: OK
       responses:
         '200':
           description: Service status payload
@@ -36,6 +41,11 @@ paths:
     get:
       operationId: getLiveness
       summary: Process liveness probe
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
+        required_json:
+          status: OK
       responses:
         '200':
           description: The API process is running
@@ -47,6 +57,11 @@ paths:
     get:
       operationId: getReadiness
       summary: PostgreSQL and strict PTG V3 readiness probe
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
+        required_json:
+          status: OK
       responses:
         '200':
           description: PostgreSQL and the strict PTG V3 schema are ready
@@ -925,6 +940,9 @@ paths:
   /formulary/statistics:
     get:
       operationId: getFormularyStatistics
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
       summary: Retrieve high-level formulary statistics
       parameters:
         - name: year
@@ -951,6 +969,9 @@ paths:
   /formulary/partd/import/status:
     get:
       operationId: getFormularyPartdImportStatus
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
       summary: Retrieve latest Part D import run status
       parameters:
         - name: run_id
@@ -1156,6 +1177,9 @@ paths:
   /pharmacy-license/import/status:
     get:
       operationId: getPharmacyLicenseImportStatus
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
       summary: Retrieve latest pharmacy-license import run status
       parameters:
         - name: run_id
@@ -1178,6 +1202,9 @@ paths:
   /pharmacy-license/coverage:
     get:
       operationId: getPharmacyLicenseCoverage
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
       summary: Retrieve state coverage for pharmacy-license ingestion support
       responses:
         '200':
@@ -1566,6 +1593,11 @@ paths:
     post:
       operationId: postPlanPriceBulk
       summary: Retrieve price rows for multiple plans
+      x-monitoring:
+        safe: true
+        max_latency_ms: 5000
+        request_body:
+          plan_ids: [monitoring-no-match]
       requestBody:
         required: true
         content:
@@ -1741,6 +1773,9 @@ paths:
   /issuer/:
     get:
       operationId: getIssuer
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
       summary: List issuers across all states
       parameters:
         - name: state
@@ -1812,6 +1847,11 @@ paths:
   /issuer/state/{state}:
     get:
       operationId: getIssuerStateState
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
+        parameters:
+          state: NY
       summary: List issuers for a specific state
       parameters:
         - name: state
@@ -1914,6 +1954,11 @@ paths:
   /geo/zip/{zip_code}:
     get:
       operationId: getGeoZipZipCode
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
+        parameters:
+          zip_code: '10001'
       summary: Look up ZIP centroid and state
       parameters:
         - name: zip_code
@@ -1944,6 +1989,11 @@ paths:
   /geo/zip/{zip_code}/places:
     get:
       operationId: getGeoZipZipCodePlaces
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
+        parameters:
+          zip_code: '10001'
       summary: Return CDC PLACES ZCTA measures for a ZIP code
       parameters:
         - name: zip_code
@@ -2011,6 +2061,9 @@ paths:
   /geo/states:
     get:
       operationId: getGeoStates
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
       summary: Aggregated ZIP and city counts per state
       parameters:
         - name: sort
@@ -2055,6 +2108,11 @@ paths:
   /geo/state/{state}/cities:
     get:
       operationId: getGeoStateStateCities
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
+        parameters:
+          state: NY
       summary: Top cities in a state by population (based on local geo data)
       parameters:
         - name: state
@@ -2758,6 +2816,11 @@ paths:
   /npi/id/{npi}/full_taxonomy:
     get:
       operationId: getNpiIdNpiFullTaxonomy
+      x-monitoring:
+        safe: true
+        max_latency_ms: 5000
+        parameters:
+          npi: 1013901784
       summary: Retrieve taxonomy list for an NPI
       parameters:
         - name: npi
@@ -2913,6 +2976,11 @@ paths:
   /npi/plans_by_npi/{npi}:
     get:
       operationId: getNpiPlansByNpiNpi
+      x-monitoring:
+        safe: true
+        max_latency_ms: 5000
+        parameters:
+          npi: 1013901784
       summary: Retrieve plan associations for an NPI
       description: |
         Returns issuer- and network-scoped plan rows. A row's `npi_info.languages`
@@ -2937,6 +3005,11 @@ paths:
   /npi/id/{npi}:
     get:
       operationId: getNpiIdNpi
+      x-monitoring:
+        safe: true
+        max_latency_ms: 5000
+        parameters:
+          npi: 1013901784
       summary: Retrieve a detailed NPI profile
       parameters:
         - name: npi
@@ -3063,6 +3136,9 @@ paths:
   /codes/:
     get:
       operationId: getCodes
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
       summary: List normalized code catalog entries
       parameters:
         - name: code_system
@@ -3097,6 +3173,12 @@ paths:
   /codes/{code_system}/{code}:
     get:
       operationId: getCodesCodeSystemCode
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
+        parameters:
+          code_system: CPT
+          code: '99213'
       summary: Retrieve one code catalog row
       parameters:
         - name: code_system
@@ -3125,6 +3207,12 @@ paths:
   /codes/{code_system}/{code}/related:
     get:
       operationId: getCodesCodeSystemCodeRelated
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
+        parameters:
+          code_system: CPT
+          code: '99213'
       summary: Retrieve related crosswalk mappings for a code
       parameters:
         - name: code_system
@@ -3523,6 +3611,11 @@ paths:
   /pricing/procedure-taxonomy/resolve:
     get:
       operationId: getPricingProcedureTaxonomyResolve
+      x-monitoring:
+        safe: true
+        max_latency_ms: 5000
+        parameters:
+          code: '99213'
       summary: Resolve provider-taxonomy guidance for a procedure code
       description: |
         Resolves a procedure billing code to provider-taxonomy guidance before
@@ -3615,6 +3708,11 @@ paths:
   /pricing/provider-types/autocomplete:
     get:
       operationId: getPricingProviderTypesAutocomplete
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
+        parameters:
+          q: facility
       summary: Autocomplete provider type and NUCC terminology aliases
       parameters:
         - name: q
@@ -3632,6 +3730,11 @@ paths:
   /pricing/provider-types/resolve:
     get:
       operationId: getPricingProviderTypesResolve
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
+        parameters:
+          q: facility
       summary: Resolve a provider type or NUCC alias to pricing provider types
       parameters:
         - name: q
@@ -4349,6 +4452,11 @@ paths:
   /pricing/procedures/autocomplete:
     get:
       operationId: getPricingProceduresAutocomplete
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
+        parameters:
+          q: primary care
       summary: Autocomplete procedure/service terms across CPT/HCPCS/internal codes
       parameters:
         - name: q
@@ -4388,6 +4496,11 @@ paths:
   /pricing/procedures/resolve:
     get:
       operationId: getPricingProceduresResolve
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
+        parameters:
+          q: primary care
       summary: Resolve a procedure/service synonym to procedure codes
       parameters:
         - name: q
@@ -5482,6 +5595,9 @@ paths:
   /clinical/concepts:
     get:
       operationId: getClinicalConcepts
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
       summary: Search clinical terminology concepts
       parameters:
         - name: system
@@ -5538,6 +5654,9 @@ paths:
   /clinical/relationships:
     get:
       operationId: getClinicalRelationships
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
       summary: Search clinical terminology relationships
       parameters:
         - name: from_system
@@ -5570,6 +5689,9 @@ paths:
   /clinical/conditions:
     get:
       operationId: getClinicalConditions
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
       summary: List condition concepts
       responses:
         '200':
@@ -5609,6 +5731,9 @@ paths:
   /clinical/treatments:
     get:
       operationId: getClinicalTreatments
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
       summary: List treatment concepts
       responses:
         '200':
@@ -5648,6 +5773,9 @@ paths:
   /clinical/clinical-areas:
     get:
       operationId: getClinicalClinicalAreas
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
       summary: List clinical areas
       parameters:
         - name: q
@@ -5757,6 +5885,9 @@ paths:
   /clinical/crosswalk:
     get:
       operationId: getClinicalCrosswalk
+      x-monitoring:
+        safe: true
+        max_latency_ms: 2000
       summary: Search clinical code crosswalks
       parameters:
         - name: from_system

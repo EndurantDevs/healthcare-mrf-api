@@ -125,6 +125,7 @@ COPY specs/ /opt/specs/
 COPY alembic/ /opt/alembic/
 COPY process/ /opt/process/
 COPY public_evidence/ /opt/public_evidence/
+COPY doc/openapi.yaml /opt/doc/openapi.yaml
 COPY scripts/ /opt/scripts/
 COPY support/ /opt/support/
 COPY --from=ptg2-scanner-builder \
