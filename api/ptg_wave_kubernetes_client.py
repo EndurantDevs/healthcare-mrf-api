@@ -60,7 +60,7 @@ def list_wave_pods(wave_digest: str) -> list[dict[str, Any]]:
 
     labels = _wave_labels(wave_digest)
     selector = ",".join(
-        f"{key}={value}" for key, value in sorted(labels.items())
+        f"{key}={label_value}" for key, label_value in sorted(labels.items())
     )
     path = (
         f"/api/v1/namespaces/{_encoded_namespace()}/pods?"
@@ -70,14 +70,27 @@ def list_wave_pods(wave_digest: str) -> list[dict[str, Any]]:
         _kubernetes_request("GET", path),
         "Kubernetes Pod list",
     )
-    items = response.get("items")
-    if not isinstance(items, list) or not all(
-        isinstance(item, dict) for item in items
+    if response.get("apiVersion") != "v1" or response.get("kind") != "PodList":
+        raise PTGWaveContractError("Kubernetes Pod list must be a v1 PodList")
+    pod_items = response.get("items")
+    if not isinstance(pod_items, list) or not all(
+        isinstance(pod_item, dict) for pod_item in pod_items
     ):
         raise PTGWaveContractError(
             "Kubernetes Pod list must contain an object items array"
         )
-    return [dict(item) for item in items]
+    pods = []
+    for pod_item in pod_items:
+        if (
+            pod_item.get("apiVersion", "v1") != "v1"
+            or pod_item.get("kind", "Pod") != "Pod"
+        ):
+            raise PTGWaveContractError("Kubernetes Pod list must contain v1 Pod items")
+        pod_map = dict(pod_item)
+        pod_map.setdefault("apiVersion", "v1")
+        pod_map.setdefault("kind", "Pod")
+        pods.append(pod_map)
+    return pods
 
 
 def list_generic_ptg_jobs() -> list[dict[str, Any]]:

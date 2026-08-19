@@ -74,9 +74,17 @@ def test_get_translates_only_not_found(kubernetes):
 
 
 def test_wave_pod_list_binds_the_complete_label_selector(kubernetes):
-    kubernetes.return_value = {"items": [{"metadata": {"uid": "pod-1"}}]}
+    kubernetes.return_value = {
+        "apiVersion": "v1",
+        "kind": "PodList",
+        "items": [{"metadata": {"uid": "pod-1"}}],
+    }
     assert client.list_wave_pods(_WAVE) == [
-        {"metadata": {"uid": "pod-1"}},
+        {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"uid": "pod-1"},
+        },
     ]
     method, path = kubernetes.call_args.args
     assert method == "GET"
@@ -84,9 +92,25 @@ def test_wave_pod_list_binds_the_complete_label_selector(kubernetes):
     assert "labelSelector=" in path
     assert "healthporta.com%2Fptg-wave-digest-hash%3Dffe054fe7ae0cb6d" in path
 
-    for invalid in ({}, {"items": {}}, {"items": [None]}):
+    for invalid in (
+        {},
+        {"apiVersion": "v1", "kind": "PodList", "items": {}},
+        {"apiVersion": "v1", "kind": "PodList", "items": [None]},
+        {"apiVersion": "batch/v1", "kind": "PodList", "items": []},
+        {"apiVersion": "v1", "kind": "List", "items": []},
+        {
+            "apiVersion": "v1",
+            "kind": "PodList",
+            "items": [{"apiVersion": "v2", "kind": "Pod"}],
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "PodList",
+            "items": [{"apiVersion": "v1", "kind": "Job"}],
+        },
+    ):
         kubernetes.return_value = invalid
-        with pytest.raises(PTGWaveContractError, match="object items array"):
+        with pytest.raises(PTGWaveContractError, match="v1 Pod|object items array"):
             client.list_wave_pods(_WAVE)
 
 
