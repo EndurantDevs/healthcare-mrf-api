@@ -35,7 +35,44 @@ jobs:
     name: exact local pre-push gate
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
+      - name: Resolve reviewed readability approval
+        id: readability-approval
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const label = 'readability-zero-growth-approved'
+            if (context.eventName === 'pull_request') {
+              const pull = context.payload.pull_request
+              const approved =
+                pull.base.ref === 'main' &&
+                pull.labels.some((item) => item.name === label)
+              core.setOutput('approved', String(approved))
+              return
+            }
+            if (context.eventName !== 'push' || context.ref !== 'refs/heads/main') {
+              core.setOutput('approved', 'false')
+              return
+            }
+            const before = String(context.payload.before || '')
+            const {data: pulls} = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              per_page: 100,
+            })
+            const approved = pulls.filter((pull) =>
+              pull.state === 'closed' &&
+              Boolean(pull.merged_at) &&
+              pull.merge_commit_sha === context.sha &&
+              pull.base.ref === 'main' &&
+              pull.base.sha === before &&
+              pull.labels.some((item) => item.name === label)
+            ).length === 1
+            core.setOutput('approved', String(approved))
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
@@ -44,7 +81,7 @@ jobs:
       - name: Run exact local pre-push gate
         env:
           PREPUSH_RECEIPT_DIR: ${{ runner.temp }}/healthcare-prepush-receipt
-          READABILITY_ZERO_GROWTH_APPROVED: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'readability-zero-growth-approved') }}
+          READABILITY_ZERO_GROWTH_APPROVED: ${{ steps.readability-approval.outputs.approved }}
         run: scripts/ci/prepush all "$COVERAGE_BASE_SHA"
       - name: Upload exact pre-push receipt
         if: always()

@@ -47,13 +47,20 @@ def test_every_required_ci_family_delegates_to_prepush() -> None:
 
 
 def test_exact_prepush_ci_job_retains_its_compact_receipt() -> None:
-    job = _job(WORKFLOW.read_text(encoding="utf-8"), "exact-prepush")
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    job = _job(workflow, "exact-prepush")
 
+    assert "pull-requests: read" in job
     assert "PREPUSH_RECEIPT_DIR: ${{ runner.temp }}/healthcare-prepush-receipt" in job
+    assert "listPullRequestsAssociatedWithCommit" in job
+    assert "pull.merge_commit_sha === context.sha" in job
+    assert "pull.base.ref === 'main'" in job
+    assert "pull.base.sha === before" in job
+    assert "pull.labels.some((item) => item.name === label)" in job
+    assert ").length === 1" in job
     assert (
-        "READABILITY_ZERO_GROWTH_APPROVED: ${{ github.event_name == 'pull_request' "
-        "&& contains(github.event.pull_request.labels.*.name, "
-        "'readability-zero-growth-approved') }}"
+        "READABILITY_ZERO_GROWTH_APPROVED: "
+        "${{ steps.readability-approval.outputs.approved }}"
     ) in job
     assert "healthcare-mrf-exact-prepush-receipt" in job
     assert "healthcare-prepush-receipt/receipt.txt" in job
