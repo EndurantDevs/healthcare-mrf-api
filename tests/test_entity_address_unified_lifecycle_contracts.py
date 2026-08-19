@@ -74,7 +74,7 @@ def _configure_source_harness(monkeypatch, environment_flag_by_name, runtime_opt
     monkeypatch.setattr(
         entity_address,
         "_is_task_or_env_enabled",
-        lambda *_args, **_kwargs: runtime_option_by_name["serving_only"],
+        lambda _task, key, *_args, **_kwargs: runtime_option_by_name.get(key, False),
     )
     monkeypatch.setattr(
         entity_address,
@@ -148,7 +148,7 @@ def _configure_materialization_harness(monkeypatch):
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_NAME_INFERENCE": True,
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_BROAD_INFERENCE": True,
     }
-    runtime_option_by_name = {"serving_only": True}
+    runtime_option_by_name = {"serving_only_refresh": True}
     _configure_database_harness(monkeypatch, sql_events)
     _configure_source_harness(monkeypatch, environment_flag_by_name, runtime_option_by_name)
     _configure_support_harness(monkeypatch, progress_events)
@@ -189,7 +189,7 @@ async def test_materialization_lifecycle_keeps_publish_separate_and_records_revi
 
     environment_flag_by_name["HLTHPRT_ENTITY_ADDRESS_UNIFIED_CHUNKED_LOAD"] = False
     environment_flag_by_name["HLTHPRT_ENTITY_ADDRESS_UNIFIED_COMPACT_SOURCE_RECORD_IDS"] = False
-    runtime_option_by_name["serving_only"] = False
+    runtime_option_by_name["serving_only_refresh"] = False
     import_context_by_key["context"]["stage_indexes_prepared"] = False
     import_context_by_key["context"]["support_stage_prepared"] = False
     import_context_by_key["context"]["support_stage_populated"] = False

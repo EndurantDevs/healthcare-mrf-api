@@ -451,8 +451,9 @@ def test_provider_directory_source_selects_are_guarded_by_table_availability():
     assert "provider_directory_organization_affiliation AS affiliation" not in selects[0]
 
 
-def test_serving_only_refresh_task_bool_overrides_env(monkeypatch):
+def test_entity_address_task_bool_overrides_env(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SERVING_ONLY", "false")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE", "false")
 
     assert (
         entity_address_unified._is_task_or_env_enabled(
@@ -471,4 +472,13 @@ def test_serving_only_refresh_task_bool_overrides_env(monkeypatch):
             False,
         )
         is False
+    )
+    assert (
+        entity_address_unified._is_task_or_env_enabled(
+            {"reuse_raw_stage": True},
+            "reuse_raw_stage",
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE",
+            False,
+        )
+        is True
     )

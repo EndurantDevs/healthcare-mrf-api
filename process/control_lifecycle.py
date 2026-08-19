@@ -723,6 +723,8 @@ def _terminal_metrics_from_context(context: Any) -> dict[str, Any] | None:
         "source_table_shards",
         "source_select_count",
         "source_concurrency",
+        "raw_stage_reused",
+        "raw_stage_reused_rows",
         "raw_location_key_index_skipped",
         "enrich_shards",
         "enrich_concurrency",

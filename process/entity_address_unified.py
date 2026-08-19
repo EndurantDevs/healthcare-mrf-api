@@ -11538,17 +11538,22 @@ async def process_entity_address_unified_data(ctx, task=None):
         )
         raw_table = _raw_stage_table_name(stage_table)
         use_unlogged_raw = _is_env_enabled("HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_RAW_STAGE", True)
-        should_reuse_raw_stage = _is_env_enabled("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE", False)
+        should_reuse_raw_stage = _is_task_or_env_enabled(
+            task,
+            "reuse_raw_stage",
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE",
+            False,
+        )
         if should_reuse_raw_stage:
             if not await _has_table(db_schema, raw_table):
                 raise RuntimeError(
-                    f"HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE requested, "
+                    "entity-address-unified raw-stage reuse requested, "
                     f"but {db_schema}.{raw_table} does not exist"
                 )
             raw_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{raw_table};") or 0)
             if raw_rows <= 0:
                 raise RuntimeError(
-                    f"HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE requested, "
+                    "entity-address-unified raw-stage reuse requested, "
                     f"but {db_schema}.{raw_table} is empty"
                 )
             context["raw_stage_reused"] = True
@@ -13178,6 +13183,7 @@ async def run_entity_address_unified_command(
     publish: bool | None = None,
     refresh_mode: str | None = None,
     serving_only_refresh: bool | None = None,
+    reuse_raw_stage: bool | None = None,
     provider_directory_run_id: str | None = None,
     provider_directory_source_ids: list[str] | tuple[str, ...] | str | None = None,
     provider_directory_dataset_id: str | None = None,
@@ -13199,6 +13205,8 @@ async def run_entity_address_unified_command(
         task_payload_map["refresh_mode"] = refresh_mode
     if serving_only_refresh is not None:
         task_payload_map["serving_only_refresh"] = bool(serving_only_refresh)
+    if reuse_raw_stage is not None:
+        task_payload_map["reuse_raw_stage"] = bool(reuse_raw_stage)
     if provider_directory_run_id:
         task_payload_map["provider_directory_run_id"] = provider_directory_run_id
     source_ids = _coerce_str_list(provider_directory_source_ids)

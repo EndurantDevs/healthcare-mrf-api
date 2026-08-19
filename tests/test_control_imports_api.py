@@ -270,6 +270,10 @@ def test_importer_registry_exposes_entity_address_params():
         for param in importer_by_name["entity-address-unified"]["params_schema"]
     )
     assert any(
+        param["name"] == "reuse_raw_stage" and param["type"] == "boolean"
+        for param in importer_by_name["entity-address-unified"]["params_schema"]
+    )
+    assert any(
         param["name"] == "refresh_mode" and param["type"] == "choice"
         for param in importer_by_name["entity-address-unified"]["params_schema"]
     )
