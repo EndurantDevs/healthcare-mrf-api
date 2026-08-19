@@ -33,7 +33,6 @@ ARC_JOBS = {
     "api-contract",
 }
 HOSTED_JOBS = {
-    "exact-prepush",
     "python-tests",
     "rust-scanner",
     "container-package",

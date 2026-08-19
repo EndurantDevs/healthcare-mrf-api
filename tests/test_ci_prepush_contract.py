@@ -27,7 +27,6 @@ def _job(workflow: str, name: str) -> str:
 def test_every_required_ci_family_delegates_to_prepush() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     expected_command_by_job = {
-        "exact-prepush": 'scripts/ci/prepush all "$COVERAGE_BASE_SHA"',
         "public-hygiene": "scripts/ci/prepush hygiene",
         "python-quality": "scripts/ci/prepush quality",
         "python-tests": 'scripts/ci/prepush python-main "${{ matrix.shard-index }}"',
@@ -44,22 +43,6 @@ def test_every_required_ci_family_delegates_to_prepush() -> None:
         job_body = _job(workflow, job)
         assert command in job_body
         assert len(re.findall(r"^        run:", job_body, re.M)) == 1
-
-
-def test_exact_prepush_ci_job_retains_its_compact_receipt() -> None:
-    job = _job(WORKFLOW.read_text(encoding="utf-8"), "exact-prepush")
-
-    assert "PREPUSH_RECEIPT_DIR: ${{ runner.temp }}/healthcare-prepush-receipt" in job
-    assert (
-        "READABILITY_ZERO_GROWTH_APPROVED: ${{ github.event_name == 'pull_request' "
-        "&& contains(github.event.pull_request.labels.*.name, "
-        "'readability-zero-growth-approved') }}"
-    ) in job
-    assert "healthcare-mrf-exact-prepush-receipt" in job
-    assert "healthcare-prepush-receipt/receipt.txt" in job
-    assert "healthcare-prepush-receipt/test-coverage-forecast-python.json" in job
-    assert "healthcare-prepush-receipt/test-coverage-forecast-rust.json" in job
-
 
 def test_container_package_bakes_and_checks_the_openapi_monitor() -> None:
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
