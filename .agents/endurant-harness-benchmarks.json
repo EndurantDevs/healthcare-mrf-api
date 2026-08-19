@@ -133,6 +133,115 @@
       "primary_metric": "dataset_publication_seconds",
       "minimum_improvement_fraction": 0.1
     },
+    "provider-directory-retained-publication": {
+      "command": {
+        "argv": [
+          "python3",
+          "-m",
+          "tests.provider_directory_retained_benchmark"
+        ],
+        "timeout": 3600,
+        "env": {
+          "DB_SCHEMA": "mrf",
+          "HLTHPRT_DB_DATABASE": "provider_directory_retained_benchmark_test",
+          "HLTHPRT_DB_DRIVER": "asyncpg",
+          "HLTHPRT_DB_HOST": "127.0.0.1",
+          "HLTHPRT_DB_PASSWORD": "postgres",
+          "HLTHPRT_DB_POOL_MAX_SIZE": "8",
+          "HLTHPRT_DB_POOL_MIN_SIZE": "1",
+          "HLTHPRT_DB_PORT": "5440",
+          "HLTHPRT_DB_SCHEMA": "mrf",
+          "HLTHPRT_DB_USER": "postgres",
+          "HLTHPRT_CONTROL_RUN_DB_UPDATE_THROTTLE_SECONDS": "0",
+          "HLTHPRT_PROVIDER_DIRECTORY_BENCHMARK_CATALOG_SHA256": "fedb11b545b5f30862dc0a18b9771afa5d7d0038e4ca6a882c54566fdff3c766",
+          "HLTHPRT_UHC_PROVIDER_FILE_ADMISSION_CONCURRENCY": "2",
+          "HLTHPRT_UHC_PROVIDER_FILE_DOWNLOAD_CONCURRENCY": "4",
+          "HLTHPRT_UHC_SEMANTIC_BIN": "support/ptg2_scanner/target/release/uhc_semantic_facts",
+          "HLTHPRT_UHC_SEMANTIC_FILE_CONCURRENCY": "4",
+          "PYTHONDONTWRITEBYTECODE": "1"
+        },
+        "evidence": "integration"
+      },
+      "source_files": [
+        "process/provider_directory_fhir.py",
+        "process/uhc_final_publication_contract.py",
+        "process/uhc_official_file_acquisition.py",
+        "process/uhc_provider_file_admission.py",
+        "process/uhc_retained_dataset.py",
+        "process/uhc_semantic_build_store.py",
+        "support/ptg2_scanner/src/bin/uhc_semantic_facts.rs",
+        "support/ptg2_scanner/src/lib.rs",
+        "support/ptg2_scanner/src/npi_identifier.rs",
+        "support/ptg2_scanner/src/uhc_retained.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/core.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/filesystem.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/json_framing.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/publication.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/range_build.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/replay.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/retain.rs",
+        "support/ptg2_scanner/src/uhc_retained_parts/verification.rs",
+        "support/ptg2_scanner/src/uhc_semantic.rs"
+      ],
+      "workload_files": [
+        "tests/provider_directory_retained_benchmark.py",
+        "tests/test_uhc_provider_file_admission.py",
+        "support/ptg2_scanner/Cargo.toml",
+        "support/ptg2_scanner/Cargo.lock",
+        "requirements-ci.lock"
+      ],
+      "correctness_keys": [
+        "input_identity",
+        "retained_acquisition",
+        "dataset",
+        "publication",
+        "cleanup"
+      ],
+      "metric_schema": {
+        "pipeline_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "post_validation_to_publication_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "acquisition_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "semantic_build_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "canonical_materialization_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "publication_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "cleanup_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "replay_pipeline_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        }
+      },
+      "primary_metric": "post_validation_to_publication_seconds",
+      "minimum_improvement_fraction": 0.1
+    },
     "entity-address-alias-integrity": {
       "command": {
         "argv": [
