@@ -1566,6 +1566,11 @@ def pharmacy_economics(test: bool):
     default=None,
     help="Publish only the denormalized serving table and leave support tables unchanged.",
 )
+@click.option(
+    "--reuse-raw-stage/--reload-raw-stage",
+    default=None,
+    help="Reuse the current import-date raw stage after validating its address generation.",
+)
 @click.option("--provider-directory-run-id", help="Provider Directory FHIR run id to scope provider-directory-partial.")
 @click.option(
     "--provider-directory-source-id",
@@ -1592,6 +1597,8 @@ def entity_address_unified(**options):
     options["provider_directory_source_ids"] = list(
         options.pop("provider_directory_source_id")
     )
+    if options["reuse_raw_stage"] is None:
+        options.pop("reuse_raw_stage")
     if options["provider_directory_dataset_id"] is None:
         options.pop("provider_directory_dataset_id")
     _run(initiate_entity_address_unified(**options))
