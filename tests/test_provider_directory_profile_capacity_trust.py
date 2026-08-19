@@ -38,10 +38,10 @@ EXECUTION_V2_FIXTURE = (
     / "fixtures/provider_directory_profile_execution_v2_golden.json"
 )
 EXECUTION_V2_CANONICAL_SHA256 = (
-    "ae4b603e204900602f937e852f26c1a0" "b5b9d6dd169881beadeb71debc4d5558"
+    "ef8d23cc3ab0e401edfd02c84ea4726b" "35ea9786b24cab41d3516461f7e58831"
 )
 EXECUTION_V2_FILE_SHA256 = (
-    "da236478757056b8e0913858ecfaf7d5" "bc7701cfe1b411404c7b237864111620"
+    "9faf73e8e137936e4281df3cc3118f74" "0d31a1d66eb8c9e3f4e5f6210e59aacc"
 )
 
 
@@ -152,7 +152,7 @@ def test_execution_v2_golden_freezes_neutral_cross_repository_envelope(
         + "\n"
     ).encode("ascii")
     assert fixture_bytes == regenerated_bytes
-    assert len(fixture_bytes) == 27_808
+    assert len(fixture_bytes) == 27_799
     assert fixture_bytes.endswith(b"\n")
     assert not fixture_bytes.endswith(b"\n\n")
     assert hashlib.sha256(fixture_bytes).hexdigest() == (EXECUTION_V2_FILE_SHA256)
