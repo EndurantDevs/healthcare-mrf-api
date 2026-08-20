@@ -170,6 +170,7 @@ def test_site_intelligence_pharmacy_geo_stmt_uses_legacy_by_default(site_intel_m
 
     assert "npi_address" in compiled
     assert "entity_address_unified" not in compiled
+    assert "address_precision" not in compiled
     assert "npi_taxonomy" in compiled
     assert "3336" in compiled
 
@@ -192,7 +193,12 @@ def test_site_intelligence_pharmacy_geo_stmt_uses_unified_addresses(site_intel_m
 
     assert "entity_address_unified" in compiled
     assert "npi_address" not in compiled
+    assert "coalesce" in compiled
+    assert "address_precision" in compiled
+    assert "city_zip" in compiled
     assert "npi_taxonomy" in compiled
+    assert "healthcare_provider_taxonomy_code" in compiled
+    assert "taxonomy_array" not in compiled
     assert "3336" in compiled
 
 
