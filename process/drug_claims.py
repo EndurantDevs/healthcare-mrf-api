@@ -760,34 +760,63 @@ async def _is_column_present(schema: str, table: str, column: str) -> bool:
     return bool(value)
 
 
-async def _ensure_indexes(obj: type, db_schema: str) -> None:
-    if hasattr(obj, "__my_index_elements__") and obj.__my_index_elements__:
-        cols = ", ".join(obj.__my_index_elements__)
+async def _ensure_indexes(model: type, db_schema: str) -> None:
+    additional_indexes = getattr(model, "__my_additional_indexes__", ()) or ()
+    trigram_operator_schema = None
+    if any(
+        " gin_trgm_ops" in element
+        for index_definition in additional_indexes
+        for element in index_definition.get("index_elements", ())
+    ):
+        trigram_operator_schema = await db.scalar(
+            """
+            SELECT quote_ident(namespace_record.nspname)
+              FROM pg_extension AS extension_record
+              JOIN pg_namespace AS namespace_record
+                ON namespace_record.oid = extension_record.extnamespace
+             WHERE extension_record.extname = 'pg_trgm'
+            """
+        )
+        if not trigram_operator_schema:
+            raise RuntimeError("pg_trgm extension is required for trigram indexes")
+
+    index_elements = getattr(model, "__my_index_elements__", ()) or ()
+    if index_elements:
+        cols = ", ".join(index_elements)
         await db.status(
             "CREATE UNIQUE INDEX IF NOT EXISTS "
-            + f"{obj.__tablename__}_idx_primary ON {db_schema}.{obj.__tablename__} ({cols});"
+            + f"{model.__tablename__}_idx_primary ON {db_schema}.{model.__tablename__} ({cols});"
         )
-    if hasattr(obj, "__my_additional_indexes__") and obj.__my_additional_indexes__:
-        for idx in obj.__my_additional_indexes__:
-            elements = idx.get("index_elements")
-            if not elements:
-                continue
-            base_name = idx.get("name") or f"{obj.__tablename__}_{'_'.join(elements)}_idx"
-            if getattr(obj, "__main_table__", obj.__tablename__) != obj.__tablename__:
-                name = f"{obj.__tablename__}_{base_name}"
-            else:
-                name = base_name
-            using = idx.get("using")
-            where = idx.get("where")
-            cols = ", ".join(elements)
-            statement = f"CREATE INDEX IF NOT EXISTS {name} ON {db_schema}.{obj.__tablename__}"
-            if using:
-                statement += f" USING {using}"
-            statement += f" ({cols})"
-            if where:
-                statement += f" WHERE {where}"
-            statement += ";"
-            await db.status(statement)
+    for index_definition in additional_indexes:
+        elements = index_definition.get("index_elements")
+        if not elements:
+            continue
+        if trigram_operator_schema and any(
+            " gin_trgm_ops" in element for element in elements
+        ):
+            elements = tuple(
+                element.replace(
+                    " gin_trgm_ops",
+                    f" {trigram_operator_schema}.gin_trgm_ops",
+                )
+                for element in elements
+            )
+        base_name = index_definition.get("name") or f"{model.__tablename__}_{'_'.join(elements)}_idx"
+        if getattr(model, "__main_table__", model.__tablename__) != model.__tablename__:
+            name = f"{model.__tablename__}_{index_definition.get('staging_name') or base_name}"
+        else:
+            name = base_name
+        using = index_definition.get("using")
+        where = index_definition.get("where")
+        cols = ", ".join(elements)
+        statement = f"CREATE INDEX IF NOT EXISTS {name} ON {db_schema}.{model.__tablename__}"
+        if using:
+            statement += f" USING {using}"
+        statement += f" ({cols})"
+        if where:
+            statement += f" WHERE {where}"
+        statement += ";"
+        await db.status(statement)
 
 
 async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str, type], str]:
@@ -2637,8 +2666,9 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                 if not elements:
                     continue
                 base_name = index.get("name") or f"{table}_{'_'.join(elements)}_idx"
+                staging_name = index.get("staging_name") or base_name
                 await db.status(
-                    f"ALTER INDEX IF EXISTS {schema}.{staging_class.__tablename__}_{base_name} RENAME TO {base_name};"
+                    f"ALTER INDEX IF EXISTS {schema}.{staging_class.__tablename__}_{staging_name} RENAME TO {base_name};"
                 )
 
 
