@@ -267,6 +267,99 @@ async def _table_row_count(table: str) -> int:
     return int(_row_mapping(count_query_rows[0])["row_count"]) if count_query_rows else 0
 
 
+def _quoted_table(schema: str, table: str) -> str:
+    quoted_schema = '"' + schema.replace('"', '""') + '"'
+    quoted_table = '"' + table.replace('"', '""') + '"'
+    return f"{quoted_schema}.{quoted_table}"
+
+
+async def _terminology_relation_oids(schema: str) -> tuple[int | None, int | None]:
+    live_table = TerminologySynonym.__tablename__
+    rows = await db.all(
+        "SELECT to_regclass(:live_relation)::oid::bigint AS live_oid, "
+        "to_regclass(:old_relation)::oid::bigint AS old_oid;",
+        live_relation=_quoted_table(schema, live_table),
+        old_relation=_quoted_table(schema, f"{live_table}_old"),
+    )
+    values = _row_mapping(rows[0]) if rows else {}
+    return (
+        int(values["live_oid"]) if values.get("live_oid") is not None else None,
+        int(values["old_oid"]) if values.get("old_oid") is not None else None,
+    )
+
+
+async def _require_terminology_relation_oids(
+    schema: str,
+    expected_oids: tuple[int, int],
+    mismatch_message: str,
+) -> None:
+    actual_oids = await _terminology_relation_oids(schema)
+    if None in actual_oids:
+        raise RuntimeError("terminology live or predecessor relation is missing")
+    if actual_oids != expected_oids:
+        raise RuntimeError(mismatch_message)
+
+
+async def _has_table_rows(table: str) -> bool:
+    rows = await db.all(
+        f"SELECT EXISTS (SELECT 1 FROM {table}) AS has_rows;"
+    )
+    return bool(_row_mapping(rows[0])["has_rows"]) if rows else False
+
+
+async def _rollback_terminology_snapshot(
+    schema: str,
+    *,
+    expected_live_oid: int,
+    expected_old_oid: int,
+) -> dict[str, Any]:
+    """Atomically restore the exact retained predecessor relation."""
+    expected_oids = (expected_live_oid, expected_old_oid)
+    if any(type(oid) is not int or not 1 <= oid <= 4_294_967_295 for oid in expected_oids):
+        raise ValueError("expected relation identities must be PostgreSQL OIDs")
+    if expected_live_oid == expected_old_oid:
+        raise ValueError("expected live and predecessor OIDs must be distinct")
+
+    await _require_terminology_relation_oids(
+        schema,
+        expected_oids,
+        "terminology relation identity changed before rollback",
+    )
+    live_table = TerminologySynonym.__tablename__
+    old_table = f"{live_table}_old"
+    swap_table = f"{live_table}_rollback_swap"
+    live_relation = _quoted_table(schema, live_table)
+    old_relation = _quoted_table(schema, old_table)
+    swap_relation = _quoted_table(schema, swap_table)
+
+    async with db.transaction():
+        await db.status(
+            f"LOCK TABLE {old_relation}, {live_relation} IN ACCESS EXCLUSIVE MODE;"
+        )
+        await _require_terminology_relation_oids(
+            schema,
+            expected_oids,
+            "terminology relation identity changed while acquiring locks",
+        )
+        if not await _has_table_rows(old_relation):
+            raise RuntimeError("terminology predecessor is empty")
+
+        await db.status(f"ALTER TABLE {live_relation} RENAME TO \"{swap_table}\";")
+        await db.status(f"ALTER TABLE {old_relation} RENAME TO \"{live_table}\";")
+        await db.status(f"ALTER TABLE {swap_relation} RENAME TO \"{old_table}\";")
+        await _require_terminology_relation_oids(
+            schema,
+            (expected_old_oid, expected_live_oid),
+            "terminology rollback verification failed",
+        )
+
+    return {
+        "live_oid": expected_old_oid,
+        "predecessor_oid": expected_live_oid,
+        "schema": schema,
+    }
+
+
 async def _publish_stage(schema: str, stage_cls, expected_row_count: int) -> None:
     if expected_row_count == 0:
         raise RuntimeError("refusing to publish an empty terminology snapshot")
@@ -349,3 +442,26 @@ async def main(
         return await import_terminology_synonyms(test_mode=test_mode, import_id=import_id)
     finally:
         await db.disconnect()
+
+
+async def rollback_terminology_snapshot(
+    *,
+    expected_live_oid: int,
+    expected_old_oid: int,
+) -> dict[str, Any]:
+    """Connect, roll back the exact terminology snapshot, and disconnect."""
+    await init_db(db)
+    try:
+        return await _rollback_terminology_snapshot(
+            _schema(),
+            expected_live_oid=expected_live_oid,
+            expected_old_oid=expected_old_oid,
+        )
+    finally:
+        original_error = sys.exception()
+        try:
+            await db.disconnect()
+        except Exception:
+            if original_error is None:
+                raise
+            logger.exception("Failed to disconnect after terminology rollback")

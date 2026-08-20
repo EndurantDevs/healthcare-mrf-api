@@ -2,6 +2,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+import json
 import logging.config
 import os
 import subprocess
@@ -207,6 +208,40 @@ def _positive_int(value) -> int | None:
 @click.group()
 def manage():
     """Utility commands for maintaining an existing deployment."""
+
+
+@manage.command("rollback-terminology-synonyms")
+@click.option(
+    "--expected-live-oid",
+    required=True,
+    type=click.IntRange(1, 4_294_967_295),
+    help="Exact current terminology_synonym relation OID.",
+)
+@click.option(
+    "--expected-old-oid",
+    required=True,
+    type=click.IntRange(1, 4_294_967_295),
+    help="Exact retained terminology_synonym_old relation OID.",
+)
+def rollback_terminology_synonyms(
+    expected_live_oid: int,
+    expected_old_oid: int,
+) -> None:
+    """Restore the exact retained terminology predecessor."""
+    from process.terminology_synonyms import rollback_terminology_snapshot
+
+    try:
+        result = _run_async(
+            rollback_terminology_snapshot(
+                expected_live_oid=expected_live_oid,
+                expected_old_oid=expected_old_oid,
+            )
+        )
+    except Exception:
+        raise click.ClickException(
+            "terminology synonym rollback failed"
+        ) from None
+    click.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 
 @manage.command("sync-structure")
