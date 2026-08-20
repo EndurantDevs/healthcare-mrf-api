@@ -5156,6 +5156,43 @@ class PricingProviderPrescription(Base, JSONOutputMixin):
     ge65_total_benes = Column(Float)
 
 
+class PricingProviderPrescriptionAutocomplete(Base, JSONOutputMixin):
+    __tablename__ = "pricing_provider_rx_rollup"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "year",
+            "rx_code_system",
+            "rx_code",
+            "variant_id",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+    __my_index_elements__ = [
+        "year",
+        "rx_code_system",
+        "rx_code",
+        "variant_id",
+    ]
+
+    year = Column(Integer, nullable=False)
+    rx_code_system = Column(String(32), nullable=False)
+    rx_code = Column(String(64), nullable=False)
+    variant_id = Column(BigInteger, nullable=False)
+    rx_name = Column(String)
+    generic_name = Column(String)
+    brand_name = Column(String)
+    total_claims = Column(Float)
+    total_drug_cost = Column(
+        Numeric(asdecimal=False, decimal_return_scale=None)
+    )
+    total_benes = Column(Float)
+    source_relation_fingerprint = Column(String(128), nullable=False)
+
+
 class PricingQppProvider(Base, JSONOutputMixin):
     __tablename__ = "pricing_qpp_provider"
     __main_table__ = __tablename__

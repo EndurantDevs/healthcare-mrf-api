@@ -64,6 +64,7 @@ async def _production_query():
         [
             FakeResult(scalar="mrf.pricing_provider_prescription"),
             FakeResult(scalar=None),
+            FakeResult(scalar=None),
             FakeResult(rows=[]),
         ],
         args={"q": "aspirin", "year": "2023", "limit": "1"},

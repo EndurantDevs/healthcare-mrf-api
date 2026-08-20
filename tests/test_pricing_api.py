@@ -201,6 +201,20 @@ def _provider_prescription_queries(request):
     ]
 
 
+def _autocomplete_prescription_row(total=1):
+    return {
+        "_pagination_total": total,
+        "rx_code_system": "HP_RX_CODE",
+        "rx_code": "ABC123",
+        "rx_name": "Lisinopril",
+        "generic_name": "Lisinopril",
+        "brand_name": "Prinivil",
+        "total_claims": 500,
+        "total_drug_cost": 1800.0,
+        "total_benes": 420,
+    }
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("param_name", ("clinical_intent", "intent"))
 async def test_raw_procedure_search_rejects_resolver_only_intent(param_name):
@@ -2591,6 +2605,7 @@ async def test_autocomplete_prescriptions_returns_generic_and_brand():
         [
             FakeResult(scalar="mrf.pricing_provider_prescription"),
             FakeResult(scalar=None),
+            FakeResult(scalar=None),
             FakeResult(
                 rows=[
                     {
@@ -2613,6 +2628,8 @@ async def test_autocomplete_prescriptions_returns_generic_and_brand():
     response = await autocomplete_prescriptions(request)
     pricing_response = json.loads(response.body)
     assert pricing_response["pagination"]["total"] == 3
+    assert pricing_response["query"]["year"] == 2023
+    assert pricing_response["query"]["year_source"] == "request"
     pricing_item = pricing_response["items"][0]
     assert "_pagination_total" not in pricing_item
     assert pricing_item["generic_name"] == "Lisinopril"
@@ -2629,10 +2646,120 @@ async def test_autocomplete_prescriptions_returns_generic_and_brand():
 
 
 @pytest.mark.asyncio
+async def test_autocomplete_prescriptions_uses_current_rollup():
+    request = make_request(
+        [
+            FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=None),
+            FakeResult(scalar="mrf.pricing_provider_rx_rollup"),
+            FakeResult(rows=[_autocomplete_prescription_row(total=3)]),
+        ],
+        args={"q": "lisin", "year": "2023"},
+    )
+
+    pricing_response = json.loads((await autocomplete_prescriptions(request)).body)
+    data_queries = _provider_prescription_queries(request)
+
+    assert pricing_response["pagination"]["total"] == 3
+    assert len(data_queries) == 1
+    assert "pricing_provider_rx_rollup" in data_queries[0]
+    assert "source_relation_fingerprint" in data_queries[0]
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_prescriptions_keeps_provider_default_year(monkeypatch):
+    monkeypatch.setattr(pricing_module, "PRICING_DEFAULT_YEAR", None)
+    request = make_request(
+        [
+            FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=2023),
+            FakeResult(scalar=None),
+            FakeResult(scalar="mrf.pricing_provider_rx_rollup"),
+            FakeResult(rows=[_autocomplete_prescription_row()]),
+        ],
+        args={"q": "lisin"},
+    )
+
+    pricing_response = json.loads((await autocomplete_prescriptions(request)).body)
+
+    assert pricing_response["query"]["year"] == 2023
+    assert pricing_response["query"]["year_source"] == "data_max"
+    assert pricing_response["items"][0]["prescription_code"] == "ABC123"
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_prescriptions_stale_rollup_falls_back():
+    request = make_request(
+        [
+            FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=None),
+            FakeResult(scalar="mrf.pricing_provider_rx_rollup"),
+            FakeResult(rows=[]),
+            FakeResult(scalar=0),
+            FakeResult(rows=[_autocomplete_prescription_row()]),
+        ],
+        args={"q": "lisin", "year": "2023"},
+    )
+
+    pricing_response = json.loads((await autocomplete_prescriptions(request)).body)
+    data_queries = _provider_prescription_queries(request)
+
+    assert pricing_response["pagination"]["total"] == 1
+    assert len(data_queries) == 3
+    assert "pricing_provider_rx_rollup" in data_queries[0]
+    assert "pricing_provider_rx_rollup" in data_queries[1]
+    assert "pricing_provider_rx_rollup" not in data_queries[2]
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_prescriptions_stale_rollup_keeps_empty_page_total():
+    request = make_request(
+        [
+            FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=None),
+            FakeResult(scalar="mrf.pricing_provider_rx_rollup"),
+            FakeResult(rows=[]),
+            FakeResult(scalar=0),
+            FakeResult(scalar=0),
+            FakeResult(rows=[]),
+            FakeResult(scalar=3),
+        ],
+        args={"q": "lisin", "year": "2023", "limit": "1", "offset": "5"},
+    )
+
+    pricing_response = json.loads((await autocomplete_prescriptions(request)).body)
+
+    assert pricing_response["items"] == []
+    assert pricing_response["pagination"]["total"] == 3
+    assert pricing_response["pagination"]["page"] == 6
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_prescriptions_current_rollup_no_match():
+    request = make_request(
+        [
+            FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=None),
+            FakeResult(scalar="mrf.pricing_provider_rx_rollup"),
+            FakeResult(rows=[]),
+            FakeResult(scalar=1),
+        ],
+        args={"q": "no-match", "year": "2023"},
+    )
+
+    pricing_response = json.loads((await autocomplete_prescriptions(request)).body)
+
+    assert pricing_response["items"] == []
+    assert pricing_response["pagination"]["total"] == 0
+    assert len(_provider_prescription_queries(request)) == 2
+
+
+@pytest.mark.asyncio
 async def test_autocomplete_prescriptions_empty_first_page_uses_one_query():
     request = make_request(
         [
             FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=None),
             FakeResult(scalar=None),
             FakeResult(rows=[]),
         ],
@@ -2652,6 +2779,7 @@ async def test_autocomplete_prescriptions_enriches_ndc_and_rxnorm_codes():
     request = make_request(
         [
             FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=None),
             FakeResult(scalar=None),
             FakeResult(
                 rows=[
@@ -2703,6 +2831,7 @@ async def test_autocomplete_prescriptions_preserves_total_beyond_last_page():
     request = make_request(
         [
             FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=None),
             FakeResult(scalar=None),
             FakeResult(rows=[]),
             FakeResult(scalar=3),
