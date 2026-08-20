@@ -2378,7 +2378,7 @@ paths:
           in: query
           schema:
             type: string
-          description: One or more NPI values to filter, comma-separated when multiple are supplied
+          description: Exact 10-digit NPI value to filter
         - name: count_only
           in: query
           schema:
@@ -2405,7 +2405,7 @@ paths:
           in: query
           schema:
             type: string
-          description: Alias for `show`
+          description: Optional result view mode (currently `sitemap`); distinct from `show` enrichment
         - name: include_total
           in: query
           schema:
@@ -2615,6 +2615,11 @@ paths:
           in: query
           schema:
             type: string
+        - name: specialization
+          in: query
+          schema:
+            type: string
+          description: Exact NUCC specialization filter
         - name: section
           in: query
           schema:
@@ -2653,12 +2658,12 @@ paths:
           in: query
           schema:
             type: string
-          description: Comma-separated ZIP codes used when coordinates are missing
+          description: Comma-separated ZIP or ZIP+4 values used when coordinates are missing; each is normalized to ZIP5
         - name: radius
           in: query
           schema:
             type: integer
-          description: Search radius in miles (defaults to 10, overridden to 1000 for ZIP lookups)
+          description: Search radius in miles (defaults to 10 for coordinates and 25 for ZIP lookups; an explicit value is always honored)
         - name: procedure_codes
           in: query
           schema:

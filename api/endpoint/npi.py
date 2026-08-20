@@ -9094,6 +9094,14 @@ async def list_providers(request):
         provider_npi_sql = (
             "COALESCE(c.npi, c.inferred_npi)" if is_unified_search else "c.npi"
         )
+        npi_where, npi_params = _build_npi_where_clause(
+            "b",
+            name_like_values,
+            first_name,
+            last_name,
+            organization_name,
+            entity_type_code,
+        )
         taxonomy_clauses = []
         include_service_locations = _is_unified_address_table(address_table_sql)
         address_clauses = [
@@ -9119,6 +9127,7 @@ async def list_providers(request):
         use_location_first_taxonomy = _is_location_first_taxonomy_filter(
             use_taxonomy_filter,
             (
+                npi_where,
                 city,
                 state,
                 zip_code,
@@ -9161,14 +9170,6 @@ async def list_providers(request):
                 ")"
             )
         dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
-        npi_where, npi_params = _build_npi_where_clause(
-            "b",
-            name_like_values,
-            first_name,
-            last_name,
-            organization_name,
-            entity_type_code,
-        )
         lightweight_candidate_columns = tuple(
             dict.fromkeys(
                 NPI_LOCATION_CANDIDATE_COLUMNS
@@ -10229,6 +10230,7 @@ async def get_near_npi(request):
     if plan_network_ids:
         plan_network_ids = [int(x) for x in plan_network_ids.split(",")]
     classification = request.args.get("classification")
+    specialization = request.args.get("specialization")
     section = request.args.get("section")
     display_name = request.args.get("display_name")
     procedure_codes_raw = request.args.get("procedure_codes")
@@ -10260,8 +10262,11 @@ async def get_near_npi(request):
     for zip_c in request.args.get("zip_codes", "").split(","):
         if not zip_c:
             continue
-        zip_codes.append(zip_c.strip().rjust(5, "0"))
-    radius = int(request.args.get("radius", 10))
+        zip_codes.append(
+            _normalize_zip_code(zip_c.strip().rjust(5, "0"), "zip_codes")
+        )
+    has_coordinates = in_long is not None and in_lat is not None
+    radius = int(request.args.get("radius", 25 if zip_codes and not has_coordinates else 10))
 
     requested_procedure_codes = _parse_code_tokens(procedure_codes_raw, "procedure_codes")
     requested_medication_codes = _parse_code_tokens(medication_codes_raw, "medication_codes")
@@ -10376,7 +10381,7 @@ async def get_near_npi(request):
 
     _validate_section_filters(section, classification, codes)
     # If only zip was provided, resolve to coordinates first using a separate connection.
-    if (not (in_long and in_lat)) and zip_codes and zip_codes[0]:
+    if not has_coordinates and zip_codes and zip_codes[0]:
         zip_sql = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
         async with db.acquire() as conn_zip:
             for coordinate_record in await conn_zip.all(text(zip_sql), zip_code=zip_codes[0]):
@@ -10459,12 +10464,12 @@ async def get_near_npi(request):
 
     taxonomy_clauses: list[str] = []
     if zip_codes:
-        # Default to a reasonable search radius when zip is used; avoid huge fan-out.
-        radius = 25
         extra_filters.append(_address_zip5_filter("a", address_table_sql, any_array=True))
 
     if classification:
         taxonomy_clauses.append("classification = :classification")
+    if specialization:
+        taxonomy_clauses.append("specialization = :specialization")
     if section:
         taxonomy_clauses.append("section = :section")
     if display_name:
@@ -10486,6 +10491,7 @@ async def get_near_npi(request):
         "in_long": in_long,
         "in_lat": in_lat,
         "classification": classification,
+        "specialization": specialization,
         "radius": radius,
         "exclude_npi": exclude_npi,
         "section": section,

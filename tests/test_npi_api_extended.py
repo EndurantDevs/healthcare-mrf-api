@@ -596,7 +596,7 @@ async def test_get_near_npi_with_lat_long_uses_knn_without_bbox_params(monkeypat
     monkeypatch.setattr(npi_module, "db", FakeDB())
 
     request = types.SimpleNamespace(
-        args={"lat": "41.0", "long": "-87.0", "radius": "10", "limit": "1"},
+        args={"lat": "41.0", "long": "-87.0", "zip_codes": "60601", "limit": "1"},
         app=types.SimpleNamespace(),
     )
     response = await npi_module.get_near_npi(request)
@@ -607,6 +607,7 @@ async def test_get_near_npi_with_lat_long_uses_knn_without_bbox_params(monkeypat
     assert "max_lat" not in captured_query_map
     assert "min_long" not in captured_query_map
     assert "max_long" not in captured_query_map
+    assert captured_query_map["radius"] == 10
 
 
 @pytest.mark.asyncio
@@ -1219,6 +1220,53 @@ async def test_get_near_npi_with_filters(monkeypatch):
     response = await npi_module.get_near_npi(request)
     response_body = json.loads(response.body)
     assert response_body[0]["npi"] == 5556667778
+
+
+@pytest.mark.parametrize(
+    ("raw_zip", "expected_zip"),
+    [("60601-1234", "60601"), ("1234", "01234")],
+)
+@pytest.mark.asyncio
+async def test_get_near_npi_honors_zip_radius_and_specialization(
+    monkeypatch, raw_zip, expected_zip
+):
+    captured_query_map = {}
+
+    class RecordingConnection:
+        async def all(self, sql, **params):
+            sql_text = str(sql)
+            if "from zcta5" in sql_text:
+                captured_query_map["zip_code"] = params["zip_code"]
+                return [{"intptlat": "41.0", "intptlon": "-87.0"}]
+            captured_query_map["sql"] = sql_text
+            captured_query_map["params"] = dict(params)
+            return [_build_near_row(5556667778)]
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    class FakeDB:
+        def acquire(self):
+            return FakeAcquire(RecordingConnection())
+
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+    request = types.SimpleNamespace(
+        args={
+            "zip_codes": raw_zip,
+            "radius": "7",
+            "specialization": "Family Medicine",
+            "limit": "1",
+        },
+        app=types.SimpleNamespace(),
+    )
+
+    response = await npi_module.get_near_npi(request)
+
+    assert len(json.loads(response.body)) == 1
+    assert captured_query_map["zip_code"] == expected_zip
+    assert "specialization = :specialization" in captured_query_map["sql"]
+    assert captured_query_map["params"]["specialization"] == "Family Medicine"
+    assert captured_query_map["params"]["radius"] == 7
 
 
 @pytest.mark.asyncio

@@ -397,6 +397,29 @@ async def test_get_all_zip_taxonomy_uses_location_first_probe(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_all_name_taxonomy_uses_same_location_first_probe_as_count(monkeypatch):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    request = types.SimpleNamespace(
+        args={
+            "q": "clinic",
+            "codes": "207Q00000X",
+            "include_total": "false",
+            "limit": "10",
+            "start": "0",
+        }
+    )
+    await get_all(request)
+
+    page_sql = conn.sql_calls[-1][0]
+    assert "filtered_npi AS" in page_sql
+    assert "JOIN LATERAL" in page_sql
+    assert "FROM mrf.npi_taxonomy AS provider_taxonomy" in page_sql
+    assert "c.taxonomy_array && q.int_codes" not in page_sql
+
+
+@pytest.mark.asyncio
 async def test_get_all_zip_phone_and_name_filters_are_applied(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
