@@ -384,6 +384,8 @@ async def test_materialize_publish_orders_staged_contract(
     monkeypatch,
     defer_indexes,
 ):
+    """Preserve every materialization step and its publication order."""
+
     calls = []
 
     async def record_call(name, return_value=None):
@@ -395,38 +397,34 @@ async def test_materialize_publish_orders_staged_contract(
         "CLAIMS_DEFER_STAGE_INDEXES",
         defer_indexes,
     )
-    monkeypatch.setattr(
-        claims_pricing,
-        "_ensure_live_code_tables",
-        lambda _schema: record_call("codes"),
-    )
-    monkeypatch.setattr(
-        claims_pricing,
-        "_materialize_code_and_crosswalk_rows",
-        lambda *_args: record_call("crosswalk"),
-    )
-    monkeypatch.setattr(
-        claims_pricing,
-        "_materialize_cost_level_rows",
-        lambda *_args: record_call("cost"),
-    )
+    for function_name, call_name in (
+        ("_ensure_live_code_tables", "codes"),
+        ("_materialize_code_and_crosswalk_rows", "crosswalk"),
+        ("_materialize_procedure_provider_counts", "provider_counts"),
+        ("_materialize_procedure_taxonomy_signals", "taxonomy_signals"),
+        ("_materialize_cost_level_rows", "cost"),
+        ("_build_staging_indexes", "indexes"),
+        ("_publish_by_table_rename", "publish"),
+    ):
+        monkeypatch.setattr(
+            claims_pricing,
+            function_name,
+            lambda *_args, name=call_name: record_call(name),
+        )
     monkeypatch.setattr(
         claims_pricing,
         "_collect_cost_level_diagnostics",
         lambda *_args: record_call("diagnostics", {"key_coverage": []}),
     )
-    monkeypatch.setattr(
-        claims_pricing,
-        "_build_staging_indexes",
-        lambda *_args: record_call("indexes"),
-    )
-    monkeypatch.setattr(
-        claims_pricing,
-        "_publish_by_table_rename",
-        lambda *_args: record_call("publish"),
-    )
     diagnostics = await claims_pricing._materialize_and_publish_claims({}, "mrf")
-    expected_calls = ["codes", "crosswalk", "cost", "diagnostics"]
+    expected_calls = [
+        "codes",
+        "crosswalk",
+        "provider_counts",
+        "taxonomy_signals",
+        "cost",
+        "diagnostics",
+    ]
     if defer_indexes:
         expected_calls.append("indexes")
     assert calls == [*expected_calls, "publish"]

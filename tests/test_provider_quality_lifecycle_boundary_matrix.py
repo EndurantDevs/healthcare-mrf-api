@@ -300,7 +300,10 @@ async def test_finalize_publishes_sharded_degraded_run_and_cleans_workdir(
     calls_by_name["materialize_sharded"].assert_awaited_once()
     calls_by_name["indexes"].assert_awaited_once()
     assert calls_by_name["metadata"].await_args.kwargs["status"] == "degraded_test"
-    calls_by_name["release"].assert_awaited_once_with(redis, "manifest-run")
+    calls_by_name["release"].assert_awaited_once_with(
+        redis,
+        "provider_quality:manifest-run",
+    )
 
 
 @pytest.mark.asyncio
@@ -355,7 +358,10 @@ async def test_finalize_retry_releases_global_lock_without_failure_mark(
         )
 
     calls_by_name["failed"].assert_not_awaited()
-    calls_by_name["release"].assert_awaited_once_with(redis, "run")
+    calls_by_name["release"].assert_awaited_once_with(
+        redis,
+        "provider_quality:run",
+    )
 
 
 @pytest.mark.asyncio

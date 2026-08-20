@@ -21,7 +21,7 @@ import sanic.exceptions
 from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage
 from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, case, cast,
-                        func, or_, select, text)
+                        func, literal, literal_column, or_, select, text)
 
 from api.billing_search_http import serve_billing_search_get
 from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
@@ -114,7 +114,11 @@ from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        PricingProviderProcedure,
                        PricingProviderProcedureCostProfile,
                        PricingProviderProcedureLocation,
+                       PricingProcedureTaxonomySignal,
                        PricingProcedurePeerStats, TerminologySynonym)
+from db.procedure_taxonomy_signal_sql import (
+    procedure_taxonomy_signal_fingerprint_sql,
+)
 from process.ptg_parts.allowed_amounts import PTG2_ALLOWED_AMOUNT_CONTRACT
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
@@ -173,6 +177,7 @@ provider_procedure_table = PricingProviderProcedure.__table__
 location_table = PricingProviderProcedureLocation.__table__
 provider_procedure_cost_profile_table = PricingProviderProcedureCostProfile.__table__
 procedure_peer_stats_table = PricingProcedurePeerStats.__table__
+procedure_taxonomy_signal_table = PricingProcedureTaxonomySignal.__table__
 prescription_table = PricingPrescription.__table__
 provider_prescription_table = PricingProviderPrescription.__table__
 code_catalog_table = CodeCatalog.__table__
@@ -414,6 +419,16 @@ def _parse_pricing_default_year() -> int | None:
 
 PRICING_DEFAULT_YEAR = _parse_pricing_default_year()
 PRICING_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+_PROCEDURE_TAXONOMY_SIGNAL_FINGERPRINT_SQL = (
+    procedure_taxonomy_signal_fingerprint_sql(
+        schema=PRICING_SCHEMA,
+        provider_table=PricingProvider.__tablename__,
+        provider_procedure_table=PricingProviderProcedure.__tablename__,
+        quality_feature_table=QUALITY_FEATURE_TABLE_NAME,
+        npi_taxonomy_table=NPIDataTaxonomy.__tablename__,
+        nucc_taxonomy_table=NUCCTaxonomy.__tablename__,
+    )
+)
 ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
 ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 GROUP_PLAN_LEGACY_ADDRESS_TYPES = ("primary", "secondary")
@@ -4208,6 +4223,79 @@ def _apply_ordering(query, order_by: str, order: str, field_map: dict[str, Any])
     return query.order_by(column.desc())
 
 
+async def _precomputed_procedure_provider_count(
+    session,
+    *,
+    year: int,
+    procedure_code: int,
+) -> int | None:
+    result = await session.execute(
+        select(procedure_table.c.provider_count)
+        .where(
+            and_(
+                procedure_table.c.procedure_code == procedure_code,
+                procedure_table.c.source_year == year,
+            )
+        )
+        .limit(1)
+    )
+    value = result.scalar()
+    return _as_int(value) if value is not None else None
+
+
+def _single_procedure_provider_page_query(
+    *,
+    year: int,
+    procedure_code: int,
+    order: str,
+    limit: int,
+    offset: int,
+):
+    query = (
+        select(
+            provider_procedure_table.c.npi.label("npi"),
+            provider_table.c.provider_name.label("provider_name"),
+            provider_table.c.provider_type.label("provider_type"),
+            provider_table.c.city.label("city"),
+            provider_table.c.state.label("state"),
+            provider_table.c.zip5.label("zip5"),
+            provider_procedure_table.c.total_services.label("total_services"),
+            provider_procedure_table.c.total_submitted_charges.label(
+                "total_submitted_charges"
+            ),
+            provider_procedure_table.c.total_allowed_amount.label(
+                "total_allowed_amount"
+            ),
+            provider_procedure_table.c.total_beneficiaries.label(
+                "total_beneficiaries"
+            ),
+            literal(1).label("matched_service_codes"),
+        )
+        .select_from(
+            provider_procedure_table.join(
+                provider_table,
+                and_(
+                    provider_table.c.npi == provider_procedure_table.c.npi,
+                    provider_table.c.year == provider_procedure_table.c.year,
+                ),
+            )
+        )
+        .where(
+            and_(
+                provider_procedure_table.c.year == year,
+                provider_procedure_table.c.procedure_code == procedure_code,
+            )
+        )
+    )
+    amount = provider_procedure_table.c.total_allowed_amount
+    npi = provider_procedure_table.c.npi
+    query = query.order_by(
+        amount.asc() if order == "asc" else amount.desc(),
+        npi.desc() if order == "asc" else npi.asc(),
+    )
+    return query.limit(limit).offset(offset)
+
+
 async def _query_crosswalk_edges(session, pairs: set[tuple[str, str]]) -> list[dict[str, Any]]:
     if not pairs:
         return []
@@ -4708,6 +4796,38 @@ async def _load_procedure_taxonomy_evidence(
     if cached_evidence_items is not None:
         return cached_evidence_items
 
+    if (
+        len(internal_codes) == 1
+        and await _is_table_available(
+            session,
+            procedure_taxonomy_signal_table.name,
+        )
+    ):
+        quality_evidence_items = await _load_precomputed_procedure_taxonomy_evidence(
+            session,
+            year=year,
+            internal_code=internal_codes[0],
+            evidence_source="quality_feature",
+            limit=limit,
+        )
+        if _has_representative_procedure_taxonomy_evidence(quality_evidence_items):
+            return _procedure_taxonomy_evidence_cache_set(
+                cache_key,
+                quality_evidence_items,
+            )
+        fallback_evidence_items = await _load_precomputed_procedure_taxonomy_evidence(
+            session,
+            year=year,
+            internal_code=internal_codes[0],
+            evidence_source="quality_or_nppes",
+            limit=limit,
+        )
+        if fallback_evidence_items:
+            return _procedure_taxonomy_evidence_cache_set(
+                cache_key,
+                fallback_evidence_items,
+            )
+
     quality_feature_exists = await _is_table_available(session, QUALITY_FEATURE_TABLE_NAME)
     if quality_feature_exists:
         quality_evidence_items = await _load_quality_procedure_taxonomy_evidence(
@@ -4832,6 +4952,53 @@ async def _load_procedure_taxonomy_evidence(
         for evidence_row in query_result
     ]
     return _procedure_taxonomy_evidence_cache_set(cache_key, evidence_items)
+
+
+async def _load_precomputed_procedure_taxonomy_evidence(
+    session,
+    *,
+    year: int,
+    internal_code: int,
+    evidence_source: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Load one bounded evidence basis from the published signal table."""
+
+    query_result = await session.execute(
+        select(
+            procedure_taxonomy_signal_table.c.taxonomy_code,
+            procedure_taxonomy_signal_table.c.classification,
+            procedure_taxonomy_signal_table.c.specialization,
+            procedure_taxonomy_signal_table.c.display_name,
+            procedure_taxonomy_signal_table.c.distinct_npis,
+            procedure_taxonomy_signal_table.c.total_services,
+            procedure_taxonomy_signal_table.c.total_beneficiaries,
+            procedure_taxonomy_signal_table.c.provider_types,
+        )
+        .where(
+            and_(
+                procedure_taxonomy_signal_table.c.year == year,
+                procedure_taxonomy_signal_table.c.procedure_code == internal_code,
+                procedure_taxonomy_signal_table.c.setting_key == "all",
+                procedure_taxonomy_signal_table.c.evidence_source
+                == evidence_source,
+                procedure_taxonomy_signal_table.c.source_relation_fingerprint
+                == literal_column(
+                    _PROCEDURE_TAXONOMY_SIGNAL_FINGERPRINT_SQL
+                ),
+            )
+        )
+        .order_by(
+            procedure_taxonomy_signal_table.c.distinct_npis.desc(),
+            procedure_taxonomy_signal_table.c.total_services.desc(),
+            procedure_taxonomy_signal_table.c.taxonomy_code.asc(),
+        )
+        .limit(limit)
+    )
+    return [
+        _taxonomy_evidence_item(_row_to_dict(evidence_row))
+        for evidence_row in query_result
+    ]
 
 
 async def _load_quality_procedure_taxonomy_evidence(
@@ -11421,63 +11588,90 @@ async def list_providers_by_procedure(request):
         )
     where_clause = and_(*filters)
 
-    grouped = (
-        select(
-            provider_procedure_table.c.npi.label("npi"),
-            provider_table.c.provider_name.label("provider_name"),
-            provider_table.c.provider_type.label("provider_type"),
-            provider_table.c.city.label("city"),
-            provider_table.c.state.label("state"),
-            provider_table.c.zip5.label("zip5"),
-            func.sum(provider_procedure_table.c.total_services).label("total_services"),
-            func.sum(provider_procedure_table.c.total_submitted_charges).label("total_submitted_charges"),
-            func.sum(provider_procedure_table.c.total_allowed_amount).label("total_allowed_amount"),
-            func.sum(provider_procedure_table.c.total_beneficiaries).label("total_beneficiaries"),
-            func.count(func.distinct(provider_procedure_table.c.procedure_code)).label("matched_service_codes"),
+    total = None
+    if (
+        len(internal_codes) == 1
+        and not query_text
+        and not state
+        and not city
+        and not zip5
+        and provider_type_clause is None
+        and provider_sex_code is None
+        and min_claims is None
+        and min_total_cost is None
+        and order_by == "total_allowed_amount"
+    ):
+        total = await _precomputed_procedure_provider_count(
+            session,
+            year=year,
+            procedure_code=internal_codes[0],
         )
-        .select_from(provider_procedure_from)
-        .where(where_clause)
-        .group_by(
-            provider_procedure_table.c.npi,
-            provider_table.c.provider_name,
-            provider_table.c.provider_type,
-            provider_table.c.city,
-            provider_table.c.state,
-            provider_table.c.zip5,
+    if total is not None:
+        query = _single_procedure_provider_page_query(
+            year=year,
+            procedure_code=internal_codes[0],
+            order=order,
+            limit=pagination.limit,
+            offset=pagination.offset,
         )
-    )
-    grouped_subquery = grouped.subquery()
-    count_result = await session.execute(select(func.count()).select_from(grouped_subquery))
-    total = int(count_result.scalar() or 0)
-
-    cost_index_expr = case(
-        (
-            grouped_subquery.c.total_services > 0,
-            cast(grouped_subquery.c.total_allowed_amount, Float) / grouped_subquery.c.total_services,
-        ),
-        else_=None,
-    ).label("cost_index")
-
-    if order_by == "cost_index":
-        query = select(grouped_subquery, cost_index_expr)
     else:
-        query = select(grouped_subquery)
-    query = _apply_ordering(
-        query,
-        order_by,
-        order,
-        {
-            "npi": grouped_subquery.c.npi,
-            "provider_name": grouped_subquery.c.provider_name,
-            "total_services": grouped_subquery.c.total_services,
-            "total_submitted_charges": grouped_subquery.c.total_submitted_charges,
-            "total_allowed_amount": grouped_subquery.c.total_allowed_amount,
-            "total_beneficiaries": grouped_subquery.c.total_beneficiaries,
-            "matched_service_codes": grouped_subquery.c.matched_service_codes,
-            "cost_index": cost_index_expr,
-        },
-    )
-    query = query.limit(pagination.limit).offset(pagination.offset)
+        grouped = (
+            select(
+                provider_procedure_table.c.npi.label("npi"),
+                provider_table.c.provider_name.label("provider_name"),
+                provider_table.c.provider_type.label("provider_type"),
+                provider_table.c.city.label("city"),
+                provider_table.c.state.label("state"),
+                provider_table.c.zip5.label("zip5"),
+                func.sum(provider_procedure_table.c.total_services).label("total_services"),
+                func.sum(provider_procedure_table.c.total_submitted_charges).label("total_submitted_charges"),
+                func.sum(provider_procedure_table.c.total_allowed_amount).label("total_allowed_amount"),
+                func.sum(provider_procedure_table.c.total_beneficiaries).label("total_beneficiaries"),
+                func.count(func.distinct(provider_procedure_table.c.procedure_code)).label("matched_service_codes"),
+            )
+            .select_from(provider_procedure_from)
+            .where(where_clause)
+            .group_by(
+                provider_procedure_table.c.npi,
+                provider_table.c.provider_name,
+                provider_table.c.provider_type,
+                provider_table.c.city,
+                provider_table.c.state,
+                provider_table.c.zip5,
+            )
+        )
+        grouped_subquery = grouped.subquery()
+        count_result = await session.execute(select(func.count()).select_from(grouped_subquery))
+        total = int(count_result.scalar() or 0)
+
+        cost_index_expr = case(
+            (
+                grouped_subquery.c.total_services > 0,
+                cast(grouped_subquery.c.total_allowed_amount, Float) / grouped_subquery.c.total_services,
+            ),
+            else_=None,
+        ).label("cost_index")
+
+        if order_by == "cost_index":
+            query = select(grouped_subquery, cost_index_expr)
+        else:
+            query = select(grouped_subquery)
+        query = _apply_ordering(
+            query,
+            order_by,
+            order,
+            {
+                "npi": grouped_subquery.c.npi,
+                "provider_name": grouped_subquery.c.provider_name,
+                "total_services": grouped_subquery.c.total_services,
+                "total_submitted_charges": grouped_subquery.c.total_submitted_charges,
+                "total_allowed_amount": grouped_subquery.c.total_allowed_amount,
+                "total_beneficiaries": grouped_subquery.c.total_beneficiaries,
+                "matched_service_codes": grouped_subquery.c.matched_service_codes,
+                "cost_index": cost_index_expr,
+            },
+        )
+        query = query.limit(pagination.limit).offset(pagination.offset)
     query_result = await session.execute(query)
     provider_items = [_normalize_provider_service_aggregate(_row_to_dict(provider_record), include_legacy=include_legacy_fields) for provider_record in query_result]
     if zip5 and provider_items:

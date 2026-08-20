@@ -34,7 +34,7 @@ async def _ensure_indexes(model_class: type, db_schema: str) -> None:
                 continue
             base_name = idx.get("name") or f"{model_class.__tablename__}_{'_'.join(elements)}_idx"
             if getattr(model_class, "__main_table__", model_class.__tablename__) != model_class.__tablename__:
-                name = f"{model_class.__tablename__}_{base_name}"
+                name = f"{model_class.__tablename__}_{idx.get('staging_name') or base_name}"
             else:
                 name = base_name
             name = _index_name_for_table(model_class.__tablename__, name)

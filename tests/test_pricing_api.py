@@ -3092,7 +3092,7 @@ async def test_load_procedure_taxonomy_evidence_uses_cache(monkeypatch):
     ]
 
     async def has_fake_table(_session, _table_name):
-        return True
+        return _table_name == pricing_module.QUALITY_FEATURE_TABLE_NAME
 
     async def fake_load_quality(_session, *, year, internal_codes, limit):
         assert year == 2023

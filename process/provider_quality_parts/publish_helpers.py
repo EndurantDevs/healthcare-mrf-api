@@ -21,7 +21,7 @@ from process.provider_quality_parts.execution_helpers import _push_objects_with_
 from process.provider_quality_parts.lifecycle import _archived_identifier
 from process.provider_quality_parts.model_helpers import _cohort_model_classes
 from process.provider_quality_parts.state import _safe_int
-from process.provider_quality_parts.table_helpers import _is_table_available
+from process.provider_quality_parts.table_helpers import _index_name_for_table, _is_table_available
 
 
 async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> None:
@@ -78,8 +78,10 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                     continue
                 base_name = index.get("name") or f"{table}_{'_'.join(elements)}_idx"
                 await archive_index(base_name)
+                staging_name = index.get("staging_name") or base_name
+                staged_index_name = _index_name_for_table(staged_model.__tablename__, f"{staged_model.__tablename__}_{staging_name}")
                 await db.status(
-                    f"ALTER INDEX IF EXISTS {schema}.{staged_model.__tablename__}_{base_name} RENAME TO {base_name};"
+                    f"ALTER INDEX IF EXISTS {schema}.{staged_index_name} RENAME TO {base_name};"
                 )
 
 

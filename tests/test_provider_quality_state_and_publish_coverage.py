@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from process.provider_quality_parts import publish_helpers, state
+from process.provider_quality_parts import publish_helpers, state, table_helpers
 
 
 class _MemoryRedis:
@@ -257,7 +257,21 @@ def _patch_publish_models(monkeypatch, live_classes):
 async def test_publish_renames_all_tables_and_indexes(monkeypatch) -> None:
     live_classes, stage_classes_by_name = _publish_classes()
     delattr(live_classes[-1], "__my_initial_indexes__")
-    delattr(live_classes[-1], "__my_additional_indexes__")
+    live_classes[-1].__my_additional_indexes__ = (
+        {
+            "index_elements": ("year", "procedure_code"),
+            "name": "procedure_taxonomy_signal_lookup_idx",
+            "staging_name": "taxonomy_lookup",
+        },
+    )
+    signal_stage = stage_classes_by_name[live_classes[-1].__name__]
+    signal_stage.__tablename__ = (
+        "procedure_taxonomy_signal_abcdefghijkl_12345678x"
+    )
+    staged_signal_index = table_helpers._index_name_for_table(
+        signal_stage.__tablename__,
+        f"{signal_stage.__tablename__}_taxonomy_lookup",
+    )
     database = _PublishDatabase()
     _patch_publish_models(monkeypatch, live_classes)
     monkeypatch.setattr(publish_helpers, "db", database)
@@ -273,6 +287,10 @@ async def test_publish_renames_all_tables_and_indexes(monkeypatch) -> None:
     assert "ALTER INDEX IF EXISTS mrf.stage_0_idx_primary" in statements
     assert "archived_live_0_npi" in statements
     assert "live_0_year_idx" in statements
+    assert (
+        f"ALTER INDEX IF EXISTS mrf.{staged_signal_index} "
+        "RENAME TO procedure_taxonomy_signal_lookup_idx"
+    ) in statements
 
 
 async def _async(value):

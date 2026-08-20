@@ -35,6 +35,8 @@ from db.models import (
     PricingProviderProcedureCostProfile,
     PricingProviderProcedure,
     PricingProviderProcedureLocation,
+    PricingProviderQualityFeature,
+    PricingProcedureTaxonomySignal,
     PricingProcedurePeerStats,
 )
 from process.ext.utils import (
@@ -50,6 +52,11 @@ from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 from process.control_lifecycle import mark_control_run
 from process.live_progress import enqueue_live_progress
+from process.procedure_taxonomy_signals import materialize_procedure_taxonomy_signals
+from process.provider_quality_parts.state import (
+    _has_global_finalize_lock,
+    _release_global_finalize_lock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +211,7 @@ def _staging_classes(stage_suffix: str, schema: str) -> dict[str, type]:
             PricingProviderProcedureCostProfile,
             PricingProcedurePeerStats,
             PricingProcedureGeoBenchmark,
+            PricingProcedureTaxonomySignal,
         )
     }
 
@@ -695,7 +703,7 @@ async def _ensure_indexes(obj: type, db_schema: str) -> None:
                 continue
             base_name = idx.get("name") or f"{obj.__tablename__}_{'_'.join(elements)}_idx"
             if getattr(obj, "__main_table__", obj.__tablename__) != obj.__tablename__:
-                name = f"{obj.__tablename__}_{base_name}"
+                name = f"{obj.__tablename__}_{idx.get('staging_name') or base_name}"
             else:
                 name = base_name
             using = idx.get("using")
@@ -724,6 +732,7 @@ async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str,
         PricingProviderProcedureCostProfile,
         PricingProcedurePeerStats,
         PricingProcedureGeoBenchmark,
+        PricingProcedureTaxonomySignal,
     ):
         obj = make_class(cls, stage_suffix, schema_override=db_schema)
         classes_by_name[cls.__name__] = obj
@@ -746,6 +755,7 @@ async def _build_staging_indexes(classes: dict[str, type], schema: str) -> None:
         "PricingProviderProcedureCostProfile",
         "PricingProcedurePeerStats",
         "PricingProcedureGeoBenchmark",
+        "PricingProcedureTaxonomySignal",
     ):
         await _ensure_indexes(classes[cls_name], schema)
 
@@ -2241,6 +2251,52 @@ async def _materialize_cost_level_rows(classes: dict[str, type], schema: str) ->
     )
 
 
+async def _materialize_procedure_provider_counts(
+    classes: dict[str, type],
+    schema: str,
+) -> None:
+    """Store the exact joined provider total for each staged procedure year."""
+
+    provider_table = classes["PricingProvider"].__tablename__
+    procedure_table = classes["PricingProcedure"].__tablename__
+    provider_procedure_table = classes["PricingProviderProcedure"].__tablename__
+    await db.status(
+        f"""
+        WITH provider_counts AS (
+            SELECT
+                pp.year,
+                pp.procedure_code,
+                COUNT(DISTINCT pp.npi)::int AS provider_count
+            FROM {schema}.{provider_procedure_table} pp
+            JOIN {schema}.{provider_table} p
+              ON p.npi = pp.npi
+             AND p.year = pp.year
+            GROUP BY pp.year, pp.procedure_code
+        )
+        UPDATE {schema}.{procedure_table} procedure
+        SET provider_count = counts.provider_count
+        FROM provider_counts counts
+        WHERE counts.procedure_code = procedure.procedure_code
+          AND counts.year = procedure.source_year;
+        """
+    )
+
+
+async def _materialize_procedure_taxonomy_signals(
+    classes: dict[str, type],
+    schema: str,
+) -> None:
+    """Build taxonomy signals from the claims generation being published."""
+
+    await materialize_procedure_taxonomy_signals(
+        schema=schema,
+        signal_model=classes.get("PricingProcedureTaxonomySignal"),
+        provider_model=classes["PricingProvider"],
+        provider_procedure_model=classes["PricingProviderProcedure"],
+        quality_feature_model=PricingProviderQualityFeature,
+    )
+
+
 async def _collect_cost_level_diagnostics(classes: dict[str, type], schema: str) -> dict[str, Any]:
     """Return publication-gate coverage diagnostics for cost-level tables."""
 
@@ -2382,6 +2438,7 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
         PricingProviderProcedureCostProfile,
         PricingProcedurePeerStats,
         PricingProcedureGeoBenchmark,
+        PricingProcedureTaxonomySignal,
     )
 
     async with db.transaction():
@@ -2410,8 +2467,9 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                 if not elements:
                     continue
                 base_name = index.get("name") or f"{table}_{'_'.join(elements)}_idx"
+                staging_name = index.get("staging_name") or base_name
                 await db.status(
-                    f"ALTER INDEX IF EXISTS {schema}.{staged_class.__tablename__}_{base_name} "
+                    f"ALTER INDEX IF EXISTS {schema}.{staged_class.__tablename__}_{staging_name} "
                     f"RENAME TO {base_name};"
                 )
 
@@ -3024,6 +3082,14 @@ async def _materialize_and_publish_claims(
         _materialize_code_and_crosswalk_rows(classes_by_name, schema),
     )
     await _timed_value(
+        "materialize procedure provider counts",
+        _materialize_procedure_provider_counts(classes_by_name, schema),
+    )
+    await _timed_value(
+        "materialize procedure taxonomy signals",
+        _materialize_procedure_taxonomy_signals(classes_by_name, schema),
+    )
+    await _timed_value(
         "materialize cost-level profile and peer stats",
         _materialize_cost_level_rows(classes_by_name, schema),
     )
@@ -3113,25 +3179,34 @@ async def _mark_claims_succeeded(finalize_spec: _ClaimsFinalizeSpec) -> None:
     )
 
 
+async def _already_finalized_claims_response(
+    redis: Any,
+    task_by_field: dict[str, Any],
+) -> dict[str, Any] | None:
+    run_id = str(task_by_field.get("run_id") or "")
+    if redis is None or not run_id:
+        return None
+    if not await redis.get(_state_key(run_id, "finalized")):
+        return None
+    return {
+        "ok": True,
+        "already_finalized": True,
+        "run_id": run_id,
+        "import_id": _normalize_import_id(task_by_field.get("import_id")),
+    }
+
+
 async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> dict[str, Any]:
     """Wait for all chunks, validate staging, and publish claims pricing."""
 
     task_by_field = task or {}
     redis = ctx.get("redis")
-    task_run_id = str(task_by_field.get("run_id") or "")
-    if (
-        redis is not None
-        and task_run_id
-        and await redis.get(_state_key(task_run_id, "finalized"))
-    ):
-        return {
-            "ok": True,
-            "already_finalized": True,
-            "run_id": task_run_id,
-            "import_id": _normalize_import_id(
-                task_by_field.get("import_id")
-            ),
-        }
+    early_response = await _already_finalized_claims_response(
+        redis,
+        task_by_field,
+    )
+    if early_response is not None:
+        return early_response
     manifest_path = str(task_by_field.get("manifest_path") or "")
     test_mode = bool(task_by_field.get("test_mode", False))
     await ensure_database(test_mode)
@@ -3141,7 +3216,12 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
     early_response = await _wait_for_claims_finalize_turn(redis, finalize_spec)
     if early_response is not None:
         return early_response
+    global_lock_owner = f"claims_pricing:{finalize_spec.run_id}"
+    has_global_lock = False
     try:
+        if not await _has_global_finalize_lock(redis, global_lock_owner):
+            raise Retry(defer=CLAIMS_FINISH_RETRY_SECONDS)
+        has_global_lock = True
         classes_by_name = _staging_classes(
             finalize_spec.stage_suffix,
             finalize_spec.schema,
@@ -3169,6 +3249,8 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
             "cost_level_diagnostics": cost_level_diagnostics,
         }
     finally:
+        if has_global_lock:
+            await _release_global_finalize_lock(redis, global_lock_owner)
         await _release_claims_finalize_lock_safely(redis, finalize_spec)
 
 

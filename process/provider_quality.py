@@ -50,6 +50,7 @@ from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 from process.control_lifecycle import mark_control_run
 from process.live_progress import enqueue_live_progress
+from process.procedure_taxonomy_signals import materialize_procedure_taxonomy_signals
 from process.provider_quality_parts.config import (
     COHORT_MODEL_CLASS_NAMES,
     DATASET_BY_KEY,
@@ -160,6 +161,7 @@ from process.provider_quality_parts.model_helpers import (
     PricingProviderQualityFeature,
     PricingProviderQualityPeerTarget,
     PricingProviderQualityProcedureLSH,
+    PricingProcedureTaxonomySignal,
     _build_stage_suffix,
     _chunk_job_id,
     _cohort_model_classes,
@@ -1545,6 +1547,21 @@ async def _materialize_quality_rows(classes: dict[str, type], schema: str, run_i
     )
 
 
+async def _materialize_procedure_taxonomy_signals(
+    classes: dict[str, type],
+    schema: str,
+) -> None:
+    """Build bounded procedure taxonomy evidence from staged quality features."""
+
+    await materialize_procedure_taxonomy_signals(
+        schema=schema,
+        signal_model=classes.get("PricingProcedureTaxonomySignal"),
+        provider_model=PricingProvider,
+        provider_procedure_model=PricingProviderProcedure,
+        quality_feature_model=classes.get("PricingProviderQualityFeature"),
+    )
+
+
 async def _enqueue_materialize_phase_shards(
     redis,
     *,
@@ -2030,6 +2047,7 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
     if not stage_suffix:
         stage_suffix = str(manifest.get("stage_suffix") or _build_stage_suffix(import_id_val, run_id))
 
+    global_lock_owner = f"provider_quality:{run_id}"
     has_global_lock = False
     if redis is not None and run_id:
         finalized_key = _state_key(run_id, "finalized")
@@ -2061,7 +2079,7 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
 
         if not await _has_finalize_lock(redis, run_id):
             raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
-        if not await _has_global_finalize_lock(redis, run_id):
+        if not await _has_global_finalize_lock(redis, global_lock_owner):
             raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
         has_global_lock = True
         await mark_control_run(
@@ -2104,6 +2122,10 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
             await _materialize_quality_rows(classes, schema, run_id)
         _step_end("materialize provider quality rows", step_started_at)
 
+        step_started_at = _step_start("materialize procedure taxonomy signals")
+        await _materialize_procedure_taxonomy_signals(classes, schema)
+        _step_end("materialize procedure taxonomy signals", step_started_at)
+
         if PROVIDER_QUALITY_DEFER_STAGE_INDEXES:
             step_started_at = _step_start("build provider quality staging indexes")
             await _build_staging_indexes(classes, schema)
@@ -2129,7 +2151,7 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
         raise
     finally:
         if redis is not None and run_id and has_global_lock:
-            await _release_global_finalize_lock(redis, run_id)
+            await _release_global_finalize_lock(redis, global_lock_owner)
 
     if manifest:
         run_work_dir = Path(manifest.get("work_dir", ""))
