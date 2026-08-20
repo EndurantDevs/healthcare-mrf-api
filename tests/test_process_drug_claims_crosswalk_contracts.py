@@ -92,6 +92,10 @@ async def test_prepare_tables_and_deferred_indexes_contract(monkeypatch):
             __tablename__="provider_stage",
             __table__="provider-table",
         ),
+        "PricingProviderPrescriptionAutocomplete": SimpleNamespace(
+            __tablename__="autocomplete_stage",
+            __table__="autocomplete-table",
+        ),
     }
     ensure_indexes = AsyncMock()
     monkeypatch.setattr(drug_claims, "db", database_probe)
@@ -107,12 +111,12 @@ async def test_prepare_tables_and_deferred_indexes_contract(monkeypatch):
     classes_by_name, schema = await drug_claims._prepare_tables("stage", False)
     assert schema == "synthetic"
     assert classes_by_name == staged_model_by_name
-    assert len(database_probe.created_tables) == 2
-    assert ensure_indexes.await_count == 2
+    assert len(database_probe.created_tables) == 3
+    assert ensure_indexes.await_count == 3
 
     ensure_indexes.reset_mock()
     await drug_claims._build_staging_indexes(staged_model_by_name, schema)
-    assert ensure_indexes.await_count == 2
+    assert ensure_indexes.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -137,6 +141,9 @@ async def test_materialization_runs_all_sql_contracts(monkeypatch):
     classes_by_name = {
         "PricingPrescription": SimpleNamespace(__tablename__="prescription_stage"),
         "PricingProviderPrescription": SimpleNamespace(__tablename__="provider_stage"),
+        "PricingProviderPrescriptionAutocomplete": SimpleNamespace(
+            __tablename__="autocomplete_stage"
+        ),
     }
     monkeypatch.setattr(drug_claims, "db", database_probe)
     monkeypatch.setattr(drug_claims, "_enrich_external_rx_crosswalk", enrich_crosswalk)

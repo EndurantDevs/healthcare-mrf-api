@@ -111,11 +111,15 @@ from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        NUCCTaxonomy, ProviderEnrichmentSummary,
                        PricingPrescription, PricingProvider,
                        PricingProviderPrescription,
+                       PricingProviderPrescriptionAutocomplete,
                        PricingProviderProcedure,
                        PricingProviderProcedureCostProfile,
                        PricingProviderProcedureLocation,
                        PricingProcedureTaxonomySignal,
                        PricingProcedurePeerStats, TerminologySynonym)
+from db.prescription_autocomplete_rollup_sql import (
+    prescription_autocomplete_source_fingerprint_sql,
+)
 from db.procedure_taxonomy_signal_sql import (
     procedure_taxonomy_signal_fingerprint_sql,
 )
@@ -180,6 +184,9 @@ procedure_peer_stats_table = PricingProcedurePeerStats.__table__
 procedure_taxonomy_signal_table = PricingProcedureTaxonomySignal.__table__
 prescription_table = PricingPrescription.__table__
 provider_prescription_table = PricingProviderPrescription.__table__
+provider_prescription_autocomplete_table = (
+    PricingProviderPrescriptionAutocomplete.__table__
+)
 code_catalog_table = CodeCatalog.__table__
 code_crosswalk_table = CodeCrosswalk.__table__
 terminology_synonym_table = TerminologySynonym.__table__
@@ -427,6 +434,12 @@ _PROCEDURE_TAXONOMY_SIGNAL_FINGERPRINT_SQL = (
         quality_feature_table=QUALITY_FEATURE_TABLE_NAME,
         npi_taxonomy_table=NPIDataTaxonomy.__tablename__,
         nucc_taxonomy_table=NUCCTaxonomy.__tablename__,
+    )
+)
+_PRESCRIPTION_AUTOCOMPLETE_FINGERPRINT_SQL = (
+    prescription_autocomplete_source_fingerprint_sql(
+        schema=PRICING_SCHEMA,
+        provider_table=PricingProviderPrescription.__tablename__,
     )
 )
 ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
@@ -10611,6 +10624,160 @@ async def list_provider_specialties(request):
     )
 
 
+def _prescription_autocomplete_grouped_subquery(
+    source_table,
+    *,
+    year: int,
+    q_like: str,
+    terminology_internal_codes: list[str],
+):
+    text_or_code_filters = [
+        func.lower(func.coalesce(source_table.c.rx_name, "")).like(q_like),
+        func.lower(func.coalesce(source_table.c.generic_name, "")).like(q_like),
+        func.lower(func.coalesce(source_table.c.brand_name, "")).like(q_like),
+        func.lower(func.coalesce(source_table.c.rx_code, "")).like(q_like),
+    ]
+    if terminology_internal_codes:
+        text_or_code_filters.append(
+            source_table.c.rx_code.in_(terminology_internal_codes)
+        )
+    filters = [
+        source_table.c.year == year,
+        source_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
+        or_(*text_or_code_filters),
+    ]
+    if "source_relation_fingerprint" in source_table.c:
+        filters.append(
+            source_table.c.source_relation_fingerprint
+            == literal_column(_PRESCRIPTION_AUTOCOMPLETE_FINGERPRINT_SQL)
+        )
+    return (
+        select(
+            source_table.c.rx_code_system.label("rx_code_system"),
+            source_table.c.rx_code.label("rx_code"),
+            func.max(source_table.c.rx_name).label("rx_name"),
+            func.max(source_table.c.generic_name).label("generic_name"),
+            func.max(source_table.c.brand_name).label("brand_name"),
+            func.sum(source_table.c.total_claims).label("total_claims"),
+            func.sum(source_table.c.total_drug_cost).label("total_drug_cost"),
+            func.sum(source_table.c.total_benes).label("total_benes"),
+        )
+        .where(and_(*filters))
+        .group_by(source_table.c.rx_code_system, source_table.c.rx_code)
+        .subquery()
+    )
+
+
+def _prescription_autocomplete_page_query(
+    grouped_subquery,
+    *,
+    q_prefix: str,
+    order_by: str,
+    order: str,
+    pagination,
+):
+    ranking = case(
+        (
+            func.lower(func.coalesce(grouped_subquery.c.generic_name, "")).like(
+                q_prefix
+            ),
+            0,
+        ),
+        (
+            func.lower(func.coalesce(grouped_subquery.c.brand_name, "")).like(
+                q_prefix
+            ),
+            1,
+        ),
+        (
+            func.lower(func.coalesce(grouped_subquery.c.rx_name, "")).like(
+                q_prefix
+            ),
+            2,
+        ),
+        (
+            func.lower(func.coalesce(grouped_subquery.c.rx_code, "")).like(
+                q_prefix
+            ),
+            3,
+        ),
+        else_=4,
+    )
+    query = select(
+        grouped_subquery,
+        func.count().over().label("_pagination_total"),
+    )
+    return _apply_ordering(
+        query.order_by(ranking.asc()),
+        order_by,
+        order,
+        {
+            "rx_code": grouped_subquery.c.rx_code,
+            "rx_name": grouped_subquery.c.rx_name,
+            "generic_name": grouped_subquery.c.generic_name,
+            "brand_name": grouped_subquery.c.brand_name,
+            "total_claims": grouped_subquery.c.total_claims,
+            "total_drug_cost": grouped_subquery.c.total_drug_cost,
+            "total_benes": grouped_subquery.c.total_benes,
+        },
+    ).limit(pagination.limit).offset(pagination.offset)
+
+
+async def _load_prescription_autocomplete_page(
+    session,
+    source_table,
+    *,
+    year: int,
+    search_query: str,
+    terminology_internal_codes: list[str],
+    order_by: str,
+    order: str,
+    pagination,
+) -> tuple[list[dict[str, Any]], int]:
+    q_like = f"%{search_query}%"
+    grouped_subquery = _prescription_autocomplete_grouped_subquery(
+        source_table,
+        year=year,
+        q_like=q_like,
+        terminology_internal_codes=terminology_internal_codes,
+    )
+    query_result = await session.execute(
+        _prescription_autocomplete_page_query(
+            grouped_subquery,
+            q_prefix=f"{search_query}%",
+            order_by=order_by,
+            order=order,
+            pagination=pagination,
+        )
+    )
+    prescription_rows = [
+        _row_to_dict(prescription_row) for prescription_row in query_result
+    ]
+    if prescription_rows:
+        return prescription_rows, int(
+            prescription_rows[0].get("_pagination_total") or 0
+        )
+    if pagination.offset:
+        count_result = await session.execute(
+            select(func.count()).select_from(grouped_subquery)
+        )
+        return prescription_rows, int(count_result.scalar() or 0)
+    return prescription_rows, 0
+
+
+async def _is_prescription_autocomplete_rollup_current(session) -> bool:
+    result = await session.execute(
+        select(literal(1))
+        .select_from(provider_prescription_autocomplete_table)
+        .where(
+            provider_prescription_autocomplete_table.c.source_relation_fingerprint
+            == literal_column(_PRESCRIPTION_AUTOCOMPLETE_FINGERPRINT_SQL)
+        )
+        .limit(1)
+    )
+    return result.scalar() == 1
+
+
 @blueprint.get("/prescriptions/autocomplete", name="pricing.prescriptions.autocomplete")
 @blueprint.get("/drugs/autocomplete", name="pricing.drugs.autocomplete")
 @blueprint.get("/medications/autocomplete", name="pricing.medications.autocomplete")
@@ -10643,8 +10810,6 @@ async def autocomplete_prescriptions(request):
         )
 
     year, year_source = await _resolve_year(session, provider_prescription_table, year)
-    q_like = f"%{search_query}%"
-    q_prefix = f"{search_query}%"
     terminology_matches = await _query_terminology(
         session,
         domain="medication",
@@ -10654,82 +10819,43 @@ async def autocomplete_prescriptions(request):
         limit=50,
     )
     terminology_internal_codes = await _internal_rx_codes_from_terminology(session, terminology_matches)
-    text_or_code_filters = [
-        func.lower(func.coalesce(provider_prescription_table.c.rx_name, "")).like(q_like),
-        func.lower(func.coalesce(provider_prescription_table.c.generic_name, "")).like(q_like),
-        func.lower(func.coalesce(provider_prescription_table.c.brand_name, "")).like(q_like),
-        func.lower(func.coalesce(provider_prescription_table.c.rx_code, "")).like(q_like),
-    ]
-    if terminology_internal_codes:
-        text_or_code_filters.append(provider_prescription_table.c.rx_code.in_(terminology_internal_codes))
-
-    filters = [
-        provider_prescription_table.c.year == year,
-        provider_prescription_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
-        or_(*text_or_code_filters),
-    ]
-    grouped_query = (
-        select(
-            provider_prescription_table.c.rx_code_system.label("rx_code_system"),
-            provider_prescription_table.c.rx_code.label("rx_code"),
-            func.max(provider_prescription_table.c.rx_name).label("rx_name"),
-            func.max(provider_prescription_table.c.generic_name).label("generic_name"),
-            func.max(provider_prescription_table.c.brand_name).label("brand_name"),
-            func.sum(provider_prescription_table.c.total_claims).label("total_claims"),
-            func.sum(provider_prescription_table.c.total_drug_cost).label("total_drug_cost"),
-            func.sum(provider_prescription_table.c.total_benes).label("total_benes"),
-        )
-        .where(and_(*filters))
-        .group_by(
-            provider_prescription_table.c.rx_code_system,
-            provider_prescription_table.c.rx_code,
-        )
-    )
-    grouped_subquery = grouped_query.subquery()
-
-    ranking = case(
-        (func.lower(func.coalesce(grouped_subquery.c.generic_name, "")).like(q_prefix), 0),
-        (func.lower(func.coalesce(grouped_subquery.c.brand_name, "")).like(q_prefix), 1),
-        (func.lower(func.coalesce(grouped_subquery.c.rx_name, "")).like(q_prefix), 2),
-        (func.lower(func.coalesce(grouped_subquery.c.rx_code, "")).like(q_prefix), 3),
-        else_=4,
-    )
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "total_claims").strip().lower()
-    query = select(
-        grouped_subquery,
-        func.count().over().label("_pagination_total"),
+    rollup_available = await _is_table_available(
+        session,
+        provider_prescription_autocomplete_table.name,
     )
-    query = _apply_ordering(
-        query.order_by(ranking.asc()),
-        order_by,
-        order,
-        {
-            "rx_code": grouped_subquery.c.rx_code,
-            "rx_name": grouped_subquery.c.rx_name,
-            "generic_name": grouped_subquery.c.generic_name,
-            "brand_name": grouped_subquery.c.brand_name,
-            "total_claims": grouped_subquery.c.total_claims,
-            "total_drug_cost": grouped_subquery.c.total_drug_cost,
-            "total_benes": grouped_subquery.c.total_benes,
-        },
+    source_table = (
+        provider_prescription_autocomplete_table
+        if rollup_available
+        else provider_prescription_table
     )
-    query = query.limit(pagination.limit).offset(pagination.offset)
-
-    prescription_result_cursor = await session.execute(query)
-    prescription_rows = [
-        _row_to_dict(prescription_row)
-        for prescription_row in prescription_result_cursor
-    ]
-    if prescription_rows:
-        total = int(prescription_rows[0].get("_pagination_total") or 0)
-    elif pagination.offset:
-        count_result = await session.execute(
-            select(func.count()).select_from(grouped_subquery)
+    prescription_rows, total = await _load_prescription_autocomplete_page(
+        session,
+        source_table,
+        year=year,
+        search_query=search_query,
+        terminology_internal_codes=terminology_internal_codes,
+        order_by=order_by,
+        order=order,
+        pagination=pagination,
+    )
+    if (
+        rollup_available
+        and not prescription_rows
+        and total == 0
+        and not await _is_prescription_autocomplete_rollup_current(session)
+    ):
+        prescription_rows, total = await _load_prescription_autocomplete_page(
+            session,
+            provider_prescription_table,
+            year=year,
+            search_query=search_query,
+            terminology_internal_codes=terminology_internal_codes,
+            order_by=order_by,
+            order=order,
+            pagination=pagination,
         )
-        total = int(count_result.scalar() or 0)
-    else:
-        total = 0
     prescription_items = []
     for prescription_item_by_field in prescription_rows:
         prescription_item_by_field.pop("_pagination_total", None)

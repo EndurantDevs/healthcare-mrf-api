@@ -36,6 +36,25 @@ class _PublishDatabase:
         return "mrf"
 
 
+def _assert_publish_contract(publish_database):
+    sql_statements = "\n".join(publish_database.statements)
+    assert publish_database.transaction_entries == 1
+    assert "DROP TABLE IF EXISTS mrf.pricing_prescription" in sql_statements
+    assert (
+        "ALTER TABLE mrf.prescription_stage "
+        "RENAME TO pricing_prescription"
+    ) in sql_statements
+    assert "ALTER TABLE IF EXISTS mrf.prescription_stage" not in sql_statements
+    assert "prescription_stage_pricing_prescription_rx_code_idx" in sql_statements
+    assert "prescription_stage_year_idx RENAME TO year_idx" in sql_statements
+    assert "provider_stage RENAME TO pricing_provider_prescription" in sql_statements
+    assert (
+        "provider_stage_rx_ac_gin "
+        "RENAME TO pricing_provider_rx_autocomplete_trgm_idx"
+    ) in sql_statements
+    assert "autocomplete_stage RENAME TO pricing_provider_rx_rollup" in sql_statements
+
+
 @pytest.mark.asyncio
 async def test_publish_renames_tables_and_declared_indexes(monkeypatch):
     prescription_model = type(
@@ -67,31 +86,24 @@ async def test_publish_renames_tables_and_declared_indexes(monkeypatch):
             ),
         },
     )
+    autocomplete_model = type(
+        "PricingProviderPrescriptionAutocomplete",
+        (),
+        {"__main_table__": "pricing_provider_rx_rollup"},
+    )
     staged_class_by_name = {
         "PricingPrescription": SimpleNamespace(__tablename__="prescription_stage"),
         "PricingProviderPrescription": SimpleNamespace(__tablename__="provider_stage"),
+        "PricingProviderPrescriptionAutocomplete": SimpleNamespace(__tablename__="autocomplete_stage"),
     }
     publish_database = _PublishDatabase()
     monkeypatch.setattr(drug_claims, "PricingPrescription", prescription_model)
     monkeypatch.setattr(drug_claims, "PricingProviderPrescription", provider_model)
+    monkeypatch.setattr(drug_claims, "PricingProviderPrescriptionAutocomplete", autocomplete_model)
     monkeypatch.setattr(drug_claims, "db", publish_database)
 
     await drug_claims._publish_by_table_rename(staged_class_by_name, "mrf")
-    sql_statements = "\n".join(publish_database.statements)
-    assert publish_database.transaction_entries == 1
-    assert "DROP TABLE IF EXISTS mrf.pricing_prescription" in sql_statements
-    assert (
-        "ALTER TABLE mrf.prescription_stage "
-        "RENAME TO pricing_prescription"
-    ) in sql_statements
-    assert "ALTER TABLE IF EXISTS mrf.prescription_stage" not in sql_statements
-    assert "prescription_stage_pricing_prescription_rx_code_idx" in sql_statements
-    assert "prescription_stage_year_idx RENAME TO year_idx" in sql_statements
-    assert "provider_stage RENAME TO pricing_provider_prescription" in sql_statements
-    assert (
-        "provider_stage_rx_ac_gin "
-        "RENAME TO pricing_provider_rx_autocomplete_trgm_idx"
-    ) in sql_statements
+    _assert_publish_contract(publish_database)
 
 
 @pytest.mark.asyncio

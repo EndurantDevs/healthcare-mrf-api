@@ -27,7 +27,11 @@ from arq import Retry, create_pool
 
 from db.connection import db
 from db.models import (CodeCatalog, CodeCrosswalk, PricingPrescription,
-                       PricingProviderPrescription)
+                       PricingProviderPrescription,
+                       PricingProviderPrescriptionAutocomplete)
+from db.prescription_autocomplete_rollup_sql import (
+    prescription_autocomplete_rollup_insert_sql,
+)
 from process.ext.utils import (download_it_and_save, ensure_database,
                                get_http_client, get_import_schema, make_class,
                                push_objects, return_checksum)
@@ -316,6 +320,7 @@ def _staging_classes(stage_suffix: str, schema: str) -> dict[str, type]:
         for cls in (
             PricingPrescription,
             PricingProviderPrescription,
+            PricingProviderPrescriptionAutocomplete,
         )
     }
 
@@ -827,6 +832,7 @@ async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str,
     for cls in (
         PricingPrescription,
         PricingProviderPrescription,
+        PricingProviderPrescriptionAutocomplete,
     ):
         obj = make_class(cls, stage_suffix, schema_override=db_schema)
         classes_by_name[cls.__name__] = obj
@@ -843,6 +849,7 @@ async def _build_staging_indexes(classes: dict[str, type], schema: str) -> None:
     for cls_name in (
         "PricingPrescription",
         "PricingProviderPrescription",
+        "PricingProviderPrescriptionAutocomplete",
     ):
         await _ensure_indexes(classes[cls_name], schema)
 
@@ -1569,11 +1576,19 @@ async def _materialize_prescription_and_code_rows(classes: dict[str, type], sche
 
     prescription_table = classes["PricingPrescription"].__tablename__
     provider_prescription_table = classes["PricingProviderPrescription"].__tablename__
+    autocomplete_table = classes[
+        "PricingProviderPrescriptionAutocomplete"
+    ].__tablename__
     code_catalog_table = CodeCatalog.__tablename__
     code_crosswalk_table = CodeCrosswalk.__tablename__
     await _materialize_prescription_rollup(
         schema,
         prescription_table,
+        provider_prescription_table,
+    )
+    await _materialize_prescription_autocomplete_rollup(
+        schema,
+        autocomplete_table,
         provider_prescription_table,
     )
     await _materialize_internal_code_catalog(schema, prescription_table, code_catalog_table)
@@ -1583,6 +1598,23 @@ async def _materialize_prescription_and_code_rows(classes: dict[str, type], sche
         prescription_table=prescription_table,
         code_catalog_table=code_catalog_table,
         code_crosswalk_table=code_crosswalk_table,
+    )
+
+
+async def _materialize_prescription_autocomplete_rollup(
+    schema: str,
+    autocomplete_table: str,
+    provider_prescription_table: str,
+) -> None:
+    """Build the exact name-variant rollup from the staged provider relation."""
+
+    await db.status(f"TRUNCATE TABLE {schema}.{autocomplete_table};")
+    await db.status(
+        prescription_autocomplete_rollup_insert_sql(
+            schema=schema,
+            rollup_table=autocomplete_table,
+            provider_table=provider_prescription_table,
+        )
     )
 
 
@@ -2638,6 +2670,7 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
     final_classes = (
         PricingPrescription,
         PricingProviderPrescription,
+        PricingProviderPrescriptionAutocomplete,
     )
 
     async with db.transaction():
