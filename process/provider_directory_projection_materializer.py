@@ -14,6 +14,7 @@ from db.connection import db
 from process.provider_directory_projection_child_read import (
     claimed_projection_child_read_lease,
     heartbeat_projection_child_read_lease,
+    projection_retained_child_stream,
     verify_projection_child_read_lease,
 )
 import process.provider_directory_projection_db as projection_db
@@ -468,7 +469,9 @@ async def materialize_projection_shards(
     lease: ProjectionLease,
     admission_id: str,
     *,
-    child_stream_factory: ProjectionChildStreamFactory,
+    child_stream_factory: ProjectionChildStreamFactory = (
+        projection_retained_child_stream
+    ),
     native_runner: ProjectionNativeRunner = run_native_projection_command,
     framing_resolver: Callable[..., Awaitable[str]] = projection_shard_input_framing,
     database: Any = db,
