@@ -1222,6 +1222,47 @@ async def test_get_near_npi_with_filters(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_near_npi_honors_zip_radius_and_specialization(monkeypatch):
+    captured = {}
+
+    class RecordingConnection:
+        async def all(self, sql, **params):
+            sql_text = str(sql)
+            if "from zcta5" in sql_text:
+                captured["zip_code"] = params["zip_code"]
+                return [{"intptlat": "41.0", "intptlon": "-87.0"}]
+            captured["sql"] = sql_text
+            captured["params"] = dict(params)
+            return [_build_near_row(5556667778)]
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    class FakeDB:
+        def acquire(self):
+            return FakeAcquire(RecordingConnection())
+
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+    request = types.SimpleNamespace(
+        args={
+            "zip_codes": "60601-1234",
+            "radius": "7",
+            "specialization": "Family Medicine",
+            "limit": "1",
+        },
+        app=types.SimpleNamespace(),
+    )
+
+    response = await npi_module.get_near_npi(request)
+
+    assert len(json.loads(response.body)) == 1
+    assert captured["zip_code"] == "60601"
+    assert "specialization = :specialization" in captured["sql"]
+    assert captured["params"]["specialization"] == "Family Medicine"
+    assert captured["params"]["radius"] == 7
+
+
+@pytest.mark.asyncio
 async def test_get_near_npi_applies_provider_sex_before_distance_limit(monkeypatch):
     captured_query_map = {}
 
