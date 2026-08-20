@@ -31,6 +31,10 @@ class _PublishDatabase:
         self.statements.append(str(statement))
         return 1
 
+    async def scalar(self, statement):
+        assert "extension_record.extname = 'pg_trgm'" in str(statement)
+        return "mrf"
+
 
 @pytest.mark.asyncio
 async def test_publish_renames_tables_and_declared_indexes(monkeypatch):
@@ -54,7 +58,13 @@ async def test_publish_renames_tables_and_declared_indexes(monkeypatch):
         {
             "__main_table__": "pricing_provider_prescription",
             "__my_initial_indexes__": (),
-            "__my_additional_indexes__": (),
+            "__my_additional_indexes__": (
+                {
+                    "name": "pricing_provider_rx_autocomplete_trgm_idx",
+                    "index_elements": ("lower(rx_name) gin_trgm_ops",),
+                    "staging_name": "rx_ac_gin",
+                },
+            ),
         },
     )
     staged_class_by_name = {
@@ -78,6 +88,55 @@ async def test_publish_renames_tables_and_declared_indexes(monkeypatch):
     assert "prescription_stage_pricing_prescription_rx_code_idx" in sql_statements
     assert "prescription_stage_year_idx RENAME TO year_idx" in sql_statements
     assert "provider_stage RENAME TO pricing_provider_prescription" in sql_statements
+    assert (
+        "provider_stage_rx_ac_gin "
+        "RENAME TO pricing_provider_rx_autocomplete_trgm_idx"
+    ) in sql_statements
+
+
+@pytest.mark.asyncio
+async def test_staging_build_declares_autocomplete_trigram_index(monkeypatch):
+    staging_model = drug_claims.make_class(
+        drug_claims.PricingProviderPrescription,
+        "autocomplete_contract",
+        schema_override="mrf",
+    )
+    publish_database = _PublishDatabase()
+    monkeypatch.setattr(drug_claims, "db", publish_database)
+
+    await drug_claims._ensure_indexes(staging_model, "mrf")
+
+    assert len(f"{staging_model.__tablename__}_rx_ac_gin") < 64
+    autocomplete_statements = [
+        statement
+        for statement in publish_database.statements
+        if "rx_ac_gin" in statement
+    ]
+    assert autocomplete_statements == [
+        "CREATE INDEX IF NOT EXISTS "
+        "pricing_provider_prescription_autocomplete_contract_rx_ac_gin "
+        "ON mrf.pricing_provider_prescription_autocomplete_contract USING gin "
+        "(lower(COALESCE(rx_name, '')) mrf.gin_trgm_ops, "
+        "lower(COALESCE(generic_name, '')) mrf.gin_trgm_ops, "
+        "lower(COALESCE(brand_name, '')) mrf.gin_trgm_ops, "
+        "lower(COALESCE(rx_code, '')) mrf.gin_trgm_ops) "
+        "WHERE rx_code_system = 'HP_RX_CODE';"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_staging_build_requires_pg_trgm_extension(monkeypatch):
+    staging_model = drug_claims.make_class(
+        drug_claims.PricingProviderPrescription,
+        "autocomplete_missing_extension",
+        schema_override="mrf",
+    )
+    publish_database = _PublishDatabase()
+    publish_database.scalar = AsyncMock(return_value=None)
+    monkeypatch.setattr(drug_claims, "db", publish_database)
+
+    with pytest.raises(RuntimeError, match="pg_trgm extension is required"):
+        await drug_claims._ensure_indexes(staging_model, "mrf")
 
 
 @pytest.mark.asyncio

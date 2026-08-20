@@ -5109,6 +5109,18 @@ class PricingProviderPrescription(Base, JSONOutputMixin):
         {"index_elements": ("year", "lower(rx_name)"), "name": "pricing_provider_rx_year_name_lower_idx"},
         {"index_elements": ("year", "lower(generic_name)"), "name": "pricing_provider_rx_year_generic_lower_idx"},
         {"index_elements": ("year", "lower(brand_name)"), "name": "pricing_provider_rx_year_brand_lower_idx"},
+        {
+            "index_elements": (
+                "lower(COALESCE(rx_name, '')) gin_trgm_ops",
+                "lower(COALESCE(generic_name, '')) gin_trgm_ops",
+                "lower(COALESCE(brand_name, '')) gin_trgm_ops",
+                "lower(COALESCE(rx_code, '')) gin_trgm_ops",
+            ),
+            "using": "gin",
+            "where": "rx_code_system = 'HP_RX_CODE'",
+            "name": "pricing_provider_rx_autocomplete_trgm_idx",
+            "staging_name": "rx_ac_gin",
+        },
         {"index_elements": ("year", "npi", "total_drug_cost DESC"), "name": "pricing_provider_rx_year_npi_total_drug_cost_desc_idx"},
         {"index_elements": ("year", "total_drug_cost DESC"), "name": "pricing_provider_rx_year_total_drug_cost_desc_idx"},
     ]
