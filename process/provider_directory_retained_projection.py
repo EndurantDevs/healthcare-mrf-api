@@ -94,10 +94,13 @@ async def materialize_retained_projection_shards(
 ) -> tuple[ProjectionProofShard, ...]:
     """Materialize retained shards through the shared projection core."""
 
+    materializer_options_map.setdefault(
+        "child_stream_factory",
+        projection_retained_child_stream,
+    )
     return await materialize_projection_shards(
         lease,
         admission_id,
-        child_stream_factory=projection_retained_child_stream,
         **materializer_options_map,
     )
 

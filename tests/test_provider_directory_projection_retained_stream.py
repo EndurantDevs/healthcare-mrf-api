@@ -253,3 +253,41 @@ async def test_materializer_reads_retained_bytes_without_injected_stream(
     )
 
     assert proof.partition_id == child.shard_claim.shard.partition_id
+
+
+@pytest.mark.asyncio
+async def test_materializer_preserves_injected_child_stream_factory(
+    monkeypatch,
+) -> None:
+    context = synthetic_projection_context("ndjson")
+    lifecycle_events: list[tuple] = []
+    injected_stream, _framing_resolver = LifecycleFakes(
+        (context.child_lease,),
+        lifecycle_events,
+    ).install(monkeypatch)
+
+    async def consume_injected_stream(
+        _lease,
+        _admission_id,
+        *,
+        child_stream_factory,
+        **_options,
+    ):
+        assert child_stream_factory is injected_stream
+        async with child_stream_factory(context.child_lease) as byte_stream:
+            assert b"".join(
+                [chunk async for chunk in byte_stream]
+            ) == b"synthetic-retained-bytes"
+        return ()
+
+    monkeypatch.setattr(
+        retained_projection,
+        "materialize_projection_shards",
+        consume_injected_stream,
+    )
+
+    assert await retained_projection.materialize_retained_projection_shards(
+        context.child_lease.shard_claim.recipe_lease,
+        context.child_lease.shard_claim.admission_id,
+        child_stream_factory=injected_stream,
+    ) == ()
