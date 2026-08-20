@@ -185,12 +185,14 @@
       ],
       "workload_files": [
         "tests/provider_directory_retained_benchmark.py",
+        "tests/test_provider_directory_retained_benchmark.py",
         "tests/test_uhc_provider_file_admission.py",
         "support/ptg2_scanner/Cargo.toml",
         "support/ptg2_scanner/Cargo.lock",
         "requirements-ci.lock"
       ],
       "correctness_keys": [
+        "performance_contract",
         "input_identity",
         "retained_acquisition",
         "dataset",
@@ -208,6 +210,11 @@
           "unit": "seconds",
           "direction": "lower"
         },
+        "resources_per_second": {
+          "type": "number",
+          "unit": "resources/second",
+          "direction": "higher"
+        },
         "acquisition_seconds": {
           "type": "number",
           "unit": "seconds",
@@ -222,6 +229,41 @@
           "type": "number",
           "unit": "seconds",
           "direction": "lower"
+        },
+        "fact_decode_copy_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "plan_materialize_copy_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "identity_proof_merge_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "deferred_index_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "npi_merge_summary_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "canonical_rows_per_second": {
+          "type": "number",
+          "unit": "rows/second",
+          "direction": "higher"
+        },
+        "npi_evidence_rows_per_second": {
+          "type": "number",
+          "unit": "rows/second",
+          "direction": "higher"
         },
         "publication_seconds": {
           "type": "number",
