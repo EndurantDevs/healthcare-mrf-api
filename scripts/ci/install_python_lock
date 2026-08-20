@@ -30,7 +30,7 @@ python -m pip install \
   --require-hashes \
   -r requirements-ci.lock
 python -m pip check
-test "$(python -m pip --version | awk '{print $2}')" = 26.1.2
+test "$(python -m pip --version | awk '{print $2}')" = 26.2.1
 python - "$report" <<'PY'
 import json
 from pathlib import Path

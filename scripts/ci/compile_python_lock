@@ -88,8 +88,8 @@ for item in report.get("install", []):
         raise SystemExit(f"duplicate selected distribution: {name}")
     requirements[name] = (version, digest)
 
-if not requirements or requirements.get("pip", (None,))[0] != "26.1.2":
-    raise SystemExit("selected lock must contain pip==26.1.2")
+if not requirements or requirements.get("pip", (None,))[0] != "26.2.1":
+    raise SystemExit("selected lock must contain pip==26.2.1")
 if requirements.get("pip-audit", (None,))[0] != "2.10.1":
     raise SystemExit("selected lock must contain pip-audit==2.10.1")
 
