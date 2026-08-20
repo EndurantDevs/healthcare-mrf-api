@@ -153,7 +153,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260820010000_prescription_autocomplete_trigram_index"
+        "20260820020000_ptg_ordinary_terminal_json_null_guard"
     ]
 
 
