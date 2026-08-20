@@ -10,8 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from process import provider_directory_projection_child_read as child_read
-from process import provider_directory_projection_materializer as materializer
+from process import provider_directory_retained_projection as retained_projection
 from process.provider_directory_retained_artifact_contract import (
     RetainedArtifactError,
 )
@@ -46,7 +45,7 @@ def _child_for_bytes(payload: bytes, *, artifact_bytes: bytes | None = None):
 
 
 async def _read_child(lease, *, chunk_bytes: int = 4) -> bytes:
-    async with child_read.projection_retained_child_stream(
+    async with retained_projection.projection_retained_child_stream(
         lease,
         chunk_bytes=chunk_bytes,
     ) as chunks:
@@ -78,6 +77,20 @@ async def test_projection_stream_reads_only_verified_layout_range(
 
 
 @pytest.mark.asyncio
+async def test_projection_stream_verifies_before_yielding_final_chunk(
+    retained_artifact_test_root: Path,
+) -> None:
+    payload = b'{"resourceType":"Endpoint","id":"single-read"}\n'
+    write_retained_artifact_blob(retained_artifact_test_root, payload)
+
+    async with retained_projection.projection_retained_child_stream(
+        _child_for_bytes(payload),
+        chunk_bytes=len(payload),
+    ) as chunks:
+        assert await anext(chunks) == payload
+
+
+@pytest.mark.asyncio
 async def test_projection_stream_rejects_tampered_retained_bytes(
     retained_artifact_test_root: Path,
 ) -> None:
@@ -94,7 +107,7 @@ async def test_projection_stream_rejects_tampered_retained_bytes(
 
 @pytest.mark.asyncio
 async def test_projection_stream_joins_cancelled_read_before_abort(monkeypatch) -> None:
-    payload = b'{"resourceType":"Endpoint","id":"synthetic"}\n'
+    expected_bytes = b'{"resourceType":"Endpoint","id":"synthetic"}\n'
 
     class BlockingBlob:
         def __init__(self) -> None:
@@ -105,7 +118,7 @@ async def test_projection_stream_joins_cancelled_read_before_abort(monkeypatch) 
         def read_at(self, requested: int, offset: int) -> bytes:
             self.started.set()
             assert self.release.wait(timeout=5)
-            return payload[offset : offset + requested]
+            return expected_bytes[offset : offset + requested]
 
         def verify_and_close(self, *, content_digest_verified: bool) -> None:
             raise AssertionError(content_digest_verified)
@@ -115,21 +128,22 @@ async def test_projection_stream_joins_cancelled_read_before_abort(monkeypatch) 
 
     opened_blob = BlockingBlob()
     monkeypatch.setattr(
-        child_read,
+        retained_projection,
         "_open_retained_artifact_blob",
         lambda *_args: opened_blob,
     )
 
-    async with child_read.projection_retained_child_stream(
-        _child_for_bytes(payload),
-        chunk_bytes=len(payload),
-    ) as chunks:
-        pending_read = asyncio.create_task(anext(chunks))
-        assert await asyncio.to_thread(opened_blob.started.wait, 2)
-        pending_read.cancel()
-        opened_blob.release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await pending_read
+    with pytest.raises(RetainedArtifactError, match="incomplete_read"):
+        async with retained_projection.projection_retained_child_stream(
+            _child_for_bytes(expected_bytes),
+            chunk_bytes=len(expected_bytes),
+        ) as chunks:
+            pending_read = asyncio.create_task(anext(chunks))
+            assert await asyncio.to_thread(opened_blob.started.wait, 2)
+            pending_read.cancel()
+            opened_blob.release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await pending_read
 
     assert opened_blob.aborted is True
 
@@ -146,15 +160,16 @@ async def test_projection_stream_aborts_when_consumer_never_starts(monkeypatch) 
 
     opened_blob = UnusedBlob()
     monkeypatch.setattr(
-        child_read,
+        retained_projection,
         "_open_retained_artifact_blob",
         lambda *_args: opened_blob,
     )
 
-    async with child_read.projection_retained_child_stream(
-        _child_for_bytes(payload)
-    ):
-        pass
+    with pytest.raises(RetainedArtifactError, match="incomplete_read"):
+        async with retained_projection.projection_retained_child_stream(
+            _child_for_bytes(payload)
+        ):
+            assert opened_blob.aborted is False
 
     assert opened_blob.aborted is True
 
@@ -174,7 +189,7 @@ async def test_projection_stream_rejects_short_retained_read(monkeypatch) -> Non
 
     opened_blob = ShortBlob()
     monkeypatch.setattr(
-        child_read,
+        retained_projection,
         "_open_retained_artifact_blob",
         lambda *_args: opened_blob,
     )
@@ -225,7 +240,7 @@ async def test_materializer_reads_retained_bytes_without_injected_stream(
             materializer_worker_count=1,
         )
 
-    (proof,) = await materializer.materialize_projection_shards(
+    (proof,) = await retained_projection.materialize_retained_projection_shards(
         child.shard_claim.recipe_lease,
         child.shard_claim.admission_id,
         native_runner=consume_retained_bytes,
