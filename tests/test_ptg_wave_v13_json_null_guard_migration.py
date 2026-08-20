@@ -136,9 +136,9 @@ def test_ordinary_terminal_json_canonical_digest_patch_is_exact(monkeypatch):
     migration.downgrade()
     assert len(statements) == 2
     assert all(
-        migration._canonical_call(value) in statements[0]
+        migration._canonical_call(document_value) in statements[0]
         for pair in migration._DOCUMENTS
-        for value in pair
+        for document_value in pair
     )
     assert statements[1].endswith(
         '"ptg_wave_canonical_json_ascii_v1"(json)'
@@ -149,6 +149,29 @@ async def _execute(connection, statements: list[str]) -> None:
     async with connection.transaction():
         for statement in statements:
             await connection.execute(statement)
+
+
+async def _apply_test_migration(connection, monkeypatch, migration, action) -> None:
+    statements: list[str] = []
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+    getattr(migration, action)()
+    await _execute(connection, statements)
+
+
+async def _assert_digest_downgrade_rejected(
+    connection, monkeypatch, migration, schema, state, receipt
+) -> None:
+    await _apply_test_migration(connection, monkeypatch, migration, "downgrade")
+    with pytest.raises(
+        asyncpg.PostgresError,
+        match="PTG_WAVE_ORDINARY_TERMINAL_RECEIPT_INVALID",
+    ):
+        await _insert_and_assert_terminal_receipt(
+            connection,
+            schema,
+            state,
+            receipt,
+        )
 
 
 async def _set_ordinary_run_error(
@@ -263,39 +286,23 @@ async def test_postgres_ordinary_terminal_preserves_python_exponent_digests(
             state["run"].run_id,
         )
 
-        patch = _load_migration(
-            ORDINARY_TERMINAL_JSON_NULL_GUARD_MIGRATION_PATH
-        )
-        statements: list[str] = []
-        monkeypatch.setattr(patch.op, "execute", statements.append)
-        patch.upgrade()
-        await _execute(connection, statements)
+        patch = _load_migration(ORDINARY_TERMINAL_JSON_NULL_GUARD_MIGRATION_PATH)
+        await _apply_test_migration(connection, monkeypatch, patch, "upgrade")
 
         canonical_patch = _load_migration(
             ORDINARY_TERMINAL_JSON_CANONICAL_DIGEST_MIGRATION_PATH
         )
-        statements.clear()
-        monkeypatch.setattr(canonical_patch.op, "execute", statements.append)
-        canonical_patch.upgrade()
-        await _execute(connection, statements)
+        await _apply_test_migration(
+            connection, monkeypatch, canonical_patch, "upgrade"
+        )
 
-        statements.clear()
-        canonical_patch.downgrade()
-        await _execute(connection, statements)
-        with pytest.raises(
-            asyncpg.PostgresError,
-            match="PTG_WAVE_ORDINARY_TERMINAL_RECEIPT_INVALID",
-        ):
-            await _insert_and_assert_terminal_receipt(
-                connection,
-                schema,
-                state,
-                receipt,
-            )
+        await _assert_digest_downgrade_rejected(
+            connection, monkeypatch, canonical_patch, schema, state, receipt
+        )
 
-        statements.clear()
-        canonical_patch.upgrade()
-        await _execute(connection, statements)
+        await _apply_test_migration(
+            connection, monkeypatch, canonical_patch, "upgrade"
+        )
         await _insert_and_assert_terminal_receipt(
             connection,
             schema,
