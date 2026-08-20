@@ -9910,7 +9910,7 @@ async def autocomplete_procedures(request):
         (code_lower.like(q_prefix), 2),
         else_=3,
     )
-    fetch_limit = min(max((pagination.offset + pagination.limit) * 30, 200), 3000)
+    fetch_limit = 3000
     query = (
         select(
             code_catalog_table.c.code_system,
