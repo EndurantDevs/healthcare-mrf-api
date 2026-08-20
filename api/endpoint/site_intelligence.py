@@ -536,17 +536,24 @@ def _pharmacy_geo_stmt(
     lng_delta: float,
 ):
     address_model = EntityAddressUnified if use_unified_addresses else NPIAddress
+    address_filters = [
+        address_model.type == "primary",
+        address_model.npi.isnot(None),
+        address_model.lat.isnot(None),
+        address_model.long.isnot(None),
+        address_model.lat.between(lat - lat_delta, lat + lat_delta),
+        address_model.long.between(lng - lng_delta, lng + lng_delta),
+    ]
+    if use_unified_addresses:
+        address_filters.append(
+            func.coalesce(EntityAddressUnified.address_precision, "") != "city_zip"
+        )
     return (
         select(address_model.npi, address_model.lat, address_model.long)
         .join(NPIDataTaxonomy, NPIDataTaxonomy.npi == address_model.npi)
         .where(
             and_(
-                address_model.type == "primary",
-                address_model.npi.isnot(None),
-                address_model.lat.isnot(None),
-                address_model.long.isnot(None),
-                address_model.lat.between(lat - lat_delta, lat + lat_delta),
-                address_model.long.between(lng - lng_delta, lng + lng_delta),
+                *address_filters,
                 NPIDataTaxonomy.healthcare_provider_taxonomy_code.like("3336%"),
             )
         )

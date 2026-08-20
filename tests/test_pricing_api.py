@@ -192,6 +192,14 @@ def make_request(results, args=None):
     )
 
 
+def _provider_prescription_queries(request):
+    return [
+        str(execution_args[0])
+        for execution_args, _execution_kwargs in request.ctx.sa_session.executions
+        if "pricing_provider_prescription" in str(execution_args[0])
+    ]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("param_name", ("clinical_intent", "intent"))
 async def test_raw_procedure_search_rejects_resolver_only_intent(param_name):
@@ -2466,10 +2474,10 @@ async def test_autocomplete_prescriptions_returns_generic_and_brand():
         [
             FakeResult(scalar="mrf.pricing_provider_prescription"),
             FakeResult(scalar=None),
-            FakeResult(scalar=1),
             FakeResult(
                 rows=[
                     {
+                        "_pagination_total": 3,
                         "rx_code_system": "HP_RX_CODE",
                         "rx_code": "ABC123",
                         "rx_name": "Lisinopril",
@@ -2487,8 +2495,9 @@ async def test_autocomplete_prescriptions_returns_generic_and_brand():
 
     response = await autocomplete_prescriptions(request)
     pricing_response = json.loads(response.body)
-    assert pricing_response["pagination"]["total"] == 1
+    assert pricing_response["pagination"]["total"] == 3
     pricing_item = pricing_response["items"][0]
+    assert "_pagination_total" not in pricing_item
     assert pricing_item["generic_name"] == "Lisinopril"
     assert pricing_item["brand_name"] == "Prinivil"
     assert pricing_item["display_label"] == "Lisinopril / Prinivil"
@@ -2497,6 +2506,28 @@ async def test_autocomplete_prescriptions_returns_generic_and_brand():
     assert pricing_item["prescription_code"] == "ABC123"
     assert pricing_item["preferred_prescription_code_system"] == "HP_RX_CODE"
     assert pricing_item["preferred_prescription_code"] == "ABC123"
+    provider_queries = _provider_prescription_queries(request)
+    assert len(provider_queries) == 1
+    assert "OVER" in provider_queries[0]
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_prescriptions_empty_first_page_uses_one_query():
+    request = make_request(
+        [
+            FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=None),
+            FakeResult(rows=[]),
+        ],
+        args={"q": "lisin", "year": "2023"},
+    )
+
+    response = await autocomplete_prescriptions(request)
+    pricing_response = json.loads(response.body)
+
+    assert pricing_response["items"] == []
+    assert pricing_response["pagination"]["total"] == 0
+    assert len(_provider_prescription_queries(request)) == 1
 
 
 @pytest.mark.asyncio
@@ -2505,10 +2536,10 @@ async def test_autocomplete_prescriptions_enriches_ndc_and_rxnorm_codes():
         [
             FakeResult(scalar="mrf.pricing_provider_prescription"),
             FakeResult(scalar=None),
-            FakeResult(scalar=1),
             FakeResult(
                 rows=[
                     {
+                        "_pagination_total": 1,
                         "rx_code_system": "HP_RX_CODE",
                         "rx_code": "ABC123",
                         "rx_name": "Lisinopril",
@@ -2548,6 +2579,47 @@ async def test_autocomplete_prescriptions_enriches_ndc_and_rxnorm_codes():
     assert pricing_item["rxnorm_id"] == "29046"
     assert pricing_item["preferred_prescription_code_system"] == "NDC"
     assert pricing_item["preferred_prescription_code"] == "00093015001"
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_prescriptions_preserves_total_beyond_last_page():
+    request = make_request(
+        [
+            FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=None),
+            FakeResult(rows=[]),
+            FakeResult(scalar=3),
+        ],
+        args={"q": "lisin", "year": "2023", "limit": "1", "offset": "10"},
+    )
+
+    response = await autocomplete_prescriptions(request)
+    pricing_response = json.loads(response.body)
+
+    assert pricing_response["items"] == []
+    assert pricing_response["pagination"]["total"] == 3
+    assert len(_provider_prescription_queries(request)) == 2
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_prescriptions_preserves_unavailable_table_contract():
+    request = make_request(
+        [FakeResult(scalar=None)],
+        args={"q": "lisin", "year": "2023", "limit": "1", "offset": "10"},
+    )
+
+    response = await autocomplete_prescriptions(request)
+
+    assert json.loads(response.body) == {
+        "items": [],
+        "pagination": {"total": 0, "limit": 1, "offset": 10, "page": 11},
+        "query": {
+            "q": "lisin",
+            "year": 2023,
+            "year_source": "request",
+            "data_status": "unavailable",
+        },
+    }
 
 
 @pytest.mark.asyncio

@@ -10519,8 +10519,6 @@ async def autocomplete_prescriptions(request):
         )
     )
     grouped_subquery = grouped_query.subquery()
-    count_result = await session.execute(select(func.count()).select_from(grouped_subquery))
-    total = int(count_result.scalar() or 0)
 
     ranking = case(
         (func.lower(func.coalesce(grouped_subquery.c.generic_name, "")).like(q_prefix), 0),
@@ -10531,7 +10529,10 @@ async def autocomplete_prescriptions(request):
     )
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "total_claims").strip().lower()
-    query = select(grouped_subquery)
+    query = select(
+        grouped_subquery,
+        func.count().over().label("_pagination_total"),
+    )
     query = _apply_ordering(
         query.order_by(ranking.asc()),
         order_by,
@@ -10549,9 +10550,22 @@ async def autocomplete_prescriptions(request):
     query = query.limit(pagination.limit).offset(pagination.offset)
 
     prescription_result_cursor = await session.execute(query)
+    prescription_rows = [
+        _row_to_dict(prescription_row)
+        for prescription_row in prescription_result_cursor
+    ]
+    if prescription_rows:
+        total = int(prescription_rows[0].get("_pagination_total") or 0)
+    elif pagination.offset:
+        count_result = await session.execute(
+            select(func.count()).select_from(grouped_subquery)
+        )
+        total = int(count_result.scalar() or 0)
+    else:
+        total = 0
     prescription_items = []
-    for prescription_row in prescription_result_cursor:
-        prescription_item_by_field = _row_to_dict(prescription_row)
+    for prescription_item_by_field in prescription_rows:
+        prescription_item_by_field.pop("_pagination_total", None)
         generic_name = str(
             prescription_item_by_field.get("generic_name")
             or prescription_item_by_field.get("rx_name")
