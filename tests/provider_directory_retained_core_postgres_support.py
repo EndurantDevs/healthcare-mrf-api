@@ -29,13 +29,15 @@ from process.provider_directory_retained_artifact_contract import (
     PAYLOAD,
     TERMINAL_ZERO,
     ArtifactLayoutRange,
+    LeaseIdentity,
     ProducedArtifact,
     RetainedCampaignItem,
     RetainedCampaignPlan,
     endpoint_request_fence_digest,
     expected_range_set_digest,
-    produced_layout_digest,
 )
+from process.provider_directory_retained_lease_store import acquire_item_lease
+from process.provider_directory_retained_producer_store import admit_produced_artifact
 from process.provider_directory_retained_store_support import database_table
 
 
@@ -62,6 +64,7 @@ def campaign_item(
     stream_identity: str | None = None,
     sequence_ordinal: int = 0,
     item_role: str = PAYLOAD,
+    declared_byte_count: int | None = 13,
 ) -> RetainedCampaignItem:
     """Build one valid payload or terminal-zero campaign member."""
 
@@ -78,7 +81,7 @@ def campaign_item(
         sequence_ordinal=sequence_ordinal,
         item_role=item_role,
         source_locator=None if is_terminal else f"fixture://{source_item_id}",
-        declared_byte_count=0 if is_terminal else 13,
+        declared_byte_count=0 if is_terminal else declared_byte_count,
         terminal_proof_sha256=(digest(f"terminal:{label}") if is_terminal else None),
     ).validate()
 
@@ -147,14 +150,14 @@ def registry_artifact(label: str, artifact_kind: str) -> ProducedArtifact:
         artifact_kind=artifact_kind,
         artifact_byte_count=len(artifact_bytes),
         artifact_record_count=1,
-        artifact_path="fixture://artifact",
+        artifact_path=f"fixture://artifact/{artifact_sha256}",
         layout_contract_id="retained-core-fixture-layout-v1",
         layout_contract_version=1,
         range_set_sha256="0" * 64,
         canonical_byte_count=len(artifact_bytes),
         manifest_sha256=digest(f"manifest:{label}"),
         manifest_byte_count=64,
-        manifest_path="fixture://manifest",
+        manifest_path=f"fixture://manifest/{digest(f'manifest:{label}')}",
         producer_build_id="retained-core-fixture-v1",
         ranges=(layout_range,),
     )
@@ -167,7 +170,7 @@ def registry_artifact(label: str, artifact_kind: str) -> ProducedArtifact:
 def registry_artifact_payload(label: str) -> bytes:
     """Return the exact bytes described by ``registry_artifact``."""
 
-    return f'{{"id":"{label}"}}\n'.encode("utf-8")
+    return digest(label)[:13].encode("ascii")
 
 
 def _load_migration():
@@ -265,79 +268,6 @@ async def retained_database(
         await database_engine.dispose()
 
 
-async def _insert_artifact_identity(
-    connection: asyncpg.Connection,
-    produced_artifact: ProducedArtifact,
-) -> None:
-    await connection.execute(
-        f"""INSERT INTO {database_table('provider_directory_retained_artifact')} (
-                artifact_sha256, artifact_byte_count, artifact_locator,
-                registry_status, verified_at, created_at
-            ) VALUES ($1, $2, $3, 'verified', now(), now());""",
-        produced_artifact.artifact_sha256,
-        produced_artifact.artifact_byte_count,
-        f"fixture://artifact/{produced_artifact.artifact_sha256}",
-    )
-
-
-async def _insert_layout_identity(
-    connection: asyncpg.Connection,
-    produced_artifact: ProducedArtifact,
-    layout_sha256: str,
-) -> None:
-    await connection.execute(
-        f"""INSERT INTO {database_table('provider_directory_retained_artifact_layout')} (
-                layout_sha256, artifact_sha256, artifact_record_count,
-                layout_contract_id, layout_contract_version, layout_range_count,
-                range_set_sha256, canonical_byte_count, manifest_sha256,
-                manifest_byte_count, manifest_locator, producer_build_id,
-                registry_status, verified_at, created_at
-            ) VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10, $11,
-                      'verified', now(), now());""",
-        layout_sha256,
-        produced_artifact.artifact_sha256,
-        produced_artifact.artifact_record_count,
-        produced_artifact.layout_contract_id,
-        produced_artifact.layout_contract_version,
-        produced_artifact.range_set_sha256,
-        produced_artifact.canonical_byte_count,
-        produced_artifact.manifest_sha256,
-        produced_artifact.manifest_byte_count,
-        f"fixture://manifest/{produced_artifact.manifest_sha256}",
-        produced_artifact.producer_build_id,
-    )
-
-
-async def _insert_layout_range(
-    connection: asyncpg.Connection,
-    produced_artifact: ProducedArtifact,
-    layout_sha256: str,
-) -> None:
-    layout_range = produced_artifact.ranges[0]
-    await connection.execute(
-        f"""INSERT INTO {database_table('provider_directory_retained_artifact_range')} (
-                layout_sha256, artifact_sha256, layout_contract_version,
-                layout_range_count, range_ordinal, raw_byte_start, raw_byte_end,
-                raw_byte_count, raw_sha256, record_start, record_end, record_count,
-                canonical_sha256, canonical_byte_count, verified_at
-            ) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10, $11,
-                      $12, $13, now());""",
-        layout_sha256,
-        produced_artifact.artifact_sha256,
-        produced_artifact.layout_contract_version,
-        layout_range.range_ordinal,
-        layout_range.raw_byte_start,
-        layout_range.raw_byte_end,
-        layout_range.raw_byte_count,
-        layout_range.raw_sha256,
-        layout_range.record_start,
-        layout_range.record_end,
-        layout_range.record_count,
-        layout_range.canonical_sha256,
-        layout_range.canonical_byte_count,
-    )
-
-
 async def admit_campaign_item(
     connection: asyncpg.Connection,
     campaign_id: str,
@@ -346,23 +276,29 @@ async def admit_campaign_item(
 ) -> str:
     """Insert verified registry identities and bind one admitted campaign member."""
 
-    layout_sha256 = produced_layout_digest(produced_artifact)
-    await _insert_artifact_identity(connection, produced_artifact)
-    await _insert_layout_identity(connection, produced_artifact, layout_sha256)
-    await _insert_layout_range(connection, produced_artifact, layout_sha256)
-    await connection.execute(
-        f"""UPDATE {database_table('provider_directory_retained_artifact_campaign_item')}
-               SET status='admitted', observed_byte_count=$3,
-                   acquisition_mode='producer_verified',
-                   validator_kind='producer_proof', validator_sha256=NULL,
-                   immutable_identity_sha256=$4, committed_byte_count=$3,
-                   downloaded_artifact_sha256=$4, artifact_sha256=$4,
-                   layout_sha256=$5, admitted_at=now(), updated_at=now()
-             WHERE campaign_id=$1 AND source_item_id=$2;""",
+    campaign_state = await connection.fetchrow(
+        f"""SELECT lease_owner, lease_epoch
+               FROM {database_table('provider_directory_retained_artifact_campaign')}
+              WHERE campaign_id=$1;""",
         campaign_id,
-        retained_item.source_item_id,
-        produced_artifact.artifact_byte_count,
-        produced_artifact.artifact_sha256,
-        layout_sha256,
     )
-    return layout_sha256
+    assert campaign_state is not None and campaign_state["lease_owner"] is not None
+    campaign_lease = LeaseIdentity(
+        owner=str(campaign_state["lease_owner"]),
+        epoch=int(campaign_state["lease_epoch"]),
+    )
+    item_lease = await acquire_item_lease(
+        connection,
+        campaign_id=campaign_id,
+        source_item_id=retained_item.source_item_id,
+        campaign_lease=campaign_lease,
+        owner=f"fixture-{retained_item.source_item_id[:16]}",
+    )
+    return await admit_produced_artifact(
+        connection,
+        campaign_id=campaign_id,
+        source_item_id=retained_item.source_item_id,
+        campaign_lease=campaign_lease,
+        item_lease=item_lease,
+        produced_artifact=produced_artifact,
+    )
