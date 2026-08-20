@@ -36,6 +36,7 @@ from api.control_imports import (
     parse_ptg_toc_preview,
 )
 from process.ext import utils as process_utils
+from process.ptg_allowed_amount_blank import ALLOWED_AMOUNT_BLANK_ERROR
 
 mrf_source_discovery = importlib.import_module("process.mrf_source_discovery")
 
@@ -1888,7 +1889,7 @@ async def test_import_run_request_paths_do_not_run_ddl(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_import_run_projects_durable_allowed_amount_blank(monkeypatch):
-    row = types.SimpleNamespace(
+    durable_run = types.SimpleNamespace(
         run_id="run_blank_neutral",
         engine="healthcare-mrf-api",
         node_id="node_neutral",
@@ -1898,24 +1899,25 @@ async def test_get_import_run_projects_durable_allowed_amount_blank(monkeypatch)
         metrics={"queue": "arq:PTGSmall"},
         error={
             "code": "ptg_import_failed",
-            "message": "PTG2 allowed-amount import produced no payment evidence",
+            "message": ALLOWED_AMOUNT_BLANK_ERROR,
         },
         source_file_import_id="source_import_neutral",
         import_id="source_import_neutral",
     )
 
-    class Result:
+    class QueryResult:
         def scalar_one_or_none(self):
-            return row
+            return durable_run
 
     monkeypatch.setattr(
         control_imports,
         "db",
-        types.SimpleNamespace(execute=AsyncMock(return_value=Result())),
+        types.SimpleNamespace(execute=AsyncMock(return_value=QueryResult())),
     )
     projection = AsyncMock(
         return_value={
             "status": "blank",
+            "source_key": "ptg_source_neutral",
             "file_domains": ["allowed_amounts"],
             "allowed_amount_evidence": False,
         }
@@ -1926,21 +1928,22 @@ async def test_get_import_run_projects_durable_allowed_amount_blank(monkeypatch)
         projection,
     )
 
-    result = await control_imports.get_import_run("run_blank_neutral")
+    public_run = await control_imports.get_import_run("run_blank_neutral")
 
-    assert result["status"] == "failed"
-    assert result["metrics"] == {
+    assert public_run["status"] == "failed"
+    assert public_run["metrics"] == {
         "queue": "arq:PTGSmall",
         "status": "blank",
         "file_domains": ["allowed_amounts"],
         "allowed_amount_evidence": False,
     }
-    projection.assert_awaited_once_with(row, result)
+    assert "source_key" not in public_run["metrics"]
+    projection.assert_awaited_once_with(durable_run, public_run)
 
 
 @pytest.mark.asyncio
 async def test_allowed_amount_blank_projection_loads_exact_inner_rows(monkeypatch):
-    from tests.ptg_wave_ordinary_terminal_receipt_support import (
+    from tests.ptg_blank_terminal_support import (
         blank_ordinary_result,
     )
 

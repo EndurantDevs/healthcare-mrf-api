@@ -14,6 +14,7 @@ from process.ptg_singleton_direct_control import (
 from process.ptg_allowed_amount_blank import (
     ALLOWED_AMOUNT_BLANK_ERROR,
     allowed_amount_blank_metrics,
+    is_allowed_amount_blank_error,
 )
 from process.ptg_wave_ordinary_terminal_contract import (
     PTGWaveOrdinaryTerminalConflict,
@@ -223,7 +224,7 @@ def _validate_outer_run_row(
     source_type: str,
     terminal_status: str,
 ) -> None:
-    common_result_conflict = (
+    has_common_result_conflict = (
         request["run_id"] != getattr(run, "run_id", None)
         or request["run_id"] == getattr(intent, "run_id", None)
         or source_id == getattr(intent, "source_file_import_id", None)
@@ -234,29 +235,21 @@ def _validate_outer_run_row(
         or getattr(run, "import_id", None) != source_id
         or getattr(run, "finished_at", None) is None
     )
-    succeeded = (
+    is_succeeded = (
         terminal_status == "succeeded"
         and getattr(run, "status", None) == "succeeded"
         and getattr(run, "error", None) is None
     )
-    blank = (
+    is_blank = (
         terminal_status == "blank"
         and source_type == "allowed_amounts"
         and getattr(run, "status", None) == "failed"
-        and _is_blank_outer_error(getattr(run, "error", None))
+        and is_allowed_amount_blank_error(getattr(run, "error", None))
     )
-    if common_result_conflict or not (succeeded or blank):
+    if has_common_result_conflict or not (is_succeeded or is_blank):
         raise PTGWaveOrdinaryTerminalConflict(
             "ordinary run does not match the frozen V12 member"
         )
-
-
-def _is_blank_outer_error(value: Any) -> bool:
-    return bool(
-        isinstance(value, Mapping)
-        and value.get("code") == "ptg_import_failed"
-        and value.get("message") == ALLOWED_AMOUNT_BLANK_ERROR
-    )
 
 
 def _validate_outer_run_params(
@@ -353,6 +346,8 @@ def _validated_engine_result(
     *,
     expectation: _EngineResultExpectation,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Validate durable engine state against the authenticated outer run."""
+
     if engine_run is None or engine_snapshot is None:
         raise PTGWaveOrdinaryTerminalConflict(
             "durable PTG terminal result is unavailable"
@@ -362,31 +357,7 @@ def _validated_engine_result(
     snapshot_manifest = _object(
         getattr(engine_snapshot, "manifest", None), "snapshot manifest"
     )
-    if expectation.terminal_status == "blank":
-        blank_metrics = allowed_amount_blank_metrics(
-            source_file_import_id=expectation.request[
-                "source_file_import_id"
-            ],
-            source_key=str(expectation.direct_intent.get("source_key") or ""),
-            import_month=expectation.frozen_params.get("import_month"),
-            plan_ids=expectation.run_params.get("plan_ids") or [],
-            plan_market_types=(
-                expectation.run_params.get("plan_market_types") or []
-            ),
-            outer_error={
-                "code": "ptg_import_failed",
-                "message": ALLOWED_AMOUNT_BLANK_ERROR,
-            },
-            engine_run=engine_run,
-            engine_snapshot=engine_snapshot,
-        )
-        if blank_metrics is None or any(
-            expectation.run_metrics.get(name) != value
-            for name, value in blank_metrics.items()
-        ):
-            raise PTGWaveOrdinaryTerminalConflict(
-                "durable PTG result conflicts with the ordinary run"
-            )
+    _validate_blank_projection(engine_run, engine_snapshot, expectation)
     run_expectation = _EngineRunExpectation(
         import_run_id=expectation.engine_import_run_id,
         snapshot_id=expectation.snapshot_id,
@@ -416,6 +387,35 @@ def _validated_engine_result(
     return engine_options, engine_report, snapshot_manifest
 
 
+def _validate_blank_projection(
+    engine_run: Any,
+    engine_snapshot: Any,
+    expectation: _EngineResultExpectation,
+) -> None:
+    if expectation.terminal_status != "blank":
+        return
+    blank_metrics = allowed_amount_blank_metrics(
+        source_file_import_id=expectation.request["source_file_import_id"],
+        source_key=str(expectation.direct_intent.get("source_key") or ""),
+        import_month=expectation.frozen_params.get("import_month"),
+        plan_ids=expectation.run_params.get("plan_ids") or [],
+        plan_market_types=expectation.run_params.get("plan_market_types") or [],
+        outer_error={
+            "code": "ptg_import_failed",
+            "message": ALLOWED_AMOUNT_BLANK_ERROR,
+        },
+        engine_run=engine_run,
+        engine_snapshot=engine_snapshot,
+    )
+    if blank_metrics is None or any(
+        expectation.run_metrics.get(name) != projected_metric
+        for name, projected_metric in blank_metrics.items()
+    ):
+        raise PTGWaveOrdinaryTerminalConflict(
+            "durable PTG result conflicts with the ordinary run"
+        )
+
+
 def _validate_engine_run(
     engine_run: Any,
     *,
@@ -424,7 +424,7 @@ def _validate_engine_run(
     expectation: _EngineRunExpectation,
     terminal_status: str,
 ) -> None:
-    common_result_conflict = (
+    has_common_result_conflict = (
         getattr(engine_run, "import_run_id", None)
         != expectation.import_run_id
         or _month(getattr(engine_run, "import_month", None))
@@ -435,17 +435,17 @@ def _validate_engine_run(
         or options.get("plan_market_types") != expectation.market_types
         or report.get("snapshot_id") != expectation.snapshot_id
     )
-    succeeded = (
+    is_succeeded = (
         terminal_status == "succeeded"
         and getattr(engine_run, "status", None) == "validated"
         and getattr(engine_run, "error", None) is None
     )
-    blank = (
+    is_blank = (
         terminal_status == "blank"
         and getattr(engine_run, "status", None) == "failed"
         and getattr(engine_run, "error", None) == ALLOWED_AMOUNT_BLANK_ERROR
     )
-    if common_result_conflict or not (succeeded or blank):
+    if has_common_result_conflict or not (is_succeeded or is_blank):
         raise PTGWaveOrdinaryTerminalConflict(
             "durable PTG result conflicts with the ordinary run"
         )

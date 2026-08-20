@@ -12,8 +12,8 @@ from process.ptg_allowed_amount_blank import (
 )
 
 
-def _state() -> dict:
-    lane = {
+def _allowed_amount_lane() -> dict:
+    return {
         "files_attempted": 1,
         "files_processed": 1,
         "files_failed": 0,
@@ -38,6 +38,10 @@ def _state() -> dict:
             }
         ],
     }
+
+
+def _blank_state() -> dict:
+    allowed_amount_lane_map = _allowed_amount_lane()
     return {
         "source_file_import_id": "source-import-neutral",
         "source_key": "ptg_source_neutral",
@@ -61,7 +65,7 @@ def _state() -> dict:
             },
             report={
                 "snapshot_id": "ptg2:202608:snapshot-neutral",
-                "allowed_amount_lane": lane,
+                "allowed_amount_lane": allowed_amount_lane_map,
             },
         ),
         "engine_snapshot": SimpleNamespace(
@@ -72,16 +76,18 @@ def _state() -> dict:
             manifest={
                 "snapshot_id": "ptg2:202608:snapshot-neutral",
                 "error": ALLOWED_AMOUNT_BLANK_ERROR,
-                "allowed_amount_lane": copy.deepcopy(lane),
+                "allowed_amount_lane": copy.deepcopy(
+                    allowed_amount_lane_map
+                ),
             },
         ),
     }
 
 
 def test_projects_only_exact_durable_blank_result() -> None:
-    state = _state()
+    blank_state = _blank_state()
 
-    metrics = allowed_amount_blank_metrics(**state)
+    metrics = allowed_amount_blank_metrics(**blank_state)
 
     assert metrics == {
         "status": "blank",
@@ -105,7 +111,19 @@ def test_projects_only_exact_durable_blank_result() -> None:
         "allowed_amount_evidence": False,
     }
 
-    state["engine_snapshot"].manifest["allowed_amount_lane"][
-        "successful_files"
-    ][0]["summary"]["allowed_amount_payments"] = 1
-    assert allowed_amount_blank_metrics(**state) is None
+    for durable_state in (
+        blank_state["engine_run"].report,
+        blank_state["engine_snapshot"].manifest,
+    ):
+        durable_state["allowed_amount_lane"]["successful_files"][0][
+            "summary"
+        ]["allowed_amount_provider_payments"] = 1
+    assert allowed_amount_blank_metrics(**blank_state) is None
+
+    blank_state = _blank_state()
+    blank_state["engine_snapshot"].status = "validated"
+    assert allowed_amount_blank_metrics(**blank_state) is None
+
+    blank_state = _blank_state()
+    blank_state["engine_run"].import_run_id = "ptg2:wrong-source"
+    assert allowed_amount_blank_metrics(**blank_state) is None

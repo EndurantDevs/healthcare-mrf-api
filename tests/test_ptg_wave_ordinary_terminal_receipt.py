@@ -90,11 +90,13 @@ from tests.ptg_wave_ordinary_terminal_receipt_support import (
     SNAPSHOT_ID,
     SOURCE_FILE_ID,
     TerminalTransaction as _TerminalTransaction,
-    blank_ordinary_result as _blank_ordinary_result,
     direct_v6_boundary as _direct_v6_boundary,
     keyring as _keyring,
     ordinary_result as _ordinary_result,
     v13_ordinary_result as _v13_ordinary_result,
+)
+from tests.ptg_blank_terminal_support import (
+    blank_ordinary_result as _blank_ordinary_result,
 )
 
 
@@ -132,6 +134,7 @@ def test_builds_authenticated_blank_terminal_payload(monkeypatch):
 
     payload = ordinary_terminal_receipt_payload(**state)
 
+    assert set(payload) == ORDINARY_TERMINAL_PAYLOAD_FIELDS
     assert payload["terminal_result"]["status"] == "blank"
     assert payload["terminal_result"]["engine_result_status"] == "failed"
     assert payload["snapshot_id"] == SNAPSHOT_ID

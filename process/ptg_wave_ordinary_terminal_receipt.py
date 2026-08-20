@@ -45,11 +45,13 @@ from process.ptg_wave_ordinary_terminal_payload import (
     ordinary_terminal_receipt_payload,
 )
 from process.ptg_wave_ordinary_terminal_validation import (
-    _is_blank_outer_error,
     _outer_result_identities,
     _validated_abandonment,
 )
-from process.ptg_allowed_amount_blank import allowed_amount_blank_metrics
+from process.ptg_allowed_amount_blank import (
+    allowed_amount_blank_metrics,
+    is_allowed_amount_blank_error,
+)
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.ptg_wave_terminal_snapshot_pin import (
     delete_ordinary_terminal_snapshot_pin,
@@ -334,7 +336,7 @@ def _outer_engine_import_run_id(
         )[0]
     if (
         getattr(run, "status", None) == "failed"
-        and _is_blank_outer_error(getattr(run, "error", None))
+        and is_allowed_amount_blank_error(getattr(run, "error", None))
         and getattr(run, "source_file_import_id", None)
         == request["source_file_import_id"]
         and getattr(run, "import_id", None) == request["source_file_import_id"]
@@ -352,42 +354,32 @@ def _run_with_blank_metrics(
 ) -> Any:
     if getattr(run, "status", None) != "failed":
         return run
-    params = getattr(run, "params", None)
-    if not isinstance(params, Mapping):
+    params_map = getattr(run, "params", None)
+    if not isinstance(params_map, Mapping):
         return run
     blank_metrics = allowed_amount_blank_metrics(
         source_file_import_id=str(
             getattr(run, "source_file_import_id", None) or ""
         ),
-        source_key=str(params.get("source_key") or ""),
-        import_month=params.get("import_month"),
-        plan_ids=params.get("plan_ids") or [],
-        plan_market_types=params.get("plan_market_types") or [],
+        source_key=str(params_map.get("source_key") or ""),
+        import_month=params_map.get("import_month"),
+        plan_ids=params_map.get("plan_ids") or [],
+        plan_market_types=params_map.get("plan_market_types") or [],
         outer_error=getattr(run, "error", None),
         engine_run=engine_run,
         engine_snapshot=engine_snapshot,
     )
     if blank_metrics is None:
         return run
-    return SimpleNamespace(
-        **{
-            name: getattr(run, name, None)
-            for name in (
-                "run_id",
-                "engine",
-                "node_id",
-                "importer",
-                "status",
-                "params",
-                "error",
-                "snapshot_id",
-                "import_id",
-                "source_file_import_id",
-                "finished_at",
-            )
-        },
-        metrics={**dict(getattr(run, "metrics", None) or {}), **blank_metrics},
-    )
+    run_fields_by_name = {
+        column.name: getattr(run, column.name, None)
+        for column in ImportRun.__table__.columns
+    }
+    run_fields_by_name["metrics"] = {
+        **dict(getattr(run, "metrics", None) or {}),
+        **blank_metrics,
+    }
+    return SimpleNamespace(**run_fields_by_name)
 
 
 def _verify_abandonment_signature(

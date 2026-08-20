@@ -1184,31 +1184,48 @@ def _decode_import_run_cursor(cursor: str) -> tuple[dt.datetime, str]:
 async def get_import_run(run_id: str) -> dict[str, Any] | None:
     """Return one import run after reconciling terminal worker failures."""
 
-    result = await db.execute(select(ImportRun).where(ImportRun.run_id == run_id).limit(1))
-    row = result.scalar_one_or_none()
-    if not row:
+    query_result = await db.execute(
+        select(ImportRun).where(ImportRun.run_id == run_id).limit(1)
+    )
+    durable_run = query_result.scalar_one_or_none()
+    if not durable_run:
         return None
-    run = await _sync_terminal_worker_failure(normalize_run(row))
-    blank_metrics = await _allowed_amount_blank_terminal_metrics(row, run)
-    if blank_metrics is not None:
-        run["metrics"] = {**dict(run.get("metrics") or {}), **blank_metrics}
-    return run
+    public_run = await _sync_terminal_worker_failure(normalize_run(durable_run))
+    blank_metrics_by_name = await _allowed_amount_blank_terminal_metrics(
+        durable_run, public_run
+    )
+    if blank_metrics_by_name is not None:
+        blank_metrics_by_name = {
+            metric_name: metric_value
+            for metric_name, metric_value in blank_metrics_by_name.items()
+            if metric_name != "source_key"
+        }
+        public_run["metrics"] = {
+            **dict(public_run.get("metrics") or {}),
+            **blank_metrics_by_name,
+        }
+    return public_run
 
 
-async def _allowed_amount_blank_terminal_metrics(
-    row: Any,
-    run: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Load the narrow durable proof for a failed singleton allowed file."""
+def _blank_projection_inputs(
+    durable_run: Any,
+    public_run: dict[str, Any],
+) -> tuple[dict[str, Any], str, dict[str, Any]] | None:
+    """Return protected coordinates only for the exact failed outer run."""
 
-    params = row.params if isinstance(getattr(row, "params", None), dict) else {}
+    # Public normalization removes the protected coordinates needed here.
+    params = (
+        durable_run.params
+        if isinstance(getattr(durable_run, "params", None), dict)
+        else {}
+    )
     source_file_import_id = str(
-        getattr(row, "source_file_import_id", None) or ""
+        getattr(durable_run, "source_file_import_id", None) or ""
     ).strip()
-    error = run.get("error")
+    error = public_run.get("error")
     if (
-        run.get("importer") != "ptg"
-        or run.get("status") != "failed"
+        public_run.get("importer") != "ptg"
+        or public_run.get("status") != "failed"
         or not isinstance(error, dict)
         or error.get("code") != "ptg_import_failed"
         or error.get("message") != ALLOWED_AMOUNT_BLANK_ERROR
@@ -1220,6 +1237,19 @@ async def _allowed_amount_blank_terminal_metrics(
         or params.get("in_network_url") is not None
     ):
         return None
+    return params, source_file_import_id, error
+
+
+async def _allowed_amount_blank_terminal_metrics(
+    durable_run: Any,
+    public_run: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Load the narrow durable proof for a failed singleton allowed file."""
+
+    projection_inputs = _blank_projection_inputs(durable_run, public_run)
+    if projection_inputs is None:
+        return None
+    params, source_file_import_id, error = projection_inputs
     engine_run_result = await db.execute(
         select(PTG2ImportRun)
         .where(
