@@ -38,6 +38,8 @@ PROJECTION_DATABASE_ACTIONS = frozenset(
         "recipe_heartbeat",
         "recipe_insert",
         "recipe_reclaim",
+        "proof_ready",
+        "seal",
         "shard_claim",
         "shard_complete",
         "shard_heartbeat",
@@ -501,7 +503,7 @@ async def assert_stage_trigger(
                 == int(expected_trigger_oid or 0),
                 trigger_fields.get("relation_schema") == stage.schema,
                 trigger_fields.get("relation_name") == stage.relation,
-                trigger_fields.get("relation_kind") in {"r", "p"},
+                trigger_fields.get("relation_kind") in {"r", "p", b"r", b"p"},
                 trigger_fields.get("function_schema") == stage.schema,
                 trigger_fields.get("function_name")
                 == "reject_provider_directory_projection_stage_mutation",

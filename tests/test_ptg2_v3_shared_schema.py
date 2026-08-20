@@ -153,7 +153,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260820140000_prescription_autocomplete_rollup"
+        "20260820200000_provider_directory_projection_finalizer"
     ]
 
 

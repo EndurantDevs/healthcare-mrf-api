@@ -8,6 +8,7 @@ import pytest
 
 from process.provider_directory_projection_contract import (
     PROJECTION_REDUCER_PROOF_CONTRACT_ID,
+    PROJECTION_WINNER_POLICY_CONTRACT_ID,
     projection_completeness_manifest,
     projection_proof_shard,
     projection_reducer_proof,
@@ -152,6 +153,7 @@ def test_candidate_projection_binds_derived_source_summary():
         ("resource_count", "semantic_outcome_reducer_mismatch"),
         ("reducer_outcome_hash", "reducer_proof_invalid"),
         ("reducer_row_hash", "reducer_proof_invalid"),
+        ("winner_policy", "reducer_proof_invalid"),
     ),
 )
 def test_candidate_projection_rejects_cross_wired_reducer_or_semantic_input(
@@ -172,8 +174,10 @@ def test_candidate_projection_rejects_cross_wired_reducer_or_semantic_input(
         resource_counts["InsurancePlan"] = 0
     elif mutation == "reducer_outcome_hash":
         reducer_proof["semantic_outcome_proof_sha256"] = digest("wrong-proof")
-    else:
+    elif mutation == "reducer_row_hash":
         reducer_proof["canonical_row_sha256"] = digest("wrong-row-hash")
+    else:
+        reducer_proof["winner_policy_contract_id"] = "unsupported-winner-policy"
 
     with pytest.raises(ProviderDirectoryProjectionError, match=expected_error):
         reduced_physical_projection_proof(
@@ -212,6 +216,7 @@ def test_recipe_resource_profile_hash_binds_every_semantic_contract():
                 SEMANTIC_SOURCE_SUMMARY_CONTRACT_ID
             ),
             "reducer_proof_contract_id": PROJECTION_REDUCER_PROOF_CONTRACT_ID,
+            "winner_policy_contract_id": PROJECTION_WINNER_POLICY_CONTRACT_ID,
         },
         domain="provider-directory-projection-resource-profile-v1",
     )
