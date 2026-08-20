@@ -1,7 +1,7 @@
 """Enable guarded native projection finalization.
 
 Revision ID: 20260820200000_provider_directory_projection_finalizer
-Revises: 20260820130000_site_intelligence_fast_paths
+Revises: 20260824143000_uhc_flex_content_type_retry
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 
 revision = "20260820200000_provider_directory_projection_finalizer"
-down_revision = "20260820130000_site_intelligence_fast_paths"
+down_revision = "20260824143000_uhc_flex_content_type_retry"
 branch_labels = None
 depends_on = None
 
