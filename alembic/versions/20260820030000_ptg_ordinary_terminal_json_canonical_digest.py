@@ -104,7 +104,7 @@ def _canonical_json_function_sql() -> str:
             WHEN 'string' THEN
                 RETURN {canonical}(payload::jsonb);
             ELSE
-                RETURN btrim(payload::text);
+                RETURN btrim(payload::text, E' \\t\\n\\r');
         END CASE;
     END;
     $$

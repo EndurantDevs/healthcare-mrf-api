@@ -123,7 +123,7 @@ def test_ordinary_terminal_json_canonical_digest_patch_is_exact(monkeypatch):
     )
     assert "FROM json_each(payload)" in function_sql
     assert "FROM json_array_elements(payload) WITH ORDINALITY" in function_sql
-    assert "RETURN btrim(payload::text)" in function_sql
+    assert "RETURN btrim(payload::text, E' \\t\\n\\r')" in function_sql
     assert "RETURN \"ordinary_terminal_digest_test\"." in function_sql
     for old_value, new_value in migration._DOCUMENTS:
         assert migration._canonical_call(old_value) in replacement_sql
@@ -315,7 +315,7 @@ async def test_postgres_ordinary_terminal_preserves_python_exponent_digests(
 
 
 @pytest.mark.asyncio
-async def test_postgres_canonical_json_rejects_duplicate_object_keys(monkeypatch):
+async def test_postgres_canonical_json_handles_raw_json_edges(monkeypatch):
     schema = "ordinary_terminal_duplicate_key"
     connection = await asyncpg.connect(_dsn())
     try:
@@ -332,6 +332,11 @@ async def test_postgres_canonical_json_rejects_duplicate_object_keys(monkeypatch
         )
         await connection.execute(migration._canonical_json_function_sql())
 
+        assert await connection.fetchval(
+            f"SELECT {_quote(schema)}."
+            "ptg_wave_canonical_json_ascii_v1($1::json)",
+            "\t\n1\r",
+        ) == "1"
         with pytest.raises(
             asyncpg.PostgresError,
             match="PTG_WAVE_CANONICAL_JSON_DUPLICATE_KEY",
