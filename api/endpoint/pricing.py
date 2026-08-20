@@ -10707,7 +10707,7 @@ def _prescription_autocomplete_page_query(
         grouped_subquery,
         func.count().over().label("_pagination_total"),
     )
-    return _apply_ordering(
+    ordered_query = _apply_ordering(
         query.order_by(ranking.asc()),
         order_by,
         order,
@@ -10720,6 +10720,10 @@ def _prescription_autocomplete_page_query(
             "total_drug_cost": grouped_subquery.c.total_drug_cost,
             "total_benes": grouped_subquery.c.total_benes,
         },
+    )
+    return ordered_query.order_by(
+        grouped_subquery.c.rx_code_system.asc(),
+        grouped_subquery.c.rx_code.asc(),
     ).limit(pagination.limit).offset(pagination.offset)
 
 

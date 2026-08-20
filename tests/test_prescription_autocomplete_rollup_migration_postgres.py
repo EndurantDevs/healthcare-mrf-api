@@ -331,8 +331,22 @@ async def test_rollup_migration_rejects_incompatible_existing_table(
     )
     try:
         await connection.execute(f'CREATE SCHEMA "{schema}"')
+        await _create_provider_table(
+            connection,
+            f'"{schema}".pricing_provider_prescription',
+        )
+        await connection.execute(migration._create_table_sql(schema))
         await connection.execute(
-            f'CREATE TABLE "{schema}".{ROLLUP_TABLE} (unexpected integer)'
+            f"""
+            ALTER TABLE "{schema}".{ROLLUP_TABLE}
+                DROP CONSTRAINT {ROLLUP_TABLE}_pkey,
+                ALTER COLUMN year TYPE text,
+                ALTER COLUMN year DROP NOT NULL;
+            INSERT INTO "{schema}".{ROLLUP_TABLE}
+                (year, rx_code_system, rx_code, variant_id,
+                 source_relation_fingerprint)
+            VALUES ('sentinel', 'HP_RX_CODE', 'RX-1', 1, 'source')
+            """
         )
         with pytest.raises(
             RuntimeError,
@@ -346,8 +360,8 @@ async def test_rollup_migration_rejects_incompatible_existing_table(
                 "upgrade",
             )
         assert await connection.fetchval(
-            f'SELECT count(*) FROM "{schema}".{ROLLUP_TABLE}'
-        ) == 0
+            f'SELECT year FROM "{schema}".{ROLLUP_TABLE}'
+        ) == "sentinel"
     finally:
         await engine.dispose()
         await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
