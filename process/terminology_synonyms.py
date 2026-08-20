@@ -282,9 +282,9 @@ async def _terminology_relation_oids(schema: str) -> tuple[int | None, int | Non
         old_relation=_quoted_table(schema, f"{live_table}_old"),
     )
     values = _row_mapping(rows[0]) if rows else {}
-    return tuple(
-        int(values[field]) if values.get(field) is not None else None
-        for field in ("live_oid", "old_oid")
+    return (
+        int(values["live_oid"]) if values.get("live_oid") is not None else None,
+        int(values["old_oid"]) if values.get("old_oid") is not None else None,
     )
 
 
