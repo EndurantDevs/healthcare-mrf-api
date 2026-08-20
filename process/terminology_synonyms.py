@@ -178,6 +178,25 @@ def _provider_rows() -> list[dict[str, Any]]:
     return provider_alias_rows
 
 
+_KNEE_PROCEDURE_DISPLAY_BY_CPT = {
+    "27445": "Knee joint replacement using hinged prosthesis",
+    "27446": "Replacement of knee joint on side of knee",
+    "27447": "Replacement of knee joint, both sides of knee",
+    "27486": "Revision of total knee prosthesis, one component",
+    "27487": "Revision of total knee prosthesis, both components",
+    "27488": "Removal of total knee joint prosthesis",
+    "29870": "Diagnostic exam of knee using an endoscope",
+    "29877": "Removal or shaving of knee joint cartilage using an endoscope",
+    "29880": "Removal of both knee cartilages using an endoscope",
+    "29881": "Removal of knee cartilage using an endoscope",
+    "29888": "Repair of anterior cruciate ligament of knee using an endoscope",
+    "29889": "Repair of posterior cruciate ligament of knee using an endoscope",
+}
+_KNEE_SURGERY_CPT_CODES = tuple(_KNEE_PROCEDURE_DISPLAY_BY_CPT)
+_ARTHROSCOPY_CPT_CODES = ("29870", "29877", "29880", "29881", "29888", "29889")
+_ARTHROPLASTY_CPT_CODES = ("27445", "27446", "27447", "27486", "27487")
+
+
 def _procedure_rows() -> list[dict[str, Any]]:
     seeds = [
         ("office visit", "CPT", ["99202", "99203", "99204", "99205", "99211", "99212", "99213", "99214", "99215"], True),
@@ -202,10 +221,14 @@ def _procedure_rows() -> list[dict[str, Any]]:
         ("colonoscopy", "CPT", ["45378", "G0121", "G0105"], True),
         ("brain mri", "CPT", ["70551", "70552", "70553"], True),
         ("knee xray", "CPT", ["73560", "73562", "73564"], True),
+        ("knee surgery", "CPT", _KNEE_SURGERY_CPT_CODES, True),
+        ("arthroscopy", "CPT", _ARTHROSCOPY_CPT_CODES, True),
+        ("arthroplasty", "CPT", _ARTHROPLASTY_CPT_CODES, True),
     ]
     procedure_alias_rows: list[dict[str, Any]] = []
     for synonym, system, codes, is_broad in seeds:
         for code in codes:
+            canonical_term = _KNEE_PROCEDURE_DISPLAY_BY_CPT.get(code, synonym)
             procedure_alias_record = _record(
                 domain="procedure",
                 synonym=synonym,
@@ -213,8 +236,8 @@ def _procedure_rows() -> list[dict[str, Any]]:
                 target_system=system,
                 target_code=code,
                 options=TerminologyRecordOptions(
-                    target_display=synonym,
-                    canonical_term=synonym,
+                    target_display=canonical_term,
+                    canonical_term=canonical_term,
                     is_broad=is_broad,
                     confidence=0.90 if is_broad else 0.96,
                 ),
