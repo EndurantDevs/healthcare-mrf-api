@@ -2282,6 +2282,43 @@ async def test_autocomplete_procedures_dedupes_terms_across_systems():
 
 
 @pytest.mark.asyncio
+async def test_autocomplete_procedure_total_does_not_depend_on_page_limit(monkeypatch):
+    catalog_rows = [
+        {
+            "code_system": code_system,
+            "code": str(index),
+            "display_name": f"Knee procedure {index:03d}",
+            "short_description": f"Knee procedure {index:03d}",
+            "source": "cms_physician_provider_service",
+        }
+        for index in range(125)
+        for code_system in ("CPT", "HCPCS", "HP_PROCEDURE_CODE")
+    ]
+
+    class CandidateSession(FakeSession):
+        async def execute(self, statement, *_args, **_kwargs):
+            self.executions.append(((statement, *_args), _kwargs))
+            return FakeResult(rows=catalog_rows[: statement._limit_clause.value])
+
+    monkeypatch.setattr(
+        pricing_module,
+        "_query_terminology",
+        AsyncMock(return_value=[]),
+    )
+
+    totals = []
+    for limit in (10, 50):
+        request = types.SimpleNamespace(
+            args={"q": "knee", "limit": str(limit)},
+            ctx=types.SimpleNamespace(sa_session=CandidateSession()),
+        )
+        response = await autocomplete_procedures(request)
+        totals.append(json.loads(response.body)["pagination"]["total"])
+
+    assert totals == [125, 125]
+
+
+@pytest.mark.asyncio
 async def test_autocomplete_procedures_includes_match_details_when_requested(
     monkeypatch,
 ):
