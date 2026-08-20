@@ -185,6 +185,7 @@
       ],
       "workload_files": [
         "tests/provider_directory_retained_benchmark.py",
+        "tests/provider_directory_retained_benchmark_evidence.py",
         "tests/test_provider_directory_retained_benchmark.py",
         "tests/test_uhc_provider_file_admission.py",
         "support/ptg2_scanner/Cargo.toml",
