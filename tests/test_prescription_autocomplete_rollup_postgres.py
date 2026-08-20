@@ -97,6 +97,21 @@ async def _create_current_autocomplete_index(connection, relation):
     )
 
 
+async def _seed_stable_tie_rows(connection, relation):
+    await connection.execute(
+        f"""
+        INSERT INTO {relation}
+            (npi, year, rx_code_system, rx_code, rx_name, generic_name,
+             brand_name, total_claims, total_drug_cost, total_benes)
+        VALUES
+            (2000000001, 2023, 'HP_RX_CODE', 'TIE-B', 'Stable tie', NULL,
+             NULL, 10, 20, 30),
+            (2000000002, 2023, 'HP_RX_CODE', 'TIE-A', 'Stable tie', NULL,
+             NULL, 10, 20, 30)
+        """
+    )
+
+
 async def _create_rollup_fixture(connection, relation, rollup_relation):
     await _create_provider_table(connection, relation)
     await connection.execute(
@@ -123,18 +138,7 @@ async def _create_rollup_fixture(connection, relation, rollup_relation):
         FROM generate_series(1, 100000) AS row_number
         """
     )
-    await connection.execute(
-        f"""
-        INSERT INTO {relation}
-            (npi, year, rx_code_system, rx_code, rx_name, generic_name,
-             brand_name, total_claims, total_drug_cost, total_benes)
-        VALUES
-            (2000000001, 2023, 'HP_RX_CODE', 'TIE-B', 'Stable tie', NULL,
-             NULL, 10, 20, 30),
-            (2000000002, 2023, 'HP_RX_CODE', 'TIE-A', 'Stable tie', NULL,
-             NULL, 10, 20, 30)
-        """
-    )
+    await _seed_stable_tie_rows(connection, relation)
     await _create_current_autocomplete_index(connection, relation)
     await connection.execute(
         f"""
@@ -239,7 +243,7 @@ async def _assert_rollup_semantic_parity(engine, schema):
 async def _assert_stable_tie_pagination(engine, schema):
     """Require tied offset pages to use the stable prescription key."""
 
-    pages_by_source = []
+    source_pages = []
     for source_table in (
         pricing_module.provider_prescription_table,
         pricing_module.provider_prescription_autocomplete_table,
@@ -256,8 +260,22 @@ async def _assert_stable_tie_pagination(engine, schema):
             )
             assert total == 2
             page_codes.append(rows[0]["rx_code"])
-        pages_by_source.append(page_codes)
-    assert pages_by_source == [["TIE-A", "TIE-B"], ["TIE-A", "TIE-B"]]
+        source_pages.append(page_codes)
+    assert source_pages == [["TIE-A", "TIE-B"], ["TIE-A", "TIE-B"]]
+
+
+def _assert_benchmark_plans(rollup_plan, provider_plan):
+    provider_nodes = list(_plan_nodes(provider_plan["Plan"]))
+    assert sum(
+        node.get("Index Name") == "pricing_provider_rx_autocomplete_trgm_idx"
+        for node in provider_nodes
+    ) == 4
+    assert provider_plan["Execution Time"] > rollup_plan["Execution Time"] * 5
+    assert rollup_plan["Execution Time"] <= 5.0
+    assert not any(
+        node.get("Relation Name") == "pricing_provider_prescription"
+        for node in _plan_nodes(rollup_plan["Plan"])
+    )
 
 
 @pytest.mark.asyncio
@@ -307,18 +325,7 @@ async def test_production_autocomplete_uses_exact_bounded_rollup(monkeypatch):
             engine,
             fallback_query,
         )
-        provider_nodes = list(_plan_nodes(provider_plan["Plan"]))
-        assert sum(
-            node.get("Index Name")
-            == "pricing_provider_rx_autocomplete_trgm_idx"
-            for node in provider_nodes
-        ) == 4
-        assert provider_plan["Execution Time"] > rollup_plan["Execution Time"] * 5
-        assert rollup_plan["Execution Time"] <= 5.0
-        assert not any(
-            node.get("Relation Name") == "pricing_provider_prescription"
-            for node in _plan_nodes(rollup_plan["Plan"])
-        )
+        _assert_benchmark_plans(rollup_plan, provider_plan)
     finally:
         await engine.dispose()
         await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
