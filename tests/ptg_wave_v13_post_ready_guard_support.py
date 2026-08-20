@@ -20,6 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = ROOT / "alembic" / "versions" / (
     "202608170001_ptg_v13_post_ready_failure_guard.py"
 )
+JSON_NULL_GUARD_MIGRATION_PATH = ROOT / "alembic" / "versions" / (
+    "202608200001_ptg_v13_json_null_guard.py"
+)
 
 
 async def add_v13_head_prerequisites(connection, quoted_schema: str) -> None:

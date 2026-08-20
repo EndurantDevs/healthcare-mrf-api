@@ -16,6 +16,7 @@ from tests.ptg_wave_v12_pristine_abandonment_support import (
     keyring as _receipt_keyring,
 )
 from tests.ptg_wave_v13_post_ready_guard_support import (
+    JSON_NULL_GUARD_MIGRATION_PATH,
     MIGRATION_PATH,
     add_v13_head_prerequisites,
     v13_proof,
@@ -34,10 +35,11 @@ from tests.test_ptg_wave_recovery_storage_postgres import _dsn, _quote, asyncpg
 async def _install_v13_guard(connection, monkeypatch, schema: str) -> None:
     await _install_receipt_migration(connection, monkeypatch, schema)
     await add_v13_head_prerequisites(connection, _quote(schema))
-    migration = _load_migration(MIGRATION_PATH)
     sql_statements: list[str] = []
-    monkeypatch.setattr(migration.op, "execute", sql_statements.append)
-    migration.upgrade()
+    for migration_path in (MIGRATION_PATH, JSON_NULL_GUARD_MIGRATION_PATH):
+        migration = _load_migration(migration_path)
+        monkeypatch.setattr(migration.op, "execute", sql_statements.append)
+        migration.upgrade()
     async with connection.transaction():
         for statement in sql_statements:
             await connection.execute(statement)
@@ -77,6 +79,9 @@ async def _seed_v13_wave(
     )
     await _seed_pristine_intents_and_runs(connection, schema, admission)
     quoted_schema = _quote(schema)
+    await connection.execute(
+        f"UPDATE {quoted_schema}.import_run SET error = 'null'::json"
+    )
     await connection.execute(
         f"UPDATE {quoted_schema}.ptg_import_wave SET "
         "kubernetes_manifest = '{}'::json, "
@@ -255,6 +260,35 @@ async def _assert_v13_work_is_frozen(
                 await connection.execute(unsafe_sql)
 
 
+async def _assert_non_null_error_rejected(
+    connection,
+    quoted_schema: str,
+    admission: dict,
+    proof: dict,
+    signer,
+) -> None:
+    await connection.execute(
+        f"UPDATE {quoted_schema}.import_run "
+        "SET error = '{\"kind\":\"synthetic\"}'::json "
+        "WHERE run_id = 'fixture-run-0'"
+    )
+    with pytest.raises(
+        asyncpg.PostgresError,
+        match="PTG_IMPORT_WAVE_V13_ABANDONMENT_NOT_PRISTINE",
+    ):
+        await _insert_signed_quarantine(
+            connection,
+            quoted_schema,
+            admission,
+            proof,
+            signer,
+        )
+    await connection.execute(
+        f"UPDATE {quoted_schema}.import_run SET error = 'null'::json "
+        "WHERE run_id = 'fixture-run-0'"
+    )
+
+
 @pytest.mark.asyncio
 async def test_postgres_v13_signed_quarantine_releases_capacity_and_freezes_work(
     monkeypatch,
@@ -276,6 +310,13 @@ async def test_postgres_v13_signed_quarantine_releases_capacity_and_freezes_work
             job_receipt_by_field,
         )
         proof = v13_proof(admission, job_receipt_by_field)
+        await _assert_non_null_error_rejected(
+            connection,
+            quoted_schema,
+            admission,
+            proof,
+            signer,
+        )
         await _insert_signed_quarantine(
             connection,
             quoted_schema,
