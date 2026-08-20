@@ -5,8 +5,10 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,6 +34,9 @@ from process.terminology_synonym_sources import (
     _insert_observed_provider_rows,
     _status_count,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _schema() -> str:
@@ -257,13 +262,25 @@ def _curated_rows() -> list[dict[str, Any]]:
     return _provider_rows() + _specialty_alias_rows() + _procedure_rows()
 
 
-async def _publish_stage(schema: str, stage_cls) -> None:
+async def _table_row_count(table: str) -> int:
+    count_query_rows = await db.all(f"SELECT count(*)::bigint AS row_count FROM {table};")
+    return int(_row_mapping(count_query_rows[0])["row_count"]) if count_query_rows else 0
+
+
+async def _publish_stage(schema: str, stage_cls, expected_row_count: int) -> None:
+    if expected_row_count == 0:
+        raise RuntimeError("refusing to publish an empty terminology snapshot")
     live_table = TerminologySynonym.__tablename__
     old_table = f"{live_table}_old"
-    await db.status(f"DROP TABLE IF EXISTS {schema}.{old_table};")
-    await db.status(f"ALTER TABLE IF EXISTS {schema}.{live_table} RENAME TO {old_table};")
-    await db.status(f"ALTER TABLE {schema}.{stage_cls.__tablename__} RENAME TO {live_table};")
-    await db.status(f"DROP TABLE IF EXISTS {schema}.{old_table};")
+    async with db.transaction():
+        await db.status(f"DROP TABLE IF EXISTS {schema}.{old_table};")
+        await db.status(f"ALTER TABLE IF EXISTS {schema}.{live_table} RENAME TO {old_table};")
+        await db.status(f"ALTER TABLE {schema}.{stage_cls.__tablename__} RENAME TO {live_table};")
+        promoted_row_count = await _table_row_count(f"{schema}.{live_table}")
+        if promoted_row_count != expected_row_count:
+            raise RuntimeError(
+                f"promoted row count {promoted_row_count} does not match staged row count {expected_row_count}"
+            )
 
 
 async def import_terminology_synonyms(
@@ -280,41 +297,43 @@ async def import_terminology_synonyms(
     stage_table = f"{schema}.{stage_cls.__tablename__}"
 
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {schema};")
-    await db.status(f"DROP TABLE IF EXISTS {stage_table};")
-    await db.create_table(stage_cls.__table__, checkfirst=True)
+    try:
+        await db.status(f"DROP TABLE IF EXISTS {stage_table};")
+        await db.create_table(stage_cls.__table__, checkfirst=True)
 
-    curated_rows = _curated_rows()
-    await push_objects(curated_rows, stage_cls, rewrite=True)
+        curated_rows = _curated_rows()
+        await push_objects(curated_rows, stage_cls, rewrite=True)
 
-    source_row_count_by_type = {
-        "curated_rows": len(curated_rows),
-        "code_catalog_rows": await _insert_code_catalog_rows(schema, stage_table),
-        "code_synonym_rows": await _insert_code_synonym_rows(schema, stage_table),
-        "observed_provider_rows": await _insert_observed_provider_rows(schema, stage_table),
-        "nucc_rows": await _insert_nucc_rows(schema, stage_table),
-        "observed_procedure_rows": await _insert_observed_procedure_rows(schema, stage_table),
-        "observed_prescription_rows": await _insert_observed_prescription_rows(schema, stage_table),
-    }
-    await _create_indexes(stage_cls, schema)
-    count_query_rows = await db.all(
-        f"SELECT count(*)::bigint AS row_count FROM {stage_table};"
-    )
-    row_count = (
-        int(_row_mapping(count_query_rows[0])["row_count"])
-        if count_query_rows
-        else 0
-    )
-    await _publish_stage(schema, stage_cls)
+        source_row_count_by_type = {
+            "curated_rows": len(curated_rows),
+            "code_catalog_rows": await _insert_code_catalog_rows(schema, stage_table),
+            "code_synonym_rows": await _insert_code_synonym_rows(schema, stage_table),
+            "observed_provider_rows": await _insert_observed_provider_rows(schema, stage_table),
+            "nucc_rows": await _insert_nucc_rows(schema, stage_table),
+            "observed_procedure_rows": await _insert_observed_procedure_rows(schema, stage_table),
+            "observed_prescription_rows": await _insert_observed_prescription_rows(schema, stage_table),
+        }
+        await _create_indexes(stage_cls, schema)
+        row_count = await _table_row_count(stage_table)
+        await _publish_stage(schema, stage_cls, row_count)
 
-    import_summary_map = {
-        "import_id": suffix,
-        "test_mode": bool(test_mode),
-        "table": f"{schema}.{TerminologySynonym.__tablename__}",
-        "row_count": row_count,
-        "source_counts": source_row_count_by_type,
-    }
-    print(f"Terminology synonym import done: {import_summary_map}")
-    return import_summary_map
+        import_summary_map = {
+            "import_id": suffix,
+            "test_mode": bool(test_mode),
+            "table": f"{schema}.{TerminologySynonym.__tablename__}",
+            "row_count": row_count,
+            "source_counts": source_row_count_by_type,
+        }
+        print(f"Terminology synonym import done: {import_summary_map}")
+        return import_summary_map
+    finally:
+        original_error = sys.exception()
+        try:
+            await db.status(f"DROP TABLE IF EXISTS {stage_table};")
+        except Exception:
+            if original_error is None:
+                raise
+            logger.exception("Failed to drop terminology staging table %s", stage_table)
 
 
 async def main(

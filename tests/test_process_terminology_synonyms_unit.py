@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import importlib
+from contextlib import asynccontextmanager
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -248,18 +249,71 @@ async def test_source_insert_builders_emit_deduplicating_upserts(
 
 @pytest.mark.asyncio
 async def test_publish_stage_swaps_snapshot_tables_in_order(monkeypatch):
-    status = AsyncMock()
+    database_events = []
+
+    async def status(statement):
+        database_events.append(statement)
+
+    async def all_rows(statement):
+        database_events.append(statement)
+        return [SimpleNamespace(_mapping={"row_count": "11"})]
+
+    @asynccontextmanager
+    async def transaction():
+        database_events.append("transaction:begin")
+        try:
+            yield
+        except Exception:
+            database_events.append("transaction:rollback")
+            raise
+        database_events.append("transaction:commit")
+
     monkeypatch.setattr(terminology_synonyms.db, "status", status)
+    monkeypatch.setattr(terminology_synonyms.db, "all", all_rows)
+    monkeypatch.setattr(terminology_synonyms.db, "transaction", transaction)
     stage_cls = SimpleNamespace(__tablename__="terminology_synonym_stage")
 
-    await terminology_synonyms._publish_stage("tenant", stage_cls)
+    await terminology_synonyms._publish_stage("tenant", stage_cls, 11)
 
-    assert [call.args[0] for call in status.await_args_list] == [
+    assert database_events == [
+        "transaction:begin",
         "DROP TABLE IF EXISTS tenant.terminology_synonym_old;",
         "ALTER TABLE IF EXISTS tenant.terminology_synonym RENAME TO terminology_synonym_old;",
         "ALTER TABLE tenant.terminology_synonym_stage RENAME TO terminology_synonym;",
-        "DROP TABLE IF EXISTS tenant.terminology_synonym_old;",
+        "SELECT count(*)::bigint AS row_count FROM tenant.terminology_synonym;",
+        "transaction:commit",
     ]
+
+
+@pytest.mark.asyncio
+async def test_publish_stage_rolls_back_on_promoted_count_mismatch(monkeypatch):
+    transaction_outcomes = []
+
+    @asynccontextmanager
+    async def transaction():
+        try:
+            yield
+        except Exception:
+            transaction_outcomes.append("rollback")
+            raise
+        transaction_outcomes.append("commit")
+
+    monkeypatch.setattr(terminology_synonyms.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        terminology_synonyms.db,
+        "all",
+        AsyncMock(return_value=[SimpleNamespace(_mapping={"row_count": "10"})]),
+    )
+    monkeypatch.setattr(terminology_synonyms.db, "transaction", transaction)
+
+    with pytest.raises(RuntimeError, match="promoted row count 10 does not match staged row count 11"):
+        await terminology_synonyms._publish_stage(
+            "tenant",
+            SimpleNamespace(__tablename__="terminology_synonym_stage"),
+            11,
+        )
+
+    assert transaction_outcomes == ["rollback"]
 
 
 def _patch_import_dependencies(monkeypatch, count_rows):
@@ -307,11 +361,12 @@ def _patch_import_dependencies(monkeypatch, count_rows):
     return harness
 
 
-def _assert_import_side_effects(harness, expected_import_id):
+def _assert_import_side_effects(harness, expected_import_id, expected_row_count):
     stage_table = f"tenant.terminology_synonym_{expected_import_id}"
     assert harness.made_suffixes == [expected_import_id]
     assert [call.args[0] for call in harness.status.await_args_list] == [
         "CREATE SCHEMA IF NOT EXISTS tenant;",
+        f"DROP TABLE IF EXISTS {stage_table};",
         f"DROP TABLE IF EXISTS {stage_table};",
     ]
     harness.create_table.assert_awaited_once()
@@ -327,7 +382,11 @@ def _assert_import_side_effects(harness, expected_import_id):
     harness.all_rows.assert_awaited_once_with(
         f"SELECT count(*)::bigint AS row_count FROM {stage_table};"
     )
-    harness.publish_stage.assert_awaited_once()
+    harness.publish_stage.assert_awaited_once_with(
+        "tenant",
+        stage_class,
+        expected_row_count,
+    )
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -352,7 +411,7 @@ async def test_import_builds_and_publishes_complete_staged_snapshot(
         import_id="run-01",
     )
 
-    _assert_import_side_effects(harness, expected_import_id)
+    _assert_import_side_effects(harness, expected_import_id, expected_row_count)
     assert import_result == {
         "import_id": expected_import_id,
         "test_mode": test_mode,
@@ -369,6 +428,36 @@ async def test_import_builds_and_publishes_complete_staged_snapshot(
         },
     }
     assert "Terminology synonym import done:" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_dependency", ("push_objects", "publish_stage"))
+async def test_import_cleans_exact_stage_table_on_failure(monkeypatch, caplog, failed_dependency):
+    harness = _patch_import_dependencies(
+        monkeypatch,
+        [SimpleNamespace(_mapping={"row_count": "11"})],
+    )
+    getattr(harness, failed_dependency).side_effect = RuntimeError("synthetic import failure")
+    harness.status.side_effect = [None, None, RuntimeError("synthetic cleanup failure")]
+
+    with pytest.raises(RuntimeError, match="synthetic import failure"):
+        await terminology_synonyms.import_terminology_synonyms(import_id="run-01")
+
+    stage_table = "tenant.terminology_synonym_run01"
+    assert harness.status.await_args_list[-1].args[0] == f"DROP TABLE IF EXISTS {stage_table};"
+    assert "synthetic cleanup failure" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_import_reports_cleanup_failure_after_success(monkeypatch):
+    harness = _patch_import_dependencies(
+        monkeypatch,
+        [SimpleNamespace(_mapping={"row_count": "11"})],
+    )
+    harness.status.side_effect = [None, None, RuntimeError("synthetic cleanup failure")]
+
+    with pytest.raises(RuntimeError, match="synthetic cleanup failure"):
+        await terminology_synonyms.import_terminology_synonyms(import_id="run-01")
 
 
 @pytest.mark.asyncio

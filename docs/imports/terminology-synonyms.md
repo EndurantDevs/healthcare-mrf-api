@@ -18,7 +18,7 @@ It does not download or load official proprietary CPT/CDT synonym files. If thos
 python -m process start terminology-synonyms
 ```
 
-The importer builds a staged `mrf.terminology_synonym_<import_id>` table, indexes it, and atomically promotes it to `mrf.terminology_synonym`.
+The importer builds a staged `mrf.terminology_synonym_<import_id>` table and indexes it. Publication rotates the live table to `mrf.terminology_synonym_old`, promotes the stage, and validates the live row count in one transaction. A failed publication rolls the complete rotation back, and the importer removes only its exact staging table on exit. The retained `_old` table is the immediately previous live dataset and is not normal cleanup material.
 
 ## API Use
 
