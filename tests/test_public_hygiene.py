@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CHECKER_PATH = REPO_ROOT / "scripts" / "ci" / "public_hygiene.py"
+BENCHMARK_PROFILE_PATH = REPO_ROOT / ".agents" / "endurant-harness-benchmarks.json"
 SPEC = importlib.util.spec_from_file_location("public_hygiene", CHECKER_PATH)
 assert SPEC is not None and SPEC.loader is not None
 PUBLIC_HYGIENE = importlib.util.module_from_spec(SPEC)
@@ -32,6 +34,16 @@ def private_example(parts: tuple[str, ...], separator: str) -> str:
 
 
 class PublicHygieneTests(unittest.TestCase):
+    def test_retained_benchmark_uses_ambient_database_credentials(self) -> None:
+        profile = json.loads(BENCHMARK_PROFILE_PATH.read_text(encoding="utf-8"))
+        environment = profile["benchmarks"][
+            "provider-directory-retained-publication"
+        ]["command"]["env"]
+
+        self.assertTrue(
+            {"HLTHPRT_DB_USER", "HLTHPRT_DB_PASSWORD"}.isdisjoint(environment)
+        )
+
     def test_private_names_match_separator_variants(self) -> None:
         for parts in PRIVATE_FRAGMENT_GROUPS:
             for separator in ("", "-", "_", "."):
