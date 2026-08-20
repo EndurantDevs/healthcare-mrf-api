@@ -911,6 +911,7 @@ run_provider_directory_postgres() {
     tests/test_provider_directory_projection_child_read_cleanup_postgres.py \
     tests/test_provider_directory_projection_materializer_postgres.py \
     tests/test_provider_directory_projection_materializer_census_postgres.py \
+    tests/test_provider_directory_projection_finalizer_postgres.py \
     tests/test_provider_directory_projection_decoded_census_migration_postgres.py \
     tests/test_uhc_organization_evidence_schema.py
 }

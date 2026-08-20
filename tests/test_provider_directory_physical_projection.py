@@ -300,8 +300,8 @@ def test_recipe_reuse_requires_exact_artifact_and_transform_contract_hashes():
     assert baseline.recipe_id != different_transform.recipe_id
 
 
-def test_public_facade_exposes_only_structural_projection_foundation():
-    """Expose only supported structural and materialization contracts."""
+def test_public_facade_exposes_projection_operations():
+    """Expose only supported structural, materialization, and finalization contracts."""
 
     structural_symbols = {
         "PROJECTION_ADMISSION_CONTRACT_ID",
@@ -325,8 +325,8 @@ def test_public_facade_exposes_only_structural_projection_foundation():
         "ProviderDirectoryProjectionBusy",
         "ProviderDirectoryProjectionError",
         "ProviderDirectoryProjectionLeaseLost",
-        "claim_projection_recipe",
-        "claim_projection_shard",
+        "claim_projection_recipe", "claim_projection_shard",
+        "finalize_projection",
         "heartbeat_projection_lease",
         "heartbeat_projection_shard",
         "materialize_projection_shards",
