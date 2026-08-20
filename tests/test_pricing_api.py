@@ -21,6 +21,7 @@ from api.ptg2_candidate_audit import (
     PTG2_CANDIDATE_AUDIT_HEADER,
 )
 from api.ptg2_rate_option_refs import encode_rate_option_ref
+from process.terminology_synonyms import _procedure_rows
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "api" / "endpoint" / "pricing.py"
 MODULE_SPEC = spec_from_file_location("pricing_endpoint_unit", MODULE_PATH)
@@ -2347,6 +2348,85 @@ async def test_autocomplete_procedures_includes_match_details_when_requested(
     assert pricing_response["query"]["include_matches"] is True
     assert pricing_response["query"]["year_source"] == "env"
     assert pricing_response["items"][0]["matches"] == [match_by_field]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query", "expected_codes"),
+    [
+        (
+            "knee surgery",
+            {
+                "27445",
+                "27446",
+                "27447",
+                "27486",
+                "27487",
+                "27488",
+                "29870",
+                "29877",
+                "29880",
+                "29881",
+                "29888",
+                "29889",
+            },
+        ),
+        ("arthroscopy", {"29870", "29877", "29880", "29881", "29888", "29889"}),
+        ("arthroplasty", {"27445", "27446", "27447", "27486", "27487"}),
+    ],
+)
+async def test_autocomplete_procedures_returns_complete_curated_knee_aliases(
+    monkeypatch,
+    query,
+    expected_codes,
+):
+    expected_terms_by_code = {
+        "27445": "Knee joint replacement using hinged prosthesis",
+        "27446": "Replacement of knee joint on side of knee",
+        "27447": "Replacement of knee joint, both sides of knee",
+        "27486": "Revision of total knee prosthesis, one component",
+        "27487": "Revision of total knee prosthesis, both components",
+        "27488": "Removal of total knee joint prosthesis",
+        "29870": "Diagnostic exam of knee using an endoscope",
+        "29877": "Removal or shaving of knee joint cartilage using an endoscope",
+        "29880": "Removal of both knee cartilages using an endoscope",
+        "29881": "Removal of knee cartilage using an endoscope",
+        "29888": "Repair of anterior cruciate ligament of knee using an endoscope",
+        "29889": "Repair of posterior cruciate ligament of knee using an endoscope",
+    }
+    alias_rows = [
+        procedure_row
+        for procedure_row in _procedure_rows()
+        if procedure_row["term_key"] == query
+    ]
+    monkeypatch.setattr(
+        pricing_module,
+        "_query_terminology",
+        AsyncMock(return_value=alias_rows),
+    )
+    request = make_request(
+        [FakeResult(rows=[])],
+        args={"q": query, "limit": "50"},
+    )
+
+    response = await autocomplete_procedures(request)
+    pricing_response = json.loads(response.body)
+    returned_codes = {
+        code["code"]
+        for procedure_item in pricing_response["items"]
+        for code in procedure_item["codes"]
+    }
+    returned_terms_by_code = {
+        code["code"]: procedure_item["term"]
+        for procedure_item in pricing_response["items"]
+        for code in procedure_item["codes"]
+    }
+
+    assert returned_codes == expected_codes
+    assert returned_terms_by_code == {
+        code: expected_terms_by_code[code] for code in expected_codes
+    }
+    assert pricing_response["pagination"]["total"] == len(expected_codes)
 
 
 @pytest.mark.asyncio
