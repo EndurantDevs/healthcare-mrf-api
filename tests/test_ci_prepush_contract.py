@@ -157,7 +157,7 @@ def test_native_python_lock_is_complete_and_hashed() -> None:
         if line and not line[0].isspace() and not line.startswith(("#", "--"))
     ]
 
-    assert lock_input == "-r requirements-dev.txt\npip==26.1.2\npip-audit==2.10.1\n"
+    assert lock_input == "-r requirements-dev.txt\npip==26.2.1\npip-audit==2.10.1\n"
     for input_name in ("requirements.txt", "requirements-dev.txt", "requirements-ci.in"):
         input_hash = hashlib.sha256((ROOT / input_name).read_bytes()).hexdigest()
         assert f"# Input: {input_name} ({input_hash})" in lock
