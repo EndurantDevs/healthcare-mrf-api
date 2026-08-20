@@ -10263,7 +10263,8 @@ async def get_near_npi(request):
         if not zip_c:
             continue
         zip_codes.append(_normalize_zip_code(zip_c, "zip_codes"))
-    radius = int(request.args.get("radius", 25 if zip_codes else 10))
+    has_coordinates = in_long is not None and in_lat is not None
+    radius = int(request.args.get("radius", 25 if zip_codes and not has_coordinates else 10))
 
     requested_procedure_codes = _parse_code_tokens(procedure_codes_raw, "procedure_codes")
     requested_medication_codes = _parse_code_tokens(medication_codes_raw, "medication_codes")
@@ -10378,7 +10379,7 @@ async def get_near_npi(request):
 
     _validate_section_filters(section, classification, codes)
     # If only zip was provided, resolve to coordinates first using a separate connection.
-    if (not (in_long and in_lat)) and zip_codes and zip_codes[0]:
+    if not has_coordinates and zip_codes and zip_codes[0]:
         zip_sql = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
         async with db.acquire() as conn_zip:
             for coordinate_record in await conn_zip.all(text(zip_sql), zip_code=zip_codes[0]):

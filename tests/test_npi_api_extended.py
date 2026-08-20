@@ -596,7 +596,7 @@ async def test_get_near_npi_with_lat_long_uses_knn_without_bbox_params(monkeypat
     monkeypatch.setattr(npi_module, "db", FakeDB())
 
     request = types.SimpleNamespace(
-        args={"lat": "41.0", "long": "-87.0", "radius": "10", "limit": "1"},
+        args={"lat": "41.0", "long": "-87.0", "zip_codes": "60601", "limit": "1"},
         app=types.SimpleNamespace(),
     )
     response = await npi_module.get_near_npi(request)
@@ -607,6 +607,7 @@ async def test_get_near_npi_with_lat_long_uses_knn_without_bbox_params(monkeypat
     assert "max_lat" not in captured_query_map
     assert "min_long" not in captured_query_map
     assert "max_long" not in captured_query_map
+    assert captured_query_map["radius"] == 10
 
 
 @pytest.mark.asyncio
