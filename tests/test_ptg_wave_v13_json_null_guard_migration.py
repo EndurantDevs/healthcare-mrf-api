@@ -335,6 +335,11 @@ async def test_postgres_canonical_json_handles_raw_json_edges(monkeypatch):
         assert await connection.fetchval(
             f"SELECT {_quote(schema)}."
             "ptg_wave_canonical_json_ascii_v1($1::json)",
+            '{"z":[3,{"b":2,"a":[2,1]}],"a":0}',
+        ) == '{"a":0,"z":[3,{"a":[2,1],"b":2}]}'
+        assert await connection.fetchval(
+            f"SELECT {_quote(schema)}."
+            "ptg_wave_canonical_json_ascii_v1($1::json)",
             "\t\n1\r",
         ) == "1"
         with pytest.raises(
