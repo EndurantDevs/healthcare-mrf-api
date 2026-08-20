@@ -10262,7 +10262,9 @@ async def get_near_npi(request):
     for zip_c in request.args.get("zip_codes", "").split(","):
         if not zip_c:
             continue
-        zip_codes.append(_normalize_zip_code(zip_c, "zip_codes"))
+        zip_codes.append(
+            _normalize_zip_code(zip_c.strip().rjust(5, "0"), "zip_codes")
+        )
     has_coordinates = in_long is not None and in_lat is not None
     radius = int(request.args.get("radius", 25 if zip_codes and not has_coordinates else 10))
 
