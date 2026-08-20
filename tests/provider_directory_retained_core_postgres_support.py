@@ -33,8 +33,10 @@ from process.provider_directory_retained_artifact_contract import (
     ProducedArtifact,
     RetainedCampaignItem,
     RetainedCampaignPlan,
+    canonical_json,
     endpoint_request_fence_digest,
     expected_range_set_digest,
+    produced_manifest_payload,
 )
 from process.provider_directory_retained_lease_store import acquire_item_lease
 from process.provider_directory_retained_producer_store import admit_produced_artifact
@@ -56,6 +58,19 @@ def digest(label: str) -> str:
     """Return a stable fixture SHA-256 identity."""
 
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def bind_produced_manifest(produced_artifact: ProducedArtifact) -> ProducedArtifact:
+    """Bind fixture metadata to its exact canonical semantic manifest."""
+
+    manifest_bytes = canonical_json(produced_manifest_payload(produced_artifact))
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    return replace(
+        produced_artifact,
+        manifest_sha256=manifest_sha256,
+        manifest_byte_count=len(manifest_bytes),
+        manifest_path=f"fixture://manifest/{manifest_sha256}",
+    )
 
 
 def campaign_item(
@@ -155,16 +170,17 @@ def registry_artifact(label: str, artifact_kind: str) -> ProducedArtifact:
         layout_contract_version=1,
         range_set_sha256="0" * 64,
         canonical_byte_count=len(artifact_bytes),
-        manifest_sha256=digest(f"manifest:{label}"),
-        manifest_byte_count=64,
-        manifest_path=f"fixture://manifest/{digest(f'manifest:{label}')}",
+        manifest_sha256="0" * 64,
+        manifest_byte_count=1,
+        manifest_path="fixture://manifest/pending",
         producer_build_id="retained-core-fixture-v1",
         ranges=(layout_range,),
     )
-    return replace(
+    range_bound_artifact = replace(
         provisional_artifact,
         range_set_sha256=expected_range_set_digest(provisional_artifact),
     )
+    return bind_produced_manifest(range_bound_artifact)
 
 
 def registry_artifact_payload(label: str) -> bytes:
@@ -273,8 +289,10 @@ async def admit_campaign_item(
     campaign_id: str,
     retained_item: RetainedCampaignItem,
     produced_artifact: ProducedArtifact,
+    *,
+    item_lease: LeaseIdentity | None = None,
 ) -> str:
-    """Insert verified registry identities and bind one admitted campaign member."""
+    """Admit one campaign member through the producer admission workflow."""
 
     campaign_state = await connection.fetchrow(
         f"""SELECT lease_owner, lease_epoch
@@ -287,14 +305,16 @@ async def admit_campaign_item(
         owner=str(campaign_state["lease_owner"]),
         epoch=int(campaign_state["lease_epoch"]),
     )
-    item_lease = await acquire_item_lease(
-        connection,
-        campaign_id=campaign_id,
-        source_item_id=retained_item.source_item_id,
-        campaign_lease=campaign_lease,
-        owner=f"fixture-{retained_item.source_item_id[:16]}",
-    )
-    return await admit_produced_artifact(
+    should_preserve_item_lease = item_lease is not None
+    if item_lease is None:
+        item_lease = await acquire_item_lease(
+            connection,
+            campaign_id=campaign_id,
+            source_item_id=retained_item.source_item_id,
+            campaign_lease=campaign_lease,
+            owner=f"fixture-{retained_item.source_item_id[:16]}",
+        )
+    layout_sha256 = await admit_produced_artifact(
         connection,
         campaign_id=campaign_id,
         source_item_id=retained_item.source_item_id,
@@ -302,3 +322,14 @@ async def admit_campaign_item(
         item_lease=item_lease,
         produced_artifact=produced_artifact,
     )
+    if should_preserve_item_lease:
+        await connection.execute(
+            f"""UPDATE {database_table('provider_directory_retained_artifact_campaign_item')}
+                   SET lease_owner=$3, lease_expires_at=now() + interval '5 minutes'
+                 WHERE campaign_id=$1 AND source_item_id=$2 AND lease_epoch=$4;""",
+            campaign_id,
+            retained_item.source_item_id,
+            item_lease.owner,
+            item_lease.epoch,
+        )
+    return layout_sha256

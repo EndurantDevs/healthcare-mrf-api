@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import datetime as dt
 import copy
+import hashlib
 import weakref
 from dataclasses import dataclass, field
 from typing import Any
@@ -19,6 +20,7 @@ from process.provider_directory_retained_artifact_base import (
     RETAINED_LAYOUT_MANIFEST_ID,
     STRONG_ETAG,
     RetainedArtifactError,
+    canonical_json,
     require_digest,
     require_nonnegative_int,
     require_positive_int,
@@ -332,6 +334,12 @@ def produced_manifest_payload(produced: ProducedArtifact) -> dict[str, Any]:
 def produced_layout_digest(produced: ProducedArtifact) -> str:
     """Identify one immutable layout independently from the physical object."""
 
+    manifest_bytes = canonical_json(produced_manifest_payload(produced))
+    if (
+        len(manifest_bytes) != produced.manifest_byte_count
+        or hashlib.sha256(manifest_bytes).hexdigest() != produced.manifest_sha256
+    ):
+        raise RetainedArtifactError("artifact_manifest_mismatch")
     return sha256_json(
         {
             "artifact_sha256": produced.artifact_sha256,

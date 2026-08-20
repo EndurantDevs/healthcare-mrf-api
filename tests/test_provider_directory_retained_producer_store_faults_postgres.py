@@ -85,6 +85,8 @@ async def test_lease_and_item_state_fail_closed(monkeypatch) -> None:
                 item_lease,
                 produced_artifact,
             )
+        assert await _registry_counts(connection) == (0, 0, 0)
+
 
 @pytest.mark.asyncio
 async def test_per_item_budget_fails_before_registry_mutation(monkeypatch) -> None:
@@ -117,7 +119,11 @@ async def test_per_item_budget_fails_before_registry_mutation(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_aggregate_budget_rolls_back_second_item(monkeypatch) -> None:
+async def test_aggregate_budget_rejects_before_second_registry_mutation(
+    monkeypatch,
+) -> None:
+    """Reject the second item before adding its registry identities."""
+
     async with retained_database(monkeypatch) as (connection, _schema_name):
         first_item = campaign_item(
             "producer-aggregate-first", declared_byte_count=None

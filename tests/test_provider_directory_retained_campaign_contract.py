@@ -27,6 +27,7 @@ from process.provider_directory_retained_artifact_contract import (
     RetainedArtifactError,
     RetainedCampaignItem,
     RetainedCampaignPlan,
+    canonical_json,
     expected_range_set_digest,
     endpoint_request_fence_digest,
     is_strong_etag,
@@ -400,6 +401,12 @@ def test_lease_and_layout_digest_contracts():
     )
     range_digest = expected_range_set_digest(produced)
     bound = replace(produced, range_set_sha256=range_digest)
+    manifest_bytes = canonical_json(produced_manifest_payload(bound))
+    bound = replace(
+        bound,
+        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        manifest_byte_count=len(manifest_bytes),
+    )
     assert produced_manifest_payload(bound)["ranges"][0]["record_count"] == 1
     assert len(produced_layout_digest(bound)) == 64
 

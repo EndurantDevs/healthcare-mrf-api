@@ -37,6 +37,7 @@ from process.provider_directory_retained_seal_store import (
 )
 from process.provider_directory_retained_store_support import database_table
 from tests.provider_directory_retained_core_postgres_support import (
+    bind_produced_manifest,
     campaign_item,
     digest,
     fixed_campaign_plan,
@@ -74,7 +75,6 @@ def _produced_artifact(
                 canonical_byte_count=len(range_bytes),
             )
         )
-    manifest_sha256 = digest(f"manifest:{label}:{range_count}")
     provisional = ProducedArtifact(
         artifact_sha256=artifact_sha256,
         artifact_kind=artifact_kind,
@@ -85,15 +85,17 @@ def _produced_artifact(
         layout_contract_version=1,
         range_set_sha256="0" * 64,
         canonical_byte_count=byte_count,
-        manifest_sha256=manifest_sha256,
-        manifest_byte_count=64,
-        manifest_path=f"fixture://manifest/{manifest_sha256}",
+        manifest_sha256="0" * 64,
+        manifest_byte_count=1,
+        manifest_path="fixture://manifest/pending",
         producer_build_id="retained-producer-fixture-v1",
         ranges=tuple(layout_ranges),
     )
-    return replace(
-        provisional,
-        range_set_sha256=expected_range_set_digest(provisional),
+    return bind_produced_manifest(
+        replace(
+            provisional,
+            range_set_sha256=expected_range_set_digest(provisional),
+        )
     )
 
 
@@ -106,9 +108,11 @@ def _with_ranges(
         ranges=layout_ranges,
         range_set_sha256="0" * 64,
     )
-    return replace(
-        provisional,
-        range_set_sha256=expected_range_set_digest(provisional),
+    return bind_produced_manifest(
+        replace(
+            provisional,
+            range_set_sha256=expected_range_set_digest(provisional),
+        )
     )
 
 
@@ -296,6 +300,55 @@ async def test_scratch_locator_variation_replays_without_persisting_input(
             ),
         }
         assert "ephemeral" not in " ".join(dict(locators).values())
+
+
+@pytest.mark.asyncio
+async def test_manifest_binds_artifact_kind_before_layout_reuse(monkeypatch) -> None:
+    """Reject relabeling one proof under another planned artifact kind."""
+
+    async with retained_database(monkeypatch) as (connection, _schema_name):
+        first_item = campaign_item("producer-manifest-kind-first")
+        produced_artifact = _produced_artifact(
+            "producer-manifest-kind-shared",
+            first_item.artifact_kind,
+        )
+        first_campaign, first_campaign_lease, first_item_lease = (
+            await _leased_item_campaign(
+                connection,
+                "producer-manifest-kind-first",
+                first_item,
+            )
+        )
+        await _admit(
+            connection,
+            first_campaign,
+            first_item,
+            first_campaign_lease,
+            first_item_lease,
+            produced_artifact,
+        )
+
+        second_item = campaign_item(
+            "producer-manifest-kind-second",
+            stream_identity=digest("producer-manifest-kind-stream"),
+        )
+        second_campaign, second_campaign_lease, second_item_lease = (
+            await _leased_item_campaign(
+                connection,
+                "producer-manifest-kind-second",
+                second_item,
+            )
+        )
+        with pytest.raises(RetainedArtifactError, match="artifact_manifest_mismatch"):
+            await _admit(
+                connection,
+                second_campaign,
+                second_item,
+                second_campaign_lease,
+                second_item_lease,
+                replace(produced_artifact, artifact_kind=second_item.artifact_kind),
+            )
+        assert await _registry_counts(connection) == (1, 1, 1)
 
 
 @pytest.mark.asyncio
