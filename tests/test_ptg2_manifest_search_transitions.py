@@ -377,6 +377,30 @@ async def test_filtered_providerless_set_returns_no_result(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_explicit_false_keeps_provider_filter_without_expansion(monkeypatch):
+    _install_base_dependencies(monkeypatch)
+    location_matches = AsyncMock(
+        return_value=({_PROVIDER_SET_ID}, {_PROVIDER_SET_ID: [dict(_PROVIDER_ROW)]})
+    )
+    monkeypatch.setattr(serving, "_ptg2_manifest_location_provider_matches", location_matches)
+
+    response, _session = await _search(
+        args=_query_args(
+            state="IL",
+            classification="Family Medicine",
+            include_providers="false",
+        )
+    )
+
+    assert response["query"]["include_providers"] is False
+    assert "npi" not in response["items"][0]
+    assert "address" not in response["items"][0]
+    assert location_matches.await_args.args[2]["classification"] == "Family Medicine"
+    assert location_matches.await_args.kwargs["require_provider_set_coverage"] is True
+    serving._provider_rows_for_sets.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_unexpanded_rate_page_stops_at_public_limit(monkeypatch):
     """Stop shaping unexpanded rows once the requested public page is full."""
 
