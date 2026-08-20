@@ -305,6 +305,8 @@ async def _release_global_finalize_lock_safely(redis, owner_token: str) -> None:
 async def _maintain_global_finalize_lock(
     redis,
     owner_token: str,
+    *,
+    lease_started_at: float | None = None,
 ) -> AsyncIterator[None]:
     """Renew an owned lease and cancel publication immediately if it is lost."""
 
@@ -313,17 +315,37 @@ async def _maintain_global_finalize_lock(
         return
     lease_lost = asyncio.Event()
     owner_task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    lease_deadline = (
+        lease_started_at if lease_started_at is not None else loop.time()
+    ) + PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_TTL_SECONDS
 
     async def refresh_lease() -> None:
         """Keep the lease alive or cancel its publication task on owner loss."""
 
+        nonlocal lease_deadline
         while True:
-            await asyncio.sleep(PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_REFRESH_SECONDS)
             try:
-                if await _has_renewed_global_finalize_lock(redis, owner_token):
-                    continue
+                async with asyncio.timeout_at(lease_deadline):
+                    await asyncio.sleep(
+                        PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_REFRESH_SECONDS
+                    )
+                    attempt_started_at = loop.time()
+                    renewed = await _has_renewed_global_finalize_lock(
+                        redis,
+                        owner_token,
+                    )
+            except TimeoutError:
+                logger.error("Global finalize lock lease deadline expired")
             except Exception:
                 logger.exception("Failed to renew global finalize lock")
+            else:
+                if renewed:
+                    lease_deadline = (
+                        attempt_started_at
+                        + PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_TTL_SECONDS
+                    )
+                    continue
             lease_lost.set()
             owner_task.cancel()
             return

@@ -2050,6 +2050,7 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
 
     global_lock_owner = f"provider_quality:{run_id}:{secrets.token_hex(16)}"
     has_global_lock = False
+    global_lock_started_at = None
     if redis is not None and run_id:
         finalized_key = _state_key(run_id, "finalized")
         if await redis.get(finalized_key):
@@ -2080,6 +2081,7 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
 
         if not await _has_finalize_lock(redis, run_id):
             raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
+        global_lock_started_at = asyncio.get_running_loop().time()
         if not await _has_global_finalize_lock(redis, global_lock_owner):
             raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
         has_global_lock = True
@@ -2087,7 +2089,11 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
     try:
         classes = _staging_classes(stage_suffix, schema)
 
-        async with _maintain_global_finalize_lock(redis, global_lock_owner):
+        async with _maintain_global_finalize_lock(
+            redis,
+            global_lock_owner,
+            lease_started_at=global_lock_started_at,
+        ):
             if redis is not None and run_id:
                 await mark_control_run(
                     run_id,

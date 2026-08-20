@@ -3252,10 +3252,15 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
     )
     has_global_lock = False
     try:
+        global_lock_started_at = asyncio.get_running_loop().time()
         if not await _has_global_finalize_lock(redis, global_lock_owner):
             raise Retry(defer=CLAIMS_FINISH_RETRY_SECONDS)
         has_global_lock = True
-        async with _maintain_global_finalize_lock(redis, global_lock_owner):
+        async with _maintain_global_finalize_lock(
+            redis,
+            global_lock_owner,
+            lease_started_at=global_lock_started_at,
+        ):
             classes_by_name = _staging_classes(
                 finalize_spec.stage_suffix,
                 finalize_spec.schema,

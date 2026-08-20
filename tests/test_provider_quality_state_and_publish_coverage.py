@@ -89,6 +89,16 @@ class _FailingRenewRedis(_MemoryRedis):
         raise RuntimeError("redis unavailable")
 
 
+class _HangingRenewRedis(_MemoryRedis):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def eval(self, *_args):
+        self.attempts += 1
+        await asyncio.Event().wait()
+
+
 class _Transaction:
     async def __aenter__(self):
         return self
@@ -314,6 +324,31 @@ async def test_global_finalize_lock_renewal_error_fails_closed(monkeypatch) -> N
     with pytest.raises(RuntimeError, match="lease lost"):
         async with state._maintain_global_finalize_lock(redis, "owner"):
             await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_global_finalize_lock_hung_renewal_cannot_outlive_deadline(
+    monkeypatch,
+) -> None:
+    redis = _HangingRenewRedis()
+    monkeypatch.setattr(
+        state,
+        "PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_REFRESH_SECONDS",
+        0,
+    )
+    monkeypatch.setattr(
+        state,
+        "PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_TTL_SECONDS",
+        0.01,
+    )
+
+    async def wait_for_deadline() -> None:
+        with pytest.raises(RuntimeError, match="lease lost"):
+            async with state._maintain_global_finalize_lock(redis, "owner"):
+                await asyncio.Event().wait()
+
+    await asyncio.wait_for(wait_for_deadline(), timeout=1)
+    assert redis.attempts == 1
 
 
 @pytest.mark.asyncio

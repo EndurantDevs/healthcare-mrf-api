@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import json
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -361,7 +362,10 @@ async def test_finalize_releases_lock_after_failure_or_cancellation(
         release_lock,
     )
 
-    with pytest.raises(type(finalize_failure), match=str(finalize_failure)):
+    with pytest.raises(
+        type(finalize_failure),
+        match=re.escape(str(finalize_failure)),
+    ):
         await claims_pricing.claims_pricing_finalize(
             {"redis": redis},
             {},
