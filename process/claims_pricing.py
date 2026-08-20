@@ -55,8 +55,10 @@ from process.live_progress import enqueue_live_progress
 from process.procedure_taxonomy_signals import materialize_procedure_taxonomy_signals
 from process.provider_quality_parts.state import (
     _has_global_finalize_lock,
-    _release_global_finalize_lock,
+    _maintain_global_finalize_lock,
+    _release_global_finalize_lock_safely,
 )
+from process.provider_quality_parts.table_helpers import _index_name_for_table
 
 logger = logging.getLogger(__name__)
 
@@ -689,27 +691,48 @@ def _is_row_allowed_for_test(row_number: int) -> bool:
 _row_allowed_for_test = _is_row_allowed_for_test
 
 
-async def _ensure_indexes(obj: type, db_schema: str) -> None:
-    if hasattr(obj, "__my_index_elements__") and obj.__my_index_elements__:
-        cols = ", ".join(obj.__my_index_elements__)
+async def _ensure_indexes(model_class: type, db_schema: str) -> None:
+    if (
+        hasattr(model_class, "__my_index_elements__")
+        and model_class.__my_index_elements__
+    ):
+        cols = ", ".join(model_class.__my_index_elements__)
+        primary_name = _index_name_for_table(
+            model_class.__tablename__,
+            f"{model_class.__tablename__}_idx_primary",
+        )
         await db.status(
             "CREATE UNIQUE INDEX IF NOT EXISTS "
-            + f"{obj.__tablename__}_idx_primary ON {db_schema}.{obj.__tablename__} ({cols});"
+            + f"{primary_name} ON {db_schema}.{model_class.__tablename__} ({cols});"
         )
-    if hasattr(obj, "__my_additional_indexes__") and obj.__my_additional_indexes__:
-        for idx in obj.__my_additional_indexes__:
+    if (
+        hasattr(model_class, "__my_additional_indexes__")
+        and model_class.__my_additional_indexes__
+    ):
+        for idx in model_class.__my_additional_indexes__:
             elements = idx.get("index_elements")
             if not elements:
                 continue
-            base_name = idx.get("name") or f"{obj.__tablename__}_{'_'.join(elements)}_idx"
-            if getattr(obj, "__main_table__", obj.__tablename__) != obj.__tablename__:
-                name = f"{obj.__tablename__}_{idx.get('staging_name') or base_name}"
+            base_name = idx.get("name") or (
+                f"{model_class.__tablename__}_{'_'.join(elements)}_idx"
+            )
+            is_staged = (
+                getattr(model_class, "__main_table__", model_class.__tablename__)
+                != model_class.__tablename__
+            )
+            if is_staged:
+                staging_name = idx.get("staging_name") or base_name
+                name = f"{model_class.__tablename__}_{staging_name}"
             else:
                 name = base_name
+            name = _index_name_for_table(model_class.__tablename__, name)
             using = idx.get("using")
             where = idx.get("where")
             cols = ", ".join(elements)
-            statement = f"CREATE INDEX IF NOT EXISTS {name} ON {db_schema}.{obj.__tablename__}"
+            statement = (
+                f"CREATE INDEX IF NOT EXISTS {name} "
+                f"ON {db_schema}.{model_class.__tablename__}"
+            )
             if using:
                 statement += f" USING {using}"
             statement += f" ({cols})"
@@ -2451,8 +2474,12 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                 f"RENAME TO {table};"
             )
 
+            staged_primary_name = _index_name_for_table(
+                staged_class.__tablename__,
+                f"{staged_class.__tablename__}_idx_primary",
+            )
             await db.status(
-                f"ALTER INDEX IF EXISTS {schema}.{staged_class.__tablename__}_idx_primary "
+                f"ALTER INDEX IF EXISTS {schema}.{staged_primary_name} "
                 f"RENAME TO {table}_idx_primary;"
             )
 
@@ -2468,8 +2495,12 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                     continue
                 base_name = index.get("name") or f"{table}_{'_'.join(elements)}_idx"
                 staging_name = index.get("staging_name") or base_name
+                staged_index_name = _index_name_for_table(
+                    staged_class.__tablename__,
+                    f"{staged_class.__tablename__}_{staging_name}",
+                )
                 await db.status(
-                    f"ALTER INDEX IF EXISTS {schema}.{staged_class.__tablename__}_{staging_name} "
+                    f"ALTER INDEX IF EXISTS {schema}.{staged_index_name} "
                     f"RENAME TO {base_name};"
                 )
 
@@ -3216,41 +3247,44 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
     early_response = await _wait_for_claims_finalize_turn(redis, finalize_spec)
     if early_response is not None:
         return early_response
-    global_lock_owner = f"claims_pricing:{finalize_spec.run_id}"
+    global_lock_owner = (
+        f"claims_pricing:{finalize_spec.run_id}:{finalize_spec.finalize_lock_token}"
+    )
     has_global_lock = False
     try:
         if not await _has_global_finalize_lock(redis, global_lock_owner):
             raise Retry(defer=CLAIMS_FINISH_RETRY_SECONDS)
         has_global_lock = True
-        classes_by_name = _staging_classes(
-            finalize_spec.stage_suffix,
-            finalize_spec.schema,
-        )
-        cost_level_diagnostics = await _materialize_and_publish_claims(
-            classes_by_name,
-            finalize_spec.schema,
-        )
-        await _record_claims_finalized(redis, finalize_spec)
-        _cleanup_claims_work_dir(manifest_by_field, finalize_spec)
-        logger.info(
-            "CMS claims pricing import finalized: "
-            "test_mode=%s import_id=%s run_id=%s",
-            finalize_spec.test_mode,
-            finalize_spec.import_id,
-            finalize_spec.run_id,
-        )
-        await _mark_claims_succeeded(finalize_spec)
-        return {
-            "ok": True,
-            "import_id": finalize_spec.import_id,
-            "run_id": finalize_spec.run_id,
-            "stage_suffix": finalize_spec.stage_suffix,
-            "schema": finalize_spec.schema,
-            "cost_level_diagnostics": cost_level_diagnostics,
-        }
+        async with _maintain_global_finalize_lock(redis, global_lock_owner):
+            classes_by_name = _staging_classes(
+                finalize_spec.stage_suffix,
+                finalize_spec.schema,
+            )
+            cost_level_diagnostics = await _materialize_and_publish_claims(
+                classes_by_name,
+                finalize_spec.schema,
+            )
+            await _record_claims_finalized(redis, finalize_spec)
+            _cleanup_claims_work_dir(manifest_by_field, finalize_spec)
+            logger.info(
+                "CMS claims pricing import finalized: "
+                "test_mode=%s import_id=%s run_id=%s",
+                finalize_spec.test_mode,
+                finalize_spec.import_id,
+                finalize_spec.run_id,
+            )
+            await _mark_claims_succeeded(finalize_spec)
+            return {
+                "ok": True,
+                "import_id": finalize_spec.import_id,
+                "run_id": finalize_spec.run_id,
+                "stage_suffix": finalize_spec.stage_suffix,
+                "schema": finalize_spec.schema,
+                "cost_level_diagnostics": cost_level_diagnostics,
+            }
     finally:
         if has_global_lock:
-            await _release_global_finalize_lock(redis, global_lock_owner)
+            await _release_global_finalize_lock_safely(redis, global_lock_owner)
         await _release_claims_finalize_lock_safely(redis, finalize_spec)
 
 

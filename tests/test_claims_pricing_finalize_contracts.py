@@ -319,6 +319,7 @@ async def test_finalize_releases_lock_after_failure_or_cancellation(
     finalize_failure,
 ):
     redis = RecordingRedis()
+    redis.eval = AsyncMock(side_effect=RuntimeError("global release failed"))
     finalize_spec = claims_pricing._ClaimsFinalizeSpec(
         "i",
         "r",
@@ -360,7 +361,7 @@ async def test_finalize_releases_lock_after_failure_or_cancellation(
         release_lock,
     )
 
-    with pytest.raises(type(finalize_failure)):
+    with pytest.raises(type(finalize_failure), match=str(finalize_failure)):
         await claims_pricing.claims_pricing_finalize(
             {"redis": redis},
             {},

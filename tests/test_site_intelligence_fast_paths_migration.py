@@ -68,7 +68,7 @@ def test_migration_matches_claims_and_signal_models():
         column.name for column in PricingProcedureTaxonomySignal.__table__.columns
     }
     assert migration.down_revision == (
-        "20260820020000_ptg_ordinary_terminal_json_null_guard"
+        "20260820030000_ptg_ordinary_terminal_json_canonical_digest"
     )
 
 

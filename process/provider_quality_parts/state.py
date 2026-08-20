@@ -4,14 +4,16 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import statistics
 import time
-from typing import Any
+from typing import Any, AsyncIterator
 
 from process.provider_quality_parts.config import (
     MAT_PHASE_SEQUENCE,
     PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY,
+    PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_REFRESH_SECONDS,
     PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_TTL_SECONDS,
     PROVIDER_QUALITY_MARK_DONE_RETRIES,
     PROVIDER_QUALITY_MARK_DONE_RETRY_BASE_SECONDS,
@@ -246,20 +248,93 @@ async def _has_finalize_lock(redis, run_id: str) -> bool:
     return bool(await redis.get(lock_key))
 
 
-async def _has_global_finalize_lock(redis, run_id: str) -> bool:
+async def _has_global_finalize_lock(redis, owner_token: str) -> bool:
     lock_set = await redis.set(
         PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY,
-        run_id,
+        owner_token,
         ex=PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_TTL_SECONDS,
         nx=True,
     )
     if lock_set:
         return True
-    current_owner = _decode_redis_str(await redis.get(PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY))
-    return current_owner == run_id
+    return await _has_renewed_global_finalize_lock(redis, owner_token)
 
 
-async def _release_global_finalize_lock(redis, run_id: str) -> None:
-    current_owner = _decode_redis_str(await redis.get(PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY))
-    if current_owner == run_id:
-        await redis.delete(PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY)
+async def _has_renewed_global_finalize_lock(redis, owner_token: str) -> bool:
+    """Refresh the shared finalize lease only while this attempt owns it."""
+
+    renew_script = (
+        "if redis.call('get', KEYS[1]) == ARGV[1] then "
+        "return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end"
+    )
+    renewed = await redis.eval(
+        renew_script,
+        1,
+        PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY,
+        owner_token,
+        PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_TTL_SECONDS,
+    )
+    return bool(renewed)
+
+
+async def _release_global_finalize_lock(redis, owner_token: str) -> None:
+    """Atomically release only the shared lease owned by this attempt."""
+
+    release_script = (
+        "if redis.call('get', KEYS[1]) == ARGV[1] then "
+        "return redis.call('del', KEYS[1]) else return 0 end"
+    )
+    await redis.eval(
+        release_script,
+        1,
+        PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY,
+        owner_token,
+    )
+
+
+async def _release_global_finalize_lock_safely(redis, owner_token: str) -> None:
+    """Release the shared lease without masking finalize success or failure."""
+
+    try:
+        await _release_global_finalize_lock(redis, owner_token)
+    except Exception as exc:
+        logger.warning("Failed to release global finalize lock: %s", exc)
+
+
+@asynccontextmanager
+async def _maintain_global_finalize_lock(
+    redis,
+    owner_token: str,
+) -> AsyncIterator[None]:
+    """Renew an owned lease and cancel publication immediately if it is lost."""
+
+    if redis is None:
+        yield
+        return
+    lease_lost = asyncio.Event()
+    owner_task = asyncio.current_task()
+
+    async def refresh_lease() -> None:
+        """Keep the lease alive or cancel its publication task on owner loss."""
+
+        while True:
+            await asyncio.sleep(PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_REFRESH_SECONDS)
+            try:
+                if await _has_renewed_global_finalize_lock(redis, owner_token):
+                    continue
+            except Exception:
+                logger.exception("Failed to renew global finalize lock")
+            lease_lost.set()
+            owner_task.cancel()
+            return
+
+    refresh_task = asyncio.create_task(refresh_lease())
+    try:
+        yield
+    except asyncio.CancelledError:
+        if lease_lost.is_set():
+            raise RuntimeError("global finalize lock lease lost") from None
+        raise
+    finally:
+        refresh_task.cancel()
+        await asyncio.gather(refresh_task, return_exceptions=True)

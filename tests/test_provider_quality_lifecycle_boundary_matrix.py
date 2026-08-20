@@ -64,11 +64,12 @@ def _patch_finalize_common(monkeypatch) -> dict[str, AsyncMock]:
     )
     monkeypatch.setattr(
         provider_quality,
-        "_release_global_finalize_lock",
+        "_release_global_finalize_lock_safely",
         calls_by_name["release"],
     )
     monkeypatch.setattr(provider_quality, "_step_start", lambda _label: 0.0)
     monkeypatch.setattr(provider_quality, "_step_end", lambda *_args: None)
+    monkeypatch.setattr(provider_quality.secrets, "token_hex", lambda _bytes: "lock-token")
     return calls_by_name
 
 
@@ -302,7 +303,7 @@ async def test_finalize_publishes_sharded_degraded_run_and_cleans_workdir(
     assert calls_by_name["metadata"].await_args.kwargs["status"] == "degraded_test"
     calls_by_name["release"].assert_awaited_once_with(
         redis,
-        "provider_quality:manifest-run",
+        "provider_quality:manifest-run:lock-token",
     )
 
 
@@ -360,7 +361,7 @@ async def test_finalize_retry_releases_global_lock_without_failure_mark(
     calls_by_name["failed"].assert_not_awaited()
     calls_by_name["release"].assert_awaited_once_with(
         redis,
-        "provider_quality:run",
+        "provider_quality:run:lock-token",
     )
 
 

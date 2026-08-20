@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from types import SimpleNamespace
 
@@ -18,6 +19,7 @@ class _MemoryRedis:
         self.lists = {}
         self.sets = {}
         self.expired = []
+        self.renewed = asyncio.Event()
 
     async def delete(self, *keys):
         for key in keys:
@@ -35,6 +37,17 @@ class _MemoryRedis:
 
     async def get(self, key):
         return self.values.get(key)
+
+    async def eval(self, _script, key_count, key, owner, *args):
+        assert key_count == 1
+        if self.values.get(key) != owner:
+            return 0
+        if args:
+            self.expired.append((key, args[0]))
+            self.renewed.set()
+            return 1
+        self.values.pop(key, None)
+        return 1
 
     async def incrby(self, key, value):
         self.values[key] = int(self.values.get(key, 0)) + value
@@ -58,6 +71,22 @@ class _MemoryRedis:
 
     async def scard(self, key):
         return len(self.sets.get(key, set()))
+
+
+class _TakeoverRedis(_MemoryRedis):
+    async def get(self, key):
+        owner = await super().get(key)
+        self.values[key] = "new-owner"
+        return owner
+
+    async def eval(self, script, key_count, key, owner, *args):
+        self.values[key] = "new-owner"
+        return await super().eval(script, key_count, key, owner, *args)
+
+
+class _FailingRenewRedis(_MemoryRedis):
+    async def eval(self, *_args):
+        raise RuntimeError("redis unavailable")
 
 
 class _Transaction:
@@ -232,6 +261,86 @@ async def test_finalize_lock_claim_and_release_are_owner_fenced() -> None:
     assert state.PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY not in redis.values
 
 
+@pytest.mark.asyncio
+async def test_global_finalize_lock_release_cannot_delete_a_new_owner() -> None:
+    redis = _TakeoverRedis()
+    lock_key = state.PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY
+    redis.values[lock_key] = "owner"
+
+    await state._release_global_finalize_lock(redis, "owner")
+
+    assert redis.values[lock_key] == "new-owner"
+
+
+@pytest.mark.asyncio
+async def test_global_finalize_lock_renews_and_fails_closed_on_owner_loss(
+    monkeypatch,
+) -> None:
+    redis = _MemoryRedis()
+    lock_key = state.PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY
+    redis.values[lock_key] = "owner"
+    monkeypatch.setattr(
+        state,
+        "PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_REFRESH_SECONDS",
+        0,
+    )
+    has_reached_publication = False
+
+    with pytest.raises(RuntimeError, match="lease lost"):
+        async with state._maintain_global_finalize_lock(redis, "owner"):
+            await asyncio.wait_for(redis.renewed.wait(), timeout=1)
+            redis.values[lock_key] = "new-owner"
+            await asyncio.sleep(1)
+            has_reached_publication = True
+
+    assert not has_reached_publication
+    assert redis.values[lock_key] == "new-owner"
+    expected_expiration = (
+        lock_key,
+        state.PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_TTL_SECONDS,
+    )
+    assert expected_expiration in redis.expired
+
+
+@pytest.mark.asyncio
+async def test_global_finalize_lock_renewal_error_fails_closed(monkeypatch) -> None:
+    redis = _FailingRenewRedis()
+    monkeypatch.setattr(
+        state,
+        "PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_REFRESH_SECONDS",
+        0,
+    )
+
+    with pytest.raises(RuntimeError, match="lease lost"):
+        async with state._maintain_global_finalize_lock(redis, "owner"):
+            await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_global_finalize_lock_preserves_external_cancellation() -> None:
+    redis = _MemoryRedis()
+    has_entered = asyncio.Event()
+
+    async def hold_lease() -> None:
+        async with state._maintain_global_finalize_lock(redis, "owner"):
+            has_entered.set()
+            await asyncio.Event().wait()
+
+    lease_task = asyncio.create_task(hold_lease())
+    await has_entered.wait()
+    lease_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await lease_task
+
+
+@pytest.mark.asyncio
+async def test_global_finalize_lock_without_redis_is_noop() -> None:
+    has_entered = False
+    async with state._maintain_global_finalize_lock(None, "owner"):
+        has_entered = True
+    assert has_entered
+
+
 def _patch_publish_models(monkeypatch, live_classes):
     model_names = (
         "PricingQppProvider",
@@ -266,7 +375,11 @@ async def test_publish_renames_all_tables_and_indexes(monkeypatch) -> None:
     )
     signal_stage = stage_classes_by_name[live_classes[-1].__name__]
     signal_stage.__tablename__ = (
-        "procedure_taxonomy_signal_abcdefghijkl_12345678x"
+        "pricing_provider_quality_measure_abcdefghijkl_12345678x"
+    )
+    staged_signal_primary = table_helpers._index_name_for_table(
+        signal_stage.__tablename__,
+        f"{signal_stage.__tablename__}_idx_primary",
     )
     staged_signal_index = table_helpers._index_name_for_table(
         signal_stage.__tablename__,
@@ -287,6 +400,10 @@ async def test_publish_renames_all_tables_and_indexes(monkeypatch) -> None:
     assert "ALTER INDEX IF EXISTS mrf.stage_0_idx_primary" in statements
     assert "archived_live_0_npi" in statements
     assert "live_0_year_idx" in statements
+    assert (
+        f"ALTER INDEX IF EXISTS mrf.{staged_signal_primary} "
+        "RENAME TO live_5_idx_primary"
+    ) in statements
     assert (
         f"ALTER INDEX IF EXISTS mrf.{staged_signal_index} "
         "RENAME TO procedure_taxonomy_signal_lookup_idx"

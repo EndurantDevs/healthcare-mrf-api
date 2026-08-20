@@ -56,15 +56,15 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
     async with db.transaction():
         for cls in final_classes:
             staged_model = classes[cls.__name__]
+            stage = staged_model.__tablename__
             table = cls.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {schema}.{table}_old;")
             await db.status(f"ALTER TABLE IF EXISTS {schema}.{table} RENAME TO {table}_old;")
-            await db.status(f"ALTER TABLE IF EXISTS {schema}.{staged_model.__tablename__} RENAME TO {table};")
+            await db.status(f"ALTER TABLE IF EXISTS {schema}.{stage} RENAME TO {table};")
 
             await archive_index(f"{table}_idx_primary")
-            await db.status(
-                f"ALTER INDEX IF EXISTS {schema}.{staged_model.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
-            )
+            primary_name = _index_name_for_table(stage, f"{stage}_idx_primary")
+            await db.status(f"ALTER INDEX IF EXISTS {schema}.{primary_name} RENAME TO {table}_idx_primary;")
 
             move_indexes = []
             if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
@@ -79,7 +79,7 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                 base_name = index.get("name") or f"{table}_{'_'.join(elements)}_idx"
                 await archive_index(base_name)
                 staging_name = index.get("staging_name") or base_name
-                staged_index_name = _index_name_for_table(staged_model.__tablename__, f"{staged_model.__tablename__}_{staging_name}")
+                staged_index_name = _index_name_for_table(stage, f"{stage}_{staging_name}")
                 await db.status(
                     f"ALTER INDEX IF EXISTS {schema}.{staged_index_name} RENAME TO {base_name};"
                 )

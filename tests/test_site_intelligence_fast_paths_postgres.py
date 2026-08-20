@@ -393,9 +393,14 @@ async def _publish_staged_indexes(connection, migration, schema: str) -> None:
             f'DROP TABLE "{schema}".procedure_taxonomy_signal; '
             f'ALTER TABLE "{schema}"."{signal_stage}" '
             'RENAME TO procedure_taxonomy_signal; '
+            f'ALTER INDEX "{schema}"."{signal_stage}_idx_primary" '
+            'RENAME TO procedure_taxonomy_signal_idx_primary; '
             f'ALTER INDEX "{schema}"."{signal_stage}_taxonomy_lookup" '
             f'RENAME TO {migration.SIGNAL_INDEX_NAME}'
         )
+    assert await connection.fetchval(
+        "SELECT to_regclass($1)", f"{schema}.procedure_taxonomy_signal_idx_primary"
+    )
 
 
 @pytest.mark.asyncio
