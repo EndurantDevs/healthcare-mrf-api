@@ -126,7 +126,10 @@ def test_state_split_keeps_facade_helpers_stable():
         provider_quality._has_global_finalize_lock
         is provider_quality_state._has_global_finalize_lock
     )
-    assert provider_quality._release_global_finalize_lock is provider_quality_state._release_global_finalize_lock
+    assert (
+        provider_quality._release_global_finalize_lock_safely
+        is provider_quality_state._release_global_finalize_lock_safely
+    )
     assert provider_quality._log_materialize_phase_summary is provider_quality_state._log_materialize_phase_summary
     assert provider_quality._safe_int(b"42") == 42
     assert provider_quality._safe_int("bad", 7) == 7

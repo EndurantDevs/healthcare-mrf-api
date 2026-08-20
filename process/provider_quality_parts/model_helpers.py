@@ -30,6 +30,7 @@ def _resolve_optional_model(name: str) -> type | None:
 PricingProviderQualityFeature = _resolve_optional_model("PricingProviderQualityFeature")
 PricingProviderQualityProcedureLSH = _resolve_optional_model("PricingProviderQualityProcedureLSH")
 PricingProviderQualityPeerTarget = _resolve_optional_model("PricingProviderQualityPeerTarget")
+PricingProcedureTaxonomySignal = _resolve_optional_model("PricingProcedureTaxonomySignal")
 
 
 def _materialize_reporting_years(manifest: dict[str, Any]) -> tuple[int, ...]:
@@ -69,6 +70,7 @@ def _cohort_model_classes() -> tuple[type, ...]:
         PricingProviderQualityFeature,
         PricingProviderQualityProcedureLSH,
         PricingProviderQualityPeerTarget,
+        PricingProcedureTaxonomySignal,
     ):
         if cls is not None:
             classes.append(cls)

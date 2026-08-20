@@ -62,6 +62,7 @@ def test_reporting_years_default_and_out_of_range_fallbacks(monkeypatch) -> None
 def test_optional_cohort_model_discovery_and_presence(monkeypatch) -> None:
     feature_model = type("FeatureModel", (), {})
     peer_model = type("PeerModel", (), {})
+    signal_model = type("SignalModel", (), {})
     monkeypatch.setattr(
         model_helpers,
         "PricingProviderQualityFeature",
@@ -73,8 +74,17 @@ def test_optional_cohort_model_discovery_and_presence(monkeypatch) -> None:
         "PricingProviderQualityPeerTarget",
         peer_model,
     )
+    monkeypatch.setattr(
+        model_helpers,
+        "PricingProcedureTaxonomySignal",
+        signal_model,
+    )
 
-    assert model_helpers._cohort_model_classes() == (feature_model, peer_model)
+    assert model_helpers._cohort_model_classes() == (
+        feature_model,
+        peer_model,
+        signal_model,
+    )
     assert not model_helpers._cohort_models_present({})
     complete_model_by_name = {
         name: type(name, (), {}) for name in model_helpers.COHORT_MODEL_CLASS_NAMES
@@ -83,6 +93,7 @@ def test_optional_cohort_model_discovery_and_presence(monkeypatch) -> None:
 
     monkeypatch.setattr(model_helpers, "PricingProviderQualityFeature", None)
     monkeypatch.setattr(model_helpers, "PricingProviderQualityPeerTarget", None)
+    monkeypatch.setattr(model_helpers, "PricingProcedureTaxonomySignal", None)
     assert model_helpers._cohort_model_classes() == ()
 
 

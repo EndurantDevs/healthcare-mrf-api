@@ -4851,6 +4851,7 @@ class PricingProcedure(Base, JSONOutputMixin):
     total_services = Column(Float)
     total_beneficiaries = Column(Float)
     source_year = Column(Integer)
+    provider_count = Column(Integer, nullable=False, server_default="0")
 
 
 class PricingProviderProcedure(Base, JSONOutputMixin):
@@ -4869,6 +4870,11 @@ class PricingProviderProcedure(Base, JSONOutputMixin):
         {"index_elements": ("year", "lower(reported_code)"), "name": "pricing_provider_proc_year_reported_code_lower_idx"},
         {"index_elements": ("year", "lower(service_description)"), "name": "pricing_provider_proc_year_service_description_lower_idx"},
         {"index_elements": ("year", "npi", "total_allowed_amount DESC"), "name": "pricing_provider_proc_year_npi_total_allowed_amount_desc_idx"},
+        {
+            "index_elements": ("year", "procedure_code", "total_allowed_amount DESC", "npi"),
+            "name": "pricing_provider_proc_amount_page_idx",
+            "staging_name": "amt_page",
+        },
     ]
 
     npi = Column(BigInteger, nullable=False)
@@ -5255,6 +5261,58 @@ class PricingProviderQualityFeature(Base, JSONOutputMixin):
     taxonomy_code = Column(String(32))
     taxonomy_classification = Column(String)
     procedure_count = Column(Integer)
+    updated_at = Column(DateTime)
+
+
+class PricingProcedureTaxonomySignal(Base, JSONOutputMixin):
+    __tablename__ = "procedure_taxonomy_signal"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "procedure_code",
+            "year",
+            "setting_key",
+            "evidence_source",
+            "taxonomy_code",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = [
+        "procedure_code",
+        "year",
+        "setting_key",
+        "evidence_source",
+        "taxonomy_code",
+    ]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": (
+                "year",
+                "procedure_code",
+                "setting_key",
+                "evidence_source",
+                "distinct_npis DESC",
+                "total_services DESC",
+                "taxonomy_code",
+            ),
+            "name": "procedure_taxonomy_signal_lookup_idx",
+            "staging_name": "taxonomy_lookup",
+        }
+    ]
+
+    procedure_code = Column(BigInteger, nullable=False)
+    year = Column(Integer, nullable=False)
+    setting_key = Column(String(64), nullable=False)
+    evidence_source = Column(String(32), nullable=False)
+    taxonomy_code = Column(String(32), nullable=False)
+    classification = Column(String)
+    specialization = Column(String)
+    display_name = Column(String)
+    distinct_npis = Column(Integer, nullable=False)
+    total_services = Column(Float, nullable=False)
+    total_beneficiaries = Column(Float, nullable=False)
+    provider_types = Column(ARRAY(String), nullable=False)
+    source_relation_fingerprint = Column(String(128), nullable=False)
     updated_at = Column(DateTime)
 
 

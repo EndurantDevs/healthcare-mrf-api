@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import json
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -303,6 +304,7 @@ async def test_finalize_with_redis_records_terminal_state(monkeypatch):
     monkeypatch.setattr(claims_pricing, "_mark_claims_succeeded", AsyncMock())
     await claims_pricing.claims_pricing_finalize({"redis": redis}, {})
     assert redis.values_by_key["claims_pricing:r:finalized"] == "1"
+    assert "imports:finalize_mutex" not in redis.values_by_key
 
 
 @pytest.mark.asyncio
@@ -318,6 +320,7 @@ async def test_finalize_releases_lock_after_failure_or_cancellation(
     finalize_failure,
 ):
     redis = RecordingRedis()
+    redis.eval = AsyncMock(side_effect=RuntimeError("global release failed"))
     finalize_spec = claims_pricing._ClaimsFinalizeSpec(
         "i",
         "r",
@@ -359,7 +362,10 @@ async def test_finalize_releases_lock_after_failure_or_cancellation(
         release_lock,
     )
 
-    with pytest.raises(type(finalize_failure)):
+    with pytest.raises(
+        type(finalize_failure),
+        match=re.escape(str(finalize_failure)),
+    ):
         await claims_pricing.claims_pricing_finalize(
             {"redis": redis},
             {},
@@ -482,5 +488,5 @@ def test_staging_classes_use_schema_override(monkeypatch):
 
     monkeypatch.setattr(claims_pricing, "make_class", make_stage)
     classes_by_name = claims_pricing._staging_classes("stage-a", "mrf")
-    assert len(classes_by_name) == 7
+    assert len(classes_by_name) == 8
     assert all(suffix == "stage-a" and schema == "mrf" for _name, suffix, schema in calls)

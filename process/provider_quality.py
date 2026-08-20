@@ -50,6 +50,7 @@ from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 from process.control_lifecycle import mark_control_run
 from process.live_progress import enqueue_live_progress
+from process.procedure_taxonomy_signals import materialize_procedure_taxonomy_signals
 from process.provider_quality_parts.config import (
     COHORT_MODEL_CLASS_NAMES,
     DATASET_BY_KEY,
@@ -160,6 +161,7 @@ from process.provider_quality_parts.model_helpers import (
     PricingProviderQualityFeature,
     PricingProviderQualityPeerTarget,
     PricingProviderQualityProcedureLSH,
+    PricingProcedureTaxonomySignal,
     _build_stage_suffix,
     _chunk_job_id,
     _cohort_model_classes,
@@ -202,13 +204,14 @@ from process.provider_quality_parts.state import (
     _mark_chunk_done_with_retry,
     _mark_materialize_done,
     _mark_materialize_failed,
+    _maintain_global_finalize_lock,
     _mat_done_key,
     _mat_failed_key,
     _mat_phase_duration_key,
     _mat_phase_key,
     _mat_total_key,
     _record_materialize_phase_duration,
-    _release_global_finalize_lock,
+    _release_global_finalize_lock_safely,
     _reset_materialize_state,
     _safe_int,
     _set_materialize_phase,
@@ -1545,6 +1548,21 @@ async def _materialize_quality_rows(classes: dict[str, type], schema: str, run_i
     )
 
 
+async def _materialize_procedure_taxonomy_signals(
+    classes: dict[str, type],
+    schema: str,
+) -> None:
+    """Build bounded procedure taxonomy evidence from staged quality features."""
+
+    await materialize_procedure_taxonomy_signals(
+        schema=schema,
+        signal_model=classes.get("PricingProcedureTaxonomySignal"),
+        provider_model=PricingProvider,
+        provider_procedure_model=PricingProviderProcedure,
+        quality_feature_model=classes.get("PricingProviderQualityFeature"),
+    )
+
+
 async def _enqueue_materialize_phase_shards(
     redis,
     *,
@@ -2030,7 +2048,9 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
     if not stage_suffix:
         stage_suffix = str(manifest.get("stage_suffix") or _build_stage_suffix(import_id_val, run_id))
 
+    global_lock_owner = f"provider_quality:{run_id}:{secrets.token_hex(16)}"
     has_global_lock = False
+    global_lock_started_at = None
     if redis is not None and run_id:
         finalized_key = _state_key(run_id, "finalized")
         if await redis.get(finalized_key):
@@ -2061,66 +2081,77 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
 
         if not await _has_finalize_lock(redis, run_id):
             raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
-        if not await _has_global_finalize_lock(redis, run_id):
+        global_lock_started_at = asyncio.get_running_loop().time()
+        if not await _has_global_finalize_lock(redis, global_lock_owner):
             raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
         has_global_lock = True
-        await mark_control_run(
-            run_id,
-            status="finalizing",
-            phase_detail="provider-quality finalizing",
-            progress_message="finalizing",
-            progress={
-                "unit": "chunks",
-                "total": total_chunks,
-                "done": done_chunks,
-                "pct": 99,
-                "message": "finalizing",
-                "phase": "provider-quality finalizing",
-            },
-        )
 
     try:
         classes = _staging_classes(stage_suffix, schema)
 
-        step_started_at = _step_start("materialize provider quality rows")
-        use_sharded_materialization = (
-            PROVIDER_QUALITY_COHORT_ENABLED
-            and PROVIDER_QUALITY_MATERIALIZE_SHARDED_ENABLED
-            and _cohort_models_present(classes)
-        )
-        if use_sharded_materialization:
-            if redis is None or not run_id:
-                raise RuntimeError("Sharded provider-quality materialization requires redis and run_id.")
-            await _materialize_quality_rows_sharded(
-                redis,
-                classes=classes,
-                schema=schema,
-                run_id=run_id,
-                stage_suffix=stage_suffix,
-                test_mode=test_mode,
-                manifest=manifest,
+        async with _maintain_global_finalize_lock(
+            redis,
+            global_lock_owner,
+            lease_started_at=global_lock_started_at,
+        ):
+            if redis is not None and run_id:
+                await mark_control_run(
+                    run_id,
+                    status="finalizing",
+                    phase_detail="provider-quality finalizing",
+                    progress_message="finalizing",
+                    progress={
+                        "unit": "chunks",
+                        "total": total_chunks,
+                        "done": done_chunks,
+                        "pct": 99,
+                        "message": "finalizing",
+                        "phase": "provider-quality finalizing",
+                    },
+                )
+            step_started_at = _step_start("materialize provider quality rows")
+            use_sharded_materialization = (
+                PROVIDER_QUALITY_COHORT_ENABLED
+                and PROVIDER_QUALITY_MATERIALIZE_SHARDED_ENABLED
+                and _cohort_models_present(classes)
             )
-        else:
-            await _materialize_quality_rows(classes, schema, run_id)
-        _step_end("materialize provider quality rows", step_started_at)
+            if use_sharded_materialization:
+                if redis is None or not run_id:
+                    raise RuntimeError("Sharded provider-quality materialization requires redis and run_id.")
+                await _materialize_quality_rows_sharded(
+                    redis,
+                    classes=classes,
+                    schema=schema,
+                    run_id=run_id,
+                    stage_suffix=stage_suffix,
+                    test_mode=test_mode,
+                    manifest=manifest,
+                )
+            else:
+                await _materialize_quality_rows(classes, schema, run_id)
+            _step_end("materialize provider quality rows", step_started_at)
 
-        if PROVIDER_QUALITY_DEFER_STAGE_INDEXES:
-            step_started_at = _step_start("build provider quality staging indexes")
-            await _build_staging_indexes(classes, schema)
-            _step_end("build provider quality staging indexes", step_started_at)
+            step_started_at = _step_start("materialize procedure taxonomy signals")
+            await _materialize_procedure_taxonomy_signals(classes, schema)
+            _step_end("materialize procedure taxonomy signals", step_started_at)
 
-        step_started_at = _step_start("publish provider quality staging -> final")
-        await _publish_by_table_rename(classes, schema)
-        _step_end("publish provider quality staging -> final", step_started_at)
+            if PROVIDER_QUALITY_DEFER_STAGE_INDEXES:
+                step_started_at = _step_start("build provider quality staging indexes")
+                await _build_staging_indexes(classes, schema)
+                _step_end("build provider quality staging indexes", step_started_at)
 
-        step_started_at = _step_start("write provider quality run metadata")
-        run_status = "degraded_test" if bool(manifest.get("degraded_sources")) else "published"
-        await _insert_run_metadata(schema, run_id, import_id_val, manifest, status=run_status)
-        _step_end("write provider quality run metadata", step_started_at)
+            step_started_at = _step_start("publish provider quality staging -> final")
+            await _publish_by_table_rename(classes, schema)
+            _step_end("publish provider quality staging -> final", step_started_at)
 
-        if redis is not None and run_id:
-            await redis.set(_state_key(run_id, "finalized"), "1", ex=PROVIDER_QUALITY_REDIS_TTL_SECONDS)
-            await redis.expire(_state_key(run_id, "finalized"), PROVIDER_QUALITY_REDIS_TTL_SECONDS)
+            step_started_at = _step_start("write provider quality run metadata")
+            run_status = "degraded_test" if bool(manifest.get("degraded_sources")) else "published"
+            await _insert_run_metadata(schema, run_id, import_id_val, manifest, status=run_status)
+            _step_end("write provider quality run metadata", step_started_at)
+
+            if redis is not None and run_id:
+                await redis.set(_state_key(run_id, "finalized"), "1", ex=PROVIDER_QUALITY_REDIS_TTL_SECONDS)
+                await redis.expire(_state_key(run_id, "finalized"), PROVIDER_QUALITY_REDIS_TTL_SECONDS)
     except Retry:
         raise
     except Exception as exc:
@@ -2129,7 +2160,7 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
         raise
     finally:
         if redis is not None and run_id and has_global_lock:
-            await _release_global_finalize_lock(redis, run_id)
+            await _release_global_finalize_lock_safely(redis, global_lock_owner)
 
     if manifest:
         run_work_dir = Path(manifest.get("work_dir", ""))
