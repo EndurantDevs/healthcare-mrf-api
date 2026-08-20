@@ -432,18 +432,32 @@ async def test_import_builds_and_publishes_complete_staged_snapshot(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failed_dependency", ("push_objects", "publish_stage"))
-async def test_import_cleans_exact_stage_table_on_failure(monkeypatch, failed_dependency):
+async def test_import_cleans_exact_stage_table_on_failure(monkeypatch, caplog, failed_dependency):
     harness = _patch_import_dependencies(
         monkeypatch,
         [SimpleNamespace(_mapping={"row_count": "11"})],
     )
     getattr(harness, failed_dependency).side_effect = RuntimeError("synthetic import failure")
+    harness.status.side_effect = [None, None, RuntimeError("synthetic cleanup failure")]
 
     with pytest.raises(RuntimeError, match="synthetic import failure"):
         await terminology_synonyms.import_terminology_synonyms(import_id="run-01")
 
     stage_table = "tenant.terminology_synonym_run01"
     assert harness.status.await_args_list[-1].args[0] == f"DROP TABLE IF EXISTS {stage_table};"
+    assert "synthetic cleanup failure" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_import_reports_cleanup_failure_after_success(monkeypatch):
+    harness = _patch_import_dependencies(
+        monkeypatch,
+        [SimpleNamespace(_mapping={"row_count": "11"})],
+    )
+    harness.status.side_effect = [None, None, RuntimeError("synthetic cleanup failure")]
+
+    with pytest.raises(RuntimeError, match="synthetic cleanup failure"):
+        await terminology_synonyms.import_terminology_synonyms(import_id="run-01")
 
 
 @pytest.mark.asyncio

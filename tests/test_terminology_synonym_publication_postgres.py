@@ -55,11 +55,12 @@ async def _relation_state(connection, schema, table):
     return relation_oid, tuple(row["marker"] for row in markers)
 
 
-async def _prepare_relations(connection, schema):
+async def _prepare_relations(connection, schema, stage_markers=None):
+    default_stage_markers = ["stage-a", "stage-b", "stage-c"]
     marker_list_by_table = {
         LIVE_TABLE: ["live-a", "live-b"],
         OLD_TABLE: ["older"],
-        STAGE_TABLE: ["stage-a", "stage-b", "stage-c"],
+        STAGE_TABLE: stage_markers if stage_markers is not None else default_stage_markers,
     }
     await connection.execute(f'CREATE SCHEMA "{schema}"')
     for table, marker_list in marker_list_by_table.items():
@@ -102,6 +103,15 @@ async def test_terminology_publication_preserves_predecessor_and_rolls_back_mism
 
         with pytest.raises(RuntimeError, match="promoted row count 3 does not match staged row count 4"):
             await terminology_synonyms._publish_stage(schema, stage_cls, 4)
+
+        for table, original_state in original_state_by_table.items():
+            assert await _relation_state(connection, schema, table) == original_state
+
+        await connection.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        original_state_by_table = await _prepare_relations(connection, schema, stage_markers=[])
+
+        with pytest.raises(RuntimeError, match="refusing to publish an empty terminology snapshot"):
+            await terminology_synonyms._publish_stage(schema, stage_cls, 0)
 
         for table, original_state in original_state_by_table.items():
             assert await _relation_state(connection, schema, table) == original_state

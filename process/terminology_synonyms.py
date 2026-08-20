@@ -5,8 +5,10 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,6 +34,9 @@ from process.terminology_synonym_sources import (
     _insert_observed_provider_rows,
     _status_count,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _schema() -> str:
@@ -263,6 +268,8 @@ async def _table_row_count(table: str) -> int:
 
 
 async def _publish_stage(schema: str, stage_cls, expected_row_count: int) -> None:
+    if expected_row_count == 0:
+        raise RuntimeError("refusing to publish an empty terminology snapshot")
     live_table = TerminologySynonym.__tablename__
     old_table = f"{live_table}_old"
     async with db.transaction():
@@ -320,7 +327,13 @@ async def import_terminology_synonyms(
         print(f"Terminology synonym import done: {import_summary_map}")
         return import_summary_map
     finally:
-        await db.status(f"DROP TABLE IF EXISTS {stage_table};")
+        original_error = sys.exception()
+        try:
+            await db.status(f"DROP TABLE IF EXISTS {stage_table};")
+        except Exception:
+            if original_error is None:
+                raise
+            logger.exception("Failed to drop terminology staging table %s", stage_table)
 
 
 async def main(
