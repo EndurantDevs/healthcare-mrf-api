@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import select, text
@@ -44,9 +45,11 @@ from process.ptg_wave_ordinary_terminal_payload import (
     ordinary_terminal_receipt_payload,
 )
 from process.ptg_wave_ordinary_terminal_validation import (
+    _is_blank_outer_error,
     _outer_result_identities,
     _validated_abandonment,
 )
+from process.ptg_allowed_amount_blank import allowed_amount_blank_metrics
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.ptg_wave_terminal_snapshot_pin import (
     delete_ordinary_terminal_snapshot_pin,
@@ -236,6 +239,7 @@ async def _load_terminal_snapshot(
         request=request,
         intent=intent,
     )
+    run = _run_with_blank_metrics(run, engine_run, engine_snapshot)
     return {
         "request": request,
         "wave": wave,
@@ -263,7 +267,7 @@ async def _load_outer_run(
         raise PTGWaveOrdinaryTerminalConflict(
             "ordinary terminal run is unavailable"
         )
-    _outer_result_identities(run, request=request, intent=intent)
+    _outer_engine_import_run_id(run, request=request, intent=intent)
     return run
 
 
@@ -274,10 +278,8 @@ async def _load_engine_result(
     request: Mapping[str, Any],
     intent: Any,
 ) -> tuple[Any, Any]:
-    engine_import_run_id, snapshot_id = _outer_result_identities(
-        run,
-        request=request,
-        intent=intent,
+    engine_import_run_id = _outer_engine_import_run_id(
+        run, request=request, intent=intent
     )
     engine_run = (
         await session.execute(
@@ -286,6 +288,23 @@ async def _load_engine_result(
             .with_for_update()
         )
     ).scalar_one_or_none()
+    if getattr(run, "status", None) == "succeeded":
+        _, snapshot_id = _outer_result_identities(
+            run, request=request, intent=intent
+        )
+    else:
+        report = (
+            getattr(engine_run, "report", None)
+            if engine_run is not None
+            else None
+        )
+        snapshot_id = (
+            report.get("snapshot_id") if isinstance(report, Mapping) else None
+        )
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            raise PTGWaveOrdinaryTerminalConflict(
+                "durable PTG terminal result is unavailable"
+            )
     engine_snapshot = (
         await session.execute(
             select(PTG2Snapshot)
@@ -294,6 +313,81 @@ async def _load_engine_result(
         )
     ).scalar_one_or_none()
     return engine_run, engine_snapshot
+
+
+def _outer_engine_import_run_id(
+    run: Any,
+    *,
+    request: Mapping[str, Any],
+    intent: Any,
+) -> str:
+    if (
+        getattr(run, "run_id", None) != request["run_id"]
+        or getattr(run, "run_id", None) == getattr(intent, "run_id", None)
+    ):
+        raise PTGWaveOrdinaryTerminalConflict(
+            "ordinary terminal run identity is invalid"
+        )
+    if getattr(run, "status", None) == "succeeded":
+        return _outer_result_identities(
+            run, request=request, intent=intent
+        )[0]
+    if (
+        getattr(run, "status", None) == "failed"
+        and _is_blank_outer_error(getattr(run, "error", None))
+        and getattr(run, "source_file_import_id", None)
+        == request["source_file_import_id"]
+        and getattr(run, "import_id", None) == request["source_file_import_id"]
+    ):
+        return f"ptg2:{request['source_file_import_id']}"
+    raise PTGWaveOrdinaryTerminalConflict(
+        "ordinary terminal run is not a supported terminal result"
+    )
+
+
+def _run_with_blank_metrics(
+    run: Any,
+    engine_run: Any,
+    engine_snapshot: Any,
+) -> Any:
+    if getattr(run, "status", None) != "failed":
+        return run
+    params = getattr(run, "params", None)
+    if not isinstance(params, Mapping):
+        return run
+    blank_metrics = allowed_amount_blank_metrics(
+        source_file_import_id=str(
+            getattr(run, "source_file_import_id", None) or ""
+        ),
+        source_key=str(params.get("source_key") or ""),
+        import_month=params.get("import_month"),
+        plan_ids=params.get("plan_ids") or [],
+        plan_market_types=params.get("plan_market_types") or [],
+        outer_error=getattr(run, "error", None),
+        engine_run=engine_run,
+        engine_snapshot=engine_snapshot,
+    )
+    if blank_metrics is None:
+        return run
+    return SimpleNamespace(
+        **{
+            name: getattr(run, name, None)
+            for name in (
+                "run_id",
+                "engine",
+                "node_id",
+                "importer",
+                "status",
+                "params",
+                "error",
+                "snapshot_id",
+                "import_id",
+                "source_file_import_id",
+                "finished_at",
+            )
+        },
+        metrics={**dict(getattr(run, "metrics", None) or {}), **blank_metrics},
+    )
 
 
 def _verify_abandonment_signature(

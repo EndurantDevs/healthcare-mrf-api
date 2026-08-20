@@ -18,6 +18,10 @@ from process.ptg_singleton_direct_control import (
     singleton_direct_source_key,
 )
 from process.ptg_singleton_direct_resource import PTG_SMALL_RESOURCE_CONTRACT
+from process.ptg_allowed_amount_blank import (
+    ALLOWED_AMOUNT_BLANK_ERROR,
+    allowed_amount_blank_metrics,
+)
 from process.ptg_wave_ordinary_terminal_receipt import (
     ORDINARY_TERMINAL_REQUEST_SCHEMA,
 )
@@ -120,10 +124,10 @@ def keyring(monkeypatch) -> PTGWaveReceiptKeyring:
     return PTGWaveReceiptKeyring.from_environment()
 
 
-def direct_v6_boundary(monkeypatch):
+def direct_v6_boundary(monkeypatch, *, source_type="in_network"):
     """Build one signed V6 boundary and pristine abandonment proof."""
     source_key, direct_intent_mapping, frozen_params_mapping = (
-        _direct_member_input()
+        _direct_member_input(source_type=source_type)
     )
     request = _signed_v6_request(frozen_params_mapping)
     wave, intents, admission = _persisted_v6_wave(request)
@@ -138,15 +142,18 @@ def direct_v6_boundary(monkeypatch):
     )
 
 
-def _direct_member_input():
+def _direct_member_input(*, source_type):
     source_key = singleton_direct_source_key(SOURCE_FILE_ID)
     historical_id = "candidate-neutral-v12"
+    selector = (
+        "allowed_url" if source_type == "allowed_amounts" else "in_network_url"
+    )
     direct_intent_mapping = {
         "contract": DIRECT_RATE_FILE_INTENT_CONTRACT,
         "source_file_import_id": historical_id,
         "source_file_id": SOURCE_FILE_ID,
         "content_version": CONTENT_VERSION,
-        "source_type": "in_network",
+        "source_type": source_type,
         "canonical_url": "https://synthetic.invalid/rates.json.gz",
         "source_key": source_key,
         "content_file_count": 1,
@@ -164,7 +171,7 @@ def _direct_member_input():
         "ptg_resource": PTG_SMALL_RESOURCE_CONTRACT, "source_key": source_key,
         "plan_ids": PLAN_IDS, "plan_market_types": PLAN_MARKET_TYPES,
         "max_files": 1,
-        "in_network_url": direct_intent_mapping["canonical_url"],
+        selector: direct_intent_mapping["canonical_url"],
     }
     return source_key, direct_intent_mapping, frozen_params_mapping
 
@@ -336,6 +343,120 @@ def ordinary_result(monkeypatch):
     }
 
 
+def blank_ordinary_result(monkeypatch):
+    """Build one exact failed allowed-amount result with no payment evidence."""
+
+    (
+        wave,
+        intents,
+        quarantine,
+        frozen_params_mapping,
+        direct_intent_mapping,
+    ) = direct_v6_boundary(monkeypatch, source_type="allowed_amounts")
+    source_key = direct_intent_mapping["source_key"]
+    run_params_mapping, _ = _ordinary_run_maps(
+        frozen_params_mapping,
+        direct_intent_mapping,
+        source_key,
+    )
+    lane = {
+        "files_attempted": 1,
+        "files_processed": 1,
+        "files_failed": 0,
+        "files_skipped": 0,
+        "failed_files": [],
+        "successful_files": [
+            {
+                "source_type": "allowed_amounts",
+                "success": True,
+                "skipped": False,
+                "error": None,
+                "summary": {
+                    "allowed_amount_plans": 2,
+                    "allowed_amount_items": 0,
+                    "allowed_amount_blocks": 0,
+                    "allowed_amount_payments": 0,
+                    "allowed_amount_provider_payments": 0,
+                    "allowed_amount_npi_references": 0,
+                    "allowed_amount_unique_tins": 0,
+                    "allowed_amount_evidence": False,
+                },
+            }
+        ],
+    }
+    engine_import_run_id = f"ptg2:{ORDINARY_IMPORT_ID}"
+    engine_run = SimpleNamespace(
+        import_run_id=engine_import_run_id,
+        import_month=dt.date(2026, 8, 1),
+        status="failed",
+        finished_at=dt.datetime(2026, 8, 10, 13, 14, 14, 999999),
+        options={
+            "source_key": source_key,
+            "plan_ids": ORDINARY_PLAN_IDS,
+            "plan_market_types": PLAN_MARKET_TYPES,
+            "max_files": 1,
+        },
+        report={"snapshot_id": SNAPSHOT_ID, "allowed_amount_lane": lane},
+        error=ALLOWED_AMOUNT_BLANK_ERROR,
+    )
+    snapshot = SimpleNamespace(
+        snapshot_id=SNAPSHOT_ID,
+        import_run_id=engine_import_run_id,
+        import_month=dt.date(2026, 8, 1),
+        status="failed",
+        manifest={
+            "snapshot_id": SNAPSHOT_ID,
+            "allowed_amount_lane": lane,
+            "error": ALLOWED_AMOUNT_BLANK_ERROR,
+        },
+    )
+    outer_error = {
+        "code": "ptg_import_failed",
+        "message": ALLOWED_AMOUNT_BLANK_ERROR,
+    }
+    run_metrics_mapping = allowed_amount_blank_metrics(
+        source_file_import_id=ORDINARY_IMPORT_ID,
+        source_key=source_key,
+        import_month=IMPORT_MONTH,
+        plan_ids=ORDINARY_PLAN_IDS,
+        plan_market_types=PLAN_MARKET_TYPES,
+        outer_error=outer_error,
+        engine_run=engine_run,
+        engine_snapshot=snapshot,
+    )
+    assert run_metrics_mapping is not None
+    run = SimpleNamespace(
+        run_id=ORDINARY_RUN_ID,
+        engine="healthcare-mrf-api",
+        node_id=NODE_ID,
+        importer="ptg",
+        status="failed",
+        params=run_params_mapping,
+        metrics=run_metrics_mapping,
+        error=outer_error,
+        snapshot_id=None,
+        import_id=ORDINARY_IMPORT_ID,
+        source_file_import_id=ORDINARY_IMPORT_ID,
+        finished_at=dt.datetime(2026, 8, 10, 13, 14, 15, 123456),
+    )
+    return {
+        "request": {
+            "schema": ORDINARY_TERMINAL_REQUEST_SCHEMA,
+            "key_id": "fixture-epoch-2026-08",
+            "operation_id": OPERATION_ID,
+            "member_ordinal": 0,
+            "source_file_import_id": ORDINARY_IMPORT_ID,
+            "run_id": ORDINARY_RUN_ID,
+        },
+        "wave": wave,
+        "intent": intents[0],
+        "quarantine": quarantine,
+        "run": run,
+        "engine_run": engine_run,
+        "engine_snapshot": snapshot,
+    }
+
+
 def v13_ordinary_result(monkeypatch):
     """Replace the ordinary-result quarantine with exact signed V13 evidence."""
 
@@ -368,6 +489,11 @@ def _ordinary_run_maps(
     direct_intent_mapping,
     source_key,
 ):
+    selector = (
+        "allowed_url"
+        if direct_intent_mapping["source_type"] == "allowed_amounts"
+        else "in_network_url"
+    )
     run_params_mapping = {
         "import_id": ORDINARY_IMPORT_ID,
         "source_file_import_id": ORDINARY_IMPORT_ID,
@@ -378,7 +504,7 @@ def _ordinary_run_maps(
         "ordinary_cutover_direct_input_digest": frozen_params_mapping[
             "direct_rate_file_intent_sha256"
         ],
-        "in_network_url": direct_intent_mapping["canonical_url"],
+        selector: direct_intent_mapping["canonical_url"],
         "max_files": 1,
         "plan_ids": ORDINARY_PLAN_IDS, "plan_market_types": PLAN_MARKET_TYPES,
         "resource_class": "small",

@@ -1886,6 +1886,96 @@ async def test_import_run_request_paths_do_not_run_ddl(monkeypatch):
     assert source_row["status"] == "queued"
 
 
+@pytest.mark.asyncio
+async def test_get_import_run_projects_durable_allowed_amount_blank(monkeypatch):
+    row = types.SimpleNamespace(
+        run_id="run_blank_neutral",
+        engine="healthcare-mrf-api",
+        node_id="node_neutral",
+        importer="ptg",
+        status="failed",
+        params={"source_file_import_id": "source_import_neutral"},
+        metrics={"queue": "arq:PTGSmall"},
+        error={
+            "code": "ptg_import_failed",
+            "message": "PTG2 allowed-amount import produced no payment evidence",
+        },
+        source_file_import_id="source_import_neutral",
+        import_id="source_import_neutral",
+    )
+
+    class Result:
+        def scalar_one_or_none(self):
+            return row
+
+    monkeypatch.setattr(
+        control_imports,
+        "db",
+        types.SimpleNamespace(execute=AsyncMock(return_value=Result())),
+    )
+    projection = AsyncMock(
+        return_value={
+            "status": "blank",
+            "file_domains": ["allowed_amounts"],
+            "allowed_amount_evidence": False,
+        }
+    )
+    monkeypatch.setattr(
+        control_imports,
+        "_allowed_amount_blank_terminal_metrics",
+        projection,
+    )
+
+    result = await control_imports.get_import_run("run_blank_neutral")
+
+    assert result["status"] == "failed"
+    assert result["metrics"] == {
+        "queue": "arq:PTGSmall",
+        "status": "blank",
+        "file_domains": ["allowed_amounts"],
+        "allowed_amount_evidence": False,
+    }
+    projection.assert_awaited_once_with(row, result)
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_blank_projection_loads_exact_inner_rows(monkeypatch):
+    from tests.ptg_wave_ordinary_terminal_receipt_support import (
+        blank_ordinary_result,
+    )
+
+    state = blank_ordinary_result(monkeypatch)
+
+    class Result:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar_one_or_none(self):
+            return self.value
+
+    execute = AsyncMock(
+        side_effect=(
+            Result(state["engine_run"]),
+            Result(state["engine_snapshot"]),
+        )
+    )
+    monkeypatch.setattr(
+        control_imports,
+        "db",
+        types.SimpleNamespace(execute=execute),
+    )
+
+    metrics = await control_imports._allowed_amount_blank_terminal_metrics(
+        state["run"],
+        normalize_run(state["run"]),
+    )
+
+    assert metrics is not None
+    assert metrics["status"] == "blank"
+    assert metrics["snapshot_status"] == "failed"
+    assert execute.await_count == 2
+
+
 def test_normalize_triggered_by_bounds_database_value():
     assert control_imports._normalize_triggered_by("") == "api"
     assert (

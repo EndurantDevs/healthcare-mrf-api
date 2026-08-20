@@ -74,9 +74,13 @@ from process.ptg_singleton_direct_control import (
     protected_singleton_direct_presence,
 )
 
-from db.models import ImportRun, db
+from db.models import ImportRun, PTG2ImportRun, PTG2Snapshot, db
 from process.import_status_events import enqueue_status_event, isoformat_utc
 from process.live_progress import enqueue_live_progress, estimate_payload_from_live, progress_payload_from_live, read_live_progress
+from process.ptg_allowed_amount_blank import (
+    ALLOWED_AMOUNT_BLANK_ERROR,
+    allowed_amount_blank_metrics,
+)
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -1184,7 +1188,69 @@ async def get_import_run(run_id: str) -> dict[str, Any] | None:
     row = result.scalar_one_or_none()
     if not row:
         return None
-    return await _sync_terminal_worker_failure(normalize_run(row))
+    run = await _sync_terminal_worker_failure(normalize_run(row))
+    blank_metrics = await _allowed_amount_blank_terminal_metrics(row, run)
+    if blank_metrics is not None:
+        run["metrics"] = {**dict(run.get("metrics") or {}), **blank_metrics}
+    return run
+
+
+async def _allowed_amount_blank_terminal_metrics(
+    row: Any,
+    run: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Load the narrow durable proof for a failed singleton allowed file."""
+
+    params = row.params if isinstance(getattr(row, "params", None), dict) else {}
+    source_file_import_id = str(
+        getattr(row, "source_file_import_id", None) or ""
+    ).strip()
+    error = run.get("error")
+    if (
+        run.get("importer") != "ptg"
+        or run.get("status") != "failed"
+        or not isinstance(error, dict)
+        or error.get("code") != "ptg_import_failed"
+        or error.get("message") != ALLOWED_AMOUNT_BLANK_ERROR
+        or not source_file_import_id
+        or params.get("source_file_import_id") != source_file_import_id
+        or params.get("import_id") != source_file_import_id
+        or params.get("max_files") != 1
+        or not params.get("allowed_url")
+        or params.get("in_network_url") is not None
+    ):
+        return None
+    engine_run_result = await db.execute(
+        select(PTG2ImportRun)
+        .where(
+            PTG2ImportRun.import_run_id == f"ptg2:{source_file_import_id}"
+        )
+        .limit(1)
+    )
+    engine_run = engine_run_result.scalar_one_or_none()
+    report = (
+        engine_run.report
+        if engine_run is not None and isinstance(engine_run.report, dict)
+        else {}
+    )
+    snapshot_id = report.get("snapshot_id")
+    if not isinstance(snapshot_id, str) or not snapshot_id:
+        return None
+    snapshot_result = await db.execute(
+        select(PTG2Snapshot)
+        .where(PTG2Snapshot.snapshot_id == snapshot_id)
+        .limit(1)
+    )
+    return allowed_amount_blank_metrics(
+        source_file_import_id=source_file_import_id,
+        source_key=str(params.get("source_key") or ""),
+        import_month=params.get("import_month"),
+        plan_ids=params.get("plan_ids") or [],
+        plan_market_types=params.get("plan_market_types") or [],
+        outer_error=error,
+        engine_run=engine_run,
+        engine_snapshot=snapshot_result.scalar_one_or_none(),
+    )
 
 
 async def _sync_terminal_worker_failure(run: dict[str, Any]) -> dict[str, Any]:

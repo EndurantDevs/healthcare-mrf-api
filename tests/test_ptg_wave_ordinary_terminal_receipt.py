@@ -90,6 +90,7 @@ from tests.ptg_wave_ordinary_terminal_receipt_support import (
     SNAPSHOT_ID,
     SOURCE_FILE_ID,
     TerminalTransaction as _TerminalTransaction,
+    blank_ordinary_result as _blank_ordinary_result,
     direct_v6_boundary as _direct_v6_boundary,
     keyring as _keyring,
     ordinary_result as _ordinary_result,
@@ -124,6 +125,25 @@ def test_builds_per_member_terminal_payload_from_later_ordinary_run(monkeypatch)
         "2026-08-10T13:14:15.123456Z"
     )
     assert len(payload["terminal_result_digest"]) == 64
+
+
+def test_builds_authenticated_blank_terminal_payload(monkeypatch):
+    state = _blank_ordinary_result(monkeypatch)
+
+    payload = ordinary_terminal_receipt_payload(**state)
+
+    assert payload["terminal_result"]["status"] == "blank"
+    assert payload["terminal_result"]["engine_result_status"] == "failed"
+    assert payload["snapshot_id"] == SNAPSHOT_ID
+
+    state["engine_snapshot"].manifest["allowed_amount_lane"][
+        "successful_files"
+    ][0]["summary"]["allowed_amount_payments"] = 1
+    with pytest.raises(
+        PTGWaveOrdinaryTerminalConflict,
+        match="durable PTG result",
+    ):
+        ordinary_terminal_receipt_payload(**state)
 
 
 @pytest.mark.parametrize(
@@ -207,7 +227,7 @@ def test_request_and_digest_domains_are_frozen(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "state_factory",
-    (_ordinary_result, _v13_ordinary_result),
+    (_ordinary_result, _v13_ordinary_result, _blank_ordinary_result),
 )
 async def test_issue_reads_one_member_and_replays_exact_receipt(
     monkeypatch,
