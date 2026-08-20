@@ -151,6 +151,8 @@ async def test_materialization_runs_all_sql_contracts(monkeypatch):
     await drug_claims._materialize_prescription_and_code_rows(classes_by_name, "mrf")
     sql_statements = "\n".join(statement for statement, _ in database_probe.statements)
     assert "FROM mrf.provider_stage" in sql_statements
+    assert "TRUNCATE TABLE mrf.autocomplete_stage" in sql_statements
+    assert 'INSERT INTO "mrf"."autocomplete_stage"' in sql_statements
     assert "INSERT INTO mrf.code_catalog" in sql_statements
     assert "INSERT INTO mrf.code_crosswalk" in sql_statements
     enrich_crosswalk.assert_awaited_once_with(
