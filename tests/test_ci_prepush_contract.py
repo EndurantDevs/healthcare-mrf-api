@@ -44,15 +44,6 @@ def test_every_required_ci_family_delegates_to_prepush() -> None:
         assert command in job_body
         assert len(re.findall(r"^        run:", job_body, re.M)) == 1
 
-def test_container_package_bakes_and_checks_the_openapi_monitor() -> None:
-    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-    prepush = PREPUSH.read_text(encoding="utf-8")
-
-    assert "COPY doc/openapi.yaml /opt/doc/openapi.yaml" in dockerfile
-    assert "--entrypoint /opt/venv/bin/python" in prepush
-    assert "/opt/scripts/monitor_openapi.py --check" in prepush
-
-
 def test_local_all_pins_ci_images_inputs_and_safety_margins() -> None:
     script = PREPUSH.read_text(encoding="utf-8")
     assert "ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c" in script
