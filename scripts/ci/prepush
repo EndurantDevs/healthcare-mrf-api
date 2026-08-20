@@ -876,6 +876,8 @@ run_provider_directory_postgres() {
     tests/test_provider_directory_retained_reader_parallel_postgres.py \
     tests/test_provider_directory_retained_reader_close_races_postgres.py \
     tests/test_provider_directory_retained_core_postgres.py \
+    tests/test_provider_directory_retained_producer_store_postgres.py \
+    tests/test_provider_directory_retained_producer_store_faults_postgres.py \
     tests/test_provider_directory_retained_core_state_guards.py \
     tests/test_provider_directory_retained_seal_claim_guards.py \
     tests/test_provider_directory_retained_binding_guards.py \
