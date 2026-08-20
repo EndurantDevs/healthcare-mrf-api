@@ -320,10 +320,9 @@ async def _maintain_global_finalize_lock(
         lease_started_at if lease_started_at is not None else loop.time()
     ) + PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_TTL_SECONDS
 
-    async def refresh_lease() -> None:
+    async def refresh_lease(lease_deadline: float) -> None:
         """Keep the lease alive or cancel its publication task on owner loss."""
 
-        nonlocal lease_deadline
         while True:
             try:
                 async with asyncio.timeout_at(lease_deadline):
@@ -350,11 +349,12 @@ async def _maintain_global_finalize_lock(
             owner_task.cancel()
             return
 
-    refresh_task = asyncio.create_task(refresh_lease())
+    refresh_task = asyncio.create_task(refresh_lease(lease_deadline))
     try:
         yield
     except asyncio.CancelledError:
         if lease_lost.is_set():
+            owner_task.uncancel()
             raise RuntimeError("global finalize lock lease lost") from None
         raise
     finally:

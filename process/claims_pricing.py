@@ -3232,10 +3232,7 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
 
     task_by_field = task or {}
     redis = ctx.get("redis")
-    early_response = await _already_finalized_claims_response(
-        redis,
-        task_by_field,
-    )
+    early_response = await _already_finalized_claims_response(redis, task_by_field)
     if early_response is not None:
         return early_response
     manifest_path = str(task_by_field.get("manifest_path") or "")
@@ -3247,9 +3244,7 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
     early_response = await _wait_for_claims_finalize_turn(redis, finalize_spec)
     if early_response is not None:
         return early_response
-    global_lock_owner = (
-        f"claims_pricing:{finalize_spec.run_id}:{finalize_spec.finalize_lock_token}"
-    )
+    global_lock_owner = f"claims_pricing:{finalize_spec.run_id}:{finalize_spec.finalize_lock_token}"
     has_global_lock = False
     try:
         global_lock_started_at = asyncio.get_running_loop().time()

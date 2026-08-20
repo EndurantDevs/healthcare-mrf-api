@@ -304,6 +304,7 @@ async def test_global_finalize_lock_renews_and_fails_closed_on_owner_loss(
             has_reached_publication = True
 
     assert not has_reached_publication
+    assert asyncio.current_task().cancelling() == 0
     assert redis.values[lock_key] == "new-owner"
     expected_expiration = (
         lock_key,
