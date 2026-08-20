@@ -315,6 +315,38 @@ async def test_postgres_ordinary_terminal_preserves_python_exponent_digests(
 
 
 @pytest.mark.asyncio
+async def test_postgres_canonical_json_rejects_duplicate_object_keys(monkeypatch):
+    schema = "ordinary_terminal_duplicate_key"
+    connection = await asyncpg.connect(_dsn())
+    try:
+        await connection.execute(f"CREATE SCHEMA {_quote(schema)}")
+        await connection.execute(
+            f"CREATE FUNCTION {_quote(schema)}.ptg_wave_json_ascii_text_v1(value text) "
+            "RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT "
+            "AS $$ SELECT value $$"
+        )
+        monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+        monkeypatch.delenv("DB_SCHEMA", raising=False)
+        migration = _load_migration(
+            ORDINARY_TERMINAL_JSON_CANONICAL_DIGEST_MIGRATION_PATH
+        )
+        await connection.execute(migration._canonical_json_function_sql())
+
+        with pytest.raises(
+            asyncpg.PostgresError,
+            match="PTG_WAVE_CANONICAL_JSON_DUPLICATE_KEY",
+        ):
+            await connection.fetchval(
+                f"SELECT {_quote(schema)}."
+                "ptg_wave_canonical_json_ascii_v1($1::json)",
+                '{"a":1,"a":2}',
+            )
+    finally:
+        await connection.execute(f"DROP SCHEMA IF EXISTS {_quote(schema)} CASCADE")
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_postgres_v13_json_null_patch_upgrades_and_downgrades(monkeypatch):
     schema = "v13_json_null_guard_migration"
     connection = await asyncpg.connect(_dsn())

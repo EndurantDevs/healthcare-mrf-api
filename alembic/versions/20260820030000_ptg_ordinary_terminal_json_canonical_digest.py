@@ -69,6 +69,7 @@ def _canonical_json_function_sql() -> str:
     SET search_path = pg_catalog, {_q(_schema())} AS $$
     DECLARE
         canonical_value text;
+        has_duplicate_key boolean;
     BEGIN
         CASE json_typeof(payload)
             WHEN 'object' THEN
@@ -79,9 +80,14 @@ def _canonical_json_function_sql() -> str:
                         ',' ORDER BY entry.key COLLATE "C"
                     ),
                     ''
-                ) || '}}'
-                  INTO canonical_value
+                ) || '}}',
+                count(*) <> count(DISTINCT entry.key COLLATE "C")
+                  INTO canonical_value, has_duplicate_key
                   FROM json_each(payload) AS entry;
+                IF has_duplicate_key THEN
+                    RAISE EXCEPTION 'PTG_WAVE_CANONICAL_JSON_DUPLICATE_KEY'
+                        USING ERRCODE = 'P0001';
+                END IF;
                 RETURN canonical_value;
             WHEN 'array' THEN
                 SELECT '[' || COALESCE(
