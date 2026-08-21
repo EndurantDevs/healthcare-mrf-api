@@ -1199,12 +1199,13 @@ async def prepare_shared_price_artifacts(
         except BaseException:
             for task in (price_map_task, atom_stages_task):
                 task.cancel()
-            drain_future = asyncio.gather(
-                price_map_task,
-                atom_stages_task,
-                return_exceptions=True,
+            await _await_cleanup_task(
+                asyncio.gather(
+                    price_map_task,
+                    atom_stages_task,
+                    return_exceptions=True,
+                )
             )
-            await _await_cleanup_task(drain_future)
             raise
         lean_manifest, atom_map_stats, atom_map_started_at = atom_stage_result
         parallel_finished_at = time.monotonic()
@@ -1214,7 +1215,6 @@ async def prepare_shared_price_artifacts(
         stage_metrics_map["parallel_price_prepare_seconds"] = (
             parallel_finished_at - parallel_started_at
         )
-        price_set_count = int(price_map_stats.get("row_count") or 0)
         atom_count = int(atom_map_stats.get("row_count") or 0)
         return PreparedSharedPriceArtifacts(
             schema_name=schema_name,
@@ -1223,7 +1223,7 @@ async def prepare_shared_price_artifacts(
             price_attr_dictionary_table=price_attr_dictionary_table,
             price_key_map=price_key_map,
             atom_key_map=atom_key_map,
-            price_set_count=price_set_count,
+            price_set_count=int(price_map_stats.get("row_count") or 0),
             atom_count=atom_count,
             atom_key_bits=select_atom_key_bits(atom_count),
             lean_manifest=lean_manifest,

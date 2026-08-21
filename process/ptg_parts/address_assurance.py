@@ -1025,11 +1025,7 @@ def build_price_address_assurance_report(
     raw_direct_displayable_location_present = any(
         report.get("direct_displayable_location_fields_present") for report in raw_reports
     )
-    issues = _payer_confirmed_raw_issues(
-        api_payload,
-        raw_reports,
-        _raw_displayable_source_ids(raw_reports),
-    )
+    issues = _payer_confirmed_raw_issues(api_payload, raw_reports, _raw_displayable_source_ids(raw_reports))
     if api_payload is None and not raw_reports:
         issues.append(
             {

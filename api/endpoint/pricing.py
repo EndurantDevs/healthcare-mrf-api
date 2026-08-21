@@ -1394,9 +1394,6 @@ async def _build_dynamic_zip_peer_stats(
     setting_key: str,
     specialty_candidates: list[str],
     zip_candidates: list[str],
-    min_claims: int,
-    min_providers: int,
-    iqr_factor: float,
 ) -> tuple[dict[str, Any], str] | None:
     """Build trimmed ZIP-based peer charge statistics for a procedure cohort."""
     if not zip_candidates:
@@ -1409,7 +1406,8 @@ async def _build_dynamic_zip_peer_stats(
             provider_procedure_cost_profile_table.c.setting_key == setting_key,
             provider_procedure_cost_profile_table.c.geography_scope == "zip5",
             provider_procedure_cost_profile_table.c.geography_value.in_(zip_candidates),
-            provider_procedure_cost_profile_table.c.claim_count >= min_claims,
+            provider_procedure_cost_profile_table.c.claim_count
+            >= PROCEDURE_COST_DYNAMIC_MIN_PEER_CLAIMS,
             provider_procedure_cost_profile_table.c.avg_submitted_charge > 0,
         ]
         if specialty_candidate != "__all__":
@@ -1427,17 +1425,20 @@ async def _build_dynamic_zip_peer_stats(
             _row_to_dict(cost_profile_row)
             for cost_profile_row in candidate_result
         ]
-        if len(candidate_rows) < min_providers:
+        if len(candidate_rows) < PROCEDURE_COST_DYNAMIC_MIN_PEER_PROVIDERS:
             continue
 
-        trimmed_rows = _trim_charge_rows_log_iqr(candidate_rows, iqr_factor=iqr_factor)
-        if len(trimmed_rows) < min_providers:
+        trimmed_rows = _trim_charge_rows_log_iqr(
+            candidate_rows,
+            iqr_factor=PROCEDURE_COST_DYNAMIC_IQR_FACTOR,
+        )
+        if len(trimmed_rows) < PROCEDURE_COST_DYNAMIC_MIN_PEER_PROVIDERS:
             continue
 
         peer_statistics_by_metric = _dynamic_zip_peer_statistics(
             trimmed_rows,
             specialty_candidate,
-            min_providers,
+            PROCEDURE_COST_DYNAMIC_MIN_PEER_PROVIDERS,
         )
         if peer_statistics_by_metric is None:
             continue
@@ -9069,9 +9070,6 @@ async def _provider_procedure_cost_level(
             setting_key=setting_key,
             specialty_candidates=specialty_candidates,
             zip_candidates=zip_candidates,
-            min_claims=PROCEDURE_COST_DYNAMIC_MIN_PEER_CLAIMS,
-            min_providers=PROCEDURE_COST_DYNAMIC_MIN_PEER_PROVIDERS,
-            iqr_factor=PROCEDURE_COST_DYNAMIC_IQR_FACTOR,
         )
         if dynamic_peer_result is not None:
             dynamic_peer_payload, dynamic_specialty = dynamic_peer_result
