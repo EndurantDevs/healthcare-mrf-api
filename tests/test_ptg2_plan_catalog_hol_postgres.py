@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = ROOT / "alembic" / "versions" / (
     "20260810140000_ptg2_plan_catalog_outbox.py"
 )
+_CREATED_AT = datetime.datetime(2026, 8, 10, tzinfo=datetime.UTC).replace(tzinfo=None)
 
 
 def _plan_row() -> dict[str, object]:
@@ -44,7 +45,7 @@ def _plan_row() -> dict[str, object]:
             "plan_id": "plan-neutral",
             "plan_market_type": "group",
         },
-        "created_at": datetime.datetime(2026, 8, 10, tzinfo=datetime.UTC),
+        "created_at": _CREATED_AT,
     }
 
 
@@ -54,7 +55,7 @@ def _alias_row() -> dict[str, object]:
         "plan_hash": "a" * 64,
         "alias_type": "plan_id",
         "alias_value": "plan-neutral",
-        "created_at": datetime.datetime(2026, 8, 10, tzinfo=datetime.UTC),
+        "created_at": _CREATED_AT,
     }
 
 
@@ -106,33 +107,33 @@ async def _enqueue_source(sessions, schema: str, source_number: int) -> str:
 
 async def _create_plan_catalog_tables(engine, schema: str) -> None:
     statements = (
-        f"CREATE TABLE {schema}.ptg2_plan ("
-        "plan_hash varchar(64) PRIMARY KEY, hash_prefix varchar(16), "
-        "plan_id varchar(64), plan_id_type varchar(32), plan_name text, "
-        "plan_market_type varchar(32), issuer_name text, "
-        "plan_sponsor_name text, canonical_payload json, "
-        "created_at timestamptz)",
-        f"CREATE TABLE {schema}.ptg2_plan_alias ("
-        "alias_hash varchar(64) PRIMARY KEY, plan_hash varchar(64), "
-        "alias_type varchar(32), alias_value text, created_at timestamptz)",
-        f"CREATE TABLE {schema}.ptg2_plan_month ("
-        "plan_month_id text PRIMARY KEY, snapshot_id text, "
-        "plan_hash varchar(64), import_month date)",
-        f"CREATE TABLE {schema}.ptg2_plan_catalog_outbox ("
-        "request_id varchar(64) PRIMARY KEY, "
-        "snapshot_id varchar(96) NOT NULL, "
-        "chunk_index integer NOT NULL, chunk_count integer NOT NULL, "
-        "payload_sha256 varchar(64) NOT NULL, "
-        "plan_rows jsonb NOT NULL, alias_rows jsonb NOT NULL, "
-        "plan_count integer NOT NULL, alias_count integer NOT NULL, "
-        "payload_bytes integer NOT NULL, "
-        "attempt_count integer NOT NULL DEFAULT 0, "
-        "available_at timestamptz NOT NULL DEFAULT now(), "
-        "lease_token varchar(64), lease_until timestamptz, "
-        "terminal_error_code varchar(64), terminal_at timestamptz, "
-        "created_at timestamptz NOT NULL DEFAULT now(), "
-        "updated_at timestamptz NOT NULL DEFAULT now(), "
-        "UNIQUE (snapshot_id, chunk_index))",
+        (f"CREATE TABLE {schema}.ptg2_plan ("
+            "plan_hash varchar(64) PRIMARY KEY, hash_prefix varchar(16), "
+            "plan_id varchar(64), plan_id_type varchar(32), plan_name text, "
+            "plan_market_type varchar(32), issuer_name text, "
+            "plan_sponsor_name text, canonical_payload json, "
+            "created_at timestamp without time zone)"),
+        (f"CREATE TABLE {schema}.ptg2_plan_alias ("
+            "alias_hash varchar(64) PRIMARY KEY, plan_hash varchar(64), "
+            "alias_type varchar(32), alias_value text, "
+            "created_at timestamp without time zone)"),
+        (f"CREATE TABLE {schema}.ptg2_plan_month ("
+            "plan_month_id text PRIMARY KEY, snapshot_id text, "
+            "plan_hash varchar(64), import_month date)"),
+        (f"CREATE TABLE {schema}.ptg2_plan_catalog_outbox ("
+            "request_id varchar(64) PRIMARY KEY, snapshot_id varchar(96) NOT NULL, "
+            "chunk_index integer NOT NULL, chunk_count integer NOT NULL, "
+            "payload_sha256 varchar(64) NOT NULL, "
+            "plan_rows jsonb NOT NULL, alias_rows jsonb NOT NULL, "
+            "plan_count integer NOT NULL, alias_count integer NOT NULL, "
+            "payload_bytes integer NOT NULL, "
+            "attempt_count integer NOT NULL DEFAULT 0, "
+            "available_at timestamptz NOT NULL DEFAULT now(), "
+            "lease_token varchar(64), lease_until timestamptz, "
+            "terminal_error_code varchar(64), terminal_at timestamptz, "
+            "created_at timestamptz NOT NULL DEFAULT now(), "
+            "updated_at timestamptz NOT NULL DEFAULT now(), "
+            "UNIQUE (snapshot_id, chunk_index))"),
     )
     async with engine.begin() as connection:
         await connection.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
