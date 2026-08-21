@@ -38,6 +38,26 @@ class MappedEvidenceWitness:
         return bool(self.insurance_plan_ids or self.networks)
 
 
+def _network_witnesses(
+    evidence_map_list: list[Mapping[str, Any]],
+    max_items: int,
+) -> tuple[NetworkWitness, ...]:
+    network_map_by_id = {
+        str(evidence_map.get("resource_id")): evidence_map
+        for evidence_map in evidence_map_list
+        if evidence_map.get("evidence_type") == "network"
+        and evidence_map.get("resource_id")
+    }
+    return tuple(
+        NetworkWitness(
+            network_id,
+            bool(str(network_map_by_id[network_id].get("name") or "").strip()),
+            bool(str(network_map_by_id[network_id].get("reference") or "").strip()),
+        )
+        for network_id in sorted(network_map_by_id)[:max_items]
+    )
+
+
 def matching_source_summary_maps(
     provider_row: Any, source_id: str
 ) -> list[Mapping[str, Any]]:

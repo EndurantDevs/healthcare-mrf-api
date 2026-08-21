@@ -254,7 +254,14 @@ def _tied_prefix_selector(prefix_rows, order):
     return select_prefix
 
 
-async def _tied_geo_response(harness, *, order, limit, offset):
+async def _tied_geo_response(
+    harness,
+    *,
+    order,
+    limit,
+    offset,
+    serving_tables=None,
+):
     return await serving._search_manifest_serving_table(
         harness.session(),
         "ptg2:209901:synthetic",
@@ -269,7 +276,7 @@ async def _tied_geo_response(harness, *, order, limit, offset):
             "order": order,
         },
         SimpleNamespace(limit=limit, offset=offset),
-        strict_v3_tables(snapshot_id="ptg2:209901:synthetic"),
+        serving_tables or strict_v3_tables(snapshot_id="ptg2:209901:synthetic"),
         "product_search",
     )
 
@@ -349,3 +356,43 @@ async def test_g0289_geo_response_reports_exact_exhausted_total(monkeypatch):
         "page": 1,
         "has_more": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_g0289_geo_response_reverses_oversized_candidate_sets(monkeypatch):
+    harness = _G0289ServingHarness()
+    harness._rate_row = lambda provider_set_key: {
+        **_G0289ServingHarness._rate_row(harness, provider_set_key),
+        "provider_count": 100_001,
+    }
+    harness.install(monkeypatch)
+    monkeypatch.setattr(
+        serving,
+        "_uses_geo_rate_prefix_selection",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        AsyncMock(
+            return_value=[
+                harness._rate_row(provider_set_key)
+                for provider_set_key in harness.provider_set_ids_by_key
+            ]
+        ),
+    )
+
+    response = await _tied_geo_response(
+        harness,
+        order="asc",
+        limit=2,
+        offset=0,
+        serving_tables=_production_tables(),
+    )
+
+    assert [
+        pricing_item["prices"][0]["negotiated_rate"]
+        for pricing_item in response["items"]
+    ] == [20, 30]
+    assert response["pagination"]["total"] == 2
+    assert response["pagination"]["total_is_exact"] is True

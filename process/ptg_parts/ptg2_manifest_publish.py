@@ -1685,7 +1685,7 @@ async def _rewrite_price_atom_lean_dictionary(
         "price_atom.negotiated_rate::text AS negotiated_rate",
     ]
     join_sql_parts: list[str] = []
-    dictionary_join_specs = [
+    for attr_kind, lookup_column, source_column in [
         ("negotiated_type", "text_lookup_key", "negotiated_type"),
         ("expiration_date", "text_lookup_key", "expiration_date"),
         ("service_code", "array_lookup_key", "service_code"),
@@ -1693,8 +1693,7 @@ async def _rewrite_price_atom_lean_dictionary(
         ("setting", "text_lookup_key", "setting"),
         ("billing_code_modifier", "array_lookup_key", "billing_code_modifier"),
         ("additional_information", "text_lookup_key", "additional_information"),
-    ]
-    for attr_kind, lookup_column, source_column in dictionary_join_specs:
+    ]:
         key_column = _price_atom_dictionary_columns_by_attr()[attr_kind]
         if key_column in constant_key_by_column:
             continue

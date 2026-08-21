@@ -11281,6 +11281,8 @@ async def _shared_provider_set_keys_by_npi(
     serving_tables: PTG2ServingTables,
     candidate_npis: Iterable[int],
     rate_provider_set_keys: Iterable[int],
+    *,
+    max_members: int | None = None,
 ) -> dict[int, set[int]]:
     """Intersect candidate NPIs with a rate scope using dense graph keys."""
 
@@ -11299,6 +11301,7 @@ async def _shared_provider_set_keys_by_npi(
                     serving_tables,
                     normalized_npis,
                     allowed_provider_set_keys=allowed_provider_set_keys,
+                    max_members=max_members,
                 )
             ).items()
             if provider_set_keys
@@ -13917,8 +13920,8 @@ class _GeoRateSelectionBudget:
     def claim_provider_sets(
         self,
         provider_counts_by_id: Mapping[str, int],
-    ) -> None:
-        """Charge exact first-seen provider sets and declared members."""
+    ) -> int | None:
+        """Charge first-seen sets and return members when expansion fits."""
 
         provider_set_ids = set(provider_counts_by_id)
         if not provider_set_ids or provider_set_ids.intersection(
@@ -13936,14 +13939,20 @@ class _GeoRateSelectionBudget:
             or len(self.provider_set_ids) + len(provider_set_ids)
             > self.maximum_geo_provider_sets
             or self.graph_batches >= self.caps.maximum_graph_batches
-            or self.candidate_members + candidate_members
-            > self.maximum_candidate_members
         ):
             raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+        claimed_candidate_members = (
+            candidate_members
+            if self.candidate_members + candidate_members
+            <= self.maximum_candidate_members
+            else None
+        )
         self.provider_set_ids.update(provider_set_ids)
         self.provider_counts_by_id.update(provider_counts_by_id)
-        self.candidate_members += candidate_members
+        if claimed_candidate_members is not None:
+            self.candidate_members += claimed_candidate_members
         self.graph_batches += 1
+        return claimed_candidate_members
 
 
 def _geo_rate_selection_budget(
@@ -14078,6 +14087,125 @@ async def _geo_eligible_provider_sets(
     return eligible_provider_set_ids
 
 
+def _reverse_geo_rate_set_ids(
+    rate_rows: Sequence[Mapping[str, Any]],
+    provider_counts_by_id: Mapping[str, int],
+) -> dict[int, str]:
+    """Bind one reverse rate scope to unique provider-set identities."""
+    provider_set_id_by_key = {
+        provider_set_key: provider_set_id
+        for provider_set_key, provider_set_id in _v4_rate_scope_set_ids(
+            rate_rows,
+            None,
+        ).items()
+        if provider_set_id in provider_counts_by_id
+    }
+    if (
+        len(provider_set_id_by_key) != len(provider_counts_by_id)
+        or set(provider_set_id_by_key.values()) != set(provider_counts_by_id)
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 geo rate reverse scope lost a provider-set identity"
+        )
+    return provider_set_id_by_key
+
+
+async def _bounded_reverse_geo_npis(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    candidate_limit: int,
+) -> tuple[tuple[int, ...], bool] | None:
+    """Read one bounded geo scope and report whether its source ended."""
+
+    location_rows = await _membership_location_rows(
+        session,
+        serving_tables,
+        args,
+        candidate_npis=None,
+        limit=candidate_limit,
+        offset=0,
+    )
+    if location_rows is None:
+        return None
+    is_source_exhausted = not location_rows or _is_graph_location_source_exhausted(
+        location_rows,
+        candidate_limit,
+    )
+    candidate_npis = tuple(
+        sorted(
+            {
+                int(location_row["npi"])
+                for location_row in location_rows
+                if location_row.get("npi") not in (None, "")
+            }
+        )
+    )
+    return candidate_npis, is_source_exhausted
+
+
+async def _reverse_geo_eligible_provider_sets(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    rate_rows: Sequence[Mapping[str, Any]],
+    provider_counts_by_id: Mapping[str, int],
+    budget: _GeoRateSelectionBudget,
+) -> set[str] | None:
+    """Reverse-intersect one bounded geo scope with oversized V4 sets."""
+
+    provider_set_id_by_key = _reverse_geo_rate_set_ids(
+        rate_rows,
+        provider_counts_by_id,
+    )
+    remaining_candidates = budget.maximum_candidate_members - budget.candidate_members
+    if remaining_candidates <= 0:
+        raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+    geo_scope = await _bounded_reverse_geo_npis(
+        session,
+        serving_tables,
+        args,
+        remaining_candidates,
+    )
+    if geo_scope is None:
+        return None
+    candidate_npis, is_source_exhausted = geo_scope
+    budget.candidate_members += len(candidate_npis)
+    if _is_ptg2_provider_filter_requested(args):
+        candidate_npis = await _filter_npis_by_taxonomy(
+            session,
+            args,
+            candidate_npis,
+            limit=max(len(candidate_npis), 1),
+        )
+    try:
+        matches_by_npi = await _shared_provider_set_keys_by_npi(
+            session,
+            serving_tables,
+            candidate_npis,
+            provider_set_id_by_key.keys(),
+            max_members=remaining_candidates,
+        )
+    except PTG2SharedBlockError as exc:
+        if not _is_v4_member_limit(exc):
+            raise
+        raise PTG2OnlineWorkBudgetExceeded("candidate_members") from exc
+    eligible_provider_set_keys = {
+        int(provider_set_key)
+        for provider_set_keys in matches_by_npi.values()
+        for provider_set_key in provider_set_keys
+    }
+    # Eligibility is exact only after source exhaustion or a witness for every set.
+    if not is_source_exhausted and not eligible_provider_set_keys.issuperset(
+        provider_set_id_by_key
+    ):
+        raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+    return {
+        provider_set_id_by_key[provider_set_key]
+        for provider_set_key in eligible_provider_set_keys
+    }
+
+
 async def _read_geo_rate_page(
     session,
     serving_tables: PTG2ServingTables,
@@ -14123,18 +14251,28 @@ async def _resolve_geo_rate_eligibility(
     )
     if not provider_counts_by_id:
         return {}
-    budget.claim_provider_sets(provider_counts_by_id)
-    npis_by_set = await _exact_geo_rate_member_npis(
-        session,
-        serving_tables,
-        provider_counts_by_id,
-    )
-    eligible_provider_set_ids = await _geo_eligible_provider_sets(
-        session,
-        serving_tables,
-        args,
-        npis_by_set,
-    )
+    claimed_candidate_members = budget.claim_provider_sets(provider_counts_by_id)
+    if claimed_candidate_members is not None:
+        npis_by_set = await _exact_geo_rate_member_npis(
+            session,
+            serving_tables,
+            provider_counts_by_id,
+        )
+        eligible_provider_set_ids = await _geo_eligible_provider_sets(
+            session,
+            serving_tables,
+            args,
+            npis_by_set,
+        )
+    else:
+        eligible_provider_set_ids = await _reverse_geo_eligible_provider_sets(
+            session,
+            serving_tables,
+            args,
+            rate_rows,
+            provider_counts_by_id,
+            budget,
+        )
     if eligible_provider_set_ids is None:
         return None
     return {

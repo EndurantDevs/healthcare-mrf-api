@@ -346,29 +346,22 @@ def _format_address(
 
 
 def _openaddresses_row_hash(
+    feature_parts_by_name: Mapping[str, Any],
     *,
     source: str | None,
-    feature_id: str | None,
-    house_number: str,
-    street_match: str,
-    city: str | None,
-    state: str,
-    zip5: str,
-    lat: float,
-    lon: float,
 ) -> str:
     return hashlib.sha256(
         "|".join(
             [
                 source or "",
-                feature_id or "",
-                house_number,
-                street_match,
-                city or "",
-                state,
-                zip5,
-                f"{lat:.8f}",
-                f"{lon:.8f}",
+                feature_parts_by_name["feature_id"] or "",
+                feature_parts_by_name["house_number"],
+                feature_parts_by_name["street_match"],
+                feature_parts_by_name["city"] or "",
+                feature_parts_by_name["state"],
+                feature_parts_by_name["zip5"],
+                f"{feature_parts_by_name['lat']:.8f}",
+                f"{feature_parts_by_name['lon']:.8f}",
             ]
         ).encode("utf-8")
     ).hexdigest()
@@ -669,15 +662,8 @@ def _record_from_feature_parts(
     formatted_address = _format_address(first_line=first_line, unit=unit, city=city, state=state, zip5=zip5)
     feature_id = feature_parts_by_name["feature_id"]
     row_hash = _openaddresses_row_hash(
+        feature_parts_by_name,
         source=source_name,
-        feature_id=feature_id,
-        house_number=house_number,
-        street_match=street_match,
-        city=city,
-        state=state,
-        zip5=zip5,
-        lat=lat,
-        lon=lon,
     )
     return {
         "row_hash": row_hash,
