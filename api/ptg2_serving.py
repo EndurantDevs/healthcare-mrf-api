@@ -17361,12 +17361,7 @@ async def _search_manifest_serving_table(
     if args.get("q") or not requested_code or (not requested_plan and not explicit_source_scope):
         return None
 
-    requested_include_providers = args.get("include_providers")
-    include_providers = (
-        _is_request_flag_enabled(requested_include_providers)
-        if requested_include_providers is not None
-        else _is_ptg2_provider_filter_requested(args)
-    )
+    include_providers = _is_request_flag_enabled(args.get("include_providers"))
     candidate_audit_npi = (
         _normalize_npi(args.get("npi"))
         if candidate_audit_access_from_args(args) is not None
