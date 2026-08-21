@@ -14183,7 +14183,7 @@ async def _reverse_geo_eligible_provider_sets(
             session,
             serving_tables,
             candidate_npis,
-            provider_set_id_by_key,
+            provider_set_id_by_key.keys(),
             max_members=remaining_candidates,
         )
     except PTG2SharedBlockError as exc:

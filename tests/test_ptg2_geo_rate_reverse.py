@@ -98,6 +98,9 @@ async def test_geo_rate_prefix_maps_only_bounded_reverse_graph_overflow(
 
     if expected_error is serving.PTG2OnlineWorkBudgetExceeded:
         assert exc_info.value.dimension == "candidate_members"
+    else:
+        assert type(exc_info.value) is serving.PTG2SharedBlockError
+        assert str(exc_info.value) == graph_error
     assert reverse_reads.await_args.kwargs["max_members"] == 100_000
     assert "max_projection_members" not in reverse_reads.await_args.kwargs
 
