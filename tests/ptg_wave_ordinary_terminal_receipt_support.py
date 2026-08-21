@@ -120,10 +120,10 @@ def keyring(monkeypatch) -> PTGWaveReceiptKeyring:
     return PTGWaveReceiptKeyring.from_environment()
 
 
-def direct_v6_boundary(monkeypatch):
+def direct_v6_boundary(monkeypatch, *, source_type="in_network"):
     """Build one signed V6 boundary and pristine abandonment proof."""
-    source_key, direct_intent_mapping, frozen_params_mapping = (
-        _direct_member_input()
+    _, direct_intent_mapping, frozen_params_mapping = (
+        _direct_member_input(source_type=source_type)
     )
     request = _signed_v6_request(frozen_params_mapping)
     wave, intents, admission = _persisted_v6_wave(request)
@@ -138,15 +138,18 @@ def direct_v6_boundary(monkeypatch):
     )
 
 
-def _direct_member_input():
+def _direct_member_input(*, source_type):
     source_key = singleton_direct_source_key(SOURCE_FILE_ID)
     historical_id = "candidate-neutral-v12"
+    selector = (
+        "allowed_url" if source_type == "allowed_amounts" else "in_network_url"
+    )
     direct_intent_mapping = {
         "contract": DIRECT_RATE_FILE_INTENT_CONTRACT,
         "source_file_import_id": historical_id,
         "source_file_id": SOURCE_FILE_ID,
         "content_version": CONTENT_VERSION,
-        "source_type": "in_network",
+        "source_type": source_type,
         "canonical_url": "https://synthetic.invalid/rates.json.gz",
         "source_key": source_key,
         "content_file_count": 1,
@@ -164,7 +167,7 @@ def _direct_member_input():
         "ptg_resource": PTG_SMALL_RESOURCE_CONTRACT, "source_key": source_key,
         "plan_ids": PLAN_IDS, "plan_market_types": PLAN_MARKET_TYPES,
         "max_files": 1,
-        "in_network_url": direct_intent_mapping["canonical_url"],
+        selector: direct_intent_mapping["canonical_url"],
     }
     return source_key, direct_intent_mapping, frozen_params_mapping
 
@@ -368,6 +371,11 @@ def _ordinary_run_maps(
     direct_intent_mapping,
     source_key,
 ):
+    selector = (
+        "allowed_url"
+        if direct_intent_mapping["source_type"] == "allowed_amounts"
+        else "in_network_url"
+    )
     run_params_mapping = {
         "import_id": ORDINARY_IMPORT_ID,
         "source_file_import_id": ORDINARY_IMPORT_ID,
@@ -378,7 +386,7 @@ def _ordinary_run_maps(
         "ordinary_cutover_direct_input_digest": frozen_params_mapping[
             "direct_rate_file_intent_sha256"
         ],
-        "in_network_url": direct_intent_mapping["canonical_url"],
+        selector: direct_intent_mapping["canonical_url"],
         "max_files": 1,
         "plan_ids": ORDINARY_PLAN_IDS, "plan_market_types": PLAN_MARKET_TYPES,
         "resource_class": "small",

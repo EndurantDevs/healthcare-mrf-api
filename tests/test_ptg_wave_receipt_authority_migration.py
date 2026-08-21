@@ -966,7 +966,7 @@ async def _insert_later_import_run(connection, quoted: str, run) -> None:
             '2026-08-10T13:00:00.000000+00:00'::timestamptz,
             $9::text::timestamptz, $9::text::timestamptz,
             '{{"unit":"files","total":1,"done":1,"pct":100}}'::jsonb,
-            $10::jsonb, NULL, $11, $8, NULL
+            $10::jsonb, $11::jsonb, $12, $8, NULL
         )
         """,
         run.run_id,
@@ -979,6 +979,7 @@ async def _insert_later_import_run(connection, quoted: str, run) -> None:
         run.source_file_import_id,
         "2026-08-10T13:14:15.123456+00:00",
         json.dumps(run.metrics),
+        json.dumps(run.error) if run.error is not None else None,
         run.snapshot_id,
     )
 
@@ -994,7 +995,7 @@ async def _insert_later_engine_run(connection, quoted: str, engine_run) -> None:
             '2026-08-10T13:00:00.000000+00:00'::timestamptz,
             '2026-08-10T13:14:14.999999+00:00'::timestamptz,
             '2026-08-10T13:14:14.999999+00:00'::timestamptz,
-            $4::jsonb, $5::jsonb, NULL
+            $4::jsonb, $5::jsonb, $6
         )
         """,
         engine_run.import_run_id,
@@ -1002,6 +1003,7 @@ async def _insert_later_engine_run(connection, quoted: str, engine_run) -> None:
         engine_run.status,
         json.dumps(engine_run.options),
         json.dumps(engine_run.report),
+        engine_run.error,
     )
 
 
@@ -1211,9 +1213,11 @@ async def _prepare_ordinary_terminal_db_fixture(
     connection,
     monkeypatch,
     schema: str,
+    *,
+    state_factory=_ordinary_result,
 ):
     await _install_receipt_migration(connection, monkeypatch, schema)
-    state = _ordinary_result(monkeypatch)
+    state = state_factory(monkeypatch)
     wave = state["wave"]
     intent = state["intent"]
     quarantine = state["quarantine"]

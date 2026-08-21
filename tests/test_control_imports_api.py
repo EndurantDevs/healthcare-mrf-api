@@ -36,6 +36,7 @@ from api.control_imports import (
     parse_ptg_toc_preview,
 )
 from process.ext import utils as process_utils
+from process.ptg_allowed_amount_blank import ALLOWED_AMOUNT_BLANK_ERROR
 
 mrf_source_discovery = importlib.import_module("process.mrf_source_discovery")
 
@@ -1884,6 +1885,107 @@ async def test_import_run_request_paths_do_not_run_ddl(monkeypatch):
     )
     assert created is True
     assert source_row["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_get_import_run_projects_durable_allowed_amount_blank(monkeypatch):
+    durable_run = types.SimpleNamespace(
+        run_id="run_blank_neutral",
+        engine="healthcare-mrf-api",
+        node_id="node_neutral",
+        importer="ptg",
+        status="failed",
+        params={"source_file_import_id": "source_import_neutral"},
+        metrics={"queue": "arq:PTGSmall"},
+        error={
+            "code": "ptg_import_failed",
+            "message": ALLOWED_AMOUNT_BLANK_ERROR,
+        },
+        source_file_import_id="source_import_neutral",
+        import_id="source_import_neutral",
+    )
+
+    class QueryResult:
+        def scalar_one_or_none(self):
+            return durable_run
+
+    monkeypatch.setattr(
+        control_imports,
+        "db",
+        types.SimpleNamespace(execute=AsyncMock(return_value=QueryResult())),
+    )
+    projection = AsyncMock(
+        return_value={
+            "status": "blank",
+            "source_key": "ptg_source_neutral",
+            "file_domains": ["allowed_amounts"],
+            "allowed_amount_evidence": False,
+        }
+    )
+    monkeypatch.setattr(
+        control_imports,
+        "_allowed_amount_blank_terminal_metrics",
+        projection,
+    )
+
+    public_run = await control_imports.get_import_run("run_blank_neutral")
+
+    assert public_run["status"] == "failed"
+    assert public_run["metrics"] == {
+        "queue": "arq:PTGSmall",
+        "status": "blank",
+        "file_domains": ["allowed_amounts"],
+        "allowed_amount_evidence": False,
+    }
+    assert "source_key" not in public_run["metrics"]
+    projection.assert_awaited_once_with(durable_run, public_run)
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_blank_projection_loads_exact_inner_rows(monkeypatch):
+    from tests.ptg_blank_terminal_support import (
+        blank_ordinary_result,
+    )
+
+    state = blank_ordinary_result(monkeypatch)
+
+    class Result:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar_one_or_none(self):
+            return self.value
+
+    execute = AsyncMock(
+        side_effect=(
+            Result(state["engine_run"]),
+            Result(state["engine_snapshot"]),
+        )
+    )
+    monkeypatch.setattr(
+        control_imports,
+        "db",
+        types.SimpleNamespace(execute=execute),
+    )
+
+    metrics = await control_imports._allowed_amount_blank_terminal_metrics(
+        state["run"],
+        normalize_run(state["run"]),
+    )
+
+    assert metrics is not None
+    assert metrics["status"] == "blank"
+    assert metrics["snapshot_status"] == "failed"
+    assert execute.await_count == 2
+    query_params = [
+        call.args[0].compile().params for call in execute.await_args_list
+    ]
+    assert query_params[0]["import_run_id_1"] == (
+        f"ptg2:{state['run'].source_file_import_id}"
+    )
+    assert query_params[1]["snapshot_id_1"] == (
+        state["engine_snapshot"].snapshot_id
+    )
 
 
 def test_normalize_triggered_by_bounds_database_value():

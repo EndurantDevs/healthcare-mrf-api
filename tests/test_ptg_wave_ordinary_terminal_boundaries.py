@@ -31,6 +31,7 @@ from tests.ptg_wave_ordinary_terminal_receipt_support import (
     ordinary_result,
     v13_ordinary_result,
 )
+from tests.ptg_blank_terminal_support import blank_ordinary_result
 
 
 def _set_nested(mapping, *path_and_value):
@@ -251,6 +252,39 @@ def test_database_sqlstate_traverses_wrappers_once_and_handles_cycles():
 
     assert terminal_receipt._database_sqlstate(outer_error) == "55P03"
     assert terminal_receipt._database_sqlstate(RuntimeError("plain")) == ""
+    cyclic_error = RuntimeError("cycle")
+    cyclic_error.__cause__ = cyclic_error
+    assert terminal_receipt._database_sqlstate(cyclic_error) == ""
+
+
+def test_blank_terminal_loading_boundaries(monkeypatch):
+    terminal_state = blank_ordinary_result(monkeypatch)
+    run = terminal_state["run"]
+    run.params = []
+    assert terminal_receipt._run_with_blank_metrics(
+        run,
+        terminal_state["engine_run"],
+        terminal_state["engine_snapshot"],
+    ) is run
+
+    run.params = terminal_state["intent"].params
+    assert terminal_receipt._run_with_blank_metrics(run, None, None) is run
+
+    run.status = "running"
+    with pytest.raises(PTGWaveOrdinaryTerminalConflict):
+        terminal_receipt._outer_engine_import_run_id(
+            run,
+            request=terminal_state["request"],
+            intent=terminal_state["intent"],
+        )
+
+    run.run_id = terminal_state["intent"].run_id
+    with pytest.raises(PTGWaveOrdinaryTerminalConflict):
+        terminal_receipt._outer_engine_import_run_id(
+            run,
+            request=terminal_state["request"],
+            intent=terminal_state["intent"],
+        )
 
 
 @pytest.mark.asyncio

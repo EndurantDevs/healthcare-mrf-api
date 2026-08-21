@@ -11,6 +11,11 @@ from process.ptg_singleton_direct_control import (
     DIRECT_RATE_FILE_INTENT_SHA256_FIELD,
     normalize_protected_singleton_direct_params,
 )
+from process.ptg_allowed_amount_blank import (
+    ALLOWED_AMOUNT_BLANK_ERROR,
+    allowed_amount_blank_metrics,
+    is_allowed_amount_blank_error,
+)
 from process.ptg_wave_ordinary_terminal_contract import (
     PTGWaveOrdinaryTerminalConflict,
     _market_types,
@@ -46,6 +51,7 @@ class _EngineResultExpectation:
     run_params: Mapping[str, Any]
     engine_import_run_id: str
     snapshot_id: str
+    terminal_status: str
 
 
 @dataclass(frozen=True)
@@ -161,12 +167,15 @@ def _validated_outer_run(
     source_key = _text(direct_intent.get("source_key"), "source key", 96)
     frozen_node_id = _text(frozen_params.get("node_id"), "node ID", 64)
     expected_selector, competing_selector = _source_selectors(direct_intent)
+    terminal_status = str(run_metrics.get("status") or "")
     _validate_outer_run_row(
         run,
         request=request,
         intent=intent,
         source_id=source_id,
         frozen_node_id=frozen_node_id,
+        source_type=str(direct_intent.get("source_type") or ""),
+        terminal_status=terminal_status,
     )
     _validate_outer_run_params(
         run_params,
@@ -183,6 +192,7 @@ def _validated_outer_run(
         source_id=source_id,
         source_key=source_key,
         import_month=frozen_params["import_month"],
+        terminal_status=terminal_status,
     )
     snapshot_id = _text(run_metrics.get("snapshot_id"), "snapshot ID", 96)
     if getattr(run, "snapshot_id", None) not in (None, "", snapshot_id):
@@ -211,20 +221,32 @@ def _validate_outer_run_row(
     intent: Any,
     source_id: str,
     frozen_node_id: str,
+    source_type: str,
+    terminal_status: str,
 ) -> None:
-    if (
+    has_common_result_conflict = (
         request["run_id"] != getattr(run, "run_id", None)
         or request["run_id"] == getattr(intent, "run_id", None)
         or source_id == getattr(intent, "source_file_import_id", None)
         or getattr(run, "engine", None) != "healthcare-mrf-api"
         or getattr(run, "importer", None) != "ptg"
-        or getattr(run, "status", None) != "succeeded"
         or getattr(run, "node_id", None) != frozen_node_id
         or getattr(run, "source_file_import_id", None) != source_id
         or getattr(run, "import_id", None) != source_id
-        or getattr(run, "error", None) is not None
         or getattr(run, "finished_at", None) is None
-    ):
+    )
+    is_succeeded = (
+        terminal_status == "succeeded"
+        and getattr(run, "status", None) == "succeeded"
+        and getattr(run, "error", None) is None
+    )
+    is_blank = (
+        terminal_status == "blank"
+        and source_type == "allowed_amounts"
+        and getattr(run, "status", None) == "failed"
+        and is_allowed_amount_blank_error(getattr(run, "error", None))
+    )
+    if has_common_result_conflict or not (is_succeeded or is_blank):
         raise PTGWaveOrdinaryTerminalConflict(
             "ordinary run does not match the frozen V12 member"
         )
@@ -273,12 +295,22 @@ def _validate_outer_run_metrics(
     source_id: str,
     source_key: str,
     import_month: str,
+    terminal_status: str,
 ) -> None:
     if (
-        run_metrics.get("status") != "succeeded"
+        terminal_status not in {"succeeded", "blank"}
         or run_metrics.get("source_key") != source_key
         or _month(run_metrics.get("import_month")) != import_month
         or run_metrics.get("source_file_import_id", source_id) != source_id
+        or (
+            terminal_status == "blank"
+            and (
+                run_metrics.get("file_domains") != ["allowed_amounts"]
+                or run_metrics.get("allowed_amount_evidence") is not False
+                or run_metrics.get("files_processed") != 1
+                or run_metrics.get("snapshot_status") != "failed"
+            )
+        )
     ):
         raise PTGWaveOrdinaryTerminalConflict(
             "ordinary run does not match the frozen V12 member"
@@ -314,6 +346,8 @@ def _validated_engine_result(
     *,
     expectation: _EngineResultExpectation,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Validate durable engine state against the authenticated outer run."""
+
     if engine_run is None or engine_snapshot is None:
         raise PTGWaveOrdinaryTerminalConflict(
             "durable PTG terminal result is unavailable"
@@ -323,6 +357,7 @@ def _validated_engine_result(
     snapshot_manifest = _object(
         getattr(engine_snapshot, "manifest", None), "snapshot manifest"
     )
+    _validate_blank_projection(engine_run, engine_snapshot, expectation)
     run_expectation = _EngineRunExpectation(
         import_run_id=expectation.engine_import_run_id,
         snapshot_id=expectation.snapshot_id,
@@ -338,6 +373,7 @@ def _validated_engine_result(
         options=engine_options,
         report=engine_report,
         expectation=run_expectation,
+        terminal_status=expectation.terminal_status,
     )
     _validate_engine_snapshot(
         engine_snapshot,
@@ -346,8 +382,38 @@ def _validated_engine_result(
         expected_import_run_id=expectation.engine_import_run_id,
         expected_snapshot_id=expectation.snapshot_id,
         expected_month=expectation.frozen_params["import_month"],
+        terminal_status=expectation.terminal_status,
     )
     return engine_options, engine_report, snapshot_manifest
+
+
+def _validate_blank_projection(
+    engine_run: Any,
+    engine_snapshot: Any,
+    expectation: _EngineResultExpectation,
+) -> None:
+    if expectation.terminal_status != "blank":
+        return
+    blank_metrics = allowed_amount_blank_metrics(
+        source_file_import_id=expectation.request["source_file_import_id"],
+        source_key=str(expectation.direct_intent.get("source_key") or ""),
+        import_month=expectation.frozen_params.get("import_month"),
+        plan_ids=expectation.run_params.get("plan_ids") or [],
+        plan_market_types=expectation.run_params.get("plan_market_types") or [],
+        outer_error={
+            "code": "ptg_import_failed",
+            "message": ALLOWED_AMOUNT_BLANK_ERROR,
+        },
+        engine_run=engine_run,
+        engine_snapshot=engine_snapshot,
+    )
+    if blank_metrics is None or any(
+        expectation.run_metrics.get(name) != projected_metric
+        for name, projected_metric in blank_metrics.items()
+    ):
+        raise PTGWaveOrdinaryTerminalConflict(
+            "durable PTG result conflicts with the ordinary run"
+        )
 
 
 def _validate_engine_run(
@@ -356,20 +422,30 @@ def _validate_engine_run(
     options: Mapping[str, Any],
     report: Mapping[str, Any],
     expectation: _EngineRunExpectation,
+    terminal_status: str,
 ) -> None:
-    if (
+    has_common_result_conflict = (
         getattr(engine_run, "import_run_id", None)
         != expectation.import_run_id
-        or getattr(engine_run, "status", None) != "validated"
         or _month(getattr(engine_run, "import_month", None))
         != expectation.import_month
         or getattr(engine_run, "finished_at", None) is None
-        or getattr(engine_run, "error", None) is not None
         or options.get("source_key") != expectation.source_key
         or options.get("plan_ids") != expectation.plan_ids
         or options.get("plan_market_types") != expectation.market_types
         or report.get("snapshot_id") != expectation.snapshot_id
-    ):
+    )
+    is_succeeded = (
+        terminal_status == "succeeded"
+        and getattr(engine_run, "status", None) == "validated"
+        and getattr(engine_run, "error", None) is None
+    )
+    is_blank = (
+        terminal_status == "blank"
+        and getattr(engine_run, "status", None) == "failed"
+        and getattr(engine_run, "error", None) == ALLOWED_AMOUNT_BLANK_ERROR
+    )
+    if has_common_result_conflict or not (is_succeeded or is_blank):
         raise PTGWaveOrdinaryTerminalConflict(
             "durable PTG result conflicts with the ordinary run"
         )
@@ -383,15 +459,18 @@ def _validate_engine_snapshot(
     expected_import_run_id: str,
     expected_snapshot_id: str,
     expected_month: str,
+    terminal_status: str,
 ) -> None:
+    expected_snapshot_statuses = (
+        {"failed"} if terminal_status == "blank" else {"validated", "published"}
+    )
     if (
         getattr(engine_snapshot, "snapshot_id", None) != expected_snapshot_id
         or getattr(engine_snapshot, "import_run_id", None)
         != expected_import_run_id
         or _month(getattr(engine_snapshot, "import_month", None))
         != expected_month
-        or getattr(engine_snapshot, "status", None)
-        not in {"validated", "published"}
+        or getattr(engine_snapshot, "status", None) not in expected_snapshot_statuses
         or run_metrics.get("snapshot_status")
         != getattr(engine_snapshot, "status", None)
         or run_metrics.get("import_run_id") != expected_import_run_id

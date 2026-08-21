@@ -139,6 +139,7 @@ def _validated_result_components(
             run_params=run_params,
             engine_import_run_id=engine_import_run_id,
             snapshot_id=snapshot_id,
+            terminal_status=str(run_metrics.get("status") or ""),
         ),
     )
     return (
@@ -249,11 +250,14 @@ def _terminal_result(
     snapshot_id: str,
 ) -> dict[str, Any]:
     engine_options, engine_report, snapshot_manifest = engine_values
+    terminal_status = str(run_metrics.get("status") or "")
     terminal_result_by_field = {
         "engine": "healthcare-mrf-api",
         "importer": "ptg",
-        "status": "succeeded",
-        "engine_result_status": "validated",
+        "status": terminal_status,
+        "engine_result_status": (
+            "failed" if terminal_status == "blank" else "validated"
+        ),
         "source_file_import_id": request["source_file_import_id"],
         "run_id": request["run_id"],
         "node_id": _text(getattr(run, "node_id", None), "node ID", 64),
