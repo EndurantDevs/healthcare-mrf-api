@@ -547,6 +547,7 @@ run_core_postgres() {
   HLTHPRT_PROVIDER_DIRECTORY_MIGRATION_POSTGRES_DSN=$dsn \
   HLTHPRT_OBSERVED_NPI_INDEX_MIGRATION_POSTGRES_DSN=$dsn \
   HLTHPRT_MRF_FILE_CURSOR_MIGRATION_POSTGRES_DSN=$dsn \
+  HLTHPRT_PTG_PLAN_ID_WIDTH_MIGRATION_POSTGRES_DSN=$dsn \
   HLTHPRT_FHIR_FORMULARY_MIGRATION_POSTGRES_DSN=$dsn \
   HLTHPRT_PUBLIC_EVIDENCE_STORAGE_POSTGRES_DSN=$dsn \
   HLTHPRT_PUBLIC_EVIDENCE_RECORD_PARITY_POSTGRES_DSN=$dsn \
@@ -564,6 +565,7 @@ run_core_postgres() {
     tests/test_provider_directory_fhir_current_census_terminal_postgres.py \
     tests/test_provider_directory_fhir_current_census_atomicity_postgres.py \
     tests/test_mrf_file_source_cursor_migration.py \
+    tests/test_ptg_legacy_plan_identifier_width.py \
     tests/test_public_evidence_storage_catalog_postgres.py \
     tests/test_public_evidence_storage_interval_postgres.py \
     tests/test_public_evidence_storage_nulls_postgres.py \
