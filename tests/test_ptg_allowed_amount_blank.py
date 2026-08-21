@@ -76,9 +76,7 @@ def _blank_state() -> dict:
             manifest={
                 "snapshot_id": "ptg2:202608:snapshot-neutral",
                 "error": ALLOWED_AMOUNT_BLANK_ERROR,
-                "allowed_amount_lane": copy.deepcopy(
-                    allowed_amount_lane_map
-                ),
+                "allowed_amount_lane": copy.deepcopy(allowed_amount_lane_map),
             },
         ),
     }
@@ -86,9 +84,7 @@ def _blank_state() -> dict:
 
 def test_projects_only_exact_durable_blank_result() -> None:
     blank_state = _blank_state()
-
     metrics = allowed_amount_blank_metrics(**blank_state)
-
     assert metrics == {
         "status": "blank",
         "import_run_id": "ptg2:source-import-neutral",
@@ -110,7 +106,6 @@ def test_projects_only_exact_durable_blank_result() -> None:
         "allowed_amount_unique_tins": 0,
         "allowed_amount_evidence": False,
     }
-
     for durable_state in (
         blank_state["engine_run"].report,
         blank_state["engine_snapshot"].manifest,
@@ -119,15 +114,12 @@ def test_projects_only_exact_durable_blank_result() -> None:
             "summary"
         ]["allowed_amount_provider_payments"] = 1
     assert allowed_amount_blank_metrics(**blank_state) is None
-
     blank_state = _blank_state()
     blank_state["engine_snapshot"].status = "validated"
     assert allowed_amount_blank_metrics(**blank_state) is None
-
     blank_state = _blank_state()
     blank_state["engine_run"].import_run_id = "ptg2:wrong-source"
     assert allowed_amount_blank_metrics(**blank_state) is None
-
     blank_state = _blank_state()
     blank_state["engine_snapshot"].manifest["allowed_amount_lane"][
         "successful_files"
@@ -139,12 +131,9 @@ def test_blank_projection_accepts_mappings_and_rejects_evidence_drift() -> None:
     blank_state = _blank_state()
     blank_state["engine_run"] = vars(blank_state["engine_run"])
     assert allowed_amount_blank_metrics(**blank_state) is not None
-
-    for durable_state in (
-        blank_state["engine_run"]["report"],
-        blank_state["engine_snapshot"].manifest,
-    ):
-        durable_state["allowed_amount_lane"]["successful_files"][0][
-            "summary"
-        ]["allowed_amount_evidence"] = True
+    lane = blank_state["engine_run"]["report"]["allowed_amount_lane"]
+    blank_state["engine_snapshot"].manifest["allowed_amount_lane"] = lane
+    lane["successful_files"][0]["summary"][
+        "allowed_amount_evidence"
+    ] = True
     assert allowed_amount_blank_metrics(**blank_state) is None

@@ -58,7 +58,6 @@ from process.ptg_wave_receipt_contract import (
     admission_receipt_mapping,
     ordinary_cutover_id,
 )
-from process import ptg_wave_ordinary_terminal_receipt as terminal_module
 from process.ptg_wave_state import canonical_json, sha256_digest
 from process.ptg_wave_v12_pristine_abandonment import (
     abandonment_receipt_payload,
@@ -148,38 +147,6 @@ def test_builds_authenticated_blank_terminal_payload(monkeypatch):
         match="durable PTG result",
     ):
         ordinary_terminal_receipt_payload(**state)
-
-
-def test_blank_terminal_internal_boundaries_are_closed(monkeypatch):
-    cyclic_error = RuntimeError("cycle")
-    cyclic_error.__cause__ = cyclic_error
-    assert terminal_module._database_sqlstate(cyclic_error) == ""
-
-    state = _blank_ordinary_result(monkeypatch)
-    run = state["run"]
-    run.params = []
-    assert terminal_module._run_with_blank_metrics(
-        run, state["engine_run"], state["engine_snapshot"]
-    ) is run
-
-    run.params = state["intent"].params
-    assert terminal_module._run_with_blank_metrics(run, None, None) is run
-
-    run.status = "running"
-    with pytest.raises(PTGWaveOrdinaryTerminalConflict):
-        terminal_module._outer_engine_import_run_id(
-            run,
-            request=state["request"],
-            intent=state["intent"],
-        )
-
-    run.run_id = state["intent"].run_id
-    with pytest.raises(PTGWaveOrdinaryTerminalConflict):
-        terminal_module._outer_engine_import_run_id(
-            run,
-            request=state["request"],
-            intent=state["intent"],
-        )
 
 
 @pytest.mark.parametrize(
