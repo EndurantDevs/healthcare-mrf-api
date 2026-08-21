@@ -12,12 +12,12 @@ from scripts.research.provider_directory_api_completion import (
 )
 from scripts.research.provider_directory_api_evidence_support import (
     MappedEvidenceWitness,
-    NetworkWitness,
     OverlaySample,
     SourceProvenance,
     SourceSelection,
 )
 from scripts.research.provider_directory_api_evidence_models import normalized_coordinate
+from scripts.research.provider_directory_api_evidence_typed import _network_witnesses
 
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -406,7 +406,10 @@ def _mapped_witnesses(
                 and evidence_map.get("resource_id")
             }
         )[:MAX_EXPECTED_EVIDENCE_ITEMS]
-        network_list = _network_witnesses(evidence_map_list)
+        network_list = _network_witnesses(
+            evidence_map_list,
+            MAX_EXPECTED_EVIDENCE_ITEMS,
+        )
         source_id = str(evidence_map_list[0].get("source_id") or "")
         if not source_id:
             continue
@@ -422,25 +425,6 @@ def _mapped_witnesses(
             )
         )
     return witness_list
-
-
-def _network_witnesses(
-    evidence_map_list: list[Mapping[str, Any]],
-) -> tuple[NetworkWitness, ...]:
-    network_map_by_id = {
-        str(evidence_map.get("resource_id")): evidence_map
-        for evidence_map in evidence_map_list
-        if evidence_map.get("evidence_type") == "network"
-        and evidence_map.get("resource_id")
-    }
-    return tuple(
-        NetworkWitness(
-            network_id,
-            bool(str(network_map_by_id[network_id].get("name") or "").strip()),
-            bool(str(network_map_by_id[network_id].get("reference") or "").strip()),
-        )
-        for network_id in sorted(network_map_by_id)[:MAX_EXPECTED_EVIDENCE_ITEMS]
-    )
 
 
 async def fetch_overlay_samples(

@@ -782,19 +782,17 @@ def _lookup_dense_sidecar_members(
         raise PTG2ManifestArtifactError("dense global membership sidecar member dictionary count mismatch")
 
     index_start = _DENSE_MEMBERSHIP_HEADER.size
-    index_end = index_start + entry_count * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
-    globals_start = index_end
+    globals_start = index_start + entry_count * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
     globals_end = globals_start + member_global_count * 16
     if len(dense_sidecar_bytes) < globals_end:
         raise PTG2ManifestArtifactError("dense global membership sidecar ended inside the dictionary")
-    members_start = globals_end
     low = 0
     high = int(entry_count) - 1
     while low <= high:
         mid = (low + high) // 2
-        record_offset = index_start + mid * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
         candidate_owner, member_offset, member_count = _MEMBERSHIP_INDEX_RECORD.unpack_from(
-            dense_sidecar_bytes, record_offset
+            dense_sidecar_bytes,
+            index_start + mid * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE,
         )
         if candidate_owner < owner_id:
             low = mid + 1
@@ -802,7 +800,7 @@ def _lookup_dense_sidecar_members(
         if candidate_owner > owner_id:
             high = mid - 1
             continue
-        start = members_start + member_offset * _DENSE_MEMBER_RECORD.size
+        start = globals_end + member_offset * _DENSE_MEMBER_RECORD.size
         end = start + member_count * _DENSE_MEMBER_RECORD.size
         if end > len(dense_sidecar_bytes):
             raise PTG2ManifestArtifactError("dense global membership sidecar member block is truncated")

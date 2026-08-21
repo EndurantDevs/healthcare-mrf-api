@@ -9363,8 +9363,10 @@ async def _provider_procedure_locations(
         filters.append(location_table.c.zip5 == zip5)
 
     where_clause = and_(*filters)
-    count_result = await session.execute(select(func.count()).select_from(location_table).where(where_clause))
-    total = int(count_result.scalar() or 0)
+    total = int(
+        (await session.execute(select(func.count()).select_from(location_table).where(where_clause))).scalar()
+        or 0
+    )
 
     query = select(location_table).where(where_clause)
     order = _normalize_order(args.get("order"))
