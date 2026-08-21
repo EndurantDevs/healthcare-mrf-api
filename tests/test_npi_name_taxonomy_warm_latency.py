@@ -14,7 +14,7 @@ import pytest
 
 LOOPBACK_URL_ENV = "HLTHPRT_NPI_NAME_TAXONOMY_LOOPBACK_URL"
 EXPECTED_NPIS_ENV = "HLTHPRT_NPI_NAME_TAXONOMY_EXPECTED_NPIS"
-TARGET_WARM_MEDIAN_MS = 40.0
+TARGET_WARM_P95_MS = 40.0
 HARD_WARM_REQUEST_MS = 3_000.0
 WARMUP_REQUESTS = 2
 WARM_REQUESTS = 7
@@ -95,7 +95,11 @@ def test_name_taxonomy_process_loopback_warm_latency_and_parity():
         for _ in range(WARM_REQUESTS)
     ]
 
-    warm_median_ms = statistics.median(warm_samples_ms)
+    warm_p95_ms = statistics.quantiles(
+        warm_samples_ms,
+        n=20,
+        method="inclusive",
+    )[18]
     warm_max_ms = max(warm_samples_ms)
-    assert warm_median_ms < TARGET_WARM_MEDIAN_MS, warm_samples_ms
+    assert warm_p95_ms < TARGET_WARM_P95_MS, warm_samples_ms
     assert warm_max_ms < HARD_WARM_REQUEST_MS, warm_samples_ms
