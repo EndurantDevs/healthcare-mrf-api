@@ -506,7 +506,7 @@ def _ptg2_plan_rows(
         "issuer_name": plan_fields.get("issuer_name"),
         "plan_sponsor_name": plan_fields.get("plan_sponsor_name"),
     }
-    plan_hash = semantic_hash(plan_identity_by_field, domain="plan")
+    plan_hash = semantic_sha256(plan_identity_by_field, domain="plan")
     plan_row_by_field = {
         "plan_hash": plan_hash,
         "hash_prefix": hash_prefix(plan_hash),
@@ -541,7 +541,7 @@ def _ptg2_plan_alias_rows(
             "alias_type": alias_type,
             "alias_value": str(alias_value),
         }
-        alias_hash = semantic_hash(alias_identity_by_field, domain="plan_alias")
+        alias_hash = semantic_sha256(alias_identity_by_field, domain="plan_alias")
         alias_rows.append(
             {
                 "alias_hash": alias_hash,

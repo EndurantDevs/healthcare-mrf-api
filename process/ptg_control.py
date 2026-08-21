@@ -31,6 +31,7 @@ from process.ptg_wave_claims import claim_wave_job_start, reconcile_wave_claim_e
 from process.ptg_frozen_control import frozen_rate_main_kwargs, validated_worker_frozen_rate_params
 from process.ptg_singleton_direct_control import singleton_direct_main_kwargs, validated_worker_singleton_direct_params
 from process.ptg_control_failures import ptg_failure_error
+from process.ptg_allowed_amount_blank_evidence import load_blank_failure_metrics
 from process.ptg_control_runtime import (
     PTG_CONTROL_HEARTBEAT_SOURCE,
     _stale_ptg_job_result,
@@ -46,6 +47,7 @@ from process.ptg_control_environment import (
 from process.ptg_wave_worker_claim_adapter import (
     exact_wave_claim_values as _exact_wave_claim_values,
 )
+
 PTG_CONTROL_QUEUE_NAME = "arq:PTG"
 _FULL_REBUILD_TOKEN_PARAM = "_full_rebuild_token"
 _FULL_REBUILD_SCOPE_PARAM = "_full_rebuild_scope_digest"
@@ -299,6 +301,9 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
             }
             if full_rebuild_proof_metrics_by_name
             else ptg_failure_error(exc)
+        )
+        failure_metrics_by_name.update(
+            await load_blank_failure_metrics(params_by_name, failure_error_by_name)
         )
         await mark_control_run(
             run_id,

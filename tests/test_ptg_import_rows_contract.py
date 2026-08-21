@@ -1,7 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Focused contracts for deterministic PTG import-row identifiers."""
 
+import datetime as dt
+
 from process.ptg_parts import import_rows
+from process.ptg_parts.ptg2_plan_catalog_payload import canonical_request_payload
 
 
 def test_import_id_normalization_handles_missing_and_oversized_values() -> None:
@@ -95,3 +98,31 @@ def test_provider_set_row_inlines_npis_without_group_dictionary() -> None:
         1234567890,
         1234567891,
     ]
+
+
+def test_plan_catalog_identities_ignore_compact_hash_mode(monkeypatch) -> None:
+    """Durable catalog identities remain full SHA-256 values."""
+
+    monkeypatch.setenv("HLTHPRT_PTG2_HASH_MODE", "checksum64")
+    plan_row, alias_rows, _plan_month_row = import_rows._ptg2_plan_rows(
+        {
+            "plan_id": "plan-neutral",
+            "plan_id_type": "hios",
+            "plan_name": "Neutral Plan",
+            "plan_market_type": "group",
+            "issuer_name": "Neutral Issuer",
+            "plan_sponsor_name": "Neutral Sponsor",
+        },
+        "ptg2:202608:snapshot-neutral",
+        dt.date(2026, 8, 1),
+    )
+
+    normalized_plans, normalized_aliases, _payload_sha256 = (
+        canonical_request_payload(
+            plan_rows=[plan_row],
+            alias_rows=alias_rows,
+        )
+    )
+
+    assert len(normalized_plans[0]["plan_hash"]) == 64
+    assert all(len(alias["alias_hash"]) == 64 for alias in normalized_aliases)
