@@ -80,6 +80,23 @@ async def test_get_all_include_total_false_skips_count_query(monkeypatch):
     assert response_body["total_source"] == "estimated_page_floor"
 
 
+@pytest.mark.parametrize(
+    ("request_args", "message"),
+    [
+        ({"order_by": "distance"}, "order_by must be one of"),
+        ({"order_by": "relevance"}, "order_by=relevance requires q"),
+        ({"view": "full"}, "view must be one of"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_get_all_rejects_invalid_doctor_search_controls(
+    request_args,
+    message,
+):
+    with pytest.raises(sanic.exceptions.InvalidUsage, match=message):
+        await get_all(types.SimpleNamespace(args=request_args))
+
+
 @pytest.mark.asyncio
 async def test_get_all_locator_defaults_to_no_total_query(monkeypatch):
     conn = RecordingConnection()
@@ -1763,6 +1780,32 @@ def test_provider_card_zip5_emits_only_schema_valid_values(
     expected_zip5,
 ):
     assert npi_module._provider_card_zip5(postal_code) == expected_zip5
+
+
+def test_provider_card_fills_compact_optional_fields():
+    card = npi_module._provider_card_from_mapping(
+        {
+            "npi": 1000000007,
+            "distance_miles": 1.25,
+            "taxonomy_list": [
+                {
+                    "healthcare_provider_taxonomy_code": "207Q00000X",
+                    "healthcare_provider_primary_taxonomy_switch": "Y",
+                },
+                {
+                    "healthcare_provider_taxonomy_code": "207Q00000X",
+                    "display": "Family Medicine",
+                },
+            ],
+        }
+    )
+
+    assert card["primary_specialty"] == {
+        "taxonomy_code": "207Q00000X",
+        "display": "Family Medicine",
+    }
+    assert card["zip5"] is None
+    assert card["distance_miles"] == 1.25
 
 
 def _fallback_location_maps():

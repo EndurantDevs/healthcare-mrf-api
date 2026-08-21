@@ -10033,7 +10033,7 @@ async def list_providers(request):
                 include_chain=include_chain_enrichment,
                 session=request_session,
             )
-        except Exception as exc:  # pragma: no cover - defensive fallback for transient DB states
+        except Exception as exc:
             logger.debug("Provider enrichment summary fetch failed: %s", exc)
     if summary_map:
         for provider_result in result_rows:

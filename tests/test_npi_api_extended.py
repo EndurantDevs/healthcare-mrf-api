@@ -626,6 +626,27 @@ async def test_get_near_npi_with_lat_long_uses_knn_without_bbox_params(
     assert captured_query_map["radius"] == expected_radius
 
 
+@pytest.mark.parametrize(
+    ("request_args", "message"),
+    [
+        ({"view": "sitemap"}, "view must be: card"),
+        (
+            {"lat": "41.0", "long": "-87.0", "limit": "0"},
+            "limit must be at least 1",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_get_near_npi_rejects_invalid_doctor_search_controls(
+    request_args,
+    message,
+):
+    with pytest.raises(sanic.exceptions.InvalidUsage, match=message):
+        await npi_module.get_near_npi(
+            types.SimpleNamespace(args=request_args, app=types.SimpleNamespace())
+        )
+
+
 @pytest.mark.asyncio
 async def test_get_near_npi_uses_unified_address_table_when_compatible(monkeypatch):
     captured_query_map = {}

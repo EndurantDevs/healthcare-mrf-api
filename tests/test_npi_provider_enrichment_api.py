@@ -341,6 +341,33 @@ async def test_get_all_attaches_provider_enrichment_summary(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_all_degrades_when_provider_enrichment_summary_fails(monkeypatch):
+    connections = [
+        FakeConnection([[(1,)]]),
+        FakeConnection([[_build_result_row(1234567890)]]),
+    ]
+
+    class FakeDB:
+        def acquire(self):
+            return FakeAcquire(connections.pop(0))
+
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_enrichment_summary_map",
+        AsyncMock(side_effect=RuntimeError("transient")),
+    )
+
+    response = await npi_module.get_all(
+        types.SimpleNamespace(args={"limit": "1"}, app=types.SimpleNamespace())
+    )
+    response_payload = json.loads(response.body)
+
+    assert response_payload["total"] == 1
+    assert "provider_enrichment_summary" not in response_payload["rows"][0]
+
+
+@pytest.mark.asyncio
 async def test_get_all_can_include_chain_provider_enrichment(monkeypatch):
     connections = [
         FakeConnection([[(1,)]]),
