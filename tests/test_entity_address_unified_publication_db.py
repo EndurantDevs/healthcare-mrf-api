@@ -255,6 +255,15 @@ async def test_real_postgres_cutover_promotes_logged_relation(monkeypatch):
             schema,
             "entity_address_unified",
         ) == "p"
+        assert await database.scalar(
+            """
+            SELECT last_analyze IS NOT NULL
+              FROM pg_stat_all_tables
+             WHERE schemaname = :schema
+               AND relname = 'entity_address_unified';
+            """,
+            schema=schema,
+        ) is True
 
 
 @pytest.mark.asyncio

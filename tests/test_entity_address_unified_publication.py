@@ -107,12 +107,13 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
     )
 
     assert recording_db.transaction_events == ["BEGIN", "COMMIT"]
-    assert recording_db.statements[0] == "SET LOCAL lock_timeout = '50ms';"
-    assert recording_db.statements[1] == (
+    assert recording_db.statements[0] == "ANALYZE mrf.entity_address_unified_stage;"
+    assert recording_db.statements[1] == "SET LOCAL lock_timeout = '50ms';"
+    assert recording_db.statements[2] == (
         "LOCK TABLE mrf.entity_address_unified, mrf.entity_address_unified_stage "
         "IN ACCESS EXCLUSIVE MODE NOWAIT;"
     )
-    assert recording_db.statements[2:5] == [
+    assert recording_db.statements[3:6] == [
         "DROP TABLE IF EXISTS mrf.entity_address_unified_old;",
         "ALTER TABLE IF EXISTS mrf.entity_address_unified RENAME TO entity_address_unified_old;",
         "ALTER TABLE mrf.entity_address_unified_stage RENAME TO entity_address_unified;",
@@ -136,6 +137,7 @@ async def test_entity_address_cutover_converts_unlogged_stage_before_transaction
     )
 
     assert recording_db.statements[0] == "ALTER TABLE mrf.entity_address_unified_stage SET LOGGED;"
+    assert recording_db.statements[1] == "ANALYZE mrf.entity_address_unified_stage;"
     assert recording_db.transaction_events == ["BEGIN", "COMMIT"]
 
 
@@ -161,11 +163,39 @@ async def test_entity_address_cutover_converts_every_promoted_stage_to_logged(mo
         context={},
     )
 
-    assert recording_db.statements[:2] == [
+    assert recording_db.statements[:3] == [
         "ALTER TABLE mrf.entity_address_unified_stage SET LOGGED;",
         "ALTER TABLE mrf.entity_address_evidence_stage SET LOGGED;",
+        "ANALYZE mrf.entity_address_unified_stage;",
     ]
     assert recording_db.transaction_events == ["BEGIN", "COMMIT"]
+
+
+@pytest.mark.asyncio
+async def test_entity_address_cutover_stops_when_stage_analyze_fails(monkeypatch):
+    recording_db = _RecordingDB()
+
+    async def fail_analyze(statement, **_params):
+        recording_db.statements.append(statement)
+        if statement == "ANALYZE mrf.entity_address_unified_stage;":
+            raise RuntimeError("analyze failed")
+        return 0
+
+    recording_db.status = fail_analyze
+    monkeypatch.setattr(entity_address_unified, "db", recording_db)
+
+    with pytest.raises(RuntimeError, match="analyze failed"):
+        await entity_address_unified._publish_staged_entity_address_tables(
+            "mrf",
+            _StageTable,
+            {},
+            partial_support_patch=False,
+            affected_group_table="",
+            context={},
+        )
+
+    assert recording_db.statements == ["ANALYZE mrf.entity_address_unified_stage;"]
+    assert recording_db.transaction_events == []
 
 
 @pytest.mark.asyncio

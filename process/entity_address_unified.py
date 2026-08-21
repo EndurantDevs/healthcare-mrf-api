@@ -2144,6 +2144,11 @@ async def _publish_staged_entity_address_tables(
     )
     for swap in swaps:
         await _ensure_promoted_stage_logged(db_schema, swap.stage_cls.__tablename__)
+    await _run_sql_phase(
+        f"ANALYZE {db_schema}.{stage_cls.__tablename__};",
+        context=context,
+        phase="entity-address-unified analyzing staged main table",
+    )
     context["stage_persistence"] = "p"
     max_attempts, base_backoff_ms, max_backoff_ms = _cutover_retry_settings()
     for attempt in range(1, max_attempts + 1):
