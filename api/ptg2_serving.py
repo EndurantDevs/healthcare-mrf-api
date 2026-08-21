@@ -14195,6 +14195,7 @@ async def _reverse_geo_eligible_provider_sets(
         for provider_set_keys in matches_by_npi.values()
         for provider_set_key in provider_set_keys
     }
+    # Eligibility is exact only after source exhaustion or a witness for every set.
     if not is_source_exhausted and not eligible_provider_set_keys.issuperset(
         provider_set_id_by_key
     ):
