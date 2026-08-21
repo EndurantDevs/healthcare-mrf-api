@@ -2153,9 +2153,9 @@ _PROCEDURE_AUTOCOMPLETE_CATALOG_SQL = text(
          WHERE (CAST(:year AS integer) IS NULL
                 OR p.source_year <= CAST(:year AS integer))
            AND (lower(coalesce(nullif(p.service_description, ''),
-                               p.reported_code)) LIKE :q_like
-                OR lower(p.reported_code) LIKE :q_like
-                OR p.procedure_code::text LIKE :q_like)
+                               p.reported_code)) LIKE :q_like ESCAPE E'\\\\'
+                OR lower(p.reported_code) LIKE :q_like ESCAPE E'\\\\'
+                OR p.procedure_code::text LIKE :q_like ESCAPE E'\\\\')
     ),
     source AS MATERIALIZED (
         SELECT matched.procedure_code,
@@ -2200,12 +2200,12 @@ _PROCEDURE_AUTOCOMPLETE_CATALOG_SQL = text(
       FROM derived
      WHERE (CAST(:target_system AS text) IS NULL
             OR target_system = CAST(:target_system AS text))
-       AND (lower(display_name) LIKE :q_like
-            OR lower(target_code) LIKE :q_like)
+       AND (lower(display_name) LIKE :q_like ESCAPE E'\\\\'
+            OR lower(target_code) LIKE :q_like ESCAPE E'\\\\')
      ORDER BY
         CASE
-            WHEN lower(display_name) LIKE :q_prefix THEN 0
-            WHEN lower(target_code) LIKE :q_prefix THEN 2
+            WHEN lower(display_name) LIKE :q_prefix ESCAPE E'\\\\' THEN 0
+            WHEN lower(target_code) LIKE :q_prefix ESCAPE E'\\\\' THEN 2
             ELSE 3
         END,
         display_name ASC NULLS LAST, target_system ASC, target_code ASC
@@ -2270,11 +2270,13 @@ async def _query_procedure_autocomplete_catalog(
     year: int | None,
     limit: int,
 ) -> list[dict[str, Any]]:
+    """Query the live procedure catalog with literal substring semantics."""
+    escaped_query = search_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     catalog_result = await session.execute(
         _PROCEDURE_AUTOCOMPLETE_CATALOG_SQL,
         {
-            "q_like": f"%{search_query}%",
-            "q_prefix": f"{search_query}%",
+            "q_like": f"%{escaped_query}%",
+            "q_prefix": f"{escaped_query}%",
             "target_system": target_systems[0] if target_systems else None,
             "year": year,
             "limit": limit,

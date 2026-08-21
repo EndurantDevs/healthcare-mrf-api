@@ -2498,10 +2498,12 @@ async def test_autocomplete_procedures_keeps_live_phrase_first(
     ],
 )
 async def test_procedure_autocomplete_uses_one_setwise_multitoken_query(
+    monkeypatch,
     query,
     expected_terms,
     minimum_matches,
 ):
+    monkeypatch.setattr(pricing_module, "ENABLE_PRICING_SCHEMA_CACHE", False)
     session = FakeSession(
         [
             FakeResult(scalar=True),
@@ -2535,6 +2537,37 @@ async def test_procedure_autocomplete_uses_one_setwise_multitoken_query(
     assert "hits AS MATERIALIZED" in str(statement)
     assert "count(DISTINCT search_index)" in str(statement)
     assert "t.term_key LIKE 'anesthesia %'" in str(statement)
+
+
+@pytest.mark.asyncio
+async def test_procedure_autocomplete_terminology_edge_paths(monkeypatch):
+    """Cover full-phrase, stopword-only, and unavailable terminology paths."""
+    terminology_rows = [{"target_code": "27447"}]
+    query_terminology = AsyncMock(return_value=terminology_rows)
+    monkeypatch.setattr(pricing_module, "_query_terminology", query_terminology)
+
+    assert await pricing_module._query_procedure_autocomplete_terminology(
+        FakeSession(),
+        search_query="knee replacement",
+        target_systems=None,
+        full_phrase_only=True,
+        limit=50,
+    ) == terminology_rows
+    assert await pricing_module._query_procedure_autocomplete_terminology(
+        FakeSession(), search_query="of the", target_systems=None, limit=50
+    ) == []
+
+    monkeypatch.setattr(
+        pricing_module,
+        "_is_terminology_available",
+        AsyncMock(return_value=False),
+    )
+    assert await pricing_module._query_procedure_autocomplete_terminology(
+        FakeSession(),
+        search_query="knee arthroplasty",
+        target_systems=None,
+        limit=50,
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -2665,13 +2698,6 @@ async def test_autocomplete_procedures_non_deduped_edge_rows(monkeypatch):
             "target_code": "123",
             "source": "synthetic_terminology",
         },
-        {
-            "canonical_term": "Synthetic catalog procedure",
-            "term": "Synthetic catalog procedure",
-            "target_system": "CPT",
-            "target_code": "12345",
-            "source": "healthporta_code_catalog",
-        },
     ]
     monkeypatch.setattr(
         pricing_module,
@@ -2679,7 +2705,18 @@ async def test_autocomplete_procedures_non_deduped_edge_rows(monkeypatch):
         AsyncMock(return_value=terminology_rows),
     )
     request = make_request(
-        [],
+        [
+            FakeResult(
+                rows=[
+                    {"display_name": "", "code_system": "", "code": ""},
+                    {
+                        "display_name": "Synthetic catalog procedure",
+                        "code_system": "CPT",
+                        "code": "12345",
+                    },
+                ]
+            )
+        ],
         args={
             "q": "synthetic",
             "year": "2023",
@@ -2703,26 +2740,14 @@ async def test_autocomplete_procedures_non_deduped_edge_rows(monkeypatch):
 @pytest.mark.asyncio
 async def test_autocomplete_procedures_deduped_edge_rows(monkeypatch):
     """Deduplicate malformed terminology and catalog edge rows."""
-    terminology_rows = [
-        *_deduped_terminology_rows(),
-        *[
-            {
-                "canonical_term": catalog_row["display_name"],
-                "term": catalog_row["display_name"],
-                "target_system": catalog_row["code_system"],
-                "target_code": catalog_row["code"],
-                "source": "healthporta_code_catalog",
-            }
-            for catalog_row in _deduped_catalog_rows()[2:]
-        ],
-    ]
+    terminology_rows = _deduped_terminology_rows()
     monkeypatch.setattr(
         pricing_module,
         "_query_procedure_autocomplete_terminology",
         AsyncMock(return_value=terminology_rows),
     )
     request = make_request(
-        [],
+        [FakeResult(rows=_deduped_catalog_rows())],
         args={
             "q": "syn",
             "include_matches": "true",

@@ -276,7 +276,8 @@ async def _create_procedure_catalog_relation(connection, procedure_relation):
             (555001, 'Dental reconstruction', 'D1234', 2023),
             (555002, 'Infusion treatment', 'J1234', 2023),
             (555003, NULL, '99999', 2023),
-            (555004, 'Invalid external code', 'ABCDE', 2023)
+            (555004, 'Invalid external code', 'ABCDE', 2023),
+            (555005, E'Literal %_\\\\path', 'Q1234', 2023)
     """))
 
 
@@ -412,6 +413,7 @@ async def test_procedure_autocomplete_catalog_year_semantics(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_procedure_autocomplete_catalog_projection_semantics(monkeypatch):
+    """Preserve catalog projections and literal substring matching."""
     dsn = os.getenv("HLTHPRT_PRESCRIPTION_AUTOCOMPLETE_POSTGRES_DSN")
     if not dsn:
         pytest.skip("requires disposable PostgreSQL")
@@ -424,6 +426,7 @@ async def test_procedure_autocomplete_catalog_projection_semantics(monkeypatch):
             ("dental", ("CDT",)),
             ("99999", None),
             ("abcde", None),
+            ("%", None), ("_", None), ("\\", None),
         ):
             rows_by_query[search_query] = (
                 await pricing_module._query_procedure_autocomplete_catalog(
@@ -460,3 +463,11 @@ async def test_procedure_autocomplete_catalog_projection_semantics(monkeypatch):
         for catalog_row in rows_by_query["99999"]
     } == {None}
     assert rows_by_query["abcde"] == []
+    for literal_query in ("%", "_", "\\"):
+        assert {
+            (catalog_row["code_system"], catalog_row["code"])
+            for catalog_row in rows_by_query[literal_query]
+        } == {
+            ("HCPCS", "Q1234"),
+            ("HP_PROCEDURE_CODE", "555005"),
+        }
