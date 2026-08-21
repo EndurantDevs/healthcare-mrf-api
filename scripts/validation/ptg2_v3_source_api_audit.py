@@ -70,7 +70,7 @@ if str(_REPOSITORY_ROOT) not in sys.path:
 from api import ptg2_capacity_evidence as capacity_evidence
 
 
-SCRIPT_VERSION = "2.12.0"
+SCRIPT_VERSION = "2.13.0"
 EXPECTED_ARCHITECTURE = "postgres_binary_v3"
 EXPECTED_STORAGE_GENERATION = "shared_blocks_v3"
 EXPECTED_DATABASE_BACKEND = "postgresql"
@@ -201,7 +201,7 @@ CODE_SYSTEM_ALIASES = {
     "SNOMEDCT": "SNOMEDCT_US",
 }
 CANONICALIZATION = {
-    "version": 6,
+    "version": 7,
     "nulls": "price-field JSON null and stripped empty scalar strings canonicalize to null",
     "strings": "trim Unicode surrounding whitespace; otherwise preserve case and content",
     "source_metadata": (
@@ -214,7 +214,10 @@ CANONICALIZATION = {
         "are omitted"
     ),
     "codes": "trim and uppercase; apply documented API aliases and catalog widths",
-    "npi": "canonical integral decimal in inclusive range 1000000000..9999999999",
+    "npi": (
+        "canonical integral JSON number or exact ASCII ten-digit source string in "
+        "inclusive range 1000000000..9999999999; exact string 0 is the TIN-only marker"
+    ),
     "provider_tin": (
         "a provider-group TIN object or nested TIN field marks its enclosing reference or rate; "
         "valid NPIs do not clear the marker, and rates are counted once"
@@ -2068,12 +2071,31 @@ def strict_source_integer(event: str, value: Any) -> int | None:
 
 
 def strict_source_npi(event: str, value: Any) -> int | None:
-    """Accept only ten-digit NPIs encoded as source JSON number events."""
+    """Accept only ten-digit NPIs in the supported source representations."""
 
-    integer = strict_source_integer(event, value)
+    integer = strict_source_npi_value(event, value)
     if integer is None:
         return None
     return integer if 1_000_000_000 <= integer <= 9_999_999_999 else None
+
+
+def strict_source_npi_value(event: str, value: Any) -> int | None:
+    """Return an integral number or the exact string NPI/TIN-only representation."""
+
+    integer = strict_source_integer(event, value)
+    if integer is not None:
+        return integer
+    if event != "string" or type(value) is not str:
+        return None
+    if value == "0":
+        return 0
+    if (
+        len(value) == 10
+        and value[0] in "123456789"
+        and all("0" <= character <= "9" for character in value[1:])
+    ):
+        return int(value)
+    return None
 
 
 def provider_identifier_quarantine_payload(
@@ -2772,7 +2794,7 @@ class SourceIndex:
             return True
         if prefix != f"{npi_array_prefix}.item" or event not in SCALAR_EVENTS:
             return False
-        integer_npi = strict_source_integer(event, raw_npi)
+        integer_npi = strict_source_npi_value(event, raw_npi)
         if integer_npi == 0:
             if state.npi_values_seen:
                 raise SourceFormatError("zero_npi_marker_must_be_singleton")

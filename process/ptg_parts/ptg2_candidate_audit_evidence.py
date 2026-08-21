@@ -157,8 +157,10 @@ def _npi_at_source_coordinate(
     npi_values = groups[group_ordinal].get("npi")
     if not isinstance(npi_values, list) or npi_ordinal >= len(npi_values):
         raise FastCandidateAuditError("source_provider_npi_coordinate_invalid")
-    selected_npi = npi_values[npi_ordinal]
-    if type(selected_npi) is not int or not 1_000_000_000 <= selected_npi <= 9_999_999_999:
+    raw_npi = npi_values[npi_ordinal]
+    event = "string" if type(raw_npi) is str else "number"
+    selected_npi = source_audit.strict_source_npi(event, raw_npi)
+    if selected_npi is None:
         raise FastCandidateAuditError("source_provider_npi_invalid")
     return selected_npi
 
@@ -414,7 +416,14 @@ def validate_provider_witness(
         npi_values = group.get("npi")
         if not isinstance(npi_values, list):
             raise FastCandidateAuditError("source_provider_npi_invalid")
-        if any(type(raw_npi) is not int for raw_npi in npi_values):
+        if any(
+            source_audit.strict_source_npi_value(
+                "string" if type(raw_npi) is str else "number",
+                raw_npi,
+            )
+            is None
+            for raw_npi in npi_values
+        ):
             raise FastCandidateAuditError("source_provider_npi_invalid")
 
 
