@@ -259,6 +259,17 @@ async def test_npi_reader_short_circuits_empty_and_unavailable_queries(monkeypat
     query_executor.assert_awaited_once()
     evidence_probe.assert_not_awaited()
 
+    query_executor.return_value = [{"npi": 101}]
+    evidence_probe.return_value = False
+    assert await serving._membership_npi_rows(
+        object(),
+        strict_v3_tables(),
+        {"zip5": "00001"},
+        candidate_npis=(101,),
+        limit=10,
+    ) == []
+    evidence_probe.assert_awaited_once()
+
 
 async def _read_full_and_compact_rows(
     session,
