@@ -1192,6 +1192,7 @@ def _validated_plan_release_id(args: Mapping[str, Any]) -> str:
 
 
 def _raise_broad_group_plan_provider_expansion(
+    *,
     has_taxonomy_scope: bool,
 ) -> None:
     """Raise the actionable error for an unbounded provider expansion."""
@@ -1281,14 +1282,14 @@ def _reject_broad_group_plan_provider_expansion(
         _raise_unresolved_specialty(specialty_filter)
     if not has_location:
         if has_taxonomy_scope:
-            _raise_broad_group_plan_provider_expansion(True)
+            _raise_broad_group_plan_provider_expansion(has_taxonomy_scope=True)
         return
     has_bounded_location = bool(
         zip5 or (latitude is not None and longitude is not None)
     )
     if has_taxonomy_scope and has_bounded_location:
         return
-    _raise_broad_group_plan_provider_expansion(has_taxonomy_scope)
+    _raise_broad_group_plan_provider_expansion(has_taxonomy_scope=has_taxonomy_scope)
 
 
 def _release_market_type_for_guard(
@@ -5014,6 +5015,7 @@ def _procedure_taxonomy_selection(
     curated_codes: tuple[str, ...],
     curated_rule: dict[str, Any] | None,
     evidence_summary_by_field: dict[str, Any],
+    *,
     is_em_ambiguous: bool,
     allow_hard_filter: bool,
 ) -> dict[str, Any]:
@@ -5088,8 +5090,8 @@ def _classify_procedure_taxonomy_resolution(
         curated_codes,
         curated_rule,
         evidence_summary_by_field,
-        is_em_ambiguous,
-        allow_hard_filter,
+        is_em_ambiguous=is_em_ambiguous,
+        allow_hard_filter=allow_hard_filter,
     )
     bias_notes = [
         "cms_physician_other_practitioners_is_medicare_fee_for_service_only",

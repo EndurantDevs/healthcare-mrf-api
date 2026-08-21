@@ -1498,25 +1498,43 @@ def _near_card_provider_record(address_key):
     )
 
 
+class _RepeatedNearCardConnection:
+    def __init__(self, address_key: str):
+        self.address_key = address_key
+
+    async def all(self, sql: object, **_params: object) -> list[object]:
+        if "COUNT(DISTINCT" in str(sql):
+            return []
+        provider_record = _near_card_provider_record(self.address_key)
+        return [provider_record, provider_record]
+
+    async def first(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
+def _capture_card_taxonomy_lists(monkeypatch) -> list[list[dict]]:
+    taxonomy_lists = []
+    project_card = npi_module._provider_card_from_mapping
+
+    def capture(mapping: dict) -> dict:
+        taxonomy_lists.append(mapping["taxonomy_list"])
+        return project_card(mapping)
+
+    monkeypatch.setattr(npi_module, "_provider_card_from_mapping", capture)
+    return taxonomy_lists
+
+
 @pytest.mark.asyncio
 async def test_get_near_npi_card_view_keeps_distance_and_compact_fields(monkeypatch):
     """Keep the nearby card response compact without dropping distance."""
 
     address_key = "00000000-0000-0000-0000-000000000001"
-
-    class CardConnection:
-        async def all(self, sql, **_params):
-            if "COUNT(DISTINCT" in str(sql):
-                return []
-            return [_near_card_provider_record(address_key)]
-
-        async def first(self, *_args, **_kwargs):
-            return None
+    projected_taxonomy_lists = _capture_card_taxonomy_lists(monkeypatch)
 
     monkeypatch.setattr(
         npi_module.db,
         "acquire",
-        lambda: FakeAcquire(CardConnection()),
+        lambda: FakeAcquire(_RepeatedNearCardConnection(address_key)),
     )
     response = await npi_module.get_near_npi(
         types.SimpleNamespace(
@@ -1546,6 +1564,8 @@ async def test_get_near_npi_card_view_keeps_distance_and_compact_fields(monkeypa
             "distance_miles": 1.0,
         }
     ]
+    assert len(projected_taxonomy_lists) == 1
+    assert len(projected_taxonomy_lists[0]) == 1
 
 
 def test_nearby_cursor_rejects_different_filters():

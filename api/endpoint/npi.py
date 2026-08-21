@@ -10927,11 +10927,9 @@ async def get_near_npi(request):
                     continue
                 if column.key in row_dict:
                     taxonomy_by_field[column.key] = row_dict[column.key]
+            if taxonomy_by_field and row_dict.get("taxonomy_display") is not None:
+                taxonomy_by_field["display"] = row_dict.get("taxonomy_display")
             if taxonomy_by_field and taxonomy_by_field not in provider_by_field["taxonomy_list"]:
-                if row_dict.get("taxonomy_display") is not None:
-                    taxonomy_by_field["display"] = row_dict.get(
-                        "taxonomy_display"
-                    )
                 provider_by_field["taxonomy_list"].append(taxonomy_by_field)
 
             providers_by_identity[identity] = provider_by_field
