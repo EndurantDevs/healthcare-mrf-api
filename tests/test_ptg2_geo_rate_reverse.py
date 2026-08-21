@@ -28,7 +28,7 @@ async def test_geo_rate_prefix_reverses_oversized_set_after_geo_taxonomy(
     location_reads = AsyncMock(
         return_value=[{"npi": 111, "_ptg_source_exhausted": True}]
     )
-    monkeypatch.setattr(serving, "_membership_location_rows", location_reads)
+    monkeypatch.setattr(serving, "_membership_npi_rows", location_reads)
     taxonomy_reads = AsyncMock(return_value=(111,))
     monkeypatch.setattr(serving, "_filter_npis_by_taxonomy", taxonomy_reads)
     reverse_reads = AsyncMock(return_value={111: (1,)})
@@ -77,7 +77,7 @@ async def test_geo_rate_prefix_maps_only_bounded_reverse_graph_overflow(
     )
     monkeypatch.setattr(
         serving,
-        "_membership_location_rows",
+        "_membership_npi_rows",
         AsyncMock(return_value=[{"npi": 111, "_ptg_source_exhausted": True}]),
     )
     reverse_reads = AsyncMock(
@@ -120,7 +120,7 @@ async def test_geo_rate_prefix_rejects_duplicate_reverse_set_identity(monkeypatc
         AsyncMock(return_value=rate_rows),
     )
     location_reads = AsyncMock()
-    monkeypatch.setattr(serving, "_membership_location_rows", location_reads)
+    monkeypatch.setattr(serving, "_membership_npi_rows", location_reads)
 
     with pytest.raises(
         serving.PTG2ManifestArtifactError,
@@ -153,7 +153,7 @@ async def test_geo_rate_prefix_preserves_unavailable_reverse_geo_source(
     location_reads = AsyncMock(return_value=None)
     reverse_reads = AsyncMock()
     monkeypatch.setattr(serving, "_provider_npis_for_sets", member_reads)
-    monkeypatch.setattr(serving, "_membership_location_rows", location_reads)
+    monkeypatch.setattr(serving, "_membership_npi_rows", location_reads)
     monkeypatch.setattr(
         serving,
         "_shared_provider_set_keys_by_npi",

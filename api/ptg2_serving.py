@@ -9622,6 +9622,38 @@ class _MembershipLocationQuery:
     distance_sql: str
     knn_order_sql: str | None
     address_assurance_sql: str = "TRUE"
+    address_filter_sql: str | None = None
+
+
+_MEMBERSHIP_NPI_SQL = """
+WITH matched AS MATERIALIZED (
+    SELECT
+        addr.npi,
+        {distance_sql} AS distance_miles,
+        ROW_NUMBER() OVER (
+            PARTITION BY addr.npi
+            ORDER BY {distance_sql} ASC NULLS LAST,
+                     CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
+                     addr.checksum,
+                     addr.location_key
+        ) AS address_rank
+    FROM {address_table} addr
+    WHERE {address_filter_sql}
+      AND {address_assurance_sql}
+      AND EXISTS (
+          SELECT 1
+          FROM {npi_scope_table} npi_scope
+          WHERE npi_scope.snapshot_key = :shared_snapshot_key
+            AND npi_scope.npi = addr.npi
+          OFFSET 0
+      )
+)
+SELECT npi, distance_miles, address_rank
+FROM matched
+WHERE address_rank = 1
+ORDER BY distance_miles ASC NULLS LAST, npi
+LIMIT :limit OFFSET :offset
+"""
 
 
 _MEMBERSHIP_LOCATION_SQL = """
@@ -10310,9 +10342,12 @@ async def _membership_location_query(
     )
     if filter_sql_parts is None:
         return None
-    filter_sql, distance_sql = filter_sql_parts
+    address_filter_sql, distance_sql = filter_sql_parts
     parameter_map["shared_snapshot_key"] = _required_shared_snapshot_key(serving_tables)
-    filter_sql = f"npi_scope.snapshot_key = :shared_snapshot_key AND ({filter_sql})"
+    filter_sql = (
+        "npi_scope.snapshot_key = :shared_snapshot_key "
+        f"AND ({address_filter_sql})"
+    )
     return _MembershipLocationQuery(
         address_table=address_table,
         npi_scope_table=provider_npi_scope_table,
@@ -10321,6 +10356,7 @@ async def _membership_location_query(
         distance_sql=distance_sql,
         knn_order_sql=knn_order_sql,
         address_assurance_sql=_membership_address_assurance_sql(args, uses_unified_addresses),
+        address_filter_sql=address_filter_sql,
     )
 
 
@@ -11086,6 +11122,18 @@ def _membership_location_sql(
     )
 
 
+def _membership_npi_sql(query_context: _MembershipLocationQuery) -> str:
+    """Render the correlated source-assured NPI eligibility lookup."""
+
+    return _MEMBERSHIP_NPI_SQL.format(
+        address_table=query_context.address_table,
+        npi_scope_table=query_context.npi_scope_table,
+        address_filter_sql=query_context.address_filter_sql,
+        address_assurance_sql=query_context.address_assurance_sql,
+        distance_sql=query_context.distance_sql,
+    )
+
+
 async def _execute_membership_location_sql(
     session: Any,
     query_context: _MembershipLocationQuery,
@@ -11213,6 +11261,64 @@ async def _membership_location_rows(
         limit=limit,
         stored_address_provenance_only=stored_address_provenance_only,
     )
+
+
+async def _membership_npi_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    *,
+    candidate_npis: tuple[int, ...] | None,
+    limit: int,
+    offset: int = 0,
+) -> list[dict[str, Any]] | None:
+    """Read only source-assured NPIs for location eligibility checks."""
+
+    if candidate_npis == ():
+        return []
+    query_context = await _membership_location_query(
+        session,
+        serving_tables,
+        args,
+        candidate_npis=candidate_npis,
+        limit=limit,
+        offset=offset,
+    )
+    if query_context is None:
+        return None
+    if (
+        query_context.address_filter_sql is None
+        or query_context.knn_order_sql is not None
+        or not _is_unified_address_table(query_context.address_table)
+        or query_context.address_assurance_sql == "TRUE"
+    ):
+        return await _membership_location_rows(
+            session,
+            serving_tables,
+            args,
+            candidate_npis=candidate_npis,
+            limit=limit,
+            offset=offset,
+        )
+    npi_rows = await _execute_membership_location_sql(
+        session,
+        query_context,
+        _membership_npi_sql(query_context),
+        offset=offset,
+    )
+    if npi_rows and not await _is_relation_available(
+        session,
+        f"{PTG2_SCHEMA}.entity_address_evidence",
+    ):
+        if candidate_npis is None:
+            return [
+                {
+                    "_ptg_probe_empty": True,
+                    "_ptg_source_exhausted": len(npi_rows) < max(int(limit), 1),
+                }
+            ]
+        return []
+    return npi_rows
 
 
 @dataclass
@@ -14062,7 +14168,7 @@ async def _geo_eligible_provider_sets(
     eligible_provider_set_ids: set[str] = set()
     for chunk_start in range(0, len(candidate_npis), chunk_size):
         candidate_chunk = candidate_npis[chunk_start : chunk_start + chunk_size]
-        location_rows = await _membership_location_rows(
+        location_rows = await _membership_npi_rows(
             session,
             serving_tables,
             args,
@@ -14118,7 +14224,7 @@ async def _bounded_reverse_geo_npis(
 ) -> tuple[tuple[int, ...], bool] | None:
     """Read one bounded geo scope and report whether its source ended."""
 
-    location_rows = await _membership_location_rows(
+    location_rows = await _membership_npi_rows(
         session,
         serving_tables,
         args,

@@ -69,7 +69,7 @@ def _install_geo_prefix_reads(monkeypatch, rate_rows, qualifying_npis):
 
     monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", page_reads)
     monkeypatch.setattr(serving, "_provider_npis_for_sets", member_reads)
-    monkeypatch.setattr(serving, "_membership_location_rows", location_rows)
+    monkeypatch.setattr(serving, "_membership_npi_rows", location_rows)
     return page_reads, member_reads
 
 
@@ -213,7 +213,7 @@ async def test_geo_rate_prefix_one_npi_can_witness_multiple_sets(monkeypatch):
         ),
     )
     membership = AsyncMock(return_value=[{"npi": shared_npi}])
-    monkeypatch.setattr(serving, "_membership_location_rows", membership)
+    monkeypatch.setattr(serving, "_membership_npi_rows", membership)
 
     selection = await serving._select_geo_filtered_rate_prefix(
         object(),
@@ -256,7 +256,7 @@ async def test_geo_rate_prefix_absent_sets_are_exact_only_after_source_end(
     )
     monkeypatch.setattr(
         serving,
-        "_membership_location_rows",
+        "_membership_npi_rows",
         AsyncMock(return_value=[]),
     )
 
@@ -290,7 +290,7 @@ async def test_geo_rate_prefix_rejects_unexhausted_reverse_member_budget(
     )
     reverse_reads = AsyncMock(return_value={})
     monkeypatch.setattr(serving, "_provider_npis_for_sets", member_reads)
-    monkeypatch.setattr(serving, "_membership_location_rows", location_reads)
+    monkeypatch.setattr(serving, "_membership_npi_rows", location_reads)
     monkeypatch.setattr(
         serving,
         "_shared_provider_set_keys_by_npi",
@@ -338,7 +338,7 @@ async def test_geo_rate_prefix_rejects_reverse_after_candidate_budget_consumed(
     location_reads = AsyncMock(return_value=[])
     reverse_reads = AsyncMock()
     monkeypatch.setattr(serving, "_provider_npis_for_sets", member_reads)
-    monkeypatch.setattr(serving, "_membership_location_rows", location_reads)
+    monkeypatch.setattr(serving, "_membership_npi_rows", location_reads)
     monkeypatch.setattr(
         serving,
         "_shared_provider_set_keys_by_npi",
@@ -385,7 +385,7 @@ async def test_geo_rate_prefix_rejects_incomplete_exact_membership(monkeypatch):
         AsyncMock(return_value={rate_row["provider_set_global_id_128"]: (111,)}),
     )
     location_reads = AsyncMock()
-    monkeypatch.setattr(serving, "_membership_location_rows", location_reads)
+    monkeypatch.setattr(serving, "_membership_npi_rows", location_reads)
 
     with pytest.raises(
         serving.PTG2ManifestArtifactError,
