@@ -1443,31 +1443,35 @@ async def test_get_near_npi_paginates_unique_provider_addresses(monkeypatch):
     ]
 
 
+def _near_card_provider_record(address_key):
+    return _near_provider_record(
+        1112223334,
+        address_key,
+        1609.34,
+        entity_type_code=1,
+        provider_first_name="Adam",
+        provider_last_name="Smith",
+        provider_credential_text="MD",
+        city_name="Chicago",
+        state_name="IL",
+        postal_code="60601-1234",
+        healthcare_provider_taxonomy_code="207Q00000X",
+        healthcare_provider_primary_taxonomy_switch="Y",
+        taxonomy_display="Family Medicine",
+    )
+
+
 @pytest.mark.asyncio
 async def test_get_near_npi_card_view_keeps_distance_and_compact_fields(monkeypatch):
+    """Keep the nearby card response compact without dropping distance."""
+
     address_key = "00000000-0000-0000-0000-000000000001"
 
     class CardConnection:
         async def all(self, sql, **_params):
             if "COUNT(DISTINCT" in str(sql):
                 return []
-            return [
-                _near_provider_record(
-                    1112223334,
-                    address_key,
-                    1609.34,
-                    entity_type_code=1,
-                    provider_first_name="Adam",
-                    provider_last_name="Smith",
-                    provider_credential_text="MD",
-                    city_name="Chicago",
-                    state_name="IL",
-                    postal_code="60601-1234",
-                    healthcare_provider_taxonomy_code="207Q00000X",
-                    healthcare_provider_primary_taxonomy_switch="Y",
-                    taxonomy_display="Family Medicine",
-                )
-            ]
+            return [_near_card_provider_record(address_key)]
 
         async def first(self, *_args, **_kwargs):
             return None

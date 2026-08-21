@@ -42,16 +42,16 @@ def _loopback_endpoint() -> str:
 
 
 def _expected_npis() -> tuple[str, ...]:
-    expected = tuple(
+    expected_npis = tuple(
         sorted(
             value.strip()
             for value in str(os.getenv(EXPECTED_NPIS_ENV) or "").split(",")
             if value.strip()
         )
     )
-    assert expected, f"set {EXPECTED_NPIS_ENV} to the exact parity oracle"
-    assert all(value.isdigit() and len(value) == 10 for value in expected)
-    return expected
+    assert expected_npis, f"set {EXPECTED_NPIS_ENV} to the exact parity oracle"
+    assert all(value.isdigit() and len(value) == 10 for value in expected_npis)
+    return expected_npis
 
 
 def _assert_response_parity(document, expected_npis: tuple[str, ...]) -> None:

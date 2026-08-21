@@ -5359,6 +5359,43 @@ async def test_list_providers_by_procedure_rejects_statewide_taxonomy_office_vis
 
 
 @pytest.mark.asyncio
+async def test_taxonomy_office_visit_without_locator_still_fails_fast(monkeypatch):
+    async def fail_search(*_args, **_kwargs):
+        raise AssertionError("taxonomy request should fail before PTG search")
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fail_search)
+    request = make_request(
+        [],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "code": "99213",
+            "code_system": "CPT",
+            "include_providers": "true",
+            "classification": "Family Medicine",
+        },
+    )
+
+    with pytest.raises(
+        pricing_module.InvalidUsage,
+        match="zip5.*zip_radius_miles",
+    ):
+        await list_providers_by_procedure(request)
+
+
+def test_unscoped_office_visit_without_locator_keeps_legacy_allowance():
+    pricing_module._reject_broad_group_plan_provider_expansion(
+        {"include_providers": "true"},
+        {
+            "plan_id": "TESTPLAN001",
+            "plan_market_type": "group",
+            "code": "99213",
+            "code_system": "CPT",
+        },
+    )
+
+
+@pytest.mark.asyncio
 async def test_statewide_taxonomy_office_visit_http_error_keeps_fix_it(monkeypatch):
     async def fail_search(*_args, **_kwargs):
         raise AssertionError("statewide taxonomy request should fail before PTG search")
@@ -5391,9 +5428,9 @@ async def test_statewide_taxonomy_office_visit_http_error_keeps_fix_it(monkeypat
     )
 
     assert http_response.status == 400
-    payload = http_response.json
-    assert "zip5" in payload["message"]
-    assert payload["context"]["fix_it"]["retry_options"] == [
+    error_document = http_response.json
+    assert "zip5" in error_document["message"]
+    assert error_document["context"]["fix_it"]["retry_options"] == [
         {
             "zip5": "<member ZIP>",
             "zip_radius_miles": 10,

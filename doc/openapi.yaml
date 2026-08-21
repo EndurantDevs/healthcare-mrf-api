@@ -4657,9 +4657,24 @@ paths:
         body; larger source results fail closed without truncation. Billing
         responses use `Cache-Control: private, no-store`.
       parameters:
-        - $ref: '#/components/parameters/PaginationPage'
-        - $ref: '#/components/parameters/PaginationPageSize'
-        - $ref: '#/components/parameters/PaginationStart'
+        - name: page
+          in: query
+          description: One-based page number.
+          schema:
+            type: integer
+            minimum: 1
+        - name: page_size
+          in: query
+          description: Alias for `limit`; both values must agree when supplied together.
+          schema:
+            type: integer
+            minimum: 1
+        - name: start
+          in: query
+          description: Legacy zero-based alias for `offset`.
+          schema:
+            type: integer
+            minimum: 0
         - name: year
           in: query
           schema: { type: integer }
@@ -5037,9 +5052,24 @@ paths:
         applies location filters internally but does not return provider address,
         contact, or distance fields.
       parameters:
-        - $ref: '#/components/parameters/PaginationPage'
-        - $ref: '#/components/parameters/PaginationPageSize'
-        - $ref: '#/components/parameters/PaginationStart'
+        - name: page
+          in: query
+          description: One-based page number.
+          schema:
+            type: integer
+            minimum: 1
+        - name: page_size
+          in: query
+          description: Alias for `limit`; both values must agree when supplied together.
+          schema:
+            type: integer
+            minimum: 1
+        - name: start
+          in: query
+          description: Legacy zero-based alias for `offset`.
+          schema:
+            type: integer
+            minimum: 0
         - name: year
           in: query
           schema:

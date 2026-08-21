@@ -1177,64 +1177,11 @@ def _validated_plan_release_id(args: Mapping[str, Any]) -> str:
     return normalized_release_id
 
 
-def _reject_broad_group_plan_provider_expansion(
-    args: Mapping[str, Any], context: Mapping[str, Any], *, specialty_filter=None
+def _raise_broad_group_plan_provider_expansion(
+    has_taxonomy_scope: bool,
 ) -> None:
-    """Reject unsafe broad group-plan office-visit provider expansion."""
+    """Raise the actionable error for an unbounded provider expansion."""
 
-    code = str(context.get("code") or "")
-    code_system = context.get("code_system")
-    plan_id = str(context.get("plan_id") or "")
-    plan_external_id = str(context.get("plan_external_id") or "")
-    plan_market_type = str(context.get("plan_market_type") or "")
-    state = str(context.get("state") or "")
-    city = str(context.get("city") or "")
-    zip5 = str(context.get("zip5") or "")
-    latitude = context.get("latitude")
-    longitude = context.get("longitude")
-    npi = context.get("npi")
-    provider_sex_code = context.get("provider_sex_code")
-    if plan_market_type != "group":
-        return
-    if not (plan_id or plan_external_id):
-        return
-    if not (
-        _parse_bool(
-            args.get("include_providers"),
-            "include_providers",
-            default=False,
-        )
-        or provider_sex_code
-    ):
-        return
-    if not _is_broad_office_visit_cpt(code_system, code):
-        return
-    has_location = bool(
-        state
-        or city
-        or zip5
-        or latitude is not None
-        or longitude is not None
-        or args.get("radius_miles") not in (None, "", "null")
-        or args.get("radius") not in (None, "", "null")
-    )
-    if not has_location:
-        return
-    if _parse_int(npi, "npi", minimum=1) is not None:
-        return
-    specialty_filter = specialty_filter or resolve_provider_specialty_filter(args)
-    has_taxonomy_scope = bool(
-        specialty_filter.is_active
-        or args.get("taxonomy_code")
-        or args.get("taxonomy_classification")
-    )
-    if specialty_filter.unresolved_specialty:
-        _raise_unresolved_specialty(specialty_filter)
-    has_bounded_location = bool(
-        zip5 or (latitude is not None and longitude is not None)
-    )
-    if has_taxonomy_scope and has_bounded_location:
-        return
     if has_taxonomy_scope:
         raise InvalidUsage(
             "Statewide taxonomy-scoped CPT office-visit provider expansion is too broad; "
@@ -1260,6 +1207,74 @@ def _reject_broad_group_plan_provider_expansion(
         "use /api/v1/pricing/group-plan-providers with specialty/classification/location filters, or add "
         "specialty/taxonomy/npi and use procedure pricing only when the user asks for office-visit cost."
     )
+
+
+def _has_provider_expansion_location(
+    args: Mapping[str, Any],
+    context: Mapping[str, Any],
+) -> bool:
+    return bool(
+        context.get("state")
+        or context.get("city")
+        or context.get("zip5")
+        or context.get("latitude") is not None
+        or context.get("longitude") is not None
+        or args.get("radius_miles") not in (None, "", "null")
+        or args.get("radius") not in (None, "", "null")
+    )
+
+
+def _reject_broad_group_plan_provider_expansion(
+    args: Mapping[str, Any], context: Mapping[str, Any], *, specialty_filter=None
+) -> None:
+    """Reject unsafe broad group-plan office-visit provider expansion."""
+
+    code = str(context.get("code") or "")
+    code_system = context.get("code_system")
+    plan_id = str(context.get("plan_id") or "")
+    plan_external_id = str(context.get("plan_external_id") or "")
+    plan_market_type = str(context.get("plan_market_type") or "")
+    zip5 = str(context.get("zip5") or "")
+    latitude = context.get("latitude")
+    longitude = context.get("longitude")
+    npi = context.get("npi")
+    provider_sex_code = context.get("provider_sex_code")
+    if plan_market_type != "group":
+        return
+    if not (plan_id or plan_external_id):
+        return
+    if not (
+        _parse_bool(
+            args.get("include_providers"),
+            "include_providers",
+            default=False,
+        )
+        or provider_sex_code
+    ):
+        return
+    if not _is_broad_office_visit_cpt(code_system, code):
+        return
+    has_location = _has_provider_expansion_location(args, context)
+    if _parse_int(npi, "npi", minimum=1) is not None:
+        return
+    specialty_filter = specialty_filter or resolve_provider_specialty_filter(args)
+    has_taxonomy_scope = bool(
+        specialty_filter.is_active
+        or args.get("taxonomy_code")
+        or args.get("taxonomy_classification")
+    )
+    if specialty_filter.unresolved_specialty:
+        _raise_unresolved_specialty(specialty_filter)
+    if not has_location:
+        if has_taxonomy_scope:
+            _raise_broad_group_plan_provider_expansion(True)
+        return
+    has_bounded_location = bool(
+        zip5 or (latitude is not None and longitude is not None)
+    )
+    if has_taxonomy_scope and has_bounded_location:
+        return
+    _raise_broad_group_plan_provider_expansion(has_taxonomy_scope)
 
 
 def _release_market_type_for_guard(

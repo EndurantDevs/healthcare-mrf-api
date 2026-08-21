@@ -442,55 +442,81 @@ def _provider_display_name_from_mapping(mapping: Mapping[str, Any]) -> str:
     return fallback or "Unknown"
 
 
-def _provider_card_from_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
-    """Project one provider result into the compact doctor-search card shape."""
+def _provider_card_taxonomy_code(taxonomy_entry: Mapping[str, Any]) -> Any:
+    return taxonomy_entry.get("taxonomy_code") or taxonomy_entry.get(
+        "healthcare_provider_taxonomy_code"
+    )
 
-    taxonomy_rows = [
-        dict(row)
-        for row in (mapping.get("taxonomy_list") or [])
-        if isinstance(row, Mapping)
-    ]
-    primary_taxonomy = next(
-        (
-            row
-            for row in taxonomy_rows
-            if row.get("primary") is True
-            or str(
-                row.get("healthcare_provider_primary_taxonomy_switch") or ""
-            ).upper()
-            == "Y"
-        ),
-        taxonomy_rows[0] if taxonomy_rows else {},
-    )
-    taxonomy_code = (
-        primary_taxonomy.get("taxonomy_code")
-        or primary_taxonomy.get("healthcare_provider_taxonomy_code")
-    )
-    nested_taxonomy = primary_taxonomy.get("nucc_taxonomy")
-    nested_taxonomy_display = (
+
+def _provider_card_taxonomy_display(taxonomy_entry: Mapping[str, Any]) -> Any:
+    return taxonomy_entry.get("display") or taxonomy_entry.get("display_name")
+
+
+def _provider_card_primary_taxonomy_display(
+    taxonomy_entry: Mapping[str, Any],
+) -> Any:
+    nested_taxonomy = taxonomy_entry.get("nucc_taxonomy")
+    nested_display = (
         nested_taxonomy.get("display_name")
         if isinstance(nested_taxonomy, Mapping)
         else None
     )
-    taxonomy_display = (
-        primary_taxonomy.get("display")
-        or primary_taxonomy.get("display_name")
-        or nested_taxonomy_display
+    return (
+        _provider_card_taxonomy_display(taxonomy_entry)
+        or nested_display
     )
+
+
+def _provider_card_primary_specialty(taxonomy_list: Any) -> dict[str, Any]:
+    """Return the compact primary-specialty projection for one provider."""
+
+    taxonomy_entries = [
+        dict(taxonomy_entry)
+        for taxonomy_entry in (taxonomy_list or [])
+        if isinstance(taxonomy_entry, Mapping)
+    ]
+    primary_taxonomy = next(
+        (
+            taxonomy_entry
+            for taxonomy_entry in taxonomy_entries
+            if taxonomy_entry.get("primary") is True
+            or str(
+                taxonomy_entry.get("healthcare_provider_primary_taxonomy_switch")
+                or ""
+            ).upper()
+            == "Y"
+        ),
+        taxonomy_entries[0] if taxonomy_entries else {},
+    )
+    taxonomy_code = _provider_card_taxonomy_code(primary_taxonomy)
+    taxonomy_display = _provider_card_primary_taxonomy_display(primary_taxonomy)
     if taxonomy_code and not taxonomy_display:
         taxonomy_display = next(
             (
-                row.get("display") or row.get("display_name")
-                for row in taxonomy_rows
-                if (
-                    row.get("taxonomy_code")
-                    or row.get("healthcare_provider_taxonomy_code")
-                )
-                == taxonomy_code
-                and (row.get("display") or row.get("display_name"))
+                _provider_card_taxonomy_display(taxonomy_entry)
+                for taxonomy_entry in taxonomy_entries
+                if _provider_card_taxonomy_code(taxonomy_entry) == taxonomy_code
+                and _provider_card_taxonomy_display(taxonomy_entry)
             ),
             None,
         )
+    return {
+        "taxonomy_code": taxonomy_code,
+        "display": taxonomy_display,
+    }
+
+
+def _provider_card_zip5(raw_postal_code: Any) -> Optional[str]:
+    """Return a schema-valid ZIP5 from a ZIP5 or ZIP+4 value."""
+
+    if raw_postal_code in (None, ""):
+        return None
+    match = re.fullmatch(r"\s*(\d{5})(?:-?\d{4})?\s*", str(raw_postal_code))
+    return match.group(1) if match else None
+
+
+def _provider_card_from_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one provider result into the compact doctor-search card shape."""
 
     entity_type_code = mapping.get("entity_type_code")
     try:
@@ -498,29 +524,28 @@ def _provider_card_from_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         entity_type_code = None
     postal_code = mapping.get("zip5") or mapping.get("postal_code")
-    card = {
+    provider_card_by_field = {
         "npi": mapping.get("npi") or mapping.get("npi_code"),
         "display_name": _provider_display_name_from_mapping(mapping),
         "entity_type": _entity_kind_from_code(entity_type_code),
         "credential": mapping.get("provider_credential_text"),
-        "primary_specialty": {
-            "taxonomy_code": taxonomy_code,
-            "display": taxonomy_display,
-        },
+        "primary_specialty": _provider_card_primary_specialty(
+            mapping.get("taxonomy_list")
+        ),
         "city": mapping.get("city") or mapping.get("city_name"),
         "state": (
             mapping.get("state")
             or mapping.get("state_code")
             or mapping.get("state_name")
         ),
-        "zip5": str(postal_code)[:5] if postal_code not in (None, "") else None,
+        "zip5": _provider_card_zip5(postal_code),
     }
     distance_miles = mapping.get("distance_miles")
     if distance_miles is None:
         distance_miles = mapping.get("distance")
     if distance_miles is not None:
-        card["distance_miles"] = distance_miles
-    return card
+        provider_card_by_field["distance_miles"] = distance_miles
+    return provider_card_by_field
 
 
 ENABLE_NPI_SCHEMA_CACHE = _is_environment_flag_enabled(
@@ -5302,10 +5327,11 @@ def _normalize_exact_npi(raw: Optional[str]) -> Optional[int]:
     text_value = str(raw).strip()
     if not text_value:
         return None
-    digits = "".join(ch for ch in text_value if ch.isdigit())
-    if len(digits) != 10:
-        raise sanic.exceptions.InvalidUsage("npi must contain exactly 10 digits")
-    return int(digits)
+    if not re.fullmatch(r"[1-9][0-9]{9}", text_value):
+        raise sanic.exceptions.InvalidUsage(
+            "npi must be exactly 10 digits and cannot start with zero"
+        )
+    return int(text_value)
 
 
 def _normalize_code_system(raw: Optional[str], param_name: str, allowed: set[str]) -> str:
@@ -11563,7 +11589,7 @@ async def get_npi(request, npi):
     v2_archive_table_cache = SimpleNamespace(resolved=False, table_name=None)
     v2_archive_table_lock = asyncio.Lock()
 
-    async def _npi_detail_table_available(table_name: str) -> bool:
+    async def _is_npi_detail_table_available(table_name: str) -> bool:
         if request_session is not None:
             return await _is_table_available(table_name, session=request_session)
         value = await db.scalar(
@@ -11605,7 +11631,7 @@ async def get_npi(request, npi):
                 preferred = os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
                 for table_name in (preferred,):
                     if (
-                        await _npi_detail_table_available(table_name)
+                        await _is_npi_detail_table_available(table_name)
                         and await _has_table_column(table_name, "address_key")
                         and await _has_table_column(table_name, "geo_source")
                         and await _has_address_key_functions()
@@ -11662,7 +11688,7 @@ async def get_npi(request, npi):
         if request_session is None and not hasattr(db, "first"):
             return None
         params = lookup_params_from_address(address)
-        if not params or not await _npi_detail_table_available("openaddresses_geocode"):
+        if not params or not await _is_npi_detail_table_available("openaddresses_geocode"):
             return None
         for query in (exact_lookup_sql(db_schema), fuzzy_lookup_sql(db_schema), relaxed_lookup_sql(db_schema)):
             if request_session is not None:

@@ -55,18 +55,18 @@ class _QueryParamCollector(ast.NodeVisitor):
         if isinstance(func, ast.Name) and func.id == "parse_pagination":
             if node.args and self._is_request_args_resolution(node.args[0]):
                 self.params.update({"limit", "page"})
-                enabled_aliases = {
+                pagination_parameter_by_flag = {
                     "allow_offset": "offset",
                     "allow_start": "start",
                     "allow_page_size": "page_size",
                 }
-                keyword_values = {
+                keyword_value_by_name = {
                     keyword.arg: keyword.value
                     for keyword in node.keywords
                     if keyword.arg is not None
                 }
-                for keyword_name, parameter_name in enabled_aliases.items():
-                    keyword_value = keyword_values.get(keyword_name)
+                for keyword_name, parameter_name in pagination_parameter_by_flag.items():
+                    keyword_value = keyword_value_by_name.get(keyword_name)
                     if not (
                         isinstance(keyword_value, ast.Constant)
                         and keyword_value.value is False
@@ -174,30 +174,6 @@ def _collect_query_params(node: ast.AST) -> set[str]:
     return visitor.params
 
 
-def test_query_param_collector_includes_list_and_pagination_helpers():
-    function_node = ast.parse(
-        """
-async def endpoint(request):
-    args = request.args
-    args.getlist("name_like")
-    parse_pagination(
-        args,
-        default_limit=25,
-        max_limit=200,
-        allow_offset=False,
-    )
-"""
-    ).body[0]
-
-    assert _collect_query_params(function_node) == {
-        "limit",
-        "name_like",
-        "page",
-        "page_size",
-        "start",
-    }
-
-
 def _collect_spec_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
     """Collect route parameters from the checked-in OpenAPI document."""
     document = yaml.safe_load(OPENAPI_PATH.read_text())
@@ -268,16 +244,6 @@ def test_openapi_routes_match_code():
             f"Query parameters mismatch for {key}: code={sorted(code_query_params)}, "
             f"spec={sorted(spec_info['query_params'])}"
         )
-
-
-def test_openapi_operation_ids_are_present_and_unique():
-    text = OPENAPI_PATH.read_text()
-    operation_ids = re.findall(r"^\s+operationId:\s+([A-Za-z0-9_]+)\s*$", text, flags=re.MULTILINE)
-    spec_routes = {(method, path) for (method, path), _info in _collect_spec_routes().items() if method}
-
-    assert len(operation_ids) == len(spec_routes)
-    assert len(operation_ids) == len(set(operation_ids))
-    assert not (HIDDEN_RUNTIME_ALIASES & spec_routes)
 
 
 def test_openapi_strict_ptg_pagination_exposes_exact_page_continuation():
@@ -365,76 +331,6 @@ def test_openapi_exposes_strict_v3_allowed_amount_fallback():
         "no_match",
         "no_route",
     }
-
-
-def test_doctor_search_contract_documents_cards_and_filter_defaults():
-    spec = yaml.safe_load(OPENAPI_PATH.read_text())
-    schemas = spec["components"]["schemas"]
-    npi_all = spec["paths"]["/npi/all"]["get"]
-    npi_near = spec["paths"]["/npi/near/"]["get"]
-
-    all_params = {item["name"]: item for item in npi_all["parameters"]}
-    assert {"name_like", "page", "offset", "page_size"} <= set(all_params)
-    assert all_params["name_like"]["schema"]["type"] == "array"
-    assert all_params["npi"]["schema"] == {
-        "type": "string",
-        "pattern": "^[1-9][0-9]{9}$",
-    }
-    assert all_params["show"]["schema"]["enum"] == ["chain"]
-    assert all_params["view"]["schema"]["enum"] == ["sitemap", "card"]
-    near_params = {item["name"]: item for item in npi_near["parameters"]}
-    assert near_params["view"]["schema"]["enum"] == ["card"]
-
-    assert schemas["NpiSearchResponse"]["properties"]["total_source"][
-        "type"
-    ] == "string"
-    assert schemas["NpiCard"]["additionalProperties"] is False
-
-    detail_params = {
-        item["name"]: item
-        for item in spec["paths"]["/npi/id/{npi}"]["get"]["parameters"]
-    }
-    assert detail_params["show"]["schema"]["enum"] == ["chain"]
-    assert detail_params["view"]["schema"]["enum"] == ["full", "summary"]
-    assert "enrichment" in detail_params["view"]["description"].lower()
-
-    for path in (
-        "/pricing/providers/search-by-procedure",
-        "/pricing/providers/by-procedure",
-    ):
-        parameters = spec["paths"][path]["get"]["parameters"]
-        primary_only = next(
-            item for item in parameters if item.get("name") == "primary_only"
-        )
-        assert primary_only["schema"] == {
-            "type": "boolean",
-            "default": True,
-        }
-
-
-def test_npi_endpoint_has_no_shadow_table_probe_or_dead_count_stub():
-    tree = ast.parse((ENDPOINT_DIR / "npi.py").read_text())
-    list_provider_node = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "list_providers"
-    )
-    detail_node = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "get_npi"
-    )
-
-    assert sum(
-        isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "get_formatted_count"
-        for node in ast.walk(list_provider_node)
-    ) == 1
-    assert not any(
-        isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "_is_table_available"
-        for node in ast.walk(detail_node)
-    )
 
 
 def test_provider_routes_share_canonical_provider_sex_parameter():

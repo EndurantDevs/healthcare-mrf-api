@@ -1702,9 +1702,9 @@ async def test_npi_all_card_view_returns_only_compact_typeahead_fields(monkeypat
             }
         )
     )
-    payload = json.loads(response.body)
+    response_document = json.loads(response.body)
 
-    assert payload["rows"] == [
+    assert response_document["rows"] == [
         {
             "npi": 1000000007,
             "display_name": "Sample Clinician",
@@ -1720,6 +1720,23 @@ async def test_npi_all_card_view_returns_only_compact_typeahead_fields(monkeypat
         }
     ]
     assert len(response.body) < 15_000
+
+
+@pytest.mark.parametrize(
+    ("postal_code", "expected_zip5"),
+    [
+        ("60601", "60601"),
+        ("60601-1234", "60601"),
+        ("606011234", "60601"),
+        ("not-a-postal-code", None),
+        ("6060A", None),
+    ],
+)
+def test_provider_card_zip5_emits_only_schema_valid_values(
+    postal_code,
+    expected_zip5,
+):
+    assert npi_module._provider_card_zip5(postal_code) == expected_zip5
 
 
 def _fallback_location_maps():
