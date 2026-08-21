@@ -255,7 +255,7 @@ def test_source_index_strictly_validates_procedure_and_network_metadata_types(
     tmp_path,
 ):
     payload = _source_document(references_before=True, duplicate_price=False)
-    payload["provider_references"][0]["network_name"] = "must-be-an-array"
+    payload["provider_references"][0]["network_name"] = {"invalid": "object"}
     payload["in_network"][0]["name"] = 123
     payload["in_network"][1]["negotiated_rates"][0]["network_names"] = {
         "invalid": "object"
@@ -617,6 +617,32 @@ def test_referenced_network_names_are_unioned_with_rate_names(tmp_path):
         "Rate Network",
         "Reference One",
         "Reference Two",
+    ]
+
+
+def test_scalar_referenced_network_name_is_a_singleton_name(tmp_path):
+    payload = _source_document(references_before=True, duplicate_price=False)
+    payload["provider_references"][0]["network_name"] = " Reference Network "
+    payload["in_network"][0]["negotiated_rates"][0]["network_names"] = [
+        "Rate Network"
+    ]
+    source_path = _write_source_fixture(
+        tmp_path / "scalar-referenced-network.json",
+        references_before=True,
+        duplicate_price=False,
+        gzip_encoded=False,
+        source_document=payload,
+    )
+
+    with _open_source_index(tmp_path, source_path) as index:
+        expected = index.expected_tuples(
+            audit.QueryKey("CPT", "99213", NPIS[0])
+        )
+
+    tuple_payload = json.loads(next(iter(expected)))
+    assert tuple_payload["network_names"] == [
+        "Rate Network",
+        "Reference Network",
     ]
 
 

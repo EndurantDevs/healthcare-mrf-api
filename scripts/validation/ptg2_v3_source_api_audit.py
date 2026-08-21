@@ -201,14 +201,18 @@ CODE_SYSTEM_ALIASES = {
     "SNOMEDCT": "SNOMEDCT_US",
 }
 CANONICALIZATION = {
-    "version": 5,
+    "version": 6,
     "nulls": "price-field JSON null and stripped empty scalar strings canonicalize to null",
     "strings": "trim Unicode surrounding whitespace; otherwise preserve case and content",
     "source_metadata": (
         "billing code version, name, and description preserve trimmed empty string "
         "distinctly from null"
     ),
-    "network_names": "rate and referenced-provider names form one trimmed, sorted, unique list; blank names are omitted",
+    "network_names": (
+        "rate names accept string, array, or null; referenced-provider names accept "
+        "string or array; all names form one trimmed, sorted, unique list; blank names "
+        "are omitted"
+    ),
     "codes": "trim and uppercase; apply documented API aliases and catalog widths",
     "npi": "canonical integral decimal in inclusive range 1000000000..9999999999",
     "provider_tin": (
@@ -3063,6 +3067,9 @@ class SourceIndex:
         network_name_prefix = f"{base_prefix}.network_name"
         if prefix == network_name_prefix:
             if event in {"start_array", "end_array"}:
+                return
+            if event == "string":
+                self._capture_provider_reference_network_name(spec, state, raw_value)
                 return
             if event in SCALAR_EVENTS or event in {"start_map"}:
                 self.metrics["invalid_field_types"] += 1

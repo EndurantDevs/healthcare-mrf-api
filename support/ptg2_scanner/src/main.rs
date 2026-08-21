@@ -1878,23 +1878,23 @@ fn validate_provider_group(
     Ok(npi_partition)
 }
 
-fn validate_provider_reference_metadata(provider_ref: &Value) -> io::Result<()> {
-    let Some(network_name) = provider_ref.get("network_name") else {
-        return Ok(());
-    };
-    let Value::Array(values) = network_name else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "provider reference network_name must be an array of strings",
-        ));
-    };
-    if values.iter().all(Value::is_string) {
-        Ok(())
-    } else {
-        Err(io::Error::new(
+fn provider_reference_network_names(provider_ref: &Value) -> io::Result<Vec<String>> {
+    match provider_ref.get("network_name") {
+        None => Ok(Vec::new()),
+        Some(Value::String(value)) => Ok(vec![value.clone()]),
+        Some(Value::Array(values)) if values.iter().all(Value::is_string) => Ok(values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()),
+        Some(Value::Array(_)) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "provider reference network_name elements must be strings",
-        ))
+        )),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider reference network_name must be a string or an array of strings",
+        )),
     }
 }
 
@@ -1941,18 +1941,7 @@ fn build_provider_entry_audited(
     provider_ref: &Value,
     allow_empty_npi_tin_only: bool,
 ) -> io::Result<(ProviderEntry, u64)> {
-    validate_provider_reference_metadata(provider_ref)?;
-    let network_names = canonical_text_list(
-        provider_ref
-            .get("network_name")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect(),
-        false,
-    );
+    let network_names = canonical_text_list(provider_reference_network_names(provider_ref)?, false);
     let groups = provider_ref
         .get("provider_groups")
         .and_then(Value::as_array)
@@ -28292,11 +28281,29 @@ mod tests {
             assert!(provider_ref_definition(&provider_ref).is_err());
         }
 
-        for invalid_network_name in [json!("network"), json!(7), json!(["network", 7])] {
+        for invalid_network_name in [
+            Value::Null,
+            json!(true),
+            json!(7),
+            json!({}),
+            json!([["network"]]),
+            json!(["network", 7]),
+        ] {
             let mut provider_ref = valid_provider_reference();
             provider_ref["network_name"] = invalid_network_name;
             assert!(provider_ref_definition(&provider_ref).is_err());
         }
+
+        let mut scalar_provider_ref = valid_provider_reference();
+        scalar_provider_ref["network_name"] = json!(" network one ");
+        let (_, scalar_entry) = provider_ref_definition(&scalar_provider_ref).unwrap();
+        assert_eq!(scalar_entry.network_names, vec!["network one"]);
+
+        let mut singleton_array_provider_ref = valid_provider_reference();
+        singleton_array_provider_ref["network_name"] = json!([" network one "]);
+        let (_, singleton_array_entry) =
+            provider_ref_definition(&singleton_array_provider_ref).unwrap();
+        assert_eq!(scalar_entry.entry_hash, singleton_array_entry.entry_hash);
 
         let mut provider_ref = valid_provider_reference();
         provider_ref["network_name"] = json!(["network one", "network two"]);

@@ -172,7 +172,7 @@ counter; exceeding it is a coverage failure rather than an unbounded read.
 
 ## Exact canonical comparison
 
-The report embeds the canonicalization version and rules. Version 5 applies:
+The report embeds the canonicalization version and rules. Version 6 applies:
 
 * Null and stripped empty scalar strings become null.
 * General scalar strings are stripped and otherwise remain case-sensitive.
@@ -195,6 +195,9 @@ The report embeds the canonicalization version and rules. Version 5 applies:
 * Expiration dates must be exact ISO calendar dates (`YYYY-MM-DD`).
 * Service-code and modifier scalar/list values become sorted unique canonical
   lists.
+* Rate network names accept a string, array, or null; referenced-provider
+  network names accept a string or array. Names are trimmed, sorted, and
+  deduplicated together.
 * Negotiated type, billing class, setting, and additional information preserve
   case after trimming.
 * Negotiated-price multiplicity is retained after provider-membership union.
