@@ -108,7 +108,29 @@ def _is_scratch_parent_unchanged(
         return False
 
 
-def _open_anonymous_projection_copy(scratch_parent: Path) -> BinaryIO:
+def _open_local_anonymous_projection_copy() -> BinaryIO:
+    local_copy: BinaryIO | None = None
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=".ptg2-tax-source-local-"
+        ) as local_scratch:
+            local_copy = _open_anonymous_projection_copy(
+                Path(local_scratch),
+                _allow_local_fallback=False,
+            )
+    except BaseException:
+        if local_copy is not None:
+            with suppress(BaseException):
+                local_copy.close()
+        raise
+    return local_copy
+
+
+def _open_anonymous_projection_copy(
+    scratch_parent: Path,
+    *,
+    _allow_local_fallback: bool = True,
+) -> BinaryIO:
     """Create an anonymous private file under one validated scratch parent."""
 
     scratch_descriptor: int | None = None
@@ -121,14 +143,18 @@ def _open_anonymous_projection_copy(scratch_parent: Path) -> BinaryIO:
             prefix=".ptg2-tax-source-",
             dir=scratch_parent,
         )
-        if (
-            not _is_scratch_parent_unchanged(
-                scratch_parent,
-                scratch_descriptor,
-                scratch_identity,
-            )
-            or _anonymous_copy_identity(os.fstat(copy_file.fileno()))[6] != 0
+        if not _is_scratch_parent_unchanged(
+            scratch_parent,
+            scratch_descriptor,
+            scratch_identity,
         ):
+            raise _fail()
+        copy_metadata = os.fstat(copy_file.fileno())
+        if copy_metadata.st_nlink != 0 and _allow_local_fallback:
+            copy_file.close()
+            copy_file = None
+            return _open_local_anonymous_projection_copy()
+        if _anonymous_copy_identity(copy_metadata)[6] != 0:
             raise _fail()
         opened_file = copy_file
         copy_file = None
