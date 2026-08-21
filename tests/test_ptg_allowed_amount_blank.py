@@ -128,12 +128,12 @@ def test_projects_only_exact_durable_blank_result() -> None:
 
 
 def test_blank_projection_accepts_mappings_and_rejects_evidence_drift() -> None:
-    blank_state = _blank_state()
-    blank_state["engine_run"] = vars(blank_state["engine_run"])
-    assert allowed_amount_blank_metrics(**blank_state) is not None
-    lane = blank_state["engine_run"]["report"]["allowed_amount_lane"]
-    blank_state["engine_snapshot"].manifest["allowed_amount_lane"] = lane
-    lane["successful_files"][0]["summary"][
-        "allowed_amount_evidence"
-    ] = True
-    assert allowed_amount_blank_metrics(**blank_state) is None
+    for snapshot_only in (False, True):
+        blank_state = _blank_state()
+        blank_state["engine_run"] = vars(blank_state["engine_run"])
+        assert allowed_amount_blank_metrics(**blank_state) is not None
+        lane = blank_state["engine_run"]["report"]["allowed_amount_lane"]
+        if snapshot_only:
+            lane = blank_state["engine_snapshot"].manifest["allowed_amount_lane"]
+        lane["successful_files"][0]["summary"]["allowed_amount_evidence"] = True
+        assert allowed_amount_blank_metrics(**blank_state) is None
