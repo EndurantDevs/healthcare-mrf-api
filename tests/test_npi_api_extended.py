@@ -576,8 +576,16 @@ async def test_get_near_npi(monkeypatch):
     assert "parent_organization_tin" not in response_body[0]
 
 
+@pytest.mark.parametrize(
+    ("radius_value", "expected_radius"),
+    [(None, 10.0), ("0", 0.0), ("2.5", 2.5), ("100", 100.0)],
+)
 @pytest.mark.asyncio
-async def test_get_near_npi_with_lat_long_uses_knn_without_bbox_params(monkeypatch):
+async def test_get_near_npi_with_lat_long_uses_knn_without_bbox_params(
+    monkeypatch,
+    radius_value,
+    expected_radius,
+):
     captured_query_map = {}
 
     class RecordingConnection:
@@ -595,8 +603,16 @@ async def test_get_near_npi_with_lat_long_uses_knn_without_bbox_params(monkeypat
 
     monkeypatch.setattr(npi_module, "db", FakeDB())
 
+    request_args_by_name = {
+        "lat": "41.0",
+        "long": "-87.0",
+        "zip_codes": "60601",
+        "limit": "1",
+    }
+    if radius_value is not None:
+        request_args_by_name["radius"] = radius_value
     request = types.SimpleNamespace(
-        args={"lat": "41.0", "long": "-87.0", "zip_codes": "60601", "limit": "1"},
+        args=request_args_by_name,
         app=types.SimpleNamespace(),
     )
     response = await npi_module.get_near_npi(request)
@@ -607,7 +623,7 @@ async def test_get_near_npi_with_lat_long_uses_knn_without_bbox_params(monkeypat
     assert "max_lat" not in captured_query_map
     assert "min_long" not in captured_query_map
     assert "max_long" not in captured_query_map
-    assert captured_query_map["radius"] == 10
+    assert captured_query_map["radius"] == expected_radius
 
 
 @pytest.mark.asyncio

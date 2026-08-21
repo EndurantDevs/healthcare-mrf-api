@@ -1188,6 +1188,32 @@ def test_names_like_filter_clause_tokenizes_punctuation_as_and_terms(monkeypatch
     assert ":name_like_0_1" in clause
 
 
+@pytest.mark.parametrize("query_param", ["q", "name_like"])
+@pytest.mark.asyncio
+async def test_get_all_punctuation_only_name_filters_fail_closed(
+    monkeypatch,
+    query_param,
+):
+    """A supplied name filter with no searchable tokens cannot widen the query."""
+
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    await get_all(
+        types.SimpleNamespace(
+            args={
+                query_param: "---",
+                "include_total": "false",
+                "limit": "5",
+                "start": "0",
+            }
+        )
+    )
+
+    page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
+    assert "WHERE FALSE" in page_sql
+
+
 @pytest.mark.asyncio
 async def test_get_all_relevance_order_is_additive_and_stably_tied_by_npi(monkeypatch):
     conn = RecordingConnection()

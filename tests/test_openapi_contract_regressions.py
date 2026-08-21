@@ -86,6 +86,11 @@ def test_doctor_search_contract_documents_cards_and_filter_defaults():
         for parameter_by_field in npi_near["parameters"]
     }
     assert near_parameters_by_name["view"]["schema"]["enum"] == ["card"]
+    assert near_parameters_by_name["radius"]["schema"] == {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 100,
+    }
 
     assert schemas["NpiSearchResponse"]["properties"]["total_source"][
         "type"

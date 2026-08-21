@@ -5272,7 +5272,7 @@ def _names_like_filter_clause(alias: str, names: Sequence[str], base_param: str 
             parameter_map[param_like] = f"%{token}%"
         clauses.append(f"({' AND '.join(token_clauses)})")
     if not clauses:
-        return "", {}
+        return "FALSE", {}
     joined = " OR ".join(clauses)
     return f"({joined})", parameter_map
 
@@ -10509,7 +10509,14 @@ async def get_near_npi(request):
             _normalize_zip_code(zip_c.strip().rjust(5, "0"), "zip_codes")
         )
     has_coordinates = in_long is not None and in_lat is not None
-    radius = int(request.args.get("radius", 25 if zip_codes and not has_coordinates else 10))
+    radius = _normalize_match_candidate_float(
+        request.args.get("radius"),
+        param_name="radius",
+        minimum=0.0,
+        maximum=_MATCH_CANDIDATES_MAX_RADIUS_MILES,
+    )
+    if radius is None:
+        radius = 25.0 if zip_codes and not has_coordinates else 10.0
 
     requested_procedure_codes = _parse_code_tokens(procedure_codes_raw, "procedure_codes")
     requested_medication_codes = _parse_code_tokens(medication_codes_raw, "medication_codes")
