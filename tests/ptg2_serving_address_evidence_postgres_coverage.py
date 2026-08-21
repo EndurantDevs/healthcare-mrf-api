@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -206,7 +205,7 @@ def _patch_candidate_geo_dependencies(monkeypatch, schema: str):
         provider_enrichment,
     )
     captured_location_rows: list[dict[str, object]] = []
-    membership_rows = serving._membership_location_rows
+    membership_rows = serving._membership_npi_rows
 
     async def capture_membership_rows(*args, **kwargs):
         location_rows = await membership_rows(*args, **kwargs)
@@ -216,7 +215,7 @@ def _patch_candidate_geo_dependencies(monkeypatch, schema: str):
 
     monkeypatch.setattr(
         serving,
-        "_membership_location_rows",
+        "_membership_npi_rows",
         capture_membership_rows,
     )
     return captured_location_rows, provider_enrichment
@@ -265,7 +264,6 @@ async def test_provider_set_geo_candidate_scope_executes_beyond_old_prefix(
             npis[5000],
         }
         for location_record in captured_location_rows:
-            address_payload = json.loads(str(location_record["address_payload"]))
-            assert "address_provenance" not in address_payload
-            assert "geo_evidence_level" not in address_payload
+            assert "address_payload" not in location_record
+            assert "_geo_evidence_level" not in location_record
         provider_enrichment.assert_not_awaited()

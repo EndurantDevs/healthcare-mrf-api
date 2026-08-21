@@ -3279,7 +3279,7 @@ def _install_v4_geo_reads(monkeypatch, schema_name, rate_rows):
     )
     monkeypatch.setattr(
         serving,
-        "_membership_location_rows",
+        "_membership_npi_rows",
         admitted_location_rows,
     )
     monkeypatch.setattr(

@@ -26,6 +26,7 @@ class _G0289ServingHarness:
         replacement_by_function_name = {
             "_ptg2_manifest_location_match_limit": lambda: 2,
             "_membership_location_rows": self.location_rows,
+            "_membership_npi_rows": self.location_rows,
             "_shared_provider_set_keys_by_npi": self.provider_sets_by_npi,
             "_shared_rate_provider_set_keys": self.rate_provider_set_keys,
             "_provider_set_ids_for_keys": self.provider_set_ids_for_keys,
