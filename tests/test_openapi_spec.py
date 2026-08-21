@@ -52,6 +52,26 @@ class _QueryParamCollector(ast.NodeVisitor):
             if node.args and self._is_request_args_resolution(node.args[0]):
                 if len(node.args) > 1 and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
                     self.params.add(node.args[1].value)
+        if isinstance(func, ast.Name) and func.id == "parse_pagination":
+            if node.args and self._is_request_args_resolution(node.args[0]):
+                self.params.update({"limit", "page"})
+                enabled_aliases = {
+                    "allow_offset": "offset",
+                    "allow_start": "start",
+                    "allow_page_size": "page_size",
+                }
+                keyword_values = {
+                    keyword.arg: keyword.value
+                    for keyword in node.keywords
+                    if keyword.arg is not None
+                }
+                for keyword_name, parameter_name in enabled_aliases.items():
+                    keyword_value = keyword_values.get(keyword_name)
+                    if not (
+                        isinstance(keyword_value, ast.Constant)
+                        and keyword_value.value is False
+                    ):
+                        self.params.add(parameter_name)
         self.generic_visit(node)
 
     @staticmethod
@@ -154,66 +174,69 @@ def _collect_query_params(node: ast.AST) -> set[str]:
     return visitor.params
 
 
+def test_query_param_collector_includes_list_and_pagination_helpers():
+    function_node = ast.parse(
+        """
+async def endpoint(request):
+    args = request.args
+    args.getlist("name_like")
+    parse_pagination(
+        args,
+        default_limit=25,
+        max_limit=200,
+        allow_offset=False,
+    )
+"""
+    ).body[0]
+
+    assert _collect_query_params(function_node) == {
+        "limit",
+        "name_like",
+        "page",
+        "page_size",
+        "start",
+    }
+
+
 def _collect_spec_routes() -> dict[tuple[str, str], dict[str, set[str]]]:
     """Collect route parameters from the checked-in OpenAPI document."""
-    routes_by_path: dict[tuple[str, str], dict[str, set[str]]] = {}
-    is_in_paths = is_in_parameters = False
-    current_path = current_method = None
-    current_parameter_by_field: dict[str, str] | None = None
+    document = yaml.safe_load(OPENAPI_PATH.read_text())
 
-    for raw_line in OPENAPI_PATH.read_text().splitlines():
-        if not is_in_paths:
-            if raw_line.strip() == "paths:":
-                is_in_paths = True
-            continue
-        if raw_line.strip().startswith("components:"):
-            break
-        if not raw_line.strip():
-            continue
-        indent = len(raw_line) - len(raw_line.lstrip(" "))
-        stripped = raw_line.strip()
-        if indent == 2 and stripped.endswith(":") and stripped.startswith("/"):
-            current_path = stripped[:-1]
-            current_method = None
-            routes_by_path.setdefault(("", current_path), {})
-            continue
-        if indent == 4 and stripped.endswith(":") and current_path:
-            token = stripped[:-1].lower()
-            if token in HTTP_METHODS:
-                current_method = token
-                routes_by_path[("", current_path)][current_method] = []
-                is_in_parameters = False
+    def resolve_parameter(parameter_by_field: dict) -> dict:
+        resolved = parameter_by_field
+        while "$ref" in resolved:
+            target = document
+            for token in resolved["$ref"].removeprefix("#/").split("/"):
+                target = target[token]
+            resolved = target
+        return resolved
+
+    routes_by_operation: dict[tuple[str, str], dict[str, set[str]]] = {}
+    for path, path_by_field in document["paths"].items():
+        shared_parameters = path_by_field.get("parameters", [])
+        for method, operation_by_field in path_by_field.items():
+            if method not in HTTP_METHODS:
                 continue
-            current_method = None
-        if indent == 6 and current_method:
-            if stripped == "parameters:":
-                is_in_parameters = True
-                routes_by_path[("", current_path)][current_method] = []
-                continue
-            is_in_parameters = False
-        if indent == 8 and is_in_parameters and current_method:
-            if stripped.startswith("- name:"):
-                name = stripped.split(":", 1)[1].strip().strip("'\"")
-                current_parameter_by_field = {"name": name}
-                routes_by_path[("", current_path)][current_method].append(current_parameter_by_field)
-                continue
-        if indent >= 10 and is_in_parameters and current_method and current_parameter_by_field is not None:
-            if stripped.startswith("in:"):
-                current_parameter_by_field["in"] = stripped.split(":", 1)[1].strip()
-            continue
-        if indent <= 6:
-            current_parameter_by_field = None
-            is_in_parameters = is_in_parameters and stripped == "parameters:"
-    spec_routes_by_operation: dict[tuple[str, str], dict[str, set[str]]] = {}
-    for (_, path), methods in routes_by_path.items():
-        for method, params in methods.items():
-            query_params = {parameter_by_field["name"] for parameter_by_field in params if parameter_by_field.get("in") == "query"}
-            path_params = {parameter_by_field["name"] for parameter_by_field in params if parameter_by_field.get("in") == "path"}
-            spec_routes_by_operation[(method, path)] = {
-                "query_params": query_params,
-                "path_params": path_params,
+            parameters = [
+                resolve_parameter(parameter_by_field)
+                for parameter_by_field in (
+                    *shared_parameters,
+                    *operation_by_field.get("parameters", []),
+                )
+            ]
+            routes_by_operation[(method, path)] = {
+                "query_params": {
+                    parameter_by_field["name"]
+                    for parameter_by_field in parameters
+                    if parameter_by_field.get("in") == "query"
+                },
+                "path_params": {
+                    parameter_by_field["name"]
+                    for parameter_by_field in parameters
+                    if parameter_by_field.get("in") == "path"
+                },
             }
-    return spec_routes_by_operation
+    return routes_by_operation
 
 
 def test_openapi_routes_match_code():
@@ -303,7 +326,7 @@ def test_openapi_exposes_strict_v3_allowed_amount_fallback():
         allowed_parameter = next(
             parameter_by_field
             for parameter_by_field in parameters
-            if parameter_by_field["name"] == "include_allowed_amounts"
+            if parameter_by_field.get("name") == "include_allowed_amounts"
         )
         assert allowed_parameter["schema"] == {
             "type": "boolean",
@@ -344,6 +367,76 @@ def test_openapi_exposes_strict_v3_allowed_amount_fallback():
     }
 
 
+def test_doctor_search_contract_documents_cards_and_filter_defaults():
+    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    schemas = spec["components"]["schemas"]
+    npi_all = spec["paths"]["/npi/all"]["get"]
+    npi_near = spec["paths"]["/npi/near/"]["get"]
+
+    all_params = {item["name"]: item for item in npi_all["parameters"]}
+    assert {"name_like", "page", "offset", "page_size"} <= set(all_params)
+    assert all_params["name_like"]["schema"]["type"] == "array"
+    assert all_params["npi"]["schema"] == {
+        "type": "string",
+        "pattern": "^[1-9][0-9]{9}$",
+    }
+    assert all_params["show"]["schema"]["enum"] == ["chain"]
+    assert all_params["view"]["schema"]["enum"] == ["sitemap", "card"]
+    near_params = {item["name"]: item for item in npi_near["parameters"]}
+    assert near_params["view"]["schema"]["enum"] == ["card"]
+
+    assert schemas["NpiSearchResponse"]["properties"]["total_source"][
+        "type"
+    ] == "string"
+    assert schemas["NpiCard"]["additionalProperties"] is False
+
+    detail_params = {
+        item["name"]: item
+        for item in spec["paths"]["/npi/id/{npi}"]["get"]["parameters"]
+    }
+    assert detail_params["show"]["schema"]["enum"] == ["chain"]
+    assert detail_params["view"]["schema"]["enum"] == ["full", "summary"]
+    assert "enrichment" in detail_params["view"]["description"].lower()
+
+    for path in (
+        "/pricing/providers/search-by-procedure",
+        "/pricing/providers/by-procedure",
+    ):
+        parameters = spec["paths"][path]["get"]["parameters"]
+        primary_only = next(
+            item for item in parameters if item.get("name") == "primary_only"
+        )
+        assert primary_only["schema"] == {
+            "type": "boolean",
+            "default": True,
+        }
+
+
+def test_npi_endpoint_has_no_shadow_table_probe_or_dead_count_stub():
+    tree = ast.parse((ENDPOINT_DIR / "npi.py").read_text())
+    list_provider_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "list_providers"
+    )
+    detail_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "get_npi"
+    )
+
+    assert sum(
+        isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "get_formatted_count"
+        for node in ast.walk(list_provider_node)
+    ) == 1
+    assert not any(
+        isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_is_table_available"
+        for node in ast.walk(detail_node)
+    )
+
+
 def test_provider_routes_share_canonical_provider_sex_parameter():
     """Keep one provider-sex parameter name and value contract across APIs."""
 
@@ -359,7 +452,7 @@ def test_provider_routes_share_canonical_provider_sex_parameter():
         provider_sex_parameter = next(
             parameter_by_field
             for parameter_by_field in parameters
-            if parameter_by_field["name"] == "provider_sex_code"
+            if parameter_by_field.get("name") == "provider_sex_code"
         )
         assert provider_sex_parameter["in"] == "query"
         assert provider_sex_parameter["schema"]["enum"] == ["M", "F", "U", "X"]
@@ -378,7 +471,7 @@ def test_openapi_documents_allowed_unverified_location_suppression():
         unverified_address_parameter = next(
             parameter_by_field
             for parameter_by_field in parameters
-            if parameter_by_field["name"] == "include_unverified_addresses"
+            if parameter_by_field.get("name") == "include_unverified_addresses"
         )
         description = " ".join(
             unverified_address_parameter["description"].split()

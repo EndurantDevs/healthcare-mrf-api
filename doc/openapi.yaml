@@ -205,6 +205,9 @@ paths:
       operationId: getPlanSearch
       summary: Search plans with optional demographic filters
       parameters:
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: age
           in: query
           schema:
@@ -673,6 +676,9 @@ paths:
       operationId: getFormularyIds
       summary: Search formularies by issuer, plan, year, or drug keyword
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: issuer_id
           in: query
           schema:
@@ -742,6 +748,9 @@ paths:
       operationId: getFormularyIdFormularyIdDrugs
       summary: List drugs covered by a formulary
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: formulary_id
           in: path
           required: true
@@ -975,6 +984,9 @@ paths:
       operationId: getFormularyPartdSnapshots
       summary: List imported Part D monthly/quarterly snapshots
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: run_id
           in: query
           schema:
@@ -1109,6 +1121,9 @@ paths:
       operationId: getFormularyPartdPharmaciesNpiMedicationsCodeSystemCodeCosts
       summary: Return medication cost rows for one pharmacy across plans
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: npi
           in: path
           required: true
@@ -2013,6 +2028,10 @@ paths:
       operationId: getGeoStates
       summary: Aggregated ZIP and city counts per state
       parameters:
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: sort
           in: query
           schema:
@@ -2057,6 +2076,10 @@ paths:
       operationId: getGeoStateStateCities
       summary: Top cities in a state by population (based on local geo data)
       parameters:
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: state
           in: path
           required: true
@@ -2101,6 +2124,11 @@ paths:
       operationId: getNuccAll
       summary: List NUCC taxonomy codes
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: q
           in: query
           required: false
@@ -2373,11 +2401,28 @@ paths:
           in: query
           schema:
             type: string
-          description: Preferred free-text provider name fragment
+          description: Preferred provider name query; punctuation-separated terms are matched in any order and every term is required.
+        - name: name_like
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+          description: Legacy repeatable provider-name query alias; each value is tokenized like `q`.
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [npi, relevance]
+            default: npi
+          description: Deterministic NPI order by default; `relevance` requires `q` and uses NPI as the tie-breaker.
         - name: npi
           in: query
           schema:
             type: string
+            pattern: '^[1-9][0-9]{9}$'
           description: Exact 10-digit NPI value to filter
         - name: count_only
           in: query
@@ -2400,12 +2445,14 @@ paths:
           in: query
           schema:
             type: string
-          description: Optional output view selector (for example `chain`)
+            enum: [chain]
+          description: Optional chain enrichment selector; independent from `view`.
         - name: view
           in: query
           schema:
             type: string
-          description: Optional result view mode (currently `sitemap`); distinct from `show` enrichment
+            enum: [sitemap, card]
+          description: Optional result projection; distinct from `show` enrichment. `card` emits compact typeahead fields.
         - name: include_total
           in: query
           schema:
@@ -2429,12 +2476,35 @@ paths:
         - name: start
           in: query
           schema:
-            type: number
+            type: integer
+            minimum: 0
           description: Offset applied to search results (default 0)
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+          description: Canonical zero-based offset alias for `start`.
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+          description: One-based page number.
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+          description: Alias for `limit`; both values must agree when supplied together.
         - name: limit
           in: query
           schema:
-            type: number
+            type: integer
+            minimum: 1
+            maximum: 200
           description: Maximum number of rows to return (default 50)
         - name: classification
           in: query
@@ -2583,6 +2653,12 @@ paths:
           schema:
             type: string
           description: Preferred free-text provider name fragment
+        - name: view
+          in: query
+          schema:
+            type: string
+            enum: [card]
+          description: Emit the compact provider-card projection while preserving the legacy array or cursor envelope.
         - name: long
           in: query
           schema:
@@ -2703,7 +2779,9 @@ paths:
                 oneOf:
                   - type: array
                     items:
-                      $ref: '#/components/schemas/NpiNearResult'
+                      oneOf:
+                        - $ref: '#/components/schemas/NpiNearResult'
+                        - $ref: '#/components/schemas/NpiCard'
                   - $ref: '#/components/schemas/NpiNearPage'
   /npi/facilities/providers:
     get:
@@ -2986,12 +3064,15 @@ paths:
           in: query
           schema:
             type: string
-          description: Optional output view selector (for example `chain`)
+            enum: [chain]
+          description: Optional chain-enrichment selector; independent from `view`.
         - name: view
           in: query
           schema:
             type: string
-          description: Alias for `show`
+            enum: [full, summary]
+            default: full
+          description: Provider-enrichment detail projection; independent from the `show=chain` selector.
         - name: include_sources
           in: query
           schema:
@@ -3070,6 +3151,11 @@ paths:
       operationId: getCodes
       summary: List normalized code catalog entries
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: code_system
           in: query
           schema:
@@ -3345,6 +3431,11 @@ paths:
       operationId: getPricingProviders
       summary: List pricing providers from CMS claims imports
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: npi
           in: query
           schema:
@@ -3429,6 +3520,9 @@ paths:
         codes/classifications, and provider-type aliases are resolved before
         filtering provider type text.
       parameters:
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: q
           in: query
           schema:
@@ -3622,6 +3716,11 @@ paths:
       operationId: getPricingProviderTypesAutocomplete
       summary: Autocomplete provider type and NUCC terminology aliases
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: q
           in: query
           required: true
@@ -3656,6 +3755,11 @@ paths:
       operationId: getPricingProviderSpecialtiesAutocomplete
       summary: Autocomplete provider specialties using terminology aliases
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: q
           in: query
           required: true
@@ -3691,6 +3795,9 @@ paths:
       summary: List provider specialty values for pricing provider filters
       description: Alias of `/pricing/provider-specialties`.
       parameters:
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: q
           in: query
           schema:
@@ -3892,6 +3999,11 @@ paths:
       operationId: getPricingProvidersNpiProcedures
       summary: List pricing procedures for a provider
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: npi
           in: path
           required: true
@@ -4182,6 +4294,11 @@ paths:
       operationId: getPricingProceduresCodeSystemCodeProviders
       summary: List providers matching a code (with optional code expansion)
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: code_system
           in: path
           required: true
@@ -4356,6 +4473,11 @@ paths:
       operationId: getPricingProceduresAutocomplete
       summary: Autocomplete procedure/service terms across CPT/HCPCS/internal codes
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: q
           in: query
           required: true
@@ -4420,6 +4542,11 @@ paths:
       operationId: getPricingPrescriptionsAutocomplete
       summary: Autocomplete prescription/drug terms
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: q
           in: query
           required: true
@@ -4479,6 +4606,11 @@ paths:
         no local match in the requested radius, or no matching rates.
         Strict V3 serves in-network negotiated rates only.
 
+        Group-plan CPT office-visit provider searches that combine a statewide
+        location with taxonomy scope fail fast. Add `zip5` and
+        `zip_radius_miles` (or bounded coordinates); the 400 response includes
+        `context.fix_it.retry_options` with the ZIP-radius remediation.
+
         Radius matches fail closed on address evidence: an address must come
         from NPPES, be independently reported by at least two marketplace
         directory issuers, or come from CMS Doctors and Clinicians whose NPI
@@ -4525,6 +4657,9 @@ paths:
         body; larger source results fail closed without truncation. Billing
         responses use `Cache-Control: private, no-store`.
       parameters:
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: year
           in: query
           schema: { type: integer }
@@ -4581,7 +4716,8 @@ paths:
             `include_providers=true` to return provider rows.
         - name: primary_only
           in: query
-          schema: { type: boolean }
+          schema: { type: boolean, default: true }
+          description: Restrict taxonomy filters to the NPI primary taxonomy; defaults to true.
         - name: taxonomy_classification
           in: query
           schema: { type: string }
@@ -4888,6 +5024,11 @@ paths:
         `provider_filter.taxonomy_codes`, `provider_filter.primary_only`, and
         `provider_filter.include_subspecialties` into this search.
 
+        Group-plan CPT office-visit provider searches that combine a statewide
+        location with taxonomy scope fail fast. Add `zip5` and
+        `zip_radius_miles` (or bounded coordinates); the 400 response includes
+        `context.fix_it.retry_options` with the ZIP-radius remediation.
+
         Address-bearing spatial matches require coherent canonical ZIP, state,
         and country identity. Coordinate-bearing addresses must fall inside
         their own ZCTA and any requested positive radius. Exact-ZIP searches
@@ -4896,6 +5037,9 @@ paths:
         applies location filters internally but does not return provider address,
         contact, or distance fields.
       parameters:
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: year
           in: query
           schema:
@@ -4977,6 +5121,7 @@ paths:
           in: query
           schema:
             type: boolean
+            default: true
           description: Restrict taxonomy filters to the NPI primary taxonomy when true.
         - name: taxonomy_classification
           in: query
@@ -5223,6 +5368,11 @@ paths:
       operationId: getPricingProvidersByPrescription
       summary: Find providers by prescription/drug text or code
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: year
           in: query
           schema:
@@ -5314,6 +5464,11 @@ paths:
       operationId: getPricingProvidersNpiPrescriptions
       summary: List prescription metrics for a provider
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: npi
           in: path
           required: true
@@ -5404,6 +5559,11 @@ paths:
       operationId: getPricingPrescriptionsRxCodeSystemRxCodeProviders
       summary: List providers that prescribe a given code
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: rx_code_system
           in: path
           required: true
@@ -5498,6 +5658,11 @@ paths:
       operationId: getClinicalConcepts
       summary: Search clinical terminology concepts
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: system
           in: query
           schema:
@@ -5554,6 +5719,11 @@ paths:
       operationId: getClinicalRelationships
       summary: Search clinical terminology relationships
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: from_system
           in: query
           schema:
@@ -5664,6 +5834,11 @@ paths:
       operationId: getClinicalClinicalAreas
       summary: List clinical areas
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: q
           in: query
           schema:
@@ -5773,6 +5948,11 @@ paths:
       operationId: getClinicalCrosswalk
       summary: Search clinical code crosswalks
       parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/PaginationPage'
+        - $ref: '#/components/parameters/PaginationPageSize'
+        - $ref: '#/components/parameters/PaginationStart'
         - name: from_system
           in: query
           schema:
@@ -5816,6 +5996,41 @@ components:
         type: string
         enum: ['private, no-store']
   parameters:
+    PaginationLimit:
+      name: limit
+      in: query
+      description: Maximum rows returned in this page.
+      schema:
+        type: integer
+        minimum: 1
+    PaginationPage:
+      name: page
+      in: query
+      description: One-based page number.
+      schema:
+        type: integer
+        minimum: 1
+    PaginationOffset:
+      name: offset
+      in: query
+      description: Zero-based row offset.
+      schema:
+        type: integer
+        minimum: 0
+    PaginationStart:
+      name: start
+      in: query
+      description: Legacy zero-based alias for `offset`.
+      schema:
+        type: integer
+        minimum: 0
+    PaginationPageSize:
+      name: page_size
+      in: query
+      description: Alias for `limit`; both values must agree when supplied together.
+      schema:
+        type: integer
+        minimum: 1
     FHIRFormularyIdPath:
       name: formulary_id
       in: path
@@ -10161,10 +10376,68 @@ components:
       properties:
         total:
           type: integer
+        page:
+          type: integer
+          minimum: 1
+        limit:
+          type: integer
+          minimum: 1
+        offset:
+          type: integer
+          minimum: 0
+        total_source:
+          type: string
+          enum: [computed, estimated_timeout_floor, estimated_page_floor]
+          description: States whether `total` is exact or a lower-bound estimate for the returned window.
         rows:
           type: array
           items:
-            $ref: '#/components/schemas/NpiRecord'
+            oneOf:
+              - $ref: '#/components/schemas/NpiRecord'
+              - $ref: '#/components/schemas/NpiCard'
+      required: [total, page, limit, offset, rows, total_source]
+    NpiCard:
+      type: object
+      properties:
+        npi:
+          type: integer
+          format: int64
+        display_name:
+          type: string
+        entity_type:
+          type: string
+          enum: [individual, organization]
+          nullable: true
+        credential:
+          type: string
+          nullable: true
+        primary_specialty:
+          type: object
+          properties:
+            taxonomy_code:
+              type: string
+              nullable: true
+            display:
+              type: string
+              nullable: true
+          required: [taxonomy_code, display]
+          additionalProperties: false
+        city:
+          type: string
+          nullable: true
+        state:
+          type: string
+          nullable: true
+        zip5:
+          type: string
+          nullable: true
+          pattern: '^[0-9]{5}$'
+        distance_miles:
+          type: number
+          nullable: true
+          description: Present only for nearby search cards.
+      required: [npi, display_name, entity_type, credential, primary_specialty, city, state, zip5]
+      additionalProperties: false
     NpiRecord:
       type: object
       properties:
@@ -10666,7 +10939,9 @@ components:
         items:
           type: array
           items:
-            $ref: '#/components/schemas/NpiNearResult'
+            oneOf:
+              - $ref: '#/components/schemas/NpiNearResult'
+              - $ref: '#/components/schemas/NpiCard'
         total_count:
           type: integer
           format: int64

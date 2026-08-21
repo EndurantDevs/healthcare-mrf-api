@@ -1342,7 +1342,7 @@ async def test_get_near_npi_applies_name_before_knn_limit(monkeypatch):
     assert captured_query_map["params"]["q"] == "%Clinic%"
 
 
-def _near_provider_record(npi, address_key, distance):
+def _near_provider_record(npi, address_key, distance, **fields):
     return types.SimpleNamespace(
         _mapping={
             "npi_code": npi,
@@ -1351,6 +1351,7 @@ def _near_provider_record(npi, address_key, distance):
             "type": "primary",
             "distance": round(distance / 1609.34, 2),
             "cursor_distance_meters": distance,
+            **fields,
         }
     )
 
@@ -1439,6 +1440,70 @@ async def test_get_near_npi_paginates_unique_provider_addresses(monkeypatch):
         for provider_item in second_payload["items"]
     ] == [
         (5556667778, second_address_key)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_near_npi_card_view_keeps_distance_and_compact_fields(monkeypatch):
+    address_key = "00000000-0000-0000-0000-000000000001"
+
+    class CardConnection:
+        async def all(self, sql, **_params):
+            if "COUNT(DISTINCT" in str(sql):
+                return []
+            return [
+                _near_provider_record(
+                    1112223334,
+                    address_key,
+                    1609.34,
+                    entity_type_code=1,
+                    provider_first_name="Adam",
+                    provider_last_name="Smith",
+                    provider_credential_text="MD",
+                    city_name="Chicago",
+                    state_name="IL",
+                    postal_code="60601-1234",
+                    healthcare_provider_taxonomy_code="207Q00000X",
+                    healthcare_provider_primary_taxonomy_switch="Y",
+                    taxonomy_display="Family Medicine",
+                )
+            ]
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        npi_module.db,
+        "acquire",
+        lambda: FakeAcquire(CardConnection()),
+    )
+    response = await npi_module.get_near_npi(
+        types.SimpleNamespace(
+            args={
+                "long": "-87.0",
+                "lat": "41.0",
+                "view": "card",
+                "limit": "1",
+            },
+            app=types.SimpleNamespace(),
+        )
+    )
+
+    assert json.loads(response.body) == [
+        {
+            "npi": 1112223334,
+            "display_name": "Adam Smith",
+            "entity_type": "individual",
+            "credential": "MD",
+            "primary_specialty": {
+                "taxonomy_code": "207Q00000X",
+                "display": "Family Medicine",
+            },
+            "city": "Chicago",
+            "state": "IL",
+            "zip5": "60601",
+            "distance_miles": 1.0,
+        }
     ]
 
 

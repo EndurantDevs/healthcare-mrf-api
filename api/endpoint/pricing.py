@@ -1223,14 +1223,38 @@ def _reject_broad_group_plan_provider_expansion(
     if _parse_int(npi, "npi", minimum=1) is not None:
         return
     specialty_filter = specialty_filter or resolve_provider_specialty_filter(args)
-    if (
+    has_taxonomy_scope = bool(
         specialty_filter.is_active
         or args.get("taxonomy_code")
         or args.get("taxonomy_classification")
-    ):
-        return
+    )
     if specialty_filter.unresolved_specialty:
         _raise_unresolved_specialty(specialty_filter)
+    has_bounded_location = bool(
+        zip5 or (latitude is not None and longitude is not None)
+    )
+    if has_taxonomy_scope and has_bounded_location:
+        return
+    if has_taxonomy_scope:
+        raise InvalidUsage(
+            "Statewide taxonomy-scoped CPT office-visit provider expansion is too broad; "
+            "add zip5 with zip_radius_miles (or lat, long, and radius_miles).",
+            context={
+                "fix_it": {
+                    "reason": (
+                        "A statewide taxonomy search expands too many provider-rate "
+                        "candidates for an interactive request."
+                    ),
+                    "retry_options": [
+                        {
+                            "zip5": "<member ZIP>",
+                            "zip_radius_miles": 10,
+                            "note": "Retry inside a bounded ZIP radius.",
+                        }
+                    ],
+                }
+            },
+        )
     raise InvalidUsage(
         "Broad CPT office-visit provider expansion for a group plan is a provider-directory request; "
         "use /api/v1/pricing/group-plan-providers with specialty/classification/location filters, or add "

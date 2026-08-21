@@ -442,6 +442,87 @@ def _provider_display_name_from_mapping(mapping: Mapping[str, Any]) -> str:
     return fallback or "Unknown"
 
 
+def _provider_card_from_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one provider result into the compact doctor-search card shape."""
+
+    taxonomy_rows = [
+        dict(row)
+        for row in (mapping.get("taxonomy_list") or [])
+        if isinstance(row, Mapping)
+    ]
+    primary_taxonomy = next(
+        (
+            row
+            for row in taxonomy_rows
+            if row.get("primary") is True
+            or str(
+                row.get("healthcare_provider_primary_taxonomy_switch") or ""
+            ).upper()
+            == "Y"
+        ),
+        taxonomy_rows[0] if taxonomy_rows else {},
+    )
+    taxonomy_code = (
+        primary_taxonomy.get("taxonomy_code")
+        or primary_taxonomy.get("healthcare_provider_taxonomy_code")
+    )
+    nested_taxonomy = primary_taxonomy.get("nucc_taxonomy")
+    nested_taxonomy_display = (
+        nested_taxonomy.get("display_name")
+        if isinstance(nested_taxonomy, Mapping)
+        else None
+    )
+    taxonomy_display = (
+        primary_taxonomy.get("display")
+        or primary_taxonomy.get("display_name")
+        or nested_taxonomy_display
+    )
+    if taxonomy_code and not taxonomy_display:
+        taxonomy_display = next(
+            (
+                row.get("display") or row.get("display_name")
+                for row in taxonomy_rows
+                if (
+                    row.get("taxonomy_code")
+                    or row.get("healthcare_provider_taxonomy_code")
+                )
+                == taxonomy_code
+                and (row.get("display") or row.get("display_name"))
+            ),
+            None,
+        )
+
+    entity_type_code = mapping.get("entity_type_code")
+    try:
+        entity_type_code = int(entity_type_code)
+    except (TypeError, ValueError):
+        entity_type_code = None
+    postal_code = mapping.get("zip5") or mapping.get("postal_code")
+    card = {
+        "npi": mapping.get("npi") or mapping.get("npi_code"),
+        "display_name": _provider_display_name_from_mapping(mapping),
+        "entity_type": _entity_kind_from_code(entity_type_code),
+        "credential": mapping.get("provider_credential_text"),
+        "primary_specialty": {
+            "taxonomy_code": taxonomy_code,
+            "display": taxonomy_display,
+        },
+        "city": mapping.get("city") or mapping.get("city_name"),
+        "state": (
+            mapping.get("state")
+            or mapping.get("state_code")
+            or mapping.get("state_name")
+        ),
+        "zip5": str(postal_code)[:5] if postal_code not in (None, "") else None,
+    }
+    distance_miles = mapping.get("distance_miles")
+    if distance_miles is None:
+        distance_miles = mapping.get("distance")
+    if distance_miles is not None:
+        card["distance_miles"] = distance_miles
+    return card
+
+
 ENABLE_NPI_SCHEMA_CACHE = _is_environment_flag_enabled(
     "HLTHPRT_ENABLE_NPI_SCHEMA_CACHE",
     "HLTHPRT_ENABLE_SCHEMA_CACHE",
@@ -554,6 +635,40 @@ def _provider_taxonomy_code_parameters(
         f":{parameter_name}" for parameter_name in parameters_by_name
     )
     return parameters_by_name, placeholders
+
+
+def _provider_taxonomy_matched_npi_cte(
+    taxonomy_conditions: str,
+    *,
+    code_placeholders: Sequence[str] = (),
+) -> str:
+    """Intersect materialized provider candidates with taxonomy once."""
+
+    if code_placeholders:
+        taxonomy_match_sql = (
+            "WHERE provider_taxonomy.healthcare_provider_taxonomy_code "
+            f"IN ({', '.join(code_placeholders)})"
+        )
+    else:
+        taxonomy_match_sql = f"""
+          JOIN (
+                SELECT code
+                  FROM mrf.nucc_taxonomy
+                 WHERE {taxonomy_conditions}
+          ) AS matched_taxonomy
+            ON matched_taxonomy.code =
+               provider_taxonomy.healthcare_provider_taxonomy_code
+        """
+
+    return f"""
+    taxonomy_matched_npi AS MATERIALIZED (
+        SELECT DISTINCT fn.*
+          FROM filtered_npi AS fn
+          JOIN mrf.npi_taxonomy AS provider_taxonomy
+            ON provider_taxonomy.npi = fn.npi
+          {taxonomy_match_sql}
+    )
+    """
 
 
 def _is_location_first_taxonomy_filter(
@@ -4880,9 +4995,11 @@ def _build_nearby_sql(
                    {row_tiebreaker}
              LIMIT :limit
         )
-        SELECT sub_s.*, t.*
+        SELECT sub_s.*, t.*, nucc.display_name AS taxonomy_display
           FROM sub_s
           LEFT JOIN mrf.npi_taxonomy AS t ON sub_s.npi_code = t.npi
+          LEFT JOIN mrf.nucc_taxonomy AS nucc
+            ON nucc.code = t.healthcare_provider_taxonomy_code
       ORDER BY sub_s.cursor_distance_meters ASC,
                sub_s.npi_code ASC,
                sub_s.address_key ASC,
@@ -5088,6 +5205,18 @@ def _name_like_clause(alias: str = "", param: str = "name_like") -> str:
     return f"({expr} LIKE {param_ref})"
 
 
+def _name_search_tokens(value: Any) -> tuple[str, ...]:
+    """Return stable alphanumeric terms for order-insensitive name matching."""
+
+    return tuple(
+        dict.fromkeys(
+            token.lower()
+            for token in re.findall(r"[^\W_]+", str(value or ""), flags=re.UNICODE)
+            if token
+        )
+    )
+
+
 def _names_like_filter_clause(alias: str, names: Sequence[str], base_param: str = "name_like") -> tuple[str, dict]:
     if not names:
         return "", {}
@@ -5098,16 +5227,27 @@ def _names_like_filter_clause(alias: str, names: Sequence[str], base_param: str 
     clauses = []
     parameter_map = {}
     for idx, name in enumerate(names):
-        param_like = f"{base_param}_{idx}"
-        if ENABLE_TRGM_FUZZY_NAME_SEARCH:
-            param_fuzzy = f"{base_param}_{idx}_fuzzy"
-            clauses.append(
-                f"(({expr} LIKE :{param_like}) OR ({expr} % :{param_fuzzy}))"
+        tokens = _name_search_tokens(name)
+        if not tokens:
+            continue
+        token_clauses = []
+        for token_index, token in enumerate(tokens):
+            parameter_suffix = (
+                str(idx) if len(tokens) == 1 else f"{idx}_{token_index}"
             )
-            parameter_map[param_fuzzy] = name.lower()
-        else:
-            clauses.append(f"({expr} LIKE :{param_like})")
-        parameter_map[param_like] = f"%{name.lower()}%"
+            param_like = f"{base_param}_{parameter_suffix}"
+            if ENABLE_TRGM_FUZZY_NAME_SEARCH:
+                param_fuzzy = f"{param_like}_fuzzy"
+                token_clauses.append(
+                    f"(({expr} LIKE :{param_like}) OR ({expr} % :{param_fuzzy}))"
+                )
+                parameter_map[param_fuzzy] = token
+            else:
+                token_clauses.append(f"({expr} LIKE :{param_like})")
+            parameter_map[param_like] = f"%{token}%"
+        clauses.append(f"({' AND '.join(token_clauses)})")
+    if not clauses:
+        return "", {}
     joined = " OR ".join(clauses)
     return f"({joined})", parameter_map
 
@@ -8192,12 +8332,14 @@ async def list_providers(request):
     legacy_name_like = _extract_name_filters(request)
     # Explicit access for route collectors / OpenAPI parity.
     request.args.get("q")
+    request.args.get("name_like")
     request.args.get("start")
     request.args.get("limit")
     request.args.get("include_total")
     request.args.get("include_sources")
     request.args.get("include_evidence")
     request.args.get("view")
+    request.args.get("order_by")
     request.args.get("npi")
     request.args.get("address_site_key")
     request.args.get("provider_sex_code")
@@ -8207,12 +8349,20 @@ async def list_providers(request):
         include_sources = True
         include_evidence = True
     q_value = str(request.args.get("q") or "").strip().lower()
+    order_by = str(request.args.get("order_by") or "npi").strip().lower()
+    if order_by not in {"npi", "relevance"}:
+        raise sanic.exceptions.InvalidUsage("order_by must be one of: npi, relevance")
+    relevance_q = " ".join(_name_search_tokens(q_value))
+    if order_by == "relevance" and not relevance_q:
+        raise sanic.exceptions.InvalidUsage("order_by=relevance requires q")
     include_total_raw = request.args.get("include_total")
     include_total = _is_truthy_arg(
         include_total_raw,
         default=_should_include_npi_all_total(request.args, is_count_only),
     )
     view_mode = str(request.args.get("view") or "").strip().lower()
+    if view_mode not in {"", "sitemap", "card"}:
+        raise sanic.exceptions.InvalidUsage("view must be one of: sitemap, card")
     classification = request.args.get("classification")
     is_sitemap_limit_mode = (
         view_mode == "sitemap"
@@ -8682,7 +8832,8 @@ async def list_providers(request):
         taxonomy_subquery = _taxonomy_codes_subquery(taxonomy_conditions)
         taxonomy_join = f"CROSS JOIN {taxonomy_subquery}"
         taxonomy_parameters_by_name: dict[str, str] = {}
-        if use_location_first_taxonomy:
+        taxonomy_code_placeholders: tuple[str, ...] = ()
+        if use_location_first_taxonomy and not npi_where:
             if codes and len(taxonomy_filters) == 1:
                 taxonomy_parameters_by_name, taxonomy_code_placeholders = (
                     _provider_taxonomy_code_parameters(
@@ -8698,32 +8849,48 @@ async def list_providers(request):
                 taxonomy_join += _provider_taxonomy_lateral_join(
                     provider_npi_sql=provider_npi_sql,
                 )
+        elif npi_where and codes and len(taxonomy_filters) == 1:
+            taxonomy_parameters_by_name, taxonomy_code_placeholders = (
+                _provider_taxonomy_code_parameters(
+                    codes,
+                    "count_name_provider_taxonomy_code",
+                )
+            )
+
+        filtered_npi_cte = None
+        taxonomy_matched_npi_cte = None
+        if npi_where:
+            filtered_npi_cte = f"""
+            filtered_npi AS MATERIALIZED (
+                SELECT b.npi
+                  FROM mrf.npi AS b
+                 WHERE {npi_where}
+            )
+            """
+            if use_taxonomy_filter:
+                taxonomy_matched_npi_cte = (
+                    _provider_taxonomy_matched_npi_cte(
+                        taxonomy_conditions,
+                        code_placeholders=taxonomy_code_placeholders,
+                    )
+                )
 
         if npi_where and use_taxonomy_filter:
             query = text(
                 f"""
-                {_sql_with_prefix_ctes(phone_candidates_cte)}filtered_npi AS (
-                    SELECT DISTINCT b.npi
-                      FROM mrf.npi AS b
-                     WHERE {npi_where}
-                )
+                {_sql_with_ctes(phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte)}
                 SELECT COUNT(DISTINCT {provider_npi_sql})
-                  FROM filtered_npi AS fn
+                  FROM taxonomy_matched_npi AS fn
                   JOIN {address_table_sql} AS c
                     ON {provider_npi_sql} = fn.npi
                   {phone_candidates_join}
-                  {taxonomy_join}
                  WHERE {' AND '.join(address_clauses)}
                 """
             )
         elif npi_where:
             query = text(
                 f"""
-                {_sql_with_prefix_ctes(phone_candidates_cte)}filtered_npi AS (
-                    SELECT DISTINCT b.npi
-                      FROM mrf.npi AS b
-                     WHERE {npi_where}
-                )
+                {_sql_with_ctes(phone_candidates_cte, filtered_npi_cte)}
                 SELECT COUNT(DISTINCT {provider_npi_sql})
                   FROM filtered_npi AS fn
                   JOIN {address_table_sql} AS c
@@ -8777,6 +8944,7 @@ async def list_providers(request):
         }
         query_parameters_by_name.update(dynamic_code_parameters)
         query_parameters_by_name.update(npi_params)
+        query_parameters_by_name.update(taxonomy_parameters_by_name)
         if phone_candidates_cte:
             query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
                 limit,
@@ -8973,6 +9141,7 @@ async def list_providers(request):
                 "page": pagination.page,
                 "limit": pagination.limit,
                 "offset": pagination.offset,
+                "total_source": "computed",
                 "rows": [],
             },
             default=str,
@@ -9052,21 +9221,6 @@ async def list_providers(request):
                 }
             )
         return sitemap_results
-
-    async def get_formatted_count(response_format: str) -> dict:
-        """
-        Return mapping for special count formats (full_taxonomy/classification).
-        """
-        # The actual SQL is less important for tests; return pairs from DB.
-        formatted_count_query = text(
-            "SELECT key, value FROM (VALUES (1, 1)) AS t(key, value)"
-        )
-        async with db.acquire() as conn:
-            formatted_count_records = await conn.all(formatted_count_query)
-        return {
-            count_record[0]: count_record[1]
-            for count_record in formatted_count_records
-        }
 
     async def get_results(start, limit, filters_by_name):
         """Return one provider result page for normalized search filters."""
@@ -9206,15 +9360,39 @@ async def list_providers(request):
         )
 
         taxonomy_filter = " and ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
+        taxonomy_parameters_by_name: dict[str, str] = {}
+        taxonomy_code_placeholders: tuple[str, ...] = ()
+        if npi_where and codes and len(taxonomy_clauses) == 1:
+            taxonomy_parameters_by_name, taxonomy_code_placeholders = (
+                _provider_taxonomy_code_parameters(
+                    codes,
+                    "page_name_provider_taxonomy_code",
+                )
+            )
         filtered_npi_cte = None
+        taxonomy_matched_npi_cte = None
         if npi_where:
+            filtered_npi_projection = "b.npi"
+            if order_by == "relevance":
+                name_expression = NAME_LIKE_TEMPLATE.format(alias="b.")
+                filtered_npi_projection += (
+                    f", similarity({name_expression}, :relevance_q) "
+                    "AS relevance_score"
+                )
             filtered_npi_cte = f"""
-        filtered_npi AS (
-            SELECT DISTINCT b.npi
+        filtered_npi AS MATERIALIZED (
+            SELECT {filtered_npi_projection}
               FROM mrf.npi AS b
              WHERE {npi_where}
         )
 """
+            if use_taxonomy_filter:
+                taxonomy_matched_npi_cte = (
+                    _provider_taxonomy_matched_npi_cte(
+                        taxonomy_filter,
+                        code_placeholders=taxonomy_code_placeholders,
+                    )
+                )
 
         taxonomy_source = (
             "CROSS JOIN ("
@@ -9223,8 +9401,7 @@ async def list_providers(request):
             f"FROM mrf.nucc_taxonomy WHERE {taxonomy_filter}"
             ") AS q"
         )
-        taxonomy_parameters_by_name: dict[str, str] = {}
-        if use_location_first_taxonomy:
+        if use_location_first_taxonomy and not npi_where:
             if codes and len(taxonomy_clauses) == 1:
                 taxonomy_parameters_by_name, taxonomy_code_placeholders = (
                     _provider_taxonomy_code_parameters(
@@ -9243,10 +9420,9 @@ async def list_providers(request):
 
         if npi_where and use_taxonomy_filter:
             address_source = (
-                "filtered_npi as fn\n"
+                "taxonomy_matched_npi as fn\n"
                 f"    JOIN {address_table_sql} as c ON {provider_npi_sql} = fn.npi\n"
-                f"    {phone_candidates_join}\n"
-                f"    {taxonomy_source}"
+                f"    {phone_candidates_join}"
             )
         elif npi_where:
             address_source = (
@@ -9263,17 +9439,37 @@ async def list_providers(request):
         else:
             address_source = f"{address_table_sql} as c\n    {phone_candidates_join}"
         address_order = _primary_address_order_clause("c", address_table_sql)
-        provider_page_query = text(
-            f"""
-        {_sql_with_prefix_ctes(phone_candidates_cte, filtered_npi_cte)}page_npis AS (
+        if order_by == "relevance":
+            page_npis_sql = f"""
+            SELECT {provider_npi_sql} AS npi,
+                   MAX(fn.relevance_score) AS relevance_score
+              FROM {address_source}
+             WHERE {' and '.join(address_clauses)}
+             GROUP BY {provider_npi_sql}
+             ORDER BY relevance_score DESC, npi ASC
+             LIMIT :limit OFFSET :start
+            """
+            sub_s_relevance_projection = ", pn.relevance_score AS _search_relevance"
+            result_order_sql = (
+                "ORDER BY sub_s._search_relevance DESC, sub_s.npi_code ASC"
+            )
+        else:
+            page_npis_sql = f"""
             SELECT DISTINCT {provider_npi_sql} AS npi
               FROM {address_source}
              WHERE {' and '.join(address_clauses)}
              ORDER BY npi
              LIMIT :limit OFFSET :start
+            """
+            sub_s_relevance_projection = ""
+            result_order_sql = "ORDER BY sub_s.npi_code ASC"
+        provider_page_query = text(
+            f"""
+        {_sql_with_prefix_ctes(phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte)}page_npis AS (
+            {page_npis_sql}
         ),
         sub_s AS (
-            SELECT pn.npi AS npi_code, b.*, g.*
+            SELECT pn.npi AS npi_code, b.*, g.*{sub_s_relevance_projection}
               FROM page_npis AS pn
          LEFT JOIN mrf.npi AS b ON b.npi = pn.npi
               JOIN LATERAL (
@@ -9286,7 +9482,7 @@ async def list_providers(request):
               ) AS g ON TRUE
         )
 
-    SELECT sub_s.* FROM sub_s;
+    SELECT sub_s.* FROM sub_s {result_order_sql};
     """
         )
 
@@ -9347,6 +9543,8 @@ async def list_providers(request):
                 **dynamic_code_parameters,
                 **taxonomy_parameters_by_name,
             }
+            if order_by == "relevance":
+                query_parameters_by_name["relevance_q"] = relevance_q
             if phone_candidates_cte:
                 query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
                     limit,
@@ -9482,7 +9680,10 @@ async def list_providers(request):
             if providers_by_npi:
                 taxonomy_records = await conn.all(
                     text(
-                        "SELECT taxonomy.* FROM mrf.npi_taxonomy AS taxonomy "
+                        "SELECT taxonomy.*, nucc.display_name AS taxonomy_display "
+                        "FROM mrf.npi_taxonomy AS taxonomy "
+                        "LEFT JOIN mrf.nucc_taxonomy AS nucc ON "
+                        "nucc.code = taxonomy.healthcare_provider_taxonomy_code "
                         "WHERE taxonomy.npi = ANY(:provider_npis) "
                         "ORDER BY taxonomy.npi, taxonomy.checksum"
                     ),
@@ -9512,6 +9713,10 @@ async def list_providers(request):
                         if column.key not in ("npi", "checksum")
                         and taxonomy_mapping.get(column.key) is not None
                     }
+                    if taxonomy_mapping.get("taxonomy_display") is not None:
+                        taxonomy_by_field["display"] = taxonomy_mapping.get(
+                            "taxonomy_display"
+                        )
                     if not taxonomy_by_field:
                         continue
                     taxonomy_identity_parts = tuple(
@@ -9791,18 +9996,19 @@ async def list_providers(request):
         total = pagination.offset + len(result_rows)
         total_source = "estimated_page_floor"
     summary_map: dict[int, dict[str, Any]] = {}
-    try:
-        summary_map = await _fetch_provider_enrichment_summary_map(
-            [
-                provider_result.get("npi")
-                for provider_result in result_rows
-                if isinstance(provider_result, dict)
-            ],
-            include_chain=include_chain_enrichment,
-            session=request_session,
-        )
-    except Exception as exc:  # pragma: no cover - defensive fallback for transient DB states
-        logger.debug("Provider enrichment summary fetch failed: %s", exc)
+    if view_mode != "card":
+        try:
+            summary_map = await _fetch_provider_enrichment_summary_map(
+                [
+                    provider_result.get("npi")
+                    for provider_result in result_rows
+                    if isinstance(provider_result, dict)
+                ],
+                include_chain=include_chain_enrichment,
+                session=request_session,
+            )
+        except Exception as exc:  # pragma: no cover - defensive fallback for transient DB states
+            logger.debug("Provider enrichment summary fetch failed: %s", exc)
     if summary_map:
         for provider_result in result_rows:
             if not isinstance(provider_result, dict):
@@ -9813,7 +10019,7 @@ async def list_providers(request):
             summary = summary_map.get(int(npi_value))
             if summary:
                 provider_result["provider_enrichment_summary"] = summary
-    if include_sources or include_evidence:
+    if view_mode != "card" and (include_sources or include_evidence):
         source_detail_targets = list(result_rows)
         source_detail_targets.extend(
             location
@@ -9850,6 +10056,13 @@ async def list_providers(request):
                 location.pop("location_key", None)
             if not include_evidence:
                 location.pop("inferred_npi", None)
+
+    if view_mode == "card":
+        result_rows = [
+            _provider_card_from_mapping(provider_result)
+            for provider_result in result_rows
+            if isinstance(provider_result, Mapping)
+        ]
 
     response_map: dict[str, Any] = {
         "total": total,
@@ -10216,6 +10429,10 @@ async def get_facility_connected_providers(request):
 async def get_near_npi(request):
     """Return providers near coordinates under optional taxonomy filters."""
     request_session = _request_session(request)
+    request.args.get("view")
+    view_mode = str(request.args.get("view") or "").strip().lower()
+    if view_mode not in {"", "card"}:
+        raise sanic.exceptions.InvalidUsage("view must be: card")
     in_long, in_lat = None, None
     if request.args.get("long"):
         in_long = float(request.args.get("long"))
@@ -10678,6 +10895,10 @@ async def get_near_npi(request):
                 if column.key in row_dict:
                     taxonomy_by_field[column.key] = row_dict[column.key]
             if taxonomy_by_field and taxonomy_by_field not in provider_by_field["taxonomy_list"]:
+                if row_dict.get("taxonomy_display") is not None:
+                    taxonomy_by_field["display"] = row_dict.get(
+                        "taxonomy_display"
+                    )
                 provider_by_field["taxonomy_list"].append(taxonomy_by_field)
 
             providers_by_identity[identity] = provider_by_field
@@ -10756,6 +10977,11 @@ async def get_near_npi(request):
             provider_result.pop("_cursor_address_key", None)
             _add_canonical_contact_fields_to_address(provider_result)
     _redact_internal_address_fields(provider_results)
+    if view_mode == "card":
+        provider_results = [
+            _provider_card_from_mapping(provider_result)
+            for provider_result in provider_results
+        ]
     if pagination_requested:
         return response.json(
             {
@@ -11337,8 +11563,13 @@ async def get_npi(request, npi):
     v2_archive_table_cache = SimpleNamespace(resolved=False, table_name=None)
     v2_archive_table_lock = asyncio.Lock()
 
-    async def _is_table_available(table_name: str) -> bool:
-        value = await db.scalar("SELECT to_regclass(:table_name);", table_name=f"{db_schema}.{table_name}")
+    async def _npi_detail_table_available(table_name: str) -> bool:
+        if request_session is not None:
+            return await _is_table_available(table_name, session=request_session)
+        value = await db.scalar(
+            "SELECT to_regclass(:table_name);",
+            table_name=f"{db_schema}.{table_name}",
+        )
         return isinstance(value, str) and bool(value)
 
     async def _has_table_column(table_name: str, column_name: str) -> bool:
@@ -11374,7 +11605,7 @@ async def get_npi(request, npi):
                 preferred = os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
                 for table_name in (preferred,):
                     if (
-                        await _is_table_available(table_name)
+                        await _npi_detail_table_available(table_name)
                         and await _has_table_column(table_name, "address_key")
                         and await _has_table_column(table_name, "geo_source")
                         and await _has_address_key_functions()
@@ -11431,7 +11662,7 @@ async def get_npi(request, npi):
         if request_session is None and not hasattr(db, "first"):
             return None
         params = lookup_params_from_address(address)
-        if not params or not await _is_table_available("openaddresses_geocode"):
+        if not params or not await _npi_detail_table_available("openaddresses_geocode"):
             return None
         for query in (exact_lookup_sql(db_schema), fuzzy_lookup_sql(db_schema), relaxed_lookup_sql(db_schema)):
             if request_session is not None:

@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import json
+import re
 import types
 import asyncio
 from unittest.mock import AsyncMock
@@ -211,7 +212,9 @@ async def test_get_all_q_filter(monkeypatch):
     ]
     assert len(data_calls) == 1
     data_sql, data_params = data_calls[0]
-    assert "b.npi" in data_sql and "name_like_0" in data_params
+    assert "b.npi" in data_sql
+    assert data_params["name_like_0_0"] == "%cvs%"
+    assert data_params["name_like_0_1"] == "%pharmacy%"
     assert data_params["limit"] > 0  # limit expanded from 0
 
 
@@ -252,12 +255,10 @@ async def test_get_all_q_alias_matches_provider_name(monkeypatch):
     resp = await get_all(request)
     response_body = json.loads(resp.body)
     assert response_body["total"] == 5
-    assert "name_like_0" in conn.last_params
-    assert conn.last_params["name_like_0"] == "%ryan james pasiewicz%"
-    assert (
-        "filtered_npi AS (" in conn.last_sql
-        or "EXISTS (SELECT 1 FROM mrf.npi AS b" in conn.last_sql
-    )
+    assert conn.last_params["name_like_0_0"] == "%ryan%"
+    assert conn.last_params["name_like_0_1"] == "%james%"
+    assert conn.last_params["name_like_0_2"] == "%pasiewicz%"
+    assert "filtered_npi AS MATERIALIZED" in conn.last_sql
 
 
 @pytest.mark.asyncio
@@ -397,7 +398,7 @@ async def test_get_all_zip_taxonomy_uses_location_first_probe(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_all_name_taxonomy_uses_same_location_first_probe_as_count(monkeypatch):
+async def test_get_all_name_taxonomy_materializes_the_name_driven_taxonomy_match(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
 
@@ -413,10 +414,99 @@ async def test_get_all_name_taxonomy_uses_same_location_first_probe_as_count(mon
     await get_all(request)
 
     page_sql = conn.sql_calls[-1][0]
-    assert "filtered_npi AS" in page_sql
-    assert "JOIN LATERAL" in page_sql
-    assert "FROM mrf.npi_taxonomy AS provider_taxonomy" in page_sql
+    assert "filtered_npi AS MATERIALIZED" in page_sql
+    assert "taxonomy_matched_npi AS MATERIALIZED" in page_sql
+    assert "JOIN mrf.npi_taxonomy AS provider_taxonomy" in page_sql
+    assert "FROM mrf.nucc_taxonomy" not in page_sql
+    assert (
+        "provider_taxonomy.healthcare_provider_taxonomy_code "
+        "IN (:page_name_provider_taxonomy_code_0)"
+    ) in page_sql
+    assert conn.sql_calls[-1][1]["page_name_provider_taxonomy_code_0"] == "207Q00000X"
+    assert "AS provider_taxonomy_match ON TRUE" not in page_sql
     assert "c.taxonomy_array && q.int_codes" not in page_sql
+    assert page_sql.rstrip().endswith("ORDER BY sub_s.npi_code ASC;")
+
+
+@pytest.mark.asyncio
+async def test_get_all_name_taxonomy_count_closes_the_cte_list(monkeypatch):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    await get_all(
+        types.SimpleNamespace(
+            args={
+                "q": "clinic",
+                "codes": "207Q00000X",
+                "include_total": "true",
+                "limit": "10",
+                "start": "0",
+            }
+        )
+    )
+
+    count_sql = next(
+        sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql
+    )
+    assert "taxonomy_matched_npi AS MATERIALIZED" in count_sql
+    assert "FROM mrf.nucc_taxonomy" not in count_sql
+    assert (
+        "provider_taxonomy.healthcare_provider_taxonomy_code "
+        "IN (:count_name_provider_taxonomy_code_0)"
+    ) in count_sql
+    assert not re.search(r"\)\s*,\s*SELECT\s+COUNT", count_sql, flags=re.IGNORECASE)
+
+
+@pytest.mark.asyncio
+async def test_get_all_name_taxonomy_unified_join_matches_serving_index(monkeypatch):
+    async def fake_table_columns(table_name, *, session=None):
+        assert session is None
+        if table_name == "entity_address_unified":
+            return npi_module._public_address_serving_column_keys() | {
+                "address_precision",
+                "location_key",
+                "source_count",
+                "updated_at",
+                "zip5",
+                "phone_number",
+            }
+        return set()
+
+    conn = RecordingConnection()
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    await get_all(
+        types.SimpleNamespace(
+            args={
+                "q": "clinic",
+                "codes": "207Q00000X",
+                "include_total": "true",
+                "limit": "10",
+                "start": "0",
+            }
+        )
+    )
+
+    page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
+    count_sql = next(
+        sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql
+    )
+    expected_join = (
+        "join mrf.entity_address_unified as c "
+        "on coalesce(c.npi, c.inferred_npi) = fn.npi"
+    )
+    for query_sql in (count_sql, page_sql):
+        normalized_sql = " ".join(query_sql.lower().split())
+        assert "taxonomy_matched_npi as materialized" in normalized_sql
+        assert expected_join in normalized_sql
+        assert "as provider_taxonomy_match on true" not in normalized_sql
+
+    assert {
+        "index_elements": ("coalesce(npi, inferred_npi)",),
+        "name": "coalesced_npi",
+    } in npi_module.EntityAddressUnified.__my_additional_indexes__
 
 
 @pytest.mark.asyncio
@@ -1080,6 +1170,55 @@ def test_names_like_filter_clause_default_like_only(monkeypatch):
     assert "name_like_0_fuzzy" not in params
 
 
+def test_names_like_filter_clause_tokenizes_punctuation_as_and_terms(monkeypatch):
+    monkeypatch.setattr(npi_module, "ENABLE_TRGM_FUZZY_NAME_SEARCH", False)
+
+    clause, params = npi_module._names_like_filter_clause(
+        "d",
+        ["  Smith,   Adam  "],
+    )
+
+    assert params == {
+        "name_like_0_0": "%smith%",
+        "name_like_0_1": "%adam%",
+    }
+    assert " OR " not in clause
+    assert " AND " in clause
+    assert ":name_like_0_0" in clause
+    assert ":name_like_0_1" in clause
+
+
+@pytest.mark.asyncio
+async def test_get_all_relevance_order_is_additive_and_stably_tied_by_npi(monkeypatch):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    await get_all(
+        types.SimpleNamespace(
+            args={
+                "q": "Smith, Adam",
+                "order_by": "relevance",
+                "include_total": "false",
+                "limit": "10",
+            }
+        )
+    )
+
+    page_sql = next(
+        sql_text
+        for sql_text, _params in conn.sql_calls
+        if "page_npis AS" in sql_text
+    )
+    assert "similarity(" in page_sql
+    assert "ORDER BY relevance_score DESC, npi ASC" in page_sql
+    page_params = next(
+        params
+        for sql_text, params in conn.sql_calls
+        if "page_npis AS" in sql_text
+    )
+    assert page_params["relevance_q"] == "smith adam"
+
+
 def test_names_like_filter_clause_can_enable_trgm_fuzzy(monkeypatch):
     monkeypatch.setattr(npi_module, "ENABLE_TRGM_FUZZY_NAME_SEARCH", True)
     clause, params = npi_module._names_like_filter_clause("d", ["cvs"])
@@ -1529,6 +1668,58 @@ async def test_npi_all_returns_three_ranked_locations_with_honest_total(monkeypa
         for location in provider_match["address_list"]
     )
     _assert_ranked_location_query_contract(connection)
+
+
+@pytest.mark.asyncio
+async def test_npi_all_card_view_returns_only_compact_typeahead_fields(monkeypatch):
+    location_maps = _ranked_location_maps()[:1]
+    location_maps[0].update(
+        {
+            "provider_last_name": "Clinician",
+            "provider_credential_text": "MD",
+        }
+    )
+    taxonomy_map = {
+        "npi": 1000000007,
+        "checksum": 1,
+        "healthcare_provider_taxonomy_code": "207Q00000X",
+        "healthcare_provider_primary_taxonomy_switch": "Y",
+        "taxonomy_display": "Family Medicine",
+    }
+    connection = _MultiLocationMappedConnection(
+        location_maps,
+        taxonomy_rows=[taxonomy_map],
+    )
+    _install_multi_location_dependencies(monkeypatch, connection)
+
+    response = await get_all(
+        types.SimpleNamespace(
+            args={
+                "q": "sample",
+                "view": "card",
+                "limit": "10",
+                "include_total": "0",
+            }
+        )
+    )
+    payload = json.loads(response.body)
+
+    assert payload["rows"] == [
+        {
+            "npi": 1000000007,
+            "display_name": "Sample Clinician",
+            "entity_type": "individual",
+            "credential": "MD",
+            "primary_specialty": {
+                "taxonomy_code": "207Q00000X",
+                "display": "Family Medicine",
+            },
+            "city": "Example City",
+            "state": "UT",
+            "zip5": "84001",
+        }
+    ]
+    assert len(response.body) < 15_000
 
 
 def _fallback_location_maps():

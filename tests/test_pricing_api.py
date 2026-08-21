@@ -3,6 +3,7 @@
 import json
 import os
 import types
+import uuid
 from datetime import datetime, timedelta, timezone
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from sanic import Sanic
 from sanic.request import RequestParameters
 
 from api import ptg2_capacity_evidence as capacity_evidence
@@ -5314,7 +5316,94 @@ async def test_canonical_plan_uses_binding_market_for_broad_expansion_guard(
 
 
 @pytest.mark.asyncio
-async def test_list_providers_by_procedure_allows_taxonomy_scoped_group_plan_office_visit(monkeypatch):
+async def test_list_providers_by_procedure_rejects_statewide_taxonomy_office_visit(monkeypatch):
+    async def fail_search(*_args, **_kwargs):
+        raise AssertionError("statewide taxonomy request should fail before PTG search")
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fail_search)
+    request = make_request(
+        [],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "code": "99213",
+            "code_system": "CPT",
+            "state": "IL",
+            "city": "Chicago",
+            "include_providers": "true",
+            "classification": "Family Medicine",
+        },
+    )
+
+    with pytest.raises(
+        pricing_module.InvalidUsage,
+        match="zip5.*zip_radius_miles",
+    ) as raised:
+        await list_providers_by_procedure(request)
+
+    assert raised.value.context == {
+        "fix_it": {
+            "reason": (
+                "A statewide taxonomy search expands too many provider-rate "
+                "candidates for an interactive request."
+            ),
+            "retry_options": [
+                {
+                    "zip5": "<member ZIP>",
+                    "zip_radius_miles": 10,
+                    "note": "Retry inside a bounded ZIP radius.",
+                }
+            ],
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_statewide_taxonomy_office_visit_http_error_keeps_fix_it(monkeypatch):
+    async def fail_search(*_args, **_kwargs):
+        raise AssertionError("statewide taxonomy request should fail before PTG search")
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fail_search)
+    app = Sanic(f"pricing-statewide-taxonomy-{uuid.uuid4().hex}")
+    app.add_route(
+        list_providers_by_procedure,
+        "/pricing/providers/by-procedure",
+        methods={"GET"},
+    )
+
+    @app.on_request
+    async def inject_session(request):
+        request.ctx.sa_session = FakeSession()
+
+    _request, http_response = await app.asgi_client.get(
+        "/pricing/providers/by-procedure",
+        params={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "code": "99213",
+            "code_system": "CPT",
+            "state": "IL",
+            "city": "Chicago",
+            "include_providers": "true",
+            "classification": "Family Medicine",
+        },
+        headers={"accept": "application/json"},
+    )
+
+    assert http_response.status == 400
+    payload = http_response.json
+    assert "zip5" in payload["message"]
+    assert payload["context"]["fix_it"]["retry_options"] == [
+        {
+            "zip5": "<member ZIP>",
+            "zip_radius_miles": 10,
+            "note": "Retry inside a bounded ZIP radius.",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_providers_by_procedure_allows_zip_taxonomy_office_visit(monkeypatch):
     observed_search_argument_map = {}
 
     async def fake_search(_session, args, pagination):
@@ -5338,8 +5427,8 @@ async def test_list_providers_by_procedure_allows_taxonomy_scoped_group_plan_off
             "market_type": "group",
             "code": "99213",
             "code_system": "CPT",
-            "state": "IL",
-            "city": "Chicago",
+            "zip5": "60601",
+            "zip_radius_miles": "0",
             "include_providers": "true",
             "classification": "Family Medicine",
         },
