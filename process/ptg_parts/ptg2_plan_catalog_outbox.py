@@ -211,7 +211,7 @@ def _claimed_rows(
         raise PTG2PlanCatalogOutboxConflict(
             "PTG plan catalog outbox payload digest changed"
         )
-    created_at = datetime.datetime.now(datetime.UTC)
+    created_at = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     return (
         [
             {**plan_row, "created_at": created_at}
