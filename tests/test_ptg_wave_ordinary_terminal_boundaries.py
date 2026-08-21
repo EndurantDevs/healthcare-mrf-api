@@ -228,6 +228,36 @@ async def test_terminal_snapshot_requires_operation_and_member(
 
 
 @pytest.mark.asyncio
+async def test_terminal_snapshot_persists_projected_blank_metrics(monkeypatch):
+    terminal_state = blank_ordinary_result(monkeypatch)
+    expected_metrics_by_name = {
+        "function": "ptg_control_start",
+        **terminal_state["run"].metrics,
+    }
+    terminal_state["run"].metrics = {"function": "ptg_control_start"}
+    session = QueuedTerminalSession(
+        (
+            terminal_state["wave"],
+            terminal_state["intent"],
+            terminal_state["quarantine"],
+            terminal_state["run"],
+            terminal_state["engine_run"],
+            terminal_state["engine_snapshot"],
+        )
+    )
+
+    snapshot = await terminal_receipt._load_terminal_snapshot(
+        session,
+        terminal_state["request"],
+    )
+
+    assert snapshot["run"] is terminal_state["run"]
+    assert snapshot["run"].metrics == expected_metrics_by_name
+    assert snapshot["run"].metrics["status"] == "blank"
+    assert session.flush_count == 1
+
+
+@pytest.mark.asyncio
 async def test_terminal_snapshot_requires_the_outer_run(monkeypatch):
     terminal_state = ordinary_result(monkeypatch)
     session = QueuedTerminalSession((None,))
@@ -261,14 +291,14 @@ def test_blank_terminal_loading_boundaries(monkeypatch):
     terminal_state = blank_ordinary_result(monkeypatch)
     run = terminal_state["run"]
     run.params = []
-    assert terminal_receipt._run_with_blank_metrics(
+    assert terminal_receipt._project_blank_metrics(
         run,
         terminal_state["engine_run"],
         terminal_state["engine_snapshot"],
-    ) is run
+    ) is None
 
     run.params = terminal_state["intent"].params
-    assert terminal_receipt._run_with_blank_metrics(run, None, None) is run
+    assert terminal_receipt._project_blank_metrics(run, None, None) is None
 
     run.status = "running"
     with pytest.raises(PTGWaveOrdinaryTerminalConflict):

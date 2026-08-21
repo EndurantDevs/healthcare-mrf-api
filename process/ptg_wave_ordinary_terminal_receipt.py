@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Mapping
-from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import select, text
@@ -241,7 +240,12 @@ async def _load_terminal_snapshot(
         request=request,
         intent=intent,
     )
-    run = _run_with_blank_metrics(run, engine_run, engine_snapshot)
+    projected_metrics_by_name = _project_blank_metrics(
+        run, engine_run, engine_snapshot
+    )
+    if projected_metrics_by_name is not None:
+        run.metrics = projected_metrics_by_name  # Persist before receipt insertion.
+        await session.flush()
     return {
         "request": request,
         "wave": wave,
@@ -347,16 +351,16 @@ def _outer_engine_import_run_id(
     )
 
 
-def _run_with_blank_metrics(
+def _project_blank_metrics(
     run: Any,
     engine_run: Any,
     engine_snapshot: Any,
-) -> Any:
+) -> dict[str, Any] | None:
     if getattr(run, "status", None) != "failed":
-        return run
+        return None
     params_map = getattr(run, "params", None)
     if not isinstance(params_map, Mapping):
-        return run
+        return None
     blank_metrics = allowed_amount_blank_metrics(
         source_file_import_id=str(
             getattr(run, "source_file_import_id", None) or ""
@@ -370,16 +374,14 @@ def _run_with_blank_metrics(
         engine_snapshot=engine_snapshot,
     )
     if blank_metrics is None:
-        return run
-    run_fields_by_name = {
-        column.name: getattr(run, column.name, None)
-        for column in ImportRun.__table__.columns
-    }
-    run_fields_by_name["metrics"] = {
+        return None
+    projected_metrics_by_name = {
         **dict(getattr(run, "metrics", None) or {}),
         **blank_metrics,
     }
-    return SimpleNamespace(**run_fields_by_name)
+    if projected_metrics_by_name != getattr(run, "metrics", None):
+        return projected_metrics_by_name
+    return None
 
 
 def _verify_abandonment_signature(
