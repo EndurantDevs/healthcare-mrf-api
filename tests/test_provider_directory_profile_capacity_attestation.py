@@ -32,16 +32,12 @@ from tests.provider_directory_profile_capacity_trust_fixtures import (
 UTC = datetime.timezone.utc
 VALIDATION_TIME = datetime.datetime(2026, 7, 30, 12, 0, 2, tzinfo=UTC)
 PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
-GOLDEN_ATTESTATION_ID = (
-    "3ba5e8da6b92260f409408881770808c" "fed27e2dcac339ed395cc319826ff16b"
-)
+GOLDEN_ATTESTATION_ID = "3ba5e8da6b92260f409408881770808cfed27e2dcac339ed395cc319826ff16b"
 GOLDEN_SIGNATURE = (
     "ueH17YjzA4pl7FVWAxwf4MJ9xOeZe8s-duup60iEUGTQKenLBUtlgB1h_LQNNaV5"
     "qFoDJKbx-N0YRutXfy_wCw"
 )
-GOLDEN_CANONICAL_BODY_SHA256 = (
-    "7319f3687b82318d05c77ef2288b6c01" "9105f2d0874bbdff98c31494caff1a42"
-)
+GOLDEN_CANONICAL_BODY_SHA256 = "7319f3687b82318d05c77ef2288b6c019105f2d0874bbdff98c31494caff1a42"
 GOLDEN_SIGNING_PREFLIGHT_GUARD_SHA256 = (
     "936d1324312013cd91c1b0a1a6e5179" "b152d3a3671c65c204775f7cb4abeb4f6"
 )

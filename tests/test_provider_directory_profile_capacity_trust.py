@@ -37,12 +37,8 @@ EXECUTION_V2_FIXTURE = (
     Path(__file__).resolve().parent
     / "fixtures/provider_directory_profile_execution_v2_golden.json"
 )
-EXECUTION_V2_CANONICAL_SHA256 = (
-    "ff7f2cc9f0627d4c26300cf2653e3c7b" "fe150eaca34fb76e387e6db1b7647e65"
-)
-EXECUTION_V2_FILE_SHA256 = (
-    "1f31dddb8f3f7bd6ac622d950922cc3c" "c289397001822f8db5b7b87b3fae5fc4"
-)
+EXECUTION_V2_CANONICAL_SHA256 = "ff7f2cc9f0627d4c26300cf2653e3c7bfe150eaca34fb76e387e6db1b7647e65"
+EXECUTION_V2_FILE_SHA256 = "1f31dddb8f3f7bd6ac622d950922cc3cc289397001822f8db5b7b87b3fae5fc4"
 
 
 def _active_key(
