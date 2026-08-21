@@ -2425,6 +2425,7 @@ async def test_autocomplete_procedures_includes_match_details_when_requested(
         ),
         ("arthroscopy", {"29870", "29877", "29880", "29881", "29888", "29889"}),
         ("arthroplasty", {"27445", "27446", "27447", "27486", "27487"}),
+        ("knee arthroplasty", {"27445", "27446", "27447", "27486", "27487"}),
     ],
 )
 async def test_autocomplete_procedures_returns_complete_curated_knee_aliases(

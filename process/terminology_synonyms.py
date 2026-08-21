@@ -224,6 +224,7 @@ def _procedure_rows() -> list[dict[str, Any]]:
         ("knee surgery", "CPT", _KNEE_SURGERY_CPT_CODES, True),
         ("arthroscopy", "CPT", _ARTHROSCOPY_CPT_CODES, True),
         ("arthroplasty", "CPT", _ARTHROPLASTY_CPT_CODES, True),
+        ("knee arthroplasty", "CPT", _ARTHROPLASTY_CPT_CODES, True),
     ]
     procedure_alias_rows: list[dict[str, Any]] = []
     for synonym, system, codes, is_broad in seeds:
