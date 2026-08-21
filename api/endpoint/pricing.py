@@ -208,6 +208,7 @@ NPI_MIN = 1_000_000_000
 NPI_MAX = 9_999_999_999
 INTERNAL_CODE_SYSTEM = INTERNAL_PROCEDURE_CODE_SYSTEM
 PROCEDURE_OVERRIDE_CODE_SYSTEMS = (INTERNAL_CODE_SYSTEM, "CPT", "HCPCS", "CDT")
+_PROCEDURE_AUTOCOMPLETE_STOPWORDS = frozenset({"a", "an", "the", "of", "for", "to"})
 RX_EXTERNAL_CODE_PRIORITY = ("NDC", "RXNORM")
 MAX_CODE_EXPANSION_HOPS = max(int(os.getenv("HLTHPRT_MAX_CODE_EXPANSION_HOPS", "4")), 1)
 INT_PATTERN = re.compile(r"^-?\d+$")
@@ -2144,23 +2145,92 @@ _PROCEDURE_AUTOCOMPLETE_TERMINOLOGY_SQL = text(
 )
 
 
+_PROCEDURE_AUTOCOMPLETE_CATALOG_SQL = text(
+    f"""
+    WITH matched_source AS MATERIALIZED (
+        SELECT p.procedure_code, p.reported_code, p.service_description
+          FROM {procedure_table.fullname} AS p
+         WHERE (CAST(:year AS integer) IS NULL
+                OR p.source_year <= CAST(:year AS integer))
+           AND (lower(coalesce(nullif(p.service_description, ''),
+                               p.reported_code)) LIKE :q_like
+                OR lower(p.reported_code) LIKE :q_like
+                OR p.procedure_code::text LIKE :q_like)
+    ),
+    source AS MATERIALIZED (
+        SELECT matched.procedure_code,
+               upper(btrim(matched.reported_code)) AS service_code,
+               nullif(btrim(matched.service_description), '') AS service_desc,
+               coalesce(nullif(btrim(matched.service_description), ''),
+                        upper(btrim(matched.reported_code))) AS display_name
+          FROM matched_source AS matched
+         WHERE coalesce(btrim(matched.reported_code), '') <> ''
+           AND upper(btrim(matched.reported_code)) ~ '^[A-Z0-9]{{5}}$'
+           AND upper(btrim(matched.reported_code)) ~ '[0-9]'
+    ),
+    derived AS (
+        SELECT src.display_name, src.service_desc,
+               catalog.target_system, catalog.target_code
+          FROM source AS src
+          CROSS JOIN LATERAL (
+              VALUES
+                  (
+                      CASE
+                          WHEN src.service_code ~ '^[0-9]{{5}}$' THEN 'CPT'
+                          WHEN src.service_code ~ '^D[0-9]{{4}}$' THEN 'CDT'
+                          ELSE 'HCPCS'
+                      END::text,
+                      src.service_code::text
+                  ),
+                  ('{INTERNAL_CODE_SYSTEM}'::text, src.procedure_code::text),
+                  (
+                      'HCPCS'::text,
+                      CASE
+                          WHEN src.service_code ~ '^[0-9]{{5}}$'
+                            OR src.service_code ~ '^D[0-9]{{4}}$'
+                          THEN src.service_code::text
+                      END
+                  )
+          ) AS catalog(target_system, target_code)
+         WHERE catalog.target_code IS NOT NULL
+    )
+    SELECT target_system AS code_system, target_code AS code,
+           display_name, service_desc AS short_description,
+           'cms_physician_provider_service'::text AS source
+      FROM derived
+     WHERE (CAST(:target_system AS text) IS NULL
+            OR target_system = CAST(:target_system AS text))
+       AND (lower(display_name) LIKE :q_like
+            OR lower(target_code) LIKE :q_like)
+     ORDER BY
+        CASE
+            WHEN lower(display_name) LIKE :q_prefix THEN 0
+            WHEN lower(target_code) LIKE :q_prefix THEN 2
+            ELSE 3
+        END,
+        display_name ASC NULLS LAST, target_system ASC, target_code ASC
+     LIMIT :limit
+    """
+)
+
+
 async def _query_procedure_autocomplete_terminology(
     session,
     *,
     search_query: str,
     target_systems: tuple[str, ...] | None,
+    full_phrase_only: bool = False,
     limit: int,
 ) -> list[dict[str, Any]] | None:
-    if not await _is_terminology_available(session):
-        return None
-
     normalized_tokens = _normalize_term_key(search_query).split()
     # ponytail: Three tokens bound latency; add trigram indexes before raising this.
     search_tokens = tuple(dict.fromkeys(
-        token for token in normalized_tokens if len(token) > 1
+        token
+        for token in normalized_tokens
+        if len(token) > 1 and token not in _PROCEDURE_AUTOCOMPLETE_STOPWORDS
     ))[-3:]
     full_term = " ".join(normalized_tokens)
-    if len(normalized_tokens) < 2:
+    if len(normalized_tokens) < 2 or full_phrase_only:
         return await _query_terminology(
             session,
             domain="procedure",
@@ -2172,6 +2242,8 @@ async def _query_procedure_autocomplete_terminology(
         )
     if not search_tokens:
         return []
+    if not await _is_terminology_available(session):
+        return None
 
     terminology_result = await session.execute(
         _PROCEDURE_AUTOCOMPLETE_TERMINOLOGY_SQL,
@@ -2179,6 +2251,7 @@ async def _query_procedure_autocomplete_terminology(
             "search_terms": json.dumps((full_term, *search_tokens)),
             "full_term": full_term,
             "target_system": target_systems[0] if target_systems else None,
+            # One-token OR surfaced unrelated tear-duct matches in dev.
             "minimum_token_matches": min(2, len(search_tokens)),
             "limit": limit,
         },
@@ -2187,6 +2260,27 @@ async def _query_procedure_autocomplete_terminology(
         _terminology_item(_row_to_dict(terminology_row))
         for terminology_row in terminology_result
     ]
+
+
+async def _query_procedure_autocomplete_catalog(
+    session,
+    *,
+    search_query: str,
+    target_systems: tuple[str, ...] | None,
+    year: int | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    catalog_result = await session.execute(
+        _PROCEDURE_AUTOCOMPLETE_CATALOG_SQL,
+        {
+            "q_like": f"%{search_query}%",
+            "q_prefix": f"{search_query}%",
+            "target_system": target_systems[0] if target_systems else None,
+            "year": year,
+            "limit": limit,
+        },
+    )
+    return [_row_to_dict(catalog_row) for catalog_row in catalog_result]
 
 
 async def _resolve_provider_type_terms(
@@ -10156,89 +10250,32 @@ async def autocomplete_procedures(request):
     else:
         year_source = "none"
 
-    display_lower = func.lower(func.coalesce(code_catalog_table.c.display_name, ""))
-    short_lower = func.lower(func.coalesce(code_catalog_table.c.short_description, ""))
-    code_lower = func.lower(func.coalesce(code_catalog_table.c.code, ""))
-    q_like = f"%{search_query}%"
-    q_prefix = f"{search_query}%"
-
-    filters = [
-        func.upper(code_catalog_table.c.code_system).in_(("CPT", "HCPCS", "CDT", INTERNAL_CODE_SYSTEM)),
-        func.lower(func.coalesce(code_catalog_table.c.source, "")) == "cms_physician_provider_service",
-        or_(
-            display_lower.like(q_like),
-            short_lower.like(q_like),
-            code_lower.like(q_like),
-        ),
-    ]
-    if code_system_raw:
-        filters.append(func.upper(code_catalog_table.c.code_system) == _normalize_code_system(code_system_raw))
-    if year is not None:
-        internal_codes_for_year = select(cast(procedure_table.c.procedure_code, String)).where(
-            procedure_table.c.source_year <= year
-        )
-        external_codes_for_year = select(func.upper(procedure_table.c.reported_code)).where(
-            and_(
-                procedure_table.c.source_year <= year,
-                procedure_table.c.reported_code.isnot(None),
-                procedure_table.c.reported_code != "",
-            )
-        )
-        filters.append(
-            or_(
-                and_(
-                    func.upper(code_catalog_table.c.code_system) == INTERNAL_CODE_SYSTEM,
-                    code_catalog_table.c.code.in_(internal_codes_for_year),
-                ),
-                and_(
-                    func.upper(code_catalog_table.c.code_system).in_(("CPT", "HCPCS", "CDT")),
-                    func.upper(code_catalog_table.c.code).in_(external_codes_for_year),
-                ),
-            )
-        )
-
-    ranking = case(
-        (display_lower.like(q_prefix), 0),
-        (short_lower.like(q_prefix), 1),
-        (code_lower.like(q_prefix), 2),
-        else_=3,
-    )
     fetch_limit = 3000
-    query = (
-        select(
-            code_catalog_table.c.code_system,
-            code_catalog_table.c.code,
-            code_catalog_table.c.display_name,
-            code_catalog_table.c.short_description,
-            code_catalog_table.c.source,
-        )
-        .where(and_(*filters))
-        .order_by(
-            ranking.asc(),
-            code_catalog_table.c.display_name.asc().nullslast(),
-            code_catalog_table.c.code_system.asc(),
-            code_catalog_table.c.code.asc(),
-        )
-        .limit(fetch_limit)
-    )
     target_systems = (
         (_normalize_code_system(code_system_raw),) if code_system_raw else None
+    )
+    code_catalog_rows = await _query_procedure_autocomplete_catalog(
+        session,
+        search_query=search_query,
+        target_systems=target_systems,
+        year=year,
+        limit=fetch_limit,
     )
     terminology_rows = await _query_procedure_autocomplete_terminology(
         session,
         search_query=search_query,
         target_systems=target_systems,
+        full_phrase_only=bool(code_catalog_rows),
         limit=min(fetch_limit, 500),
     )
     if terminology_rows is None:
-        code_catalog_result_cursor = await session.execute(query)
-        code_catalog_rows = [
-            _row_to_dict(code_catalog_row)
-            for code_catalog_row in code_catalog_result_cursor
-        ]
         terminology_rows = []
-    else:
-        code_catalog_rows = []
+    elif code_catalog_rows:
+        terminology_rows = [
+            terminology_row
+            for terminology_row in terminology_rows
+            if terminology_row.get("source") != "healthporta_code_catalog"
+        ]
 
     if not dedupe_terms:
         procedure_items = []

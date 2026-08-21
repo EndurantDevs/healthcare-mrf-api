@@ -2320,7 +2320,7 @@ async def test_autocomplete_procedure_total_does_not_depend_on_page_limit(monkey
     class CandidateSession(FakeSession):
         async def execute(self, statement, *_args, **_kwargs):
             self.executions.append(((statement, *_args), _kwargs))
-            return FakeResult(rows=catalog_rows[: statement._limit_clause.value])
+            return FakeResult(rows=catalog_rows)
 
     monkeypatch.setattr(
         pricing_module,
@@ -2420,7 +2420,59 @@ async def test_autocomplete_procedures_falls_back_to_token_terminology(
     assert expected_codes <= set(returned_codes)
     assert set(returned_codes[:3]) == {"27445", "27446", "27447"}
     terminology_query.assert_awaited_once()
-    assert request.ctx.sa_session.executions == []
+    assert len(request.ctx.sa_session.executions) == 1
+    assert "matched_source AS MATERIALIZED" in str(
+        request.ctx.sa_session.executions[0][0][0]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dedupe_terms", (True, False))
+async def test_autocomplete_procedures_keeps_live_phrase_first(
+    monkeypatch,
+    dedupe_terms,
+):
+    terminology_query = AsyncMock(
+        return_value=[
+            {
+                "canonical_term": f"Stale knee match {index:03d}",
+                "target_system": "CPT",
+                "target_code": str(30000 + index),
+                "source": "healthporta_code_catalog",
+            }
+            for index in range(25)
+        ]
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_query_procedure_autocomplete_terminology",
+        terminology_query,
+    )
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "code_system": "CPT",
+                        "code": "27447",
+                        "display_name": "Replacement of the knee",
+                        "source": "cms_physician_provider_service",
+                    }
+                ]
+            )
+        ],
+        args={
+            "q": "replacement of the knee",
+            "limit": "10",
+            "dedupe_terms": str(dedupe_terms).lower(),
+        },
+    )
+
+    pricing_response = json.loads((await autocomplete_procedures(request)).body)
+
+    assert pricing_response["items"][0]["term"] == "Replacement of the knee"
+    assert pricing_response["items"][0]["codes"][0]["code"] == "27447"
+    assert terminology_query.await_args.kwargs["full_phrase_only"] is True
 
 
 @pytest.mark.asyncio
@@ -2436,6 +2488,11 @@ async def test_autocomplete_procedures_falls_back_to_token_terminology(
         (
             "find total knee replacement surgery",
             ["find total knee replacement surgery", "knee", "replacement", "surgery"],
+            2,
+        ),
+        (
+            "replacement of the knee",
+            ["replacement of the knee", "replacement", "knee"],
             2,
         ),
     ],
@@ -2475,7 +2532,7 @@ async def test_procedure_autocomplete_uses_one_setwise_multitoken_query(
     assert json.loads(parameters["search_terms"]) == expected_terms
     assert parameters["target_system"] == "CPT"
     assert parameters["minimum_token_matches"] == minimum_matches
-    assert "WITH hits AS MATERIALIZED" in str(statement)
+    assert "hits AS MATERIALIZED" in str(statement)
     assert "count(DISTINCT search_index)" in str(statement)
     assert "t.term_key LIKE 'anesthesia %'" in str(statement)
 

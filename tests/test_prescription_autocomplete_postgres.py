@@ -213,11 +213,15 @@ async def test_production_autocomplete_query_uses_trigram_index(monkeypatch):
         await connection.close()
 
 
-async def _create_procedure_terminology_relation(connection, schema, relation):
+async def _create_procedure_terminology_relation(
+    connection,
+    schema,
+    terminology_relation,
+):
     """Create the minimal split-row terminology fixture for production SQL."""
     await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
     await connection.execute(text(f"""
-        CREATE TABLE {relation} (
+        CREATE TABLE {terminology_relation} (
             domain text NOT NULL,
             term_key text NOT NULL,
             synonym text NOT NULL,
@@ -235,7 +239,7 @@ async def _create_procedure_terminology_relation(connection, schema, relation):
         )
     """))
     await connection.execute(text(f"""
-        INSERT INTO {relation}
+        INSERT INTO {terminology_relation}
             (domain, term_key, synonym, target_system, target_code,
              canonical_term, confidence)
         VALUES
@@ -245,7 +249,34 @@ async def _create_procedure_terminology_relation(connection, schema, relation):
             ('procedure', 'arthroplasty', 'Arthroplasty', 'CPT', '27447', 'Total knee replacement', 0.90),
             ('procedure', 'anesthesia for total knee joint replacement', 'Anesthesia for total knee joint replacement', 'CPT', '01402', 'Anesthesia for total knee joint replacement', 0.94),
             ('procedure', 'knee surgery', 'Knee surgery', 'CPT', '29888', 'Knee surgery', 0.90),
-            ('procedure', 'knee exam', 'Knee exam', 'CPT', '29870', 'Knee exam', 0.94)
+            ('procedure', 'knee exam', 'Knee exam', 'CPT', '29870', 'Knee exam', 0.94),
+            ('procedure', 'other arthroscopy', 'Other arthroscopy', 'CPT', 'G0289', 'Other arthroscopy', 0.95)
+    """))
+
+
+async def _create_procedure_catalog_relation(connection, procedure_relation):
+    """Create the minimal live procedure catalog fixture."""
+    await connection.execute(text(f"""
+        CREATE TABLE {procedure_relation} (
+            procedure_code bigint PRIMARY KEY,
+            service_description text,
+            reported_code text,
+            source_year integer
+        )
+    """))
+    await connection.execute(text(f"""
+        INSERT INTO {procedure_relation}
+            (procedure_code, service_description, reported_code, source_year)
+        VALUES
+            (27446, 'Replacement of knee joint on side', '27446', 2023),
+            (27447, 'Replacement of both knee joints', '27447', 2023),
+            (64721, 'Carpal tunnel release', '64721', 2023),
+            (64722, 'Carpal tunnel release revision', '64722', 2024),
+            (10289, 'Arthroscopy of the knee', 'G0289', 2023),
+            (555001, 'Dental reconstruction', 'D1234', 2023),
+            (555002, 'Infusion treatment', 'J1234', 2023),
+            (555003, NULL, '99999', 2023),
+            (555004, 'Invalid external code', 'ABCDE', 2023)
     """))
 
 
@@ -253,7 +284,8 @@ async def _create_procedure_terminology_relation(connection, schema, relation):
 async def _procedure_terminology_session(monkeypatch, dsn):
     """Yield a session bound to a disposable production-query fixture."""
     schema = f"procedure_autocomplete_{uuid.uuid4().hex}"
-    relation = f'"{schema}".terminology_synonym'
+    terminology_relation = f'"{schema}".terminology_synonym'
+    procedure_relation = f'"{schema}".pricing_procedure'
     engine = create_async_engine(
         dsn.replace("postgresql://", "postgresql+asyncpg://", 1),
         pool_size=1,
@@ -261,14 +293,36 @@ async def _procedure_terminology_session(monkeypatch, dsn):
     )
     try:
         async with engine.begin() as connection:
-            await _create_procedure_terminology_relation(connection, schema, relation)
+            await _create_procedure_terminology_relation(
+                connection,
+                schema,
+                terminology_relation,
+            )
+            await _create_procedure_catalog_relation(connection, procedure_relation)
         candidate_sql = str(
             pricing_module._PROCEDURE_AUTOCOMPLETE_TERMINOLOGY_SQL
-        ).replace(pricing_module.terminology_synonym_table.fullname, relation)
+        ).replace(
+            pricing_module.terminology_synonym_table.fullname,
+            terminology_relation,
+        ).replace(
+            pricing_module.procedure_table.fullname,
+            procedure_relation,
+        )
         monkeypatch.setattr(
             pricing_module,
             "_PROCEDURE_AUTOCOMPLETE_TERMINOLOGY_SQL",
             text(candidate_sql),
+        )
+        catalog_sql = str(
+            pricing_module._PROCEDURE_AUTOCOMPLETE_CATALOG_SQL
+        ).replace(
+            pricing_module.procedure_table.fullname,
+            procedure_relation,
+        )
+        monkeypatch.setattr(
+            pricing_module,
+            "_PROCEDURE_AUTOCOMPLETE_CATALOG_SQL",
+            text(catalog_sql),
         )
         monkeypatch.setattr(
             pricing_module,
@@ -298,6 +352,8 @@ async def test_procedure_autocomplete_setwise_token_semantics(monkeypatch):
             "knee arthroplasty",
             "total knee replacement",
             "knee surgery",
+            "replacement of the knee",
+            "carpal tunnel release",
         ):
             rows_by_query[search_query] = await query_terminology(
                 session,
@@ -319,3 +375,88 @@ async def test_procedure_autocomplete_setwise_token_semantics(monkeypatch):
         terminology_row["target_code"]
         for terminology_row in rows_by_query["knee surgery"]
     } == {"29888"}
+    stopword_codes = {
+        terminology_row["target_code"]
+        for terminology_row in rows_by_query["replacement of the knee"]
+    }
+    assert {"27446", "27447"} <= stopword_codes
+    assert "G0289" not in stopword_codes
+    assert rows_by_query["carpal tunnel release"] == []
+
+
+@pytest.mark.asyncio
+async def test_procedure_autocomplete_catalog_year_semantics(monkeypatch):
+    dsn = os.getenv("HLTHPRT_PRESCRIPTION_AUTOCOMPLETE_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("requires disposable PostgreSQL")
+
+    rows_by_year = {}
+    async with _procedure_terminology_session(monkeypatch, dsn) as session:
+        for year in (2023, 2024):
+            rows_by_year[year] = await pricing_module._query_procedure_autocomplete_catalog(
+                session,
+                search_query="carpal tunnel release",
+                target_systems=None,
+                year=year,
+                limit=50,
+            )
+
+    assert {catalog_row["code"] for catalog_row in rows_by_year[2023]} == {
+        "64721"
+    }
+    assert {catalog_row["code"] for catalog_row in rows_by_year[2024]} == {
+        "64721",
+        "64722",
+    }
+
+
+@pytest.mark.asyncio
+async def test_procedure_autocomplete_catalog_projection_semantics(monkeypatch):
+    dsn = os.getenv("HLTHPRT_PRESCRIPTION_AUTOCOMPLETE_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("requires disposable PostgreSQL")
+
+    rows_by_query = {}
+    async with _procedure_terminology_session(monkeypatch, dsn) as session:
+        for search_query, target_systems in (
+            ("d1234", None),
+            ("555002", None),
+            ("dental", ("CDT",)),
+            ("99999", None),
+            ("abcde", None),
+        ):
+            rows_by_query[search_query] = (
+                await pricing_module._query_procedure_autocomplete_catalog(
+                    session,
+                    search_query=search_query,
+                    target_systems=target_systems,
+                    year=2023,
+                    limit=50,
+                )
+            )
+
+    assert {
+        (catalog_row["code_system"], catalog_row["code"])
+        for catalog_row in rows_by_query["d1234"]
+    } == {("CDT", "D1234"), ("HCPCS", "D1234")}
+    assert [
+        (catalog_row["code_system"], catalog_row["code"])
+        for catalog_row in rows_by_query["555002"]
+    ] == [("HP_PROCEDURE_CODE", "555002")]
+    assert [
+        (catalog_row["code_system"], catalog_row["code"])
+        for catalog_row in rows_by_query["dental"]
+    ] == [("CDT", "D1234")]
+    assert {
+        (catalog_row["code_system"], catalog_row["code"])
+        for catalog_row in rows_by_query["99999"]
+    } == {
+        ("CPT", "99999"),
+        ("HCPCS", "99999"),
+        ("HP_PROCEDURE_CODE", "555003"),
+    }
+    assert {
+        catalog_row["short_description"]
+        for catalog_row in rows_by_query["99999"]
+    } == {None}
+    assert rows_by_query["abcde"] == []
