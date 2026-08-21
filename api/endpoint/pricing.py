@@ -527,35 +527,7 @@ def _coalesce_value(*values: Any) -> Any:
     return None
 
 
-def _normalize_service_payload(service_payload_by_field: dict[str, Any]) -> dict[str, Any]:
-    """
-    Keep legacy fields for compatibility, but expose physician-service-native aliases.
-    """
-    if "procedure_code" not in service_payload_by_field:
-        return service_payload_by_field
-    include_legacy = bool(service_payload_by_field.pop("__include_legacy_fields__", False))
-    procedure_code = service_payload_by_field.get("procedure_code")
-    service_name = _coalesce_value(
-        service_payload_by_field.get("service_description"),
-        service_payload_by_field.get("generic_name"),
-        service_payload_by_field.get("reported_code"),
-        service_payload_by_field.get("brand_name"),
-    )
-    reported_code = _coalesce_value(
-        service_payload_by_field.get("reported_code"),
-        service_payload_by_field.get("brand_name"),
-    )
-    reported_code_system = _reported_procedure_code_system(reported_code)
-    service_payload_by_field["service_code_system"] = INTERNAL_CODE_SYSTEM
-    service_payload_by_field["service_code"] = (
-        str(procedure_code) if procedure_code is not None else None
-    )
-    service_payload_by_field["service_name"] = service_name
-    service_payload_by_field["service_description"] = service_name
-    service_payload_by_field["reported_code"] = (
-        str(reported_code).strip().upper() if reported_code else None
-    )
-    service_payload_by_field["reported_code_system"] = reported_code_system
+def _normalize_service_totals(service_payload_by_field: dict[str, Any]) -> None:
     service_payload_by_field["total_services"] = _coalesce_value(
         service_payload_by_field.get("total_services"),
         service_payload_by_field.get("total_claims"),
@@ -588,6 +560,86 @@ def _normalize_service_payload(service_payload_by_field: dict[str, Any]) -> dict
         service_payload_by_field.get("ge65_total_allowed_amount"),
         service_payload_by_field.get("ge65_total_drug_cost"),
     )
+
+
+def _add_legacy_service_fields(service_payload_by_field: dict[str, Any]) -> None:
+    service_payload_by_field["generic_name"] = service_payload_by_field.get(
+        "service_description"
+    )
+    service_payload_by_field["brand_name"] = service_payload_by_field.get(
+        "reported_code"
+    )
+    service_payload_by_field["total_claims"] = service_payload_by_field.get(
+        "total_services"
+    )
+    service_payload_by_field["total_30day_fills"] = service_payload_by_field.get(
+        "total_beneficiary_day_services"
+    )
+    service_payload_by_field["total_day_supply"] = service_payload_by_field.get(
+        "total_submitted_charges"
+    )
+    service_payload_by_field["total_benes"] = service_payload_by_field.get(
+        "total_beneficiaries"
+    )
+    service_payload_by_field["total_drug_cost"] = service_payload_by_field.get(
+        "total_allowed_amount"
+    )
+    service_payload_by_field["ge65_total_claims"] = service_payload_by_field.get(
+        "ge65_total_services"
+    )
+    service_payload_by_field["ge65_total_benes"] = service_payload_by_field.get(
+        "ge65_total_beneficiaries"
+    )
+    service_payload_by_field["ge65_total_drug_cost"] = service_payload_by_field.get(
+        "ge65_total_allowed_amount"
+    )
+
+
+def _drop_legacy_service_fields(service_payload_by_field: dict[str, Any]) -> None:
+    for field_name in (
+        "generic_name",
+        "brand_name",
+        "total_claims",
+        "total_30day_fills",
+        "total_day_supply",
+        "total_drug_cost",
+        "total_benes",
+        "ge65_total_claims",
+        "ge65_total_benes",
+        "ge65_total_drug_cost",
+        "legacy_field_aliases",
+    ):
+        service_payload_by_field.pop(field_name, None)
+
+
+def _normalize_service_payload(service_payload_by_field: dict[str, Any]) -> dict[str, Any]:
+    """Expose service-native aliases while retaining optional legacy fields."""
+
+    if "procedure_code" not in service_payload_by_field:
+        return service_payload_by_field
+    include_legacy = bool(service_payload_by_field.pop("__include_legacy_fields__", False))
+    procedure_code = service_payload_by_field.get("procedure_code")
+    service_name = _coalesce_value(
+        service_payload_by_field.get("service_description"),
+        service_payload_by_field.get("generic_name"),
+        service_payload_by_field.get("reported_code"),
+        service_payload_by_field.get("brand_name"),
+    )
+    reported_code = _coalesce_value(
+        service_payload_by_field.get("reported_code"),
+        service_payload_by_field.get("brand_name"),
+    )
+    service_payload_by_field.update(
+        {
+            "service_code_system": INTERNAL_CODE_SYSTEM,
+            "service_code": str(procedure_code) if procedure_code is not None else None,
+            "service_name": service_name,
+            "service_description": service_name,
+            "reported_code": str(reported_code).strip().upper() if reported_code else None,
+            "reported_code_system": _reported_procedure_code_system(reported_code),
+        }
+    )
+    _normalize_service_totals(service_payload_by_field)
     service_payload_by_field["legacy_field_aliases"] = {
         "procedure_code": "service_code",
         "service_description": "service_name",
@@ -599,47 +651,9 @@ def _normalize_service_payload(service_payload_by_field: dict[str, Any]) -> dict
         "total_drug_cost": "total_allowed_amount",
     }
     if include_legacy:
-        service_payload_by_field["generic_name"] = service_payload_by_field.get(
-            "service_description"
-        )
-        service_payload_by_field["brand_name"] = service_payload_by_field.get("reported_code")
-        service_payload_by_field["total_claims"] = service_payload_by_field.get("total_services")
-        service_payload_by_field["total_30day_fills"] = service_payload_by_field.get(
-            "total_beneficiary_day_services"
-        )
-        service_payload_by_field["total_day_supply"] = service_payload_by_field.get(
-            "total_submitted_charges"
-        )
-        service_payload_by_field["total_benes"] = service_payload_by_field.get(
-            "total_beneficiaries"
-        )
-        service_payload_by_field["total_drug_cost"] = service_payload_by_field.get(
-            "total_allowed_amount"
-        )
-        service_payload_by_field["ge65_total_claims"] = service_payload_by_field.get(
-            "ge65_total_services"
-        )
-        service_payload_by_field["ge65_total_benes"] = service_payload_by_field.get(
-            "ge65_total_beneficiaries"
-        )
-        service_payload_by_field["ge65_total_drug_cost"] = service_payload_by_field.get(
-            "ge65_total_allowed_amount"
-        )
-    if not include_legacy:
-        for key in (
-            "generic_name",
-            "brand_name",
-            "total_claims",
-            "total_30day_fills",
-            "total_day_supply",
-            "total_drug_cost",
-            "total_benes",
-            "ge65_total_claims",
-            "ge65_total_benes",
-            "ge65_total_drug_cost",
-            "legacy_field_aliases",
-        ):
-            service_payload_by_field.pop(key, None)
+        _add_legacy_service_fields(service_payload_by_field)
+    else:
+        _drop_legacy_service_fields(service_payload_by_field)
     return service_payload_by_field
 
 
@@ -3940,6 +3954,89 @@ async def _resolve_procedure_override_codes(
     return set(normalized_codes)
 
 
+async def _load_provider_qpp_scores(
+    session,
+    *,
+    npi: int,
+    year: int,
+) -> tuple[float | None, float | None]:
+    try:
+        qpp_result = await session.execute(
+            text(
+                f"""
+                SELECT quality_score, cost_score
+                FROM {PRICING_SCHEMA}.{QUALITY_QPP_TABLE_NAME}
+                WHERE npi = :npi AND year = :year
+                LIMIT 1
+                """
+            ),
+            {"npi": npi, "year": year},
+        )
+        qpp_row = qpp_result.first()
+        if qpp_row is None:
+            return None, None
+        qpp_payload = _row_to_dict(qpp_row)
+        return (
+            _as_float(qpp_payload.get("quality_score")),
+            _as_float(qpp_payload.get("cost_score")),
+        )
+    except Exception:
+        return None, None
+
+
+async def _load_provider_rx_totals(
+    session,
+    *,
+    npi: int,
+    year: int,
+) -> tuple[float, float]:
+    try:
+        rx_result = await session.execute(
+            select(
+                func.coalesce(func.sum(provider_prescription_table.c.total_claims), 0.0).label("total_rx_claims"),
+                func.coalesce(func.sum(provider_prescription_table.c.total_benes), 0.0).label("total_rx_beneficiaries"),
+            ).where(
+                and_(
+                    provider_prescription_table.c.npi == npi,
+                    provider_prescription_table.c.year == year,
+                )
+            )
+        )
+        rx_row = rx_result.first()
+        if rx_row is None:
+            return 0.0, 0.0
+        rx_payload = _row_to_dict(rx_row)
+        return (
+            _as_float(rx_payload.get("total_rx_claims")) or 0.0,
+            _as_float(rx_payload.get("total_rx_beneficiaries")) or 0.0,
+        )
+    except Exception:
+        return 0.0, 0.0
+
+
+async def _load_provider_svi(session, *, zip5: str | None, year: int) -> float:
+    if not zip5:
+        return PROVIDER_QUALITY_DEFAULT_SVI
+    try:
+        svi_result = await session.execute(
+            text(
+                f"""
+                SELECT svi_overall
+                FROM {PRICING_SCHEMA}.{QUALITY_SVI_TABLE_NAME}
+                WHERE zcta = :zcta AND year = :year
+                LIMIT 1
+                """
+            ),
+            {"zcta": zip5, "year": year},
+        )
+        svi_value = _as_float(svi_result.scalar())
+        if svi_value is not None:
+            return min(1.0, max(0.0, svi_value))
+    except Exception:
+        return PROVIDER_QUALITY_DEFAULT_SVI
+    return PROVIDER_QUALITY_DEFAULT_SVI
+
+
 async def _load_provider_quality_observed(session, *, npi: int, year: int) -> dict[str, Any] | None:
     """Load observed utilization, cost, prescription, and QPP measures for a provider and year."""
     provider_result = await session.execute(
@@ -3955,76 +4052,17 @@ async def _load_provider_quality_observed(session, *, npi: int, year: int) -> di
     total_allowed_amount = _as_float(provider_payload.get("total_allowed_amount")) or 0.0
     state_key = str(provider_payload.get("state") or "").strip().upper() or None
     zip5 = str(provider_payload.get("zip5") or "").strip() or None
+    qpp_quality_score, qpp_cost_score = await _load_provider_qpp_scores(
+        session, npi=npi, year=year
+    )
+    total_rx_claims, total_rx_beneficiaries = await _load_provider_rx_totals(
+        session, npi=npi, year=year
+    )
+    svi_overall = await _load_provider_svi(session, zip5=zip5, year=year)
 
-    qpp_quality_score = None
-    qpp_cost_score = None
-    try:
-        qpp_result = await session.execute(
-            text(
-                f"""
-                SELECT quality_score, cost_score
-                FROM {PRICING_SCHEMA}.{QUALITY_QPP_TABLE_NAME}
-                WHERE npi = :npi AND year = :year
-                LIMIT 1
-                """
-            ),
-            {"npi": npi, "year": year},
-        )
-        qpp_row = qpp_result.first()
-        if qpp_row is not None:
-            qpp_payload = _row_to_dict(qpp_row)
-            qpp_quality_score = _as_float(qpp_payload.get("quality_score"))
-            qpp_cost_score = _as_float(qpp_payload.get("cost_score"))
-    except Exception:
-        qpp_quality_score = None
-        qpp_cost_score = None
-
-    total_rx_claims = 0.0
-    total_rx_beneficiaries = 0.0
-    try:
-        rx_result = await session.execute(
-            select(
-                func.coalesce(func.sum(provider_prescription_table.c.total_claims), 0.0).label("total_rx_claims"),
-                func.coalesce(func.sum(provider_prescription_table.c.total_benes), 0.0).label("total_rx_beneficiaries"),
-            ).where(
-                and_(
-                    provider_prescription_table.c.npi == npi,
-                    provider_prescription_table.c.year == year,
-                )
-            )
-        )
-        rx_row = rx_result.first()
-        if rx_row is not None:
-            rx_payload = _row_to_dict(rx_row)
-            total_rx_claims = _as_float(rx_payload.get("total_rx_claims")) or 0.0
-            total_rx_beneficiaries = _as_float(rx_payload.get("total_rx_beneficiaries")) or 0.0
-    except Exception:
-        total_rx_claims = 0.0
-        total_rx_beneficiaries = 0.0
-
-    svi_overall = PROVIDER_QUALITY_DEFAULT_SVI
-    if zip5:
-        try:
-            svi_result = await session.execute(
-                text(
-                    f"""
-                    SELECT svi_overall
-                    FROM {PRICING_SCHEMA}.{QUALITY_SVI_TABLE_NAME}
-                    WHERE zcta = :zcta AND year = :year
-                    LIMIT 1
-                    """
-                ),
-                {"zcta": zip5, "year": year},
-            )
-            svi_value = _as_float(svi_result.scalar())
-            if svi_value is not None:
-                svi_overall = min(1.0, max(0.0, svi_value))
-        except Exception:
-            svi_overall = PROVIDER_QUALITY_DEFAULT_SVI
-
-    utilization_rate = None
-    if total_beneficiaries > 0:
-        utilization_rate = total_services / total_beneficiaries
+    utilization_rate = (
+        total_services / total_beneficiaries if total_beneficiaries > 0 else None
+    )
     svi_adjustment = 1.0 + 0.2 * (svi_overall - 0.5)
     if svi_adjustment == 0:
         svi_adjustment = 1.0
@@ -4610,33 +4648,15 @@ async def _query_catalog_neighbors(session, pairs: set[tuple[str, str]]) -> set[
     return named_pairs
 
 
-async def _resolve_code_context(
+async def _expand_code_crosswalk(
     session,
-    code_system_raw: Any,
-    code_raw: Any,
-    expand_codes: bool = False,
-) -> dict[str, Any]:
-    """Resolve an input procedure code through crosswalk and optional catalog expansion rules."""
-    code_system = _normalize_code_system(code_system_raw)
-    code = _normalize_code(code_raw, "code")
-
-    # Common fast path: internal numeric code with no expansion requested.
-    if code_system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code) and not expand_codes:
-        internal_code = int(code)
-        return {
-            "input_code": {"code_system": code_system, "code": code},
-            "resolved_codes": [{"code_system": code_system, "code": code}],
-            "internal_codes": [internal_code],
-            "matched_via": [],
-            "expanded": False,
-        }
-
-    visited_code_pairs: set[tuple[str, str]] = {(code_system, code)}
-    frontier_code_pairs: set[tuple[str, str]] = {(code_system, code)}
+    initial_code_pair: tuple[str, str],
+    hops: int,
+) -> tuple[set[tuple[str, str]], list[dict[str, Any]]]:
+    visited_code_pairs = {initial_code_pair}
+    frontier_code_pairs = {initial_code_pair}
     crosswalk_matches: list[dict[str, Any]] = []
     seen_edges: set[tuple[str, str, str, str]] = set()
-
-    hops = MAX_CODE_EXPANSION_HOPS if expand_codes else 1
     for _ in range(hops):
         edges = await _query_crosswalk_edges(session, frontier_code_pairs)
         if not edges:
@@ -4665,13 +4685,43 @@ async def _resolve_code_context(
                         "source": edge.get("source"),
                     }
                 )
-            for pair in (from_pair, to_pair):
-                if pair not in visited_code_pairs:
-                    visited_code_pairs.add(pair)
-                    next_frontier_code_pairs.add(pair)
+            for code_pair in (from_pair, to_pair):
+                if code_pair not in visited_code_pairs:
+                    visited_code_pairs.add(code_pair)
+                    next_frontier_code_pairs.add(code_pair)
         frontier_code_pairs = next_frontier_code_pairs
         if not frontier_code_pairs:
             break
+    return visited_code_pairs, crosswalk_matches
+
+
+async def _resolve_code_context(
+    session,
+    code_system_raw: Any,
+    code_raw: Any,
+    expand_codes: bool = False,
+) -> dict[str, Any]:
+    """Resolve an input procedure code through crosswalk and optional catalog expansion rules."""
+    code_system = _normalize_code_system(code_system_raw)
+    code = _normalize_code(code_raw, "code")
+
+    # Common fast path: internal numeric code with no expansion requested.
+    if code_system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code) and not expand_codes:
+        internal_code = int(code)
+        return {
+            "input_code": {"code_system": code_system, "code": code},
+            "resolved_codes": [{"code_system": code_system, "code": code}],
+            "internal_codes": [internal_code],
+            "matched_via": [],
+            "expanded": False,
+        }
+
+    hops = MAX_CODE_EXPANSION_HOPS if expand_codes else 1
+    visited_code_pairs, crosswalk_matches = await _expand_code_crosswalk(
+        session,
+        (code_system, code),
+        hops,
+    )
 
     # Optional expansion by display_name peers from code catalog.
     if expand_codes:
@@ -4842,21 +4892,11 @@ def _has_representative_procedure_taxonomy_evidence(evidence_items: list[dict[st
     )
 
 
-def _classify_procedure_taxonomy_resolution(
-    *,
-    reported_code: str,
-    clinical_intent: Any,
+def _procedure_taxonomy_evidence_summary(
     evidence_items: list[dict[str, Any]],
-    allow_hard_filter: bool,
+    *,
+    is_known_young_skew: bool,
 ) -> dict[str, Any]:
-    """Classify taxonomy evidence and return recommended filters, confidence, and review flags."""
-    normalized_code = str(reported_code or "").strip().upper()
-    intent_codes, intent_source = _taxonomy_codes_for_intent(clinical_intent)
-    curated_rule = _taxonomy_rule_for_reported_code(normalized_code)
-    curated_codes = tuple(curated_rule.get("taxonomy_codes") or ()) if curated_rule else ()
-    is_em_ambiguous = normalized_code in PROCEDURE_TAXONOMY_OFFICE_EM_CODES and not intent_source
-    is_known_young_skew = normalized_code in PROCEDURE_TAXONOMY_KNOWN_YOUNG_SKEW_CODES
-
     evidence_totals_by_metric = {
         "distinct_npis": sum(
             evidence_item.get("distinct_npis") or 0
@@ -4871,9 +4911,9 @@ def _classify_procedure_taxonomy_resolution(
             for evidence_item in evidence_items
         ),
     }
+    total_npis = max(float(evidence_totals_by_metric["distinct_npis"]), 1.0)
+    total_services = max(float(evidence_totals_by_metric["total_services"]), 1.0)
     for evidence_item in evidence_items:
-        total_npis = max(float(evidence_totals_by_metric["distinct_npis"]), 1.0)
-        total_services = max(float(evidence_totals_by_metric["total_services"]), 1.0)
         evidence_item["distinct_npi_share"] = round(
             float(evidence_item.get("distinct_npis") or 0) / total_npis,
             6,
@@ -4883,8 +4923,12 @@ def _classify_procedure_taxonomy_resolution(
             6,
         )
 
-    top_item = evidence_items[0] if evidence_items else None
-    top_npi_share = _as_float(top_item.get("distinct_npi_share")) if top_item else 0.0
+    top_evidence_item = evidence_items[0] if evidence_items else None
+    top_npi_share = (
+        _as_float(top_evidence_item.get("distinct_npi_share"))
+        if top_evidence_item
+        else 0.0
+    )
     is_representative = (
         evidence_totals_by_metric["distinct_npis"] >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_NPIS
         and evidence_totals_by_metric["total_beneficiaries"]
@@ -4899,72 +4943,116 @@ def _classify_procedure_taxonomy_resolution(
         confidence = "low"
     else:
         confidence = "none"
+    return {
+        "totals": evidence_totals_by_metric,
+        "top_item": top_evidence_item,
+        "confidence": confidence,
+        "is_representative": is_representative,
+    }
 
+
+def _procedure_taxonomy_recommended_mode(
+    *,
+    recommended_codes: list[str],
+    needs_intent: bool,
+    safe_for_hard_filter: bool,
+    allow_hard_filter: bool,
+) -> tuple[str, str]:
+    hard_filter_allowed = (
+        allow_hard_filter or not PROCEDURE_TAXONOMY_HARD_FILTER_REQUIRES_ALLOW
+    )
+    if needs_intent:
+        return "ambiguous", "ambiguous"
+    if not recommended_codes:
+        return "insufficient_evidence", "validate_only"
+    if safe_for_hard_filter and hard_filter_allowed:
+        return "resolved", "hard_filter"
+    return "resolved", "soft_boost"
+
+
+def _procedure_taxonomy_filter_payloads(
+    recommended_codes: list[str],
+    recommended_mode: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not recommended_codes:
+        return None, None
+    taxonomy_filter_parameter_map = {
+        "taxonomy_codes": recommended_codes,
+        "include_subspecialties": False,
+        "primary_only": False,
+    }
+    if recommended_mode == "hard_filter":
+        return taxonomy_filter_parameter_map, None
+    return None, taxonomy_filter_parameter_map
+
+
+def _procedure_taxonomy_conflicts(
+    intent_codes: tuple[str, ...],
+    curated_codes: tuple[str, ...],
+    recommended_codes: list[str],
+    top_evidence_item: dict[str, Any] | None,
+) -> tuple[bool, list[str]]:
+    conflict_reasons: list[str] = []
+    if intent_codes and curated_codes and set(intent_codes).isdisjoint(set(curated_codes)):
+        conflict_reasons.append("intent_conflicts_with_curated_code_range")
+    if (
+        recommended_codes
+        and top_evidence_item
+        and top_evidence_item.get("taxonomy_code") not in recommended_codes
+    ):
+        top_share = _as_float(top_evidence_item.get("distinct_npi_share")) or 0.0
+        if top_share >= PROCEDURE_TAXONOMY_MEDIUM_NPI_SHARE:
+            conflict_reasons.append(
+                "utilization_top_taxonomy_conflicts_with_selected_taxonomy"
+            )
+    return bool(conflict_reasons), conflict_reasons
+
+
+def _procedure_taxonomy_selection(
+    intent_codes: tuple[str, ...],
+    intent_source: str | None,
+    curated_codes: tuple[str, ...],
+    curated_rule: dict[str, Any] | None,
+    evidence_summary_by_field: dict[str, Any],
+    is_em_ambiguous: bool,
+    allow_hard_filter: bool,
+) -> dict[str, Any]:
+    top_evidence_item = evidence_summary_by_field["top_item"]
     recommended_codes = _dedupe_taxonomy_codes(intent_codes, curated_codes)
     taxonomy_source = intent_source or (curated_rule or {}).get("source")
-    if not recommended_codes and top_item and top_item.get("taxonomy_code"):
-        recommended_codes = [str(top_item["taxonomy_code"])]
+    if not recommended_codes and top_evidence_item and top_evidence_item.get("taxonomy_code"):
+        recommended_codes = [str(top_evidence_item["taxonomy_code"])]
         taxonomy_source = "medicare_provider_taxonomy_evidence"
 
     needs_intent = bool(is_em_ambiguous)
-    needs_review = False
-    conflict_reasons: list[str] = []
-    if intent_codes and curated_codes and set(intent_codes).isdisjoint(set(curated_codes)):
-        needs_review = True
-        conflict_reasons.append("intent_conflicts_with_curated_code_range")
-    if recommended_codes and top_item and top_item.get("taxonomy_code") not in recommended_codes:
-        top_share = _as_float(top_item.get("distinct_npi_share")) or 0.0
-        if top_share >= PROCEDURE_TAXONOMY_MEDIUM_NPI_SHARE:
-            needs_review = True
-            conflict_reasons.append("utilization_top_taxonomy_conflicts_with_selected_taxonomy")
-
-    bias_notes = [
-        "cms_physician_other_practitioners_is_medicare_fee_for_service_only",
-        "cells_suppressed_by_cms_are_absent_from_the_aggregate",
-    ]
-    if is_known_young_skew:
-        bias_notes.append("procedure_is_known_to_skew_younger_than_medicare_ffs")
-    if not is_representative:
-        bias_notes.append("representativeness_gate_failed")
+    needs_review, conflict_reasons = _procedure_taxonomy_conflicts(
+        intent_codes,
+        curated_codes,
+        recommended_codes,
+        top_evidence_item,
+    )
 
     safe_for_hard_filter = (
         bool(recommended_codes)
         and not needs_intent
         and not needs_review
-        and confidence == "high"
-        and is_representative
+        and evidence_summary_by_field["confidence"] == "high"
+        and evidence_summary_by_field["is_representative"]
     )
-    hard_filter_allowed_by_request = allow_hard_filter or not PROCEDURE_TAXONOMY_HARD_FILTER_REQUIRES_ALLOW
-    if needs_intent:
-        status = "ambiguous"
-        recommended_mode = "ambiguous"
-    elif not recommended_codes:
-        status = "insufficient_evidence"
-        recommended_mode = "validate_only"
-    elif safe_for_hard_filter and hard_filter_allowed_by_request:
-        status = "resolved"
-        recommended_mode = "hard_filter"
-    else:
-        status = "resolved"
-        recommended_mode = "soft_boost"
-
-    filter_payload = None
-    boost_payload = None
-    if recommended_codes:
-        taxonomy_filter_parameter_map = {
-            "taxonomy_codes": recommended_codes,
-            "include_subspecialties": False,
-            "primary_only": False,
-        }
-        if recommended_mode == "hard_filter":
-            filter_payload = taxonomy_filter_parameter_map
-        else:
-            boost_payload = taxonomy_filter_parameter_map
-
+    status, recommended_mode = _procedure_taxonomy_recommended_mode(
+        recommended_codes=recommended_codes,
+        needs_intent=needs_intent,
+        safe_for_hard_filter=safe_for_hard_filter,
+        allow_hard_filter=allow_hard_filter,
+    )
+    filter_payload, boost_payload = _procedure_taxonomy_filter_payloads(
+        recommended_codes,
+        recommended_mode,
+    )
     return {
         "status": status,
         "recommended_mode": recommended_mode,
-        "confidence": confidence,
+        "confidence": evidence_summary_by_field["confidence"],
         "needs_intent": needs_intent,
         "needs_review": needs_review,
         "safe_for_hard_filter": safe_for_hard_filter,
@@ -4973,8 +5061,50 @@ def _classify_procedure_taxonomy_resolution(
         "provider_filter": filter_payload,
         "provider_boost": boost_payload,
         "conflict_reasons": conflict_reasons,
+    }
+
+
+def _classify_procedure_taxonomy_resolution(
+    *,
+    reported_code: str,
+    clinical_intent: Any,
+    evidence_items: list[dict[str, Any]],
+    allow_hard_filter: bool,
+) -> dict[str, Any]:
+    """Classify taxonomy evidence and return filters and review flags."""
+    normalized_code = str(reported_code or "").strip().upper()
+    intent_codes, intent_source = _taxonomy_codes_for_intent(clinical_intent)
+    curated_rule = _taxonomy_rule_for_reported_code(normalized_code)
+    curated_codes = tuple(curated_rule.get("taxonomy_codes") or ()) if curated_rule else ()
+    is_em_ambiguous = normalized_code in PROCEDURE_TAXONOMY_OFFICE_EM_CODES and not intent_source
+    is_known_young_skew = normalized_code in PROCEDURE_TAXONOMY_KNOWN_YOUNG_SKEW_CODES
+    evidence_summary_by_field = _procedure_taxonomy_evidence_summary(
+        evidence_items,
+        is_known_young_skew=is_known_young_skew,
+    )
+    selection_by_field = _procedure_taxonomy_selection(
+        intent_codes,
+        intent_source,
+        curated_codes,
+        curated_rule,
+        evidence_summary_by_field,
+        is_em_ambiguous,
+        allow_hard_filter,
+    )
+    bias_notes = [
+        "cms_physician_other_practitioners_is_medicare_fee_for_service_only",
+        "cells_suppressed_by_cms_are_absent_from_the_aggregate",
+    ]
+    if is_known_young_skew:
+        bias_notes.append("procedure_is_known_to_skew_younger_than_medicare_ffs")
+    if not evidence_summary_by_field["is_representative"]:
+        bias_notes.append("representativeness_gate_failed")
+    evidence_totals_by_metric = evidence_summary_by_field["totals"]
+
+    return {
+        **selection_by_field,
         "representativeness": {
-            "passed": is_representative,
+            "passed": evidence_summary_by_field["is_representative"],
             "distinct_npis": evidence_totals_by_metric["distinct_npis"],
             "total_services": evidence_totals_by_metric["total_services"],
             "total_beneficiaries": evidence_totals_by_metric["total_beneficiaries"],
@@ -5283,6 +5413,40 @@ async def _load_quality_procedure_taxonomy_evidence(
     return [_taxonomy_evidence_item(_row_to_dict(query_row)) for query_row in query_result]
 
 
+def _resolved_rx_crosswalk_matches(
+    crosswalk_rows: list[dict[str, Any]],
+    *,
+    expand_codes: bool,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    resolved_codes: list[str] = []
+    crosswalk_matches: list[dict[str, Any]] = []
+    for crosswalk_row in crosswalk_rows:
+        from_system = str(crosswalk_row.get("from_system") or "").upper()
+        to_system = str(crosswalk_row.get("to_system") or "").upper()
+        from_code = str(crosswalk_row.get("from_code") or "").upper()
+        to_code = str(crosswalk_row.get("to_code") or "").upper()
+        resolved_code = None
+        if to_system == INTERNAL_RX_CODE_SYSTEM:
+            resolved_code = to_code
+        elif expand_codes and from_system == INTERNAL_RX_CODE_SYSTEM:
+            resolved_code = from_code
+        if resolved_code is None:
+            continue
+        resolved_codes.append(resolved_code)
+        crosswalk_matches.append(
+            {
+                "from_system": from_system,
+                "from_code": from_code,
+                "to_system": to_system,
+                "to_code": to_code,
+                "match_type": crosswalk_row.get("match_type"),
+                "confidence": crosswalk_row.get("confidence"),
+                "source": crosswalk_row.get("source"),
+            }
+        )
+    return resolved_codes, crosswalk_matches
+
+
 async def _resolve_internal_rx_codes_for_request(
     session,
     rx_code_value: Any,
@@ -5325,40 +5489,10 @@ async def _resolve_internal_rx_codes_for_request(
         _row_to_dict(crosswalk_row)
         for crosswalk_row in crosswalk_result
     ]
-    resolved_codes: list[str] = []
-    crosswalk_matches: list[dict[str, Any]] = []
-
-    for crosswalk_row in crosswalk_rows:
-        from_system = str(crosswalk_row.get("from_system") or "").upper()
-        to_system = str(crosswalk_row.get("to_system") or "").upper()
-        from_code = str(crosswalk_row.get("from_code") or "").upper()
-        to_code = str(crosswalk_row.get("to_code") or "").upper()
-        if to_system == INTERNAL_RX_CODE_SYSTEM:
-            resolved_codes.append(to_code)
-            crosswalk_matches.append(
-                {
-                    "from_system": from_system,
-                    "from_code": from_code,
-                    "to_system": to_system,
-                    "to_code": to_code,
-                    "match_type": crosswalk_row.get("match_type"),
-                    "confidence": crosswalk_row.get("confidence"),
-                    "source": crosswalk_row.get("source"),
-                }
-            )
-        elif expand_codes and from_system == INTERNAL_RX_CODE_SYSTEM:
-            resolved_codes.append(from_code)
-            crosswalk_matches.append(
-                {
-                    "from_system": from_system,
-                    "from_code": from_code,
-                    "to_system": to_system,
-                    "to_code": to_code,
-                    "match_type": crosswalk_row.get("match_type"),
-                    "confidence": crosswalk_row.get("confidence"),
-                    "source": crosswalk_row.get("source"),
-                }
-            )
+    resolved_codes, crosswalk_matches = _resolved_rx_crosswalk_matches(
+        crosswalk_rows,
+        expand_codes=expand_codes,
+    )
 
     unique_codes = sorted({code_item for code_item in resolved_codes if code_item})
     if not unique_codes:
@@ -9566,36 +9700,14 @@ async def get_physician_service_estimated_cost_level(request, npi: str, code_sys
     )
 
 
-async def _provider_procedure_locations(
-    request,
-    npi: str,
-    code_value: str,
-    *,
-    default_code_system: str = INTERNAL_CODE_SYSTEM,
-):
-    """Build the provider procedure location list response for a service code."""
-    session = _get_session(request)
-    args = request.args
-
-    provider_npi = _parse_int(npi, "npi", minimum=1)
-    if provider_npi is None:
-        raise InvalidUsage("Path parameter 'npi' must be provided")
-
-    pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
-    year = _parse_int(args.get("year"), "year", minimum=2013)
-    state = str(args.get("state", "")).strip().upper()
-    city = str(args.get("city", "")).strip().lower()
-    zip5 = str(args.get("zip5", "")).strip()
-    include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
-
-    year, year_source = await _resolve_year(session, location_table, year)
-    internal_codes, code_context = await _resolve_internal_codes_for_request(
-        session,
-        code_value,
-        args,
-        default_system=default_code_system,
-    )
-
+def _provider_procedure_location_filters(
+    provider_npi: int,
+    internal_codes: list[int],
+    year: int,
+    state: str,
+    city: str,
+    zip5: str,
+) -> list[Any]:
     filters = [
         location_table.c.npi == provider_npi,
         location_table.c.procedure_code.in_(internal_codes),
@@ -9607,7 +9719,16 @@ async def _provider_procedure_locations(
         filters.append(func.lower(location_table.c.city).like(f"%{city}%"))
     if zip5:
         filters.append(location_table.c.zip5 == zip5)
+    return filters
 
+
+async def _query_provider_procedure_location_page(
+    session,
+    args,
+    pagination,
+    filters: list[Any],
+    include_legacy_fields: bool,
+) -> dict[str, Any]:
     where_clause = and_(*filters)
     total = int(
         (await session.execute(select(func.count()).select_from(location_table).where(where_clause))).scalar()
@@ -9640,33 +9761,91 @@ async def _provider_procedure_locations(
         )
         for location_row in location_query_result
     ]
+    return {
+        "items": location_entries,
+        "total": total,
+        "order_by": order_by,
+        "order": order,
+    }
 
-    return response.json(
-        {
-            "items": location_entries,
-            "pagination": {
-                "total": total,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": pagination.page,
-            },
-            "query": {
-                "npi": provider_npi,
-                "year": year,
-                "year_used": year,
-                "year_source": year_source,
-                "state": state or None,
-                "city": city or None,
-                "zip5": zip5 or None,
-                "include_legacy_fields": include_legacy_fields,
-                "order_by": order_by,
-                "order": order,
-                "input_code": code_context["input_code"],
-                "resolved_codes": code_context["resolved_codes"],
-                "matched_via": code_context["matched_via"],
-            },
-        }
+
+def _provider_procedure_location_document(
+    page_by_field: dict[str, Any],
+    pagination,
+    query_by_field: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "items": page_by_field["items"],
+        "pagination": {
+            "total": page_by_field["total"],
+            "limit": pagination.limit,
+            "offset": pagination.offset,
+            "page": pagination.page,
+        },
+        "query": query_by_field,
+    }
+
+
+async def _provider_procedure_locations(
+    request,
+    npi: str,
+    code_value: str,
+    *,
+    default_code_system: str = INTERNAL_CODE_SYSTEM,
+):
+    """Build the provider procedure location list response for a service code."""
+    session = _get_session(request)
+    args = request.args
+    provider_npi = _parse_int(npi, "npi", minimum=1)
+    if provider_npi is None:
+        raise InvalidUsage("Path parameter 'npi' must be provided")
+
+    pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
+    year = _parse_int(args.get("year"), "year", minimum=2013)
+    state = str(args.get("state", "")).strip().upper()
+    city = str(args.get("city", "")).strip().lower()
+    zip5 = str(args.get("zip5", "")).strip()
+    include_legacy_fields = _parse_bool(
+        args.get("include_legacy_fields"),
+        "include_legacy_fields",
+        default=False,
     )
+    year, year_source = await _resolve_year(session, location_table, year)
+    internal_codes, code_context = await _resolve_internal_codes_for_request(
+        session, code_value, args, default_system=default_code_system
+    )
+    filters = _provider_procedure_location_filters(
+        provider_npi, internal_codes, year, state, city, zip5
+    )
+    page_by_field = await _query_provider_procedure_location_page(
+        session,
+        args,
+        pagination,
+        filters,
+        include_legacy_fields,
+    )
+    query_by_field = {
+        "npi": provider_npi,
+        "year": year,
+        "year_used": year,
+        "year_source": year_source,
+        "state": state or None,
+        "city": city or None,
+        "zip5": zip5 or None,
+        "include_legacy_fields": include_legacy_fields,
+        "order_by": page_by_field["order_by"],
+        "order": page_by_field["order"],
+        "input_code": code_context["input_code"],
+        "resolved_codes": code_context["resolved_codes"],
+        "matched_via": code_context["matched_via"],
+    }
+
+    response_document = _provider_procedure_location_document(
+        page_by_field,
+        pagination,
+        query_by_field,
+    )
+    return response.json(response_document)
 
 
 @blueprint.get("/providers/<npi>/procedures/<procedure_code>/locations", name="pricing.providers.procedures.locations.list")
