@@ -244,8 +244,7 @@ async def _load_terminal_snapshot(
         run, engine_run, engine_snapshot
     )
     if projected_metrics_by_name is not None:
-        # Persist before receipt insertion so synchronized mirrors see blank metrics.
-        run.metrics = projected_metrics_by_name
+        run.metrics = projected_metrics_by_name  # Persist before receipt insertion.
         await session.flush()
     return {
         "request": request,
