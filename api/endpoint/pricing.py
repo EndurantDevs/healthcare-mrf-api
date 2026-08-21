@@ -10181,11 +10181,9 @@ async def autocomplete_procedures(request):
                     "internal_codes": set(),
                     "sources": set(),
                     "_seen_codes": set(),
-                    "_rank": 0,
                     "matches": [],
                 }
                 procedure_items_by_term[term_key] = current_procedure_item_by_field
-            current_procedure_item_by_field["_rank"] = min(current_procedure_item_by_field["_rank"], 0)
             if term_row.get("source"):
                 current_procedure_item_by_field["sources"].add(str(term_row["source"]))
             if len(current_procedure_item_by_field.setdefault("matches", [])) < 5:
@@ -10216,15 +10214,6 @@ async def autocomplete_procedures(request):
             term_key = term.lower()
             code_system = str(code_catalog_row.get("code_system") or "").upper()
             code_value = str(code_catalog_row.get("code") or "").upper()
-            row_rank = 3
-            if term_key.startswith(search_query):
-                row_rank = 0
-            elif str(code_catalog_row.get("short_description") or "").strip().lower().startswith(
-                search_query
-            ):
-                row_rank = 1
-            elif code_value.lower().startswith(search_query):
-                row_rank = 2
 
             current_procedure_item_by_field = procedure_items_by_term.get(term_key)
             if current_procedure_item_by_field is None:
@@ -10235,15 +10224,10 @@ async def autocomplete_procedures(request):
                     "internal_codes": set(),
                     "sources": set(),
                     "_seen_codes": set(),
-                    "_rank": row_rank,
                     "matches": [],
                 }
                 procedure_items_by_term[term_key] = current_procedure_item_by_field
 
-            current_procedure_item_by_field["_rank"] = min(
-                current_procedure_item_by_field["_rank"],
-                row_rank,
-            )
             if code_catalog_row.get("source"):
                 current_procedure_item_by_field["sources"].add(str(code_catalog_row["source"]))
             if code_system:
@@ -10285,20 +10269,11 @@ async def autocomplete_procedures(request):
                         if include_matches
                         else {}
                     ),
-                    "_rank": procedure_item_by_field["_rank"],
                 }
             )
 
-        ordered_items.sort(
-            key=lambda procedure_item_by_field: (
-                procedure_item_by_field["_rank"],
-                procedure_item_by_field["term"].lower(),
-            )
-        )
         total = len(ordered_items)
         page_items = ordered_items[pagination.offset: pagination.offset + pagination.limit]
-        for procedure_item_by_field in page_items:
-            procedure_item_by_field.pop("_rank", None)
 
     return response.json(
         {
