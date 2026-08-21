@@ -414,11 +414,40 @@ def test_source_index_counts_inline_mixed_tin_and_valid_npi_group(tmp_path):
         )
 
 
-def test_source_index_does_not_publish_or_quarantine_zero_npi(tmp_path):
+def test_source_index_accepts_exact_string_npis(tmp_path):
     payload = _source_document(references_before=True, duplicate_price=False)
-    payload["provider_references"][0]["provider_groups"] = [{"npi": [0]}]
+    payload["provider_references"][0]["provider_groups"][0]["npi"] = [
+        str(value) for value in NPIS[:2]
+    ]
+    payload["in_network"][1]["negotiated_rates"][0]["provider_groups"][0][
+        "npi"
+    ] = [str(NPIS[2])]
     source_path = _write_source_fixture(
-        tmp_path / "zero-npi.json",
+        tmp_path / "string-npis.json",
+        references_before=True,
+        gzip_encoded=False,
+        source_document=payload,
+    )
+
+    with _open_source_index(tmp_path, source_path) as index:
+        assert index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0]))
+        assert index.expected_tuples(audit.QueryKey("HCPCS", "A1234", NPIS[2]))
+        assert index.metrics.get("invalid_provider_npis", 0) == 0
+        assert index.metrics.get("invalid_inline_npis", 0) == 0
+        assert index.metrics.get("invalid_field_types", 0) == 0
+
+
+@pytest.mark.parametrize("zero_marker", [0, "0"], ids=["number", "string"])
+def test_source_index_does_not_publish_or_quarantine_zero_npi(
+    tmp_path,
+    zero_marker,
+):
+    payload = _source_document(references_before=True, duplicate_price=False)
+    payload["provider_references"][0]["provider_groups"] = [
+        {"npi": [zero_marker]}
+    ]
+    source_path = _write_source_fixture(
+        tmp_path / f"zero-npi-{type(zero_marker).__name__}.json",
         references_before=True,
         gzip_encoded=False,
         source_document=payload,
@@ -436,8 +465,8 @@ def test_source_index_does_not_publish_or_quarantine_zero_npi(tmp_path):
 @pytest.mark.parametrize("provider_form", ["referenced", "inline"])
 @pytest.mark.parametrize(
     "npi_values",
-    [[0, NPIS[0]], [NPIS[0], 0], [0, 0]],
-    ids=["zero-first", "zero-last", "zero-repeated"],
+    [[0, NPIS[0]], [NPIS[0], 0], [0, 0], ["0", str(NPIS[0])]],
+    ids=["zero-first", "zero-last", "zero-repeated", "string-zero-first"],
 )
 def test_source_index_rejects_non_singleton_zero_npi_marker(
     tmp_path,
@@ -491,6 +520,24 @@ def test_source_index_quarantines_malformed_integer_but_keeps_valid_npi(tmp_path
         assert quarantine["entries"] == [
             {"value": "123456789", "occurrence_count": 1}
         ]
+
+
+@pytest.mark.parametrize(
+    "raw_npi",
+    [
+        " 1111111111",
+        "1111111111 ",
+        "0111111111",
+        "+1111111111",
+        "1e9",
+        "1111111111.0",
+        "111111111",
+        "11111111111",
+        "１１１１１１１１１１",
+    ],
+)
+def test_source_npi_rejects_noncanonical_strings(raw_npi):
+    assert audit.strict_source_npi("string", raw_npi) is None
 
 
 def test_source_index_does_not_mask_complementary_incomplete_rates(tmp_path):

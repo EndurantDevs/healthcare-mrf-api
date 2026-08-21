@@ -445,7 +445,7 @@ fn run_compact_v4(source: &Path, output: &Path) -> Output {
 fn compact_cli_active_byte_engine_emits_paired_tax_identity_sidecars() {
     let temporary = tempfile::tempdir().expect("temporary fixture root");
     let provider_references = r#""provider_references":[
-      {"provider_group_id":7,"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1000000491]}]},
+      {"provider_group_id":7,"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":["1000000491"]}]},
       {"provider_group_id":8,"provider_groups":[{"tin":{"type":"npi","value":"2999999990"},"npi":[2999999990]}]}
     ]"#;
     let in_network = r#""in_network":[{

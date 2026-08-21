@@ -103,6 +103,11 @@ def test_candidate_evidence_covers_inline_provider_guards():
         None,
     )[0] == 1_234_567_890
 
+    assert evidence._npi_at_source_coordinate(
+        [{"npi": ["1234567890"]}],
+        coordinate_by_field,
+    ) == 1_234_567_890
+
 def test_candidate_evidence_covers_referenced_provider_guards():
     occurrence_witness = _occurrence_record()
     raw_rate = json.loads(occurrence_witness.raw_json)
@@ -203,6 +208,13 @@ def test_candidate_evidence_rejects_invalid_provider_witness_shapes():
             {"provider_group_id": 1, "provider_groups": [{"npi": [True]}]},
             "source_provider_npi_invalid",
         ),
+        (
+            {
+                "provider_group_id": 1,
+                "provider_groups": [{"npi": [" 1234567890"]}],
+            },
+            "source_provider_npi_invalid",
+        ),
     )
     for raw_provider, reason in malformed_providers:
         raw_json = json.dumps(raw_provider, separators=(",", ":")).encode()
@@ -210,6 +222,20 @@ def test_candidate_evidence_rejects_invalid_provider_witness_shapes():
             evidence.validate_provider_witness(
                 replace(_provider_record(), raw_json=raw_json)
             )
+
+    canonical_string_provider_by_field = {
+        "provider_group_id": 1,
+        "provider_groups": [{"npi": ["1234567890", "0"]}],
+    }
+    evidence.validate_provider_witness(
+        replace(
+            _provider_record(),
+            raw_json=json.dumps(
+                canonical_string_provider_by_field,
+                separators=(",", ":"),
+            ).encode(),
+        )
+    )
 
 def test_candidate_evidence_tuple_matching_fail_closed_paths():
     challenge = evidence.source_challenge(_occurrence_record())

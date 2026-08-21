@@ -59,7 +59,7 @@ def _linked_provider(index: int = 0) -> bytes:
             "network_name": ["Provider Network"],
             "provider_groups": [
                 {"npi": [2_234_567_890]},
-                {"npi": [3_234_567_890, 1_234_567_890 + index]},
+                {"npi": [3_234_567_890, str(1_234_567_890 + index)]},
             ],
         },
         separators=(",", ":"),

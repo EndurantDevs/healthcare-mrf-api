@@ -49,7 +49,7 @@ use ptg2_scanner::normalize::{
     canonical_modifier_list, canonical_text_list, compare_canonical_decimal_text,
     normalize_catalog_code, normalize_code, normalize_code_system, normalize_string,
     normalize_tin_type, normalize_tin_value, strict_integer_text, strict_money_number,
-    strict_money_number_from_reader, strict_npi_list, strict_npi_partition,
+    strict_money_number_from_reader, strict_npi_integer, strict_npi_list, strict_npi_partition,
     strict_npi_partition_allow_empty_tin_only, strict_string_array_from_reader, StrictNpiList,
 };
 use ptg2_scanner::output::{emit_json_record, emit_object};
@@ -6543,7 +6543,8 @@ fn npi_source_coordinate(groups: &[Value], selected_npi: i64) -> Option<(usize, 
     for (group_ordinal, group) in groups.iter().enumerate() {
         let npi_values = group.get("npi")?.as_array()?;
         for (npi_ordinal, raw_npi) in npi_values.iter().enumerate() {
-            if raw_npi.as_i64() == Some(selected_npi) {
+            if strict_npi_integer(raw_npi, "provider group npi element").ok() == Some(selected_npi)
+            {
                 return Some((group_ordinal, npi_ordinal));
             }
         }
@@ -28173,7 +28174,7 @@ mod tests {
 
         for invalid_npi in [
             json!(1234567890_i64),
-            json!(["1234567890"]),
+            json!([" 1234567890"]),
             json!([true]),
             json!([{}]),
             json!([[]]),
@@ -28185,6 +28186,31 @@ mod tests {
             let error = provider_ref_definition(&provider_ref).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
+    }
+
+    #[test]
+    fn provider_definition_accepts_exact_string_npis() {
+        let numeric = valid_provider_reference();
+        let mut string = numeric.clone();
+        string["provider_groups"][0]["npi"] = json!(["1234567890"]);
+
+        assert_eq!(
+            provider_ref_definition(&string).unwrap(),
+            provider_ref_definition(&numeric).unwrap(),
+        );
+        assert_eq!(
+            npi_source_coordinate(string["provider_groups"].as_array().unwrap(), 1234567890,),
+            Some((0, 0)),
+        );
+
+        let mut string_zero = numeric.clone();
+        string_zero["provider_groups"][0]["npi"] = json!(["0"]);
+        let mut numeric_zero = numeric;
+        numeric_zero["provider_groups"][0]["npi"] = json!([0]);
+        assert_eq!(
+            provider_ref_definition(&string_zero).unwrap(),
+            provider_ref_definition(&numeric_zero).unwrap(),
+        );
     }
 
     #[test]
