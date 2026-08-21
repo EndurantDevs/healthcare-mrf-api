@@ -8,7 +8,7 @@
     "collection_name_mismatch": 0,
     "comment_noise": 0,
     "confusable_function_names": 0,
-    "deep_nesting": 35,
+    "deep_nesting": 34,
     "function_name_shape": 0,
     "global_state_usage": 0,
     "inline_suppressions": 2,
@@ -38,7 +38,6 @@
     "deep_nesting": [
       "deep_nesting:api/endpoint/npi.py:get_near_npi",
       "deep_nesting:api/endpoint/npi.py:list_providers.get_results",
-      "deep_nesting:api/endpoint/pricing.py:autocomplete_procedures",
       "deep_nesting:api/endpoint/pricing.py:get_pricing_provider_score._fallback_response",
       "deep_nesting:api/ptg2_code_context.py:_resolve_ptg2_code_search_context",
       "deep_nesting:api/ptg2_serving.py:_search_manifest_serving_table",
