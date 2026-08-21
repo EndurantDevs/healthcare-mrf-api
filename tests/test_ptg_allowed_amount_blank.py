@@ -133,3 +133,18 @@ def test_projects_only_exact_durable_blank_result() -> None:
         "successful_files"
     ][0]["summary"]["allowed_amount_plans"] = 3
     assert allowed_amount_blank_metrics(**blank_state) is None
+
+
+def test_blank_projection_accepts_mappings_and_rejects_evidence_drift() -> None:
+    blank_state = _blank_state()
+    blank_state["engine_run"] = vars(blank_state["engine_run"])
+    assert allowed_amount_blank_metrics(**blank_state) is not None
+
+    for durable_state in (
+        blank_state["engine_run"]["report"],
+        blank_state["engine_snapshot"].manifest,
+    ):
+        durable_state["allowed_amount_lane"]["successful_files"][0][
+            "summary"
+        ]["allowed_amount_evidence"] = True
+    assert allowed_amount_blank_metrics(**blank_state) is None
