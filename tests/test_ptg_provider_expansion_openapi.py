@@ -15,6 +15,15 @@ def test_procedure_provider_expansion_is_explicit_opt_in():
         "/pricing/providers/by-procedure",
     ):
         parameters = spec_by_field["paths"][path]["get"]["parameters"]
+        parameters_by_name = {
+            parameter["name"]: parameter
+            for parameter in parameters
+        }
+        assert parameters_by_name["page_size"]["schema"]["maximum"] == 200
+        assert (
+            parameters_by_name["page_size"]["schema"]["maximum"]
+            == parameters_by_name["limit"]["schema"]["maximum"]
+        )
         include_providers_by_field = next(
             parameter
             for parameter in parameters

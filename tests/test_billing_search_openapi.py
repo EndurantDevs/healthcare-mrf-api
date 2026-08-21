@@ -133,6 +133,7 @@ def test_exact_billing_operation_documents_closed_conditional_contract():
     ):
         assert f"`{required_name}`" in description
     assert "requires" in description
+    assert "`limit` from 1 through 100" in normalized_description
     assert "exactly one GEO form" in normalized_description
     assert "raw tax identifiers" in normalized_description
     assert "client-supplied `plan_release_id`" in normalized_description

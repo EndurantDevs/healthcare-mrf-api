@@ -576,8 +576,16 @@ async def test_get_near_npi(monkeypatch):
     assert "parent_organization_tin" not in response_body[0]
 
 
+@pytest.mark.parametrize(
+    ("radius_value", "expected_radius"),
+    [(None, 10.0), ("0", 0.0), ("2.5", 2.5), ("100", 100.0)],
+)
 @pytest.mark.asyncio
-async def test_get_near_npi_with_lat_long_uses_knn_without_bbox_params(monkeypatch):
+async def test_get_near_npi_with_lat_long_uses_knn_without_bbox_params(
+    monkeypatch,
+    radius_value,
+    expected_radius,
+):
     captured_query_map = {}
 
     class RecordingConnection:
@@ -595,8 +603,16 @@ async def test_get_near_npi_with_lat_long_uses_knn_without_bbox_params(monkeypat
 
     monkeypatch.setattr(npi_module, "db", FakeDB())
 
+    request_args_by_name = {
+        "lat": "41.0",
+        "long": "-87.0",
+        "zip_codes": "60601",
+        "limit": "1",
+    }
+    if radius_value is not None:
+        request_args_by_name["radius"] = radius_value
     request = types.SimpleNamespace(
-        args={"lat": "41.0", "long": "-87.0", "zip_codes": "60601", "limit": "1"},
+        args=request_args_by_name,
         app=types.SimpleNamespace(),
     )
     response = await npi_module.get_near_npi(request)
@@ -607,7 +623,28 @@ async def test_get_near_npi_with_lat_long_uses_knn_without_bbox_params(monkeypat
     assert "max_lat" not in captured_query_map
     assert "min_long" not in captured_query_map
     assert "max_long" not in captured_query_map
-    assert captured_query_map["radius"] == 10
+    assert captured_query_map["radius"] == expected_radius
+
+
+@pytest.mark.parametrize(
+    ("request_args", "message"),
+    [
+        ({"view": "sitemap"}, "view must be: card"),
+        (
+            {"lat": "41.0", "long": "-87.0", "limit": "0"},
+            "limit must be at least 1",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_get_near_npi_rejects_invalid_doctor_search_controls(
+    request_args,
+    message,
+):
+    with pytest.raises(sanic.exceptions.InvalidUsage, match=message):
+        await npi_module.get_near_npi(
+            types.SimpleNamespace(args=request_args, app=types.SimpleNamespace())
+        )
 
 
 @pytest.mark.asyncio
@@ -1342,7 +1379,7 @@ async def test_get_near_npi_applies_name_before_knn_limit(monkeypatch):
     assert captured_query_map["params"]["q"] == "%Clinic%"
 
 
-def _near_provider_record(npi, address_key, distance):
+def _near_provider_record(npi, address_key, distance, **fields):
     return types.SimpleNamespace(
         _mapping={
             "npi_code": npi,
@@ -1351,6 +1388,7 @@ def _near_provider_record(npi, address_key, distance):
             "type": "primary",
             "distance": round(distance / 1609.34, 2),
             "cursor_distance_meters": distance,
+            **fields,
         }
     )
 
@@ -1440,6 +1478,94 @@ async def test_get_near_npi_paginates_unique_provider_addresses(monkeypatch):
     ] == [
         (5556667778, second_address_key)
     ]
+
+
+def _near_card_provider_record(address_key):
+    return _near_provider_record(
+        1112223334,
+        address_key,
+        1609.34,
+        entity_type_code=1,
+        provider_first_name="Adam",
+        provider_last_name="Smith",
+        provider_credential_text="MD",
+        city_name="Chicago",
+        state_name="IL",
+        postal_code="60601-1234",
+        healthcare_provider_taxonomy_code="207Q00000X",
+        healthcare_provider_primary_taxonomy_switch="Y",
+        taxonomy_display="Family Medicine",
+    )
+
+
+class _RepeatedNearCardConnection:
+    def __init__(self, address_key: str):
+        self.address_key = address_key
+
+    async def all(self, sql: object, **_params: object) -> list[object]:
+        if "COUNT(DISTINCT" in str(sql):
+            return []
+        provider_record = _near_card_provider_record(self.address_key)
+        return [provider_record, provider_record]
+
+    async def first(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
+def _capture_card_taxonomy_lists(monkeypatch) -> list[list[dict]]:
+    taxonomy_lists = []
+    project_card = npi_module._provider_card_from_mapping
+
+    def capture(mapping: dict) -> dict:
+        taxonomy_lists.append(mapping["taxonomy_list"])
+        return project_card(mapping)
+
+    monkeypatch.setattr(npi_module, "_provider_card_from_mapping", capture)
+    return taxonomy_lists
+
+
+@pytest.mark.asyncio
+async def test_get_near_npi_card_view_keeps_distance_and_compact_fields(monkeypatch):
+    """Keep the nearby card response compact without dropping distance."""
+
+    address_key = "00000000-0000-0000-0000-000000000001"
+    projected_taxonomy_lists = _capture_card_taxonomy_lists(monkeypatch)
+
+    monkeypatch.setattr(
+        npi_module.db,
+        "acquire",
+        lambda: FakeAcquire(_RepeatedNearCardConnection(address_key)),
+    )
+    response = await npi_module.get_near_npi(
+        types.SimpleNamespace(
+            args={
+                "long": "-87.0",
+                "lat": "41.0",
+                "view": "card",
+                "limit": "1",
+            },
+            app=types.SimpleNamespace(),
+        )
+    )
+
+    assert json.loads(response.body) == [
+        {
+            "npi": 1112223334,
+            "display_name": "Adam Smith",
+            "entity_type": "individual",
+            "credential": "MD",
+            "primary_specialty": {
+                "taxonomy_code": "207Q00000X",
+                "display": "Family Medicine",
+            },
+            "city": "Chicago",
+            "state": "IL",
+            "zip5": "60601",
+            "distance_miles": 1.0,
+        }
+    ]
+    assert len(projected_taxonomy_lists) == 1
+    assert len(projected_taxonomy_lists[0]) == 1
 
 
 def test_nearby_cursor_rejects_different_filters():

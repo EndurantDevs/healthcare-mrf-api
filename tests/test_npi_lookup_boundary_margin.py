@@ -88,6 +88,16 @@ def test_provider_lookup_normalizers_reject_or_drop_ambiguous_values():
         npi_module._parse_optional_year("2012")
 
 
+def test_exact_npi_filter_matches_the_documented_identifier_shape():
+    assert npi_module._normalize_exact_npi("1000000007") == 1000000007
+    for invalid_npi in ("0123456789", "100-000-0007", "100000000A"):
+        with pytest.raises(
+            sanic.exceptions.InvalidUsage,
+            match="exactly 10 digits.*cannot start with zero",
+        ):
+            npi_module._normalize_exact_npi(invalid_npi)
+
+
 def test_legacy_address_filters_do_not_infer_unified_site_columns():
     assert (
         npi_module._address_npi_filter("a", "mrf.npi_address")
