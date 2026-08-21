@@ -30,8 +30,34 @@ def _schema() -> str:
     return runtime_schema or legacy_schema or "mrf"
 
 
+def _is_offline_mode() -> bool:
+    get_context = getattr(op, "get_context", None)
+    return bool(get_context and get_context().as_sql)
+
+
+def _alter_plan_id_width(
+    table_name: str, *, schema: str, expected: int, target: int
+) -> None:
+    op.alter_column(
+        table_name,
+        "plan_id",
+        existing_type=sa.String(length=expected),
+        type_=sa.String(length=target),
+        schema=schema,
+    )
+
+
 def _set_plan_id_width(*, expected: int, target: int) -> None:
     schema = _schema()
+    if _is_offline_mode():
+        for table_name in _TABLES:
+            _alter_plan_id_width(
+                table_name,
+                schema=schema,
+                expected=expected,
+                target=target,
+            )
+        return
     inspector = sa.inspect(op.get_bind())
     for table_name in _TABLES:
         if not inspector.has_table(table_name, schema=schema):
@@ -48,12 +74,11 @@ def _set_plan_id_width(*, expected: int, target: int) -> None:
             raise RuntimeError(f"unexpected_plan_id_column:{schema}.{table_name}")
         if plan_id["type"].length == target:
             continue
-        op.alter_column(
+        _alter_plan_id_width(
             table_name,
-            "plan_id",
-            existing_type=sa.String(length=expected),
-            type_=sa.String(length=target),
             schema=schema,
+            expected=expected,
+            target=target,
         )
 
 
