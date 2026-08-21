@@ -274,7 +274,7 @@ async def test_geo_rate_prefix_absent_sets_are_exact_only_after_source_end(
 
 
 @pytest.mark.asyncio
-async def test_geo_rate_prefix_rejects_member_budget_before_graph_or_sql(
+async def test_geo_rate_prefix_rejects_unexhausted_reverse_member_budget(
     monkeypatch,
 ):
     rate_rows = [_rate_row(0, provider_count=3), _rate_row(1, provider_count=3)]
@@ -285,9 +285,17 @@ async def test_geo_rate_prefix_rejects_member_budget_before_graph_or_sql(
         AsyncMock(return_value=rate_rows),
     )
     member_reads = AsyncMock()
-    location_reads = AsyncMock()
+    location_reads = AsyncMock(
+        return_value=[{"npi": 111, "_ptg_source_exhausted": False}]
+    )
+    reverse_reads = AsyncMock(return_value={})
     monkeypatch.setattr(serving, "_provider_npis_for_sets", member_reads)
     monkeypatch.setattr(serving, "_membership_location_rows", location_reads)
+    monkeypatch.setattr(
+        serving,
+        "_shared_provider_set_keys_by_npi",
+        reverse_reads,
+    )
 
     with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as exc_info:
         await serving._select_geo_filtered_rate_prefix(
@@ -302,7 +310,65 @@ async def test_geo_rate_prefix_rejects_member_budget_before_graph_or_sql(
 
     assert exc_info.value.dimension == "candidate_members"
     member_reads.assert_not_awaited()
-    location_reads.assert_not_awaited()
+    location_reads.assert_awaited_once()
+    reverse_reads.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_geo_rate_prefix_rejects_reverse_after_candidate_budget_consumed(
+    monkeypatch,
+):
+    rate_rows = [
+        _rate_row(0, provider_count=20),
+        _rate_row(1, provider_count=21),
+    ]
+    monkeypatch.setattr(serving, "_ptg2_manifest_location_match_limit", lambda: 1)
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        AsyncMock(
+            side_effect=lambda *_args, **kwargs: rate_rows[
+                kwargs["offset"] : kwargs["offset"] + kwargs["limit"]
+            ]
+        ),
+    )
+    member_reads = AsyncMock(
+        return_value={rate_rows[0]["provider_set_global_id_128"]: tuple(range(100, 120))}
+    )
+    location_reads = AsyncMock(return_value=[])
+    reverse_reads = AsyncMock()
+    monkeypatch.setattr(serving, "_provider_npis_for_sets", member_reads)
+    monkeypatch.setattr(serving, "_membership_location_rows", location_reads)
+    monkeypatch.setattr(
+        serving,
+        "_shared_provider_set_keys_by_npi",
+        reverse_reads,
+    )
+
+    with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as exc_info:
+        await serving._select_geo_filtered_rate_prefix(
+            object(),
+            _tables(
+                provider_expansion_rate_page_rows=1,
+                max_online_provider_expansion_rate_rows=2,
+                max_online_provider_expansion_provider_sets=2,
+                max_online_provider_expansion_graph_batches=2,
+            ),
+            code_rows=_code_rows(2),
+            args={"state": "MI"},
+            network_names=[],
+            target_count=1,
+            descending=False,
+        )
+
+    assert exc_info.value.dimension == "candidate_members"
+    member_reads.assert_awaited_once()
+    assert location_reads.await_count == 20
+    assert all(
+        call.kwargs["candidate_npis"] is not None
+        for call in location_reads.await_args_list
+    )
+    reverse_reads.assert_not_awaited()
 
 
 @pytest.mark.asyncio
