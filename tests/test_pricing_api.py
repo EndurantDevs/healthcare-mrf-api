@@ -2334,6 +2334,44 @@ async def test_autocomplete_procedure_total_does_not_depend_on_page_limit(monkey
 
 
 @pytest.mark.asyncio
+async def test_autocomplete_procedures_preserves_ranked_terminology_order(monkeypatch):
+    monkeypatch.setattr(
+        pricing_module,
+        "_query_terminology",
+        AsyncMock(
+            return_value=[
+                {
+                    "canonical_term": "Replacement of knee joint, both sides of knee",
+                    "target_system": "CPT",
+                    "target_code": "27447",
+                    "source": "synthetic_terminology",
+                },
+                {
+                    "canonical_term": "Anesthesia for procedures on knee and popliteal area",
+                    "target_system": "CPT",
+                    "target_code": "01380",
+                    "source": "synthetic_terminology",
+                },
+            ]
+        ),
+    )
+
+    codes = []
+    totals = []
+    for offset in (0, 1):
+        request = make_request(
+            [FakeResult(rows=[])],
+            args={"q": "knee", "limit": "1", "offset": str(offset)},
+        )
+        pricing_response = json.loads((await autocomplete_procedures(request)).body)
+        codes.append(pricing_response["items"][0]["codes"][0]["code"])
+        totals.append(pricing_response["pagination"]["total"])
+
+    assert codes == ["27447", "01380"]
+    assert totals == [2, 2]
+
+
+@pytest.mark.asyncio
 async def test_autocomplete_procedures_includes_match_details_when_requested(
     monkeypatch,
 ):
