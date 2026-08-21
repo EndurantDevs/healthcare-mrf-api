@@ -4576,8 +4576,9 @@ paths:
             type: string
             enum: [M, F, U, X]
           description: |
-            Exact NPPES provider sex code. For PTG/TiC pricing this implicitly
-            enables provider expansion and filters before pagination.
+            Exact NPPES provider sex code. Filters eligible providers before
+            pagination but does not enable provider expansion; set
+            `include_providers=true` to return provider rows.
         - name: primary_only
           in: query
           schema: { type: boolean }
@@ -4695,7 +4696,10 @@ paths:
           schema: { type: number }
         - name: include_providers
           in: query
-          schema: { type: boolean }
+          schema: { type: boolean, default: false }
+          description: |
+            Return provider/location rows when true. False or omitted returns
+            aggregate rate rows; provider filters remain active in either shape.
         - name: include_code_details
           in: query
           schema: { type: boolean }
@@ -4966,8 +4970,9 @@ paths:
             type: string
             enum: [M, F, U, X]
           description: |
-            Exact NPPES provider sex code. For PTG/TiC pricing this implicitly
-            enables provider expansion and filters before pagination.
+            Exact NPPES provider sex code. Filters eligible providers before
+            pagination but does not enable provider expansion; set
+            `include_providers=true` to return provider rows.
         - name: primary_only
           in: query
           schema:
@@ -5112,6 +5117,10 @@ paths:
           in: query
           schema:
             type: boolean
+            default: false
+          description: |
+            Return provider/location rows when true. False or omitted returns
+            aggregate rate rows; provider filters remain active in either shape.
         - name: include_code_details
           in: query
           schema:
