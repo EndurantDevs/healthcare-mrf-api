@@ -127,3 +127,9 @@ def test_projects_only_exact_durable_blank_result() -> None:
     blank_state = _blank_state()
     blank_state["engine_run"].import_run_id = "ptg2:wrong-source"
     assert allowed_amount_blank_metrics(**blank_state) is None
+
+    blank_state = _blank_state()
+    blank_state["engine_snapshot"].manifest["allowed_amount_lane"][
+        "successful_files"
+    ][0]["summary"]["allowed_amount_plans"] = 3
+    assert allowed_amount_blank_metrics(**blank_state) is None

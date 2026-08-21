@@ -146,7 +146,7 @@ async def test_postgres_blank_receipt_rejects_payment_drift(monkeypatch):
             )
         with pytest.raises(
             asyncpg.PostgresError,
-            match="TERMINAL_RESULT_INVALID|TERMINAL_RECEIPT_INVALID",
+            match=r"TERMINAL_RESULT_INVALID",
         ):
             await _insert_and_assert_terminal_receipt(
                 connection,
@@ -154,6 +154,73 @@ async def test_postgres_blank_receipt_rejects_payment_drift(monkeypatch):
                 state,
                 receipt,
             )
+    finally:
+        await connection.execute(
+            f"DROP SCHEMA IF EXISTS {_quote(schema)} CASCADE"
+        )
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("schema", "blank_receipt_present"),
+    (
+        ("ptg_terminal_blank_downgrade_blocked", True),
+        ("ptg_terminal_blank_downgrade_restored", False),
+    ),
+)
+async def test_postgres_blank_receipt_downgrade_boundary(
+    monkeypatch,
+    schema,
+    blank_receipt_present,
+):
+    connection = await asyncpg.connect(_dsn())
+    try:
+        state, receipt = await _prepare_ordinary_terminal_db_fixture(
+            connection,
+            monkeypatch,
+            schema,
+            state_factory=blank_ordinary_result,
+        )
+        migration = await _upgrade_terminal_guard(
+            connection,
+            monkeypatch,
+            schema,
+        )
+        if blank_receipt_present:
+            await _insert_and_assert_terminal_receipt(
+                connection,
+                schema,
+                state,
+                receipt,
+            )
+            with pytest.raises(
+                asyncpg.PostgresError,
+                match=r"PTG_ORDINARY_TERMINAL_BLANK_DOWNGRADE_BLOCKED",
+            ):
+                await _apply_test_migration(
+                    connection,
+                    monkeypatch,
+                    migration,
+                    "downgrade",
+                )
+        else:
+            await _apply_test_migration(
+                connection,
+                monkeypatch,
+                migration,
+                "downgrade",
+            )
+            with pytest.raises(
+                asyncpg.PostgresError,
+                match=r"PTG_WAVE_ORDINARY_TERMINAL_BINDING_INVALID",
+            ):
+                await _insert_and_assert_terminal_receipt(
+                    connection,
+                    schema,
+                    state,
+                    receipt,
+                )
     finally:
         await connection.execute(
             f"DROP SCHEMA IF EXISTS {_quote(schema)} CASCADE"

@@ -1977,6 +1977,15 @@ async def test_allowed_amount_blank_projection_loads_exact_inner_rows(monkeypatc
     assert metrics["status"] == "blank"
     assert metrics["snapshot_status"] == "failed"
     assert execute.await_count == 2
+    query_params = [
+        call.args[0].compile().params for call in execute.await_args_list
+    ]
+    assert query_params[0]["import_run_id_1"] == (
+        f"ptg2:{state['run'].source_file_import_id}"
+    )
+    assert query_params[1]["snapshot_id_1"] == (
+        state["engine_snapshot"].snapshot_id
+    )
 
 
 def test_normalize_triggered_by_bounds_database_value():

@@ -265,15 +265,11 @@ async def test_postgres_ordinary_terminal_preserves_python_exponent_digests(
     schema = "ordinary_terminal_exponent_digest"
     connection = await asyncpg.connect(_dsn())
     try:
-        monkeypatch.setattr(
-            receipt_authority,
-            "_ordinary_result",
-            _ordinary_result_with_exponent,
-        )
         state, receipt = await _prepare_ordinary_terminal_db_fixture(
             connection,
             monkeypatch,
             schema,
+            state_factory=_ordinary_result_with_exponent,
         )
         quoted = _quote(schema)
         await _restore_raw_exponent_documents(
