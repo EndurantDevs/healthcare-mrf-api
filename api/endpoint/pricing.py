@@ -2076,6 +2076,119 @@ async def _query_terminology(
     ]
 
 
+_PROCEDURE_AUTOCOMPLETE_TERMINOLOGY_SQL = text(
+    f"""
+    WITH hits AS MATERIALIZED (
+        SELECT t.domain, t.term_key, t.target_system, t.target_code,
+               search.search_index
+          FROM {terminology_synonym_table.fullname} AS t
+          CROSS JOIN jsonb_array_elements_text(CAST(:search_terms AS jsonb))
+                     WITH ORDINALITY AS search(search_term, search_index)
+         WHERE t.domain = 'procedure'
+           AND (CAST(:target_system AS text) IS NULL
+                OR upper(t.target_system) = CAST(:target_system AS text))
+           AND t.term_key LIKE '%' || search.search_term || '%'
+    ),
+    mode AS MATERIALIZED (
+        SELECT coalesce(bool_or(search_index = 1), false) AS has_full_match
+          FROM hits
+    ),
+    target_scores AS MATERIALIZED (
+        SELECT target_system, target_code,
+               count(DISTINCT search_index) FILTER (WHERE search_index > 1)
+                   AS matched_token_count,
+               max(search_index) FILTER (WHERE search_index > 1)
+                   AS rightmost_token
+          FROM hits
+         GROUP BY target_system, target_code
+    ),
+    chosen_keys AS (
+        SELECT DISTINCT ON (h.domain, h.term_key, h.target_system, h.target_code)
+               h.domain, h.term_key, h.target_system, h.target_code,
+               mode.has_full_match, scores.matched_token_count,
+               coalesce(scores.rightmost_token, 0) AS rightmost_token
+          FROM hits AS h
+          CROSS JOIN mode
+          JOIN target_scores AS scores USING (target_system, target_code)
+         WHERE (mode.has_full_match AND h.search_index = 1)
+            OR (NOT mode.has_full_match AND h.search_index > 1
+                AND scores.matched_token_count >= :minimum_token_matches)
+         ORDER BY h.domain, h.term_key, h.target_system, h.target_code,
+                  h.search_index DESC
+    )
+    SELECT t.*
+      FROM chosen_keys AS chosen
+      JOIN {terminology_synonym_table.fullname} AS t
+        USING (domain, term_key, target_system, target_code)
+     ORDER BY
+        CASE WHEN chosen.has_full_match THEN
+            CASE
+                WHEN t.term_key = :full_term THEN 0
+                WHEN t.term_key LIKE :full_term || '%' THEN 1
+                WHEN lower(coalesce(t.synonym, '')) LIKE :full_term || '%' THEN 2
+                ELSE 3
+            END
+            ELSE 0
+        END,
+        CASE WHEN NOT chosen.has_full_match
+                  AND t.term_key LIKE 'anesthesia %'
+             THEN 1 ELSE 0 END,
+        CASE WHEN NOT chosen.has_full_match
+             THEN chosen.matched_token_count ELSE 0 END DESC,
+        CASE WHEN NOT chosen.has_full_match
+             THEN chosen.rightmost_token ELSE 0 END DESC,
+        t.confidence DESC NULLS LAST, t.is_broad ASC, t.synonym ASC,
+        t.target_system ASC, t.target_code ASC
+     LIMIT :limit
+    """
+)
+
+
+async def _query_procedure_autocomplete_terminology(
+    session,
+    *,
+    search_query: str,
+    target_systems: tuple[str, ...] | None,
+    limit: int,
+) -> list[dict[str, Any]] | None:
+    if not await _is_terminology_available(session):
+        return None
+
+    normalized_tokens = _normalize_term_key(search_query).split()
+    # ponytail: Three tokens bound latency; add trigram indexes before raising this.
+    search_tokens = tuple(dict.fromkeys(
+        token for token in normalized_tokens if len(token) > 1
+    ))[-3:]
+    full_term = " ".join(normalized_tokens)
+    if len(normalized_tokens) < 2:
+        return await _query_terminology(
+            session,
+            domain="procedure",
+            term=full_term,
+            exact=False,
+            target_systems=target_systems,
+            include_broad=True,
+            limit=limit,
+        )
+    if not search_tokens:
+        return []
+
+    terminology_result = await session.execute(
+        _PROCEDURE_AUTOCOMPLETE_TERMINOLOGY_SQL,
+        {
+            "search_terms": json.dumps((full_term, *search_tokens)),
+            "full_term": full_term,
+            "target_system": target_systems[0] if target_systems else None,
+            "minimum_token_matches": min(2, len(search_tokens)),
+            "limit": limit,
+        },
+    )
+    return [
+        _terminology_item(_row_to_dict(terminology_row))
+        for terminology_row in terminology_result
+    ]
+
+
 async def _resolve_provider_type_terms(
     session,
     terms: list[str],
@@ -10020,7 +10133,7 @@ async def resolve_medication_term(request):
 @blueprint.get("/procedures/autocomplete", name="pricing.procedures.autocomplete")
 @blueprint.get("/services/autocomplete", name="pricing.services.autocomplete")
 async def autocomplete_procedures(request):
-    """Return paginated procedure or service autocomplete matches from the code catalog."""
+    """Return paginated procedure or service autocomplete matches."""
     session = _get_session(request)
     args = request.args
 
@@ -10108,20 +10221,24 @@ async def autocomplete_procedures(request):
         )
         .limit(fetch_limit)
     )
-    code_catalog_result_cursor = await session.execute(query)
-    code_catalog_rows = [
-        _row_to_dict(code_catalog_row)
-        for code_catalog_row in code_catalog_result_cursor
-    ]
-    terminology_rows = await _query_terminology(
+    target_systems = (
+        (_normalize_code_system(code_system_raw),) if code_system_raw else None
+    )
+    terminology_rows = await _query_procedure_autocomplete_terminology(
         session,
-        domain="procedure",
-        term=search_query,
-        exact=False,
-        target_systems=(_normalize_code_system(code_system_raw),) if code_system_raw else None,
-        include_broad=True,
+        search_query=search_query,
+        target_systems=target_systems,
         limit=min(fetch_limit, 500),
     )
+    if terminology_rows is None:
+        code_catalog_result_cursor = await session.execute(query)
+        code_catalog_rows = [
+            _row_to_dict(code_catalog_row)
+            for code_catalog_row in code_catalog_result_cursor
+        ]
+        terminology_rows = []
+    else:
+        code_catalog_rows = []
 
     if not dedupe_terms:
         procedure_items = []

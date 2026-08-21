@@ -2250,7 +2250,13 @@ async def test_get_prescription_benchmarks_success():
 
 
 @pytest.mark.asyncio
-async def test_autocomplete_procedures_dedupes_terms_across_systems():
+async def test_autocomplete_procedures_dedupes_terms_across_systems(monkeypatch):
+    terminology_query = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        pricing_module,
+        "_query_procedure_autocomplete_terminology",
+        terminology_query,
+    )
     request = make_request(
         [
             FakeResult(
@@ -2294,6 +2300,7 @@ async def test_autocomplete_procedures_dedupes_terms_across_systems():
     assert "123456" in pricing_item["internal_codes"]
     assert "matches" not in pricing_item
     assert pricing_response["query"]["include_matches"] is False
+    terminology_query.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -2317,8 +2324,8 @@ async def test_autocomplete_procedure_total_does_not_depend_on_page_limit(monkey
 
     monkeypatch.setattr(
         pricing_module,
-        "_query_terminology",
-        AsyncMock(return_value=[]),
+        "_query_procedure_autocomplete_terminology",
+        AsyncMock(return_value=None),
     )
 
     totals = []
@@ -2337,7 +2344,7 @@ async def test_autocomplete_procedure_total_does_not_depend_on_page_limit(monkey
 async def test_autocomplete_procedures_preserves_ranked_terminology_order(monkeypatch):
     monkeypatch.setattr(
         pricing_module,
-        "_query_terminology",
+        "_query_procedure_autocomplete_terminology",
         AsyncMock(
             return_value=[
                 {
@@ -2372,6 +2379,108 @@ async def test_autocomplete_procedures_preserves_ranked_terminology_order(monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query", "expected_codes"),
+    [
+        ("total knee replacement", {"27447"}),
+        ("knee arthroplasty", {"27446", "27447"}),
+    ],
+)
+async def test_autocomplete_procedures_falls_back_to_token_terminology(
+    monkeypatch,
+    query,
+    expected_codes,
+):
+    terminology_rows = [
+        terminology_row
+        for terminology_row in _procedure_rows()
+        if terminology_row["term_key"] == "knee surgery"
+        and terminology_row["target_code"] in {"27445", "27446", "27447"}
+    ]
+    terminology_query = AsyncMock(
+        return_value=terminology_rows
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_query_procedure_autocomplete_terminology",
+        terminology_query,
+    )
+    request = make_request(
+        [],
+        args={"q": query, "year": "2023", "limit": "50"},
+    )
+
+    pricing_response = json.loads((await autocomplete_procedures(request)).body)
+    returned_codes = [
+        code["code"]
+        for procedure_item in pricing_response["items"]
+        for code in procedure_item["codes"]
+    ]
+
+    assert expected_codes <= set(returned_codes)
+    assert set(returned_codes[:3]) == {"27445", "27446", "27447"}
+    terminology_query.assert_awaited_once()
+    assert request.ctx.sa_session.executions == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query", "expected_terms", "minimum_matches"),
+    [
+        (
+            "total knee replacement",
+            ["total knee replacement", "total", "knee", "replacement"],
+            2,
+        ),
+        ("a replacement", ["a replacement", "replacement"], 1),
+        (
+            "find total knee replacement surgery",
+            ["find total knee replacement surgery", "knee", "replacement", "surgery"],
+            2,
+        ),
+    ],
+)
+async def test_procedure_autocomplete_uses_one_setwise_multitoken_query(
+    query,
+    expected_terms,
+    minimum_matches,
+):
+    session = FakeSession(
+        [
+            FakeResult(scalar=True),
+            FakeResult(
+                rows=[
+                    {
+                        "domain": "procedure",
+                        "synonym": "Knee arthroplasty",
+                        "term_key": "arthroplasty",
+                        "target_system": "CPT",
+                        "target_code": "27447",
+                    }
+                ]
+            ),
+        ]
+    )
+
+    terminology_rows = await pricing_module._query_procedure_autocomplete_terminology(
+        session,
+        search_query=query,
+        target_systems=("CPT",),
+        limit=50,
+    )
+
+    assert terminology_rows[0]["target_code"] == "27447"
+    assert len(session.executions) == 2
+    statement, parameters = session.executions[1][0]
+    assert json.loads(parameters["search_terms"]) == expected_terms
+    assert parameters["target_system"] == "CPT"
+    assert parameters["minimum_token_matches"] == minimum_matches
+    assert "WITH hits AS MATERIALIZED" in str(statement)
+    assert "count(DISTINCT search_index)" in str(statement)
+    assert "t.term_key LIKE 'anesthesia %'" in str(statement)
+
+
+@pytest.mark.asyncio
 async def test_autocomplete_procedures_includes_match_details_when_requested(
     monkeypatch,
 ):
@@ -2385,7 +2494,7 @@ async def test_autocomplete_procedures_includes_match_details_when_requested(
     }
     monkeypatch.setattr(
         pricing_module,
-        "_query_terminology",
+        "_query_procedure_autocomplete_terminology",
         AsyncMock(return_value=[match_by_field]),
     )
     monkeypatch.setattr(pricing_module, "PRICING_DEFAULT_YEAR", 2024)
@@ -2451,10 +2560,11 @@ async def test_autocomplete_procedures_returns_complete_curated_knee_aliases(
         for procedure_row in _procedure_rows()
         if procedure_row["term_key"] == query
     ]
+    terminology_query = AsyncMock(return_value=alias_rows)
     monkeypatch.setattr(
         pricing_module,
-        "_query_terminology",
-        AsyncMock(return_value=alias_rows),
+        "_query_procedure_autocomplete_terminology",
+        terminology_query,
     )
     request = make_request(
         [FakeResult(rows=[])],
@@ -2479,6 +2589,7 @@ async def test_autocomplete_procedures_returns_complete_curated_knee_aliases(
         code: expected_terms_by_code[code] for code in expected_codes
     }
     assert pricing_response["pagination"]["total"] == len(expected_codes)
+    terminology_query.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -2497,32 +2608,21 @@ async def test_autocomplete_procedures_non_deduped_edge_rows(monkeypatch):
             "target_code": "123",
             "source": "synthetic_terminology",
         },
+        {
+            "canonical_term": "Synthetic catalog procedure",
+            "term": "Synthetic catalog procedure",
+            "target_system": "CPT",
+            "target_code": "12345",
+            "source": "healthporta_code_catalog",
+        },
     ]
     monkeypatch.setattr(
         pricing_module,
-        "_query_terminology",
+        "_query_procedure_autocomplete_terminology",
         AsyncMock(return_value=terminology_rows),
     )
     request = make_request(
-        [
-            FakeResult(
-                rows=[
-                    {
-                        "code_system": "",
-                        "code": "",
-                        "display_name": "",
-                        "short_description": "",
-                    },
-                    {
-                        "code_system": "CPT",
-                        "code": "12345",
-                        "display_name": "Synthetic catalog procedure",
-                        "short_description": "Synthetic",
-                        "source": "cms_physician_provider_service",
-                    },
-                ]
-            )
-        ],
+        [],
         args={
             "q": "synthetic",
             "year": "2023",
@@ -2546,14 +2646,26 @@ async def test_autocomplete_procedures_non_deduped_edge_rows(monkeypatch):
 @pytest.mark.asyncio
 async def test_autocomplete_procedures_deduped_edge_rows(monkeypatch):
     """Deduplicate malformed terminology and catalog edge rows."""
-    terminology_rows = _deduped_terminology_rows()
+    terminology_rows = [
+        *_deduped_terminology_rows(),
+        *[
+            {
+                "canonical_term": catalog_row["display_name"],
+                "term": catalog_row["display_name"],
+                "target_system": catalog_row["code_system"],
+                "target_code": catalog_row["code"],
+                "source": "healthporta_code_catalog",
+            }
+            for catalog_row in _deduped_catalog_rows()[2:]
+        ],
+    ]
     monkeypatch.setattr(
         pricing_module,
-        "_query_terminology",
+        "_query_procedure_autocomplete_terminology",
         AsyncMock(return_value=terminology_rows),
     )
     request = make_request(
-        [FakeResult(rows=_deduped_catalog_rows())],
+        [],
         args={
             "q": "syn",
             "include_matches": "true",
