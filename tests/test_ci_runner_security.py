@@ -89,6 +89,7 @@ def test_ci_image_publisher_is_hosted_and_has_bounded_permissions() -> None:
         "cargo llvm-cov --version",
         "cargo audit --version",
         "rustup component list --installed",
+        "/usr/bin/tini --version",
     ):
         assert receipt in workflow
     assert "cargo-llvm-cov 0.8.7" in workflow
@@ -98,6 +99,10 @@ def test_ci_image_publisher_is_hosted_and_has_bounded_permissions() -> None:
         "rustup component list --installed | grep -c '^llvm-tools-')\" = \"1\""
     )
     assert llvm_tools_receipt in workflow
+    assert (
+        'test "$(docker run --rm healthcare-mrf-arc-ci-candidate '
+        "stat -c '%u:%g %a' /usr/bin/tini)\" = \"0:0 755\""
+    ) in workflow
 
 
 def test_ci_image_retention_is_hosted_bounded_and_fail_closed() -> None:
@@ -167,3 +172,4 @@ def test_arc_image_contains_no_repository_or_credentials() -> None:
     assert "cargo install --locked --version 0.22.2" in dockerfile
     assert "--root /opt/cargo-tools cargo-audit" in dockerfile
     assert "COPY --from=rust-toolchain /opt/cargo-tools/bin /usr/local/bin" in dockerfile
+    assert "        tini \\\n" in dockerfile
