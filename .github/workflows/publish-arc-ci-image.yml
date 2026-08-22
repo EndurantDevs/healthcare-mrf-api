@@ -46,6 +46,11 @@ jobs:
           test "$(docker run --rm healthcare-mrf-arc-ci-candidate id -u)" = "1001"
           docker run --rm healthcare-mrf-arc-ci-candidate python --version
           docker run --rm healthcare-mrf-arc-ci-candidate cargo --version
+          docker run --rm healthcare-mrf-arc-ci-candidate cargo fmt --version
+          docker run --rm healthcare-mrf-arc-ci-candidate cargo clippy --version
+          test "$(docker run --rm healthcare-mrf-arc-ci-candidate cargo llvm-cov --version)" = "cargo-llvm-cov 0.8.7"
+          test "$(docker run --rm healthcare-mrf-arc-ci-candidate cargo audit --version)" = "cargo-audit-audit 0.22.2"
+          test "$(docker run --rm healthcare-mrf-arc-ci-candidate rustup component list --installed | grep -c '^llvm-tools-')" = "1"
           docker run --rm healthcare-mrf-arc-ci-candidate psql --version
           test "$(docker run --rm healthcare-mrf-arc-ci-candidate stat -c '%u:%g %a' /usr/local/bin/arc-network-fence)" = "0:0 555"
           docker run --rm healthcare-mrf-arc-ci-candidate \

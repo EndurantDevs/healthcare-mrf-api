@@ -1,6 +1,13 @@
 name: CI
 
 on:
+  workflow_call:
+    inputs:
+      activate_arc:
+        description: Request ARC only after protected-main and fork checks pass
+        required: false
+        type: boolean
+        default: false
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
@@ -33,7 +40,22 @@ env:
 jobs:
   public-hygiene:
     name: public hygiene
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]' &&
+      !endsWith(github.actor, '[bot]') &&
+      !endsWith(github.triggering_actor, '[bot]'))) &&
+      vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:
@@ -49,7 +71,22 @@ jobs:
         run: scripts/ci/prepush hygiene
   python-quality:
     name: python quality
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]' &&
+      !endsWith(github.actor, '[bot]') &&
+      !endsWith(github.triggering_actor, '[bot]'))) &&
+      vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:
@@ -101,7 +138,22 @@ jobs:
 
   capacity-evidence:
     name: ptg2 capacity evidence
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]' &&
+      !endsWith(github.actor, '[bot]') &&
+      !endsWith(github.triggering_actor, '[bot]'))) &&
+      vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:
@@ -141,7 +193,22 @@ jobs:
       - security
       - worker-queue-smoke
       - address-canonical-db-tests
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]' &&
+      !endsWith(github.actor, '[bot]') &&
+      !endsWith(github.triggering_actor, '[bot]'))) &&
+      vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:
@@ -184,7 +251,22 @@ jobs:
 
   api-contract:
     name: openapi contract
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]' &&
+      !endsWith(github.actor, '[bot]') &&
+      !endsWith(github.triggering_actor, '[bot]'))) &&
+      vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:

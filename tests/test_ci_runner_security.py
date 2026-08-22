@@ -83,6 +83,21 @@ def test_ci_image_publisher_is_hosted_and_has_bounded_permissions() -> None:
     ) in workflow
     assert "docker buildx rm arc-ci-publisher" in workflow
     assert "arc-network-fence --timeout 0.1 --target 127.0.0.1:9" in workflow
+    for receipt in (
+        "cargo fmt --version",
+        "cargo clippy --version",
+        "cargo llvm-cov --version",
+        "cargo audit --version",
+        "rustup component list --installed",
+    ):
+        assert receipt in workflow
+    assert "cargo-llvm-cov 0.8.7" in workflow
+    assert "cargo-audit-audit 0.22.2" in workflow
+    llvm_tools_receipt = (
+        'test "$(docker run --rm healthcare-mrf-arc-ci-candidate '
+        "rustup component list --installed | grep -c '^llvm-tools-')\" = \"1\""
+    )
+    assert llvm_tools_receipt in workflow
 
 
 def test_ci_image_retention_is_hosted_bounded_and_fail_closed() -> None:
@@ -145,3 +160,10 @@ def test_arc_image_contains_no_repository_or_credentials() -> None:
     )
     assert "USER 1001:1001" in dockerfile
     assert dockerfile.count("@sha256:") == 3
+    assert "rustup component add --toolchain 1.97.1" in dockerfile
+    assert "llvm-tools-preview" in dockerfile
+    assert "cargo install --locked --version 0.8.7" in dockerfile
+    assert "--root /opt/cargo-tools cargo-llvm-cov" in dockerfile
+    assert "cargo install --locked --version 0.22.2" in dockerfile
+    assert "--root /opt/cargo-tools cargo-audit" in dockerfile
+    assert "COPY --from=rust-toolchain /opt/cargo-tools/bin /usr/local/bin" in dockerfile

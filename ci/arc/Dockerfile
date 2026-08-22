@@ -5,6 +5,15 @@ ARG RUST_IMAGE=docker.io/library/rust:1.97.1-bookworm@sha256:705e294093973d7c10e
 
 FROM ${RUST_IMAGE} AS rust-toolchain
 
+RUN rustup component add --toolchain 1.97.1 \
+        clippy \
+        llvm-tools-preview \
+        rustfmt \
+    && cargo install --locked --version 0.8.7 \
+        --root /opt/cargo-tools cargo-llvm-cov \
+    && cargo install --locked --version 0.22.2 \
+        --root /opt/cargo-tools cargo-audit
+
 FROM ${PYTHON_IMAGE}
 
 RUN apt-get update \
@@ -24,6 +33,7 @@ RUN apt-get update \
 
 COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
 COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+COPY --from=rust-toolchain /opt/cargo-tools/bin /usr/local/bin
 COPY ci/arc/network_fence.py /usr/local/bin/arc-network-fence
 
 RUN groupadd --gid 1001 runner \
@@ -51,5 +61,10 @@ WORKDIR /home/runner
 RUN python --version \
     && cargo --version \
     && rustc --version \
+    && cargo fmt --version \
+    && cargo clippy --version \
+    && cargo llvm-cov --version \
+    && cargo audit --version \
+    && test "$(rustup component list --installed | grep -c '^llvm-tools-')" = "1" \
     && git --version \
     && psql --version

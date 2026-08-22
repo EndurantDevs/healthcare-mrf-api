@@ -228,6 +228,21 @@ def test_every_python_mode_uses_the_exact_lock() -> None:
     assert "actions/setup-python@" not in _job(workflow, "container-package")
 
 
+def test_rust_gate_reuses_only_the_exact_baked_cargo_tools() -> None:
+    script = PREPUSH.read_text(encoding="utf-8")
+
+    assert (
+        '"$(cargo llvm-cov --version 2>/dev/null || true)" '
+        '!= "cargo-llvm-cov 0.8.7"'
+    ) in script
+    assert "cargo install cargo-llvm-cov --version 0.8.7 --locked" in script
+    assert (
+        '"$(cargo audit --version 2>/dev/null || true)" '
+        '!= "cargo-audit-audit 0.22.2"'
+    ) in script
+    assert "cargo install cargo-audit --version 0.22.2 --locked" in script
+
+
 def test_container_and_lock_generator_use_exact_inputs() -> None:
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
     generator = PYTHON_LOCK_GENERATOR.read_text(encoding="utf-8")
