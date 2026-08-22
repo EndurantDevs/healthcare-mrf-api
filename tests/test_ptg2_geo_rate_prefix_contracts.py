@@ -274,6 +274,7 @@ async def _tied_geo_response(
             "zip_radius_miles": 30,
             "order_by": "rate",
             "order": order,
+            "include_providers": "false",
         },
         SimpleNamespace(limit=limit, offset=offset),
         serving_tables or strict_v3_tables(snapshot_id="ptg2:209901:synthetic"),

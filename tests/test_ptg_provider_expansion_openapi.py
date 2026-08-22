@@ -8,7 +8,7 @@ import yaml
 OPENAPI_PATH = Path("doc/openapi.yaml")
 
 
-def test_procedure_provider_expansion_is_explicit_opt_in():
+def test_procedure_provider_expansion_defaults_on():
     spec_by_field = yaml.safe_load(OPENAPI_PATH.read_text())
     for path in (
         "/pricing/providers/search-by-procedure",
@@ -29,11 +29,18 @@ def test_procedure_provider_expansion_is_explicit_opt_in():
             for parameter in parameters
             if parameter["name"] == "include_providers"
         )
-        assert include_providers_by_field["schema"]["default"] is False
-        assert "provider filters remain active" in include_providers_by_field["description"]
+        if path == "/pricing/providers/search-by-procedure":
+            assert "default" not in include_providers_by_field["schema"]
+            assert include_providers_by_field["x-legacy-plan-default"] is True
+        else:
+            assert include_providers_by_field["schema"]["default"] is True
+        include_description = " ".join(
+            include_providers_by_field["description"].split()
+        )
+        assert "provider filters remain active" in include_description
         provider_sex_by_field = next(
             parameter
             for parameter in parameters
             if parameter["name"] == "provider_sex_code"
         )
-        assert "include_providers=true" in provider_sex_by_field["description"]
+        assert "include_providers=false" in provider_sex_by_field["description"]

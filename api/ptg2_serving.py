@@ -192,6 +192,27 @@ from api.provider_specialty_filters import (
 )
 from api.provider_demographic_filters import provider_sex_exists_sql
 
+
+class PTG2ProviderFilterScopeError(ValueError):
+    """Reject an aggregate provider filter that cannot be applied exactly."""
+
+    error_code = "ptg2_provider_filter_scope_required"
+
+
+class PTG2ProviderFilterUnsupportedError(ValueError):
+    """Reject provider filter fields unsupported by PTG2 serving."""
+
+    error_code = "ptg2_provider_filter_unsupported"
+
+
+_UNSUPPORTED_PTG2_PROVIDER_FILTER_FIELDS = (
+    "provider_type",
+    "taxonomy_classification",
+    "taxonomy_specialization",
+    "taxonomy_section",
+)
+
+
 PTG2_MODE_EXACT_SOURCE = "exact_source"
 PTG2_MODE_PRODUCT_SEARCH = "product_search"
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
@@ -14001,6 +14022,7 @@ class _GeoRateSelectionBudget:
     candidate_members: int = 0
     provider_set_ids: set[str] = field(default_factory=set)
     provider_counts_by_id: dict[str, int] = field(default_factory=dict)
+    reverse_geo_scope: tuple[tuple[int, ...], bool, int] | None = None
 
     @property
     def maximum_geo_provider_sets(self) -> int:
@@ -14250,6 +14272,40 @@ async def _bounded_reverse_geo_npis(
     return candidate_npis, is_source_exhausted
 
 
+async def _cached_reverse_geo_scope(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    budget: _GeoRateSelectionBudget,
+) -> tuple[tuple[int, ...], bool, int] | None:
+    """Read and cache one bounded reverse-geo candidate scope."""
+
+    if budget.reverse_geo_scope is not None:
+        return budget.reverse_geo_scope
+    candidate_limit = budget.maximum_candidate_members - budget.candidate_members
+    if candidate_limit <= 0:
+        raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+    bounded_geo_scope = await _bounded_reverse_geo_npis(
+        session,
+        serving_tables,
+        args,
+        candidate_limit,
+    )
+    if bounded_geo_scope is None:
+        return None
+    candidate_npis, is_source_exhausted = bounded_geo_scope
+    budget.candidate_members += len(candidate_npis)
+    if _is_ptg2_provider_filter_requested(args):
+        candidate_npis = await _filter_npis_by_taxonomy(
+            session,
+            args,
+            candidate_npis,
+            limit=max(len(candidate_npis), 1),
+        )
+    budget.reverse_geo_scope = candidate_npis, is_source_exhausted, candidate_limit
+    return budget.reverse_geo_scope
+
+
 async def _reverse_geo_eligible_provider_sets(
     session,
     serving_tables: PTG2ServingTables,
@@ -14264,33 +14320,22 @@ async def _reverse_geo_eligible_provider_sets(
         rate_rows,
         provider_counts_by_id,
     )
-    remaining_candidates = budget.maximum_candidate_members - budget.candidate_members
-    if remaining_candidates <= 0:
-        raise PTG2OnlineWorkBudgetExceeded("candidate_members")
-    geo_scope = await _bounded_reverse_geo_npis(
+    reverse_geo_scope = await _cached_reverse_geo_scope(
         session,
         serving_tables,
         args,
-        remaining_candidates,
+        budget,
     )
-    if geo_scope is None:
+    if reverse_geo_scope is None:
         return None
-    candidate_npis, is_source_exhausted = geo_scope
-    budget.candidate_members += len(candidate_npis)
-    if _is_ptg2_provider_filter_requested(args):
-        candidate_npis = await _filter_npis_by_taxonomy(
-            session,
-            args,
-            candidate_npis,
-            limit=max(len(candidate_npis), 1),
-        )
+    candidate_npis, is_source_exhausted, candidate_limit = reverse_geo_scope
     try:
         matches_by_npi = await _shared_provider_set_keys_by_npi(
             session,
             serving_tables,
             candidate_npis,
             provider_set_id_by_key.keys(),
-            max_members=remaining_candidates,
+            max_members=candidate_limit,
         )
     except PTG2SharedBlockError as exc:
         if not _is_v4_member_limit(exc):
@@ -17361,7 +17406,22 @@ async def _search_manifest_serving_table(
     if args.get("q") or not requested_code or (not requested_plan and not explicit_source_scope):
         return None
 
-    include_providers = _is_request_flag_enabled(args.get("include_providers"))
+    unsupported_provider_filters = tuple(
+        field
+        for field in _UNSUPPORTED_PTG2_PROVIDER_FILTER_FIELDS
+        if args.get(field) not in (None, "", "null")
+    )
+    if unsupported_provider_filters:
+        raise PTG2ProviderFilterUnsupportedError(
+            "Unsupported PTG2 provider filters: "
+            + ", ".join(unsupported_provider_filters)
+            + ". Use specialty, classification, taxonomy_code, or taxonomy_codes."
+        )
+
+    include_providers = _is_request_flag_enabled(
+        args.get("include_providers"),
+        default=True,
+    )
     candidate_audit_npi = (
         _normalize_npi(args.get("npi"))
         if candidate_audit_access_from_args(args) is not None
@@ -17372,10 +17432,16 @@ async def _search_manifest_serving_table(
         args,
         include_npi=False,
     )
+    is_provider_filter_requested = _is_ptg2_provider_filter_requested(args)
+    explicit_provider_filter_requested = bool(
+        args.get("provider_sex_code") not in (None, "", "null")
+        or args.get("taxonomy_code") not in (None, "", "null")
+        or resolve_provider_specialty_filter(args).active
+    )
     direct_npi_filter_requested = bool(
         requested_npi is not None
         and not has_geographic_filter
-        and not _is_ptg2_provider_filter_requested(args)
+        and not is_provider_filter_requested
     )
     location_filter_requested = bool(
         has_geographic_filter
@@ -17416,6 +17482,16 @@ async def _search_manifest_serving_table(
         price_filter_requested=price_filter_requested,
         direct_npi_filter_requested=direct_npi_filter_requested,
     )
+    if (
+        not include_providers
+        and explicit_provider_filter_requested
+        and requested_npi is None
+        and not use_geo_rate_prefix_selection
+    ):
+        raise PTG2ProviderFilterScopeError(
+            "Provider filters with include_providers=false require an NPI or "
+            "supported cost-ordered geographic scope."
+        )
     if direct_npi_filter_requested:
         rate_candidate_limit = (
             max(int(getattr(pagination, "offset", 0) or 0), 0)

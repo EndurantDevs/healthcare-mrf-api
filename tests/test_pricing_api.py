@@ -3683,6 +3683,62 @@ async def test_plan_pricing_translates_only_online_work_budget_to_503(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_class", "error_code", "error_message"),
+    (
+        (
+            pricing_module.PTG2ProviderFilterScopeError,
+            "ptg2_provider_filter_scope_required",
+            "Provider filters with include_providers=false require an NPI or "
+            "supported cost-ordered geographic scope.",
+        ),
+        (
+            pricing_module.PTG2ProviderFilterUnsupportedError,
+            "ptg2_provider_filter_unsupported",
+            "Unsupported PTG2 provider filters: provider_type. Use specialty, "
+            "classification, taxonomy_code, or taxonomy_codes.",
+        ),
+    ),
+)
+async def test_plan_pricing_translates_provider_filter_errors_to_400(
+    monkeypatch,
+    error_class,
+    error_code,
+    error_message,
+):
+    async def rejected_search(*_args, **_kwargs):
+        assert _args[1]["provider_type"] == "Unsupported provider type"
+        raise error_class(error_message)
+
+    monkeypatch.setattr(
+        pricing_module,
+        "search_current_ptg2_index",
+        rejected_search,
+    )
+    request = make_request(
+        [FakeResult(scalar=1)],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "code": "70553",
+            "provider_type": "Unsupported provider type",
+            "classification": "Family Medicine",
+            "include_providers": "false",
+        },
+    )
+
+    endpoint_response = await list_providers_by_procedure(request)
+
+    assert endpoint_response.status == 400
+    assert json.loads(endpoint_response.body) == {
+        "error": {
+            "code": error_code,
+            "message": error_message,
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_g0289_geo_candidate_budget_returns_structured_503(monkeypatch):
     """Never translate an unproven broad geo bound into a backend 500."""
 
@@ -5255,7 +5311,6 @@ async def test_list_providers_by_procedure_rejects_broad_group_plan_office_visit
             "code_system": "CPT",
             "state": "IL",
             "city": "Chicago",
-            "include_providers": "true",
             "limit": "50",
         },
     )
@@ -5391,6 +5446,21 @@ def test_unscoped_office_visit_without_locator_keeps_legacy_allowance():
             "plan_market_type": "group",
             "code": "99213",
             "code_system": "CPT",
+        },
+    )
+
+
+def test_explicit_false_provider_filter_keeps_aggregate_shape():
+    pricing_module._reject_broad_group_plan_provider_expansion(
+        {"include_providers": "false"},
+        {
+            "plan_id": "TESTPLAN001",
+            "plan_market_type": "group",
+            "code": "99213",
+            "code_system": "CPT",
+            "state": "IL",
+            "city": "Chicago",
+            "provider_sex_code": "F",
         },
     )
 

@@ -2795,6 +2795,7 @@ async def test_g0289_geo_rate_search_uses_exact_provider_set_coverage(monkeypatc
             "code": "G0289",
             "zip5": "48201",
             "zip_radius_miles": 30,
+            "include_providers": False,
             "order_by": "rate",
         },
         SimpleNamespace(limit=3, offset=0),

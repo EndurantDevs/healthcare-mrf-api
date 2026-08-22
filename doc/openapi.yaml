@@ -4730,8 +4730,8 @@ paths:
             enum: [M, F, U, X]
           description: |
             Exact NPPES provider sex code. Filters eligible providers before
-            pagination but does not enable provider expansion; set
-            `include_providers=true` to return provider rows.
+            pagination. Provider expansion defaults on; set
+            `include_providers=false` for aggregate rate rows.
         - name: primary_only
           in: query
           schema: { type: boolean, default: true }
@@ -4850,10 +4850,14 @@ paths:
           schema: { type: number }
         - name: include_providers
           in: query
-          schema: { type: boolean, default: false }
+          x-legacy-plan-default: true
+          schema: { type: boolean }
           description: |
-            Return provider/location rows when true. False or omitted returns
-            aggregate rate rows; provider filters remain active in either shape.
+            On legacy plan-scoped searches, return provider/location rows when
+            true or omitted. Set false for aggregate rate rows; provider filters
+            remain active in either shape. An explicit provider filter with
+            false requires an NPI or a supported cost-ordered geographic scope.
+            Exact billing-identity searches do not accept this parameter.
         - name: include_code_details
           in: query
           schema: { type: boolean }
@@ -5126,7 +5130,7 @@ paths:
           in: query
           schema:
             type: string
-          description: Provider type alias resolved through terminology synonyms before filtering.
+          description: Claims-only provider type filter. PTG2 plan-rate searches reject it; use specialty, classification, taxonomy_code, or taxonomy_codes.
         - name: classification
           in: query
           schema:
@@ -5149,8 +5153,8 @@ paths:
             enum: [M, F, U, X]
           description: |
             Exact NPPES provider sex code. Filters eligible providers before
-            pagination but does not enable provider expansion; set
-            `include_providers=true` to return provider rows.
+            pagination. Provider expansion defaults on; set
+            `include_providers=false` for aggregate rate rows.
         - name: primary_only
           in: query
           schema:
@@ -5161,17 +5165,17 @@ paths:
           in: query
           schema:
             type: string
-          description: Optional exact NUCC classification filter for PTG2 plan-rate provider results.
+          description: Claims-only taxonomy filter. PTG2 plan-rate searches reject it; use classification.
         - name: taxonomy_specialization
           in: query
           schema:
             type: string
-          description: Optional exact NUCC specialization filter for PTG2 plan-rate provider results.
+          description: Claims-only taxonomy filter. PTG2 plan-rate searches reject it; use specialty or taxonomy_code.
         - name: taxonomy_section
           in: query
           schema:
             type: string
-          description: Optional exact NUCC section filter for PTG2 plan-rate provider results.
+          description: Claims-only taxonomy filter. PTG2 plan-rate searches reject it; use specialty or taxonomy_code.
         - name: q
           in: query
           schema:
@@ -5296,10 +5300,12 @@ paths:
           in: query
           schema:
             type: boolean
-            default: false
+            default: true
           description: |
-            Return provider/location rows when true. False or omitted returns
+            Return provider/location rows when true or omitted. Set false for
             aggregate rate rows; provider filters remain active in either shape.
+            An explicit provider filter with false requires an NPI or a supported
+            cost-ordered geographic scope.
         - name: include_code_details
           in: query
           schema:

@@ -10,7 +10,36 @@ from tests.test_ptg2_geo_rate_prefix import (
     _code_rows,
     _production_tables,
     _rate_row,
+    _tables,
 )
+
+
+_EXHAUSTIVE_LOCAL_NPIS = tuple(range(101, 112))
+
+
+def _exhaustive_location_rows(*_args, **kwargs):
+    selected_npis = _EXHAUSTIVE_LOCAL_NPIS[: kwargs["limit"]]
+    return [
+        {
+            "npi": npi,
+            "_ptg_source_exhausted": len(selected_npis)
+            == len(_EXHAUSTIVE_LOCAL_NPIS),
+        }
+        for npi in selected_npis
+    ]
+
+
+def _second_set_reverse_matches(
+    _session,
+    _tables,
+    candidate_npis,
+    provider_set_keys,
+    **_kwargs,
+):
+    selected_set_key = next(iter(provider_set_keys))
+    if selected_set_key == 2 and _EXHAUSTIVE_LOCAL_NPIS[-1] in candidate_npis:
+        return {_EXHAUSTIVE_LOCAL_NPIS[-1]: (selected_set_key,)}
+    return {}
 
 
 @pytest.mark.asyncio
@@ -174,3 +203,51 @@ async def test_geo_rate_prefix_preserves_unavailable_reverse_geo_source(
     member_reads.assert_not_awaited()
     location_reads.assert_awaited_once()
     reverse_reads.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_geo_rate_prefix_reuses_exhaustive_reverse_scope_across_pages(
+    monkeypatch,
+):
+    """Keep one bounded reverse-geo candidate scope across rate pages."""
+    rate_rows = [
+        _rate_row(0, provider_count=21),
+        _rate_row(1, provider_count=21),
+    ]
+    monkeypatch.setattr(serving, "_ptg2_manifest_location_match_limit", lambda: 1)
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        AsyncMock(
+            side_effect=lambda *_args, **kwargs: rate_rows[
+                kwargs["offset"] : kwargs["offset"] + kwargs["limit"]
+            ]
+        ),
+    )
+    location_reads = AsyncMock(side_effect=_exhaustive_location_rows)
+    monkeypatch.setattr(serving, "_membership_npi_rows", location_reads)
+    reverse_reads = AsyncMock(side_effect=_second_set_reverse_matches)
+    monkeypatch.setattr(serving, "_shared_provider_set_keys_by_npi", reverse_reads)
+
+    selection = await serving._select_geo_filtered_rate_prefix(
+        object(),
+        _tables(
+            provider_expansion_rate_page_rows=1,
+            max_online_provider_expansion_rate_rows=2,
+            max_online_provider_expansion_provider_sets=2,
+            max_online_provider_expansion_graph_batches=2,
+        ),
+        code_rows=_code_rows(2),
+        args={"zip5": "48201"},
+        network_names=[],
+        target_count=2,
+        descending=False,
+    )
+
+    assert selection == serving._GeoRateSelection((rate_rows[1],), True)
+    location_reads.assert_awaited_once()
+    assert reverse_reads.await_count == 2
+    assert [call.kwargs["max_members"] for call in reverse_reads.await_args_list] == [
+        20,
+        20,
+    ]
