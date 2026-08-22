@@ -142,9 +142,9 @@ def test_reusable_arc_classifier_is_exact_and_human_only() -> None:
         for required in (
             "inputs.activate_arc",
             "github.event_name == 'pull_request'",
-            "github.workflow_ref == format('",
-            ".github/workflows/trusted-pr-ci.yml@refs/heads/{0}'",
-            "github.head_ref",
+            "github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/"
+            ".github/workflows/trusted-pr-ci.yml@refs/heads/{0}', "
+            "github.head_ref)",
             "github.repository == 'EndurantDevs/healthcare-mrf-api'",
             "github.event.pull_request.base.ref == 'main'",
             "github.event.pull_request.base.repo.full_name == github.repository",
@@ -157,6 +157,8 @@ def test_reusable_arc_classifier_is_exact_and_human_only() -> None:
             "!endsWith(github.triggering_actor, '[bot]')",
         ):
             assert required in route
+        assert "refs/pull/{0}/merge" not in route
+        assert "github.event.number" not in route
         assert '[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]' in route
         assert "inputs.activate_arc" not in route.split("||", 1)[0]
     for name in KUBERNETES_JOBS:
