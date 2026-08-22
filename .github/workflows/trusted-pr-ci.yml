@@ -11,19 +11,4 @@ jobs:
   ci:
     uses: EndurantDevs/healthcare-mrf-api/.github/workflows/ci.yml@main
     with:
-      activate_arc: >-
-        ${{ vars.HEALTHCARE_MRF_CI_RUNNER != '' &&
-        vars.HEALTHCARE_MRF_DIND_CI_RUNNER != '' &&
-        github.repository == 'EndurantDevs/healthcare-mrf-api' &&
-        github.event_name == 'pull_request' &&
-        github.ref == format('refs/pull/{0}/merge', github.event.number) &&
-        github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
-        github.event.pull_request.base.ref == 'main' &&
-        github.event.pull_request.base.repo.full_name == github.repository &&
-        github.event.pull_request.head.repo.full_name == github.repository &&
-        github.event.pull_request.head.repo.fork == false &&
-        github.event.pull_request.user.type == 'User' &&
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
-        github.actor != 'dependabot[bot]' &&
-        !endsWith(github.actor, '[bot]') &&
-        !endsWith(github.triggering_actor, '[bot]') }}
+      activate_arc: true

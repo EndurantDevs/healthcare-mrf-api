@@ -21,11 +21,17 @@ def test_ci_readability_ratchet_requires_python_debt_reduction():
     workflow_text = (
         Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
     ).read_text(encoding="utf-8")
+    caller_text = (
+        Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / "trusted-pr-ci.yml"
+    ).read_text(encoding="utf-8")
     prepush_text = (
         Path(__file__).resolve().parents[1] / "scripts" / "ci" / "prepush"
     ).read_text(encoding="utf-8")
 
-    assert "types: [opened, synchronize, reopened, labeled, unlabeled]" in workflow_text
+    assert "types: [opened, synchronize, reopened, labeled, unlabeled]" in caller_text
     assert "run: scripts/ci/prepush quality" in workflow_text
     assert 'git diff --quiet "$BASE_SHA" HEAD -- \\' in prepush_text
     for source_root in ("api", "db", "process", "service"):

@@ -2,8 +2,9 @@
 set -euo pipefail
 
 workflow_path=".github/workflows/ci.yml"
+caller_path=".github/workflows/trusted-pr-ci.yml"
 prepush_path="scripts/ci/prepush"
-trigger_block="$(sed -n '/^on:/,/^permissions:/p' "$workflow_path")"
+trigger_block="$(sed -n '/^on:/,/^permissions:/p' "$caller_path")"
 quality_job="$(sed -n '/^  python-quality:/,/^  python-tests:/p' "$workflow_path")"
 policy_block="$(sed -n '/^run_quality() {/,/^}/p' "$prepush_path")"
 

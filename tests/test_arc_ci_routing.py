@@ -75,28 +75,6 @@ POSTGRES_HOST_EXPRESSION = (
     "${{ runner.environment == 'self-hosted' && "
     "'127.0.0.1' || 'postgres' }}"
 )
-CALLER_ACTIVATE_EXPRESSION = (
-    "${{ vars.HEALTHCARE_MRF_CI_RUNNER != '' && "
-    "vars.HEALTHCARE_MRF_DIND_CI_RUNNER != '' && "
-    "github.repository == 'EndurantDevs/healthcare-mrf-api' && "
-    "github.event_name == 'pull_request' && "
-    "github.ref == format('refs/pull/{0}/merge', github.event.number) && "
-    "github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/"
-    ".github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', "
-    "github.event.number) && "
-    "github.event.pull_request.base.ref == 'main' && "
-    "github.event.pull_request.base.repo.full_name == github.repository && "
-    "github.event.pull_request.head.repo.full_name == github.repository && "
-    "github.event.pull_request.head.repo.fork == false && "
-    "github.event.pull_request.user.type == 'User' && "
-    "contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'), "
-    "github.event.pull_request.author_association) && "
-    "github.actor != 'dependabot[bot]' && "
-    "!endsWith(github.actor, '[bot]') && "
-    "!endsWith(github.triggering_actor, '[bot]') }}"
-)
-
-
 def _values_for_key(value: object, key: str) -> list[object]:
     matches: list[object] = []
     if isinstance(value, dict):
@@ -174,9 +152,12 @@ def test_trusted_pr_caller_is_one_secretless_protected_workflow_call() -> None:
                 "EndurantDevs/healthcare-mrf-api/"
                 ".github/workflows/ci.yml@main"
             ),
-            "with": {"activate_arc": CALLER_ACTIVATE_EXPRESSION},
+            "with": {"activate_arc": True},
         }
     }
+    caller = CALLER.read_text(encoding="utf-8")
+    assert "vars." not in caller
+    assert "github.workflow_ref" not in caller
 
 
 def test_reusable_arc_classifier_is_exact_and_human_only() -> None:
