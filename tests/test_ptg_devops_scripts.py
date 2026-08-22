@@ -2,7 +2,11 @@
 
 import importlib.util
 import asyncio
+import os
 from pathlib import Path
+import subprocess
+
+import yaml
 
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts" / "devops"
@@ -69,6 +73,62 @@ def test_dev_deploy_workflow_requires_one_terminal_source_bound_receipt():
         "config_digest=sha256:[0-9a-f]{64}",
     ):
         assert field in workflow
+
+
+def test_dev_deploy_workflow_executes_receipt_failure_paths(tmp_path):
+    workflow = yaml.safe_load(
+        (REPOSITORY_ROOT / ".github/workflows/deploy-dev.yml").read_text()
+    )
+    deploy_script = next(
+        step["run"]
+        for step in workflow["jobs"]["queue"]["steps"]
+        if step.get("name") == "Deploy on dev node"
+    )
+    ssh_stub = tmp_path / "ssh"
+    ssh_stub.write_text(
+        '#!/bin/sh\nprintf \'%s\\n\' "${SSH_OUTPUT}"\nexit "${SSH_STATUS}"\n'
+    )
+    ssh_stub.chmod(0o755)
+
+    source_sha = "a" * 40
+    receipt = (
+        "healthporta_deploy_receipt_v1 service=healthcare-mrf-api "
+        f"source_sha={source_sha} deploy_sha={'b' * 40} image=registry/image@sha256:digest "
+        f"manifest_digest=sha256:{'c' * 64} config_digest=sha256:{'d' * 64}"
+    )
+    base_env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "RUNNER_TEMP": str(tmp_path),
+        "DEV_DEPLOY_HOST": "localhost",
+        "DEPLOY_SHA": source_sha,
+        "DEPLOY_BRANCH": "main",
+        "PTG_V3_PHASE": "auto",
+    }
+    cases = (
+        ("valid", f"progress\n{receipt}", 0, True),
+        ("duplicate", f"{receipt}\n{receipt}", 0, False),
+        ("non-terminal", f"{receipt}\ntrailing output", 0, False),
+        ("ssh failure", receipt, 42, False),
+    )
+
+    for label, output, ssh_status, should_succeed in cases:
+        completed = subprocess.run(
+            ["bash", "-c", deploy_script],
+            env={
+                **base_env,
+                "SSH_OUTPUT": output,
+                "SSH_STATUS": str(ssh_status),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert (completed.returncode == 0) is should_succeed, (
+            label,
+            completed.stdout,
+            completed.stderr,
+        )
 
 
 def test_cutover_requires_idle_valid_pointers():
