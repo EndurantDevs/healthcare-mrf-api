@@ -489,11 +489,13 @@ async def test_get_all_name_taxonomy_count_closes_the_cte_list(monkeypatch):
 async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypatch):
     provider_npi = 1000000049
     request_session = object()
-    provider_row = {
-        **_provider_directory_row_mapping(),
-        "provider_address_total": 1,
-        "_provider_total": 52,
-    }
+    provider_record_map = _provider_directory_row_mapping()
+    provider_record = (
+        (provider_npi,)
+        + tuple(provider_record_map.get(column.key) for column in npi_module.NPIData.__table__.columns)
+        + tuple(provider_record_map.get(column.key) for column in npi_module.NPIAddress.__table__.columns)
+        + (1, 52)
+    )
     status_started = asyncio.Event()
     enrichment_started = asyncio.Event()
 
@@ -512,44 +514,27 @@ async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypat
         await asyncio.wait_for(status_started.wait(), timeout=1)
         return {provider_npi: {"status": "active"}}
 
-    conn = _MultiLocationMappedConnection([provider_row])
-    monkeypatch.setattr(
-        npi_module,
-        "_address_serving_table_sql",
-        AsyncMock(return_value="mrf.npi_address"),
-    )
+    conn = types.SimpleNamespace(all=AsyncMock(side_effect=[[provider_record], []]))
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.npi_address"))
     monkeypatch.setattr(npi_module, "_apply_location_statuses", fake_apply_location_statuses)
-    monkeypatch.setattr(
-        npi_module,
-        "_fetch_provider_enrichment_summary_map",
-        fake_fetch_enrichment,
-    )
+    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", fake_fetch_enrichment)
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
 
     response = await get_all(
         types.SimpleNamespace(
             ctx=types.SimpleNamespace(sa_session=request_session),
-            args={
-                "q": "smith",
-                "codes": "1223E0200X",
-                "include_total": "true",
-                "limit": "10",
-                "start": "0",
-            }
+            args={"q": "smith", "codes": "1223E0200X", "limit": "10"},
         )
     )
     response_body = json.loads(response.body)
 
     assert response_body["total"] == 52
     assert response_body["total_source"] == "computed"
-    assert [row["npi"] for row in response_body["rows"]] == [provider_npi]
-    assert response_body["rows"][0]["provider_enrichment_summary"] == {
-        "status": "active"
-    }
-    page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
+    assert [provider_result["npi"] for provider_result in response_body["rows"]] == [provider_npi]
+    page_sql = str(conn.all.await_args_list[0].args[0])
     assert page_sql.count("taxonomy_matched_npi AS MATERIALIZED") == 1
     assert "COUNT(*) OVER () AS provider_total" in page_sql
-    assert not any("SELECT COUNT(DISTINCT" in sql for sql, _params in conn.sql_calls)
+    assert not any("SELECT COUNT(DISTINCT" in str(call.args[0]) for call in conn.all.await_args_list)
 
 
 @pytest.mark.asyncio

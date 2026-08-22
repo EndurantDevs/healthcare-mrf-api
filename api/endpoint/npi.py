@@ -9416,6 +9416,7 @@ async def list_providers(request):
             + tuple(column.key for column in NPIData.__table__.columns)
             + projected_candidate_names
             + ("provider_address_total",)
+            + (("_provider_total",) if inline_name_taxonomy_total else ())
         )
 
         taxonomy_filter = " and ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
