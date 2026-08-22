@@ -94,7 +94,7 @@ def _request_once(
 
 def test_response_parity_requires_default_npi_order():
     expected_npis = ("1003010604", "1598811960")
-    document = {
+    response_document_map = {
         "rows": [
             {
                 "npi": npi,
@@ -108,10 +108,10 @@ def test_response_parity_requires_default_npi_order():
         "total_source": "computed",
     }
 
-    _assert_response_parity(document, expected_npis, 2)
-    document["rows"].reverse()
+    _assert_response_parity(response_document_map, expected_npis, 2)
+    response_document_map["rows"].reverse()
     with pytest.raises(AssertionError):
-        _assert_response_parity(document, expected_npis, 2)
+        _assert_response_parity(response_document_map, expected_npis, 2)
 
 
 @pytest.mark.parametrize(
