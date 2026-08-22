@@ -5320,7 +5320,7 @@ async def test_list_providers_by_procedure_rejects_broad_group_plan_office_visit
 
 
 @pytest.mark.asyncio
-async def test_canonical_plan_uses_binding_market_for_broad_expansion_guard(
+async def test_canonical_plan_uses_binding_market_for_statewide_taxonomy_guard(
     monkeypatch,
 ):
     selection = _canonical_release_selection(
@@ -5356,16 +5356,16 @@ async def test_canonical_plan_uses_binding_market_for_broad_expansion_guard(
             "plan_release_id": selection.plan_release_id,
             "market_type": "individual",
             "code": "99213",
-            "code_system": "CPT",
             "state": "IL",
             "city": "Chicago",
-            "include_providers": "true",
+            "include_providers": "false",
+            "classification": "Family Medicine",
         },
     )
 
     with pytest.raises(
         pricing_module.InvalidUsage,
-        match="provider-directory request",
+        match=r"zip5.*zip_radius_miles",
     ):
         await list_providers_by_procedure(request)
 
@@ -5385,7 +5385,7 @@ async def test_list_providers_by_procedure_rejects_statewide_taxonomy_office_vis
             "code_system": "CPT",
             "state": "IL",
             "city": "Chicago",
-            "include_providers": "true",
+            "include_providers": "false",
             "classification": "Family Medicine",
         },
     )
