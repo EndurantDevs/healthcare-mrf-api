@@ -531,6 +531,8 @@ async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypat
     assert response_body["total"] == 52
     assert response_body["total_source"] == "computed"
     assert [provider_result["npi"] for provider_result in response_body["rows"]] == [provider_npi]
+    assert response_body["rows"][0]["location_status"] == "active"
+    assert response_body["rows"][0]["provider_enrichment_summary"] == {"status": "active"}
     page_sql = str(conn.all.await_args_list[0].args[0])
     assert page_sql.count("taxonomy_matched_npi AS MATERIALIZED") == 1
     assert "COUNT(*) OVER () AS provider_total" in page_sql
