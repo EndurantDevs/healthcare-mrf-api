@@ -5392,7 +5392,7 @@ async def test_list_providers_by_procedure_rejects_statewide_taxonomy_office_vis
 
     with pytest.raises(
         pricing_module.InvalidUsage,
-        match="zip5.*zip_radius_miles",
+        match=r"zip5.*zip_radius_miles",
     ) as raised:
         await list_providers_by_procedure(request)
 
@@ -5433,7 +5433,7 @@ async def test_taxonomy_office_visit_without_locator_still_fails_fast(monkeypatc
 
     with pytest.raises(
         pricing_module.InvalidUsage,
-        match="zip5.*zip_radius_miles",
+        match=r"zip5.*zip_radius_miles",
     ):
         await list_providers_by_procedure(request)
 
