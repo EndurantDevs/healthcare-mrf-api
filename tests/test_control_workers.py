@@ -835,7 +835,13 @@ def test_kubernetes_worker_job_uses_resource_profile(monkeypatch):
 def test_kubernetes_worker_job_sets_finalizer_identity_capacity_only_for_ptg_huge():
     capacity_env_by_worker = {}
 
-    for queue in ("arq:PTGSmall", "arq:PTG", "arq:PTGLarge", "arq:PTGHuge"):
+    for queue in (
+        "arq:PTGSmall",
+        "arq:PTG",
+        "arq:PTGNormal",
+        "arq:PTGLarge",
+        "arq:PTGHuge",
+    ):
         spec = control_workers._BY_QUEUE[queue]
         job = control_workers._worker_job_manifest(
             spec,
@@ -852,6 +858,7 @@ def test_kubernetes_worker_job_sets_finalizer_identity_capacity_only_for_ptg_hug
     assert capacity_env_by_worker == {
         "process.PTGSmall": [],
         "process.PTG": [],
+        "process.PTGNormal": [],
         "process.PTGLarge": [],
         "process.PTGHuge": [
             {
