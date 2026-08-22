@@ -96,7 +96,7 @@ def test_dev_deploy_workflow_executes_receipt_failure_paths(tmp_path):
         f"source_sha={source_sha} deploy_sha={'b' * 40} image=registry/image@sha256:digest "
         f"manifest_digest=sha256:{'c' * 64} config_digest=sha256:{'d' * 64}"
     )
-    base_env = {
+    environment_by_name = {
         **os.environ,
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
         "RUNNER_TEMP": str(tmp_path),
@@ -116,7 +116,7 @@ def test_dev_deploy_workflow_executes_receipt_failure_paths(tmp_path):
         completed = subprocess.run(
             ["bash", "-c", deploy_script],
             env={
-                **base_env,
+                **environment_by_name,
                 "SSH_OUTPUT": output,
                 "SSH_STATUS": str(ssh_status),
             },
