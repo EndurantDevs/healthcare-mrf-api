@@ -45,11 +45,9 @@ def _loopback_endpoint(query: dict[str, str]) -> str:
 
 def _expected_npis(environment_name: str) -> tuple[str, ...]:
     expected_npis = tuple(
-        sorted(
-            value.strip()
-            for value in str(os.getenv(environment_name) or "").split(",")
-            if value.strip()
-        )
+        value.strip()
+        for value in str(os.getenv(environment_name) or "").split(",")
+        if value.strip()
     )
     assert expected_npis, f"set {environment_name} to the exact parity oracle"
     assert all(value.isdigit() and len(value) == 10 for value in expected_npis)
@@ -92,8 +90,10 @@ def _request_once(
     return elapsed_ms
 
 
-def test_response_parity_requires_default_npi_order():
-    expected_npis = ("1003010604", "1598811960")
+def test_response_parity_requires_configured_npi_order(monkeypatch):
+    monkeypatch.setenv(EXPECTED_NPIS_ENV, "1598811960,1003010604")
+    expected_npis = _expected_npis(EXPECTED_NPIS_ENV)
+    assert expected_npis == ("1598811960", "1003010604")
     response_document_map = {
         "rows": [
             {
@@ -116,7 +116,7 @@ def test_response_parity_requires_default_npi_order():
 
 @pytest.mark.parametrize(
     ("query", "expected_npis_environment", "expected_total_environment"),
-    (
+    [
         (
             {"q": "wheeler", "codes": EXPECTED_TAXONOMY_CODE},
             EXPECTED_NPIS_ENV,
@@ -127,7 +127,7 @@ def test_response_parity_requires_default_npi_order():
             SMITH_EXPECTED_NPIS_ENV,
             SMITH_EXPECTED_TOTAL_ENV,
         ),
-    ),
+    ],
     ids=("wheeler", "smith-limit-10"),
 )
 def test_name_taxonomy_process_loopback_warm_latency_and_parity(
