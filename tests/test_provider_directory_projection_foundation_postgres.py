@@ -69,6 +69,7 @@ from tests.provider_directory_projection_foundation_postgres_support import (
 )
 from tests.provider_directory_retained_core_postgres_support import (
     admit_campaign_item,
+    bind_produced_manifest,
     campaign_item,
     fixed_campaign_plan,
     ordered_campaign_plan,
@@ -644,9 +645,11 @@ def _two_range_artifact(label: str, artifact_kind: str) -> ProducedArtifact:
         producer_build_id="retained-core-fixture-v1",
         ranges=ranges,
     )
-    return replace(
-        provisional,
-        range_set_sha256=expected_range_set_digest(provisional),
+    return bind_produced_manifest(
+        replace(
+            provisional,
+            range_set_sha256=expected_range_set_digest(provisional),
+        )
     )
 
 

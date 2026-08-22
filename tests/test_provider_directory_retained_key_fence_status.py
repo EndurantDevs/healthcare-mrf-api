@@ -441,7 +441,7 @@ async def _assert_far_future_fence_rejected(connection, leased_state):
 async def _assert_completed_item_fence_rejected(connection, leased_state):
     retained_item, campaign_id, campaign_lease, item_lease = leased_state
     artifact = registry_artifact("completed-fence", retained_item.artifact_kind)
-    await admit_campaign_item(connection, campaign_id, retained_item, artifact)
+    await admit_campaign_item(connection, campaign_id, retained_item, artifact, item_lease=item_lease)
     with pytest.raises(RetainedArtifactError, match="already_complete"):
         await reserve_endpoint_request_slot(
             connection,

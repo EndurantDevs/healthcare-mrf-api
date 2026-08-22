@@ -21,6 +21,7 @@ from process.provider_directory_retained_seal_store import (
 from process.provider_directory_retained_store_support import database_table
 from tests.provider_directory_retained_core_postgres_support import (
     admit_campaign_item,
+    bind_produced_manifest,
     campaign_item,
     fixed_campaign_plan,
     registry_artifact,
@@ -109,9 +110,11 @@ def _artifact_with_nonzero_range(
         canonical_byte_count=len(range_bytes),
         ranges=(layout_range,),
     )
-    return replace(
-        provisional_artifact,
-        range_set_sha256=expected_range_set_digest(provisional_artifact),
+    return bind_produced_manifest(
+        replace(
+            provisional_artifact,
+            range_set_sha256=expected_range_set_digest(provisional_artifact),
+        )
     )
 
 
