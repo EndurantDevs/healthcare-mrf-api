@@ -144,8 +144,8 @@ def test_reusable_arc_classifier_is_exact_and_human_only() -> None:
             "github.event_name == 'pull_request'",
             (
                 "github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/"
-                + ".github/workflows/trusted-pr-ci.yml@refs/heads/{0}', "
-                + "github.head_ref)"
+                ".github/workflows/trusted-pr-ci.yml@refs/heads/{0}', "
+                "github.head_ref)"
             ),
             "github.repository == 'EndurantDevs/healthcare-mrf-api'",
             "github.event.pull_request.base.ref == 'main'",
