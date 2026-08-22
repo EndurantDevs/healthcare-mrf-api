@@ -259,10 +259,7 @@ def test_arc_jobs_use_the_pinned_image_toolchain() -> None:
     rust_actions = _values_for_key(document["jobs"]["rust-scanner"], "uses")
     assert not any(
         isinstance(action, str)
-        and (
-            action.startswith("dtolnay/rust-toolchain@")
-            or action.startswith("Swatinem/rust-cache@")
-        )
+        and action.startswith(("dtolnay/rust-toolchain@", "Swatinem/rust-cache@"))
         for action in rust_actions
     )
 
