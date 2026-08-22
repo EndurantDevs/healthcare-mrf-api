@@ -224,7 +224,7 @@ def test_every_python_mode_uses_the_exact_lock() -> None:
     assert "requirements-ci.lock scripts/ci/install_python_lock" in script
     assert "python -m pip freeze --all" in script
     assert 'PYTHON_VERSION: "3.14.6"' in workflow
-    assert workflow.count("cache-dependency-path: requirements-ci.lock") == 5
+    assert workflow.count("cache-dependency-path: requirements-ci.lock") == 4
     assert "actions/setup-python@" not in _job(workflow, "container-package")
 
 

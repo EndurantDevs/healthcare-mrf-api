@@ -10,9 +10,8 @@ import yaml
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
 PREPUSH = Path(__file__).resolve().parents[1] / "scripts/ci/prepush"
 ARC_RUNNER_EXPRESSION = (
-    "${{ (github.event_name == 'push' || "
-    "github.event_name == 'workflow_dispatch') && "
-    "github.ref == 'refs/heads/main' && "
+    "${{ github.event_name == 'pull_request' && "
+    "github.event.pull_request.head.repo.fork && 'ubuntu-latest' || "
     "vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}"
 )
 COVERAGE_BASE_EXPRESSION = (
@@ -28,12 +27,12 @@ ARC_IMAGE = (
 ARC_JOBS = {
     "public-hygiene",
     "python-quality",
+    "python-tests",
     "capacity-evidence",
     "test-coverage",
     "api-contract",
 }
 HOSTED_JOBS = {
-    "python-tests",
     "rust-scanner",
     "container-package",
     "security",
@@ -58,7 +57,7 @@ def _documents() -> tuple[dict, dict]:
     return yaml.safe_load(workflow), yaml.load(workflow, Loader=yaml.BaseLoader)
 
 
-def test_arc_route_is_trusted_main_only_with_a_hosted_fallback() -> None:
+def test_arc_route_uses_a_hosted_fallback_for_fork_pull_requests() -> None:
     document, trigger_document = _documents()
 
     assert set(trigger_document["on"]) == {
