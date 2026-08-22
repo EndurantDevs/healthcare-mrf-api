@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -58,6 +60,105 @@ def _assert_pid_exits(process_id: int, timeout: float = 5.0) -> None:
     while _is_pid_alive(process_id) and time.monotonic() < deadline:
         time.sleep(0.02)
     assert not _is_pid_alive(process_id), f"process {process_id} survived cancellation"
+
+
+def _write_proc_stat(
+    proc_root: Path, process_id: int, state: str, group_id: int
+) -> None:
+    process_root = proc_root / str(process_id)
+    process_root.mkdir()
+    (process_root / "stat").write_text(
+        f"{process_id} (test process) {state} 1 {group_id}\n",
+        encoding="ascii",
+    )
+
+
+def test_linux_process_group_liveness_ignores_only_terminal_members(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    process_group_id = 71
+    _write_proc_stat(tmp_path, 101, "Z", process_group_id)
+    _write_proc_stat(tmp_path, 102, "X", process_group_id)
+    _write_proc_stat(tmp_path, 103, "S", process_group_id + 1)
+    monkeypatch.setattr(rust_scanner.os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(rust_scanner.os, "killpg", lambda *_args: None)
+    monkeypatch.setattr(rust_scanner, "_LINUX_PROC_ROOT", tmp_path, raising=False)
+
+    assert not rust_scanner._is_process_group_alive(process_group_id)
+
+    _write_proc_stat(tmp_path, 104, "S", process_group_id)
+    assert rust_scanner._is_process_group_alive(process_group_id)
+
+
+def test_linux_process_group_liveness_fails_closed_for_indeterminate_procfs(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    process_group_id = 71
+    monkeypatch.setattr(rust_scanner.os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(rust_scanner.os, "killpg", lambda *_args: None)
+
+    missing_root = tmp_path / "missing"
+    monkeypatch.setattr(rust_scanner, "_LINUX_PROC_ROOT", missing_root, raising=False)
+    assert rust_scanner._is_process_group_alive(process_group_id)
+
+    unrelated_root = tmp_path / "unrelated"
+    unrelated_root.mkdir()
+    _write_proc_stat(unrelated_root, 100, "S", process_group_id + 1)
+    monkeypatch.setattr(rust_scanner, "_LINUX_PROC_ROOT", unrelated_root)
+    assert rust_scanner._is_process_group_alive(process_group_id)
+
+    malformed_root = tmp_path / "malformed"
+    malformed_root.mkdir()
+    malformed_process_root = malformed_root / "101"
+    malformed_process_root.mkdir()
+    (malformed_process_root / "stat").write_text("malformed\n", encoding="ascii")
+    monkeypatch.setattr(rust_scanner, "_LINUX_PROC_ROOT", malformed_root)
+    assert rust_scanner._is_process_group_alive(process_group_id)
+
+    class UnreadableProc:
+        @staticmethod
+        def iterdir():
+            raise PermissionError
+
+    monkeypatch.setattr(rust_scanner, "_LINUX_PROC_ROOT", UnreadableProc())
+    assert rust_scanner._is_process_group_alive(process_group_id)
+
+
+def test_non_linux_posix_process_group_liveness_keeps_signal_zero_result(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(rust_scanner.os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(rust_scanner.os, "killpg", lambda *_args: None)
+
+    assert rust_scanner._is_process_group_alive(71)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires procfs")
+def test_real_linux_zombie_only_process_group_is_not_alive() -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        start_new_session=True,
+    )
+    try:
+        stat_path = Path(f"/proc/{process.pid}/stat")
+        deadline = time.monotonic() + 5
+        while (
+            stat_path.read_text(encoding="ascii").rpartition(")")[2].split()[0]
+            != "Z"
+        ):
+            if time.monotonic() >= deadline:
+                raise AssertionError("timed out waiting for zombie process state")
+            time.sleep(0.01)
+
+        os.killpg(process.pid, 0)
+        assert not rust_scanner._is_process_group_alive(process.pid)
+    finally:
+        process.wait(timeout=5)
 
 
 def _scanner_invocation(tmp_path: Path) -> dict[str, object]:

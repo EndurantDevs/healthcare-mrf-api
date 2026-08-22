@@ -13,6 +13,7 @@ import queue
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -117,6 +118,8 @@ _V3_SHARED_GRAPH_SUMMARY_MAX_BYTES = 1024 * 1024
 _PROCESS_GROUP_TERM_TIMEOUT_SECONDS = 2.0
 _PROCESS_GROUP_KILL_TIMEOUT_SECONDS = 2.0
 _PROCESS_GROUP_POLL_SECONDS = 0.02
+_LINUX_PROC_ROOT = Path("/proc")
+_LINUX_TERMINAL_PROCESS_STATES = frozenset({"Z", "X", "x"})
 _ASYNC_READER_QUEUE_PUT_TIMEOUT_SECONDS = 0.05
 _V3_SHARED_GRAPH_OUTPUT_NAMES = {
     "block_copy_path": "graph-blocks.copy",
@@ -263,6 +266,42 @@ def _prepare_source_witness_scratch_directory(run_directory: Path) -> Path:
     return scratch_path
 
 
+def _has_live_linux_process_group_member(process_group_id: int) -> bool | None:
+    """Return live membership, or ``None`` when procfs cannot decide safely."""
+
+    has_group_member = False
+    try:
+        for process_root in _LINUX_PROC_ROOT.iterdir():
+            if not process_root.name.isdecimal():
+                continue
+            try:
+                process_stat = (process_root / "stat").read_text(encoding="ascii")
+            except FileNotFoundError:
+                continue
+            identity, separator, stat_fields = process_stat.rpartition(")")
+            fields = stat_fields.split()
+            if (
+                separator != ")"
+                or not identity.startswith(f"{process_root.name} (")
+                or len(fields) < 3
+                or len(fields[0]) != 1
+            ):
+                return None
+            try:
+                int(fields[1])
+                member_group_id = int(fields[2])
+            except ValueError:
+                return None
+            if member_group_id != process_group_id:
+                continue
+            has_group_member = True
+            if fields[0] not in _LINUX_TERMINAL_PROCESS_STATES:
+                return True
+    except (OSError, UnicodeError):
+        return None
+    return False if has_group_member else None
+
+
 def _is_process_group_alive(process_group_id: int) -> bool:
     if os.name != "posix":
         return False
@@ -272,6 +311,10 @@ def _is_process_group_alive(process_group_id: int) -> bool:
         return False
     except PermissionError:
         return True
+    if sys.platform.startswith("linux"):
+        has_live_member = _has_live_linux_process_group_member(process_group_id)
+        if has_live_member is not None:
+            return has_live_member
     return True
 
 
