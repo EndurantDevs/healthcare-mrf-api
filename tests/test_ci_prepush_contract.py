@@ -7,6 +7,8 @@ from pathlib import Path
 import re
 import subprocess
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -95,7 +97,7 @@ if output=$(wait_for_service Missing 0 never 2>&1); then exit 1; fi
 
 def test_local_all_pins_ci_images_inputs_and_safety_margins() -> None:
     script = PREPUSH.read_text(encoding="utf-8")
-    assert "ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c" in script
+    assert "ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:0e97164f0e06b60fe5608e5654e026a88c3ef5d3b6a195a26fdc60489b404803" in script
     assert "postgis/postgis:18-3.6@sha256:0aacdfb9dda40942d424785c3ccabeffe31da9cc9e26b0dfd93b222b31462871" in script
     assert "redis:7@sha256:e9b2e45ecd47fbb69b877cf8d045d5cccaaaed52524b6e098b4abe8212994f73" in script
     assert "--platform linux/amd64" in script
@@ -273,7 +275,16 @@ def test_every_python_mode_uses_the_exact_lock() -> None:
     assert "requirements-ci.lock scripts/ci/install_python_lock" in script
     assert "python -m pip freeze --all" in script
     assert 'PYTHON_VERSION: "3.14.6"' in workflow
-    assert workflow.count("cache-dependency-path: requirements-ci.lock") == 5
+    document = yaml.safe_load(workflow)
+    setup_python_jobs = {
+        name
+        for name, job in document["jobs"].items()
+        if any(
+            str(step.get("uses", "")).startswith("actions/setup-python@")
+            for step in job["steps"]
+        )
+    }
+    assert setup_python_jobs == {"security"}
     assert "actions/setup-python@" not in _job(workflow, "container-package")
 
 
