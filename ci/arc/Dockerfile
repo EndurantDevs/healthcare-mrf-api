@@ -29,6 +29,7 @@ RUN apt-get update \
         libpq-dev \
         pkg-config \
         postgresql-client \
+        tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
