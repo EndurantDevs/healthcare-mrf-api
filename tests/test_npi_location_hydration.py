@@ -268,7 +268,10 @@ async def test_location_status_lookup_normalizes_rows_and_empty_input(monkeypatc
     assert execute_stmt.await_args.kwargs["params"] == {
         "source_record_ids": ["synthetic-role-a", "synthetic-role-b"]
     }
-    assert "PractitionerRole" in str(execute_stmt.await_args.args[0])
+    status_sql = str(execute_stmt.await_args.args[0])
+    assert "PractitionerRole" in status_sql
+    assert "matched_overlays AS MATERIALIZED" in status_sql
+    assert "FROM matched_overlays AS overlay" in status_sql
 
 
 @pytest.mark.asyncio
