@@ -40,7 +40,19 @@ env:
 jobs:
   public-hygiene:
     name: public hygiene
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]')) &&
+      vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:
@@ -56,7 +68,19 @@ jobs:
         run: scripts/ci/prepush hygiene
   python-quality:
     name: python quality
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]')) &&
+      vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:
@@ -75,7 +99,24 @@ jobs:
         run: scripts/ci/prepush quality
   python-tests:
     name: python test suite (${{ matrix.shard-index }}/4)
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]')) &&
+      vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 15
     strategy:
       fail-fast: true
@@ -89,11 +130,6 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
           ref: ${{ github.sha }}
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-          cache-dependency-path: requirements-ci.lock
       - name: Run shared pre-push gate
         run: scripts/ci/prepush python-main "${{ matrix.shard-index }}"
       - name: Upload main-suite coverage data
@@ -108,7 +144,19 @@ jobs:
 
   capacity-evidence:
     name: ptg2 capacity evidence
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]')) &&
+      vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:
@@ -148,7 +196,19 @@ jobs:
       - security
       - worker-queue-smoke
       - address-canonical-db-tests
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]')) &&
+      vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:
@@ -191,7 +251,19 @@ jobs:
 
   api-contract:
     name: openapi contract
-    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]')) &&
+      vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:
@@ -206,7 +278,24 @@ jobs:
         run: scripts/ci/prepush api-contract
   rust-scanner:
     name: rust scanner
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]')) &&
+      vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -214,16 +303,6 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
           ref: ${{ github.sha }}
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-          components: rustfmt, clippy, llvm-tools-preview
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-          cache-dependency-path: requirements-ci.lock
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           workspaces: support/ptg2_scanner
@@ -247,7 +326,19 @@ jobs:
           retention-days: 1
   container-package:
     name: linux container package
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]')) &&
+      vars.HEALTHCARE_MRF_DIND_CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -257,7 +348,19 @@ jobs:
         run: scripts/ci/prepush container-package
   security:
     name: dependency and semgrep security
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]')) &&
+      vars.HEALTHCARE_MRF_DIND_CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -272,7 +375,24 @@ jobs:
         run: scripts/ci/prepush security
   worker-queue-smoke:
     name: redis worker queue smoke
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]')) &&
+      vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 15
     services:
       redis:
@@ -285,21 +405,45 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
+      HLTHPRT_REDIS_ADDRESS: >-
+        ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+        github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+        github.event_name == 'pull_request' &&
+        github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+        github.event.pull_request.base.ref == 'main' &&
+        github.event.pull_request.base.repo.full_name == github.repository &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.head.repo.fork == false &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+        github.event.pull_request.user.type == 'User' &&
+        github.actor != 'dependabot[bot]')) && vars.HEALTHCARE_MRF_CI_RUNNER &&
+        'redis://127.0.0.1:6379' || 'redis://redis:6379' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-          cache-dependency-path: requirements-ci.lock
       - name: Run shared pre-push gate
         run: scripts/ci/prepush redis
   address-canonical-db-tests:
     name: postgres18 postgis tests (${{ matrix.shard }})
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+      github.event_name == 'pull_request' &&
+      github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.repo.fork == false &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]')) &&
+      vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 15
     strategy:
       fail-fast: true
@@ -328,25 +472,44 @@ jobs:
         --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main
         --cov-branch --cov-report= --cov-append
       HLTHPRT_DB_DRIVER: asyncpg
-      HLTHPRT_DB_HOST: 127.0.0.1
+      HLTHPRT_DB_HOST: >-
+        ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+        github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+        github.event_name == 'pull_request' &&
+        github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+        github.event.pull_request.base.ref == 'main' &&
+        github.event.pull_request.base.repo.full_name == github.repository &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.head.repo.fork == false &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+        github.event.pull_request.user.type == 'User' &&
+        github.actor != 'dependabot[bot]')) && vars.HEALTHCARE_MRF_CI_RUNNER &&
+        '127.0.0.1' || 'postgres' }}
       HLTHPRT_DB_PORT: "5432"
       HLTHPRT_DB_USER: postgres
       HLTHPRT_DB_PASSWORD: postgres
       HLTHPRT_DB_DATABASE: ptg2_v3_lifecycle_test_ci_runner
       HLTHPRT_DB_SCHEMA: mrf
       DB_SCHEMA: mrf
-      HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
+      HLTHPRT_REDIS_ADDRESS: >-
+        ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+        github.ref == 'refs/heads/main') || (inputs.activate_arc &&
+        github.event_name == 'pull_request' &&
+        github.repository == 'EndurantDevs/healthcare-mrf-api' &&
+        github.event.pull_request.base.ref == 'main' &&
+        github.event.pull_request.base.repo.full_name == github.repository &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.head.repo.fork == false &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+        github.event.pull_request.user.type == 'User' &&
+        github.actor != 'dependabot[bot]')) && vars.HEALTHCARE_MRF_CI_RUNNER &&
+        'redis://127.0.0.1:6379' || 'redis://redis:6379' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           fetch-depth: 0
           ref: ${{ github.sha }}
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-          cache-dependency-path: requirements-ci.lock
       - name: Run shared pre-push gate
         run: scripts/ci/prepush postgres "${{ matrix.shard }}"
       - name: Upload PostgreSQL coverage data

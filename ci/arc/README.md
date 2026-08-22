@@ -8,8 +8,15 @@ source, credentials, private package configuration, deployment metadata, or
 runtime data. Base images and workflow references are immutable digest or
 commit pins. Workflows consume the published image by digest.
 
-Pull-request jobs remain on GitHub-hosted runners. The self-hosted boundary is
-also enforced outside this repository by an organization runner group that is
-limited to this repository and to the `CI` workflow on `refs/heads/main`.
-That workflow is reusable so a later protected-main caller can preserve the
-same boundary; this foundation does not activate pull-request routing.
+Pull-request jobs remain on GitHub-hosted runners in this foundation. A later
+caller may request ARC only through this workflow on protected `main`; the
+default-false input is combined with exact repository, base-branch, non-fork,
+trusted-human association, and non-bot checks. An organization runner group
+independently limits self-hosted use to this repository and to `.github/workflows/ci.yml`
+on `refs/heads/main`.
+
+The future route assigns Kubernetes-compatible jobs to
+`HEALTHCARE_MRF_CI_RUNNER`; only container packaging and security use
+`HEALTHCARE_MRF_DIND_CI_RUNNER`. Direct pull-request CI and all forks keep the
+hosted fallback until the protected caller, infrastructure, variables, and
+required-check migration are separately reviewed and activated.

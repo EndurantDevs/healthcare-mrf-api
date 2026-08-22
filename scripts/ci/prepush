@@ -475,9 +475,11 @@ run_redis() {
   python - <<'PY'
 import asyncio
 import os
+import time
 from urllib.parse import urlparse
 
 from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 
 async def main() -> None:
@@ -487,6 +489,15 @@ async def main() -> None:
         port=address.port or 6379,
         decode_responses=True,
     )
+    deadline = time.monotonic() + 90
+    while True:
+        try:
+            assert await redis.ping()
+            break
+        except (OSError, RedisConnectionError):
+            if time.monotonic() >= deadline:
+                raise
+            await asyncio.sleep(1)
     await redis.rpush("arq:ci-smoke", "healthporta-ci")
     assert await redis.llen("arq:ci-smoke") == 1
     await redis.delete("arq:ci-smoke")
@@ -505,18 +516,27 @@ prepare_postgres() {
   python - <<'PY'
 import asyncio
 import os
+import time
 
 import asyncpg
 
 
 async def main() -> None:
-    conn = await asyncpg.connect(
-        host=os.environ["HLTHPRT_DB_HOST"],
-        port=int(os.environ["HLTHPRT_DB_PORT"]),
-        user=os.environ["HLTHPRT_DB_USER"],
-        password=os.environ["HLTHPRT_DB_PASSWORD"],
-        database=os.environ["HLTHPRT_DB_DATABASE"],
-    )
+    deadline = time.monotonic() + 90
+    while True:
+        try:
+            conn = await asyncpg.connect(
+                host=os.environ["HLTHPRT_DB_HOST"],
+                port=int(os.environ["HLTHPRT_DB_PORT"]),
+                user=os.environ["HLTHPRT_DB_USER"],
+                password=os.environ["HLTHPRT_DB_PASSWORD"],
+                database=os.environ["HLTHPRT_DB_DATABASE"],
+            )
+            break
+        except (OSError, asyncpg.CannotConnectNowError):
+            if time.monotonic() >= deadline:
+                raise
+            await asyncio.sleep(1)
     await conn.execute("CREATE EXTENSION IF NOT EXISTS postgis")
     await conn.execute('CREATE SCHEMA IF NOT EXISTS "mrf"')
     await conn.close()

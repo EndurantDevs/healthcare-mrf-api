@@ -93,6 +93,11 @@ def test_ci_image_publisher_is_hosted_and_has_bounded_permissions() -> None:
         assert receipt in workflow
     assert "cargo-llvm-cov 0.8.7" in workflow
     assert "cargo-audit-audit 0.22.2" in workflow
+    llvm_tools_receipt = (
+        'test "$(docker run --rm healthcare-mrf-arc-ci-candidate '
+        "rustup component list --installed | grep -c '^llvm-tools-')\" = \"1\""
+    )
+    assert llvm_tools_receipt in workflow
 
 
 def test_ci_image_retention_is_hosted_bounded_and_fail_closed() -> None:
