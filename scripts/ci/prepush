@@ -70,6 +70,20 @@ install_python_dependencies() {
   scripts/ci/install_python_lock
 }
 
+wait_for_service() {
+  local service=$1
+  local timeout_seconds=$2
+  shift 2
+  local deadline=$((SECONDS + timeout_seconds))
+  until "$@" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      echo "$service service was not ready within $timeout_seconds seconds" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 require_base_sha() {
   if [[ ! "${COVERAGE_BASE_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
     echo "COVERAGE_BASE_SHA must be an exact commit SHA" >&2
@@ -472,6 +486,9 @@ run_security() {
 
 run_redis() {
   install_python_dependencies
+  export HLTHPRT_REDIS_ADDRESS=${HLTHPRT_REDIS_ADDRESS:-redis://127.0.0.1:6379}
+  wait_for_service Redis 30 \
+    python -c 'import os; from redis import Redis; Redis.from_url(os.environ["HLTHPRT_REDIS_ADDRESS"], socket_connect_timeout=1, socket_timeout=1).ping()'
   python - <<'PY'
 import asyncio
 import os
@@ -953,6 +970,13 @@ run_postgres() {
   export PYTEST_ADDOPTS=${PYTEST_ADDOPTS:-'--cov-config=test-coverage.ini --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main --cov-branch --cov-report= --cov-append'}
   export COVERAGE_FILE=${COVERAGE_FILE:-$(artifact_path ".coverage.postgres.${shard}")}
 
+  wait_for_service PostgreSQL 30 \
+    pg_isready \
+      --host "$HLTHPRT_DB_HOST" \
+      --port "$HLTHPRT_DB_PORT" \
+      --username "$HLTHPRT_DB_USER" \
+      --dbname "$HLTHPRT_DB_DATABASE" \
+      --timeout=1
   prepare_postgres
   local dsn="postgresql://${HLTHPRT_DB_USER}:${HLTHPRT_DB_PASSWORD}@${HLTHPRT_DB_HOST}:${HLTHPRT_DB_PORT}/${HLTHPRT_DB_DATABASE}"
   case "$shard" in

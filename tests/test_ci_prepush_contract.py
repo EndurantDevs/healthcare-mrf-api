@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 import re
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +44,54 @@ def test_every_required_ci_family_delegates_to_prepush() -> None:
         job_body = _job(workflow, job)
         assert command in job_body
         assert len(re.findall(r"^        run:", job_body, re.M)) == 1
+
+
+def test_service_modes_wait_for_ready_redis_and_postgres() -> None:
+    script = PREPUSH.read_text(encoding="utf-8")
+    helper = re.search(r"^wait_for_service\(\) \{\n.*?^\}", script, re.M | re.S)
+    assert helper is not None
+
+    subprocess.run(
+        [
+            "bash",
+            "-eu",
+            "-o",
+            "pipefail",
+            "-c",
+            f"""
+{helper.group(0)}
+attempt=0
+ready() {{ return 0; }}
+delayed() {{ attempt=$((attempt + 1)); [ "$attempt" -eq 2 ]; }}
+never() {{ return 1; }}
+wait_for_service Ready 0 ready
+wait_for_service Delayed 1 delayed
+if output=$(wait_for_service Missing 0 never 2>&1); then exit 1; fi
+[ "$attempt" -eq 2 ]
+[ "$output" = "Missing service was not ready within 0 seconds" ]
+""",
+        ],
+        check=True,
+    )
+
+    redis = re.search(r"^run_redis\(\) \{\n(.*?)(?=^\}\n)", script, re.M | re.S)
+    postgres = re.search(
+        r"^run_postgres\(\) \{\n(.*?)(?=^\}\n)", script, re.M | re.S
+    )
+    assert redis is not None
+    assert postgres is not None
+    assert redis.group(1).index("wait_for_service Redis 30") < redis.group(1).index(
+        'await redis.rpush("arq:ci-smoke", "healthporta-ci")'
+    )
+    assert "redis://127.0.0.1:6379" in redis.group(1)
+    assert "socket_connect_timeout=1, socket_timeout=1" in redis.group(1)
+    assert postgres.group(1).index(
+        "wait_for_service PostgreSQL 30"
+    ) < postgres.group(1).index("prepare_postgres")
+    assert "pg_isready" in postgres.group(1)
+    assert "HLTHPRT_DB_HOST:-127.0.0.1" in postgres.group(1)
+    assert "--timeout=1" in postgres.group(1)
+
 
 def test_local_all_pins_ci_images_inputs_and_safety_margins() -> None:
     script = PREPUSH.read_text(encoding="utf-8")
