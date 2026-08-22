@@ -218,7 +218,9 @@ run_rust() {
   cargo fmt --manifest-path support/ptg2_scanner/Cargo.toml -- --check
   cargo clippy --manifest-path support/ptg2_scanner/Cargo.toml --all-targets -- -D warnings
   mkdir -p "$rust_artifacts"
-  cargo install cargo-llvm-cov --version 0.8.7 --locked
+  if [ "$(cargo llvm-cov --version 2>/dev/null || true)" != "cargo-llvm-cov 0.8.7" ]; then
+    cargo install cargo-llvm-cov --version 0.8.7 --locked
+  fi
   timeout --foreground 295s cargo llvm-cov --manifest-path support/ptg2_scanner/Cargo.toml \
     --all-targets --features python --json --summary-only \
     --output-path "$rust_artifacts/test-coverage-rust.json"
@@ -236,7 +238,9 @@ run_rust() {
     --artifacts "$rust_artifacts" \
     --output "$(artifact_path test-coverage-forecast-rust.json)"
   require_margin "$(artifact_path test-coverage-forecast-rust.json)" rust functions 2
-  cargo install cargo-audit --version 0.22.2 --locked
+  if [ "$(cargo audit --version 2>/dev/null || true)" != "cargo-audit-audit 0.22.2" ]; then
+    cargo install cargo-audit --version 0.22.2 --locked
+  fi
   (cd support/ptg2_scanner && cargo audit)
   cargo build --release --bins --manifest-path support/ptg2_scanner/Cargo.toml
   HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_NATIVE_TEST_BIN="$repository_root/support/ptg2_scanner/target/release/ptg2_scanner" \

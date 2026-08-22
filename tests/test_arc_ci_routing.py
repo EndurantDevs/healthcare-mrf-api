@@ -10,8 +10,9 @@ import yaml
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
 PREPUSH = Path(__file__).resolve().parents[1] / "scripts/ci/prepush"
 ARC_RUNNER_EXPRESSION = (
-    "${{ github.event_name == 'pull_request' && "
-    "github.event.pull_request.head.repo.fork && 'ubuntu-latest' || "
+    "${{ (github.event_name == 'push' || "
+    "github.event_name == 'workflow_dispatch') && "
+    "github.ref == 'refs/heads/main' && "
     "vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}"
 )
 COVERAGE_BASE_EXPRESSION = (
@@ -27,18 +28,20 @@ ARC_IMAGE = (
 ARC_JOBS = {
     "public-hygiene",
     "python-quality",
-    "python-tests",
     "capacity-evidence",
     "test-coverage",
     "api-contract",
 }
 HOSTED_JOBS = {
+    "python-tests",
     "rust-scanner",
     "container-package",
     "security",
     "worker-queue-smoke",
     "address-canonical-db-tests",
 }
+
+
 def _values_for_key(value: object, key: str) -> list[object]:
     matches: list[object] = []
     if isinstance(value, dict):
@@ -57,10 +60,11 @@ def _documents() -> tuple[dict, dict]:
     return yaml.safe_load(workflow), yaml.load(workflow, Loader=yaml.BaseLoader)
 
 
-def test_arc_route_uses_a_hosted_fallback_for_fork_pull_requests() -> None:
+def test_arc_route_is_trusted_main_only_with_a_hosted_fallback() -> None:
     document, trigger_document = _documents()
 
     assert set(trigger_document["on"]) == {
+        "workflow_call",
         "pull_request",
         "push",
         "workflow_dispatch",
@@ -70,6 +74,18 @@ def test_arc_route_uses_a_hosted_fallback_for_fork_pull_requests() -> None:
         "workflow_run",
         "repository_dispatch",
     }.isdisjoint(trigger_document["on"])
+    assert trigger_document["on"]["workflow_call"] == {
+        "inputs": {
+            "activate_arc": {
+                "description": (
+                    "Request ARC only after protected-main and fork checks pass"
+                ),
+                "required": "false",
+                "type": "boolean",
+                "default": "false",
+            }
+        }
+    }
     assert document["jobs"].keys() == ARC_JOBS | HOSTED_JOBS
     for name in ARC_JOBS:
         assert document["jobs"][name]["runs-on"] == ARC_RUNNER_EXPRESSION
@@ -77,6 +93,35 @@ def test_arc_route_uses_a_hosted_fallback_for_fork_pull_requests() -> None:
         job = document["jobs"][name]
         assert job["runs-on"] == "ubuntu-latest"
         assert "HEALTHCARE_MRF_CI_RUNNER" not in yaml.safe_dump(job)
+
+
+def test_reusable_foundation_preserves_caller_checkout_and_pr_context() -> None:
+    document, trigger_document = _documents()
+
+    assert trigger_document["on"]["workflow_call"]["inputs"]["activate_arc"] == {
+        "description": "Request ARC only after protected-main and fork checks pass",
+        "required": "false",
+        "type": "boolean",
+        "default": "false",
+    }
+    assert document["env"]["COVERAGE_BASE_SHA"] == COVERAGE_BASE_EXPRESSION
+    assert (
+        document["jobs"]["python-quality"]["steps"][-1]["env"]
+        ["READABILITY_ZERO_GROWTH_APPROVED"]
+        == "${{ github.event_name == 'pull_request' && "
+        "contains(github.event.pull_request.labels.*.name, "
+        "'readability-zero-growth-approved') }}"
+    )
+    for checkout in (
+        step
+        for job in document["jobs"].values()
+        for step in job["steps"]
+        if isinstance(step.get("uses"), str)
+        and step["uses"].startswith("actions/checkout@")
+    ):
+        assert checkout["with"]["persist-credentials"] is False
+        assert "repository" not in checkout["with"]
+        assert checkout["with"].get("ref", "${{ github.sha }}") == "${{ github.sha }}"
 
 
 def test_matrices_fail_fast_and_coverage_waits_for_every_root_job() -> None:

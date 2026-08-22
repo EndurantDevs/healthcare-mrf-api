@@ -1,6 +1,13 @@
 name: CI
 
 on:
+  workflow_call:
+    inputs:
+      activate_arc:
+        description: Request ARC only after protected-main and fork checks pass
+        required: false
+        type: boolean
+        default: false
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
@@ -33,7 +40,7 @@ env:
 jobs:
   public-hygiene:
     name: public hygiene
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:
@@ -49,7 +56,7 @@ jobs:
         run: scripts/ci/prepush hygiene
   python-quality:
     name: python quality
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:
@@ -68,12 +75,7 @@ jobs:
         run: scripts/ci/prepush quality
   python-tests:
     name: python test suite (${{ matrix.shard-index }}/4)
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
-    container:
-      image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
-    defaults:
-      run:
-        shell: bash
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: true
@@ -87,10 +89,13 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
           ref: ${{ github.sha }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-ci.lock
       - name: Run shared pre-push gate
-        run: |
-          export CARGO_HOME="$RUNNER_TEMP/cargo"
-          scripts/ci/prepush python-main "${{ matrix.shard-index }}"
+        run: scripts/ci/prepush python-main "${{ matrix.shard-index }}"
       - name: Upload main-suite coverage data
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -103,7 +108,7 @@ jobs:
 
   capacity-evidence:
     name: ptg2 capacity evidence
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:
@@ -143,7 +148,7 @@ jobs:
       - security
       - worker-queue-smoke
       - address-canonical-db-tests
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:
@@ -186,7 +191,7 @@ jobs:
 
   api-contract:
     name: openapi contract
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}
     container:
       image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
     defaults:
