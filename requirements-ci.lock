@@ -2,7 +2,7 @@
 # Input: requirements.txt (c3f449e56c11dd4852a5e003b9035553d895f8f8068e24b6c3cbe51265755fb8)
 # Input: requirements-dev.txt (264000638cc79d905f5f4c89560a2115fb05f68e2826eaa1e18d1df9734ca7a5)
 # Input: requirements-ci.in (50e58c879dfb3983636119f365880fa403daaf290c1a1d0ad787cf62adea8abf)
-# ARC image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c
+# ARC image: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:0e97164f0e06b60fe5608e5654e026a88c3ef5d3b6a195a26fdc60489b404803
 # Python: 3.14.6 (Linux x86_64)
 # Resolver: pip 26.1.2
 # Each hash is the wheel selected on native Linux/amd64 by pip's install report.

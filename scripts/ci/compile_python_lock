@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-arc_image='ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c'
+arc_image='ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:0e97164f0e06b60fe5608e5654e026a88c3ef5d3b6a195a26fdc60489b404803'
 
 if [ "$(docker info --format '{{.OSType}}/{{.Architecture}}')" != linux/x86_64 ]; then
   echo "Python lock generation requires a native Linux/amd64 Docker engine" >&2

@@ -4,7 +4,7 @@ set -euo pipefail
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$repository_root"
 
-arc_image='ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c'
+arc_image='ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:0e97164f0e06b60fe5608e5654e026a88c3ef5d3b6a195a26fdc60489b404803'
 postgres_image='postgis/postgis:18-3.6@sha256:0aacdfb9dda40942d424785c3ccabeffe31da9cc9e26b0dfd93b222b31462871'
 redis_image='redis:7@sha256:e9b2e45ecd47fbb69b877cf8d045d5cccaaaed52524b6e098b4abe8212994f73'
 semgrep_image='returntocorp/semgrep-agent@sha256:50140e658095736c7f9d2c12c1e8a98b13f044b773dc79aa98e83b8117dbf096'
