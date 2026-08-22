@@ -31,7 +31,7 @@ concurrency:
 
 jobs:
   queue:
-    name: Queue dev-node build
+    name: Deploy on dev node
     if: >-
       ${{
         (
@@ -169,7 +169,7 @@ jobs:
           chmod 600 ~/.ssh/dev-deploy
           printf '%s' "${DEV_DEPLOY_KNOWN_HOSTS_B64}" | base64 --decode > ~/.ssh/known_hosts
 
-      - name: Queue build on dev node
+      - name: Deploy on dev node
         env:
           DEV_DEPLOY_HOST: ${{ secrets.DEV_DEPLOY_HOST }}
           DEPLOY_SHA: ${{ steps.authorize.outputs.deploy_sha }}
@@ -185,7 +185,10 @@ jobs:
             [ -n "${address}" ] && echo "::add-mask::${address}"
           done < <(getent ahosts "${DEV_DEPLOY_HOST}" 2>/dev/null | awk '{print $1}' | sort -u)
           deploy_args="${DEPLOY_SHA} ${DEPLOY_BRANCH} --ptg-v3-phase=${PTG_V3_PHASE}"
+          receipt_log="${RUNNER_TEMP}/healthporta-deploy-${DEPLOY_SHA}.log"
+          receipt_pattern="^healthporta_deploy_receipt_v1 service=healthcare-mrf-api source_sha=${DEPLOY_SHA} deploy_sha=[0-9a-f]{40} image=[^[:space:]]+ manifest_digest=sha256:[0-9a-f]{64} config_digest=sha256:[0-9a-f]{64}$"
           # Strict V3 stays synchronous so this job verifies migration and rollout completion.
+          set -o pipefail
           if ! ssh -i ~/.ssh/dev-deploy \
             -o IdentitiesOnly=yes \
             -o BatchMode=yes \
@@ -196,8 +199,13 @@ jobs:
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile=~/.ssh/known_hosts \
             "ubuntu@${DEV_DEPLOY_HOST}" \
-            "${deploy_args}" >/dev/null 2>&1; then
-            echo "::error::Failed to queue dev deploy"
+            "${deploy_args}" 2>&1 | tee "${receipt_log}"; then
+            echo "::error::Dev deploy failed"
             exit 1
           fi
-          echo "Dev deploy queued."
+          receipt_count=$(grep -Ec "${receipt_pattern}" "${receipt_log}" || true)
+          if [ "${receipt_count}" -ne 1 ] || ! tail -n 1 "${receipt_log}" | grep -Eq "${receipt_pattern}"; then
+            echo "::error::Dev deploy did not return exactly one terminal receipt"
+            exit 1
+          fi
+          echo "Dev deploy completed."

@@ -53,6 +53,24 @@ def test_dev_deploy_workflow_requires_successful_ci_for_exact_main_sha():
     assert "run.conclusion === 'success'" in workflow
 
 
+def test_dev_deploy_workflow_requires_one_terminal_source_bound_receipt():
+    workflow = (REPOSITORY_ROOT / ".github/workflows/deploy-dev.yml").read_text()
+
+    assert "set -o pipefail" in workflow
+    assert '2>&1 | tee "${receipt_log}"' in workflow
+    assert "receipt_count=$(grep -Ec" in workflow
+    assert 'tail -n 1 "${receipt_log}"' in workflow
+    for field in (
+        "healthporta_deploy_receipt_v1 service=healthcare-mrf-api",
+        "source_sha=${DEPLOY_SHA}",
+        "deploy_sha=[0-9a-f]{40}",
+        "image=[^[:space:]]+",
+        "manifest_digest=sha256:[0-9a-f]{64}",
+        "config_digest=sha256:[0-9a-f]{64}",
+    ):
+        assert field in workflow
+
+
 def test_cutover_requires_idle_valid_pointers():
     module = _load_script("ptg2_strict_v3_cutover_ready")
     statements = []
