@@ -840,6 +840,13 @@ def _worker_job_container(
                 "value": target_job_id,
             }
         )
+    if spec.worker_class == "process.PTGHuge":
+        env_list.append(
+            {
+                "name": "HLTHPRT_PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES",
+                "value": "68719476736",
+            }
+        )
     env_list.extend(_worker_job_secret_env(spec.worker_class))
 
     container_dict: dict[str, Any] = {

@@ -832,6 +832,43 @@ def test_kubernetes_worker_job_uses_resource_profile(monkeypatch):
     assert env_by_name["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == "ptg_start_run_ptg"
 
 
+def test_kubernetes_worker_job_sets_finalizer_identity_capacity_only_for_ptg_huge():
+    capacity_env_by_worker = {}
+
+    for queue in (
+        "arq:PTGSmall",
+        "arq:PTG",
+        "arq:PTGNormal",
+        "arq:PTGLarge",
+        "arq:PTGHuge",
+    ):
+        spec = control_workers._BY_QUEUE[queue]
+        job = control_workers._worker_job_manifest(
+            spec,
+            {"run_id": f"run_{queue.removeprefix('arq:').lower()}"},
+            "healthcare-mrf-api:test",
+        )
+        container = job["spec"]["template"]["spec"]["containers"][0]
+        capacity_env_by_worker[spec.worker_class] = [
+            entry
+            for entry in container["env"]
+            if entry["name"] == "HLTHPRT_PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES"
+        ]
+
+    assert capacity_env_by_worker == {
+        "process.PTGSmall": [],
+        "process.PTG": [],
+        "process.PTGNormal": [],
+        "process.PTGLarge": [],
+        "process.PTGHuge": [
+            {
+                "name": "HLTHPRT_PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES",
+                "value": "68719476736",
+            }
+        ],
+    }
+
+
 def test_kubernetes_start_worker_replicas_use_parallel_job(monkeypatch):
     calls: list[tuple[str, str, dict[str, object] | None]] = []
 
