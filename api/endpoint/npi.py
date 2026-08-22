@@ -666,10 +666,23 @@ def _provider_taxonomy_matched_npi_cte(
     taxonomy_conditions: str,
     *,
     code_placeholders: Sequence[str] = (),
+    npi_where: str = "",
+    npi_projection: str = "b.npi",
 ) -> str:
-    """Intersect materialized provider candidates with taxonomy once."""
+    """Materialize the smaller side of a provider/taxonomy intersection."""
 
     if code_placeholders:
+        if npi_where:
+            return f"""
+    taxonomy_matched_npi AS MATERIALIZED (
+        SELECT DISTINCT {npi_projection}
+          FROM mrf.npi_taxonomy AS provider_taxonomy
+          JOIN mrf.npi AS b
+            ON b.npi = provider_taxonomy.npi
+         WHERE provider_taxonomy.healthcare_provider_taxonomy_code IN ({', '.join(code_placeholders)})
+           AND ({npi_where})
+    )
+    """
         taxonomy_match_sql = (
             "WHERE provider_taxonomy.healthcare_provider_taxonomy_code "
             f"IN ({', '.join(code_placeholders)})"
@@ -5249,6 +5262,11 @@ def _names_like_filter_clause(alias: str, names: Sequence[str], base_param: str 
     if prefix and not prefix.endswith("."):
         prefix = f"{prefix}."
     expr = NAME_LIKE_TEMPLATE.format(alias=prefix)
+    indexed_like_expressions = (
+        f"LOWER(COALESCE({prefix}provider_first_name, ''))",
+        f"LOWER(COALESCE({prefix}provider_last_name, ''))",
+        ORGANIZATION_LIKE_TEMPLATE.format(alias=prefix),
+    )
     clauses = []
     parameter_map = {}
     for idx, name in enumerate(names):
@@ -5261,14 +5279,18 @@ def _names_like_filter_clause(alias: str, names: Sequence[str], base_param: str 
                 str(idx) if len(tokens) == 1 else f"{idx}_{token_index}"
             )
             param_like = f"{base_param}_{parameter_suffix}"
+            indexed_like_clause = " OR ".join(
+                f"({field_expression} LIKE :{param_like})"
+                for field_expression in indexed_like_expressions
+            )
             if ENABLE_TRGM_FUZZY_NAME_SEARCH:
                 param_fuzzy = f"{param_like}_fuzzy"
                 token_clauses.append(
-                    f"(({expr} LIKE :{param_like}) OR ({expr} % :{param_fuzzy}))"
+                    f"(({indexed_like_clause}) OR ({expr} % :{param_fuzzy}))"
                 )
                 parameter_map[param_fuzzy] = token
             else:
-                token_clauses.append(f"({expr} LIKE :{param_like})")
+                token_clauses.append(f"({indexed_like_clause})")
             parameter_map[param_like] = f"%{token}%"
         clauses.append(f"({' AND '.join(token_clauses)})")
     if not clauses:
@@ -8886,18 +8908,21 @@ async def list_providers(request):
         filtered_npi_cte = None
         taxonomy_matched_npi_cte = None
         if npi_where:
-            filtered_npi_cte = f"""
-            filtered_npi AS MATERIALIZED (
-                SELECT b.npi
-                  FROM mrf.npi AS b
-                 WHERE {npi_where}
-            )
-            """
+            direct_name_taxonomy = bool(taxonomy_code_placeholders)
+            if not direct_name_taxonomy:
+                filtered_npi_cte = f"""
+                filtered_npi AS MATERIALIZED (
+                    SELECT b.npi
+                      FROM mrf.npi AS b
+                     WHERE {npi_where}
+                )
+                """
             if use_taxonomy_filter:
                 taxonomy_matched_npi_cte = (
                     _provider_taxonomy_matched_npi_cte(
                         taxonomy_conditions,
                         code_placeholders=taxonomy_code_placeholders,
+                        npi_where=npi_where if direct_name_taxonomy else "",
                     )
                 )
 
@@ -9405,7 +9430,9 @@ async def list_providers(request):
                     f", similarity({name_expression}, :relevance_q) "
                     "AS relevance_score"
                 )
-            filtered_npi_cte = f"""
+            direct_name_taxonomy = bool(taxonomy_code_placeholders)
+            if not direct_name_taxonomy:
+                filtered_npi_cte = f"""
         filtered_npi AS MATERIALIZED (
             SELECT {filtered_npi_projection}
               FROM mrf.npi AS b
@@ -9417,6 +9444,8 @@ async def list_providers(request):
                     _provider_taxonomy_matched_npi_cte(
                         taxonomy_filter,
                         code_placeholders=taxonomy_code_placeholders,
+                        npi_where=npi_where if direct_name_taxonomy else "",
+                        npi_projection=filtered_npi_projection,
                     )
                 )
 
@@ -13369,17 +13398,24 @@ def _location_status_query(schema: str, overlay_table_sql: str) -> Any:
     )
     return text(
         f"""
-        WITH {current_resource_ctes_sql}, visible_roles AS MATERIALIZED (
+        WITH {current_resource_ctes_sql}, matched_overlays AS MATERIALIZED (
+            SELECT overlay.source_record_id,
+                   overlay.source_id,
+                   overlay.resource_type,
+                   overlay.resource_id,
+                   overlay.last_seen_run_id
+              FROM {overlay_table_sql} AS overlay
+             WHERE overlay.source_record_id = ANY(:source_record_ids)
+        ), visible_roles AS MATERIALIZED (
             SELECT overlay.source_record_id,
                    overlay.resource_type,
                    current_resource.payload_json
-              FROM {overlay_table_sql} AS overlay
+              FROM matched_overlays AS overlay
               JOIN current_resources AS current_resource
                 ON current_resource.source_id = overlay.source_id
                AND current_resource.resource_type = overlay.resource_type
                AND current_resource.resource_id = overlay.resource_id
                AND overlay.last_seen_run_id = current_resource.run_id
-             WHERE overlay.source_record_id = ANY(:source_record_ids)
         )
         SELECT overlay.source_record_id,
                {location_status_sql} AS location_status

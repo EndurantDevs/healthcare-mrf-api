@@ -415,7 +415,7 @@ async def test_get_all_zip_taxonomy_uses_location_first_probe(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_all_name_taxonomy_materializes_the_name_driven_taxonomy_match(monkeypatch):
+async def test_get_all_name_taxonomy_materializes_taxonomy_driven_name_match(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
 
@@ -431,15 +431,17 @@ async def test_get_all_name_taxonomy_materializes_the_name_driven_taxonomy_match
     await get_all(request)
 
     page_sql = conn.sql_calls[-1][0]
-    assert "filtered_npi AS MATERIALIZED" in page_sql
+    assert "filtered_npi AS MATERIALIZED" not in page_sql
     assert "taxonomy_matched_npi AS MATERIALIZED" in page_sql
-    assert "JOIN mrf.npi_taxonomy AS provider_taxonomy" in page_sql
+    assert "JOIN mrf.npi AS b" in page_sql
+    assert "FROM mrf.npi_taxonomy AS provider_taxonomy" in page_sql
     assert "FROM mrf.nucc_taxonomy" not in page_sql
     assert (
         "provider_taxonomy.healthcare_provider_taxonomy_code "
         "IN (:page_name_provider_taxonomy_code_0)"
     ) in page_sql
     assert conn.sql_calls[-1][1]["page_name_provider_taxonomy_code_0"] == "207Q00000X"
+    assert "LOWER(COALESCE(b.provider_last_name, ''))" in page_sql
     assert "AS provider_taxonomy_match ON TRUE" not in page_sql
     assert "c.taxonomy_array && q.int_codes" not in page_sql
     assert page_sql.rstrip().endswith("ORDER BY sub_s.npi_code ASC;")
@@ -465,13 +467,39 @@ async def test_get_all_name_taxonomy_count_closes_the_cte_list(monkeypatch):
     count_sql = next(
         sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql
     )
+    assert "filtered_npi AS MATERIALIZED" not in count_sql
     assert "taxonomy_matched_npi AS MATERIALIZED" in count_sql
+    assert "JOIN mrf.npi AS b" in count_sql
     assert "FROM mrf.nucc_taxonomy" not in count_sql
     assert (
         "provider_taxonomy.healthcare_provider_taxonomy_code "
         "IN (:count_name_provider_taxonomy_code_0)"
     ) in count_sql
     assert not re.search(r"\)\s*,\s*SELECT\s+COUNT", count_sql, flags=re.IGNORECASE)
+
+
+@pytest.mark.asyncio
+async def test_get_all_name_taxonomy_relevance_keeps_candidate_score(monkeypatch):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    await get_all(
+        types.SimpleNamespace(
+            args={
+                "q": "clinic",
+                "codes": "207Q00000X",
+                "order_by": "relevance",
+                "include_total": "false",
+                "limit": "10",
+            }
+        )
+    )
+
+    page_sql = conn.sql_calls[-1][0]
+    assert "SELECT DISTINCT b.npi," in page_sql
+    assert "AS relevance_score" in page_sql
+    assert "MAX(fn.relevance_score) AS relevance_score" in page_sql
+    assert "ORDER BY relevance_score DESC, npi ASC" in page_sql
 
 
 @pytest.mark.asyncio
@@ -1179,12 +1207,16 @@ async def test_get_all_falls_back_to_exists_when_arrays_unavailable(monkeypatch)
     assert "c.medications_array @> ARRAY[:medication_code_0]::INTEGER[]" not in conn.last_sql
 
 
-def test_names_like_filter_clause_default_like_only(monkeypatch):
+def test_names_like_filter_clause_default_like_uses_indexed_name_fields(monkeypatch):
     monkeypatch.setattr(npi_module, "ENABLE_TRGM_FUZZY_NAME_SEARCH", False)
     clause, params = npi_module._names_like_filter_clause("d", ["cvs"])
     assert " % :" not in clause
     assert "name_like_0" in params
     assert "name_like_0_fuzzy" not in params
+    assert "d.provider_first_name" in clause
+    assert "d.provider_last_name" in clause
+    assert "d.provider_organization_name" in clause
+    assert " OR " in clause
 
 
 def test_names_like_filter_clause_tokenizes_punctuation_as_and_terms(monkeypatch):
@@ -1199,8 +1231,7 @@ def test_names_like_filter_clause_tokenizes_punctuation_as_and_terms(monkeypatch
         "name_like_0_0": "%smith%",
         "name_like_0_1": "%adam%",
     }
-    assert " OR " not in clause
-    assert " AND " in clause
+    assert ") AND (" in clause
     assert ":name_like_0_0" in clause
     assert ":name_like_0_1" in clause
 
