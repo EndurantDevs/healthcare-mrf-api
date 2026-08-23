@@ -13510,12 +13510,11 @@ async def _fetch_location_status_by_record_id(
             PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
             *PROVIDER_DIRECTORY_VISIBILITY_TABLES,
         )
-        if not all(
-            [
-                await _is_table_available(table_name, session=session)
-                for table_name in required_tables
-            ]
-        ):
+        if await _provider_directory_evidence_tables(
+            session,
+            required_names=required_tables,
+            optional_names=(),
+        ) is None:
             return {}
         overlay_table_sql = _schema_cache_key(
             PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE

@@ -248,12 +248,17 @@ async def test_location_status_lookup_normalizes_rows_and_empty_input(monkeypatc
             {"source_record_id": "synthetic-role-b", "location_status": None},
         ]
     )
-    monkeypatch.setattr(
-        npi_module,
-        "_is_table_available",
-        AsyncMock(return_value=True),
+
+    capability_result = _ResultRows(
+        [
+            {"table_name": table_name, "is_available": True}
+            for table_name in (
+                npi_module.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+                *npi_module.PROVIDER_DIRECTORY_VISIBILITY_TABLES,
+            )
+        ]
     )
-    execute_stmt = AsyncMock(return_value=query_result)
+    execute_stmt = AsyncMock(side_effect=[capability_result, query_result])
     monkeypatch.setattr(npi_module, "_execute_stmt", execute_stmt)
 
     assert await npi_module._fetch_location_status_by_record_id(["", None]) == {}
@@ -265,28 +270,52 @@ async def test_location_status_lookup_normalizes_rows_and_empty_input(monkeypatc
         "synthetic-role-a": "active",
         "synthetic-role-b": "unknown",
     }
-    assert execute_stmt.await_args.kwargs["params"] == {
+    assert execute_stmt.await_count == 2
+    capability_call, status_call = execute_stmt.await_args_list
+    assert "requested_columns AS" in str(capability_call.args[0])
+    assert capability_call.kwargs["params"]["table_names"] == [
+        npi_module.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+        *npi_module.PROVIDER_DIRECTORY_VISIBILITY_TABLES,
+    ]
+    assert status_call.kwargs["params"] == {
         "source_record_ids": ["synthetic-role-a", "synthetic-role-b"]
     }
-    status_sql = str(execute_stmt.await_args.args[0])
+    status_sql = str(status_call.args[0])
     assert "PractitionerRole" in status_sql
     assert "matched_overlays AS MATERIALIZED" in status_sql
     assert "FROM matched_overlays AS overlay" in status_sql
 
 
 @pytest.mark.asyncio
-async def test_location_status_lookup_degrades_on_runtime_failure(monkeypatch):
-    monkeypatch.setattr(
-        npi_module,
-        "_is_table_available",
-        AsyncMock(side_effect=RuntimeError("synthetic status lookup failure")),
+async def test_location_status_lookup_skips_status_query_when_relation_missing(
+    monkeypatch,
+):
+    execute_stmt = AsyncMock(
+        return_value=_ResultRows(
+            [
+                {
+                    "table_name": table_name,
+                    "is_available": table_name
+                    != npi_module.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+                }
+                for table_name in (
+                    npi_module.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+                    *npi_module.PROVIDER_DIRECTORY_VISIBILITY_TABLES,
+                )
+            ]
+        )
     )
+    monkeypatch.setattr(npi_module, "_execute_stmt", execute_stmt)
 
     status_map = await npi_module._fetch_location_status_by_record_id(
         ["synthetic-role-a"]
     )
 
     assert status_map == {}
+    assert execute_stmt.await_count == 1
+    assert "requested_columns AS" in str(
+        execute_stmt.await_args.args[0]
+    )
 
 
 @pytest.mark.asyncio
