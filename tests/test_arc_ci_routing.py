@@ -21,8 +21,6 @@ ARC_ELIGIBLE_EXPRESSION = (
     "github.event.pull_request.base.repo.full_name == github.repository && "
     "github.event.pull_request.head.repo.full_name == github.repository && "
     "github.event.pull_request.head.repo.fork == false && "
-    "contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'), "
-    "github.event.pull_request.author_association) && "
     "github.event.pull_request.user.type == 'User' && "
     "github.actor != 'dependabot[bot]' && "
     "!endsWith(github.actor, '[bot]') && "
@@ -146,7 +144,6 @@ def test_reusable_arc_classifier_is_exact_and_human_only() -> None:
             "github.event.pull_request.base.repo.full_name == github.repository",
             "github.event.pull_request.head.repo.full_name == github.repository",
             "github.event.pull_request.head.repo.fork == false",
-            "github.event.pull_request.author_association",
             "github.event.pull_request.user.type == 'User'",
             "github.actor != 'dependabot[bot]'",
             "!endsWith(github.actor, '[bot]')",
@@ -154,7 +151,7 @@ def test_reusable_arc_classifier_is_exact_and_human_only() -> None:
         ):
             assert required in route
         assert "github.workflow_ref" not in route
-        assert '[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]' in route
+        assert "author_association" not in route
         assert "inputs.activate_arc" not in route.split("||", 1)[0]
     for name in KUBERNETES_JOBS:
         assert "vars.HEALTHCARE_MRF_CI_RUNNER" in document["jobs"][name]["runs-on"]
