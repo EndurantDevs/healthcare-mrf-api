@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlsplit
 import uuid
 
 import asyncpg
@@ -39,8 +40,9 @@ def _inputs() -> tuple[Path, Path, str, int, int, int, int]:
     binary = root / "support/ptg2_scanner/target/release/ptg2_provider_graph_v4"
     dsn = os.getenv(
         "HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_DSN",
-        "postgresql://127.0.0.1:5440/postgres",
+        "postgresql://127.0.0.1:5440/healthporta_test",
     )
+    database_url = urlsplit(dsn)
     shards = int(os.getenv("HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_SHARDS", "192"))
     rows_per_shard = int(
         os.getenv("HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_ROWS_PER_SHARD", "40000")
@@ -48,7 +50,9 @@ def _inputs() -> tuple[Path, Path, str, int, int, int, int]:
     universe = int(os.getenv("HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_UNIVERSE", "1500000"))
     samples = int(os.getenv("HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_SAMPLES", "3"))
     if (
-        "127.0.0.1:5440/" not in dsn
+        database_url.hostname != "127.0.0.1"
+        or database_url.port != 5440
+        or "test" not in database_url.path.removeprefix("/").lower()
         or shards < 2
         or rows_per_shard < 1
         or universe < rows_per_shard
@@ -159,6 +163,7 @@ def _workload(
         intervals.append((start, start + rows_per_shard - 1))
     expected = _expected_output(_merged_intervals(intervals))
     expected["source_row_count"] = shard_count * rows_per_shard
+    expected["input_byte_count"] = shard_count * (21 + 14 * rows_per_shard)
     return tuple(artifacts), expected
 
 
@@ -303,6 +308,7 @@ async def _sample(
             preparation.manifest["row_count"] != expected["row_count"]
             or preparation.manifest["source_owner_count"]
             != expected["source_row_count"]
+            or preparation.manifest["input_byte_count"] != expected["input_byte_count"]
             or preparation.manifest["output_byte_count"] != expected["byte_count"]
             or preparation.manifest["output_sha256"] != expected["sha256"]
             or observed_sha256 != expected["sha256"]
@@ -326,6 +332,7 @@ async def _sample(
             "schema_version": 1,
             "correctness": {
                 "source_row_count": expected["source_row_count"],
+                "input_byte_count": expected["input_byte_count"],
                 "output_row_count": expected["row_count"],
                 "output_byte_count": expected["byte_count"],
                 "output_sha256": expected["sha256"],
@@ -335,6 +342,7 @@ async def _sample(
                 "postgres_npi_sum": postgres["npi_sum"],
                 "postgres_sequence_violations": postgres["sequence_violations"],
                 "postgres_schema_cleaned": True,
+                "scope_scratch_cleaned": True,
             },
             "metrics": {
                 "npi_scope_seconds": process_seconds[0],
@@ -350,6 +358,11 @@ async def _sample(
         compiler._build_v4_graph_manifest_shards = original_manifest
         if preparation is not None:
             preparation.cleanup()
+            if (
+                preparation.copy_path.exists()
+                or preparation.source_scope_directory.exists()
+            ):
+                raise RuntimeError("benchmark NPI-scope scratch cleanup failed")
 
 
 async def _run() -> None:

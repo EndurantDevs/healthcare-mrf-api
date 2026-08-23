@@ -9,7 +9,7 @@
         ],
         "timeout": 1800,
         "env": {
-          "HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_DSN": "postgresql://127.0.0.1:5440/postgres",
+          "HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_DSN": "postgresql://127.0.0.1:5440/healthporta_test",
           "HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_ROWS_PER_SHARD": "40000",
           "HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_SAMPLES": "3",
           "HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_SHARDS": "192",
@@ -30,6 +30,7 @@
       ],
       "correctness_keys": [
         "source_row_count",
+        "input_byte_count",
         "output_row_count",
         "output_byte_count",
         "output_sha256",
@@ -38,7 +39,8 @@
         "postgres_max_npi",
         "postgres_npi_sum",
         "postgres_sequence_violations",
-        "postgres_schema_cleaned"
+        "postgres_schema_cleaned",
+        "scope_scratch_cleaned"
       ],
       "metric_schema": {
         "npi_scope_seconds": {
