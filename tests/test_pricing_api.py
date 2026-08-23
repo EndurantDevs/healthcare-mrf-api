@@ -5536,7 +5536,7 @@ async def test_list_providers_by_procedure_allows_zip_taxonomy_office_visit(monk
             "code_system": "CPT",
             "zip5": "60601",
             "zip_radius_miles": "0",
-            "include_providers": "true",
+            "include_providers": "false",
             "classification": "Family Medicine",
         },
     )
@@ -5546,7 +5546,7 @@ async def test_list_providers_by_procedure_allows_zip_taxonomy_office_visit(monk
 
     assert pricing_response["query"]["source"] == "ptg2"
     assert observed_search_argument_map["classification"] == "Family Medicine"
-    assert observed_search_argument_map["include_providers"] == "true"
+    assert observed_search_argument_map["include_providers"] == "false"
 
 
 @pytest.mark.asyncio
