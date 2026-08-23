@@ -1259,16 +1259,7 @@ def _reject_broad_group_plan_provider_expansion(
         return
     if not (plan_id or plan_external_id):
         return
-    if not _parse_bool(
-        args.get("include_providers"),
-        "include_providers",
-        default=True,
-    ):
-        return
     if not _is_broad_office_visit_cpt(code_system, code):
-        return
-    has_location = _has_provider_expansion_location(args, context)
-    if _parse_int(npi, "npi", minimum=1) is not None:
         return
     specialty_filter = specialty_filter or resolve_provider_specialty_filter(args)
     has_taxonomy_scope = bool(
@@ -1276,6 +1267,18 @@ def _reject_broad_group_plan_provider_expansion(
         or args.get("taxonomy_code")
         or args.get("taxonomy_classification")
     )
+    if not (
+        _parse_bool(
+            args.get("include_providers"),
+            "include_providers",
+            default=True,
+        )
+        or has_taxonomy_scope
+    ):
+        return
+    has_location = _has_provider_expansion_location(args, context)
+    if _parse_int(npi, "npi", minimum=1) is not None:
+        return
     if specialty_filter.unresolved_specialty:
         _raise_unresolved_specialty(specialty_filter)
     if not has_location:

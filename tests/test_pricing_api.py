@@ -5320,7 +5320,7 @@ async def test_list_providers_by_procedure_rejects_broad_group_plan_office_visit
 
 
 @pytest.mark.asyncio
-async def test_canonical_plan_uses_binding_market_for_broad_expansion_guard(
+async def test_canonical_plan_uses_binding_market_for_statewide_taxonomy_guard(
     monkeypatch,
 ):
     selection = _canonical_release_selection(
@@ -5356,16 +5356,16 @@ async def test_canonical_plan_uses_binding_market_for_broad_expansion_guard(
             "plan_release_id": selection.plan_release_id,
             "market_type": "individual",
             "code": "99213",
-            "code_system": "CPT",
             "state": "IL",
             "city": "Chicago",
-            "include_providers": "true",
+            "include_providers": "false",
+            "classification": "Family Medicine",
         },
     )
 
     with pytest.raises(
         pricing_module.InvalidUsage,
-        match="provider-directory request",
+        match=r"zip5.*zip_radius_miles",
     ):
         await list_providers_by_procedure(request)
 
@@ -5385,14 +5385,14 @@ async def test_list_providers_by_procedure_rejects_statewide_taxonomy_office_vis
             "code_system": "CPT",
             "state": "IL",
             "city": "Chicago",
-            "include_providers": "true",
+            "include_providers": "false",
             "classification": "Family Medicine",
         },
     )
 
     with pytest.raises(
         pricing_module.InvalidUsage,
-        match="zip5.*zip_radius_miles",
+        match=r"zip5.*zip_radius_miles",
     ) as raised:
         await list_providers_by_procedure(request)
 
@@ -5433,7 +5433,7 @@ async def test_taxonomy_office_visit_without_locator_still_fails_fast(monkeypatc
 
     with pytest.raises(
         pricing_module.InvalidUsage,
-        match="zip5.*zip_radius_miles",
+        match=r"zip5.*zip_radius_miles",
     ):
         await list_providers_by_procedure(request)
 
@@ -5461,6 +5461,20 @@ def test_explicit_false_provider_filter_keeps_aggregate_shape():
             "state": "IL",
             "city": "Chicago",
             "provider_sex_code": "F",
+        },
+    )
+
+
+def test_npi_scoped_taxonomy_office_visit_keeps_search_allowed():
+    pricing_module._reject_broad_group_plan_provider_expansion(
+        {"include_providers": "false", "classification": "Family Medicine"},
+        {
+            "plan_id": "TESTPLAN001",
+            "plan_market_type": "group",
+            "code": "99213",
+            "code_system": "CPT",
+            "state": "IL",
+            "npi": 1234567890,
         },
     )
 
@@ -5536,7 +5550,7 @@ async def test_list_providers_by_procedure_allows_zip_taxonomy_office_visit(monk
             "code_system": "CPT",
             "zip5": "60601",
             "zip_radius_miles": "0",
-            "include_providers": "true",
+            "include_providers": "false",
             "classification": "Family Medicine",
         },
     )
@@ -5546,7 +5560,7 @@ async def test_list_providers_by_procedure_allows_zip_taxonomy_office_visit(monk
 
     assert pricing_response["query"]["source"] == "ptg2"
     assert observed_search_argument_map["classification"] == "Family Medicine"
-    assert observed_search_argument_map["include_providers"] == "true"
+    assert observed_search_argument_map["include_providers"] == "false"
 
 
 @pytest.mark.asyncio
