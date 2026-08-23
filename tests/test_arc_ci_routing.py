@@ -16,8 +16,6 @@ ARC_ELIGIBLE_EXPRESSION = (
     "github.ref == 'refs/heads/main') || (inputs.activate_arc && "
     "github.event_name == 'pull_request' && "
     "github.ref == format('refs/pull/{0}/merge', github.event.number) && "
-    "startsWith(github.workflow_ref, 'EndurantDevs/healthcare-mrf-api/"
-    ".github/workflows/trusted-pr-ci.yml@') && "
     "github.repository == 'EndurantDevs/healthcare-mrf-api' && "
     "github.event.pull_request.base.ref == 'main' && "
     "github.event.pull_request.base.repo.full_name == github.repository && "
@@ -143,8 +141,6 @@ def test_reusable_arc_classifier_is_exact_and_human_only() -> None:
             "inputs.activate_arc",
             "github.event_name == 'pull_request'",
             "github.ref == format('refs/pull/{0}/merge', github.event.number)",
-            "startsWith(github.workflow_ref, '",
-            ".github/workflows/trusted-pr-ci.yml@')",
             "github.repository == 'EndurantDevs/healthcare-mrf-api'",
             "github.event.pull_request.base.ref == 'main'",
             "github.event.pull_request.base.repo.full_name == github.repository",
@@ -157,6 +153,7 @@ def test_reusable_arc_classifier_is_exact_and_human_only() -> None:
             "!endsWith(github.triggering_actor, '[bot]')",
         ):
             assert required in route
+        assert "github.workflow_ref" not in route
         assert '[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]' in route
         assert "inputs.activate_arc" not in route.split("||", 1)[0]
     for name in KUBERNETES_JOBS:
