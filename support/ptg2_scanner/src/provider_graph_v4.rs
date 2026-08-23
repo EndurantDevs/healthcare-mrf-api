@@ -6905,6 +6905,13 @@ fn extract_provider_graph_v4_npi_scope_inner(
     extract_provider_graph_v4_npi_scope_inner_with_hook(shards, output_path, |_| {})
 }
 
+fn npi_scope_auth_worker_count(available_parallelism: usize, shard_count: usize) -> usize {
+    available_parallelism
+        .min(MAX_NPI_SCOPE_AUTH_WORKERS)
+        .min(shard_count)
+        .max(1)
+}
+
 fn extract_provider_graph_v4_npi_scope_inner_with_hook(
     shards: &[V4ProviderGraphShardDescriptor],
     output_path: &Path,
@@ -6926,12 +6933,12 @@ fn extract_provider_graph_v4_npi_scope_inner_with_hook(
             validate_scope_shard(descriptor, &mut seen_shards)?;
         scope_inputs.push((descriptor, scope_descriptor, reciprocal_descriptor));
     }
-    let worker_count = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .min(MAX_NPI_SCOPE_AUTH_WORKERS)
-        .min(scope_inputs.len())
-        .max(1);
+    let worker_count = npi_scope_auth_worker_count(
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+        scope_inputs.len(),
+    );
     let worker_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(worker_count)
         .thread_name(|index| format!("ptg2-v4-npi-auth-{index}"))
@@ -9088,6 +9095,13 @@ mod tests {
             output_sha256: summary.output_sha256.clone(),
             output_path: summary.output_path.clone(),
         }
+    }
+
+    #[test]
+    fn npi_scope_auth_workers_are_bounded_by_cpu_shards_and_cap() {
+        assert_eq!(npi_scope_auth_worker_count(1, 192), 1);
+        assert_eq!(npi_scope_auth_worker_count(64, 3), 3);
+        assert_eq!(npi_scope_auth_worker_count(64, 192), 8);
     }
 
     #[test]
