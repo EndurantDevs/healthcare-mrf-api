@@ -10,6 +10,7 @@
 //! hashed, or emitted.
 
 use memmap2::{Mmap, MmapOptions};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -116,6 +117,7 @@ const NPI_SCOPE_SHARD_BINDING_CONTRACT: &str = "provider_npi_scope_shard_binding
 const NPI_SCOPE_SHARD_BINDING_HASH_DOMAIN: &[u8] =
     b"ptg2:v4:provider-npi-scope-shard-binding:v1\x00";
 const NPI_SCOPE_RETENTION_CONTRACT: &str = "shared_v4_publication_scratch_v1";
+const MAX_NPI_SCOPE_AUTH_WORKERS: usize = 8;
 const INFERRED_TAXONOMY_INPUT_CONTRACT: &str = "ptg2_v4_inferred_taxonomy_compiler_input_v1";
 const INFERRED_TAXONOMY_CATALOG_CONTRACT: &str = "snapshot_npi_live_catalog_individual_v1";
 const INFERRED_TAXONOMY_VECTOR_FORMAT: &str = "sorted_u32le_v1";
@@ -6914,7 +6916,7 @@ fn extract_provider_graph_v4_npi_scope_inner_with_hook(
     let mut ordered = shards.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
     let mut seen_shards = HashSet::new();
-    let mut artifacts = Vec::with_capacity(ordered.len());
+    let mut scope_inputs = Vec::with_capacity(ordered.len());
     let mut input_digest = Sha256::new();
     input_digest.update(NPI_SCOPE_INPUT_HASH_DOMAIN);
     let mut input_byte_count = 0u64;
@@ -6922,11 +6924,35 @@ fn extract_provider_graph_v4_npi_scope_inner_with_hook(
     for descriptor in ordered {
         let (scope_descriptor, reciprocal_descriptor) =
             validate_scope_shard(descriptor, &mut seen_shards)?;
-        let artifact = ValidatedNpiScopeArtifact::open(
-            scope_descriptor,
-            reciprocal_descriptor,
-            &descriptor.shard_id,
-        )?;
+        scope_inputs.push((descriptor, scope_descriptor, reciprocal_descriptor));
+    }
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(MAX_NPI_SCOPE_AUTH_WORKERS)
+        .min(scope_inputs.len())
+        .max(1);
+    let worker_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_count)
+        .thread_name(|index| format!("ptg2-v4-npi-auth-{index}"))
+        .build()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let opened = worker_pool.install(|| {
+        scope_inputs
+            .par_iter()
+            .map(|(descriptor, scope_descriptor, reciprocal_descriptor)| {
+                ValidatedNpiScopeArtifact::open(
+                    scope_descriptor,
+                    reciprocal_descriptor,
+                    &descriptor.shard_id,
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut artifacts = opened
+        .into_iter()
+        .collect::<ProviderGraphV4Result<Vec<_>>>()?;
+    for (descriptor, scope_descriptor, _reciprocal_descriptor) in scope_inputs {
         input_byte_count = input_byte_count
             .checked_add(scope_descriptor.metadata.byte_count)
             .ok_or(invalid("V4 NPI scope input byte count overflows"))?;
@@ -6938,7 +6964,6 @@ fn extract_provider_graph_v4_npi_scope_inner_with_hook(
         input_digest.update(scope_descriptor.metadata.byte_count.to_be_bytes());
         input_digest.update(scope_descriptor.metadata.row_count.to_be_bytes());
         input_digest.update(parse_sha256(&scope_descriptor.metadata.binding_sha256)?);
-        artifacts.push(artifact);
     }
 
     let mut heap = BinaryHeap::new();
