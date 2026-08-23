@@ -571,18 +571,18 @@ async def _run_independent_publication_lanes(
     price: Callable[[], Awaitable[Any]],
     source_witness: Callable[[], Awaitable[Any]],
 ) -> tuple[Any, Any, Any, Any]:
-    """Run independent durable outputs concurrently and fail as one unit."""
+    """Publish the bounded witness before the concurrent heavy outputs."""
 
+    source_witness_result = await source_witness()
     async with asyncio.TaskGroup() as task_group:
         finalizer_block_task = task_group.create_task(finalizer_blocks())
         provider_graph_task = task_group.create_task(provider_graph())
         price_task = task_group.create_task(price())
-        source_witness_task = task_group.create_task(source_witness())
     return (
         finalizer_block_task.result(),
         provider_graph_task.result(),
         price_task.result(),
-        source_witness_task.result(),
+        source_witness_result,
     )
 
 
