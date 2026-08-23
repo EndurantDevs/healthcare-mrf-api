@@ -6603,6 +6603,17 @@ impl PgCopyFileWriter {
         Ok(())
     }
 
+    fn npi_scope_row(&mut self, key: i32, npi: i64) -> ProviderGraphV4Result<()> {
+        let mut row = [0u8; 22];
+        row[..2].copy_from_slice(&2i16.to_be_bytes());
+        row[2..6].copy_from_slice(&4i32.to_be_bytes());
+        row[6..10].copy_from_slice(&key.to_be_bytes());
+        row[10..14].copy_from_slice(&8i32.to_be_bytes());
+        row[14..].copy_from_slice(&npi.to_be_bytes());
+        self.writer.write_all(&row)?;
+        Ok(())
+    }
+
     fn finish(mut self) -> ProviderGraphV4Result<()> {
         self.writer.write_all(&(-1i16).to_be_bytes())?;
         self.writer.flush()?;
@@ -6859,16 +6870,21 @@ impl ValidatedNpiScopeArtifact {
             }
             return Ok(None);
         }
-        let mut field_count = [0u8; 2];
+        let mut row = [0u8; 14];
         self.reader
-            .read_exact(&mut field_count)
+            .read_exact(&mut row)
             .map_err(|_| invalid("V4 provider NPI scope row is truncated"))?;
-        if i16::from_be_bytes(field_count) != 1 {
+        if row[..2] != 1i16.to_be_bytes() {
             return Err(invalid(
                 "V4 provider NPI scope row has an invalid field count",
             ));
         }
-        let npi = u64::from_be_bytes(read_copy_field::<8>(&mut self.reader, "source NPI")?);
+        if row[2..6] != 8i32.to_be_bytes() {
+            return Err(invalid(
+                "V4 provider NPI scope source NPI has an invalid width",
+            ));
+        }
+        let npi = u64::from_be_bytes(row[6..].try_into().expect("source NPI width"));
         if !(MIN_NPI..=MAX_NPI).contains(&npi) || npi <= self.previous_npi {
             return Err(invalid(
                 "V4 provider NPI scope rows must contain strict sorted ten-digit NPIs",
@@ -6941,7 +6957,7 @@ fn extract_provider_graph_v4_npi_scope_inner_with_hook(
                 "V4 NPI scope row count exceeds int32",
             )?;
             let npi = invalid_conversion(i64::try_from(npi), "V4 NPI exceeds int64")?;
-            output.row(&[&key.to_be_bytes(), &npi.to_be_bytes()])?;
+            output.npi_scope_row(key, npi)?;
             row_count = row_count
                 .checked_add(1)
                 .ok_or(invalid("V4 NPI scope row count overflows"))?;
@@ -9063,14 +9079,20 @@ mod tests {
 
         assert_eq!(summary.format, "ptg2_provider_graph_v4_npi_scope_v1");
         assert_eq!(summary.row_count, 3);
-        assert_eq!(
-            summary.output_sha256,
-            hex(&Sha256::digest(fs::read(&output_path).unwrap()))
-        );
-        assert_eq!(
-            read_npi_scope_copy(&output_path).unwrap(),
-            vec![(0, 1_111_111_111), (1, 1_234_567_890), (2, 2_222_222_222),]
-        );
+        let output_bytes = fs::read(&output_path).unwrap();
+        assert_eq!(summary.output_sha256, hex(&Sha256::digest(&output_bytes)));
+        let expected_rows = vec![(0, 1_111_111_111), (1, 1_234_567_890), (2, 2_222_222_222)];
+        assert_eq!(read_npi_scope_copy(&output_path).unwrap(), expected_rows);
+        let mut expected_bytes = PG_COPY_HEADER.to_vec();
+        for (key, npi) in expected_rows {
+            expected_bytes.extend_from_slice(&2i16.to_be_bytes());
+            expected_bytes.extend_from_slice(&4i32.to_be_bytes());
+            expected_bytes.extend_from_slice(&key.to_be_bytes());
+            expected_bytes.extend_from_slice(&8i32.to_be_bytes());
+            expected_bytes.extend_from_slice(&(npi as i64).to_be_bytes());
+        }
+        expected_bytes.extend_from_slice(&(-1i16).to_be_bytes());
+        assert_eq!(output_bytes, expected_bytes);
     }
 
     #[test]
@@ -9330,6 +9352,15 @@ mod tests {
         direct("truncated-trailer.copy", b"", 0);
         direct("truncated-source-row.copy", b"", 1);
         direct("truncated-source-length.copy", &1i16.to_be_bytes(), 1);
+        let mut invalid_field_count = [0u8; 14];
+        invalid_field_count[..2].copy_from_slice(&2i16.to_be_bytes());
+        invalid_field_count[2..6].copy_from_slice(&8i32.to_be_bytes());
+        invalid_field_count[6..].copy_from_slice(&MIN_NPI.to_be_bytes());
+        direct("invalid-source-field-count.copy", &invalid_field_count, 1);
+        let mut invalid_field_width = invalid_field_count;
+        invalid_field_width[..2].copy_from_slice(&1i16.to_be_bytes());
+        invalid_field_width[2..6].copy_from_slice(&7i32.to_be_bytes());
+        direct("invalid-source-field-width.copy", &invalid_field_width, 1);
         let mut truncated_value = 1i16.to_be_bytes().to_vec();
         truncated_value.extend_from_slice(&8i32.to_be_bytes());
         truncated_value.extend_from_slice(&[0; 4]);
