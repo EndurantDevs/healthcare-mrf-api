@@ -10,6 +10,7 @@
 //! hashed, or emitted.
 
 use memmap2::{Mmap, MmapOptions};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -116,6 +117,7 @@ const NPI_SCOPE_SHARD_BINDING_CONTRACT: &str = "provider_npi_scope_shard_binding
 const NPI_SCOPE_SHARD_BINDING_HASH_DOMAIN: &[u8] =
     b"ptg2:v4:provider-npi-scope-shard-binding:v1\x00";
 const NPI_SCOPE_RETENTION_CONTRACT: &str = "shared_v4_publication_scratch_v1";
+const MAX_NPI_SCOPE_AUTH_WORKERS: usize = 8;
 const INFERRED_TAXONOMY_INPUT_CONTRACT: &str = "ptg2_v4_inferred_taxonomy_compiler_input_v1";
 const INFERRED_TAXONOMY_CATALOG_CONTRACT: &str = "snapshot_npi_live_catalog_individual_v1";
 const INFERRED_TAXONOMY_VECTOR_FORMAT: &str = "sorted_u32le_v1";
@@ -6603,6 +6605,17 @@ impl PgCopyFileWriter {
         Ok(())
     }
 
+    fn npi_scope_row(&mut self, key: i32, npi: i64) -> ProviderGraphV4Result<()> {
+        let mut row = [0u8; 22];
+        row[..2].copy_from_slice(&2i16.to_be_bytes());
+        row[2..6].copy_from_slice(&4i32.to_be_bytes());
+        row[6..10].copy_from_slice(&key.to_be_bytes());
+        row[10..14].copy_from_slice(&8i32.to_be_bytes());
+        row[14..].copy_from_slice(&npi.to_be_bytes());
+        self.writer.write_all(&row)?;
+        Ok(())
+    }
+
     fn finish(mut self) -> ProviderGraphV4Result<()> {
         self.writer.write_all(&(-1i16).to_be_bytes())?;
         self.writer.flush()?;
@@ -6859,16 +6872,21 @@ impl ValidatedNpiScopeArtifact {
             }
             return Ok(None);
         }
-        let mut field_count = [0u8; 2];
+        let mut row = [0u8; 14];
         self.reader
-            .read_exact(&mut field_count)
+            .read_exact(&mut row)
             .map_err(|_| invalid("V4 provider NPI scope row is truncated"))?;
-        if i16::from_be_bytes(field_count) != 1 {
+        if row[..2] != 1i16.to_be_bytes() {
             return Err(invalid(
                 "V4 provider NPI scope row has an invalid field count",
             ));
         }
-        let npi = u64::from_be_bytes(read_copy_field::<8>(&mut self.reader, "source NPI")?);
+        if row[2..6] != 8i32.to_be_bytes() {
+            return Err(invalid(
+                "V4 provider NPI scope source NPI has an invalid width",
+            ));
+        }
+        let npi = u64::from_be_bytes(row[6..].try_into().expect("source NPI width"));
         if !(MIN_NPI..=MAX_NPI).contains(&npi) || npi <= self.previous_npi {
             return Err(invalid(
                 "V4 provider NPI scope rows must contain strict sorted ten-digit NPIs",
@@ -6887,6 +6905,13 @@ fn extract_provider_graph_v4_npi_scope_inner(
     extract_provider_graph_v4_npi_scope_inner_with_hook(shards, output_path, |_| {})
 }
 
+fn npi_scope_auth_worker_count(available_parallelism: usize, shard_count: usize) -> usize {
+    available_parallelism
+        .min(MAX_NPI_SCOPE_AUTH_WORKERS)
+        .min(shard_count)
+        .max(1)
+}
+
 fn extract_provider_graph_v4_npi_scope_inner_with_hook(
     shards: &[V4ProviderGraphShardDescriptor],
     output_path: &Path,
@@ -6898,7 +6923,7 @@ fn extract_provider_graph_v4_npi_scope_inner_with_hook(
     let mut ordered = shards.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
     let mut seen_shards = HashSet::new();
-    let mut artifacts = Vec::with_capacity(ordered.len());
+    let mut scope_inputs = Vec::with_capacity(ordered.len());
     let mut input_digest = Sha256::new();
     input_digest.update(NPI_SCOPE_INPUT_HASH_DOMAIN);
     let mut input_byte_count = 0u64;
@@ -6906,11 +6931,35 @@ fn extract_provider_graph_v4_npi_scope_inner_with_hook(
     for descriptor in ordered {
         let (scope_descriptor, reciprocal_descriptor) =
             validate_scope_shard(descriptor, &mut seen_shards)?;
-        let artifact = ValidatedNpiScopeArtifact::open(
-            scope_descriptor,
-            reciprocal_descriptor,
-            &descriptor.shard_id,
-        )?;
+        scope_inputs.push((descriptor, scope_descriptor, reciprocal_descriptor));
+    }
+    let worker_count = npi_scope_auth_worker_count(
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+        scope_inputs.len(),
+    );
+    let worker_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_count)
+        .thread_name(|index| format!("ptg2-v4-npi-auth-{index}"))
+        .build()
+        .map_err(io::Error::other)?;
+    let opened = worker_pool.install(|| {
+        scope_inputs
+            .par_iter()
+            .map(|(descriptor, scope_descriptor, reciprocal_descriptor)| {
+                ValidatedNpiScopeArtifact::open(
+                    scope_descriptor,
+                    reciprocal_descriptor,
+                    &descriptor.shard_id,
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut artifacts = opened
+        .into_iter()
+        .collect::<ProviderGraphV4Result<Vec<_>>>()?;
+    for (descriptor, scope_descriptor, _reciprocal_descriptor) in scope_inputs {
         input_byte_count = input_byte_count
             .checked_add(scope_descriptor.metadata.byte_count)
             .ok_or(invalid("V4 NPI scope input byte count overflows"))?;
@@ -6922,7 +6971,6 @@ fn extract_provider_graph_v4_npi_scope_inner_with_hook(
         input_digest.update(scope_descriptor.metadata.byte_count.to_be_bytes());
         input_digest.update(scope_descriptor.metadata.row_count.to_be_bytes());
         input_digest.update(parse_sha256(&scope_descriptor.metadata.binding_sha256)?);
-        artifacts.push(artifact);
     }
 
     let mut heap = BinaryHeap::new();
@@ -6941,7 +6989,7 @@ fn extract_provider_graph_v4_npi_scope_inner_with_hook(
                 "V4 NPI scope row count exceeds int32",
             )?;
             let npi = invalid_conversion(i64::try_from(npi), "V4 NPI exceeds int64")?;
-            output.row(&[&key.to_be_bytes(), &npi.to_be_bytes()])?;
+            output.npi_scope_row(key, npi)?;
             row_count = row_count
                 .checked_add(1)
                 .ok_or(invalid("V4 NPI scope row count overflows"))?;
@@ -9050,6 +9098,13 @@ mod tests {
     }
 
     #[test]
+    fn npi_scope_auth_workers_are_bounded_by_cpu_shards_and_cap() {
+        assert_eq!(npi_scope_auth_worker_count(1, 192), 1);
+        assert_eq!(npi_scope_auth_worker_count(64, 3), 3);
+        assert_eq!(npi_scope_auth_worker_count(64, 192), 8);
+    }
+
+    #[test]
     fn npi_scope_prepass_merges_shards_in_model_key_order() {
         let shared = shared_pattern_fixture(4, 2);
         let independent = independent_fixture();
@@ -9063,14 +9118,20 @@ mod tests {
 
         assert_eq!(summary.format, "ptg2_provider_graph_v4_npi_scope_v1");
         assert_eq!(summary.row_count, 3);
-        assert_eq!(
-            summary.output_sha256,
-            hex(&Sha256::digest(fs::read(&output_path).unwrap()))
-        );
-        assert_eq!(
-            read_npi_scope_copy(&output_path).unwrap(),
-            vec![(0, 1_111_111_111), (1, 1_234_567_890), (2, 2_222_222_222),]
-        );
+        let output_bytes = fs::read(&output_path).unwrap();
+        assert_eq!(summary.output_sha256, hex(&Sha256::digest(&output_bytes)));
+        let expected_rows = vec![(0, 1_111_111_111), (1, 1_234_567_890), (2, 2_222_222_222)];
+        assert_eq!(read_npi_scope_copy(&output_path).unwrap(), expected_rows);
+        let mut expected_bytes = PG_COPY_HEADER.to_vec();
+        for (key, npi) in expected_rows {
+            expected_bytes.extend_from_slice(&2i16.to_be_bytes());
+            expected_bytes.extend_from_slice(&4i32.to_be_bytes());
+            expected_bytes.extend_from_slice(&key.to_be_bytes());
+            expected_bytes.extend_from_slice(&8i32.to_be_bytes());
+            expected_bytes.extend_from_slice(&(npi as i64).to_be_bytes());
+        }
+        expected_bytes.extend_from_slice(&(-1i16).to_be_bytes());
+        assert_eq!(output_bytes, expected_bytes);
     }
 
     #[test]
@@ -9330,6 +9391,15 @@ mod tests {
         direct("truncated-trailer.copy", b"", 0);
         direct("truncated-source-row.copy", b"", 1);
         direct("truncated-source-length.copy", &1i16.to_be_bytes(), 1);
+        let mut invalid_field_count = [0u8; 14];
+        invalid_field_count[..2].copy_from_slice(&2i16.to_be_bytes());
+        invalid_field_count[2..6].copy_from_slice(&8i32.to_be_bytes());
+        invalid_field_count[6..].copy_from_slice(&MIN_NPI.to_be_bytes());
+        direct("invalid-source-field-count.copy", &invalid_field_count, 1);
+        let mut invalid_field_width = invalid_field_count;
+        invalid_field_width[..2].copy_from_slice(&1i16.to_be_bytes());
+        invalid_field_width[2..6].copy_from_slice(&7i32.to_be_bytes());
+        direct("invalid-source-field-width.copy", &invalid_field_width, 1);
         let mut truncated_value = 1i16.to_be_bytes().to_vec();
         truncated_value.extend_from_slice(&8i32.to_be_bytes());
         truncated_value.extend_from_slice(&[0; 4]);

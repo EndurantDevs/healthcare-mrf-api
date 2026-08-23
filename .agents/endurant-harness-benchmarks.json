@@ -1,6 +1,77 @@
 {
   "schema_version": 1,
   "benchmarks": {
+    "ptg-v4-npi-scope-extraction": {
+      "command": {
+        "argv": [
+          "python3",
+          ".agents/ptg_v4_npi_scope_benchmark.py"
+        ],
+        "timeout": 1800,
+        "env": {
+          "HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_DSN": "postgresql://127.0.0.1:5440/healthporta_test",
+          "HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_ROWS_PER_SHARD": "40000",
+          "HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_SAMPLES": "3",
+          "HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_SHARDS": "192",
+          "HLTHPRT_PTG_NPI_SCOPE_BENCHMARK_UNIVERSE": "1500000",
+          "PYTHONDONTWRITEBYTECODE": "1"
+        },
+        "evidence": "integration"
+      },
+      "source_files": [
+        "support/ptg2_scanner/src/provider_graph_v4.rs"
+      ],
+      "workload_files": [
+        ".agents/ptg_v4_npi_scope_benchmark.py",
+        "process/ptg_parts/ptg2_v4_graph_compiler.py",
+        "tests/ptg2_v4_graph_compiler_test_support.py",
+        "support/ptg2_scanner/Cargo.toml",
+        "support/ptg2_scanner/Cargo.lock"
+      ],
+      "correctness_keys": [
+        "source_row_count",
+        "input_byte_count",
+        "output_row_count",
+        "output_byte_count",
+        "output_sha256",
+        "input_sha256",
+        "postgres_min_npi",
+        "postgres_max_npi",
+        "postgres_npi_sum",
+        "postgres_sequence_violations",
+        "postgres_schema_cleaned",
+        "scope_scratch_cleaned"
+      ],
+      "metric_schema": {
+        "npi_scope_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "preparation_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "source_scope_rebuild_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "manifest_auth_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "postgres_copy_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        }
+      },
+      "primary_metric": "npi_scope_seconds",
+      "minimum_improvement_fraction": 0.1
+    },
     "provider-directory-scoped-address-format": {
       "command": {
         "argv": [
