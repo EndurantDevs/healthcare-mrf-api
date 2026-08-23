@@ -9,22 +9,22 @@ import yaml
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+CALLER = (
+    Path(__file__).resolve().parents[1]
+    / ".github/workflows/trusted-pr-ci.yml"
+)
 PREPUSH = Path(__file__).resolve().parents[1] / "scripts/ci/prepush"
 ARC_ELIGIBLE_EXPRESSION = (
     "(((github.event_name == 'push' || "
     "github.event_name == 'workflow_dispatch') && "
     "github.ref == 'refs/heads/main') || (inputs.activate_arc && "
     "github.event_name == 'pull_request' && "
-    "github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/"
-    ".github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', "
-    "github.event.number) && "
+    "github.ref == format('refs/pull/{0}/merge', github.event.number) && "
     "github.repository == 'EndurantDevs/healthcare-mrf-api' && "
     "github.event.pull_request.base.ref == 'main' && "
     "github.event.pull_request.base.repo.full_name == github.repository && "
     "github.event.pull_request.head.repo.full_name == github.repository && "
     "github.event.pull_request.head.repo.fork == false && "
-    "contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'), "
-    "github.event.pull_request.author_association) && "
     "github.event.pull_request.user.type == 'User' && "
     "github.actor != 'dependabot[bot]' && "
     "!endsWith(github.actor, '[bot]') && "
@@ -75,8 +75,6 @@ POSTGRES_HOST_EXPRESSION = (
     "${{ runner.environment == 'self-hosted' && "
     "'127.0.0.1' || 'postgres' }}"
 )
-
-
 def _values_for_key(value: object, key: str) -> list[object]:
     matches: list[object] = []
     if isinstance(value, dict):
@@ -95,12 +93,16 @@ def _documents() -> tuple[dict, dict]:
     return yaml.safe_load(workflow), yaml.load(workflow, Loader=yaml.BaseLoader)
 
 
+def _caller_documents() -> tuple[dict, dict]:
+    caller = CALLER.read_text(encoding="utf-8")
+    return yaml.safe_load(caller), yaml.load(caller, Loader=yaml.BaseLoader)
+
+
 def test_arc_route_is_trusted_main_only_with_a_hosted_fallback() -> None:
     document, trigger_document = _documents()
 
     assert set(trigger_document["on"]) == {
         "workflow_call",
-        "pull_request",
         "push",
         "workflow_dispatch",
     }
@@ -133,6 +135,31 @@ def test_arc_route_is_trusted_main_only_with_a_hosted_fallback() -> None:
         assert "container" not in job
 
 
+def test_trusted_pr_caller_is_one_secretless_protected_workflow_call() -> None:
+    document, trigger_document = _caller_documents()
+
+    assert trigger_document["on"] == {
+        "pull_request": {
+            "types": ["opened", "synchronize", "reopened", "labeled", "unlabeled"]
+        }
+    }
+    assert set(document) == {"name", True, "permissions", "jobs"}
+    assert document["name"] == "Trusted pull request CI"
+    assert document["permissions"] == {"contents": "read"}
+    assert document["jobs"] == {
+        "ci": {
+            "uses": (
+                "EndurantDevs/healthcare-mrf-api/"
+                ".github/workflows/ci.yml@main"
+            ),
+            "with": {"activate_arc": True},
+        }
+    }
+    caller = CALLER.read_text(encoding="utf-8")
+    assert "vars." not in caller
+    assert "github.workflow_ref" not in caller
+
+
 def test_reusable_arc_classifier_is_exact_and_human_only() -> None:
     document, _ = _documents()
 
@@ -142,22 +169,20 @@ def test_reusable_arc_classifier_is_exact_and_human_only() -> None:
         for required in (
             "inputs.activate_arc",
             "github.event_name == 'pull_request'",
-            "github.workflow_ref == format('",
-            ".github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge'",
-            "github.event.number",
+            "github.ref == format('refs/pull/{0}/merge', github.event.number)",
             "github.repository == 'EndurantDevs/healthcare-mrf-api'",
             "github.event.pull_request.base.ref == 'main'",
             "github.event.pull_request.base.repo.full_name == github.repository",
             "github.event.pull_request.head.repo.full_name == github.repository",
             "github.event.pull_request.head.repo.fork == false",
-            "github.event.pull_request.author_association",
             "github.event.pull_request.user.type == 'User'",
             "github.actor != 'dependabot[bot]'",
             "!endsWith(github.actor, '[bot]')",
             "!endsWith(github.triggering_actor, '[bot]')",
         ):
             assert required in route
-        assert '[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]' in route
+        assert "github.workflow_ref" not in route
+        assert "author_association" not in route
         assert "inputs.activate_arc" not in route.split("||", 1)[0]
     for name in KUBERNETES_JOBS:
         assert "vars.HEALTHCARE_MRF_CI_RUNNER" in document["jobs"][name]["runs-on"]

@@ -11,6 +11,9 @@ import yaml
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_ROOT = REPOSITORY_ROOT / ".github" / "workflows"
 FULL_COMMIT_ACTION = re.compile(r"^[^./\s][^@\s]*@[0-9a-f]{40}$")
+PROTECTED_MAIN_CI = (
+    "EndurantDevs/healthcare-mrf-api/.github/workflows/ci.yml@main"
+)
 
 
 def _workflow(path: str) -> str:
@@ -40,6 +43,9 @@ def test_every_external_action_is_pinned_to_a_full_commit() -> None:
         for action in _values_for_key(document, "uses"):
             assert isinstance(action, str)
             if action.startswith("./"):
+                continue
+            if workflow_path.name == "trusted-pr-ci.yml":
+                assert action == PROTECTED_MAIN_CI
                 continue
             assert FULL_COMMIT_ACTION.fullmatch(action), (
                 f"{workflow_path.name} must pin external Action {action!r} "
