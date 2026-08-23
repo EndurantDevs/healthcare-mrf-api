@@ -7735,6 +7735,7 @@ async def group_plan_providers(request):
     provider_sex_code = normalize_provider_sex_code(
         request.args.get("provider_sex_code")
     )
+    request.args.get("primary_only")
     specialty_filter = await _resolve_ptg_specialty_or_raise(session, request.args)
     specialty_warning = None
 
