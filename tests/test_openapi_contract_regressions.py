@@ -116,6 +116,16 @@ def test_doctor_search_contract_documents_cards_and_filter_defaults():
 
 def test_provider_specialty_filter_primary_only_defaults_to_true():
     spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    group_plan_parameters = spec["paths"]["/pricing/group-plan-providers"]["get"][
+        "parameters"
+    ]
+    assert {
+        "classification",
+        "include_subspecialties",
+        "primary_only",
+        "specialty",
+        "taxonomy_codes",
+    }.issubset({parameter.get("name") for parameter in group_plan_parameters})
     for path in (
         "/pricing/group-plan-providers",
         "/pricing/providers/search-by-procedure",
