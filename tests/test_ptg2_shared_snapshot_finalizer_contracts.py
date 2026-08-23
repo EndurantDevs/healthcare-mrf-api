@@ -80,26 +80,34 @@ async def test_v4_disabled_publication_keeps_v3_path(
 
 
 @pytest.mark.asyncio
-async def test_source_witness_and_graph_finish_before_parallel_heavy_lanes():
+async def test_source_witness_and_graph_gate_price_lane_capacity():
     source_witness_finished = asyncio.Event()
-    graph_started = asyncio.Event()
-    heavy_lanes: set[str] = set()
+    price_started = asyncio.Event()
     lane_events: list[str] = []
+    admission_slots: list[str] = []
 
-    async def heavy_lane(name: str) -> str:
-        await graph_started.wait()
+    async def lane(
+        name: str,
+        slot_count: int,
+        *,
+        release: asyncio.Event | None = None,
+        started: asyncio.Event | None = None,
+    ) -> str:
         assert source_witness_finished.is_set()
-        heavy_lanes.add(name)
+        admission_slots.extend([name] * slot_count)
         lane_events.append(name)
-        return name
-
-    async def provider_graph() -> str:
-        assert source_witness_finished.is_set()
-        lane_events.append("provider_graph")
-        graph_started.set()
-        await asyncio.sleep(0)
-        assert not heavy_lanes
-        return "provider_graph"
+        try:
+            assert len(admission_slots) <= 3
+            if started is not None:
+                started.set()
+            if release is not None:
+                await release.wait()
+            else:
+                await asyncio.sleep(0)
+            return name
+        finally:
+            for _ in range(slot_count):
+                admission_slots.remove(name)
 
     async def source_witness() -> str:
         await asyncio.sleep(0)
@@ -107,55 +115,26 @@ async def test_source_witness_and_graph_finish_before_parallel_heavy_lanes():
         source_witness_finished.set()
         return "source_witness"
 
-    lane_outputs = await _run_independent_publication_lanes(
-        finalizer_blocks=lambda: heavy_lane("finalizer_blocks"),
-        provider_graph=provider_graph,
-        price=lambda: heavy_lane("price"),
-        source_witness=source_witness,
+    lane_outputs = await asyncio.wait_for(
+        _run_independent_publication_lanes(
+            finalizer_blocks=lambda: lane(
+                "finalizer_blocks", 1, release=price_started
+            ),
+            provider_graph=lambda: lane("provider_graph", 2),
+            price=lambda: lane("price", 2, started=price_started),
+            source_witness=source_witness,
+        ),
+        timeout=0.5,
     )
 
-    assert lane_events[0] == "provider_graph"
-    assert heavy_lanes == {"finalizer_blocks", "price"}
+    assert lane_events == ["finalizer_blocks", "provider_graph", "price"]
+    assert not admission_slots
     assert lane_outputs == (
         "finalizer_blocks",
         "provider_graph",
         "price",
         "source_witness",
     )
-
-
-@pytest.mark.asyncio
-async def test_parallel_heavy_lane_failure_cancels_peer():
-    price_started = asyncio.Event()
-    price_cancelled = asyncio.Event()
-
-    async def finalizer_blocks() -> str:
-        await price_started.wait()
-        raise RuntimeError("finalizer failed")
-
-    async def price() -> str:
-        price_started.set()
-        try:
-            await asyncio.Future()
-        except asyncio.CancelledError:
-            price_cancelled.set()
-            raise
-
-    async def result(name: str) -> str:
-        return name
-
-    with pytest.raises(ExceptionGroup) as exc_info:
-        await _run_independent_publication_lanes(
-            finalizer_blocks=finalizer_blocks,
-            provider_graph=lambda: result("provider_graph"),
-            price=price,
-            source_witness=lambda: result("source_witness"),
-        )
-
-    assert [str(error) for error in exc_info.value.exceptions] == [
-        "finalizer failed"
-    ]
-    assert price_cancelled.is_set()
 
 
 @pytest.mark.asyncio

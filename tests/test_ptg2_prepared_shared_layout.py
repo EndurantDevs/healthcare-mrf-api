@@ -359,20 +359,24 @@ async def test_finalizer_cas_failure_cancels_adaptive_v4_lane_before_seal(
     monkeypatch.setattr(snapshot_publish, "seal_v4_shared_layout", seal_v4)
 
     with pytest.raises(ExceptionGroup) as exc_info:
-        await _publish_prepared_layout(
-            mocks,
-            tmp_path,
-            provider_graph_v4=True,
-            compressed_acquisition_bytes=1,
-            empty_npi_tin_only_normalization_count=0,
-            progress_callback=lambda stage, counters: progress_events.append(
-                (stage, counters)
+        await asyncio.wait_for(
+            _publish_prepared_layout(
+                mocks,
+                tmp_path,
+                provider_graph_v4=True,
+                compressed_acquisition_bytes=1,
+                empty_npi_tin_only_normalization_count=0,
+                progress_callback=lambda stage, counters: progress_events.append(
+                    (stage, counters)
+                ),
             ),
+            timeout=0.5,
         )
 
     assert len(exc_info.value.exceptions) == 1
     assert "no payload or durable CAS row" in str(exc_info.value.exceptions[0])
     assert adaptive_cancelled.is_set()
+    mocks.publish_price.assert_not_awaited()
     seal_v4.assert_not_awaited()
     assert all(stage != "snapshot seal" for stage, _counters in progress_events)
 
