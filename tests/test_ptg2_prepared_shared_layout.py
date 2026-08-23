@@ -351,6 +351,7 @@ async def test_v4_graph_failure_prevents_finalizer_and_price_before_seal(
 
     assert len(exc_info.value.exceptions) == 1
     assert "synthetic provider graph failure" in str(exc_info.value.exceptions[0])
+    mocks.create_stage.assert_not_awaited()
     mocks.publish_blocks.assert_not_awaited()
     mocks.publish_price.assert_not_awaited()
     mocks.publish_witness.assert_awaited_once()
