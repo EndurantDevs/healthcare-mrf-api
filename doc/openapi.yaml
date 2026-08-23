@@ -3337,6 +3337,12 @@ paths:
             type: boolean
             default: false
           description: Include mailing addresses when applying location filters.
+        - name: primary_only
+          in: query
+          schema:
+            type: boolean
+            default: true
+          description: Restrict taxonomy filters to the NPI primary taxonomy when true.
       responses:
         '200':
           description: Group plan provider page

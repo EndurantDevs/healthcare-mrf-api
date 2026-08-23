@@ -114,9 +114,10 @@ def test_doctor_search_contract_documents_cards_and_filter_defaults():
 
 
 
-def test_procedure_provider_primary_taxonomy_filter_defaults_to_true():
+def test_provider_specialty_filter_primary_only_defaults_to_true():
     spec = yaml.safe_load(OPENAPI_PATH.read_text())
     for path in (
+        "/pricing/group-plan-providers",
         "/pricing/providers/search-by-procedure",
         "/pricing/providers/by-procedure",
     ):
