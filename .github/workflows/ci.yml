@@ -44,7 +44,8 @@ jobs:
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
       github.event_name == 'pull_request' &&
-      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.ref == format('refs/pull/{0}/merge', github.event.number) &&
+      startsWith(github.workflow_ref, 'EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@') &&
       github.repository == 'EndurantDevs/healthcare-mrf-api' &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.base.repo.full_name == github.repository &&
@@ -76,7 +77,8 @@ jobs:
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
       github.event_name == 'pull_request' &&
-      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.ref == format('refs/pull/{0}/merge', github.event.number) &&
+      startsWith(github.workflow_ref, 'EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@') &&
       github.repository == 'EndurantDevs/healthcare-mrf-api' &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.base.repo.full_name == github.repository &&
@@ -111,7 +113,8 @@ jobs:
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
       github.event_name == 'pull_request' &&
-      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.ref == format('refs/pull/{0}/merge', github.event.number) &&
+      startsWith(github.workflow_ref, 'EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@') &&
       github.repository == 'EndurantDevs/healthcare-mrf-api' &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.base.repo.full_name == github.repository &&
@@ -160,7 +163,8 @@ jobs:
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
       github.event_name == 'pull_request' &&
-      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.ref == format('refs/pull/{0}/merge', github.event.number) &&
+      startsWith(github.workflow_ref, 'EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@') &&
       github.repository == 'EndurantDevs/healthcare-mrf-api' &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.base.repo.full_name == github.repository &&
@@ -216,7 +220,8 @@ jobs:
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
       github.event_name == 'pull_request' &&
-      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.ref == format('refs/pull/{0}/merge', github.event.number) &&
+      startsWith(github.workflow_ref, 'EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@') &&
       github.repository == 'EndurantDevs/healthcare-mrf-api' &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.base.repo.full_name == github.repository &&
@@ -275,7 +280,8 @@ jobs:
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
       github.event_name == 'pull_request' &&
-      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.ref == format('refs/pull/{0}/merge', github.event.number) &&
+      startsWith(github.workflow_ref, 'EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@') &&
       github.repository == 'EndurantDevs/healthcare-mrf-api' &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.base.repo.full_name == github.repository &&
@@ -306,7 +312,8 @@ jobs:
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
       github.event_name == 'pull_request' &&
-      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.ref == format('refs/pull/{0}/merge', github.event.number) &&
+      startsWith(github.workflow_ref, 'EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@') &&
       github.repository == 'EndurantDevs/healthcare-mrf-api' &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.base.repo.full_name == github.repository &&
@@ -355,7 +362,8 @@ jobs:
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
       github.event_name == 'pull_request' &&
-      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.ref == format('refs/pull/{0}/merge', github.event.number) &&
+      startsWith(github.workflow_ref, 'EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@') &&
       github.repository == 'EndurantDevs/healthcare-mrf-api' &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.base.repo.full_name == github.repository &&
@@ -380,7 +388,8 @@ jobs:
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
       github.event_name == 'pull_request' &&
-      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.ref == format('refs/pull/{0}/merge', github.event.number) &&
+      startsWith(github.workflow_ref, 'EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@') &&
       github.repository == 'EndurantDevs/healthcare-mrf-api' &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.base.repo.full_name == github.repository &&
@@ -410,7 +419,8 @@ jobs:
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
       github.event_name == 'pull_request' &&
-      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.ref == format('refs/pull/{0}/merge', github.event.number) &&
+      startsWith(github.workflow_ref, 'EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@') &&
       github.repository == 'EndurantDevs/healthcare-mrf-api' &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.base.repo.full_name == github.repository &&
@@ -453,7 +463,8 @@ jobs:
       ${{ (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main') || (inputs.activate_arc &&
       github.event_name == 'pull_request' &&
-      github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', github.event.number) &&
+      github.ref == format('refs/pull/{0}/merge', github.event.number) &&
+      startsWith(github.workflow_ref, 'EndurantDevs/healthcare-mrf-api/.github/workflows/trusted-pr-ci.yml@') &&
       github.repository == 'EndurantDevs/healthcare-mrf-api' &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.base.repo.full_name == github.repository &&

@@ -15,9 +15,9 @@ ARC_ELIGIBLE_EXPRESSION = (
     "github.event_name == 'workflow_dispatch') && "
     "github.ref == 'refs/heads/main') || (inputs.activate_arc && "
     "github.event_name == 'pull_request' && "
-    "github.workflow_ref == format('EndurantDevs/healthcare-mrf-api/"
-    ".github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge', "
-    "github.event.number) && "
+    "github.ref == format('refs/pull/{0}/merge', github.event.number) && "
+    "startsWith(github.workflow_ref, 'EndurantDevs/healthcare-mrf-api/"
+    ".github/workflows/trusted-pr-ci.yml@') && "
     "github.repository == 'EndurantDevs/healthcare-mrf-api' && "
     "github.event.pull_request.base.ref == 'main' && "
     "github.event.pull_request.base.repo.full_name == github.repository && "
@@ -142,9 +142,9 @@ def test_reusable_arc_classifier_is_exact_and_human_only() -> None:
         for required in (
             "inputs.activate_arc",
             "github.event_name == 'pull_request'",
-            "github.workflow_ref == format('",
-            ".github/workflows/trusted-pr-ci.yml@refs/pull/{0}/merge'",
-            "github.event.number",
+            "github.ref == format('refs/pull/{0}/merge', github.event.number)",
+            "startsWith(github.workflow_ref, '",
+            ".github/workflows/trusted-pr-ci.yml@')",
             "github.repository == 'EndurantDevs/healthcare-mrf-api'",
             "github.event.pull_request.base.ref == 'main'",
             "github.event.pull_request.base.repo.full_name == github.repository",
