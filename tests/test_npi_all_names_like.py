@@ -141,6 +141,8 @@ async def test_get_all_unified_phone_list_and_count_bind_candidate_limit(monkeyp
         types.SimpleNamespace(
             args={
                 "phone": "8106526315",
+                "q": "smith",
+                "codes": "1223E0200X",
                 "limit": "5",
                 "start": "0",
                 "include_total": "1",
@@ -155,6 +157,8 @@ async def test_get_all_unified_phone_list_and_count_bind_candidate_limit(monkeyp
         if "LIMIT :candidate_limit" in sql
     ]
     assert {params["candidate_limit"] for params in phone_candidate_calls} == {100, 500}
+    page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
+    assert "provider_total" not in page_sql
 
 
 
@@ -452,18 +456,21 @@ async def test_get_all_name_taxonomy_count_closes_the_cte_list(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
 
-    await get_all(
+    response = await get_all(
         types.SimpleNamespace(
             args={
                 "q": "clinic",
                 "codes": "207Q00000X",
                 "include_total": "true",
                 "limit": "10",
-                "start": "0",
+                "start": "10",
             }
         )
     )
 
+    response_body = json.loads(response.body)
+    assert response_body["total"] == 5
+    assert response_body["total_source"] == "computed"
     count_sql = next(
         sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql
     )
@@ -476,6 +483,60 @@ async def test_get_all_name_taxonomy_count_closes_the_cte_list(monkeypatch):
         "IN (:count_name_provider_taxonomy_code_0)"
     ) in count_sql
     assert not re.search(r"\)\s*,\s*SELECT\s+COUNT", count_sql, flags=re.IGNORECASE)
+
+
+@pytest.mark.asyncio
+async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypatch):
+    provider_npi = 1000000049
+    request_session = object()
+    provider_record_map = _provider_directory_row_mapping()
+    provider_record = (
+        (provider_npi,)
+        + tuple(provider_record_map.get(column.key) for column in npi_module.NPIData.__table__.columns)
+        + tuple(provider_record_map.get(column.key) for column in npi_module.NPIAddress.__table__.columns)
+        + (1, 52)
+    )
+    status_started = asyncio.Event()
+    enrichment_started = asyncio.Event()
+
+    async def fake_apply_location_statuses(locations, *, session=None):
+        assert session is request_session
+        status_started.set()
+        await asyncio.wait_for(enrichment_started.wait(), timeout=1)
+        for location in locations:
+            location["location_status"] = "active"
+
+    async def fake_fetch_enrichment(npis, *, include_chain=False, session=None):
+        assert npis == [provider_npi]
+        assert include_chain is False
+        assert session is None
+        enrichment_started.set()
+        await asyncio.wait_for(status_started.wait(), timeout=1)
+        return {provider_npi: {"status": "active"}}
+
+    conn = types.SimpleNamespace(all=AsyncMock(side_effect=[[provider_record], []]))
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.npi_address"))
+    monkeypatch.setattr(npi_module, "_apply_location_statuses", fake_apply_location_statuses)
+    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", fake_fetch_enrichment)
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    response = await get_all(
+        types.SimpleNamespace(
+            ctx=types.SimpleNamespace(sa_session=request_session),
+            args={"q": "smith", "codes": "1223E0200X", "limit": "10"},
+        )
+    )
+    response_body = json.loads(response.body)
+
+    assert response_body["total"] == 52
+    assert response_body["total_source"] == "computed"
+    assert [provider_result["npi"] for provider_result in response_body["rows"]] == [provider_npi]
+    assert response_body["rows"][0]["location_status"] == "active"
+    assert response_body["rows"][0]["provider_enrichment_summary"] == {"status": "active"}
+    page_sql = str(conn.all.await_args_list[0].args[0])
+    assert page_sql.count("taxonomy_matched_npi AS MATERIALIZED") == 1
+    assert "COUNT(*) OVER () AS provider_total" in page_sql
+    assert not any("SELECT COUNT(DISTINCT" in str(call.args[0]) for call in conn.all.await_args_list)
 
 
 @pytest.mark.asyncio
