@@ -80,34 +80,38 @@ async def test_v4_disabled_publication_keeps_v3_path(
 
 
 @pytest.mark.asyncio
-async def test_source_witness_and_graph_gate_price_lane_capacity():
+async def test_source_witness_and_graph_gate_finalizer_db_admission():
     source_witness_finished = asyncio.Event()
-    price_started = asyncio.Event()
+    graph_started = asyncio.Event()
+    graph_finished = asyncio.Event()
     lane_events: list[str] = []
-    admission_slots: list[str] = []
+    active_db_lanes: list[str] = []
 
-    async def lane(
-        name: str,
-        slot_count: int,
-        *,
-        release: asyncio.Event | None = None,
-        started: asyncio.Event | None = None,
-    ) -> str:
+    async def provider_graph() -> str:
         assert source_witness_finished.is_set()
-        admission_slots.extend([name] * slot_count)
-        lane_events.append(name)
+        active_db_lanes.append("provider_graph")
+        lane_events.append("provider_graph")
+        graph_started.set()
         try:
-            assert len(admission_slots) <= 3
-            if started is not None:
-                started.set()
-            if release is not None:
-                await release.wait()
-            else:
-                await asyncio.sleep(0)
-            return name
+            await asyncio.sleep(0)
+            graph_finished.set()
+            return "provider_graph"
         finally:
-            for _ in range(slot_count):
-                admission_slots.remove(name)
+            active_db_lanes.remove("provider_graph")
+
+    async def finalizer_blocks() -> str:
+        assert source_witness_finished.is_set()
+        await graph_started.wait()
+        assert graph_finished.is_set()
+        assert not active_db_lanes
+        lane_events.append("finalizer_blocks")
+        return "finalizer_blocks"
+
+    async def prepublished_price() -> str:
+        assert source_witness_finished.is_set()
+        assert graph_finished.is_set()
+        lane_events.append("prepublished_price")
+        return "prepublished_price"
 
     async def source_witness() -> str:
         await asyncio.sleep(0)
@@ -117,24 +121,55 @@ async def test_source_witness_and_graph_gate_price_lane_capacity():
 
     lane_outputs = await asyncio.wait_for(
         _run_independent_publication_lanes(
-            finalizer_blocks=lambda: lane(
-                "finalizer_blocks", 1, release=price_started
-            ),
-            provider_graph=lambda: lane("provider_graph", 2),
-            price=lambda: lane("price", 2, started=price_started),
+            finalizer_blocks=finalizer_blocks,
+            provider_graph=provider_graph,
+            price=prepublished_price,
             source_witness=source_witness,
         ),
         timeout=0.5,
     )
 
-    assert lane_events == ["finalizer_blocks", "provider_graph", "price"]
-    assert not admission_slots
+    assert lane_events[0] == "provider_graph"
+    assert sorted(lane_events[1:]) == ["finalizer_blocks", "prepublished_price"]
+    assert not active_db_lanes
     assert lane_outputs == (
         "finalizer_blocks",
         "provider_graph",
-        "price",
+        "prepublished_price",
         "source_witness",
     )
+
+
+@pytest.mark.asyncio
+async def test_finalizer_failure_cancels_waiting_price_after_graph():
+    price_started = asyncio.Event()
+    price_cancelled = asyncio.Event()
+
+    async def fail_finalizer() -> None:
+        await price_started.wait()
+        raise RuntimeError("synthetic finalizer failure")
+
+    async def wait_for_price() -> None:
+        price_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            price_cancelled.set()
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await asyncio.wait_for(
+            _run_independent_publication_lanes(
+                finalizer_blocks=fail_finalizer,
+                provider_graph=lambda: asyncio.sleep(0),
+                price=wait_for_price,
+                source_witness=lambda: asyncio.sleep(0),
+            ),
+            timeout=0.5,
+        )
+
+    assert len(exc_info.value.exceptions) == 1
+    assert "synthetic finalizer failure" in str(exc_info.value.exceptions[0])
+    assert price_cancelled.is_set()
 
 
 @pytest.mark.asyncio
