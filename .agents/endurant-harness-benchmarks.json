@@ -19,11 +19,11 @@
         "evidence": "integration"
       },
       "source_files": [
+        "process/ptg_parts/ptg2_v4_graph_compiler.py",
         "support/ptg2_scanner/src/provider_graph_v4.rs"
       ],
       "workload_files": [
         ".agents/ptg_v4_npi_scope_benchmark.py",
-        "process/ptg_parts/ptg2_v4_graph_compiler.py",
         "tests/ptg2_v4_graph_compiler_test_support.py",
         "support/ptg2_scanner/Cargo.toml",
         "support/ptg2_scanner/Cargo.lock"
@@ -69,7 +69,7 @@
           "direction": "lower"
         }
       },
-      "primary_metric": "npi_scope_seconds",
+      "primary_metric": "preparation_seconds",
       "minimum_improvement_fraction": 0.1
     },
     "provider-directory-scoped-address-format": {

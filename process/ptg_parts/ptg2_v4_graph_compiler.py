@@ -4250,31 +4250,6 @@ def _validate_reciprocal_header(
         raise RuntimeError("V4 provider NPI scope reciprocal header changed")
 
 
-def _reciprocal_npi_owner(
-    reciprocal_file: Any,
-    *,
-    previous_npi: int,
-    expected_offset: int,
-) -> tuple[int, int]:
-    owner = reciprocal_file.read(16)
-    raw_offset = reciprocal_file.read(8)
-    raw_count = reciprocal_file.read(4)
-    if len(owner) != 16 or len(raw_offset) != 8 or len(raw_count) != 4:
-        raise RuntimeError("V4 provider NPI scope reciprocal index is truncated")
-    npi = int.from_bytes(owner[8:], "big")
-    owner_offset = int.from_bytes(raw_offset, "little")
-    owner_members = int.from_bytes(raw_count, "little")
-    if (
-        owner[:8] != bytes(8)
-        or not 1_000_000_000 <= npi <= 9_999_999_999
-        or npi <= previous_npi
-        or owner_offset != expected_offset
-        or owner_members <= 0
-    ):
-        raise RuntimeError("V4 provider NPI scope reciprocal index changed")
-    return npi, owner_members
-
-
 def _write_npi_scope_rows(
     reciprocal_file: Any,
     scope_file: Any,
@@ -4285,15 +4260,36 @@ def _write_npi_scope_rows(
     scope_file.write(_PG_COPY_HEADER)
     previous_npi = 0
     expected_offset = 0
-    for _owner_index in range(owner_count):
-        npi, owner_members = _reciprocal_npi_owner(
-            reciprocal_file,
-            previous_npi=previous_npi,
-            expected_offset=expected_offset,
-        )
-        scope_file.write(struct.pack(">hIq", 1, 8, npi))
-        expected_offset += owner_members
-        previous_npi = npi
+    remaining_owners = owner_count
+    zero_owner = bytes(8)
+    owner_head = struct.Struct(">8sQ")
+    owner_tail = struct.Struct("<QI")
+    scope_row = struct.Struct(">hIq")
+    while remaining_owners:
+        chunk_owner_count = min(4_096, remaining_owners)
+        owners = reciprocal_file.read(chunk_owner_count * 28)
+        if len(owners) != chunk_owner_count * 28:
+            raise RuntimeError("V4 provider NPI scope reciprocal index is truncated")
+        scope_rows = bytearray(chunk_owner_count * scope_row.size)
+        for owner_index in range(chunk_owner_count):
+            owner_offset = owner_index * 28
+            owner_prefix, npi = owner_head.unpack_from(owners, owner_offset)
+            source_member_offset, owner_members = owner_tail.unpack_from(
+                owners, owner_offset + owner_head.size
+            )
+            if (
+                owner_prefix != zero_owner
+                or not 1_000_000_000 <= npi <= 9_999_999_999
+                or npi <= previous_npi
+                or source_member_offset != expected_offset
+                or owner_members <= 0
+            ):
+                raise RuntimeError("V4 provider NPI scope reciprocal index changed")
+            scope_row.pack_into(scope_rows, owner_index * scope_row.size, 1, 8, npi)
+            expected_offset += owner_members
+            previous_npi = npi
+        scope_file.write(scope_rows)
+        remaining_owners -= chunk_owner_count
     if expected_offset != member_count:
         raise RuntimeError("V4 provider NPI scope reciprocal member count changed")
     scope_file.write(struct.pack(">h", -1))

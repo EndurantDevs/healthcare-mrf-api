@@ -3,6 +3,7 @@
 import asyncio
 import io
 from pathlib import Path
+import struct
 
 import pytest
 
@@ -19,6 +20,46 @@ from tests.test_ptg2_v4_graph_compiler import (
     _fixture,
     _progress_event,
 )
+
+
+def test_scope_prepass_batches_owner_rows_and_preserves_validation() -> None:
+    owner_count = 4_097
+    owners = b"".join(
+        bytes(8)
+        + (1_000_000_000 + index).to_bytes(8, "big")
+        + index.to_bytes(8, "little")
+        + (1).to_bytes(4, "little")
+        for index in range(owner_count)
+    )
+    scope = io.BytesIO()
+    compiler._write_npi_scope_rows(
+        io.BytesIO(owners),
+        scope,
+        owner_count=owner_count,
+        member_count=owner_count,
+    )
+    expected = compiler._PG_COPY_HEADER + b"".join(
+        struct.pack(">hIq", 1, 8, 1_000_000_000 + index)
+        for index in range(owner_count)
+    ) + struct.pack(">h", -1)
+    assert scope.getvalue() == expected
+
+    with pytest.raises(RuntimeError, match="index is truncated"):
+        compiler._write_npi_scope_rows(
+            io.BytesIO(owners[:-1]),
+            io.BytesIO(),
+            owner_count=owner_count,
+            member_count=owner_count,
+        )
+    invalid = bytearray(owners[:28])
+    invalid[-4:] = bytes(4)
+    with pytest.raises(RuntimeError, match="index changed"):
+        compiler._write_npi_scope_rows(
+            io.BytesIO(invalid),
+            io.BytesIO(),
+            owner_count=1,
+            member_count=1,
+        )
 
 
 @pytest.mark.asyncio
