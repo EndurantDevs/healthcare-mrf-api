@@ -304,43 +304,19 @@ async def test_prepared_layout_requires_selective_copy_proof(monkeypatch, tmp_pa
     mocks.graph_conversion.cleanup.assert_called_once_with()
 
 
-def _failing_cas_and_waiting_graph(adaptive_started, adaptive_cancelled):
-    async def fail_finalizer_cas(**_kwargs):
-        await adaptive_started.wait()
-        raise RuntimeError(
-            "strict V3 shared block stage has no payload or durable CAS row"
-        )
-
-    async def publish_adaptive_graph(*_args, **_kwargs):
-        adaptive_started.set()
-        try:
-            await asyncio.Future()
-        finally:
-            adaptive_cancelled.set()
-
-    return fail_finalizer_cas, publish_adaptive_graph
-
-
 @pytest.mark.asyncio
-async def test_finalizer_cas_failure_cancels_adaptive_v4_lane_before_seal(
+async def test_v4_graph_failure_prevents_finalizer_and_price_before_seal(
     monkeypatch,
     tmp_path,
 ):
-    """Cancel adaptive dictionary work without fabricating sealed progress."""
+    """Leave later publication lanes untouched when provider graph publication fails."""
 
     mocks = _prepared_layout_mocks(monkeypatch, tmp_path)
-    adaptive_started = asyncio.Event()
-    adaptive_cancelled = asyncio.Event()
     seal_v4 = AsyncMock()
     progress_events = []
     mocks.graph_conversion.block_count = 4
     (tmp_path / "price-key-map.copy").write_bytes(b"price keys")
     (tmp_path / "provider-keys.tsv").write_bytes(b"provider keys")
-    fail_finalizer_cas, publish_adaptive_graph = _failing_cas_and_waiting_graph(
-        adaptive_started,
-        adaptive_cancelled,
-    )
-    mocks.publish_blocks.side_effect = fail_finalizer_cas
     monkeypatch.setattr(
         snapshot_publish,
         "_compile_v4_provider_graph",
@@ -354,7 +330,7 @@ async def test_finalizer_cas_failure_cancels_adaptive_v4_lane_before_seal(
     monkeypatch.setattr(
         snapshot_publish,
         "_publish_v4_graph",
-        publish_adaptive_graph,
+        AsyncMock(side_effect=RuntimeError("synthetic provider graph failure")),
     )
     monkeypatch.setattr(snapshot_publish, "seal_v4_shared_layout", seal_v4)
 
@@ -374,9 +350,11 @@ async def test_finalizer_cas_failure_cancels_adaptive_v4_lane_before_seal(
         )
 
     assert len(exc_info.value.exceptions) == 1
-    assert "no payload or durable CAS row" in str(exc_info.value.exceptions[0])
-    assert adaptive_cancelled.is_set()
+    assert "synthetic provider graph failure" in str(exc_info.value.exceptions[0])
+    mocks.create_stage.assert_not_awaited()
+    mocks.publish_blocks.assert_not_awaited()
     mocks.publish_price.assert_not_awaited()
+    mocks.publish_witness.assert_awaited_once()
     seal_v4.assert_not_awaited()
     assert all(stage != "snapshot seal" for stage, _counters in progress_events)
 
@@ -384,6 +362,22 @@ async def test_finalizer_cas_failure_cancels_adaptive_v4_lane_before_seal(
 @pytest.mark.asyncio
 async def test_prepared_layout_reuses_early_results(monkeypatch, tmp_path):
     mocks = _prepared_layout_mocks(monkeypatch, tmp_path, seal_reused=True)
+    lane_events = []
+    graph_finished = asyncio.Event()
+
+    async def publish_graph(*_args, **_kwargs):
+        lane_events.append("provider_graph")
+        await asyncio.sleep(0)
+        graph_finished.set()
+        return mocks.lanes.graph
+
+    async def create_finalizer_stage(**_kwargs):
+        assert lane_events == ["provider_graph"]
+        assert graph_finished.is_set()
+        lane_events.append("finalizer_stage")
+
+    mocks.publish_graph.side_effect = publish_graph
+    mocks.create_stage.side_effect = create_finalizer_stage
     finalizer = snapshot_publish._PreparedFinalizer(
         summary=mocks.summary_by_field,
         price_key_map_export_seconds=0.1,
@@ -406,6 +400,7 @@ async def test_prepared_layout_reuses_early_results(monkeypatch, tmp_path):
     mocks.export_price.assert_not_awaited()
     mocks.run_finalizer.assert_not_awaited()
     mocks.publish_price.assert_not_awaited()
+    assert lane_events == ["provider_graph", "finalizer_stage"]
     mocks.sealed_audit.assert_awaited_once()
     assert publication.layout_reused_at_seal is True
     assert publication.serving_index["audit_sample"]["contract"] == (
