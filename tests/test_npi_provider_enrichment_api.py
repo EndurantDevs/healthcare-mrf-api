@@ -309,6 +309,7 @@ async def test_get_all_attaches_provider_enrichment_summary(monkeypatch):
     connections = [
         FakeConnection([[(1,)]]),
         FakeConnection([[_build_result_row(1234567890)]]),
+        FakeConnection([[]]),
     ]
 
     class FakeDB:
@@ -345,6 +346,7 @@ async def test_get_all_degrades_when_provider_enrichment_summary_fails(monkeypat
     connections = [
         FakeConnection([[(1,)]]),
         FakeConnection([[_build_result_row(1234567890)]]),
+        FakeConnection([[]]),
     ]
 
     class FakeDB:
@@ -372,6 +374,7 @@ async def test_get_all_can_include_chain_provider_enrichment(monkeypatch):
     connections = [
         FakeConnection([[(1,)]]),
         FakeConnection([[_build_result_row(1234567890)]]),
+        FakeConnection([[]]),
     ]
 
     class FakeDB:
