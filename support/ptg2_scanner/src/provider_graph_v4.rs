@@ -6943,7 +6943,7 @@ fn extract_provider_graph_v4_npi_scope_inner_with_hook(
         .num_threads(worker_count)
         .thread_name(|index| format!("ptg2-v4-npi-auth-{index}"))
         .build()
-        .map_err(|error| io::Error::other(error.to_string()))?;
+        .map_err(io::Error::other)?;
     let opened = worker_pool.install(|| {
         scope_inputs
             .par_iter()
