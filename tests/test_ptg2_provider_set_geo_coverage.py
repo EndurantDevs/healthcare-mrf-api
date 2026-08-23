@@ -51,6 +51,7 @@ class _G0289ServingHarness:
                 "zip5": "48201",
                 "zip_radius_miles": 30,
                 "order_by": "rate",
+                "include_providers": "false",
             },
             SimpleNamespace(limit=limit, offset=offset),
             strict_v3_tables(snapshot_id="ptg2:209901:synthetic"),

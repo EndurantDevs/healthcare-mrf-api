@@ -935,6 +935,7 @@ async def test_forward_search_scopes_shared_layout_rows_to_each_logical_plan(
                 "plan_market_type": "group",
                 "code_system": "CPT",
                 "code": "99213",
+                "include_providers": "false",
             },
             SimpleNamespace(limit=10, offset=0),
             _strict_tables(
@@ -1594,6 +1595,7 @@ async def _search_forward_response(
         "plan_market_type": "group",
         "code_system": "CPT",
         "code": "99213",
+        "include_providers": False,
     }
     if include_sources:
         query_by_name.update(

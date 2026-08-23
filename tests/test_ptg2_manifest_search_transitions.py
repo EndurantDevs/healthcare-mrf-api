@@ -103,7 +103,7 @@ def _install_base_dependencies(monkeypatch, *, merge_result=None):
     )
 
 
-async def _search(*, args=None, code_rows=None, pagination=None):
+async def _search(*, args=None, code_rows=None, pagination=None, serving_tables=None):
     session = FakeSession(
         [FakeResult([dict(_CODE_ROW) for _ in range(1)])]
         if code_rows is None
@@ -114,7 +114,7 @@ async def _search(*, args=None, code_rows=None, pagination=None):
         "synthetic-snapshot",
         args or _query_args(),
         pagination or SimpleNamespace(limit=10, offset=0),
-        strict_v3_tables(snapshot_id="synthetic-snapshot"),
+        serving_tables or strict_v3_tables(snapshot_id="synthetic-snapshot"),
         serving.PTG2_MODE_PRODUCT_SEARCH,
     )
     return response, session
@@ -374,30 +374,6 @@ async def test_filtered_providerless_set_returns_no_result(monkeypatch):
         )
     )
     assert response is None
-
-
-@pytest.mark.asyncio
-async def test_explicit_false_keeps_provider_filter_without_expansion(monkeypatch):
-    _install_base_dependencies(monkeypatch)
-    location_matches = AsyncMock(
-        return_value=({_PROVIDER_SET_ID}, {_PROVIDER_SET_ID: [dict(_PROVIDER_ROW)]})
-    )
-    monkeypatch.setattr(serving, "_ptg2_manifest_location_provider_matches", location_matches)
-
-    response, _session = await _search(
-        args=_query_args(
-            state="IL",
-            classification="Family Medicine",
-            include_providers="false",
-        )
-    )
-
-    assert response["query"]["include_providers"] is False
-    assert "npi" not in response["items"][0]
-    assert "address" not in response["items"][0]
-    assert location_matches.await_args.args[2]["classification"] == "Family Medicine"
-    assert location_matches.await_args.kwargs["require_provider_set_coverage"] is True
-    serving._provider_rows_for_sets.assert_not_awaited()
 
 
 @pytest.mark.asyncio

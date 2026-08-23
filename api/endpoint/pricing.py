@@ -55,6 +55,8 @@ from api.ptg2_capacity_evidence import (
     maybe_attach_capacity_evidence_headers,
 )
 from api.ptg2_serving import (
+    PTG2ProviderFilterScopeError,
+    PTG2ProviderFilterUnsupportedError,
     _is_unified_address_table,
     _provider_taxonomy_summary_lateral_sql,
     _ptg2_address_serving_table,
@@ -1253,18 +1255,14 @@ def _reject_broad_group_plan_provider_expansion(
     latitude = context.get("latitude")
     longitude = context.get("longitude")
     npi = context.get("npi")
-    provider_sex_code = context.get("provider_sex_code")
     if plan_market_type != "group":
         return
     if not (plan_id or plan_external_id):
         return
-    if not (
-        _parse_bool(
-            args.get("include_providers"),
-            "include_providers",
-            default=False,
-        )
-        or provider_sex_code
+    if not _parse_bool(
+        args.get("include_providers"),
+        "include_providers",
+        default=True,
     ):
         return
     if not _is_broad_office_visit_cpt(code_system, code):
@@ -11761,6 +11759,7 @@ async def list_providers_by_procedure(request):
                 "code_system": ptg_code_system or None,
                 "q": query_text or None,
                 "specialty": specialty or None,
+                "provider_type": args.get("provider_type") or None,
                 "classification": args.get("classification") or None,
                 "taxonomy_codes": (
                     args.get("taxonomy_codes")
@@ -11810,6 +11809,15 @@ async def list_providers_by_procedure(request):
                 ptg_args_by_name,
                 pagination,
                 **release_selection_args_by_name,
+            )
+        except (
+            PTG2ProviderFilterScopeError,
+            PTG2ProviderFilterUnsupportedError,
+        ) as exc:
+            return _ptg_json_response(
+                request,
+                {"error": {"code": exc.error_code, "message": str(exc)}},
+                status=400,
             )
         except PTG2OnlineWorkBudgetExceeded as exc:
             logger.info(
