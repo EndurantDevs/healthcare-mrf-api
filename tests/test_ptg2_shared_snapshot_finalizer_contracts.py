@@ -80,29 +80,39 @@ async def test_v4_disabled_publication_keeps_v3_path(
 
 
 @pytest.mark.asyncio
-async def test_independent_publication_lanes_start_together():
+async def test_source_witness_finishes_before_parallel_publication_lanes():
+    source_witness_started = asyncio.Event()
+    source_witness_finished = asyncio.Event()
     started_lanes: set[str] = set()
     release = asyncio.Event()
 
     async def lane(name: str) -> str:
+        await source_witness_started.wait()
         started_lanes.add(name)
-        if len(started_lanes) == 4:
+        if len(started_lanes) == 3:
             release.set()
         await asyncio.wait_for(release.wait(), timeout=0.5)
+        assert source_witness_finished.is_set()
         return name
+
+    async def source_witness() -> str:
+        source_witness_started.set()
+        await asyncio.sleep(0)
+        assert not started_lanes
+        source_witness_finished.set()
+        return "source_witness"
 
     lane_outputs = await _run_independent_publication_lanes(
         finalizer_blocks=lambda: lane("finalizer_blocks"),
         provider_graph=lambda: lane("provider_graph"),
         price=lambda: lane("price"),
-        source_witness=lambda: lane("source_witness"),
+        source_witness=source_witness,
     )
 
     assert started_lanes == {
         "finalizer_blocks",
         "provider_graph",
         "price",
-        "source_witness",
     }
     assert lane_outputs == (
         "finalizer_blocks",
