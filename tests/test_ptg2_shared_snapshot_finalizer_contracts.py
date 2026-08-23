@@ -129,11 +129,7 @@ async def test_source_witness_and_graph_gate_finalizer_db_admission():
         timeout=0.5,
     )
 
-    assert lane_events == [
-        "provider_graph",
-        "finalizer_blocks",
-        "prepublished_price",
-    ]
+    assert lane_events == ["provider_graph", "finalizer_blocks", "prepublished_price"]
     assert not active_db_lanes
     assert lane_outputs == (
         "finalizer_blocks",
