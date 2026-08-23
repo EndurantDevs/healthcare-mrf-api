@@ -1,0 +1,14 @@
+name: Trusted pull request CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: EndurantDevs/healthcare-mrf-api/.github/workflows/ci.yml@main
+    with:
+      activate_arc: true

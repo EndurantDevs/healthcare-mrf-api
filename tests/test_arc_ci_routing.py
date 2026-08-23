@@ -9,6 +9,10 @@ import yaml
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+CALLER = (
+    Path(__file__).resolve().parents[1]
+    / ".github/workflows/trusted-pr-ci.yml"
+)
 PREPUSH = Path(__file__).resolve().parents[1] / "scripts/ci/prepush"
 ARC_ELIGIBLE_EXPRESSION = (
     "(((github.event_name == 'push' || "
@@ -71,8 +75,6 @@ POSTGRES_HOST_EXPRESSION = (
     "${{ runner.environment == 'self-hosted' && "
     "'127.0.0.1' || 'postgres' }}"
 )
-
-
 def _values_for_key(value: object, key: str) -> list[object]:
     matches: list[object] = []
     if isinstance(value, dict):
@@ -91,12 +93,16 @@ def _documents() -> tuple[dict, dict]:
     return yaml.safe_load(workflow), yaml.load(workflow, Loader=yaml.BaseLoader)
 
 
+def _caller_documents() -> tuple[dict, dict]:
+    caller = CALLER.read_text(encoding="utf-8")
+    return yaml.safe_load(caller), yaml.load(caller, Loader=yaml.BaseLoader)
+
+
 def test_arc_route_is_trusted_main_only_with_a_hosted_fallback() -> None:
     document, trigger_document = _documents()
 
     assert set(trigger_document["on"]) == {
         "workflow_call",
-        "pull_request",
         "push",
         "workflow_dispatch",
     }
@@ -127,6 +133,31 @@ def test_arc_route_is_trusted_main_only_with_a_hosted_fallback() -> None:
         job = document["jobs"][name]
         assert job["runs-on"] == DIND_RUNNER_EXPRESSION
         assert "container" not in job
+
+
+def test_trusted_pr_caller_is_one_secretless_protected_workflow_call() -> None:
+    document, trigger_document = _caller_documents()
+
+    assert trigger_document["on"] == {
+        "pull_request": {
+            "types": ["opened", "synchronize", "reopened", "labeled", "unlabeled"]
+        }
+    }
+    assert set(document) == {"name", True, "permissions", "jobs"}
+    assert document["name"] == "Trusted pull request CI"
+    assert document["permissions"] == {"contents": "read"}
+    assert document["jobs"] == {
+        "ci": {
+            "uses": (
+                "EndurantDevs/healthcare-mrf-api/"
+                ".github/workflows/ci.yml@main"
+            ),
+            "with": {"activate_arc": True},
+        }
+    }
+    caller = CALLER.read_text(encoding="utf-8")
+    assert "vars." not in caller
+    assert "github.workflow_ref" not in caller
 
 
 def test_reusable_arc_classifier_is_exact_and_human_only() -> None:
