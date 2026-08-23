@@ -31,6 +31,9 @@ HIDDEN_RUNTIME_ALIASES = {
     ("get", "/pricing/physicians/{npi}/prescriptions/{rx_code_system}/{rx_code}"),
 }
 ROUTE_QUERY_PARAM_ADDITIONS = {
+    # The shared specialty-filter helper parses this outside the decorated
+    # group-plan route's AST.
+    ("get", "/pricing/group-plan-providers"): {"primary_only"},
     # The gateway resolves the public plan ID, while the isolated helper parses
     # the internal selector and cursor outside the legacy handler's AST.
     ("get", "/pricing/providers/search-by-procedure"): {
