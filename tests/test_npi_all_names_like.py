@@ -487,6 +487,7 @@ async def test_get_all_name_taxonomy_count_closes_the_cte_list(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypatch):
+    """Keep taxonomy, status, and enrichment reads concurrent after paging."""
     provider_npi = 1000000049
     request_session = object()
     provider_record_map = _provider_directory_row_mapping()
@@ -498,23 +499,29 @@ async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypat
     )
     status_started = asyncio.Event()
     enrichment_started = asyncio.Event()
-
+    taxonomy_started = asyncio.Event()
     async def fake_apply_location_statuses(locations, *, session=None):
         assert session is request_session
         status_started.set()
-        await asyncio.wait_for(enrichment_started.wait(), timeout=1)
+        await asyncio.wait_for(asyncio.gather(enrichment_started.wait(), taxonomy_started.wait()), timeout=1)
         for location in locations:
             location["location_status"] = "active"
-
     async def fake_fetch_enrichment(npis, *, include_chain=False, session=None):
         assert npis == [provider_npi]
         assert include_chain is False
         assert session is None
         enrichment_started.set()
-        await asyncio.wait_for(status_started.wait(), timeout=1)
+        await asyncio.wait_for(asyncio.gather(status_started.wait(), taxonomy_started.wait()), timeout=1)
         return {provider_npi: {"status": "active"}}
 
-    conn = types.SimpleNamespace(all=AsyncMock(side_effect=[[provider_record], []]))
+    async def fake_conn_all(sql, **_params):
+        if "SELECT taxonomy.*" not in str(sql):
+            return [provider_record]
+        taxonomy_started.set()
+        await asyncio.wait_for(asyncio.gather(status_started.wait(), enrichment_started.wait()), timeout=1)
+        return []
+
+    conn = types.SimpleNamespace(all=AsyncMock(side_effect=fake_conn_all))
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.npi_address"))
     monkeypatch.setattr(npi_module, "_apply_location_statuses", fake_apply_location_statuses)
     monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", fake_fetch_enrichment)
@@ -536,6 +543,7 @@ async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypat
     page_sql = str(conn.all.await_args_list[0].args[0])
     assert page_sql.count("taxonomy_matched_npi AS MATERIALIZED") == 1
     assert "COUNT(*) OVER () AS provider_total" in page_sql
+    assert "ORDER BY taxonomy.npi, taxonomy.checksum" in str(conn.all.await_args_list[1].args[0])
     assert not any("SELECT COUNT(DISTINCT" in str(call.args[0]) for call in conn.all.await_args_list)
 
 
