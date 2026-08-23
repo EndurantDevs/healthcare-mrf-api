@@ -363,13 +363,17 @@ async def test_v4_graph_failure_prevents_finalizer_and_price_before_seal(
 async def test_prepared_layout_reuses_early_results(monkeypatch, tmp_path):
     mocks = _prepared_layout_mocks(monkeypatch, tmp_path, seal_reused=True)
     lane_events = []
+    graph_finished = asyncio.Event()
 
     async def publish_graph(*_args, **_kwargs):
         lane_events.append("provider_graph")
+        await asyncio.sleep(0)
+        graph_finished.set()
         return mocks.lanes.graph
 
     async def create_finalizer_stage(**_kwargs):
         assert lane_events == ["provider_graph"]
+        assert graph_finished.is_set()
         lane_events.append("finalizer_stage")
 
     mocks.publish_graph.side_effect = publish_graph
