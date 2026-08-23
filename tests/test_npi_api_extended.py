@@ -2183,9 +2183,8 @@ async def test_get_all_format_all_returns_classification_map(monkeypatch):
 async def test_get_all_deduplicates_rows(monkeypatch):
     connections = [
         FakeConnection([[(1,)]]),
-        FakeConnection(
-            [[_build_result_row(999), _build_result_row(999)], []]
-        ),
+        FakeConnection([[_build_result_row(999), _build_result_row(999)]]),
+        FakeConnection([[]]),
     ]
 
     class FakeDB:
