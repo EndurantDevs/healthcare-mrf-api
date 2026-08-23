@@ -46,6 +46,21 @@
           "unit": "seconds",
           "direction": "lower"
         },
+        "preparation_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "source_scope_rebuild_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
+        "manifest_auth_seconds": {
+          "type": "number",
+          "unit": "seconds",
+          "direction": "lower"
+        },
         "postgres_copy_seconds": {
           "type": "number",
           "unit": "seconds",

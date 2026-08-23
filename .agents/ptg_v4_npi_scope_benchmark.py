@@ -166,6 +166,27 @@ async def _quiet_progress(**_payload: object) -> None:
     return None
 
 
+def _measure_sync(original, seconds: dict[str, float], name: str, *args, **kwargs):
+    started = time.perf_counter()
+    try:
+        return original(*args, **kwargs)
+    finally:
+        seconds[name] = time.perf_counter() - started
+
+
+async def _measured_npi_scope_process(
+    original,
+    seconds: list[float],
+    *args,
+    **kwargs,
+) -> None:
+    started = time.perf_counter()
+    try:
+        await original(*args, **kwargs)
+    finally:
+        seconds.append(time.perf_counter() - started)
+
+
 async def _postgres_proof(
     dsn: str,
     copy_path: Path,
@@ -173,13 +194,13 @@ async def _postgres_proof(
     connection = await asyncpg.connect(dsn)
     schema = f"ptg_npi_scope_bench_{uuid.uuid4().hex}"
     quoted_schema = '"' + schema + '"'
-    started = time.perf_counter()
     try:
         await connection.execute(f"CREATE SCHEMA {quoted_schema}")
         await connection.execute(
             f"CREATE UNLOGGED TABLE {quoted_schema}.scope "
             "(key integer NOT NULL, npi bigint NOT NULL)"
         )
+        started = time.perf_counter()
         with copy_path.open("rb") as source:
             await connection.copy_to_table(
                 "scope",
@@ -232,7 +253,36 @@ async def _sample(
 ) -> dict[str, object]:
     output = root / f"scope-{sample}.copy"
     original_progress = compiler._emit_npi_scope_progress
+    original_process = compiler._run_npi_scope_process
+    original_normalize = compiler._normalized_source_npi_scope_entries
+    original_manifest = compiler._build_v4_graph_manifest_shards
+    phase_seconds: dict[str, float] = {}
+    process_seconds: list[float] = []
     compiler._emit_npi_scope_progress = _quiet_progress
+    compiler._run_npi_scope_process = (
+        lambda *args, **kwargs: _measured_npi_scope_process(
+            original_process,
+            process_seconds,
+            *args,
+            **kwargs,
+        )
+    )
+    compiler._normalized_source_npi_scope_entries = (
+        lambda *args, **kwargs: _measure_sync(
+            original_normalize,
+            phase_seconds,
+            "source_scope_rebuild_seconds",
+            *args,
+            **kwargs,
+        )
+    )
+    compiler._build_v4_graph_manifest_shards = lambda *args, **kwargs: _measure_sync(
+        original_manifest,
+        phase_seconds,
+        "manifest_auth_seconds",
+        *args,
+        **kwargs,
+    )
     preparation = None
     started = time.perf_counter()
     try:
@@ -241,7 +291,12 @@ async def _sample(
             output_path=output,
             binary_path=binary,
         )
-        npi_scope_seconds = time.perf_counter() - started
+        preparation_seconds = time.perf_counter() - started
+        if len(process_seconds) != 1 or set(phase_seconds) != {
+            "source_scope_rebuild_seconds",
+            "manifest_auth_seconds",
+        }:
+            raise RuntimeError("benchmark did not observe every NPI-scope phase once")
         with preparation.copy_path.open("rb") as output_file:
             observed_sha256 = hashlib.file_digest(output_file, "sha256").hexdigest()
         if (
@@ -282,12 +337,17 @@ async def _sample(
                 "postgres_schema_cleaned": True,
             },
             "metrics": {
-                "npi_scope_seconds": npi_scope_seconds,
+                "npi_scope_seconds": process_seconds[0],
+                "preparation_seconds": preparation_seconds,
+                **phase_seconds,
                 "postgres_copy_seconds": postgres_copy_seconds,
             },
         }
     finally:
         compiler._emit_npi_scope_progress = original_progress
+        compiler._run_npi_scope_process = original_process
+        compiler._normalized_source_npi_scope_entries = original_normalize
+        compiler._build_v4_graph_manifest_shards = original_manifest
         if preparation is not None:
             preparation.cleanup()
 
