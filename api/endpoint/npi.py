@@ -9792,21 +9792,32 @@ async def list_providers(request):
                 logger.debug("Provider enrichment summary fetch failed: %s", exc)
                 return {}
 
-        taxonomy_records, _, summary_map = await asyncio.gather(
-            _fetch_search_taxonomy_records(),
-            _apply_location_statuses(
-                [
-                    address_candidate
-                    for provider_result in provider_results
-                    for address_candidate in provider_result.get(
-                        "_address_candidates",
-                        [],
-                    )
-                ],
-                session=request_session,
+        search_read_tasks = (
+            asyncio.create_task(_fetch_search_taxonomy_records()),
+            asyncio.create_task(
+                _apply_location_statuses(
+                    [
+                        address_candidate
+                        for provider_result in provider_results
+                        for address_candidate in provider_result.get(
+                            "_address_candidates",
+                            [],
+                        )
+                    ],
+                    session=request_session,
+                )
             ),
-            _fetch_search_enrichment_summary(),
+            asyncio.create_task(_fetch_search_enrichment_summary()),
         )
+        try:
+            taxonomy_records, _, summary_map = await asyncio.gather(
+                *search_read_tasks
+            )
+        except BaseException:
+            for search_read_task in search_read_tasks:
+                search_read_task.cancel()
+            await asyncio.gather(*search_read_tasks, return_exceptions=True)
+            raise
         for taxonomy_record in taxonomy_records:
             taxonomy_mapping = getattr(
                 taxonomy_record,

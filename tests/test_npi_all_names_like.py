@@ -548,6 +548,59 @@ async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_get_all_name_taxonomy_cancels_sibling_reads_on_failure(monkeypatch):
+    """Finish sibling cancellation before propagating a taxonomy read failure."""
+    provider_npi = 1000000049
+    request_session = object()
+    provider_record_map = _provider_directory_row_mapping()
+    provider_record = (
+        (provider_npi,)
+        + tuple(provider_record_map.get(column.key) for column in npi_module.NPIData.__table__.columns)
+        + tuple(provider_record_map.get(column.key) for column in npi_module.NPIAddress.__table__.columns)
+        + (1, 52)
+    )
+    status_started = asyncio.Event()
+    enrichment_started = asyncio.Event()
+    never_finishes = asyncio.Event()
+    cancelled_reads = set()
+
+    async def block_read(name, started):
+        started.set()
+        try:
+            await never_finishes.wait()
+        except asyncio.CancelledError:
+            cancelled_reads.add(name)
+            raise
+
+    async def fake_status(_locations, *, session=None):
+        assert session is request_session
+        await block_read("status", status_started)
+
+    async def fake_enrichment(_npis, *, include_chain=False, session=None):
+        assert include_chain is False and session is None
+        await block_read("enrichment", enrichment_started)
+
+    async def fake_conn_all(sql, **_params):
+        if "SELECT taxonomy.*" not in str(sql):
+            return [provider_record]
+        await asyncio.gather(status_started.wait(), enrichment_started.wait())
+        raise RuntimeError("taxonomy read failed")
+
+    conn = types.SimpleNamespace(all=AsyncMock(side_effect=fake_conn_all))
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.npi_address"))
+    monkeypatch.setattr(npi_module, "_apply_location_statuses", fake_status)
+    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", fake_enrichment)
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    with pytest.raises(RuntimeError, match="taxonomy read failed"):
+        await get_all(types.SimpleNamespace(
+            ctx=types.SimpleNamespace(sa_session=request_session),
+            args={"q": "smith", "codes": "1223E0200X", "limit": "10"},
+        ))
+    assert cancelled_reads == {"status", "enrichment"}
+
+
+@pytest.mark.asyncio
 async def test_get_all_name_taxonomy_relevance_keeps_candidate_score(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
