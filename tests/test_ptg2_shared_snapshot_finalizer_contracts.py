@@ -80,46 +80,62 @@ async def test_v4_disabled_publication_keeps_v3_path(
 
 
 @pytest.mark.asyncio
-async def test_source_witness_finishes_before_parallel_publication_lanes():
-    source_witness_started = asyncio.Event()
+async def test_source_witness_and_graph_gate_price_lane_capacity():
     source_witness_finished = asyncio.Event()
-    started_lanes: set[str] = set()
-    release = asyncio.Event()
+    price_started = asyncio.Event()
+    lane_events: list[str] = []
+    admission_slots: list[str] = []
 
-    async def lane(name: str) -> str:
-        await source_witness_started.wait()
-        started_lanes.add(name)
-        if len(started_lanes) == 3:
-            release.set()
-        await asyncio.wait_for(release.wait(), timeout=0.5)
+    async def lane(
+        name: str,
+        slot_count: int,
+        *,
+        release: asyncio.Event | None = None,
+        started: asyncio.Event | None = None,
+    ) -> str:
         assert source_witness_finished.is_set()
-        return name
+        admission_slots.extend([name] * slot_count)
+        lane_events.append(name)
+        try:
+            assert len(admission_slots) <= 3
+            if started is not None:
+                started.set()
+            if release is not None:
+                await release.wait()
+            else:
+                await asyncio.sleep(0)
+            return name
+        finally:
+            for _ in range(slot_count):
+                admission_slots.remove(name)
 
     async def source_witness() -> str:
-        source_witness_started.set()
         await asyncio.sleep(0)
-        assert not started_lanes
+        assert not lane_events
         source_witness_finished.set()
         return "source_witness"
 
-    lane_outputs = await _run_independent_publication_lanes(
-        finalizer_blocks=lambda: lane("finalizer_blocks"),
-        provider_graph=lambda: lane("provider_graph"),
-        price=lambda: lane("price"),
-        source_witness=source_witness,
+    lane_outputs = await asyncio.wait_for(
+        _run_independent_publication_lanes(
+            finalizer_blocks=lambda: lane(
+                "finalizer_blocks", 1, release=price_started
+            ),
+            provider_graph=lambda: lane("provider_graph", 2),
+            price=lambda: lane("price", 2, started=price_started),
+            source_witness=source_witness,
+        ),
+        timeout=0.5,
     )
 
-    assert started_lanes == {
-        "finalizer_blocks",
-        "provider_graph",
-        "price",
-    }
+    assert lane_events == ["finalizer_blocks", "provider_graph", "price"]
+    assert not admission_slots
     assert lane_outputs == (
         "finalizer_blocks",
         "provider_graph",
         "price",
         "source_witness",
     )
+
 
 @pytest.mark.asyncio
 async def test_finalizer_starts_before_independent_atom_preparation_finishes(
