@@ -5465,6 +5465,20 @@ def test_explicit_false_provider_filter_keeps_aggregate_shape():
     )
 
 
+def test_npi_scoped_taxonomy_office_visit_keeps_search_allowed():
+    pricing_module._reject_broad_group_plan_provider_expansion(
+        {"include_providers": "false", "classification": "Family Medicine"},
+        {
+            "plan_id": "TESTPLAN001",
+            "plan_market_type": "group",
+            "code": "99213",
+            "code_system": "CPT",
+            "state": "IL",
+            "npi": 1234567890,
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_statewide_taxonomy_office_visit_http_error_keeps_fix_it(monkeypatch):
     async def fail_search(*_args, **_kwargs):
