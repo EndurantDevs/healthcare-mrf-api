@@ -3019,6 +3019,109 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/NpiPlansResponse'
+  /npi/id/batch:
+    post:
+      operationId: postNpiIdBatch
+      summary: Retrieve bounded provider summaries for up to 100 NPIs
+      description: |
+        Returns ordered, per-NPI provider summaries from one set-based database
+        pipeline. The batch projection is storage-only, uses flat address
+        grouping, and includes summary enrollment data rather than full
+        enrollment rows or Provider Directory profiles. Missing providers are
+        represented by per-item 404 results while the batch remains HTTP 200.
+        A Provider Directory profile without either an NPPES identity row or a
+        published address does not by itself establish batch-v1 existence.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [npis]
+              properties:
+                npis:
+                  type: array
+                  description: Values must be unique after string/integer normalization.
+                  minItems: 1
+                  maxItems: 100
+                  uniqueItems: true
+                  items:
+                    oneOf:
+                      - type: string
+                        pattern: '^[0-9]{10}$'
+                      - type: integer
+                        format: int64
+                        minimum: 1000000000
+                        maximum: 9999999999
+                address_limit:
+                  type: integer
+                  minimum: 1
+                  maximum: 20
+                  default: 5
+                address_offset:
+                  type: integer
+                  minimum: 0
+                  maximum: 1000000
+                  default: 0
+                include_sources:
+                  type: boolean
+                  default: false
+                include_evidence:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: Ordered provider results with per-item status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, requested, found, not_found, meta]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [npi, status]
+                      properties:
+                        npi:
+                          type: integer
+                          format: int64
+                        status:
+                          type: integer
+                          enum: [200, 404]
+                        provider:
+                          $ref: '#/components/schemas/NpiRecord'
+                        error:
+                          $ref: '#/components/schemas/Error'
+                  requested:
+                    type: integer
+                  found:
+                    type: integer
+                  not_found:
+                    type: integer
+                  meta:
+                    type: object
+                    additionalProperties: false
+                    required: [elapsed_ms, max_batch_size, view]
+                    properties:
+                      elapsed_ms:
+                        type: number
+                        format: double
+                        minimum: 0
+                      max_batch_size:
+                        type: integer
+                        enum: [100]
+                      view:
+                        type: string
+                        enum: [summary]
+        '400':
+          description: Invalid body, NPI list, or shared address options
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /npi/id/{npi}:
     get:
       operationId: getNpiIdNpi

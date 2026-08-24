@@ -1107,6 +1107,9 @@ PROVIDER_DIRECTORY_EVIDENCE_CAPABILITY_SQL = """
 # callers walk every address via address_offset, or opt out with address_limit=all.
 NPI_DETAIL_ADDRESS_DEFAULT_LIMIT = 200
 NPI_DETAIL_ADDRESS_MAX_LIMIT = 1000
+NPI_BATCH_MAX_SIZE = 100
+NPI_BATCH_ADDRESS_DEFAULT_LIMIT = 5
+NPI_BATCH_ADDRESS_MAX_LIMIT = 20
 NPI_DETAIL_ADDRESS_GROUP_DEFAULT_LIMIT = 5
 NPI_DETAIL_ADDRESS_GROUP_MAX_LIMIT = 5
 NPI_DETAIL_ADDRESS_GROUP_MEMBER_LIMIT = 5
@@ -4624,16 +4627,12 @@ def _partition_ffs_enrollment_payloads(
     return visible_rows, chain_rows
 
 
-async def _fetch_ffs_summary_overrides(
-    visible_rows_by_npi: dict[int, list[dict[str, Any]]],
-    *,
-    session: Any = None,
-) -> dict[int, dict[str, Any]]:
-    """Build per-NPI FFS enrollment summary overrides from detail tables."""
+def _initialize_ffs_summary_overrides(
+    visible_rows_by_npi: Mapping[int, Sequence[Mapping[str, Any]]],
+) -> tuple[dict[int, dict[str, Any]], dict[str, int], list[str]]:
     summary_overrides_by_npi: dict[int, dict[str, Any]] = {}
     npi_by_enrollment: dict[str, int] = {}
     all_enrollment_ids: list[str] = []
-
     for npi_value, enrollment_rows in visible_rows_by_npi.items():
         enrollment_ids = _unique_non_empty(
             [enrollment.get("enrollment_id") for enrollment in enrollment_rows]
@@ -4657,153 +4656,232 @@ async def _fetch_ffs_summary_overrides(
         for enrollment_id in enrollment_ids:
             npi_by_enrollment[enrollment_id] = npi_value
             all_enrollment_ids.append(enrollment_id)
+    return (
+        summary_overrides_by_npi,
+        npi_by_enrollment,
+        _unique_non_empty(all_enrollment_ids),
+    )
 
-    all_enrollment_ids = _unique_non_empty(all_enrollment_ids)
+
+async def _apply_ffs_related_npi_overrides(
+    summary_overrides_by_npi: dict[int, dict[str, Any]],
+    npi_by_enrollment: Mapping[str, int],
+    enrollment_ids: Sequence[str],
+    *,
+    session: Any = None,
+) -> None:
+    if not await _is_table_available(
+        ProviderEnrollmentFFSAdditionalNPI.__tablename__,
+        session=session,
+    ):
+        return
+    statement = (
+        select(
+            ProviderEnrollmentFFSAdditionalNPI.enrollment_id,
+            ProviderEnrollmentFFSAdditionalNPI.additional_npi,
+        )
+        .where(ProviderEnrollmentFFSAdditionalNPI.enrollment_id.in_(enrollment_ids))
+        .order_by(
+            ProviderEnrollmentFFSAdditionalNPI.enrollment_id.asc(),
+            ProviderEnrollmentFFSAdditionalNPI.additional_npi.asc(),
+        )
+    )
+    query_result = await _execute_stmt(statement, session=session)
+    related_by_npi: dict[int, list[int]] = defaultdict(list)
+    for enrollment_id, additional_npi in query_result.all():
+        npi_value = npi_by_enrollment.get(str(enrollment_id))
+        if additional_npi is not None and npi_value is not None:
+            related_by_npi[npi_value].append(int(additional_npi))
+    for npi_value, related_npis in related_by_npi.items():
+        unique_related_npis = _unique_non_empty(related_npis)
+        summary_overrides_by_npi[npi_value]["ffs_related_npis"] = unique_related_npis
+        summary_overrides_by_npi[npi_value]["ffs_related_npi_count"] = len(
+            unique_related_npis
+        )
+
+
+async def _apply_ffs_address_overrides(
+    summary_overrides_by_npi: dict[int, dict[str, Any]],
+    npi_by_enrollment: Mapping[str, int],
+    enrollment_ids: Sequence[str],
+    *,
+    session: Any = None,
+) -> None:
+    if not await _is_table_available(
+        ProviderEnrollmentFFSAddress.__tablename__,
+        session=session,
+    ):
+        return
+    statement = (
+        select(
+            ProviderEnrollmentFFSAddress.enrollment_id,
+            ProviderEnrollmentFFSAddress.zip_code,
+            ProviderEnrollmentFFSAddress.city,
+            ProviderEnrollmentFFSAddress.state,
+        )
+        .where(ProviderEnrollmentFFSAddress.enrollment_id.in_(enrollment_ids))
+        .order_by(
+            ProviderEnrollmentFFSAddress.enrollment_id.asc(),
+            ProviderEnrollmentFFSAddress.state.asc().nullslast(),
+            ProviderEnrollmentFFSAddress.city.asc().nullslast(),
+            ProviderEnrollmentFFSAddress.zip_code.asc().nullslast(),
+        )
+    )
+    query_result = await _execute_stmt(statement, session=session)
+    values_by_field: dict[str, dict[int, list[str]]] = {
+        "ffs_practice_zip_codes": defaultdict(list),
+        "ffs_practice_cities": defaultdict(list),
+        "ffs_practice_states": defaultdict(list),
+    }
+    for enrollment_id, zip_code, city, state in query_result.all():
+        npi_value = npi_by_enrollment.get(str(enrollment_id))
+        if npi_value is None:
+            continue
+        for field_name, field_value in zip(
+            values_by_field,
+            (zip_code, city, state),
+        ):
+            if field_value:
+                values_by_field[field_name][npi_value].append(str(field_value))
+    for npi_value, summary in summary_overrides_by_npi.items():
+        for field_name, values_by_npi in values_by_field.items():
+            summary[field_name] = _unique_non_empty(values_by_npi.get(npi_value, []))
+
+
+async def _apply_ffs_specialty_overrides(
+    summary_overrides_by_npi: dict[int, dict[str, Any]],
+    npi_by_enrollment: Mapping[str, int],
+    enrollment_ids: Sequence[str],
+    *,
+    session: Any = None,
+) -> None:
+    if not await _is_table_available(
+        ProviderEnrollmentFFSSecondarySpecialty.__tablename__,
+        session=session,
+    ):
+        return
+    statement = (
+        select(
+            ProviderEnrollmentFFSSecondarySpecialty.enrollment_id,
+            ProviderEnrollmentFFSSecondarySpecialty.provider_type_code,
+            ProviderEnrollmentFFSSecondarySpecialty.provider_type_text,
+        )
+        .where(
+            ProviderEnrollmentFFSSecondarySpecialty.enrollment_id.in_(enrollment_ids)
+        )
+        .order_by(
+            ProviderEnrollmentFFSSecondarySpecialty.enrollment_id.asc(),
+            ProviderEnrollmentFFSSecondarySpecialty.provider_type_code.asc(),
+        )
+    )
+    query_result = await _execute_stmt(statement, session=session)
+    codes_by_npi: dict[int, list[str]] = defaultdict(list)
+    texts_by_npi: dict[int, list[str]] = defaultdict(list)
+    for enrollment_id, provider_type_code, provider_type_text in query_result.all():
+        npi_value = npi_by_enrollment.get(str(enrollment_id))
+        if npi_value is None:
+            continue
+        if provider_type_code:
+            codes_by_npi[npi_value].append(str(provider_type_code))
+        if provider_type_text:
+            texts_by_npi[npi_value].append(str(provider_type_text))
+    for npi_value, summary in summary_overrides_by_npi.items():
+        summary["ffs_secondary_provider_type_codes"] = _unique_non_empty(
+            codes_by_npi.get(npi_value, [])
+        )
+        summary["ffs_secondary_provider_type_texts"] = _unique_non_empty(
+            texts_by_npi.get(npi_value, [])
+        )
+
+
+async def _fetch_ffs_reassignment_counts(
+    enrollment_column: Any,
+    enrollment_ids: Sequence[str],
+    npi_by_enrollment: Mapping[str, int],
+    *,
+    session: Any = None,
+) -> dict[int, int]:
+    statement = (
+        select(enrollment_column, func.count().label("row_count"))
+        .where(enrollment_column.in_(enrollment_ids))
+        .group_by(enrollment_column)
+    )
+    query_result = await _execute_stmt(statement, session=session)
+    counts_by_npi: dict[int, int] = defaultdict(int)
+    for enrollment_id, row_count in query_result.all():
+        npi_value = npi_by_enrollment.get(str(enrollment_id))
+        if npi_value is not None:
+            counts_by_npi[npi_value] += int(row_count or 0)
+    return dict(counts_by_npi)
+
+
+async def _apply_ffs_reassignment_overrides(
+    summary_overrides_by_npi: dict[int, dict[str, Any]],
+    npi_by_enrollment: Mapping[str, int],
+    enrollment_ids: Sequence[str],
+    *,
+    session: Any = None,
+) -> None:
+    if not await _is_table_available(
+        ProviderEnrollmentFFSReassignment.__tablename__,
+        session=session,
+    ):
+        return
+    out_counts_by_npi = await _fetch_ffs_reassignment_counts(
+        ProviderEnrollmentFFSReassignment.reassigning_enrollment_id,
+        enrollment_ids,
+        npi_by_enrollment,
+        session=session,
+    )
+    in_counts_by_npi = await _fetch_ffs_reassignment_counts(
+        ProviderEnrollmentFFSReassignment.receiving_enrollment_id,
+        enrollment_ids,
+        npi_by_enrollment,
+        session=session,
+    )
+    for npi_value, summary in summary_overrides_by_npi.items():
+        summary["ffs_reassignment_out_count"] = out_counts_by_npi.get(npi_value, 0)
+        summary["ffs_reassignment_in_count"] = in_counts_by_npi.get(npi_value, 0)
+
+
+async def _fetch_ffs_summary_overrides(
+    visible_rows_by_npi: dict[int, list[dict[str, Any]]],
+    *,
+    session: Any = None,
+) -> dict[int, dict[str, Any]]:
+    """Build per-NPI FFS enrollment summary overrides from detail tables."""
+    (
+        summary_overrides_by_npi,
+        npi_by_enrollment,
+        all_enrollment_ids,
+    ) = _initialize_ffs_summary_overrides(visible_rows_by_npi)
+
     if not all_enrollment_ids:
         return summary_overrides_by_npi
-
-    if await _is_table_available(ProviderEnrollmentFFSAdditionalNPI.__tablename__, session=session):
-        stmt = (
-            select(
-                ProviderEnrollmentFFSAdditionalNPI.enrollment_id,
-                ProviderEnrollmentFFSAdditionalNPI.additional_npi,
-            )
-            .where(ProviderEnrollmentFFSAdditionalNPI.enrollment_id.in_(all_enrollment_ids))
-            .order_by(
-                ProviderEnrollmentFFSAdditionalNPI.enrollment_id.asc(),
-                ProviderEnrollmentFFSAdditionalNPI.additional_npi.asc(),
-            )
-        )
-        query_result = await _execute_stmt(stmt, session=session)
-        related_by_npi: dict[int, list[int]] = defaultdict(list)
-        for enrollment_id, additional_npi in query_result.all():
-            if additional_npi is None:
-                continue
-            npi_value = npi_by_enrollment.get(str(enrollment_id))
-            if npi_value is None:
-                continue
-            related_by_npi[npi_value].append(int(additional_npi))
-        for npi_value, related_npis in related_by_npi.items():
-            unique_related_npis = _unique_non_empty(related_npis)
-            summary_overrides_by_npi[npi_value][
-                "ffs_related_npis"
-            ] = unique_related_npis
-            summary_overrides_by_npi[npi_value][
-                "ffs_related_npi_count"
-            ] = len(unique_related_npis)
-
-    if await _is_table_available(ProviderEnrollmentFFSAddress.__tablename__, session=session):
-        stmt = (
-            select(
-                ProviderEnrollmentFFSAddress.enrollment_id,
-                ProviderEnrollmentFFSAddress.zip_code,
-                ProviderEnrollmentFFSAddress.city,
-                ProviderEnrollmentFFSAddress.state,
-            )
-            .where(ProviderEnrollmentFFSAddress.enrollment_id.in_(all_enrollment_ids))
-            .order_by(
-                ProviderEnrollmentFFSAddress.enrollment_id.asc(),
-                ProviderEnrollmentFFSAddress.state.asc().nullslast(),
-                ProviderEnrollmentFFSAddress.city.asc().nullslast(),
-                ProviderEnrollmentFFSAddress.zip_code.asc().nullslast(),
-            )
-        )
-        query_result = await _execute_stmt(stmt, session=session)
-        zip_codes_by_npi: dict[int, list[str]] = defaultdict(list)
-        cities_by_npi: dict[int, list[str]] = defaultdict(list)
-        states_by_npi: dict[int, list[str]] = defaultdict(list)
-        for enrollment_id, zip_code, city, state in query_result.all():
-            npi_value = npi_by_enrollment.get(str(enrollment_id))
-            if npi_value is None:
-                continue
-            if zip_code:
-                zip_codes_by_npi[npi_value].append(str(zip_code))
-            if city:
-                cities_by_npi[npi_value].append(str(city))
-            if state:
-                states_by_npi[npi_value].append(str(state))
-        for npi_value in summary_overrides_by_npi:
-            summary_overrides_by_npi[npi_value][
-                "ffs_practice_zip_codes"
-            ] = _unique_non_empty(zip_codes_by_npi.get(npi_value, []))
-            summary_overrides_by_npi[npi_value][
-                "ffs_practice_cities"
-            ] = _unique_non_empty(cities_by_npi.get(npi_value, []))
-            summary_overrides_by_npi[npi_value][
-                "ffs_practice_states"
-            ] = _unique_non_empty(states_by_npi.get(npi_value, []))
-
-    if await _is_table_available(ProviderEnrollmentFFSSecondarySpecialty.__tablename__, session=session):
-        stmt = (
-            select(
-                ProviderEnrollmentFFSSecondarySpecialty.enrollment_id,
-                ProviderEnrollmentFFSSecondarySpecialty.provider_type_code,
-                ProviderEnrollmentFFSSecondarySpecialty.provider_type_text,
-            )
-            .where(ProviderEnrollmentFFSSecondarySpecialty.enrollment_id.in_(all_enrollment_ids))
-            .order_by(
-                ProviderEnrollmentFFSSecondarySpecialty.enrollment_id.asc(),
-                ProviderEnrollmentFFSSecondarySpecialty.provider_type_code.asc(),
-            )
-        )
-        query_result = await _execute_stmt(stmt, session=session)
-        codes_by_npi: dict[int, list[str]] = defaultdict(list)
-        texts_by_npi: dict[int, list[str]] = defaultdict(list)
-        for enrollment_id, provider_type_code, provider_type_text in query_result.all():
-            npi_value = npi_by_enrollment.get(str(enrollment_id))
-            if npi_value is None:
-                continue
-            if provider_type_code:
-                codes_by_npi[npi_value].append(str(provider_type_code))
-            if provider_type_text:
-                texts_by_npi[npi_value].append(str(provider_type_text))
-        for npi_value in summary_overrides_by_npi:
-            summary_overrides_by_npi[npi_value][
-                "ffs_secondary_provider_type_codes"
-            ] = _unique_non_empty(
-                codes_by_npi.get(npi_value, [])
-            )
-            summary_overrides_by_npi[npi_value][
-                "ffs_secondary_provider_type_texts"
-            ] = _unique_non_empty(
-                texts_by_npi.get(npi_value, [])
-            )
-
-    if await _is_table_available(ProviderEnrollmentFFSReassignment.__tablename__, session=session):
-        stmt = (
-            select(
-                ProviderEnrollmentFFSReassignment.reassigning_enrollment_id,
-                func.count().label("row_count"),
-            )
-            .where(ProviderEnrollmentFFSReassignment.reassigning_enrollment_id.in_(all_enrollment_ids))
-            .group_by(ProviderEnrollmentFFSReassignment.reassigning_enrollment_id)
-        )
-        query_result = await _execute_stmt(stmt, session=session)
-        for enrollment_id, row_count in query_result.all():
-            npi_value = npi_by_enrollment.get(str(enrollment_id))
-            if npi_value is None:
-                continue
-            summary_overrides_by_npi[npi_value][
-                "ffs_reassignment_out_count"
-            ] += int(row_count or 0)
-
-        stmt = (
-            select(
-                ProviderEnrollmentFFSReassignment.receiving_enrollment_id,
-                func.count().label("row_count"),
-            )
-            .where(ProviderEnrollmentFFSReassignment.receiving_enrollment_id.in_(all_enrollment_ids))
-            .group_by(ProviderEnrollmentFFSReassignment.receiving_enrollment_id)
-        )
-        query_result = await _execute_stmt(stmt, session=session)
-        for enrollment_id, row_count in query_result.all():
-            npi_value = npi_by_enrollment.get(str(enrollment_id))
-            if npi_value is None:
-                continue
-            summary_overrides_by_npi[npi_value][
-                "ffs_reassignment_in_count"
-            ] += int(row_count or 0)
-
+    await _apply_ffs_related_npi_overrides(
+        summary_overrides_by_npi,
+        npi_by_enrollment,
+        all_enrollment_ids,
+        session=session,
+    )
+    await _apply_ffs_address_overrides(
+        summary_overrides_by_npi,
+        npi_by_enrollment,
+        all_enrollment_ids,
+        session=session,
+    )
+    await _apply_ffs_specialty_overrides(
+        summary_overrides_by_npi,
+        npi_by_enrollment,
+        all_enrollment_ids,
+        session=session,
+    )
+    await _apply_ffs_reassignment_overrides(
+        summary_overrides_by_npi,
+        npi_by_enrollment,
+        all_enrollment_ids,
+        session=session,
+    )
     return summary_overrides_by_npi
 
 
@@ -6074,36 +6152,210 @@ async def _address_serving_table_sql(required_columns: set[str] | None = None, *
     return _schema_cache_key(model.__tablename__)
 
 
-async def _fetch_provider_enrichment_summary_map(
+PROVIDER_ENRICHMENT_SUMMARY_COLUMNS = (
+    "npi",
+    "latest_reporting_year",
+    "status",
+    "has_any_enrollment",
+    "has_medicare_claims",
+    "has_ffs_enrollment",
+    "has_hospital_enrollment",
+    "has_hha_enrollment",
+    "has_hospice_enrollment",
+    "has_fqhc_enrollment",
+    "has_rhc_enrollment",
+    "has_snf_enrollment",
+    "primary_state",
+    "primary_provider_type_code",
+    "total_enrollment_rows",
+    "dataset_keys",
+    "ffs_enrollment_ids",
+    "ffs_pecos_asct_cntl_ids",
+    "ffs_secondary_provider_type_codes",
+    "ffs_secondary_provider_type_texts",
+    "ffs_practice_zip_codes",
+    "ffs_practice_cities",
+    "ffs_practice_states",
+    "ffs_related_npis",
+    "ffs_related_npi_count",
+    "ffs_reassignment_in_count",
+    "ffs_reassignment_out_count",
+)
+
+
+async def _provider_enrichment_rows_for_columns(
+    npis: Sequence[int],
+    available_columns: set[str],
+    *,
+    session: Any = None,
+) -> list[Any]:
+    summary_table = _schema_cache_key(ProviderEnrichmentSummary.__tablename__)
+    select_columns = [
+        column_name if column_name in available_columns else f"NULL AS {column_name}"
+        for column_name in PROVIDER_ENRICHMENT_SUMMARY_COLUMNS
+    ]
+    query = text(
+        f"""
+        SELECT
+            {', '.join(select_columns)}
+          FROM {summary_table}
+         WHERE npi = ANY(:npis)
+        """
+    )
+    query_result = await _execute_stmt(
+        query,
+        session=session,
+        params={"npis": list(npis)},
+    )
+    return query_result.all()
+
+
+async def _fetch_provider_enrichment_summary_rows(
     npis: Sequence[int],
     *,
-    include_chain: bool = False,
     session: Any = None,
-) -> dict[int, dict[str, Any]]:
-    """Fetch public provider-enrichment summaries keyed by requested NPI."""
-    unique_npis = sorted({int(npi) for npi in npis if npi is not None})
-    if not unique_npis:
-        return {}
-    if not await _is_table_available(ProviderEnrichmentSummary.__tablename__, session=session):
-        return {}
+) -> list[Any]:
+    try:
+        return await _provider_enrichment_rows_for_columns(
+            npis,
+            _model_table_columns(ProviderEnrichmentSummary),
+            session=session,
+        )
+    except Exception:
+        available_columns = await _table_columns(
+            ProviderEnrichmentSummary.__tablename__,
+            session=session,
+        )
+        return await _provider_enrichment_rows_for_columns(
+            npis,
+            available_columns,
+            session=session,
+        )
 
-    requested_columns = [
-        "npi",
-        "latest_reporting_year",
-        "status",
-        "has_any_enrollment",
-        "has_medicare_claims",
-        "has_ffs_enrollment",
-        "has_hospital_enrollment",
-        "has_hha_enrollment",
-        "has_hospice_enrollment",
-        "has_fqhc_enrollment",
-        "has_rhc_enrollment",
-        "has_snf_enrollment",
-        "primary_state",
-        "primary_provider_type_code",
-        "total_enrollment_rows",
-        "dataset_keys",
+
+def _provider_enrichment_summary_from_row(summary_row: Sequence[Any]) -> dict[str, Any]:
+    return {
+        "latest_reporting_year": summary_row[1],
+        "status": summary_row[2],
+        "has_any_enrollment": bool(summary_row[3]),
+        "has_medicare_claims": bool(summary_row[4]),
+        "has_ffs_enrollment": bool(summary_row[5]),
+        "has_hospital_enrollment": bool(summary_row[6]),
+        "has_hha_enrollment": bool(summary_row[7]),
+        "has_hospice_enrollment": bool(summary_row[8]),
+        "has_fqhc_enrollment": bool(summary_row[9]),
+        "has_rhc_enrollment": bool(summary_row[10]),
+        "has_snf_enrollment": bool(summary_row[11]),
+        "primary_state": summary_row[12],
+        "primary_provider_type_code": summary_row[13],
+        "total_enrollment_rows": summary_row[14],
+        "dataset_keys": list(summary_row[15] or []),
+        "ffs_enrollment_ids": list(summary_row[16] or []),
+        "ffs_pecos_asct_cntl_ids": list(summary_row[17] or []),
+        "ffs_secondary_provider_type_codes": list(summary_row[18] or []),
+        "ffs_secondary_provider_type_texts": list(summary_row[19] or []),
+        "ffs_practice_zip_codes": list(summary_row[20] or []),
+        "ffs_practice_cities": list(summary_row[21] or []),
+        "ffs_practice_states": list(summary_row[22] or []),
+        "ffs_related_npis": [
+            int(related_npi)
+            for related_npi in (summary_row[23] or [])
+            if related_npi is not None
+        ],
+        "ffs_related_npi_count": int(summary_row[24] or 0),
+        "ffs_reassignment_in_count": int(summary_row[25] or 0),
+        "ffs_reassignment_out_count": int(summary_row[26] or 0),
+        "ffs_chain_hidden": False,
+        "ffs_chain_enrollment_count": 0,
+        "ffs_chain_enrollment_ids": [],
+    }
+
+
+async def _fetch_provider_enrichment_ffs_rows(
+    npis: Sequence[int],
+    *,
+    session: Any = None,
+) -> dict[int, list[dict[str, Any]]]:
+    statement = (
+        select(
+            ProviderEnrollmentFFS.npi,
+            ProviderEnrollmentFFS.enrollment_id,
+            ProviderEnrollmentFFS.pecos_asct_cntl_id,
+            ProviderEnrollmentFFS.provider_type_code,
+            ProviderEnrollmentFFS.provider_type_text,
+            ProviderEnrollmentFFS.multiple_npi_flag,
+        )
+        .where(ProviderEnrollmentFFS.npi.in_(npis))
+        .order_by(
+            ProviderEnrollmentFFS.npi.asc(),
+            ProviderEnrollmentFFS.reporting_year.desc().nullslast(),
+            ProviderEnrollmentFFS.enrollment_id.asc(),
+        )
+    )
+    query_result = await _execute_stmt(statement, session=session)
+    rows_by_npi: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for enrollment_row in query_result.all():
+        rows_by_npi[int(enrollment_row[0])].append(
+            {
+                "enrollment_id": enrollment_row[1],
+                "pecos_asct_cntl_id": enrollment_row[2],
+                "provider_type_code": enrollment_row[3],
+                "provider_type_text": enrollment_row[4],
+                "multiple_npi_flag": enrollment_row[5],
+            }
+        )
+    return dict(rows_by_npi)
+
+
+def _visible_ffs_rows_by_npi(
+    summary_map: Mapping[int, dict[str, Any]],
+    ffs_rows_by_npi: Mapping[int, Sequence[dict[str, Any]]],
+    *,
+    include_chain: bool,
+) -> dict[int, list[dict[str, Any]]]:
+    visible_rows_by_npi: dict[int, list[dict[str, Any]]] = {}
+    for npi_value, summary in summary_map.items():
+        visible_rows, chain_rows = _partition_ffs_enrollment_payloads(
+            ffs_rows_by_npi.get(npi_value, [])
+        )
+        summary["ffs_chain_hidden"] = bool(chain_rows) and not include_chain
+        summary["ffs_chain_enrollment_count"] = len(chain_rows)
+        summary["ffs_chain_enrollment_ids"] = _unique_non_empty(
+            [enrollment.get("enrollment_id") for enrollment in chain_rows]
+        )
+        if chain_rows and not include_chain:
+            visible_rows_by_npi[npi_value] = visible_rows
+    return visible_rows_by_npi
+
+
+def _default_ffs_summary_override(
+    visible_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "ffs_enrollment_ids": _unique_non_empty(
+            [enrollment.get("enrollment_id") for enrollment in visible_rows]
+        ),
+        "ffs_pecos_asct_cntl_ids": _unique_non_empty(
+            [enrollment.get("pecos_asct_cntl_id") for enrollment in visible_rows]
+        ),
+        "ffs_secondary_provider_type_codes": [],
+        "ffs_secondary_provider_type_texts": [],
+        "ffs_practice_zip_codes": [],
+        "ffs_practice_cities": [],
+        "ffs_practice_states": [],
+        "ffs_related_npis": [],
+        "ffs_related_npi_count": 0,
+        "ffs_reassignment_in_count": 0,
+        "ffs_reassignment_out_count": 0,
+    }
+
+
+def _apply_provider_enrichment_overrides(
+    summary_map: Mapping[int, dict[str, Any]],
+    visible_rows_by_npi: Mapping[int, Sequence[Mapping[str, Any]]],
+    summary_overrides_by_npi: Mapping[int, Mapping[str, Any]],
+) -> None:
+    override_fields = (
         "ffs_enrollment_ids",
         "ffs_pecos_asct_cntl_ids",
         "ffs_secondary_provider_type_codes",
@@ -6115,189 +6367,64 @@ async def _fetch_provider_enrichment_summary_map(
         "ffs_related_npi_count",
         "ffs_reassignment_in_count",
         "ffs_reassignment_out_count",
-    ]
-    model_columns = _model_table_columns(ProviderEnrichmentSummary)
-
-    async def _run_summary_query(available_columns: set[str]):
-        select_columns = [
-            column_name if column_name in available_columns else f"NULL AS {column_name}"
-            for column_name in requested_columns
-        ]
-        query = text(
-            f"""
-            SELECT
-                {', '.join(select_columns)}
-              FROM mrf.{ProviderEnrichmentSummary.__tablename__}
-             WHERE npi = ANY(:npis)
-            """
-        )
-        summary_query_result = await _execute_stmt(
-            query,
-            session=session,
-            params={"npis": unique_npis},
-        )
-        return summary_query_result.all()
-
-    try:
-        summary_rows = await _run_summary_query(model_columns)
-    except Exception:
-        available_columns = await _table_columns(ProviderEnrichmentSummary.__tablename__, session=session)
-        summary_rows = await _run_summary_query(available_columns)
-
-    summary_map: dict[int, dict[str, Any]] = {}
-    for summary_row in summary_rows:
-        npi_value = int(summary_row[0])
-        summary_map[npi_value] = {
-            "latest_reporting_year": summary_row[1],
-            "status": summary_row[2],
-            "has_any_enrollment": bool(summary_row[3]),
-            "has_medicare_claims": bool(summary_row[4]),
-            "has_ffs_enrollment": bool(summary_row[5]),
-            "has_hospital_enrollment": bool(summary_row[6]),
-            "has_hha_enrollment": bool(summary_row[7]),
-            "has_hospice_enrollment": bool(summary_row[8]),
-            "has_fqhc_enrollment": bool(summary_row[9]),
-            "has_rhc_enrollment": bool(summary_row[10]),
-            "has_snf_enrollment": bool(summary_row[11]),
-            "primary_state": summary_row[12],
-            "primary_provider_type_code": summary_row[13],
-            "total_enrollment_rows": summary_row[14],
-            "dataset_keys": list(summary_row[15] or []),
-            "ffs_enrollment_ids": list(summary_row[16] or []),
-            "ffs_pecos_asct_cntl_ids": list(summary_row[17] or []),
-            "ffs_secondary_provider_type_codes": list(summary_row[18] or []),
-            "ffs_secondary_provider_type_texts": list(summary_row[19] or []),
-            "ffs_practice_zip_codes": list(summary_row[20] or []),
-            "ffs_practice_cities": list(summary_row[21] or []),
-            "ffs_practice_states": list(summary_row[22] or []),
-            "ffs_related_npis": [
-                int(related_npi)
-                for related_npi in (summary_row[23] or [])
-                if related_npi is not None
-            ],
-            "ffs_related_npi_count": int(summary_row[24] or 0),
-            "ffs_reassignment_in_count": int(summary_row[25] or 0),
-            "ffs_reassignment_out_count": int(summary_row[26] or 0),
-            "ffs_chain_hidden": False,
-            "ffs_chain_enrollment_count": 0,
-            "ffs_chain_enrollment_ids": [],
-        }
-
-    if not summary_map or not await _is_table_available(ProviderEnrollmentFFS.__tablename__, session=session):
-        return summary_map
-
-    stmt = (
-        select(
-            ProviderEnrollmentFFS.npi,
-            ProviderEnrollmentFFS.enrollment_id,
-            ProviderEnrollmentFFS.pecos_asct_cntl_id,
-            ProviderEnrollmentFFS.provider_type_code,
-            ProviderEnrollmentFFS.provider_type_text,
-            ProviderEnrollmentFFS.multiple_npi_flag,
-        )
-        .where(ProviderEnrollmentFFS.npi.in_(unique_npis))
-        .order_by(
-            ProviderEnrollmentFFS.npi.asc(),
-            ProviderEnrollmentFFS.reporting_year.desc().nullslast(),
-            ProviderEnrollmentFFS.enrollment_id.asc(),
-        )
-    )
-    enrollment_query_result = await _execute_stmt(stmt, session=session)
-
-    ffs_rows_by_npi: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    for enrollment_row in enrollment_query_result.all():
-        (
-            npi_value,
-            enrollment_id,
-            pecos_asct_cntl_id,
-            provider_type_code,
-            provider_type_text,
-            multiple_npi_flag,
-        ) = enrollment_row
-        ffs_rows_by_npi[int(npi_value)].append(
-            {
-                "enrollment_id": enrollment_id,
-                "pecos_asct_cntl_id": pecos_asct_cntl_id,
-                "provider_type_code": provider_type_code,
-                "provider_type_text": provider_type_text,
-                "multiple_npi_flag": multiple_npi_flag,
-            }
-        )
-
-    visible_rows_by_npi: dict[int, list[dict[str, Any]]] = {}
-    for npi_value, summary in summary_map.items():
-        visible_rows, chain_rows = _partition_ffs_enrollment_payloads(ffs_rows_by_npi.get(npi_value, []))
-        summary["ffs_chain_hidden"] = bool(chain_rows) and not include_chain
-        summary["ffs_chain_enrollment_count"] = len(chain_rows)
-        summary["ffs_chain_enrollment_ids"] = _unique_non_empty(
-            [enrollment.get("enrollment_id") for enrollment in chain_rows]
-        )
-        if chain_rows and not include_chain:
-            visible_rows_by_npi[npi_value] = visible_rows
-
-    if not visible_rows_by_npi:
-        return summary_map
-
-    summary_overrides_by_npi = await _fetch_ffs_summary_overrides(
-        visible_rows_by_npi,
-        session=session,
     )
     for npi_value, visible_rows in visible_rows_by_npi.items():
         summary = summary_map.get(npi_value)
         if summary is None:
             continue
-        summary_override_map = summary_overrides_by_npi.get(npi_value)
-        if summary_override_map is None:
-            summary_override_map = {
-                "ffs_enrollment_ids": _unique_non_empty(
-                    [enrollment.get("enrollment_id") for enrollment in visible_rows]
-                ),
-                "ffs_pecos_asct_cntl_ids": _unique_non_empty(
-                    [
-                        enrollment.get("pecos_asct_cntl_id")
-                        for enrollment in visible_rows
-                    ]
-                ),
-                "ffs_secondary_provider_type_codes": [],
-                "ffs_secondary_provider_type_texts": [],
-                "ffs_practice_zip_codes": [],
-                "ffs_practice_cities": [],
-                "ffs_practice_states": [],
-                "ffs_related_npis": [],
-                "ffs_related_npi_count": 0,
-                "ffs_reassignment_in_count": 0,
-                "ffs_reassignment_out_count": 0,
-            }
+        summary_override = summary_overrides_by_npi.get(npi_value)
+        if summary_override is None:
+            summary_override = _default_ffs_summary_override(visible_rows)
+        for field_name in override_fields:
+            summary[field_name] = summary_override[field_name]
 
-        summary["ffs_enrollment_ids"] = summary_override_map["ffs_enrollment_ids"]
-        summary["ffs_pecos_asct_cntl_ids"] = summary_override_map[
-            "ffs_pecos_asct_cntl_ids"
-        ]
-        summary["ffs_secondary_provider_type_codes"] = summary_override_map[
-            "ffs_secondary_provider_type_codes"
-        ]
-        summary["ffs_secondary_provider_type_texts"] = summary_override_map[
-            "ffs_secondary_provider_type_texts"
-        ]
-        summary["ffs_practice_zip_codes"] = summary_override_map[
-            "ffs_practice_zip_codes"
-        ]
-        summary["ffs_practice_cities"] = summary_override_map[
-            "ffs_practice_cities"
-        ]
-        summary["ffs_practice_states"] = summary_override_map[
-            "ffs_practice_states"
-        ]
-        summary["ffs_related_npis"] = summary_override_map["ffs_related_npis"]
-        summary["ffs_related_npi_count"] = summary_override_map[
-            "ffs_related_npi_count"
-        ]
-        summary["ffs_reassignment_in_count"] = summary_override_map[
-            "ffs_reassignment_in_count"
-        ]
-        summary["ffs_reassignment_out_count"] = summary_override_map[
-            "ffs_reassignment_out_count"
-        ]
+
+async def _fetch_provider_enrichment_summary_map(
+    npis: Sequence[int],
+    *,
+    include_chain: bool = False,
+    session: Any = None,
+) -> dict[int, dict[str, Any]]:
+    """Fetch public provider-enrichment summaries keyed by requested NPI."""
+    unique_npis = sorted({int(npi) for npi in npis if npi is not None})
+    if not unique_npis or not await _is_table_available(
+        ProviderEnrichmentSummary.__tablename__,
+        session=session,
+    ):
+        return {}
+    summary_rows = await _fetch_provider_enrichment_summary_rows(
+        unique_npis,
+        session=session,
+    )
+    summary_map = {
+        int(summary_row[0]): _provider_enrichment_summary_from_row(summary_row)
+        for summary_row in summary_rows
+    }
+    if not summary_map or not await _is_table_available(
+        ProviderEnrollmentFFS.__tablename__,
+        session=session,
+    ):
+        return summary_map
+    ffs_rows_by_npi = await _fetch_provider_enrichment_ffs_rows(
+        unique_npis,
+        session=session,
+    )
+    visible_rows_by_npi = _visible_ffs_rows_by_npi(
+        summary_map,
+        ffs_rows_by_npi,
+        include_chain=include_chain,
+    )
+    if not visible_rows_by_npi:
+        return summary_map
+    summary_overrides_by_npi = await _fetch_ffs_summary_overrides(
+        visible_rows_by_npi,
+        session=session,
+    )
+    _apply_provider_enrichment_overrides(
+        summary_map,
+        visible_rows_by_npi,
+        summary_overrides_by_npi,
+    )
     return summary_map
 
 
@@ -8000,6 +8127,128 @@ def _is_provider_type_taxonomy_matched(row: Mapping[str, Any], params: Mapping[s
     return False
 
 
+def _match_candidate_source_flags(
+    provider_row: Mapping[str, Any],
+    public_provider_map: Mapping[str, Any],
+    enrichment: Mapping[str, Any] | None,
+) -> tuple[list[Any], list[Any], bool, Any, bool]:
+    fhir_sources = _json_array_value(
+        public_provider_map.get(PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY)
+    )
+    address_sources = _json_array_value(provider_row.get("address_sources"))
+    fhir_matched = bool(fhir_sources) or "provider_directory_fhir" in address_sources
+    fhir_source_count = provider_row.get("provider_directory_source_count")
+    if fhir_source_count is None:
+        fhir_source_count = provider_row.get("source_count") or len(fhir_sources)
+    ffs_matched = bool(
+        enrichment
+        and (
+            enrichment.get("has_any_enrollment")
+            or enrichment.get("has_ffs_enrollment")
+            or enrichment.get("has_medicare_claims")
+        )
+    )
+    return (
+        fhir_sources,
+        address_sources,
+        fhir_matched,
+        fhir_source_count,
+        ffs_matched,
+    )
+
+
+def _match_candidate_address_map(provider_row: Mapping[str, Any]) -> dict[str, Any]:
+    address_map = {
+        "type": provider_row.get("address_type"),
+        "first_line": provider_row.get("first_line"),
+        "second_line": provider_row.get("second_line"),
+        "city_name": provider_row.get("city_name"),
+        "state_name": provider_row.get("state_name"),
+        "postal_code": provider_row.get("postal_code"),
+        "country_code": provider_row.get("country_code"),
+        "telephone_number": provider_row.get("telephone_number"),
+        "phone_number": provider_row.get("phone_number"),
+        "lat": provider_row.get("lat"),
+        "long": provider_row.get("long"),
+        "address_key": provider_row.get("address_key"),
+        "address_site_key": provider_row.get("address_site_key"),
+    }
+    return {
+        key: field_value
+        for key, field_value in address_map.items()
+        if field_value not in (None, "", [])
+    }
+
+
+def _match_candidate_source_map(
+    enrichment: Mapping[str, Any] | None,
+    *,
+    fhir_matched: bool,
+    fhir_source_count: Any,
+    ffs_matched: bool,
+) -> dict[str, Any]:
+    return {
+        "nppes": {"matched": True},
+        "fhir": {
+            "matched": fhir_matched,
+            "source_count": fhir_source_count,
+        },
+        "ffs": {
+            "matched": ffs_matched,
+            "has_ffs_enrollment": bool(
+                enrichment and enrichment.get("has_ffs_enrollment")
+            ),
+            "has_medicare_claims": bool(
+                enrichment and enrichment.get("has_medicare_claims")
+            ),
+        },
+    }
+
+
+def _match_candidate_evidence_map(
+    provider_row: Mapping[str, Any],
+    enrichment: Mapping[str, Any] | None,
+    address_sources: Sequence[Any],
+) -> dict[str, Any]:
+    evidence_map = {
+        "provider_enrichment_summary": dict(enrichment or {}),
+        "source_record_ids": _json_array_value(provider_row.get("source_record_ids")),
+        "address_sources": list(address_sources),
+    }
+    phone_source_record_ids = _json_array_value(
+        provider_row.get("phone_source_record_ids")
+    )
+    if phone_source_record_ids:
+        evidence_map["phone_source_record_ids"] = phone_source_record_ids
+    return evidence_map
+
+
+def _match_candidate_response_map(
+    provider_row: Mapping[str, Any],
+    taxonomy_list: Sequence[Any],
+    enrichment: Mapping[str, Any] | None,
+    match_score: int,
+    match_signals: Mapping[str, Any],
+    address_map: Mapping[str, Any],
+    source_map: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "npi": provider_row.get("npi"),
+        "display_name": _match_candidate_name(provider_row),
+        "organization_name": provider_row.get("provider_organization_name"),
+        "entity_type_code": provider_row.get("entity_type_code"),
+        "entity_kind": _entity_kind_from_code(provider_row.get("entity_type_code")),
+        "address_key": provider_row.get("address_key"),
+        "address_site_key": provider_row.get("address_site_key"),
+        "match_score": match_score,
+        "confidence_band": _confidence_band(match_score),
+        "match_signals": dict(match_signals),
+        "facility": _facility_payload(provider_row, taxonomy_list, enrichment),
+        "address": dict(address_map),
+        "sources": dict(source_map),
+    }
+
+
 def _match_candidate_output(
     provider_row: Mapping[str, Any],
     params: Mapping[str, Any],
@@ -8009,17 +8258,9 @@ def _match_candidate_output(
     public_provider_map = dict(provider_row)
     _redact_internal_address_fields(public_provider_map)
     taxonomy_list = _json_array_value(provider_row.get("taxonomy_list"))
-    fhir_sources = _json_array_value(public_provider_map.get(PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY))
-    address_sources = _json_array_value(provider_row.get("address_sources"))
-    fhir_matched = bool(fhir_sources) or "provider_directory_fhir" in address_sources
-    fhir_source_count = provider_row.get("provider_directory_source_count")
-    if fhir_source_count is None:
-        fhir_source_count = provider_row.get("source_count") or len(fhir_sources)
-    ffs_matched = bool(enrichment and (
-        enrichment.get("has_any_enrollment")
-        or enrichment.get("has_ffs_enrollment")
-        or enrichment.get("has_medicare_claims")
-    ))
+    fhir_sources, address_sources, fhir_matched, fhir_source_count, ffs_matched = (
+        _match_candidate_source_flags(provider_row, public_provider_map, enrichment)
+    )
     is_taxonomy_matched = _is_provider_type_filter_matched(provider_row, params)
     is_provider_type_matched = _is_provider_type_taxonomy_matched(provider_row, params)
     is_general_acute_care_matched = _should_boost_general_acute_care_candidate(
@@ -8038,69 +8279,30 @@ def _match_candidate_output(
     )
     if is_general_acute_care_matched:
         match_score = _boost_general_acute_care_score(match_signals, match_score)
-    address_map = {
-        "type": provider_row.get("address_type"),
-        "first_line": provider_row.get("first_line"),
-        "second_line": provider_row.get("second_line"),
-        "city_name": provider_row.get("city_name"),
-        "state_name": provider_row.get("state_name"),
-        "postal_code": provider_row.get("postal_code"),
-        "country_code": provider_row.get("country_code"),
-        "telephone_number": provider_row.get("telephone_number"),
-        "phone_number": provider_row.get("phone_number"),
-        "lat": provider_row.get("lat"),
-        "long": provider_row.get("long"),
-        "address_key": provider_row.get("address_key"),
-        "address_site_key": provider_row.get("address_site_key"),
-    }
-    address_map = {
-        key: field_value
-        for key, field_value in address_map.items()
-        if field_value not in (None, "", [])
-    }
-    source_map = {
-        "nppes": {"matched": True},
-        "fhir": {
-            "matched": fhir_matched,
-            "source_count": fhir_source_count,
-        },
-        "ffs": {
-            "matched": ffs_matched,
-            "has_ffs_enrollment": bool(enrichment and enrichment.get("has_ffs_enrollment")),
-            "has_medicare_claims": bool(enrichment and enrichment.get("has_medicare_claims")),
-        },
-    }
-    candidate_map = {
-        "npi": provider_row.get("npi"),
-        "display_name": _match_candidate_name(provider_row),
-        "organization_name": provider_row.get("provider_organization_name"),
-        "entity_type_code": provider_row.get("entity_type_code"),
-        "entity_kind": _entity_kind_from_code(provider_row.get("entity_type_code")),
-        "address_key": provider_row.get("address_key"),
-        "address_site_key": provider_row.get("address_site_key"),
-        "match_score": match_score,
-        "confidence_band": _confidence_band(match_score),
-        "match_signals": match_signals,
-        "facility": _facility_payload(provider_row, taxonomy_list, enrichment),
-        "address": address_map,
-        "sources": source_map,
-    }
+    candidate_map = _match_candidate_response_map(
+        provider_row,
+        taxonomy_list,
+        enrichment,
+        match_score,
+        match_signals,
+        _match_candidate_address_map(provider_row),
+        _match_candidate_source_map(
+            enrichment,
+            fhir_matched=fhir_matched,
+            fhir_source_count=fhir_source_count,
+            ffs_matched=ffs_matched,
+        ),
+    )
     if taxonomy_list:
         candidate_map["taxonomy"] = taxonomy_list
     if params.get("include_sources") and fhir_sources:
         candidate_map["provider_directory_sources"] = fhir_sources
     if params.get("include_evidence"):
-        evidence_dict = {
-            "provider_enrichment_summary": dict(enrichment or {}),
-            "source_record_ids": _json_array_value(provider_row.get("source_record_ids")),
-            "address_sources": address_sources,
-        }
-        phone_source_record_ids = _json_array_value(
-            provider_row.get("phone_source_record_ids")
+        candidate_map["evidence"] = _match_candidate_evidence_map(
+            provider_row,
+            enrichment,
+            address_sources,
         )
-        if phone_source_record_ids:
-            evidence_dict["phone_source_record_ids"] = phone_source_record_ids
-        candidate_map["evidence"] = evidence_dict
     return {
         key: field_value
         for key, field_value in candidate_map.items()
@@ -11512,6 +11714,322 @@ async def get_plans_by_npi(_request, npi):
     return response.json({"npi_data": npi_plan_rows, "plan_data": plan_rows, "issuer_data": issuer_rows})
 
 
+def _normalize_npi_batch_npis(raw_npis: Any) -> list[int]:
+    """Validate and normalize the ordered NPI list."""
+    if not isinstance(raw_npis, list) or not 1 <= len(raw_npis) <= NPI_BATCH_MAX_SIZE:
+        raise sanic.exceptions.InvalidUsage(
+            f"npis must contain between 1 and {NPI_BATCH_MAX_SIZE} values"
+        )
+    normalized_npis: list[int] = []
+    for raw_npi in raw_npis:
+        if isinstance(raw_npi, bool):
+            npi_text = ""
+        elif isinstance(raw_npi, (str, int)):
+            npi_text = str(raw_npi).strip()
+        else:
+            npi_text = ""
+        if len(npi_text) != 10 or not npi_text.isascii() or not npi_text.isdigit():
+            raise sanic.exceptions.InvalidUsage("each npi must be a 10-digit numeric value")
+        normalized_npis.append(int(npi_text))
+    if len(set(normalized_npis)) != len(normalized_npis):
+        raise sanic.exceptions.InvalidUsage("npis must be unique")
+    return normalized_npis
+
+
+def _bounded_npi_batch_integer(
+    raw_body: Mapping[str, Any],
+    field_name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Read one bounded integer option without accepting booleans."""
+    field_value = raw_body.get(field_name, default)
+    if (
+        isinstance(field_value, bool)
+        or not isinstance(field_value, int)
+        or not minimum <= field_value <= maximum
+    ):
+        raise sanic.exceptions.InvalidUsage(
+            f"{field_name} must be an integer between {minimum} and {maximum}"
+        )
+    return field_value
+
+
+def _npi_batch_boolean_map(raw_body: Mapping[str, Any]) -> dict[str, bool]:
+    boolean_option_map: dict[str, bool] = {}
+    for option_name in ("include_sources", "include_evidence"):
+        option_value = raw_body.get(option_name, False)
+        if not isinstance(option_value, bool):
+            raise sanic.exceptions.InvalidUsage(f"{option_name} must be a boolean")
+        boolean_option_map[option_name] = option_value
+    return boolean_option_map
+
+
+def _normalize_npi_batch_request(raw_body: Any) -> dict[str, Any]:
+    """Validate the bounded, shared-option provider batch contract."""
+    if not isinstance(raw_body, Mapping):
+        raise sanic.exceptions.InvalidUsage("request body must be a JSON object")
+    allowed_fields = {
+        "npis",
+        "address_limit",
+        "address_offset",
+        "include_sources",
+        "include_evidence",
+    }
+    unknown_fields = sorted(set(raw_body) - allowed_fields)
+    if unknown_fields:
+        raise sanic.exceptions.InvalidUsage(f"unsupported batch field: {unknown_fields[0]}")
+    return {
+        "npis": _normalize_npi_batch_npis(raw_body.get("npis")),
+        "address_limit": _bounded_npi_batch_integer(
+            raw_body,
+            "address_limit",
+            default=NPI_BATCH_ADDRESS_DEFAULT_LIMIT,
+            minimum=1,
+            maximum=NPI_BATCH_ADDRESS_MAX_LIMIT,
+        ),
+        "address_offset": _bounded_npi_batch_integer(
+            raw_body,
+            "address_offset",
+            default=0,
+            minimum=0,
+            maximum=1_000_000,
+        ),
+        **_npi_batch_boolean_map(raw_body),
+    }
+
+
+async def _rank_npi_batch_addresses(
+    npis: Sequence[int],
+    *,
+    session: Any,
+) -> dict[int, list[dict[str, Any]]]:
+    """Fetch and rank summary address candidates with fixed-count reads."""
+    base_addresses_by_npi = await _fetch_npi_location_candidates_map(
+        npis,
+        session=session,
+    )
+    overlay_addresses_by_npi = await _fetch_provider_directory_address_overlay_map(
+        npis,
+        session=session,
+    )
+    await _apply_location_statuses(
+        [
+            address
+            for npi in npis
+            for address in base_addresses_by_npi.get(npi, [])
+        ],
+        session=session,
+    )
+    ranked_addresses_by_npi: dict[int, list[dict[str, Any]]] = {}
+    for npi in npis:
+        addresses = [
+            address
+            for address in (
+                list(base_addresses_by_npi.get(npi, []))
+                + list(overlay_addresses_by_npi.get(npi, []))
+            )
+            if _is_public_street_level_address(address)
+        ]
+        ranked_addresses = _rank_provider_locations(
+            _dedupe_addresses_by_key(addresses)
+        )
+        ranked_addresses_by_npi[npi] = ranked_addresses
+    return ranked_addresses_by_npi
+
+
+async def _hydrate_npi_batch_addresses(
+    npis: Sequence[int],
+    ranked_addresses_by_npi: Mapping[int, Sequence[Mapping[str, Any]]],
+    *,
+    address_limit: int,
+    address_offset: int,
+    include_sources: bool,
+    include_evidence: bool,
+    session: Any,
+) -> dict[int, list[dict[str, Any]]]:
+    """Hydrate only each provider's selected address page."""
+    selected_addresses_by_npi = {
+        npi: list(ranked_addresses_by_npi[npi])[
+            address_offset : address_offset + address_limit
+        ]
+        for npi in npis
+    }
+
+    selected_identity_list = sorted(
+        {
+            identity
+            for npi in npis
+            for identity in _selected_base_identity_list(
+                selected_addresses_by_npi[npi]
+            )
+        }
+    )
+    hydrated_by_npi: dict[int, list[dict[str, Any]]] = {}
+    if selected_identity_list:
+        hydrated_by_npi = await _fetch_npi_address_rows_map(
+            npis,
+            include_sources=include_sources,
+            include_evidence=include_evidence,
+            address_row_identities=selected_identity_list,
+            session=session,
+        )
+    for npi in npis:
+        selected_addresses_by_npi[npi] = _merge_hydrated_location_candidates(
+            selected_addresses_by_npi[npi],
+            hydrated_by_npi.get(npi, []),
+        )
+    selected_addresses = [
+        address
+        for npi in npis
+        for address in selected_addresses_by_npi[npi]
+    ]
+    if selected_addresses and (include_sources or include_evidence):
+        await _attach_provider_directory_source_details(
+            selected_addresses,
+            include_role_evidence=include_evidence,
+            session=session,
+        )
+    return selected_addresses_by_npi
+
+
+def _npi_batch_dba_names(
+    provider_detail_map: Mapping[str, Any],
+    other_names: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    existing_dba_names = [
+        name for name in (provider_detail_map.get("do_business_as") or []) if name
+    ]
+    if existing_dba_names:
+        return list(dict.fromkeys(existing_dba_names))
+    return list(
+        dict.fromkeys(
+            entry.get("other_provider_identifier")
+            for entry in other_names
+            if entry.get("other_provider_identifier_type_code") == "3"
+            and entry.get("other_provider_identifier")
+        )
+    )
+
+
+def _npi_batch_provider_result(
+    npi: int,
+    provider_detail_map: Mapping[str, Any] | None,
+    ranked_addresses: Sequence[Mapping[str, Any]],
+    selected_addresses: Sequence[Mapping[str, Any]],
+    other_names: Sequence[Mapping[str, Any]],
+    enrichment: Mapping[str, Any] | None,
+    batch_params: Mapping[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Format one success or not-found entry without extra reads."""
+    address_total = len(ranked_addresses)
+    if provider_detail_map is None and address_total == 0:
+        return (
+            {
+                "npi": npi,
+                "status": 404,
+                "error": {
+                    "code": "not_found",
+                    "detail": "provider was not found",
+                },
+            },
+            False,
+        )
+    public_provider_map = dict(provider_detail_map or {"npi": npi})
+    finalized_addresses = [
+        _finalize_public_provider_address(
+            dict(address),
+            include_sources=bool(batch_params["include_sources"]),
+            include_evidence=bool(batch_params["include_evidence"]),
+        )
+        for address in selected_addresses
+    ]
+    address_offset = int(batch_params["address_offset"])
+    public_provider_map["address_list"] = finalized_addresses
+    public_provider_map["address_pagination"] = {
+        "limit": int(batch_params["address_limit"]),
+        "offset": address_offset,
+        "returned": len(finalized_addresses),
+        "total": address_total,
+        "has_more": address_offset + len(finalized_addresses) < address_total,
+    }
+    public_provider_map["other_name_list"] = list(other_names)
+    public_provider_map["do_business_as"] = _npi_batch_dba_names(
+        public_provider_map,
+        other_names,
+    )
+    public_provider_map["provider_enrichment"] = {
+        "summary": _public_provider_enrichment_summary(enrichment),
+        "ffs_visibility": _provider_enrichment_visibility(
+            enrichment,
+            include_chain=False,
+        ),
+    }
+    _redact_internal_address_fields(public_provider_map)
+    return {"npi": npi, "status": 200, "provider": public_provider_map}, True
+
+
+async def _build_npi_batch_payload(
+    batch_params: Mapping[str, Any],
+    *,
+    session: Any = None,
+) -> dict[str, Any]:
+    """Assemble ordered provider summaries with set-based database reads."""
+    npis = list(batch_params["npis"])
+    detail_by_npi = await _build_npi_identity_details_map(npis, session=session)
+    ranked_addresses_by_npi = await _rank_npi_batch_addresses(npis, session=session)
+    selected_addresses_by_npi = await _hydrate_npi_batch_addresses(
+        npis,
+        ranked_addresses_by_npi,
+        address_limit=int(batch_params["address_limit"]),
+        address_offset=int(batch_params["address_offset"]),
+        include_sources=bool(batch_params["include_sources"]),
+        include_evidence=bool(batch_params["include_evidence"]),
+        session=session,
+    )
+    other_names_by_npi = await _fetch_other_names_map(npis, session=session)
+    enrichment_by_npi = await _fetch_provider_enrichment_summary_map(npis, session=session)
+    response_items: list[dict[str, Any]] = []
+    found_count = 0
+    for npi in npis:
+        provider_result_map, was_found = _npi_batch_provider_result(
+            npi,
+            detail_by_npi.get(npi),
+            ranked_addresses_by_npi[npi],
+            selected_addresses_by_npi[npi],
+            other_names_by_npi.get(npi, []),
+            enrichment_by_npi.get(npi),
+            batch_params,
+        )
+        response_items.append(provider_result_map)
+        found_count += int(was_found)
+    return {
+        "items": response_items,
+        "requested": len(npis),
+        "found": found_count,
+        "not_found": len(npis) - found_count,
+    }
+
+
+@blueprint.post("/id/batch")
+async def get_npi_batch(request):
+    """Return up to 100 provider summaries from one bounded database pipeline."""
+    started = time.monotonic()
+    batch_params = _normalize_npi_batch_request(request.json)
+    payload = await _build_npi_batch_payload(
+        batch_params,
+        session=_request_session(request),
+    )
+    payload["meta"] = {
+        "elapsed_ms": round((time.monotonic() - started) * 1000.0, 2),
+        "max_batch_size": NPI_BATCH_MAX_SIZE,
+        "view": "summary",
+    }
+    return response.json(payload, default=str)
+
+
 @blueprint.get("/id/<npi>")
 async def get_npi(request, npi):
     """Return one NPPES- or profile-backed provider with optional provenance."""
@@ -12513,14 +13031,51 @@ def _provider_detail_address_type_clause(address_model: Any, table: Any) -> Any:
     return or_(table.c.type == "primary", table.c.type == "secondary")
 
 
-async def _fetch_npi_location_candidates(
-    npi: int,
+def _npi_batch_address_filters(
+    address_model: Any,
+    address_table: Any,
+    npis: Sequence[int],
+) -> list[Any]:
+    if address_model is EntityAddressUnified:
+        return [
+            func.coalesce(address_table.c.npi, address_table.c.inferred_npi).in_(npis)
+        ]
+    return [address_table.c.npi.in_(npis)]
+
+
+def _group_npi_location_candidates(
+    query_result: Any,
+    candidate_columns: Sequence[Any],
+) -> dict[int, list[dict[str, Any]]]:
+    candidates_by_npi: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for address_record in query_result.all():
+        row_mapping = getattr(address_record, "_mapping", address_record)
+        candidate_map = {
+            column.key: row_mapping[column.key] for column in candidate_columns
+        }
+        provider_npi = candidate_map.get("npi") or candidate_map.get("inferred_npi")
+        if provider_npi is None:
+            continue
+        provider_npi = int(provider_npi)
+        candidate_map["npi"] = provider_npi
+        base_identity = _base_address_row_identity(candidate_map)
+        if base_identity:
+            candidate_map["_base_row_identities"] = [base_identity]
+        candidates_by_npi[provider_npi].append(candidate_map)
+    return dict(candidates_by_npi)
+
+
+async def _fetch_npi_location_candidates_map(
+    npis: Sequence[int],
     *,
     address_key: str | None = None,
     address_site_key: str | None = None,
     session: Any = None,
-) -> list[dict[str, Any]]:
-    """Read only the fields needed to rank the complete base location set."""
+) -> dict[int, list[dict[str, Any]]]:
+    """Read ranking fields for many providers in one address query."""
+    unique_npis = sorted({int(npi) for npi in npis})
+    if not unique_npis:
+        return {}
     address_model = await _address_serving_model(
         _public_address_serving_column_keys()
         - {"procedures_array", "medications_array"},
@@ -12537,12 +13092,7 @@ async def _fetch_npi_location_candidates(
         for column_name in NPI_LOCATION_CANDIDATE_COLUMNS
         if column_name in existing_columns
     ]
-    filters = [address_table.c.npi == npi]
-    if address_model is EntityAddressUnified:
-        filters[0] = func.coalesce(
-            address_table.c.npi,
-            address_table.c.inferred_npi,
-        ) == npi
+    filters = _npi_batch_address_filters(address_model, address_table, unique_npis)
     if address_key is not None:
         filters.append(address_table.c.address_key == address_key)
     if address_site_key is not None:
@@ -12550,7 +13100,7 @@ async def _fetch_npi_location_candidates(
             address_model is not EntityAddressUnified
             or "premise_key" not in existing_columns
         ):
-            return []
+            return {}
         filters.append(address_table.c.premise_key == address_site_key)
     statement = (
         select(*candidate_columns)
@@ -12558,20 +13108,25 @@ async def _fetch_npi_location_candidates(
         .where(_provider_detail_address_type_clause(address_model, address_table))
     )
     query_result = await _execute_stmt(statement, session=session)
-    candidates: list[dict[str, Any]] = []
-    for address_record in query_result.all():
-        row_mapping = getattr(address_record, "_mapping", address_record)
-        candidate_map = {
-            column.key: row_mapping[column.key]
-            for column in candidate_columns
-        }
-        if candidate_map.get("npi") is None:
-            candidate_map["npi"] = npi
-        base_identity = _base_address_row_identity(candidate_map)
-        if base_identity:
-            candidate_map["_base_row_identities"] = [base_identity]
-        candidates.append(candidate_map)
-    return candidates
+    return _group_npi_location_candidates(query_result, candidate_columns)
+
+
+async def _fetch_npi_location_candidates(
+    npi: int,
+    *,
+    address_key: str | None = None,
+    address_site_key: str | None = None,
+    session: Any = None,
+) -> list[dict[str, Any]]:
+    """Read only the fields needed to rank one provider's locations."""
+    return (
+        await _fetch_npi_location_candidates_map(
+            [npi],
+            address_key=address_key,
+            address_site_key=address_site_key,
+            session=session,
+        )
+    ).get(int(npi), [])
 
 
 def _address_hydration_columns(
@@ -12586,7 +13141,9 @@ def _address_hydration_columns(
     allowed_columns = set(_model_table_columns(NPIAddress))
     if address_model is EntityAddressUnified:
         allowed_columns.update(PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS)
-        allowed_columns.update({"premise_key", "source_record_ids", "location_key"})
+        allowed_columns.update(
+            {"inferred_npi", "premise_key", "source_record_ids", "location_key"}
+        )
     if include_sources or include_evidence:
         allowed_columns.update(PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS)
     if include_evidence:
@@ -12642,25 +13199,44 @@ def _hydrate_address_query_rows(
     npi: int,
     selected_identity_set: set[str],
 ) -> list[dict[str, Any]]:
-    hydrated_addresses: list[dict[str, Any]] = []
+    return _hydrate_address_query_rows_map(
+        query_result,
+        selected_columns,
+        selected_identity_set,
+    ).get(int(npi), [])
+
+
+def _hydrate_address_query_rows_map(
+    query_result: Any,
+    selected_columns: Sequence[Any],
+    selected_identity_set: set[str],
+) -> dict[int, list[dict[str, Any]]]:
+    """Group hydrated address rows by their resolved provider NPI."""
+    hydrated_by_npi: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for address_record in query_result.all():
         mapping = getattr(address_record, "_mapping", address_record)
         address_by_field = {
             column.key: mapping[column.key]
             for column in selected_columns
         }
-        if address_by_field.get("npi") is None:
-            address_by_field["npi"] = npi
+        provider_npi = address_by_field.get("npi") or address_by_field.get(
+            "inferred_npi"
+        )
+        if provider_npi is None:
+            continue
+        provider_npi = int(provider_npi)
+        address_by_field["npi"] = provider_npi
         identity = _base_address_row_identity(address_by_field)
         if selected_identity_set and identity not in selected_identity_set:
             continue
         if identity:
             address_by_field["_base_row_identities"] = [identity]
         _attach_public_address_site_key(address_by_field, address_by_field)
-        hydrated_addresses.append(
+        hydrated_address = (
             _add_canonical_contact_fields_to_address(address_by_field)
         )
-    return hydrated_addresses
+        hydrated_by_npi[provider_npi].append(hydrated_address)
+    return dict(hydrated_by_npi)
 
 
 def _selected_base_identity_list(
@@ -12747,16 +13323,19 @@ async def _hydrate_selected_provider_locations(
     )
 
 
-async def _fetch_npi_address_rows(
-    npi: int,
+async def _fetch_npi_address_rows_map(
+    npis: Sequence[int],
     *,
     include_sources: bool = False,
     include_evidence: bool = False,
     address_key: str | None = None,
     address_row_identities: Sequence[str] | None = None,
     session: Any = None,
-) -> list[dict[str, Any]]:
-    """Hydrate address rows without requiring a matching NPIData identity row."""
+) -> dict[int, list[dict[str, Any]]]:
+    """Hydrate selected address rows for many NPIs in one query."""
+    unique_npis = sorted({int(npi) for npi in npis})
+    if not unique_npis:
+        return {}
     address_model = await _address_serving_model(
         _public_address_serving_column_keys()
         - {"procedures_array", "medications_array"},
@@ -12777,12 +13356,7 @@ async def _fetch_npi_address_rows(
         include_evidence=include_evidence,
         include_location_key=address_row_identities is not None,
     )
-    filters = [address_table.c.npi == npi]
-    if address_model is EntityAddressUnified:
-        filters[0] = func.coalesce(
-            address_table.c.npi,
-            address_table.c.inferred_npi,
-        ) == npi
+    filters = _npi_batch_address_filters(address_model, address_table, unique_npis)
     if address_key is not None:
         filters.append(address_table.c.address_key == address_key)
     selected_identity_set, identity_filter = _address_identity_filter(
@@ -12803,59 +13377,181 @@ async def _fetch_npi_address_rows(
         )
     )
     query_result = await _execute_stmt(statement, session=session)
-    return _hydrate_address_query_rows(
-        query_result, selected_columns, npi, selected_identity_set
+    return _hydrate_address_query_rows_map(
+        query_result,
+        selected_columns,
+        selected_identity_set,
     )
 
 
-async def _build_npi_details(
+async def _fetch_npi_address_rows(
     npi: int,
     *,
     include_sources: bool = False,
     include_evidence: bool = False,
-    address_limit: int | None = None,
-    include_address_total: bool = True,
     address_key: str | None = None,
     address_row_identities: Sequence[str] | None = None,
     session: Any = None,
-) -> dict:
-    """Assemble one provider identity, taxonomy, and address detail payload."""
-    npi_data_table = NPIData.__table__
-    taxonomy_table = NPIDataTaxonomy.__table__
-    taxonomy_group_table = NPIDataTaxonomyGroup.__table__
-    filter_capabilities = await _resolve_npi_filter_capabilities(session=session)
-    procedures_array_available = bool(filter_capabilities.get("npi_procedures_array_available", True))
-    medications_array_available = bool(filter_capabilities.get("npi_medications_array_available", True))
-    address_model = await _address_serving_model(
-        _public_address_serving_column_keys() - {"procedures_array", "medications_array"},
-        session=session,
-    )
-    address_table = address_model.__table__
-    existing_address_columns = await _table_columns(address_model.__tablename__, session=session)
-    if not existing_address_columns:
-        existing_address_columns = _model_table_columns(address_model)
+) -> list[dict[str, Any]]:
+    """Hydrate address rows without requiring a matching NPIData identity row."""
+    return (
+        await _fetch_npi_address_rows_map(
+            [npi],
+            include_sources=include_sources,
+            include_evidence=include_evidence,
+            address_key=address_key,
+            address_row_identities=address_row_identities,
+            session=session,
+        )
+    ).get(int(npi), [])
 
+
+def _npi_detail_from_result_row(
+    result_row: Sequence[Any],
+    *,
+    include_address_rows: bool,
+    address_total: int | None = None,
+) -> dict[str, Any]:
+    """Convert the shared NPI/taxonomy projection into its public shape."""
+    provider_detail_map: dict[str, Any] = {
+        "taxonomy_list": [],
+        "taxonomy_group_list": [],
+        "address_list": [],
+    }
+    index = 0
+    for column in NPIData.__table__.columns:
+        column_value = result_row[index]
+        index += 1
+        if (
+            column.key == "do_business_as_text"
+            or column.key in PUBLIC_NPI_EXCLUDED_COLUMNS
+        ):
+            continue
+        provider_detail_map[column.key] = column_value
+    if result_row[index]:
+        provider_detail_map["taxonomy_list"].extend(
+            _public_nested_taxonomy_rows(result_row[index])
+        )
+    index += 1
+    if result_row[index]:
+        provider_detail_map["taxonomy_group_list"].extend(
+            _public_nested_taxonomy_rows(result_row[index])
+        )
+    index += 1
+    if include_address_rows and index < len(result_row) and result_row[index]:
+        provider_detail_map["address_list"] = result_row[index]
+    if address_total is not None:
+        provider_detail_map["address_total"] = address_total
+    provider_detail_map["do_business_as"] = (
+        provider_detail_map.get("do_business_as") or []
+    )
+    return provider_detail_map
+
+
+def _npi_taxonomy_batch_aggregate(
+    taxonomy_model: Any,
+    npis: Sequence[int],
+    alias: str,
+) -> Any:
+    taxonomy_table = taxonomy_model.__table__
+    return (
+        select(
+            taxonomy_table.c.npi,
+            func.json_agg(
+                literal_column(f'distinct "{taxonomy_model.__tablename__}"')
+            ).label("rows"),
+        )
+        .where(taxonomy_table.c.npi.in_(npis))
+        .group_by(taxonomy_table.c.npi)
+        .subquery(alias)
+    )
+
+
+async def _build_npi_identity_details_map(
+    npis: Sequence[int],
+    *,
+    session: Any = None,
+) -> dict[int, dict[str, Any]]:
+    """Fetch provider identity and taxonomy aggregates for many NPIs at once."""
+    unique_npis = sorted({int(npi) for npi in npis})
+    if not unique_npis:
+        return {}
+    npi_data_table = NPIData.__table__
+    taxonomy_aggregate = _npi_taxonomy_batch_aggregate(
+        NPIDataTaxonomy,
+        unique_npis,
+        "batch_taxonomy_aggregate",
+    )
+    taxonomy_group_aggregate = _npi_taxonomy_batch_aggregate(
+        NPIDataTaxonomyGroup,
+        unique_npis,
+        "batch_taxonomy_group_aggregate",
+    )
+    join_clause = npi_data_table.outerjoin(
+        taxonomy_aggregate,
+        npi_data_table.c.npi == taxonomy_aggregate.c.npi,
+    ).outerjoin(
+        taxonomy_group_aggregate,
+        npi_data_table.c.npi == taxonomy_group_aggregate.c.npi,
+    )
+    query = (
+        db.select(
+            npi_data_table,
+            taxonomy_aggregate.c.rows,
+            taxonomy_group_aggregate.c.rows,
+        )
+        .select_from(join_clause)
+        .where(npi_data_table.c.npi.in_(unique_npis))
+        .order_by(npi_data_table.c.npi)
+    )
+    if session is not None:
+        query_result = await session.execute(query._stmt)
+        detail_rows = query_result.all()
+    else:
+        detail_rows = await query.all()
+    return {
+        int(detail_row[0]): _npi_detail_from_result_row(
+            detail_row,
+            include_address_rows=False,
+        )
+        for detail_row in detail_rows
+    }
+
+
+def _npi_detail_allowed_address_columns(
+    address_model: Any,
+    *,
+    include_sources: bool,
+    include_evidence: bool,
+    include_location_key: bool,
+) -> set[str]:
     allowed_address_columns = set(_model_table_columns(NPIAddress))
     if address_model is EntityAddressUnified:
-        # Keep premise_key internally so public response redaction can expose it
-        # as address_site_key without leaking the internal column name.
         allowed_address_columns.add("premise_key")
-        # Surface per-address source + plan/network attribution by default so the
-        # unified table fulfils its purpose: see where each address came from and
-        # which plans/networks it belongs to. Heavier internals stay behind flags.
         allowed_address_columns.update(PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS)
-        # Used internally to resolve provider_directory_fhir source ids to
-        # readable carrier/source details. The raw ids are removed from the
-        # response unless evidence output is requested.
         allowed_address_columns.add("source_record_ids")
     if include_sources or include_evidence:
         allowed_address_columns.update(PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS)
     if include_evidence:
         allowed_address_columns.update(PUBLIC_ADDRESS_EVIDENCE_DEBUG_COLUMNS)
-    if address_row_identities is not None and address_model is EntityAddressUnified:
+    if include_location_key and address_model is EntityAddressUnified:
         allowed_address_columns.add("location_key")
+    return allowed_address_columns
 
-    address_columns = []
+
+def _npi_detail_address_columns(
+    address_table: Any,
+    existing_address_columns: set[str],
+    allowed_address_columns: set[str],
+    filter_capabilities: Mapping[str, Any],
+) -> list[Any]:
+    procedures_available = bool(
+        filter_capabilities.get("npi_procedures_array_available", True)
+    )
+    medications_available = bool(
+        filter_capabilities.get("npi_medications_array_available", True)
+    )
+    address_columns: list[Any] = []
     for column in address_table.columns:
         if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS and column.key not in allowed_address_columns:
             continue
@@ -12867,17 +13563,61 @@ async def _build_npi_details(
             elif column.key == "medications_array":
                 address_columns.append(literal_column("'{}'::INTEGER[]").label("medications_array"))
             continue
-        if column.key == "procedures_array" and not procedures_array_available:
+        if column.key == "procedures_array" and not procedures_available:
             address_columns.append(literal_column("'{}'::INTEGER[]").label("procedures_array"))
             continue
-        if column.key == "medications_array" and not medications_array_available:
+        if column.key == "medications_array" and not medications_available:
             address_columns.append(literal_column("'{}'::INTEGER[]").label("medications_array"))
             continue
         address_columns.append(address_table.c[column.key])
+    return address_columns
 
-    # Keep the serving-type predicate outside this optimization barrier. On
-    # PostgreSQL 18, combining it with NPI can otherwise select a ZIP-first
-    # partial-index skip scan instead of the direct NPI index.
+
+async def _npi_detail_address_context(
+    *,
+    include_sources: bool,
+    include_evidence: bool,
+    include_location_key: bool,
+    session: Any = None,
+) -> tuple[Any, Any, list[Any]]:
+    filter_capabilities = await _resolve_npi_filter_capabilities(session=session)
+    address_model = await _address_serving_model(
+        _public_address_serving_column_keys()
+        - {"procedures_array", "medications_array"},
+        session=session,
+    )
+    address_table = address_model.__table__
+    existing_columns = await _table_columns(
+        address_model.__tablename__,
+        session=session,
+    )
+    if not existing_columns:
+        existing_columns = _model_table_columns(address_model)
+    allowed_columns = _npi_detail_allowed_address_columns(
+        address_model,
+        include_sources=include_sources,
+        include_evidence=include_evidence,
+        include_location_key=include_location_key,
+    )
+    return (
+        address_model,
+        address_table,
+        _npi_detail_address_columns(
+            address_table,
+            existing_columns,
+            allowed_columns,
+            filter_capabilities,
+        ),
+    )
+
+
+def _npi_detail_address_filters(
+    address_model: Any,
+    address_table: Any,
+    npi: int,
+    address_key: str | None,
+    address_row_identities: Sequence[str] | None,
+) -> list[Any]:
     base_address_filters = [address_table.c.npi == npi]
     if address_model is EntityAddressUnified:
         base_address_filters[0] = func.coalesce(
@@ -12905,9 +13645,19 @@ async def _build_npi_details(
             base_address_filters.append(
                 address_table.c.checksum.in_(selected_checksums)
             )
+    return base_address_filters
+
+
+def _npi_detail_address_subquery(
+    address_model: Any,
+    address_table: Any,
+    address_columns: Sequence[Any],
+    address_filters: Sequence[Any],
+    address_limit: int | None,
+) -> Any:
     npi_address_rows = (
         select(*address_columns)
-        .where(*base_address_filters)
+        .where(*address_filters)
         .offset(0)
         .subquery("npi_address_rows")
     )
@@ -12921,59 +13671,70 @@ async def _build_npi_details(
             npi_address_rows.c.city_name,
         )
     )
-    address_total: int | None = None
-    if address_limit is not None and include_address_total:
-        count_npi_rows = (
-            select(address_table.c.type)
-            .where(*base_address_filters)
-            .offset(0)
-            .subquery("count_npi_address_rows")
-        )
-        count_stmt = select(func.count()).select_from(count_npi_rows).where(
-            _provider_detail_address_type_clause(address_model, count_npi_rows)
-        )
-        if session is not None:
-            total_res = await session.execute(count_stmt)
-            address_total = int(total_res.scalar() or 0)
-        else:
-            try:
-                address_total = int(await db.scalar(count_stmt) or 0)
-            except Exception:  # pragma: no cover - gino fallback when no session bound
-                address_total = None
     if address_limit is not None:
         address_subquery_base = address_subquery_base.limit(address_limit)
     try:
-        address_subquery = address_subquery_base.alias("address_list")
+        return address_subquery_base.alias("address_list")
     except NameError:
-        address_subquery = address_subquery_base
+        return address_subquery_base
 
-    taxonomy_aggregate = (
+
+async def _count_npi_detail_addresses(
+    address_model: Any,
+    address_table: Any,
+    address_filters: Sequence[Any],
+    *,
+    session: Any = None,
+) -> int | None:
+    count_npi_rows = (
+        select(address_table.c.type)
+        .where(*address_filters)
+        .offset(0)
+        .subquery("count_npi_address_rows")
+    )
+    count_statement = select(func.count()).select_from(count_npi_rows).where(
+        _provider_detail_address_type_clause(address_model, count_npi_rows)
+    )
+    if session is not None:
+        query_result = await session.execute(count_statement)
+        return int(query_result.scalar() or 0)
+    try:
+        return int(await db.scalar(count_statement) or 0)
+    except Exception:
+        return None
+
+
+def _npi_detail_taxonomy_aggregate(
+    taxonomy_model: Any,
+    npi: int,
+    alias: str,
+) -> Any:
+    taxonomy_table = taxonomy_model.__table__
+    return (
         select(
             taxonomy_table.c.npi,
             func.json_agg(
-                literal_column(
-                    f'distinct "{NPIDataTaxonomy.__tablename__}"'
-                )
+                literal_column(f'distinct "{taxonomy_model.__tablename__}"')
             ).label("rows"),
         )
         .select_from(taxonomy_table)
         .where(taxonomy_table.c.npi == npi)
         .group_by(taxonomy_table.c.npi)
-        .subquery("taxonomy_aggregate")
+        .subquery(alias)
     )
-    taxonomy_group_aggregate = (
-        select(
-            taxonomy_group_table.c.npi,
-            func.json_agg(
-                literal_column(
-                    f'distinct "{NPIDataTaxonomyGroup.__tablename__}"'
-                )
-            ).label("rows"),
-        )
-        .select_from(taxonomy_group_table)
-        .where(taxonomy_group_table.c.npi == npi)
-        .group_by(taxonomy_group_table.c.npi)
-        .subquery("taxonomy_group_aggregate")
+
+
+def _npi_detail_query(npi: int, address_subquery: Any) -> Any:
+    npi_data_table = NPIData.__table__
+    taxonomy_aggregate = _npi_detail_taxonomy_aggregate(
+        NPIDataTaxonomy,
+        npi,
+        "taxonomy_aggregate",
+    )
+    taxonomy_group_aggregate = _npi_detail_taxonomy_aggregate(
+        NPIDataTaxonomyGroup,
+        npi,
+        "taxonomy_group_aggregate",
     )
     select_columns = [
         npi_data_table,
@@ -13006,11 +13767,54 @@ async def _build_npi_details(
         select_columns.append(address_aggregate.c.rows)
     else:
         select_columns.append(literal_column("NULL::json"))
-    query = (
+    return (
         db.select(*select_columns)
         .select_from(join_clause)
         .where(npi_data_table.c.npi == npi)
     )
+
+
+async def _build_npi_details(
+    npi: int,
+    *,
+    include_sources: bool = False,
+    include_evidence: bool = False,
+    address_limit: int | None = None,
+    include_address_total: bool = True,
+    address_key: str | None = None,
+    address_row_identities: Sequence[str] | None = None,
+    session: Any = None,
+) -> dict:
+    """Assemble one provider identity, taxonomy, and address detail payload."""
+    address_model, address_table, address_columns = await _npi_detail_address_context(
+        include_sources=include_sources,
+        include_evidence=include_evidence,
+        include_location_key=address_row_identities is not None,
+        session=session,
+    )
+    address_filters = _npi_detail_address_filters(
+        address_model,
+        address_table,
+        npi,
+        address_key,
+        address_row_identities,
+    )
+    address_total: int | None = None
+    if address_limit is not None and include_address_total:
+        address_total = await _count_npi_detail_addresses(
+            address_model,
+            address_table,
+            address_filters,
+            session=session,
+        )
+    address_subquery = _npi_detail_address_subquery(
+        address_model,
+        address_table,
+        address_columns,
+        address_filters,
+        address_limit,
+    )
+    query = _npi_detail_query(npi, address_subquery)
 
     if session is not None:
         detail_query_result = await session.execute(query._stmt)
@@ -13019,51 +13823,44 @@ async def _build_npi_details(
         detail_rows = await query.all()
     if not detail_rows:
         return {}
-    result_row = detail_rows[0]
-    provider_detail_map: dict[str, Any] = {
-        "taxonomy_list": [],
-        "taxonomy_group_list": [],
-        "address_list": [],
-    }
-    idx = 0
-    for column in NPIData.__table__.columns:
-        column_value = result_row[idx]
-        idx += 1
-        if (
-            column.key == "do_business_as_text"
-            or column.key in PUBLIC_NPI_EXCLUDED_COLUMNS
-        ):
-            continue
-        provider_detail_map[column.key] = column_value
+    return _npi_detail_from_result_row(
+        detail_rows[0],
+        include_address_rows=True,
+        address_total=address_total,
+    )
 
-    if result_row[idx]:
-        provider_detail_map["taxonomy_list"].extend(_public_nested_taxonomy_rows(result_row[idx]))
-    idx += 1
-    if result_row[idx]:
-        provider_detail_map["taxonomy_group_list"].extend(_public_nested_taxonomy_rows(result_row[idx]))
-    idx += 1
-    if idx < len(result_row) and result_row[idx]:
-        provider_detail_map["address_list"] = result_row[idx]
-    if address_total is not None:
-        provider_detail_map["address_total"] = address_total
-    provider_detail_map["do_business_as"] = provider_detail_map.get("do_business_as") or []
-    return provider_detail_map
+
+async def _fetch_other_names_map(
+    npis: Sequence[int],
+    *,
+    session: Any = None,
+) -> dict[int, list[dict[str, Any]]]:
+    """Fetch and deduplicate other-name rows for many NPIs."""
+    unique_npis = sorted({int(npi) for npi in npis})
+    if not unique_npis:
+        return {}
+    result = await _execute_stmt(
+        select(NPIDataOtherIdentifier).where(
+            NPIDataOtherIdentifier.npi.in_(unique_npis)
+        ),
+        session=session,
+    )
+    rows_by_npi: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    seen_checksums_by_npi: dict[int, set[int]] = defaultdict(set)
+    for row in result.scalars():
+        payload = row.to_json_dict()
+        row_npi = int(payload.pop("npi", None) or row.npi)
+        checksum = payload.pop("checksum", None)
+        if checksum in seen_checksums_by_npi[row_npi]:
+            continue
+        if checksum is not None:
+            seen_checksums_by_npi[row_npi].add(checksum)
+        rows_by_npi[row_npi].append(payload)
+    return dict(rows_by_npi)
 
 
 async def _fetch_other_names(npi: int, *, session: Any = None) -> list[dict[str, Any]]:
-    result = await _execute_stmt(select(NPIDataOtherIdentifier).where(NPIDataOtherIdentifier.npi == npi), session=session)
-    rows: list[dict[str, Any]] = []
-    seen_checksums: set[int] = set()
-    for row in result.scalars():
-        payload = row.to_json_dict()
-        checksum = payload.pop("checksum", None)
-        if checksum in seen_checksums:
-            continue
-        if checksum is not None:
-            seen_checksums.add(checksum)
-        payload.pop("npi", None)
-        rows.append(payload)
-    return rows
+    return (await _fetch_other_names_map([npi], session=session)).get(int(npi), [])
 
 
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE = "provider_directory_address_overlay"
@@ -13290,7 +14087,7 @@ _PROVIDER_DIRECTORY_OVERLAY_QUERY_TEMPLATE = """
                AND current_resource.resource_type = overlay.resource_type
                AND current_resource.resource_id = overlay.resource_id
                AND overlay.last_seen_run_id = current_resource.run_id
-             WHERE overlay.npi = :npi
+             WHERE overlay.npi = ANY(:npis)
                AND (
                    CAST(:address_key AS uuid) IS NULL
                    OR overlay.address_key = CAST(:address_key AS uuid)
@@ -13413,22 +14210,25 @@ def _provider_directory_location_status_sql(
     """
 
 
-async def _fetch_provider_directory_address_overlay(
-    npi: int,
+async def _fetch_provider_directory_address_overlay_map(
+    npis: Sequence[int],
     *,
     address_key: str | None = None,
     address_site_key: str | None = None,
     session: Any = None,
-) -> list[dict[str, Any]]:
-    """Fetch FHIR address evidence with endpoint-aware confirmation counts."""
+) -> dict[int, list[dict[str, Any]]]:
+    """Fetch current FHIR address evidence for many NPIs in one query."""
+    unique_npis = sorted({int(npi) for npi in npis})
+    if not unique_npis:
+        return {}
     if not await _is_table_available(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session):
-        return []
+        return {}
     visibility_table_states = [
         await _is_table_available(table_name, session=session)
         for table_name in PROVIDER_DIRECTORY_VISIBILITY_TABLES
     ]
     if not all(visibility_table_states):
-        return []
+        return {}
     overlay_columns = await _table_columns(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session)
     overlay_query = text(
         _provider_directory_overlay_query_sql(
@@ -13439,12 +14239,12 @@ async def _fetch_provider_directory_address_overlay(
         overlay_query,
         session=session,
         params={
-            "npi": int(npi),
+            "npis": unique_npis,
             "address_key": address_key,
             "address_site_key": address_site_key,
         },
     )
-    overlay_addresses: list[dict[str, Any]] = []
+    overlay_addresses_by_npi: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for overlay_row in overlay_result.all():
         overlay_mapping = getattr(overlay_row, "_mapping", overlay_row)
         overlay_address_by_field = dict(overlay_mapping)
@@ -13454,8 +14254,32 @@ async def _fetch_provider_directory_address_overlay(
             overlay_address_by_field["address_status"] = (
                 UHC_PROVIDER_FILE_ADDRESS_STATUS
             )
-        overlay_addresses.append(overlay_address_by_field)
-    return overlay_addresses
+        overlay_npi = overlay_address_by_field.get("npi")
+        if overlay_npi is None and len(unique_npis) == 1:
+            overlay_npi = unique_npis[0]
+        if overlay_npi is not None:
+            overlay_addresses_by_npi[int(overlay_npi)].append(
+                overlay_address_by_field
+            )
+    return dict(overlay_addresses_by_npi)
+
+
+async def _fetch_provider_directory_address_overlay(
+    npi: int,
+    *,
+    address_key: str | None = None,
+    address_site_key: str | None = None,
+    session: Any = None,
+) -> list[dict[str, Any]]:
+    """Fetch FHIR address evidence with endpoint-aware confirmation counts."""
+    return (
+        await _fetch_provider_directory_address_overlay_map(
+            [npi],
+            address_key=address_key,
+            address_site_key=address_site_key,
+            session=session,
+        )
+    ).get(int(npi), [])
 
 
 def _location_status_query(schema: str, overlay_table_sql: str) -> Any:
