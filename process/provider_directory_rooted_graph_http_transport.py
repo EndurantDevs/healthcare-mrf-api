@@ -393,15 +393,15 @@ def _validate_headers(response: Any) -> int | None:
     )
     parts = [part.strip() for part in content_type.split(";")]
     if not parts or parts[0].casefold() != PROVIDER_DIRECTORY_ROOTED_GRAPH_ACCEPT:
-        raise ProviderDirectoryRootedGraphHTTPError("content_type_invalid")
+        raise ProviderDirectoryRootedGraphHTTPError("content_type_invalid", retryable=True)
     for parameter in parts[1:]:
-        name, separator, value = parameter.partition("=")
+        name, separator, charset = parameter.partition("=")
         if (
             not separator
             or name.strip().casefold() != "charset"
-            or value.strip().strip('"').casefold() not in {"utf-8", "utf8"}
+            or charset.strip().strip('"').casefold() not in {"utf-8", "utf8"}
         ):
-            raise ProviderDirectoryRootedGraphHTTPError("content_type_invalid")
+            raise ProviderDirectoryRootedGraphHTTPError("content_type_invalid", retryable=True)
     return _declared_length(response)
 
 

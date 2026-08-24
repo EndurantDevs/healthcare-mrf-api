@@ -106,7 +106,7 @@ def _response_from_body(
     if isinstance(body, dict):
         body = json.dumps(body, separators=(",", ":")).encode()
     response_headers_by_name = {
-        "Content-Type": "application/fhir+json; charset=utf-8",
+        "Content-Type": "application/fhir+json;charset=UTF-8",
         "Content-Encoding": "identity",
         "Content-Length": str(len(body)),
         **(headers or {}),
@@ -254,7 +254,7 @@ async def test_response_requires_exact_fhir_utf8_media_type(content_type):
     error = await _transport_error(_Session(response))
 
     assert error.code == "content_type_invalid"
-    assert error.is_retryable is False
+    assert error.is_retryable is True
 
 
 @pytest.mark.parametrize("encoding", ["gzip", "br", "deflate", "identity, gzip"])

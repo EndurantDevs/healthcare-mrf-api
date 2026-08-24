@@ -47,7 +47,10 @@ current official dataset and cohort. Repeating the same inputs replays the same
 authority; it does not publish. Exhausted retryable transport work is released,
 cooled down for 60 seconds, and resumed against the same root in the same
 process. A transient Bundle-total mismatch is retried without retaining the
-invalid response. Other validation failures still terminate the root. The
+invalid response. An unexpected response media type is likewise rejected
+before body parsing and retried; an attempt-1 error recorded by the older
+runtime is reclaimed on exact replay. Other validation failures still
+terminate the root. The
 production Job's `activeDeadlineSeconds` bounds repeated cooldown cycles;
 direct invocation continues until completion, another error, or a signal.
 

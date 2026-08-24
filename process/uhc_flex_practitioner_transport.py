@@ -302,17 +302,17 @@ def _validate_response_headers(response: Any, max_response_bytes: int) -> int | 
     )
     content_type_parts = [part.strip() for part in raw_content_type.split(";")]
     if content_type_parts[0].lower() != UHC_FLEX_PRACTITIONER_ACCEPT:
-        raise UHCFlexPractitionerTransportError("content_type_invalid")
+        raise UHCFlexPractitionerTransportError("content_type_invalid", retryable=True)
     for parameter in content_type_parts[1:]:
         if not parameter:
             continue
-        parameter_name, separator, parameter_value = parameter.partition("=")
+        parameter_name, separator, charset = parameter.partition("=")
         if (
             not separator
             or parameter_name.strip().lower() != "charset"
-            or parameter_value.strip().strip('"').lower() not in {"utf-8", "utf8"}
+            or charset.strip().strip('"').lower() not in {"utf-8", "utf8"}
         ):
-            raise UHCFlexPractitionerTransportError("content_type_invalid")
+            raise UHCFlexPractitionerTransportError("content_type_invalid", retryable=True)
     return _declared_content_length(response, max_response_bytes)
 
 

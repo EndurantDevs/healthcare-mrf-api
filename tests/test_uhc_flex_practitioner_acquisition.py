@@ -331,7 +331,9 @@ async def test_transient_failure_releases_before_bounded_retry_after_sleep():
 @pytest.mark.asyncio
 async def test_final_retryable_failure_resumes_same_worker_and_root():
     harness = AcquisitionHarness()
-    retryable_failure = UHCFlexPractitionerTransportError("transport_timeout", retryable=True)
+    retryable_failure = UHCFlexPractitionerTransportError(
+        "content_type_invalid", retryable=True
+    )
     for call_number in (1, 2):
         harness.fetch_failures[("baseline", MEMBER_NPIS[1], call_number)] = retryable_failure
 
