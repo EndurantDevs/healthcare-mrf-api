@@ -3337,6 +3337,33 @@ paths:
             type: boolean
             default: false
           description: Include mailing addresses when applying location filters.
+        - name: specialty
+          in: query
+          schema:
+            type: string
+          description: Specialty text resolved through NUCC and terminology synonyms.
+        - name: classification
+          in: query
+          schema:
+            type: string
+          description: NUCC classification resolved through terminology synonyms.
+        - name: taxonomy_codes
+          in: query
+          schema:
+            type: string
+          description: Comma-separated exact NUCC taxonomy codes.
+        - name: include_subspecialties
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Include NUCC subspecialties when resolving specialty text.
+        - name: primary_only
+          in: query
+          schema:
+            type: boolean
+            default: true
+          description: Restrict taxonomy filters to the NPI primary taxonomy when true.
       responses:
         '200':
           description: Group plan provider page

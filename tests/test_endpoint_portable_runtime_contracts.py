@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -194,6 +195,49 @@ async def test_unified_address_source_reports_optional_capabilities(monkeypatch)
         True,
         True,
     )
+
+
+def test_group_plan_specialty_options_include_subspecialties_and_nonprimary():
+    """Honor the documented group-plan specialty boolean options."""
+
+    specialty_filter = pricing.resolve_provider_specialty_filter(
+        {
+            "classification": "Synthetic Classification",
+            "include_subspecialties": "true",
+            "primary_only": "false",
+        }
+    )
+    parameters_by_name: dict[str, object] = {}
+
+    sql = pricing.provider_specialty_taxonomy_exists_sql(
+        "provider.npi",
+        parameters_by_name,
+        "group_specialty",
+        specialty_filter,
+    )
+
+    assert "group_specialty_nucc.classification" in sql
+    assert "group_specialty_nucc.specialization" not in sql
+    assert "healthcare_provider_primary_taxonomy_switch" not in sql
+    assert parameters_by_name == {
+        "group_specialty_classification": "Synthetic Classification"
+    }
+
+
+@pytest.mark.asyncio
+async def test_group_plan_provider_query_requires_plan_scope():
+    """Reject a group-plan directory query without either plan selector."""
+
+    request = SimpleNamespace(
+        args={},
+        ctx=SimpleNamespace(sa_session=object()),
+    )
+
+    with pytest.raises(
+        pricing.InvalidUsage,
+        match=r"plan_id \(EIN\) or plan_release_id is required",
+    ):
+        await pricing.group_plan_providers(request)
 
 
 @pytest.mark.asyncio
