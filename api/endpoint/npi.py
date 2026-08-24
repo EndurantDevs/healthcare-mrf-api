@@ -9761,8 +9761,13 @@ async def list_providers(request):
                     providers_by_npi[npi_value] = provider_by_field
                     continue
 
-            if providers_by_npi:
-                taxonomy_records = await conn.all(
+        provider_results = list(providers_by_npi.values())
+
+        async def _fetch_search_taxonomy_records() -> list[Any]:
+            if not providers_by_npi:
+                return []
+            async with db.acquire() as taxonomy_conn:
+                return await taxonomy_conn.all(
                     text(
                         "SELECT taxonomy.*, nucc.display_name AS taxonomy_display "
                         "FROM mrf.npi_taxonomy AS taxonomy "
@@ -9773,60 +9778,6 @@ async def list_providers(request):
                     ),
                     provider_npis=sorted(providers_by_npi),
                 )
-                for taxonomy_record in taxonomy_records:
-                    taxonomy_mapping = getattr(
-                        taxonomy_record,
-                        "_mapping",
-                        None,
-                    )
-                    if taxonomy_mapping is None:
-                        taxonomy_mapping = {
-                            column.key: taxonomy_record[index]
-                            for index, column in enumerate(
-                                NPIDataTaxonomy.__table__.columns
-                            )
-                            if index < len(taxonomy_record)
-                        }
-                    taxonomy_npi = taxonomy_mapping.get("npi")
-                    provider_by_field = providers_by_npi.get(taxonomy_npi)
-                    if provider_by_field is None:
-                        continue
-                    taxonomy_by_field = {
-                        column.key: taxonomy_mapping.get(column.key)
-                        for column in NPIDataTaxonomy.__table__.columns
-                        if column.key not in ("npi", "checksum")
-                        and taxonomy_mapping.get(column.key) is not None
-                    }
-                    if taxonomy_mapping.get("taxonomy_display") is not None:
-                        taxonomy_by_field["display"] = taxonomy_mapping.get(
-                            "taxonomy_display"
-                        )
-                    if not taxonomy_by_field:
-                        continue
-                    taxonomy_identity_parts = tuple(
-                        sorted(
-                            (
-                                key,
-                                json.dumps(
-                                    field_value,
-                                    sort_keys=True,
-                                    default=str,
-                                ),
-                            )
-                            for key, field_value in taxonomy_by_field.items()
-                        )
-                    )
-                    taxonomy_identities = provider_by_field.setdefault(
-                        "_taxonomy_identities",
-                        set(),
-                    )
-                    if taxonomy_identity_parts not in taxonomy_identities:
-                        taxonomy_identities.add(taxonomy_identity_parts)
-                        provider_by_field["taxonomy_list"].append(
-                            taxonomy_by_field
-                        )
-
-        provider_results = list(providers_by_npi.values())
 
         async def _fetch_search_enrichment_summary() -> dict[int, dict[str, Any]]:
             if view_mode == "card":
@@ -9841,20 +9792,84 @@ async def list_providers(request):
                 logger.debug("Provider enrichment summary fetch failed: %s", exc)
                 return {}
 
-        _, summary_map = await asyncio.gather(
-            _apply_location_statuses(
-                [
-                    address_candidate
-                    for provider_result in provider_results
-                    for address_candidate in provider_result.get(
-                        "_address_candidates",
-                        [],
-                    )
-                ],
-                session=request_session,
+        search_read_tasks = (
+            asyncio.create_task(_fetch_search_taxonomy_records()),
+            asyncio.create_task(
+                _apply_location_statuses(
+                    [
+                        address_candidate
+                        for provider_result in provider_results
+                        for address_candidate in provider_result.get(
+                            "_address_candidates",
+                            [],
+                        )
+                    ],
+                    session=request_session,
+                )
             ),
-            _fetch_search_enrichment_summary(),
+            asyncio.create_task(_fetch_search_enrichment_summary()),
         )
+        try:
+            taxonomy_records, _, summary_map = await asyncio.gather(
+                *search_read_tasks
+            )
+        except BaseException:
+            for search_read_task in search_read_tasks:
+                search_read_task.cancel()
+            await asyncio.gather(*search_read_tasks, return_exceptions=True)
+            raise
+        for taxonomy_record in taxonomy_records:
+            taxonomy_mapping = getattr(
+                taxonomy_record,
+                "_mapping",
+                None,
+            )
+            if taxonomy_mapping is None:
+                taxonomy_mapping = {
+                    column.key: taxonomy_record[index]
+                    for index, column in enumerate(
+                        NPIDataTaxonomy.__table__.columns
+                    )
+                    if index < len(taxonomy_record)
+                }
+            taxonomy_npi = taxonomy_mapping.get("npi")
+            provider_by_field = providers_by_npi.get(taxonomy_npi)
+            if provider_by_field is None:
+                continue
+            taxonomy_by_field = {
+                column.key: taxonomy_mapping.get(column.key)
+                for column in NPIDataTaxonomy.__table__.columns
+                if column.key not in ("npi", "checksum")
+                and taxonomy_mapping.get(column.key) is not None
+            }
+            if taxonomy_mapping.get("taxonomy_display") is not None:
+                taxonomy_by_field["display"] = taxonomy_mapping.get(
+                    "taxonomy_display"
+                )
+            if not taxonomy_by_field:
+                continue
+            taxonomy_identity_parts = tuple(
+                sorted(
+                    (
+                        key,
+                        json.dumps(
+                            field_value,
+                            sort_keys=True,
+                            default=str,
+                        ),
+                    )
+                    for key, field_value in taxonomy_by_field.items()
+                )
+            )
+            taxonomy_identities = provider_by_field.setdefault(
+                "_taxonomy_identities",
+                set(),
+            )
+            if taxonomy_identity_parts not in taxonomy_identities:
+                taxonomy_identities.add(taxonomy_identity_parts)
+                provider_by_field["taxonomy_list"].append(
+                    taxonomy_by_field
+                )
         for provider_result in provider_results:
             provider_result["do_business_as"] = provider_result.get("do_business_as") or []
             address_candidates = provider_result.pop("_address_candidates", [])
