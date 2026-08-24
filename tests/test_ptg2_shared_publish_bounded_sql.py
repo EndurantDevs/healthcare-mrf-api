@@ -103,6 +103,93 @@ async def test_shared_block_stage_returns_only_bounded_sql_aggregates(monkeypatc
     )
 
 
+@pytest.mark.asyncio
+async def test_shared_block_stage_prepares_hash_access_before_scan_and_cleans_failure(
+    monkeypatch,
+):
+    events = []
+
+    async def record_status(statement):
+        events.append(str(statement).strip())
+
+    async def fail_scan(*_args, **_kwargs):
+        events.append("scan")
+        raise RuntimeError("scan failed")
+
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", record_status)
+    monkeypatch.setattr(ptg2_shared_publish.db, "all", fail_scan)
+
+    with pytest.raises(RuntimeError, match="scan failed"):
+        await publish_shared_block_stage(
+            schema_name="mrf",
+            stage_table="ptg2_v3_block_stage_proof",
+            snapshot_key=42,
+            build_token="build-42",
+        )
+
+    index_name = ptg2_shared_publish._ptg2_snapshot_index_name(
+        "ptg2_v3_block_stage_proof",
+        "block_hash_idx",
+    )
+    assert events == [
+        f'CREATE INDEX IF NOT EXISTS "{index_name}" '
+        'ON "mrf"."ptg2_v3_block_stage_proof" (block_hash) '
+        'WITH (fillfactor = 100);',
+        'ANALYZE "mrf"."ptg2_v3_block_stage_proof" (block_hash);',
+        "scan",
+        'DROP TABLE IF EXISTS "mrf"."ptg2_v3_block_stage_proof";',
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shared_block_stage_releases_hash_index_after_cas_preparation(
+    monkeypatch,
+):
+    status = AsyncMock()
+    select_rows = AsyncMock(side_effect=([], []))
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", status)
+    monkeypatch.setattr(ptg2_shared_publish.db, "all", select_rows)
+
+    await ptg2_shared_publish.prepare_shared_cas_block_stage(
+        schema_name="mrf",
+        stage_table="ptg2_v3_block_stage_proof",
+        snapshot_key=42,
+        build_token="build-42",
+        expected_generation="shared_blocks_v3",
+    )
+
+    index_name = ptg2_shared_publish._ptg2_snapshot_index_name(
+        "ptg2_v3_block_stage_proof",
+        "block_hash_idx",
+    )
+    statements = [str(call.args[0]).strip() for call in status.await_args_list]
+    assert statements[-1] == f'DROP INDEX IF EXISTS "mrf"."{index_name}";'
+    assert select_rows.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last_hash", (None, b"a" * 32))
+async def test_v4_hash_cursor_uses_an_explicit_later_page_range(monkeypatch, last_hash):
+    select_rows = AsyncMock(return_value=[])
+    monkeypatch.setattr(ptg2_shared_publish.db, "all", select_rows)
+
+    await ptg2_shared_publish._v4_stage_hash_batch(
+        schema='"mrf"',
+        stage='"ptg2_v3_block_stage_proof"',
+        last_hash=last_hash,
+    )
+
+    statement = str(select_rows.await_args.args[0])
+    assert "NOT :has_last_hash" not in statement
+    assert ("WHERE staged.block_hash > :last_hash" in statement) == (
+        last_hash is not None
+    )
+    assert select_rows.await_args.kwargs == {
+        "batch_rows": ptg2_shared_publish._SHARED_BLOCK_PUBLISH_BATCH_ROWS,
+        **({"last_hash": last_hash} if last_hash is not None else {}),
+    }
+
+
 def _assert_bounded_stage_publication(
     publication,
     session,

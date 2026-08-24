@@ -44,6 +44,7 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_SHARED_GENERATION,
     lock_v4_shared_layout_for_map_write,
 )
+from process.ptg_parts.snapshot_tables import _ptg2_snapshot_index_name
 
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -223,7 +224,7 @@ SELECT COUNT(*)::bigint,
 _V4_STAGE_HASH_BATCH_SQL = """
 SELECT DISTINCT staged.block_hash
   FROM {schema}.{stage} AS staged
- WHERE (NOT :has_last_hash OR staged.block_hash > :last_hash)
+{cursor_predicate}
  ORDER BY staged.block_hash
  LIMIT :batch_rows
 """
@@ -1961,18 +1962,24 @@ async def _v4_stage_hash_batch(
     stage: str,
     last_hash: bytes | None,
 ) -> tuple[bytes, ...]:
-    rows = await db.all(
+    batch_parameters_by_name = {
+        "batch_rows": _SHARED_BLOCK_PUBLISH_BATCH_ROWS
+    }
+    cursor_predicate = ""
+    if last_hash is not None:
+        cursor_predicate = " WHERE staged.block_hash > :last_hash"
+        batch_parameters_by_name["last_hash"] = last_hash
+    hash_records = await db.all(
         db.text(
             _V4_STAGE_HASH_BATCH_SQL.format(
                 schema=schema,
                 stage=stage,
+                cursor_predicate=cursor_predicate,
             )
         ),
-        has_last_hash=last_hash is not None,
-        last_hash=last_hash or b"",
-        batch_rows=_SHARED_BLOCK_PUBLISH_BATCH_ROWS,
+        **batch_parameters_by_name,
     )
-    hashes = tuple(bytes(row[0]) for row in rows)
+    hashes = tuple(bytes(hash_record[0]) for hash_record in hash_records)
     if (
         hashes != tuple(sorted(set(hashes)))
         or any(len(block_hash) != 32 for block_hash in hashes)
@@ -1991,7 +1998,15 @@ async def _pin_v4_cas_stage(
     build_token: str,
     pin_token: str,
     progress_callback: Callable[[str, int], None],
-) -> None:
+) -> str:
+    block_hash_index = _quote_ident(
+        _ptg2_snapshot_index_name(pin_token, "block_hash_idx")
+    )
+    await db.status(
+        f"CREATE INDEX IF NOT EXISTS {block_hash_index} "
+        f"ON {schema}.{stage} (block_hash) WITH (fillfactor = 100);"
+    )
+    await db.status(f"ANALYZE {schema}.{stage} (block_hash);")
     last_hash: bytes | None = None
     while True:
         block_hashes = await _v4_stage_hash_batch(
@@ -2000,7 +2015,7 @@ async def _pin_v4_cas_stage(
             last_hash=last_hash,
         )
         if not block_hashes:
-            return
+            return block_hash_index
         async with db.transaction() as session:
             await pin_shared_block_hashes(
                 session,
@@ -2106,7 +2121,7 @@ async def prepare_shared_cas_block_stage(
     schema = _quote_ident(_safe_identifier(schema_name))
     stage = _quote_ident(_safe_identifier(stage_table))
     report = progress_callback or _discard_publish_work
-    await _pin_v4_cas_stage(
+    block_hash_index = await _pin_v4_cas_stage(
         schema_name=schema_name,
         schema=schema,
         stage=stage,
@@ -2123,6 +2138,9 @@ async def prepare_shared_cas_block_stage(
             last_hash=last_hash,
         )
         if not block_hashes:
+            await db.status(
+                f"DROP INDEX IF EXISTS {schema}.{block_hash_index};"
+            )
             return
         await _publish_durable_cas_batch(
             schema_name=schema_name,
@@ -2150,7 +2168,7 @@ async def prepare_v4_cas_block_stage(
     schema = _quote_ident(_safe_identifier(schema_name))
     stage = _quote_ident(_safe_identifier(stage_table))
     report = progress_callback or _discard_publish_work
-    await _pin_v4_cas_stage(
+    block_hash_index = await _pin_v4_cas_stage(
         schema_name=schema_name,
         schema=schema,
         stage=stage,
@@ -2167,6 +2185,9 @@ async def prepare_v4_cas_block_stage(
             last_hash=last_hash,
         )
         if not block_hashes:
+            await db.status(
+                f"DROP INDEX IF EXISTS {schema}.{block_hash_index};"
+            )
             return
         await _publish_v4_durable_cas_batch(
             schema_name=schema_name,
