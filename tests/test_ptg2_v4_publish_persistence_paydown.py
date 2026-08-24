@@ -250,11 +250,13 @@ async def test_duplicate_price_readiness_fails_closed(monkeypatch, tmp_path) -> 
             schema_name="mrf",
             manifest_stage_table="manifest",
             price_set_summary_source_count=1,
-            raw_work_directory=tmp_path,
-            serving_run_entries=(),
-            code_dictionary_entries=(),
-            provider_set_metadata_entries=(),
-            expected_source_identities=(),
+            finalizer_inputs=publication._EarlyFinalizerInputs(
+                raw_work_directory=tmp_path,
+                serving_run_entries=(),
+                code_dictionary_entries=(),
+                provider_set_metadata_entries=(),
+                expected_source_identities=(),
+            ),
         )
 
 
