@@ -1,8 +1,10 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import yaml
 from sanic.exceptions import InvalidUsage
 
 from api.endpoint import npi as npi_module
@@ -17,7 +19,19 @@ class _ResultRows:
         return self._rows
 
 
-def test_batch_request_requires_unique_10_digit_npis_and_caps_at_100():
+def test_openapi_documents_npi_batch_contract():
+    operation = yaml.safe_load(Path("doc/openapi.yaml").read_text())["paths"]["/npi/id/batch"]["post"]
+    request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    npi_schema = request_schema["properties"]["npis"]
+    assert npi_schema["uniqueItems"] is True
+    assert "normalization" in npi_schema["description"]
+    response_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    meta_schema = response_schema["properties"]["meta"]
+    assert set(meta_schema["required"]) == {"elapsed_ms", "max_batch_size", "view"}
+    assert meta_schema["properties"]["view"]["enum"] == ["summary"]
+
+
+def test_batch_request_requires_unique_10_digit_npis_and_caps_at_100(monkeypatch):
     normalized = npi_module._normalize_npi_batch_request(
         {"npis": [str(1_000_000_000 + index) for index in range(100)]}
     )
@@ -26,12 +40,33 @@ def test_batch_request_requires_unique_10_digit_npis_and_caps_at_100():
 
     for payload, message in (
         ({"npis": []}, "between 1 and 100"),
-        ({"npis": ["1234567890", "1234567890"]}, "unique"),
+        ({"npis": ["1234567890", 1234567890]}, "unique"),
         ({"npis": ["123"]}, "10-digit"),
         ({"npis": [str(1_000_000_000 + index) for index in range(101)]}, "between 1 and 100"),
     ):
         with pytest.raises(InvalidUsage, match=message):
             npi_module._normalize_npi_batch_request(payload)
+    monkeypatch.setattr(npi_module, "NPI_BATCH_MAX_SIZE", 2)
+    with pytest.raises(InvalidUsage, match="between 1 and 2"):
+        npi_module._normalize_npi_batch_request(
+            {"npis": ["1234567890", "1098765432", "1987654321"]}
+        )
+
+
+def _ranked_batch_addresses(npi):
+    return [
+        {
+            "npi": npi,
+            "type": "primary",
+            "first_line": f"{index} Main Street",
+            "city_name": "Chicago",
+            "state_name": "IL",
+            "postal_code": "60601",
+            "country_code": "US",
+            "_base_row_identities": [f"location:address-{index}"],
+        }
+        for index in range(1, 4)
+    ]
 
 
 @pytest.mark.asyncio
@@ -39,14 +74,8 @@ async def test_batch_uses_set_maps_once_and_preserves_partial_result_order(monke
     found_npi = 1234567890
     missing_npi = 1098765432
     address_map = {
-        "npi": found_npi,
-        "type": "primary",
-        "first_line": "10 Main Street",
-        "city_name": "Chicago",
-        "state_name": "IL",
+        **_ranked_batch_addresses(found_npi)[0],
         "state_code": "IL",
-        "postal_code": "60601",
-        "country_code": "US",
         "address_key": "00000000-0000-0000-0000-000000000001",
         "address_sources": ["nppes"],
     }
@@ -85,6 +114,9 @@ async def test_batch_uses_set_maps_once_and_preserves_partial_result_order(monke
     assert [provider_result["status"] for provider_result in response_map["items"]] == [200, 404]
     assert response_map["found"] == 1
     assert response_map["not_found"] == 1
+    assert response_map["meta"]["max_batch_size"] == npi_module.NPI_BATCH_MAX_SIZE
+    assert response_map["meta"]["view"] == "summary"
+    assert response_map["meta"]["elapsed_ms"] >= 0
     assert response_map["items"][0]["provider"]["address_pagination"] == {
         "limit": 5,
         "offset": 0,
@@ -94,6 +126,73 @@ async def test_batch_uses_set_maps_once_and_preserves_partial_result_order(monke
     }
     for batch_mock in (identity_map, candidate_map, overlay_map, hydration_map, names_map, enrichment_map):
         assert batch_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_address_offset_slices_and_paginates(monkeypatch):
+    npi = 1234567890
+    ranked_addresses = _ranked_batch_addresses(npi)
+    hydration_map = AsyncMock(return_value={npi: [ranked_addresses[1]]})
+    monkeypatch.setattr(npi_module, "_fetch_npi_address_rows_map", hydration_map)
+
+    selected_by_npi = await npi_module._hydrate_npi_batch_addresses(
+        [npi],
+        {npi: ranked_addresses},
+        address_limit=1,
+        address_offset=1,
+        include_sources=False,
+        include_evidence=False,
+        session=None,
+    )
+
+    assert selected_by_npi[npi][0]["first_line"] == "2 Main Street"
+    assert hydration_map.await_args.kwargs["address_row_identities"] == [
+        "location:address-2"
+    ]
+    provider_result, was_found = npi_module._npi_batch_provider_result(
+        npi,
+        {"npi": npi},
+        ranked_addresses,
+        selected_by_npi[npi],
+        [],
+        None,
+        {
+            "address_limit": 1,
+            "address_offset": 1,
+            "include_sources": False,
+            "include_evidence": False,
+        },
+    )
+    assert was_found is True
+    assert provider_result["provider"]["address_pagination"] == {
+        "limit": 1,
+        "offset": 1,
+        "returned": 1,
+        "total": 3,
+        "has_more": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_batch_skips_hydration_without_base_identities(monkeypatch):
+    npi = 1234567890
+    hydration_map = AsyncMock()
+    monkeypatch.setattr(npi_module, "_fetch_npi_address_rows_map", hydration_map)
+    overlay_address_map = {
+        **_ranked_batch_addresses(npi)[0],
+        "_base_row_identities": [],
+    }
+    selected_by_npi = await npi_module._hydrate_npi_batch_addresses(
+        [npi],
+        {npi: [overlay_address_map]},
+        address_limit=1,
+        address_offset=0,
+        include_sources=False,
+        include_evidence=False,
+        session=None,
+    )
+    assert selected_by_npi[npi] == [overlay_address_map]
+    hydration_map.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -3042,6 +3042,7 @@ paths:
               properties:
                 npis:
                   type: array
+                  description: Values must be unique after string/integer normalization.
                   minItems: 1
                   maxItems: 100
                   uniqueItems: true
@@ -3102,6 +3103,19 @@ paths:
                     type: integer
                   meta:
                     type: object
+                    additionalProperties: false
+                    required: [elapsed_ms, max_batch_size, view]
+                    properties:
+                      elapsed_ms:
+                        type: number
+                        format: double
+                        minimum: 0
+                      max_batch_size:
+                        type: integer
+                        enum: [100]
+                      view:
+                        type: string
+                        enum: [summary]
         '400':
           description: Invalid body, NPI list, or shared address options
           content:

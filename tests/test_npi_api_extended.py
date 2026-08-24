@@ -851,9 +851,10 @@ async def test_build_npi_details(monkeypatch):
 @pytest.mark.asyncio
 async def test_fetch_other_names(monkeypatch):
     class FakeRow:
+        npi = 1
+
         def to_json_dict(self):
             return {
-                "npi": 1,
                 "checksum": 2,
                 "other_provider_identifier": "ALT",
             }
