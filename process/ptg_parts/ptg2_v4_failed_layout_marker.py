@@ -10,30 +10,23 @@ from typing import Any, Mapping
 
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_v4_failed_layout_state import (
+    _REFERENCE_FENCE_NAMES,
     json_mapping,
     load_recovery_postconditions,
     load_recovery_records,
     load_reference_counts,
 )
+from process.ptg_parts.ptg2_v4_failed_layout_fence import (
+    load_recovery_attempt_fence,
+)
+from process.ptg_parts.ptg2_v4_stale_metadata_json import canonical_json_digest
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_SHARED_GENERATION,
 )
 
 
-PTG2_V4_FAILED_LAYOUT_RECOVERY_CONTRACT = (
-    "ptg_v4_failed_layout_recovery_v1"
-)
+PTG2_V4_FAILED_LAYOUT_RECOVERY_CONTRACT = "ptg_v4_failed_layout_recovery_v1"
 
-_REFERENCE_FENCE_NAMES = (
-    "bindings",
-    "attestations",
-    "global_pointers",
-    "source_pointers",
-    "plan_pointers",
-    "pins",
-    "scopes",
-    "sources",
-)
 _PHYSICAL_COUNT_NAMES = (
     "fingerprints",
     "mapping_rows",
@@ -47,7 +40,13 @@ _POSTCONDITION_NAMES = {
     "map_roots",
     "map_packs",
     "relation_manifests",
+    "build_pins",
+    "build_pin_lease_groups",
     "dense_rows",
+}
+_LEGACY_POSTCONDITION_NAMES = _POSTCONDITION_NAMES - {
+    "build_pins",
+    "build_pin_lease_groups",
 }
 
 
@@ -88,9 +87,7 @@ def _valid_recovered_at(raw_value: Any) -> str | None:
     if not timestamp_text:
         return None
     try:
-        parsed_at = datetime.fromisoformat(
-            timestamp_text.replace("Z", "+00:00")
-        )
+        parsed_at = datetime.fromisoformat(timestamp_text.replace("Z", "+00:00"))
     except ValueError:
         return None
     return timestamp_text if parsed_at.tzinfo is not None else None
@@ -99,10 +96,15 @@ def _valid_recovered_at(raw_value: Any) -> str | None:
 def _normalized_postconditions(
     marker_by_field: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    postcondition_by_name = json_mapping(
-        marker_by_field.get("postconditions")
-    )
-    if set(postcondition_by_name) != _POSTCONDITION_NAMES:
+    postcondition_by_name = json_mapping(marker_by_field.get("postconditions"))
+    postcondition_names = set(postcondition_by_name)
+    if postcondition_names == _LEGACY_POSTCONDITION_NAMES:
+        postcondition_by_name = {
+            **postcondition_by_name,
+            "build_pins": 0,
+            "build_pin_lease_groups": 0,
+        }
+    elif postcondition_names != _POSTCONDITION_NAMES:
         return None
     normalized_count_by_name = {
         name: _non_negative_int(raw_count)
@@ -113,6 +115,15 @@ def _normalized_postconditions(
     return postcondition_by_name
 
 
+def _is_legacy_marker(marker_by_field: Mapping[str, Any]) -> bool:
+    return (
+        marker_by_field.get("target_digest") is None
+        and marker_by_field.get("candidate_metrics_scope") is None
+        and set(json_mapping(marker_by_field.get("postconditions")))
+        == _LEGACY_POSTCONDITION_NAMES
+    )
+
+
 def _completed_marker(
     *,
     report_by_field: Mapping[str, Any],
@@ -120,10 +131,12 @@ def _completed_marker(
     import_run_id: str,
     snapshot_key: int,
 ) -> dict[str, Any] | None:
-    marker_by_field = json_mapping(
-        report_by_field.get("shared_layout_recovery")
-    )
+    """Return one fully validated durable recovery marker."""
+
+    marker_by_field = json_mapping(report_by_field.get("shared_layout_recovery"))
     digest = _normalized_digest(marker_by_field.get("plan_digest"))
+    target_digest = _normalized_digest(marker_by_field.get("target_digest"))
+    is_legacy_marker = _is_legacy_marker(marker_by_field)
     recovered_at = _valid_recovered_at(marker_by_field.get("recovered_at"))
     candidate_hash_count = _non_negative_int(
         marker_by_field.get("queued_candidate_hashes")
@@ -134,24 +147,23 @@ def _completed_marker(
     cas_payloads_deleted = _non_negative_int(
         marker_by_field.get("cas_payloads_deleted")
     )
-    marker_snapshot_key = _non_negative_int(
-        marker_by_field.get("snapshot_key")
-    )
-    released_layouts = _non_negative_int(
-        marker_by_field.get("released_layouts")
-    )
+    marker_snapshot_key = _non_negative_int(marker_by_field.get("snapshot_key"))
+    released_layouts = _non_negative_int(marker_by_field.get("released_layouts"))
     postcondition_by_name = _normalized_postconditions(marker_by_field)
     if (
         report_by_field.get("shared_layout_abandoned") is not True
         or report_by_field.get("shared_layout_abandonment_deferred") is not False
-        or str(report_by_field.get("shared_snapshot_key") or "")
-        != str(snapshot_key)
-        or marker_by_field.get("contract")
-        != PTG2_V4_FAILED_LAYOUT_RECOVERY_CONTRACT
+        or str(report_by_field.get("shared_snapshot_key") or "") != str(snapshot_key)
+        or marker_by_field.get("contract") != PTG2_V4_FAILED_LAYOUT_RECOVERY_CONTRACT
         or marker_by_field.get("snapshot_id") != snapshot_id
         or marker_by_field.get("import_run_id") != import_run_id
         or marker_snapshot_key != snapshot_key
+        or (
+            marker_by_field.get("candidate_metrics_scope") != "layout_reachability"
+            and not is_legacy_marker
+        )
         or digest is None
+        or (target_digest is None and not is_legacy_marker)
         or recovered_at is None
         or candidate_hash_count is None
         or candidate_stored_bytes is None
@@ -163,6 +175,8 @@ def _completed_marker(
     return {
         **marker_by_field,
         "plan_digest": digest,
+        "candidate_metrics_scope": "layout_reachability",
+        "target_digest": target_digest,
         "recovered_at": recovered_at,
         "queued_candidate_hashes": candidate_hash_count,
         "queued_candidate_stored_bytes": candidate_stored_bytes,
@@ -189,12 +203,9 @@ def _idempotent_response(
         "root_state": None,
         "representation": marker_by_field.get("representation"),
         "reference_counts": dict(count_by_name),
-        "candidate_hash_count": marker_by_field[
-            "queued_candidate_hashes"
-        ],
-        "candidate_stored_bytes": marker_by_field[
-            "queued_candidate_stored_bytes"
-        ],
+        "candidate_hash_count": marker_by_field["queued_candidate_hashes"],
+        "candidate_stored_bytes": marker_by_field["queued_candidate_stored_bytes"],
+        "candidate_metrics_scope": marker_by_field["candidate_metrics_scope"],
         "gates": {
             "durable_recovery_marker": True,
             "physical_ownership_released": True,
@@ -202,13 +213,12 @@ def _idempotent_response(
         },
         "cas_payloads_deleted": 0,
         "plan_digest": marker_by_field["plan_digest"],
+        "target_digest": marker_by_field["target_digest"],
         "executable": False,
         "executed": True,
         "idempotent": True,
         "released_layouts": 1,
-        "queued_candidate_hashes": marker_by_field[
-            "queued_candidate_hashes"
-        ],
+        "queued_candidate_hashes": marker_by_field["queued_candidate_hashes"],
         "queued_candidate_stored_bytes": marker_by_field[
             "queued_candidate_stored_bytes"
         ],
@@ -226,6 +236,7 @@ def completed_recovery_result(
     snapshot_key: int,
     count_by_name: Mapping[str, int],
     postconditions_by_name: Mapping[str, int],
+    attempt_fence_by_field: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     """Return authenticated idempotent evidence only after every zero gate."""
     marker_by_field = _completed_marker(
@@ -233,6 +244,10 @@ def completed_recovery_result(
         snapshot_id=snapshot_id,
         import_run_id=import_run_id,
         snapshot_key=snapshot_key,
+    )
+    fence_marker_by_field = json_mapping(attempt_fence_by_field.get("marker"))
+    needs_sealed_fence = marker_by_field is not None and (
+        marker_by_field["target_digest"] is not None
     )
     if (
         marker_by_field is None
@@ -244,8 +259,22 @@ def completed_recovery_result(
         or run_by_field.get("status") != "failed"
         or any(int(count_by_name.get(name) or 0) for name in _REFERENCE_FENCE_NAMES)
         or any(int(count_by_name.get(name) or 0) for name in _PHYSICAL_COUNT_NAMES)
-        or any(
-            int(count or 0) for count in postconditions_by_name.values()
+        or any(int(count or 0) for count in postconditions_by_name.values())
+        or (
+            needs_sealed_fence
+            and (
+                attempt_fence_by_field.get("snapshot_id") != snapshot_id
+                or attempt_fence_by_field.get("internal_run_id") != import_run_id
+                or attempt_fence_by_field.get("state") != "reconciled"
+                or attempt_fence_by_field.get("reconciled_at") is None
+                or _normalized_digest(attempt_fence_by_field.get("target_digest"))
+                != marker_by_field["target_digest"]
+                or _normalized_digest(attempt_fence_by_field.get("plan_digest"))
+                != marker_by_field["plan_digest"]
+                or _normalized_digest(attempt_fence_by_field.get("marker_digest"))
+                != canonical_json_digest(marker_by_field)
+                or fence_marker_by_field != marker_by_field
+            )
         )
     ):
         return None
@@ -269,14 +298,12 @@ async def load_completed_recovery_result(
 ) -> dict[str, Any] | None:
     """Load replay evidence only when every physical owner row is gone."""
 
-    snapshot_by_field, run_by_field, layout_by_field = (
-        await load_recovery_records(
-            executor,
-            schema_name=schema_name,
-            snapshot_id=snapshot_id,
-            import_run_id=import_run_id,
-            snapshot_key=snapshot_key,
-        )
+    snapshot_by_field, run_by_field, layout_by_field = await load_recovery_records(
+        executor,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        import_run_id=import_run_id,
+        snapshot_key=snapshot_key,
     )
     if layout_by_field:
         return None
@@ -291,6 +318,12 @@ async def load_completed_recovery_result(
         schema_name=schema_name,
         snapshot_key=snapshot_key,
     )
+    attempt_fence_by_field = await load_recovery_attempt_fence(
+        executor,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        import_run_id=import_run_id,
+    )
     return completed_recovery_result(
         snapshot_by_field=snapshot_by_field,
         run_by_field=run_by_field,
@@ -299,6 +332,7 @@ async def load_completed_recovery_result(
         snapshot_key=snapshot_key,
         count_by_name=count_by_name,
         postconditions_by_name=postcondition_by_name,
+        attempt_fence_by_field=attempt_fence_by_field,
     )
 
 
@@ -312,14 +346,16 @@ def _marker_payload(
         "import_run_id": marker_write.import_run_id,
         "snapshot_key": marker_write.snapshot_key,
         "plan_digest": str(marker_write.plan_by_field["plan_digest"]),
+        "target_digest": str(marker_write.plan_by_field["target_digest"]),
         "representation": marker_write.plan_by_field.get("representation"),
         "recovered_at": recovered_at,
         "released_layouts": int(marker_write.released_layouts),
-        "queued_candidate_hashes": int(
-            marker_write.queued_candidate_hashes
-        ),
+        "queued_candidate_hashes": int(marker_write.queued_candidate_hashes),
         "queued_candidate_stored_bytes": int(
             marker_write.queued_candidate_stored_bytes
+        ),
+        "candidate_metrics_scope": str(
+            marker_write.plan_by_field["candidate_metrics_scope"]
         ),
         "cas_payloads_deleted": 0,
         "postconditions": dict(marker_write.postcondition_by_name),

@@ -16,9 +16,41 @@ from process.ptg_parts import ptg2_shared_gc as shared_gc
 from process.ptg_parts import ptg2_source_snapshot_gc as source_snapshot_gc
 from process.ptg_parts import snapshot_cleanup
 
+_BUILD_TOKEN = "a" * 32
+
 
 def _hash(value: int) -> bytes:
     return bytes([value]) * 32
+
+
+class _Executor:
+    def __init__(self, *rows):
+        self.rows = list(rows)
+        self.all_calls: list[tuple[str, dict[str, object]]] = []
+        self.status_calls: list[tuple[str, dict[str, object]]] = []
+
+    async def all(self, statement: str, **params):
+        self.all_calls.append((statement, params))
+        if not self.rows:
+            raise AssertionError("unexpected query")
+        return self.rows.pop(0)
+
+    async def status(self, statement: str, **params):
+        self.status_calls.append((statement, params))
+        return 1
+
+
+def _abandonment_context():
+    return shared_gc._OwnedV4AbandonmentContext(
+        schema_name="mrf",
+        snapshot_key=1,
+        build_token=_BUILD_TOKEN,
+        batch_rows=2,
+        deadline=10.0,
+        statement_timeout_seconds=1.0,
+        monotonic=lambda: 0.0,
+        grace_seconds=60,
+    )
 
 
 def _patch_v4_abandonment_pipeline(

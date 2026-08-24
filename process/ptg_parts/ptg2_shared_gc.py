@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import hashlib
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
@@ -36,9 +37,7 @@ PTG2_V3_BLOCK_GC_MAX_BYTES_ENV = "HLTHPRT_PTG2_V3_BLOCK_GC_MAX_BYTES"
 PTG2_V3_LAYOUT_GC_BATCH_ROWS_ENV = "HLTHPRT_PTG2_V3_LAYOUT_GC_BATCH_ROWS"
 PTG2_V3_BLOCK_GC_MAX_ROWS_ENV = "HLTHPRT_PTG2_V3_BLOCK_GC_MAX_ROWS"
 PTG2_V4_ABANDONMENT_BATCH_ROWS_ENV = "HLTHPRT_PTG2_V4_ABANDONMENT_BATCH_ROWS"
-PTG2_V4_ABANDONMENT_TIMEOUT_SECONDS_ENV = (
-    "HLTHPRT_PTG2_V4_ABANDONMENT_TIMEOUT_SECONDS"
-)
+PTG2_V4_ABANDONMENT_TIMEOUT_SECONDS_ENV = "HLTHPRT_PTG2_V4_ABANDONMENT_TIMEOUT_SECONDS"
 PTG2_V4_ABANDONMENT_STATEMENT_TIMEOUT_SECONDS_ENV = (
     "HLTHPRT_PTG2_V4_ABANDONMENT_STATEMENT_TIMEOUT_SECONDS"
 )
@@ -125,6 +124,14 @@ class PTG2V4AbandonmentOptions:
 
 
 @dataclass(frozen=True)
+class PTG2V4AbandonmentCallbacks:
+    """Bind recovery-only guards to the shared cleanup engine."""
+
+    step_guard: Callable[[Any], Any] | None = None
+    finalize: Callable[[Any, PTG2SharedLayoutGCStats], Any] | None = None
+
+
+@dataclass(frozen=True)
 class _OwnedV4AbandonmentContext:
     schema_name: str
     snapshot_key: int
@@ -141,6 +148,7 @@ class _OwnedV4AbandonmentInventory:
     block_hashes: tuple[bytes, ...]
     stored_bytes: int
     abandonment_token: str
+    build_pin_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -221,9 +229,7 @@ async def missing_migration_owned_tables(
         for table_record in table_records
         if _row_mapping(table_record).get("table_name")
     }
-    return tuple(
-        sorted(set(PTG2_V3_MIGRATION_OWNED_TABLE_NAMES) - present_table_names)
-    )
+    return tuple(sorted(set(PTG2_V3_MIGRATION_OWNED_TABLE_NAMES) - present_table_names))
 
 
 async def require_migration_owned_tables(
@@ -586,15 +592,10 @@ async def _v4_map_pack_batch(
     """Read one ordered batch of persisted V4 map packs."""
 
     return await executor.all(
-        _V4_REACHABLE_PACK_SQL_TEMPLATE.format(
-            schema=_quote_ident(schema_name)
-        ),
+        _V4_REACHABLE_PACK_SQL_TEMPLATE.format(schema=_quote_ident(schema_name)),
         v4_generation=PTG2_V4_SHARED_GENERATION,
         restrict_snapshot_keys=snapshot_keys is not None,
-        snapshot_keys=[
-            int(snapshot_key)
-            for snapshot_key in (snapshot_keys or ())
-        ],
+        snapshot_keys=[int(snapshot_key) for snapshot_key in (snapshot_keys or ())],
         last_snapshot_key=last_coordinate[0],
         last_object_kind=last_coordinate[1],
         last_pack_no=last_coordinate[2],
@@ -613,13 +614,10 @@ def _authenticated_v4_map_payload(
         len(map_block_hash) != 32
         or int(map_pack_by_field.get("format_version") or -1)
         != PTG2_V3_SHARED_FORMAT_VERSION
-        or map_pack_by_field.get("map_object_kind")
-        != PTG2_V4_MAP_BLOCK_KIND
+        or map_pack_by_field.get("map_object_kind") != PTG2_V4_MAP_BLOCK_KIND
         or map_pack_by_field.get("codec") != "none"
-        or int(map_pack_by_field.get("raw_byte_count") or -1)
-        != len(map_payload)
-        or int(map_pack_by_field.get("stored_byte_count") or -1)
-        != len(map_payload)
+        or int(map_pack_by_field.get("raw_byte_count") or -1) != len(map_payload)
+        or int(map_pack_by_field.get("stored_byte_count") or -1) != len(map_payload)
         or shared_block_hash(
             format_version=PTG2_V3_SHARED_FORMAT_VERSION,
             object_kind=PTG2_V4_MAP_BLOCK_KIND,
@@ -647,15 +645,10 @@ def _validated_v4_map_coordinates(
     if not map_coordinates:
         raise RuntimeError("PTG V4 GC found an empty persisted map pack")
     if (
-        int(map_pack_by_field.get("coordinate_count") or -1)
-        != len(map_coordinates)
-        or int(map_pack_by_field.get("map_entry_count") or -1)
-        != len(map_coordinates)
+        int(map_pack_by_field.get("coordinate_count") or -1) != len(map_coordinates)
+        or int(map_pack_by_field.get("map_entry_count") or -1) != len(map_coordinates)
         or int(map_pack_by_field.get("entry_count") or -1)
-        != sum(
-            int(map_coordinate.entry_count)
-            for map_coordinate in map_coordinates
-        )
+        != sum(int(map_coordinate.entry_count) for map_coordinate in map_coordinates)
         or (map_coordinates[0].block_key, map_coordinates[0].fragment_no)
         != (
             int(map_pack_by_field.get("first_block_key")),
@@ -686,9 +679,7 @@ def _v4_map_pack_hashes(
     )
     if coordinate <= last_coordinate:
         raise RuntimeError("PTG V4 GC map-pack ordering is not strict")
-    map_block_hash, map_payload = _authenticated_v4_map_payload(
-        map_pack_by_field
-    )
+    map_block_hash, map_payload = _authenticated_v4_map_payload(map_pack_by_field)
     map_coordinates = _validated_v4_map_coordinates(
         map_pack_by_field,
         object_kind=coordinate[1],
@@ -846,8 +837,11 @@ def _owned_v4_layout_lock_sql(schema: str) -> str:
 def _owned_v4_abandonment_token(build_token: str) -> str:
     """Derive the durable owner marker that prevents failed-build resumption."""
 
+    normalized_token = str(build_token)
+    if re.fullmatch(r"abandon-[0-9a-f]{64}", normalized_token):
+        return normalized_token
     digest = hashlib.sha256(
-        PTG2_V4_ABANDONMENT_TOKEN_DOMAIN + str(build_token).encode("utf-8")
+        PTG2_V4_ABANDONMENT_TOKEN_DOMAIN + normalized_token.encode("utf-8")
     ).hexdigest()
     return f"abandon-{digest}"
 
@@ -1064,9 +1058,7 @@ _LAYOUT_PLAN_SQL_TEMPLATE = """
 def _layout_plan_sql(schema_name: str) -> str:
     """Return bounded read-only SQL for eligible shared-layout accounting."""
 
-    return _LAYOUT_PLAN_SQL_TEMPLATE.format(
-        schema=_quote_ident(schema_name)
-    )
+    return _LAYOUT_PLAN_SQL_TEMPLATE.format(schema=_quote_ident(schema_name))
 
 
 async def _build_layout_release_plan_ready(
@@ -1081,9 +1073,7 @@ async def _build_layout_release_plan_ready(
         _layout_plan_sql(schema_name),
         cleanup_generations=list(PTG2_V3_CLEANUP_GENERATIONS),
         removing_snapshot_ids=list(
-            dict.fromkeys(
-                str(snapshot_id) for snapshot_id in removing_snapshot_ids
-            )
+            dict.fromkeys(str(snapshot_id) for snapshot_id in removing_snapshot_ids)
         ),
         building_max_age_seconds=building_max_age_seconds,
         layout_limit=layout_limit,
@@ -1091,9 +1081,7 @@ async def _build_layout_release_plan_ready(
     aggregate_record = _row_mapping(aggregate_records[0]) if aggregate_records else {}
     eligible_layout_keys = tuple(
         int(layout_key)
-        for layout_key in (
-            aggregate_record.get("eligible_layout_keys") or ()
-        )
+        for layout_key in (aggregate_record.get("eligible_layout_keys") or ())
     )
     v4_hashes = await _v4_reachable_hashes(
         executor,
@@ -1113,8 +1101,7 @@ async def _build_layout_release_plan_ready(
             + v4_stats.candidate_hash_count
         ),
         stored_bytes=(
-            int(aggregate_record.get("stored_bytes") or 0)
-            + v4_stats.stored_bytes
+            int(aggregate_record.get("stored_bytes") or 0) + v4_stats.stored_bytes
         ),
     )
 
@@ -1414,9 +1401,10 @@ def _is_v4_abandonment_statement_timeout(error: BaseException) -> bool:
         type(getattr(error, "orig", None)).__name__,
         type(getattr(getattr(error, "orig", None), "__cause__", None)).__name__,
     }
-    return bool(
-        error_names & {"QueryCanceledError", "QueryCanceled", "OperationalError"}
-    ) and "statement timeout" in str(error).lower()
+    return (
+        bool(error_names & {"QueryCanceledError", "QueryCanceled", "OperationalError"})
+        and "statement timeout" in str(error).lower()
+    )
 
 
 async def _owned_v4_mapping_hashes(
@@ -1494,13 +1482,40 @@ async def _owned_v4_stored_bytes(
         if len(block_records) != len(hash_batch):
             raise RuntimeError("PTG V4 layout references a missing CAS block")
         stored_bytes += sum(
-            int(
-                _row_mapping(block_record).get("stored_byte_count")
-                or 0
-            )
+            int(_row_mapping(block_record).get("stored_byte_count") or 0)
             for block_record in block_records
         )
     return stored_bytes
+
+
+async def _owned_v4_build_pin_token(
+    executor: Any,
+    *,
+    context: _OwnedV4AbandonmentContext,
+) -> str | None:
+    """Return the sole exact build-pin owner or reject ambiguous ownership."""
+
+    schema = _quote_ident(context.schema_name)
+    owner_records = await executor.all(
+        f"""
+        SELECT DISTINCT pin.build_token
+          FROM {schema}.ptg2_block_build_pin AS pin
+         WHERE pin.snapshot_key = :snapshot_key
+         ORDER BY pin.build_token
+         LIMIT 2
+        """,
+        snapshot_key=context.snapshot_key,
+    )
+    if len(owner_records) > 1:
+        raise RuntimeError("owned PTG V4 build-pin ownership is ambiguous")
+    if not owner_records:
+        return None
+    build_pin_token = str(_row_mapping(owner_records[0]).get("build_token") or "")
+    if not build_pin_token or _owned_v4_abandonment_token(
+        build_pin_token
+    ) != _owned_v4_abandonment_token(context.build_token):
+        raise RuntimeError("owned PTG V4 build-pin owner changed")
+    return build_pin_token
 
 
 async def _owned_v4_inventory(
@@ -1544,6 +1559,10 @@ async def _owned_v4_inventory(
             block_hashes=ordered_hashes,
         ),
         abandonment_token=_owned_v4_abandonment_token(context.build_token),
+        build_pin_token=await _owned_v4_build_pin_token(
+            executor,
+            context=context,
+        ),
     )
 
 
@@ -1649,6 +1668,112 @@ async def _delete_owned_v4_dense_batch(
     return len(deleted_rows)
 
 
+def _delete_v4_pin_batch_sql(schema: str) -> str:
+    """Return the atomic exact-owner pin queue/delete statement."""
+
+    return f"""
+        WITH selected AS MATERIALIZED (
+            SELECT pin.pin_token, pin.block_hash
+              FROM {schema}.ptg2_block_build_pin AS pin
+             WHERE pin.snapshot_key = :snapshot_key
+               AND pin.build_token = :build_pin_token
+             ORDER BY pin.pin_token, pin.block_hash
+             LIMIT :batch_rows
+             FOR UPDATE
+        ),
+        locked_blocks AS MATERIALIZED (
+            SELECT block.block_hash
+              FROM {schema}.ptg2_v3_block AS block
+             WHERE block.block_hash IN (
+                    SELECT DISTINCT selected.block_hash FROM selected
+             )
+             ORDER BY block.block_hash
+             FOR KEY SHARE
+        ),
+        queued AS (
+            INSERT INTO {schema}.ptg2_v3_gc_candidate AS candidate
+                (block_hash, eligible_at, queued_at)
+            SELECT locked.block_hash,
+                   transaction_timestamp()
+                       + (:grace_seconds * INTERVAL '1 second'),
+                   transaction_timestamp()
+              FROM locked_blocks AS locked
+            ON CONFLICT (block_hash) DO UPDATE
+                SET eligible_at = GREATEST(
+                    candidate.eligible_at,
+                    EXCLUDED.eligible_at
+                )
+            RETURNING block_hash
+        ),
+        deleted AS (
+            DELETE FROM {schema}.ptg2_block_build_pin AS pin
+             USING selected
+             WHERE pin.snapshot_key = :snapshot_key
+               AND pin.build_token = :build_pin_token
+               AND pin.pin_token = selected.pin_token
+               AND pin.block_hash = selected.block_hash
+               AND (SELECT COUNT(*) FROM locked_blocks) =
+                   (SELECT COUNT(DISTINCT block_hash) FROM selected)
+               AND (SELECT COUNT(*) FROM queued) =
+                   (SELECT COUNT(*) FROM locked_blocks)
+            RETURNING 1
+        )
+        SELECT (SELECT COUNT(*) FROM selected) AS selected_rows,
+               (SELECT COUNT(DISTINCT block_hash) FROM selected)
+                   AS selected_hashes,
+               (SELECT COUNT(*) FROM locked_blocks) AS resolved_hashes,
+               (SELECT COUNT(*) FROM queued) AS queued_hashes,
+               (SELECT COUNT(*) FROM deleted) AS deleted_rows
+    """
+
+
+async def _delete_v4_pin_batch(
+    executor: Any,
+    *,
+    context: _OwnedV4AbandonmentContext,
+    build_pin_token: str,
+) -> int:
+    """Queue and delete one exact-owner build-pin batch atomically."""
+
+    await _set_v4_abandonment_statement_timeout(
+        executor,
+        deadline=context.deadline,
+        monotonic=context.monotonic,
+        statement_timeout_seconds=context.statement_timeout_seconds,
+    )
+    if not await _is_owned_v4_layout_locked(
+        executor,
+        schema_name=context.schema_name,
+        snapshot_key=context.snapshot_key,
+        build_token=context.build_token,
+        claim_abandonment=True,
+    ):
+        raise RuntimeError("owned PTG V4 layout changed during abandonment")
+    if _owned_v4_abandonment_token(build_pin_token) != _owned_v4_abandonment_token(
+        context.build_token
+    ):
+        raise RuntimeError("owned PTG V4 build-pin owner changed")
+    schema = _quote_ident(context.schema_name)
+    result_records = await executor.all(
+        _delete_v4_pin_batch_sql(schema),
+        snapshot_key=context.snapshot_key,
+        build_pin_token=build_pin_token,
+        batch_rows=context.batch_rows,
+        grace_seconds=context.grace_seconds,
+    )
+    result_by_field = _row_mapping(result_records[0] if result_records else None)
+    selected_rows = int(result_by_field.get("selected_rows") or 0)
+    selected_hashes = int(result_by_field.get("selected_hashes") or 0)
+    if int(result_by_field.get("resolved_hashes") or 0) != selected_hashes:
+        raise RuntimeError("PTG V4 build pin references a missing CAS block")
+    if int(result_by_field.get("queued_hashes") or 0) != selected_hashes:
+        raise RuntimeError("owned PTG V4 build-pin candidate queue is incomplete")
+    deleted_rows = int(result_by_field.get("deleted_rows") or 0)
+    if deleted_rows != selected_rows:
+        raise RuntimeError("owned PTG V4 build-pin cleanup changed")
+    return deleted_rows
+
+
 async def _current_owned_v4_hashes(
     executor: Any,
     *,
@@ -1697,9 +1822,7 @@ async def _assert_owned_v4_candidates_complete(
             block_hashes=list(hash_batch),
         )
         if len(candidate_rows) != len(hash_batch):
-            raise RuntimeError(
-                "owned PTG V4 abandonment candidate queue is incomplete"
-            )
+            raise RuntimeError("owned PTG V4 abandonment candidate queue is incomplete")
 
 
 async def _require_owned_v4_dense_cleanup(
@@ -1751,6 +1874,11 @@ async def _delete_owned_v4_layout(
                   FROM {schema}.ptg2_v3_snapshot_binding AS binding
                  WHERE binding.snapshot_key = layout.snapshot_key
            )
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM {schema}.ptg2_block_build_pin AS pin
+                 WHERE pin.snapshot_key = layout.snapshot_key
+           )
         """,
         snapshot_key=context.snapshot_key,
         generation=PTG2_V4_SHARED_GENERATION,
@@ -1782,10 +1910,13 @@ async def _finalize_owned_v4_abandonment(
         claim_abandonment=True,
     ):
         raise RuntimeError("owned PTG V4 layout changed during abandonment")
-    if await _current_owned_v4_hashes(
-        executor,
-        context=context,
-    ) != inventory.block_hashes:
+    if (
+        await _current_owned_v4_hashes(
+            executor,
+            context=context,
+        )
+        != inventory.block_hashes
+    ):
         raise RuntimeError(
             "owned PTG V4 layout reachability changed during abandonment"
         )
@@ -1812,10 +1943,13 @@ async def _finalize_owned_v4_abandonment(
 
 async def _run_owned_v4_abandonment_step(
     operation: Callable[[Any], Any],
+    step_guard: Callable[[Any], Any] | None = None,
 ) -> Any:
     """Run one independently committable failed-layout cleanup step."""
 
     async with db.acquire() as connection:
+        if step_guard is not None:
+            await step_guard(connection)
         return await operation(connection)
 
 
@@ -1837,8 +1971,7 @@ def _owned_v4_abandonment_context(
         build_token=str(build_token),
         batch_rows=_v4_abandonment_batch_rows(controls.batch_rows),
         deadline=(
-            monotonic()
-            + _v4_abandonment_timeout_seconds(controls.timeout_seconds)
+            monotonic() + _v4_abandonment_timeout_seconds(controls.timeout_seconds)
         ),
         statement_timeout_seconds=(
             _v4_abandonment_statement_timeout_seconds(
@@ -1872,6 +2005,7 @@ async def _run_owned_v4_step(
     *,
     context: _OwnedV4AbandonmentContext,
     executor: Any | None,
+    step_guard: Callable[[Any], Any] | None,
 ) -> Any:
     """Run a bounded step on the caller transaction or a fresh connection."""
 
@@ -1880,8 +2014,10 @@ async def _run_owned_v4_step(
         context.monotonic,
     )
     if executor is not None:
+        if step_guard is not None:
+            await step_guard(executor)
         return await operation(executor)
-    return await _run_owned_v4_abandonment_step(operation)
+    return await _run_owned_v4_abandonment_step(operation, step_guard)
 
 
 async def _queue_owned_v4_candidates(
@@ -1890,6 +2026,7 @@ async def _queue_owned_v4_candidates(
     inventory: _OwnedV4AbandonmentInventory,
     executor: Any | None,
     progress_callback: Callable[[str, int], None] | None,
+    step_guard: Callable[[Any], Any] | None,
 ) -> None:
     """Queue every inventory hash in independently committable batches."""
 
@@ -1907,6 +2044,7 @@ async def _queue_owned_v4_candidates(
             ),
             context=context,
             executor=executor,
+            step_guard=step_guard,
         )
         if progress_callback is not None:
             progress_callback("candidate_hashes", int(queued))
@@ -1917,6 +2055,7 @@ async def _delete_owned_v4_dense_rows(
     context: _OwnedV4AbandonmentContext,
     executor: Any | None,
     progress_callback: Callable[[str, int], None] | None,
+    step_guard: Callable[[Any], Any] | None,
 ) -> None:
     """Delete every dense layout table in restartable bounded batches."""
 
@@ -1932,6 +2071,7 @@ async def _delete_owned_v4_dense_rows(
                 ),
                 context=context,
                 executor=executor,
+                step_guard=step_guard,
             )
             if progress_callback is not None and deleted:
                 progress_callback("dense_rows", int(deleted))
@@ -1939,6 +2079,105 @@ async def _delete_owned_v4_dense_rows(
                 break
         if progress_callback is not None:
             progress_callback("dense_tables", 1)
+
+
+async def _delete_owned_v4_build_pins(
+    *,
+    context: _OwnedV4AbandonmentContext,
+    inventory: _OwnedV4AbandonmentInventory,
+    executor: Any | None,
+    progress_callback: Callable[[str, int], None] | None,
+    step_guard: Callable[[Any], Any] | None,
+) -> None:
+    """Delete every exact-owner build pin in restartable bounded batches."""
+
+    if inventory.build_pin_token is None:
+        return
+    while True:
+        deleted = await _run_owned_v4_step(
+            lambda connection: _delete_v4_pin_batch(
+                connection,
+                context=context,
+                build_pin_token=inventory.build_pin_token or "",
+            ),
+            context=context,
+            executor=executor,
+            step_guard=step_guard,
+        )
+        if progress_callback is not None and deleted:
+            progress_callback("build_pins", int(deleted))
+        if deleted < context.batch_rows:
+            return
+
+
+async def _finalize_owned_v4_step(
+    connection: Any,
+    *,
+    context: _OwnedV4AbandonmentContext,
+    inventory: _OwnedV4AbandonmentInventory,
+    finalize_callback: Callable[[Any, PTG2SharedLayoutGCStats], Any] | None,
+) -> PTG2SharedLayoutGCStats:
+    stats = await _finalize_owned_v4_abandonment(
+        connection,
+        context=context,
+        inventory=inventory,
+    )
+    if finalize_callback is not None:
+        await finalize_callback(connection, stats)
+    return stats
+
+
+async def _execute_owned_v4_abandonment(
+    *,
+    context: _OwnedV4AbandonmentContext,
+    executor: Any | None,
+    progress_callback: Callable[[str, int], None] | None,
+    callbacks: PTG2V4AbandonmentCallbacks,
+) -> PTG2SharedLayoutGCStats:
+    """Execute the bounded candidate, pin, dense-row, and layout steps."""
+
+    inventory = await _run_owned_v4_step(
+        lambda connection: _checked_owned_v4_inventory(connection, context),
+        context=context,
+        executor=executor,
+        step_guard=callbacks.step_guard,
+    )
+    if inventory is None:
+        return PTG2SharedLayoutGCStats()
+    await _queue_owned_v4_candidates(
+        context=context,
+        inventory=inventory,
+        executor=executor,
+        progress_callback=progress_callback,
+        step_guard=callbacks.step_guard,
+    )
+    await _delete_owned_v4_build_pins(
+        context=context,
+        inventory=inventory,
+        executor=executor,
+        progress_callback=progress_callback,
+        step_guard=callbacks.step_guard,
+    )
+    await _delete_owned_v4_dense_rows(
+        context=context,
+        executor=executor,
+        progress_callback=progress_callback,
+        step_guard=callbacks.step_guard,
+    )
+    stats = await _run_owned_v4_step(
+        lambda connection: _finalize_owned_v4_step(
+            connection,
+            context=context,
+            inventory=inventory,
+            finalize_callback=callbacks.finalize,
+        ),
+        context=context,
+        executor=executor,
+        step_guard=callbacks.step_guard,
+    )
+    if progress_callback is not None:
+        progress_callback("layouts", stats.logical_layout_count)
+    return stats
 
 
 async def abandon_owned_v4_layout(
@@ -1950,6 +2189,7 @@ async def abandon_owned_v4_layout(
     grace_seconds: int | None = None,
     progress_callback: Callable[[str, int], None] | None = None,
     options: PTG2V4AbandonmentOptions | None = None,
+    callbacks: PTG2V4AbandonmentCallbacks | None = None,
 ) -> PTG2SharedLayoutGCStats:
     """Bound and resume exact failed V4 cleanup without deleting CAS payloads."""
 
@@ -1961,39 +2201,12 @@ async def abandon_owned_v4_layout(
         options=options,
     )
     try:
-        inventory = await _run_owned_v4_step(
-            lambda connection: _checked_owned_v4_inventory(
-                connection,
-                context,
-            ),
-            context=context,
-            executor=executor,
-        )
-        if inventory is None:
-            return PTG2SharedLayoutGCStats()
-        await _queue_owned_v4_candidates(
-            context=context,
-            inventory=inventory,
-            executor=executor,
-            progress_callback=progress_callback,
-        )
-        await _delete_owned_v4_dense_rows(
+        return await _execute_owned_v4_abandonment(
             context=context,
             executor=executor,
             progress_callback=progress_callback,
+            callbacks=callbacks or PTG2V4AbandonmentCallbacks(),
         )
-        stats = await _run_owned_v4_step(
-            lambda connection: _finalize_owned_v4_abandonment(
-                connection,
-                context=context,
-                inventory=inventory,
-            ),
-            context=context,
-            executor=executor,
-        )
-        if progress_callback is not None:
-            progress_callback("layouts", stats.logical_layout_count)
-        return stats
     except Exception as error:
         if _is_v4_abandonment_statement_timeout(error):
             raise PTG2SharedLayoutAbandonmentDeferred(
@@ -2320,7 +2533,9 @@ async def _sweep_ready(
     )
     return PTG2SharedBlockSweepPlan(
         selected_hashes=deleted_hashes,
-        stored_bytes=sum(deleted_bytes_by_hash[block_hash] for block_hash in deleted_hashes),
+        stored_bytes=sum(
+            deleted_bytes_by_hash[block_hash] for block_hash in deleted_hashes
+        ),
     )
 
 
@@ -2425,9 +2640,13 @@ def _non_negative_int(value: str) -> int:
 
 
 async def _amain(argv: Iterable[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Clean PTG V3 shared layouts and blocks.")
+    parser = argparse.ArgumentParser(
+        description="Clean PTG V3 shared layouts and blocks."
+    )
     parser.add_argument("--schema", default=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
-    parser.add_argument("--execute", action="store_true", help="Apply cleanup. Default is dry-run.")
+    parser.add_argument(
+        "--execute", action="store_true", help="Apply cleanup. Default is dry-run."
+    )
     parser.add_argument("--max-layouts", type=_non_negative_int, default=None)
     parser.add_argument("--max-rows", type=_non_negative_int, default=None)
     parser.add_argument("--max-bytes", type=_non_negative_int, default=None)

@@ -24,6 +24,7 @@ from tests.ptg2_shared_gc_test_support import (
 )
 from tests.ptg2_shared_gc_schema_support import _create_gc_block_schema
 
+
 async def _create_gc_layout_schema(connection, schema: str) -> None:
     await connection.status(
         f"CREATE TABLE {schema}.ptg2_snapshot "
@@ -149,15 +150,21 @@ async def _release_and_sweep_gc_fixture(
 
 async def _assert_gc_fixture_storage(database: Database, schema: str) -> None:
     async with database.acquire() as connection:
-        assert await connection.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_layout"
-        ) == 1
-        assert await connection.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_block"
-        ) == 1
-        assert await connection.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate"
-        ) == 0
+        assert (
+            await connection.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_layout"
+            )
+            == 1
+        )
+        assert (
+            await connection.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_v3_block") == 1
+        )
+        assert (
+            await connection.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate"
+            )
+            == 0
+        )
 
 
 _V4_ABANDONMENT_TABLE_TEMPLATES = (
@@ -298,18 +305,9 @@ async def _create_v4_abandonment_schema(
         await connection.status(table_template.format(schema=schema))
 
 
-async def _insert_v4_abandonment_fixture(
-    connection,
-    schema: str,
-    *,
-    build_token: str,
-) -> tuple[bytes, ...]:
-    """Populate one owned V4 layout with three mapped and dense records."""
-
-    block_hashes = tuple(
-        _hash(hash_seed)
-        for hash_seed in (31, 32, 33)
-    )
+async def _insert_v4_layout_and_blocks(
+    connection, schema, build_token, block_hashes, layout_hashes
+):
     await connection.status(
         f"""
         INSERT INTO {schema}.ptg2_v3_snapshot_layout
@@ -318,6 +316,14 @@ async def _insert_v4_abandonment_fixture(
         """,
         generation=shared_gc.PTG2_V4_SHARED_GENERATION,
         build_token=build_token,
+    )
+    await connection.status(
+        f"""
+        INSERT INTO {schema}.ptg2_v3_snapshot_layout
+            (snapshot_key, generation, state, build_token)
+        VALUES (78, :generation, 'building', 'unrelated-build-token')
+        """,
+        generation=shared_gc.PTG2_V4_SHARED_GENERATION,
     )
     await connection.status(
         f"""
@@ -339,16 +345,32 @@ async def _insert_v4_abandonment_fixture(
             block_hash=block_hash,
             payload=block_payload,
         )
-        await connection.status(
-            f"""
-            INSERT INTO {schema}.ptg2_v3_snapshot_block
-                (snapshot_key, object_kind, block_key, fragment_no,
-                 entry_count, block_hash)
-            VALUES (77, 'serving', :block_key, 0, 1, :block_hash)
-            """,
-            block_key=block_key,
-            block_hash=block_hash,
-        )
+        if block_hash in layout_hashes:
+            await connection.status(
+                f"""
+                INSERT INTO {schema}.ptg2_v3_snapshot_block
+                    (snapshot_key, object_kind, block_key, fragment_no,
+                     entry_count, block_hash)
+                VALUES (77, 'serving', :block_key, 0, 1, :block_hash)
+                """,
+                block_key=block_key,
+                block_hash=block_hash,
+            )
+
+
+async def _insert_v4_abandonment_fixture(
+    connection,
+    schema: str,
+    *,
+    build_token: str,
+) -> tuple[bytes, ...]:
+    """Populate one owned V4 layout with pins plus one unrelated owner."""
+
+    layout_hashes = tuple(_hash(hash_seed) for hash_seed in (31, 32, 33))
+    block_hashes = (_hash(0), *layout_hashes)
+    await _insert_v4_layout_and_blocks(
+        connection, schema, build_token, block_hashes, layout_hashes
+    )
     for table_name in shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES:
         await connection.status(
             f"""
@@ -356,6 +378,29 @@ async def _insert_v4_abandonment_fixture(
             VALUES (77), (77), (77)
             """
         )
+    for pin_token in ("stage-a", "stage-b"):
+        for block_hash in block_hashes:
+            await connection.status(
+                f"""
+                INSERT INTO {schema}.ptg2_block_build_pin
+                    (snapshot_key, build_token, pin_token, block_hash,
+                     lease_until)
+                VALUES (77, :build_token, :pin_token, :block_hash,
+                        transaction_timestamp() + INTERVAL '1 hour')
+                """,
+                build_token=build_token,
+                pin_token=pin_token,
+                block_hash=block_hash,
+            )
+    await connection.status(
+        f"""
+        INSERT INTO {schema}.ptg2_block_build_pin
+            (snapshot_key, build_token, pin_token, block_hash, lease_until)
+        VALUES (78, 'unrelated-build-token', 'unrelated-stage', :block_hash,
+                transaction_timestamp() + INTERVAL '1 hour')
+        """,
+        block_hash=block_hashes[0],
+    )
     return block_hashes
 
 
@@ -368,19 +413,25 @@ async def _assert_partial_v4_abandonment(
     """Require a canceled first batch to preserve layout reachability."""
 
     async with database.acquire() as connection:
-        assert await connection.scalar(
-            f"""
-            SELECT build_token
-              FROM {schema}.ptg2_v3_snapshot_layout
-             WHERE snapshot_key = 77
+        claimed_token = await connection.scalar(
+            f"SELECT build_token FROM {schema}.ptg2_v3_snapshot_layout "
+            "WHERE snapshot_key = 77"
+        )
+        counts = (
+            await connection.all(
+                f"""
+            SELECT
+                (SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate),
+                (SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block),
+                (SELECT COUNT(*) FROM {schema}.ptg2_block_build_pin
+                  WHERE snapshot_key = 77),
+                (SELECT COUNT(DISTINCT pin_token)
+                   FROM {schema}.ptg2_block_build_pin WHERE snapshot_key = 77)
             """
-        ) == shared_gc._owned_v4_abandonment_token(build_token)
-        assert await connection.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate"
-        ) == 2
-        assert await connection.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block"
-        ) == 3
+            )
+        )[0]
+        assert claimed_token == shared_gc._owned_v4_abandonment_token(build_token)
+        assert tuple(counts) == (4, 3, 6, 2)
 
 
 async def _assert_completed_v4_abandonment(
@@ -391,37 +442,43 @@ async def _assert_completed_v4_abandonment(
     """Require resumed cleanup to remove layout edges but retain CAS bytes."""
 
     async with database.acquire() as connection:
-        for table_name in (
-            "ptg2_v3_snapshot_layout",
-            "ptg2_v3_snapshot_block",
-        ):
-            assert await connection.scalar(
-                f'SELECT COUNT(*) FROM {schema}."{table_name}"'
-            ) == 0
-        assert await connection.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate"
-        ) == 3
-        assert await connection.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_block"
-        ) == 3
+        counts = (
+            await connection.all(
+                f"""
+            SELECT
+                (SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_layout
+                  WHERE snapshot_key = 77),
+                (SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_layout
+                  WHERE snapshot_key = 78),
+                (SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block),
+                (SELECT COUNT(*) FROM {schema}.ptg2_block_build_pin
+                  WHERE snapshot_key = 77),
+                (SELECT COUNT(*) FROM {schema}.ptg2_block_build_pin
+                  WHERE snapshot_key = 78),
+                (SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate),
+                (SELECT COUNT(*) FROM {schema}.ptg2_v3_block)
+            """
+            )
+        )[0]
+        assert tuple(counts) == (0, 1, 0, 0, 1, 4, 4)
         for table_name in shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES:
-            assert await connection.scalar(
+            count = await connection.scalar(
                 f'SELECT COUNT(*) FROM {schema}."{table_name}"'
-            ) == 0
+            )
+            assert count == 0
         retained_records = await connection.all(
             f"SELECT block_hash FROM {schema}.ptg2_v3_block"
         )
-        assert {
-            bytes(block_record[0])
-            for block_record in retained_records
-        } == set(block_hashes)
+        assert {bytes(block_record[0]) for block_record in retained_records} == set(
+            block_hashes
+        )
 
 
-def _cancel_after_candidate_batch(metric: str, _amount: int) -> None:
-    """Cancel immediately after one candidate batch reports committed."""
+def _cancel_after_build_pin_batch(metric: str, _amount: int) -> None:
+    """Cancel immediately after one build-pin batch reports committed."""
 
-    assert metric == "candidate_hashes"
-    raise asyncio.CancelledError
+    if metric == "build_pins":
+        raise asyncio.CancelledError
 
 
 async def _drop_test_schema_and_disconnect(
@@ -432,8 +489,6 @@ async def _drop_test_schema_and_disconnect(
 
     try:
         async with database.acquire() as connection:
-            await connection.status(
-                f"DROP SCHEMA IF EXISTS {schema} CASCADE"
-            )
+            await connection.status(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
     finally:
         await database.disconnect()

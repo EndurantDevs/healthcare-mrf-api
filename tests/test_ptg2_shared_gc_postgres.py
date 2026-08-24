@@ -26,7 +26,7 @@ from tests.ptg2_shared_gc_postgres_support import (
     _assert_completed_v4_abandonment,
     _assert_gc_fixture_storage,
     _assert_partial_v4_abandonment,
-    _cancel_after_candidate_batch,
+    _cancel_after_build_pin_batch,
     _create_gc_block_schema,
     _create_gc_layout_schema,
     _create_v4_abandonment_schema,
@@ -36,6 +36,7 @@ from tests.ptg2_shared_gc_postgres_support import (
     _insert_v4_abandonment_fixture,
     _release_and_sweep_gc_fixture,
 )
+
 
 @pytest.mark.asyncio
 async def test_real_postgres_v4_abandonment_resumes_after_cancellation(
@@ -49,7 +50,7 @@ async def test_real_postgres_v4_abandonment_resumes_after_cancellation(
     database = Database()
     schema_name = f"ptg2_v4_abandon_{uuid.uuid4().hex}"
     schema = f'"{schema_name}"'
-    build_token = "failed-build-token"
+    build_token = "a" * 32
     await database.connect()
     monkeypatch.setattr(shared_gc, "db", database)
     try:
@@ -68,7 +69,7 @@ async def test_real_postgres_v4_abandonment_resumes_after_cancellation(
                 snapshot_key=77,
                 build_token=build_token,
                 grace_seconds=60,
-                progress_callback=_cancel_after_candidate_batch,
+                progress_callback=_cancel_after_build_pin_batch,
                 options=shared_gc.PTG2V4AbandonmentOptions(batch_rows=2),
             )
         await _assert_partial_v4_abandonment(
@@ -100,7 +101,9 @@ async def test_real_postgres_candidate_scoped_release_and_sweep_sql():
     """Exercise candidate-scoped layout release and block sweep in PostgreSQL."""
 
     if os.getenv("HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST") != "1":
-        pytest.skip("set HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1 for the isolated PostgreSQL test")
+        pytest.skip(
+            "set HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1 for the isolated PostgreSQL test"
+        )
 
     database = Database()
     schema_name = f"ptg2_shared_gc_test_{uuid.uuid4().hex}"
