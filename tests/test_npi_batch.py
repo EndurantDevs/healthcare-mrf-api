@@ -57,6 +57,8 @@ def test_batch_request_requires_unique_10_digit_npis_and_caps_at_100(monkeypatch
 
     for payload, message in (
         ({"npis": []}, "between 1 and 100"),
+        ({"npis": [True]}, "10-digit"),
+        ({"npis": [{}]}, "10-digit"),
         ({"npis": ["1234567890", 1234567890]}, "unique"),
         ({"npis": ["123"]}, "10-digit"),
         ({"npis": [str(1_000_000_000 + index) for index in range(101)]}, "between 1 and 100"),
@@ -68,6 +70,15 @@ def test_batch_request_requires_unique_10_digit_npis_and_caps_at_100(monkeypatch
         npi_module._normalize_npi_batch_request(
             {"npis": ["1234567890", "1098765432", "1987654321"]}
         )
+
+    for payload, message in (
+        (None, "JSON object"),
+        ({"npis": ["1234567890"], "unknown": True}, "unsupported batch field"),
+        ({"npis": ["1234567890"], "address_limit": True}, "address_limit"),
+        ({"npis": ["1234567890"], "include_sources": "true"}, "include_sources"),
+    ):
+        with pytest.raises(InvalidUsage, match=message):
+            npi_module._normalize_npi_batch_request(payload)
 
 
 def _ranked_batch_addresses(npi):
