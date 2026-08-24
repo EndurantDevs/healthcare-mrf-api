@@ -1885,6 +1885,23 @@ async def test_get_npi_query_flags_disable_stored_and_live_geocode(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_address_count_degrades_without_bound_session(monkeypatch):
+    monkeypatch.setattr(
+        npi_module,
+        "db",
+        types.SimpleNamespace(scalar=AsyncMock(side_effect=RuntimeError("offline"))),
+    )
+
+    address_total = await npi_module._count_npi_detail_addresses(
+        npi_module.NPIAddress,
+        npi_module.NPIAddress.__table__,
+        [],
+    )
+
+    assert address_total is None
+
+
+@pytest.mark.asyncio
 async def test_get_npi_cache_tracks_address_serving_relation_identity(
     monkeypatch,
 ):

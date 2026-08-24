@@ -13700,7 +13700,7 @@ async def _count_npi_detail_addresses(
         return int(query_result.scalar() or 0)
     try:
         return int(await db.scalar(count_statement) or 0)
-    except Exception:  # pragma: no cover - gino fallback when no session bound
+    except Exception:
         return None
 
 
