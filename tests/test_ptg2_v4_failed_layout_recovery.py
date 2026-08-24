@@ -11,6 +11,7 @@ import pytest
 
 from process.ptg_parts import ptg2_v4_failed_layout_recovery as recovery
 from process.ptg_parts import ptg2_v4_failed_layout_marker as marker
+from process.ptg_parts import ptg2_v4_failed_layout_owner as owner
 from process.ptg_parts import ptg2_v4_failed_layout_request as request_contract
 from process.ptg_parts import ptg2_v4_failed_layout_state as state
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
@@ -48,7 +49,7 @@ def _failed_owner_fixture() -> tuple[
         "snapshot_key": 491,
         "generation": PTG2_V4_SHARED_GENERATION,
         "state": "building",
-        "build_token": "secret-build-token",
+        "build_token": "a" * 32,
         "published_at": None,
         "root_state": "building",
         "semantic_fingerprint": v4_layout_fingerprint(shared_fingerprint),
@@ -124,7 +125,7 @@ def test_failed_owner_gates_reject_referenced_or_ambiguous_layout(
         )
 
 
-@pytest.mark.parametrize("digest", ("", "g" * 64, "a" * 63))
+@pytest.mark.parametrize("digest", ["", "g" * 64, "a" * 63])
 @pytest.mark.asyncio
 async def test_recovery_execute_rejects_invalid_plan_digest(
     digest: str,
@@ -147,6 +148,8 @@ _ZERO_POSTCONDITION_BY_NAME = {
     "map_roots": 0,
     "map_packs": 0,
     "relation_manifests": 0,
+    "build_pins": 0,
+    "build_pin_lease_groups": 0,
     "dense_rows": 0,
 }
 
@@ -160,11 +163,13 @@ def _completed_report(
         "import_run_id": _RECOVERY_RUN_ID,
         "snapshot_key": 491,
         "plan_digest": "a" * 64,
+        "target_digest": "b" * 64,
         "representation": "direct_v1",
         "recovered_at": "2026-07-24T00:00:00+00:00",
         "released_layouts": 1,
         "queued_candidate_hashes": 3,
         "queued_candidate_stored_bytes": 18,
+        "candidate_metrics_scope": "layout_reachability",
         "cas_payloads_deleted": 0,
         "postconditions": dict(_ZERO_POSTCONDITION_BY_NAME),
         **marker_overrides,
@@ -179,7 +184,10 @@ def _completed_report(
 
 def _completed_result(
     report_by_field: dict[str, object],
+    *,
+    attempt_fence_by_field: dict[str, object] | None = None,
 ) -> dict[str, object] | None:
+    marker_by_field = dict(report_by_field["shared_layout_recovery"])
     return marker.completed_recovery_result(
         snapshot_by_field={
             "snapshot_id": _RECOVERY_SNAPSHOT_ID,
@@ -197,6 +205,17 @@ def _completed_result(
         snapshot_key=491,
         count_by_name={},
         postconditions_by_name=_ZERO_POSTCONDITION_BY_NAME,
+        attempt_fence_by_field=attempt_fence_by_field
+        or {
+            "snapshot_id": _RECOVERY_SNAPSHOT_ID,
+            "internal_run_id": _RECOVERY_RUN_ID,
+            "state": "reconciled",
+            "target_digest": marker_by_field.get("target_digest"),
+            "plan_digest": marker_by_field.get("plan_digest"),
+            "marker_digest": marker.canonical_json_digest(marker_by_field),
+            "marker": marker_by_field,
+            "reconciled_at": "2026-08-24T00:00:00+00:00",
+        },
     )
 
 
@@ -228,6 +247,8 @@ def test_completed_recovery_marker_is_exact_and_idempotent() -> None:
                 "map_roots": 0,
                 "map_packs": 0,
                 "relation_manifests": 0,
+                "build_pins": 0,
+                "build_pin_lease_groups": 0,
                 "dense_rows": 0,
             },
         ),
@@ -239,9 +260,7 @@ def test_completed_recovery_marker_rejects_weak_evidence(
 ) -> None:
     """Reject malformed persisted evidence without raising."""
 
-    replay_by_field = _completed_result(
-        _completed_report(**{field_name: field_value})
-    )
+    replay_by_field = _completed_result(_completed_report(**{field_name: field_value}))
 
     assert replay_by_field is None
 
@@ -250,13 +269,9 @@ def test_state_mapping_helpers_fail_closed() -> None:
     database_record = SimpleNamespace(_mapping={"snapshot_key": 491})
 
     assert state.row_mapping(None) == {}
-    assert state.row_mapping({"snapshot_key": 491}) == {
-        "snapshot_key": 491
-    }
+    assert state.row_mapping({"snapshot_key": 491}) == {"snapshot_key": 491}
     assert state.row_mapping(database_record) == {"snapshot_key": 491}
-    assert state.json_mapping('{"status":"failed"}') == {
-        "status": "failed"
-    }
+    assert state.json_mapping('{"status":"failed"}') == {"status": "failed"}
     assert state.json_mapping("[1]") == {}
     assert state.json_mapping("{") == {}
     assert state.json_mapping(7) == {}
@@ -297,14 +312,63 @@ def test_failed_owner_rejects_malformed_fingerprint() -> None:
         )
 
 
-@pytest.mark.parametrize("lock_outcome", (False, RuntimeError("corrupt")))
+@pytest.mark.asyncio
+async def test_owner_records_can_load_without_layout_lock(monkeypatch) -> None:
+    records = ({"snapshot_id": _RECOVERY_SNAPSHOT_ID}, {}, {})
+    load_mock = AsyncMock(return_value=records)
+    monkeypatch.setattr(owner, "load_recovery_records", load_mock)
+
+    assert await owner._owner_records(
+        object(),
+        schema_name="mrf",
+        snapshot_id=_RECOVERY_SNAPSHOT_ID,
+        import_run_id=_RECOVERY_RUN_ID,
+        snapshot_key=491,
+        lock_owned_layout=False,
+    ) == records
+
+    load_mock.assert_awaited_once()
+    assert load_mock.await_args.kwargs["lock_logical_owner"] is False
+
+
+@pytest.mark.asyncio
+async def test_owner_records_reloads_after_locked_layout(monkeypatch) -> None:
+    first_records = ({}, {}, {"build_token": "owned"})
+    second_records = ({"snapshot_id": _RECOVERY_SNAPSHOT_ID}, {}, {})
+    load_mock = AsyncMock(side_effect=(first_records, second_records))
+    monkeypatch.setattr(
+        owner,
+        "load_recovery_records",
+        load_mock,
+    )
+    monkeypatch.setattr(
+        owner,
+        "_is_owned_v4_layout_locked",
+        AsyncMock(return_value=True),
+    )
+
+    assert await owner._owner_records(
+        object(),
+        schema_name="mrf",
+        snapshot_id=_RECOVERY_SNAPSHOT_ID,
+        import_run_id=_RECOVERY_RUN_ID,
+        snapshot_key=491,
+        lock_owned_layout=True,
+    ) == second_records
+    assert [
+        call.kwargs["lock_logical_owner"]
+        for call in load_mock.await_args_list
+    ] == [True, False]
+
+
+@pytest.mark.parametrize("lock_outcome", [False, RuntimeError("corrupt")])
 @pytest.mark.asyncio
 async def test_owner_lock_failures_become_recovery_conflicts(
     monkeypatch,
     lock_outcome: object,
 ) -> None:
     monkeypatch.setattr(
-        recovery,
+        owner,
         "load_recovery_records",
         AsyncMock(return_value=({}, {}, {"build_token": "owned"})),
     )
@@ -313,10 +377,10 @@ async def test_owner_lock_failures_become_recovery_conflicts(
         if isinstance(lock_outcome, Exception)
         else AsyncMock(return_value=lock_outcome)
     )
-    monkeypatch.setattr(recovery, "_is_owned_v4_layout_locked", lock_mock)
+    monkeypatch.setattr(owner, "_is_owned_v4_layout_locked", lock_mock)
 
     with pytest.raises(recovery.PTG2V4RecoveryConflict):
-        await recovery._owner_records(
+        await owner._owner_records(
             object(),
             schema_name="mrf",
             snapshot_id=_RECOVERY_SNAPSHOT_ID,
@@ -357,52 +421,21 @@ async def test_recovery_rejects_missing_cas_blocks(monkeypatch) -> None:
 
 
 def _recovery_context() -> recovery._RecoveryContext:
+    build_token = "a" * 32
     return recovery._RecoveryContext(
         snapshot_id=_RECOVERY_SNAPSHOT_ID,
         import_run_id=_RECOVERY_RUN_ID,
         snapshot_key=491,
-        build_token="owned",
+        build_token=build_token,
         expected_report={},
-        plan_by_field={"plan_digest": "a" * 64},
+        plan_by_field={
+            "plan_digest": "a" * 64,
+            "target_digest": "b" * 64,
+            "candidate_metrics_scope": "layout_reachability",
+        },
+        fence_nonce="11111111-1111-1111-1111-111111111111",
+        fence_created_at="2026-08-24T00:00:00+00:00",
     )
-
-
-@pytest.mark.parametrize(
-    ("released_layouts", "postcondition_by_name", "message"),
-    (
-        (0, {}, "ownership changed"),
-        (1, {"layouts": 1}, "left physical ownership rows"),
-    ),
-)
-@pytest.mark.asyncio
-async def test_release_context_rejects_changed_physical_state(
-    monkeypatch,
-    released_layouts: int,
-    postcondition_by_name: dict[str, int],
-    message: str,
-) -> None:
-    monkeypatch.setattr(
-        recovery,
-        "abandon_writable_v4_layout",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                logical_layout_count=released_layouts,
-                candidate_hash_count=0,
-                stored_bytes=0,
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        recovery,
-        "load_recovery_postconditions",
-        AsyncMock(return_value=postcondition_by_name),
-    )
-    with pytest.raises(RuntimeError, match=message):
-        await recovery._release_recovery_context(
-            object(),
-            schema_name="mrf",
-            context=_recovery_context(),
-        )
 
 
 @pytest.mark.asyncio
@@ -413,7 +446,11 @@ async def test_marker_persistence_requires_one_failed_run() -> None:
         import_run_id=_RECOVERY_RUN_ID,
         snapshot_key=491,
         expected_report_by_field={},
-        plan_by_field={"plan_digest": "a" * 64},
+        plan_by_field={
+            "plan_digest": "a" * 64,
+            "target_digest": "b" * 64,
+            "candidate_metrics_scope": "layout_reachability",
+        },
         released_layouts=1,
         queued_candidate_hashes=0,
         queued_candidate_stored_bytes=0,

@@ -10,7 +10,8 @@ from typing import Any, Mapping
 
 from db.connection import db
 from process.ptg_parts.ptg2_shared_gc import (
-    _is_owned_v4_layout_locked,
+    PTG2SharedLayoutGCStats,
+    _owned_v4_abandonment_token,
     _v4_reachable_hashes,
     require_migration_owned_tables,
     resolve_ptg2_schema,
@@ -18,13 +19,21 @@ from process.ptg_parts.ptg2_shared_gc import (
 from process.ptg_parts.ptg2_v4_failed_layout_fence import (
     PTG2V4RecoveryConflict,
     abandon_writable_v4_layout,
+    load_recovery_attempt_fence,
+    lock_active_recovery_fence,
+    require_active_recovery_fence,
+    seal_recovery_attempt_fence,
 )
 from process.ptg_parts.ptg2_v4_failed_layout_state import (
     json_mapping,
     load_block_stats,
     load_recovery_postconditions,
-    load_recovery_records,
     load_reference_counts,
+)
+from process.ptg_parts.ptg2_v4_failed_layout_owner import (
+    _owner_records,
+    _require_failed_owner,
+    _require_recovery_build_token,
 )
 from process.ptg_parts.ptg2_v4_failed_layout_marker import (
     PTG2_V4_FAILED_LAYOUT_RECOVERY_CONTRACT,
@@ -37,10 +46,12 @@ from process.ptg_parts.ptg2_v4_failed_layout_request import (
     normalize_plan_digest,
     normalize_recovery_request,
 )
+from process.ptg_parts.ptg2_v4_stale_metadata_json import canonical_json_digest
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_SHARED_GENERATION,
-    v4_layout_fingerprint,
 )
+
+
 @dataclass(frozen=True)
 class _RecoveryContext:
     snapshot_id: str
@@ -49,162 +60,8 @@ class _RecoveryContext:
     build_token: str
     expected_report: dict[str, Any]
     plan_by_field: dict[str, Any]
-
-
-def _has_no_references(count_by_name: Mapping[str, int]) -> bool:
-    return all(
-        int(count_by_name.get(count_name) or 0) == 0
-        for count_name in (
-            "bindings",
-            "attestations",
-            "global_pointers",
-            "source_pointers",
-            "plan_pointers",
-            "pins",
-            "scopes",
-            "sources",
-        )
-    )
-
-
-def _failed_owner_gate_map(
-    *,
-    snapshot_by_field: Mapping[str, Any],
-    run_by_field: Mapping[str, Any],
-    layout_by_field: Mapping[str, Any],
-    report_by_field: Mapping[str, Any],
-    owner_ids: tuple[str, str, int],
-    count_by_name: Mapping[str, int],
-    expected_fingerprint: bytes,
-) -> dict[str, Any]:
-    snapshot_id, import_run_id, snapshot_key = owner_ids
-    observed_fingerprint = bytes(
-        layout_by_field.get("semantic_fingerprint") or b""
-    )
-    return {
-        "snapshot_failed": (
-            snapshot_by_field.get("snapshot_id") == snapshot_id
-            and snapshot_by_field.get("import_run_id") == import_run_id
-            and snapshot_by_field.get("status") == "failed"
-            and snapshot_by_field.get("published_at") is None
-        ),
-        "import_run_failed": (
-            run_by_field.get("import_run_id") == import_run_id
-            and run_by_field.get("status") == "failed"
-        ),
-        "report_matches_layout": (
-            str(report_by_field.get("shared_snapshot_key") or "")
-            == str(snapshot_key)
-            and report_by_field.get("shared_layout_abandoned") is False
-            and report_by_field.get("shared_layout_abandonment_deferred")
-            is True
-        ),
-        "layout_owned_building_v4": (
-            int(layout_by_field.get("snapshot_key") or 0) == snapshot_key
-            and layout_by_field.get("generation") == PTG2_V4_SHARED_GENERATION
-            and layout_by_field.get("state") == "building"
-            and bool(layout_by_field.get("build_token"))
-            and layout_by_field.get("published_at") is None
-            and layout_by_field.get("root_state") in (None, "building")
-        ),
-        "fingerprint_matches_report": (
-            len(observed_fingerprint) == 32
-            and observed_fingerprint == expected_fingerprint
-        ),
-        "single_fingerprint": (
-            int(count_by_name.get("fingerprints") or 0) == 1
-        ),
-        "unreferenced": _has_no_references(count_by_name),
-    }
-
-
-def _require_failed_owner(
-    *,
-    snapshot_by_field: Mapping[str, Any],
-    run_by_field: Mapping[str, Any],
-    layout_by_field: Mapping[str, Any],
-    snapshot_id: str,
-    import_run_id: str,
-    snapshot_key: int,
-    count_by_name: Mapping[str, int],
-) -> dict[str, Any]:
-    """Validate the failed logical owner and every no-reference fence."""
-
-    report_by_field = json_mapping(run_by_field.get("report"))
-    raw_fingerprint_hex = str(
-        report_by_field.get("shared_semantic_fingerprint") or ""
-    ).strip()
-    try:
-        expected_fingerprint = v4_layout_fingerprint(
-            bytes.fromhex(raw_fingerprint_hex)
-        )
-    except ValueError as exc:
-        raise PTG2V4RecoveryConflict(
-            "failed import report has no valid shared semantic fingerprint"
-        ) from exc
-    gate_by_name = _failed_owner_gate_map(
-        snapshot_by_field=snapshot_by_field,
-        run_by_field=run_by_field,
-        layout_by_field=layout_by_field,
-        report_by_field=report_by_field,
-        owner_ids=(snapshot_id, import_run_id, snapshot_key),
-        count_by_name=count_by_name,
-        expected_fingerprint=expected_fingerprint,
-    )
-    failed_gates = sorted(
-        gate_name
-        for gate_name, is_passed in gate_by_name.items()
-        if not is_passed
-    )
-    if failed_gates:
-        raise PTG2V4RecoveryConflict(
-            "failed PTG V4 layout recovery gates did not pass: "
-            + ", ".join(failed_gates)
-        )
-    return gate_by_name
-
-
-async def _owner_records(
-    executor: Any,
-    *,
-    schema_name: str,
-    snapshot_id: str,
-    import_run_id: str,
-    snapshot_key: int,
-    lock_owned_layout: bool,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    owner_records = await load_recovery_records(
-        executor,
-        schema_name=schema_name,
-        snapshot_id=snapshot_id,
-        import_run_id=import_run_id,
-        snapshot_key=snapshot_key,
-        lock_logical_owner=lock_owned_layout,
-    )
-    if not lock_owned_layout:
-        return owner_records
-    layout_by_field = owner_records[2]
-    try:
-        is_locked = await _is_owned_v4_layout_locked(
-            executor,
-            schema_name=schema_name,
-            snapshot_key=snapshot_key,
-            build_token=str(layout_by_field.get("build_token") or ""),
-        )
-    except RuntimeError as exc:
-        raise PTG2V4RecoveryConflict(str(exc)) from exc
-    if not is_locked:
-        raise PTG2V4RecoveryConflict(
-            "failed PTG V4 layout ownership changed"
-        )
-    return await load_recovery_records(
-        executor,
-        schema_name=schema_name,
-        snapshot_id=snapshot_id,
-        import_run_id=import_run_id,
-        snapshot_key=snapshot_key,
-        lock_logical_owner=False,
-    )
+    fence_nonce: str
+    fence_created_at: Any
 
 
 def _plan_digest(
@@ -213,8 +70,8 @@ def _plan_digest(
 ) -> str:
     digest_by_field = {
         **dict(plan_by_field),
-        "build_token_sha256": hashlib.sha256(
-            str(build_token).encode("utf-8")
+        "abandonment_token_sha256": hashlib.sha256(
+            _owned_v4_abandonment_token(build_token).encode("utf-8")
         ).hexdigest(),
     }
     encoded = json.dumps(
@@ -253,22 +110,33 @@ async def _verified_block_stats(
 
 def _recovery_plan(
     *,
-    snapshot_id: str,
-    import_run_id: str,
-    snapshot_key: int,
+    owner_ids: tuple[str, str, int],
     layout_by_field: Mapping[str, Any],
     count_by_name: Mapping[str, int],
     stats_by_name: Mapping[str, int],
     gate_by_name: Mapping[str, Any],
     build_token: str,
+    fence_by_field: Mapping[str, Any],
 ) -> dict[str, Any]:
+    snapshot_id, import_run_id, snapshot_key = owner_ids
     plan_by_field = {
         "contract": PTG2_V4_FAILED_LAYOUT_RECOVERY_CONTRACT,
         "snapshot_id": snapshot_id,
         "import_run_id": import_run_id,
         "snapshot_key": snapshot_key,
+        "target_digest": canonical_json_digest(
+            {
+                "contract": PTG2_V4_FAILED_LAYOUT_RECOVERY_CONTRACT,
+                "snapshot_id": snapshot_id,
+                "import_run_id": import_run_id,
+                "snapshot_key": snapshot_key,
+            }
+        ),
         "generation": str(layout_by_field["generation"]),
         "layout_state": str(layout_by_field["state"]),
+        "semantic_fingerprint_sha256": hashlib.sha256(
+            bytes(layout_by_field["semantic_fingerprint"])
+        ).hexdigest(),
         "root_state": layout_by_field.get("root_state"),
         "representation": layout_by_field.get("representation"),
         "created_at": layout_by_field.get("created_at"),
@@ -279,6 +147,13 @@ def _recovery_plan(
         "candidate_stored_bytes": stats_by_name["stored_bytes"],
         "gates": dict(gate_by_name),
         "cas_payloads_deleted": 0,
+        "candidate_metrics_scope": "layout_reachability",
+        "attempt_fence": {
+            "nonce_sha256": hashlib.sha256(
+                str(fence_by_field["fence_nonce"]).encode("utf-8")
+            ).hexdigest(),
+            "created_at": fence_by_field["created_at"],
+        },
         "executable": True,
     }
     plan_by_field["plan_digest"] = _plan_digest(plan_by_field, build_token)
@@ -292,6 +167,7 @@ async def _build_context(
     snapshot_id: str,
     import_run_id: str,
     snapshot_key: int,
+    fence_by_field: Mapping[str, Any],
     lock_owned_layout: bool = False,
 ) -> _RecoveryContext:
     """Build one token-bound plan from authenticated logical and CAS state."""
@@ -321,20 +197,17 @@ async def _build_context(
         count_by_name=count_by_name,
     )
     stats_by_name = await _verified_block_stats(
-        executor,
-        schema_name=schema_name,
-        snapshot_key=snapshot_key,
+        executor, schema_name=schema_name, snapshot_key=snapshot_key
     )
-    build_token = str(layout_by_field["build_token"])
+    build_token = _require_recovery_build_token(layout_by_field["build_token"])
     plan_by_field = _recovery_plan(
-        snapshot_id=snapshot_id,
-        import_run_id=import_run_id,
-        snapshot_key=snapshot_key,
+        owner_ids=(snapshot_id, import_run_id, snapshot_key),
         layout_by_field=layout_by_field,
         count_by_name=count_by_name,
         stats_by_name=stats_by_name,
         gate_by_name=gate_by_name,
         build_token=build_token,
+        fence_by_field=fence_by_field,
     )
     return _RecoveryContext(
         snapshot_id=snapshot_id,
@@ -343,6 +216,8 @@ async def _build_context(
         build_token=build_token,
         expected_report=json_mapping(run_by_field.get("report")),
         plan_by_field=plan_by_field,
+        fence_nonce=str(fence_by_field["fence_nonce"]),
+        fence_created_at=fence_by_field["created_at"],
     )
 
 
@@ -372,11 +247,22 @@ async def plan_ptg2_v4_recovery(
         )
         if completed is not None:
             return completed
+        fence_by_field = require_active_recovery_fence(
+            await load_recovery_attempt_fence(
+                connection,
+                schema_name=schema_name,
+                snapshot_id=snapshot_id,
+                import_run_id=import_run_id,
+            ),
+            snapshot_id=snapshot_id,
+            import_run_id=import_run_id,
+        )
         context = await _build_context(
             connection,
             schema_name=schema_name,
             snapshot_id=snapshot_id,
             import_run_id=import_run_id,
+            fence_by_field=fence_by_field,
             snapshot_key=snapshot_key,
         )
     return context.plan_by_field
@@ -387,35 +273,69 @@ def _require_matching_digest(
     normalized_digest: str,
 ) -> None:
     if plan_by_field["plan_digest"] != normalized_digest:
-        raise PTG2V4RecoveryConflict(
-            "failed PTG V4 layout recovery plan changed"
-        )
+        raise PTG2V4RecoveryConflict("failed PTG V4 layout recovery plan changed")
 
 
-async def _release_recovery_context(
+async def _guard_recovery_step(
     connection: Any,
     *,
     schema_name: str,
     context: _RecoveryContext,
-) -> dict[str, Any]:
-    abandonment = await abandon_writable_v4_layout(
-        connection, schema_name=schema_name,
-        snapshot_id=context.snapshot_id, import_run_id=context.import_run_id,
-        snapshot_key=context.snapshot_key, build_token=context.build_token,
+) -> None:
+    """Revalidate the exact logical owner before every committed batch."""
+
+    snapshot_by_field, run_by_field, layout_by_field = await _owner_records(
+        connection,
+        schema_name=schema_name,
+        snapshot_id=context.snapshot_id,
+        import_run_id=context.import_run_id,
+        snapshot_key=context.snapshot_key,
+        lock_owned_layout=True,
     )
-    if abandonment.logical_layout_count != 1:
+    if json_mapping(run_by_field.get("report")) != context.expected_report:
         raise PTG2V4RecoveryConflict(
-            "failed PTG V4 layout ownership changed"
+            "failed PTG V4 layout recovery owner report changed"
         )
+    count_by_name = await load_reference_counts(
+        connection,
+        schema_name=schema_name,
+        snapshot_id=context.snapshot_id,
+        snapshot_key=context.snapshot_key,
+    )
+    _require_failed_owner(
+        snapshot_by_field=snapshot_by_field,
+        run_by_field=run_by_field,
+        layout_by_field=layout_by_field,
+        snapshot_id=context.snapshot_id,
+        import_run_id=context.import_run_id,
+        snapshot_key=context.snapshot_key,
+        count_by_name=count_by_name,
+    )
+    if str(layout_by_field.get("build_token") or "") not in {
+        context.build_token,
+        _owned_v4_abandonment_token(context.build_token),
+    }:
+        raise PTG2V4RecoveryConflict("failed PTG V4 layout ownership changed")
+
+
+async def _finalize_recovery_step(
+    connection: Any,
+    *,
+    schema_name: str,
+    context: _RecoveryContext,
+    abandonment: PTG2SharedLayoutGCStats,
+) -> None:
+    """Persist the marker and seal its attempt fence with layout deletion."""
+
+    if abandonment.logical_layout_count != 1:
+        raise PTG2V4RecoveryConflict("failed PTG V4 layout ownership changed")
     postcondition_by_name = await load_recovery_postconditions(
         connection,
         schema_name=schema_name,
         snapshot_key=context.snapshot_key,
     )
     if any(postcondition_by_name.values()):
-        raise RuntimeError(
-            "failed PTG V4 layout recovery left physical ownership rows"
-        )
+        raise RuntimeError("failed PTG V4 layout recovery left physical ownership rows")
     marker_by_field = await persist_recovery_marker(
         connection,
         schema_name=schema_name,
@@ -431,15 +351,61 @@ async def _release_recovery_context(
             postcondition_by_name=postcondition_by_name,
         ),
     )
-    return {
-        **context.plan_by_field,
-        "executed": True,
-        "released_layouts": abandonment.logical_layout_count,
-        "queued_candidate_hashes": abandonment.candidate_hash_count,
-        "queued_candidate_stored_bytes": abandonment.stored_bytes,
-        "postconditions": postcondition_by_name,
-        "recovered_at": marker_by_field["recovered_at"],
-    }
+    await seal_recovery_attempt_fence(
+        connection,
+        schema_name=schema_name,
+        snapshot_id=context.snapshot_id,
+        import_run_id=context.import_run_id,
+        expected_fence_nonce=context.fence_nonce,
+        expected_fence_created_at=context.fence_created_at,
+        marker_by_field=marker_by_field,
+    )
+
+
+async def _release_recovery_context(
+    *,
+    schema_name: str,
+    context: _RecoveryContext,
+) -> dict[str, Any]:
+    """Run restartable cleanup and reload its sealed durable evidence."""
+
+    abandonment = await abandon_writable_v4_layout(
+        schema_name=schema_name,
+        snapshot_id=context.snapshot_id,
+        import_run_id=context.import_run_id,
+        snapshot_key=context.snapshot_key,
+        build_token=context.build_token,
+        expected_fence_by_field={
+            "fence_nonce": context.fence_nonce,
+            "created_at": context.fence_created_at,
+        },
+        step_guard=lambda connection: _guard_recovery_step(
+            connection,
+            schema_name=schema_name,
+            context=context,
+        ),
+        finalize_callback=lambda connection, stats: _finalize_recovery_step(
+            connection,
+            schema_name=schema_name,
+            context=context,
+            abandonment=stats,
+        ),
+    )
+    if abandonment.logical_layout_count != 1:
+        raise PTG2V4RecoveryConflict("failed PTG V4 layout ownership changed")
+    async with db.acquire() as connection:
+        completed = await load_completed_recovery_result(
+            connection,
+            schema_name=schema_name,
+            snapshot_id=context.snapshot_id,
+            import_run_id=context.import_run_id,
+            snapshot_key=context.snapshot_key,
+        )
+    if completed is None:
+        raise RuntimeError(
+            "failed PTG V4 layout recovery did not seal durable evidence"
+        )
+    return completed
 
 
 async def recover_ptg2_v4_layout(
@@ -472,20 +438,26 @@ async def recover_ptg2_v4_layout(
         if completed is not None:
             _require_matching_digest(completed, normalized_digest)
             return completed
+        fence_by_field = await lock_active_recovery_fence(
+            connection,
+            schema_name=schema_name,
+            snapshot_id=snapshot_id,
+            import_run_id=import_run_id,
+        )
         context = await _build_context(
             connection,
             schema_name=schema_name,
             snapshot_id=snapshot_id,
             import_run_id=import_run_id,
             snapshot_key=snapshot_key,
+            fence_by_field=fence_by_field,
             lock_owned_layout=True,
         )
         _require_matching_digest(context.plan_by_field, normalized_digest)
-        return await _release_recovery_context(
-            connection,
-            schema_name=schema_name,
-            context=context,
-        )
+    return await _release_recovery_context(
+        schema_name=schema_name,
+        context=context,
+    )
 
 
 __all__ = [

@@ -250,3 +250,60 @@ async def test_owned_v4_abandonment_fails_closed_at_time_budget(monkeypatch):
         )
 
     load_inventory.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shared_gc_cli_dry_run_and_execute(monkeypatch, capsys):
+    plan = shared_gc.PTG2SharedGCPlan(
+        layouts=shared_gc.PTG2SharedLayoutGCStats(1, 2, 3),
+        sweep=shared_gc.PTG2SharedBlockSweepPlan((b"a" * 32,), 4),
+    )
+    build = AsyncMock(return_value=plan)
+    release = AsyncMock(return_value=plan.layouts)
+    sweep = AsyncMock(return_value=plan.sweep)
+    monkeypatch.setattr(shared_gc, "build_ptg2_shared_gc_plan", build)
+    monkeypatch.setattr(
+        shared_gc,
+        "release_unbound_ptg2_shared_layouts",
+        release,
+    )
+    monkeypatch.setattr(shared_gc, "sweep_ptg2_shared_blocks", sweep)
+
+    await shared_gc._amain(
+        ("--schema", "testing", "--max-layouts", "1", "--max-rows", "2")
+    )
+    assert "cleanup_executed=false" in capsys.readouterr().out
+    build.assert_awaited_once_with(
+        schema_name="testing",
+        max_layouts=1,
+        max_rows=2,
+        max_bytes=None,
+    )
+    release.assert_not_awaited()
+
+    await shared_gc._amain(
+        (
+            "--schema",
+            "testing",
+            "--execute",
+            "--max-layouts",
+            "3",
+            "--max-rows",
+            "4",
+            "--max-bytes",
+            "5",
+        )
+    )
+    output = capsys.readouterr().out
+    assert "selected_hash=" in output
+    assert "cleanup_executed=true" in output
+    release.assert_awaited_once_with(schema_name="testing", max_layouts=3)
+    sweep.assert_awaited_once_with(
+        schema_name="testing",
+        max_rows=4,
+        max_bytes=5,
+    )
+
+    assert shared_gc._non_negative_int("0") == 0
+    with pytest.raises(Exception, match="non-negative"):
+        shared_gc._non_negative_int("-1")

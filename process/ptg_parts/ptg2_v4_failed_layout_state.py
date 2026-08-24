@@ -10,6 +10,18 @@ from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_shared_blocks import PTG2_V3_DENSE_LAYOUT_TABLES
 
 
+_REFERENCE_FENCE_NAMES = (
+    "bindings",
+    "attestations",
+    "global_pointers",
+    "source_pointers",
+    "plan_pointers",
+    "pins",
+    "scopes",
+    "sources",
+)
+
+
 def row_mapping(database_record: Any) -> dict[str, Any]:
     """Return one database record as a mutable field mapping."""
 
@@ -278,6 +290,11 @@ async def load_recovery_postconditions(
               WHERE snapshot_key = :snapshot_key) AS map_packs,
             (SELECT COUNT(*) FROM {schema}.ptg2_v4_relation_manifest
               WHERE snapshot_key = :snapshot_key) AS relation_manifests,
+            (SELECT COUNT(*) FROM {schema}.ptg2_block_build_pin
+              WHERE snapshot_key = :snapshot_key) AS build_pins,
+            (SELECT COUNT(DISTINCT pin_token)
+               FROM {schema}.ptg2_block_build_pin
+              WHERE snapshot_key = :snapshot_key) AS build_pin_lease_groups,
             ({dense_rows_sql}) AS dense_rows
         """,
         snapshot_key=snapshot_key,
