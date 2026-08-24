@@ -190,7 +190,7 @@ class _SlowSharedBlockSQLDriver:
             ):
                 return _RowsResult(())
             return await self._fetch_stage_rows()
-        if "LEFT JOIN \"mrf\".ptg2_v3_snapshot_block AS mapping" in statement_text:
+        if "AS mapping ON TRUE" in statement_text:
             batch_size = self.batch_sizes[self.fetch_index - 1]
             return _OneRowResult(
                 (

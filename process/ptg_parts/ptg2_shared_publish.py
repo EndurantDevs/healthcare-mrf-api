@@ -108,7 +108,7 @@ SELECT COUNT(*)::bigint,
            FALSE
        ),
        COALESCE(
-           BOOL_OR(staged.payload IS NULL AND stored.block_hash IS NULL),
+           BOOL_OR(staged.payload_is_null AND stored.block_hash IS NULL),
            FALSE
        ),
        COALESCE(
@@ -131,15 +131,45 @@ SELECT COUNT(*)::bigint,
            ),
            FALSE
        )
-  FROM {schema}.{stage} AS staged
-  JOIN {batch} AS batch ON batch.row_ctid = staged.ctid
-  LEFT JOIN {schema}.ptg2_v3_block AS stored
-    ON stored.block_hash = staged.block_hash
-  LEFT JOIN {schema}.ptg2_v3_snapshot_block AS mapping
-    ON mapping.snapshot_key = :snapshot_key
-   AND mapping.object_kind = staged.object_kind
-   AND mapping.block_key = staged.block_key
-   AND mapping.fragment_no = staged.fragment_no
+  FROM {batch} AS batch
+ CROSS JOIN LATERAL (
+       SELECT candidate.block_hash,
+              candidate.format_version,
+              candidate.object_kind,
+              candidate.block_key,
+              candidate.fragment_no,
+              candidate.entry_count,
+              candidate.codec,
+              candidate.raw_byte_count,
+              candidate.stored_byte_count,
+              candidate.payload IS NULL AS payload_is_null
+         FROM {schema}.{stage} AS candidate
+        WHERE candidate.ctid = batch.row_ctid
+        LIMIT 1
+ ) AS staged
+  LEFT JOIN LATERAL (
+       SELECT candidate.block_hash,
+              candidate.format_version,
+              candidate.object_kind,
+              candidate.codec,
+              candidate.entry_count,
+              candidate.raw_byte_count,
+              candidate.stored_byte_count
+         FROM {schema}.ptg2_v3_block AS candidate
+        WHERE candidate.block_hash = staged.block_hash
+        LIMIT 1
+ ) AS stored ON TRUE
+  LEFT JOIN LATERAL (
+       SELECT candidate.snapshot_key,
+              candidate.entry_count,
+              candidate.block_hash
+         FROM {schema}.ptg2_v3_snapshot_block AS candidate
+        WHERE candidate.snapshot_key = :snapshot_key
+          AND candidate.object_kind = staged.object_kind
+          AND candidate.block_key = staged.block_key
+          AND candidate.fragment_no = staged.fragment_no
+        LIMIT 1
+ ) AS mapping ON TRUE
 """
 _V4_BATCH_UNIQUE_TOTALS_SQL = """
 WITH inserted AS (
