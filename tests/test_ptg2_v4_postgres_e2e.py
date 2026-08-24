@@ -2140,6 +2140,12 @@ async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
         await _assert_pattern_v4_cold_reader(state)
         await _assert_pattern_v4_relation_reads(state)
         await _assert_pattern_v4_warm_reader(state)
+        await _assert_v4_mixed_geo_pages(
+            state.database,
+            state.schema_name,
+            state.sealed.snapshot_key,
+            monkeypatch,
+        )
         await _report_pattern_v4_performance(state)
     finally:
         state.compilation.cleanup()
@@ -3264,7 +3270,7 @@ async def _assert_v4_packed_layout(database, schema, snapshot_key):
     )
 
 
-def _v4_geo_prefix_tables(snapshot_key):
+def _v4_geo_prefix_tables(snapshot_key, **limit_overrides):
     return PTG2ServingTables(
         arch_version="postgres_binary_v3",
         shared_snapshot_key=snapshot_key,
@@ -3272,7 +3278,7 @@ def _v4_geo_prefix_tables(snapshot_key):
         cold_lookup_contract="ptg_v3_cold_v2",
         shared_block_layout="packed_snapshot_maps_v4",
         source_count=1,
-        provider_graph_v4_hot_prefix=sealed_v4_hot_prefix(),
+        provider_graph_v4_hot_prefix=sealed_v4_hot_prefix(**limit_overrides),
     )
 
 
@@ -3293,9 +3299,17 @@ def _v4_geo_rate_rows():
     ]
 
 
-def _install_v4_geo_reads(monkeypatch, schema_name, rate_rows):
+def _install_v4_geo_reads(
+    monkeypatch,
+    schema_name,
+    rate_rows,
+    *,
+    expected_candidate_npis=(1_111_111_111, 2_222_222_222),
+    admitted_npi=2_222_222_222,
+):
     rate_read_calls = []
     location_read_calls = []
+    real_v4_sets_by_npi = serving._v4_sets_by_npi
 
     async def read_rate_page(*_args, **kwargs):
         rate_read_calls.append(dict(kwargs))
@@ -3305,11 +3319,20 @@ def _install_v4_geo_reads(monkeypatch, schema_name, rate_rows):
 
     async def admitted_location_rows(*_args, **kwargs):
         location_read_calls.append(dict(kwargs))
-        assert kwargs["candidate_npis"] == (1_111_111_111, 2_222_222_222)
-        return [{"npi": 2_222_222_222}]
+        assert kwargs["candidate_npis"] == expected_candidate_npis
+        return [{"npi": admitted_npi}]
 
     async def reject_cold_fallback(*_args, **_kwargs):
         raise AssertionError("V4 geo prefix used the retained V3/cold graph")
+
+    async def read_fixture_v4_sets(session, serving_tables, npis, **kwargs):
+        return await real_v4_sets_by_npi(
+            session,
+            serving_tables,
+            npis,
+            schema_name=schema_name,
+            **kwargs,
+        )
 
     _isolate_graph_caches(monkeypatch)
     monkeypatch.setattr(
@@ -3318,6 +3341,7 @@ def _install_v4_geo_reads(monkeypatch, schema_name, rate_rows):
         OrderedDict(),
     )
     monkeypatch.setattr(serving, "PTG2_SCHEMA", schema_name)
+    monkeypatch.setattr(serving, "_v4_sets_by_npi", read_fixture_v4_sets)
     monkeypatch.setattr(
         serving,
         "_merge_manifest_code_variant_rows",
@@ -3402,6 +3426,67 @@ async def _direct_v4_storage_shape(
         snapshot_key=snapshot_key,
     )
     return str(representation), int(pattern_count)
+
+
+async def _assert_v4_mixed_geo_pages(
+    database,
+    schema_name,
+    snapshot_key,
+    monkeypatch,
+):
+    """Prove mixed pages reuse one geo scope with real packed V4 lookups."""
+
+    serving_tables = _v4_geo_prefix_tables(
+        snapshot_key,
+        provider_expansion_rate_page_rows=1,
+        max_online_provider_expansion_rate_rows=2,
+        max_online_provider_expansion_provider_sets=2,
+        max_online_provider_expansion_graph_batches=2,
+    )
+    rate_rows = [
+        {
+            "provider_set_global_id_128": _global(1, provider_set_key).hex(),
+            "provider_count": provider_count,
+            "price_key": provider_set_key,
+            "_ptg_provider_set_key": provider_set_key,
+            "serving_content_hash_128": _global(4, provider_set_key).hex(),
+        }
+        for provider_set_key, provider_count in zip((1, 2), (20, 21), strict=True)
+    ]
+    rate_read_calls, location_read_calls = _install_v4_geo_reads(
+        monkeypatch,
+        schema_name,
+        rate_rows,
+        expected_candidate_npis=None,
+        admitted_npi=_NPI,
+    )
+    monkeypatch.setattr(serving, "_ptg2_manifest_location_match_limit", lambda: 1)
+    before_metrics = graph.v4_graph_metrics_snapshot()
+    async with database.transaction() as session:
+        selection = await serving._select_geo_filtered_rate_prefix(
+            session,
+            serving_tables,
+            code_rows=[{"code_key": 1, "rate_count": 2}],
+            args={"zip5": "48201", "zip_radius_miles": 30},
+            network_names=[],
+            target_count=2,
+            descending=False,
+        )
+    after_metrics = graph.v4_graph_metrics_snapshot()
+
+    assert selection == serving._GeoRateSelection(tuple(rate_rows), False)
+    assert [call["offset"] for call in rate_read_calls] == [0, 1]
+    assert [call["limit"] for call in rate_read_calls] == [1, 1]
+    assert len(location_read_calls) == 1
+    assert location_read_calls[0]["candidate_npis"] is None
+    assert location_read_calls[0]["limit"] == 20
+    assert after_metrics["hot_prefix_requests"] == before_metrics[
+        "hot_prefix_requests"
+    ]
+    assert after_metrics["cold_exact_requests"] == before_metrics[
+        "cold_exact_requests"
+    ]
+    assert after_metrics["database_blocks"] > before_metrics["database_blocks"]
 
 
 @pytest.mark.asyncio

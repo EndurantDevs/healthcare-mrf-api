@@ -63,13 +63,34 @@ def _install_geo_prefix_reads(monkeypatch, rate_rows, qualifying_npis):
     )
 
     async def location_rows(*_args, **kwargs):
+        if kwargs["candidate_npis"] is None:
+            return [{"npi": npi} for npi in sorted(qualifying_npis)]
         return [
             {"npi": npi} for npi in kwargs["candidate_npis"] if npi in qualifying_npis
         ]
 
+    async def reverse_matches(
+        _session,
+        _tables,
+        candidate_npis,
+        provider_set_keys,
+        **_kwargs,
+    ):
+        allowed_provider_set_keys = set(provider_set_keys)
+        return {
+            npi: (npi - 100,)
+            for npi in candidate_npis
+            if npi - 100 in allowed_provider_set_keys
+        }
+
     monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", page_reads)
     monkeypatch.setattr(serving, "_provider_npis_for_sets", member_reads)
     monkeypatch.setattr(serving, "_membership_npi_rows", location_rows)
+    monkeypatch.setattr(
+        serving,
+        "_shared_provider_set_keys_by_npi",
+        reverse_matches,
+    )
     return page_reads, member_reads
 
 
@@ -100,7 +121,7 @@ async def test_geo_rate_prefix_reads_disjoint_pages_and_preserves_rate_order(
     assert selection.exhausted is False
     assert [call.kwargs["offset"] for call in page_reads.await_args_list] == [0, 4]
     assert [call.kwargs["limit"] for call in page_reads.await_args_list] == [4, 4]
-    assert member_reads.await_count == 2
+    member_reads.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -135,7 +156,7 @@ async def test_geo_rate_prefix_descending_pages_preserve_dense_tie_order(
     assert [call.kwargs["offset"] for call in page_reads.await_args_list] == [0, 2]
     assert [call.kwargs["limit"] for call in page_reads.await_args_list] == [2, 2]
     assert all(call.kwargs["descending"] is True for call in page_reads.await_args_list)
-    assert member_reads.await_count == 2
+    member_reads.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -170,7 +191,7 @@ async def test_geo_rate_prefix_reaches_production_256_set_budget(monkeypatch):
         128,
         192,
     ]
-    assert member_reads.await_count == 4
+    member_reads.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -315,7 +336,7 @@ async def test_geo_rate_prefix_rejects_unexhausted_reverse_member_budget(
 
 
 @pytest.mark.asyncio
-async def test_geo_rate_prefix_rejects_reverse_after_candidate_budget_consumed(
+async def test_geo_rate_prefix_uses_reverse_scope_before_multi_page_member_budget(
     monkeypatch,
 ):
     rate_rows = [
@@ -333,42 +354,47 @@ async def test_geo_rate_prefix_rejects_reverse_after_candidate_budget_consumed(
         ),
     )
     member_reads = AsyncMock(
-        return_value={rate_rows[0]["provider_set_global_id_128"]: tuple(range(100, 120))}
+        return_value={
+            rate_rows[0]["provider_set_global_id_128"]: tuple(range(100, 120))
+        }
     )
-    location_reads = AsyncMock(return_value=[])
-    reverse_reads = AsyncMock()
+
+    location_reads = AsyncMock(
+        side_effect=lambda *_args, **kwargs: (
+            []
+            if kwargs["candidate_npis"] is not None
+            else [{"npi": 111, "_ptg_source_exhausted": True}]
+        ),
+    )
+    reverse_reads = AsyncMock(
+        side_effect=lambda _session, _tables, _candidate_npis, provider_set_keys, **_kwargs: (
+            {111: (2,)} if 2 in provider_set_keys else {}
+        ),
+    )
     monkeypatch.setattr(serving, "_provider_npis_for_sets", member_reads)
     monkeypatch.setattr(serving, "_membership_npi_rows", location_reads)
-    monkeypatch.setattr(
-        serving,
-        "_shared_provider_set_keys_by_npi",
-        reverse_reads,
+    monkeypatch.setattr(serving, "_shared_provider_set_keys_by_npi", reverse_reads)
+
+    selection = await serving._select_geo_filtered_rate_prefix(
+        object(),
+        _tables(
+            provider_expansion_rate_page_rows=1,
+            max_online_provider_expansion_rate_rows=2,
+            max_online_provider_expansion_provider_sets=2,
+            max_online_provider_expansion_graph_batches=2,
+        ),
+        code_rows=_code_rows(2),
+        args={"zip5": "85016", "zip_radius_miles": 25.0},
+        network_names=[],
+        target_count=1,
+        descending=False,
     )
 
-    with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as exc_info:
-        await serving._select_geo_filtered_rate_prefix(
-            object(),
-            _tables(
-                provider_expansion_rate_page_rows=1,
-                max_online_provider_expansion_rate_rows=2,
-                max_online_provider_expansion_provider_sets=2,
-                max_online_provider_expansion_graph_batches=2,
-            ),
-            code_rows=_code_rows(2),
-            args={"state": "MI"},
-            network_names=[],
-            target_count=1,
-            descending=False,
-        )
-
-    assert exc_info.value.dimension == "candidate_members"
-    member_reads.assert_awaited_once()
-    assert location_reads.await_count == 20
-    assert all(
-        call.kwargs["candidate_npis"] is not None
-        for call in location_reads.await_args_list
-    )
-    reverse_reads.assert_not_awaited()
+    assert selection == serving._GeoRateSelection((rate_rows[1],), False)
+    member_reads.assert_not_awaited()
+    location_reads.assert_awaited_once()
+    assert location_reads.await_args.kwargs["candidate_npis"] is None
+    assert reverse_reads.await_count == 2
 
 
 @pytest.mark.asyncio
