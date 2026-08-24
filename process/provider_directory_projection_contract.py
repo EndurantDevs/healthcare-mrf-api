@@ -578,7 +578,6 @@ def _resource_profile_hash(
                 SEMANTIC_SOURCE_SUMMARY_CONTRACT_ID
             ),
             "reducer_proof_contract_id": PROJECTION_REDUCER_PROOF_CONTRACT_ID,
-            "winner_policy_contract_id": PROJECTION_WINNER_POLICY_CONTRACT_ID,
         },
         domain="provider-directory-projection-resource-profile-v1",
     )
