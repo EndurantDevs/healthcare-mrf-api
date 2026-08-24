@@ -66,6 +66,25 @@ def test_cleanup_recognizes_current_and_legacy_shared_generations_only():
     )
 
 
+def test_shared_gc_helper_defaults_cover_empty_inputs(monkeypatch):
+    assert shared_gc._row_mapping(None) == {}
+    assert not shared_gc.is_shared_blocks_cleanup_manifest(None)
+    monkeypatch.delenv(
+        shared_gc.PTG2_V4_ABANDONMENT_STATEMENT_TIMEOUT_SECONDS_ENV,
+        raising=False,
+    )
+    assert (
+        shared_gc._v4_abandonment_statement_timeout_seconds()
+        == shared_gc.PTG2_V4_ABANDONMENT_STATEMENT_TIMEOUT_SECONDS_DEFAULT
+    )
+    assert shared_gc._v4_abandonment_statement_timeout_seconds(0) == 0.001
+    monkeypatch.setenv(
+        shared_gc.PTG2_V4_ABANDONMENT_STATEMENT_TIMEOUT_SECONDS_ENV,
+        "0",
+    )
+    assert shared_gc._v4_abandonment_statement_timeout_seconds() == 0.001
+
+
 @pytest.mark.asyncio
 async def test_owned_v4_abandonment_acquires_connection_without_executor(
     monkeypatch,
