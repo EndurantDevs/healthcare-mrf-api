@@ -136,8 +136,8 @@ async def _insert_physical_projection(
             CAST(:required_resources_json AS jsonb), :resource_count,
             CAST(:resource_counts_json AS jsonb), CAST(:proof_json AS jsonb),
             :storage_schema, :storage_relation, :storage_relation_oid,
-            :storage_trigger_oid, 'sealed', now(), now(),
-            now() + make_interval(secs => :retain_seconds)
+            :storage_trigger_oid, 'sealed', clock_timestamp(), clock_timestamp(),
+            clock_timestamp() + make_interval(secs => :retain_seconds)
         );
         """,
         **value_by_name,
@@ -251,7 +251,7 @@ async def _seal(
         UPDATE {table_ref(schema, 'provider_directory_projection_recipe')}
            SET status = 'sealed', physical_projection_id = :projection_id,
                lease_token = NULL, lease_expires_at = NULL,
-               lease_heartbeat_at = NULL, sealed_at = now(),
+               lease_heartbeat_at = NULL, sealed_at = clock_timestamp(),
                updated_at = clock_timestamp()
          WHERE recipe_id = :recipe_id AND attempt = :attempt
            AND status = 'proof_ready' AND lease_token = :lease_token

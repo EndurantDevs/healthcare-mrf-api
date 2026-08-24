@@ -207,6 +207,21 @@ async def test_finalizer_seals_atomically_and_replays_exact_proof(monkeypatch):
         case = await _finalizer_case(postgres, "native-finalizer-seal")
         await _commit_case(postgres, case)
         await postgres.upgrade_finalizer()
+        original_prepared_projection = finalizer._prepared_projection
+        seal_barrier_by_name = {}
+
+        async def prepared_projection_after_barrier(*args, **kwargs):
+            prepared = await original_prepared_projection(*args, **kwargs)
+            seal_barrier_by_name["timestamp"] = await args[0].scalar(
+                "SELECT clock_timestamp();"
+            )
+            return prepared
+
+        monkeypatch.setattr(
+            finalizer,
+            "_prepared_projection",
+            prepared_projection_after_barrier,
+        )
 
         proof = await finalize_projection(
             case.lease,
@@ -226,6 +241,17 @@ async def test_finalizer_seals_atomically_and_replays_exact_proof(monkeypatch):
             "catalog_counts": (1, 1, 1, 1),
             "stage": (3, 2, True, 1),
         }
+        physical_times = await postgres.database.first(
+            f'SELECT sealed_at, retain_until FROM "{postgres.schema}".'
+            "provider_directory_physical_projection;"
+        )
+        recipe_sealed_at = await postgres.database.scalar(
+            f'SELECT sealed_at FROM "{postgres.schema}".'
+            "provider_directory_projection_recipe;"
+        )
+        assert physical_times[0] >= seal_barrier_by_name["timestamp"]
+        assert recipe_sealed_at >= seal_barrier_by_name["timestamp"]
+        assert physical_times[1] > physical_times[0]
 
         replay = await finalize_projection(
             case.lease,
