@@ -74,10 +74,18 @@ def test_provider_directory_address_merge_preserves_best_row_and_all_evidence(
 
 
 def test_provider_directory_address_helpers_handle_empty_and_duplicate_values():
+    class TextValue:
+        def __str__(self) -> str:
+            return "same"
+
     assert npi_module._merge_unique_list_values(
         [None, "", {"code": "A"}],
         [{"code": "A"}, "second"],
     ) == [{"code": "A"}, "second"]
+    assert npi_module._merge_unique_list_values(
+        ["1", 1, True, "same"],
+        [1, "1", True, TextValue()],
+    ) == ["1", 1, True, "same"]
     assert not npi_module._has_contact_value(None)
     assert not npi_module._has_contact_value("  ")
     assert npi_module._has_contact_value(0)
