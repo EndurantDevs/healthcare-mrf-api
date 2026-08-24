@@ -6189,6 +6189,7 @@ async def _provider_enrichment_rows_for_columns(
     *,
     session: Any = None,
 ) -> list[Any]:
+    summary_table = _schema_cache_key(ProviderEnrichmentSummary.__tablename__)
     select_columns = [
         column_name if column_name in available_columns else f"NULL AS {column_name}"
         for column_name in PROVIDER_ENRICHMENT_SUMMARY_COLUMNS
@@ -6197,7 +6198,7 @@ async def _provider_enrichment_rows_for_columns(
         f"""
         SELECT
             {', '.join(select_columns)}
-          FROM mrf.{ProviderEnrichmentSummary.__tablename__}
+          FROM {summary_table}
          WHERE npi = ANY(:npis)
         """
     )

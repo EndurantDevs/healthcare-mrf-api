@@ -19,6 +19,23 @@ class _ResultRows:
         return self._rows
 
 
+@pytest.mark.asyncio
+async def test_enrichment_batch_query_uses_runtime_schema(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "provider_tenant")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    execute = AsyncMock(return_value=_ResultRows([]))
+    monkeypatch.setattr(npi_module, "_execute_stmt", execute)
+
+    await npi_module._provider_enrichment_rows_for_columns(
+        [1234567890],
+        {"npi"},
+    )
+
+    assert "FROM provider_tenant.provider_enrichment_summary" in str(
+        execute.await_args.args[0]
+    )
+
+
 def test_openapi_documents_npi_batch_contract():
     operation = yaml.safe_load(Path("doc/openapi.yaml").read_text())["paths"]["/npi/id/batch"]["post"]
     request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
