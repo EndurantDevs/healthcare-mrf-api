@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from dataclasses import replace
+from typing import NoReturn
 
 import pytest
 
@@ -115,6 +116,30 @@ async def test_drain_operation_preserves_or_suppresses_outer_cancellation():
 
 
 @pytest.mark.asyncio
+async def test_drain_operation_keeps_outer_cancel_when_inner_also_cancels():
+    entered = asyncio.Event()
+    released = asyncio.Event()
+
+    async def cancel_after_cancellation() -> NoReturn:
+        entered.set()
+        await released.wait()
+        raise asyncio.CancelledError("inner")
+
+    task = asyncio.create_task(
+        runtime.drain_operation(
+            cancel_after_cancellation(),
+            preserve_cancellation=True,
+        )
+    )
+    await entered.wait()
+    task.cancel("outer")
+    await asyncio.sleep(0)
+    released.set()
+    with pytest.raises(asyncio.CancelledError, match="outer"):
+        await task
+
+
+@pytest.mark.asyncio
 async def test_runner_callback_claim_and_retry_failure_boundaries():
     runner, harness, _context = await _runner_fixture()
     await runner.emit("root_started")
@@ -192,6 +217,16 @@ async def test_runner_claim_lock_and_invalid_retry_claim():
 
     runner.dependencies = replace(runner.dependencies, claim_work=missing_claim)
     assert await runner.claim_retry(1000000004, 0.0) is None
+
+    runner, harness, _context = await _runner_fixture()
+
+    async def cancel_sleep(_delay):
+        raise asyncio.CancelledError
+
+    runner.dependencies = replace(runner.dependencies, sleep=cancel_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await runner.claim_retry(1000000004, 1.0)
+    assert not harness.active
 
 
 @pytest.mark.asyncio

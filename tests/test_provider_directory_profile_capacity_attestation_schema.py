@@ -88,7 +88,7 @@ def _load_migration():
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260821143000_ptg_legacy_plan_identifier_width"
+        "20260824143000_uhc_flex_content_type_retry"
     ]
     migration = _load_capacity_v2_migration()
     assert migration.down_revision == (

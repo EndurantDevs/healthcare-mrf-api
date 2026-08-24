@@ -124,6 +124,7 @@ def test_strict_float_and_header_parameters_reject_ambiguous_values() -> None:
             )
         )
     assert media_error.value.code == "content_type_invalid"
+    assert media_error.value.retryable is True
 
 
 class _Content:

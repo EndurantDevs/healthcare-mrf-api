@@ -58,6 +58,8 @@ the sole reviewed current root, then acquisition revalidates that root and the
 source before work and before sealing. Both independent roots must seal with
 matching rooted-graph evidence before admission. A successful receipt reports
 the exact `publication_acquisition_id`; acquisition never publishes.
+Unexpected response media types remain rejected before body parsing and enter
+the existing bounded retry path.
 
 Optional bounded controls are `--concurrency` (1-16), `--max-attempts` (1-8),
 `--lease-seconds` (60-3600), `--retry-base-seconds` and

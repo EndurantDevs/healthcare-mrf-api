@@ -208,6 +208,10 @@ def _uhc_flex_practitioner_claim_sql(
                AND (work.status = 'pending' OR (
                    work.status = 'leased'
                    AND work.lease_expires_at <= clock_timestamp()
+               ) OR (
+                   work.status = 'error'
+                   AND work.error_code = 'content_type_invalid'
+                   AND work.attempt_count = 1
                ))
                {fresh_filter}
              ORDER BY work.npi
