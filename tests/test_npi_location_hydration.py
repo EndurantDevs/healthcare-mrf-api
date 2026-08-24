@@ -149,7 +149,6 @@ async def test_unified_candidate_and_address_only_hydrator_share_location_identi
     identity = candidates[0]["_base_row_identities"][0]
     hydrated_locations = await npi_module._fetch_npi_address_rows(
         1234567890,
-        include_evidence=True,
         address_row_identities=[identity],
     )
 
