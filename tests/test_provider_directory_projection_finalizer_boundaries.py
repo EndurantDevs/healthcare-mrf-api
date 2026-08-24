@@ -129,6 +129,13 @@ async def test_finalizer_transition_counts_are_fenced(monkeypatch):
     monkeypatch.setattr(finalizer, "_insert_projection_catalog", AsyncMock())
     with pytest.raises(ProviderDirectoryProjectionLeaseLost, match="lease_lost"):
         await finalizer._seal(connection, "mrf", lease, prepared, proof, 60)
+    seal_statements = [
+        call.args[0] for call in connection.status.await_args_list[-2:]
+    ]
+    assert "ATTACH PARTITION" in seal_statements[0]
+    assert "WITH seal_clock AS" in seal_statements[1]
+    assert "physical_seal AS" in seal_statements[1]
+    assert "provider_directory_projection_recipe" in seal_statements[1]
 
 
 @pytest.mark.asyncio

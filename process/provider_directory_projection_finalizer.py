@@ -118,6 +118,9 @@ async def _insert_physical_projection(
 ) -> int:
     return await connection.status(
         f"""
+        WITH seal_clock AS (
+            SELECT clock_timestamp() AS sealed_at
+        )
         INSERT INTO {table_ref(schema, 'provider_directory_physical_projection')} (
             physical_projection_id, canonical_row_sha256,
             content_hash_contract_id, decoder_contract_id, input_set_sha256,
@@ -127,7 +130,7 @@ async def _insert_physical_projection(
             resource_counts_json, proof_json, storage_schema, storage_relation,
             storage_relation_oid, storage_trigger_oid, status, created_at,
             sealed_at, retain_until
-        ) VALUES (
+        ) SELECT
             :physical_projection_id, :canonical_row_sha256,
             :content_hash_contract_id, :decoder_contract_id, :input_set_sha256,
             :transform_contract_id, :scope_contract_id, :transform_context_hash,
@@ -136,9 +139,10 @@ async def _insert_physical_projection(
             CAST(:required_resources_json AS jsonb), :resource_count,
             CAST(:resource_counts_json AS jsonb), CAST(:proof_json AS jsonb),
             :storage_schema, :storage_relation, :storage_relation_oid,
-            :storage_trigger_oid, 'sealed', clock_timestamp(), clock_timestamp(),
-            clock_timestamp() + make_interval(secs => :retain_seconds)
-        );
+            :storage_trigger_oid, 'sealed', seal_clock.sealed_at,
+            seal_clock.sealed_at,
+            seal_clock.sealed_at + make_interval(secs => :retain_seconds)
+          FROM seal_clock;
         """,
         **value_by_name,
     )
@@ -226,10 +230,7 @@ async def _seal(
     proof: PhysicalProjectionProof,
     retain_seconds: int,
 ) -> None:
-    projection_id = required_hash(
-        proof.physical_projection_id,
-        "physical_projection_id",
-    )
+    projection_id = required_hash(proof.physical_projection_id, "physical_projection_id")
     await set_local_projection_action(
         connection,
         "seal",
@@ -248,11 +249,22 @@ async def _seal(
     )
     sealed_count = await connection.status(
         f"""
+        WITH seal_clock AS (SELECT clock_timestamp() AS sealed_at),
+        physical_seal AS (
+            UPDATE {table_ref(schema, 'provider_directory_physical_projection')} AS physical
+               SET sealed_at = seal_clock.sealed_at,
+                   retain_until = seal_clock.sealed_at + make_interval(secs => :retain_seconds)
+              FROM seal_clock
+             WHERE physical.physical_projection_id = :projection_id AND physical.status = 'sealed'
+         RETURNING physical.sealed_at
+        )
         UPDATE {table_ref(schema, 'provider_directory_projection_recipe')}
            SET status = 'sealed', physical_projection_id = :projection_id,
                lease_token = NULL, lease_expires_at = NULL,
-               lease_heartbeat_at = NULL, sealed_at = clock_timestamp(),
-               updated_at = clock_timestamp()
+               lease_heartbeat_at = NULL,
+               sealed_at = physical_seal.sealed_at,
+               updated_at = physical_seal.sealed_at
+          FROM physical_seal
          WHERE recipe_id = :recipe_id AND attempt = :attempt
            AND status = 'proof_ready' AND lease_token = :lease_token
            AND lease_expires_at > clock_timestamp();
@@ -261,6 +273,7 @@ async def _seal(
         recipe_id=lease.recipe.recipe_id,
         attempt=lease.attempt,
         lease_token=lease.lease_token,
+        retain_seconds=retain_seconds,
     )
     if sealed_count != 1:
         raise ProviderDirectoryProjectionLeaseLost(

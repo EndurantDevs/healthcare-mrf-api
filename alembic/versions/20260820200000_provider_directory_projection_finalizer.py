@@ -48,6 +48,45 @@ _RAW_PARTITION_COUNT_CHECK = """                    AND NOT EXISTS (
                                expected.resource_count
                     )
 """
+_PHYSICAL_GC_UPDATE_ANCHOR = """            IF TG_OP = 'UPDATE'
+               AND action_setting = 'gc'"""
+
+
+def _physical_seal_update_guard(schema: str) -> str:
+    quoted_schema = _quoted_identifier(schema)
+    return f"""            IF TG_OP = 'UPDATE'
+               AND action_setting = 'seal'
+               AND recipe_id_setting = OLD.physical_projection_id
+               AND physical_id_setting = OLD.physical_projection_id
+               AND recipe_attempt_setting ~ '^[1-9][0-9]*$'
+               AND recipe_lease_setting ~ '^[0-9a-f]{{64}}$'
+               AND OLD.status = 'sealed' AND NEW.status = 'sealed'
+               AND NEW.sealed_at >= OLD.sealed_at
+               AND NEW.sealed_at <= clock_timestamp()
+               AND NEW.retain_until >= NEW.sealed_at
+               AND NEW.retain_until - NEW.sealed_at =
+                   OLD.retain_until - OLD.sealed_at
+               AND {quoted_schema}.
+                   provider_directory_projection_stage_is_attached(
+                       OLD.storage_relation_oid,
+                       'provider_directory_physical_projection_resource',
+                       OLD.physical_projection_id
+                   )
+               AND EXISTS (
+                   SELECT 1
+                     FROM {quoted_schema}.provider_directory_projection_recipe
+                    WHERE recipe_id = OLD.physical_projection_id
+                      AND attempt = recipe_attempt_setting::integer
+                      AND status = 'proof_ready'
+                      AND lease_token = recipe_lease_setting
+                      AND lease_expires_at > clock_timestamp()
+                    FOR SHARE
+               )
+               AND to_jsonb(NEW) - ARRAY['sealed_at', 'retain_until'] =
+                   to_jsonb(OLD) - ARRAY['sealed_at', 'retain_until'] THEN
+                RETURN NEW;
+            END IF;
+"""
 
 
 def _schema() -> str:
@@ -138,6 +177,13 @@ def _guard_rewrites(schema: str, *, upgrade: bool) -> tuple[str, ...]:
             _RECIPE_BLOCKER,
             recipe_anchor,
             upgrade=upgrade,
+        ),
+        _rewrite_function_sql(
+            schema,
+            "guard_provider_directory_physical_projection",
+            _physical_seal_update_guard(schema),
+            _PHYSICAL_GC_UPDATE_ANCHOR,
+            upgrade=not upgrade,
         ),
         _rewrite_function_sql(
             schema,

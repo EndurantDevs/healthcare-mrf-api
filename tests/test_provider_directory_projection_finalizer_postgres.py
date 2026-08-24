@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import timedelta
 import hashlib
 
 import pytest
@@ -249,9 +250,8 @@ async def test_finalizer_seals_atomically_and_replays_exact_proof(monkeypatch):
             f'SELECT sealed_at FROM "{postgres.schema}".'
             "provider_directory_projection_recipe;"
         )
-        assert physical_times[0] >= seal_barrier_by_name["timestamp"]
-        assert recipe_sealed_at >= seal_barrier_by_name["timestamp"]
-        assert physical_times[1] > physical_times[0]
+        assert recipe_sealed_at == physical_times[0] >= seal_barrier_by_name["timestamp"]
+        assert physical_times[1] - physical_times[0] == timedelta(seconds=60)
 
         replay = await finalize_projection(
             case.lease,
