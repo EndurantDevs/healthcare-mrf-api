@@ -880,6 +880,36 @@ def _validate_v3_atom_summary(
     _validate_atom_width(summary, "price atoms", atom_key_bits)
 
 
+async def _has_price_atom_payload_conflict(
+    qualified_source: str,
+    qualified_canonical: str,
+) -> bool:
+    """Return whether one atom ID maps to different payloads."""
+
+    payload_row = ", ".join(
+        f"source.{_quote_ident(column_name)}"
+        for column_name in _PRICE_ATOM_PAYLOAD_COLUMNS
+    )
+    canonical_row = ", ".join(
+        f"canonical.{_quote_ident(column_name)}"
+        for column_name in _PRICE_ATOM_PAYLOAD_COLUMNS
+    )
+    return bool(
+        await db.scalar(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {qualified_source} AS source
+                  JOIN {qualified_canonical} AS canonical
+                    USING (price_atom_global_id_128)
+                 WHERE ROW({payload_row}) IS DISTINCT FROM ROW({canonical_row})
+                 LIMIT 1
+            )
+            """
+        )
+    )
+
+
 async def _normalize_strict_price_atom_stage(
     *,
     schema_name: str,
@@ -917,29 +947,7 @@ async def _normalize_strict_price_atom_stage(
                 ON {qualified_dedup} (price_atom_global_id_128);
             """
         )
-        payload_row = ", ".join(
-            f"source.{_quote_ident(column_name)}"
-            for column_name in _PRICE_ATOM_PAYLOAD_COLUMNS
-        )
-        canonical_row = ", ".join(
-            f"canonical.{_quote_ident(column_name)}"
-            for column_name in _PRICE_ATOM_PAYLOAD_COLUMNS
-        )
-        conflict = bool(
-            await db.scalar(
-                f"""
-                SELECT EXISTS (
-                    SELECT 1
-                      FROM {qualified} AS source
-                      JOIN {qualified_dedup} AS canonical
-                        USING (price_atom_global_id_128)
-                     WHERE ROW({payload_row}) IS DISTINCT FROM ROW({canonical_row})
-                     LIMIT 1
-                )
-                """
-            )
-        )
-        if conflict:
+        if await _has_price_atom_payload_conflict(qualified, qualified_dedup):
             await db.status(f"DROP TABLE IF EXISTS {qualified_dedup} CASCADE;")
             raise RuntimeError(
                 "strict V3 observed one price atom ID with conflicting source payloads"
@@ -956,6 +964,44 @@ async def _normalize_strict_price_atom_stage(
     }
 
 
+async def _price_attribute_rows(
+    dictionary_table: str | None,
+    snapshot_key: int,
+) -> list[dict[str, Any]]:
+    """Load manifest-safe price-attribute rows from the prepared dictionary."""
+
+    attribute_rows: list[dict[str, Any]] = []
+    if not dictionary_table:
+        return attribute_rows
+    raw_rows = await db.all(
+        f"""
+        SELECT attr_kind, attr_key, text_value, text_array
+          FROM {dictionary_table}
+         ORDER BY attr_kind, attr_key
+        """
+    )
+    for raw_row in raw_rows:
+        mapping = getattr(raw_row, "_mapping", None)
+        attr_kind = str(mapping["attr_kind"] if mapping is not None else raw_row[0])
+        attr_key = mapping["attr_key"] if mapping is not None else raw_row[1]
+        text_value = mapping["text_value"] if mapping is not None else raw_row[2]
+        text_array = mapping["text_array"] if mapping is not None else raw_row[3]
+        attribute_value = (
+            json.dumps(list(text_array or []), ensure_ascii=True, separators=(",", ":"))
+            if attr_kind in {"service_code", "billing_code_modifier"}
+            else text_value
+        )
+        attribute_rows.append(
+            {
+                "snapshot_key": int(snapshot_key),
+                "attribute_kind": attr_kind,
+                "attribute_key": int(attr_key),
+                "value": attribute_value,
+            }
+        )
+    return attribute_rows
+
+
 async def _publish_price_attributes(
     *,
     schema_name: str,
@@ -967,34 +1013,7 @@ async def _publish_price_attributes(
 ) -> tuple[int, bytes]:
     """Persist price attributes and return their row count and support digest."""
 
-    attribute_rows: list[dict[str, Any]] = []
-    if dictionary_table:
-        raw_rows = await db.all(
-            f"""
-            SELECT attr_kind, attr_key, text_value, text_array
-              FROM {dictionary_table}
-             ORDER BY attr_kind, attr_key
-            """
-        )
-        for raw_row in raw_rows:
-            mapping = getattr(raw_row, "_mapping", None)
-            attr_kind = str(mapping["attr_kind"] if mapping is not None else raw_row[0])
-            attr_key = mapping["attr_key"] if mapping is not None else raw_row[1]
-            text_value = mapping["text_value"] if mapping is not None else raw_row[2]
-            text_array = mapping["text_array"] if mapping is not None else raw_row[3]
-            attribute_value = (
-                json.dumps(list(text_array or []), ensure_ascii=True, separators=(",", ":"))
-                if attr_kind in {"service_code", "billing_code_modifier"}
-                else text_value
-            )
-            attribute_rows.append(
-                {
-                    "snapshot_key": int(snapshot_key),
-                    "attribute_kind": attr_kind,
-                    "attribute_key": int(attr_key),
-                    "value": attribute_value,
-                }
-            )
+    attribute_rows = await _price_attribute_rows(dictionary_table, snapshot_key)
     schema = _quote_ident(schema_name)
     batch_size = 10_000
     async with db.transaction() as session:

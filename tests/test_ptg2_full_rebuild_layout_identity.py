@@ -38,7 +38,7 @@ def _serving_index_by_field(
         "price_set_atom_memberships_v3": {"block_count": 1},
         "price_atoms_v3": {"block_count": 1},
     }
-    return _physical_serving_index(
+    serving_index = _physical_serving_index(
         snapshot_key=17,
         coverage_scope_id=b"c" * 32,
         finalizer_summary=finalizer_summary_by_field,
@@ -57,13 +57,20 @@ def _serving_index_by_field(
             dictionary_publication=dictionary_publication,
         ),
         code_count=6,
-        audit_sample={"sample_digest": "a" * 64},
-        source_witness={"witness_digest": "b" * 64},
-        provider_identifier_quarantine=provider_identifier_quarantine_payload({}),
-        finalizer_block_copy={},
-        stored_byte_count=7,
         full_rebuild_scope_digest=full_rebuild_scope_digest,
     )
+    serving_index.update(
+        {
+            "audit_sample": {"sample_digest": "a" * 64},
+            "source_witness": {"witness_digest": "b" * 64},
+            "provider_identifier_quarantine": (
+                provider_identifier_quarantine_payload({})
+            ),
+            "finalizer_block_copy": {},
+            "storage_bytes": 7,
+        }
+    )
+    return serving_index
 
 
 def test_serving_index_authenticates_v4_dictionary_publication_contract():

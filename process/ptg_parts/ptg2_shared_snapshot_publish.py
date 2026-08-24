@@ -248,6 +248,28 @@ class _PreparedPricePublication:
 
 
 @dataclass(frozen=True)
+class _EarlyFinalizerInputs:
+    """Inputs consumed once the validated price-key map becomes available."""
+
+    raw_work_directory: str | Path
+    serving_run_entries: Iterable[Mapping[str, Any]]
+    code_dictionary_entries: Iterable[Mapping[str, Any]]
+    provider_set_metadata_entries: Iterable[Mapping[str, Any]]
+    expected_source_identities: Iterable[
+        Mapping[str, Any] | SharedPhysicalArtifactIdentity
+    ]
+
+
+_EarlyFinalizerResult = tuple[
+    PreparedSharedPriceArtifacts,
+    float,
+    _PreparedFinalizer | None,
+    _PreparedPricePublication | None,
+]
+_PreparedPriceKeyFuture = asyncio.Future[PreparedSharedPriceKeyMap]
+
+
+@dataclass(frozen=True)
 class _FinalizerBlockPublicationResult:
     """Keep durable publication and immutable COPY proof together."""
 
@@ -628,140 +650,164 @@ async def _export_price_map_and_run_finalizer(
     )
 
 
+async def _cancel_price_pipeline_tasks(
+    prepare_task: asyncio.Task[tuple[PreparedSharedPriceArtifacts, float]],
+    *tasks: asyncio.Task[Any],
+) -> None:
+    """Cancel one price pipeline and clean any completed prepared artifacts."""
+
+    active_tasks = (prepare_task, *tasks)
+    for task in active_tasks:
+        task.cancel()
+    await _await_cleanup_task(asyncio.gather(*active_tasks, return_exceptions=True))
+    prepared = _completed_prepared_price(prepare_task)
+    if prepared is not None:
+        await _await_cleanup_task(
+            asyncio.create_task(cleanup_prepared_shared_price_artifacts(prepared))
+        )
+
+
+async def _publish_prepared_price_with_timing(
+    prepare_task: asyncio.Task[tuple[PreparedSharedPriceArtifacts, float]],
+    publisher: Callable[[PreparedSharedPriceArtifacts], Awaitable[Any]],
+) -> _PreparedPricePublication:
+    """Publish prepared price blocks while retaining measured wall time."""
+
+    prepared, _price_prepare_seconds = await prepare_task
+    started_at = time.monotonic()
+    return _PreparedPricePublication(
+        publication=await publisher(prepared),
+        publish_seconds=time.monotonic() - started_at,
+    )
+
+
+async def _complete_price_without_finalizer(
+    prepare_task: asyncio.Task[tuple[PreparedSharedPriceArtifacts, float]],
+    publisher: Callable[[PreparedSharedPriceArtifacts], Awaitable[Any]] | None,
+) -> _EarlyFinalizerResult:
+    """Finish price preparation when no early key was announced."""
+
+    prepared, elapsed_seconds = await prepare_task
+    publication = (
+        await _publish_prepared_price_with_timing(prepare_task, publisher)
+        if publisher is not None
+        else None
+    )
+    return prepared, elapsed_seconds, None, publication
+
+
+async def _complete_early_finalizer_pipeline(
+    *,
+    prepare_task: asyncio.Task[tuple[PreparedSharedPriceArtifacts, float]],
+    prepared_price_key: PreparedSharedPriceKeyMap,
+    finalizer_inputs: _EarlyFinalizerInputs,
+    publish_prepared_price: (
+        Callable[[PreparedSharedPriceArtifacts], Awaitable[Any]] | None
+    ),
+    progress_callback: Callable[[str, int], None] | None,
+) -> _EarlyFinalizerResult:
+    """Finish the overlapped finalizer and optional price-publication lanes."""
+
+    finalizer_task = asyncio.create_task(
+        _export_price_map_and_run_finalizer(
+            prepared_price_key=prepared_price_key,
+            raw_work_directory=finalizer_inputs.raw_work_directory,
+            serving_run_entries=finalizer_inputs.serving_run_entries,
+            code_dictionary_entries=finalizer_inputs.code_dictionary_entries,
+            provider_set_metadata_entries=(
+                finalizer_inputs.provider_set_metadata_entries
+            ),
+            expected_source_identities=finalizer_inputs.expected_source_identities,
+            progress_callback=progress_callback,
+        )
+    )
+    price_task = (
+        asyncio.create_task(
+            _publish_prepared_price_with_timing(
+                prepare_task,
+                publish_prepared_price,
+            )
+        )
+        if publish_prepared_price is not None
+        else None
+    )
+    try:
+        gathered = await asyncio.gather(
+            prepare_task,
+            finalizer_task,
+            *([price_task] if price_task is not None else []),
+        )
+    except BaseException:
+        await _cancel_price_pipeline_tasks(
+            prepare_task,
+            finalizer_task,
+            *([price_task] if price_task is not None else []),
+        )
+        raise
+    prepared, price_prepare_seconds = gathered[0]
+    return (
+        prepared,
+        price_prepare_seconds,
+        gathered[1],
+        gathered[2] if price_task is not None else None,
+    )
+
+
 async def _prepare_price_with_early_finalizer(
     *,
     schema_name: str,
     manifest_stage_table: str,
     price_set_summary_source_count: int | None,
-    raw_work_directory: str | Path,
-    serving_run_entries: Iterable[Mapping[str, Any]],
-    code_dictionary_entries: Iterable[Mapping[str, Any]],
-    provider_set_metadata_entries: Iterable[Mapping[str, Any]],
-    expected_source_identities: Iterable[
-        Mapping[str, Any] | SharedPhysicalArtifactIdentity
-    ],
+    finalizer_inputs: _EarlyFinalizerInputs,
     publish_prepared_price: (
         Callable[[PreparedSharedPriceArtifacts], Awaitable[Any]] | None
     ) = None,
     finalizer_progress_callback: Callable[[str, int], None] | None = None,
-) -> tuple[
-    PreparedSharedPriceArtifacts,
-    float,
-    _PreparedFinalizer | None,
-    _PreparedPricePublication | None,
-]:
+) -> _EarlyFinalizerResult:
     """Prepare price stages and overlap the finalizer when early readiness exists."""
 
-    loop = asyncio.get_running_loop()
-    price_key_ready: asyncio.Future[PreparedSharedPriceKeyMap] = loop.create_future()
+    price_key_ready: _PreparedPriceKeyFuture = (
+        asyncio.get_running_loop().create_future()
+    )
 
-    def notify_price_key_ready(prepared_key: PreparedSharedPriceKeyMap) -> None:
-        """Announce the single validated price-key map to the finalizer lane."""
-
+    def _notify_price_key_ready(prepared_key: PreparedSharedPriceKeyMap) -> None:
         if price_key_ready.done():
             raise RuntimeError("strict V3 price-key stage reported readiness twice")
         price_key_ready.set_result(prepared_key)
 
-    price_prepare_started_at = time.monotonic()
+    started_at = time.monotonic()
 
-    async def prepare_price() -> tuple[PreparedSharedPriceArtifacts, float]:
-        """Prepare price artifacts and retain their measured wall time."""
-
+    async def _prepare_price() -> tuple[PreparedSharedPriceArtifacts, float]:
         prepared = await prepare_shared_price_artifacts(
             schema_name=schema_name,
             manifest_stage_table=manifest_stage_table,
             price_set_summary_source_count=price_set_summary_source_count,
-            price_key_ready=notify_price_key_ready,
+            price_key_ready=_notify_price_key_ready,
         )
-        return prepared, time.monotonic() - price_prepare_started_at
+        return prepared, time.monotonic() - started_at
 
-    prepare_task = asyncio.create_task(prepare_price())
+    prepare_task = asyncio.create_task(_prepare_price())
     try:
         completed, _pending = await asyncio.wait(
             (prepare_task, price_key_ready),
             return_when=asyncio.FIRST_COMPLETED,
         )
     except BaseException:
-        prepare_task.cancel()
-        await _await_cleanup_task(asyncio.gather(prepare_task, return_exceptions=True))
-        prepared_after_cancellation = _completed_prepared_price(prepare_task)
-        if prepared_after_cancellation is not None:
-            await _await_cleanup_task(
-                asyncio.create_task(
-                    cleanup_prepared_shared_price_artifacts(prepared_after_cancellation)
-                )
-            )
+        await _cancel_price_pipeline_tasks(prepare_task)
         if not price_key_ready.done():
             price_key_ready.cancel()
         raise
     if price_key_ready not in completed:
-        prepared, price_prepare_seconds = await prepare_task
-        prepared_price_publication = None
-        if publish_prepared_price is not None:
-            price_publish_started_at = time.monotonic()
-            prepared_price_publication = _PreparedPricePublication(
-                publication=await publish_prepared_price(prepared),
-                publish_seconds=time.monotonic() - price_publish_started_at,
-            )
-        return prepared, price_prepare_seconds, None, prepared_price_publication
-
-    finalizer_task = asyncio.create_task(
-        _export_price_map_and_run_finalizer(
-            prepared_price_key=price_key_ready.result(),
-            raw_work_directory=raw_work_directory,
-            serving_run_entries=serving_run_entries,
-            code_dictionary_entries=code_dictionary_entries,
-            provider_set_metadata_entries=provider_set_metadata_entries,
-            expected_source_identities=expected_source_identities,
-            progress_callback=finalizer_progress_callback,
-        )
-    )
-    early_price_task: asyncio.Task[_PreparedPricePublication] | None = None
-    if publish_prepared_price is not None:
-
-        async def publish_after_price_preparation() -> _PreparedPricePublication:
-            """Publish prepared price blocks while the finalizer remains active."""
-
-            prepared, _price_prepare_seconds = await prepare_task
-            price_publish_started_at = time.monotonic()
-            return _PreparedPricePublication(
-                publication=await publish_prepared_price(prepared),
-                publish_seconds=time.monotonic() - price_publish_started_at,
-            )
-
-        early_price_task = asyncio.create_task(publish_after_price_preparation())
-    try:
-        gathered = await asyncio.gather(
+        return await _complete_price_without_finalizer(
             prepare_task,
-            finalizer_task,
-            *([early_price_task] if early_price_task is not None else []),
+            publish_prepared_price,
         )
-    except BaseException:
-        active_tasks = tuple(
-            task
-            for task in (prepare_task, finalizer_task, early_price_task)
-            if task is not None
-        )
-        for task in active_tasks:
-            task.cancel()
-        await _await_cleanup_task(asyncio.gather(*active_tasks, return_exceptions=True))
-        prepared_after_failure = _completed_prepared_price(prepare_task)
-        if prepared_after_failure is not None:
-            await _await_cleanup_task(
-                asyncio.create_task(
-                    cleanup_prepared_shared_price_artifacts(prepared_after_failure)
-                )
-            )
-        raise
-    prepare_result = gathered[0]
-    prepared_finalizer = gathered[1]
-    prepared_price_publication = gathered[2] if early_price_task is not None else None
-    prepared, price_prepare_seconds = prepare_result
-    return (
-        prepared,
-        price_prepare_seconds,
-        prepared_finalizer,
-        prepared_price_publication,
+    return await _complete_early_finalizer_pipeline(
+        prepare_task=prepare_task,
+        prepared_price_key=price_key_ready.result(),
+        finalizer_inputs=finalizer_inputs,
+        publish_prepared_price=publish_prepared_price,
+        progress_callback=finalizer_progress_callback,
     )
 
 
@@ -1843,6 +1889,68 @@ async def _validate_v4_sparse_dictionary_stage(
         raise RuntimeError("PTG V4 dictionary COPY changed or duplicated keys")
 
 
+def _v4_dictionary_range_contract(
+    schema: str,
+    stage: _V4DenseDictionaryStage,
+) -> tuple[str, str, tuple[Any, Any]]:
+    """Quote one dense stage and build its reusable range statements."""
+
+    stage_table = _quote_ident(stage.stage_table)
+    target_table = _quote_ident(stage.target_table)
+    key_name = _quote_ident(stage.key_name)
+    quoted_columns = tuple(_quote_ident(column) for column in stage.columns)
+    columns = ", ".join(quoted_columns)
+    matching_columns = " AND ".join(
+        f"stored.{column} = staged.{column}" for column in quoted_columns
+    )
+    statements = (
+        db.text(
+            f"""
+            INSERT INTO {schema}.{target_table} (snapshot_key, {columns})
+            SELECT :snapshot_key, {columns}
+              FROM {schema}.{stage_table}
+             WHERE {key_name} >= :range_start
+               AND {key_name} < :range_end
+             ORDER BY {key_name}
+            ON CONFLICT DO NOTHING
+            """
+        ),
+        db.text(
+            f"""
+            SELECT COUNT(*)::bigint
+              FROM {schema}.{stage_table} AS staged
+              JOIN {schema}.{target_table} AS stored
+                ON stored.snapshot_key = :snapshot_key
+               AND {matching_columns}
+             WHERE staged.{key_name} >= :range_start
+               AND staged.{key_name} < :range_end
+            """
+        ),
+    )
+    return target_table, key_name, statements
+
+
+async def _publish_v4_dictionary_range(
+    session: Any,
+    *,
+    statements: tuple[Any, Any],
+    parameters_by_name: Mapping[str, int],
+    heartbeat_callback: Callable[[], None] | None,
+) -> tuple[int, float]:
+    """Publish and verify one authenticated dense dictionary range."""
+
+    insert_statement, verification_statement = statements
+    _, insert_seconds = await _await_v4_dictionary_statement(
+        session.execute(insert_statement, parameters_by_name),
+        heartbeat_callback=heartbeat_callback,
+    )
+    matching_count, verification_seconds = await _await_v4_dictionary_statement(
+        session.scalar(verification_statement, parameters_by_name),
+        heartbeat_callback=heartbeat_callback,
+    )
+    return int(matching_count or 0), max(insert_seconds, verification_seconds)
+
+
 async def _publish_v4_dictionary_stage_ranges(
     session: Any,
     *,
@@ -1854,7 +1962,16 @@ async def _publish_v4_dictionary_stage_ranges(
 ) -> None:
     """Publish one validated dictionary through bounded key-range statements."""
 
-    if not stage.dense_keys:
+    if stage.dense_keys:
+        await _publish_v4_dense_dictionary_ranges(
+            session,
+            schema=schema,
+            snapshot_key=snapshot_key,
+            stage=stage,
+            progress_callback=progress_callback,
+            heartbeat_callback=heartbeat_callback,
+        )
+    else:
         await _publish_v4_sparse_dictionary_stage_ranges(
             session,
             schema=schema,
@@ -1863,14 +1980,22 @@ async def _publish_v4_dictionary_stage_ranges(
             progress_callback=progress_callback,
             heartbeat_callback=heartbeat_callback,
         )
-        return
-    stage_table = _quote_ident(stage.stage_table)
-    target_table = _quote_ident(stage.target_table)
-    key_name = _quote_ident(stage.key_name)
-    quoted_columns = tuple(_quote_ident(column) for column in stage.columns)
-    columns = ", ".join(quoted_columns)
-    matching_columns = " AND ".join(
-        f"stored.{column} = staged.{column}" for column in quoted_columns
+
+
+async def _publish_v4_dense_dictionary_ranges(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    stage: _V4DenseDictionaryStage,
+    progress_callback: Callable[[str, int], None] | None,
+    heartbeat_callback: Callable[[], None] | None = None,
+) -> None:
+    """Publish one dense dictionary through bounded key-range statements."""
+
+    target_table, key_name, statements = _v4_dictionary_range_contract(
+        schema,
+        stage,
     )
     range_start = 0
     sizer = _V4DictionaryBatchSizer(
@@ -1887,47 +2012,19 @@ async def _publish_v4_dictionary_stage_ranges(
             "range_start": range_start,
             "range_end": range_end,
         }
-        _, insert_seconds = await _await_v4_dictionary_statement(
-            session.execute(
-                db.text(
-                    f"""
-                    INSERT INTO {schema}.{target_table} (snapshot_key, {columns})
-                    SELECT :snapshot_key, {columns}
-                      FROM {schema}.{stage_table}
-                     WHERE {key_name} >= :range_start
-                       AND {key_name} < :range_end
-                     ORDER BY {key_name}
-                    ON CONFLICT DO NOTHING
-                    """
-                ),
-                range_parameters_by_name,
-            ),
-            heartbeat_callback=heartbeat_callback,
-        )
-        matching_count, verification_seconds = await _await_v4_dictionary_statement(
-            session.scalar(
-                db.text(
-                    f"""
-                        SELECT COUNT(*)::bigint
-                          FROM {schema}.{stage_table} AS staged
-                          JOIN {schema}.{target_table} AS stored
-                            ON stored.snapshot_key = :snapshot_key
-                           AND {matching_columns}
-                         WHERE staged.{key_name} >= :range_start
-                           AND staged.{key_name} < :range_end
-                        """
-                ),
-                range_parameters_by_name,
-            ),
+        matching_count, elapsed_seconds = await _publish_v4_dictionary_range(
+            session,
+            statements=statements,
+            parameters_by_name=range_parameters_by_name,
             heartbeat_callback=heartbeat_callback,
         )
         expected_rows = range_end - range_start
-        if int(matching_count or 0) != expected_rows:
+        if matching_count != expected_rows:
             raise RuntimeError("PTG V4 persisted dictionary rows changed")
         if progress_callback is not None:
             progress_callback("published_dictionary_rows", expected_rows)
             progress_callback("publish_batches", 1)
-        sizer.observe(max(insert_seconds, verification_seconds))
+        sizer.observe(elapsed_seconds)
         range_start = range_end
     await _reject_v4_dictionary_extra_keys(
         session,
@@ -4704,22 +4801,11 @@ def _attach_v4_dictionary_publication_contract(
         )
 
 
-def _physical_serving_index(
-    *,
-    snapshot_key: int,
-    coverage_scope_id: bytes,
+def _physical_finalizer_fields(
     finalizer_summary: Mapping[str, Any],
     price_publication: Any,
-    graph_publication: Any,
-    code_count: int,
-    audit_sample: Mapping[str, Any],
-    source_witness: Mapping[str, Any],
-    provider_identifier_quarantine: Mapping[str, Any],
-    finalizer_block_copy: Mapping[str, Any],
-    stored_byte_count: int,
-    full_rebuild_scope_digest: str | None = None,
 ) -> dict[str, Any]:
-    """Build the physical serving index from validated publication summaries."""
+    """Build serving fields owned by finalizer and price publication."""
 
     blocks = _mapping(finalizer_summary.get("blocks"), "blocks")
     dense_keys = _mapping(finalizer_summary.get("dense_keys"), "dense_keys")
@@ -4742,11 +4828,65 @@ def _physical_serving_index(
     source_count = _integer(finalizer_summary.get("source_count"), "source_count")
     if source_count <= 0:
         raise RuntimeError("strict V3 source_count must be positive")
-    quarantine = validate_provider_identifier_quarantine(provider_identifier_quarantine)
     price_dictionary = {
         **price_encoder,
         "price_set_count": _integer(price_dense.get("count"), "price key count"),
     }
+    return {
+        "source_count": source_count,
+        "serving_rates": serving_rate_count,
+        "rate_count": serving_rate_count,
+        "atom_key_bits": int(price_publication.atom_key_bits),
+        "price_atom_constant_keys": dict(price_publication.price_atom_constant_keys),
+        "price_atom_constant_values": dict(
+            price_publication.price_atom_constant_values
+        ),
+        "price_stage": dict(price_publication.stage_metrics),
+        "serving_binary": {
+            "format": "postgres_binary_v3",
+            "price_dictionary": price_dictionary,
+            "price_set_atom_memberships_v3": membership_summary_map,
+            "price_atoms_v3": atom_summary_map,
+            "assigned_encoder": assigned_encoder,
+        },
+        "timings": dict(finalizer_summary.get("timings") or {}),
+    }
+
+
+def _physical_provider_graph(graph_publication: Any) -> dict[str, Any]:
+    """Build provider-graph fields owned by graph publication."""
+
+    return {
+        "owner_count": int(graph_publication.owner_count),
+        "provider_group_count": int(graph_publication.provider_group_count),
+        "npi_count": int(graph_publication.npi_count),
+        "block_count": int(graph_publication.block_count),
+        "representation": str(getattr(graph_publication, "representation", "")),
+        "adaptive_layout": dict(getattr(graph_publication, "adaptive_layout", {})),
+        "inferred_taxonomy_candidates": dict(
+            getattr(graph_publication, "inferred_taxonomy_candidates", {})
+        ),
+        "provider_tax_identity": dict(
+            getattr(graph_publication, "provider_tax_identity", {})
+        ),
+        "provider_tax_identity_source": dict(
+            getattr(graph_publication, "provider_tax_identity_source", {})
+        ),
+    }
+
+
+def _physical_serving_index(
+    *,
+    snapshot_key: int,
+    coverage_scope_id: bytes,
+    finalizer_summary: Mapping[str, Any],
+    price_publication: Any,
+    graph_publication: Any,
+    code_count: int,
+    full_rebuild_scope_digest: str | None = None,
+) -> dict[str, Any]:
+    """Build the physical serving index from validated publication summaries."""
+
     serving_index = {
         "storage": "manifest_snapshot",
         "type": "ptg2_shared_blocks_v3",
@@ -4765,58 +4905,9 @@ def _physical_serving_index(
         "id_storage": "binary128",
         "serving_table_layout": "lean_provider_key_v1",
         "shared_block_layout": PTG2_V3_SHARED_BLOCK_LAYOUT,
-        "source_count": source_count,
         "code_count": int(code_count),
-        "serving_rates": serving_rate_count,
-        "rate_count": serving_rate_count,
-        "atom_key_bits": int(price_publication.atom_key_bits),
-        "price_atom_constant_keys": dict(price_publication.price_atom_constant_keys),
-        "price_atom_constant_values": dict(
-            price_publication.price_atom_constant_values
-        ),
-        "price_stage": dict(price_publication.stage_metrics),
-        "serving_binary": {
-            "format": "postgres_binary_v3",
-            "price_dictionary": price_dictionary,
-            "price_set_atom_memberships_v3": membership_summary_map,
-            "price_atoms_v3": atom_summary_map,
-            "assigned_encoder": assigned_encoder,
-        },
-        "provider_graph": {
-            "owner_count": int(graph_publication.owner_count),
-            "provider_group_count": int(graph_publication.provider_group_count),
-            "npi_count": int(graph_publication.npi_count),
-            "block_count": int(graph_publication.block_count),
-            "representation": str(getattr(graph_publication, "representation", "")),
-            "adaptive_layout": dict(getattr(graph_publication, "adaptive_layout", {})),
-            "inferred_taxonomy_candidates": dict(
-                getattr(
-                    graph_publication,
-                    "inferred_taxonomy_candidates",
-                    {},
-                )
-            ),
-            "provider_tax_identity": dict(
-                getattr(
-                    graph_publication,
-                    "provider_tax_identity",
-                    {},
-                )
-            ),
-            "provider_tax_identity_source": dict(
-                getattr(
-                    graph_publication,
-                    "provider_tax_identity_source",
-                    {},
-                )
-            ),
-        },
-        "provider_identifier_quarantine": quarantine,
-        "finalizer_block_copy": dict(finalizer_block_copy),
-        "audit_sample": dict(audit_sample),
-        "source_witness": dict(source_witness),
-        "storage_bytes": int(stored_byte_count),
-        "timings": dict(finalizer_summary.get("timings") or {}),
+        **_physical_finalizer_fields(finalizer_summary, price_publication),
+        "provider_graph": _physical_provider_graph(graph_publication),
     }
     _attach_v4_dictionary_publication_contract(
         serving_index,
@@ -5436,12 +5527,16 @@ async def _publish_prepared_shared_layout(
             price_publication=price_publication,
             graph_publication=graph_publication,
             code_count=dictionary_publication.code_count,
-            audit_sample=audit_publication.metadata,
-            source_witness=source_witness_publication.metadata,
-            provider_identifier_quarantine=quarantine,
-            finalizer_block_copy=finalizer_block_copy_manifest,
-            stored_byte_count=stored_byte_count,
             full_rebuild_scope_digest=full_rebuild_scope_digest,
+        )
+        provisional_serving_index.update(
+            {
+                "provider_identifier_quarantine": quarantine,
+                "finalizer_block_copy": dict(finalizer_block_copy_manifest),
+                "audit_sample": dict(audit_publication.metadata),
+                "source_witness": dict(source_witness_publication.metadata),
+                "storage_bytes": int(stored_byte_count),
+            }
         )
         provisional_serving_index["timings"] = {
             **dict(provisional_serving_index.get("timings") or {}),
@@ -5700,11 +5795,13 @@ async def publish_strict_shared_v3_layout(
                 schema_name=schema_name,
                 manifest_stage_table=manifest_stage_table,
                 price_set_summary_source_count=price_set_summary_source_count,
-                raw_work_directory=raw_work_directory,
-                serving_run_entries=serving_run_entries,
-                code_dictionary_entries=code_dictionary_entries,
-                provider_set_metadata_entries=provider_set_metadata_entries,
-                expected_source_identities=expected_source_identities,
+                finalizer_inputs=_EarlyFinalizerInputs(
+                    raw_work_directory=raw_work_directory,
+                    serving_run_entries=serving_run_entries,
+                    code_dictionary_entries=code_dictionary_entries,
+                    provider_set_metadata_entries=provider_set_metadata_entries,
+                    expected_source_identities=expected_source_identities,
+                ),
                 publish_prepared_price=publish_prepared_price_early,
                 finalizer_progress_callback=(
                     finalizer_progress.add if progress_callback is not None else None

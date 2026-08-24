@@ -200,11 +200,13 @@ async def test_finalizer_starts_before_independent_atom_preparation_finishes(
             schema_name="mrf",
             manifest_stage_table="manifest_stage",
             price_set_summary_source_count=1,
-            raw_work_directory=tmp_path,
-            serving_run_entries=(),
-            code_dictionary_entries=(),
-            provider_set_metadata_entries=(),
-            expected_source_identities=(),
+            finalizer_inputs=shared_snapshot_publish._EarlyFinalizerInputs(
+                raw_work_directory=tmp_path,
+                serving_run_entries=(),
+                code_dictionary_entries=(),
+                provider_set_metadata_entries=(),
+                expected_source_identities=(),
+            ),
             publish_prepared_price=publish_price,
         )
     )
@@ -274,11 +276,13 @@ async def test_early_finalizer_failure_cleans_successful_price_preparation(
             schema_name="mrf",
             manifest_stage_table="manifest_stage",
             price_set_summary_source_count=1,
-            raw_work_directory=tmp_path,
-            serving_run_entries=(),
-            code_dictionary_entries=(),
-            provider_set_metadata_entries=(),
-            expected_source_identities=(),
+            finalizer_inputs=shared_snapshot_publish._EarlyFinalizerInputs(
+                raw_work_directory=tmp_path,
+                serving_run_entries=(),
+                code_dictionary_entries=(),
+                provider_set_metadata_entries=(),
+                expected_source_identities=(),
+            ),
         )
 
     cleanup.assert_awaited_once_with(prepared_price)
@@ -316,11 +320,13 @@ async def test_cancellation_before_price_key_readiness_drains_preparation(
             schema_name="mrf",
             manifest_stage_table="manifest_stage",
             price_set_summary_source_count=1,
-            raw_work_directory=tmp_path,
-            serving_run_entries=(),
-            code_dictionary_entries=(),
-            provider_set_metadata_entries=(),
-            expected_source_identities=(),
+            finalizer_inputs=shared_snapshot_publish._EarlyFinalizerInputs(
+                raw_work_directory=tmp_path,
+                serving_run_entries=(),
+                code_dictionary_entries=(),
+                provider_set_metadata_entries=(),
+                expected_source_identities=(),
+            ),
         )
     )
     await preparation_started.wait()

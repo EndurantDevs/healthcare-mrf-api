@@ -174,11 +174,13 @@ async def test_price_preparation_without_early_key_can_publish_after_completion(
         schema_name="mrf",
         manifest_stage_table="stage",
         price_set_summary_source_count=1,
-        raw_work_directory=".",
-        serving_run_entries=(),
-        code_dictionary_entries=(),
-        provider_set_metadata_entries=(),
-        expected_source_identities=(),
+        finalizer_inputs=publisher._EarlyFinalizerInputs(
+            raw_work_directory=".",
+            serving_run_entries=(),
+            code_dictionary_entries=(),
+            provider_set_metadata_entries=(),
+            expected_source_identities=(),
+        ),
         publish_prepared_price=publish_prepared,
     )
 

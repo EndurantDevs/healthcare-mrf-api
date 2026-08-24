@@ -188,6 +188,21 @@ async def test_slow_sql_stage_reports_exact_bounded_rows_before_completion(
     )
 
 
+def test_batch_validation_is_driven_by_bounded_point_probes():
+    """Each batch stays bounded even when durable tables are very large."""
+
+    validation_sql = ptg2_shared_publish._BATCH_AGGREGATE_SQL
+    assert "FROM {batch} AS batch" in validation_sql
+    assert "WHERE candidate.ctid = batch.row_ctid" in validation_sql
+    assert "WHERE candidate.block_hash = staged.block_hash" in validation_sql
+    assert "WHERE candidate.snapshot_key = :snapshot_key" in validation_sql
+    assert "candidate.object_kind = staged.object_kind" in validation_sql
+    assert "candidate.block_key = staged.block_key" in validation_sql
+    assert "candidate.fragment_no = staged.fragment_no" in validation_sql
+    assert validation_sql.count("JOIN LATERAL") == 3
+    assert validation_sql.count("LIMIT 1") == 3
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_progress", (False, True))
 async def test_v4_cas_session_helper_is_read_only_for_both_paths(
