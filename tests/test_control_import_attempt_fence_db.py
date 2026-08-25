@@ -105,7 +105,7 @@ class _FrozenValidationFailureHarness:
     async def fail_if_engine_started(self, **_kwargs):
         raise AssertionError("frozen validation failure started the engine")
 
-    async def flush_status(self, run_id):
+    async def flush_status(self, run_id) -> None:
         self.flushed_run_ids.append(run_id)
 
 

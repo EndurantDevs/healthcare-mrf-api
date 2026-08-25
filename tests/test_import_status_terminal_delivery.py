@@ -111,7 +111,7 @@ async def test_pending_capacity_preserves_terminals_across_runs(monkeypatch):
     monkeypatch.setattr(status_events, "_status_event_url", lambda: "https://sink.invalid/events")
     monkeypatch.setattr(status_events, "_post_event", posted_events.append)
 
-    def enqueue_before_bind():
+    def enqueue_before_bind() -> None:
         status_events.enqueue_status_event({"run_id": "run-a", "status": "succeeded"})
         status_events.enqueue_status_event({"run_id": "run-b", "status": "failed"})
         status_events.enqueue_status_event({"run_id": "run-c", "status": "running"})
