@@ -118,7 +118,10 @@ async def install_arm_schema(dsn: str, *, schema_name: str) -> None:
         _SELECTIVE_V4_MAP_PACK_DDL.format(schema=_quote_ident(schema_name))
     )
     migration_module = migration("20260825120000_ptg_v4_finalizer_map_pack.py")
-    with patch.dict(os.environ, {"HLTHPRT_DB_SCHEMA": schema_name}):
+    with patch.dict(
+        os.environ,
+        {"DB_SCHEMA": schema_name, "HLTHPRT_DB_SCHEMA": schema_name},
+    ):
         await run_migration_action(dsn, migration_module, "upgrade")
 
 

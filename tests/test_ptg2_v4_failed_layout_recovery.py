@@ -346,6 +346,11 @@ async def test_owner_records_reloads_after_locked_layout(monkeypatch) -> None:
         "_is_owned_v4_layout_locked",
         AsyncMock(return_value=True),
     )
+    monkeypatch.setattr(
+        owner,
+        "_has_finalizer_map_tables",
+        AsyncMock(return_value=False),
+    )
 
     assert await owner._owner_records(
         object(),
@@ -359,6 +364,9 @@ async def test_owner_records_reloads_after_locked_layout(monkeypatch) -> None:
         call.kwargs["lock_logical_owner"]
         for call in load_mock.await_args_list
     ] == [True, False]
+    assert owner._is_owned_v4_layout_locked.await_args.kwargs[
+        "finalizer_tables_available"
+    ] is False
 
 
 @pytest.mark.parametrize("lock_outcome", [False, RuntimeError("corrupt")])
@@ -378,6 +386,11 @@ async def test_owner_lock_failures_become_recovery_conflicts(
         else AsyncMock(return_value=lock_outcome)
     )
     monkeypatch.setattr(owner, "_is_owned_v4_layout_locked", lock_mock)
+    monkeypatch.setattr(
+        owner,
+        "_has_finalizer_map_tables",
+        AsyncMock(return_value=False),
+    )
 
     with pytest.raises(recovery.PTG2V4RecoveryConflict):
         await owner._owner_records(

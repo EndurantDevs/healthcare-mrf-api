@@ -188,11 +188,18 @@ class _ReservationSession:
 
 
 @pytest.mark.asyncio
-async def test_reservation_load_selects_finalizer_root_and_mixed_storage_fence() -> None:
+async def test_reservation_load_selects_finalizer_root_and_mixed_storage_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     session = _ReservationSession()
+    monkeypatch.setattr(
+        "process.ptg_parts.ptg2_v4_finalizer_maps._has_finalizer_map_tables",
+        AsyncMock(return_value=True),
+    )
 
     loaded = await snapshot_maps._load_v4_layout_reservation(
         session,
+        schema_name="mrf",
         schema='"mrf"',
         fingerprint=b"f" * 32,
     )
@@ -212,9 +219,14 @@ async def test_seal_reuse_load_selects_finalizer_root_and_mixed_storage_fence(
     session = _ReservationSession()
     digest_lock = AsyncMock()
     monkeypatch.setattr(snapshot_maps, "acquire_layout_digest_lock", digest_lock)
+    monkeypatch.setattr(
+        "process.ptg_parts.ptg2_v4_finalizer_maps._has_finalizer_map_tables",
+        AsyncMock(return_value=True),
+    )
 
     loaded = await snapshot_maps._load_reusable_v4_layout(
         session,
+        schema_name="mrf",
         schema='"mrf"',
         snapshot_key=19,
         mapping_digest=b"m" * 32,
@@ -232,6 +244,49 @@ async def test_seal_reuse_load_selects_finalizer_root_and_mixed_storage_fence(
         digest=b"m" * 32,
         purpose="V4 mapping digest",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("loader", "kwargs"),
+    (
+        (
+            snapshot_maps._load_v4_layout_reservation,
+            {"fingerprint": b"f" * 32},
+        ),
+        (
+            snapshot_maps._load_reusable_v4_layout,
+            {
+                "snapshot_key": 19,
+                "mapping_digest": b"m" * 32,
+                "support_digest": b"s" * 32,
+            },
+        ),
+    ),
+)
+async def test_layout_loaders_accept_clean_legacy_finalizer_storage_absence(
+    monkeypatch: pytest.MonkeyPatch,
+    loader,
+    kwargs,
+) -> None:
+    session = _ReservationSession()
+    monkeypatch.setattr(snapshot_maps, "acquire_layout_digest_lock", AsyncMock())
+    monkeypatch.setattr(
+        "process.ptg_parts.ptg2_v4_finalizer_maps._has_finalizer_map_tables",
+        AsyncMock(return_value=False),
+    )
+
+    loaded = await loader(
+        session,
+        schema_name="mrf",
+        schema='"mrf"',
+        **kwargs,
+    )
+
+    assert loaded == {"snapshot_key": 17}
+    assert "ptg2_v4_finalizer_map_root" not in session.sql
+    assert "FALSE AS finalizer_root_present" in session.sql
+    assert "finalizer_relational_mapping_present" in session.sql
 
 
 def test_seal_reuse_authenticates_finalizer_root_after_graph_root(

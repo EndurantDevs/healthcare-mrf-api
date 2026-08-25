@@ -21702,8 +21702,12 @@ impl V4FinalizerPackArtifactWriter {
         })
     }
 
-    fn begin_row(&mut self) -> io::Result<()> {
-        self.writer.write_all(&10i16.to_be_bytes())
+    fn write_row(&mut self, fields: [&[u8]; 10], count_label: &str) -> io::Result<()> {
+        self.writer.write_all(&10i16.to_be_bytes())?;
+        for field in fields {
+            write_pg_binary_copy_field(&mut self.writer, field)?;
+        }
+        add_v4_finalizer_count(&mut self.row_count, 1, count_label)
     }
 
     fn finish(mut self) -> io::Result<Value> {
@@ -21865,25 +21869,33 @@ impl V4FinalizerPackLaneWriter {
     }
 
     fn write_target(&mut self, row: &V4FinalizerSourceRow) -> io::Result<()> {
-        self.target_blocks.begin_row()?;
-        write_pg_binary_copy_field(&mut self.target_blocks.writer, &row.block_hash)?;
-        write_pg_binary_copy_i16_field(&mut self.target_blocks.writer, row.format_version)?;
-        write_pg_binary_copy_field(&mut self.target_blocks.writer, row.object_kind.as_bytes())?;
-        write_pg_binary_copy_i64_field(&mut self.target_blocks.writer, row.block_key)?;
-        write_pg_binary_copy_i32_field(&mut self.target_blocks.writer, row.fragment_no)?;
-        write_pg_binary_copy_i64_field(&mut self.target_blocks.writer, row.entry_count)?;
-        write_pg_binary_copy_field(&mut self.target_blocks.writer, row.codec.as_bytes())?;
-        write_pg_binary_copy_i64_field(&mut self.target_blocks.writer, row.raw_byte_count)?;
-        write_pg_binary_copy_i64_field(&mut self.target_blocks.writer, row.stored_byte_count)?;
-        write_pg_binary_copy_field(&mut self.target_blocks.writer, &row.payload)?;
-        add_v4_finalizer_count(&mut self.target_blocks.row_count, 1, "target row count")?;
+        let format_version = row.format_version.to_be_bytes();
+        let block_key = row.block_key.to_be_bytes();
+        let fragment_no = row.fragment_no.to_be_bytes();
+        let entry_count = row.entry_count.to_be_bytes();
+        let raw_byte_count = row.raw_byte_count.to_be_bytes();
+        let stored_byte_count = row.stored_byte_count.to_be_bytes();
+        self.target_blocks.write_row(
+            [
+                &row.block_hash,
+                &format_version,
+                row.object_kind.as_bytes(),
+                &block_key,
+                &fragment_no,
+                &entry_count,
+                row.codec.as_bytes(),
+                &raw_byte_count,
+                &stored_byte_count,
+                &row.payload,
+            ],
+            "target row count",
+        )?;
         add_v4_finalizer_count(&mut self.target_block_count, 1, "target block count")?;
         add_v4_finalizer_count(
             &mut self.target_stored_byte_count,
             row.stored_byte_count as u64,
             "target stored byte count",
-        )?;
-        Ok(())
+        )
     }
 
     fn add_mapping(&mut self, row: &V4FinalizerSourceRow) -> io::Result<()> {
@@ -21995,49 +22007,56 @@ impl V4FinalizerPackLaneWriter {
         let map_block_key = i64::try_from(self.map_block_count).map_err(to_io_error)?;
         let map_payload_bytes = map_payload.len() as i64;
 
-        self.map_blocks.begin_row()?;
-        write_pg_binary_copy_field(&mut self.map_blocks.writer, &map_block_hash)?;
-        write_pg_binary_copy_i16_field(
-            &mut self.map_blocks.writer,
-            PTG2_V3_SHARED_BLOCK_FORMAT_VERSION,
+        let map_format_version = PTG2_V3_SHARED_BLOCK_FORMAT_VERSION.to_be_bytes();
+        let map_block_key_bytes = map_block_key.to_be_bytes();
+        let zero_fragment = 0i32.to_be_bytes();
+        let coordinate_count_i64 = i64::from(coordinate_count).to_be_bytes();
+        let map_payload_bytes = map_payload_bytes.to_be_bytes();
+        self.map_blocks.write_row(
+            [
+                &map_block_hash,
+                &map_format_version,
+                V4_FINALIZER_MAP_BLOCK_KIND.as_bytes(),
+                &map_block_key_bytes,
+                &zero_fragment,
+                &coordinate_count_i64,
+                b"none",
+                &map_payload_bytes,
+                &map_payload_bytes,
+                &map_payload,
+            ],
+            "map block row count",
         )?;
-        write_pg_binary_copy_field(
-            &mut self.map_blocks.writer,
-            V4_FINALIZER_MAP_BLOCK_KIND.as_bytes(),
-        )?;
-        write_pg_binary_copy_i64_field(&mut self.map_blocks.writer, map_block_key)?;
-        write_pg_binary_copy_i32_field(&mut self.map_blocks.writer, 0)?;
-        write_pg_binary_copy_i64_field(&mut self.map_blocks.writer, i64::from(coordinate_count))?;
-        write_pg_binary_copy_field(&mut self.map_blocks.writer, b"none")?;
-        write_pg_binary_copy_i64_field(&mut self.map_blocks.writer, map_payload_bytes)?;
-        write_pg_binary_copy_i64_field(&mut self.map_blocks.writer, map_payload_bytes)?;
-        write_pg_binary_copy_field(&mut self.map_blocks.writer, &map_payload)?;
-        add_v4_finalizer_count(&mut self.map_blocks.row_count, 1, "map block row count")?;
 
-        self.map_packs.begin_row()?;
-        write_pg_binary_copy_field(&mut self.map_packs.writer, object_kind.as_bytes())?;
-        write_pg_binary_copy_i32_field(
-            &mut self.map_packs.writer,
-            i32::try_from(pack_no).map_err(to_io_error)?,
+        let pack_no_bytes = i32::try_from(pack_no).map_err(to_io_error)?.to_be_bytes();
+        let first_block_key = first.block_key.to_be_bytes();
+        let first_fragment_no = first.fragment_no.to_be_bytes();
+        let last_block_key = last.block_key.to_be_bytes();
+        let last_fragment_no = last.fragment_no.to_be_bytes();
+        let coordinate_count_bytes = i32::try_from(coordinate_count)
+            .map_err(to_io_error)?
+            .to_be_bytes();
+        let entry_count_bytes = i64::try_from(entry_count)
+            .map_err(to_io_error)?
+            .to_be_bytes();
+        let logical_byte_count_bytes = i64::try_from(logical_byte_count)
+            .map_err(to_io_error)?
+            .to_be_bytes();
+        self.map_packs.write_row(
+            [
+                object_kind.as_bytes(),
+                &pack_no_bytes,
+                &first_block_key,
+                &first_fragment_no,
+                &last_block_key,
+                &last_fragment_no,
+                &coordinate_count_bytes,
+                &entry_count_bytes,
+                &logical_byte_count_bytes,
+                &map_block_hash,
+            ],
+            "map pack row count",
         )?;
-        write_pg_binary_copy_i64_field(&mut self.map_packs.writer, first.block_key)?;
-        write_pg_binary_copy_i32_field(&mut self.map_packs.writer, first.fragment_no)?;
-        write_pg_binary_copy_i64_field(&mut self.map_packs.writer, last.block_key)?;
-        write_pg_binary_copy_i32_field(&mut self.map_packs.writer, last.fragment_no)?;
-        write_pg_binary_copy_i32_field(
-            &mut self.map_packs.writer,
-            i32::try_from(coordinate_count).map_err(to_io_error)?,
-        )?;
-        write_pg_binary_copy_i64_field(
-            &mut self.map_packs.writer,
-            i64::try_from(entry_count).map_err(to_io_error)?,
-        )?;
-        write_pg_binary_copy_i64_field(
-            &mut self.map_packs.writer,
-            i64::try_from(logical_byte_count).map_err(to_io_error)?,
-        )?;
-        write_pg_binary_copy_field(&mut self.map_packs.writer, &map_block_hash)?;
-        add_v4_finalizer_count(&mut self.map_packs.row_count, 1, "map pack row count")?;
 
         state.digest.update(pack_no.to_be_bytes());
         state.digest.update(first.block_key.to_be_bytes());
@@ -22055,8 +22074,7 @@ impl V4FinalizerPackLaneWriter {
             &mut self.stored_map_byte_count,
             map_payload.len() as u64,
             "stored map byte count",
-        )?;
-        Ok(())
+        )
     }
 
     fn finish(mut self, staged_root: &Path) -> io::Result<V4FinalizerLaneSummary> {
@@ -22143,17 +22161,21 @@ impl V4FinalizerCanonicalSegment {
 
     fn write_mapping(&mut self, row: &V4FinalizerSourceRow) -> io::Result<()> {
         let object_kind_bytes = row.object_kind.as_bytes();
-        self.writer
-            .write_all(&(object_kind_bytes.len() as u32).to_be_bytes())?;
-        self.writer.write_all(object_kind_bytes)?;
-        self.writer.write_all(&row.block_key.to_be_bytes())?;
-        self.writer
-            .write_all(&(row.fragment_no as u32).to_be_bytes())?;
-        self.writer
-            .write_all(&(row.entry_count as u64).to_be_bytes())?;
-        self.writer.write_all(&row.block_hash)?;
-        add_v4_finalizer_count(&mut self.row_count, 1, "canonical row count")?;
-        Ok(())
+        let mut encoded = [0u8; 120];
+        let mut end = 4;
+        encoded[..end].copy_from_slice(&(object_kind_bytes.len() as u32).to_be_bytes());
+        encoded[end..end + object_kind_bytes.len()].copy_from_slice(object_kind_bytes);
+        end += object_kind_bytes.len();
+        encoded[end..end + 8].copy_from_slice(&row.block_key.to_be_bytes());
+        end += 8;
+        encoded[end..end + 4].copy_from_slice(&(row.fragment_no as u32).to_be_bytes());
+        end += 4;
+        encoded[end..end + 8].copy_from_slice(&(row.entry_count as u64).to_be_bytes());
+        end += 8;
+        encoded[end..end + 32].copy_from_slice(&row.block_hash);
+        end += 32;
+        self.writer.write_all(&encoded[..end])?;
+        add_v4_finalizer_count(&mut self.row_count, 1, "canonical row count")
     }
 
     fn finish(mut self) -> io::Result<(PathBuf, u64, u64)> {

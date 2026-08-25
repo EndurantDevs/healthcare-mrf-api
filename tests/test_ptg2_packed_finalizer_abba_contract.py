@@ -31,6 +31,7 @@ from scripts.research.ptg2_packed_finalizer_abba_inputs import (
     load_representative_artifacts,
 )
 from scripts.research import ptg2_packed_finalizer_abba as abba
+from scripts.research import ptg2_packed_finalizer_abba_lifecycle as lifecycle
 from scripts.research import ptg2_packed_finalizer_abba_local_screen as local_screen
 
 
@@ -50,6 +51,34 @@ def test_mechanism_speed_gate_uses_comparable_whole_wrapper_time():
     )
 
     assert gates["packed_faster_than_legacy_whole_wrapper"] is True
+
+
+@pytest.mark.asyncio
+async def test_install_arm_schema_binds_both_schema_environment_names(monkeypatch):
+    schema_name = "ptg_packed_abba_0123456789ab_b1"
+    observed_by_name = {}
+
+    async def capture_migration(_dsn, _migration, _action):
+        observed_by_name.update(
+            DB_SCHEMA=os.environ.get("DB_SCHEMA"),
+            HLTHPRT_DB_SCHEMA=os.environ.get("HLTHPRT_DB_SCHEMA"),
+        )
+
+    monkeypatch.setattr(lifecycle, "_create_shared_schema", AsyncMock())
+    monkeypatch.setattr(lifecycle.db, "execute_ddl", AsyncMock())
+    monkeypatch.setattr(lifecycle, "migration", lambda _name: object())
+    monkeypatch.setattr(lifecycle, "run_migration_action", capture_migration)
+    monkeypatch.setenv("DB_SCHEMA", "mrf")
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
+
+    await lifecycle.install_arm_schema("postgresql://test", schema_name=schema_name)
+
+    assert observed_by_name == {
+        "DB_SCHEMA": schema_name,
+        "HLTHPRT_DB_SCHEMA": schema_name,
+    }
+    assert os.environ["DB_SCHEMA"] == "mrf"
+    assert os.environ["HLTHPRT_DB_SCHEMA"] == "mrf"
 
 
 def test_synthetic_shape_and_artifacts_are_exact_and_fail_closed(tmp_path):

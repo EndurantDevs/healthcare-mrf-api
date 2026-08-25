@@ -2113,16 +2113,7 @@ async def summarize_persisted_v4_snapshot_metadata(
     )
 
 
-_V4_LAYOUT_RESERVATION_SQL = """
-    SELECT layout.snapshot_key, layout.state, layout.generation,
-           layout.build_token, layout.layout_manifest,
-           layout.mapping_digest AS layout_mapping_digest,
-           root.state AS root_state, root.format_version AS root_format_version,
-           root.map_format, root.representation, root.projection_id_scope,
-           root.map_digest, root.object_kind_count, root.map_pack_count,
-           root.coordinate_count, root.entry_count, root.logical_byte_count,
-           root.stored_map_byte_count, root.npi_count, root.component_count,
-           root.pattern_count, root.relation_count, root.heavy_owner_count,
+_FINALIZER_ROOT_PROJECTION_SQL = """
            finalizer_root.snapshot_key IS NOT NULL AS finalizer_root_present,
            finalizer_root.state AS finalizer_root_state,
            finalizer_root.contract AS finalizer_root_contract,
@@ -2142,7 +2133,63 @@ _V4_LAYOUT_RESERVATION_SQL = """
            finalizer_root.stored_map_byte_count
                AS finalizer_root_stored_map_byte_count,
            finalizer_root.target_block_count AS finalizer_root_target_block_count,
-           finalizer_root.completed_at AS finalizer_root_completed_at,
+           finalizer_root.completed_at AS finalizer_root_completed_at
+"""
+
+_ABSENT_FINALIZER_ROOT_PROJECTION_SQL = """
+           FALSE AS finalizer_root_present,
+           NULL AS finalizer_root_state,
+           NULL AS finalizer_root_contract,
+           NULL AS finalizer_root_map_format,
+           NULL AS finalizer_root_map_digest,
+           NULL AS finalizer_root_canonical_mapping_digest,
+           NULL AS finalizer_root_canonical_byte_count,
+           NULL AS finalizer_root_target_identity_digest,
+           NULL AS finalizer_root_object_kind_count,
+           NULL AS finalizer_root_map_pack_count,
+           NULL AS finalizer_root_coordinate_count,
+           NULL AS finalizer_root_entry_count,
+           NULL AS finalizer_root_logical_byte_count,
+           NULL AS finalizer_root_stored_map_byte_count,
+           NULL AS finalizer_root_target_block_count,
+           NULL AS finalizer_root_completed_at
+"""
+
+_FINALIZER_ROOT_JOIN_SQL = """
+      LEFT JOIN {schema}.ptg2_v4_finalizer_map_root AS finalizer_root
+        ON finalizer_root.snapshot_key = layout.snapshot_key
+"""
+
+
+async def _finalizer_root_layout_sql(
+    session: Any,
+    *,
+    schema_name: str,
+    schema: str,
+) -> tuple[str, str]:
+    """Select packed-root SQL only when its complete storage extension exists."""
+
+    from process.ptg_parts.ptg2_v4_finalizer_maps import _has_finalizer_map_tables
+
+    if not await _has_finalizer_map_tables(session, schema_name=schema_name):
+        return _ABSENT_FINALIZER_ROOT_PROJECTION_SQL, ""
+    return (
+        _FINALIZER_ROOT_PROJECTION_SQL,
+        _FINALIZER_ROOT_JOIN_SQL.format(schema=schema),
+    )
+
+
+_V4_LAYOUT_RESERVATION_SQL = """
+    SELECT layout.snapshot_key, layout.state, layout.generation,
+           layout.build_token, layout.layout_manifest,
+           layout.mapping_digest AS layout_mapping_digest,
+           root.state AS root_state, root.format_version AS root_format_version,
+           root.map_format, root.representation, root.projection_id_scope,
+           root.map_digest, root.object_kind_count, root.map_pack_count,
+           root.coordinate_count, root.entry_count, root.logical_byte_count,
+           root.stored_map_byte_count, root.npi_count, root.component_count,
+           root.pattern_count, root.relation_count, root.heavy_owner_count,
+{finalizer_root_projection},
            EXISTS (
                SELECT 1
                  FROM {schema}.ptg2_v3_snapshot_block AS finalizer_mapping
@@ -2156,8 +2203,7 @@ _V4_LAYOUT_RESERVATION_SQL = """
         ON layout.snapshot_key = fingerprint.snapshot_key
       LEFT JOIN {schema}.ptg2_v4_snapshot_map_root AS root
         ON root.snapshot_key = layout.snapshot_key
-      LEFT JOIN {schema}.ptg2_v4_finalizer_map_root AS finalizer_root
-        ON finalizer_root.snapshot_key = layout.snapshot_key
+{finalizer_root_join}
      WHERE fingerprint.semantic_fingerprint = :semantic_fingerprint
      LIMIT 1
 """
@@ -2166,6 +2212,7 @@ _V4_LAYOUT_RESERVATION_SQL = """
 async def _load_v4_layout_reservation(
     session: Any,
     *,
+    schema_name: str,
     schema: str,
     fingerprint: bytes,
 ) -> dict[str, Any] | None:
@@ -2175,8 +2222,19 @@ async def _load_v4_layout_reservation(
         PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
     )
 
+    finalizer_root_projection, finalizer_root_join = await _finalizer_root_layout_sql(
+        session,
+        schema_name=schema_name,
+        schema=schema,
+    )
     existing_result = await session.execute(
-        text(_V4_LAYOUT_RESERVATION_SQL.format(schema=schema)),
+        text(
+            _V4_LAYOUT_RESERVATION_SQL.format(
+                schema=schema,
+                finalizer_root_projection=finalizer_root_projection,
+                finalizer_root_join=finalizer_root_join,
+            )
+        ),
         {
             "semantic_fingerprint": fingerprint,
             "finalizer_object_kinds": PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
@@ -2473,6 +2531,7 @@ async def reserve_v4_shared_layout(
     )
     existing = await _load_v4_layout_reservation(
         session,
+        schema_name=schema_name,
         schema=schema,
         fingerprint=fingerprint,
     )
@@ -3944,26 +4003,7 @@ _REUSABLE_V4_LAYOUT_SQL = """
            root.coordinate_count, root.entry_count, root.logical_byte_count,
            root.stored_map_byte_count, root.npi_count, root.component_count,
            root.pattern_count, root.relation_count, root.heavy_owner_count,
-           finalizer_root.snapshot_key IS NOT NULL AS finalizer_root_present,
-           finalizer_root.state AS finalizer_root_state,
-           finalizer_root.contract AS finalizer_root_contract,
-           finalizer_root.map_format AS finalizer_root_map_format,
-           finalizer_root.map_digest AS finalizer_root_map_digest,
-           finalizer_root.canonical_mapping_digest
-               AS finalizer_root_canonical_mapping_digest,
-           finalizer_root.canonical_byte_count
-               AS finalizer_root_canonical_byte_count,
-           finalizer_root.target_identity_digest
-               AS finalizer_root_target_identity_digest,
-           finalizer_root.object_kind_count AS finalizer_root_object_kind_count,
-           finalizer_root.map_pack_count AS finalizer_root_map_pack_count,
-           finalizer_root.coordinate_count AS finalizer_root_coordinate_count,
-           finalizer_root.entry_count AS finalizer_root_entry_count,
-           finalizer_root.logical_byte_count AS finalizer_root_logical_byte_count,
-           finalizer_root.stored_map_byte_count
-               AS finalizer_root_stored_map_byte_count,
-           finalizer_root.target_block_count AS finalizer_root_target_block_count,
-           finalizer_root.completed_at AS finalizer_root_completed_at,
+{finalizer_root_projection},
            EXISTS (
                SELECT 1
                  FROM {schema}.ptg2_v3_snapshot_block AS finalizer_mapping
@@ -3975,8 +4015,7 @@ _REUSABLE_V4_LAYOUT_SQL = """
       FROM {schema}.ptg2_v3_snapshot_layout AS layout
       JOIN {schema}.ptg2_v4_snapshot_map_root AS root
         ON root.snapshot_key = layout.snapshot_key
-      LEFT JOIN {schema}.ptg2_v4_finalizer_map_root AS finalizer_root
-        ON finalizer_root.snapshot_key = layout.snapshot_key
+{finalizer_root_join}
      WHERE layout.generation = :generation
        AND layout.state = 'sealed'
        AND layout.mapping_digest = :mapping_digest
@@ -3990,6 +4029,7 @@ _REUSABLE_V4_LAYOUT_SQL = """
 async def _load_reusable_v4_layout(
     session: Any,
     *,
+    schema_name: str,
     schema: str,
     snapshot_key: int,
     mapping_digest: bytes,
@@ -4006,8 +4046,19 @@ async def _load_reusable_v4_layout(
         digest=mapping_digest,
         purpose="V4 mapping digest",
     )
+    finalizer_root_projection, finalizer_root_join = await _finalizer_root_layout_sql(
+        session,
+        schema_name=schema_name,
+        schema=schema,
+    )
     reusable_result = await session.execute(
-        text(_REUSABLE_V4_LAYOUT_SQL.format(schema=schema)),
+        text(
+            _REUSABLE_V4_LAYOUT_SQL.format(
+                schema=schema,
+                finalizer_root_projection=finalizer_root_projection,
+                finalizer_root_join=finalizer_root_join,
+            )
+        ),
         {
             "generation": PTG2_V4_SHARED_GENERATION,
             "mapping_digest": mapping_digest,
@@ -4278,6 +4329,7 @@ async def _reuse_v4_layout_if_available(
 ) -> int | None:
     reusable = await _load_reusable_v4_layout(
         session,
+        schema_name=state.schema_name,
         schema=state.schema,
         snapshot_key=state.snapshot_key,
         mapping_digest=state.summary.map_digest,
