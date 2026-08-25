@@ -110,7 +110,7 @@ def test_help_is_runtime_free_and_exposes_no_broad_scan(monkeypatch, capsys):
         [
             *_acquisition_arguments(),
             "--concurrency",
-            "17",
+            "33",
         ],
         [
             *_acquisition_arguments(),
@@ -158,6 +158,9 @@ def test_acquisition_defaults_match_the_bounded_runtime_contract() -> None:
     assert parsed.lease_seconds == 300
     assert parsed.retry_base_seconds == 1.0
     assert parsed.max_retry_seconds == 60.0
+    assert script_module._parser().parse_args(
+        [*_acquisition_arguments(), "--concurrency", "32"]
+    ).concurrency == 32
 
 
 @pytest.mark.asyncio

@@ -190,7 +190,7 @@ async def test_claim_rejects_invalid_fresh_only_selection():
     for excluded_npis in (
         [NPI],
         (NPI, NPI),
-        tuple(1000000000 + index for index in range(17)),
+        tuple(1000000000 + index for index in range(33)),
         (1,),
     ):
         with pytest.raises(ValueError):
