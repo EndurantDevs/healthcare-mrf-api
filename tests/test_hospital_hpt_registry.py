@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -188,6 +189,41 @@ def test_duplicate_yaml_fields_are_rejected(tmp_path, text):
 def test_malformed_yaml_is_rejected(tmp_path):
     with pytest.raises(registry.HospitalHptRegistryError, match="document_unreadable"):
         _load(tmp_path, "version: [\n")
+
+
+def test_unhashable_yaml_key_is_rejected(tmp_path):
+    with pytest.raises(registry.HospitalHptRegistryError, match="document_unreadable"):
+        _load(tmp_path, "? [unhashable]\n: value\n")
+
+
+def test_checked_in_registry_read_failure_is_normalized(tmp_path, monkeypatch):
+    monkeypatch.setattr(registry, "HOSPITAL_HPT_REGISTRY_PATH", tmp_path / "missing")
+    registry._cached_hospital_hpt_registry.cache_clear()
+    try:
+        with pytest.raises(
+            registry.HospitalHptRegistryError, match="document_unreadable"
+        ):
+            registry.load_hospital_hpt_registry()
+    finally:
+        registry._cached_hospital_hpt_registry.cache_clear()
+
+
+def test_checked_in_registry_count_is_gated(tmp_path, monkeypatch):
+    path = tmp_path / "registry.yaml"
+    path.write_text(_document(), encoding="utf-8")
+    monkeypatch.setattr(registry, "HOSPITAL_HPT_REGISTRY_PATH", path)
+    monkeypatch.setattr(
+        registry,
+        "EXPECTED_HOSPITAL_HPT_REGISTRY_SHA256",
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setattr(registry, "EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT", 2)
+    registry._cached_hospital_hpt_registry.cache_clear()
+    try:
+        with pytest.raises(registry.HospitalHptRegistryError, match="count"):
+            registry.load_hospital_hpt_registry()
+    finally:
+        registry._cached_hospital_hpt_registry.cache_clear()
 
 
 def test_runtime_selection_is_exact_and_source_neutral(monkeypatch):

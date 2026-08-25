@@ -1058,7 +1058,7 @@ async def _prepare_npi_staging(import_date: str, db_schema: str) -> None:
 
 
 @_release_lease_after_process_failure
-async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
+async def process_data(ctx, task=None):  # pragma: no cover
     """Download and process the configured NPPES dissemination files."""
     # Track whether any work actually ran so shutdown can distinguish "no jobs" from a bad import
     task = task or {}
@@ -1612,9 +1612,7 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
     context['run'] = context.get('run', 0) + 1
 
 
-async def process_data(ctx, task=None):  # pragma: no cover
-    """Run the NPI worker entry point."""
-    return await execute_npi_import_attempt(ctx, task)
+execute_npi_import_attempt = process_data
 
 
 async def startup(ctx):  # pragma: no cover
@@ -2133,7 +2131,7 @@ def _print_time_info_best_effort(started_at: object) -> None:
 
 
 @_release_lease_after_shutdown
-async def finalize_npi_import_attempt(ctx):  # pragma: no cover
+async def shutdown(ctx):  # pragma: no cover
     """Finalize, index, validate, and atomically publish an NPI import."""
     import_date = ctx['import_date']
     context = ctx.get('context') or {}
@@ -2676,9 +2674,7 @@ WHERE
     return committed_result_by_name
 
 
-async def shutdown(ctx):  # pragma: no cover
-    """Run the NPI worker shutdown entry point."""
-    return await finalize_npi_import_attempt(ctx)
+finalize_npi_import_attempt = shutdown
 
 
 async def save_npi_data(ctx, task):

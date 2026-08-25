@@ -23,6 +23,126 @@ _ArtifactStore = ArtifactStore
 _orchestrator_module = orchestrator_module
 
 
+def test_progress_reports_complete_empty_batch(monkeypatch):
+    orchestrator = _orchestrator_module()
+    events = []
+    monkeypatch.setattr(
+        orchestrator._runtime,
+        "enqueue_live_progress",
+        lambda **event_by_field: events.append(event_by_field),
+    )
+
+    orchestrator._progress(None, "complete", 0, 0, "complete")
+
+    assert events[0]["pct"] == 100
+
+
+def test_strict_positive_env_rejects_zero(monkeypatch):
+    orchestrator = _orchestrator_module()
+    monkeypatch.setenv("HOSPITAL_TEST_LIMIT", "0")
+
+    with pytest.raises(RuntimeError, match="must be a positive integer"):
+        orchestrator._runtime.strict_positive_env("HOSPITAL_TEST_LIMIT")
+
+
+@pytest.mark.asyncio
+async def test_resource_lock_yields_and_releases():
+    orchestrator = _orchestrator_module()
+
+    class Lock:
+        releases = 0
+
+        def try_acquire(self):
+            return self
+
+        def release(self):
+            self.releases += 1
+
+    lock = Lock()
+    store = _ArtifactStore()
+    store.named_lock = lambda *_args: lock
+
+    async with orchestrator._hospital_resource_lock(store):
+        assert lock.releases == 0
+    assert lock.releases == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_resource_acquire_does_not_release_unheld_lock():
+    orchestrator = _orchestrator_module()
+    acquire_started, allow_acquire = threading.Event(), threading.Event()
+
+    class Lock:
+        releases = 0
+
+        def try_acquire(self):
+            acquire_started.set()
+            assert allow_acquire.wait(timeout=1)
+            return None
+
+        def release(self):
+            self.releases += 1
+
+    lock = Lock()
+    store = _ArtifactStore()
+    store.named_lock = lambda *_args: lock
+    operation = asyncio.create_task(
+        orchestrator._hospital_resource_lock(store).__aenter__()
+    )
+    assert await asyncio.to_thread(acquire_started.wait, 1)
+    operation.cancel()
+    allow_acquire.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    assert lock.releases == 0
+
+
+@pytest.mark.asyncio
+async def test_cancellation_guard_returns_completed_operation():
+    orchestrator = _orchestrator_module()
+
+    async def operation():
+        return "done"
+
+    assert await orchestrator._guard_cancellation(
+        {}, {}, operation(), [], "owner", 30, 10
+    ) == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("heartbeat_seconds", [0, 1_000])
+async def test_cancellation_monitor_checks_and_renews(
+    monkeypatch, heartbeat_seconds
+):
+    orchestrator = _orchestrator_module()
+    calls_by_kind = {"checks": 0, "renewals": 0}
+
+    async def check_cancelled(*_args):
+        calls_by_kind["checks"] += 1
+        if calls_by_kind["checks"] == 2:
+            raise RuntimeError("cancelled")
+
+    async def renew(*_args, **_kwargs):
+        calls_by_kind["renewals"] += 1
+
+    async def operation():
+        await asyncio.Future()
+
+    monkeypatch.setattr(orchestrator._runtime, "positive_env", lambda *_args: 0)
+    monkeypatch.setattr(orchestrator._runtime, "raise_if_cancelled", check_cancelled)
+    monkeypatch.setattr(orchestrator._runtime, "renew_attempt_leases", renew)
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        await orchestrator._guard_cancellation(
+            {}, {}, operation(), [], "owner", 30, heartbeat_seconds
+        )
+    assert calls_by_kind == {
+        "checks": 2,
+        "renewals": 1 if heartbeat_seconds == 0 else 0,
+    }
+
+
 @pytest.mark.asyncio
 async def test_bounded_failure_cancels_and_drains_siblings():
     orchestrator = _orchestrator_module()

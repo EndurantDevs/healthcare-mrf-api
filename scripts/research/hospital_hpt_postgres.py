@@ -25,11 +25,13 @@ from scripts.research.hospital_hpt_postgres_sql import (
     create_sql,
     index_sql,
     materialize_sql,
+    plan_indexes,
     publish_sql,
 )
 
 SAFE_SCHEMA = re.compile(r"^hpt_bench_(?:typed|dictionary|blocks)_[a-z0-9_]+$")
 DISPOSABLE_DATABASE = re.compile(r"(?:^|[_-])test(?:[_-]|$)", re.IGNORECASE)
+HOSPITAL_MRF_SCHEMA_REVISION = "5333564a710f80d7740180b9ffab8dbdcba9b502"
 MAX_STORAGE_RATIO_TO_TYPED = 1.0
 MAX_QUERY_P95_RATIO_TO_TYPED = 1.25
 MAX_QUERY_P95_ADDITIVE_MS = 1.0
@@ -170,12 +172,9 @@ WHERE n.nspname='{schema}' AND c.relkind IN ('r','m');"""
 
 
 def _probe_sql(schema: str) -> dict[str, str]:
-    base = f"SELECT * FROM {schema}.published_price"
+    base = f"SELECT {', '.join(FACT_COLUMNS)} FROM {schema}.published_price"
     order = " ORDER BY " + ", ".join(FACT_COLUMNS)
-    comparable = (
-        "COALESCE(negotiated_dollar, median_amount, gross_amount, "
-        "discounted_cash)"
-    )
+    comparable = "comparison_amount"
     return {
         "hospital_code": base + " WHERE hospital_id='hospital-00001' AND code_system='MS-DRG' AND code='10000'" + order,
         "payer_plan": base + " WHERE payer_name='Synthetic Payer 001' AND plan_name='Synthetic Plan 001' AND code='10000'" + order,
@@ -247,9 +246,10 @@ def _wal_bytes(dsn: str, before: str, after: str) -> int:
     )
 
 
-def _explain_ms(dsn: str, sql: str) -> float:
-    plan = json.loads(_psql(dsn, f"EXPLAIN (ANALYZE, FORMAT JSON) {sql};", tuples=True))
-    return float(plan[0]["Execution Time"])
+def _explain(dsn: str, sql: str) -> dict[str, Any]:
+    return json.loads(_psql(
+        dsn, f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql};", tuples=True
+    ))[0]
 
 
 def _percentiles(samples: list[float]) -> dict[str, float]:
@@ -259,34 +259,23 @@ def _percentiles(samples: list[float]) -> dict[str, float]:
 
 
 def run_candidate(
-    dsn: str,
-    candidate: str,
-    trial: int,
-    paths: dict[str, Path],
-    expected_facts: int,
-    query_iterations: int,
+    dsn: str, candidate: str, trial: int, paths: dict[str, Path],
+    expected_facts: int, query_iterations: int,
 ) -> dict[str, Any]:
     """Load, validate, probe, and remove one exact candidate schema."""
     schema = _schema(candidate, trial)
     phase_seconds_by_name: dict[str, float] = {}
     wal_before = _wal_lsn(dsn)
     try:
-        phase_seconds_by_name["create_seconds"] = _timed_sql(dsn, create_sql(candidate, schema))
-        phase_seconds_by_name["copy_seconds"] = _timed_sql(
-            dsn, copy_sql(schema, paths)
-        )
-        phase_seconds_by_name["materialize_seconds"] = _timed_sql(
-            dsn, materialize_sql(candidate, schema)
-        )
-        phase_seconds_by_name["index_seconds"] = _timed_sql(
-            dsn, index_sql(candidate, schema)
-        )
-        phase_seconds_by_name["analyze_seconds"] = _timed_sql(
-            dsn, analyze_sql(candidate, schema)
-        )
-        phase_seconds_by_name["publish_seconds"] = _timed_sql(
-            dsn, publish_sql(candidate, schema)
-        )
+        for phase, sql in (
+            ("create", create_sql(candidate, schema)),
+            ("copy", copy_sql(schema, paths)),
+            ("materialize", materialize_sql(candidate, schema)),
+            ("index", index_sql(candidate, schema)),
+            ("analyze", analyze_sql(candidate, schema)),
+            ("publish", publish_sql(candidate, schema)),
+        ):
+            phase_seconds_by_name[f"{phase}_seconds"] = _timed_sql(dsn, sql)
         validation_started = time.perf_counter()
         count = int(_psql(dsn, f"SELECT count(*) FROM {schema}.published_price;", tuples=True))
         if count != expected_facts:
@@ -295,15 +284,26 @@ def run_candidate(
         phase_seconds_by_name["validation_seconds"] = time.perf_counter() - validation_started
         wal_after = _wal_lsn(dsn)
         probe_metrics_by_name = {}
+        comparison_index = {
+            "typed": "price_fact_comparison_idx",
+            "dictionary": "price_fact_comparison_idx",
+            "blocks": "price_lookup_comparison_idx",
+        }[candidate]
         for name, sql in _probe_sql(schema).items():
-            cold = _explain_ms(dsn, sql)
-            warm_samples = [
-                _explain_ms(dsn, sql) for _ in range(query_iterations)
-            ]
+            cold_plan = _explain(dsn, sql)
+            cold = float(cold_plan["Execution Time"])
+            indexes = plan_indexes(cold_plan)
+            if name == "comparison" and comparison_index not in indexes:
+                raise RuntimeError(
+                    f"{candidate} comparison probe did not use {comparison_index}"
+                )
+            warm_samples = [float(_explain(dsn, sql)["Execution Time"])
+                            for _ in range(query_iterations)]
             probe_metrics_by_name[name] = {
                 "cold_ms": cold,
                 **_percentiles(warm_samples),
                 "digest": _query_digest(dsn, sql),
+                "indexes": indexes,
             }
         phase_seconds_by_name["total_seconds"] = sum(phase_seconds_by_name.values())
         return {
@@ -428,14 +428,8 @@ def _surviving_candidates(summary_by_candidate: dict[str, Any]) -> list[str]:
 
 
 def run_benchmark(
-    dsn: str,
-    manifest_path: Path,
-    work_dir: Path,
-    *,
-    measured_trials: int = 5,
-    warmup_trials: int = 1,
-    query_iterations: int = 5,
-    format_name: str = "json",
+    dsn: str, manifest_path: Path, work_dir: Path, *, measured_trials: int = 5,
+    warmup_trials: int = 1, query_iterations: int = 5, format_name: str = "json",
 ) -> dict[str, Any]:
     """Run alternating fresh-schema trials and return a JSON-ready receipt."""
     if measured_trials < 1 or warmup_trials < 0 or query_iterations < 1:
@@ -453,17 +447,24 @@ def run_benchmark(
     survivors = _surviving_candidates(summaries)
     winner = min(survivors, key=lambda name: summaries[name]["median_import_seconds"])
     return {
+        "schema_version": 1,
+        "cms_schema_revision": HOSPITAL_MRF_SCHEMA_REVISION,
         "status": "passed",
         "database": database,
-        "environment": {
-            "machine": platform.machine(),
-            "postgres": _psql(dsn, "SHOW server_version;", tuples=True),
+        "environment": {"machine": platform.machine(), "postgres": _psql(dsn, "SHOW server_version;", tuples=True)},
+        "protocol": {
+            "warmup_trials": warmup_trials,
+            "measured_trials": measured_trials,
+            "query_iterations_per_trial": query_iterations,
+            "candidate_order": "rotated",
+            "source_format": format_name,
         },
         "corpus": {
             "hospitals": len(hospitals),
             "facts": len(facts),
             "format": format_name,
             "semantic_sha256": manifest["semantic_sha256"],
+            "reconstructed_sha256": trials[0]["semantic_sha256"],
             "canonical_bytes": sum(path.stat().st_size for path in paths.values()),
             "source_bytes": {
                 name: sum(

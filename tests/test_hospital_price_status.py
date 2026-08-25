@@ -59,6 +59,37 @@ def _load_module():
 status_api = _load_module()
 
 
+def test_invalid_schema_fails_at_module_load(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "bad-schema")
+
+    with pytest.raises(RuntimeError, match="database schema is invalid"):
+        _load_module()
+
+
+@pytest.mark.parametrize("value", [None, ""])
+def test_page_limit_uses_default_for_empty_values(value):
+    assert (
+        status_api.hospital_price_page_limit(value)
+        == status_api.DEFAULT_HOSPITAL_PRICE_PAGE_SIZE
+    )
+
+
+def test_page_limit_rejects_non_integer():
+    with pytest.raises(ValueError, match="limit must be an integer"):
+        status_api.hospital_price_page_limit(object())
+
+
+def test_status_match_handles_success_and_attempt_statuses():
+    published_item_by_field = {
+        "publication": {}, "latest_attempt": {"status": "published"}
+    }
+    unpublished_item_by_field = {"publication": None, "latest_attempt": None}
+
+    assert status_api._is_status_match(published_item_by_field, "succeeded")
+    assert not status_api._is_status_match(unpublished_item_by_field, "succeeded")
+    assert status_api._is_status_match(published_item_by_field, "published")
+
+
 @pytest.mark.asyncio
 async def test_registry_load_does_not_block_status_event_loop(monkeypatch):
     event_loop_thread = threading.get_ident()

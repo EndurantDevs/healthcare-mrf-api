@@ -97,7 +97,15 @@ struct BoundedCsvRecordReader<R> {
     inner: R,
     max_bytes: u64,
     record_bytes: u64,
-    in_quotes: bool,
+    field_state: CsvFieldState,
+}
+
+#[derive(Clone, Copy)]
+enum CsvFieldState {
+    Start,
+    Unquoted,
+    Quoted,
+    PostQuote,
 }
 
 impl<R: Read> BoundedCsvRecordReader<R> {
@@ -106,7 +114,7 @@ impl<R: Read> BoundedCsvRecordReader<R> {
             inner,
             max_bytes,
             record_bytes: 0,
-            in_quotes: false,
+            field_state: CsvFieldState::Start,
         }
     }
 }
@@ -119,11 +127,30 @@ impl<R: Read> Read for BoundedCsvRecordReader<R> {
             if self.record_bytes > self.max_bytes {
                 return Err(invalid("hospital MRF CSV record exceeds configured limit"));
             }
-            if *byte == b'"' {
-                self.in_quotes = !self.in_quotes;
-            } else if *byte == b'\n' && !self.in_quotes {
-                self.record_bytes = 0;
-            }
+            self.field_state = match (self.field_state, *byte) {
+                (CsvFieldState::Start, b'"') => CsvFieldState::Quoted,
+                (CsvFieldState::Start, b',') => CsvFieldState::Start,
+                (CsvFieldState::Start, b'\r' | b'\n') => {
+                    self.record_bytes = 0;
+                    CsvFieldState::Start
+                }
+                (CsvFieldState::Start, _) => CsvFieldState::Unquoted,
+                (CsvFieldState::Unquoted, b',') => CsvFieldState::Start,
+                (CsvFieldState::Unquoted, b'\r' | b'\n') => {
+                    self.record_bytes = 0;
+                    CsvFieldState::Start
+                }
+                (CsvFieldState::Unquoted, _) => CsvFieldState::Unquoted,
+                (CsvFieldState::Quoted, b'"') => CsvFieldState::PostQuote,
+                (CsvFieldState::Quoted, _) => CsvFieldState::Quoted,
+                (CsvFieldState::PostQuote, b'"') => CsvFieldState::Quoted,
+                (CsvFieldState::PostQuote, b',') => CsvFieldState::Start,
+                (CsvFieldState::PostQuote, b'\r' | b'\n') => {
+                    self.record_bytes = 0;
+                    CsvFieldState::Start
+                }
+                (CsvFieldState::PostQuote, _) => CsvFieldState::Unquoted,
+            };
         }
         Ok(read)
     }

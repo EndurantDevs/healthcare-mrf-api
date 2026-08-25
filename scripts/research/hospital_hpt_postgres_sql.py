@@ -4,11 +4,27 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from scripts.research.hospital_hpt_corpus import PriceFact
 
 CANDIDATES = ("typed", "dictionary", "blocks")
 FACT_COLUMNS = tuple(PriceFact.__dataclass_fields__)
+
+
+def plan_indexes(plan: Any) -> tuple[str, ...]:
+    """Collect every index named by a PostgreSQL JSON plan."""
+    indexes = set()
+    if isinstance(plan, dict):
+        index_name = plan.get("Index Name")
+        if isinstance(index_name, str):
+            indexes.add(index_name)
+        for value in plan.values():
+            indexes.update(plan_indexes(value))
+    elif isinstance(plan, list):
+        for value in plan:
+            indexes.update(plan_indexes(value))
+    return tuple(sorted(indexes))
 COMMON_DDL = """
 CREATE TABLE {schema}.facility_anchor (
     id text PRIMARY KEY, name text NOT NULL
@@ -78,7 +94,7 @@ CREATE TABLE {schema}.price_fact (
     negotiated_dollar numeric, negotiated_percentage numeric,
     negotiated_algorithm text, methodology text NOT NULL,
     median_amount numeric, percentile_10 numeric, percentile_90 numeric,
-    allowed_count text, additional_payer_notes text,
+    allowed_count text, additional_payer_notes text, comparison_amount numeric,
     FOREIGN KEY (hospital_id, service_ordinal)
         REFERENCES {schema}.price_service (hospital_id, service_ordinal)
 );
@@ -197,7 +213,8 @@ INSERT INTO {schema}.price_fact
 SELECT hospital_id, service_ordinal, payer_name, plan_name,
        negotiated_dollar, negotiated_percentage, negotiated_algorithm,
        methodology, median_amount, percentile_10, percentile_90, allowed_count,
-       additional_payer_notes
+       additional_payer_notes,
+       COALESCE(negotiated_dollar, median_amount, gross_amount, discounted_cash)
 FROM {schema}.fact_stage;
 DROP TABLE {schema}.fact_stage;
 """
@@ -290,15 +307,15 @@ CREATE INDEX ON {schema}.price_service (hospital_id, code_system, code, service_
 CREATE INDEX ON {schema}.price_service (code_system, code, hospital_id, service_ordinal);
 CREATE INDEX ON {schema}.price_fact (hospital_id, service_ordinal, payer_name, plan_name);
 CREATE INDEX ON {schema}.price_fact (payer_name, plan_name, hospital_id, service_ordinal);
-CREATE INDEX ON {schema}.price_fact (
-    (COALESCE(negotiated_dollar, median_amount)), hospital_id, service_ordinal
+CREATE INDEX price_fact_comparison_idx ON {schema}.price_fact (
+    comparison_amount, hospital_id, service_ordinal
 );
 """
     if candidate == "dictionary":
         return prefix + f"""
 CREATE INDEX ON {schema}.price_fact (hospital_id, service_ordinal, code_id, payer_plan_id);
 CREATE INDEX ON {schema}.price_fact (payer_plan_id, code_id, hospital_id, service_ordinal);
-CREATE INDEX ON {schema}.price_fact (
+CREATE INDEX price_fact_comparison_idx ON {schema}.price_fact (
     code_id,
     (COALESCE(negotiated_dollar, median_amount, gross_amount, discounted_cash)),
     hospital_id
@@ -308,7 +325,9 @@ CREATE INDEX ON {schema}.price_fact (
         return prefix + f"""
 CREATE INDEX ON {schema}.price_lookup (hospital_id, code_system, code, payer_name, plan_name);
 CREATE INDEX ON {schema}.price_lookup (payer_name, plan_name, code_system, code, hospital_id);
-CREATE INDEX ON {schema}.price_lookup (code_system, code, comparison_amount, hospital_id);
+CREATE INDEX price_lookup_comparison_idx ON {schema}.price_lookup (
+    code_system, code, comparison_amount, hospital_id
+);
 """
     raise ValueError(f"unknown candidate: {candidate}")
 
@@ -340,7 +359,8 @@ s.drug_type, s.gross_amount, s.discounted_cash, f.payer_name, f.plan_name,
 f.negotiated_dollar, f.negotiated_percentage, f.negotiated_algorithm,
 f.methodology, s.minimum_amount, s.maximum_amount, f.median_amount,
 f.percentile_10, f.percentile_90, f.allowed_count,
-s.additional_generic_notes, f.additional_payer_notes
+s.additional_generic_notes, f.additional_payer_notes,
+f.comparison_amount
 FROM {schema}.price_fact f JOIN {schema}.price_service s
 USING (hospital_id, service_ordinal)"""
     elif candidate == "dictionary":
@@ -351,7 +371,9 @@ f.discounted_cash, p.payer_name, p.plan_name, f.negotiated_dollar,
 f.negotiated_percentage, f.negotiated_algorithm, m.methodology,
 f.minimum_amount, f.maximum_amount, f.median_amount, f.percentile_10,
 f.percentile_90, f.allowed_count, f.additional_generic_notes,
-f.additional_payer_notes FROM {schema}.price_fact f
+f.additional_payer_notes,
+COALESCE(f.negotiated_dollar, f.median_amount, f.gross_amount,
+         f.discounted_cash) AS comparison_amount FROM {schema}.price_fact f
 JOIN {schema}.code_dictionary c ON c.id=f.code_id
 JOIN {schema}.service_dictionary s ON s.id=f.service_id
 JOIN {schema}.payer_plan_dictionary p ON p.id=f.payer_plan_id
@@ -377,6 +399,7 @@ b.payload -> l.item_ordinal ->> 10 AS methodology,
 (b.payload -> l.item_ordinal ->> 15)::numeric AS percentile_90,
 b.payload -> l.item_ordinal ->> 16 AS allowed_count,
 b.payload -> l.item_ordinal ->> 17 AS additional_generic_notes,
-b.payload -> l.item_ordinal ->> 18 AS additional_payer_notes
+b.payload -> l.item_ordinal ->> 18 AS additional_payer_notes,
+l.comparison_amount
 FROM {schema}.price_lookup l JOIN {schema}.price_block b ON b.id=l.block_id"""
     return f"CREATE VIEW {schema}.published_price AS {projection};"

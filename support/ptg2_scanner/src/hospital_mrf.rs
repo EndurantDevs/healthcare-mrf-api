@@ -31,6 +31,7 @@ include!("hospital_mrf/rows_and_metadata.rs");
 include!("hospital_mrf/validation_and_json_types.rs");
 include!("hospital_mrf/json_and_csv_types.rs");
 include!("hospital_mrf/csv_headers.rs");
+include!("hospital_mrf/csv_columns.rs");
 include!("hospital_mrf/csv_rows.rs");
 include!("hospital_mrf/csv_stream.rs");
 
@@ -39,4 +40,5 @@ mod tests {
     include!("hospital_mrf/tests_support.rs");
     include!("hospital_mrf/tests_import.rs");
     include!("hospital_mrf/tests_validation.rs");
+    include!("hospital_mrf/tests_limits.rs");
 }

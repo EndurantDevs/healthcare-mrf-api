@@ -302,6 +302,86 @@ async def test_locator_fetch_is_fresh_exact_and_bounded(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_locator_fetch_records_download_parse_and_cancellation_errors(
+    tmp_path, monkeypatch
+):
+    acquisition = _acquisition_module()
+    hospital_by_field = {"hospital_id": "a", "name": "Hospital A"}
+    locator_input = ("https://a/cms-hpt.txt", (hospital_by_field,))
+    observations = []
+
+    async def record(*args, **kwargs):
+        observations.append((args, kwargs))
+
+    async def fail_download(*_args, **_kwargs):
+        raise ValueError("download failed")
+
+    monkeypatch.setattr(acquisition, "_record_locator_observation", record)
+    monkeypatch.setattr(acquisition, "download_raw_artifact", fail_download)
+    failed = await acquisition.fetch_locator(locator_input, object())
+    assert failed.error_code == "value"
+    assert observations[-1][0][3] == "fetch_failed"
+
+    locator_path = tmp_path / "cms-hpt.txt"
+    locator_path.write_bytes(b"invalid")
+    raw = SimpleNamespace(raw_path=str(locator_path), head=None)
+
+    async def download(*_args, **_kwargs):
+        return raw
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", download)
+    invalid = await acquisition.fetch_locator(locator_input, object())
+    assert invalid.error_code == "hospitalhptlocator"
+    assert observations[-1][0][3] == "invalid"
+
+    async def cancel(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition.fetch_locator(locator_input, object())
+
+
+@pytest.mark.asyncio
+async def test_source_download_updates_shared_attempts_and_reports_errors(monkeypatch):
+    acquisition = _acquisition_module()
+    attempt = acquisition.Attempt("attempt", "a", "Hospital A", "https://a/mrf", 1)
+    raw = SimpleNamespace(head=SimpleNamespace(url="https://a/final", status=200))
+
+    async def download(*_args, **_kwargs):
+        return raw
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", download)
+    downloaded_source = await acquisition.download_source(
+        ("https://a/mrf", (attempt,)), object(), 1024
+    )
+    assert downloaded_source.raw is raw
+    assert attempt.final_source_url == "https://a/final"
+    assert attempt.source_http_status == 200
+    raw.head = None
+    await acquisition.download_source(("https://a/mrf", (attempt,)), object(), 1024)
+
+    async def fail(*_args, **_kwargs):
+        raise ValueError("failed")
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", fail)
+    failed = await acquisition.download_source(
+        ("https://a/mrf", (attempt,)), object(), 1024
+    )
+    assert failed.raw is None
+    assert failed.error_code == "value"
+
+    async def cancel(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition.download_source(
+            ("https://a/mrf", (attempt,)), object(), 1024
+        )
+
+
+@pytest.mark.asyncio
 async def test_native_runner_rejects_debug_binary(tmp_path, monkeypatch):
     acquisition = _acquisition_module()
     monkeypatch.setattr(
@@ -360,10 +440,10 @@ async def test_native_runner_drains_cleanup_after_repeated_cancel(
             "json", 1, 2048, 1024,
         )
     )
-    await communicate_started.wait()
+    await asyncio.wait_for(communicate_started.wait(), timeout=1)
 
     operation.cancel()
-    await cleanup_started.wait()
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
     operation.cancel()
     await asyncio.sleep(0)
     assert not operation.done()

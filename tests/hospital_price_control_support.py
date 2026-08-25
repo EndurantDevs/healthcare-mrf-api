@@ -62,6 +62,11 @@ def store_module() -> tuple[Any, Any]:
 
 def acquisition_module() -> Any:
     native = native_module()
+    async_safety = _load_path(
+        "hospital_price_async_safety_control_test",
+        "process/formulary_fhir/async_safety.py",
+        {},
+    )
     locator = _load_path(
         "hospital_hpt_locator_control_test",
         "process/hospital_hpt_locator.py",
@@ -82,6 +87,7 @@ def acquisition_module() -> Any:
         "process.control_cancel": _module(
             "process.control_cancel", ImportCancelledError=RuntimeError
         ),
+        "process.formulary_fhir.async_safety": async_safety,
         "process.hospital_hpt_locator": locator,
         "process.hospital_hpt_registry": _module(
             "process.hospital_hpt_registry",

@@ -70,7 +70,7 @@ fn json_fixture() -> Vec<u8> {
     .unwrap()
 }
 
-fn csv_fixture(tall: bool) -> Vec<u8> {
+fn csv_fixture(is_tall: bool) -> Vec<u8> {
     let mut data_headers = vec![
         "description",
         "code|1",
@@ -97,11 +97,11 @@ fn csv_fixture(tall: bool) -> Vec<u8> {
         "",
         "12",
         "",
-        "",
-        "",
-        "",
+        "8",
+        "12",
+        "Generic note",
     ];
-    if tall {
+    if is_tall {
         data_headers.extend([
             "payer_name",
             "plan_name",
@@ -115,6 +115,29 @@ fn csv_fixture(tall: bool) -> Vec<u8> {
             "standard_charge|methodology",
         ]);
         data_values.resize(data_headers.len(), "");
+    } else {
+        data_headers.extend([
+            "standard_charge|Payer|Plan|negotiated_dollar",
+            "standard_charge|Payer|Plan|negotiated_percentage",
+            "standard_charge|Payer|Plan|negotiated_algorithm",
+            "median_amount|Payer|Plan",
+            "10th_percentile|Payer|Plan",
+            "90th_percentile|Payer|Plan",
+            "count|Payer|Plan",
+            "standard_charge|Payer|Plan|methodology",
+            "additional_payer_notes|Payer|Plan",
+        ]);
+        data_values.extend([
+            "10",
+            "",
+            "",
+            "10",
+            "8",
+            "12",
+            "11",
+            "fee schedule",
+            "Contract note",
+        ]);
     }
 
     let mut general_headers = vec![
@@ -270,6 +293,29 @@ fn production_binary_imports_json_tall_wide_gzip_and_one_member_zip() {
         assert!(!rows["service"].is_empty());
         assert!(!rows["charge"].is_empty());
     }
+    let wide_charge = String::from_utf8(wide["charge"].clone()).unwrap();
+    assert_eq!(
+        wide_charge.trim_end().split('\t').nth(9),
+        Some("Generic note")
+    );
+    let wide_payer = String::from_utf8(wide["payer_charge"].clone()).unwrap();
+    let payer_fields = wide_payer.trim_end().split('\t').collect::<Vec<_>>();
+    assert_eq!(
+        &payer_fields[4..15],
+        &[
+            "Payer",
+            "Plan",
+            "10",
+            "\\N",
+            "\\N",
+            "10",
+            "8",
+            "12",
+            "11",
+            "fee schedule",
+            "Contract note"
+        ]
+    );
     assert_eq!(
         run_case(
             temporary.path(),

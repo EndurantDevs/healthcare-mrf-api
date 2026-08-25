@@ -10,6 +10,21 @@ from scripts.research import hospital_hpt_postgres as benchmark
 from scripts.research import hospital_hpt_postgres_sql as benchmark_sql
 
 
+def _projection_expressions(projection: str) -> tuple[str, ...]:
+    expressions = []
+    start = 0
+    depth = 0
+    for index, character in enumerate(projection):
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        elif character == "," and depth == 0:
+            expressions.append(projection[start:index])
+            start = index + 1
+    return tuple((*expressions, projection[start:]))
+
+
 def test_candidate_sql_has_three_distinct_layouts():
     typed = benchmark_sql.create_sql("typed", "hpt_bench_typed_001")
     dictionary = benchmark_sql.create_sql(
@@ -66,9 +81,51 @@ def test_published_view_columns_match_canonical_order(candidate):
     )[0]
     columns = tuple(
         expression.strip().rsplit(" AS ", 1)[-1].rsplit(".", 1)[-1]
-        for expression in projection.replace("\n", " ").split(",")
+        for expression in _projection_expressions(projection.replace("\n", " "))
     )
-    assert columns == benchmark_sql.FACT_COLUMNS
+    assert columns == (*benchmark_sql.FACT_COLUMNS, "comparison_amount")
+
+
+def test_comparison_probes_use_each_layouts_indexable_internal_value():
+    probes = benchmark._probe_sql("hpt_bench_typed_001")
+    canonical_columns = ", ".join(benchmark_sql.FACT_COLUMNS)
+    assert probes["comparison"].startswith(f"SELECT {canonical_columns} FROM ")
+    assert "ORDER BY comparison_amount" in probes["comparison"]
+    assert "min(comparison_amount), max(comparison_amount)" in probes["stats"]
+
+    index_expression_by_candidate = {
+        "typed": "comparison_amount, hospital_id, service_ordinal",
+        "dictionary": (
+            "COALESCE(negotiated_dollar, median_amount, gross_amount, "
+            "discounted_cash)"
+        ),
+        "blocks": "code_system, code, comparison_amount, hospital_id",
+    }
+    for candidate in benchmark_sql.CANDIDATES:
+        schema = f"hpt_bench_{candidate}_001"
+        assert "comparison_amount" in benchmark_sql.publish_sql(candidate, schema)
+        assert index_expression_by_candidate[candidate] in benchmark_sql.index_sql(
+            candidate, schema
+        ).replace("\n", " ")
+
+    typed_materialization = benchmark_sql.materialize_sql(
+        "typed", "hpt_bench_typed_001"
+    )
+    assert (
+        "COALESCE(negotiated_dollar, median_amount, gross_amount, discounted_cash)"
+        in typed_materialization.replace("\n", " ")
+    )
+
+
+def test_explain_receipt_collects_nested_index_names():
+    assert benchmark_sql.plan_indexes(
+        {
+            "Plan": {
+                "Index Name": "outer_idx",
+                "Plans": [{"Index Name": "inner_idx"}, {"Node Type": "Sort"}],
+            }
+        }
+    ) == ("inner_idx", "outer_idx")
 
 
 def test_block_payload_positions_match_published_projection():
