@@ -82,6 +82,15 @@ def json_mapping(raw_json: Any) -> dict[str, Any]:
     return {}
 
 
+def _finalizer_count_sql(schema: str, table_name: str, enabled: bool) -> str:
+    if not enabled:
+        return ""
+    return (
+        f" + (SELECT COUNT(*) FROM {schema}.{_quote_ident(table_name)} "
+        "WHERE snapshot_key = :snapshot_key)"
+    )
+
+
 async def _load_snapshot_record(
     executor: Any,
     *,
@@ -212,17 +221,11 @@ async def load_reference_counts(
 
     schema = _quote_ident(schema_name)
     has_finalizer_maps = await _has_finalizer_map_tables(executor, schema_name)
-    finalizer_targets = (
-        f" + (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_target "
-        "WHERE snapshot_key = :snapshot_key)"
-        if has_finalizer_maps
-        else ""
+    finalizer_targets = _finalizer_count_sql(
+        schema, PTG2_V4_FINALIZER_MAP_TARGET_TABLE, has_finalizer_maps
     )
-    finalizer_packs = (
-        f" + (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_pack "
-        "WHERE snapshot_key = :snapshot_key)"
-        if has_finalizer_maps
-        else ""
+    finalizer_packs = _finalizer_count_sql(
+        schema, PTG2_V4_FINALIZER_MAP_PACK_TABLE, has_finalizer_maps
     )
     count_record = await executor.first(
         f"""
@@ -331,23 +334,14 @@ async def load_recovery_postconditions(
 
     schema = _quote_ident(schema_name)
     has_finalizer_maps = await _has_finalizer_map_tables(executor, schema_name)
-    finalizer_targets = (
-        f" + (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_target "
-        "WHERE snapshot_key = :snapshot_key)"
-        if has_finalizer_maps
-        else ""
+    finalizer_targets = _finalizer_count_sql(
+        schema, PTG2_V4_FINALIZER_MAP_TARGET_TABLE, has_finalizer_maps
     )
-    finalizer_roots = (
-        f" + (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_root "
-        "WHERE snapshot_key = :snapshot_key)"
-        if has_finalizer_maps
-        else ""
+    finalizer_roots = _finalizer_count_sql(
+        schema, PTG2_V4_FINALIZER_MAP_ROOT_TABLE, has_finalizer_maps
     )
-    finalizer_packs = (
-        f" + (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_pack "
-        "WHERE snapshot_key = :snapshot_key)"
-        if has_finalizer_maps
-        else ""
+    finalizer_packs = _finalizer_count_sql(
+        schema, PTG2_V4_FINALIZER_MAP_PACK_TABLE, has_finalizer_maps
     )
     dense_rows_sql = " + ".join(
         (

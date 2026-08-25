@@ -448,15 +448,15 @@ async def test_failed_cleanup_allows_complete_finalizer_root(monkeypatch):
 @pytest.mark.asyncio
 async def test_failed_layout_counts_include_finalizer_ownership():
     executor = AsyncMock()
-    tables_present = {
+    table_presence_by_name = {
         table_name: True for table_name in failed_state._FINALIZER_MAP_TABLES
     }
     executor.first.side_effect = [
-        tables_present,
+        table_presence_by_name,
         {},
-        tables_present,
+        table_presence_by_name,
         {},
-        tables_present,
+        table_presence_by_name,
         {},
     ]
 
