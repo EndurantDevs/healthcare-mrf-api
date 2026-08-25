@@ -1,0 +1,128 @@
+{
+  "aggregate_rows": 13700,
+  "benchmarked_dense_codes": 20,
+  "card_rows": 342500,
+  "database": "healthporta_plan_card_cold_test_20260825",
+  "environment": {
+    "architecture": "arm64",
+    "operating_system": "macOS 26.5.2",
+    "postgresql": "18.2 (Homebrew)"
+  },
+  "fragment_bytes": 123252600,
+  "lanes": {
+    "aggregate": {
+      "distinct_response_hashes": 100,
+      "paired_warm_total_ms": {
+        "max": 1.898,
+        "p50": 1.493,
+        "p95": 1.779,
+        "p99": 1.891
+      },
+      "response_bytes": {
+        "max": 4125,
+        "median": 4125,
+        "min": 4125
+      },
+      "unseen_geo_cell_resolution_ms": {
+        "max": 1.048,
+        "p50": 0.615,
+        "p95": 0.762,
+        "p99": 0.837
+      },
+      "unseen_geo_fragment_read_ms": {
+        "max": 1.349,
+        "p50": 0.801,
+        "p95": 0.982,
+        "p99": 1.307
+      },
+      "unseen_release_resolution_ms": {
+        "max": 0.373,
+        "p50": 0.214,
+        "p95": 0.288,
+        "p99": 0.322
+      },
+      "unseen_serialization_ms": {
+        "max": 0.021,
+        "p50": 0.010,
+        "p95": 0.014,
+        "p99": 0.019
+      },
+      "unseen_total_ms": {
+        "max": 2.276,
+        "p50": 1.639,
+        "p95": 1.952,
+        "p99": 2.268
+      }
+    },
+    "card": {
+      "distinct_response_hashes": 100,
+      "paired_warm_total_ms": {
+        "max": 11.210,
+        "p50": 7.465,
+        "p95": 8.455,
+        "p99": 9.102
+      },
+      "response_bytes": {
+        "max": 9224,
+        "median": 9224,
+        "min": 9224
+      },
+      "unseen_geo_cell_resolution_ms": {
+        "max": 4.307,
+        "p50": 0.524,
+        "p95": 0.670,
+        "p99": 0.817
+      },
+      "unseen_geo_fragment_read_ms": {
+        "max": 38.547,
+        "p50": 6.686,
+        "p95": 7.673,
+        "p99": 8.472
+      },
+      "unseen_release_resolution_ms": {
+        "max": 3.552,
+        "p50": 0.148,
+        "p95": 0.223,
+        "p99": 0.354
+      },
+      "unseen_serialization_ms": {
+        "max": 0.035,
+        "p50": 0.015,
+        "p95": 0.020,
+        "p99": 0.029
+      },
+      "unseen_total_ms": {
+        "max": 46.435,
+        "p50": 7.385,
+        "p95": 8.372,
+        "p99": 9.330
+      }
+    }
+  },
+  "percentile_method": "nearest-rank",
+  "projection_contract": "plan_pricing_card_v1",
+  "provenance": "endurant-provenance:v7:1665272cdeb7b2f7db4facac2ebeb30cfb8df044443d63534976508d2396b130",
+  "relation_bytes": {
+    "aggregate": 7946240,
+    "candidate": 49152,
+    "card": 416849920
+  },
+  "samples_per_lane": 100,
+  "source_base_commit": "a36774ae082c82dedb8d4b9b12afed56c7097e33",
+  "synthetic_codes": 120,
+  "synthetic_dense_anchor_zip5s": [
+    "60016",
+    "60018",
+    "60022",
+    "60025",
+    "60026"
+  ],
+  "synthetic_dense_zip_cells": {
+    "max": 199,
+    "min": 151
+  },
+  "synthetic_query_contract": "25-mile radius with nearest-cell NPI de-duplication",
+  "synthetic_providers_per_code_zip": 25,
+  "synthetic_zip_cells": 100,
+  "zip_catalog_rows": 33179
+}

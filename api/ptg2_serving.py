@@ -91,6 +91,7 @@ from api.plan_release_serving import (
     has_conflicting_release_selectors,
     resolve_plan_release_serving,
 )
+from api.plan_pricing_projection import search_plan_pricing_projection
 from api.ptg2_response import (
     _canonical_catalog_code,
     _catalog_key,
@@ -9674,7 +9675,13 @@ WITH matched AS MATERIALIZED (
                      {location_tiebreak_sql}
         ) AS address_rank
     FROM {address_table} addr
-    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
+    CROSS JOIN LATERAL (
+        SELECT npi_scope.snapshot_key, npi_scope.npi
+        FROM {npi_scope_table} npi_scope
+        WHERE npi_scope.snapshot_key = :shared_snapshot_key
+          AND npi_scope.npi = addr.npi
+        OFFSET 0
+    ) npi_scope
     WHERE {filter_sql}
       AND {address_assurance_sql}
 )
@@ -9700,7 +9707,13 @@ WITH located AS MATERIALIZED (
         addr.type,
         addr.checksum
     FROM {address_table} addr
-    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
+    CROSS JOIN LATERAL (
+        SELECT npi_scope.snapshot_key, npi_scope.npi
+        FROM {npi_scope_table} npi_scope
+        WHERE npi_scope.snapshot_key = :shared_snapshot_key
+          AND npi_scope.npi = addr.npi
+        OFFSET 0
+    ) npi_scope
     WHERE {filter_sql}
 ), nppes_requested AS MATERIALIZED (
     SELECT DISTINCT located.npi, located.address_key
@@ -9904,7 +9917,13 @@ WITH nearest_addresses AS MATERIALIZED (
         {geo_evidence_level_sql} AS geo_evidence_level,
         {distance_sql} AS candidate_distance_miles
     FROM {address_table} addr
-    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
+    CROSS JOIN LATERAL (
+        SELECT npi_scope.snapshot_key, npi_scope.npi
+        FROM {npi_scope_table} npi_scope
+        WHERE npi_scope.snapshot_key = :shared_snapshot_key
+          AND npi_scope.npi = addr.npi
+        OFFSET 0
+    ) npi_scope
     WHERE {filter_sql}
     ORDER BY {knn_order_sql},
              addr.npi,
@@ -20233,6 +20252,21 @@ async def search_current_ptg2_index(
     if has_release_route:
         if selected_release is None:
             return None
+        projected_response = await search_plan_pricing_projection(
+            session,
+            selected_release,
+            args,
+            pagination,
+        )
+        if projected_response is not None:
+            return projected_response
+        if selected_release.network_tables_by_snapshot() is None:
+            selected_release = await resolve_plan_release_serving(
+                session,
+                selected_release.plan_release_id,
+            )
+            if selected_release is None:
+                return None
         return await _search_plan_release_index(
             session,
             args,

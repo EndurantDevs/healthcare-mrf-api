@@ -143,12 +143,18 @@ def _install_multi_snapshot_search(monkeypatch, selection, calls):
 
 
 class _Session:
-    def __init__(self, rows):
+    def __init__(self, rows, *, pricing_projection_relation=True):
         self.rows = rows
+        self.pricing_projection_relation = pricing_projection_relation
         self.calls = []
 
     async def execute(self, statement, params):
-        self.calls.append((str(statement), params))
+        sql = str(statement)
+        self.calls.append((sql, params))
+        if "to_regclass" in sql:
+            return SimpleNamespace(
+                scalar_one=lambda: self.pricing_projection_relation
+            )
         return list(self.rows)
 
 
@@ -207,7 +213,7 @@ def test_release_resolver_requires_complete_published_pinned_binding_set(
     assert [binding.snapshot_id for binding in selection.allowed_amount_bindings] == [
         "ptg2:release-allowed"
     ]
-    sql, params = session.calls[0]
+    sql, params = session.calls[-1]
     assert "ptg2_current" not in sql
     assert "plan_release_snapshot_binding" in sql
     assert "ptg2_snapshot_pin" in sql
@@ -215,6 +221,67 @@ def test_release_resolver_requires_complete_published_pinned_binding_set(
         "plan_release_id": PLAN_RELEASE_ID,
         "pin_owner_type": "plan_release_serving_revision",
     }
+
+
+def test_projection_only_release_resolution_skips_snapshot_readiness(
+    monkeypatch,
+):
+    projection_id = "f" * 64
+    session = _Session(
+        [_binding_row(pricing_projection_id=projection_id)]
+    )
+
+    async def fail_readiness(*_args, **_kwargs):
+        raise AssertionError("the immutable projection does not read PTG tables")
+
+    monkeypatch.setattr(
+        plan_release_serving,
+        "is_release_binding_serving_ready",
+        fail_readiness,
+    )
+
+    selection = asyncio.run(
+        plan_release_serving.resolve_plan_release_serving(
+            session,
+            PLAN_RELEASE_ID,
+            projection_only=True,
+        )
+    )
+
+    assert selection is not None
+    assert selection.pricing_projection_id == projection_id
+    assert selection._validated_serving_tables == ()
+    sql = session.calls[-1][0]
+    assert "plan_pricing_projection_candidate" in sql
+    assert "revision.binding_set_digest" in sql
+    assert "pricing_projection.content_digest" in sql
+
+
+def test_release_resolution_without_projection_relation_keeps_full_path(
+    monkeypatch,
+):
+    session = _Session(
+        [_binding_row()],
+        pricing_projection_relation=False,
+    )
+    monkeypatch.setattr(
+        plan_release_serving,
+        "is_release_binding_serving_ready",
+        _is_serving_binding_ready,
+    )
+
+    selection = asyncio.run(
+        plan_release_serving.resolve_plan_release_serving(
+            session,
+            PLAN_RELEASE_ID,
+        )
+    )
+
+    assert selection is not None
+    assert selection.pricing_projection_id is None
+    release_sql = session.calls[-1][0]
+    assert "NULL::varchar(64) AS pricing_projection_id" in release_sql
+    assert "plan_pricing_projection_candidate" not in release_sql
 
 
 def test_release_resolver_fails_closed_for_missing_or_unpinned_binding():

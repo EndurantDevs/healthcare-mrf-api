@@ -4978,6 +4978,22 @@ paths:
         - name: negotiated_rate_tolerance
           in: query
           schema: { type: number }
+        - name: view
+          in: query
+          schema:
+            type: string
+            enum: [full, card]
+            default: full
+          description: |
+            Response detail for an immutable release-scoped pricing search.
+            `full` retains the complete PTG/TiC response. `card` requires a
+            resolved `plan_release_id`; representable provider expansions use
+            compact pre-rendered provider cards, while incompatible provider-card
+            filters are rejected. With `view=card`, `include_providers=false`
+            serves precomputed ZIP-cell rate aggregates for representable
+            shapes; filters not represented by the projection retain the
+            existing aggregate reader. Omitted or explicit `view=full`
+            preserves the existing PTG/TiC response shape.
         - name: include_providers
           in: query
           x-legacy-plan-default: true
@@ -5426,6 +5442,22 @@ paths:
           in: query
           schema:
             type: number
+        - name: view
+          in: query
+          schema:
+            type: string
+            enum: [full, card]
+            default: full
+          description: |
+            Response detail for an immutable release-scoped pricing search.
+            `full` retains the complete PTG/TiC response. `card` requires a
+            resolved `plan_release_id`; representable provider expansions use
+            compact pre-rendered provider cards, while incompatible provider-card
+            filters are rejected. With `view=card`, `include_providers=false`
+            serves precomputed ZIP-cell rate aggregates for representable
+            shapes; filters not represented by the projection retain the
+            existing aggregate reader. Omitted or explicit `view=full`
+            preserves the existing PTG/TiC response shape.
         - name: include_providers
           in: query
           schema:
@@ -8477,9 +8509,79 @@ components:
               type: array
               items:
                 $ref: '#/components/schemas/CodeResolutionEdge'
+    PricingProcedureProviderCardRecord:
+      type: object
+      required:
+        [npi, provider_name, zip5, minimum_negotiated_rate, maximum_negotiated_rate, rate_count]
+      properties:
+        npi:
+          type: integer
+        provider_name:
+          type: string
+        entity_type_code:
+          type: integer
+          nullable: true
+        credential:
+          type: string
+          nullable: true
+        taxonomy_code:
+          type: string
+          nullable: true
+        primary_specialty:
+          type: string
+          nullable: true
+        classification:
+          type: string
+          nullable: true
+        city:
+          type: string
+          nullable: true
+        state:
+          type: string
+          nullable: true
+        zip5:
+          type: string
+          pattern: '^[0-9]{5}$'
+        minimum_negotiated_rate:
+          type: number
+          minimum: 0
+        maximum_negotiated_rate:
+          type: number
+          minimum: 0
+        rate_count:
+          type: integer
+          minimum: 1
+    PricingProcedureRateAggregateRecord:
+      type: object
+      required:
+        [geo_cell, provider_count, rate_count, minimum_negotiated_rate, median_negotiated_rate, maximum_negotiated_rate]
+      properties:
+        geo_cell:
+          type: string
+          pattern: '^[0-9]{5}$'
+        provider_count:
+          type: integer
+          minimum: 1
+        rate_count:
+          type: integer
+          minimum: 1
+        minimum_negotiated_rate:
+          type: number
+          minimum: 0
+        median_negotiated_rate:
+          type: number
+          minimum: 0
+        maximum_negotiated_rate:
+          type: number
+          minimum: 0
     PricingProcedureProviderListResponse:
       type: object
       properties:
+        result_type:
+          type: string
+          nullable: true
+          description: Present for the immutable card or aggregate projection lane.
+          enum: [provider_cards, rate_aggregates]
         result_state:
           type: string
           nullable: true
@@ -8497,7 +8599,10 @@ components:
         items:
           type: array
           items:
-            $ref: '#/components/schemas/PricingProcedureProviderRecord'
+            anyOf:
+              - $ref: '#/components/schemas/PricingProcedureProviderRecord'
+              - $ref: '#/components/schemas/PricingProcedureProviderCardRecord'
+              - $ref: '#/components/schemas/PricingProcedureRateAggregateRecord'
         pagination:
           $ref: '#/components/schemas/PtgPricingPaginationMeta'
         query:
@@ -8526,6 +8631,14 @@ components:
               type: string
               nullable: true
               enum: [matched, allowed_amounts_found, no_match, no_route]
+            view:
+              type: string
+              enum: [full, card]
+            include_providers:
+              type: boolean
+            projection_contract:
+              type: string
+              nullable: true
             state:
               type: string
               nullable: true

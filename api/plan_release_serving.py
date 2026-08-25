@@ -38,7 +38,48 @@ PLAN_RELEASE_BINDING_ROLES = frozenset(
     {PLAN_RELEASE_IN_NETWORK_ROLE, PLAN_RELEASE_ALLOWED_AMOUNTS_ROLE}
 )
 
-_PLAN_RELEASE_SERVING_SQL = f"""
+_PRICING_PROJECTION_RELATION = (
+    f"{PTG2_SCHEMA}.plan_pricing_projection_candidate"
+)
+_PRICING_PROJECTION_ID_SQL = """
+       CASE
+           WHEN pricing_projection.state = 'ready'
+            AND pricing_projection.contract_version =
+                revision.source_manifest
+                    -> 'pricing_projection' ->> 'contract'
+            AND pricing_projection.binding_manifest_digest =
+                revision.binding_set_digest
+            AND pricing_projection.binding_manifest_digest =
+                revision.source_manifest
+                    -> 'pricing_projection' ->> 'binding_manifest_digest'
+            AND pricing_projection.provider_signature =
+                revision.source_manifest
+                    -> 'pricing_projection' ->> 'provider_signature'
+            AND pricing_projection.content_digest =
+                revision.source_manifest
+                    -> 'pricing_projection' ->> 'content_digest'
+           THEN pricing_projection.projection_id
+       END
+"""
+_PRICING_PROJECTION_JOIN_SQL = f"""
+  LEFT JOIN {_PRICING_PROJECTION_RELATION} pricing_projection
+    ON pricing_projection.projection_id =
+       revision.source_manifest -> 'pricing_projection' ->> 'projection_id'
+"""
+
+
+def _plan_release_serving_sql(*, include_pricing_projection: bool) -> str:
+    pricing_projection_id_sql = (
+        _PRICING_PROJECTION_ID_SQL
+        if include_pricing_projection
+        else "       NULL::varchar(64)"
+    )
+    pricing_projection_join_sql = (
+        _PRICING_PROJECTION_JOIN_SQL
+        if include_pricing_projection
+        else ""
+    )
+    return f"""
 SELECT revision.serving_revision_id,
        revision.plan_release_id,
        revision.healthporta_plan_id,
@@ -47,6 +88,7 @@ SELECT revision.serving_revision_id,
        revision.release_status,
        revision.expected_binding_count,
        revision.binding_set_digest,
+{pricing_projection_id_sql} AS pricing_projection_id,
        binding.binding_ordinal,
        binding.snapshot_id,
        binding.source_key,
@@ -67,6 +109,7 @@ SELECT revision.serving_revision_id,
     ON binding.serving_revision_id = revision.serving_revision_id
   LEFT JOIN {PTG2_SCHEMA}.ptg2_snapshot snapshot
     ON snapshot.snapshot_id = binding.snapshot_id
+{pricing_projection_join_sql}
  WHERE revision.plan_release_id = :plan_release_id
    AND revision.serving_status = 'published'
    AND revision.release_status = 'published'
@@ -74,6 +117,22 @@ SELECT revision.serving_revision_id,
  ORDER BY CASE binding.role WHEN 'in_network' THEN 0 ELSE 1 END,
           binding.binding_ordinal
 """
+
+
+_PLAN_RELEASE_SERVING_SQL = _plan_release_serving_sql(
+    include_pricing_projection=True
+)
+_PLAN_RELEASE_SERVING_WITHOUT_PROJECTION_SQL = _plan_release_serving_sql(
+    include_pricing_projection=False
+)
+
+
+async def _pricing_projection_relation_available(session: Any) -> bool:
+    relation_result = await session.execute(
+        text("SELECT to_regclass(:relation_name) IS NOT NULL"),
+        {"relation_name": _PRICING_PROJECTION_RELATION},
+    )
+    return bool(relation_result.scalar_one())
 
 
 def _row_mapping(row: Any) -> dict[str, Any]:
@@ -127,6 +186,7 @@ class PlanReleaseServingSelection:
     release_status: str
     binding_set_digest: str
     bindings: tuple[PlanReleaseSnapshotBinding, ...]
+    pricing_projection_id: str | None = None
     _validated_serving_tables: tuple[tuple[str, PTG2ServingTables], ...] = field(
         default=(), repr=False, compare=False
     )
@@ -241,6 +301,7 @@ class _PlanReleaseHeader:
     release_month: str
     release_status: str
     binding_set_digest: str
+    pricing_projection_id: str | None
 
 
 def _release_header_from_rows(
@@ -259,6 +320,13 @@ def _release_header_from_rows(
     binding_set_digest = _single_text_value(
         release_rows, "binding_set_digest"
     )
+    pricing_projection_id = _single_text_value(
+        release_rows, "pricing_projection_id"
+    )
+    if pricing_projection_id and not re.fullmatch(
+        r"[0-9a-f]{64}", pricing_projection_id
+    ):
+        pricing_projection_id = None
     plan_version_values = {
         str(release_row.get("plan_version_id") or "").strip()
         for release_row in release_rows
@@ -289,6 +357,7 @@ def _release_header_from_rows(
         release_month=release_month,
         release_status=release_status,
         binding_set_digest=binding_set_digest,
+        pricing_projection_id=pricing_projection_id,
     )
 
 
@@ -389,6 +458,7 @@ def _selection_from_rows(
         release_status=release_header.release_status,
         binding_set_digest=release_header.binding_set_digest,
         bindings=bindings,
+        pricing_projection_id=release_header.pricing_projection_id,
     )
 
 
@@ -423,16 +493,25 @@ async def resolve_plan_release_serving(
     plan_release_id: Any,
     *,
     include_billing_tax_identity_source: bool = False,
+    projection_only: bool = False,
 ) -> PlanReleaseServingSelection | None:
     """Load one exact, complete, optionally source-aware pinned release."""
 
-    if type(include_billing_tax_identity_source) is not bool:
+    if (
+        type(include_billing_tax_identity_source) is not bool
+        or type(projection_only) is not bool
+    ):
         return None
     normalized_release_id = normalize_plan_release_id(plan_release_id)
     if normalized_release_id is None:
         return None
+    release_sql = (
+        _PLAN_RELEASE_SERVING_SQL
+        if await _pricing_projection_relation_available(session)
+        else _PLAN_RELEASE_SERVING_WITHOUT_PROJECTION_SQL
+    )
     release_query_result = await session.execute(
-        text(_PLAN_RELEASE_SERVING_SQL),
+        text(release_sql),
         {
             "plan_release_id": normalized_release_id,
             "pin_owner_type": PLAN_RELEASE_PIN_OWNER_TYPE,
@@ -444,6 +523,8 @@ async def resolve_plan_release_serving(
     )
     if selection is None:
         return None
+    if projection_only:
+        return selection
     validated_serving_tables_by_snapshot_id: dict[
         str, PTG2ServingTables
     ] = {}

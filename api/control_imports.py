@@ -123,6 +123,14 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_function": "main",
         "job_prefix": "ptg_candidate_audit",
     },
+    "plan-pricing-projection": {
+        "queue": "arq:PTGCandidateAudit",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped_kwargs",
+        "target_module": "api.plan_pricing_projection",
+        "target_function": "build_plan_pricing_projection",
+        "job_prefix": "plan_pricing_projection",
+    },
     "mrf": {"queue": "arq:MRF", "function": "init_file", "payload": "test_mode"},
     "npi": {
         "queue": "arq:NPI",
@@ -483,7 +491,44 @@ def importer_registry() -> list[dict[str, Any]]:
                 "params_schema": _control_param_schema(name, command),
             }
         )
-    return importers
+    importers.append(
+        {
+            "name": "plan-pricing-projection",
+            "engine": ENGINE_NAME,
+            "family": "mrf",
+            "kind": "control",
+            "lifecycle": "single",
+            "schedulable": False,
+            "cancelable": False,
+            "retryable": True,
+            "enqueue_adapter": "arq_single_job",
+            "queue": "arq:PTGCandidateAudit",
+            "depends_on": [],
+            "params_schema": [
+                {
+                    "name": "binding_manifest_digest",
+                    "opts": ["--binding-manifest-digest"],
+                    "required": True,
+                    "multiple": False,
+                    "is_flag": False,
+                    "type": "string",
+                    "default": None,
+                    "help": "Exact release binding-manifest digest.",
+                },
+                {
+                    "name": "bindings",
+                    "opts": ["--bindings"],
+                    "required": True,
+                    "multiple": False,
+                    "is_flag": False,
+                    "type": "array",
+                    "default": None,
+                    "help": "Exact release binding array.",
+                },
+            ],
+        }
+    )
+    return sorted(importers, key=lambda importer: importer["name"])
 
 
 def importer_names() -> set[str]:
@@ -494,7 +539,7 @@ def importer_names() -> set[str]:
 
 def _importer_family(importer: str) -> str:
     if importer in {
-        "ptg", "ptg-candidate-audit", "mrf", "mrf-source-discovery",
+        "ptg", "ptg-candidate-audit", "plan-pricing-projection", "mrf", "mrf-source-discovery",
         "hospital-prices",
     }:
         return "mrf"

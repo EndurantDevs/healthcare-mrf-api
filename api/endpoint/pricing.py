@@ -92,6 +92,11 @@ from api.plan_release_serving import (
     resolve_plan_release_serving,
 )
 from api.plan_release_readiness import is_release_binding_serving_scope_exact
+from api.plan_pricing_projection import (
+    PlanPricingProjectionUnavailable,
+    PlanPricingProjectionUnsupported,
+    projection_result_type,
+)
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
 from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from api.provider_demographic_filters import (
@@ -7667,13 +7672,23 @@ def _annotate_ptg2_result_state(
         query_payload_map = {}
     items = ptg2_payload.get("items")
     has_items = isinstance(items, list) and bool(items)
-    status = str(query_payload_map.get("status") or ("matched" if has_items else "no_match")).strip()
+    pagination = ptg2_payload.get("pagination")
+    total = (
+        _as_int(pagination.get("total"))
+        if isinstance(pagination, dict)
+        else None
+    )
+    has_matches = has_items or (total is not None and total > 0)
+    status = str(
+        query_payload_map.get("status")
+        or ("matched" if has_matches else "no_match")
+    ).strip()
     result_state = (
         "matched"
-        if has_items
+        if has_matches
         else _ptg2_empty_result_state(status, has_location_filter=has_location_filter)
     )
-    query_payload_map["status"] = "matched" if has_items else "no_match"
+    query_payload_map["status"] = "matched" if has_matches else "no_match"
     ptg2_payload["query"] = query_payload_map
     ptg2_payload.setdefault("result_state", result_state)
     ptg2_payload.setdefault("pricing_scope", "plan_scoped_ptg")
@@ -11661,6 +11676,9 @@ async def list_providers_by_procedure(request):
         "include_allowed_amounts",
         default=True,
     )
+    view = str(args.get("view") or "full").strip().lower()
+    if view not in {"full", "card"}:
+        raise InvalidUsage("Parameter 'view' must be one of: full, card")
     internal_codes: list[int] = []
     plan_id = str(args.get("plan_id", "")).strip()
     plan_external_id = str(args.get("plan_external_id", "")).strip()
@@ -11672,6 +11690,21 @@ async def list_providers_by_procedure(request):
     snapshot_id = str(args.get("snapshot_id", "")).strip()
     args.get("plan_release_id")
     plan_release_id = _validated_plan_release_id(args)
+    if view == "card" and not plan_release_id:
+        raise InvalidUsage("Parameter 'view=card' requires healthporta_plan_id")
+    projected_result_type = (
+        projection_result_type(args) if plan_release_id else None
+    )
+    if projected_result_type is not None:
+        if (
+            args.get("include_allowed_amounts") not in (None, "", "null")
+            and include_allowed_amounts
+        ):
+            raise InvalidUsage(
+                "Card and aggregate projections do not support "
+                "include_allowed_amounts=true"
+            )
+        include_allowed_amounts = False
     mode = str(args.get("mode", "")).strip()
     npi = _parse_int(args.get("npi") or None, "npi", minimum=1)
     provider_sex_code = normalize_provider_sex_code(
@@ -11698,10 +11731,17 @@ async def list_providers_by_procedure(request):
     release_selection = None
     release_selection_args_by_name = {}
     if plan_release_id:
-        release_selection = await resolve_plan_release_serving(
-            session,
-            plan_release_id,
-        )
+        if projected_result_type is not None:
+            release_selection = await resolve_plan_release_serving(
+                session,
+                plan_release_id,
+                projection_only=True,
+            )
+        else:
+            release_selection = await resolve_plan_release_serving(
+                session,
+                plan_release_id,
+            )
         release_selection_args_by_name = _release_selection_args_by_name(
             release_selection
         )
@@ -11801,6 +11841,7 @@ async def list_providers_by_procedure(request):
                 "include_unverified_addresses": args.get("include_unverified_addresses") or None,
                 "include_details": args.get("include_details") or None,
                 "include_debug": args.get("include_debug") or None,
+                "view": view,
                 "npi": npi,
             }
         route_name = str(getattr(getattr(request, "route", None), "name", ""))
@@ -11821,6 +11862,19 @@ async def list_providers_by_procedure(request):
                 request,
                 {"error": {"code": exc.error_code, "message": str(exc)}},
                 status=400,
+            )
+        except PlanPricingProjectionUnsupported as exc:
+            raise InvalidUsage(str(exc)) from exc
+        except PlanPricingProjectionUnavailable as exc:
+            return _ptg_json_response(
+                request,
+                {
+                    "error": {
+                        "code": "pricing_projection_unavailable",
+                        "message": str(exc),
+                    }
+                },
+                status=503,
             )
         except PTG2OnlineWorkBudgetExceeded as exc:
             logger.info(
