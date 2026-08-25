@@ -7,6 +7,7 @@ pub mod contact_canon;
 pub mod copy_format;
 pub mod dedupe;
 pub mod hashing;
+pub mod hospital_mrf;
 pub mod input;
 pub mod manifest;
 pub mod normalize;

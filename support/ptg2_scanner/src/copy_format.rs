@@ -115,7 +115,7 @@ fn write_copy_text_field<W: Write>(writer: &mut W, value: Option<&str>) -> io::R
     Ok(())
 }
 
-fn write_copy_text_fields<W: Write>(writer: &mut W, fields: &[Option<&str>]) -> io::Result<()> {
+pub fn write_copy_text_fields<W: Write>(writer: &mut W, fields: &[Option<&str>]) -> io::Result<()> {
     for (index, field) in fields.iter().enumerate() {
         if index > 0 {
             writer.write_all(b"\t")?;

@@ -14,6 +14,86 @@ import pytest
 discovery = importlib.import_module("process.mrf_source_discovery")
 
 
+_EXPECTED_ANCILLARY_BENEFIT_LINES_BY_PAYER_NAME = types.MappingProxyType(
+    {
+        "Apta Health Coverage": ("medical",),
+        "Allegiance Ancillary Claims Coverage": ("dental", "vision"),
+        "Auxiant Ancillary Benefits": ("dental", "vision"),
+        "ASR Health Benefits Dental and Vision Coverage": ("dental", "vision"),
+        "BCBS Alabama Dental Coverage": ("dental",),
+        "BCBS Arizona Dental Coverage": ("dental",),
+        "BCBS Illinois Dental Coverage": ("dental",),
+        "BCBS Kansas Dental and Vision Coverage": ("dental", "vision"),
+        "BCBS Kansas City Dental and Vision Coverage": ("dental", "vision"),
+        "BCBS Massachusetts Vision Coverage": ("vision",),
+        "BCBS Montana Dental Coverage": ("dental",),
+        "BCBS Montana Vision Coverage": ("vision",),
+        "BCBS New Mexico Dental Coverage": ("dental",),
+        "BCBS North Carolina Dental Coverage": ("dental",),
+        "BCBS North Carolina Vision Coverage": ("vision",),
+        "BCBS Oklahoma Dental Coverage": ("dental",),
+        "BCBS South Carolina Dental Coverage": ("dental",),
+        "BCBS South Carolina Vision Coverage": ("vision",),
+        "BCBS Tennessee Dental and Vision Coverage": ("dental", "vision"),
+        "BCBS Texas Dental Coverage": ("dental",),
+        "BAS Ancillary Benefits": ("dental", "vision"),
+        "Beam Benefits Ancillary Coverage": ("dental", "vision"),
+        "BEST Life Dental and Vision Coverage": ("dental", "vision"),
+        "ByWater Ancillary Benefits": ("dental", "vision"),
+        "CBA Blue Dental Coverage": ("dental",),
+        "CarePlus Dental Plans Coverage": ("dental",),
+        "ClaimChoice Administrators Coverage": ("medical",),
+        "Consociate Health Ancillary Benefits": ("dental", "vision"),
+        "Crescent Dental Coverage": ("dental",),
+        "Direct Dental Coverage": ("dental",),
+        "Diversified Group Ancillary Coverage": ("dental", "vision"),
+        "Dominion National Dental": ("dental",),
+        "Dominion National Vision": ("vision",),
+        "EBPA Medical and Dental Coverage": ("dental",),
+        "EMI Health Vision Coverage": ("vision",),
+        "Ameritas Dental": ("dental",),
+        "Ameritas Vision": ("vision",),
+        "HealthPartners Dental Coverage": ("dental",),
+        "Guardian Dental": ("dental",),
+        "Guardian Vision": ("vision",),
+        "Healthgram Dental and Vision Coverage": ("dental", "vision"),
+        "Highmark Dental and Vision Coverage": ("dental", "vision"),
+        "HNAS Dental Network Coverage": ("dental",),
+        "HRI Dental and Vision": ("dental", "vision"),
+        "Humana Dental": ("dental",),
+        "Humana Vision": ("vision",),
+        "IAEC Dental and Vision Plans": ("dental", "vision"),
+        "International Medical Solutions Coverage": ("medical", "dental", "vision"),
+        "LIBERTY Dental Plan": ("dental",),
+        "Loomis Dental Coverage": ("dental",),
+        "Lucent Health Ancillary Coverage": ("dental", "vision"),
+        "MetLife Dental Coverage": ("dental",),
+        "MedBen Dental and Vision Coverage": ("dental", "vision"),
+        "Meritain Health Vision Coverage": ("vision",),
+        "Mutual of Omaha Dental": ("dental",),
+        "Mutual of Omaha Vision": ("vision",),
+        "PacificSource Vision Coverage": ("vision",),
+        "Principal Dental": ("dental",),
+        "Principal Vision": ("vision",),
+        "Renaissance Dental": ("dental",),
+        "Renaissance Vision": ("vision",),
+        "Reliance Matrix Dental and Vision": ("dental", "vision"),
+        "Smile Brands Ancillary Coverage": ("dental", "vision"),
+        "Sun Life Dental": ("dental",),
+        "Sun Life Vision": ("vision",),
+        "Tall Tree Dental Coverage": ("dental",),
+        "Tall Tree Vision Coverage": ("vision",),
+        "The Standard Dental": ("dental",),
+        "The Standard Vision": ("vision",),
+        "TruAssure Dental": ("dental",),
+        "UHA Dental Coverage": ("dental",),
+        "UHA Vision Coverage": ("vision",),
+        "UPMC Dental and Vision Coverage": ("dental", "vision"),
+        "Wellmark Blue Dental Coverage": ("dental",),
+    }
+)
+
+
 class _FakeChunkedContent:
     def __init__(self, body: bytes):
         self._body = body
@@ -2969,13 +3049,9 @@ async def test_master_list_uses_current_public_source_urls_for_selected_payers()
     assert by_name["Paramount Health Care"][0].hosting_platform == "healthsparq"
 
 
-@pytest.mark.asyncio
-async def test_master_list_keeps_high_value_public_aliases():
-    """Verify this source-discovery regression contract."""
-    candidates = await discovery._load_candidates(
-        "master-list", test_mode=True, limit=2000
-    )
-    by_name = {candidate.payer_name: candidate for candidate in candidates}
+def _assert_master_list_candidate_contract_01(
+    candidates,
+):
     active_humana_candidates = [
         candidate
         for candidate in candidates
@@ -2986,93 +3062,12 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert active_humana.source_tier == "coverage_evidence"
     assert active_humana.benefit_lines == ("medical", "dental", "vision")
     assert not discovery._is_candidate_importable_source(active_humana)
-    aliases_by_name = {}
-    for candidate in candidates:
-        aliases_by_name.setdefault(candidate.payer_name, set()).update(
-            candidate.aliases
-        )
-    benefit_lines_by_ancillary_name = {
-        "Apta Health Coverage": ("medical",),
-        "Allegiance Ancillary Claims Coverage": ("dental", "vision"),
-        "Auxiant Ancillary Benefits": ("dental", "vision"),
-        "ASR Health Benefits Dental and Vision Coverage": ("dental", "vision"),
-        "BCBS Alabama Dental Coverage": ("dental",),
-        "BCBS Arizona Dental Coverage": ("dental",),
-        "BCBS Illinois Dental Coverage": ("dental",),
-        "BCBS Kansas Dental and Vision Coverage": ("dental", "vision"),
-        "BCBS Kansas City Dental and Vision Coverage": ("dental", "vision"),
-        "BCBS Massachusetts Vision Coverage": ("vision",),
-        "BCBS Montana Dental Coverage": ("dental",),
-        "BCBS Montana Vision Coverage": ("vision",),
-        "BCBS New Mexico Dental Coverage": ("dental",),
-        "BCBS North Carolina Dental Coverage": ("dental",),
-        "BCBS North Carolina Vision Coverage": ("vision",),
-        "BCBS Oklahoma Dental Coverage": ("dental",),
-        "BCBS South Carolina Dental Coverage": ("dental",),
-        "BCBS South Carolina Vision Coverage": ("vision",),
-        "BCBS Tennessee Dental and Vision Coverage": ("dental", "vision"),
-        "BCBS Texas Dental Coverage": ("dental",),
-        "BAS Ancillary Benefits": ("dental", "vision"),
-        "Beam Benefits Ancillary Coverage": ("dental", "vision"),
-        "BEST Life Dental and Vision Coverage": ("dental", "vision"),
-        "ByWater Ancillary Benefits": ("dental", "vision"),
-        "CBA Blue Dental Coverage": ("dental",),
-        "CarePlus Dental Plans Coverage": ("dental",),
-        "ClaimChoice Administrators Coverage": ("medical",),
-        "Consociate Health Ancillary Benefits": ("dental", "vision"),
-        "Crescent Dental Coverage": ("dental",),
-        "Direct Dental Coverage": ("dental",),
-        "Diversified Group Ancillary Coverage": ("dental", "vision"),
-        "Dominion National Dental": ("dental",),
-        "Dominion National Vision": ("vision",),
-        "EBPA Medical and Dental Coverage": ("dental",),
-        "EMI Health Vision Coverage": ("vision",),
-        "Ameritas Dental": ("dental",),
-        "Ameritas Vision": ("vision",),
-        "HealthPartners Dental Coverage": ("dental",),
-        "Guardian Dental": ("dental",),
-        "Guardian Vision": ("vision",),
-        "Healthgram Dental and Vision Coverage": ("dental", "vision"),
-        "Highmark Dental and Vision Coverage": ("dental", "vision"),
-        "HNAS Dental Network Coverage": ("dental",),
-        "HRI Dental and Vision": ("dental", "vision"),
-        "Humana Dental": ("dental",),
-        "Humana Vision": ("vision",),
-        "IAEC Dental and Vision Plans": ("dental", "vision"),
-        "International Medical Solutions Coverage": ("medical", "dental", "vision"),
-        "LIBERTY Dental Plan": ("dental",),
-        "Loomis Dental Coverage": ("dental",),
-        "Lucent Health Ancillary Coverage": ("dental", "vision"),
-        "MetLife Dental Coverage": ("dental",),
-        "MedBen Dental and Vision Coverage": ("dental", "vision"),
-        "Meritain Health Vision Coverage": ("vision",),
-        "Mutual of Omaha Dental": ("dental",),
-        "Mutual of Omaha Vision": ("vision",),
-        "PacificSource Vision Coverage": ("vision",),
-        "Principal Dental": ("dental",),
-        "Principal Vision": ("vision",),
-        "Renaissance Dental": ("dental",),
-        "Renaissance Vision": ("vision",),
-        "Reliance Matrix Dental and Vision": ("dental", "vision"),
-        "Smile Brands Ancillary Coverage": ("dental", "vision"),
-        "Sun Life Dental": ("dental",),
-        "Sun Life Vision": ("vision",),
-        "Tall Tree Dental Coverage": ("dental",),
-        "Tall Tree Vision Coverage": ("vision",),
-        "The Standard Dental": ("dental",),
-        "The Standard Vision": ("vision",),
-        "TruAssure Dental": ("dental",),
-        "UHA Dental Coverage": ("dental",),
-        "UHA Vision Coverage": ("vision",),
-        "UPMC Dental and Vision Coverage": ("dental", "vision"),
-        "Wellmark Blue Dental Coverage": ("dental",),
-    }
-    ancillary_by_name = {
-        candidate.payer_name: candidate
-        for candidate in candidates
-        if candidate.payer_name in benefit_lines_by_ancillary_name
-    }
 
+
+def _assert_master_list_candidate_contract_02(
+    candidates,
+    by_name,
+):
     assert "Wellmark Blue Cross and Blue Shield" in by_name["Wellmark"].aliases
     assert "Wellmark Health Plan of Iowa, Inc." in by_name["Wellmark"].aliases
     assert "Wellmark Blue Dental" in by_name["Wellmark"].aliases
@@ -3121,6 +3116,12 @@ async def test_master_list_keeps_high_value_public_aliases():
         == "Clover Health"
     )
     assert "Clover Health" in by_name["Clover Health Employee Benefits"].aliases
+
+
+def _assert_master_list_candidate_contract_03(
+    by_name,
+    aliases_by_name,
+):
     assert by_name["Devoted Health"].status == "stale"
     assert by_name["Geisinger Health Plan"].status == "unsupported"
     assert by_name["OSF HealthCare"].status == "stale"
@@ -3169,6 +3170,11 @@ async def test_master_list_keeps_high_value_public_aliases():
         "dental",
         "vision",
     )
+
+
+def _assert_master_list_candidate_contract_04(
+    by_name,
+):
     assert by_name["UnitedHealthcare"].benefit_lines == (
         "medical",
         "dental",
@@ -3217,16 +3223,22 @@ async def test_master_list_keeps_high_value_public_aliases():
         "Allegiance Life & Health Insurance Company, Inc."
         in by_name["Cigna"].aliases
     )
+
+
+def _assert_master_list_candidate_contract_05(
+    by_name,
+    ancillary_by_name,
+):
     assert "Yuzu Health" in by_name["Cigna"].aliases
     assert "YUZU HEALTH INC." in by_name["Cigna"].aliases
     assert "Cigna Shared Administration PPO - Yuzu" in by_name["Cigna"].aliases
     assert by_name["Cigna"].benefit_lines == ("medical", "dental")
-    assert set(ancillary_by_name) == set(benefit_lines_by_ancillary_name)
+    assert set(ancillary_by_name) == set(_EXPECTED_ANCILLARY_BENEFIT_LINES_BY_PAYER_NAME)
     assert all(
         candidate.source_tier == "coverage_evidence"
         for candidate in ancillary_by_name.values()
     )
-    for payer_name, benefit_lines in benefit_lines_by_ancillary_name.items():
+    for payer_name, benefit_lines in _EXPECTED_ANCILLARY_BENEFIT_LINES_BY_PAYER_NAME.items():
         assert ancillary_by_name[payer_name].benefit_lines == benefit_lines
     assert "Dental Blue" in ancillary_by_name["BCBS Alabama Dental Coverage"].aliases
     assert "AZ Blue" in ancillary_by_name["BCBS Arizona Dental Coverage"].aliases
@@ -3262,6 +3274,11 @@ async def test_master_list_keeps_high_value_public_aliases():
         "BlueCross Dental"
         in ancillary_by_name["BCBS Tennessee Dental and Vision Coverage"].aliases
     )
+
+
+def _assert_master_list_candidate_contract_06(
+    ancillary_by_name,
+):
     assert (
         "Blue Cross Blue Shield TN"
         in ancillary_by_name["BCBS Tennessee Dental and Vision Coverage"].aliases
@@ -3307,6 +3324,11 @@ async def test_master_list_keeps_high_value_public_aliases():
         in ancillary_by_name["Highmark Dental and Vision Coverage"].aliases
     )
     assert "IMS" in ancillary_by_name["International Medical Solutions Coverage"].aliases
+
+
+def _assert_master_list_candidate_contract_07(
+    ancillary_by_name,
+):
     assert (
         "Aetna Vision Preferred"
         in ancillary_by_name["Meritain Health Vision Coverage"].aliases
@@ -3355,6 +3377,13 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Loomis Benefit Administrators" in ancillary_by_name["Loomis Dental Coverage"].aliases
     assert "MedBen VisionPlus" in ancillary_by_name["MedBen Dental and Vision Coverage"].aliases
     assert "Met Life Dental" in ancillary_by_name["MetLife Dental Coverage"].aliases
+
+
+def _assert_master_list_candidate_contract_08(
+    by_name,
+    aliases_by_name,
+    ancillary_by_name,
+):
     assert "Hawaii Dental Service" in ancillary_by_name["UHA Dental Coverage"].aliases
     assert "UHA Vision" in ancillary_by_name["UHA Vision Coverage"].aliases
     assert "UPMC Dental Advantage" in ancillary_by_name["UPMC Dental and Vision Coverage"].aliases
@@ -3403,6 +3432,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     ):
         assert alias in by_name["Davis Vision"].aliases
     assert by_name["Superior Vision"].status == "active"
+
+
+def _assert_master_list_candidate_contract_09(
+    by_name,
+):
     assert by_name["Superior Vision"].source_tier == "coverage_evidence"
     assert by_name["Superior Vision"].index_url == "https://superiorvision.com/"
     assert by_name["Superior Vision"].benefit_lines == ("vision",)
@@ -3448,6 +3482,12 @@ async def test_master_list_keeps_high_value_public_aliases():
         "Blue 20/20 of Massachusetts (powered by EyeMed)"
         in by_name["EyeMed"].aliases
     )
+
+
+def _assert_master_list_candidate_contract_10(
+    candidates,
+    by_name,
+):
     assert (
         "BlueCare Vision of Illinois (powered by EyeMed)"
         in by_name["EyeMed"].aliases
@@ -3495,6 +3535,11 @@ async def test_master_list_keeps_high_value_public_aliases():
         "machine-readable-transparency-in-coverage"
     )
     assert by_name["Aspirus Health Plan"].raw_payload["notes"]
+
+
+def _assert_master_list_candidate_contract_11(
+    by_name,
+):
     assert (
         "https://aspirushealthplan.com/insurance/pricingTransparency"
         in discovery._candidate_metadata(
@@ -3543,6 +3588,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "VSP Guardian" in by_name["VSP Vision"].aliases
     assert "VSP Service Plan" in by_name["VSP Vision"].aliases
     assert "VPS Vision Care" in by_name["VSP Vision"].aliases
+
+
+def _assert_master_list_candidate_contract_12(
+    by_name,
+):
     assert "Principal Financial Group VSP" in by_name["VSP Vision"].aliases
     assert "Principal Financial Group - VSP" in by_name["VSP Vision"].aliases
     assert "Principal / VSP" in by_name["VSP Vision"].aliases
@@ -3591,6 +3641,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "DeltaVision VSP" in by_name["VSP Vision"].aliases
     assert "DeltaVision with VSP" in by_name["VSP Vision"].aliases
     assert "United Heritage (Using VSP Network)" in by_name["VSP Vision"].aliases
+
+
+def _assert_master_list_candidate_contract_13(
+    by_name,
+):
     assert by_name["Vision Benefits of America"].status == "active"
     assert by_name["Vision Benefits of America"].source_tier == "coverage_evidence"
     assert by_name["Vision Benefits of America"].benefit_lines == ("vision",)
@@ -3631,6 +3686,11 @@ async def test_master_list_keeps_high_value_public_aliases():
         assert by_name[coverage_evidence_vision_name].status == "active"
         assert by_name[coverage_evidence_vision_name].source_tier == "coverage_evidence"
         assert by_name[coverage_evidence_vision_name].index_url
+
+
+def _assert_master_list_candidate_contract_14(
+    by_name,
+):
     for review_only_name in (
         "HMSA Vision",
         "Anthem Vision Plan",
@@ -3671,6 +3731,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "DeltaDental" in by_name["Delta Dental"].aliases
     assert "Delta Dental of Iowa" in by_name["Delta Dental"].aliases
     assert "Delta Dental of Missouri" in by_name["Delta Dental"].aliases
+
+
+def _assert_master_list_candidate_contract_15(
+    by_name,
+):
     for coverage_evidence_dental_name in (
         "Dominion National Dental",
         "Florida Combined Life Dental",
@@ -3716,6 +3781,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["Premier Access Dental"].status == "active"
     assert by_name["Premier Access Dental"].source_tier == "coverage_evidence"
     assert by_name["Premier Access Dental"].index_url
+
+
+def _assert_master_list_candidate_contract_16(
+    by_name,
+):
     for review_only_name in (
         "Highmark Blue Edge Dental",
     ):
@@ -3764,6 +3834,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["Lincoln Financial DentalConnect"].benefit_lines == ("dental",)
     assert by_name["Lincoln Financial DentalConnect"].status == "needs_review"
     assert by_name["Lincoln Financial DentalConnect"].index_url is None
+
+
+def _assert_master_list_candidate_contract_17(
+    by_name,
+):
     assert (
         "Lincoln DentalConnect"
         in by_name["Lincoln Financial DentalConnect"].aliases
@@ -3812,6 +3887,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert by_name["GEHA"].hosting_platform == "html_delegated_mrf_links"
     assert by_name["GEHA"].benefit_lines == ("dental", "medical")
+
+
+def _assert_master_list_candidate_contract_18(
+    by_name,
+):
     assert "Connection Dental Federal" in by_name["GEHA"].aliases
     assert by_name["The Health Plan"].hosting_platform == "healthplan_html_mrf_links"
     assert "The Health Plan of West Virginia" in by_name["The Health Plan"].aliases
@@ -3860,6 +3940,12 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["U.S. Renal Care"].hosting_platform == "healthcarebluebook_mrf"
     assert by_name["Washington Community Schools"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["Reliance Matrix"].hosting_platform == "html_delegated_mrf_links"
+
+
+def _assert_master_list_candidate_contract_19(
+    by_name,
+    aliases_by_name,
+):
     assert "Reliance Standard" in by_name["Reliance Matrix"].aliases
     assert (
         "Reliance Standard Life Insurance Company"
@@ -3908,6 +3994,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "BCBSWY" in by_name["BCBS Wyoming"].aliases
     assert "BCBSWY Dental" in by_name["BCBS Wyoming"].aliases
     assert "BCBSWY Vision" in by_name["BCBS Wyoming"].aliases
+
+
+def _assert_master_list_candidate_contract_20(
+    by_name,
+):
     assert "Blue Cross Blue Shield/Blue Water" in by_name["BCBS Michigan"].aliases
     assert "Blue Cross & Blue Shield of Mississippi" in by_name["BCBS Mississippi"].aliases
     assert "BlueCross BlueShield of Mississippi" in by_name["BCBS Mississippi"].aliases
@@ -3956,6 +4047,12 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Blue Cross Blue Shield TN" in by_name["BCBS Tennessee"].aliases
     assert "BCBS Tennessee" in by_name["BCBS Tennessee ASO"].aliases
     assert "Blue Cross Blue Shield Tennessee" in by_name["BCBS Tennessee ASO"].aliases
+
+
+def _assert_master_list_candidate_contract_21(
+    by_name,
+    aliases_by_name,
+):
     assert "Blue Cross Blue Shield Rhode Island" in by_name["BCBS Rhode Island"].aliases
     assert "Blue Cross Blue Shield South Carolina" in aliases_by_name["BCBS South Carolina"]
     assert "Blue Cross Blue Shield Vermont" in by_name["BCBS Vermont"].aliases
@@ -4004,6 +4101,12 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Maine Community Health Options" in by_name["Community Health Options"].aliases
     assert "Point-C" in by_name["Point C"].aliases
     assert "Cypress Benefit Administrators" in by_name["Lucent Health"].aliases
+
+
+def _assert_master_list_candidate_contract_22(
+    candidates,
+    by_name,
+):
     assert "Sierra Health and Life" in by_name["United Healthcare"].aliases
     assert "UnitedHealthcare of Arizona, Inc." in by_name["United Healthcare"].aliases
     assert (
@@ -4052,6 +4155,12 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert by_name["WPS Health"].hosting_platform == "html_mrf_links"
     assert "WPS Health Insurance" in by_name["WPS Health"].aliases
+
+
+def _assert_master_list_candidate_contract_23(
+    by_name,
+    aliases_by_name,
+):
     assert "Wisconsin Physicians Service Insurance Corporation" in (
         by_name["WPS Health"].aliases
     )
@@ -4100,6 +4209,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert "EVHC" in by_name["Luminare Health Benefits"].aliases
     assert "Evolution Healthcare" in by_name["Luminare Health Benefits"].aliases
+
+
+def _assert_master_list_candidate_contract_24(
+    by_name,
+):
     assert "Evolution Healthcare EVHC" in by_name["Luminare Health Benefits"].aliases
     assert "Cofinity" in by_name["Luminare Health Benefits"].aliases
     assert "First Health Cofinity" in by_name["Luminare Health Benefits"].aliases
@@ -4114,6 +4228,49 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["Peak Health"].hosting_platform == "html_mrf_links"
     assert by_name["Centivo - Rockwell Automation"].hosting_platform == "html_mrf_links"
     assert "Centivo" in by_name["Centivo - Rockwell Automation"].aliases
+
+
+@pytest.mark.asyncio
+async def test_master_list_keeps_high_value_public_aliases():
+    """Verify this source-discovery regression contract."""
+    candidates = await discovery._load_candidates(
+        "master-list", test_mode=True, limit=2000
+    )
+    by_name = {candidate.payer_name: candidate for candidate in candidates}
+    _assert_master_list_candidate_contract_01(candidates)
+    aliases_by_name = {}
+    for candidate in candidates:
+        aliases_by_name.setdefault(candidate.payer_name, set()).update(
+            candidate.aliases
+        )
+    ancillary_by_name = {
+        candidate.payer_name: candidate
+        for candidate in candidates
+        if candidate.payer_name in _EXPECTED_ANCILLARY_BENEFIT_LINES_BY_PAYER_NAME
+    }
+    _assert_master_list_candidate_contract_02(candidates, by_name)
+    _assert_master_list_candidate_contract_03(by_name, aliases_by_name)
+    _assert_master_list_candidate_contract_04(by_name)
+    _assert_master_list_candidate_contract_05(by_name, ancillary_by_name)
+    _assert_master_list_candidate_contract_06(ancillary_by_name)
+    _assert_master_list_candidate_contract_07(ancillary_by_name)
+    _assert_master_list_candidate_contract_08(by_name, aliases_by_name, ancillary_by_name)
+    _assert_master_list_candidate_contract_09(by_name)
+    _assert_master_list_candidate_contract_10(candidates, by_name)
+    _assert_master_list_candidate_contract_11(by_name)
+    _assert_master_list_candidate_contract_12(by_name)
+    _assert_master_list_candidate_contract_13(by_name)
+    _assert_master_list_candidate_contract_14(by_name)
+    _assert_master_list_candidate_contract_15(by_name)
+    _assert_master_list_candidate_contract_16(by_name)
+    _assert_master_list_candidate_contract_17(by_name)
+    _assert_master_list_candidate_contract_18(by_name)
+    _assert_master_list_candidate_contract_19(by_name, aliases_by_name)
+    _assert_master_list_candidate_contract_20(by_name)
+    _assert_master_list_candidate_contract_21(by_name, aliases_by_name)
+    _assert_master_list_candidate_contract_22(candidates, by_name)
+    _assert_master_list_candidate_contract_23(by_name, aliases_by_name)
+    _assert_master_list_candidate_contract_24(by_name)
 
 
 def _master_candidate_names(candidates, query, *, importable):

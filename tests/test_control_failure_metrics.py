@@ -94,3 +94,44 @@ async def test_control_job_preserves_importer_retry_contract(monkeypatch):
         "message": "evidence mismatch",
         "retryable": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_control_job_persists_hospital_failure_metrics(monkeypatch):
+    run_marks = []
+
+    async def is_control_run_marked(run_id, **kwargs):
+        run_marks.append((run_id, kwargs))
+        return True
+
+    async def fake_target(ctx, _task):
+        ctx.setdefault("context", {})["hospital_price_metrics"] = {
+            "selected": 2,
+            "published": 0,
+            "failed": 2,
+        }
+        raise RuntimeError("nothing published")
+
+    class FakeModule:
+        process_data = staticmethod(fake_target)
+
+    monkeypatch.setattr(control_lifecycle, "mark_control_run", is_control_run_marked)
+    monkeypatch.setattr(control_lifecycle, "import_module", lambda _name: FakeModule)
+
+    with pytest.raises(RuntimeError, match="nothing published"):
+        await control_single_job_start(
+            {},
+            {
+                "run_id": "run_hospital_failure",
+                "target_module": "fake.module",
+                "target_function": "process_data",
+            },
+        )
+
+    assert run_marks[-1][1]["metrics"] == {
+        "hospital_price_metrics": {
+            "selected": 2,
+            "published": 0,
+            "failed": 2,
+        }
+    }

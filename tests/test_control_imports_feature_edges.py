@@ -1,12 +1,28 @@
 from __future__ import annotations
 
 import importlib
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 control_imports = importlib.import_module("api.control_imports")
+
+
+@pytest.mark.asyncio
+async def test_hospital_registry_validation_runs_off_event_loop(monkeypatch):
+    event_loop_thread = threading.get_ident()
+    validation_threads: list[int] = []
+
+    def validate(_params):
+        validation_threads.append(threading.get_ident())
+
+    monkeypatch.setattr(control_imports, "selected_hospital_hpt_registry", validate)
+
+    await control_imports._validate_hospital_price_params("hospital-prices", {})
+
+    assert validation_threads and validation_threads[0] != event_loop_thread
 
 
 def _acquisition_params() -> dict[str, object]:

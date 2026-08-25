@@ -1,0 +1,419 @@
+fn csv_value(record: &StringRecord, column: usize) -> &str {
+    record.get(column).unwrap_or("").trim()
+}
+
+fn parse_csv_service(record: &StringRecord, columns: &CommonCsvColumns) -> io::Result<ServiceRow> {
+    let mut codes = Vec::new();
+    for code_columns in &columns.codes {
+        let code = csv_value(record, code_columns.code);
+        let code_type = csv_value(record, code_columns.code_type);
+        if code.is_empty() && code_type.is_empty() {
+            continue;
+        }
+        if code.is_empty() || code_type.is_empty() {
+            return Err(invalid("CSV code and code type must be supplied together"));
+        }
+        codes.push(CodeRow {
+            code_type: code_type.to_owned(),
+            code: code.to_owned(),
+        });
+    }
+    let drug_unit = optional_decimal(csv_value(record, columns.drug_unit), "drug unit")?;
+    let drug_type = optional_text(csv_value(record, columns.drug_type));
+    validate_service(
+        ServiceRow {
+            description: csv_value(record, columns.description).to_owned(),
+            codes,
+            drug_unit,
+            drug_type,
+        },
+        true,
+    )
+}
+
+fn parse_csv_charge(
+    record: &StringRecord,
+    columns: &CommonCsvColumns,
+    max_fanout_rows: usize,
+) -> io::Result<ChargeRow> {
+    Ok(ChargeRow {
+        setting: csv_value(record, columns.setting).to_owned(),
+        billing_class: columns
+            .billing_class
+            .and_then(|column| optional_text(csv_value(record, column))),
+        modifier_codes: split_pipe_bounded(
+            csv_value(record, columns.modifiers),
+            "modifier code",
+            max_fanout_rows,
+        )?,
+        gross_charge: optional_decimal(csv_value(record, columns.gross_charge), "gross_charge")?,
+        discounted_cash: optional_decimal(
+            csv_value(record, columns.discounted_cash),
+            "discounted_cash",
+        )?,
+        minimum: optional_decimal(csv_value(record, columns.minimum), "minimum")?,
+        maximum: optional_decimal(csv_value(record, columns.maximum), "maximum")?,
+        additional_generic_notes: optional_text(csv_value(
+            record,
+            columns.additional_generic_notes,
+        )),
+    })
+}
+
+fn csv_row_has_code(record: &StringRecord, columns: &CommonCsvColumns) -> bool {
+    columns.codes.iter().any(|columns| {
+        !csv_value(record, columns.code).is_empty()
+            || !csv_value(record, columns.code_type).is_empty()
+    })
+}
+
+fn parse_csv_modifier(
+    record: &StringRecord,
+    columns: &CommonCsvColumns,
+) -> io::Result<ModifierRow> {
+    let setting = optional_text(csv_value(record, columns.setting))
+        .as_deref()
+        .map(|value| canonical_setting(value, true))
+        .transpose()?;
+    Ok(ModifierRow {
+        code: required_text(csv_value(record, columns.modifiers), "modifier code")?.to_owned(),
+        description: required_text(
+            csv_value(record, columns.description),
+            "modifier description",
+        )?
+        .to_owned(),
+        setting,
+        additional_generic_notes: optional_text(csv_value(
+            record,
+            columns.additional_generic_notes,
+        )),
+    })
+}
+
+fn parse_tall_modifier_payer(
+    record: &StringRecord,
+    columns: &TallCsvColumns,
+) -> io::Result<Option<ModifierPayerRow>> {
+    let payer_name = optional_text(csv_value(record, columns.payer_name));
+    let plan_name = optional_text(csv_value(record, columns.plan_name));
+    let standard_charge_dollar = optional_decimal(
+        csv_value(record, columns.standard_charge_dollar),
+        "standard_charge_dollar",
+    )?;
+    let standard_charge_percentage = optional_decimal(
+        csv_value(record, columns.standard_charge_percentage),
+        "standard_charge_percentage",
+    )?;
+    let standard_charge_algorithm =
+        optional_text(csv_value(record, columns.standard_charge_algorithm));
+    let description = optional_text(csv_value(record, columns.common.additional_generic_notes));
+    if payer_name.is_none()
+        && plan_name.is_none()
+        && standard_charge_dollar.is_none()
+        && standard_charge_percentage.is_none()
+        && standard_charge_algorithm.is_none()
+    {
+        return Ok(None);
+    }
+    if standard_charge_dollar.is_none()
+        && standard_charge_percentage.is_none()
+        && standard_charge_algorithm.is_none()
+        && description.is_none()
+    {
+        return Err(invalid(
+            "modifier payer requires a charge adjustment or explanatory note",
+        ));
+    }
+    let Some(payer_name) = payer_name else {
+        return Err(invalid("modifier payer evidence requires payer_name"));
+    };
+    let Some(plan_name) = plan_name else {
+        return Err(invalid("modifier payer evidence requires plan_name"));
+    };
+    Ok(Some(ModifierPayerRow {
+        payer_name,
+        plan_name,
+        description,
+        standard_charge_dollar,
+        standard_charge_percentage,
+        standard_charge_algorithm,
+    }))
+}
+
+fn parse_wide_modifier_payers(
+    record: &StringRecord,
+    columns: &[WidePayerColumns],
+) -> io::Result<Vec<ModifierPayerRow>> {
+    let mut payers = Vec::new();
+    for payer in columns {
+        let adjustment_columns = [
+            payer.standard_charge_dollar,
+            payer.standard_charge_percentage,
+            payer.standard_charge_algorithm,
+        ];
+        let description = csv_value(record, payer.additional_payer_notes);
+        if adjustment_columns
+            .iter()
+            .all(|column| csv_value(record, *column).is_empty())
+            && description.is_empty()
+        {
+            continue;
+        }
+        payers.push(ModifierPayerRow {
+            payer_name: payer.payer_name.clone(),
+            plan_name: payer.plan_name.clone(),
+            description: optional_text(description),
+            standard_charge_dollar: optional_decimal(
+                csv_value(record, payer.standard_charge_dollar),
+                "standard_charge_dollar",
+            )?,
+            standard_charge_percentage: optional_decimal(
+                csv_value(record, payer.standard_charge_percentage),
+                "standard_charge_percentage",
+            )?,
+            standard_charge_algorithm: optional_text(csv_value(
+                record,
+                payer.standard_charge_algorithm,
+            )),
+        });
+    }
+    Ok(payers)
+}
+
+fn parse_tall_payer(
+    record: &StringRecord,
+    columns: &TallCsvColumns,
+    generic_notes: Option<&str>,
+) -> io::Result<Option<PayerChargeRow>> {
+    let relevant_columns = [
+        columns.payer_name,
+        columns.plan_name,
+        columns.standard_charge_dollar,
+        columns.standard_charge_percentage,
+        columns.standard_charge_algorithm,
+        columns.median_amount,
+        columns.percentile_10,
+        columns.percentile_90,
+        columns.allowed_count,
+        columns.methodology,
+    ];
+    if relevant_columns
+        .iter()
+        .all(|column| csv_value(record, *column).is_empty())
+    {
+        return Ok(None);
+    }
+    validate_payer(
+        PayerChargeRow {
+            payer_name: csv_value(record, columns.payer_name).to_owned(),
+            plan_name: csv_value(record, columns.plan_name).to_owned(),
+            standard_charge_dollar: optional_decimal(
+                csv_value(record, columns.standard_charge_dollar),
+                "standard_charge_dollar",
+            )?,
+            standard_charge_percentage: optional_decimal(
+                csv_value(record, columns.standard_charge_percentage),
+                "standard_charge_percentage",
+            )?,
+            standard_charge_algorithm: optional_text(csv_value(
+                record,
+                columns.standard_charge_algorithm,
+            )),
+            median_amount: optional_decimal(
+                csv_value(record, columns.median_amount),
+                "median_amount",
+            )?,
+            percentile_10: optional_decimal(
+                csv_value(record, columns.percentile_10),
+                "10th_percentile",
+            )?,
+            percentile_90: optional_decimal(
+                csv_value(record, columns.percentile_90),
+                "90th_percentile",
+            )?,
+            allowed_count: optional_text(csv_value(record, columns.allowed_count))
+                .as_deref()
+                .map(|value| allowed_count(value, true))
+                .transpose()?,
+            methodology: csv_value(record, columns.methodology).to_owned(),
+            additional_payer_notes: generic_notes.and_then(optional_text),
+        },
+        generic_notes,
+        true,
+    )
+    .map(Some)
+}
+
+fn parse_wide_payers(
+    record: &StringRecord,
+    columns: &[WidePayerColumns],
+) -> io::Result<Vec<PayerChargeRow>> {
+    let mut payers = Vec::new();
+    for payer in columns {
+        let relevant_columns = [
+            payer.standard_charge_dollar,
+            payer.standard_charge_percentage,
+            payer.standard_charge_algorithm,
+            payer.median_amount,
+            payer.percentile_10,
+            payer.percentile_90,
+            payer.allowed_count,
+            payer.methodology,
+            payer.additional_payer_notes,
+        ];
+        if relevant_columns
+            .iter()
+            .all(|column| csv_value(record, *column).is_empty())
+        {
+            continue;
+        }
+        payers.push(validate_payer(
+            PayerChargeRow {
+                payer_name: payer.payer_name.clone(),
+                plan_name: payer.plan_name.clone(),
+                standard_charge_dollar: optional_decimal(
+                    csv_value(record, payer.standard_charge_dollar),
+                    "standard_charge_dollar",
+                )?,
+                standard_charge_percentage: optional_decimal(
+                    csv_value(record, payer.standard_charge_percentage),
+                    "standard_charge_percentage",
+                )?,
+                standard_charge_algorithm: optional_text(csv_value(
+                    record,
+                    payer.standard_charge_algorithm,
+                )),
+                median_amount: optional_decimal(
+                    csv_value(record, payer.median_amount),
+                    "median_amount",
+                )?,
+                percentile_10: optional_decimal(
+                    csv_value(record, payer.percentile_10),
+                    "10th_percentile",
+                )?,
+                percentile_90: optional_decimal(
+                    csv_value(record, payer.percentile_90),
+                    "90th_percentile",
+                )?,
+                allowed_count: optional_text(csv_value(record, payer.allowed_count))
+                    .as_deref()
+                    .map(|value| allowed_count(value, true))
+                    .transpose()?,
+                methodology: csv_value(record, payer.methodology).to_owned(),
+                additional_payer_notes: optional_text(csv_value(
+                    record,
+                    payer.additional_payer_notes,
+                )),
+            },
+            None,
+            true,
+        )?);
+    }
+    Ok(payers)
+}
+
+fn parse_tall_records<R: Read>(
+    records: csv::StringRecordsIter<'_, R>,
+    version_id: &str,
+    columns: &TallCsvColumns,
+    max_fanout_rows: usize,
+    outputs: &mut CopyOutputs,
+) -> io::Result<()> {
+    let mut current_service: Option<ServiceRow> = None;
+    let mut service_ordinal = 0u64;
+    let mut next_service_ordinal = 0u64;
+    let mut next_charge_ordinal = 0u64;
+    let mut charge_accumulator: Option<ChargeAccumulator> = None;
+    let mut service_row_count = 0u64;
+    let mut current_modifier: Option<ModifierRow> = None;
+    let mut modifier_ordinal = 0u64;
+    let mut next_modifier_ordinal = 0u64;
+    let mut modifier_payer_ordinal = 0u64;
+
+    for record in records {
+        let record = record.map_err(to_io_error)?;
+        if record.iter().all(|value| value.trim().is_empty()) {
+            continue;
+        }
+        if !csv_row_has_code(&record, &columns.common) {
+            flush_charge(&mut charge_accumulator, outputs, version_id)?;
+            let mut modifier = parse_csv_modifier(&record, &columns.common)?;
+            let payer = parse_tall_modifier_payer(&record, columns)?;
+            if payer.is_some() {
+                modifier.additional_generic_notes = None;
+            } else if modifier.additional_generic_notes.is_none() {
+                return Err(invalid(
+                    "CSV modifier information requires a payer adjustment or generic note",
+                ));
+            }
+            if current_modifier.as_ref() != Some(&modifier) {
+                modifier_ordinal = next_modifier_ordinal;
+                next_modifier_ordinal = next_modifier_ordinal.saturating_add(1);
+                modifier_payer_ordinal = 0;
+                emit_modifier(outputs, version_id, modifier_ordinal, &modifier)?;
+                current_modifier = Some(modifier);
+            }
+            if let Some(payer) = payer {
+                emit_modifier_payer(
+                    outputs,
+                    version_id,
+                    modifier_ordinal,
+                    modifier_payer_ordinal,
+                    &payer,
+                )?;
+                modifier_payer_ordinal = modifier_payer_ordinal.saturating_add(1);
+            }
+            current_service = None;
+            continue;
+        }
+        service_row_count = service_row_count.saturating_add(1);
+        current_modifier = None;
+        let service = parse_csv_service(&record, &columns.common)?;
+        let mut raw_charge = parse_csv_charge(&record, &columns.common, max_fanout_rows)?;
+        let payer = parse_tall_payer(
+            &record,
+            columns,
+            raw_charge.additional_generic_notes.as_deref(),
+        )?;
+        if payer.is_some() {
+            // Tall has one notes column; on a payer row it canonically belongs to that payer.
+            raw_charge.additional_generic_notes = None;
+        }
+        let payers = payer.into_iter().collect::<Vec<_>>();
+        let charge = validate_charge(raw_charge, &payers, true)?;
+
+        let new_service = current_service.as_ref() != Some(&service);
+        if new_service {
+            flush_charge(&mut charge_accumulator, outputs, version_id)?;
+            service_ordinal = next_service_ordinal;
+            next_service_ordinal = next_service_ordinal.saturating_add(1);
+            emit_service(outputs, version_id, service_ordinal, &service)?;
+            current_service = Some(service);
+            next_charge_ordinal = 0;
+        }
+        if charge_accumulator
+            .as_ref()
+            .is_some_and(|current| current.can_merge(&charge, &payers))
+        {
+            charge_accumulator
+                .as_mut()
+                .expect("charge accumulator exists")
+                .merge(charge, payers, max_fanout_rows)?;
+        } else {
+            flush_charge(&mut charge_accumulator, outputs, version_id)?;
+            let charge_ordinal = next_charge_ordinal;
+            next_charge_ordinal = next_charge_ordinal.saturating_add(1);
+            charge_accumulator = Some(ChargeAccumulator {
+                service_ordinal,
+                charge_ordinal,
+                charge,
+                payers,
+            });
+        }
+    }
+    flush_charge(&mut charge_accumulator, outputs, version_id)?;
+    if service_row_count == 0 {
+        return Err(invalid("CSV MRF contains no standard charge rows"));
+    }
+    Ok(())
+}
