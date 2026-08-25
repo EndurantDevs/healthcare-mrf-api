@@ -1,7 +1,7 @@
 """Add immutable plan-pricing card and aggregate projections.
 
 Revision ID: 20260825150000_plan_pricing_card_projection
-Revises: 20260825090000_geo_assurance_projection
+Revises: 20260825120000_ptg_v4_finalizer_map_pack
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from alembic import op
 
 
 revision = "20260825150000_plan_pricing_card_projection"
-down_revision = "20260825090000_geo_assurance_projection"
+down_revision = "20260825120000_ptg_v4_finalizer_map_pack"
 branch_labels = None
 depends_on = None
 
@@ -29,6 +29,10 @@ def _qt(schema: str, table: str) -> str:
     return f"{_q(schema)}.{_q(table)}"
 
 
+def _ql(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def upgrade() -> None:
     schema = _schema()
     candidate = _qt(schema, "plan_pricing_projection_candidate")
@@ -41,8 +45,14 @@ def upgrade() -> None:
 
     statements = (
         f"""
-        CREATE INDEX IF NOT EXISTS plan_pricing_geo_zip_coordinates_idx
-            ON {zip_lookup} (latitude, longitude, zip_code)
+        DO $$
+        BEGIN
+            IF to_regclass({_ql(zip_lookup)}) IS NOT NULL THEN
+                CREATE INDEX IF NOT EXISTS plan_pricing_geo_zip_coordinates_idx
+                    ON {zip_lookup} (latitude, longitude, zip_code);
+            END IF;
+        END
+        $$
         """,
         f"""
         CREATE TABLE {candidate} (

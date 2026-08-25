@@ -12,6 +12,8 @@ import pytest
 
 from api import control_imports, control_workers
 from api import plan_pricing_projection as projection
+from api import plan_pricing_projection_materialize as projection_materialize
+from api import plan_pricing_projection_source as projection_source
 from api.plan_release_serving import PlanReleaseServingSelection
 
 
@@ -249,8 +251,8 @@ async def test_project_code_card_insert_matches_its_bound_row(monkeypatch):
     monkeypatch.setattr(serving, "_provider_npis_for_sets", _npis)
     monkeypatch.setattr(serving, "_ptg2_manifest_id", str)
     monkeypatch.setattr(
-        projection,
-        "_projection_provider_rows_for_npis",
+        projection_materialize,
+        "projection_provider_rows_for_npis",
         _providers,
     )
     session = _Session([])
@@ -361,7 +363,7 @@ async def test_binding_projection_uses_release_market_type(monkeypatch):
         seen.update(kwargs)
         return "", ["TRUE"], {}, "code_metadata.code_key"
 
-    monkeypatch.setattr(projection, "snapshot_serving_tables", _tables)
+    monkeypatch.setattr(projection_source, "snapshot_serving_tables", _tables)
     monkeypatch.setattr(serving, "_require_strict_shared_v3", lambda _tables: None)
     monkeypatch.setattr(serving, "_shared_v3_code_scope_sql", _scope)
     monkeypatch.setattr(serving, "_required_shared_snapshot_key", lambda _tables: 1)
@@ -381,13 +383,15 @@ async def test_binding_projection_uses_release_market_type(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_binding_projection_builds_hcpcs_identity(monkeypatch):
+async def test_binding_projection_groups_numeric_cpt_hcpcs_but_keeps_g_code(
+    monkeypatch,
+):
     from api import ptg2_serving as serving
 
     async def _tables(_session, _snapshot_id):
         return SimpleNamespace(network_names=[])
 
-    monkeypatch.setattr(projection, "snapshot_serving_tables", _tables)
+    monkeypatch.setattr(projection_source, "snapshot_serving_tables", _tables)
     monkeypatch.setattr(serving, "_require_strict_shared_v3", lambda _tables: None)
     monkeypatch.setattr(
         serving,
@@ -414,7 +418,31 @@ async def test_binding_projection_builds_hcpcs_identity(monkeypatch):
                 "source_name": None,
                 "source_description": None,
                 "rate_count": 1,
-            }
+            },
+            {
+                "code_key": 2,
+                "plan_id": "plan",
+                "plan_market_type": "group",
+                "reported_code_system": "HCPCS",
+                "reported_code": "27447",
+                "negotiation_arrangement": "ffs",
+                "billing_code_type_version": "2026",
+                "source_name": None,
+                "source_description": None,
+                "rate_count": 1,
+            },
+            {
+                "code_key": 3,
+                "plan_id": "plan",
+                "plan_market_type": "group",
+                "reported_code_system": "CPT",
+                "reported_code": "27447",
+                "negotiation_arrangement": "ffs",
+                "billing_code_type_version": "2026",
+                "source_name": None,
+                "source_description": None,
+                "rate_count": 1,
+            },
         ]
     )
 
@@ -427,7 +455,14 @@ async def test_binding_projection_builds_hcpcs_identity(monkeypatch):
         },
     )
 
-    assert list(built.code_rows_by_identity) == [("HCPCS", "G0439")]
+    assert set(built.code_rows_by_identity) == {
+        ("CPT", "27447"),
+        ("HCPCS", "G0439"),
+    }
+    assert [
+        row["code_key"]
+        for row in built.code_rows_by_identity[("CPT", "27447")]
+    ] == [2, 3]
 
 
 @pytest.mark.asyncio
@@ -601,6 +636,33 @@ async def test_projection_reader_uses_existing_code_system_aliases():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("requested_system", ["CPT", "HCPCS"])
+async def test_projection_reader_uses_shared_numeric_cpt_hcpcs_identity(
+    requested_system,
+):
+    fragment = b'{"npi":1234567890,"minimum_negotiated_rate":44}'
+    session = _Session([(memoryview(fragment), 1)])
+
+    response = await projection.search_plan_pricing_projection(
+        session,
+        _selection(),
+        {
+            "view": "card",
+            "code_system": requested_system,
+            "code": "27447",
+            "zip5": "62401",
+            "zip_radius_miles": 0,
+        },
+        SimpleNamespace(limit=25, offset=0, page=1),
+    )
+
+    assert response["pagination"]["total"] == 1
+    params = session.statements[0][1]
+    assert params["code_system"] == "CPT"
+    assert params["code"] == "27447"
+
+
+@pytest.mark.asyncio
 async def test_projection_reader_reads_hcpcs_card_fragment():
     fragment = b'{"npi":1234567890,"minimum_negotiated_rate":44}'
     session = _Session([(memoryview(fragment), 1)])
@@ -758,6 +820,7 @@ def test_projection_migration_keeps_fragments_and_aggregates_in_one_build(
     assert "fragment bytea NOT NULL" in statement
     assert "median_negotiated_rate numeric NOT NULL" in statement
     assert "contract_version = 'plan_pricing_card_v2'" in statement
+    assert "IF to_regclass" in statement
     assert "plan_pricing_geo_zip_coordinates_idx" in statement
     assert "(latitude, longitude, zip_code)" in statement
     assert "ready plan-pricing projections are immutable" in statement

@@ -88,12 +88,17 @@ def _load_migration():
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260826090000_hospital_price_packed_blocks"
+        "20260825150000_plan_pricing_card_projection"
     ]
+    assert script.get_revision(
+        "20260825150000_plan_pricing_card_projection"
+    ).down_revision == "20260825120000_ptg_v4_finalizer_map_pack"
     migration = _load_capacity_v2_migration()
     assert migration.down_revision == (
         "20260801010000_uhc_semantic_layout_identity"
     )
+
+
 def test_capacity_v2_migration_replaces_only_the_guarded_constraint(
     monkeypatch,
 ):

@@ -102,7 +102,7 @@ bytes); its paired-repeat p99 was 9.102 ms. Aggregate unseen-shape p99 was
 ms. The card/aggregate tables occupied 416,849,920 and 7,946,240 bytes. These
 are component results through release resolution, cell selection, fragment
 fetch, envelope assembly, and serialization; they do not stand in for
-origin/API-layer acceptance. Origin p99 and real-release build runtime/storage
+end-to-end acceptance. Origin p99 and real-release build runtime/storage
 must be recorded after the exact source images are deployed.
 
 `endurant-provenance:v7:1665272cdeb7b2f7db4facac2ebeb30cfb8df044443d63534976508d2396b130`

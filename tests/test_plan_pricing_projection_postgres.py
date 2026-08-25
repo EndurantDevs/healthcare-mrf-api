@@ -112,15 +112,6 @@ async def test_ready_seal_serializes_against_child_writes(monkeypatch):
     tasks: list[asyncio.Task] = []
     try:
         await admin.execute(f"CREATE SCHEMA {schema}")
-        await admin.execute(
-            f"""
-            CREATE TABLE {schema}.geo_zip_lookup (
-                zip_code varchar(5),
-                latitude double precision,
-                longitude double precision
-            )
-            """
-        )
         for statement in _migration_statements(monkeypatch, schema):
             await admin.execute(statement)
 
