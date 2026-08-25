@@ -40,6 +40,7 @@ class _RecordingDB:
         self.persistence_values = list(persistence_values)
         self.advisory_values = list(advisory_values)
         self.statements = []
+        self.events = []
         self.transaction_events = []
         self.existing_names = set(
             existing_names
@@ -50,6 +51,7 @@ class _RecordingDB:
         )
 
     async def scalar(self, statement, **_params):
+        self.events.append(statement)
         if "relpersistence" in statement:
             return self.persistence_values.pop(0)
         if "address_numeric_grid_alias_v1" in statement:
@@ -78,6 +80,7 @@ class _RecordingDB:
 
     async def status(self, statement, **_params):
         self.statements.append(statement)
+        self.events.append(statement)
         return 0
 
     @asynccontextmanager
@@ -123,6 +126,15 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
     assert cutover_context_map["cutover_attempts"] == 1
     assert cutover_context_map["stage_persistence"] == "p"
     assert cutover_context_map["geo_assurance_active_table_oid"] == 123
+    stage_rename_at = recording_db.events.index(
+        "ALTER TABLE mrf.entity_address_unified_stage RENAME TO entity_address_unified;"
+    )
+    activation_at = next(
+        index
+        for index, statement in enumerate(recording_db.events)
+        if "entity_address_geo_assurance_state" in statement
+    )
+    assert stage_rename_at < activation_at
 
 
 @pytest.mark.asyncio
