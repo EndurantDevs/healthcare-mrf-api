@@ -409,7 +409,7 @@ class _StreamingShardSession:
 
     async def execute(self, _statement, _params):
         self.execute_calls += 1
-        raise AssertionError("budgeted shard discovery must stream")
+        return ({},)
 
 
 @pytest.mark.asyncio
@@ -441,7 +441,7 @@ async def test_shard_discovery_stops_at_first_unclaimable_streamed_row():
 
     assert session.result.consumed_count == 2
     assert session.stream_calls == 1
-    assert session.execute_calls == 0
+    assert session.execute_calls == 1
     retention.release()
     assert budget.retained_bytes == 0
 

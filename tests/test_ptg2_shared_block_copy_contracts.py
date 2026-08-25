@@ -9,6 +9,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process.ptg_parts import ptg2_shared_publish
+from process.ptg_parts.ptg2_shared_block_copy import (
+    binary_copy_rows,
+    scan_shared_block_copy,
+)
 from process.ptg_parts.ptg2_shared_publish import copy_shared_block_binary_file
 
 
@@ -37,6 +41,41 @@ def _block_row(block_hash: bytes, block_key: int, payload: bytes) -> bytes:
 
 def _block_copy(*rows: bytes) -> bytes:
     return _COPY_HEADER + b"".join(rows) + struct.pack(">h", -1)
+
+
+def test_scan_rejects_truncated_payload(tmp_path):
+    path = tmp_path / "truncated.copy"
+    path.write_bytes(_block_copy(_block_row(b"a" * 32, 1, b"payload"))[:-4])
+
+    with pytest.raises(RuntimeError, match="truncates"):
+        scan_shared_block_copy(path)
+
+
+@pytest.mark.parametrize(
+    ("copy_payload", "error"),
+    (
+        (_COPY_HEADER + struct.pack(">h", 9), "row width changed"),
+        (
+            _COPY_HEADER
+            + _block_row(b"a" * 32, 1, b"payload")[:-11]
+            + struct.pack(">i", 8)
+            + b"payload",
+            "payload length is invalid",
+        ),
+        (_block_copy(), "contains no rows"),
+    ),
+)
+def test_scan_rejects_corrupt_framing(tmp_path, copy_payload, error):
+    path = tmp_path / "corrupt.copy"
+    path.write_bytes(copy_payload)
+
+    with pytest.raises(RuntimeError, match=error):
+        scan_shared_block_copy(path)
+
+
+def test_binary_copy_rows_rejects_wrong_row_width():
+    with pytest.raises(RuntimeError, match="row width changed"):
+        binary_copy_rows(_COPY_HEADER + struct.pack(">h", 9))
 
 
 def _install_copy_capture(monkeypatch, *, existing_hashes=()):

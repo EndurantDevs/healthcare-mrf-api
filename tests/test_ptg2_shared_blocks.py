@@ -115,6 +115,8 @@ class _ReadOnceSession:
         self.calls.append((sql, params_by_name))
         if "ptg2_v3_graph_owner" in sql:
             return _Rows(self.owner_rows)
+        if "ptg2_v4_finalizer_map_root" in sql:
+            return _Rows(({"root_present": False, "finalizer_manifest": None},))
         if "ptg2_v3_snapshot_block" in sql:
             requested_keys = set(params_by_name["block_keys"])
             return _Rows(
@@ -2825,7 +2827,7 @@ async def test_fetch_shared_blocks_filters_exact_fragments():
     )
 
     assert result[0][0].fragment_no == 7080
-    sql, params = session.calls[0]
+    sql, params = session.calls[-1]
     assert "mapping.fragment_no = ANY" in sql
     assert params["fragment_nos"] == (7080,)
     assert params["shared_projection_generations"] == (

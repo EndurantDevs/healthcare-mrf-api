@@ -372,7 +372,12 @@ def test_price_atom_decoder_wraps_invalid_payload():
 
 
 @pytest.mark.asyncio
-async def test_provider_page_existence_uses_shared_layout_query():
+async def test_provider_page_existence_uses_shared_layout_query(monkeypatch):
+    monkeypatch.setattr(
+        sidecars,
+        "has_complete_v4_finalizer_map",
+        AsyncMock(return_value=None),
+    )
     query_result = SimpleNamespace(scalar=lambda: 1)
     session = SimpleNamespace(execute=AsyncMock(return_value=query_result))
 

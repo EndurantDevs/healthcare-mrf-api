@@ -361,4 +361,5 @@ def test_block_pin_migration_is_chained_and_gc_guarded(monkeypatch) -> None:
     assert "ptg2_block_build_pin" in shared_gc._delete_blocks_sql(
         "mrf",
         v4_tables_available=False,
+        finalizer_tables_available=False,
     )

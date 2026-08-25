@@ -41,6 +41,10 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_RELATION_MANIFEST_TABLE,
     PTG2_V4_SHARED_GENERATION,
 )
+from process.ptg_parts.ptg2_v4_finalizer_maps import (
+    FinalizerMapError,
+    has_complete_v4_finalizer_map,
+)
 from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
     validate_v4_inferred_taxonomy_projection_manifest,
 )
@@ -98,6 +102,25 @@ _V4_WORST_OWNER_INTEGER_FIELDS = (
     "worst_group_npi_member_page_work",
     "worst_group_npi_byte_work",
     "worst_group_npi_batch_work",
+)
+_V3_LEGACY_TABLE_FIELDS = (
+    "table",
+    "serving_binary_table",
+    "price_code_set_table",
+    "price_atom_table",
+    "price_atom_dictionary_table",
+    "price_set_entry_table",
+    "procedure_table",
+    "code_count_table",
+    "provider_set_table",
+    "provider_set_component_table",
+    "provider_set_entry_table",
+    "provider_entry_component_table",
+    "provider_group_member_table",
+    "provider_npi_scope_table",
+    "provider_group_location_table",
+    "provider_group_rate_scope_table",
+    "provider_set_dictionary_table",
 )
 
 
@@ -688,23 +711,28 @@ def _database_execution_evidence(row_fields: Any) -> dict[str, Any]:
     return database_evidence_by_field
 
 
-def _strict_v3_manifest_fields(
-    serving_index: dict[str, Any],
-) -> tuple[int | None, str | None, str | None, dict[str, Any]]:
-    """Validate the only serving contract accepted by the API."""
+def _normalized_manifest_field(
+    manifest: Mapping[str, Any],
+    field_name: str,
+) -> str:
+    return str(manifest.get(field_name) or "").strip().lower()
 
-    arch_version = str(serving_index.get("arch_version") or "").strip().lower()
-    storage_generation = (
-        str(serving_index.get("storage_generation") or "").strip().lower()
+
+def _strict_v3_contract_fields(
+    serving_index: dict[str, Any],
+) -> tuple[int, str, str, int]:
+    """Validate required top-level V3 contract fields."""
+
+    arch_version = _normalized_manifest_field(serving_index, "arch_version")
+    storage_generation = _normalized_manifest_field(serving_index, "storage_generation")
+    cold_lookup_contract = _normalized_manifest_field(
+        serving_index, "cold_lookup_contract"
     )
-    cold_lookup_contract = (
-        str(serving_index.get("cold_lookup_contract") or "").strip().lower()
+    price_membership_semantics = _normalized_manifest_field(
+        serving_index, "price_membership_semantics"
     )
-    price_membership_semantics = (
-        str(serving_index.get("price_membership_semantics") or "").strip().lower()
-    )
-    serving_multiplicity_semantics = (
-        str(serving_index.get("serving_multiplicity_semantics") or "").strip().lower()
+    serving_multiplicity_semantics = _normalized_manifest_field(
+        serving_index, "serving_multiplicity_semantics"
     )
     shared_snapshot_key = _optional_integer(serving_index.get("shared_snapshot_key"))
     source_count = _optional_integer(serving_index.get("source_count"))
@@ -748,7 +776,13 @@ def _strict_v3_manifest_fields(
             "reimport the snapshot"
         )
     _strict_coverage_scope_id(serving_index)
+    return shared_snapshot_key, storage_generation, cold_lookup_contract, source_count
 
+
+def _validate_v3_storage_markers(
+    serving_index: dict[str, Any],
+    storage_generation: str,
+) -> None:
     generation_marker_values = {
         PTG2_V3_SHARED_GENERATION: {
             "type": PTG2_V3_STORAGE_TYPE,
@@ -768,8 +802,7 @@ def _strict_v3_manifest_fields(
         **generation_marker_values,
     }
     for field_name, expected_value in required_marker_values_by_field.items():
-        actual_value = str(serving_index.get(field_name) or "").strip().lower()
-        if actual_value != expected_value:
+        if _normalized_manifest_field(serving_index, field_name) != expected_value:
             raise PTG2ManifestArtifactError(
                 f"PTG2 postgres_binary_v3 snapshot is missing {field_name}={expected_value}; "
                 "reimport the snapshot"
@@ -780,28 +813,9 @@ def _strict_v3_manifest_fields(
         )
 
     materialized_tables = serving_index.get("materialized_tables")
-    legacy_table_fields = (
-        "table",
-        "serving_binary_table",
-        "price_code_set_table",
-        "price_atom_table",
-        "price_atom_dictionary_table",
-        "price_set_entry_table",
-        "procedure_table",
-        "code_count_table",
-        "provider_set_table",
-        "provider_set_component_table",
-        "provider_set_entry_table",
-        "provider_entry_component_table",
-        "provider_group_member_table",
-        "provider_npi_scope_table",
-        "provider_group_location_table",
-        "provider_group_rate_scope_table",
-        "provider_set_dictionary_table",
-    )
-    if any(serving_index.get(field_name) for field_name in legacy_table_fields) or (
-        isinstance(materialized_tables, dict) and bool(materialized_tables)
-    ):
+    if any(
+        serving_index.get(field_name) for field_name in _V3_LEGACY_TABLE_FIELDS
+    ) or (isinstance(materialized_tables, dict) and bool(materialized_tables)):
         raise PTG2ManifestArtifactError(
             "PTG2 postgres_binary_v3 manifests must not declare legacy materialized tables; "
             "reimport the snapshot"
@@ -816,6 +830,61 @@ def _strict_v3_manifest_fields(
             "reimport the snapshot"
         )
 
+
+def _has_valid_v4_provider_graph(provider_graph: dict[str, Any]) -> bool:
+    representation = _normalized_manifest_field(provider_graph, "representation")
+    map_digest = _normalized_manifest_field(provider_graph, "map_digest")
+    return not (
+        provider_graph.get("contract") != PTG2_V4_PROVIDER_GRAPH_CONTRACT
+        or representation not in {"direct_v1", "pattern_v1"}
+        or _normalized_manifest_field(provider_graph, "map_format")
+        != PTG2_V4_MAP_FORMAT
+        or _normalized_manifest_field(provider_graph, "projection_id_scope")
+        != PTG2_V4_PROJECTION_ID_SCOPE
+        or provider_graph.get("locator_page_contract")
+        != PTG2_V4_OWNER_LOCATOR_PAGE_CONTRACT
+        or provider_graph.get("member_page_contract")
+        != PTG2_V4_MEMBER_PAGE_CONTRACT
+        or provider_graph.get("npi_table") != PTG2_V4_NPI_TABLE
+        or provider_graph.get("component_table") != PTG2_V4_COMPONENT_TABLE
+        or provider_graph.get("pattern_table") != PTG2_V4_PATTERN_TABLE
+        or provider_graph.get("relation_manifest_table")
+        != PTG2_V4_RELATION_MANIFEST_TABLE
+        or provider_graph.get("heavy_owner_table") != PTG2_V4_HEAVY_OWNER_TABLE
+        or provider_graph.get("npi_prefix_table") != PTG2_V4_NPI_PREFIX_TABLE
+        or provider_graph.get("diagnostic_table") != PTG2_V4_GRAPH_DIAGNOSTIC_TABLE
+        or not _has_valid_v4_manifest(
+            provider_graph.get("hot_prefix"),
+            representation=representation,
+        )
+        or not _has_valid_v4_resources(provider_graph.get("resource_admission"))
+        or not _COVERAGE_SCOPE_ID_RE.fullmatch(map_digest)
+    )
+
+
+def _validate_v4_provider_graph_manifest(serving_binary: dict[str, Any]) -> None:
+    provider_graph = serving_binary.get("provider_graph_v4")
+    if not isinstance(provider_graph, dict):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 snapshot is missing provider_graph_v4 metadata; reimport the snapshot"
+        )
+    if not _has_valid_v4_provider_graph(provider_graph):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 provider graph metadata is invalid; reimport the snapshot"
+        )
+    inferred_taxonomy_projection = provider_graph.get(
+        "inferred_taxonomy_candidates"
+    )
+    if inferred_taxonomy_projection is not None:
+        validate_v4_inferred_taxonomy_projection_manifest(
+            inferred_taxonomy_projection
+        )
+
+
+def _strict_v3_serving_binary(
+    serving_index: dict[str, Any],
+    storage_generation: str,
+) -> dict[str, Any]:
     serving_binary = serving_index.get("serving_binary")
     required_sections = (
         "price_dictionary",
@@ -830,81 +899,39 @@ def _strict_v3_manifest_fields(
             "PTG2 postgres_binary_v3 snapshot is missing strict serving_binary metadata; "
             "reimport the snapshot"
         )
-    if str(serving_binary.get("format") or "").strip().lower() != PTG2_V3_ARCH_VERSION:
+    if _normalized_manifest_field(serving_binary, "format") != PTG2_V3_ARCH_VERSION:
         raise PTG2ManifestArtifactError(
             "PTG2 postgres_binary_v3 snapshot has an invalid serving_binary format; "
             "reimport the snapshot"
         )
     if storage_generation == PTG2_V4_SHARED_GENERATION:
-        provider_graph = serving_binary.get("provider_graph_v4")
-        if not isinstance(provider_graph, dict):
-            raise PTG2ManifestArtifactError(
-                "PTG2 V4 snapshot is missing provider_graph_v4 metadata; reimport the snapshot"
-            )
-        map_digest = str(provider_graph.get("map_digest") or "").strip().lower()
-        if (
-            provider_graph.get("contract") != PTG2_V4_PROVIDER_GRAPH_CONTRACT
-            or str(provider_graph.get("representation") or "").strip().lower()
-            not in {"direct_v1", "pattern_v1"}
-            or str(provider_graph.get("map_format") or "").strip().lower()
-            != PTG2_V4_MAP_FORMAT
-            or str(provider_graph.get("projection_id_scope") or "").strip().lower()
-            != PTG2_V4_PROJECTION_ID_SCOPE
-            or provider_graph.get("locator_page_contract")
-            != PTG2_V4_OWNER_LOCATOR_PAGE_CONTRACT
-            or provider_graph.get("member_page_contract")
-            != PTG2_V4_MEMBER_PAGE_CONTRACT
-            or provider_graph.get("npi_table") != PTG2_V4_NPI_TABLE
-            or provider_graph.get("component_table") != PTG2_V4_COMPONENT_TABLE
-            or provider_graph.get("pattern_table") != PTG2_V4_PATTERN_TABLE
-            or provider_graph.get("relation_manifest_table")
-            != PTG2_V4_RELATION_MANIFEST_TABLE
-            or provider_graph.get("heavy_owner_table")
-            != PTG2_V4_HEAVY_OWNER_TABLE
-            or provider_graph.get("npi_prefix_table")
-            != PTG2_V4_NPI_PREFIX_TABLE
-            or provider_graph.get("diagnostic_table")
-            != PTG2_V4_GRAPH_DIAGNOSTIC_TABLE
-            or not _has_valid_v4_manifest(
-                provider_graph.get("hot_prefix"),
-                representation=str(provider_graph.get("representation") or "")
-                .strip()
-                .lower(),
-            )
-            or not _has_valid_v4_resources(
-                provider_graph.get("resource_admission")
-            )
-            or not _COVERAGE_SCOPE_ID_RE.fullmatch(map_digest)
-        ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 V4 provider graph metadata is invalid; reimport the snapshot"
-            )
-        inferred_taxonomy_projection = provider_graph.get(
-            "inferred_taxonomy_candidates"
-        )
-        if inferred_taxonomy_projection is not None:
-            validate_v4_inferred_taxonomy_projection_manifest(
-                inferred_taxonomy_projection
-            )
+        _validate_v4_provider_graph_manifest(serving_binary)
+    return serving_binary
 
+
+def _required_manifest_integer(
+    section: dict[str, Any],
+    field_name: str,
+) -> int:
+    value = _optional_integer(section.get(field_name))
+    if value is None:
+        raise PTG2ManifestArtifactError(
+            f"PTG2 postgres_binary_v3 snapshot is missing {field_name}; reimport the snapshot"
+        )
+    return value
+
+
+def _validate_v3_price_metadata(
+    serving_index: dict[str, Any],
+    serving_binary: dict[str, Any],
+) -> None:
     price_dictionary = serving_binary["price_dictionary"]
     membership = serving_binary["price_set_atom_memberships_v3"]
     price_atoms = serving_binary["price_atoms_v3"]
-
-    def required_integer(section: dict[str, Any], field_name: str) -> int:
-        """Read one required non-null integer from a manifest section."""
-
-        value = _optional_integer(section.get(field_name))
-        if value is None:
-            raise PTG2ManifestArtifactError(
-                f"PTG2 postgres_binary_v3 snapshot is missing {field_name}; reimport the snapshot"
-            )
-        return value
-
-    price_set_count = required_integer(price_dictionary, "price_set_count")
-    block_bytes = required_integer(price_dictionary, "block_bytes")
-    membership_span = required_integer(membership, "block_span")
-    atom_span = required_integer(price_atoms, "block_span")
+    price_set_count = _required_manifest_integer(price_dictionary, "price_set_count")
+    block_bytes = _required_manifest_integer(price_dictionary, "block_bytes")
+    membership_span = _required_manifest_integer(membership, "block_span")
+    atom_span = _required_manifest_integer(price_atoms, "block_span")
     atom_key_bits = _serving_index_atom_key_bits(serving_index)
     if price_set_count < 0 or block_bytes < 16 or block_bytes % 16 != 0:
         raise PTG2ManifestArtifactError(
@@ -918,6 +945,22 @@ def _strict_v3_manifest_fields(
         raise PTG2ManifestArtifactError(
             "PTG2 postgres_binary_v3 price dictionary kind is invalid; reimport the snapshot"
         )
+
+
+def _strict_v3_manifest_fields(
+    serving_index: dict[str, Any],
+) -> tuple[int | None, str | None, str | None, dict[str, Any]]:
+    """Validate the only serving contract accepted by the API."""
+
+    (
+        shared_snapshot_key,
+        storage_generation,
+        cold_lookup_contract,
+        source_count,
+    ) = _strict_v3_contract_fields(serving_index)
+    _validate_v3_storage_markers(serving_index, storage_generation)
+    serving_binary = _strict_v3_serving_binary(serving_index, storage_generation)
+    _validate_v3_price_metadata(serving_index, serving_binary)
     return (
         shared_snapshot_key,
         storage_generation,
@@ -1043,6 +1086,23 @@ async def _validate_v4_provider_graph_root(
         snapshot_key=snapshot_key,
     )
     _validate_v4_provider_graph_fields(fields, provider_graph)
+
+
+async def _validate_v4_finalizer_map_root(
+    session: Any,
+    *,
+    snapshot_key: int,
+) -> None:
+    """Authenticate an explicit packed-finalizer root or legacy absence."""
+
+    try:
+        await has_complete_v4_finalizer_map(
+            session,
+            schema_name=PTG2_SCHEMA,
+            snapshot_key=snapshot_key,
+        )
+    except FinalizerMapError as exc:
+        raise PTG2ManifestArtifactError(str(exc)) from exc
 
 
 async def snapshot_serving_tables(
@@ -1280,6 +1340,10 @@ async def snapshot_serving_tables(
             session,
             snapshot_key=int(shared_snapshot_key or 0),
             serving_index=serving_index,
+        )
+        await _validate_v4_finalizer_map_root(
+            session,
+            snapshot_key=int(shared_snapshot_key or 0),
         )
     coverage_scope_id = _strict_coverage_scope_id(serving_index)
     code_count = _optional_integer(serving_index.get("code_count"))

@@ -296,7 +296,7 @@ async def test_prepared_layout_requires_selective_copy_proof(monkeypatch, tmp_pa
         await _publish_prepared_layout(mocks, tmp_path)
 
     assert len(exc_info.value.exceptions) == 1
-    assert "did not return selective proof" in str(exc_info.value.exceptions[0])
+    assert "omitted selective proof" in str(exc_info.value.exceptions[0])
     assert mocks.run_finalizer.await_args.kwargs["scratch_durability"] == (
         snapshot_publish.PTG2_V3_DURABLE_SCRATCH_DURABILITY
     )
@@ -334,7 +334,7 @@ async def test_v4_graph_failure_prevents_finalizer_and_price_before_seal(
     )
     monkeypatch.setattr(snapshot_publish, "seal_v4_shared_layout", seal_v4)
 
-    with pytest.raises(ExceptionGroup) as exc_info:
+    with pytest.raises(RuntimeError, match="synthetic provider graph failure"):
         await asyncio.wait_for(
             _publish_prepared_layout(
                 mocks,
@@ -349,8 +349,6 @@ async def test_v4_graph_failure_prevents_finalizer_and_price_before_seal(
             timeout=0.5,
         )
 
-    assert len(exc_info.value.exceptions) == 1
-    assert "synthetic provider graph failure" in str(exc_info.value.exceptions[0])
     mocks.create_stage.assert_not_awaited()
     mocks.publish_blocks.assert_not_awaited()
     mocks.publish_price.assert_not_awaited()

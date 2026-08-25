@@ -86,7 +86,7 @@ async def test_real_postgres_v4_abandonment_resumes_after_cancellation(
             options=shared_gc.PTG2V4AbandonmentOptions(batch_rows=2),
         )
 
-        assert resumed == shared_gc.PTG2SharedLayoutGCStats(1, 3, 3)
+        assert resumed == shared_gc.PTG2SharedLayoutGCStats(1, 5, 5)
         await _assert_completed_v4_abandonment(
             database,
             schema,

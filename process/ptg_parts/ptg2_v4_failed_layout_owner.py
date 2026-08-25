@@ -15,6 +15,7 @@ from process.ptg_parts.ptg2_v4_failed_layout_fence import (
 )
 from process.ptg_parts.ptg2_v4_failed_layout_state import (
     _REFERENCE_FENCE_NAMES,
+    _has_finalizer_map_tables,
     json_mapping,
     load_recovery_records,
 )
@@ -152,11 +153,16 @@ async def _owner_records(
         return owner_records
     layout_by_field = owner_records[2]
     try:
+        finalizer_tables_available = await _has_finalizer_map_tables(
+            executor,
+            schema_name,
+        )
         is_locked = await _is_owned_v4_layout_locked(
             executor,
             schema_name=schema_name,
             snapshot_key=snapshot_key,
             build_token=str(layout_by_field.get("build_token") or ""),
+            finalizer_tables_available=finalizer_tables_available,
         )
     except RuntimeError as exc:
         raise PTG2V4RecoveryConflict(str(exc)) from exc

@@ -50,6 +50,13 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2ManifestArtifactError,
     ManifestReadLimitError,
 )
+from process.ptg_parts.ptg2_v4_finalizer_maps import (
+    FinalizerMapError,
+    has_complete_v4_finalizer_map,
+)
+from process.ptg_parts.ptg2_v4_finalizer_range_reader import (
+    load_v4_finalizer_range_keys,
+)
 
 
 _ProviderCodeRequests = Mapping[int, tuple[int, ...]]
@@ -746,22 +753,55 @@ def _computed_forward_shard_keys(
     return shard_keys_by_code
 
 
-async def _discover_forward_shard_keys(
+async def _packed_finalizer_block_keys_by_range(
     session: Any,
     *,
     shared_snapshot_key: int,
     schema_name: str,
-    code_keys: Iterable[int],
-    provider_shard_span: int | None = None,
+    object_kind: str,
+    ranges: Iterable[tuple[int, int, int]],
+    maximum_pack_rows: int | None = None,
     temporary_retention: _ForwardTemporaryRetention | None = None,
-) -> dict[int, tuple[int, ...]]:
-    """Discover every immutable provider shard in exact code-key ranges."""
+) -> dict[int, tuple[int, ...]] | None:
+    """Return authenticated packed block keys in inclusive integer ranges."""
 
-    normalized_code_keys = tuple(
-        sorted({_normalized_code_key(code_key) for code_key in code_keys})
+    def retain_block_key(_range_key: int, _block_key: int) -> None:
+        """Claim the fixed retained-byte cost for one discovered key."""
+
+        if temporary_retention is not None:
+            temporary_retention.claim(
+                _FORWARD_DISCOVERED_SHARD_RETAINED_BYTES,
+                category="a decoded discovered forward shard",
+            )
+
+    claim_block_key = (
+        retain_block_key
+        if temporary_retention is not None and temporary_retention.budget is not None
+        else None
     )
-    if not normalized_code_keys:
-        return {}
+    try:
+        return await load_v4_finalizer_range_keys(
+            session,
+            schema_name=schema_name,
+            snapshot_key=_required_shared_snapshot_key(shared_snapshot_key),
+            object_kind=object_kind,
+            ranges=ranges,
+            maximum_pack_rows=maximum_pack_rows,
+            claim_block_key=claim_block_key,
+        )
+    except FinalizerMapError as exc:
+        raise PTG2ManifestArtifactError(str(exc)) from exc
+
+
+async def _legacy_forward_shard_rows(
+    session: Any,
+    *,
+    shared_snapshot_key: int,
+    schema_name: str,
+    normalized_code_keys: tuple[int, ...],
+) -> Any:
+    """Return the legacy relational shard-range query result."""
+
     schema = _quote_ident(schema_name)
     statement = text(
         f"""
@@ -794,11 +834,22 @@ async def _discover_forward_shard_keys(
         "code_block_span": _SERVING_BINARY_BY_CODE_BLOCK_SPAN,
     }
     stream = getattr(session, "stream", None)
-    shard_query_result = (
+    return (
         await stream(statement, params_by_name)
         if callable(stream)
         else await session.execute(statement, params_by_name)
     )
+
+
+async def _collect_forward_shard_keys(
+    shard_query_result: Any,
+    *,
+    normalized_code_keys: tuple[int, ...],
+    provider_shard_span: int | None,
+    temporary_retention: _ForwardTemporaryRetention | None,
+) -> dict[int, tuple[int, ...]]:
+    """Validate and group streamed relational shard coordinates."""
+
     requested_code_set = set(normalized_code_keys)
     shard_keys_by_code: dict[int, list[int]] = {
         code_key: [] for code_key in normalized_code_keys
@@ -833,6 +884,60 @@ async def _discover_forward_shard_keys(
         code_key: tuple(block_keys)
         for code_key, block_keys in shard_keys_by_code.items()
     }
+
+
+async def _discover_forward_shard_keys(
+    session: Any,
+    *,
+    shared_snapshot_key: int,
+    schema_name: str,
+    code_keys: Iterable[int],
+    provider_shard_span: int | None = None,
+    temporary_retention: _ForwardTemporaryRetention | None = None,
+) -> dict[int, tuple[int, ...]]:
+    """Discover every immutable provider shard in exact code-key ranges."""
+
+    normalized_code_keys = tuple(
+        sorted({_normalized_code_key(code_key) for code_key in code_keys})
+    )
+    if not normalized_code_keys:
+        return {}
+    packed_keys = await _packed_finalizer_block_keys_by_range(
+        session,
+        shared_snapshot_key=shared_snapshot_key,
+        schema_name=schema_name,
+        object_kind=_SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND,
+        ranges=(
+            (
+                code_key,
+                code_key * _SERVING_BINARY_BY_CODE_BLOCK_SPAN,
+                (code_key + 1) * _SERVING_BINARY_BY_CODE_BLOCK_SPAN - 1,
+            )
+            for code_key in normalized_code_keys
+        ),
+        temporary_retention=temporary_retention,
+    )
+    if packed_keys is not None:
+        for code_key, block_keys in packed_keys.items():
+            for block_key in block_keys:
+                _forward_provider_range_for_block(
+                    code_key,
+                    block_key,
+                    provider_shard_span,
+                )
+        return packed_keys
+    shard_query_result = await _legacy_forward_shard_rows(
+        session,
+        shared_snapshot_key=shared_snapshot_key,
+        schema_name=schema_name,
+        normalized_code_keys=normalized_code_keys,
+    )
+    return await _collect_forward_shard_keys(
+        shard_query_result,
+        normalized_code_keys=normalized_code_keys,
+        provider_shard_span=provider_shard_span,
+        temporary_retention=temporary_retention,
+    )
 
 
 async def _iterate_forward_query_rows(query_result: Any):
@@ -1409,6 +1514,104 @@ def _visit_forward_occurrences(
     return source_vector_end, previous_occurrence
 
 
+def _require_forward_provider_key(
+    provider_set_key: int,
+    previous_provider_set_key: int | None,
+    validation: _ForwardFragmentValidation,
+) -> None:
+    if (
+        previous_provider_set_key is not None
+        and provider_set_key < previous_provider_set_key
+    ) or provider_set_key > 2**31 - 1:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 grouped by-code provider sets are not ordered"
+        )
+    if (
+        validation.provider_key_min is not None
+        and provider_set_key < int(validation.provider_key_min)
+    ) or (
+        validation.provider_key_max is not None
+        and provider_set_key >= int(validation.provider_key_max)
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 provider set is outside its forward shard"
+        )
+
+
+def _forward_provider_consumers(
+    provider_set_key: int,
+    source_filter: frozenset[int] | None,
+    occurrence_consumer: Callable[[int, int, int], None] | None,
+    first_occurrence_consumer: Callable[[int, int, int], None] | None,
+) -> tuple[
+    Callable[[int, int], None] | None,
+    Callable[[int, int], None] | None,
+]:
+    def _consume(price_key: int, source_key: int) -> None:
+        if source_filter is None or source_key in source_filter:
+            assert occurrence_consumer is not None
+            occurrence_consumer(provider_set_key, price_key, source_key)
+
+    def _capture_first(price_key: int, source_key: int) -> None:
+        assert first_occurrence_consumer is not None
+        first_occurrence_consumer(provider_set_key, price_key, source_key)
+
+    return (
+        _consume if occurrence_consumer is not None else None,
+        _capture_first if first_occurrence_consumer is not None else None,
+    )
+
+
+def _visit_forward_provider(
+    fragment_bytes: bytes,
+    cursor: int,
+    provider_set_key: int,
+    fragment_cursor: _ForwardFragmentCursor,
+    *,
+    source_shape: tuple[int, int],
+    provider_filter: AbstractSet[int] | None,
+    validation: _ForwardFragmentValidation,
+    consumers: tuple[
+        Callable[[int, int, int], None],
+        Callable[[int, int, int], None] | None,
+    ],
+) -> tuple[int, _ForwardFragmentCursor]:
+    provider_delta, cursor = read_strict_uvarint(fragment_bytes, cursor)
+    provider_set_key += provider_delta
+    _require_forward_provider_key(
+        provider_set_key,
+        fragment_cursor.provider_set_key,
+        validation,
+    )
+    occurrence_consumer, first_occurrence_consumer = consumers
+    provider_consumers = _forward_provider_consumers(
+        provider_set_key,
+        validation.source_filter,
+        (
+            occurrence_consumer
+            if provider_filter is None or provider_set_key in provider_filter
+            else None
+        ),
+        first_occurrence_consumer,
+    )
+    source_count, source_bits = source_shape
+    cursor, previous_occurrence = _visit_forward_occurrences(
+        fragment_bytes,
+        cursor,
+        source_count=source_count,
+        source_bits=source_bits,
+        occurrence_consumer=provider_consumers[0],
+        first_occurrence_consumer=provider_consumers[1],
+        price_item_count=validation.price_item_count,
+        previous_occurrence=(
+            fragment_cursor.occurrence
+            if fragment_cursor.provider_set_key == provider_set_key
+            else None
+        ),
+    )
+    return cursor, _ForwardFragmentCursor(provider_set_key, previous_occurrence)
+
+
 def _visit_forward_fragment_unchecked(
     fragment_row: Mapping[str, Any],
     *,
@@ -1427,91 +1630,37 @@ def _visit_forward_fragment_unchecked(
         format_version=2,
         expected_source_count=validation.expected_source_count,
     )
-    previous_provider_set_key = fragment_cursor.provider_set_key
-    previous_occurrence = fragment_cursor.occurrence
-    provider_set_key = 0
     entry_count = int(fragment_row.get("entry_count") or 0)
     if entry_count <= 0:
         raise PTG2ManifestArtifactError(
             "PTG2 v3 grouped by-code fragment has an invalid entry count"
         )
+    provider_set_key = 0
     for provider_index in range(entry_count):
-        provider_delta, cursor = read_strict_uvarint(fragment_bytes, cursor)
-        provider_set_key += provider_delta
-        if (
-            previous_provider_set_key is not None
-            and provider_set_key < previous_provider_set_key
-        ) or provider_set_key > 2**31 - 1:
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 grouped by-code provider sets are not ordered"
-            )
-        if (
-            validation.provider_key_min is not None
-            and provider_set_key < int(validation.provider_key_min)
-        ) or (
-            validation.provider_key_max is not None
-            and provider_set_key >= int(validation.provider_key_max)
-        ):
-            raise PTG2ManifestArtifactError(
-                "PTG2 v3 provider set is outside its forward shard"
-            )
-
-        is_provider_match = (
-            provider_filter is None or provider_set_key in provider_filter
-        )
-
-        def _consume(price_key: int, source_key: int) -> None:
-            is_source_match = (
-                validation.source_filter is None
-                or source_key in validation.source_filter
-            )
-            if is_source_match:
-                occurrence_consumer(provider_set_key, price_key, source_key)
-
-        def _capture_first(price_key: int, source_key: int) -> None:
-            if first_occurrence_consumer is not None:
-                first_occurrence_consumer(
-                    provider_set_key,
-                    price_key,
-                    source_key,
-                )
-
-        is_provider_continuation = (
-            previous_provider_set_key == provider_set_key
-        )
-        cursor, previous_occurrence = _visit_forward_occurrences(
+        cursor, fragment_cursor = _visit_forward_provider(
             fragment_bytes,
             cursor,
-            source_count=source_count,
-            source_bits=source_bits,
-            occurrence_consumer=(_consume if is_provider_match else None),
-            first_occurrence_consumer=(
-                _capture_first
-                if first_occurrence_consumer is not None
-                and provider_index == 0
-                else None
-            ),
-            price_item_count=validation.price_item_count,
-            previous_occurrence=(
-                previous_occurrence if is_provider_continuation else None
+            provider_set_key,
+            fragment_cursor,
+            source_shape=(source_count, source_bits),
+            provider_filter=provider_filter,
+            validation=validation,
+            consumers=(
+                occurrence_consumer,
+                first_occurrence_consumer if provider_index == 0 else None,
             ),
         )
-        previous_provider_set_key = provider_set_key
+        assert fragment_cursor.provider_set_key is not None
+        provider_set_key = fragment_cursor.provider_set_key
     if cursor != len(fragment_bytes):
         raise PTG2ManifestArtifactError(
             "PTG2 v3 grouped by-code fragment has trailing bytes"
         )
-    if previous_occurrence is None:
+    if fragment_cursor.occurrence is None:
         raise PTG2ManifestArtifactError(
             "PTG2 v3 grouped by-code fragment has no occurrences"
         )
-    return (
-        _ForwardFragmentCursor(
-            provider_set_key=provider_set_key,
-            occurrence=previous_occurrence,
-        ),
-        source_count,
-    )
+    return fragment_cursor, source_count
 
 
 def _decode_forward_fragment_unchecked(
@@ -2333,6 +2482,16 @@ async def has_serving_binary_code_block(
     lower_bound, upper_bound = _forward_code_block_bounds(
         normalized_code_key
     )
+    packed_keys = await _packed_finalizer_block_keys_by_range(
+        session,
+        shared_snapshot_key=shared_snapshot_key,
+        schema_name=schema_name,
+        object_kind=_SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND,
+        ranges=((normalized_code_key, lower_bound, upper_bound - 1),),
+        maximum_pack_rows=1,
+    )
+    if packed_keys is not None:
+        return bool(packed_keys[normalized_code_key])
     schema = _quote_ident(schema_name)
     block_exists_result = await session.execute(
         text(
@@ -5178,6 +5337,15 @@ async def has_shared_provider_pages_in_db(
         PTG2_SERVING_BINARY_V3_PROVIDER_SET_PAGE_KIND,
     )
 
+    try:
+        if await has_complete_v4_finalizer_map(
+            session,
+            schema_name=schema_name,
+            snapshot_key=_required_shared_snapshot_key(shared_snapshot_key),
+        ):
+            return True
+    except FinalizerMapError as exc:
+        raise PTG2ManifestArtifactError(str(exc)) from exc
     schema = _quote_ident(schema_name)
     query_result = await session.execute(
         text(

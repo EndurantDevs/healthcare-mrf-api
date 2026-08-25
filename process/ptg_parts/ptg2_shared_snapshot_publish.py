@@ -21,6 +21,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
+
 from db.connection import db
 from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from process.ptg_parts.db_tables import _quote_ident
@@ -35,6 +38,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
     SharedMappingDigestSummary,
     seal_shared_layout,
     shared_support_digest,
+    summarize_native_v4_finalizer_mappings,
     summarize_shared_snapshot_mappings,
     touch_shared_layout_build,
 )
@@ -87,6 +91,12 @@ from process.ptg_parts.ptg2_shared_publish import (
     prepare_v4_cas_block_stage,
     shared_block_stage_name,
     shared_graph_bundles_from_artifacts,
+)
+from process.ptg_parts.ptg2_v4_finalizer_map_sidecars import (
+    PackedMapNativeReceipt,
+)
+from process.ptg_parts.ptg2_v4_finalizer_maps import (
+    PTG2_V4_FINALIZER_MAP_CONTRACT,
 )
 from process.ptg_parts.ptg2_block_build_pins import (
     SharedBlockBuildPinLease,
@@ -274,22 +284,41 @@ class _FinalizerBlockPublicationResult:
     """Keep durable publication and immutable COPY proof together."""
 
     publication: Any
-    serving_copy: SharedBlockCopyMetrics
-    price_dictionary_copy: SharedBlockCopyMetrics
+    serving_copy: SharedBlockCopyMetrics | None = None
+    price_dictionary_copy: SharedBlockCopyMetrics | None = None
+    native_receipt: PackedMapNativeReceipt | None = None
 
     def copy_manifest(self) -> dict[str, Any]:
         """Return per-lane and total selective-staging proof."""
 
-        total = SharedBlockCopyMetrics.combine(
-            self.serving_copy,
-            self.price_dictionary_copy,
-        )
+        if self.native_receipt is not None:
+            if self.serving_copy is not None or self.price_dictionary_copy is not None:
+                raise RuntimeError("finalizer block publication mixed COPY contracts")
+            return self.native_receipt.manifest()
+        if self.serving_copy is None or self.price_dictionary_copy is None:
+            raise RuntimeError("finalizer block publication omitted COPY proof")
+        total = SharedBlockCopyMetrics.combine(self.serving_copy, self.price_dictionary_copy)
         return {
             "contract": "selective_shared_block_copy_v1",
             "serving": self.serving_copy.as_dict(),
             "price_dictionary": self.price_dictionary_copy.as_dict(),
             "total": total.as_dict(),
         }
+
+
+@dataclass(frozen=True)
+class _FinalizerBlockStageRequest:
+    schema_name: str
+    stage_table: str
+    snapshot_key: int
+    build_token: str
+    expected_generation: str
+    finalizer_summary: Mapping[str, Any]
+    serving_summary: Mapping[str, Any]
+    price_summary: Mapping[str, Any]
+    work_directory: Path
+    packed: bool
+    progress_callback: Callable[[str, int], None] | None
 
 
 @dataclass(frozen=True)
@@ -592,19 +621,25 @@ async def _run_independent_publication_lanes(
     provider_graph: Callable[[], Awaitable[Any]],
     price: Callable[[], Awaitable[Any]],
     source_witness: Callable[[], Awaitable[Any]],
+    serialize_price_before_finalizer: bool = False,
 ) -> tuple[Any, Any, Any, Any]:
     """Publish the witness first and gate finalizer and price on the graph."""
 
     source_witness_result = await source_witness()
-    async with asyncio.TaskGroup() as task_group:
-        provider_graph_task = task_group.create_task(provider_graph())
-        await provider_graph_task
-        finalizer_block_task = task_group.create_task(finalizer_blocks())
-        price_task = task_group.create_task(price())
+    provider_graph_result = await provider_graph()
+    if serialize_price_before_finalizer:
+        price_result = await price()
+        finalizer_block_result = await finalizer_blocks()
+    else:
+        async with asyncio.TaskGroup() as task_group:
+            finalizer_block_task = task_group.create_task(finalizer_blocks())
+            price_task = task_group.create_task(price())
+        finalizer_block_result = finalizer_block_task.result()
+        price_result = price_task.result()
     return (
-        finalizer_block_task.result(),
-        provider_graph_task.result(),
-        price_task.result(),
+        finalizer_block_result,
+        provider_graph_result,
+        price_result,
         source_witness_result,
     )
 
@@ -1303,6 +1338,189 @@ async def _copy_finalizer_block(
         reuse_existing=True,
         **_progress_callback_kwargs(progress_callback),
     )
+
+
+async def _copy_finalizer_lane(
+    request: _FinalizerBlockStageRequest,
+    block_summary: Mapping[str, Any],
+) -> SharedBlockCopyMetrics:
+    """Copy one relational finalizer lane with selective reuse proof."""
+
+    metrics = await _copy_finalizer_block(
+        request.finalizer_summary,
+        block_summary,
+        schema_name=request.schema_name,
+        stage_table=request.stage_table,
+        progress_callback=request.progress_callback,
+    )
+    if metrics is None:
+        raise RuntimeError("strict V3 finalizer block COPY omitted selective proof")
+    return metrics
+
+
+async def _publish_finalizer_stage_mappings(
+    request: _FinalizerBlockStageRequest,
+) -> Any:
+    """Attach relational mappings for the legacy finalizer path."""
+
+    return await publish_shared_block_stage(
+        schema_name=request.schema_name,
+        stage_table=request.stage_table,
+        snapshot_key=request.snapshot_key,
+        build_token=request.build_token,
+        expected_generation=request.expected_generation,
+        **_progress_callback_kwargs(request.progress_callback),
+    )
+
+
+_FINALIZER_STAGE_NAME_DOMAIN = b"PTG2V4FINALIZERSTAGE\x01"
+
+
+def _finalizer_block_stage_name(snapshot_key: int, build_token: str) -> str:
+    """Bind one reclaimable stage name to the exact layout attempt."""
+
+    stage_digest = hashlib.sha256(
+        _FINALIZER_STAGE_NAME_DOMAIN
+        + str(int(snapshot_key)).encode("ascii")
+        + b":"
+        + str(build_token).encode("utf-8")
+    ).hexdigest()
+    return shared_block_stage_name(stage_digest)
+
+
+@asynccontextmanager
+async def _finalizer_block_stage_guard(
+    *, schema_name: str, snapshot_key: int, build_token: str
+):
+    """Serialize duplicate calls until their deterministic stages are removed."""
+
+    if db.engine is None:
+        await db.connect()
+    if db.engine is None:
+        raise RuntimeError("packed finalizer stage guard requires a database engine")
+    lock_engine = create_async_engine(db.engine.url, poolclass=NullPool)
+    lock_name = (
+        f"ptg2-v4-finalizer-stage:{schema_name}:{int(snapshot_key)}:{build_token}"
+    )
+    try:
+        async with lock_engine.begin() as connection:
+            await connection.scalar(
+                db.text(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(:lock_name, 0))"
+                ),
+                {"lock_name": lock_name},
+            )
+            await connection.execute(
+                db.text(
+                    "SELECT set_config('idle_in_transaction_session_timeout', '0', true), "
+                    "CASE WHEN current_setting('transaction_timeout', true) IS NOT NULL "
+                    "THEN set_config('transaction_timeout', '0', true) END"
+                )
+            )
+            yield
+    finally:
+        cleanup_task = asyncio.create_task(lock_engine.dispose())
+        await _await_cleanup_task(cleanup_task, propagate_cancellation=True)
+
+
+async def _drop_finalizer_block_stage(request: _FinalizerBlockStageRequest) -> None:
+    await db.status(
+        "DROP TABLE IF EXISTS "
+        f"{_quote_ident(request.schema_name)}.{_quote_ident(request.stage_table)};"
+    )
+
+
+async def _publish_packed_finalizer_block_stage(
+    request: _FinalizerBlockStageRequest,
+) -> _FinalizerBlockPublicationResult:
+    """Pack, attach, and clean one attempt-bound finalizer stage."""
+
+    from process.ptg_parts.ptg2_v4_finalizer_native import (
+        pack_v4_finalizer_copies,
+    )
+
+    expected_stage_table = _finalizer_block_stage_name(
+        request.snapshot_key, request.build_token
+    )
+    if request.stage_table != expected_stage_table:
+        raise RuntimeError("packed finalizer stage is not bound to its build token")
+    async with _finalizer_block_stage_guard(
+        schema_name=request.schema_name,
+        snapshot_key=request.snapshot_key,
+        build_token=request.build_token,
+    ):
+        native_receipt = await pack_v4_finalizer_copies(
+            request.finalizer_summary,
+            work_directory=request.work_directory,
+        )
+        try:
+            await create_shared_block_stage(
+                schema_name=request.schema_name,
+                stage_table=request.stage_table,
+            )
+            from process.ptg_parts.ptg2_v4_finalizer_publish import (
+                publish_v4_finalizer_maps,
+            )
+
+            publication = await publish_v4_finalizer_maps(
+                native_receipt,
+                schema_name=request.schema_name,
+                stage_table=request.stage_table,
+                snapshot_key=request.snapshot_key,
+                build_token=request.build_token,
+                **_progress_callback_kwargs(request.progress_callback),
+            )
+            return _FinalizerBlockPublicationResult(
+                publication=publication,
+                native_receipt=native_receipt,
+            )
+        finally:
+            try:
+                native_receipt.cleanup()
+            finally:
+                cleanup_task = asyncio.create_task(
+                    _drop_finalizer_block_stage(request)
+                )
+                await _await_cleanup_task(
+                    cleanup_task,
+                    propagate_cancellation=True,
+                )
+
+
+async def _publish_finalizer_block_stage(
+    request: _FinalizerBlockStageRequest,
+) -> _FinalizerBlockPublicationResult:
+    """Publish both finalizer lanes and clean their exact temporary state."""
+
+    if request.packed:
+        return await _publish_packed_finalizer_block_stage(request)
+
+    serving_metrics = None
+    price_metrics = None
+    await create_shared_block_stage(
+        schema_name=request.schema_name,
+        stage_table=request.stage_table,
+    )
+    try:
+        serving_metrics = await _copy_finalizer_lane(
+            request,
+            request.serving_summary,
+        )
+        price_metrics = await _copy_finalizer_lane(
+            request,
+            request.price_summary,
+        )
+        publication = await _publish_finalizer_stage_mappings(
+            request,
+        )
+        return _FinalizerBlockPublicationResult(
+            publication=publication,
+            serving_copy=serving_metrics,
+            price_dictionary_copy=price_metrics,
+        )
+    finally:
+        cleanup_task = asyncio.create_task(_drop_finalizer_block_stage(request))
+        await _await_cleanup_task(cleanup_task, propagate_cancellation=True)
 
 
 async def _convert_shared_graph_natively(
@@ -5180,7 +5398,9 @@ async def _publish_prepared_shared_layout(
                 converted_blocks=int(graph_conversion.block_count),
             )
 
-        block_stage = shared_block_stage_name(f"final-{reserved_snapshot_key}")
+        block_stage = _finalizer_block_stage_name(
+            int(reserved_snapshot_key), build_token
+        )
 
         async def publish_finalizer_blocks() -> Any:
             """Publish finalizer serving and price blocks."""
@@ -5191,54 +5411,28 @@ async def _publish_prepared_shared_layout(
                 interval_seconds=progress_interval_seconds,
             )
             stage_started_at = time.monotonic()
-            await create_shared_block_stage(
-                schema_name=schema_name,
-                stage_table=block_stage,
-            )
             try:
-                serving_copy_metrics = await _copy_finalizer_block(
-                    finalizer_summary_by_field,
-                    serving_block_summary,
-                    schema_name=schema_name,
-                    stage_table=block_stage,
-                    progress_callback=(
-                        lane_progress.add if progress_callback is not None else None
-                    ),
-                )
-                price_copy_metrics = await _copy_finalizer_block(
-                    finalizer_summary_by_field,
-                    price_block_summary,
-                    schema_name=schema_name,
-                    stage_table=block_stage,
-                    progress_callback=(
-                        lane_progress.add if progress_callback is not None else None
-                    ),
-                )
-                if serving_copy_metrics is None or price_copy_metrics is None:
-                    raise RuntimeError(
-                        "strict V3 finalizer block COPY did not return selective proof"
+                return await _publish_finalizer_block_stage(
+                    _FinalizerBlockStageRequest(
+                        schema_name=schema_name,
+                        stage_table=block_stage,
+                        snapshot_key=int(reserved_snapshot_key),
+                        build_token=build_token,
+                        expected_generation=shared_generation,
+                        finalizer_summary=finalizer_summary_by_field,
+                        serving_summary=serving_block_summary,
+                        price_summary=price_block_summary,
+                        work_directory=Path(raw_work_directory),
+                        packed=provider_graph_v4,
+                        progress_callback=(
+                            lane_progress.add
+                            if progress_callback is not None
+                            else None
+                        ),
                     )
-                publication = await publish_shared_block_stage(
-                    schema_name=schema_name,
-                    stage_table=block_stage,
-                    snapshot_key=int(reserved_snapshot_key),
-                    build_token=build_token,
-                    expected_generation=shared_generation,
-                    **_progress_callback_kwargs(
-                        lane_progress.add if progress_callback is not None else None
-                    ),
-                )
-                return _FinalizerBlockPublicationResult(
-                    publication=publication,
-                    serving_copy=serving_copy_metrics,
-                    price_dictionary_copy=price_copy_metrics,
                 )
             finally:
                 lane_progress.flush()
-                await db.status(
-                    "DROP TABLE IF EXISTS "
-                    f"{_quote_ident(schema_name)}.{_quote_ident(block_stage)};"
-                )
                 record_stage("serving_block_publish", stage_started_at)
 
         async def publish_provider_graph() -> Any:
@@ -5382,6 +5576,7 @@ async def _publish_prepared_shared_layout(
                 provider_graph=publish_provider_graph,
                 price=publish_price,
                 source_witness=publish_source_witness,
+                serialize_price_before_finalizer=provider_graph_v4,
             )
         finally:
             # The V4 audit re-authenticates the compiler's bounded witness
@@ -5399,7 +5594,14 @@ async def _publish_prepared_shared_layout(
         await touch_build()
         stage_started_at = time.monotonic()
         async with db.transaction() as session:
-            mapping_summary = await summarize_shared_snapshot_mappings(
+            summary_loader = (
+                summarize_native_v4_finalizer_mappings
+                if provider_graph_v4
+                and finalizer_block_publication.contract
+                == PTG2_V4_FINALIZER_MAP_CONTRACT
+                else summarize_shared_snapshot_mappings
+            )
+            mapping_summary = await summary_loader(
                 session,
                 schema_name=schema_name,
                 snapshot_key=int(reserved_snapshot_key),
@@ -5417,6 +5619,13 @@ async def _publish_prepared_shared_layout(
             *(() if provider_graph_v4 else (graph_publication,)),
             price_publication,
         )
+        if provider_graph_v4 and (
+            mapping_summary.packed_mapping_count
+            != int(finalizer_block_publication.mapping_count)
+            or mapping_summary.relational_mapping_count
+            != int(price_publication.mapping_count)
+        ):
+            raise RuntimeError("PTG V4 mapping lane counts changed after publication")
         observed_kinds = set(mapping_summary.object_kinds)
         missing_kinds = (
             _REQUIRED_PRICE_OBJECT_KINDS
@@ -5428,7 +5637,7 @@ async def _publish_prepared_shared_layout(
                 f"strict V3 physical layout is missing required blocks: {sorted(missing_kinds)}"
             )
         core_support_map = {
-            "contract_version": 2 if provider_graph_v4 else 1,
+            "contract_version": 3 if provider_graph_v4 else 1,
             "serving_multiplicity_semantics": (PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS),
             "finalizer_dictionaries": dictionary_publication.support_digest.hex(),
             "provider_graph": graph_publication.support_digest.hex(),
@@ -5437,9 +5646,8 @@ async def _publish_prepared_shared_layout(
             "provider_identifier_quarantine": quarantine["sha256"],
         }
         if provider_graph_v4:
-            # The V4 root digest owns only the factored provider graph.  Bind
-            # the unchanged V3 rate/finalizer mappings into the support digest
-            # so a graph-identical but rate-different layout cannot be reused.
+            # The V4 root digest owns only the factored provider graph. Bind
+            # the finalizer and rate mappings separately into support identity.
             source_projection_by_field = dict(
                 graph_publication.provider_tax_identity_source
             )
@@ -5450,12 +5658,20 @@ async def _publish_prepared_shared_layout(
             core_support_map["provider_tax_identity_source"] = (
                 source_projection_by_field
             )
-            core_support_map["price_finalizer_mapping_digest"] = (
-                mapping_summary.mapping_digest.hex()
-            )
-            core_support_map["price_finalizer_mapping_count"] = int(
-                mapping_summary.mapping_count
-            )
+            if (
+                mapping_summary.packed_mapping_digest is None
+                or mapping_summary.relational_mapping_digest is None
+            ):
+                raise RuntimeError("PTG V4 mapping component evidence is missing")
+            core_support_map["packed_finalizer_mapping"] = {
+                "mapping_digest": mapping_summary.packed_mapping_digest.hex(),
+                "mapping_count": int(mapping_summary.packed_mapping_count),
+                "map_root_digest": finalizer_block_publication.map_digest.hex(),
+            }
+            core_support_map["relational_price_mapping"] = {
+                "mapping_digest": mapping_summary.relational_mapping_digest.hex(),
+                "mapping_count": int(mapping_summary.relational_mapping_count),
+            }
         core_support_digest = shared_support_digest(core_support_map)
         price_membership_summary = _mapping(
             price_publication.stream_summaries.get("price_set_atom_memberships_v3"),
@@ -5516,6 +5732,11 @@ async def _publish_prepared_shared_layout(
         )
         stored_byte_count = (
             int(finalizer_block_publication.stored_byte_count)
+            + int(
+                finalizer_block_publication.stored_map_byte_count
+                if provider_graph_v4
+                else 0
+            )
             + int(graph_publication.stored_byte_count)
             + int(price_publication.stored_byte_count)
             + int(source_witness_publication.stored_byte_count)
@@ -5538,6 +5759,10 @@ async def _publish_prepared_shared_layout(
                 "storage_bytes": int(stored_byte_count),
             }
         )
+        if provider_graph_v4:
+            provisional_serving_index["finalizer_mapping"] = (
+                finalizer_block_publication.manifest()
+            )
         provisional_serving_index["timings"] = {
             **dict(provisional_serving_index.get("timings") or {}),
             **publication_timing_map,

@@ -2113,37 +2113,132 @@ async def summarize_persisted_v4_snapshot_metadata(
     )
 
 
+_FINALIZER_ROOT_PROJECTION_SQL = """
+           finalizer_root.snapshot_key IS NOT NULL AS finalizer_root_present,
+           finalizer_root.state AS finalizer_root_state,
+           finalizer_root.contract AS finalizer_root_contract,
+           finalizer_root.map_format AS finalizer_root_map_format,
+           finalizer_root.map_digest AS finalizer_root_map_digest,
+           finalizer_root.canonical_mapping_digest
+               AS finalizer_root_canonical_mapping_digest,
+           finalizer_root.canonical_byte_count
+               AS finalizer_root_canonical_byte_count,
+           finalizer_root.target_identity_digest
+               AS finalizer_root_target_identity_digest,
+           finalizer_root.object_kind_count AS finalizer_root_object_kind_count,
+           finalizer_root.map_pack_count AS finalizer_root_map_pack_count,
+           finalizer_root.coordinate_count AS finalizer_root_coordinate_count,
+           finalizer_root.entry_count AS finalizer_root_entry_count,
+           finalizer_root.logical_byte_count AS finalizer_root_logical_byte_count,
+           finalizer_root.stored_map_byte_count
+               AS finalizer_root_stored_map_byte_count,
+           finalizer_root.target_block_count AS finalizer_root_target_block_count,
+           finalizer_root.completed_at AS finalizer_root_completed_at
+"""
+
+_ABSENT_FINALIZER_ROOT_PROJECTION_SQL = """
+           FALSE AS finalizer_root_present,
+           NULL AS finalizer_root_state,
+           NULL AS finalizer_root_contract,
+           NULL AS finalizer_root_map_format,
+           NULL AS finalizer_root_map_digest,
+           NULL AS finalizer_root_canonical_mapping_digest,
+           NULL AS finalizer_root_canonical_byte_count,
+           NULL AS finalizer_root_target_identity_digest,
+           NULL AS finalizer_root_object_kind_count,
+           NULL AS finalizer_root_map_pack_count,
+           NULL AS finalizer_root_coordinate_count,
+           NULL AS finalizer_root_entry_count,
+           NULL AS finalizer_root_logical_byte_count,
+           NULL AS finalizer_root_stored_map_byte_count,
+           NULL AS finalizer_root_target_block_count,
+           NULL AS finalizer_root_completed_at
+"""
+
+_FINALIZER_ROOT_JOIN_SQL = """
+      LEFT JOIN {schema}.ptg2_v4_finalizer_map_root AS finalizer_root
+        ON finalizer_root.snapshot_key = layout.snapshot_key
+"""
+
+
+async def _finalizer_root_layout_sql(
+    session: Any,
+    *,
+    schema_name: str,
+    schema: str,
+) -> tuple[str, str]:
+    """Select packed-root SQL only when its complete storage extension exists."""
+
+    from process.ptg_parts.ptg2_v4_finalizer_maps import _has_finalizer_map_tables
+
+    if not await _has_finalizer_map_tables(session, schema_name=schema_name):
+        return _ABSENT_FINALIZER_ROOT_PROJECTION_SQL, ""
+    return (
+        _FINALIZER_ROOT_PROJECTION_SQL,
+        _FINALIZER_ROOT_JOIN_SQL.format(schema=schema),
+    )
+
+
+_V4_LAYOUT_RESERVATION_SQL = """
+    SELECT layout.snapshot_key, layout.state, layout.generation,
+           layout.build_token, layout.layout_manifest,
+           layout.mapping_digest AS layout_mapping_digest,
+           root.state AS root_state, root.format_version AS root_format_version,
+           root.map_format, root.representation, root.projection_id_scope,
+           root.map_digest, root.object_kind_count, root.map_pack_count,
+           root.coordinate_count, root.entry_count, root.logical_byte_count,
+           root.stored_map_byte_count, root.npi_count, root.component_count,
+           root.pattern_count, root.relation_count, root.heavy_owner_count,
+{finalizer_root_projection},
+           EXISTS (
+               SELECT 1
+                 FROM {schema}.ptg2_v3_snapshot_block AS finalizer_mapping
+                WHERE finalizer_mapping.snapshot_key = layout.snapshot_key
+                  AND finalizer_mapping.object_kind = ANY(
+                      CAST(:finalizer_object_kinds AS text[])
+                  )
+           ) AS finalizer_relational_mapping_present
+      FROM {schema}.ptg2_v3_layout_fingerprint AS fingerprint
+      JOIN {schema}.ptg2_v3_snapshot_layout AS layout
+        ON layout.snapshot_key = fingerprint.snapshot_key
+      LEFT JOIN {schema}.ptg2_v4_snapshot_map_root AS root
+        ON root.snapshot_key = layout.snapshot_key
+{finalizer_root_join}
+     WHERE fingerprint.semantic_fingerprint = :semantic_fingerprint
+     LIMIT 1
+"""
+
+
 async def _load_v4_layout_reservation(
     session: Any,
     *,
+    schema_name: str,
     schema: str,
     fingerprint: bytes,
 ) -> dict[str, Any] | None:
+    """Load graph and finalizer roots used by the sealed fast-reuse fence."""
+
+    from process.ptg_parts.ptg2_v4_finalizer_maps import (
+        PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
+    )
+
+    finalizer_root_projection, finalizer_root_join = await _finalizer_root_layout_sql(
+        session,
+        schema_name=schema_name,
+        schema=schema,
+    )
     existing_result = await session.execute(
         text(
-            f"""
-            SELECT layout.snapshot_key, layout.state, layout.generation,
-                   layout.build_token, layout.layout_manifest,
-                   layout.mapping_digest AS layout_mapping_digest,
-                   root.state AS root_state,
-                   root.format_version AS root_format_version,
-                   root.map_format, root.representation,
-                   root.projection_id_scope, root.map_digest,
-                   root.object_kind_count, root.map_pack_count,
-                   root.coordinate_count, root.entry_count,
-                   root.logical_byte_count, root.stored_map_byte_count,
-                   root.npi_count, root.component_count, root.pattern_count,
-                   root.relation_count, root.heavy_owner_count
-              FROM {schema}.ptg2_v3_layout_fingerprint AS fingerprint
-              JOIN {schema}.ptg2_v3_snapshot_layout AS layout
-                ON layout.snapshot_key = fingerprint.snapshot_key
-              LEFT JOIN {schema}.ptg2_v4_snapshot_map_root AS root
-                ON root.snapshot_key = layout.snapshot_key
-             WHERE fingerprint.semantic_fingerprint = :semantic_fingerprint
-             LIMIT 1
-            """
+            _V4_LAYOUT_RESERVATION_SQL.format(
+                schema=schema,
+                finalizer_root_projection=finalizer_root_projection,
+                finalizer_root_join=finalizer_root_join,
+            )
         ),
-        {"semantic_fingerprint": fingerprint},
+        {
+            "semantic_fingerprint": fingerprint,
+            "finalizer_object_kinds": PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
+        },
     )
     existing_row = existing_result.first()
     return _row_mapping(existing_row) if existing_row is not None else None
@@ -2249,7 +2344,77 @@ def _validate_sealed_reservation(existing: Mapping[str, Any]) -> Mapping[str, An
         summary=sealed_summary,
         metadata=sealed_metadata,
     )
+    _validate_reused_finalizer_root(existing, manifest)
     return manifest
+
+
+def _reused_finalizer_root_fields(existing: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "layout_state": existing.get("state"),
+        "layout_generation": existing.get("generation"),
+        "root_state": existing.get("finalizer_root_state"),
+        "root_contract": existing.get("finalizer_root_contract"),
+        "root_map_format": existing.get("finalizer_root_map_format"),
+        "root_map_digest": existing.get("finalizer_root_map_digest"),
+        "root_canonical_mapping_digest": existing.get(
+            "finalizer_root_canonical_mapping_digest"
+        ),
+        "root_canonical_byte_count": existing.get(
+            "finalizer_root_canonical_byte_count"
+        ),
+        "root_target_identity_digest": existing.get(
+            "finalizer_root_target_identity_digest"
+        ),
+        "root_completed_at": existing.get("finalizer_root_completed_at"),
+        **{
+            f"root_{field_name}": existing.get(f"finalizer_root_{field_name}")
+            for field_name in (
+                "object_kind_count",
+                "map_pack_count",
+                "coordinate_count",
+                "entry_count",
+                "logical_byte_count",
+                "stored_map_byte_count",
+                "target_block_count",
+            )
+        },
+    }
+
+
+def _validate_reused_finalizer_root(
+    existing: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> None:
+    """Accept legacy absence or prove one sealed packed finalizer root."""
+
+    from process.ptg_parts.ptg2_v4_finalizer_maps import (
+        FinalizerMapError,
+        PTG2_V4_FINALIZER_MAP_MANIFEST_KEY,
+        _validated_root,
+    )
+
+    serving_index = manifest.get("serving_index")
+    manifest_present = isinstance(serving_index, Mapping) and (
+        PTG2_V4_FINALIZER_MAP_MANIFEST_KEY in serving_index
+    )
+    root_present = bool(existing.get("finalizer_root_present"))
+    if not manifest_present and not root_present:
+        return
+    if manifest_present != root_present:
+        raise RuntimeError(
+            "sealed PTG V4 finalizer root and manifest must appear together"
+        )
+    if bool(existing.get("finalizer_relational_mapping_present")):
+        raise RuntimeError(
+            "sealed PTG V4 finalizer root has mixed relational mappings"
+        )
+    finalizer_manifest = serving_index.get(PTG2_V4_FINALIZER_MAP_MANIFEST_KEY)
+    if not isinstance(finalizer_manifest, Mapping):
+        raise RuntimeError("sealed PTG V4 finalizer manifest is not an object")
+    try:
+        _validated_root(_reused_finalizer_root_fields(existing), finalizer_manifest)
+    except FinalizerMapError as exc:
+        raise RuntimeError("sealed PTG V4 finalizer root is inconsistent") from exc
 
 
 async def _touch_sealed_reservation(
@@ -2366,6 +2531,7 @@ async def reserve_v4_shared_layout(
     )
     existing = await _load_v4_layout_reservation(
         session,
+        schema_name=schema_name,
         schema=schema,
         fingerprint=fingerprint,
     )
@@ -3828,49 +3994,77 @@ async def _complete_v4_map_root(
         raise RuntimeError("PTG V4 map root could not be completed during seal")
 
 
+_REUSABLE_V4_LAYOUT_SQL = """
+    SELECT layout.snapshot_key, layout.state, layout.generation,
+           layout.layout_manifest,
+           root.state AS root_state, root.format_version AS root_format_version,
+           root.map_format, root.representation, root.projection_id_scope,
+           root.map_digest, root.object_kind_count, root.map_pack_count,
+           root.coordinate_count, root.entry_count, root.logical_byte_count,
+           root.stored_map_byte_count, root.npi_count, root.component_count,
+           root.pattern_count, root.relation_count, root.heavy_owner_count,
+{finalizer_root_projection},
+           EXISTS (
+               SELECT 1
+                 FROM {schema}.ptg2_v3_snapshot_block AS finalizer_mapping
+                WHERE finalizer_mapping.snapshot_key = layout.snapshot_key
+                  AND finalizer_mapping.object_kind = ANY(
+                      CAST(:finalizer_object_kinds AS text[])
+                  )
+           ) AS finalizer_relational_mapping_present
+      FROM {schema}.ptg2_v3_snapshot_layout AS layout
+      JOIN {schema}.ptg2_v4_snapshot_map_root AS root
+        ON root.snapshot_key = layout.snapshot_key
+{finalizer_root_join}
+     WHERE layout.generation = :generation
+       AND layout.state = 'sealed'
+       AND layout.mapping_digest = :mapping_digest
+       AND layout.support_digest = :support_digest
+       AND layout.snapshot_key <> :snapshot_key
+     LIMIT 1
+     FOR UPDATE OF layout, root
+"""
+
+
 async def _load_reusable_v4_layout(
     session: Any,
     *,
+    schema_name: str,
     schema: str,
     snapshot_key: int,
     mapping_digest: bytes,
     support_digest: bytes,
 ) -> dict[str, Any] | None:
+    """Lock and load one canonical graph plus packed-finalizer root."""
+
+    from process.ptg_parts.ptg2_v4_finalizer_maps import (
+        PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
+    )
+
     await acquire_layout_digest_lock(
         session,
         digest=mapping_digest,
         purpose="V4 mapping digest",
     )
+    finalizer_root_projection, finalizer_root_join = await _finalizer_root_layout_sql(
+        session,
+        schema_name=schema_name,
+        schema=schema,
+    )
     reusable_result = await session.execute(
         text(
-            f"""
-            SELECT layout.snapshot_key, layout.layout_manifest,
-                   root.state AS root_state,
-                   root.format_version AS root_format_version,
-                   root.map_format, root.representation,
-                   root.projection_id_scope, root.map_digest,
-                   root.object_kind_count, root.map_pack_count,
-                   root.coordinate_count, root.entry_count,
-                   root.logical_byte_count, root.stored_map_byte_count,
-                   root.npi_count, root.component_count, root.pattern_count,
-                   root.relation_count, root.heavy_owner_count
-              FROM {schema}.ptg2_v3_snapshot_layout AS layout
-              JOIN {schema}.ptg2_v4_snapshot_map_root AS root
-                ON root.snapshot_key = layout.snapshot_key
-             WHERE layout.generation = :generation
-               AND layout.state = 'sealed'
-               AND layout.mapping_digest = :mapping_digest
-               AND layout.support_digest = :support_digest
-               AND layout.snapshot_key <> :snapshot_key
-             LIMIT 1
-             FOR UPDATE OF layout, root
-            """
+            _REUSABLE_V4_LAYOUT_SQL.format(
+                schema=schema,
+                finalizer_root_projection=finalizer_root_projection,
+                finalizer_root_join=finalizer_root_join,
+            )
         ),
         {
             "generation": PTG2_V4_SHARED_GENERATION,
             "mapping_digest": mapping_digest,
             "support_digest": support_digest,
             "snapshot_key": snapshot_key,
+            "finalizer_object_kinds": PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
         },
     )
     reusable_row = reusable_result.first()
@@ -3884,7 +4078,7 @@ def _validate_reusable_v4_layout(
     observed_summary: V4SnapshotMapSummary,
     observed_metadata: V4SnapshotMetadataSummary,
 ) -> None:
-    _reusable_manifest, reusable_summary, reusable_metadata = _sealed_root_summaries(
+    reusable_manifest, reusable_summary, reusable_metadata = _sealed_root_summaries(
         reusable
     )
     if (
@@ -3904,11 +4098,12 @@ def _validate_reusable_v4_layout(
         context="reusable root",
     )
     _validate_v4_manifest_root(
-        reusable.get("layout_manifest") or {},
+        reusable_manifest,
         representation=representation,
         summary=reusable_summary,
         metadata=reusable_metadata,
     )
+    _validate_reused_finalizer_root(reusable, reusable_manifest)
 
 
 async def _refresh_reusable_v4_layout(
@@ -4134,6 +4329,7 @@ async def _reuse_v4_layout_if_available(
 ) -> int | None:
     reusable = await _load_reusable_v4_layout(
         session,
+        schema_name=state.schema_name,
         schema=state.schema,
         snapshot_key=state.snapshot_key,
         mapping_digest=state.summary.map_digest,
@@ -4231,6 +4427,22 @@ async def _seal_and_publish_v4_layout(
         sealed_manifest=state.sealed_manifest,
         logical_byte_count=state.summary.logical_byte_count,
     )
+    from process.ptg_parts.ptg2_v4_finalizer_maps import (
+        FinalizerMapError,
+        has_valid_finalizer_map,
+    )
+
+    try:
+        await has_valid_finalizer_map(
+            session,
+            schema_name=state.schema_name,
+            snapshot_key=state.snapshot_key,
+            layout_manifest=state.sealed_manifest,
+        )
+    except FinalizerMapError as exc:
+        raise RuntimeError(
+            "PTG V4 finalizer root could not be authenticated during seal"
+        ) from exc
     canonical_snapshot_key = await publish_layout_fingerprint(
         session,
         schema_name=state.schema_name,

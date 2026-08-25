@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from api import ptg2_db_serving_v3, ptg2_db_sidecars, ptg2_serving
+from api import ptg2_shared_blocks as shared_blocks
 
 from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionBudget,
@@ -26,6 +27,7 @@ from api.ptg2_shared_blocks import (
 from process.ptg_parts.ptg2_shared_blocks import shared_block_hash
 
 from process.ptg_parts import ptg2_serving_binary_v3
+from process.ptg_parts import ptg2_v4_finalizer_range_reader
 
 from process.ptg_parts.ptg2_serving_binary_v3_types import (
     PTG2V3PriceAtomRecord,
@@ -183,7 +185,12 @@ async def test_bounded_code_prefix_requires_positive_integer_limit(limit):
         )
 
 @pytest.mark.asyncio
-async def test_code_shard_discovery_uses_exact_mapping_ranges():
+async def test_code_shard_discovery_uses_exact_mapping_ranges(monkeypatch):
+    monkeypatch.setattr(
+        ptg2_v4_finalizer_range_reader,
+        "has_complete_v4_finalizer_map",
+        AsyncMock(return_value=False),
+    )
     block_7_0 = _shard_block_key(7, 5)
     block_7_1 = _shard_block_key(7, 1025)
     block_9_0 = _shard_block_key(9, 5)
@@ -219,7 +226,12 @@ async def test_code_shard_discovery_uses_exact_mapping_ranges():
     )
 
 @pytest.mark.asyncio
-async def test_code_shard_discovery_rejects_unreachable_provider_shard():
+async def test_code_shard_discovery_rejects_unreachable_provider_shard(monkeypatch):
+    monkeypatch.setattr(
+        ptg2_v4_finalizer_range_reader,
+        "has_complete_v4_finalizer_map",
+        AsyncMock(return_value=False),
+    )
     invalid_shard = (7 << 31) | 3_000_000
     session = _Session([{"code_key": 7, "block_key": invalid_shard}])
 
@@ -232,7 +244,12 @@ async def test_code_shard_discovery_rejects_unreachable_provider_shard():
         )
 
 @pytest.mark.asyncio
-async def test_code_existence_uses_provider_shard_range():
+async def test_code_existence_uses_provider_shard_range(monkeypatch):
+    monkeypatch.setattr(
+        ptg2_v4_finalizer_range_reader,
+        "has_complete_v4_finalizer_map",
+        AsyncMock(return_value=False),
+    )
     session = _Session([True])
 
     exists = await ptg2_db_sidecars.has_serving_binary_code_block(
@@ -256,7 +273,12 @@ async def test_code_existence_uses_provider_shard_range():
     )
 
 @pytest.mark.asyncio
-async def test_shared_block_stream_uses_server_side_iteration():
+async def test_shared_block_stream_uses_server_side_iteration(monkeypatch):
+    monkeypatch.setattr(
+        shared_blocks,
+        "load_v4_finalizer_mapping_records",
+        AsyncMock(return_value=None),
+    )
     stream_row = _stored_row(
         object_kind="by_code_provider_shard_v1",
         block_key=_shard_block_key(7, 0),

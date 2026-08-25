@@ -89,6 +89,8 @@ async def run_migration_action(
     )
     try:
         async with async_engine.begin() as async_connection:
+            # Raw asyncpg batches bypass SQLAlchemy's lazy transaction start.
+            await async_connection.exec_driver_sql("SELECT 1")
 
             def apply_action(sync_connection) -> None:
                 migration_context = MigrationContext.configure(sync_connection)

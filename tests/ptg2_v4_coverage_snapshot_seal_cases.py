@@ -216,6 +216,7 @@ async def _assert_new_layout_seal(monkeypatch, expected_summary):
         _Result(scalar=17),
         _Result(),
         _Result(scalar=17),
+        _Result(rows=({},)),
     )
     sealed = await snapshot_maps.seal_v4_shared_layout(
         new_session,
@@ -265,6 +266,10 @@ def _install_new_layout_seal_mocks(monkeypatch, expected_summary) -> None:
         snapshot_maps,
         "acquire_layout_digest_lock",
         AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "process.ptg_parts.ptg2_v4_finalizer_maps._has_finalizer_map_tables",
+        AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
         snapshot_maps,
@@ -349,6 +354,7 @@ async def _assert_reused_layout_seal(
         _Result(rows=(reusable_layout_by_field,)),
         _Result(),
         _Result(scalar=17),
+        _Result(rows=({},)),
     )
     reused = await snapshot_maps.seal_v4_shared_layout(
         reused_session,

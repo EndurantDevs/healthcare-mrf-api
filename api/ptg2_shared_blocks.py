@@ -24,6 +24,11 @@ from process.ptg_parts.ptg2_shared_reuse import shared_source_set_metadata
 from process.ptg_parts.ptg2_shared_source_set import (
     ordered_source_ordinal_digest,
 )
+from process.ptg_parts.ptg2_v4_finalizer_maps import (
+    FinalizerMapError,
+    FinalizerMapReadLimitError,
+    load_v4_finalizer_mapping_records,
+)
 from process.ptg_parts.ptg2_v4_snapshot_maps import PTG2_V4_SHARED_GENERATION
 
 
@@ -411,12 +416,45 @@ def _shared_block_read_request(
     )
 
 
+async def _packed_finalizer_mapping_records(
+    session: Any,
+    request: _SharedBlockReadRequest,
+    *,
+    row_limit: int,
+) -> tuple[dict[str, Any], ...] | None:
+    try:
+        return await load_v4_finalizer_mapping_records(
+            session,
+            schema_name=request.schema_name,
+            snapshot_key=request.snapshot_key,
+            object_kind=request.object_kind,
+            block_keys=request.block_keys,
+            fragment_nos=(
+                request.fragment_nos if request.has_fragment_filter else None
+            ),
+            row_limit=row_limit,
+        )
+    except FinalizerMapReadLimitError as exc:
+        raise SharedMappingReadLimitError(str(exc)) from exc
+    except FinalizerMapError as exc:
+        raise PTG2SharedBlockError(str(exc)) from exc
+
+
 async def _stream_shared_mapping_records(
     session: Any,
     request: _SharedBlockReadRequest,
     *,
     row_limit: int,
 ) -> AsyncIterator[Any]:
+    packed_records = await _packed_finalizer_mapping_records(
+        session,
+        request,
+        row_limit=row_limit,
+    )
+    if packed_records is not None:
+        for mapping_record in packed_records:
+            yield mapping_record
+        return
     schema = _quote_ident(request.schema_name)
     fragment_filter = (
         "AND mapping.fragment_no = ANY(CAST(:fragment_nos AS integer[]))"
@@ -1206,10 +1244,61 @@ async def _stream_shared_blocks_direct(
     )
 
 
+async def _packed_direct_query_result(
+    session: Any,
+    request: _SharedBlockReadRequest,
+) -> list[dict[str, Any]] | None:
+    packed_records = await _packed_finalizer_mapping_records(
+        session,
+        request,
+        row_limit=(
+            _SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES
+            // _SHARED_MAPPING_RECORD_RETAINED_BYTES
+        ),
+    )
+    if packed_records is None:
+        return None
+    physical_hashes = frozenset(
+        bytes(mapping_record["block_hash"])
+        for mapping_record in packed_records
+    )
+    physical_by_hash: dict[bytes, dict[str, Any]] = {}
+    async for physical_by_field in _stream_shared_physical_records(
+        session,
+        request.schema_name,
+        physical_hashes,
+    ):
+        physical_hash = bytes(physical_by_field.get("block_hash") or b"")
+        if physical_hash not in physical_hashes or physical_hash in physical_by_hash:
+            raise PTG2SharedBlockError(
+                "shared PTG physical block query returned an unexpected row"
+            )
+        physical_by_hash[physical_hash] = physical_by_field
+    if set(physical_by_hash) != set(physical_hashes):
+        raise PTG2SharedBlockError(
+            "shared PTG layout references a missing physical block"
+        )
+    combined_rows: list[dict[str, Any]] = []
+    for mapping_record in packed_records:
+        physical_by_field = dict(
+            physical_by_hash[bytes(mapping_record["block_hash"])]
+        )
+        physical_by_field.update(
+            block_key=mapping_record["block_key"],
+            fragment_no=mapping_record["fragment_no"],
+            mapping_entry_count=mapping_record["mapping_entry_count"],
+        )
+        combined_rows.append(physical_by_field)
+    return combined_rows
+
+
 async def _shared_direct_query_result(
     session: Any,
     request: _SharedBlockReadRequest,
 ) -> Any:
+    packed_query = await _packed_direct_query_result(session, request)
+    if packed_query is not None:
+        return packed_query
     fragment_filter = (
         "AND mapping.fragment_no = ANY(CAST(:fragment_nos AS integer[]))"
         if request.has_fragment_filter
