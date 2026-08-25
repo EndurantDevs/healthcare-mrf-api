@@ -86,14 +86,16 @@ async def _create_geo_assurance_state_table(database: Database, schema: str) -> 
     await database.status(
         f"""
         CREATE TABLE {schema}.entity_address_geo_assurance_state (
-            singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+            singleton boolean PRIMARY KEY DEFAULT true,
             active_geo_assurance_version smallint,
             active_table_oid oid,
             active_relation_signature jsonb,
             candidate_geo_assurance_version smallint,
             candidate_table_oid oid,
             candidate_relation_signature jsonb,
-            candidate_projected_rows bigint
+            candidate_projected_rows bigint,
+            CONSTRAINT entity_address_geo_assurance_state_singleton_ck
+                CHECK (singleton)
         )
         """
     )

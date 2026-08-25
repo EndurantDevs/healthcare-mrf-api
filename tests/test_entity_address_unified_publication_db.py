@@ -12,6 +12,9 @@ import uuid
 import pytest
 
 from db.connection import Database
+from tests.ptg2_serving_address_evidence_postgres_support import (
+    _create_geo_assurance_state_table,
+)
 
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
@@ -72,24 +75,7 @@ async def _temporary_schema():
         ) VALUES (true, 2, 1, 0);
         """
     )
-    await database.status(
-        f"""
-        CREATE TABLE {schema}.entity_address_geo_assurance_state (
-            singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
-            active_geo_assurance_version smallint,
-            active_table_oid oid,
-            active_relation_signature jsonb,
-            candidate_geo_assurance_version smallint,
-            candidate_table_oid oid,
-            candidate_relation_signature jsonb,
-            candidate_projected_rows bigint
-        );
-        """
-    )
-    await database.status(
-        f"INSERT INTO {schema}.entity_address_geo_assurance_state (singleton) "
-        "VALUES (true)"
-    )
+    await _create_geo_assurance_state_table(database, schema)
     try:
         yield database, schema
     finally:

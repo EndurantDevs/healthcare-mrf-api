@@ -95,11 +95,6 @@ def projection_state_available_sql(schema_name: str) -> str:
          WHERE geo_assurance_state.singleton IS TRUE
            AND geo_assurance_state.active_geo_assurance_version = {GEO_ASSURANCE_VERSION}
            AND geo_assurance_state.active_table_oid = to_regclass('{live_table}')::oid
-           AND CASE
-                   WHEN jsonb_typeof(geo_assurance_state.active_relation_signature) = 'object'
-                   THEN jsonb_object_length(geo_assurance_state.active_relation_signature) = {len(_PROJECTION_DEPENDENCIES)}
-                   ELSE FALSE
-               END
            AND {signature_match_sql}
     )"""
 
@@ -298,9 +293,9 @@ def projected_evidence_available_sql(alias: str, *, schema_name: str) -> str:
     schema_name = _sql_identifier(schema_name, field_name="address schema")
     valid_source_ids = ", ".join(str(value) for value in GEO_EVIDENCE_SOURCE_IDS)
     return (
-        f"{alias}.geo_assurance_version = {GEO_ASSURANCE_VERSION} "
+        f"({alias}.geo_assurance_version = {GEO_ASSURANCE_VERSION} "
         f"AND {alias}.geo_evidence_source_id IN ({valid_source_ids})"
-        f" AND {projection_state_available_sql(schema_name)}"
+        f" AND {projection_state_available_sql(schema_name)})"
     )
 
 

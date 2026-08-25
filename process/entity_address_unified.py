@@ -12052,6 +12052,7 @@ async def process_entity_address_unified_data(ctx, task=None):
         "provider_enrollment_fqhc",
         "provider_enrollment_ffs_additional_npi",
         "doctor_clinician_address",
+        "geo_zip_lookup",
         "provider_enrollment_ffs",
         "provider_enrollment_ffs_address",
         "facility_anchor",
@@ -12073,12 +12074,40 @@ async def process_entity_address_unified_data(ctx, task=None):
         "address_archive_v2",
         address_alias_sql.ADDRESS_ALIAS_TABLE,
         address_alias_sql.ADDRESS_ALIAS_STATE_TABLE,
+        geo_projection.GEO_ASSURANCE_STATE_TABLE,
     ]
     available_relation_map = {table: await _has_table(db_schema, table) for table in required_checks}
+    if not available_relation_map.get(geo_projection.GEO_ASSURANCE_STATE_TABLE):
+        raise RuntimeError(
+            "entity-address-unified requires migrated geo assurance schema"
+        )
     if not available_relation_map.get(address_alias_sql.ADDRESS_ALIAS_TABLE) or not (
         available_relation_map.get(address_alias_sql.ADDRESS_ALIAS_STATE_TABLE)
     ):
         raise RuntimeError("entity-address-unified requires migrated address alias schema")
+    missing_geo_reference_relations = [
+        f"{db_schema}.{table_name}"
+        for table_name in (
+            "npi_address",
+            "mrf_address",
+            "doctor_clinician_address",
+            "geo_zip_lookup",
+        )
+        if not available_relation_map.get(table_name)
+    ]
+    for relation_schema, table_name in (
+        ("tiger", "zip_state"),
+        ("tiger", "zcta5"),
+    ):
+        if not await _has_table(relation_schema, table_name):
+            missing_geo_reference_relations.append(
+                f"{relation_schema}.{table_name}"
+            )
+    if missing_geo_reference_relations:
+        raise RuntimeError(
+            "entity-address-unified requires geo assurance relations: "
+            f"{', '.join(missing_geo_reference_relations)}"
+        )
     alias_generation = await _address_alias_generation(db_schema)
     alias_base_address_version = f"{ALIAS_BASE_ADDRESS_VERSION_PREFIX}{alias_generation}"
     context["address_alias_generation"] = alias_generation

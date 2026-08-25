@@ -233,7 +233,7 @@ async def test_partial_refresh_rejects_reusing_a_full_refresh_stage(monkeypatch)
 @pytest.mark.asyncio
 async def test_reused_stage_reconciles_current_model_columns(monkeypatch):
     (
-        _sql_events,
+        sql_events,
         _progress_events,
         environment_flag_by_name,
         _runtime_option_by_name,
@@ -255,6 +255,43 @@ async def test_reused_stage_reconciles_current_model_columns(monkeypatch):
         _StageClass.__tablename__,
     )
     assert import_context_by_key["context"]["stage_reused"] is True
+    assert not any(
+        f"DROP TABLE IF EXISTS mrf.{_StageClass.__tablename__};" == statement
+        for statement in sql_events
+    )
+    assert "CREATE_STAGE" not in sql_events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("missing_schema", "missing_table", "message"),
+    (
+        (
+            "mrf",
+            entity_address.geo_projection.GEO_ASSURANCE_STATE_TABLE,
+            "migrated geo assurance schema",
+        ),
+        ("tiger", "zcta5", "geo assurance relations"),
+    ),
+)
+async def test_materialization_preflights_geo_projection_dependencies(
+    monkeypatch,
+    missing_schema,
+    missing_table,
+    message,
+):
+    _configure_materialization_harness(monkeypatch)
+
+    async def is_table_present(schema_name, table_name):
+        return (schema_name, table_name) != (missing_schema, missing_table)
+
+    monkeypatch.setattr(entity_address, "_has_table", is_table_present)
+
+    with pytest.raises(RuntimeError, match=message):
+        await entity_address.process_data(
+            {"import_date": "20260724", "context": {}},
+            {"publish": False, "limit_per_source": 0},
+        )
 
 
 @pytest.mark.asyncio

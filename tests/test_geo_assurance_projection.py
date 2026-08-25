@@ -87,6 +87,12 @@ def test_runtime_uses_projection_and_falls_back_to_exact_legacy_predicates():
 
     assert "addr.geo_assurance_version = 1" in evidence_sql
     assert "addr.geo_evidence_source_id IN (0, 1, 2, 3)" in evidence_sql
+    assert {
+        "geo_evidence_source_id",
+        "geo_identity_coherent",
+        "geo_point_coherent",
+        "geo_assurance_version",
+    } <= serving._PTG2_UNIFIED_ADDRESS_COLUMNS
     assert "FROM mrf.npi_address AS geo_nppes" in evidence_sql
     assert "FROM mrf.mrf_address AS geo_mrf" in evidence_sql
     assert "FROM mrf.doctor_clinician_address AS geo_doctor" in evidence_sql
@@ -228,7 +234,7 @@ async def _insert_projection_addresses(database, schema: str) -> None:
              'US', 42.0, -83.0),
             ('none', 7004, '00000000-0000-0000-0000-000000000004',
              '10000000-0000-0000-0000-000000000004', 0, 'practice', 4,
-             '4 TEST STREET', 'TEST CITY', 'TS', 'TS', '00001', '00001',
+             '4 TEST STREET', 'TEST CITY', 'TS', 'TS', '00002', '00002',
              'US', 42.0, -83.0),
             ('cms-anchor', 7003, '00000000-0000-0000-0000-000000000005',
              '10000000-0000-0000-0000-000000000003', 1, 'practice', 5,
@@ -338,6 +344,7 @@ async def _assert_stored_projection(
         location_key: assurance_fields[0]
         for location_key, assurance_fields in stored_by_key.items()
     } == {"cms": 3, "mrf": 2, "none": 0, "nppes": 1}
+    assert stored_by_key["none"][2] is False
     assert all(
         address_record._mapping["geo_assurance_version"]
         == projection.GEO_ASSURANCE_VERSION
