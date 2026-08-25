@@ -14048,8 +14048,10 @@ class _GeoRateSelectionBudget:
     def claim_provider_sets(
         self,
         provider_counts_by_id: Mapping[str, int],
+        *,
+        use_reverse_geo_scope: bool = False,
     ) -> int | None:
-        """Charge first-seen sets and return members when expansion fits."""
+        """Charge first-seen sets and return permitted forward members."""
 
         provider_set_ids = set(provider_counts_by_id)
         if not provider_set_ids or provider_set_ids.intersection(
@@ -14069,12 +14071,13 @@ class _GeoRateSelectionBudget:
             or self.graph_batches >= self.caps.maximum_graph_batches
         ):
             raise PTG2OnlineWorkBudgetExceeded("candidate_members")
-        claimed_candidate_members = (
-            candidate_members
-            if self.candidate_members + candidate_members
+        claimed_candidate_members = None
+        if (
+            not use_reverse_geo_scope
+            and self.candidate_members + candidate_members
             <= self.maximum_candidate_members
-            else None
-        )
+        ):
+            claimed_candidate_members = candidate_members
         self.provider_set_ids.update(provider_set_ids)
         self.provider_counts_by_id.update(provider_counts_by_id)
         if claimed_candidate_members is not None:
@@ -14393,6 +14396,8 @@ async def _resolve_geo_rate_eligibility(
     args: dict[str, Any],
     rate_rows: Sequence[Mapping[str, Any]],
     budget: _GeoRateSelectionBudget,
+    *,
+    use_reverse_geo_scope: bool = False,
 ) -> dict[str, bool] | None:
     """Resolve geo admission for first-seen sets in one rate page."""
 
@@ -14402,7 +14407,10 @@ async def _resolve_geo_rate_eligibility(
     )
     if not provider_counts_by_id:
         return {}
-    claimed_candidate_members = budget.claim_provider_sets(provider_counts_by_id)
+    claimed_candidate_members = budget.claim_provider_sets(
+        provider_counts_by_id,
+        use_reverse_geo_scope=use_reverse_geo_scope,
+    )
     if claimed_candidate_members is not None:
         npis_by_set = await _exact_geo_rate_member_npis(
             session,
@@ -14564,6 +14572,7 @@ async def _select_geo_rate_request(
             request.args,
             rate_rows,
             budget,
+            use_reverse_geo_scope=declared_rate_count > budget.caps.rate_page_rows,
         )
         if page_eligibility_by_provider_set_id is None:
             return None
