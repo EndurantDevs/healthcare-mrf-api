@@ -359,7 +359,9 @@ async def test_source_download_updates_shared_attempts_and_reports_errors(monkey
     assert attempt.final_source_url == "https://a/final"
     assert attempt.source_http_status == 200
     raw.head = None
-    await acquisition.download_source(("https://a/mrf", (attempt,)), object(), 1024)
+    unchanged = await acquisition.download_source(("https://a/mrf", (attempt,)), object(), 1024)
+    assert unchanged.raw is raw
+    assert (attempt.final_source_url, attempt.source_http_status) == ("https://a/final", 200)
 
     async def fail(*_args, **_kwargs):
         raise ValueError("failed")

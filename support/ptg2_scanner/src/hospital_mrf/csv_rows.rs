@@ -247,7 +247,6 @@ fn parse_tall_payer(
 fn parse_wide_payers(
     record: &StringRecord,
     columns: &[WidePayerColumns],
-    generic_notes: Option<&str>,
 ) -> io::Result<Vec<PayerChargeRow>> {
     let mut payers = Vec::new();
     for payer in columns {
@@ -306,7 +305,7 @@ fn parse_wide_payers(
                     payer.additional_payer_notes,
                 )),
             },
-            generic_notes,
+            None,
             true,
         )?);
     }

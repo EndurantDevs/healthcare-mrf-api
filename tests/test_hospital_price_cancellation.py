@@ -134,8 +134,11 @@ async def test_cancellation_monitor_checks_and_renews(
     monkeypatch.setattr(orchestrator._runtime, "renew_attempt_leases", renew)
 
     with pytest.raises(RuntimeError, match="cancelled"):
-        await orchestrator._guard_cancellation(
-            {}, {}, operation(), [], "owner", 30, heartbeat_seconds
+        await asyncio.wait_for(
+            orchestrator._guard_cancellation(
+                {}, {}, operation(), [], "owner", 30, heartbeat_seconds
+            ),
+            timeout=1,
         )
     assert calls_by_kind == {
         "checks": 2,

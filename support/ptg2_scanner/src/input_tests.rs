@@ -3,14 +3,12 @@ mod tests {
     use super::*;
     use flate2::{write::GzEncoder, Compression};
     use std::io::{Cursor, Write};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
 
-    fn temp_path(suffix: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("ptg2_scanner_input_test_{nanos}_{suffix}"))
+    fn temp_path(suffix: &str) -> (TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let path = directory.path().join(suffix);
+        (directory, path)
     }
 
     fn write_gzip(path: &Path, payload: &[u8]) {
@@ -66,7 +64,7 @@ mod tests {
 
     #[test]
     fn open_reader_reads_plain_files_and_counts_bytes() {
-        let path = temp_path("plain.json");
+        let (_directory, path) = temp_path("plain.json");
         std::fs::write(&path, b"{\"ok\":true}").expect("write plain test file");
         let bytes_read = Arc::new(AtomicU64::new(0));
         let mut reader = open_reader(&path, Arc::clone(&bytes_read)).expect("open plain reader");
@@ -74,12 +72,11 @@ mod tests {
         reader.read_to_string(&mut text).expect("read plain file");
         assert_eq!(text, "{\"ok\":true}");
         assert_eq!(bytes_read.load(Ordering::Relaxed), 11);
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn open_reader_decompresses_gzip_files_and_counts_compressed_bytes() {
-        let path = temp_path("compressed.json.gz");
+        let (_directory, path) = temp_path("compressed.json.gz");
         write_gzip(&path, b"{\"ok\":true}");
 
         let bytes_read = Arc::new(AtomicU64::new(0));
@@ -88,12 +85,11 @@ mod tests {
         reader.read_to_string(&mut text).expect("read gzip file");
         assert_eq!(text, "{\"ok\":true}");
         assert!(bytes_read.load(Ordering::Relaxed) > 0);
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn open_json_reader_rejects_invalid_utf8_without_loading_file() {
-        let path = temp_path("invalid_utf8.json");
+        let (_directory, path) = temp_path("invalid_utf8.json");
         std::fs::write(&path, b"{\"name\":\"A\xffB\"}").expect("write invalid utf8 test file");
         let bytes_read = Arc::new(AtomicU64::new(0));
         let mut reader =
@@ -102,12 +98,11 @@ mod tests {
         let error = reader.read_to_string(&mut text).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(bytes_read.load(Ordering::Relaxed), 14);
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn open_json_reader_strips_utf8_bom() {
-        let path = temp_path("bom.json");
+        let (_directory, path) = temp_path("bom.json");
         std::fs::write(&path, b"\xEF\xBB\xBF{\"ok\":true}").expect("write bom test file");
         let bytes_read = Arc::new(AtomicU64::new(0));
         let mut reader =
@@ -116,12 +111,11 @@ mod tests {
         reader.read_to_string(&mut text).expect("read json file");
         assert_eq!(text, "{\"ok\":true}");
         assert_eq!(bytes_read.load(Ordering::Relaxed), 14);
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn open_json_reader_validates_gzip_utf8_and_strips_bom() {
-        let path = temp_path("valid_utf8.json.gz");
+        let (_directory, path) = temp_path("valid_utf8.json.gz");
         let payload = "\u{feff}{\"name\":\"Café 😀\"}".as_bytes();
         write_gzip(&path, payload);
 
@@ -134,12 +128,11 @@ mod tests {
             .expect("read valid gzip UTF-8");
         assert_eq!(text, "{\"name\":\"Café 😀\"}");
         assert!(bytes_read.load(Ordering::Relaxed) > 0);
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn open_json_reader_rejects_invalid_utf8_in_gzip() {
-        let path = temp_path("invalid_utf8.json.gz");
+        let (_directory, path) = temp_path("invalid_utf8.json.gz");
         write_gzip(&path, b"{\"name\":\"A\xFFB\"}");
 
         let bytes_read = Arc::new(AtomicU64::new(0));
@@ -149,7 +142,6 @@ mod tests {
         let error = reader.read_to_string(&mut text).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(bytes_read.load(Ordering::Relaxed) > 0);
-        std::fs::remove_file(path).ok();
     }
 
     #[test]

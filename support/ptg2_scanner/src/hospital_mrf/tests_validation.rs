@@ -269,3 +269,87 @@
             "payer fanout exceeds configured limit 1",
         );
     }
+
+    #[test]
+    fn wide_payers_group_case_insensitively_and_require_payer_notes() {
+        let wide = fixture_wide_csv();
+        let mut reader = ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(wide.as_slice());
+        let records = reader.records().collect::<Result<Vec<_>, _>>().unwrap();
+        let headers = records[2]
+            .iter()
+            .enumerate()
+            .map(|(index, header)| {
+                if index > 10 {
+                    header.replace("Payer, Inc.|Plan A", "PAYER, INC.|plan a")
+                } else {
+                    header.to_owned()
+                }
+            })
+            .collect::<Vec<_>>();
+        let columns = parse_wide_columns(&StringRecord::from(headers.clone()), 1).unwrap();
+        assert_eq!(columns.payers.len(), 1);
+        assert_eq!(columns.payers[0].payer_name, "Payer, Inc.");
+        assert_eq!(columns.payers[0].plan_name, "Plan A");
+
+        let mut duplicate = headers.clone();
+        duplicate.push(
+            "STANDARD_CHARGE|payer, inc.|PLAN A|NEGOTIATED_DOLLAR".to_owned(),
+        );
+        let error = parse_wide_columns(&StringRecord::from(duplicate), 1).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("duplicate wide CSV payer header"));
+
+        let missing_notes = headers
+            .into_iter()
+            .filter(|header| !header.to_ascii_lowercase().starts_with("additional_payer_notes|"))
+            .collect::<Vec<_>>();
+        let error = parse_wide_columns(&StringRecord::from(missing_notes), 1).unwrap_err();
+        assert!(error.to_string().contains("is missing additional_payer_notes"));
+
+        let payer_row = |methodology, count, payer_notes| {
+            let mut values = vec![
+                    ("description", "Generic note is not payer-specific"),
+                    ("code|1", "0001"),
+                    ("code|1|type", "CPT"),
+                    ("setting", "outpatient"),
+                    ("billing_class", "facility"),
+                    ("standard_charge|min", "1"),
+                    ("standard_charge|max", "1"),
+                    (
+                        "standard_charge|Payer, Inc.|Plan A|negotiated_dollar",
+                        "1",
+                    ),
+                    ("count|Payer, Inc.|Plan A", count),
+                    (
+                        "standard_charge|Payer, Inc.|Plan A|methodology",
+                        methodology,
+                    ),
+                    ("additional_generic_notes", "Generic note"),
+                ];
+            if let Some(notes) = payer_notes {
+                values.push((
+                    "additional_payer_notes|Payer, Inc.|Plan A",
+                    notes,
+                ));
+            }
+            append_csv_row(&fixture_wide_csv(), &values)
+        };
+        assert_import_error(
+            InputFormat::WideCsv,
+            &payer_row("fee schedule", "0", None),
+            DEFAULT_MAX_FANOUT_ROWS,
+            "count 0 requires explanatory notes",
+        );
+        assert_import_error(
+            InputFormat::WideCsv,
+            &payer_row("other", "", None),
+            DEFAULT_MAX_FANOUT_ROWS,
+            "methodology other requires explanatory notes",
+        );
+
+        let payer_note = payer_row("fee schedule", "0", Some("Payer-specific note"));
+        run_fixture(InputFormat::WideCsv, &payer_note, false);
+    }

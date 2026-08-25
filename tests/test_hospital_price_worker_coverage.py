@@ -242,22 +242,26 @@ async def test_bulk_import_returns_complete_selected_cohort(tmp_path, monkeypatc
 @pytest.mark.asyncio
 async def test_finish_failed_attempts_drains_cleanup_after_cancel(monkeypatch):
     orchestrator = orchestrator_module()
-    cleanup_started, allow_cleanup = asyncio.Event(), asyncio.Event()
+    cleanup_started, allow_cleanup, cleanup_finished = (
+        asyncio.Event(), asyncio.Event(), asyncio.Event()
+    )
 
     async def fail(*_args):
         cleanup_started.set()
         await allow_cleanup.wait()
+        cleanup_finished.set()
 
     monkeypatch.setattr(orchestrator, "_fail_attempts", fail)
     cleanup = asyncio.create_task(
         orchestrator._finish_failed_attempts([], "cancelled", "cancelled")
     )
-    await cleanup_started.wait()
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
     cleanup.cancel()
     await asyncio.sleep(0)
     allow_cleanup.set()
 
-    await cleanup
+    await asyncio.wait_for(cleanup, timeout=1)
+    assert cleanup_finished.is_set()
 
 
 @pytest.mark.asyncio

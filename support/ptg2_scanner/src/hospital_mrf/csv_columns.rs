@@ -193,7 +193,7 @@ fn parse_wide_columns(
                 "wide CSV payer headers must replace payer and plan placeholders",
             ));
         }
-        let key = (payer_name.to_owned(), plan_name.to_owned());
+        let key = (payer_name.to_lowercase(), plan_name.to_lowercase());
         if !payers.contains_key(&key) {
             if payers.len() == max_fanout_rows {
                 return Err(invalid(format!(
