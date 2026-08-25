@@ -84,13 +84,20 @@ async def test_terminal_flush_binds_pending_event(monkeypatch):
     monkeypatch.setattr(status_events, "_status_event_url", lambda: "https://sink.invalid/events")
     monkeypatch.setattr(status_events, "_post_event", posted_events.append)
 
-    thread = threading.Thread(
-        target=status_events.enqueue_status_event,
-        args=({"run_id": "run-before-bind", "status": "succeeded"},),
-    )
+    def enqueue_before_bind():
+        status_events.enqueue_status_event(
+            {"run_id": "run-before-bind", "status": "succeeded"}
+        )
+        status_events.enqueue_status_event(
+            {"run_id": "run-before-bind", "status": "running"}
+        )
+
+    thread = threading.Thread(target=enqueue_before_bind)
     thread.start()
     thread.join()
 
     await status_events.flush_terminal_status_event("run-before-bind")
 
-    assert [event["run_id"] for event in posted_events] == ["run-before-bind"]
+    assert [(event["run_id"], event["status"]) for event in posted_events] == [
+        ("run-before-bind", "succeeded")
+    ]

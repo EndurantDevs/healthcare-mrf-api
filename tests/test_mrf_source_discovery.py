@@ -13777,6 +13777,7 @@ class _DirectDiscoveryHarness:
         self.persisted_batches = []
         self.events = []
         self.progress = []
+        self.flush_run_ids = []
         self.flush_timeouts = []
 
     async def load_candidates(self, _provider, *, test_mode, limit):
@@ -13805,7 +13806,7 @@ class _DirectDiscoveryHarness:
         return None
 
     async def flush(self, run_id, *, timeout_seconds):
-        assert run_id.startswith("mrfcrawl_")
+        self.flush_run_ids.append(run_id)
         self.flush_timeouts.append(timeout_seconds)
 
     async def execute_source_batch(self, **kwargs):
@@ -13886,6 +13887,7 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
         control_run_id,
         control_run_id,
     ]
+    assert harness.flush_run_ids == [control_run_id]
     assert harness.flush_timeouts == [1.0]
 
 
@@ -13895,12 +13897,14 @@ async def test_direct_discovery_run_closes_visible_state_on_failure(monkeypatch)
     push_calls = []
     control_events = []
     progress_events = []
+    flush_run_ids = []
     flush_timeouts = []
 
     async def fake_push_objects(row_dicts, orm_model, *, rewrite, use_copy):
         push_calls.append((orm_model, row_dicts, rewrite, use_copy))
 
-    def fake_flush(_run_id, *, timeout_seconds):
+    def fake_flush(run_id, *, timeout_seconds):
+        flush_run_ids.append(run_id)
         flush_timeouts.append(timeout_seconds)
 
     def record_live_progress(**progress_payload):
@@ -13941,6 +13945,7 @@ async def test_direct_discovery_run_closes_visible_state_on_failure(monkeypatch)
     assert control_events[1]["error"]["message"] == "catalog write failed"
     assert progress_events[-1]["status"] == "failed"
     assert progress_events[-1]["message"] == "catalog write failed"
+    assert flush_run_ids == [control_events[-1]["run_id"]]
     assert flush_timeouts == [1.0]
 
 

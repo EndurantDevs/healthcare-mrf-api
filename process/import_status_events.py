@@ -138,12 +138,21 @@ def _append_pending_event_locked(event: dict[str, Any]) -> None:
         int(os.getenv("HLTHPRT_IMPORT_STATUS_EVENT_QUEUE_SIZE", "256")),
         1,
     )
-    run_id = str(event.get("run_id") or "")
+    run_id = str(event.get("run_id") or "").strip()
     if run_id:
+        has_pending_terminal = any(
+            str(pending.get("run_id") or "").strip() == run_id
+            and str(pending.get("status") or "").strip().lower()
+            in TERMINAL_STATUSES
+            for pending in _publisher_state.pending
+        )
+        status = str(event.get("status") or "").strip().lower()
+        if has_pending_terminal and status not in TERMINAL_STATUSES:
+            return
         _publisher_state.pending = deque(
             pending
             for pending in _publisher_state.pending
-            if str(pending.get("run_id") or "") != run_id
+            if str(pending.get("run_id") or "").strip() != run_id
         )
     while len(_publisher_state.pending) >= pending_limit:
         _publisher_state.pending.popleft()
