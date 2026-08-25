@@ -2610,13 +2610,14 @@ def _repair_missing_array_object_commas(text: str) -> str:
     length = len(text)
     for idx, char in enumerate(text):
         repaired_chunks.append(char)
+        if is_in_string and is_escaped:
+            is_escaped = False
+            continue
+        if is_in_string and char == "\\":
+            is_escaped = True
+            continue
         if is_in_string:
-            if is_escaped:
-                is_escaped = False
-            elif char == "\\":
-                is_escaped = True
-            elif char == '"':
-                is_in_string = False
+            is_in_string = char != '"'
             continue
         if char == '"':
             is_in_string = True
@@ -4235,13 +4236,13 @@ async def _mymedicalshopper_ddp_recv(
             messages = _mymedicalshopper_sockjs_messages(str(frame.data))
             returned_messages: list[dict[str, Any]] = []
             for message in messages:
-                if message.get("msg") == "ping":
-                    pong_message_by_field: dict[str, Any] = {"msg": "pong"}
-                    if message.get("id") is not None:
-                        pong_message_by_field["id"] = message.get("id")
-                    await _mymedicalshopper_ddp_send(ws, pong_message_by_field)
+                if message.get("msg") != "ping":
+                    returned_messages.append(message)
                     continue
-                returned_messages.append(message)
+                pong_message_by_field: dict[str, Any] = {"msg": "pong"}
+                if message.get("id") is not None:
+                    pong_message_by_field["id"] = message.get("id")
+                await _mymedicalshopper_ddp_send(ws, pong_message_by_field)
             if returned_messages:
                 return returned_messages
             continue
@@ -5341,15 +5342,15 @@ async def _resolve_magnacare_transparency_mrf(
 ) -> list[CrawlTarget]:
     """Resolve MagnaCare transparency search results into crawl targets."""
     resolver_type = str(resolver.get("type") or "magnacare_transparency_mrf")
-    search_terms = _magnacare_search_terms(source_record, resolver)
     max_bytes = int(resolver.get("max_bytes") or 5 * 1024 * 1024)
     ip_address = str(resolver.get("download_ip_address") or "127.0.0.1")
     grouped_by_target_key: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     max_targets = _as_int(resolver.get("max_targets"))
-    for search_term in search_terms:
+    for search_term in _magnacare_search_terms(source_record, resolver):
         results_url = _magnacare_results_url(url, search_term)
-        html_text = await _fetch_text(results_url, max_bytes=max_bytes, session=session)
-        for result_row in _magnacare_result_rows(html_text):
+        for result_row in _magnacare_result_rows(
+            await _fetch_text(results_url, max_bytes=max_bytes, session=session)
+        ):
             run_history_id = _clean_text(result_row.get("run_history_id"))
             if not run_history_id or run_history_id == "0":
                 continue
@@ -5361,9 +5362,8 @@ async def _resolve_magnacare_transparency_mrf(
             )
             if not file_name or not file_type:
                 continue
-            key = _magnacare_target_key(result_row)
             grouped_result = grouped_by_target_key.setdefault(
-                key,
+                _magnacare_target_key(result_row),
                 {
                     "row": result_row,
                     "search_terms": set(),
@@ -5980,7 +5980,6 @@ def _auxiant_landing_target(
     directory_url: str,
     landing_url: str,
     resolver_type: str,
-    reason: str,
     landing_label: str | None = None,
     nested_error: str | None = None,
 ) -> CrawlTarget:
@@ -5999,7 +5998,11 @@ def _auxiant_landing_target(
             "external_source_url": landing_url if landing_url != page_url else None,
             "external_hosting_platform": classify_hosting_platform(landing_url),
             "landing_label": landing_label,
-            "landing_reason": reason,
+            "landing_reason": (
+                "auxiant_page_without_file_links"
+                if landing_url == page_url
+                else "external_landing_no_concrete_targets"
+            ),
             "nested_error": _truncate_text(nested_error, 500),
         },
     )
@@ -6136,7 +6139,6 @@ async def _resolve_auxiant_wordpress_directory(
                         directory_url=directory_url,
                         landing_url=external_url,
                         resolver_type=resolver_type,
-                        reason="external_landing_no_concrete_targets",
                         landing_label=str(link.get("label") or ""),
                         nested_error=nested_error,
                     )
@@ -6150,7 +6152,6 @@ async def _resolve_auxiant_wordpress_directory(
                     directory_url=directory_url,
                     landing_url=page_url,
                     resolver_type=resolver_type,
-                    reason="auxiant_page_without_file_links",
                     landing_label=network_name,
                 )
             )

@@ -2960,7 +2960,7 @@ async def refresh_archive_geocodes_from_openaddresses(
     )
 
 
-async def execute_openaddresses_import_task(ctx, task=None):  # pragma: no cover
+async def process_data(ctx, task=None):  # pragma: no cover
     """Run the OpenAddresses load or backfill task."""
     task = task or {}
     await _maybe_raise_if_cancelled(ctx, task)
@@ -3121,8 +3121,7 @@ async def execute_openaddresses_import_task(ctx, task=None):  # pragma: no cover
     )
 
 
-process_data = execute_openaddresses_import_task
-process_data.__name__ = "process_data"
+execute_openaddresses_import_task = process_data
 
 
 async def startup(ctx):  # pragma: no cover
@@ -3142,7 +3141,7 @@ async def startup(ctx):  # pragma: no cover
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(schema)};")
 
 
-async def publish_openaddresses_generation(ctx):  # pragma: no cover
+async def shutdown(ctx):  # pragma: no cover
     """Publish staged OpenAddresses data after a completed load."""
     context = ctx.get("context") or {}
     if not context.get("run") or context.get("backfill_only"):
@@ -3277,8 +3276,7 @@ async def publish_openaddresses_generation(ctx):  # pragma: no cover
     print_time_info(context.get("start"))
 
 
-shutdown = publish_openaddresses_generation
-shutdown.__name__ = "shutdown"
+publish_openaddresses_generation = shutdown
 
 
 async def main(

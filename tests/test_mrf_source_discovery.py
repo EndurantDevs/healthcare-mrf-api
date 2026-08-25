@@ -6685,7 +6685,6 @@ def test_auxiant_landing_target_indexes_unresolved_network_pages():
         directory_url="https://transparency.auxiant.com/directory-of-data-sources/",
         landing_url="https://www.healthlink.com/machine-readable-file/search/",
         resolver_type="auxiant_wordpress_directory",
-        reason="external_landing_no_concrete_targets",
         landing_label="HealthLink hosted files",
         nested_error="no links found",
     )
@@ -11708,7 +11707,10 @@ def test_kaiser_inventory_parses_tocs_rate_files_and_allowed_amounts():
         "payer_id": "payer_1",
         "display_name": "Kaiser Permanente",
     }
-    resolver = discovery._source_config()["platform_resolvers"]["kaiser_mrf_inventory"]
+    resolver_by_field = {
+        **discovery._source_config()["platform_resolvers"]["kaiser_mrf_inventory"],
+        "region_codes": ["hi"],
+    }
     in_network_targets = discovery._kaiser_inventory_targets_from_text(
         source_by_field,
         "\n".join(
@@ -11716,6 +11718,9 @@ def test_kaiser_inventory_parses_tocs_rate_files_and_allowed_amounts():
                 "/hi/2026-07-01_KFHP-HI_index.json 26574",
                 "/hi/2026-07-01_NEW_HI-COMMERCIAL-01_in-network-rates.zip 650894695",
                 "/externaldata/ash/2026-07-01_ASH_KFHP-HI_in-network-rates.json 433813",
+                "malformed",
+                "/ca/2026-07-01_KFHP-CA_index.json 10",
+                "/hi/readme.txt 10",
             ]
         ),
         inventory_url=(
@@ -11724,7 +11729,7 @@ def test_kaiser_inventory_parses_tocs_rate_files_and_allowed_amounts():
         ),
         inventory_month="2026-07",
         category="innetwork",
-        resolver=resolver,
+        resolver=resolver_by_field,
     )
     allowed_targets = discovery._kaiser_inventory_targets_from_text(
         source_by_field,
@@ -11735,7 +11740,7 @@ def test_kaiser_inventory_parses_tocs_rate_files_and_allowed_amounts():
         ),
         inventory_month="2026-07",
         category="outofnetwork",
-        resolver=resolver,
+        resolver=resolver_by_field,
     )
 
     assert [inventory_target.metadata["target_file_type"] for inventory_target in in_network_targets] == [
