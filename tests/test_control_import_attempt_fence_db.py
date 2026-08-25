@@ -60,6 +60,7 @@ class _FrozenValidationFailureHarness:
     def __init__(self, stop_live_heartbeat) -> None:
         self.mark_results: list[tuple[str, bool, str, str]] = []
         self.heartbeat_events: list[str] = []
+        self.flushed_run_ids: list[str] = []
         self._stop_live_heartbeat = stop_live_heartbeat
         self._thread_heartbeat_token = object()
 
@@ -104,8 +105,8 @@ class _FrozenValidationFailureHarness:
     async def fail_if_engine_started(self, **_kwargs):
         raise AssertionError("frozen validation failure started the engine")
 
-    async def flush_status(self):
-        return None
+    async def flush_status(self, run_id) -> None:
+        self.flushed_run_ids.append(run_id)
 
 
 def _install_frozen_failure_harness(
@@ -318,6 +319,7 @@ async def _assert_frozen_failure_persisted(
         "thread-stop",
         "live-stop",
     ]
+    assert harness.flushed_run_ids == [run_id]
     assert stored_run.status == "failed"
     assert stored_run.phase_detail == "ptg import failed"
     assert stored_run.error == {

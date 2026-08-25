@@ -6685,7 +6685,6 @@ def test_auxiant_landing_target_indexes_unresolved_network_pages():
         directory_url="https://transparency.auxiant.com/directory-of-data-sources/",
         landing_url="https://www.healthlink.com/machine-readable-file/search/",
         resolver_type="auxiant_wordpress_directory",
-        reason="external_landing_no_concrete_targets",
         landing_label="HealthLink hosted files",
         nested_error="no links found",
     )
@@ -11708,7 +11707,10 @@ def test_kaiser_inventory_parses_tocs_rate_files_and_allowed_amounts():
         "payer_id": "payer_1",
         "display_name": "Kaiser Permanente",
     }
-    resolver = discovery._source_config()["platform_resolvers"]["kaiser_mrf_inventory"]
+    resolver_by_field = {
+        **discovery._source_config()["platform_resolvers"]["kaiser_mrf_inventory"],
+        "region_codes": ["hi"],
+    }
     in_network_targets = discovery._kaiser_inventory_targets_from_text(
         source_by_field,
         "\n".join(
@@ -11716,6 +11718,9 @@ def test_kaiser_inventory_parses_tocs_rate_files_and_allowed_amounts():
                 "/hi/2026-07-01_KFHP-HI_index.json 26574",
                 "/hi/2026-07-01_NEW_HI-COMMERCIAL-01_in-network-rates.zip 650894695",
                 "/externaldata/ash/2026-07-01_ASH_KFHP-HI_in-network-rates.json 433813",
+                "malformed",
+                "/ca/2026-07-01_KFHP-CA_index.json 10",
+                "/hi/readme.txt 10",
             ]
         ),
         inventory_url=(
@@ -11724,7 +11729,7 @@ def test_kaiser_inventory_parses_tocs_rate_files_and_allowed_amounts():
         ),
         inventory_month="2026-07",
         category="innetwork",
-        resolver=resolver,
+        resolver=resolver_by_field,
     )
     allowed_targets = discovery._kaiser_inventory_targets_from_text(
         source_by_field,
@@ -11735,7 +11740,7 @@ def test_kaiser_inventory_parses_tocs_rate_files_and_allowed_amounts():
         ),
         inventory_month="2026-07",
         category="outofnetwork",
-        resolver=resolver,
+        resolver=resolver_by_field,
     )
 
     assert [inventory_target.metadata["target_file_type"] for inventory_target in in_network_targets] == [
@@ -13777,6 +13782,7 @@ class _DirectDiscoveryHarness:
         self.persisted_batches = []
         self.events = []
         self.progress = []
+        self.flush_run_ids = []
         self.flush_timeouts = []
 
     async def load_candidates(self, _provider, *, test_mode, limit):
@@ -13804,7 +13810,8 @@ class _DirectDiscoveryHarness:
     async def noop(self, *_args, **_kwargs):
         return None
 
-    async def flush(self, timeout_seconds):
+    async def flush(self, run_id, *, timeout_seconds):
+        self.flush_run_ids.append(run_id)
         self.flush_timeouts.append(timeout_seconds)
 
     async def execute_source_batch(self, **kwargs):
@@ -13854,7 +13861,7 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
         "enqueue_live_progress",
         lambda **payload: harness.progress.append(payload),
     )
-    monkeypatch.setattr(discovery, "flush_status_events", harness.flush)
+    monkeypatch.setattr(discovery, "flush_terminal_status_event", harness.flush)
 
     discovery_summary = await discovery.main(test_mode=True, provider="master-list", limit=1)
 
@@ -13885,6 +13892,7 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
         control_run_id,
         control_run_id,
     ]
+    assert harness.flush_run_ids == [control_run_id]
     assert harness.flush_timeouts == [1.0]
 
 
@@ -13894,12 +13902,14 @@ async def test_direct_discovery_run_closes_visible_state_on_failure(monkeypatch)
     push_calls = []
     control_events = []
     progress_events = []
+    flush_run_ids = []
     flush_timeouts = []
 
     async def fake_push_objects(row_dicts, orm_model, *, rewrite, use_copy):
         push_calls.append((orm_model, row_dicts, rewrite, use_copy))
 
-    def fake_flush(timeout_seconds):
+    def fake_flush(run_id, *, timeout_seconds):
+        flush_run_ids.append(run_id)
         flush_timeouts.append(timeout_seconds)
 
     def record_live_progress(**progress_payload):
@@ -13920,7 +13930,7 @@ async def test_direct_discovery_run_closes_visible_state_on_failure(monkeypatch)
         ("_store_candidates", AsyncMock(side_effect=RuntimeError("catalog write failed"))),
         ("enqueue_status_event", control_events.append),
         ("enqueue_live_progress", record_live_progress),
-        ("flush_status_events", AsyncMock(side_effect=fake_flush)),
+        ("flush_terminal_status_event", AsyncMock(side_effect=fake_flush)),
     ]
     for attribute_name, replacement_value in replacements:
         monkeypatch.setattr(discovery, attribute_name, replacement_value)
@@ -13940,6 +13950,7 @@ async def test_direct_discovery_run_closes_visible_state_on_failure(monkeypatch)
     assert control_events[1]["error"]["message"] == "catalog write failed"
     assert progress_events[-1]["status"] == "failed"
     assert progress_events[-1]["message"] == "catalog write failed"
+    assert flush_run_ids == [control_events[-1]["run_id"]]
     assert flush_timeouts == [1.0]
 
 

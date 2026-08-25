@@ -62,6 +62,13 @@ class _LoopProbe:
             raise RuntimeError("task scheduling failed")
         return SimpleNamespace(done=lambda: False)
 
+    def create_future(self):
+        future = SimpleNamespace(value=None)
+        future.done = lambda: future.value is not None
+        future.set_result = lambda value: setattr(future, "value", value)
+        future.cancel = lambda: setattr(future, "value", False)
+        return future
+
     def call_soon(self, callback, *args):
         callback(*args)
 
@@ -84,6 +91,9 @@ def _reset_status_publisher():
     status_events._publisher_state.pending.clear()
     status_events._publisher_state.coalesced_by_run.clear()
     status_events._publisher_state.flush_handle_by_run.clear()
+    status_events._publisher_state.pending_terminal_events.clear()
+    status_events._publisher_state.terminal_event_by_run.clear()
+    status_events._publisher_state.terminal_delivery_by_run.clear()
     status_events._last_sent_by_run.clear()
     yield
     worker = status_events._publisher_state.worker
@@ -95,6 +105,9 @@ def _reset_status_publisher():
     status_events._publisher_state.pending.clear()
     status_events._publisher_state.coalesced_by_run.clear()
     status_events._publisher_state.flush_handle_by_run.clear()
+    status_events._publisher_state.pending_terminal_events.clear()
+    status_events._publisher_state.terminal_event_by_run.clear()
+    status_events._publisher_state.terminal_delivery_by_run.clear()
     status_events._last_sent_by_run.clear()
 
 

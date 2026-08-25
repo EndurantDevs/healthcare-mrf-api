@@ -16,7 +16,7 @@ async def _allow_active_run(_run_id: str) -> None:
     return None
 
 
-async def _skip_terminal_flush() -> None:
+async def _skip_terminal_flush(_run_id: str) -> None:
     return None
 
 

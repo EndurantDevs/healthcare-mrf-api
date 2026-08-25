@@ -144,4 +144,4 @@ async def test_ptg_stale_and_flush_helpers_skip_absent_work(monkeypatch):
         "HLTHPRT_IMPORT_STATUS_EVENT_TERMINAL_FLUSH_SECONDS",
         "0",
     )
-    await ptg_control._flush_terminal_status_events()
+    await ptg_control._flush_terminal_status_events("run")

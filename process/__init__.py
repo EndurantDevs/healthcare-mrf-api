@@ -920,7 +920,10 @@ class AddressArchive:
 
 
 class OpenAddresses:
-    functions = [process_openaddresses_data, control_single_job_start]
+    functions = [
+        arq_func(process_openaddresses_data, name="process_data"),
+        control_single_job_start,
+    ]
     on_startup = openaddresses_startup
     on_shutdown = openaddresses_shutdown
     max_jobs = 1

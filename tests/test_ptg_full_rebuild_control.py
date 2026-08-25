@@ -42,7 +42,7 @@ def control_observations(monkeypatch):
         run_marks.append((args, kwargs))
         return True
 
-    async def fake_flush_terminal_status_events():
+    async def fake_flush_terminal_status_events(_run_id):
         return None
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
