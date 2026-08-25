@@ -64,6 +64,52 @@ async def _query_ptg2_code_crosswalk_edges(session, pairs: set[tuple[str, str]])
     return [_row_mapping(edge_row) for edge_row in query_result]
 
 
+def _add_crosswalk_edge_context(
+    edge: dict[str, Any],
+    *,
+    resolved_pairs: set[tuple[str, str]],
+    internal_codes: set[int],
+    seen_edges: set[tuple[str, str, str, str]],
+    matched_via_edges: list[dict[str, Any]],
+) -> set[tuple[str, str]]:
+    """Add one valid crosswalk edge and return newly discovered pairs."""
+
+    from_pair = (
+        _normalize_code_system(edge.get("from_system")) or "",
+        _normalize_code(edge.get("from_code")),
+    )
+    to_pair = (
+        _normalize_code_system(edge.get("to_system")) or "",
+        _normalize_code(edge.get("to_code")),
+    )
+    if from_pair[0] not in PROCEDURE_CODE_SYSTEMS or to_pair[0] not in PROCEDURE_CODE_SYSTEMS:
+        return set()
+    edge_key = (*from_pair, *to_pair)
+    if edge_key not in seen_edges:
+        seen_edges.add(edge_key)
+        matched_via_edges.append(
+            {
+                "from_system": from_pair[0],
+                "from_code": from_pair[1],
+                "to_system": to_pair[0],
+                "to_code": to_pair[1],
+                "match_type": edge.get("match_type"),
+                "confidence": edge.get("confidence"),
+                "source": edge.get("source"),
+            }
+        )
+    discovered_pairs: set[tuple[str, str]] = set()
+    for pair in (from_pair, to_pair):
+        candidate_pairs = {pair, *_ptg2_equivalent_external_pairs(pair[0], pair[1])}
+        for candidate_pair in candidate_pairs:
+            if candidate_pair[0] == INTERNAL_PROCEDURE_CODE_SYSTEM and _is_signed_int_text(candidate_pair[1]):
+                internal_codes.add(int(candidate_pair[1]))
+            if candidate_pair not in resolved_pairs:
+                resolved_pairs.add(candidate_pair)
+                discovered_pairs.add(candidate_pair)
+    return discovered_pairs
+
+
 async def _resolve_ptg2_code_search_context(
     session,
     *,
@@ -102,39 +148,15 @@ async def _resolve_ptg2_code_search_context(
         edges = await _query_ptg2_code_crosswalk_edges(session, frontier_pairs)
         next_frontier_pairs: set[tuple[str, str]] = set()
         for edge in edges:
-            from_pair = (
-                _normalize_code_system(edge.get("from_system")) or "",
-                _normalize_code(edge.get("from_code")),
-            )
-            to_pair = (
-                _normalize_code_system(edge.get("to_system")) or "",
-                _normalize_code(edge.get("to_code")),
-            )
-            if from_pair[0] not in PROCEDURE_CODE_SYSTEMS or to_pair[0] not in PROCEDURE_CODE_SYSTEMS:
-                continue
-            edge_key = (*from_pair, *to_pair)
-            if edge_key not in seen_edges:
-                seen_edges.add(edge_key)
-                matched_via_edges.append(
-                    {
-                        "from_system": from_pair[0],
-                        "from_code": from_pair[1],
-                        "to_system": to_pair[0],
-                        "to_code": to_pair[1],
-                        "match_type": edge.get("match_type"),
-                        "confidence": edge.get("confidence"),
-                        "source": edge.get("source"),
-                    }
+            next_frontier_pairs.update(
+                _add_crosswalk_edge_context(
+                    edge,
+                    resolved_pairs=resolved_pairs,
+                    internal_codes=internal_codes,
+                    seen_edges=seen_edges,
+                    matched_via_edges=matched_via_edges,
                 )
-            for pair in (from_pair, to_pair):
-                candidate_pairs = {pair}
-                candidate_pairs.update(_ptg2_equivalent_external_pairs(pair[0], pair[1]))
-                for candidate_pair in candidate_pairs:
-                    if candidate_pair[0] == INTERNAL_PROCEDURE_CODE_SYSTEM and _is_signed_int_text(candidate_pair[1]):
-                        internal_codes.add(int(candidate_pair[1]))
-                    if candidate_pair not in resolved_pairs:
-                        resolved_pairs.add(candidate_pair)
-                        next_frontier_pairs.add(candidate_pair)
+            )
         if not next_frontier_pairs:
             break
         frontier_pairs = next_frontier_pairs

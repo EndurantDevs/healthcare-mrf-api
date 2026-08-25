@@ -12589,6 +12589,105 @@ def _monthly_toc_targets(
     return crawl_targets
 
 
+@dataclass(frozen=True)
+class _KaiserInventoryContext:
+    source_record: dict[str, Any]
+    inventory_url: str
+    inventory_base_url: str
+    inventory_month: str
+    category: str
+    resolver_type: str
+    toc_max_bytes: int
+    include_external_data: bool
+    configured_regions: frozenset[str]
+
+
+def _kaiser_inventory_target_metadata(
+    context: _KaiserInventoryContext,
+    *,
+    path_parts: list[str],
+    file_name: str,
+    file_type: str,
+    region_code: str,
+    size_bytes: int | None,
+    target_url: str,
+) -> dict[str, Any]:
+    metadata_by_name = {
+        "resolver": context.resolver_type,
+        "target_kind": (
+            "toc_json" if file_type == "table-of-contents" else "file_reference"
+        ),
+        "target_file_type": file_type,
+        "container_format": _container_format(target_url),
+        "file_name": file_name,
+        "size_bytes": size_bytes,
+        "inventory_url": context.inventory_url,
+        "inventory_month": context.inventory_month,
+        "kaiser_region_code": region_code,
+        "kaiser_inventory_category": context.category,
+        "kaiser_state_file": path_parts[0].lower() == "state",
+        "kaiser_external_data": path_parts[0].lower() == "externaldata",
+        "plan_info": _plan_info_from_label(file_name),
+        "target_max_bytes": (
+            context.toc_max_bytes if file_type == "table-of-contents" else None
+        ),
+    }
+    return {
+        metadata_key: metadata_value
+        for metadata_key, metadata_value in metadata_by_name.items()
+        if metadata_value not in (None, "", [], False)
+    }
+
+
+def _kaiser_inventory_target_from_line(
+    context: _KaiserInventoryContext,
+    raw_line: str,
+) -> CrawlTarget | None:
+    columns = raw_line.strip().rsplit(None, 1)
+    if len(columns) != 2:
+        return None
+    relative_path, raw_size = columns
+    path_parts = [part for part in relative_path.strip("/").split("/") if part]
+    if len(path_parts) < 2:
+        return None
+    is_external_data = path_parts[0].lower() == "externaldata"
+    if is_external_data and not context.include_external_data:
+        return None
+    region_code = (
+        path_parts[1].lower()
+        if path_parts[0].lower() == "state" and len(path_parts) > 2
+        else path_parts[0].lower()
+    )
+    if context.configured_regions and region_code not in context.configured_regions:
+        return None
+    file_name = path_parts[-1]
+    file_type = _mrf_file_type_from_text(relative_path, file_name)
+    if context.category == "outofnetwork":
+        file_type = "allowed-amounts"
+    if file_type not in {"table-of-contents", "in-network", "allowed-amounts"}:
+        return None
+    try:
+        size_bytes = int(raw_size)
+    except ValueError:
+        size_bytes = None
+    target_url = urljoin(context.inventory_base_url, relative_path.lstrip("/"))
+    return CrawlTarget(
+        source=context.source_record,
+        url=target_url,
+        label=file_name,
+        resolved_from_url=context.inventory_url,
+        metadata=_kaiser_inventory_target_metadata(
+            context,
+            path_parts=path_parts,
+            file_name=file_name,
+            file_type=file_type,
+            region_code=region_code,
+            size_bytes=size_bytes,
+            target_url=target_url,
+        ),
+    )
+
+
 def _kaiser_inventory_targets_from_text(
     source_record: dict[str, Any],
     inventory_text: str,
@@ -12601,85 +12700,29 @@ def _kaiser_inventory_targets_from_text(
     """Parse one Kaiser monthly inventory into typed crawl targets."""
     if category not in {"innetwork", "outofnetwork"}:
         raise ValueError(f"unsupported Kaiser inventory category: {category}")
-    include_external_data = resolver.get("include_external_data") is True
-    configured_regions = {
-        str(region_value or "").strip().lower()
-        for region_value in (resolver.get("region_codes") or ())
-        if str(region_value or "").strip()
-    }
-    toc_max_bytes = (
-        _parse_size_bytes(resolver.get("toc_max_bytes")) or 5 * 1024 * 1024
+    context = _KaiserInventoryContext(
+        source_record=source_record,
+        inventory_url=inventory_url,
+        inventory_base_url=inventory_url.rsplit("/", 1)[0].rstrip("/") + "/",
+        inventory_month=inventory_month,
+        category=category,
+        resolver_type=str(resolver.get("type") or "kaiser_monthly_inventory"),
+        toc_max_bytes=(
+            _parse_size_bytes(resolver.get("toc_max_bytes")) or 5 * 1024 * 1024
+        ),
+        include_external_data=resolver.get("include_external_data") is True,
+        configured_regions=frozenset(
+            str(region_value or "").strip().lower()
+            for region_value in (resolver.get("region_codes") or ())
+            if str(region_value or "").strip()
+        ),
     )
-    inventory_base_url = inventory_url.rsplit("/", 1)[0].rstrip("/") + "/"
-    resolver_type = str(resolver.get("type") or "kaiser_monthly_inventory")
-    crawl_targets: list[CrawlTarget] = []
-    for raw_line in (inventory_text or "").splitlines():
-        columns = raw_line.strip().rsplit(None, 1)
-        if len(columns) != 2:
-            continue
-        relative_path, raw_size = columns
-        path_parts = [part for part in relative_path.strip("/").split("/") if part]
-        if len(path_parts) < 2:
-            continue
-        if path_parts[0].lower() == "externaldata" and not include_external_data:
-            continue
-        region_code = (
-            path_parts[1].lower()
-            if path_parts[0].lower() == "state" and len(path_parts) > 2
-            else path_parts[0].lower()
-        )
-        if configured_regions and region_code not in configured_regions:
-            continue
-        file_name = path_parts[-1]
-        file_type = _mrf_file_type_from_text(relative_path, file_name)
-        if category == "outofnetwork":
-            file_type = "allowed-amounts"
-        if file_type not in {
-            "table-of-contents",
-            "in-network",
-            "allowed-amounts",
-        }:
-            continue
-        try:
-            size_bytes = int(raw_size)
-        except ValueError:
-            size_bytes = None
-        target_url = urljoin(inventory_base_url, relative_path.lstrip("/"))
-        target_kind = (
-            "toc_json" if file_type == "table-of-contents" else "file_reference"
-        )
-        metadata = {
-            "resolver": resolver_type,
-            "target_kind": target_kind,
-            "target_file_type": file_type,
-            "container_format": _container_format(target_url),
-            "file_name": file_name,
-            "size_bytes": size_bytes,
-            "inventory_url": inventory_url,
-            "inventory_month": inventory_month,
-            "kaiser_region_code": region_code,
-            "kaiser_inventory_category": category,
-            "kaiser_state_file": path_parts[0].lower() == "state",
-            "kaiser_external_data": path_parts[0].lower() == "externaldata",
-            "plan_info": _plan_info_from_label(file_name),
-            "target_max_bytes": (
-                toc_max_bytes if file_type == "table-of-contents" else None
-            ),
-        }
-        crawl_targets.append(
-            CrawlTarget(
-                source=source_record,
-                url=target_url,
-                label=file_name,
-                resolved_from_url=inventory_url,
-                metadata={
-                    metadata_key: metadata_value
-                    for metadata_key, metadata_value in metadata.items()
-                    if metadata_value not in (None, "", [], False)
-                },
-            )
-        )
-    return crawl_targets
+    return [
+        crawl_target
+        for raw_line in (inventory_text or "").splitlines()
+        if (crawl_target := _kaiser_inventory_target_from_line(context, raw_line))
+        is not None
+    ]
 
 
 def _kaiser_inventory_months(
