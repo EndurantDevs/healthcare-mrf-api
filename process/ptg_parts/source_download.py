@@ -117,6 +117,7 @@ INCOMPLETE_TLS_CHAIN_HOSTS_ENV = "HLTHPRT_INCOMPLETE_TLS_CHAIN_HOSTS"
 DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS = frozenset({"api.midlandschoice.com"})
 _CONTENT_RANGE_PATTERN = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+)$", re.IGNORECASE)
 _ARTIFACT_FILENAME_QUERY_KEYS = frozenset({"file", "filename", "file_name", "name"})
+_HTTP_USER_AGENT = "HealthPorta-MRF/1.0"
 
 
 class _PublicResolver(AbstractResolver):
@@ -141,6 +142,14 @@ class _PublicResolver(AbstractResolver):
 
 def _public_connector() -> aiohttp.TCPConnector:
     return aiohttp.TCPConnector(resolver=_PublicResolver())
+
+
+def _download_session(timeout: aiohttp.ClientTimeout) -> aiohttp.ClientSession:
+    return aiohttp.ClientSession(
+        timeout=timeout,
+        connector=_public_connector(),
+        headers={"User-Agent": _HTTP_USER_AGENT},
+    )
 
 
 @dataclass
@@ -740,9 +749,7 @@ async def fetch_head_metadata(url: str, timeout_seconds: int = 30) -> PTG2HeadMe
     await assert_safe_url(url)
     timeout = aiohttp.ClientTimeout(total=timeout_seconds, connect=min(timeout_seconds, 10))
     try:
-        async with aiohttp.ClientSession(
-            timeout=timeout, connector=_public_connector()
-        ) as session:
+        async with _download_session(timeout) as session:
             async with _validated_request(session, "HEAD", url) as response:
                 response_headers_by_name = response.headers
                 length = response_headers_by_name.get("Content-Length")
@@ -771,9 +778,7 @@ async def _probe_http_range_support(
     if validator:
         headers_by_name["If-Match"] = validator
     try:
-        async with aiohttp.ClientSession(
-            timeout=timeout, connector=_public_connector()
-        ) as session:
+        async with _download_session(timeout) as session:
             async with _validated_request(session, "GET", url, headers=headers_by_name) as response:
                 if response.status != 206:
                     return False, None, None, None
@@ -1025,9 +1030,7 @@ async def _run_range_download_tasks(
     pending_ranges: list[tuple[int, int]],
 ) -> None:
     timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)
-    async with aiohttp.ClientSession(
-        timeout=timeout, connector=_public_connector()
-    ) as session:
+    async with _download_session(timeout) as session:
         range_tasks = [
             asyncio.create_task(
                 context._bounded_fetch(session, byte_range)
@@ -1238,9 +1241,7 @@ async def _run_single_get_attempt(
             "Range": f"bytes={state.byte_count}-",
             "If-Match": str(state.validator),
         }
-    async with aiohttp.ClientSession(
-        timeout=timeout, connector=_public_connector()
-    ) as session:
+    async with _download_session(timeout) as session:
         async with _validated_request(session, "GET", url, headers=request_headers_by_name) as response:
             response.raise_for_status()
             file_mode = _prepare_single_get_response(

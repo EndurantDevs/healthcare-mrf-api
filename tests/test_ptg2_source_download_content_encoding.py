@@ -17,6 +17,26 @@ from tests.ptg2_source_download_security_support import (
 )
 
 
+def test_download_session_uses_stable_product_user_agent(monkeypatch) -> None:
+    session_options_by_name = {}
+    connector = object()
+
+    monkeypatch.setattr(source_download, "_public_connector", lambda: connector)
+    monkeypatch.setattr(
+        source_download.aiohttp,
+        "ClientSession",
+        lambda **kwargs: session_options_by_name.update(kwargs) or _Session(),
+    )
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    source_download._download_session(timeout)
+    assert session_options_by_name == {
+        "timeout": timeout,
+        "connector": connector,
+        "headers": {"User-Agent": "HealthPorta-MRF/1.0"},
+    }
+
+
 def test_single_get_uses_decoded_byte_space_for_encoded_response(
     tmp_path, monkeypatch
 ) -> None:
