@@ -1092,11 +1092,20 @@ class _DownloadSizeLimitError(RuntimeError):
     pass
 
 
+def _is_identity_content_encoding(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"", "identity"}
+
+
 def _single_get_download_state(path: Path, head: PTG2HeadMetadata) -> _SingleGetDownloadState:
+    total_bytes = (
+        head.content_length
+        if _is_identity_content_encoding(head.content_encoding)
+        else None
+    )
     validator = head.etag if _is_strong_etag(head.etag) else None
     resume_offset = _validated_resume_offset(
         path,
-        total_bytes=head.content_length,
+        total_bytes=total_bytes,
         etag=validator,
     )
     if resume_offset == 0:
@@ -1110,7 +1119,7 @@ def _single_get_download_state(path: Path, head: PTG2HeadMetadata) -> _SingleGet
         path=path,
         digest=digest,
         byte_count=byte_count,
-        total_bytes=head.content_length,
+        total_bytes=total_bytes,
         validator=validator,
         last_modified=head.last_modified if resume_offset else None,
         next_progress_bytes=next_progress_bytes,
@@ -1138,6 +1147,10 @@ def _prepare_single_get_response(
     state.content_encoding = response.headers.get("Content-Encoding")
     state.content_type = response.headers.get("Content-Type")
     if is_resume_request:
+        if not _is_identity_content_encoding(state.content_encoding):
+            raise _UnsafeRangeResponseError(
+                f"Resume download for {url} returned encoded content"
+            )
         if response.status != 206:
             raise _UnsafeRangeResponseError(
                 f"Resume download not supported for {url}: status {response.status}"
@@ -1159,7 +1172,13 @@ def _prepare_single_get_response(
     if response.status == 206:
         raise _UnsafeRangeResponseError(f"Full download for {url} unexpectedly returned partial content")
     content_length = response.headers.get("Content-Length")
-    state.total_bytes = int(content_length) if content_length and content_length.isdigit() else None
+    state.total_bytes = (
+        int(content_length)
+        if _is_identity_content_encoding(state.content_encoding)
+        and content_length
+        and content_length.isdigit()
+        else None
+    )
     returned_etag = response.headers.get("ETag")
     state.validator = returned_etag if _is_strong_etag(returned_etag) else None
     state.last_modified = response.headers.get("Last-Modified")
