@@ -78,9 +78,6 @@ CREATE TABLE {schema}.hospital_price_hospital (
     updated_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
     CONSTRAINT hospital_price_hospital_facility_anchor_key
         UNIQUE (facility_anchor_id),
-    CONSTRAINT hospital_price_hospital_facility_anchor_fkey
-        FOREIGN KEY (facility_anchor_id)
-        REFERENCES {schema}.facility_anchor(id),
     CONSTRAINT hospital_price_hospital_locator_fkey
         FOREIGN KEY (locator_id)
         REFERENCES {schema}.hospital_price_locator(locator_id),

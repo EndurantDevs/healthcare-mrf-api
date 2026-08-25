@@ -126,17 +126,12 @@ class HospitalPriceLocatorObservation(Base, JSONOutputMixin):
 
 
 class HospitalPriceHospital(Base, JSONOutputMixin):
-    """Stable project hospital identity bound to the canonical facility anchor."""
+    """Stable project hospital identity with an optional canonical anchor ID."""
 
     __tablename__ = "hospital_price_hospital"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
         PrimaryKeyConstraint("hospital_id"),
-        ForeignKeyConstraint(
-            ["facility_anchor_id"],
-            [_reference("facility_anchor", "id")],
-            name="hospital_price_hospital_facility_anchor_fkey",
-        ),
         ForeignKeyConstraint(
             ["locator_id"],
             [_reference("hospital_price_locator", "locator_id")],

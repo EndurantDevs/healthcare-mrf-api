@@ -78,21 +78,13 @@ async def _drop_schema(engine, schema: str) -> None:
     assert remaining is None
 
 
-async def _prepare_anchor(engine, schema: str) -> None:
+async def _prepare_schema(engine, schema: str) -> None:
     quoted = _quote(schema)
     async with engine.begin() as connection:
         await connection.exec_driver_sql(f"CREATE SCHEMA {quoted}")
-        await connection.exec_driver_sql(
-            f"CREATE TABLE {quoted}.facility_anchor (id varchar(128) PRIMARY KEY, "
-            "name text NOT NULL, facility_type varchar(64) NOT NULL)"
-        )
 
 
 async def _seed_registry(connection, quoted: str) -> None:
-    await connection.execute(
-        f"INSERT INTO {quoted}.facility_anchor VALUES ('facility-a', 'Hospital A', 'Hospital'), "
-        "('facility-b', 'Hospital B', 'Hospital')"
-    )
     await connection.execute(f"INSERT INTO {quoted}.hospital_price_locator(locator_id, cms_hpt_url) "
                              "VALUES ('locator-1', 'https://hospital.example/cms-hpt.txt')")
     await connection.execute(
@@ -557,7 +549,7 @@ async def _assert_bad_allowed_count_rejected(connection, quoted, version_id) -> 
         )
 
 
-def test_models_use_lossless_types_and_existing_facility_anchor() -> None:
+def test_models_use_lossless_types_and_optional_facility_anchor() -> None:
     tables = Base.metadata.tables
     assert HospitalPriceVersion.__table__ is tables["mrf.hospital_price_version"]
     assert HospitalPriceLocatorObservation.__table__ is tables["mrf.hospital_price_locator_observation"]
@@ -570,7 +562,8 @@ def test_models_use_lossless_types_and_existing_facility_anchor() -> None:
         for foreign_key in hospital.foreign_key_constraints
         for element in foreign_key.elements
     }
-    assert "mrf.facility_anchor.id" in foreign_key_targets
+    assert hospital.c.facility_anchor_id.nullable
+    assert "mrf.facility_anchor.id" not in foreign_key_targets
     payer = tables["mrf.hospital_price_payer_charge"]
     assert isinstance(payer.c.standard_charge_percentage.type, sa.Numeric)
     assert payer.c.standard_charge_percentage.type.scale is None
@@ -603,7 +596,7 @@ async def test_postgres_round_trip_and_last_known_good_cas(monkeypatch) -> None:
     monkeypatch.setattr(hospital_price_store, "schema_name", lambda: schema)
     engine = create_async_engine(database_url.set(drivername="postgresql+asyncpg"), poolclass=NullPool)
     migration = _load_migration()
-    await _prepare_anchor(engine, schema)
+    await _prepare_schema(engine, schema)
     try:
         await _run_migration(engine, migration, "upgrade")
         connection = await asyncpg.connect(str(database_url.set(drivername="postgresql")))
