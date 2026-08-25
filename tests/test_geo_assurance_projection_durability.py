@@ -41,7 +41,6 @@ async def test_projection_receipt_locks_sources_and_forces_stale_reimports(
     expected_force,
 ):
     """Require locking before projection and full work for stale imports."""
-
     events: list[str] = []
 
     class FakeDB:
@@ -81,7 +80,6 @@ async def test_projection_receipt_locks_sources_and_forces_stale_reimports(
         run_id="run-1",
         stage_rows=7,
     ) == 7
-
     settings_at = next(i for i, sql in enumerate(events) if "SET LOCAL lock_timeout" in sql)
     lock_at = next(i for i, sql in enumerate(events) if sql.startswith("LOCK TABLE"))
     update_sql = next(sql for sql in events if "UPDATE fixture.stage AS target" in sql)
@@ -89,10 +87,8 @@ async def test_projection_receipt_locks_sources_and_forces_stale_reimports(
     assert "fixture.npi_address" in events[lock_at]
     assert "tiger.zcta5" in events[lock_at]
     assert ("WHERE TRUE" in update_sql) is expected_force
-    assert (
-        projection_context_by_field["geo_assurance_forced_full_projection"]
-        is expected_force
-    )
+    forced = projection_context_by_field["geo_assurance_forced_full_projection"]
+    assert forced is expected_force
     assert projection_context_by_field["invalid_geo_assurance_rows"] == 0
     assert [call.kwargs["done"] for call in progress.call_args_list] == [0, 7]
     assert "row(s)" not in progress.call_args_list[0].kwargs["message"]
