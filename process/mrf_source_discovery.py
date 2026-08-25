@@ -60,7 +60,10 @@ from db.models import (
     db,
 )
 from process.ext.utils import ensure_database, push_objects
-from process.import_status_events import enqueue_status_event, flush_status_events
+from process.import_status_events import (
+    enqueue_status_event,
+    flush_terminal_status_event,
+)
 from process.live_progress import enqueue_live_progress
 from process.mrf_discovery_checkpoints import (
     DatabaseDiscoveryCheckpointStore,
@@ -2607,13 +2610,14 @@ def _repair_missing_array_object_commas(text: str) -> str:
     length = len(text)
     for idx, char in enumerate(text):
         repaired_chunks.append(char)
+        if is_in_string and is_escaped:
+            is_escaped = False
+            continue
+        if is_in_string and char == "\\":
+            is_escaped = True
+            continue
         if is_in_string:
-            if is_escaped:
-                is_escaped = False
-            elif char == "\\":
-                is_escaped = True
-            elif char == '"':
-                is_in_string = False
+            is_in_string = char != '"'
             continue
         if char == '"':
             is_in_string = True
@@ -4232,13 +4236,13 @@ async def _mymedicalshopper_ddp_recv(
             messages = _mymedicalshopper_sockjs_messages(str(frame.data))
             returned_messages: list[dict[str, Any]] = []
             for message in messages:
-                if message.get("msg") == "ping":
-                    pong_message_by_field: dict[str, Any] = {"msg": "pong"}
-                    if message.get("id") is not None:
-                        pong_message_by_field["id"] = message.get("id")
-                    await _mymedicalshopper_ddp_send(ws, pong_message_by_field)
+                if message.get("msg") != "ping":
+                    returned_messages.append(message)
                     continue
-                returned_messages.append(message)
+                pong_message_by_field: dict[str, Any] = {"msg": "pong"}
+                if message.get("id") is not None:
+                    pong_message_by_field["id"] = message.get("id")
+                await _mymedicalshopper_ddp_send(ws, pong_message_by_field)
             if returned_messages:
                 return returned_messages
             continue
@@ -5338,15 +5342,15 @@ async def _resolve_magnacare_transparency_mrf(
 ) -> list[CrawlTarget]:
     """Resolve MagnaCare transparency search results into crawl targets."""
     resolver_type = str(resolver.get("type") or "magnacare_transparency_mrf")
-    search_terms = _magnacare_search_terms(source_record, resolver)
     max_bytes = int(resolver.get("max_bytes") or 5 * 1024 * 1024)
     ip_address = str(resolver.get("download_ip_address") or "127.0.0.1")
     grouped_by_target_key: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     max_targets = _as_int(resolver.get("max_targets"))
-    for search_term in search_terms:
+    for search_term in _magnacare_search_terms(source_record, resolver):
         results_url = _magnacare_results_url(url, search_term)
-        html_text = await _fetch_text(results_url, max_bytes=max_bytes, session=session)
-        for result_row in _magnacare_result_rows(html_text):
+        for result_row in _magnacare_result_rows(
+            await _fetch_text(results_url, max_bytes=max_bytes, session=session)
+        ):
             run_history_id = _clean_text(result_row.get("run_history_id"))
             if not run_history_id or run_history_id == "0":
                 continue
@@ -5358,9 +5362,8 @@ async def _resolve_magnacare_transparency_mrf(
             )
             if not file_name or not file_type:
                 continue
-            key = _magnacare_target_key(result_row)
             grouped_result = grouped_by_target_key.setdefault(
-                key,
+                _magnacare_target_key(result_row),
                 {
                     "row": result_row,
                     "search_terms": set(),
@@ -5977,7 +5980,6 @@ def _auxiant_landing_target(
     directory_url: str,
     landing_url: str,
     resolver_type: str,
-    reason: str,
     landing_label: str | None = None,
     nested_error: str | None = None,
 ) -> CrawlTarget:
@@ -5996,7 +5998,11 @@ def _auxiant_landing_target(
             "external_source_url": landing_url if landing_url != page_url else None,
             "external_hosting_platform": classify_hosting_platform(landing_url),
             "landing_label": landing_label,
-            "landing_reason": reason,
+            "landing_reason": (
+                "auxiant_page_without_file_links"
+                if landing_url == page_url
+                else "external_landing_no_concrete_targets"
+            ),
             "nested_error": _truncate_text(nested_error, 500),
         },
     )
@@ -6133,7 +6139,6 @@ async def _resolve_auxiant_wordpress_directory(
                         directory_url=directory_url,
                         landing_url=external_url,
                         resolver_type=resolver_type,
-                        reason="external_landing_no_concrete_targets",
                         landing_label=str(link.get("label") or ""),
                         nested_error=nested_error,
                     )
@@ -6147,7 +6152,6 @@ async def _resolve_auxiant_wordpress_directory(
                     directory_url=directory_url,
                     landing_url=page_url,
                     resolver_type=resolver_type,
-                    reason="auxiant_page_without_file_links",
                     landing_label=network_name,
                 )
             )
@@ -12586,6 +12590,105 @@ def _monthly_toc_targets(
     return crawl_targets
 
 
+@dataclass(frozen=True)
+class _KaiserInventoryContext:
+    source_record: dict[str, Any]
+    inventory_url: str
+    inventory_base_url: str
+    inventory_month: str
+    category: str
+    resolver_type: str
+    toc_max_bytes: int
+    include_external_data: bool
+    configured_regions: frozenset[str]
+
+
+def _kaiser_inventory_target_metadata(
+    context: _KaiserInventoryContext,
+    *,
+    path_parts: list[str],
+    file_name: str,
+    file_type: str,
+    region_code: str,
+    size_bytes: int | None,
+    target_url: str,
+) -> dict[str, Any]:
+    metadata_by_name = {
+        "resolver": context.resolver_type,
+        "target_kind": (
+            "toc_json" if file_type == "table-of-contents" else "file_reference"
+        ),
+        "target_file_type": file_type,
+        "container_format": _container_format(target_url),
+        "file_name": file_name,
+        "size_bytes": size_bytes,
+        "inventory_url": context.inventory_url,
+        "inventory_month": context.inventory_month,
+        "kaiser_region_code": region_code,
+        "kaiser_inventory_category": context.category,
+        "kaiser_state_file": path_parts[0].lower() == "state",
+        "kaiser_external_data": path_parts[0].lower() == "externaldata",
+        "plan_info": _plan_info_from_label(file_name),
+        "target_max_bytes": (
+            context.toc_max_bytes if file_type == "table-of-contents" else None
+        ),
+    }
+    return {
+        metadata_key: metadata_value
+        for metadata_key, metadata_value in metadata_by_name.items()
+        if metadata_value not in (None, "", [], False)
+    }
+
+
+def _kaiser_inventory_target_from_line(
+    context: _KaiserInventoryContext,
+    raw_line: str,
+) -> CrawlTarget | None:
+    columns = raw_line.strip().rsplit(None, 1)
+    if len(columns) != 2:
+        return None
+    relative_path, raw_size = columns
+    path_parts = [part for part in relative_path.strip("/").split("/") if part]
+    if len(path_parts) < 2:
+        return None
+    is_external_data = path_parts[0].lower() == "externaldata"
+    if is_external_data and not context.include_external_data:
+        return None
+    region_code = (
+        path_parts[1].lower()
+        if path_parts[0].lower() == "state" and len(path_parts) > 2
+        else path_parts[0].lower()
+    )
+    if context.configured_regions and region_code not in context.configured_regions:
+        return None
+    file_name = path_parts[-1]
+    file_type = _mrf_file_type_from_text(relative_path, file_name)
+    if context.category == "outofnetwork":
+        file_type = "allowed-amounts"
+    if file_type not in {"table-of-contents", "in-network", "allowed-amounts"}:
+        return None
+    try:
+        size_bytes = int(raw_size)
+    except ValueError:
+        size_bytes = None
+    target_url = urljoin(context.inventory_base_url, relative_path.lstrip("/"))
+    return CrawlTarget(
+        source=context.source_record,
+        url=target_url,
+        label=file_name,
+        resolved_from_url=context.inventory_url,
+        metadata=_kaiser_inventory_target_metadata(
+            context,
+            path_parts=path_parts,
+            file_name=file_name,
+            file_type=file_type,
+            region_code=region_code,
+            size_bytes=size_bytes,
+            target_url=target_url,
+        ),
+    )
+
+
 def _kaiser_inventory_targets_from_text(
     source_record: dict[str, Any],
     inventory_text: str,
@@ -12598,85 +12701,29 @@ def _kaiser_inventory_targets_from_text(
     """Parse one Kaiser monthly inventory into typed crawl targets."""
     if category not in {"innetwork", "outofnetwork"}:
         raise ValueError(f"unsupported Kaiser inventory category: {category}")
-    include_external_data = resolver.get("include_external_data") is True
-    configured_regions = {
-        str(region_value or "").strip().lower()
-        for region_value in (resolver.get("region_codes") or ())
-        if str(region_value or "").strip()
-    }
-    toc_max_bytes = (
-        _parse_size_bytes(resolver.get("toc_max_bytes")) or 5 * 1024 * 1024
+    context = _KaiserInventoryContext(
+        source_record=source_record,
+        inventory_url=inventory_url,
+        inventory_base_url=inventory_url.rsplit("/", 1)[0].rstrip("/") + "/",
+        inventory_month=inventory_month,
+        category=category,
+        resolver_type=str(resolver.get("type") or "kaiser_monthly_inventory"),
+        toc_max_bytes=(
+            _parse_size_bytes(resolver.get("toc_max_bytes")) or 5 * 1024 * 1024
+        ),
+        include_external_data=resolver.get("include_external_data") is True,
+        configured_regions=frozenset(
+            str(region_value or "").strip().lower()
+            for region_value in (resolver.get("region_codes") or ())
+            if str(region_value or "").strip()
+        ),
     )
-    inventory_base_url = inventory_url.rsplit("/", 1)[0].rstrip("/") + "/"
-    resolver_type = str(resolver.get("type") or "kaiser_monthly_inventory")
-    crawl_targets: list[CrawlTarget] = []
-    for raw_line in (inventory_text or "").splitlines():
-        columns = raw_line.strip().rsplit(None, 1)
-        if len(columns) != 2:
-            continue
-        relative_path, raw_size = columns
-        path_parts = [part for part in relative_path.strip("/").split("/") if part]
-        if len(path_parts) < 2:
-            continue
-        if path_parts[0].lower() == "externaldata" and not include_external_data:
-            continue
-        region_code = (
-            path_parts[1].lower()
-            if path_parts[0].lower() == "state" and len(path_parts) > 2
-            else path_parts[0].lower()
-        )
-        if configured_regions and region_code not in configured_regions:
-            continue
-        file_name = path_parts[-1]
-        file_type = _mrf_file_type_from_text(relative_path, file_name)
-        if category == "outofnetwork":
-            file_type = "allowed-amounts"
-        if file_type not in {
-            "table-of-contents",
-            "in-network",
-            "allowed-amounts",
-        }:
-            continue
-        try:
-            size_bytes = int(raw_size)
-        except ValueError:
-            size_bytes = None
-        target_url = urljoin(inventory_base_url, relative_path.lstrip("/"))
-        target_kind = (
-            "toc_json" if file_type == "table-of-contents" else "file_reference"
-        )
-        metadata = {
-            "resolver": resolver_type,
-            "target_kind": target_kind,
-            "target_file_type": file_type,
-            "container_format": _container_format(target_url),
-            "file_name": file_name,
-            "size_bytes": size_bytes,
-            "inventory_url": inventory_url,
-            "inventory_month": inventory_month,
-            "kaiser_region_code": region_code,
-            "kaiser_inventory_category": category,
-            "kaiser_state_file": path_parts[0].lower() == "state",
-            "kaiser_external_data": path_parts[0].lower() == "externaldata",
-            "plan_info": _plan_info_from_label(file_name),
-            "target_max_bytes": (
-                toc_max_bytes if file_type == "table-of-contents" else None
-            ),
-        }
-        crawl_targets.append(
-            CrawlTarget(
-                source=source_record,
-                url=target_url,
-                label=file_name,
-                resolved_from_url=inventory_url,
-                metadata={
-                    metadata_key: metadata_value
-                    for metadata_key, metadata_value in metadata.items()
-                    if metadata_value not in (None, "", [], False)
-                },
-            )
-        )
-    return crawl_targets
+    return [
+        crawl_target
+        for raw_line in (inventory_text or "").splitlines()
+        if (crawl_target := _kaiser_inventory_target_from_line(context, raw_line))
+        is not None
+    ]
 
 
 def _kaiser_inventory_months(
@@ -16527,7 +16574,7 @@ async def _publish_failed_discovery_state(
         finished_at=finished_at,
         triggered_by=failure_context_dict["triggered_by"],
     )
-    await _flush_discovery_control_events()
+    await _flush_discovery_control_events(control_run_id)
 
 
 async def _record_failed_discovery_state(
@@ -16575,13 +16622,13 @@ def _emit_discovery_control_event(
     enqueue_status_event(event_by_field)
 
 
-async def _flush_discovery_control_events() -> None:
+async def _flush_discovery_control_events(control_run_id: str) -> None:
     timeout = float(
         os.getenv("HLTHPRT_MRF_DISCOVERY_CONTROL_EVENT_FLUSH_SECONDS", "1.0")
     )
     if timeout <= 0:
         return
-    await flush_status_events(timeout_seconds=timeout)
+    await flush_terminal_status_event(control_run_id, timeout_seconds=timeout)
 
 
 @dataclass(frozen=True)
@@ -17415,7 +17462,7 @@ async def run_mrf_source_discovery_command(
                 started_at=started_at,
                 finished_at=finished_at,
             )
-            await _flush_discovery_control_events()
+            await _flush_discovery_control_events(control_run_id)
     return discovery_result.as_dict()
 
 

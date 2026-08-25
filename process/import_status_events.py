@@ -54,6 +54,11 @@ class _PublisherState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     coalesced_by_run: dict[str, dict[str, Any]] = field(default_factory=dict)
     flush_handle_by_run: dict[str, asyncio.TimerHandle] = field(default_factory=dict)
+    pending_terminal_events: deque[dict[str, Any]] = field(default_factory=deque)
+    terminal_event_by_run: dict[str, dict[str, Any]] = field(default_factory=dict)
+    terminal_delivery_by_run: dict[str, asyncio.Future[bool]] = field(
+        default_factory=dict
+    )
 
 
 _publisher_state = _PublisherState()
@@ -133,15 +138,37 @@ def _append_pending_event_locked(event: dict[str, Any]) -> None:
         int(os.getenv("HLTHPRT_IMPORT_STATUS_EVENT_QUEUE_SIZE", "256")),
         1,
     )
-    run_id = str(event.get("run_id") or "")
+    run_id = str(event.get("run_id") or "").strip()
     if run_id:
+        has_pending_terminal = any(
+            str(pending.get("run_id") or "").strip() == run_id
+            and str(pending.get("status") or "").strip().lower()
+            in TERMINAL_STATUSES
+            for pending in _publisher_state.pending
+        )
+        status = str(event.get("status") or "").strip().lower()
+        if has_pending_terminal and status not in TERMINAL_STATUSES:
+            return
         _publisher_state.pending = deque(
             pending
             for pending in _publisher_state.pending
-            if str(pending.get("run_id") or "") != run_id
+            if str(pending.get("run_id") or "").strip() != run_id
         )
     while len(_publisher_state.pending) >= pending_limit:
-        _publisher_state.pending.popleft()
+        progress_event = next(
+            (
+                pending
+                for pending in _publisher_state.pending
+                if str(pending.get("status") or "").strip().lower()
+                not in TERMINAL_STATUSES
+            ),
+            None,
+        )
+        if progress_event is None:
+            if status not in TERMINAL_STATUSES:
+                return
+            break
+        _publisher_state.pending.remove(progress_event)
     _publisher_state.pending.append(event)
 
 
@@ -158,7 +185,15 @@ def _accept_event_on_loop(
     status = str(event.get("status") or "").strip().lower()
     if status in TERMINAL_STATUSES:
         _cancel_coalesced(run_id)
+        previous_delivery = _publisher_state.terminal_delivery_by_run.get(run_id)
+        if previous_delivery is not None and not previous_delivery.done():
+            previous_delivery.set_result(False)
+        _publisher_state.terminal_event_by_run[run_id] = event
+        _publisher_state.terminal_delivery_by_run[run_id] = loop.create_future()
+        _publisher_state.pending_terminal_events.append(event)
         _publish_event_now(queue, event)
+        return
+    if run_id in _publisher_state.terminal_event_by_run:
         return
 
     now = time.monotonic()
@@ -260,6 +295,38 @@ async def flush_status_events(timeout_seconds: float = 2.0) -> None:
         return
 
 
+async def flush_terminal_status_event(
+    run_id: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> None:
+    """Wait for one terminal event instead of the publisher's whole backlog."""
+
+    normalized_run_id = str(run_id or "").strip()
+    if not normalized_run_id or not _status_event_url():
+        return
+    timeout = _terminal_flush_timeout_seconds(timeout_seconds)
+    if timeout <= 0:
+        return
+    _ensure_queue(asyncio.get_running_loop())
+    await asyncio.sleep(0)
+    delivery = _publisher_state.terminal_delivery_by_run.get(normalized_run_id)
+    if delivery is None:
+        logger.warning(
+            "terminal import status event was not queued run_id=%s",
+            normalized_run_id,
+        )
+        return
+    try:
+        await asyncio.wait_for(asyncio.shield(delivery), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "timed out publishing terminal import status event run_id=%s timeout=%.2fs",
+            normalized_run_id,
+            timeout,
+        )
+
+
 def _event_payload(payload: dict[str, Any]) -> dict[str, Any]:
     event_by_field = {
         "engine": ENGINE_NAME,
@@ -277,8 +344,14 @@ def _ensure_queue(loop: asyncio.AbstractEventLoop) -> asyncio.Queue[dict[str, An
         if _publisher_state.loop is not loop:
             for handle in _publisher_state.flush_handle_by_run.values():
                 handle.cancel()
+            for delivery in _publisher_state.terminal_delivery_by_run.values():
+                if not delivery.done():
+                    delivery.cancel()
             _publisher_state.coalesced_by_run.clear()
             _publisher_state.flush_handle_by_run.clear()
+            _publisher_state.pending_terminal_events.clear()
+            _publisher_state.terminal_event_by_run.clear()
+            _publisher_state.terminal_delivery_by_run.clear()
             _publisher_state.loop = loop
             _publisher_state.queue = None
             _publisher_state.worker = None
@@ -302,18 +375,55 @@ def _ensure_queue(loop: asyncio.AbstractEventLoop) -> asyncio.Queue[dict[str, An
 
 async def _publisher_worker(queue: asyncio.Queue[dict[str, Any]]) -> None:
     while True:
-        event = await queue.get()
+        is_from_queue = not _publisher_state.pending_terminal_events
+        event = (
+            await queue.get()
+            if is_from_queue
+            else _publisher_state.pending_terminal_events.popleft()
+        )
+        run_id = str(event.get("run_id") or "").strip()
+        terminal_event = _publisher_state.terminal_event_by_run.get(run_id)
+        delivery = _publisher_state.terminal_delivery_by_run.get(run_id)
+        if terminal_event is not None and (
+            event is not terminal_event or (delivery is not None and delivery.done())
+        ):
+            if is_from_queue:
+                queue.task_done()
+            continue
+        is_terminal = event is terminal_event
         try:
             await asyncio.to_thread(_post_event, event)
         except Exception as exc:
-            logger.debug(
-                "failed to publish import status event run_id=%s status=%s: %s",
-                event.get("run_id"),
-                event.get("status"),
-                exc,
-            )
+            if is_terminal:
+                logger.warning(
+                    "failed to publish terminal import status event run_id=%s status=%s: %s",
+                    event.get("run_id"),
+                    event.get("status"),
+                    exc,
+                )
+                _resolve_terminal_delivery(event, False)
+            else:
+                logger.debug(
+                    "failed to publish import status event run_id=%s status=%s: %s",
+                    event.get("run_id"),
+                    event.get("status"),
+                    exc,
+                )
+        else:
+            if is_terminal:
+                _resolve_terminal_delivery(event, True)
         finally:
-            queue.task_done()
+            if is_from_queue:
+                queue.task_done()
+
+
+def _resolve_terminal_delivery(event: dict[str, Any], delivered: bool) -> None:
+    run_id = str(event.get("run_id") or "").strip()
+    if _publisher_state.terminal_event_by_run.get(run_id) is not event:
+        return
+    delivery = _publisher_state.terminal_delivery_by_run.get(run_id)
+    if delivery is not None and not delivery.done():
+        delivery.set_result(delivered)
 
 
 def _post_event(event: dict[str, Any]) -> None:
@@ -342,6 +452,17 @@ def _status_event_url() -> str:
 
 def _timeout_seconds() -> float:
     return max(float(os.getenv("HLTHPRT_IMPORT_STATUS_EVENT_TIMEOUT_SECONDS", "1.0")), 0.1)
+
+
+def _terminal_flush_timeout_seconds(timeout_seconds: float | None) -> float:
+    configured = (
+        float(os.getenv("HLTHPRT_IMPORT_STATUS_EVENT_TERMINAL_FLUSH_SECONDS", "2.25"))
+        if timeout_seconds is None
+        else float(timeout_seconds)
+    )
+    if configured <= 0:
+        return 0.0
+    return max(configured, 2 * _timeout_seconds() + 0.25)
 
 
 def _throttle_seconds() -> float:

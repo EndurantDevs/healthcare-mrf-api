@@ -84,7 +84,7 @@ async def test_ptg_control_start_marks_failed_and_reraises_cancelled_ptg_main(mo
         marks.append((args, kwargs))
         return True
 
-    async def fake_flush_terminal_status_events():
+    async def fake_flush_terminal_status_events(_run_id):
         flushes.append(True)
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
@@ -132,7 +132,7 @@ async def test_ptg_control_surfaces_nested_source_witness_budget_failure(monkeyp
         marks.append((args, kwargs))
         return True
 
-    async def fake_flush_terminal_status_events():
+    async def fake_flush_terminal_status_events(_run_id):
         return None
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
@@ -186,7 +186,7 @@ async def test_ptg_control_classifies_provider_group_definition_failures(
         marks.append((args, kwargs))
         return True
 
-    async def fake_flush_terminal_status_events():
+    async def fake_flush_terminal_status_events(_run_id):
         return None
 
     monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)

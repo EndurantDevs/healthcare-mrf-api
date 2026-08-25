@@ -57,7 +57,7 @@ class _WorkerFailureHarness:
         self.mark_calls.append(kwargs)
         return True
 
-    async def flush_status(self):
+    async def flush_status(self, _run_id):
         return None
 
     async def run_main(self, **_kwargs):
