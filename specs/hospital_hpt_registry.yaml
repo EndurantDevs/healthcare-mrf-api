@@ -17363,13 +17363,13 @@ hospitals:
   name: ROCKY MTN HOSP FOR CHILDREN
   cms_hpt_url: https://www.healthonecares.com/cms-hpt.txt
 - hospital_id: hospital-005484
-  name: Rogers Memorial Hospital Brown Deer
+  name: "Rogers\u0020Memorial Hospital Brown Deer"
   cms_hpt_url: https://rogersbh.org/cms-hpt.txt
 - hospital_id: hospital-005485
-  name: Rogers Memorial Hospital Oconomowoc
+  name: "Rogers\u0020Memorial Hospital Oconomowoc"
   cms_hpt_url: https://rogersbh.org/cms-hpt.txt
 - hospital_id: hospital-005486
-  name: Rogers Memorial Hospital West Allis
+  name: "Rogers\u0020Memorial Hospital West Allis"
   cms_hpt_url: https://rogersbh.org/cms-hpt.txt
 - hospital_id: hospital-005487
   name: Rolling Hills Hospital
