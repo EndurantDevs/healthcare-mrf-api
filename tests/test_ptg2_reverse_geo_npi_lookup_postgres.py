@@ -159,7 +159,7 @@ def test_npi_only_sql_keeps_the_unique_scope_probe_correlated():
     assert "addr.location_key" in statement
     assert "ORDER BY distance_miles ASC NULLS LAST, npi" in statement
     assert statement.index("ORDER BY distance_miles") < statement.index("LIMIT :limit")
-    assert "jsonb_build_object" not in statement
+    assert "jsonb_build_" not in statement
     assert "address_payload" not in statement
 
 

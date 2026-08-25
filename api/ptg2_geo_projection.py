@@ -73,15 +73,34 @@ def projection_state_available_sql(schema_name: str) -> str:
 
     schema_name = _sql_identifier(schema_name, field_name="address schema")
     live_table = f"{schema_name}.entity_address_unified"
+    signature_checks: list[str] = []
+    for dependency_schema, table_name in _PROJECTION_DEPENDENCIES:
+        relation_schema = dependency_schema or schema_name
+        qualified_name = f"{relation_schema}.{table_name}"
+        signature_checks.extend(
+            (
+                "COALESCE(geo_assurance_state.active_relation_signature #>> "
+                f"ARRAY[{qualified_name!r}, '0'], '') = "
+                f"COALESCE(to_regclass('{qualified_name}')::oid::bigint, -1)::text",
+                "COALESCE(geo_assurance_state.active_relation_signature #>> "
+                f"ARRAY[{qualified_name!r}, '1'], '') = "
+                "COALESCE(pg_relation_filenode("
+                f"to_regclass('{qualified_name}'))::bigint, -1)::text",
+            )
+        )
+    signature_match_sql = "\n           AND ".join(signature_checks)
     return f"""EXISTS (
         SELECT 1
           FROM {schema_name}.{GEO_ASSURANCE_STATE_TABLE} AS geo_assurance_state
          WHERE geo_assurance_state.singleton IS TRUE
            AND geo_assurance_state.active_geo_assurance_version = {GEO_ASSURANCE_VERSION}
            AND geo_assurance_state.active_table_oid = to_regclass('{live_table}')::oid
-           AND geo_assurance_state.active_relation_signature = (
-               {projection_relation_signature_sql(schema_name)}
-           )
+           AND CASE
+                   WHEN jsonb_typeof(geo_assurance_state.active_relation_signature) = 'object'
+                   THEN jsonb_object_length(geo_assurance_state.active_relation_signature) = {len(_PROJECTION_DEPENDENCIES)}
+                   ELSE FALSE
+               END
+           AND {signature_match_sql}
     )"""
 
 
