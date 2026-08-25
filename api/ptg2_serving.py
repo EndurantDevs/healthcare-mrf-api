@@ -18154,43 +18154,56 @@ async def _search_manifest_serving_table(
         for price_set_id in retained_price_set_ids
     }
     providers_by_set: dict[str, list[dict[str, Any]]] = {}
-    if include_providers and exact_provider_materialization is None:
-        if location_filter_requested:
-            providers_by_set = location_providers_by_set
-        elif candidate_audit_npi is not None:
-            providers_by_set = _candidate_audit_provider_rows_by_set(
-                candidate_npi=candidate_audit_npi,
-                serving_rows=serving_rows,
-            )
-        elif direct_npi_filter_requested and explicit_npi_scope is not None:
-            exact_npi_provider_rows = await _exact_npi_provider_rows_by_set(
-                session,
-                serving_tables,
-                npi=explicit_npi_scope.npi,
-                serving_rows=serving_rows,
-                args=args,
-                snapshot_id=snapshot_id,
-            )
-            if exact_npi_provider_rows is None:
-                return None
-            providers_by_set = exact_npi_provider_rows
-        else:
-            provider_set_ids = [
-                _ptg2_manifest_id(
-                    serving_row.get("provider_set_global_id_128")
-                )
-                for serving_row in serving_rows
-            ]
-            provider_rows_by_set = await _provider_rows_for_sets(
-                session,
-                serving_tables,
-                provider_set_ids,
-                limit_per_set=None,
-                args={**args, "snapshot_id": snapshot_id, "source_key": serving_tables.source_key or args.get("source_key")},
-            )
-            if provider_rows_by_set is None:
-                return None
-            providers_by_set = provider_rows_by_set
+    should_materialize_providers = (
+        include_providers and exact_provider_materialization is None
+    )
+    has_scoped_provider_materialization = (
+        location_filter_requested
+        or candidate_audit_npi is not None
+        or (direct_npi_filter_requested and explicit_npi_scope is not None)
+    )
+    if should_materialize_providers and not has_scoped_provider_materialization:
+        provider_set_ids = [
+            _ptg2_manifest_id(serving_row.get("provider_set_global_id_128"))
+            for serving_row in serving_rows
+        ]
+        provider_rows_by_set = await _provider_rows_for_sets(
+            session,
+            serving_tables,
+            provider_set_ids,
+            limit_per_set=None,
+            args={
+                **args,
+                "snapshot_id": snapshot_id,
+                "source_key": serving_tables.source_key or args.get("source_key"),
+            },
+        )
+        if provider_rows_by_set is None:
+            return None
+        providers_by_set = provider_rows_by_set
+    if should_materialize_providers and location_filter_requested:
+        providers_by_set = location_providers_by_set
+    elif should_materialize_providers and candidate_audit_npi is not None:
+        providers_by_set = _candidate_audit_provider_rows_by_set(
+            candidate_npi=candidate_audit_npi,
+            serving_rows=serving_rows,
+        )
+    elif (
+        should_materialize_providers
+        and direct_npi_filter_requested
+        and explicit_npi_scope is not None
+    ):
+        exact_npi_provider_rows = await _exact_npi_provider_rows_by_set(
+            session,
+            serving_tables,
+            npi=explicit_npi_scope.npi,
+            serving_rows=serving_rows,
+            args=args,
+            snapshot_id=snapshot_id,
+        )
+        if exact_npi_provider_rows is None:
+            return None
+        providers_by_set = exact_npi_provider_rows
     billing_associations_by_set = (
         await _billing_associations_for_exact_npi_request(
             session,
