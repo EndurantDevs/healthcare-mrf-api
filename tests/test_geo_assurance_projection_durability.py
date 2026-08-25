@@ -6,6 +6,8 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from functools import partial
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -68,13 +70,15 @@ async def test_projection_receipt_locks_sources_and_forces_stale_reimports(
         "_entity_address_sql_settings",
         lambda: [("lock_timeout", "1s")],
     )
+    progress = Mock()
+    monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", progress)
     projection_context_by_field: dict = {}
     assert await entity_address_unified._materialize_geo_assurance(
         "fixture",
         "stage",
         force=False,
         context=projection_context_by_field,
-        run_id="",
+        run_id="run-1",
         stage_rows=7,
     ) == 7
 
@@ -90,6 +94,94 @@ async def test_projection_receipt_locks_sources_and_forces_stale_reimports(
         is expected_force
     )
     assert projection_context_by_field["invalid_geo_assurance_rows"] == 0
+    assert [call.kwargs["done"] for call in progress.call_args_list] == [0, 7]
+    assert "row(s)" not in progress.call_args_list[0].kwargs["message"]
+    assert "7 row(s)" in progress.call_args_list[1].kwargs["message"]
+
+
+@pytest.mark.asyncio
+async def test_projection_transaction_settings_preserve_permission_boundary(
+    monkeypatch,
+):
+    class FakeDB:
+        status = AsyncMock(
+            side_effect=(
+                RuntimeError("permission denied to set parameter lock_timeout"),
+                RuntimeError("database unavailable"),
+            )
+        )
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_entity_address_sql_settings",
+        lambda: [("lock_timeout", "1s"), ("work_mem", "1MB")],
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await entity_address_unified._apply_entity_address_transaction_settings()
+
+
+@pytest.mark.asyncio
+async def test_projection_stage_housekeeping_is_fail_closed(monkeypatch):
+    class FakeStage:
+        __tablename__ = "entity_address_unified_stage"
+        __my_additional_indexes__ = [
+            {"name": "npi", "index_elements": ("npi",)},
+        ]
+
+    status = AsyncMock()
+    execute_ddl = AsyncMock()
+    monkeypatch.setattr(
+        entity_address_unified,
+        "db",
+        SimpleNamespace(status=status, execute_ddl=execute_ddl),
+    )
+    assert await entity_address_unified._drop_stage_secondary_indexes(
+        FakeStage,
+        "fixture",
+    ) == 1
+    assert "DROP INDEX IF EXISTS fixture." in status.await_args.args[0]
+
+    persistence = AsyncMock(side_effect=(None, "u", "p"))
+    promote = AsyncMock()
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_stage_table_persistence",
+        persistence,
+    )
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_ensure_promoted_stage_logged",
+        promote,
+    )
+    with pytest.raises(RuntimeError, match="does not exist"):
+        await entity_address_unified._compact_geo_assurance_stage(
+            "fixture",
+            "entity_address_unified_stage",
+        )
+    assert (
+        await entity_address_unified._compact_geo_assurance_stage(
+            "fixture",
+            "entity_address_unified_stage",
+        )
+        == "set_logged"
+    )
+    assert (
+        await entity_address_unified._compact_geo_assurance_stage(
+            "fixture",
+            "entity_address_unified_stage",
+        )
+        == "vacuum_full"
+    )
+    promote.assert_awaited_once_with("fixture", "entity_address_unified_stage")
+    execute_ddl.assert_awaited_once_with(
+        "VACUUM (FULL, ANALYZE) fixture.entity_address_unified_stage;"
+    )
 
 
 async def _activate_projection_state(database, schema: str, projected_rows: int) -> None:

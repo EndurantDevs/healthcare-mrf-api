@@ -105,6 +105,13 @@ def test_runtime_uses_projection_and_falls_back_to_exact_legacy_predicates():
     assert "tiger.zcta5" in location_sql
 
 
+def test_projection_rejects_missing_or_unsafe_schema_names():
+    with pytest.raises(ValueError, match="schema_name is required"):
+        provider_address_point_coherence_sql("addr")
+    with pytest.raises(ValueError, match="simple PostgreSQL identifier"):
+        projection.projection_relation_signature_sql("tenant.data")
+
+
 def test_migration_adds_nullable_metadata_and_generation_state(monkeypatch):
     migration = _load_migration()
     statements: list[str] = []
