@@ -3246,8 +3246,8 @@ async def _assert_proof_ready_requires_attestation(
     projection_proof,
 ) -> None:
     with pytest.raises(
-        ProviderDirectoryProjectionError,
-        match="provider_directory_projection_action_invalid",
+        DBAPIError,
+        match="provider_directory_projection_native_attestation_required",
     ):
         await _mark_projection_proof_ready(
             database, schema, lease, projection_proof

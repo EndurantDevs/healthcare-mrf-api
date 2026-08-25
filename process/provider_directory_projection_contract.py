@@ -67,6 +67,9 @@ PROJECTION_COMPLETENESS_CONTRACT_ID = (
 PROJECTION_REDUCER_PROOF_CONTRACT_ID = (
     "healthporta.provider-directory.projection-reducer.v1"
 )
+PROJECTION_WINNER_POLICY_CONTRACT_ID = (
+    "healthporta.provider-directory.minimum-source-rank-payload-hash-winner.v1"
+)
 _COMPLETENESS_FIELDS = frozenset(
     {
         "block_count",
@@ -2003,6 +2006,8 @@ def _validated_reducer_proof_map(
         len(reducer_resource_count_by_type) != len(raw_resource_count_by_type)
         or reducer_proof.get("contract_id")
         != PROJECTION_REDUCER_PROOF_CONTRACT_ID
+        or reducer_proof.get("winner_policy_contract_id")
+        != PROJECTION_WINNER_POLICY_CONTRACT_ID
         or required_hash(
             reducer_proof.get("canonical_row_sha256"),
             "reducer_canonical_row_sha256",
@@ -2057,6 +2062,7 @@ def projection_reducer_proof(
         )
     return {
         "contract_id": PROJECTION_REDUCER_PROOF_CONTRACT_ID,
+        "winner_policy_contract_id": PROJECTION_WINNER_POLICY_CONTRACT_ID,
         "canonical_row_sha256": validated_outcome.canonical_row_sha256,
         "resource_count": validated_outcome.resource_count,
         "resource_counts": dict(sorted(normalized_count_by_resource.items())),

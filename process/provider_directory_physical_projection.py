@@ -2,9 +2,7 @@
 
 """Public contracts, leased worksets, and native physical materialization.
 
-Publication remains a later slice. Candidate row reducers, semantic summaries,
-and physical-output envelopes remain in their owning internal modules: none of
-them is native retained-byte attestation or a publish gate.
+Source-visible publication remains a later slice.
 """
 
 from process.provider_directory_projection_admission import (
@@ -25,6 +23,7 @@ from process.provider_directory_projection_contract import (
     validated_physical_projection_recipe_identity,
     validated_projection_recipe_identity,
 )
+from process.provider_directory_projection_finalizer import finalize_projection
 from process.provider_directory_projection_lease import (
     claim_projection_recipe,
     heartbeat_projection_lease,
@@ -85,6 +84,7 @@ __all__ = [
     "ProviderDirectoryProjectionLeaseLost",
     "claim_projection_recipe",
     "claim_projection_shard",
+    "finalize_projection",
     "heartbeat_projection_lease",
     "heartbeat_projection_shard",
     "materialize_projection_shards",
