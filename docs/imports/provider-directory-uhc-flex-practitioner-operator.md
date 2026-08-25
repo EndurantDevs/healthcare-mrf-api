@@ -70,7 +70,7 @@ official cohort before work and again before admission. Both complete roots
 must have zero errors and identical terminal hashes and resource counts. A
 successful receipt is only admission evidence; it does not publish a dataset.
 
-Optional bounded controls are `--concurrency` (1-16, default 4),
+Optional bounded controls are `--concurrency` (1-32, default 4),
 `--max-attempts` (1-8, default 3), `--lease-seconds` (30-3600, default 300),
 `--retry-base-seconds` (greater than zero and at most 60, default 1), and
 `--max-retry-seconds` (greater than zero and at most 60, default 60). The

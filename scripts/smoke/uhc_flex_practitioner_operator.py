@@ -103,7 +103,7 @@ def _bounded_integer(raw_value: str, minimum: int, maximum: int) -> int:
 
 
 def _concurrency(raw_value: str) -> int:
-    return _bounded_integer(raw_value, 1, 16)
+    return _bounded_integer(raw_value, 1, 32)
 
 
 def _max_attempts(raw_value: str) -> int:
