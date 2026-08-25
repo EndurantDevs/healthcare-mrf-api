@@ -36,6 +36,7 @@ from process.ptg_parts.ptg2_v4_finalizer_maps import (
     PTG2_V4_FINALIZER_MAP_TARGET_TABLE,
     PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
     PTG2_V4_FINALIZER_PACKED_OBJECT_KIND_SET,
+    _has_finalizer_map_tables,
     _load_target_metadata,
 )
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
@@ -61,11 +62,14 @@ class _PackedTotals:
 async def load_packed_finalizer_root(
     session: Any,
     *,
-    schema: str,
+    schema_name: str,
     snapshot_key: int,
 ) -> dict[str, Any] | None:
     """Return the explicit packed root, or ``None`` for a legacy layout."""
 
+    if not await _has_finalizer_map_tables(session, schema_name=schema_name):
+        return None
+    schema = _quote_ident(schema_name)
     query_result = await session.execute(
         text(
             f"""

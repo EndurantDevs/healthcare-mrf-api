@@ -216,6 +216,7 @@ async def _assert_new_layout_seal(monkeypatch, expected_summary):
         _Result(scalar=17),
         _Result(),
         _Result(scalar=17),
+        _Result(rows=({},)),
     )
     sealed = await snapshot_maps.seal_v4_shared_layout(
         new_session,
@@ -349,6 +350,7 @@ async def _assert_reused_layout_seal(
         _Result(rows=(reusable_layout_by_field,)),
         _Result(),
         _Result(scalar=17),
+        _Result(rows=({},)),
     )
     reused = await snapshot_maps.seal_v4_shared_layout(
         reused_session,

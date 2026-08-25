@@ -21,6 +21,8 @@ from tests.test_ptg2_partitioned_candidate_audit_api import (
 
 @pytest.mark.asyncio
 async def test_partition_accepts_complete_direct_prefix_manifest(monkeypatch):
+    """Accept direct V4 evidence with an explicit legacy finalizer layout."""
+
     audit_request = _request()
     serving_index = strict_direct_v4_serving_index()
     candidate_row = strict_candidate_row(
@@ -28,13 +30,7 @@ async def test_partition_accepts_complete_direct_prefix_manifest(monkeypatch):
         snapshot_plan_id="12-3456789",
     )
     candidate_row["candidate_serving_index"]["source_key"] = "test-source"
-    session = FakeSession(
-        [
-            None,
-            candidate_row,
-            strict_v4_root_row(serving_index),
-        ]
-    )
+    session = FakeSession([None, candidate_row, strict_v4_root_row(serving_index), {}])
     binding_validator = AsyncMock()
     monkeypatch.setattr(
         candidate_partition,
@@ -76,6 +72,7 @@ async def test_partition_accepts_complete_direct_prefix_manifest(monkeypatch):
 
     assert audit_result.matched_challenge_count == 1
     assert audit_result.validated_persisted_audit_occurrence_count == 1
-    assert len(session.calls) == 3
+    assert len(session.calls) == 4
+    assert "to_regclass" in str(session.calls[-1][0][0])
     binding_validator.assert_awaited_once()
     data_loader.assert_awaited_once()

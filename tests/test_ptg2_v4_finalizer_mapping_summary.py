@@ -10,6 +10,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
     SharedBlockReference,
     shared_block_hash,
     shared_mapping_digest,
+    summarize_native_v4_finalizer_mappings,
     summarize_shared_snapshot_mappings,
 )
 from process.ptg_parts.ptg2_shared_snapshot_publish import (
@@ -36,6 +37,11 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
 
 _COPY_HEADER = b"PGCOPY\n\xff\r\n\0" + struct.pack(">II", 0, 0)
 _PRICE_KINDS = ("price_atoms_v3", "price_set_atom_memberships_v3")
+_FINALIZER_TABLES = (
+    "ptg2_v4_finalizer_map_root",
+    "ptg2_v4_finalizer_map_pack",
+    "ptg2_v4_finalizer_map_target",
+)
 
 
 class _Rows:
@@ -44,6 +50,29 @@ class _Rows:
 
     def __iter__(self):
         return iter(self.rows)
+
+
+def _fixture_query_result(fixture, sql, parameters_by_name):
+    if "GROUP BY mapping.object_kind" in sql:
+        return _Rows(fixture["aggregates"])
+    if "to_regclass" in sql:
+        present = fixture.get("finalizer_tables_present", True)
+        return _Rows(({table: present for table in _FINALIZER_TABLES},))
+    if "ptg2_v4_finalizer_map_root AS root" in sql:
+        return _Rows((fixture["root"],))
+    if "ptg2_v4_finalizer_map_pack\" AS pack" in sql:
+        if int(parameters_by_name["after_pack_no"]) >= 0:
+            return _Rows()
+        return _Rows((fixture["packs"][parameters_by_name["object_kind"]],))
+    if "block_hashes" in parameters_by_name:
+        return _Rows(
+            fixture["targets"][bytes(block_hash)]
+            for block_hash in parameters_by_name["block_hashes"]
+        )
+    if "COUNT(*) AS target_count" in sql:
+        target_count = len(fixture["targets"])
+        return _Rows(({"target_count": target_count, "valid_target_count": target_count},))
+    raise AssertionError(f"unexpected SQL: {sql}")
 
 
 class _Driver:
@@ -77,29 +106,7 @@ class _Session:
         sql = str(statement)
         parameters_by_name = dict(params or {})
         self.calls.append((sql, parameters_by_name))
-        if "GROUP BY mapping.object_kind" in sql:
-            return _Rows(self.fixture["aggregates"])
-        if "ptg2_v4_finalizer_map_root AS root" in sql:
-            return _Rows((self.fixture["root"],))
-        if "ptg2_v4_finalizer_map_pack\" AS pack" in sql:
-            if int(parameters_by_name["after_pack_no"]) >= 0:
-                return _Rows()
-            return _Rows(
-                (
-                    self.fixture["packs"][parameters_by_name["object_kind"]],
-                )
-            )
-        if "block_hashes" in parameters_by_name:
-            return _Rows(
-                self.fixture["targets"][bytes(block_hash)]
-                for block_hash in parameters_by_name["block_hashes"]
-            )
-        if "COUNT(*) AS target_count" in sql:
-            target_count = len(self.fixture["targets"])
-            return _Rows(
-                ({"target_count": target_count, "valid_target_count": target_count},)
-            )
-        raise AssertionError(f"unexpected SQL: {sql}")
+        return _fixture_query_result(self.fixture, sql, parameters_by_name)
 
 
 def _mapping_record(reference):
@@ -304,6 +311,28 @@ async def test_hybrid_mapping_summary_matches_canonical_v3_digest_in_bounded_bat
     pack_calls = [call for call in session.calls if "finalizer_map_pack\" AS pack" in call[0]]
     assert len(pack_calls) == len(PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS)
     assert all(call[1]["batch_rows"] == 256 for call in pack_calls)
+
+
+@pytest.mark.asyncio
+async def test_legacy_mapping_summary_skips_absent_packed_storage():
+    fixture = _fixture()
+    fixture["finalizer_tables_present"] = False
+    session = _Session(fixture)
+
+    summary = await summarize_shared_snapshot_mappings(
+        session,
+        schema_name="mrf",
+        snapshot_key=41,
+    )
+
+    assert summary.mapping_digest == shared_mapping_digest(fixture["price_references"])
+    assert all("finalizer_map_root AS root" not in sql for sql, _params in session.calls)
+    with pytest.raises(RuntimeError, match="native root is missing"):
+        await summarize_native_v4_finalizer_mappings(
+            _Session(fixture),
+            schema_name="mrf",
+            snapshot_key=41,
+        )
 
 
 @pytest.mark.asyncio

@@ -308,7 +308,7 @@ class ArtifactFileReceipt:
     def as_dict(self, root: Path) -> dict[str, Any]:
         """Return a root-relative immutable file receipt."""
         return {
-            "path": str(self.path.relative_to(root)),
+            "path": str(self.path.relative_to(root.resolve())),
             "byte_count": self.byte_count,
             "row_count": self.row_count,
             "stored_payload_bytes": self.stored_payload_bytes,

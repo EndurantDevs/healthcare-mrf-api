@@ -816,7 +816,7 @@ async def summarize_shared_snapshot_mappings(
 
     packed_root = await load_packed_finalizer_root(
         session,
-        schema=schema,
+        schema_name=schema_name,
         snapshot_key=int(snapshot_key),
     )
     if packed_root is not None:
@@ -859,7 +859,7 @@ async def summarize_native_v4_finalizer_mappings(
 
     packed_root = await load_packed_finalizer_root(
         session,
-        schema=schema,
+        schema_name=schema_name,
         snapshot_key=int(snapshot_key),
     )
     if packed_root is None:

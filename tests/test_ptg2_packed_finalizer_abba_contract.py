@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -14,6 +15,7 @@ from process.ptg_parts.ptg2_shared_block_copy import scan_shared_block_copy
 from scripts.research.ptg2_packed_finalizer_abba_contract import (
     ALL_OBJECT_KINDS,
     ARTIFACT_CONTRACT,
+    ArtifactFileReceipt,
     BenchmarkShape,
     CANONICAL_FIELDS,
     PRICE_OBJECT_KINDS,
@@ -139,6 +141,25 @@ def test_representative_artifacts_reject_self_attested_promotion(tmp_path):
     artifacts.cleanup()
 
 
+def test_artifact_receipt_serializes_beneath_symlinked_root(tmp_path):
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    linked_root = tmp_path / "linked"
+    linked_root.symlink_to(real_root, target_is_directory=True)
+    artifact_path = real_root / "lane.copy"
+    artifact_path.write_bytes(b"x")
+
+    receipt = ArtifactFileReceipt(
+        path=artifact_path.resolve(),
+        byte_count=1,
+        row_count=1,
+        stored_payload_bytes=1,
+        sha256=hashlib.sha256(b"x").hexdigest(),
+    )
+
+    assert receipt.as_dict(linked_root)["path"] == "lane.copy"
+
+
 @pytest.mark.asyncio
 async def test_abba_coordinator_records_failure_and_cleans_root(monkeypatch, tmp_path):
     root = tmp_path / "run"
@@ -167,9 +188,24 @@ async def test_abba_coordinator_records_failure_and_cleans_root(monkeypatch, tmp
     disconnect = AsyncMock()
     monkeypatch.setattr(abba.db, "disconnect", disconnect)
 
-    receipt, exit_code = await abba._run_abba(
-        SimpleNamespace(artifacts=None, source_receipt=None, shape=None)
+    database_environment_names = (
+        "HLTHPRT_DB_DRIVER",
+        "HLTHPRT_DB_HOST",
+        "HLTHPRT_DB_PORT",
+        "HLTHPRT_DB_USER",
+        "HLTHPRT_DB_PASSWORD",
+        "HLTHPRT_DB_DATABASE",
+        "HLTHPRT_DB_POOL_MIN_SIZE",
+        "HLTHPRT_DB_POOL_MAX_SIZE",
     )
+    original_port = os.environ.get("HLTHPRT_DB_PORT")
+    with monkeypatch.context() as database_environment:
+        for name in database_environment_names:
+            database_environment.setenv(name, os.environ.get(name, ""))
+        receipt, exit_code = await abba._run_abba(
+            SimpleNamespace(artifacts=None, source_receipt=None, shape=None)
+        )
+    assert os.environ.get("HLTHPRT_DB_PORT") == original_port
 
     assert exit_code == 1
     assert receipt["status"] == "failed"

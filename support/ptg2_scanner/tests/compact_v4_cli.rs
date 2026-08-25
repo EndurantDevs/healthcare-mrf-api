@@ -79,31 +79,74 @@ fn append_pg_binary_field(payload: &mut Vec<u8>, field: &[u8]) {
     payload.extend_from_slice(field);
 }
 
-fn replace_first_pg_binary_field(copy: &mut Vec<u8>, field_index: usize, value: Option<&[u8]>) {
-    let mut cursor = 21usize;
-    for index in 0..=field_index {
-        let field_length = i32::from_be_bytes(copy[cursor..cursor + 4].try_into().unwrap());
-        let field_end = cursor
-            + 4
-            + if field_length < 0 {
-                0
-            } else {
-                field_length as usize
-            };
-        if index == field_index {
-            let replacement = value.map_or_else(
-                || (-1i32).to_be_bytes().to_vec(),
-                |field| {
-                    let mut replacement = (field.len() as i32).to_be_bytes().to_vec();
-                    replacement.extend_from_slice(field);
-                    replacement
-                },
-            );
-            copy.splice(cursor..field_end, replacement);
-            return;
+fn replace_pg_binary_field(
+    copy: &mut Vec<u8>,
+    row_index: usize,
+    field_index: usize,
+    value: Option<&[u8]>,
+) {
+    let mut cursor = 19usize;
+    for row in 0..=row_index {
+        let field_count = i16::from_be_bytes(copy[cursor..cursor + 2].try_into().unwrap());
+        assert_eq!(field_count, 10);
+        cursor += 2;
+        for field in 0..field_count as usize {
+            let field_length = i32::from_be_bytes(copy[cursor..cursor + 4].try_into().unwrap());
+            let field_end = cursor
+                + 4
+                + if field_length < 0 {
+                    0
+                } else {
+                    field_length as usize
+                };
+            if row == row_index && field == field_index {
+                let replacement = value.map_or_else(
+                    || (-1i32).to_be_bytes().to_vec(),
+                    |field| {
+                        let mut replacement = (field.len() as i32).to_be_bytes().to_vec();
+                        replacement.extend_from_slice(field);
+                        replacement
+                    },
+                );
+                copy.splice(cursor..field_end, replacement);
+                return;
+            }
+            cursor = field_end;
         }
-        cursor = field_end;
     }
+    panic!("PostgreSQL binary COPY field is unavailable");
+}
+
+fn duplicate_only_pg_binary_row(copy: &mut Vec<u8>) {
+    let row = copy[19..copy.len() - 2].to_vec();
+    let trailer = copy.len() - 2;
+    copy.splice(trailer..trailer, row);
+}
+
+fn rewrite_v4_finalizer_lane(manifest: &mut Value, lane_index: usize, copy: &[u8]) {
+    let path = PathBuf::from(manifest["lanes"][lane_index]["path"].as_str().unwrap());
+    fs::write(path, copy).unwrap();
+    manifest["lanes"][lane_index]["byte_count"] = json!(copy.len());
+    manifest["lanes"][lane_index]["sha256"] = json!(sha256_hex(copy));
+}
+
+fn assert_v4_finalizer_failure(root: &Path, completed: &Output, expected: &str) {
+    assert!(!completed.status.success());
+    assert!(
+        String::from_utf8_lossy(&completed.stderr).contains(expected),
+        "expected {expected:?}, stderr: {}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    assert!(!root.join("packed").exists());
+    assert!(fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .all(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".ptg2-finalizer-")
+        }));
 }
 
 fn v4_finalizer_shared_block_hash(object_kind: &str, payload: &[u8]) -> [u8; 32] {
@@ -750,7 +793,7 @@ fn packed_finalizer_cli_rejects_copy_wire_drift() {
         let (manifest_path, mut manifest) = write_v4_finalizer_pack_manifest(&root);
         let price_path = PathBuf::from(manifest["lanes"][0]["path"].as_str().unwrap());
         let mut copy = fs::read(&price_path).unwrap();
-        replace_first_pg_binary_field(&mut copy, field_index, replacement.as_deref());
+        replace_pg_binary_field(&mut copy, 0, field_index, replacement.as_deref());
         fs::write(&price_path, &copy).unwrap();
         manifest["lanes"][0]["byte_count"] = json!(copy.len());
         manifest["lanes"][0]["sha256"] = json!(sha256_hex(&copy));
@@ -771,6 +814,113 @@ fn packed_finalizer_cli_rejects_copy_wire_drift() {
         .expect("run identity-capped V4 finalizer pack CLI");
     assert!(!capped.status.success());
     assert!(!capped_root.join("packed").exists());
+}
+
+#[test]
+fn packed_finalizer_cli_rejects_semantic_drift_without_residue() {
+    let temporary = tempfile::tempdir().expect("temporary semantic-drift root");
+
+    for (name, digest) in [("sha-high", "G".repeat(64)), ("sha-low", "0G".repeat(32))] {
+        let root = temporary.path().join(name);
+        let (manifest_path, mut manifest) = write_v4_finalizer_pack_manifest(&root);
+        manifest["lanes"][0]["sha256"] = json!(digest);
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let completed = run_v4_finalizer_pack(&root, &manifest_path);
+        assert_v4_finalizer_failure(&root, &completed, "must be lowercase sha256 hex");
+    }
+
+    let root = temporary.path().join("wrong-lane-kind");
+    let (manifest_path, mut manifest) = write_v4_finalizer_pack_manifest(&root);
+    let mut copy = fs::read(manifest["lanes"][0]["path"].as_str().unwrap()).unwrap();
+    replace_pg_binary_field(&mut copy, 0, 2, Some(b"by_code_price_page_v4"));
+    replace_pg_binary_field(
+        &mut copy,
+        0,
+        0,
+        Some(&v4_finalizer_shared_block_hash(
+            "by_code_price_page_v4",
+            &[1],
+        )),
+    );
+    rewrite_v4_finalizer_lane(&mut manifest, 0, &copy);
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let completed = run_v4_finalizer_pack(&root, &manifest_path);
+    assert_v4_finalizer_failure(&root, &completed, "contains unsupported object kind");
+
+    let root = temporary.path().join("duplicate-coordinate");
+    let (manifest_path, mut manifest) = write_v4_finalizer_pack_manifest(&root);
+    let mut copy = fs::read(manifest["lanes"][0]["path"].as_str().unwrap()).unwrap();
+    duplicate_only_pg_binary_row(&mut copy);
+    rewrite_v4_finalizer_lane(&mut manifest, 0, &copy);
+    manifest["lanes"][0]["row_count"] = json!(2);
+    manifest["lanes"][0]["stored_payload_bytes"] = json!(2);
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let completed = run_v4_finalizer_pack(&root, &manifest_path);
+    assert_v4_finalizer_failure(&root, &completed, "coordinates are not strictly ordered");
+
+    let root = temporary.path().join("conflicting-metadata");
+    let (manifest_path, mut manifest) = write_v4_finalizer_pack_manifest(&root);
+    let mut copy = fs::read(manifest["lanes"][0]["path"].as_str().unwrap()).unwrap();
+    duplicate_only_pg_binary_row(&mut copy);
+    replace_pg_binary_field(&mut copy, 1, 3, Some(&1i64.to_be_bytes()));
+    replace_pg_binary_field(&mut copy, 1, 5, Some(&2i64.to_be_bytes()));
+    rewrite_v4_finalizer_lane(&mut manifest, 0, &copy);
+    manifest["lanes"][0]["row_count"] = json!(2);
+    manifest["lanes"][0]["stored_payload_bytes"] = json!(2);
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let completed = run_v4_finalizer_pack(&root, &manifest_path);
+    assert_v4_finalizer_failure(&root, &completed, "duplicate hash has conflicting metadata");
+
+    let root = temporary.path().join("post-manifest-drift");
+    let (manifest_path, manifest) = write_v4_finalizer_pack_manifest(&root);
+    let price_path = PathBuf::from(manifest["lanes"][0]["path"].as_str().unwrap());
+    let mut copy = fs::read(&price_path).unwrap();
+    replace_pg_binary_field(&mut copy, 0, 9, Some(&[2]));
+    fs::write(price_path, copy).unwrap();
+    let completed = run_v4_finalizer_pack(&root, &manifest_path);
+    assert_v4_finalizer_failure(&root, &completed, "source content changed");
+
+    let root = temporary.path().join("missing-required-kind");
+    let (manifest_path, mut manifest) = write_v4_finalizer_pack_manifest(&root);
+    let required_kinds = manifest["lanes"][1]["object_kinds"].clone();
+    let mut serving_lane = write_v4_finalizer_pack_lane(
+        &root,
+        "serving",
+        &[
+            "by_code_price_page_v4",
+            "by_code_provider_shard_v1",
+            "provider_set_codes_v3",
+            "provider_set_count_dictionary",
+        ],
+    );
+    serving_lane["object_kinds"] = required_kinds;
+    manifest["lanes"][1] = serving_lane;
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let completed = run_v4_finalizer_pack(&root, &manifest_path);
+    assert_v4_finalizer_failure(
+        &root,
+        &completed,
+        "does not contain every required object kind",
+    );
+
+    let root = temporary.path().join("pre-existing-output");
+    let (manifest_path, _) = write_v4_finalizer_pack_manifest(&root);
+    let output = root.join("packed");
+    fs::create_dir(&output).unwrap();
+    fs::write(output.join("sentinel"), b"preserve").unwrap();
+    let completed = run_v4_finalizer_pack(&root, &manifest_path);
+    assert!(!completed.status.success());
+    assert!(String::from_utf8_lossy(&completed.stderr).contains("output already exists"));
+    assert_eq!(fs::read(output.join("sentinel")).unwrap(), b"preserve");
+    assert!(fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .all(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".ptg2-finalizer-")
+        }));
 }
 
 #[test]
