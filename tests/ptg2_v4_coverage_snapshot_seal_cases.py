@@ -268,6 +268,10 @@ def _install_new_layout_seal_mocks(monkeypatch, expected_summary) -> None:
         AsyncMock(),
     )
     monkeypatch.setattr(
+        "process.ptg_parts.ptg2_v4_finalizer_maps._has_finalizer_map_tables",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
         snapshot_maps,
         "publish_layout_fingerprint",
         AsyncMock(
