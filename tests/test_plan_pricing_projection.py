@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
-import importlib.util
 from decimal import Decimal
-from pathlib import Path
 from types import SimpleNamespace
 
 import orjson
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 from api import control_imports, control_workers
 from api import plan_pricing_projection as projection
 from api import plan_pricing_projection_materialize as projection_materialize
 from api import plan_pricing_projection_source as projection_source
 from api.plan_release_serving import PlanReleaseServingSelection
+from tests.provider_directory_profile_capacity_v2_migration_support import (
+    load_capacity_v2_migration,
+)
 
 
 PROJECTION_ID = "a" * 64
@@ -79,16 +82,58 @@ def _selection(*, projection_id=PROJECTION_ID):
     )
 
 
+def _install_project_code_sources(monkeypatch):
+    from api import ptg2_serving as serving
+
+    async def _serving_rows(*_args, **_kwargs):
+        return [
+            {
+                "price_set_global_id_128": "price-set",
+                "price_key": 7,
+                "provider_set_global_id_128": "provider-set",
+            }
+        ]
+
+    async def _prices(*_args, **_kwargs):
+        return {"price-set": ({"negotiated_rate": "42.50"},)}
+
+    async def _npis(*_args, **_kwargs):
+        return {"provider-set": (1234567890,)}
+
+    async def _providers(*_args, **_kwargs):
+        return {
+            1234567890: (
+                {
+                    "npi": 1234567890,
+                    "provider_name": "Synthetic Provider",
+                    "taxonomy_codes": (),
+                    "classifications": (),
+                    "zip5": "62401",
+                },
+            )
+        }
+
+    monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", _serving_rows)
+    monkeypatch.setattr(serving, "_prices_for_price_sets", _prices)
+    monkeypatch.setattr(serving, "_provider_npis_for_sets", _npis)
+    monkeypatch.setattr(serving, "_ptg2_manifest_id", str)
+    monkeypatch.setattr(
+        projection_materialize,
+        "projection_provider_rows_for_npis",
+        _providers,
+    )
+
+
 def test_projection_build_uses_existing_durable_single_job_worker():
     contract = next(
-        item
-        for item in control_imports.importer_registry()
-        if item["name"] == "plan-pricing-projection"
+        importer_contract
+        for importer_contract in control_imports.importer_registry()
+        if importer_contract["name"] == "plan-pricing-projection"
     )
     adapter = control_imports._SINGLE_JOB_ADAPTERS[
         "plan-pricing-projection"
     ]
-    payload = control_imports._adapter_payload(
+    worker_payload = control_imports._adapter_payload(
         adapter,
         {
             "run_id": "run_projection",
@@ -107,10 +152,10 @@ def test_projection_build_uses_existing_durable_single_job_worker():
         "string",
         "array",
     ]
-    assert payload["target_module"] == "api.plan_pricing_projection"
-    assert payload["target_function"] == "build_plan_pricing_projection"
-    assert payload["call_style"] == "kwargs"
-    assert payload["task"]["bindings"] == [{"snapshot_id": "synthetic"}]
+    assert worker_payload["target_module"] == "api.plan_pricing_projection"
+    assert worker_payload["target_function"] == "build_plan_pricing_projection"
+    assert worker_payload["call_style"] == "kwargs"
+    assert worker_payload["task"]["bindings"] == [{"snapshot_id": "synthetic"}]
     worker = control_workers._BY_IMPORTER_ROLE[
         ("plan-pricing-projection", "start")
     ]
@@ -125,7 +170,7 @@ def test_projection_build_uses_existing_durable_single_job_worker():
 
 
 def test_card_and_aggregate_fragments_are_fixed_and_distinct():
-    provider = {
+    provider_dict = {
         "npi": 1234567890,
         "provider_name": "Synthetic Provider",
         "entity_type_code": 1,
@@ -141,7 +186,7 @@ def test_card_and_aggregate_fragments_are_fixed_and_distinct():
     card = orjson.loads(
         projection._card_fragment(
             projection._CardStats(
-                provider,
+                provider_dict,
                 Decimal("10.25"),
                 Decimal("14.75"),
                 3,
@@ -212,49 +257,7 @@ def test_ruled_numeric_cpt_and_hcpcs_share_fail_closed_taxonomy_eligibility():
 
 @pytest.mark.asyncio
 async def test_project_code_card_insert_matches_its_bound_row(monkeypatch):
-    from api import ptg2_serving as serving
-
-    async def _serving_rows(*_args, **_kwargs):
-        return [
-            {
-                "price_set_global_id_128": "price-set",
-                "price_key": 7,
-                "provider_set_global_id_128": "provider-set",
-            }
-        ]
-
-    async def _prices(*_args, **_kwargs):
-        return {"price-set": ({"negotiated_rate": "42.50"},)}
-
-    async def _npis(*_args, **_kwargs):
-        return {"provider-set": (1234567890,)}
-
-    async def _providers(*_args, **_kwargs):
-        return {
-            1234567890: (
-                {
-                    "npi": 1234567890,
-                    "provider_name": "Synthetic Provider",
-                    "taxonomy_codes": (),
-                    "classifications": (),
-                    "zip5": "62401",
-                },
-            )
-        }
-
-    monkeypatch.setattr(
-        serving,
-        "_merge_manifest_code_variant_rows",
-        _serving_rows,
-    )
-    monkeypatch.setattr(serving, "_prices_for_price_sets", _prices)
-    monkeypatch.setattr(serving, "_provider_npis_for_sets", _npis)
-    monkeypatch.setattr(serving, "_ptg2_manifest_id", str)
-    monkeypatch.setattr(
-        projection_materialize,
-        "projection_provider_rows_for_npis",
-        _providers,
-    )
+    _install_project_code_sources(monkeypatch)
     session = _Session([])
     binding = projection._BindingProjection(
         binding={},
@@ -308,7 +311,7 @@ def test_projection_result_type_is_explicit_card_only(args, expected):
 
 @pytest.mark.asyncio
 async def test_provider_signature_checks_relations_without_rejecting_strings():
-    signature = {
+    signature_dict = {
         "npi": [1, 11],
         "taxonomy": [2, 12],
         "vocabulary": [3, 13],
@@ -319,17 +322,17 @@ async def test_provider_signature_checks_relations_without_rejecting_strings():
     }
 
     result = await projection._provider_signature(
-        _ScalarSession(orjson.dumps(signature).decode())
+        _ScalarSession(orjson.dumps(signature_dict).decode())
     )
 
     assert result == projection.hashlib.sha256(
-        projection._canonical_json(signature).encode()
+        projection._canonical_json(signature_dict).encode()
     ).hexdigest()
 
-    signature["zip"] = [None, None]
+    signature_dict["zip"] = [None, None]
     with pytest.raises(ValueError, match="relations are incomplete"):
         await projection._provider_signature(
-            _ScalarSession(orjson.dumps(signature).decode())
+            _ScalarSession(orjson.dumps(signature_dict).decode())
         )
 
 
@@ -354,13 +357,13 @@ async def test_provider_generation_is_repeatable_and_locked_before_signature():
 async def test_binding_projection_uses_release_market_type(monkeypatch):
     from api import ptg2_serving as serving
 
-    seen = {}
+    scope_kwargs_dict = {}
 
     async def _tables(_session, _snapshot_id):
         return SimpleNamespace(network_names=[])
 
     def _scope(_tables, **kwargs):
-        seen.update(kwargs)
+        scope_kwargs_dict.update(kwargs)
         return "", ["TRUE"], {}, "code_metadata.code_key"
 
     monkeypatch.setattr(projection_source, "snapshot_serving_tables", _tables)
@@ -379,7 +382,48 @@ async def test_binding_projection_uses_release_market_type(monkeypatch):
         },
     )
 
-    assert seen["plan_market_type"] == "individual"
+    assert scope_kwargs_dict["plan_market_type"] == "individual"
+
+
+def _binding_code_rows():
+    return [
+        {
+            "code_key": 1,
+            "plan_id": "plan",
+            "plan_market_type": "group",
+            "reported_code_system": "HCPCS",
+            "reported_code": "G0439",
+            "negotiation_arrangement": "ffs",
+            "billing_code_type_version": "2026",
+            "source_name": None,
+            "source_description": None,
+            "rate_count": 1,
+        },
+        {
+            "code_key": 2,
+            "plan_id": "plan",
+            "plan_market_type": "group",
+            "reported_code_system": "HCPCS",
+            "reported_code": "27447",
+            "negotiation_arrangement": "ffs",
+            "billing_code_type_version": "2026",
+            "source_name": None,
+            "source_description": None,
+            "rate_count": 1,
+        },
+        {
+            "code_key": 3,
+            "plan_id": "plan",
+            "plan_market_type": "group",
+            "reported_code_system": "CPT",
+            "reported_code": "27447",
+            "negotiation_arrangement": "ffs",
+            "billing_code_type_version": "2026",
+            "source_name": None,
+            "source_description": None,
+            "rate_count": 1,
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -405,46 +449,7 @@ async def test_binding_projection_groups_numeric_cpt_hcpcs_but_keeps_g_code(
     )
     monkeypatch.setattr(serving, "_required_shared_snapshot_key", lambda _tables: 1)
     monkeypatch.setattr(serving, "_shared_v3_code_table", lambda: "code_table")
-    session = _Session(
-        [
-            {
-                "code_key": 1,
-                "plan_id": "plan",
-                "plan_market_type": "group",
-                "reported_code_system": "HCPCS",
-                "reported_code": "G0439",
-                "negotiation_arrangement": "ffs",
-                "billing_code_type_version": "2026",
-                "source_name": None,
-                "source_description": None,
-                "rate_count": 1,
-            },
-            {
-                "code_key": 2,
-                "plan_id": "plan",
-                "plan_market_type": "group",
-                "reported_code_system": "HCPCS",
-                "reported_code": "27447",
-                "negotiation_arrangement": "ffs",
-                "billing_code_type_version": "2026",
-                "source_name": None,
-                "source_description": None,
-                "rate_count": 1,
-            },
-            {
-                "code_key": 3,
-                "plan_id": "plan",
-                "plan_market_type": "group",
-                "reported_code_system": "CPT",
-                "reported_code": "27447",
-                "negotiation_arrangement": "ffs",
-                "billing_code_type_version": "2026",
-                "source_name": None,
-                "source_description": None,
-                "rate_count": 1,
-            },
-        ]
-    )
+    session = _Session(_binding_code_rows())
 
     built = await projection._binding_projection(
         session,
@@ -460,371 +465,20 @@ async def test_binding_projection_groups_numeric_cpt_hcpcs_but_keeps_g_code(
         ("HCPCS", "G0439"),
     }
     assert [
-        row["code_key"]
-        for row in built.code_rows_by_identity[("CPT", "27447")]
+        code_row["code_key"]
+        for code_row in built.code_rows_by_identity[("CPT", "27447")]
     ] == [2, 3]
 
 
-@pytest.mark.asyncio
-async def test_provider_projection_keeps_one_address_per_npi_and_zip():
-    provider_rows = [
-        {
-            "npi": 1234567890,
-            "provider_name": "Synthetic Provider",
-            "entity_type_code": 1,
-            "credential": "MD",
-            "taxonomy_codes": ["207Q00000X"],
-            "classifications": ["Family Medicine"],
-            "primary_specialty": "Family Medicine",
-            "city": "Example One",
-            "state": "IL",
-            "zip5": "60601",
-        },
-        {
-            "npi": 1234567890,
-            "provider_name": "Synthetic Provider",
-            "entity_type_code": 1,
-            "credential": "MD",
-            "taxonomy_codes": ["207Q00000X"],
-            "classifications": ["Family Medicine"],
-            "primary_specialty": "Family Medicine",
-            "city": "Example Two",
-            "state": "IL",
-            "zip5": "60602",
-        },
+def test_capacity_v2_migration_precedes_the_unique_repository_head():
+    script = ScriptDirectory.from_config(Config("alembic.ini"))
+    assert script.get_heads() == [
+        "20260825150000_plan_pricing_card_projection"
     ]
-    session = _Session(provider_rows)
-
-    result = await projection._projection_provider_rows_for_npis(
-        session, [1234567890]
+    assert script.get_revision(
+        "20260825150000_plan_pricing_card_projection"
+    ).down_revision == "20260825120000_ptg_v4_finalizer_map_pack"
+    migration = load_capacity_v2_migration()
+    assert migration.down_revision == (
+        "20260801010000_uhc_semantic_layout_identity"
     )
-
-    assert [row["zip5"] for row in result[1234567890]] == ["60601", "60602"]
-    assert "PARTITION BY addr.npi, COALESCE" in session.statements[0][0]
-
-
-@pytest.mark.asyncio
-async def test_zip_radius_resolves_its_centroid_inside_the_projection_query():
-    session = _Session(["62401", "62402"])
-
-    cells = await projection._geo_cells(
-        session,
-        {"zip5": "62401", "zip_radius_miles": 25},
-        result_type="provider_cards",
-    )
-
-    assert cells == ["62401", "62402"]
-    statement, params = session.statements[0]
-    assert "WHERE zip_code = :zip5" in statement
-    assert "CROSS JOIN LATERAL" in statement
-    assert params["zip5"] == "62401"
-    assert "latitude" not in params
-
-    assert await projection._geo_cells(
-        _Session([]),
-        {"zip5": "62401", "zip_radius_miles": 25},
-        result_type="provider_cards",
-    ) == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("args", "expected_result_type", "fragment"),
-    (
-        (
-            {
-                "view": "card",
-                "include_providers": "true",
-                "code_system": "CPT",
-                "code": "27447",
-                "zip5": "62401",
-                "zip_radius_miles": 0,
-            },
-            "provider_cards",
-            b'{"npi":1234567890,"provider_name":"Synthetic Provider"}',
-        ),
-        (
-            {
-                "view": "card",
-                "include_providers": "false",
-                "code_system": "CPT",
-                "code": "27447",
-                "zip5": "62401",
-                "zip_radius_miles": 0,
-            },
-            "rate_aggregates",
-            b'{"geo_cell":"62401","provider_count":1,"rate_count":2}',
-        ),
-    ),
-)
-async def test_projection_reader_embeds_pre_rendered_fragments(
-    args,
-    expected_result_type,
-    fragment,
-):
-    session = _Session([(memoryview(fragment), 1)])
-    response = await projection.search_plan_pricing_projection(
-        session,
-        _selection(),
-        args,
-        SimpleNamespace(limit=25, offset=0, page=1),
-    )
-    wire_response = orjson.loads(orjson.dumps(response))
-
-    assert wire_response["result_type"] == expected_result_type
-    assert wire_response["items"] == [orjson.loads(fragment)]
-    assert wire_response["query"]["projection_contract"] == (
-        projection.PROJECTION_CONTRACT
-    )
-    assert wire_response["query"]["include_providers"] is (
-        expected_result_type == "provider_cards"
-    )
-    assert wire_response["query"]["view"] == args["view"]
-    assert PROJECTION_ID in session.statements[0][1].values()
-    if expected_result_type == "provider_cards":
-        assert "PARTITION BY item.npi" in session.statements[0][0]
-
-
-@pytest.mark.asyncio
-async def test_projection_reader_preserves_total_past_the_last_page():
-    response = await projection.search_plan_pricing_projection(
-        _Session([(None, 2)]),
-        _selection(),
-        {
-            "view": "card",
-            "code_system": "CPT",
-            "code": "27447",
-            "zip5": "62401",
-            "zip_radius_miles": 0,
-        },
-        SimpleNamespace(limit=25, offset=50, page=3),
-    )
-
-    assert response["result_state"] == "matched"
-    assert response["items"] == []
-    assert response["pagination"] == {
-        "total": 2,
-        "total_is_exact": True,
-        "total_lower_bound": 2,
-        "limit": 25,
-        "offset": 50,
-        "page": 3,
-        "has_more": False,
-    }
-
-
-@pytest.mark.asyncio
-async def test_projection_reader_uses_existing_code_system_aliases():
-    session = _Session([])
-
-    await projection.search_plan_pricing_projection(
-        session,
-        _selection(),
-        {
-            "view": "card",
-            "code_system": "MS-DRG",
-            "code": "20",
-            "zip5": "62401",
-            "zip_radius_miles": 0,
-        },
-        SimpleNamespace(limit=25, offset=0, page=1),
-    )
-
-    params = session.statements[0][1]
-    assert params["code_system"] == "MS_DRG"
-    assert params["code"] == "020"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("requested_system", ["CPT", "HCPCS"])
-async def test_projection_reader_uses_shared_numeric_cpt_hcpcs_identity(
-    requested_system,
-):
-    fragment = b'{"npi":1234567890,"minimum_negotiated_rate":44}'
-    session = _Session([(memoryview(fragment), 1)])
-
-    response = await projection.search_plan_pricing_projection(
-        session,
-        _selection(),
-        {
-            "view": "card",
-            "code_system": requested_system,
-            "code": "27447",
-            "zip5": "62401",
-            "zip_radius_miles": 0,
-        },
-        SimpleNamespace(limit=25, offset=0, page=1),
-    )
-
-    assert response["pagination"]["total"] == 1
-    params = session.statements[0][1]
-    assert params["code_system"] == "CPT"
-    assert params["code"] == "27447"
-
-
-@pytest.mark.asyncio
-async def test_projection_reader_reads_hcpcs_card_fragment():
-    fragment = b'{"npi":1234567890,"minimum_negotiated_rate":44}'
-    session = _Session([(memoryview(fragment), 1)])
-
-    response = await projection.search_plan_pricing_projection(
-        session,
-        _selection(),
-        {
-            "view": "card",
-            "code_system": "HCPCS",
-            "code": "G0439",
-            "zip5": "62401",
-            "zip_radius_miles": 0,
-        },
-        SimpleNamespace(limit=25, offset=0, page=1),
-    )
-
-    assert orjson.loads(orjson.dumps(response))["items"] == [
-        {"npi": 1234567890, "minimum_negotiated_rate": 44}
-    ]
-    params = session.statements[0][1]
-    assert params["code_system"] == "HCPCS"
-    assert params["code"] == "G0439"
-
-
-@pytest.mark.asyncio
-async def test_card_rejects_filters_that_projection_cannot_preserve():
-    with pytest.raises(
-        projection.PlanPricingProjectionUnsupported,
-        match="classification",
-    ):
-        await projection.search_plan_pricing_projection(
-            _Session([]),
-            _selection(),
-            {
-                "view": "card",
-                "code_system": "CPT",
-                "code": "27447",
-                "zip5": "62401",
-                "classification": "Family Medicine",
-            },
-            SimpleNamespace(limit=25, offset=0, page=1),
-        )
-
-
-@pytest.mark.asyncio
-async def test_card_aggregate_uses_full_fallback_for_unprojected_filters():
-    session = _Session([])
-
-    response = await projection.search_plan_pricing_projection(
-        session,
-        _selection(),
-        {
-            "view": "card",
-            "include_providers": "false",
-            "code_system": "CPT",
-            "code": "99213",
-            "zip5": "62401",
-            "classification": "Family Medicine",
-        },
-        SimpleNamespace(limit=25, offset=0, page=1),
-    )
-
-    assert response is None
-    assert session.statements == []
-
-
-def test_projection_ignores_explicit_false_diagnostic_flags():
-    assert projection._unsupported_projection_fields(
-        {
-            "include_sources": "false",
-            "include_evidence": "0",
-            "include_details": False,
-            "include_debug": "off",
-        }
-    ) == ()
-
-
-def test_projection_rejects_unverified_locations_and_non_cost_ordering():
-    assert projection._unsupported_projection_fields(
-        {"include_unverified_addresses": "true"}
-    ) == ("include_unverified_addresses",)
-    assert projection._unsupported_projection_fields(
-        {"order_by": "distance"}
-    ) == ("order_by",)
-
-
-@pytest.mark.asyncio
-async def test_full_false_never_uses_the_projection_reader():
-    session = _Session([])
-
-    response = await projection.search_plan_pricing_projection(
-        session,
-        _selection(),
-        {
-            "view": "full",
-            "include_providers": "false",
-            "code_system": "CPT",
-            "code": "27447",
-            "state": "IL",
-        },
-        SimpleNamespace(limit=25, offset=0, page=1),
-    )
-
-    assert response is None
-    assert session.statements == []
-
-
-@pytest.mark.asyncio
-async def test_projection_distinguishes_no_rates_from_no_geography():
-    response = await projection.search_plan_pricing_projection(
-        _Session([]),
-        _selection(),
-        {
-            "view": "card",
-            "code_system": "CPT",
-            "code": "27447",
-            "zip5": "62401",
-            "zip_radius_miles": 0,
-        },
-        SimpleNamespace(limit=25, offset=0, page=1),
-    )
-
-    assert response["result_state"] == "no_matching_rates"
-    assert response["items"] == []
-
-
-def test_projection_migration_keeps_fragments_and_aggregates_in_one_build(
-    monkeypatch,
-):
-    migration_path = (
-        Path(__file__).resolve().parents[1]
-        / "alembic"
-        / "versions"
-        / "20260825150000_plan_pricing_card_projection.py"
-    )
-    module_spec = importlib.util.spec_from_file_location(
-        "plan_pricing_card_projection_migration",
-        migration_path,
-    )
-    assert module_spec is not None and module_spec.loader is not None
-    migration = importlib.util.module_from_spec(module_spec)
-    module_spec.loader.exec_module(migration)
-    statements = []
-    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "projection_test")
-    monkeypatch.setattr(migration.op, "execute", statements.append)
-
-    migration.upgrade()
-
-    statement = " ".join(" ".join(statements).split())
-    assert migration.down_revision == "20260825090000_geo_assurance_projection"
-    assert '"projection_test"."plan_pricing_projection_candidate"' in statement
-    assert '"projection_test"."plan_pricing_card"' in statement
-    assert '"projection_test"."plan_pricing_cell_aggregate"' in statement
-    assert "fragment bytea NOT NULL" in statement
-    assert "median_negotiated_rate numeric NOT NULL" in statement
-    assert "contract_version = 'plan_pricing_card_v2'" in statement
-    assert "IF to_regclass" in statement
-    assert "plan_pricing_geo_zip_coordinates_idx" in statement
-    assert "(latitude, longitude, zip_code)" in statement
-    assert "ready plan-pricing projections are immutable" in statement
-    assert "receipt counts do not match rows" in statement
-    assert "SELECT state INTO parent_state" in statement
-    assert "FOR UPDATE" in statement
-    assert "BEFORE TRUNCATE" in statement

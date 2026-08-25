@@ -160,6 +160,8 @@ async def _binding_rate_inputs(
     binding_projection: BindingProjection,
     code_rows: list[dict[str, Any]],
 ) -> _BindingRateInputs:
+    """Load one binding's sealed price sets and provider memberships."""
+
     from api import ptg2_serving as serving
     serving_tables = binding_projection.serving_tables
     serving_rows = await serving._merge_manifest_code_variant_rows(
@@ -210,10 +212,7 @@ async def _binding_rate_inputs(
         (npi for npi_group in npis_by_set.values() for npi in npi_group),
     )
     return _BindingRateInputs(
-        tuple(serving_rows),
-        prices_by_set,
-        npis_by_set,
-        providers_by_npi,
+        tuple(serving_rows), prices_by_set, npis_by_set, providers_by_npi
     )
 
 

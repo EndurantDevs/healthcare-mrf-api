@@ -102,27 +102,18 @@ def test_release_query_does_not_reresolve_explicit_resolution_miss(
     assert response is None
 
 
-def test_projection_only_selection_reresolves_for_full_fallback(monkeypatch):
-    projection_selection = replace(
-        _release_selection(
-            _network_binding(0, "ptg2:release-old", "aetna-network-a"),
-            validated_serving_tables=(),
-        ),
-        pricing_projection_id="f" * 64,
-    )
-    full_selection = _release_selection(
-        _network_binding(0, "ptg2:release-old", "aetna-network-a")
-    )
-    resolver_calls = []
-
+def _install_projection_fallback_search(
+    monkeypatch,
+    full_selection,
+    resolver_calls,
+    search_calls,
+):
     async def resolve_full(_session, release_id):
         resolver_calls.append(release_id)
         return full_selection
 
     async def no_projected_response(*_args, **_kwargs):
         return None
-
-    search_calls = []
 
     async def search_snapshot(
         _session,
@@ -148,6 +139,27 @@ def test_projection_only_selection_reresolves_for_full_fallback(monkeypatch):
         ptg2_serving,
         "_search_one_ptg2_snapshot",
         search_snapshot,
+    )
+
+
+def test_projection_only_selection_reresolves_for_full_fallback(monkeypatch):
+    projection_selection = replace(
+        _release_selection(
+            _network_binding(0, "ptg2:release-old", "aetna-network-a"),
+            validated_serving_tables=(),
+        ),
+        pricing_projection_id="f" * 64,
+    )
+    full_selection = _release_selection(
+        _network_binding(0, "ptg2:release-old", "aetna-network-a")
+    )
+    resolver_calls = []
+    search_calls = []
+    _install_projection_fallback_search(
+        monkeypatch,
+        full_selection,
+        resolver_calls,
+        search_calls,
     )
 
     response = asyncio.run(

@@ -4324,7 +4324,7 @@ async def test_full_false_keeps_legacy_path_without_projection(
         "search_current_ptg2_index",
         strict_search,
     )
-    args = {
+    request_args_dict = {
         "plan_release_id": selection.plan_release_id,
         "code": "70551",
         "code_system": "CPT",
@@ -4333,8 +4333,8 @@ async def test_full_false_keeps_legacy_path_without_projection(
         "include_allowed_amounts": "false",
     }
     if view is not None:
-        args["view"] = view
-    request = make_request([], args=args)
+        request_args_dict["view"] = view
+    request = make_request([], args=request_args_dict)
 
     response = await list_providers_by_procedure(request)
 

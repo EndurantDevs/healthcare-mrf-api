@@ -467,6 +467,44 @@ def _json_safe_default(value: Any) -> Any:
     return None
 
 
+def _plan_pricing_projection_registry_entry() -> dict[str, Any]:
+    return {
+        "name": "plan-pricing-projection",
+        "engine": ENGINE_NAME,
+        "family": "mrf",
+        "kind": "control",
+        "lifecycle": "single",
+        "schedulable": False,
+        "cancelable": False,
+        "retryable": True,
+        "enqueue_adapter": "arq_single_job",
+        "queue": "arq:PTGCandidateAudit",
+        "depends_on": [],
+        "params_schema": [
+            {
+                "name": "binding_manifest_digest",
+                "opts": ["--binding-manifest-digest"],
+                "required": True,
+                "multiple": False,
+                "is_flag": False,
+                "type": "string",
+                "default": None,
+                "help": "Exact release binding-manifest digest.",
+            },
+            {
+                "name": "bindings",
+                "opts": ["--bindings"],
+                "required": True,
+                "multiple": False,
+                "is_flag": False,
+                "type": "array",
+                "default": None,
+                "help": "Exact release binding array.",
+            },
+        ],
+    }
+
+
 def importer_registry() -> list[dict[str, Any]]:
     """Describe the importer commands exposed by the public control API."""
 
@@ -491,43 +529,7 @@ def importer_registry() -> list[dict[str, Any]]:
                 "params_schema": _control_param_schema(name, command),
             }
         )
-    importers.append(
-        {
-            "name": "plan-pricing-projection",
-            "engine": ENGINE_NAME,
-            "family": "mrf",
-            "kind": "control",
-            "lifecycle": "single",
-            "schedulable": False,
-            "cancelable": False,
-            "retryable": True,
-            "enqueue_adapter": "arq_single_job",
-            "queue": "arq:PTGCandidateAudit",
-            "depends_on": [],
-            "params_schema": [
-                {
-                    "name": "binding_manifest_digest",
-                    "opts": ["--binding-manifest-digest"],
-                    "required": True,
-                    "multiple": False,
-                    "is_flag": False,
-                    "type": "string",
-                    "default": None,
-                    "help": "Exact release binding-manifest digest.",
-                },
-                {
-                    "name": "bindings",
-                    "opts": ["--bindings"],
-                    "required": True,
-                    "multiple": False,
-                    "is_flag": False,
-                    "type": "array",
-                    "default": None,
-                    "help": "Exact release binding array.",
-                },
-            ],
-        }
-    )
+    importers.append(_plan_pricing_projection_registry_entry())
     return sorted(importers, key=lambda importer: importer["name"])
 
 

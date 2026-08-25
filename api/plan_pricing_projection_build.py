@@ -65,14 +65,14 @@ async def _existing_candidate_receipt(
     if existing_candidate is None:
         return None
     if existing_candidate.get("state") == "ready":
-        identity_matches = (
+        has_matching_identity = (
             existing_candidate.get("binding_manifest") == binding_manifest
             and existing_candidate.get("binding_manifest_digest")
             == binding_manifest_digest
             and existing_candidate.get("provider_signature")
             == provider_generation_signature
         )
-        if not identity_matches:
+        if not has_matching_identity:
             raise ValueError("pricing projection identity collision")
         existing_receipt = receipt(existing_candidate)
         return existing_receipt

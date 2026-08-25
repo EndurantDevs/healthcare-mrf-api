@@ -95,6 +95,62 @@ async def _seal(
     )
 
 
+async def _assert_seal_blocks_later_child(
+    admin,
+    dsn: str,
+    schema: str,
+    connections: list,
+    tasks: list[asyncio.Task],
+) -> None:
+    projection_id = "1" * 64
+    digest = "a" * 64
+    await _candidate(admin, schema, projection_id, digest)
+    sealer = await asyncpg.connect(dsn)
+    child_writer = await asyncpg.connect(dsn)
+    connections.extend((sealer, child_writer))
+    seal_transaction = sealer.transaction()
+    child_transaction = child_writer.transaction()
+    await seal_transaction.start()
+    await _seal(sealer, schema, projection_id, digest)
+    await child_transaction.start()
+    child_task = asyncio.create_task(_card(child_writer, schema, projection_id))
+    tasks.append(child_task)
+    await asyncio.sleep(0.05)
+    assert not child_task.done()
+    await seal_transaction.commit()
+    with pytest.raises(asyncpg.RaiseError, match="immutable"):
+        await asyncio.wait_for(child_task, timeout=2)
+    await child_transaction.rollback()
+
+
+async def _assert_child_blocks_incorrect_seal(
+    admin,
+    dsn: str,
+    schema: str,
+    connections: list,
+    tasks: list[asyncio.Task],
+) -> None:
+    projection_id = "2" * 64
+    digest = "b" * 64
+    await _candidate(admin, schema, projection_id, digest)
+    child_writer = await asyncpg.connect(dsn)
+    sealer = await asyncpg.connect(dsn)
+    connections.extend((child_writer, sealer))
+    child_transaction = child_writer.transaction()
+    seal_transaction = sealer.transaction()
+    await child_transaction.start()
+    await _card(child_writer, schema, projection_id)
+    await seal_transaction.start()
+    seal_task = asyncio.create_task(_seal(sealer, schema, projection_id, digest))
+    tasks.append(seal_task)
+    await asyncio.sleep(0.05)
+    assert not seal_task.done()
+    await child_transaction.commit()
+    with pytest.raises(asyncpg.RaiseError, match="receipt counts"):
+        await asyncio.wait_for(seal_task, timeout=2)
+    await seal_transaction.rollback()
+
+
 @pytest.mark.asyncio
 async def test_ready_seal_serializes_against_child_writes(monkeypatch):
     dsn = os.getenv(POSTGRES_DSN_ENV)
@@ -115,51 +171,12 @@ async def test_ready_seal_serializes_against_child_writes(monkeypatch):
         for statement in _migration_statements(monkeypatch, schema):
             await admin.execute(statement)
 
-        # A seal that owns the parent lock makes a later child reject.
-        projection_one = "1" * 64
-        digest_one = "a" * 64
-        await _candidate(admin, schema, projection_one, digest_one)
-        sealer = await asyncpg.connect(dsn)
-        child_writer = await asyncpg.connect(dsn)
-        connections.extend((sealer, child_writer))
-        seal_transaction = sealer.transaction()
-        child_transaction = child_writer.transaction()
-        await seal_transaction.start()
-        await _seal(sealer, schema, projection_one, digest_one)
-        await child_transaction.start()
-        child_task = asyncio.create_task(
-            _card(child_writer, schema, projection_one)
+        await _assert_seal_blocks_later_child(
+            admin, dsn, schema, connections, tasks
         )
-        tasks.append(child_task)
-        await asyncio.sleep(0.05)
-        assert not child_task.done()
-        await seal_transaction.commit()
-        with pytest.raises(asyncpg.RaiseError, match="immutable"):
-            await asyncio.wait_for(child_task, timeout=2)
-        await child_transaction.rollback()
-
-        # A child that owns the parent lock makes the seal re-count and reject.
-        projection_two = "2" * 64
-        digest_two = "b" * 64
-        await _candidate(admin, schema, projection_two, digest_two)
-        child_writer = await asyncpg.connect(dsn)
-        sealer = await asyncpg.connect(dsn)
-        connections.extend((child_writer, sealer))
-        child_transaction = child_writer.transaction()
-        seal_transaction = sealer.transaction()
-        await child_transaction.start()
-        await _card(child_writer, schema, projection_two)
-        await seal_transaction.start()
-        seal_task = asyncio.create_task(
-            _seal(sealer, schema, projection_two, digest_two)
+        await _assert_child_blocks_incorrect_seal(
+            admin, dsn, schema, connections, tasks
         )
-        tasks.append(seal_task)
-        await asyncio.sleep(0.05)
-        assert not seal_task.done()
-        await child_transaction.commit()
-        with pytest.raises(asyncpg.RaiseError, match="receipt counts"):
-            await asyncio.wait_for(seal_task, timeout=2)
-        await seal_transaction.rollback()
     finally:
         for task in tasks:
             if not task.done():

@@ -20233,6 +20233,37 @@ async def _plan_release_route_selection(
     return True, supplied_selection
 
 
+async def _search_selected_plan_release(
+    session,
+    args: dict[str, Any],
+    pagination,
+    selected_release: PlanReleaseServingSelection | None,
+) -> dict[str, Any] | None:
+    if selected_release is None:
+        return None
+    projected_response = await search_plan_pricing_projection(
+        session,
+        selected_release,
+        args,
+        pagination,
+    )
+    if projected_response is not None:
+        return projected_response
+    if selected_release.network_tables_by_snapshot() is None:
+        selected_release = await resolve_plan_release_serving(
+            session,
+            selected_release.plan_release_id,
+        )
+        if selected_release is None:
+            return None
+    return await _search_plan_release_index(
+        session,
+        args,
+        pagination,
+        selected_release,
+    )
+
+
 async def search_current_ptg2_index(
     session,
     args: dict[str, Any],
@@ -20250,24 +20281,7 @@ async def search_current_ptg2_index(
         release_selection,
     )
     if has_release_route:
-        if selected_release is None:
-            return None
-        projected_response = await search_plan_pricing_projection(
-            session,
-            selected_release,
-            args,
-            pagination,
-        )
-        if projected_response is not None:
-            return projected_response
-        if selected_release.network_tables_by_snapshot() is None:
-            selected_release = await resolve_plan_release_serving(
-                session,
-                selected_release.plan_release_id,
-            )
-            if selected_release is None:
-                return None
-        return await _search_plan_release_index(
+        return await _search_selected_plan_release(
             session,
             args,
             pagination,

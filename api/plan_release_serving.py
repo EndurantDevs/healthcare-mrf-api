@@ -10,6 +10,10 @@ from typing import Any, Iterable, Mapping
 
 from sqlalchemy import text
 
+from api.plan_release_pricing_projection import (
+    has_pricing_projection_relation,
+    plan_release_serving_queries,
+)
 from api.plan_release_readiness import is_release_binding_serving_ready
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
@@ -38,101 +42,10 @@ PLAN_RELEASE_BINDING_ROLES = frozenset(
     {PLAN_RELEASE_IN_NETWORK_ROLE, PLAN_RELEASE_ALLOWED_AMOUNTS_ROLE}
 )
 
-_PRICING_PROJECTION_RELATION = (
-    f"{PTG2_SCHEMA}.plan_pricing_projection_candidate"
-)
-_PRICING_PROJECTION_ID_SQL = """
-       CASE
-           WHEN pricing_projection.state = 'ready'
-            AND pricing_projection.contract_version =
-                revision.source_manifest
-                    -> 'pricing_projection' ->> 'contract'
-            AND pricing_projection.binding_manifest_digest =
-                revision.binding_set_digest
-            AND pricing_projection.binding_manifest_digest =
-                revision.source_manifest
-                    -> 'pricing_projection' ->> 'binding_manifest_digest'
-            AND pricing_projection.provider_signature =
-                revision.source_manifest
-                    -> 'pricing_projection' ->> 'provider_signature'
-            AND pricing_projection.content_digest =
-                revision.source_manifest
-                    -> 'pricing_projection' ->> 'content_digest'
-           THEN pricing_projection.projection_id
-       END
-"""
-_PRICING_PROJECTION_JOIN_SQL = f"""
-  LEFT JOIN {_PRICING_PROJECTION_RELATION} pricing_projection
-    ON pricing_projection.projection_id =
-       revision.source_manifest -> 'pricing_projection' ->> 'projection_id'
-"""
-
-
-def _plan_release_serving_sql(*, include_pricing_projection: bool) -> str:
-    pricing_projection_id_sql = (
-        _PRICING_PROJECTION_ID_SQL
-        if include_pricing_projection
-        else "       NULL::varchar(64)"
-    )
-    pricing_projection_join_sql = (
-        _PRICING_PROJECTION_JOIN_SQL
-        if include_pricing_projection
-        else ""
-    )
-    return f"""
-SELECT revision.serving_revision_id,
-       revision.plan_release_id,
-       revision.healthporta_plan_id,
-       revision.plan_version_id,
-       revision.release_month,
-       revision.release_status,
-       revision.expected_binding_count,
-       revision.binding_set_digest,
-{pricing_projection_id_sql} AS pricing_projection_id,
-       binding.binding_ordinal,
-       binding.snapshot_id,
-       binding.source_key,
-       binding.plan_id,
-       binding.plan_market_type,
-       binding.role,
-       binding.required,
-       snapshot.status AS snapshot_status,
-       EXISTS (
-           SELECT 1
-             FROM {PTG2_SCHEMA}.ptg2_snapshot_pin pin
-            WHERE pin.owner_type = :pin_owner_type
-              AND pin.owner_id = revision.serving_revision_id
-              AND pin.snapshot_id = binding.snapshot_id
-       ) AS is_pinned
-  FROM {PTG2_SCHEMA}.plan_release_serving_revision revision
-  JOIN {PTG2_SCHEMA}.plan_release_snapshot_binding binding
-    ON binding.serving_revision_id = revision.serving_revision_id
-  LEFT JOIN {PTG2_SCHEMA}.ptg2_snapshot snapshot
-    ON snapshot.snapshot_id = binding.snapshot_id
-{pricing_projection_join_sql}
- WHERE revision.plan_release_id = :plan_release_id
-   AND revision.serving_status = 'published'
-   AND revision.release_status = 'published'
-   AND revision.is_current
- ORDER BY CASE binding.role WHEN 'in_network' THEN 0 ELSE 1 END,
-          binding.binding_ordinal
-"""
-
-
-_PLAN_RELEASE_SERVING_SQL = _plan_release_serving_sql(
-    include_pricing_projection=True
-)
-_PLAN_RELEASE_SERVING_WITHOUT_PROJECTION_SQL = _plan_release_serving_sql(
-    include_pricing_projection=False
-)
-
-
-async def _pricing_projection_relation_available(session: Any) -> bool:
-    relation_result = await session.execute(
-        text("SELECT to_regclass(:relation_name) IS NOT NULL"),
-        {"relation_name": _PRICING_PROJECTION_RELATION},
-    )
-    return bool(relation_result.scalar_one())
+(
+    _PLAN_RELEASE_SERVING_SQL,
+    _PLAN_RELEASE_SERVING_WITHOUT_PROJECTION_SQL,
+) = plan_release_serving_queries(PTG2_SCHEMA)
 
 
 def _row_mapping(row: Any) -> dict[str, Any]:
@@ -507,7 +420,7 @@ async def resolve_plan_release_serving(
         return None
     release_sql = (
         _PLAN_RELEASE_SERVING_SQL
-        if await _pricing_projection_relation_available(session)
+        if await has_pricing_projection_relation(session, PTG2_SCHEMA)
         else _PLAN_RELEASE_SERVING_WITHOUT_PROJECTION_SQL
     )
     release_query_result = await session.execute(

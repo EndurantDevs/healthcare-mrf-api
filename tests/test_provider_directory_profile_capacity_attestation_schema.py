@@ -9,8 +9,6 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
-from alembic.config import Config
-from alembic.script import ScriptDirectory
 
 from db.models.system import (
     ProviderDirectoryProfileBuildCheckpoint,
@@ -83,20 +81,6 @@ def _load_migration():
     migration = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(migration)
     return migration
-
-
-def test_capacity_v2_migration_precedes_the_unique_repository_head():
-    script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == [
-        "20260825150000_plan_pricing_card_projection"
-    ]
-    assert script.get_revision(
-        "20260825150000_plan_pricing_card_projection"
-    ).down_revision == "20260825120000_ptg_v4_finalizer_map_pack"
-    migration = _load_capacity_v2_migration()
-    assert migration.down_revision == (
-        "20260801010000_uhc_semantic_layout_identity"
-    )
 
 
 def test_capacity_v2_migration_replaces_only_the_guarded_constraint(

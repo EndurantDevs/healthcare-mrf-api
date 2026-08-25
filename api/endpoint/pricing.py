@@ -7670,8 +7670,8 @@ def _annotate_ptg2_result_state(
     query_payload_map = ptg2_payload.get("query")
     if not isinstance(query_payload_map, dict):
         query_payload_map = {}
-    items = ptg2_payload.get("items")
-    has_items = isinstance(items, list) and bool(items)
+    result_items = ptg2_payload.get("items")
+    has_items = isinstance(result_items, list) and bool(result_items)
     pagination = ptg2_payload.get("pagination")
     total = (
         _as_int(pagination.get("total"))
