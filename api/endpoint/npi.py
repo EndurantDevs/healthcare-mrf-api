@@ -1224,6 +1224,16 @@ def _address_type_rank(address: Mapping[str, Any]) -> int:
     }.get(str(address.get("type") or "").strip().lower(), 9)
 
 
+def _json_merge_identity_marker(value: Any) -> str:
+    if type(value) is str:
+        return json.encoder.encode_basestring_ascii(value)
+    if type(value) is bool:
+        return "true" if value else "false"
+    if type(value) is int:
+        return str(value)
+    return json.dumps(value, sort_keys=True, default=str)
+
+
 def _merge_unique_list_values(first: Any, second: Any) -> list[Any]:
     merged_values: list[Any] = []
     seen_markers: set[str] = set()
@@ -1234,7 +1244,7 @@ def _merge_unique_list_values(first: Any, second: Any) -> list[Any]:
         for value in candidates:
             if value in (None, ""):
                 continue
-            marker = json.dumps(value, sort_keys=True, default=str)
+            marker = _json_merge_identity_marker(value)
             if marker in seen_markers:
                 continue
             seen_markers.add(marker)
@@ -13998,8 +14008,7 @@ async def _provider_directory_address_overlay_serving_identity(
     return f"overlay:{overlay_identity}|unified:{unified_identity}"
 
 
-def _directory_overlay_resource_ctes_sql(schema: str) -> str:
-    """Resolve current overlay resources without parsing unrelated graph metadata."""
+def _directory_current_dataset_ctes_sql(schema: str) -> str:
     return f"""
     current_endpoint_counts AS MATERIALIZED (
         SELECT dataset.endpoint_id
@@ -14018,7 +14027,14 @@ def _directory_overlay_resource_ctes_sql(schema: str) -> str:
            AND dataset.published_at IS NOT NULL
            AND dataset.superseded_at IS NULL
            AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
-    ), current_resources AS NOT MATERIALIZED (
+    )
+    """
+
+
+def _directory_overlay_resource_ctes_sql(schema: str) -> str:
+    """Resolve current overlay resources without parsing unrelated graph metadata."""
+    return f"""
+    {_directory_current_dataset_ctes_sql(schema)}, current_resources AS NOT MATERIALIZED (
         SELECT source.source_id, source.canonical_api_base,
                dataset.dataset_id, dataset.run_id,
                resource.resource_type, resource.resource_id,
@@ -14283,36 +14299,59 @@ async def _fetch_provider_directory_address_overlay(
 
 
 def _location_status_query(schema: str, overlay_table_sql: str) -> Any:
-    current_resource_ctes_sql = _directory_overlay_resource_ctes_sql(schema)
+    current_dataset_ctes_sql = _directory_current_dataset_ctes_sql(schema)
+    role_table_sql = f"{schema}.{ProviderDirectoryPractitionerRole.__tablename__}"
+    resource_table_sql = f"{schema}.provider_directory_dataset_resource"
     location_status_sql = _provider_directory_location_status_sql(
-        "overlay.payload_json",
-        resource_type_sql="overlay.resource_type",
+        "visible_role.payload_json",
+        resource_type_sql="'PractitionerRole'",
     )
+    # Typed rows are mutable; the immutable dataset payload preserves current
+    # publication semantics when a checkpoint run ID differs.
     return text(
         f"""
-        WITH {current_resource_ctes_sql}, matched_overlays AS MATERIALIZED (
+        WITH {current_dataset_ctes_sql}, matched_overlays AS MATERIALIZED (
             SELECT overlay.source_record_id,
                    overlay.source_id,
-                   overlay.resource_type,
                    overlay.resource_id,
                    overlay.last_seen_run_id
               FROM {overlay_table_sql} AS overlay
              WHERE overlay.source_record_id = ANY(:source_record_ids)
-        ), visible_roles AS MATERIALIZED (
+               AND overlay.resource_type = 'PractitionerRole'
+        ), visible_roles AS NOT MATERIALIZED (
             SELECT overlay.source_record_id,
-                   overlay.resource_type,
-                   current_resource.payload_json
+                   CASE
+                       WHEN role.resource_id IS NOT NULL THEN jsonb_build_object(
+                           'active', role.active,
+                           'period', jsonb_build_object(
+                               'start', role.period_start,
+                               'end', role.period_end
+                           )
+                       )
+                       ELSE resource.payload_json::jsonb
+                   END AS payload_json
               FROM matched_overlays AS overlay
-              JOIN current_resources AS current_resource
-                ON current_resource.source_id = overlay.source_id
-               AND current_resource.resource_type = overlay.resource_type
-               AND current_resource.resource_id = overlay.resource_id
-               AND overlay.last_seen_run_id = current_resource.run_id
+              JOIN {schema}.provider_directory_source AS source
+                ON source.source_id = overlay.source_id
+              JOIN current_datasets AS dataset
+                ON dataset.endpoint_id = source.endpoint_id
+               AND dataset.run_id = overlay.last_seen_run_id
+         LEFT JOIN {role_table_sql} AS role
+                ON role.source_id = overlay.source_id
+               AND role.resource_id = overlay.resource_id
+               AND role.last_seen_run_id = dataset.run_id
+         LEFT JOIN {resource_table_sql} AS resource
+                ON role.resource_id IS NULL
+               AND resource.dataset_id = dataset.dataset_id
+               AND resource.resource_type = 'PractitionerRole'
+               AND resource.resource_id = overlay.resource_id
+             WHERE role.resource_id IS NOT NULL
+                OR resource.resource_id IS NOT NULL
         )
-        SELECT overlay.source_record_id,
+        SELECT visible_role.source_record_id,
                {location_status_sql} AS location_status
-          FROM visible_roles AS overlay
-      GROUP BY overlay.source_record_id;
+          FROM visible_roles AS visible_role
+      GROUP BY visible_role.source_record_id;
         """
     )
 
@@ -14339,22 +14378,14 @@ async def _fetch_location_status_by_record_id(
         {
             str(record_id).strip()
             for record_id in source_record_ids
-            if str(record_id or "").strip()
+            if str(record_id or "").strip().startswith(
+                "provider_directory_fhir:practitioner_role:"
+            )
         }
     )
     if not normalized_record_ids:
         return {}
     try:
-        required_tables = (
-            PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-            *PROVIDER_DIRECTORY_VISIBILITY_TABLES,
-        )
-        if await _provider_directory_evidence_tables(
-            session,
-            required_names=required_tables,
-            optional_names=(),
-        ) is None:
-            return {}
         overlay_table_sql = _schema_cache_key(
             PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE
         )
@@ -14362,15 +14393,16 @@ async def _fetch_location_status_by_record_id(
             _runtime_db_schema(),
             overlay_table_sql,
         )
-        query_result = await _execute_stmt(
-            status_query,
-            session=session,
-            params={"source_record_ids": normalized_record_ids},
-        )
+        async with db.session() as status_session:
+            query_result = await _execute_stmt(
+                status_query,
+                session=status_session,
+                params={"source_record_ids": normalized_record_ids},
+            )
+            return _status_map_from_result(query_result)
     except Exception as exc:
         logger.debug("Provider location status lookup failed: %s", exc)
         return {}
-    return _status_map_from_result(query_result)
 
 
 def _location_status_from_source_records(

@@ -7,6 +7,62 @@ from sqlalchemy import text
 
 from api.endpoint import npi as npi_module
 from db.models import db
+from tests.test_npi_provider_directory_role_evidence_db import (
+    _insert_dataset_rows,
+    _insert_endpoint_rows,
+    _insert_resource_rows,
+    _insert_source_rows,
+    _publish_dataset_rows,
+)
+
+
+LOCATION_STATUS_ENDPOINT_ID = "pd-location-status"
+LOCATION_STATUS_SOURCE_ID = "pdfhir_location_status_test"
+LOCATION_STATUS_DATASET_ID = "dataset-location-status"
+LOCATION_STATUS_RUN_ID = "run-location-status"
+LOCATION_STATUS_DATASET_ROWS = [
+    (
+        LOCATION_STATUS_DATASET_ID,
+        LOCATION_STATUS_ENDPOINT_ID,
+        LOCATION_STATUS_RUN_ID,
+        {},
+    )
+]
+LOCATION_STATUS_ROLE_RECORDS = (
+    {
+        "role_id": "role-current",
+        "source_record_id": "provider_directory_fhir:practitioner_role:"
+        f"{LOCATION_STATUS_SOURCE_ID}:role-current:location-current",
+        "role_run_id": LOCATION_STATUS_RUN_ID,
+        "period_start": "2999-01-01",
+        "period_end": None,
+        "payload": {"active": True},
+        "npi": 1000000001,
+        "address_key": "00000000-0000-0000-0000-000000000001",
+    },
+    {
+        "role_id": "role-fallback",
+        "source_record_id": "provider_directory_fhir:practitioner_role:"
+        f"{LOCATION_STATUS_SOURCE_ID}:role-fallback:location-fallback",
+        "role_run_id": "future-checkpoint-run",
+        "period_start": None,
+        "period_end": None,
+        "payload": {"active": False},
+        "npi": 1000000002,
+        "address_key": "00000000-0000-0000-0000-000000000002",
+    },
+    {
+        "role_id": "role-expired",
+        "source_record_id": "provider_directory_fhir:practitioner_role:"
+        f"{LOCATION_STATUS_SOURCE_ID}:role-expired:location-expired",
+        "role_run_id": LOCATION_STATUS_RUN_ID,
+        "period_start": None,
+        "period_end": "2000-01-01",
+        "payload": {"active": True},
+        "npi": 1000000003,
+        "address_key": "00000000-0000-0000-0000-000000000003",
+    },
+)
 
 
 def _requires_test_database() -> None:
@@ -127,6 +183,66 @@ async def _insert_overlay_rows(session, schema: str, fixture: dict) -> None:
         )
 
 
+async def _insert_location_status_fixture(session, schema: str) -> None:
+    """Create current typed and immutable-fallback practitioner roles."""
+    await _insert_endpoint_rows(
+        session,
+        schema,
+        [(LOCATION_STATUS_ENDPOINT_ID, "https://location-status.test/fhir")],
+    )
+    await _insert_source_rows(
+        session,
+        schema,
+        [(LOCATION_STATUS_SOURCE_ID, LOCATION_STATUS_ENDPOINT_ID)],
+    )
+    await _insert_dataset_rows(
+        session,
+        schema,
+        LOCATION_STATUS_DATASET_ROWS,
+    )
+    await _insert_resource_rows(
+        session,
+        schema,
+        LOCATION_STATUS_DATASET_ID,
+        [
+            ("PractitionerRole", role_record["role_id"], role_record["payload"])
+            for role_record in LOCATION_STATUS_ROLE_RECORDS
+        ],
+    )
+    await _publish_dataset_rows(
+        session,
+        schema,
+        [(LOCATION_STATUS_DATASET_ID, len(LOCATION_STATUS_ROLE_RECORDS))],
+    )
+    fixture_params = [
+        {
+            **role_record,
+            "source_id": LOCATION_STATUS_SOURCE_ID,
+            "run_id": LOCATION_STATUS_RUN_ID,
+        }
+        for role_record in LOCATION_STATUS_ROLE_RECORDS
+    ]
+    await session.execute(
+        text(
+            f"INSERT INTO {schema}.provider_directory_practitioner_role "
+            "(source_id, resource_id, active, period_start, period_end, "
+            "last_seen_run_id) VALUES (:source_id, :role_id, true, "
+            ":period_start, :period_end, :role_run_id)"
+        ),
+        fixture_params,
+    )
+    await session.execute(
+        text(
+            f"INSERT INTO {schema}.provider_directory_address_overlay "
+            "(source_record_id, source_id, last_seen_run_id, resource_type, "
+            "resource_id, npi, address_key) VALUES (:source_record_id, "
+            ":source_id, :run_id, 'PractitionerRole', :role_id, :npi, "
+            "CAST(:address_key AS uuid))"
+        ),
+        fixture_params,
+    )
+
+
 @pytest.mark.asyncio(loop_scope="session")
 async def test_geo_evidence_excludes_resource_absent_from_current_dataset():
     """Current-run overlays still require exact current dataset membership."""
@@ -153,5 +269,43 @@ async def test_geo_evidence_excludes_resource_absent_from_current_dataset():
             evidence = evidence_rows[0]._mapping
             assert evidence["source_record_ids"] == [fixture["included_record_id"]]
             assert evidence["provider_directory_source_count"] == 1
+        finally:
+            await fixture_savepoint.rollback()
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_location_status_query_uses_current_typed_row_and_dataset_fallback():
+    """Use current typed rows and immutable payloads for mismatched checkpoints."""
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+
+    async with db.transaction() as database_session:
+        fixture_savepoint = await database_session.begin_nested()
+        try:
+            await _insert_location_status_fixture(database_session, schema)
+            query_result = await database_session.execute(
+                npi_module._location_status_query(
+                    schema,
+                    f"{schema}.provider_directory_address_overlay",
+                ),
+                {
+                    "source_record_ids": [
+                        role_record["source_record_id"]
+                        for role_record in LOCATION_STATUS_ROLE_RECORDS
+                    ]
+                },
+            )
+            status_by_record_id = {
+                status_row._mapping["source_record_id"]: status_row._mapping[
+                    "location_status"
+                ]
+                for status_row in query_result.all()
+            }
+
+            assert status_by_record_id == {
+                LOCATION_STATUS_ROLE_RECORDS[0]["source_record_id"]: "inactive",
+                LOCATION_STATUS_ROLE_RECORDS[1]["source_record_id"]: "inactive",
+                LOCATION_STATUS_ROLE_RECORDS[2]["source_record_id"]: "inactive",
+            }
         finally:
             await fixture_savepoint.rollback()

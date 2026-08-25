@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
 import json
 import types
@@ -233,88 +234,121 @@ def test_address_datetime_types_and_naive_freshness_are_normalized():
     ) == aware_value.timestamp()
 
 
+def _assert_location_status_sql_contract(status_sql: str) -> None:
+    for fragment in (
+        "provider_directory_practitioner_role AS role",
+        "role.active",
+        "role.period_start",
+        "role.period_end",
+        "overlay.resource_type = 'PractitionerRole'",
+        "role.last_seen_run_id = dataset.run_id",
+        "ON role.resource_id IS NULL",
+        "provider_directory_dataset_resource AS resource",
+        "WHEN role.resource_id IS NOT NULL THEN jsonb_build_object",
+        "'period', jsonb_build_object",
+        "'start', role.period_start",
+        "'end', role.period_end",
+        "ELSE resource.payload_json::jsonb",
+        "resource.dataset_id = dataset.dataset_id",
+        "resource.resource_type = 'PractitionerRole'",
+        "resource.resource_id = overlay.resource_id",
+        "matched_overlays AS MATERIALIZED",
+        "dataset.run_id = overlay.last_seen_run_id",
+    ):
+        assert fragment in status_sql
+
+
 @pytest.mark.asyncio
 async def test_location_status_lookup_normalizes_rows_and_empty_input(monkeypatch):
+    role_a = (
+        "provider_directory_fhir:practitioner_role:source-a:role-a:location-a"
+    )
+    role_b = (
+        "provider_directory_fhir:practitioner_role:source-b:role-b:location-b"
+    )
     query_result = _ResultRows(
         [
             types.SimpleNamespace(
                 _mapping={
-                    "source_record_id": "synthetic-role-a",
+                    "source_record_id": role_a,
                     "location_status": "ACTIVE",
                 }
             ),
             {"source_record_id": " ", "location_status": "inactive"},
-            {"source_record_id": "synthetic-role-b", "location_status": None},
+            {"source_record_id": role_b, "location_status": None},
         ]
     )
+    request_session = object()
+    status_session = object()
 
-    capability_result = _ResultRows(
-        [
-            {"table_name": table_name, "is_available": True}
-            for table_name in (
-                npi_module.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-                *npi_module.PROVIDER_DIRECTORY_VISIBILITY_TABLES,
-            )
-        ]
-    )
-    execute_stmt = AsyncMock(side_effect=[capability_result, query_result])
+    @asynccontextmanager
+    async def owned_status_session():
+        yield status_session
+
+    execute_stmt = AsyncMock(return_value=query_result)
+    monkeypatch.setattr(npi_module.db, "session", owned_status_session)
     monkeypatch.setattr(npi_module, "_execute_stmt", execute_stmt)
 
     assert await npi_module._fetch_location_status_by_record_id(["", None]) == {}
     statuses = await npi_module._fetch_location_status_by_record_id(
-        [" synthetic-role-b ", "synthetic-role-a", "synthetic-role-a"]
+        [
+            f" {role_b} ",
+            "provider_directory_fhir:organization_address:source-a:org-a:1",
+            role_a,
+            role_a,
+        ],
+        session=request_session,
     )
 
     assert statuses == {
-        "synthetic-role-a": "active",
-        "synthetic-role-b": "unknown",
+        role_a: "active",
+        role_b: "unknown",
     }
-    assert execute_stmt.await_count == 2
-    capability_call, status_call = execute_stmt.await_args_list
-    assert "requested_columns AS" in str(capability_call.args[0])
-    assert capability_call.kwargs["params"]["table_names"] == [
-        npi_module.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-        *npi_module.PROVIDER_DIRECTORY_VISIBILITY_TABLES,
-    ]
+    execute_stmt.assert_awaited_once()
+    status_call = execute_stmt.await_args
+    assert status_call.kwargs["session"] is status_session
+    assert status_call.kwargs["session"] is not request_session
     assert status_call.kwargs["params"] == {
-        "source_record_ids": ["synthetic-role-a", "synthetic-role-b"]
+        "source_record_ids": [role_a, role_b]
     }
-    status_sql = str(status_call.args[0])
-    assert "PractitionerRole" in status_sql
-    assert "matched_overlays AS MATERIALIZED" in status_sql
-    assert "FROM matched_overlays AS overlay" in status_sql
+    _assert_location_status_sql_contract(str(status_call.args[0]))
 
 
 @pytest.mark.asyncio
-async def test_location_status_lookup_skips_status_query_when_relation_missing(
+async def test_location_status_lookup_missing_relation_uses_owned_transaction(
     monkeypatch,
 ):
-    execute_stmt = AsyncMock(
-        return_value=_ResultRows(
-            [
-                {
-                    "table_name": table_name,
-                    "is_available": table_name
-                    != npi_module.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-                }
-                for table_name in (
-                    npi_module.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-                    *npi_module.PROVIDER_DIRECTORY_VISIBILITY_TABLES,
-                )
-            ]
-        )
-    )
+    request_session = AsyncMock()
+    status_session = object()
+    transaction_events = []
+
+    @asynccontextmanager
+    async def owned_status_session():
+        transaction_events.append("enter")
+        try:
+            yield status_session
+        except RuntimeError:
+            transaction_events.append("rollback")
+            raise
+        finally:
+            transaction_events.append("exit")
+
+    execute_stmt = AsyncMock(side_effect=RuntimeError("missing relation"))
+    monkeypatch.setattr(npi_module.db, "session", owned_status_session)
     monkeypatch.setattr(npi_module, "_execute_stmt", execute_stmt)
 
     status_map = await npi_module._fetch_location_status_by_record_id(
-        ["synthetic-role-a"]
+        [
+            "provider_directory_fhir:practitioner_role:source-a:role-a:location-a"
+        ],
+        session=request_session,
     )
 
     assert status_map == {}
-    assert execute_stmt.await_count == 1
-    assert "requested_columns AS" in str(
-        execute_stmt.await_args.args[0]
-    )
+    execute_stmt.assert_awaited_once()
+    assert execute_stmt.await_args.kwargs["session"] is status_session
+    assert transaction_events == ["enter", "rollback", "exit"]
+    request_session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
