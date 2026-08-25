@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import importlib.util
 import sys
 import threading
@@ -115,9 +116,12 @@ async def test_page_keeps_latest_attempt_separate_from_last_good_publication():
             "facility_anchor_id": "facility-1",
             "attempt_id": "attempt-1",
             "attempt_status": "failed",
+            "started_at": dt.datetime(2026, 8, 25, 17, 11, 18, tzinfo=dt.UTC),
+            "finished_at": dt.datetime(2026, 8, 25, 17, 11, 19, tzinfo=dt.UTC),
             "error_code": "source_unavailable",
             "version_id": "a" * 64,
             "generation": 2,
+            "last_success_at": dt.datetime(2026, 8, 24, 12, tzinfo=dt.UTC),
             "service_count": 10,
             "charge_count": 20,
             "payer_charge_count": 30,
@@ -133,8 +137,13 @@ async def test_page_keeps_latest_attempt_separate_from_last_good_publication():
 
     page = await status_api.list_hospital_price_status_page(limit=1)
 
-    assert page["items"][0]["latest_attempt"]["status"] == "failed"
-    assert page["items"][0]["publication"]["generation"] == 2
+    latest_attempt = page["items"][0]["latest_attempt"]
+    publication = page["items"][0]["publication"]
+    assert latest_attempt["status"] == "failed"
+    assert latest_attempt["started_at"] == "2026-08-25T17:11:18+00:00"
+    assert latest_attempt["finished_at"] == "2026-08-25T17:11:19+00:00"
+    assert publication["generation"] == 2
+    assert publication["last_success_at"] == "2026-08-24T12:00:00+00:00"
     assert page["next_cursor"] == "hospital-000001"
     assert page["summary"] == {
         "total": 3,
