@@ -46,6 +46,10 @@ async def _create_unified_address_table(database: Database, schema: str) -> None
             address_key uuid,
             premise_key uuid,
             address_source_mask bigint NOT NULL DEFAULT 0,
+            geo_evidence_source_id smallint,
+            geo_identity_coherent boolean,
+            geo_point_coherent boolean,
+            geo_assurance_version smallint,
             address_sources varchar[] NOT NULL DEFAULT '{{}}',
             source_record_ids varchar[] NOT NULL DEFAULT '{{}}',
             source_count int NOT NULL DEFAULT 0,
@@ -75,6 +79,27 @@ async def _create_unified_address_table(database: Database, schema: str) -> None
             last_seen_at timestamptz
         )
         """
+    )
+
+
+async def _create_geo_assurance_state_table(database: Database, schema: str) -> None:
+    await database.status(
+        f"""
+        CREATE TABLE {schema}.entity_address_geo_assurance_state (
+            singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+            active_geo_assurance_version smallint,
+            active_table_oid oid,
+            active_relation_signature jsonb,
+            candidate_geo_assurance_version smallint,
+            candidate_table_oid oid,
+            candidate_relation_signature jsonb,
+            candidate_projected_rows bigint
+        )
+        """
+    )
+    await database.status(
+        f"INSERT INTO {schema}.entity_address_geo_assurance_state (singleton) "
+        "VALUES (true)"
     )
 
 
@@ -206,6 +231,7 @@ async def _create_geo_reference_tables(database: Database, schema: str) -> None:
 async def _create_tables(database: Database, schema: str) -> None:
     await database.status("CREATE EXTENSION IF NOT EXISTS postgis")
     await _create_unified_address_table(database, schema)
+    await _create_geo_assurance_state_table(database, schema)
     await _create_unified_address_geo_index(database, schema)
     await _create_evidence_table(database, schema)
     await _create_mrf_address_table(database, schema)
@@ -218,6 +244,7 @@ async def _create_tables(database: Database, schema: str) -> None:
 def _schema_sql(sql: str, schema: str) -> str:
     for table_name in (
         "doctor_clinician_address",
+        "entity_address_geo_assurance_state",
         "entity_address_evidence",
         "entity_address_unified",
         "npi",
@@ -242,6 +269,10 @@ def _schema_sql(sql: str, schema: str) -> str:
             rf"{source_relation}(?![A-Za-z0-9_])",
             rf"\g<prefix>{schema}.{table_name}",
             sql,
+        )
+        sql = sql.replace(
+            f"'{serving.PTG2_SCHEMA}.{table_name}'",
+            f"'{schema}.{table_name}'",
         )
     for source_relation, target_relation in (
         ("tiger.zip_state", f"{schema}.zip_state"),

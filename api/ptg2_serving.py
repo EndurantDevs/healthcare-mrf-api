@@ -21,6 +21,7 @@ from sqlalchemy import text
 
 from db.connection import db as sa_db
 
+from api import ptg2_geo_projection as geo_projection
 from api.ptg2_address_policy import (
     PTG_ADDRESS_KIND_POSTAL_BOX,
     PTG2_LEGACY_ADDRESS_COLUMNS as _PTG2_LEGACY_ADDRESS_COLUMNS,
@@ -124,6 +125,7 @@ from api.ptg2_db_sidecars import (
     lookup_shared_graph_members_from_db,
     lookup_shared_price_atom_memberships_from_db,
     lookup_shared_price_atoms_from_db,
+    lookup_shared_provider_code_intersections_from_db,
     lookup_shared_provider_code_keys_from_db,
     lookup_shared_provider_pages_from_db,
 )
@@ -405,36 +407,19 @@ def _ptg2_nullish_text_sql(value_sql: str) -> str:
 def _ptg2_independent_issuer_sql(issuer_array_sql: str) -> str:
     """Require two distinct, nonblank issuer identities."""
 
-    return f"""(
-        SELECT COUNT(DISTINCT LOWER(BTRIM(issuer_name)))
-          FROM UNNEST(COALESCE({issuer_array_sql}, ARRAY[]::varchar[])) AS issuer_names(issuer_name)
-         WHERE NULLIF(BTRIM(issuer_name), '') IS NOT NULL
-    ) >= 2"""
+    return geo_projection.independent_issuer_sql(issuer_array_sql)
 
 
 def _ptg2_nonblank_array_value_sql(array_sql: str) -> str:
     """Require one nonblank value without trusting raw array cardinality."""
 
-    return f"""EXISTS (
-        SELECT 1
-          FROM UNNEST({array_sql}) AS array_values(array_value)
-         WHERE NULLIF(BTRIM(array_value::text), '') IS NOT NULL
-    )"""
+    return geo_projection.nonblank_array_value_sql(array_sql)
 
 
 def _ptg2_mrf_lineage_complete_sql(alias: str) -> str:
     """Require one MRF row to carry a truthful version and retrieval time."""
 
-    return f"""(
-        (
-            {_ptg2_nonblank_array_value_sql(f'{alias}.source_import_ids')}
-            OR {alias}.date_added IS NOT NULL
-        )
-        AND (
-            {_ptg2_nonblank_array_value_sql(f'{alias}.source_import_dates')}
-            OR {alias}.date_added IS NOT NULL
-        )
-    )"""
+    return geo_projection.mrf_lineage_complete_sql(alias)
 
 
 def _geo_evidence_level_case_sql(
@@ -445,66 +430,26 @@ def _geo_evidence_level_case_sql(
 ) -> str:
     """Classify one admitted address with stable evidence precedence."""
 
-    return f"""CASE
-        WHEN {nppes_condition_sql} THEN 'nppes_registry_address'
-        WHEN {mrf_condition_sql} THEN 'multi_issuer_marketplace_address'
-        WHEN {cms_condition_sql} THEN 'cms_doctors_source_with_nppes_identity_anchor'
-        ELSE NULL::varchar
-    END"""
+    return geo_projection.evidence_level_case_sql(
+        nppes_condition_sql=nppes_condition_sql,
+        mrf_condition_sql=mrf_condition_sql,
+        cms_condition_sql=cms_condition_sql,
+    )
 
 
 def _ptg2_geo_evidence_level_sql(alias: str) -> str:
     """Return the record-level evidence class for one selected address."""
 
-    nppes_condition_sql = f"""(
-        ({alias}.address_source_mask & 1) <> 0
-        AND {alias}.address_key IS NOT NULL
-        AND EXISTS (
-            SELECT 1
-              FROM {PTG2_SCHEMA}.npi_address AS geo_nppes
-             WHERE geo_nppes.npi = {alias}.npi
-               AND geo_nppes.address_key = {alias}.address_key
-               AND geo_nppes.date_added IS NOT NULL
-        )
-    )"""
-    mrf_condition_sql = f"""EXISTS (
-        SELECT 1
-          FROM {PTG2_SCHEMA}.mrf_address AS geo_mrf
-         WHERE geo_mrf.npi = {alias}.npi
-           AND geo_mrf.address_key = {alias}.address_key
-           AND {_ptg2_independent_issuer_sql('geo_mrf.source_issuer_names')}
-           AND {_ptg2_mrf_lineage_complete_sql('geo_mrf')}
-    )"""
-    cms_condition_sql = f"""(
-        ({alias}.address_source_mask & 4) <> 0
-        AND {alias}.address_key IS NOT NULL
-        AND {alias}.premise_key IS NOT NULL
-        AND EXISTS (
-            SELECT 1
-              FROM {PTG2_SCHEMA}.doctor_clinician_address AS geo_doctor
-             WHERE geo_doctor.npi = {alias}.npi
-               AND geo_doctor.address_key = {alias}.address_key
-               AND geo_doctor.updated_at IS NOT NULL
-        )
-        AND EXISTS (
-            SELECT 1
-              FROM {PTG2_SCHEMA}.entity_address_unified AS geo_nppes_anchor
-              JOIN {PTG2_SCHEMA}.npi_address AS geo_nppes_anchor_source
-                ON geo_nppes_anchor_source.npi = geo_nppes_anchor.npi
-               AND geo_nppes_anchor_source.address_key = geo_nppes_anchor.address_key
-               AND geo_nppes_anchor_source.date_added IS NOT NULL
-             WHERE geo_nppes_anchor.npi = {alias}.npi
-               AND geo_nppes_anchor.premise_key = {alias}.premise_key
-               AND (geo_nppes_anchor.address_source_mask & 1) <> 0
-               AND geo_nppes_anchor.type IN (
-                   'primary', 'secondary', 'practice', 'site'
-               )
-        )
-    )"""
-    return _geo_evidence_level_case_sql(
-        nppes_condition_sql=nppes_condition_sql,
-        mrf_condition_sql=mrf_condition_sql,
-        cms_condition_sql=cms_condition_sql,
+    legacy_source_id_sql = geo_projection.legacy_evidence_source_id_sql(
+        alias,
+        schema_name=PTG2_SCHEMA,
+    )
+    return geo_projection.projected_evidence_level_sql(
+        alias,
+        schema_name=PTG2_SCHEMA,
+        legacy_level_sql=geo_projection.evidence_level_from_source_id_sql(
+            legacy_source_id_sql
+        ),
     )
 
 
@@ -9749,6 +9694,8 @@ WITH located AS MATERIALIZED (
         addr.address_key,
         addr.premise_key,
         addr.address_source_mask,
+        addr.geo_evidence_source_id,
+        addr.geo_assurance_version,
         {distance_sql} AS distance_miles,
         addr.type,
         addr.checksum
@@ -9758,7 +9705,8 @@ WITH located AS MATERIALIZED (
 ), nppes_requested AS MATERIALIZED (
     SELECT DISTINCT located.npi, located.address_key
     FROM located
-    WHERE (located.address_source_mask & 1) <> 0
+    WHERE {legacy_geo_evidence_required_sql}
+      AND (located.address_source_mask & 1) <> 0
       AND located.address_key IS NOT NULL
 ), nppes_assured AS MATERIALIZED (
     SELECT requested.npi, requested.address_key
@@ -9777,7 +9725,8 @@ WITH located AS MATERIALIZED (
     LEFT JOIN nppes_assured nppes
       ON nppes.npi = located.npi
      AND nppes.address_key = located.address_key
-    WHERE located.address_key IS NOT NULL
+    WHERE {legacy_geo_evidence_required_sql}
+      AND located.address_key IS NOT NULL
       AND (
           (located.address_source_mask & 1) = 0
           OR nppes.npi IS NULL
@@ -9803,7 +9752,8 @@ WITH located AS MATERIALIZED (
     LEFT JOIN mrf_assured mrf
       ON mrf.npi = located.npi
      AND mrf.address_key = located.address_key
-    WHERE (located.address_source_mask & 4) <> 0
+    WHERE {legacy_geo_evidence_required_sql}
+      AND (located.address_source_mask & 4) <> 0
       AND located.address_key IS NOT NULL
       AND located.premise_key IS NOT NULL
       AND (
@@ -11053,6 +11003,53 @@ def _membership_tiebreak_sql(*, uses_unified_addresses: bool) -> str:
     return "COALESCE(addr.address_key::text, ''), COALESCE(addr.type, '')"
 
 
+def _membership_geo_sql_values(
+    *,
+    uses_unified_addresses: bool,
+    address_assurance_sql: str,
+) -> dict[str, str]:
+    """Return projected geo evidence values for the location SQL templates."""
+
+    geo_evidence_level_sql = (
+        _ptg2_geo_evidence_level_sql("addr")
+        if uses_unified_addresses and address_assurance_sql != "TRUE"
+        else "NULL::varchar"
+    )
+    legacy_evidence_level_sql = _geo_evidence_level_case_sql(
+        nppes_condition_sql=(
+            "(located.address_source_mask & 1) <> 0 AND nppes.npi IS NOT NULL"
+        ),
+        mrf_condition_sql="mrf.npi IS NOT NULL",
+        cms_condition_sql=(
+            "(located.address_source_mask & 4) <> 0 AND cms.npi IS NOT NULL"
+        ),
+    )
+    return {
+        "geo_evidence_level_sql": geo_evidence_level_sql,
+        "selected_geo_evidence_source_id_sql": _geo_evidence_source_id_sql(
+            "selected.geo_evidence_level"
+        ),
+        "knn_geo_evidence_source_id_sql": _geo_evidence_source_id_sql(
+            "addr.geo_evidence_level"
+        ),
+        "mrf_issuer_assurance_sql": _ptg2_independent_issuer_sql(
+            "mrf.source_issuer_names"
+        ),
+        "mrf_lineage_complete_sql": _ptg2_mrf_lineage_complete_sql("mrf"),
+        "assured_geo_evidence_level_sql": geo_projection.projected_evidence_level_sql(
+            "located",
+            schema_name=PTG2_SCHEMA,
+            legacy_level_sql=legacy_evidence_level_sql,
+        ),
+        "legacy_geo_evidence_required_sql": "("
+        + geo_projection.projected_evidence_available_sql(
+            "located",
+            schema_name=PTG2_SCHEMA,
+        )
+        + ") IS NOT TRUE",
+    }
+
+
 def _membership_sql_values(
     query_context: _MembershipLocationQuery,
     *,
@@ -11064,11 +11061,6 @@ def _membership_sql_values(
         "addr", query_context.address_table
     )
     uses_unified_addresses = _is_unified_address_table(query_context.address_table)
-    geo_evidence_level_sql = (
-        _ptg2_geo_evidence_level_sql("addr")
-        if uses_unified_addresses and query_context.address_assurance_sql != "TRUE"
-        else "NULL::varchar"
-    )
     format_values_by_name = {
         "location_hash_sql": location_hash_sql,
         "telephone_sql": _ptg2_nullish_text_sql("addr.telephone_number"),
@@ -11085,28 +11077,12 @@ def _membership_sql_values(
         "filter_sql": query_context.filter_sql,
         "address_assurance_sql": query_context.address_assurance_sql,
         "postal_box_rank_sql": address_display_rank_sql("addr"),
-        "geo_evidence_level_sql": geo_evidence_level_sql,
         "location_tiebreak_sql": _membership_tiebreak_sql(
             uses_unified_addresses=uses_unified_addresses
         ),
-        "selected_geo_evidence_source_id_sql": _geo_evidence_source_id_sql(
-            "selected.geo_evidence_level"
-        ),
-        "knn_geo_evidence_source_id_sql": _geo_evidence_source_id_sql(
-            "addr.geo_evidence_level"
-        ),
-        "mrf_issuer_assurance_sql": _ptg2_independent_issuer_sql(
-            "mrf.source_issuer_names"
-        ),
-        "mrf_lineage_complete_sql": _ptg2_mrf_lineage_complete_sql("mrf"),
-        "assured_geo_evidence_level_sql": _geo_evidence_level_case_sql(
-            nppes_condition_sql=(
-                "(located.address_source_mask & 1) <> 0 AND nppes.npi IS NOT NULL"
-            ),
-            mrf_condition_sql="mrf.npi IS NOT NULL",
-            cms_condition_sql=(
-                "(located.address_source_mask & 4) <> 0 AND cms.npi IS NOT NULL"
-            ),
+        **_membership_geo_sql_values(
+            uses_unified_addresses=uses_unified_addresses,
+            address_assurance_sql=query_context.address_assurance_sql,
         ),
     }
     return format_values_by_name, uses_unified_addresses
@@ -14110,6 +14086,78 @@ def _geo_rate_selection_budget(
     )
 
 
+@dataclass(frozen=True)
+class _V4GeoRateForwardLimits:
+    maximum_retained_memberships: int
+    maximum_projection_members: int
+    maximum_code_sets: int
+    maximum_graph_batches: int
+    scan_budget: ForwardReadBudget
+
+
+def _v4_geo_rate_limit(manifest: Mapping[str, Any], field_name: str) -> int:
+    try:
+        value = int(manifest[field_name])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 sealed forward-read limits are malformed"
+        ) from exc
+    if value <= 0:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 sealed forward-read limits must be positive"
+        )
+    return value
+
+
+def _v4_geo_rate_forward_limits(
+    serving_tables: PTG2ServingTables,
+) -> _V4GeoRateForwardLimits:
+    """Reuse the authenticated V4 physical-read caps for oversized geo rates."""
+
+    projection_manifest = (
+        serving_tables.provider_graph_v4_inferred_taxonomy_candidates
+    )
+    if not isinstance(projection_manifest, Mapping):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 snapshot is missing sealed forward-read limits"
+        )
+    limits_by_name = {
+        field_name: _v4_geo_rate_limit(projection_manifest, field_name)
+        for field_name in (
+            "max_online_inferred_taxonomy_retained_memberships",
+            "max_online_candidate_pattern_projection_members",
+            "max_online_inferred_taxonomy_graph_pages",
+            "max_online_inferred_taxonomy_graph_bytes",
+            "max_online_inferred_taxonomy_graph_batches",
+            "max_online_filtered_reverse_code_occurrences",
+            "max_online_filtered_reverse_code_sets",
+        )
+    }
+    return _V4GeoRateForwardLimits(
+        maximum_retained_memberships=limits_by_name[
+            "max_online_inferred_taxonomy_retained_memberships"
+        ],
+        maximum_projection_members=limits_by_name[
+            "max_online_candidate_pattern_projection_members"
+        ],
+        maximum_code_sets=limits_by_name["max_online_filtered_reverse_code_sets"],
+        maximum_graph_batches=limits_by_name[
+            "max_online_inferred_taxonomy_graph_batches"
+        ],
+        scan_budget=ForwardReadBudget(
+            maximum_fragments=limits_by_name[
+                "max_online_inferred_taxonomy_graph_pages"
+            ],
+            maximum_raw_payload_bytes=limits_by_name[
+                "max_online_inferred_taxonomy_graph_bytes"
+            ],
+            maximum_row_capacity=(
+                limits_by_name["max_online_filtered_reverse_code_occurrences"] + 1
+            ),
+        ),
+    )
+
+
 def _geo_rate_provider_counts(
     rate_rows: Sequence[Mapping[str, Any]],
     known_provider_counts_by_id: Mapping[str, int],
@@ -14533,17 +14581,198 @@ async def _select_geo_filtered_rate_prefix(
     )
 
 
-async def _select_geo_rate_request(
+async def _oversized_geo_local_provider_sets(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: Mapping[str, Any],
+    budget: _GeoRateSelectionBudget,
+    forward_limits: _V4GeoRateForwardLimits,
+) -> tuple[int, ...] | None:
+    """Resolve the bounded exact V4 provider sets for one local geo scope."""
+
+    reverse_geo_scope = await _cached_reverse_geo_scope(
+        session,
+        serving_tables,
+        args,
+        budget,
+    )
+    if reverse_geo_scope is None:
+        return None
+    candidate_npis, is_source_exhausted, _candidate_limit = reverse_geo_scope
+    if not candidate_npis:
+        if not is_source_exhausted:
+            raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+        return ()
+    if not is_source_exhausted:
+        raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+    try:
+        with v4_graph_taxonomy_projection_scope(
+            maximum_members=forward_limits.maximum_projection_members,
+            maximum_pages=forward_limits.scan_budget.maximum_fragments,
+            maximum_bytes=forward_limits.scan_budget.maximum_raw_payload_bytes,
+            maximum_batches=forward_limits.maximum_graph_batches,
+        ):
+            provider_set_keys_by_npi = await _v4_sets_by_npi(
+                session,
+                serving_tables,
+                candidate_npis,
+                allowed_provider_set_keys=None,
+                max_members=forward_limits.maximum_retained_memberships,
+                max_projection_members=forward_limits.maximum_projection_members,
+            )
+    except PTG2OnlineWorkBudgetExceeded as exc:
+        raise PTG2OnlineWorkBudgetExceeded("candidate_members") from exc
+    except PTG2SharedBlockError as exc:
+        if not _is_v4_member_limit(exc):
+            raise
+        raise PTG2OnlineWorkBudgetExceeded("candidate_members") from exc
+    return tuple(
+        sorted(
+            {
+                int(provider_set_key)
+                for npi_provider_set_keys in provider_set_keys_by_npi.values()
+                for provider_set_key in npi_provider_set_keys
+            }
+        )
+    )
+
+
+async def _oversized_geo_code_provider_sets(
+    session,
+    serving_tables: PTG2ServingTables,
+    code_keys: tuple[int, ...],
+    local_provider_set_keys: tuple[int, ...],
+    budget: _GeoRateSelectionBudget,
+    maximum_retained_memberships: int,
+    maximum_code_sets: int,
+) -> tuple[int, ...]:
+    """Keep only bounded local sets that contain a requested code variant."""
+
+    if len(local_provider_set_keys) > maximum_code_sets:
+        raise PTG2OnlineWorkBudgetExceeded("code_sets")
+    try:
+        code_keys_by_provider_set = (
+            await lookup_shared_provider_code_intersections_from_db(
+                session,
+                _required_shared_snapshot_key(serving_tables),
+                local_provider_set_keys,
+                code_keys,
+                max_retained_memberships=(
+                    min(
+                        maximum_retained_memberships,
+                        (budget.maximum_geo_provider_sets + 1)
+                        * max(len(code_keys), 1),
+                    )
+                ),
+                schema_name=PTG2_SCHEMA,
+            )
+        )
+    except PTG2ManifestArtifactError as exc:
+        if "provider-code intersections exceed their retention limit" not in str(exc):
+            raise
+        raise PTG2OnlineWorkBudgetExceeded("candidate_members") from exc
+    if set(code_keys_by_provider_set) != set(local_provider_set_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 provider-code artifact is missing a local provider set"
+        )
+    matching_provider_set_keys = tuple(
+        provider_set_key
+        for provider_set_key in local_provider_set_keys
+        if code_keys_by_provider_set[provider_set_key]
+    )
+    if len(matching_provider_set_keys) > budget.maximum_geo_provider_sets:
+        raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+    return matching_provider_set_keys
+
+
+async def _read_oversized_geo_rate_rows(
     session,
     serving_tables: PTG2ServingTables,
     request: _GeoRateSelectionRequest,
+    budget: _GeoRateSelectionBudget,
+    provider_set_keys: tuple[int, ...],
+    scan_budget: ForwardReadBudget,
 ) -> _GeoRateSelection | None:
-    """Execute one prevalidated aggregate geo-rate selection request."""
+    """Read one bounded ordered page from the exact local provider sets."""
 
-    declared_rate_count = _declared_geo_rate_count(request.code_rows)
-    if declared_rate_count <= 0:
+    target_count = max(int(request.target_count), 1)
+    read_limit = min(target_count + 1, budget.caps.maximum_rate_rows)
+    scoped_rate_rows = await _merge_manifest_code_variant_rows(
+        session,
+        serving_tables,
+        code_rows=request.code_rows,
+        provider_set_keys=provider_set_keys,
+        source_trace_set_hash=None,
+        network_names=request.network_names,
+        limit=read_limit,
+        offset=0,
+        descending=request.descending,
+        scan_budget=scan_budget,
+    )
+    if scoped_rate_rows is None:
+        return None
+    budget.claim_rate_page(len(scoped_rate_rows))
+    return _GeoRateSelection(
+        tuple(scoped_rate_rows[:target_count]),
+        exhausted=len(scoped_rate_rows) < read_limit,
+    )
+
+
+async def _select_oversized_geo_rate_scope(
+    session,
+    serving_tables: PTG2ServingTables,
+    request: _GeoRateSelectionRequest,
+    budget: _GeoRateSelectionBudget,
+) -> _GeoRateSelection | None:
+    """Read cost rows only for provider sets reached by an exact local scope."""
+
+    if max(int(request.target_count), 1) > budget.caps.maximum_rate_rows:
+        raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+    code_keys = tuple(_manifest_code_rows_by_key(request.code_rows))
+    if len(code_keys) > budget.caps.maximum_rate_rows:
+        raise PTG2OnlineWorkBudgetExceeded("forward_scan")
+    forward_limits = _v4_geo_rate_forward_limits(serving_tables)
+    local_provider_set_keys = await _oversized_geo_local_provider_sets(
+        session,
+        serving_tables,
+        request.args,
+        budget,
+        forward_limits,
+    )
+    if local_provider_set_keys is None:
+        return None
+    if not local_provider_set_keys:
         return _GeoRateSelection((), True)
-    budget = _geo_rate_selection_budget(serving_tables)
+    provider_set_keys = await _oversized_geo_code_provider_sets(
+        session,
+        serving_tables,
+        code_keys,
+        local_provider_set_keys,
+        budget,
+        forward_limits.maximum_retained_memberships,
+        forward_limits.maximum_code_sets,
+    )
+    if not provider_set_keys:
+        return _GeoRateSelection((), True)
+    return await _read_oversized_geo_rate_rows(
+        session,
+        serving_tables,
+        request,
+        budget,
+        provider_set_keys,
+        forward_limits.scan_budget,
+    )
+
+
+async def _select_bounded_geo_rate_scope(
+    session,
+    serving_tables: PTG2ServingTables,
+    request: _GeoRateSelectionRequest,
+    budget: _GeoRateSelectionBudget,
+    declared_rate_count: int,
+) -> _GeoRateSelection | None:
+    """Scan authenticated national rate pages within their sealed work budget."""
+
     selected_rows: list[dict[str, Any]] = []
     eligibility_by_provider_set_id: dict[str, bool] = {}
     rate_offset = 0
@@ -14592,6 +14821,36 @@ async def _select_geo_rate_request(
             rate_offset >= declared_rate_count
             and len(selected_rows) < normalized_target
         ),
+    )
+
+
+async def _select_geo_rate_request(
+    session,
+    serving_tables: PTG2ServingTables,
+    request: _GeoRateSelectionRequest,
+) -> _GeoRateSelection | None:
+    """Execute one prevalidated aggregate geo-rate selection request."""
+
+    declared_rate_count = _declared_geo_rate_count(request.code_rows)
+    if declared_rate_count <= 0:
+        return _GeoRateSelection((), True)
+    budget = _geo_rate_selection_budget(serving_tables)
+    if (
+        declared_rate_count > budget.caps.maximum_rate_rows
+        and serving_tables.provider_graph_v4_inferred_taxonomy_candidates is not None
+    ):
+        return await _select_oversized_geo_rate_scope(
+            session,
+            serving_tables,
+            request,
+            budget,
+        )
+    return await _select_bounded_geo_rate_scope(
+        session,
+        serving_tables,
+        request,
+        budget,
+        declared_rate_count,
     )
 
 

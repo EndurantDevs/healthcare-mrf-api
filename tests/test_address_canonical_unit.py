@@ -2675,16 +2675,22 @@ def test_entity_address_unified_provider_directory_replacement_can_copy_into_hea
 
 def test_provider_directory_replacement_stage_rebuilds_indexes_after_promote():
     source = inspect.getsource(entity_address_unified.process_data)
+    publish_source = inspect.getsource(
+        entity_address_unified.publish_entity_address_unified_generation
+    )
     promote = "ALTER TABLE {db_schema}.{replacement_stage_table} RENAME TO {stage_table};"
     invalidate = 'context["stage_indexes_prepared"] = False'
     rebuild = "await _create_stage_indexes(stage_cls, db_schema, context=context)"
 
     promote_at = source.index(promote)
     invalidate_at = source.index(invalidate, promote_at)
-    rebuild_at = source.index(rebuild, promote_at)
+    projection_at = publish_source.index("await _materialize_geo_assurance(")
+    compact_at = publish_source.index("await _compact_geo_assurance_stage(")
+    rebuild_at = publish_source.index(rebuild)
 
-    assert promote_at < invalidate_at < rebuild_at
-    assert "partial_provider_directory_replacement_stage_indexes_invalidated" in source[promote_at:rebuild_at]
+    assert promote_at < invalidate_at
+    assert projection_at < compact_at < rebuild_at
+    assert "partial_provider_directory_replacement_stage_indexes_invalidated" in source[promote_at:]
 
 
 @pytest.mark.asyncio
@@ -2760,6 +2766,22 @@ async def test_provider_directory_partial_shutdown_uses_atomic_publisher(monkeyp
     monkeypatch.setattr(entity_address_unified, "_support_stage_classes", lambda _import_date: {})
     monkeypatch.setattr(entity_address_unified, "mark_control_run", AsyncMock())
     monkeypatch.setattr(entity_address_unified, "_publish_staged_entity_address_tables", publish_mock)
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_drop_stage_secondary_indexes",
+        AsyncMock(return_value=0),
+    )
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_materialize_geo_assurance",
+        AsyncMock(return_value=120),
+    )
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_compact_geo_assurance_stage",
+        AsyncMock(return_value="set_logged"),
+    )
+    monkeypatch.setattr(entity_address_unified, "_create_stage_indexes", AsyncMock())
 
     await entity_address_unified.shutdown(_partial_shutdown_payload())
 

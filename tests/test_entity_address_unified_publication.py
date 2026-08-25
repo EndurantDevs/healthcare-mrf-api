@@ -56,6 +56,8 @@ class _RecordingDB:
             return 1
         if "pg_try_advisory_xact_lock" in statement:
             return self.advisory_values.pop(0)
+        if "entity_address_geo_assurance_state" in statement:
+            return 123
         raise AssertionError(f"unexpected scalar SQL: {statement}")
 
     async def all(self, statement, **params):
@@ -120,6 +122,7 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
     ]
     assert cutover_context_map["cutover_attempts"] == 1
     assert cutover_context_map["stage_persistence"] == "p"
+    assert cutover_context_map["geo_assurance_active_table_oid"] == 123
 
 
 @pytest.mark.asyncio

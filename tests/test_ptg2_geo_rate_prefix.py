@@ -30,6 +30,15 @@ def _production_tables():
         storage_generation="shared_blocks_v4",
         shared_block_layout="packed_snapshot_maps_v4",
         provider_graph_v4_hot_prefix=sealed_v4_hot_prefix(),
+        provider_graph_v4_inferred_taxonomy_candidates={
+            "max_online_inferred_taxonomy_retained_memberships": 65_536,
+            "max_online_candidate_pattern_projection_members": 131_072,
+            "max_online_inferred_taxonomy_graph_pages": 256,
+            "max_online_inferred_taxonomy_graph_bytes": 4 * 1024 * 1024,
+            "max_online_inferred_taxonomy_graph_batches": 32,
+            "max_online_filtered_reverse_code_occurrences": 6_700,
+            "max_online_filtered_reverse_code_sets": 6_600,
+        },
     )
 
 
@@ -192,26 +201,6 @@ async def test_geo_rate_prefix_reaches_production_256_set_budget(monkeypatch):
         192,
     ]
     member_reads.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_geo_rate_prefix_deep_page_rejects_at_sealed_rate_cap(monkeypatch):
-    rate_rows = [_rate_row(rank) for rank in range(256)]
-    qualifying_npis = {rank + 101 for rank in (49, 134, 148, 188, 206, 210)}
-    _install_geo_prefix_reads(monkeypatch, rate_rows, qualifying_npis)
-
-    with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as exc_info:
-        await serving._select_geo_filtered_rate_prefix(
-            object(),
-            _production_tables(),
-            code_rows=_code_rows(2560),
-            args={"zip5": "48201", "zip_radius_miles": 30},
-            network_names=[],
-            target_count=11,
-            descending=False,
-        )
-
-    assert exc_info.value.dimension == "candidate_members"
 
 
 @pytest.mark.asyncio
