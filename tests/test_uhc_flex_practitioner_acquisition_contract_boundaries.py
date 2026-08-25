@@ -74,6 +74,14 @@ def test_duration_and_aggregate_contracts_reject_noncanonical_values(value):
         )
 
 
+def test_runtime_accepts_the_documented_concurrency_ceiling():
+    assert contract.UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_CONCURRENCY == 32
+    assert contract.UHCFlexPractitionerAcquisitionConfig(
+        enabled=True,
+        concurrency=32,
+    ).concurrency == 32
+
+
 @pytest.mark.asyncio
 async def test_receipt_contracts_reject_each_closed_identity_boundary():
     receipt = await acquire_with_harness(AcquisitionHarness(npi_count=1))

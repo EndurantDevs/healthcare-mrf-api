@@ -294,11 +294,6 @@ async def test_runtime_concurrency_and_connection_limit_are_hard_bounded():
     assert receipt.expected_npi_count == 8
     assert harness.maximum_active_fetches == 3
     assert [session.connection_limit for session in harness.sessions] == [3, 3]
-    assert acquisition.UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_CONCURRENCY == 32
-    assert acquisition.UHCFlexPractitionerAcquisitionConfig(
-        enabled=True,
-        concurrency=32,
-    ).concurrency == 32
     with pytest.raises(ValueError):
         acquisition.UHCFlexPractitionerAcquisitionConfig(
             enabled=True,
