@@ -26,6 +26,7 @@ from process.provider_directory_profile_selection import (
     ProviderDirectoryProfileSelectionError,
     validated_profile_execution,
 )
+from process.hospital_hpt_registry import selected_hospital_hpt_registry
 from process.provider_directory_fhir_census_contract import (
     ProviderDirectoryFHIRAcquisitionStrategy,
 )
@@ -316,6 +317,14 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_function": "process_data",
         "run_shutdown": True,
     },
+    "hospital-prices": {
+        "queue": "arq:HospitalPrices",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.hospital_prices",
+        "target_function": "process_data",
+        "job_prefix": "hospital_prices_start",
+    },
 }
 
 _PTG_CONTROL_QUEUES = frozenset({"arq:PTG", "arq:PTGSmall", "arq:PTGNormal", "arq:PTGLarge", "arq:PTGHuge"})
@@ -371,6 +380,7 @@ _CANCELABLE_IMPORTERS = {
     "clinical-reference",
     "ms-drg",
     "openaddresses",
+    "hospital-prices",
 }
 _FINISH_IMPORTERS = {
     "mrf",
@@ -478,7 +488,10 @@ def importer_names() -> set[str]:
 
 
 def _importer_family(importer: str) -> str:
-    if importer in {"ptg", "ptg-candidate-audit", "mrf", "mrf-source-discovery"}:
+    if importer in {
+        "ptg", "ptg-candidate-audit", "mrf", "mrf-source-discovery",
+        "hospital-prices",
+    }:
         return "mrf"
     if importer in {"claims-pricing", "claims-procedures", "drug-claims"}:
         return "claims"
@@ -1915,6 +1928,17 @@ def _validate_provider_directory_profile_execution_params(
         raise ValueError(str(exc)) from exc
 
 
+def _validate_hospital_price_params(
+    importer: str, params: dict[str, Any]
+) -> None:
+    if importer != "hospital-prices":
+        return
+    try:
+        selected_hospital_hpt_registry(params)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def _normalize_triggered_by(value: Any) -> str:
     triggered_by = str(value or "api").strip() or "api"
     return triggered_by[:MAX_TRIGGERED_BY_LENGTH].rstrip("-_:. ") or "api"
@@ -2152,6 +2176,7 @@ async def create_import_run(
         importer,
         effective_params_by_name,
     )
+    _validate_hospital_price_params(importer, effective_params_by_name)
     if importer == "provider-directory-fhir":
         validated_publication_candidate_from_params(
             effective_params_by_name

@@ -126,6 +126,34 @@ def test_redirect_rewrites_303_and_rejects_missing_or_excessive_locations(monkey
     assert len(looping.calls) == source_download._MAX_REDIRECTS + 1
 
 
+def test_public_resolver_rejects_rebound_private_address(monkeypatch) -> None:
+    class RebindingResolver:
+        def __init__(self) -> None:
+            self.addresses = iter(("8.8.8.8", "127.0.0.1"))
+
+        async def resolve(self, host, port=0, family=0):
+            return [{
+                "hostname": host, "host": next(self.addresses), "port": port,
+                "family": family, "proto": 0, "flags": 0,
+            }]
+
+        async def close(self):
+            return None
+
+    delegate = RebindingResolver()
+    monkeypatch.delenv("HLTHPRT_FETCH_ALLOW_LOCAL", raising=False)
+    monkeypatch.setattr(source_download.aiohttp, "DefaultResolver", lambda: delegate)
+
+    async def resolve_twice():
+        resolver = source_download._PublicResolver()
+        assert (await resolver.resolve("example.test", 443))[0]["host"] == "8.8.8.8"
+        with pytest.raises(UnsafeUrlError, match="127.0.0.1"):
+            await resolver.resolve("example.test", 443)
+        await resolver.close()
+
+    asyncio.run(resolve_twice())
+
+
 def test_validated_request_releases_response(monkeypatch) -> None:
     response = _Response()
 

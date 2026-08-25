@@ -32,6 +32,7 @@ use ptg2_scanner::hashing::{
     checksum_i64_list, hash_i64_list, hash_string_list, hash_text, make_checksum, semantic_hash,
     update_hash_string_list, xxh3_63,
 };
+use ptg2_scanner::hospital_mrf::run_hospital_mrf_cli;
 use ptg2_scanner::input::{
     is_gzip, open_full_scan_json_reader, open_full_scan_reader,
     open_full_scan_reader_exporting_index, open_indexed_ranges_reader, open_json_reader,
@@ -38042,6 +38043,9 @@ fn run_cli() -> io::Result<()> {
             )
         })?;
         return scan_compact(Path::new(&compact_path));
+    }
+    if first_arg == "--hospital-mrf-copy" {
+        return run_hospital_mrf_cli(&args.collect::<Vec<_>>());
     }
     if first_arg == "--uhc-retain" {
         return run_uhc_retain_cli(&args.collect::<Vec<_>>());

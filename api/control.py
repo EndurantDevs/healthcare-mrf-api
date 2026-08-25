@@ -25,7 +25,7 @@ from api.control_frozen_rate_files import (
 )
 from api.control_workers import guarded_ensure_worker, worker_registry
 from api.control_auth import require_control_auth as _require_control_auth
-from api.control_wave_routes import register_control_wave_routes
+from api.control_route_registration import register_control_routes
 from api.control_ptg_source_attempt_errors import (
     register_source_attempt_error_handler,
 )
@@ -60,7 +60,7 @@ from process.ptg_parts.source_snapshot_control import (
     retire_ptg2_source_snapshot,
 )
 
-blueprint = register_control_wave_routes(Blueprint("control", url_prefix="/control/v1"))
+blueprint = register_control_routes(Blueprint("control", url_prefix="/control/v1"))
 register_source_attempt_error_handler(blueprint)
 register_source_snapshot_rollback_route(blueprint)
 register_v4_control_routes(blueprint)

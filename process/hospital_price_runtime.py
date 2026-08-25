@@ -1,0 +1,195 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+"""Shared resource and cancellation guards for hospital-price imports."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import shutil
+from contextlib import asynccontextmanager
+from typing import Any, Sequence
+
+from process.control_cancel import raise_if_cancelled
+from process.hospital_price_acquisition import (
+    MAX_HOSPITAL_HPT_LOCATOR_BYTES,
+    PTG2_DEFAULT_MAX_BYTES,
+    positive_env,
+)
+from process.hospital_price_store import renew_attempt_leases
+from process.hospital_price_native import HOSPITAL_MRF_MAX_DECOMPRESSED_BYTES_ENV
+from process.live_progress import enqueue_live_progress
+from process.ptg_parts.artifacts import PTG2ArtifactStore
+
+
+def strict_positive_env(name: str, default: int | None = None) -> int:
+    """Read one required positive integer environment value."""
+
+    raw_value = os.getenv(name)
+    if raw_value is None and default is not None:
+        return default
+    try:
+        value = int(raw_value or "")
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive integer") from exc
+    if value < 1:
+        raise RuntimeError(f"{name} must be a positive integer")
+    return value
+
+
+def resource_limits(
+    store: PTG2ArtifactStore,
+    requested_fetches: int,
+    requested_loads: int,
+    locator_count: int,
+) -> tuple[int, int, int, int, int, int]:
+    """Derive worker counts and byte limits from explicit capacity budgets."""
+
+    max_raw = strict_positive_env(
+        "HLTHPRT_HOSPITAL_MRF_MAX_BYTES", PTG2_DEFAULT_MAX_BYTES
+    )
+    max_output = strict_positive_env("HLTHPRT_HOSPITAL_MRF_MAX_OUTPUT_BYTES")
+    max_decompressed = strict_positive_env(
+        HOSPITAL_MRF_MAX_DECOMPRESSED_BYTES_ENV
+    )
+    active_raw = strict_positive_env("HLTHPRT_HOSPITAL_PRICE_ACTIVE_RAW_BYTES")
+    active_scratch = strict_positive_env(
+        "HLTHPRT_HOSPITAL_PRICE_ACTIVE_SCRATCH_BYTES"
+    )
+    minimum_free = strict_positive_env("HLTHPRT_HOSPITAL_PRICE_MIN_FREE_BYTES")
+    fetches = min(requested_fetches, active_raw // max_raw)
+    loads = min(requested_loads, active_scratch // max_output)
+    if fetches < 1 or loads < 1:
+        raise RuntimeError("hospital price byte budgets cannot admit one source")
+    required_free = active_raw + active_scratch + minimum_free
+    require_disk_capacity(
+        store, required_free + locator_count * MAX_HOSPITAL_HPT_LOCATOR_BYTES
+    )
+    return fetches, loads, max_raw, max_decompressed, max_output, required_free
+
+
+def require_disk_capacity(store: PTG2ArtifactStore, required_free: int) -> None:
+    """Reject work unless the artifact volume has the required free bytes."""
+
+    if shutil.disk_usage(store.root).free < required_free:
+        raise RuntimeError("hospital price artifact storage capacity is insufficient")
+
+
+@asynccontextmanager
+async def hospital_resource_lock(store: PTG2ArtifactStore):
+    """Serialize capacity admission for one shared artifact volume."""
+
+    # ponytail: one run lock protects a shared artifact volume; replace it with
+    # cross-process weighted reservations if concurrent runs become necessary.
+    lock = store.named_lock("hospital-price", "resource-capacity")
+    acquire_task = asyncio.create_task(asyncio.to_thread(lock.acquire))
+    try:
+        await asyncio.shield(acquire_task)
+    except BaseException:
+        await acquire_task
+        lock.release()
+        raise
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+async def bounded(
+    items: Sequence[Any], concurrency: int, operation: Any
+) -> list[Any]:
+    """Run operations concurrently and drain every task after failure."""
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _run_one(item: Any) -> Any:
+        """Run one operation while holding a bounded slot."""
+        async with semaphore:
+            return await operation(item)
+
+    operation_tasks = [asyncio.create_task(_run_one(item)) for item in items]
+    try:
+        return list(await asyncio.gather(*operation_tasks))
+    except BaseException:
+        for operation_task in operation_tasks:
+            if not operation_task.done() and operation_task.cancelling() == 0:
+                operation_task.cancel()
+        await asyncio.gather(*operation_tasks, return_exceptions=True)
+        raise
+
+
+async def guard_cancellation(
+    ctx: dict[str, Any],
+    task: dict[str, Any],
+    operation: Any,
+    attempts: list[Any],
+    lease_owner: str,
+    lease_seconds: int,
+    heartbeat_seconds: int,
+) -> Any:
+    """Monitor cancellation and renew durable attempt leases during work."""
+
+    operation_task = asyncio.ensure_future(operation)
+
+    async def _monitor() -> None:
+        loop = asyncio.get_running_loop()
+        next_heartbeat = loop.time() + heartbeat_seconds
+        while True:
+            await asyncio.sleep(
+                positive_env("HLTHPRT_HOSPITAL_PRICE_CANCEL_POLL_SECONDS", 2)
+            )
+            await raise_if_cancelled(ctx, task)
+            if loop.time() >= next_heartbeat:
+                await renew_attempt_leases(
+                    attempts,
+                    lease_owner=lease_owner,
+                    lease_seconds=lease_seconds,
+                )
+                next_heartbeat = loop.time() + heartbeat_seconds
+
+    monitor_task = asyncio.create_task(_monitor())
+    try:
+        completed, _pending = await asyncio.wait(
+            {operation_task, monitor_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if operation_task in completed:
+            return await operation_task
+        return await monitor_task
+    finally:
+        for pending_task in (operation_task, monitor_task):
+            if not pending_task.done():
+                pending_task.cancel()
+        await asyncio.gather(operation_task, monitor_task, return_exceptions=True)
+
+
+def progress(
+    run_id: str | None, phase: str, done: int, total: int, message: str
+) -> None:
+    """Publish one hospital-price progress update."""
+
+    enqueue_live_progress(
+        run_id=run_id,
+        importer="hospital-prices",
+        status="running",
+        phase=phase,
+        unit="hospital",
+        done=done,
+        total=total,
+        pct=(100 * done / total if total else 100),
+        message=message,
+    )
+
+
+def locator_groups(
+    hospitals: Sequence[dict[str, str]],
+) -> tuple[tuple[str, tuple[dict[str, str], ...]], ...]:
+    """Group hospitals by locator while preserving registry order."""
+
+    hospitals_by_locator: dict[str, list[dict[str, str]]] = {}
+    for hospital in hospitals:
+        hospitals_by_locator.setdefault(hospital["cms_hpt_url"], []).append(hospital)
+    return tuple(
+        (url, tuple(hospital_rows))
+        for url, hospital_rows in hospitals_by_locator.items()
+    )

@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "cms_schema_revision": "5333564a710f80d7740180b9ffab8dbdcba9b502",
+  "environment": {
+    "machine": "arm64",
+    "postgres": "18.2 (Homebrew)"
+  },
+  "protocol": {
+    "warmup_trials": 1,
+    "measured_trials": 5,
+    "query_iterations_per_trial": 5,
+    "candidate_order": "rotated",
+    "source_format": "json"
+  },
+  "corpus": {
+    "hospitals": 100,
+    "facts": 250000,
+    "semantic_sha256": "b5193acad1dd682f35b791fe7b4a330026906214958106fa67f6f1e4142b99a6",
+    "reconstructed_sha256": "b4312c10ee11e606f0c31f301c2ec223f22a14b69c06f0c165ab33ee67f5eee2",
+    "source_bytes": {
+      "json": 58898158,
+      "tall_csv": 50048974,
+      "wide_csv": 20647058
+    }
+  },
+  "gates": {
+    "semantic_parity": "passed",
+    "response_parity": "passed",
+    "max_storage_ratio_to_typed": 1.0,
+    "max_query_p95_ratio_to_typed": 1.25,
+    "max_query_p95_additive_ms": 1.0,
+    "survivors": ["typed"],
+    "winner": "typed"
+  },
+  "candidates": {
+    "typed": {
+      "median_import_seconds": 3.5989297097548842,
+      "storage_bytes": {
+        "heap": 38682624,
+        "index": 56238080,
+        "toast": 221184,
+        "total": 95141888,
+        "wal": 96729288
+      },
+      "query_latency_ms": {
+        "hospital_code": {"p50": 0.238, "p95": 0.264, "p99": 0.264},
+        "payer_plan": {"p50": 5.727, "p95": 7.234, "p99": 7.234},
+        "details": {"p50": 0.205, "p95": 0.237, "p99": 0.237},
+        "comparison": {"p50": 19.621, "p95": 23.164, "p99": 23.164},
+        "stats": {"p50": 4.989, "p95": 5.158, "p99": 5.158},
+        "pagination": {"p50": 0.256, "p95": 0.285, "p99": 0.285},
+        "zero_match": {"p50": 0.070, "p95": 0.089, "p99": 0.089},
+        "high_fanout": {"p50": 1.247, "p95": 2.089, "p99": 2.089},
+        "ein_exact": {"p50": 0.263, "p95": 0.621, "p99": 0.621}
+      }
+    },
+    "dictionary": {
+      "median_import_seconds": 4.400189456064254,
+      "storage_bytes": {
+        "heap": 36642816,
+        "index": 37609472,
+        "toast": 221184,
+        "total": 74473472,
+        "wal": 77573400
+      },
+      "query_latency_ms": {
+        "hospital_code": {"p50": 0.603, "p95": 0.680, "p99": 0.680},
+        "payer_plan": {"p50": 0.496, "p95": 0.604, "p99": 0.604},
+        "details": {"p50": 0.637, "p95": 0.710, "p99": 0.710},
+        "comparison": {"p50": 12.665, "p95": 15.430, "p99": 15.430},
+        "stats": {"p50": 5.557, "p95": 5.666, "p99": 5.666},
+        "pagination": {"p50": 0.912, "p95": 0.950, "p99": 0.950},
+        "zero_match": {"p50": 0.114, "p95": 0.138, "p99": 0.138},
+        "high_fanout": {"p50": 3.366, "p95": 3.721, "p99": 3.721},
+        "ein_exact": {"p50": 0.658, "p95": 0.761, "p99": 0.761}
+      }
+    },
+    "blocks": {
+      "median_import_seconds": 23.399946707766503,
+      "storage_bytes": {
+        "heap": 34054144,
+        "index": 58769408,
+        "toast": 7225344,
+        "total": 100048896,
+        "wal": 101519120
+      },
+      "query_latency_ms": {
+        "hospital_code": {"p50": 10.471, "p95": 10.849, "p99": 10.849},
+        "payer_plan": {"p50": 11.129, "p95": 11.481, "p99": 11.481},
+        "details": {"p50": 10.160, "p95": 10.256, "p99": 10.256},
+        "comparison": {"p50": 364.178, "p95": 369.843, "p99": 369.843},
+        "stats": {"p50": 20.513, "p95": 20.806, "p99": 20.806},
+        "pagination": {"p50": 234.839, "p95": 240.110, "p99": 240.110},
+        "zero_match": {"p50": 0.102, "p95": 0.121, "p99": 0.121},
+        "high_fanout": {"p50": 11.729, "p95": 12.418, "p99": 12.418},
+        "ein_exact": {"p50": 9.883, "p95": 10.042, "p99": 10.042}
+      }
+    }
+  }
+}
