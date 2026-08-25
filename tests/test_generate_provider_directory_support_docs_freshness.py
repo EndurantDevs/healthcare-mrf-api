@@ -62,7 +62,7 @@ def test_freshness_validation_accepts_current_reviews():
         ("idaho", "api-ida-prd.safhir.io cursor continuations with checkpoints"),
         ("molina", "checkpointed 497,700 Location rows"),
         ("michigan", "Synthetic _getpagesoffset continuation is not equivalent"),
-        ("cigna", "_count=75 returns false-empty search sets"),
+        ("cigna", "both _count=100 and _count=75 returned populated search sets"),
         ("aetna-commercial-medicare", "OAuth2 client credentials and Bulk"),
         ("humana", "catalog product aliases are neutralized"),
         ("iehp", "Normalizes portal and resource paths"),

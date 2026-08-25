@@ -31,7 +31,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "CareSource (`caresource`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint" in rendered_document
     assert "processed and unique candidate resource IDs equal unchanged post-scan census" in rendered_document
     assert "No product membership is inferred from the catalog row" in rendered_document
-    assert "_count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets" in rendered_document
+    assert "both _count=100 and _count=75 returned populated search sets" in rendered_document
     assert "ALOHR (`alohr`) | Acquisition-configured | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole | https://" in rendered_document
     assert "UnitedHealthcare Official Provider Files (`uhc-provider-files`) | Acquisition-configured | None | Official files | InsurancePlan, Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole" in rendered_document
     assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Probe | None configured" in rendered_document
@@ -54,7 +54,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`)" in rendered_document
     assert "Required | 2026-07-11 | 2026-08-25 | OAuth2 client credentials and Bulk" in rendered_document
     assert "Cigna (`cigna`)" in rendered_document
-    assert "Not required | 2026-07-10 | 2026-08-24 | Sequential REST pagination" in rendered_document
+    assert "Not required | 2026-08-25 | 2026-10-09 | Sequential REST pagination" in rendered_document
     assert "## Observed Live Verification" in rendered_document
     assert "| Terminal status | Resource completion | Derived artifacts | Unified/API readiness | Readiness observed at |" in rendered_document
     assert "| ALOHR (`alohr`) | Not recorded | Not recorded | Not recorded | Not Promoted | Not Ready |" in rendered_document
@@ -307,7 +307,7 @@ def test_blocker_registry_is_complete_and_shared_with_generated_docs():
     assert "Not importable | None confirmed | None confirmed" in rendered
     assert "Practitioner, PractitionerRole, Location | None confirmed" in rendered
     assert "| Live verification |" in rendered
-    assert "2026-07-10" in rendered
+    assert "2026-08-25" in rendered
 
 
 def test_validate_blocker_registry_rejects_unknown_access_requirement():
