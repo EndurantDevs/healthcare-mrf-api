@@ -87,10 +87,11 @@ fn validate_payer(
     let derived_charge =
         payer.standard_charge_percentage.is_some() || payer.standard_charge_algorithm.is_some();
     if derived_charge {
-        let count = payer
-            .allowed_count
-            .as_deref()
-            .ok_or_else(|| invalid("percentage and algorithm charges require count"))?;
+        let Some(count) = payer.allowed_count.as_deref() else {
+            return Err(invalid(
+                "percentage and algorithm charges require count",
+            ));
+        };
         if count != "0"
             && (payer.median_amount.is_none()
                 || payer.percentile_10.is_none()

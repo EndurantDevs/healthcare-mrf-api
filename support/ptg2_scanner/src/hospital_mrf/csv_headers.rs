@@ -13,7 +13,8 @@ fn parse_csv<R: Read>(
     let general_headers = next_csv_record(&mut records, "general header row")?;
     let general_values = next_csv_record(&mut records, "general value row")?;
     let data_headers = next_csv_record(&mut records, "data header row")?;
-    let (metadata, contract_provision) = parse_csv_metadata(&general_headers, &general_values)?;
+    let (metadata, contract_provision) =
+        parse_csv_metadata(&general_headers, &general_values, max_fanout_rows)?;
     metadata.validate(true)?.emit(version_id, outputs)?;
     if let Some(contract_provision) = contract_provision {
         emit_contract_provision(outputs, version_id, 0, contract_provision)?;
@@ -32,15 +33,16 @@ fn next_csv_record<R: Read>(
     records: &mut csv::StringRecordsIter<'_, R>,
     name: &str,
 ) -> io::Result<StringRecord> {
-    records
-        .next()
-        .ok_or_else(|| invalid(format!("missing {name}")))?
-        .map_err(to_io_error)
+    match records.next() {
+        Some(record) => record.map_err(to_io_error),
+        None => Err(invalid(format!("missing {name}"))),
+    }
 }
 
 fn parse_csv_metadata(
     headers: &StringRecord,
     values: &StringRecord,
+    max_fanout_rows: usize,
 ) -> io::Result<(GeneralMetadata, Option<ContractProvision>)> {
     let mut fields = BTreeMap::<String, usize>::new();
     let mut license_state = None;
@@ -86,9 +88,9 @@ fn parse_csv_metadata(
         }
     }
     let value = |name: &str| -> io::Result<&str> {
-        let index = fields
-            .get(name)
-            .ok_or_else(|| invalid(format!("missing general CSV header {name}")))?;
+        let Some(index) = fields.get(name) else {
+            return Err(invalid(format!("missing general CSV header {name}")));
+        };
         Ok(values.get(*index).unwrap_or("").trim())
     };
     let optional_value = |name: &str| {
@@ -97,8 +99,9 @@ fn parse_csv_metadata(
             .and_then(|index| values.get(*index))
             .and_then(optional_text)
     };
-    let attestation_index =
-        attestation_index.ok_or_else(|| invalid("missing attestation header"))?;
+    let Some(attestation_index) = attestation_index else {
+        return Err(invalid("missing attestation header"));
+    };
     let confirm_attestation = match values
         .get(attestation_index)
         .unwrap_or("")
@@ -110,7 +113,12 @@ fn parse_csv_metadata(
         "false" => false,
         _ => return Err(invalid("attestation value must be true or false")),
     };
-    let license_index = license_index.ok_or_else(|| invalid("missing license_number header"))?;
+    let Some(license_index) = license_index else {
+        return Err(invalid("missing license_number header"));
+    };
+    let Some(license_state) = license_state else {
+        return Err(invalid("missing license state"));
+    };
     let contract_provision =
         optional_value("general_contract_provisions").map(|provisions| ContractProvision {
             payer_name: None,
@@ -122,12 +130,24 @@ fn parse_csv_metadata(
             hospital_name: value("hospital_name")?.to_owned(),
             last_updated_on: canonical_csv_date(value("last_updated_on")?)?,
             version: value("version")?.to_owned(),
-            location_names: split_pipe(value("location_name")?),
-            hospital_addresses: split_pipe(value("hospital_address")?),
-            type_2_npis: split_pipe(value("type_2_npi")?),
+            location_names: split_pipe_bounded(
+                value("location_name")?,
+                "location_name",
+                max_fanout_rows,
+            )?,
+            hospital_addresses: split_pipe_bounded(
+                value("hospital_address")?,
+                "hospital_address",
+                max_fanout_rows,
+            )?,
+            type_2_npis: split_pipe_bounded(
+                value("type_2_npi")?,
+                "type_2_npi",
+                max_fanout_rows,
+            )?,
             license: License {
                 license_number: optional_text(values.get(license_index).unwrap_or("")),
-                state: license_state.ok_or_else(|| invalid("missing license state"))?,
+                state: license_state,
             },
             attestation_text: ATTESTATION_TEXT.to_owned(),
             confirm_attestation,
@@ -136,13 +156,6 @@ fn parse_csv_metadata(
         },
         contract_provision,
     ))
-}
-
-fn split_pipe(value: &str) -> Vec<String> {
-    value
-        .split('|')
-        .filter_map(optional_text)
-        .collect::<Vec<_>>()
 }
 
 fn split_pipe_bounded(value: &str, field: &str, limit: usize) -> io::Result<Vec<String>> {
@@ -174,15 +187,9 @@ fn canonical_csv_date(value: &str) -> io::Result<String> {
     if year.len() != 4 || !year.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(invalid("last_updated_on contains an invalid year"));
     }
-    let year_number = year
-        .parse::<u32>()
-        .map_err(|_| invalid("last_updated_on contains an invalid year"))?;
-    let month_number = month
-        .parse::<u32>()
-        .map_err(|_| invalid("last_updated_on contains an invalid month"))?;
-    let day_number = day
-        .parse::<u32>()
-        .map_err(|_| invalid("last_updated_on contains an invalid day"))?;
+    let year_number = parse_date_number(year, "year")?;
+    let month_number = parse_date_number(month, "month")?;
+    let day_number = parse_date_number(day, "day")?;
     let leap_year = year_number.is_multiple_of(4)
         && (!year_number.is_multiple_of(100) || year_number.is_multiple_of(400));
     let maximum_day = match month_number {
@@ -198,6 +205,15 @@ fn canonical_csv_date(value: &str) -> io::Result<String> {
     Ok(format!(
         "{year_number:04}-{month_number:02}-{day_number:02}"
     ))
+}
+
+fn parse_date_number(value: &str, part: &str) -> io::Result<u32> {
+    match value.parse::<u32>() {
+        Ok(value) => Ok(value),
+        Err(_) => Err(invalid(format!(
+            "last_updated_on contains an invalid {part}"
+        ))),
+    }
 }
 
 fn canonical_json_date(value: &str) -> io::Result<String> {
@@ -231,7 +247,13 @@ fn find_header(headers: &StringRecord, parts: &[&str]) -> io::Result<usize> {
             return Err(invalid(format!("duplicate CSV header {}", parts.join("|"))));
         }
     }
-    found.ok_or_else(|| invalid(format!("missing CSV header {}", parts.join("|"))))
+    match found {
+        Some(index) => Ok(index),
+        None => Err(invalid(format!(
+            "missing CSV header {}",
+            parts.join("|")
+        ))),
+    }
 }
 
 fn find_optional_header(headers: &StringRecord, parts: &[&str]) -> io::Result<Option<usize>> {
@@ -264,9 +286,14 @@ fn parse_common_columns(
             _ => continue,
         };
         let ordinal_text = ordinal.as_str();
-        let ordinal = ordinal_text
-            .parse::<usize>()
-            .map_err(|_| invalid("code CSV headers must replace [i] with a positive integer"))?;
+        let ordinal = match ordinal_text.parse::<usize>() {
+            Ok(ordinal) => ordinal,
+            Err(_) => {
+                return Err(invalid(
+                    "code CSV headers must replace [i] with a positive integer",
+                ));
+            }
+        };
         if ordinal == 0 || ordinal.to_string() != ordinal_text {
             return Err(invalid(
                 "code CSV header ordinals must use canonical positive integers",
@@ -294,10 +321,15 @@ fn parse_common_columns(
     let codes = code_columns
         .into_iter()
         .map(|(ordinal, (code, code_type))| {
+            let Some(code) = code else {
+                return Err(invalid(format!("code {ordinal} is missing")));
+            };
+            let Some(code_type) = code_type else {
+                return Err(invalid(format!("code {ordinal} type is missing")));
+            };
             Ok(CodeColumns {
-                code: code.ok_or_else(|| invalid(format!("code {ordinal} is missing")))?,
-                code_type: code_type
-                    .ok_or_else(|| invalid(format!("code {ordinal} type is missing")))?,
+                code,
+                code_type,
             })
         })
         .collect::<io::Result<Vec<_>>>()?;
@@ -340,6 +372,19 @@ fn parse_tall_columns(
         allowed_count: find_header(headers, &["count"])?,
         methodology: find_header(headers, &["standard_charge", "methodology"])?,
     })
+}
+
+fn required_wide_column(
+    value: Option<usize>,
+    payer_label: &str,
+    name: &str,
+) -> io::Result<usize> {
+    match value {
+        Some(value) => Ok(value),
+        None => Err(invalid(format!(
+            "wide CSV payer {payer_label} is missing {name}"
+        ))),
+    }
 }
 
 fn parse_wide_columns(
@@ -429,34 +474,54 @@ fn parse_wide_columns(
         .map(|key| {
             let builder = payers.remove(&key).expect("wide payer key exists");
             let payer_label = format!("{} / {}", builder.payer_name, builder.plan_name);
-            let missing =
-                |name: &str| invalid(format!("wide CSV payer {payer_label} is missing {name}",));
             Ok(WidePayerColumns {
                 payer_name: builder.payer_name,
                 plan_name: builder.plan_name,
-                standard_charge_dollar: builder
-                    .standard_charge_dollar
-                    .ok_or_else(|| missing("negotiated_dollar"))?,
-                standard_charge_percentage: builder
-                    .standard_charge_percentage
-                    .ok_or_else(|| missing("negotiated_percentage"))?,
-                standard_charge_algorithm: builder
-                    .standard_charge_algorithm
-                    .ok_or_else(|| missing("negotiated_algorithm"))?,
-                median_amount: builder
-                    .median_amount
-                    .ok_or_else(|| missing("median_amount"))?,
-                percentile_10: builder
-                    .percentile_10
-                    .ok_or_else(|| missing("10th_percentile"))?,
-                percentile_90: builder
-                    .percentile_90
-                    .ok_or_else(|| missing("90th_percentile"))?,
-                allowed_count: builder.allowed_count.ok_or_else(|| missing("count"))?,
-                methodology: builder.methodology.ok_or_else(|| missing("methodology"))?,
-                additional_payer_notes: builder
-                    .additional_payer_notes
-                    .ok_or_else(|| missing("additional_payer_notes"))?,
+                standard_charge_dollar: required_wide_column(
+                    builder.standard_charge_dollar,
+                    &payer_label,
+                    "negotiated_dollar",
+                )?,
+                standard_charge_percentage: required_wide_column(
+                    builder.standard_charge_percentage,
+                    &payer_label,
+                    "negotiated_percentage",
+                )?,
+                standard_charge_algorithm: required_wide_column(
+                    builder.standard_charge_algorithm,
+                    &payer_label,
+                    "negotiated_algorithm",
+                )?,
+                median_amount: required_wide_column(
+                    builder.median_amount,
+                    &payer_label,
+                    "median_amount",
+                )?,
+                percentile_10: required_wide_column(
+                    builder.percentile_10,
+                    &payer_label,
+                    "10th_percentile",
+                )?,
+                percentile_90: required_wide_column(
+                    builder.percentile_90,
+                    &payer_label,
+                    "90th_percentile",
+                )?,
+                allowed_count: required_wide_column(
+                    builder.allowed_count,
+                    &payer_label,
+                    "count",
+                )?,
+                methodology: required_wide_column(
+                    builder.methodology,
+                    &payer_label,
+                    "methodology",
+                )?,
+                additional_payer_notes: required_wide_column(
+                    builder.additional_payer_notes,
+                    &payer_label,
+                    "additional_payer_notes",
+                )?,
             })
         })
         .collect::<io::Result<Vec<_>>>()?;

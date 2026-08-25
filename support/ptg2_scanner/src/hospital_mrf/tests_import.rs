@@ -108,6 +108,18 @@
         assert_eq!(second.file.metadata().unwrap().len(), 0);
         second.write_all(b"de").unwrap();
         assert_eq!(aggregate_bytes.load(Ordering::Relaxed), 5);
+
+        let mut closed = CopySink::create(
+            directory.path(),
+            CopyKind::Mrf,
+            Arc::new(AtomicU64::new(0)),
+            128,
+        )
+        .unwrap();
+        closed.write_fields(&[Some("row")]).unwrap();
+        closed.finish().unwrap();
+        assert!(closed.write_fields(&[Some("second row")]).is_err());
+        assert!(closed.finish().is_err());
     }
 
     #[test]
@@ -116,6 +128,23 @@
         for value in ["0", "-1", "not-a-number"] {
             let error = parse_max_output_bytes(value).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+        for (fanout, decompressed, output, expected) in [
+            (0, 1, 1, "max fanout rows must be positive"),
+            (1, 0, 1, "max decompressed bytes must be positive"),
+            (1, 1, 0, "max output bytes must be positive"),
+        ] {
+            let error = import_hospital_mrf_with_limits(
+                InputFormat::Json,
+                VERSION_ID,
+                Path::new("unused-input"),
+                Path::new("unused-output"),
+                fanout,
+                decompressed,
+                output,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected));
         }
     }
 
@@ -170,6 +199,7 @@
                 ("payer_name", "Payer, Inc."),
                 ("plan_name", "Plan A"),
                 ("standard_charge | negotiated_dollar", "150.000"),
+                ("additional_generic_notes", "Tall payer note"),
             ],
         );
         let tall = append_csv_row(
@@ -193,7 +223,10 @@
         let tall_payers = String::from_utf8(tall_rows["modifier_payer"].clone()).unwrap();
         let tall_payer_fields = tall_payers.trim_end().split('\t').collect::<Vec<_>>();
         assert_eq!(tall_payer_fields.len(), MODIFIER_PAYER_COPY_COLUMNS.len());
-        assert_eq!(&tall_payer_fields[5..], &["\\N", "150", "\\N", "\\N"]);
+        assert_eq!(
+            &tall_payer_fields[5..],
+            &["Tall payer note", "150", "\\N", "\\N"]
+        );
 
         let wide = append_csv_row(
             &fixture_wide_csv(),
@@ -212,6 +245,89 @@
         let wide_payer_fields = wide_payers.trim_end().split('\t').collect::<Vec<_>>();
         assert_eq!(wide_payer_fields.len(), MODIFIER_PAYER_COPY_COLUMNS.len());
         assert_eq!(&wide_payer_fields[5..], &["\\N", "\\N", "62.5", "\\N"]);
+
+        let merged_wide = append_csv_row(
+            &fixture_wide_csv(),
+            &[
+                ("description", "MRI,\nbrain"),
+                ("code|1", "70551"),
+                ("code|1|type", "CPT"),
+                ("modifiers", "26|TC"),
+                ("setting", "outpatient"),
+                ("billing_class", "facility"),
+                ("standard_charge|gross", "12.34"),
+                ("standard_charge|discounted_cash", "10.5"),
+                (
+                    "standard_charge|Payer, Inc.|Plan A|negotiated_dollar",
+                    "8.5",
+                ),
+                ("count|Payer, Inc.|Plan A", "1 THROUGH 10"),
+                (
+                    "standard_charge|Payer, Inc.|Plan A|methodology",
+                    "fee schedule",
+                ),
+                ("standard_charge|min", "7"),
+                ("standard_charge|max", "11"),
+            ],
+        );
+        let merged_rows = run_fixture(InputFormat::WideCsv, &merged_wide, false);
+        let merged_charge = String::from_utf8(merged_rows["charge"].clone()).unwrap();
+        let merged_charge_fields = merged_charge.trim_end().split('\t').collect::<Vec<_>>();
+        assert_eq!(merged_charge_fields[7], "7");
+        assert_eq!(merged_charge_fields[8], "11");
+        let merged_payers = String::from_utf8(merged_rows["payer_charge"].clone()).unwrap();
+        let merged_payer_fields = merged_payers
+            .lines()
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert_eq!(merged_payer_fields.len(), 2);
+        assert_eq!(merged_payer_fields[1][12], "1 through 10");
+
+        let mut json_value: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+        json_value["standard_charge_information"][0]["standard_charges"][0]
+            ["payers_information"][0]["count"] = json!("1 through 10");
+        json_value["standard_charge_information"][0]["standard_charges"][0]
+            ["payers_information"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "payer_name": "Payer, Inc.",
+                "plan_name": "A Plan",
+                "standard_charge_dollar": 9.5,
+                "methodology": "fee schedule"
+            }));
+        json_value["modifier_information"] = json!([{
+            "code": "25",
+            "description": "Professional component",
+            "setting": "outpatient",
+            "modifier_payer_information": [{
+                "payer_name": "Payer, Inc.",
+                "plan_name": "Plan A",
+                "description": "Contract note"
+            }]
+        }]);
+        let json_rows = run_fixture(
+            InputFormat::Json,
+            &serde_json::to_vec(&json_value).unwrap(),
+            false,
+        );
+        let payer_lines = String::from_utf8(json_rows["payer_charge"].clone()).unwrap();
+        let payer_fields = payer_lines
+            .lines()
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert_eq!(payer_fields.len(), 2);
+        assert_eq!(payer_fields[0][5], "A Plan");
+        assert_eq!(payer_fields[1][5], "Plan A");
+        assert_eq!(payer_fields[1][12], "1 through 10");
+        assert_eq!(
+            String::from_utf8(json_rows["modifier"].clone()).unwrap(),
+            "fixture-version\t0\t25\tProfessional component\toutpatient\t\\N\n"
+        );
+        assert_eq!(
+            String::from_utf8(json_rows["modifier_payer"].clone()).unwrap(),
+            "fixture-version\t0\t0\tPayer, Inc.\tPlan A\tContract note\t\\N\t\\N\t\\N\n"
+        );
     }
 
     #[test]

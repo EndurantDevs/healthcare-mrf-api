@@ -25,6 +25,7 @@ use struson::reader::{JsonReader, JsonStreamReader};
 
 include!("hospital_mrf/schema_and_output.rs");
 include!("hospital_mrf/zip_input.rs");
+include!("hospital_mrf/resource_limits.rs");
 include!("hospital_mrf/import_and_values.rs");
 include!("hospital_mrf/rows_and_metadata.rs");
 include!("hospital_mrf/validation_and_json_types.rs");

@@ -15,6 +15,7 @@ from typing import Any, Sequence
 
 from db.models import HospitalPriceVersion, db
 from process.control_cancel import ImportCancelledError
+from process.formulary_fhir.async_safety import drain_operation
 from process.hospital_hpt_locator import (
     MAX_HOSPITAL_HPT_LOCATOR_BYTES,
     HospitalHptLocatorRecord,
@@ -243,7 +244,8 @@ async def fetch_locator(
             max_bytes=MAX_HOSPITAL_HPT_LOCATOR_BYTES,
             keep_partial_artifacts=False, exact_get_evidence=True,
         )
-        records = parse_hospital_hpt_locator(Path(raw.raw_path).read_bytes())
+        payload = await asyncio.to_thread(Path(raw.raw_path).read_bytes)
+        records = parse_hospital_hpt_locator(payload)
         status = "redirected_verified" if raw.head and raw.head.url != url else "verified"
         await _record_locator_observation(url, locator, observation, status, raw)
         return LocatorResult(url, locator, observation, hospitals, records)
@@ -258,6 +260,22 @@ async def fetch_locator(
         return LocatorResult(url, locator, observation, hospitals, None, code, detail)
 
 
+def _locator_error_candidates(locator_result: LocatorResult) -> tuple[Candidate, ...]:
+    return tuple(
+        Candidate(
+            hospital_id=hospital["hospital_id"],
+            hospital_name=hospital["name"],
+            locator_id=locator_result.locator_id,
+            observation_id=locator_result.observation_id,
+            source_url=locator_result.url,
+            locator_name=hospital.get("locator_name") or hospital["name"],
+            initial_error_code=locator_result.error_code or "locator_invalid",
+            initial_error_detail=locator_result.error_detail,
+        )
+        for hospital in locator_result.hospitals
+    )
+
+
 def candidates_from_locators(
     locator_results: Sequence[LocatorResult],
 ) -> tuple[Candidate, ...]:
@@ -266,21 +284,7 @@ def candidates_from_locators(
     candidates: list[Candidate] = []
     for locator_result in locator_results:
         if locator_result.records is None:
-            candidates.extend(
-                Candidate(
-                    hospital_id=hospital["hospital_id"],
-                    hospital_name=hospital["name"],
-                    locator_id=locator_result.locator_id,
-                    observation_id=locator_result.observation_id,
-                    source_url=locator_result.url,
-                    locator_name=hospital.get("locator_name") or hospital["name"],
-                    initial_error_code=(
-                        locator_result.error_code or "locator_invalid"
-                    ),
-                    initial_error_detail=locator_result.error_detail,
-                )
-                for hospital in locator_result.hospitals
-            )
+            candidates.extend(_locator_error_candidates(locator_result))
             continue
         match = match_hospital_hpt_locator(
             locator_result.hospitals, locator_result.url, locator_result.records
@@ -386,10 +390,18 @@ async def run_native_parser(
         )
     except BaseException:
         if process is None:
+            async def _wait_for_spawn() -> Any:
+                return await spawn
+
             try:
-                process = await asyncio.shield(spawn)
+                process = await drain_operation(
+                    _wait_for_spawn(), preserve_cancellation=False
+                )
             except BaseException:
                 process = None
         if process is not None and process.returncode is None:
-            await _terminate_asyncio_subprocess_group(process)
+            await drain_operation(
+                _terminate_asyncio_subprocess_group(process),
+                preserve_cancellation=False,
+            )
         raise

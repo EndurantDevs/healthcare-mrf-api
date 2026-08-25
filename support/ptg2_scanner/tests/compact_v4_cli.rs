@@ -8,6 +8,1080 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const RAW_MRF: &[u8] = include_bytes!("fixtures/compact_v4_mrf.json");
-include!("compact_v4_cli/helpers.rs");
-include!("compact_v4_cli/sidecar_tests.rs");
-include!("compact_v4_cli/failure_and_factor_tests.rs");
+
+fn sha256_hex(payload: &[u8]) -> String {
+    Sha256::digest(payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn file_sha256(path: &Path) -> String {
+    sha256_hex(&fs::read(path).expect("read artifact for digest"))
+}
+
+fn framed_json_records_named(output: &[u8], expected_kind: &str) -> Vec<Value> {
+    let mut records = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < output.len() {
+        let header_end = output[cursor..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| cursor + offset)
+            .expect("framed scanner output header newline");
+        let header = std::str::from_utf8(&output[cursor..header_end])
+            .expect("UTF-8 framed scanner output header");
+        let (kind, payload_length) = header
+            .split_once('\t')
+            .expect("scanner output kind and length");
+        let payload_length = payload_length
+            .parse::<usize>()
+            .expect("numeric scanner output payload length");
+        let payload_start = header_end + 1;
+        let payload_end = payload_start
+            .checked_add(payload_length)
+            .expect("scanner output payload boundary");
+        let payload = output
+            .get(payload_start..payload_end)
+            .expect("complete scanner output payload");
+        assert_eq!(output.get(payload_end), Some(&b'\n'));
+        if kind == expected_kind {
+            records.push(serde_json::from_slice(payload).expect("JSON scanner output payload"));
+        }
+        cursor = payload_end + 1;
+    }
+    records
+}
+
+fn json_sha256(value: &Value) -> String {
+    sha256_hex(&serde_json::to_vec(value).expect("encode digest payload"))
+}
+
+fn artifact_path(event: &Value) -> PathBuf {
+    PathBuf::from(event["path"].as_str().expect("artifact path"))
+}
+
+fn scanner_artifacts<'a>(payloads: &'a [Value], name: &str) -> Vec<&'a Value> {
+    let mut events = payloads
+        .iter()
+        .filter(|payload| {
+            payload["path"]
+                .as_str()
+                .is_some_and(|path| path.contains(name))
+        })
+        .collect::<Vec<_>>();
+    events.sort_by_key(|event| event["path"].as_str().expect("artifact path"));
+    events
+}
+
+fn append_pg_binary_field(payload: &mut Vec<u8>, field: &[u8]) {
+    payload.extend_from_slice(&(field.len() as i32).to_be_bytes());
+    payload.extend_from_slice(field);
+}
+
+fn decode_global_id(value: &str) -> [u8; 16] {
+    assert_eq!(value.len(), 32, "global ID must contain 32 hex digits");
+    let mut decoded = [0u8; 16];
+    for (index, destination) in decoded.iter_mut().enumerate() {
+        *destination = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .expect("lowercase global ID hex");
+    }
+    decoded
+}
+
+fn write_price_key_map(payloads: &[Value], path: &Path) -> usize {
+    let mut price_sets = BTreeMap::<String, f64>::new();
+    for event in scanner_artifacts(payloads, "price-set-summary.copy") {
+        let contents = fs::read_to_string(artifact_path(event)).expect("price-set summary");
+        for line in contents.lines().filter(|line| !line.is_empty()) {
+            let mut fields = line.split('\t');
+            let global_id = fields.next().expect("price-set global ID").to_owned();
+            let minimum_rate = fields
+                .next()
+                .expect("minimum negotiated rate")
+                .parse::<f64>()
+                .expect("numeric minimum negotiated rate");
+            price_sets
+                .entry(global_id)
+                .and_modify(|existing| *existing = existing.min(minimum_rate))
+                .or_insert(minimum_rate);
+        }
+    }
+    assert!(
+        !price_sets.is_empty(),
+        "scanner must emit price-set summaries"
+    );
+    let mut price_sets = price_sets.into_iter().collect::<Vec<_>>();
+    price_sets.sort_by(|(left_id, left_rate), (right_id, right_rate)| {
+        left_rate
+            .total_cmp(right_rate)
+            .then_with(|| left_id.cmp(right_id))
+    });
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+    payload.extend_from_slice(&0i32.to_be_bytes());
+    payload.extend_from_slice(&0i32.to_be_bytes());
+    for (price_key, (global_id, _minimum_rate)) in price_sets.iter().enumerate() {
+        payload.extend_from_slice(&2i16.to_be_bytes());
+        append_pg_binary_field(&mut payload, &decode_global_id(global_id));
+        append_pg_binary_field(&mut payload, &(price_key as i64).to_be_bytes());
+    }
+    payload.extend_from_slice(&(-1i16).to_be_bytes());
+    fs::write(path, payload).expect("write authoritative price-key map");
+    price_sets.len()
+}
+
+fn write_finalizer_manifest(payloads: &[Value], path: &Path) {
+    let source_identity = json!({
+        "source_type": "in_network",
+        "identity_kind": "raw_container_sha256_v1",
+        "identity_sha256": sha256_hex(RAW_MRF),
+    });
+    let mut serving_events = payloads
+        .iter()
+        .filter(|payload| payload["format"] == "ptg2_v3_serving_run")
+        .collect::<Vec<_>>();
+    serving_events.sort_by_key(|event| {
+        (
+            event["partition"].as_u64().expect("serving partition"),
+            event["path"].as_str().expect("serving path"),
+        )
+    });
+    assert!(!serving_events.is_empty(), "scanner must emit serving runs");
+    let partition_count = serving_events[0]["partition_count"]
+        .as_u64()
+        .expect("partition count") as usize;
+    let mut partition_rows = vec![0u64; partition_count];
+    let mut source_files = serving_events
+        .iter()
+        .map(|event| {
+            let partition = event["partition"].as_u64().expect("serving partition") as usize;
+            let row_count = event["row_count"].as_u64().expect("serving rows");
+            partition_rows[partition] += row_count;
+            json!({
+                "partition": partition,
+                "row_count": row_count,
+                "bytes": event["bytes"],
+                "sha256": event["sha256"],
+            })
+        })
+        .collect::<Vec<_>>();
+    source_files.sort_by_key(|entry| {
+        (
+            entry["partition"].as_u64().expect("source partition"),
+            entry["sha256"].as_str().expect("source digest").to_owned(),
+            entry["row_count"].as_u64().expect("source rows"),
+            entry["bytes"].as_u64().expect("source bytes"),
+        )
+    });
+    let source_contract_body = json!({
+        "version": 1,
+        "source_identity": source_identity,
+        "partition_count": partition_count,
+        "partition_rows": partition_rows,
+        "file_count": source_files.len(),
+        "row_count": source_files.iter().map(|entry| entry["row_count"].as_u64().unwrap()).sum::<u64>(),
+        "byte_count": source_files.iter().map(|entry| entry["bytes"].as_u64().unwrap()).sum::<u64>(),
+        "files": source_files,
+    });
+    let source_contract_sha256 = json_sha256(&source_contract_body);
+    let mut source_contract = source_contract_body.as_object().unwrap().clone();
+    source_contract.insert("source_key".to_owned(), json!(0));
+    source_contract.insert("contract_sha256".to_owned(), json!(source_contract_sha256));
+    let source_contracts = vec![Value::Object(source_contract)];
+
+    let mut code_events = payloads
+        .iter()
+        .filter(|payload| payload["format"] == "ptg2_v3_serving_code_dictionary")
+        .collect::<Vec<_>>();
+    code_events.sort_by_key(|event| event["path"].as_str().expect("code dictionary path"));
+    assert!(
+        !code_events.is_empty(),
+        "scanner must emit code dictionaries"
+    );
+    let mut code_files = code_events
+        .iter()
+        .map(|event| {
+            json!({
+                "row_count": event["row_count"],
+                "bytes": event["bytes"],
+                "sha256": event["sha256"],
+            })
+        })
+        .collect::<Vec<_>>();
+    code_files.sort_by_key(|entry| {
+        (
+            entry["sha256"].as_str().expect("code digest").to_owned(),
+            entry["row_count"].as_u64().expect("code rows"),
+            entry["bytes"].as_u64().expect("code bytes"),
+        )
+    });
+    let code_source_contract_body = json!({
+        "version": 1,
+        "source_identity": source_identity,
+        "source_run_contract_sha256": source_contract_sha256,
+        "file_count": code_files.len(),
+        "row_count": code_files.iter().map(|entry| entry["row_count"].as_u64().unwrap()).sum::<u64>(),
+        "byte_count": code_files.iter().map(|entry| entry["bytes"].as_u64().unwrap()).sum::<u64>(),
+        "files": code_files,
+    });
+    let code_source_contract_sha256 = json_sha256(&code_source_contract_body);
+    let mut code_source_contract = code_source_contract_body.as_object().unwrap().clone();
+    code_source_contract.insert("source_key".to_owned(), json!(0));
+    code_source_contract.insert(
+        "contract_sha256".to_owned(),
+        json!(code_source_contract_sha256),
+    );
+    let code_source_contracts = vec![Value::Object(code_source_contract)];
+
+    let serving_entries = serving_events
+        .iter()
+        .map(|event| {
+            json!({
+                "path": event["path"],
+                "partition": event["partition"],
+                "partition_count": event["partition_count"],
+                "source_key": 0,
+                "source_count": 1,
+                "row_count": event["row_count"],
+                "bytes": event["bytes"],
+                "sha256": event["sha256"],
+                "format": event["format"],
+                "version": event["version"],
+            })
+        })
+        .collect::<Vec<_>>();
+    let code_entries = code_events
+        .iter()
+        .map(|event| {
+            json!({
+                "path": event["path"],
+                "source_key": 0,
+                "source_count": 1,
+                "source_run_contract_sha256": source_contract_sha256,
+                "code_dictionary_contract_sha256": code_source_contract_sha256,
+                "row_count": event["row_count"],
+                "bytes": event["bytes"],
+                "sha256": event["sha256"],
+                "format": event["format"],
+                "version": event["version"],
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let provider_events = scanner_artifacts(payloads, "provider-set-metadata.copy");
+    assert!(
+        !provider_events.is_empty(),
+        "scanner must emit provider metadata"
+    );
+    let provider_entries = provider_events
+        .iter()
+        .map(|event| {
+            let artifact = artifact_path(event);
+            json!({
+                "path": artifact,
+                "source_key": 0,
+                "source_count": 1,
+                "physical_source_identity": source_identity,
+                "source_run_contract_sha256": source_contract_sha256,
+                "row_count": event["row_count"],
+                "bytes": event["bytes"],
+                "sha256": file_sha256(&artifact),
+                "format": "ptg2_v3_provider_set_metadata_copy",
+                "version": 1,
+            })
+        })
+        .collect::<Vec<_>>();
+    let code_contracts = code_entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "source_key": entry["source_key"],
+                "row_count": entry["row_count"],
+                "bytes": entry["bytes"],
+                "sha256": entry["sha256"],
+                "source_run_contract_sha256": entry["source_run_contract_sha256"],
+                "code_dictionary_contract_sha256": entry["code_dictionary_contract_sha256"],
+            })
+        })
+        .collect::<Vec<_>>();
+    let provider_contracts = provider_entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "source_key": entry["source_key"],
+                "row_count": entry["row_count"],
+                "bytes": entry["bytes"],
+                "sha256": entry["sha256"],
+                "source_run_contract_sha256": entry["source_run_contract_sha256"],
+            })
+        })
+        .collect::<Vec<_>>();
+    let manifest = json!({
+        "source_count": 1,
+        "source_run_contracts": source_contracts,
+        "source_run_contract_set_sha256": json_sha256(&json!({"source_run_contracts": source_contracts})),
+        "code_dictionary_source_contracts": code_source_contracts,
+        "code_dictionary_source_contract_set_sha256": json_sha256(&json!({"code_dictionary_source_contracts": code_source_contracts})),
+        "serving_run_partition_files": serving_entries,
+        "serving_run_code_dictionary_files": code_entries,
+        "provider_set_metadata_files": provider_entries,
+        "expected_serving_run_files": serving_entries.len(),
+        "expected_serving_run_rows": serving_entries.iter().map(|entry| entry["row_count"].as_u64().unwrap()).sum::<u64>(),
+        "expected_serving_run_bytes": serving_entries.iter().map(|entry| entry["bytes"].as_u64().unwrap()).sum::<u64>(),
+        "expected_code_dictionary_files": code_entries.len(),
+        "expected_code_dictionary_rows": code_entries.iter().map(|entry| entry["row_count"].as_u64().unwrap()).sum::<u64>(),
+        "expected_code_dictionary_bytes": code_entries.iter().map(|entry| entry["bytes"].as_u64().unwrap()).sum::<u64>(),
+        "code_dictionary_contract_set_sha256": json_sha256(&json!({"code_dictionary_contracts": code_contracts})),
+        "expected_provider_set_metadata_files": provider_entries.len(),
+        "expected_provider_set_metadata_rows": provider_entries.iter().map(|entry| entry["row_count"].as_u64().unwrap()).sum::<u64>(),
+        "expected_provider_set_metadata_bytes": provider_entries.iter().map(|entry| entry["bytes"].as_u64().unwrap()).sum::<u64>(),
+        "provider_set_metadata_contract_set_sha256": json_sha256(&json!({"provider_set_metadata_contracts": provider_contracts})),
+    });
+    fs::write(path, serde_json::to_vec(&manifest).unwrap()).expect("write finalizer manifest");
+}
+
+fn run_v3_finalizer(
+    output: &Path,
+    manifest: &Path,
+    price_key_map: &Path,
+    price_key_count: usize,
+) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
+        .arg("--finalize-v3-runs")
+        .arg(output)
+        .args(["--price-key-map-input", price_key_map.to_str().unwrap()])
+        .args(["--price-key-map-row-count", &price_key_count.to_string()])
+        .args(["--workers", "2"])
+        .args(["--identity-map-max-bytes", "55188180"])
+        .args(["--total-sort-memory-bytes", "33554432"])
+        .args(["--scratch-durability", "ephemeral"])
+        .arg(manifest)
+        .env("HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION", "zlib")
+        .env(
+            "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_BYTES",
+            "1",
+        )
+        .env(
+            "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_SAVINGS_PCT",
+            "0",
+        )
+        .env("HLTHPRT_PTG2_SERVING_BINARY_BLOCK_BYTES", "65536")
+        .env("HLTHPRT_PTG2_RATE_SCHEDULE_OBSERVE", "true")
+        .output()
+        .expect("run V3 finalizer")
+}
+
+fn compact_v4_command(source: &Path, output: &Path) -> Command {
+    let serving = output.join("serving");
+    let witness_scratch = output.join("witness-scratch");
+    let tax_secret = output.join("tin-token-secret.bin");
+    let raw_source_sha256 =
+        sha256_hex(&fs::read(source).expect("read compact V4 source for digest"));
+    fs::create_dir_all(&serving).expect("create serving directory");
+    fs::create_dir_all(&witness_scratch).expect("create witness scratch directory");
+    fs::write(&tax_secret, [17u8; 32]).expect("write exact test token secret");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"));
+    command
+        .args(["--compact-serving", source.to_str().expect("UTF-8 source")])
+        .env("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
+        .env("HLTHPRT_PTG2_V3_SERVING_RUN_DIR", &serving)
+        .env("HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID", "11".repeat(32))
+        .env("HLTHPRT_PTG2_RAW_SOURCE_SHA256", raw_source_sha256)
+        .env("HLTHPRT_PTG2_SOURCE_WITNESS_SCRATCH_DIR", &witness_scratch)
+        .env("HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS", "false")
+        .env("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", "true")
+        .env(
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_SIDECAR_PATH",
+            output.join("provider-set-component.ptg2sc"),
+        )
+        .env(
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_COMPONENT_GROUP_SIDECAR_PATH",
+            output.join("provider-component-group.ptg2sc"),
+        )
+        .env(
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH",
+            output.join("provider-group-tax-identity.ptg2tax"),
+        )
+        .env(
+            "HLTHPRT_PTG2_TIN_TOKEN_POLICY_ID",
+            "ptg-tin-hmac-sha256-v1:test-1",
+        )
+        .env("HLTHPRT_PTG2_TIN_TOKEN_SECRET_FILE", &tax_secret)
+        .env(
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_DICTIONARY_COPY_PATH",
+            output.join("provider-set-metadata.copy"),
+        )
+        .env(
+            "HLTHPRT_PTG2_MANIFEST_PRICE_SET_SUMMARY_COPY_PATH",
+            output.join("price-set-summary.copy"),
+        )
+        .env("HLTHPRT_PTG2_MANIFEST_SIDECAR_SPILL", "true")
+        .env("HLTHPRT_PTG2_RUST_WORKERS", "2")
+        .env("HLTHPRT_PTG2_RUST_WORK_QUEUE", "2")
+        .env("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS", "true")
+        .env("HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN", "true")
+        .env("HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS", "true")
+        .env("HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED", "false")
+        .env("HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID", "snapshot-v4-test")
+        .env("HLTHPRT_PTG2_COMPACT_PLAN_ID", "plan-v4-test")
+        .env("HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID", "2026-07")
+        .env(
+            "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH",
+            "trace-v4-test",
+        )
+        .env("HLTHPRT_PTG2_COMPACT_CONFIDENCE_CODE", "coverage-test");
+    command
+}
+
+fn run_compact_v4(source: &Path, output: &Path) -> Output {
+    compact_v4_command(source, output)
+        .output()
+        .expect("run compact V4 scanner")
+}
+
+#[test]
+fn compact_cli_active_byte_engine_emits_paired_tax_identity_sidecars() {
+    let temporary = tempfile::tempdir().expect("temporary fixture root");
+    let provider_references = r#""provider_references":[
+      {"provider_group_id":7,"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":["1000000491"]}]},
+      {"provider_group_id":8,"provider_groups":[{"tin":{"type":"npi","value":"2999999990"},"npi":[2999999990]}]}
+    ]"#;
+    let in_network = r#""in_network":[{
+            "billing_code_type":"CPT",
+            "billing_code":"99213",
+            "negotiation_arrangement":"ffs",
+            "negotiated_rates":[
+              {"provider_references":[7,8],"negotiated_prices":[{"negotiated_rate":100}]},
+              {"provider_groups":[{"tin":{"type":"npi","value":"1000000491"},"npi":[1000000491]}],"negotiated_prices":[{"negotiated_rate":125}]}
+            ]
+          }]"#;
+    let cases = [
+        (
+            "source-order",
+            format!("{{{provider_references},{in_network}}}"),
+        ),
+        (
+            "reordered",
+            format!("{{{in_network},{provider_references}}}"),
+        ),
+    ];
+    let mut expected_v1 = None;
+    let mut expected_v2 = None;
+    for (label, raw_fixture) in cases {
+        let case_root = temporary.path().join(label);
+        let source = case_root.join("rates.json");
+        let output = case_root.join("output");
+        fs::create_dir_all(&output).expect("create output directory");
+        fs::write(&source, raw_fixture).expect("write paired tax identity fixture");
+        let v2_path = output.join("provider-group-tax-identity-v2.ptg2tax");
+        let completed = compact_v4_command(&source, &output)
+            .env(
+                "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH",
+                &v2_path,
+            )
+            .output()
+            .expect("run active byte-parallel scanner");
+        assert!(
+            completed.status.success(),
+            "{label} scanner failed: {}\nstdout:\n{}",
+            String::from_utf8_lossy(&completed.stderr),
+            String::from_utf8_lossy(&completed.stdout),
+        );
+
+        let stdout = String::from_utf8_lossy(&completed.stdout);
+        assert!(stdout.contains("\"top_level_byte_scan_selected\":true"));
+        if label == "reordered" {
+            assert!(
+                stdout.contains("parallel_top_level_bytes_plain_range_reorder")
+                    || stdout.contains("parallel_top_level_bytes_indexed_reorder")
+            );
+        }
+        assert!(stdout.contains("manifest_provider_group_tax_identity_sidecar_file"));
+        assert!(stdout.contains("manifest_provider_group_tax_identity_v2_sidecar_file"));
+        for raw_identity in ["123456789", "1000000491", "2999999990"] {
+            assert!(!stdout.contains(raw_identity));
+            assert!(!String::from_utf8_lossy(&completed.stderr).contains(raw_identity));
+        }
+
+        let v1_path = output.join("provider-group-tax-identity.ptg2tax");
+        let v1_bytes = fs::read(&v1_path).expect("read v1 sidecar");
+        if let Some(expected) = expected_v1.as_ref() {
+            assert_eq!(&v1_bytes, expected);
+        } else {
+            expected_v1 = Some(v1_bytes.clone());
+        }
+        let v2_bytes = fs::read(&v2_path).expect("read v2 sidecar");
+        if let Some(expected) = expected_v2.as_ref() {
+            assert_eq!(&v2_bytes, expected);
+        } else {
+            expected_v2 = Some(v2_bytes.clone());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            for artifact in [&v1_path, &v2_path] {
+                assert_eq!(
+                    fs::metadata(artifact)
+                        .expect("read sidecar permissions")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+        let mut validator = TaxIdentitySidecarV2StreamValidator::new(
+            fs::File::open(&v2_path).expect("open v2 sidecar"),
+            3,
+        )
+        .expect("validate v2 sidecar header");
+        let mut states = Vec::new();
+        while let Some(record) = validator.next_record().expect("validate v2 record") {
+            states.push(record.state());
+        }
+        states.sort_unstable_by_key(|state| *state as u8);
+        assert_eq!(
+            states,
+            vec![
+                TaxIdentityStateV2::MatchedEin,
+                TaxIdentityStateV2::MatchedNpi,
+                TaxIdentityStateV2::MatchedNpi,
+            ]
+        );
+        assert_eq!(validator.records_validated(), 3);
+        let v1_events = framed_json_records_named(
+            &completed.stdout,
+            "manifest_provider_group_tax_identity_sidecar_file",
+        );
+        let v2_events = framed_json_records_named(
+            &completed.stdout,
+            "manifest_provider_group_tax_identity_v2_sidecar_file",
+        );
+        assert_eq!(v1_events.len(), 1);
+        assert_eq!(v2_events.len(), 1);
+        assert_eq!(v1_events[0]["path"], v1_path.display().to_string());
+        assert_eq!(v1_events[0]["bytes"], v1_bytes.len() as u64);
+        assert_eq!(v1_events[0]["sha256"], file_sha256(&v1_path));
+        assert_eq!(v1_events[0]["row_count"], 3);
+        assert_eq!(v1_events[0]["provider_group_count"], 3);
+        assert_eq!(v1_events[0]["matched_ein_count"], 1);
+        assert_eq!(v1_events[0]["unsupported_type_count"], 2);
+        assert_eq!(v2_events[0]["path"], v2_path.display().to_string());
+        assert_eq!(v2_events[0]["bytes"], v2_bytes.len() as u64);
+        assert_eq!(v2_events[0]["sha256"], file_sha256(&v2_path));
+        assert_eq!(v2_events[0]["row_count"], 3);
+        assert_eq!(v2_events[0]["provider_group_count"], 3);
+        assert_eq!(v2_events[0]["matched_ein_count"], 1);
+        assert_eq!(v2_events[0]["matched_npi_count"], 2);
+        assert_eq!(v2_events[0]["missing_count"], 0);
+        assert_eq!(v2_events[0]["malformed_count"], 0);
+        assert_eq!(v2_events[0]["unsupported_type_count"], 0);
+        assert!(!output
+            .join("provider-group-tax-identity.ptg2tax.building")
+            .exists());
+        assert!(!output
+            .join("provider-group-tax-identity-v2.ptg2tax.building")
+            .exists());
+        assert!(fs::read_dir(&output)
+            .expect("read output directory")
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ptg2-tax-identity-")));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn compact_cli_rejects_tax_identity_aliases_before_worker_outputs() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = tempfile::tempdir().expect("temporary path-collision fixture root");
+    let raw_fixture = br#"{
+      "provider_references":[
+        {"provider_group_id":7,"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1000000491]}]}
+      ],
+      "in_network":[{
+        "billing_code_type":"CPT",
+        "billing_code":"99213",
+        "negotiation_arrangement":"ffs",
+        "negotiated_rates":[
+          {"provider_references":[7],"negotiated_prices":[{"negotiated_rate":100}]}
+        ]
+      }]
+    }"#;
+    for case in [
+        "v1-raw-input",
+        "v1-token-secret",
+        "v1-manifest-final",
+        "v2-raw-input",
+        "v2-token-secret",
+        "v2-manifest-symlink-parent",
+        "price-worker",
+        "price-worker-rotation",
+        "provider-reference-worker",
+    ] {
+        let case_root = temporary.path().join(case);
+        let source = case_root.join("rates.json");
+        let output = case_root.join("output");
+        fs::create_dir_all(&output).expect("create collision output directory");
+        fs::write(&source, raw_fixture).expect("write collision fixture");
+        let mut command = compact_v4_command(&source, &output);
+        let secret = output.join("tin-token-secret.bin");
+        let candidate = match case {
+            "v1-raw-input" | "v2-raw-input" => source.clone(),
+            "v1-token-secret" | "v2-token-secret" => secret.clone(),
+            "v1-manifest-final" => output.join("provider-set-component.ptg2sc"),
+            "v2-manifest-symlink-parent" => {
+                let output_alias = case_root.join("output-alias");
+                symlink(&output, &output_alias).expect("create output directory alias");
+                output_alias.join("provider-set-component.ptg2sc")
+            }
+            "price-worker" => output.join("price-set-summary.copy.worker0000"),
+            "price-worker-rotation" => {
+                output.join("price-set-summary.copy.worker0000.part000000.ready")
+            }
+            "provider-reference-worker" => {
+                let provider_group_base = output.join("provider-group-member.copy");
+                command.env(
+                    "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH",
+                    &provider_group_base,
+                );
+                output.join("provider-group-member.copy.provider_refs.worker0000")
+            }
+            _ => unreachable!(),
+        };
+        if case.starts_with("v1-") {
+            command.env(
+                "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH",
+                &candidate,
+            );
+        } else {
+            command.env(
+                "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH",
+                &candidate,
+            );
+        }
+        let source_before = fs::read(&source).expect("read source sentinel");
+        let secret_before = fs::read(&secret).expect("read secret sentinel");
+        let completed = command.output().expect("run collision scanner");
+        assert!(!completed.status.success(), "{case} unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&completed.stderr);
+        assert!(
+            stderr.contains("configured tax identity output")
+                || stderr.contains("configured output paths"),
+            "{case} unexpected stderr: {stderr}"
+        );
+        for raw_identity in ["123456789", "1000000491"] {
+            assert!(!stderr.contains(raw_identity));
+            assert!(!String::from_utf8_lossy(&completed.stdout).contains(raw_identity));
+        }
+        assert_eq!(fs::read(&source).expect("reread source"), source_before);
+        assert_eq!(fs::read(&secret).expect("reread secret"), secret_before);
+        assert!(framed_json_records_named(
+            &completed.stdout,
+            "manifest_provider_group_tax_identity_sidecar_file"
+        )
+        .is_empty());
+        assert!(framed_json_records_named(
+            &completed.stdout,
+            "manifest_provider_group_tax_identity_v2_sidecar_file"
+        )
+        .is_empty());
+        assert!(!output.join("provider-group-tax-identity.ptg2tax").exists());
+        assert!(!output
+            .join("provider-group-tax-identity.ptg2tax.building")
+            .exists());
+        assert!(fs::read_dir(&output)
+            .expect("read collision output directory")
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ptg2-tax-identity-")));
+    }
+}
+
+#[test]
+fn compact_cli_reuses_byte_identical_raw_inline_groups_before_deserialization() {
+    let temporary = tempfile::tempdir().expect("temporary fixture root");
+    let source = temporary.path().join("rates.json");
+    let output = temporary.path().join("output");
+    fs::create_dir(&output).expect("create output directory");
+    let raw = br#"{
+      "reporting_entity_name":"V4 raw cache fixture",
+      "provider_references":[],
+      "in_network":[{
+        "billing_code_type":"CPT",
+        "billing_code":"70553",
+        "negotiation_arrangement":"ffs",
+        "negotiated_rates":[
+          {"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890]}],"negotiated_prices":[{"negotiated_rate":100}]},
+          {"provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890]}],"negotiated_prices":[{"negotiated_rate":125}]}
+        ]
+      }]
+    }"#;
+    fs::write(&source, raw).expect("write repeated inline-group fixture");
+
+    let completed = run_compact_v4(&source, &output);
+    assert!(
+        completed.status.success(),
+        "scanner failed: {}\nstdout:\n{}",
+        String::from_utf8_lossy(&completed.stderr),
+        String::from_utf8_lossy(&completed.stdout),
+    );
+    let records = String::from_utf8(completed.stdout).expect("UTF-8 scanner output");
+    let summary = records
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|payload| {
+            payload
+                .get("provider_graph_v4_inline_transform_cache_transforms")
+                .is_some()
+        })
+        .unwrap_or_else(|| panic!("parallel scanner summary in:\n{records}"));
+    assert_eq!(
+        summary["provider_graph_v4_inline_transform_cache_transforms"],
+        1
+    );
+    assert_eq!(
+        summary["provider_graph_v4_inline_transform_cache_misses"],
+        1
+    );
+    assert_eq!(summary["provider_graph_v4_inline_transform_cache_hits"], 1);
+    assert_eq!(
+        summary["provider_graph_v4_inline_transform_cache_entries"],
+        1
+    );
+    assert!(
+        summary["provider_graph_v4_inline_transform_cache_estimated_bytes"]
+            .as_u64()
+            .zip(summary["provider_graph_v4_inline_transform_cache_max_bytes"].as_u64())
+            .is_some_and(|(estimated, maximum)| estimated <= maximum)
+    );
+}
+
+#[test]
+fn compact_cli_reports_provider_reference_worker_failures() {
+    let temporary = tempfile::tempdir().expect("temporary fixture root");
+    let source = temporary.path().join("rates.json");
+    let output = temporary.path().join("output");
+    fs::create_dir(&output).expect("create output directory");
+    fs::write(
+        &source,
+        br#"{
+          "provider_references":[{"provider_group_id":7,"provider_groups":"invalid"}],
+          "in_network":[]
+        }"#,
+    )
+    .expect("write malformed provider reference fixture");
+
+    let v2_path = output.join("provider-group-tax-identity-v2.ptg2tax");
+    let completed = compact_v4_command(&source, &output)
+        .env(
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH",
+            &v2_path,
+        )
+        .output()
+        .expect("run compact V4 scanner");
+    assert!(!completed.status.success());
+    let stderr = String::from_utf8_lossy(&completed.stderr);
+    assert!(stderr.contains("PTG2_SCANNER_WORKER_FAILED"), "{stderr}");
+    assert!(stderr.contains("provider_ref_error"), "{stderr}");
+    assert!(framed_json_records_named(
+        &completed.stdout,
+        "manifest_provider_group_tax_identity_sidecar_file"
+    )
+    .is_empty());
+    assert!(framed_json_records_named(
+        &completed.stdout,
+        "manifest_provider_group_tax_identity_v2_sidecar_file"
+    )
+    .is_empty());
+    for path in [
+        output.join("provider-group-tax-identity.ptg2tax"),
+        v2_path,
+        output.join("provider-group-tax-identity.ptg2tax.building"),
+        output.join("provider-group-tax-identity-v2.ptg2tax.building"),
+    ] {
+        assert!(!path.exists());
+    }
+}
+
+#[test]
+fn compact_cli_reports_primary_producer_failures() {
+    let temporary = tempfile::tempdir().expect("temporary fixture root");
+    let source = temporary.path().join("rates.json");
+    let output = temporary.path().join("output");
+    fs::create_dir(&output).expect("create output directory");
+    fs::write(
+        &source,
+        br#"{
+          "provider_references":[{
+            "provider_group_id":7,
+            "provider_groups":[{
+              "tin":{"type":"ein","value":"111223333"},
+              "npi":[1234567890]
+            }]
+          }],
+          "in_network":[{
+            "billing_code_type":"CPT",
+            "billing_code":"99213",
+            "negotiated_rates":[}
+        }"#,
+    )
+    .expect("write malformed rate fixture");
+
+    let v2_path = output.join("provider-group-tax-identity-v2.ptg2tax");
+    let completed = compact_v4_command(&source, &output)
+        .env(
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH",
+            &v2_path,
+        )
+        .output()
+        .expect("run compact V4 scanner");
+    assert!(!completed.status.success());
+    let stderr = String::from_utf8_lossy(&completed.stderr);
+    assert!(stderr.contains("PTG2_SCANNER_PRIMARY_FAILED"), "{stderr}");
+    assert!(stderr.contains("producer_error"), "{stderr}");
+    assert!(framed_json_records_named(
+        &completed.stdout,
+        "manifest_provider_group_tax_identity_sidecar_file"
+    )
+    .is_empty());
+    assert!(framed_json_records_named(
+        &completed.stdout,
+        "manifest_provider_group_tax_identity_v2_sidecar_file"
+    )
+    .is_empty());
+    for path in [
+        output.join("provider-group-tax-identity.ptg2tax"),
+        v2_path,
+        output.join("provider-group-tax-identity.ptg2tax.building"),
+        output.join("provider-group-tax-identity-v2.ptg2tax.building"),
+    ] {
+        assert!(!path.exists());
+    }
+}
+
+#[test]
+fn compact_cli_reports_fail_closed_provider_and_sidecar_boundaries() {
+    fn run_case<F>(root: &Path, name: &str, source_bytes: &[u8], configure: F, expected: &str)
+    where
+        F: FnOnce(&mut Command),
+    {
+        let case_root = root.join(name);
+        let source = case_root.join("rates.json");
+        let output = case_root.join("output");
+        fs::create_dir_all(&output).expect("create case output directory");
+        fs::write(&source, source_bytes).expect("write fail-closed fixture");
+        let mut command = compact_v4_command(&source, &output);
+        configure(&mut command);
+        let completed = command.output().expect("run fail-closed compact scanner");
+        assert!(!completed.status.success(), "{name} unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&completed.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{name} stderr did not contain {expected:?}: {stderr}"
+        );
+    }
+
+    let temporary = tempfile::tempdir().expect("temporary fail-closed fixture root");
+    let root = temporary.path();
+    let no_overrides = |_: &mut Command| {};
+    run_case(
+        root,
+        "missing-groups",
+        br#"{"provider_references":[{"provider_group_id":7}],"in_network":[]}"#,
+        no_overrides,
+        "provider_groups must be an array",
+    );
+    run_case(
+        root,
+        "non-object-group",
+        br#"{"provider_references":[{"provider_group_id":7,"provider_groups":[7]}],"in_network":[]}"#,
+        no_overrides,
+        "provider_groups elements must be JSON objects",
+    );
+    run_case(
+        root,
+        "missing-group-id",
+        br#"{"provider_references":[{"provider_groups":[{"tin":{"type":"ein","value":"111223333"},"npi":[1234567890]}]}],"in_network":[]}"#,
+        no_overrides,
+        "provider reference is missing provider_group_id",
+    );
+
+    run_case(
+        root,
+        "non-array-inline-groups",
+        br#"{"provider_references":[],"in_network":[{"billing_code_type":"CPT","billing_code":"99213","negotiated_rates":[{"provider_groups":{},"negotiated_prices":[{"negotiated_rate":125}]}]}]}"#,
+        no_overrides,
+        "expected JSON value type Array",
+    );
+
+    let blocked_parent = root.join("sidecar-parent-is-a-file");
+    fs::write(&blocked_parent, b"not a directory").expect("write blocked sidecar parent");
+    run_case(
+        root,
+        "blocked-sidecar-parent",
+        RAW_MRF,
+        |command| {
+            command.env(
+                "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_SIDECAR_PATH",
+                blocked_parent.join("provider-set-component.ptg2sc"),
+            );
+        },
+        "tax identity collision coordinate could not be resolved",
+    );
+}
+
+#[test]
+fn compact_cli_emits_exact_v4_factors_and_source_witnesses() {
+    let temporary = tempfile::tempdir().expect("temporary fixture root");
+    let source = temporary.path().join("rates.json");
+    let output = temporary.path().join("output");
+    fs::create_dir(&output).expect("create output directory");
+    fs::write(&source, RAW_MRF).expect("write MRF fixture");
+
+    let completed = run_compact_v4(&source, &output);
+    assert!(
+        completed.status.success(),
+        "scanner failed: {}\nstdout:\n{}",
+        String::from_utf8_lossy(&completed.stderr),
+        String::from_utf8_lossy(&completed.stdout),
+    );
+    let records = String::from_utf8(completed.stdout).expect("UTF-8 scanner output");
+    let payloads = records
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    let summary = payloads
+        .iter()
+        .find(|payload| {
+            payload
+                .get("provider_graph_v4_factor_cache_entries")
+                .is_some()
+        })
+        .unwrap_or_else(|| panic!("parallel scanner summary in:\n{records}"));
+    assert_eq!(summary["top_level_byte_scan_selected"], true);
+    assert_eq!(summary["provider_graph_v4_factor_mode"], true);
+    assert_eq!(summary["provider_graph_v4_factor_cache_entries"], 3);
+    assert_eq!(summary["provider_graph_v4_npi_union_attempts"], 3);
+    assert_eq!(summary["provider_graph_v4_flat_group_union_attempts"], 3);
+    assert_eq!(
+        summary["provider_graph_v4_inline_transform_cache_transforms"],
+        1
+    );
+    assert_eq!(
+        summary["provider_graph_v4_inline_transform_cache_misses"],
+        1
+    );
+    assert_eq!(
+        summary["provider_graph_v4_inline_transform_cache_entries"],
+        1
+    );
+    assert!(
+        summary["provider_graph_v4_inline_transform_cache_estimated_bytes"]
+            .as_u64()
+            .zip(summary["provider_graph_v4_inline_transform_cache_max_bytes"].as_u64())
+            .is_some_and(|(estimated, maximum)| estimated <= maximum)
+    );
+    assert!(summary["provider_graph_v4_reference_only_rates"]
+        .as_u64()
+        .is_some_and(|value| value >= 2));
+    assert_eq!(summary["provider_graph_v4_inline_only_rates"], 1);
+
+    for name in [
+        "provider-set-component.ptg2sc",
+        "provider-component-group.ptg2sc",
+    ] {
+        assert!(
+            fs::metadata(output.join(name))
+                .expect("factor sidecar")
+                .len()
+                > 0
+        );
+    }
+    let witness = payloads
+        .iter()
+        .find(|payload| payload["contract"] == "ptg2_v3_source_witness_v3")
+        .expect("source witness summary");
+    assert_eq!(witness["provider_population_count"], 2);
+    assert_eq!(witness["queryable_occurrence_population_count"], 9);
+    assert_eq!(witness["occurrence_witness_count"], 9);
+    assert!(
+        fs::metadata(witness["path"].as_str().expect("witness path"))
+            .expect("witness bundle")
+            .len()
+            > 0
+    );
+
+    let manifest = output.join("scanner-manifest.json");
+    write_finalizer_manifest(&payloads, &manifest);
+    let price_key_map = output.join("price-key-map.copy");
+    let price_key_count = write_price_key_map(&payloads, &price_key_map);
+    let finalizer_output = output.join("finalized");
+    let finalized = run_v3_finalizer(
+        &finalizer_output,
+        &manifest,
+        &price_key_map,
+        price_key_count,
+    );
+    assert!(
+        finalized.status.success(),
+        "finalizer failed: {}\nstdout:\n{}",
+        String::from_utf8_lossy(&finalized.stderr),
+        String::from_utf8_lossy(&finalized.stdout),
+    );
+    let finalizer_payloads = String::from_utf8(finalized.stdout)
+        .expect("UTF-8 finalizer output")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    let finalizer_summary = finalizer_payloads
+        .iter()
+        .find(|payload| payload["format"] == "ptg2_v3_direct_finalizer_v3")
+        .expect("V3 finalizer summary");
+    assert_eq!(
+        finalizer_summary["preservation"]["all_source_occurrences_preserved"],
+        true
+    );
+    let provider_code_bitmap_candidate_bytes =
+        finalizer_summary["identity_maps"]["provider_code_bitmap_candidate_bytes"].as_u64();
+    let provider_code_bitmap_charged_bytes = finalizer_summary["identity_maps"]
+        ["provider_code_bitmap_charged_bytes"]
+        .as_u64()
+        .expect("provider-code bitmap charge");
+    let expected_provider_code_mode = if provider_code_bitmap_charged_bytes > 0
+        || provider_code_bitmap_candidate_bytes == Some(0)
+    {
+        "provider_major_bitmap_v1"
+    } else {
+        "pair_spool_sort_v1"
+    };
+    assert_eq!(
+        finalizer_summary["identity_maps"]["provider_code_bitmap_planned_mode"],
+        expected_provider_code_mode
+    );
+    assert_eq!(finalizer_summary["rate_schedule_observe"]["enabled"], true);
+    assert!(
+        finalizer_summary
+            .pointer("/blocks/assigned_encoder/provider_set_codes/storage/compressed_records")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0),
+        "{finalizer_summary:#}"
+    );
+    for name in [
+        "summary.json",
+        "shared_serving_blocks.copy",
+        "shared_price_dictionary_blocks.copy",
+        "code_dictionary.copy",
+        "provider_set_dictionary.copy",
+    ] {
+        assert!(finalizer_output.join(name).is_file(), "missing {name}");
+    }
+}

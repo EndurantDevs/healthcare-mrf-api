@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -56,6 +57,23 @@ def _load_module():
 
 
 status_api = _load_module()
+
+
+@pytest.mark.asyncio
+async def test_registry_load_does_not_block_status_event_loop(monkeypatch):
+    event_loop_thread = threading.get_ident()
+    registry_threads = []
+
+    def load_registry():
+        registry_threads.append(threading.get_ident())
+        return _registry
+
+    monkeypatch.setattr(status_api, "load_hospital_hpt_registry", load_registry)
+    status_api.db.rows = []
+
+    await status_api.list_hospital_price_status_page(limit=1)
+
+    assert registry_threads and registry_threads[0] != event_loop_thread
 
 
 @pytest.mark.asyncio

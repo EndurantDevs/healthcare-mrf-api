@@ -30,6 +30,9 @@ from scripts.research.hospital_hpt_postgres_sql import (
 
 SAFE_SCHEMA = re.compile(r"^hpt_bench_(?:typed|dictionary|blocks)_[a-z0-9_]+$")
 DISPOSABLE_DATABASE = re.compile(r"(?:^|[_-])test(?:[_-]|$)", re.IGNORECASE)
+MAX_STORAGE_RATIO_TO_TYPED = 1.0
+MAX_QUERY_P95_RATIO_TO_TYPED = 1.25
+MAX_QUERY_P95_ADDITIVE_MS = 1.0
 
 
 def _psql(dsn: str, sql: str, *, tuples: bool = False) -> str:
@@ -409,12 +412,15 @@ def _surviving_candidates(summary_by_candidate: dict[str, Any]) -> list[str]:
     return [
         candidate
         for candidate, summary in summary_by_candidate.items()
-        if summary["median_storage_bytes"] <= typed_summary["median_storage_bytes"]
+        if summary["median_storage_bytes"]
+        <= typed_summary["median_storage_bytes"] * MAX_STORAGE_RATIO_TO_TYPED
         and all(
             summary["query_p95_ms"][name]
             <= max(
-                typed_summary["query_p95_ms"][name] * 1.25,
-                typed_summary["query_p95_ms"][name] + 1.0,
+                typed_summary["query_p95_ms"][name]
+                * MAX_QUERY_P95_RATIO_TO_TYPED,
+                typed_summary["query_p95_ms"][name]
+                + MAX_QUERY_P95_ADDITIVE_MS,
             )
             for name in typed_summary["query_p95_ms"]
         )
@@ -470,9 +476,9 @@ def run_benchmark(
         "gates": {
             "semantic_parity": "passed",
             "response_parity": "passed",
-            "max_storage_ratio_to_typed": 1.0,
-            "max_query_p95_ratio_to_typed": 1.25,
-            "max_query_p95_additive_ms": 1.0,
+            "max_storage_ratio_to_typed": MAX_STORAGE_RATIO_TO_TYPED,
+            "max_query_p95_ratio_to_typed": MAX_QUERY_P95_RATIO_TO_TYPED,
+            "max_query_p95_additive_ms": MAX_QUERY_P95_ADDITIVE_MS,
             "survivors": survivors,
             "winner": winner,
         },

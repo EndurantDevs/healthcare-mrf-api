@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from collections.abc import Mapping
@@ -158,14 +159,18 @@ async def list_hospital_price_status_page(
     if normalized_cursor and _CURSOR_PATTERN.fullmatch(normalized_cursor) is None:
         raise ValueError("cursor is invalid")
     normalized_query = str(query or "").strip().casefold()
+    hospitals, status_rows = await asyncio.gather(
+        asyncio.to_thread(load_hospital_hpt_registry),
+        db.all(_STATUS_SQL),
+    )
     rows_by_hospital_id = {
         str(mapping.get("hospital_id")): mapping
-        for mapping in map(_row_mapping, await db.all(_STATUS_SQL))
+        for mapping in map(_row_mapping, status_rows)
         if mapping.get("hospital_id")
     }
     status_items = [
         _status_item(hospital, rows_by_hospital_id.get(hospital["hospital_id"], {}))
-        for hospital in load_hospital_hpt_registry()
+        for hospital in hospitals
         if not normalized_query
         or normalized_query in "\n".join(hospital.values()).casefold()
     ]

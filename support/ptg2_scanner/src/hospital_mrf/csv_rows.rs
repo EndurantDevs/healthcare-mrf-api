@@ -124,11 +124,15 @@ fn parse_tall_modifier_payer(
             "modifier payer requires a charge adjustment or explanatory note",
         ));
     }
+    let Some(payer_name) = payer_name else {
+        return Err(invalid("modifier payer evidence requires payer_name"));
+    };
+    let Some(plan_name) = plan_name else {
+        return Err(invalid("modifier payer evidence requires plan_name"));
+    };
     Ok(Some(ModifierPayerRow {
-        payer_name: payer_name
-            .ok_or_else(|| invalid("modifier payer evidence requires payer_name"))?,
-        plan_name: plan_name
-            .ok_or_else(|| invalid("modifier payer evidence requires plan_name"))?,
+        payer_name,
+        plan_name,
         description,
         standard_charge_dollar,
         standard_charge_percentage,

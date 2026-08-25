@@ -51,6 +51,38 @@ class ArtifactStore:
         self.root = tmp_dir
 
 
+def configure_incomplete_import(
+    orchestrator: Any,
+    monkeypatch: Any,
+    resolved_failures: int,
+    pipeline_metrics: dict[str, int],
+) -> None:
+    """Install deterministic collaborators for incomplete-cohort proof."""
+
+    async def noop(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def bounded(*_args: Any, **_kwargs: Any) -> list[Any]:
+        return []
+
+    async def resolve(*_args: Any, **_kwargs: Any) -> tuple[dict[str, Any], int, int]:
+        return {}, 0, resolved_failures
+
+    async def pipeline(*_args: Any, **_kwargs: Any) -> dict[str, int]:
+        return dict(pipeline_metrics)
+
+    monkeypatch.setattr(orchestrator, "sync_registry", noop)
+    monkeypatch.setattr(orchestrator, "raise_if_cancelled", noop)
+    monkeypatch.setattr(orchestrator, "_bounded", bounded)
+    monkeypatch.setattr(orchestrator, "_resolve_attempts", resolve)
+    monkeypatch.setattr(orchestrator, "_progress", lambda *_args: None)
+    monkeypatch.setattr(
+        orchestrator, "_resource_limits",
+        lambda *_args: (1, 1, 1024, 4096, 2048, 1),
+    )
+    monkeypatch.setattr(orchestrator, "_stream_sources", pipeline)
+
+
 def _acquisition_module(noop: Any) -> types.ModuleType:
     return _module(
         "process.hospital_price_acquisition",
@@ -94,7 +126,7 @@ def _replacement_modules(noop: Any, lease_context: Any) -> dict[str, types.Modul
         ),
         "process.hospital_price_store": _module(
             "process.hospital_price_store", admit_attempts=noop,
-            has_existing_version=noop, publish_existing=noop,
+            fail_attempts=noop, has_existing_version=noop, publish_existing=noop,
             renew_attempt_leases=noop, stage_content=noop,
         ),
         "process.live_progress": _module(

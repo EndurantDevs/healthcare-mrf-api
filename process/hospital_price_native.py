@@ -134,10 +134,14 @@ class _BoundedPayload(io.RawIOBase):
     def __init__(self, source: BinaryIO, max_bytes: int) -> None:
         self.source, self.remaining = source, max_bytes
 
-    def readable(self) -> bool:
+    def is_readable(self) -> bool:
+        """Return true because the wrapper provides bounded reads."""
         return True
 
+    readable = is_readable
+
     def readinto(self, buffer: Any) -> int:
+        """Read into a caller buffer without crossing the configured limit."""
         if not buffer:
             return 0
         if self.remaining == 0:
@@ -180,7 +184,11 @@ def _open_payload(path: Path, max_decompressed_bytes: int) -> Iterator[BinaryIO]
     if magic in _ZIP_MAGICS or path.suffix.casefold() == ".zip":
         try:
             with zipfile.ZipFile(path) as archive:
-                members = [item for item in archive.infolist() if not item.is_dir()]
+                members = [
+                    archive_entry
+                    for archive_entry in archive.infolist()
+                    if not archive_entry.is_dir()
+                ]
                 if len(members) != 1:
                     raise ValueError("ZIP hospital MRF must contain exactly one file")
                 member = members[0]
@@ -192,21 +200,21 @@ def _open_payload(path: Path, max_decompressed_bytes: int) -> Iterator[BinaryIO]
                     raise ValueError(
                         "ZIP hospital MRF decompressed size exceeds its configured limit"
                     )
-                with archive.open(member) as payload, io.BufferedReader(
-                    _BoundedPayload(payload, read_limit)
+                with archive.open(member) as member_stream, io.BufferedReader(
+                    _BoundedPayload(member_stream, read_limit)
                 ) as bounded:
                     yield bounded
         except zipfile.BadZipFile as exc:
             raise ValueError("ZIP hospital MRF input is invalid") from exc
         return
     if magic[:2] == b"\x1f\x8b":
-        with gzip.open(path, "rb") as payload, io.BufferedReader(
-            _BoundedPayload(payload, read_limit)
+        with gzip.open(path, "rb") as gzip_stream, io.BufferedReader(
+            _BoundedPayload(gzip_stream, read_limit)
         ) as bounded:
             yield bounded
     else:
-        with path.open("rb") as payload, io.BufferedReader(
-            _BoundedPayload(payload, read_limit)
+        with path.open("rb") as file_stream, io.BufferedReader(
+            _BoundedPayload(file_stream, read_limit)
         ) as bounded:
             yield bounded
 
@@ -273,6 +281,32 @@ def _parser_artifact(
     return HospitalParserArtifact(kind, path, rows, byte_count, digest)
 
 
+def _is_parser_contract_valid(
+    summary: dict[str, Any], version_id: str, source_format: str,
+    input_bytes: int, max_decompressed_bytes: int, max_output_bytes: int,
+) -> bool:
+    return (
+        summary["contract"] == "hospital-mrf-copy-v3"
+        and summary["version_id"] == version_id
+        and summary["schema_version"] == "3.0.0"
+        and summary["schema_revision"] == HOSPITAL_MRF_SCHEMA_REVISION
+        and summary["format"] == source_format
+        and summary["compressed_input_bytes"] == input_bytes
+        and type(summary["max_fanout_rows"]) is int
+        and summary["max_fanout_rows"] >= 1
+        and type(summary["max_decompressed_bytes"]) is int
+        and summary["max_decompressed_bytes"] == max_decompressed_bytes
+        and type(max_decompressed_bytes) is int
+        and max_decompressed_bytes >= 1
+        and type(summary["max_output_bytes"]) is int
+        and summary["max_output_bytes"] == max_output_bytes
+        and type(max_output_bytes) is int
+        and max_output_bytes >= 1
+        and isinstance(summary["artifacts"], list)
+        and len(summary["artifacts"]) == len(HOSPITAL_MRF_COPY_COLUMNS)
+    )
+
+
 def validate_hospital_parser_summary(
     summary_bytes: bytes, *,
     version_id: str,
@@ -298,25 +332,9 @@ def validate_hospital_parser_summary(
         "max_output_bytes", "artifacts",
     } != set(summary):
         raise ValueError("hospital parser summary shape is invalid")
-    if (
-        summary["contract"] != "hospital-mrf-copy-v3"
-        or summary["version_id"] != version_id
-        or summary["schema_version"] != "3.0.0"
-        or summary["schema_revision"] != HOSPITAL_MRF_SCHEMA_REVISION
-        or summary["format"] != source_format
-        or summary["compressed_input_bytes"] != input_bytes
-        or type(summary["max_fanout_rows"]) is not int
-        or summary["max_fanout_rows"] < 1
-        or type(summary["max_decompressed_bytes"]) is not int
-        or summary["max_decompressed_bytes"] != max_decompressed_bytes
-        or type(max_decompressed_bytes) is not int
-        or max_decompressed_bytes < 1
-        or type(summary["max_output_bytes"]) is not int
-        or summary["max_output_bytes"] != max_output_bytes
-        or type(max_output_bytes) is not int
-        or max_output_bytes < 1
-        or not isinstance(summary["artifacts"], list)
-        or len(summary["artifacts"]) != len(HOSPITAL_MRF_COPY_COLUMNS)
+    if not _is_parser_contract_valid(
+        summary, version_id, source_format, input_bytes,
+        max_decompressed_bytes, max_output_bytes,
     ):
         raise ValueError("hospital parser summary contract is invalid")
     output = Path(output_directory).resolve()

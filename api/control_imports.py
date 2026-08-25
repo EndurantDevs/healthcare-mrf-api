@@ -1928,13 +1928,13 @@ def _validate_provider_directory_profile_execution_params(
         raise ValueError(str(exc)) from exc
 
 
-def _validate_hospital_price_params(
+async def _validate_hospital_price_params(
     importer: str, params: dict[str, Any]
 ) -> None:
     if importer != "hospital-prices":
         return
     try:
-        selected_hospital_hpt_registry(params)
+        await asyncio.to_thread(selected_hospital_hpt_registry, params)
     except ValueError as exc:
         raise ValueError(str(exc)) from exc
 
@@ -2176,7 +2176,7 @@ async def create_import_run(
         importer,
         effective_params_by_name,
     )
-    _validate_hospital_price_params(importer, effective_params_by_name)
+    await _validate_hospital_price_params(importer, effective_params_by_name)
     if importer == "provider-directory-fhir":
         validated_publication_candidate_from_params(
             effective_params_by_name

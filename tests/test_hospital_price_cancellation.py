@@ -1,0 +1,240 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+"""Cancellation and lock-lifetime proof for hospital-price imports."""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from process.ptg_parts import artifacts as ptg_artifacts
+from process.ptg_parts.artifacts import PTG2ArtifactStore
+from tests.hospital_price_orchestration_support import (
+    ArtifactStore,
+    orchestrator_module,
+)
+
+
+_ArtifactStore = ArtifactStore
+_orchestrator_module = orchestrator_module
+
+
+@pytest.mark.asyncio
+async def test_bounded_failure_cancels_and_drains_siblings():
+    orchestrator = _orchestrator_module()
+    slow_started, slow_cleaned = asyncio.Event(), asyncio.Event()
+
+    async def operation(name: str) -> str:
+        if name == "failure":
+            await slow_started.wait()
+            raise ValueError("failed")
+        slow_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            slow_cleaned.set()
+
+    with pytest.raises(ValueError, match="failed"):
+        await orchestrator._bounded(("slow", "failure"), 2, operation)
+    assert slow_cleaned.is_set()
+
+
+@pytest.mark.asyncio
+async def test_bounded_outer_cancel_does_not_interrupt_async_cleanup():
+    orchestrator = _orchestrator_module()
+    operation_started_by_name = {
+        "fast": asyncio.Event(), "slow": asyncio.Event()
+    }
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    cleanup_interrupted = asyncio.Event()
+
+    async def operation(name: str) -> None:
+        operation_started_by_name[name].set()
+        try:
+            await asyncio.Future()
+        finally:
+            if name == "slow":
+                cleanup_started.set()
+                try:
+                    await allow_cleanup.wait()
+                    cleanup_finished.set()
+                except asyncio.CancelledError:
+                    cleanup_interrupted.set()
+                    raise
+
+    bounded_task = asyncio.create_task(
+        orchestrator._bounded(("fast", "slow"), 2, operation)
+    )
+    await asyncio.gather(
+        *(started.wait() for started in operation_started_by_name.values())
+    )
+    bounded_task.cancel()
+    await cleanup_started.wait()
+    await asyncio.sleep(0)
+    bounded_task.cancel()
+    allow_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await bounded_task
+
+    assert cleanup_finished.is_set()
+    assert not cleanup_interrupted.is_set()
+
+
+@pytest.mark.asyncio
+async def test_resource_lock_releases_after_repeated_cancellation(tmp_path):
+    orchestrator = _orchestrator_module()
+    acquire_started = threading.Event()
+    allow_acquire = threading.Event()
+
+    class Lock:
+        releases = 0
+
+        def try_acquire(self) -> "Lock | None":
+            acquire_started.set()
+            assert allow_acquire.wait(timeout=1)
+            return self
+
+        def release(self) -> None:
+            self.releases += 1
+
+    lock = Lock()
+    store = _ArtifactStore(tmp_path)
+    store.named_lock = lambda *_args: lock
+
+    async def enter_lock() -> None:
+        async with orchestrator._hospital_resource_lock(store):
+            raise AssertionError("cancelled acquisition entered the lock")
+
+    lock_task = asyncio.create_task(enter_lock())
+    assert await asyncio.to_thread(acquire_started.wait, 1)
+    lock_task.cancel()
+    await asyncio.sleep(0)
+    lock_task.cancel()
+    allow_acquire.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await lock_task
+    assert lock.releases == 1
+
+
+@pytest.mark.asyncio
+async def test_cancellation_guard_drains_operation_after_repeated_cancel():
+    orchestrator = _orchestrator_module()
+    operation_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def operation() -> None:
+        operation_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            cleanup_finished.set()
+
+    guarded = asyncio.create_task(
+        orchestrator._guard_cancellation(
+            {}, {}, operation(), [], "hospital-prices:test", 300, 60
+        )
+    )
+    await operation_started.wait()
+    guarded.cancel()
+    await cleanup_started.wait()
+    guarded.cancel()
+    await asyncio.sleep(0)
+    assert not guarded.done()
+    allow_cleanup.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await guarded
+    assert cleanup_finished.is_set()
+
+
+def test_resource_lock_supports_nonblocking_capacity_poll(tmp_path, monkeypatch):
+    store = PTG2ArtifactStore(tmp_path)
+    held = store.named_lock("hospital-price", "resource-capacity")
+    waiting = store.named_lock("hospital-price", "resource-capacity")
+
+    held.acquire()
+    try:
+        assert waiting.try_acquire() is None
+    finally:
+        held.release()
+
+    assert waiting.try_acquire() is waiting
+    waiting.release()
+
+    unavailable = store.named_lock("hospital-price", "unavailable-capacity")
+
+    def unavailable_flock(_fd, _operation):
+        raise BlockingIOError
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ptg_artifacts.fcntl, "flock", unavailable_flock)
+        assert unavailable.try_acquire() is None
+    assert unavailable.try_acquire() is unavailable
+    unavailable.release()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_resource_wait_does_not_wait_for_current_import(tmp_path):
+    orchestrator = _orchestrator_module()
+    store = PTG2ArtifactStore(tmp_path)
+    held = store.named_lock("hospital-price", "resource-capacity")
+    held.acquire()
+
+    entered = asyncio.Event()
+
+    async def wait_for_capacity() -> None:
+        async with orchestrator._hospital_resource_lock(store):
+            entered.set()
+
+    waiting = asyncio.create_task(wait_for_capacity())
+    try:
+        await asyncio.sleep(0.05)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(waiting, timeout=0.5)
+    finally:
+        held.release()
+    assert not entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_format_detection_is_drained(tmp_path, monkeypatch):
+    orchestrator = _orchestrator_module()
+    detection_started = threading.Event()
+    allow_detection = threading.Event()
+
+    def detect_format(*_args: Any) -> str:
+        detection_started.set()
+        assert allow_detection.wait(timeout=1)
+        return "json"
+
+    monkeypatch.setattr(orchestrator, "detect_hospital_mrf_format", detect_format)
+    raw = SimpleNamespace(
+        raw_sha256="a" * 64, raw_path=str(tmp_path / "source.json"), byte_count=2
+    )
+    operation = asyncio.create_task(
+        orchestrator._ensure_content(
+            {}, {}, _ArtifactStore(tmp_path), raw, 2048, 1024
+        )
+    )
+    assert await asyncio.to_thread(detection_started.wait, 1)
+
+    operation.cancel()
+    await asyncio.sleep(0)
+    assert not operation.done()
+    operation.cancel()
+    allow_detection.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await operation

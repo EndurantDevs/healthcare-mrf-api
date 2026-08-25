@@ -211,7 +211,7 @@
             let index = headers
                 .iter()
                 .position(|candidate| candidate == *header)
-                .unwrap_or_else(|| panic!("missing fixture header {header}"));
+                .expect("missing fixture header");
             row[index] = (*value).to_owned();
         }
         let mut writer = csv::WriterBuilder::new()
@@ -293,9 +293,7 @@
         bytes[start..start + 4].copy_from_slice(&value.to_le_bytes());
     }
 
-    fn assert_zip_import_error(
-        bytes: &[u8], max_decompressed_bytes: u64, expected: &str
-    ) {
+    fn assert_zip_import_error(bytes: &[u8], max_decompressed_bytes: u64, expected: &str) {
         let directory = tempfile::tempdir().unwrap();
         let input_path = directory.path().join("invalid.zip");
         fs::write(&input_path, bytes).unwrap();
@@ -397,12 +395,12 @@
             Cursor::new(payload),
             VERSION_ID,
             &output_directory,
-            (
-                DEFAULT_MAX_FANOUT_ROWS,
-                payload.len() as u64 + 1,
-                TEST_MAX_OUTPUT_BYTES,
+            HospitalMrfLimits {
+                max_fanout_rows: DEFAULT_MAX_FANOUT_ROWS,
+                max_decompressed_bytes: payload.len() as u64 + 1,
+                max_output_bytes: TEST_MAX_OUTPUT_BYTES,
                 max_input_value_bytes,
-            ),
+            },
         )
         .unwrap_err();
         assert!(

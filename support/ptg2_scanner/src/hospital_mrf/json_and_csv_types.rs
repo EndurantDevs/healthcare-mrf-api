@@ -13,7 +13,7 @@ fn parse_json<R: Read>(
     let mut hospital_addresses = None;
     let mut type_2_npis = None;
     let mut license = None;
-    let mut attestation = None;
+    let mut attestation: Option<JsonAttestation> = None;
     let mut financial_aid_policy = None;
     let mut service_count = None;
     let mut modifier_count = None;
@@ -35,15 +35,24 @@ fn parse_json<R: Read>(
             }
             "location_name" => {
                 mark_once(&mut seen, "location_name")?;
-                location_names = Some(json_reader.deserialize_next().map_err(to_io_error)?);
+                let values: FanoutVec<String> =
+                    with_json_fanout_budget(max_fanout_rows, || json_reader.deserialize_next())
+                        .map_err(to_io_error)?;
+                location_names = Some(values.0);
             }
             "hospital_address" => {
                 mark_once(&mut seen, "hospital_address")?;
-                hospital_addresses = Some(json_reader.deserialize_next().map_err(to_io_error)?);
+                let values: FanoutVec<String> =
+                    with_json_fanout_budget(max_fanout_rows, || json_reader.deserialize_next())
+                        .map_err(to_io_error)?;
+                hospital_addresses = Some(values.0);
             }
             "type_2_npi" => {
                 mark_once(&mut seen, "type_2_npi")?;
-                type_2_npis = Some(json_reader.deserialize_next().map_err(to_io_error)?);
+                let values: FanoutVec<String> =
+                    with_json_fanout_budget(max_fanout_rows, || json_reader.deserialize_next())
+                        .map_err(to_io_error)?;
+                type_2_npis = Some(values.0);
             }
             "license_information" => {
                 mark_once(&mut seen, "license_information")?;
@@ -115,18 +124,41 @@ fn parse_json<R: Read>(
         .consume_trailing_whitespace()
         .map_err(to_io_error)?;
     let _ = modifier_count;
-    service_count.ok_or_else(|| invalid("missing standard_charge_information"))?;
-    let attestation: JsonAttestation = attestation.ok_or_else(|| invalid("missing attestation"))?;
-    let last_updated_on = last_updated_on.ok_or_else(|| invalid("missing last_updated_on"))?;
+    let Some(_) = service_count else {
+        return Err(invalid("missing standard_charge_information"));
+    };
+    let Some(attestation) = attestation else {
+        return Err(invalid("missing attestation"));
+    };
+    let Some(last_updated_on) = last_updated_on else {
+        return Err(invalid("missing last_updated_on"));
+    };
+    let Some(hospital_name) = hospital_name else {
+        return Err(invalid("missing hospital_name"));
+    };
+    let Some(version) = version else {
+        return Err(invalid("missing version"));
+    };
+    let Some(location_names) = location_names else {
+        return Err(invalid("missing location_name"));
+    };
+    let Some(hospital_addresses) = hospital_addresses else {
+        return Err(invalid("missing hospital_address"));
+    };
+    let Some(type_2_npis) = type_2_npis else {
+        return Err(invalid("missing type_2_npi"));
+    };
+    let Some(license) = license else {
+        return Err(invalid("missing license_information"));
+    };
     GeneralMetadata {
-        hospital_name: hospital_name.ok_or_else(|| invalid("missing hospital_name"))?,
+        hospital_name,
         last_updated_on: canonical_json_date(&last_updated_on)?,
-        version: version.ok_or_else(|| invalid("missing version"))?,
-        location_names: location_names.ok_or_else(|| invalid("missing location_name"))?,
-        hospital_addresses: hospital_addresses
-            .ok_or_else(|| invalid("missing hospital_address"))?,
-        type_2_npis: type_2_npis.ok_or_else(|| invalid("missing type_2_npi"))?,
-        license: license.ok_or_else(|| invalid("missing license_information"))?,
+        version,
+        location_names,
+        hospital_addresses,
+        type_2_npis,
+        license,
         attestation_text: attestation.attestation,
         confirm_attestation: attestation.confirm_attestation,
         attester_name: attestation.attester_name,

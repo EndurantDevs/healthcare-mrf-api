@@ -215,7 +215,7 @@ def test_matcher_does_not_fuzzy_match_names():
 
 def test_matcher_uses_explicit_exact_locator_name_for_a_sublocation():
     shared_locator = "https://hospital.example/cms-hpt.txt"
-    hospital = {
+    hospital_by_field = {
         "hospital_id": "sublocation",
         "name": "South Outpatient Center",
         "locator_name": "Parent Hospital - South Campus",
@@ -223,7 +223,7 @@ def test_matcher_uses_explicit_exact_locator_name_for_a_sublocation():
     }
 
     result = locator.match_hospital_hpt_locator(
-        (hospital,),
+        (hospital_by_field,),
         shared_locator,
         (_record("Parent Hospital - South Campus"),),
     )
@@ -234,7 +234,7 @@ def test_matcher_uses_explicit_exact_locator_name_for_a_sublocation():
 
 def test_matcher_uses_exact_mrf_selector_for_repeated_locator_names():
     shared_locator = "https://hospital.example/cms-hpt.txt"
-    hospital = {
+    hospital_by_field = {
         "hospital_id": "selected",
         "name": "Same Hospital",
         "locator_mrf_url": "https://files.example/b.json",
@@ -242,7 +242,7 @@ def test_matcher_uses_exact_mrf_selector_for_repeated_locator_names():
     }
 
     result = locator.match_hospital_hpt_locator(
-        (hospital,),
+        (hospital_by_field,),
         shared_locator,
         (
             _record("Same Hospital", "https://files.example/a.json"),
@@ -258,7 +258,7 @@ def test_matcher_uses_exact_mrf_selector_for_repeated_locator_names():
 
 def test_matcher_collapses_identical_repeated_locator_records():
     shared_locator = "https://hospital.example/cms-hpt.txt"
-    hospital = {
+    hospital_by_field = {
         "hospital_id": "selected",
         "name": "Same Hospital",
         "cms_hpt_url": shared_locator,
@@ -266,7 +266,7 @@ def test_matcher_collapses_identical_repeated_locator_records():
     repeated = _record("Same Hospital", "https://files.example/same.json")
 
     result = locator.match_hospital_hpt_locator(
-        (hospital,), shared_locator, (repeated, repeated)
+        (hospital_by_field,), shared_locator, (repeated, repeated)
     )
 
     assert result.bindings[0].mrf_url == repeated.mrf_url

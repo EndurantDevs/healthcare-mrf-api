@@ -4,6 +4,44 @@
         assert!(canonical_drug_type("gr", false).is_err());
         assert_eq!(allowed_count("1 THROUGH 10", true).unwrap(), "1 through 10");
         assert!(allowed_count("1 THROUGH 10", false).is_err());
+        assert_eq!(allowed_count("0", false).unwrap(), "0");
+        assert!(allowed_count("", true).is_err());
+        assert!(allowed_count("", false).is_err());
+        assert!(allowed_count("1", false).is_err());
+        assert_eq!(allowed_count("11", false).unwrap(), "11");
+        let drug_service = validate_service(
+            ServiceRow {
+                description: "Drug".to_owned(),
+                codes: vec![CodeRow {
+                    code_type: "NDC".to_owned(),
+                    code: "0001".to_owned(),
+                }],
+                drug_unit: Some("1".to_owned()),
+                drug_type: Some("gr".to_owned()),
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(drug_service.drug_type.as_deref(), Some("GR"));
+        let other_payer = validate_payer(
+            PayerChargeRow {
+                payer_name: "Payer".to_owned(),
+                plan_name: "Plan".to_owned(),
+                standard_charge_dollar: Some("1".to_owned()),
+                standard_charge_percentage: None,
+                standard_charge_algorithm: None,
+                median_amount: None,
+                percentile_10: None,
+                percentile_90: None,
+                allowed_count: None,
+                methodology: "other".to_owned(),
+                additional_payer_notes: None,
+            },
+            Some("Generic note"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(other_payer.methodology, "other");
         let rows = run_fixture(InputFormat::Json, &fixture_json(), false);
         assert!(String::from_utf8(rows["mrf"].clone())
             .unwrap()
@@ -17,7 +55,26 @@
             .ends_with("\tfacility\n"));
 
         let original: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+        assert!(serde_json::from_str::<FanoutVec<String>>("{}")
+            .unwrap_err()
+            .to_string()
+            .contains("bounded hospital MRF array"));
+        let mut non_array_codes = original.clone();
+        non_array_codes["standard_charge_information"][0]["code_information"] = json!({});
+        assert_import_error(
+            InputFormat::Json,
+            &serde_json::to_vec(&non_array_codes).unwrap(),
+            DEFAULT_MAX_FANOUT_ROWS,
+            "expected JSON value type Array",
+        );
         for (pointer, invalid_value, expected) in [
+            ("/version", "", "version must be a non-empty string"),
+            ("/version", "2.0.0", "version must be 3.0.0"),
+            (
+                "/license_information/state",
+                "",
+                "license state must be a non-empty string",
+            ),
             ("/license_information/state", "ca", "invalid license state"),
             (
                 "/standard_charge_information/0/code_information/0/type",
@@ -49,6 +106,15 @@
                 expected,
             );
         }
+
+        let mut empty_locations = original.clone();
+        empty_locations["location_name"] = json!([]);
+        assert_import_error(
+            InputFormat::Json,
+            &serde_json::to_vec(&empty_locations).unwrap(),
+            DEFAULT_MAX_FANOUT_ROWS,
+            "location_name must contain at least one value",
+        );
 
         let mut attestation_whitespace = original.clone();
         *attestation_whitespace
@@ -120,6 +186,17 @@
             "modifier_code must contain at least one value",
         );
 
+        let duplicate = StringRecord::from(vec!["description", " DESCRIPTION "]);
+        assert!(find_header(&duplicate, &["description"])
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate CSV header description"));
+        let duplicate_optional = StringRecord::from(vec!["billing_class", " BILLING_CLASS "]);
+        assert!(find_optional_header(&duplicate_optional, &["billing_class"])
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate CSV header billing_class"));
+
         let gap = String::from_utf8(fixture_tall_csv())
             .unwrap()
             .replace("code | 1 | type", "code | 2 | type")
@@ -148,6 +225,28 @@
             "fanout exceeds configured limit 2",
         );
 
+        let mut oversized_header: serde_json::Value =
+            serde_json::from_slice(&fixture_json()).unwrap();
+        oversized_header["location_name"] = json!(["A", "B", "C"]);
+        assert_import_error(
+            InputFormat::Json,
+            &serde_json::to_vec(&oversized_header).unwrap(),
+            2,
+            "fanout exceeds configured limit 2",
+        );
+
+        let (headers, mut values) = general_rows(11);
+        values[3] = "A|B|C".to_owned();
+        let error = parse_csv_metadata(
+            &StringRecord::from(headers),
+            &StringRecord::from(values),
+            2,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("location_name fanout exceeds configured limit 2"));
+
         let tall = String::from_utf8(fixture_tall_csv())
             .unwrap()
             .replace("26 | TC", "26")
@@ -174,6 +273,11 @@
 
     #[test]
     fn unsafe_zip_inputs_are_rejected_without_outputs() {
+        assert_zip_import_error(
+            b"PK\x03\x04not-a-zip",
+            TEST_MAX_OUTPUT_BYTES,
+            "ZIP",
+        );
         let nested = zip_bytes(
             &[(
                 "inner.zip",

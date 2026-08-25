@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Sequence
 
 from process.control_cancel import raise_if_cancelled
+from process.formulary_fhir.async_safety import drain_operation
 from process.hospital_price_acquisition import (
     MAX_HOSPITAL_HPT_LOCATOR_BYTES,
     PTG2_DEFAULT_MAX_BYTES,
@@ -82,13 +83,24 @@ async def hospital_resource_lock(store: PTG2ArtifactStore):
     # ponytail: one run lock protects a shared artifact volume; replace it with
     # cross-process weighted reservations if concurrent runs become necessary.
     lock = store.named_lock("hospital-price", "resource-capacity")
-    acquire_task = asyncio.create_task(asyncio.to_thread(lock.acquire))
-    try:
-        await asyncio.shield(acquire_task)
-    except BaseException:
-        await acquire_task
-        lock.release()
-        raise
+    while True:
+        acquire_task = asyncio.create_task(
+            asyncio.to_thread(lock.try_acquire)
+        )
+        try:
+            acquired = await asyncio.shield(acquire_task)
+        except BaseException:
+            while not acquire_task.done():
+                try:
+                    await asyncio.shield(acquire_task)
+                except asyncio.CancelledError:
+                    continue
+            if acquire_task.result() is not None:
+                lock.release()
+            raise
+        if acquired is not None:
+            break
+        await asyncio.sleep(0.1)
     try:
         yield
     finally:
@@ -108,14 +120,38 @@ async def bounded(
             return await operation(item)
 
     operation_tasks = [asyncio.create_task(_run_one(item)) for item in items]
-    try:
+
+    async def _join() -> list[Any]:
         return list(await asyncio.gather(*operation_tasks))
+
+    join_task = asyncio.create_task(_join())
+    try:
+        return await asyncio.shield(join_task)
     except BaseException:
-        for operation_task in operation_tasks:
-            if not operation_task.done() and operation_task.cancelling() == 0:
-                operation_task.cancel()
-        await asyncio.gather(*operation_tasks, return_exceptions=True)
+        await cancel_and_drain(
+            operation_tasks,
+            wait_for=(join_task,),
+            preserve_cancellation=False,
+        )
         raise
+
+
+async def cancel_and_drain(
+    tasks: Sequence[asyncio.Task[Any]],
+    *,
+    wait_for: Sequence[asyncio.Task[Any]] = (),
+    preserve_cancellation: bool,
+) -> None:
+    """Cancel owned tasks and finish their cleanup through repeated cancellation."""
+
+    for owned_task in tasks:
+        if not owned_task.done() and owned_task.cancelling() == 0:
+            owned_task.cancel()
+
+    async def _join() -> None:
+        await asyncio.gather(*tasks, *wait_for, return_exceptions=True)
+
+    await drain_operation(_join(), preserve_cancellation=preserve_cancellation)
 
 
 async def guard_cancellation(
@@ -157,10 +193,9 @@ async def guard_cancellation(
             return await operation_task
         return await monitor_task
     finally:
-        for pending_task in (operation_task, monitor_task):
-            if not pending_task.done():
-                pending_task.cancel()
-        await asyncio.gather(operation_task, monitor_task, return_exceptions=True)
+        await cancel_and_drain(
+            (operation_task, monitor_task), preserve_cancellation=True
+        )
 
 
 def progress(

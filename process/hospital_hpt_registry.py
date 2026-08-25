@@ -75,7 +75,7 @@ def _validated_locator(value: Any) -> str:
         raise _registry_error("cms_hpt_url_invalid")
     try:
         parsed = urlsplit(locator)
-        parsed.port
+        _validated_port = parsed.port
     except ValueError as exc:
         raise _registry_error("cms_hpt_url_invalid") from exc
     if (
@@ -126,20 +126,20 @@ def _load_hospital_hpt_registry_path(
         if hospital_id in hospital_ids:
             raise _registry_error("duplicate_hospital_id")
         hospital_ids.add(hospital_id)
-        hospital = {
+        hospital_by_field = {
             "hospital_id": hospital_id,
             "name": _strict_text(entry["name"], "name"),
             "cms_hpt_url": _validated_locator(entry["cms_hpt_url"]),
         }
         if "locator_name" in entry:
-            hospital["locator_name"] = _strict_text(
+            hospital_by_field["locator_name"] = _strict_text(
                 entry["locator_name"], "locator_name"
             )
         if "locator_mrf_url" in entry:
-            hospital["locator_mrf_url"] = _validated_locator(
+            hospital_by_field["locator_mrf_url"] = _validated_locator(
                 entry["locator_mrf_url"]
             )
-        hospitals.append(hospital)
+        hospitals.append(hospital_by_field)
     return tuple(hospitals)
 
 
@@ -195,7 +195,8 @@ def selected_hospital_hpt_registry(
             raise _registry_error("hospital_ids_invalid")
         hospital_ids = tuple(
             dict.fromkeys(
-                _strict_text(value, "hospital_id") for value in hospital_ids_value
+                _strict_text(hospital_id_value, "hospital_id")
+                for hospital_id_value in hospital_ids_value
             )
         )
     else:

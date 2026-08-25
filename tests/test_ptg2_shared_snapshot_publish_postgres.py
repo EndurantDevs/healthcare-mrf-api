@@ -3284,18 +3284,62 @@ async def test_real_postgres_shared_block_publish_preserves_content_conflict_che
         await db.disconnect()
 
 
-@pytest.mark.asyncio
-async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
-    tmp_path,
-    monkeypatch,
-):
-    """Publish a strict shared layout and verify cache-free reads and reuse."""
+@dataclass(frozen=True)
+class _StrictSharedScan:
+    coverage_scope_id: bytes
+    scanner_tests: object
+    scanner_binary: Path
+    scan: dict
+    provider_set_id: bytes
+    price_set_ids: set[bytes]
+    provider_set_metadata_path: Path
 
-    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
-        pytest.skip(
-            "set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1 for the isolated PostgreSQL test"
-        )
 
+@dataclass(frozen=True)
+class _StrictSharedFixture:
+    tmp_path: Path
+    scanner: _StrictSharedScan
+    schema_name: str
+    quoted_schema: str
+    snapshot_id: str
+    artifact_digest: str
+    source_identity: SharedPhysicalArtifactIdentity
+    source_assignment: SharedSnapshotSourceAssignment
+    scanner_summary: dict
+    serving_run_entries: list[dict]
+    code_dictionary_entries: list[dict]
+    provider_set_metadata_entries: tuple[dict, ...]
+
+
+@dataclass(frozen=True)
+class _StrictSharedLayout:
+    publication: object
+    graph_entries: object
+    npi: int
+    reserved_snapshot_key: int
+
+
+@dataclass(frozen=True)
+class _StrictServingKeys:
+    provider_set_key: int
+    provider_group_key: int
+    code_key_by_reported_code: dict[str, int]
+
+
+@dataclass(frozen=True)
+class _StrictForwardRows:
+    first: list
+    second: list
+
+
+@dataclass(frozen=True)
+class _StrictReuse:
+    discarded_snapshot_key: int
+    stage_table: str
+    snapshot_id: str
+
+
+def _run_strict_shared_scanner(tmp_path, monkeypatch):
     coverage_scope_id = b"\xcc" * 32
     monkeypatch.setenv(
         "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID",
@@ -3321,6 +3365,10 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
         multiple_prices=True,
         duplicate_first_price=True,
     )
+    return coverage_scope_id, scanner_tests, scanner_binary, scan
+
+
+def _assert_strict_scanner_artifacts(scan, tmp_path):
     serving_records = [
         SERVING_RECORD.unpack_from(scan["partition_bytes"], offset)
         for offset in range(0, len(scan["partition_bytes"]), SERVING_RECORD.size)
@@ -3337,8 +3385,8 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
     assert len(provider_set_ids) == 1
     assert len(price_set_ids) == 2
     provider_set_id = next(iter(provider_set_ids))
-    provider_set_metadata_path = tmp_path / "provider-set-metadata.copy"
-    provider_set_metadata_path.write_text(
+    metadata_path = tmp_path / "provider-set-metadata.copy"
+    metadata_path.write_text(
         f"{provider_set_id.hex()}\t2\t{{}}\n",
         encoding="ascii",
     )
@@ -3352,15 +3400,54 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
         Path(frame["path"]).stat().st_size > 0
         for frame in scan["price_set_atom_frames"]
     )
+    return provider_set_id, price_set_ids, metadata_path
 
+
+def _prepare_strict_shared_scan(tmp_path, monkeypatch):
+    coverage_scope_id, scanner_tests, scanner_binary, scan = (
+        _run_strict_shared_scanner(tmp_path, monkeypatch)
+    )
+    provider_set_id, price_set_ids, metadata_path = (
+        _assert_strict_scanner_artifacts(scan, tmp_path)
+    )
+    return _StrictSharedScan(
+        coverage_scope_id=coverage_scope_id,
+        scanner_tests=scanner_tests,
+        scanner_binary=scanner_binary,
+        scan=scan,
+        provider_set_id=provider_set_id,
+        price_set_ids=price_set_ids,
+        provider_set_metadata_path=metadata_path,
+    )
+
+
+def _strict_provider_metadata_entries(scanner, source_identity, serving_entries):
+    metadata_payload = scanner.provider_set_metadata_path.read_bytes()
+    return (
+        {
+            "path": str(scanner.provider_set_metadata_path),
+            "row_count": 1,
+            "bytes": len(metadata_payload),
+            "sha256": hashlib.sha256(metadata_payload).hexdigest(),
+            "format": "ptg2_v3_provider_set_metadata_copy",
+            "version": 1,
+            "source_type": source_identity.source_type,
+            "identity_kind": source_identity.identity_kind,
+            "identity_sha256": source_identity.identity_sha256,
+            "source_run_contract_sha256": serving_entries[0][
+                "source_run_contract_sha256"
+            ],
+        },
+    )
+
+
+def _prepare_strict_shared_fixture(tmp_path, monkeypatch):
+    scanner = _prepare_strict_shared_scan(tmp_path, monkeypatch)
     schema_name = f"ptg2_shared_publish_{uuid.uuid4().hex[:16]}"
-    quoted_schema = '"' + schema_name + '"'
     snapshot_id = f"shared-smoke-{uuid.uuid4().hex}"
-    artifact_digest = hashlib.sha256(scan["artifact"].read_bytes()).hexdigest()
+    artifact_digest = hashlib.sha256(scanner.scan["artifact"].read_bytes()).hexdigest()
     source_identity = SharedPhysicalArtifactIdentity(
-        "in_network",
-        "logical_json_sha256_v1",
-        "a" * 64,
+        "in_network", "logical_json_sha256_v1", "a" * 64
     )
     source_assignment = SharedSnapshotSourceAssignment(
         source_key=0,
@@ -3371,47 +3458,54 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
         logical_json_sha256="a" * 64,
         logical_hash_deferred=False,
     )
-    scanner_summary = scanner_tests._single_frame(scan["frames"], "scanner_summary")
-    serving_run_entries = attach_v3_source_run_contract(
-        scan["partition_frames"],
+    scanner_summary = scanner.scanner_tests._single_frame(
+        scanner.scan["frames"], "scanner_summary"
+    )
+    serving_entries = attach_v3_source_run_contract(
+        scanner.scan["partition_frames"],
         source_identity=source_identity,
         scanner_summary=scanner_summary,
-        scanner_config=scanner_tests._single_frame(scan["frames"], "scanner_config"),
+        scanner_config=scanner.scanner_tests._single_frame(
+            scanner.scan["frames"], "scanner_config"
+        ),
     )
-    code_dictionary_entries = attach_v3_dictionary_contract(
-        scan["code_dictionary_frames"],
+    dictionary_entries = attach_v3_dictionary_contract(
+        scanner.scan["code_dictionary_frames"],
         source_identity=source_identity,
-        source_run_contract_sha256=serving_run_entries[0][
-            "source_run_contract_sha256"
-        ],
+        source_run_contract_sha256=serving_entries[0]["source_run_contract_sha256"],
         scanner_summary=scanner_summary,
     )
-    provider_set_metadata_payload = provider_set_metadata_path.read_bytes()
-    provider_set_metadata_entries = (
-        {
-            "path": str(provider_set_metadata_path),
-            "row_count": 1,
-            "bytes": len(provider_set_metadata_payload),
-            "sha256": hashlib.sha256(provider_set_metadata_payload).hexdigest(),
-            "format": "ptg2_v3_provider_set_metadata_copy",
-            "version": 1,
-            "source_type": source_identity.source_type,
-            "identity_kind": source_identity.identity_kind,
-            "identity_sha256": source_identity.identity_sha256,
-            "source_run_contract_sha256": serving_run_entries[0][
-                "source_run_contract_sha256"
-            ],
-        },
+    metadata_entries = _strict_provider_metadata_entries(
+        scanner, source_identity, serving_entries
     )
-    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
-    monkeypatch.setenv("DB_SCHEMA", schema_name)
+    return _StrictSharedFixture(
+        tmp_path=tmp_path,
+        scanner=scanner,
+        schema_name=schema_name,
+        quoted_schema=f'"{schema_name}"',
+        snapshot_id=snapshot_id,
+        artifact_digest=artifact_digest,
+        source_identity=source_identity,
+        source_assignment=source_assignment,
+        scanner_summary=scanner_summary,
+        serving_run_entries=serving_entries,
+        code_dictionary_entries=dictionary_entries,
+        provider_set_metadata_entries=metadata_entries,
+    )
+
+
+def _configure_strict_shared_environment(fixture, monkeypatch):
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", fixture.schema_name)
+    monkeypatch.setenv("DB_SCHEMA", fixture.schema_name)
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
     monkeypatch.setenv(
         "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
         PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
     )
     monkeypatch.setenv("HLTHPRT_PTG2_BINARY_IDS", "true")
-    monkeypatch.setenv("HLTHPRT_PTG2_RUST_SCANNER_BIN", str(scanner_binary))
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_RUST_SCANNER_BIN", str(fixture.scanner.scanner_binary)
+    )
     monkeypatch.setenv("HLTHPRT_PTG2_V3_FINALIZER_WORKERS", "1")
     monkeypatch.setenv(
         "HLTHPRT_PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES", "67108864"
@@ -3422,153 +3516,185 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
     monkeypatch.setenv("HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION", "none")
     monkeypatch.setenv("HLTHPRT_PTG2_SERVING_BINARY_BLOCK_BYTES", "65536")
 
-    await db.disconnect()
-    await db.connect()
-    stage_table: str | None = None
-    try:
-        await _create_shared_schema(schema_name)
-        await db.status(
-            f"""
-            INSERT INTO {quoted_schema}.ptg2_snapshot
-                (snapshot_id, status, manifest)
-            VALUES (:snapshot_id, 'building', '{{}}'::json)
-            """,
-            snapshot_id=snapshot_id,
-        )
-        await db.status(
-            f"""
-            INSERT INTO {quoted_schema}.ptg2_source_trace_set
-                (source_trace_set_hash, source_trace_hashes)
-            VALUES (:source_trace_set_hash, CAST(:source_trace_hashes AS varchar[]))
-            """,
-            source_trace_set_hash=source_assignment.source_trace_set_hash,
-            source_trace_hashes=list(source_assignment.source_trace_hashes),
-        )
-        published_source_rows = await publish_shared_v3_snapshot_sources(
-            schema_name=schema_name,
-            snapshot_id=snapshot_id,
-            plan_scopes=[
-                SharedLogicalPlanScope("plan-v3-runs", "ein", "group")
-            ],
-            coverage_scope_id=coverage_scope_id,
-            assignments=[source_assignment],
-        )
-        replayed_source_rows = await publish_shared_v3_snapshot_sources(
-            schema_name=schema_name,
-            snapshot_id=snapshot_id,
-            plan_scopes=[
-                SharedLogicalPlanScope("plan-v3-runs", "ein", "group")
-            ],
-            coverage_scope_id=coverage_scope_id,
-            assignments=[source_assignment],
-        )
-        assert replayed_source_rows == published_source_rows
-        async with db.transaction() as session:
-            reservation = await reserve_shared_layout(
-                session,
-                schema_name=schema_name,
-                semantic_fingerprint=shared_semantic_fingerprint(
-                    {"fixture": "strict-shared-publish-v1"}
-                ),
-                build_token="strict-shared-publish-smoke",
-            )
-        assert reservation.reused is False
 
-        stage_table = await _create_serving_stage_table(
-            f"shared_{reservation.snapshot_key}"
-        )
-        # A single scanner source emits every atom ID once. Cross-source
-        # canonicalization has separate PostgreSQL coverage.
-        for frame in scan["price_atom_frames"]:
-            await _copy_price_atom_file(
-                Path(frame["path"]),
-                target_table=_ptg2_manifest_support_stage_table(
-                    stage_table, "price_atom"
-                ),
-            )
-        for frame in scan["price_set_atom_frames"]:
-            await _copy_price_atom_member_file(
-                Path(frame["path"]),
-                target_table=_ptg2_manifest_support_stage_table(
-                    stage_table,
-                    "price_set_atom",
-                ),
-            )
-        for frame in scan["price_set_summary_frames"]:
-            await _copy_price_set_summary_file(
-                Path(frame["path"]),
-                target_table=_ptg2_manifest_support_stage_table(
-                    stage_table,
-                    "price_set_summary",
-                ),
-            )
-
-        provider_group_id = bytes.fromhex("00112233445566778899aabbccddeeff")
-        npi = 1234567890
-        graph_entries = _graph_artifacts(
-            tmp_path / "shared-graph",
-            provider_set_id=provider_set_id,
-            provider_group_id=provider_group_id,
-            npi=npi,
-        )
-        publication = await publish_strict_shared_v3_layout(
-            schema_name=schema_name,
-            manifest_stage_table=stage_table,
-            reserved_snapshot_key=reservation.snapshot_key,
-            build_token="strict-shared-publish-smoke",
-            expected_coverage_scope_id=coverage_scope_id,
-            logical_snapshot_id=snapshot_id,
-            expected_source_identities=[source_identity],
-            serving_run_entries=serving_run_entries,
-            code_dictionary_entries=code_dictionary_entries,
-            provider_set_metadata_entries=provider_set_metadata_entries,
-            price_set_summary_source_count=1,
-            graph_artifact_entries=graph_entries,
-            source_audit_witness_entries=(
-                scanner_tests._single_frame(
-                    scan["frames"],
-                    "source_audit_witness_file",
-                ),
+async def _create_strict_shared_reservation(fixture):
+    await _create_shared_schema(fixture.schema_name)
+    await db.status(
+        f"""
+        INSERT INTO {fixture.quoted_schema}.ptg2_snapshot
+            (snapshot_id, status, manifest)
+        VALUES (:snapshot_id, 'building', '{{}}'::json)
+        """,
+        snapshot_id=fixture.snapshot_id,
+    )
+    await db.status(
+        f"""
+        INSERT INTO {fixture.quoted_schema}.ptg2_source_trace_set
+            (source_trace_set_hash, source_trace_hashes)
+        VALUES (:source_trace_set_hash, CAST(:source_trace_hashes AS varchar[]))
+        """,
+        source_trace_set_hash=fixture.source_assignment.source_trace_set_hash,
+        source_trace_hashes=list(fixture.source_assignment.source_trace_hashes),
+    )
+    published_source_rows = await publish_shared_v3_snapshot_sources(
+        schema_name=fixture.schema_name,
+        snapshot_id=fixture.snapshot_id,
+        plan_scopes=[SharedLogicalPlanScope("plan-v3-runs", "ein", "group")],
+        coverage_scope_id=fixture.scanner.coverage_scope_id,
+        assignments=[fixture.source_assignment],
+    )
+    replayed_source_rows = await publish_shared_v3_snapshot_sources(
+        schema_name=fixture.schema_name,
+        snapshot_id=fixture.snapshot_id,
+        plan_scopes=[SharedLogicalPlanScope("plan-v3-runs", "ein", "group")],
+        coverage_scope_id=fixture.scanner.coverage_scope_id,
+        assignments=[fixture.source_assignment],
+    )
+    assert replayed_source_rows == published_source_rows
+    async with db.transaction() as session:
+        reservation = await reserve_shared_layout(
+            session,
+            schema_name=fixture.schema_name,
+            semantic_fingerprint=shared_semantic_fingerprint(
+                {"fixture": "strict-shared-publish-v1"}
             ),
-            expected_raw_source_sha256=(artifact_digest,),
-            provider_identifier_quarantine=scanner_summary[
-                "provider_identifier_quarantine"
-            ],
-            scratch_parent=tmp_path,
+            build_token="strict-shared-publish-smoke",
         )
-        assert publication.snapshot_key == reservation.snapshot_key
-        assert publication.layout_reused_at_seal is False
-        assert publication.stored_byte_count > 0
-        assert publication.mapping_count > 0
-        assert 0 < publication.unique_block_count <= publication.mapping_count
-        assert len(publication.mapping_digest) == 32
-        assert set(publication.object_kinds) == {
-            "by_code_provider_shard_v1",
-            "by_code_price_page_v4",
-            "by_code_price_dictionary",
-            "provider_set_count_dictionary",
-            "provider_set_codes_v3",
-            "provider_set_page_v3_s2",
-            "price_set_atom_memberships_v3",
-            "price_atoms_v3",
-            "graph_npi_groups_v1",
-            "graph_group_npis_v1",
-            "graph_group_provider_sets_v1",
-            "graph_provider_set_groups_v1",
-        }
-        assert publication.serving_index["storage_generation"] == "shared_blocks_v3"
-        assert publication.serving_index["shared_block_layout"] == "dense_shared_blocks_v3"
-        assert publication.serving_index["source_count"] == 1
-        assert publication.serving_index["cold_lookup_contract"] == "ptg_v3_cold_v2"
-        assert publication.serving_index["serving_multiplicity_semantics"] == (
-            "source_multiset_v1"
+    assert reservation.reused is False
+    return reservation
+
+
+async def _copy_strict_price_frames(scan, stage_table):
+    for frame in scan["price_atom_frames"]:
+        await _copy_price_atom_file(
+            Path(frame["path"]),
+            target_table=_ptg2_manifest_support_stage_table(
+                stage_table, "price_atom"
+            ),
         )
-        assert publication.serving_index["provider_identifier_quarantine"] == (
-            scanner_summary["provider_identifier_quarantine"]
+    for frame in scan["price_set_atom_frames"]:
+        await _copy_price_atom_member_file(
+            Path(frame["path"]),
+            target_table=_ptg2_manifest_support_stage_table(
+                stage_table,
+                "price_set_atom",
+            ),
         )
-        assert publication.serving_index["coverage_scope_id"] == coverage_scope_id.hex()
-        assert publication.serving_index["serving_binary_table"] is None
-        assert {
+    for frame in scan["price_set_summary_frames"]:
+        await _copy_price_set_summary_file(
+            Path(frame["path"]),
+            target_table=_ptg2_manifest_support_stage_table(
+                stage_table,
+                "price_set_summary",
+            ),
+        )
+
+
+async def _publish_strict_shared_fixture(fixture, reservation):
+    stage_table = await _create_serving_stage_table(
+        f"shared_{reservation.snapshot_key}"
+    )
+    # A single scanner source emits every atom ID once. Cross-source
+    # canonicalization has separate PostgreSQL coverage.
+    await _copy_strict_price_frames(fixture.scanner.scan, stage_table)
+    provider_group_id = bytes.fromhex("00112233445566778899aabbccddeeff")
+    npi = 1234567890
+    graph_entries = _graph_artifacts(
+        fixture.tmp_path / "shared-graph",
+        provider_set_id=fixture.scanner.provider_set_id,
+        provider_group_id=provider_group_id,
+        npi=npi,
+    )
+    publication = await publish_strict_shared_v3_layout(
+        schema_name=fixture.schema_name,
+        manifest_stage_table=stage_table,
+        reserved_snapshot_key=reservation.snapshot_key,
+        build_token="strict-shared-publish-smoke",
+        expected_coverage_scope_id=fixture.scanner.coverage_scope_id,
+        logical_snapshot_id=fixture.snapshot_id,
+        expected_source_identities=[fixture.source_identity],
+        serving_run_entries=fixture.serving_run_entries,
+        code_dictionary_entries=fixture.code_dictionary_entries,
+        provider_set_metadata_entries=fixture.provider_set_metadata_entries,
+        price_set_summary_source_count=1,
+        graph_artifact_entries=graph_entries,
+        source_audit_witness_entries=(
+            fixture.scanner.scanner_tests._single_frame(
+                fixture.scanner.scan["frames"], "source_audit_witness_file"
+            ),
+        ),
+        expected_raw_source_sha256=(fixture.artifact_digest,),
+        provider_identifier_quarantine=fixture.scanner_summary[
+            "provider_identifier_quarantine"
+        ],
+        scratch_parent=fixture.tmp_path,
+    )
+    return _StrictSharedLayout(
+        publication=publication,
+        graph_entries=graph_entries,
+        npi=npi,
+        reserved_snapshot_key=reservation.snapshot_key,
+    )
+
+
+def _assert_strict_publication_summary(layout):
+    publication = layout.publication
+    assert publication.snapshot_key == layout.reserved_snapshot_key
+    assert publication.layout_reused_at_seal is False
+    assert publication.stored_byte_count > 0
+    assert publication.mapping_count > 0
+    assert 0 < publication.unique_block_count <= publication.mapping_count
+    assert len(publication.mapping_digest) == 32
+    assert set(publication.object_kinds) == {
+        "by_code_provider_shard_v1",
+        "by_code_price_page_v4",
+        "by_code_price_dictionary",
+        "provider_set_count_dictionary",
+        "provider_set_codes_v3",
+        "provider_set_page_v3_s2",
+        "price_set_atom_memberships_v3",
+        "price_atoms_v3",
+        "graph_npi_groups_v1",
+        "graph_group_npis_v1",
+        "graph_group_provider_sets_v1",
+        "graph_provider_set_groups_v1",
+    }
+
+
+def _assert_strict_serving_index(fixture, publication):
+    serving_index = publication.serving_index
+    assert serving_index["storage_generation"] == "shared_blocks_v3"
+    assert serving_index["shared_block_layout"] == "dense_shared_blocks_v3"
+    assert serving_index["source_count"] == 1
+    assert serving_index["cold_lookup_contract"] == "ptg_v3_cold_v2"
+    assert serving_index["serving_multiplicity_semantics"] == "source_multiset_v1"
+    assert serving_index["provider_identifier_quarantine"] == (
+        fixture.scanner_summary["provider_identifier_quarantine"]
+    )
+    assert serving_index["coverage_scope_id"] == (
+        fixture.scanner.coverage_scope_id.hex()
+    )
+    assert serving_index["serving_binary_table"] is None
+    assert {
+        "finalizer_seconds",
+        "price_key_ready_finalizer_wall_seconds",
+        "serving_block_publish_seconds",
+        "dictionary_publish_seconds",
+        "provider_set_key_export_seconds",
+        "provider_graph_convert_seconds",
+        "provider_graph_publish_seconds",
+        "independent_publish_wall_seconds",
+        "price_publish_seconds",
+        "audit_publish_seconds",
+        "seal_seconds",
+        "shared_publish_total_seconds",
+    } <= serving_index["timings"].keys()
+
+
+def _assert_strict_timing_values(publication):
+    assert all(
+        publication.serving_index["timings"][name] >= 0
+        for name in (
             "finalizer_seconds",
             "price_key_ready_finalizer_wall_seconds",
             "serving_block_publish_seconds",
@@ -3581,643 +3707,737 @@ async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
             "audit_publish_seconds",
             "seal_seconds",
             "shared_publish_total_seconds",
-        } <= publication.serving_index["timings"].keys()
-        assert all(
-            publication.serving_index["timings"][name] >= 0
-            for name in (
-                "finalizer_seconds",
-                "price_key_ready_finalizer_wall_seconds",
-                "serving_block_publish_seconds",
-                "dictionary_publish_seconds",
-                "provider_set_key_export_seconds",
-                "provider_graph_convert_seconds",
-                "provider_graph_publish_seconds",
-                "independent_publish_wall_seconds",
-                "price_publish_seconds",
-                "audit_publish_seconds",
-                "seal_seconds",
-                "shared_publish_total_seconds",
-            )
         )
-        assert publication.serving_index["price_stage"]["price_key_build_seconds"] >= 0
-        assert publication.serving_index["price_stage"]["price_atom_source_mode"] == (
-            "single_scanner_unique_provenance"
-        )
-        assert publication.serving_index["price_stage"]["normalization_seconds"] == 0
-        assert publication.serving_index["price_stage"]["duplicate_rows_removed"] == 0
-        assert publication.serving_index["audit_sample"]["contract"] == (
-            "persisted_served_occurrence_sample_v2"
-        )
-        assert publication.serving_index["audit_sample"]["method"] == (
-            "publish_time_stratified_v1"
-        )
-        assert (
-            publication.serving_index["audit_sample"]["serving_multiplicity_semantics"]
-            == "source_multiset_v1"
-        )
-        assert publication.serving_index["audit_sample"]["provider_selection"] == (
-            "hash_targeted_budgeted_owner_ordinals_v2"
-        )
-        assert publication.serving_index["audit_sample"][
-            "hydration_candidate_selection"
-        ] == "source_preserving_equal_interval_v1"
-        assert publication.serving_index["audit_sample"][
-            "price_hydration_candidate_count"
-        ] == 2
-        assert publication.serving_index["audit_sample"][
-            "hydrated_candidate_count"
-        ] == 2
-        assert 0 < publication.serving_index["audit_sample"][
-            "provider_selection_count"
-        ] <= publication.serving_index["audit_sample"]["provider_selection_budget"]
-        assert (
-            publication.serving_index["audit_sample"]["price_membership_block_span"]
-            == publication.serving_index["serving_binary"][
-                "price_set_atom_memberships_v3"
-            ]["block_span"]
-        )
-        assert publication.serving_index["audit_sample"]["sample_count"] == 3
-        assert publication.serving_index["audit_sample"]["candidate_count"] == 2
-        assert len(publication.serving_index["audit_sample"]["sample_digest"]) == 64
-        assert not any(
-            path.name.startswith("ptg2-v3-shared-publish-")
-            for path in tmp_path.iterdir()
-        )
-        source_set_by_field = shared_source_set_metadata(
-            [source_assignment.raw_container_sha256]
-        )
-        logical_source_set = await db.scalar(
-            f"""
-            SELECT manifest::jsonb #> '{{serving_index,source_set}}'
-              FROM {quoted_schema}.ptg2_snapshot
-             WHERE snapshot_id = :snapshot_id
-            """,
-            snapshot_id=snapshot_id,
-        )
-        assert logical_source_set == source_set_by_field
-        assert "source_set" not in publication.serving_index
-        assert (
-            await db.scalar(
-                f"""
-                SELECT layout_manifest #> '{{serving_index,source_set}}'
-                  FROM {quoted_schema}.ptg2_v3_snapshot_layout
-                 WHERE snapshot_key = :snapshot_key
-                """,
-                snapshot_key=publication.snapshot_key,
-            )
-            is None
-        )
-        conflicting_snapshot_id = f"shared-conflict-{uuid.uuid4().hex}"
-        conflicting_source_set = shared_source_set_metadata(["f" * 64])
-        await db.status(
-            f"""
-            INSERT INTO {quoted_schema}.ptg2_snapshot
-                (snapshot_id, status, manifest)
-            VALUES (:snapshot_id, 'building', CAST(:manifest AS json))
-            """,
-            snapshot_id=conflicting_snapshot_id,
-            manifest=json.dumps(
-                {"serving_index": {"source_set": conflicting_source_set}},
-                ensure_ascii=True,
-                separators=(",", ":"),
-            ),
-        )
-        with pytest.raises(
-            RuntimeError,
-            match="conflicting logical source-set seal",
-        ):
-            await publish_shared_v3_snapshot_sources(
-                schema_name=schema_name,
-                snapshot_id=conflicting_snapshot_id,
-                plan_scopes=[
-                    SharedLogicalPlanScope("plan-v3-conflict", "ein", "group")
-                ],
-                coverage_scope_id=coverage_scope_id,
-                assignments=[source_assignment],
-            )
-        assert await db.scalar(
-            f"""
-            SELECT manifest::jsonb #> '{{serving_index,source_set}}'
-              FROM {quoted_schema}.ptg2_snapshot
-             WHERE snapshot_id = :snapshot_id
-            """,
-            snapshot_id=conflicting_snapshot_id,
-        ) == conflicting_source_set
+    )
+    price_stage = publication.serving_index["price_stage"]
+    assert price_stage["price_key_build_seconds"] >= 0
+    assert price_stage["price_atom_source_mode"] == (
+        "single_scanner_unique_provenance"
+    )
+    assert price_stage["normalization_seconds"] == 0
+    assert price_stage["duplicate_rows_removed"] == 0
 
-        await db.status(
-            f"""
-            UPDATE {quoted_schema}.ptg2_snapshot
-               SET status = 'published',
-                   manifest = CAST(:manifest AS json)
-             WHERE snapshot_id = :snapshot_id
-            """,
-            snapshot_id=snapshot_id,
-            manifest=json.dumps(
-                {
-                    "serving_index": {
-                        **publication.serving_index,
-                        "source_key": "synthetic-source",
-                        "source_set": logical_source_set,
-                    }
-                },
-                ensure_ascii=True,
-                separators=(",", ":"),
-            ),
-        )
-        async with db.transaction() as session:
-            await bind_snapshot_to_shared_layout(
-                session,
-                schema_name=schema_name,
-                snapshot_id=snapshot_id,
-                snapshot_key=publication.snapshot_key,
-            )
-        await db.status(
-            f"""
-            INSERT INTO {quoted_schema}.ptg2_v3_candidate_audit_attestation
-                (snapshot_id, snapshot_key, source_key, plan_id,
-                 plan_market_type, coverage_scope_id, source_set_digest,
-                 audit_sample_digest, contract, tool_name, tool_version,
-                 report_digest, report, attested_at, expires_at, activated_at)
-            VALUES
-                (:snapshot_id, :snapshot_key, 'synthetic-source',
-                 'plan-v3-runs', 'group', :coverage_scope_id,
-                 :source_set_digest, :audit_sample_digest,
-                 :contract, 'integration-test', '1',
-                 :report_digest, '{{}}'::jsonb,
-                 transaction_timestamp(),
-                 transaction_timestamp() + interval '1 hour',
-                 transaction_timestamp())
-            """,
-            snapshot_id=snapshot_id,
-            snapshot_key=publication.snapshot_key,
-            coverage_scope_id=coverage_scope_id,
-            source_set_digest=bytes.fromhex(
-                source_set_by_field[
-                    "raw_container_sha256_digest"
-                ]
-            ),
-            audit_sample_digest=bytes.fromhex(
-                publication.serving_index["audit_sample"]["sample_digest"]
-            ),
-            contract=PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
-            report_digest=b"\x11" * 32,
-        )
 
-        row_counts = await db.first(
+def _assert_strict_audit_sample(fixture, publication):
+    audit_sample = publication.serving_index["audit_sample"]
+    assert audit_sample["contract"] == "persisted_served_occurrence_sample_v2"
+    assert audit_sample["method"] == "publish_time_stratified_v1"
+    assert audit_sample["serving_multiplicity_semantics"] == "source_multiset_v1"
+    assert audit_sample["provider_selection"] == (
+        "hash_targeted_budgeted_owner_ordinals_v2"
+    )
+    assert audit_sample["hydration_candidate_selection"] == (
+        "source_preserving_equal_interval_v1"
+    )
+    assert audit_sample["price_hydration_candidate_count"] == 2
+    assert audit_sample["hydrated_candidate_count"] == 2
+    assert 0 < audit_sample["provider_selection_count"] <= audit_sample[
+        "provider_selection_budget"
+    ]
+    assert audit_sample["price_membership_block_span"] == publication.serving_index[
+        "serving_binary"
+    ]["price_set_atom_memberships_v3"]["block_span"]
+    assert audit_sample["sample_count"] == 3
+    assert audit_sample["candidate_count"] == 2
+    assert len(audit_sample["sample_digest"]) == 64
+    assert not any(
+        path.name.startswith("ptg2-v3-shared-publish-")
+        for path in fixture.tmp_path.iterdir()
+    )
+
+
+def _assert_strict_publication(fixture, layout):
+    _assert_strict_publication_summary(layout)
+    _assert_strict_serving_index(fixture, layout.publication)
+    _assert_strict_timing_values(layout.publication)
+    _assert_strict_audit_sample(fixture, layout.publication)
+
+
+async def _read_strict_logical_source_set(fixture, publication):
+    source_set_by_field = shared_source_set_metadata(
+        [fixture.source_assignment.raw_container_sha256]
+    )
+    logical_source_set = await db.scalar(
+        f"""
+        SELECT manifest::jsonb #> '{{serving_index,source_set}}'
+          FROM {fixture.quoted_schema}.ptg2_snapshot
+         WHERE snapshot_id = :snapshot_id
+        """,
+        snapshot_id=fixture.snapshot_id,
+    )
+    assert logical_source_set == source_set_by_field
+    assert "source_set" not in publication.serving_index
+    assert (
+        await db.scalar(
             f"""
-            SELECT
-                (SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_code),
-                (SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_provider_set),
-                (SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_provider_group),
-                (SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_npi_scope),
-                (SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_snapshot_binding),
-                (SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_snapshot_scope),
-                (SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_audit_occurrence),
-                (SELECT COUNT(DISTINCT coverage_scope_id)
-                   FROM {quoted_schema}.ptg2_v3_code)
-            """
-        )
-        assert tuple(int(table_count) for table_count in row_counts) == (
-            2,
-            1,
-            1,
-            1,
-            1,
-            1,
-            3,
-            1,
-        )
-        provider_set_key = int(
-            await db.scalar(
-                f"SELECT provider_set_key FROM {quoted_schema}.ptg2_v3_provider_set"
-            )
-        )
-        provider_group_key = int(
-            await db.scalar(
-                f"SELECT provider_group_key FROM {quoted_schema}.ptg2_v3_provider_group"
-            )
-        )
-        code_key_rows = await db.all(
-            f"""
-            SELECT reported_code, code_key, negotiation_arrangement
-              FROM {quoted_schema}.ptg2_v3_code
-             ORDER BY reported_code
-            """
-        )
-        code_key_by_reported_code = {
-            str(code_key_record[0]): int(code_key_record[1])
-            for code_key_record in code_key_rows
-        }
-        assert set(code_key_by_reported_code) == {"99213", "99214"}
-        assert {str(code_key_record[2]) for code_key_record in code_key_rows} == {
-            "FFS"
-        }
-        audit_rows = await db.all(
-            f"""
-            SELECT occurrence_id, atom_ordinal, atom_key
-              FROM {quoted_schema}.ptg2_v3_audit_occurrence
-             WHERE snapshot_key = :snapshot_key
-               AND code_key = :code_key
-             ORDER BY atom_ordinal
-            """,
-            snapshot_key=publication.snapshot_key,
-            code_key=code_key_by_reported_code["99213"],
-        )
-        assert [int(audit_row[1]) for audit_row in audit_rows] == [0, 1]
-        assert audit_rows[0][2] == audit_rows[1][2]
-        assert bytes(audit_rows[0][0]) != bytes(audit_rows[1][0])
-        layout_audit_sample = await db.scalar(
-            f"""
-            SELECT layout_manifest #> '{{serving_index,audit_sample}}'
-              FROM {quoted_schema}.ptg2_v3_snapshot_layout
+            SELECT layout_manifest #> '{{serving_index,source_set}}'
+              FROM {fixture.quoted_schema}.ptg2_v3_snapshot_layout
              WHERE snapshot_key = :snapshot_key
             """,
             snapshot_key=publication.snapshot_key,
         )
-        assert layout_audit_sample == publication.serving_index["audit_sample"]
+        is None
+    )
+    return source_set_by_field, logical_source_set
 
-        async with db.session() as session:
-            original_schema = ptg2_tables.PTG2_SCHEMA
-            ptg2_tables.PTG2_SCHEMA = schema_name
-            try:
-                serving_tables = await ptg2_tables.snapshot_serving_tables(
-                    session,
-                    snapshot_id,
-                )
-            finally:
-                ptg2_tables.PTG2_SCHEMA = original_schema
-            assert serving_tables.uses_shared_blocks
-            assert serving_tables.shared_snapshot_key == publication.snapshot_key
 
-            class _Pagination:
-                limit = 25
-                offset = 0
-
-            original_serving_schema = ptg2_serving.PTG2_SCHEMA
-            ptg2_serving.PTG2_SCHEMA = schema_name
-            try:
-                api_payload = await ptg2_serving.search_ptg2_serving_table(
-                    session,
-                    snapshot_id,
-                    {
-                        "plan_id": "plan-v3-runs",
-                        "code_system": "CPT",
-                        "code": "99213",
-                    },
-                    _Pagination(),
-                    serving_tables=serving_tables,
-                )
-            finally:
-                ptg2_serving.PTG2_SCHEMA = original_serving_schema
-            assert api_payload is not None
-            assert len(api_payload["items"]) == 1
-            provenance_map = dict(api_payload["provenance"])
-            database_evidence = provenance_map.pop("database_evidence")
-            assert provenance_map == {
-                "arch_version": "postgres_binary_v3",
-                "storage_generation": "shared_blocks_v3",
-                "database_backend": "postgresql",
-                "plan_id": "plan-v3-runs",
-                "snapshot_id": snapshot_id,
-                "source_key": "synthetic-source",
-                "mode": "product_search",
-                "pricing_scope": "plan_scoped_ptg",
-            }
-            assert database_evidence["contract"] == "postgresql_session_v1"
-            assert database_evidence["backend_session_active"] is True
-            assert database_evidence["database_selected"] is True
-            assert database_evidence["transaction_snapshot_observed"] is True
-            assert int(database_evidence["server_version_num"]) > 0
-            assert api_payload["items"][0]["negotiation_arrangement"] == "FFS"
-            assert len(api_payload["items"][0]["prices"]) == 2
-            assert (
-                api_payload["items"][0]["prices"][0]
-                == api_payload["items"][0]["prices"][1]
-            )
-
-            forward_rows = await lookup_serving_binary_by_code_from_db(
-                session,
-                code_key_by_reported_code["99213"],
-                shared_snapshot_key=publication.snapshot_key,
-                schema_name=schema_name,
-                price_dictionary_item_count=2,
-                price_dictionary_block_bytes=int(
-                    publication.serving_index["serving_binary"]["price_dictionary"][
-                        "block_bytes"
-                    ]
-                ),
-            )
-            assert len(forward_rows) == 1
-            assert forward_rows[0].provider_set_key == provider_set_key
-            assert forward_rows[0].provider_count == 2
-            assert (
-                bytes.fromhex(forward_rows[0].price_set_global_id_128) in price_set_ids
-            )
-            second_forward_rows = await lookup_serving_binary_by_code_from_db(
-                session,
-                code_key_by_reported_code["99214"],
-                shared_snapshot_key=publication.snapshot_key,
-                schema_name=schema_name,
-                price_dictionary_item_count=2,
-                price_dictionary_block_bytes=int(
-                    publication.serving_index["serving_binary"]["price_dictionary"][
-                        "block_bytes"
-                    ]
-                ),
-            )
-            assert len(second_forward_rows) == 1
-            assert (
-                bytes.fromhex(second_forward_rows[0].price_set_global_id_128)
-                in price_set_ids
-            )
-            assert second_forward_rows[0].price_key != forward_rows[0].price_key
-
-            assert await lookup_shared_provider_code_keys_from_db(
-                session,
-                publication.snapshot_key,
-                (provider_set_key,),
-                schema_name=schema_name,
-            ) == {
-                provider_set_key: tuple(sorted(code_key_by_reported_code.values()))
-            }
-            assert (
-                await lookup_shared_code_page_from_db(
-                    session,
-                    publication.snapshot_key,
-                    code_key_by_reported_code["99213"],
-                    schema_name=schema_name,
-                )
-                is not None
-            )
-            price_keys = {
-                int(forward_rows[0].price_key),
-                int(second_forward_rows[0].price_key),
-            }
-            memberships = await lookup_shared_price_atom_memberships_from_db(
-                session,
-                publication.snapshot_key,
-                price_keys,
-                atom_key_bits=int(publication.serving_index["atom_key_bits"]),
-                schema_name=schema_name,
-            )
-            assert set(memberships) == price_keys
-            assert sorted(len(atom_keys) for atom_keys in memberships.values()) == [
-                1,
-                2,
-            ]
-            duplicate_atom_keys = memberships[int(forward_rows[0].price_key)]
-            assert len(duplicate_atom_keys) == 2
-            assert duplicate_atom_keys[0] == duplicate_atom_keys[1]
-            atoms = await lookup_shared_price_atoms_from_db(
-                session,
-                publication.snapshot_key,
-                {
-                    atom_key
-                    for atom_keys in memberships.values()
-                    for atom_key in atom_keys
-                },
-                atom_key_bits=int(publication.serving_index["atom_key_bits"]),
-                schema_name=schema_name,
-            )
-            assert {atom.negotiated_rate for atom in atoms.values()} == {"125.5", "250"}
-
-            assert await fetch_shared_graph_members(
-                session,
-                schema_name=schema_name,
-                snapshot_key=publication.snapshot_key,
-                direction=PTG2_V3_GRAPH_NPI_TO_GROUP,
-                owner_keys=(npi,),
-            ) == {npi: (provider_group_key,)}
-            assert await fetch_shared_graph_members(
-                session,
-                schema_name=schema_name,
-                snapshot_key=publication.snapshot_key,
-                direction=PTG2_V3_GRAPH_GROUP_TO_NPI,
-                owner_keys=(provider_group_key,),
-            ) == {provider_group_key: (npi,)}
-            assert await fetch_shared_graph_members(
-                session,
-                schema_name=schema_name,
-                snapshot_key=publication.snapshot_key,
-                direction=PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
-                owner_keys=(provider_group_key,),
-            ) == {provider_group_key: (provider_set_key,)}
-            assert await fetch_shared_graph_members(
-                session,
-                schema_name=schema_name,
-                snapshot_key=publication.snapshot_key,
-                direction=PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
-                owner_keys=(provider_set_key,),
-            ) == {provider_set_key: (provider_group_key,)}
-            assert await fetch_shared_blocks(
-                session,
-                schema_name=schema_name,
-                snapshot_key=publication.snapshot_key,
-                object_kind="by_code_provider_shard_v1",
-                block_keys=(
-                    (code_key_by_reported_code["99213"] << 31)
-                    | (provider_set_key // 1024),
-                ),
-                require_all=True,
-            )
-
-        async with db.transaction() as session:
-            second_reservation = await reserve_shared_layout(
-                session,
-                schema_name=schema_name,
-                semantic_fingerprint=shared_semantic_fingerprint(
-                    {"fixture": "strict-shared-publish-v1-second-logical-source"}
-                ),
-                build_token="strict-shared-publish-reuse-smoke",
-            )
-        assert second_reservation.reused is False
-        discarded_snapshot_key = second_reservation.snapshot_key
-        reused_stage = await _create_serving_stage_table(
-            f"shared_{discarded_snapshot_key}"
-        )
-        for frame in scan["price_atom_frames"]:
-            await _copy_price_atom_file(
-                Path(frame["path"]),
-                target_table=_ptg2_manifest_support_stage_table(
-                    reused_stage,
-                    "price_atom",
-                ),
-            )
-        for frame in scan["price_set_atom_frames"]:
-            await _copy_price_atom_member_file(
-                Path(frame["path"]),
-                target_table=_ptg2_manifest_support_stage_table(
-                    reused_stage,
-                    "price_set_atom",
-                ),
-            )
-        for frame in scan["price_set_summary_frames"]:
-            await _copy_price_set_summary_file(
-                Path(frame["path"]),
-                target_table=_ptg2_manifest_support_stage_table(
-                    reused_stage,
-                    "price_set_summary",
-                ),
-            )
-        reused_snapshot_id = f"shared-reused-{uuid.uuid4().hex}"
-        reused_assignment = SharedSnapshotSourceAssignment(
-            source_key=0,
-            identity=source_identity,
-            source_trace_set_hash="e" * 64,
-            source_trace_hashes=("f" * 64,),
-            raw_container_sha256="1" * 64,
-            logical_json_sha256="a" * 64,
-            logical_hash_deferred=False,
-        )
-        await db.status(
-            f"""
-            INSERT INTO {quoted_schema}.ptg2_snapshot
-                (snapshot_id, status, manifest)
-            VALUES (:snapshot_id, 'building', '{{}}'::json)
-            """,
-            snapshot_id=reused_snapshot_id,
-        )
-        await db.status(
-            f"""
-            INSERT INTO {quoted_schema}.ptg2_source_trace_set
-                (source_trace_set_hash, source_trace_hashes)
-            VALUES (:source_trace_set_hash, CAST(:source_trace_hashes AS varchar[]))
-            """,
-            source_trace_set_hash=reused_assignment.source_trace_set_hash,
-            source_trace_hashes=list(reused_assignment.source_trace_hashes),
-        )
+async def _assert_strict_source_conflict(fixture):
+    conflicting_snapshot_id = f"shared-conflict-{uuid.uuid4().hex}"
+    conflicting_source_set = shared_source_set_metadata(["f" * 64])
+    await db.status(
+        f"""
+        INSERT INTO {fixture.quoted_schema}.ptg2_snapshot
+            (snapshot_id, status, manifest)
+        VALUES (:snapshot_id, 'building', CAST(:manifest AS json))
+        """,
+        snapshot_id=conflicting_snapshot_id,
+        manifest=json.dumps(
+            {"serving_index": {"source_set": conflicting_source_set}},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="conflicting logical source-set seal"):
         await publish_shared_v3_snapshot_sources(
-            schema_name=schema_name,
-            snapshot_id=reused_snapshot_id,
+            schema_name=fixture.schema_name,
+            snapshot_id=conflicting_snapshot_id,
             plan_scopes=[
-                SharedLogicalPlanScope(
-                    "plan-v3-runs-reused",
-                    "ein",
-                    "group",
-                )
+                SharedLogicalPlanScope("plan-v3-conflict", "ein", "group")
             ],
-            coverage_scope_id=coverage_scope_id,
-            assignments=[reused_assignment],
+            coverage_scope_id=fixture.scanner.coverage_scope_id,
+            assignments=[fixture.source_assignment],
         )
-        reused_source_set = await db.scalar(
-            f"""
-            SELECT manifest::jsonb #> '{{serving_index,source_set}}'
-              FROM {quoted_schema}.ptg2_snapshot
-             WHERE snapshot_id = :snapshot_id
-            """,
-            snapshot_id=reused_snapshot_id,
+    assert await db.scalar(
+        f"""
+        SELECT manifest::jsonb #> '{{serving_index,source_set}}'
+          FROM {fixture.quoted_schema}.ptg2_snapshot
+         WHERE snapshot_id = :snapshot_id
+        """,
+        snapshot_id=conflicting_snapshot_id,
+    ) == conflicting_source_set
+
+
+async def _publish_strict_snapshot_manifest(fixture, publication, source_set):
+    await db.status(
+        f"""
+        UPDATE {fixture.quoted_schema}.ptg2_snapshot
+           SET status = 'published',
+               manifest = CAST(:manifest AS json)
+         WHERE snapshot_id = :snapshot_id
+        """,
+        snapshot_id=fixture.snapshot_id,
+        manifest=json.dumps(
+            {
+                "serving_index": {
+                    **publication.serving_index,
+                    "source_key": "synthetic-source",
+                    "source_set": source_set,
+                }
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
+    )
+    async with db.transaction() as session:
+        await bind_snapshot_to_shared_layout(
+            session,
+            schema_name=fixture.schema_name,
+            snapshot_id=fixture.snapshot_id,
+            snapshot_key=publication.snapshot_key,
         )
-        assert reused_source_set == shared_source_set_metadata(
-            [reused_assignment.raw_container_sha256]
+
+
+async def _attest_strict_snapshot(fixture, publication, source_set_by_field):
+    await db.status(
+        f"""
+        INSERT INTO {fixture.quoted_schema}.ptg2_v3_candidate_audit_attestation
+            (snapshot_id, snapshot_key, source_key, plan_id,
+             plan_market_type, coverage_scope_id, source_set_digest,
+             audit_sample_digest, contract, tool_name, tool_version,
+             report_digest, report, attested_at, expires_at, activated_at)
+        VALUES
+            (:snapshot_id, :snapshot_key, 'synthetic-source',
+             'plan-v3-runs', 'group', :coverage_scope_id,
+             :source_set_digest, :audit_sample_digest,
+             :contract, 'integration-test', '1',
+             :report_digest, '{{}}'::jsonb,
+             transaction_timestamp(),
+             transaction_timestamp() + interval '1 hour',
+             transaction_timestamp())
+        """,
+        snapshot_id=fixture.snapshot_id,
+        snapshot_key=publication.snapshot_key,
+        coverage_scope_id=fixture.scanner.coverage_scope_id,
+        source_set_digest=bytes.fromhex(
+            source_set_by_field["raw_container_sha256_digest"]
+        ),
+        audit_sample_digest=bytes.fromhex(
+            publication.serving_index["audit_sample"]["sample_digest"]
+        ),
+        contract=PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
+        report_digest=b"\x11" * 32,
+    )
+
+
+async def _assert_strict_table_counts(fixture):
+    row_counts = await db.first(
+        f"""
+        SELECT
+            (SELECT COUNT(*) FROM {fixture.quoted_schema}.ptg2_v3_code),
+            (SELECT COUNT(*) FROM {fixture.quoted_schema}.ptg2_v3_provider_set),
+            (SELECT COUNT(*) FROM {fixture.quoted_schema}.ptg2_v3_provider_group),
+            (SELECT COUNT(*) FROM {fixture.quoted_schema}.ptg2_v3_npi_scope),
+            (SELECT COUNT(*) FROM {fixture.quoted_schema}.ptg2_v3_snapshot_binding),
+            (SELECT COUNT(*) FROM {fixture.quoted_schema}.ptg2_v3_snapshot_scope),
+            (SELECT COUNT(*) FROM {fixture.quoted_schema}.ptg2_v3_audit_occurrence),
+            (SELECT COUNT(DISTINCT coverage_scope_id)
+               FROM {fixture.quoted_schema}.ptg2_v3_code)
+        """
+    )
+    assert tuple(int(table_count) for table_count in row_counts) == (
+        2,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+    )
+
+
+async def _read_strict_serving_keys(fixture):
+    provider_set_key = int(
+        await db.scalar(
+            f"SELECT provider_set_key FROM {fixture.quoted_schema}.ptg2_v3_provider_set"
         )
-        assert reused_source_set != logical_source_set
-        reused_publication = await publish_strict_shared_v3_layout(
-            schema_name=schema_name,
-            manifest_stage_table=reused_stage,
-            reserved_snapshot_key=discarded_snapshot_key,
-            build_token="strict-shared-publish-reuse-smoke",
-            expected_coverage_scope_id=coverage_scope_id,
-            logical_snapshot_id=reused_snapshot_id,
-            expected_source_identities=[source_identity],
-            serving_run_entries=serving_run_entries,
-            code_dictionary_entries=code_dictionary_entries,
-            provider_set_metadata_entries=provider_set_metadata_entries,
-            price_set_summary_source_count=1,
-            graph_artifact_entries=graph_entries,
-            source_audit_witness_entries=(
-                scanner_tests._single_frame(
-                    scan["frames"],
-                    "source_audit_witness_file",
-                ),
-            ),
-            expected_raw_source_sha256=(artifact_digest,),
-            provider_identifier_quarantine=scanner_summary[
-                "provider_identifier_quarantine"
-            ],
-            scratch_parent=tmp_path,
+    )
+    provider_group_key = int(
+        await db.scalar(
+            f"SELECT provider_group_key FROM {fixture.quoted_schema}.ptg2_v3_provider_group"
         )
-        assert reused_publication.layout_reused_at_seal is True
-        assert reused_publication.snapshot_key == publication.snapshot_key
-        assert reused_publication.serving_index["audit_sample"] == (
-            publication.serving_index["audit_sample"]
-        )
-        cleanup_marker = await db.first(
-            f"""
-            SELECT canonical_snapshot_key,
-                   cleanup_pending_at IS NOT NULL AS cleanup_pending
-              FROM {quoted_schema}.ptg2_layout_build_candidate
-             WHERE snapshot_key = :snapshot_key
-            """,
-            snapshot_key=discarded_snapshot_key,
-        )
-        assert dict(cleanup_marker._mapping) == {
-            "canonical_snapshot_key": publication.snapshot_key,
-            "cleanup_pending": True,
-        }
-        assert (
-            int(
-                await db.scalar(
-                    f"""
-                SELECT COUNT(*)
-                  FROM {quoted_schema}.ptg2_v3_snapshot_layout
-                 WHERE snapshot_key = :snapshot_key
-                """,
-                    snapshot_key=discarded_snapshot_key,
-                )
-                or 0
-            )
-            == 1
-        )
-        released = await ptg2_shared_gc.release_unbound_ptg2_shared_layouts(
-            schema_name=schema_name,
-            building_max_age_seconds=21_600,
-            grace_seconds=0,
-            max_layouts=1,
-            require_shared=True,
-            layout_keys=(discarded_snapshot_key,),
-        )
-        replayed_release = (
-            await ptg2_shared_gc.release_unbound_ptg2_shared_layouts(
-                schema_name=schema_name,
-                building_max_age_seconds=21_600,
-                grace_seconds=0,
-                max_layouts=1,
-                require_shared=True,
-                layout_keys=(discarded_snapshot_key,),
-            )
-        )
-        assert released.logical_layout_count == 1
-        assert replayed_release.logical_layout_count == 0
-        assert (
-            int(
-                await db.scalar(
-                    f"""
-                SELECT COUNT(*)
-                  FROM {quoted_schema}.ptg2_v3_snapshot_layout
-                 WHERE snapshot_key = :snapshot_key
-                """,
-                    snapshot_key=discarded_snapshot_key,
-                )
-                or 0
-            )
-            == 0
-        )
-        assert (
-            int(
-                await db.scalar(
-                    f"""
-                SELECT COUNT(*)
-                  FROM {quoted_schema}.ptg2_v3_audit_occurrence
-                 WHERE snapshot_key = :snapshot_key
-                """,
-                    snapshot_key=discarded_snapshot_key,
-                )
-                or 0
-            )
-            == 0
+    )
+    code_key_rows = await db.all(
+        f"""
+        SELECT reported_code, code_key, negotiation_arrangement
+          FROM {fixture.quoted_schema}.ptg2_v3_code
+         ORDER BY reported_code
+        """
+    )
+    code_key_by_reported_code = {
+        str(code_key_record[0]): int(code_key_record[1])
+        for code_key_record in code_key_rows
+    }
+    assert set(code_key_by_reported_code) == {"99213", "99214"}
+    assert {str(code_key_record[2]) for code_key_record in code_key_rows} == {"FFS"}
+    return _StrictServingKeys(
+        provider_set_key=provider_set_key,
+        provider_group_key=provider_group_key,
+        code_key_by_reported_code=code_key_by_reported_code,
+    )
+
+
+async def _assert_strict_audit_rows(fixture, publication, serving_keys):
+    audit_rows = await db.all(
+        f"""
+        SELECT occurrence_id, atom_ordinal, atom_key
+          FROM {fixture.quoted_schema}.ptg2_v3_audit_occurrence
+         WHERE snapshot_key = :snapshot_key
+           AND code_key = :code_key
+         ORDER BY atom_ordinal
+        """,
+        snapshot_key=publication.snapshot_key,
+        code_key=serving_keys.code_key_by_reported_code["99213"],
+    )
+    assert [int(audit_row[1]) for audit_row in audit_rows] == [0, 1]
+    assert audit_rows[0][2] == audit_rows[1][2]
+    assert bytes(audit_rows[0][0]) != bytes(audit_rows[1][0])
+    layout_audit_sample = await db.scalar(
+        f"""
+        SELECT layout_manifest #> '{{serving_index,audit_sample}}'
+          FROM {fixture.quoted_schema}.ptg2_v3_snapshot_layout
+         WHERE snapshot_key = :snapshot_key
+        """,
+        snapshot_key=publication.snapshot_key,
+    )
+    assert layout_audit_sample == publication.serving_index["audit_sample"]
+
+
+async def _load_strict_serving_tables(session, fixture, publication):
+    original_schema = ptg2_tables.PTG2_SCHEMA
+    ptg2_tables.PTG2_SCHEMA = fixture.schema_name
+    try:
+        serving_tables = await ptg2_tables.snapshot_serving_tables(
+            session,
+            fixture.snapshot_id,
         )
     finally:
+        ptg2_tables.PTG2_SCHEMA = original_schema
+    assert serving_tables.uses_shared_blocks
+    assert serving_tables.shared_snapshot_key == publication.snapshot_key
+    return serving_tables
+
+
+async def _assert_strict_api_response(session, fixture, publication, serving_tables):
+    class _Pagination:
+        limit = 25
+        offset = 0
+
+    original_schema = ptg2_serving.PTG2_SCHEMA
+    ptg2_serving.PTG2_SCHEMA = fixture.schema_name
+    try:
+        api_payload = await ptg2_serving.search_ptg2_serving_table(
+            session,
+            fixture.snapshot_id,
+            {
+                "plan_id": "plan-v3-runs",
+                "code_system": "CPT",
+                "code": "99213",
+            },
+            _Pagination(),
+            serving_tables=serving_tables,
+        )
+    finally:
+        ptg2_serving.PTG2_SCHEMA = original_schema
+    assert api_payload is not None
+    assert len(api_payload["items"]) == 1
+    provenance_map = dict(api_payload["provenance"])
+    database_evidence = provenance_map.pop("database_evidence")
+    assert provenance_map == {
+        "arch_version": "postgres_binary_v3",
+        "storage_generation": "shared_blocks_v3",
+        "database_backend": "postgresql",
+        "plan_id": "plan-v3-runs",
+        "snapshot_id": fixture.snapshot_id,
+        "source_key": "synthetic-source",
+        "mode": "product_search",
+        "pricing_scope": "plan_scoped_ptg",
+    }
+    assert database_evidence["contract"] == "postgresql_session_v1"
+    assert database_evidence["backend_session_active"] is True
+    assert database_evidence["database_selected"] is True
+    assert database_evidence["transaction_snapshot_observed"] is True
+    assert int(database_evidence["server_version_num"]) > 0
+    assert api_payload["items"][0]["negotiation_arrangement"] == "FFS"
+    assert len(api_payload["items"][0]["prices"]) == 2
+    assert api_payload["items"][0]["prices"][0] == api_payload["items"][0][
+        "prices"
+    ][1]
+
+
+async def _read_strict_forward_rows(session, fixture, publication, serving_keys):
+    first_rows = await lookup_serving_binary_by_code_from_db(
+        session,
+        serving_keys.code_key_by_reported_code["99213"],
+        shared_snapshot_key=publication.snapshot_key,
+        schema_name=fixture.schema_name,
+        price_dictionary_item_count=2,
+        price_dictionary_block_bytes=int(
+            publication.serving_index["serving_binary"]["price_dictionary"][
+                "block_bytes"
+            ]
+        ),
+    )
+    assert len(first_rows) == 1
+    assert first_rows[0].provider_set_key == serving_keys.provider_set_key
+    assert first_rows[0].provider_count == 2
+    assert (
+        bytes.fromhex(first_rows[0].price_set_global_id_128)
+        in fixture.scanner.price_set_ids
+    )
+    second_rows = await lookup_serving_binary_by_code_from_db(
+        session,
+        serving_keys.code_key_by_reported_code["99214"],
+        shared_snapshot_key=publication.snapshot_key,
+        schema_name=fixture.schema_name,
+        price_dictionary_item_count=2,
+        price_dictionary_block_bytes=int(
+            publication.serving_index["serving_binary"]["price_dictionary"][
+                "block_bytes"
+            ]
+        ),
+    )
+    assert len(second_rows) == 1
+    assert (
+        bytes.fromhex(second_rows[0].price_set_global_id_128)
+        in fixture.scanner.price_set_ids
+    )
+    assert second_rows[0].price_key != first_rows[0].price_key
+    return _StrictForwardRows(first=first_rows, second=second_rows)
+
+
+async def _assert_strict_price_reads(
+    session,
+    fixture,
+    publication,
+    serving_keys,
+    forward_rows,
+):
+    assert await lookup_shared_provider_code_keys_from_db(
+        session,
+        publication.snapshot_key,
+        (serving_keys.provider_set_key,),
+        schema_name=fixture.schema_name,
+    ) == {
+        serving_keys.provider_set_key: tuple(
+            sorted(serving_keys.code_key_by_reported_code.values())
+        )
+    }
+    assert (
+        await lookup_shared_code_page_from_db(
+            session,
+            publication.snapshot_key,
+            serving_keys.code_key_by_reported_code["99213"],
+            schema_name=fixture.schema_name,
+        )
+        is not None
+    )
+    price_keys = {
+        int(forward_rows.first[0].price_key),
+        int(forward_rows.second[0].price_key),
+    }
+    memberships = await lookup_shared_price_atom_memberships_from_db(
+        session,
+        publication.snapshot_key,
+        price_keys,
+        atom_key_bits=int(publication.serving_index["atom_key_bits"]),
+        schema_name=fixture.schema_name,
+    )
+    assert set(memberships) == price_keys
+    assert sorted(len(atom_keys) for atom_keys in memberships.values()) == [1, 2]
+    duplicate_atom_keys = memberships[int(forward_rows.first[0].price_key)]
+    assert len(duplicate_atom_keys) == 2
+    assert duplicate_atom_keys[0] == duplicate_atom_keys[1]
+    atoms = await lookup_shared_price_atoms_from_db(
+        session,
+        publication.snapshot_key,
+        {
+            atom_key
+            for atom_keys in memberships.values()
+            for atom_key in atom_keys
+        },
+        atom_key_bits=int(publication.serving_index["atom_key_bits"]),
+        schema_name=fixture.schema_name,
+    )
+    assert {atom.negotiated_rate for atom in atoms.values()} == {"125.5", "250"}
+
+
+async def _assert_strict_graph_reads(
+    session,
+    fixture,
+    layout,
+    serving_keys,
+):
+    assert await fetch_shared_graph_members(
+        session,
+        schema_name=fixture.schema_name,
+        snapshot_key=layout.publication.snapshot_key,
+        direction=PTG2_V3_GRAPH_NPI_TO_GROUP,
+        owner_keys=(layout.npi,),
+    ) == {layout.npi: (serving_keys.provider_group_key,)}
+    assert await fetch_shared_graph_members(
+        session,
+        schema_name=fixture.schema_name,
+        snapshot_key=layout.publication.snapshot_key,
+        direction=PTG2_V3_GRAPH_GROUP_TO_NPI,
+        owner_keys=(serving_keys.provider_group_key,),
+    ) == {serving_keys.provider_group_key: (layout.npi,)}
+    assert await fetch_shared_graph_members(
+        session,
+        schema_name=fixture.schema_name,
+        snapshot_key=layout.publication.snapshot_key,
+        direction=PTG2_V3_GRAPH_GROUP_TO_PROVIDER_SET,
+        owner_keys=(serving_keys.provider_group_key,),
+    ) == {serving_keys.provider_group_key: (serving_keys.provider_set_key,)}
+    assert await fetch_shared_graph_members(
+        session,
+        schema_name=fixture.schema_name,
+        snapshot_key=layout.publication.snapshot_key,
+        direction=PTG2_V3_GRAPH_PROVIDER_SET_TO_GROUP,
+        owner_keys=(serving_keys.provider_set_key,),
+    ) == {serving_keys.provider_set_key: (serving_keys.provider_group_key,)}
+    assert await fetch_shared_blocks(
+        session,
+        schema_name=fixture.schema_name,
+        snapshot_key=layout.publication.snapshot_key,
+        object_kind="by_code_provider_shard_v1",
+        block_keys=(
+            (serving_keys.code_key_by_reported_code["99213"] << 31)
+            | (serving_keys.provider_set_key // 1024),
+        ),
+        require_all=True,
+    )
+
+
+async def _assert_strict_cache_free_reads(fixture, layout, serving_keys):
+    async with db.session() as session:
+        serving_tables = await _load_strict_serving_tables(
+            session, fixture, layout.publication
+        )
+        await _assert_strict_api_response(
+            session, fixture, layout.publication, serving_tables
+        )
+        forward_rows = await _read_strict_forward_rows(
+            session, fixture, layout.publication, serving_keys
+        )
+        await _assert_strict_price_reads(
+            session,
+            fixture,
+            layout.publication,
+            serving_keys,
+            forward_rows,
+        )
+        await _assert_strict_graph_reads(session, fixture, layout, serving_keys)
+
+
+async def _prepare_strict_reuse_stage(fixture):
+    async with db.transaction() as session:
+        reservation = await reserve_shared_layout(
+            session,
+            schema_name=fixture.schema_name,
+            semantic_fingerprint=shared_semantic_fingerprint(
+                {"fixture": "strict-shared-publish-v1-second-logical-source"}
+            ),
+            build_token="strict-shared-publish-reuse-smoke",
+        )
+    assert reservation.reused is False
+    discarded_snapshot_key = reservation.snapshot_key
+    stage_table = await _create_serving_stage_table(
+        f"shared_{discarded_snapshot_key}"
+    )
+    await _copy_strict_price_frames(fixture.scanner.scan, stage_table)
+    return discarded_snapshot_key, stage_table
+
+
+async def _insert_strict_reuse_source(fixture, snapshot_id, assignment):
+    await db.status(
+        f"""
+        INSERT INTO {fixture.quoted_schema}.ptg2_snapshot
+            (snapshot_id, status, manifest)
+        VALUES (:snapshot_id, 'building', '{{}}'::json)
+        """,
+        snapshot_id=snapshot_id,
+    )
+    await db.status(
+        f"""
+        INSERT INTO {fixture.quoted_schema}.ptg2_source_trace_set
+            (source_trace_set_hash, source_trace_hashes)
+        VALUES (:source_trace_set_hash, CAST(:source_trace_hashes AS varchar[]))
+        """,
+        source_trace_set_hash=assignment.source_trace_set_hash,
+        source_trace_hashes=list(assignment.source_trace_hashes),
+    )
+    await publish_shared_v3_snapshot_sources(
+        schema_name=fixture.schema_name,
+        snapshot_id=snapshot_id,
+        plan_scopes=[
+            SharedLogicalPlanScope(
+                "plan-v3-runs-reused",
+                "ein",
+                "group",
+            )
+        ],
+        coverage_scope_id=fixture.scanner.coverage_scope_id,
+        assignments=[assignment],
+    )
+
+
+async def _prepare_strict_reuse_source(fixture, logical_source_set):
+    snapshot_id = f"shared-reused-{uuid.uuid4().hex}"
+    assignment = SharedSnapshotSourceAssignment(
+        source_key=0,
+        identity=fixture.source_identity,
+        source_trace_set_hash="e" * 64,
+        source_trace_hashes=("f" * 64,),
+        raw_container_sha256="1" * 64,
+        logical_json_sha256="a" * 64,
+        logical_hash_deferred=False,
+    )
+    await _insert_strict_reuse_source(fixture, snapshot_id, assignment)
+    reused_source_set = await db.scalar(
+        f"""
+        SELECT manifest::jsonb #> '{{serving_index,source_set}}'
+          FROM {fixture.quoted_schema}.ptg2_snapshot
+         WHERE snapshot_id = :snapshot_id
+        """,
+        snapshot_id=snapshot_id,
+    )
+    assert reused_source_set == shared_source_set_metadata(
+        [assignment.raw_container_sha256]
+    )
+    assert reused_source_set != logical_source_set
+    return snapshot_id
+
+
+async def _publish_strict_reused_layout(fixture, layout, reuse):
+    return await publish_strict_shared_v3_layout(
+        schema_name=fixture.schema_name,
+        manifest_stage_table=reuse.stage_table,
+        reserved_snapshot_key=reuse.discarded_snapshot_key,
+        build_token="strict-shared-publish-reuse-smoke",
+        expected_coverage_scope_id=fixture.scanner.coverage_scope_id,
+        logical_snapshot_id=reuse.snapshot_id,
+        expected_source_identities=[fixture.source_identity],
+        serving_run_entries=fixture.serving_run_entries,
+        code_dictionary_entries=fixture.code_dictionary_entries,
+        provider_set_metadata_entries=fixture.provider_set_metadata_entries,
+        price_set_summary_source_count=1,
+        graph_artifact_entries=layout.graph_entries,
+        source_audit_witness_entries=(
+            fixture.scanner.scanner_tests._single_frame(
+                fixture.scanner.scan["frames"], "source_audit_witness_file"
+            ),
+        ),
+        expected_raw_source_sha256=(fixture.artifact_digest,),
+        provider_identifier_quarantine=fixture.scanner_summary[
+            "provider_identifier_quarantine"
+        ],
+        scratch_parent=fixture.tmp_path,
+    )
+
+
+async def _assert_strict_reuse_marker(fixture, layout, reuse, reused_publication):
+    assert reused_publication.layout_reused_at_seal is True
+    assert reused_publication.snapshot_key == layout.publication.snapshot_key
+    assert reused_publication.serving_index["audit_sample"] == (
+        layout.publication.serving_index["audit_sample"]
+    )
+    cleanup_marker = await db.first(
+        f"""
+        SELECT canonical_snapshot_key,
+               cleanup_pending_at IS NOT NULL AS cleanup_pending
+          FROM {fixture.quoted_schema}.ptg2_layout_build_candidate
+         WHERE snapshot_key = :snapshot_key
+        """,
+        snapshot_key=reuse.discarded_snapshot_key,
+    )
+    assert dict(cleanup_marker._mapping) == {
+        "canonical_snapshot_key": layout.publication.snapshot_key,
+        "cleanup_pending": True,
+    }
+    assert (
+        int(
+            await db.scalar(
+                f"""
+            SELECT COUNT(*)
+              FROM {fixture.quoted_schema}.ptg2_v3_snapshot_layout
+             WHERE snapshot_key = :snapshot_key
+            """,
+                snapshot_key=reuse.discarded_snapshot_key,
+            )
+            or 0
+        )
+        == 1
+    )
+
+
+async def _assert_strict_reuse_release(fixture, reuse):
+    released = await ptg2_shared_gc.release_unbound_ptg2_shared_layouts(
+        schema_name=fixture.schema_name,
+        building_max_age_seconds=21_600,
+        grace_seconds=0,
+        max_layouts=1,
+        require_shared=True,
+        layout_keys=(reuse.discarded_snapshot_key,),
+    )
+    replayed_release = await ptg2_shared_gc.release_unbound_ptg2_shared_layouts(
+        schema_name=fixture.schema_name,
+        building_max_age_seconds=21_600,
+        grace_seconds=0,
+        max_layouts=1,
+        require_shared=True,
+        layout_keys=(reuse.discarded_snapshot_key,),
+    )
+    assert released.logical_layout_count == 1
+    assert replayed_release.logical_layout_count == 0
+    assert (
+        int(
+            await db.scalar(
+                f"""
+            SELECT COUNT(*)
+              FROM {fixture.quoted_schema}.ptg2_v3_snapshot_layout
+             WHERE snapshot_key = :snapshot_key
+            """,
+                snapshot_key=reuse.discarded_snapshot_key,
+            )
+            or 0
+        )
+        == 0
+    )
+    assert (
+        int(
+            await db.scalar(
+                f"""
+            SELECT COUNT(*)
+              FROM {fixture.quoted_schema}.ptg2_v3_audit_occurrence
+             WHERE snapshot_key = :snapshot_key
+            """,
+                snapshot_key=reuse.discarded_snapshot_key,
+            )
+            or 0
+        )
+        == 0
+    )
+
+
+async def _exercise_strict_shared_reuse(fixture, layout, logical_source_set):
+    discarded_snapshot_key, stage_table = await _prepare_strict_reuse_stage(fixture)
+    snapshot_id = await _prepare_strict_reuse_source(fixture, logical_source_set)
+    reuse = _StrictReuse(
+        discarded_snapshot_key=discarded_snapshot_key,
+        stage_table=stage_table,
+        snapshot_id=snapshot_id,
+    )
+    reused_publication = await _publish_strict_reused_layout(fixture, layout, reuse)
+    await _assert_strict_reuse_marker(fixture, layout, reuse, reused_publication)
+    await _assert_strict_reuse_release(fixture, reuse)
+
+
+async def _exercise_strict_shared_database(fixture):
+    await db.disconnect()
+    await db.connect()
+    try:
+        reservation = await _create_strict_shared_reservation(fixture)
+        layout = await _publish_strict_shared_fixture(fixture, reservation)
+        _assert_strict_publication(fixture, layout)
+        source_set_by_field, logical_source_set = (
+            await _read_strict_logical_source_set(fixture, layout.publication)
+        )
+        await _assert_strict_source_conflict(fixture)
+        await _publish_strict_snapshot_manifest(
+            fixture, layout.publication, logical_source_set
+        )
+        await _attest_strict_snapshot(
+            fixture, layout.publication, source_set_by_field
+        )
+        await _assert_strict_table_counts(fixture)
+        serving_keys = await _read_strict_serving_keys(fixture)
+        await _assert_strict_audit_rows(
+            fixture, layout.publication, serving_keys
+        )
+        await _assert_strict_cache_free_reads(fixture, layout, serving_keys)
+        await _exercise_strict_shared_reuse(fixture, layout, logical_source_set)
+    finally:
         try:
-            await db.execute_ddl(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
+            await db.execute_ddl(
+                f"DROP SCHEMA IF EXISTS {fixture.quoted_schema} CASCADE"
+            )
         finally:
             await db.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_strict_shared_v3_publish_and_cache_free_reads(
+    tmp_path,
+    monkeypatch,
+):
+    """Publish a strict shared layout and verify cache-free reads and reuse."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip(
+            "set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1 for the isolated PostgreSQL test"
+        )
+
+    fixture = _prepare_strict_shared_fixture(tmp_path, monkeypatch)
+    _configure_strict_shared_environment(fixture, monkeypatch)
+    await _exercise_strict_shared_database(fixture)

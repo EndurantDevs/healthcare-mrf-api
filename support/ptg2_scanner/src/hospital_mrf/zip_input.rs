@@ -40,8 +40,9 @@ fn import_zip_payload(
             member.encrypted(),
         ));
     }
-    let (index, declared_bytes, compression, encrypted) =
-        selected.ok_or_else(|| invalid("ZIP hospital MRF must contain exactly one file"))?;
+    let Some((index, declared_bytes, compression, encrypted)) = selected else {
+        return Err(invalid("ZIP hospital MRF must contain exactly one file"));
+    };
     if encrypted {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -108,8 +109,10 @@ impl<R: Read> Read for BoundedZipReader<R> {
                 )),
             };
         }
-        let allowed = usize::try_from(self.remaining.min(buffer.len() as u64))
-            .map_err(|_| invalid("ZIP hospital MRF read size exceeds usize"))?;
+        let allowed = match usize::try_from(self.remaining.min(buffer.len() as u64)) {
+            Ok(allowed) => allowed,
+            Err(_) => return Err(invalid("ZIP hospital MRF read size exceeds usize")),
+        };
         let read = self.inner.read(&mut buffer[..allowed])?;
         self.remaining -= read as u64;
         Ok(read)

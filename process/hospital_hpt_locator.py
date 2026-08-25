@@ -77,7 +77,7 @@ def _validated_mrf_url(value: str) -> str:
         raise _locator_error("mrf_url")
     try:
         parsed = urlsplit(value)
-        parsed.port
+        _validated_port = parsed.port
     except ValueError as exc:
         raise _locator_error("mrf_url") from exc
     if (

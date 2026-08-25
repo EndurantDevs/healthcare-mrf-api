@@ -10,9 +10,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
-from db.models import db
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.ext.utils import ensure_database
+from process.formulary_fhir.async_safety import drain_operation
 from process.hospital_hpt_registry import selected_hospital_hpt_registry
 from process.hospital_price_acquisition import (
     Attempt,
@@ -24,7 +24,6 @@ from process.hospital_price_acquisition import (
     fetch_locator,
     positive_env,
     run_native_parser,
-    schema_name,
     sync_registry,
 )
 from process.hospital_price_native import (
@@ -34,12 +33,12 @@ from process.hospital_price_native import (
 from process import hospital_price_runtime as _runtime
 from process.hospital_price_store import (
     admit_attempts,
+    fail_attempts as _fail_attempts,
     has_existing_version,
     publish_existing,
     stage_content,
 )
 from process.ptg_parts.artifacts import PTG2ArtifactStore
-from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.input_artifact_retention import (
     artifact_lease_context,
     guard_artifact_lease,
@@ -53,6 +52,7 @@ DEFAULT_ATTEMPT_LEASE_SECONDS = 300
 DEFAULT_ATTEMPT_HEARTBEAT_SECONDS = 60
 
 _bounded = _runtime.bounded
+_cancel_and_drain = _runtime.cancel_and_drain
 _guard_cancellation = _runtime.guard_cancellation
 _hospital_resource_lock = _runtime.hospital_resource_lock
 _locator_groups = _runtime.locator_groups
@@ -83,40 +83,6 @@ async def _start_attempts(
     return attempts, len(candidates) - len(attempts)
 
 
-async def _fail_attempts(
-    attempts: Sequence[Attempt], error_code: str, error_detail: str | None
-) -> int:
-    if not attempts:
-        return 0
-    schema = _quote_ident(schema_name())
-    stage_name = f"hospital_failed_attempts_{uuid.uuid4().hex[:12]}"
-    stage = _quote_ident(stage_name)
-    async with db.acquire() as connection:
-        await connection.status(
-            f"CREATE TEMP TABLE {stage} (attempt_id varchar(64), final_source_url text, "
-            "source_http_status integer) ON COMMIT DROP"
-        )
-        driver = getattr(
-            connection.raw_connection, "driver_connection", connection.raw_connection
-        )
-        await driver.copy_records_to_table(
-            stage_name, columns=["attempt_id", "final_source_url", "source_http_status"],
-            records=[
-                (attempt.attempt_id, attempt.final_source_url, attempt.source_http_status)
-                for attempt in attempts
-            ],
-        )
-        return int(await connection.status(
-            f"UPDATE {schema}.hospital_price_import_attempt attempt SET status='failed', "
-            "finished_at=clock_timestamp(), final_source_url=staged.final_source_url, "
-            "source_http_status=staged.source_http_status, error_code=:code, "
-            f"error_detail=:detail FROM {stage} staged "
-            "WHERE attempt.attempt_id=staged.attempt_id "
-            "AND attempt.status IN ('running', 'verified')",
-            code=error_code[:64], detail=(error_detail or error_code)[:2000],
-        ) or 0)
-
-
 async def _ensure_content(
     ctx: dict[str, Any], task: dict[str, Any], store: PTG2ArtifactStore, raw: Any,
     max_decompressed_bytes: int,
@@ -126,8 +92,11 @@ async def _ensure_content(
     await raise_if_cancelled(ctx, task)
     if await has_existing_version(version_id, raw.raw_sha256, raw.byte_count):
         return version_id
-    source_format = detect_hospital_mrf_format(
-        raw.raw_path, max_decompressed_bytes
+    source_format = await drain_operation(
+        asyncio.to_thread(
+            detect_hospital_mrf_format, raw.raw_path, max_decompressed_bytes
+        ),
+        preserve_cancellation=True,
     )
     with tempfile.TemporaryDirectory(
         prefix=f"hospital-mrf-{raw.raw_sha256[:12]}-", dir=store.tmp_dir
@@ -200,11 +169,19 @@ async def _download_worker(
         with artifact_lease_context(owner=owner, store=store) as lease:
             acknowledgement = asyncio.get_running_loop().create_future()
 
-            async def _download_and_wait() -> None:
+            async def _download_and_wait(
+                source_job: Any = source_job,
+                acknowledgement: asyncio.Future[None] = acknowledgement,
+            ) -> None:
+                async def _wait_for_acknowledgement() -> None:
+                    await acknowledgement
+
                 _require_disk_capacity(store, required_free_bytes)
                 downloaded = await download_source(source_job, store, max_raw_bytes)
                 await downloads.put((downloaded, acknowledgement))
-                await asyncio.shield(acknowledgement)
+                await drain_operation(
+                    _wait_for_acknowledgement(), preserve_cancellation=True
+                )
 
             await guard_artifact_lease(lease, _download_and_wait())
 
@@ -322,8 +299,7 @@ async def _stream_sources(
         "processed": 0, "published": 0, "superseded": 0,
         "unchanged": 0, "failed": 0,
     }
-    lock_by_digest: dict[str, asyncio.Lock] = {}
-    ingest_error_by_digest: dict[str, tuple[str | None, str | None]] = {}
+    content_pipeline = ({}, {}, metrics_by_name)
     download_tasks = [
         asyncio.create_task(_download_worker(
             source_jobs, downloads, store, owner, max_raw_bytes, required_free_bytes
@@ -333,29 +309,32 @@ async def _stream_sources(
     load_tasks = [
         asyncio.create_task(_load_worker(
             ctx, task, store, downloads,
-            (lock_by_digest, ingest_error_by_digest, metrics_by_name), progress_context,
+            content_pipeline, progress_context,
             max_decompressed_bytes, max_output_bytes,
         ))
         for _unused in range(loads)
     ]
     closer = asyncio.create_task(_close_downloads(download_tasks, downloads, loads))
-    try:
+
+    async def _join_workers() -> None:
         await asyncio.gather(closer, *load_tasks)
+
+    join_task = asyncio.create_task(_join_workers())
+    try:
+        await asyncio.shield(join_task)
     except BaseException:
-        for owned_task in (*download_tasks, *load_tasks, closer):
-            if not owned_task.done() and owned_task.cancelling() == 0:
-                owned_task.cancel()
-        await asyncio.gather(
-            *download_tasks, *load_tasks, closer, return_exceptions=True
+        await _cancel_and_drain(
+            (*download_tasks, *load_tasks, closer),
+            wait_for=(join_task,),
+            preserve_cancellation=False,
         )
         raise
-    return {**metrics_by_name, "contents": len(ingest_error_by_digest)}
+    return {**metrics_by_name, "contents": len(content_pipeline[1])}
 
 
 async def _run_import(
-    ctx: dict[str, Any], task: dict[str, Any], hospitals: Sequence[dict[str, str]],
-    store: PTG2ArtifactStore, run_attempts: list[Attempt],
-    lease_owner: str, lease_seconds: int,
+    ctx: dict[str, Any], task: dict[str, Any], hospitals: Sequence[dict[str, str]], store: PTG2ArtifactStore,
+    run_attempts: list[Attempt], lease_owner: str, lease_seconds: int,
 ) -> dict[str, int]:
     run_id = str(task.get("run_id") or "").strip() or None
     total = len(hospitals)
@@ -392,21 +371,23 @@ async def _run_import(
         (run_id, failed + active, total),
         (lease_owner, max_raw, max_decompressed, max_output, required_free),
     )
-    published = pipeline_metrics_by_name["published"]
-    superseded = pipeline_metrics_by_name["superseded"]
-    unchanged = pipeline_metrics_by_name["unchanged"]
     failed += pipeline_metrics_by_name["failed"]
     metrics_by_name = {
         "selected": total, "locators": len(locator_groups),
         "mrf_urls": len(attempts_by_url),
         "contents": pipeline_metrics_by_name["contents"],
-        "published": published, "unchanged": unchanged, "superseded": superseded,
+        "published": pipeline_metrics_by_name["published"],
+        "unchanged": pipeline_metrics_by_name["unchanged"],
+        "superseded": pipeline_metrics_by_name["superseded"],
         "failed": failed, "active": active,
     }
-    terminal = published + unchanged + superseded + failed + active
-    _progress(run_id, "complete", terminal, total,
-              "hospital price refresh completed")
-    if published + unchanged != total or failed or active or superseded:
+    _progress(
+        run_id, "complete", sum(metrics_by_name[name] for name in (
+            "published", "unchanged", "superseded", "failed", "active"
+        )), total, "hospital price refresh completed")
+    if (metrics_by_name["published"] + metrics_by_name["unchanged"] != total
+            or metrics_by_name["failed"] or metrics_by_name["active"]
+            or metrics_by_name["superseded"]):
         ctx.setdefault("context", {})["hospital_price_metrics"] = metrics_by_name
         raise RuntimeError("hospital price refresh did not complete every selected hospital")
     return metrics_by_name
@@ -436,7 +417,9 @@ async def refresh_hospital_prices(
     """Run the guarded hospital-price refresh lifecycle."""
 
     task_by_name = dict(task or {})
-    hospitals = selected_hospital_hpt_registry(task_by_name, runtime=True)
+    hospitals = await asyncio.to_thread(
+        selected_hospital_hpt_registry, task_by_name, runtime=True
+    )
     await ensure_database(False)
     store, attempts = PTG2ArtifactStore(), []
     owner = f"hospital-prices:{task_by_name.get('run_id') or uuid.uuid4().hex}"

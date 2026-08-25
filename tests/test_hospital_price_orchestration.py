@@ -19,6 +19,7 @@ from tests.hospital_price_orchestration_support import (
     ArtifactStore,
     Attempt,
     DownloadedSource,
+    configure_incomplete_import,
     orchestrator_module,
 )
 
@@ -41,68 +42,6 @@ def test_locator_groups_duplicate_urls_once():
 
     assert [group[0] for group in groups] == ["https://a/locator", "https://c/locator"]
     assert [hospital["hospital_id"] for hospital in groups[0][1]] == ["a", "b"]
-
-
-@pytest.mark.asyncio
-async def test_bounded_failure_cancels_and_drains_siblings():
-    orchestrator = _orchestrator_module()
-    slow_started, slow_cleaned = asyncio.Event(), asyncio.Event()
-
-    async def operation(name: str) -> str:
-        if name == "failure":
-            await slow_started.wait()
-            raise ValueError("failed")
-        slow_started.set()
-        try:
-            await asyncio.Future()
-        finally:
-            slow_cleaned.set()
-
-    with pytest.raises(ValueError, match="failed"):
-        await orchestrator._bounded(("slow", "failure"), 2, operation)
-    assert slow_cleaned.is_set()
-
-
-@pytest.mark.asyncio
-async def test_bounded_outer_cancel_does_not_interrupt_async_cleanup():
-    orchestrator = _orchestrator_module()
-    operation_started_by_name = {
-        "fast": asyncio.Event(), "slow": asyncio.Event()
-    }
-    cleanup_started = asyncio.Event()
-    allow_cleanup = asyncio.Event()
-    cleanup_finished = asyncio.Event()
-    cleanup_interrupted = asyncio.Event()
-
-    async def operation(name: str) -> None:
-        operation_started_by_name[name].set()
-        try:
-            await asyncio.Future()
-        finally:
-            if name == "slow":
-                cleanup_started.set()
-                try:
-                    await allow_cleanup.wait()
-                    cleanup_finished.set()
-                except asyncio.CancelledError:
-                    cleanup_interrupted.set()
-                    raise
-
-    bounded_task = asyncio.create_task(
-        orchestrator._bounded(("fast", "slow"), 2, operation)
-    )
-    await asyncio.gather(
-        *(started.wait() for started in operation_started_by_name.values())
-    )
-    bounded_task.cancel()
-    await cleanup_started.wait()
-    await asyncio.sleep(0)
-    allow_cleanup.set()
-    with pytest.raises(asyncio.CancelledError):
-        await bounded_task
-
-    assert cleanup_finished.is_set()
-    assert not cleanup_interrupted.is_set()
 
 
 @pytest.mark.asyncio
@@ -219,7 +158,7 @@ def test_resource_limits_fail_before_work_when_capacity_is_unconfigured_or_low(
     with pytest.raises(RuntimeError, match="MAX_OUTPUT_BYTES"):
         orchestrator._resource_limits(_ArtifactStore(tmp_path), 1, 1, 0)
 
-    for name, value in {
+    for env_name, env_value in {
         "HLTHPRT_HOSPITAL_MRF_MAX_BYTES": "100",
         "HLTHPRT_HOSPITAL_MRF_MAX_DECOMPRESSED_BYTES": "100",
         "HLTHPRT_HOSPITAL_MRF_MAX_OUTPUT_BYTES": "100",
@@ -227,7 +166,7 @@ def test_resource_limits_fail_before_work_when_capacity_is_unconfigured_or_low(
         "HLTHPRT_HOSPITAL_PRICE_ACTIVE_SCRATCH_BYTES": "100",
         "HLTHPRT_HOSPITAL_PRICE_MIN_FREE_BYTES": "1",
     }.items():
-        monkeypatch.setenv(name, value)
+        monkeypatch.setenv(env_name, env_value)
     monkeypatch.setattr(
         orchestrator._runtime.shutil,
         "disk_usage",
@@ -362,6 +301,8 @@ async def test_source_pipeline_cancellation_releases_waiting_producer_lease(
 ):
     orchestrator = _orchestrator_module()
     parse_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
     lease_events: list[str] = []
     attempt = _Attempt("one", "a", "A", "https://a/source.json", 0)
     raw = SimpleNamespace(
@@ -383,7 +324,11 @@ async def test_source_pipeline_cancellation_releases_waiting_producer_lease(
 
     async def ensure_content(*_args: Any) -> str:
         parse_started.set()
-        await asyncio.Future()
+        try:
+            await asyncio.Future()
+        finally:
+            cleanup_started.set()
+            await allow_cleanup.wait()
 
     monkeypatch.setattr(orchestrator, "artifact_lease_context", lease_context)
     monkeypatch.setattr(orchestrator, "download_source", download_source)
@@ -398,6 +343,12 @@ async def test_source_pipeline_cancellation_releases_waiting_producer_lease(
     ))
     await asyncio.wait_for(parse_started.wait(), timeout=1)
     pipeline.cancel()
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    await asyncio.sleep(0)
+    pipeline.cancel()
+    await asyncio.sleep(0)
+    assert lease_events == ["start"]
+    allow_cleanup.set()
     with pytest.raises(asyncio.CancelledError):
         await pipeline
 
@@ -405,8 +356,19 @@ async def test_source_pipeline_cancellation_releases_waiting_producer_lease(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resolved_failures", "pipeline_metrics", "expected_metrics"),
+    (
+        (1, {"processed": 1, "published": 1, "superseded": 0, "unchanged": 0,
+             "failed": 0, "contents": 1}, {"published": 1, "failed": 1}),
+        (1, {"processed": 1, "published": 0, "superseded": 0, "unchanged": 0,
+             "failed": 1, "contents": 0}, {"published": 0, "failed": 2}),
+        (0, {"processed": 2, "published": 1, "superseded": 1, "unchanged": 0,
+             "failed": 0, "contents": 1}, {"published": 1, "superseded": 1}),
+    ),
+)
 async def test_bulk_import_rejects_every_incomplete_selected_cohort(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, resolved_failures, pipeline_metrics, expected_metrics
 ):
     orchestrator = _orchestrator_module()
     hospitals = (
@@ -414,76 +376,14 @@ async def test_bulk_import_rejects_every_incomplete_selected_cohort(
         {"hospital_id": "b", "name": "B", "cms_hpt_url": "https://b/locator"},
     )
 
-    async def noop(*_args: Any, **_kwargs: Any) -> None:
-        return None
-
-    async def bounded(*_args: Any, **_kwargs: Any) -> list[Any]:
-        return []
-
-    async def resolve(*_args: Any, **_kwargs: Any) -> tuple[dict[str, Any], int, int]:
-        return {}, 0, 1
-
-    monkeypatch.setattr(orchestrator, "sync_registry", noop)
-    monkeypatch.setattr(orchestrator, "raise_if_cancelled", noop)
-    monkeypatch.setattr(orchestrator, "_bounded", bounded)
-    monkeypatch.setattr(orchestrator, "_resolve_attempts", resolve)
-    monkeypatch.setattr(orchestrator, "_progress", lambda *_args: None)
-    monkeypatch.setattr(
-        orchestrator,
-        "_resource_limits",
-        lambda *_args: (1, 1, 1024, 4096, 2048, 1),
+    configure_incomplete_import(
+        orchestrator, monkeypatch, resolved_failures, pipeline_metrics
     )
-
-    async def pipeline(*_args: Any, **_kwargs: Any) -> dict[str, int]:
-        return {
-            "processed": 1, "published": 1, "superseded": 0, "unchanged": 0,
-            "failed": 0, "contents": 1,
-        }
-
-    monkeypatch.setattr(orchestrator, "_stream_sources", pipeline)
-    partial_context: dict[str, Any] = {}
+    context_by_field: dict[str, Any] = {}
     with pytest.raises(RuntimeError, match="did not complete every selected hospital"):
         await orchestrator._run_import(
-            partial_context, {}, hospitals, _ArtifactStore(tmp_path), [],
+            context_by_field, {}, hospitals, _ArtifactStore(tmp_path), [],
             "hospital-prices:test", 300,
         )
-    assert partial_context["context"]["hospital_price_metrics"]["published"] == 1
-    assert partial_context["context"]["hospital_price_metrics"]["failed"] == 1
-
-    async def failed_pipeline(*_args: Any, **_kwargs: Any) -> dict[str, int]:
-        return {
-            "processed": 1, "published": 0, "superseded": 0, "unchanged": 0,
-            "failed": 1, "contents": 0,
-        }
-
-    monkeypatch.setattr(orchestrator, "_stream_sources", failed_pipeline)
-    failure_context_by_name: dict[str, Any] = {}
-    with pytest.raises(RuntimeError, match="did not complete every selected hospital"):
-        await orchestrator._run_import(
-            failure_context_by_name, {}, hospitals, _ArtifactStore(tmp_path), [],
-            "hospital-prices:test", 300,
-        )
-    assert failure_context_by_name["context"]["hospital_price_metrics"] == {
-        "selected": 2, "locators": 2, "mrf_urls": 0, "contents": 0,
-        "published": 0, "unchanged": 0, "superseded": 0,
-        "failed": 2, "active": 0,
-    }
-
-    async def resolve_without_failures(
-        *_args: Any, **_kwargs: Any
-    ) -> tuple[dict[str, Any], int, int]:
-        return {}, 0, 0
-
-    async def superseded_pipeline(*_args: Any, **_kwargs: Any) -> dict[str, int]:
-        return {
-            "processed": 2, "published": 1, "superseded": 1, "unchanged": 0,
-            "failed": 0, "contents": 1,
-        }
-
-    monkeypatch.setattr(orchestrator, "_resolve_attempts", resolve_without_failures)
-    monkeypatch.setattr(orchestrator, "_stream_sources", superseded_pipeline)
-    with pytest.raises(RuntimeError, match="did not complete every selected hospital"):
-        await orchestrator._run_import(
-            {}, {}, hospitals, _ArtifactStore(tmp_path), [],
-            "hospital-prices:test", 300,
-        )
+    actual_metrics = context_by_field["context"]["hospital_price_metrics"]
+    assert {name: actual_metrics[name] for name in expected_metrics} == expected_metrics

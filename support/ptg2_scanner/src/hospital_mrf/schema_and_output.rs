@@ -180,20 +180,24 @@ struct DigestWriter {
 
 impl Write for DigestWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let requested = u64::try_from(buffer.len())
-            .map_err(|_| invalid("hospital MRF COPY write size exceeds u64"))?;
-        self.aggregate_bytes
+        let requested = match u64::try_from(buffer.len()) {
+            Ok(requested) => requested,
+            Err(_) => return Err(invalid("hospital MRF COPY write size exceeds u64")),
+        };
+        if self
+            .aggregate_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
                 bytes
                     .checked_add(requested)
                     .filter(|next| *next <= self.max_output_bytes)
             })
-            .map_err(|_| {
-                invalid(format!(
-                    "hospital MRF COPY output exceeds configured limit {} bytes",
-                    self.max_output_bytes
-                ))
-            })?;
+            .is_err()
+        {
+            return Err(invalid(format!(
+                "hospital MRF COPY output exceeds configured limit {} bytes",
+                self.max_output_bytes
+            )));
+        }
         let written = match self.file.write(buffer) {
             Ok(written) => written,
             Err(error) => {
@@ -259,20 +263,18 @@ impl CopySink {
     }
 
     fn write_fields(&mut self, fields: &[Option<&str>]) -> io::Result<()> {
-        let writer = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| invalid("hospital MRF COPY sink is already closed"))?;
+        let Some(writer) = self.writer.as_mut() else {
+            return Err(invalid("hospital MRF COPY sink is already closed"));
+        };
         write_copy_text_fields(writer, fields)?;
         self.rows = self.rows.saturating_add(1);
         Ok(())
     }
 
     fn finish(&mut self) -> io::Result<CopyArtifactSummary> {
-        let mut writer = self
-            .writer
-            .take()
-            .ok_or_else(|| invalid("hospital MRF COPY sink is already closed"))?;
+        let Some(mut writer) = self.writer.take() else {
+            return Err(invalid("hospital MRF COPY sink is already closed"));
+        };
         writer.flush()?;
         writer.get_ref().file.sync_all()?;
         let bytes = writer.get_ref().bytes;
@@ -308,7 +310,10 @@ impl CopyOutputs {
             committed: false,
         };
         let aggregate_bytes = Arc::new(AtomicU64::new(0));
-        for kind in CopyKind::ALL {
+        for (index, kind) in CopyKind::ALL.into_iter().enumerate() {
+            if kind as usize != index {
+                return Err(invalid("hospital MRF COPY sink order is inconsistent"));
+            }
             outputs.sinks.push(CopySink::create(
                 output_directory,
                 kind,

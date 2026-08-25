@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from sanic import response
 from sanic.exceptions import BadRequest
+from sanic.response import HTTPResponse
 
 from api.control_auth import require_control_auth
 from api.control_wave_routes import register_control_wave_routes
@@ -21,7 +22,7 @@ def register_control_routes(blueprint):
     register_control_wave_routes(blueprint)
 
     @blueprint.get("/hospital-prices")
-    async def control_hospital_prices(request):
+    async def control_hospital_prices(request) -> HTTPResponse:
         """List hospital registry rows with attempt and LKG status."""
 
         require_control_auth(request)

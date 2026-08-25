@@ -39,8 +39,15 @@ class _PTG2FileLock:
         self._fd: int | None = None
 
     def acquire(self) -> None:
-        """Acquire the process and filesystem artifact lock."""
-        self._thread_lock.acquire()
+        """Block until the process and filesystem artifact lock is acquired."""
+
+        if self.try_acquire(blocking=True) is None:
+            raise RuntimeError("blocking artifact lock acquisition failed")
+
+    def try_acquire(self, blocking: bool = False) -> "_PTG2FileLock | None":
+        """Acquire the artifact lock when available and return its owner."""
+        if not self._thread_lock.acquire(blocking=blocking):
+            return None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with suppress(OSError):
@@ -48,13 +55,23 @@ class _PTG2FileLock:
             self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o666)
             with suppress(OSError):
                 os.chmod(self.path, 0o666)
-            fcntl.flock(self._fd, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(
+                    self._fd,
+                    fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError:
+                os.close(self._fd)
+                self._fd = None
+                self._thread_lock.release()
+                return None
         except BaseException:
             if self._fd is not None:
                 os.close(self._fd)
                 self._fd = None
             self._thread_lock.release()
             raise
+        return self
 
     def release(self) -> None:
         """Release the filesystem and process artifact lock."""

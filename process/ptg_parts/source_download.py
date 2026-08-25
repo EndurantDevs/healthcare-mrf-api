@@ -27,6 +27,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qsl, urljoin, urlsplit
 
 import aiohttp
+from aiohttp.abc import AbstractResolver, ResolveResult
 
 from process.ptg_parts.artifact_streams import logical_artifact_identity, stream_logical_artifact
 from process.ptg_parts.artifacts import (
@@ -118,19 +119,23 @@ _CONTENT_RANGE_PATTERN = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+)$", re.IGNORECASE
 _ARTIFACT_FILENAME_QUERY_KEYS = frozenset({"file", "filename", "file_name", "name"})
 
 
-class _PublicResolver(aiohttp.abc.AbstractResolver):
+class _PublicResolver(AbstractResolver):
     """Reject DNS-rebinding targets before aiohttp opens a connection."""
 
     def __init__(self) -> None:
         self._resolver = aiohttp.DefaultResolver()
 
-    async def resolve(self, host: str, port: int = 0, family: int = 0):
+    async def resolve(
+        self, host: str, port: int = 0, family: int = 0
+    ) -> list[ResolveResult]:
+        """Resolve a host and reject every non-public answer."""
         addresses = await self._resolver.resolve(host, port, family)
         for address in addresses:
             assert_public_ip(ipaddress.ip_address(address["host"]))
         return addresses
 
     async def close(self) -> None:
+        """Close the delegated aiohttp resolver."""
         await self._resolver.close()
 
 

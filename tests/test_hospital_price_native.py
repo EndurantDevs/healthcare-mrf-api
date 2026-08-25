@@ -62,8 +62,7 @@ def test_format_detection_plain_and_gzip(tmp_path, payload, expected):
 
 def test_format_detection_rejects_empty_multiple_and_encrypted_zips(tmp_path):
     empty = tmp_path / "empty.zip"
-    with zipfile.ZipFile(empty, "w"):
-        pass
+    zipfile.ZipFile(empty, "w").close()
 
     multiple = tmp_path / "multiple.zip"
     with zipfile.ZipFile(multiple, "w") as archive:

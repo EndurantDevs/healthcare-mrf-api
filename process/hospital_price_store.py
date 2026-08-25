@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import uuid
 from typing import Any, Sequence
 
@@ -22,35 +21,13 @@ from process.hospital_price_native import (
     HospitalParserReceipt,
     hospital_ein_from_mrf_url,
 )
-from process.ptg_parts.db_tables import _quote_ident
-
-
-_TARGET = {
-    "mrf": "hospital_price_version", "location": "hospital_price_version_location",
-    "npi": "hospital_price_version_npi", "license": "hospital_price_version_license",
-    "contract_provision": "hospital_price_contract_provision", "service": "hospital_price_service",
-    "code": "hospital_price_service_code", "charge": "hospital_price_charge",
-    "payer_charge": "hospital_price_payer_charge", "modifier": "hospital_price_modifier",
-    "modifier_payer": "hospital_price_modifier_payer",
-}
-_KEYS = {
-    "mrf": ("version_id",), "location": ("version_id", "location_ordinal"),
-    "npi": ("version_id", "npi_ordinal"), "license": ("version_id", "license_ordinal"),
-    "contract_provision": ("version_id", "provision_ordinal"),
-    "service": ("version_id", "service_ordinal"),
-    "code": ("version_id", "service_ordinal", "code_ordinal"),
-    "charge": ("version_id", "service_ordinal", "charge_ordinal"),
-    "payer_charge": ("version_id", "service_ordinal", "charge_ordinal", "payer_ordinal"),
-    "modifier": ("version_id", "modifier_ordinal"),
-    "modifier_payer": ("version_id", "modifier_ordinal", "payer_ordinal"),
-}
-_CHILDREN = tuple(kind for kind in _TARGET if kind != "mrf")
-_REFERENCES = (
-    ("code", "service", ("version_id", "service_ordinal")),
-    ("charge", "service", ("version_id", "service_ordinal")),
-    ("payer_charge", "charge", ("version_id", "service_ordinal", "charge_ordinal")),
-    ("modifier_payer", "modifier", ("version_id", "modifier_ordinal")),
+from process.hospital_price_store_copy import (
+    _CHILDREN,
+    _TARGET,
+    copy_stages,
+    validate_stages,
 )
+from process.ptg_parts.db_tables import _quote_ident
 
 
 async def admit_attempts(candidates: Sequence[Candidate], *, lease_owner: str, lease_seconds: int) -> Sequence[Any]:
@@ -115,6 +92,42 @@ async def admit_attempts(candidates: Sequence[Candidate], *, lease_owner: str, l
         )
 
 
+async def fail_attempts(
+    attempts: Sequence[Attempt], error_code: str, error_detail: str | None
+) -> int:
+    """Fail running attempts with their final bounded source evidence."""
+
+    if not attempts:
+        return 0
+    schema = _quote_ident(schema_name())
+    stage_name = f"hospital_failed_attempts_{uuid.uuid4().hex[:12]}"
+    stage = _quote_ident(stage_name)
+    async with db.acquire() as connection:
+        await connection.status(
+            f"CREATE TEMP TABLE {stage} (attempt_id varchar(64), final_source_url text, "
+            "source_http_status integer) ON COMMIT DROP"
+        )
+        driver = getattr(
+            connection.raw_connection, "driver_connection", connection.raw_connection
+        )
+        await driver.copy_records_to_table(
+            stage_name, columns=["attempt_id", "final_source_url", "source_http_status"],
+            records=[
+                (attempt.attempt_id, attempt.final_source_url, attempt.source_http_status)
+                for attempt in attempts
+            ],
+        )
+        return int(await connection.status(
+            f"UPDATE {schema}.hospital_price_import_attempt attempt SET status='failed', "
+            "finished_at=clock_timestamp(), final_source_url=staged.final_source_url, "
+            "source_http_status=staged.source_http_status, error_code=:code, "
+            f"error_detail=:detail FROM {stage} staged "
+            "WHERE attempt.attempt_id=staged.attempt_id "
+            "AND attempt.status IN ('running', 'verified')",
+            code=error_code[:64], detail=(error_detail or error_code)[:2000],
+        ) or 0)
+
+
 async def renew_attempt_leases(
     attempts: Sequence[Attempt], *, lease_owner: str, lease_seconds: int
 ) -> int:
@@ -150,67 +163,16 @@ async def renew_attempt_leases(
     return int(renewed)
 
 
-class _DigestingSource:
-    def __init__(self, source: Any) -> None:
-        self.source, self.digest, self.byte_count = source, hashlib.sha256(), 0
-
-    def read(self, size: int = -1) -> bytes:
-        """Read bytes while measuring the exact COPY stream."""
-
-        chunk = self.source.read(size)
-        self.digest.update(chunk)
-        self.byte_count += len(chunk)
-        return chunk
+async def _copy_stages(
+    connection: Any, receipt: HospitalParserReceipt, stages: dict[str, str]
+) -> None:
+    await copy_stages(connection, receipt, stages, schema_name())
 
 
-async def _copy_stages(connection: Any, receipt: HospitalParserReceipt, stages: dict[str, str]) -> None:
-    schema = _quote_ident(schema_name())
-    driver = getattr(connection.raw_connection, "driver_connection", connection.raw_connection)
-    copy = getattr(driver, "copy_to_table", None)
-    if copy is None:
-        raise NotImplementedError("active database driver does not expose text COPY")
-    for artifact in receipt.artifacts:
-        columns = HOSPITAL_MRF_COPY_COLUMNS[artifact.kind]
-        quoted_columns = ", ".join(map(_quote_ident, columns))
-        stage = _quote_ident(stages[artifact.kind])
-        await connection.status(
-            f"CREATE TEMP TABLE {stage} ON COMMIT DROP AS SELECT {quoted_columns} "
-            f"FROM {schema}.{_quote_ident(_TARGET[artifact.kind])} WITH NO DATA"
-        )
-        with artifact.path.open("rb") as source:
-            measured = _DigestingSource(source)
-            await copy(
-                stages[artifact.kind], source=measured, columns=list(columns),
-                format="text", delimiter="\t", null="\\N",
-            )
-        if measured.byte_count != artifact.bytes or measured.digest.hexdigest() != artifact.sha256:
-            raise RuntimeError(f"hospital parser {artifact.kind} COPY changed before staging")
-
-
-async def _validate_stages(connection: Any, receipt: HospitalParserReceipt, stages: dict[str, str]) -> None:
-    for artifact in receipt.artifacts:
-        stage = _quote_ident(stages[artifact.kind])
-        count, wrong_version = await connection.first(
-            f"SELECT COUNT(*), COUNT(*) FILTER (WHERE version_id <> :version_id) FROM {stage}",
-            version_id=receipt.version_id,
-        )
-        if int(count) != artifact.rows or int(wrong_version):
-            raise RuntimeError(f"hospital parser {artifact.kind} staging count is invalid")
-        if artifact.kind == "mrf" and artifact.rows != 1:
-            raise RuntimeError("hospital parser must produce one MRF header")
-        keys = ", ".join(map(_quote_ident, _KEYS[artifact.kind]))
-        await connection.status(f"CREATE UNIQUE INDEX ON {stage} ({keys})")
-        await connection.status(f"ANALYZE {stage}")
-    for child_kind, parent_kind, keys in _REFERENCES:
-        child, parent = map(_quote_ident, (stages[child_kind], stages[parent_kind]))
-        predicate = " AND ".join(
-            f"parent.{_quote_ident(key)}=child.{_quote_ident(key)}" for key in keys
-        )
-        if await connection.scalar(
-            f"SELECT EXISTS (SELECT 1 FROM {child} child LEFT JOIN {parent} parent "
-            f"ON {predicate} WHERE parent.{_quote_ident(keys[0])} IS NULL)"
-        ):
-            raise RuntimeError(f"hospital parser {child_kind} has an unresolved reference")
+async def _validate_stages(
+    connection: Any, receipt: HospitalParserReceipt, stages: dict[str, str]
+) -> None:
+    await validate_stages(connection, receipt, stages)
 
 
 async def _insert_content(
@@ -446,8 +408,8 @@ async def _cas_publish(
         WHERE attempt.attempt_id=staged.attempt_id RETURNING attempt.status""",
         version=version_id,
     )
-    published = sum(str(row[0]) == "published" for row in statuses)
-    unchanged = sum(str(row[0]) == "unchanged" for row in statuses)
+    published = sum(str(status_row[0]) == "published" for status_row in statuses)
+    unchanged = sum(str(status_row[0]) == "unchanged" for status_row in statuses)
     await connection.status(
         f"DELETE FROM {schema}.hospital_price_hospital_tax_identity tax "
         f"USING {stage} staged, {schema}.hospital_price_import_attempt attempt "
@@ -482,14 +444,16 @@ async def has_existing_version(
     """Check that an immutable parsed version already matches this source."""
 
     schema = _quote_ident(schema_name())
-    row = await db.first(
+    stored_version = await db.first(
         f"SELECT version.content_sha256, version.parser_contract_sha256, content.byte_count "
         f"FROM {schema}.hospital_price_version version JOIN {schema}.hospital_price_content "
         f"content USING (content_sha256) WHERE version.version_id=:version", version=version_id,
     )
-    if row is None:
+    if stored_version is None:
         return False
-    if tuple(row) != (content_sha256, HOSPITAL_MRF_PARSER_CONTRACT_SHA256, byte_count):
+    if tuple(stored_version) != (
+        content_sha256, HOSPITAL_MRF_PARSER_CONTRACT_SHA256, byte_count
+    ):
         raise RuntimeError("stored hospital version conflicts with source content")
     return True
 
