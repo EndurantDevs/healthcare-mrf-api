@@ -79,6 +79,111 @@ fn append_pg_binary_field(payload: &mut Vec<u8>, field: &[u8]) {
     payload.extend_from_slice(field);
 }
 
+fn replace_first_pg_binary_field(copy: &mut Vec<u8>, field_index: usize, value: Option<&[u8]>) {
+    let mut cursor = 21usize;
+    for index in 0..=field_index {
+        let field_length = i32::from_be_bytes(copy[cursor..cursor + 4].try_into().unwrap());
+        let field_end = cursor
+            + 4
+            + if field_length < 0 {
+                0
+            } else {
+                field_length as usize
+            };
+        if index == field_index {
+            let replacement = value.map_or_else(
+                || (-1i32).to_be_bytes().to_vec(),
+                |field| {
+                    let mut replacement = (field.len() as i32).to_be_bytes().to_vec();
+                    replacement.extend_from_slice(field);
+                    replacement
+                },
+            );
+            copy.splice(cursor..field_end, replacement);
+            return;
+        }
+        cursor = field_end;
+    }
+}
+
+fn v4_finalizer_shared_block_hash(object_kind: &str, payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"PTG2V3BLOCK\x01");
+    hasher.update(2i16.to_be_bytes());
+    for field in [object_kind.as_bytes(), b"none", payload] {
+        hasher.update((field.len() as u32).to_be_bytes());
+        hasher.update(field);
+    }
+    hasher.finalize().into()
+}
+
+fn write_v4_finalizer_pack_lane(root: &Path, name: &str, object_kinds: &[&str]) -> Value {
+    let mut copy = b"PGCOPY\n\xff\r\n\0".to_vec();
+    copy.extend_from_slice(&0i32.to_be_bytes());
+    copy.extend_from_slice(&0i32.to_be_bytes());
+    for (index, object_kind) in object_kinds.iter().enumerate() {
+        let payload = [index as u8 + 1];
+        copy.extend_from_slice(&10i16.to_be_bytes());
+        for field in [
+            v4_finalizer_shared_block_hash(object_kind, &payload).as_slice(),
+            2i16.to_be_bytes().as_slice(),
+            object_kind.as_bytes(),
+            (index as i64).to_be_bytes().as_slice(),
+            0i32.to_be_bytes().as_slice(),
+            1i64.to_be_bytes().as_slice(),
+            b"none",
+            1i64.to_be_bytes().as_slice(),
+            1i64.to_be_bytes().as_slice(),
+            payload.as_slice(),
+        ] {
+            append_pg_binary_field(&mut copy, field);
+        }
+    }
+    copy.extend_from_slice(&(-1i16).to_be_bytes());
+    let path = root.join(format!("{name}.copy"));
+    fs::write(&path, &copy).expect("write V4 finalizer pack lane");
+    json!({
+        "name": name,
+        "path": path,
+        "byte_count": copy.len(),
+        "sha256": sha256_hex(&copy),
+        "row_count": object_kinds.len(),
+        "stored_payload_bytes": object_kinds.len(),
+        "object_kinds": object_kinds,
+    })
+}
+
+fn write_v4_finalizer_pack_manifest(root: &Path) -> (PathBuf, Value) {
+    fs::create_dir_all(root).expect("create V4 finalizer pack root");
+    let manifest = json!({
+        "contract": "ptg2_v4_finalizer_pack_input_v1",
+        "coordinates_per_pack": 2,
+        "lanes": [
+            write_v4_finalizer_pack_lane(root, "price_dictionary", &["by_code_price_dictionary"]),
+            write_v4_finalizer_pack_lane(root, "serving", &[
+                "by_code_price_page_v4",
+                "by_code_provider_shard_v1",
+                "provider_set_codes_v3",
+                "provider_set_count_dictionary",
+                "provider_set_page_v3_s2",
+            ]),
+        ],
+    });
+    let path = root.join("manifest.json");
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).expect("write V4 pack manifest");
+    (path, manifest)
+}
+
+fn run_v4_finalizer_pack(root: &Path, manifest_path: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
+        .arg("--pack-v4-finalizer-copies")
+        .arg(root.join("packed"))
+        .args(["--identity-map-max-bytes", "1048576"])
+        .arg(manifest_path)
+        .output()
+        .expect("run V4 finalizer pack CLI")
+}
+
 fn decode_global_id(value: &str) -> [u8; 16] {
     assert_eq!(value.len(), 32, "global ID must contain 32 hex digits");
     let mut decoded = [0u8; 16];
@@ -439,6 +544,233 @@ fn run_compact_v4(source: &Path, output: &Path) -> Output {
     compact_v4_command(source, output)
         .output()
         .expect("run compact V4 scanner")
+}
+
+#[test]
+fn packed_finalizer_cli_emits_the_persisted_summary() {
+    let temporary = tempfile::tempdir().expect("temporary packed-finalizer root");
+    let (manifest_path, _) = write_v4_finalizer_pack_manifest(temporary.path());
+    let output = temporary.path().join("packed");
+    let completed = run_v4_finalizer_pack(temporary.path(), &manifest_path);
+    assert!(
+        completed.status.success(),
+        "packed finalizer failed: {}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let summaries = framed_json_records_named(&completed.stdout, "v4_finalizer_pack_summary");
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0]["canonical_mapping_count"], 6);
+    assert_eq!(summaries[0]["target_block_count"], 6);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(output.join("summary.json")).unwrap()).unwrap(),
+        summaries[0]
+    );
+}
+
+#[test]
+fn packed_finalizer_cli_rejects_invalid_coordinates_before_io() {
+    for arguments in [
+        vec![],
+        vec!["--output", "/tmp/manifest"],
+        vec!["/tmp/output", "--identity-map-max-bytes"],
+        vec![
+            "/tmp/output",
+            "--identity-map-max-bytes",
+            "invalid",
+            "/tmp/manifest",
+        ],
+        vec!["/tmp/output", "--unknown", "/tmp/manifest"],
+        vec![
+            "/tmp/output",
+            "--identity-map-max-bytes",
+            "160",
+            "--identity-map-max-bytes",
+            "160",
+            "/tmp/manifest",
+        ],
+        vec![
+            "/tmp/output",
+            "--identity-map-max-bytes",
+            "160",
+            "/tmp/one",
+            "/tmp/two",
+        ],
+        vec!["/tmp/output", "--identity-map-max-bytes", "160"],
+        vec![
+            "/tmp/output",
+            "--identity-map-max-bytes",
+            "159",
+            "/tmp/manifest",
+        ],
+        vec!["/tmp/output", "/tmp/manifest"],
+    ] {
+        let completed = Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
+            .arg("--pack-v4-finalizer-copies")
+            .args(&arguments)
+            .output()
+            .expect("run invalid V4 finalizer pack CLI");
+        assert!(!completed.status.success(), "accepted {arguments:?}");
+    }
+}
+
+#[test]
+fn packed_finalizer_cli_rejects_manifest_contract_drift() {
+    let temporary = tempfile::tempdir().expect("temporary invalid-manifest root");
+    for (name, pointer, replacement) in [
+        ("contract", "/contract", json!("other")),
+        ("coordinates", "/coordinates_per_pack", json!(0)),
+        ("lane-count", "/lanes", json!([])),
+        ("blank-lane", "/lanes/0/name", json!("")),
+        ("duplicate-lane", "/lanes/1/name", json!("price_dictionary")),
+        ("missing-lane", "/lanes/0/name", json!("other")),
+        ("object-kinds", "/lanes/0/object_kinds", json!([])),
+        ("byte-count", "/lanes/0/byte_count", json!(0)),
+        ("sha", "/lanes/0/sha256", json!("bad")),
+        ("row-count", "/lanes/0/row_count", json!(2)),
+        (
+            "stored-payload-bytes",
+            "/lanes/0/stored_payload_bytes",
+            json!(2),
+        ),
+    ] {
+        let root = temporary.path().join(name);
+        let (manifest_path, mut manifest) = write_v4_finalizer_pack_manifest(&root);
+        *manifest.pointer_mut(pointer).unwrap() = replacement;
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(!run_v4_finalizer_pack(&root, &manifest_path)
+            .status
+            .success());
+    }
+
+    let root = temporary.path().join("same-source");
+    let (manifest_path, mut manifest) = write_v4_finalizer_pack_manifest(&root);
+    manifest["lanes"][1]["path"] = manifest["lanes"][0]["path"].clone();
+    manifest["lanes"][1]["byte_count"] = manifest["lanes"][0]["byte_count"].clone();
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert!(!run_v4_finalizer_pack(&root, &manifest_path)
+        .status
+        .success());
+}
+
+#[test]
+fn packed_finalizer_cli_rejects_copy_wire_drift() {
+    let temporary = tempfile::tempdir().expect("temporary invalid-copy root");
+    for name in [
+        "header",
+        "header-extension",
+        "trailing",
+        "empty",
+        "truncated-header",
+        "missing-trailer",
+        "field-count",
+        "field-length",
+        "truncated-field",
+    ] {
+        let root = temporary.path().join(name);
+        let (manifest_path, mut manifest) = write_v4_finalizer_pack_manifest(&root);
+        let price_path = PathBuf::from(manifest["lanes"][0]["path"].as_str().unwrap());
+        let mut copy = fs::read(&price_path).unwrap();
+        match name {
+            "header" => copy[0] ^= 1,
+            "header-extension" => {
+                copy[15..19].copy_from_slice(&2i32.to_be_bytes());
+                copy.splice(19..19, b"ok".iter().copied());
+            }
+            "trailing" => copy.push(0),
+            "empty" => {
+                copy = b"PGCOPY\n\xff\r\n\0".to_vec();
+                copy.extend_from_slice(&0i32.to_be_bytes());
+                copy.extend_from_slice(&0i32.to_be_bytes());
+                copy.extend_from_slice(&(-1i16).to_be_bytes());
+                manifest["lanes"][0]["row_count"] = json!(0);
+                manifest["lanes"][0]["stored_payload_bytes"] = json!(0);
+            }
+            "truncated-header" => copy.truncate(10),
+            "missing-trailer" => copy.truncate(copy.len() - 2),
+            "field-count" => copy[19..21].copy_from_slice(&9i16.to_be_bytes()),
+            "field-length" => copy[21..25].copy_from_slice(&(-2i32).to_be_bytes()),
+            "truncated-field" => copy.truncate(30),
+            _ => unreachable!(),
+        }
+        fs::write(&price_path, &copy).unwrap();
+        manifest["lanes"][0]["byte_count"] = json!(copy.len());
+        manifest["lanes"][0]["sha256"] = json!(sha256_hex(&copy));
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let completed = run_v4_finalizer_pack(&root, &manifest_path);
+        assert!(!completed.status.success(), "accepted {name}");
+        assert!(!root.join("packed").exists());
+    }
+
+    for (name, field_index, replacement) in [
+        ("null-hash", 0, None),
+        ("null-format", 1, None),
+        ("null-kind", 2, None),
+        ("null-block-key", 3, None),
+        ("null-fragment", 4, None),
+        ("null-entry-count", 5, None),
+        ("null-codec", 6, None),
+        ("null-raw-bytes", 7, None),
+        ("null-stored-bytes", 8, None),
+        ("null-payload", 9, None),
+        ("hash-width", 0, Some(vec![0; 31])),
+        ("format-width", 1, Some(vec![0])),
+        ("format-version", 1, Some(1i16.to_be_bytes().to_vec())),
+        ("empty-kind", 2, Some(vec![])),
+        ("invalid-utf8-kind", 2, Some(vec![0xff])),
+        ("long-kind", 2, Some(vec![b'x'; 65])),
+        ("unknown-kind", 2, Some(b"other".to_vec())),
+        ("int4-block-key", 3, Some(0i32.to_be_bytes().to_vec())),
+        (
+            "negative-block-key",
+            3,
+            Some((-1i64).to_be_bytes().to_vec()),
+        ),
+        ("fragment-width", 4, Some(vec![0; 3])),
+        ("negative-fragment", 4, Some((-1i32).to_be_bytes().to_vec())),
+        (
+            "negative-entry-count",
+            5,
+            Some((-1i64).to_be_bytes().to_vec()),
+        ),
+        ("codec", 6, Some(b"gzip".to_vec())),
+        (
+            "negative-raw-bytes",
+            7,
+            Some((-1i64).to_be_bytes().to_vec()),
+        ),
+        (
+            "negative-stored-bytes",
+            8,
+            Some((-1i64).to_be_bytes().to_vec()),
+        ),
+        ("none-raw-length", 7, Some(2i64.to_be_bytes().to_vec())),
+        ("payload-length", 9, Some(vec![1, 2])),
+    ] {
+        let root = temporary.path().join(name);
+        let (manifest_path, mut manifest) = write_v4_finalizer_pack_manifest(&root);
+        let price_path = PathBuf::from(manifest["lanes"][0]["path"].as_str().unwrap());
+        let mut copy = fs::read(&price_path).unwrap();
+        replace_first_pg_binary_field(&mut copy, field_index, replacement.as_deref());
+        fs::write(&price_path, &copy).unwrap();
+        manifest["lanes"][0]["byte_count"] = json!(copy.len());
+        manifest["lanes"][0]["sha256"] = json!(sha256_hex(&copy));
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let completed = run_v4_finalizer_pack(&root, &manifest_path);
+        assert!(!completed.status.success(), "accepted {name}");
+        assert!(!root.join("packed").exists());
+    }
+
+    let capped_root = temporary.path().join("identity-cap");
+    let (capped_manifest, _) = write_v4_finalizer_pack_manifest(&capped_root);
+    let capped = Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
+        .arg("--pack-v4-finalizer-copies")
+        .arg(capped_root.join("packed"))
+        .args(["--identity-map-max-bytes", "160"])
+        .arg(&capped_manifest)
+        .output()
+        .expect("run identity-capped V4 finalizer pack CLI");
+    assert!(!capped.status.success());
+    assert!(!capped_root.join("packed").exists());
 }
 
 #[test]

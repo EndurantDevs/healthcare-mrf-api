@@ -389,6 +389,8 @@ async def run_production_arm(request: ArmRequest) -> dict[str, Any]:
 
     publication_started_at = time.monotonic()
     if request.packed:
+        # Mirror V4 production ordering: the audit keeps the graph witness alive,
+        # so price publication completes before the packed finalizer starts.
         price_result = await _publish_price_artifact(request)
         finalizer_result, finalizer_seconds, phase_timeline = await _publish_finalizer(
             request

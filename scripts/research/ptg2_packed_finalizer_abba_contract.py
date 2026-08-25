@@ -29,7 +29,9 @@ SERVING_OBJECT_KINDS = tuple(
     if kind != PRICE_DICTIONARY_KIND
 )
 SHA256_HEX_LENGTH = 64
+# Aspirational DEV gate from the requested 300K finalizer target.
 FINALIZER_RATE_GATE = 300_000.0
+# 73.996M rows in eight minutes, including prepare, publish, summary, and commit.
 WHOLE_RATE_GATE = 154_160.0
 CANONICAL_FIELDS = (
     "mapping_digest",
@@ -236,10 +238,14 @@ def _mechanism_gates(arms: list[Mapping[str, Any]]) -> dict[str, Any]:
             >= WHOLE_RATE_GATE
             for arm in packed_arms
         ),
-        "packed_faster_than_legacy_finalizer": max(
-            arm["finalizer_seconds"] for arm in packed_arms
+        "packed_faster_than_legacy_whole_wrapper": max(
+            arm["prepare_plus_publication_plus_summary_seconds"]
+            for arm in packed_arms
         )
-        < min(arm["finalizer_seconds"] for arm in legacy_arms),
+        < min(
+            arm["prepare_plus_publication_plus_summary_seconds"]
+            for arm in legacy_arms
+        ),
         "canonical_abba_parity": len(canonical_summaries) == 1,
     }
     gate_by_name["passed"] = all(gate_by_name.values())

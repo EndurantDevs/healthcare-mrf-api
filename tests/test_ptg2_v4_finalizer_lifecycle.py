@@ -448,7 +448,17 @@ async def test_failed_cleanup_allows_complete_finalizer_root(monkeypatch):
 @pytest.mark.asyncio
 async def test_failed_layout_counts_include_finalizer_ownership():
     executor = AsyncMock()
-    executor.first.return_value = {}
+    tables_present = {
+        table_name: True for table_name in failed_state._FINALIZER_MAP_TABLES
+    }
+    executor.first.side_effect = [
+        tables_present,
+        {},
+        tables_present,
+        {},
+        tables_present,
+        {},
+    ]
 
     await failed_state.load_reference_counts(
         executor,
@@ -479,3 +489,30 @@ async def test_failed_layout_counts_include_finalizer_ownership():
     assert "ptg2_v4_finalizer_map_root" in postcondition_sql
     assert "ptg2_v4_finalizer_map_pack" in postcondition_sql
     assert "ptg2_v4_finalizer_map_target" in postcondition_sql
+
+
+@pytest.mark.asyncio
+async def test_failed_layout_counts_accept_absent_or_reject_partial_finalizer_storage():
+    legacy = AsyncMock()
+    legacy.first.side_effect = [{}, {}]
+    await failed_state.load_reference_counts(
+        legacy,
+        schema_name="mrf",
+        snapshot_id="snapshot",
+        snapshot_key=17,
+    )
+    legacy_sql = legacy.first.await_args.args[0]
+    assert "ptg2_v4_finalizer_map_target" not in legacy_sql
+
+    partial = AsyncMock()
+    partial.first.return_value = {
+        failed_state.PTG2_V4_FINALIZER_MAP_ROOT_TABLE: True,
+    }
+    with pytest.raises(RuntimeError, match="storage extension is partial"):
+        await failed_state.load_reference_counts(
+            partial,
+            schema_name="mrf",
+            snapshot_id="snapshot",
+            snapshot_key=17,
+        )
+    assert partial.first.await_count == 1

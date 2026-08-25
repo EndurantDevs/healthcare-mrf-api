@@ -3385,8 +3385,10 @@ class PTG2V4FinalizerMapRoot(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ["snapshot_key"],
             [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v3_snapshot_layout.snapshot_key"
+                (
+                    f"{_PTG2_DATABASE_SCHEMA}."
+                    "ptg2_v3_snapshot_layout.snapshot_key"
+                )
             ],
             name="ptg2_v4_finalizer_map_root_layout_fkey",
             ondelete="CASCADE",
@@ -3490,8 +3492,10 @@ class PTG2V4FinalizerMapPack(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ["snapshot_key"],
             [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v4_finalizer_map_root.snapshot_key"
+                (
+                    f"{_PTG2_DATABASE_SCHEMA}."
+                    "ptg2_v4_finalizer_map_root.snapshot_key"
+                )
             ],
             name="ptg2_v4_finalizer_map_pack_root_fkey",
             ondelete="CASCADE",
@@ -3566,8 +3570,10 @@ class PTG2V4FinalizerMapTarget(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ["snapshot_key"],
             [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v4_finalizer_map_root.snapshot_key"
+                (
+                    f"{_PTG2_DATABASE_SCHEMA}."
+                    "ptg2_v4_finalizer_map_root.snapshot_key"
+                )
             ],
             name="ptg2_v4_finalizer_map_target_root_fkey",
             ondelete="CASCADE",

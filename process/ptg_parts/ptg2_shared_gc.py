@@ -800,7 +800,7 @@ async def _v4_reachable_hashes(
     snapshot_keys: Sequence[int] | None = None,
     candidate_hashes: Iterable[bytes] | None = None,
 ) -> set[bytes]:
-    """Decode authenticated map packs into exact V4 CAS reachability."""
+    """Decode base packs; unfiltered callers add finalizer hashes separately."""
 
     if snapshot_keys is not None and not snapshot_keys:
         return set()
@@ -986,7 +986,7 @@ def _owned_v4_layout_lock_sql(
         """
                (
                    SELECT root.state
-                     FROM {schema}.ptg2_v4_finalizer_map_root AS root
+                     FROM {schema}.{finalizer_root} AS root
                     WHERE root.snapshot_key = layout.snapshot_key
                ) AS finalizer_root_state,
         """
@@ -995,7 +995,10 @@ def _owned_v4_layout_lock_sql(
     )
     return _OWNED_V4_LAYOUT_LOCK_SQL_TEMPLATE.format(
         schema=schema,
-        finalizer_root_state_sql=finalizer_root_state_sql.format(schema=schema),
+        finalizer_root_state_sql=finalizer_root_state_sql.format(
+            schema=schema,
+            finalizer_root=_quote_ident(PTG2_V4_FINALIZER_MAP_ROOT_TABLE),
+        ),
     )
 
 
@@ -1154,11 +1157,11 @@ async def _additional_v4_layout_stats(
         f"""
         UNION
         SELECT pack.map_block_hash
-          FROM {schema}.ptg2_v4_finalizer_map_pack AS pack
+          FROM {schema}.{_quote_ident(PTG2_V4_FINALIZER_MAP_PACK_TABLE)} AS pack
          WHERE pack.snapshot_key = ANY(CAST(:snapshot_keys AS bigint[]))
         UNION
         SELECT target.block_hash
-          FROM {schema}.ptg2_v4_finalizer_map_target AS target
+          FROM {schema}.{_quote_ident(PTG2_V4_FINALIZER_MAP_TARGET_TABLE)} AS target
          WHERE target.snapshot_key = ANY(CAST(:snapshot_keys AS bigint[]))
         """
         if finalizer_tables_available
@@ -1657,11 +1660,11 @@ async def _owned_v4_mapping_hashes(
         f"""
                     UNION
                     SELECT pack.map_block_hash
-                      FROM {schema}.ptg2_v4_finalizer_map_pack AS pack
+                      FROM {schema}.{_quote_ident(PTG2_V4_FINALIZER_MAP_PACK_TABLE)} AS pack
                      WHERE pack.snapshot_key = :snapshot_key
                     UNION
                     SELECT target.block_hash
-                      FROM {schema}.ptg2_v4_finalizer_map_target AS target
+                      FROM {schema}.{_quote_ident(PTG2_V4_FINALIZER_MAP_TARGET_TABLE)} AS target
                      WHERE target.snapshot_key = :snapshot_key
         """
         if context.finalizer_tables_available
@@ -2738,12 +2741,12 @@ def _delete_blocks_sql(
         f"""
            AND NOT EXISTS (
                 SELECT 1
-                  FROM {schema}.ptg2_v4_finalizer_map_pack AS finalizer_pack
+                  FROM {schema}.{_quote_ident(PTG2_V4_FINALIZER_MAP_PACK_TABLE)} AS finalizer_pack
                  WHERE finalizer_pack.map_block_hash = block.block_hash
            )
            AND NOT EXISTS (
                 SELECT 1
-                  FROM {schema}.ptg2_v4_finalizer_map_target AS finalizer_target
+                  FROM {schema}.{_quote_ident(PTG2_V4_FINALIZER_MAP_TARGET_TABLE)} AS finalizer_target
                  WHERE finalizer_target.block_hash = block.block_hash
            )
         """

@@ -148,11 +148,15 @@ async def _isolation_fixture(monkeypatch, tmp_path):
             stale_artifacts,
         )
     finally:
+        schema_removed = True
         if db.engine is not None:
-            await is_arm_schema_removed(schema_name)
+            schema_removed = await is_arm_schema_removed(schema_name)
         await db.disconnect()
         owner_artifacts.cleanup()
         stale_artifacts.cleanup()
+        assert schema_removed
+        assert not any(owner_work.iterdir())
+        assert not any(stale_work.iterdir())
         owner_work.rmdir()
         stale_work.rmdir()
 

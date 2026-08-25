@@ -10,7 +10,7 @@ from typing import Any, Mapping
 from process.ptg_parts.ptg2_shared_blocks import SharedMappingDigestSummary
 
 
-RECEIPT_CONTRACT = "ptg2_packed_finalizer_abba_receipt_v2"
+RECEIPT_CONTRACT = "ptg2_packed_finalizer_abba_receipt_v3"
 
 
 def _completed_arm_receipt(

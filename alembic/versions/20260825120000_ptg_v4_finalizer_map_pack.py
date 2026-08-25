@@ -62,7 +62,7 @@ _UPGRADE_SQL = (
             canonical_mapping_digest bytea,
             canonical_byte_count bigint NOT NULL DEFAULT 0,
             target_identity_digest bytea,
-            object_kind_count integer NOT NULL DEFAULT 6,
+            object_kind_count integer NOT NULL DEFAULT {kind_count},
             map_pack_count bigint NOT NULL DEFAULT 0,
             coordinate_count bigint NOT NULL DEFAULT 0,
             entry_count bigint NOT NULL DEFAULT 0,
@@ -94,7 +94,7 @@ _UPGRADE_SQL = (
                     )
                 ),
             CONSTRAINT "ptg2_v4_finalizer_map_root_counts_check" CHECK (
-                object_kind_count = 6 AND map_pack_count >= 0
+                object_kind_count = {kind_count} AND map_pack_count >= 0
                 AND coordinate_count >= 0 AND entry_count >= 0
                 AND logical_byte_count >= 0 AND stored_map_byte_count >= 0
                 AND target_block_count >= 0 AND canonical_byte_count >= 0
@@ -282,7 +282,7 @@ _UPGRADE_SQL = (
               FROM {target} AS anchor
               LEFT JOIN {block} AS cas ON cas.block_hash = anchor.block_hash
              WHERE anchor.snapshot_key = NEW.snapshot_key;
-            IF observed_kind_count <> 6
+            IF observed_kind_count <> {kind_count}
                OR observed_pack_count <> resolved_map_block_count
                OR NEW.object_kind_count <> observed_kind_count
                OR NEW.map_pack_count <> observed_pack_count
@@ -488,6 +488,7 @@ _UPGRADE_SQL = (
 
 def _migration_names(schema: str) -> dict[str, str]:
     names = {
+        "kind_count": str(len(_FINALIZER_KINDS)),
         "layout": _qt(schema, "ptg2_v3_snapshot_layout"),
         "block": _qt(schema, "ptg2_v3_block"),
         "legacy_mapping": _qt(schema, "ptg2_v3_snapshot_block"),

@@ -174,11 +174,17 @@ def _cgroup_resource_receipt(proc_cgroup: str, root: Path) -> dict[str, Any]:
     cpu_limits: list[float] = []
     memory_limits: list[int] = []
     for path in paths:
-        cpu_limit = _cpu_quota_value(
-            (path / "cpu.max").read_text(encoding="ascii")
-        )
-        memory_limit = _finite_limit_value(
-            (path / "memory.max").read_text(encoding="ascii")
+        try:
+            cpu_raw = (path / "cpu.max").read_text(encoding="ascii")
+        except OSError:
+            cpu_raw = None
+        try:
+            memory_raw = (path / "memory.max").read_text(encoding="ascii")
+        except OSError:
+            memory_raw = None
+        cpu_limit = _cpu_quota_value(cpu_raw) if cpu_raw is not None else None
+        memory_limit = (
+            _finite_limit_value(memory_raw) if memory_raw is not None else None
         )
         if cpu_limit is not None:
             cpu_limits.append(cpu_limit)
@@ -285,11 +291,15 @@ async def _postgres_resource_receipt(
     cpu_limits: list[float] = []
     memory_limits: list[int] = []
     for path in paths:
-        cpu_limit = _cpu_quota_value(
-            str(await _postgres_file(connection, str(path / "cpu.max")))
+        cpu_raw = await _postgres_file(
+            connection, str(path / "cpu.max"), missing_ok=True
         )
-        memory_limit = _finite_limit_value(
-            str(await _postgres_file(connection, str(path / "memory.max")))
+        memory_raw = await _postgres_file(
+            connection, str(path / "memory.max"), missing_ok=True
+        )
+        cpu_limit = _cpu_quota_value(str(cpu_raw)) if cpu_raw is not None else None
+        memory_limit = (
+            _finite_limit_value(str(memory_raw)) if memory_raw is not None else None
         )
         if cpu_limit is not None:
             cpu_limits.append(cpu_limit)

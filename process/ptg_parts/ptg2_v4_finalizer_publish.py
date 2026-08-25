@@ -44,6 +44,7 @@ from process.ptg_parts.ptg2_v4_finalizer_maps import (
     PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
 )
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
+    PTG2_V4_DEFAULT_COORDINATES_PER_PACK,
     PTG2_V4_MAP_BLOCK_KIND,
     PTG2_V4_MAP_FORMAT,
     lock_v4_shared_layout_for_map_write,
@@ -144,7 +145,7 @@ def _lane_values(sidecar: PackedMapSidecars, lane_no: int) -> tuple[dict[str, in
         sidecar.target_block_count, "target block count", positive=True
     )
     if (sidecar.map_blocks.row_count != packs or sidecar.map_packs.row_count != packs
-            or not packs <= coordinates <= packs * 256
+            or not packs <= coordinates <= packs * PTG2_V4_DEFAULT_COORDINATES_PER_PACK
             or target_count > coordinates
     ):
         raise ValueError("packed finalizer lane aggregates are inconsistent")
@@ -346,8 +347,7 @@ async def _require_pin_lease(session: Any, schema_name: str,
     )
     if not renewed:
         raise RuntimeError("packed finalizer pin heartbeat lost ownership")
-async def _seal_and_unpin(session: Any, publication: V4FinalizerMapPublication,
-                          names: dict[str, str], parameters: dict[str, Any],
+async def _seal_and_unpin(session: Any, names: dict[str, str], parameters: dict[str, Any],
                           schema_name: str) -> None:
     completed = await session.execute(db.text(_ROOT_COMPLETE_SQL.format(**names)), parameters)
     if int(completed.one()[0]) != int(parameters["snapshot_key"]):
@@ -422,7 +422,7 @@ async def _publish_atomic_map(publication: V4FinalizerMapPublication, *, schema_
         )
         await _attach_rows(session, publication, names, parameters)
         _report(progress_callback, "finalizer_map_rows_attached", publication.mapping_count)
-        await _seal_and_unpin(session, publication, names, parameters, schema_name)
+        await _seal_and_unpin(session, names, parameters, schema_name)
         _report(progress_callback, "finalizer_map_attached", publication.mapping_count)
 def _report(callback: Callable[[str, int], None] | None, metric: str, amount: int = 1) -> None:
     if callback is not None:

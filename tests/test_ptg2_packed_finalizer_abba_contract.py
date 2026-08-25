@@ -15,11 +15,13 @@ from scripts.research.ptg2_packed_finalizer_abba_contract import (
     ALL_OBJECT_KINDS,
     ARTIFACT_CONTRACT,
     BenchmarkShape,
+    CANONICAL_FIELDS,
     PRICE_OBJECT_KINDS,
     PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
     REPRESENTATIVE_CLASSIFICATION,
     SHAPE_CONTRACT,
     SYNTHETIC_CLASSIFICATION,
+    _mechanism_gates,
     default_synthetic_shape,
 )
 from scripts.research.ptg2_packed_finalizer_abba_artifacts import generate_artifacts
@@ -28,6 +30,24 @@ from scripts.research.ptg2_packed_finalizer_abba_inputs import (
 )
 from scripts.research import ptg2_packed_finalizer_abba as abba
 from scripts.research import ptg2_packed_finalizer_abba_local_screen as local_screen
+
+
+def test_mechanism_speed_gate_uses_comparable_whole_wrapper_time():
+    def arm(kind: str, finalizer_seconds: float, whole_seconds: float):
+        return {
+            "arm": kind,
+            "finalizer_seconds": finalizer_seconds,
+            "finalizer_rows_per_second": 300_000.0,
+            "prepare_plus_publication_plus_summary_seconds": whole_seconds,
+            "prepare_plus_publication_plus_summary_rows_per_second": 154_160.0,
+            "summary": {field: field for field in CANONICAL_FIELDS},
+        }
+
+    gates = _mechanism_gates(
+        [arm("legacy", 1.0, 2.0), arm("packed", 10.0, 1.0)] * 2
+    )
+
+    assert gates["packed_faster_than_legacy_whole_wrapper"] is True
 
 
 def test_synthetic_shape_and_artifacts_are_exact_and_fail_closed(tmp_path):
@@ -173,5 +193,10 @@ def test_local_screen_requires_opt_in_and_synthetic_inputs(monkeypatch):
 
     monkeypatch.setattr(sys, "argv", ["local-screen"])
     monkeypatch.setattr(local_screen.abba, "main", lambda: 7)
+    monkeypatch.setattr(
+        local_screen.abba,
+        "verify_benchmark_environment",
+        local_screen.abba.verify_benchmark_environment,
+    )
     assert local_screen.main() == 7
     assert local_screen.abba.verify_benchmark_environment is local_screen._verify_local_screen

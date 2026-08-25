@@ -41,7 +41,12 @@ from tests.test_ptg2_v3_bounded_readers import (
 class _SingleForwardShardSession:
     def __init__(self, block_key: int) -> None:
         self.block_key = block_key
+        self.execute_count = 0
         self.stream_count = 0
+
+    async def execute(self, _statement, params):
+        self.execute_count += 1
+        return [{table_name: False for table_name in params}]
 
     async def stream(self, _statement, _params):
         self.stream_count += 1
@@ -164,6 +169,7 @@ async def test_direct_exact_bound_completes_real_code_first_scope(
     assert observed.provider_set_keys_by_npi == {challenge.npi: (5,)}
     assert observed.price_keys_by_occurrence == {(7, 5, 0): (8,)}
     assert graph_calls[0]["allowed"] == {5}
+    assert session.execute_count == 1
     assert session.stream_count == 1
     fetch_fragments.assert_awaited_once()
     assert budget.peak_retained_bytes <= required_bytes

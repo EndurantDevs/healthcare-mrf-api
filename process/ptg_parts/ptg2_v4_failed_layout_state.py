@@ -8,6 +8,11 @@ from typing import Any, Mapping
 
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_shared_blocks import PTG2_V3_DENSE_LAYOUT_TABLES
+from process.ptg_parts.ptg2_v4_finalizer_maps import (
+    PTG2_V4_FINALIZER_MAP_PACK_TABLE,
+    PTG2_V4_FINALIZER_MAP_ROOT_TABLE,
+    PTG2_V4_FINALIZER_MAP_TARGET_TABLE,
+)
 
 
 _REFERENCE_FENCE_NAMES = (
@@ -20,6 +25,37 @@ _REFERENCE_FENCE_NAMES = (
     "scopes",
     "sources",
 )
+_FINALIZER_MAP_TABLES = (
+    PTG2_V4_FINALIZER_MAP_ROOT_TABLE,
+    PTG2_V4_FINALIZER_MAP_PACK_TABLE,
+    PTG2_V4_FINALIZER_MAP_TARGET_TABLE,
+)
+
+
+async def _has_finalizer_map_tables(executor: Any, schema_name: str) -> bool:
+    """Accept complete legacy absence and reject a partial storage extension."""
+
+    schema = _quote_ident(schema_name)
+    relation_name_by_table = {
+        table_name: f"{schema}.{_quote_ident(table_name)}"
+        for table_name in _FINALIZER_MAP_TABLES
+    }
+    fields_by_name = row_mapping(
+        await executor.first(
+            "SELECT "
+            + ", ".join(
+                f"to_regclass(:{table_name}) IS NOT NULL AS {table_name}"
+                for table_name in _FINALIZER_MAP_TABLES
+            ),
+            **relation_name_by_table,
+        )
+    )
+    present_count = sum(
+        bool(fields_by_name.get(table_name)) for table_name in _FINALIZER_MAP_TABLES
+    )
+    if present_count not in (0, len(_FINALIZER_MAP_TABLES)):
+        raise RuntimeError("packed finalizer map storage extension is partial")
+    return present_count == len(_FINALIZER_MAP_TABLES)
 
 
 def row_mapping(database_record: Any) -> dict[str, Any]:
@@ -175,6 +211,19 @@ async def load_reference_counts(
     """Count every logical or physical reference that fences recovery."""
 
     schema = _quote_ident(schema_name)
+    has_finalizer_maps = await _has_finalizer_map_tables(executor, schema_name)
+    finalizer_targets = (
+        f" + (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_target "
+        "WHERE snapshot_key = :snapshot_key)"
+        if has_finalizer_maps
+        else ""
+    )
+    finalizer_packs = (
+        f" + (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_pack "
+        "WHERE snapshot_key = :snapshot_key)"
+        if has_finalizer_maps
+        else ""
+    )
     count_record = await executor.first(
         f"""
         SELECT
@@ -205,15 +254,9 @@ async def load_reference_counts(
             (SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_source
               WHERE snapshot_id = :snapshot_id) AS sources,
             ((SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block
-               WHERE snapshot_key = :snapshot_key)
-             +
-             (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_target
-               WHERE snapshot_key = :snapshot_key)) AS mapping_rows,
+               WHERE snapshot_key = :snapshot_key){finalizer_targets}) AS mapping_rows,
             ((SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack
-               WHERE snapshot_key = :snapshot_key)
-             +
-             (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_pack
-               WHERE snapshot_key = :snapshot_key)) AS map_packs,
+               WHERE snapshot_key = :snapshot_key){finalizer_packs}) AS map_packs,
             (SELECT COUNT(*) FROM {schema}.ptg2_v4_relation_manifest
               WHERE snapshot_key = :snapshot_key) AS relation_manifests
         """,
@@ -236,12 +279,9 @@ async def load_block_stats(
     """Resolve all V3 and packed V4 references against durable CAS."""
 
     schema = _quote_ident(schema_name)
-    stats_record = await executor.first(
+    has_finalizer_maps = await _has_finalizer_map_tables(executor, schema_name)
+    finalizer_hashes = (
         f"""
-        WITH candidate_hashes AS MATERIALIZED (
-            SELECT DISTINCT block_hash
-              FROM {schema}.ptg2_v3_snapshot_block
-             WHERE snapshot_key = :snapshot_key
             UNION
             SELECT map_block_hash
               FROM {schema}.ptg2_v4_finalizer_map_pack
@@ -250,6 +290,17 @@ async def load_block_stats(
             SELECT block_hash
               FROM {schema}.ptg2_v4_finalizer_map_target
              WHERE snapshot_key = :snapshot_key
+        """
+        if has_finalizer_maps
+        else ""
+    )
+    stats_record = await executor.first(
+        f"""
+        WITH candidate_hashes AS MATERIALIZED (
+            SELECT DISTINCT block_hash
+              FROM {schema}.ptg2_v3_snapshot_block
+             WHERE snapshot_key = :snapshot_key
+            {finalizer_hashes}
             UNION
             SELECT DISTINCT block_hash
               FROM unnest(CAST(:v4_hashes AS bytea[])) AS hash(block_hash)
@@ -279,6 +330,25 @@ async def load_recovery_postconditions(
     """Count all physical ownership rows that recovery must remove."""
 
     schema = _quote_ident(schema_name)
+    has_finalizer_maps = await _has_finalizer_map_tables(executor, schema_name)
+    finalizer_targets = (
+        f" + (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_target "
+        "WHERE snapshot_key = :snapshot_key)"
+        if has_finalizer_maps
+        else ""
+    )
+    finalizer_roots = (
+        f" + (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_root "
+        "WHERE snapshot_key = :snapshot_key)"
+        if has_finalizer_maps
+        else ""
+    )
+    finalizer_packs = (
+        f" + (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_pack "
+        "WHERE snapshot_key = :snapshot_key)"
+        if has_finalizer_maps
+        else ""
+    )
     dense_rows_sql = " + ".join(
         (
             f"(SELECT COUNT(*) FROM {schema}.{_quote_ident(table_name)} "
@@ -297,20 +367,11 @@ async def load_recovery_postconditions(
              (SELECT COUNT(*) FROM {schema}.ptg2_v3_layout_fingerprint
                WHERE snapshot_key = :snapshot_key)) AS fingerprints,
             ((SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block
-               WHERE snapshot_key = :snapshot_key)
-             +
-             (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_target
-               WHERE snapshot_key = :snapshot_key)) AS mappings,
+               WHERE snapshot_key = :snapshot_key){finalizer_targets}) AS mappings,
             ((SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_root
-               WHERE snapshot_key = :snapshot_key)
-             +
-             (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_root
-               WHERE snapshot_key = :snapshot_key)) AS map_roots,
+               WHERE snapshot_key = :snapshot_key){finalizer_roots}) AS map_roots,
             ((SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack
-               WHERE snapshot_key = :snapshot_key)
-             +
-             (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_pack
-               WHERE snapshot_key = :snapshot_key)) AS map_packs,
+               WHERE snapshot_key = :snapshot_key){finalizer_packs}) AS map_packs,
             (SELECT COUNT(*) FROM {schema}.ptg2_v4_relation_manifest
               WHERE snapshot_key = :snapshot_key) AS relation_manifests,
             (SELECT COUNT(*) FROM {schema}.ptg2_block_build_pin

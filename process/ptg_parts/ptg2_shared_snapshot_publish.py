@@ -1396,7 +1396,8 @@ async def _finalizer_block_stage_guard(
 
     if db.engine is None:
         await db.connect()
-    assert db.engine is not None
+    if db.engine is None:
+        raise RuntimeError("packed finalizer stage guard requires a database engine")
     lock_engine = create_async_engine(db.engine.url, poolclass=NullPool)
     lock_name = (
         f"ptg2-v4-finalizer-stage:{schema_name}:{int(snapshot_key)}:{build_token}"
