@@ -134,6 +134,8 @@ from process.mrf_source_discovery import main as initiate_mrf_source_discovery
 from process.mrf_source_discovery import process_data as process_mrf_source_discovery_data
 from process.mrf_source_discovery import shutdown as mrf_source_discovery_shutdown
 from process.mrf_source_discovery import startup as mrf_source_discovery_startup
+from process.hospital_prices import main as initiate_hospital_prices
+from process.hospital_prices import process_data as process_hospital_prices_data
 from process.cms_doctors import main as initiate_cms_doctors
 from process.cms_doctors import process_data as process_cms_doctors_data
 from process.cms_doctors import shutdown as cms_doctors_shutdown
@@ -943,6 +945,20 @@ class MRFSourceDiscovery:
     queue_read_limit = 2
     queue_name = "arq:MRFSourceDiscovery"
     job_timeout = 86400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class HospitalPrices:
+    functions = [process_hospital_prices_data, control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 2
+    queue_name = "arq:HospitalPrices"
+    job_timeout = max(
+        _worker_int_env("HLTHPRT_HOSPITAL_PRICE_JOB_TIMEOUT", 604800), 1
+    )
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
     job_deserializer = deserialize_job
@@ -1839,6 +1855,28 @@ def mrf_source_discovery_command(**options):
     _run(initiate_mrf_source_discovery(**options))
 
 
+@click.command(help="Refresh selected hospital price files or the complete registry")
+@click.option(
+    "--hospital-id",
+    "hospital_ids",
+    multiple=True,
+    help="Stable hospital identifier to refresh; repeat for a selected batch.",
+)
+@click.option(
+    "--all-hospitals", is_flag=True,
+    help="Refresh every hospital in the checked-in registry.",
+)
+def hospital_prices(hospital_ids: tuple[str, ...], all_hospitals: bool):
+    """Run a direct hospital-price refresh."""
+
+    _run(
+        initiate_hospital_prices(
+            hospital_ids=hospital_ids or None,
+            all_hospitals=all_hospitals,
+        )
+    )
+
+
 @click.command(help="Finish CMS Part D formulary + pharmacy network import for a queued run id")
 @click.option("--import-id", required=True, help="Import id/date suffix used for the run.")
 @click.option("--run-id", required=True, help="Run id emitted by `start partd-formulary-network`.")
@@ -1906,6 +1944,7 @@ process_group.add_command(provider_enrichment, name="provider-enrichment")
 process_group.add_command(lodes, name="lodes")
 process_group.add_command(medicare_enrollment, name="medicare-enrollment")
 process_group.add_command(mrf_source_discovery_command, name="mrf-source-discovery")
+process_group.add_command(hospital_prices, name="hospital-prices")
 process_group.add_command(cms_doctors, name="cms-doctors")
 process_group.add_command(facility_anchors, name="facility-anchors")
 process_group.add_command(pharmacy_economics, name="pharmacy-economics")

@@ -748,6 +748,7 @@ def _terminal_metrics_from_context(context: Any) -> dict[str, Any] | None:
         "published_elapsed_seconds",
         "publish_validation",
         "phase_timings",
+        "hospital_price_metrics",
         "audit", "skipped_stage_indexes",
     )
     metrics_by_name = {key: context[key] for key in keys if key in context}

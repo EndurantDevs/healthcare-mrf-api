@@ -2,7 +2,7 @@
 """Add transitional geo-assurance projection columns.
 
 Revision ID: 20260825090000_geo_assurance_projection
-Revises: 20260820200000_provider_directory_projection_finalizer
+Revises: 20260825120000_hospital_price_storage
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from alembic import op
 
 
 revision = "20260825090000_geo_assurance_projection"
-down_revision = "20260820200000_provider_directory_projection_finalizer"
+down_revision = "20260825120000_hospital_price_storage"
 branch_labels = None
 depends_on = None
 

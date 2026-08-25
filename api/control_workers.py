@@ -70,6 +70,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:GeoCensus", "process.GeoCensus", ("geo-census",)),
     WorkerSpec("arq:Attributes", "process.Attributes", ("plan-attributes",)),
     WorkerSpec("arq:MRFSourceDiscovery", "process.MRFSourceDiscovery", ("mrf-source-discovery",)),
+    WorkerSpec("arq:HospitalPrices", "process.HospitalPrices", ("hospital-prices",)),
     WorkerSpec("arq:ClaimsPricing", "process.ClaimsPricing", ("claims-pricing", "claims-procedures")),
     WorkerSpec("arq:DrugClaims", "process.DrugClaims", ("drug-claims",)),
     WorkerSpec("arq:ProviderQuality", "process.ProviderQuality", ("provider-quality",)),

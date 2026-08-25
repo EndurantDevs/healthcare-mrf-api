@@ -282,7 +282,7 @@ pub fn normalize_money_text(text: String) -> Option<String> {
     }
 }
 
-fn canonical_decimal_text(source_text: &str) -> Option<String> {
+pub fn canonical_decimal_text(source_text: &str) -> Option<String> {
     let (is_negative, unsigned_text) = match source_text.as_bytes().first() {
         Some(b'-') => (true, &source_text[1..]),
         Some(b'+') => (false, &source_text[1..]),
@@ -750,10 +750,30 @@ mod tests {
                 Some(expected.to_string())
             );
         }
-        for raw in [r#""12.34""#, "true", "{}", "[]", "null", "1e999999999"] {
+        for raw in [
+            r#""12.34""#,
+            "true",
+            "{}",
+            "[]",
+            "null",
+            "1e131072",
+            "1e999999999",
+        ] {
             let mut reader = JsonStreamReader::new(raw.as_bytes());
             assert!(strict_money_number_from_reader(&mut reader).is_err());
         }
+        let oversized_number = "1".repeat(131_073);
+        let mut reader = JsonStreamReader::new_custom(
+            oversized_number.as_bytes(),
+            struson::reader::ReaderSettings {
+                restrict_number_values: false,
+                ..Default::default()
+            },
+        );
+        assert!(strict_money_number_from_reader(&mut reader)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be represented"));
     }
 
     #[test]

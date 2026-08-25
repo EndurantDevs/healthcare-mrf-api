@@ -8,17 +8,17 @@
     "collection_name_mismatch": 0,
     "comment_noise": 0,
     "confusable_function_names": 0,
-    "deep_nesting": 31,
+    "deep_nesting": 30,
     "function_name_shape": 0,
     "global_state_usage": 0,
     "inline_suppressions": 2,
-    "long_files": 156,
-    "long_functions": 267,
+    "long_files": 154,
+    "long_functions": 264,
     "missing_contract_docstrings": 0,
     "pass_placeholders": 0,
     "single_letter_names": 0,
     "syntax_errors": 0,
-    "too_many_locals": 103,
+    "too_many_locals": 101,
     "too_many_parameters": 44
   },
   "issue_ids": {
@@ -65,8 +65,7 @@
       "deep_nesting:process/ptg_parts/rust_scanner.py:_iter_compact_serving_records_rust",
       "deep_nesting:process/ptg_parts/source_download.py:_download_raw_artifact_locked",
       "deep_nesting:process/ptg_parts/source_jobs.py:_load_toc_urls_from_file",
-      "deep_nesting:scripts/validation/ptg2_v3_source_api_audit.py:SourceIndex._is_rate_event_consumed",
-      "deep_nesting:tests/test_ptg2_v4_snapshot_maps.py:test_real_postgres_v4_root_pack_overlap_and_publication"
+      "deep_nesting:scripts/validation/ptg2_v3_source_api_audit.py:SourceIndex._is_rate_event_consumed"
     ],
     "function_name_shape": [],
     "global_state_usage": [],
@@ -180,11 +179,9 @@
       "long_file:support/ptg2_scanner/src/address_canon.rs",
       "long_file:support/ptg2_scanner/src/bin/raw_claim_check.rs",
       "long_file:support/ptg2_scanner/src/dedupe.rs",
-      "long_file:support/ptg2_scanner/src/input.rs",
       "long_file:support/ptg2_scanner/src/input/rapidgzip.rs",
       "long_file:support/ptg2_scanner/src/main.rs",
       "long_file:support/ptg2_scanner/src/normalize.rs",
-      "long_file:support/ptg2_scanner/src/progress.rs",
       "long_file:support/ptg2_scanner/src/provider_graph_v4.rs",
       "long_file:support/ptg2_scanner/src/rate_schedule_observe.rs",
       "long_file:support/ptg2_scanner/src/shared_graph.rs",
@@ -496,10 +493,7 @@
       "long_function:scripts/validation/ptg2_v3_capacity_gate.py:_validate_storage",
       "long_function:scripts/validation/ptg2_v3_capacity_gate.py:evaluate_evidence",
       "long_function:scripts/validation/ptg2_v3_capacity_gate.py:example_measurement",
-      "long_function:scripts/validation/ptg2_v3_source_api_audit.py:AuditRunner._build_latency_reports",
-      "long_function:tests/test_mrf_source_discovery.py:test_master_list_keeps_high_value_public_aliases",
-      "long_function:tests/test_ptg2_shared_snapshot_publish_postgres.py:test_real_postgres_strict_shared_v3_publish_and_cache_free_reads",
-      "long_function:tests/test_ptg2_v4_snapshot_maps.py:test_real_postgres_v4_root_pack_overlap_and_publication"
+      "long_function:scripts/validation/ptg2_v3_source_api_audit.py:AuditRunner._build_latency_reports"
     ],
     "missing_contract_docstrings": [],
     "pass_placeholders": [],
@@ -606,9 +600,7 @@
       "too_many_locals:process/ptg_parts/rust_scanner.py:_shared_graph_result_from_summary",
       "too_many_locals:process/ptg_parts/source_download.py:_download_raw_artifact_locked",
       "too_many_locals:scripts/research/provider_directory_coverage_audit.py:render_markdown",
-      "too_many_locals:scripts/validation/ptg2_v3_capacity_gate.py:evaluate_evidence",
-      "too_many_locals:tests/test_ptg2_shared_snapshot_publish_postgres.py:test_real_postgres_strict_shared_v3_publish_and_cache_free_reads",
-      "too_many_locals:tests/test_ptg2_v4_snapshot_maps.py:test_real_postgres_v4_root_pack_overlap_and_publication"
+      "too_many_locals:scripts/validation/ptg2_v3_capacity_gate.py:evaluate_evidence"
     ],
     "too_many_parameters": [
       "too_many_parameters:api/endpoint/npi.py:_npi_detail_cache_key",

@@ -575,10 +575,12 @@ run_core_postgres() {
   HLTHPRT_PRESCRIPTION_AUTOCOMPLETE_POSTGRES_DSN=$dsn \
   HLTHPRT_TERMINOLOGY_PUBLICATION_POSTGRES_DSN=$dsn \
   HLTHPRT_SITE_INTELLIGENCE_POSTGRES_DSN=$dsn \
+  HLTHPRT_HOSPITAL_PRICE_MIGRATION_POSTGRES_DSN=$dsn \
     timeout --foreground 295s python -m pytest -q \
     tests/test_prescription_autocomplete_postgres.py \
     tests/test_terminology_synonym_publication_postgres.py \
     tests/test_site_intelligence_fast_paths_postgres.py \
+    tests/test_hospital_price_storage.py \
     tests/test_provider_directory_migration_adoption_postgres.py \
     tests/test_provider_directory_observed_npi_index_migration.py \
     tests/test_provider_directory_caresource_census_db.py \

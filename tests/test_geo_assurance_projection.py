@@ -120,9 +120,7 @@ def test_migration_adds_nullable_metadata_and_generation_state(monkeypatch):
 
     migration.upgrade()
 
-    assert migration.down_revision == (
-        "20260820200000_provider_directory_projection_finalizer"
-    )
+    assert migration.down_revision == "20260825120000_hospital_price_storage"
     assert len(statements) == 4
     assert '"fixture"."entity_address_unified"' in statements[0]
     assert '"fixture"."entity_address_unified_old"' in statements[1]
