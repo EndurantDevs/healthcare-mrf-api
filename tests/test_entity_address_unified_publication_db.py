@@ -12,6 +12,9 @@ import uuid
 import pytest
 
 from db.connection import Database
+from tests.ptg2_serving_address_evidence_postgres_support import (
+    _create_geo_assurance_state_table,
+)
 
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
@@ -72,6 +75,7 @@ async def _temporary_schema():
         ) VALUES (true, 2, 1, 0);
         """
     )
+    await _create_geo_assurance_state_table(database, schema)
     try:
         yield database, schema
     finally:
@@ -94,6 +98,13 @@ async def _prepare_live_and_stage(database: Database, schema: str) -> None:
     await database.status(
         f"INSERT INTO {schema}.entity_address_unified_stage (marker) VALUES ('new');"
     )
+    assert await database.scalar(
+        entity_address_unified._record_geo_assurance_candidate_sql(
+            schema,
+            "entity_address_unified_stage",
+            1,
+        )
+    ) is not None
 
 
 async def _relation_persistence(database: Database, schema: str, table_name: str) -> str | None:
@@ -264,6 +275,50 @@ async def test_real_postgres_cutover_promotes_logged_relation(monkeypatch):
             """,
             schema=schema,
         ) is True
+        assert await database.scalar(
+            f"SELECT candidate_table_oid IS NULL "
+            f"FROM {schema}.entity_address_geo_assurance_state"
+        ) is True
+        assert cutover_context_map["geo_assurance_active_table_oid"] == await database.scalar(
+            f"SELECT '{schema}.entity_address_unified'::regclass::oid::bigint"
+        )
+
+
+@pytest.mark.asyncio
+async def test_stale_geo_receipt_rolls_back_cutover_and_activation(monkeypatch):
+    async with _temporary_schema() as (database, schema):
+        monkeypatch.setattr(entity_address_unified, "db", database)
+        await _prepare_live_and_stage(database, schema)
+        await database.status(f"CREATE TABLE {schema}.npi_address (npi bigint)")
+
+        with pytest.raises(
+            RuntimeError,
+            match="candidate does not match the published table and sources",
+        ):
+            await entity_address_unified._publish_staged_entity_address_tables(
+                schema,
+                _StageTable,
+                {},
+                partial_support_patch=False,
+                affected_group_table="",
+                context={},
+            )
+
+        assert await database.scalar(
+            f"SELECT marker FROM {schema}.entity_address_unified"
+        ) == "old"
+        assert await database.scalar(
+            f"SELECT marker FROM {schema}.entity_address_unified_stage"
+        ) == "new"
+        assert await database.scalar(
+            f"SELECT to_regclass('{schema}.entity_address_unified_old') IS NULL"
+        ) is True
+        state = await database.first(
+            f"SELECT active_table_oid, candidate_table_oid "
+            f"FROM {schema}.entity_address_geo_assurance_state"
+        )
+        assert state.active_table_oid is None
+        assert state.candidate_table_oid is not None
 
 
 @pytest.mark.asyncio

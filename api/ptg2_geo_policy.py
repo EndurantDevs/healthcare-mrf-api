@@ -9,6 +9,7 @@ from typing import Any, Mapping
 from sqlalchemy import text
 
 from api.ptg2_address_policy import postal_box_address_sql
+from api.ptg2_geo_projection import projected_boolean_sql
 
 
 _PROVIDER_ADDRESS_GEO_CAPABILITY_SQL = """
@@ -122,7 +123,12 @@ def _display_zip5_sql(alias: str) -> str:
     )
 
 
-def _canonical_zip_state_sql(alias: str, schema_name: str) -> str:
+def _canonical_zip_state_sql(
+    alias: str,
+    schema_name: str,
+    *,
+    reference_aliases: tuple[str, str] | None = None,
+) -> str:
     alias = _validated_sql_identifier(alias, field_name="address alias")
     schema_name = _validated_sql_identifier(
         schema_name,
@@ -131,6 +137,15 @@ def _canonical_zip_state_sql(alias: str, schema_name: str) -> str:
     displayed_state = f"UPPER(BTRIM(COALESCE({alias}.state_name, '')))"
     canonical_state = f"UPPER(BTRIM(COALESCE({alias}.state_code, '')))"
     canonical_zip = f"BTRIM(COALESCE({alias}.zip5, ''))"
+    if reference_aliases is not None:
+        geo_zip_alias, zip_state_alias = (
+            _validated_sql_identifier(reference_alias, field_name="reference alias")
+            for reference_alias in reference_aliases
+        )
+        return (
+            f"({geo_zip_alias}.zip_code IS NOT NULL "
+            f"OR {zip_state_alias}.zip IS NOT NULL)"
+        )
     return f"""(
         EXISTS (
             SELECT 1
@@ -152,16 +167,47 @@ def _canonical_zip_state_sql(alias: str, schema_name: str) -> str:
     )"""
 
 
+def provider_address_identity_reference_joins_sql(
+    alias: str,
+    *,
+    schema_name: str,
+    geo_zip_alias: str,
+    zip_state_alias: str,
+) -> str:
+    """Join the same canonical postal references used by legacy assurance."""
+
+    alias = _validated_sql_identifier(alias, field_name="address alias")
+    schema_name = _validated_sql_identifier(schema_name, field_name="address schema")
+    geo_zip_alias = _validated_sql_identifier(geo_zip_alias, field_name="reference alias")
+    zip_state_alias = _validated_sql_identifier(zip_state_alias, field_name="reference alias")
+    displayed_state = f"UPPER(BTRIM(COALESCE({alias}.state_name, '')))"
+    canonical_state = f"UPPER(BTRIM(COALESCE({alias}.state_code, '')))"
+    canonical_zip = f"BTRIM(COALESCE({alias}.zip5, ''))"
+    return f"""LEFT JOIN {schema_name}.geo_zip_lookup AS {geo_zip_alias}
+      ON {geo_zip_alias}.zip_code = {canonical_zip}
+     AND UPPER(BTRIM(COALESCE({geo_zip_alias}.state, ''))) = {canonical_state}
+     AND {displayed_state} IN (
+          UPPER(BTRIM(COALESCE({geo_zip_alias}.state, ''))),
+          UPPER(BTRIM(COALESCE({geo_zip_alias}.state_name, '')))
+     )
+    LEFT JOIN tiger.zip_state AS {zip_state_alias}
+      ON {zip_state_alias}.zip = {canonical_zip}
+     AND UPPER(BTRIM(COALESCE({zip_state_alias}.stusps, ''))) = {canonical_state}
+     AND {displayed_state} = UPPER(BTRIM(COALESCE({zip_state_alias}.stusps, '')))"""
+
+
 def provider_address_identity_coherence_sql(
     alias: str,
     *,
     schema_name: str,
+    use_projection: bool = True,
+    reference_aliases: tuple[str, str] | None = None,
 ) -> str:
     """Require displayed and canonical US postal identity to agree."""
 
     alias = _validated_sql_identifier(alias, field_name="address alias")
     normalized_country = f"UPPER(BTRIM(COALESCE({alias}.country_code, '')))"
-    return f"""(
+    legacy_sql = f"""(
         {alias}.address_key IS NOT NULL
         AND NOT {postal_box_address_sql(alias)}
         AND NULLIF(BTRIM(COALESCE({alias}.zip5, '')), '') IS NOT NULL
@@ -170,20 +216,47 @@ def provider_address_identity_coherence_sql(
         AND {normalized_country} IN (
             'US', 'USA', 'UNITED STATES', 'UNITED STATES OF AMERICA', '840'
         )
-        AND {_canonical_zip_state_sql(alias, schema_name)}
+        AND {_canonical_zip_state_sql(
+            alias,
+            schema_name,
+            reference_aliases=reference_aliases,
+        )}
     )"""
+    if not use_projection:
+        return legacy_sql
+    return projected_boolean_sql(
+        alias,
+        "geo_identity_coherent",
+        schema_name=schema_name,
+        legacy_sql=legacy_sql,
+    )
 
 
-def provider_address_point_coherence_sql(alias: str) -> str:
+def provider_address_point_coherence_sql(
+    alias: str,
+    *,
+    schema_name: str | None = None,
+    use_projection: bool = True,
+    zcta_alias: str | None = None,
+) -> str:
     """Require one usable point to fall inside its address ZIP polygon."""
 
     alias = _validated_sql_identifier(alias, field_name="address alias")
-    return f"""(
-        {alias}.lat IS NOT NULL
-        AND {alias}.long IS NOT NULL
-        AND {alias}.lat::double precision BETWEEN -90.0 AND 90.0
-        AND {alias}.long::double precision BETWEEN -180.0 AND 180.0
-        AND EXISTS (
+    zcta_alias = (
+        _validated_sql_identifier(zcta_alias, field_name="reference alias")
+        if zcta_alias
+        else None
+    )
+    point_covered_sql = f"""ST_Covers(
+                    {zcta_alias}.the_geom,
+                    ST_SetSRID(
+                        ST_MakePoint(
+                            {alias}.long::double precision,
+                            {alias}.lat::double precision
+                        ),
+                        4269
+                    )
+               )""" if zcta_alias else f"""EXISTS (
             SELECT 1
               FROM tiger.zcta5 AS address_zcta
              WHERE address_zcta.zcta5ce = BTRIM({alias}.zip5)
@@ -197,8 +270,39 @@ def provider_address_point_coherence_sql(alias: str) -> str:
                         4269
                     )
                )
-        )
+        )"""
+    legacy_sql = f"""(
+        {alias}.lat IS NOT NULL
+        AND {alias}.long IS NOT NULL
+        AND {alias}.lat::double precision BETWEEN -90.0 AND 90.0
+        AND {alias}.long::double precision BETWEEN -180.0 AND 180.0
+        AND {point_covered_sql}
     )"""
+    if not use_projection:
+        return legacy_sql
+    if schema_name is None:
+        raise ValueError("schema_name is required when using geo projection")
+    return projected_boolean_sql(
+        alias,
+        "geo_point_coherent",
+        schema_name=schema_name,
+        legacy_sql=legacy_sql,
+    )
+
+
+def provider_address_point_reference_join_sql(
+    alias: str,
+    *,
+    zcta_alias: str,
+) -> str:
+    """Join the ZIP polygon used by the legacy point-coherence predicate."""
+
+    alias = _validated_sql_identifier(alias, field_name="address alias")
+    zcta_alias = _validated_sql_identifier(zcta_alias, field_name="reference alias")
+    return (
+        f"JOIN tiger.zcta5 AS {zcta_alias} "
+        f"ON {zcta_alias}.zcta5ce = BTRIM({alias}.zip5)"
+    )
 
 
 def provider_address_location_filter_sql(
@@ -216,7 +320,10 @@ def provider_address_location_filter_sql(
         alias,
         schema_name=schema_name,
     )
-    point_sql = provider_address_point_coherence_sql(alias)
+    point_sql = provider_address_point_coherence_sql(
+        alias,
+        schema_name=schema_name,
+    )
     missing_point_sql = f"({alias}.lat IS NULL AND {alias}.long IS NULL)"
     radius_sql = " AND ".join(radius_predicates)
     radius_branch = f"({point_sql} AND ({radius_sql}))" if radius_sql else None
@@ -286,6 +393,8 @@ async def is_provider_address_geo_capability_available(
 __all__ = [
     "is_provider_address_geo_capability_available",
     "provider_address_identity_coherence_sql",
+    "provider_address_identity_reference_joins_sql",
     "provider_address_location_filter_sql",
     "provider_address_point_coherence_sql",
+    "provider_address_point_reference_join_sql",
 ]

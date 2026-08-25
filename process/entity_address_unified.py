@@ -17,6 +17,13 @@ from arq import create_pool
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateColumn
 
+from api import ptg2_geo_projection as geo_projection
+from api.ptg2_geo_policy import (
+    provider_address_identity_coherence_sql,
+    provider_address_identity_reference_joins_sql,
+    provider_address_point_coherence_sql,
+    provider_address_point_reference_join_sql,
+)
 from db.models import (
     EntityAddressEvidence,
     EntityAddressMedicationBridge,
@@ -1164,71 +1171,73 @@ def _compacted_source_record_ids_expr(source_record_ids: str = "source_record_id
     )
 
 
-async def _compact_hot_row_source_record_ids(
+async def _replace_source_record_ids_metadata_column(
     db_schema: str,
     stage_table: str,
-    *,
-    context: dict | None = None,
+    phase_context: dict,
+) -> None:
+    """Replace the hot identifier column without rewriting the stage table."""
+
+    compact_column = "source_record_ids_compact"
+    phase = "entity-address-unified compacting hot rows metadata"
+    statements = (
+        f"""
+        ALTER TABLE {db_schema}.{stage_table}
+            DROP COLUMN IF EXISTS {compact_column};
+        """,
+        f"""
+        ALTER TABLE {db_schema}.{stage_table}
+            ADD COLUMN {compact_column} varchar[] NOT NULL DEFAULT '{{}}'::varchar[];
+        """,
+        f"""
+        UPDATE {db_schema}.{stage_table}
+           SET {compact_column} = {_compacted_source_record_ids_expr()}
+         WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[];
+        """,
+        f"ALTER TABLE {db_schema}.{stage_table} DROP COLUMN source_record_ids;",
+        f"""
+        ALTER TABLE {db_schema}.{stage_table}
+            RENAME COLUMN {compact_column} TO source_record_ids;
+        """,
+    )
+    for statement in statements:
+        await _run_sql_phase(statement, context=phase_context, phase=phase)
+
+
+async def _compact_record_ids_by_metadata_reset(
+    db_schema: str,
+    stage_table: str,
+    phase_context: dict,
 ) -> int:
-    """Compact source-record identifiers while preserving stage row identity."""
-    phase_context = context if context is not None else {}
-    if not _is_env_enabled(
-        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE",
-        DEFAULT_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE,
-    ):
-        row_estimate = int(
-            await db.scalar(
-                f"""
-                SELECT GREATEST(COALESCE(c.reltuples, 0), 0)::bigint
-                  FROM pg_class c
-                  JOIN pg_namespace n
-                    ON n.oid = c.relnamespace
-                 WHERE n.nspname = {_sql_literal(db_schema)}
-                   AND c.relname = {_sql_literal(stage_table)};
-                """
-            )
-            or 0
-        )
-        compact_column = "source_record_ids_compact"
-        await _run_sql_phase(
+    """Compact identifiers in place and return the stage row estimate."""
+
+    row_estimate = int(
+        await db.scalar(
             f"""
-            ALTER TABLE {db_schema}.{stage_table}
-                DROP COLUMN IF EXISTS {compact_column};
-            """,
-            context=phase_context,
-            phase="entity-address-unified compacting hot rows metadata",
+            SELECT GREATEST(COALESCE(c.reltuples, 0), 0)::bigint
+              FROM pg_class c
+              JOIN pg_namespace n
+                ON n.oid = c.relnamespace
+             WHERE n.nspname = {_sql_literal(db_schema)}
+               AND c.relname = {_sql_literal(stage_table)};
+            """
         )
-        await _run_sql_phase(
-            f"""
-            ALTER TABLE {db_schema}.{stage_table}
-                ADD COLUMN {compact_column} varchar[] NOT NULL DEFAULT '{{}}'::varchar[];
-            """,
-            context=phase_context,
-            phase="entity-address-unified compacting hot rows metadata",
-        )
-        await _run_sql_phase(
-            f"""
-            UPDATE {db_schema}.{stage_table}
-               SET {compact_column} = {_compacted_source_record_ids_expr()}
-             WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[];
-            """,
-            context=phase_context,
-            phase="entity-address-unified compacting hot rows metadata",
-        )
-        await _run_sql_phase(
-            f"ALTER TABLE {db_schema}.{stage_table} DROP COLUMN source_record_ids;",
-            context=phase_context,
-            phase="entity-address-unified compacting hot rows metadata",
-        )
-        await _run_sql_phase(
-            f"""
-            ALTER TABLE {db_schema}.{stage_table}
-                RENAME COLUMN {compact_column} TO source_record_ids;
-            """,
-            context=phase_context,
-            phase="entity-address-unified compacting hot rows metadata",
-        )
-        return row_estimate
+        or 0
+    )
+    await _replace_source_record_ids_metadata_column(
+        db_schema,
+        stage_table,
+        phase_context,
+    )
+    return row_estimate
+
+
+async def _rewrite_compacted_source_record_ids_stage(
+    db_schema: str,
+    stage_table: str,
+    phase_context: dict,
+) -> int:
+    """Rewrite the stage with compact identifiers and swap it into place."""
 
     compact_table = _compact_stage_table_name(stage_table)
     columns = _entity_address_unified_columns()
@@ -1270,19 +1279,38 @@ async def _compact_hot_row_source_record_ids(
     return int(rowcount or 0)
 
 
-async def _create_stage_indexes(
-    stage_cls,
+async def _compact_hot_row_source_record_ids(
     db_schema: str,
+    stage_table: str,
     *,
     context: dict | None = None,
-) -> None:
-    """Build configured indexes for one staged entity-address table."""
+) -> int:
+    """Compact source-record identifiers while preserving stage row identity."""
+
     phase_context = context if context is not None else {}
-    if getattr(stage_cls, "__main_table__", "") == EntityAddressUnified.__main_table__:
-        phase_context["stage_index_profile"] = _stage_index_profile()
-    indexes = list(getattr(stage_cls, "__my_additional_indexes__", []) or [])
-    if not indexes:
-        return
+    if _is_env_enabled(
+        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE",
+        DEFAULT_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE,
+    ):
+        return await _rewrite_compacted_source_record_ids_stage(
+            db_schema,
+            stage_table,
+            phase_context,
+        )
+    return await _compact_record_ids_by_metadata_reset(
+        db_schema,
+        stage_table,
+        phase_context,
+    )
+
+
+def _stage_index_statements(
+    stage_cls,
+    db_schema: str,
+    indexes: list[dict],
+    phase_context: dict,
+) -> list[tuple[str, str]]:
+    """Build enabled stage-index statements and record skipped indexes."""
 
     statements: list[tuple[str, str]] = []
     for index in indexes:
@@ -1305,6 +1333,107 @@ async def _create_stage_indexes(
             f"({', '.join(index.get('index_elements'))}){include}{where};"
         )
         statements.append((index_name, stmt))
+    return statements
+
+
+async def _build_stage_index(
+    index_name: str,
+    statement: str,
+    phase_context: dict,
+) -> None:
+    """Build one stage index while retaining timing and PostGIS fallback."""
+
+    started_at = time.time()
+    try:
+        await _run_sql_phase(
+            statement,
+            context=phase_context,
+            phase="entity-address-unified indexing stage",
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        if "st_makepoint" in message or "geography" in message or "postgis" in message:
+            logger.warning(
+                "Skipping geo index %s because PostGIS is unavailable in current DB: %s",
+                index_name,
+                exc,
+            )
+            return
+        raise
+    finally:
+        finished_at = time.time()
+        timings = phase_context.setdefault("stage_index_timings", [])
+        timings.append(
+            {
+                "index": index_name,
+                "seconds": round(finished_at - started_at, 3),
+                "started_at": round(started_at, 6),
+                "finished_at": round(finished_at, 6),
+            }
+        )
+
+
+async def _build_guarded_stage_index(
+    index_name: str,
+    statement: str,
+    phase_context: dict,
+    semaphore: asyncio.Semaphore,
+) -> None:
+    """Build one stage index inside the configured concurrency bound."""
+
+    async with semaphore:
+        await _build_stage_index(index_name, statement, phase_context)
+
+
+async def _run_stage_index_statements(
+    statements: list[tuple[str, str]],
+    phase_context: dict,
+    index_concurrency: int,
+) -> None:
+    """Run stage-index statements with the original ordering and failures."""
+
+    if index_concurrency <= 1 or len(statements) == 1:
+        for index_name, statement in statements:
+            await _build_stage_index(index_name, statement, phase_context)
+        return
+    semaphore = asyncio.Semaphore(index_concurrency)
+    index_results = await asyncio.gather(
+        *(
+            _build_guarded_stage_index(
+                index_name,
+                statement,
+                phase_context,
+                semaphore,
+            )
+            for index_name, statement in statements
+        ),
+        return_exceptions=True,
+    )
+    for index_result in index_results:
+        if isinstance(index_result, BaseException):
+            raise index_result
+
+
+async def _create_stage_indexes(
+    stage_cls,
+    db_schema: str,
+    *,
+    context: dict | None = None,
+) -> None:
+    """Build configured indexes for one staged entity-address table."""
+
+    phase_context = context if context is not None else {}
+    if getattr(stage_cls, "__main_table__", "") == EntityAddressUnified.__main_table__:
+        phase_context["stage_index_profile"] = _stage_index_profile()
+    indexes = list(getattr(stage_cls, "__my_additional_indexes__", []) or [])
+    if not indexes:
+        return
+    statements = _stage_index_statements(
+        stage_cls,
+        db_schema,
+        indexes,
+        phase_context,
+    )
 
     if not statements:
         return
@@ -1318,55 +1447,11 @@ async def _create_stage_indexes(
         len(statements),
     )
     phase_context["stage_index_concurrency"] = index_concurrency
-
-    async def _build_index(index_name: str, stmt: str) -> None:
-        started_at = time.time()
-        try:
-            await _run_sql_phase(
-                stmt,
-                context=phase_context,
-                phase="entity-address-unified indexing stage",
-            )
-        except Exception as exc:
-            msg = str(exc).lower()
-            if "st_makepoint" in msg or "geography" in msg or "postgis" in msg:
-                logger.warning(
-                    "Skipping geo index %s because PostGIS is unavailable in current DB: %s",
-                    index_name,
-                    exc,
-                )
-                return
-            raise
-        finally:
-            finished_at = time.time()
-            timings = phase_context.setdefault("stage_index_timings", [])
-            timings.append(
-                {
-                    "index": index_name,
-                    "seconds": round(finished_at - started_at, 3),
-                    "started_at": round(started_at, 6),
-                    "finished_at": round(finished_at, 6),
-                }
-            )
-
-    if index_concurrency <= 1 or len(statements) == 1:
-        for index_name, stmt in statements:
-            await _build_index(index_name, stmt)
-        return
-
-    semaphore = asyncio.Semaphore(index_concurrency)
-
-    async def _guarded(index_name: str, stmt: str) -> None:
-        async with semaphore:
-            await _build_index(index_name, stmt)
-
-    index_results = await asyncio.gather(
-        *(_guarded(index_name, stmt) for index_name, stmt in statements),
-        return_exceptions=True,
+    await _run_stage_index_statements(
+        statements,
+        phase_context,
+        index_concurrency,
     )
-    for index_result in index_results:
-        if isinstance(index_result, BaseException):
-            raise index_result
 
 
 async def _create_post_publish_indexes(
@@ -2070,6 +2155,14 @@ async def _run_entity_address_cutover(
                 time.monotonic() - started,
                 _coerce_rowcount(rowcount),
             )
+        active_table_oid = await db.scalar(
+            _activate_geo_assurance_candidate_sql(db_schema)
+        )
+        if active_table_oid is None:
+            raise RuntimeError(
+                "geo assurance candidate does not match the published table and sources"
+            )
+        context["geo_assurance_active_table_oid"] = int(active_table_oid)
 
 
 def _entity_address_cutover_plan(
@@ -5173,54 +5266,51 @@ async def _validate_raw_alias_integrity(
         )
 
 
-def _enrich_raw_stage_sql(
+def _available_archive_fields_sql() -> str:
+    """Return archive columns selected by raw-stage enrichment."""
+
+    return (
+        "a.address_key AS archive_address_key, "
+        "a.premise_key, "
+        "'v' || COALESCE(a.identity_version, 2)::text AS archive_identity_version, "
+        "COALESCE(a.precision, 'unknown') AS address_precision, "
+        "a.zip5 AS archive_zip5, "
+        "NULLIF(upper(left(a.state_code, 2)), '') AS archive_state_code, "
+        "a.city_norm AS archive_city_norm, "
+        "NULL::varchar AS archive_county_fips, "
+        "a.lat::numeric AS archive_lat, "
+        "a.long::numeric AS archive_long, "
+        "a.place_id::varchar AS archive_place_id"
+    )
+
+
+def _available_archive_enrichment_sql(
     db_schema: str,
-    raw_table: str,
-    *,
-    archive_available: bool = True,
     is_address_canon_available: bool = True,
-    checksum_min: int | None = None,
-    checksum_max: int | None = None,
-    evidence_shards: int | None = None,
-) -> str:
-    """Build SQL that enriches raw addresses with canonical archive evidence."""
-    archive_join = ""
-    archive_fields = ""
-    if archive_available:
-        computed_address_key = _address_key_expr(
-            db_schema,
-            is_address_canon_available,
-            address_source="r.address_source",
-            table_alias="r",
-        )
-        should_trust_source_key = _is_env_enabled(
-            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_TRUST_SOURCE_ADDRESS_KEY",
-            DEFAULT_TRUST_SOURCE_ADDRESS_KEY,
-        )
-        source_identity_key = (
-            f"{db_schema}.addr_identity_key_v1("
-            "r.first_line, r.second_line, r.city_name, r.state_name, "
-            "r.postal_code, r.country_code)"
-        )
-        candidate_values = (
-            f"(r.address_key, 0), ({computed_address_key}, 1)"
-            if should_trust_source_key
-            else f"({computed_address_key}, 0), (r.address_key, 1)"
-        )
-        archive_fields = (
-            "a.address_key AS archive_address_key, "
-            "a.premise_key, "
-            "'v' || COALESCE(a.identity_version, 2)::text AS archive_identity_version, "
-            "COALESCE(a.precision, 'unknown') AS address_precision, "
-            "a.zip5 AS archive_zip5, "
-            "NULLIF(upper(left(a.state_code, 2)), '') AS archive_state_code, "
-            "a.city_norm AS archive_city_norm, "
-            "NULL::varchar AS archive_county_fips, "
-            "a.lat::numeric AS archive_lat, "
-            "a.long::numeric AS archive_long, "
-            "a.place_id::varchar AS archive_place_id"
-        )
-        archive_join = f"""
+) -> tuple[str, str]:
+    """Return archive fields and the exact alias-aware lookup join."""
+
+    computed_address_key = _address_key_expr(
+        db_schema,
+        is_address_canon_available,
+        address_source="r.address_source",
+        table_alias="r",
+    )
+    should_trust_source_key = _is_env_enabled(
+        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_TRUST_SOURCE_ADDRESS_KEY",
+        DEFAULT_TRUST_SOURCE_ADDRESS_KEY,
+    )
+    source_identity_key = (
+        f"{db_schema}.addr_identity_key_v1("
+        "r.first_line, r.second_line, r.city_name, r.state_name, "
+        "r.postal_code, r.country_code)"
+    )
+    candidate_values = (
+        f"(r.address_key, 0), ({computed_address_key}, 1)"
+        if should_trust_source_key
+        else f"({computed_address_key}, 0), (r.address_key, 1)"
+    )
+    archive_join = f"""
           LEFT JOIN LATERAL (
               SELECT archive_row.*
                 FROM (VALUES {candidate_values}) AS candidate(address_key, priority)
@@ -5244,29 +5334,36 @@ def _enrich_raw_stage_sql(
             ORDER BY candidate.priority
                LIMIT 1
           ) a ON TRUE"""
-    else:
-        archive_fields = (
-            "NULL::uuid AS archive_address_key, "
-            "NULL::uuid AS premise_key, "
-            f"'{ARCHIVE_IDENTITY_VERSION}'::varchar AS archive_identity_version, "
-            "CASE WHEN r.address_key IS NULL THEN 'unknown' ELSE 'street' END::varchar AS address_precision, "
-            "NULL::varchar AS archive_zip5, "
-            "NULL::varchar AS archive_state_code, "
-            "NULL::varchar AS archive_city_norm, "
-            "NULL::varchar AS archive_county_fips, "
-            "NULL::numeric AS archive_lat, "
-            "NULL::numeric AS archive_long, "
-            "NULL::varchar AS archive_place_id"
-        )
-    checksum_where = ""
-    if checksum_min is not None and checksum_max is not None:
-        checksum_where = f"WHERE r.checksum >= {int(checksum_min)} AND r.checksum < {int(checksum_max)}"
-    evidence_shard_set = ""
-    if evidence_shards and int(evidence_shards) > 1:
-        evidence_shard_set = (
-            "           evidence_shard = "
-            f"{_evidence_group_hash_expr_for_alias('k', int(evidence_shards))},\n"
-        )
+    return _available_archive_fields_sql(), archive_join
+
+
+def _unavailable_archive_fields_sql() -> str:
+    """Return archive-shaped NULL fields when the archive is unavailable."""
+
+    return (
+        "NULL::uuid AS archive_address_key, "
+        "NULL::uuid AS premise_key, "
+        f"'{ARCHIVE_IDENTITY_VERSION}'::varchar AS archive_identity_version, "
+        "CASE WHEN r.address_key IS NULL THEN 'unknown' ELSE 'street' END::varchar AS address_precision, "
+        "NULL::varchar AS archive_zip5, "
+        "NULL::varchar AS archive_state_code, "
+        "NULL::varchar AS archive_city_norm, "
+        "NULL::varchar AS archive_county_fips, "
+        "NULL::numeric AS archive_lat, "
+        "NULL::numeric AS archive_long, "
+        "NULL::varchar AS archive_place_id"
+    )
+
+
+def _enriched_raw_cte_sql(
+    db_schema: str,
+    raw_table: str,
+    archive_fields: str,
+    archive_join: str,
+    checksum_where: str,
+) -> str:
+    """Build the archive-enriched raw-row CTE."""
+
     return f"""
     WITH enriched AS (
         SELECT
@@ -5289,7 +5386,13 @@ def _enrich_raw_stage_sql(
           FROM {db_schema}.{raw_table} r
           {archive_join}
          {checksum_where}
-    ),
+    ),"""
+
+
+def _enriched_raw_keyed_cte_sql(*, archive_available: bool) -> str:
+    """Build normalized address keys and confidence fields."""
+
+    return f"""
     keyed AS (
         SELECT
             row_id,
@@ -5324,7 +5427,17 @@ def _enrich_raw_stage_sql(
                 ELSE 0
             END::smallint AS location_confidence_id
           FROM enriched
-    )
+    )"""
+
+
+def _enriched_raw_update_sql(
+    db_schema: str,
+    raw_table: str,
+    evidence_shard_set: str,
+) -> str:
+    """Build the raw-stage update from enriched keyed rows."""
+
+    return f"""
     UPDATE {db_schema}.{raw_table} r
        SET address_key = k.address_key,
            premise_key = k.premise_key,
@@ -5372,6 +5485,53 @@ def _enrich_raw_stage_sql(
       FROM keyed k
      WHERE r.ctid = k.row_id;
     """
+
+
+def _enrich_raw_stage_sql(
+    db_schema: str,
+    raw_table: str,
+    *,
+    archive_available: bool = True,
+    is_address_canon_available: bool = True,
+    checksum_min: int | None = None,
+    checksum_max: int | None = None,
+    evidence_shards: int | None = None,
+) -> str:
+    """Build SQL that enriches raw addresses with canonical archive evidence."""
+
+    if archive_available:
+        archive_fields, archive_join = _available_archive_enrichment_sql(
+            db_schema,
+            is_address_canon_available,
+        )
+    else:
+        archive_fields = _unavailable_archive_fields_sql()
+        archive_join = ""
+    checksum_where = ""
+    if checksum_min is not None and checksum_max is not None:
+        checksum_where = (
+            f"WHERE r.checksum >= {int(checksum_min)} "
+            f"AND r.checksum < {int(checksum_max)}"
+        )
+    evidence_shard_set = ""
+    if evidence_shards and int(evidence_shards) > 1:
+        evidence_shard_set = (
+            "           evidence_shard = "
+            f"{_evidence_group_hash_expr_for_alias('k', int(evidence_shards))},\n"
+        )
+    return "".join(
+        (
+            _enriched_raw_cte_sql(
+                db_schema,
+                raw_table,
+                archive_fields,
+                archive_join,
+                checksum_where,
+            ),
+            _enriched_raw_keyed_cte_sql(archive_available=archive_available),
+            _enriched_raw_update_sql(db_schema, raw_table, evidence_shard_set),
+        )
+    )
 
 
 def _is_key_v2_enabled() -> bool:
@@ -5476,6 +5636,493 @@ def _coordinate_missing_or_invalid_sql(alias: str) -> str:
         f"OR {alias}.long < -180 OR {alias}.long > 180 "
         f"OR (ABS({alias}.lat) < 0.0000001 AND ABS({alias}.long) < 0.0000001)"
     )
+
+
+def _geo_projection_reference_sql(db_schema: str) -> tuple[str, str, str, str]:
+    """Build the exact legacy identity and point predicates for projection."""
+
+    target_alias = "projection_target"
+    identity_joins_sql = provider_address_identity_reference_joins_sql(
+        target_alias,
+        schema_name=db_schema,
+        geo_zip_alias="projection_geo_zip",
+        zip_state_alias="projection_zip_state",
+    )
+    identity_predicate_sql = provider_address_identity_coherence_sql(
+        target_alias,
+        schema_name=db_schema,
+        use_projection=False,
+        reference_aliases=("projection_geo_zip", "projection_zip_state"),
+    )
+    point_join_sql = provider_address_point_reference_join_sql(
+        target_alias,
+        zcta_alias="projection_zcta",
+    )
+    point_predicate_sql = provider_address_point_coherence_sql(
+        target_alias,
+        use_projection=False,
+        zcta_alias="projection_zcta",
+    )
+    return (
+        identity_joins_sql,
+        identity_predicate_sql,
+        point_join_sql,
+        point_predicate_sql,
+    )
+
+
+def _geo_projection_evidence_source_sql() -> str:
+    """Build evidence precedence from the admitted set-wise keys."""
+
+    return geo_projection.evidence_source_id_case_sql(
+        nppes_condition_sql=(
+            "(projection_target.address_source_mask & 1) <> 0 "
+            "AND projection_nppes.npi IS NOT NULL"
+        ),
+        mrf_condition_sql="projection_mrf.npi IS NOT NULL",
+        cms_condition_sql=(
+            "(projection_target.address_source_mask & 4) <> 0 "
+            "AND projection_cms.location_key IS NOT NULL"
+        ),
+    )
+
+
+def _geo_projection_filter_sql(*, force: bool) -> str:
+    """Select every row for reused stages, otherwise only stale projections."""
+
+    valid_source_ids = ", ".join(
+        str(source_id) for source_id in geo_projection.GEO_EVIDENCE_SOURCE_IDS
+    )
+    return "TRUE" if force else f"""(
+                target.geo_assurance_version = {geo_projection.GEO_ASSURANCE_VERSION}
+            AND target.geo_evidence_source_id IN ({valid_source_ids})
+            AND target.geo_identity_coherent IS NOT NULL
+            AND target.geo_point_coherent IS NOT NULL
+         ) IS NOT TRUE"""
+
+
+def _geo_projection_target_ctes_sql(
+    db_schema: str,
+    stage_table: str,
+    projection_filter_sql: str,
+    identity_joins_sql: str,
+    identity_predicate_sql: str,
+    point_join_sql: str,
+    point_predicate_sql: str,
+) -> str:
+    """Build target and spatial-coherence admitted-key CTEs."""
+
+    target_alias = "projection_target"
+    return f"""
+    WITH projection_targets AS MATERIALIZED (
+        SELECT
+            target.location_key,
+            target.npi,
+            target.address_key,
+            target.premise_key,
+            target.address_source_mask,
+            target.first_line,
+            target.second_line,
+            target.postal_code,
+            target.country_code,
+            target.zip5,
+            target.state_code,
+            target.state_name,
+            target.lat,
+            target.long
+          FROM {db_schema}.{stage_table} AS target
+         WHERE {projection_filter_sql}
+    ), projection_identity_admitted AS MATERIALIZED (
+        SELECT DISTINCT {target_alias}.location_key
+          FROM projection_targets AS {target_alias}
+          {identity_joins_sql}
+         WHERE {identity_predicate_sql}
+    ), projection_point_admitted AS MATERIALIZED (
+        SELECT DISTINCT {target_alias}.location_key
+          FROM projection_targets AS {target_alias}
+          {point_join_sql}
+         WHERE {point_predicate_sql}
+    ),"""
+
+
+def _geo_projection_external_evidence_ctes_sql(db_schema: str) -> str:
+    """Build set-wise NPPES and MRF evidence admitted-key CTEs."""
+
+    return f""" projection_nppes AS MATERIALIZED (
+        SELECT DISTINCT projection_target.npi, projection_target.address_key
+          FROM projection_targets AS projection_target
+          JOIN {db_schema}.npi_address AS source_nppes
+            ON source_nppes.npi = projection_target.npi
+           AND source_nppes.address_key = projection_target.address_key
+           AND source_nppes.date_added IS NOT NULL
+         WHERE (projection_target.address_source_mask & 1) <> 0
+           AND projection_target.address_key IS NOT NULL
+    ), projection_mrf AS MATERIALIZED (
+        SELECT DISTINCT projection_target.npi, projection_target.address_key
+          FROM projection_targets AS projection_target
+          JOIN {db_schema}.mrf_address AS source_mrf
+            ON source_mrf.npi = projection_target.npi
+           AND source_mrf.address_key = projection_target.address_key
+           AND {geo_projection.independent_issuer_sql('source_mrf.source_issuer_names')}
+           AND {geo_projection.mrf_lineage_complete_sql('source_mrf')}
+         WHERE projection_target.address_key IS NOT NULL
+    ),"""
+
+
+def _geo_projection_cms_anchor_ctes_sql(
+    db_schema: str,
+    stage_table: str,
+) -> str:
+    """Build CMS target premises and their durable NPPES anchors."""
+
+    return f""" projection_cms_premises AS MATERIALIZED (
+        SELECT DISTINCT projection_target.npi, projection_target.premise_key
+          FROM projection_targets AS projection_target
+         WHERE (projection_target.address_source_mask & 4) <> 0
+           AND projection_target.address_key IS NOT NULL
+           AND projection_target.premise_key IS NOT NULL
+    ), projection_nppes_anchors AS MATERIALIZED (
+        SELECT DISTINCT requested.npi, requested.premise_key
+          FROM projection_cms_premises AS requested
+          JOIN {db_schema}.{stage_table} AS candidate
+            ON candidate.npi = requested.npi
+           AND candidate.premise_key = requested.premise_key
+           AND (candidate.address_source_mask & 1) <> 0
+           AND candidate.type IN ('primary', 'secondary', 'practice', 'site')
+          JOIN {db_schema}.npi_address AS anchor_source
+            ON anchor_source.npi = candidate.npi
+           AND anchor_source.address_key = candidate.address_key
+           AND anchor_source.date_added IS NOT NULL
+    ),"""
+
+
+def _geo_projection_cms_cte_sql(db_schema: str) -> str:
+    """Build CMS evidence admitted keys from source rows and anchors."""
+
+    return f""" projection_cms AS MATERIALIZED (
+        SELECT DISTINCT projection_target.location_key
+          FROM projection_targets AS projection_target
+          JOIN {db_schema}.doctor_clinician_address AS source_doctor
+            ON source_doctor.npi = projection_target.npi
+           AND source_doctor.address_key = projection_target.address_key
+           AND source_doctor.updated_at IS NOT NULL
+          JOIN projection_nppes_anchors AS anchor
+            ON anchor.npi = projection_target.npi
+           AND anchor.premise_key = projection_target.premise_key
+         WHERE (projection_target.address_source_mask & 4) <> 0
+           AND projection_target.address_key IS NOT NULL
+           AND projection_target.premise_key IS NOT NULL
+    ),"""
+
+
+def _geo_projection_update_sql(
+    db_schema: str,
+    stage_table: str,
+    evidence_source_id_sql: str,
+) -> str:
+    """Classify each target once and atomically update its projection."""
+
+    return f""" projection_classified AS MATERIALIZED (
+        SELECT
+            projection_target.location_key,
+            {evidence_source_id_sql} AS geo_evidence_source_id,
+            (projection_identity.location_key IS NOT NULL) AS geo_identity_coherent,
+            (projection_point.location_key IS NOT NULL) AS geo_point_coherent
+          FROM projection_targets AS projection_target
+          LEFT JOIN projection_nppes
+            ON projection_nppes.npi = projection_target.npi
+           AND projection_nppes.address_key = projection_target.address_key
+          LEFT JOIN projection_mrf
+            ON projection_mrf.npi = projection_target.npi
+           AND projection_mrf.address_key = projection_target.address_key
+          LEFT JOIN projection_cms
+            ON projection_cms.location_key = projection_target.location_key
+          LEFT JOIN projection_identity_admitted AS projection_identity
+            ON projection_identity.location_key = projection_target.location_key
+          LEFT JOIN projection_point_admitted AS projection_point
+            ON projection_point.location_key = projection_target.location_key
+    )
+    UPDATE {db_schema}.{stage_table} AS target
+       SET geo_evidence_source_id = projection.geo_evidence_source_id,
+           geo_identity_coherent = projection.geo_identity_coherent,
+           geo_point_coherent = projection.geo_point_coherent,
+           geo_assurance_version = {geo_projection.GEO_ASSURANCE_VERSION}
+      FROM projection_classified AS projection
+     WHERE projection.location_key = target.location_key;
+    """
+
+
+def _materialize_geo_assurance_sql(
+    db_schema: str,
+    stage_table: str,
+    *,
+    force: bool = False,
+) -> str:
+    """Project exact evidence and spatial coherence onto finalized stage rows."""
+
+    reference_sql = _geo_projection_reference_sql(db_schema)
+    return "".join(
+        (
+            _geo_projection_target_ctes_sql(
+                db_schema,
+                stage_table,
+                _geo_projection_filter_sql(force=force),
+                *reference_sql,
+            ),
+            _geo_projection_external_evidence_ctes_sql(db_schema),
+            _geo_projection_cms_anchor_ctes_sql(db_schema, stage_table),
+            _geo_projection_cms_cte_sql(db_schema),
+            _geo_projection_update_sql(
+                db_schema,
+                stage_table,
+                _geo_projection_evidence_source_sql(),
+            ),
+        )
+    )
+
+
+def _invalid_geo_assurance_projection_sql(db_schema: str, stage_table: str) -> str:
+    valid_source_ids = ", ".join(
+        str(value) for value in geo_projection.GEO_EVIDENCE_SOURCE_IDS
+    )
+    return f"""
+    SELECT COUNT(*)
+      FROM {db_schema}.{stage_table}
+     WHERE geo_assurance_version IS DISTINCT FROM {geo_projection.GEO_ASSURANCE_VERSION}
+        OR geo_evidence_source_id IS NULL
+        OR geo_evidence_source_id NOT IN ({valid_source_ids})
+        OR geo_identity_coherent IS NULL
+        OR geo_point_coherent IS NULL;
+    """
+
+
+async def _validate_geo_assurance_projection(
+    db_schema: str,
+    stage_table: str,
+) -> int:
+    invalid_rows = int(
+        await db.scalar(
+            _invalid_geo_assurance_projection_sql(db_schema, stage_table)
+        )
+        or 0
+    )
+    if invalid_rows:
+        raise RuntimeError(
+            f"{invalid_rows} staged rows have incomplete geo assurance"
+        )
+    return invalid_rows
+
+
+def _record_geo_assurance_candidate_sql(
+    db_schema: str,
+    stage_table: str,
+    projected_rows: int,
+) -> str:
+    db_schema = _validate_schema_name(db_schema)
+    stage_table = _validate_schema_name(stage_table)
+    state_table = geo_projection.GEO_ASSURANCE_STATE_TABLE
+    stage_relation = f"{db_schema}.{stage_table}"
+    return f"""
+    INSERT INTO {db_schema}.{state_table} (
+        singleton,
+        candidate_geo_assurance_version,
+        candidate_table_oid,
+        candidate_relation_signature,
+        candidate_projected_rows
+    )
+    SELECT
+        true,
+        {geo_projection.GEO_ASSURANCE_VERSION},
+        to_regclass('{stage_relation}')::oid,
+        {geo_projection.projection_relation_signature_sql(db_schema)},
+        {int(projected_rows)}::bigint
+     WHERE to_regclass('{stage_relation}') IS NOT NULL
+    ON CONFLICT (singleton) DO UPDATE SET
+        candidate_geo_assurance_version = EXCLUDED.candidate_geo_assurance_version,
+        candidate_table_oid = EXCLUDED.candidate_table_oid,
+        candidate_relation_signature = EXCLUDED.candidate_relation_signature,
+        candidate_projected_rows = EXCLUDED.candidate_projected_rows
+    RETURNING candidate_table_oid::bigint;
+    """
+
+
+def _activate_geo_assurance_candidate_sql(db_schema: str) -> str:
+    db_schema = _validate_schema_name(db_schema)
+    state_table = geo_projection.GEO_ASSURANCE_STATE_TABLE
+    live_relation = f"{db_schema}.{EntityAddressUnified.__main_table__}"
+    return f"""
+    UPDATE {db_schema}.{state_table}
+       SET active_geo_assurance_version = candidate_geo_assurance_version,
+           active_table_oid = candidate_table_oid,
+           active_relation_signature = candidate_relation_signature,
+           candidate_geo_assurance_version = NULL,
+           candidate_table_oid = NULL,
+           candidate_relation_signature = NULL,
+           candidate_projected_rows = NULL
+     WHERE singleton IS TRUE
+       AND candidate_geo_assurance_version = {geo_projection.GEO_ASSURANCE_VERSION}
+       AND candidate_table_oid = to_regclass('{live_relation}')::oid
+       AND candidate_relation_signature = (
+           {geo_projection.projection_relation_signature_sql(db_schema)}
+       )
+    RETURNING active_table_oid::bigint;
+    """
+
+
+def _emit_geo_assurance_progress(
+    run_id: str,
+    stage_rows: int,
+    *,
+    projected_rows: int = 0,
+    elapsed: float | None = None,
+) -> None:
+    if not run_id:
+        return
+    phase = "entity-address-unified projecting geo assurance"
+    message = "projecting durable provider geo assurance"
+    if elapsed is not None:
+        message = f"{message}: {projected_rows:,} row(s), {_format_seconds(elapsed)}"
+    enqueue_live_progress(
+        run_id=run_id,
+        importer="entity-address-unified",
+        status="running",
+        phase=phase,
+        unit="rows",
+        done=projected_rows,
+        total=stage_rows,
+        pct=97,
+        message=message,
+        source="entity-address-unified-sql-progress",
+    )
+
+
+async def _materialize_geo_assurance(
+    db_schema: str,
+    stage_table: str,
+    *,
+    force: bool,
+    context: dict,
+    run_id: str,
+    stage_rows: int,
+) -> int:
+    _emit_geo_assurance_progress(run_id, stage_rows)
+    started = time.monotonic()
+    projected_rows, invalid_rows, candidate_table_oid, effective_force = (
+        await _project_geo_assurance_transaction(
+            db_schema,
+            stage_table,
+            force=force,
+        )
+    )
+    elapsed = time.monotonic() - started
+    _record_phase_timing(
+        context,
+        "entity-address-unified projecting geo assurance",
+        elapsed,
+        projected_rows,
+    )
+    context["geo_assurance_candidate_table_oid"] = candidate_table_oid
+    context["geo_assurance_forced_full_projection"] = effective_force
+    context["invalid_geo_assurance_rows"] = invalid_rows
+    _emit_geo_assurance_progress(
+        run_id,
+        stage_rows,
+        projected_rows=projected_rows,
+        elapsed=elapsed,
+    )
+    return projected_rows
+
+
+async def _project_geo_assurance_transaction(
+    db_schema: str,
+    stage_table: str,
+    *,
+    force: bool,
+) -> tuple[int, int, int, bool]:
+    """Project, validate, and receipt one source-stable stage atomically."""
+
+    async with db.transaction():
+        await _apply_entity_address_transaction_settings()
+        await db.status(geo_projection.projection_dependency_lock_sql(db_schema))
+        current_projection_available = bool(
+            await db.scalar(
+                f"SELECT {geo_projection.projection_state_available_sql(db_schema)};"
+            )
+        )
+        effective_force = force or not current_projection_available
+        projected_rows = int(
+            _coerce_rowcount(
+                await db.status(
+                    _materialize_geo_assurance_sql(
+                        db_schema,
+                        stage_table,
+                        force=effective_force,
+                    )
+                )
+            )
+            or 0
+        )
+        invalid_rows = await _validate_geo_assurance_projection(
+            db_schema,
+            stage_table,
+        )
+        candidate_table_oid = await db.scalar(
+            _record_geo_assurance_candidate_sql(
+                db_schema,
+                stage_table,
+                projected_rows,
+            )
+        )
+        if candidate_table_oid is None:
+            raise RuntimeError("geo assurance stage disappeared before receipt")
+    return (
+        projected_rows,
+        invalid_rows,
+        int(candidate_table_oid),
+        effective_force,
+    )
+
+
+async def _apply_entity_address_transaction_settings() -> None:
+    for name, value in _entity_address_sql_settings():
+        try:
+            async with db.transaction():
+                await db.status(f"SET LOCAL {name} = {_sql_literal(value)};")
+        except Exception as exc:
+            if "permission denied to set parameter" not in str(exc).lower():
+                raise
+            logger.warning(
+                "Skipping unprivileged entity-address SQL setting %s=%s: %s",
+                name,
+                value,
+                exc,
+            )
+
+
+async def _drop_stage_secondary_indexes(stage_cls, db_schema: str) -> int:
+    dropped = 0
+    for index in getattr(stage_cls, "__my_additional_indexes__", []) or []:
+        index_name = index.get("name", "_".join(index.get("index_elements")))
+        await db.status(
+            f"DROP INDEX IF EXISTS {db_schema}."
+            f"{_stage_index_name(stage_cls.__tablename__, index_name)};"
+        )
+        dropped += 1
+    return dropped
+
+
+async def _compact_geo_assurance_stage(
+    db_schema: str,
+    stage_table: str,
+) -> str:
+    persistence = await _stage_table_persistence(db_schema, stage_table)
+    if persistence is None:
+        raise RuntimeError(f"Geo assurance stage {db_schema}.{stage_table} does not exist")
+    if persistence != "p":
+        await _ensure_promoted_stage_logged(db_schema, stage_table)
+        return "set_logged"
+    await db.execute_ddl(f"VACUUM (FULL, ANALYZE) {db_schema}.{stage_table};")
+    return "vacuum_full"
 
 
 def _backfill_archive_coordinates_sql(
@@ -6146,14 +6793,12 @@ async def _validate_publish_integrity(
     return integrity_metric_map
 
 
-def _insert_raw_from_source_sql(
+def _insert_raw_header_sql(
     db_schema: str,
     raw_table: str,
-    source_select: str,
-    *,
-    is_address_canon_available: bool = True,
 ) -> str:
-    """Build SQL that normalizes one source query into the raw stage."""
+    """Build the raw-source insert column header."""
+
     return f"""
     INSERT INTO {db_schema}.{raw_table} (
         entity_type,
@@ -6200,10 +6845,22 @@ def _insert_raw_from_source_sql(
         source_record_id,
         address_key,
         checksum
-    )
+    )"""
+
+
+def _insert_raw_base_rows_cte_sql(source_select: str) -> str:
+    """Build the caller-supplied raw base-row CTE."""
+
+    return f"""
     WITH base_rows AS (
         {source_select.strip()}
-    ),
+    ),"""
+
+
+def _insert_raw_sanitized_cte_sql() -> str:
+    """Build the raw value-sanitization CTE."""
+
+    return f"""
     sanitized AS (
         SELECT
             entity_type,
@@ -6247,7 +6904,13 @@ def _insert_raw_from_source_sql(
             updated_at::timestamp AS updated_at,
             address_key::uuid AS address_key
           FROM base_rows
-    ),
+    ),"""
+
+
+def _insert_raw_normalized_cte_sql() -> str:
+    """Build the normalized raw row and checksum CTE."""
+
+    return f"""
     normalized AS (
         SELECT
             entity_type,
@@ -6300,7 +6963,13 @@ def _insert_raw_from_source_sql(
                 "telephone_number": _phone_norm_expr("telephone_number"),
             })} AS checksum
           FROM sanitized
-    )
+    )"""
+
+
+def _insert_raw_select_sql() -> str:
+    """Build the normalized raw-row projection."""
+
+    return """
     SELECT
         entity_type,
         entity_id,
@@ -6350,48 +7019,72 @@ def _insert_raw_from_source_sql(
     """
 
 
-def _materialize_from_raw_sql(
+def _insert_raw_from_source_sql(
     db_schema: str,
-    stage_table: str,
     raw_table: str,
+    source_select: str,
     *,
-    checksum_modulo: int | None = None,
-    checksum_remainder: int | None = None,
     is_address_canon_available: bool = True,
-    inline_source_evidence: bool = False,
 ) -> str:
-    """Build SQL that deduplicates raw evidence into unified locations."""
-    dedupe_key_expr = _dedupe_key_expr(is_address_canon_available)
-    source_record_ids_select = _source_record_ids_select_sql()
-    should_split_array_aggregates = _is_env_enabled(
-        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SPLIT_ARRAY_AGGREGATES",
-        DEFAULT_SPLIT_ARRAY_AGGREGATES,
+    """Build SQL that normalizes one source query into the raw stage."""
+
+    del is_address_canon_available
+    return "".join(
+        (
+            _insert_raw_header_sql(db_schema, raw_table),
+            _insert_raw_base_rows_cte_sql(source_select),
+            _insert_raw_sanitized_cte_sql(),
+            _insert_raw_normalized_cte_sql(),
+            _insert_raw_select_sql(),
+        )
     )
-    shard_filter = ""
-    if checksum_modulo and checksum_modulo > 1 and checksum_remainder is not None:
-        shard_expr = (
-            "evidence_shard"
-            if inline_source_evidence
-            else _aggregate_shard_expr(dedupe_key_expr, int(checksum_modulo))
-        )
-        shard_filter = f" WHERE {shard_expr} = {int(checksum_remainder)}"
-    if should_split_array_aggregates:
-        array_filter_clauses = []
-        if shard_filter:
-            array_filter_clauses.append(shard_filter.replace(" WHERE ", "", 1))
-        array_filter_clauses.append(
-            "("
-            "COALESCE(CARDINALITY(aca_plan_array), 0) > 0 OR "
-            "COALESCE(CARDINALITY(aca_network_array), 0) > 0 OR "
-            "COALESCE(CARDINALITY(ptg_plan_array), 0) > 0 OR "
-            "COALESCE(CARDINALITY(ptg_source_array), 0) > 0 OR "
-            "COALESCE(CARDINALITY(group_plan_array), 0) > 0"
-            ")"
-        )
-        array_filter = " WHERE " + " AND ".join(array_filter_clauses)
-        raw_array_joins = ""
-        aggregated_array_columns = ""
-        array_cte = f"""
+
+
+def _raw_materialize_shard_filter_sql(
+    dedupe_key_expr: str,
+    checksum_modulo: int | None,
+    checksum_remainder: int | None,
+    *,
+    inline_source_evidence: bool,
+) -> str:
+    """Build the optional raw aggregation shard predicate."""
+
+    if not checksum_modulo or checksum_modulo <= 1 or checksum_remainder is None:
+        return ""
+    shard_expr = (
+        "evidence_shard"
+        if inline_source_evidence
+        else _aggregate_shard_expr(dedupe_key_expr, int(checksum_modulo))
+    )
+    return f" WHERE {shard_expr} = {int(checksum_remainder)}"
+
+
+def _raw_split_array_filter_sql(shard_filter: str) -> str:
+    """Build the split-array scan predicate."""
+
+    filter_clauses = []
+    if shard_filter:
+        filter_clauses.append(shard_filter.replace(" WHERE ", "", 1))
+    filter_clauses.append(
+        "("
+        "COALESCE(CARDINALITY(aca_plan_array), 0) > 0 OR "
+        "COALESCE(CARDINALITY(aca_network_array), 0) > 0 OR "
+        "COALESCE(CARDINALITY(ptg_plan_array), 0) > 0 OR "
+        "COALESCE(CARDINALITY(ptg_source_array), 0) > 0 OR "
+        "COALESCE(CARDINALITY(group_plan_array), 0) > 0"
+        ")"
+    )
+    return " WHERE " + " AND ".join(filter_clauses)
+
+
+def _raw_split_array_cte_sql(
+    db_schema: str,
+    raw_table: str,
+    dedupe_key_expr: str,
+    array_filter: str,
+) -> str:
+    """Build the split array-aggregation CTE."""
+    return f"""
     ),
     array_aggregates AS (
         SELECT
@@ -6444,42 +7137,89 @@ def _materialize_from_raw_sql(
          {array_filter}
          GROUP BY entity_type, entity_id, type, {dedupe_key_expr}
     """
-        array_join = f"""
+
+
+def _raw_split_array_join_sql(dedupe_key_expr: str) -> str:
+    """Build the split array-aggregation join."""
+
+    return f"""
       LEFT JOIN array_aggregates arr
         ON arr.aggregate_entity_type = aggregated.entity_type
        AND arr.aggregate_entity_id = aggregated.entity_id
        AND arr.aggregate_type = aggregated.type
        AND arr.aggregate_key IS NOT DISTINCT FROM aggregated.{dedupe_key_expr}"""
-        array_selects = (
-            "COALESCE(arr.aca_plan_array, ARRAY[]::varchar[]) AS aca_plan_array,\n"
-            "        COALESCE(arr.aca_network_array, ARRAY[]::varchar[]) AS aca_network_array,\n"
-            "        COALESCE(arr.ptg_plan_array, ARRAY[]::varchar[]) AS ptg_plan_array,\n"
-            "        COALESCE(arr.ptg_source_array, ARRAY[]::varchar[]) AS ptg_source_array,\n"
-            "        COALESCE(arr.group_plan_array, ARRAY[]::varchar[]) AS group_plan_array"
-        )
-    else:
-        raw_array_joins = """
+
+
+def _raw_split_array_selects_sql() -> str:
+    """Build split array projections."""
+
+    return (
+        "COALESCE(arr.aca_plan_array, ARRAY[]::varchar[]) AS aca_plan_array,\n"
+        "        COALESCE(arr.aca_network_array, ARRAY[]::varchar[]) AS aca_network_array,\n"
+        "        COALESCE(arr.ptg_plan_array, ARRAY[]::varchar[]) AS ptg_plan_array,\n"
+        "        COALESCE(arr.ptg_source_array, ARRAY[]::varchar[]) AS ptg_source_array,\n"
+        "        COALESCE(arr.group_plan_array, ARRAY[]::varchar[]) AS group_plan_array"
+    )
+
+
+def _raw_inline_array_aggregation_sql() -> tuple[str, str, str]:
+    """Build the legacy lateral array aggregation fragments."""
+
+    raw_array_joins = """
           LEFT JOIN LATERAL unnest(COALESCE(aca_plan_array, ARRAY[]::varchar[])) AS aca_plan(value) ON TRUE
           LEFT JOIN LATERAL unnest(COALESCE(aca_network_array, ARRAY[]::varchar[])) AS aca_network(value) ON TRUE
           LEFT JOIN LATERAL unnest(COALESCE(ptg_plan_array, ARRAY[]::varchar[])) AS ptg_plan(value) ON TRUE
           LEFT JOIN LATERAL unnest(COALESCE(ptg_source_array, ARRAY[]::varchar[])) AS ptg_source(value) ON TRUE
           LEFT JOIN LATERAL unnest(COALESCE(group_plan_array, ARRAY[]::varchar[])) AS group_plan(value) ON TRUE"""
-        aggregated_array_columns = """
+    aggregated_array_columns = """
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT aca_plan.value ORDER BY aca_plan.value), NULL)::varchar[] AS aca_plan_array,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT aca_network.value ORDER BY aca_network.value), NULL)::varchar[] AS aca_network_array,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT ptg_plan.value ORDER BY ptg_plan.value), NULL)::varchar[] AS ptg_plan_array,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT ptg_source.value ORDER BY ptg_source.value), NULL)::varchar[] AS ptg_source_array,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT group_plan.value ORDER BY group_plan.value), NULL)::varchar[] AS group_plan_array,"""
-        array_cte = ""
-        array_join = ""
-        array_selects = (
-            "COALESCE(aca_plan_array, ARRAY[]::varchar[]) AS aca_plan_array,\n"
-            "        COALESCE(aca_network_array, ARRAY[]::varchar[]) AS aca_network_array,\n"
-            "        COALESCE(ptg_plan_array, ARRAY[]::varchar[]) AS ptg_plan_array,\n"
-            "        COALESCE(ptg_source_array, ARRAY[]::varchar[]) AS ptg_source_array,\n"
-            "        COALESCE(group_plan_array, ARRAY[]::varchar[]) AS group_plan_array"
+    array_selects = (
+        "COALESCE(aca_plan_array, ARRAY[]::varchar[]) AS aca_plan_array,\n"
+        "        COALESCE(aca_network_array, ARRAY[]::varchar[]) AS aca_network_array,\n"
+        "        COALESCE(ptg_plan_array, ARRAY[]::varchar[]) AS ptg_plan_array,\n"
+        "        COALESCE(ptg_source_array, ARRAY[]::varchar[]) AS ptg_source_array,\n"
+        "        COALESCE(group_plan_array, ARRAY[]::varchar[]) AS group_plan_array"
+    )
+    return raw_array_joins, aggregated_array_columns, array_selects
+
+
+def _raw_array_aggregation_sql(
+    db_schema: str,
+    raw_table: str,
+    dedupe_key_expr: str,
+    shard_filter: str,
+    *,
+    should_split: bool,
+) -> tuple[str, str, str, str, str]:
+    """Return raw array join, column, CTE, join, and select fragments."""
+
+    if should_split:
+        return (
+            "",
+            "",
+            _raw_split_array_cte_sql(
+                db_schema,
+                raw_table,
+                dedupe_key_expr,
+                _raw_split_array_filter_sql(shard_filter),
+            ),
+            _raw_split_array_join_sql(dedupe_key_expr),
+            _raw_split_array_selects_sql(),
         )
-    sql = f"""
+    raw_array_joins, aggregated_array_columns, array_selects = (
+        _raw_inline_array_aggregation_sql()
+    )
+    return raw_array_joins, aggregated_array_columns, "", "", array_selects
+
+
+def _raw_materialize_insert_header_sql(db_schema: str, stage_table: str) -> str:
+    """Build the first half of the raw materialization insert columns."""
+
+    return f"""
     INSERT INTO {db_schema}.{stage_table} (
         entity_type,
         entity_id,
@@ -6507,7 +7247,13 @@ def _materialize_from_raw_sql(
         confidence_score,
         freshness_score,
         address_sources,
-        source_record_ids,
+        source_record_ids,"""
+
+
+def _raw_materialize_insert_tail_sql() -> str:
+    """Build the remaining raw materialization insert columns."""
+
+    return """
         aca_plan_array,
         aca_network_array,
         ptg_plan_array,
@@ -6542,7 +7288,13 @@ def _materialize_from_raw_sql(
         address_key,
         updated_at,
         last_seen_at
-    )
+    )"""
+
+
+def _raw_materialize_aggregate_identity_sql() -> str:
+    """Build the identity half of raw aggregation."""
+
+    return """
     WITH aggregated AS (
         SELECT
             entity_type,
@@ -6567,7 +7319,22 @@ def _materialize_from_raw_sql(
             MAX(inference_confidence)::float8 AS inference_confidence,
             MAX(inference_method)::varchar AS inference_method,
             (ARRAY_AGG(entity_name ORDER BY source_priority ASC, (entity_name IS NULL), LENGTH(COALESCE(entity_name, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS entity_name,
-            MAX(entity_subtype)::varchar AS entity_subtype,
+            MAX(entity_subtype)::varchar AS entity_subtype,"""
+
+
+def _raw_materialize_aggregate_address_sql(
+    db_schema: str,
+    raw_table: str,
+    dedupe_key_expr: str,
+    source_record_ids_select: str,
+    aggregated_array_columns: str,
+    raw_array_joins: str,
+    shard_filter: str,
+    array_cte: str,
+) -> str:
+    """Build address fields and grouping for raw aggregation."""
+
+    return f"""
             COALESCE(MAX(taxonomy_array), ARRAY[0]::int[])::int[] AS taxonomy_array,
             COALESCE(MAX(plans_network_array), ARRAY[0]::int[])::int[] AS plans_network_array,
             COALESCE(MAX(procedures_array), ARRAY[0]::int[])::int[] AS procedures_array,
@@ -6598,7 +7365,13 @@ def _materialize_from_raw_sql(
          {shard_filter}
          GROUP BY entity_type, entity_id, type, {dedupe_key_expr}
 {array_cte}
-    )
+    )"""
+
+
+def _raw_materialize_select_assurance_sql(array_selects: str) -> str:
+    """Build the assurance half of the raw materialization projection."""
+
+    return f"""
     SELECT
         entity_type,
         entity_id,
@@ -6637,7 +7410,13 @@ def _materialize_from_raw_sql(
         (CASE WHEN updated_at >= NOW() - INTERVAL '12 months' THEN 10 ELSE 0 END)::smallint AS freshness_score,
         COALESCE(address_sources, ARRAY[]::varchar[]) AS address_sources,
         COALESCE(source_record_ids, ARRAY[]::varchar[]) AS source_record_ids,
-        {array_selects},
+        {array_selects},"""
+
+
+def _raw_materialize_select_address_sql(db_schema: str, array_join: str) -> str:
+    """Build address fields and the final raw aggregation join."""
+
+    return f"""
         base_address_version,
         checksum,
         type,
@@ -6676,22 +7455,108 @@ def _materialize_from_raw_sql(
         updated_at AS last_seen_at
       FROM aggregated{array_join};
     """
+
+
+def _materialize_from_raw_sql(
+    db_schema: str,
+    stage_table: str,
+    raw_table: str,
+    *,
+    checksum_modulo: int | None = None,
+    checksum_remainder: int | None = None,
+    is_address_canon_available: bool = True,
+    inline_source_evidence: bool = False,
+) -> str:
+    """Build SQL that deduplicates raw evidence into unified locations."""
+
+    dedupe_key_expr = _dedupe_key_expr(is_address_canon_available)
+    shard_filter = _raw_materialize_shard_filter_sql(
+        dedupe_key_expr,
+        checksum_modulo,
+        checksum_remainder,
+        inline_source_evidence=inline_source_evidence,
+    )
+    array_fragments = _raw_array_aggregation_sql(
+        db_schema,
+        raw_table,
+        dedupe_key_expr,
+        shard_filter,
+        should_split=_is_env_enabled(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SPLIT_ARRAY_AGGREGATES",
+            DEFAULT_SPLIT_ARRAY_AGGREGATES,
+        ),
+    )
+    raw_array_joins, aggregated_array_columns, array_cte, array_join, array_selects = (
+        array_fragments
+    )
+    sql = "".join(
+        (
+            _raw_materialize_insert_header_sql(db_schema, stage_table),
+            _raw_materialize_insert_tail_sql(),
+            _raw_materialize_aggregate_identity_sql(),
+            _raw_materialize_aggregate_address_sql(
+                db_schema,
+                raw_table,
+                dedupe_key_expr,
+                _source_record_ids_select_sql(),
+                aggregated_array_columns,
+                raw_array_joins,
+                shard_filter,
+                array_cte,
+            ),
+            _raw_materialize_select_assurance_sql(array_selects),
+            _raw_materialize_select_address_sql(db_schema, array_join),
+        )
+    )
     if inline_source_evidence:
         return _inline_source_evidence_sql(sql)
     return sql
 
 
-def _materialize_sql(
+def _direct_materialize_location_key_sql() -> str:
+    """Build the direct-materialization location key expression."""
+
+    return _location_key_expr(
+        {
+            "entity_type": "entity_type",
+            "entity_id": "entity_id",
+            "npi": "npi",
+            "inferred_npi": "inferred_npi",
+            "address_role_id": _address_role_id_expr("type"),
+            "row_origin": "'base'",
+            "address_key": "address_key",
+            "source_id": _source_id_expr("address_source"),
+            "source_record_id": "source_record_id",
+            "zip5": _zip5_norm_expr("postal_code"),
+            "state_code": _state_norm_expr("state_name"),
+            "city_norm": _alnum_norm_expr("city_name"),
+        }
+    )
+
+
+def _direct_materialize_checksum_sql() -> str:
+    """Build the direct-materialization address checksum expression."""
+
+    return _address_checksum_expr(
+        {
+            "first_line": _alnum_norm_expr("first_line"),
+            "second_line": _alnum_norm_expr("second_line"),
+            "city_name": _alnum_norm_expr("city_name"),
+            "state_name": _state_norm_expr("state_name"),
+            "postal_code": _zip5_norm_expr("postal_code"),
+            "country_code": _state_norm_expr("country_code"),
+            "telephone_number": _phone_norm_expr("telephone_number"),
+        }
+    )
+
+
+def _direct_materialize_header_sql(
     db_schema: str,
     stage_table: str,
-    source_selects: Iterable[str],
-    *,
-    is_address_canon_available: bool = True,
+    selects_sql: str,
 ) -> str:
-    """Build direct source-to-stage materialization SQL."""
-    selects_sql = "\nUNION ALL\n".join(select.strip() for select in source_selects)
-    dedupe_key_expr = _dedupe_key_expr(is_address_canon_available)
-    source_record_ids_select = _source_record_ids_select_sql()
+    """Build the direct materialization insert header and base CTE."""
+
     return f"""
     INSERT INTO {db_schema}.{stage_table} (
         entity_type,
@@ -6737,7 +7602,13 @@ def _materialize_sql(
     )
     WITH base_rows AS (
         {selects_sql}
-    ),
+    ),"""
+
+
+def _direct_materialize_sanitized_cte_sql() -> str:
+    """Build direct source value sanitization."""
+
+    return f"""
     sanitized AS (
         SELECT
             entity_type,
@@ -6775,7 +7646,13 @@ def _materialize_sql(
             updated_at::timestamp AS updated_at,
             address_key::uuid AS address_key
           FROM base_rows
-    ),
+    ),"""
+
+
+def _direct_materialize_normalized_cte_sql() -> str:
+    """Build direct normalized location and checksum fields."""
+
+    return f"""
     normalized AS (
         SELECT
             entity_type,
@@ -6812,31 +7689,19 @@ def _materialize_sql(
             source_record_id,
             updated_at,
             address_key,
-            {_location_key_expr({
-                "entity_type": "entity_type",
-                "entity_id": "entity_id",
-                "npi": "npi",
-                "inferred_npi": "inferred_npi",
-                "address_role_id": _address_role_id_expr("type"),
-                "row_origin": "'base'",
-                "address_key": "address_key",
-                "source_id": _source_id_expr("address_source"),
-                "source_record_id": "source_record_id",
-                "zip5": _zip5_norm_expr("postal_code"),
-                "state_code": _state_norm_expr("state_name"),
-                "city_norm": _alnum_norm_expr("city_name"),
-            })} AS location_key,
-            {_address_checksum_expr({
-                "first_line": _alnum_norm_expr("first_line"),
-                "second_line": _alnum_norm_expr("second_line"),
-                "city_name": _alnum_norm_expr("city_name"),
-                "state_name": _state_norm_expr("state_name"),
-                "postal_code": _zip5_norm_expr("postal_code"),
-                "country_code": _state_norm_expr("country_code"),
-                "telephone_number": _phone_norm_expr("telephone_number"),
-            })} AS checksum
+            {_direct_materialize_location_key_sql()} AS location_key,
+            {_direct_materialize_checksum_sql()} AS checksum
           FROM sanitized
-    ),
+    ),"""
+
+
+def _direct_materialize_aggregated_cte_sql(
+    dedupe_key_expr: str,
+    source_record_ids_select: str,
+) -> str:
+    """Build direct address aggregation."""
+
+    return f"""
     aggregated AS (
         SELECT
             entity_type,
@@ -6876,7 +7741,13 @@ def _materialize_sql(
             MAX(updated_at)::timestamp AS updated_at
           FROM normalized
       GROUP BY entity_type, entity_id, type, {dedupe_key_expr}
-    )
+    )"""
+
+
+def _direct_materialize_select_sql(db_schema: str) -> str:
+    """Build the final direct materialization projection."""
+
+    return f"""
     SELECT
         entity_type,
         entity_id,
@@ -6927,6 +7798,30 @@ def _materialize_sql(
         updated_at
       FROM aggregated;
     """
+
+
+def _materialize_sql(
+    db_schema: str,
+    stage_table: str,
+    source_selects: Iterable[str],
+    *,
+    is_address_canon_available: bool = True,
+) -> str:
+    """Build direct source-to-stage materialization SQL."""
+
+    selects_sql = "\nUNION ALL\n".join(select.strip() for select in source_selects)
+    return "".join(
+        (
+            _direct_materialize_header_sql(db_schema, stage_table, selects_sql),
+            _direct_materialize_sanitized_cte_sql(),
+            _direct_materialize_normalized_cte_sql(),
+            _direct_materialize_aggregated_cte_sql(
+                _dedupe_key_expr(is_address_canon_available),
+                _source_record_ids_select_sql(),
+            ),
+            _direct_materialize_select_sql(db_schema),
+        )
+    )
 
 
 def _evidence_group_hash_expr(evidence_shards: int) -> str:
@@ -7186,16 +8081,13 @@ def _load_multi_source_evidence_base_sql(
     )
 
 
-def _insert_multi_source_evidence_shard_sql(
+def _multi_source_evidence_keyed_cte_sql(
     db_schema: str,
-    stage_table: str,
     evidence_table: str,
-    *,
-    evidence_shards: int,
     evidence_shard: int,
 ) -> str:
-    """Build SQL that aggregates one multi-source evidence shard."""
-    del stage_table, evidence_shards
+    """Build the selected evidence-shard key CTE."""
+
     return f"""
     WITH keyed AS MATERIALIZED (
         SELECT
@@ -7212,7 +8104,13 @@ def _insert_multi_source_evidence_shard_sql(
             source_record_ids
           FROM {db_schema}.{evidence_table}
          WHERE evidence_shard = {int(evidence_shard)}
-    ),
+    ),"""
+
+
+def _multi_source_evidence_sources_cte_sql() -> str:
+    """Build the source-evidence aggregation CTE."""
+
+    return """
     source_evidence AS (
         SELECT
             k.entity_type,
@@ -7235,7 +8133,13 @@ def _insert_multi_source_evidence_shard_sql(
             k.state_key,
             k.zip_key,
             k.country_key
-    ),
+    ),"""
+
+
+def _multi_source_evidence_records_cte_sql() -> str:
+    """Build the source-record-evidence aggregation CTE."""
+
+    return """
     record_evidence AS (
         SELECT
             k.entity_type,
@@ -7258,7 +8162,16 @@ def _insert_multi_source_evidence_shard_sql(
             k.state_key,
             k.zip_key,
             k.country_key
-    )
+    )"""
+
+
+def _multi_source_evidence_update_sql(
+    db_schema: str,
+    evidence_table: str,
+) -> str:
+    """Build the evidence-array update from the aggregated CTEs."""
+
+    return f"""
     UPDATE {db_schema}.{evidence_table} AS e
        SET evidence_sources = COALESCE(se.evidence_sources, ARRAY[]::varchar[]),
            evidence_record_ids = COALESCE(re.evidence_record_ids, ARRAY[]::varchar[])
@@ -7283,6 +8196,31 @@ def _insert_multi_source_evidence_shard_sql(
        AND se.country_key IS NOT DISTINCT FROM k.country_key
      WHERE e.location_key = k.location_key;
     """
+
+
+def _insert_multi_source_evidence_shard_sql(
+    db_schema: str,
+    stage_table: str,
+    evidence_table: str,
+    *,
+    evidence_shards: int,
+    evidence_shard: int,
+) -> str:
+    """Build SQL that aggregates one multi-source evidence shard."""
+
+    del stage_table, evidence_shards
+    return "".join(
+        (
+            _multi_source_evidence_keyed_cte_sql(
+                db_schema,
+                evidence_table,
+                evidence_shard,
+            ),
+            _multi_source_evidence_sources_cte_sql(),
+            _multi_source_evidence_records_cte_sql(),
+            _multi_source_evidence_update_sql(db_schema, evidence_table),
+        )
+    )
 
 
 def _index_multi_source_evidence_table_sql(db_schema: str, evidence_table: str) -> str:
@@ -11085,6 +12023,10 @@ async def process_entity_address_unified_data(ctx, task=None):
                     f"HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE requested, "
                     f"but {db_schema}.{stage_table} does not exist"
                 )
+            await _ensure_entity_address_unified_live_columns(
+                db_schema,
+                stage_table,
+            )
             context["stage_reused"] = True
         else:
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_table};")
@@ -11110,6 +12052,7 @@ async def process_entity_address_unified_data(ctx, task=None):
         "provider_enrollment_fqhc",
         "provider_enrollment_ffs_additional_npi",
         "doctor_clinician_address",
+        "geo_zip_lookup",
         "provider_enrollment_ffs",
         "provider_enrollment_ffs_address",
         "facility_anchor",
@@ -11131,12 +12074,40 @@ async def process_entity_address_unified_data(ctx, task=None):
         "address_archive_v2",
         address_alias_sql.ADDRESS_ALIAS_TABLE,
         address_alias_sql.ADDRESS_ALIAS_STATE_TABLE,
+        geo_projection.GEO_ASSURANCE_STATE_TABLE,
     ]
     available_relation_map = {table: await _has_table(db_schema, table) for table in required_checks}
+    if not available_relation_map.get(geo_projection.GEO_ASSURANCE_STATE_TABLE):
+        raise RuntimeError(
+            "entity-address-unified requires migrated geo assurance schema"
+        )
     if not available_relation_map.get(address_alias_sql.ADDRESS_ALIAS_TABLE) or not (
         available_relation_map.get(address_alias_sql.ADDRESS_ALIAS_STATE_TABLE)
     ):
         raise RuntimeError("entity-address-unified requires migrated address alias schema")
+    missing_geo_reference_relations = [
+        f"{db_schema}.{table_name}"
+        for table_name in (
+            "npi_address",
+            "mrf_address",
+            "doctor_clinician_address",
+            "geo_zip_lookup",
+        )
+        if not available_relation_map.get(table_name)
+    ]
+    for relation_schema, table_name in (
+        ("tiger", "zip_state"),
+        ("tiger", "zcta5"),
+    ):
+        if not await _has_table(relation_schema, table_name):
+            missing_geo_reference_relations.append(
+                f"{relation_schema}.{table_name}"
+            )
+    if missing_geo_reference_relations:
+        raise RuntimeError(
+            "entity-address-unified requires geo assurance relations: "
+            f"{', '.join(missing_geo_reference_relations)}"
+        )
     alias_generation = await _address_alias_generation(db_schema)
     alias_base_address_version = f"{ALIAS_BASE_ADDRESS_VERSION_PREFIX}{alias_generation}"
     context["address_alias_generation"] = alias_generation
@@ -12552,22 +13523,6 @@ async def process_entity_address_unified_data(ctx, task=None):
             message="dropping affected Provider Directory groups",
             emit_done=True,
         )
-    if not ctx["context"].get("stage_indexes_prepared"):
-        if run_id:
-            enqueue_live_progress(
-                run_id=run_id,
-                importer="entity-address-unified",
-                status="running",
-                phase="entity-address-unified indexing",
-                unit="run",
-                done=0,
-                total=1,
-                pct=90,
-                message="building indexes",
-            )
-        await _create_stage_indexes(stage_cls, db_schema, context=context)
-        context["stage_indexes_prepared"] = True
-
     if (
         not ctx["context"].get("support_stage_indexes_prepared")
         and not context.get("partial_support_patch_publish")
@@ -12876,6 +13831,43 @@ async def publish_entity_address_unified_generation(ctx):
         emit_done=True,
     )
     context["invalid_coordinate_clear_rows"] = int(invalid_coordinate_clear_rows or 0)
+    context["geo_assurance_stage_index_drop_attempts"] = (
+        await _drop_stage_secondary_indexes(stage_cls, db_schema)
+    )
+    context["stage_indexes_prepared"] = False
+    context["geo_assurance_projected_rows"] = await _materialize_geo_assurance(
+        db_schema,
+        stage_cls.__tablename__,
+        force=bool(context.get("stage_reused")),
+        context=context,
+        run_id=run_id,
+        stage_rows=stage_rows,
+    )
+    compaction_started = time.monotonic()
+    context["geo_assurance_compaction"] = await _compact_geo_assurance_stage(
+        db_schema,
+        stage_cls.__tablename__,
+    )
+    _record_phase_timing(
+        context,
+        "entity-address-unified compacting geo assurance",
+        time.monotonic() - compaction_started,
+        stage_rows,
+    )
+    if run_id:
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="entity-address-unified",
+            status="running",
+            phase="entity-address-unified indexing",
+            unit="run",
+            done=0,
+            total=1,
+            pct=98,
+            message="building indexes on finalized geo assurance",
+        )
+    await _create_stage_indexes(stage_cls, db_schema, context=context)
+    context["stage_indexes_prepared"] = True
     if coordinate_scope_table:
         await _run_sql_phase(
             f"DROP TABLE IF EXISTS {db_schema}.{coordinate_scope_table};",
@@ -13037,6 +14029,12 @@ async def publish_entity_address_unified_generation(ctx):
             ),
             "invalid_coordinate_clear_rows": int(
                 context.get("invalid_coordinate_clear_rows") or 0
+            ),
+            "geo_assurance_projected_rows": int(
+                context.get("geo_assurance_projected_rows") or 0
+            ),
+            "invalid_geo_assurance_rows": int(
+                context.get("invalid_geo_assurance_rows") or 0
             ),
             **_runtime_config_metrics(context),
             "publish_validation": context.get("publish_validation") or {},

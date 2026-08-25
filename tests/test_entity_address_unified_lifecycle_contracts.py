@@ -231,6 +231,70 @@ async def test_partial_refresh_rejects_reusing_a_full_refresh_stage(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_reused_stage_reconciles_current_model_columns(monkeypatch):
+    (
+        sql_events,
+        _progress_events,
+        environment_flag_by_name,
+        _runtime_option_by_name,
+    ) = _configure_materialization_harness(monkeypatch)
+    environment_flag_by_name["HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE"] = True
+    ensure_columns = entity_address._ensure_entity_address_unified_live_columns
+    import_context_by_key = {
+        "import_date": "20260724",
+        "context": {"control_run_id": "run-reused-stage-contract"},
+    }
+
+    await entity_address.process_data(
+        import_context_by_key,
+        {"publish": False, "limit_per_source": 0},
+    )
+
+    ensure_columns.assert_awaited_once_with(
+        "mrf",
+        _StageClass.__tablename__,
+    )
+    assert import_context_by_key["context"]["stage_reused"] is True
+    assert not any(
+        f"DROP TABLE IF EXISTS mrf.{_StageClass.__tablename__};" == statement
+        for statement in sql_events
+    )
+    assert "CREATE_STAGE" not in sql_events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("missing_schema", "missing_table", "message"),
+    (
+        (
+            "mrf",
+            entity_address.geo_projection.GEO_ASSURANCE_STATE_TABLE,
+            "migrated geo assurance schema",
+        ),
+        ("tiger", "zcta5", "geo assurance relations"),
+    ),
+)
+async def test_materialization_preflights_geo_projection_dependencies(
+    monkeypatch,
+    missing_schema,
+    missing_table,
+    message,
+):
+    _configure_materialization_harness(monkeypatch)
+
+    async def is_table_present(schema_name, table_name):
+        return (schema_name, table_name) != (missing_schema, missing_table)
+
+    monkeypatch.setattr(entity_address, "_has_table", is_table_present)
+
+    with pytest.raises(RuntimeError, match=message):
+        await entity_address.process_data(
+            {"import_date": "20260724", "context": {}},
+            {"publish": False, "limit_per_source": 0},
+        )
+
+
+@pytest.mark.asyncio
 async def test_partial_refresh_builds_an_atomic_replacement_stage_without_patching_live_rows(monkeypatch):
     sql_events, _progress_events, _environment_flags, _runtime_options = _configure_materialization_harness(
         monkeypatch

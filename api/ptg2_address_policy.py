@@ -165,6 +165,10 @@ PTG2_UNIFIED_ADDRESS_COLUMNS = PTG2_LEGACY_ADDRESS_COLUMNS | {
     "source_mask",
     "address_source_mask",
     "location_confidence_id",
+    "geo_evidence_source_id",
+    "geo_identity_coherent",
+    "geo_point_coherent",
+    "geo_assurance_version",
 }
 
 PTG_NO_DISPLAY_ADDRESS_FIELDS = {
