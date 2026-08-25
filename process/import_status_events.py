@@ -155,7 +155,20 @@ def _append_pending_event_locked(event: dict[str, Any]) -> None:
             if str(pending.get("run_id") or "").strip() != run_id
         )
     while len(_publisher_state.pending) >= pending_limit:
-        _publisher_state.pending.popleft()
+        progress_event = next(
+            (
+                pending
+                for pending in _publisher_state.pending
+                if str(pending.get("status") or "").strip().lower()
+                not in TERMINAL_STATUSES
+            ),
+            None,
+        )
+        if progress_event is None:
+            if status not in TERMINAL_STATUSES:
+                return
+            break
+        _publisher_state.pending.remove(progress_event)
     _publisher_state.pending.append(event)
 
 

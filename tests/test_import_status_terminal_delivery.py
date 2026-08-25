@@ -101,3 +101,28 @@ async def test_terminal_flush_binds_pending_event(monkeypatch):
     assert [(event["run_id"], event["status"]) for event in posted_events] == [
         ("run-before-bind", "succeeded")
     ]
+
+
+@pytest.mark.asyncio
+async def test_pending_capacity_preserves_terminals_across_runs(monkeypatch):
+    posted_events: list[dict[str, object]] = []
+    monkeypatch.setenv("HLTHPRT_IMPORT_STATUS_EVENT_QUEUE_SIZE", "1")
+    monkeypatch.setattr(status_events, "_status_event_url", lambda: "https://sink.invalid/events")
+    monkeypatch.setattr(status_events, "_post_event", posted_events.append)
+
+    def enqueue_before_bind():
+        status_events.enqueue_status_event({"run_id": "run-a", "status": "succeeded"})
+        status_events.enqueue_status_event({"run_id": "run-b", "status": "failed"})
+        status_events.enqueue_status_event({"run_id": "run-c", "status": "running"})
+
+    thread = threading.Thread(target=enqueue_before_bind)
+    thread.start()
+    thread.join()
+
+    await status_events.flush_terminal_status_event("run-a")
+    await status_events.flush_terminal_status_event("run-b")
+
+    assert sorted((event["run_id"], event["status"]) for event in posted_events) == [
+        ("run-a", "succeeded"),
+        ("run-b", "failed"),
+    ]

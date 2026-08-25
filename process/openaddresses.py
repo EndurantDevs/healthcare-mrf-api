@@ -3122,6 +3122,7 @@ async def execute_openaddresses_import_task(ctx, task=None):  # pragma: no cover
 
 
 process_data = execute_openaddresses_import_task
+process_data.__name__ = "process_data"
 
 
 async def startup(ctx):  # pragma: no cover
@@ -3277,6 +3278,7 @@ async def publish_openaddresses_generation(ctx):  # pragma: no cover
 
 
 shutdown = publish_openaddresses_generation
+shutdown.__name__ = "shutdown"
 
 
 async def main(

@@ -184,6 +184,13 @@ def test_npi_worker_registers_only_the_control_wrapper():
     assert not hasattr(process_cli, "NPI_finish")
 
 
+def test_openaddresses_worker_preserves_legacy_job_name():
+    registered = process_cli.OpenAddresses.functions[0]
+
+    assert registered.name == "process_data"
+    assert registered.coroutine is process_cli.process_openaddresses_data
+
+
 @pytest.mark.parametrize(
     ("command", "target_name", "args", "expected"),
     [

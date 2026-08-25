@@ -1613,6 +1613,7 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
 
 
 process_data = execute_npi_import_attempt
+process_data.__name__ = "process_data"
 
 
 async def startup(ctx):  # pragma: no cover
@@ -2675,6 +2676,7 @@ WHERE
 
 
 shutdown = finalize_npi_import_attempt
+shutdown.__name__ = "shutdown"
 
 
 async def save_npi_data(ctx, task):
