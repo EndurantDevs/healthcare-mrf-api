@@ -24,7 +24,6 @@ from process.ptg_parts.ptg2_v4_finalizer_maps import (
     PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
 )
 from process.ptg_parts.ptg2_v4_snapshot_maps import PTG2_V4_SHARED_GENERATION
-from process.ptg_parts.ptg2_v4_snapshot_maps import PTG2_V4_MAP_FORMAT
 from scripts.research import ptg2_packed_finalizer_abba_artifacts as artifact_factory
 from scripts.research.ptg2_packed_finalizer_abba_contract import BenchmarkArtifacts
 from scripts.research.ptg2_packed_finalizer_abba_lifecycle import (
@@ -276,22 +275,25 @@ async def _assert_api_reads_all_packed_kinds(fixture: _IsolationFixture) -> None
 
 async def _attach_finalizer_manifest(fixture: _IsolationFixture, arm) -> None:
     publication = arm["finalizer_publication"]
-    manifest_by_field = {
-        "contract": publication["contract"],
-        "map_format": PTG2_V4_MAP_FORMAT,
-        "map_digest": publication["map_digest"],
-        "object_kinds": publication["object_kinds"],
-        "object_kind_count": len(publication["object_kinds"]),
-        "map_pack_count": publication["map_pack_count"],
-        "coordinate_count": publication["mapping_count"],
-        "entry_count": publication["entry_count"],
-        "logical_byte_count": publication["logical_byte_count"],
-        "stored_map_byte_count": publication["stored_map_byte_count"],
-        "target_block_count": publication["unique_block_count"],
-        "canonical_mapping_digest": publication["canonical_mapping_digest"],
-        "canonical_byte_count": publication["canonical_byte_count"],
-        "target_identity_digest": publication["target_identity_digest"],
-    }
+    manifest_by_field = finalizer_publish.V4FinalizerMapPublication(
+        object_kinds=tuple(publication["object_kinds"]),
+        mapping_count=publication["mapping_count"],
+        unique_block_count=publication["unique_block_count"],
+        entry_count=publication["entry_count"],
+        logical_byte_count=publication["logical_byte_count"],
+        stored_byte_count=publication["stored_byte_count"],
+        map_pack_count=publication["map_pack_count"],
+        stored_map_byte_count=publication["stored_map_byte_count"],
+        map_digest=bytes.fromhex(publication["map_digest"]),
+        canonical_mapping_digest=bytes.fromhex(
+            publication["canonical_mapping_digest"]
+        ),
+        canonical_byte_count=publication["canonical_byte_count"],
+        target_identity_digest=bytes.fromhex(
+            publication["target_identity_digest"]
+        ),
+        contract=publication["contract"],
+    ).manifest()
     schema = _quote_ident(fixture.schema_name)
     await db.status(
         f"""

@@ -71,13 +71,7 @@ def _sha256(value: Any, label: str) -> str:
 
 
 def _digest_bytes(value: Any, label: str) -> bytes:
-    try:
-        result = bytes.fromhex(_sha256(value, label))
-    except ValueError as exc:
-        raise RuntimeError(f"native packed finalizer {label} is invalid") from exc
-    if len(result) != 32:
-        raise RuntimeError(f"native packed finalizer {label} is invalid")
-    return result
+    return bytes.fromhex(_sha256(value, label))
 
 
 def _mapping(value: Any, label: str) -> dict[str, Any]:

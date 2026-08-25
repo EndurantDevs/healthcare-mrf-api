@@ -8,7 +8,10 @@ from typing import Any, Iterable, Mapping, Sequence
 from sqlalchemy import text
 
 from process.ptg_parts.db_tables import _quote_ident
-from process.ptg_parts.ptg2_shared_blocks import PTG2_V3_SHARED_FORMAT_VERSION
+from process.ptg_parts.ptg2_shared_blocks import (
+    PTG2_V3_SHARED_FORMAT_VERSION,
+    _row_mapping,
+)
 from process.ptg_parts.ptg2_v4_finalizer_map_sql import (
     _MAP_PACK_SQL,
     _ROOT_SELECTION_SQL,
@@ -67,16 +70,6 @@ class FinalizerMapError(RuntimeError):
 
 class FinalizerMapReadLimitError(FinalizerMapError):
     """Raised before packed mapping metadata exceeds its bounded read limit."""
-
-
-def _row_mapping(row: Any) -> dict[str, Any]:
-    mapping = getattr(row, "_mapping", None)
-    if mapping is not None:
-        return dict(mapping)
-    if isinstance(row, Mapping):
-        return dict(row)
-    return dict(row or {})
-
 
 def _first_row(query_result: Any) -> dict[str, Any]:
     first = getattr(query_result, "first", None)
