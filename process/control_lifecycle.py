@@ -23,7 +23,7 @@ from db.models import ImportRun, db
 from process.control_cancel import ImportCancelledError
 from process.import_status_events import (
     bind_status_event_loop,
-    flush_status_events,
+    flush_terminal_status_event,
     isoformat_utc,
 )
 from process.live_progress import (
@@ -308,7 +308,7 @@ async def control_single_job_start(
                 attempt_id=attempt_id,
                 attempt_started_at=started_at if run_id else None,
             )
-            await _flush_terminal_status_events()
+            await _flush_terminal_status_events(run_id)
         finally:
             if live_token is not None:
                 reset_live_progress_context(live_token)
@@ -355,7 +355,7 @@ async def control_single_job_start(
                 attempt_id=attempt_id,
                 attempt_started_at=started_at if run_id else None,
             )
-            await _flush_terminal_status_events()
+            await _flush_terminal_status_events(run_id)
             return {"status": "canceled", "run_id": run_id}
         target_result = committed_result
     except asyncio.CancelledError as exc:
@@ -376,7 +376,7 @@ async def control_single_job_start(
                 attempt_id=attempt_id,
                 attempt_started_at=started_at if run_id else None,
             )
-            await _flush_terminal_status_events()
+            await _flush_terminal_status_events(run_id)
             return {"status": "failed", "run_id": run_id, "error": str(exc)}
         target_result = committed_result
         current_task = asyncio.current_task()
@@ -398,7 +398,7 @@ async def control_single_job_start(
                 attempt_id=attempt_id,
                 attempt_started_at=started_at if run_id else None,
             )
-            await _flush_terminal_status_events()
+            await _flush_terminal_status_events(run_id)
             raise
         target_result = committed_result
     finally:
@@ -757,11 +757,11 @@ def _terminal_metrics_from_context(context: Any) -> dict[str, Any] | None:
     return metrics_by_name or None
 
 
-async def _flush_terminal_status_events() -> None:
-    timeout = float(os.getenv("HLTHPRT_IMPORT_STATUS_EVENT_TERMINAL_FLUSH_SECONDS", "0.25"))
+async def _flush_terminal_status_events(run_id: str) -> None:
+    timeout = float(os.getenv("HLTHPRT_IMPORT_STATUS_EVENT_TERMINAL_FLUSH_SECONDS", "2.25"))
     if timeout <= 0:
         return
-    await flush_status_events(timeout_seconds=timeout)
+    await flush_terminal_status_event(run_id, timeout_seconds=timeout)
 
 
 async def _mark_and_flush_terminal_control_run(
@@ -771,7 +771,7 @@ async def _mark_and_flush_terminal_control_run(
     """Project one terminal state and flush its status event."""
 
     await mark_control_run(run_id, status="succeeded", **mark_by_name)
-    await _flush_terminal_status_events()
+    await _flush_terminal_status_events(run_id)
 
 
 async def _drain_committed_terminal_projection(awaitable: Any) -> None:

@@ -60,7 +60,10 @@ from db.models import (
     db,
 )
 from process.ext.utils import ensure_database, push_objects
-from process.import_status_events import enqueue_status_event, flush_status_events
+from process.import_status_events import (
+    enqueue_status_event,
+    flush_terminal_status_event,
+)
 from process.live_progress import enqueue_live_progress
 from process.mrf_discovery_checkpoints import (
     DatabaseDiscoveryCheckpointStore,
@@ -16527,7 +16530,7 @@ async def _publish_failed_discovery_state(
         finished_at=finished_at,
         triggered_by=failure_context_dict["triggered_by"],
     )
-    await _flush_discovery_control_events()
+    await _flush_discovery_control_events(control_run_id)
 
 
 async def _record_failed_discovery_state(
@@ -16575,13 +16578,13 @@ def _emit_discovery_control_event(
     enqueue_status_event(event_by_field)
 
 
-async def _flush_discovery_control_events() -> None:
+async def _flush_discovery_control_events(control_run_id: str) -> None:
     timeout = float(
         os.getenv("HLTHPRT_MRF_DISCOVERY_CONTROL_EVENT_FLUSH_SECONDS", "1.0")
     )
     if timeout <= 0:
         return
-    await flush_status_events(timeout_seconds=timeout)
+    await flush_terminal_status_event(control_run_id, timeout_seconds=timeout)
 
 
 @dataclass(frozen=True)
@@ -17415,7 +17418,7 @@ async def run_mrf_source_discovery_command(
                 started_at=started_at,
                 finished_at=finished_at,
             )
-            await _flush_discovery_control_events()
+            await _flush_discovery_control_events(control_run_id)
     return discovery_result.as_dict()
 
 

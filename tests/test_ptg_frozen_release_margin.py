@@ -413,7 +413,7 @@ async def test_control_helpers_filter_kwargs_and_terminal_shapes(monkeypatch):
         "HLTHPRT_IMPORT_STATUS_EVENT_TERMINAL_FLUSH_SECONDS",
         "0",
     )
-    await control_lifecycle._flush_terminal_status_events()
+    await control_lifecycle._flush_terminal_status_events("run")
 
 
 @pytest.mark.asyncio

@@ -13804,7 +13804,8 @@ class _DirectDiscoveryHarness:
     async def noop(self, *_args, **_kwargs):
         return None
 
-    async def flush(self, timeout_seconds):
+    async def flush(self, run_id, *, timeout_seconds):
+        assert run_id.startswith("mrfcrawl_")
         self.flush_timeouts.append(timeout_seconds)
 
     async def execute_source_batch(self, **kwargs):
@@ -13854,7 +13855,7 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
         "enqueue_live_progress",
         lambda **payload: harness.progress.append(payload),
     )
-    monkeypatch.setattr(discovery, "flush_status_events", harness.flush)
+    monkeypatch.setattr(discovery, "flush_terminal_status_event", harness.flush)
 
     discovery_summary = await discovery.main(test_mode=True, provider="master-list", limit=1)
 
@@ -13899,7 +13900,7 @@ async def test_direct_discovery_run_closes_visible_state_on_failure(monkeypatch)
     async def fake_push_objects(row_dicts, orm_model, *, rewrite, use_copy):
         push_calls.append((orm_model, row_dicts, rewrite, use_copy))
 
-    def fake_flush(timeout_seconds):
+    def fake_flush(_run_id, *, timeout_seconds):
         flush_timeouts.append(timeout_seconds)
 
     def record_live_progress(**progress_payload):
@@ -13920,7 +13921,7 @@ async def test_direct_discovery_run_closes_visible_state_on_failure(monkeypatch)
         ("_store_candidates", AsyncMock(side_effect=RuntimeError("catalog write failed"))),
         ("enqueue_status_event", control_events.append),
         ("enqueue_live_progress", record_live_progress),
-        ("flush_status_events", AsyncMock(side_effect=fake_flush)),
+        ("flush_terminal_status_event", AsyncMock(side_effect=fake_flush)),
     ]
     for attribute_name, replacement_value in replacements:
         monkeypatch.setattr(discovery, attribute_name, replacement_value)

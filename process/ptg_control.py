@@ -14,7 +14,7 @@ from process.control_lifecycle import (
     _stop_live_progress_heartbeat,
     mark_control_run,
 )
-from process.import_status_events import bind_status_event_loop, flush_status_events
+from process.import_status_events import bind_status_event_loop, flush_terminal_status_event
 from process.live_progress import (
     reset_live_progress_context,
     set_live_progress_context,
@@ -245,7 +245,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
             attempt_id=attempt_id,
             attempt_started_at=attempt_started_at if run_id else None,
         )
-        await _flush_terminal_status_events()
+        await _flush_terminal_status_events(run_id)
         return {"status": "canceled", "run_id": run_id}
     except asyncio.CancelledError as exc:
         failure_metrics_by_name = _build_rebuild_terminal_metrics_by_name(
@@ -266,7 +266,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
             attempt_id=attempt_id,
             attempt_started_at=attempt_started_at if run_id else None,
         )
-        await _flush_terminal_status_events()
+        await _flush_terminal_status_events(run_id)
         raise
     except PTG2FullRebuildFreshnessError as exc:
         freshness_metrics_by_name = _build_rebuild_terminal_metrics_by_name(
@@ -287,7 +287,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
             attempt_id=attempt_id,
             attempt_started_at=attempt_started_at if run_id else None,
         )
-        await _flush_terminal_status_events()
+        await _flush_terminal_status_events(run_id)
         raise
     except Exception as exc:
         failure_metrics_by_name = _build_rebuild_terminal_metrics_by_name(
@@ -319,7 +319,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
             attempt_id=attempt_id,
             attempt_started_at=attempt_started_at if run_id else None,
         )
-        await _flush_terminal_status_events()
+        await _flush_terminal_status_events(run_id)
         raise
     finally:
         _stop_threaded_ptg_heartbeat(heartbeat_stop)
@@ -345,7 +345,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
         attempt_id=attempt_id,
         attempt_started_at=attempt_started_at if run_id else None,
     )
-    await _flush_terminal_status_events()
+    await _flush_terminal_status_events(run_id)
     return {**result_metrics_by_name, "status": "succeeded", "run_id": run_id}
 
 
@@ -390,7 +390,7 @@ async def _reconcile_exact_wave_claim_exception(
         # whether a failed reconciliation committed anything or issue a retry.
         return
     if resolution.status == "rejected":
-        await _flush_terminal_status_events()
+        await _flush_terminal_status_events(run_id)
     return resolution
 
 
@@ -425,14 +425,14 @@ async def _mark_exact_wave_preexecution_failure(
             "retryable": False,
         },
     )
-    await _flush_terminal_status_events()
+    await _flush_terminal_status_events(run_id)
 
 
-async def _flush_terminal_status_events() -> None:
-    timeout = float(os.getenv("HLTHPRT_IMPORT_STATUS_EVENT_TERMINAL_FLUSH_SECONDS", "0.25"))
+async def _flush_terminal_status_events(run_id: str) -> None:
+    timeout = float(os.getenv("HLTHPRT_IMPORT_STATUS_EVENT_TERMINAL_FLUSH_SECONDS", "2.25"))
     if timeout <= 0:
         return
-    await flush_status_events(timeout_seconds=timeout)
+    await flush_terminal_status_event(run_id, timeout_seconds=timeout)
 
 
 def _assert_expected_lane(params: dict[str, Any]) -> None:
