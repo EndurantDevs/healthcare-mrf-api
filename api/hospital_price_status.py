@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import os
 import re
 from collections.abc import Mapping
@@ -70,14 +71,18 @@ def _row_mapping(row: Any) -> Mapping[str, Any]:
     return mapping if isinstance(mapping, Mapping) else {}
 
 
+def _timestamp_text(value: dt.datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
 def _attempt_item(row: Mapping[str, Any]) -> dict[str, Any] | None:
     if not row.get("attempt_id"):
         return None
     return {
         "attempt_id": row["attempt_id"],
         "status": row.get("attempt_status"),
-        "started_at": row.get("started_at"),
-        "finished_at": row.get("finished_at"),
+        "started_at": _timestamp_text(row.get("started_at")),
+        "finished_at": _timestamp_text(row.get("finished_at")),
         "error_code": row.get("error_code"),
     }
 
@@ -88,7 +93,7 @@ def _publication_item(row: Mapping[str, Any]) -> dict[str, Any] | None:
     return {
         "version_id": row["version_id"],
         "generation": row.get("generation"),
-        "last_success_at": row.get("last_success_at"),
+        "last_success_at": _timestamp_text(row.get("last_success_at")),
         "service_count": row.get("service_count"),
         "charge_count": row.get("charge_count"),
         "payer_charge_count": row.get("payer_charge_count"),
