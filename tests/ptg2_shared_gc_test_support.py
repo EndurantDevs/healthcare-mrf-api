@@ -65,6 +65,7 @@ def _patch_v4_abandonment_pipeline(
     pipeline_mock_by_name = {
         "shared_tables": AsyncMock(return_value=True),
         "map_tables": AsyncMock(return_value=True),
+        "finalizer_map_tables": AsyncMock(return_value=True),
         "inventory": AsyncMock(return_value=inventory),
         "queue_batch": AsyncMock(
             side_effect=lambda _connection, **kwargs: len(
@@ -78,36 +79,16 @@ def _patch_v4_abandonment_pipeline(
         ),
         "finalize": AsyncMock(return_value=final_stats),
     }
-    monkeypatch.setattr(
-        shared_gc,
-        "_has_shared_tables",
-        pipeline_mock_by_name["shared_tables"],
-    )
-    monkeypatch.setattr(
-        shared_gc,
-        "_has_v4_map_tables",
-        pipeline_mock_by_name["map_tables"],
-    )
-    monkeypatch.setattr(
-        shared_gc,
-        "_owned_v4_inventory",
-        pipeline_mock_by_name["inventory"],
-    )
-    monkeypatch.setattr(
-        shared_gc,
-        "_queue_owned_v4_candidate_batch",
-        pipeline_mock_by_name["queue_batch"],
-    )
-    monkeypatch.setattr(
-        shared_gc,
-        "_delete_owned_v4_dense_batch",
-        pipeline_mock_by_name["delete_dense"],
-    )
-    monkeypatch.setattr(
-        shared_gc,
-        "_finalize_owned_v4_abandonment",
-        pipeline_mock_by_name["finalize"],
-    )
+    for attribute, mock_name in (
+        ("_has_shared_tables", "shared_tables"),
+        ("_has_v4_map_tables", "map_tables"),
+        ("_has_v4_finalizer_map_tables", "finalizer_map_tables"),
+        ("_owned_v4_inventory", "inventory"),
+        ("_queue_owned_v4_candidate_batch", "queue_batch"),
+        ("_delete_owned_v4_dense_batch", "delete_dense"),
+        ("_finalize_owned_v4_abandonment", "finalize"),
+    ):
+        monkeypatch.setattr(shared_gc, attribute, pipeline_mock_by_name[mock_name])
     return pipeline_mock_by_name
 
 class _SharedGCExecutor:

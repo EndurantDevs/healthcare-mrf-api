@@ -336,6 +336,10 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
     publish_strict_shared_v3_layout,
     validate_reused_snapshot_sources,
 )
+from process.ptg_parts.ptg2_v4_finalizer_maps import (
+    PTG2_V4_FINALIZER_MAP_CONTRACT,
+    PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
+)
 from process.ptg_parts.ptg2_tax_identity_source_binding import (
     bind_tax_source_sidecars,
     build_tax_source_bindings,
@@ -344,6 +348,7 @@ from process.ptg_parts.ptg2_tax_identity_source_validation import (
     validate_reused_tax_identity_source_projection,
 )
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
+    PTG2_V4_MAP_FORMAT,
     PTG2_V4_SHARED_GENERATION,
     reserve_v4_shared_layout,
 )
@@ -5386,6 +5391,7 @@ _SHARED_V3_PHYSICAL_SERVING_INDEX_KEYS = frozenset(
         "audit_sample",
         "source_witness",
         "snapshot_map",
+        "finalizer_mapping",
     }
 )
 
@@ -5452,6 +5458,124 @@ def _validate_reused_v4_contract(serving_index: Mapping[str, Any]) -> None:
         raise RuntimeError(
             "reusable PTG V4 layout is missing its packed graph contract"
         )
+    _validate_reused_v4_finalizer_manifest(serving_index)
+
+
+_V4_FINALIZER_MANIFEST_FIELDS = {
+        "contract",
+        "map_format",
+        "map_digest",
+        "object_kinds",
+        "object_kind_count",
+        "map_pack_count",
+        "coordinate_count",
+        "entry_count",
+        "logical_byte_count",
+        "stored_map_byte_count",
+        "target_block_count",
+        "canonical_mapping_digest",
+        "canonical_byte_count",
+        "target_identity_digest",
+}
+
+
+def _validated_v4_finalizer_manifest_fields(
+    raw_manifest: Any,
+) -> Mapping[str, Any]:
+    """Require one exact versioned finalizer-manifest field set."""
+
+    if (
+        not isinstance(raw_manifest, Mapping)
+        or set(raw_manifest) != _V4_FINALIZER_MANIFEST_FIELDS
+    ):
+        raise RuntimeError(
+            "reusable PTG V4 finalizer mapping contract is incompatible"
+        )
+    return raw_manifest
+
+
+def _is_lower_sha256_text(digest_value: Any) -> bool:
+    return (
+        isinstance(digest_value, str)
+        and len(digest_value) == 64
+        and not any(character not in "0123456789abcdef" for character in digest_value)
+    )
+
+
+def _validate_v4_finalizer_manifest_identity(
+    finalizer_manifest: Mapping[str, Any],
+) -> None:
+    """Validate the packed kind set and every reader-facing digest."""
+
+    digest = finalizer_manifest.get("map_digest")
+    object_kinds = finalizer_manifest.get("object_kinds")
+    if (
+        finalizer_manifest.get("contract") != PTG2_V4_FINALIZER_MAP_CONTRACT
+        or finalizer_manifest.get("map_format") != PTG2_V4_MAP_FORMAT
+        or tuple(object_kinds or ()) != PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS
+        or not _is_lower_sha256_text(digest)
+    ):
+        raise RuntimeError("reusable PTG V4 finalizer mapping contract is incompatible")
+    for field_name in ("canonical_mapping_digest", "target_identity_digest"):
+        if not _is_lower_sha256_text(finalizer_manifest.get(field_name)):
+            raise RuntimeError(
+                "reusable PTG V4 finalizer native receipt is incompatible"
+            )
+
+
+def _validate_reused_v4_finalizer_manifest(
+    serving_index: Mapping[str, Any],
+) -> None:
+    """Accept legacy absence or validate one explicit packed finalizer manifest."""
+
+    if "finalizer_mapping" not in serving_index:
+        return
+    finalizer_manifest = _validated_v4_finalizer_manifest_fields(
+        serving_index.get("finalizer_mapping")
+    )
+    _validate_v4_finalizer_manifest_identity(finalizer_manifest)
+    count_by_name = _validated_v4_finalizer_manifest_counts(
+        finalizer_manifest,
+        _V4_FINALIZER_MANIFEST_FIELDS - {
+            "contract",
+            "map_format",
+            "map_digest",
+            "object_kinds",
+            "canonical_mapping_digest",
+            "target_identity_digest",
+        },
+    )
+    if (
+        count_by_name["object_kind_count"]
+        != len(PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS)
+        or count_by_name["map_pack_count"] < count_by_name["object_kind_count"]
+        or count_by_name["coordinate_count"] < count_by_name["map_pack_count"]
+        or not 0
+        < count_by_name["target_block_count"]
+        <= count_by_name["coordinate_count"]
+        or count_by_name["stored_map_byte_count"] <= 0
+        or count_by_name["canonical_byte_count"] <= 0
+    ):
+        raise RuntimeError("reusable PTG V4 finalizer mapping counts are invalid")
+
+
+def _validated_v4_finalizer_manifest_counts(
+    finalizer_manifest: Mapping[str, Any],
+    summary_field_names: set[str],
+) -> dict[str, int]:
+    """Require exact non-negative integer summaries without bool coercion."""
+
+    count_by_name = {}
+    for field_name in summary_field_names:
+        count_value = finalizer_manifest.get(field_name)
+        if (
+            isinstance(count_value, bool)
+            or not isinstance(count_value, int)
+            or count_value < 0
+        ):
+            raise RuntimeError("reusable PTG V4 finalizer mapping counts are invalid")
+        count_by_name[field_name] = count_value
+    return count_by_name
 
 
 def _validated_reused_source_evidence(
@@ -5994,6 +6118,7 @@ def _shared_v3_publisher_sources(
         source_root / "ptg_parts" / "ptg2_serving_binary_v3_primitives.py",
         source_root / "ptg_parts" / "ptg2_serving_binary_v3_types.py",
         source_root / "ptg_parts" / "ptg2_shared_audit.py",
+        source_root / "ptg_parts" / "ptg2_shared_block_copy.py",
         source_root / "ptg_parts" / "ptg2_shared_blocks.py",
         source_root / "ptg_parts" / "ptg2_shared_finalize.py",
         source_root / "ptg_parts" / "ptg2_shared_graph.py",
@@ -6009,6 +6134,14 @@ def _shared_v3_publisher_sources(
     return publisher_sources + (
         source_root.parent / "api" / "ptg2_code_filters.py",
         source_root / "ptg_parts" / "ptg2_v4_audit.py",
+        source_root / "ptg_parts" / "ptg2_v4_finalizer_map_digest.py",
+        source_root / "ptg_parts" / "ptg2_v4_finalizer_map_sidecars.py",
+        source_root / "ptg_parts" / "ptg2_v4_finalizer_map_sql.py",
+        source_root / "ptg_parts" / "ptg2_v4_finalizer_mapping_receipt.py",
+        source_root / "ptg_parts" / "ptg2_v4_finalizer_mapping_summary.py",
+        source_root / "ptg_parts" / "ptg2_v4_finalizer_maps.py",
+        source_root / "ptg_parts" / "ptg2_v4_finalizer_native.py",
+        source_root / "ptg_parts" / "ptg2_v4_finalizer_publish.py",
         source_root / "ptg_parts" / "ptg2_v4_graph_compiler.py",
         source_root / "ptg_parts" / "ptg2_v4_snapshot_maps.py",
         source_root / "ptg_parts" / "ptg2_v4_taxonomy_candidates.py",

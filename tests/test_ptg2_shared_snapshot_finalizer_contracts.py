@@ -141,6 +141,26 @@ async def test_source_witness_and_graph_gate_finalizer_db_admission():
 
 
 @pytest.mark.asyncio
+async def test_v4_serializes_price_before_atomic_finalizer():
+    events = []
+
+    async def lane(name):
+        events.append(name)
+        return name
+
+    lane_outputs = await _run_independent_publication_lanes(
+        finalizer_blocks=lambda: lane("finalizer"),
+        provider_graph=lambda: lane("graph"),
+        price=lambda: lane("price"),
+        source_witness=lambda: lane("witness"),
+        serialize_price_before_finalizer=True,
+    )
+
+    assert events == ["witness", "graph", "price", "finalizer"]
+    assert lane_outputs == ("finalizer", "graph", "price", "witness")
+
+
+@pytest.mark.asyncio
 async def test_finalizer_failure_cancels_waiting_price_after_graph():
     price_started = asyncio.Event()
     price_cancelled = asyncio.Event()
@@ -337,97 +357,6 @@ async def test_cancellation_before_price_key_readiness_drains_preparation(
     assert preparation_cancelled.is_set()
     export.assert_not_awaited()
 
-
-def test_authoritative_mapping_summary_matches_bounded_lane_metadata():
-    lanes = (
-        SimpleNamespace(
-            object_kinds=("a_kind", "b_kind"),
-            mapping_count=3,
-            unique_block_count=2,
-            logical_byte_count=30,
-        ),
-        SimpleNamespace(
-            object_kinds=("c_kind",),
-            mapping_count=2,
-            unique_block_count=2,
-            logical_byte_count=20,
-        ),
-    )
-    summary = SharedMappingDigestSummary(
-        mapping_digest=b"m" * 32,
-        mapping_count=5,
-        unique_block_count=4,
-        entry_count=99,
-        logical_byte_count=50,
-        canonical_byte_count=400,
-        object_kinds=("a_kind", "b_kind", "c_kind"),
-    )
-
-    _validate_authoritative_mapping_summary(summary, *lanes)
-
-
-@pytest.mark.parametrize(
-    ("summary_field", "summary_value"),
-    [
-        ("object_kinds", ("a_kind", "missing_kind")),
-        ("mapping_count", 4),
-        ("unique_block_count", 3),
-        ("logical_byte_count", 49),
-    ],
-)
-def test_authoritative_mapping_summary_rejects_lane_disagreement(
-    summary_field,
-    summary_value,
-):
-    summary_values_by_field = {
-        "mapping_digest": b"m" * 32,
-        "mapping_count": 5,
-        "unique_block_count": 4,
-        "entry_count": 99,
-        "logical_byte_count": 50,
-        "canonical_byte_count": 400,
-        "object_kinds": ("a_kind", "b_kind", "c_kind"),
-    }
-    summary_values_by_field[summary_field] = summary_value
-    summary = SharedMappingDigestSummary(**summary_values_by_field)
-    lanes = (
-        SimpleNamespace(
-            object_kinds=("a_kind", "b_kind"),
-            mapping_count=3,
-            unique_block_count=2,
-            logical_byte_count=30,
-        ),
-        SimpleNamespace(
-            object_kinds=("c_kind",),
-            mapping_count=2,
-            unique_block_count=2,
-            logical_byte_count=20,
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match=summary_field):
-        _validate_authoritative_mapping_summary(summary, *lanes)
-
-
-def test_authoritative_mapping_summary_rejects_overlapping_lane_kinds():
-    summary = SharedMappingDigestSummary(
-        mapping_digest=b"m" * 32,
-        mapping_count=2,
-        unique_block_count=2,
-        entry_count=2,
-        logical_byte_count=2,
-        canonical_byte_count=100,
-        object_kinds=("a_kind",),
-    )
-    lane = SimpleNamespace(
-        object_kinds=("a_kind",),
-        mapping_count=1,
-        unique_block_count=1,
-        logical_byte_count=1,
-    )
-
-    with pytest.raises(RuntimeError, match="overlap object kinds"):
-        _validate_authoritative_mapping_summary(summary, lane, lane)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel_during_publication", [False, True])

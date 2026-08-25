@@ -9,7 +9,7 @@ import hashlib
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable, Sequence
 
 from db.connection import db
@@ -28,6 +28,11 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_SHARED_GENERATION,
     decode_v4_snapshot_map_pack,
     v4_layout_advisory_lock_key,
+)
+from process.ptg_parts.ptg2_v4_finalizer_maps import (
+    PTG2_V4_FINALIZER_MAP_PACK_TABLE,
+    PTG2_V4_FINALIZER_MAP_ROOT_TABLE,
+    PTG2_V4_FINALIZER_MAP_TARGET_TABLE,
 )
 
 
@@ -56,6 +61,11 @@ PTG2_V4_ABANDONMENT_TOKEN_DOMAIN = b"PTG2V4ABANDON\x01"
 PTG2_V4_GC_TABLE_NAMES = (
     "ptg2_v4_snapshot_map_root",
     "ptg2_v4_snapshot_map_pack",
+)
+PTG2_V4_FINALIZER_GC_TABLE_NAMES = (
+    PTG2_V4_FINALIZER_MAP_ROOT_TABLE,
+    PTG2_V4_FINALIZER_MAP_PACK_TABLE,
+    PTG2_V4_FINALIZER_MAP_TARGET_TABLE,
 )
 PTG2_PROVIDER_TAX_IDENTITY_BASE_TABLE_NAMES = (
     "ptg2_provider_tax_identity_legacy_layout",
@@ -141,6 +151,7 @@ class _OwnedV4AbandonmentContext:
     statement_timeout_seconds: float
     monotonic: Callable[[], float]
     grace_seconds: int
+    finalizer_tables_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -149,6 +160,7 @@ class _OwnedV4AbandonmentInventory:
     stored_bytes: int
     abandonment_token: str
     build_pin_token: str | None = None
+    finalizer_tables_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -515,7 +527,35 @@ async def _has_provider_tax_identity_tables(
 
 
 async def _has_v4_map_tables(executor: Any, schema_name: str) -> bool:
-    """Return whether the additive V4 map migration is fully installed."""
+    """Return whether the base V4 map migration is fully installed."""
+
+    return await _has_complete_v4_table_group(
+        executor,
+        schema_name,
+        table_names=PTG2_V4_GC_TABLE_NAMES,
+        label="map",
+    )
+
+
+async def _has_v4_finalizer_map_tables(executor: Any, schema_name: str) -> bool:
+    """Return whether the additive V4 finalizer-map extension is installed."""
+
+    return await _has_complete_v4_table_group(
+        executor,
+        schema_name,
+        table_names=PTG2_V4_FINALIZER_GC_TABLE_NAMES,
+        label="finalizer map",
+    )
+
+
+async def _has_complete_v4_table_group(
+    executor: Any,
+    schema_name: str,
+    *,
+    table_names: Sequence[str],
+    label: str,
+) -> bool:
+    """Accept one complete additive table group or its clean absence."""
 
     table_records = await executor.all(
         """
@@ -525,19 +565,19 @@ async def _has_v4_map_tables(executor: Any, schema_name: str) -> bool:
            AND table_name = ANY(CAST(:table_names AS text[]))
         """,
         schema_name=schema_name,
-        table_names=list(PTG2_V4_GC_TABLE_NAMES),
+        table_names=list(table_names),
     )
     present_names = {
-        str(_row_mapping(record).get("table_name") or "")
-        for record in table_records
-        if _row_mapping(record).get("table_name")
+        str(_row_mapping(table_record).get("table_name") or "")
+        for table_record in table_records
+        if _row_mapping(table_record).get("table_name")
     }
-    expected_names = set(PTG2_V4_GC_TABLE_NAMES)
+    expected_names = set(table_names)
     installed_names = expected_names & present_names
     if installed_names and installed_names != expected_names:
         missing = ", ".join(sorted(expected_names - present_names))
         raise RuntimeError(
-            "PTG V4 map GC requires the complete additive schema; "
+            f"PTG V4 {label} GC requires the complete additive schema; "
             f"missing tables: {missing}; run alembic upgrade head"
         )
     return installed_names == expected_names
@@ -691,6 +731,68 @@ def _v4_map_pack_hashes(
     }
 
 
+async def _v4_finalizer_candidate_hashes(
+    executor: Any,
+    *,
+    schema_name: str,
+    candidate_hashes: set[bytes],
+    snapshot_keys: Sequence[int] | None,
+) -> set[bytes]:
+    """Resolve a bounded candidate set against explicit finalizer anchors."""
+
+    if not candidate_hashes:
+        return set()
+    schema = _quote_ident(schema_name)
+    hash_records = await executor.all(
+        f"""
+        WITH referenced AS (
+            SELECT pack.map_block_hash AS block_hash
+              FROM {schema}.{_quote_ident(PTG2_V4_FINALIZER_MAP_PACK_TABLE)} AS pack
+              JOIN {schema}.{_quote_ident(PTG2_V4_FINALIZER_MAP_ROOT_TABLE)} AS root
+                ON root.snapshot_key = pack.snapshot_key
+              JOIN {schema}.ptg2_v3_snapshot_layout AS layout
+                ON layout.snapshot_key = pack.snapshot_key
+             WHERE root.state IN ('building', 'complete')
+               AND layout.generation = :v4_generation
+               AND (
+                    NOT :restrict_snapshot_keys
+                    OR pack.snapshot_key = ANY(CAST(:snapshot_keys AS bigint[]))
+               )
+            UNION
+            SELECT target.block_hash
+              FROM {schema}.{_quote_ident(PTG2_V4_FINALIZER_MAP_TARGET_TABLE)} AS target
+              JOIN {schema}.{_quote_ident(PTG2_V4_FINALIZER_MAP_ROOT_TABLE)} AS root
+                ON root.snapshot_key = target.snapshot_key
+              JOIN {schema}.ptg2_v3_snapshot_layout AS layout
+                ON layout.snapshot_key = target.snapshot_key
+             WHERE root.state IN ('building', 'complete')
+               AND layout.generation = :v4_generation
+               AND (
+                    NOT :restrict_snapshot_keys
+                    OR target.snapshot_key = ANY(CAST(:snapshot_keys AS bigint[]))
+               )
+        )
+        SELECT referenced.block_hash
+          FROM referenced
+         WHERE referenced.block_hash = ANY(CAST(:candidate_hashes AS bytea[]))
+         ORDER BY referenced.block_hash
+        """,
+        v4_generation=PTG2_V4_SHARED_GENERATION,
+        restrict_snapshot_keys=snapshot_keys is not None,
+        snapshot_keys=[int(snapshot_key) for snapshot_key in (snapshot_keys or ())],
+        candidate_hashes=sorted(candidate_hashes),
+    )
+    reachable_hashes = {
+        bytes(_row_mapping(hash_record).get("block_hash") or b"")
+        for hash_record in hash_records
+    }
+    if any(len(block_hash) != 32 for block_hash in reachable_hashes) or not (
+        reachable_hashes <= candidate_hashes
+    ):
+        raise RuntimeError("PTG V4 GC finalizer reachability is invalid")
+    return reachable_hashes
+
+
 async def _v4_reachable_hashes(
     executor: Any,
     *,
@@ -702,7 +804,13 @@ async def _v4_reachable_hashes(
 
     if snapshot_keys is not None and not snapshot_keys:
         return set()
-    if not await _has_v4_map_tables(executor, schema_name):
+    v4_tables_available = await _has_v4_map_tables(executor, schema_name)
+    finalizer_tables_available = await _has_v4_finalizer_map_tables(
+        executor, schema_name
+    )
+    if finalizer_tables_available and not v4_tables_available:
+        raise RuntimeError("PTG V4 finalizer map GC requires base V4 map tables")
+    if not v4_tables_available:
         return set()
     candidate_filter = (
         {bytes(block_hash) for block_hash in candidate_hashes}
@@ -735,7 +843,42 @@ async def _v4_reachable_hashes(
                     return reachable_hashes
         if len(map_pack_records) < PTG2_V4_GC_MAP_PACK_BATCH_ROWS:
             break
+    await _include_v4_finalizer_hashes(
+        executor,
+        schema_name=schema_name,
+        snapshot_keys=snapshot_keys,
+        candidate_filter=candidate_filter,
+        reachable_hashes=reachable_hashes,
+        finalizer_tables_available=finalizer_tables_available,
+    )
     return reachable_hashes
+
+
+async def _include_v4_finalizer_hashes(
+    executor: Any,
+    *,
+    schema_name: str,
+    snapshot_keys: Sequence[int] | None,
+    candidate_filter: set[bytes] | None,
+    reachable_hashes: set[bytes],
+    finalizer_tables_available: bool,
+) -> None:
+    """Add finalizer-map targets not already found in base V4 packs."""
+
+    if (
+        not finalizer_tables_available
+        or candidate_filter is None
+        or reachable_hashes == candidate_filter
+    ):
+        return
+    reachable_hashes.update(
+        await _v4_finalizer_candidate_hashes(
+            executor,
+            schema_name=schema_name,
+            candidate_hashes=candidate_filter - reachable_hashes,
+            snapshot_keys=snapshot_keys,
+        )
+    )
 
 
 async def _owned_v4_layout_fingerprint(
@@ -781,14 +924,14 @@ async def _owned_v4_layout_fingerprint(
     return fingerprint
 
 
-def _owned_v4_layout_lock_sql(schema: str) -> str:
-    return f"""
+_OWNED_V4_LAYOUT_LOCK_SQL_TEMPLATE = """
         SELECT layout.snapshot_key, layout.build_token,
                (
                    SELECT root.state
                      FROM {schema}.ptg2_v4_snapshot_map_root AS root
                     WHERE root.snapshot_key = layout.snapshot_key
                ) AS root_state,
+{finalizer_root_state_sql}
                EXISTS (
                    SELECT 1
                      FROM {schema}.ptg2_v3_snapshot_binding AS binding
@@ -832,6 +975,28 @@ def _owned_v4_layout_lock_sql(schema: str) -> str:
            ) = 1
          FOR UPDATE OF layout
     """
+
+
+def _owned_v4_layout_lock_sql(
+    schema: str, *, finalizer_tables_available: bool = True
+) -> str:
+    """Build the ownership lock query for the installed V4 table set."""
+
+    finalizer_root_state_sql = (
+        """
+               (
+                   SELECT root.state
+                     FROM {schema}.ptg2_v4_finalizer_map_root AS root
+                    WHERE root.snapshot_key = layout.snapshot_key
+               ) AS finalizer_root_state,
+        """
+        if finalizer_tables_available
+        else "               NULL::text AS finalizer_root_state,\n"
+    )
+    return _OWNED_V4_LAYOUT_LOCK_SQL_TEMPLATE.format(
+        schema=schema,
+        finalizer_root_state_sql=finalizer_root_state_sql.format(schema=schema),
+    )
 
 
 def _owned_v4_abandonment_token(build_token: str) -> str:
@@ -885,6 +1050,7 @@ async def _is_owned_v4_layout_locked(
     snapshot_key: int,
     build_token: str,
     claim_abandonment: bool = False,
+    finalizer_tables_available: bool = True,
 ) -> bool:
     """Fence an exact unpublished V4 build against reservation and publication."""
 
@@ -902,7 +1068,10 @@ async def _is_owned_v4_layout_locked(
     )
     schema = _quote_ident(schema_name)
     owner_rows = await executor.all(
-        _owned_v4_layout_lock_sql(schema),
+        _owned_v4_layout_lock_sql(
+            schema,
+            finalizer_tables_available=finalizer_tables_available,
+        ),
         semantic_fingerprint=fingerprint,
         snapshot_key=int(snapshot_key),
         generation=PTG2_V4_SHARED_GENERATION,
@@ -919,6 +1088,8 @@ async def _is_owned_v4_layout_locked(
         raise RuntimeError("refusing to abandon a bound PTG V4 layout")
     if owner.get("root_state") not in (None, "building"):
         raise RuntimeError("refusing to abandon a completed PTG V4 map root")
+    if owner.get("finalizer_root_state") not in (None, "building", "complete"):
+        raise RuntimeError("refusing to abandon an invalid PTG V4 finalizer map root")
     if not claim_abandonment:
         return True
     await _claim_owned_v4_abandonment(
@@ -932,12 +1103,46 @@ async def _is_owned_v4_layout_locked(
     return True
 
 
+_ADDITIONAL_V4_LAYOUT_STATS_SQL = """
+    WITH requested AS MATERIALIZED (
+        SELECT DISTINCT unnest(CAST(:block_hashes AS bytea[])) AS block_hash
+    ),
+    directly_mapped AS MATERIALIZED (
+        SELECT mapping.block_hash
+          FROM {schema}.ptg2_v3_snapshot_block AS mapping
+         WHERE mapping.snapshot_key = ANY(CAST(:snapshot_keys AS bigint[]))
+        {finalizer_mapping_unions}
+    )
+    SELECT COUNT(*)::bigint AS requested_count,
+           COUNT(block.block_hash)::bigint AS resolved_count,
+           COUNT(*) FILTER (
+               WHERE block.block_hash IS NOT NULL
+                 AND NOT EXISTS (
+                     SELECT 1
+                       FROM directly_mapped AS mapping
+                      WHERE mapping.block_hash = requested.block_hash
+                 )
+           )::bigint AS additional_count,
+           COALESCE(SUM(block.stored_byte_count) FILTER (
+               WHERE NOT EXISTS (
+                     SELECT 1
+                       FROM directly_mapped AS mapping
+                      WHERE mapping.block_hash = requested.block_hash
+               )
+           ), 0)::bigint AS additional_stored_bytes
+      FROM requested
+      LEFT JOIN {schema}.ptg2_v3_block AS block
+        ON block.block_hash = requested.block_hash
+"""
+
+
 async def _additional_v4_layout_stats(
     executor: Any,
     *,
     schema_name: str,
     snapshot_keys: Sequence[int],
     v4_hashes: Iterable[bytes],
+    finalizer_tables_available: bool = True,
 ) -> PTG2SharedLayoutGCStats:
     """Count V4 hashes not already represented by selected V3 mappings."""
 
@@ -945,38 +1150,25 @@ async def _additional_v4_layout_stats(
     if not normalized_hashes:
         return PTG2SharedLayoutGCStats()
     schema = _quote_ident(schema_name)
-    stat_rows = await executor.all(
+    finalizer_mapping_unions = (
         f"""
-        WITH requested AS MATERIALIZED (
-            SELECT DISTINCT unnest(CAST(:block_hashes AS bytea[])) AS block_hash
-        )
-        SELECT COUNT(*)::bigint AS requested_count,
-               COUNT(block.block_hash)::bigint AS resolved_count,
-               COUNT(*) FILTER (
-                   WHERE block.block_hash IS NOT NULL
-                     AND NOT EXISTS (
-                         SELECT 1
-                           FROM {schema}.ptg2_v3_snapshot_block AS mapping
-                          WHERE mapping.snapshot_key = ANY(
-                                    CAST(:snapshot_keys AS bigint[])
-                                )
-                            AND mapping.block_hash = requested.block_hash
-                     )
-               )::bigint AS additional_count,
-               COALESCE(SUM(block.stored_byte_count) FILTER (
-                   WHERE NOT EXISTS (
-                         SELECT 1
-                           FROM {schema}.ptg2_v3_snapshot_block AS mapping
-                          WHERE mapping.snapshot_key = ANY(
-                                    CAST(:snapshot_keys AS bigint[])
-                                )
-                            AND mapping.block_hash = requested.block_hash
-                   )
-               ), 0)::bigint AS additional_stored_bytes
-          FROM requested
-          LEFT JOIN {schema}.ptg2_v3_block AS block
-            ON block.block_hash = requested.block_hash
-        """,
+        UNION
+        SELECT pack.map_block_hash
+          FROM {schema}.ptg2_v4_finalizer_map_pack AS pack
+         WHERE pack.snapshot_key = ANY(CAST(:snapshot_keys AS bigint[]))
+        UNION
+        SELECT target.block_hash
+          FROM {schema}.ptg2_v4_finalizer_map_target AS target
+         WHERE target.snapshot_key = ANY(CAST(:snapshot_keys AS bigint[]))
+        """
+        if finalizer_tables_available
+        else ""
+    )
+    stat_rows = await executor.all(
+        _ADDITIONAL_V4_LAYOUT_STATS_SQL.format(
+            schema=schema,
+            finalizer_mapping_unions=finalizer_mapping_unions,
+        ),
         block_hashes=normalized_hashes,
         snapshot_keys=[int(snapshot_key) for snapshot_key in snapshot_keys],
     )
@@ -1040,6 +1232,7 @@ _LAYOUT_PLAN_SQL_TEMPLATE = """
               FROM {schema}.ptg2_v3_snapshot_block AS mapping
               JOIN eligible_layouts AS layout
                 ON layout.snapshot_key = mapping.snapshot_key
+            {finalizer_mapping_unions}
         )
         SELECT (SELECT COUNT(*) FROM eligible_layouts) AS logical_layout_count,
                ARRAY(
@@ -1055,10 +1248,33 @@ _LAYOUT_PLAN_SQL_TEMPLATE = """
 """
 
 
-def _layout_plan_sql(schema_name: str) -> str:
+def _finalizer_mapping_unions(schema: str, layout_cte: str) -> str:
+    return f"""
+            UNION
+            SELECT pack.map_block_hash
+              FROM {schema}.{_quote_ident(PTG2_V4_FINALIZER_MAP_PACK_TABLE)} AS pack
+              JOIN {layout_cte} AS layout ON layout.snapshot_key = pack.snapshot_key
+            UNION
+            SELECT target.block_hash
+              FROM {schema}.{_quote_ident(PTG2_V4_FINALIZER_MAP_TARGET_TABLE)} AS target
+              JOIN {layout_cte} AS layout ON layout.snapshot_key = target.snapshot_key
+    """
+
+
+def _layout_plan_sql(
+    schema_name: str, *, finalizer_tables_available: bool = True
+) -> str:
     """Return bounded read-only SQL for eligible shared-layout accounting."""
 
-    return _LAYOUT_PLAN_SQL_TEMPLATE.format(schema=_quote_ident(schema_name))
+    schema = _quote_ident(schema_name)
+    return _LAYOUT_PLAN_SQL_TEMPLATE.format(
+        schema=schema,
+        finalizer_mapping_unions=(
+            _finalizer_mapping_unions(schema, "eligible_layouts")
+            if finalizer_tables_available
+            else ""
+        ),
+    )
 
 
 async def _build_layout_release_plan_ready(
@@ -1069,8 +1285,17 @@ async def _build_layout_release_plan_ready(
     building_max_age_seconds: int,
     layout_limit: int | None,
 ) -> PTG2SharedLayoutGCStats:
+    v4_tables_available = await _has_v4_map_tables(executor, schema_name)
+    finalizer_tables_available = await _has_v4_finalizer_map_tables(
+        executor, schema_name
+    )
+    if finalizer_tables_available and not v4_tables_available:
+        raise RuntimeError("PTG V4 finalizer map GC requires base V4 map tables")
     aggregate_records = await executor.all(
-        _layout_plan_sql(schema_name),
+        _layout_plan_sql(
+            schema_name,
+            finalizer_tables_available=finalizer_tables_available,
+        ),
         cleanup_generations=list(PTG2_V3_CLEANUP_GENERATIONS),
         removing_snapshot_ids=list(
             dict.fromkeys(str(snapshot_id) for snapshot_id in removing_snapshot_ids)
@@ -1083,16 +1308,21 @@ async def _build_layout_release_plan_ready(
         int(layout_key)
         for layout_key in (aggregate_record.get("eligible_layout_keys") or ())
     )
-    v4_hashes = await _v4_reachable_hashes(
-        executor,
-        schema_name=schema_name,
-        snapshot_keys=eligible_layout_keys,
+    v4_hashes = (
+        await _v4_reachable_hashes(
+            executor,
+            schema_name=schema_name,
+            snapshot_keys=eligible_layout_keys,
+        )
+        if v4_tables_available
+        else set()
     )
     v4_stats = await _additional_v4_layout_stats(
         executor,
         schema_name=schema_name,
         snapshot_keys=eligible_layout_keys,
         v4_hashes=v4_hashes,
+        finalizer_tables_available=finalizer_tables_available,
     )
     return PTG2SharedLayoutGCStats(
         logical_layout_count=int(aggregate_record.get("logical_layout_count") or 0),
@@ -1294,6 +1524,7 @@ _RELEASE_LAYOUTS_SQL_TEMPLATE = """
               FROM {schema}.ptg2_v3_snapshot_block AS mapping
               JOIN layout_batch AS layout
                 ON layout.snapshot_key = mapping.snapshot_key
+            {finalizer_mapping_unions}
             UNION
             SELECT DISTINCT v4_hash.block_hash
               FROM unnest(CAST(:v4_block_hashes AS bytea[]))
@@ -1340,7 +1571,9 @@ _RELEASE_LAYOUTS_SQL_TEMPLATE = """
 """
 
 
-def _release_layouts_sql(schema_name: str) -> str:
+def _release_layouts_sql(
+    schema_name: str, *, finalizer_tables_available: bool = True
+) -> str:
     """Build guarded SQL that queues block GC and deletes unbound layouts."""
 
     schema = _quote_ident(schema_name)
@@ -1351,6 +1584,11 @@ def _release_layouts_sql(schema_name: str) -> str:
     ) = _dense_layout_delete_fragments(schema)
     return _RELEASE_LAYOUTS_SQL_TEMPLATE.format(
         schema=schema,
+        finalizer_mapping_unions=(
+            _finalizer_mapping_unions(schema, "layout_batch")
+            if finalizer_tables_available
+            else ""
+        ),
         dense_delete_sql=dense_delete_sql,
         dense_dependency_sql=dense_dependency_sql,
         dense_empty_guard_sql=dense_empty_guard_sql,
@@ -1415,17 +1653,35 @@ async def _owned_v4_mapping_hashes(
     """Read exact mapping hashes in deterministic bounded keyset batches."""
 
     schema = _quote_ident(context.schema_name)
+    finalizer_mapping_unions = (
+        f"""
+                    UNION
+                    SELECT pack.map_block_hash
+                      FROM {schema}.ptg2_v4_finalizer_map_pack AS pack
+                     WHERE pack.snapshot_key = :snapshot_key
+                    UNION
+                    SELECT target.block_hash
+                      FROM {schema}.ptg2_v4_finalizer_map_target AS target
+                     WHERE target.snapshot_key = :snapshot_key
+        """
+        if context.finalizer_tables_available
+        else ""
+    )
     block_hashes: set[bytes] = set()
     last_hash = b""
     while True:
         _v4_abandonment_remaining_seconds(context.deadline, context.monotonic)
         mapping_records = await executor.all(
             f"""
-            SELECT DISTINCT mapping.block_hash
-              FROM {schema}.ptg2_v3_snapshot_block AS mapping
-             WHERE mapping.snapshot_key = :snapshot_key
-               AND mapping.block_hash > :last_hash
-            ORDER BY mapping.block_hash
+            SELECT owned.block_hash
+              FROM (
+                    SELECT mapping.block_hash
+                      FROM {schema}.ptg2_v3_snapshot_block AS mapping
+                     WHERE mapping.snapshot_key = :snapshot_key
+                    {finalizer_mapping_unions}
+              ) AS owned
+             WHERE owned.block_hash > :last_hash
+            ORDER BY owned.block_hash
              LIMIT :batch_rows
             """,
             snapshot_key=context.snapshot_key,
@@ -1537,6 +1793,7 @@ async def _owned_v4_inventory(
         snapshot_key=context.snapshot_key,
         build_token=context.build_token,
         claim_abandonment=True,
+        finalizer_tables_available=context.finalizer_tables_available,
     ):
         return None
     block_hashes = await _owned_v4_mapping_hashes(
@@ -1563,6 +1820,7 @@ async def _owned_v4_inventory(
             executor,
             context=context,
         ),
+        finalizer_tables_available=context.finalizer_tables_available,
     )
 
 
@@ -1586,6 +1844,7 @@ async def _queue_owned_v4_candidate_batch(
         snapshot_key=context.snapshot_key,
         build_token=context.build_token,
         claim_abandonment=True,
+        finalizer_tables_available=context.finalizer_tables_available,
     ):
         raise RuntimeError("owned PTG V4 layout changed during abandonment")
     schema = _quote_ident(context.schema_name)
@@ -1643,6 +1902,7 @@ async def _delete_owned_v4_dense_batch(
         snapshot_key=context.snapshot_key,
         build_token=context.build_token,
         claim_abandonment=True,
+        finalizer_tables_available=context.finalizer_tables_available,
     ):
         raise RuntimeError("owned PTG V4 layout changed during abandonment")
     schema = _quote_ident(context.schema_name)
@@ -1747,6 +2007,7 @@ async def _delete_v4_pin_batch(
         snapshot_key=context.snapshot_key,
         build_token=context.build_token,
         claim_abandonment=True,
+        finalizer_tables_available=context.finalizer_tables_available,
     ):
         raise RuntimeError("owned PTG V4 layout changed during abandonment")
     if _owned_v4_abandonment_token(build_pin_token) != _owned_v4_abandonment_token(
@@ -1908,6 +2169,7 @@ async def _finalize_owned_v4_abandonment(
         snapshot_key=context.snapshot_key,
         build_token=context.build_token,
         claim_abandonment=True,
+        finalizer_tables_available=context.finalizer_tables_available,
     ):
         raise RuntimeError("owned PTG V4 layout changed during abandonment")
     if (
@@ -1997,7 +2259,16 @@ async def _checked_owned_v4_inventory(
         raise RuntimeError("owned PTG V4 abandonment requires shared tables")
     if not await _has_v4_map_tables(connection, context.schema_name):
         raise RuntimeError("owned PTG V4 abandonment requires V4 map tables")
-    return await _owned_v4_inventory(connection, context=context)
+    finalizer_tables_available = await _has_v4_finalizer_map_tables(
+        connection, context.schema_name
+    )
+    return await _owned_v4_inventory(
+        connection,
+        context=replace(
+            context,
+            finalizer_tables_available=finalizer_tables_available,
+        ),
+    )
 
 
 async def _run_owned_v4_step(
@@ -2144,6 +2415,10 @@ async def _execute_owned_v4_abandonment(
     )
     if inventory is None:
         return PTG2SharedLayoutGCStats()
+    context = replace(
+        context,
+        finalizer_tables_available=inventory.finalizer_tables_available,
+    )
     await _queue_owned_v4_candidates(
         context=context,
         inventory=inventory,
@@ -2240,13 +2515,26 @@ async def _release_layouts_ready(
     ]
     if not layout_keys:
         return PTG2SharedLayoutGCStats()
-    v4_block_hashes = await _v4_reachable_hashes(
-        executor,
-        schema_name=schema_name,
-        snapshot_keys=layout_keys,
+    v4_tables_available = await _has_v4_map_tables(executor, schema_name)
+    finalizer_tables_available = await _has_v4_finalizer_map_tables(
+        executor, schema_name
+    )
+    if finalizer_tables_available and not v4_tables_available:
+        raise RuntimeError("PTG V4 finalizer map GC requires base V4 map tables")
+    v4_block_hashes = (
+        await _v4_reachable_hashes(
+            executor,
+            schema_name=schema_name,
+            snapshot_keys=layout_keys,
+        )
+        if v4_tables_available
+        else set()
     )
     aggregate_records = await executor.all(
-        _release_layouts_sql(schema_name),
+        _release_layouts_sql(
+            schema_name,
+            finalizer_tables_available=finalizer_tables_available,
+        ),
         layout_keys=layout_keys,
         cleanup_generations=list(PTG2_V3_CLEANUP_GENERATIONS),
         building_max_age_seconds=building_max_age_seconds,
@@ -2432,6 +2720,7 @@ def _delete_blocks_sql(
     schema_name: str,
     *,
     v4_tables_available: bool,
+    finalizer_tables_available: bool,
 ) -> str:
     schema = _quote_ident(schema_name)
     v4_guard = (
@@ -2443,6 +2732,22 @@ def _delete_blocks_sql(
            )
         """
         if v4_tables_available
+        else ""
+    )
+    finalizer_guard = (
+        f"""
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM {schema}.ptg2_v4_finalizer_map_pack AS finalizer_pack
+                 WHERE finalizer_pack.map_block_hash = block.block_hash
+           )
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM {schema}.ptg2_v4_finalizer_map_target AS finalizer_target
+                 WHERE finalizer_target.block_hash = block.block_hash
+           )
+        """
+        if finalizer_tables_available
         else ""
     )
     return f"""
@@ -2467,6 +2772,7 @@ def _delete_blocks_sql(
                    )
            )
            {v4_guard}
+           {finalizer_guard}
         RETURNING block.block_hash, block.stored_byte_count
     """
 
@@ -2508,10 +2814,16 @@ async def _sweep_ready(
     deleted_rows: list[Any] = []
     if selected.selected_hashes:
         v4_tables_available = await _has_v4_map_tables(executor, schema_name)
+        finalizer_tables_available = await _has_v4_finalizer_map_tables(
+            executor, schema_name
+        )
+        if finalizer_tables_available and not v4_tables_available:
+            raise RuntimeError("PTG V4 finalizer map GC requires base V4 map tables")
         deleted_rows = await executor.all(
             _delete_blocks_sql(
                 schema_name,
                 v4_tables_available=v4_tables_available,
+                finalizer_tables_available=finalizer_tables_available,
             ),
             block_hashes=list(selected.selected_hashes),
         )

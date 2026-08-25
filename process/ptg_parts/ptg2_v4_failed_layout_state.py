@@ -204,10 +204,16 @@ async def load_reference_counts(
               WHERE snapshot_id = :snapshot_id) AS scopes,
             (SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_source
               WHERE snapshot_id = :snapshot_id) AS sources,
-            (SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block
-              WHERE snapshot_key = :snapshot_key) AS mapping_rows,
-            (SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack
-              WHERE snapshot_key = :snapshot_key) AS map_packs,
+            ((SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block
+               WHERE snapshot_key = :snapshot_key)
+             +
+             (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_target
+               WHERE snapshot_key = :snapshot_key)) AS mapping_rows,
+            ((SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack
+               WHERE snapshot_key = :snapshot_key)
+             +
+             (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_pack
+               WHERE snapshot_key = :snapshot_key)) AS map_packs,
             (SELECT COUNT(*) FROM {schema}.ptg2_v4_relation_manifest
               WHERE snapshot_key = :snapshot_key) AS relation_manifests
         """,
@@ -235,6 +241,14 @@ async def load_block_stats(
         WITH candidate_hashes AS MATERIALIZED (
             SELECT DISTINCT block_hash
               FROM {schema}.ptg2_v3_snapshot_block
+             WHERE snapshot_key = :snapshot_key
+            UNION
+            SELECT map_block_hash
+              FROM {schema}.ptg2_v4_finalizer_map_pack
+             WHERE snapshot_key = :snapshot_key
+            UNION
+            SELECT block_hash
+              FROM {schema}.ptg2_v4_finalizer_map_target
              WHERE snapshot_key = :snapshot_key
             UNION
             SELECT DISTINCT block_hash
@@ -282,12 +296,21 @@ async def load_recovery_postconditions(
              +
              (SELECT COUNT(*) FROM {schema}.ptg2_v3_layout_fingerprint
                WHERE snapshot_key = :snapshot_key)) AS fingerprints,
-            (SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block
-              WHERE snapshot_key = :snapshot_key) AS mappings,
-            (SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_root
-              WHERE snapshot_key = :snapshot_key) AS map_roots,
-            (SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack
-              WHERE snapshot_key = :snapshot_key) AS map_packs,
+            ((SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block
+               WHERE snapshot_key = :snapshot_key)
+             +
+             (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_target
+               WHERE snapshot_key = :snapshot_key)) AS mappings,
+            ((SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_root
+               WHERE snapshot_key = :snapshot_key)
+             +
+             (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_root
+               WHERE snapshot_key = :snapshot_key)) AS map_roots,
+            ((SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack
+               WHERE snapshot_key = :snapshot_key)
+             +
+             (SELECT COUNT(*) FROM {schema}.ptg2_v4_finalizer_map_pack
+               WHERE snapshot_key = :snapshot_key)) AS map_packs,
             (SELECT COUNT(*) FROM {schema}.ptg2_v4_relation_manifest
               WHERE snapshot_key = :snapshot_key) AS relation_manifests,
             (SELECT COUNT(*) FROM {schema}.ptg2_block_build_pin

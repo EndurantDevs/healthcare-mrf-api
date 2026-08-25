@@ -198,8 +198,17 @@ def test_v4_publisher_fingerprint_includes_projection_contract_only_for_v4():
         include_provider_graph_v4=True,
     )
 
+    assert "ptg2_shared_block_copy.py" in {path.name for path in v3_sources}
     assert not any("tax_identity_source" in path.name for path in v3_sources)
     assert {path.name for path in v4_sources} >= {
+        "ptg2_v4_finalizer_map_digest.py",
+        "ptg2_v4_finalizer_map_sidecars.py",
+        "ptg2_v4_finalizer_map_sql.py",
+        "ptg2_v4_finalizer_mapping_receipt.py",
+        "ptg2_v4_finalizer_mapping_summary.py",
+        "ptg2_v4_finalizer_maps.py",
+        "ptg2_v4_finalizer_native.py",
+        "ptg2_v4_finalizer_publish.py",
         "ptg2_tax_identity_source_binding.py",
         "ptg2_tax_identity_source_artifact.py",
         "ptg2_tax_identity_source_aggregate_reuse.py",

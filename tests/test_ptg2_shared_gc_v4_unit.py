@@ -10,6 +10,7 @@ from process.ptg_parts import ptg2_shared_gc as shared_gc
 from tests.ptg2_shared_gc_test_support import (
     _BUILD_TOKEN,
     _Executor,
+    _SharedGCExecutor,
     _abandonment_context,
 )
 
@@ -431,4 +432,40 @@ async def test_owned_v4_statement_timeout_becomes_deferred(monkeypatch):
                 timeout_seconds=10,
                 monotonic=lambda: 0.0,
             ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_v4_gc_accepts_base_only_and_rejects_partial_finalizer_extension():
+    executor = _SharedGCExecutor()
+    executor.present_tables.update(shared_gc.PTG2_V4_GC_TABLE_NAMES)
+
+    assert await shared_gc._has_v4_map_tables(executor, "mrf")
+    assert not await shared_gc._has_v4_finalizer_map_tables(executor, "mrf")
+    await shared_gc.build_shared_layout_release_plan(
+        executor=executor,
+        require_shared=True,
+    )
+    base_plan_sql = next(
+        sql for sql, _params in executor.calls if "WITH eligible_layouts" in sql
+    )
+    assert "ptg2_v4_finalizer_map_pack" not in base_plan_sql
+
+    executor.present_tables.update(shared_gc.PTG2_V4_FINALIZER_GC_TABLE_NAMES)
+    assert await shared_gc._has_v4_finalizer_map_tables(executor, "mrf")
+    executor.calls.clear()
+    await shared_gc.build_shared_layout_release_plan(
+        executor=executor,
+        require_shared=True,
+    )
+    upgraded_plan_sql = next(
+        sql for sql, _params in executor.calls if "WITH eligible_layouts" in sql
+    )
+    assert "ptg2_v4_finalizer_map_pack" in upgraded_plan_sql
+
+    executor.present_tables.remove(shared_gc.PTG2_V4_FINALIZER_GC_TABLE_NAMES[-1])
+    with pytest.raises(RuntimeError, match="complete additive schema.*missing tables"):
+        await shared_gc.build_shared_layout_release_plan(
+            executor=executor,
+            require_shared=True,
         )

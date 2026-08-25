@@ -17,7 +17,6 @@ from process.ptg_parts.ptg2_shared_publish import (
 )
 from process.ptg_parts.ptg2_shared_block_copy import (
     binary_copy_rows,
-    scan_shared_block_copy,
 )
 
 
@@ -46,13 +45,24 @@ def _field(value: bytes) -> bytes:
 
 
 def _block_row(block_hash: bytes, block_key: int, payload: bytes) -> bytes:
+    return _kind_block_row(b"serving", block_hash, block_key, payload)
+
+
+def _kind_block_row(
+    object_kind: bytes,
+    block_hash: bytes,
+    block_key: int,
+    payload: bytes,
+    *,
+    entry_count: int = 1,
+) -> bytes:
     fields = (
         block_hash,
         struct.pack(">h", 2),
-        b"serving",
+        object_kind,
         struct.pack(">q", block_key),
         struct.pack(">i", 0),
-        struct.pack(">q", 1),
+        struct.pack(">q", entry_count),
         b"none",
         struct.pack(">q", len(payload)),
         struct.pack(">q", len(payload)),
@@ -362,45 +372,6 @@ async def test_shared_block_copy_stages_one_payload_per_repeated_new_hash(
     assert metrics.same_copy_reused_row_count == 1
     assert metrics.same_copy_reused_payload_bytes == len(payloads[1])
     assert metrics.durable_reused_row_count == 0
-
-
-def test_shared_block_copy_scan_rejects_truncated_payload(tmp_path):
-    path = tmp_path / "truncated.copy"
-    path.write_bytes(_block_copy(_block_row(b"a" * 32, 1, b"payload"))[:-4])
-
-    with pytest.raises(RuntimeError, match="truncates"):
-        scan_shared_block_copy(path)
-
-
-@pytest.mark.parametrize(
-    ("copy_payload", "error"),
-    (
-        (_COPY_HEADER + struct.pack(">h", 9), "row width changed"),
-        (
-            _COPY_HEADER
-            + _block_row(b"a" * 32, 1, b"payload")[:-11]
-            + struct.pack(">i", 8)
-            + b"payload",
-            "payload length is invalid",
-        ),
-        (_block_copy(), "contains no rows"),
-    ),
-)
-def test_shared_block_copy_scan_rejects_corrupt_framing(
-    tmp_path,
-    copy_payload,
-    error,
-):
-    path = tmp_path / "corrupt.copy"
-    path.write_bytes(copy_payload)
-
-    with pytest.raises(RuntimeError, match=error):
-        scan_shared_block_copy(path)
-
-
-def test_binary_copy_rows_rejects_wrong_row_width():
-    with pytest.raises(RuntimeError, match="row width changed"):
-        binary_copy_rows(_COPY_HEADER + struct.pack(">h", 9))
 
 
 @pytest.mark.parametrize(

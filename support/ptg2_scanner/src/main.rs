@@ -21361,6 +21361,1200 @@ fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
     Ok(digest.finalize().into())
 }
 
+const V4_FINALIZER_PACK_FORMAT: &str = "ptg2_v4_finalizer_pack_v1";
+const V4_FINALIZER_PACK_INPUT_CONTRACT: &str = "ptg2_v4_finalizer_pack_input_v1";
+const V4_FINALIZER_PACK_TARGET_HASH_DOMAIN: &[u8] = b"PTG2V4FINALIZERTARGETS\x01";
+const V4_FINALIZER_PACK_KIND_HASH_DOMAIN: &[u8] = b"PTG2V4FINALIZERPACKS\x01";
+const V4_FINALIZER_PACK_ROOT_HASH_DOMAIN: &[u8] = b"PTG2V4FINALIZERMAPROOT\x01";
+const V4_FINALIZER_PACK_MAPPING_HASH_DOMAIN: &[u8] = b"PTG2V3MAP\x02";
+const V4_FINALIZER_MAP_BLOCK_KIND: &str = "snapshot_coordinate_map_v1";
+const V4_FINALIZER_MAP_MAGIC: &[u8; 8] = b"PTG4MAP1";
+const V4_FINALIZER_MAP_FORMAT_VERSION: u16 = 1;
+const V4_FINALIZER_PACK_MAX_COORDINATES: usize = 256;
+// Includes the hash, metadata, HashMap control bytes, and the temporary sort pointer.
+const V4_FINALIZER_TARGET_IDENTITY_BYTES_PER_ENTRY: usize = 160;
+const V4_FINALIZER_PACKED_OBJECT_KINDS: [&str; 6] = [
+    "by_code_price_dictionary",
+    "by_code_price_page_v4",
+    "by_code_provider_shard_v1",
+    "provider_set_codes_v3",
+    "provider_set_count_dictionary",
+    "provider_set_page_v3_s2",
+];
+const V4_FINALIZER_PRICE_DICTIONARY_KINDS: [&str; 1] = ["by_code_price_dictionary"];
+const V4_FINALIZER_SERVING_KINDS: [&str; 5] = [
+    "by_code_price_page_v4",
+    "by_code_provider_shard_v1",
+    "provider_set_codes_v3",
+    "provider_set_count_dictionary",
+    "provider_set_page_v3_s2",
+];
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V4FinalizerPackInputManifest {
+    contract: String,
+    coordinates_per_pack: usize,
+    lanes: Vec<V4FinalizerPackInputLane>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V4FinalizerPackInputLane {
+    name: String,
+    path: PathBuf,
+    byte_count: u64,
+    sha256: String,
+    row_count: u64,
+    stored_payload_bytes: u64,
+    object_kinds: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedV4FinalizerPackLane {
+    name: &'static str,
+    path: PathBuf,
+    byte_count: u64,
+    sha256: [u8; 32],
+    row_count: u64,
+    stored_payload_bytes: u64,
+    object_kinds: &'static [&'static str],
+}
+
+#[derive(Clone, Debug)]
+struct V4FinalizerPackOptions {
+    output_directory: PathBuf,
+    manifest_path: PathBuf,
+    identity_map_max_bytes: usize,
+}
+
+fn v4_finalizer_pack_usage() -> &'static str {
+    "usage: ptg2_scanner --pack-v4-finalizer-copies <output_directory> --identity-map-max-bytes N <input_manifest.json>"
+}
+
+fn parse_v4_finalizer_pack_options(arguments: &[String]) -> io::Result<V4FinalizerPackOptions> {
+    let Some(output_directory) = arguments.first() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            v4_finalizer_pack_usage(),
+        ));
+    };
+    if output_directory.starts_with("--") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            v4_finalizer_pack_usage(),
+        ));
+    }
+    let mut manifest_path = None;
+    let mut identity_map_max_bytes = None;
+    let mut index = 1usize;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--identity-map-max-bytes" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, v4_finalizer_pack_usage())
+                })?;
+                let parsed = value.parse::<usize>().map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid --identity-map-max-bytes value: {error}"),
+                    )
+                })?;
+                if parsed < V4_FINALIZER_TARGET_IDENTITY_BYTES_PER_ENTRY {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "--identity-map-max-bytes must be at least {V4_FINALIZER_TARGET_IDENTITY_BYTES_PER_ENTRY}"
+                        ),
+                    ));
+                }
+                if identity_map_max_bytes.replace(parsed).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--identity-map-max-bytes may be specified only once",
+                    ));
+                }
+            }
+            value if value.starts_with("--") => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown V4 finalizer pack option {value:?}"),
+                ));
+            }
+            value => {
+                if manifest_path.replace(PathBuf::from(value)).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "V4 finalizer pack accepts exactly one input manifest",
+                    ));
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(V4FinalizerPackOptions {
+        output_directory: PathBuf::from(output_directory),
+        manifest_path: manifest_path.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "V4 finalizer pack requires one input manifest",
+            )
+        })?,
+        identity_map_max_bytes: identity_map_max_bytes.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "V4 finalizer pack requires --identity-map-max-bytes N",
+            )
+        })?,
+    })
+}
+
+fn decode_v4_finalizer_pack_sha256(value: &str, label: &str) -> io::Result<[u8; 32]> {
+    if value.len() != 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} must be lowercase sha256 hex"),
+        ));
+    }
+    let mut digest = [0u8; 32];
+    for (index, destination) in digest.iter_mut().enumerate() {
+        let decode = |byte: u8| match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{label} must be lowercase sha256 hex"),
+            )),
+        };
+        *destination =
+            (decode(value.as_bytes()[index * 2])? << 4) | decode(value.as_bytes()[index * 2 + 1])?;
+    }
+    Ok(digest)
+}
+
+fn load_v4_finalizer_pack_manifest(
+    path: &Path,
+) -> io::Result<(usize, Vec<ValidatedV4FinalizerPackLane>)> {
+    let manifest: V4FinalizerPackInputManifest =
+        serde_json::from_reader(BufReader::new(File::open(path)?)).map_err(to_io_error)?;
+    if manifest.contract != V4_FINALIZER_PACK_INPUT_CONTRACT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer pack input contract is incompatible",
+        ));
+    }
+    if !(1..=V4_FINALIZER_PACK_MAX_COORDINATES).contains(&manifest.coordinates_per_pack) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "V4 finalizer coordinates_per_pack must be between 1 and {V4_FINALIZER_PACK_MAX_COORDINATES}"
+            ),
+        ));
+    }
+    if manifest.lanes.len() != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer pack requires exactly two uniquely named lanes",
+        ));
+    }
+    let mut lanes = manifest
+        .lanes
+        .into_iter()
+        .map(|lane| {
+            if lane.name.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "V4 finalizer pack lane name is required",
+                ));
+            }
+            Ok((lane.name.clone(), lane))
+        })
+        .collect::<io::Result<BTreeMap<_, _>>>()?;
+    if lanes.len() != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer pack requires exactly two uniquely named lanes",
+        ));
+    }
+    let mut validated = Vec::with_capacity(2);
+    let mut source_paths = HashSet::new();
+    for (lane_name, required_kinds) in [
+        (
+            "price_dictionary",
+            V4_FINALIZER_PRICE_DICTIONARY_KINDS.as_slice(),
+        ),
+        ("serving", V4_FINALIZER_SERVING_KINDS.as_slice()),
+    ] {
+        let lane = lanes.remove(lane_name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("V4 finalizer pack is missing lane {lane_name:?}"),
+            )
+        })?;
+        if lane
+            .object_kinds
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            != required_kinds
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("V4 finalizer pack lane {lane_name:?} object kinds are incompatible"),
+            ));
+        }
+        if lane.byte_count == 0 || lane.path.metadata()?.len() != lane.byte_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("V4 finalizer pack lane {lane_name:?} byte count changed"),
+            ));
+        }
+        let canonical_path = std::fs::canonicalize(&lane.path)?;
+        if !source_paths.insert(canonical_path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V4 finalizer pack lanes must use distinct source files",
+            ));
+        }
+        validated.push(ValidatedV4FinalizerPackLane {
+            name: lane_name,
+            path: lane.path,
+            byte_count: lane.byte_count,
+            sha256: decode_v4_finalizer_pack_sha256(
+                &lane.sha256,
+                &format!("V4 finalizer pack lane {lane_name:?} sha256"),
+            )?,
+            row_count: lane.row_count,
+            stored_payload_bytes: lane.stored_payload_bytes,
+            object_kinds: required_kinds,
+        });
+    }
+    Ok((manifest.coordinates_per_pack, validated))
+}
+
+struct V4FinalizerPackAuthenticatingReader<R: Read> {
+    inner: R,
+    byte_count: u64,
+    sha256: Sha256,
+}
+
+impl<R: Read> V4FinalizerPackAuthenticatingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            byte_count: 0,
+            sha256: Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> (u64, [u8; 32]) {
+        (self.byte_count, self.sha256.finalize().into())
+    }
+}
+
+impl<R: Read> Read for V4FinalizerPackAuthenticatingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let byte_count = self.inner.read(buffer)?;
+        self.byte_count = self
+            .byte_count
+            .checked_add(byte_count as u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "V4 finalizer authenticated source byte count overflow",
+                )
+            })?;
+        self.sha256.update(&buffer[..byte_count]);
+        Ok(byte_count)
+    }
+}
+
+fn add_v4_finalizer_count(total: &mut u64, value: u64, label: &str) -> io::Result<()> {
+    *total = total.checked_add(value).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("V4 finalizer {label} overflow"),
+        )
+    })?;
+    Ok(())
+}
+
+struct V4FinalizerPackArtifactWriter {
+    final_path: PathBuf,
+    writer: CountingWriter<BufWriter<File>>,
+    row_count: u64,
+}
+
+impl V4FinalizerPackArtifactWriter {
+    fn new(staged_path: &Path, final_path: PathBuf) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(staged_path)?;
+        let mut writer = CountingWriter::new(BufWriter::new(file));
+        write_pg_binary_copy_header(&mut writer)?;
+        Ok(Self {
+            final_path,
+            writer,
+            row_count: 0,
+        })
+    }
+
+    fn begin_row(&mut self) -> io::Result<()> {
+        self.writer.write_all(&10i16.to_be_bytes())
+    }
+
+    fn finish(mut self) -> io::Result<Value> {
+        write_pg_binary_copy_trailer(&mut self.writer)?;
+        self.writer.flush()?;
+        self.writer.inner.get_ref().sync_all()?;
+        Ok(json!({
+            "path": self.final_path.display().to_string(),
+            "row_count": self.row_count,
+            "byte_count": self.writer.byte_count,
+            "sha256": sha256_hex(&self.writer.sha256.finalize()),
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct V4FinalizerTargetMetadata {
+    format_version: i16,
+    object_kind_index: u8,
+    codec_index: u8,
+    entry_count: i64,
+    raw_byte_count: i64,
+    stored_byte_count: i64,
+}
+
+#[derive(Clone, Debug)]
+struct V4FinalizerSourceRow {
+    block_hash: [u8; 32],
+    format_version: i16,
+    object_kind: &'static str,
+    object_kind_index: usize,
+    block_key: i64,
+    fragment_no: i32,
+    entry_count: i64,
+    codec: &'static str,
+    codec_index: u8,
+    raw_byte_count: i64,
+    stored_byte_count: i64,
+    payload: Vec<u8>,
+}
+
+impl V4FinalizerSourceRow {
+    fn target_metadata(&self) -> V4FinalizerTargetMetadata {
+        V4FinalizerTargetMetadata {
+            format_version: self.format_version,
+            object_kind_index: self.object_kind_index as u8,
+            codec_index: self.codec_index,
+            entry_count: self.entry_count,
+            raw_byte_count: self.raw_byte_count,
+            stored_byte_count: self.stored_byte_count,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct V4FinalizerMapReference {
+    block_key: i64,
+    fragment_no: i32,
+    entry_count: i64,
+    block_hash: [u8; 32],
+    raw_byte_count: i64,
+}
+
+struct V4FinalizerKindPackState {
+    references: Vec<V4FinalizerMapReference>,
+    previous_coordinate: Option<(i64, i32)>,
+    next_pack_no: u32,
+    digest: Sha256,
+    coordinate_count: u64,
+}
+
+impl V4FinalizerKindPackState {
+    fn new(object_kind: &str, coordinates_per_pack: usize) -> io::Result<Self> {
+        let mut digest = Sha256::new();
+        digest.update(V4_FINALIZER_PACK_KIND_HASH_DOMAIN);
+        update_sha256_length_prefixed(&mut digest, object_kind.as_bytes())?;
+        Ok(Self {
+            references: Vec::with_capacity(coordinates_per_pack),
+            previous_coordinate: None,
+            next_pack_no: 0,
+            digest,
+            coordinate_count: 0,
+        })
+    }
+}
+
+struct V4FinalizerPackLaneWriter {
+    source: ValidatedV4FinalizerPackLane,
+    target_blocks: V4FinalizerPackArtifactWriter,
+    map_blocks: V4FinalizerPackArtifactWriter,
+    map_packs: V4FinalizerPackArtifactWriter,
+    kind_states: BTreeMap<usize, V4FinalizerKindPackState>,
+    coordinates_per_pack: usize,
+    map_block_count: u64,
+    coordinate_count: u64,
+    target_block_count: u64,
+    target_stored_byte_count: u64,
+    entry_count: u64,
+    logical_byte_count: u64,
+    stored_byte_count: u64,
+    stored_map_byte_count: u64,
+    source_row_count: u64,
+    source_stored_payload_bytes: u64,
+}
+
+type V4FinalizerLaneSummary = (Value, Vec<(usize, [u8; 32])>);
+
+impl V4FinalizerPackLaneWriter {
+    fn new(
+        source: ValidatedV4FinalizerPackLane,
+        coordinates_per_pack: usize,
+        staged_root: &Path,
+        final_root: &Path,
+    ) -> io::Result<Self> {
+        let staged_lane = staged_root.join(source.name);
+        std::fs::create_dir(&staged_lane)?;
+        let final_lane = final_root.join(source.name);
+        let kind_states = source
+            .object_kinds
+            .iter()
+            .map(|object_kind| {
+                let index = v4_finalizer_object_kind_index(object_kind).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "V4 finalizer pack lane contains an unsupported object kind",
+                    )
+                })?;
+                Ok((
+                    index,
+                    V4FinalizerKindPackState::new(object_kind, coordinates_per_pack)?,
+                ))
+            })
+            .collect::<io::Result<BTreeMap<_, _>>>()?;
+        Ok(Self {
+            source,
+            target_blocks: V4FinalizerPackArtifactWriter::new(
+                &staged_lane.join("target_blocks.copy"),
+                final_lane.join("target_blocks.copy"),
+            )?,
+            map_blocks: V4FinalizerPackArtifactWriter::new(
+                &staged_lane.join("map_blocks.copy"),
+                final_lane.join("map_blocks.copy"),
+            )?,
+            map_packs: V4FinalizerPackArtifactWriter::new(
+                &staged_lane.join("map_packs.copy"),
+                final_lane.join("map_packs.copy"),
+            )?,
+            kind_states,
+            coordinates_per_pack,
+            map_block_count: 0,
+            coordinate_count: 0,
+            target_block_count: 0,
+            target_stored_byte_count: 0,
+            entry_count: 0,
+            logical_byte_count: 0,
+            stored_byte_count: 0,
+            stored_map_byte_count: 0,
+            source_row_count: 0,
+            source_stored_payload_bytes: 0,
+        })
+    }
+
+    fn write_target(&mut self, row: &V4FinalizerSourceRow) -> io::Result<()> {
+        self.target_blocks.begin_row()?;
+        write_pg_binary_copy_field(&mut self.target_blocks.writer, &row.block_hash)?;
+        write_pg_binary_copy_i16_field(&mut self.target_blocks.writer, row.format_version)?;
+        write_pg_binary_copy_field(&mut self.target_blocks.writer, row.object_kind.as_bytes())?;
+        write_pg_binary_copy_i64_field(&mut self.target_blocks.writer, row.block_key)?;
+        write_pg_binary_copy_i32_field(&mut self.target_blocks.writer, row.fragment_no)?;
+        write_pg_binary_copy_i64_field(&mut self.target_blocks.writer, row.entry_count)?;
+        write_pg_binary_copy_field(&mut self.target_blocks.writer, row.codec.as_bytes())?;
+        write_pg_binary_copy_i64_field(&mut self.target_blocks.writer, row.raw_byte_count)?;
+        write_pg_binary_copy_i64_field(&mut self.target_blocks.writer, row.stored_byte_count)?;
+        write_pg_binary_copy_field(&mut self.target_blocks.writer, &row.payload)?;
+        add_v4_finalizer_count(&mut self.target_blocks.row_count, 1, "target row count")?;
+        add_v4_finalizer_count(&mut self.target_block_count, 1, "target block count")?;
+        add_v4_finalizer_count(
+            &mut self.target_stored_byte_count,
+            row.stored_byte_count as u64,
+            "target stored byte count",
+        )?;
+        Ok(())
+    }
+
+    fn add_mapping(&mut self, row: &V4FinalizerSourceRow) -> io::Result<()> {
+        let state = self
+            .kind_states
+            .get_mut(&row.object_kind_index)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "V4 finalizer pack lane {:?} contains unsupported object kind {:?}",
+                        self.source.name, row.object_kind
+                    ),
+                )
+            })?;
+        let coordinate = (row.block_key, row.fragment_no);
+        if state
+            .previous_coordinate
+            .is_some_and(|previous| coordinate <= previous)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "V4 finalizer pack coordinates are not strictly ordered for object kind {:?}",
+                    row.object_kind
+                ),
+            ));
+        }
+        state.previous_coordinate = Some(coordinate);
+        state.references.push(V4FinalizerMapReference {
+            block_key: row.block_key,
+            fragment_no: row.fragment_no,
+            entry_count: row.entry_count,
+            block_hash: row.block_hash,
+            raw_byte_count: row.raw_byte_count,
+        });
+        add_v4_finalizer_count(&mut state.coordinate_count, 1, "kind coordinate count")?;
+        add_v4_finalizer_count(&mut self.coordinate_count, 1, "coordinate count")?;
+        add_v4_finalizer_count(&mut self.entry_count, row.entry_count as u64, "entry count")?;
+        add_v4_finalizer_count(
+            &mut self.logical_byte_count,
+            row.raw_byte_count as u64,
+            "logical byte count",
+        )?;
+        add_v4_finalizer_count(
+            &mut self.stored_byte_count,
+            row.stored_byte_count as u64,
+            "stored byte count",
+        )?;
+        add_v4_finalizer_count(&mut self.source_row_count, 1, "source row count")?;
+        add_v4_finalizer_count(
+            &mut self.source_stored_payload_bytes,
+            row.stored_byte_count as u64,
+            "source stored payload byte count",
+        )?;
+        if state.references.len() == self.coordinates_per_pack {
+            self.flush_kind(row.object_kind_index)?;
+        }
+        Ok(())
+    }
+
+    fn flush_kind(&mut self, object_kind_index: usize) -> io::Result<()> {
+        let object_kind = V4_FINALIZER_PACKED_OBJECT_KINDS[object_kind_index];
+        let state = self
+            .kind_states
+            .get_mut(&object_kind_index)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "V4 finalizer pack kind state is unavailable",
+                )
+            })?;
+        if state.references.is_empty() {
+            return Ok(());
+        }
+        let references = std::mem::take(&mut state.references);
+        let pack_no = state.next_pack_no;
+        state.next_pack_no = state.next_pack_no.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V4 finalizer pack number overflow",
+            )
+        })?;
+        let first = references[0];
+        let last = references[references.len() - 1];
+        let coordinate_count = u32::try_from(references.len()).map_err(to_io_error)?;
+        let entry_count = references.iter().try_fold(0u64, |total, reference| {
+            total
+                .checked_add(reference.entry_count as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "entry count overflow"))
+        })?;
+        let logical_byte_count = references.iter().try_fold(0u64, |total, reference| {
+            total
+                .checked_add(reference.raw_byte_count as u64)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "logical byte count overflow")
+                })
+        })?;
+        let map_payload = encode_v4_finalizer_map_pack(object_kind, &references)?;
+        let map_block_hash = shared_v3_block_hash(
+            PTG2_V3_SHARED_BLOCK_FORMAT_VERSION,
+            V4_FINALIZER_MAP_BLOCK_KIND,
+            "none",
+            &map_payload,
+        )?;
+        let map_block_key = i64::try_from(self.map_block_count).map_err(to_io_error)?;
+        let map_payload_bytes = i64::try_from(map_payload.len()).map_err(to_io_error)?;
+
+        self.map_blocks.begin_row()?;
+        write_pg_binary_copy_field(&mut self.map_blocks.writer, &map_block_hash)?;
+        write_pg_binary_copy_i16_field(
+            &mut self.map_blocks.writer,
+            PTG2_V3_SHARED_BLOCK_FORMAT_VERSION,
+        )?;
+        write_pg_binary_copy_field(
+            &mut self.map_blocks.writer,
+            V4_FINALIZER_MAP_BLOCK_KIND.as_bytes(),
+        )?;
+        write_pg_binary_copy_i64_field(&mut self.map_blocks.writer, map_block_key)?;
+        write_pg_binary_copy_i32_field(&mut self.map_blocks.writer, 0)?;
+        write_pg_binary_copy_i64_field(&mut self.map_blocks.writer, i64::from(coordinate_count))?;
+        write_pg_binary_copy_field(&mut self.map_blocks.writer, b"none")?;
+        write_pg_binary_copy_i64_field(&mut self.map_blocks.writer, map_payload_bytes)?;
+        write_pg_binary_copy_i64_field(&mut self.map_blocks.writer, map_payload_bytes)?;
+        write_pg_binary_copy_field(&mut self.map_blocks.writer, &map_payload)?;
+        add_v4_finalizer_count(&mut self.map_blocks.row_count, 1, "map block row count")?;
+
+        self.map_packs.begin_row()?;
+        write_pg_binary_copy_field(&mut self.map_packs.writer, object_kind.as_bytes())?;
+        write_pg_binary_copy_i32_field(
+            &mut self.map_packs.writer,
+            i32::try_from(pack_no).map_err(to_io_error)?,
+        )?;
+        write_pg_binary_copy_i64_field(&mut self.map_packs.writer, first.block_key)?;
+        write_pg_binary_copy_i32_field(&mut self.map_packs.writer, first.fragment_no)?;
+        write_pg_binary_copy_i64_field(&mut self.map_packs.writer, last.block_key)?;
+        write_pg_binary_copy_i32_field(&mut self.map_packs.writer, last.fragment_no)?;
+        write_pg_binary_copy_i32_field(
+            &mut self.map_packs.writer,
+            i32::try_from(coordinate_count).map_err(to_io_error)?,
+        )?;
+        write_pg_binary_copy_i64_field(
+            &mut self.map_packs.writer,
+            i64::try_from(entry_count).map_err(to_io_error)?,
+        )?;
+        write_pg_binary_copy_i64_field(
+            &mut self.map_packs.writer,
+            i64::try_from(logical_byte_count).map_err(to_io_error)?,
+        )?;
+        write_pg_binary_copy_field(&mut self.map_packs.writer, &map_block_hash)?;
+        add_v4_finalizer_count(&mut self.map_packs.row_count, 1, "map pack row count")?;
+
+        state.digest.update(pack_no.to_be_bytes());
+        state.digest.update(first.block_key.to_be_bytes());
+        state
+            .digest
+            .update((first.fragment_no as u32).to_be_bytes());
+        state.digest.update(last.block_key.to_be_bytes());
+        state.digest.update((last.fragment_no as u32).to_be_bytes());
+        state.digest.update(coordinate_count.to_be_bytes());
+        state.digest.update(entry_count.to_be_bytes());
+        state.digest.update(logical_byte_count.to_be_bytes());
+        state.digest.update(map_block_hash);
+        add_v4_finalizer_count(&mut self.map_block_count, 1, "map block count")?;
+        add_v4_finalizer_count(
+            &mut self.stored_map_byte_count,
+            map_payload.len() as u64,
+            "stored map byte count",
+        )?;
+        Ok(())
+    }
+
+    fn finish(mut self, staged_root: &Path) -> io::Result<V4FinalizerLaneSummary> {
+        let kind_indices = self.kind_states.keys().copied().collect::<Vec<_>>();
+        for object_kind_index in kind_indices {
+            self.flush_kind(object_kind_index)?;
+        }
+        if self.coordinate_count == 0
+            || self
+                .kind_states
+                .values()
+                .any(|state| state.coordinate_count == 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "V4 finalizer pack lane {:?} does not contain every required object kind",
+                    self.source.name
+                ),
+            ));
+        }
+        let mut kind_digests = Vec::with_capacity(self.kind_states.len());
+        let mut kind_digest_json = Map::new();
+        for (object_kind_index, state) in &self.kind_states {
+            let digest: [u8; 32] = state.digest.clone().finalize().into();
+            kind_digest_json.insert(
+                V4_FINALIZER_PACKED_OBJECT_KINDS[*object_kind_index].to_owned(),
+                json!(sha256_hex(&digest)),
+            );
+            kind_digests.push((*object_kind_index, digest));
+        }
+        let lane_directory = staged_root.join(self.source.name);
+        let target_blocks = self.target_blocks.finish()?;
+        let map_blocks = self.map_blocks.finish()?;
+        let map_packs = self.map_packs.finish()?;
+        File::open(&lane_directory)?.sync_all()?;
+        Ok((
+            json!({
+                "name": self.source.name,
+                "source": {
+                    "path": self.source.path.display().to_string(),
+                    "byte_count": self.source.byte_count,
+                    "sha256": sha256_hex(&self.source.sha256),
+                    "row_count": self.source_row_count,
+                    "stored_payload_bytes": self.source_stored_payload_bytes,
+                },
+                "target_blocks": target_blocks,
+                "map_blocks": map_blocks,
+                "map_packs": map_packs,
+                "object_kinds": self.source.object_kinds,
+                "map_pack_count": self.map_block_count,
+                "coordinate_count": self.coordinate_count,
+                "target_block_count": self.target_block_count,
+                "target_stored_byte_count": self.target_stored_byte_count,
+                "entry_count": self.entry_count,
+                "logical_byte_count": self.logical_byte_count,
+                "stored_byte_count": self.stored_byte_count,
+                "stored_map_byte_count": self.stored_map_byte_count,
+                "kind_digests": kind_digest_json,
+            }),
+            kind_digests,
+        ))
+    }
+}
+
+struct V4FinalizerCanonicalSegment {
+    path: PathBuf,
+    writer: CountingWriter<BufWriter<File>>,
+    row_count: u64,
+}
+
+impl V4FinalizerCanonicalSegment {
+    fn new(path: PathBuf) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(Self {
+            path,
+            writer: CountingWriter::new(BufWriter::new(file)),
+            row_count: 0,
+        })
+    }
+
+    fn write_mapping(&mut self, row: &V4FinalizerSourceRow) -> io::Result<()> {
+        let object_kind_bytes = row.object_kind.as_bytes();
+        self.writer.write_all(
+            &u32::try_from(object_kind_bytes.len())
+                .map_err(to_io_error)?
+                .to_be_bytes(),
+        )?;
+        self.writer.write_all(object_kind_bytes)?;
+        self.writer.write_all(&row.block_key.to_be_bytes())?;
+        self.writer
+            .write_all(&(row.fragment_no as u32).to_be_bytes())?;
+        self.writer
+            .write_all(&(row.entry_count as u64).to_be_bytes())?;
+        self.writer.write_all(&row.block_hash)?;
+        add_v4_finalizer_count(&mut self.row_count, 1, "canonical row count")?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<(PathBuf, u64, u64)> {
+        self.writer.flush()?;
+        self.writer.inner.get_ref().sync_all()?;
+        Ok((self.path, self.row_count, self.writer.byte_count))
+    }
+}
+
+fn v4_finalizer_object_kind_index(object_kind: &str) -> Option<usize> {
+    V4_FINALIZER_PACKED_OBJECT_KINDS
+        .iter()
+        .position(|candidate| *candidate == object_kind)
+}
+
+fn parse_v4_finalizer_source_row(fields: &[Option<Vec<u8>>]) -> io::Result<V4FinalizerSourceRow> {
+    let block_hash_field = required_pg_binary_field(fields, 0, "block_hash")?;
+    let block_hash: [u8; 32] = block_hash_field.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer source block_hash must contain 32 bytes",
+        )
+    })?;
+    let format_field = required_pg_binary_field(fields, 1, "format_version")?;
+    if format_field.len() != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer source format_version width changed",
+        ));
+    }
+    let format_version = i16::from_be_bytes(format_field.try_into().map_err(to_io_error)?);
+    if format_version != PTG2_V3_SHARED_BLOCK_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer source format_version is incompatible",
+        ));
+    }
+    let object_kind_field = required_pg_binary_field(fields, 2, "object_kind")?;
+    let object_kind_text = std::str::from_utf8(object_kind_field).map_err(to_io_error)?;
+    if object_kind_field.is_empty() || object_kind_field.len() > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer source object_kind is invalid",
+        ));
+    }
+    let object_kind_index = v4_finalizer_object_kind_index(object_kind_text).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("V4 finalizer source object kind {object_kind_text:?} is unsupported"),
+        )
+    })?;
+    let object_kind = V4_FINALIZER_PACKED_OBJECT_KINDS[object_kind_index];
+    let read_nonnegative_i64 = |index, name| -> io::Result<i64> {
+        let field = required_pg_binary_field(fields, index, name)?;
+        let value = pg_binary_nonnegative_int8(field, name)?;
+        i64::try_from(value).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("V4 finalizer source {name} exceeds i64"),
+            )
+        })
+    };
+    let block_key = read_nonnegative_i64(3, "block_key")?;
+    let fragment_field = required_pg_binary_field(fields, 4, "fragment_no")?;
+    if fragment_field.len() != 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer source fragment_no width changed",
+        ));
+    }
+    let fragment_no = i32::from_be_bytes(fragment_field.try_into().map_err(to_io_error)?);
+    if fragment_no < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer source fragment_no cannot be negative",
+        ));
+    }
+    let entry_count = read_nonnegative_i64(5, "entry_count")?;
+    let codec_field = required_pg_binary_field(fields, 6, "codec")?;
+    let (codec, codec_index) = match codec_field {
+        b"none" => ("none", 0),
+        b"zlib" => ("zlib", 1),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V4 finalizer source codec is invalid",
+            ));
+        }
+    };
+    let raw_byte_count = read_nonnegative_i64(7, "raw_byte_count")?;
+    let stored_byte_count = read_nonnegative_i64(8, "stored_byte_count")?;
+    let payload = required_pg_binary_field(fields, 9, "payload")?.to_vec();
+    if payload.len() != stored_byte_count as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer source payload length does not match stored_byte_count",
+        ));
+    }
+    Ok(V4FinalizerSourceRow {
+        block_hash,
+        format_version,
+        object_kind,
+        object_kind_index,
+        block_key,
+        fragment_no,
+        entry_count,
+        codec,
+        codec_index,
+        raw_byte_count,
+        stored_byte_count,
+        payload,
+    })
+}
+
+fn encode_v4_finalizer_map_pack(
+    object_kind: &str,
+    references: &[V4FinalizerMapReference],
+) -> io::Result<Vec<u8>> {
+    if object_kind.is_empty()
+        || object_kind.len() > 64
+        || references.is_empty()
+        || references.len() > V4_FINALIZER_PACK_MAX_COORDINATES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer map pack geometry is invalid",
+        ));
+    }
+    let mut payload = Vec::with_capacity(80 + references.len() * 52);
+    payload.extend_from_slice(V4_FINALIZER_MAP_MAGIC);
+    payload.extend_from_slice(&V4_FINALIZER_MAP_FORMAT_VERSION.to_be_bytes());
+    payload.extend_from_slice(&(object_kind.len() as u16).to_be_bytes());
+    payload.extend_from_slice(&(references.len() as u32).to_be_bytes());
+    payload.extend_from_slice(object_kind.as_bytes());
+    payload.resize(80, 0);
+    for reference in references {
+        payload.extend_from_slice(&(reference.block_key as u64).to_be_bytes());
+        payload.extend_from_slice(&(reference.fragment_no as u32).to_be_bytes());
+        payload.extend_from_slice(&(reference.entry_count as u64).to_be_bytes());
+        payload.extend_from_slice(&reference.block_hash);
+    }
+    Ok(payload)
+}
+
+fn process_v4_finalizer_pack_lane(
+    lane: &mut V4FinalizerPackLaneWriter,
+    canonical_segments: &mut [V4FinalizerCanonicalSegment],
+    target_metadata_by_hash: &mut HashMap<[u8; 32], V4FinalizerTargetMetadata>,
+    target_identity_max_entries: usize,
+) -> io::Result<()> {
+    let source = V4FinalizerPackAuthenticatingReader::new(File::open(&lane.source.path)?);
+    let mut reader = BufReader::with_capacity(1024 * 1024, source);
+    let mut header = [0u8; 19];
+    reader.read_exact(&mut header)?;
+    if header != *b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer source PostgreSQL binary COPY header is incompatible",
+        ));
+    }
+    while let Some(fields) = read_pg_binary_copy_row(&mut reader, 10, "V4 finalizer source")? {
+        let row = parse_v4_finalizer_source_row(&fields)?;
+        let metadata = row.target_metadata();
+        match target_metadata_by_hash.get(&row.block_hash) {
+            Some(previous) if *previous != metadata => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "V4 finalizer duplicate hash has conflicting metadata",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                if target_metadata_by_hash.len() >= target_identity_max_entries {
+                    return Err(io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "V4 finalizer target identity map exceeds --identity-map-max-bytes",
+                    ));
+                }
+                target_metadata_by_hash.insert(row.block_hash, metadata);
+                lane.write_target(&row)?;
+            }
+        }
+        canonical_segments[row.object_kind_index].write_mapping(&row)?;
+        lane.add_mapping(&row)?;
+    }
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer source PostgreSQL binary COPY contains trailing bytes",
+        ));
+    }
+    let (observed_bytes, observed_sha256) = reader.into_inner().finish();
+    if observed_bytes != lane.source.byte_count || observed_sha256 != lane.source.sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "V4 finalizer pack lane {:?} source content changed",
+                lane.source.name
+            ),
+        ));
+    }
+    if lane.source_row_count != lane.source.row_count
+        || lane.source_stored_payload_bytes != lane.source.stored_payload_bytes
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "V4 finalizer pack lane {:?} source aggregates changed",
+                lane.source.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn finish_v4_finalizer_canonical_segments(
+    segments: Vec<V4FinalizerCanonicalSegment>,
+    directory: &Path,
+) -> io::Result<([u8; 32], u64, u64)> {
+    let mut digest = Sha256::new();
+    digest.update(V4_FINALIZER_PACK_MAPPING_HASH_DOMAIN);
+    let mut mapping_count = 0u64;
+    let mut canonical_byte_count = 0u64;
+    for segment in segments {
+        let (path, row_count, byte_count) = segment.finish()?;
+        mapping_count = mapping_count.checked_add(row_count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "canonical mapping count overflow",
+            )
+        })?;
+        canonical_byte_count = canonical_byte_count
+            .checked_add(byte_count)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "canonical byte count overflow")
+            })?;
+        let mut reader = BufReader::new(File::open(&path)?);
+        let mut buffer = [0u8; 1024 * 1024];
+        loop {
+            let byte_count = reader.read(&mut buffer)?;
+            if byte_count == 0 {
+                break;
+            }
+            digest.update(&buffer[..byte_count]);
+        }
+        drop(reader);
+        std::fs::remove_file(path)?;
+    }
+    std::fs::remove_dir(directory)?;
+    Ok((
+        digest.finalize().into(),
+        mapping_count,
+        canonical_byte_count,
+    ))
+}
+
+fn v4_finalizer_pack_root_digest(kind_digests: &[[u8; 32]; 6]) -> io::Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    digest.update(V4_FINALIZER_PACK_ROOT_HASH_DOMAIN);
+    digest.update((V4_FINALIZER_PACKED_OBJECT_KINDS.len() as u32).to_be_bytes());
+    for (object_kind, kind_digest) in V4_FINALIZER_PACKED_OBJECT_KINDS.iter().zip(kind_digests) {
+        update_sha256_length_prefixed(&mut digest, object_kind.as_bytes())?;
+        digest.update(kind_digest);
+    }
+    Ok(digest.finalize().into())
+}
+
+fn pack_v4_finalizer_copies(options: &V4FinalizerPackOptions) -> io::Result<Value> {
+    let started_at = Instant::now();
+    let (coordinates_per_pack, source_lanes) =
+        load_v4_finalizer_pack_manifest(&options.manifest_path)?;
+    let target_identity_max_entries =
+        options.identity_map_max_bytes / V4_FINALIZER_TARGET_IDENTITY_BYTES_PER_ENTRY;
+    let output = AtomicFinalizerDirectory::new(&options.output_directory)?;
+    let canonical_directory = output.path(".canonical");
+    std::fs::create_dir(&canonical_directory)?;
+    let mut canonical_segments = V4_FINALIZER_PACKED_OBJECT_KINDS
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            V4FinalizerCanonicalSegment::new(
+                canonical_directory.join(format!("kind-{index:02}.bin")),
+            )
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut lanes = source_lanes
+        .into_iter()
+        .map(|source| {
+            V4FinalizerPackLaneWriter::new(
+                source,
+                coordinates_per_pack,
+                &output.staged_path,
+                &options.output_directory,
+            )
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut target_metadata_by_hash = HashMap::new();
+    for lane in &mut lanes {
+        process_v4_finalizer_pack_lane(
+            lane,
+            &mut canonical_segments,
+            &mut target_metadata_by_hash,
+            target_identity_max_entries,
+        )?;
+    }
+    let (canonical_mapping_digest, canonical_mapping_count, canonical_byte_count) =
+        finish_v4_finalizer_canonical_segments(canonical_segments, &canonical_directory)?;
+    let mut target_hashes = target_metadata_by_hash.keys().collect::<Vec<_>>();
+    target_hashes.sort_unstable();
+    let mut target_identity_digest = Sha256::new();
+    target_identity_digest.update(V4_FINALIZER_PACK_TARGET_HASH_DOMAIN);
+    for block_hash in target_hashes {
+        target_identity_digest.update(block_hash);
+    }
+    let target_identity_digest: [u8; 32] = target_identity_digest.finalize().into();
+    let target_block_count = u64::try_from(target_metadata_by_hash.len()).map_err(to_io_error)?;
+
+    let mut lane_summaries = Vec::with_capacity(2);
+    let mut kind_digests = [[0u8; 32]; 6];
+    let mut seen_kind_digests = [false; 6];
+    for lane in lanes {
+        let (summary, lane_kind_digests) = lane.finish(&output.staged_path)?;
+        for (object_kind_index, digest) in lane_kind_digests {
+            if seen_kind_digests[object_kind_index] {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "V4 finalizer pack kind digest is duplicated across lanes",
+                ));
+            }
+            seen_kind_digests[object_kind_index] = true;
+            kind_digests[object_kind_index] = digest;
+        }
+        lane_summaries.push(summary);
+    }
+    if !seen_kind_digests.into_iter().all(|present| present) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer pack kind digest set is incomplete",
+        ));
+    }
+    let map_digest = v4_finalizer_pack_root_digest(&kind_digests)?;
+    if canonical_mapping_count
+        != lane_summaries
+            .iter()
+            .map(|lane| lane["coordinate_count"].as_u64().unwrap_or(0))
+            .sum::<u64>()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer canonical mapping count changed",
+        ));
+    }
+    if target_block_count
+        != lane_summaries
+            .iter()
+            .map(|lane| lane["target_block_count"].as_u64().unwrap_or(0))
+            .sum::<u64>()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 finalizer target block count changed",
+        ));
+    }
+    let summary = json!({
+        "format": V4_FINALIZER_PACK_FORMAT,
+        "output_directory": options.output_directory.display().to_string(),
+        "coordinates_per_pack": coordinates_per_pack,
+        "map_digest": sha256_hex(&map_digest),
+        "canonical_mapping_digest": sha256_hex(&canonical_mapping_digest),
+        "canonical_mapping_count": canonical_mapping_count,
+        "canonical_byte_count": canonical_byte_count,
+        "target_identity_digest": sha256_hex(&target_identity_digest),
+        "target_block_count": target_block_count,
+        "object_kinds": V4_FINALIZER_PACKED_OBJECT_KINDS,
+        "lanes": lane_summaries,
+        "elapsed_seconds": started_at.elapsed().as_secs_f64(),
+    });
+    let summary_path = output.path("summary.json");
+    let summary_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(summary_path)?;
+    let mut summary_writer = BufWriter::new(summary_file);
+    serde_json::to_writer(&mut summary_writer, &summary).map_err(to_io_error)?;
+    summary_writer.write_all(b"\n")?;
+    summary_writer.flush()?;
+    summary_writer.get_ref().sync_all()?;
+    output.commit()?;
+    Ok(summary)
+}
+
+fn run_v4_finalizer_pack(arguments: &[String]) -> io::Result<()> {
+    let options = parse_v4_finalizer_pack_options(arguments)?;
+    let summary = pack_v4_finalizer_copies(&options)?;
+    let mut writer = BufWriter::new(io::stdout().lock());
+    emit_json_record(&mut writer, "v4_finalizer_pack_summary", &summary)?;
+    writer.flush()
+}
+
 fn v3_code_dictionary_memory_estimate(
     inputs: &[V3FinalizerCodeDictionaryInput],
 ) -> io::Result<usize> {
@@ -24574,6 +25768,593 @@ mod tests {
     fn scanner_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[derive(Clone)]
+    struct V4FinalizerPackTestRow {
+        object_kind: &'static str,
+        block_key: i64,
+        fragment_no: i32,
+        entry_count: i64,
+        payload: Vec<u8>,
+        block_hash: Option<[u8; 32]>,
+    }
+
+    type V4FinalizerPackTestInput = (PathBuf, u64, String, u64, u64, Vec<[u8; 32]>);
+    type V4FinalizerPackSuccessFixture = (
+        Vec<V4FinalizerPackTestRow>,
+        Vec<V4FinalizerPackTestRow>,
+        V4FinalizerPackTestInput,
+        V4FinalizerPackTestInput,
+    );
+
+    fn v4_finalizer_pack_test_copy(
+        directory: &Path,
+        name: &str,
+        rows: &[V4FinalizerPackTestRow],
+    ) -> V4FinalizerPackTestInput {
+        let mut hashes = Vec::with_capacity(rows.len());
+        let copy_rows = rows
+            .iter()
+            .map(|row| {
+                let block_hash = row.block_hash.unwrap_or_else(|| {
+                    shared_v3_block_hash(
+                        PTG2_V3_SHARED_BLOCK_FORMAT_VERSION,
+                        row.object_kind,
+                        "none",
+                        &row.payload,
+                    )
+                    .unwrap()
+                });
+                hashes.push(block_hash);
+                vec![
+                    Some(block_hash.to_vec()),
+                    Some(PTG2_V3_SHARED_BLOCK_FORMAT_VERSION.to_be_bytes().to_vec()),
+                    Some(row.object_kind.as_bytes().to_vec()),
+                    Some(row.block_key.to_be_bytes().to_vec()),
+                    Some(row.fragment_no.to_be_bytes().to_vec()),
+                    Some(row.entry_count.to_be_bytes().to_vec()),
+                    Some(b"none".to_vec()),
+                    Some((row.payload.len() as i64).to_be_bytes().to_vec()),
+                    Some((row.payload.len() as i64).to_be_bytes().to_vec()),
+                    Some(row.payload.clone()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let payload = pg_binary_copy_rows(&copy_rows);
+        let path = directory.join(name);
+        std::fs::write(&path, &payload).unwrap();
+        let digest = Sha256::digest(&payload);
+        (
+            path,
+            payload.len() as u64,
+            sha256_hex(&digest),
+            rows.len() as u64,
+            rows.iter().map(|row| row.payload.len() as u64).sum(),
+            hashes,
+        )
+    }
+
+    fn v4_finalizer_pack_test_manifest_with_size(
+        directory: &Path,
+        price: &V4FinalizerPackTestInput,
+        serving: &V4FinalizerPackTestInput,
+        coordinates_per_pack: usize,
+    ) -> PathBuf {
+        let path = directory.join("pack-manifest.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "contract": V4_FINALIZER_PACK_INPUT_CONTRACT,
+                "coordinates_per_pack": coordinates_per_pack,
+                "lanes": [
+                    {
+                        "name": "price_dictionary",
+                        "path": price.0,
+                        "byte_count": price.1,
+                        "sha256": price.2,
+                        "row_count": price.3,
+                        "stored_payload_bytes": price.4,
+                        "object_kinds": V4_FINALIZER_PRICE_DICTIONARY_KINDS,
+                    },
+                    {
+                        "name": "serving",
+                        "path": serving.0,
+                        "byte_count": serving.1,
+                        "sha256": serving.2,
+                        "row_count": serving.3,
+                        "stored_payload_bytes": serving.4,
+                        "object_kinds": V4_FINALIZER_SERVING_KINDS,
+                    },
+                ],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    fn v4_finalizer_pack_test_manifest(
+        directory: &Path,
+        price: &V4FinalizerPackTestInput,
+        serving: &V4FinalizerPackTestInput,
+    ) -> PathBuf {
+        v4_finalizer_pack_test_manifest_with_size(directory, price, serving, 2)
+    }
+
+    fn v4_finalizer_pack_success_fixture(directory: &Path) -> V4FinalizerPackSuccessFixture {
+        let price_rows = vec![
+            V4FinalizerPackTestRow {
+                object_kind: V4_FINALIZER_PACKED_OBJECT_KINDS[0],
+                block_key: 0,
+                fragment_no: 0,
+                entry_count: 3,
+                payload: b"same-price".to_vec(),
+                block_hash: None,
+            },
+            V4FinalizerPackTestRow {
+                object_kind: V4_FINALIZER_PACKED_OBJECT_KINDS[0],
+                block_key: 1,
+                fragment_no: 0,
+                entry_count: 3,
+                payload: b"same-price".to_vec(),
+                block_hash: None,
+            },
+        ];
+        let serving_rows = V4_FINALIZER_SERVING_KINDS
+            .iter()
+            .enumerate()
+            .map(|(index, object_kind)| V4FinalizerPackTestRow {
+                object_kind,
+                block_key: index as i64,
+                fragment_no: 0,
+                entry_count: index as i64 + 1,
+                payload: vec![index as u8 + 1; index + 1],
+                block_hash: None,
+            })
+            .collect::<Vec<_>>();
+        let price = v4_finalizer_pack_test_copy(
+            directory,
+            "shared_price_dictionary_blocks.copy",
+            &price_rows,
+        );
+        let serving =
+            v4_finalizer_pack_test_copy(directory, "shared_serving_blocks.copy", &serving_rows);
+        (price_rows, serving_rows, price, serving)
+    }
+
+    fn v4_finalizer_pack_copy_rows(path: &Path, expected_fields: i16) -> Vec<Vec<Vec<u8>>> {
+        let mut reader = BufReader::new(File::open(path).unwrap());
+        read_pg_binary_copy_header(&mut reader).unwrap();
+        let mut rows = Vec::new();
+        while let Some(fields) =
+            read_pg_binary_copy_row(&mut reader, expected_fields, "packed test output").unwrap()
+        {
+            rows.push(
+                fields
+                    .into_iter()
+                    .map(|field| field.expect("packed output fields are non-null"))
+                    .collect(),
+            );
+        }
+        assert_eq!(reader.read(&mut [0u8; 1]).unwrap(), 0);
+        rows
+    }
+
+    #[test]
+    fn v4_finalizer_pack_emits_exact_atomic_native_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let (price_rows, serving_rows, price, serving) =
+            v4_finalizer_pack_success_fixture(directory.path());
+        let manifest = v4_finalizer_pack_test_manifest(directory.path(), &price, &serving);
+        let output = directory.path().join("packed");
+        let summary = pack_v4_finalizer_copies(&V4FinalizerPackOptions {
+            output_directory: output.clone(),
+            manifest_path: manifest,
+            identity_map_max_bytes: 1024 * 1024,
+        })
+        .unwrap();
+
+        assert_eq!(summary["format"], V4_FINALIZER_PACK_FORMAT);
+        assert_eq!(summary["coordinates_per_pack"], 2);
+        assert_eq!(summary["canonical_mapping_count"], 7);
+        assert_eq!(summary["canonical_byte_count"], 559);
+        assert_eq!(
+            summary["canonical_mapping_digest"],
+            "0f7bd15dd6890eff5f0d3e83f6be32fe7522374676533f37743a4420df63aab8"
+        );
+        assert_eq!(
+            summary["target_identity_digest"],
+            "d226609a59a4cd1259d044d5b2a8cb1f8e72cca1cf455d6b85cdbcd70efc6230"
+        );
+        assert_eq!(
+            summary["map_digest"],
+            "7deec5a7085aac5d976587ede6bf1645ea760f6aabbbdbc664b27482bf44a0a6"
+        );
+        assert_eq!(summary["target_block_count"], 6);
+        assert!(summary["elapsed_seconds"].as_f64().unwrap().is_finite());
+        assert!(summary["elapsed_seconds"].as_f64().unwrap() >= 0.0);
+        assert_eq!(summary["lanes"][0]["name"], "price_dictionary");
+        assert_eq!(summary["lanes"][0]["coordinate_count"], 2);
+        assert_eq!(summary["lanes"][0]["target_block_count"], 1);
+        assert_eq!(summary["lanes"][0]["target_stored_byte_count"], 10);
+        assert_eq!(summary["lanes"][0]["map_pack_count"], 1);
+        assert_eq!(summary["lanes"][1]["name"], "serving");
+        assert_eq!(summary["lanes"][1]["coordinate_count"], 5);
+        assert_eq!(summary["lanes"][1]["target_block_count"], 5);
+        assert_eq!(summary["lanes"][1]["target_stored_byte_count"], 15);
+        assert_eq!(summary["lanes"][1]["map_pack_count"], 5);
+
+        let mut canonical_digest = Sha256::new();
+        canonical_digest.update(V4_FINALIZER_PACK_MAPPING_HASH_DOMAIN);
+        let mut canonical_bytes = 0usize;
+        for row in price_rows.iter().chain(&serving_rows) {
+            let block_hash = shared_v3_block_hash(
+                PTG2_V3_SHARED_BLOCK_FORMAT_VERSION,
+                row.object_kind,
+                "none",
+                &row.payload,
+            )
+            .unwrap();
+            let mut record = Vec::new();
+            update_sha256_length_prefixed(&mut canonical_digest, row.object_kind.as_bytes())
+                .unwrap();
+            record.extend_from_slice(&row.block_key.to_be_bytes());
+            record.extend_from_slice(&(row.fragment_no as u32).to_be_bytes());
+            record.extend_from_slice(&(row.entry_count as u64).to_be_bytes());
+            record.extend_from_slice(&block_hash);
+            canonical_digest.update(&record);
+            canonical_bytes += 4 + row.object_kind.len() + record.len();
+        }
+        assert_eq!(
+            summary["canonical_mapping_digest"],
+            sha256_hex(&canonical_digest.finalize())
+        );
+        assert_eq!(summary["canonical_byte_count"], canonical_bytes);
+
+        let mut unique_hashes = price
+            .5
+            .iter()
+            .chain(&serving.5)
+            .copied()
+            .collect::<Vec<_>>();
+        unique_hashes.sort_unstable();
+        unique_hashes.dedup();
+        let mut target_digest = Sha256::new();
+        target_digest.update(V4_FINALIZER_PACK_TARGET_HASH_DOMAIN);
+        for block_hash in unique_hashes {
+            target_digest.update(block_hash);
+        }
+        assert_eq!(
+            summary["target_identity_digest"],
+            sha256_hex(&target_digest.finalize())
+        );
+
+        let price_targets =
+            v4_finalizer_pack_copy_rows(&output.join("price_dictionary/target_blocks.copy"), 10);
+        assert_eq!(price_targets.len(), 1);
+        let price_map_blocks =
+            v4_finalizer_pack_copy_rows(&output.join("price_dictionary/map_blocks.copy"), 10);
+        assert_eq!(price_map_blocks.len(), 1);
+        let map_payload = &price_map_blocks[0][9];
+        assert_eq!(&map_payload[..8], V4_FINALIZER_MAP_MAGIC);
+        assert_eq!(
+            u16::from_be_bytes(map_payload[8..10].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u32::from_be_bytes(map_payload[12..16].try_into().unwrap()),
+            2
+        );
+        assert_eq!(map_payload.len(), 80 + 2 * 52);
+        assert_eq!(
+            price_map_blocks[0][0],
+            shared_v3_block_hash(
+                PTG2_V3_SHARED_BLOCK_FORMAT_VERSION,
+                V4_FINALIZER_MAP_BLOCK_KIND,
+                "none",
+                map_payload,
+            )
+            .unwrap()
+        );
+        for lane in ["price_dictionary", "serving"] {
+            for artifact in ["target_blocks", "map_blocks", "map_packs"] {
+                let receipt = &summary["lanes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|value| value["name"] == lane)
+                    .unwrap()[artifact];
+                let path = PathBuf::from(receipt["path"].as_str().unwrap());
+                assert_eq!(path.metadata().unwrap().len(), receipt["byte_count"]);
+                assert_eq!(sha256_hex(&sha256_file(&path).unwrap()), receipt["sha256"]);
+            }
+        }
+        let persisted_summary: Value =
+            serde_json::from_reader(File::open(output.join("summary.json")).unwrap()).unwrap();
+        assert_eq!(persisted_summary, summary);
+        let mut output_names = std::fs::read_dir(&output)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        output_names.sort();
+        assert_eq!(
+            output_names,
+            ["price_dictionary", "serving", "summary.json"]
+                .map(std::ffi::OsString::from)
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn v4_finalizer_pack_geometry_covers_255_256_257_and_boundary_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_, serving_rows, _, serving) = v4_finalizer_pack_success_fixture(directory.path());
+        for coordinate_count in [255usize, 256, 257] {
+            let price_rows = (0..coordinate_count)
+                .map(|block_key| V4FinalizerPackTestRow {
+                    object_kind: V4_FINALIZER_PACKED_OBJECT_KINDS[0],
+                    block_key: block_key as i64,
+                    fragment_no: 0,
+                    entry_count: 1,
+                    payload: b"geometry".to_vec(),
+                    block_hash: None,
+                })
+                .collect::<Vec<_>>();
+            let price = v4_finalizer_pack_test_copy(
+                directory.path(),
+                &format!("geometry-{coordinate_count}.copy"),
+                &price_rows,
+            );
+            let manifest =
+                v4_finalizer_pack_test_manifest_with_size(directory.path(), &price, &serving, 256);
+            let output = directory
+                .path()
+                .join(format!("geometry-{coordinate_count}"));
+            let summary = pack_v4_finalizer_copies(&V4FinalizerPackOptions {
+                output_directory: output.clone(),
+                manifest_path: manifest,
+                identity_map_max_bytes: 1024 * 1024,
+            })
+            .unwrap();
+
+            let expected_pack_count = coordinate_count.div_ceil(256);
+            assert_eq!(summary["lanes"][0]["map_pack_count"], expected_pack_count);
+            let packs =
+                v4_finalizer_pack_copy_rows(&output.join("price_dictionary/map_packs.copy"), 10);
+            assert_eq!(packs.len(), expected_pack_count);
+            for (pack_no, pack) in packs.iter().enumerate() {
+                let first = pack_no * 256;
+                let last = (first + 255).min(coordinate_count - 1);
+                assert_eq!(
+                    i32::from_be_bytes(pack[1][..].try_into().unwrap()),
+                    pack_no as i32
+                );
+                assert_eq!(
+                    i64::from_be_bytes(pack[2][..].try_into().unwrap()),
+                    first as i64
+                );
+                assert_eq!(
+                    i64::from_be_bytes(pack[4][..].try_into().unwrap()),
+                    last as i64
+                );
+                assert_eq!(
+                    i32::from_be_bytes(pack[6][..].try_into().unwrap()),
+                    (last - first + 1) as i32
+                );
+            }
+
+            let mut expected_digest = Sha256::new();
+            expected_digest.update(V4_FINALIZER_PACK_MAPPING_HASH_DOMAIN);
+            let mut expected_bytes = 0usize;
+            for row in price_rows.iter().chain(&serving_rows) {
+                let block_hash = shared_v3_block_hash(
+                    PTG2_V3_SHARED_BLOCK_FORMAT_VERSION,
+                    row.object_kind,
+                    "none",
+                    &row.payload,
+                )
+                .unwrap();
+                let record_bytes = 4 + row.object_kind.len() + 8 + 4 + 8 + block_hash.len();
+                update_sha256_length_prefixed(&mut expected_digest, row.object_kind.as_bytes())
+                    .unwrap();
+                expected_digest.update(row.block_key.to_be_bytes());
+                expected_digest.update((row.fragment_no as u32).to_be_bytes());
+                expected_digest.update((row.entry_count as u64).to_be_bytes());
+                expected_digest.update(block_hash);
+                expected_bytes += record_bytes;
+            }
+            assert_eq!(
+                summary["canonical_mapping_count"],
+                coordinate_count + serving_rows.len()
+            );
+            assert_eq!(summary["canonical_byte_count"], expected_bytes);
+            assert_eq!(
+                summary["canonical_mapping_digest"],
+                sha256_hex(&expected_digest.finalize())
+            );
+        }
+
+        let mut duplicate_rows = (0..257)
+            .map(|block_key| V4FinalizerPackTestRow {
+                object_kind: V4_FINALIZER_PACKED_OBJECT_KINDS[0],
+                block_key,
+                fragment_no: 0,
+                entry_count: 1,
+                payload: b"duplicate-boundary".to_vec(),
+                block_hash: None,
+            })
+            .collect::<Vec<_>>();
+        duplicate_rows[256].block_key = 255;
+        let duplicate = v4_finalizer_pack_test_copy(
+            directory.path(),
+            "duplicate-boundary.copy",
+            &duplicate_rows,
+        );
+        let manifest =
+            v4_finalizer_pack_test_manifest_with_size(directory.path(), &duplicate, &serving, 256);
+        let output = directory.path().join("duplicate-boundary");
+        let error = pack_v4_finalizer_copies(&V4FinalizerPackOptions {
+            output_directory: output.clone(),
+            manifest_path: manifest,
+            identity_map_max_bytes: 1024 * 1024,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("not strictly ordered"));
+        assert!(!output.exists());
+        assert!(!std::fs::read_dir(directory.path())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".ptg2-finalizer-")));
+    }
+
+    #[test]
+    fn v4_finalizer_pack_rejects_conflicts_caps_and_source_drift_without_residue() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_, _, _, serving) = v4_finalizer_pack_success_fixture(directory.path());
+        let shared_hash = shared_v3_block_hash(
+            PTG2_V3_SHARED_BLOCK_FORMAT_VERSION,
+            V4_FINALIZER_PACKED_OBJECT_KINDS[0],
+            "none",
+            b"conflict",
+        )
+        .unwrap();
+        let conflict_rows = [
+            V4FinalizerPackTestRow {
+                object_kind: V4_FINALIZER_PACKED_OBJECT_KINDS[0],
+                block_key: 0,
+                fragment_no: 0,
+                entry_count: 1,
+                payload: b"conflict".to_vec(),
+                block_hash: Some(shared_hash),
+            },
+            V4FinalizerPackTestRow {
+                object_kind: V4_FINALIZER_PACKED_OBJECT_KINDS[0],
+                block_key: 1,
+                fragment_no: 0,
+                entry_count: 2,
+                payload: b"conflict".to_vec(),
+                block_hash: Some(shared_hash),
+            },
+        ];
+        let conflict =
+            v4_finalizer_pack_test_copy(directory.path(), "conflict.copy", &conflict_rows);
+        let conflict_manifest =
+            v4_finalizer_pack_test_manifest(directory.path(), &conflict, &serving);
+        let conflict_output = directory.path().join("conflict-output");
+        let error = pack_v4_finalizer_copies(&V4FinalizerPackOptions {
+            output_directory: conflict_output.clone(),
+            manifest_path: conflict_manifest,
+            identity_map_max_bytes: 1024 * 1024,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("conflicting metadata"));
+        assert!(!conflict_output.exists());
+
+        let unique_rows = [
+            V4FinalizerPackTestRow {
+                block_key: 0,
+                entry_count: 1,
+                payload: b"one".to_vec(),
+                block_hash: None,
+                ..conflict_rows[0].clone()
+            },
+            V4FinalizerPackTestRow {
+                block_key: 1,
+                entry_count: 1,
+                payload: b"two".to_vec(),
+                block_hash: None,
+                ..conflict_rows[0].clone()
+            },
+        ];
+        let capped = v4_finalizer_pack_test_copy(directory.path(), "capped.copy", &unique_rows);
+        let capped_manifest = v4_finalizer_pack_test_manifest(directory.path(), &capped, &serving);
+        let capped_output = directory.path().join("capped-output");
+        let error = pack_v4_finalizer_copies(&V4FinalizerPackOptions {
+            output_directory: capped_output.clone(),
+            manifest_path: capped_manifest,
+            identity_map_max_bytes: V4_FINALIZER_TARGET_IDENTITY_BYTES_PER_ENTRY,
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert!(!capped_output.exists());
+
+        let aggregate_price =
+            v4_finalizer_pack_test_copy(directory.path(), "aggregate.copy", &unique_rows[..1]);
+        let aggregate_manifest =
+            v4_finalizer_pack_test_manifest(directory.path(), &aggregate_price, &serving);
+        let mut aggregate_manifest_value: Value =
+            serde_json::from_reader(File::open(&aggregate_manifest).unwrap()).unwrap();
+        aggregate_manifest_value["lanes"][0]["row_count"] = json!(2);
+        std::fs::write(
+            &aggregate_manifest,
+            serde_json::to_vec(&aggregate_manifest_value).unwrap(),
+        )
+        .unwrap();
+        let aggregate_output = directory.path().join("aggregate-output");
+        let error = pack_v4_finalizer_copies(&V4FinalizerPackOptions {
+            output_directory: aggregate_output.clone(),
+            manifest_path: aggregate_manifest,
+            identity_map_max_bytes: 1024 * 1024,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("source aggregates changed"));
+        assert!(!aggregate_output.exists());
+
+        let drift_price =
+            v4_finalizer_pack_test_copy(directory.path(), "drift.copy", &unique_rows[..1]);
+        let drift_manifest =
+            v4_finalizer_pack_test_manifest(directory.path(), &drift_price, &serving);
+        let mut drift_bytes = std::fs::read(&drift_price.0).unwrap();
+        let last_payload = drift_bytes.len() - 3;
+        drift_bytes[last_payload] ^= 1;
+        std::fs::write(&drift_price.0, drift_bytes).unwrap();
+        let drift_output = directory.path().join("drift-output");
+        let error = pack_v4_finalizer_copies(&V4FinalizerPackOptions {
+            output_directory: drift_output.clone(),
+            manifest_path: drift_manifest,
+            identity_map_max_bytes: 1024 * 1024,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("source content changed"));
+        assert!(!drift_output.exists());
+        assert!(!std::fs::read_dir(directory.path())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".ptg2-finalizer-")));
+    }
+
+    #[test]
+    fn v4_finalizer_pack_cli_requires_one_manifest_and_explicit_memory_cap() {
+        let output = "/tmp/packed".to_owned();
+        let manifest = "/tmp/manifest.json".to_owned();
+        assert!(
+            parse_v4_finalizer_pack_options(&[output.clone(), manifest.clone()])
+                .unwrap_err()
+                .to_string()
+                .contains("requires --identity-map-max-bytes")
+        );
+        let options = parse_v4_finalizer_pack_options(&[
+            output,
+            "--identity-map-max-bytes".to_owned(),
+            "160".to_owned(),
+            manifest,
+        ])
+        .unwrap();
+        assert_eq!(options.identity_map_max_bytes, 160);
+        assert!(parse_v4_finalizer_pack_options(&[
+            "/tmp/a".to_owned(),
+            "--identity-map-max-bytes".to_owned(),
+            "159".to_owned(),
+            "/tmp/b".to_owned(),
+        ])
+        .is_err());
     }
 
     #[test]
@@ -38055,6 +39836,9 @@ fn run_cli() -> io::Result<()> {
     }
     if first_arg == "--finalize-v3-runs" {
         return run_v3_finalizer(&args.collect::<Vec<_>>());
+    }
+    if first_arg == "--pack-v4-finalizer-copies" {
+        return run_v4_finalizer_pack(&args.collect::<Vec<_>>());
     }
     if first_arg == "--convert-shared-graph" {
         return run_shared_graph_converter(&args.collect::<Vec<_>>());

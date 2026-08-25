@@ -3374,6 +3374,225 @@ class PTG2V4SnapshotMapPack(Base, JSONOutputMixin):
     )
 
 
+class PTG2V4FinalizerMapRoot(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v4_finalizer_map_root"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            name="ptg2_v4_finalizer_map_root_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}."
+                "ptg2_v3_snapshot_layout.snapshot_key"
+            ],
+            name="ptg2_v4_finalizer_map_root_layout_fkey",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "state IN ('building', 'complete')",
+            name="ptg2_v4_finalizer_map_root_state_check",
+        ),
+        CheckConstraint(
+            "contract = 'packed_finalizer_map_v2'",
+            name="ptg2_v4_finalizer_map_root_contract_check",
+        ),
+        CheckConstraint(
+            "map_format = 'packed_coordinate_hash_v1'",
+            name="ptg2_v4_finalizer_map_root_format_check",
+        ),
+        CheckConstraint(
+            "(map_digest IS NULL OR octet_length(map_digest) = 32) AND "
+            "(canonical_mapping_digest IS NULL OR "
+            "octet_length(canonical_mapping_digest) = 32) AND "
+            "(target_identity_digest IS NULL OR "
+            "octet_length(target_identity_digest) = 32)",
+            name="ptg2_v4_finalizer_map_root_digest_check",
+        ),
+        CheckConstraint(
+            "object_kind_count = 6 AND map_pack_count >= 0 "
+            "AND coordinate_count >= 0 AND entry_count >= 0 "
+            "AND logical_byte_count >= 0 AND stored_map_byte_count >= 0 "
+            "AND target_block_count >= 0 AND canonical_byte_count >= 0",
+            name="ptg2_v4_finalizer_map_root_counts_check",
+        ),
+        CheckConstraint(
+            "(state = 'building' AND "
+            "canonical_mapping_digest IS NULL AND canonical_byte_count = 0 AND "
+            "target_identity_digest IS NULL) OR (state = 'complete' AND "
+            "canonical_mapping_digest IS NOT NULL AND canonical_byte_count > 0 AND "
+            "target_identity_digest IS NOT NULL)",
+            name="ptg2_v4_finalizer_map_root_receipt_check",
+        ),
+        CheckConstraint(
+            "(state = 'building' AND map_digest IS NULL "
+            "AND map_pack_count = 0 AND coordinate_count = 0 "
+            "AND entry_count = 0 AND logical_byte_count = 0 "
+            "AND stored_map_byte_count = 0 AND target_block_count = 0 "
+            "AND completed_at IS NULL) OR "
+            "(state = 'complete' AND map_digest IS NOT NULL "
+            "AND map_pack_count > 0 AND coordinate_count > 0 "
+            "AND target_block_count > 0 AND completed_at IS NOT NULL)",
+            name="ptg2_v4_finalizer_map_root_completion_check",
+        ),
+        {
+            "schema": _PTG2_DATABASE_SCHEMA,
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    state = Column(String(16), nullable=False)
+    contract = Column(String(48), nullable=False)
+    map_format = Column(String(32), nullable=False)
+    map_digest = Column(LargeBinary)
+    canonical_mapping_digest = Column(LargeBinary)
+    canonical_byte_count = Column(BigInteger, nullable=False, server_default=text("0"))
+    target_identity_digest = Column(LargeBinary)
+    object_kind_count = Column(Integer, nullable=False, server_default=text("6"))
+    map_pack_count = Column(BigInteger, nullable=False, server_default=text("0"))
+    coordinate_count = Column(BigInteger, nullable=False, server_default=text("0"))
+    entry_count = Column(BigInteger, nullable=False, server_default=text("0"))
+    logical_byte_count = Column(BigInteger, nullable=False, server_default=text("0"))
+    stored_map_byte_count = Column(
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    )
+    target_block_count = Column(BigInteger, nullable=False, server_default=text("0"))
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+    completed_at = Column(DateTime(timezone=True))
+
+
+class PTG2V4FinalizerMapPack(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v4_finalizer_map_pack"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "object_kind",
+            "pack_no",
+            name="ptg2_v4_finalizer_map_pack_pkey",
+        ),
+        UniqueConstraint(
+            "snapshot_key",
+            "object_kind",
+            "first_block_key",
+            "first_fragment_no",
+            name="ptg2_v4_finalizer_map_pack_start_key",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}."
+                "ptg2_v4_finalizer_map_root.snapshot_key"
+            ],
+            name="ptg2_v4_finalizer_map_pack_root_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["map_block_hash"],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_block.block_hash"],
+            name="ptg2_v4_finalizer_map_pack_block_fkey",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "object_kind IN ('by_code_provider_shard_v1', "
+            "'by_code_price_page_v4', 'by_code_price_dictionary', "
+            "'provider_set_count_dictionary', 'provider_set_codes_v3', "
+            "'provider_set_page_v3_s2')",
+            name="ptg2_v4_finalizer_map_pack_kind_check",
+        ),
+        CheckConstraint(
+            "pack_no >= 0",
+            name="ptg2_v4_finalizer_map_pack_number_check",
+        ),
+        CheckConstraint(
+            "first_block_key >= 0 AND first_fragment_no >= 0 "
+            "AND last_block_key >= 0 AND last_fragment_no >= 0 "
+            "AND ROW(first_block_key, first_fragment_no) "
+            "<= ROW(last_block_key, last_fragment_no)",
+            name="ptg2_v4_finalizer_map_pack_range_check",
+        ),
+        CheckConstraint(
+            "coordinate_count BETWEEN 1 AND 256 AND entry_count >= 0 "
+            "AND logical_byte_count >= 0",
+            name="ptg2_v4_finalizer_map_pack_counts_check",
+        ),
+        CheckConstraint(
+            "octet_length(map_block_hash) = 32",
+            name="ptg2_v4_finalizer_map_pack_hash_check",
+        ),
+        Index("ptg2_v4_finalizer_map_pack_block_hash_idx", "map_block_hash"),
+        {
+            "schema": _PTG2_DATABASE_SCHEMA,
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    object_kind = Column(String(64), nullable=False)
+    pack_no = Column(Integer, nullable=False)
+    first_block_key = Column(BigInteger, nullable=False)
+    first_fragment_no = Column(Integer, nullable=False)
+    last_block_key = Column(BigInteger, nullable=False)
+    last_fragment_no = Column(Integer, nullable=False)
+    coordinate_count = Column(Integer, nullable=False)
+    entry_count = Column(BigInteger, nullable=False)
+    logical_byte_count = Column(BigInteger, nullable=False)
+    map_block_hash = Column(LargeBinary, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+
+
+class PTG2V4FinalizerMapTarget(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_v4_finalizer_map_target"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "snapshot_key",
+            "block_hash",
+            name="ptg2_v4_finalizer_map_target_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["snapshot_key"],
+            [
+                f"{_PTG2_DATABASE_SCHEMA}."
+                "ptg2_v4_finalizer_map_root.snapshot_key"
+            ],
+            name="ptg2_v4_finalizer_map_target_root_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["block_hash"],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_block.block_hash"],
+            name="ptg2_v4_finalizer_map_target_block_fkey",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "octet_length(block_hash) = 32",
+            name="ptg2_v4_finalizer_map_target_hash_check",
+        ),
+        Index("ptg2_v4_finalizer_map_target_block_hash_idx", "block_hash"),
+        {
+            "schema": _PTG2_DATABASE_SCHEMA,
+            "extend_existing": True,
+        },
+    )
+
+    snapshot_key = Column(BigInteger, nullable=False)
+    block_hash = Column(LargeBinary, nullable=False)
+
+
 class PTG2V4NPIScope(Base, JSONOutputMixin):
     __tablename__ = "ptg2_v4_npi_scope"
     __main_table__ = __tablename__

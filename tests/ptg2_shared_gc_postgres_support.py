@@ -22,36 +22,12 @@ from tests.ptg2_shared_gc_test_support import (
     _hash,
     _patch_v4_abandonment_pipeline,
 )
-from tests.ptg2_shared_gc_schema_support import _create_gc_block_schema
-
-
-async def _create_gc_layout_schema(connection, schema: str) -> None:
-    await connection.status(
-        f"CREATE TABLE {schema}.ptg2_snapshot "
-        "(snapshot_id varchar(96) PRIMARY KEY, manifest jsonb)"
-    )
-    await connection.status(
-        f"""
-        CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
-            snapshot_key bigint PRIMARY KEY,
-            generation varchar(32) NOT NULL,
-            state varchar(16) NOT NULL,
-            created_at timestamptz NOT NULL,
-            heartbeat_at timestamptz NOT NULL,
-            lease_until timestamptz
-        )
-        """
-    )
-    await connection.status(
-        f"""
-        CREATE TABLE {schema}.ptg2_v3_snapshot_binding (
-            snapshot_id varchar(96) PRIMARY KEY
-                REFERENCES {schema}.ptg2_snapshot(snapshot_id) ON DELETE CASCADE,
-            snapshot_key bigint NOT NULL
-                REFERENCES {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE RESTRICT
-        )
-        """
-    )
+from tests.ptg2_shared_gc_schema_support import (
+    _create_gc_block_schema,
+    _create_gc_layout_schema,
+    _insert_gc_build_pins,
+    _insert_gc_finalizer_fixture,
+)
 
 
 async def _insert_gc_layout_fixture(connection, schema: str) -> None:
@@ -271,6 +247,34 @@ _V4_ABANDONMENT_TABLE_TEMPLATES = (
         PRIMARY KEY (snapshot_key, object_kind, pack_no)
     )
     """,
+    """
+    CREATE TABLE {schema}.ptg2_v4_finalizer_map_root (
+        snapshot_key bigint PRIMARY KEY
+            REFERENCES {schema}.ptg2_v3_snapshot_layout(snapshot_key)
+            ON DELETE CASCADE,
+        state varchar(16) NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE {schema}.ptg2_v4_finalizer_map_pack (
+        snapshot_key bigint NOT NULL
+            REFERENCES {schema}.ptg2_v4_finalizer_map_root(snapshot_key)
+            ON DELETE CASCADE,
+        map_block_hash bytea NOT NULL
+            REFERENCES {schema}.ptg2_v3_block(block_hash),
+        PRIMARY KEY (snapshot_key, map_block_hash)
+    )
+    """,
+    """
+    CREATE TABLE {schema}.ptg2_v4_finalizer_map_target (
+        snapshot_key bigint NOT NULL
+            REFERENCES {schema}.ptg2_v4_finalizer_map_root(snapshot_key)
+            ON DELETE CASCADE,
+        block_hash bytea NOT NULL
+            REFERENCES {schema}.ptg2_v3_block(block_hash),
+        PRIMARY KEY (snapshot_key, block_hash)
+    )
+    """,
 )
 _V4_ABANDONMENT_RESERVED_TABLES = frozenset(
     {
@@ -367,10 +371,12 @@ async def _insert_v4_abandonment_fixture(
     """Populate one owned V4 layout with pins plus one unrelated owner."""
 
     layout_hashes = tuple(_hash(hash_seed) for hash_seed in (31, 32, 33))
-    block_hashes = (_hash(0), *layout_hashes)
+    finalizer_hashes = tuple(_hash(hash_seed) for hash_seed in (34, 35))
+    block_hashes = (_hash(0), *layout_hashes, *finalizer_hashes)
     await _insert_v4_layout_and_blocks(
         connection, schema, build_token, block_hashes, layout_hashes
     )
+    await _insert_gc_finalizer_fixture(connection, schema, finalizer_hashes)
     for table_name in shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES:
         await connection.status(
             f"""
@@ -378,29 +384,7 @@ async def _insert_v4_abandonment_fixture(
             VALUES (77), (77), (77)
             """
         )
-    for pin_token in ("stage-a", "stage-b"):
-        for block_hash in block_hashes:
-            await connection.status(
-                f"""
-                INSERT INTO {schema}.ptg2_block_build_pin
-                    (snapshot_key, build_token, pin_token, block_hash,
-                     lease_until)
-                VALUES (77, :build_token, :pin_token, :block_hash,
-                        transaction_timestamp() + INTERVAL '1 hour')
-                """,
-                build_token=build_token,
-                pin_token=pin_token,
-                block_hash=block_hash,
-            )
-    await connection.status(
-        f"""
-        INSERT INTO {schema}.ptg2_block_build_pin
-            (snapshot_key, build_token, pin_token, block_hash, lease_until)
-        VALUES (78, 'unrelated-build-token', 'unrelated-stage', :block_hash,
-                transaction_timestamp() + INTERVAL '1 hour')
-        """,
-        block_hash=block_hashes[0],
-    )
+    await _insert_gc_build_pins(connection, schema, build_token, block_hashes)
     return block_hashes
 
 
@@ -431,7 +415,7 @@ async def _assert_partial_v4_abandonment(
             )
         )[0]
         assert claimed_token == shared_gc._owned_v4_abandonment_token(build_token)
-        assert tuple(counts) == (4, 3, 6, 2)
+        assert tuple(counts) == (6, 3, 10, 2)
 
 
 async def _assert_completed_v4_abandonment(
@@ -460,7 +444,7 @@ async def _assert_completed_v4_abandonment(
             """
             )
         )[0]
-        assert tuple(counts) == (0, 1, 0, 0, 1, 4, 4)
+        assert tuple(counts) == (0, 1, 0, 0, 1, 6, 6)
         for table_name in shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES:
             count = await connection.scalar(
                 f'SELECT COUNT(*) FROM {schema}."{table_name}"'
