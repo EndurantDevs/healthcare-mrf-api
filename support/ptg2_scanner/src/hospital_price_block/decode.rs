@@ -192,7 +192,7 @@ fn checked_bitmap<'a>(
     row_count: usize,
 ) -> HospitalPriceBlockResult<&'a [u8]> {
     let bitmap = cursor.take(bitmap_bytes(row_count))?;
-    if row_count % 8 != 0 {
+    if !row_count.is_multiple_of(8) {
         let used_mask = (1u8 << (row_count % 8)) - 1;
         if bitmap.last().is_some_and(|byte| byte & !used_mask != 0) {
             return Err(invalid("presence bitmap has nonzero unused bits"));

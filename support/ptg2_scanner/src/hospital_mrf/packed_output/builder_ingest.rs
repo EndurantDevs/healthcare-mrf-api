@@ -24,28 +24,29 @@ impl PackedOutputBuilder {
                 "hospital MRF packed version_id exceeds 64 UTF-8 bytes",
             ));
         }
-        let mut sinks = Vec::with_capacity(3);
-        sinks.push(PackedSink::create(
-            output_directory,
-            "service_block",
-            version_id,
-            Arc::clone(&retained_bytes),
-            max_output_bytes,
-        )?);
-        sinks.push(PackedSink::create(
-            output_directory,
-            "fact_block",
-            version_id,
-            Arc::clone(&retained_bytes),
-            max_output_bytes,
-        )?);
-        sinks.push(PackedSink::create(
-            output_directory,
-            "selector_page",
-            version_id,
-            retained_bytes,
-            max_output_bytes,
-        )?);
+        let sinks = vec![
+            PackedSink::create(
+                output_directory,
+                "service_block",
+                version_id,
+                Arc::clone(&retained_bytes),
+                max_output_bytes,
+            )?,
+            PackedSink::create(
+                output_directory,
+                "fact_block",
+                version_id,
+                Arc::clone(&retained_bytes),
+                max_output_bytes,
+            )?,
+            PackedSink::create(
+                output_directory,
+                "selector_page",
+                version_id,
+                retained_bytes,
+                max_output_bytes,
+            )?,
+        ];
 
         let selector_spool_path = output_directory.join(".selector_refs.partial");
         let selector_sorted_path = output_directory.join(".selector_refs.sorted.partial");

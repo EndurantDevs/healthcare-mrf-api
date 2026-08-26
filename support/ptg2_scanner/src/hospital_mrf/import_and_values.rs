@@ -53,9 +53,11 @@ pub fn run_hospital_mrf_cli(args: &[String]) -> io::Result<()> {
         &args[1],
         Path::new(&args[2]),
         Path::new(&args[3]),
-        load_max_fanout_rows()?,
-        max_decompressed_bytes,
-        max_output_bytes,
+        HospitalMrfLimits::new(
+            load_max_fanout_rows()?,
+            max_decompressed_bytes,
+            max_output_bytes,
+        ),
         output_mode,
     )?;
     let stdout = io::stdout();
@@ -100,9 +102,7 @@ fn import_hospital_mrf_with_limits(
         version_id,
         input_path,
         output_directory,
-        max_fanout_rows,
-        max_decompressed_bytes,
-        max_output_bytes,
+        HospitalMrfLimits::new(max_fanout_rows, max_decompressed_bytes, max_output_bytes),
         HospitalMrfOutputMode::Legacy,
     )
 }
@@ -112,18 +112,16 @@ fn import_hospital_mrf_with_output_mode(
     version_id: &str,
     input_path: &Path,
     output_directory: &Path,
-    max_fanout_rows: usize,
-    max_decompressed_bytes: u64,
-    max_output_bytes: u64,
+    limits: HospitalMrfLimits,
     output_mode: HospitalMrfOutputMode,
 ) -> io::Result<HospitalMrfSummary> {
-    if max_fanout_rows == 0 {
+    if limits.max_fanout_rows == 0 {
         return Err(invalid("hospital MRF max fanout rows must be positive"));
     }
-    if max_output_bytes == 0 {
+    if limits.max_output_bytes == 0 {
         return Err(invalid("hospital MRF max output bytes must be positive"));
     }
-    if max_decompressed_bytes == 0 {
+    if limits.max_decompressed_bytes == 0 {
         return Err(invalid(
             "hospital MRF max decompressed bytes must be positive",
         ));
@@ -138,9 +136,7 @@ fn import_hospital_mrf_with_output_mode(
             version_id,
             input_path,
             output_directory,
-            max_fanout_rows,
-            max_decompressed_bytes,
-            max_output_bytes,
+            limits,
             output_mode,
         )?
     } else {
@@ -159,14 +155,12 @@ fn import_hospital_mrf_with_output_mode(
                 )?)
             }
         };
-        let outputs = parse_hospital_payload(
+        let outputs = parse_hospital_payload_with_output_mode(
             format,
             reader,
             version_id,
             output_directory,
-            max_fanout_rows,
-            max_decompressed_bytes,
-            max_output_bytes,
+            limits,
             output_mode,
         )?;
         (compressed_input_bytes.load(Ordering::Relaxed), outputs)
@@ -187,37 +181,12 @@ fn import_hospital_mrf_with_output_mode(
         schema_revision,
         format: format.as_str(),
         compressed_input_bytes,
-        max_fanout_rows,
-        max_decompressed_bytes,
-        max_output_bytes,
+        max_fanout_rows: limits.max_fanout_rows,
+        max_decompressed_bytes: limits.max_decompressed_bytes,
+        max_output_bytes: limits.max_output_bytes,
         artifacts: outputs.artifacts,
         root: outputs.root,
     })
-}
-
-fn parse_hospital_payload<R: Read>(
-    format: InputFormat,
-    reader: R,
-    version_id: &str,
-    output_directory: &Path,
-    max_fanout_rows: usize,
-    max_decompressed_bytes: u64,
-    max_output_bytes: u64,
-    output_mode: HospitalMrfOutputMode,
-) -> io::Result<HospitalMrfArtifacts> {
-    parse_hospital_payload_with_output_mode(
-        format,
-        reader,
-        version_id,
-        output_directory,
-        HospitalMrfLimits {
-            max_fanout_rows,
-            max_decompressed_bytes,
-            max_output_bytes,
-            max_input_value_bytes: MAX_INPUT_VALUE_BYTES,
-        },
-        output_mode,
-    )
 }
 
 #[cfg(test)]

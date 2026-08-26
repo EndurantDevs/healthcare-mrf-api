@@ -7,15 +7,15 @@ mod tests {
             charge_key: service,
             payer_name: payer.to_owned(),
             plan_name: plan.to_owned(),
-            negotiated_dollar: (service % 2 == 0).then(|| format!("{service}.00")),
+            negotiated_dollar: service.is_multiple_of(2).then(|| format!("{service}.00")),
             negotiated_percentage: (service % 2 == 1).then(|| "87.125".to_owned()),
-            negotiated_algorithm: (service % 3 == 0).then(|| "fee less 3%".to_owned()),
+            negotiated_algorithm: service.is_multiple_of(3).then(|| "fee less 3%".to_owned()),
             methodology: "fee schedule".to_owned(),
             median_amount: Some(format!("{service}.50")),
             percentile_10: Some(format!("{service}.00")),
             percentile_90: Some(format!("{service}.99")),
             allowed_count: Some("11".to_owned()),
-            additional_payer_notes: (service % 2 == 0).then(|| "reviewed".to_owned()),
+            additional_payer_notes: service.is_multiple_of(2).then(|| "reviewed".to_owned()),
             comparison_amount: Some(format!("{service}.50")),
         }
     }

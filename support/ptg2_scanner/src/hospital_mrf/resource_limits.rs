@@ -6,6 +6,17 @@ struct HospitalMrfLimits {
     max_input_value_bytes: u64,
 }
 
+impl HospitalMrfLimits {
+    fn new(max_fanout_rows: usize, max_decompressed_bytes: u64, max_output_bytes: u64) -> Self {
+        Self {
+            max_fanout_rows,
+            max_decompressed_bytes,
+            max_output_bytes,
+            max_input_value_bytes: MAX_INPUT_VALUE_BYTES,
+        }
+    }
+}
+
 struct BoundedDecompressedReader<R> {
     inner: R,
     remaining: u64,

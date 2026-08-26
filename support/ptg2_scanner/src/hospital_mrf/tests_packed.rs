@@ -13,9 +13,11 @@ fn import_packed(
         VERSION_ID,
         &input_path,
         &output_directory,
-        DEFAULT_MAX_FANOUT_ROWS,
-        TEST_MAX_DECOMPRESSED_BYTES,
-        max_output_bytes,
+        HospitalMrfLimits::new(
+            DEFAULT_MAX_FANOUT_ROWS,
+            TEST_MAX_DECOMPRESSED_BYTES,
+            max_output_bytes,
+        ),
         HospitalMrfOutputMode::Packed,
     )
     .unwrap();
@@ -40,9 +42,11 @@ fn assert_packed_nul_rejected(payload: &serde_json::Value) {
         VERSION_ID,
         &input_path,
         &output_directory,
-        DEFAULT_MAX_FANOUT_ROWS,
-        TEST_MAX_DECOMPRESSED_BYTES,
-        TEST_MAX_OUTPUT_BYTES,
+        HospitalMrfLimits::new(
+            DEFAULT_MAX_FANOUT_ROWS,
+            TEST_MAX_DECOMPRESSED_BYTES,
+            TEST_MAX_OUTPUT_BYTES,
+        ),
         HospitalMrfOutputMode::Packed,
     )
     .unwrap_err();
@@ -188,9 +192,11 @@ fn packed_mode_emits_ordered_artifacts_root_and_shared_budget() {
         VERSION_ID,
         &input_path,
         &failed_output,
-        DEFAULT_MAX_FANOUT_ROWS,
-        TEST_MAX_DECOMPRESSED_BYTES,
-        retained_bytes - 1,
+        HospitalMrfLimits::new(
+            DEFAULT_MAX_FANOUT_ROWS,
+            TEST_MAX_DECOMPRESSED_BYTES,
+            retained_bytes - 1,
+        ),
         HospitalMrfOutputMode::Packed,
     )
     .unwrap_err();
@@ -330,9 +336,11 @@ fn packed_zip_matches_plain_and_late_finish_failure_cleans_everything() {
         VERSION_ID,
         &input_path,
         &output_directory,
-        DEFAULT_MAX_FANOUT_ROWS,
-        TEST_MAX_DECOMPRESSED_BYTES,
-        TEST_MAX_OUTPUT_BYTES,
+        HospitalMrfLimits::new(
+            DEFAULT_MAX_FANOUT_ROWS,
+            TEST_MAX_DECOMPRESSED_BYTES,
+            TEST_MAX_OUTPUT_BYTES,
+        ),
         HospitalMrfOutputMode::Packed,
     )
     .unwrap();
