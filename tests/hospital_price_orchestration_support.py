@@ -192,6 +192,7 @@ def orchestrator_module() -> Any:
     sys.modules[orchestrator_name] = orchestrator
     try:
         orchestrator_spec.loader.exec_module(orchestrator)
+        orchestrator._hospital_price_artifact_store = lambda: ArtifactStore()
         return orchestrator
     finally:
         for module_name, prior_module in prior_module_by_name.items():

@@ -8,6 +8,7 @@ import asyncio
 import os
 import shutil
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Sequence
 
 from process.control_cancel import raise_if_cancelled
@@ -27,6 +28,19 @@ HOSPITAL_MRF_SELECTOR_KEY_MEMORY_BYTES = 256 * 1024**2
 HOSPITAL_MRF_PARSER_BASE_MEMORY_BYTES = 256 * 1024**2
 DEFAULT_FETCH_CONCURRENCY = 8
 DEFAULT_LOAD_CONCURRENCY = 2
+HOSPITAL_PRICE_ARTIFACT_DIR_ENV = "HLTHPRT_HOSPITAL_PRICE_ARTIFACT_DIR"
+
+
+def hospital_price_artifact_store() -> PTG2ArtifactStore:
+    """Open the dedicated shared hospital-price artifact volume."""
+
+    raw_root = os.getenv(HOSPITAL_PRICE_ARTIFACT_DIR_ENV, "").strip()
+    root = Path(raw_root)
+    if not raw_root or not root.is_absolute():
+        raise RuntimeError(
+            f"{HOSPITAL_PRICE_ARTIFACT_DIR_ENV} must be an absolute path"
+        )
+    return PTG2ArtifactStore(root)
 
 
 def strict_positive_env(name: str, default: int | None = None) -> int:

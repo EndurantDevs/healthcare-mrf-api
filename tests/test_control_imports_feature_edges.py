@@ -14,16 +14,21 @@ control_imports = importlib.import_module("api.control_imports")
 async def test_hospital_registry_validation_runs_off_event_loop(monkeypatch):
     event_loop_thread = threading.get_ident()
     validation_threads: list[int] = []
+    artifact_store = object()
 
     def validate(_params):
         validation_threads.append(threading.get_ident())
         return ({"cms_hpt_url": "https://hospital.example/cms-hpt.txt"},)
 
-    def capacity(_store, locator_count):
+    def capacity(store, locator_count):
         validation_threads.append(threading.get_ident())
+        assert store is artifact_store
         assert locator_count == 1
 
     monkeypatch.setattr(control_imports, "selected_hospital_hpt_registry", validate)
+    monkeypatch.setattr(
+        control_imports, "hospital_price_artifact_store", lambda: artifact_store
+    )
     monkeypatch.setattr(control_imports, "configured_resource_limits", capacity)
 
     await control_imports._validate_hospital_price_params("hospital-prices", {})

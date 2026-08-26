@@ -35,6 +35,19 @@ def _configure_resource_budgets(orchestrator, monkeypatch) -> int:
     return parser_memory
 
 
+def test_artifact_store_requires_dedicated_absolute_root(tmp_path, monkeypatch):
+    orchestrator = _orchestrator_module()
+    env_name = orchestrator._runtime.HOSPITAL_PRICE_ARTIFACT_DIR_ENV
+    monkeypatch.delenv(env_name, raising=False)
+    with pytest.raises(RuntimeError, match="must be an absolute path"):
+        orchestrator._runtime.hospital_price_artifact_store()
+    monkeypatch.setenv(env_name, "relative")
+    with pytest.raises(RuntimeError, match="must be an absolute path"):
+        orchestrator._runtime.hospital_price_artifact_store()
+    monkeypatch.setenv(env_name, str(tmp_path))
+    assert orchestrator._runtime.hospital_price_artifact_store().root == tmp_path
+
+
 def test_resource_limits_derive_workers_from_explicit_byte_budgets(
     tmp_path, monkeypatch
 ):

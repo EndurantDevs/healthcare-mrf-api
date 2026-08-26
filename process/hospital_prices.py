@@ -74,6 +74,7 @@ DEFAULT_ATTEMPT_HEARTBEAT_SECONDS = 60
 _bounded = _runtime.bounded
 _cancel_and_drain = _runtime.cancel_and_drain
 _guard_cancellation = _runtime.guard_cancellation
+_hospital_price_artifact_store = _runtime.hospital_price_artifact_store
 _hospital_resource_lock = _runtime.hospital_resource_lock
 _locator_groups = _runtime.locator_groups
 _progress = _runtime.progress
@@ -427,7 +428,7 @@ async def refresh_hospital_prices(
     hospitals = await asyncio.to_thread(
         selected_hospital_hpt_registry, task_by_name, runtime=True
     )
-    store, attempts = PTG2ArtifactStore(), []
+    store, attempts = _hospital_price_artifact_store(), []
     owner = f"hospital-prices:{task_by_name.get('run_id') or uuid.uuid4().hex}"
     if len(owner) > 128:
         raise ValueError("hospital price run owner is invalid")

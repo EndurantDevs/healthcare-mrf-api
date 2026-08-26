@@ -348,7 +348,7 @@ async def test_refresh_sweeps_under_resource_lock_before_database_network(
     monkeypatch.setattr(
         orchestrator, "selected_hospital_hpt_registry", lambda *_args, **_kwargs: ()
     )
-    monkeypatch.setattr(orchestrator, "PTG2ArtifactStore", lambda: store)
+    monkeypatch.setattr(orchestrator, "_hospital_price_artifact_store", lambda: store)
     monkeypatch.setattr(orchestrator, "positive_env", lambda _name, default: default)
 
     @contextlib.asynccontextmanager
