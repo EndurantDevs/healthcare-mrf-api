@@ -35,7 +35,10 @@ impl HospitalPriceSelectorKind {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum HospitalPriceSelectorKey {
-    Code(String),
+    Code {
+        code_type: String,
+        code: String,
+    },
     PayerPlan {
         payer_name: String,
         plan_name: String,
@@ -45,7 +48,7 @@ pub enum HospitalPriceSelectorKey {
 impl HospitalPriceSelectorKey {
     pub fn kind(&self) -> HospitalPriceSelectorKind {
         match self {
-            Self::Code(_) => HospitalPriceSelectorKind::CodeToCharge,
+            Self::Code { .. } => HospitalPriceSelectorKind::CodeToCharge,
             Self::PayerPlan { .. } => HospitalPriceSelectorKind::PayerPlanToFact,
         }
     }
@@ -121,7 +124,9 @@ fn entry_raw_len(entry: &HospitalPriceSelectorEntry) -> HospitalPriceSelectorBlo
         return Err(invalid("selector row has no references"));
     }
     let key_bytes = match &entry.key {
-        HospitalPriceSelectorKey::Code(code) => checked_text_len(code)?,
+        HospitalPriceSelectorKey::Code { code_type, code } => {
+            checked_text_len(code_type)? + checked_text_len(code)?
+        }
         HospitalPriceSelectorKey::PayerPlan {
             payer_name,
             plan_name,
@@ -174,7 +179,10 @@ fn encode_raw(entries: &[HospitalPriceSelectorEntry]) -> (Vec<u8>, usize) {
     let mut raw = Vec::with_capacity(raw_len);
     for entry in entries {
         match &entry.key {
-            HospitalPriceSelectorKey::Code(code) => put_text(&mut raw, code),
+            HospitalPriceSelectorKey::Code { code_type, code } => {
+                put_text(&mut raw, code_type);
+                put_text(&mut raw, code);
+            }
             HospitalPriceSelectorKey::PayerPlan {
                 payer_name,
                 plan_name,
@@ -382,9 +390,10 @@ fn decode_key(
     cursor: &mut SliceCursor<'_>,
 ) -> HospitalPriceSelectorBlockResult<HospitalPriceSelectorKey> {
     Ok(match kind {
-        HospitalPriceSelectorKind::CodeToCharge => {
-            HospitalPriceSelectorKey::Code(cursor.text()?.to_owned())
-        }
+        HospitalPriceSelectorKind::CodeToCharge => HospitalPriceSelectorKey::Code {
+            code_type: cursor.text()?.to_owned(),
+            code: cursor.text()?.to_owned(),
+        },
         HospitalPriceSelectorKind::PayerPlanToFact => HospitalPriceSelectorKey::PayerPlan {
             payer_name: cursor.text()?.to_owned(),
             plan_name: cursor.text()?.to_owned(),

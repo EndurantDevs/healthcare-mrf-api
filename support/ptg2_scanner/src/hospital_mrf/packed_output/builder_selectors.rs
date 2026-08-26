@@ -45,7 +45,7 @@ impl PackedOutputBuilder {
         }
         let key = &self.selector_keys[ordinal as usize];
         let kind = match key {
-            crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(_) => 1,
+            crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code { .. } => 1,
             crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {
                 ..
             } => 2,
@@ -248,7 +248,7 @@ impl PackedOutputBuilder {
         let mut payer_plan_selector_key_count = 0u64;
         for key in &self.selector_keys {
             match key {
-                crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(_) => {
+                crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code { .. } => {
                     code_selector_key_count += 1;
                 }
                 crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {

@@ -3,8 +3,15 @@ mod tests {
     use super::*;
 
     fn code(key: &str, refs: &[u64]) -> HospitalPriceSelectorEntry {
+        typed_code("CPT", key, refs)
+    }
+
+    fn typed_code(code_type: &str, key: &str, refs: &[u64]) -> HospitalPriceSelectorEntry {
         HospitalPriceSelectorEntry {
-            key: HospitalPriceSelectorKey::Code(key.to_owned()),
+            key: HospitalPriceSelectorKey::Code {
+                code_type: code_type.to_owned(),
+                code: key.to_owned(),
+            },
             refs: refs.to_vec(),
         }
     }
@@ -45,11 +52,17 @@ mod tests {
             vec![code("A01", &[2, 8]), code("Z99", &[3, 7, 9])]
         );
         assert_eq!(
-            page.exact_refs(&HospitalPriceSelectorKey::Code("Z99".to_owned())),
+            page.exact_refs(&HospitalPriceSelectorKey::Code {
+                code_type: "CPT".to_owned(),
+                code: "Z99".to_owned(),
+            }),
             Some(&[3, 7, 9][..])
         );
         assert_eq!(
-            page.exact_refs(&HospitalPriceSelectorKey::Code("missing".to_owned())),
+            page.exact_refs(&HospitalPriceSelectorKey::Code {
+                code_type: "CPT".to_owned(),
+                code: "missing".to_owned(),
+            }),
             None
         );
         assert_eq!(header_u32(&block, 16) as usize, page.row_count());
@@ -92,7 +105,10 @@ mod tests {
             Some(&[2][..])
         );
         assert_eq!(
-            page.exact_refs(&HospitalPriceSelectorKey::Code("a\0bc".to_owned())),
+            page.exact_refs(&HospitalPriceSelectorKey::Code {
+                code_type: "CPT".to_owned(),
+                code: "a\0bc".to_owned(),
+            }),
             None
         );
     }
@@ -405,7 +421,7 @@ mod tests {
         ));
 
         let mut zero_refs = raw.clone();
-        zero_refs[5..9].copy_from_slice(&0u32.to_le_bytes());
+        zero_refs[12..16].copy_from_slice(&0u32.to_le_bytes());
         cases.push((
             "zero row references",
             frame(&zero_refs, 1, 2),
@@ -413,7 +429,7 @@ mod tests {
         ));
 
         let mut too_many_refs = raw.clone();
-        too_many_refs[5..9].copy_from_slice(
+        too_many_refs[12..16].copy_from_slice(
             &((HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_RAW_BYTES / 8) as u32 + 1).to_le_bytes(),
         );
         cases.push((
@@ -444,7 +460,8 @@ mod tests {
         )
         .unwrap();
         let mut duplicate_key = raw_from(&two_rows);
-        duplicate_key[21] = b'A';
+        let second_code_offset = entry_raw_len(&code("A", &[1])).unwrap() + 4 + 3 + 4;
+        duplicate_key[second_code_offset] = b'A';
         cases.push((
             "duplicate key",
             frame(&duplicate_key, 2, 2),
@@ -456,4 +473,6 @@ mod tests {
             assert!(error.contains(expected), "{name}: {error}");
         }
     }
+
+    include!("tests_code_identity.rs");
 }

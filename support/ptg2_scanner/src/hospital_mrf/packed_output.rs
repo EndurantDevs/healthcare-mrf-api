@@ -274,14 +274,14 @@ struct PendingPackedService {
 fn packed_service_code_indexes(row: &ServiceRow) -> io::Result<Vec<usize>> {
     let mut raw_bytes = 4usize;
     for code in &row.codes {
-        if code.code.len()
-            > crate::hospital_price_selector_block::HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES
-        {
-            return Err(invalid(
-                "hospital MRF packed selector key component exceeds 1 MiB",
-            ));
-        }
         for value in [&code.code_type, &code.code] {
+            if value.len()
+                > crate::hospital_price_selector_block::HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES
+            {
+                return Err(invalid(
+                    "hospital MRF packed selector key component exceeds 1 MiB",
+                ));
+            }
             raw_bytes += 4 + value.len();
         }
         if raw_bytes
@@ -293,8 +293,14 @@ fn packed_service_code_indexes(row: &ServiceRow) -> io::Result<Vec<usize>> {
         }
     }
     let mut indexes = (0..row.codes.len()).collect::<Vec<_>>();
-    indexes.sort_unstable_by(|left, right| row.codes[*left].code.cmp(&row.codes[*right].code));
-    indexes.dedup_by(|left, right| row.codes[*left].code == row.codes[*right].code);
+    indexes.sort_unstable_by(|left, right| {
+        (&row.codes[*left].code_type, &row.codes[*left].code)
+            .cmp(&(&row.codes[*right].code_type, &row.codes[*right].code))
+    });
+    indexes.dedup_by(|left, right| {
+        row.codes[*left].code_type == row.codes[*right].code_type
+            && row.codes[*left].code == row.codes[*right].code
+    });
     Ok(indexes)
 }
 

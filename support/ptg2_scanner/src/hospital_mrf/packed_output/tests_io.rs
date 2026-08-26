@@ -218,7 +218,7 @@
                 File::open(&path).unwrap(),
             ));
             assert!(output
-                .write_selector_ref(HospitalPriceSelectorKey::Code("x".to_owned()), 0)
+                .write_selector_ref(selector_code("x"), 0)
                 .is_err());
         }
 
@@ -253,7 +253,7 @@
         let directory = tempfile::tempdir().unwrap();
         let mut output = builder(directory.path());
         output
-            .selector_key_ordinal(HospitalPriceSelectorKey::Code("x".to_owned()))
+            .selector_key_ordinal(selector_code("x"))
             .unwrap();
         fs::write(&output.selector_sorted_path, selector_record(1, 0, 0)).unwrap();
         assert!(output.write_selector_pages(&[]).is_err());
@@ -264,7 +264,7 @@
         let directory = tempfile::tempdir().unwrap();
         let mut output = builder(directory.path());
         assert!(output
-            .selector_key_ordinal(HospitalPriceSelectorKey::Code(oversized.clone()))
+            .selector_key_ordinal(selector_code(oversized.clone()))
             .is_err());
         assert!(selector_ref_capacity(&HospitalPriceSelectorKey::PayerPlan {
             payer_name: oversized.clone(),
@@ -276,7 +276,7 @@
             plan_name: oversized.clone(),
         })
         .is_err());
-        output.selector_keys = vec![HospitalPriceSelectorKey::Code(oversized)];
+        output.selector_keys = vec![selector_code(oversized)];
         fs::write(&output.selector_sorted_path, selector_record(1, 0, 0)).unwrap();
         assert!(output.write_selector_pages(&[1]).is_err());
 
@@ -289,7 +289,7 @@
         fs::write(&path, selector_record(1, 0, 0)).unwrap();
         assert!(count_selector_pages(
             &path,
-            &[HospitalPriceSelectorKey::Code(oversized)],
+            &[selector_code(oversized)],
             1,
             0,
         )
@@ -322,7 +322,7 @@
         let directory = tempfile::tempdir().unwrap();
         let mut output = prepared_builder(directory.path());
         output
-            .write_selector_ref(HospitalPriceSelectorKey::Code("12345".to_owned()), 99)
+            .write_selector_ref(selector_code("12345"), 99)
             .unwrap();
         assert!(output.finish().is_err());
     }

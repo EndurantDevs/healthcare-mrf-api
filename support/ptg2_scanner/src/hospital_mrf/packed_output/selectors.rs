@@ -61,9 +61,10 @@ fn selector_ref_capacity(
     key: &crate::hospital_price_selector_block::HospitalPriceSelectorKey,
 ) -> io::Result<usize> {
     let key_bytes = match key {
-        crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(code) => {
-            selector_text_bytes(code)?
-        }
+        crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code {
+            code_type,
+            code,
+        } => selector_text_bytes(code_type)? + selector_text_bytes(code)?,
         crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {
             payer_name,
             plan_name,
@@ -80,7 +81,10 @@ fn selector_key_memory_bytes(
     key: &crate::hospital_price_selector_block::HospitalPriceSelectorKey,
 ) -> u64 {
     let text_bytes = match key {
-        crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(code) => code.len(),
+        crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code {
+            code_type,
+            code,
+        } => code_type.len() + code.len(),
         crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {
             payer_name,
             plan_name,
@@ -94,8 +98,13 @@ fn selector_key_sha256(
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
     match key {
-        crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(code) => {
+        crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code {
+            code_type,
+            code,
+        } => {
             digest.update(b"code\0");
+            digest.update((code_type.len() as u64).to_le_bytes());
+            digest.update(code_type.as_bytes());
             digest.update((code.len() as u64).to_le_bytes());
             digest.update(code.as_bytes());
         }
@@ -179,7 +188,7 @@ fn count_selector_pages(
         )?;
         validate_selector_kind(kind, key)?;
         let ref_counter = match key {
-            crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(_)
+            crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code { .. }
                 if reference < charge_count =>
             {
                 &mut code_ref_count
@@ -189,7 +198,7 @@ fn count_selector_pages(
             {
                 &mut payer_plan_ref_count
             }
-            crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(_) => {
+            crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code { .. } => {
                 return Err(invalid(
                     "hospital MRF packed code selector reference is outside dense charge keys",
                 ));
@@ -225,7 +234,7 @@ fn count_selector_pages(
     let mut payer_plan_page_count = 0u64;
     for (key, page_count) in keys.iter().zip(&counts) {
         let total = match key {
-            crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(_) => {
+            crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code { .. } => {
                 &mut code_page_count
             }
             crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {

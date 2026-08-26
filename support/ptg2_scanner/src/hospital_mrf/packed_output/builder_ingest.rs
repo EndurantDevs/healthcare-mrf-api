@@ -235,17 +235,19 @@ impl PackedOutputBuilder {
         .selector_code_indexes
         .len();
         for position in 0..selector_code_count {
-            let code = {
+            let (code_type, code) = {
                 let service = self
                     .current_service
                     .as_ref()
                     .expect("active service was validated above");
-                service.codes[service.selector_code_indexes[position]]
-                    .code
-                    .clone()
+                let code = &service.codes[service.selector_code_indexes[position]];
+                (code.code_type.clone(), code.code.clone())
             };
             self.write_selector_ref(
-                crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(code),
+                crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code {
+                    code_type,
+                    code,
+                },
                 charge.charge_key as u64,
             )?;
         }

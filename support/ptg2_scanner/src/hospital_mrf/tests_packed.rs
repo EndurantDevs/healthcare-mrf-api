@@ -212,6 +212,10 @@ fn packed_selector_spool_deduplicates_codes_per_charge() {
     payload["standard_charge_information"][0]["code_information"]
         .as_array_mut()
         .unwrap()
+        .push(json!({"code": "70551", "type": "CPT"}));
+    payload["standard_charge_information"][0]["code_information"]
+        .as_array_mut()
+        .unwrap()
         .push(json!({"code": "70551", "type": "HCPCS"}));
     let (_, summary) = import_packed_json(
         &serde_json::to_vec(&payload).unwrap(),
@@ -219,10 +223,10 @@ fn packed_selector_spool_deduplicates_codes_per_charge() {
     );
     let root = summary.root.unwrap();
 
-    assert_eq!(root.code_selector_key_count, 1);
-    assert_eq!(root.code_selector_ref_count, 1);
+    assert_eq!(root.code_selector_key_count, 2);
+    assert_eq!(root.code_selector_ref_count, 2);
     assert_eq!(root.payer_plan_selector_ref_count, 1);
-    assert_eq!(root.selector_spool_bytes, 2 * SELECTOR_SPOOL_RECORD_BYTES as u64);
+    assert_eq!(root.selector_spool_bytes, 3 * SELECTOR_SPOOL_RECORD_BYTES as u64);
     assert_eq!(root.peak_scratch_bytes, root.selector_spool_bytes * 3);
 }
 
@@ -237,18 +241,19 @@ fn selector_key_memory_is_bounded_before_retaining_a_new_key() {
     )
     .unwrap();
     for suffix in ["a", "b"] {
-        let key = crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(
-            format!("{suffix}{}", "x".repeat(99)),
-        );
+        let key = crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code {
+            code_type: "CPT".to_owned(),
+            code: format!("{suffix}{}", "x".repeat(99)),
+        };
         builder.selector_key_ordinal(key).unwrap();
     }
     let retained_bytes = builder.selector_key_memory_bytes;
     let error = builder
         .selector_key_ordinal(
-            crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(format!(
-                "c{}",
-                "x".repeat(99)
-            )),
+            crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code {
+                code_type: "CPT".to_owned(),
+                code: format!("c{}", "x".repeat(99)),
+            },
         )
         .unwrap_err();
 

@@ -131,7 +131,7 @@
             .map(|_| tempfile::tempdir().unwrap())
             .collect::<Vec<_>>();
         let mut output = builder(directories[0].path());
-        let key = HospitalPriceSelectorKey::Code("12345".to_owned());
+        let key = selector_code("12345");
         output.selector_key_ordinal(key).unwrap();
         fs::write(
             &output.selector_sorted_path,
@@ -146,7 +146,7 @@
         {
             let mut output = builder(directories[index + 1].path());
             output
-                .selector_key_ordinal(HospitalPriceSelectorKey::Code("12345".to_owned()))
+                .selector_key_ordinal(selector_code("12345"))
                 .unwrap();
             fs::write(&output.selector_sorted_path, record).unwrap();
             assert!(output.write_selector_pages(&[1]).is_err());
@@ -164,7 +164,7 @@
 
         let mut output = builder(directories[4].path());
         output
-            .selector_key_ordinal(HospitalPriceSelectorKey::Code("12345".to_owned()))
+            .selector_key_ordinal(selector_code("12345"))
             .unwrap();
         let mut refs = vec![0];
         assert!(output
@@ -177,10 +177,10 @@
         let directory = tempfile::tempdir().unwrap();
         let mut output = builder(directory.path());
         output
-            .selector_key_ordinal(HospitalPriceSelectorKey::Code("first".to_owned()))
+            .selector_key_ordinal(selector_code("first"))
             .unwrap();
         output
-            .selector_key_ordinal(HospitalPriceSelectorKey::Code("second".to_owned()))
+            .selector_key_ordinal(selector_code("second"))
             .unwrap();
         fs::write(
             &output.selector_sorted_path,
@@ -192,7 +192,7 @@
         let directory = tempfile::tempdir().unwrap();
         let mut output = builder(directory.path());
         output
-            .selector_key_ordinal(HospitalPriceSelectorKey::Code("12345".to_owned()))
+            .selector_key_ordinal(selector_code("12345"))
             .unwrap();
         fail_next_sink_write(&mut output.sinks[2]);
         assert!(output
@@ -249,7 +249,7 @@
         let directory = tempfile::tempdir().unwrap();
         let mut output = builder(directory.path());
         output
-            .write_selector_ref(HospitalPriceSelectorKey::Code("12345".to_owned()), 0)
+            .write_selector_ref(selector_code("12345"), 0)
             .unwrap();
         fs::remove_dir(&output.selector_sort_directory).unwrap();
         assert!(output.finish_selector_pages().is_err());
@@ -257,7 +257,7 @@
         let directory = tempfile::tempdir().unwrap();
         let mut output = builder(directory.path());
         output
-            .write_selector_ref(HospitalPriceSelectorKey::Code("12345".to_owned()), 0)
+            .write_selector_ref(selector_code("12345"), 0)
             .unwrap();
         assert!(output.finish_selector_pages().is_err());
     }

@@ -150,7 +150,7 @@
         use crate::hospital_price_selector_block::HospitalPriceSelectorKey;
 
         let keys = vec![
-            HospitalPriceSelectorKey::Code("12345".to_owned()),
+            selector_code("12345"),
             HospitalPriceSelectorKey::PayerPlan {
                 payer_name: "payer".to_owned(),
                 plan_name: "plan".to_owned(),
@@ -199,12 +199,10 @@
         assert!(add_selector_page_count(&mut [0], 0, &keys[0], usize::MAX).is_err());
 
         let oversized_keys = vec![
-            HospitalPriceSelectorKey::Code(
-                "x".repeat(
-                    crate::hospital_price_selector_block::HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES
-                        + 1,
-                ),
-            ),
+            selector_code("x".repeat(
+                crate::hospital_price_selector_block::HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES
+                    + 1,
+            )),
             keys[1].clone(),
         ];
         write(&[
@@ -212,12 +210,9 @@
             selector_record(2, 1, 0),
         ]);
         assert!(count_selector_pages(&path, &oversized_keys, 1, 1).is_err());
-        assert!(selector_ref_capacity(&HospitalPriceSelectorKey::Code(
-            "x".repeat(
-                crate::hospital_price_selector_block::HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES
-                    + 1
-            )
-        ))
+        assert!(selector_ref_capacity(&selector_code("x".repeat(
+            crate::hospital_price_selector_block::HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES + 1
+        )))
         .is_err());
         assert!(service_block_size_error(
             crate::hospital_price_service_block::HOSPITAL_PRICE_SERVICE_BLOCK_RAW_SIZE_ERROR
@@ -233,19 +228,17 @@
 
     #[test]
     fn selector_builder_rejects_closed_or_over_budget_scratch() {
-        use crate::hospital_price_selector_block::HospitalPriceSelectorKey;
-
         let directories = (0..4)
             .map(|_| tempfile::tempdir().unwrap())
             .collect::<Vec<_>>();
         let mut output = builder(directories[0].path());
         output.max_output_bytes = 257;
         assert!(output
-            .write_selector_ref(HospitalPriceSelectorKey::Code("x".to_owned()), 0)
+            .write_selector_ref(selector_code("x"), 0)
             .is_err());
 
         let mut output = builder(directories[1].path());
-        let key = HospitalPriceSelectorKey::Code("x".to_owned());
+        let key = selector_code("x");
         output.selector_key_ordinal(key.clone()).unwrap();
         output.max_output_bytes = 38;
         assert!(output.write_selector_ref(key, 0).is_err());
@@ -253,13 +246,13 @@
         let mut output = builder(directories[2].path());
         output.selector_spool_bytes = u64::MAX;
         assert!(output
-            .write_selector_ref(HospitalPriceSelectorKey::Code("x".to_owned()), 0)
+            .write_selector_ref(selector_code("x"), 0)
             .is_err());
 
         let mut output = builder(directories[3].path());
         output.selector_spool = None;
         assert!(output
-            .write_selector_ref(HospitalPriceSelectorKey::Code("x".to_owned()), 0)
+            .write_selector_ref(selector_code("x"), 0)
             .is_err());
         assert!(output.finish_selector_pages().is_err());
 
@@ -270,16 +263,16 @@
         let directory = tempfile::tempdir().unwrap();
         let mut output = builder(directory.path());
         output
-            .write_selector_ref(HospitalPriceSelectorKey::Code("x".to_owned()), 0)
+            .write_selector_ref(selector_code("x"), 0)
             .unwrap();
         fs::remove_file(&output.selector_spool_path).unwrap();
         assert!(output.finish_selector_pages().is_err());
 
         let directory = tempfile::tempdir().unwrap();
         let mut output = builder(directory.path());
-        output.selector_keys = vec![HospitalPriceSelectorKey::Code(String::new()); MAX_SELECTOR_KEYS];
+        output.selector_keys = vec![selector_code(String::new()); MAX_SELECTOR_KEYS];
         assert!(output
-            .selector_key_ordinal(HospitalPriceSelectorKey::Code("new".to_owned()))
+            .selector_key_ordinal(selector_code("new"))
             .is_err());
     }
 
@@ -332,4 +325,32 @@
         )
         .unwrap();
         emit_service(&mut outputs, "version-1", 0, &service()).unwrap();
+    }
+    fn selector_code(
+        code: impl Into<String>,
+    ) -> crate::hospital_price_selector_block::HospitalPriceSelectorKey {
+        selector_code_with_type("CPT", code)
+    }
+
+    fn selector_code_with_type(
+        code_type: impl Into<String>,
+        code: impl Into<String>,
+    ) -> crate::hospital_price_selector_block::HospitalPriceSelectorKey {
+        crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code {
+            code_type: code_type.into(),
+            code: code.into(),
+        }
+    }
+
+    #[test]
+    fn selector_code_identity_includes_code_type() {
+        assert_ne!(
+            selector_key_sha256(&selector_code_with_type("CPT", "12345")),
+            selector_key_sha256(&selector_code_with_type("HCPCS", "12345")),
+        );
+        let mut row = service();
+        row.codes[0].code_type = "x".repeat(
+            crate::hospital_price_selector_block::HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES + 1,
+        );
+        assert!(packed_service_code_indexes(&row).is_err());
     }
