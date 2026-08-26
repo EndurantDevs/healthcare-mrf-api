@@ -8305,7 +8305,12 @@ def _alohr_telecom(*telecom_items: Any) -> list[dict[str, Any]]:
         if isinstance(telecom_item_by_field, list):
             nested_telecom_items = telecom_item_by_field
         elif isinstance(telecom_item_by_field, dict):
-            nested_telecom_items = telecom_item_by_field.get("contacts") or []
+            contacts = telecom_item_by_field.get("contacts")
+            nested_telecom_items = (
+                [contacts]
+                if isinstance(contacts, dict)
+                else contacts if isinstance(contacts, list) else []
+            )
         else:
             telecom_value = _clean_text(telecom_item_by_field)
             if telecom_value:
