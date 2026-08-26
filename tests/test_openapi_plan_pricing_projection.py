@@ -9,8 +9,12 @@ import yaml
 OPENAPI_PATH = Path("doc/openapi.yaml")
 
 
-def test_openapi_documents_card_and_aggregate_projection_shapes():
-    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+def _openapi_spec():
+    return yaml.safe_load(OPENAPI_PATH.read_text())
+
+
+def test_openapi_documents_projection_view_routing():
+    spec = _openapi_spec()
     for path in (
         "/pricing/providers/search-by-procedure",
         "/pricing/providers/by-procedure",
@@ -22,16 +26,41 @@ def test_openapi_documents_card_and_aggregate_projection_shapes():
         assert view_parameter["schema"] == {
             "type": "string",
             "enum": ["full", "card"],
-            "default": "full",
         }
+        assert "default" not in view_parameter["schema"]
         description = " ".join(view_parameter["description"].split())
         assert "pre-rendered provider cards" in description
         assert "With `view=card`, `include_providers=false`" in description
         assert "retain the existing aggregate reader" in description
-        assert "`view=full` preserves the existing PTG/TiC response" in description
+        assert "Omitting `view` with explicit" in description
+        assert "no ready projection" in description
+        assert "Only explicit `view=card` requires" in description
+        assert "`view=full` always preserves the existing PTG/TiC" in description
 
+
+def test_openapi_documents_projection_response_shapes():
+    spec = _openapi_spec()
     schemas = spec["components"]["schemas"]
     response = schemas["PricingProcedureProviderListResponse"]
+    assert response["properties"]["plan_version_id"] == {
+        "type": "string",
+        "nullable": True,
+        "pattern": "^hpversion_[0-9A-HJKMNP-TV-Z]{26}$",
+    }
+    assert response["properties"]["serving_revision_id"] == {
+        "type": "string",
+        "nullable": True,
+        "pattern": "^hpserve_[0-9A-HJKMNP-TV-Z]{26}$",
+    }
+    assert response["properties"]["serving_revision_published_at"] == {
+        "type": "string",
+        "format": "date-time",
+        "nullable": True,
+        "pattern": (
+            "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:"
+            "[0-9]{2}\\.[0-9]{6}Z$"
+        ),
+    }
     assert response["properties"]["result_type"]["enum"] == [
         "provider_cards",
         "rate_aggregates",

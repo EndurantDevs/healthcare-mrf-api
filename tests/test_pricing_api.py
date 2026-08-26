@@ -4208,6 +4208,20 @@ def _mixed_canonical_release_selection():
 
 
 @pytest.mark.asyncio
+async def test_card_requires_plan_release_id():
+    request = make_request(
+        [],
+        args={"view": "card", "code": "70551", "zip5": "60601"},
+    )
+
+    with pytest.raises(
+        pricing_module.InvalidUsage,
+        match="view=card.*requires plan_release_id",
+    ):
+        await list_providers_by_procedure(request)
+
+
+@pytest.mark.asyncio
 async def test_group_plan_99213_unscoped_card_and_full_keep_identical_guard(
     monkeypatch,
 ):
@@ -4300,10 +4314,58 @@ async def test_card_false_uses_ready_aggregate_projection(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("view", (None, "full"), ids=("default", "explicit"))
-async def test_full_false_keeps_legacy_path_without_projection(
+async def test_omitted_view_false_uses_ready_aggregate_projection(monkeypatch):
+    selection = replace(
+        _mixed_canonical_release_selection(),
+        pricing_projection_id="f" * 64,
+    )
+    release_resolver = AsyncMock(return_value=selection)
+    strict_search = AsyncMock(
+        return_value={
+            "result_type": "rate_aggregates",
+            "result_state": "matched",
+            "items": [{"geo_cell": "60601", "provider_count": 2}],
+            "pagination": {"total": 1, "limit": 25, "offset": 0, "page": 1},
+            "query": {"view": "full", "include_providers": False},
+        }
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        release_resolver,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "search_current_ptg2_index",
+        strict_search,
+    )
+    request = make_request(
+        [],
+        args={
+            "plan_release_id": selection.plan_release_id,
+            "code": "70551",
+            "code_system": "CPT",
+            "zip5": "60601",
+            "include_providers": "false",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+
+    assert response.status == 200
+    assert json.loads(response.body)["result_type"] == "rate_aggregates"
+    release_resolver.assert_awaited_once_with(
+        request.ctx.sa_session,
+        selection.plan_release_id,
+        projection_only=True,
+    )
+    assert strict_search.await_args.args[1]["view"] is None
+    assert strict_search.await_args.args[1]["include_providers"] == "false"
+
+
+@pytest.mark.asyncio
+async def test_explicit_full_false_keeps_legacy_path_without_projection(
     monkeypatch,
-    view,
 ):
     selection = _mixed_canonical_release_selection()
     release_resolver = AsyncMock(return_value=selection)
@@ -4332,8 +4394,7 @@ async def test_full_false_keeps_legacy_path_without_projection(
         "include_providers": "false",
         "include_allowed_amounts": "false",
     }
-    if view is not None:
-        request_args_dict["view"] = view
+    request_args_dict["view"] = "full"
     request = make_request([], args=request_args_dict)
 
     response = await list_providers_by_procedure(request)
@@ -4345,6 +4406,109 @@ async def test_full_false_keeps_legacy_path_without_projection(
     )
     assert strict_search.await_args.args[1]["view"] == "full"
     assert strict_search.await_args.args[1]["include_providers"] == "false"
+
+
+@pytest.mark.asyncio
+async def test_omitted_false_missing_projection_falls_back_to_legacy(
+    monkeypatch,
+):
+    selection = _mixed_canonical_release_selection()
+    release_resolver = AsyncMock(return_value=selection)
+    strict_search = AsyncMock(
+        return_value={
+            "items": [],
+            "pagination": {"total": 0, "limit": 25, "offset": 0, "page": 1},
+            "query": {"status": "no_match"},
+        }
+    )
+    allowed_amount_search = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        release_resolver,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "search_current_ptg2_index",
+        strict_search,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_search_ptg_allowed_amount_evidence",
+        allowed_amount_search,
+    )
+    request = make_request(
+        [],
+        args={
+            "plan_release_id": selection.plan_release_id,
+            "code": "70551",
+            "code_system": "CPT",
+            "zip5": "60601",
+            "include_providers": "false",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+
+    assert response.status == 200
+    release_resolver.assert_awaited_once_with(
+        request.ctx.sa_session,
+        selection.plan_release_id,
+        projection_only=True,
+    )
+    assert strict_search.await_args.args[1]["view"] is None
+    assert strict_search.await_args.args[1]["include_providers"] == "false"
+    allowed_amount_search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_omitted_false_unsupported_projection_restores_allowed_fallback(
+    monkeypatch,
+):
+    selection = replace(
+        _mixed_canonical_release_selection(),
+        pricing_projection_id="f" * 64,
+    )
+    strict_search = AsyncMock(
+        return_value={
+            "items": [],
+            "pagination": {"total": 0, "limit": 25, "offset": 0, "page": 1},
+            "query": {"status": "no_match", "source": "ptg2"},
+        }
+    )
+    allowed_amount_search = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "search_current_ptg2_index",
+        strict_search,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_search_ptg_allowed_amount_evidence",
+        allowed_amount_search,
+    )
+    request = make_request(
+        [],
+        args={
+            "plan_release_id": selection.plan_release_id,
+            "code": "70551",
+            "code_system": "CPT",
+            "state": "IL",
+            "include_providers": "false",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+
+    assert response.status == 200
+    assert strict_search.await_args.args[1]["view"] is None
+    assert strict_search.await_args.args[1]["state"] == "IL"
+    allowed_amount_search.assert_awaited_once()
 
 
 @pytest.mark.asyncio

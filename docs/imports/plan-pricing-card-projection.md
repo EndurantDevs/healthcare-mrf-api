@@ -2,8 +2,12 @@
 
 Release-scoped `view=card` reads use the immutable
 `plan_pricing_card_v2` projection. With `view=card`,
-`include_providers=false` selects its compact rate aggregates. Omitted or
-explicit `view=full` retains the existing PTG serving path and response shape.
+`include_providers=false` selects its compact rate aggregates. An omitted
+`view` with explicit `include_providers=false` selects those same aggregate
+rows when the selected release has a ready projection and otherwise falls back
+to the existing PTG reader. Explicit `view=full` always retains the existing
+PTG serving path and response shape; only explicit `view=card` requires a ready
+projection.
 
 ## Release contract
 
@@ -52,11 +56,10 @@ as `no_match_in_radius`.
 
 The projection supports exact ZIP and coordinate/radius geography. For
 provider cards, city/state, unverified-address display, non-cost ordering, and
-other incompatible filters are rejected. With
-`view=card&include_providers=false`, filters not represented by the projection
-retain the existing aggregate reader so their semantics do not change. The
-omitted or explicit `view=full&include_providers=false` path also always
-retains that reader.
+other incompatible filters are rejected. With `include_providers=false`,
+filters not represented by the selected card or omitted-view projection retain
+the existing aggregate reader so their semantics do not change. Explicit
+`view=full&include_providers=false` always retains that reader.
 
 ## Cold-path attribution and cache boundary
 
@@ -76,12 +79,43 @@ request arguments, network identity, order, and target count, so a republished
 release cannot reuse the prior release's entry. ZIP-radius rows have a separate
 24-hour process cache and contain only ZIP geography.
 
-A separate top-N warm-up queue was not added. The existing provider-expansion
-selection cache is process-local, so a release worker cannot warm every serving pod and any
-claim that it did would be false. The card and aggregate 70 ms lanes use the
-complete database projection and do not depend on process cache state; the
-full lane receives the independent membership-plan repair. Add pod-addressed warm-up only if
-source-bound live proof shows `view=full` approaching the 30-second timeout.
+The durable `plan-pricing-prewarm` control import validates the exact current
+release, serving revision, and ready projection. It deterministically selects
+at most 768 projection cells by `provider_count DESC, code_system, code,
+geo_cell`. The API Layer fleet budget is 3,584 entries/448 MiB, with 512
+entries/64 MiB reserved for release overlap. The observed four current
+published serving plans therefore receive at most 768 entries/96 MiB each.
+Here `provider_count` means immutable provider-set member density: it is a
+supply-side heuristic, not enrollee population or observed request demand.
+Future enrollee or request-density inputs require a separate privacy-reviewed
+contract.
+
+The predeployment read-only DEV measurement found four current published
+serving plan releases and zero projection-ready releases because the projection
+relation was not yet deployed. Redis reported 54.41 MiB used, 71.04 MiB peak,
+a 16 GiB maximum with `noeviction`, and a 24 GiB pod limit. These observations
+bound the four-plan activation decision; they are not postdeployment projection
+readiness evidence.
+
+The worker excludes unscoped E&M codes 99202–99215 and sends the remaining
+shapes to API Layer's signed internal `GET
+/internal/v1/plan-pricing/prewarm` endpoint. That endpoint applies the normal
+default/full pricing contract with `view` and `include_providers` omitted. The
+worker requires a dedicated API Layer prewarm bearer credential; the Import
+Control token is not accepted. Every response must retain the exact
+release and serving revision and prove the shared write with
+`stored_shared=true`, a cache-key digest, and positive payload byte count. Each
+request pins `zip_radius_miles=25` and `limit=3` to the acceptance key template.
+Healthcare also returns the serving revision's canonical UTC
+`serving_revision_published_at`; API Layer uses it with the revision ID as the
+monotonic activation fence. A fifth distinct authoritative plan is reported as
+the partial-receipt error `prewarm_capacity_exceeded`, without treating it as a
+successful warm.
+Concurrency is bounded at eight. Its durable
+complete or partial receipt records the ranking semantics, cap, shape digest,
+counts, and stable error classes, so replay is idempotent and auditable without
+storing response bodies. Card and aggregate reads continue to use the complete
+database projection and do not depend on prewarm state.
 
 ## Synthetic PostgreSQL receipt
 

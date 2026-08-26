@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +14,23 @@ import pytest
 from api import plan_pricing_projection as projection
 
 from .test_plan_pricing_projection import PROJECTION_ID, _selection, _Session
+
+
+def _projection_migration():
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "20260825150000_plan_pricing_card_projection.py"
+    )
+    module_spec = importlib.util.spec_from_file_location(
+        "plan_pricing_card_projection_migration",
+        migration_path,
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    migration = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(migration)
+    return migration
 
 
 @pytest.mark.asyncio
@@ -107,6 +125,17 @@ async def test_zip_radius_resolves_its_centroid_inside_the_projection_query():
             "rate_aggregates",
             b'{"geo_cell":"62401","provider_count":1,"rate_count":2}',
         ),
+        (
+            {
+                "include_providers": "false",
+                "code_system": "CPT",
+                "code": "27447",
+                "zip5": "62401",
+                "zip_radius_miles": 0,
+            },
+            "rate_aggregates",
+            b'{"geo_cell":"62401","provider_count":1,"rate_count":2}',
+        ),
     ),
 )
 async def test_projection_reader_embeds_pre_rendered_fragments(
@@ -131,7 +160,17 @@ async def test_projection_reader_embeds_pre_rendered_fragments(
     assert wire_response["query"]["include_providers"] is (
         expected_result_type == "provider_cards"
     )
-    assert wire_response["query"]["view"] == args["view"]
+    assert wire_response["query"]["view"] == str(
+        args.get("view") or "full"
+    )
+    selection = _selection()
+    assert wire_response["plan_version_id"] == selection.plan_version_id
+    assert wire_response["serving_revision_id"] == (
+        selection.serving_revision_id
+    )
+    assert wire_response["serving_revision_published_at"] == (
+        selection.serving_revision_published_at
+    )
     assert PROJECTION_ID in session.statements[0][1].values()
     if expected_result_type == "provider_cards":
         assert "PARTITION BY item.npi" in session.statements[0][0]
@@ -345,22 +384,29 @@ async def test_projection_distinguishes_no_rates_from_no_geography():
 def test_projection_migration_keeps_fragments_and_aggregates_in_one_build(
     monkeypatch,
 ):
-    migration_path = (
-        Path(__file__).resolve().parents[1]
-        / "alembic"
-        / "versions"
-        / "20260825150000_plan_pricing_card_projection.py"
-    )
-    module_spec = importlib.util.spec_from_file_location(
-        "plan_pricing_card_projection_migration",
-        migration_path,
-    )
-    assert module_spec is not None and module_spec.loader is not None
-    migration = importlib.util.module_from_spec(module_spec)
-    module_spec.loader.exec_module(migration)
+    migration = _projection_migration()
     statements = []
+    created_indexes = []
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "projection_test")
     monkeypatch.setattr(migration.op, "execute", statements.append)
+    monkeypatch.setattr(
+        migration.op,
+        "get_context",
+        lambda: SimpleNamespace(as_sql=False, autocommit_block=nullcontext),
+    )
+    monkeypatch.setattr(
+        migration,
+        "_zip_table_has_index_columns",
+        lambda _schema: True,
+    )
+    monkeypatch.setattr(migration, "_zip_index_record", lambda _schema: None)
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda *positional, **keyword: created_indexes.append(
+            (positional, keyword)
+        ),
+    )
 
     migration.upgrade()
 
@@ -372,11 +418,53 @@ def test_projection_migration_keeps_fragments_and_aggregates_in_one_build(
     assert "fragment bytea NOT NULL" in statement
     assert "median_negotiated_rate numeric NOT NULL" in statement
     assert "contract_version = 'plan_pricing_card_v2'" in statement
-    assert "IF to_regclass" in statement
-    assert "plan_pricing_geo_zip_coordinates_idx" in statement
-    assert "(latitude, longitude, zip_code)" in statement
+    assert "plan_pricing_cell_aggregate_lookup_idx" not in statement
+    assert created_indexes == [
+        (
+            (
+                "plan_pricing_geo_zip_coordinates_idx",
+                "geo_zip_lookup",
+                ["latitude", "longitude", "zip_code"],
+            ),
+            {
+                "schema": "projection_test",
+                "if_not_exists": True,
+                "postgresql_concurrently": True,
+            },
+        )
+    ]
     assert "ready plan-pricing projections are immutable" in statement
     assert "receipt counts do not match rows" in statement
     assert "SELECT state INTO parent_state" in statement
     assert "FOR UPDATE" in statement
     assert "BEFORE TRUNCATE" in statement
+
+
+def test_projection_migration_skips_zip_index_without_required_columns(
+    monkeypatch,
+):
+    migration = _projection_migration()
+    created_indexes = []
+    monkeypatch.setattr(migration.op, "execute", lambda _statement: None)
+    monkeypatch.setattr(
+        migration.op,
+        "get_context",
+        lambda: SimpleNamespace(as_sql=False, autocommit_block=nullcontext),
+    )
+    monkeypatch.setattr(
+        migration,
+        "_zip_table_has_index_columns",
+        lambda _schema: False,
+    )
+    monkeypatch.setattr(migration, "_zip_index_record", lambda _schema: None)
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda *positional, **keyword: created_indexes.append(
+            (positional, keyword)
+        ),
+    )
+
+    migration.upgrade()
+
+    assert created_indexes == []

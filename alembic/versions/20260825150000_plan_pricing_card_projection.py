@@ -9,12 +9,18 @@ from __future__ import annotations
 import os
 
 from alembic import op
+from sqlalchemy import text
 
 
 revision = "20260825150000_plan_pricing_card_projection"
 down_revision = "20260825120000_ptg_v4_finalizer_map_pack"
 branch_labels = None
 depends_on = None
+
+
+ZIP_INDEX_NAME = "plan_pricing_geo_zip_coordinates_idx"
+ZIP_TABLE_NAME = "geo_zip_lookup"
+IDEMPOTENCY_INDEX_NAME = "import_run_plan_pricing_idempotency_idx"
 
 
 def _schema() -> str:
@@ -29,30 +35,109 @@ def _qt(schema: str, table: str) -> str:
     return f"{_q(schema)}.{_q(table)}"
 
 
-def _ql(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
+def _zip_table_has_index_columns(schema: str) -> bool:
+    return bool(
+        op.get_bind().execute(
+            text(
+                """
+                SELECT COUNT(*) = 3
+                  FROM pg_catalog.pg_class AS table_record
+                  JOIN pg_catalog.pg_namespace AS table_namespace
+                    ON table_namespace.oid = table_record.relnamespace
+                  JOIN pg_catalog.pg_attribute AS column_record
+                    ON column_record.attrelid = table_record.oid
+                 WHERE table_namespace.nspname = :schema
+                   AND table_record.relname = :table_name
+                   AND table_record.relkind IN ('r', 'p')
+                   AND column_record.attnum > 0
+                   AND NOT column_record.attisdropped
+                   AND column_record.attname IN (
+                           'latitude', 'longitude', 'zip_code'
+                       )
+                """
+            ),
+            {"schema": schema, "table_name": ZIP_TABLE_NAME},
+        ).scalar()
+    )
+
+
+def _zip_index_record(schema: str):
+    return op.get_bind().execute(
+        text(
+            """
+            SELECT table_namespace.nspname AS table_schema,
+                   table_record.relname AS table_name,
+                   index_record.indisvalid AS is_valid
+              FROM pg_catalog.pg_index AS index_record
+              JOIN pg_catalog.pg_class AS index_class
+                ON index_class.oid = index_record.indexrelid
+              JOIN pg_catalog.pg_namespace AS index_namespace
+                ON index_namespace.oid = index_class.relnamespace
+              JOIN pg_catalog.pg_class AS table_record
+                ON table_record.oid = index_record.indrelid
+              JOIN pg_catalog.pg_namespace AS table_namespace
+                ON table_namespace.oid = table_record.relnamespace
+             WHERE index_namespace.nspname = :schema
+               AND index_class.relname = :index_name
+            """
+        ),
+        {"schema": schema, "index_name": ZIP_INDEX_NAME},
+    ).mappings().one_or_none()
+
+
+def _create_zip_index(schema: str) -> None:
+    context = op.get_context()
+    if context.as_sql or not _zip_table_has_index_columns(schema):
+        return
+    index_record = _zip_index_record(schema)
+    drop_invalid_index = False
+    if index_record is not None:
+        if (
+            str(index_record["table_schema"]),
+            str(index_record["table_name"]),
+        ) != (schema, ZIP_TABLE_NAME):
+            raise RuntimeError(
+                f"existing_schema_index_mismatch:{schema}.{ZIP_INDEX_NAME}"
+            )
+        drop_invalid_index = not bool(index_record["is_valid"])
+    with context.autocommit_block():
+        if drop_invalid_index:
+            op.drop_index(
+                ZIP_INDEX_NAME,
+                table_name=ZIP_TABLE_NAME,
+                schema=schema,
+                if_exists=True,
+                postgresql_concurrently=True,
+            )
+        op.create_index(
+            ZIP_INDEX_NAME,
+            ZIP_TABLE_NAME,
+            ["latitude", "longitude", "zip_code"],
+            schema=schema,
+            if_not_exists=True,
+            postgresql_concurrently=True,
+        )
 
 
 def upgrade() -> None:
     schema = _schema()
+    import_run = _qt(schema, "import_run")
     candidate = _qt(schema, "plan_pricing_projection_candidate")
     card = _qt(schema, "plan_pricing_card")
     aggregate = _qt(schema, "plan_pricing_cell_aggregate")
-    zip_lookup = _qt(schema, "geo_zip_lookup")
     candidate_guard = _qt(schema, "plan_pricing_projection_candidate_guard")
     child_guard = _qt(schema, "plan_pricing_projection_child_guard")
     truncate_guard = _qt(schema, "plan_pricing_projection_truncate_guard")
 
+    _create_zip_index(schema)
     statements = (
         f"""
-        DO $$
-        BEGIN
-            IF to_regclass({_ql(zip_lookup)}) IS NOT NULL THEN
-                CREATE INDEX IF NOT EXISTS plan_pricing_geo_zip_coordinates_idx
-                    ON {zip_lookup} (latitude, longitude, zip_code);
-            END IF;
-        END
-        $$
+        CREATE UNIQUE INDEX IF NOT EXISTS {IDEMPOTENCY_INDEX_NAME}
+            ON {import_run} (importer, idempotency_key)
+         WHERE importer IN (
+                   'plan-pricing-projection', 'plan-pricing-prewarm'
+               )
+           AND idempotency_key IS NOT NULL
         """,
         f"""
         CREATE TABLE {candidate} (
@@ -157,11 +242,6 @@ def upgrade() -> None:
             ),
             CONSTRAINT plan_pricing_cell_aggregate_fragment_ck
                 CHECK (octet_length(fragment) BETWEEN 2 AND 2048)
-        )
-        """,
-        f"""
-        CREATE INDEX plan_pricing_cell_aggregate_lookup_idx ON {aggregate} (
-            projection_id, code_system, code, geo_cell
         )
         """,
         f"""
@@ -311,7 +391,17 @@ def downgrade() -> None:
         op.execute(
             f"DROP FUNCTION IF EXISTS {_qt(schema, function_name)}()"
         )
-    op.execute(
-        f"DROP INDEX IF EXISTS "
-        f"{_qt(schema, 'plan_pricing_geo_zip_coordinates_idx')}"
+    op.drop_index(
+        IDEMPOTENCY_INDEX_NAME,
+        table_name="import_run",
+        schema=schema,
+        if_exists=True,
     )
+    with op.get_context().autocommit_block():
+        op.drop_index(
+            ZIP_INDEX_NAME,
+            table_name=ZIP_TABLE_NAME,
+            schema=schema,
+            if_exists=True,
+            postgresql_concurrently=True,
+        )

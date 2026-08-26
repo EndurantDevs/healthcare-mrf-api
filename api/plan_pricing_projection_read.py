@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Read immutable plan-pricing projections with card-only strictness."""
+"""Read immutable plan-pricing card and aggregate projections."""
 
 from __future__ import annotations
 
@@ -35,16 +35,19 @@ class _ProjectionRequest:
 
 
 def projection_result_type(args: Mapping[str, Any]) -> str | None:
-    """Select a projection only for an explicit card response."""
+    """Select the additive card or omitted-view aggregate response."""
 
-    view = str(args.get("view") or "full").strip().lower()
-    if view != "card":
-        return None
+    raw_view = args.get("view")
+    view = str(raw_view or "full").strip().lower()
     include_providers = _is_request_flag_enabled(
         args.get("include_providers"),
         default=True,
     )
-    return "provider_cards" if include_providers else "rate_aggregates"
+    if view == "card":
+        return "provider_cards" if include_providers else "rate_aggregates"
+    if raw_view is None and not include_providers:
+        return "rate_aggregates"
+    return None
 
 
 def unsupported_projection_fields(
@@ -264,6 +267,8 @@ def _validated_projection_request(
             "view=card requires code_system and code"
         )
     if not selection.pricing_projection_id:
+        if args.get("view") is None and result_type == "rate_aggregates":
+            return None
         raise PlanPricingProjectionUnavailable(
             "the selected release has no ready card projection"
         )

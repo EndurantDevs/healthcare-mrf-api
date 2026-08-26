@@ -15,6 +15,11 @@ from api.plan_release_pricing_projection import (
     plan_release_serving_queries,
 )
 from api.plan_release_readiness import is_release_binding_serving_ready
+from api.plan_release_serving_metadata import (
+    has_expected_binding_count as _has_expected_binding_count,
+    serving_revision_published_at as _serving_revision_published_at,
+    single_text_value as _single_text_value,
+)
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
@@ -100,6 +105,7 @@ class PlanReleaseServingSelection:
     binding_set_digest: str
     bindings: tuple[PlanReleaseSnapshotBinding, ...]
     pricing_projection_id: str | None = None
+    serving_revision_published_at: str | None = None
     _validated_serving_tables: tuple[tuple[str, PTG2ServingTables], ...] = field(
         default=(), repr=False, compare=False
     )
@@ -190,6 +196,9 @@ class PlanReleaseServingSelection:
             "plan_release_id": self.plan_release_id,
             "plan_version_id": self.plan_version_id,
             "serving_revision_id": self.serving_revision_id,
+            "serving_revision_published_at": (
+                self.serving_revision_published_at
+            ),
             "release_month": self.release_month,
             "release_status": self.release_status,
             "is_current": True,
@@ -197,17 +206,10 @@ class PlanReleaseServingSelection:
         }
 
 
-def _single_text_value(rows: Iterable[Mapping[str, Any]], field: str) -> str | None:
-    values = {str(row.get(field) or "").strip() for row in rows}
-    if len(values) != 1:
-        return None
-    value = values.pop()
-    return value or None
-
-
 @dataclass(frozen=True)
 class _PlanReleaseHeader:
     serving_revision_id: str
+    serving_revision_published_at: str | None
     plan_release_id: str
     healthporta_plan_id: str
     plan_version_id: str | None
@@ -221,6 +223,8 @@ def _release_header_from_rows(
     requested_release_id: str,
     release_rows: list[dict[str, Any]],
 ) -> _PlanReleaseHeader | None:
+    """Validate shared release metadata without rejecting legacy null times."""
+
     plan_release_id = _single_text_value(release_rows, "plan_release_id")
     serving_revision_id = _single_text_value(
         release_rows, "serving_revision_id"
@@ -236,6 +240,7 @@ def _release_header_from_rows(
     pricing_projection_id = _single_text_value(
         release_rows, "pricing_projection_id"
     )
+    published_at = _serving_revision_published_at(release_rows)
     if pricing_projection_id and not re.fullmatch(
         r"[0-9a-f]{64}", pricing_projection_id
     ):
@@ -244,13 +249,6 @@ def _release_header_from_rows(
         str(release_row.get("plan_version_id") or "").strip()
         for release_row in release_rows
     }
-    try:
-        expected_counts = {
-            int(release_row.get("expected_binding_count"))
-            for release_row in release_rows
-        }
-    except (TypeError, ValueError):
-        return None
     if (
         plan_release_id != requested_release_id
         or not serving_revision_id
@@ -259,11 +257,12 @@ def _release_header_from_rows(
         or release_status != "published"
         or not binding_set_digest
         or len(plan_version_values) != 1
-        or expected_counts != {len(release_rows)}
+        or not _has_expected_binding_count(release_rows)
     ):
         return None
     return _PlanReleaseHeader(
         serving_revision_id=serving_revision_id,
+        serving_revision_published_at=published_at,
         plan_release_id=plan_release_id,
         healthporta_plan_id=healthporta_plan_id,
         plan_version_id=plan_version_values.pop() or None,
@@ -372,6 +371,9 @@ def _selection_from_rows(
         binding_set_digest=release_header.binding_set_digest,
         bindings=bindings,
         pricing_projection_id=release_header.pricing_projection_id,
+        serving_revision_published_at=(
+            release_header.serving_revision_published_at
+        ),
     )
 
 

@@ -5771,6 +5771,16 @@ def _has_no_ptg2_priced_items(payload: Any) -> bool:
     return isinstance(items, list) and not items
 
 
+def _is_plan_pricing_projection_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    query_by_field = payload.get("query")
+    return (
+        isinstance(query_by_field, dict)
+        and query_by_field.get("source") == "plan_pricing_projection"
+    )
+
+
 def _allowed_amount_scope_from_args(
     args: Mapping[str, Any],
 ) -> tuple[str, str, str, int | None] | None:
@@ -11676,7 +11686,9 @@ async def list_providers_by_procedure(request):
         "include_allowed_amounts",
         default=True,
     )
-    view = str(args.get("view") or "full").strip().lower()
+    legacy_include_allowed_amounts = include_allowed_amounts
+    raw_view = args.get("view")
+    view = str(raw_view or "full").strip().lower()
     if view not in {"full", "card"}:
         raise InvalidUsage("Parameter 'view' must be one of: full, card")
     internal_codes: list[int] = []
@@ -11691,7 +11703,7 @@ async def list_providers_by_procedure(request):
     args.get("plan_release_id")
     plan_release_id = _validated_plan_release_id(args)
     if view == "card" and not plan_release_id:
-        raise InvalidUsage("Parameter 'view=card' requires healthporta_plan_id")
+        raise InvalidUsage("Parameter 'view=card' requires plan_release_id")
     projected_result_type = (
         projection_result_type(args) if plan_release_id else None
     )
@@ -11841,7 +11853,7 @@ async def list_providers_by_procedure(request):
                 "include_unverified_addresses": args.get("include_unverified_addresses") or None,
                 "include_details": args.get("include_details") or None,
                 "include_debug": args.get("include_debug") or None,
-                "view": view,
+                "view": raw_view,
                 "npi": npi,
             }
         route_name = str(getattr(getattr(request, "route", None), "name", ""))
@@ -11895,6 +11907,12 @@ async def list_providers_by_procedure(request):
                 },
                 status=503,
             )
+        if (
+            projected_result_type == "rate_aggregates"
+            and raw_view is None
+            and not _is_plan_pricing_projection_payload(ptg2_payload)
+        ):
+            include_allowed_amounts = legacy_include_allowed_amounts
         if ptg2_payload is None:
             if include_allowed_amounts:
                 allowed_amount_payload = (

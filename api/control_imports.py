@@ -93,6 +93,9 @@ from process.serialization import deserialize_job, serialize_job
 ENGINE_NAME = "healthcare-mrf-api"
 ACTIVE_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "dead_letter"}
+ALL_STATUS_IDEMPOTENCY_IMPORTERS = frozenset(
+    {"plan-pricing-projection", "plan-pricing-prewarm"}
+)
 CANCEL_FLAG_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_IMPORT_RUN_LIST_LIMIT = 200
 MAX_TRIGGERED_BY_LENGTH = 32
@@ -130,6 +133,14 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_module": "api.plan_pricing_projection",
         "target_function": "build_plan_pricing_projection",
         "job_prefix": "plan_pricing_projection",
+    },
+    "plan-pricing-prewarm": {
+        "queue": "arq:PTGCandidateAudit",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped_kwargs",
+        "target_module": "api.plan_pricing_prewarm",
+        "target_function": "prewarm_plan_pricing",
+        "job_prefix": "plan_pricing_prewarm",
     },
     "mrf": {"queue": "arq:MRF", "function": "init_file", "payload": "test_mode"},
     "npi": {
@@ -505,6 +516,69 @@ def _plan_pricing_projection_registry_entry() -> dict[str, Any]:
     }
 
 
+_PLAN_PRICING_PREWARM_PARAM_NAMES = frozenset(
+    {"plan_release_id", "serving_revision_id", "projection_id"}
+)
+
+
+def _validate_plan_pricing_prewarm_params(
+    importer: str,
+    params_by_name: dict[str, Any],
+) -> None:
+    if importer != "plan-pricing-prewarm":
+        return
+    if set(params_by_name) != _PLAN_PRICING_PREWARM_PARAM_NAMES:
+        raise ValueError(
+            "plan-pricing-prewarm params must be exactly plan_release_id, "
+            "serving_revision_id, and projection_id"
+        )
+    if any(
+        type(params_by_name[name]) is not str
+        or not params_by_name[name]
+        or params_by_name[name] != params_by_name[name].strip()
+        for name in _PLAN_PRICING_PREWARM_PARAM_NAMES
+    ):
+        raise ValueError("plan-pricing-prewarm params must be non-empty strings")
+
+
+def _plan_pricing_prewarm_registry_entry() -> dict[str, Any]:
+    parameter_help_by_name = {
+        "plan_release_id": "Exact current immutable plan release ID.",
+        "serving_revision_id": "Exact current serving revision ID.",
+        "projection_id": "Exact ready pricing projection ID.",
+    }
+    return {
+        "name": "plan-pricing-prewarm",
+        "engine": ENGINE_NAME,
+        "family": "mrf",
+        "kind": "control",
+        "lifecycle": "single",
+        "schedulable": False,
+        "cancelable": False,
+        "retryable": True,
+        "enqueue_adapter": "arq_single_job",
+        "queue": "arq:PTGCandidateAudit",
+        "depends_on": [],
+        "params_schema": [
+            {
+                "name": name,
+                "opts": ["--" + name.replace("_", "-")],
+                "required": True,
+                "multiple": False,
+                "is_flag": False,
+                "type": "string",
+                "default": None,
+                "help": parameter_help_by_name[name],
+            }
+            for name in (
+                "plan_release_id",
+                "serving_revision_id",
+                "projection_id",
+            )
+        ],
+    }
+
+
 def importer_registry() -> list[dict[str, Any]]:
     """Describe the importer commands exposed by the public control API."""
 
@@ -529,7 +603,12 @@ def importer_registry() -> list[dict[str, Any]]:
                 "params_schema": _control_param_schema(name, command),
             }
         )
-    importers.append(_plan_pricing_projection_registry_entry())
+    importers.extend(
+        (
+            _plan_pricing_projection_registry_entry(),
+            _plan_pricing_prewarm_registry_entry(),
+        )
+    )
     return sorted(importers, key=lambda importer: importer["name"])
 
 
@@ -541,7 +620,8 @@ def importer_names() -> set[str]:
 
 def _importer_family(importer: str) -> str:
     if importer in {
-        "ptg", "ptg-candidate-audit", "plan-pricing-projection", "mrf", "mrf-source-discovery",
+        "ptg", "ptg-candidate-audit", "plan-pricing-projection",
+        "plan-pricing-prewarm", "mrf", "mrf-source-discovery",
         "hospital-prices",
     }:
         return "mrf"
@@ -1493,6 +1573,34 @@ async def find_active_run_by_idempotency_key(idempotency_key: str) -> dict[str, 
     return normalize_run(row) if row else None
 
 
+async def find_importer_run_by_idempotency_key(
+    importer: str,
+    idempotency_key: str,
+) -> dict[str, Any] | None:
+    """Find the durable all-status owner for a scoped idempotency key."""
+
+    result = await db.execute(
+        select(ImportRun)
+        .where(ImportRun.importer == importer)
+        .where(ImportRun.idempotency_key == idempotency_key)
+        .limit(1)
+    )
+    row = result.scalar_one_or_none()
+    return normalize_run(row) if row else None
+
+
+async def _idempotent_import_run(
+    importer: str,
+    idempotency_key: str,
+) -> dict[str, Any] | None:
+    if importer in ALL_STATUS_IDEMPOTENCY_IMPORTERS:
+        return await find_importer_run_by_idempotency_key(
+            importer,
+            idempotency_key,
+        )
+    return await find_active_run_by_idempotency_key(idempotency_key)
+
+
 async def find_earliest_active_run_by_importer(importer: str) -> dict[str, Any] | None:
     """Return the earliest active run for an importer."""
 
@@ -2235,6 +2343,10 @@ async def create_import_run(
         importer,
         effective_params_by_name,
     )
+    _validate_plan_pricing_prewarm_params(
+        importer,
+        effective_params_by_name,
+    )
     await _validate_hospital_price_params(importer, effective_params_by_name)
     if importer == "provider-directory-fhir":
         validated_publication_candidate_from_params(
@@ -2290,9 +2402,9 @@ async def create_import_run(
         and importer != "provider-directory-fhir"
         and not is_ptg_source_file_admission
     ):
-        active = await find_active_run_by_idempotency_key(idempotency_key)
-        if active:
-            return normalize_run(active), False
+        replayed_run = await _idempotent_import_run(importer, idempotency_key)
+        if replayed_run:
+            return normalize_run(replayed_run), False
     if (
         importer != "provider-directory-fhir"
         and not is_ptg_source_file_admission
@@ -2363,9 +2475,12 @@ async def create_import_run(
             return normalize_run(blocking_run), False
     except IntegrityError:
         if idempotency_key:
-            active = await find_active_run_by_idempotency_key(idempotency_key)
-            if active:
-                return normalize_run(active), False
+            replayed_run = await _idempotent_import_run(
+                importer,
+                idempotency_key,
+            )
+            if replayed_run:
+                return normalize_run(replayed_run), False
         raise
     enqueue_result = await _enqueue_import_start(
         {

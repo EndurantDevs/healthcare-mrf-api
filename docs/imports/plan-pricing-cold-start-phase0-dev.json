@@ -1,0 +1,109 @@
+{
+  "contract": "plan-pricing-cold-start-phase0-current-dev-v1",
+  "captured_at": "2026-08-25T23:55:24Z",
+  "environment": "dev",
+  "identity": {
+    "gateway_source_commit": "9be2552f680721a0836712c1c1a264f770441efa",
+    "gateway_image_digest": "sha256:7a03f0f6bf950b253a0b967c038d9dab8d0416c1c2e943d2b8c8ee24858b9269",
+    "healthcare_source_commit": "20d35e4768761dd3cb05befe28a5d1f9ef474269",
+    "healthcare_image_digest": "sha256:832e40c3b28e99c003230c51f58b8a801bddf2a5fb40e36fb21c1c331430cc9a",
+    "gitops_revision": "dev@sha1:8bd6dc98a2ea6326bf52bf766a7db797c89024a9",
+    "release_id_sha256_16": "1710793b61e73d7e",
+    "serving_revision_id_sha256_16": "08aab9cf3199d3f2"
+  },
+  "request": {
+    "selection": "paced_never_seen_shape",
+    "code_system": "CPT",
+    "code": "59430",
+    "zip5": "64106",
+    "zip_radius_miles": 25,
+    "limit": 3,
+    "include_providers": false,
+    "view": "omitted"
+  },
+  "trace": {
+    "public_status": 502,
+    "public_ttfb_ms": 8510.972,
+    "public_total_ms": 8510.972,
+    "public_response_bytes": 232,
+    "healthcare_status": 503,
+    "healthcare_error_code": "ptg2_online_work_budget_exceeded",
+    "healthcare_error_dimension": "candidate_members",
+    "healthcare_response_bytes": 164,
+    "single_healthcare_wall_ms": 3800,
+    "release_resolver_wall_ms": 60,
+    "gateway_transient_retry_delay_ms": 300,
+    "gateway_upstream_attempts": 2
+  },
+  "postgres": {
+    "query_id": "-1667578012701458064",
+    "pg_stat_statements_calls": 11,
+    "pg_stat_statements_rows": 146872,
+    "pg_stat_statements_total_exec_ms": 40479.231,
+    "pg_stat_statements_mean_exec_ms": 3679.93,
+    "pg_stat_statements_shared_hit_blocks": 26708909,
+    "pg_stat_statements_shared_read_blocks": 67,
+    "pg_stat_statements_temp_read_blocks": 0,
+    "pg_stat_statements_temp_written_blocks": 0,
+    "explain_analyze_buffers": [
+      {
+        "binding_ordinal": 0,
+        "snapshot_id_sha256_16": "2735c7e9ce1a26d2",
+        "execution_ms": 1382.286,
+        "actual_rows": 0,
+        "shared_hit_blocks": 775441,
+        "shared_read_blocks": 0,
+        "address_candidates_removed": 157527,
+        "npi_scope_probe_loops": 157458
+      },
+      {
+        "binding_ordinal": 1,
+        "snapshot_id_sha256_16": "cd15a08b5a224c5f",
+        "execution_ms": 1341.594,
+        "actual_rows": 0,
+        "shared_hit_blocks": 775432,
+        "shared_read_blocks": 0,
+        "address_candidates_removed": 157527,
+        "npi_scope_probe_loops": 157458
+      },
+      {
+        "binding_ordinal": 2,
+        "snapshot_id_sha256_16": "d478986ecac3a47f",
+        "execution_ms": 3701.676,
+        "actual_rows": 13352,
+        "shared_hit_blocks": 2428145,
+        "shared_read_blocks": 0,
+        "address_candidates_removed": 122395,
+        "ranked_rows_removed": 21780,
+        "dominant_inner_relation": "mrf_address",
+        "dominant_inner_loops": 53158,
+        "dominant_inner_shared_hit_blocks": 841938
+      }
+    ]
+  },
+  "split": {
+    "query": "The dominant binding spent 3701.676 ms in PostgreSQL and touched 2428145 shared-hit blocks without physical reads.",
+    "rows": "The dominant SQL produced 13352 eligible NPI rows after removing 122395 address candidates and 21780 non-winning ranked rows; the handler then rejected the request on its sealed candidate_members budget before price-row shaping.",
+    "serialization": "Only the bounded error was serialized: 164 bytes at Healthcare and 232 bytes at the public API. The direct Healthcare non-SQL remainder is at most about 100 ms and also includes request handling, release routing, and error shaping, so it is not attributed solely to JSON serialization.",
+    "upstream": "Canonical release resolution was about 60 ms. The gateway retried the transient 503 once after 300 ms, so two multi-second upstream attempts plus retry and proxy overhead produced the 8510.972 ms public result."
+  },
+  "current_gateway_response_cache": {
+    "scope": "process_local",
+    "implementation": "HashMap",
+    "eviction": "oldest_insertion",
+    "default_ttl_seconds": 30,
+    "default_max_keys": 512,
+    "key_binds": [
+      "public_path",
+      "presentation_flags",
+      "serving_revision_id",
+      "normalized_upstream_url"
+    ],
+    "republish_miss_proof": {
+      "source_commit": "9be2552f680721a0836712c1c1a264f770441efa",
+      "test": "canonical_plan_proxy_is_client_scoped_release_pinned_and_fail_closed",
+      "witness": "Two requests for the same plan_release_id resolved consecutive distinct serving_revision_id values and produced two upstream calls; the prior cached response was not served after the revision changed."
+    },
+    "republish_behavior": "A changed serving_revision_id produces a miss. An old entry may remain until TTL but is unreachable through the new revision-bound key."
+  }
+}

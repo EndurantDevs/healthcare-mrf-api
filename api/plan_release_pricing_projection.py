@@ -30,6 +30,7 @@ _PRICING_PROJECTION_ID_SQL = """
 """
 _PLAN_RELEASE_SERVING_SQL_TEMPLATE = """
 SELECT revision.serving_revision_id,
+       revision.published_at AS serving_revision_published_at,
        revision.plan_release_id,
        revision.healthporta_plan_id,
        revision.plan_version_id,

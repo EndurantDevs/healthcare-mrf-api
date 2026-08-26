@@ -11,11 +11,13 @@ PLAN_RELEASE_ID = "hprelease_" + "0" * 26
 PLAN_ID = "hpplan_" + "1" * 26
 PLAN_VERSION_ID = "hpversion_" + "2" * 26
 SERVING_REVISION_ID = "hpserve_" + "3" * 26
+SERVING_REVISION_PUBLISHED_AT = "2026-08-25T12:34:56.123456Z"
 
 
 def _binding_row(**updates):
     row_by_field = {
         "serving_revision_id": SERVING_REVISION_ID,
+        "serving_revision_published_at": SERVING_REVISION_PUBLISHED_AT,
         "plan_release_id": PLAN_RELEASE_ID,
         "healthporta_plan_id": PLAN_ID,
         "plan_version_id": PLAN_VERSION_ID,
@@ -68,6 +70,7 @@ def _release_selection(
         )
     return plan_release_serving.PlanReleaseServingSelection(
         serving_revision_id=SERVING_REVISION_ID,
+        serving_revision_published_at=SERVING_REVISION_PUBLISHED_AT,
         plan_release_id=PLAN_RELEASE_ID,
         healthporta_plan_id=PLAN_ID,
         plan_version_id=PLAN_VERSION_ID,
@@ -294,6 +297,9 @@ def test_release_query_uses_bound_snapshot_when_current_pointer_differs(monkeypa
     ]
     assert response["plan_release_id"] == PLAN_RELEASE_ID
     assert response["serving_revision_id"] == SERVING_REVISION_ID
+    assert response["serving_revision_published_at"] == (
+        SERVING_REVISION_PUBLISHED_AT
+    )
     assert response["release_status"] == "published"
     assert response["is_current"] is True
     assert response["resolved"] is True

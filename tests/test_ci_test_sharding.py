@@ -136,6 +136,20 @@ def test_plan_pricing_projection_postgres_runs_in_core_with_its_dsn() -> None:
     )
 
 
+def test_plan_pricing_idempotency_postgres_runs_in_core_once() -> None:
+    prepush = (REPOSITORY_ROOT / "scripts" / "ci" / "prepush").read_text(
+        encoding="utf-8"
+    )
+    core_step = prepush.split("run_core_postgres() {", 1)[1].split(
+        "run_provider_directory_postgres() {", 1
+    )[0]
+    _assert_single_lifecycle_test(
+        prepush,
+        core_step,
+        "tests/test_plan_pricing_idempotency_postgres.py",
+    )
+
+
 def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> None:
     """Keep coverage artifacts, lifecycle proofs, and command deadlines closed."""
 

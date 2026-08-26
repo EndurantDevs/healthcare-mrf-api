@@ -33,6 +33,7 @@ MAX_BILLING_SEARCH_RELEASE_BINDINGS = 8
 
 _PLAN_RELEASE_SERVING_SQL = f"""
 SELECT revision.serving_revision_id,
+       revision.published_at AS serving_revision_published_at,
        revision.plan_release_id,
        revision.healthporta_plan_id,
        revision.plan_version_id,

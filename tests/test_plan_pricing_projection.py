@@ -71,6 +71,7 @@ class _ScalarSession:
 def _selection(*, projection_id=PROJECTION_ID):
     return PlanReleaseServingSelection(
         serving_revision_id="hpserve_" + "1" * 26,
+        serving_revision_published_at="2026-08-25T12:34:56.123456Z",
         plan_release_id="hprelease_" + "2" * 26,
         healthporta_plan_id="hpplan_" + "3" * 26,
         plan_version_id="hpversion_" + "4" * 26,
@@ -299,13 +300,13 @@ async def test_project_code_card_insert_matches_its_bound_row(monkeypatch):
 @pytest.mark.parametrize(
     ("args", "expected"),
     (
-        ({"include_providers": "false"}, None),
+        ({"include_providers": "false"}, "rate_aggregates"),
         ({"view": "full", "include_providers": "false"}, None),
         ({"view": "card", "include_providers": "true"}, "provider_cards"),
         ({"view": "card", "include_providers": "false"}, "rate_aggregates"),
     ),
 )
-def test_projection_result_type_is_explicit_card_only(args, expected):
+def test_projection_result_type_preserves_omitted_view_contract(args, expected):
     assert projection.projection_result_type(args) == expected
 
 

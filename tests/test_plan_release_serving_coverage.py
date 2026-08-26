@@ -2,6 +2,7 @@
 """Behavior coverage for fail-closed canonical release routing helpers."""
 
 import asyncio
+import datetime as dt
 from types import SimpleNamespace
 
 import pytest
@@ -14,11 +15,13 @@ PLAN_RELEASE_ID = "hprelease_" + "0" * 26
 HEALTHPORTA_PLAN_ID = "hpplan_" + "1" * 26
 PLAN_VERSION_ID = "hpversion_" + "2" * 26
 SERVING_REVISION_ID = "hpserve_" + "3" * 26
+SERVING_REVISION_PUBLISHED_AT = "2026-08-25T12:34:56.123456Z"
 
 
 def _binding_row(**updates):
     row_by_field = {
         "serving_revision_id": SERVING_REVISION_ID,
+        "serving_revision_published_at": SERVING_REVISION_PUBLISHED_AT,
         "plan_release_id": PLAN_RELEASE_ID,
         "healthporta_plan_id": HEALTHPORTA_PLAN_ID,
         "plan_version_id": PLAN_VERSION_ID,
@@ -63,6 +66,7 @@ def _binding(
 def _selection(*bindings):
     return plan_release_serving.PlanReleaseServingSelection(
         serving_revision_id=SERVING_REVISION_ID,
+        serving_revision_published_at=SERVING_REVISION_PUBLISHED_AT,
         plan_release_id=PLAN_RELEASE_ID,
         healthporta_plan_id=HEALTHPORTA_PLAN_ID,
         plan_version_id=PLAN_VERSION_ID,
@@ -125,6 +129,49 @@ def test_release_projection_rejects_malformed_counts_ordinals_and_empty_rows():
         PLAN_RELEASE_ID,
         [],
     ) is None
+
+
+def test_release_projection_preserves_legacy_nullable_publication_time():
+    for invalid_published_at in (
+        None,
+        "not-a-timestamp",
+        dt.datetime(2026, 8, 25, 12, 34, 56),
+    ):
+        legacy_selection = plan_release_serving._selection_from_rows(
+            PLAN_RELEASE_ID,
+            [
+                _binding_row(
+                    serving_revision_published_at=invalid_published_at
+                )
+            ],
+        )
+        assert legacy_selection is not None
+        assert legacy_selection.serving_revision_published_at is None
+
+    current_selection = plan_release_serving._selection_from_rows(
+        PLAN_RELEASE_ID,
+        [
+            _binding_row(
+                serving_revision_published_at=dt.datetime(
+                    2026,
+                    8,
+                    25,
+                    14,
+                    34,
+                    56,
+                    123456,
+                    tzinfo=dt.timezone(dt.timedelta(hours=2)),
+                )
+            )
+        ],
+    )
+    assert current_selection is not None
+    assert current_selection.serving_revision_published_at == (
+        SERVING_REVISION_PUBLISHED_AT
+    )
+    assert current_selection.response_metadata()[
+        "serving_revision_published_at"
+    ] == SERVING_REVISION_PUBLISHED_AT
 
 
 def test_release_projection_rejects_one_snapshot_with_conflicting_plan_routes():

@@ -4983,7 +4983,6 @@ paths:
           schema:
             type: string
             enum: [full, card]
-            default: full
           description: |
             Response detail for an immutable release-scoped pricing search.
             `full` retains the complete PTG/TiC response. `card` requires a
@@ -4992,8 +4991,12 @@ paths:
             filters are rejected. With `view=card`, `include_providers=false`
             serves precomputed ZIP-cell rate aggregates for representable
             shapes; filters not represented by the projection retain the
-            existing aggregate reader. Omitted or explicit `view=full`
-            preserves the existing PTG/TiC response shape.
+            existing aggregate reader. Omitting `view` with explicit
+            `include_providers=false` prefers those aggregate rows and falls
+            back to the existing PTG/TiC reader when the selected release has
+            no ready projection. Explicit `view=full` always preserves the
+            existing PTG/TiC response shape. Only explicit `view=card` requires
+            a ready projection.
         - name: include_providers
           in: query
           x-legacy-plan-default: true
@@ -5447,7 +5450,6 @@ paths:
           schema:
             type: string
             enum: [full, card]
-            default: full
           description: |
             Response detail for an immutable release-scoped pricing search.
             `full` retains the complete PTG/TiC response. `card` requires a
@@ -5456,8 +5458,12 @@ paths:
             filters are rejected. With `view=card`, `include_providers=false`
             serves precomputed ZIP-cell rate aggregates for representable
             shapes; filters not represented by the projection retain the
-            existing aggregate reader. Omitted or explicit `view=full`
-            preserves the existing PTG/TiC response shape.
+            existing aggregate reader. Omitting `view` with explicit
+            `include_providers=false` prefers those aggregate rows and falls
+            back to the existing PTG/TiC reader when the selected release has
+            no ready projection. Explicit `view=full` always preserves the
+            existing PTG/TiC response shape. Only explicit `view=card` requires
+            a ready projection.
         - name: include_providers
           in: query
           schema:
@@ -8577,6 +8583,19 @@ components:
     PricingProcedureProviderListResponse:
       type: object
       properties:
+        plan_version_id:
+          type: string
+          nullable: true
+          pattern: '^hpversion_[0-9A-HJKMNP-TV-Z]{26}$'
+        serving_revision_id:
+          type: string
+          nullable: true
+          pattern: '^hpserve_[0-9A-HJKMNP-TV-Z]{26}$'
+        serving_revision_published_at:
+          type: string
+          format: date-time
+          nullable: true
+          pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$'
         result_type:
           type: string
           nullable: true
