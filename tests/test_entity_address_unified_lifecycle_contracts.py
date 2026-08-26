@@ -208,6 +208,36 @@ async def test_materialization_lifecycle_keeps_publish_separate_and_records_revi
 
 
 @pytest.mark.asyncio
+async def test_materialization_rejects_dependent_views_before_stage_mutation(
+    monkeypatch,
+):
+    sql_events, _progress_events, _environment_flags, _runtime_options = (
+        _configure_materialization_harness(monkeypatch)
+    )
+    dependency_preflight = AsyncMock(
+        side_effect=RuntimeError(
+            "entity-address-unified cutover has dependent views: "
+            "mrf.entity_address_unified_old -> harness.entity_address_unified"
+        )
+    )
+    monkeypatch.setattr(
+        entity_address,
+        "_assert_cutover_has_no_dependent_views",
+        dependency_preflight,
+    )
+
+    with pytest.raises(RuntimeError, match="cutover has dependent views"):
+        await entity_address.process_data(
+            {"import_date": "20260724", "context": {}},
+            {"publish": True, "limit_per_source": 0},
+        )
+
+    dependency_preflight.assert_awaited_once()
+    assert "CREATE_STAGE" not in sql_events
+    assert not any("DROP TABLE" in event for event in sql_events)
+
+
+@pytest.mark.asyncio
 async def test_partial_refresh_rejects_reusing_a_full_refresh_stage(monkeypatch):
     monkeypatch.setattr(entity_address, "ensure_database", AsyncMock())
     monkeypatch.setattr(entity_address, "make_class", lambda _model, _date: _StageClass)

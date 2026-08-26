@@ -2068,6 +2068,56 @@ async def _existing_cutover_relations(db_schema: str, relation_names: list[str])
     return [str(row[0]) for row in rows]
 
 
+async def _assert_cutover_has_no_dependent_views(
+    db_schema: str,
+    live_table_names: Iterable[str],
+) -> None:
+    """Fail before materialization when a cutover table has dependent views."""
+    relation_names = sorted(
+        {
+            relation_name
+            for live_table_name in live_table_names
+            for relation_name in (live_table_name, f"{live_table_name}_old")
+        }
+    )
+    dependency_records = await db.all(
+        """
+        SELECT DISTINCT
+               format('%I.%I', target_namespace.nspname, target_relation.relname),
+               format('%I.%I', dependent_namespace.nspname, dependent_relation.relname)
+          FROM pg_class AS target_relation
+          JOIN pg_namespace AS target_namespace
+            ON target_namespace.oid = target_relation.relnamespace
+          JOIN pg_depend AS dependency
+            ON dependency.refclassid = 'pg_class'::regclass
+           AND dependency.refobjid = target_relation.oid
+           AND dependency.classid = 'pg_rewrite'::regclass
+          JOIN pg_rewrite AS rewrite_rule
+            ON rewrite_rule.oid = dependency.objid
+          JOIN pg_class AS dependent_relation
+            ON dependent_relation.oid = rewrite_rule.ev_class
+          JOIN pg_namespace AS dependent_namespace
+            ON dependent_namespace.oid = dependent_relation.relnamespace
+         WHERE target_namespace.nspname = :db_schema
+           AND target_relation.relname = ANY(CAST(:relation_names AS text[]))
+           AND target_relation.relkind IN ('r', 'p')
+           AND dependent_relation.relkind IN ('v', 'm')
+         ORDER BY 1, 2;
+        """,
+        db_schema=db_schema,
+        relation_names=relation_names,
+    )
+    dependencies = [
+        f"{dependency_record[0]} -> {dependency_record[1]}"
+        for dependency_record in dependency_records
+    ]
+    if dependencies:
+        raise RuntimeError(
+            "entity-address-unified cutover has dependent views: "
+            + ", ".join(dependencies)
+        )
+
+
 async def _acquire_cutover_locks(
     db_schema: str,
     relation_names: list[str],
@@ -2144,6 +2194,10 @@ async def _run_entity_address_cutover(
             )
         await _assert_provider_directory_overlay_alias_fence(db_schema, context)
         await _acquire_cutover_locks(db_schema, relation_names, required_names)
+        await _assert_cutover_has_no_dependent_views(
+            db_schema,
+            [swap.live_cls.__main_table__ for swap in swaps],
+        )
         for swap in swaps:
             await _swap_stage_table(db_schema, swap.live_cls, swap.stage_cls)
         for label, statement in patch_statements:
@@ -12006,6 +12060,20 @@ async def process_entity_address_unified_data(ctx, task=None):
             f"entity-address-unified {refresh_mode} refresh cannot be combined with "
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE."
         )
+
+    if context["publish_requested"] and not context.get(
+        "cutover_dependency_preflight"
+    ):
+        live_models = (
+            (EntityAddressUnified,)
+            if serving_only_refresh
+            else (EntityAddressUnified, *SUPPORT_TABLE_MODELS)
+        )
+        await _assert_cutover_has_no_dependent_views(
+            db_schema,
+            [model.__main_table__ for model in live_models],
+        )
+        context["cutover_dependency_preflight"] = True
 
     if not ctx["context"].get("stage_prepared"):
         await _ensure_schema_exists(db_schema)
