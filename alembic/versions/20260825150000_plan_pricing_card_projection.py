@@ -1,7 +1,7 @@
 """Add immutable plan-pricing card and aggregate projections.
 
 Revision ID: 20260825150000_plan_pricing_card_projection
-Revises: 20260825120000_ptg_v4_finalizer_map_pack
+Revises: 20260826090000_hospital_price_packed_blocks
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from sqlalchemy import text
 
 
 revision = "20260825150000_plan_pricing_card_projection"
-down_revision = "20260825120000_ptg_v4_finalizer_map_pack"
+down_revision = "20260826090000_hospital_price_packed_blocks"
 branch_labels = None
 depends_on = None
 

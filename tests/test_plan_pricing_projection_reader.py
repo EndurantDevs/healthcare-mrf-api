@@ -411,7 +411,7 @@ def test_projection_migration_keeps_fragments_and_aggregates_in_one_build(
     migration.upgrade()
 
     statement = " ".join(" ".join(statements).split())
-    assert migration.down_revision == "20260825120000_ptg_v4_finalizer_map_pack"
+    assert migration.down_revision == "20260826090000_hospital_price_packed_blocks"
     assert '"projection_test"."plan_pricing_projection_candidate"' in statement
     assert '"projection_test"."plan_pricing_card"' in statement
     assert '"projection_test"."plan_pricing_cell_aggregate"' in statement
