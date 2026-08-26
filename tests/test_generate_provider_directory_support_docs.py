@@ -52,9 +52,9 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "First Medical Health Plan, Inc. (`provider-directory-blocked-first-medical-pr`) | Not supported | User token | Required" in rendered_document
     assert "| Registration | Reviewed at | Review valid through |" in rendered_document
     assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`)" in rendered_document
-    assert "Required | 2026-07-11 | 2026-08-25 | OAuth2 client credentials and Bulk" in rendered_document
+    assert "Required | 2026-08-26 | 2026-10-10 | OAuth2 client credentials and Bulk" in rendered_document
     assert "Cigna (`cigna`)" in rendered_document
-    assert "Not required | 2026-08-25 | 2026-10-09 | Sequential REST pagination" in rendered_document
+    assert "Not required | 2026-08-26 | 2026-10-10 | Sequential REST pagination" in rendered_document
     assert "## Observed Live Verification" in rendered_document
     assert "| Terminal status | Resource completion | Derived artifacts | Unified/API readiness | Readiness observed at |" in rendered_document
     assert "| ALOHR (`alohr`) | Not recorded | Not recorded | Not recorded | Not Promoted | Not Ready |" in rendered_document
@@ -145,7 +145,7 @@ def test_rendered_live_proof_summarizes_resource_rows():
 
     assert "| Rows by resource |" in rendered_document
     assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Promoted | Ready |" in rendered_document
-    assert "| Cigna (`cigna`) | Current | Succeeded | Complete | Promoted | Ready |" in rendered_document
+    assert "| Cigna (`cigna`) | Current | Succeeded | Complete | Superseded (Promoted) | Superseded (Ready) |" in rendered_document
     assert "HealthcareService: 1,108,600" in rendered_document
     assert "Location: 280,847" in rendered_document
 

@@ -218,7 +218,7 @@ def _validate_verification_observation(entry_id: str, observation: Any) -> None:
 def _validate_publication_readiness(entry_id: str, readiness_record: Any) -> None:
     """Validate downstream readiness without treating it as acquisition proof."""
     required_fields = {"derived_artifact_state", "unified_api_state", "observed_at"}
-    optional_fields = {"evidence"}
+    optional_fields = {"dataset_id", "evidence", "proof_state"}
     if readiness_record is None:
         return
     if (
@@ -233,6 +233,17 @@ def _validate_publication_readiness(entry_id: str, readiness_record: Any) -> Non
         raise SupportDocumentationError(f"{entry_id}: invalid derived artifact state")
     if readiness_record["unified_api_state"] not in UNIFIED_API_STATES:
         raise SupportDocumentationError(f"{entry_id}: invalid unified API state")
+    proof_state = readiness_record.get("proof_state", "current")
+    if proof_state not in {"current", "superseded"}:
+        raise SupportDocumentationError(f"{entry_id}: invalid publication readiness proof state")
+    is_ready = (
+        readiness_record["derived_artifact_state"] == "promoted"
+        and readiness_record["unified_api_state"] == "ready"
+    )
+    if is_ready and not re.fullmatch(r"pdds_[0-9a-f]{64}", str(readiness_record.get("dataset_id", ""))):
+        raise SupportDocumentationError(
+            f"{entry_id}: ready publication evidence must bind a dataset_id"
+        )
     validate_optional_verification_timestamp(
         readiness_record["observed_at"], f"{entry_id}: publication readiness observed_at"
     )

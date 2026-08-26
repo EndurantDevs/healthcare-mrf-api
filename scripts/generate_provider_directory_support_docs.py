@@ -309,7 +309,12 @@ def _display_verification(value: str | None) -> str:
 def _observation_display(record: dict[str, Any]) -> str:
     observation = record.get("current_observation")
     if not isinstance(observation, dict):
-        return NOT_RECORDED_DISPLAY
+        terminal_status = record.get("terminal_status")
+        run_id = record.get("run_id")
+        observed_at = record.get("checked_at")
+        if not all(isinstance(value, str) and value for value in (terminal_status, run_id, observed_at)):
+            return NOT_RECORDED_DISPLAY
+        return f"{_display_verification(terminal_status)} (`{run_id}`) at `{observed_at}`"
     status = observation.get("run_status") or observation["state_status"]
     run_id = observation.get("run_id") or NOT_RECORDED_DISPLAY
     return f"{_display_verification(str(status))} (`{run_id}`) at `{observation['observed_at']}`"

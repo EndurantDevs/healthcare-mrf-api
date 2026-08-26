@@ -299,6 +299,25 @@ def _verification_expiration_messages(
     expiration_messages = []
     verification_records_by_entry = verification_snapshot.get("entries", {})
     for entry_id, verification_record in verification_records_by_entry.items():
+        observation = (
+            verification_record.get("current_observation")
+            if isinstance(verification_record, dict)
+            else None
+        )
+        observed_status = (
+            observation.get("run_status") or observation.get("state_status")
+            if isinstance(observation, dict)
+            else None
+        )
+        if observed_status in {"queued", "starting", "running", "finalizing", "canceling"}:
+            observed_on = parse_timestamp_date(
+                observation.get("observed_at"), f"{entry_id}: observed_at"
+            )
+            observation_due = observed_on + dt.timedelta(days=maximum_age_days)
+            if evaluation_date > observation_due:
+                expiration_messages.append(
+                    f"{entry_id} active observation expired {observation_due.isoformat()}"
+                )
         if (
             not isinstance(verification_record, dict)
             or verification_record.get("proof_state") == "superseded"

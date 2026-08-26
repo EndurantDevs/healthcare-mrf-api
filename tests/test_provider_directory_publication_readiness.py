@@ -13,6 +13,7 @@ def test_rendered_live_proof_keeps_artifact_and_api_readiness_separate():
         generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
     )
     snapshot["entries"]["idaho"]["publication_readiness"] = {
+        "dataset_id": "pdds_fc4faaf27524be41f181cc4ccfa81bf5911d9a534c0114b0ecbe6a114685b94f",
         "derived_artifact_state": "promoted",
         "unified_api_state": "pending_verification",
         "observed_at": "2026-07-12T00:00:00Z",
@@ -40,6 +41,7 @@ def test_verification_snapshot_rejects_invalid_publication_readiness_signal():
         generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
     )
     snapshot["entries"]["idaho"]["publication_readiness"] = {
+        "dataset_id": "pdds_fc4faaf27524be41f181cc4ccfa81bf5911d9a534c0114b0ecbe6a114685b94f",
         "derived_artifact_state": "promoted",
         "unified_api_state": "ready",
         "observed_at": "2026-07-12T00:00:00Z",

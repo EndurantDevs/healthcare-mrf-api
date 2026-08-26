@@ -31,7 +31,14 @@ except ModuleNotFoundError:
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = ROOT / "specs/provider_directory_endpoint_acquisition_manifest.json"
 SOURCE_ID_PATTERN = re.compile(r"^pdfhir_[0-9a-f]{24}$")
+RUN_ID_PATTERN = re.compile(r"^run_[0-9a-f]{32}$")
 SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+RUN_LINEAGE_PARAM_FIELDS = {
+    "provider_directory_endpoint_scope",
+    "provider_directory_pagination_attempt",
+    "provider_directory_pagination_root_run_id",
+    "retry_of_run_id",
+}
 RESOURCE_PROFILES = {
     "G4": [
         "Practitioner",
@@ -356,9 +363,34 @@ def _result_param_errors(
         errors.append("result importer does not match the manifest")
     actual_params = result.get("params")
     actual_params = actual_params if isinstance(actual_params, dict) else {}
-    for param_name, expected_value in entry_params(manifest, entry).items():
+    expected_params = entry_params(manifest, entry)
+    for param_name, expected_value in expected_params.items():
         if actual_params.get(param_name) != expected_value:
             errors.append(f"params.{param_name} does not match the manifest")
+    unsupported_params = sorted(
+        set(actual_params) - set(expected_params) - RUN_LINEAGE_PARAM_FIELDS
+    )
+    if unsupported_params:
+        errors.append(
+            "result params are not controlled: " + ",".join(unsupported_params)
+        )
+    endpoint_scope = actual_params.get("provider_directory_endpoint_scope")
+    if endpoint_scope is not None and endpoint_scope != entry["canonical_base"]:
+        errors.append("params.provider_directory_endpoint_scope does not match the manifest")
+    pagination_attempt = actual_params.get("provider_directory_pagination_attempt")
+    if pagination_attempt is not None and (
+        type(pagination_attempt) is not int or pagination_attempt < 1
+    ):
+        errors.append("params.provider_directory_pagination_attempt is invalid")
+    for run_id_field in (
+        "provider_directory_pagination_root_run_id",
+        "retry_of_run_id",
+    ):
+        run_id = actual_params.get(run_id_field)
+        if run_id is not None and (
+            not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id)
+        ):
+            errors.append(f"params.{run_id_field} is invalid")
     if entry["classification"] == "probe_only":
         forbidden_keys = sorted(PROBE_OMITTED_KEYS.intersection(actual_params))
         if forbidden_keys:
@@ -366,6 +398,27 @@ def _result_param_errors(
                 "probe-only result contains resource/pagination params: "
                 + ",".join(forbidden_keys)
             )
+    return errors
+
+
+def result_source_identity_errors(
+    manifest: dict[str, Any],
+    entry: dict[str, Any],
+    result: dict[str, Any],
+) -> list[str]:
+    """Reject observations that do not identify the exact configured source."""
+    errors = []
+    if result.get("importer") != manifest["importer"]:
+        errors.append("result importer does not match the manifest")
+    params = result.get("params") if isinstance(result.get("params"), dict) else {}
+    if params.get("source_ids") != entry["source_ids"]:
+        errors.append("result params.source_ids does not match the endpoint")
+    endpoint_scope = params.get("provider_directory_endpoint_scope")
+    if endpoint_scope is not None and endpoint_scope != entry["canonical_base"]:
+        errors.append("result endpoint scope does not match the manifest")
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    if metrics.get("source_ids") not in (None, entry["source_ids"]):
+        errors.append("result metrics.source_ids does not match the endpoint")
     return errors
 
 

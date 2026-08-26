@@ -29,6 +29,9 @@ def publication_readiness_display(
         return (NOT_RECORDED_DISPLAY,) * 4
     artifact_state = _display_state(readiness_record["derived_artifact_state"])
     api_state = _display_state(readiness_record["unified_api_state"])
+    if readiness_record.get("proof_state") == "superseded":
+        artifact_state = f"Superseded ({artifact_state})"
+        api_state = f"Superseded ({api_state})"
     observed_at = readiness_record["observed_at"]
     readiness_evidence = readiness_record.get("evidence")
     if not isinstance(readiness_evidence, dict):
