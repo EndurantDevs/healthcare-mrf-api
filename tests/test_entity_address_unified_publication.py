@@ -36,6 +36,7 @@ class _RecordingDB:
         persistence_values=("p",),
         advisory_values=(True,),
         existing_names=None,
+        dependent_views=(),
     ):
         self.persistence_values = list(persistence_values)
         self.advisory_values = list(advisory_values)
@@ -49,6 +50,7 @@ class _RecordingDB:
                 "entity_address_unified_stage",
             }
         )
+        self.dependent_views = list(dependent_views)
 
     async def scalar(self, statement, **_params):
         self.events.append(statement)
@@ -63,6 +65,9 @@ class _RecordingDB:
         raise AssertionError(f"unexpected scalar SQL: {statement}")
 
     async def all(self, statement, **params):
+        self.events.append(statement)
+        if "pg_depend AS dependency" in statement:
+            return self.dependent_views
         assert "ORDER BY c.relname" in statement
         return [
             (name,)
@@ -135,6 +140,19 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
         if "entity_address_geo_assurance_state" in statement
     )
     assert stage_rename_at < activation_at
+    dependency_check_at = next(
+        index
+        for index, statement in enumerate(recording_db.events)
+        if "pg_depend AS dependency" in statement
+    )
+    lock_at = recording_db.events.index(
+        "LOCK TABLE mrf.entity_address_unified, mrf.entity_address_unified_stage "
+        "IN ACCESS EXCLUSIVE MODE NOWAIT;"
+    )
+    drop_at = recording_db.events.index(
+        "DROP TABLE IF EXISTS mrf.entity_address_unified_old;"
+    )
+    assert lock_at < dependency_check_at < drop_at
 
 
 @pytest.mark.asyncio
