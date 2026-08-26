@@ -93,35 +93,6 @@ fn selector_key_memory_bytes(
     text_bytes as u64 * 2 + SELECTOR_KEY_MEMORY_OVERHEAD_BYTES
 }
 
-fn selector_key_sha256(
-    key: &crate::hospital_price_selector_block::HospitalPriceSelectorKey,
-) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    match key {
-        crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code {
-            code_type,
-            code,
-        } => {
-            digest.update(b"code\0");
-            digest.update((code_type.len() as u64).to_le_bytes());
-            digest.update(code_type.as_bytes());
-            digest.update((code.len() as u64).to_le_bytes());
-            digest.update(code.as_bytes());
-        }
-        crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {
-            payer_name,
-            plan_name,
-        } => {
-            digest.update(b"payer-plan\0");
-            digest.update((payer_name.len() as u64).to_le_bytes());
-            digest.update(payer_name.as_bytes());
-            digest.update((plan_name.len() as u64).to_le_bytes());
-            digest.update(plan_name.as_bytes());
-        }
-    }
-    digest.finalize().into()
-}
-
 fn selector_parent_sha256(
     key: &crate::hospital_price_selector_block::HospitalPriceSelectorKey,
 ) -> Option<[u8; 32]> {

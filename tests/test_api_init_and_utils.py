@@ -15,6 +15,7 @@ EXPECTED_PUBLIC_BLUEPRINT_NAMES = {
     "clinical",
     "codes",
     "healthcheck",
+    "hospital_prices",
     "plan",
     "formulary",
     "formulary_fhir",

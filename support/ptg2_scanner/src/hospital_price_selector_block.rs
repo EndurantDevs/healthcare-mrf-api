@@ -54,6 +54,30 @@ impl HospitalPriceSelectorKey {
     }
 }
 
+pub fn selector_key_sha256(key: &HospitalPriceSelectorKey) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    match key {
+        HospitalPriceSelectorKey::Code { code_type, code } => {
+            digest.update(b"code\0");
+            digest.update((code_type.len() as u64).to_le_bytes());
+            digest.update(code_type.as_bytes());
+            digest.update((code.len() as u64).to_le_bytes());
+            digest.update(code.as_bytes());
+        }
+        HospitalPriceSelectorKey::PayerPlan {
+            payer_name,
+            plan_name,
+        } => {
+            digest.update(b"payer-plan\0");
+            digest.update((payer_name.len() as u64).to_le_bytes());
+            digest.update(payer_name.as_bytes());
+            digest.update((plan_name.len() as u64).to_le_bytes());
+            digest.update(plan_name.as_bytes());
+        }
+    }
+    digest.finalize().into()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HospitalPriceSelectorEntry {
     pub key: HospitalPriceSelectorKey,

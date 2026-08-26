@@ -341,8 +341,10 @@
     fn selector_code_identity_includes_code_type() {
         let key = selector_code_with_type("HCPCS", "12345");
         assert_ne!(
-            selector_key_sha256(&selector_code_with_type("CPT", "12345")),
-            selector_key_sha256(&key),
+            crate::hospital_price_selector_block::selector_key_sha256(
+                &selector_code_with_type("CPT", "12345"),
+            ),
+            crate::hospital_price_selector_block::selector_key_sha256(&key),
         );
         assert_eq!(
             selector_key_memory_bytes(&key),
