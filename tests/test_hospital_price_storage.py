@@ -48,6 +48,22 @@ def _load_migration(path: Path = MIGRATION_PATH):
     return migration
 
 
+def test_source_format_constraint_matches_native_receipts() -> None:
+    migration_sql = MIGRATION_PATH.read_text(encoding="utf-8")
+    shape_check = next(
+        constraint
+        for constraint in HospitalPriceVersion.__table__.constraints
+        if constraint.name == "hospital_price_version_shape_check"
+    )
+    model_sql = str(shape_check.sqltext)
+    for value in ("csv-tall", "csv-wide"):
+        assert value in migration_sql
+        assert value in model_sql
+    for value in ("csv_tall", "csv_wide"):
+        assert value not in migration_sql
+        assert value not in model_sql
+
+
 def _database_url() -> sa.URL:
     raw_dsn = os.getenv(POSTGRES_DSN_ENV)
     if not raw_dsn:

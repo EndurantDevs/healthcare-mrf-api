@@ -155,6 +155,7 @@ async def test_refreshed_source_rebind_is_atomic_and_provenance_bound() -> None:
     """Persist the exact fresh locator observation before retrying its source."""
 
     store, _native = _store_module()
+    await store.rebind_attempt_sources(())
     connection = _Connection(all_rows=[[('attempt-a',)]])
     store.db.acquire = _acquire(connection)
     attempt = SimpleNamespace(attempt_id="attempt-a", hospital_id="hospital-a")
@@ -164,6 +165,10 @@ async def test_refreshed_source_rebind_is_atomic_and_provenance_bound() -> None:
         observation_id="observation-fresh",
         source_url="https://hospital.example/prices.json?sig=fresh",
     )
+    with pytest.raises(ValueError, match="binding is invalid"):
+        await store.rebind_attempt_sources(((
+            attempt, SimpleNamespace(**{**vars(candidate), "hospital_id": "other"})
+        ),))
 
     await store.rebind_attempt_sources(((attempt, candidate),))
 
@@ -230,6 +235,7 @@ async def test_content_version_children_and_count_invariants(
 ) -> None:
     store, _native = _store_module()
     receipt = _receipt(_native, tmp_path)
+    receipt.source_format = "csv-tall"
     stage_by_kind = {
         artifact.kind: f"stage_{artifact.kind}" for artifact in receipt.artifacts
     }
@@ -386,7 +392,12 @@ async def test_existing_version_and_publication_paths(monkeypatch) -> None:
         store.HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
         7,
     )
-    stored_versions = [None, ("wrong", "contract", 1), (*expected, True, True)]
+    stored_versions = [
+        None,
+        ("wrong", "contract", 1),
+        (*expected, False, True),
+        (*expected, True, True),
+    ]
 
     async def first(*_args: Any, **_kwargs: Any) -> Any:
         return stored_versions.pop(0)
@@ -394,6 +405,8 @@ async def test_existing_version_and_publication_paths(monkeypatch) -> None:
     store.db.first = first
     assert not await store.has_existing_version("v", "c" * 64, 7)
     with pytest.raises(RuntimeError, match="conflicts with source"):
+        await store.has_existing_version("v", "c" * 64, 7)
+    with pytest.raises(RuntimeError, match="packed version is incomplete"):
         await store.has_existing_version("v", "c" * 64, 7)
     assert await store.has_existing_version("v", "c" * 64, 7)
 
@@ -435,9 +448,11 @@ async def test_stage_content_runs_one_transactional_pipeline(monkeypatch) -> Non
     ):
         monkeypatch.setattr(store, name, record(name))
 
+    inserted_outcomes = [True, False]
+
     async def has_inserted_version(*_args: Any) -> bool:
         calls.append("_has_inserted_version")
-        return True
+        return inserted_outcomes.pop(0)
 
     monkeypatch.setattr(store, "_has_inserted_version", has_inserted_version)
     raw = SimpleNamespace(
@@ -456,6 +471,16 @@ async def test_stage_content_runs_one_transactional_pipeline(monkeypatch) -> Non
         "_insert_children",
         "_insert_packed_root",
         "copy_packed_blocks",
+        "_validate_stored_counts",
+    ]
+
+    calls.clear()
+    await store.stage_content(SimpleNamespace(), raw)
+    assert calls == [
+        "_copy_stages",
+        "_validate_stages",
+        "_insert_content",
+        "_has_inserted_version",
         "_validate_stored_counts",
     ]
 
