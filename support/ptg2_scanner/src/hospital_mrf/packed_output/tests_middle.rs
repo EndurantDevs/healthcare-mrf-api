@@ -344,9 +344,22 @@
 
     #[test]
     fn selector_code_identity_includes_code_type() {
+        let key = selector_code_with_type("HCPCS", "12345");
         assert_ne!(
             selector_key_sha256(&selector_code_with_type("CPT", "12345")),
-            selector_key_sha256(&selector_code_with_type("HCPCS", "12345")),
+            selector_key_sha256(&key),
+        );
+        assert_eq!(
+            selector_key_memory_bytes(&key),
+            (("HCPCS".len() + "12345".len()) * 2) as u64 + SELECTOR_KEY_MEMORY_OVERHEAD_BYTES,
+        );
+        assert_eq!(
+            selector_ref_capacity(&key).unwrap(),
+            (crate::hospital_price_selector_block::HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_RAW_BYTES
+                - (4 + "HCPCS".len())
+                - (4 + "12345".len())
+                - 4)
+                / 8,
         );
         let mut row = service();
         row.codes[0].code_type = "x".repeat(
