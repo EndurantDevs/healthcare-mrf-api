@@ -1,3 +1,12 @@
+fn ensure_selector_key_capacity(key_count: usize) -> io::Result<()> {
+    if key_count >= MAX_SELECTOR_KEYS {
+        return Err(invalid(format!(
+            "hospital MRF packed selector key count exceeds {MAX_SELECTOR_KEYS}"
+        )));
+    }
+    Ok(())
+}
+
 impl PackedOutputBuilder {
     fn selector_key_ordinal(
         &mut self,
@@ -7,11 +16,7 @@ impl PackedOutputBuilder {
             return Ok(*ordinal);
         }
         selector_ref_capacity(&key)?;
-        if self.selector_keys.len() == MAX_SELECTOR_KEYS {
-            return Err(invalid(format!(
-                "hospital MRF packed selector key count exceeds {MAX_SELECTOR_KEYS}"
-            )));
-        }
+        ensure_selector_key_capacity(self.selector_keys.len())?;
         let next_memory_bytes = self.selector_key_memory_bytes + selector_key_memory_bytes(&key);
         let memory_limit = self.max_output_bytes.min(MAX_SELECTOR_KEY_MEMORY_BYTES);
         if next_memory_bytes > memory_limit {

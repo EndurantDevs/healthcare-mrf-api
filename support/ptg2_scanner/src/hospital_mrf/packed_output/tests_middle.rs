@@ -268,12 +268,7 @@
         fs::remove_file(&output.selector_spool_path).unwrap();
         assert!(output.finish_selector_pages().is_err());
 
-        let directory = tempfile::tempdir().unwrap();
-        let mut output = builder(directory.path());
-        output.selector_keys = vec![selector_code(String::new()); MAX_SELECTOR_KEYS];
-        assert!(output
-            .selector_key_ordinal(selector_code("new"))
-            .is_err());
+        assert!(ensure_selector_key_capacity(MAX_SELECTOR_KEYS).is_err());
     }
 
     #[test]
