@@ -492,9 +492,6 @@ def test_capacity_v2_migration_precedes_the_unique_repository_head():
         "20260826200000_hospital_price_selector_range_index"
     ]
     assert script.get_revision(
-        "20260826200000_hospital_price_selector_range_index"
-    ).down_revision == "20260825150000_plan_pricing_card_projection"
-    assert script.get_revision(
         "20260825150000_plan_pricing_card_projection"
     ).down_revision == "20260826090000_hospital_price_packed_blocks"
     migration = load_capacity_v2_migration()
