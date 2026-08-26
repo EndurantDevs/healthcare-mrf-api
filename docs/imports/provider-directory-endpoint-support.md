@@ -1,6 +1,6 @@
 # Provider Directory Endpoint Support
 
-This matrix describes maintained implementation and campaign configuration. It does not claim that a live probe succeeded, that an import ran, or that a dataset is current. Runtime and import status are written locally or on dev by the endpoint-acquisition harness to `reports/provider-directory-endpoint-acquisition/report.json`, or to its selected `--report` path; the report is not tracked.
+This matrix describes maintained implementation and campaign configuration. It does not claim that a live probe succeeded, that an import ran, or that a dataset is current. Credential-safe operator results are written locally or on dev to `reports/provider-directory-endpoint-acquisition/report.json`, or to a selected `--output` path with `--verification-report`; the report is not tracked.
 
 The live catalog and curated support matrix are distinct: the catalog inventory covers every source in `mrf.provider_directory_source`, while this maintained matrix tracks only sources with curated support records. The tracked verification snapshot remains the authority for terminal per-endpoint live status.
 

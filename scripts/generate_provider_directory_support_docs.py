@@ -33,7 +33,11 @@ try:
         render_inventory_summary,
         resource_completion_display,
     )
-    from scripts.provider_directory_readiness_display import publication_readiness_display
+    from scripts.provider_directory_readiness_display import (
+        display_verification as _display_verification,
+        observation_display as _observation_display,
+        publication_readiness_display,
+    )
     from scripts.provider_directory_verification_contract import (
         VERIFICATION_STATUSES,
         provider_directory_entry_sha256,
@@ -65,7 +69,11 @@ except ModuleNotFoundError:
         render_inventory_summary,
         resource_completion_display,
     )
-    from provider_directory_readiness_display import publication_readiness_display
+    from provider_directory_readiness_display import (
+        display_verification as _display_verification,
+        observation_display as _observation_display,
+        publication_readiness_display,
+    )
     from provider_directory_verification_contract import (
         VERIFICATION_STATUSES,
         provider_directory_entry_sha256,
@@ -245,7 +253,7 @@ def _support_document_header(manifest: dict[str, Any]) -> list[str]:
     return [
         "# Provider Directory Endpoint Support",
         "",
-        "This matrix describes maintained implementation and campaign configuration. It does not claim that a live probe succeeded, that an import ran, or that a dataset is current. Runtime and import status are written locally or on dev by the endpoint-acquisition harness to `" + report_path + "`, or to its selected `--report` path; the report is not tracked.",
+        "This matrix describes maintained implementation and campaign configuration. It does not claim that a live probe succeeded, that an import ran, or that a dataset is current. Credential-safe operator results are written locally or on dev to `" + report_path + "`, or to a selected `--output` path with `--verification-report`; the report is not tracked.",
         "",
         "The live catalog and curated support matrix are distinct: the catalog inventory covers every source in `" + confirmation_by_field["relation"] + "`, while this maintained matrix tracks only sources with curated support records. The tracked verification snapshot remains the authority for terminal per-endpoint live status.",
         "",
@@ -298,28 +306,6 @@ def _configured_support_rows(
         ]
         markdown_rows.append("| " + " | ".join(_markdown_cell(cell) for cell in cells) + " |")
     return markdown_rows
-def _display_verification(value: str | None) -> str:
-    if value is None or value in {"not_recorded", NOT_RECORDED}:
-        return NOT_RECORDED_DISPLAY
-    if value == "not_verified":
-        return "Not verified"
-    if value == "verified":
-        return "Verified"
-    return value.replace("_", " ").title()
-def _observation_display(record: dict[str, Any]) -> str:
-    observation = record.get("current_observation")
-    if not isinstance(observation, dict):
-        terminal_status = record.get("terminal_status")
-        run_id = record.get("run_id")
-        observed_at = record.get("checked_at")
-        if not all(isinstance(value, str) and value for value in (terminal_status, run_id, observed_at)):
-            return NOT_RECORDED_DISPLAY
-        return f"{_display_verification(terminal_status)} (`{run_id}`) at `{observed_at}`"
-    status = observation.get("run_status") or observation["state_status"]
-    run_id = observation.get("run_id") or NOT_RECORDED_DISPLAY
-    return f"{_display_verification(str(status))} (`{run_id}`) at `{observation['observed_at']}`"
-
-
 def _terminal_resource_rows_display(
     entry: dict[str, Any],
     verification_record: dict[str, Any],

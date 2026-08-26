@@ -20,7 +20,7 @@ def test_rendered_catalog_snapshot_distinguishes_full_catalog_from_curated_matri
 
     assert "does not claim that a live probe succeeded" in rendered_document
     assert "`reports/provider-directory-endpoint-acquisition/report.json`" in rendered_document
-    assert "selected `--report` path; the report is not tracked" in rendered_document
+    assert "selected `--output` path with `--verification-report`" in rendered_document
     assert "## Catalog Inventory Snapshot" in rendered_document
     assert "entire live catalog: `874` sources confirmed in `mrf-dev`" in rendered_document
     assert (

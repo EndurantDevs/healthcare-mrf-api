@@ -18,6 +18,7 @@ from typing import Any
 try:
     from scripts import generate_provider_directory_support_docs as generator
     from scripts.provider_directory_verification_contract import (
+        ACTIVE_RUN_STATUSES,
         VerificationUpdateError,
         ensure_verification_report_is_fresh as _ensure_report_is_fresh,
         manifest_sha256 as _manifest_sha256,
@@ -25,15 +26,24 @@ try:
         supersede_changed_entry_proofs,
         verification_report_identity as _report_identity,
     )
+    from scripts.research.provider_directory_endpoint_acquisition_reporting import (
+        validate_operator_attestation as _validate_operator_attestation,
+        validate_verification_update_metadata as _validate_integration_metadata,
+    )
 except ModuleNotFoundError:
     import generate_provider_directory_support_docs as generator
     from provider_directory_verification_contract import (
+        ACTIVE_RUN_STATUSES,
         VerificationUpdateError,
         ensure_verification_report_is_fresh as _ensure_report_is_fresh,
         manifest_sha256 as _manifest_sha256,
         provider_directory_entry_sha256,
         supersede_changed_entry_proofs,
         verification_report_identity as _report_identity,
+    )
+    from research.provider_directory_endpoint_acquisition_reporting import (
+        validate_operator_attestation as _validate_operator_attestation,
+        validate_verification_update_metadata as _validate_integration_metadata,
     )
 
 
@@ -44,7 +54,6 @@ DEFAULT_SNAPSHOT = ROOT / "specs/provider_directory_endpoint_verification.json"
 DEFAULT_OUTPUT = ROOT / "docs/imports/provider-directory-endpoint-support.md"
 TERMINAL_STATUSES = generator.VERIFICATION_STATUSES
 SENSITIVE_NAME_PARTS = ("token", "secret", "password", "authorization", "api_key", "credential")
-ACTIVE_RUN_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
 RAW_TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
 SENSITIVE_TEXT_PATTERN = re.compile(
     r"(?i)(?:bearer\s+\S+|token|secret|password|authorization|api[_-]?key|credential)"
@@ -270,100 +279,28 @@ def _empty_snapshot(manifest: dict[str, Any]) -> dict[str, Any]:
         },
     }
 
-def _validate_integration_metadata(
-    report: dict[str, Any],
-    entry_ids: set[str],
-) -> set[str]:
-    integration = report.get("verification_update")
-    if integration is None:
-        return set(report["entries"])
-    if not isinstance(integration, dict):
-        raise VerificationUpdateError("report verification_update must be an object")
-    selected = integration.get("selected_entry_ids")
-    terminal = integration.get("terminal_entry_ids")
-    nonterminal = integration.get("nonterminal_entry_ids")
-    eligible = integration.get("eligible")
-    argv = integration.get("argv")
-    entry_id_groups = (selected, terminal, nonterminal)
-    if not all(isinstance(entry_id_group, list) for entry_id_group in entry_id_groups):
-        raise VerificationUpdateError("report verification_update entry lists are required")
-    if any(not isinstance(entry_id, str) for entry_id_group in entry_id_groups for entry_id in entry_id_group):
-        raise VerificationUpdateError("report verification_update entry identities are invalid")
-    if any(len(entry_id_group) != len(set(entry_id_group)) for entry_id_group in entry_id_groups):
-        raise VerificationUpdateError("report verification_update entry identities are duplicated")
-    if not set(selected).issubset(entry_ids) or set(selected) != set(terminal) | set(nonterminal):
-        raise VerificationUpdateError("report verification_update entry identities do not agree")
-    report_entries = report["entries"]
-    if not set(selected).issubset(report_entries) or any(
-        not isinstance(report_entries[entry_id], dict) for entry_id in selected
-    ):
-        raise VerificationUpdateError("report verification_update entries are missing")
-    if set(terminal) & set(nonterminal) or not isinstance(eligible, bool) or eligible != (not nonterminal):
-        raise VerificationUpdateError("report verification_update eligibility is inconsistent")
-    if (
-        not isinstance(argv, list)
-        or not all(isinstance(argument, str) for argument in argv)
-        or "scripts/update_provider_directory_verification.py" not in argv
-    ):
-        raise VerificationUpdateError("report verification_update argv is invalid")
-    incorrectly_terminal_ids = [
-        entry_id
-        for entry_id in terminal
-        if not isinstance(report_entries.get(entry_id), dict)
-        or report_entries[entry_id].get("status") not in TERMINAL_STATUSES
-    ]
-    if incorrectly_terminal_ids:
-        raise VerificationUpdateError("report verification_update marks nonterminal entries as terminal")
-    expected_terminal_ids = {
-        entry_id
-        for entry_id in selected
-        if report_entries[entry_id].get("status") in TERMINAL_STATUSES
-    }
-    if set(terminal) != expected_terminal_ids:
-        raise VerificationUpdateError("report verification_update terminal identities do not agree")
-    return set(selected)
+def _has_newer_active_run(
+    entry_id: str,
+    report_entry: dict[str, Any],
+    observation: dict[str, Any],
+    prior_record: dict[str, Any],
+    checked_at: str,
+) -> bool:
+    current_run_id = observation.get("run_id")
+    current_status = observation.get("run_status") or observation["state_status"]
+    prior_checked_at = prior_record.get("checked_at")
+    return (
+        report_entry.get("plan_bound", True) is True
+        and current_status in ACTIVE_RUN_STATUSES
+        and current_run_id is not None
+        and current_run_id != prior_record.get("run_id")
+        and (
+            prior_checked_at is None
+            or _parsed_timestamp(checked_at, f"{entry_id}: observed_at")
+            > _parsed_timestamp(prior_checked_at, f"{entry_id}: checked_at")
+        )
+    )
 
-
-def _validate_operator_attestation(
-    report: dict[str, Any],
-    report_entries: dict[str, Any],
-    selected_entry_ids: set[str],
-    environment: str,
-) -> None:
-    """Bind offline operator observations without claiming authenticated proof."""
-    observation = report.get("observation")
-    if not isinstance(observation, dict) or observation.get("method") != "operator-attested-read-only-export":
-        return
-    if not isinstance(report.get("verification_update"), dict):
-        raise VerificationUpdateError(
-            "operator-attested reports require verification update metadata"
-        )
-    if observation.get("environment") != environment:
-        raise VerificationUpdateError("report observation environment does not match")
-    operator_input_sha256 = observation.get("operator_input_sha256")
-    if not isinstance(operator_input_sha256, str) or not re.fullmatch(
-        r"[0-9a-f]{64}", operator_input_sha256
-    ):
-        raise VerificationUpdateError("report operator input identity is invalid")
-    if any(
-        report_entries[entry_id].get("access_verification") != "not_verified"
-        for entry_id in selected_entry_ids
-    ):
-        raise VerificationUpdateError(
-            "operator-attested reports cannot claim verified access"
-        )
-    nonterminal_entry_ids = {
-        entry_id
-        for entry_id in selected_entry_ids
-        if report_entries[entry_id].get("status") not in TERMINAL_STATUSES
-    }
-    if any(
-        type(report_entries[entry_id].get("plan_bound")) is not bool
-        for entry_id in nonterminal_entry_ids
-    ):
-        raise VerificationUpdateError(
-            "operator-attested observations require plan binding state"
-        )
 
 def _merge_nonterminal_observation(
     entry_id: str,
@@ -372,43 +309,29 @@ def _merge_nonterminal_observation(
     prior_record: dict[str, Any],
     checked_at: str,
 ) -> dict[str, Any]:
+    """Preserve terminal proof while merging one current run observation."""
     merged = copy.deepcopy(prior_record)
     observation = _current_observation(entry_id, manifest_entry, report_entry, checked_at)
     merged["current_observation"] = observation
-    prior_run_id = prior_record.get("run_id")
     current_run_id = observation.get("run_id")
     current_status = observation.get("run_status") or observation["state_status"]
-    prior_checked_at = prior_record.get("checked_at")
     prior_observation = prior_record.get("current_observation")
-    prior_active_run_id = (
-        prior_observation.get("run_id")
-        if isinstance(prior_observation, dict)
-        else None
-    )
-    prior_is_superseded_by_active = (
+    prior_active_run_id = prior_observation.get("run_id") if isinstance(prior_observation, dict) else None
+    is_prior_proof_superseded_by_active = (
         prior_record.get("proof_state") == "superseded"
         and prior_record.get("superseded_reason") == "newer_active_run"
     )
-    same_bound_successor = (
+    is_same_bound_successor = (
         report_entry.get("plan_bound") is True
         and current_run_id == prior_active_run_id
     )
-    same_bound_successor_finished = (
-        same_bound_successor and current_status not in ACTIVE_RUN_STATUSES
+    has_same_bound_successor_finished = (
+        is_same_bound_successor and current_status not in ACTIVE_RUN_STATUSES
     )
-    if prior_is_superseded_by_active and not same_bound_successor:
+    if is_prior_proof_superseded_by_active and not is_same_bound_successor:
         return copy.deepcopy(prior_record)
-    has_newer_active_run = (
-        report_entry.get("plan_bound", True) is True
-        and
-        current_status in ACTIVE_RUN_STATUSES
-        and current_run_id is not None
-        and current_run_id != prior_run_id
-        and (
-            prior_checked_at is None
-            or _parsed_timestamp(checked_at, f"{entry_id}: observed_at")
-            > _parsed_timestamp(prior_checked_at, f"{entry_id}: checked_at")
-        )
+    has_newer_active_run = _has_newer_active_run(
+        entry_id, report_entry, observation, prior_record, checked_at
     )
     if prior_record.get("terminal_status") is not None:
         expected_entry_sha256 = provider_directory_entry_sha256(manifest_entry)
@@ -419,8 +342,8 @@ def _merge_nonterminal_observation(
             merged["proof_state"] = "superseded"
             merged["superseded_reason"] = "newer_active_run"
         elif (
-            prior_is_superseded_by_active
-            and same_bound_successor_finished
+            is_prior_proof_superseded_by_active
+            and has_same_bound_successor_finished
         ):
             merged["proof_state"] = "current"
             merged.pop("superseded_reason", None)
@@ -431,13 +354,31 @@ def _merge_nonterminal_observation(
     return merged
 
 
-def _preserve_publication_readiness(
-    terminal_record: dict[str, Any],
-    prior_record: dict[str, Any],
+def _apply_report_entries(
+    snapshot_entries: dict[str, Any],
+    manifest_entry_by_id: dict[str, Any],
+    report_entries: dict[str, Any],
+    selected_entry_ids: set[str],
+    checked_at: str,
 ) -> None:
-    publication_readiness = prior_record.get("publication_readiness")
-    if publication_readiness is not None:
-        terminal_record["publication_readiness"] = copy.deepcopy(publication_readiness)
+    for entry_id in selected_entry_ids:
+        report_entry = report_entries[entry_id]
+        terminal_record = _terminal_record(
+            entry_id, manifest_entry_by_id[entry_id], report_entry, checked_at
+        )
+        if terminal_record is not None:
+            publication_readiness = snapshot_entries[entry_id].get("publication_readiness")
+            if publication_readiness is not None:
+                terminal_record["publication_readiness"] = copy.deepcopy(publication_readiness)
+            snapshot_entries[entry_id] = terminal_record
+        elif isinstance(report_entry, dict):
+            snapshot_entries[entry_id] = _merge_nonterminal_observation(
+                entry_id,
+                manifest_entry_by_id[entry_id],
+                report_entry,
+                snapshot_entries[entry_id],
+                checked_at,
+            )
 
 
 def update_verification_snapshot(
@@ -460,18 +401,20 @@ def update_verification_snapshot(
     unknown_entries = sorted(set(report_entries) - set(entry_ids))
     if unknown_entries:
         raise VerificationUpdateError("report contains unknown entries: " + ", ".join(unknown_entries))
-    generator.validate_verification_snapshot(
-        prior_snapshot,
-        manifest,
-        allow_current_spec_mismatch=True,
-    )
+    generator.validate_verification_snapshot(prior_snapshot, manifest, allow_current_spec_mismatch=True)
     checked_at = _checked_timestamp(report)
     report_identity = _report_identity(report, checked_at)
     _ensure_report_is_fresh(prior_snapshot, report_identity)
-    selected_entry_ids = _validate_integration_metadata(report, set(entry_ids))
+    selected_entry_ids = _validate_integration_metadata(
+        report, set(entry_ids), TERMINAL_STATUSES
+    )
     safe_environment = _safe_environment(environment)
     _validate_operator_attestation(
-        report, report_entries, selected_entry_ids, safe_environment
+        report,
+        report_entries,
+        selected_entry_ids,
+        safe_environment,
+        TERMINAL_STATUSES,
     )
     snapshot_by_field = {
         "schema_version": 1,
@@ -482,24 +425,13 @@ def update_verification_snapshot(
         "entries": copy.deepcopy(prior_snapshot["entries"]),
     }
     supersede_changed_entry_proofs(snapshot_by_field["entries"], manifest_entry_by_id)
-    for entry_id in selected_entry_ids:
-        report_entry = report_entries[entry_id]
-        terminal_record = _terminal_record(
-            entry_id, manifest_entry_by_id[entry_id], report_entry, checked_at
-        )
-        if terminal_record is not None:
-            _preserve_publication_readiness(
-                terminal_record, snapshot_by_field["entries"][entry_id]
-            )
-            snapshot_by_field["entries"][entry_id] = terminal_record
-        elif isinstance(report_entry, dict):
-            snapshot_by_field["entries"][entry_id] = _merge_nonterminal_observation(
-                entry_id,
-                manifest_entry_by_id[entry_id],
-                report_entry,
-                snapshot_by_field["entries"][entry_id],
-                checked_at,
-            )
+    _apply_report_entries(
+        snapshot_by_field["entries"],
+        manifest_entry_by_id,
+        report_entries,
+        selected_entry_ids,
+        checked_at,
+    )
     generator.validate_verification_snapshot(snapshot_by_field, manifest)
     return snapshot_by_field
 

@@ -15,13 +15,21 @@ try:
     )
     from scripts.research.provider_directory_endpoint_acquisition_reporting import (
         RAW_RUN_STATUSES,
-        _run_summary,
+        run_summary,
+    )
+    from scripts.research.provider_directory_endpoint_acquisition_support import (
+        result_param_errors,
+        result_source_identity_errors,
     )
 except ModuleNotFoundError:
     import provider_directory_endpoint_acquisition_harness as harness
     from provider_directory_endpoint_acquisition_reporting import (
         RAW_RUN_STATUSES,
-        _run_summary,
+        run_summary,
+    )
+    from provider_directory_endpoint_acquisition_support import (
+        result_param_errors,
+        result_source_identity_errors,
     )
 
 ENVIRONMENT_PATTERN = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
@@ -104,6 +112,78 @@ def _verification_update_metadata(
     }
 
 
+def _operator_verification_entry(
+    manifest: dict[str, Any],
+    manifest_entry: dict[str, Any],
+    validation_entry: dict[str, Any],
+    operator_result_by_field: dict[str, Any],
+) -> dict[str, Any]:
+    run_status = operator_result_by_field.get("status")
+    if not isinstance(run_status, str) or run_status not in RAW_RUN_STATUSES:
+        raise harness.ManifestError(
+            f"{manifest_entry['entry_id']}: run status is not controlled"
+        )
+    run_id = operator_result_by_field.get("run_id")
+    if not isinstance(run_id, str) or not harness.RUN_ID_PATTERN.fullmatch(run_id):
+        raise harness.ManifestError(
+            f"{manifest_entry['entry_id']}: observed result requires a run_id"
+        )
+    is_manual_observation = (
+        manifest_entry["classification"] == harness.MANUAL_CLASSIFICATION
+    )
+    is_plan_bound = True
+    if run_status != "succeeded" or is_manual_observation:
+        identity_errors = result_source_identity_errors(
+            manifest, manifest_entry, operator_result_by_field
+        )
+        if identity_errors:
+            raise harness.ManifestError(
+                f"{manifest_entry['entry_id']}: observed run identity is invalid: "
+                + "; ".join(identity_errors)
+            )
+        expected_params = harness.entry_params(manifest, manifest_entry)
+        is_plan_bound = bool(expected_params) and not result_param_errors(
+            manifest,
+            manifest_entry,
+            operator_result_by_field,
+            expected_params,
+        )
+    return {
+        "status": (
+            "observed"
+            if is_manual_observation
+            else "succeeded"
+            if run_status == "succeeded" and validation_entry["status"] == "passed"
+            else "metric_validation_failed" if run_status == "succeeded" else "observed"
+        ),
+        "current_run_id": run_id,
+        "last_run": run_summary(operator_result_by_field),
+        "metric_errors": validation_entry["errors"] if run_status == "succeeded" else [],
+        "access_verification": "not_verified",
+        **(
+            {"plan_bound": is_plan_bound}
+            if run_status != "succeeded" or is_manual_observation
+            else {}
+        ),
+    }
+
+
+def _verification_entry_ids_by_state(
+    report_entry_by_id: dict[str, dict[str, Any]],
+) -> tuple[list[str], list[str]]:
+    terminal_entry_ids = [
+        entry_id
+        for entry_id, report_entry in report_entry_by_id.items()
+        if report_entry["status"] != "observed"
+    ]
+    nonterminal_entry_ids = [
+        entry_id
+        for entry_id, report_entry in report_entry_by_id.items()
+        if report_entry["status"] == "observed"
+    ]
+    return terminal_entry_ids, nonterminal_entry_ids
+
+
 def _build_verification_report(
     manifest: dict[str, Any],
     operator_input: dict[str, Any],
@@ -123,57 +203,19 @@ def _build_verification_report(
     manifest_entry_by_id = {
         entry["entry_id"]: entry for entry in manifest["entries"]
     }
-    report_entry_by_id = {}
-    for entry_id, validation_entry in validation_report["entries"].items():
-        operator_result_by_field = operator_result_by_entry_id[entry_id]
-        run_status = operator_result_by_field.get("status")
-        if not isinstance(run_status, str) or run_status not in RAW_RUN_STATUSES:
-            raise harness.ManifestError(f"{entry_id}: run status is not controlled")
-        run_id = operator_result_by_field.get("run_id")
-        if not isinstance(run_id, str) or not harness.RUN_ID_PATTERN.fullmatch(run_id):
-            raise harness.ManifestError(f"{entry_id}: observed result requires a run_id")
-        plan_bound = True
-        if run_status != "succeeded":
-            identity_errors = harness.result_source_identity_errors(
-                manifest,
-                manifest_entry_by_id[entry_id],
-                operator_result_by_field,
-            )
-            if identity_errors:
-                raise harness.ManifestError(
-                    f"{entry_id}: observed run identity is invalid: "
-                    + "; ".join(identity_errors)
-                )
-            plan_bound = not harness._result_param_errors(
-                manifest,
-                manifest_entry_by_id[entry_id],
-                operator_result_by_field,
-            )
-        report_entry_by_id[entry_id] = {
-            "status": (
-                "succeeded"
-                if run_status == "succeeded" and validation_entry["status"] == "passed"
-                else "metric_validation_failed" if run_status == "succeeded" else "observed"
-            ),
-            "current_run_id": run_id,
-            "last_run": _run_summary(operator_result_by_field),
-            "metric_errors": (
-                validation_entry["errors"] if run_status == "succeeded" else []
-            ),
-            "access_verification": "not_verified",
-            **({"plan_bound": plan_bound} if run_status != "succeeded" else {}),
-        }
+    report_entry_by_id = {
+        entry_id: _operator_verification_entry(
+            manifest,
+            manifest_entry_by_id[entry_id],
+            validation_entry,
+            operator_result_by_entry_id[entry_id],
+        )
+        for entry_id, validation_entry in validation_report["entries"].items()
+    }
 
-    terminal_entry_ids = [
-        entry_id
-        for entry_id, report_entry in report_entry_by_id.items()
-        if report_entry["status"] != "observed"
-    ]
-    nonterminal_entry_ids = [
-        entry_id
-        for entry_id, report_entry in report_entry_by_id.items()
-        if report_entry["status"] == "observed"
-    ]
+    terminal_entry_ids, nonterminal_entry_ids = _verification_entry_ids_by_state(
+        report_entry_by_id
+    )
     return {
         "schema_version": 1,
         "generated_at": observed_at,

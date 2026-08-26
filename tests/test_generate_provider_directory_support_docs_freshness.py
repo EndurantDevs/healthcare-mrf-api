@@ -246,7 +246,8 @@ def test_provider_directory_guide_documents_the_full_lifecycle():
     for command in (
         "scripts/research/provider_directory_endpoint_acquisition_cli.py",
         "--validate-only",
-        "--apply",
+        "--operator-input",
+        "--verification-report",
         "scripts/update_provider_directory_verification.py",
         "scripts/generate_provider_directory_support_docs.py",
         "--check",

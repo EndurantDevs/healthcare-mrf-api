@@ -82,16 +82,24 @@ Use this sequence for a campaign or documentation review:
      --validate-only
    ```
 
-2. Run the acquisition harness in its default GET-only mode for inspection.
-   Add `--apply` only when the selected campaign should create or resume live
-   operator-managed runs. Keep the report at the manifest's configured path, or
-   pass an explicit `--report` path:
+2. Emit the exact operator plan for the selected entry. This CLI does not create
+   or resume live runs:
 
    ```bash
    ./venv314/bin/python scripts/research/provider_directory_endpoint_acquisition_cli.py \
-     --control-url "$OPERATOR_API_URL" \
-     --apply \
-     --report reports/provider-directory-endpoint-acquisition/report.json
+     --entry "$ENTRY_ID" \
+     --output /tmp/provider-directory-operator-plan.json
+   ```
+
+   After the authorized operator workflow completes, verify its credential-free
+   result and write an updater-compatible report:
+
+   ```bash
+   ./venv314/bin/python scripts/research/provider_directory_endpoint_acquisition_cli.py \
+     --entry "$ENTRY_ID" \
+     --operator-input /path/to/operator-input.json \
+     --output reports/provider-directory-endpoint-acquisition/report.json \
+     --verification-report
    ```
 
 3. After the report is eligible for verification, update the snapshot and

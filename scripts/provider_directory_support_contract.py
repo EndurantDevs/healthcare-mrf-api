@@ -34,6 +34,7 @@ RESOURCE_TYPES = {
     "OrganizationAffiliation",
     "Endpoint",
 }
+ACTIVE_RUN_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
 BLOCKER_OPERATIONAL_STATUSES = {"unreachable", "auth-gated", "not-published"}
 BLOCKER_ACQUISITION_METHODS = {"not-importable"}
 SOURCE_ID_PATTERN = re.compile(r"pdfhir_[0-9a-f]{24}")
@@ -309,7 +310,7 @@ def _verification_expiration_messages(
             if isinstance(observation, dict)
             else None
         )
-        if observed_status in {"queued", "starting", "running", "finalizing", "canceling"}:
+        if observed_status in ACTIVE_RUN_STATUSES:
             observed_on = parse_timestamp_date(
                 observation.get("observed_at"), f"{entry_id}: observed_at"
             )

@@ -50,3 +50,20 @@ def test_verification_snapshot_rejects_invalid_publication_readiness_signal():
 
     with pytest.raises(generator.SupportDocumentationError, match="readiness signals"):
         generator.validate_verification_snapshot(snapshot, manifest)
+
+
+@pytest.mark.parametrize("dataset_id", ["not-a-dataset-id", None])
+def test_verification_snapshot_rejects_malformed_nonready_dataset_id(dataset_id):
+    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    snapshot = copy.deepcopy(
+        generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
+    )
+    snapshot["entries"]["idaho"]["publication_readiness"] = {
+        "dataset_id": dataset_id,
+        "derived_artifact_state": "promoted",
+        "unified_api_state": "pending_verification",
+        "observed_at": "2026-07-12T00:00:00Z",
+    }
+
+    with pytest.raises(generator.SupportDocumentationError, match="dataset_id is invalid"):
+        generator.validate_verification_snapshot(snapshot, manifest)
