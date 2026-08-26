@@ -3627,6 +3627,35 @@ class SourceIndex:
         if prefix == IN_NETWORK_ITEM_PREFIX and event == "end_map":
             self._finish_in_network_item(spec, state)
 
+    def _is_rate_network_event_consumed(
+        self,
+        state: InNetworkState,
+        prefix: str,
+        event: str,
+        raw_value: Any,
+    ) -> bool:
+        for field_name in ("network_name", "network_names"):
+            field_prefix = f"{NEGOTIATED_RATE_PREFIX}.{field_name}"
+            if prefix == field_prefix:
+                if event in {"start_array", "end_array"}:
+                    return True
+                if event == "string":
+                    self._capture_rate_network_name(state, raw_value)
+                    return True
+                if event == "null":
+                    return True
+                if event in SCALAR_EVENTS or event == "start_map":
+                    self.metrics["invalid_field_types"] += 1
+                return True
+            if prefix == f"{field_prefix}.item":
+                if event == "string":
+                    self._capture_rate_network_name(state, raw_value)
+                    return True
+                if event in SCALAR_EVENTS or event in {"start_map", "start_array"}:
+                    self.metrics["invalid_field_types"] += 1
+                return True
+        return False
+
     def _is_rate_event_consumed(
         self,
         spec: SourceSpec,
@@ -3639,24 +3668,8 @@ class SourceIndex:
         if prefix == f"{NEGOTIATED_RATE_PREFIX}.provider_references.item" and event in SCALAR_EVENTS:
             self._capture_rate_reference(spec, state, event, raw_value)
             return True
-        for field_name in ("network_name", "network_names"):
-            field_prefix = f"{NEGOTIATED_RATE_PREFIX}.{field_name}"
-            if prefix == field_prefix:
-                if event in {"start_array", "end_array"}:
-                    return True
-                if event == "string":
-                    self._capture_rate_network_name(state, raw_value)
-                elif event == "null":
-                    return True
-                elif event in SCALAR_EVENTS or event == "start_map":
-                    self.metrics["invalid_field_types"] += 1
-                return True
-            if prefix == f"{field_prefix}.item":
-                if event == "string":
-                    self._capture_rate_network_name(state, raw_value)
-                elif event in SCALAR_EVENTS or event in {"start_map", "start_array"}:
-                    self.metrics["invalid_field_types"] += 1
-                return True
+        if self._is_rate_network_event_consumed(state, prefix, event, raw_value):
+            return True
         inline_prefix = f"{NEGOTIATED_RATE_PREFIX}.provider_groups.item"
         if self._is_zero_npi_marker_event_consumed(
             state,

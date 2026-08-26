@@ -60465,20 +60465,32 @@ def _row_reference_values(row: dict[str, Any], fields: tuple[str, ...]) -> list[
     return values
 
 
-def _linked_resource_refs(rows_by_resource: dict[str, list[dict[str, Any]]]) -> list[tuple[str, str, str, str]]:
+def _linked_reference_candidates(
+    rows_by_resource: dict[str, list[dict[str, Any]]],
+) -> Iterable[tuple[str, str, str]]:
+    return (
+        (target_resource_type, reference, field)
+        for source_resource_type, fields_by_target in LINKED_REFERENCE_FIELDS.items()
+        for row in rows_by_resource.get(source_resource_type, [])
+        for target_resource_type, fields in fields_by_target.items()
+        for field in fields
+        for reference in _row_reference_values(row, (field,))
+    )
+
+
+def _linked_resource_refs(
+    rows_by_resource: dict[str, list[dict[str, Any]]],
+) -> list[tuple[str, str, str, str]]:
     refs: list[tuple[str, str, str, str]] = []
     seen_resource_keys: set[tuple[str, str]] = set()
-    for source_resource_type, fields_by_target in LINKED_REFERENCE_FIELDS.items():
-        for row in rows_by_resource.get(source_resource_type, []):
-            for target_resource_type, fields in fields_by_target.items():
-                for field in fields:
-                    references = _row_reference_values(row, (field,))
-                    for reference in references:
-                        key = _reference_resource_key(reference, target_resource_type)
-                        if not key or key in seen_resource_keys:
-                            continue
-                        seen_resource_keys.add(key)
-                        refs.append((target_resource_type, key[1], reference, field))
+    for target_resource_type, reference, field in (
+        _linked_reference_candidates(rows_by_resource)
+    ):
+        key = _reference_resource_key(reference, target_resource_type)
+        if not key or key in seen_resource_keys:
+            continue
+        seen_resource_keys.add(key)
+        refs.append((target_resource_type, key[1], reference, field))
     return refs
 
 
