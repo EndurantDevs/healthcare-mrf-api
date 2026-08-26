@@ -64,7 +64,7 @@ def test_reviewed_manual_source_manifest_contract():
     assert support["access_requirement"] == "none"
 
 
-def test_reviewed_manual_source_has_no_current_proof():
+def test_reviewed_manual_source_separates_current_dataset_from_acquisition_proof():
     """Keep acquisition, current-dataset, and downstream proof states separate."""
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
     manual_entry = _manual_manifest_entry(manifest)
@@ -86,7 +86,11 @@ def test_reviewed_manual_source_has_no_current_proof():
         for candidate_record in audit["records"]
         if candidate_record.get("entry_id") == manual_entry["entry_id"]
     )
-    assert audit_record["dataset_state"] == "no-current-dataset"
+    assert audit_record["dataset_state"] == "current-published"
+    assert audit_record["dataset_id"] == (
+        "pdds_35600ed11ba3a119aa75352d01086f47a9615110585ebe28326352559e010f23"
+    )
+    assert audit_record["resource_count"] == 1_948_923
     assert audit_record["downstream_evidence"] == "not-proven"
 
 

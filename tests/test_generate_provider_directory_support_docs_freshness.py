@@ -33,7 +33,7 @@ def test_freshness_validation_rejects_expired_catalog_source_and_proof():
             manifest,
             blockers,
             snapshot,
-            dt.date(2026, 8, 26),
+            dt.date(2026, 10, 11),
         )
 
     assert "idaho terminal proof expired" in str(error.value)
@@ -52,15 +52,39 @@ def test_freshness_validation_accepts_current_reviews():
         manifest,
         blockers,
         snapshot,
-        dt.date(2026, 7, 11),
+        dt.date(2026, 9, 25),
     )
+
+
+def test_freshness_validation_rejects_stale_active_observation():
+    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    blockers = generator.validate_blocker_registry(
+        generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY)
+    )
+    snapshot = copy.deepcopy(
+        generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
+    )
+    snapshot["entries"]["aetna-commercial-medicare"]["current_observation"][
+        "run_status"
+    ] = "running"
+    snapshot["entries"]["aetna-commercial-medicare"]["current_observation"][
+        "observed_at"
+    ] = "2026-07-12T11:32:21Z"
+
+    with pytest.raises(generator.SupportDocumentationError, match="active observation expired"):
+        generator.validate_support_freshness(
+            manifest,
+            blockers,
+            snapshot,
+            dt.date(2026, 9, 25),
+        )
 
 
 @pytest.mark.parametrize(
     "entry_id, expected_detail",
     [
         ("idaho", "api-ida-prd.safhir.io cursor continuations with checkpoints"),
-        ("molina", "checkpointed 497,700 Location rows"),
+        ("molina", "progressed beyond the initial quota failure"),
         ("michigan", "Synthetic _getpagesoffset continuation is not equivalent"),
         ("cigna", "both _count=100 and _count=75 returned populated search sets"),
         ("aetna-commercial-medicare", "OAuth2 client credentials and Bulk"),
@@ -68,11 +92,11 @@ def test_freshness_validation_accepts_current_reviews():
         ("iehp", "Normalizes portal and resource paths"),
         ("arkansas", "synthetic _skip pagination with stable _id sorting"),
         ("hap", "throttles requests to 20 seconds"),
-        ("washington", "regressed from 50,800 to 16,800"),
+        ("washington", "active PractitionerRole checkpoint has 20,800 rows"),
         ("wyoming", "PractitionerRole pagination was revalidated"),
         ("amerihealth-caritas-carrier", "clears plan_name"),
         ("texas-tmhp", "stable _id sorting and offset pagination"),
-        ("nebraska", "Endpoint is excluded because it returns HTTP 404"),
+        ("nebraska", "Endpoint returns HTTP 404 and remains excluded"),
         ("uhc", "server ignores the :missing modifier"),
         ("maine", "Five collections are anonymously readable with ct cursor pagination"),
         ("horizon-nj", "approved Provider Directory API-product subscription"),
@@ -156,7 +180,7 @@ def test_amerihealth_uses_one_carrier_acquisition_and_five_probe_aliases():
     assert support["method"] == "rest"
     assert "Exhaustive equivalence" in support["limitation"]
     assert "no resource evidence is fanned out" in support["limitation"]
-    assert "No terminal full-acquisition" in support["limitation"]
+    assert "Terminal six-collection acquisition evidence" in support["limitation"]
 
 
 def test_documentation_metadata_does_not_change_entry_execution_fingerprints():
@@ -222,7 +246,8 @@ def test_provider_directory_guide_documents_the_full_lifecycle():
     for command in (
         "scripts/research/provider_directory_endpoint_acquisition_cli.py",
         "--validate-only",
-        "--apply",
+        "--operator-input",
+        "--verification-report",
         "scripts/update_provider_directory_verification.py",
         "scripts/generate_provider_directory_support_docs.py",
         "--check",

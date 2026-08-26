@@ -9,12 +9,17 @@ import re
 from typing import Any
 
 try:
-    from scripts.provider_directory_support_contract import SupportDocumentationError
+    from scripts.provider_directory_support_contract import (
+        ACTIVE_RUN_STATUSES,
+        SupportDocumentationError,
+    )
 except ModuleNotFoundError:
-    from provider_directory_support_contract import SupportDocumentationError
+    from provider_directory_support_contract import (
+        ACTIVE_RUN_STATUSES,
+        SupportDocumentationError,
+    )
 
 
-ACTIVE_RUN_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
 ACCESS_VERIFICATION_VALUES = {"verified", "not_verified", "not_recorded"}
 PROOF_STATES = {"current", "superseded", "not_recorded"}
 SUPERSEDED_REASONS = {"manifest_entry_changed", "newer_active_run"}
@@ -202,6 +207,15 @@ def _validate_verification_observation(entry_id: str, observation: Any) -> None:
         )
     if not isinstance(observation, dict):
         return
+    observation_status = observation.get("run_status") or observation.get(
+        "state_status"
+    )
+    if observation.get("observed_at") is None or not (
+        isinstance(observation_status, str) and observation_status
+    ):
+        raise SupportDocumentationError(
+            f"{entry_id}: current observation requires observed_at and status"
+        )
     validate_optional_verification_timestamp(
         observation.get("observed_at"),
         f"{entry_id}: observed_at",
@@ -215,28 +229,8 @@ def _validate_verification_observation(entry_id: str, observation: Any) -> None:
         )
 
 
-def _validate_publication_readiness(entry_id: str, readiness_record: Any) -> None:
-    """Validate downstream readiness without treating it as acquisition proof."""
-    required_fields = {"derived_artifact_state", "unified_api_state", "observed_at"}
-    optional_fields = {"evidence"}
-    if readiness_record is None:
-        return
-    if (
-        not isinstance(readiness_record, dict)
-        or not required_fields.issubset(readiness_record)
-        or not set(readiness_record).issubset(required_fields | optional_fields)
-    ):
-        raise SupportDocumentationError(
-            f"{entry_id}: publication readiness fields are not controlled"
-        )
-    if readiness_record["derived_artifact_state"] not in DERIVED_ARTIFACT_STATES:
-        raise SupportDocumentationError(f"{entry_id}: invalid derived artifact state")
-    if readiness_record["unified_api_state"] not in UNIFIED_API_STATES:
-        raise SupportDocumentationError(f"{entry_id}: invalid unified API state")
-    validate_optional_verification_timestamp(
-        readiness_record["observed_at"], f"{entry_id}: publication readiness observed_at"
-    )
-    evidence_map = readiness_record.get("evidence")
+def _validate_publication_readiness_evidence(entry_id: str, evidence_map: Any) -> None:
+    """Validate bounded readiness counts and signals."""
     if evidence_map is None:
         return
     if not isinstance(evidence_map, dict) or set(evidence_map) - {"counts", "signals"}:
@@ -269,6 +263,50 @@ def _validate_publication_readiness(entry_id: str, readiness_record: Any) -> Non
         raise SupportDocumentationError(
             f"{entry_id}: publication readiness signals are invalid"
         )
+
+
+def _validate_publication_readiness(entry_id: str, readiness_record: Any) -> None:
+    """Validate downstream readiness without treating it as acquisition proof."""
+    required_fields = {"derived_artifact_state", "unified_api_state", "observed_at"}
+    optional_fields = {"dataset_id", "evidence", "proof_state"}
+    if readiness_record is None:
+        return
+    if (
+        not isinstance(readiness_record, dict)
+        or not required_fields.issubset(readiness_record)
+        or not set(readiness_record).issubset(required_fields | optional_fields)
+    ):
+        raise SupportDocumentationError(
+            f"{entry_id}: publication readiness fields are not controlled"
+        )
+    if readiness_record["derived_artifact_state"] not in DERIVED_ARTIFACT_STATES:
+        raise SupportDocumentationError(f"{entry_id}: invalid derived artifact state")
+    if readiness_record["unified_api_state"] not in UNIFIED_API_STATES:
+        raise SupportDocumentationError(f"{entry_id}: invalid unified API state")
+    proof_state = readiness_record.get("proof_state", "current")
+    if proof_state not in {"current", "superseded"}:
+        raise SupportDocumentationError(
+            f"{entry_id}: invalid publication readiness proof state"
+        )
+    is_ready = (
+        readiness_record["derived_artifact_state"] == "promoted"
+        and readiness_record["unified_api_state"] == "ready"
+    )
+    dataset_id = readiness_record.get("dataset_id")
+    if "dataset_id" in readiness_record and (
+        not isinstance(dataset_id, str)
+        or not re.fullmatch(r"pdds_[0-9a-f]{64}", dataset_id)
+    ):
+        raise SupportDocumentationError(f"{entry_id}: publication readiness dataset_id is invalid")
+    if is_ready and dataset_id is None:
+        raise SupportDocumentationError(
+            f"{entry_id}: ready publication evidence must bind a dataset_id"
+        )
+    validate_optional_verification_timestamp(
+        readiness_record["observed_at"],
+        f"{entry_id}: publication readiness observed_at",
+    )
+    _validate_publication_readiness_evidence(entry_id, readiness_record.get("evidence"))
 
 
 def validate_verification_record(

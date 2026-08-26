@@ -85,18 +85,44 @@ def _validate_snapshot_ready_record(
     verification_snapshot: dict[str, Any] | None,
 ) -> None:
     """Require promoted artifacts and API readiness behind snapshot-ready claims."""
-    if audit_record["downstream_evidence"] != "snapshot-ready" or verification_snapshot is None:
+    if verification_snapshot is None:
         return
-    if len(represented_entry_ids) != 1:
+    is_claimed_ready = audit_record["downstream_evidence"] == "snapshot-ready"
+    if is_claimed_ready and len(represented_entry_ids) != 1:
         raise SupportDocumentationError("snapshot-ready audit records must map to one entry_id")
-    readiness = verification_snapshot.get("entries", {}).get(
-        represented_entry_ids[0], {}
-    ).get("publication_readiness", {})
-    if readiness.get("derived_artifact_state") != "promoted" or readiness.get(
-        "unified_api_state"
-    ) != "ready":
+    current_ready_entry_ids = []
+    for entry_id in represented_entry_ids:
+        readiness = verification_snapshot.get("entries", {}).get(
+            entry_id, {}
+        ).get("publication_readiness")
+        if not isinstance(readiness, dict):
+            continue
+        is_ready = (
+            readiness.get("derived_artifact_state") == "promoted"
+            and readiness.get("unified_api_state") == "ready"
+            and readiness.get("proof_state", "current") == "current"
+        )
+        if not is_ready:
+            continue
+        evidence = readiness.get("evidence")
+        counts = evidence.get("counts") if isinstance(evidence, dict) else None
+        if (
+            readiness.get("dataset_id") != audit_record.get("dataset_id")
+            or not isinstance(counts, dict)
+            or counts.get("source_rows") != audit_record.get("resource_count")
+        ):
+            raise SupportDocumentationError(
+                f"{entry_id}: ready verification does not match the audited dataset"
+            )
+        current_ready_entry_ids.append(entry_id)
+    if is_claimed_ready and not current_ready_entry_ids:
         raise SupportDocumentationError(
             f"snapshot-ready audit record lacks ready verification for {represented_entry_ids[0]}"
+        )
+    if not is_claimed_ready and current_ready_entry_ids:
+        raise SupportDocumentationError(
+            "non-ready audit record retains ready verification for "
+            + ", ".join(current_ready_entry_ids)
         )
 
 

@@ -19,12 +19,16 @@ try:
         acquisition_metric_errors,
         bulk_acquisition_metric_errors,
         external_result_errors,
+        RUN_ID_PATTERN,
+        result_param_errors,
     )
 except ModuleNotFoundError:
     from provider_directory_endpoint_acquisition_support import (
         acquisition_metric_errors,
         bulk_acquisition_metric_errors,
         external_result_errors,
+        RUN_ID_PATTERN,
+        result_param_errors,
     )
 
 
@@ -94,18 +98,6 @@ ACQUISITION_CLASSIFICATIONS = {"acquisition", "bulk_acquisition"}
 MANUAL_CLASSIFICATION = "manual_acquisition"
 RESOURCE_CLASSIFICATIONS = ACQUISITION_CLASSIFICATIONS | {MANUAL_CLASSIFICATION}
 SUPPORTED_CLASSIFICATIONS = RESOURCE_CLASSIFICATIONS | {"probe_only", "external"}
-PROBE_OMITTED_KEYS = {
-    "resources",
-    "resource_limit",
-    "resource_deadline_seconds",
-    "linked_resource_limit",
-    "linked_resource_deadline_seconds",
-    "page_limit",
-    "page_count",
-    "stream_batch_size",
-    "bulk_export",
-    "source_concurrency",
-}
 PUBLICATION_FLAGS = (
     "stale_cleanup",
     "publish_artifacts",
@@ -346,29 +338,6 @@ def build_operator_plan(
     }
 
 
-def _result_param_errors(
-    manifest: dict[str, Any],
-    entry: dict[str, Any],
-    result: dict[str, Any],
-) -> list[str]:
-    errors: list[str] = []
-    if result.get("importer") != manifest["importer"]:
-        errors.append("result importer does not match the manifest")
-    actual_params = result.get("params")
-    actual_params = actual_params if isinstance(actual_params, dict) else {}
-    for param_name, expected_value in entry_params(manifest, entry).items():
-        if actual_params.get(param_name) != expected_value:
-            errors.append(f"params.{param_name} does not match the manifest")
-    if entry["classification"] == "probe_only":
-        forbidden_keys = sorted(PROBE_OMITTED_KEYS.intersection(actual_params))
-        if forbidden_keys:
-            errors.append(
-                "probe-only result contains resource/pagination params: "
-                + ",".join(forbidden_keys)
-            )
-    return errors
-
-
 def terminal_metric_errors(
     manifest: dict[str, Any],
     entry: dict[str, Any],
@@ -385,7 +354,12 @@ def terminal_metric_errors(
     elif classification == MANUAL_CLASSIFICATION:
         errors = ["manual acquisition requires dedicated current-version census proof"]
     else:
-        errors = _result_param_errors(manifest, entry, operator_result_by_field)
+        errors = result_param_errors(
+            manifest,
+            entry,
+            operator_result_by_field,
+            entry_params(manifest, entry),
+        )
     metrics = operator_result_by_field.get("metrics")
     metrics = metrics if isinstance(metrics, dict) else {}
     for flag_name in PUBLICATION_FLAGS:
