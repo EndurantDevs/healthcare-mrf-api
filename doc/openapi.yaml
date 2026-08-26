@@ -2108,6 +2108,101 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /hospital-prices/facilities/{hospital_id}/prices:
+    get:
+      operationId: getHospitalPrices
+      summary: Read one hospital's packed prices for an exact billing code
+      description: |
+        Returns a bounded, immutable-version page. Supplying `payer_name`
+        requires `plan_name` and includes only their exact negotiated-price
+        facts; omitting both returns charge metadata without payer facts.
+      parameters:
+        - name: hospital_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^hospital-[0-9]{6}$'
+        - name: code_type
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [AP-DRG, APC, APR-DRG, APS-DRG, CDM, CDT, CMG, CPT, DRG, EAPG, HCPCS, HIPPS, ICD, LOCAL, MS-DRG, MS-LTC-DRG, NDC, R-DRG, RC, S-DRG, TRIS-DRG]
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 1024
+        - name: payer_name
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 4096
+          description: Exact payer name; must be supplied with plan_name.
+        - name: plan_name
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 4096
+          description: Exact plan name; must be supplied with payer_name.
+        - name: version_id
+          in: query
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+          description: Optional immutable version binding.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9_-]{96}$'
+          description: Opaque continuation bound to the selector and version.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+      responses:
+        '200':
+          description: Source-hidden charge page and optional exact payer facts
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+              description: Always `private, no-store`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hospital_id, version, query, pagination, items]
+                properties:
+                  hospital_id:
+                    type: string
+                  version:
+                    type: object
+                  query:
+                    type: object
+                  pagination:
+                    type: object
+                  items:
+                    type: array
+                    items:
+                      type: object
+        '400':
+          description: Invalid selector, cursor, or pagination input
+        '404':
+          description: Hospital or published packed version not found
+        '409':
+          description: Cursor is stale because the current version changed
+        '503':
+          description: Packed serving evidence is unavailable or invalid
   /nucc/:
     get:
       operationId: getNucc

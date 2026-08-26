@@ -22,6 +22,12 @@ from api.hospital_price_request import HospitalPriceInvalidRequestError
 from api.hospital_price_request import HospitalPriceNotFoundError
 from api.hospital_price_request import HospitalPriceQuery
 from api.hospital_price_request import validate_hospital_price_query
+from api.hospital_price_serving_support import consume_public_bytes
+from api.hospital_price_serving_support import HOSPITAL_PRICE_PUBLIC_DATA_BYTES
+from api.hospital_price_serving_support import HospitalPriceServingUnavailableError
+from api.hospital_price_serving_support import MAX_HOSPITAL_PRICE_PUBLIC_BYTES
+from api.hospital_price_serving_support import public_hospital_price_item
+from api.hospital_price_serving_support import validate_payer_page_coverage
 from support.hospital_price_native_validation import (
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
 )
@@ -40,10 +46,6 @@ _NATIVE_FUNCTIONS = (
     "hospital_price_decode_service_block", "hospital_price_decode_fact_block",
 )
 _READ_TRANSACTION_SQL = text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-
-
-class HospitalPriceServingUnavailableError(RuntimeError):
-    """Fail closed when packed serving evidence cannot be trusted."""
 
 
 def _native_module():
@@ -265,6 +267,7 @@ async def _charges_by_key(
     charge_keys: list[int],
     code_type: str,
     code: str,
+    public_byte_budget: list[int] | None = None,
 ):
     if not charge_keys:
         return {}
@@ -297,6 +300,10 @@ async def _charges_by_key(
                     "hospital price charge selector identity is invalid"
                 )
             for charge in selected_charges:
+                consume_public_bytes(
+                    public_byte_budget,
+                    {"service": service_metadata_by_field, "charge": charge},
+                )
                 charge_by_key[charge["charge_key"]] = (
                     service_metadata_by_field, charge
                 )
@@ -346,7 +353,7 @@ async def _selected_fact_ordinals(
             "fact_ends": [fact_range[1] for fact_range in ranges],
         },
     ))
-    selected_refs, is_truncated, _page_indexes, _page_count = await _selector_refs(
+    selected_refs, is_truncated, page_indexes, _page_count = await _selector_refs(
         payer_selector_records, "payer_plan", query.payer_name, query.plan_name,
         [(fact_range[0], fact_range[1]) for fact_range in ranges],
         MAX_HOSPITAL_PRICE_MATCHING_FACTS + 1,
@@ -355,6 +362,9 @@ async def _selected_fact_ordinals(
         raise HospitalPriceServingUnavailableError(
             "hospital price matching fact fanout exceeds its bound"
         )
+    validate_payer_page_coverage(
+        payer_selector_records, page_indexes, len(ranges)
+    )
     starts = [fact_range[0] for fact_range in ranges]
     charge_by_fact: dict[int, int] = {}
     for reference in selected_refs:
@@ -368,6 +378,7 @@ async def _facts_by_charge(
     query: HospitalPriceQuery,
     version_id: str,
     charge_by_fact: dict[int, int],
+    public_byte_budget: list[int] | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
     if not charge_by_fact:
         return {}
@@ -399,6 +410,7 @@ async def _facts_by_charge(
                 raise HospitalPriceServingUnavailableError(
                     "hospital price fact identity is invalid"
                 )
+            consume_public_bytes(public_byte_budget, fact)
             fact_by_ordinal[fact_ordinal] = fact
     if set(fact_by_ordinal) != set(fact_ordinals):
         raise HospitalPriceServingUnavailableError(
@@ -412,33 +424,11 @@ async def _facts_by_charge(
     return facts_by_charge_key
 
 
-def _public_item(service: Mapping[str, Any], charge: Mapping[str, Any], facts):
-    return {
-        "service": {
-            field: service.get(field)
-            for field in (
-                "service_ordinal", "description", "drug_unit", "drug_type", "codes"
-            )
-        },
-        "charge": {
-            field: charge.get(field)
-            for field in (
-                "charge_ordinal", "setting", "billing_class", "modifier_codes",
-                "gross_charge", "discounted_cash", "minimum", "maximum",
-                "additional_generic_notes",
-            )
-        },
-        "negotiated_prices": [
-            {field: value for field, value in fact.items() if field != "charge_key"}
-            for fact in facts
-        ],
-    }
-
-
 async def read_hospital_price_page(session: Any, query: HospitalPriceQuery) -> dict[str, Any]:
     """Return one source-version-bound page whose pagination unit is charges."""
 
     _native_module()
+    public_byte_budgets = [HOSPITAL_PRICE_PUBLIC_DATA_BYTES]
     async with session.begin():
         await session.execute(_READ_TRANSACTION_SQL)
         version = _validated_version(_mappings(await session.execute(
@@ -451,7 +441,8 @@ async def read_hospital_price_page(session: Any, query: HospitalPriceQuery) -> d
             session, query, version_id, after_key
         )
         charges_by_key = await _charges_by_key(
-            session, version_id, charge_keys, query.code_type, query.code
+            session, version_id, charge_keys, query.code_type, query.code,
+            public_byte_budgets,
         )
         facts_by_charge = await _facts_by_charge(
             session, query, version_id,
@@ -459,10 +450,13 @@ async def read_hospital_price_page(session: Any, query: HospitalPriceQuery) -> d
                 session, query, version_id,
                 _fact_ranges(charges_by_key, charge_keys),
             ),
+            public_byte_budgets,
         )
     has_payer_filter = query.payer_name is not None
     public_items = [
-        _public_item(*charges_by_key[key], facts_by_charge.get(key, []))
+        public_hospital_price_item(
+            *charges_by_key[key], facts_by_charge.get(key, [])
+        )
         for key in charge_keys
         if not has_payer_filter or key in facts_by_charge
     ]

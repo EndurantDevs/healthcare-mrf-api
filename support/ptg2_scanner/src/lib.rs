@@ -72,9 +72,10 @@ mod python_api {
     use pyo3::exceptions::{PyRuntimeError, PyValueError};
     use pyo3::prelude::*;
     use pyo3::types::{PyBytes, PyDict, PyList};
+    use pyo3::BoundObject;
     use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
     use serde_json::Value;
-    use std::sync::OnceLock;
+    use std::{convert::Infallible, sync::OnceLock};
 
     type AddressRow = (
         Option<String>,

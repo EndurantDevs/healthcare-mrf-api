@@ -76,6 +76,48 @@ def _restricted_public_filter(column):
     return func.upper(column).notin_(("SNOMEDCT_US",))
 
 
+def _build_code_catalog_queries(
+    code_system: str,
+    query_text: str,
+    source_name: str,
+):
+    filters = []
+    restricted_filter = _restricted_public_filter(code_catalog_table.c.code_system)
+    if restricted_filter is not None:
+        filters.append(restricted_filter)
+    if code_system:
+        filters.append(func.upper(code_catalog_table.c.code_system) == code_system)
+    if source_name:
+        filters.append(func.lower(code_catalog_table.c.source) == source_name)
+    if query_text:
+        query_pattern = f"%{query_text}%"
+        filters.append(
+            or_(
+                func.lower(code_catalog_table.c.code).like(query_pattern),
+                func.lower(code_catalog_table.c.display_name).like(query_pattern),
+                func.lower(code_catalog_table.c.short_description).like(query_pattern),
+                exists(
+                    select(1).where(
+                        and_(
+                            func.upper(code_synonym_table.c.code_system)
+                            == func.upper(code_catalog_table.c.code_system),
+                            func.upper(code_synonym_table.c.code)
+                            == func.upper(code_catalog_table.c.code),
+                            func.lower(code_synonym_table.c.synonym).like(query_pattern),
+                        )
+                    )
+                ),
+            )
+        )
+    where_clause = and_(*filters) if filters else None
+    count_query = select(func.count()).select_from(code_catalog_table)
+    code_query = select(code_catalog_table)
+    if where_clause is not None:
+        count_query = count_query.where(where_clause)
+        code_query = code_query.where(where_clause)
+    return count_query, code_query
+
+
 @blueprint.get("/")
 async def list_codes(request):
     """List normalized reference codes with bounded filtering and paging."""
@@ -90,44 +132,11 @@ async def list_codes(request):
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "code").strip().lower()
 
-    filters = []
-    restricted_filter = _restricted_public_filter(code_catalog_table.c.code_system)
-    if restricted_filter is not None:
-        filters.append(restricted_filter)
-    if code_system:
-        filters.append(func.upper(code_catalog_table.c.code_system) == code_system)
-    if source_name:
-        filters.append(func.lower(code_catalog_table.c.source) == source_name)
-    if query_text:
-        q_like = f"%{query_text}%"
-        filters.append(
-            or_(
-                func.lower(code_catalog_table.c.code).like(q_like),
-                func.lower(code_catalog_table.c.display_name).like(q_like),
-                func.lower(code_catalog_table.c.short_description).like(q_like),
-                exists(
-                    select(1).where(
-                        and_(
-                            func.upper(code_synonym_table.c.code_system)
-                            == func.upper(code_catalog_table.c.code_system),
-                            func.upper(code_synonym_table.c.code) == func.upper(code_catalog_table.c.code),
-                            func.lower(code_synonym_table.c.synonym).like(q_like),
-                        )
-                    )
-                ),
-            )
-        )
-
-    where_clause = and_(*filters) if filters else None
-    count_query = select(func.count()).select_from(code_catalog_table)
-    if where_clause is not None:
-        count_query = count_query.where(where_clause)
+    count_query, query = _build_code_catalog_queries(
+        code_system, query_text, source_name
+    )
     count_result = await session.execute(count_query)
     total = int(count_result.scalar() or 0)
-
-    query = select(code_catalog_table)
-    if where_clause is not None:
-        query = query.where(where_clause)
 
     order_column_by_name = {
         "code": code_catalog_table.c.code,

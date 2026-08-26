@@ -38,6 +38,8 @@ def test_worker_aliases_preserve_registered_names():
     assert process_npi.shutdown.__name__ == "shutdown"
     assert process_openaddresses.process_data.__name__ == "process_data"
     assert process_openaddresses.shutdown.__name__ == "shutdown"
+    assert process_pkg.NPI.on_shutdown is process_npi.shutdown
+    assert process_pkg.OpenAddresses.on_shutdown is process_openaddresses.shutdown
 
 
 def test_transparency_zip_path_is_unique_per_source(tmp_path):

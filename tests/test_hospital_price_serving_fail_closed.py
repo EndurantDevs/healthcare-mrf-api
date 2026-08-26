@@ -380,3 +380,92 @@ async def test_fact_selection_and_blocks_fail_closed(monkeypatch):
         await serving._facts_by_charge(
             _MissingBlockSession(), _query(), VERSION_ID, {0: 0}
         )
+
+
+@pytest.mark.asyncio
+async def test_payer_selector_coverage_is_contiguous_per_fact_range(monkeypatch):
+    monkeypatch.setattr(serving, "_NATIVE", _Native())
+
+    class CountingSession(_RowsSession):
+        def __init__(self, rows):
+            super().__init__(rows)
+            self.calls = 0
+
+        async def execute(self, statement, params=None):
+            assert statement is serving.PAYER_SELECTOR_SQL
+            self.calls += 1
+            return await super().execute(statement, params)
+
+    async def selected_pages(*_args):
+        return [0, 2], False, [0, 2], 3
+
+    monkeypatch.setattr(serving, "_selector_refs", selected_pages)
+    incomplete = CountingSession([
+        {"page_index": 0, "page_count": 3, "range_indexes": [0],
+         "key_page_count": 3},
+        {"page_index": 2, "page_count": 3, "range_indexes": [0],
+         "key_page_count": 3},
+    ])
+    with pytest.raises(serving.HospitalPriceServingUnavailableError, match="incomplete"):
+        await serving._selected_fact_ordinals(
+            incomplete, _query(), VERSION_ID, [(0, 3, 0)]
+        )
+    assert incomplete.calls == 1
+
+    disjoint = CountingSession([
+        {"page_index": 0, "page_count": 3, "range_indexes": [0],
+         "key_page_count": 3},
+        {"page_index": 2, "page_count": 3, "range_indexes": [1],
+         "key_page_count": 3},
+    ])
+    assert await serving._selected_fact_ordinals(
+        disjoint, _query(), VERSION_ID, [(0, 1, 0), (2, 3, 2)]
+    ) == {0: 0, 2: 2}
+    assert disjoint.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_public_byte_budget_fails_before_retaining_large_rows(monkeypatch):
+    session = _Session()
+    monkeypatch.setattr(serving, "_NATIVE", session.native)
+
+    with pytest.raises(serving.HospitalPriceServingUnavailableError, match="bound"):
+        await serving._charges_by_key(
+            session, VERSION_ID, [0], "CPT", "12345", [1]
+        )
+    with pytest.raises(serving.HospitalPriceServingUnavailableError, match="bound"):
+        await serving._facts_by_charge(
+            session, _query(), VERSION_ID, {0: 0}, [1]
+        )
+
+
+@pytest.mark.parametrize(
+    "range_indexes",
+    [None, [0, 0], [True], [1]],
+)
+def test_serving_support_rejects_invalid_payload_and_payer_coverage(range_indexes):
+    with pytest.raises(serving.HospitalPriceServingUnavailableError, match="payload"):
+        serving.consume_public_bytes([100], object())
+    with pytest.raises(serving.HospitalPriceServingUnavailableError, match="incomplete"):
+        serving.validate_payer_page_coverage((), [0], 1)
+    with pytest.raises(serving.HospitalPriceServingUnavailableError, match="incomplete"):
+        serving.validate_payer_page_coverage(
+            ({"page_index": 0, "page_count": 2, "range_indexes": [0],
+              "key_page_count": None},),
+            [0],
+            1,
+        )
+    with pytest.raises(serving.HospitalPriceServingUnavailableError, match="coverage"):
+        serving.validate_payer_page_coverage(
+            ({"page_index": 0, "page_count": 1, "key_page_count": 1,
+              "range_indexes": range_indexes},),
+            [0],
+            1,
+        )
+    serving.validate_payer_page_coverage((), [], 1)
+    serving.validate_payer_page_coverage(
+        ({"page_index": 0, "page_count": 1, "range_indexes": [],
+          "key_page_count": 1},),
+        [0],
+        1,
+    )

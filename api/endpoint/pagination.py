@@ -28,6 +28,43 @@ def _parse_non_negative_int(raw: Any, param_name: str) -> Optional[int]:
     return value
 
 
+def _parse_pagination_aliases(
+    args,
+    *,
+    allow_offset: bool,
+    allow_start: bool,
+    allow_page_size: bool,
+) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+    raw_limit = _parse_non_negative_int(args.get("limit"), "limit")
+    raw_page_size = (
+        _parse_non_negative_int(args.get("page_size"), "page_size")
+        if allow_page_size else None
+    )
+    raw_page = _parse_non_negative_int(args.get("page"), "page")
+    raw_offset = (
+        _parse_non_negative_int(args.get("offset"), "offset")
+        if allow_offset else None
+    )
+    raw_start = (
+        _parse_non_negative_int(args.get("start"), "start")
+        if allow_start else None
+    )
+    if raw_offset is not None and raw_start is not None and raw_offset != raw_start:
+        raise InvalidUsage("Parameters 'offset' and 'start' must match when both are provided")
+    if (
+        raw_limit is not None
+        and raw_page_size is not None
+        and raw_limit != raw_page_size
+    ):
+        raise InvalidUsage("Parameters 'limit' and 'page_size' must match when both are provided")
+    return (
+        raw_page_size if raw_limit is None else raw_limit,
+        raw_page,
+        raw_offset,
+        raw_start,
+    )
+
+
 def parse_pagination(
     args,
     *,
@@ -38,44 +75,17 @@ def parse_pagination(
     allow_start: bool = True,
     allow_page_size: bool = True,
 ) -> PaginationParams:
-    """Parse mixed pagination styles into a canonical window.
-
-    Supported aliases:
-    - canonical: page + limit
-    - offset + limit
-    - start + limit
-    - page + page_size
-    """
+    """Parse supported page, limit, offset, start, and page-size aliases."""
 
     if default_limit <= 0 or max_limit <= 0:
         raise ValueError("default_limit and max_limit must be positive")
 
-    raw_limit = _parse_non_negative_int(args.get("limit"), "limit")
-    raw_page_size = (
-        _parse_non_negative_int(args.get("page_size"), "page_size")
-        if allow_page_size
-        else None
+    raw_limit, raw_page, raw_offset, raw_start = _parse_pagination_aliases(
+        args,
+        allow_offset=allow_offset,
+        allow_start=allow_start,
+        allow_page_size=allow_page_size,
     )
-    raw_page = _parse_non_negative_int(args.get("page"), "page")
-    raw_offset = (
-        _parse_non_negative_int(args.get("offset"), "offset") if allow_offset else None
-    )
-    raw_start = (
-        _parse_non_negative_int(args.get("start"), "start") if allow_start else None
-    )
-
-    if raw_offset is not None and raw_start is not None and raw_offset != raw_start:
-        raise InvalidUsage("Parameters 'offset' and 'start' must match when both are provided")
-
-    if (
-        raw_limit is not None
-        and raw_page_size is not None
-        and raw_limit != raw_page_size
-    ):
-        raise InvalidUsage("Parameters 'limit' and 'page_size' must match when both are provided")
-
-    if raw_limit is None and raw_page_size is not None:
-        raw_limit = raw_page_size
 
     limit = raw_limit if raw_limit is not None else default_limit
     if limit <= 0:

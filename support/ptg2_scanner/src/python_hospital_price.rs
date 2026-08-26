@@ -6,6 +6,35 @@ use crate::hospital_price_service_block::decode_service_block;
 
 const HOSPITAL_PRICE_PUBLIC_SELECTOR_MAX_REFS: usize = 10_001;
 
+fn hospital_price_py_value<'py, T>(py: Python<'py>, value: T) -> Bound<'py, PyAny>
+where
+    T: IntoPyObject<'py, Error = Infallible>,
+{
+    match value.into_pyobject(py) {
+        Ok(value) => value.into_any().into_bound(),
+        Err(error) => match error {},
+    }
+}
+
+fn hospital_price_dict<'py>(
+    py: Python<'py>,
+    fields: &[(&str, Bound<'py, PyAny>)],
+) -> PyResult<Bound<'py, PyDict>> {
+    let payload = PyDict::new(py);
+    for (name, value) in fields {
+        payload.set_item(name, value)?;
+    }
+    Ok(payload)
+}
+
+fn hospital_price_dict_list<'py>(
+    py: Python<'py>,
+    payloads: &mut dyn Iterator<Item = PyResult<Bound<'py, PyDict>>>,
+) -> PyResult<Bound<'py, PyList>> {
+    let payloads = payloads.collect::<PyResult<Vec<_>>>()?;
+    PyList::new(py, payloads)
+}
+
 fn hospital_price_selector_key(
     kind: &str,
     first: &str,
@@ -66,6 +95,9 @@ fn hospital_price_decode_selector_page<'py>(
     let (page_index, page_count, ref_count, first_ref, refs, truncated) = py
         .detach(move || {
             let page = decode_selector_page(&payload)?;
+            if page.row_count() != 1 {
+                return Err("hospital price selector page must contain one key".to_owned());
+            }
             let page_refs = page
                 .exact_refs(&key)
                 .ok_or_else(|| "hospital price selector key is absent".to_owned())?;
@@ -92,47 +124,130 @@ fn hospital_price_decode_selector_page<'py>(
             ))
         })
         .map_err(PyValueError::new_err)?;
-    let result = PyDict::new(py);
-    result.set_item("page_index", page_index)?;
-    result.set_item("page_count", page_count)?;
-    result.set_item("ref_count", ref_count)?;
-    result.set_item("first_ref", first_ref)?;
-    result.set_item("refs", refs)?;
-    result.set_item("truncated", truncated)?;
-    Ok(result)
+    let refs = PyList::new(py, refs)?;
+    hospital_price_dict(
+        py,
+        &[
+            ("page_index", hospital_price_py_value(py, page_index)),
+            ("page_count", hospital_price_py_value(py, page_count)),
+            ("ref_count", hospital_price_py_value(py, ref_count)),
+            ("first_ref", hospital_price_py_value(py, first_ref)),
+            ("refs", refs.into_any()),
+            ("truncated", hospital_price_py_value(py, truncated)),
+        ],
+    )
 }
 
 fn hospital_price_code_payload<'py>(
     py: Python<'py>,
     code: &crate::hospital_price_service_block::HospitalPriceServiceCode,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let payload = PyDict::new(py);
-    payload.set_item("code_type", &code.code_type)?;
-    payload.set_item("code", &code.code)?;
-    Ok(payload)
+    hospital_price_dict(
+        py,
+        &[
+            (
+                "code_type",
+                hospital_price_py_value(py, code.code_type.as_str()),
+            ),
+            ("code", hospital_price_py_value(py, code.code.as_str())),
+        ],
+    )
 }
 
 fn hospital_price_charge_payload<'py>(
     py: Python<'py>,
     charge: &crate::hospital_price_service_block::HospitalPriceChargeRow,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let payload = PyDict::new(py);
-    payload.set_item("charge_key", charge.charge_key)?;
-    payload.set_item("charge_ordinal", charge.charge_ordinal)?;
-    payload.set_item("setting", &charge.setting)?;
-    payload.set_item("billing_class", charge.billing_class.as_deref())?;
-    payload.set_item("modifier_codes", &charge.modifier_codes)?;
-    payload.set_item("gross_charge", charge.gross_charge.as_deref())?;
-    payload.set_item("discounted_cash", charge.discounted_cash.as_deref())?;
-    payload.set_item("minimum", charge.minimum.as_deref())?;
-    payload.set_item("maximum", charge.maximum.as_deref())?;
-    payload.set_item(
-        "additional_generic_notes",
-        charge.additional_generic_notes.as_deref(),
-    )?;
-    payload.set_item("first_fact_ordinal", charge.first_fact_ordinal)?;
-    payload.set_item("fact_count", charge.fact_count)?;
-    Ok(payload)
+    let modifier_codes = PyList::new(py, &charge.modifier_codes)?;
+    hospital_price_dict(
+        py,
+        &[
+            (
+                "charge_key",
+                hospital_price_py_value(py, charge.charge_key),
+            ),
+            (
+                "charge_ordinal",
+                hospital_price_py_value(py, charge.charge_ordinal),
+            ),
+            (
+                "setting",
+                hospital_price_py_value(py, charge.setting.as_str()),
+            ),
+            (
+                "billing_class",
+                hospital_price_py_value(py, charge.billing_class.as_deref()),
+            ),
+            ("modifier_codes", modifier_codes.into_any()),
+            (
+                "gross_charge",
+                hospital_price_py_value(py, charge.gross_charge.as_deref()),
+            ),
+            (
+                "discounted_cash",
+                hospital_price_py_value(py, charge.discounted_cash.as_deref()),
+            ),
+            (
+                "minimum",
+                hospital_price_py_value(py, charge.minimum.as_deref()),
+            ),
+            (
+                "maximum",
+                hospital_price_py_value(py, charge.maximum.as_deref()),
+            ),
+            (
+                "additional_generic_notes",
+                hospital_price_py_value(py, charge.additional_generic_notes.as_deref()),
+            ),
+            (
+                "first_fact_ordinal",
+                hospital_price_py_value(py, charge.first_fact_ordinal),
+            ),
+            (
+                "fact_count",
+                hospital_price_py_value(py, charge.fact_count),
+            ),
+        ],
+    )
+}
+
+fn hospital_price_service_payload<'py>(
+    py: Python<'py>,
+    service: &crate::hospital_price_service_block::HospitalPriceServiceRow,
+) -> PyResult<Bound<'py, PyDict>> {
+    let mut code_payloads = service
+        .codes
+        .iter()
+        .map(|code| hospital_price_code_payload(py, code));
+    let codes = hospital_price_dict_list(py, &mut code_payloads)?;
+    let mut charge_payloads = service
+        .charges
+        .iter()
+        .map(|charge| hospital_price_charge_payload(py, charge));
+    let charges = hospital_price_dict_list(py, &mut charge_payloads)?;
+    hospital_price_dict(
+        py,
+        &[
+            (
+                "service_ordinal",
+                hospital_price_py_value(py, service.service_ordinal),
+            ),
+            (
+                "description",
+                hospital_price_py_value(py, service.description.as_str()),
+            ),
+            (
+                "drug_unit",
+                hospital_price_py_value(py, service.drug_unit.as_deref()),
+            ),
+            (
+                "drug_type",
+                hospital_price_py_value(py, service.drug_type.as_deref()),
+            ),
+            ("codes", codes.into_any()),
+            ("charges", charges.into_any()),
+        ],
+    )
 }
 
 #[pyfunction]
@@ -144,56 +259,73 @@ fn hospital_price_decode_service_block<'py>(
     let services = py
         .detach(move || decode_service_block(&payload))
         .map_err(PyValueError::new_err)?;
-    let output = PyList::empty(py);
-    for service in services {
-        let item = PyDict::new(py);
-        item.set_item("service_ordinal", service.service_ordinal)?;
-        item.set_item("description", &service.description)?;
-        item.set_item("drug_unit", service.drug_unit.as_deref())?;
-        item.set_item("drug_type", service.drug_type.as_deref())?;
-        let codes = PyList::empty(py);
-        for code in &service.codes {
-            codes.append(hospital_price_code_payload(py, code)?)?;
-        }
-        item.set_item("codes", codes)?;
-        let charges = PyList::empty(py);
-        for charge in &service.charges {
-            charges.append(hospital_price_charge_payload(py, charge)?)?;
-        }
-        item.set_item("charges", charges)?;
-        output.append(item)?;
-    }
-    Ok(output)
+    let mut output = services
+        .iter()
+        .map(|service| hospital_price_service_payload(py, service));
+    hospital_price_dict_list(py, &mut output)
 }
 
 fn hospital_price_fact_payload<'py>(
     py: Python<'py>,
     fact: &crate::hospital_price_block::HospitalPriceFactRow,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let payload = PyDict::new(py);
-    payload.set_item("charge_key", fact.charge_key)?;
-    payload.set_item("payer_name", &fact.payer_name)?;
-    payload.set_item("plan_name", &fact.plan_name)?;
-    payload.set_item("negotiated_dollar", fact.negotiated_dollar.as_deref())?;
-    payload.set_item(
-        "negotiated_percentage",
-        fact.negotiated_percentage.as_deref(),
-    )?;
-    payload.set_item(
-        "negotiated_algorithm",
-        fact.negotiated_algorithm.as_deref(),
-    )?;
-    payload.set_item("methodology", &fact.methodology)?;
-    payload.set_item("median_amount", fact.median_amount.as_deref())?;
-    payload.set_item("percentile_10", fact.percentile_10.as_deref())?;
-    payload.set_item("percentile_90", fact.percentile_90.as_deref())?;
-    payload.set_item("allowed_count", fact.allowed_count.as_deref())?;
-    payload.set_item(
-        "additional_payer_notes",
-        fact.additional_payer_notes.as_deref(),
-    )?;
-    payload.set_item("comparison_amount", fact.comparison_amount.as_deref())?;
-    Ok(payload)
+    hospital_price_dict(
+        py,
+        &[
+            (
+                "charge_key",
+                hospital_price_py_value(py, fact.charge_key),
+            ),
+            (
+                "payer_name",
+                hospital_price_py_value(py, fact.payer_name.as_str()),
+            ),
+            (
+                "plan_name",
+                hospital_price_py_value(py, fact.plan_name.as_str()),
+            ),
+            (
+                "negotiated_dollar",
+                hospital_price_py_value(py, fact.negotiated_dollar.as_deref()),
+            ),
+            (
+                "negotiated_percentage",
+                hospital_price_py_value(py, fact.negotiated_percentage.as_deref()),
+            ),
+            (
+                "negotiated_algorithm",
+                hospital_price_py_value(py, fact.negotiated_algorithm.as_deref()),
+            ),
+            (
+                "methodology",
+                hospital_price_py_value(py, fact.methodology.as_str()),
+            ),
+            (
+                "median_amount",
+                hospital_price_py_value(py, fact.median_amount.as_deref()),
+            ),
+            (
+                "percentile_10",
+                hospital_price_py_value(py, fact.percentile_10.as_deref()),
+            ),
+            (
+                "percentile_90",
+                hospital_price_py_value(py, fact.percentile_90.as_deref()),
+            ),
+            (
+                "allowed_count",
+                hospital_price_py_value(py, fact.allowed_count.as_deref()),
+            ),
+            (
+                "additional_payer_notes",
+                hospital_price_py_value(py, fact.additional_payer_notes.as_deref()),
+            ),
+            (
+                "comparison_amount",
+                hospital_price_py_value(py, fact.comparison_amount.as_deref()),
+            ),
+        ],
+    )
 }
 
 #[pyfunction]
@@ -213,9 +345,8 @@ fn hospital_price_decode_fact_block<'py>(
             )
         })
         .map_err(PyValueError::new_err)?;
-    let output = PyList::empty(py);
-    for fact in facts {
-        output.append(hospital_price_fact_payload(py, &fact)?)?;
-    }
-    Ok(output)
+    let mut output = facts
+        .iter()
+        .map(|fact| hospital_price_fact_payload(py, fact));
+    hospital_price_dict_list(py, &mut output)
 }

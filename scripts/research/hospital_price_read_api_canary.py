@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Measure one populated packed hospital-price page and its payload ratio."""
+"""Gate one populated packed hospital-price page on latency and physical storage."""
 
 from __future__ import annotations
 
@@ -25,16 +25,16 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from api.hospital_price_request import validate_hospital_price_query
+from scripts.research.hospital_price_canary_storage import CanaryError
+from scripts.research.hospital_price_canary_storage import (
+    capture_storage_receipt as _storage_receipt,
+)
 
 
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z")
 _HEADER_PATTERN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
 _VERSION_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_RESPONSE_BYTES = 2 << 20
-
-
-class CanaryError(RuntimeError):
-    """Reject an unsafe canary configuration or invalid observation."""
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -45,7 +45,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--code", required=True)
     parser.add_argument("--payer-name")
     parser.add_argument("--plan-name")
-    parser.add_argument("--version-id")
+    parser.add_argument("--version-id", required=True)
     parser.add_argument("--limit", type=int, default=25)
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--samples", type=int, default=20)
@@ -55,7 +55,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--header-env", action="append", default=[])
     parser.add_argument("--database-url-env", default="HOSPITAL_PRICE_CANARY_DATABASE_URL")
     parser.add_argument("--database-schema", default="mrf")
+    parser.add_argument("--pre-import-receipt", type=Path, required=True)
+    parser.add_argument("--maximum-baseline-age-seconds", type=float, default=21_600.0)
+    parser.add_argument(
+        "--maximum-physical-storage-ratio", type=float, default=0.2
+    )
     parser.add_argument("--maximum-packed-payload-ratio", type=float)
+    parser.add_argument("--maximum-cold-ms", type=float, required=True)
+    parser.add_argument("--maximum-warm-p95-ms", type=float, required=True)
     parser.add_argument("--allow-insecure-http", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     return parser
@@ -71,6 +78,16 @@ def _base_url(value: str, allow_insecure_http: bool) -> str:
     ):
         raise CanaryError("API base URL is invalid")
     return normalized
+
+
+def _load_baseline_receipt(path: Path) -> Mapping[str, Any]:
+    try:
+        payload = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError):
+        raise CanaryError("pre-import storage receipt is unreadable") from None
+    if type(payload) is not dict:
+        raise CanaryError("pre-import storage receipt is invalid")
+    return payload
 
 
 def _headers(specifications: list[str]) -> tuple[dict[str, str], list[str]]:
@@ -223,123 +240,147 @@ def _http_sample(
     return elapsed_ms, body, response_header_by_name
 
 
+def _validated_http_sample(
+    args: argparse.Namespace,
+    url: str,
+    headers: Mapping[str, str],
+) -> tuple[float, str, str, int, int]:
+    """Return one response-bound latency sample and its stable identity."""
+
+    elapsed_ms, body, response_header_by_name = _http_sample(
+        url, headers, args.timeout_seconds
+    )
+    cache_control = response_header_by_name.get("Cache-Control", "").lower()
+    if "private" not in cache_control or "no-store" not in cache_control:
+        raise CanaryError("hospital-price response cache policy is invalid")
+    try:
+        response_payload_by_field = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise CanaryError("hospital-price response JSON is invalid") from None
+    version_id, scanned, item_count = _response_values(
+        response_payload_by_field,
+        args=args,
+    )
+    return (
+        elapsed_ms,
+        hashlib.sha256(body).hexdigest(),
+        version_id,
+        scanned,
+        item_count,
+    )
+
+
 def _latency_receipt(
     args: argparse.Namespace,
     url: str,
     headers: Mapping[str, str],
 ) -> dict[str, object]:
-    latencies = []
-    digests = set()
-    version_ids = set()
-    scanned_values = set()
-    item_counts = set()
+    cold_sample = _validated_http_sample(args, url, headers)
+    stable_identity = cold_sample[1:]
+    warm_latencies = []
     for ordinal in range(args.warmups + args.samples):
-        elapsed_ms, body, response_header_by_name = _http_sample(
-            url, headers, args.timeout_seconds
-        )
-        cache_control = response_header_by_name.get("Cache-Control", "").lower()
-        if "private" not in cache_control or "no-store" not in cache_control:
-            raise CanaryError("hospital-price response cache policy is invalid")
-        try:
-            response_payload_by_field = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raise CanaryError("hospital-price response JSON is invalid") from None
-        version_id, scanned, item_count = _response_values(
-            response_payload_by_field,
-            args=args,
-        )
+        sample = _validated_http_sample(args, url, headers)
+        if sample[1:] != stable_identity:
+            raise CanaryError("hospital-price populated sample is not stable")
         if ordinal >= args.warmups:
-            latencies.append(elapsed_ms)
-            digests.add(hashlib.sha256(body).hexdigest())
-            version_ids.add(version_id)
-            scanned_values.add(scanned)
-            item_counts.add(item_count)
-    if (
-        len(digests) != 1 or len(version_ids) != 1
-        or min(scanned_values) < args.minimum_scanned
-        or min(item_counts) < args.minimum_items
-    ):
+            warm_latencies.append(sample[0])
+    _digest, version_id, scanned, item_count = stable_identity
+    if scanned < args.minimum_scanned or item_count < args.minimum_items:
         raise CanaryError("hospital-price populated sample is not stable")
-    ordered = sorted(latencies)
+    ordered = sorted(warm_latencies)
     return {
-        "version_id": next(iter(version_ids)),
-        "response_sha256": next(iter(digests)),
-        "samples": len(latencies),
-        "minimum_scanned_charges": min(scanned_values),
-        "minimum_returned_charges": min(item_counts),
-        "median_ms": round(statistics.median(latencies), 3),
+        "version_id": version_id,
+        "response_sha256": _digest,
+        "cold_ms": round(cold_sample[0], 3),
+        "samples": len(warm_latencies),
+        "minimum_scanned_charges": scanned,
+        "minimum_returned_charges": item_count,
+        "median_ms": round(statistics.median(warm_latencies), 3),
         "p95_ms": round(ordered[math.ceil(0.95 * len(ordered)) - 1], 3),
-        "maximum_ms": round(max(latencies), 3),
+        "maximum_ms": round(max(warm_latencies), 3),
     }
 
 
-async def _storage_receipt(
-    dsn: str,
-    schema: str,
-    version_id: str,
+def _canary_gates(
+    args: argparse.Namespace,
+    latency: Mapping[str, object],
+    storage: Mapping[str, object],
 ) -> dict[str, object]:
-    import asyncpg
-
-    normalized_dsn = dsn.replace("postgresql+asyncpg://", "postgresql://", 1)
-    normalized_dsn = normalized_dsn.replace("postgresql+psycopg://", "postgresql://", 1)
-    quoted_schema = '"' + schema.replace('"', '""') + '"'
-    connection = await asyncpg.connect(normalized_dsn)
-    try:
-        version = await connection.fetchrow(
-            f"""SELECT content.byte_count, root.service_count,
-                       root.charge_count, root.fact_count
-                  FROM {quoted_schema}.hospital_price_version version
-                  JOIN {quoted_schema}.hospital_price_content content
-                    ON content.content_sha256=version.content_sha256
-                  JOIN {quoted_schema}.hospital_price_packed_root root
-                    ON root.version_id=version.version_id
-                 WHERE version.version_id=$1""",
-            version_id,
-        )
-        blocks = await connection.fetch(
-            f"""SELECT block_kind, count(*)::bigint AS block_count,
-                       sum(octet_length(payload))::bigint AS payload_bytes
-                  FROM {quoted_schema}.hospital_price_data_block
-                 WHERE version_id=$1 GROUP BY block_kind ORDER BY block_kind""",
-            version_id,
-        )
-    finally:
-        await connection.close()
-    if version is None or not blocks:
-        raise CanaryError("packed storage evidence is unavailable")
-    source_bytes = int(version["byte_count"])
-    packed_payload_bytes = sum(
-        int(block_row["payload_bytes"])
-        for block_row in blocks
+    packed_payload_ratio = (
+        int(storage["packed_payload_bytes"])
+        / int(storage["source_content_bytes"])
     )
-    if source_bytes <= 0 or packed_payload_bytes <= 0:
-        raise CanaryError("packed storage byte counts are invalid")
+    physical_ratio = (
+        int(storage["physical_growth_bytes"])
+        / int(storage["unique_downloaded_source_bytes"])
+    )
     return {
-        "measurement": "version_scoped_native_block_payloads_excluding_heap_and_index_overhead",
-        "source_content_bytes": source_bytes,
-        "packed_payload_bytes": packed_payload_bytes,
-        "packed_payload_ratio_to_source": round(packed_payload_bytes / source_bytes, 6),
-        "service_count": int(version["service_count"]),
-        "charge_count": int(version["charge_count"]),
-        "fact_count": int(version["fact_count"]),
-        "blocks": [
-            {
-                "block_kind": int(block_row["block_kind"]),
-                "block_count": int(block_row["block_count"]),
-                "payload_bytes": int(block_row["payload_bytes"]),
-            }
-            for block_row in blocks
-        ],
+        "maximum_physical_storage_ratio": args.maximum_physical_storage_ratio,
+        "physical_storage_ratio_passed": (
+            physical_ratio <= args.maximum_physical_storage_ratio
+        ),
+        "maximum_cold_ms": args.maximum_cold_ms,
+        "cold_latency_passed": float(latency["cold_ms"]) <= args.maximum_cold_ms,
+        "maximum_warm_p95_ms": args.maximum_warm_p95_ms,
+        "warm_p95_latency_passed": (
+            float(latency["p95_ms"]) <= args.maximum_warm_p95_ms
+        ),
+        "maximum_packed_payload_ratio": args.maximum_packed_payload_ratio,
+        "packed_payload_ratio_diagnostic_passed": (
+            None if args.maximum_packed_payload_ratio is None
+            else packed_payload_ratio <= args.maximum_packed_payload_ratio
+        ),
+    }
+
+
+def _canary_result(
+    args: argparse.Namespace,
+    header_environment_names: list[str],
+    parameters_by_name: Mapping[str, str],
+    latency: Mapping[str, object],
+    storage: Mapping[str, object],
+    gates: Mapping[str, object],
+) -> dict[str, object]:
+    is_passed = all(
+        gates[name] is True
+        for name in (
+            "physical_storage_ratio_passed",
+            "cold_latency_passed",
+            "warm_p95_latency_passed",
+        )
+    )
+    return {
+        "schema_version": 2,
+        "status": "passed" if is_passed else "gate_failed",
+        "captured_at": dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z"),
+        "contract": {
+            "pagination_unit": "charges",
+            "payer_omission": "charge_metadata_only",
+            "payer_pair": "all_or_none_exact_nested_facts",
+            "storage_measurement": (
+                "quiescent_relation_delta_including_heap_toast_and_indexes"
+            ),
+            "header_environment_names": header_environment_names,
+        },
+        "query": {"hospital_id": args.hospital_id, **parameters_by_name},
+        "latency": dict(latency),
+        "storage": dict(storage),
+        "gates": dict(gates),
     }
 
 
 def capture_canary_receipt(args: argparse.Namespace) -> dict[str, object]:
-    """Run the read-only latency and version-scoped storage observations."""
+    """Run source-bound latency and quiescent physical-storage gates."""
 
     if (
         args.warmups < 0 or args.samples < 1
         or args.minimum_scanned < 1 or args.minimum_items < 1
         or args.timeout_seconds <= 0
+        or args.version_id is None
+        or args.maximum_baseline_age_seconds <= 0
+        or not 0 < args.maximum_physical_storage_ratio <= 1
+        or args.maximum_cold_ms <= 0
+        or args.maximum_warm_p95_ms <= 0
         or _IDENTIFIER_PATTERN.fullmatch(args.database_schema) is None
         or (
             args.maximum_packed_payload_ratio is not None
@@ -358,38 +399,21 @@ def capture_canary_receipt(args: argparse.Namespace) -> dict[str, object]:
     dsn = os.getenv(args.database_url_env)
     if not dsn:
         raise CanaryError(f"database URL environment is unset: {args.database_url_env}")
+    baseline = _load_baseline_receipt(args.pre_import_receipt)
     storage = asyncio.run(
-        _storage_receipt(dsn, args.database_schema, str(latency["version_id"]))
+        _storage_receipt(
+            dsn,
+            args.database_schema,
+            str(latency["version_id"]),
+            baseline,
+            args.timeout_seconds,
+            args.maximum_baseline_age_seconds,
+        )
     )
-    ratio = (
-        int(storage["packed_payload_bytes"])
-        / int(storage["source_content_bytes"])
+    gates = _canary_gates(args, latency, storage)
+    return _canary_result(
+        args, header_environment_names, parameters_by_name, latency, storage, gates
     )
-    is_ratio_passed = (
-        None if args.maximum_packed_payload_ratio is None
-        else ratio <= args.maximum_packed_payload_ratio
-    )
-    return {
-        "schema_version": 1,
-        "status": "passed" if is_ratio_passed is not False else "gate_failed",
-        "captured_at": dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z"),
-        "contract": {
-            "pagination_unit": "charges",
-            "payer_omission": "charge_metadata_only",
-            "payer_pair": "all_or_none_exact_nested_facts",
-            "header_environment_names": header_environment_names,
-        },
-        "query": {
-            "hospital_id": args.hospital_id,
-            **parameters_by_name,
-        },
-        "latency": latency,
-        "storage": storage,
-        "gates": {
-            "maximum_packed_payload_ratio": args.maximum_packed_payload_ratio,
-            "packed_payload_ratio_passed": is_ratio_passed,
-        },
-    }
 
 
 def main(argv: list[str] | None = None) -> int:

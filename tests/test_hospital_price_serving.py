@@ -184,6 +184,7 @@ class _Session:
                     "secondary_first": self.native.payer_refs[0],
                     "secondary_count": len(self.native.payer_refs),
                     "page_index": 0, "page_count": 1, "payload": b"payer",
+                    "range_indexes": [0], "key_page_count": 1,
                 }]
             )
         if statement is FACT_BLOCK_SQL:

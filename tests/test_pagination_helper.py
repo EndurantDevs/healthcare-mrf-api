@@ -98,6 +98,21 @@ def test_parse_pagination_rejects_bad_default_config():
         parse_pagination({}, default_limit=0, max_limit=200, default_page=1)
 
 
+def test_parse_pagination_ignores_disabled_aliases():
+    params = parse_pagination(
+        {"offset": "40", "start": "40", "page_size": "10"},
+        default_limit=50,
+        max_limit=200,
+        allow_offset=False,
+        allow_start=False,
+        allow_page_size=False,
+    )
+
+    assert (params.page, params.limit, params.offset, params.source) == (
+        1, 50, 0, "page"
+    )
+
+
 def test_parse_pagination_rejects_offset_start_conflict():
     with pytest.raises(InvalidUsage):
         parse_pagination(

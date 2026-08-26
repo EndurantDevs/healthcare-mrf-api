@@ -11,6 +11,7 @@ import orjson
 from sanic import Blueprint, response
 
 from api.hospital_price_serving import HOSPITAL_PRICE_CACHE_CONTROL
+from api.hospital_price_serving import MAX_HOSPITAL_PRICE_PUBLIC_BYTES
 from api.hospital_price_serving import HospitalPriceCursorStaleError
 from api.hospital_price_serving import HospitalPriceInvalidRequestError
 from api.hospital_price_serving import HospitalPriceNotFoundError
@@ -37,7 +38,6 @@ _ERROR_BY_STATUS = {
         "Hospital price serving is temporarily unavailable.",
     ),
 }
-_MAX_SUCCESS_BODY_BYTES = 2 << 20
 
 
 def _get_session(request: Any) -> Any:
@@ -77,7 +77,7 @@ def _query_values(request: Any) -> dict[str, str]:
 
 def _json_response(payload: dict[str, object], *, status: int):
     encoded = orjson.dumps(payload)
-    if status < 400 and len(encoded) > _MAX_SUCCESS_BODY_BYTES:
+    if status < 400 and len(encoded) > MAX_HOSPITAL_PRICE_PUBLIC_BYTES:
         raise HospitalPriceServingUnavailableError(
             "hospital price response exceeds its bound"
         )

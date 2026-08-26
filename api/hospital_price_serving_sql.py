@@ -82,33 +82,55 @@ SERVICE_BLOCK_SQL = text(
        ORDER BY block.block_ordinal"""
 )
 PAYER_SELECTOR_SQL = text(
-    f"""WITH wanted(first_fact, fact_end) AS (
-      SELECT * FROM unnest(
+    f"""WITH key_pages AS (
+      SELECT block_ordinal, secondary_first, page_index, page_count
+      FROM {_SCHEMA}.hospital_price_data_block
+      WHERE version_id=:version_id AND block_kind=4 AND key_sha256=:key_sha256
+    ), key_census AS (
+      SELECT (array_agg(block_ordinal ORDER BY page_index))[1]
+               AS first_block_ordinal,
+             CASE WHEN count(*) > 0 AND min(page_index) = 0
+                        AND max(page_index) + 1 = count(*)
+                        AND min(page_count) = count(*)
+                        AND max(page_count) = count(*)
+                  THEN count(*)::integer END AS key_page_count
+      FROM key_pages
+    ), wanted(first_fact, fact_end, range_index) AS (
+      SELECT first_fact, fact_end, range_ordinal - 1 FROM unnest(
         CAST(:fact_starts AS bigint[]), CAST(:fact_ends AS bigint[])
-      )
-    ), selected AS (
-      SELECT anchor.block_ordinal FROM wanted
+      ) WITH ORDINALITY AS requested(first_fact, fact_end, range_ordinal)
+    ), selected(range_index, block_ordinal) AS (
+      SELECT wanted.range_index, anchor.block_ordinal FROM wanted
       CROSS JOIN LATERAL (
         SELECT candidate.block_ordinal, candidate.secondary_first
-        FROM {_SCHEMA}.hospital_price_data_block candidate
-        WHERE candidate.version_id=:version_id AND candidate.block_kind=4
-          AND candidate.key_sha256=:key_sha256
-          AND candidate.secondary_first<=wanted.first_fact
+        FROM key_pages candidate
+        WHERE candidate.secondary_first<=wanted.first_fact
         ORDER BY candidate.secondary_first DESC LIMIT 1
       ) anchor
       UNION
-      SELECT block.block_ordinal
-      FROM {_SCHEMA}.hospital_price_data_block block JOIN wanted
+      SELECT wanted.range_index, block.block_ordinal
+      FROM key_pages block JOIN wanted
         ON block.secondary_first>=wanted.first_fact
        AND block.secondary_first<wanted.fact_end
-      WHERE block.version_id=:version_id AND block.block_kind=4
-        AND block.key_sha256=:key_sha256
+      UNION
+      SELECT NULL::bigint, first_block_ordinal FROM key_census
+      WHERE first_block_ordinal IS NOT NULL
+    ), selected_blocks AS (
+      SELECT block_ordinal,
+             coalesce(
+               array_agg(range_index ORDER BY range_index)
+                 FILTER (WHERE range_index IS NOT NULL),
+               ARRAY[]::bigint[]
+             ) AS range_indexes
+      FROM selected GROUP BY block_ordinal
     ) SELECT block.block_ordinal, block.logical_first,
              block.secondary_first, block.secondary_count,
-             block.page_index, block.page_count, block.payload
-        FROM selected JOIN {_SCHEMA}.hospital_price_data_block block
+             block.page_index, block.page_count, block.payload,
+             selected_blocks.range_indexes, key_census.key_page_count
+        FROM selected_blocks JOIN {_SCHEMA}.hospital_price_data_block block
           ON block.version_id=:version_id AND block.block_kind=4
-         AND block.block_ordinal=selected.block_ordinal
+         AND block.block_ordinal=selected_blocks.block_ordinal
+       CROSS JOIN key_census
        ORDER BY block.page_index"""
 )
 FACT_BLOCK_SQL = text(

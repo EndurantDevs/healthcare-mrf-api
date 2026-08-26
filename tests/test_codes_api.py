@@ -100,10 +100,10 @@ async def test_list_codes_searches_code_synonyms_without_changing_response_shape
 
     response = await list_codes(request)
     payload = json.loads(response.body)
-    query_sql = "\n".join(str(call[0][0]) for call in request.ctx.sa_session.calls)
+    query_statements = [str(call[0][0]) for call in request.ctx.sa_session.calls]
 
     assert payload["items"][0]["code_system"] == "CDT"
-    assert "code_synonym" in query_sql
+    assert all("code_synonym" in statement for statement in query_statements)
     assert "synonym" not in payload["items"][0]
 
 
@@ -243,8 +243,9 @@ async def test_list_codes_supports_unfiltered_descending_and_source_scopes(
     )
     source_response = await list_codes(source_request)
     assert json.loads(source_response.body)["query"]["source"] == "cms"
-    assert "lower(mrf.code_catalog.source)" in str(
-        source_request.ctx.sa_session.calls[0][0][0]
+    assert all(
+        "lower(mrf.code_catalog.source)" in str(call[0][0])
+        for call in source_request.ctx.sa_session.calls
     )
 
 
