@@ -94,22 +94,26 @@
     #[test]
     fn remaining_io_edges_fail_closed() {
         use crate::hospital_price_selector_block::HospitalPriceSelectorKey;
-        use std::os::unix::fs::PermissionsExt;
 
-        if unsafe { libc::geteuid() } != 0 {
-            let directory = tempfile::tempdir().unwrap();
-            let locked = directory.path().join("locked");
-            fs::create_dir(&locked).unwrap();
-            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-            let locked_result = PackedSink::create(
-                &locked,
-                "test",
-                "version-1",
-                Arc::new(AtomicU64::new(0)),
-                1024,
-            );
-            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
-            assert!(locked_result.is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            if unsafe { libc::geteuid() } != 0 {
+                let directory = tempfile::tempdir().unwrap();
+                let locked = directory.path().join("locked");
+                fs::create_dir(&locked).unwrap();
+                fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+                let locked_result = PackedSink::create(
+                    &locked,
+                    "test",
+                    "version-1",
+                    Arc::new(AtomicU64::new(0)),
+                    1024,
+                );
+                fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+                assert!(locked_result.is_err());
+            }
         }
 
         let directory = tempfile::tempdir().unwrap();
@@ -124,20 +128,23 @@
         fail_next_sink_write(&mut sink);
         assert!(sink.finish().is_err());
 
-        let directory = tempfile::tempdir().unwrap();
-        let mut sink = PackedSink::create(
-            directory.path(),
-            "test",
-            "version-1",
-            Arc::new(AtomicU64::new(0)),
-            1024,
-        )
-        .unwrap();
-        let writer = sink.writer.take().unwrap();
-        let mut inner = writer.into_inner().ok().unwrap();
-        inner.file = OpenOptions::new().write(true).open("/dev/null").unwrap();
-        sink.writer = Some(BufWriter::with_capacity(1, inner));
-        assert!(sink.finish().is_err());
+        #[cfg(unix)]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let mut sink = PackedSink::create(
+                directory.path(),
+                "test",
+                "version-1",
+                Arc::new(AtomicU64::new(0)),
+                1024,
+            )
+            .unwrap();
+            let writer = sink.writer.take().unwrap();
+            let mut inner = writer.into_inner().ok().unwrap();
+            inner.file = OpenOptions::new().write(true).open("/dev/null").unwrap();
+            sink.writer = Some(BufWriter::with_capacity(1, inner));
+            assert!(sink.finish().is_err());
+        }
 
         let directory = tempfile::tempdir().unwrap();
         assert!(PackedOutputBuilder::create(
@@ -236,13 +243,16 @@
         output.selector_spool_bytes = 8;
         assert!(output.finish_selector_pages().is_err());
 
-        let directory = tempfile::tempdir().unwrap();
-        let mut output = builder(directory.path());
-        output.selector_spool = Some(BufWriter::new(
-            OpenOptions::new().write(true).open("/dev/null").unwrap(),
-        ));
-        output.selector_spool_bytes = 1;
-        assert!(output.finish_selector_pages().is_err());
+        #[cfg(unix)]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let mut output = builder(directory.path());
+            output.selector_spool = Some(BufWriter::new(
+                OpenOptions::new().write(true).open("/dev/null").unwrap(),
+            ));
+            output.selector_spool_bytes = 1;
+            assert!(output.finish_selector_pages().is_err());
+        }
 
         let directory = tempfile::tempdir().unwrap();
         let mut output = builder(directory.path());
