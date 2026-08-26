@@ -8,6 +8,8 @@ from scripts import update_provider_directory_verification as verification_updat
 from scripts import generate_provider_directory_support_docs as generator
 from scripts.research import (
     provider_directory_endpoint_acquisition_cli as acquisition_cli,
+    provider_directory_endpoint_acquisition_reporting as acquisition_reporting,
+    provider_directory_endpoint_acquisition_support as acquisition_support,
 )
 from tests.provider_directory_endpoint_acquisition_test_support import (
     successful_operator_input,
@@ -470,3 +472,8 @@ def test_acquisition_cli_is_directly_executable():
     payload = json.loads(result.stdout)
     assert payload["valid"] is True
     assert payload["entries"] > 0
+
+
+def test_acquisition_modules_share_run_id_pattern():
+    assert acquisition_cli.harness.RUN_ID_PATTERN is acquisition_support.RUN_ID_PATTERN
+    assert acquisition_reporting.RUN_ID_PATTERN is acquisition_support.RUN_ID_PATTERN

@@ -323,6 +323,8 @@ def _merge_nonterminal_observation(
     )
     is_same_bound_successor = (
         report_entry.get("plan_bound") is True
+        and current_run_id is not None
+        and prior_active_run_id is not None
         and current_run_id == prior_active_run_id
     )
     has_same_bound_successor_finished = (

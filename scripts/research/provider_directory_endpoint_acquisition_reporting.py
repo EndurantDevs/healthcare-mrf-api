@@ -11,17 +11,20 @@ from typing import Any
 try:
     from scripts.provider_directory_support_contract import RESOURCE_TYPES
     from scripts.provider_directory_verification_contract import VerificationUpdateError
+    from scripts.research.provider_directory_endpoint_acquisition_support import (
+        RUN_ID_PATTERN,
+    )
 except ModuleNotFoundError:
     scripts_dir = str(Path(__file__).resolve().parents[1])
     if scripts_dir not in sys.path:
         sys.path.insert(0, scripts_dir)
     from provider_directory_support_contract import RESOURCE_TYPES
     from provider_directory_verification_contract import VerificationUpdateError
+    from provider_directory_endpoint_acquisition_support import RUN_ID_PATTERN
 
 SENSITIVE_TEXT_PATTERN = re.compile(
     r"(?i)(?:bearer\s+\S+|token|secret|password|authorization|api[_-]?key|credential)"
 )
-RUN_ID_PATTERN = re.compile(r"run_[0-9a-f]{32}")
 SOURCE_ID_PATTERN = re.compile(r"pdfhir_[0-9a-f]{24}")
 RAW_RUN_STATUSES = frozenset(
     {"queued", "starting", "running", "finalizing", "canceling", "succeeded", "failed", "canceled", "cancelled", "dead_letter"}

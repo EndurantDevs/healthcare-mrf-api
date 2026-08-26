@@ -99,14 +99,25 @@ def test_unbound_active_observation_does_not_supersede_terminal_proof():
 
 
 @pytest.mark.parametrize(
-    ("is_plan_bound", "run_status", "run_id"),
+    ("is_plan_bound", "run_status", "prior_active_run_id", "run_id"),
     [
-        (False, "running", "run_22222222222222222222222222222222"),
-        (True, "failed", "run_33333333333333333333333333333333"),
+        (
+            False,
+            "running",
+            "run_11111111111111111111111111111111",
+            "run_22222222222222222222222222222222",
+        ),
+        (
+            True,
+            "failed",
+            "run_11111111111111111111111111111111",
+            "run_33333333333333333333333333333333",
+        ),
+        (True, "failed", None, None),
     ],
 )
 def test_unrelated_observation_preserves_bound_active_supersession(
-    is_plan_bound, run_status, run_id
+    is_plan_bound, run_status, prior_active_run_id, run_id
 ):
     manifest_entry = _resource_manifest_entry()
     prior_record_by_field = {
@@ -120,7 +131,7 @@ def test_unrelated_observation_preserves_bound_active_supersession(
         "proof_state": "superseded",
         "superseded_reason": "newer_active_run",
         "current_observation": {
-            "run_id": "run_11111111111111111111111111111111",
+            **({"run_id": prior_active_run_id} if prior_active_run_id else {}),
             "state_status": "observed",
             "run_status": "running",
             "observed_at": "2026-08-25T01:00:00Z",

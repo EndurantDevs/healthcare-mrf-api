@@ -19,6 +19,7 @@ try:
         acquisition_metric_errors,
         bulk_acquisition_metric_errors,
         external_result_errors,
+        RUN_ID_PATTERN,
         result_param_errors,
     )
 except ModuleNotFoundError:
@@ -26,6 +27,7 @@ except ModuleNotFoundError:
         acquisition_metric_errors,
         bulk_acquisition_metric_errors,
         external_result_errors,
+        RUN_ID_PATTERN,
         result_param_errors,
     )
 
@@ -33,7 +35,6 @@ except ModuleNotFoundError:
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = ROOT / "specs/provider_directory_endpoint_acquisition_manifest.json"
 SOURCE_ID_PATTERN = re.compile(r"^pdfhir_[0-9a-f]{24}$")
-RUN_ID_PATTERN = re.compile(r"^run_[0-9a-f]{32}$")
 SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 RESOURCE_PROFILES = {
     "G4": [

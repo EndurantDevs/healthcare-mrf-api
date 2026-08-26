@@ -207,6 +207,15 @@ def _validate_verification_observation(entry_id: str, observation: Any) -> None:
         )
     if not isinstance(observation, dict):
         return
+    observation_status = observation.get("run_status") or observation.get(
+        "state_status"
+    )
+    if observation.get("observed_at") is None or not (
+        isinstance(observation_status, str) and observation_status
+    ):
+        raise SupportDocumentationError(
+            f"{entry_id}: current observation requires observed_at and status"
+        )
     validate_optional_verification_timestamp(
         observation.get("observed_at"),
         f"{entry_id}: observed_at",
