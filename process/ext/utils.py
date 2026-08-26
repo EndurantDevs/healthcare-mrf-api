@@ -837,28 +837,29 @@ async def flush_error_log(cls):
 
 async def push_objects_slow(obj_list, cls):
     """Insert objects with a row-by-row fallback on batch failure."""
-    if obj_list:
-        try:
-            if hasattr(cls, "__my_index_elements__"):
-                stmt = (
-                    db.insert(cls)
-                    .values(obj_list)
-                    .on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
-                )
+    if not obj_list:
+        return
+    try:
+        if hasattr(cls, "__my_index_elements__"):
+            stmt = (
+                db.insert(cls)
+                .values(obj_list)
+                .on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
+            )
+            await stmt.status()
+        else:
+            await db.insert(cls).values(obj_list).status()
+    except (SQLAlchemyError, UniqueViolationError, InterfaceError):
+        for obj in obj_list:
+            try:
+                stmt = db.insert(cls).values(obj)
+                if hasattr(cls, "__my_index_elements__"):
+                    stmt = stmt.on_conflict_do_nothing(
+                        index_elements=cls.__my_index_elements__
+                    )
                 await stmt.status()
-            else:
-                await db.insert(cls).values(obj_list).status()
-        except (SQLAlchemyError, UniqueViolationError, InterfaceError):
-            for obj in obj_list:
-                try:
-                    stmt = db.insert(cls).values(obj)
-                    if hasattr(cls, "__my_index_elements__"):
-                        stmt = stmt.on_conflict_do_nothing(
-                            index_elements=cls.__my_index_elements__
-                        )
-                    await stmt.status()
-                except (SQLAlchemyError, UniqueViolationError) as exc:
-                    print(exc)
+            except (SQLAlchemyError, UniqueViolationError) as exc:
+                print(exc)
 
 
 class IterateList:

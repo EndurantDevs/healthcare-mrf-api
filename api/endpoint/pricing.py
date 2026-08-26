@@ -8686,8 +8686,6 @@ async def get_pricing_provider_score(request, npi: str):
         if profile is not None:
             if selected_mode == "zip" and profile.get("zip5"):
                 selected_geography = _selected_geography_label("zip", profile.get("zip5"))
-            elif selected_mode in {"zip", "state"} and profile.get("state_key"):
-                selected_geography = _selected_geography_label("state", profile.get("state_key"))
             elif profile.get("state_key"):
                 selected_geography = _selected_geography_label("state", profile.get("state_key"))
             elif profile.get("zip5"):
