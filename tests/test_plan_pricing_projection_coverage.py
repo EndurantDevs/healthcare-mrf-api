@@ -122,7 +122,14 @@ async def test_projection_candidate_insert_and_seal_keep_receipt_counts():
         '[{"snapshot_id":"snapshot"}]'
     )
     assert receipt["aggregate_row_count"] == 1
-    assert len(session.statements[1][1]["content_digest"]) == 64
+    assert session.statements[1][1] == {
+        "projection_id": PROJECTION_ID,
+        "content_digest": hashlib.sha256(b"content").hexdigest(),
+        "card_row_count": 2,
+        "aggregate_row_count": 1,
+        "fragment_byte_count": 80,
+        "build_seconds": 1.5,
+    }
 
 
 @pytest.mark.asyncio
@@ -161,7 +168,7 @@ async def test_materialize_all_codes_requires_rates_and_sorts_identity(
 
 
 @pytest.mark.asyncio
-async def test_session_builder_reuses_or_builds_exact_candidate(monkeypatch):
+async def test_session_builder_reuses_exact_candidate_under_lock(monkeypatch):
     with pytest.raises(ValueError, match="digest is invalid"):
         await projection_build.build_in_session(
             object(), binding_manifest_digest="bad", bindings=[]
@@ -183,13 +190,30 @@ async def test_session_builder_reuses_or_builds_exact_candidate(monkeypatch):
 
     monkeypatch.setattr(projection_build, "provider_signature", provider_signature)
     monkeypatch.setattr(projection_build, "_existing_candidate_receipt", existing)
+    candidate_id = projection_contract.projection_id("b" * 64, "c" * 64)
+    reuse_session = _ResultSession()
     assert await projection_build.build_in_session(
-        _ResultSession(),
+        reuse_session,
         binding_manifest_digest="b" * 64,
         bindings=[binding_by_field],
     ) == {"state": "ready"}
+    assert "pg_advisory_xact_lock" in reuse_session.statements[0][0]
+    assert reuse_session.statements[0][1] == {"key": candidate_id}
 
+
+@pytest.mark.asyncio
+async def test_session_builder_builds_exact_candidate_under_lock(monkeypatch):
+    binding_by_field = {
+        "snapshot_id": "snapshot",
+        "source_key": "source",
+        "plan_id": "plan",
+        "role": "in_network",
+        "ordinal": 0,
+    }
     calls = []
+
+    async def provider_signature(_session):
+        return "c" * 64
 
     async def absent(*_args):
         return None
@@ -205,15 +229,20 @@ async def test_session_builder_reuses_or_builds_exact_candidate(monkeypatch):
         calls.append("seal")
         return {"state": "ready"}
 
+    monkeypatch.setattr(projection_build, "provider_signature", provider_signature)
     monkeypatch.setattr(projection_build, "_existing_candidate_receipt", absent)
     monkeypatch.setattr(projection_build, "_insert_candidate", insert)
     monkeypatch.setattr(projection_build, "_materialize_all_codes", materialize)
     monkeypatch.setattr(projection_build, "_seal_candidate", seal)
+    candidate_id = projection_contract.projection_id("b" * 64, "c" * 64)
+    build_session = _ResultSession()
     assert await projection_build.build_in_session(
-        _ResultSession(),
+        build_session,
         binding_manifest_digest="b" * 64,
         bindings=[binding_by_field],
     ) == {"state": "ready"}
+    assert "pg_advisory_xact_lock" in build_session.statements[0][0]
+    assert build_session.statements[0][1] == {"key": candidate_id}
     assert calls == ["insert", "materialize", "seal"]
 
 
