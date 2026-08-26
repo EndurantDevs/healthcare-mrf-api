@@ -23,7 +23,7 @@ class _ConcurrentPrecheckBarrier:
         if self.arrival_count <= 2:
             if self.arrival_count == 2:
                 self.both_arrived.set()
-            await self.both_arrived.wait()
+            await asyncio.wait_for(self.both_arrived.wait(), timeout=5)
             return None
         return await self.durable_lookup(importer, idempotency_key)
 

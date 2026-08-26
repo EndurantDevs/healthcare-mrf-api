@@ -4229,7 +4229,13 @@ async def test_group_plan_99213_unscoped_card_and_full_keep_identical_guard(
         _mixed_canonical_release_selection(),
         pricing_projection_id="f" * 64,
     )
-    release_resolver = AsyncMock(return_value=selection)
+    guard_resolver = AsyncMock(return_value=selection)
+    release_resolver = AsyncMock()
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_guard_selection",
+        guard_resolver,
+    )
     strict_search = AsyncMock()
     monkeypatch.setattr(
         pricing_module,
@@ -4261,6 +4267,8 @@ async def test_group_plan_99213_unscoped_card_and_full_keep_identical_guard(
         messages.append(str(exc_info.value))
 
     assert messages[0] == messages[1]
+    assert guard_resolver.await_count == 2
+    release_resolver.assert_not_awaited()
     strict_search.assert_not_awaited()
 
 
@@ -4270,6 +4278,7 @@ async def test_card_false_uses_ready_aggregate_projection(monkeypatch):
         _mixed_canonical_release_selection(),
         pricing_projection_id="f" * 64,
     )
+    guard_resolver = AsyncMock()
     release_resolver = AsyncMock(return_value=selection)
     strict_search = AsyncMock(
         return_value={
@@ -4279,6 +4288,11 @@ async def test_card_false_uses_ready_aggregate_projection(monkeypatch):
             "pagination": {"total": 0, "limit": 25, "offset": 0, "page": 1},
             "query": {"view": "card", "include_providers": False},
         }
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_guard_selection",
+        guard_resolver,
     )
     monkeypatch.setattr(
         pricing_module,
@@ -4305,6 +4319,7 @@ async def test_card_false_uses_ready_aggregate_projection(monkeypatch):
     response = await list_providers_by_procedure(request)
 
     assert response.status == 200
+    guard_resolver.assert_not_awaited()
     release_resolver.assert_awaited_once_with(
         request.ctx.sa_session,
         selection.plan_release_id,
@@ -5749,7 +5764,7 @@ async def test_canonical_plan_uses_binding_market_for_statewide_taxonomy_guard(
     )
     monkeypatch.setattr(
         pricing_module,
-        "resolve_plan_release_serving",
+        "resolve_plan_release_guard_selection",
         AsyncMock(return_value=selection),
     )
 

@@ -20,7 +20,22 @@ from api.code_systems import (
 
 
 PROJECTION_CONTRACT = "plan_pricing_card_v2"
-SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
+
+
+def _projection_schema() -> str:
+    runtime_schema = os.getenv("HLTHPRT_DB_SCHEMA")
+    legacy_schema = os.getenv("DB_SCHEMA")
+    if runtime_schema and legacy_schema and runtime_schema != legacy_schema:
+        raise RuntimeError(
+            "DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema"
+        )
+    return geo_projection._sql_identifier(
+        runtime_schema or legacy_schema or "mrf",
+        field_name="pricing projection schema",
+    )
+
+
+SCHEMA = _projection_schema()
 HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 ZIP5 = re.compile(r"^[0-9]{5}$")
 INSERT_BATCH_SIZE = 1_000

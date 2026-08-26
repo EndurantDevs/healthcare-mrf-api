@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy import text
 
 from api import plan_release_serving
+from api.plan_release_pricing_projection import plan_release_serving_sql
 from api.plan_release_serving import (
     PLAN_RELEASE_PIN_OWNER_TYPE,
     PTG2_SCHEMA,
@@ -77,6 +78,10 @@ SELECT EXISTS (
      WHERE plan_release_id = :plan_release_id
 ) AS release_exists
 """
+_PLAN_RELEASE_GUARD_SQL = plan_release_serving_sql(
+    PTG2_SCHEMA,
+    include_pricing_projection=False,
+)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -117,6 +122,22 @@ async def _load_release_rows(
         },
     )
     return list(result)
+
+
+async def resolve_plan_release_guard_selection(
+    session: Any,
+    plan_release_id: Any,
+) -> PlanReleaseServingSelection | None:
+    """Load projection-free frozen metadata for semantic request guards."""
+
+    normalized = normalize_plan_release_id(plan_release_id)
+    if normalized is None:
+        return None
+    result = await session.execute(
+        text(_PLAN_RELEASE_GUARD_SQL),
+        {"plan_release_id": normalized, "pin_owner_type": PLAN_RELEASE_PIN_OWNER_TYPE},
+    )
+    return _selection_from_rows(normalized, result)
 
 
 async def _has_release_revision(session: Any, plan_release_id: str) -> bool:

@@ -248,6 +248,28 @@ async def _assert_child_blocks_incorrect_seal(
     await seal_transaction.rollback()
 
 
+async def _assert_direct_ready_insert_rechecks_counts(
+    admin,
+    schema: str,
+) -> None:
+    with pytest.raises(asyncpg.RaiseError, match="receipt counts"):
+        await admin.execute(
+            f"""
+            INSERT INTO {schema}.plan_pricing_projection_candidate (
+                projection_id, contract_version, binding_manifest_digest,
+                binding_manifest, provider_signature, state, content_digest,
+                card_row_count, aggregate_row_count, fragment_byte_count,
+                build_seconds, completed_at
+            ) VALUES (
+                $1, 'plan_pricing_card_v2', $2, '[]'::jsonb, $2, 'ready', $2,
+                1, 0, 0, 0, transaction_timestamp()
+            )
+            """,
+            "3" * 64,
+            "c" * 64,
+        )
+
+
 @pytest.mark.asyncio
 async def test_ready_seal_serializes_against_child_writes(monkeypatch):
     dsn = os.getenv(POSTGRES_DSN_ENV)
@@ -275,6 +297,7 @@ async def test_ready_seal_serializes_against_child_writes(monkeypatch):
         await _assert_child_blocks_incorrect_seal(
             admin, dsn, schema, connections, tasks
         )
+        await _assert_direct_ready_insert_rechecks_counts(admin, schema)
     finally:
         for task in tasks:
             if not task.done():

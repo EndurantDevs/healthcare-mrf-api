@@ -252,7 +252,7 @@ def upgrade() -> None:
             actual_aggregate_rows bigint;
             actual_fragment_bytes bigint;
         BEGIN
-            IF OLD.state = 'ready' THEN
+            IF TG_OP <> 'INSERT' AND OLD.state = 'ready' THEN
                 RAISE EXCEPTION 'ready plan-pricing projections are immutable';
             END IF;
             IF TG_OP = 'DELETE' THEN
@@ -342,7 +342,7 @@ def upgrade() -> None:
         """,
         f"""
         CREATE TRIGGER plan_pricing_projection_candidate_guard_trg
-        BEFORE UPDATE OR DELETE ON {candidate}
+        BEFORE INSERT OR UPDATE OR DELETE ON {candidate}
         FOR EACH ROW EXECUTE FUNCTION {candidate_guard}()
         """,
         f"""

@@ -12,6 +12,7 @@ from alembic.script import ScriptDirectory
 
 from api import control_imports, control_workers
 from api import plan_pricing_projection as projection
+from api import plan_pricing_projection_contract as projection_contract
 from api import plan_pricing_projection_materialize as projection_materialize
 from api import plan_pricing_projection_source as projection_source
 from api.plan_release_serving import PlanReleaseServingSelection
@@ -21,6 +22,20 @@ from tests.provider_directory_profile_capacity_v2_migration_support import (
 
 
 PROJECTION_ID = "a" * 64
+
+
+def test_projection_schema_rejects_unsafe_or_conflicting_environment(
+    monkeypatch,
+):
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "unsafe-schema")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    with pytest.raises(ValueError, match="PostgreSQL identifier"):
+        projection_contract._projection_schema()
+
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "runtime_schema")
+    monkeypatch.setenv("DB_SCHEMA", "different_schema")
+    with pytest.raises(RuntimeError, match="must identify the same schema"):
+        projection_contract._projection_schema()
 
 
 class _Rows:

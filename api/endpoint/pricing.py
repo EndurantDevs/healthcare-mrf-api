@@ -91,6 +91,7 @@ from api.plan_release_serving import (
     normalize_plan_release_id,
     resolve_plan_release_serving,
 )
+from api.plan_release_serving_resolution import resolve_plan_release_guard_selection
 from api.plan_release_readiness import is_release_binding_serving_scope_exact
 from api.plan_pricing_projection import (
     PlanPricingProjectionUnavailable,
@@ -11742,25 +11743,16 @@ async def list_providers_by_procedure(request):
     broad_expansion_market_type = plan_market_type
     release_selection = None
     release_selection_args_by_name = {}
-    if plan_release_id:
-        if projected_result_type is not None:
-            release_selection = await resolve_plan_release_serving(
-                session,
-                plan_release_id,
-                projection_only=True,
-            )
-        else:
-            release_selection = await resolve_plan_release_serving(
-                session,
-                plan_release_id,
-            )
-        release_selection_args_by_name = _release_selection_args_by_name(
-            release_selection
+    if plan_release_id and _is_broad_office_visit_cpt(
+        ptg_code_system,
+        code,
+    ):
+        guard_release_selection = await resolve_plan_release_guard_selection(
+            session,
+            plan_release_id,
         )
-        broad_expansion_market_type = (
-            _release_market_type_for_guard(
-                release_selection
-            )
+        broad_expansion_market_type = _release_market_type_for_guard(
+            guard_release_selection
         )
     _reject_broad_group_plan_provider_expansion(
         args,
@@ -11780,6 +11772,21 @@ async def list_providers_by_procedure(request):
         },
         specialty_filter=ptg_specialty_filter,
     )
+    if plan_release_id:
+        if projected_result_type is not None:
+            release_selection = await resolve_plan_release_serving(
+                session,
+                plan_release_id,
+                projection_only=True,
+            )
+        else:
+            release_selection = await resolve_plan_release_serving(
+                session,
+                plan_release_id,
+            )
+        release_selection_args_by_name = _release_selection_args_by_name(
+            release_selection
+        )
     if mode:
         try:
             normalize_ptg2_mode(mode)

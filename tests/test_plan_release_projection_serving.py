@@ -3,7 +3,7 @@
 
 import asyncio
 
-from api import plan_release_serving
+from api import plan_release_serving, plan_release_serving_resolution
 
 from .test_plan_release_serving import (
     PLAN_RELEASE_ID,
@@ -43,6 +43,24 @@ def test_projection_only_release_resolution_skips_snapshot_readiness(
     assert "plan_pricing_projection_candidate" in sql
     assert "revision.binding_set_digest" in sql
     assert "pricing_projection.content_digest" in sql
+
+
+def test_guard_release_resolution_never_reads_projection_metadata():
+    session = _Session([_binding_row(pricing_projection_id=None)])
+
+    selection = asyncio.run(
+        plan_release_serving_resolution.resolve_plan_release_guard_selection(
+            session,
+            PLAN_RELEASE_ID,
+        )
+    )
+
+    assert selection is not None
+    assert selection.pricing_projection_id is None
+    assert len(session.calls) == 1
+    sql = session.calls[0][0]
+    assert "to_regclass" not in sql
+    assert "plan_pricing_projection_candidate" not in sql
 
 
 def test_release_resolution_without_projection_relation_keeps_full_path(
