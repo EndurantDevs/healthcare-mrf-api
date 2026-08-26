@@ -2187,14 +2187,71 @@ paths:
                     type: string
                   version:
                     type: object
+                    required: [version_id]
+                    properties:
+                      version_id:
+                        type: string
+                        pattern: '^[0-9a-f]{64}$'
                   query:
                     type: object
+                    required: [code_type, code, payer_name, plan_name, negotiated_prices_requested]
+                    properties:
+                      code_type:
+                        type: string
+                      code:
+                        type: string
+                      payer_name:
+                        type: string
+                        nullable: true
+                      plan_name:
+                        type: string
+                        nullable: true
+                      negotiated_prices_requested:
+                        type: boolean
                   pagination:
                     type: object
+                    required: [unit, limit, scanned]
+                    properties:
+                      unit:
+                        type: string
+                        enum: [charges]
+                      limit:
+                        type: integer
+                        minimum: 1
+                        maximum: 100
+                      scanned:
+                        type: integer
+                        minimum: 0
+                      next_cursor:
+                        type: string
+                        nullable: true
+                        pattern: '^[A-Za-z0-9_-]{96}$'
                   items:
                     type: array
                     items:
                       type: object
+                      required: [service, charge, negotiated_prices]
+                      properties:
+                        service:
+                          type: object
+                          required: [codes]
+                          properties:
+                            codes:
+                              type: array
+                              items:
+                                type: object
+                                required: [code_type, code]
+                                properties:
+                                  code_type:
+                                    type: string
+                                  code:
+                                    type: string
+                        charge:
+                          type: object
+                        negotiated_prices:
+                          type: array
+                          items:
+                            type: object
         '400':
           description: Invalid selector, cursor, or pagination input
         '404':

@@ -380,3 +380,7 @@ def test_pre_import_receipt_loader_fails_closed(tmp_path):
     invalid.write_text("[]", encoding="utf-8")
     with pytest.raises(canary.CanaryError, match="invalid"):
         canary._load_baseline_receipt(invalid)
+
+    invalid.write_bytes(b"\xff")
+    with pytest.raises(canary.CanaryError, match="unreadable"):
+        canary._load_baseline_receipt(invalid)

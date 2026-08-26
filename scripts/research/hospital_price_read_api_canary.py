@@ -83,7 +83,7 @@ def _base_url(value: str, allow_insecure_http: bool) -> str:
 def _load_baseline_receipt(path: Path) -> Mapping[str, Any]:
     try:
         payload = json.loads(path.read_bytes())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         raise CanaryError("pre-import storage receipt is unreadable") from None
     if type(payload) is not dict:
         raise CanaryError("pre-import storage receipt is invalid")
