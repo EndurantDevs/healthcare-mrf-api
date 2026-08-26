@@ -1188,19 +1188,21 @@ mod packed_output_tests {
         use crate::hospital_price_selector_block::HospitalPriceSelectorKey;
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = tempfile::tempdir().unwrap();
-        let locked = directory.path().join("locked");
-        fs::create_dir(&locked).unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-        let locked_result = PackedSink::create(
-            &locked,
-            "test",
-            "version-1",
-            Arc::new(AtomicU64::new(0)),
-            1024,
-        );
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(locked_result.is_err());
+        if unsafe { libc::geteuid() } != 0 {
+            let directory = tempfile::tempdir().unwrap();
+            let locked = directory.path().join("locked");
+            fs::create_dir(&locked).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let locked_result = PackedSink::create(
+                &locked,
+                "test",
+                "version-1",
+                Arc::new(AtomicU64::new(0)),
+                1024,
+            );
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(locked_result.is_err());
+        }
 
         let directory = tempfile::tempdir().unwrap();
         let mut sink = PackedSink::create(
