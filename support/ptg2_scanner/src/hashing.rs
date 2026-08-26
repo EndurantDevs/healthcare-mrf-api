@@ -55,7 +55,7 @@ pub fn canonical_value(value: &Value) -> Value {
 }
 
 pub fn canonical_json(value: &Value) -> String {
-    serde_json::to_string(&canonical_value(value)).unwrap_or_else(|_| "null".to_string())
+    serde_json::to_string(&canonical_value(value)).expect("canonical JSON values serialize")
 }
 
 pub fn sha63_hex_from_json(value: &Value) -> String {

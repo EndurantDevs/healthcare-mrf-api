@@ -27,6 +27,11 @@ from process.provider_directory_profile_selection import (
     validated_profile_execution,
 )
 from process.hospital_hpt_registry import selected_hospital_hpt_registry
+from process.hospital_price_runtime import (
+    configured_resource_limits,
+    hospital_price_artifact_store,
+    locator_groups,
+)
 from process.provider_directory_fhir_census_contract import (
     ProviderDirectoryFHIRAcquisitionStrategy,
 )
@@ -1928,13 +1933,20 @@ def _validate_provider_directory_profile_execution_params(
         raise ValueError(str(exc)) from exc
 
 
+def _validate_hospital_price_admission(params: dict[str, Any]) -> None:
+    hospitals = selected_hospital_hpt_registry(params)
+    configured_resource_limits(
+        hospital_price_artifact_store(), len(locator_groups(hospitals))
+    )
+
+
 async def _validate_hospital_price_params(
     importer: str, params: dict[str, Any]
 ) -> None:
     if importer != "hospital-prices":
         return
     try:
-        await asyncio.to_thread(selected_hospital_hpt_registry, params)
+        await asyncio.to_thread(_validate_hospital_price_admission, params)
     except ValueError as exc:
         raise ValueError(str(exc)) from exc
 

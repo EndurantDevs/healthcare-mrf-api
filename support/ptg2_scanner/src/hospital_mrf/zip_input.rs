@@ -18,10 +18,9 @@ fn import_zip_payload(
     version_id: &str,
     input_path: &Path,
     output_directory: &Path,
-    max_fanout_rows: usize,
-    max_decompressed_bytes: u64,
-    max_output_bytes: u64,
-) -> io::Result<(u64, Vec<CopyArtifactSummary>)> {
+    limits: HospitalMrfLimits,
+    output_mode: HospitalMrfOutputMode,
+) -> io::Result<(u64, HospitalMrfArtifacts)> {
     let input_bytes = input_path.metadata()?.len();
     let mut archive = zip::ZipArchive::new(File::open(input_path)?).map_err(zip_error)?;
     let mut selected = None;
@@ -61,22 +60,22 @@ fn import_zip_payload(
     if declared_bytes == 0 {
         return Err(invalid("ZIP hospital MRF member is empty"));
     }
-    if declared_bytes > max_decompressed_bytes {
+    if declared_bytes > limits.max_decompressed_bytes {
         return Err(invalid(format!(
-            "ZIP hospital MRF decompressed size exceeds configured limit {max_decompressed_bytes} bytes"
+            "ZIP hospital MRF decompressed size exceeds configured limit {} bytes",
+            limits.max_decompressed_bytes
         )));
     }
 
     let member = archive.by_index(index).map_err(zip_error)?;
-    let reader = ZipPayloadReader::new(member, max_decompressed_bytes)?;
-    let artifacts = parse_hospital_payload(
+    let reader = ZipPayloadReader::new(member, limits.max_decompressed_bytes)?;
+    let artifacts = parse_hospital_payload_with_output_mode(
         format,
         reader,
         version_id,
         output_directory,
-        max_fanout_rows,
-        max_decompressed_bytes,
-        max_output_bytes,
+        limits,
+        output_mode,
     )?;
     Ok((input_bytes, artifacts))
 }
@@ -165,9 +164,8 @@ impl<R: Read> Read for ZipPayloadReader<R> {
         }
         if self.prefix_position < self.prefix_length {
             let count = (self.prefix_length - self.prefix_position).min(buffer.len());
-            buffer[..count].copy_from_slice(
-                &self.prefix[self.prefix_position..self.prefix_position + count],
-            );
+            buffer[..count]
+                .copy_from_slice(&self.prefix[self.prefix_position..self.prefix_position + count]);
             self.prefix_position += count;
             return Ok(count);
         }

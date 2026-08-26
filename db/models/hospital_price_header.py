@@ -54,7 +54,7 @@ class HospitalPriceVersion(Base, JSONOutputMixin):
             "version_id ~ '^[0-9a-f]{64}$' "
             "AND parser_contract_sha256 ~ '^[0-9a-f]{64}$' "
             "AND semantic_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND source_format IN ('json', 'csv_tall', 'csv_wide') "
+            "AND source_format IN ('json', 'csv-tall', 'csv-wide') "
             "AND location_count > 0 AND npi_count > 0 AND license_count > 0 "
             "AND service_count > 0 AND charge_count > 0 "
             "AND payer_charge_count >= 0",

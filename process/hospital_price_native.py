@@ -8,74 +8,32 @@ import csv
 import gzip
 import hashlib
 import io
-import json
 import os
 import re
 import zipfile
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator
 from urllib.parse import unquote, urlsplit
 
+from support.hospital_price_native_validation import (
+    HOSPITAL_MRF_BINARY_COPY_KINDS,
+    HOSPITAL_MRF_COPY_COLUMNS,
+    HOSPITAL_MRF_PACKED_COPY_COLUMNS,
+    HOSPITAL_MRF_PARSER_CONTRACT,
+    HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
+    HOSPITAL_MRF_SCHEMA_REVISION,
+    HOSPITAL_MRF_SUMMARY_CONTRACT,
+    HOSPITAL_MRF_TEXT_COPY_COLUMNS,
+    HospitalPackedRoot,
+    HospitalParserArtifact,
+    HospitalParserReceipt,
+    _SHA256,
+    _parser_artifact,
+    validate_hospital_parser_summary,
+)
 
-HOSPITAL_MRF_SCHEMA_REVISION = "5333564a710f80d7740180b9ffab8dbdcba9b502"
-HOSPITAL_MRF_PARSER_CONTRACT = (
-    f"hospital-mrf-copy-v3-resource-bounded:{HOSPITAL_MRF_SCHEMA_REVISION}"
-)
-HOSPITAL_MRF_PARSER_CONTRACT_SHA256 = hashlib.sha256(
-    HOSPITAL_MRF_PARSER_CONTRACT.encode("ascii")
-).hexdigest()
-HOSPITAL_MRF_COPY_COLUMNS = {
-    "mrf": (
-        "version_id", "source_hospital_name", "last_updated_on", "template_version",
-        "attestation_text", "confirm_attestation", "attester_name",
-        "financial_aid_policy",
-    ),
-    "location": (
-        "version_id", "location_ordinal", "location_name", "hospital_address",
-    ),
-    "npi": ("version_id", "npi_ordinal", "npi"),
-    "license": (
-        "version_id", "license_ordinal", "license_number", "state",
-    ),
-    "contract_provision": (
-        "version_id", "provision_ordinal", "payer_name", "plan_name",
-        "provisions",
-    ),
-    "service": (
-        "version_id", "service_ordinal", "description", "drug_unit", "drug_type",
-    ),
-    "code": (
-        "version_id", "service_ordinal", "code_ordinal", "code_type", "code",
-    ),
-    "charge": (
-        "version_id", "service_ordinal", "charge_ordinal", "setting",
-        "modifier_codes", "gross_charge", "discounted_cash", "minimum",
-        "maximum", "additional_generic_notes",
-        "billing_class",
-    ),
-    "payer_charge": (
-        "version_id", "service_ordinal", "charge_ordinal", "payer_ordinal",
-        "payer_name", "plan_name", "standard_charge_dollar",
-        "standard_charge_percentage", "standard_charge_algorithm",
-        "median_amount", "percentile_10", "percentile_90", "allowed_count",
-        "methodology", "additional_payer_notes",
-    ),
-    "modifier": (
-        "version_id", "modifier_ordinal", "code", "description", "setting",
-        "additional_generic_notes",
-    ),
-    "modifier_payer": (
-        "version_id", "modifier_ordinal", "payer_ordinal", "payer_name",
-        "plan_name", "description", "standard_charge_dollar",
-        "standard_charge_percentage", "standard_charge_algorithm",
-    ),
-}
-_REQUIRED_NONEMPTY_RELATIONS = frozenset(
-    {"mrf", "location", "npi", "license", "service", "code", "charge"}
-)
-_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
 _EIN_FILENAME = re.compile(r"^(\d{2})-?(\d{7})(?:[_-]|$)")
 _ZIP_MAGICS = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 HOSPITAL_MRF_MAX_DECOMPRESSED_BYTES_ENV = (
@@ -83,31 +41,6 @@ HOSPITAL_MRF_MAX_DECOMPRESSED_BYTES_ENV = (
 )
 DEFAULT_HOSPITAL_MRF_MAX_DECOMPRESSED_BYTES = 64 * 1024**3
 HOSPITAL_MRF_FORMAT_DETECTION_MAX_BYTES = 64 * 1024**2
-
-
-@dataclass(frozen=True)
-class HospitalParserArtifact:
-    kind: str
-    path: Path
-    rows: int
-    bytes: int
-    sha256: str
-
-
-@dataclass(frozen=True)
-class HospitalParserReceipt:
-    version_id: str
-    source_format: str
-    semantic_sha256: str
-    max_fanout_rows: int
-    max_decompressed_bytes: int
-    max_output_bytes: int
-    artifacts: tuple[HospitalParserArtifact, ...]
-
-    def artifact(self, kind: str) -> HospitalParserArtifact:
-        """Return the artifact for one known COPY relation."""
-
-        return self.artifacts[tuple(HOSPITAL_MRF_COPY_COLUMNS).index(kind)]
 
 
 def hospital_price_version_id(content_sha256: str) -> str:
@@ -257,104 +190,3 @@ def detect_hospital_mrf_format(
     ):
         return "csv-wide"
     raise ValueError("hospital CSV payer layout is not CMS v3 tall or wide")
-
-
-def _parser_artifact(
-    raw: Any, *, kind: str, output_directory: Path
-) -> HospitalParserArtifact:
-    if not isinstance(raw, dict) or raw.get("kind") != kind:
-        raise ValueError(f"hospital parser artifact {kind} is missing")
-    path = Path(str(raw.get("path") or ""))
-    expected_path = (output_directory / f"{kind}.copy").resolve()
-    if path.resolve() != expected_path or path.is_symlink() or not path.is_file():
-        raise ValueError(f"hospital parser artifact {kind} has an unsafe path")
-    rows, byte_count, digest = raw.get("rows"), raw.get("bytes"), raw.get("sha256")
-    if (
-        type(rows) is not int or rows < 0
-        or type(byte_count) is not int or byte_count < 0
-        or path.stat().st_size != byte_count
-        or not isinstance(digest, str) or _SHA256.fullmatch(digest) is None
-        or (kind in _REQUIRED_NONEMPTY_RELATIONS and rows == 0)
-        or (rows > 0) != (byte_count > 0)
-    ):
-        raise ValueError(f"hospital parser artifact {kind} is invalid")
-    return HospitalParserArtifact(kind, path, rows, byte_count, digest)
-
-
-def _is_parser_contract_valid(
-    summary: dict[str, Any], version_id: str, source_format: str,
-    input_bytes: int, max_decompressed_bytes: int, max_output_bytes: int,
-) -> bool:
-    return (
-        summary["contract"] == "hospital-mrf-copy-v3"
-        and summary["version_id"] == version_id
-        and summary["schema_version"] == "3.0.0"
-        and summary["schema_revision"] == HOSPITAL_MRF_SCHEMA_REVISION
-        and summary["format"] == source_format
-        and summary["compressed_input_bytes"] == input_bytes
-        and type(summary["max_fanout_rows"]) is int
-        and summary["max_fanout_rows"] >= 1
-        and type(summary["max_decompressed_bytes"]) is int
-        and summary["max_decompressed_bytes"] == max_decompressed_bytes
-        and type(max_decompressed_bytes) is int
-        and max_decompressed_bytes >= 1
-        and type(summary["max_output_bytes"]) is int
-        and summary["max_output_bytes"] == max_output_bytes
-        and type(max_output_bytes) is int
-        and max_output_bytes >= 1
-        and isinstance(summary["artifacts"], list)
-        and len(summary["artifacts"]) == len(HOSPITAL_MRF_COPY_COLUMNS)
-    )
-
-
-def validate_hospital_parser_summary(
-    summary_bytes: bytes, *,
-    version_id: str,
-    source_format: str,
-    input_bytes: int,
-    output_directory: str | Path,
-    max_decompressed_bytes: int,
-    max_output_bytes: int,
-) -> HospitalParserReceipt:
-    """Validate the bounded native receipt and its private COPY paths."""
-
-    if _SHA256.fullmatch(version_id) is None:
-        raise ValueError("hospital version identity is invalid")
-    if len(summary_bytes) > 1_000_000:
-        raise ValueError("hospital parser summary is oversized")
-    try:
-        summary = json.loads(summary_bytes)
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError("hospital parser summary is invalid JSON") from exc
-    if not isinstance(summary, dict) or {
-        "contract", "version_id", "schema_version", "schema_revision", "format",
-        "compressed_input_bytes", "max_fanout_rows", "max_decompressed_bytes",
-        "max_output_bytes", "artifacts",
-    } != set(summary):
-        raise ValueError("hospital parser summary shape is invalid")
-    if not _is_parser_contract_valid(
-        summary, version_id, source_format, input_bytes,
-        max_decompressed_bytes, max_output_bytes,
-    ):
-        raise ValueError("hospital parser summary contract is invalid")
-    output = Path(output_directory).resolve()
-    artifacts = tuple(
-        _parser_artifact(raw, kind=kind, output_directory=output)
-        for kind, raw in zip(HOSPITAL_MRF_COPY_COLUMNS, summary["artifacts"])
-    )
-    if sum(artifact.bytes for artifact in artifacts) > max_output_bytes:
-        raise ValueError("hospital parser artifacts exceed their output limit")
-    digest = hashlib.sha256()
-    for artifact in artifacts:
-        digest.update(
-            f"{artifact.kind}\0{artifact.rows}\0{artifact.sha256}\n".encode("ascii")
-        )
-    return HospitalParserReceipt(
-        version_id=version_id,
-        source_format=source_format.replace("-", "_"),
-        semantic_sha256=digest.hexdigest(),
-        max_fanout_rows=summary["max_fanout_rows"],
-        max_decompressed_bytes=summary["max_decompressed_bytes"],
-        max_output_bytes=max_output_bytes,
-        artifacts=artifacts,
-    )

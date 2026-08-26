@@ -8,6 +8,7 @@ import asyncio
 import os
 import shutil
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Sequence
 
 from process.control_cancel import raise_if_cancelled
@@ -21,6 +22,25 @@ from process.hospital_price_store import renew_attempt_leases
 from process.hospital_price_native import HOSPITAL_MRF_MAX_DECOMPRESSED_BYTES_ENV
 from process.live_progress import enqueue_live_progress
 from process.ptg_parts.artifacts import PTG2ArtifactStore
+
+
+HOSPITAL_MRF_SELECTOR_KEY_MEMORY_BYTES = 256 * 1024**2
+HOSPITAL_MRF_PARSER_BASE_MEMORY_BYTES = 256 * 1024**2
+DEFAULT_FETCH_CONCURRENCY = 8
+DEFAULT_LOAD_CONCURRENCY = 2
+HOSPITAL_PRICE_ARTIFACT_DIR_ENV = "HLTHPRT_HOSPITAL_PRICE_ARTIFACT_DIR"
+
+
+def hospital_price_artifact_store() -> PTG2ArtifactStore:
+    """Open the dedicated shared hospital-price artifact volume."""
+
+    raw_root = os.getenv(HOSPITAL_PRICE_ARTIFACT_DIR_ENV, "").strip()
+    root = Path(raw_root)
+    if not raw_root or not root.is_absolute():
+        raise RuntimeError(
+            f"{HOSPITAL_PRICE_ARTIFACT_DIR_ENV} must be an absolute path"
+        )
+    return PTG2ArtifactStore(root)
 
 
 def strict_positive_env(name: str, default: int | None = None) -> int:
@@ -57,16 +77,64 @@ def resource_limits(
     active_scratch = strict_positive_env(
         "HLTHPRT_HOSPITAL_PRICE_ACTIVE_SCRATCH_BYTES"
     )
+    active_memory = strict_positive_env(
+        "HLTHPRT_HOSPITAL_PRICE_ACTIVE_MEMORY_BYTES"
+    )
+    database_growth = strict_positive_env(
+        "HLTHPRT_HOSPITAL_PRICE_DATABASE_GROWTH_BYTES"
+    )
     minimum_free = strict_positive_env("HLTHPRT_HOSPITAL_PRICE_MIN_FREE_BYTES")
     fetches = min(requested_fetches, active_raw // max_raw)
-    loads = min(requested_loads, active_scratch // max_output)
-    if fetches < 1 or loads < 1:
-        raise RuntimeError("hospital price byte budgets cannot admit one source")
-    required_free = active_raw + active_scratch + minimum_free
-    require_disk_capacity(
-        store, required_free + locator_count * MAX_HOSPITAL_HPT_LOCATOR_BYTES
+    # Retained output is capped at max_output; selector sort scratch is capped at
+    # another max_output. Reserve parser buffers plus its bounded selector keys.
+    packed_peak = 2 * max_output
+    parser_memory = HOSPITAL_MRF_PARSER_BASE_MEMORY_BYTES + min(
+        max_output, HOSPITAL_MRF_SELECTOR_KEY_MEMORY_BYTES
     )
-    return fetches, loads, max_raw, max_decompressed, max_output, required_free
+    loads = min(
+        requested_loads,
+        active_scratch // packed_peak,
+        active_memory // parser_memory,
+    )
+    if fetches < 1 or loads < 1:
+        raise RuntimeError(
+            "hospital price byte and memory budgets cannot admit one source"
+        )
+    # DEV preflight verifies that the artifact and database paths share one
+    # capacity domain. Database growth is a one-time admission reserve; workers
+    # retain only the operating floor as committed data consumes that reserve.
+    operating_free = (
+        active_raw
+        + active_scratch
+        + packed_peak * loads
+        + minimum_free
+    )
+    require_disk_capacity(
+        store,
+        operating_free
+        + database_growth
+        + locator_count * MAX_HOSPITAL_HPT_LOCATOR_BYTES,
+    )
+    return fetches, loads, max_raw, max_decompressed, max_output, operating_free
+
+
+def configured_resource_limits(
+    store: PTG2ArtifactStore, locator_count: int
+) -> tuple[int, int, int, int, int, int]:
+    """Apply the configured hospital worker counts to the shared capacity gate."""
+
+    return resource_limits(
+        store,
+        positive_env(
+            "HLTHPRT_HOSPITAL_PRICE_FETCH_CONCURRENCY",
+            DEFAULT_FETCH_CONCURRENCY,
+        ),
+        positive_env(
+            "HLTHPRT_HOSPITAL_PRICE_LOAD_CONCURRENCY",
+            DEFAULT_LOAD_CONCURRENCY,
+        ),
+        locator_count,
+    )
 
 
 def require_disk_capacity(store: PTG2ArtifactStore, required_free: int) -> None:

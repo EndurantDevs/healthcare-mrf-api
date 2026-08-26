@@ -4,6 +4,7 @@ fn parse_json<R: Read>(
     max_fanout_rows: usize,
     outputs: &mut CopyOutputs,
 ) -> io::Result<()> {
+    let _retained_budget = JsonRetainedBudget::new();
     let mut json_reader = JsonStreamReader::new(reader);
     let mut seen = BTreeSet::new();
     let mut hospital_name = None;
@@ -23,36 +24,42 @@ fn parse_json<R: Read>(
         match json_reader.next_name().map_err(to_io_error)? {
             "hospital_name" => {
                 mark_once(&mut seen, "hospital_name")?;
-                hospital_name = Some(json_reader.next_string().map_err(to_io_error)?);
+                let value: JsonRetainedString =
+                    json_reader.deserialize_next().map_err(to_io_error)?;
+                hospital_name = Some(value.0);
             }
             "last_updated_on" => {
                 mark_once(&mut seen, "last_updated_on")?;
-                last_updated_on = Some(json_reader.next_string().map_err(to_io_error)?);
+                let value: JsonRetainedString =
+                    json_reader.deserialize_next().map_err(to_io_error)?;
+                last_updated_on = Some(value.0);
             }
             "version" => {
                 mark_once(&mut seen, "version")?;
-                version = Some(json_reader.next_string().map_err(to_io_error)?);
+                let value: JsonRetainedString =
+                    json_reader.deserialize_next().map_err(to_io_error)?;
+                version = Some(value.0);
             }
             "location_name" => {
                 mark_once(&mut seen, "location_name")?;
-                let values: FanoutVec<String> =
+                let values: FanoutVec<JsonRetainedString> =
                     with_json_fanout_budget(max_fanout_rows, || json_reader.deserialize_next())
                         .map_err(to_io_error)?;
-                location_names = Some(values.0);
+                location_names = Some(values.0.into_iter().map(|value| value.0).collect());
             }
             "hospital_address" => {
                 mark_once(&mut seen, "hospital_address")?;
-                let values: FanoutVec<String> =
+                let values: FanoutVec<JsonRetainedString> =
                     with_json_fanout_budget(max_fanout_rows, || json_reader.deserialize_next())
                         .map_err(to_io_error)?;
-                hospital_addresses = Some(values.0);
+                hospital_addresses = Some(values.0.into_iter().map(|value| value.0).collect());
             }
             "type_2_npi" => {
                 mark_once(&mut seen, "type_2_npi")?;
-                let values: FanoutVec<String> =
+                let values: FanoutVec<JsonRetainedString> =
                     with_json_fanout_budget(max_fanout_rows, || json_reader.deserialize_next())
                         .map_err(to_io_error)?;
-                type_2_npis = Some(values.0);
+                type_2_npis = Some(values.0.into_iter().map(|value| value.0).collect());
             }
             "license_information" => {
                 mark_once(&mut seen, "license_information")?;
@@ -64,16 +71,20 @@ fn parse_json<R: Read>(
             }
             "financial_aid_policy" => {
                 mark_once(&mut seen, "financial_aid_policy")?;
-                financial_aid_policy = Some(json_reader.next_string().map_err(to_io_error)?);
+                let value: JsonRetainedString =
+                    json_reader.deserialize_next().map_err(to_io_error)?;
+                financial_aid_policy = Some(value.0);
             }
             "general_contract_provisions" => {
                 mark_once(&mut seen, "general_contract_provisions")?;
                 json_reader.begin_array().map_err(to_io_error)?;
                 let mut ordinal = 0u64;
                 while json_reader.has_next().map_err(to_io_error)? {
-                    let provision: ContractProvision =
-                        json_reader.deserialize_next().map_err(to_io_error)?;
-                    emit_contract_provision(outputs, version_id, ordinal, provision)?;
+                    with_json_retained_budget(|| -> io::Result<()> {
+                        let provision: ContractProvision =
+                            json_reader.deserialize_next().map_err(to_io_error)?;
+                        emit_contract_provision(outputs, version_id, ordinal, provision)
+                    })?;
                     ordinal = ordinal.saturating_add(1);
                 }
                 json_reader.end_array().map_err(to_io_error)?;
@@ -83,10 +94,11 @@ fn parse_json<R: Read>(
                 json_reader.begin_array().map_err(to_io_error)?;
                 let mut count = 0u64;
                 while json_reader.has_next().map_err(to_io_error)? {
-                    let service: JsonService =
-                        with_json_fanout_budget(max_fanout_rows, || json_reader.deserialize_next())
-                            .map_err(to_io_error)?;
-                    emit_json_service(outputs, version_id, count, service)?;
+                    with_json_service_budgets(max_fanout_rows, || -> io::Result<()> {
+                        let service: JsonService =
+                            json_reader.deserialize_next().map_err(to_io_error)?;
+                        emit_json_service(outputs, version_id, count, service)
+                    })?;
                     count = count.saturating_add(1);
                 }
                 json_reader.end_array().map_err(to_io_error)?;
@@ -102,10 +114,14 @@ fn parse_json<R: Read>(
                 json_reader.begin_array().map_err(to_io_error)?;
                 let mut count = 0u64;
                 while json_reader.has_next().map_err(to_io_error)? {
-                    let modifier: JsonModifier =
-                        with_json_fanout_budget(max_fanout_rows, || json_reader.deserialize_next())
-                            .map_err(to_io_error)?;
-                    emit_json_modifier(outputs, version_id, count, modifier)?;
+                    with_json_retained_budget(|| -> io::Result<()> {
+                        let modifier: JsonModifier = with_json_fanout_budget(
+                            max_fanout_rows,
+                            || json_reader.deserialize_next(),
+                        )
+                        .map_err(to_io_error)?;
+                        emit_json_modifier(outputs, version_id, count, modifier)
+                    })?;
                     count = count.saturating_add(1);
                 }
                 json_reader.end_array().map_err(to_io_error)?;
@@ -235,7 +251,7 @@ fn emit_json_service(
                     "modifier_code must contain at least one value when present",
                 ));
             }
-            Some(codes) => codes.0,
+            Some(codes) => codes.0.into_iter().map(|code| code.0).collect(),
             None => Vec::new(),
         };
         let generic_notes = additional_generic_notes.as_deref().and_then(optional_text);

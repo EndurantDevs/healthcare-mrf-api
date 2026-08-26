@@ -28,12 +28,15 @@ include!("hospital_mrf/zip_input.rs");
 include!("hospital_mrf/resource_limits.rs");
 include!("hospital_mrf/import_and_values.rs");
 include!("hospital_mrf/rows_and_metadata.rs");
+include!("hospital_mrf/json_code_budget.rs");
 include!("hospital_mrf/validation_and_json_types.rs");
+include!("hospital_mrf/json_value_types.rs");
 include!("hospital_mrf/json_and_csv_types.rs");
 include!("hospital_mrf/csv_headers.rs");
 include!("hospital_mrf/csv_columns.rs");
 include!("hospital_mrf/csv_rows.rs");
 include!("hospital_mrf/csv_stream.rs");
+include!("hospital_mrf/packed_output.rs");
 
 #[cfg(test)]
 mod tests {
@@ -41,4 +44,5 @@ mod tests {
     include!("hospital_mrf/tests_import.rs");
     include!("hospital_mrf/tests_validation.rs");
     include!("hospital_mrf/tests_limits.rs");
+    include!("hospital_mrf/tests_packed.rs");
 }

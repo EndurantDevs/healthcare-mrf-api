@@ -13,6 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from process.ptg_parts.canonical import canonicalize_url
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -32,6 +34,7 @@ class Attempt:
     source_url: str
     expected_generation: int
     locator_name: str | None = None
+    locator_url: str | None = None
     final_source_url: str | None = None
     source_http_status: int | None = None
 
@@ -43,6 +46,7 @@ class DownloadedSource:
     attempts: tuple[Attempt, ...]
     error_code: str | None = None
     error_detail: str | None = None
+    auth_refresh_required: bool = False
 
 
 class ArtifactStore:
@@ -89,6 +93,7 @@ def _acquisition_module(noop: Any) -> types.ModuleType:
         REGISTRY_VERSION=1,
         Attempt=Attempt,
         Candidate=object,
+        canonicalize_url=canonicalize_url,
         MAX_HOSPITAL_HPT_LOCATOR_BYTES=1_000_000,
         PTG2_DEFAULT_MAX_BYTES=64 * 1024**3,
         DownloadedSource=DownloadedSource,
@@ -126,8 +131,10 @@ def _replacement_modules(noop: Any, lease_context: Any) -> dict[str, types.Modul
         ),
         "process.hospital_price_store": _module(
             "process.hospital_price_store", admit_attempts=noop,
-            fail_attempts=noop, has_existing_version=noop, publish_existing=noop,
-            renew_attempt_leases=noop, stage_content=noop,
+            fail_attempts=noop, garbage_collect_superseded_versions=noop,
+            has_existing_version=noop, publish_existing=noop,
+            rebind_attempt_sources=noop, renew_attempt_leases=noop,
+            stage_content=noop,
         ),
         "process.live_progress": _module(
             "process.live_progress", enqueue_live_progress=lambda **_kwargs: None
@@ -185,6 +192,7 @@ def orchestrator_module() -> Any:
     sys.modules[orchestrator_name] = orchestrator
     try:
         orchestrator_spec.loader.exec_module(orchestrator)
+        orchestrator._hospital_price_artifact_store = lambda: ArtifactStore()
         return orchestrator
     finally:
         for module_name, prior_module in prior_module_by_name.items():

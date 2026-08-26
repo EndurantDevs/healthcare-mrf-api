@@ -1,0 +1,267 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+"""Source-download and native-runner proof for hospital-price acquisition."""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from tests.hospital_price_control_support import (
+    acquisition_module as _acquisition_module,
+)
+
+
+class _ExpiredPermissionError(PermissionError):
+    status = 403
+
+
+class _ServerError(Exception):
+    def __init__(self, status: int) -> None:
+        super().__init__(str(status))
+        self.status = status
+
+
+@pytest.mark.asyncio
+async def test_source_download_updates_shared_attempts_and_reports_errors(monkeypatch):
+    acquisition = _acquisition_module()
+    attempt = acquisition.Attempt("attempt", "a", "Hospital A", "https://a/mrf", 1)
+    raw = SimpleNamespace(head=SimpleNamespace(url="https://a/final", status=200))
+    download_options: list[dict[str, Any]] = []
+
+    async def download(*_args, **kwargs):
+        download_options.append(dict(kwargs))
+        return raw
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", download)
+    downloaded_source = await acquisition.download_source(
+        ("https://a/mrf", (attempt,)), object(), 1024
+    )
+    assert downloaded_source.raw is raw
+    assert (attempt.final_source_url, attempt.source_http_status) == (
+        "https://a/final", 200,
+    )
+    assert download_options[0]["reuse_raw_artifacts"] is False
+    assert download_options[0]["max_bytes"] == 1024
+    assert download_options[0]["keep_partial_artifacts"] is False
+    raw.head = None
+    unchanged = await acquisition.download_source(
+        ("https://a/mrf", (attempt,)), object(), 1024
+    )
+    assert unchanged.raw is raw
+    assert (attempt.final_source_url, attempt.source_http_status) == (None, None)
+
+    async def fail(*_args, **_kwargs):
+        raise ValueError("failed")
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", fail)
+    failed = await acquisition.download_source(
+        ("https://a/mrf", (attempt,)), object(), 1024
+    )
+    assert (failed.raw, failed.error_code) == (None, "value")
+
+    async def cancel(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition.download_source(("https://a/mrf", (attempt,)), object(), 1024)
+
+
+@pytest.mark.asyncio
+async def test_source_download_marks_expired_authorization_and_exact_retry(monkeypatch):
+    acquisition = _acquisition_module()
+    expired_attempt = acquisition.Attempt(
+        "expired", "a", "Hospital A", "https://a/mrf?sig=expired", 1
+    )
+
+    async def expired(*_args, **_kwargs):
+        raise _ExpiredPermissionError("expired")
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", expired)
+    expired_source = await acquisition.download_source(
+        (expired_attempt.source_url, (expired_attempt,)), object(), 1024
+    )
+    assert expired_source.auth_refresh_required is True
+    assert (expired_attempt.final_source_url, expired_attempt.source_http_status) == (
+        expired_attempt.source_url, 403,
+    )
+
+    exact_requests: list[str] = []
+
+    async def exact_expired(url, **_kwargs):
+        exact_requests.append(url)
+        raise _ExpiredPermissionError("expired")
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", exact_expired)
+    await acquisition.download_source(
+        ("https://a/mrf?sig=refreshed", (expired_attempt,)),
+        object(), 1024, exact_url_only=True,
+    )
+    assert exact_requests == ["https://a/mrf?sig=refreshed"]
+
+
+@pytest.mark.asyncio
+async def test_source_download_refresh_requires_only_authorization_failures(monkeypatch):
+    acquisition = _acquisition_module()
+    expired_attempt = acquisition.Attempt(
+        "expired", "a", "Hospital A", "https://a/mrf?sig=expired", 1
+    )
+    mixed_attempt = acquisition.Attempt(
+        "mixed", "b", "Hospital B", "https://a/mrf?sig=other", 1
+    )
+
+    async def mixed_status(url, **_kwargs):
+        raise _ServerError(403 if url == expired_attempt.source_url else 500)
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", mixed_status)
+    mixed_failure = await acquisition.download_source(
+        (expired_attempt.source_url, (expired_attempt, mixed_attempt)), object(), 1024
+    )
+    assert mixed_failure.auth_refresh_required is False
+
+
+@pytest.mark.asyncio
+async def test_source_download_tries_distinct_exact_url_variants(monkeypatch):
+    acquisition = _acquisition_module()
+    stale_attempt = acquisition.Attempt(
+        "stale", "a", "Hospital A", "https://a/mrf?sig=stale", 1
+    )
+    fresh_attempt = acquisition.Attempt(
+        "fresh", "b", "Hospital B", "https://a/mrf?sig=fresh", 1
+    )
+    raw = SimpleNamespace(head=None)
+    requested_urls: list[str] = []
+
+    async def stale_then_fresh(url, **_kwargs):
+        requested_urls.append(url)
+        if url == stale_attempt.source_url:
+            raise ValueError("expired")
+        return raw
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", stale_then_fresh)
+    recovered = await acquisition.download_source(
+        (stale_attempt.source_url, (stale_attempt, fresh_attempt)), object(), 1024
+    )
+    assert recovered.raw is raw
+    assert requested_urls == [stale_attempt.source_url, fresh_attempt.source_url]
+
+
+@pytest.mark.asyncio
+async def test_native_runner_rejects_debug_binary(tmp_path, monkeypatch):
+    acquisition = _acquisition_module()
+    monkeypatch.setattr(
+        acquisition, "_ptg2_rust_scanner_binary",
+        lambda: tmp_path / "debug" / "ptg2_scanner",
+    )
+    monkeypatch.setattr(
+        acquisition, "_ptg2_scanner_binary_profile", lambda _path: "debug"
+    )
+
+    with pytest.raises(RuntimeError, match="release Rust parser"):
+        await acquisition.run_native_parser(
+            tmp_path / "input.json", tmp_path / "output", "a" * 64,
+            "json", 1, 2048, 1024,
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_runner_drains_cleanup_after_repeated_cancel(
+    tmp_path, monkeypatch
+):
+    acquisition = _acquisition_module()
+    communicate_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    class Process:
+        returncode = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            communicate_started.set()
+            await asyncio.Future()
+            raise AssertionError("cancelled parser communication returned")
+
+    process = Process()
+
+    async def spawn(*_args: Any, **_kwargs: Any) -> Process:
+        return process
+
+    async def terminate(_process: Process) -> None:
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        cleanup_finished.set()
+
+    binary = tmp_path / "release" / "ptg2_scanner"
+    monkeypatch.setattr(acquisition, "_ptg2_rust_scanner_binary", lambda: binary)
+    monkeypatch.setattr(
+        acquisition, "_ptg2_scanner_binary_profile", lambda _path: "release"
+    )
+    monkeypatch.setattr(acquisition.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(acquisition, "_terminate_asyncio_subprocess_group", terminate)
+    operation = asyncio.create_task(acquisition.run_native_parser(
+        tmp_path / "input.json", tmp_path / "output", "a" * 64,
+        "json", 1, 2048, 1024,
+    ))
+    await asyncio.wait_for(communicate_started.wait(), timeout=1)
+
+    operation.cancel()
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    operation.cancel()
+    await asyncio.sleep(0)
+    assert not operation.done()
+    allow_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    assert cleanup_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_native_runner_passes_and_validates_exact_output_cap(
+    tmp_path, monkeypatch
+):
+    acquisition = _acquisition_module()
+    call_by_name: dict[str, Any] = {}
+    expected_receipt = object()
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"{}", b""
+
+    async def spawn(*args: Any, **kwargs: Any) -> Process:
+        call_by_name["args"] = args
+        call_by_name["kwargs"] = kwargs
+        return Process()
+
+    def validate(summary_bytes: bytes, **kwargs: Any) -> object:
+        call_by_name["summary_bytes"] = summary_bytes
+        call_by_name["validation"] = kwargs
+        call_by_name["validation_thread"] = threading.get_ident()
+        return expected_receipt
+
+    binary = tmp_path / "release" / "ptg2_scanner"
+    monkeypatch.setattr(acquisition, "_ptg2_rust_scanner_binary", lambda: binary)
+    monkeypatch.setattr(
+        acquisition, "_ptg2_scanner_binary_profile", lambda _path: "release"
+    )
+    monkeypatch.setattr(acquisition.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(acquisition, "validate_hospital_parser_summary", validate)
+
+    event_loop_thread = threading.get_ident()
+    receipt = await acquisition.run_native_parser(
+        tmp_path / "input.json", tmp_path / "output", "a" * 64,
+        "json", 123, 8192, 4096,
+    )
+
+    assert receipt is expected_receipt
+    assert call_by_name["args"][-3:] == ("8192", "4096", "packed")
+    assert call_by_name["validation"]["max_decompressed_bytes"] == 8192
+    assert call_by_name["validation"]["max_output_bytes"] == 4096
+    assert call_by_name["validation_thread"] != event_loop_thread

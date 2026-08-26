@@ -50,6 +50,11 @@ def store_module() -> tuple[Any, Any]:
         "process/hospital_price_store_copy.py",
         replacement_by_name,
     )
+    replacement_by_name["process.hospital_price_attempt_store"] = _load_path(
+        "process.hospital_price_attempt_store",
+        "process/hospital_price_attempt_store.py",
+        replacement_by_name,
+    )
     return (
         _load_path(
             "hospital_price_store_control_test",

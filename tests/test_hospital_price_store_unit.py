@@ -63,25 +63,38 @@ class _Connection:
         return self.all_rows.pop(0) if self.all_rows else []
 
 
-def _receipt(store: Any, directory: Path, *, rows: int = 1) -> Any:
+def _receipt(native: Any, directory: Path, *, row_count: int = 1) -> Any:
     directory.mkdir(parents=True, exist_ok=True)
     artifacts = []
-    for kind in store.HOSPITAL_MRF_COPY_COLUMNS:
-        payload = f"{kind}\n".encode()
+    for kind in native.HOSPITAL_MRF_COPY_COLUMNS:
+        artifact_bytes = f"{kind}\n".encode()
         path = directory / f"{kind}.copy"
-        path.write_bytes(payload)
+        path.write_bytes(artifact_bytes)
         artifacts.append(SimpleNamespace(
             kind=kind,
             path=path,
-            rows=rows,
-            bytes=len(payload),
-            sha256=hashlib.sha256(payload).hexdigest(),
+            rows=row_count,
+            bytes=len(artifact_bytes),
+            sha256=hashlib.sha256(artifact_bytes).hexdigest(),
         ))
     return SimpleNamespace(
         version_id="a" * 64,
         source_format="json",
         semantic_sha256="b" * 64,
         artifacts=tuple(artifacts),
+        root=SimpleNamespace(
+            service_count=1,
+            charge_count=1,
+            fact_count=1,
+            code_selector_key_count=1,
+            payer_plan_selector_key_count=1,
+            code_selector_ref_count=1,
+            payer_plan_selector_ref_count=1,
+            service_block_count=row_count,
+            fact_block_count=row_count,
+            code_selector_page_count=row_count,
+            payer_plan_selector_page_count=0,
+        ),
     )
 
 
@@ -138,9 +151,45 @@ async def test_fail_attempts_copies_bounded_final_evidence() -> None:
 
 
 @pytest.mark.asyncio
+async def test_refreshed_source_rebind_is_atomic_and_provenance_bound() -> None:
+    """Persist the exact fresh locator observation before retrying its source."""
+
+    store, _native = _store_module()
+    await store.rebind_attempt_sources(())
+    connection = _Connection(all_rows=[[('attempt-a',)]])
+    store.db.acquire = _acquire(connection)
+    attempt = SimpleNamespace(attempt_id="attempt-a", hospital_id="hospital-a")
+    candidate = SimpleNamespace(
+        hospital_id="hospital-a",
+        locator_id="locator-a",
+        observation_id="observation-fresh",
+        source_url="https://hospital.example/prices.json?sig=fresh",
+    )
+    with pytest.raises(ValueError, match="binding is invalid"):
+        await store.rebind_attempt_sources(((
+            attempt, SimpleNamespace(**{**vars(candidate), "hospital_id": "other"})
+        ),))
+
+    await store.rebind_attempt_sources(((attempt, candidate),))
+
+    assert connection.driver.records == [(
+        "attempt-a", "hospital-a", "locator-a", "observation-fresh",
+        candidate.source_url,
+    )]
+    update_sql = connection.statements[-1]
+    assert "locator_observation_id=staged.observation_id" in update_sql
+    assert "requested_source_url=staged.source_url" in update_sql
+    assert "attempt.status='running'" in update_sql
+
+    connection.all_rows = [[]]
+    with pytest.raises(RuntimeError, match="changed before source retry"):
+        await store.rebind_attempt_sources(((attempt, candidate),))
+
+
+@pytest.mark.asyncio
 async def test_copy_and_stage_validation_reject_drift(tmp_path: Path) -> None:
     store, _native = _store_module()
-    receipt = _receipt(store, tmp_path)
+    receipt = _receipt(_native, tmp_path)
     stage_by_kind = {
         artifact.kind: f"stage_{artifact.kind}" for artifact in receipt.artifacts
     }
@@ -148,7 +197,7 @@ async def test_copy_and_stage_validation_reject_drift(tmp_path: Path) -> None:
     with pytest.raises(NotImplementedError, match="text COPY"):
         await store.copy_stages(no_copy, receipt, stage_by_kind, "mrf")
 
-    drifted = _receipt(store, tmp_path / "drift")
+    drifted = _receipt(_native, tmp_path / "drift")
     drifted.artifacts[0].sha256 = "0" * 64
     with pytest.raises(RuntimeError, match="COPY changed"):
         await store.copy_stages(_Connection(), drifted, stage_by_kind, "mrf")
@@ -159,14 +208,14 @@ async def test_copy_and_stage_validation_reject_drift(tmp_path: Path) -> None:
     )
     await store.validate_stages(good, receipt, stage_by_kind)
     assert sum("CREATE UNIQUE INDEX" in sql for sql in good.statements) == len(
-        receipt.artifacts
+        _native.HOSPITAL_MRF_TEXT_COPY_COLUMNS
     )
 
     bad_count = _Connection(firsts=[(0, 0)])
     with pytest.raises(RuntimeError, match="staging count"):
         await store.validate_stages(bad_count, receipt, stage_by_kind)
 
-    two_headers = _receipt(store, tmp_path / "headers", rows=2)
+    two_headers = _receipt(_native, tmp_path / "headers", row_count=2)
     with pytest.raises(RuntimeError, match="one MRF header"):
         await store.validate_stages(
             _Connection(firsts=[(2, 0)]), two_headers, stage_by_kind
@@ -181,9 +230,12 @@ async def test_copy_and_stage_validation_reject_drift(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_content_version_children_and_count_invariants(tmp_path: Path) -> None:
+async def test_content_version_children_and_count_invariants(
+    tmp_path: Path, monkeypatch
+) -> None:
     store, _native = _store_module()
-    receipt = _receipt(store, tmp_path)
+    receipt = _receipt(_native, tmp_path)
+    receipt.source_format = "csv-tall"
     stage_by_kind = {
         artifact.kind: f"stage_{artifact.kind}" for artifact in receipt.artifacts
     }
@@ -201,23 +253,31 @@ async def test_content_version_children_and_count_invariants(tmp_path: Path) -> 
         count_by_kind["location"],
         count_by_kind["npi"],
         count_by_kind["license"],
-        count_by_kind["service"],
-        count_by_kind["charge"],
-        count_by_kind["payer_charge"],
+        receipt.root.service_count,
+        receipt.root.charge_count,
+        receipt.root.fact_count,
     )
-    await store._insert_version(
+    await store._has_inserted_version(
         _Connection(firsts=[expected_version]), receipt, stage_by_kind, "c" * 64
     )
     with pytest.raises(RuntimeError, match="stored projection"):
-        await store._insert_version(
+        await store._has_inserted_version(
             _Connection(firsts=[None]), receipt, stage_by_kind, "c" * 64
         )
 
     children = _Connection()
     await store._insert_children(children, stage_by_kind)
-    assert len(children.statements) == len(receipt.artifacts) - 1
+    assert len(children.statements) == len(store._CHILDREN)
 
-    stored_counts = [(artifact.kind, artifact.rows) for artifact in receipt.artifacts]
+    async def packed_valid(*_args: Any) -> None:
+        return None
+
+    monkeypatch.setattr(store, "validate_packed_storage", packed_valid)
+    stored_counts = [
+        (artifact.kind, artifact.rows)
+        for artifact in receipt.artifacts
+        if artifact.kind in _native.HOSPITAL_MRF_TEXT_COPY_COLUMNS
+    ]
     await store._validate_stored_counts(
         _Connection(all_rows=[stored_counts]), receipt
     )
@@ -332,7 +392,12 @@ async def test_existing_version_and_publication_paths(monkeypatch) -> None:
         store.HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
         7,
     )
-    stored_versions = [None, ("wrong", "contract", 1), expected]
+    stored_versions = [
+        None,
+        ("wrong", "contract", 1),
+        (*expected, False, True),
+        (*expected, True, True),
+    ]
 
     async def first(*_args: Any, **_kwargs: Any) -> Any:
         return stored_versions.pop(0)
@@ -340,6 +405,8 @@ async def test_existing_version_and_publication_paths(monkeypatch) -> None:
     store.db.first = first
     assert not await store.has_existing_version("v", "c" * 64, 7)
     with pytest.raises(RuntimeError, match="conflicts with source"):
+        await store.has_existing_version("v", "c" * 64, 7)
+    with pytest.raises(RuntimeError, match="packed version is incomplete"):
         await store.has_existing_version("v", "c" * 64, 7)
     assert await store.has_existing_version("v", "c" * 64, 7)
 
@@ -374,11 +441,20 @@ async def test_stage_content_runs_one_transactional_pipeline(monkeypatch) -> Non
         "_copy_stages",
         "_validate_stages",
         "_insert_content",
-        "_insert_version",
         "_insert_children",
+        "_insert_packed_root",
+        "copy_packed_blocks",
         "_validate_stored_counts",
     ):
         monkeypatch.setattr(store, name, record(name))
+
+    inserted_outcomes = [True, False]
+
+    async def has_inserted_version(*_args: Any) -> bool:
+        calls.append("_has_inserted_version")
+        return inserted_outcomes.pop(0)
+
+    monkeypatch.setattr(store, "_has_inserted_version", has_inserted_version)
     raw = SimpleNamespace(
         raw_sha256="c" * 64,
         byte_count=7,
@@ -391,8 +467,20 @@ async def test_stage_content_runs_one_transactional_pipeline(monkeypatch) -> Non
         "_copy_stages",
         "_validate_stages",
         "_insert_content",
-        "_insert_version",
+        "_has_inserted_version",
         "_insert_children",
+        "_insert_packed_root",
+        "copy_packed_blocks",
+        "_validate_stored_counts",
+    ]
+
+    calls.clear()
+    await store.stage_content(SimpleNamespace(), raw)
+    assert calls == [
+        "_copy_stages",
+        "_validate_stages",
+        "_insert_content",
+        "_has_inserted_version",
         "_validate_stored_counts",
     ]
 

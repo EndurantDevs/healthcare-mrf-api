@@ -274,6 +274,31 @@ fn production_binary_imports_json_tall_wide_gzip_and_one_member_zip() {
     let temporary = tempfile::tempdir().unwrap();
     let json = json_fixture();
     let expected = run_case(temporary.path(), "json", "json", "json", &json);
+    let packed_output = temporary.path().join("packed");
+    fs::create_dir(&packed_output).unwrap();
+    let packed = Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
+        .args([
+            "--hospital-mrf-copy",
+            "json",
+            VERSION_ID,
+            temporary.path().join("json.json").to_str().unwrap(),
+            packed_output.to_str().unwrap(),
+            "2097152",
+            "1048576",
+            "packed",
+        ])
+        .env("HLTHPRT_HOSPITAL_MRF_MAX_FANOUT_ROWS", "128")
+        .output()
+        .unwrap();
+    assert!(
+        packed.status.success(),
+        "packed import failed: {}",
+        String::from_utf8_lossy(&packed.stderr)
+    );
+    let packed_summary: serde_json::Value = serde_json::from_slice(&packed.stdout).unwrap();
+    assert_eq!(packed_summary["contract"], "hospital-mrf-copy-v3-packed-v1");
+    assert_eq!(packed_summary["artifacts"].as_array().unwrap().len(), 10);
+    assert_eq!(packed_summary["root"]["fact_count"], 1);
     let tall = run_case(
         temporary.path(),
         "tall",
