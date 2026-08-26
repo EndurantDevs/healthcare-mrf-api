@@ -16,12 +16,12 @@ from process.ptg_parts import ptg2_v4_finalizer_range_reader as range_reader
 from process.ptg_parts import ptg2_v4_failed_layout_state as failed_state
 from process.ptg_parts import ptg2_v4_snapshot_maps as snapshot_maps
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
-from process.ptg_parts.ptg2_v4_finalizer_maps import (
-    PTG2_V4_FINALIZER_MAP_CONTRACT,
-    PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS,
-    FinalizerMapError,
-)
+from process.ptg_parts.ptg2_v4_finalizer_maps import FinalizerMapError
 from tests.ptg2_shared_gc_test_support import _Executor
+from tests.ptg2_packed_finalizer_lifecycle_support import (
+    finalizer_manifest as _finalizer_manifest,
+    finalizer_root_fields as _finalizer_root_fields,
+)
 from tests.ptg2_v4_orchestration_support import _v4_reuse_manifest, ptg
 from tests.test_ptg2_v4_finalizer_maps import (
     _Rows,
@@ -29,55 +29,6 @@ from tests.test_ptg2_v4_finalizer_maps import (
     _packed_fixture,
     _root_row,
 )
-
-
-def _finalizer_manifest() -> dict[str, object]:
-    return {
-        "contract": PTG2_V4_FINALIZER_MAP_CONTRACT,
-        "map_format": snapshot_maps.PTG2_V4_MAP_FORMAT,
-        "map_digest": (b"d" * 32).hex(),
-        "object_kinds": list(PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS),
-        "object_kind_count": 6,
-        "map_pack_count": 6,
-        "coordinate_count": 6,
-        "entry_count": 9,
-        "logical_byte_count": 12,
-        "stored_map_byte_count": 600,
-        "target_block_count": 6,
-        "canonical_mapping_digest": (b"c" * 32).hex(),
-        "canonical_byte_count": 640,
-        "target_identity_digest": (b"t" * 32).hex(),
-    }
-
-
-def _finalizer_root_fields() -> dict[str, object]:
-    manifest = _finalizer_manifest()
-    return {
-        "state": "sealed",
-        "generation": snapshot_maps.PTG2_V4_SHARED_GENERATION,
-        "finalizer_root_present": True,
-        "finalizer_root_state": "complete",
-        "finalizer_root_contract": PTG2_V4_FINALIZER_MAP_CONTRACT,
-        "finalizer_root_map_format": snapshot_maps.PTG2_V4_MAP_FORMAT,
-        "finalizer_root_map_digest": b"d" * 32,
-        "finalizer_root_canonical_mapping_digest": b"c" * 32,
-        "finalizer_root_canonical_byte_count": 640,
-        "finalizer_root_target_identity_digest": b"t" * 32,
-        "finalizer_root_completed_at": object(),
-        "finalizer_relational_mapping_present": False,
-        **{
-            f"finalizer_root_{field_name}": manifest[field_name]
-            for field_name in (
-                "object_kind_count",
-                "map_pack_count",
-                "coordinate_count",
-                "entry_count",
-                "logical_byte_count",
-                "stored_map_byte_count",
-                "target_block_count",
-            )
-        },
-    }
 
 
 @pytest.mark.asyncio

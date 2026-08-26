@@ -7,7 +7,6 @@ import hashlib
 import json
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,7 +26,6 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import PTG2_V4_SHARED_GENERATION
 from scripts.research import ptg2_packed_finalizer_abba_artifacts as artifact_factory
 from scripts.research.ptg2_packed_finalizer_abba_contract import BenchmarkArtifacts
 from scripts.research.ptg2_packed_finalizer_abba_lifecycle import (
-    ArmRequest,
     inspect_arm_state,
     is_arm_schema_removed,
     prepare_arm_schema,
@@ -35,6 +33,7 @@ from scripts.research.ptg2_packed_finalizer_abba_lifecycle import (
     run_production_arm,
 )
 from tests.ptg2_v4_stale_metadata_postgres_support import postgres_dsn
+from tests.ptg2_packed_finalizer_lifecycle_support import IsolationFixture
 from tests.test_ptg2_packed_finalizer_wrapper_postgres import (
     _configure_test_database,
     _tiny_shape,
@@ -42,30 +41,6 @@ from tests.test_ptg2_packed_finalizer_wrapper_postgres import (
 
 
 _TARGET_DIGEST_DOMAIN = b"PTG2V4FINALIZERTARGETS\x01"
-
-
-@dataclass(frozen=True)
-class _IsolationFixture:
-    dsn: str
-    schema_name: str
-    snapshot_key: int
-    owner_token: str
-    stale_token: str
-    owner_work: Path
-    stale_work: Path
-    owner_artifacts: BenchmarkArtifacts
-    stale_artifacts: BenchmarkArtifacts
-
-    def request(self, *, stale: bool = False) -> ArmRequest:
-        return ArmRequest(
-            "b2" if stale else "b1",
-            True,
-            self.schema_name,
-            self.snapshot_key,
-            self.stale_token if stale else self.owner_token,
-            self.stale_work if stale else self.owner_work,
-            self.stale_artifacts if stale else self.owner_artifacts,
-        )
 
 
 def _different_artifacts(directory: Path) -> BenchmarkArtifacts:
@@ -135,7 +110,7 @@ async def _isolation_fixture(monkeypatch, tmp_path):
             shape_sha256=owner_artifacts.shape.sha256(),
         )
         await _seed_prior_pointer(dsn, schema_name)
-        yield _IsolationFixture(
+        yield IsolationFixture(
             dsn,
             schema_name,
             snapshot_key,
@@ -183,7 +158,7 @@ async def _stage_fingerprint(
 
 async def _stage_pair(
     connection: asyncpg.Connection,
-    fixture: _IsolationFixture,
+    fixture: IsolationFixture,
     build_token: str,
 ) -> tuple[tuple[int, int, str], tuple[int, int, str]]:
     stage = snapshot_publish._finalizer_block_stage_name(
@@ -202,7 +177,7 @@ async def _stage_pair(
 
 async def _assert_stale_attempt_absent(
     connection: asyncpg.Connection,
-    fixture: _IsolationFixture,
+    fixture: IsolationFixture,
 ) -> None:
     stage = snapshot_publish._finalizer_block_stage_name(
         fixture.snapshot_key, fixture.stale_token
@@ -227,7 +202,7 @@ async def _assert_stale_attempt_absent(
     assert tuple(counts) == (0, 0, 0, 2, 0, 0, 2)
 
 
-async def _assert_persisted_owner(fixture: _IsolationFixture, arm) -> None:
+async def _assert_persisted_owner(fixture: IsolationFixture, arm) -> None:
     connection = await asyncpg.connect(fixture.dsn)
     schema = _quote_ident(fixture.schema_name)
     try:
@@ -258,7 +233,7 @@ async def _assert_persisted_owner(fixture: _IsolationFixture, arm) -> None:
     )
 
 
-async def _assert_api_reads_all_packed_kinds(fixture: _IsolationFixture) -> None:
+async def _assert_api_reads_all_packed_kinds(fixture: IsolationFixture) -> None:
     async with db.transaction() as session:
         for object_kind in PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS:
             blocks = await fetch_shared_blocks(
@@ -273,7 +248,7 @@ async def _assert_api_reads_all_packed_kinds(fixture: _IsolationFixture) -> None
             assert len(blocks[0]) == 1
 
 
-async def _attach_finalizer_manifest(fixture: _IsolationFixture, arm) -> None:
+async def _attach_finalizer_manifest(fixture: IsolationFixture, arm) -> None:
     publication = arm["finalizer_publication"]
     manifest_by_field = finalizer_publish.V4FinalizerMapPublication(
         object_kinds=tuple(publication["object_kinds"]),
@@ -312,7 +287,7 @@ async def _attach_finalizer_manifest(fixture: _IsolationFixture, arm) -> None:
     )
 
 
-async def _assert_recovery_preserves_prior_pointer(fixture: _IsolationFixture) -> None:
+async def _assert_recovery_preserves_prior_pointer(fixture: IsolationFixture) -> None:
     stats = await shared_gc.abandon_owned_v4_layout(
         schema_name=fixture.schema_name,
         snapshot_key=fixture.snapshot_key,

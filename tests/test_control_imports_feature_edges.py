@@ -17,12 +17,42 @@ async def test_hospital_registry_validation_runs_off_event_loop(monkeypatch):
 
     def validate(_params):
         validation_threads.append(threading.get_ident())
+        return ({"cms_hpt_url": "https://hospital.example/cms-hpt.txt"},)
+
+    def capacity(_store, locator_count):
+        validation_threads.append(threading.get_ident())
+        assert locator_count == 1
 
     monkeypatch.setattr(control_imports, "selected_hospital_hpt_registry", validate)
+    monkeypatch.setattr(control_imports, "configured_resource_limits", capacity)
 
     await control_imports._validate_hospital_price_params("hospital-prices", {})
 
-    assert validation_threads and validation_threads[0] != event_loop_thread
+    assert len(validation_threads) == 2
+    assert all(thread != event_loop_thread for thread in validation_threads)
+
+
+@pytest.mark.asyncio
+async def test_hospital_capacity_rejection_precedes_admission_and_enqueue(monkeypatch):
+    admission = AsyncMock()
+    enqueue = AsyncMock()
+    monkeypatch.setattr(control_imports, "importer_names", lambda: {"hospital-prices"})
+    monkeypatch.setattr(
+        control_imports,
+        "_validate_hospital_price_params",
+        AsyncMock(side_effect=RuntimeError("hospital capacity rejected")),
+    )
+    monkeypatch.setattr(control_imports, "_admit_import_row", admission)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+
+    with pytest.raises(RuntimeError, match="capacity rejected"):
+        await control_imports.create_import_run({
+            "importer": "hospital-prices",
+            "params": {"all_hospitals": True},
+        })
+
+    admission.assert_not_awaited()
+    enqueue.assert_not_awaited()
 
 
 def _acquisition_params() -> dict[str, object]:

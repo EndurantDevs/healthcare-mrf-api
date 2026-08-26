@@ -15,15 +15,21 @@ struct GeneralMetadata {
 
 #[derive(Clone, Debug, Deserialize)]
 struct License {
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_json_retained_string"
+    )]
     license_number: Option<String>,
+    #[serde(deserialize_with = "deserialize_json_retained_string")]
     state: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct JsonAttestation {
+    #[serde(deserialize_with = "deserialize_json_retained_string")]
     attestation: String,
     confirm_attestation: bool,
+    #[serde(deserialize_with = "deserialize_json_retained_string")]
     attester_name: String,
 }
 
@@ -55,10 +61,17 @@ struct ChargeRow {
 
 #[derive(Debug, Deserialize)]
 struct ContractProvision {
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_json_retained_string"
+    )]
     payer_name: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_json_retained_string"
+    )]
     plan_name: Option<String>,
+    #[serde(deserialize_with = "deserialize_json_retained_string")]
     provisions: String,
 }
 

@@ -21,7 +21,8 @@ fn import_zip_payload(
     max_fanout_rows: usize,
     max_decompressed_bytes: u64,
     max_output_bytes: u64,
-) -> io::Result<(u64, Vec<CopyArtifactSummary>)> {
+    output_mode: HospitalMrfOutputMode,
+) -> io::Result<(u64, HospitalMrfArtifacts)> {
     let input_bytes = input_path.metadata()?.len();
     let mut archive = zip::ZipArchive::new(File::open(input_path)?).map_err(zip_error)?;
     let mut selected = None;
@@ -77,6 +78,7 @@ fn import_zip_payload(
         max_fanout_rows,
         max_decompressed_bytes,
         max_output_bytes,
+        output_mode,
     )?;
     Ok((input_bytes, artifacts))
 }
@@ -165,9 +167,8 @@ impl<R: Read> Read for ZipPayloadReader<R> {
         }
         if self.prefix_position < self.prefix_length {
             let count = (self.prefix_length - self.prefix_position).min(buffer.len());
-            buffer[..count].copy_from_slice(
-                &self.prefix[self.prefix_position..self.prefix_position + count],
-            );
+            buffer[..count]
+                .copy_from_slice(&self.prefix[self.prefix_position..self.prefix_position + count]);
             self.prefix_position += count;
             return Ok(count);
         }

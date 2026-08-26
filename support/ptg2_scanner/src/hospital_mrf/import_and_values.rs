@@ -19,21 +19,36 @@ pub struct HospitalMrfSummary {
     max_decompressed_bytes: u64,
     max_output_bytes: u64,
     artifacts: Vec<CopyArtifactSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root: Option<PackedRootSummary>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HospitalMrfOutputMode {
+    Legacy,
+    Packed,
+}
+
+struct HospitalMrfArtifacts {
+    artifacts: Vec<CopyArtifactSummary>,
+    root: Option<PackedRootSummary>,
 }
 
 pub fn run_hospital_mrf_cli(args: &[String]) -> io::Result<()> {
-    if args.len() != 6 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: ptg2_scanner --hospital-mrf-copy <json|csv-tall|csv-wide> <version_id> <input_path> <output_directory> <max_decompressed_bytes> <max_output_bytes>",
-        ));
-    }
+    let output_mode = match args {
+        [_, _, _, _, _, _] => HospitalMrfOutputMode::Legacy,
+        [_, _, _, _, _, _, mode] if mode == "packed" => HospitalMrfOutputMode::Packed,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --hospital-mrf-copy <json|csv-tall|csv-wide> <version_id> <input_path> <output_directory> <max_decompressed_bytes> <max_output_bytes> [packed]",
+            ));
+        }
+    };
     let format = InputFormat::parse(&args[0])?;
-    let max_decompressed_bytes = parse_positive_bytes(
-        &args[4], "max_decompressed_bytes"
-    )?;
+    let max_decompressed_bytes = parse_positive_bytes(&args[4], "max_decompressed_bytes")?;
     let max_output_bytes = parse_max_output_bytes(&args[5])?;
-    let summary = import_hospital_mrf_with_limits(
+    let summary = import_hospital_mrf_with_output_mode(
         format,
         &args[1],
         Path::new(&args[2]),
@@ -41,6 +56,7 @@ pub fn run_hospital_mrf_cli(args: &[String]) -> io::Result<()> {
         load_max_fanout_rows()?,
         max_decompressed_bytes,
         max_output_bytes,
+        output_mode,
     )?;
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
@@ -69,6 +85,7 @@ fn import_hospital_mrf(
     )
 }
 
+#[cfg(test)]
 fn import_hospital_mrf_with_limits(
     format: InputFormat,
     version_id: &str,
@@ -77,6 +94,28 @@ fn import_hospital_mrf_with_limits(
     max_fanout_rows: usize,
     max_decompressed_bytes: u64,
     max_output_bytes: u64,
+) -> io::Result<HospitalMrfSummary> {
+    import_hospital_mrf_with_output_mode(
+        format,
+        version_id,
+        input_path,
+        output_directory,
+        max_fanout_rows,
+        max_decompressed_bytes,
+        max_output_bytes,
+        HospitalMrfOutputMode::Legacy,
+    )
+}
+
+fn import_hospital_mrf_with_output_mode(
+    format: InputFormat,
+    version_id: &str,
+    input_path: &Path,
+    output_directory: &Path,
+    max_fanout_rows: usize,
+    max_decompressed_bytes: u64,
+    max_output_bytes: u64,
+    output_mode: HospitalMrfOutputMode,
 ) -> io::Result<HospitalMrfSummary> {
     if max_fanout_rows == 0 {
         return Err(invalid("hospital MRF max fanout rows must be positive"));
@@ -93,7 +132,7 @@ fn import_hospital_mrf_with_limits(
     if version_id.len() > MAX_VERSION_ID_BYTES {
         return Err(invalid("version_id exceeds 64 UTF-8 bytes"));
     }
-    let (compressed_input_bytes, artifacts) = if is_zip(input_path)? {
+    let (compressed_input_bytes, outputs) = if is_zip(input_path)? {
         import_zip_payload(
             format,
             version_id,
@@ -102,6 +141,7 @@ fn import_hospital_mrf_with_limits(
             max_fanout_rows,
             max_decompressed_bytes,
             max_output_bytes,
+            output_mode,
         )?
     } else {
         let compressed_input_bytes = Arc::new(AtomicU64::new(0));
@@ -119,7 +159,7 @@ fn import_hospital_mrf_with_limits(
                 )?)
             }
         };
-        let artifacts = parse_hospital_payload(
+        let outputs = parse_hospital_payload(
             format,
             reader,
             version_id,
@@ -127,21 +167,31 @@ fn import_hospital_mrf_with_limits(
             max_fanout_rows,
             max_decompressed_bytes,
             max_output_bytes,
+            output_mode,
         )?;
-        (compressed_input_bytes.load(Ordering::Relaxed), artifacts)
+        (compressed_input_bytes.load(Ordering::Relaxed), outputs)
+    };
+
+    let (contract, schema_revision) = match output_mode {
+        HospitalMrfOutputMode::Legacy => ("hospital-mrf-copy-v3", HOSPITAL_MRF_SCHEMA_REVISION),
+        HospitalMrfOutputMode::Packed => (
+            "hospital-mrf-copy-v3-packed-v1",
+            HOSPITAL_MRF_PACKED_SCHEMA_REVISION,
+        ),
     };
 
     Ok(HospitalMrfSummary {
-        contract: "hospital-mrf-copy-v3",
+        contract,
         version_id: version_id.to_owned(),
         schema_version: HOSPITAL_MRF_SCHEMA_VERSION,
-        schema_revision: HOSPITAL_MRF_SCHEMA_REVISION,
+        schema_revision,
         format: format.as_str(),
         compressed_input_bytes,
         max_fanout_rows,
         max_decompressed_bytes,
         max_output_bytes,
-        artifacts,
+        artifacts: outputs.artifacts,
+        root: outputs.root,
     })
 }
 
@@ -153,8 +203,9 @@ fn parse_hospital_payload<R: Read>(
     max_fanout_rows: usize,
     max_decompressed_bytes: u64,
     max_output_bytes: u64,
-) -> io::Result<Vec<CopyArtifactSummary>> {
-    parse_hospital_payload_with_limits(
+    output_mode: HospitalMrfOutputMode,
+) -> io::Result<HospitalMrfArtifacts> {
+    parse_hospital_payload_with_output_mode(
         format,
         reader,
         version_id,
@@ -165,9 +216,11 @@ fn parse_hospital_payload<R: Read>(
             max_output_bytes,
             max_input_value_bytes: MAX_INPUT_VALUE_BYTES,
         },
+        output_mode,
     )
 }
 
+#[cfg(test)]
 fn parse_hospital_payload_with_limits<R: Read>(
     format: InputFormat,
     reader: R,
@@ -175,7 +228,31 @@ fn parse_hospital_payload_with_limits<R: Read>(
     output_directory: &Path,
     limits: HospitalMrfLimits,
 ) -> io::Result<Vec<CopyArtifactSummary>> {
-    let mut outputs = CopyOutputs::create(output_directory, limits.max_output_bytes)?;
+    Ok(parse_hospital_payload_with_output_mode(
+        format,
+        reader,
+        version_id,
+        output_directory,
+        limits,
+        HospitalMrfOutputMode::Legacy,
+    )?
+    .artifacts)
+}
+
+fn parse_hospital_payload_with_output_mode<R: Read>(
+    format: InputFormat,
+    reader: R,
+    version_id: &str,
+    output_directory: &Path,
+    limits: HospitalMrfLimits,
+    output_mode: HospitalMrfOutputMode,
+) -> io::Result<HospitalMrfArtifacts> {
+    let mut outputs = CopyOutputs::create(
+        output_directory,
+        version_id,
+        limits.max_output_bytes,
+        output_mode,
+    )?;
     let reader = BoundedDecompressedReader::new(reader, limits.max_decompressed_bytes);
     match format {
         InputFormat::Json => parse_json(
@@ -184,15 +261,13 @@ fn parse_hospital_payload_with_limits<R: Read>(
             limits.max_fanout_rows,
             &mut outputs,
         )?,
-        InputFormat::TallCsv => {
-            parse_csv(
-                BoundedCsvRecordReader::new(reader, limits.max_input_value_bytes),
-                version_id,
-                false,
-                limits.max_fanout_rows,
-                &mut outputs,
-            )?
-        }
+        InputFormat::TallCsv => parse_csv(
+            BoundedCsvRecordReader::new(reader, limits.max_input_value_bytes),
+            version_id,
+            false,
+            limits.max_fanout_rows,
+            &mut outputs,
+        )?,
         InputFormat::WideCsv => parse_csv(
             BoundedCsvRecordReader::new(reader, limits.max_input_value_bytes),
             version_id,
@@ -267,9 +342,7 @@ fn optional_text(value: &str) -> Option<String> {
 
 fn positive_decimal(value: &str, field: &str) -> io::Result<String> {
     let Some(canonical) = canonical_decimal_text(value.trim()) else {
-        return Err(invalid(format!(
-            "{field} must be an exact decimal number"
-        )));
+        return Err(invalid(format!("{field} must be an exact decimal number")));
     };
     if canonical == "0" || canonical.starts_with('-') {
         return Err(invalid(format!("{field} must be greater than zero")));

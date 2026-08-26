@@ -6,13 +6,19 @@ from __future__ import annotations
 
 from sqlalchemy import ARRAY
 from sqlalchemy import TEXT
+from sqlalchemy import BigInteger
 from sqlalchemy import CheckConstraint
 from sqlalchemy import Column
 from sqlalchemy import ForeignKeyConstraint
+from sqlalchemy import Index
 from sqlalchemy import Integer
+from sqlalchemy import LargeBinary
 from sqlalchemy import Numeric
 from sqlalchemy import PrimaryKeyConstraint
+from sqlalchemy import SmallInteger
 from sqlalchemy import String
+from sqlalchemy import TIMESTAMP
+from sqlalchemy import text
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -21,12 +27,192 @@ from db.models.hospital_price_header import _reference, _table_args
 
 __all__ = (
     "HospitalPriceCharge",
+    "HospitalPriceDataBlock",
     "HospitalPriceModifier",
     "HospitalPriceModifierPayer",
+    "HospitalPricePackedRoot",
     "HospitalPricePayerCharge",
     "HospitalPriceService",
     "HospitalPriceServiceCode",
 )
+
+
+class HospitalPricePackedRoot(Base, JSONOutputMixin):
+    """One verified version's compact packed-storage receipt."""
+
+    __tablename__ = "hospital_price_packed_root"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(
+        PrimaryKeyConstraint(
+            "version_id",
+            name="hospital_price_packed_root_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["version_id"],
+            [_reference("hospital_price_version", "version_id")],
+            name="hospital_price_packed_root_version_fkey",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "format_version = 1",
+            name="hospital_price_packed_root_format_check",
+        ),
+        CheckConstraint(
+            "service_count > 0 "
+            "AND charge_count >= service_count "
+            "AND service_block_count BETWEEN 1 AND charge_count "
+            "AND code_selector_key_count > 0 "
+            "AND code_selector_key_count <= code_selector_page_count "
+            "AND code_selector_page_count <= code_selector_ref_count "
+            "AND code_selector_ref_count >= charge_count "
+            "AND (((fact_count = 0 AND fact_block_count = 0 "
+            "AND payer_plan_selector_key_count = 0 "
+            "AND payer_plan_selector_ref_count = 0 "
+            "AND payer_plan_selector_page_count = 0)) OR "
+            "((fact_count > 0 AND fact_block_count BETWEEN 1 AND fact_count "
+            "AND payer_plan_selector_key_count > 0 "
+            "AND payer_plan_selector_key_count "
+            "<= payer_plan_selector_page_count "
+            "AND payer_plan_selector_page_count "
+            "<= payer_plan_selector_ref_count "
+            "AND payer_plan_selector_ref_count = fact_count)))",
+            name="hospital_price_packed_root_counts_check",
+        ),
+    )
+    __my_index_elements__ = ["version_id"]
+
+    version_id = Column(String(64), nullable=False)
+    format_version = Column(
+        SmallInteger,
+        nullable=False,
+        server_default=text("1"),
+    )
+    service_count = Column(BigInteger, nullable=False)
+    charge_count = Column(BigInteger, nullable=False)
+    fact_count = Column(BigInteger, nullable=False)
+    code_selector_key_count = Column(BigInteger, nullable=False)
+    payer_plan_selector_key_count = Column(BigInteger, nullable=False)
+    code_selector_ref_count = Column(BigInteger, nullable=False)
+    payer_plan_selector_ref_count = Column(BigInteger, nullable=False)
+    service_block_count = Column(BigInteger, nullable=False)
+    fact_block_count = Column(BigInteger, nullable=False)
+    code_selector_page_count = Column(BigInteger, nullable=False)
+    payer_plan_selector_page_count = Column(BigInteger, nullable=False)
+    created_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=text("transaction_timestamp()"),
+    )
+
+
+class HospitalPriceDataBlock(Base, JSONOutputMixin):
+    """One authenticated packed service, fact, or selector block."""
+
+    __tablename__ = "hospital_price_data_block"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(
+        PrimaryKeyConstraint(
+            "version_id",
+            "block_kind",
+            "block_ordinal",
+            name="hospital_price_data_block_pkey",
+        ),
+        ForeignKeyConstraint(
+            ["version_id"],
+            [_reference("hospital_price_packed_root", "version_id")],
+            name="hospital_price_data_block_root_fkey",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "block_kind BETWEEN 1 AND 4 AND block_ordinal >= 0 "
+            "AND logical_first >= 0 AND logical_count > 0 "
+            "AND secondary_first >= 0 AND secondary_count >= 0 "
+            "AND page_index >= 0 AND page_count >= 0 "
+            "AND (key_sha256 IS NULL OR octet_length(key_sha256) = 32) "
+            "AND (parent_sha256 IS NULL "
+            "OR octet_length(parent_sha256) = 32)",
+            name="hospital_price_data_block_common_check",
+        ),
+        CheckConstraint(
+            "octet_length(payload_sha256) = 32 "
+            "AND payload_sha256 = pg_catalog.sha256(payload) "
+            "AND octet_length(payload) BETWEEN 1 AND 4259912",
+            name="hospital_price_data_block_payload_check",
+        ),
+        CheckConstraint(
+            "((block_kind = 1 AND logical_count BETWEEN 1 AND 512 "
+            "AND secondary_count BETWEEN 1 AND 512 "
+            "AND page_index = 0 AND page_count = 0 "
+            "AND key_sha256 IS NULL AND parent_sha256 IS NULL) OR "
+            "(block_kind = 2 AND logical_count BETWEEN 1 AND 512 "
+            "AND secondary_first = 0 AND secondary_count = 0 "
+            "AND page_index = 0 AND page_count = 0 "
+            "AND key_sha256 IS NULL AND parent_sha256 IS NULL) OR "
+            "(block_kind = 3 AND logical_first < 1000000 "
+            "AND logical_count = 1 "
+            "AND secondary_count BETWEEN 1 AND 524288 "
+            "AND page_count > 0 AND page_index < page_count "
+            "AND key_sha256 IS NOT NULL AND parent_sha256 IS NULL) OR "
+            "(block_kind = 4 AND logical_first < 1000000 "
+            "AND logical_count = 1 "
+            "AND secondary_count BETWEEN 1 AND 524288 "
+            "AND page_count > 0 AND page_index < page_count "
+            "AND key_sha256 IS NOT NULL AND parent_sha256 IS NOT NULL))",
+            name="hospital_price_data_block_kind_shape_check",
+        ),
+        Index(
+            "hospital_price_data_block_selector_ordinal_key",
+            "version_id",
+            "logical_first",
+            "page_index",
+            unique=True,
+            postgresql_where=text("block_kind IN (3, 4)"),
+        ),
+        Index(
+            "hospital_price_data_block_selector_lookup_idx",
+            "version_id",
+            "block_kind",
+            "key_sha256",
+            "logical_first",
+            "page_index",
+            postgresql_where=text("block_kind IN (3, 4)"),
+        ),
+        Index(
+            "hospital_price_data_block_parent_lookup_idx",
+            "version_id",
+            "parent_sha256",
+            "logical_first",
+            "page_index",
+            postgresql_where=text("block_kind = 4"),
+        ),
+        Index(
+            "hospital_price_data_block_charge_range_idx",
+            "version_id",
+            text("secondary_first DESC"),
+            postgresql_where=text("block_kind = 1"),
+        ),
+        Index(
+            "hospital_price_data_block_fact_range_idx",
+            "version_id",
+            text("logical_first DESC"),
+            postgresql_where=text("block_kind = 2"),
+        ),
+    )
+    __my_index_elements__ = ["version_id", "block_kind", "block_ordinal"]
+
+    version_id = Column(String(64), nullable=False)
+    block_kind = Column(SmallInteger, nullable=False)
+    block_ordinal = Column(BigInteger, nullable=False)
+    logical_first = Column(BigInteger, nullable=False)
+    logical_count = Column(Integer, nullable=False)
+    secondary_first = Column(BigInteger, nullable=False)
+    secondary_count = Column(Integer, nullable=False)
+    page_index = Column(Integer, nullable=False)
+    page_count = Column(Integer, nullable=False)
+    key_sha256 = Column(LargeBinary(32))
+    parent_sha256 = Column(LargeBinary(32))
+    payload_sha256 = Column(LargeBinary(32), nullable=False)
+    payload = Column(LargeBinary, nullable=False)
 
 
 class HospitalPriceService(Base, JSONOutputMixin):

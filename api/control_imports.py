@@ -27,6 +27,7 @@ from process.provider_directory_profile_selection import (
     validated_profile_execution,
 )
 from process.hospital_hpt_registry import selected_hospital_hpt_registry
+from process.hospital_price_runtime import configured_resource_limits, locator_groups
 from process.provider_directory_fhir_census_contract import (
     ProviderDirectoryFHIRAcquisitionStrategy,
 )
@@ -84,6 +85,7 @@ from process.ptg_allowed_amount_blank import (
 )
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
+from process.ptg_parts.artifacts import PTG2ArtifactStore
 
 ENGINE_NAME = "healthcare-mrf-api"
 ACTIVE_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
@@ -1928,13 +1930,20 @@ def _validate_provider_directory_profile_execution_params(
         raise ValueError(str(exc)) from exc
 
 
+def _validate_hospital_price_admission(params: dict[str, Any]) -> None:
+    hospitals = selected_hospital_hpt_registry(params)
+    configured_resource_limits(
+        PTG2ArtifactStore(), len(locator_groups(hospitals))
+    )
+
+
 async def _validate_hospital_price_params(
     importer: str, params: dict[str, Any]
 ) -> None:
     if importer != "hospital-prices":
         return
     try:
-        await asyncio.to_thread(selected_hospital_hpt_registry, params)
+        await asyncio.to_thread(_validate_hospital_price_admission, params)
     except ValueError as exc:
         raise ValueError(str(exc)) from exc
 

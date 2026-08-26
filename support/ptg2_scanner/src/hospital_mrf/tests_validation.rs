@@ -352,4 +352,21 @@
 
         let payer_note = payer_row("fee schedule", "0", Some("Payer-specific note"));
         run_fixture(InputFormat::WideCsv, &payer_note, false);
+
+        let note_only_payer = append_csv_row(
+            &fixture_wide_csv(),
+            &[
+                ("description", "Service unavailable for payer"),
+                ("code|1", "0002"),
+                ("code|1|type", "CPT"),
+                ("setting", "outpatient"),
+                ("billing_class", "facility"),
+                ("standard_charge|gross", "1"),
+                (
+                    "additional_payer_notes|Payer, Inc.|Plan A",
+                    "service not payable",
+                ),
+            ],
+        );
+        run_fixture(InputFormat::WideCsv, &note_only_payer, false);
     }

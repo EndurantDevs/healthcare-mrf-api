@@ -31,11 +31,11 @@ async def test_start_attempts_handles_empty_and_active_candidates(monkeypatch):
     candidates = (
         SimpleNamespace(
             hospital_id="a", hospital_name="A", source_url="https://a/mrf",
-            locator_name="A locator",
+            locator_name="A locator", locator_url="https://a/locator",
         ),
         SimpleNamespace(
             hospital_id="b", hospital_name="B", source_url="https://b/mrf",
-            locator_name=None,
+            locator_name=None, locator_url="https://b/locator",
         ),
     )
     monkeypatch.setattr(
@@ -52,13 +52,15 @@ async def test_start_attempts_handles_empty_and_active_candidates(monkeypatch):
         ("a", 4)
     ]
     assert run_attempts == list(attempts)
+    assert attempts[0].locator_url == "https://a/locator"
     assert active == 1
 
 
 @pytest.mark.asyncio
 async def test_new_content_is_staged_after_native_parse(tmp_path, monkeypatch):
     orchestrator = orchestrator_module()
-    source_path = tmp_path / "source.json"
+    source_path = tmp_path / "hospital-mrf-source-test" / "raw" / "source.json"
+    source_path.parent.mkdir(parents=True)
     source_path.write_text("{}")
     raw = SimpleNamespace(
         raw_sha256="a" * 64, raw_path=str(source_path), byte_count=2
@@ -162,13 +164,18 @@ async def test_successful_content_ingest_is_cached_by_digest(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_load_worker_acknowledges_download_failures_and_publishes(monkeypatch):
+async def test_load_worker_acknowledges_download_failures_and_publishes(
+    tmp_path, monkeypatch
+):
     orchestrator = orchestrator_module()
     attempt = Attempt("one", "a", "A", "https://a/mrf", 0)
     pending_acknowledgement = asyncio.get_running_loop().create_future()
     completed_acknowledgement = asyncio.get_running_loop().create_future()
     completed_acknowledgement.set_result(None)
-    raw = SimpleNamespace(raw_sha256="a" * 64)
+    raw_path = tmp_path / "hospital-mrf-source-test" / "raw" / "source.json"
+    raw_path.parent.mkdir(parents=True)
+    raw_path.write_bytes(b"{}")
+    raw = SimpleNamespace(raw_sha256="a" * 64, raw_path=str(raw_path))
     downloads = asyncio.Queue()
     for queued_download in (
         (
@@ -204,11 +211,13 @@ async def test_load_worker_acknowledges_download_failures_and_publishes(monkeypa
     monkeypatch.setattr(orchestrator, "_progress", lambda *_args: None)
 
     await orchestrator._load_worker(
-        {}, {}, ArtifactStore(), downloads, ({}, {}, metrics_by_name), (None, 0, 3),
+        {}, {}, ArtifactStore(tmp_path), downloads,
+        ({}, {}, metrics_by_name), (None, 0, 3),
         2048, 1024,
     )
 
     assert pending_acknowledgement.done()
+    assert not raw_path.exists()
     assert metrics_by_name == {
         "processed": 3, "published": 1, "superseded": 0,
         "unchanged": 0, "failed": 2,
@@ -231,12 +240,17 @@ async def test_bulk_import_returns_complete_selected_cohort(tmp_path, monkeypatc
             "unchanged": 0, "failed": 0, "contents": 1,
         },
     )
+    collect = AsyncMock(return_value=0)
+    monkeypatch.setattr(
+        orchestrator, "garbage_collect_superseded_versions", collect
+    )
 
     metrics_by_name = await orchestrator._run_import(
         {}, {}, hospitals, ArtifactStore(tmp_path), [], "owner", 30
     )
 
     assert metrics_by_name["selected"] == metrics_by_name["published"] == 2
+    collect.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -321,6 +335,48 @@ async def test_refresh_lifecycle_succeeds_and_rejects_long_owner(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_refresh_sweeps_under_resource_lock_before_database_network(
+    tmp_path, monkeypatch
+):
+    orchestrator = orchestrator_module()
+    store = ArtifactStore(tmp_path)
+    stale_root = tmp_path / "hospital-mrf-source-stale"
+    (stale_root / "raw").mkdir(parents=True)
+    (stale_root / "raw" / "source.json").write_bytes(b"{}")
+    lock_held = asyncio.Event()
+
+    monkeypatch.setattr(
+        orchestrator, "selected_hospital_hpt_registry", lambda *_args, **_kwargs: ()
+    )
+    monkeypatch.setattr(orchestrator, "PTG2ArtifactStore", lambda: store)
+    monkeypatch.setattr(orchestrator, "positive_env", lambda _name, default: default)
+
+    @contextlib.asynccontextmanager
+    async def resource_lock(_store):
+        lock_held.set()
+        try:
+            yield
+        finally:
+            lock_held.clear()
+
+    async def ensure_database(_migrate):
+        assert lock_held.is_set()
+        assert not stale_root.exists()
+        raise RuntimeError("stop after ordered sweep")
+
+    async def guard(_ctx, _task, operation, *_args):
+        return await operation
+
+    monkeypatch.setattr(orchestrator, "_hospital_resource_lock", resource_lock)
+    monkeypatch.setattr(orchestrator, "ensure_database", ensure_database)
+    monkeypatch.setattr(orchestrator, "_guard_cancellation", guard)
+
+    with pytest.raises(RuntimeError, match="stop after ordered sweep"):
+        await orchestrator.refresh_hospital_prices({}, {"hospital_id": "a"})
+    assert not lock_held.is_set()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("failure", "expected_cleanup"),
     (
@@ -332,6 +388,7 @@ async def test_refresh_lifecycle_finishes_attempts_on_failure(
     monkeypatch, failure, expected_cleanup
 ):
     orchestrator = orchestrator_module()
+    events: list[str] = []
     hospital_by_field = {
         "hospital_id": "a", "name": "A", "cms_hpt_url": "https://a/locator"
     }
@@ -343,15 +400,40 @@ async def test_refresh_lifecycle_finishes_attempts_on_failure(
     monkeypatch.setattr(orchestrator, "ensure_database", AsyncMock())
     monkeypatch.setattr(orchestrator, "positive_env", lambda _name, default: default)
     monkeypatch.setattr(orchestrator, "error_details", lambda exc: ("runtime", str(exc)))
-    finish = AsyncMock()
+    async def finish_attempts(*_args):
+        events.append("attempts_terminal")
+        raise RuntimeError("attempt cleanup failed")
+
+    finish = AsyncMock(side_effect=finish_attempts)
     monkeypatch.setattr(orchestrator, "_finish_failed_attempts", finish)
 
-    async def guard(_ctx, _task, operation, *_args):
-        operation.close()
+    @contextlib.asynccontextmanager
+    async def resource_lock(_store):
+        events.append("lock")
+        try:
+            yield
+        finally:
+            events.append("unlock")
+
+    async def run_import(_ctx, _task, _hospitals, _store, attempts, *_args):
+        attempts.append(SimpleNamespace(attempt_id="attempt"))
+        events.append("workers_drained")
         raise failure
 
-    monkeypatch.setattr(orchestrator, "_guard_cancellation", guard)
+    async def guard(_ctx, _task, operation, *_args):
+        return await operation
 
-    with pytest.raises(type(failure)):
+    async def collect():
+        events.append("gc")
+        raise RuntimeError("gc failed")
+
+    monkeypatch.setattr(orchestrator, "_hospital_resource_lock", resource_lock)
+    monkeypatch.setattr(orchestrator, "_run_import", run_import)
+    monkeypatch.setattr(orchestrator, "_guard_cancellation", guard)
+    monkeypatch.setattr(orchestrator, "garbage_collect_superseded_versions", collect)
+
+    with pytest.raises(type(failure)) as caught:
         await orchestrator.refresh_hospital_prices({}, {"hospital_id": "a"})
-    finish.assert_awaited_once_with([], *expected_cleanup)
+    assert caught.value is failure
+    finish.assert_awaited_once_with([SimpleNamespace(attempt_id="attempt")], *expected_cleanup)
+    assert events == ["lock", "workers_drained", "attempts_terminal", "gc", "unlock"]

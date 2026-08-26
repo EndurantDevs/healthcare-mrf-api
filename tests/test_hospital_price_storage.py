@@ -38,9 +38,9 @@ DATABASE_RE = re.compile(
 SCHEMA_RE = re.compile(r"^hospital_price_test_[0-9a-f]{32}$")
 
 
-def _load_migration():
+def _load_migration(path: Path = MIGRATION_PATH):
     module_spec = importlib.util.spec_from_file_location(
-        "hospital_price_storage_test_migration", MIGRATION_PATH,
+        f"hospital_price_storage_test_migration_{path.stem}", path,
     )
     assert module_spec is not None and module_spec.loader is not None
     migration = importlib.util.module_from_spec(module_spec)
@@ -168,6 +168,12 @@ async def _seed_version(connection, schema: str) -> tuple[str, str, str]:
     await _seed_registry(connection, quoted)
     await _seed_version_header(connection, quoted, content_sha, version_id)
     return content_sha, version_id, quoted
+
+
+async def _seed_content_version(
+    connection, quoted: str, content_sha: str, version_id: str
+) -> None:
+    await _seed_version_header(connection, quoted, content_sha, version_id)
 
 
 async def _seed_full_v3_facts(connection, quoted: str, version_id: str) -> None:
@@ -338,7 +344,7 @@ def test_models_use_lossless_types_and_optional_facility_anchor() -> None:
     assert HospitalPriceVersion.__table__ is tables["mrf.hospital_price_version"]
     assert HospitalPriceLocatorObservation.__table__ is tables["mrf.hospital_price_locator_observation"]
     assert HospitalPricePayerCharge.__table__ is tables["mrf.hospital_price_payer_charge"]
-    assert len([name for name in tables if name.startswith("mrf.hospital_price_")]) == 20
+    assert len([name for name in tables if name.startswith("mrf.hospital_price_")]) == 22
     assert "mrf.hospital_price_facility" not in tables
     hospital = tables["mrf.hospital_price_hospital"]
     foreign_key_targets = {
@@ -404,3 +410,25 @@ async def test_postgres_round_trip_and_last_known_good_cas(monkeypatch) -> None:
     finally:
         await _drop_schema(engine, schema)
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_postgres_packed_copy_integrity_and_rollback(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Prove binary COPY integrity, immutable blocks, rollback, and cascade."""
+
+    from tests.hospital_price_packed_storage_postgres import _prove_packed_integrity
+
+    await _prove_packed_integrity(monkeypatch, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_postgres_gc_preserves_shared_lkg_and_active_versions(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Keep shared LKG and active versions, then collect only stale storage."""
+
+    from tests.hospital_price_packed_storage_postgres import _prove_gc_retention
+
+    await _prove_gc_retention(monkeypatch, tmp_path)

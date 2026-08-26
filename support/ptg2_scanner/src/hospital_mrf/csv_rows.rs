@@ -259,7 +259,6 @@ fn parse_wide_payers(
             payer.percentile_90,
             payer.allowed_count,
             payer.methodology,
-            payer.additional_payer_notes,
         ];
         if relevant_columns
             .iter()

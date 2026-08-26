@@ -68,17 +68,35 @@ class _AdmissionConnection:
 def _receipt(native: Any, directory: Path) -> Any:
     artifacts = []
     for kind in native.HOSPITAL_MRF_COPY_COLUMNS:
-        payload = f"{kind}\n".encode()
+        artifact_bytes = f"{kind}\n".encode()
         path = directory / f"{kind}.copy"
-        path.write_bytes(payload)
+        path.write_bytes(artifact_bytes)
         artifacts.append(
             native.HospitalParserArtifact(
-                kind, path, 1, len(payload), hashlib.sha256(payload).hexdigest()
+                kind, path, 1, len(artifact_bytes),
+                hashlib.sha256(artifact_bytes).hexdigest(),
             )
         )
     return native.HospitalParserReceipt(
         "a" * 64, "json", "b" * 64, 100_000, 2048, 1024,
         tuple(artifacts),
+        native.HospitalPackedRoot(
+            service_count=1,
+            charge_count=1,
+            fact_count=1,
+            code_selector_key_count=1,
+            payer_plan_selector_key_count=1,
+            code_selector_ref_count=1,
+            payer_plan_selector_ref_count=1,
+            code_selector_page_count=1,
+            payer_plan_selector_page_count=1,
+            service_block_count=1,
+            fact_block_count=1,
+            code_selector_block_count=1,
+            payer_plan_selector_block_count=1,
+            selector_spool_bytes=26,
+            peak_scratch_bytes=78,
+        ),
     )
 
 
@@ -127,6 +145,7 @@ def test_exact_locator_name_survives_candidate_and_location_binding():
     )
 
     assert candidate.locator_name == "Exact Locator Name"
+    assert candidate.locator_url == locator_url
     assert store._location_ordinals((attempt,), ((7, "Exact Locator Name"),)) == {
         "hospital-a": 7
     }
@@ -155,7 +174,7 @@ async def test_copy_stages_use_exact_v3_columns_and_private_temp_tables(tmp_path
         "standard_charge_percentage", "standard_charge_algorithm",
     )
     assert set(columns_by_stage) == {
-        f"stage_{kind}" for kind in native.HOSPITAL_MRF_COPY_COLUMNS
+        f"stage_{kind}" for kind in native.HOSPITAL_MRF_TEXT_COPY_COLUMNS
     }
     assert all("CREATE TEMP TABLE" in statement for statement in connection.statements)
     assert all("ON COMMIT DROP" in statement for statement in connection.statements)
@@ -340,160 +359,3 @@ async def test_locator_fetch_records_download_parse_and_cancellation_errors(
     monkeypatch.setattr(acquisition, "download_raw_artifact", cancel)
     with pytest.raises(asyncio.CancelledError):
         await acquisition.fetch_locator(locator_input, object())
-
-
-@pytest.mark.asyncio
-async def test_source_download_updates_shared_attempts_and_reports_errors(monkeypatch):
-    acquisition = _acquisition_module()
-    attempt = acquisition.Attempt("attempt", "a", "Hospital A", "https://a/mrf", 1)
-    raw = SimpleNamespace(head=SimpleNamespace(url="https://a/final", status=200))
-
-    async def download(*_args, **_kwargs):
-        return raw
-
-    monkeypatch.setattr(acquisition, "download_raw_artifact", download)
-    downloaded_source = await acquisition.download_source(
-        ("https://a/mrf", (attempt,)), object(), 1024
-    )
-    assert downloaded_source.raw is raw
-    assert attempt.final_source_url == "https://a/final"
-    assert attempt.source_http_status == 200
-    raw.head = None
-    unchanged = await acquisition.download_source(("https://a/mrf", (attempt,)), object(), 1024)
-    assert unchanged.raw is raw
-    assert (attempt.final_source_url, attempt.source_http_status) == ("https://a/final", 200)
-
-    async def fail(*_args, **_kwargs):
-        raise ValueError("failed")
-
-    monkeypatch.setattr(acquisition, "download_raw_artifact", fail)
-    failed = await acquisition.download_source(
-        ("https://a/mrf", (attempt,)), object(), 1024
-    )
-    assert failed.raw is None
-    assert failed.error_code == "value"
-
-    async def cancel(*_args, **_kwargs):
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(acquisition, "download_raw_artifact", cancel)
-    with pytest.raises(asyncio.CancelledError):
-        await acquisition.download_source(
-            ("https://a/mrf", (attempt,)), object(), 1024
-        )
-
-
-@pytest.mark.asyncio
-async def test_native_runner_rejects_debug_binary(tmp_path, monkeypatch):
-    acquisition = _acquisition_module()
-    monkeypatch.setattr(
-        acquisition, "_ptg2_rust_scanner_binary",
-        lambda: tmp_path / "debug" / "ptg2_scanner",
-    )
-    monkeypatch.setattr(
-        acquisition, "_ptg2_scanner_binary_profile", lambda _path: "debug"
-    )
-
-    with pytest.raises(RuntimeError, match="release Rust parser"):
-        await acquisition.run_native_parser(
-            tmp_path / "input.json", tmp_path / "output", "a" * 64,
-            "json", 1, 2048, 1024,
-        )
-
-
-@pytest.mark.asyncio
-async def test_native_runner_drains_cleanup_after_repeated_cancel(
-    tmp_path, monkeypatch
-):
-    acquisition = _acquisition_module()
-    communicate_started = asyncio.Event()
-    cleanup_started = asyncio.Event()
-    allow_cleanup = asyncio.Event()
-    cleanup_finished = asyncio.Event()
-
-    class Process:
-        returncode = None
-
-        async def communicate(self) -> tuple[bytes, bytes]:
-            communicate_started.set()
-            await asyncio.Future()
-            raise AssertionError("cancelled parser communication returned")
-
-    process = Process()
-
-    async def spawn(*_args: Any, **_kwargs: Any) -> Process:
-        return process
-
-    async def terminate(_process: Process) -> None:
-        cleanup_started.set()
-        await allow_cleanup.wait()
-        cleanup_finished.set()
-
-    binary = tmp_path / "release" / "ptg2_scanner"
-    monkeypatch.setattr(acquisition, "_ptg2_rust_scanner_binary", lambda: binary)
-    monkeypatch.setattr(
-        acquisition, "_ptg2_scanner_binary_profile", lambda _path: "release"
-    )
-    monkeypatch.setattr(acquisition.asyncio, "create_subprocess_exec", spawn)
-    monkeypatch.setattr(acquisition, "_terminate_asyncio_subprocess_group", terminate)
-    operation = asyncio.create_task(
-        acquisition.run_native_parser(
-            tmp_path / "input.json", tmp_path / "output", "a" * 64,
-            "json", 1, 2048, 1024,
-        )
-    )
-    await asyncio.wait_for(communicate_started.wait(), timeout=1)
-
-    operation.cancel()
-    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
-    operation.cancel()
-    await asyncio.sleep(0)
-    assert not operation.done()
-    allow_cleanup.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await operation
-    assert cleanup_finished.is_set()
-
-
-@pytest.mark.asyncio
-async def test_native_runner_passes_and_validates_exact_output_cap(
-    tmp_path, monkeypatch
-):
-    acquisition = _acquisition_module()
-    call_by_name: dict[str, Any] = {}
-    expected_receipt = object()
-
-    class Process:
-        returncode = 0
-
-        async def communicate(self) -> tuple[bytes, bytes]:
-            return b"{}", b""
-
-    async def spawn(*args: Any, **kwargs: Any) -> Process:
-        call_by_name["args"] = args
-        call_by_name["kwargs"] = kwargs
-        return Process()
-
-    def validate(payload: bytes, **kwargs: Any) -> object:
-        call_by_name["payload"] = payload
-        call_by_name["validation"] = kwargs
-        return expected_receipt
-
-    binary = tmp_path / "release" / "ptg2_scanner"
-    monkeypatch.setattr(acquisition, "_ptg2_rust_scanner_binary", lambda: binary)
-    monkeypatch.setattr(
-        acquisition, "_ptg2_scanner_binary_profile", lambda _path: "release"
-    )
-    monkeypatch.setattr(acquisition.asyncio, "create_subprocess_exec", spawn)
-    monkeypatch.setattr(acquisition, "validate_hospital_parser_summary", validate)
-
-    receipt = await acquisition.run_native_parser(
-        tmp_path / "input.json", tmp_path / "output", "a" * 64,
-        "json", 123, 8192, 4096,
-    )
-
-    assert receipt is expected_receipt
-    assert call_by_name["args"][-2:] == ("8192", "4096")
-    assert call_by_name["validation"]["max_decompressed_bytes"] == 8192
-    assert call_by_name["validation"]["max_output_bytes"] == 4096

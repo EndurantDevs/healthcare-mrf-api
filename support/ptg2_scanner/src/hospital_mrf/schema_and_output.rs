@@ -1,5 +1,6 @@
 pub const HOSPITAL_MRF_SCHEMA_VERSION: &str = "3.0.0";
 pub const HOSPITAL_MRF_SCHEMA_REVISION: &str = "5333564a710f80d7740180b9ffab8dbdcba9b502";
+const HOSPITAL_MRF_PACKED_SCHEMA_REVISION: &str = "hospital-mrf-packed-blocks-v1";
 
 pub const MRF_COPY_COLUMNS: &[&str] = &[
     "version_id",
@@ -168,6 +169,19 @@ impl CopyKind {
             Self::ModifierPayer => "modifier_payer",
         }
     }
+
+    fn is_packed_text(self) -> bool {
+        matches!(
+            self,
+            Self::Mrf
+                | Self::Location
+                | Self::Npi
+                | Self::License
+                | Self::ContractProvision
+                | Self::Modifier
+                | Self::ModifierPayer
+        )
+    }
 }
 
 struct DigestWriter {
@@ -223,6 +237,15 @@ struct CopySink {
     final_path: PathBuf,
     writer: Option<BufWriter<DigestWriter>>,
     rows: u64,
+    final_owned: bool,
+}
+
+fn path_entry_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 impl CopySink {
@@ -234,7 +257,7 @@ impl CopySink {
     ) -> io::Result<Self> {
         let final_path = output_directory.join(format!("{}.copy", kind.name()));
         let partial_path = output_directory.join(format!(".{}.copy.partial", kind.name()));
-        if final_path.exists() || partial_path.exists() {
+        if path_entry_exists(&final_path)? || path_entry_exists(&partial_path)? {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
@@ -259,6 +282,7 @@ impl CopySink {
                 max_output_bytes,
             })),
             rows: 0,
+            final_owned: false,
         })
     }
 
@@ -281,6 +305,7 @@ impl CopySink {
         let sha256 = hex_digest(writer.get_ref().digest.clone().finalize().as_slice());
         drop(writer);
         fs::hard_link(&self.partial_path, &self.final_path)?;
+        self.final_owned = true;
         fs::remove_file(&self.partial_path)?;
         Ok(CopyArtifactSummary {
             kind: self.kind.name(),
@@ -293,12 +318,28 @@ impl CopySink {
 }
 
 struct CopyOutputs {
-    sinks: Vec<CopySink>,
+    sinks: Vec<Option<CopySink>>,
+    packed: Option<PackedOutputBuilder>,
     committed: bool,
 }
 
+fn validate_copy_text_fields(kind: CopyKind, fields: &[Option<&str>]) -> io::Result<()> {
+    if fields.iter().flatten().any(|value| value.contains('\0')) {
+        return Err(invalid(format!(
+            "hospital MRF {} COPY row contains NUL",
+            kind.name()
+        )));
+    }
+    Ok(())
+}
+
 impl CopyOutputs {
-    fn create(output_directory: &Path, max_output_bytes: u64) -> io::Result<Self> {
+    fn create(
+        output_directory: &Path,
+        version_id: &str,
+        max_output_bytes: u64,
+        output_mode: HospitalMrfOutputMode,
+    ) -> io::Result<Self> {
         let metadata = fs::symlink_metadata(output_directory)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(invalid(
@@ -307,6 +348,7 @@ impl CopyOutputs {
         }
         let mut outputs = Self {
             sinks: Vec::with_capacity(CopyKind::ALL.len()),
+            packed: None,
             committed: false,
         };
         let aggregate_bytes = Arc::new(AtomicU64::new(0));
@@ -314,10 +356,23 @@ impl CopyOutputs {
             if kind as usize != index {
                 return Err(invalid("hospital MRF COPY sink order is inconsistent"));
             }
-            outputs.sinks.push(CopySink::create(
+            let sink = if output_mode == HospitalMrfOutputMode::Legacy || kind.is_packed_text() {
+                Some(CopySink::create(
+                    output_directory,
+                    kind,
+                    Arc::clone(&aggregate_bytes),
+                    max_output_bytes,
+                )?)
+            } else {
+                None
+            };
+            outputs.sinks.push(sink);
+        }
+        if output_mode == HospitalMrfOutputMode::Packed {
+            outputs.packed = Some(PackedOutputBuilder::create(
                 output_directory,
-                kind,
-                Arc::clone(&aggregate_bytes),
+                version_id,
+                aggregate_bytes,
                 max_output_bytes,
             )?);
         }
@@ -325,22 +380,43 @@ impl CopyOutputs {
     }
 
     fn write(&mut self, kind: CopyKind, fields: &[Option<&str>]) -> io::Result<()> {
-        if fields.iter().flatten().any(|value| value.contains('\0')) {
-            return Err(invalid(format!(
-                "hospital MRF {} COPY row contains NUL",
-                kind.name()
-            )));
-        }
-        self.sinks[kind as usize].write_fields(fields)
+        validate_copy_text_fields(kind, fields)?;
+        self.sinks[kind as usize]
+            .as_mut()
+            .ok_or_else(|| {
+                invalid(format!(
+                    "hospital MRF {} text output is disabled in packed mode",
+                    kind.name()
+                ))
+            })?
+            .write_fields(fields)
     }
 
-    fn finish(mut self) -> io::Result<Vec<CopyArtifactSummary>> {
+    fn finish(mut self) -> io::Result<HospitalMrfArtifacts> {
         let mut artifacts = Vec::with_capacity(self.sinks.len());
-        for sink in &mut self.sinks {
+        for sink in self.sinks.iter_mut().flatten() {
             artifacts.push(sink.finish()?);
         }
+        let packed = self
+            .packed
+            .take()
+            .map(PackedOutputBuilder::finish)
+            .transpose()?;
+        let root =
+            packed.map(|packed| {
+                artifacts.extend(packed.artifacts.into_iter().map(|artifact| {
+                    CopyArtifactSummary {
+                        kind: artifact.kind,
+                        path: artifact.path,
+                        rows: artifact.rows,
+                        bytes: artifact.bytes,
+                        sha256: artifact.sha256,
+                    }
+                }));
+                packed.root
+            });
         self.committed = true;
-        Ok(artifacts)
+        Ok(HospitalMrfArtifacts { artifacts, root })
     }
 }
 
@@ -349,10 +425,12 @@ impl Drop for CopyOutputs {
         if self.committed {
             return;
         }
-        for sink in &mut self.sinks {
+        for sink in self.sinks.iter_mut().flatten() {
             drop(sink.writer.take());
             let _ = fs::remove_file(&sink.partial_path);
-            let _ = fs::remove_file(&sink.final_path);
+            if sink.final_owned {
+                let _ = fs::remove_file(&sink.final_path);
+            }
         }
     }
 }

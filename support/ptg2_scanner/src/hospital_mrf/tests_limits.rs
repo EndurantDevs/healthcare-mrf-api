@@ -128,6 +128,52 @@
     }
 
     #[test]
+    fn json_service_code_budget_fails_before_retaining_unbounded_fanout() {
+        let mut payload: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+        payload["standard_charge_information"][0]["code_information"] = serde_json::Value::Array(
+            (0..5)
+                .map(|index| {
+                    json!({
+                        "code": format!("{index}{}", "x".repeat(1024 * 1024 - 1)),
+                        "type": "CPT",
+                    })
+                })
+                .collect(),
+        );
+
+        assert_payload_limit_error(
+            InputFormat::Json,
+            &serde_json::to_vec(&payload).unwrap(),
+            MAX_INPUT_VALUE_BYTES,
+            "service code data exceeds 4 MiB",
+        );
+    }
+
+    #[test]
+    fn json_retained_budget_rejects_metadata_and_nested_payer_heap() {
+        let mut metadata: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+        metadata["location_name"] = json!(["x".repeat(JSON_RETAINED_BYTE_LIMIT)]);
+        assert_payload_limit_error(
+            InputFormat::Json,
+            &serde_json::to_vec(&metadata).unwrap(),
+            MAX_INPUT_VALUE_BYTES,
+            "JSON retained data exceeds 64 MiB",
+        );
+        drop(metadata);
+
+        let mut payer: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+        payer["standard_charge_information"][0]["standard_charges"][0]
+            ["payers_information"][0]["additional_payer_notes"] =
+            json!("x".repeat(JSON_RETAINED_BYTE_LIMIT));
+        assert_payload_limit_error(
+            InputFormat::Json,
+            &serde_json::to_vec(&payer).unwrap(),
+            MAX_INPUT_VALUE_BYTES,
+            "JSON retained data exceeds 64 MiB",
+        );
+    }
+
+    #[test]
     fn csv_record_limit_follows_quote_and_line_ending_boundaries() {
         let mut accepted = BoundedCsvRecordReader::new(
             Cursor::new(b"ab\"cd\rx\n\"a\"\"\nb\",x\r\nz"),

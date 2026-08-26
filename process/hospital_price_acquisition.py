@@ -27,6 +27,7 @@ from process.hospital_price_native import (
     validate_hospital_parser_summary,
 )
 from process.ptg_parts.artifacts import PTG2ArtifactStore
+from process.ptg_parts.canonical import canonicalize_url
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.rust_scanner import (
     _ptg2_rust_scanner_binary,
@@ -62,6 +63,7 @@ class Candidate:
     observation_id: str
     source_url: str
     locator_name: str | None = None
+    locator_url: str | None = None
     initial_error_code: str | None = None
     initial_error_detail: str | None = None
 
@@ -74,6 +76,7 @@ class Attempt:
     source_url: str
     expected_generation: int
     locator_name: str | None = None
+    locator_url: str | None = None
     final_source_url: str | None = None
     source_http_status: int | None = None
 
@@ -85,6 +88,7 @@ class DownloadedSource:
     attempts: tuple[Attempt, ...]
     error_code: str | None = None
     error_detail: str | None = None
+    auth_refresh_required: bool = False
 
 
 def schema_name() -> str:
@@ -167,8 +171,12 @@ async def sync_registry(hospitals: Sequence[dict[str, str]]) -> None:
     )
     async with db.acquire() as connection:
         if not await connection.scalar(
-            "SELECT to_regclass(:relation) IS NOT NULL",
-            relation=f"{schema_name()}.hospital_price_hospital",
+            "SELECT to_regclass(:hospital) IS NOT NULL "
+            "AND to_regclass(:packed_root) IS NOT NULL "
+            "AND to_regclass(:data_block) IS NOT NULL",
+            hospital=f"{schema_name()}.hospital_price_hospital",
+            packed_root=f"{schema_name()}.hospital_price_packed_root",
+            data_block=f"{schema_name()}.hospital_price_data_block",
         ):
             raise RuntimeError("hospital price storage migration is not installed")
         await connection.status(
@@ -269,6 +277,7 @@ def _locator_error_candidates(locator_result: LocatorResult) -> tuple[Candidate,
             observation_id=locator_result.observation_id,
             source_url=locator_result.url,
             locator_name=hospital.get("locator_name") or hospital["name"],
+            locator_url=locator_result.url,
             initial_error_code=locator_result.error_code or "locator_invalid",
             initial_error_detail=locator_result.error_detail,
         )
@@ -301,6 +310,7 @@ def candidates_from_locators(
                 observation_id=locator_result.observation_id,
                 source_url=binding.mrf_url,
                 locator_name=locator_result.records[binding.record_index].location_name,
+                locator_url=locator_result.url,
             )
             for binding in match.bindings
         )
@@ -319,6 +329,7 @@ def candidates_from_locators(
                         hospital_by_id[hospital_id].get("locator_name")
                         or hospital_by_id[hospital_id]["name"]
                     ),
+                    locator_url=locator_result.url,
                     initial_error_code=code,
                     initial_error_detail=detail,
                 )
@@ -328,27 +339,66 @@ def candidates_from_locators(
 
 
 async def download_source(
-    item: tuple[str, tuple[Attempt, ...]], store: PTG2ArtifactStore,
+    source_job: tuple[str, tuple[Attempt, ...]], store: PTG2ArtifactStore,
     max_bytes: int,
+    *,
+    exact_url_only: bool = False,
 ) -> DownloadedSource:
     """Download one canonical MRF URL for all associated attempts."""
 
-    url, attempts = item
-    try:
-        raw = await download_raw_artifact(
-            url, store=store, reuse_raw_artifacts=True,
-            max_bytes=max_bytes,
-        )
+    url, attempts = source_job
+    last_error: tuple[str, str] | None = None
+    for attempt in attempts:
+        attempt.final_source_url = None
+        attempt.source_http_status = None
+    request_urls = (
+        (url,)
+        if exact_url_only
+        else tuple(dict.fromkeys((url, *(attempt.source_url for attempt in attempts))))
+    )
+    for request_url in request_urls:
+        try:
+            raw = await download_raw_artifact(
+                request_url, store=store, reuse_raw_artifacts=False,
+                max_bytes=max_bytes, keep_partial_artifacts=False,
+            )
+        except (ImportCancelledError, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            last_error = error_details(exc)
+            status = getattr(exc, "status", None)
+            if type(status) is int and 100 <= status <= 599:
+                affected_attempts = (
+                    attempts
+                    if exact_url_only
+                    else tuple(
+                        attempt for attempt in attempts
+                        if attempt.source_url == request_url
+                    )
+                )
+                for attempt in affected_attempts:
+                    attempt.final_source_url = request_url
+                    attempt.source_http_status = status
+            continue
         for attempt in attempts:
             if raw.head:
                 attempt.final_source_url = str(raw.head.url)
                 attempt.source_http_status = int(raw.head.status) if raw.head.status else None
-        return DownloadedSource(url, raw, attempts)
-    except (ImportCancelledError, asyncio.CancelledError):
-        raise
-    except Exception as exc:
-        code, detail = error_details(exc)
-        return DownloadedSource(url, None, attempts, code, detail)
+        return DownloadedSource(request_url, raw, attempts)
+    assert last_error is not None
+    return DownloadedSource(
+        url, None, attempts, *last_error,
+        auth_refresh_required=bool(attempts) and all(
+            attempt.source_http_status in {401, 403} for attempt in attempts
+        ),
+    )
+
+
+def _release_parser_binary() -> Path:
+    binary = _ptg2_rust_scanner_binary()
+    if binary is None or _ptg2_scanner_binary_profile(binary) == "debug":
+        raise RuntimeError("hospital MRF imports require a release Rust parser")
+    return binary
 
 
 async def run_native_parser(
@@ -362,15 +412,13 @@ async def run_native_parser(
 ) -> HospitalParserReceipt:
     """Run the release native parser and validate its complete receipt."""
 
-    binary = _ptg2_rust_scanner_binary()
-    if binary is None or _ptg2_scanner_binary_profile(binary) == "debug":
-        raise RuntimeError("hospital MRF imports require a release Rust parser")
+    binary = _release_parser_binary()
     process = None
     spawn = asyncio.create_task(
         asyncio.create_subprocess_exec(
             str(binary), "--hospital-mrf-copy", source_format, version_id,
             str(input_path), str(output_directory),
-            str(max_decompressed_bytes), str(max_output_bytes),
+            str(max_decompressed_bytes), str(max_output_bytes), "packed",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             **_subprocess_session_options(asyncio.create_subprocess_exec),
@@ -382,11 +430,18 @@ async def run_native_parser(
         if process.returncode:
             detail = stderr.decode("utf-8", errors="replace")[-2000:]
             raise RuntimeError(f"hospital MRF parser exited {process.returncode}: {detail}")
-        return validate_hospital_parser_summary(
-            stdout, version_id=version_id, source_format=source_format,
-            input_bytes=input_bytes, output_directory=output_directory,
-            max_decompressed_bytes=max_decompressed_bytes,
-            max_output_bytes=max_output_bytes,
+        return await drain_operation(
+            asyncio.to_thread(
+                validate_hospital_parser_summary,
+                stdout,
+                version_id=version_id,
+                source_format=source_format,
+                input_bytes=input_bytes,
+                output_directory=output_directory,
+                max_decompressed_bytes=max_decompressed_bytes,
+                max_output_bytes=max_output_bytes,
+            ),
+            preserve_cancellation=True,
         )
     except BaseException:
         if process is None:
