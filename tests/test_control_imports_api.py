@@ -1648,6 +1648,7 @@ def test_import_run_migration_mirrors_model(monkeypatch):
         not in {
             "import_run_provider_directory_retry_child_idx",
             "import_run_mrf_discovery_retry_child_idx",
+            "import_run_plan_pricing_idempotency_idx",
         }
     }
     idempotency_idx = recorder.indexes["import_run_active_idempotency_idx"]

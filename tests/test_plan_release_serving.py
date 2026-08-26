@@ -11,11 +11,13 @@ PLAN_RELEASE_ID = "hprelease_" + "0" * 26
 PLAN_ID = "hpplan_" + "1" * 26
 PLAN_VERSION_ID = "hpversion_" + "2" * 26
 SERVING_REVISION_ID = "hpserve_" + "3" * 26
+SERVING_REVISION_PUBLISHED_AT = "2026-08-25T12:34:56.123456Z"
 
 
 def _binding_row(**updates):
     row_by_field = {
         "serving_revision_id": SERVING_REVISION_ID,
+        "serving_revision_published_at": SERVING_REVISION_PUBLISHED_AT,
         "plan_release_id": PLAN_RELEASE_ID,
         "healthporta_plan_id": PLAN_ID,
         "plan_version_id": PLAN_VERSION_ID,
@@ -68,6 +70,7 @@ def _release_selection(
         )
     return plan_release_serving.PlanReleaseServingSelection(
         serving_revision_id=SERVING_REVISION_ID,
+        serving_revision_published_at=SERVING_REVISION_PUBLISHED_AT,
         plan_release_id=PLAN_RELEASE_ID,
         healthporta_plan_id=PLAN_ID,
         plan_version_id=PLAN_VERSION_ID,
@@ -143,12 +146,18 @@ def _install_multi_snapshot_search(monkeypatch, selection, calls):
 
 
 class _Session:
-    def __init__(self, rows):
+    def __init__(self, rows, *, pricing_projection_relation=True):
         self.rows = rows
+        self.pricing_projection_relation = pricing_projection_relation
         self.calls = []
 
     async def execute(self, statement, params):
-        self.calls.append((str(statement), params))
+        sql = str(statement)
+        self.calls.append((sql, params))
+        if "to_regclass" in sql:
+            return SimpleNamespace(
+                scalar_one=lambda: self.pricing_projection_relation
+            )
         return list(self.rows)
 
 
@@ -207,7 +216,7 @@ def test_release_resolver_requires_complete_published_pinned_binding_set(
     assert [binding.snapshot_id for binding in selection.allowed_amount_bindings] == [
         "ptg2:release-allowed"
     ]
-    sql, params = session.calls[0]
+    sql, params = session.calls[-1]
     assert "ptg2_current" not in sql
     assert "plan_release_snapshot_binding" in sql
     assert "ptg2_snapshot_pin" in sql
@@ -288,6 +297,9 @@ def test_release_query_uses_bound_snapshot_when_current_pointer_differs(monkeypa
     ]
     assert response["plan_release_id"] == PLAN_RELEASE_ID
     assert response["serving_revision_id"] == SERVING_REVISION_ID
+    assert response["serving_revision_published_at"] == (
+        SERVING_REVISION_PUBLISHED_AT
+    )
     assert response["release_status"] == "published"
     assert response["is_current"] is True
     assert response["resolved"] is True

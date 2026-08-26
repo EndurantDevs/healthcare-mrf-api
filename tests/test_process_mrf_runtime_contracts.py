@@ -19,7 +19,26 @@ os.environ.setdefault("HLTHPRT_REDIS_ADDRESS", "redis://localhost")
 process_pkg = importlib.import_module("process")
 process_initial = importlib.import_module("process.initial")
 process_npi = importlib.import_module("process.npi")
+process_openaddresses = importlib.import_module("process.openaddresses")
 utils_module = importlib.import_module("process.ext.utils")
+
+
+def test_worker_aliases_preserve_registered_names():
+    assert process_npi.process_data is process_npi.execute_npi_import_attempt
+    assert process_npi.shutdown is process_npi.finalize_npi_import_attempt
+    assert (
+        process_openaddresses.process_data
+        is process_openaddresses.execute_openaddresses_import_task
+    )
+    assert (
+        process_openaddresses.shutdown
+        is process_openaddresses.publish_openaddresses_generation
+    )
+    assert process_npi.process_data.__name__ == "process_data"
+    assert process_npi.shutdown.__name__ == "shutdown"
+    assert process_openaddresses.process_data.__name__ == "process_data"
+    assert process_openaddresses.shutdown.__name__ == "shutdown"
+
 
 def test_transparency_zip_path_is_unique_per_source(tmp_path):
     first = process_initial._transparency_zip_path(str(tmp_path), 0, {"year": "2026"})

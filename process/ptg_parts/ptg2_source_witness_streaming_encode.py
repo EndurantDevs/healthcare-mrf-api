@@ -257,6 +257,42 @@ def _stage_locator_record(
     )
 
 
+def _materialize_bundle_records_and_evidence(
+    stage_file: BinaryIO,
+    indexed_locators: Sequence[tuple[int, SourceWitnessRecordLocator]],
+    staged_record_by_index: list[_StagedRecord | None],
+    staged_evidence_by_sha256: dict[str, _StagedEvidence],
+    budget: _StreamingBudget,
+    bundle_file: BinaryIO,
+) -> None:
+    validated_evidence_locators: set[tuple[str, int, int, int]] = set()
+    for selected_index, record_locator in indexed_locators:
+        staged_record_by_index[selected_index] = _stage_locator_record(
+            stage_file,
+            record_locator,
+            bundle_file,
+            budget,
+        )
+        for evidence_locator in record_locator.evidence_by_sha256.values():
+            evidence_key = (
+                evidence_locator.sha256,
+                evidence_locator.raw_byte_count,
+                evidence_locator.offset,
+                evidence_locator.length,
+            )
+            if evidence_key in validated_evidence_locators:
+                continue
+            _stage_locator_evidence(
+                stage_file,
+                staged_evidence_by_sha256,
+                budget,
+                bundle_file,
+                record_locator,
+                evidence_locator,
+            )
+            validated_evidence_locators.add(evidence_key)
+
+
 def _stage_locator_bundles(
     stage_file: BinaryIO,
     selected_records: Sequence[SourceWitnessCandidate],
@@ -275,32 +311,14 @@ def _stage_locator_bundles(
             )
     for bundle_identity, indexed_locators in locator_indices_by_bundle.items():
         with _materialization_bundle_file(bundle_identity) as bundle_file:
-            validated_evidence_locators: set[tuple[str, int, int, int]] = set()
-            for selected_index, record_locator in indexed_locators:
-                staged_record_by_index[selected_index] = _stage_locator_record(
-                    stage_file,
-                    record_locator,
-                    bundle_file,
-                    budget,
-                )
-                for evidence_locator in record_locator.evidence_by_sha256.values():
-                    evidence_key = (
-                        evidence_locator.sha256,
-                        evidence_locator.raw_byte_count,
-                        evidence_locator.offset,
-                        evidence_locator.length,
-                    )
-                    if evidence_key in validated_evidence_locators:
-                        continue
-                    _stage_locator_evidence(
-                        stage_file,
-                        staged_evidence_by_sha256,
-                        budget,
-                        bundle_file,
-                        record_locator,
-                        evidence_locator,
-                    )
-                    validated_evidence_locators.add(evidence_key)
+            _materialize_bundle_records_and_evidence(
+                stage_file,
+                indexed_locators,
+                staged_record_by_index,
+                staged_evidence_by_sha256,
+                budget,
+                bundle_file,
+            )
 
 
 def _stage_legacy_record(

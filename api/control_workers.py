@@ -57,7 +57,11 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec(
         "arq:PTGCandidateAudit",
         "process.PTGCandidateAudit",
-        ("ptg-candidate-audit",),
+        (
+            "ptg-candidate-audit",
+            "plan-pricing-projection",
+            "plan-pricing-prewarm",
+        ),
     ),
     WorkerSpec("arq:MRF", "process.MRF", ("mrf",)),
     WorkerSpec("arq:NPI", "process.NPI", ("npi",)),
@@ -1276,6 +1280,13 @@ def _single_job_worker_target(
     if queued_job_id:
         return queued_job_id
     run_id = str(payload.get("run_id") or "").strip()
+    projection_job_prefix_by_importer = {
+        "plan-pricing-projection": "plan_pricing_projection",
+        "plan-pricing-prewarm": "plan_pricing_prewarm",
+    }
+    importer = str(payload.get("importer") or "").strip()
+    if importer in projection_job_prefix_by_importer and run_id:
+        return f"{projection_job_prefix_by_importer[importer]}_{run_id}"
     if spec.worker_class.startswith("process.PTG") and run_id:
         return f"ptg_start_{run_id}"
     if spec.worker_class == "process.NPI" and run_id:

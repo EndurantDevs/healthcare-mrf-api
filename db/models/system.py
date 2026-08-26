@@ -132,6 +132,15 @@ class ImportRun(Base, JSONOutputMixin):
             "unique": True,
             "where": "status IN ('queued', 'starting', 'running', 'finalizing', 'canceling')",
         },
+        {
+            "index_elements": ("importer", "idempotency_key"),
+            "name": "import_run_plan_pricing_idempotency_idx",
+            "unique": True,
+            "where": (
+                "importer IN ('plan-pricing-projection', "
+                "'plan-pricing-prewarm') AND idempotency_key IS NOT NULL"
+            ),
+        },
         {"index_elements": ("schedule_id",), "name": "import_run_schedule_idx"},
         {"index_elements": ("subscription_id",), "name": "import_run_subscription_idx"},
         {"index_elements": ("source_file_import_id",), "name": "import_run_source_file_import_idx"},

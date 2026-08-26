@@ -225,6 +225,10 @@ def test_profile_contact_normalizers_drop_invalid_and_duplicate_values():
         {"system": "phone", "value": "5550100"},
         {"system": "email", "value": "directory@example.test"},
     ]
+    assert importer._alohr_telecom(
+        {"contacts": {"system": "fax", "value": "5550199"}}
+    ) == [{"system": "fax", "value": "5550199"}]
+    assert importer._alohr_telecom({"contacts": 1}) == []
 
     address_rows = importer._alohr_address_items(
         {

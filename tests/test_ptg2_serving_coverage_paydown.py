@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -21,6 +22,32 @@ def _location_query(*, knn_order_sql=None):
         distance_sql="NULL::double precision",
         knn_order_sql=knn_order_sql,
     )
+
+
+@pytest.mark.parametrize(
+    ("knn_order_sql", "address_assurance_sql"),
+    [
+        (None, "TRUE"),
+        (None, "addr.geo_evidence_level IS NOT NULL"),
+        ("addr.location <-> :requested_location", "addr.geo_evidence_level IS NOT NULL"),
+    ],
+)
+def test_membership_location_sql_keeps_snapshot_scope_probe_correlated(
+    knn_order_sql,
+    address_assurance_sql,
+):
+    query = _location_query(knn_order_sql=knn_order_sql)
+    query = replace(
+        query,
+        address_assurance_sql=address_assurance_sql,
+    )
+
+    statement = serving._membership_location_sql(query, limit=2, offset=0)
+
+    assert "CROSS JOIN LATERAL" in statement
+    assert "npi_scope.snapshot_key = :shared_snapshot_key" in statement
+    assert "npi_scope.npi = addr.npi" in statement
+    assert "OFFSET 0" in statement
 
 
 def test_membership_filter_rejects_empty_scope_and_invalid_values():

@@ -317,6 +317,28 @@ def parse_toc_catalog_entries(
     return _merge_duplicate_catalog_entries(entries)
 
 
+def _json_toc_urls(parsed_content: Any) -> list[str]:
+    if isinstance(parsed_content, list):
+        return [
+            entry.strip()
+            for entry in parsed_content
+            if isinstance(entry, str) and entry.strip()
+        ]
+    if not isinstance(parsed_content, dict):
+        return []
+    urls: list[str] = []
+    for entry in parsed_content.values():
+        if isinstance(entry, str) and entry.strip():
+            urls.append(entry.strip())
+        elif isinstance(entry, list):
+            urls.extend(
+                str(toc_url_value).strip()
+                for toc_url_value in entry
+                if str(toc_url_value).strip()
+            )
+    return urls
+
+
 def _load_toc_urls_from_file(path: str) -> list[str]:
     urls: list[str] = []
     try:
@@ -328,23 +350,7 @@ def _load_toc_urls_from_file(path: str) -> list[str]:
         return urls
     if text_strip.startswith("["):
         try:
-            parsed_content = json.loads(text_strip)
-            if isinstance(parsed_content, list):
-                for entry in parsed_content:
-                    if isinstance(entry, str) and entry.strip():
-                        urls.append(entry.strip())
-            elif isinstance(parsed_content, dict):
-                for entry in parsed_content.values():
-                    if isinstance(entry, str) and entry.strip():
-                        urls.append(entry.strip())
-                    elif isinstance(entry, list):
-                        urls.extend(
-                            [
-                                str(toc_url_value).strip()
-                                for toc_url_value in entry
-                                if str(toc_url_value).strip()
-                            ]
-                        )
+            urls.extend(_json_toc_urls(json.loads(text_strip)))
         except json.JSONDecodeError:
             return urls
     else:

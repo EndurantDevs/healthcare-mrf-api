@@ -9,6 +9,7 @@ PLAN_RELEASE_ID = "hprelease_" + "0" * 26
 PLAN_ID = "hpplan_" + "1" * 26
 PLAN_VERSION_ID = "hpversion_" + "2" * 26
 SERVING_REVISION_ID = "hpserve_" + "3" * 26
+SERVING_REVISION_PUBLISHED_AT = "2026-08-25T12:34:56.123456Z"
 
 
 class _Session:
@@ -34,6 +35,7 @@ class _SequenceSession:
 def _binding_row(**updates):
     row_by_field = {
         "serving_revision_id": SERVING_REVISION_ID,
+        "serving_revision_published_at": SERVING_REVISION_PUBLISHED_AT,
         "plan_release_id": PLAN_RELEASE_ID,
         "healthporta_plan_id": PLAN_ID,
         "plan_version_id": PLAN_VERSION_ID,

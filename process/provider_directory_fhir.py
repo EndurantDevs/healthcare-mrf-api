@@ -8303,25 +8303,33 @@ def _alohr_telecom(*telecom_items: Any) -> list[dict[str, Any]]:
         if not telecom_item_by_field:
             continue
         if isinstance(telecom_item_by_field, list):
-            for nested in telecom_item_by_field:
-                if isinstance(nested, dict):
-                    system = _clean_text(nested.get("system"))
-                    telecom_value = _clean_text(nested.get("value"))
-                    if system and telecom_value:
-                        telecom_rows.append({"system": system, "value": telecom_value, "use": _clean_text(nested.get("use"))})
+            nested_telecom_items = telecom_item_by_field
+        elif isinstance(telecom_item_by_field, dict):
+            contacts = telecom_item_by_field.get("contacts")
+            nested_telecom_items = (
+                [contacts]
+                if isinstance(contacts, dict)
+                else contacts if isinstance(contacts, list) else []
+            )
+        else:
+            telecom_value = _clean_text(telecom_item_by_field)
+            if telecom_value:
+                system = "email" if "@" in telecom_value else "phone"
+                telecom_rows.append({"system": system, "value": telecom_value})
             continue
-        if isinstance(telecom_item_by_field, dict):
-            for nested in telecom_item_by_field.get("contacts") or []:
-                if isinstance(nested, dict):
-                    system = _clean_text(nested.get("system"))
-                    telecom_value = _clean_text(nested.get("value"))
-                    if system and telecom_value:
-                        telecom_rows.append({"system": system, "value": telecom_value, "use": _clean_text(nested.get("use"))})
-            continue
-        telecom_value = _clean_text(telecom_item_by_field)
-        if telecom_value:
-            system = "email" if "@" in telecom_value else "phone"
-            telecom_rows.append({"system": system, "value": telecom_value})
+        for nested in nested_telecom_items:
+            if not isinstance(nested, dict):
+                continue
+            system = _clean_text(nested.get("system"))
+            telecom_value = _clean_text(nested.get("value"))
+            if system and telecom_value:
+                telecom_rows.append(
+                    {
+                        "system": system,
+                        "value": telecom_value,
+                        "use": _clean_text(nested.get("use")),
+                    }
+                )
     deduped_telecom_rows: list[dict[str, Any]] = []
     seen_telecom_keys: set[tuple[str | None, str | None, str | None]] = set()
     for telecom_item_by_field in telecom_rows:
@@ -60457,20 +60465,37 @@ def _row_reference_values(row: dict[str, Any], fields: tuple[str, ...]) -> list[
     return values
 
 
-def _linked_resource_refs(rows_by_resource: dict[str, list[dict[str, Any]]]) -> list[tuple[str, str, str, str]]:
-    refs: list[tuple[str, str, str, str]] = []
-    seen_resource_keys: set[tuple[str, str]] = set()
+def _row_linked_reference_candidates(
+    row: dict[str, Any],
+    fields_by_target: dict[str, tuple[str, ...]],
+) -> Iterable[tuple[str, str, str]]:
+    for target_resource_type, fields in fields_by_target.items():
+        for field in fields:
+            for reference in _row_reference_values(row, (field,)):
+                yield target_resource_type, reference, field
+
+
+def _linked_reference_candidates(
+    rows_by_resource: dict[str, list[dict[str, Any]]],
+) -> Iterable[tuple[str, str, str]]:
     for source_resource_type, fields_by_target in LINKED_REFERENCE_FIELDS.items():
         for row in rows_by_resource.get(source_resource_type, []):
-            for target_resource_type, fields in fields_by_target.items():
-                for field in fields:
-                    references = _row_reference_values(row, (field,))
-                    for reference in references:
-                        key = _reference_resource_key(reference, target_resource_type)
-                        if not key or key in seen_resource_keys:
-                            continue
-                        seen_resource_keys.add(key)
-                        refs.append((target_resource_type, key[1], reference, field))
+            yield from _row_linked_reference_candidates(row, fields_by_target)
+
+
+def _linked_resource_refs(
+    rows_by_resource: dict[str, list[dict[str, Any]]],
+) -> list[tuple[str, str, str, str]]:
+    refs: list[tuple[str, str, str, str]] = []
+    seen_resource_keys: set[tuple[str, str]] = set()
+    for target_resource_type, reference, field in (
+        _linked_reference_candidates(rows_by_resource)
+    ):
+        key = _reference_resource_key(reference, target_resource_type)
+        if not key or key in seen_resource_keys:
+            continue
+        seen_resource_keys.add(key)
+        refs.append((target_resource_type, key[1], reference, field))
     return refs
 
 
