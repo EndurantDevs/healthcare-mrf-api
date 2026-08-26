@@ -102,10 +102,7 @@ impl PackedOutputBuilder {
     }
 
     fn service(&mut self, service_ordinal: u64, row: &ServiceRow) -> io::Result<()> {
-        if self
-            .last_service_ordinal
-            .is_some_and(|previous| previous >= service_ordinal)
-        {
+        if self.last_service_ordinal >= Some(service_ordinal) {
             return Err(invalid(
                 "hospital MRF packed service ordinals must be strictly increasing",
             ));
@@ -113,10 +110,10 @@ impl PackedOutputBuilder {
         self.finish_current_charge()?;
         self.finish_current_service()?;
         self.current_service = Some(PendingPackedService::from_row(service_ordinal, row)?);
-        self.service_count = self
-            .service_count
-            .checked_add(1)
-            .ok_or_else(|| invalid("hospital MRF packed service count overflows"))?;
+        self.service_count = or_invalid(
+            self.service_count.checked_add(1),
+            "hospital MRF packed service count overflows",
+        )?;
         self.last_service_ordinal = Some(service_ordinal);
         self.last_charge_ordinal = None;
         Ok(())
@@ -128,30 +125,25 @@ impl PackedOutputBuilder {
         charge_ordinal: u64,
         row: &ChargeRow,
     ) -> io::Result<()> {
-        if self
-            .current_service
-            .as_ref()
-            .map(|service| service.service_ordinal)
-            != Some(service_ordinal)
-        {
+        if match self.current_service.as_ref() {
+            Some(service) => service.service_ordinal != service_ordinal,
+            None => true,
+        } {
             return Err(invalid(
                 "hospital MRF packed charge does not match the active service",
             ));
         }
-        if self
-            .last_charge_ordinal
-            .is_some_and(|previous| previous >= charge_ordinal)
-        {
+        if self.last_charge_ordinal >= Some(charge_ordinal) {
             return Err(invalid(
                 "hospital MRF packed charge ordinals must be strictly increasing",
             ));
         }
         self.finish_current_charge()?;
         let charge_key = self.next_charge_key;
-        self.next_charge_key = self
-            .next_charge_key
-            .checked_add(1)
-            .ok_or_else(|| invalid("hospital MRF packed charge key exceeds u32"))?;
+        self.next_charge_key = or_invalid(
+            self.next_charge_key.checked_add(1),
+            "hospital MRF packed charge key exceeds u32",
+        )?;
         self.current_charge = Some(CurrentPackedCharge {
             service_ordinal,
             charge_ordinal,
@@ -169,10 +161,10 @@ impl PackedOutputBuilder {
         charge_ordinal: u64,
         row: &PayerChargeRow,
     ) -> io::Result<()> {
-        let charge = self
-            .current_charge
-            .as_ref()
-            .ok_or_else(|| invalid("hospital MRF packed payer row requires an active charge"))?;
+        let charge = or_invalid(
+            self.current_charge.as_ref(),
+            "hospital MRF packed payer row requires an active charge",
+        )?;
         if charge.service_ordinal != service_ordinal || charge.charge_ordinal != charge_ordinal {
             return Err(invalid(
                 "hospital MRF packed payer row does not match the active charge",
@@ -182,10 +174,10 @@ impl PackedOutputBuilder {
         let gross_charge = charge.row.gross_charge.clone();
         let discounted_cash = charge.row.discounted_cash.clone();
         let fact_ordinal = self.next_fact_ordinal;
-        self.next_fact_ordinal = self
-            .next_fact_ordinal
-            .checked_add(1)
-            .ok_or_else(|| invalid("hospital MRF packed fact ordinal exceeds u64"))?;
+        self.next_fact_ordinal = or_invalid(
+            self.next_fact_ordinal.checked_add(1),
+            "hospital MRF packed fact ordinal exceeds u64",
+        )?;
         let selector_key =
             crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {
                 payer_name: row.payer_name.clone(),
@@ -228,23 +220,26 @@ impl PackedOutputBuilder {
         let Some(charge) = self.current_charge.take() else {
             return Ok(());
         };
-        let fact_count = u32::try_from(
-            self.next_fact_ordinal
-                .checked_sub(charge.first_fact_ordinal)
-                .ok_or_else(|| invalid("hospital MRF packed fact range is invalid"))?,
-        )
-        .map_err(|_| invalid("hospital MRF packed charge fact count exceeds u32"))?;
-        let selector_code_count = self
-            .current_service
-            .as_ref()
-            .ok_or_else(|| invalid("hospital MRF packed charge has no active service"))?
-            .selector_code_indexes
-            .len();
+        let fact_count = map_invalid(
+            u32::try_from(or_invalid(
+                self.next_fact_ordinal
+                    .checked_sub(charge.first_fact_ordinal),
+                "hospital MRF packed fact range is invalid",
+            )?),
+            "hospital MRF packed charge fact count exceeds u32",
+        )?;
+        let selector_code_count = or_invalid(
+            self.current_service.as_ref(),
+            "hospital MRF packed charge has no active service",
+        )?
+        .selector_code_indexes
+        .len();
         for position in 0..selector_code_count {
             let code = {
-                let service = self.current_service.as_ref().ok_or_else(|| {
-                    invalid("hospital MRF packed charge has no active service")
-                })?;
+                let service = self
+                    .current_service
+                    .as_ref()
+                    .expect("active service was validated above");
                 service.codes[service.selector_code_indexes[position]]
                     .code
                     .clone()
@@ -257,7 +252,7 @@ impl PackedOutputBuilder {
         let service = self
             .current_service
             .as_mut()
-            .ok_or_else(|| invalid("hospital MRF packed charge has no active service"))?;
+            .expect("active service was validated above");
         service.had_charge = true;
         service.charges.push(
             crate::hospital_price_service_block::HospitalPriceChargeRow {
@@ -278,23 +273,22 @@ impl PackedOutputBuilder {
         if self.service_charge_count + service.charges.len()
             == crate::hospital_price_service_block::HOSPITAL_PRICE_SERVICE_BLOCK_MAX_CHARGES
         {
-            self.finish_current_service_segment()?;
+            self.finish_current_service_segment();
             self.flush_service_rows()?;
         }
         Ok(())
     }
 
-    fn finish_current_service_segment(&mut self) -> io::Result<()> {
+    fn finish_current_service_segment(&mut self) {
         let Some(service) = self.current_service.as_mut() else {
-            return Ok(());
+            return;
         };
         if service.charges.is_empty() {
-            return Ok(());
+            return;
         }
         let charges = std::mem::take(&mut service.charges);
         self.service_charge_count += charges.len();
         self.service_rows.push(service.row_with_charges(charges));
-        Ok(())
     }
 
     fn finish_current_service(&mut self) -> io::Result<()> {
@@ -306,7 +300,7 @@ impl PackedOutputBuilder {
                 "hospital MRF packed service must contain at least one charge",
             ));
         }
-        self.finish_current_service_segment()?;
+        self.finish_current_service_segment();
         self.current_service = None;
         Ok(())
     }
@@ -340,13 +334,9 @@ impl PackedOutputBuilder {
                         block_kind: HOSPITAL_PRICE_SERVICE_BLOCK_KIND,
                         block_ordinal,
                         logical_first: first_service,
-                        logical_count: u32::try_from(rows.len()).map_err(|_| {
-                            invalid("hospital MRF packed service row count exceeds u32")
-                        })?,
+                        logical_count: rows.len() as u32,
                         secondary_first: first_charge,
-                        secondary_count: u32::try_from(charge_count).map_err(|_| {
-                            invalid("hospital MRF packed charge row count exceeds u32")
-                        })?,
+                        secondary_count: charge_count as u32,
                         page_index: 0,
                         page_count: 0,
                         key_sha256: None,
@@ -354,10 +344,7 @@ impl PackedOutputBuilder {
                     },
                     &payload,
                 )?;
-                self.written_charge_count = self
-                    .written_charge_count
-                    .checked_add(charge_count as u64)
-                    .ok_or_else(|| invalid("hospital MRF packed written charge count overflows"))?;
+                self.written_charge_count += charge_count as u64;
                 Ok(())
             }
             Err(error) if service_block_size_error(&error) => {
@@ -389,15 +376,10 @@ impl PackedOutputBuilder {
     ) -> io::Result<()> {
         let payload = match crate::hospital_price_block::encode_fact_block(rows) {
             Ok(payload) => payload,
-            Err(_) if rows.len() > 1 => {
+            Err(error) if rows.len() > 1 && fact_block_size_error(&error) => {
                 let middle = rows.len() / 2;
                 self.write_fact_rows(first_fact_ordinal, &rows[..middle])?;
-                return self.write_fact_rows(
-                    first_fact_ordinal
-                        .checked_add(middle as u64)
-                        .ok_or_else(|| invalid("hospital MRF packed fact block range overflows"))?,
-                    &rows[middle..],
-                );
+                return self.write_fact_rows(self.written_fact_count, &rows[middle..]);
             }
             Err(error) => return Err(invalid(error)),
         };
@@ -409,12 +391,7 @@ impl PackedOutputBuilder {
         if raw_bytes > PACKED_FACT_TARGET_BYTES && rows.len() > 1 {
             let middle = rows.len() / 2;
             self.write_fact_rows(first_fact_ordinal, &rows[..middle])?;
-            return self.write_fact_rows(
-                first_fact_ordinal
-                    .checked_add(middle as u64)
-                    .ok_or_else(|| invalid("hospital MRF packed fact block range overflows"))?,
-                &rows[middle..],
-            );
+            return self.write_fact_rows(self.written_fact_count, &rows[middle..]);
         }
         if first_fact_ordinal != self.written_fact_count {
             return Err(invalid(
@@ -437,10 +414,7 @@ impl PackedOutputBuilder {
             },
             &payload,
         )?;
-        self.written_fact_count = self
-            .written_fact_count
-            .checked_add(rows.len() as u64)
-            .ok_or_else(|| invalid("hospital MRF packed written fact count overflows"))?;
+        self.written_fact_count += rows.len() as u64;
         Ok(())
     }
 }

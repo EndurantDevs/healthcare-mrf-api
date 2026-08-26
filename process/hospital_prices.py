@@ -48,6 +48,7 @@ from process.hospital_price_scratch import (
     HOSPITAL_SOURCE_TMP_PREFIX,
     owned_tmp_root as _owned_tmp_root,
     sweep_transient_source_roots as _sweep_transient_source_roots,
+    transient_relative_path as _transient_relative_path,
     unlink_transient_source as _unlink_transient_source,
 )
 from process.hospital_price_store import (
@@ -118,23 +119,8 @@ async def _ensure_content(
         ),
         preserve_cancellation=True,
     )
-    try:
-        raw_path = Path(raw.raw_path).resolve(strict=True)
-        scratch_root = Path(store.tmp_dir).resolve(strict=True)
-        relative_raw = raw_path.relative_to(scratch_root)
-    except (OSError, ValueError) as exc:
-        raise RuntimeError(
-            "hospital source artifact is outside hospital source scratch"
-        ) from exc
-    if (
-        len(relative_raw.parts) < 3
-        or not relative_raw.parts[0].startswith(HOSPITAL_SOURCE_TMP_PREFIX)
-        or relative_raw.parts[1] != "raw"
-    ):
-        raise RuntimeError(
-            "hospital source artifact is outside task-owned raw scratch"
-        )
-    source_root = scratch_root / relative_raw.parts[0]
+    relative_raw = _transient_relative_path(store, raw)
+    source_root = _owned_tmp_root(store) / relative_raw.parts[0]
     with tempfile.TemporaryDirectory(prefix="projection-", dir=source_root) as output:
         receipt = await run_native_parser(
             Path(raw.raw_path), Path(output), version_id, source_format, raw.byte_count,

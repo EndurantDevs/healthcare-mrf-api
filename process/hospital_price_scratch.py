@@ -43,7 +43,9 @@ def owned_tmp_root(store: Any) -> Path:
     return tmp_root
 
 
-def _transient_relative_path(store: Any, raw: Any) -> Path:
+def transient_relative_path(store: Any, raw: Any) -> Path:
+    """Return one source path relative to its validated scratch root."""
+
     source_path = Path(raw.raw_path)
     try:
         logical_relative = Path(os.path.abspath(source_path)).relative_to(
@@ -76,7 +78,7 @@ def unlink_transient_source(store: Any, raw: Any) -> None:
 
     if not _SAFE_DIR_FD_UNLINK:
         raise RuntimeError("hospital source cleanup requires anchored directory unlink")
-    relative_path = _transient_relative_path(store, raw)
+    relative_path = transient_relative_path(store, raw)
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     directory_fds: list[int] = []
     try:

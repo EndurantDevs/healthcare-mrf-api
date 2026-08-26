@@ -13,6 +13,8 @@ pub const HOSPITAL_PRICE_FACT_BLOCK_MAX_RAW_BYTES: usize = 4 * 1024 * 1024;
 pub const HOSPITAL_PRICE_FACT_BLOCK_MAX_COMPRESSED_BYTES: usize =
     HOSPITAL_PRICE_FACT_BLOCK_MAX_RAW_BYTES + 64 * 1024;
 pub const HOSPITAL_PRICE_FACT_BLOCK_MAX_DECODED_TEXT_BYTES: usize = 64 * 1024 * 1024;
+pub const HOSPITAL_PRICE_FACT_BLOCK_RAW_SIZE_ERROR: &str =
+    "hospital price fact block raw payload exceeds 4 MiB";
 
 const LANE_COUNT: usize = 17;
 const RAW_HEADER_BYTES: usize = 4 + LANE_COUNT * 8;

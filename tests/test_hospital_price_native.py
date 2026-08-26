@@ -455,16 +455,19 @@ async def test_native_runner_reports_process_and_spawn_failures(tmp_path, monkey
 
 def test_version_identity_is_bound_to_content_and_parser_contract():
     content = "b" * 64
-    typed_contract = hashlib.sha256(
-        b"hospital-mrf-copy-v3-resource-bounded:"
-        b"5333564a710f80d7740180b9ffab8dbdcba9b502"
+    actual = native.hospital_price_version_id(content)
+    expected = hashlib.sha256(
+        (
+            f"hospital-price-version-v1\0{content}\0"
+            f"{native.HOSPITAL_MRF_PARSER_CONTRACT_SHA256}"
+        ).encode("ascii")
     ).hexdigest()
-    typed_version = hashlib.sha256(
-        f"hospital-price-version-v1\0{content}\0{typed_contract}".encode()
+    other_contract = hashlib.sha256(
+        f"hospital-price-version-v1\0{content}\0{'0' * 64}".encode("ascii")
     ).hexdigest()
 
-    assert native.hospital_price_version_id(content) == native.hospital_price_version_id(content)
+    assert actual == expected
+    assert actual != other_contract
     assert native.hospital_price_version_id(content) != native.hospital_price_version_id("c" * 64)
-    assert native.hospital_price_version_id(content) != typed_version
     with pytest.raises(ValueError, match="SHA-256"):
         native.hospital_price_version_id("not-a-digest")

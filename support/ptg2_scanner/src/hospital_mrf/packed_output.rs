@@ -11,6 +11,20 @@ const MAX_SELECTOR_KEYS: usize = 1_000_000;
 const MAX_SELECTOR_KEY_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 const SELECTOR_KEY_MEMORY_OVERHEAD_BYTES: u64 = 256;
 
+fn or_invalid<T>(value: Option<T>, message: &'static str) -> io::Result<T> {
+    match value {
+        Some(value) => Ok(value),
+        None => Err(invalid(message)),
+    }
+}
+
+fn map_invalid<T, E>(value: Result<T, E>, message: &'static str) -> io::Result<T> {
+    match value {
+        Ok(value) => Ok(value),
+        Err(_) => Err(invalid(message)),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct PackedArtifactSummary {
     kind: &'static str,
@@ -126,32 +140,47 @@ impl PackedSink {
     }
 
     fn writer_mut(&mut self) -> io::Result<&mut BufWriter<DigestWriter>> {
-        self.writer
-            .as_mut()
-            .ok_or_else(|| invalid("hospital MRF packed sink is already closed"))
+        or_invalid(
+            self.writer.as_mut(),
+            "hospital MRF packed sink is already closed",
+        )
     }
 
     fn write_record(&mut self, metadata: PackedRecordMetadata, payload: &[u8]) -> io::Result<()> {
-        let block_ordinal = i64::try_from(metadata.block_ordinal)
-            .map_err(|_| invalid("hospital MRF packed block ordinal exceeds PostgreSQL int8"))?;
-        let logical_first = i64::try_from(metadata.logical_first)
-            .map_err(|_| invalid("hospital MRF packed logical first exceeds PostgreSQL int8"))?;
-        let logical_count = i32::try_from(metadata.logical_count)
-            .map_err(|_| invalid("hospital MRF packed logical count exceeds PostgreSQL int4"))?;
-        let secondary_first = i64::try_from(metadata.secondary_first)
-            .map_err(|_| invalid("hospital MRF packed secondary first exceeds PostgreSQL int8"))?;
-        let secondary_count = i32::try_from(metadata.secondary_count)
-            .map_err(|_| invalid("hospital MRF packed secondary count exceeds PostgreSQL int4"))?;
-        let page_index = i32::try_from(metadata.page_index)
-            .map_err(|_| invalid("hospital MRF packed page index exceeds PostgreSQL int4"))?;
-        let page_count = i32::try_from(metadata.page_count)
-            .map_err(|_| invalid("hospital MRF packed page count exceeds PostgreSQL int4"))?;
+        let block_ordinal = map_invalid(
+            i64::try_from(metadata.block_ordinal),
+            "hospital MRF packed block ordinal exceeds PostgreSQL int8",
+        )?;
+        let logical_first = map_invalid(
+            i64::try_from(metadata.logical_first),
+            "hospital MRF packed logical first exceeds PostgreSQL int8",
+        )?;
+        let logical_count = map_invalid(
+            i32::try_from(metadata.logical_count),
+            "hospital MRF packed logical count exceeds PostgreSQL int4",
+        )?;
+        let secondary_first = map_invalid(
+            i64::try_from(metadata.secondary_first),
+            "hospital MRF packed secondary first exceeds PostgreSQL int8",
+        )?;
+        let secondary_count = map_invalid(
+            i32::try_from(metadata.secondary_count),
+            "hospital MRF packed secondary count exceeds PostgreSQL int4",
+        )?;
+        let page_index = map_invalid(
+            i32::try_from(metadata.page_index),
+            "hospital MRF packed page index exceeds PostgreSQL int4",
+        )?;
+        let page_count = map_invalid(
+            i32::try_from(metadata.page_count),
+            "hospital MRF packed page count exceeds PostgreSQL int4",
+        )?;
         let payload_sha256: [u8; 32] = Sha256::digest(payload).into();
         let version_id = self.version_id.as_bytes();
-        let writer = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| invalid("hospital MRF packed sink is already closed"))?;
+        let writer = or_invalid(
+            self.writer.as_mut(),
+            "hospital MRF packed sink is already closed",
+        )?;
         writer.write_all(&PG_BINARY_COPY_FIELD_COUNT.to_be_bytes())?;
         write_binary_copy_field(writer, Some(version_id))?;
         write_binary_copy_field(writer, Some(&metadata.block_kind.to_be_bytes()))?;
@@ -164,21 +193,24 @@ impl PackedSink {
         write_binary_copy_field(writer, Some(&page_count.to_be_bytes()))?;
         write_binary_copy_field(
             writer,
-            metadata.key_sha256.as_ref().map(|value| value.as_slice()),
+            match metadata.key_sha256.as_ref() {
+                Some(value) => Some(value.as_slice()),
+                None => None,
+            },
         )?;
         write_binary_copy_field(
             writer,
-            metadata
-                .parent_sha256
-                .as_ref()
-                .map(|value| value.as_slice()),
+            match metadata.parent_sha256.as_ref() {
+                Some(value) => Some(value.as_slice()),
+                None => None,
+            },
         )?;
         write_binary_copy_field(writer, Some(&payload_sha256))?;
         write_binary_copy_field(writer, Some(payload))?;
-        self.rows = self
-            .rows
-            .checked_add(1)
-            .ok_or_else(|| invalid("hospital MRF packed record count overflows"))?;
+        self.rows = or_invalid(
+            self.rows.checked_add(1),
+            "hospital MRF packed record count overflows",
+        )?;
         Ok(())
     }
 
@@ -209,8 +241,7 @@ fn write_binary_copy_field<W: Write>(writer: &mut W, value: Option<&[u8]>) -> io
     let Some(value) = value else {
         return writer.write_all(&(-1i32).to_be_bytes());
     };
-    let length = i32::try_from(value.len())
-        .map_err(|_| invalid("hospital MRF packed COPY field exceeds PostgreSQL int4"))?;
+    let length = value.len() as i32;
     writer.write_all(&length.to_be_bytes())?;
     writer.write_all(value)
 }
@@ -251,10 +282,7 @@ fn packed_service_code_indexes(row: &ServiceRow) -> io::Result<Vec<usize>> {
             ));
         }
         for value in [&code.code_type, &code.code] {
-            raw_bytes = raw_bytes
-                .checked_add(4)
-                .and_then(|total| total.checked_add(value.len()))
-                .ok_or_else(|| invalid("hospital MRF packed service code bytes overflow"))?;
+            raw_bytes += 4 + value.len();
         }
         if raw_bytes
             > crate::hospital_price_service_block::HOSPITAL_PRICE_SERVICE_BLOCK_MAX_RAW_BYTES

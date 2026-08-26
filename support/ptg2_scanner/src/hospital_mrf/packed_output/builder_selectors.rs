@@ -12,10 +12,7 @@ impl PackedOutputBuilder {
                 "hospital MRF packed selector key count exceeds {MAX_SELECTOR_KEYS}"
             )));
         }
-        let next_memory_bytes = self
-            .selector_key_memory_bytes
-            .checked_add(selector_key_memory_bytes(&key)?)
-            .ok_or_else(|| invalid("hospital MRF packed selector key memory bytes overflow"))?;
+        let next_memory_bytes = self.selector_key_memory_bytes + selector_key_memory_bytes(&key);
         let memory_limit = self.max_output_bytes.min(MAX_SELECTOR_KEY_MEMORY_BYTES);
         if next_memory_bytes > memory_limit {
             return Err(invalid(format!(
@@ -35,19 +32,17 @@ impl PackedOutputBuilder {
         reference: u64,
     ) -> io::Result<()> {
         let ordinal = self.selector_key_ordinal(key)?;
-        let next_bytes = self
-            .selector_spool_bytes
-            .checked_add(SELECTOR_SPOOL_RECORD_BYTES as u64)
-            .ok_or_else(|| invalid("hospital MRF packed selector scratch byte count overflows"))?;
-        next_bytes
-            .checked_mul(3)
-            .filter(|peak| *peak <= self.max_output_bytes)
-            .ok_or_else(|| {
-                invalid(format!(
-                    "hospital MRF packed selector peak scratch exceeds configured limit {} bytes",
-                    self.max_output_bytes
-                ))
-            })?;
+        let next_bytes = or_invalid(
+            self.selector_spool_bytes
+                .checked_add(SELECTOR_SPOOL_RECORD_BYTES as u64),
+            "hospital MRF packed selector scratch byte count overflows",
+        )?;
+        if !matches!(next_bytes.checked_mul(3), Some(peak) if peak <= self.max_output_bytes) {
+            return Err(invalid(format!(
+                "hospital MRF packed selector peak scratch exceeds configured limit {} bytes",
+                self.max_output_bytes
+            )));
+        }
         let key = &self.selector_keys[ordinal as usize];
         let kind = match key {
             crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(_) => 1,
@@ -55,10 +50,10 @@ impl PackedOutputBuilder {
                 ..
             } => 2,
         };
-        let writer = self
-            .selector_spool
-            .as_mut()
-            .ok_or_else(|| invalid("hospital MRF packed selector spool is already closed"))?;
+        let writer = or_invalid(
+            self.selector_spool.as_mut(),
+            "hospital MRF packed selector spool is already closed",
+        )?;
         writer.write_all(&[kind])?;
         writer.write_all(&ordinal.to_be_bytes())?;
         writer.write_all(&reference.to_be_bytes())?;
@@ -108,9 +103,10 @@ impl PackedOutputBuilder {
         let mut page_indexes = vec![0u32; self.selector_keys.len()];
         while let Some((kind, ordinal, reference)) = read_selector_spool_record(&mut reader)? {
             let capacity = {
-                let key = self.selector_keys.get(ordinal as usize).ok_or_else(|| {
-                    invalid("hospital MRF packed selector key ordinal is invalid")
-                })?;
+                let key = or_invalid(
+                    self.selector_keys.get(ordinal as usize),
+                    "hospital MRF packed selector key ordinal is invalid",
+                )?;
                 validate_selector_kind(kind, key)?;
                 selector_ref_capacity(key)?
             };
@@ -151,19 +147,21 @@ impl PackedOutputBuilder {
         if refs.is_empty() {
             return Ok(());
         }
-        let key = self
-            .selector_keys
-            .get(ordinal as usize)
-            .ok_or_else(|| invalid("hospital MRF packed selector key ordinal is invalid"))?
-            .clone();
+        let key = or_invalid(
+            self.selector_keys.get(ordinal as usize),
+            "hospital MRF packed selector key ordinal is invalid",
+        )?
+        .clone();
         let kind = key.kind();
         let slot = ordinal as usize;
-        let page_index = *page_indexes
-            .get(slot)
-            .ok_or_else(|| invalid("hospital MRF packed selector key ordinal is invalid"))?;
-        let page_count = *page_counts
-            .get(slot)
-            .ok_or_else(|| invalid("hospital MRF packed selector page count is missing"))?;
+        let page_index = *or_invalid(
+            page_indexes.get(slot),
+            "hospital MRF packed selector key ordinal is invalid",
+        )?;
+        let page_count = *or_invalid(
+            page_counts.get(slot),
+            "hospital MRF packed selector page count is missing",
+        )?;
         let entry = crate::hospital_price_selector_block::HospitalPriceSelectorEntry {
             key: key.clone(),
             refs: std::mem::take(refs),
@@ -196,9 +194,7 @@ impl PackedOutputBuilder {
                 logical_first: ordinal as u64,
                 logical_count: 1,
                 secondary_first: first_ref,
-                secondary_count: u32::try_from(ref_count).map_err(|_| {
-                    invalid("hospital MRF packed selector reference count exceeds u32")
-                })?,
+                secondary_count: ref_count as u32,
                 page_index,
                 page_count,
                 key_sha256: Some(selector_key_sha256(&key)),
@@ -206,12 +202,8 @@ impl PackedOutputBuilder {
             },
             &payload,
         )?;
-        self.selector_block_counts[selector_slot] = block_ordinal
-            .checked_add(1)
-            .ok_or_else(|| invalid("hospital MRF packed selector block count overflows"))?;
-        page_indexes[slot] = page_index
-            .checked_add(1)
-            .ok_or_else(|| invalid("hospital MRF packed selector page index overflows"))?;
+        self.selector_block_counts[selector_slot] = block_ordinal + 1;
+        page_indexes[slot] = page_index + 1;
         Ok(())
     }
 
@@ -252,29 +244,24 @@ impl PackedOutputBuilder {
                 "hospital MRF packed selector physical block counts differ from page counts",
             ));
         }
-        let (code_selector_key_count, payer_plan_selector_key_count) = self
-            .selector_keys
-            .iter()
-            .try_fold((0u64, 0u64), |(code, payer), key| match key {
-                crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(_) => code
-                    .checked_add(1)
-                    .map(|next| (next, payer))
-                    .ok_or_else(|| {
-                        invalid("hospital MRF packed code selector key count overflows")
-                    }),
+        let mut code_selector_key_count = 0u64;
+        let mut payer_plan_selector_key_count = 0u64;
+        for key in &self.selector_keys {
+            match key {
+                crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(_) => {
+                    code_selector_key_count += 1;
+                }
                 crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {
                     ..
-                } => payer
-                    .checked_add(1)
-                    .map(|next| (code, next))
-                    .ok_or_else(|| {
-                        invalid("hospital MRF packed payer-plan selector key count overflows")
-                    }),
-            })?;
-        let peak_scratch_bytes = self
-            .selector_spool_bytes
-            .checked_mul(3)
-            .ok_or_else(|| invalid("hospital MRF packed peak scratch byte count overflows"))?;
+                } => {
+                    payer_plan_selector_key_count += 1;
+                }
+            }
+        }
+        let peak_scratch_bytes = or_invalid(
+            self.selector_spool_bytes.checked_mul(3),
+            "hospital MRF packed peak scratch byte count overflows",
+        )?;
         let service_block_count = self.sinks[0].rows;
         let fact_block_count = self.sinks[1].rows;
         let mut summaries = Vec::with_capacity(self.sinks.len());

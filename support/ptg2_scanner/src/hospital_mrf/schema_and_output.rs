@@ -194,10 +194,7 @@ struct DigestWriter {
 
 impl Write for DigestWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let requested = match u64::try_from(buffer.len()) {
-            Ok(requested) => requested,
-            Err(_) => return Err(invalid("hospital MRF COPY write size exceeds u64")),
-        };
+        let requested = buffer.len() as u64;
         if self
             .aggregate_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
@@ -352,10 +349,7 @@ impl CopyOutputs {
             committed: false,
         };
         let aggregate_bytes = Arc::new(AtomicU64::new(0));
-        for (index, kind) in CopyKind::ALL.into_iter().enumerate() {
-            if kind as usize != index {
-                return Err(invalid("hospital MRF COPY sink order is inconsistent"));
-            }
+        for kind in CopyKind::ALL {
             let sink = if output_mode == HospitalMrfOutputMode::Legacy || kind.is_packed_text() {
                 Some(CopySink::create(
                     output_directory,
@@ -432,5 +426,71 @@ impl Drop for CopyOutputs {
                 let _ = fs::remove_file(&sink.final_path);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod schema_output_tail_tests {
+    use super::*;
+
+    #[test]
+    fn copy_io_failures_remain_explicit() {
+        let directory = tempfile::tempdir().unwrap();
+        let read_only_path = directory.path().join("read-only.copy");
+        fs::write(&read_only_path, b"").unwrap();
+        let aggregate_bytes = Arc::new(AtomicU64::new(0));
+        let mut sink = CopySink {
+            kind: CopyKind::Mrf,
+            partial_path: read_only_path.clone(),
+            final_path: directory.path().join("final.copy"),
+            writer: Some(BufWriter::with_capacity(
+                1,
+                DigestWriter {
+                    file: File::open(&read_only_path).unwrap(),
+                    digest: Sha256::new(),
+                    bytes: 0,
+                    aggregate_bytes: Arc::clone(&aggregate_bytes),
+                    max_output_bytes: 128,
+                },
+            )),
+            rows: 0,
+            final_owned: false,
+        };
+        assert!(sink.write_fields(&[Some("x")]).is_err());
+        assert_eq!(aggregate_bytes.load(Ordering::Relaxed), 0);
+        assert!(path_entry_exists(&read_only_path.join("child")).is_err());
+
+        let first = CopySink::create(
+            directory.path(),
+            CopyKind::Npi,
+            Arc::new(AtomicU64::new(0)),
+            128,
+        )
+        .unwrap();
+        assert!(CopySink::create(
+            directory.path(),
+            CopyKind::Npi,
+            Arc::new(AtomicU64::new(0)),
+            128,
+        )
+        .is_err());
+        drop(first);
+
+        assert!(CopyOutputs::create(
+            &directory.path().join("missing"),
+            "version",
+            128,
+            HospitalMrfOutputMode::Legacy,
+        )
+        .is_err());
+        let output_directory = tempfile::tempdir().unwrap();
+        let mut outputs = CopyOutputs::create(
+            output_directory.path(),
+            "version",
+            128,
+            HospitalMrfOutputMode::Legacy,
+        )
+        .unwrap();
+        assert!(outputs.write(CopyKind::Mrf, &[Some("nul\0")]).is_err());
     }
 }

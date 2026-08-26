@@ -79,16 +79,12 @@ fn encode_optional_decimals<'a>(
 }
 
 fn assemble_raw(lanes: &[Vec<u8>; LANE_COUNT]) -> HospitalPriceBlockResult<Vec<u8>> {
-    let payload_bytes = lanes.iter().try_fold(0usize, |total, lane| {
-        total
-            .checked_add(lane.len())
-            .ok_or_else(|| invalid("raw length overflows"))
-    })?;
-    let raw_len = RAW_HEADER_BYTES
-        .checked_add(payload_bytes)
-        .ok_or_else(|| invalid("raw length overflows"))?;
+    let payload_bytes = lanes
+        .iter()
+        .fold(0usize, |total, lane| total.saturating_add(lane.len()));
+    let raw_len = RAW_HEADER_BYTES.saturating_add(payload_bytes);
     if raw_len > HOSPITAL_PRICE_FACT_BLOCK_MAX_RAW_BYTES {
-        return Err(invalid("raw payload exceeds 4 MiB"));
+        return Err(HOSPITAL_PRICE_FACT_BLOCK_RAW_SIZE_ERROR.to_owned());
     }
     let mut raw = Vec::with_capacity(raw_len);
     put_u32(&mut raw, LANE_COUNT as u32);
@@ -104,14 +100,8 @@ fn assemble_raw(lanes: &[Vec<u8>; LANE_COUNT]) -> HospitalPriceBlockResult<Vec<u
     Ok(raw)
 }
 
-fn add_preflight_bytes(total: &mut usize, bytes: usize) -> HospitalPriceBlockResult<()> {
-    *total = total
-        .checked_add(bytes)
-        .ok_or_else(|| invalid("raw length overflows"))?;
-    if *total > HOSPITAL_PRICE_FACT_BLOCK_MAX_RAW_BYTES {
-        return Err(invalid("raw payload exceeds 4 MiB"));
-    }
-    Ok(())
+fn add_preflight_bytes(total: &mut usize, bytes: usize) {
+    *total = total.saturating_add(bytes);
 }
 
 fn preflight_raw_bytes(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockResult<()> {
@@ -121,14 +111,11 @@ fn preflight_raw_bytes(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockResul
     let mut allowed_counts = HashSet::<&str>::new();
     let mut payer_notes = HashSet::<&str>::new();
     let mut total = RAW_HEADER_BYTES + 5 * 2 + rows.len() * 8 + bitmap_bytes(rows.len()) * 9;
-    if total > HOSPITAL_PRICE_FACT_BLOCK_MAX_RAW_BYTES {
-        return Err(invalid("raw payload exceeds 4 MiB"));
-    }
     for row in rows {
         if payer_plans.insert((&row.payer_name, &row.plan_name)) {
-            add_preflight_bytes(&mut total, 8)?;
-            add_preflight_bytes(&mut total, row.payer_name.len())?;
-            add_preflight_bytes(&mut total, row.plan_name.len())?;
+            add_preflight_bytes(&mut total, 8);
+            add_preflight_bytes(&mut total, row.payer_name.len());
+            add_preflight_bytes(&mut total, row.plan_name.len());
         }
         for (dictionary, value) in [
             (&mut algorithms, row.negotiated_algorithm.as_deref()),
@@ -138,8 +125,8 @@ fn preflight_raw_bytes(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockResul
         ] {
             if let Some(value) = value {
                 if dictionary.insert(value) {
-                    add_preflight_bytes(&mut total, 4)?;
-                    add_preflight_bytes(&mut total, value.len())?;
+                    add_preflight_bytes(&mut total, 4);
+                    add_preflight_bytes(&mut total, value.len());
                 }
             }
         }
@@ -157,33 +144,33 @@ fn preflight_raw_bytes(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockResul
             if !valid_decimal(value) {
                 return Err(invalid("decimal value is invalid"));
             }
-            add_preflight_bytes(&mut total, 4)?;
-            add_preflight_bytes(&mut total, value.len())?;
+            add_preflight_bytes(&mut total, 4);
+            add_preflight_bytes(&mut total, value.len());
         }
         add_preflight_bytes(
             &mut total,
             2 * usize::from(row.negotiated_algorithm.is_some())
                 + 2 * usize::from(row.allowed_count.is_some())
                 + 2 * usize::from(row.additional_payer_notes.is_some()),
-        )?;
+        );
+        if total > HOSPITAL_PRICE_FACT_BLOCK_MAX_RAW_BYTES {
+            return Err(HOSPITAL_PRICE_FACT_BLOCK_RAW_SIZE_ERROR.to_owned());
+        }
     }
     Ok(())
 }
 
 fn frame_raw(raw: &[u8], row_count: usize) -> HospitalPriceBlockResult<Vec<u8>> {
     if raw.len() > HOSPITAL_PRICE_FACT_BLOCK_MAX_RAW_BYTES {
-        return Err(invalid("raw payload exceeds 4 MiB"));
+        return Err(HOSPITAL_PRICE_FACT_BLOCK_RAW_SIZE_ERROR.to_owned());
     }
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(6));
     encoder
         .write_all(raw)
-        .map_err(|error| invalid(format!("compression failed: {error}")))?;
+        .expect("Vec-backed zlib writes cannot fail");
     let compressed = encoder
         .finish()
-        .map_err(|error| invalid(format!("compression failed: {error}")))?;
-    if compressed.len() > HOSPITAL_PRICE_FACT_BLOCK_MAX_COMPRESSED_BYTES {
-        return Err(invalid("compressed payload exceeds the byte limit"));
-    }
+        .expect("Vec-backed zlib finalization cannot fail");
     let mut block = Vec::with_capacity(HOSPITAL_PRICE_FACT_BLOCK_HEADER_BYTES + compressed.len());
     block.extend_from_slice(HOSPITAL_PRICE_FACT_BLOCK_MAGIC);
     put_u32(&mut block, HOSPITAL_PRICE_FACT_BLOCK_VERSION);
@@ -211,25 +198,42 @@ pub fn encode_fact_block(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockRes
     let mut allowed_count_ids = Vec::with_capacity(rows.len());
     let mut payer_note_ids = Vec::with_capacity(rows.len());
     for row in rows {
-        payer_plan_ids.push(payer_plans.intern(&row.payer_name, &row.plan_name)?);
+        payer_plan_ids.push(
+            payer_plans
+                .intern(&row.payer_name, &row.plan_name)
+                .expect("row cap bounds payer-plan dictionary IDs"),
+        );
         algorithm_ids.push(
             row.negotiated_algorithm
                 .as_deref()
-                .map(|value| algorithms.intern(value))
-                .transpose()?,
+                .map(|value| {
+                    algorithms
+                        .intern(value)
+                        .expect("row cap bounds algorithm dictionary IDs")
+                }),
         );
-        methodology_ids.push(methodologies.intern(&row.methodology)?);
+        methodology_ids.push(
+            methodologies
+                .intern(&row.methodology)
+                .expect("row cap bounds methodology dictionary IDs"),
+        );
         allowed_count_ids.push(
             row.allowed_count
                 .as_deref()
-                .map(|value| allowed_counts.intern(value))
-                .transpose()?,
+                .map(|value| {
+                    allowed_counts
+                        .intern(value)
+                        .expect("row cap bounds allowed-count dictionary IDs")
+                }),
         );
         payer_note_ids.push(
             row.additional_payer_notes
                 .as_deref()
-                .map(|value| payer_notes.intern(value))
-                .transpose()?,
+                .map(|value| {
+                    payer_notes
+                        .intern(value)
+                        .expect("row cap bounds payer-note dictionary IDs")
+                }),
         );
     }
     let mut charge_keys = Vec::with_capacity(rows.len() * 4);
@@ -237,41 +241,58 @@ pub fn encode_fact_block(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockRes
         put_u32(&mut charge_keys, row.charge_key);
     }
     let lanes = [
-        payer_plans.encode()?,
-        algorithms.encode()?,
-        methodologies.encode()?,
-        allowed_counts.encode()?,
-        payer_notes.encode()?,
+        payer_plans
+            .encode()
+            .expect("preflight bounds payer-plan dictionary bytes"),
+        algorithms
+            .encode()
+            .expect("preflight bounds algorithm dictionary bytes"),
+        methodologies
+            .encode()
+            .expect("preflight bounds methodology dictionary bytes"),
+        allowed_counts
+            .encode()
+            .expect("preflight bounds allowed-count dictionary bytes"),
+        payer_notes
+            .encode()
+            .expect("preflight bounds payer-note dictionary bytes"),
         charge_keys,
         encode_required_ids(&payer_plan_ids),
         encode_optional_decimals(
             rows.iter().map(|row| row.negotiated_dollar.as_deref()),
             rows.len(),
-        )?,
+        )
+        .expect("preflight validates negotiated dollars"),
         encode_optional_decimals(
             rows.iter().map(|row| row.negotiated_percentage.as_deref()),
             rows.len(),
-        )?,
+        )
+        .expect("preflight validates negotiated percentages"),
         encode_optional_ids(&algorithm_ids),
         encode_required_ids(&methodology_ids),
         encode_optional_decimals(
             rows.iter().map(|row| row.median_amount.as_deref()),
             rows.len(),
-        )?,
+        )
+        .expect("preflight validates median amounts"),
         encode_optional_decimals(
             rows.iter().map(|row| row.percentile_10.as_deref()),
             rows.len(),
-        )?,
+        )
+        .expect("preflight validates percentile-10 amounts"),
         encode_optional_decimals(
             rows.iter().map(|row| row.percentile_90.as_deref()),
             rows.len(),
-        )?,
+        )
+        .expect("preflight validates percentile-90 amounts"),
         encode_optional_ids(&allowed_count_ids),
         encode_optional_ids(&payer_note_ids),
         encode_optional_decimals(
             rows.iter().map(|row| row.comparison_amount.as_deref()),
             rows.len(),
-        )?,
+        )
+        .expect("preflight validates comparison amounts"),
     ];
-    frame_raw(&assemble_raw(&lanes)?, rows.len())
+    let raw = assemble_raw(&lanes).expect("preflight bounds assembled raw bytes");
+    frame_raw(&raw, rows.len())
 }

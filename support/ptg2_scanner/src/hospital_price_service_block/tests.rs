@@ -68,6 +68,26 @@ mod tests {
         decode_frame(block).unwrap().2
     }
 
+    fn assert_error<T>(result: HospitalPriceServiceBlockResult<T>, message: &str) {
+        assert_eq!(result.err().as_deref(), Some(message));
+    }
+
+    fn assert_authenticated_raw_error(
+        raw: &[u8],
+        service_count: usize,
+        charge_count: usize,
+        message: &str,
+    ) {
+        assert_error(
+            decode_service_block(&frame_raw(raw, service_count, charge_count).unwrap()),
+            message,
+        );
+    }
+
+    fn raw_u64(raw: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap())
+    }
+
     #[test]
     fn multi_code_multi_charge_null_and_lexical_decimal_round_trip() {
         let expected = services();
@@ -145,6 +165,103 @@ mod tests {
         );
     }
 
+    include!("tests_validation_tail.rs");
+
+    #[test]
+    fn direct_cursor_guards_reject_impossible_public_states() {
+        assert_error(
+            frame_raw(
+                &vec![0; HOSPITAL_PRICE_SERVICE_BLOCK_MAX_RAW_BYTES + 1],
+                1,
+                1,
+            ),
+            &invalid("raw payload exceeds 4 MiB"),
+        );
+
+        let mut cursor = Cursor::new(&[]);
+        assert_error(
+            cursor.reserve_decoded(usize::MAX, 2, "test"),
+            &invalid("test decoded size overflows"),
+        );
+
+        let mut cursor = Cursor {
+            bytes: &[],
+            position: 0,
+            decoded_bytes: 1,
+        };
+        assert_error(
+            cursor.reserve_decoded(usize::MAX, 1, "test"),
+            &invalid("test decoded size overflows"),
+        );
+
+        let mut cursor = Cursor::new(&[]);
+        assert_error(
+            cursor.reserve_decoded(
+                HOSPITAL_PRICE_SERVICE_BLOCK_MAX_DECODED_BYTES + 1,
+                1,
+                "test",
+            ),
+            &invalid("decoded output exceeds 64 MiB"),
+        );
+
+        let mut cursor = Cursor {
+            bytes: &[],
+            position: usize::MAX,
+            decoded_bytes: 0,
+        };
+        assert_error(cursor.take(1), &invalid("raw field length overflows"));
+
+        let mut cursor = Cursor::new(&[]);
+        assert_error(cursor.take(1), &invalid("raw payload is truncated"));
+
+        assert_error(Cursor::new(&[]).u8(), &invalid("raw payload is truncated"));
+        assert_error(Cursor::new(&[]).u32(), &invalid("raw payload is truncated"));
+        assert_error(Cursor::new(&[]).u64(), &invalid("raw payload is truncated"));
+        assert_error(
+            Cursor::new(&[]).text("test"),
+            &invalid("raw payload is truncated"),
+        );
+        assert_error(
+            Cursor::new(&[1, 0, 0, 0]).text("test"),
+            &invalid("raw payload is truncated"),
+        );
+        assert_error(
+            Cursor::new(&[]).optional_text("test"),
+            &invalid("raw payload is truncated"),
+        );
+        assert_error(
+            Cursor::new(&[1]).optional_text("test"),
+            &invalid("raw payload is truncated"),
+        );
+        assert_error(
+            Cursor::new(&[1, 0, 0, 0, 0xff]).text("test"),
+            &invalid("test contains invalid UTF-8"),
+        );
+        let mut cursor = Cursor {
+            bytes: &[1, 0, 0, 0, b'x'],
+            position: 0,
+            decoded_bytes: HOSPITAL_PRICE_SERVICE_BLOCK_MAX_DECODED_BYTES,
+        };
+        assert_error(
+            cursor.text("test"),
+            &invalid("decoded output exceeds 64 MiB"),
+        );
+
+        let count = 1u32.to_le_bytes();
+        let mut cursor = Cursor::new(&count);
+        assert_error(
+            cursor.bounded_count("test", 1),
+            &invalid("test count exceeds the raw payload"),
+        );
+        assert_error(
+            Cursor::new(&[]).bounded_count("test", 1),
+            &invalid("raw payload is truncated"),
+        );
+
+        let cursor = Cursor::new(&[0]);
+        assert_error(cursor.finish(), &invalid("raw payload has trailing bytes"));
+    }
+
     #[test]
     fn corruption_truncation_trailing_utf8_decimal_and_zlib_tail_fail_closed() {
         let valid = encode_service_block(&services()).unwrap();
@@ -185,5 +302,185 @@ mod tests {
         zlib_trailing[24..28].copy_from_slice(&(compressed_len + 1).to_le_bytes());
         zlib_trailing.push(0);
         assert!(decode_service_block(&zlib_trailing).is_err());
+    }
+
+    #[test]
+    fn authenticated_header_and_raw_corruption_matrix_fails_closed() {
+        let valid = encode_service_block(&services()).unwrap();
+
+        assert_error(decode_service_block(&[]), &invalid("header is truncated"));
+
+        for (offset, value, message) in [
+            (8, 2, "version is unsupported"),
+            (12, 0, "service or charge count is invalid"),
+            (12, 513, "service or charge count is invalid"),
+            (16, 0, "service or charge count is invalid"),
+            (16, 513, "service or charge count is invalid"),
+            (12, 4, "service or charge count is invalid"),
+            (
+                20,
+                HOSPITAL_PRICE_SERVICE_BLOCK_MAX_RAW_BYTES as u32 + 1,
+                "raw length exceeds 4 MiB",
+            ),
+            (
+                24,
+                HOSPITAL_PRICE_SERVICE_BLOCK_MAX_COMPRESSED_BYTES as u32 + 1,
+                "compressed length exceeds the byte limit",
+            ),
+            (
+                20,
+                header_u32(&valid, 20) + 1,
+                "decompressed length does not match the header",
+            ),
+        ] {
+            let mut block = valid.clone();
+            block[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert_error(decode_service_block(&block), &invalid(message));
+        }
+
+        let mut corrupt_zlib = valid.clone();
+        corrupt_zlib[HOSPITAL_PRICE_SERVICE_BLOCK_HEADER_BYTES] ^= 0xff;
+        let error = decode_service_block(&corrupt_zlib).unwrap_err();
+        assert!(
+            error.starts_with(&invalid("decompression failed:")),
+            "{error}"
+        );
+
+        let raw = raw_from(&valid);
+        assert_eq!(header_u32(&raw, 56), 2);
+        assert_eq!(header_u32(&raw, 94), 2);
+        assert_eq!(header_u32(&raw, 136), 2);
+        assert_eq!(header_u32(&raw, 213), 8);
+        assert_eq!(raw_u64(&raw, 217), 1);
+        assert_eq!(raw_u64(&raw, 261), 9);
+        let mut cases = Vec::new();
+
+        let mut changed = raw[..70].to_vec();
+        changed[56..60].copy_from_slice(&1u32.to_le_bytes());
+        changed[60..64].copy_from_slice(&20u32.to_le_bytes());
+        assert_authenticated_raw_error(&changed, 1, 1, &invalid("raw payload is truncated"));
+
+        let mut changed = raw[..74].to_vec();
+        changed[56..60].copy_from_slice(&1u32.to_le_bytes());
+        changed[67..71].copy_from_slice(&20u32.to_le_bytes());
+        assert_authenticated_raw_error(&changed, 1, 1, &invalid("raw payload is truncated"));
+
+        assert_authenticated_raw_error(
+            &raw[..94],
+            1,
+            2,
+            &invalid("raw payload is truncated"),
+        );
+        assert_authenticated_raw_error(
+            &raw[..217],
+            1,
+            2,
+            &invalid("raw payload is truncated"),
+        );
+
+        let mut changed = raw.clone();
+        changed[110..114].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_authenticated_raw_error(&changed, 2, 3, &invalid("raw payload is truncated"));
+
+        for (offset, field) in [
+            (123, "billing class"),
+            (163, "discounted cash"),
+            (173, "minimum"),
+            (184, "maximum"),
+            (195, "additional generic notes"),
+        ] {
+            let mut changed = raw.clone();
+            changed[offset] = 2;
+            assert_authenticated_raw_error(
+                &changed,
+                2,
+                3,
+                &invalid(format!("{field} has an invalid presence tag")),
+            );
+        }
+
+        let mut changed = raw.clone();
+        changed[140..144].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_authenticated_raw_error(&changed, 2, 3, &invalid("raw payload is truncated"));
+
+        let mut changed = raw.clone();
+        changed.truncate(changed.len() - 1);
+        cases.push((changed, 2, 3, "raw payload is truncated"));
+
+        let mut changed = raw.clone();
+        changed[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        cases.push((changed, 2, 3, "final-fact range overflows u64"));
+
+        cases.push((Vec::new(), 1, 1, "raw payload is truncated"));
+
+        let mut changed = raw.clone();
+        changed[16..20].copy_from_slice(&0u32.to_le_bytes());
+        cases.push((changed, 2, 3, "description must be non-empty"));
+
+        let mut changed = raw.clone();
+        changed[49] = 2;
+        cases.push((changed, 2, 3, "drug type has an invalid presence tag"));
+
+        let mut changed = raw.clone();
+        changed[56..60].copy_from_slice(&0u32.to_le_bytes());
+        cases.push((changed, 2, 3, "service must contain at least one code"));
+
+        let mut changed = raw.clone();
+        changed[56..60].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push((changed, 2, 3, "code count exceeds the raw payload"));
+
+        let mut changed = raw.clone();
+        changed[94..98].copy_from_slice(&0u32.to_le_bytes());
+        cases.push((changed, 2, 3, "service charge count is invalid"));
+
+        let mut changed = raw.clone();
+        changed[136..140].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push((changed, 2, 3, "modifier count exceeds the raw payload"));
+
+        let mut changed = raw.clone();
+        changed.push(0);
+        cases.push((changed, 2, 3, "raw payload has trailing bytes"));
+
+        cases.push((
+            raw.clone(),
+            2,
+            4,
+            "decoded charge count does not match the header",
+        ));
+
+        let mut changed = raw.clone();
+        changed.splice(38..49, [0]);
+        cases.push((
+            changed,
+            2,
+            3,
+            "drug unit and type must be supplied together",
+        ));
+
+        let mut changed = raw.clone();
+        changed[261..269].copy_from_slice(&3u64.to_le_bytes());
+        cases.push((
+            changed,
+            2,
+            3,
+            "service ordinals must be strictly increasing",
+        ));
+
+        let mut changed = raw.clone();
+        changed[217..225].copy_from_slice(&0u64.to_le_bytes());
+        cases.push((
+            changed,
+            2,
+            3,
+            "charge ordinals must be strictly increasing within a service",
+        ));
+
+        let mut changed = raw.clone();
+        changed[213..217].copy_from_slice(&7u32.to_le_bytes());
+        cases.push((changed, 2, 3, "charge key is duplicated"));
+
+        for (raw, service_count, charge_count, message) in cases {
+            assert_authenticated_raw_error(&raw, service_count, charge_count, &invalid(message));
+        }
     }
 }

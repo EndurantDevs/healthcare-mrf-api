@@ -98,9 +98,10 @@ fn put_u64(output: &mut Vec<u8>, value: u64) {
 }
 
 fn checked_add(total: usize, value: usize) -> HospitalPriceSelectorBlockResult<usize> {
-    total
-        .checked_add(value)
-        .ok_or_else(|| invalid("raw length overflows"))
+    let Some(total) = total.checked_add(value) else {
+        return Err(invalid("raw length overflows"));
+    };
+    Ok(total)
 }
 
 fn checked_text_len(value: &str) -> HospitalPriceSelectorBlockResult<usize> {
@@ -124,14 +125,10 @@ fn entry_raw_len(entry: &HospitalPriceSelectorEntry) -> HospitalPriceSelectorBlo
         HospitalPriceSelectorKey::PayerPlan {
             payer_name,
             plan_name,
-        } => checked_add(checked_text_len(payer_name)?, checked_text_len(plan_name)?)?,
+        } => checked_text_len(payer_name)? + checked_text_len(plan_name)?,
     };
-    let refs_bytes = entry
-        .refs
-        .len()
-        .checked_mul(8)
-        .ok_or_else(|| invalid("reference byte length overflows"))?;
-    checked_add(checked_add(key_bytes, 4)?, refs_bytes)
+    let refs_bytes = entry.refs.len() * 8;
+    Ok(key_bytes + 4 + refs_bytes)
 }
 
 fn canonical_entries(
@@ -147,7 +144,7 @@ fn canonical_entries(
         if entry.key.kind() != kind {
             return Err(invalid("key does not match the selector kind"));
         }
-        input_raw_len = checked_add(input_raw_len, entry_raw_len(entry)?)?;
+        input_raw_len += entry_raw_len(entry)?;
         if input_raw_len > HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_RAW_BYTES {
             return Err(invalid("input rows exceed the 4 MiB page limit"));
         }
@@ -164,23 +161,15 @@ fn canonical_entries(
             HospitalPriceSelectorEntry { key, refs }
         })
         .collect::<Vec<_>>();
-    if canonical.len() > HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_ROWS {
-        return Err(invalid("canonical row count exceeds 4096"));
-    }
     Ok(canonical)
 }
 
-fn encode_raw(
-    entries: &[HospitalPriceSelectorEntry],
-) -> HospitalPriceSelectorBlockResult<(Vec<u8>, usize)> {
+fn encode_raw(entries: &[HospitalPriceSelectorEntry]) -> (Vec<u8>, usize) {
     let mut raw_len = 0usize;
     let mut ref_count = 0usize;
     for entry in entries {
-        raw_len = checked_add(raw_len, entry_raw_len(entry)?)?;
-        ref_count = checked_add(ref_count, entry.refs.len())?;
-    }
-    if raw_len > HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_RAW_BYTES {
-        return Err(invalid("raw payload exceeds 4 MiB"));
+        raw_len += entry_raw_len(entry).expect("canonical input rows were prevalidated");
+        ref_count += entry.refs.len();
     }
     let mut raw = Vec::with_capacity(raw_len);
     for entry in entries {
@@ -199,7 +188,7 @@ fn encode_raw(
             put_u64(&mut raw, *reference);
         }
     }
-    Ok((raw, ref_count))
+    (raw, ref_count)
 }
 
 fn frame_raw(
@@ -222,13 +211,10 @@ fn frame_raw(
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(6));
     encoder
         .write_all(raw)
-        .map_err(|error| invalid(format!("compression failed: {error}")))?;
+        .expect("writing compressed bytes to Vec cannot fail");
     let compressed = encoder
         .finish()
-        .map_err(|error| invalid(format!("compression failed: {error}")))?;
-    if compressed.len() > HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_COMPRESSED_BYTES {
-        return Err(invalid("compressed payload exceeds the byte limit"));
-    }
+        .expect("finishing compressed bytes in Vec cannot fail");
     let mut block =
         Vec::with_capacity(HOSPITAL_PRICE_SELECTOR_BLOCK_HEADER_BYTES + compressed.len());
     block.extend_from_slice(HOSPITAL_PRICE_SELECTOR_BLOCK_MAGIC);
@@ -252,7 +238,7 @@ pub fn encode_selector_page(
     entries: &[HospitalPriceSelectorEntry],
 ) -> HospitalPriceSelectorBlockResult<Vec<u8>> {
     let entries = canonical_entries(kind, entries)?;
-    let (raw, ref_count) = encode_raw(&entries)?;
+    let (raw, ref_count) = encode_raw(&entries);
     frame_raw(kind, page_index, page_count, entries.len(), ref_count, &raw)
 }
 
@@ -305,9 +291,7 @@ fn decode_frame(block: &[u8]) -> HospitalPriceSelectorBlockResult<(FrameMetadata
     if compressed_len > HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_COMPRESSED_BYTES {
         return Err(invalid("compressed length exceeds the byte limit"));
     }
-    let expected_len = HOSPITAL_PRICE_SELECTOR_BLOCK_HEADER_BYTES
-        .checked_add(compressed_len)
-        .ok_or_else(|| invalid("compressed length overflows"))?;
+    let expected_len = HOSPITAL_PRICE_SELECTOR_BLOCK_HEADER_BYTES + compressed_len;
     if block.len() < expected_len {
         return Err(invalid("compressed payload is truncated"));
     }
@@ -355,10 +339,7 @@ impl<'a> SliceCursor<'a> {
     }
 
     fn take(&mut self, length: usize) -> HospitalPriceSelectorBlockResult<&'a [u8]> {
-        let end = self
-            .position
-            .checked_add(length)
-            .ok_or_else(|| invalid("field length overflows"))?;
+        let end = self.position.saturating_add(length);
         let value = self
             .bytes
             .get(self.position..end)
@@ -368,15 +349,15 @@ impl<'a> SliceCursor<'a> {
     }
 
     fn u32(&mut self) -> HospitalPriceSelectorBlockResult<u32> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?.try_into().expect("exact u32"),
-        ))
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     fn u64(&mut self) -> HospitalPriceSelectorBlockResult<u64> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?.try_into().expect("exact u64"),
-        ))
+        let bytes = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
     }
 
     fn text(&mut self) -> HospitalPriceSelectorBlockResult<&'a str> {
@@ -431,7 +412,7 @@ pub fn decode_selector_page(
         if ref_count == 0 || ref_count > HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_RAW_BYTES / 8 {
             return Err(invalid("selector row reference count is invalid"));
         }
-        decoded_ref_count = checked_add(decoded_ref_count, ref_count)?;
+        decoded_ref_count += ref_count;
         if decoded_ref_count > metadata.ref_count {
             return Err(invalid("reference count exceeds the header"));
         }

@@ -48,6 +48,10 @@ mod tests {
             page.exact_refs(&HospitalPriceSelectorKey::Code("Z99".to_owned())),
             Some(&[3, 7, 9][..])
         );
+        assert_eq!(
+            page.exact_refs(&HospitalPriceSelectorKey::Code("missing".to_owned())),
+            None
+        );
         assert_eq!(header_u32(&block, 16) as usize, page.row_count());
         assert_eq!(header_u32(&block, 28) as usize, page.ref_count());
     }
@@ -161,5 +165,295 @@ mod tests {
         zlib_trailing[36..40].copy_from_slice(&(compressed_len + 1).to_le_bytes());
         zlib_trailing.push(0);
         assert!(decode_selector_page(&zlib_trailing).is_err());
+    }
+
+    #[test]
+    fn encoder_and_frame_limits_fail_closed() {
+        assert!(checked_add(usize::MAX, 1)
+            .unwrap_err()
+            .contains("raw length overflows"));
+
+        for entries in [
+            Vec::new(),
+            vec![code("A", &[1]); HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_ROWS + 1],
+        ] {
+            assert!(encode_selector_page(
+                HospitalPriceSelectorKind::CodeToCharge,
+                0,
+                1,
+                &entries,
+            )
+            .unwrap_err()
+            .contains("row count must be between 1 and 4096"));
+        }
+
+        assert!(encode_selector_page(
+            HospitalPriceSelectorKind::CodeToCharge,
+            0,
+            1,
+            &[code(
+                &"x".repeat(HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES + 1),
+                &[1],
+            )],
+        )
+        .unwrap_err()
+        .contains("key component exceeds 1 MiB"));
+
+        let oversized = "x".repeat(HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES + 1);
+        assert!(encode_selector_page(
+            HospitalPriceSelectorKind::PayerPlanToFact,
+            0,
+            1,
+            &[payer_plan(&oversized, "plan", &[1])],
+        )
+        .is_err());
+        assert!(encode_selector_page(
+            HospitalPriceSelectorKind::PayerPlanToFact,
+            0,
+            1,
+            &[payer_plan("payer", &oversized, &[1])],
+        )
+        .is_err());
+
+        let refs = vec![1; HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_RAW_BYTES / 8];
+        assert!(encode_selector_page(
+            HospitalPriceSelectorKind::CodeToCharge,
+            0,
+            1,
+            &[code("A", &refs)],
+        )
+        .unwrap_err()
+        .contains("input rows exceed the 4 MiB page limit"));
+
+        for row_count in [0, HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_ROWS + 1] {
+            assert!(frame_raw(
+                HospitalPriceSelectorKind::CodeToCharge,
+                0,
+                1,
+                row_count,
+                1,
+                &[],
+            )
+            .unwrap_err()
+            .contains("row count must be between 1 and 4096"));
+        }
+        assert!(frame_raw(
+            HospitalPriceSelectorKind::CodeToCharge,
+            1,
+            1,
+            1,
+            1,
+            &[],
+        )
+        .unwrap_err()
+        .contains("page index or count is invalid"));
+        assert!(frame_raw(
+            HospitalPriceSelectorKind::CodeToCharge,
+            0,
+            1,
+            1,
+            1,
+            &vec![0; HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_RAW_BYTES + 1],
+        )
+        .unwrap_err()
+        .contains("raw payload exceeds 4 MiB"));
+    }
+
+    #[test]
+    fn hostile_frame_headers_fail_closed() {
+        let valid = encode_selector_page(
+            HospitalPriceSelectorKind::CodeToCharge,
+            0,
+            1,
+            &[code("A", &[1, 2])],
+        )
+        .unwrap();
+        let corrupt_u32 = |offset: usize, value: u32| {
+            let mut block = valid.clone();
+            block[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            block
+        };
+        let mut cases = vec![
+            ("empty header", Vec::new(), "header is truncated"),
+            ("truncated header", valid[..71].to_vec(), "header is truncated"),
+            (
+                "version",
+                corrupt_u32(8, 2),
+                "version is unsupported",
+            ),
+            ("kind", corrupt_u32(12, 3), "kind is unsupported"),
+            ("row count", corrupt_u32(16, 0), "row count is invalid"),
+            (
+                "row count maximum",
+                corrupt_u32(16, HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_ROWS as u32 + 1),
+                "row count is invalid",
+            ),
+            (
+                "page count",
+                corrupt_u32(24, 0),
+                "page index or count is invalid",
+            ),
+            (
+                "reference count",
+                corrupt_u32(28, 0),
+                "reference count is invalid",
+            ),
+            (
+                "reference count maximum",
+                corrupt_u32(
+                    28,
+                    (HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_RAW_BYTES / 8) as u32 + 1,
+                ),
+                "reference count is invalid",
+            ),
+            (
+                "raw length",
+                corrupt_u32(32, HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_RAW_BYTES as u32 + 1),
+                "raw length exceeds 4 MiB",
+            ),
+            (
+                "compressed length",
+                corrupt_u32(
+                    36,
+                    HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_COMPRESSED_BYTES as u32 + 1,
+                ),
+                "compressed length exceeds the byte limit",
+            ),
+        ];
+
+        let mut bad_zlib = valid.clone();
+        bad_zlib[HOSPITAL_PRICE_SELECTOR_BLOCK_HEADER_BYTES] = 0;
+        cases.push(("zlib", bad_zlib, "decompression failed"));
+
+        let mut wrong_raw_len = valid.clone();
+        let raw_len = header_u32(&wrong_raw_len, 32);
+        wrong_raw_len[32..36].copy_from_slice(&(raw_len + 1).to_le_bytes());
+        cases.push((
+            "decompressed length",
+            wrong_raw_len,
+            "decompressed length does not match the header",
+        ));
+
+        for (name, block, expected) in cases {
+            let error = decode_selector_page(&block).unwrap_err();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn authenticated_raw_validation_fails_closed() {
+        let valid = encode_selector_page(
+            HospitalPriceSelectorKind::CodeToCharge,
+            0,
+            1,
+            &[code("A", &[1, 2])],
+        )
+        .unwrap();
+        let raw = raw_from(&valid);
+        let frame = |raw: &[u8], row_count, ref_count| {
+            frame_raw(
+                HospitalPriceSelectorKind::CodeToCharge,
+                0,
+                1,
+                row_count,
+                ref_count,
+                raw,
+            )
+            .unwrap()
+        };
+        let mut cases = vec![(
+            "truncated key",
+            frame(&[1, 0, 0, 0], 1, 2),
+            "raw payload is truncated",
+        )];
+        cases.push((
+            "truncated key length",
+            frame(&[], 1, 1),
+            "raw payload is truncated",
+        ));
+        cases.push((
+            "truncated reference count",
+            frame(&[1, 0, 0, 0, b'A'], 1, 1),
+            "raw payload is truncated",
+        ));
+        cases.push((
+            "truncated reference",
+            frame(&[1, 0, 0, 0, b'A', 1, 0, 0, 0], 1, 1),
+            "raw payload is truncated",
+        ));
+
+        let mut payer_cursor = SliceCursor::new(&[1, 0, 0, 0, b'A']);
+        assert!(decode_key(
+            HospitalPriceSelectorKind::PayerPlanToFact,
+            &mut payer_cursor,
+        )
+        .is_err());
+        assert!(decode_key(
+            HospitalPriceSelectorKind::PayerPlanToFact,
+            &mut SliceCursor::new(&[]),
+        )
+        .is_err());
+
+        let mut oversized_key = raw.clone();
+        oversized_key[..4].copy_from_slice(
+            &(HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES as u32 + 1).to_le_bytes(),
+        );
+        cases.push((
+            "oversized key",
+            frame(&oversized_key, 1, 2),
+            "key component exceeds 1 MiB",
+        ));
+
+        let mut zero_refs = raw.clone();
+        zero_refs[5..9].copy_from_slice(&0u32.to_le_bytes());
+        cases.push((
+            "zero row references",
+            frame(&zero_refs, 1, 2),
+            "selector row reference count is invalid",
+        ));
+
+        let mut too_many_refs = raw.clone();
+        too_many_refs[5..9].copy_from_slice(
+            &((HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_RAW_BYTES / 8) as u32 + 1).to_le_bytes(),
+        );
+        cases.push((
+            "too many row references",
+            frame(&too_many_refs, 1, 2),
+            "selector row reference count is invalid",
+        ));
+
+        cases.push((
+            "references exceed header",
+            frame(&raw, 1, 1),
+            "reference count exceeds the header",
+        ));
+
+        let mut trailing_raw = raw.clone();
+        trailing_raw.push(0);
+        cases.push((
+            "trailing raw byte",
+            frame(&trailing_raw, 1, 2),
+            "raw payload has trailing bytes",
+        ));
+
+        let two_rows = encode_selector_page(
+            HospitalPriceSelectorKind::CodeToCharge,
+            0,
+            1,
+            &[code("A", &[1]), code("B", &[2])],
+        )
+        .unwrap();
+        let mut duplicate_key = raw_from(&two_rows);
+        duplicate_key[21] = b'A';
+        cases.push((
+            "duplicate key",
+            frame(&duplicate_key, 2, 2),
+            "keys are not strictly sorted and unique",
+        ));
+
+        for (name, block, expected) in cases {
+            let error = decode_selector_page(&block).unwrap_err();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
     }
 }

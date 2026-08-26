@@ -13,6 +13,8 @@ pub const HOSPITAL_PRICE_SERVICE_BLOCK_MAX_RAW_BYTES: usize = 4 * 1024 * 1024;
 pub const HOSPITAL_PRICE_SERVICE_BLOCK_MAX_COMPRESSED_BYTES: usize =
     HOSPITAL_PRICE_SERVICE_BLOCK_MAX_RAW_BYTES + 64 * 1024;
 pub const HOSPITAL_PRICE_SERVICE_BLOCK_MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
+pub const HOSPITAL_PRICE_SERVICE_BLOCK_RAW_SIZE_ERROR: &str =
+    "hospital price service block raw payload exceeds 4 MiB";
 
 pub type HospitalPriceServiceBlockResult<T> = Result<T, String>;
 
@@ -130,9 +132,7 @@ fn validate_services(
         if service.charges.is_empty() {
             return Err(invalid("service must contain at least one charge"));
         }
-        charge_count = charge_count
-            .checked_add(service.charges.len())
-            .ok_or_else(|| invalid("charge count overflows"))?;
+        charge_count += service.charges.len();
         if charge_count > HOSPITAL_PRICE_SERVICE_BLOCK_MAX_CHARGES {
             return Err(invalid("charge count exceeds 512"));
         }
@@ -189,57 +189,53 @@ fn validate_services(
 
 struct RawWriter {
     bytes: Vec<u8>,
+    exceeded: bool,
 }
 
 impl RawWriter {
     fn new() -> Self {
-        Self { bytes: Vec::new() }
+        Self {
+            bytes: Vec::new(),
+            exceeded: false,
+        }
     }
 
-    fn put(&mut self, bytes: &[u8]) -> HospitalPriceServiceBlockResult<()> {
-        let new_len = self
-            .bytes
-            .len()
-            .checked_add(bytes.len())
-            .ok_or_else(|| invalid("raw length overflows"))?;
-        if new_len > HOSPITAL_PRICE_SERVICE_BLOCK_MAX_RAW_BYTES {
-            return Err(invalid("raw payload exceeds 4 MiB"));
+    fn put(&mut self, bytes: &[u8]) {
+        if self.exceeded
+            || bytes.len() > HOSPITAL_PRICE_SERVICE_BLOCK_MAX_RAW_BYTES - self.bytes.len()
+        {
+            self.exceeded = true;
+            return;
         }
         self.bytes.extend_from_slice(bytes);
-        Ok(())
     }
 
-    fn u8(&mut self, value: u8) -> HospitalPriceServiceBlockResult<()> {
+    fn u8(&mut self, value: u8) {
         self.put(&[value])
     }
 
-    fn u32(&mut self, value: u32) -> HospitalPriceServiceBlockResult<()> {
+    fn u32(&mut self, value: u32) {
         self.put(&value.to_le_bytes())
     }
 
-    fn u64(&mut self, value: u64) -> HospitalPriceServiceBlockResult<()> {
+    fn u64(&mut self, value: u64) {
         self.put(&value.to_le_bytes())
     }
 
-    fn text(&mut self, value: &str) -> HospitalPriceServiceBlockResult<()> {
-        let length = u32::try_from(value.len()).map_err(|_| invalid("text is too long"))?;
-        self.u32(length)?;
+    fn text(&mut self, value: &str) {
+        self.u32(value.len() as u32);
         self.put(value.as_bytes())
     }
 
-    fn optional_text(&mut self, value: Option<&str>) -> HospitalPriceServiceBlockResult<()> {
+    fn optional_text(&mut self, value: Option<&str>) {
         match value {
             None => self.u8(0),
             Some(value) => {
-                self.u8(1)?;
+                self.u8(1);
                 self.text(value)
             }
         }
     }
-}
-
-fn count_u32(count: usize, field: &str) -> HospitalPriceServiceBlockResult<u32> {
-    u32::try_from(count).map_err(|_| invalid(format!("{field} count exceeds u32")))
 }
 
 fn encode_raw(
@@ -247,36 +243,40 @@ fn encode_raw(
     first_fact_ordinal: u64,
 ) -> HospitalPriceServiceBlockResult<Vec<u8>> {
     let mut raw = RawWriter::new();
-    raw.u64(first_fact_ordinal)?;
+    raw.u64(first_fact_ordinal);
     for service in services {
-        raw.u64(service.service_ordinal)?;
-        raw.text(&service.description)?;
-        raw.optional_text(service.drug_unit.as_deref())?;
-        raw.optional_text(service.drug_type.as_deref())?;
-        raw.u32(count_u32(service.codes.len(), "code")?)?;
+        raw.u64(service.service_ordinal);
+        raw.text(&service.description);
+        raw.optional_text(service.drug_unit.as_deref());
+        raw.optional_text(service.drug_type.as_deref());
+        raw.u32(service.codes.len() as u32);
         for code in &service.codes {
-            raw.text(&code.code_type)?;
-            raw.text(&code.code)?;
+            raw.text(&code.code_type);
+            raw.text(&code.code);
         }
-        raw.u32(count_u32(service.charges.len(), "charge")?)?;
+        raw.u32(service.charges.len() as u32);
         for charge in &service.charges {
-            raw.u32(charge.charge_key)?;
-            raw.u64(charge.charge_ordinal)?;
-            raw.text(&charge.setting)?;
-            raw.optional_text(charge.billing_class.as_deref())?;
-            raw.u32(count_u32(charge.modifier_codes.len(), "modifier")?)?;
+            raw.u32(charge.charge_key);
+            raw.u64(charge.charge_ordinal);
+            raw.text(&charge.setting);
+            raw.optional_text(charge.billing_class.as_deref());
+            raw.u32(charge.modifier_codes.len() as u32);
             for modifier in &charge.modifier_codes {
-                raw.text(modifier)?;
+                raw.text(modifier);
             }
-            raw.optional_text(charge.gross_charge.as_deref())?;
-            raw.optional_text(charge.discounted_cash.as_deref())?;
-            raw.optional_text(charge.minimum.as_deref())?;
-            raw.optional_text(charge.maximum.as_deref())?;
-            raw.optional_text(charge.additional_generic_notes.as_deref())?;
-            raw.u32(charge.fact_count)?;
+            raw.optional_text(charge.gross_charge.as_deref());
+            raw.optional_text(charge.discounted_cash.as_deref());
+            raw.optional_text(charge.minimum.as_deref());
+            raw.optional_text(charge.maximum.as_deref());
+            raw.optional_text(charge.additional_generic_notes.as_deref());
+            raw.u32(charge.fact_count);
         }
     }
-    Ok(raw.bytes)
+    if raw.exceeded {
+        Err(HOSPITAL_PRICE_SERVICE_BLOCK_RAW_SIZE_ERROR.to_owned())
+    } else {
+        Ok(raw.bytes)
+    }
 }
 
 fn frame_raw(
@@ -285,18 +285,15 @@ fn frame_raw(
     charge_count: usize,
 ) -> HospitalPriceServiceBlockResult<Vec<u8>> {
     if raw.len() > HOSPITAL_PRICE_SERVICE_BLOCK_MAX_RAW_BYTES {
-        return Err(invalid("raw payload exceeds 4 MiB"));
+        return Err(HOSPITAL_PRICE_SERVICE_BLOCK_RAW_SIZE_ERROR.to_owned());
     }
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(6));
     encoder
         .write_all(raw)
-        .map_err(|error| invalid(format!("compression failed: {error}")))?;
+        .expect("Vec-backed zlib writes cannot fail");
     let compressed = encoder
         .finish()
-        .map_err(|error| invalid(format!("compression failed: {error}")))?;
-    if compressed.len() > HOSPITAL_PRICE_SERVICE_BLOCK_MAX_COMPRESSED_BYTES {
-        return Err(invalid("compressed payload exceeds the byte limit"));
-    }
+        .expect("Vec-backed zlib finalization cannot fail");
     let mut block =
         Vec::with_capacity(HOSPITAL_PRICE_SERVICE_BLOCK_HEADER_BYTES + compressed.len());
     block.extend_from_slice(HOSPITAL_PRICE_SERVICE_BLOCK_MAGIC);

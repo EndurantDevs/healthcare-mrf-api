@@ -162,6 +162,7 @@ def _install_waiting_producer_pipeline(orchestrator, monkeypatch, tmp_path):
         parse_started=asyncio.Event(),
         both_downloaded=asyncio.Event(),
         cleanup_started=asyncio.Event(),
+        first_release=asyncio.Event(),
         allow_cleanup=asyncio.Event(),
         lease_events=[],
         source_roots=[],
@@ -179,6 +180,8 @@ def _install_waiting_producer_pipeline(orchestrator, monkeypatch, tmp_path):
             yield object()
         finally:
             state.lease_events.append("release")
+            if state.lease_events.count("release") == 1:
+                state.first_release.set()
 
     async def download_source(
         item: Any, source_store: Any, _max_bytes: int
@@ -228,15 +231,13 @@ async def test_source_pipeline_cancellation_releases_waiting_producer_lease(
     ))
     await asyncio.wait_for(state.parse_started.wait(), timeout=1)
     await asyncio.wait_for(state.both_downloaded.wait(), timeout=1)
-    await asyncio.sleep(0)
     pipeline.cancel()
     await asyncio.wait_for(state.cleanup_started.wait(), timeout=1)
-    await asyncio.sleep(0)
-    pipeline.cancel()
-    await asyncio.sleep(0)
+    await asyncio.wait_for(state.first_release.wait(), timeout=1)
     assert state.lease_events == ["start", "start", "release"]
     assert sum(raw_path.exists() for raw_path in state.raw_paths) == 1
     assert sum(source_root.exists() for source_root in state.source_roots) == 1
+    pipeline.cancel()
     state.allow_cleanup.set()
     with pytest.raises(asyncio.CancelledError):
         await pipeline

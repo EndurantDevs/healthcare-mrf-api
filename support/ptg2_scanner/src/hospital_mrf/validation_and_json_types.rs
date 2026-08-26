@@ -118,30 +118,30 @@ fn emit_service(
     service: &ServiceRow,
 ) -> io::Result<()> {
     let service_ordinal_text = service_ordinal.to_string();
-    validate_copy_text_fields(
-        CopyKind::Service,
-        &[
-            Some(version_id),
-            Some(&service_ordinal_text),
-            Some(&service.description),
-            service.drug_unit.as_deref(),
-            service.drug_type.as_deref(),
-        ],
-    )?;
-    for (code_ordinal, code) in service.codes.iter().enumerate() {
-        let code_ordinal = code_ordinal.to_string();
+    if let Some(packed) = outputs.packed.as_mut() {
         validate_copy_text_fields(
-            CopyKind::Code,
+            CopyKind::Service,
             &[
                 Some(version_id),
                 Some(&service_ordinal_text),
-                Some(&code_ordinal),
-                Some(&code.code_type),
-                Some(&code.code),
+                Some(&service.description),
+                service.drug_unit.as_deref(),
+                service.drug_type.as_deref(),
             ],
         )?;
-    }
-    if let Some(packed) = outputs.packed.as_mut() {
+        for (code_ordinal, code) in service.codes.iter().enumerate() {
+            let code_ordinal = code_ordinal.to_string();
+            validate_copy_text_fields(
+                CopyKind::Code,
+                &[
+                    Some(version_id),
+                    Some(&service_ordinal_text),
+                    Some(&code_ordinal),
+                    Some(&code.code_type),
+                    Some(&code.code),
+                ],
+            )?;
+        }
         return packed.service(service_ordinal, service);
     }
     outputs.write(
@@ -187,23 +187,23 @@ fn emit_charge(
     let service_ordinal_text = service_ordinal.to_string();
     let charge_ordinal_text = charge_ordinal.to_string();
     let modifier_codes = pg_text_array_field(&charge.modifier_codes);
-    validate_copy_text_fields(
-        CopyKind::Charge,
-        &[
-            Some(version_id),
-            Some(&service_ordinal_text),
-            Some(&charge_ordinal_text),
-            Some(&charge.setting),
-            Some(&modifier_codes),
-            charge.gross_charge.as_deref(),
-            charge.discounted_cash.as_deref(),
-            charge.minimum.as_deref(),
-            charge.maximum.as_deref(),
-            charge.additional_generic_notes.as_deref(),
-            charge.billing_class.as_deref(),
-        ],
-    )?;
     if let Some(packed) = outputs.packed.as_mut() {
+        validate_copy_text_fields(
+            CopyKind::Charge,
+            &[
+                Some(version_id),
+                Some(&service_ordinal_text),
+                Some(&charge_ordinal_text),
+                Some(&charge.setting),
+                Some(&modifier_codes),
+                charge.gross_charge.as_deref(),
+                charge.discounted_cash.as_deref(),
+                charge.minimum.as_deref(),
+                charge.maximum.as_deref(),
+                charge.additional_generic_notes.as_deref(),
+                charge.billing_class.as_deref(),
+            ],
+        )?;
         return packed.charge(service_ordinal, charge_ordinal, charge);
     }
     outputs.write(
@@ -235,27 +235,27 @@ fn emit_payer(
     let service_ordinal_text = service_ordinal.to_string();
     let charge_ordinal_text = charge_ordinal.to_string();
     let payer_ordinal_text = payer_ordinal.to_string();
-    validate_copy_text_fields(
-        CopyKind::PayerCharge,
-        &[
-            Some(version_id),
-            Some(&service_ordinal_text),
-            Some(&charge_ordinal_text),
-            Some(&payer_ordinal_text),
-            Some(&payer.payer_name),
-            Some(&payer.plan_name),
-            payer.standard_charge_dollar.as_deref(),
-            payer.standard_charge_percentage.as_deref(),
-            payer.standard_charge_algorithm.as_deref(),
-            payer.median_amount.as_deref(),
-            payer.percentile_10.as_deref(),
-            payer.percentile_90.as_deref(),
-            payer.allowed_count.as_deref(),
-            Some(&payer.methodology),
-            payer.additional_payer_notes.as_deref(),
-        ],
-    )?;
     if let Some(packed) = outputs.packed.as_mut() {
+        validate_copy_text_fields(
+            CopyKind::PayerCharge,
+            &[
+                Some(version_id),
+                Some(&service_ordinal_text),
+                Some(&charge_ordinal_text),
+                Some(&payer_ordinal_text),
+                Some(&payer.payer_name),
+                Some(&payer.plan_name),
+                payer.standard_charge_dollar.as_deref(),
+                payer.standard_charge_percentage.as_deref(),
+                payer.standard_charge_algorithm.as_deref(),
+                payer.median_amount.as_deref(),
+                payer.percentile_10.as_deref(),
+                payer.percentile_90.as_deref(),
+                payer.allowed_count.as_deref(),
+                Some(&payer.methodology),
+                payer.additional_payer_notes.as_deref(),
+            ],
+        )?;
         return packed.payer(service_ordinal, charge_ordinal, payer);
     }
     outputs.write(
@@ -359,9 +359,7 @@ where
                 let remaining = JSON_FANOUT_BUDGET
                     .with(|budget| budget.get().map(|value| value.0))
                     .unwrap_or(DEFAULT_MAX_FANOUT_ROWS);
-                let structural_bytes = std::mem::size_of::<T>()
-                    .checked_mul(2)
-                    .ok_or_else(|| A::Error::custom("hospital MRF JSON structure overflows"))?;
+                let structural_bytes = std::mem::size_of::<T>() * 2;
                 let retained_capacity = JSON_RETAINED_BYTES
                     .with(|budget| budget.get())
                     .map(|bytes| bytes / structural_bytes.max(1))
@@ -409,3 +407,6 @@ fn with_json_fanout_budget<T>(limit: usize, action: impl FnOnce() -> T) -> T {
     drop(restore);
     result
 }
+
+#[cfg(test)]
+include!("validation_and_json_types_tail_tests.rs");

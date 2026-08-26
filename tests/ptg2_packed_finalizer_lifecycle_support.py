@@ -49,7 +49,7 @@ def finalizer_manifest() -> dict[str, object]:
         "map_format": snapshot_maps.PTG2_V4_MAP_FORMAT,
         "map_digest": (b"d" * 32).hex(),
         "object_kinds": list(PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS),
-        "object_kind_count": 6,
+        "object_kind_count": len(PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS),
         "map_pack_count": 6,
         "coordinate_count": 6,
         "entry_count": 9,

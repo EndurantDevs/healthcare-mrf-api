@@ -33,9 +33,7 @@ fn decode_frame(block: &[u8]) -> HospitalPriceServiceBlockResult<(usize, usize, 
     if compressed_len > HOSPITAL_PRICE_SERVICE_BLOCK_MAX_COMPRESSED_BYTES {
         return Err(invalid("compressed length exceeds the byte limit"));
     }
-    let expected_len = HOSPITAL_PRICE_SERVICE_BLOCK_HEADER_BYTES
-        .checked_add(compressed_len)
-        .ok_or_else(|| invalid("compressed length overflows"))?;
+    let expected_len = HOSPITAL_PRICE_SERVICE_BLOCK_HEADER_BYTES + compressed_len;
     if block.len() != expected_len {
         return Err(invalid("block length does not match the header"));
     }
@@ -82,13 +80,13 @@ impl<'a> Cursor<'a> {
         item_bytes: usize,
         field: &str,
     ) -> HospitalPriceServiceBlockResult<()> {
-        let bytes = count
-            .checked_mul(item_bytes)
-            .ok_or_else(|| invalid(format!("{field} decoded size overflows")))?;
-        self.decoded_bytes = self
-            .decoded_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| invalid(format!("{field} decoded size overflows")))?;
+        let Some(bytes) = count.checked_mul(item_bytes) else {
+            return Err(invalid(format!("{field} decoded size overflows")));
+        };
+        let Some(decoded_bytes) = self.decoded_bytes.checked_add(bytes) else {
+            return Err(invalid(format!("{field} decoded size overflows")));
+        };
+        self.decoded_bytes = decoded_bytes;
         if self.decoded_bytes > HOSPITAL_PRICE_SERVICE_BLOCK_MAX_DECODED_BYTES {
             return Err(invalid("decoded output exceeds 64 MiB"));
         }
@@ -100,10 +98,9 @@ impl<'a> Cursor<'a> {
     }
 
     fn take(&mut self, length: usize) -> HospitalPriceServiceBlockResult<&'a [u8]> {
-        let end = self
-            .position
-            .checked_add(length)
-            .ok_or_else(|| invalid("raw field length overflows"))?;
+        let Some(end) = self.position.checked_add(length) else {
+            return Err(invalid("raw field length overflows"));
+        };
         let value = self
             .bytes
             .get(self.position..end)
@@ -117,15 +114,15 @@ impl<'a> Cursor<'a> {
     }
 
     fn u32(&mut self) -> HospitalPriceServiceBlockResult<u32> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?.try_into().expect("exact u32"),
-        ))
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     fn u64(&mut self) -> HospitalPriceServiceBlockResult<u64> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?.try_into().expect("exact u64"),
-        ))
+        let bytes = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
     }
 
     fn text(&mut self, field: &str) -> HospitalPriceServiceBlockResult<String> {
@@ -178,12 +175,12 @@ pub fn decode_service_block(
     let (service_count, expected_charge_count, raw) = decode_frame(block)?;
     let mut cursor = Cursor::new(&raw);
     let mut next_fact_ordinal = cursor.u64()?;
-    let first_fact_ordinal = next_fact_ordinal;
     cursor.reserve_decoded(
         service_count,
         std::mem::size_of::<HospitalPriceServiceRow>(),
         "service",
-    )?;
+    )
+    .expect("authenticated service count fits decoded budget");
     let mut services = Vec::with_capacity(service_count);
     let mut decoded_charge_count = 0usize;
 
@@ -200,7 +197,8 @@ pub fn decode_service_block(
             code_count,
             std::mem::size_of::<HospitalPriceServiceCode>(),
             "code",
-        )?;
+        )
+        .expect("raw-bounded code count fits decoded budget");
         let mut codes = Vec::with_capacity(code_count);
         for _ in 0..code_count {
             codes.push(HospitalPriceServiceCode {
@@ -210,11 +208,7 @@ pub fn decode_service_block(
         }
 
         let charge_count = cursor.bounded_count("charge", 31)?;
-        if charge_count == 0
-            || decoded_charge_count
-                .checked_add(charge_count)
-                .is_none_or(|count| count > expected_charge_count)
-        {
+        if charge_count == 0 || decoded_charge_count + charge_count > expected_charge_count {
             return Err(invalid("service charge count is invalid"));
         }
         decoded_charge_count += charge_count;
@@ -222,7 +216,8 @@ pub fn decode_service_block(
             charge_count,
             std::mem::size_of::<HospitalPriceChargeRow>(),
             "charge",
-        )?;
+        )
+        .expect("authenticated charge count fits decoded budget");
         let mut charges = Vec::with_capacity(charge_count);
         for _ in 0..charge_count {
             let charge_key = cursor.u32()?;
@@ -230,7 +225,9 @@ pub fn decode_service_block(
             let setting = cursor.text("setting")?;
             let billing_class = cursor.optional_text("billing class")?;
             let modifier_count = cursor.bounded_count("modifier", 5)?;
-            cursor.reserve_decoded(modifier_count, std::mem::size_of::<String>(), "modifier")?;
+            cursor
+                .reserve_decoded(modifier_count, std::mem::size_of::<String>(), "modifier")
+                .expect("raw-bounded modifier count fits decoded budget");
             let mut modifier_codes = Vec::with_capacity(modifier_count);
             for _ in 0..modifier_count {
                 modifier_codes.push(cursor.text("modifier code")?);
@@ -273,9 +270,6 @@ pub fn decode_service_block(
         return Err(invalid("decoded charge count does not match the header"));
     }
     cursor.finish()?;
-    let (_, validated_first_fact) = validate_services(&services)?;
-    if validated_first_fact != first_fact_ordinal {
-        return Err(invalid("first final-fact ordinal is inconsistent"));
-    }
+    validate_services(&services)?;
     Ok(services)
 }

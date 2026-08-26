@@ -197,7 +197,7 @@ impl<V1: Read, V2: Read> TaxIdentitySidecarPairValidator<V1, V2> {
     pub fn validate_to_end(&mut self) -> io::Result<TaxIdentitySidecarPairSummary> {
         while self.next_record()?.is_some() {}
         self.validated_summary()
-            .ok_or_else(|| invalid_data(STATE_TOTAL_MISMATCH))
+            .ok_or(invalid_data(STATE_TOTAL_MISMATCH))
     }
 
     fn finish(&mut self) -> io::Result<()> {

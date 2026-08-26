@@ -68,10 +68,7 @@ where
         let Some(remaining) = budget.get() else {
             return Ok(());
         };
-        let encoded_bytes = value
-            .len()
-            .checked_add(std::mem::size_of::<u32>())
-            .ok_or_else(|| D::Error::custom("hospital MRF service code bytes overflow"))?;
+        let encoded_bytes = value.len() + std::mem::size_of::<u32>();
         let next = remaining.checked_sub(encoded_bytes).ok_or_else(|| {
             D::Error::custom("hospital MRF service code data exceeds 4 MiB")
         })?;
@@ -105,3 +102,29 @@ where
 
 #[derive(Debug, Deserialize)]
 struct JsonRetainedString(#[serde(deserialize_with = "deserialize_json_retained_string")] String);
+
+#[cfg(test)]
+mod json_code_budget_tail_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_and_budgeted_strings_are_reported() {
+        let mut deserializer = serde_json::Deserializer::from_str("1");
+        assert!(deserialize_json_code_text(&mut deserializer).is_err());
+
+        let previous = JSON_RETAINED_BYTES.with(|budget| budget.replace(Some(0)));
+        let mut deserializer = serde_json::Deserializer::from_str("\"code\"");
+        assert!(deserialize_json_code_text(&mut deserializer).is_err());
+        JSON_RETAINED_BYTES.with(|budget| budget.set(previous));
+
+        let mut deserializer = serde_json::Deserializer::from_str("1");
+        assert!(deserialize_optional_json_retained_string(&mut deserializer).is_err());
+        let previous = JSON_RETAINED_BYTES.with(|budget| budget.replace(Some(128)));
+        let mut deserializer = serde_json::Deserializer::from_str("\"value\"");
+        assert_eq!(
+            deserialize_optional_json_retained_string(&mut deserializer).unwrap(),
+            Some("value".to_owned())
+        );
+        JSON_RETAINED_BYTES.with(|budget| budget.set(previous));
+    }
+}

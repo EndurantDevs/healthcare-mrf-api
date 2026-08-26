@@ -28,9 +28,7 @@ fn decode_frame(block: &[u8]) -> HospitalPriceBlockResult<(usize, Vec<u8>)> {
     if compressed_len > HOSPITAL_PRICE_FACT_BLOCK_MAX_COMPRESSED_BYTES {
         return Err(invalid("compressed length exceeds the byte limit"));
     }
-    let expected_len = HOSPITAL_PRICE_FACT_BLOCK_HEADER_BYTES
-        .checked_add(compressed_len)
-        .ok_or_else(|| invalid("compressed length overflows"))?;
+    let expected_len = HOSPITAL_PRICE_FACT_BLOCK_HEADER_BYTES + compressed_len;
     if block.len() < expected_len {
         return Err(invalid("compressed payload is truncated"));
     }
@@ -69,10 +67,7 @@ impl<'a> SliceCursor<'a> {
     }
 
     fn take(&mut self, length: usize) -> HospitalPriceBlockResult<&'a [u8]> {
-        let end = self
-            .position
-            .checked_add(length)
-            .ok_or_else(|| invalid("lane length overflows"))?;
+        let end = self.position.saturating_add(length);
         let value = self
             .bytes
             .get(self.position..end)
@@ -82,15 +77,13 @@ impl<'a> SliceCursor<'a> {
     }
 
     fn u16(&mut self) -> HospitalPriceBlockResult<u16> {
-        Ok(u16::from_le_bytes(
-            self.take(2)?.try_into().expect("exact u16"),
-        ))
+        let bytes = self.take(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
     fn u32(&mut self) -> HospitalPriceBlockResult<u32> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?.try_into().expect("exact u32"),
-        ))
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     fn text(&mut self) -> HospitalPriceBlockResult<&'a str> {
@@ -135,9 +128,7 @@ fn decode_lanes(raw: &[u8]) -> HospitalPriceBlockResult<[&[u8]; LANE_COUNT]> {
         if offset != expected_offset {
             return Err(invalid("lane offsets are not contiguous"));
         }
-        let end = offset
-            .checked_add(length)
-            .ok_or_else(|| invalid("lane length overflows"))?;
+        let end = offset.saturating_add(length);
         *lane = raw
             .get(offset..end)
             .ok_or_else(|| invalid("lane is truncated"))?;
@@ -213,16 +204,14 @@ fn decode_all_required_ids(
     if lane.len() != row_count * 2 {
         return Err(invalid("required ID lane length is invalid"));
     }
-    let mut cursor = SliceCursor::new(lane);
     let mut ids = Vec::with_capacity(row_count);
-    for _ in 0..row_count {
-        let id = cursor.u16()?;
+    for bytes in lane.chunks_exact(2) {
+        let id = u16::from_le_bytes([bytes[0], bytes[1]]);
         if id as usize >= dictionary_len {
             return Err(invalid("dictionary ID is out of range"));
         }
         ids.push(id);
     }
-    cursor.finish()?;
     Ok(ids)
 }
 
@@ -244,14 +233,12 @@ fn decode_selected_u32(
         return Err(invalid("u32 lane length is invalid"));
     }
     let mut values = vec![0; selected_count];
-    let mut cursor = SliceCursor::new(lane);
-    for slot in slots.iter().take(row_count) {
-        let value = cursor.u32()?;
+    for (bytes, slot) in lane.chunks_exact(4).zip(slots.iter().take(row_count)) {
+        let value = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         if let Some(slot) = slot {
             values[*slot] = value;
         }
     }
-    cursor.finish()?;
     Ok(values)
 }
 
@@ -316,13 +303,6 @@ fn decode_selected_optional_decimals(
     }
     cursor.finish()?;
     Ok(selected)
-}
-
-fn dictionary_value(dictionary: &[&str], id: u16) -> HospitalPriceBlockResult<String> {
-    dictionary
-        .get(id as usize)
-        .map(|value| (*value).to_owned())
-        .ok_or_else(|| invalid("dictionary ID is out of range"))
 }
 
 pub fn decode_fact_block(
@@ -444,9 +424,7 @@ pub fn decode_fact_block(
             comparison_amounts[slot].as_deref(),
         ];
         for value in values.into_iter().flatten() {
-            decoded_text_bytes = decoded_text_bytes
-                .checked_add(value.len())
-                .ok_or_else(|| invalid("decoded text length overflows"))?;
+            decoded_text_bytes = decoded_text_bytes.saturating_add(value.len());
             if decoded_text_bytes > HOSPITAL_PRICE_FACT_BLOCK_MAX_DECODED_TEXT_BYTES {
                 return Err(invalid(
                     "decoded text exceeds the 64 MiB materialization limit",
@@ -466,18 +444,15 @@ pub fn decode_fact_block(
             negotiated_dollar: negotiated_dollars[slot].clone(),
             negotiated_percentage: negotiated_percentages[slot].clone(),
             negotiated_algorithm: algorithm_ids[slot]
-                .map(|id| dictionary_value(&algorithms, id))
-                .transpose()?,
-            methodology: dictionary_value(&methodologies, methodology_ids[slot])?,
+                .map(|id| algorithms[id as usize].to_owned()),
+            methodology: methodologies[methodology_ids[slot] as usize].to_owned(),
             median_amount: median_amounts[slot].clone(),
             percentile_10: percentile_10[slot].clone(),
             percentile_90: percentile_90[slot].clone(),
             allowed_count: allowed_count_ids[slot]
-                .map(|id| dictionary_value(&allowed_counts, id))
-                .transpose()?,
+                .map(|id| allowed_counts[id as usize].to_owned()),
             additional_payer_notes: payer_note_ids[slot]
-                .map(|id| dictionary_value(&payer_notes, id))
-                .transpose()?,
+                .map(|id| payer_notes[id as usize].to_owned()),
             comparison_amount: comparison_amounts[slot].clone(),
         });
     }

@@ -26,8 +26,11 @@ fn split_service_rows(
     (left, right)
 }
 fn service_block_size_error(error: &str) -> bool {
-    error.ends_with("raw payload exceeds 4 MiB")
-        || error.ends_with("compressed payload exceeds the byte limit")
+    error == crate::hospital_price_service_block::HOSPITAL_PRICE_SERVICE_BLOCK_RAW_SIZE_ERROR
+}
+
+fn fact_block_size_error(error: &str) -> bool {
+    error == crate::hospital_price_block::HOSPITAL_PRICE_FACT_BLOCK_RAW_SIZE_ERROR
 }
 
 fn validate_selector_kind(
@@ -43,66 +46,47 @@ fn validate_selector_kind(
     }
 }
 
+fn selector_text_bytes(value: &str) -> io::Result<usize> {
+    if value.len()
+        > crate::hospital_price_selector_block::HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES
+    {
+        return Err(invalid(
+            "hospital MRF packed selector key component exceeds 1 MiB",
+        ));
+    }
+    Ok(4 + value.len())
+}
+
 fn selector_ref_capacity(
     key: &crate::hospital_price_selector_block::HospitalPriceSelectorKey,
 ) -> io::Result<usize> {
-    let text_bytes = |value: &str| -> io::Result<usize> {
-        if value.len()
-            > crate::hospital_price_selector_block::HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES
-        {
-            return Err(invalid(
-                "hospital MRF packed selector key component exceeds 1 MiB",
-            ));
-        }
-        4usize
-            .checked_add(value.len())
-            .ok_or_else(|| invalid("hospital MRF packed selector key length overflows"))
-    };
     let key_bytes = match key {
         crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(code) => {
-            text_bytes(code)?
+            selector_text_bytes(code)?
         }
         crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {
             payer_name,
             plan_name,
-        } => text_bytes(payer_name)?
-            .checked_add(text_bytes(plan_name)?)
-            .ok_or_else(|| invalid("hospital MRF packed selector key length overflows"))?,
+        } => selector_text_bytes(payer_name)? + selector_text_bytes(plan_name)?,
     };
-    let overhead = key_bytes
-        .checked_add(4)
-        .ok_or_else(|| invalid("hospital MRF packed selector row length overflows"))?;
-    let capacity = crate::hospital_price_selector_block::HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_RAW_BYTES
-        .checked_sub(overhead)
-        .ok_or_else(|| invalid("hospital MRF packed selector key is too large"))?
+    let capacity = (crate::hospital_price_selector_block::HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_RAW_BYTES
+        - key_bytes
+        - 4)
         / 8;
-    if capacity == 0 {
-        Err(invalid(
-            "hospital MRF packed selector key leaves no reference capacity",
-        ))
-    } else {
-        Ok(capacity)
-    }
+    Ok(capacity)
 }
 
 fn selector_key_memory_bytes(
     key: &crate::hospital_price_selector_block::HospitalPriceSelectorKey,
-) -> io::Result<u64> {
+) -> u64 {
     let text_bytes = match key {
         crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(code) => code.len(),
         crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {
             payer_name,
             plan_name,
-        } => payer_name
-            .len()
-            .checked_add(plan_name.len())
-            .ok_or_else(|| invalid("hospital MRF packed selector key memory bytes overflow"))?,
+        } => payer_name.len() + plan_name.len(),
     };
-    u64::try_from(text_bytes)
-        .ok()
-        .and_then(|bytes| bytes.checked_mul(2))
-        .and_then(|bytes| bytes.checked_add(SELECTOR_KEY_MEMORY_OVERHEAD_BYTES))
-        .ok_or_else(|| invalid("hospital MRF packed selector key memory bytes overflow"))
+    text_bytes as u64 * 2 + SELECTOR_KEY_MEMORY_OVERHEAD_BYTES
 }
 
 fn selector_key_sha256(
@@ -183,34 +167,40 @@ fn count_selector_pages(
     let mut current_refs = 0usize;
     let mut previous_record = None;
     while let Some(record @ (kind, ordinal, reference)) = read_selector_spool_record(&mut reader)? {
-        if previous_record.is_some_and(|previous| previous >= record) {
+        if previous_record >= Some(record) {
             return Err(invalid(
                 "hospital MRF packed selector spool is not strictly sorted and unique",
             ));
         }
         previous_record = Some(record);
-        let key = keys
-            .get(ordinal as usize)
-            .ok_or_else(|| invalid("hospital MRF packed selector key ordinal is invalid"))?;
+        let key = or_invalid(
+            keys.get(ordinal as usize),
+            "hospital MRF packed selector key ordinal is invalid",
+        )?;
         validate_selector_kind(kind, key)?;
-        let ref_counter = match kind {
-            1 if reference < charge_count => &mut code_ref_count,
-            2 if reference < fact_count => &mut payer_plan_ref_count,
-            1 => {
+        let ref_counter = match key {
+            crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(_)
+                if reference < charge_count =>
+            {
+                &mut code_ref_count
+            }
+            crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan { .. }
+                if reference < fact_count =>
+            {
+                &mut payer_plan_ref_count
+            }
+            crate::hospital_price_selector_block::HospitalPriceSelectorKey::Code(_) => {
                 return Err(invalid(
                     "hospital MRF packed code selector reference is outside dense charge keys",
                 ));
             }
-            2 => {
+            crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan { .. } => {
                 return Err(invalid(
                     "hospital MRF packed payer-plan selector reference is outside dense facts",
                 ));
             }
-            _ => return Err(invalid("hospital MRF packed selector kind is unsupported")),
         };
-        *ref_counter = ref_counter
-            .checked_add(1)
-            .ok_or_else(|| invalid("hospital MRF packed selector reference count overflows"))?;
+        *ref_counter += 1;
         if current_ordinal != Some(ordinal) {
             if let Some(previous) = current_ordinal {
                 add_selector_page_count(
@@ -223,9 +213,7 @@ fn count_selector_pages(
             current_ordinal = Some(ordinal);
             current_refs = 0;
         }
-        current_refs = current_refs
-            .checked_add(1)
-            .ok_or_else(|| invalid("hospital MRF packed selector reference count overflows"))?;
+        current_refs += 1;
     }
     if let Some(ordinal) = current_ordinal {
         add_selector_page_count(&mut counts, ordinal, &keys[ordinal as usize], current_refs)?;
@@ -244,9 +232,7 @@ fn count_selector_pages(
                 ..
             } => &mut payer_plan_page_count,
         };
-        *total = total
-            .checked_add(u64::from(*page_count))
-            .ok_or_else(|| invalid("hospital MRF packed selector page count overflows"))?;
+        *total += u64::from(*page_count);
     }
     Ok(SelectorPreflight {
         page_counts: counts,
@@ -265,14 +251,17 @@ fn add_selector_page_count(
 ) -> io::Result<()> {
     let capacity = selector_ref_capacity(key)?;
     let pages = refs.div_ceil(capacity);
-    let count = counts
-        .get_mut(ordinal as usize)
-        .ok_or_else(|| invalid("hospital MRF packed selector key ordinal is invalid"))?;
-    *count = count
-        .checked_add(
-            u32::try_from(pages)
-                .map_err(|_| invalid("hospital MRF packed selector page count exceeds u32"))?,
-        )
-        .ok_or_else(|| invalid("hospital MRF packed selector page count overflows"))?;
+    let count = or_invalid(
+        counts.get_mut(ordinal as usize),
+        "hospital MRF packed selector key ordinal is invalid",
+    )?;
+    let pages = map_invalid(
+        u32::try_from(pages),
+        "hospital MRF packed selector page count exceeds u32",
+    )?;
+    *count = or_invalid(
+        count.checked_add(pages),
+        "hospital MRF packed selector page count overflows",
+    )?;
     Ok(())
 }
