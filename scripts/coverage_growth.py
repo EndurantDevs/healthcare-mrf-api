@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,9 @@ COVERAGE_EXCLUSION_MARKERS = (
     "node:coverageignore",
     "pragma:nobranch",
     "pragma:nocover",
+)
+FUNCTION_DEFINITION_PATTERN = re.compile(
+    r"^(\s*(?:async\s+)?def\s+)[A-Za-z_][A-Za-z0-9_]*(?=\s*\()"
 )
 
 
@@ -249,7 +253,8 @@ def find_added_exclusion_directives_in_diff(
     """Return new in-scope source directives that suppress coverage."""
     error_messages: list[str] = []
     current_relative_path: str | None = None
-    for raw_line in diff_text.splitlines():
+    raw_lines = diff_text.splitlines()
+    for line_index, raw_line in enumerate(raw_lines):
         if raw_line.startswith("+++ "):
             header_path = raw_line[4:]
             current_relative_path = (
@@ -263,6 +268,14 @@ def find_added_exclusion_directives_in_diff(
             marker in compact_added_line for marker in COVERAGE_EXCLUSION_MARKERS
         ):
             continue
+        signature = _function_exclusion_signature(raw_line)
+        previous_raw_line = raw_lines[line_index - 1] if line_index else ""
+        if (
+            signature
+            and previous_raw_line.startswith("-")
+            and _function_exclusion_signature(previous_raw_line) == signature
+        ):
+            continue
         for report_name in selected_report_names:
             report_config_by_field = baseline_by_field["reports"][report_name]
             if _is_path_in_scope(current_relative_path, report_config_by_field):
@@ -271,6 +284,19 @@ def find_added_exclusion_directives_in_diff(
                     f"{current_relative_path}"
                 )
     return error_messages
+
+
+def _function_exclusion_signature(raw_line: str) -> str | None:
+    """Identify an excluded function definition independently of its name."""
+    compact_line = "".join(raw_line[1:].lower().split())
+    if not any(marker in compact_line for marker in COVERAGE_EXCLUSION_MARKERS):
+        return None
+    signature, substitution_count = FUNCTION_DEFINITION_PATTERN.subn(
+        r"\1<name>", raw_line[1:], count=1
+    )
+    if not substitution_count:
+        return None
+    return signature
 
 
 def find_added_exclusion_directives(
@@ -416,4 +442,31 @@ def run_exclusion_guard_self_test() -> None:
     ]:
         raise CoverageRatchetError(
             "coverage ratchet self-test failed: exclusion directive guard"
+        )
+    directive = "pragma:" + "no" + "cover"
+    rename_errors = find_added_exclusion_directives_in_diff(
+        "diff --git a/sample.py b/sample.py\n"
+        "+++ b/sample.py\n"
+        f"-async def process_data(ctx): # {directive}\n"
+        f"+async def import_sample(ctx): # {directive}\n",
+        build_growth_policy_test_baseline(),
+        ["python"],
+    )
+    if rename_errors:
+        raise CoverageRatchetError(
+            "coverage ratchet self-test failed: renamed exclusion directive"
+        )
+    changed_signature_errors = find_added_exclusion_directives_in_diff(
+        "diff --git a/sample.py b/sample.py\n"
+        "+++ b/sample.py\n"
+        f"-async def process_data(ctx): # {directive}\n"
+        f"+async def import_sample(ctx, task=None): # {directive}\n",
+        build_growth_policy_test_baseline(),
+        ["python"],
+    )
+    if changed_signature_errors != [
+        "python: new coverage exclusion directive in sample.py"
+    ]:
+        raise CoverageRatchetError(
+            "coverage ratchet self-test failed: changed excluded signature"
         )

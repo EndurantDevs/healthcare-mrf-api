@@ -263,6 +263,31 @@ def _validate_packed_summary(summary, tmp_path, **overrides):
     )
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (_csv(["description", "payer_name"]), "csv-tall"),
+        (_csv([
+            "description", "standard_charge|Payer|Plan|negotiated_dollar",
+        ]), "csv-wide"),
+    ],
+)
+def test_zip_csv_format_is_preserved_in_parser_receipt(tmp_path, payload, expected):
+    archived = tmp_path / "input.zip"
+    with zipfile.ZipFile(archived, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("prices.mrf", payload)
+    source_format = native.detect_hospital_mrf_format(archived)
+    output = tmp_path / "output"
+    output.mkdir()
+    summary = _packed_summary(output)
+    summary["format"] = source_format
+
+    receipt = _validate_packed_summary(summary, output)
+
+    assert source_format == expected
+    assert receipt.source_format == expected
+
+
 def test_native_summary_is_path_and_contract_bound(tmp_path):
     summary_by_field = _packed_summary(tmp_path)
 

@@ -31,6 +31,17 @@ HIDDEN_RUNTIME_ALIASES = {
     ("get", "/pricing/physicians/{npi}/prescriptions/{rx_code_system}/{rx_code}"),
 }
 ROUTE_QUERY_PARAM_ADDITIONS = {
+    # The source-hidden request helper validates the bounded query outside the
+    # decorated hospital-price route's AST.
+    ("get", "/hospital-prices/facilities/{hospital_id}/prices"): {
+        "code",
+        "code_type",
+        "cursor",
+        "limit",
+        "payer_name",
+        "plan_name",
+        "version_id",
+    },
     # The shared specialty-filter helper parses these outside the decorated
     # group-plan route's AST.
     ("get", "/pricing/group-plan-providers"): {

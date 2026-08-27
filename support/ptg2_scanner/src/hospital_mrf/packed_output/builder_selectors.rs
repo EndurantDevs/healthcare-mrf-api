@@ -202,7 +202,9 @@ impl PackedOutputBuilder {
                 secondary_count: ref_count as u32,
                 page_index,
                 page_count,
-                key_sha256: Some(selector_key_sha256(&key)),
+                key_sha256: Some(
+                    crate::hospital_price_selector_block::selector_key_sha256(&key),
+                ),
                 parent_sha256: selector_parent_sha256(&key),
             },
             &payload,

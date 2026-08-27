@@ -210,6 +210,7 @@ def test_model_has_exact_packed_indexes() -> None:
     assert set(indexes_by_name) == {
         "hospital_price_data_block_selector_ordinal_key",
         "hospital_price_data_block_selector_lookup_idx",
+        "hospital_price_data_block_selector_secondary_lookup_idx",
         "hospital_price_data_block_parent_lookup_idx",
         "hospital_price_data_block_charge_range_idx",
         "hospital_price_data_block_fact_range_idx",
@@ -222,6 +223,18 @@ def test_model_has_exact_packed_indexes() -> None:
         "hospital_price_data_block.page_index",
     ]
     assert str(selector_key.dialect_options["postgresql"]["where"]) == (
+        "block_kind IN (3, 4)"
+    )
+    selector_secondary = indexes_by_name[
+        "hospital_price_data_block_selector_secondary_lookup_idx"
+    ]
+    assert [str(expression) for expression in selector_secondary.expressions] == [
+        "hospital_price_data_block.version_id",
+        "hospital_price_data_block.block_kind",
+        "hospital_price_data_block.key_sha256",
+        "hospital_price_data_block.secondary_first",
+    ]
+    assert str(selector_secondary.dialect_options["postgresql"]["where"]) == (
         "block_kind IN (3, 4)"
     )
     assert [

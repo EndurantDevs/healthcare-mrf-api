@@ -72,9 +72,10 @@ mod python_api {
     use pyo3::exceptions::{PyRuntimeError, PyValueError};
     use pyo3::prelude::*;
     use pyo3::types::{PyBytes, PyDict, PyList};
+    use pyo3::BoundObject;
     use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
     use serde_json::Value;
-    use std::sync::OnceLock;
+    use std::{convert::Infallible, sync::OnceLock};
 
     type AddressRow = (
         Option<String>,
@@ -87,6 +88,8 @@ mod python_api {
     type ContactRow = (Option<String>, Option<String>, Option<String>);
     type LocationCanonicalRow = (Option<String>, Option<String>, Option<String>);
     static LOCATION_CANON_POOL: OnceLock<ThreadPool> = OnceLock::new();
+
+    include!("python_hospital_price.rs");
 
     fn location_canon_pool() -> PyResult<&'static ThreadPool> {
         if let Some(pool) = LOCATION_CANON_POOL.get() {
@@ -240,12 +243,18 @@ mod python_api {
         m.add_function(wrap_pyfunction!(canon_version, m)?)?;
         m.add_function(wrap_pyfunction!(intersect_sorted_u32_py, m)?)?;
         m.add_function(wrap_pyfunction!(decode_u32_le_py, m)?)?;
+        m.add_function(wrap_pyfunction!(hospital_price_selector_sha256, m)?)?;
+        m.add_function(wrap_pyfunction!(hospital_price_decode_selector_page, m)?)?;
+        m.add_function(wrap_pyfunction!(hospital_price_decode_service_block, m)?)?;
+        m.add_function(wrap_pyfunction!(hospital_price_decode_fact_block, m)?)?;
         Ok(())
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        include!("python_hospital_price_tests.rs");
 
         #[test]
         fn python_module_exports_real_address_contact_and_version_payloads() {
@@ -304,6 +313,14 @@ mod python_api {
                 assert!(module.hasattr("canon_version").unwrap());
                 assert!(module.hasattr("intersect_sorted_u32").unwrap());
                 assert!(module.hasattr("ptg2_decode_u32_le").unwrap());
+                assert!(module.hasattr("hospital_price_selector_sha256").unwrap());
+                assert!(module
+                    .hasattr("hospital_price_decode_selector_page")
+                    .unwrap());
+                assert!(module
+                    .hasattr("hospital_price_decode_service_block")
+                    .unwrap());
+                assert!(module.hasattr("hospital_price_decode_fact_block").unwrap());
                 let empty_locations = module
                     .getattr("canonicalize_location_batch")
                     .unwrap()

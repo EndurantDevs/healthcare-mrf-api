@@ -414,7 +414,7 @@ def validate_hospital_parser_summary(
     packed_root = _packed_root(summary_fields["root"], artifacts, max_output_bytes)
     return HospitalParserReceipt(
         version_id=version_id,
-        source_format=source_format.replace("-", "_"),
+        source_format=source_format,
         semantic_sha256=_semantic_sha256(artifacts, packed_root),
         max_fanout_rows=summary_fields["max_fanout_rows"],
         max_decompressed_bytes=summary_fields["max_decompressed_bytes"],

@@ -13,6 +13,7 @@ from api.endpoint.codes import blueprint as v1_codes
 from api.endpoint.clinical import blueprint as v1_clinical
 from api.endpoint.geo import blueprint as v1_geo
 from api.endpoint.healthcheck import blueprint as v1_healthcheck
+from api.endpoint.hospital_prices import blueprint as v1_hospital_prices
 from api.endpoint.importer import blueprint as v1_import
 from api.endpoint.issuer import blueprint as v1_issuer
 from api.endpoint.npi import blueprint as v1_npi
@@ -65,6 +66,7 @@ def init_api(api):
     api_bluenprint = Blueprint.group(
         [
             v1_healthcheck,
+            v1_hospital_prices,
             v1_coverage,
             v1_plan,
             v1_formulary,

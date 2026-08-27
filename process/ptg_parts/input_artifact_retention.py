@@ -1255,18 +1255,12 @@ def _stored_artifacts_locked(
     return stored_artifacts, newly_unleased_paths
 
 
-def _select_artifacts(
+def _eligible_artifacts(
     stored: list[_StoredArtifact],
-    *,
     now_timestamp: float,
     retention_seconds: float,
     min_age_seconds: float,
-    target_bytes: int | None,
-    max_delete_bytes: int | None,
-    max_delete_files: int | None,
-) -> tuple[list[_StoredArtifact], list[_StoredArtifact]]:
-    """Return age-eligible artifacts and a bounded, retention-first selection."""
-
+) -> tuple[list[_StoredArtifact], set[str]]:
     eligible_artifacts: list[_StoredArtifact] = []
     retention_due_paths: set[str] = set()
     for artifact in stored:
@@ -1281,11 +1275,28 @@ def _select_artifacts(
     eligible_artifacts.sort(
         key=lambda artifact: (
             artifact.unleased_since.timestamp()
-            if artifact.unleased_since
-            else now_timestamp,
+            if artifact.unleased_since else now_timestamp,
             artifact.modified_at,
             artifact.relative_path,
         )
+    )
+    return eligible_artifacts, retention_due_paths
+
+
+def _select_artifacts(
+    stored: list[_StoredArtifact],
+    *,
+    now_timestamp: float,
+    retention_seconds: float,
+    min_age_seconds: float,
+    target_bytes: int | None,
+    max_delete_bytes: int | None,
+    max_delete_files: int | None,
+) -> tuple[list[_StoredArtifact], list[_StoredArtifact]]:
+    """Return age-eligible artifacts and a bounded, retention-first selection."""
+
+    eligible_artifacts, retention_due_paths = _eligible_artifacts(
+        stored, now_timestamp, retention_seconds, min_age_seconds
     )
     selected_artifacts: list[_StoredArtifact] = []
     selected_paths: set[str] = set()

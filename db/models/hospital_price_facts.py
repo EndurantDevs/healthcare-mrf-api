@@ -178,6 +178,14 @@ class HospitalPriceDataBlock(Base, JSONOutputMixin):
             postgresql_where=text("block_kind IN (3, 4)"),
         ),
         Index(
+            "hospital_price_data_block_selector_secondary_lookup_idx",
+            "version_id",
+            "block_kind",
+            "key_sha256",
+            "secondary_first",
+            postgresql_where=text("block_kind IN (3, 4)"),
+        ),
+        Index(
             "hospital_price_data_block_parent_lookup_idx",
             "version_id",
             "parent_sha256",
