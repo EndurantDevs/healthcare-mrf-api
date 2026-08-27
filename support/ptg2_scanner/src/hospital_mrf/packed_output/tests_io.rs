@@ -273,6 +273,11 @@
         );
         let directory = tempfile::tempdir().unwrap();
         let mut output = builder(directory.path());
+        assert!(selector_ref_capacity(&selector_code_with_type(
+            oversized.clone(),
+            "12345",
+        ))
+        .is_err());
         assert!(output
             .selector_key_ordinal(selector_code(oversized.clone()))
             .is_err());
