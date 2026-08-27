@@ -145,6 +145,11 @@ fn required_wide_column(
     }
 }
 
+fn is_wide_payer_placeholder(value: &str) -> bool {
+    value.eq_ignore_ascii_case("[payer_name]")
+        || value.eq_ignore_ascii_case("[plan_name]")
+}
+
 fn parse_wide_columns(
     headers: &StringRecord,
     max_fanout_rows: usize,
@@ -186,8 +191,8 @@ fn parse_wide_columns(
         };
         if payer_name.is_empty()
             || plan_name.is_empty()
-            || payer_name.starts_with('[')
-            || plan_name.starts_with('[')
+            || is_wide_payer_placeholder(payer_name)
+            || is_wide_payer_placeholder(plan_name)
         {
             return Err(invalid(
                 "wide CSV payer headers must replace payer and plan placeholders",
