@@ -6715,6 +6715,21 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             ),
         },
         {
+            # Let radius+taxonomy searches apply both selective predicates in
+            # one GiST scan instead of filtering every address in the radius.
+            "index_elements": (
+                "public.Geography(public.ST_MakePoint((long)::double precision, (lat)::double precision))",
+                "taxonomy_array public.gist__intbig_ops",
+            ),
+            "using": "gist",
+            "name": "geo_taxonomy",
+            "where": (
+                "type IN ('primary', 'secondary', 'practice', 'site') "
+                "AND COALESCE(address_precision, '') <> 'city_zip' "
+                "AND lat IS NOT NULL AND long IS NOT NULL"
+            ),
+        },
+        {
             # Cheaper serving index for /npi/near/. The query applies a lat/long
             # bounding box before exact ST_DWithin distance filtering, so this
             # preserves exact results while avoiding the full GiST build on each

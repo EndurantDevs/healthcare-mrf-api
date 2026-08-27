@@ -1872,8 +1872,7 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
         "mrf",
         "entity_address_unified_stage",
         {FakeModel: FakeStage},
-        source_run_id="run_1",
-        node_id="node_a",
+        plan=entity_address_unified._SupportStagePlan("run_1", "node_a"),
         run_id="run_eau",
         context=support_context_map,
     )
@@ -1941,8 +1940,7 @@ async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkey
         "mrf",
         "entity_address_unified_stage",
         {FakeModel: FakeStage},
-        source_run_id="run_1",
-        node_id="node_a",
+        plan=entity_address_unified._SupportStagePlan("run_1", "node_a"),
         context=support_context_map,
     )
     assert operation_order_list[0] == "truncate"
@@ -2205,13 +2203,15 @@ def test_entity_address_unified_support_statements_shard_facility_candidates(mon
                 "facility_anchor_npi_candidate_20260614"
             ),
         },
-        source_run_id="run_1",
-        node_id=None,
-        build_network_bridge=False,
-        available={
-            "facility_anchor": True,
-            "facility_anchor.medicare_ccn": True,
-        },
+        plan=entity_address_unified._SupportStagePlan(
+            source_run_id="run_1",
+            node_id=None,
+            build_network_bridge=False,
+            available={
+                "facility_anchor": True,
+                "facility_anchor.medicare_ccn": True,
+            },
+        ),
     )
 
     facility_statements = [
@@ -2253,10 +2253,12 @@ def test_entity_address_unified_support_statements_shard_code_bridges(monkeypatc
                 "entity_address_medication_bridge_20260614"
             ),
         },
-        source_run_id="run_1",
-        node_id=None,
-        build_network_bridge=False,
-        available={},
+        plan=entity_address_unified._SupportStagePlan(
+            source_run_id="run_1",
+            node_id=None,
+            build_network_bridge=False,
+            available={},
+        ),
     )
 
     procedure_statements = [
@@ -2311,13 +2313,15 @@ def test_entity_address_unified_support_statements_can_skip_optional_serving_tab
                 "facility_anchor_npi_candidate_20260614"
             ),
         },
-        source_run_id="run_1",
-        node_id=None,
-        build_network_bridge=False,
-        available={
-            "facility_anchor": True,
-            "facility_anchor.medicare_ccn": True,
-        },
+        plan=entity_address_unified._SupportStagePlan(
+            source_run_id="run_1",
+            node_id=None,
+            build_network_bridge=False,
+            available={
+                "facility_anchor": True,
+                "facility_anchor.medicare_ccn": True,
+            },
+        ),
     )
 
     labels = [statement.label for statement in statements]
@@ -2446,10 +2450,12 @@ def test_entity_address_unified_builds_evidence_and_bridge_stage_sql():
             "mrf",
             "entity_address_unified_stage",
             stage_classes,
-            source_run_id="run_1",
-            node_id="node_a",
-            raw_table="entity_address_unified_raw",
-            build_network_bridge=True,
+            plan=entity_address_unified._SupportStagePlan(
+                source_run_id="run_1",
+                node_id="node_a",
+                raw_table="entity_address_unified_raw",
+                build_network_bridge=True,
+            ),
         )
     )
 
@@ -2477,10 +2483,12 @@ def test_entity_address_unified_partial_support_stage_reuses_live_bridge_rows():
             "mrf",
             "entity_address_unified_stage",
             stage_classes,
-            source_run_id="run_1",
-            node_id="node_a",
-            build_network_bridge=True,
-            affected_group_table="entity_address_unified_stage_affected_groups",
+            plan=entity_address_unified._SupportStagePlan(
+                source_run_id="run_1",
+                node_id="node_a",
+                build_network_bridge=True,
+                affected_group_table="entity_address_unified_stage_affected_groups",
+            ),
         )
     )
 
@@ -2506,12 +2514,17 @@ def test_entity_address_unified_partial_support_patch_stages_only_affected_rows(
             "mrf",
             "entity_address_unified_stage",
             stage_classes,
-            source_run_id="run_1",
-            node_id="node_a",
-            build_network_bridge=True,
-            available={"facility_anchor": True, "facility_anchor.medicare_ccn": True},
-            affected_group_table="entity_address_unified_stage_affected_groups",
-            copy_unaffected_bridges=False,
+            plan=entity_address_unified._SupportStagePlan(
+                source_run_id="run_1",
+                node_id="node_a",
+                build_network_bridge=True,
+                available={
+                    "facility_anchor": True,
+                    "facility_anchor.medicare_ccn": True,
+                },
+                affected_group_table="entity_address_unified_stage_affected_groups",
+                copy_unaffected_bridges=False,
+            ),
         )
     )
 
@@ -2804,21 +2817,23 @@ def test_entity_address_unified_builds_facility_anchor_npi_candidate_stage_sql(m
             "mrf",
             "entity_address_unified_stage",
             stage_classes,
-            source_run_id="run_1",
-            node_id="node_a",
-            raw_table="entity_address_unified_raw",
-            build_network_bridge=True,
-            available={
-                "facility_anchor": True,
-                "provider_enrollment_hospital": True,
-                "provider_enrollment_fqhc": True,
-                "provider_enrollment_ffs_additional_npi": True,
-                "npi": True,
-                "npi_address": True,
-                "npi_taxonomy": True,
-                "nucc_taxonomy": True,
-                "npi_other_identifier": True,
-            },
+            plan=entity_address_unified._SupportStagePlan(
+                source_run_id="run_1",
+                node_id="node_a",
+                raw_table="entity_address_unified_raw",
+                build_network_bridge=True,
+                available={
+                    "facility_anchor": True,
+                    "provider_enrollment_hospital": True,
+                    "provider_enrollment_fqhc": True,
+                    "provider_enrollment_ffs_additional_npi": True,
+                    "npi": True,
+                    "npi_address": True,
+                    "npi_taxonomy": True,
+                    "nucc_taxonomy": True,
+                    "npi_other_identifier": True,
+                },
+            ),
         )
     )
 
@@ -2858,20 +2873,22 @@ def test_facility_anchor_npi_candidate_stage_keeps_indexed_nppes_default(monkeyp
             "mrf",
             "entity_address_unified_stage",
             stage_classes,
-            source_run_id="run_1",
-            node_id="node_a",
-            raw_table="entity_address_unified_raw",
-            build_network_bridge=True,
-            available={
-                "facility_anchor": True,
-                "provider_enrollment_hospital": True,
-                "provider_enrollment_fqhc": True,
-                "npi": True,
-                "npi_address": True,
-                "npi_taxonomy": True,
-                "nucc_taxonomy": True,
-                "npi_other_identifier": True,
-            },
+            plan=entity_address_unified._SupportStagePlan(
+                source_run_id="run_1",
+                node_id="node_a",
+                raw_table="entity_address_unified_raw",
+                build_network_bridge=True,
+                available={
+                    "facility_anchor": True,
+                    "provider_enrollment_hospital": True,
+                    "provider_enrollment_fqhc": True,
+                    "npi": True,
+                    "npi_address": True,
+                    "npi_taxonomy": True,
+                    "nucc_taxonomy": True,
+                    "npi_other_identifier": True,
+                },
+            ),
         )
     )
 
@@ -2902,10 +2919,12 @@ def test_entity_address_unified_can_skip_network_bridge_stage_sql():
             "mrf",
             "entity_address_unified_stage",
             stage_classes,
-            source_run_id="run_1",
-            node_id="node_a",
-            raw_table="entity_address_unified_raw",
-            build_network_bridge=False,
+            plan=entity_address_unified._SupportStagePlan(
+                source_run_id="run_1",
+                node_id="node_a",
+                raw_table="entity_address_unified_raw",
+                build_network_bridge=False,
+            ),
         )
     )
 
@@ -3079,6 +3098,7 @@ def _assert_serving_stage_indexes(statements, index_context_map) -> None:
         "idx_procedures_array",
         "idx_geo_bbox",
         "idx_geo_idx",
+        "idx_geo_taxonomy",
         "idx_primary_phone_npi",
         "idx_service_phone_lookup_npi",
         "idx_service_phone_digits_npi",
@@ -3117,6 +3137,10 @@ class _StageIndexRecorder:
 
     async def status(self, statement):
         self._statements.append(statement)
+
+    async def scalar(self, statement):
+        self._statements.append(statement)
+        return 1
 
 
 class _EntityAddressServingStage:
@@ -3225,6 +3249,16 @@ class _EntityAddressServingStage:
             "where": "lat IS NOT NULL AND long IS NOT NULL",
         },
         {
+            "index_elements": (
+                "public.Geography(public.ST_MakePoint((long)::double precision, "
+                "(lat)::double precision))",
+                "taxonomy_array public.gist__intbig_ops",
+            ),
+            "using": "gist",
+            "name": "geo_taxonomy",
+            "where": "lat IS NOT NULL AND long IS NOT NULL",
+        },
+        {
             "index_elements": ("lat", "long"),
             "name": "geo_bbox",
             "where": "lat IS NOT NULL AND long IS NOT NULL",
@@ -3248,6 +3282,121 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
     )
 
     _assert_serving_stage_indexes(statements, index_context_map)
+    assert index_context_map["geo_taxonomy_stage_index_valid"] is True
+    geo_taxonomy_ddl = next(
+        statement
+        for statement in statements
+        if statement.lstrip().startswith("CREATE INDEX")
+        and "idx_geo_taxonomy" in statement
+    )
+    assert "taxonomy_array public.gist__intbig_ops" in geo_taxonomy_ddl
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_skips_geo_validation_without_postgis(monkeypatch):
+    class FakeDB:
+        async def status(self, statement):
+            if "ST_MakePoint" in statement:
+                raise RuntimeError("PostGIS is unavailable")
+
+        async def scalar(self, _statement):
+            raise AssertionError("geo index validation should be skipped")
+
+    index_context_map = {}
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE", "serving")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_CONCURRENCY", "1")
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    await entity_address_unified._create_stage_indexes(
+        _EntityAddressServingStage,
+        "mrf",
+        context=index_context_map,
+    )
+
+    assert index_context_map["postgis_skipped_stage_indexes"] == {
+        _EntityAddressServingStage.__tablename__: ["geo_idx", "geo_taxonomy"]
+    }
+    assert "geo_taxonomy_stage_index_valid" not in index_context_map
+
+
+def test_entity_address_unified_detects_nested_postgis_sqlstate():
+    missing_function = RuntimeError("undefined function")
+    missing_function.sqlstate = "42883"
+    driver_error = RuntimeError("ST_MakePoint lookup failed")
+    driver_error.__cause__ = missing_function
+    wrapped_error = RuntimeError("statement failed")
+    wrapped_error.orig = driver_error
+
+    assert entity_address_unified._is_postgis_unavailable_error(wrapped_error)
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_does_not_hide_non_postgis_index_errors(monkeypatch):
+    class FakeDB:
+        async def status(self, statement):
+            if "ST_MakePoint" in statement:
+                raise RuntimeError(f"disk full while executing {statement}")
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE", "serving")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_CONCURRENCY", "1")
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        await entity_address_unified._create_stage_indexes(
+            _EntityAddressServingStage,
+            "mrf",
+            context={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_requires_geo_taxonomy_stage_index(monkeypatch):
+    class FakeDB:
+        async def scalar(self, _statement):
+            return None
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    with pytest.raises(RuntimeError, match="requires a valid geo_taxonomy GiST index"):
+        await entity_address_unified._require_geo_taxonomy_stage_index(
+            _EntityAddressServingStage,
+            "mrf",
+            {"stage_index_profile": "serving"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_does_not_reuse_stale_postgis_skip(monkeypatch):
+    class FakeDB:
+        async def status(self, _statement):
+            return None
+
+        async def scalar(self, _statement):
+            return None
+
+    table_name = _EntityAddressServingStage.__tablename__
+    index_context_map = {
+        "postgis_skipped_stage_indexes": {
+            table_name: ["geo_idx", "geo_taxonomy"],
+            "another_stage": ["geo_idx", "geo_taxonomy"],
+        }
+    }
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE", "serving")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_CONCURRENCY", "1")
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    with pytest.raises(RuntimeError, match="requires a valid geo_taxonomy GiST index"):
+        await entity_address_unified._create_stage_indexes(
+            _EntityAddressServingStage,
+            "mrf",
+            context=index_context_map,
+        )
+
+    assert index_context_map["postgis_skipped_stage_indexes"][table_name] == []
+    assert index_context_map["postgis_skipped_stage_indexes"]["another_stage"] == [
+        "geo_idx",
+        "geo_taxonomy",
+    ]
 
 
 @pytest.mark.asyncio
@@ -3308,6 +3457,8 @@ async def test_entity_address_unified_post_publish_serving_indexes_use_live_tabl
     assert "entity_address_unified_idx_geo_bbox" in joined
     assert "(lat, long) INCLUDE (npi, address_key)" in joined
     assert "entity_address_unified_idx_geo_idx" in joined
+    assert "entity_address_unified_idx_geo_taxonomy" in joined
+    assert "taxonomy_array public.gist__intbig_ops" in joined
     assert "entity_address_unified_idx_primary_phone_npi" in joined
     assert "entity_address_unified_idx_service_phone_lookup_npi" in joined
     assert (
@@ -3357,6 +3508,7 @@ async def test_entity_address_unified_swap_renames_model_serving_indexes(monkeyp
         "service_phone_number_npi",
         "service_address_key_npi",
         "service_premise_key_npi",
+        "geo_taxonomy",
     }
     for index_name in expected_indexes:
         assert f"entity_address_unified_20260614_idx_{index_name}" in joined
@@ -3440,6 +3592,24 @@ async def test_entity_address_unified_post_publish_drops_invalid_index_before_re
     assert index_context_map["post_publish_index_completed"] in {1}
     assert index_context_map["post_publish_index_pending"] is False
     assert index_context_map["post_publish_index_timings"][0]["index"] == "npi"
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_post_publish_does_not_hide_non_postgis_errors(monkeypatch):
+    statement = "CREATE INDEX ON mrf.entity_address_unified USING gist (Geography(ST_MakePoint(long, lat)));"
+
+    class FakeDB:
+        async def scalar(self, _statement):
+            return None
+
+        async def execute_ddl(self, _statement):
+            raise RuntimeError(f"disk full while executing {statement}")
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    build = entity_address_unified._PostPublishIndexBuild("mrf", "entity_address_unified", {}, True)
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        await entity_address_unified._build_post_publish_index(build, "geo_taxonomy", statement)
 
 
 @pytest.mark.asyncio
@@ -3828,9 +3998,11 @@ def test_entity_address_unified_support_stage_sql_has_stage_fallback_evidence():
             "mrf",
             "entity_address_unified_stage",
             stage_classes,
-            source_run_id="run_2",
-            node_id=None,
-            raw_table=None,
+            plan=entity_address_unified._SupportStagePlan(
+                source_run_id="run_2",
+                node_id=None,
+                raw_table=None,
+            ),
         )
     )
 

@@ -266,6 +266,7 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "procedures_array",
     "medications_array",
     "geo_idx",
+    "geo_taxonomy",
     "geo_bbox",
     "address_key",
 }
@@ -297,6 +298,46 @@ class _SupportStageStatement:
     label: str
     statement: str
     parallel: bool = True
+
+
+@dataclass(frozen=True)
+class _SupportStagePlan:
+    source_run_id: str
+    node_id: str | None
+    raw_table: str | None = None
+    build_network_bridge: bool = True
+    available: Mapping[str, bool] | None = None
+    affected_group_table: str | None = None
+    copy_unaffected_bridges: bool = True
+
+
+@dataclass(frozen=True)
+class _SupportStageContext:
+    db_schema: str
+    stage_table: str
+    stage_table_map: dict[type, str]
+    plan: _SupportStagePlan
+    available: Mapping[str, bool]
+    is_partial_bridge_reuse: bool
+    is_partial_support_patch: bool
+
+
+@dataclass(frozen=True)
+class _SupportBridgeSpec:
+    model: type
+    label: str
+    columns: tuple[str, ...]
+    builder: object
+    shard_env: str | None = None
+    default_shards: int = 1
+
+
+@dataclass(frozen=True)
+class _PostPublishIndexBuild:
+    db_schema: str
+    table_name: str
+    phase_context: dict
+    should_build_concurrently: bool
 
 
 @dataclass(frozen=True)
@@ -1336,10 +1377,33 @@ def _stage_index_statements(
     return statements
 
 
+def _is_postgis_unavailable_error(exc: Exception) -> bool:
+    root_error = getattr(exc, "orig", None) or getattr(exc, "__cause__", None) or exc
+    message = str(root_error).lower()
+    sqlstate = _postgres_sqlstate(exc)
+    mentions_postgis = any(
+        term in message for term in ("st_makepoint", "geography", "postgis")
+    )
+    explicitly_missing = any(
+        term in message
+        for term in (
+            "does not exist",
+            "no such function",
+            "no such type",
+            "postgis is unavailable",
+            "postgis unavailable",
+        )
+    )
+    return mentions_postgis and (
+        sqlstate in {"42704", "42883"} or explicitly_missing
+    )
+
+
 async def _build_stage_index(
     index_name: str,
     statement: str,
     phase_context: dict,
+    postgis_skipped_indexes: list[str],
 ) -> None:
     """Build one stage index while retaining timing and PostGIS fallback."""
 
@@ -1351,13 +1415,13 @@ async def _build_stage_index(
             phase="entity-address-unified indexing stage",
         )
     except Exception as exc:
-        message = str(exc).lower()
-        if "st_makepoint" in message or "geography" in message or "postgis" in message:
+        if _is_postgis_unavailable_error(exc):
             logger.warning(
                 "Skipping geo index %s because PostGIS is unavailable in current DB: %s",
                 index_name,
                 exc,
             )
+            postgis_skipped_indexes.append(index_name)
             return
         raise
     finally:
@@ -1374,35 +1438,45 @@ async def _build_stage_index(
 
 
 async def _build_guarded_stage_index(
-    index_name: str,
-    statement: str,
+    index_statement: tuple[str, str],
     phase_context: dict,
+    postgis_skipped_indexes: list[str],
     semaphore: asyncio.Semaphore,
 ) -> None:
     """Build one stage index inside the configured concurrency bound."""
 
     async with semaphore:
-        await _build_stage_index(index_name, statement, phase_context)
+        await _build_stage_index(
+            *index_statement,
+            phase_context,
+            postgis_skipped_indexes,
+        )
 
 
 async def _run_stage_index_statements(
     statements: list[tuple[str, str]],
     phase_context: dict,
     index_concurrency: int,
+    postgis_skipped_indexes: list[str],
 ) -> None:
     """Run stage-index statements with the original ordering and failures."""
 
     if index_concurrency <= 1 or len(statements) == 1:
         for index_name, statement in statements:
-            await _build_stage_index(index_name, statement, phase_context)
+            await _build_stage_index(
+                index_name,
+                statement,
+                phase_context,
+                postgis_skipped_indexes,
+            )
         return
     semaphore = asyncio.Semaphore(index_concurrency)
     index_results = await asyncio.gather(
         *(
             _build_guarded_stage_index(
-                index_name,
-                statement,
+                (index_name, statement),
                 phase_context,
+                postgis_skipped_indexes,
                 semaphore,
             )
             for index_name, statement in statements
@@ -1412,6 +1486,79 @@ async def _run_stage_index_statements(
     for index_result in index_results:
         if isinstance(index_result, BaseException):
             raise index_result
+
+
+def _required_geo_taxonomy_stage_index_sql(db_schema: str, stage_table: str) -> str:
+    required_index = _stage_index_name(stage_table, "geo_taxonomy")
+    geo_index = _stage_index_name(stage_table, "geo_idx")
+    return f"""
+    SELECT EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_index AS required_meta
+          JOIN pg_catalog.pg_class AS required_index
+            ON required_index.oid = required_meta.indexrelid
+          JOIN pg_catalog.pg_namespace AS index_namespace
+            ON index_namespace.oid = required_index.relnamespace
+          JOIN pg_catalog.pg_class AS stage_table
+            ON stage_table.oid = required_meta.indrelid
+          JOIN pg_catalog.pg_namespace AS table_namespace
+            ON table_namespace.oid = stage_table.relnamespace
+          JOIN pg_catalog.pg_am AS access_method
+            ON access_method.oid = required_index.relam
+          JOIN pg_catalog.pg_class AS geo_index
+            ON geo_index.relnamespace = required_index.relnamespace
+           AND geo_index.relname = {_sql_literal(geo_index)}
+          JOIN pg_catalog.pg_index AS geo_meta
+            ON geo_meta.indexrelid = geo_index.oid
+           AND geo_meta.indrelid = required_meta.indrelid
+         WHERE index_namespace.nspname = {_sql_literal(db_schema)}
+           AND table_namespace.nspname = {_sql_literal(db_schema)}
+           AND stage_table.relname = {_sql_literal(stage_table)}
+           AND required_index.relname = {_sql_literal(required_index)}
+           AND required_meta.indisvalid IS TRUE
+           AND required_meta.indisready IS TRUE
+           AND required_meta.indislive IS TRUE
+           AND required_meta.indisunique IS FALSE
+           AND required_meta.indnkeyatts = 2
+           AND required_meta.indnatts = 2
+           AND access_method.amname = 'gist'
+           AND geo_meta.indisvalid IS TRUE
+           AND geo_meta.indisready IS TRUE
+           AND geo_meta.indislive IS TRUE
+           AND pg_get_indexdef(required_meta.indexrelid, 1, TRUE)
+               = pg_get_indexdef(geo_meta.indexrelid, 1, TRUE)
+           AND pg_get_indexdef(required_meta.indexrelid, 2, TRUE) = 'taxonomy_array'
+           AND pg_get_expr(required_meta.indpred, required_meta.indrelid)
+               = pg_get_expr(geo_meta.indpred, geo_meta.indrelid)
+           AND (
+                SELECT array_agg(opclass.opcname::text ORDER BY key.position)
+                  FROM unnest(required_meta.indclass)
+                       WITH ORDINALITY AS key(opclass_oid, position)
+                  JOIN pg_catalog.pg_opclass AS opclass
+                    ON opclass.oid = key.opclass_oid
+                 WHERE key.position <= required_meta.indnkeyatts
+               ) = ARRAY['gist_geography_ops', 'gist__intbig_ops']::text[]
+    );
+    """
+
+
+async def _require_geo_taxonomy_stage_index(
+    stage_cls,
+    db_schema: str,
+    phase_context: dict,
+    postgis_skipped_indexes: tuple[str, ...] | list[str] = (),
+) -> None:
+    if phase_context.get("stage_index_profile") == "none":
+        return
+    if {"geo_idx", "geo_taxonomy"}.issubset(postgis_skipped_indexes):
+        return
+    if not await db.scalar(
+        _required_geo_taxonomy_stage_index_sql(db_schema, stage_cls.__tablename__)
+    ):
+        raise RuntimeError(
+            "entity-address-unified stage requires a valid geo_taxonomy GiST index"
+        )
+    phase_context["geo_taxonomy_stage_index_valid"] = True
 
 
 async def _create_stage_indexes(
@@ -1447,11 +1594,190 @@ async def _create_stage_indexes(
         len(statements),
     )
     phase_context["stage_index_concurrency"] = index_concurrency
+    postgis_skipped_indexes: list[str] = []
+    phase_context.setdefault("postgis_skipped_stage_indexes", {})[
+        stage_cls.__tablename__
+    ] = postgis_skipped_indexes
     await _run_stage_index_statements(
         statements,
         phase_context,
         index_concurrency,
+        postgis_skipped_indexes,
     )
+    if getattr(stage_cls, "__main_table__", "") == EntityAddressUnified.__main_table__:
+        await _require_geo_taxonomy_stage_index(
+            stage_cls,
+            db_schema,
+            phase_context,
+            postgis_skipped_indexes,
+        )
+
+
+async def _run_post_publish_ddl(
+    build: _PostPublishIndexBuild,
+    statement: str,
+    phase: str,
+) -> None:
+    if build.should_build_concurrently and hasattr(db, "execute_ddl"):
+        await db.execute_ddl(statement)
+        return
+    await _run_sql_phase(statement, context=build.phase_context, phase=phase)
+
+
+async def _analyze_post_publish_table(build: _PostPublishIndexBuild) -> None:
+    started_at = time.time()
+    await _run_post_publish_ddl(
+        build,
+        f"ANALYZE {build.db_schema}.{build.table_name};",
+        "entity-address-unified post-publish analyze",
+    )
+    build.phase_context["post_publish_analyze_seconds"] = round(
+        time.time() - started_at, 3
+    )
+    build.phase_context["post_publish_analyzed"] = True
+
+
+async def _ensure_post_publish_extensions(
+    build: _PostPublishIndexBuild,
+    statements: list[tuple[str, str]],
+) -> None:
+    if not any(" USING gin " in statement for _name, statement in statements):
+        return
+    await _run_post_publish_ddl(
+        build,
+        "CREATE EXTENSION IF NOT EXISTS btree_gin",
+        "entity-address-unified post-publish extension",
+    )
+
+
+async def _is_post_publish_index_invalid(
+    build: _PostPublishIndexBuild,
+    live_index_name: str,
+) -> bool:
+    invalid = await db.scalar(
+        f"""
+        SELECT 1
+          FROM pg_class i
+          JOIN pg_namespace n
+            ON n.oid = i.relnamespace
+          JOIN pg_index ix
+            ON ix.indexrelid = i.oid
+         WHERE n.nspname = {_sql_literal(build.db_schema)}
+           AND i.relname = {_sql_literal(live_index_name)}
+           AND ix.indisvalid IS FALSE
+         LIMIT 1;
+        """
+    )
+    return bool(invalid)
+
+
+async def _drop_invalid_post_publish_index(
+    build: _PostPublishIndexBuild,
+    live_index_name: str,
+) -> None:
+    if not await _is_post_publish_index_invalid(build, live_index_name):
+        return
+    concurrent = "CONCURRENTLY " if build.should_build_concurrently else ""
+    await _run_post_publish_ddl(
+        build,
+        f"DROP INDEX {concurrent}IF EXISTS {build.db_schema}.{live_index_name};",
+        "entity-address-unified post-publish invalid index cleanup",
+    )
+
+
+def _record_post_publish_index_result(
+    build: _PostPublishIndexBuild,
+    index_name: str,
+    started_at: float,
+    is_completed: bool,
+) -> None:
+    finished_at = time.time()
+    build.phase_context.setdefault("post_publish_index_timings", []).append(
+        {
+            "index": index_name,
+            "seconds": round(finished_at - started_at, 3),
+            "started_at": round(started_at, 6),
+            "finished_at": round(finished_at, 6),
+        }
+    )
+    if not is_completed:
+        return
+    completed = int(build.phase_context.get("post_publish_index_completed") or 0) + 1
+    build.phase_context["post_publish_index_completed"] = completed
+    build.phase_context["post_publish_index_pending"] = completed < int(
+        build.phase_context.get("post_publish_index_total") or 0
+    )
+
+
+async def _build_post_publish_index(
+    build: _PostPublishIndexBuild,
+    index_name: str,
+    statement: str,
+) -> None:
+    started_at = time.time()
+    is_completed = False
+    try:
+        await _drop_invalid_post_publish_index(
+            build, f"{build.table_name}_idx_{index_name}"
+        )
+        if build.should_build_concurrently and hasattr(db, "execute_ddl"):
+            await db.execute_ddl(statement)
+            _record_phase_timing(
+                build.phase_context,
+                "entity-address-unified post-publish indexing",
+                time.time() - started_at,
+                None,
+            )
+        else:
+            await _run_sql_phase(
+                statement,
+                context=build.phase_context,
+                phase="entity-address-unified post-publish indexing",
+            )
+        is_completed = True
+    except Exception as exc:
+        if not _is_postgis_unavailable_error(exc):
+            raise
+        logger.warning(
+            "Skipping post-publish geo index %s because PostGIS is unavailable in current DB: %s",
+            index_name,
+            exc,
+        )
+        is_completed = True
+    finally:
+        _record_post_publish_index_result(build, index_name, started_at, is_completed)
+
+
+async def _guarded_post_publish_index(
+    semaphore: asyncio.Semaphore,
+    build: _PostPublishIndexBuild,
+    index_name: str,
+    statement: str,
+) -> None:
+    async with semaphore:
+        await _build_post_publish_index(build, index_name, statement)
+
+
+async def _run_post_publish_indexes(
+    build: _PostPublishIndexBuild,
+    statements: list[tuple[str, str]],
+    concurrency: int,
+) -> None:
+    if concurrency <= 1 or len(statements) == 1:
+        for index_name, statement in statements:
+            await _build_post_publish_index(build, index_name, statement)
+        return
+    semaphore = asyncio.Semaphore(concurrency)
+    index_results = await asyncio.gather(
+        *(
+            _guarded_post_publish_index(semaphore, build, index_name, statement)
+            for index_name, statement in statements
+        ),
+        return_exceptions=True,
+    )
+    for index_result in index_results:
+        if isinstance(index_result, BaseException):
+            raise index_result
 
 
 async def _create_post_publish_indexes(
@@ -1462,65 +1788,42 @@ async def _create_post_publish_indexes(
     """Build and analyze configured indexes on the published address table."""
     phase_context = context if context is not None else {}
     profile = _post_publish_index_profile()
-    phase_context["post_publish_index_profile"] = profile
     should_build_concurrently = _should_build_post_publish_concurrently()
+    phase_context["post_publish_index_profile"] = profile
     phase_context["post_publish_index_concurrently"] = should_build_concurrently
     if profile == "none":
-        phase_context["post_publish_index_pending"] = False
-        phase_context["post_publish_index_total"] = 0
-        phase_context["post_publish_index_completed"] = 0
-        phase_context["post_publish_skipped_indexes"] = []
+        phase_context.update(
+            post_publish_index_pending=False,
+            post_publish_index_total=0,
+            post_publish_index_completed=0,
+            post_publish_skipped_indexes=[],
+        )
         return
-    table_name = EntityAddressUnified.__main_table__
-    statements, skipped_indexes = _post_publish_index_plan(
+    build = _PostPublishIndexBuild(
         db_schema,
-        profile,
-        build_concurrently=should_build_concurrently,
+        EntityAddressUnified.__main_table__,
+        phase_context,
+        should_build_concurrently,
+    )
+    statements, skipped_indexes = _post_publish_index_plan(
+        db_schema, profile, build_concurrently=should_build_concurrently
     )
     phase_context["post_publish_skipped_indexes"] = skipped_indexes
-
-    async def _analyze_live_table() -> None:
-        statement = f"ANALYZE {db_schema}.{table_name};"
-        started_at = time.time()
-        if should_build_concurrently and hasattr(db, "execute_ddl"):
-            await db.execute_ddl(statement)
-        else:
-            await _run_sql_phase(
-                statement,
-                context=phase_context,
-                phase="entity-address-unified post-publish analyze",
-            )
-        phase_context["post_publish_analyze_seconds"] = round(time.time() - started_at, 3)
-        phase_context["post_publish_analyzed"] = True
-
     if not statements:
-        phase_context["post_publish_index_pending"] = False
-        phase_context["post_publish_index_total"] = 0
-        phase_context["post_publish_index_completed"] = 0
-        await _analyze_live_table()
+        phase_context.update(
+            post_publish_index_pending=False,
+            post_publish_index_total=0,
+            post_publish_index_completed=0,
+        )
+        await _analyze_post_publish_table(build)
         return
-
-    phase_context["post_publish_index_pending"] = True
-    phase_context["post_publish_index_total"] = len(statements)
-    phase_context["post_publish_index_completed"] = 0
-
-    if any(" USING gin " in stmt for _name, stmt in statements):
-        # serving_zip5_taxonomy mixes a btree-typed expression into a GIN
-        # index, which needs the btree_gin extension. It is a trusted
-        # extension (DB owner can create it without superuser), so ensure it
-        # here instead of failing the whole post-publish index pass on a
-        # freshly provisioned database.
-        ensure_extension = "CREATE EXTENSION IF NOT EXISTS btree_gin"
-        if should_build_concurrently and hasattr(db, "execute_ddl"):
-            await db.execute_ddl(ensure_extension)
-        else:
-            await _run_sql_phase(
-                ensure_extension,
-                context=phase_context,
-                phase="entity-address-unified post-publish extension",
-            )
-
-    configured_index_concurrency = _env_int(
+    phase_context.update(
+        post_publish_index_pending=True,
+        post_publish_index_total=len(statements),
+        post_publish_index_completed=0,
+    )
+    await _ensure_post_publish_extensions(build, statements)
+    configured_concurrency = _env_int(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_CONCURRENCY",
         _env_int(
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_CONCURRENCY",
@@ -1529,111 +1832,14 @@ async def _create_post_publish_indexes(
         ),
         minimum=1,
     )
-    index_concurrency = 1 if should_build_concurrently else min(configured_index_concurrency, len(statements))
-    phase_context["post_publish_index_concurrency"] = index_concurrency
-
-    async def _is_post_publish_index_invalid(live_index_name: str) -> bool:
-        invalid = await db.scalar(
-            f"""
-            SELECT 1
-              FROM pg_class i
-              JOIN pg_namespace n
-                ON n.oid = i.relnamespace
-              JOIN pg_index ix
-                ON ix.indexrelid = i.oid
-             WHERE n.nspname = {_sql_literal(db_schema)}
-               AND i.relname = {_sql_literal(live_index_name)}
-               AND ix.indisvalid IS FALSE
-             LIMIT 1;
-            """
-        )
-        return bool(invalid)
-
-    async def _drop_invalid_index(live_index_name: str) -> None:
-        if not await _is_post_publish_index_invalid(live_index_name):
-            return
-        drop_stmt = f"DROP INDEX {'CONCURRENTLY ' if should_build_concurrently else ''}IF EXISTS {db_schema}.{live_index_name};"
-        if should_build_concurrently and hasattr(db, "execute_ddl"):
-            await db.execute_ddl(drop_stmt)
-        else:
-            await _run_sql_phase(
-                drop_stmt,
-                context=phase_context,
-                phase="entity-address-unified post-publish invalid index cleanup",
-            )
-
-    async def _build_index(index_name: str, stmt: str) -> None:
-        started_at = time.time()
-        live_index_name = f"{table_name}_idx_{index_name}"
-        is_completed = False
-        try:
-            await _drop_invalid_index(live_index_name)
-            if should_build_concurrently and hasattr(db, "execute_ddl"):
-                await db.execute_ddl(stmt)
-                _record_phase_timing(
-                    phase_context,
-                    "entity-address-unified post-publish indexing",
-                    time.time() - started_at,
-                    None,
-                )
-            else:
-                await _run_sql_phase(
-                    stmt,
-                    context=phase_context,
-                    phase="entity-address-unified post-publish indexing",
-                )
-            is_completed = True
-        except Exception as exc:
-            msg = str(exc).lower()
-            if "st_makepoint" in msg or "geography" in msg or "postgis" in msg:
-                logger.warning(
-                    "Skipping post-publish geo index %s because PostGIS is unavailable in current DB: %s",
-                    index_name,
-                    exc,
-                )
-                is_completed = True
-                return
-            raise
-        finally:
-            finished_at = time.time()
-            timings = phase_context.setdefault("post_publish_index_timings", [])
-            timings.append(
-                {
-                    "index": index_name,
-                    "seconds": round(finished_at - started_at, 3),
-                    "started_at": round(started_at, 6),
-                    "finished_at": round(finished_at, 6),
-                }
-            )
-            if is_completed:
-                phase_context["post_publish_index_completed"] = int(
-                    phase_context.get("post_publish_index_completed") or 0
-                ) + 1
-                phase_context["post_publish_index_pending"] = (
-                    int(phase_context.get("post_publish_index_completed") or 0)
-                    < int(phase_context.get("post_publish_index_total") or 0)
-                )
-
-    if index_concurrency <= 1 or len(statements) == 1:
-        for index_name, stmt in statements:
-            await _build_index(index_name, stmt)
-        await _analyze_live_table()
-        return
-
-    semaphore = asyncio.Semaphore(index_concurrency)
-
-    async def _guarded(index_name: str, stmt: str) -> None:
-        async with semaphore:
-            await _build_index(index_name, stmt)
-
-    index_results = await asyncio.gather(
-        *(_guarded(index_name, stmt) for index_name, stmt in statements),
-        return_exceptions=True,
+    index_concurrency = (
+        1
+        if should_build_concurrently
+        else min(configured_concurrency, len(statements))
     )
-    for index_result in index_results:
-        if isinstance(index_result, BaseException):
-            raise index_result
-    await _analyze_live_table()
+    phase_context["post_publish_index_concurrency"] = index_concurrency
+    await _run_post_publish_indexes(build, statements, index_concurrency)
+    await _analyze_post_publish_table(build)
 
 
 async def _prepare_inference_stage_indexes(
@@ -8770,33 +8976,6 @@ def _facility_anchor_npi_candidate_sql(
 ) -> str:
     """Build ranked facility-to-NPI candidate materialization SQL."""
     candidate_options_by_name = dict(candidate_options_by_name or {})
-    include_hospital_enrollment = candidate_options_by_name.get(
-        "include_hospital_enrollment", False
-    )
-    include_fqhc_enrollment = candidate_options_by_name.get(
-        "include_fqhc_enrollment", False
-    )
-    include_npi_address_key = candidate_options_by_name.get(
-        "include_npi_address_key", False
-    )
-    include_npi_registry = candidate_options_by_name.get(
-        "include_npi_registry", False
-    )
-    include_npi_taxonomy = candidate_options_by_name.get(
-        "include_npi_taxonomy", False
-    )
-    include_nucc_taxonomy = candidate_options_by_name.get(
-        "include_nucc_taxonomy", False
-    )
-    include_npi_other_identifier = candidate_options_by_name.get(
-        "include_npi_other_identifier", False
-    )
-    include_provider_additional_npi = candidate_options_by_name.get(
-        "include_provider_additional_npi", False
-    )
-    include_facility_anchor = candidate_options_by_name.get(
-        "include_facility_anchor", False
-    )
     candidate_limit = _env_int("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_LIMIT", 25, minimum=1)
     shard_filter = _location_key_shard_filter_sql(
         "t.location_key",
@@ -8873,7 +9052,7 @@ def _facility_anchor_npi_candidate_sql(
 
     fragments: list[str] = []
 
-    if include_hospital_enrollment:
+    if candidate_options_by_name.get("include_hospital_enrollment", False):
         fragments.append(
             f"""
         SELECT
@@ -8903,7 +9082,7 @@ def _facility_anchor_npi_candidate_sql(
             """
         )
 
-    if include_npi_other_identifier:
+    if candidate_options_by_name.get("include_npi_other_identifier", False):
         fragments.append(
             f"""
         SELECT
@@ -8946,7 +9125,7 @@ def _facility_anchor_npi_candidate_sql(
             """
         )
 
-    if include_provider_additional_npi:
+    if candidate_options_by_name.get("include_provider_additional_npi", False):
         fragments.extend(
             [
                 f"""
@@ -9016,7 +9195,7 @@ def _facility_anchor_npi_candidate_sql(
             ]
         )
 
-    if include_fqhc_enrollment:
+    if candidate_options_by_name.get("include_fqhc_enrollment", False):
         fragments.extend(
             [
                 f"""
@@ -9158,7 +9337,9 @@ def _facility_anchor_npi_candidate_sql(
             ]
         )
 
-    if include_npi_address_key and include_npi_taxonomy:
+    if candidate_options_by_name.get(
+        "include_npi_address_key", False
+    ) and candidate_options_by_name.get("include_npi_taxonomy", False):
         fragments.append(
             f"""
         SELECT
@@ -9292,7 +9473,7 @@ def _facility_anchor_npi_candidate_sql(
                 """,
             ]
         )
-        if include_nucc_taxonomy:
+        if candidate_options_by_name.get("include_nucc_taxonomy", False):
             fragments.append(
                 f"""
         SELECT
@@ -9379,7 +9560,9 @@ def _facility_anchor_npi_candidate_sql(
             """
             )
 
-    if include_npi_registry and include_npi_taxonomy:
+    if candidate_options_by_name.get(
+        "include_npi_registry", False
+    ) and candidate_options_by_name.get("include_npi_taxonomy", False):
         fragments.extend(
             [
                 f"""
@@ -9493,7 +9676,7 @@ def _facility_anchor_npi_candidate_sql(
             ]
         )
 
-    if include_facility_anchor:
+    if candidate_options_by_name.get("include_facility_anchor", False):
         fragments.append(
             f"""
         SELECT
@@ -9706,206 +9889,245 @@ def _facility_anchor_npi_candidate_sql(
     """
 
 
+def _support_stage_evidence_sql(context: _SupportStageContext) -> str:
+    plan = context.plan
+    if plan.raw_table:
+        return _evidence_from_raw_sql(
+            context.db_schema,
+            context.stage_table_map[EntityAddressEvidence],
+            plan.raw_table,
+            source_run_id=plan.source_run_id,
+            node_id=plan.node_id,
+        )
+    return _evidence_from_stage_sql(
+        context.db_schema,
+        context.stage_table_map[EntityAddressEvidence],
+        context.stage_table,
+        source_run_id=plan.source_run_id,
+        node_id=plan.node_id,
+        affected_group_table=(
+            plan.affected_group_table if context.is_partial_support_patch else None
+        ),
+    )
+
+
+def _support_bridge_specs(context: _SupportStageContext) -> list[_SupportBridgeSpec]:
+    specs = [
+        _SupportBridgeSpec(
+            EntityAddressPlanBridge,
+            "plan bridge",
+            ("location_key", "entity_type", "entity_id", "plan_id", "market_type"),
+            _plan_bridge_sql,
+        )
+    ]
+    if _is_env_enabled(
+        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_CODE_BRIDGES",
+        DEFAULT_BUILD_CODE_BRIDGES,
+    ) or context.is_partial_bridge_reuse:
+        specs.extend(
+            (
+                _SupportBridgeSpec(
+                    EntityAddressProcedureBridge,
+                    "procedure bridge",
+                    ("location_key", "npi", "code_system", "code"),
+                    _procedure_bridge_sql,
+                    "HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROCEDURE_BRIDGE_SHARDS",
+                    DEFAULT_PROCEDURE_BRIDGE_SHARDS,
+                ),
+                _SupportBridgeSpec(
+                    EntityAddressMedicationBridge,
+                    "medication bridge",
+                    ("location_key", "npi", "code_system", "code"),
+                    _medication_bridge_sql,
+                    "HLTHPRT_ENTITY_ADDRESS_UNIFIED_MEDICATION_BRIDGE_SHARDS",
+                    DEFAULT_MEDICATION_BRIDGE_SHARDS,
+                ),
+            )
+        )
+    if context.plan.build_network_bridge:
+        specs.insert(
+            1,
+            _SupportBridgeSpec(
+                EntityAddressNetworkBridge,
+                "network bridge",
+                ("location_key", "entity_type", "entity_id", "network_id"),
+                _network_bridge_sql,
+            ),
+        )
+    return specs
+
+
+def _should_build_facility_candidates(context: _SupportStageContext) -> bool:
+    available = context.available
+    return (
+        _is_env_enabled(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_FACILITY_CANDIDATES",
+            DEFAULT_BUILD_FACILITY_CANDIDATES,
+        )
+        and not context.is_partial_support_patch
+        and FacilityAnchorNPICandidate in context.stage_table_map
+        and available.get("facility_anchor", False)
+        and available.get(
+            "facility_anchor.medicare_ccn",
+            available.get("facility_anchor", False),
+        )
+    )
+
+
+def _facility_candidate_options(context: _SupportStageContext) -> dict[str, bool]:
+    available = context.available
+    include_nppes = _is_env_enabled(
+        "HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_NPPES", False
+    )
+    include_other_identifier = _is_env_enabled(
+        "HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_OTHER_IDENTIFIER", False
+    )
+    return {
+        "include_hospital_enrollment": available.get(
+            "provider_enrollment_hospital", False
+        ),
+        "include_fqhc_enrollment": available.get("provider_enrollment_fqhc", False),
+        "include_npi_address_key": (
+            available.get("npi", False)
+            and available.get("npi_address", False)
+            and available.get(
+                "npi_address.address_key", available.get("npi_address", False)
+            )
+            and available.get("npi_taxonomy", False)
+        ),
+        "include_npi_registry": (
+            include_nppes
+            and available.get("npi", False)
+            and available.get("npi_address", False)
+        ),
+        "include_npi_taxonomy": available.get("npi_taxonomy", False),
+        "include_nucc_taxonomy": available.get("nucc_taxonomy", False),
+        "include_npi_other_identifier": (
+            include_other_identifier
+            and available.get("npi_other_identifier", False)
+        ),
+        "include_provider_additional_npi": available.get(
+            "provider_enrollment_ffs_additional_npi", False
+        ),
+        "include_facility_anchor": available.get("facility_anchor", False),
+    }
+
+
+def _facility_candidate_stage_statements(
+    context: _SupportStageContext,
+) -> list[_SupportStageStatement]:
+    if not _should_build_facility_candidates(context):
+        return []
+    shard_count = _env_int(
+        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_FACILITY_CANDIDATE_SHARDS",
+        DEFAULT_FACILITY_CANDIDATE_SHARDS,
+        minimum=1,
+    )
+    candidate_options_by_name = _facility_candidate_options(context)
+    statements = []
+    for shard in range(shard_count):
+        label = "facility anchor npi candidate"
+        if shard_count > 1:
+            label = f"{label} shard {shard + 1}/{shard_count}"
+        statements.append(
+            _SupportStageStatement(
+                label,
+                _facility_anchor_npi_candidate_sql(
+                    context.db_schema,
+                    context.stage_table_map[FacilityAnchorNPICandidate],
+                    context.stage_table,
+                    source_run_id=context.plan.source_run_id,
+                    candidate_options_by_name=candidate_options_by_name,
+                    candidate_shards=shard_count,
+                    candidate_shard=shard,
+                ),
+            )
+        )
+    return statements
+
+
+def _support_bridge_stage_statements(
+    context: _SupportStageContext,
+    spec: _SupportBridgeSpec,
+) -> list[_SupportStageStatement]:
+    statements = []
+    plan = context.plan
+    if context.is_partial_bridge_reuse and plan.copy_unaffected_bridges:
+        statements.append(
+            _SupportStageStatement(
+                f"reusing {spec.label}",
+                _copy_unaffected_bridge_rows_sql(
+                    context.db_schema,
+                    spec.model.__main_table__,
+                    context.stage_table_map[spec.model],
+                    spec.columns,
+                    plan.affected_group_table,
+                ),
+            )
+        )
+    shard_count = (
+        _env_int(spec.shard_env, spec.default_shards, minimum=1)
+        if spec.shard_env
+        else 1
+    )
+    for shard in range(shard_count):
+        label = spec.label
+        if shard_count > 1:
+            label = f"{label} shard {shard + 1}/{shard_count}"
+        option_map = {
+            "affected_group_table": (
+                plan.affected_group_table if context.is_partial_bridge_reuse else None
+            )
+        }
+        if spec.shard_env:
+            option_map.update({"bridge_shards": shard_count, "bridge_shard": shard})
+        statements.append(
+            _SupportStageStatement(
+                label,
+                spec.builder(
+                    context.db_schema,
+                    context.stage_table_map[spec.model],
+                    context.stage_table,
+                    **option_map,
+                ),
+            )
+        )
+    return statements
+
+
 def _support_stage_statements(
     db_schema: str,
     stage_table: str,
     stage_classes: dict[type, type],
     *,
-    source_run_id: str,
-    node_id: str | None,
-    raw_table: str | None = None,
-    build_network_bridge: bool = True,
-    available: dict[str, bool] | None = None,
-    affected_group_table: str | None = None,
-    copy_unaffected_bridges: bool = True,
+    plan: _SupportStagePlan,
 ) -> list[_SupportStageStatement]:
     """Build the ordered support-table population plan."""
-    available = available or {}
-    stage_table_map = {
-        model: stage_cls.__tablename__ for model, stage_cls in stage_classes.items()
-    }
-    partial_bridge_reuse = bool(affected_group_table)
-    partial_support_patch = partial_bridge_reuse and not copy_unaffected_bridges
-    should_build_code_bridges = _is_env_enabled(
-        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_CODE_BRIDGES",
-        DEFAULT_BUILD_CODE_BRIDGES,
-    )
-    should_build_facility_candidates = _is_env_enabled(
-        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_FACILITY_CANDIDATES",
-        DEFAULT_BUILD_FACILITY_CANDIDATES,
-    )
-    evidence_sql = (
-        _evidence_from_raw_sql(
-            db_schema,
-            stage_table_map[EntityAddressEvidence],
-            raw_table,
-            source_run_id=source_run_id,
-            node_id=node_id,
-        )
-        if raw_table
-        else _evidence_from_stage_sql(
-            db_schema,
-            stage_table_map[EntityAddressEvidence],
-            stage_table,
-            source_run_id=source_run_id,
-            node_id=node_id,
-            affected_group_table=affected_group_table if partial_support_patch else None,
-        )
+    is_partial_bridge_reuse = bool(plan.affected_group_table)
+    context = _SupportStageContext(
+        db_schema=db_schema,
+        stage_table=stage_table,
+        stage_table_map={
+            model: stage_cls.__tablename__ for model, stage_cls in stage_classes.items()
+        },
+        plan=plan,
+        available=plan.available or {},
+        is_partial_bridge_reuse=is_partial_bridge_reuse,
+        is_partial_support_patch=(
+            is_partial_bridge_reuse and not plan.copy_unaffected_bridges
+        ),
     )
     statements = [
         _SupportStageStatement(
             "support tables",
-            _truncate_support_stage_sql(db_schema, stage_table_map),
+            _truncate_support_stage_sql(db_schema, context.stage_table_map),
             parallel=False,
         ),
-        _SupportStageStatement("evidence", evidence_sql),
+        _SupportStageStatement("evidence", _support_stage_evidence_sql(context)),
     ]
-    code_bridge_specs = [
-        (
-            EntityAddressProcedureBridge,
-            "procedure bridge",
-            ("location_key", "npi", "code_system", "code"),
-            _procedure_bridge_sql,
-            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROCEDURE_BRIDGE_SHARDS",
-            DEFAULT_PROCEDURE_BRIDGE_SHARDS,
-        ),
-        (
-            EntityAddressMedicationBridge,
-            "medication bridge",
-            ("location_key", "npi", "code_system", "code"),
-            _medication_bridge_sql,
-            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_MEDICATION_BRIDGE_SHARDS",
-            DEFAULT_MEDICATION_BRIDGE_SHARDS,
-        ),
-    ]
-    bridge_specs = [
-        (
-            EntityAddressPlanBridge,
-            "plan bridge",
-            ("location_key", "entity_type", "entity_id", "plan_id", "market_type"),
-            _plan_bridge_sql,
-            None,
-            1,
-        ),
-    ]
-    if should_build_code_bridges or partial_bridge_reuse:
-        bridge_specs.extend(code_bridge_specs)
-    if (
-        should_build_facility_candidates
-        and not partial_support_patch
-        and FacilityAnchorNPICandidate in stage_table_map
-        and available.get("facility_anchor", False)
-        and available.get("facility_anchor.medicare_ccn", available.get("facility_anchor", False))
-    ):
-        include_nppes_candidates = _is_env_enabled(
-            "HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_NPPES",
-            False,
-        )
-        include_other_identifier_candidates = _is_env_enabled(
-            "HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_OTHER_IDENTIFIER",
-            False,
-        )
-        facility_candidate_shards = _env_int(
-            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_FACILITY_CANDIDATE_SHARDS",
-            DEFAULT_FACILITY_CANDIDATE_SHARDS,
-            minimum=1,
-        )
-        facility_candidate_options_by_name = dict(
-            include_hospital_enrollment=available.get("provider_enrollment_hospital", False),
-            include_fqhc_enrollment=available.get("provider_enrollment_fqhc", False),
-            include_npi_address_key=(
-                available.get("npi", False)
-                and available.get("npi_address", False)
-                and available.get("npi_address.address_key", available.get("npi_address", False))
-                and available.get("npi_taxonomy", False)
-            ),
-            include_npi_registry=(
-                include_nppes_candidates
-                and available.get("npi", False)
-                and available.get("npi_address", False)
-            ),
-            include_npi_taxonomy=available.get("npi_taxonomy", False),
-            include_nucc_taxonomy=available.get("nucc_taxonomy", False),
-            include_npi_other_identifier=(
-                include_other_identifier_candidates
-                and available.get("npi_other_identifier", False)
-            ),
-            include_provider_additional_npi=available.get(
-                "provider_enrollment_ffs_additional_npi", False
-            ),
-            include_facility_anchor=available.get("facility_anchor", False),
-        )
-        for shard in range(facility_candidate_shards):
-            label = "facility anchor npi candidate"
-            if facility_candidate_shards > 1:
-                label = f"{label} shard {shard + 1}/{facility_candidate_shards}"
-            statements.append(
-                _SupportStageStatement(
-                    label,
-                    _facility_anchor_npi_candidate_sql(
-                        db_schema,
-                        stage_table_map[FacilityAnchorNPICandidate],
-                        stage_table,
-                        source_run_id=source_run_id,
-                        candidate_options_by_name=facility_candidate_options_by_name,
-                        candidate_shards=facility_candidate_shards,
-                        candidate_shard=shard,
-                    ),
-                )
-            )
-    if build_network_bridge:
-        bridge_specs.insert(
-            1,
-            (
-                EntityAddressNetworkBridge,
-                "network bridge",
-                ("location_key", "entity_type", "entity_id", "network_id"),
-                _network_bridge_sql,
-                None,
-                1,
-            ),
-        )
-    for model, label, columns, builder, shard_env, default_shards in bridge_specs:
-        if partial_bridge_reuse and copy_unaffected_bridges:
-            statements.append(
-                _SupportStageStatement(
-                    f"reusing {label}",
-                    _copy_unaffected_bridge_rows_sql(
-                        db_schema,
-                        model.__main_table__,
-                        stage_table_map[model],
-                        columns,
-                        affected_group_table,
-                    ),
-                )
-            )
-        bridge_shards = (
-            _env_int(shard_env, default_shards, minimum=1)
-            if shard_env
-            else 1
-        )
-        for shard in range(bridge_shards):
-            statement_label = label
-            if bridge_shards > 1:
-                statement_label = f"{label} shard {shard + 1}/{bridge_shards}"
-            statement_option_map = {
-                "affected_group_table": affected_group_table if partial_bridge_reuse else None,
-            }
-            if shard_env:
-                statement_option_map.update(
-                    {"bridge_shards": bridge_shards, "bridge_shard": shard}
-                )
-            statements.append(
-                _SupportStageStatement(
-                    statement_label,
-                    builder(
-                        db_schema,
-                        stage_table_map[model],
-                        stage_table,
-                        **statement_option_map,
-                    ),
-                )
-            )
+    statements.extend(_facility_candidate_stage_statements(context))
+    for spec in _support_bridge_specs(context):
+        statements.extend(_support_bridge_stage_statements(context, spec))
     return statements
 
 
@@ -9914,13 +10136,7 @@ def _support_stage_sql(
     stage_table: str,
     stage_classes: dict[type, type],
     *,
-    source_run_id: str,
-    node_id: str | None,
-    raw_table: str | None = None,
-    build_network_bridge: bool = True,
-    available: dict[str, bool] | None = None,
-    affected_group_table: str | None = None,
-    copy_unaffected_bridges: bool = True,
+    plan: _SupportStagePlan,
 ) -> list[str]:
     return [
         stage_statement.statement
@@ -9928,15 +10144,100 @@ def _support_stage_sql(
             db_schema,
             stage_table,
             stage_classes,
-            source_run_id=source_run_id,
-            node_id=node_id,
-            raw_table=raw_table,
-            build_network_bridge=build_network_bridge,
-            available=available,
-            affected_group_table=affected_group_table,
-            copy_unaffected_bridges=copy_unaffected_bridges,
+            plan=plan,
         )
     ]
+
+
+@dataclass
+class _SupportStageProgress:
+    phase_context: dict
+    run_id: str | None
+    concurrency: int
+    total: int
+    lock: asyncio.Lock
+    completed_steps: int = 0
+
+
+async def _report_support_stage_progress(
+    progress: _SupportStageProgress,
+    index: int,
+    stage_statement: _SupportStageStatement,
+    *,
+    is_completed: bool,
+) -> None:
+    async with progress.lock:
+        if is_completed:
+            progress.completed_steps += 1
+        if not progress.run_id:
+            return
+        action = "built" if is_completed else "building"
+        concurrency = "" if is_completed else f" (concurrency {progress.concurrency})"
+        enqueue_live_progress(
+            run_id=progress.run_id,
+            importer="entity-address-unified",
+            status="running",
+            phase=f"entity-address-unified {action} {stage_statement.label}",
+            unit="steps",
+            done=progress.completed_steps,
+            total=progress.total,
+            pct=95 + (progress.completed_steps / max(progress.total, 1)) * 4,
+            message=(
+                f"{action} support table {index}/{progress.total}: "
+                f"{stage_statement.label}{concurrency}"
+            ),
+        )
+
+
+async def _run_support_stage_item(
+    progress: _SupportStageProgress,
+    index: int,
+    stage_statement: _SupportStageStatement,
+) -> None:
+    await _report_support_stage_progress(
+        progress, index, stage_statement, is_completed=False
+    )
+    await _run_sql_phase(
+        stage_statement.statement,
+        context=progress.phase_context,
+        phase=f"entity-address-unified building {stage_statement.label}",
+    )
+    await _report_support_stage_progress(
+        progress, index, stage_statement, is_completed=True
+    )
+
+
+async def _guarded_support_stage_item(
+    semaphore: asyncio.Semaphore,
+    progress: _SupportStageProgress,
+    index: int,
+    stage_statement: _SupportStageStatement,
+) -> None:
+    async with semaphore:
+        await _run_support_stage_item(progress, index, stage_statement)
+
+
+async def _run_support_stage_batch(
+    progress: _SupportStageProgress,
+    batch: list[tuple[int, _SupportStageStatement]],
+) -> None:
+    if not batch:
+        return
+    if progress.concurrency <= 1 or len(batch) == 1:
+        for index, stage_statement in batch:
+            await _run_support_stage_item(progress, index, stage_statement)
+        return
+    semaphore = asyncio.Semaphore(progress.concurrency)
+    results = await asyncio.gather(
+        *(
+            _guarded_support_stage_item(semaphore, progress, index, stage_statement)
+            for index, stage_statement in batch
+        ),
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
 
 
 async def _populate_support_stage_tables(
@@ -9944,29 +10245,14 @@ async def _populate_support_stage_tables(
     stage_table: str,
     stage_classes: dict[type, type],
     *,
-    source_run_id: str,
-    node_id: str | None,
-    raw_table: str | None = None,
-    build_network_bridge: bool = True,
-    available: dict[str, bool] | None = None,
+    plan: _SupportStagePlan,
     run_id: str | None = None,
     context: dict | None = None,
-    affected_group_table: str | None = None,
-    copy_unaffected_bridges: bool = True,
 ) -> dict[str, int]:
     """Populate support stages with bounded parallel execution."""
     phase_context = context if context is not None else {}
     statements = _support_stage_statements(
-        db_schema,
-        stage_table,
-        stage_classes,
-        source_run_id=source_run_id,
-        node_id=node_id,
-        raw_table=raw_table,
-        build_network_bridge=build_network_bridge,
-        available=available,
-        affected_group_table=affected_group_table,
-        copy_unaffected_bridges=copy_unaffected_bridges,
+        db_schema, stage_table, stage_classes, plan=plan
     )
     support_concurrency = min(
         _env_int(
@@ -9974,96 +10260,31 @@ async def _populate_support_stage_tables(
             DEFAULT_SUPPORT_STAGE_CONCURRENCY,
             minimum=1,
         ),
-        max(1, sum(1 for stage_statement in statements if stage_statement.parallel)),
+        max(1, sum(1 for statement in statements if statement.parallel)),
     )
     phase_context["support_stage_concurrency"] = support_concurrency
-    total_steps = len(statements)
-    step_progress_map = {"completed_steps": 0}
-    progress_lock = asyncio.Lock()
-
-    async def _run_item(index: int, stage_statement: _SupportStageStatement) -> None:
-        # Progress is held in step_progress_map to avoid nonlocal state.
-        if run_id:
-            async with progress_lock:
-                current_done = step_progress_map["completed_steps"]
-                enqueue_live_progress(
-                    run_id=run_id,
-                    importer="entity-address-unified",
-                    status="running",
-                    phase=f"entity-address-unified building {stage_statement.label}",
-                    unit="steps",
-                    done=current_done,
-                    total=total_steps,
-                    pct=95 + (current_done / max(total_steps, 1)) * 4,
-                    message=(
-                        f"building support table {index}/{total_steps}: {stage_statement.label} "
-                        f"(concurrency {support_concurrency})"
-                    ),
-                )
-        await _run_sql_phase(
-            stage_statement.statement,
-            context=phase_context,
-            phase=f"entity-address-unified building {stage_statement.label}",
-        )
-
-    async def _finish_item(index: int, stage_statement: _SupportStageStatement) -> None:
-        # Progress is held in step_progress_map to avoid nonlocal state.
-        await _run_item(index, stage_statement)
-        async with progress_lock:
-            step_progress_map["completed_steps"] += 1
-            if run_id:
-                enqueue_live_progress(
-                    run_id=run_id,
-                    importer="entity-address-unified",
-                    status="running",
-                    phase=f"entity-address-unified built {stage_statement.label}",
-                    unit="steps",
-                    done=step_progress_map["completed_steps"],
-                    total=total_steps,
-                    pct=95 + (step_progress_map["completed_steps"] / max(total_steps, 1)) * 4,
-                    message=(
-                        f"built support table {index}/{total_steps}: "
-                        f"{stage_statement.label}"
-                    ),
-                )
-
-    async def _run_parallel_batch(batch: list[tuple[int, _SupportStageStatement]]) -> None:
-        if not batch:
-            return
-        if support_concurrency <= 1 or len(batch) in {1}:
-            for index, stage_statement in batch:
-                await _finish_item(index, stage_statement)
-            return
-        semaphore = asyncio.Semaphore(support_concurrency)
-
-        async def _guarded(index: int, stage_statement: _SupportStageStatement) -> None:
-            async with semaphore:
-                await _finish_item(index, stage_statement)
-
-        results = await asyncio.gather(
-            *(
-                _guarded(index, stage_statement)
-                for index, stage_statement in batch
-            ),
-            return_exceptions=True,
-        )
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
-
-    parallel_batches: list[tuple[int, _SupportStageStatement]] = []
+    progress = _SupportStageProgress(
+        phase_context,
+        run_id,
+        support_concurrency,
+        len(statements),
+        asyncio.Lock(),
+    )
+    parallel_items: list[tuple[int, _SupportStageStatement]] = []
     for index, stage_statement in enumerate(statements, start=1):
         if stage_statement.parallel:
-            parallel_batches.append((index, stage_statement))
+            parallel_items.append((index, stage_statement))
             continue
-        await _run_parallel_batch(parallel_batches)
-        parallel_batches = []
-        await _finish_item(index, stage_statement)
-    await _run_parallel_batch(parallel_batches)
-    row_count_map: dict[str, int] = {}
+        await _run_support_stage_batch(progress, parallel_items)
+        parallel_items = []
+        await _run_support_stage_item(progress, index, stage_statement)
+    await _run_support_stage_batch(progress, parallel_items)
+    row_count_map = {}
     for model, stage_cls in stage_classes.items():
         row_count_map[model.__tablename__] = int(
-            await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};")
+            await db.scalar(
+                f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};"
+            )
             or 0
         )
     return row_count_map
@@ -13335,15 +13556,17 @@ async def process_entity_address_unified_data(ctx, task=None):
             db_schema,
             stage_table,
             support_stage_class_map,
-            source_run_id=import_date,
-            node_id=node_id,
-            raw_table=support_raw_table,
-            build_network_bridge=should_build_network_bridge,
-            available=available_relation_map,
+            plan=_SupportStagePlan(
+                source_run_id=import_date,
+                node_id=node_id,
+                raw_table=support_raw_table,
+                build_network_bridge=should_build_network_bridge,
+                available=available_relation_map,
+                affected_group_table=support_affected_group_table,
+                copy_unaffected_bridges=should_copy_unaffected_support_bridges,
+            ),
             run_id=run_id,
             context=context,
-            affected_group_table=support_affected_group_table,
-            copy_unaffected_bridges=should_copy_unaffected_support_bridges,
         )
         context["support_stage_populated"] = True
         context["support_counts"] = support_counts_by_kind
