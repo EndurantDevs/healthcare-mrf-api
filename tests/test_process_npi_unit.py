@@ -101,6 +101,22 @@ def test_index_requires_postgis_matches_geo_idx_and_expressions(npi_module):
     assert npi_module._index_requires_postgis({"name": "pricing_proc_peer_stats_geo_idx"})
     assert not npi_module._index_requires_postgis({"name": "taxonomy_array", "index_elements": ("taxonomy_array",)})
 
+
+def test_npi_search_taxonomy_projection_has_one_canonical_gin_index(npi_module):
+    model = npi_module.NPIData
+    projection_index = next(
+        index
+        for index in model.__my_additional_indexes__
+        if index.get("name") == "search_taxonomy_codes"
+    )
+
+    assert projection_index == {
+        "index_elements": ("search_taxonomy_codes",),
+        "using": "gin",
+        "name": "search_taxonomy_codes",
+    }
+    assert model.__table__.c.search_taxonomy_codes.nullable is False
+
 def test_npi_requires_nucc_defaults_to_full_imports_only(monkeypatch, npi_module):
     monkeypatch.delenv("HLTHPRT_NPI_REQUIRE_NUCC", raising=False)
     monkeypatch.delenv("HLTHPRT_NPI_REQUIRE_NUCC_IN_TEST", raising=False)
@@ -414,6 +430,8 @@ class _ShutdownRawConnection:
 
     async def fetchval(self, statement: str, *_args):
         self.events.append(statement)
+        if "search_taxonomy_codes" in statement and "FULL OUTER JOIN" in statement:
+            return False
         if "count(*)::bigint" in statement:
             return next(
                 count

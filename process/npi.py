@@ -1788,6 +1788,79 @@ async def refresh_taxonomy_arrays(
     return updated
 
 
+async def refresh_npi_search_taxonomy_codes(
+    *,
+    npi_table: str,
+    taxonomy_table: str,
+    schema: str,
+) -> int:
+    """Project exact taxonomy-code sets onto staged provider rows."""
+    updated = int(
+        await db.scalar(
+            f"""
+            WITH projection AS (
+                SELECT tax.npi,
+                       ARRAY_AGG(
+                           DISTINCT tax.healthcare_provider_taxonomy_code
+                           ORDER BY tax.healthcare_provider_taxonomy_code
+                       )::varchar[] AS codes
+                  FROM {schema}.{taxonomy_table} AS tax
+                 WHERE tax.healthcare_provider_taxonomy_code IS NOT NULL
+                 GROUP BY tax.npi
+            ), updated AS (
+                UPDATE {schema}.{npi_table} AS provider
+                   SET search_taxonomy_codes = projection.codes
+                  FROM projection
+                 WHERE provider.npi = projection.npi
+                   AND provider.search_taxonomy_codes IS DISTINCT FROM projection.codes
+                RETURNING 1
+            )
+            SELECT count(*) FROM updated;
+            """
+        )
+        or 0
+    )
+    print(f"NPI search taxonomy projection complete: updated={updated}")
+    return updated
+
+
+async def validate_npi_search_taxonomy_projection(
+    *,
+    npi_table: str,
+    taxonomy_table: str,
+    schema: str,
+    connection=None,
+) -> None:
+    """Reject a staged provider/taxonomy projection mismatch before publish."""
+    validation_sql = f"""
+        SELECT EXISTS (
+            SELECT 1
+              FROM {schema}.{npi_table} AS provider
+              FULL OUTER JOIN (
+                  SELECT tax.npi,
+                         ARRAY_AGG(
+                             DISTINCT tax.healthcare_provider_taxonomy_code
+                             ORDER BY tax.healthcare_provider_taxonomy_code
+                         )::varchar[] AS codes
+                    FROM {schema}.{taxonomy_table} AS tax
+                   WHERE tax.healthcare_provider_taxonomy_code IS NOT NULL
+                   GROUP BY tax.npi
+              ) AS projection USING (npi)
+             WHERE provider.npi IS NULL
+                OR provider.search_taxonomy_codes IS DISTINCT FROM
+                   COALESCE(projection.codes, ARRAY[]::varchar[])
+             LIMIT 1
+        );
+        """
+    mismatch = (
+        await connection.fetchval(validation_sql)
+        if connection is not None
+        else await db.scalar(validation_sql)
+    )
+    if mismatch:
+        raise NPIPrerequisiteError("NPI search taxonomy projection is invalid")
+
+
 async def _resolve_npi_archive_once(
     staging_table: str,
     field_map: dict[str, str],
@@ -2380,6 +2453,15 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
                         test_mode=bool(context.get("test_mode")),
                     ),
                 )
+                taxonomy_stage = make_class(NPIDataTaxonomy, import_date)
+                await timed_shutdown_phase(
+                    "search_taxonomy_projection",
+                    refresh_npi_search_taxonomy_codes(
+                        npi_table=target_table_name,
+                        taxonomy_table=taxonomy_stage.__tablename__,
+                        schema=db_schema,
+                    ),
+                )
                 if deferred_npi_indexes_obj is not None:
                     await create_additional_indexes(NPIData, deferred_npi_indexes_obj)
                     deferred_npi_indexes_obj = None
@@ -2583,6 +2665,15 @@ WHERE
             lease.connection,
             schema=schema,
             stage_tables=tuple(stage_table_by_live_table.values()),
+        )
+        await timed_shutdown_phase(
+            "search_taxonomy_projection_validation",
+            validate_npi_search_taxonomy_projection(
+                npi_table=stage_table_by_live_table["npi"],
+                taxonomy_table=stage_table_by_live_table["npi_taxonomy"],
+                schema=schema,
+                connection=lease.connection,
+            ),
         )
         stage_row_counts_by_table: dict[str, int] = {}
         for table, stage_table in stage_table_by_live_table.items():
