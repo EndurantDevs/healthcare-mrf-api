@@ -291,9 +291,9 @@ def test_artifact_cleanup_paths_are_event_scoped_and_snapshot_before_delete() ->
     assert closed["steps"][0]["env"]["PR_CLOSED_AT"] == "${{ github.event.pull_request.closed_at }}"
     assert '.status == "completed"' in closed["steps"][0]["run"]
     assert ".pull_requests[]?" not in closed["steps"][0]["run"]
-    assert '.event == "pull_request"' not in closed["steps"][0]["run"]
     assert ".created_at >= $pr_created_at" in closed["steps"][0]["run"]
     assert ".created_at <= $pr_closed_at" in closed["steps"][0]["run"]
+    assert all(token not in closed["steps"][0]["run"] for token in ("2>/dev/null", "|| true"))
     assert 'artifact_rows="$(mktemp)"' in closed["steps"][0]["run"]
     assert 'trap \'rm -f "$artifact_rows"\' EXIT' in closed["steps"][0]["run"]
     assert 'done < "$artifact_rows"' in closed["steps"][0]["run"]
