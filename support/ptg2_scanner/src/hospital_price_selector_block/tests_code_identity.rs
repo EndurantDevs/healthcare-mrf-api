@@ -28,3 +28,18 @@ fn code_system_keeps_equal_code_values_distinct() {
         Some(&[2][..])
     );
 }
+
+#[test]
+fn oversized_code_system_is_rejected() {
+    assert!(encode_selector_page(
+        HospitalPriceSelectorKind::CodeToCharge,
+        0,
+        1,
+        &[typed_code(
+            &"x".repeat(HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES + 1),
+            "A",
+            &[1],
+        )],
+    )
+    .is_err());
+}

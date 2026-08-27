@@ -215,18 +215,6 @@ mod tests {
         .unwrap_err()
         .contains("key component exceeds 1 MiB"));
 
-        assert!(encode_selector_page(
-            HospitalPriceSelectorKind::CodeToCharge,
-            0,
-            1,
-            &[typed_code(
-                &"x".repeat(HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES + 1),
-                "A",
-                &[1],
-            )],
-        )
-        .is_err());
-
         let oversized = "x".repeat(HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES + 1);
         assert!(encode_selector_page(
             HospitalPriceSelectorKind::PayerPlanToFact,
