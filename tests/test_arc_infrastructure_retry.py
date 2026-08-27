@@ -286,7 +286,9 @@ def test_artifact_cleanup_paths_are_event_scoped_and_snapshot_before_delete() ->
     assert closed["concurrency"] == serialized_cleanup_by_field
     assert closed["if"] == "github.event_name == 'pull_request_target'"
     assert ".workflow_run.head_branch == $head_ref" in closed["steps"][0]["run"]
-    assert ".workflow_run.head_repository_id | tostring" in closed["steps"][0]["run"]
+    assert "(.workflow_run.head_repository_id | tostring) == $head_repository_id" in (
+        closed["steps"][0]["run"]
+    )
     assert closed["steps"][0]["env"]["PR_CREATED_AT"] == "${{ github.event.pull_request.created_at }}"
     assert closed["steps"][0]["env"]["PR_CLOSED_AT"] == "${{ github.event.pull_request.closed_at }}"
     assert '.status == "completed"' in closed["steps"][0]["run"]
