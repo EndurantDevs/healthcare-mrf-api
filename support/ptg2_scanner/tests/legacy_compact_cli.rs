@@ -121,6 +121,88 @@ fn legacy_compact_scan_exercises_direct_provider_and_price_projection() {
         .is_empty());
 }
 
+#[test]
+fn legacy_compact_scan_rejects_invalid_expiration_without_terminal_outputs() {
+    let temporary = tempfile::tempdir().expect("temporary fixture root");
+    let source = temporary.path().join("rates.json");
+    let output = temporary.path().join("output");
+    let serving = output.join("serving");
+    let witness_scratch = output.join("witness-scratch");
+    fs::create_dir(&output).expect("create output directory");
+    fs::create_dir(&serving).expect("create serving directory");
+    fs::create_dir(&witness_scratch).expect("create witness scratch directory");
+    let baseline = serving.join("ptg2-v3-serving-baseline.ready");
+    fs::write(&baseline, b"baseline").expect("seed serving baseline");
+
+    let mut fixture: serde_json::Value =
+        serde_json::from_slice(RAW_MRF).expect("parse compact source fixture");
+    let rates = fixture["in_network"][0]["negotiated_rates"]
+        .as_array_mut()
+        .expect("negotiated rates");
+    let mut valid_rate = rates[0].clone();
+    valid_rate["negotiated_prices"][0]["expiration_date"] = serde_json::json!("2028-02-29");
+    let mut invalid_rate = valid_rate.clone();
+    invalid_rate["negotiated_prices"][0]["expiration_date"] = serde_json::json!("2027-02-30");
+    rates.clear();
+    rates.extend([valid_rate, invalid_rate]);
+    let raw = serde_json::to_vec(&fixture).expect("encode compact source fixture");
+    fs::write(&source, &raw).expect("write compact source fixture");
+
+    let completed = Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
+        .args(["--compact-serving", source.to_str().expect("UTF-8 source")])
+        .env("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
+        .env("HLTHPRT_PTG2_V3_SERVING_RUN_DIR", &serving)
+        .env("HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID", "33".repeat(32))
+        .env("HLTHPRT_PTG2_RAW_SOURCE_SHA256", sha256_hex(&raw))
+        .env("HLTHPRT_PTG2_SOURCE_WITNESS_SCRATCH_DIR", &witness_scratch)
+        .env("HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS", "false")
+        .env("HLTHPRT_PTG2_PROVIDER_GRAPH_V4", "false")
+        .env(
+            "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH",
+            output.join("price-atom.copy"),
+        )
+        .env("HLTHPRT_PTG2_RUST_WORKERS", "1")
+        .env("HLTHPRT_PTG2_RUST_WORK_QUEUE", "1")
+        .env("HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES", "1")
+        .env("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS", "true")
+        .env("HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN", "true")
+        .env("HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS", "true")
+        .env("HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED", "false")
+        .output()
+        .expect("run legacy compact scanner");
+
+    assert!(!completed.status.success());
+    assert!(String::from_utf8_lossy(&completed.stderr)
+        .contains("expiration_date must be an exact ISO calendar date"));
+    for terminal_kind in [
+        b"manifest_price_atom_copy_file\t".as_slice(),
+        b"scanner_summary\t".as_slice(),
+        b"source_audit_witness_file\t".as_slice(),
+        b"v3_serving_code_dictionary_file\t".as_slice(),
+        b"v3_serving_run_partition_file\t".as_slice(),
+    ] {
+        assert!(!completed
+            .stdout
+            .windows(terminal_kind.len())
+            .any(|window| window == terminal_kind));
+    }
+    assert_eq!(fs::read(&baseline).unwrap(), b"baseline");
+    assert!(fs::read_dir(&witness_scratch).unwrap().next().is_none());
+    assert!(!fs::read_dir(&serving)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            path != baseline
+                && path.is_file()
+                && (name.starts_with(".ptg2-v3-serving-")
+                    || name.starts_with("ptg2-v3-serving-")
+                    || name.starts_with("ptg2-v3-source-witness-"))
+        }));
+}
+
 #[cfg(unix)]
 #[test]
 fn gzip_scan_indexes_and_reorders_in_network_before_provider_references() {

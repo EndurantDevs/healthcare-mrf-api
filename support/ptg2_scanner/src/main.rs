@@ -2284,7 +2284,8 @@ fn price_atom_from_lite(price: &PriceLite) -> PriceAtomLite {
     }
 }
 
-fn price_atom_from_owned_lite(price: PriceLite) -> PriceAtomLite {
+fn price_atom_from_owned_lite(mut price: PriceLite) -> io::Result<PriceAtomLite> {
+    price.expiration_date = strict_optional_iso_calendar_date(price.expiration_date)?;
     let global_id = GlobalId128::from_price_atom_parts(
         price.negotiated_type.as_deref(),
         Some(&price.negotiated_rate),
@@ -2295,7 +2296,7 @@ fn price_atom_from_owned_lite(price: PriceLite) -> PriceAtomLite {
         &price.billing_code_modifier,
         price.additional_information.as_deref(),
     );
-    PriceAtomLite {
+    Ok(PriceAtomLite {
         global_id,
         negotiated_type: price.negotiated_type,
         negotiated_rate: price.negotiated_rate,
@@ -2305,7 +2306,7 @@ fn price_atom_from_owned_lite(price: PriceLite) -> PriceAtomLite {
         setting: price.setting,
         billing_code_modifier: price.billing_code_modifier,
         additional_information: price.additional_information,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -9953,7 +9954,7 @@ fn read_rate_lite_struson<R: Read>(
                 json_reader.begin_array().map_err(to_io_error)?;
                 while json_reader.has_next().map_err(to_io_error)? {
                     if let Some(price) = read_price_lite_struson(json_reader)? {
-                        price_atoms.push(price_atom_from_owned_lite(price));
+                        price_atoms.push(price_atom_from_owned_lite(price)?);
                     }
                 }
                 json_reader.end_array().map_err(to_io_error)?;
@@ -10028,6 +10029,54 @@ fn trim_optional_wire_text(value: Option<String>) -> Option<String> {
     }
 }
 
+fn strict_optional_iso_calendar_date(value: Option<String>) -> io::Result<Option<String>> {
+    let Some(value) = trim_optional_wire_text(value) else {
+        return Ok(None);
+    };
+    let mut parts = value.split('-');
+    let (Some(year), Some(month), Some(day), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(invalid_expiration_date());
+    };
+    if year.len() != 4
+        || month.len() != 2
+        || day.len() != 2
+        || !year.bytes().all(|byte| byte.is_ascii_digit())
+        || !month.bytes().all(|byte| byte.is_ascii_digit())
+        || !day.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(invalid_expiration_date());
+    }
+    let (Ok(year), Ok(month), Ok(day)) = (
+        year.parse::<u32>(),
+        month.parse::<u32>(),
+        day.parse::<u32>(),
+    ) else {
+        return Err(invalid_expiration_date());
+    };
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let maximum_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return Err(invalid_expiration_date()),
+    };
+    if year == 0 || day == 0 || day > maximum_day {
+        return Err(invalid_expiration_date());
+    }
+    Ok(Some(value))
+}
+
+fn invalid_expiration_date() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "expiration_date must be an exact ISO calendar date",
+    )
+}
+
 fn read_rate_lite_bytes_typed(
     raw: &[u8],
     allow_empty_npi_tin_only: bool,
@@ -10073,7 +10122,7 @@ fn read_rate_lite_bytes_typed(
             setting: trim_optional_wire_text(price.setting),
             billing_code_modifier: canonical_modifier_list(price.billing_code_modifier),
             additional_information: trim_optional_wire_text(price.additional_information),
-        }));
+        })?);
     }
     let prepared_price_set = price_set_from_atoms(price_atoms).ok_or_else(|| {
         io::Error::new(
@@ -10133,7 +10182,7 @@ fn read_rate_lite_bytes_typed_v4(raw: &[u8]) -> io::Result<Option<RateLite>> {
             setting: trim_optional_wire_text(price.setting),
             billing_code_modifier: canonical_modifier_list(price.billing_code_modifier),
             additional_information: trim_optional_wire_text(price.additional_information),
-        }));
+        })?);
     }
     let prepared_price_set = price_set_from_atoms(price_atoms).ok_or_else(|| {
         io::Error::new(
@@ -30213,6 +30262,62 @@ mod tests {
                 read_rate_lite_bytes_typed(raw, false).unwrap(),
                 read_rate_lite_bytes_streaming(raw, false).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn expiration_date_requires_an_exact_gregorian_calendar_date() {
+        for (raw, expected) in [
+            (None, None),
+            (Some("   "), None),
+            (Some(" 2028-02-29 "), Some("2028-02-29")),
+            (Some("1900-02-28"), Some("1900-02-28")),
+            (Some("9999-12-31"), Some("9999-12-31")),
+        ] {
+            assert_eq!(
+                strict_optional_iso_calendar_date(raw.map(str::to_owned)).unwrap(),
+                expected.map(str::to_owned),
+            );
+        }
+        for invalid in [
+            "0000-01-01",
+            "1900-02-29",
+            "2027-02-29",
+            "2027-02-30",
+            "2027-00-01",
+            "2027-13-01",
+            "2027-01-00",
+            "2027-1-01",
+            "+001-01-01",
+            "2027-+1-01",
+            "2027-01-+1",
+            "2027-01-01T00:00:00Z",
+        ] {
+            let error = strict_optional_iso_calendar_date(Some(invalid.to_owned())).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{invalid}");
+        }
+
+        let valid = br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":12.5,"expiration_date":"2028-02-29"}]}"#;
+        let invalid = br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":12.5,"expiration_date":"2027-02-30"},{"negotiated_rate":13.5,"expiration_date":"2028-02-29"}]}"#;
+        for allow_empty_npi_tin_only in [false, true] {
+            let (parsed, typed) =
+                read_rate_lite_bytes_profiled_with_policy(valid, allow_empty_npi_tin_only).unwrap();
+            assert!(typed);
+            assert_eq!(
+                parsed.unwrap().prepared_price_set.unwrap().atoms[0]
+                    .expiration_date
+                    .as_deref(),
+                Some("2028-02-29"),
+            );
+            for error in [
+                read_rate_lite_bytes_typed(invalid, allow_empty_npi_tin_only).unwrap_err(),
+                read_rate_lite_bytes_streaming(invalid, allow_empty_npi_tin_only).unwrap_err(),
+                read_rate_lite_bytes_profiled_with_policy(invalid, allow_empty_npi_tin_only)
+                    .unwrap_err(),
+            ] {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("exact ISO calendar date"));
+            }
         }
     }
 
