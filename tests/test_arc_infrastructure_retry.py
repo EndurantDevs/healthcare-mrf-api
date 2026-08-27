@@ -286,12 +286,17 @@ def test_artifact_cleanup_paths_are_event_scoped_and_snapshot_before_delete() ->
     assert closed["concurrency"] == serialized_cleanup_by_field
     assert closed["if"] == "github.event_name == 'pull_request_target'"
     assert ".workflow_run.head_branch == $head_ref" in closed["steps"][0]["run"]
-    assert ".workflow_run.head_repository_id | tostring" in closed["steps"][0]["run"]
-    assert closed["steps"][0]["env"]["PR_NUMBER"] == (
-        "${{ github.event.pull_request.number }}"
+    assert "(.workflow_run.head_repository_id | tostring) == $head_repository_id" in (
+        closed["steps"][0]["run"]
     )
+    assert closed["steps"][0]["env"]["PR_CREATED_AT"] == "${{ github.event.pull_request.created_at }}"
+    assert closed["steps"][0]["env"]["PR_CLOSED_AT"] == "${{ github.event.pull_request.closed_at }}"
     assert '.status == "completed"' in closed["steps"][0]["run"]
-    assert "any(.pull_requests[]?;" in closed["steps"][0]["run"]
+    assert ".pull_requests[]" not in closed["steps"][0]["run"]
+    assert "PR_NUMBER" not in closed["steps"][0]["run"]
+    assert ".created_at >= $pr_created_at" in closed["steps"][0]["run"]
+    assert ".created_at <= $pr_closed_at" in closed["steps"][0]["run"]
+    assert all(token not in closed["steps"][0]["run"] for token in ("2>/dev/null", "|| true"))
     assert 'artifact_rows="$(mktemp)"' in closed["steps"][0]["run"]
     assert 'trap \'rm -f "$artifact_rows"\' EXIT' in closed["steps"][0]["run"]
     assert 'done < "$artifact_rows"' in closed["steps"][0]["run"]
@@ -306,6 +311,14 @@ def test_artifact_cleanup_paths_are_event_scoped_and_snapshot_before_delete() ->
     assert 'done < "$artifact_ids"' in stale["steps"][0]["run"]
     assert ".workflow_run.id" not in stale["steps"][0]["run"]
     assert "/actions/runs/${run_id}" not in stale["steps"][0]["run"]
+
+
+def test_closed_pr_cleanup_uses_exact_event_identity() -> None:
+    workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
+    closed_env = workflow["jobs"]["delete-closed-pr-artifacts"]["steps"][0]["env"]
+    assert closed_env["HEAD_REF"] == "${{ github.event.pull_request.head.ref }}"
+    assert closed_env["HEAD_REPOSITORY_ID"] == "${{ github.event.pull_request.head.repo.id }}"
+    assert "PR_NUMBER" not in str(closed_env)
 
 
 def test_all_explicit_artifacts_expire_after_one_day() -> None:

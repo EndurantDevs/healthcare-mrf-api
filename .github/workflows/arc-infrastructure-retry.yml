@@ -135,7 +135,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_CREATED_AT: ${{ github.event.pull_request.created_at }}
+          PR_CLOSED_AT: ${{ github.event.pull_request.closed_at }}
         run: |
           artifact_rows="$(mktemp)"
           trap 'rm -f "$artifact_rows"' EXIT
@@ -154,12 +155,13 @@ jobs:
              @tsv' > "$artifact_rows"
           while IFS=$'\t' read -r artifact_id run_id; do
             run_json="$(gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" \
-              2>/dev/null || true)"
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}")"
             if jq -e \
-              --arg pr_number "${PR_NUMBER}" \
+              --arg pr_created_at "${PR_CREATED_AT}" \
+              --arg pr_closed_at "${PR_CLOSED_AT}" \
               '.status == "completed" and
-               any(.pull_requests[]?; (.number | tostring) == $pr_number)' \
+               .created_at >= $pr_created_at and
+               .created_at <= $pr_closed_at' \
               <<<"${run_json}" >/dev/null; then
               gh api --method DELETE \
                 "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
