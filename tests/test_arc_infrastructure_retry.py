@@ -299,6 +299,7 @@ def test_artifact_cleanup_paths_are_event_scoped_and_snapshot_before_delete() ->
     stale = workflow["jobs"]["delete-stale-artifacts"]
     assert stale["concurrency"] == serialized_cleanup_by_field
     assert "github.event_name == 'schedule'" in stale["if"]
+    assert "github.event_name == 'workflow_dispatch'" in stale["if"]
     assert "1 day ago" in stale["steps"][0]["run"]
     assert 'artifact_ids="$(mktemp)"' in stale["steps"][0]["run"]
     assert 'trap \'rm -f "$artifact_ids"\' EXIT' in stale["steps"][0]["run"]
