@@ -31,6 +31,9 @@ from tests.hospital_price_storage_assertions import (
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = ROOT / "alembic/versions/20260825120000_hospital_price_storage.py"
+SOURCE_FORMAT_MIGRATION_PATH = (
+    ROOT / "alembic/versions/20260827120000_hospital_price_source_format.py"
+)
 POSTGRES_DSN_ENV = "HLTHPRT_HOSPITAL_PRICE_MIGRATION_POSTGRES_DSN"
 DATABASE_RE = re.compile(
     r"^(?:hospital_price_schema_test_[a-z0-9_]+|ptg2_v3_lifecycle_test_ci_runner)$"
@@ -48,20 +51,26 @@ def _load_migration(path: Path = MIGRATION_PATH):
     return migration
 
 
-def test_source_format_constraint_matches_native_receipts() -> None:
-    migration_sql = MIGRATION_PATH.read_text(encoding="utf-8")
+def test_source_format_migration_history_reaches_native_receipts() -> None:
+    historical_sql = MIGRATION_PATH.read_text(encoding="utf-8")
+    repair_sql = SOURCE_FORMAT_MIGRATION_PATH.read_text(encoding="utf-8")
     shape_check = next(
         constraint
         for constraint in HospitalPriceVersion.__table__.constraints
         if constraint.name == "hospital_price_version_shape_check"
     )
     model_sql = str(shape_check.sqltext)
-    for value in ("csv-tall", "csv-wide"):
-        assert value in migration_sql
-        assert value in model_sql
     for value in ("csv_tall", "csv_wide"):
-        assert value not in migration_sql
+        assert value in historical_sql
         assert value not in model_sql
+    for value in ("csv-tall", "csv-wide"):
+        assert value in repair_sql
+        assert value in model_sql
+    repair = _load_migration(SOURCE_FORMAT_MIGRATION_PATH)
+    assert repair.revision == "20260827120000_hospital_price_source_format"
+    assert repair.down_revision == (
+        "20260826200000_hospital_price_selector_range_index"
+    )
 
 
 def _database_url() -> sa.URL:
@@ -426,6 +435,17 @@ async def test_postgres_round_trip_and_last_known_good_cas(monkeypatch) -> None:
     finally:
         await _drop_schema(engine, schema)
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_postgres_source_format_forward_and_rollback(monkeypatch) -> None:
+    """Rewrite legacy spellings and keep the migration reversible."""
+
+    from tests.hospital_price_source_format_migration_postgres import (
+        prove_source_format_forward_and_rollback,
+    )
+
+    await prove_source_format_forward_and_rollback(monkeypatch)
 
 
 @pytest.mark.asyncio
