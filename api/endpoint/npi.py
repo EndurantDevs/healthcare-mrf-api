@@ -104,6 +104,7 @@ PUBLIC_ADDRESS_EXCLUDED_COLUMNS = {
 PUBLIC_NPI_EXCLUDED_COLUMNS = {
     "employer_identification_number",
     "parent_organization_tin",
+    "search_taxonomy_codes",
 }
 PUBLIC_ADDRESS_SITE_KEY = "address_site_key"
 PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS = {
@@ -552,6 +553,57 @@ ENABLE_NPI_SCHEMA_CACHE = _is_environment_flag_enabled(
     "HLTHPRT_ENABLE_NPI_SCHEMA_CACHE",
     "HLTHPRT_ENABLE_SCHEMA_CACHE",
 )
+ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION = _is_environment_flag_enabled(
+    "HLTHPRT_NPI_SEARCH_TAXONOMY_PROJECTION_ENABLED"
+)
+_NPI_SEARCH_TAXONOMY_PROJECTION_READY_SQL = """
+SELECT EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_index AS projection_index
+      JOIN pg_catalog.pg_class AS projection_index_relation
+        ON projection_index_relation.oid = projection_index.indexrelid
+      JOIN pg_catalog.pg_am AS projection_index_method
+        ON projection_index_method.oid = projection_index_relation.relam
+      JOIN pg_catalog.pg_attribute AS projection_column
+        ON projection_column.attrelid = projection_index.indrelid
+       AND projection_column.attname = 'search_taxonomy_codes'
+       AND NOT projection_column.attisdropped
+      JOIN mrf.npi_canonical_publication_receipt AS publication_receipt
+        ON publication_receipt.npi_table_oid = projection_index.indrelid
+      JOIN mrf.npi_canonical_publication_receipt_seal AS publication_seal
+        USING (publication_ref)
+     WHERE projection_index.indrelid = 'mrf.npi'::regclass
+       AND projection_index_relation.relname = 'npi_idx_search_taxonomy_codes'
+       AND projection_index_method.amname = 'gin'
+       AND projection_index.indisvalid
+       AND projection_index.indisready
+       AND projection_index.indnkeyatts = 1
+       AND projection_index.indexprs IS NULL
+       AND projection_index.indpred IS NULL
+       AND projection_index.indkey[0] = projection_column.attnum
+       AND projection_column.attnotnull
+       AND pg_catalog.format_type(
+               projection_column.atttypid,
+               projection_column.atttypmod
+           ) = 'character varying[]'
+);
+"""
+
+
+async def _assert_npi_search_taxonomy_projection_ready() -> None:
+    """Fail startup when an enabled projection is not sealed and indexed."""
+
+    if not ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION:
+        return
+    if await db.scalar(text(_NPI_SEARCH_TAXONOMY_PROJECTION_READY_SQL)) is not True:
+        raise RuntimeError("npi_search_taxonomy_projection_not_ready")
+
+
+@blueprint.listener("before_server_start")
+async def _assert_npi_projection_before_start(_app, _loop):
+    await _assert_npi_search_taxonomy_projection_ready()
+
+
 _NPI_SCHEMA_CACHE_TTL_SECONDS = 300.0
 _TABLE_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
 _TABLE_COLUMNS_CACHE: dict[str, tuple[float, set[str]]] = {}
@@ -673,13 +725,22 @@ def _provider_taxonomy_matched_npi_cte(
 
     if code_placeholders:
         if npi_where:
-            return f"""
+            if not ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION:
+                return f"""
     taxonomy_matched_npi AS MATERIALIZED (
         SELECT DISTINCT {npi_projection}
           FROM mrf.npi_taxonomy AS provider_taxonomy
           JOIN mrf.npi AS b
             ON b.npi = provider_taxonomy.npi
          WHERE provider_taxonomy.healthcare_provider_taxonomy_code IN ({', '.join(code_placeholders)})
+           AND ({npi_where})
+    )
+    """
+            return f"""
+    taxonomy_matched_npi AS MATERIALIZED (
+        SELECT {npi_projection}
+          FROM mrf.npi AS b
+         WHERE b.search_taxonomy_codes && ARRAY[{', '.join(code_placeholders)}]::varchar[]
            AND ({npi_where})
     )
     """
@@ -906,6 +967,16 @@ def _model_table_columns(model: Any) -> set[str]:
     if table is None:
         return set()
     return {str(column.key) for column in table.columns if getattr(column, "key", None)}
+
+
+def _npi_serving_columns() -> tuple[Any, ...]:
+    """Return columns available before taxonomy-projection activation."""
+
+    return tuple(
+        column
+        for column in NPIData.__table__.columns
+        if column.key != "search_taxonomy_codes"
+    )
 
 
 _DB_SCHEMA_RE = re.compile(r"[a-z_][a-z0-9_]{0,62}", flags=re.ASCII)
@@ -9623,12 +9694,18 @@ async def list_providers(request):
             if is_unified_search
             else tuple(column.key for column in NPIAddress.__table__.columns)
         )
+        search_npi_column_names = tuple(
+            column.key for column in _npi_serving_columns()
+        )
         search_row_column_names = (
             ("npi_code",)
-            + tuple(column.key for column in NPIData.__table__.columns)
+            + search_npi_column_names
             + projected_candidate_names
             + ("provider_address_total",)
             + (("_provider_total",) if inline_name_taxonomy_total else ())
+        )
+        search_npi_projection = ", ".join(
+            f"b.{column_name}" for column_name in search_npi_column_names
         )
 
         taxonomy_filter = " and ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
@@ -9759,7 +9836,7 @@ async def list_providers(request):
             {page_npis_sql}
         ),
         sub_s AS (
-            SELECT pn.npi AS npi_code, b.*, g.*{sub_s_relevance_projection}{sub_s_total_projection}
+            SELECT pn.npi AS npi_code, {search_npi_projection}, g.*{sub_s_relevance_projection}{sub_s_total_projection}
               FROM page_npis AS pn
          LEFT JOIN mrf.npi AS b ON b.npi = pn.npi
               JOIN LATERAL (
@@ -13429,7 +13506,7 @@ def _npi_detail_from_result_row(
         "address_list": [],
     }
     index = 0
-    for column in NPIData.__table__.columns:
+    for column in _npi_serving_columns():
         column_value = result_row[index]
         index += 1
         if (
@@ -13506,7 +13583,7 @@ async def _build_npi_identity_details_map(
     )
     query = (
         db.select(
-            npi_data_table,
+            *_npi_serving_columns(),
             taxonomy_aggregate.c.rows,
             taxonomy_group_aggregate.c.rows,
         )
@@ -13747,7 +13824,7 @@ def _npi_detail_query(npi: int, address_subquery: Any) -> Any:
         "taxonomy_group_aggregate",
     )
     select_columns = [
-        npi_data_table,
+        *_npi_serving_columns(),
         taxonomy_aggregate.c.rows,
         taxonomy_group_aggregate.c.rows,
     ]

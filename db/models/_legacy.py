@@ -1049,6 +1049,11 @@ class NPIData(Base, JSONOutputMixin):
             'name': 'entity_type_code',
         },
         {
+            'index_elements': ('search_taxonomy_codes',),
+            'using': 'gin',
+            'name': 'search_taxonomy_codes',
+        },
+        {
             'index_elements': ('npi', 'provider_sex_code'),
             'where': 'provider_sex_code IS NOT NULL',
             'name': 'npi_idx_npi_provider_sex_code',
@@ -1093,6 +1098,12 @@ class NPIData(Base, JSONOutputMixin):
     authorized_official_name_suffix_text = Column(String)
     authorized_official_credential_text = Column(String)
     certification_date = Column(DATE)
+    search_taxonomy_codes = Column(
+        ARRAY(String),
+        nullable=False,
+        server_default=text("ARRAY[]::varchar[]"),
+        default=list,
+    )
     do_business_as = Column(
         ARRAY(String),
         nullable=False,

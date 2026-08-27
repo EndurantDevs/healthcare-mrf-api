@@ -8,7 +8,7 @@ import sanic.exceptions
 pytest.importorskip("pytz")
 
 from api.endpoint import npi as npi_module
-from db.models import NPIAddress, NPIData, NPIDataTaxonomy
+from db.models import NPIAddress, NPIDataTaxonomy
 
 
 class FakeConnection:
@@ -42,7 +42,7 @@ class FakeSessionContext:
 
 def _build_result_row(npi_value: int):
     result_row_list = [npi_value]
-    for column in NPIData.__table__.columns:
+    for column in npi_module._npi_serving_columns():
         if column.key == "npi":
             result_row_list.append(npi_value)
         elif column.key == "do_business_as":

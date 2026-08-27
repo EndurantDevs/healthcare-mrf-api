@@ -231,7 +231,7 @@ async def test_batch_identity_map_uses_one_sorted_set_query():
     def identity_row(npi):
         return [
             npi if column.key == "npi" else None
-            for column in npi_module.NPIData.__table__.columns
+            for column in npi_module._npi_serving_columns()
         ] + [[], []]
 
     session = SimpleNamespace(
@@ -250,7 +250,9 @@ async def test_batch_identity_map_uses_one_sorted_set_query():
     assert set(identity_map) == {first_npi, second_npi}
     assert identity_map[first_npi]["npi"] == first_npi
     assert identity_map[second_npi]["taxonomy_list"] == []
-    statement_params = session.execute.await_args.args[0].compile().params.values()
+    statement = session.execute.await_args.args[0]
+    assert "search_taxonomy_codes" not in str(statement)
+    statement_params = statement.compile().params.values()
     assert [second_npi, first_npi] in statement_params
 
 

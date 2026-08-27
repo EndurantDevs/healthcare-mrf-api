@@ -220,3 +220,66 @@ async def test_refresh_taxonomy_arrays_uses_deterministic_changed_only_update(mo
     sql = calls[0]
     assert "ARRAY_AGG(DISTINCT nucc.int_code ORDER BY nucc.int_code)::int[]" in sql
     assert "addr.taxonomy_array IS DISTINCT FROM sub.res" in sql
+
+
+@pytest.mark.asyncio
+async def test_refresh_npi_search_taxonomy_codes_is_deterministic_and_exact(monkeypatch):
+    calls = []
+
+    async def fake_scalar(sql):
+        calls.append(str(sql))
+        return 34
+
+    monkeypatch.setattr(process_npi.db, "scalar", fake_scalar)
+
+    updated = await process_npi.refresh_npi_search_taxonomy_codes(
+        npi_table="npi_20260828",
+        taxonomy_table="npi_taxonomy_20260828",
+        schema="mrf",
+    )
+
+    assert updated == 34
+    sql = " ".join(calls[0].split())
+    assert "DISTINCT tax.healthcare_provider_taxonomy_code" in sql
+    assert "ORDER BY tax.healthcare_provider_taxonomy_code" in sql
+    assert "tax.healthcare_provider_taxonomy_code IS NOT NULL" in sql
+    assert "UPPER(" not in sql
+    assert "BTRIM(" not in sql
+    assert ")::varchar[] AS codes" in sql
+    assert "provider.search_taxonomy_codes IS DISTINCT FROM projection.codes" in sql
+
+
+@pytest.mark.asyncio
+async def test_npi_search_taxonomy_projection_validation_rejects_mismatch(monkeypatch):
+    monkeypatch.setattr(process_npi.db, "scalar", AsyncMock(return_value=True))
+
+    with pytest.raises(
+        process_npi.NPIPrerequisiteError,
+        match="NPI search taxonomy projection is invalid",
+    ):
+        await process_npi.validate_npi_search_taxonomy_projection(
+            npi_table="npi_20260828",
+            taxonomy_table="npi_taxonomy_20260828",
+            schema="mrf",
+        )
+
+    sql = str(process_npi.db.scalar.await_args.args[0])
+    assert "COALESCE(projection.codes, ARRAY[]::varchar[])" in sql
+    assert "provider.search_taxonomy_codes IS DISTINCT FROM" in sql
+
+
+@pytest.mark.asyncio
+async def test_npi_search_taxonomy_projection_validates_on_owned_connection(monkeypatch):
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=False))
+    scalar = AsyncMock()
+    monkeypatch.setattr(process_npi.db, "scalar", scalar)
+
+    await process_npi.validate_npi_search_taxonomy_projection(
+        npi_table="npi_20260828",
+        taxonomy_table="npi_taxonomy_20260828",
+        schema="mrf",
+        connection=connection,
+    )
+
+    connection.fetchval.assert_awaited_once()
+    scalar.assert_not_awaited()

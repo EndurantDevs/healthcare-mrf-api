@@ -424,7 +424,12 @@ async def test_shutdown_handles_rotation(monkeypatch, npi_module):
         index for index, event in enumerate(raw_connection.events)
         if "count(*)::bigint" in event
     )
-    assert final_count < first_swap
+    stage_lock = next(
+        index for index, event in enumerate(raw_connection.events)
+        if event.startswith("LOCK TABLE ")
+    )
+    projection_validation = next(index for index, event in enumerate(raw_connection.events) if "search_taxonomy_codes" in event and "FULL OUTER JOIN" in event)
+    assert stage_lock < projection_validation < final_count < first_swap
     assert raw_connection.events[-1] == "transaction:commit"
     assert shutdown_context_map["context"][npi_module._NPI_CONTROL_TERMINAL_COMMITTED_KEY] is True
     assert shutdown_context_map["context"][

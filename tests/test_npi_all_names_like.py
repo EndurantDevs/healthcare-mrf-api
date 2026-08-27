@@ -422,6 +422,11 @@ async def test_get_all_zip_taxonomy_uses_location_first_probe(monkeypatch):
 async def test_get_all_name_taxonomy_materializes_taxonomy_driven_name_match(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(
+        npi_module,
+        "ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION",
+        True,
+    )
 
     request = types.SimpleNamespace(
         args={
@@ -437,12 +442,12 @@ async def test_get_all_name_taxonomy_materializes_taxonomy_driven_name_match(mon
     page_sql = conn.sql_calls[-1][0]
     assert "filtered_npi AS MATERIALIZED" not in page_sql
     assert "taxonomy_matched_npi AS MATERIALIZED" in page_sql
-    assert "JOIN mrf.npi AS b" in page_sql
-    assert "FROM mrf.npi_taxonomy AS provider_taxonomy" in page_sql
+    assert "FROM mrf.npi AS b" in page_sql
+    assert "FROM mrf.npi_taxonomy AS provider_taxonomy" not in page_sql
     assert "FROM mrf.nucc_taxonomy" not in page_sql
     assert (
-        "provider_taxonomy.healthcare_provider_taxonomy_code "
-        "IN (:page_name_provider_taxonomy_code_0)"
+        "b.search_taxonomy_codes && "
+        "ARRAY[:page_name_provider_taxonomy_code_0]::varchar[]"
     ) in page_sql
     assert conn.sql_calls[-1][1]["page_name_provider_taxonomy_code_0"] == "207Q00000X"
     assert "LOWER(COALESCE(b.provider_last_name, ''))" in page_sql
@@ -455,6 +460,11 @@ async def test_get_all_name_taxonomy_materializes_taxonomy_driven_name_match(mon
 async def test_get_all_name_taxonomy_count_closes_the_cte_list(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(
+        npi_module,
+        "ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION",
+        True,
+    )
 
     response = await get_all(
         types.SimpleNamespace(
@@ -476,13 +486,76 @@ async def test_get_all_name_taxonomy_count_closes_the_cte_list(monkeypatch):
     )
     assert "filtered_npi AS MATERIALIZED" not in count_sql
     assert "taxonomy_matched_npi AS MATERIALIZED" in count_sql
-    assert "JOIN mrf.npi AS b" in count_sql
+    assert "FROM mrf.npi AS b" in count_sql
+    assert "FROM mrf.npi_taxonomy AS provider_taxonomy" not in count_sql
     assert "FROM mrf.nucc_taxonomy" not in count_sql
     assert (
-        "provider_taxonomy.healthcare_provider_taxonomy_code "
-        "IN (:count_name_provider_taxonomy_code_0)"
+        "b.search_taxonomy_codes && "
+        "ARRAY[:count_name_provider_taxonomy_code_0]::varchar[]"
     ) in count_sql
     assert not re.search(r"\)\s*,\s*SELECT\s+COUNT", count_sql, flags=re.IGNORECASE)
+
+
+def test_name_taxonomy_projection_disabled_emits_legacy_schema_sql(monkeypatch):
+    monkeypatch.setattr(
+        npi_module,
+        "ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION",
+        False,
+    )
+
+    sql = npi_module._provider_taxonomy_matched_npi_cte(
+        "1=1",
+        code_placeholders=(":taxonomy_code",),
+        npi_where="LOWER(COALESCE(b.provider_last_name, '')) LIKE :q",
+    )
+
+    assert "search_taxonomy_codes" not in sql
+    assert "FROM mrf.npi_taxonomy AS provider_taxonomy" in sql
+    assert "provider_taxonomy.healthcare_provider_taxonomy_code IN (:taxonomy_code)" in sql
+
+
+@pytest.mark.asyncio
+async def test_name_taxonomy_projection_disabled_skips_startup_catalog(monkeypatch):
+    scalar = AsyncMock()
+    monkeypatch.setattr(
+        npi_module,
+        "ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION",
+        False,
+    )
+    monkeypatch.setattr(npi_module.db, "scalar", scalar)
+
+    await npi_module._assert_npi_search_taxonomy_projection_ready()
+
+    scalar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_name_taxonomy_projection_enabled_requires_sealed_current_gin(monkeypatch):
+    scalar = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        npi_module,
+        "ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION",
+        True,
+    )
+    monkeypatch.setattr(npi_module.db, "scalar", scalar)
+
+    with pytest.raises(
+        RuntimeError,
+        match="npi_search_taxonomy_projection_not_ready",
+    ):
+        await npi_module._assert_npi_search_taxonomy_projection_ready()
+
+    sql = str(scalar.await_args.args[0])
+    assert "projection_index.indrelid = 'mrf.npi'::regclass" in sql
+    assert "publication_receipt.npi_table_oid = projection_index.indrelid" in sql
+    assert "npi_idx_search_taxonomy_codes" in sql
+    assert "projection_index_method.amname = 'gin'" in sql
+    assert "projection_index.indisvalid" in sql
+    assert "projection_index.indisready" in sql
+    assert "projection_index.indkey[0] = projection_column.attnum" in sql
+
+    scalar.return_value = True
+    await npi_module._assert_npi_search_taxonomy_projection_ready()
 
 
 @pytest.mark.asyncio
@@ -493,7 +566,7 @@ async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypat
     provider_record_map = _provider_directory_row_mapping()
     provider_record = (
         (provider_npi,)
-        + tuple(provider_record_map.get(column.key) for column in npi_module.NPIData.__table__.columns)
+        + tuple(provider_record_map.get(column.key) for column in npi_module._npi_serving_columns())
         + tuple(provider_record_map.get(column.key) for column in npi_module.NPIAddress.__table__.columns)
         + (1, 52)
     )
@@ -555,7 +628,7 @@ async def test_get_all_name_taxonomy_cancels_sibling_reads_on_failure(monkeypatc
     provider_record_map = _provider_directory_row_mapping()
     provider_record = (
         (provider_npi,)
-        + tuple(provider_record_map.get(column.key) for column in npi_module.NPIData.__table__.columns)
+        + tuple(provider_record_map.get(column.key) for column in npi_module._npi_serving_columns())
         + tuple(provider_record_map.get(column.key) for column in npi_module.NPIAddress.__table__.columns)
         + (1, 52)
     )
@@ -1622,6 +1695,7 @@ def _provider_directory_row_mapping():
         "provider_organization_name": "SYNTHETIC PROVIDER ORGANIZATION",
         "employer_identification_number": "private-ein-sentinel",
         "parent_organization_tin": "private-tin-sentinel",
+        "search_taxonomy_codes": ["207Q00000X"],
         "type": "practice",
         "first_line": "115 Example Court",
         "city_name": "Example City",
@@ -1697,6 +1771,7 @@ async def test_npi_all_includes_fhir_sources(monkeypatch):
 
     assert "employer_identification_number" not in provider_match
     assert "parent_organization_tin" not in provider_match
+    assert "search_taxonomy_codes" not in provider_match
     assert "private-ein-sentinel" not in json.dumps(provider_match)
     assert "private-tin-sentinel" not in json.dumps(provider_match)
 

@@ -391,9 +391,17 @@ async def test_fast_has_insurance_count_city_uses_distinct(monkeypatch):
     assert "count(distinct" in calls[0].lower()
 
 
+def _search_npi_columns():
+    return tuple(
+        column
+        for column in NPIData.__table__.columns
+        if column.key != "search_taxonomy_codes"
+    )
+
+
 def _build_result_row(npi_value: int) -> list:
     result_values = [npi_value]
-    for column in NPIData.__table__.columns:
+    for column in _search_npi_columns():
         if column.key == "npi":
             result_values.append(npi_value)
         elif column.key == "do_business_as":
@@ -414,7 +422,7 @@ def _build_result_row(npi_value: int) -> list:
 def _set_result_address_column(result_values: list, key: str, value):
     for idx, column in enumerate(NPIAddress.__table__.columns):
         if column.key == key:
-            result_values[1 + len(NPIData.__table__.columns) + idx] = value
+            result_values[1 + len(_search_npi_columns()) + idx] = value
             return
     raise AssertionError(f"Unknown NPIAddress column: {key}")
 
@@ -574,6 +582,7 @@ async def test_get_near_npi(monkeypatch):
     assert response_body[0]["phone_number"] == "2175550100"
     assert "employer_identification_number" not in response_body[0]
     assert "parent_organization_tin" not in response_body[0]
+    assert "search_taxonomy_codes" not in response_body[0]
 
 
 @pytest.mark.parametrize(
@@ -805,7 +814,7 @@ def test_public_nested_taxonomy_rows_hide_internal_identity_and_dedupe():
 @pytest.mark.asyncio
 async def test_build_npi_details(monkeypatch):
     row_values = []
-    for column in NPIData.__table__.columns:
+    for column in npi_module._npi_serving_columns():
         if column.key == "npi":
             row_values.append(1234567890)
         else:
@@ -846,6 +855,13 @@ async def test_build_npi_details(monkeypatch):
     assert response_body["address_list"]
     assert "employer_identification_number" not in response_body
     assert "parent_organization_tin" not in response_body
+    assert "search_taxonomy_codes" not in response_body
+
+
+def test_npi_detail_query_compiles_without_activation_column():
+    query = npi_module._npi_detail_query(1234567890, object())
+
+    assert "search_taxonomy_codes" not in str(query._stmt)
 
 
 @pytest.mark.asyncio
