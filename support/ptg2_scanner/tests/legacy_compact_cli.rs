@@ -187,6 +187,7 @@ fn legacy_compact_scan_rejects_invalid_expiration_without_terminal_outputs() {
             .any(|window| window == terminal_kind));
     }
     assert_eq!(fs::read(&baseline).unwrap(), b"baseline");
+    assert!(fs::read_dir(&witness_scratch).unwrap().next().is_none());
     assert!(!fs::read_dir(&serving)
         .unwrap()
         .filter_map(Result::ok)
