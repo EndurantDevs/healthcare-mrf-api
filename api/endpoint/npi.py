@@ -668,13 +668,15 @@ def _provider_taxonomy_matched_npi_cte(
     code_placeholders: Sequence[str] = (),
     npi_where: str = "",
     npi_projection: str = "b.npi",
+    materialized: bool = True,
 ) -> str:
-    """Materialize the smaller side of a provider/taxonomy intersection."""
+    """Build the provider/taxonomy intersection with the requested planner boundary."""
 
+    materialization = "MATERIALIZED" if materialized else "NOT MATERIALIZED"
     if code_placeholders:
         if npi_where:
             return f"""
-    taxonomy_matched_npi AS MATERIALIZED (
+    taxonomy_matched_npi AS {materialization} (
         SELECT DISTINCT {npi_projection}
           FROM mrf.npi_taxonomy AS provider_taxonomy
           JOIN mrf.npi AS b
@@ -699,7 +701,7 @@ def _provider_taxonomy_matched_npi_cte(
         """
 
     return f"""
-    taxonomy_matched_npi AS MATERIALIZED (
+    taxonomy_matched_npi AS {materialization} (
         SELECT DISTINCT fn.*
           FROM filtered_npi AS fn
           JOIN mrf.npi_taxonomy AS provider_taxonomy
@@ -8897,9 +8899,8 @@ async def list_providers(request):
             medication_internal_codes,
         ]
     )
-    inline_name_taxonomy_total = bool(
-        include_total
-        and order_by == "npi"
+    stream_name_taxonomy_page = bool(
+        order_by == "npi"
         and name_like_values
         and codes
         and not phone_digits
@@ -9628,7 +9629,6 @@ async def list_providers(request):
             + tuple(column.key for column in NPIData.__table__.columns)
             + projected_candidate_names
             + ("provider_address_total",)
-            + (("_provider_total",) if inline_name_taxonomy_total else ())
         )
 
         taxonomy_filter = " and ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
@@ -9667,6 +9667,7 @@ async def list_providers(request):
                         code_placeholders=taxonomy_code_placeholders,
                         npi_where=npi_where if direct_name_taxonomy else "",
                         npi_projection=filtered_npi_projection,
+                        materialized=not stream_name_taxonomy_page,
                     )
                 )
 
@@ -9737,29 +9738,18 @@ async def list_providers(request):
             page_order_sql = "ORDER BY npi"
             sub_s_relevance_projection = ""
             result_order_sql = "ORDER BY sub_s.npi_code ASC"
-        if inline_name_taxonomy_total:
-            page_npis_sql = f"""
-            SELECT eligible_npi.*,
-                   COUNT(*) OVER () AS provider_total
-              FROM ({eligible_npis_sql}) AS eligible_npi
-             {page_order_sql}
-             LIMIT :limit OFFSET :start
-            """
-            sub_s_total_projection = ", pn.provider_total AS _provider_total"
-        else:
-            page_npis_sql = f"""
-            {eligible_npis_sql}
-            {page_order_sql}
-            LIMIT :limit OFFSET :start
-            """
-            sub_s_total_projection = ""
+        page_npis_sql = f"""
+        {eligible_npis_sql}
+        {page_order_sql}
+        LIMIT :limit OFFSET :start
+        """
         provider_page_query = text(
             f"""
         {_sql_with_prefix_ctes(phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte)}page_npis AS (
             {page_npis_sql}
         ),
         sub_s AS (
-            SELECT pn.npi AS npi_code, b.*, g.*{sub_s_relevance_projection}{sub_s_total_projection}
+            SELECT pn.npi AS npi_code, b.*, g.*{sub_s_relevance_projection}
               FROM page_npis AS pn
          LEFT JOIN mrf.npi AS b ON b.npi = pn.npi
               JOIN LATERAL (
@@ -9811,7 +9801,6 @@ async def list_providers(request):
             return _add_canonical_contact_fields_to_address(location_by_field)
 
         providers_by_npi = {}
-        provider_total: Optional[int] = None
         async with db.acquire() as conn:
             query_parameters_by_name = {
                 "start": start,
@@ -9859,11 +9848,6 @@ async def list_providers(request):
                         if index < len(provider_record)
                     }
                 if row_mapping is not None:
-                    if (
-                        provider_total is None
-                        and row_mapping.get("_provider_total") is not None
-                    ):
-                        provider_total = int(row_mapping["_provider_total"])
                     npi_value = (
                         row_mapping.get("npi_code")
                         or row_mapping.get("npi")
@@ -10234,16 +10218,14 @@ async def list_providers(request):
             ) if locations else "unknown"
             _add_canonical_contact_fields_to_address(provider_result)
             _redact_internal_address_fields(provider_result)
-        return provider_results, provider_total, summary_map
+        return provider_results, summary_map
 
     if is_count_only:
         count_rows = await get_count(filters_by_name)
         return response.json({"rows": count_rows}, default=str)
 
-    async def _count_with_timeout(*, allow_inline_total: bool = True) -> Optional[int]:
+    async def _count_with_timeout() -> Optional[int]:
         if not include_total:
-            return None
-        if allow_inline_total and inline_name_taxonomy_total:
             return None
         if broad_name_total_deferred:
             logger.info(
@@ -10317,11 +10299,7 @@ async def list_providers(request):
             _count_with_timeout(),
             get_results(start, limit, filters_by_name),
         )
-        result_rows, inline_total, summary_map = result_payload
-        if inline_total is not None:
-            raw_total = inline_total
-        elif inline_name_taxonomy_total:
-            raw_total = await _count_with_timeout(allow_inline_total=False)
+        result_rows, summary_map = result_payload
     if include_total and raw_total is not None:
         total = int(raw_total)
         total_source = "computed"

@@ -419,7 +419,7 @@ async def test_get_all_zip_taxonomy_uses_location_first_probe(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_all_name_taxonomy_materializes_taxonomy_driven_name_match(monkeypatch):
+async def test_get_all_name_taxonomy_streams_taxonomy_driven_name_page(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
 
@@ -436,7 +436,7 @@ async def test_get_all_name_taxonomy_materializes_taxonomy_driven_name_match(mon
 
     page_sql = conn.sql_calls[-1][0]
     assert "filtered_npi AS MATERIALIZED" not in page_sql
-    assert "taxonomy_matched_npi AS MATERIALIZED" in page_sql
+    assert "taxonomy_matched_npi AS NOT MATERIALIZED" in page_sql
     assert "JOIN mrf.npi AS b" in page_sql
     assert "FROM mrf.npi_taxonomy AS provider_taxonomy" in page_sql
     assert "FROM mrf.nucc_taxonomy" not in page_sql
@@ -486,8 +486,8 @@ async def test_get_all_name_taxonomy_count_closes_the_cte_list(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypatch):
-    """Keep taxonomy, status, and enrichment reads concurrent after paging."""
+async def test_get_all_name_taxonomy_overlaps_exact_count_and_streamed_page(monkeypatch):
+    """Keep exact count, page, and independent result reads concurrent."""
     provider_npi = 1000000049
     request_session = object()
     provider_record_map = _provider_directory_row_mapping()
@@ -495,8 +495,10 @@ async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypat
         (provider_npi,)
         + tuple(provider_record_map.get(column.key) for column in npi_module.NPIData.__table__.columns)
         + tuple(provider_record_map.get(column.key) for column in npi_module.NPIAddress.__table__.columns)
-        + (1, 52)
+        + (1,)
     )
+    count_started = asyncio.Event()
+    page_started = asyncio.Event()
     status_started = asyncio.Event()
     enrichment_started = asyncio.Event()
     taxonomy_started = asyncio.Event()
@@ -515,7 +517,14 @@ async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypat
         return {provider_npi: {"status": "active"}}
 
     async def fake_conn_all(sql, **_params):
-        if "SELECT taxonomy.*" not in str(sql):
+        sql_text = str(sql)
+        if "SELECT COUNT(DISTINCT" in sql_text:
+            count_started.set()
+            await asyncio.wait_for(page_started.wait(), timeout=1)
+            return [(52,)]
+        if "page_npis AS" in sql_text:
+            page_started.set()
+            await asyncio.wait_for(count_started.wait(), timeout=1)
             return [provider_record]
         taxonomy_started.set()
         await asyncio.wait_for(asyncio.gather(status_started.wait(), enrichment_started.wait()), timeout=1)
@@ -540,11 +549,13 @@ async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypat
     assert [provider_result["npi"] for provider_result in response_body["rows"]] == [provider_npi]
     assert response_body["rows"][0]["location_status"] == "active"
     assert response_body["rows"][0]["provider_enrichment_summary"] == {"status": "active"}
-    page_sql = str(conn.all.await_args_list[0].args[0])
-    assert page_sql.count("taxonomy_matched_npi AS MATERIALIZED") == 1
-    assert "COUNT(*) OVER () AS provider_total" in page_sql
-    assert "ORDER BY taxonomy.npi, taxonomy.checksum" in str(conn.all.await_args_list[1].args[0])
-    assert not any("SELECT COUNT(DISTINCT" in str(call.args[0]) for call in conn.all.await_args_list)
+    query_sql = [str(call.args[0]) for call in conn.all.await_args_list]
+    page_sql = next(sql for sql in query_sql if "page_npis AS" in sql)
+    count_sql = next(sql for sql in query_sql if "SELECT COUNT(DISTINCT" in sql)
+    assert "taxonomy_matched_npi AS NOT MATERIALIZED" in page_sql
+    assert "COUNT(*) OVER () AS provider_total" not in page_sql
+    assert "taxonomy_matched_npi AS MATERIALIZED" in count_sql
+    assert any("ORDER BY taxonomy.npi, taxonomy.checksum" in sql for sql in query_sql)
 
 
 @pytest.mark.asyncio
@@ -664,11 +675,13 @@ async def test_get_all_name_taxonomy_unified_join_matches_serving_index(monkeypa
         "join mrf.entity_address_unified as c "
         "on coalesce(c.npi, c.inferred_npi) = fn.npi"
     )
-    for query_sql in (count_sql, page_sql):
-        normalized_sql = " ".join(query_sql.lower().split())
-        assert "taxonomy_matched_npi as materialized" in normalized_sql
-        assert expected_join in normalized_sql
-        assert "as provider_taxonomy_match on true" not in normalized_sql
+    normalized_sql = " ".join(count_sql.lower().split())
+    assert "taxonomy_matched_npi as materialized" in normalized_sql
+    assert expected_join in normalized_sql
+    normalized_sql = " ".join(page_sql.lower().split())
+    assert "taxonomy_matched_npi as not materialized" in normalized_sql
+    assert expected_join in normalized_sql
+    assert "as provider_taxonomy_match on true" not in normalized_sql
 
     assert {
         "index_elements": ("coalesce(npi, inferred_npi)",),
