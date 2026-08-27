@@ -256,6 +256,7 @@ def test_artifact_cleanup_paths_are_event_scoped_and_snapshot_before_delete() ->
     workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
     serialized_cleanup_by_field = {
         "group": "arc-infrastructure-artifact-cleanup",
+        "queue": "max",
         "cancel-in-progress": False,
     }
     cleanup = workflow["jobs"]["delete-completed-artifacts"]

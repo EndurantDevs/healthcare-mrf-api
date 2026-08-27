@@ -101,6 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     concurrency:
       group: arc-infrastructure-artifact-cleanup
+      queue: max
       cancel-in-progress: false
     timeout-minutes: 5
     steps:
@@ -125,6 +126,7 @@ jobs:
     runs-on: ubuntu-latest
     concurrency:
       group: arc-infrastructure-artifact-cleanup
+      queue: max
       cancel-in-progress: false
     timeout-minutes: 10
     steps:
@@ -170,6 +172,7 @@ jobs:
     runs-on: ubuntu-latest
     concurrency:
       group: arc-infrastructure-artifact-cleanup
+      queue: max
       cancel-in-progress: false
     timeout-minutes: 15
     steps:
