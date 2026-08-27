@@ -78,7 +78,12 @@ def _validated_selector_page(
         raise HospitalPriceServingUnavailableError(
             "hospital price selector metadata is invalid"
         )
-    selected_refs = list(decoded_page_by_field.get("refs", ()))
+    refs = decoded_page_by_field.get("refs")
+    if type(refs) not in (list, tuple):
+        raise HospitalPriceServingUnavailableError(
+            "hospital price selector metadata is invalid"
+        )
+    selected_refs = list(refs)
     page_index = decoded_page_by_field.get("page_index")
     page_count = decoded_page_by_field.get("page_count")
     page_ref_count = decoded_page_by_field.get("page_ref_count")

@@ -179,6 +179,14 @@ def test_version_and_selector_metadata_fail_closed():
              "first_ref": 0, "refs": [0], "truncated": False},
             b"s" * 32,
         )
+    with pytest.raises(serving.HospitalPriceServingUnavailableError, match="selector"):
+        serving._validated_selector_page(
+            _selector_records()[0],
+            {"page_index": 0, "page_count": 2, "row_count": 1,
+             "page_ref_count": 1, "found": True, "ref_count": 1,
+             "first_ref": 0, "refs": None, "truncated": False},
+            b"s" * 32,
+        )
 
 
 def _selector_records(*, duplicate_page=False):

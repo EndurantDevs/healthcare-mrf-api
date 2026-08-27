@@ -269,6 +269,8 @@ def _has_valid_root_counts(packed_root: HospitalPackedRoot) -> bool:
         )
         or packed_root.payer_plan_selector_block_count
         > packed_root.payer_plan_selector_page_count
+        or packed_root.payer_plan_selector_page_count
+        > packed_root.payer_plan_selector_ref_count
     )
 
 
