@@ -21,6 +21,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = (
     REPOSITORY_ROOT / ".github" / "workflows" / "arc-infrastructure-retry.yml"
 )
+CI_WORKFLOW_PATH = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 RUNNER_LABEL = "healthcare-mrf-ci-main"
 RUNNER_PREFIX = "healthcare-mrf-ci-main-"
 
@@ -184,11 +185,20 @@ def test_public_retry_workflow_excludes_pull_requests_and_untrusted_branches() -
     workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
 
     assert workflow["on"] == {
-        "workflow_run": {"workflows": ["CI"], "types": ["completed"]}
+        "workflow_run": {
+            "workflows": ["CI", "Trusted pull request CI"],
+            "types": ["completed"],
+        },
+        "pull_request_target": {"types": ["closed"]},
+        "schedule": [{"cron": "17 3 * * *"}],
+        "workflow_dispatch": None,
     }
     assert workflow["permissions"] == {"actions": "write", "contents": "read"}
     assert workflow["concurrency"] == {
-        "group": "arc-infrastructure-retry-${{ github.event.workflow_run.id }}",
+        "group": (
+            "arc-infrastructure-retry-"
+            "${{ github.event.workflow_run.id || github.run_id }}"
+        ),
         "cancel-in-progress": False,
     }
 
@@ -201,6 +211,9 @@ def test_public_retry_workflow_excludes_pull_requests_and_untrusted_branches() -
     assert "pull_request" not in condition
     assert job["runs-on"] == "ubuntu-latest"
     assert job["timeout-minutes"] == 3
+    assert job["outputs"] == {
+        "should_retry": "${{ steps.classify.outputs.should_retry }}"
+    }
     assert "container" not in job
 
     checkout, current_tip, classify, rerun = job["steps"]
@@ -232,3 +245,62 @@ def test_public_retry_workflow_excludes_pull_requests_and_untrusted_branches() -
     assert "commits/${DEFAULT_BRANCH}" in rerun["run"]
     assert '"$current_tip" != "$FAILED_HEAD_SHA"' in rerun["run"]
     assert rerun["run"].rstrip().endswith("/rerun-failed-jobs\"")
+
+    cleanup = workflow["jobs"]["delete-completed-artifacts"]
+    assert cleanup["needs"] == "retry-failed-infrastructure"
+    assert "always()" in cleanup["if"]
+    assert "github.event_name == 'workflow_run'" in cleanup["if"]
+    assert "workflow_run.conclusion == 'success'" in cleanup["if"]
+    assert "result == 'success'" in cleanup["if"]
+    assert "result == 'skipped'" in cleanup["if"]
+    assert "outputs.should_retry != 'true'" in cleanup["if"]
+    assert cleanup["runs-on"] == "ubuntu-latest"
+    assert cleanup["timeout-minutes"] == 5
+
+    delete = cleanup["steps"][0]
+    assert delete["env"] == {
+        "GH_TOKEN": "${{ github.token }}",
+        "RUN_ID": "${{ github.event.workflow_run.id }}",
+    }
+    assert "/actions/runs/${RUN_ID}/artifacts?per_page=100" in delete["run"]
+    assert 'artifact_ids="$(mktemp)"' in delete["run"]
+    assert 'trap \'rm -f "$artifact_ids"\' EXIT' in delete["run"]
+    assert 'done < "$artifact_ids"' in delete["run"]
+    assert "/actions/artifacts/${artifact_id}" in delete["run"]
+
+    closed = workflow["jobs"]["delete-closed-pr-artifacts"]
+    assert closed["if"] == "github.event_name == 'pull_request_target'"
+    assert ".workflow_run.head_branch == $head_ref" in closed["steps"][0]["run"]
+    assert ".workflow_run.head_repository_id | tostring" in closed["steps"][0]["run"]
+    assert 'if [ "${status}" = "completed" ]' in closed["steps"][0]["run"]
+    assert 'artifact_rows="$(mktemp)"' in closed["steps"][0]["run"]
+    assert 'trap \'rm -f "$artifact_rows"\' EXIT' in closed["steps"][0]["run"]
+    assert 'done < "$artifact_rows"' in closed["steps"][0]["run"]
+
+    stale = workflow["jobs"]["delete-stale-artifacts"]
+    assert "github.event_name == 'schedule'" in stale["if"]
+    assert "1 day ago" in stale["steps"][0]["run"]
+    assert 'artifact_ids="$(mktemp)"' in stale["steps"][0]["run"]
+    assert 'trap \'rm -f "$artifact_ids"\' EXIT' in stale["steps"][0]["run"]
+    assert 'done < "$artifact_ids"' in stale["steps"][0]["run"]
+    assert ".workflow_run.id" not in stale["steps"][0]["run"]
+    assert "/actions/runs/${run_id}" not in stale["steps"][0]["run"]
+
+
+def test_all_explicit_artifacts_expire_after_one_day() -> None:
+    workflow = yaml.safe_load(CI_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    retention = {
+        step["with"]["name"]: step["with"]["retention-days"]
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if "actions/upload-artifact@" in str(step.get("uses", ""))
+    }
+
+    assert retention == {
+        "mrf-python-coverage-main-${{ matrix.shard-index }}": 1,
+        "mrf-python-coverage-capacity": 1,
+        "mrf-python-coverage-forecast": 1,
+        "mrf-rust-coverage": 1,
+        "mrf-rust-coverage-forecast": 1,
+        "mrf-python-coverage-postgres-${{ matrix.shard }}": 1,
+    }

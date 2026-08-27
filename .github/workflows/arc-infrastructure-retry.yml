@@ -2,15 +2,20 @@ name: ARC infrastructure retry
 
 "on":
   workflow_run:
-    workflows: [CI]
+    workflows: [CI, Trusted pull request CI]
     types: [completed]
+  pull_request_target:
+    types: [closed]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 permissions:
   actions: write
   contents: read
 
 concurrency:
-  group: arc-infrastructure-retry-${{ github.event.workflow_run.id }}
+  group: arc-infrastructure-retry-${{ github.event.workflow_run.id || github.run_id }}
   cancel-in-progress: false
 
 defaults:
@@ -28,6 +33,8 @@ jobs:
       github.event.workflow_run.event == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 3
+    outputs:
+      should_retry: ${{ steps.classify.outputs.should_retry }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -81,3 +88,93 @@ jobs:
           fi
           gh api --method POST \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/rerun-failed-jobs"
+
+  delete-completed-artifacts:
+    needs: retry-failed-infrastructure
+    if: >-
+      always() &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      (needs.retry-failed-infrastructure.result == 'success' ||
+      needs.retry-failed-infrastructure.result == 'skipped') &&
+      needs.retry-failed-infrastructure.outputs.should_retry != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Delete completed CI artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          artifact_ids="$(mktemp)"
+          trap 'rm -f "$artifact_ids"' EXIT
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts[].id' > "$artifact_ids"
+          while IFS= read -r artifact_id; do
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
+            sleep 1
+          done < "$artifact_ids"
+
+  delete-closed-pr-artifacts:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Delete completed artifacts for the closed PR branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id }}
+        run: |
+          artifact_rows="$(mktemp)"
+          trap 'rm -f "$artifact_rows"' EXIT
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" |
+          jq -r \
+            --arg head_ref "${HEAD_REF}" \
+            --arg head_repository_id "${HEAD_REPOSITORY_ID}" \
+            '.artifacts[] |
+             select(
+               .expired == false and
+               .workflow_run.head_branch == $head_ref and
+               (.workflow_run.head_repository_id | tostring) == $head_repository_id
+             ) |
+             [.id, .workflow_run.id] |
+             @tsv' > "$artifact_rows"
+          while IFS=$'\t' read -r artifact_id run_id; do
+            status="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" \
+              --jq '.status' 2>/dev/null || true)"
+            if [ "${status}" = "completed" ]; then
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
+              sleep 1
+            fi
+          done < "$artifact_rows"
+
+  delete-stale-artifacts:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Delete artifacts older than one day
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cutoff="$(date -u -d '1 day ago' '+%Y-%m-%dT%H:%M:%SZ')"
+          artifact_ids="$(mktemp)"
+          trap 'rm -f "$artifact_ids"' EXIT
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" |
+          jq -r \
+            --arg cutoff "${cutoff}" \
+            '.artifacts[] |
+             select(.expired == false and .created_at < $cutoff) |
+             .id' > "$artifact_ids"
+          while IFS= read -r artifact_id; do
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
+            sleep 1
+          done < "$artifact_ids"
