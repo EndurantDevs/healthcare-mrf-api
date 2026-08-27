@@ -15,6 +15,7 @@ INDEX_CATALOG_QUERY = sa.text(
     """
     SELECT index_record.indisvalid,
            index_record.indisready,
+           index_record.indislive,
            index_record.indisunique,
            index_record.indnullsnotdistinct,
            index_record.indisexclusion,
@@ -154,4 +155,3 @@ def _index_catalog_record(
         },
     )
     return catalog_query_result.mappings().one_or_none()
-
