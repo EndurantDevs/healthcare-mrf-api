@@ -439,7 +439,7 @@ async def test_postgres_round_trip_and_last_known_good_cas(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_postgres_source_format_forward_and_rollback(monkeypatch) -> None:
-    """Rewrite legacy spellings and keep the migration reversible."""
+    """Rewrite legacy spellings and keep predecessor rollback compatible."""
 
     from tests.hospital_price_source_format_migration_postgres import (
         prove_source_format_forward_and_rollback,

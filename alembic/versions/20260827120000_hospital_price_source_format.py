@@ -70,16 +70,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Restore the deployed legacy spellings for an application rollback."""
+    """Keep the canonical repair required by the predecessor application."""
 
-    table = f'{_q(_schema())}."hospital_price_version"'
-    _drop_shape_check(table)
-    op.execute(
-        f"UPDATE {table} SET source_format = CASE source_format "
-        "WHEN 'csv-tall' THEN 'csv_tall' "
-        "WHEN 'csv-wide' THEN 'csv_wide' ELSE source_format END "
-        "WHERE source_format IN ('csv-tall', 'csv-wide');"
-    )
-    _add_shape_check(
-        table, source_formats="'json', 'csv_tall', 'csv_wide'"
-    )
+    # The predecessor runtime already emits and serves the canonical spellings.
+    # Reintroducing the deployed constraint defect would break its CSV imports.
+    return None

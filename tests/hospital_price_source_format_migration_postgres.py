@@ -119,7 +119,7 @@ async def _assert_database_state(database_url, schema: str, *args, **kwargs) -> 
 
 
 async def prove_source_format_forward_and_rollback(monkeypatch) -> None:
-    """Prove legacy upgrade, canonical re-entry, and lossless rollback."""
+    """Prove legacy upgrade and canonical-preserving application rollback."""
 
     database_url = _database_url()
     schema = f"hospital_price_test_{uuid.uuid4().hex}"
@@ -153,9 +153,9 @@ async def prove_source_format_forward_and_rollback(monkeypatch) -> None:
         await _assert_database_state(
             database_url,
             schema,
-            legacy_by_version,
-            allowed=("csv_tall", "csv_wide"),
-            rejected=("csv-tall", "csv-wide"),
+            canonical_by_version,
+            allowed=("csv-tall", "csv-wide"),
+            rejected=("csv_tall", "csv_wide"),
         )
     finally:
         await _drop_schema(engine, schema)
