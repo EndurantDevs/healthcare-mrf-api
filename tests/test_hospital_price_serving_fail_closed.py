@@ -12,6 +12,7 @@ import pytest
 
 from api.endpoint import hospital_prices as endpoint
 from api import hospital_price_serving as serving
+from api import hospital_price_serving_support as serving_support
 from api import hospital_price_serving_sql as serving_sql
 from api.hospital_price_request import decode_hospital_price_cursor
 from api.hospital_price_request import encode_hospital_price_cursor
@@ -187,6 +188,9 @@ def test_version_and_selector_metadata_fail_closed():
              "first_ref": 0, "refs": None, "truncated": False},
             b"s" * 32,
         )
+    assert serving_support._is_invalid_selector_layout(
+        {"format_version": 3}, {}, b"s" * 32
+    )
 
 
 def _selector_records(*, duplicate_page=False):
