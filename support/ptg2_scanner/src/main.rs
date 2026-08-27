@@ -133,6 +133,8 @@ const REQUIRED_SHARED_BLOCK_LAYOUT: &str = "dense_shared_blocks_v3";
 const V3_SCRATCH_DURABILITY_CONTRACT: &str = "ptg2_v3_scratch_durability_v1";
 const V3_COVERAGE_SCOPE_ID_ENV: &str = "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID";
 const V3_RAW_SOURCE_SHA256_ENV: &str = "HLTHPRT_PTG2_RAW_SOURCE_SHA256";
+const INVALID_PRICE_EXCLUSION_ENV: &str = "HLTHPRT_PTG2_INVALID_PRICE_EXCLUSION_JSON";
+const INVALID_PRICE_EXCLUSION_MAX_JSON_BYTES: usize = 65_536;
 const GROUP_NEGOTIATED_RATE_CHUNKS_ENV: &str = "HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS";
 const RATE_SCHEDULE_OBSERVE_ENV: &str = "HLTHPRT_PTG2_RATE_SCHEDULE_OBSERVE";
 const PROVIDER_GRAPH_V4_ENV: &str = "HLTHPRT_PTG2_PROVIDER_GRAPH_V4";
@@ -662,6 +664,7 @@ impl StringOrStrings {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PriceAtomLite {
     global_id: GlobalId128,
+    source_ordinal: u64,
     negotiated_type: Option<String>,
     negotiated_rate: String,
     expiration_date: Option<String>,
@@ -1621,14 +1624,124 @@ fn emit_copy_file_event<W: Write>(writer: &mut W, event: &CopyFileEvent) -> io::
     emit_json_record(writer, &event.record_kind, &Value::Object(payload))
 }
 
+struct CopyFileEventGate {
+    deferred: Option<Vec<CopyFileEvent>>,
+    baseline_paths: HashSet<PathBuf>,
+    cleanup_paths: HashSet<PathBuf>,
+}
+
+impl CopyFileEventGate {
+    fn passthrough() -> Self {
+        Self {
+            deferred: None,
+            baseline_paths: HashSet::new(),
+            cleanup_paths: HashSet::new(),
+        }
+    }
+
+    fn deferred_for_scan(
+        paths: &CopyPathConfig,
+        worker_count: usize,
+        provider_ref_worker_count: usize,
+    ) -> io::Result<Self> {
+        let configured_paths = configured_output_paths(paths)?;
+        let mut parent_directories = configured_paths
+            .iter()
+            .filter_map(|(_name, path)| path.parent().map(Path::to_path_buf))
+            .collect::<HashSet<_>>();
+        if let Some(directory) = paths.v3_serving_run_directory.as_deref() {
+            parent_directories.insert(normalized_absolute_lexical_path(directory)?);
+        }
+        let mut baseline_paths = HashSet::new();
+        for directory in parent_directories {
+            match std::fs::read_dir(directory) {
+                Ok(entries) => {
+                    for entry in entries.filter_map(Result::ok) {
+                        baseline_paths
+                            .insert(normalized_absolute_lexical_path_value(&entry.path())?);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let mut task_paths = configured_paths
+            .into_iter()
+            .map(|(_name, path)| path)
+            .collect::<Vec<_>>();
+        for worker_id in 0..worker_count.max(1) {
+            task_paths.extend(
+                worker_owned_output_paths(&paths.for_worker(worker_id))?
+                    .into_iter()
+                    .map(|(_name, path)| path),
+            );
+        }
+        let provider_paths = paths.for_provider_refs();
+        for worker_id in 0..provider_ref_worker_count.max(1) {
+            task_paths.extend(
+                worker_owned_output_paths(&provider_paths.for_worker(worker_id))?
+                    .into_iter()
+                    .map(|(_name, path)| path),
+            );
+        }
+        let cleanup_paths = task_paths
+            .into_iter()
+            .filter(|path| !baseline_paths.contains(path))
+            .collect();
+        Ok(Self {
+            deferred: Some(Vec::new()),
+            baseline_paths,
+            cleanup_paths,
+        })
+    }
+
+    fn publish<W: Write>(&mut self, writer: &mut W, event: CopyFileEvent) -> io::Result<bool> {
+        if let Some(events) = self.deferred.as_mut() {
+            let path = normalized_absolute_lexical_path(&event.path)?;
+            if !self.baseline_paths.contains(&path) {
+                self.cleanup_paths.insert(path);
+            }
+            events.push(event);
+            return Ok(false);
+        }
+        emit_copy_file_event(writer, &event)?;
+        Ok(true)
+    }
+
+    fn release<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        let Some(events) = self.deferred.as_mut() else {
+            return Ok(());
+        };
+        for event in std::mem::take(events) {
+            emit_copy_file_event(writer, &event)?;
+        }
+        writer.flush()?;
+        self.deferred = None;
+        self.cleanup_paths.clear();
+        Ok(())
+    }
+}
+
+impl Drop for CopyFileEventGate {
+    fn drop(&mut self) {
+        if self.deferred.is_none() {
+            return;
+        }
+        for path in self.cleanup_paths.drain() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn drain_copy_file_events<W: Write>(
     event_rx: &Receiver<CopyFileEvent>,
     writer: &mut W,
+    gate: &mut CopyFileEventGate,
 ) -> io::Result<()> {
     let mut emitted = false;
     for event in event_rx.try_iter() {
-        emit_copy_file_event(writer, &event)?;
-        emitted = true;
+        emitted |= gate.publish(writer, event)?;
     }
     if emitted {
         writer.flush()?;
@@ -1640,6 +1753,7 @@ fn drain_copy_file_events_until_workers_finish<W: Write, T>(
     event_rx: &Receiver<CopyFileEvent>,
     handles: &[(usize, thread::JoinHandle<T>)],
     writer: &mut W,
+    gate: &mut CopyFileEventGate,
 ) -> io::Result<()> {
     let mut emitted = false;
     while handles
@@ -1648,16 +1762,14 @@ fn drain_copy_file_events_until_workers_finish<W: Write, T>(
     {
         match event_rx.recv_timeout(Duration::from_millis(10)) {
             Ok(event) => {
-                emit_copy_file_event(writer, &event)?;
-                emitted = true;
+                emitted |= gate.publish(writer, event)?;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
     for event in event_rx.try_iter() {
-        emit_copy_file_event(writer, &event)?;
-        emitted = true;
+        emitted |= gate.publish(writer, event)?;
     }
     if emitted {
         writer.flush()?;
@@ -1666,52 +1778,66 @@ fn drain_copy_file_events_until_workers_finish<W: Write, T>(
 }
 
 fn send_worker_job<W: Write>(
-    tx: &Sender<WorkerJob>,
-    event_rx: &Receiver<CopyFileEvent>,
-    writer: &mut W,
-    cancelled: Option<&AtomicBool>,
-    producer_blocked_micros: &mut u128,
-    raw_chunk_stats: &mut RawChunkStats,
+    io_state: &mut InNetworkEnqueueIo<'_, W>,
     mut job: WorkerJob,
 ) -> io::Result<()> {
     let mut blocked_since: Option<Instant> = None;
     let queued_bytes = job.raw_byte_len();
     loop {
-        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        if io_state
+            .cancelled
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "parallel range production cancelled",
             ));
         }
-        let depth_before_send = tx.len();
-        raw_chunk_stats.queue_bytes.begin_send(queued_bytes);
-        match tx.try_send(job) {
+        let depth_before_send = io_state.tx.len();
+        io_state
+            .raw_chunk_stats
+            .queue_bytes
+            .begin_send(queued_bytes);
+        match io_state.tx.try_send(job) {
             Ok(()) => {
-                raw_chunk_stats.record_queue_depth(
+                io_state.raw_chunk_stats.record_queue_depth(
                     depth_before_send
                         .saturating_add(1)
-                        .min(tx.capacity().unwrap_or(usize::MAX)),
+                        .min(io_state.tx.capacity().unwrap_or(usize::MAX)),
                 );
                 if let Some(started_at) = blocked_since.take() {
-                    *producer_blocked_micros =
-                        producer_blocked_micros.saturating_add(started_at.elapsed().as_micros());
+                    *io_state.producer_blocked_micros = io_state
+                        .producer_blocked_micros
+                        .saturating_add(started_at.elapsed().as_micros());
                 }
                 return Ok(());
             }
             Err(TrySendError::Full(returned_job)) => {
-                raw_chunk_stats.queue_bytes.finish_receive(queued_bytes);
+                io_state
+                    .raw_chunk_stats
+                    .queue_bytes
+                    .finish_receive(queued_bytes);
                 if blocked_since.is_none() {
                     blocked_since = Some(Instant::now());
-                    raw_chunk_stats.record_queue_blocked();
+                    io_state.raw_chunk_stats.record_queue_blocked();
                 }
-                raw_chunk_stats.record_queue_depth(tx.capacity().unwrap_or(depth_before_send));
+                io_state
+                    .raw_chunk_stats
+                    .record_queue_depth(io_state.tx.capacity().unwrap_or(depth_before_send));
                 job = returned_job;
-                drain_copy_file_events(event_rx, writer)?;
+                drain_copy_file_events(
+                    io_state.event_rx,
+                    io_state.writer,
+                    io_state.copy_file_event_gate,
+                )?;
                 thread::yield_now();
             }
             Err(TrySendError::Disconnected(returned_job)) => {
-                raw_chunk_stats.queue_bytes.finish_receive(queued_bytes);
-                if let Some(flag) = cancelled {
+                io_state
+                    .raw_chunk_stats
+                    .queue_bytes
+                    .finish_receive(queued_bytes);
+                if let Some(flag) = io_state.cancelled {
                     flag.store(true, Ordering::Release);
                 }
                 return Err(io::Error::new(
@@ -1732,6 +1858,7 @@ fn send_provider_ref_batch<W: Write>(
     writer: &mut W,
     producer_blocked_micros: &mut u128,
     raw_chunk_stats: &mut RawChunkStats,
+    gate: &mut CopyFileEventGate,
     mut batch: RawRateChunk,
 ) -> io::Result<()> {
     let mut blocked_since: Option<Instant> = None;
@@ -1760,7 +1887,7 @@ fn send_provider_ref_batch<W: Write>(
                 }
                 raw_chunk_stats.record_queue_depth(tx.capacity().unwrap_or(depth_before_send));
                 batch = returned_batch;
-                drain_copy_file_events(event_rx, writer)?;
+                drain_copy_file_events(event_rx, writer, gate)?;
                 thread::yield_now();
             }
             Err(TrySendError::Disconnected(_returned_batch)) => {
@@ -2260,7 +2387,7 @@ fn provider_entry_view_from_ref_keys<'a>(
     Ok(provider_set_from_ref_keys(provider_map, refs)?.map(ProviderEntryView::Owned))
 }
 
-fn price_atom_from_lite(price: &PriceLite) -> PriceAtomLite {
+fn price_atom_from_lite(price: &PriceLite, source_ordinal: usize) -> PriceAtomLite {
     let global_id = GlobalId128::from_price_atom_parts(
         price.negotiated_type.as_deref(),
         Some(&price.negotiated_rate),
@@ -2273,6 +2400,7 @@ fn price_atom_from_lite(price: &PriceLite) -> PriceAtomLite {
     );
     PriceAtomLite {
         global_id,
+        source_ordinal: source_ordinal as u64,
         negotiated_type: price.negotiated_type.clone(),
         negotiated_rate: price.negotiated_rate.clone(),
         expiration_date: price.expiration_date.clone(),
@@ -2284,8 +2412,7 @@ fn price_atom_from_lite(price: &PriceLite) -> PriceAtomLite {
     }
 }
 
-fn price_atom_from_owned_lite(mut price: PriceLite) -> io::Result<PriceAtomLite> {
-    price.expiration_date = strict_optional_iso_calendar_date(price.expiration_date)?;
+fn price_atom_from_validated_owned_lite(price: PriceLite, source_ordinal: usize) -> PriceAtomLite {
     let global_id = GlobalId128::from_price_atom_parts(
         price.negotiated_type.as_deref(),
         Some(&price.negotiated_rate),
@@ -2296,8 +2423,9 @@ fn price_atom_from_owned_lite(mut price: PriceLite) -> io::Result<PriceAtomLite>
         &price.billing_code_modifier,
         price.additional_information.as_deref(),
     );
-    Ok(PriceAtomLite {
+    PriceAtomLite {
         global_id,
+        source_ordinal: source_ordinal as u64,
         negotiated_type: price.negotiated_type,
         negotiated_rate: price.negotiated_rate,
         expiration_date: price.expiration_date,
@@ -2306,7 +2434,7 @@ fn price_atom_from_owned_lite(mut price: PriceLite) -> io::Result<PriceAtomLite>
         setting: price.setting,
         billing_code_modifier: price.billing_code_modifier,
         additional_information: price.additional_information,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -2330,7 +2458,13 @@ fn price_set_from_atoms(atoms: Vec<PriceAtomLite>) -> Option<PriceSetLite> {
 
 #[cfg(test)]
 fn price_lite_set(prices: &[PriceLite]) -> Option<PriceSetLite> {
-    price_set_from_atoms(prices.iter().map(price_atom_from_lite).collect())
+    price_set_from_atoms(
+        prices
+            .iter()
+            .enumerate()
+            .map(|(ordinal, price)| price_atom_from_lite(price, ordinal))
+            .collect(),
+    )
 }
 
 enum RatePriceSet<'a> {
@@ -2365,8 +2499,14 @@ impl RatePriceSet<'_> {
 fn rate_price_set(rate: &RateLite) -> Option<RatePriceSet<'_>> {
     match rate.prepared_price_set.as_ref() {
         Some(price_set) => Some(RatePriceSet::Borrowed(price_set)),
-        None => price_set_from_atoms(rate.prices.iter().map(price_atom_from_lite).collect())
-            .map(RatePriceSet::Owned),
+        None => price_set_from_atoms(
+            rate.prices
+                .iter()
+                .enumerate()
+                .map(|(ordinal, price)| price_atom_from_lite(price, ordinal))
+                .collect(),
+        )
+        .map(RatePriceSet::Owned),
     }
 }
 
@@ -6469,6 +6609,7 @@ struct CompactContext {
     source_trace_set_hash: String,
     confidence_code: String,
     source_witness: Arc<SourceWitnessCollector>,
+    invalid_price_exclusion: Option<Arc<InvalidPriceExclusionPolicy>>,
 }
 
 #[derive(Default)]
@@ -6760,8 +6901,25 @@ fn capture_emitted_source_rate_occurrences(
     let rate_source_locator = context
         .source_witness
         .store_rate_source(coordinate, procedure, raw_rate)?;
+    let price_set = rate_price_set(rate).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source witness rate is missing its emitted price set",
+        )
+    })?;
     for candidate in candidates {
-        let price_ordinal = candidate.occurrence_index / provider_count;
+        let emitted_price_ordinal = candidate.occurrence_index / provider_count;
+        let price_ordinal = price_set
+            .as_ref()
+            .atoms
+            .get(emitted_price_ordinal as usize)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "source witness price ordinal is outside the emitted price set",
+                )
+            })?
+            .source_ordinal;
         let provider_ordinal = candidate.occurrence_index % provider_count;
         let selected_npi = emitted_provider_npis.nth(provider_ordinal, rate, provider_map)?;
         let (provider_evidence, linked_provider_locator, linked_provider_sha256) =
@@ -7983,6 +8141,8 @@ struct ProviderRefWorkerOutput {
 struct CompactWorkerOutput {
     events: Vec<CopyFileEvent>,
     metrics: CompactWorkerMetrics,
+    invalid_price_exclusions: Vec<InvalidPriceExclusionObservation>,
+    invalid_price_emptied_rates: u64,
 }
 
 type ProviderRefWorkerSender = Sender<RawRateChunk>;
@@ -9902,14 +10062,36 @@ fn process_compact_rate_lites_worker_inner<W: Write>(
     Ok(())
 }
 
+struct ParsedRateLite {
+    rate: RateLite,
+    exclusions: Vec<InvalidPriceExclusionObservation>,
+    emptied_rate: bool,
+}
+
 fn read_rate_lite_struson<R: Read>(
     json_reader: &mut JsonStreamReader<R>,
     allow_empty_npi_tin_only: bool,
 ) -> io::Result<Option<RateLite>> {
+    read_rate_lite_struson_with_exclusion(
+        json_reader,
+        allow_empty_npi_tin_only,
+        SourceWitnessCoordinate::new(0, 0),
+        None,
+    )
+    .map(|parsed| Some(parsed.rate))
+}
+
+fn read_rate_lite_struson_with_exclusion<R: Read>(
+    json_reader: &mut JsonStreamReader<R>,
+    allow_empty_npi_tin_only: bool,
+    coordinate: SourceWitnessCoordinate,
+    policy: Option<&InvalidPriceExclusionPolicy>,
+) -> io::Result<ParsedRateLite> {
     let mut provider_refs: Vec<ProviderRefKey> = Vec::new();
     let mut provider_groups: Vec<Value> = Vec::new();
     let mut network_names: Vec<String> = Vec::new();
     let mut price_atoms: Vec<PriceAtomLite> = Vec::new();
+    let mut exclusions = Vec::new();
     json_reader.begin_object().map_err(to_io_error)?;
     while json_reader.has_next().map_err(to_io_error)? {
         let field = match json_reader.next_name().map_err(to_io_error)? {
@@ -9952,9 +10134,19 @@ fn read_rate_lite_struson<R: Read>(
             }
             3 => {
                 json_reader.begin_array().map_err(to_io_error)?;
+                let mut price_ordinal = 0usize;
                 while json_reader.has_next().map_err(to_io_error)? {
                     if let Some(price) = read_price_lite_struson(json_reader)? {
-                        price_atoms.push(price_atom_from_owned_lite(price)?);
+                        match price_atom_from_owned_lite_with_exclusion(
+                            price,
+                            price_ordinal,
+                            coordinate,
+                            policy,
+                        )? {
+                            ParsedPriceAtom::Retained(atom) => price_atoms.push(atom),
+                            ParsedPriceAtom::Excluded(observation) => exclusions.push(observation),
+                        }
+                        price_ordinal = price_ordinal.saturating_add(1);
                     }
                 }
                 json_reader.end_array().map_err(to_io_error)?;
@@ -9977,26 +10169,25 @@ fn read_rate_lite_struson<R: Read>(
             "negotiated rate must contain at least one provider reference or inline provider group",
         ));
     }
-    if price_atoms.is_empty() {
+    if price_atoms.is_empty() && exclusions.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "negotiated rate must contain at least one negotiated price",
         ));
     }
-    let prepared_price_set = price_set_from_atoms(price_atoms).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "negotiated rate must contain at least one negotiated price",
-        )
-    })?;
-    Ok(Some(RateLite {
-        provider_refs,
-        provider_groups,
-        provider_groups_raw: None,
-        network_names: canonical_text_list(network_names, false),
-        prices: Vec::new(),
-        prepared_price_set: Some(prepared_price_set),
-    }))
+    let emptied_rate = price_atoms.is_empty();
+    Ok(ParsedRateLite {
+        rate: RateLite {
+            provider_refs,
+            provider_groups,
+            provider_groups_raw: None,
+            network_names: canonical_text_list(network_names, false),
+            prices: Vec::new(),
+            prepared_price_set: price_set_from_atoms(price_atoms),
+        },
+        exclusions,
+        emptied_rate,
+    })
 }
 
 fn transfer_next_value_to_bytes_append<R: Read>(
@@ -10026,6 +10217,199 @@ fn trim_optional_wire_text(value: Option<String>) -> Option<String> {
         Some(value)
     } else {
         Some(trimmed.to_owned())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct InvalidPriceExclusionObservation {
+    coordinate: SourceWitnessCoordinate,
+    price_ordinal: u64,
+    invalid_value_sha256: [u8; 32],
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvalidPriceExclusionEntryWire {
+    object_ordinal: u64,
+    rate_ordinal: u64,
+    price_ordinal: u64,
+    invalid_value_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvalidPriceExclusionExpectationWire {
+    contract: String,
+    reason: String,
+    raw_source_sha256: String,
+    excluded_price_count: u64,
+    emptied_rate_count: u64,
+    entries: Vec<InvalidPriceExclusionEntryWire>,
+    sha256: String,
+}
+
+#[derive(Clone)]
+struct InvalidPriceExclusionPolicy {
+    expected: Vec<InvalidPriceExclusionObservation>,
+    emptied_rate_count: u64,
+    sha256: String,
+}
+
+impl InvalidPriceExclusionPolicy {
+    fn from_env(raw_source_sha256: &str) -> io::Result<Option<Self>> {
+        let raw_policy = match env::var(INVALID_PRICE_EXCLUSION_ENV) {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => return Ok(None),
+            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+        };
+        if raw_policy.len() > INVALID_PRICE_EXCLUSION_MAX_JSON_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid price exclusion expectation exceeds transport limit",
+            ));
+        }
+        let wire: InvalidPriceExclusionExpectationWire =
+            serde_json::from_str(&raw_policy).map_err(to_io_error)?;
+        if wire.contract != "ptg2_invalid_price_exclusion_source_v1"
+            || wire.reason != "invalid_iso_calendar_date"
+            || wire.raw_source_sha256 != raw_source_sha256
+            || wire.entries.is_empty()
+            || wire.entries.len() > 1024
+            || wire.excluded_price_count != wire.entries.len() as u64
+            || wire.emptied_rate_count > wire.excluded_price_count
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid price exclusion expectation is incompatible",
+            ));
+        }
+        decode_v4_finalizer_pack_sha256(&wire.raw_source_sha256, "raw source SHA-256")?;
+        let mut expected = wire
+            .entries
+            .into_iter()
+            .map(|entry| {
+                Ok(InvalidPriceExclusionObservation {
+                    coordinate: SourceWitnessCoordinate::new(
+                        entry.object_ordinal,
+                        entry.rate_ordinal,
+                    ),
+                    price_ordinal: entry.price_ordinal,
+                    invalid_value_sha256: decode_v4_finalizer_pack_sha256(
+                        &entry.invalid_value_sha256,
+                        "invalid price value SHA-256",
+                    )?,
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let supplied_order = expected.clone();
+        expected.sort_unstable();
+        if expected != supplied_order
+            || expected.windows(2).any(|entries| entries[0] == entries[1])
+            || invalid_price_exclusion_source_sha256(&expected) != wire.sha256
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid price exclusion expectation digest or order does not match",
+            ));
+        }
+        Ok(Some(Self {
+            expected,
+            emptied_rate_count: wire.emptied_rate_count,
+            sha256: wire.sha256,
+        }))
+    }
+
+    fn authorize(
+        &self,
+        coordinate: SourceWitnessCoordinate,
+        price_ordinal: u64,
+        invalid_value: &str,
+    ) -> Option<InvalidPriceExclusionObservation> {
+        let observation = InvalidPriceExclusionObservation {
+            coordinate,
+            price_ordinal,
+            invalid_value_sha256: invalid_price_value_sha256(invalid_value),
+        };
+        self.expected
+            .binary_search(&observation)
+            .is_ok()
+            .then_some(observation)
+    }
+
+    fn validate_observed(
+        &self,
+        mut observed: Vec<InvalidPriceExclusionObservation>,
+        emptied_rate_count: u64,
+    ) -> io::Result<Value> {
+        observed.sort_unstable();
+        if observed != self.expected || emptied_rate_count != self.emptied_rate_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "observed invalid price exclusions do not match the exact expectation",
+            ));
+        }
+        Ok(json!({
+            "contract": "ptg2_invalid_price_exclusion_source_v1",
+            "reason": "invalid_iso_calendar_date",
+            "excluded_price_count": observed.len(),
+            "emptied_rate_count": emptied_rate_count,
+            "sha256": self.sha256,
+        }))
+    }
+}
+
+fn invalid_price_value_sha256(value: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"PTG2_INVALID_PRICE_EXCLUSION_VALUE_V1\0");
+    digest.update(value.as_bytes());
+    digest.finalize().into()
+}
+
+fn invalid_price_exclusion_source_sha256(
+    observations: &[InvalidPriceExclusionObservation],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"PTG2_INVALID_PRICE_EXCLUSION_SOURCE_V1\0");
+    for observation in observations {
+        digest.update(observation.coordinate.object_ordinal.to_be_bytes());
+        digest.update(observation.coordinate.rate_ordinal.to_be_bytes());
+        digest.update(observation.price_ordinal.to_be_bytes());
+        digest.update(observation.invalid_value_sha256);
+    }
+    sha256_hex(&digest.finalize())
+}
+
+enum ParsedPriceAtom {
+    Retained(PriceAtomLite),
+    Excluded(InvalidPriceExclusionObservation),
+}
+
+fn price_atom_from_owned_lite_with_exclusion(
+    mut price: PriceLite,
+    source_ordinal: usize,
+    coordinate: SourceWitnessCoordinate,
+    policy: Option<&InvalidPriceExclusionPolicy>,
+) -> io::Result<ParsedPriceAtom> {
+    let normalized_expiration = trim_optional_wire_text(price.expiration_date);
+    match strict_optional_iso_calendar_date(normalized_expiration.clone()) {
+        Ok(expiration_date) => {
+            price.expiration_date = expiration_date;
+            Ok(ParsedPriceAtom::Retained(
+                price_atom_from_validated_owned_lite(price, source_ordinal),
+            ))
+        }
+        Err(error) => {
+            let Some(observation) = policy.and_then(|policy| {
+                policy.authorize(
+                    coordinate,
+                    source_ordinal as u64,
+                    normalized_expiration.as_deref().unwrap_or_default(),
+                )
+            }) else {
+                return Err(error);
+            };
+            Ok(ParsedPriceAtom::Excluded(observation))
+        }
     }
 }
 
@@ -10077,12 +10461,28 @@ fn invalid_expiration_date() -> io::Error {
     )
 }
 
+#[cfg(test)]
 fn read_rate_lite_bytes_typed(
     raw: &[u8],
     allow_empty_npi_tin_only: bool,
 ) -> io::Result<Option<RateLite>> {
+    read_rate_lite_bytes_typed_with_exclusion(
+        raw,
+        allow_empty_npi_tin_only,
+        SourceWitnessCoordinate::new(0, 0),
+        None,
+    )
+    .map(|parsed| Some(parsed.rate))
+}
+
+fn read_rate_lite_bytes_typed_with_exclusion(
+    raw: &[u8],
+    allow_empty_npi_tin_only: bool,
+    coordinate: SourceWitnessCoordinate,
+    policy: Option<&InvalidPriceExclusionPolicy>,
+) -> io::Result<ParsedRateLite> {
     if allow_empty_npi_tin_only {
-        return read_rate_lite_bytes_typed_v4(raw);
+        return read_rate_lite_bytes_typed_v4_with_exclusion(raw, coordinate, policy);
     }
     let wire: RateLiteWire = serde_json::from_slice(raw).map_err(to_io_error)?;
     let mut provider_refs = Vec::with_capacity(wire.provider_references.len());
@@ -10112,8 +10512,9 @@ fn read_rate_lite_bytes_typed(
     wire.network_name.append_to(&mut network_names);
     wire.network_names.append_to(&mut network_names);
     let mut price_atoms = Vec::with_capacity(wire.negotiated_prices.len());
-    for price in wire.negotiated_prices {
-        price_atoms.push(price_atom_from_owned_lite(PriceLite {
+    let mut exclusions = Vec::new();
+    for (price_ordinal, price) in wire.negotiated_prices.into_iter().enumerate() {
+        let price = PriceLite {
             negotiated_type: trim_optional_wire_text(price.negotiated_type),
             negotiated_rate: strict_money_number(&Value::Number(price.negotiated_rate))?,
             expiration_date: trim_optional_wire_text(price.expiration_date),
@@ -10122,25 +10523,32 @@ fn read_rate_lite_bytes_typed(
             setting: trim_optional_wire_text(price.setting),
             billing_code_modifier: canonical_modifier_list(price.billing_code_modifier),
             additional_information: trim_optional_wire_text(price.additional_information),
-        })?);
+        };
+        match price_atom_from_owned_lite_with_exclusion(price, price_ordinal, coordinate, policy)? {
+            ParsedPriceAtom::Retained(atom) => price_atoms.push(atom),
+            ParsedPriceAtom::Excluded(observation) => exclusions.push(observation),
+        }
     }
-    let prepared_price_set = price_set_from_atoms(price_atoms).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "negotiated rate must contain at least one negotiated price",
-        )
-    })?;
-    Ok(Some(RateLite {
-        provider_refs,
-        provider_groups: wire.provider_groups,
-        provider_groups_raw: None,
-        network_names: canonical_text_list(network_names, false),
-        prices: Vec::new(),
-        prepared_price_set: Some(prepared_price_set),
-    }))
+    let emptied_rate = price_atoms.is_empty();
+    Ok(ParsedRateLite {
+        rate: RateLite {
+            provider_refs,
+            provider_groups: wire.provider_groups,
+            provider_groups_raw: None,
+            network_names: canonical_text_list(network_names, false),
+            prices: Vec::new(),
+            prepared_price_set: price_set_from_atoms(price_atoms),
+        },
+        exclusions,
+        emptied_rate,
+    })
 }
 
-fn read_rate_lite_bytes_typed_v4(raw: &[u8]) -> io::Result<Option<RateLite>> {
+fn read_rate_lite_bytes_typed_v4_with_exclusion(
+    raw: &[u8],
+    coordinate: SourceWitnessCoordinate,
+    policy: Option<&InvalidPriceExclusionPolicy>,
+) -> io::Result<ParsedRateLite> {
     let wire: V4RateLiteWire = serde_json::from_slice(raw).map_err(to_io_error)?;
     let has_inline_provider_groups = wire
         .provider_groups
@@ -10172,8 +10580,9 @@ fn read_rate_lite_bytes_typed_v4(raw: &[u8]) -> io::Result<Option<RateLite>> {
     wire.network_name.append_to(&mut network_names);
     wire.network_names.append_to(&mut network_names);
     let mut price_atoms = Vec::with_capacity(wire.negotiated_prices.len());
-    for price in wire.negotiated_prices {
-        price_atoms.push(price_atom_from_owned_lite(PriceLite {
+    let mut exclusions = Vec::new();
+    for (price_ordinal, price) in wire.negotiated_prices.into_iter().enumerate() {
+        let price = PriceLite {
             negotiated_type: trim_optional_wire_text(price.negotiated_type),
             negotiated_rate: strict_money_number(&Value::Number(price.negotiated_rate))?,
             expiration_date: trim_optional_wire_text(price.expiration_date),
@@ -10182,46 +10591,95 @@ fn read_rate_lite_bytes_typed_v4(raw: &[u8]) -> io::Result<Option<RateLite>> {
             setting: trim_optional_wire_text(price.setting),
             billing_code_modifier: canonical_modifier_list(price.billing_code_modifier),
             additional_information: trim_optional_wire_text(price.additional_information),
-        })?);
+        };
+        match price_atom_from_owned_lite_with_exclusion(price, price_ordinal, coordinate, policy)? {
+            ParsedPriceAtom::Retained(atom) => price_atoms.push(atom),
+            ParsedPriceAtom::Excluded(observation) => exclusions.push(observation),
+        }
     }
-    let prepared_price_set = price_set_from_atoms(price_atoms).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "negotiated rate must contain at least one negotiated price",
-        )
-    })?;
-    Ok(Some(RateLite {
-        provider_refs,
-        provider_groups: Vec::new(),
-        provider_groups_raw: wire.provider_groups,
-        network_names: canonical_text_list(network_names, false),
-        prices: Vec::new(),
-        prepared_price_set: Some(prepared_price_set),
-    }))
+    let emptied_rate = price_atoms.is_empty();
+    Ok(ParsedRateLite {
+        rate: RateLite {
+            provider_refs,
+            provider_groups: Vec::new(),
+            provider_groups_raw: wire.provider_groups,
+            network_names: canonical_text_list(network_names, false),
+            prices: Vec::new(),
+            prepared_price_set: price_set_from_atoms(price_atoms),
+        },
+        exclusions,
+        emptied_rate,
+    })
 }
 
+#[cfg(test)]
 fn read_rate_lite_bytes_streaming(
     raw: &[u8],
     allow_empty_npi_tin_only: bool,
 ) -> io::Result<Option<RateLite>> {
+    read_rate_lite_bytes_streaming_with_exclusion(
+        raw,
+        allow_empty_npi_tin_only,
+        SourceWitnessCoordinate::new(0, 0),
+        None,
+    )
+    .map(|parsed| Some(parsed.rate))
+}
+
+fn read_rate_lite_bytes_streaming_with_exclusion(
+    raw: &[u8],
+    allow_empty_npi_tin_only: bool,
+    coordinate: SourceWitnessCoordinate,
+    policy: Option<&InvalidPriceExclusionPolicy>,
+) -> io::Result<ParsedRateLite> {
     std::str::from_utf8(raw).map_err(to_io_error)?;
     let mut json_reader = JsonStreamReader::new(raw);
-    let rate = read_rate_lite_struson(&mut json_reader, allow_empty_npi_tin_only)?;
+    let rate = read_rate_lite_struson_with_exclusion(
+        &mut json_reader,
+        allow_empty_npi_tin_only,
+        coordinate,
+        policy,
+    )?;
     json_reader
         .consume_trailing_whitespace()
         .map_err(to_io_error)?;
     Ok(rate)
 }
 
+#[cfg(test)]
 fn read_rate_lite_bytes_profiled_with_policy(
     raw: &[u8],
     allow_empty_npi_tin_only: bool,
 ) -> io::Result<(Option<RateLite>, bool)> {
-    match read_rate_lite_bytes_typed(raw, allow_empty_npi_tin_only) {
+    read_rate_lite_bytes_profiled_with_exclusion(
+        raw,
+        allow_empty_npi_tin_only,
+        SourceWitnessCoordinate::new(0, 0),
+        None,
+    )
+    .map(|(parsed, typed)| (Some(parsed.rate), typed))
+}
+
+fn read_rate_lite_bytes_profiled_with_exclusion(
+    raw: &[u8],
+    allow_empty_npi_tin_only: bool,
+    coordinate: SourceWitnessCoordinate,
+    policy: Option<&InvalidPriceExclusionPolicy>,
+) -> io::Result<(ParsedRateLite, bool)> {
+    match read_rate_lite_bytes_typed_with_exclusion(
+        raw,
+        allow_empty_npi_tin_only,
+        coordinate,
+        policy,
+    ) {
         Ok(rate) => Ok((rate, true)),
-        Err(_) => {
-            read_rate_lite_bytes_streaming(raw, allow_empty_npi_tin_only).map(|rate| (rate, false))
-        }
+        Err(_) => read_rate_lite_bytes_streaming_with_exclusion(
+            raw,
+            allow_empty_npi_tin_only,
+            coordinate,
+            policy,
+        )
+        .map(|rate| (rate, false)),
     }
 }
 
@@ -10433,6 +10891,7 @@ struct InNetworkEnqueueIo<'a, W: Write> {
     tx: &'a Sender<WorkerJob>,
     event_rx: &'a Receiver<CopyFileEvent>,
     writer: &'a mut W,
+    copy_file_event_gate: &'a mut CopyFileEventGate,
     cancelled: Option<&'a AtomicBool>,
     producer_blocked_micros: &'a mut u128,
     raw_chunk_stats: &'a mut RawChunkStats,
@@ -10520,19 +10979,18 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
                         let raw_bytes = raw_rates.byte_len();
                         io_state.raw_chunk_stats.record(raw_rates.len(), raw_bytes);
                         send_worker_job(
-                            io_state.tx,
-                            io_state.event_rx,
-                            io_state.writer,
-                            io_state.cancelled,
-                            io_state.producer_blocked_micros,
-                            io_state.raw_chunk_stats,
+                            io_state,
                             WorkerJob::RawRates {
                                 procedure: procedure.clone(),
                                 raw_rates,
                             },
                         )?;
                         rates_dispatched = true;
-                        drain_copy_file_events(io_state.event_rx, io_state.writer)?;
+                        drain_copy_file_events(
+                            io_state.event_rx,
+                            io_state.writer,
+                            io_state.copy_file_event_gate,
+                        )?;
                         capture_batch_started_at = Some(Instant::now());
                     }
                 }
@@ -10553,18 +11011,17 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
             .raw_chunk_stats
             .record(raw_rate_chunk.len(), raw_rate_chunk.byte_len());
         send_worker_job(
-            io_state.tx,
-            io_state.event_rx,
-            io_state.writer,
-            io_state.cancelled,
-            io_state.producer_blocked_micros,
-            io_state.raw_chunk_stats,
+            io_state,
             WorkerJob::RawRates {
                 procedure,
                 raw_rates: raw_rate_chunk,
             },
         )?;
-        drain_copy_file_events(io_state.event_rx, io_state.writer)?;
+        drain_copy_file_events(
+            io_state.event_rx,
+            io_state.writer,
+            io_state.copy_file_event_gate,
+        )?;
     }
     io_state.raw_chunk_stats.framing_micros = io_state
         .raw_chunk_stats
@@ -10641,19 +11098,18 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
                             let raw_bytes = raw_rates.byte_len();
                             io_state.raw_chunk_stats.record(raw_rates.len(), raw_bytes);
                             send_worker_job(
-                                io_state.tx,
-                                io_state.event_rx,
-                                io_state.writer,
-                                io_state.cancelled,
-                                io_state.producer_blocked_micros,
-                                io_state.raw_chunk_stats,
+                                io_state,
                                 WorkerJob::RawRates {
                                     procedure: procedure.clone(),
                                     raw_rates,
                                 },
                             )?;
                             rates_dispatched = true;
-                            drain_copy_file_events(io_state.event_rx, io_state.writer)?;
+                            drain_copy_file_events(
+                                io_state.event_rx,
+                                io_state.writer,
+                                io_state.copy_file_event_gate,
+                            )?;
                             capture_batch_started_at = Some(Instant::now());
                         }
                     } else if let Some(rate) = read_rate_lite_struson(json_reader, false)? {
@@ -10663,19 +11119,18 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
                             let rates =
                                 take_vec_replacing_with_capacity(&mut rate_chunk, chunk_size);
                             send_worker_job(
-                                io_state.tx,
-                                io_state.event_rx,
-                                io_state.writer,
-                                io_state.cancelled,
-                                io_state.producer_blocked_micros,
-                                io_state.raw_chunk_stats,
+                                io_state,
                                 WorkerJob::Rates {
                                     procedure: procedure.clone(),
                                     rates,
                                 },
                             )?;
                             rates_dispatched = true;
-                            drain_copy_file_events(io_state.event_rx, io_state.writer)?;
+                            drain_copy_file_events(
+                                io_state.event_rx,
+                                io_state.writer,
+                                io_state.copy_file_event_gate,
+                            )?;
                         }
                     }
                 }
@@ -10697,33 +11152,31 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
             .raw_chunk_stats
             .record(raw_rate_chunk.len(), raw_rate_chunk.byte_len());
         send_worker_job(
-            io_state.tx,
-            io_state.event_rx,
-            io_state.writer,
-            io_state.cancelled,
-            io_state.producer_blocked_micros,
-            io_state.raw_chunk_stats,
+            io_state,
             WorkerJob::RawRates {
                 procedure,
                 raw_rates: raw_rate_chunk,
             },
         )?;
-        drain_copy_file_events(io_state.event_rx, io_state.writer)?;
+        drain_copy_file_events(
+            io_state.event_rx,
+            io_state.writer,
+            io_state.copy_file_event_gate,
+        )?;
     } else if !rate_chunk.is_empty() {
         validate_procedure_for_rate_dispatch(&procedure)?;
         send_worker_job(
-            io_state.tx,
-            io_state.event_rx,
-            io_state.writer,
-            io_state.cancelled,
-            io_state.producer_blocked_micros,
-            io_state.raw_chunk_stats,
+            io_state,
             WorkerJob::Rates {
                 procedure,
                 rates: rate_chunk,
             },
         )?;
-        drain_copy_file_events(io_state.event_rx, io_state.writer)?;
+        drain_copy_file_events(
+            io_state.event_rx,
+            io_state.writer,
+            io_state.copy_file_event_gate,
+        )?;
     }
     io_state.raw_chunk_stats.framing_micros = io_state
         .raw_chunk_stats
@@ -10829,6 +11282,8 @@ fn compact_worker_loop(
         worker_id,
         ..CompactWorkerMetrics::default()
     };
+    let mut invalid_price_exclusions = Vec::new();
+    let mut invalid_price_emptied_rates = 0u64;
     let semantic_progress = config
         .provider_graph_v4_factor_cache
         .semantic_progress_if_enabled();
@@ -10899,9 +11354,11 @@ fn compact_worker_loop(
                 let mut rates = Vec::with_capacity(raw_rates.len());
                 let mut source_inputs = Vec::with_capacity(raw_rates.len());
                 for (coordinate, raw_rate) in raw_rates.iter_with_coordinates() {
-                    let (rate, typed) = read_rate_lite_bytes_profiled_with_policy(
+                    let (parsed, typed) = read_rate_lite_bytes_profiled_with_exclusion(
                         raw_rate,
                         config.provider_graph_v4_factor_mode,
+                        coordinate,
+                        config.context.invalid_price_exclusion.as_deref(),
                     )?;
                     if let Some(semantic_progress) = semantic_progress.as_ref() {
                         semantic_progress.record_negotiated_rate_parsed();
@@ -10912,13 +11369,15 @@ fn compact_worker_loop(
                         metrics.streaming_rate_parse_fallbacks =
                             metrics.streaming_rate_parse_fallbacks.saturating_add(1);
                     }
-                    if let Some(rate) = rate {
-                        rates.push(rate);
-                        source_inputs.push(SourceRateWitnessInput {
-                            coordinate,
-                            raw_rate,
-                        });
+                    invalid_price_exclusions.extend(parsed.exclusions);
+                    if parsed.emptied_rate {
+                        invalid_price_emptied_rates = invalid_price_emptied_rates.saturating_add(1);
                     }
+                    rates.push(parsed.rate);
+                    source_inputs.push(SourceRateWitnessInput {
+                        coordinate,
+                        raw_rate,
+                    });
                 }
                 metrics.parse_micros = metrics
                     .parse_micros
@@ -11052,7 +11511,12 @@ fn compact_worker_loop(
         .sidecar_lock_wait_micros
         .saturating_add(take_sidecar_lock_wait_micros());
     metrics.elapsed_micros = started_at.elapsed().as_micros();
-    Ok(CompactWorkerOutput { events, metrics })
+    Ok(CompactWorkerOutput {
+        events,
+        metrics,
+        invalid_price_exclusions,
+        invalid_price_emptied_rates,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -11418,6 +11882,7 @@ fn produce_indexed_in_network_range(
         WrappedIndexedRangeReader::new(range_reader, config.range.length, b"[", b"]");
     let (_event_tx, event_rx) = unbounded::<CopyFileEvent>();
     let mut sink = io::sink();
+    let mut copy_file_event_gate = CopyFileEventGate::passthrough();
     let mut blocked_micros = 0u128;
     let mut raw_chunk_stats = RawChunkStats {
         queue_bytes: config.queue_bytes,
@@ -11437,6 +11902,7 @@ fn produce_indexed_in_network_range(
                 tx: &config.tx,
                 event_rx: &event_rx,
                 writer: &mut sink,
+                copy_file_event_gate: &mut copy_file_event_gate,
                 cancelled: Some(&config.cancelled),
                 producer_blocked_micros: &mut blocked_micros,
                 raw_chunk_stats: &mut raw_chunk_stats,
@@ -11467,6 +11933,7 @@ fn produce_indexed_in_network_range(
                 tx: &config.tx,
                 event_rx: &event_rx,
                 writer: &mut sink,
+                copy_file_event_gate: &mut copy_file_event_gate,
                 cancelled: Some(&config.cancelled),
                 producer_blocked_micros: &mut blocked_micros,
                 raw_chunk_stats: &mut raw_chunk_stats,
@@ -11764,6 +12231,11 @@ fn scan_compact_byte_top_level_parallel(
     };
     let (tx, rx) = bounded::<WorkerJob>(bounded_queue_size);
     let (event_tx, event_rx) = bounded::<CopyFileEvent>(event_queue_size);
+    let mut copy_file_event_gate = if context.invalid_price_exclusion.is_some() {
+        CopyFileEventGate::deferred_for_scan(&copy_paths, worker_count, provider_ref_worker_count)?
+    } else {
+        CopyFileEventGate::passthrough()
+    };
     let indexed_cancelled = Arc::new(AtomicBool::new(false));
     let indexed_producer_progress = Arc::new(IndexedProducerProgress::default());
     let stdout = io::stdout();
@@ -11794,6 +12266,8 @@ fn scan_compact_byte_top_level_parallel(
     let mut sidecar_merge_write_seconds = 0.0f64;
     let provider_worker_metrics: Vec<ProviderRefWorkerMetrics>;
     let mut compact_worker_metrics = Vec::new();
+    let mut invalid_price_exclusions = Vec::new();
+    let mut invalid_price_emptied_rates = 0u64;
     let mut indexed_range_metrics = Vec::new();
 
     emit_json_record(
@@ -11920,14 +12394,14 @@ fn scan_compact_byte_top_level_parallel(
                 {
                     Ok(joined_provider_refs) => {
                         for event in joined_provider_refs.events {
-                            emit_copy_file_event(&mut writer, &event)?;
+                            copy_file_event_gate.publish(&mut writer, event)?;
                         }
                     }
                     Err(cleanup_error) => {
                         eprintln!("PTG2_SCANNER_PROVIDER_CLEANUP_FAILED\terror={cleanup_error}");
                     }
                 }
-                drain_copy_file_events(&event_rx, &mut writer)?;
+                drain_copy_file_events(&event_rx, &mut writer, &mut copy_file_event_gate)?;
                 writer.flush()?;
                 return Err(error);
             }
@@ -12026,6 +12500,7 @@ fn scan_compact_byte_top_level_parallel(
                             &mut writer,
                             &mut provider_ref_producer_blocked_micros,
                             &mut provider_ref_raw_chunk_stats,
+                            &mut copy_file_event_gate,
                             batch,
                         )?;
                     }
@@ -12045,9 +12520,9 @@ fn scan_compact_byte_top_level_parallel(
                         + joined_provider_refs.worker_join_seconds
                         + joined_provider_refs.map_merge_seconds;
                     provider_worker_metrics = joined_provider_refs.worker_metrics;
-                    drain_copy_file_events(&event_rx, &mut writer)?;
+                    drain_copy_file_events(&event_rx, &mut writer, &mut copy_file_event_gate)?;
                     for event in joined_provider_refs.events {
-                        emit_copy_file_event(&mut writer, &event)?;
+                        copy_file_event_gate.publish(&mut writer, event)?;
                     }
                     writer.flush()?;
 
@@ -12211,7 +12686,11 @@ fn scan_compact_byte_top_level_parallel(
                                     break;
                                 }
                             }
-                            drain_copy_file_events(&event_rx, &mut writer)?;
+                            drain_copy_file_events(
+                                &event_rx,
+                                &mut writer,
+                                &mut copy_file_event_gate,
+                            )?;
                             let completed_objects = indexed_producer_progress
                                 .completed_objects
                                 .load(Ordering::Acquire)
@@ -12244,7 +12723,7 @@ fn scan_compact_byte_top_level_parallel(
                                 ));
                             }
                         }
-                        drain_copy_file_events(&event_rx, &mut writer)?;
+                        drain_copy_file_events(&event_rx, &mut writer, &mut copy_file_event_gate)?;
                         producer_failures.sort_by_key(|(range_id, error)| {
                             (error.kind() == io::ErrorKind::Interrupted, *range_id)
                         });
@@ -12327,6 +12806,7 @@ fn scan_compact_byte_top_level_parallel(
                                         tx: &tx,
                                         event_rx: &event_rx,
                                         writer: &mut writer,
+                                        copy_file_event_gate: &mut copy_file_event_gate,
                                         cancelled: Some(&indexed_cancelled),
                                         producer_blocked_micros: &mut producer_blocked_micros,
                                         raw_chunk_stats: &mut raw_chunk_stats,
@@ -12343,7 +12823,11 @@ fn scan_compact_byte_top_level_parallel(
                                                 .unwrap_or(&0),
                                         },
                                     )?;
-                                    drain_copy_file_events(&event_rx, &mut writer)?;
+                                    drain_copy_file_events(
+                                        &event_rx,
+                                        &mut writer,
+                                        &mut copy_file_event_gate,
+                                    )?;
                                     *object_counts.entry("in_network".to_string()).or_insert(0) +=
                                         1;
                                     if let Some(semantic_progress) = semantic_progress.as_ref() {
@@ -12401,6 +12885,7 @@ fn scan_compact_byte_top_level_parallel(
                                         tx: &tx,
                                         event_rx: &event_rx,
                                         writer: &mut writer,
+                                        copy_file_event_gate: &mut copy_file_event_gate,
                                         cancelled: Some(&indexed_cancelled),
                                         producer_blocked_micros: &mut producer_blocked_micros,
                                         raw_chunk_stats: &mut raw_chunk_stats,
@@ -12417,7 +12902,11 @@ fn scan_compact_byte_top_level_parallel(
                                                 .unwrap_or(&0),
                                         },
                                     )?;
-                                    drain_copy_file_events(&event_rx, &mut writer)?;
+                                    drain_copy_file_events(
+                                        &event_rx,
+                                        &mut writer,
+                                        &mut copy_file_event_gate,
+                                    )?;
                                     *object_counts.entry("in_network".to_string()).or_insert(0) +=
                                         1;
                                     if let Some(semantic_progress) = semantic_progress.as_ref() {
@@ -12486,13 +12975,28 @@ fn scan_compact_byte_top_level_parallel(
                     drop(tx);
                     drop(event_tx);
                     let worker_join_started_at = Instant::now();
-                    drain_copy_file_events_until_workers_finish(&event_rx, &handles, &mut writer)?;
+                    drain_copy_file_events_until_workers_finish(
+                        &event_rx,
+                        &handles,
+                        &mut writer,
+                        &mut copy_file_event_gate,
+                    )?;
                     let mut worker_error: Option<io::Error> = None;
                     let mut copy_file_events = Vec::new();
                     for (worker_id, handle) in handles {
                         match handle.join() {
                             Ok(Ok(mut output)) => {
                                 copy_file_events.append(&mut output.events);
+                                invalid_price_exclusions
+                                    .append(&mut output.invalid_price_exclusions);
+                                invalid_price_emptied_rates = invalid_price_emptied_rates
+                                    .checked_add(output.invalid_price_emptied_rates)
+                                    .ok_or_else(|| {
+                                        io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "invalid price emptied-rate count overflow",
+                                        )
+                                    })?;
                                 compact_worker_metrics.push(output.metrics);
                             }
                             Ok(Err(err)) => {
@@ -12523,14 +13027,33 @@ fn scan_compact_byte_top_level_parallel(
                                 .sum(),
                         );
                     }
-                    drain_copy_file_events(&event_rx, &mut writer)?;
+                    drain_copy_file_events(&event_rx, &mut writer, &mut copy_file_event_gate)?;
                     for event in copy_file_events {
-                        emit_copy_file_event(&mut writer, &event)?;
+                        copy_file_event_gate.publish(&mut writer, event)?;
                     }
                     writer.flush()?;
                     if let Some(err) = compact_pipeline_error(worker_error, producer_error) {
                         return Err(err);
                     }
+                    let invalid_price_exclusion_evidence =
+                        match context.invalid_price_exclusion.as_deref() {
+                            Some(policy) => policy.validate_observed(
+                                invalid_price_exclusions,
+                                invalid_price_emptied_rates,
+                            )?,
+                            None if invalid_price_exclusions.is_empty()
+                                && invalid_price_emptied_rates == 0 =>
+                            {
+                                Value::Null
+                            }
+                            None => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "invalid price exclusions require an exact expectation",
+                                ));
+                            }
+                        };
+                    copy_file_event_gate.release(&mut writer)?;
                     if plain_reorder_used {
                         let completed_objects =
                             object_counts.get("in_network").copied().unwrap_or(0);
@@ -12596,6 +13119,7 @@ fn scan_compact_byte_top_level_parallel(
                         "scanner_summary",
                         &scanner_summary_with_v4_empty_npi_audit(
                             json!({
+                                "invalid_price_exclusion": invalid_price_exclusion_evidence,
                                 "provider_identifier_quarantine": provider_identifier_quarantine_payload(
                                     &provider_map,
                                     dedupe.provider_identifier_quarantine()?,
@@ -12825,9 +13349,14 @@ fn scan_compact_byte_top_level_parallel(
                                     &mut writer,
                                     &mut provider_ref_producer_blocked_micros,
                                     &mut provider_ref_raw_chunk_stats,
+                                    &mut copy_file_event_gate,
                                     batch,
                                 )?;
-                                drain_copy_file_events(&event_rx, &mut writer)?;
+                                drain_copy_file_events(
+                                    &event_rx,
+                                    &mut writer,
+                                    &mut copy_file_event_gate,
+                                )?;
                                 provider_capture_started_at = Some(Instant::now());
                             }
                             if !indexed_reorder_used {
@@ -12878,6 +13407,12 @@ fn scan_compact_byte_top_level_parallel(
 
     drop(provider_tx);
     let _ = join_provider_ref_workers(&mut writer, provider_handles)?;
+    if context.invalid_price_exclusion.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "observed invalid price exclusions do not match the exact expectation",
+        ));
+    }
     writer.flush()?;
     drop(semantic_progress_reporter.take());
     emit_progress(
@@ -13567,15 +14102,22 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
             format!("strict V3 scan requires {V3_RAW_SOURCE_SHA256_ENV}"),
         )
     })?;
+    let invalid_price_exclusion =
+        InvalidPriceExclusionPolicy::from_env(&raw_source_sha256)?.map(Arc::new);
     let source_witness = Arc::new(SourceWitnessCollector::new(&raw_source_sha256)?);
-    let result = scan_compact_struson_inner(path, copy_paths, Arc::clone(&source_witness))
-        .and_then(|()| {
-            let summary = source_witness.write_bundle(Path::new(&source_witness_directory))?;
-            let stdout = io::stdout();
-            let mut writer = BufWriter::new(stdout.lock());
-            emit_json_record(&mut writer, "source_audit_witness_file", &summary)?;
-            writer.flush()
-        });
+    let result = scan_compact_struson_inner(
+        path,
+        copy_paths,
+        Arc::clone(&source_witness),
+        invalid_price_exclusion,
+    )
+    .and_then(|()| {
+        let summary = source_witness.write_bundle(Path::new(&source_witness_directory))?;
+        let stdout = io::stdout();
+        let mut writer = BufWriter::new(stdout.lock());
+        emit_json_record(&mut writer, "source_audit_witness_file", &summary)?;
+        writer.flush()
+    });
     if result.is_ok() {
         serving_run_guard.commit();
     }
@@ -13586,6 +14128,7 @@ fn scan_compact_struson_inner(
     path: &Path,
     copy_paths: CopyPathConfig,
     source_witness: Arc<SourceWitnessCollector>,
+    invalid_price_exclusion: Option<Arc<InvalidPriceExclusionPolicy>>,
 ) -> io::Result<()> {
     configured_v4_factor_mode(&copy_paths)?;
     let snapshot_id = env::var("HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID").unwrap_or_default();
@@ -13707,6 +14250,7 @@ fn scan_compact_struson_inner(
             source_trace_set_hash,
             confidence_code,
             source_witness: Arc::clone(&source_witness),
+            invalid_price_exclusion,
         },
         rust_worker_count,
         rust_queue_size,
@@ -27109,6 +27653,7 @@ mod tests {
             &input_path,
             CopyPathConfig::default(),
             Arc::new(SourceWitnessCollector::new(&"00".repeat(32)).unwrap()),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -27624,6 +28169,7 @@ mod tests {
             source_trace_set_hash: "trace-test".to_string(),
             confidence_code: "test".to_string(),
             source_witness: Arc::new(SourceWitnessCollector::new(&"00".repeat(32)).unwrap()),
+            invalid_price_exclusion: None,
         }
     }
 
@@ -27808,6 +28354,7 @@ mod tests {
             source_trace_set_hash: "trace-test".to_string(),
             confidence_code: "test".to_string(),
             source_witness: Arc::clone(&source_witness),
+            invalid_price_exclusion: None,
         };
         let paths = CopyPathConfig::default();
         let mut writer = io::sink();
@@ -30322,6 +30869,121 @@ mod tests {
     }
 
     #[test]
+    fn exact_invalid_price_exclusion_preserves_original_price_ordinals() {
+        let coordinate = SourceWitnessCoordinate::new(4, 2);
+        let observation = InvalidPriceExclusionObservation {
+            coordinate,
+            price_ordinal: 1,
+            invalid_value_sha256: invalid_price_value_sha256("2027-02-30"),
+        };
+        let expected = vec![observation];
+        let policy = InvalidPriceExclusionPolicy {
+            sha256: invalid_price_exclusion_source_sha256(&expected),
+            expected,
+            emptied_rate_count: 0,
+        };
+        let raw = br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":10,"expiration_date":"2028-02-29"},{"negotiated_rate":11,"expiration_date":"2027-02-30"},{"negotiated_rate":12,"expiration_date":"2029-03-01"}]}"#;
+
+        for allow_empty_npi_tin_only in [false, true] {
+            for parsed in [
+                read_rate_lite_bytes_typed_with_exclusion(
+                    raw,
+                    allow_empty_npi_tin_only,
+                    coordinate,
+                    Some(&policy),
+                )
+                .unwrap(),
+                read_rate_lite_bytes_streaming_with_exclusion(
+                    raw,
+                    allow_empty_npi_tin_only,
+                    coordinate,
+                    Some(&policy),
+                )
+                .unwrap(),
+            ] {
+                assert_eq!(parsed.exclusions, vec![observation]);
+                assert!(!parsed.emptied_rate);
+                assert_eq!(
+                    parsed
+                        .rate
+                        .prepared_price_set
+                        .unwrap()
+                        .atoms
+                        .iter()
+                        .map(|atom| atom.source_ordinal)
+                        .collect::<Vec<_>>(),
+                    vec![0, 2],
+                );
+            }
+        }
+        assert_eq!(
+            policy.validate_observed(vec![observation], 0).unwrap()["excluded_price_count"],
+            1,
+        );
+        assert!(read_rate_lite_bytes_profiled_with_exclusion(
+            raw,
+            false,
+            SourceWitnessCoordinate::new(4, 3),
+            Some(&policy),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn all_invalid_price_exclusion_is_exact_across_parser_paths() {
+        let coordinate = SourceWitnessCoordinate::new(4, 2);
+        let expected = vec![
+            InvalidPriceExclusionObservation {
+                coordinate,
+                price_ordinal: 0,
+                invalid_value_sha256: invalid_price_value_sha256("2027-02-30"),
+            },
+            InvalidPriceExclusionObservation {
+                coordinate,
+                price_ordinal: 1,
+                invalid_value_sha256: invalid_price_value_sha256("2027-02-31"),
+            },
+        ];
+        let policy = InvalidPriceExclusionPolicy {
+            sha256: invalid_price_exclusion_source_sha256(&expected),
+            expected: expected.clone(),
+            emptied_rate_count: 1,
+        };
+        let raw = br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_rate":10,"expiration_date":"2027-02-30"},{"negotiated_rate":11,"expiration_date":"2027-02-31"}]}"#;
+        let fallback_raw = br#"{"provider_references":[7],"network_name":"one","network_name":"two","negotiated_prices":[{"negotiated_rate":10,"expiration_date":"2027-02-30"},{"negotiated_rate":11,"expiration_date":"2027-02-31"}]}"#;
+
+        for parsed in [
+            read_rate_lite_bytes_typed_with_exclusion(raw, false, coordinate, Some(&policy))
+                .unwrap(),
+            read_rate_lite_bytes_typed_with_exclusion(raw, true, coordinate, Some(&policy))
+                .unwrap(),
+            read_rate_lite_bytes_streaming_with_exclusion(raw, false, coordinate, Some(&policy))
+                .unwrap(),
+            read_rate_lite_bytes_streaming_with_exclusion(raw, true, coordinate, Some(&policy))
+                .unwrap(),
+        ] {
+            assert_eq!(parsed.exclusions, expected);
+            assert!(parsed.emptied_rate);
+            assert!(parsed.rate.prepared_price_set.is_none());
+        }
+        let (fallback, typed) = read_rate_lite_bytes_profiled_with_exclusion(
+            fallback_raw,
+            false,
+            coordinate,
+            Some(&policy),
+        )
+        .unwrap();
+        assert!(!typed);
+        assert_eq!(fallback.exclusions, expected);
+        assert!(fallback.emptied_rate);
+        assert!(fallback.rate.prepared_price_set.is_none());
+        assert_eq!(
+            policy.validate_observed(expected, 1).unwrap()["emptied_rate_count"],
+            1,
+        );
+    }
+
+    #[test]
     fn v4_typed_rate_parser_retains_raw_inline_groups_without_deserializing_them() {
         let raw_provider_groups =
             br#"[ { "tin": { "type": "ein", "value": "123456789" }, "npi": [1234567890] } ]"#;
@@ -32411,6 +33073,7 @@ mod tests {
         let mut writer = Vec::new();
         let mut producer_blocked_micros = 0u128;
         let mut stats = RawChunkStats::default();
+        let mut copy_file_event_gate = CopyFileEventGate::passthrough();
         let recycle_tx = stats.enable_recycling(2);
 
         for object_ordinal in 0..2 {
@@ -32418,6 +33081,7 @@ mod tests {
                 tx: &tx,
                 event_rx: &event_rx,
                 writer: &mut writer,
+                copy_file_event_gate: &mut copy_file_event_gate,
                 cancelled: None,
                 producer_blocked_micros: &mut producer_blocked_micros,
                 raw_chunk_stats: &mut stats,
@@ -38661,11 +39325,13 @@ mod tests {
         let mut writer = Vec::new();
         let mut producer_blocked_micros = 0u128;
         let mut stats = RawChunkStats::default();
+        let mut copy_file_event_gate = CopyFileEventGate::passthrough();
 
         let mut enqueue_io = InNetworkEnqueueIo {
             tx: &tx,
             event_rx: &event_rx,
             writer: &mut writer,
+            copy_file_event_gate: &mut copy_file_event_gate,
             cancelled: None,
             producer_blocked_micros: &mut producer_blocked_micros,
             raw_chunk_stats: &mut stats,
@@ -39314,7 +39980,7 @@ mod tests {
                 additional_information: None,
             },
         ];
-        let first_atom = price_atom_from_lite(&prices[0]);
+        let first_atom = price_atom_from_lite(&prices[0], 0);
         assert_eq!(first_atom.global_id, price_atom_global_id(&first_atom));
         assert_eq!(
             price_code_set_hash(&first_atom.service_code),
@@ -40084,52 +40750,42 @@ mod tests {
         let mut writer = Vec::new();
         let mut blocked_micros = 0;
         let mut stats = RawChunkStats::default();
+        let mut copy_file_event_gate = CopyFileEventGate::passthrough();
 
         let (job_tx, job_rx) = bounded(1);
-        send_worker_job(
-            &job_tx,
-            &event_rx,
-            &mut writer,
-            None,
-            &mut blocked_micros,
-            &mut stats,
-            empty_job(),
-        )
-        .unwrap();
-        assert!(matches!(job_rx.recv().unwrap(), WorkerJob::Rates { .. }));
+        {
+            let mut send_test_job = |tx, cancelled, job| {
+                let mut io_state = InNetworkEnqueueIo {
+                    tx,
+                    event_rx: &event_rx,
+                    writer: &mut writer,
+                    copy_file_event_gate: &mut copy_file_event_gate,
+                    cancelled,
+                    producer_blocked_micros: &mut blocked_micros,
+                    raw_chunk_stats: &mut stats,
+                };
+                send_worker_job(&mut io_state, job)
+            };
+            send_test_job(&job_tx, None, empty_job()).unwrap();
+            assert!(matches!(job_rx.recv().unwrap(), WorkerJob::Rates { .. }));
 
-        let cancelled = AtomicBool::new(true);
-        assert_eq!(
-            send_worker_job(
-                &job_tx,
-                &event_rx,
-                &mut writer,
-                Some(&cancelled),
-                &mut blocked_micros,
-                &mut stats,
-                empty_job(),
-            )
-            .unwrap_err()
-            .kind(),
-            io::ErrorKind::Interrupted
-        );
+            let cancelled = AtomicBool::new(true);
+            assert_eq!(
+                send_test_job(&job_tx, Some(&cancelled), empty_job())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::Interrupted
+            );
 
-        let (stopped_job_tx, stopped_job_rx) = bounded(1);
-        drop(stopped_job_rx);
-        assert_eq!(
-            send_worker_job(
-                &stopped_job_tx,
-                &event_rx,
-                &mut writer,
-                None,
-                &mut blocked_micros,
-                &mut stats,
-                empty_job(),
-            )
-            .unwrap_err()
-            .kind(),
-            io::ErrorKind::BrokenPipe
-        );
+            let (stopped_job_tx, stopped_job_rx) = bounded(1);
+            drop(stopped_job_rx);
+            assert_eq!(
+                send_test_job(&stopped_job_tx, None, empty_job())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::BrokenPipe
+            );
+        }
 
         super::bounded_queue_pressure::assert_worker_job_queue_pressure(
             &mut blocked_micros,
@@ -40143,6 +40799,7 @@ mod tests {
             &mut writer,
             &mut blocked_micros,
             &mut stats,
+            &mut copy_file_event_gate,
             empty_batch(),
         )
         .unwrap();
@@ -40157,6 +40814,7 @@ mod tests {
                 &mut writer,
                 &mut blocked_micros,
                 &mut stats,
+                &mut copy_file_event_gate,
                 empty_batch(),
             )
             .unwrap_err()
@@ -40174,19 +40832,19 @@ mod tests {
         emit_copy_file_event(&mut sink, &event).unwrap();
         let (sink_event_tx, sink_event_rx) = unbounded();
         sink_event_tx.send(event).unwrap();
-        drain_copy_file_events(&sink_event_rx, &mut sink).unwrap();
+        drain_copy_file_events(&sink_event_rx, &mut sink, &mut copy_file_event_gate).unwrap();
 
         let (sink_job_tx, sink_job_rx) = bounded(1);
-        send_worker_job(
-            &sink_job_tx,
-            &sink_event_rx,
-            &mut sink,
-            None,
-            &mut blocked_micros,
-            &mut stats,
-            empty_job(),
-        )
-        .unwrap();
+        let mut sink_io_state = InNetworkEnqueueIo {
+            tx: &sink_job_tx,
+            event_rx: &sink_event_rx,
+            writer: &mut sink,
+            copy_file_event_gate: &mut copy_file_event_gate,
+            cancelled: None,
+            producer_blocked_micros: &mut blocked_micros,
+            raw_chunk_stats: &mut stats,
+        };
+        send_worker_job(&mut sink_io_state, empty_job()).unwrap();
         assert!(matches!(
             sink_job_rx.recv().unwrap(),
             WorkerJob::Rates { .. }

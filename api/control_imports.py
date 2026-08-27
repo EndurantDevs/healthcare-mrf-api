@@ -54,7 +54,6 @@ from process.uhc_provider_file_admission import (
 )
 from process.ptg_parts.frozen_rate_binding import (
     FROZEN_RATE_FILE_PROTECTED_FIELDS,
-    normalize_protected_frozen_rate_params,
     protected_frozen_tuple_presence,
 )
 from process.ptg_parts.frozen_rate_binding_store import (
@@ -65,6 +64,9 @@ from process.ptg_parts.frozen_rate_privacy import (
     frozen_private_scalar_values,
     has_frozen_private_evidence,
     redact_frozen_public_values,
+)
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    INVALID_PRICE_EXCLUSION_POLICY_FIELD,
 )
 from process.ptg_parts.ptg_source_attempt_actions import (
     record_source_attempt_event,
@@ -85,6 +87,7 @@ from process.ptg_singleton_direct_control import (
     DIRECT_RATE_FILE_INTENT_SHA256_FIELD,
     DIRECT_RATE_FILE_PROTECTED_FIELDS,
     DIRECT_RATE_FILE_PUBLIC_MARKER,
+    normalize_protected_rate_params,
     protected_singleton_direct_presence,
 )
 
@@ -1068,6 +1071,7 @@ def _params_for_import_run_response(
     )
     if importer != "ptg":
         return stored_params_by_name
+    stored_params_by_name.pop(INVALID_PRICE_EXCLUSION_POLICY_FIELD, None)
     if protected_singleton_direct_presence(stored_params_by_name):
         public_params_by_name = {
             name: param_value
@@ -2941,12 +2945,13 @@ async def create_import_run(
         )
         validate_uhc_official_file_admission(effective_params_by_name)
     normalized_params_by_name = (
-        normalize_protected_frozen_rate_params(effective_params_by_name)
+        normalize_protected_rate_params(effective_params_by_name)
         if importer == "ptg"
         else dict(effective_params_by_name)
     )
-    if importer == "ptg" and protected_frozen_tuple_presence(
-        normalized_params_by_name
+    if importer == "ptg" and (
+        protected_frozen_tuple_presence(normalized_params_by_name)
+        or protected_singleton_direct_presence(normalized_params_by_name)
     ):
         protected_id = normalized_params_by_name[
             "source_file_import_id"

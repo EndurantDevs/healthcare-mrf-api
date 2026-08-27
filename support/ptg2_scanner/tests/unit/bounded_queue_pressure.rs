@@ -53,13 +53,18 @@ pub(super) fn assert_worker_job_queue_pressure(
             .expect("pressured worker job was not delivered");
     });
     let blocked_sends_before = stats.queue_blocked_sends;
+    let mut copy_file_event_gate = CopyFileEventGate::passthrough();
+    let mut io_state = InNetworkEnqueueIo {
+        tx: &job_tx,
+        event_rx: &event_rx,
+        writer: &mut writer,
+        copy_file_event_gate: &mut copy_file_event_gate,
+        cancelled: None,
+        producer_blocked_micros: blocked_micros,
+        raw_chunk_stats: stats,
+    };
     send_worker_job(
-        &job_tx,
-        &event_rx,
-        &mut writer,
-        None,
-        blocked_micros,
-        stats,
+        &mut io_state,
         WorkerJob::Rates {
             procedure: Map::new(),
             rates: Vec::new(),
@@ -96,12 +101,14 @@ pub(super) fn assert_provider_reference_queue_pressure(
             .expect("pressured provider-reference batch was not delivered");
     });
     let blocked_sends_before = stats.queue_blocked_sends;
+    let mut copy_file_event_gate = CopyFileEventGate::passthrough();
     send_provider_ref_batch(
         &batch_tx,
         &event_rx,
         &mut writer,
         blocked_micros,
         stats,
+        &mut copy_file_event_gate,
         RawRateChunk::with_capacity(0, 0),
     )
     .unwrap();

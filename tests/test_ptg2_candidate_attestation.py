@@ -10,12 +10,22 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from process.ptg_parts import ptg2_candidate_attestation, source_pointers
+from process.ptg_parts.frozen_rate_binding import (
+    frozen_internal_run_id,
+    frozen_rate_binding_from_params,
+)
 from process.ptg_parts.ptg2_candidate_audit_contract import (
     PTG2_FAST_AUDIT_CONTRACT,
     PTG2_FAST_AUDIT_TOOL_VERSION,
 )
 from process.ptg_parts.ptg2_legacy_global_projection_queue import (
     PTG2LegacyGlobalProjectionDrain,
+)
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    invalid_price_exclusion_evidence,
+    invalid_price_exclusion_policy,
+    invalid_price_exclusion_source,
+    invalid_price_value_sha256,
 )
 from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_payload,
@@ -32,12 +42,77 @@ from tests.ptg2_attestation_compat_test_support import (
     writer_identity_by_field,
     writer_report_by_field,
 )
+from tests.ptg_frozen_test_support import (
+    frozen_candidate_evidence,
+    protected_control_payload,
+)
 
 
 EMPTY_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload({})
 MALFORMED_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload(
     {123456789: 1}
 )
+
+
+def _frozen_candidate_row(
+    params,
+    frozen_manifest,
+    frozen_source_records,
+    serving_index,
+    raw_source_hashes,
+    coverage_scope_id,
+    *,
+    database_binding,
+    database_policy=None,
+):
+    return {
+        "status": "validated",
+        "import_run_id": frozen_internal_run_id(str(params["source_file_import_id"])),
+        "manifest": {
+            **frozen_manifest,
+            "activation": {
+                "contract": "ptg2_candidate_activation_v1",
+                "state": "validated",
+                "source_key": "source_a",
+            },
+            "serving_index": serving_index,
+        },
+        "frozen_binding_payload": database_binding,
+        "invalid_price_exclusion_policy": database_policy,
+        "frozen_source_records": frozen_source_records,
+        "layout_manifest": {
+            "serving_index": {
+                **serving_index,
+                "source_count": len(raw_source_hashes),
+            }
+        },
+        "snapshot_key": 17,
+        "layout_state": "sealed",
+        "layout_generation": "shared_blocks_v3",
+        "plan_id": "12-3456789",
+        "plan_market_type": "group",
+        "coverage_scope_id": coverage_scope_id,
+        "raw_container_sha256_values": [bytes.fromhex(source_hash) for source_hash in raw_source_hashes],
+    }
+
+
+def _candidate_invalid_price_policy(raw_source_sha256):
+    return invalid_price_exclusion_policy(
+        [
+            invalid_price_exclusion_source(
+                raw_source_sha256=raw_source_sha256,
+                entries=[
+                    {
+                        "object_ordinal": 1,
+                        "rate_ordinal": 2,
+                        "price_ordinal": 3,
+                        "invalid_value_sha256": invalid_price_value_sha256("2027-02-30"),
+                    }
+                ],
+                emptied_rate_count=0,
+            )
+        ]
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -292,19 +367,37 @@ def test_release_report_accepts_explicit_authenticated_cluster_transport():
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (lambda report: report["target"].update(expected_snapshot_lifecycle="published"), "target"),
+        (
+            lambda report: report["target"].update(expected_snapshot_lifecycle="published"),
+            "target",
+        ),
         (lambda report: report["checks"].update(source_witnesses=10_999), "below"),
         (lambda report: report["failures"]["counts"].update(altered=1), "release gate"),
-        (lambda report: report["api_audit_sample"].update(source_set_validated=False), "coverage"),
-        (lambda report: report["random_api_requests"].update(executed=9_999), "coverage"),
+        (
+            lambda report: report["api_audit_sample"].update(source_set_validated=False),
+            "coverage",
+        ),
+        (
+            lambda report: report["random_api_requests"].update(executed=9_999),
+            "coverage",
+        ),
         (lambda report: report["checks"].update(source_witnesses="11000"), "invalid"),
-        (lambda report: report["api_audit_sample"].update(sample_digest="bad"), "sample_digest"),
+        (
+            lambda report: report["api_audit_sample"].update(sample_digest="bad"),
+            "sample_digest",
+        ),
         (lambda report: report["redaction"]["excluded"].pop(), "redaction"),
         (lambda report: report["target"].update(transport_contract=None), "transport"),
         (lambda report: report["target"].update(tls_verified=False), "transport"),
         (lambda report: report["latency"].update(request_p95_ms=250.001), "latency"),
-        (lambda report: report["latency"].update(request_p95_ceiling_ms=251.0), "latency"),
-        (lambda report: report["latency"].update(request_p95_within_ceiling=False), "latency"),
+        (
+            lambda report: report["latency"].update(request_p95_ceiling_ms=251.0),
+            "latency",
+        ),
+        (
+            lambda report: report["latency"].update(request_p95_within_ceiling=False),
+            "latency",
+        ),
         (lambda report: report.update(unexpected_sensitive_value="no"), "fields"),
     ],
 )
@@ -651,6 +744,138 @@ def test_candidate_identity_binds_complete_v4_packed_root():
     assert identity["snapshot_key"] == 17
 
 
+def test_candidate_identity_binds_exact_invalid_price_exclusion():
+    """Bind candidate evidence to the exact private exclusion policy."""
+
+    protected_payload = protected_control_payload(count=2)
+    params = protected_payload["params"]
+    assert isinstance(params, dict)
+    raw_source_hashes = [str(descriptor_by_field["raw_sha256"]) for descriptor_by_field in params["frozen_rate_files"]]
+    raw_source_sha256 = raw_source_hashes[0]
+    source_set = ptg2_candidate_attestation.shared_source_set_metadata(raw_source_hashes)
+    policy = _candidate_invalid_price_policy(raw_source_sha256)
+    evidence = invalid_price_exclusion_evidence(policy)
+    coverage_scope_id = b"c" * 32
+    common_index = {
+        "arch_version": "postgres_binary_v3",
+        "storage_generation": "shared_blocks_v3",
+        "coverage_scope_id": coverage_scope_id.hex(),
+        "audit_sample": {**_audit_sample("ab" * 32), "source_count": 2},
+        "source_witness": _source_witness(source_set),
+        "provider_identifier_quarantine": (EMPTY_PROVIDER_IDENTIFIER_QUARANTINE),
+        "invalid_price_exclusion": evidence,
+    }
+    params["invalid_price_exclusion_policy"] = policy
+    binding = frozen_rate_binding_from_params(params)
+    assert binding is not None
+    frozen_manifest, frozen_source_records = frozen_candidate_evidence(
+        params,
+        binding,
+    )
+    candidate_row_by_field = _frozen_candidate_row(
+        params,
+        {**frozen_manifest, "frozen_rate_file_binding": binding},
+        frozen_source_records,
+        {**common_index, "source_set": source_set},
+        raw_source_hashes,
+        coverage_scope_id,
+        database_binding=binding,
+        database_policy=policy,
+    )
+
+    assert ptg2_candidate_attestation._candidate_identity(candidate_row_by_field)["source_set_digest"] == bytes.fromhex(
+        source_set["raw_container_sha256_digest"]
+    )
+    candidate_row_by_field["invalid_price_exclusion_policy"] = None
+    with pytest.raises(ValueError, match="binding changed"):
+        ptg2_candidate_attestation._candidate_identity(candidate_row_by_field)
+    candidate_row_by_field["invalid_price_exclusion_policy"] = policy
+    candidate_row_by_field["layout_manifest"]["serving_index"]["invalid_price_exclusion"] = {
+        **evidence,
+        "sha256": "00" * 32,
+    }
+    with pytest.raises(ValueError, match="changed after layout sealing"):
+        ptg2_candidate_attestation._candidate_identity(candidate_row_by_field)
+
+
+def test_candidate_identity_accepts_singleton_run_policy():
+    raw_source_sha256 = "ab" * 32
+    policy = _candidate_invalid_price_policy(raw_source_sha256)
+    evidence = invalid_price_exclusion_evidence(policy)
+    source_set = ptg2_candidate_attestation.shared_source_set_metadata(
+        [raw_source_sha256]
+    )
+    coverage_scope_id = b"c" * 32
+    serving_index = {
+        "arch_version": "postgres_binary_v3",
+        "storage_generation": "shared_blocks_v3",
+        "coverage_scope_id": coverage_scope_id.hex(),
+        "source_set": source_set,
+        "audit_sample": _audit_sample("ab" * 32),
+        "source_witness": _source_witness(source_set),
+        "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
+        "invalid_price_exclusion": evidence,
+    }
+    candidate_row = _frozen_candidate_row(
+        {"source_file_import_id": "direct-source-import"},
+        {},
+        None,
+        serving_index,
+        [raw_source_sha256],
+        coverage_scope_id,
+        database_binding=None,
+        database_policy=policy,
+    )
+
+    identity = ptg2_candidate_attestation._candidate_identity(candidate_row)
+
+    assert identity["source_set_digest"] == bytes.fromhex(
+        source_set["raw_container_sha256_digest"]
+    )
+
+
+@pytest.mark.parametrize("manifest_binding", [None, "malformed"])
+def test_candidate_identity_rejects_frozen_markers_without_exact_binding(
+    manifest_binding,
+):
+    """Reject frozen markers without their exact private database binding."""
+
+    protected_payload = protected_control_payload(count=2)
+    params = protected_payload["params"]
+    assert isinstance(params, dict)
+    binding = frozen_rate_binding_from_params(params)
+    assert binding is not None
+    frozen_manifest, frozen_source_records = frozen_candidate_evidence(
+        params,
+        binding,
+    )
+    frozen_manifest["frozen_rate_file_binding"] = manifest_binding
+    raw_source_hashes = [str(descriptor_by_field["raw_sha256"]) for descriptor_by_field in params["frozen_rate_files"]]
+    source_set = ptg2_candidate_attestation.shared_source_set_metadata(raw_source_hashes)
+    coverage_scope_id = b"c" * 32
+    serving_index = {
+        "arch_version": "postgres_binary_v3",
+        "storage_generation": "shared_blocks_v3",
+        "coverage_scope_id": coverage_scope_id.hex(),
+        "source_set": source_set,
+        "audit_sample": _audit_sample("ab" * 32),
+        "source_witness": _source_witness(source_set),
+        "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
+    }
+    candidate_row_by_field = _frozen_candidate_row(
+        params,
+        frozen_manifest,
+        frozen_source_records,
+        serving_index,
+        raw_source_hashes,
+        coverage_scope_id,
+        database_binding=None,
+    )
+
+    with pytest.raises(RuntimeError, match="frozen source-file binding changed"):
+        ptg2_candidate_attestation._candidate_identity(candidate_row_by_field)
+
+
 def test_candidate_identity_rejects_snapshot_layout_sample_mismatch():
     raw_container_digest = b"x" * 32
     source_set = ptg2_candidate_attestation.shared_source_set_metadata(
@@ -810,6 +1035,9 @@ class _Result:
 
     def one_or_none(self):
         return self._row
+
+    def all(self):
+        return []
 
 
 def _attestation_row(
@@ -1533,7 +1761,9 @@ def _install_generic_candidate_publish_collaborators(monkeypatch):
     )
 
 
-def test_generic_publish_uses_locked_database_candidate_not_caller_attributes(monkeypatch):
+def test_generic_publish_uses_locked_database_candidate_not_caller_attributes(
+    monkeypatch,
+):
     """Verify generic publish uses locked database candidate not caller attributes."""
     (
         session,
@@ -1949,7 +2179,9 @@ def _assert_reviewed_activation(
     assert activation_result["idempotent"] is False
 
 
-def test_strict_candidate_activation_verifies_and_consumes_attestation_atomically(monkeypatch):
+def test_strict_candidate_activation_verifies_and_consumes_attestation_atomically(
+    monkeypatch,
+):
     """Verify strict candidate activation verifies and consumes attestation atomically."""
     events = []
     cas_calls = []
@@ -2533,11 +2765,38 @@ def test_locked_candidate_identity_loads_and_validates_database_row(monkeypatch)
     )
 
     assert identity == {"snapshot_key": 17}
-    candidate_identity.assert_called_once_with(database_row_by_field)
+    candidate_identity.assert_called_once_with({**database_row_by_field, "frozen_source_records": None})
     assert "FOR UPDATE OF snapshot" in session.calls[0][0]
+    assert 'LEFT JOIN "mrf".ptg2_import_run internal_run' in session.calls[0][0]
+    assert "FOR UPDATE OF snapshot, internal_run" not in session.calls[0][0]
     assert "ptg2_v4_snapshot_map_root v4_root" in session.calls[0][0]
     assert session.calls[0][1]["v3_generation"] == "shared_blocks_v3"
     assert session.calls[0][1]["v4_generation"] == "shared_blocks_v4"
+    assert len(session.calls) == 1
+
+
+def test_locked_candidate_identity_loads_private_sources_for_frozen_candidate(monkeypatch):
+    database_row_by_field = {
+        "status": "validated",
+        "snapshot_key": 17,
+        "frozen_binding_payload": {"contract": "frozen"},
+    }
+    session = _Session(_Result(database_row_by_field))
+    candidate_identity = Mock(return_value={"snapshot_key": 17})
+    monkeypatch.setattr(ptg2_candidate_attestation, "_candidate_identity", candidate_identity)
+
+    identity = asyncio.run(
+        ptg2_candidate_attestation._locked_candidate_identity(
+            session,
+            schema_name="mrf",
+            snapshot_id="snap-new",
+        )
+    )
+
+    assert identity == {"snapshot_key": 17}
+    candidate_identity.assert_called_once_with({**database_row_by_field, "frozen_source_records": []})
+    assert "ptg2_source_file_version AS version" in session.calls[1][0]
+    assert session.calls[1][1] == {"snapshot_id": "snap-new"}
 
 
 def test_locked_candidate_identity_rejects_missing_candidate():
@@ -2647,7 +2906,11 @@ def test_v4_attestation_writer_rejects_post_lock_identity_changes(
     identity = writer_identity_by_field()
     if mismatch == "target":
         identity["source_key"] = "different-source"
-    elif mismatch in {"audit_sample_digest", "source_set_digest", "source_witness_digest"}:
+    elif mismatch in {
+        "audit_sample_digest",
+        "source_set_digest",
+        "source_witness_digest",
+    }:
         evidence[mismatch] = b"x" * 32
     elif mismatch == "ordered_source_ordinal_digest":
         evidence[mismatch] = "x" * 64
@@ -2760,15 +3023,18 @@ def _verify_v4_attestation(monkeypatch, *, identity_by_field, query_result):
         "_locked_candidate_identity",
         AsyncMock(return_value=identity_by_field),
     )
-    return session, ptg2_candidate_attestation.verify_candidate_audit_attestation_in_transaction(
+    return (
         session,
-        schema_name="mrf",
-        snapshot_id="snap-new",
-        snapshot_key=17,
-        source_key="source-a",
-        plan_id="12-3456789",
-        plan_market_type="group",
-        coverage_scope_id=b"c" * 32,
+        ptg2_candidate_attestation.verify_candidate_audit_attestation_in_transaction(
+            session,
+            schema_name="mrf",
+            snapshot_id="snap-new",
+            snapshot_key=17,
+            source_key="source-a",
+            plan_id="12-3456789",
+            plan_market_type="group",
+            coverage_scope_id=b"c" * 32,
+        ),
     )
 
 

@@ -5,11 +5,8 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from api.control_import_wave_attestation import _canonical
-from process.ptg_parts.frozen_rate_binding import (
-    normalize_protected_frozen_rate_params,
-)
 from process.ptg_singleton_direct_control import (
-    normalize_protected_singleton_direct_params,
+    normalize_protected_rate_params,
     protected_singleton_direct_presence,
     require_exact_wave_singleton_direct_params,
 )
@@ -47,9 +44,7 @@ def normalized_wave_params(params_by_name: object) -> dict[str, Any]:
 
     if not isinstance(params_by_name, Mapping):
         raise ValueError("signed intent params must be an object")
-    return normalize_protected_singleton_direct_params(
-        normalize_protected_frozen_rate_params(params_by_name)
-    )
+    return normalize_protected_rate_params(params_by_name)
 
 
 def require_matching_direct_coordinate(

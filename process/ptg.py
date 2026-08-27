@@ -160,6 +160,8 @@ from process.ptg_parts.config import (
 from process.ptg_parts.config import _should_auto_activate_ptg2_candidates
 from process.ptg_parts.frozen_rate_binding import (
     FROZEN_RATE_FILE_BINDING_OPTION,
+    FROZEN_RATE_FILE_REQUIRED_FIELDS,
+    INVALID_PRICE_EXCLUSION_POLICY_FIELD,
     binding_option,
     frozen_internal_run_id,
     frozen_rate_binding_from_params,
@@ -298,9 +300,20 @@ from process.ptg_parts.ptg2_manifest_publish import (
     _ptg2_manifest_stage_table_name,
     _ptg2_manifest_support_stage_table,
 )
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    invalid_price_exclusion_evidence,
+    invalid_price_exclusion_source_evidence,
+    invalid_price_exclusion_source_expectation,
+    validate_invalid_price_exclusion_evidence,
+    validate_invalid_price_exclusion_policy,
+    validate_invalid_price_exclusion_source_evidence,
+)
 from process.ptg_parts.ptg2_provider_quarantine import (
     combine_provider_identifier_quarantines,
     validate_provider_identifier_quarantine,
+)
+from process.ptg_singleton_direct_control import (
+    validated_singleton_invalid_price_exclusion,
 )
 from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_COLD_LOOKUP_CONTRACT,
@@ -2500,6 +2513,7 @@ async def _parse_strict_v3_file(
     ptg2_manifest_stage_table: str | None = None,
     source_network_names: list[str] | str | None = None,
     progress_observer: Callable[[dict[str, Any]], None] | None = None,
+    invalid_price_exclusion: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Scan one file into strict V3 COPY artifacts and clean incomplete scratch state."""
 
@@ -2811,6 +2825,7 @@ async def _parse_strict_v3_file(
             source_network_names=source_network_name_values,
             manifest_only=True,
             progress_observer=progress_observer,
+            invalid_price_exclusion=invalid_price_exclusion,
         ):
             if record_kind == "dedupe_summary":
                 rust_dedupe_summary_by_field = dict(record_row or {})
@@ -3610,6 +3625,7 @@ class _InNetworkFileContext:
     logical_artifact: PTG2LogicalArtifact | None = None
     recorded_provenance: Mapping[str, Any] | None = None
     progress_observer: Callable[[dict[str, Any]], None] | None = None
+    invalid_price_exclusion: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -3688,6 +3704,7 @@ async def _parse_in_network_artifact(
         ptg2_manifest_stage_table=context.ptg2_manifest_stage_table,
         source_network_names=source_network_names,
         progress_observer=context.progress_observer,
+        invalid_price_exclusion=context.invalid_price_exclusion,
     )
     return _InNetworkParseResult(
         url=url,
@@ -5391,6 +5408,7 @@ _SHARED_V3_PHYSICAL_SERVING_INDEX_KEYS = frozenset(
         "source_witness",
         "snapshot_map",
         "finalizer_mapping",
+        "invalid_price_exclusion",
     }
 )
 
@@ -5624,6 +5642,7 @@ def _reused_shared_v3_serving_index(
     source_key: str,
     shared_snapshot_key: int,
     expected_generation: str = PTG2_V3_SHARED_GENERATION,
+    expected_invalid_price_exclusion_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Bind source-scoped metadata to one already sealed physical layout."""
 
@@ -5646,6 +5665,10 @@ def _reused_shared_v3_serving_index(
         _validate_reused_v4_contract(serving_index)
     _validated_reused_source_evidence(serving_index)
     _validate_reused_code_count(serving_index)
+    _bind_reused_invalid_price_exclusion(
+        serving_index,
+        expected_invalid_price_exclusion_sha256,
+    )
     serving_index.update(
         {
             "source_key": source_key,
@@ -5660,6 +5683,26 @@ def _reused_shared_v3_serving_index(
         }
     )
     return serving_index
+
+
+def _bind_reused_invalid_price_exclusion(
+    serving_index_by_name: dict[str, Any],
+    expected_sha256: str | None,
+) -> None:
+    """Retain exclusion evidence only for the exact physical input policy."""
+
+    raw_evidence = serving_index_by_name.get("invalid_price_exclusion")
+    if expected_sha256 is None:
+        if raw_evidence is not None:
+            raise RuntimeError("reusable strict V3 layout has unauthorized invalid-price evidence")
+        return
+    try:
+        evidence_by_name = validate_invalid_price_exclusion_evidence(raw_evidence)
+    except ValueError as exc:
+        raise RuntimeError("reusable strict V3 layout has invalid invalid-price evidence") from exc
+    if evidence_by_name["sha256"] != expected_sha256:
+        raise RuntimeError("reusable strict V3 layout invalid-price evidence changed")
+    serving_index_by_name["invalid_price_exclusion"] = evidence_by_name
 
 
 def _bind_v3_entry_identity(
@@ -5863,6 +5906,78 @@ def _sum_v4_tin_only_audits(
     if observed_source_count == 0:
         raise RuntimeError("PTG V4 publication has no empty-NPI normalization evidence")
     return normalization_total
+
+
+def _invalid_price_exclusion_publication_evidence(
+    policy: Mapping[str, Any] | None,
+    source_file_results: Iterable[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Verify every exact source observation before sealing public evidence."""
+
+    if policy is None:
+        return None
+    canonical_policy = validate_invalid_price_exclusion_policy(policy)
+    expected_by_source = {
+        source_by_field["raw_source_sha256"]: invalid_price_exclusion_source_evidence(
+            invalid_price_exclusion_source_expectation(
+                canonical_policy,
+                source_by_field["raw_source_sha256"],
+            )
+        )
+        for source_by_field in canonical_policy["sources"]
+    }
+    observed_sources: set[str] = set()
+    for source_file_result in source_file_results:
+        observation = _invalid_price_exclusion_observation(source_file_result)
+        if observation is None:
+            continue
+        raw_source_sha256, observed = observation
+        expected = expected_by_source.get(raw_source_sha256)
+        if expected is None:
+            if observed is not None:
+                raise RuntimeError("strict V3 publication has unauthorized invalid-price exclusion evidence")
+            continue
+        try:
+            observed = validate_invalid_price_exclusion_source_evidence(observed)
+        except ValueError as exc:
+            raise RuntimeError("strict V3 publication has invalid invalid-price exclusion evidence") from exc
+        if observed != expected:
+            raise RuntimeError("strict V3 publication invalid-price exclusion evidence changed")
+        observed_sources.add(raw_source_sha256)
+    if observed_sources != set(expected_by_source):
+        raise RuntimeError("strict V3 publication did not observe every invalid-price exclusion source")
+    return invalid_price_exclusion_evidence(canonical_policy)
+
+
+def _invalid_price_exclusion_observation(
+    source_file_result: Mapping[str, Any],
+) -> tuple[str, Any] | None:
+    """Return one scanner's raw-source binding and exclusion evidence."""
+
+    if source_file_result.get("skipped"):
+        return None
+    file_summary = source_file_result.get("summary")
+    if not isinstance(file_summary, Mapping):
+        return "", None
+    scanner_record = file_summary.get("scanner")
+    scanner_summary = scanner_record.get("summary") if isinstance(scanner_record, Mapping) else None
+    observed = scanner_summary.get("invalid_price_exclusion") if isinstance(scanner_summary, Mapping) else None
+    return str(file_summary.get("raw_sha256") or ""), observed
+
+
+def _source_invalid_price_exclusion_expectation(
+    options_by_name: Mapping[str, Any],
+    downloaded: PTG2DownloadedJob,
+) -> dict[str, Any] | None:
+    """Return the exact policy slice for one authenticated raw artifact."""
+
+    policy = options_by_name.get(INVALID_PRICE_EXCLUSION_POLICY_FIELD)
+    if policy is None:
+        return None
+    return invalid_price_exclusion_source_expectation(
+        policy,
+        downloaded.raw_artifact.raw_sha256,
+    )
 
 
 def _shared_v3_source_set_metadata(
@@ -6444,11 +6559,13 @@ async def _publish_reused_serving_metadata(
     publication: _ReusedSharedV3PublicationInputs,
     evidence: _ReusedSharedV3Evidence,
 ) -> dict[str, Any]:
+    physical_options_by_name = dict(publication.shared_input_identity.payload.get("physical_options") or {})
     serving_index = _reused_shared_v3_serving_index(
         publication.layout_manifest,
         source_key=publication.source_key,
         shared_snapshot_key=publication.shared_snapshot_key,
         expected_generation=publication.expected_generation,
+        expected_invalid_price_exclusion_sha256=physical_options_by_name.get(INVALID_PRICE_EXCLUSION_POLICY_FIELD),
     )
     serving_index["coverage_scope_id"] = bytes(publication.coverage_scope_id).hex()
     serving_index["source_trace_set_hash"] = build_source_trace_set(
@@ -7400,6 +7517,54 @@ async def _should_preserve_after_failed_import_cleanup(
     return should_preserve
 
 
+def _normalized_direct_frozen_params(
+    raw_params_by_name: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the protected direct-input envelope without inventing optionals."""
+
+    protected_values_by_name = {
+        field_name: raw_params_by_name.get(field_name) for field_name in FROZEN_RATE_FILE_REQUIRED_FIELDS
+    }
+    policy = raw_params_by_name.get(INVALID_PRICE_EXCLUSION_POLICY_FIELD)
+    direct_intent_digest = raw_params_by_name.get(
+        "direct_rate_file_intent_sha256"
+    )
+    has_protected_values = (
+        any(field_value is not None for field_value in protected_values_by_name.values()) or policy is not None
+    )
+    if raw_params_by_name.get("source_file_import_id") is None and not (has_protected_values):
+        return {}
+    direct_params_by_name = {
+        field_name: raw_params_by_name.get(field_name)
+        for field_name in (
+            "source_file_import_id",
+            "import_id",
+            "source_key",
+            "import_month",
+            "plan_ids",
+            "plan_market_types",
+        )
+    }
+    if has_protected_values:
+        direct_params_by_name.update(protected_values_by_name)
+    if policy is not None:
+        direct_params_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = policy
+    if direct_intent_digest is not None:
+        if any(
+            field_value is not None
+            for field_value in protected_values_by_name.values()
+        ):
+            raise ValueError(
+                "singleton direct and frozen multipart inputs are exclusive"
+            )
+        if policy is not None:
+            direct_params_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = (
+                validated_singleton_invalid_price_exclusion(policy)
+            )
+        return direct_params_by_name
+    return normalize_protected_frozen_rate_params(direct_params_by_name)
+
+
 async def _main_with_artifact_lease(
     test_mode: bool = False,
     toc_urls: list[str] | None = None,
@@ -7412,6 +7577,7 @@ async def _main_with_artifact_lease(
     frozen_rate_file_set_sha256: str | None = None,
     frozen_rate_file_count: int | None = None,
     direct_rate_file_intent_sha256: str | None = None,
+    invalid_price_exclusion_policy: Mapping[str, Any] | None = None,
     provider_ref_url: str | None = None,
     import_id: str | None = None,
     source_key: str | None = None,
@@ -7443,61 +7609,35 @@ async def _main_with_artifact_lease(
         "HLTHPRT_PTG2_PROVIDER_GRAPH_V4",
         False,
     )
-    shared_storage_generation = (
-        PTG2_V4_SHARED_GENERATION
-        if provider_graph_v4_enabled
-        else PTG2_V3_SHARED_GENERATION
-    )
-    direct_frozen_params_by_name = {
-        **(
-            {
-                "source_file_import_id": source_file_import_id,
-                "import_id": import_id,
-                "source_key": source_key_val,
-                "import_month": import_month_value,
-                "plan_ids": plan_ids or [],
-                "plan_market_types": plan_market_types or [],
-            }
-            if source_file_import_id is not None
-            or any(
-                protected_option_value is not None
-                for protected_option_value in (
-                    frozen_rate_file_set_contract,
-                    frozen_rate_files,
-                    frozen_rate_file_set_sha256,
-                    frozen_rate_file_count,
-                )
-            )
-            else {}
-        ),
-        **(
-            {
-                "frozen_rate_file_set_contract": (frozen_rate_file_set_contract),
-                "frozen_rate_files": frozen_rate_files,
-                "frozen_rate_file_set_sha256": (frozen_rate_file_set_sha256),
-                "frozen_rate_file_count": frozen_rate_file_count,
-            }
-            if any(
-                protected_option_value is not None
-                for protected_option_value in (
-                    frozen_rate_file_set_contract,
-                    frozen_rate_files,
-                    frozen_rate_file_set_sha256,
-                    frozen_rate_file_count,
-                )
-            )
-            else {}
-        ),
-    }
-    normalized_direct_frozen_params_by_name = (
-        normalize_protected_frozen_rate_params(direct_frozen_params_by_name)
-        if direct_frozen_params_by_name
-        else {}
+    shared_storage_generation = PTG2_V4_SHARED_GENERATION if provider_graph_v4_enabled else PTG2_V3_SHARED_GENERATION
+    normalized_direct_frozen_params_by_name = _normalized_direct_frozen_params(
+        {
+            "source_file_import_id": source_file_import_id,
+            "import_id": import_id,
+            "source_key": source_key_val,
+            "import_month": import_month_value,
+            "plan_ids": plan_ids or [],
+            "plan_market_types": plan_market_types or [],
+            "frozen_rate_file_set_contract": frozen_rate_file_set_contract,
+            "frozen_rate_files": frozen_rate_files,
+            "frozen_rate_file_set_sha256": frozen_rate_file_set_sha256,
+            "frozen_rate_file_count": frozen_rate_file_count,
+            "direct_rate_file_intent_sha256": (
+                direct_rate_file_intent_sha256
+            ),
+            INVALID_PRICE_EXCLUSION_POLICY_FIELD: invalid_price_exclusion_policy,
+        }
     )
     normalized_frozen_rate_files: list[dict[str, Any]] = []
     normalized_frozen_set_digest: str | None = None
-    frozen_binding_by_name = frozen_rate_binding_from_params(
-        normalized_direct_frozen_params_by_name
+    frozen_binding_by_name = (
+        frozen_rate_binding_from_params(
+            normalized_direct_frozen_params_by_name
+        )
+        if protected_frozen_tuple_presence(
+            normalized_direct_frozen_params_by_name
+        )
+        else None
     )
     if protected_frozen_tuple_presence(normalized_direct_frozen_params_by_name):
         normalized_frozen_rate_files = normalized_direct_frozen_params_by_name[
@@ -7601,8 +7741,9 @@ async def _main_with_artifact_lease(
         "frozen_rate_files": normalized_frozen_rate_files,
         "frozen_rate_file_set_sha256": normalized_frozen_set_digest,
         "frozen_rate_file_count": len(normalized_frozen_rate_files),
-        "direct_rate_file_intent_sha256": (
-            direct_rate_file_intent_sha256
+        "direct_rate_file_intent_sha256": (direct_rate_file_intent_sha256),
+        INVALID_PRICE_EXCLUSION_POLICY_FIELD: (
+            normalized_direct_frozen_params_by_name.get(INVALID_PRICE_EXCLUSION_POLICY_FIELD)
         ),
         "source_key": source_key_val,
         "plan_ids": plan_ids or [],
@@ -8382,6 +8523,12 @@ async def _main_with_artifact_lease(
                             source_network_names=job.get("source_network_names"),
                             raw_artifact=downloaded.raw_artifact,
                             logical_artifact=downloaded.logical_artifact,
+                            invalid_price_exclusion=(
+                                _source_invalid_price_exclusion_expectation(
+                                    options_by_name,
+                                    downloaded,
+                                )
+                            ),
                             progress_observer=(
                                 file_progress_coordinator.observer(
                                     _progress_job_index(job)
@@ -8436,7 +8583,7 @@ async def _main_with_artifact_lease(
                             error=downloaded.error,
                         )
                     )
-                elif (
+                if not downloaded.error and (
                     downloaded.raw_artifact is None
                     or downloaded.logical_artifact is None
                 ):
@@ -8641,7 +8788,7 @@ async def _main_with_artifact_lease(
                         False,
                         error=downloaded.error,
                     )
-                elif (
+                if file_result is None and (
                     downloaded.raw_artifact is None
                     or downloaded.logical_artifact is None
                 ):
@@ -8651,7 +8798,7 @@ async def _main_with_artifact_lease(
                         False,
                         error="download did not produce an artifact",
                     )
-                elif any(
+                if file_result is None and any(
                     is_same_downloaded_physical_input(previous, downloaded)
                     for previous in downloads_by_logical_hash.get(
                         downloaded.logical_artifact.logical_sha256,
@@ -8691,7 +8838,10 @@ async def _main_with_artifact_lease(
                         shared_physical_artifact_identity(downloaded),
                         shared_logical_artifact_metadata(downloaded),
                     )
-                elif downloaded.logical_artifact.logical_sha256:
+                if (
+                    file_result is None
+                    and downloaded.logical_artifact.logical_sha256
+                ):
                     downloads_by_logical_hash.setdefault(
                         downloaded.logical_artifact.logical_sha256,
                         [],
@@ -8795,6 +8945,10 @@ async def _main_with_artifact_lease(
             _sum_v4_tin_only_audits(successful_files)
             if provider_graph_v4_enabled
             else None
+        )
+        invalid_price_exclusion_publication_evidence = _invalid_price_exclusion_publication_evidence(
+            options_by_name.get(INVALID_PRICE_EXCLUSION_POLICY_FIELD),
+            successful_files,
         )
         source_assignments = await _publish_shared_v3_source_dictionary(
             shared_input_identity=shared_input_identity,
@@ -8964,6 +9118,7 @@ async def _main_with_artifact_lease(
                     ),
                     tax_identity_source_artifacts=tax_identity_source_artifacts,
                     provider_identifier_quarantine=provider_identifier_quarantine,
+                    invalid_price_exclusion=(invalid_price_exclusion_publication_evidence),
                     compressed_acquisition_entries=(
                         tuple(
                             {
@@ -9453,6 +9608,7 @@ async def run_ptg_command(
     frozen_rate_file_set_sha256: str | None = None,
     frozen_rate_file_count: int | None = None,
     direct_rate_file_intent_sha256: str | None = None,
+    invalid_price_exclusion_policy: Mapping[str, Any] | None = None,
     provider_ref_url: str | None = None,
     import_id: str | None = None,
     source_key: str | None = None,

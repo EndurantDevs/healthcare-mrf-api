@@ -27,6 +27,7 @@ _FROZEN_MARKER_KEYS = _FROZEN_INPUT_MARKER_KEYS | frozenset(
         DIRECT_RATE_FILE_INTENT_FIELD,
         DIRECT_RATE_FILE_INTENT_SHA256_FIELD,
         DIRECT_RATE_FILE_PUBLIC_MARKER,
+        "invalid_price_exclusion_policy",
         "allowed_url",
         "in_network_url",
     }
@@ -55,6 +56,7 @@ _PRIVATE_EVIDENCE_KEYS = frozenset(
         "frozen_rate_file_set_sha256",
         "frozen_rate_file_proof",
         "frozen_rate_file_proof_sha256",
+        "invalid_price_exclusion_policy",
         "source_file_versions",
         "successful_files",
         "skipped_files",

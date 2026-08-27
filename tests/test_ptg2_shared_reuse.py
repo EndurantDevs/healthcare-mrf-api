@@ -67,7 +67,12 @@ def _downloaded(
     )
 
 
-def _identity(downloaded_jobs, *, full_rebuild_scope_digest=None):
+def _identity(
+    downloaded_jobs,
+    *,
+    full_rebuild_scope_digest=None,
+    invalid_price_exclusion=None,
+):
     return shared_physical_input_identity(
         downloaded_jobs,
         options={
@@ -79,6 +84,11 @@ def _identity(downloaded_jobs, *, full_rebuild_scope_digest=None):
             **(
                 {"full_rebuild_scope_digest": full_rebuild_scope_digest}
                 if full_rebuild_scope_digest is not None
+                else {}
+            ),
+            **(
+                {"invalid_price_exclusion_policy": invalid_price_exclusion}
+                if invalid_price_exclusion is not None
                 else {}
             ),
         },
@@ -331,7 +341,10 @@ def test_dense_source_keys_are_sorted_by_complete_physical_identity():
 
     assert forward == reverse
     assert [source_key for source_key, _identity_value in forward] == [0, 1]
-    assert [identity.identity_sha256 for _key, identity in forward] == ["1" * 64, "f" * 64]
+    assert [identity.identity_sha256 for _key, identity in forward] == [
+        "1" * 64,
+        "f" * 64,
+    ]
 
 
 def test_unknown_physical_identity_kind_fails_closed():

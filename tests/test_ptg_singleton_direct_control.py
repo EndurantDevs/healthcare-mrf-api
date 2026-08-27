@@ -19,6 +19,11 @@ from api.control_import_waves import (
 )
 from api.control_imports import normalize_run
 from process.ptg_parts.frozen_rate_files import FROZEN_RATE_FILE_SET_CONTRACT
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    invalid_price_exclusion_policy,
+    invalid_price_exclusion_source,
+    invalid_price_value_sha256,
+)
 from process.ptg_singleton_direct_control import (
     DIRECT_RATE_FILE_INTENT_FIELD,
     DIRECT_RATE_FILE_INTENT_SHA256_FIELD,
@@ -32,6 +37,27 @@ from tests.ptg_singleton_direct_test_support import _direct_params
 
 
 _KEY = "test-singleton-direct-key"
+
+
+def _invalid_price_policy(raw_source_sha256: str = "a" * 64) -> dict:
+    return invalid_price_exclusion_policy(
+        [
+            invalid_price_exclusion_source(
+                raw_source_sha256=raw_source_sha256,
+                entries=[
+                    {
+                        "object_ordinal": 1,
+                        "rate_ordinal": 2,
+                        "price_ordinal": 3,
+                        "invalid_value_sha256": invalid_price_value_sha256(
+                            "2027-02-30"
+                        ),
+                    }
+                ],
+                emptied_rate_count=0,
+            )
+        ]
+    )
 
 
 def _payload(count: int = 1, *, source_type: str = "in_network") -> dict:
@@ -176,6 +202,46 @@ def test_ordinary_scalar_direct_import_remains_outside_protected_contract():
     assert public_params == {"max_files": 1}
     assert DIRECT_RATE_FILE_PUBLIC_MARKER not in public_params
     assert DIRECT_RATE_FILE_INTENT_SHA256_FIELD not in public_params
+
+
+def test_singleton_direct_contract_binds_one_private_exclusion_policy():
+    params = _direct_params()
+    policy = _invalid_price_policy()
+    params["invalid_price_exclusion_policy"] = policy
+
+    normalized = normalize_protected_singleton_direct_params(params)
+
+    assert normalized["invalid_price_exclusion_policy"] == policy
+    assert singleton_direct_main_kwargs(normalized) == {
+        DIRECT_RATE_FILE_INTENT_SHA256_FIELD: params[
+            DIRECT_RATE_FILE_INTENT_SHA256_FIELD
+        ],
+        "invalid_price_exclusion_policy": policy,
+    }
+
+    changed = copy.deepcopy(_payload())
+    changed["cohort_attestation"]["intents"][0]["params"][
+        "invalid_price_exclusion_policy"
+    ] = policy
+    _resign_payload(changed)
+    validated = validate_import_wave_payload(changed, attestation_key=_KEY)
+    assert validated["intents"][0]["params"][
+        "invalid_price_exclusion_policy"
+    ] == policy
+
+    params["invalid_price_exclusion_policy"] = invalid_price_exclusion_policy(
+        [
+            policy["sources"][0],
+            _invalid_price_policy("b" * 64)["sources"][0],
+        ]
+    )
+    with pytest.raises(SingletonDirectValidationError, match="one source"):
+        normalize_protected_singleton_direct_params(params)
+
+    allowed_params = _direct_params(source_type="allowed_amounts")
+    allowed_params["invalid_price_exclusion_policy"] = policy
+    with pytest.raises(SingletonDirectValidationError, match="in-network"):
+        normalize_protected_singleton_direct_params(allowed_params)
 
 
 @pytest.mark.parametrize(

@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from process.ptg_parts.frozen_rate_binding import (
+    INVALID_PRICE_EXCLUSION_POLICY_FIELD,
     normalize_protected_frozen_rate_params,
     protected_frozen_tuple_presence,
 )
@@ -102,13 +103,9 @@ def frozen_rate_main_kwargs(
 
     if not protected_frozen_tuple_presence(params_by_name):
         return {}
-    return {
-        "source_file_import_id": params_by_name.get(
-            "source_file_import_id"
-        ),
-        "frozen_rate_file_set_contract": params_by_name.get(
-            "frozen_rate_file_set_contract"
-        ),
+    main_kwargs_by_name = {
+        "source_file_import_id": params_by_name.get("source_file_import_id"),
+        "frozen_rate_file_set_contract": params_by_name.get("frozen_rate_file_set_contract"),
         "frozen_rate_files": params_by_name.get("frozen_rate_files"),
         "frozen_rate_file_set_sha256": params_by_name.get(
             "frozen_rate_file_set_sha256"
@@ -117,6 +114,9 @@ def frozen_rate_main_kwargs(
             "frozen_rate_file_count"
         ),
     }
+    if INVALID_PRICE_EXCLUSION_POLICY_FIELD in params_by_name:
+        main_kwargs_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = params_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD]
+    return main_kwargs_by_name
 
 
 def _normalized_string_list(raw_entries: Any) -> list[str] | None:

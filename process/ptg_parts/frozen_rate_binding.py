@@ -15,17 +15,25 @@ from process.ptg_parts.frozen_rate_files import (
     FrozenRateFileValidationError,
     normalize_frozen_rate_file_set,
 )
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    INVALID_PRICE_EXCLUSION_POLICY_FIELD,
+    validate_invalid_price_exclusion_policy,
+)
 from process.ptg_parts.snapshot_tables import _normalize_source_key
 
 
 FROZEN_RATE_FILE_BINDING_CONTRACT = "ptg_frozen_source_file_binding_v1"
 FROZEN_RATE_FILE_BINDING_OPTION = "frozen_rate_file_binding"
 FROZEN_RATE_FILE_BINDING_TABLE = "ptg2_frozen_source_file_binding"
-FROZEN_RATE_FILE_PROTECTED_FIELDS = (
+FROZEN_RATE_FILE_REQUIRED_FIELDS = (
     "frozen_rate_file_set_contract",
     "frozen_rate_files",
     "frozen_rate_file_set_sha256",
     "frozen_rate_file_count",
+)
+FROZEN_RATE_FILE_PROTECTED_FIELDS = (
+    *FROZEN_RATE_FILE_REQUIRED_FIELDS,
+    INVALID_PRICE_EXCLUSION_POLICY_FIELD,
 )
 
 
@@ -146,11 +154,60 @@ def protected_frozen_tuple_presence(
 ) -> tuple[str, ...]:
     """Return supplied protected marker fields in canonical declaration order."""
 
-    return tuple(
-        field_name
-        for field_name in FROZEN_RATE_FILE_PROTECTED_FIELDS
-        if field_name in params_by_name
+    return tuple(field_name for field_name in FROZEN_RATE_FILE_REQUIRED_FIELDS if field_name in params_by_name)
+
+
+def protected_frozen_field_presence(
+    params_by_name: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return every supplied private frozen field, including optional policy."""
+
+    return tuple(field_name for field_name in FROZEN_RATE_FILE_PROTECTED_FIELDS if field_name in params_by_name)
+
+
+def _validated_invalid_price_exclusion_policy(
+    raw_policy: Any,
+    normalized_files: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bind one exclusion policy to the frozen source-file set."""
+
+    try:
+        policy_by_name = validate_invalid_price_exclusion_policy(raw_policy)
+    except ValueError as exc:
+        raise FrozenRateFileValidationError("invalid price exclusion policy is invalid") from exc
+    frozen_source_hashes = {descriptor["raw_sha256"] for descriptor in normalized_files}
+    policy_source_hashes = {source_by_field["raw_source_sha256"] for source_by_field in policy_by_name["sources"]}
+    if not policy_source_hashes <= frozen_source_hashes:
+        raise FrozenRateFileValidationError("invalid price exclusion policy contains an unbound source")
+    return policy_by_name
+
+
+def _normalized_frozen_file_set(
+    params_by_name: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], str, int]:
+    """Validate the required frozen marker tuple and its source descriptors."""
+
+    supplied_fields = protected_frozen_tuple_presence(params_by_name)
+    if len(supplied_fields) != len(FROZEN_RATE_FILE_REQUIRED_FIELDS):
+        raise FrozenRateFileValidationError(
+            "frozen_rate_file_set_contract, frozen_rate_files, "
+            "frozen_rate_file_set_sha256, and frozen_rate_file_count are all "
+            "required together"
+        )
+    if params_by_name["frozen_rate_file_set_contract"] != FROZEN_RATE_FILE_SET_CONTRACT:
+        raise FrozenRateFileValidationError("frozen_rate_file_set_contract is invalid")
+    file_count = params_by_name["frozen_rate_file_count"]
+    if isinstance(file_count, bool) or not isinstance(file_count, int):
+        raise FrozenRateFileValidationError(
+            "frozen_rate_file_count must be an integer"
+        )
+    normalized_files, set_digest = normalize_frozen_rate_file_set(
+        params_by_name["frozen_rate_files"],
+        params_by_name["frozen_rate_file_set_sha256"],
     )
+    if file_count != len(normalized_files):
+        raise FrozenRateFileValidationError("frozen_rate_file_count does not match frozen_rate_files")
+    return normalized_files, set_digest, file_count
 
 
 def normalize_protected_frozen_rate_params(
@@ -159,40 +216,18 @@ def normalize_protected_frozen_rate_params(
     """Validate the all-or-none marker tuple and return canonical parameters."""
 
     normalized_params_by_name = dict(params_by_name)
-    supplied_fields = protected_frozen_tuple_presence(
-        normalized_params_by_name
-    )
+    supplied_fields = protected_frozen_tuple_presence(normalized_params_by_name)
     if not supplied_fields:
+        if INVALID_PRICE_EXCLUSION_POLICY_FIELD in normalized_params_by_name:
+            raise FrozenRateFileValidationError("invalid price exclusion requires a frozen rate file set")
         return normalized_params_by_name
-    if len(supplied_fields) != len(FROZEN_RATE_FILE_PROTECTED_FIELDS):
-        raise FrozenRateFileValidationError(
-            "frozen_rate_file_set_contract, frozen_rate_files, "
-            "frozen_rate_file_set_sha256, and frozen_rate_file_count are all "
-            "required together"
+    normalized_files, set_digest, file_count = _normalized_frozen_file_set(normalized_params_by_name)
+    if INVALID_PRICE_EXCLUSION_POLICY_FIELD in normalized_params_by_name:
+        normalized_params_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = _validated_invalid_price_exclusion_policy(
+            normalized_params_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD],
+            normalized_files,
         )
-    if (
-        normalized_params_by_name["frozen_rate_file_set_contract"]
-        != FROZEN_RATE_FILE_SET_CONTRACT
-    ):
-        raise FrozenRateFileValidationError(
-            "frozen_rate_file_set_contract is invalid"
-        )
-    file_count = normalized_params_by_name["frozen_rate_file_count"]
-    if isinstance(file_count, bool) or not isinstance(file_count, int):
-        raise FrozenRateFileValidationError(
-            "frozen_rate_file_count must be an integer"
-        )
-    normalized_files, set_digest = normalize_frozen_rate_file_set(
-        normalized_params_by_name["frozen_rate_files"],
-        normalized_params_by_name["frozen_rate_file_set_sha256"],
-    )
-    if file_count != len(normalized_files):
-        raise FrozenRateFileValidationError(
-            "frozen_rate_file_count does not match frozen_rate_files"
-        )
-    source_file_import_id = source_file_import_id_from_params(
-        normalized_params_by_name
-    )
+    source_file_import_id = source_file_import_id_from_params(normalized_params_by_name)
     import_id = _required_text(
         normalized_params_by_name.get("import_id"),
         field_name="import_id",
@@ -223,10 +258,8 @@ def frozen_rate_binding_from_params(
     normalized_params = normalize_protected_frozen_rate_params(params_by_name)
     if not protected_frozen_tuple_presence(normalized_params):
         return None
-    source_file_import_id = str(
-        normalized_params["source_file_import_id"]
-    )
-    return {
+    source_file_import_id = str(normalized_params["source_file_import_id"])
+    binding_by_name = {
         "contract": FROZEN_RATE_FILE_BINDING_CONTRACT,
         "source_file_import_id": source_file_import_id,
         "frozen_rate_file_set_contract": FROZEN_RATE_FILE_SET_CONTRACT,
@@ -253,6 +286,9 @@ def frozen_rate_binding_from_params(
             lowercase=True,
         ),
     }
+    if INVALID_PRICE_EXCLUSION_POLICY_FIELD in normalized_params:
+        binding_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = normalized_params[INVALID_PRICE_EXCLUSION_POLICY_FIELD]
+    return binding_by_name
 
 
 def frozen_rate_binding_sha256(binding: Mapping[str, Any]) -> str:
@@ -315,6 +351,8 @@ __all__ = [
     "FROZEN_RATE_FILE_BINDING_OPTION",
     "FROZEN_RATE_FILE_BINDING_TABLE",
     "FROZEN_RATE_FILE_PROTECTED_FIELDS",
+    "FROZEN_RATE_FILE_REQUIRED_FIELDS",
+    "INVALID_PRICE_EXCLUSION_POLICY_FIELD",
     "FrozenRateFileBindingMismatchError",
     "assert_existing_frozen_binding",
     "binding_option",
@@ -322,6 +360,7 @@ __all__ = [
     "frozen_rate_binding_from_params",
     "frozen_rate_binding_sha256",
     "normalize_protected_frozen_rate_params",
+    "protected_frozen_field_presence",
     "protected_frozen_tuple_presence",
     "source_file_import_id_from_params",
 ]

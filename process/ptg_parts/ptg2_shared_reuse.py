@@ -16,6 +16,10 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SHARED_GENERATION,
     shared_semantic_fingerprint,
 )
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    INVALID_PRICE_EXCLUSION_POLICY_FIELD,
+    validate_invalid_price_exclusion_policy,
+)
 from process.ptg_parts.ptg2_shared_source_set import (
     PTG2_V3_SOURCE_SET_CONTRACT,
     _normalized_sha256,
@@ -345,55 +349,62 @@ def deterministic_source_key_assignments(
     return tuple(enumerate(distinct_identities))
 
 
-def shared_snapshot_source_assignments(
+def _normalized_source_provenance(
+    entry: Mapping[str, Any],
+) -> tuple[SharedPhysicalArtifactIdentity, str, str, str | None, bool]:
+    """Validate one logical trace against its physical artifact identity."""
+
+    identity = normalized_physical_artifact_identity(entry)
+    trace_hash = _normalized_sha256(
+        entry.get("source_trace_hash"),
+        field_name="source_trace_hash",
+    )
+    raw_container_sha256 = _normalized_sha256(
+        entry.get("raw_container_sha256"),
+        field_name="raw_container_sha256",
+    )
+    logical_hash_deferred = bool(entry.get("logical_hash_deferred"))
+    logical_json_sha256 = (
+        None
+        if logical_hash_deferred
+        else _normalized_sha256(
+            entry.get("logical_json_sha256"),
+            field_name="logical_json_sha256",
+        )
+    )
+    if identity.identity_kind == "logical_json_sha256_v1" and (
+        logical_hash_deferred or logical_json_sha256 != identity.identity_sha256
+    ):
+        raise ValueError("strict shared V3 logical source metadata disagrees with its physical identity")
+    if identity.identity_kind == "raw_container_sha256_v1" and (
+        not logical_hash_deferred or raw_container_sha256 != identity.identity_sha256
+    ):
+        raise ValueError("strict shared V3 deferred source metadata disagrees with its physical identity")
+    return (
+        identity,
+        trace_hash,
+        raw_container_sha256,
+        logical_json_sha256,
+        logical_hash_deferred,
+    )
+
+
+def _grouped_source_provenance(
     source_provenance_entries: Iterable[Mapping[str, Any]],
-    *,
-    expected_identities: Iterable[
-        Mapping[str, Any] | SharedPhysicalArtifactIdentity
-    ],
-) -> tuple[
-    tuple[SharedSnapshotSourceAssignment, ...],
-    tuple[dict[str, Any], ...],
-]:
-    """Build one dense physical-key mapping to a complete logical trace set."""
+) -> dict[SharedPhysicalArtifactIdentity, dict[str, set[Any]]]:
+    """Group exact logical provenance by physical artifact identity."""
 
     provenance_by_identity: dict[
         SharedPhysicalArtifactIdentity, dict[str, set[Any]]
     ] = {}
     for entry in source_provenance_entries:
-        identity = normalized_physical_artifact_identity(entry)
-        trace_hash = _normalized_sha256(
-            entry.get("source_trace_hash"),
-            field_name="source_trace_hash",
-        )
-        raw_container_sha256 = _normalized_sha256(
-            entry.get("raw_container_sha256"),
-            field_name="raw_container_sha256",
-        )
-        logical_hash_deferred = bool(entry.get("logical_hash_deferred"))
-        raw_logical_sha256 = entry.get("logical_json_sha256")
-        logical_json_sha256 = (
-            None
-            if logical_hash_deferred
-            else _normalized_sha256(
-                raw_logical_sha256,
-                field_name="logical_json_sha256",
-            )
-        )
-        if identity.identity_kind == "logical_json_sha256_v1" and (
-            logical_hash_deferred
-            or logical_json_sha256 != identity.identity_sha256
-        ):
-            raise ValueError(
-                "strict shared V3 logical source metadata disagrees with its physical identity"
-            )
-        if identity.identity_kind == "raw_container_sha256_v1" and (
-            not logical_hash_deferred
-            or raw_container_sha256 != identity.identity_sha256
-        ):
-            raise ValueError(
-                "strict shared V3 deferred source metadata disagrees with its physical identity"
-            )
+        (
+            identity,
+            trace_hash,
+            raw_container_sha256,
+            logical_json_sha256,
+            logical_hash_deferred,
+        ) = _normalized_source_provenance(entry)
         grouped = provenance_by_identity.setdefault(
             identity,
             {
@@ -407,14 +418,14 @@ def shared_snapshot_source_assignments(
         grouped["raw_container_sha256"].add(raw_container_sha256)
         grouped["logical_json_sha256"].add(logical_json_sha256)
         grouped["logical_hash_deferred"].add(logical_hash_deferred)
-    dense = deterministic_source_key_assignments(expected_identities)
-    expected_identity_set = {identity for _source_key, identity in dense}
-    unexpected = set(provenance_by_identity) - expected_identity_set
-    missing = expected_identity_set - set(provenance_by_identity)
-    if unexpected or missing:
-        raise ValueError(
-            "strict shared V3 logical source traces do not match the complete physical input set"
-        )
+    return provenance_by_identity
+
+
+def _source_assignments(
+    dense: tuple[tuple[int, SharedPhysicalArtifactIdentity], ...],
+    provenance_by_identity: Mapping[SharedPhysicalArtifactIdentity, Mapping[str, set[Any]]],
+) -> tuple[tuple[SharedSnapshotSourceAssignment, ...], tuple[dict[str, Any], ...]]:
+    """Construct the dense source rows from exact grouped provenance."""
 
     assignments: list[SharedSnapshotSourceAssignment] = []
     trace_set_rows: list[dict[str, Any]] = []
@@ -447,6 +458,24 @@ def shared_snapshot_source_assignments(
             )
         )
     return tuple(assignments), tuple(trace_set_rows)
+
+
+def shared_snapshot_source_assignments(
+    source_provenance_entries: Iterable[Mapping[str, Any]],
+    *,
+    expected_identities: Iterable[Mapping[str, Any] | SharedPhysicalArtifactIdentity],
+) -> tuple[
+    tuple[SharedSnapshotSourceAssignment, ...],
+    tuple[dict[str, Any], ...],
+]:
+    """Build one dense physical-key mapping to a complete logical trace set."""
+
+    provenance_by_identity = _grouped_source_provenance(source_provenance_entries)
+    dense = deterministic_source_key_assignments(expected_identities)
+    expected_identity_set = {identity for _source_key, identity in dense}
+    if set(provenance_by_identity) != expected_identity_set:
+        raise ValueError("strict shared V3 logical source traces do not match the complete physical input set")
+    return _source_assignments(dense, provenance_by_identity)
 
 
 def _distinct_artifact_payloads(
@@ -520,8 +549,11 @@ def shared_physical_input_identity(
         options.get(_FULL_REBUILD_SCOPE_DIGEST_OPTION)
     )
     if full_rebuild_scope_digest is not None:
-        physical_option_map[_FULL_REBUILD_SCOPE_DIGEST_OPTION] = (
-            full_rebuild_scope_digest
+        physical_option_map[_FULL_REBUILD_SCOPE_DIGEST_OPTION] = full_rebuild_scope_digest
+    invalid_price_exclusion = options.get(INVALID_PRICE_EXCLUSION_POLICY_FIELD)
+    if invalid_price_exclusion is not None:
+        physical_option_map[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = (
+            validate_invalid_price_exclusion_policy(invalid_price_exclusion)["sha256"]
         )
     identity_payload_map = {
         "identity_version": 6,

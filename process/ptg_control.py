@@ -29,7 +29,11 @@ from process.ptg_parts.ptg_source_worker_admission import (
 )
 from process.ptg_wave_claims import claim_wave_job_start, reconcile_wave_claim_exception
 from process.ptg_frozen_control import frozen_rate_main_kwargs, validated_worker_frozen_rate_params
-from process.ptg_singleton_direct_control import singleton_direct_main_kwargs, validated_worker_singleton_direct_params
+from process.ptg_singleton_direct_control import (
+    protected_singleton_direct_presence,
+    singleton_direct_main_kwargs,
+    validated_worker_singleton_direct_params,
+)
 from process.ptg_control_failures import ptg_failure_error
 from process.ptg_allowed_amount_blank_evidence import load_blank_failure_metrics
 from process.ptg_control_runtime import (
@@ -154,8 +158,16 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 attempt_started_at,
                 attempt_id=attempt_id,
             )
-        params_by_name = await validated_worker_frozen_rate_params(task_payload, params_by_name)
-        params_by_name = validated_worker_singleton_direct_params(task_payload, params_by_name)
+        if protected_singleton_direct_presence(params_by_name):
+            params_by_name = validated_worker_singleton_direct_params(
+                task_payload,
+                params_by_name,
+            )
+        else:
+            params_by_name = await validated_worker_frozen_rate_params(
+                task_payload,
+                params_by_name,
+            )
         full_rebuild_scope_digest = _full_rebuild_scope_digest(
             params_by_name,
         )

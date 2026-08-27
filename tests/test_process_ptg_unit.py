@@ -46,9 +46,8 @@ ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
 ptg_live_progress = importlib.import_module("process.ptg_parts.live_progress")
 ptg_progress = importlib.import_module("process.ptg_parts.progress")
 ptg_config = importlib.import_module("process.ptg_parts.config")
-ptg_provider_quarantine = importlib.import_module(
-    "process.ptg_parts.ptg2_provider_quarantine"
-)
+ptg_provider_quarantine = importlib.import_module("process.ptg_parts.ptg2_provider_quarantine")
+ptg_invalid_price_exclusion = importlib.import_module("process.ptg_parts.ptg2_invalid_price_exclusion")
 
 
 def test_candidate_audit_worker_requires_uvloop_before_startup(monkeypatch):
@@ -7253,9 +7252,8 @@ def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_pat
         return FakeProcess()
 
     monkeypatch.delenv(process_ptg.PTG2_RUST_EVENT_QUEUE_ENV, raising=False)
-    monkeypatch.setattr(
-        ptg_rust_scanner, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner"
-    )
+    monkeypatch.setenv(ptg_rust_scanner._INVALID_PRICE_EXCLUSION_ENV, "untrusted")
+    monkeypatch.setattr(ptg_rust_scanner, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
     monkeypatch.setattr(ptg_rust_scanner.subprocess, "Popen", fake_popen)
 
     list(
@@ -7280,6 +7278,149 @@ def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_pat
     )
     assert "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH" not in captured_env_map
     assert captured_env_map["HLTHPRT_PTG2_MANIFEST_ONLY"] == "true"
+    assert ptg_rust_scanner._INVALID_PRICE_EXCLUSION_ENV not in captured_env_map
+
+
+def _invalid_price_policy():
+    raw_source_sha256 = "a" * 64
+    source_by_field = ptg_invalid_price_exclusion.invalid_price_exclusion_source(
+        raw_source_sha256=raw_source_sha256,
+        entries=[
+            {
+                "object_ordinal": 2,
+                "rate_ordinal": 3,
+                "price_ordinal": 4,
+                "invalid_value_sha256": "b" * 64,
+            }
+        ],
+        emptied_rate_count=0,
+    )
+    policy = ptg_invalid_price_exclusion.invalid_price_exclusion_policy([source_by_field])
+    return raw_source_sha256, policy
+
+
+def _invalid_price_exclusion_scanner_case():
+    raw_source_sha256, policy = _invalid_price_policy()
+    expectation = ptg_invalid_price_exclusion.invalid_price_exclusion_source_expectation(
+        policy,
+        raw_source_sha256,
+    )
+    evidence = ptg_invalid_price_exclusion.invalid_price_exclusion_source_evidence(expectation)
+    return raw_source_sha256, expectation, evidence
+
+
+def _run_rust_scanner_with_exclusion(
+    monkeypatch,
+    tmp_path,
+    raw_source_sha256,
+    expectation,
+    evidence,
+):
+    captured_env_map = {}
+
+    class FakeProcess:
+        stdout = io.BytesIO(_strict_v3_scanner_frame_stream(summary={"invalid_price_exclusion": evidence}))
+        stderr = None
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(_args, stdout, stderr, env):
+        captured_env_map.update(env)
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        ptg_rust_scanner,
+        "_ptg2_rust_scanner_binary",
+        lambda: tmp_path / "ptg2_scanner",
+    )
+    monkeypatch.setattr(ptg_rust_scanner.subprocess, "Popen", fake_popen)
+
+    list(
+        ptg_rust_scanner._iter_compact_serving_records_rust(
+            tmp_path / "rates.json.gz",
+            raw_source_sha256=raw_source_sha256,
+            snapshot_id="snap",
+            plan_id="plan",
+            coverage_scope_id="c" * 64,
+            plan_month_id="month",
+            source_trace_set_hash="trace",
+            v3_serving_run_directory=tmp_path / "v3-runs-exclusion",
+            manifest_only=True,
+            invalid_price_exclusion=expectation,
+        )
+    )
+    return captured_env_map
+
+
+def test_ptg2_rust_compact_binds_exact_invalid_price_exclusion(monkeypatch, tmp_path):
+    """Bind the private policy and reject changed scanner evidence."""
+
+    raw_source_sha256, expectation, evidence = _invalid_price_exclusion_scanner_case()
+    captured_env_map = _run_rust_scanner_with_exclusion(
+        monkeypatch,
+        tmp_path,
+        raw_source_sha256,
+        expectation,
+        evidence,
+    )
+
+    assert json.loads(captured_env_map[ptg_rust_scanner._INVALID_PRICE_EXCLUSION_ENV]) == expectation
+    with pytest.raises(RuntimeError, match="evidence changed"):
+        ptg_rust_scanner._validate_v3_scanner_summary(
+            {
+                "invalid_price_exclusion": {
+                    **evidence,
+                    "emptied_rate_count": 1,
+                }
+            },
+            invalid_price_exclusion=expectation,
+        )
+
+
+def test_direct_frozen_params_do_not_invent_optional_policy():
+    normalized = process_ptg._normalized_direct_frozen_params(
+        {
+            "source_file_import_id": "source-file-import-001",
+            "import_id": "source-file-import-001",
+            "source_key": "source_a",
+            "import_month": None,
+            "plan_ids": [],
+            "plan_market_types": [],
+        }
+    )
+
+    assert normalized["source_file_import_id"] == "source-file-import-001"
+    assert "invalid_price_exclusion_policy" not in normalized
+    assert process_ptg._normalized_direct_frozen_params({}) == {}
+
+
+def test_direct_source_params_accept_only_singleton_bound_policy():
+    _, policy = _invalid_price_policy()
+    normalized = process_ptg._normalized_direct_frozen_params(
+        {
+            "source_file_import_id": "source-file-import-001",
+            "import_id": "source-file-import-001",
+            "source_key": "source_a",
+            "import_month": None,
+            "plan_ids": ["plan-a"],
+            "plan_market_types": ["group"],
+            "direct_rate_file_intent_sha256": "d" * 64,
+            "invalid_price_exclusion_policy": policy,
+        }
+    )
+
+    assert normalized["invalid_price_exclusion_policy"] == policy
+    with pytest.raises(ValueError, match="frozen_rate_file"):
+        process_ptg._normalized_direct_frozen_params(
+            {
+                **normalized,
+                "direct_rate_file_intent_sha256": None,
+            }
+        )
 
 
 def test_v4_flag_enables_rust_factor_mode(
@@ -8924,6 +9065,50 @@ def test_reused_v3_serving_index_copies_only_physical_contract_fields():
     assert "future_logical_provenance" not in serving_result
 
 
+def test_reused_v3_serving_index_binds_invalid_price_exclusion_evidence():
+    policy = ptg_invalid_price_exclusion.invalid_price_exclusion_policy(
+        [
+            ptg_invalid_price_exclusion.invalid_price_exclusion_source(
+                raw_source_sha256="11" * 32,
+                entries=[
+                    {
+                        "object_ordinal": 0,
+                        "rate_ordinal": 0,
+                        "price_ordinal": 0,
+                        "invalid_value_sha256": "22" * 32,
+                    }
+                ],
+                emptied_rate_count=0,
+            )
+        ]
+    )
+    evidence = ptg_invalid_price_exclusion.invalid_price_exclusion_evidence(policy)
+    layout_manifest = _reusable_v3_layout_manifest(ptg_provider_quarantine.provider_identifier_quarantine_payload({}))
+    layout_manifest["serving_index"]["invalid_price_exclusion"] = evidence
+
+    serving_result = process_ptg._reused_shared_v3_serving_index(
+        layout_manifest,
+        source_key="current-source",
+        shared_snapshot_key=9,
+        expected_invalid_price_exclusion_sha256=policy["sha256"],
+    )
+    assert serving_result["invalid_price_exclusion"] == evidence
+
+    with pytest.raises(RuntimeError, match="unauthorized invalid-price evidence"):
+        process_ptg._reused_shared_v3_serving_index(
+            layout_manifest,
+            source_key="current-source",
+            shared_snapshot_key=9,
+        )
+    with pytest.raises(RuntimeError, match="evidence changed"):
+        process_ptg._reused_shared_v3_serving_index(
+            layout_manifest,
+            source_key="current-source",
+            shared_snapshot_key=9,
+            expected_invalid_price_exclusion_sha256="00" * 32,
+        )
+
+
 def test_reused_v4_serving_index_requires_packed_graph_contract():
     quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload({})
     layout_manifest = _reusable_v3_layout_manifest(quarantine)
@@ -9570,7 +9755,10 @@ def _run_reused_mixed_publish(
     publication_by_field = asyncio.run(
         process_ptg._publish_reused_shared_v3_snapshot(
             downloaded_jobs=[downloaded],
-            shared_input_identity=SimpleNamespace(source_count=1),
+            shared_input_identity=SimpleNamespace(
+                source_count=1,
+                payload={"physical_options": {}},
+            ),
             classes={"ImportLog": object},
             layout_manifest=_reusable_v3_layout_manifest(
                 ptg_provider_quarantine.provider_identifier_quarantine_payload({})

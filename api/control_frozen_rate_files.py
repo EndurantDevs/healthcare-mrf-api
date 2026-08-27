@@ -7,8 +7,11 @@ from typing import Any
 
 from process.ptg_parts.frozen_rate_binding import (
     FROZEN_RATE_FILE_PROTECTED_FIELDS,
-    normalize_protected_frozen_rate_params,
-    protected_frozen_tuple_presence,
+    protected_frozen_field_presence,
+)
+from process.ptg_singleton_direct_control import (
+    normalize_protected_rate_params,
+    protected_singleton_direct_presence,
 )
 
 
@@ -64,16 +67,18 @@ def ptg_import_file_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
 def validated_control_import_payload(
     request_payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Validate the private PTG multipart envelope before run persistence."""
+    """Validate one private PTG source envelope before run persistence."""
 
     if str(request_payload.get("importer") or "") != "ptg":
         return request_payload
     raw_params = request_payload.get("params")
     params_by_name = dict(raw_params) if isinstance(raw_params, dict) else {}
-    supplied_fields = protected_frozen_tuple_presence(params_by_name)
-    if not supplied_fields:
+    supplied_fields = protected_frozen_field_presence(params_by_name)
+    if not supplied_fields and not protected_singleton_direct_presence(
+        params_by_name
+    ):
         return request_payload
-    params_by_name = normalize_protected_frozen_rate_params(params_by_name)
+    params_by_name = normalize_protected_rate_params(params_by_name)
     nested_source_file_import_id = params_by_name["source_file_import_id"]
     outer_ids = (
         request_payload.get("source_file_import_id"),

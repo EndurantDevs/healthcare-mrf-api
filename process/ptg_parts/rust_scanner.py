@@ -40,9 +40,16 @@ from process.ptg_parts.config import (
     _env_int,
 )
 from process.ptg_parts.domain import PTG2_CONFIDENCE_TIC_RATE_NPI_TIN
-from process.ptg_parts.live_progress import current_live_progress_context, write_live_progress
+from process.ptg_parts.live_progress import (
+    current_live_progress_context,
+    write_live_progress,
+)
 from process.ptg_parts.progress import _scale_stage_progress_pct
 from process.ptg_parts.ptg2_shared_blocks import PTG2_V3_SHARED_GENERATION
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    invalid_price_exclusion_source_evidence,
+    validate_invalid_price_exclusion_source_evidence,
+)
 from process.ptg_parts.ptg2_shared_graph import (
     MembershipArtifact,
     SharedGraphConversionResult,
@@ -105,6 +112,7 @@ _V4_EMPTY_NPI_NORMALIZATION_FIELDS = frozenset(
     }
 )
 _SOURCE_WITNESS_SCRATCH_DIR_ENV = "HLTHPRT_PTG2_SOURCE_WITNESS_SCRATCH_DIR"
+_INVALID_PRICE_EXCLUSION_ENV = "HLTHPRT_PTG2_INVALID_PRICE_EXCLUSION_JSON"
 _SOURCE_WITNESS_SCRATCH_PREFIX = ".ptg2-source-witness-scratch-"
 _SOURCE_WITNESS_SCRATCH_MARKER = ".healthporta-source-witness-scratch-v1"
 _V3_SERVING_RUN_FORMAT = "ptg2_v3_serving_run"
@@ -1131,27 +1139,36 @@ def _validate_v3_scanner_config(
 
 
 def _validate_v3_scanner_summary(
-    payload: Any,
+    summary_by_name: Any,
     *,
     expect_factor_mode: bool = False,
+    invalid_price_exclusion: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if not isinstance(payload, dict):
+    if not isinstance(summary_by_name, dict):
         raise RuntimeError("strict V3 scanner emitted invalid scanner_summary")
     if expect_factor_mode and (
-        payload.get("factor_mode") is not True
-        or payload.get("provider_graph_v4_factor_mode") is not True
+        summary_by_name.get("factor_mode") is not True
+        or summary_by_name.get("provider_graph_v4_factor_mode") is not True
     ):
-        raise RuntimeError(
-            "strict V3 scanner_summary did not confirm required V4 factor mode"
-        )
-    empty_npi_evidence = payload.get("empty_npi_tin_only_normalization")
+        raise RuntimeError("strict V3 scanner_summary did not confirm required V4 factor mode")
+    empty_npi_evidence = summary_by_name.get("empty_npi_tin_only_normalization")
     if expect_factor_mode:
         _verify_v4_tin_only_audit(empty_npi_evidence)
     elif empty_npi_evidence is not None:
-        raise RuntimeError(
-            "strict V3 scanner_summary emitted V4-only empty-NPI evidence"
-        )
-    return payload
+        raise RuntimeError("strict V3 scanner_summary emitted V4-only empty-NPI evidence")
+    observed_exclusion = summary_by_name.get("invalid_price_exclusion")
+    if invalid_price_exclusion is None:
+        if observed_exclusion is not None:
+            raise RuntimeError("strict V3 scanner emitted unauthorized invalid-price exclusion evidence")
+    else:
+        try:
+            expected_exclusion = invalid_price_exclusion_source_evidence(invalid_price_exclusion)
+            observed_exclusion = validate_invalid_price_exclusion_source_evidence(observed_exclusion)
+        except ValueError as exc:
+            raise RuntimeError("strict V3 scanner emitted invalid invalid-price exclusion evidence") from exc
+        if observed_exclusion != expected_exclusion:
+            raise RuntimeError("strict V3 scanner invalid-price exclusion evidence changed")
+    return summary_by_name
 
 
 def _verify_v4_tin_only_audit(
@@ -1611,6 +1628,106 @@ def _scanner_bounded_progress_message(
     return ", ".join(message_parts), work_rate
 
 
+def _scanner_progress_projection(
+    progress: _ScannerProgress,
+    phase: str,
+    progress_context_by_name: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project parsed scanner progress into display and denominator fields."""
+    is_unbounded_objects = bool(
+        not progress.is_done
+        and progress.progress_basis == "objects"
+        and progress.work_done is not None
+        and progress.work_done > 0
+        and progress.work_total is None
+    )
+    is_indeterminate_semantic = bool(
+        not progress.is_done and progress.progress_basis == "semantic_work" and progress.work_total is None
+    )
+    phase_pct = None if is_unbounded_objects or is_indeterminate_semantic else progress.percent
+    if phase_pct is None and progress.work_total and progress.work_done is not None:
+        phase_pct = min(progress.work_done * 100.0 / progress.work_total, 100.0)
+    overall_pct = _scale_stage_progress_pct(
+        phase_pct,
+        progress_context_by_name.get("overall_progress_start_pct"),
+        progress_context_by_name.get("overall_progress_end_pct"),
+    )
+    pct = overall_pct if overall_pct is not None else phase_pct
+    pct_lower_bound = None
+    if is_unbounded_objects:
+        pct = _coerce_progress_float(progress_context_by_name.get("overall_progress_start_pct"))
+        message, object_rate = _scanner_object_progress_message(
+            phase,
+            progress.scanner_object_count_by_kind,
+            object_count=progress.object_count,
+            elapsed_seconds=progress.elapsed_seconds,
+            total_bytes=progress.total_bytes,
+        )
+    else:
+        message, object_rate = _scanner_bounded_progress_message(phase, progress)
+        if is_indeterminate_semantic:
+            pct_lower_bound = _coerce_progress_float(progress_context_by_name.get("overall_progress_start_pct"))
+    return {
+        "unit": progress.progress_basis,
+        "done": progress.object_count if is_unbounded_objects else progress.work_done,
+        "total": (None if is_unbounded_objects or is_indeterminate_semantic else progress.work_total),
+        "pct": pct,
+        "pct_lower_bound": pct_lower_bound,
+        "phase_pct": phase_pct,
+        "eta_seconds": (None if is_unbounded_objects or is_indeterminate_semantic else progress.eta_seconds),
+        "message": message,
+        "object_rate": object_rate,
+    }
+
+
+def _scanner_live_progress_payload(
+    progress: _ScannerProgress,
+    phase: str,
+    progress_context_by_name: Mapping[str, Any],
+    projection_by_name: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one live-progress payload from authenticated scanner fields."""
+
+    object_rate = projection_by_name["object_rate"]
+    message = projection_by_name["message"]
+    return {
+        **progress_context_by_name,
+        **{
+            field_name: projection_by_name[field_name]
+            for field_name in (
+                "unit",
+                "done",
+                "total",
+                "pct",
+                "pct_lower_bound",
+                "phase_pct",
+                "eta_seconds",
+            )
+        },
+        "phase": phase,
+        "stage_id": phase,
+        "stage_pct": projection_by_name["phase_pct"],
+        "basis": progress.progress_basis,
+        "denominator_state": "known" if progress.work_total is not None else "unknown",
+        "work_done": progress.work_done,
+        "work_total": progress.work_total,
+        "elapsed_seconds": progress.elapsed_seconds,
+        "message": message,
+        "detail": message,
+        "source": "ptg2-scanner-progress",
+        "confidence": "live",
+        "scanner_path": progress.scanner_path,
+        "scanner_done": progress.is_done,
+        "scanner_objects": progress.scanner_object_count_by_kind or None,
+        "counters": progress.scanner_object_count_by_kind or None,
+        "scanner_progress_basis": progress.progress_basis,
+        "scanner_object_rate": object_rate,
+        "throughput": (
+            {"unit": f"{progress.progress_basis}_per_second", "value": object_rate} if object_rate is not None else None
+        ),
+    }
+
+
 def _emit_scanner_live_progress(
     line: str,
     *,
@@ -1628,106 +1745,17 @@ def _emit_scanner_live_progress(
         for context_key, context_value in (live_progress_context or {}).items()
         if context_value not in (None, "")
     }
-    use_unbounded_object_progress = bool(
-        not progress.is_done
-        and progress.progress_basis == "objects"
-        and progress.work_done is not None
-        and progress.work_done > 0
-        and progress.work_total is None
+    projection_by_name = _scanner_progress_projection(
+        progress,
+        phase,
+        progress_context_map,
     )
-    use_indeterminate_semantic_progress = bool(
-        not progress.is_done
-        and progress.progress_basis == "semantic_work"
-        and progress.work_total is None
+    progress_value_by_field = _scanner_live_progress_payload(
+        progress,
+        phase,
+        progress_context_map,
+        projection_by_name,
     )
-    phase_pct = (
-        None
-        if use_unbounded_object_progress or use_indeterminate_semantic_progress
-        else progress.percent
-    )
-    if (
-        phase_pct is None
-        and progress.work_done is not None
-        and progress.work_total is not None
-        and progress.work_total > 0
-    ):
-        phase_pct = min(progress.work_done * 100.0 / progress.work_total, 100.0)
-    overall_pct = _scale_stage_progress_pct(
-        phase_pct,
-        progress_context_map.get("overall_progress_start_pct"),
-        progress_context_map.get("overall_progress_end_pct"),
-    )
-    pct = overall_pct if overall_pct is not None else phase_pct
-    pct_lower_bound = None
-    object_rate = None
-    if use_unbounded_object_progress:
-        pct = _coerce_progress_float(
-            progress_context_map.get("overall_progress_start_pct")
-        )
-        message, object_rate = _scanner_object_progress_message(
-            phase,
-            progress.scanner_object_count_by_kind,
-            object_count=progress.object_count,
-            elapsed_seconds=progress.elapsed_seconds,
-            total_bytes=progress.total_bytes,
-        )
-        progress_unit = "objects"
-        progress_done = progress.object_count
-        progress_total = None
-        progress_eta = None
-    elif use_indeterminate_semantic_progress:
-        pct_lower_bound = _coerce_progress_float(
-            progress_context_map.get("overall_progress_start_pct")
-        )
-        message, object_rate = _scanner_bounded_progress_message(phase, progress)
-        progress_unit = progress.progress_basis
-        progress_done = progress.work_done
-        progress_total = None
-        progress_eta = None
-    else:
-        message, object_rate = _scanner_bounded_progress_message(phase, progress)
-        progress_unit = progress.progress_basis
-        progress_done = progress.work_done
-        progress_total = progress.work_total
-        progress_eta = progress.eta_seconds
-    progress_value_by_field: dict[str, Any] = {
-        **progress_context_map,
-        "phase": phase,
-        "unit": progress_unit,
-        "done": progress_done,
-        "total": progress_total,
-        "pct": pct,
-        "pct_lower_bound": pct_lower_bound,
-        "phase_pct": phase_pct,
-        "stage_id": phase,
-        "stage_pct": phase_pct,
-        "basis": progress.progress_basis,
-        "denominator_state": (
-            "known" if progress.work_total is not None else "unknown"
-        ),
-        "work_done": progress.work_done,
-        "work_total": progress.work_total,
-        "eta_seconds": progress_eta,
-        "elapsed_seconds": progress.elapsed_seconds,
-        "message": message,
-        "detail": message,
-        "source": "ptg2-scanner-progress",
-        "confidence": "live",
-        "scanner_path": progress.scanner_path,
-        "scanner_done": progress.is_done,
-        "scanner_objects": progress.scanner_object_count_by_kind or None,
-        "counters": progress.scanner_object_count_by_kind or None,
-        "scanner_progress_basis": progress.progress_basis,
-        "scanner_object_rate": object_rate,
-        "throughput": (
-            {
-                "unit": f"{progress.progress_basis}_per_second",
-                "value": object_rate,
-            }
-            if object_rate is not None
-            else None
-        ),
-    }
     try:
         if progress_observer is not None:
             progress_observer(progress_value_by_field)
@@ -1814,7 +1842,6 @@ def _start_top_level_stderr_reader(
 
     def read_scanner_stderr() -> None:
         """Drain one scanner's stderr while retaining its bounded tail."""
-
         assert process.stderr is not None
         for raw_line in iter(process.stderr.readline, b""):
             line = raw_line.decode("utf-8", errors="replace").strip()
@@ -1846,19 +1873,17 @@ def _start_top_level_stderr_reader(
 def _iter_top_level_object_bytes_rust(
     path: str | Path,
     array_names: set[str],
-    *,
-    live_progress_context: dict[str, Any] | None = None,
-):
-    """Run the Rust scanner and yield top-level object frames as raw bytes."""
+) -> tuple[subprocess.Popen, _ScannerProcessControl]:
+    """Start one framed top-level scan under its process-control fence."""
+
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
         raise RuntimeError(
             "PTG2 Rust scanner is enabled but no scanner binary was found; "
-            "build it with `cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml`"
+            "build it with `cargo build --release --manifest-path "
+            "support/ptg2_scanner/Cargo.toml`"
         )
     _log_ptg2_rust_scanner_binary(binary)
-    if live_progress_context is None:
-        live_progress_context = current_live_progress_context()
     process = subprocess.Popen(
         [str(binary), str(path), *sorted(array_names)],
         stdout=subprocess.PIPE,
@@ -1867,6 +1892,19 @@ def _iter_top_level_object_bytes_rust(
     )
     process_control = _ScannerProcessControl()
     process_control.attach(process)
+    return process, process_control
+
+
+def _iter_top_level_object_bytes_rust(
+    path: str | Path,
+    array_names: set[str],
+    *,
+    live_progress_context: dict[str, Any] | None = None,
+):
+    """Run the Rust scanner and yield top-level object frames as raw bytes."""
+    if live_progress_context is None:
+        live_progress_context = current_live_progress_context()
+    process, process_control = _start_top_level_scanner(path, array_names)
     assert process.stdout is not None
     stderr_lines, stderr_thread = _start_top_level_stderr_reader(
         process,
@@ -1945,6 +1983,7 @@ def _iter_compact_serving_records_rust(
     manifest_only: bool | None = None,
     live_progress_context: dict[str, Any] | None = None,
     progress_observer: Callable[[dict[str, Any]], None] | None = None,
+    invalid_price_exclusion: Mapping[str, Any] | None = None,
     _process_control: _ScannerProcessControl | None = None,
 ):
     """Run the Rust compact scanner and yield validated decoded record frames."""
@@ -1968,6 +2007,19 @@ def _iter_compact_serving_records_rust(
         "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": source_trace_set_hash,
         "HLTHPRT_PTG2_COMPACT_CONFIDENCE_CODE": confidence_code,
     }
+    scanner_environment_map.pop(_INVALID_PRICE_EXCLUSION_ENV, None)
+    if invalid_price_exclusion is not None:
+        try:
+            invalid_price_exclusion_source_evidence(invalid_price_exclusion)
+        except ValueError as exc:
+            raise RuntimeError("strict V3 scanner invalid-price exclusion expectation is invalid") from exc
+        if invalid_price_exclusion.get("raw_source_sha256") != raw_source_sha256:
+            raise RuntimeError("strict V3 scanner invalid-price exclusion source does not match")
+        scanner_environment_map[_INVALID_PRICE_EXCLUSION_ENV] = json.dumps(
+            invalid_price_exclusion,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     is_factor_mode_expected = _use_v4_provider_factors(
         scanner_environment_map,
         provider_set_component_path=manifest_provider_set_component_sidecar_path,
@@ -2249,7 +2301,7 @@ def _iter_compact_serving_records_rust(
                         expected_version=_V3_SERVING_RUN_VERSION,
                     )
                 )
-            elif record_kind == "v3_serving_code_dictionary_file":
+            if record_kind == "v3_serving_code_dictionary_file":
                 serving_run_code_dictionary_files.append(
                     _validated_v3_file_frame(
                         frame_field_map,
@@ -2266,10 +2318,11 @@ def _iter_compact_serving_records_rust(
                         expected_version=_V3_CODE_DICTIONARY_VERSION,
                     )
                 )
-            elif record_kind == "scanner_summary":
+            if record_kind == "scanner_summary":
                 frame_field_map = _validate_v3_scanner_summary(
                     frame_field_map,
                     expect_factor_mode=is_factor_mode_expected,
+                    invalid_price_exclusion=invalid_price_exclusion,
                 )
                 has_scanner_summary = True
                 frame_field_map = {
@@ -2279,7 +2332,7 @@ def _iter_compact_serving_records_rust(
                         serving_run_code_dictionary_files
                     ),
                 }
-            elif record_kind == "scanner_config":
+            if record_kind == "scanner_config":
                 frame_field_map = _validate_v3_scanner_config(
                     frame_field_map,
                     expect_factor_mode=is_factor_mode_expected,
@@ -2378,6 +2431,7 @@ async def _aiter_compact_serving_records_rust(
     source_network_names: list[str] | tuple[str, ...] | set[str] | None = None,
     manifest_only: bool | None = None,
     progress_observer: Callable[[dict[str, Any]], None] | None = None,
+    invalid_price_exclusion: Mapping[str, Any] | None = None,
 ):
     """Yield compact scanner records asynchronously through a bounded queue."""
     live_progress_context = current_live_progress_context()
@@ -2423,6 +2477,7 @@ async def _aiter_compact_serving_records_rust(
         manifest_only=manifest_only,
         live_progress_context=live_progress_context,
         progress_observer=progress_observer,
+        invalid_price_exclusion=invalid_price_exclusion,
         _process_control=process_control,
     )
     event_queue: queue.Queue[Any] = queue.Queue(

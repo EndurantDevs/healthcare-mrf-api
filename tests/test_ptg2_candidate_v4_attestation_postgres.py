@@ -95,6 +95,9 @@ def _v4_identity_and_manifests():
 
 async def _create_v4_candidate_tables(quoted_schema: str) -> None:
     table_definitions = (
+        f"""CREATE TABLE {quoted_schema}.ptg2_import_run (
+            import_run_id text PRIMARY KEY, options jsonb NOT NULL
+            DEFAULT CAST('{{}}' AS jsonb))""",
         f"""CREATE TABLE {quoted_schema}.ptg2_snapshot (
             snapshot_id text PRIMARY KEY,
             import_run_id text NOT NULL DEFAULT 'run-1',
@@ -120,6 +123,8 @@ async def _create_v4_candidate_tables(quoted_schema: str) -> None:
         f"""CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_source (
             snapshot_id text NOT NULL, source_key text NOT NULL,
             raw_container_sha256 bytea NOT NULL)""",
+        f"""CREATE TABLE {quoted_schema}.ptg2_frozen_source_file_binding (
+            internal_run_id text PRIMARY KEY, binding_payload jsonb NOT NULL)""",
     )
     for table_definition in table_definitions:
         await db.execute_ddl(table_definition)

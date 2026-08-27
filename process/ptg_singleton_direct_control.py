@@ -9,7 +9,14 @@ import re
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
-from process.ptg_parts.frozen_rate_binding import protected_frozen_tuple_presence
+from process.ptg_parts.frozen_rate_binding import (
+    INVALID_PRICE_EXCLUSION_POLICY_FIELD,
+    normalize_protected_frozen_rate_params,
+    protected_frozen_tuple_presence,
+)
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    validate_invalid_price_exclusion_policy,
+)
 from process.ptg_singleton_direct_resource import PTG_SMALL_RESOURCE_CONTRACT
 
 
@@ -128,6 +135,16 @@ def normalize_protected_singleton_direct_params(
     )
     _require_direct_outer_matches(normalized_params_by_name, direct_intent)
     _require_singleton_selection(normalized_params_by_name)
+    if INVALID_PRICE_EXCLUSION_POLICY_FIELD in normalized_params_by_name:
+        if direct_intent["source_type"] != "in_network":
+            raise SingletonDirectValidationError(
+                "invalid price exclusion requires an in-network source"
+            )
+        normalized_params_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = (
+            validated_singleton_invalid_price_exclusion(
+                normalized_params_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD]
+            )
+        )
     normalized_params_by_name[DIRECT_RATE_FILE_INTENT_FIELD] = direct_intent
     normalized_params_by_name[DIRECT_RATE_FILE_INTENT_SHA256_FIELD] = (
         direct_digest
@@ -138,6 +155,34 @@ def normalize_protected_singleton_direct_params(
     ]
     normalized_params_by_name["max_files"] = 1
     return normalized_params_by_name
+
+
+def normalize_protected_rate_params(
+    params_by_name: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate exactly one protected singleton or multipart envelope."""
+
+    if protected_singleton_direct_presence(params_by_name):
+        return normalize_protected_singleton_direct_params(params_by_name)
+    return normalize_protected_frozen_rate_params(params_by_name)
+
+
+def validated_singleton_invalid_price_exclusion(
+    raw_policy: Any,
+) -> dict[str, Any]:
+    """Require one canonical policy source for one protected direct file."""
+
+    try:
+        policy_by_name = validate_invalid_price_exclusion_policy(raw_policy)
+    except ValueError as exc:
+        raise SingletonDirectValidationError(
+            "singleton direct invalid price exclusion policy is invalid"
+        ) from exc
+    if policy_by_name["source_count"] != 1:
+        raise SingletonDirectValidationError(
+            "singleton direct invalid price exclusion must bind one source"
+        )
+    return policy_by_name
 
 
 def _require_direct_marker_tuple(
@@ -253,9 +298,10 @@ def require_exact_wave_singleton_direct_params(
         else None
     )
     selector_field = _direct_selector_field(source_type)
-    if set(params_by_name) != set(_DIRECT_WAVE_PARAM_BASE_FIELDS) | {
-        selector_field
-    }:
+    expected_fields = set(_DIRECT_WAVE_PARAM_BASE_FIELDS) | {selector_field}
+    if INVALID_PRICE_EXCLUSION_POLICY_FIELD in params_by_name:
+        expected_fields.add(INVALID_PRICE_EXCLUSION_POLICY_FIELD)
+    if set(params_by_name) != expected_fields:
         raise SingletonDirectValidationError(
             "singleton direct wave parameter fields are not exact"
         )
@@ -324,11 +370,16 @@ def singleton_direct_main_kwargs(
 
     if not protected_singleton_direct_presence(params_by_name):
         return {}
-    return {
+    main_kwargs_by_name = {
         "direct_rate_file_intent_sha256": params_by_name[
             DIRECT_RATE_FILE_INTENT_SHA256_FIELD
         ]
     }
+    if INVALID_PRICE_EXCLUSION_POLICY_FIELD in params_by_name:
+        main_kwargs_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = (
+            params_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD]
+        )
+    return main_kwargs_by_name
 
 
 def singleton_direct_intent_sha256(
@@ -492,9 +543,11 @@ __all__ = [
     "PTG_SMALL_RESOURCE_CONTRACT",
     "SingletonDirectValidationError",
     "normalize_protected_singleton_direct_params",
+    "normalize_protected_rate_params",
     "protected_singleton_direct_presence",
     "require_exact_wave_singleton_direct_params",
     "singleton_direct_failure_payload",
     "singleton_direct_main_kwargs",
     "validated_worker_singleton_direct_params",
+    "validated_singleton_invalid_price_exclusion",
 ]
