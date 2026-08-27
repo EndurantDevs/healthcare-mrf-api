@@ -17,6 +17,104 @@ class HospitalPriceServingUnavailableError(RuntimeError):
     """Fail closed when packed serving evidence cannot be trusted."""
 
 
+def _is_invalid_selector_layout(
+    selector_record: Mapping[str, Any],
+    decoded_page_by_field: Mapping[str, Any],
+    key_sha256: bytes,
+) -> bool:
+    format_version = selector_record.get("format_version")
+    logical_count = selector_record.get("logical_count")
+    lower_digest = selector_record.get("key_sha256")
+    upper_digest = selector_record.get("parent_sha256")
+    found = decoded_page_by_field.get("found")
+    if format_version == 1:
+        return (
+            logical_count != 1
+            or decoded_page_by_field.get("row_count") != 1
+            or lower_digest != key_sha256
+            or not found
+            or decoded_page_by_field.get("ref_count")
+            != decoded_page_by_field.get("page_ref_count")
+            or decoded_page_by_field.get("first_ref")
+            != selector_record.get("secondary_first")
+        )
+    if format_version != 2:
+        return True
+    return (
+        type(logical_count) is not int
+        or not 1 <= logical_count <= 256
+        or decoded_page_by_field.get("row_count") != logical_count
+        or not isinstance(lower_digest, bytes)
+        or not isinstance(upper_digest, bytes)
+        or len(lower_digest) != 32
+        or len(upper_digest) != 32
+        or not lower_digest <= key_sha256 <= upper_digest
+        or (
+            logical_count > 1
+            and (lower_digest == upper_digest
+                 or selector_record.get("page_index") != 0
+                 or selector_record.get("page_count") != 1)
+        )
+        or (
+            logical_count == 1
+            and (lower_digest != upper_digest
+                 or not found
+                 or decoded_page_by_field.get("ref_count")
+                 != decoded_page_by_field.get("page_ref_count")
+                 or decoded_page_by_field.get("first_ref")
+                 != selector_record.get("secondary_first"))
+        )
+    )
+
+
+def _validated_selector_page(
+    selector_record: Mapping[str, Any],
+    decoded_page_by_field: object,
+    key_sha256: bytes,
+) -> tuple[list[int], int, int, bool]:
+    """Return one authenticated selector page or fail closed."""
+
+    if type(decoded_page_by_field) is not dict:
+        raise HospitalPriceServingUnavailableError(
+            "hospital price selector metadata is invalid"
+        )
+    refs = decoded_page_by_field.get("refs")
+    if type(refs) not in (list, tuple):
+        raise HospitalPriceServingUnavailableError(
+            "hospital price selector metadata is invalid"
+        )
+    selected_refs = list(refs)
+    page_index = decoded_page_by_field.get("page_index")
+    page_count = decoded_page_by_field.get("page_count")
+    page_ref_count = decoded_page_by_field.get("page_ref_count")
+    found = decoded_page_by_field.get("found")
+    ref_count = decoded_page_by_field.get("ref_count")
+    first_ref = decoded_page_by_field.get("first_ref")
+    if (
+        type(page_index) is not int or page_index < 0
+        or type(page_count) is not int or page_count <= page_index
+        or page_index != selector_record.get("page_index")
+        or page_count != selector_record.get("page_count")
+        or type(decoded_page_by_field.get("row_count")) is not int
+        or decoded_page_by_field["row_count"] < 1
+        or type(page_ref_count) is not int or page_ref_count < 1
+        or page_ref_count != selector_record.get("secondary_count")
+        or type(found) is not bool
+        or type(ref_count) is not int or ref_count < 0
+        or (found and (ref_count < 1 or type(first_ref) is not int or first_ref < 0))
+        or (not found and (ref_count != 0 or first_ref is not None or selected_refs))
+        or type(decoded_page_by_field.get("truncated")) is not bool
+        or any(type(reference) is not int or reference < 0 for reference in selected_refs)
+        or _is_invalid_selector_layout(
+            selector_record, decoded_page_by_field, key_sha256
+        )
+    ):
+        raise HospitalPriceServingUnavailableError(
+            "hospital price selector metadata is invalid"
+        )
+    return selected_refs, page_index, page_count, decoded_page_by_field["truncated"]
+
+
 def consume_public_bytes(byte_budget: list[int] | None, value: object) -> None:
     """Fail before retaining decoded rows that cannot fit the public response."""
 

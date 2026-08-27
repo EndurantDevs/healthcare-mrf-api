@@ -14,8 +14,17 @@ from pathlib import Path
 from typing import Any
 
 
-HOSPITAL_MRF_SCHEMA_REVISION = "hospital-mrf-packed-blocks-v1"
-HOSPITAL_MRF_SUMMARY_CONTRACT = "hospital-mrf-copy-v3-packed-v1"
+HOSPITAL_MRF_LEGACY_SCHEMA_REVISION = "hospital-mrf-packed-blocks-v1"
+HOSPITAL_MRF_LEGACY_SUMMARY_CONTRACT = "hospital-mrf-copy-v3-packed-v1"
+HOSPITAL_MRF_LEGACY_PARSER_CONTRACT = (
+    f"{HOSPITAL_MRF_LEGACY_SUMMARY_CONTRACT}-resource-bounded:"
+    f"{HOSPITAL_MRF_LEGACY_SCHEMA_REVISION}"
+)
+HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256 = hashlib.sha256(
+    HOSPITAL_MRF_LEGACY_PARSER_CONTRACT.encode("ascii")
+).hexdigest()
+HOSPITAL_MRF_SCHEMA_REVISION = "hospital-mrf-packed-blocks-v2"
+HOSPITAL_MRF_SUMMARY_CONTRACT = "hospital-mrf-copy-v3-packed-v2"
 HOSPITAL_MRF_PARSER_CONTRACT = (
     f"{HOSPITAL_MRF_SUMMARY_CONTRACT}-resource-bounded:"
     f"{HOSPITAL_MRF_SCHEMA_REVISION}"
@@ -239,7 +248,9 @@ def _has_valid_root_counts(packed_root: HospitalPackedRoot) -> bool:
         or packed_root.code_selector_key_count == 0
         or packed_root.code_selector_ref_count < packed_root.charge_count
         or packed_root.code_selector_page_count < packed_root.code_selector_key_count
-        or packed_root.code_selector_block_count != packed_root.code_selector_page_count
+        or packed_root.code_selector_page_count > packed_root.code_selector_ref_count
+        or packed_root.code_selector_block_count == 0
+        or packed_root.code_selector_block_count > packed_root.code_selector_page_count
         or packed_root.payer_plan_selector_ref_count != packed_root.fact_count
         or (packed_root.fact_count == 0) != all(
             count == 0 for count in payer_count_values
@@ -257,7 +268,9 @@ def _has_valid_root_counts(packed_root: HospitalPackedRoot) -> bool:
             )
         )
         or packed_root.payer_plan_selector_block_count
-        != packed_root.payer_plan_selector_page_count
+        > packed_root.payer_plan_selector_page_count
+        or packed_root.payer_plan_selector_page_count
+        > packed_root.payer_plan_selector_ref_count
     )
 
 
@@ -270,8 +283,8 @@ def _has_matching_artifact_counts(
         artifacts_by_kind["service_block"].rows == packed_root.service_block_count
         and artifacts_by_kind["fact_block"].rows == packed_root.fact_block_count
         and artifacts_by_kind["selector_page"].rows
-        == packed_root.code_selector_page_count
-        + packed_root.payer_plan_selector_page_count
+        == packed_root.code_selector_block_count
+        + packed_root.payer_plan_selector_block_count
     )
 
 

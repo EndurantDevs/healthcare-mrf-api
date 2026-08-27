@@ -209,7 +209,8 @@ async def _validate_packed_root(
         root.payer_plan_selector_key_count, root.code_selector_ref_count,
         root.payer_plan_selector_ref_count, root.service_block_count,
         root.fact_block_count, root.code_selector_page_count,
-        root.payer_plan_selector_page_count, version.service_count,
+        root.payer_plan_selector_page_count, root.code_selector_block_count,
+        root.payer_plan_selector_block_count, version.service_count,
         version.charge_count, version.payer_charge_count
         FROM {schema}.hospital_price_packed_root root
         JOIN {schema}.hospital_price_version version USING (version_id)
@@ -217,7 +218,7 @@ async def _validate_packed_root(
         version=receipt.version_id,
     )
     expected_root = (
-        1,
+        2,
         root.service_count,
         root.charge_count,
         root.fact_count,
@@ -229,6 +230,8 @@ async def _validate_packed_root(
         root.fact_block_count,
         root.code_selector_page_count,
         root.payer_plan_selector_page_count,
+        root.code_selector_block_count,
+        root.payer_plan_selector_block_count,
         root.service_count,
         root.charge_count,
         root.fact_count,
@@ -246,8 +249,8 @@ async def _validate_block_ordinals(
     block_counts_by_kind = {
         1: root.service_block_count,
         2: root.fact_block_count,
-        3: root.code_selector_page_count,
-        4: root.payer_plan_selector_page_count,
+        3: root.code_selector_block_count,
+        4: root.payer_plan_selector_block_count,
     }
     physical_rows = await connection.all(
         f"SELECT block_kind, COUNT(*), MIN(block_ordinal), MAX(block_ordinal) "
@@ -333,56 +336,85 @@ async def _validate_selector_pages(
 ) -> None:
     root = receipt.root
     selector_summary = await connection.all(
-        f"SELECT block_kind, COUNT(DISTINCT logical_first), COUNT(*), "
-        f"COALESCE(SUM(secondary_count), 0) FROM {schema}.hospital_price_data_block "
+        f"SELECT block_kind, COUNT(*), COALESCE(SUM(secondary_count), 0) "
+        f"FROM {schema}.hospital_price_data_block "
         "WHERE version_id=:version AND block_kind IN (3, 4) "
         "GROUP BY block_kind ORDER BY block_kind",
         version=receipt.version_id,
     )
     observed_selectors_by_kind = {
-        int(kind): (int(keys), int(pages), int(refs))
-        for kind, keys, pages, refs in selector_summary
+        int(kind): (int(pages), int(refs))
+        for kind, pages, refs in selector_summary
     }
     expected_selectors_by_kind = {
-        3: (root.code_selector_key_count, root.code_selector_page_count,
-            root.code_selector_ref_count),
-        4: (root.payer_plan_selector_key_count,
-            root.payer_plan_selector_page_count,
+        3: (root.code_selector_block_count, root.code_selector_ref_count),
+        4: (root.payer_plan_selector_block_count,
             root.payer_plan_selector_ref_count),
     }
     if observed_selectors_by_kind != {
         kind: counts
         for kind, counts in expected_selectors_by_kind.items()
-        if counts[1]
+        if counts[0]
     }:
         raise RuntimeError("hospital packed selector totals are invalid")
     selector_keys = root.code_selector_key_count + root.payer_plan_selector_key_count
-    distinct_keys, minimum_key, maximum_key = await connection.first(
-        f"SELECT COUNT(DISTINCT logical_first), MIN(logical_first), "
-        f"MAX(logical_first) FROM {schema}.hospital_price_data_block "
-        "WHERE version_id=:version AND block_kind IN (3, 4)",
+    grouped_keys = await connection.all(
+        f"SELECT block_kind, logical_first, MIN(logical_count), "
+        f"MAX(logical_count) FROM {schema}.hospital_price_data_block "
+        "WHERE version_id=:version AND block_kind IN (3, 4) "
+        "GROUP BY block_kind, logical_first ORDER BY logical_first",
         version=receipt.version_id,
     )
-    if (
-        int(distinct_keys) != selector_keys
-        or int(minimum_key) != 0
-        or int(maximum_key) != selector_keys - 1
-    ):
+    next_ordinal = 0
+    keys_by_kind = {3: 0, 4: 0}
+    for kind, logical_first, minimum_count, maximum_count in grouped_keys:
+        if (
+            int(logical_first) != next_ordinal
+            or int(minimum_count) != int(maximum_count)
+        ):
+            raise RuntimeError("hospital packed selector key ordinals are not dense")
+        next_ordinal += int(minimum_count)
+        keys_by_kind[int(kind)] += int(minimum_count)
+    if next_ordinal != selector_keys or keys_by_kind != {
+        3: root.code_selector_key_count,
+        4: root.payer_plan_selector_key_count,
+    }:
         raise RuntimeError("hospital packed selector key ordinals are not dense")
+    await _validate_selector_page_shapes(connection, receipt, schema)
+
+
+async def _validate_selector_page_shapes(
+    connection: Any, receipt: HospitalParserReceipt, schema: str,
+) -> None:
     invalid_pages = await connection.scalar(
         f"SELECT EXISTS (SELECT 1 FROM (SELECT block_kind, logical_first, "
         "COUNT(*) AS rows, MIN(page_count) AS min_pages, "
         "MAX(page_count) AS max_pages, MIN(page_index) AS first_page, "
         "MAX(page_index) AS last_page, COUNT(DISTINCT page_index) AS pages, "
+        "MIN(logical_count) AS min_keys, MAX(logical_count) AS max_keys, "
+        "COUNT(parent_sha256) AS parent_values, "
         "COUNT(DISTINCT key_sha256) AS key_hashes, "
         "COUNT(DISTINCT parent_sha256) AS parent_hashes "
         f"FROM {schema}.hospital_price_data_block WHERE version_id=:version "
         "AND block_kind IN (3, 4) GROUP BY block_kind, logical_first) grouped "
         "WHERE rows<>min_pages OR min_pages<>max_pages OR first_page<>0 "
-        "OR last_page<>rows-1 OR pages<>rows OR key_hashes<>1 "
-        "OR (block_kind=3 AND parent_hashes<>0) "
-        "OR (block_kind=4 AND parent_hashes<>1))",
+        "OR last_page<>rows-1 OR pages<>rows OR min_keys<>max_keys "
+        "OR (min_keys>1 AND (rows<>1 OR first_page<>0)) "
+        "OR key_hashes<>1 OR parent_values<>rows OR parent_hashes<>1)",
         version=receipt.version_id,
     )
     if invalid_pages:
         raise RuntimeError("hospital packed selector pages are incomplete")
+    overlapping_ranges = await connection.scalar(
+        f"SELECT EXISTS (SELECT 1 FROM (SELECT block_kind, key_sha256, "
+        "parent_sha256, LAG(parent_sha256) OVER "
+        "(PARTITION BY block_kind ORDER BY logical_first) AS prior_last "
+        "FROM (SELECT block_kind, logical_first, MIN(key_sha256) AS key_sha256, "
+        "MIN(parent_sha256) AS parent_sha256 "
+        f"FROM {schema}.hospital_price_data_block WHERE version_id=:version "
+        "AND block_kind IN (3, 4) GROUP BY block_kind, logical_first) grouped) ranged "
+        "WHERE key_sha256>parent_sha256 OR prior_last>=key_sha256)",
+        version=receipt.version_id,
+    )
+    if overlapping_ranges:
+        raise RuntimeError("hospital packed selector digest ranges are invalid")

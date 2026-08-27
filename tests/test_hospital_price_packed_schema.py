@@ -20,6 +20,12 @@ MIGRATION_PATH = (
     / "versions"
     / "20260826090000_hospital_price_packed_blocks.py"
 )
+SELECTOR_PACKING_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic"
+    / "versions"
+    / "20260827160000_hospital_price_selector_page_packing.py"
+)
 SCHEMA = "hospital_price_packed_test"
 
 ROOT_COLUMNS = [
@@ -36,6 +42,8 @@ ROOT_COLUMNS = [
     "fact_block_count",
     "code_selector_page_count",
     "payer_plan_selector_page_count",
+    "code_selector_block_count",
+    "payer_plan_selector_block_count",
     "created_at",
 ]
 BLOCK_COLUMNS = [
@@ -67,16 +75,16 @@ def _normalized(value: str) -> str:
     return " ".join(value.split())
 
 
-def _load_migration(name: str):
-    module_spec = importlib.util.spec_from_file_location(name, MIGRATION_PATH)
+def _load_migration(name: str, path: Path = MIGRATION_PATH):
+    module_spec = importlib.util.spec_from_file_location(name, path)
     assert module_spec is not None and module_spec.loader is not None
     migration = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(migration)
     return migration
 
 
-def _capture(monkeypatch, operation: str):
-    migration = _load_migration(f"hospital_price_packed_{operation}")
+def _capture(monkeypatch, operation: str, path: Path = MIGRATION_PATH):
+    migration = _load_migration(f"hospital_price_packed_{operation}", path)
     recorder = _Recorder()
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", SCHEMA)
     monkeypatch.delenv("DB_SCHEMA", raising=False)
@@ -84,6 +92,30 @@ def _capture(monkeypatch, operation: str):
     getattr(migration, operation)()
     statements = [_normalized(statement) for statement in recorder.statements]
     return migration, statements, " ".join(statements)
+
+
+def test_selector_packing_migration_backfills_and_guards_rollback(monkeypatch) -> None:
+    migration, statements, upgrade_sql = _capture(
+        monkeypatch, "upgrade", SELECTOR_PACKING_MIGRATION_PATH
+    )
+    assert migration.revision == "20260827160000_hospital_price_selector_page_packing"
+    assert migration.down_revision == "20260827120000_hospital_price_source_format"
+    assert len(statements) == 6
+    assert "ADD COLUMN code_selector_block_count bigint" in upgrade_sql
+    assert "DISABLE TRIGGER hospital_price_packed_root_reject_update" in upgrade_sql
+    assert "WHERE child.version_id=root.version_id AND child.block_kind=3" in upgrade_sql
+    assert "ENABLE TRIGGER hospital_price_packed_root_reject_update" in upgrade_sql
+    assert "CHECK (format_version IN (1, 2))" in upgrade_sql
+    assert "logical_count BETWEEN 1 AND 256" in upgrade_sql
+
+    _migration, statements, downgrade_sql = _capture(
+        monkeypatch, "downgrade", SELECTOR_PACKING_MIGRATION_PATH
+    )
+    assert len(statements) == 4
+    assert "IF EXISTS (SELECT 1" in downgrade_sql
+    assert "WHERE format_version = 2" in downgrade_sql
+    assert "cannot downgrade while hospital selector v2 roots exist" in downgrade_sql
+    assert "DROP COLUMN code_selector_block_count" in downgrade_sql
 
 
 def test_upgrade_sql_matches_root_copy_and_lookup_contract(monkeypatch) -> None:
@@ -186,6 +218,17 @@ def test_models_have_exact_packed_check_constraints() -> None:
         "payer_plan_selector_ref_count = fact_count"
         in root_checks_by_name["hospital_price_packed_root_counts_check"]
     )
+    assert "format_version IN (1, 2)" in root_checks_by_name[
+        "hospital_price_packed_root_format_check"
+    ]
+    assert (
+        "code_selector_block_count BETWEEN 1 AND code_selector_page_count"
+        in root_checks_by_name["hospital_price_packed_root_counts_check"]
+    )
+    assert (
+        "payer_plan_selector_block_count BETWEEN 1 AND payer_plan_selector_page_count"
+        in root_checks_by_name["hospital_price_packed_root_counts_check"]
+    )
     assert set(block_checks_by_name) == {
         "hospital_price_data_block_common_check",
         "hospital_price_data_block_payload_check",
@@ -197,6 +240,10 @@ def test_models_have_exact_packed_check_constraints() -> None:
     )
     assert (
         "secondary_count BETWEEN 1 AND 524288"
+        in block_checks_by_name["hospital_price_data_block_kind_shape_check"]
+    )
+    assert (
+        "logical_count BETWEEN 1 AND 256"
         in block_checks_by_name["hospital_price_data_block_kind_shape_check"]
     )
     assert block.c.key_sha256.type.length == 32

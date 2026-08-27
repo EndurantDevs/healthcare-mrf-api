@@ -90,10 +90,11 @@ def _receipt(native: Any, directory: Path, *, row_count: int = 1) -> Any:
             payer_plan_selector_key_count=1,
             code_selector_ref_count=1,
             payer_plan_selector_ref_count=1,
-            service_block_count=row_count,
-            fact_block_count=row_count,
+            service_block_count=row_count, fact_block_count=row_count,
             code_selector_page_count=row_count,
-            payer_plan_selector_page_count=0,
+            payer_plan_selector_page_count=row_count,
+            code_selector_block_count=row_count,
+            payer_plan_selector_block_count=row_count,
         ),
     )
 

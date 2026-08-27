@@ -409,6 +409,7 @@ def test_native_summary_enforces_root_and_resource_invariants(tmp_path):
         ("service_block_count", 2),
         ("fact_block_count", 2),
         ("payer_plan_selector_ref_count", 4),
+        ("payer_plan_selector_page_count", 6),
         ("code_selector_ref_count", 3),
         ("selector_spool_bytes", 118),
         ("peak_scratch_bytes", 352),

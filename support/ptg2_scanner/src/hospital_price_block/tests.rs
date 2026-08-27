@@ -146,6 +146,23 @@ mod tests {
         let oversized = "x".repeat(HOSPITAL_PRICE_FACT_BLOCK_MAX_RAW_BYTES + 1);
         assert!(put_text(&mut Vec::new(), &oversized).is_err());
         assert!(frame_raw(oversized.as_bytes(), 1).is_err());
+        assert!(TextDictionary {
+            entries: vec![oversized.clone()],
+            ids: HashMap::new(),
+        }
+        .encode()
+        .is_err());
+        for entry in [
+            (oversized.clone(), "plan".to_owned()),
+            ("payer".to_owned(), oversized.clone()),
+        ] {
+            assert!(PayerPlanDictionary {
+                entries: vec![entry],
+                ids: HashMap::new(),
+            }
+            .encode()
+            .is_err());
+        }
 
         let mut lanes: [Vec<u8>; LANE_COUNT] = std::array::from_fn(|_| Vec::new());
         lanes[0] = vec![0; HOSPITAL_PRICE_FACT_BLOCK_MAX_RAW_BYTES];

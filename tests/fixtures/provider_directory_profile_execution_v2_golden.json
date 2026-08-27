@@ -3,7 +3,7 @@
   "probe": false,
   "provider_directory_profile_capacity_attestation": {
     "lease": {
-      "attestation_id": "6145ee543b82ba4b83dcbaf80d3a01e457d6c15d3e3d6727e37f9360fe11d1dd",
+      "attestation_id": "5ee586e72b5b9d9652d6c7a48fea46af13d1dd9e844078488be90ff299b2dcbc",
       "attestor_id": "capacity-authority-dev",
       "attestor_release_digest": "1111111111111111111111111111111111111111111111111111111111111111",
       "capacity_geometry_hash": "5555555555555555555555555555555555555555555555555555555555555555",
@@ -33,11 +33,11 @@
         "healthcare_image_digest": "sha256:1313131313131313131313131313131313131313131313131313131313131313",
         "healthcare_source_commit": "1212121212121212121212121212121212121212",
         "postgres_server_version_num": 180002,
-        "profile_migration_revision": "20260827120000_hospital_price_source_format",
+        "profile_migration_revision": "20260827160000_hospital_price_selector_page_packing",
         "profile_schema_version": 1,
         "profile_strategy_version": "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6"
       },
-      "runtime_witness_sha256": "c8e9431169e3ccb56eea48fd057ba91846688c1b51c7ea89334a353e48b9874d",
+      "runtime_witness_sha256": "a6de07bab38cbac55f991edbbad63095d0af273761c99e2cd9702c0d0c7c2ffd",
       "signature_algorithm": "Ed25519",
       "signing_preflight_guard": {
         "bundle_validation_path": "/v1/provider-directory/profile-capacity-bundle-validation",
@@ -527,7 +527,7 @@
         }
       ]
     },
-    "signature": "cWqB2V9vWsGfjPpOqjHaZNgSZkktT4eAFJDYH1FnyNh_vD5ne6TG6tIm2UUqyz3O_vUL2DiB424JhN2J8X1lDw"
+    "signature": "15D2kIwePZ19Z2q1KVjMAqc9aaav6hJuL9WvmAmSVH8U7J08uq2J4nv7PczG70TbLMWJrvhq6ZglJ9wKzLCICA"
   },
   "provider_directory_profile_contract_id": "healthporta.provider-directory-profile-execution.v2",
   "provider_directory_profile_generation": 11,

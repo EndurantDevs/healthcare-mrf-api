@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 import uuid
@@ -32,6 +33,15 @@ from tests.test_hospital_price_storage import (
 
 PACKED_MIGRATION_PATH = (
     ROOT / "alembic/versions/20260826090000_hospital_price_packed_blocks.py"
+)
+SELECTOR_RANGE_MIGRATION_PATH = (
+    ROOT / "alembic/versions/20260826200000_hospital_price_selector_range_index.py"
+)
+SOURCE_FORMAT_MIGRATION_PATH = (
+    ROOT / "alembic/versions/20260827120000_hospital_price_source_format.py"
+)
+SELECTOR_PACKING_MIGRATION_PATH = (
+    ROOT / "alembic/versions/20260827160000_hospital_price_selector_page_packing.py"
 )
 
 GC_ATTEMPTS_SQL = """INSERT INTO {quoted}.hospital_price_import_attempt (
@@ -86,6 +96,9 @@ async def _packed_database(monkeypatch):
         engine=engine,
         base_migration=_load_migration(),
         packed_migration=_load_migration(PACKED_MIGRATION_PATH),
+        selector_range_migration=_load_migration(SELECTOR_RANGE_MIGRATION_PATH),
+        source_format_migration=_load_migration(SOURCE_FORMAT_MIGRATION_PATH),
+        selector_packing_migration=_load_migration(SELECTOR_PACKING_MIGRATION_PATH),
     )
     await _prepare_schema(engine, schema)
     try:
@@ -126,6 +139,51 @@ async def _seed_packed_versions(case, version_ids: tuple[str, str, str]) -> None
             f"UPDATE {case.quoted}.hospital_price_version "
             "SET service_count=3, charge_count=3 WHERE version_id=$1",
             replay_version_id,
+        )
+    finally:
+        await connection.close()
+
+
+async def _prove_v1_selector_count_backfill(case) -> None:
+    version_id = "0" * 64
+    connection = await asyncpg.connect(_driver_dsn(case))
+    try:
+        await _seed_content_version(connection, case.quoted, "f" * 64, version_id)
+        await connection.execute(
+            f"INSERT INTO {case.quoted}.hospital_price_packed_root VALUES "
+            "($1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, clock_timestamp())",
+            version_id,
+        )
+        for kind, logical_first, key_digest, parent_digest, block_payload in (
+            (3, 0, b"c" * 32, None, b"code"),
+            (4, 1, b"p" * 32, b"p" * 32, b"payer"),
+        ):
+            await connection.execute(
+                f"INSERT INTO {case.quoted}.hospital_price_data_block VALUES "
+                "($1, $2, 0, $3, 1, 0, 1, 0, 1, $4, $5, $6, $7)",
+                version_id,
+                kind,
+                logical_first,
+                key_digest,
+                parent_digest,
+                hashlib.sha256(block_payload).digest(),
+                block_payload,
+            )
+    finally:
+        await connection.close()
+
+    await _run_migration(case.engine, case.selector_packing_migration, "upgrade")
+    connection = await asyncpg.connect(_driver_dsn(case))
+    try:
+        assert tuple(await connection.fetchrow(
+            f"SELECT format_version, code_selector_block_count, "
+            f"payer_plan_selector_block_count FROM {case.quoted}.hospital_price_packed_root "
+            "WHERE version_id=$1",
+            version_id,
+        )) == (1, 1, 1)
+        await connection.execute(
+            f"DELETE FROM {case.quoted}.hospital_price_version WHERE version_id=$1",
+            version_id,
         )
     finally:
         await connection.close()
@@ -189,8 +247,15 @@ async def _assert_downgrade_is_blocked(case, version_id: str) -> None:
         ) == 5
 
 
-async def _assert_invalid_receipt_rolls_back(case, receipt) -> None:
-    with pytest.raises(RuntimeError, match="logical ranges"):
+async def _assert_selector_packing_downgrade_is_blocked(case) -> None:
+    with pytest.raises(sa.exc.DBAPIError, match="cannot downgrade.*v2 roots"):
+        await _run_migration(case.engine, case.selector_packing_migration, "downgrade")
+
+
+async def _assert_invalid_receipt_rolls_back(
+    case, receipt, *, match: str = "logical ranges",
+) -> None:
+    with pytest.raises(RuntimeError, match=match):
         async with case.engine.begin() as connection:
             proxy = await _connection_proxy(connection)
             await hospital_price_store._insert_packed_root(proxy, receipt)
@@ -230,15 +295,38 @@ async def _prove_packed_integrity(monkeypatch, tmp_path: Path) -> None:
     async with _packed_database(monkeypatch) as case:
         await _run_migration(case.engine, case.base_migration, "upgrade")
         await _run_migration(case.engine, case.packed_migration, "upgrade")
+        await _run_migration(case.engine, case.selector_range_migration, "upgrade")
+        await _run_migration(case.engine, case.source_format_migration, "upgrade")
         version_ids = ("2" * 64, "4" * 64, "6" * 64)
         await _seed_packed_versions(case, version_ids)
+        await _prove_v1_selector_count_backfill(case)
         await _store_packed_receipt(
             case, _packed_receipt(tmp_path, version_ids[0], split_service=True)
         )
         await _assert_packed_constraints(case, version_ids[0])
+        await _assert_selector_packing_downgrade_is_blocked(case)
         await _assert_downgrade_is_blocked(case, version_ids[0])
         await _assert_invalid_receipt_rolls_back(
             case, _packed_receipt(tmp_path, version_ids[1], service_first=1)
+        )
+        connection = await asyncpg.connect(_driver_dsn(case))
+        try:
+            await connection.execute(
+                f"UPDATE {case.quoted}.hospital_price_version SET charge_count=513 "
+                "WHERE version_id=$1",
+                version_ids[1],
+            )
+        finally:
+            await connection.close()
+        await _assert_invalid_receipt_rolls_back(
+            case,
+            _packed_receipt(
+                tmp_path,
+                version_ids[1],
+                split_service=True,
+                mixed_null_code_parent=True,
+            ),
+            match="selector pages are incomplete",
         )
         await _assert_invalid_receipt_rolls_back(
             case, _packed_receipt(
@@ -246,6 +334,8 @@ async def _prove_packed_integrity(monkeypatch, tmp_path: Path) -> None:
             )
         )
         await _assert_packed_cascade(case, version_ids)
+        await _run_migration(case.engine, case.selector_packing_migration, "downgrade")
+        await _run_migration(case.engine, case.selector_range_migration, "downgrade")
         await _run_migration(case.engine, case.packed_migration, "downgrade")
         await _run_migration(case.engine, case.base_migration, "downgrade")
 
@@ -387,6 +477,9 @@ async def _prove_gc_retention(
     async with _packed_database(monkeypatch) as case:
         await _run_migration(case.engine, case.base_migration, "upgrade")
         await _run_migration(case.engine, case.packed_migration, "upgrade")
+        await _run_migration(case.engine, case.selector_range_migration, "upgrade")
+        await _run_migration(case.engine, case.source_format_migration, "upgrade")
+        await _run_migration(case.engine, case.selector_packing_migration, "upgrade")
         state = await _seed_gc_scenario(case)
         await _store_packed_receipt(
             case, _packed_receipt(tmp_path, state.old_version)
@@ -394,5 +487,7 @@ async def _prove_gc_retention(
         _install_gc_connection(monkeypatch, case)
         await _assert_shared_lkg_is_retained(case, state)
         await _assert_superseded_version_is_collected(case, state)
+        await _run_migration(case.engine, case.selector_packing_migration, "downgrade")
+        await _run_migration(case.engine, case.selector_range_migration, "downgrade")
         await _run_migration(case.engine, case.packed_migration, "downgrade")
         await _run_migration(case.engine, case.base_migration, "downgrade")

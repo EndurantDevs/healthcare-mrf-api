@@ -54,7 +54,7 @@ class HospitalPricePackedRoot(Base, JSONOutputMixin):
             ondelete="CASCADE",
         ),
         CheckConstraint(
-            "format_version = 1",
+            "format_version IN (1, 2)",
             name="hospital_price_packed_root_format_check",
         ),
         CheckConstraint(
@@ -62,19 +62,22 @@ class HospitalPricePackedRoot(Base, JSONOutputMixin):
             "AND charge_count >= service_count "
             "AND service_block_count BETWEEN 1 AND charge_count "
             "AND code_selector_key_count > 0 "
-            "AND code_selector_key_count <= code_selector_page_count "
-            "AND code_selector_page_count <= code_selector_ref_count "
+            "AND code_selector_page_count BETWEEN code_selector_key_count "
+            "AND code_selector_ref_count "
+            "AND code_selector_block_count BETWEEN 1 "
+            "AND code_selector_page_count "
             "AND code_selector_ref_count >= charge_count "
             "AND (((fact_count = 0 AND fact_block_count = 0 "
             "AND payer_plan_selector_key_count = 0 "
             "AND payer_plan_selector_ref_count = 0 "
-            "AND payer_plan_selector_page_count = 0)) OR "
+            "AND payer_plan_selector_page_count = 0 "
+            "AND payer_plan_selector_block_count = 0)) OR "
             "((fact_count > 0 AND fact_block_count BETWEEN 1 AND fact_count "
             "AND payer_plan_selector_key_count > 0 "
-            "AND payer_plan_selector_key_count "
-            "<= payer_plan_selector_page_count "
+            "AND payer_plan_selector_page_count BETWEEN "
+            "payer_plan_selector_key_count AND payer_plan_selector_ref_count "
+            "AND payer_plan_selector_block_count BETWEEN 1 "
             "AND payer_plan_selector_page_count "
-            "<= payer_plan_selector_ref_count "
             "AND payer_plan_selector_ref_count = fact_count)))",
             name="hospital_price_packed_root_counts_check",
         ),
@@ -98,6 +101,8 @@ class HospitalPricePackedRoot(Base, JSONOutputMixin):
     fact_block_count = Column(BigInteger, nullable=False)
     code_selector_page_count = Column(BigInteger, nullable=False)
     payer_plan_selector_page_count = Column(BigInteger, nullable=False)
+    code_selector_block_count = Column(BigInteger, nullable=False)
+    payer_plan_selector_block_count = Column(BigInteger, nullable=False)
     created_at = Column(
         TIMESTAMP(timezone=True),
         nullable=False,
@@ -149,15 +154,18 @@ class HospitalPriceDataBlock(Base, JSONOutputMixin):
             "AND page_index = 0 AND page_count = 0 "
             "AND key_sha256 IS NULL AND parent_sha256 IS NULL) OR "
             "(block_kind = 3 AND logical_first < 1000000 "
-            "AND logical_count = 1 "
+            "AND logical_count BETWEEN 1 AND 256 "
             "AND secondary_count BETWEEN 1 AND 524288 "
             "AND page_count > 0 AND page_index < page_count "
-            "AND key_sha256 IS NOT NULL AND parent_sha256 IS NULL) OR "
+            "AND key_sha256 IS NOT NULL "
+            "AND (logical_count = 1 OR (page_index = 0 AND page_count = 1 "
+            "AND parent_sha256 IS NOT NULL))) OR "
             "(block_kind = 4 AND logical_first < 1000000 "
-            "AND logical_count = 1 "
+            "AND logical_count BETWEEN 1 AND 256 "
             "AND secondary_count BETWEEN 1 AND 524288 "
             "AND page_count > 0 AND page_index < page_count "
-            "AND key_sha256 IS NOT NULL AND parent_sha256 IS NOT NULL))",
+            "AND key_sha256 IS NOT NULL AND parent_sha256 IS NOT NULL "
+            "AND (logical_count = 1 OR (page_index = 0 AND page_count = 1))))",
             name="hospital_price_data_block_kind_shape_check",
         ),
         Index(

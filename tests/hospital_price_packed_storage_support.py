@@ -91,6 +91,7 @@ def _packed_root(
     service_count: int,
     charge_count: int,
     service_block_count: int,
+    code_selector_block_count: int,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         service_count=service_count,
@@ -102,9 +103,46 @@ def _packed_root(
         payer_plan_selector_ref_count=1,
         service_block_count=service_block_count,
         fact_block_count=1,
-        code_selector_page_count=1,
+        code_selector_page_count=code_selector_block_count,
         payer_plan_selector_page_count=1,
+        code_selector_block_count=code_selector_block_count,
+        payer_plan_selector_block_count=1,
     )
+
+
+def _selector_blocks(
+    version_id: str,
+    charge_count: int,
+    mixed_null_code_parent: bool,
+) -> list[tuple[bytes | None, ...]]:
+    code_hash = hashlib.sha256(b"CPT\x0070551").digest()
+    payer_hash = hashlib.sha256(b"Payer\x00Plan").digest()
+    code_blocks = (
+        [
+            _packed_row(
+                version_id, 3, 0, (0, 1), (0, 512), (0, 2),
+                (code_hash, None), b"HPTSEL code page 0",
+            ),
+            _packed_row(
+                version_id, 3, 1, (0, 1), (512, 1), (1, 2),
+                (code_hash, code_hash), b"HPTSEL code page 1",
+            ),
+        ]
+        if mixed_null_code_parent
+        else [
+            _packed_row(
+                version_id, 3, 0, (0, 1), (0, charge_count), (0, 1),
+                (code_hash, code_hash), b"HPTSEL code",
+            )
+        ]
+    )
+    return [
+        *code_blocks,
+        _packed_row(
+            version_id, 4, 0, (1, 1), (0, 1), (0, 1),
+            (payer_hash, payer_hash), b"HPTSEL payer-plan",
+        ),
+    ]
 
 
 def _packed_receipt(
@@ -114,7 +152,9 @@ def _packed_receipt(
     service_first: int = 0,
     split_service: bool = False,
     replayed_services: bool = False,
+    mixed_null_code_parent: bool = False,
 ) -> Any:
+    """Build one synthetic packed receipt for store integrity tests."""
     service_count, charge_count, service_ranges = _service_layout(
         service_first, split_service, replayed_services
     )
@@ -132,8 +172,6 @@ def _packed_receipt(
         for ordinal, logical_first, logical_count, charge_first, charge_rows
         in service_ranges
     ]
-    code_hash = hashlib.sha256(b"CPT\x0070551").digest()
-    payer_hash = hashlib.sha256(b"Payer\x00Plan").digest()
     blocks_by_kind = {
         "service_block": service_blocks,
         "fact_block": [
@@ -142,19 +180,17 @@ def _packed_receipt(
                 (None, None), b"HPTFACT synthetic",
             )
         ],
-        "selector_page": [
-            _packed_row(
-                version_id, 3, 0, (0, 1), (0, charge_count), (0, 1),
-                (code_hash, None), b"HPTSEL code",
-            ),
-            _packed_row(
-                version_id, 4, 0, (1, 1), (0, 1), (0, 1),
-                (payer_hash, payer_hash), b"HPTSEL payer-plan",
-            ),
-        ],
+        "selector_page": _selector_blocks(
+            version_id, charge_count, mixed_null_code_parent
+        ),
     }
     return SimpleNamespace(
         version_id=version_id,
         artifacts=_write_packed_artifacts(tmp_path, version_id, blocks_by_kind),
-        root=_packed_root(service_count, charge_count, len(service_blocks)),
+        root=_packed_root(
+            service_count,
+            charge_count,
+            len(service_blocks),
+            1 + int(mixed_null_code_parent),
+        ),
     )

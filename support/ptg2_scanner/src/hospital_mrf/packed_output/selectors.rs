@@ -93,21 +93,15 @@ fn selector_key_memory_bytes(
     text_bytes as u64 * 2 + SELECTOR_KEY_MEMORY_OVERHEAD_BYTES
 }
 
-fn selector_parent_sha256(
-    key: &crate::hospital_price_selector_block::HospitalPriceSelectorKey,
-) -> Option<[u8; 32]> {
-    let crate::hospital_price_selector_block::HospitalPriceSelectorKey::PayerPlan {
-        payer_name,
-        ..
-    } = key
-    else {
-        return None;
-    };
-    let mut digest = Sha256::new();
-    digest.update(b"payer\0");
-    digest.update((payer_name.len() as u64).to_le_bytes());
-    digest.update(payer_name.as_bytes());
-    Some(digest.finalize().into())
+fn write_selector_spool_record<W: Write>(
+    writer: &mut W,
+    kind: u8,
+    ordinal: u32,
+    reference: u64,
+) -> io::Result<()> {
+    writer.write_all(&[kind])?;
+    writer.write_all(&ordinal.to_be_bytes())?;
+    writer.write_all(&reference.to_be_bytes())
 }
 
 fn read_selector_spool_record<R: Read>(reader: &mut R) -> io::Result<Option<(u8, u32, u64)>> {

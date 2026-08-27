@@ -397,6 +397,16 @@ mod tests {
             frame(&[1, 0, 0, 0, b'A', 1, 0, 0, 0], 1, 1),
             "raw payload is truncated",
         ));
+        cases.push((
+            "missing reference count after complete key",
+            frame(&raw[..12], 1, 2),
+            "raw payload is truncated",
+        ));
+        cases.push((
+            "truncated reference after complete key",
+            frame(&raw[..raw.len() - 4], 1, 2),
+            "raw payload is truncated",
+        ));
 
         let mut payer_cursor = SliceCursor::new(&[1, 0, 0, 0, b'A']);
         assert!(decode_key(
@@ -442,6 +452,14 @@ mod tests {
             "references exceed header",
             frame(&raw, 1, 1),
             "reference count exceeds the header",
+        ));
+
+        let mut duplicate_refs = raw.clone();
+        duplicate_refs[24..32].copy_from_slice(&1u64.to_le_bytes());
+        cases.push((
+            "duplicate references",
+            frame(&duplicate_refs, 1, 2),
+            "references are not strictly sorted and unique",
         ));
 
         let mut trailing_raw = raw.clone();

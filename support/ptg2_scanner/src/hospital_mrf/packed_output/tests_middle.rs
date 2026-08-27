@@ -364,3 +364,95 @@
         );
         assert!(packed_service_code_indexes(&row).is_err());
     }
+
+    type SelectorTestRows = ([u64; 2], Vec<Vec<Option<Vec<u8>>>>);
+
+    fn write_selector_test_rows(
+        directory: &Path,
+        keys: Vec<crate::hospital_price_selector_block::HospitalPriceSelectorKey>,
+        refs_by_key: Vec<Vec<u64>>,
+        page_counts: &[u32],
+    ) -> SelectorTestRows {
+        assert_eq!(keys.len(), refs_by_key.len());
+        assert_eq!(keys.len(), page_counts.len());
+        let digests = keys
+            .iter()
+            .map(crate::hospital_price_selector_block::selector_key_sha256)
+            .collect::<Vec<_>>();
+        assert!(digests.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let mut output = builder(directory);
+        for key in keys {
+            output.selector_key_ordinal(key).unwrap();
+        }
+        let mut records = Vec::with_capacity(
+            refs_by_key.iter().map(Vec::len).sum::<usize>() * SELECTOR_SPOOL_RECORD_BYTES,
+        );
+        for (ordinal, references) in refs_by_key.iter().enumerate() {
+            for reference in references {
+                records.extend_from_slice(&selector_record(1, ordinal as u32, *reference));
+            }
+        }
+        fs::write(&output.selector_sorted_path, records).unwrap();
+        output.write_selector_pages(page_counts).unwrap();
+        let block_counts = output.selector_block_counts;
+        let artifact = output.sinks[2].finish().unwrap();
+        let rows = copy_rows(&directory.join("selector_page.copy"));
+        assert_eq!(artifact.rows as usize, rows.len());
+        (block_counts, rows)
+    }
+
+    #[test]
+    fn selector_packing_keeps_multi_page_keys_between_packs() {
+        use crate::hospital_price_selector_block::{
+            HospitalPriceSelectorKey, HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES,
+        };
+
+        let code_key = |code: &str| HospitalPriceSelectorKey::Code {
+            code_type: "CPT".to_owned(),
+            code: code.to_owned(),
+        };
+        let keys = vec![
+            code_key("adjacent-32"),
+            code_key("adjacent-95"),
+            HospitalPriceSelectorKey::Code {
+                code_type: "x".repeat(HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES),
+                code: "x".repeat(HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_KEY_BYTES),
+            },
+            code_key("adjacent-24"),
+            code_key("adjacent-3"),
+        ];
+        let capacity = selector_ref_capacity(&keys[2]).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (block_counts, rows) = write_selector_test_rows(
+            directory.path(),
+            keys,
+            vec![
+                vec![0],
+                vec![1],
+                (0..=capacity as u64).collect(),
+                vec![0],
+                vec![1],
+            ],
+            &[1, 1, 2, 1, 1],
+        );
+
+        assert_eq!(block_counts, [4, 0]);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (
+                    field_i64(row, 2),
+                    field_i64(row, 3),
+                    field_i32(row, 4),
+                    field_i32(row, 7),
+                    field_i32(row, 8),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (0, 0, 2, 0, 1),
+                (1, 2, 1, 0, 2),
+                (2, 2, 1, 1, 2),
+                (3, 3, 2, 0, 1),
+            ]
+        );
+    }

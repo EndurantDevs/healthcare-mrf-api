@@ -456,20 +456,21 @@ def validated_projection_completeness_manifest(
     return ProjectionCompletenessManifest(manifest_sha256, canonical_proof)
 
 
-def _recipe_components(
-    decoder_contract_id: str,
-    acquisition_adapter_id: str,
-    input_set_sha256: str,
+def _validated_recipe_resources(
     source_ids: Iterable[str],
-    transform_contract_id: str,
-    scope_contract_id: str,
-    transform_context: Mapping[str, Any],
-    selected_resources: Iterable[str],
-    required_resources: Iterable[str],
-    completeness_manifest: ProjectionCompletenessManifest,
-) -> dict[str, Any]:
-    """Normalize exact recipe inputs before source-neutral identity hashing."""
-
+    resource_profile: tuple[
+        Iterable[str],
+        Iterable[str],
+        ProjectionCompletenessManifest,
+    ],
+) -> tuple[
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    ProjectionCompletenessManifest,
+    dict[str, Any],
+]:
+    selected_resources, required_resources, completeness_manifest = resource_profile
     validated_completeness = validated_projection_completeness_manifest(
         completeness_manifest
     )
@@ -502,6 +503,18 @@ def _recipe_components(
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_completeness_profile_mismatch"
         )
+    return (
+        normalized_sources,
+        normalized_selected,
+        normalized_required_resources,
+        validated_completeness,
+        completeness_proof_map,
+    )
+
+
+def _validated_transform_context(
+    transform_context: Mapping[str, Any],
+) -> dict[str, str]:
     normalized_context_map = {
         "as_of_date": required_text(
             transform_context.get("as_of_date"),
@@ -523,6 +536,33 @@ def _recipe_components(
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_transform_context_invalid"
         )
+    return normalized_context_map
+
+
+def _recipe_components(
+    decoder_contract_id: str,
+    acquisition_adapter_id: str,
+    input_set_sha256: str,
+    source_ids: Iterable[str],
+    transform_contract_id: str,
+    scope_contract_id: str,
+    transform_context: Mapping[str, Any],
+    resource_profile: tuple[
+        Iterable[str],
+        Iterable[str],
+        ProjectionCompletenessManifest,
+    ],
+) -> dict[str, Any]:
+    """Normalize exact recipe inputs before source-neutral identity hashing."""
+
+    (
+        normalized_sources,
+        normalized_selected,
+        normalized_required_resources,
+        validated_completeness,
+        completeness_proof_map,
+    ) = _validated_recipe_resources(source_ids, resource_profile)
+    normalized_context_map = _validated_transform_context(transform_context)
     return {
         "decoder_contract_id": required_text(
             decoder_contract_id,
@@ -650,9 +690,7 @@ def projection_recipe_identity(
         transform_contract_id,
         scope_contract_id,
         transform_context,
-        selected_resources,
-        required_resources,
-        completeness_manifest,
+        (selected_resources, required_resources, completeness_manifest),
     )
     identity = _recipe_payload(components)
     return ProjectionRecipeIdentity(
@@ -1526,31 +1564,15 @@ def _ordered_partition_resources(
     return ordered_resources
 
 
-def prepare_projection_proof_shard(
-    resources: Iterable[Mapping[str, Any]],
-    *,
-    recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
-    attempt: int,
-    partition_ordinal: int,
-    resource_type: str,
+def _projection_proof_fields(
+    recipe: PhysicalProjectionRecipeIdentity,
+    ordered_resources: Sequence[Mapping[str, Any]],
+    coordinates: tuple[int, int, int],
+    normalized_type: str,
     input_sha256: str,
-    partition_id: str | None = None,
-    partition_attempt: int = 1,
-    producer_proof: Mapping[str, Any] | None = None,
-) -> tuple[ProjectionProofShard, list[dict[str, Any]]]:
-    """Build one shard proof and return its single normalized ordered row set."""
-
-    recipe = validated_physical_projection_recipe_identity(recipe)
-    if attempt < 1 or partition_attempt < 1 or partition_ordinal < 0:
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_partition_coordinate_invalid"
-        )
-    normalized_type = required_text(resource_type, "resource_type", limit=64)
-    ordered_resources = _ordered_partition_resources(
-        resources,
-        normalized_type,
-        recipe.selected_resources,
-    )
+    producer_proof: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], str, int]:
+    attempt, partition_attempt, partition_ordinal = coordinates
     row_hash, resource_count = canonical_row_digest(ordered_resources)
     resource_count_by_type = {
         selected_resource: sum(
@@ -1582,6 +1604,42 @@ def prepare_projection_proof_shard(
     }
     if producer_proof is not None:
         proof_dict["producer_proof"] = dict(producer_proof)
+    return proof_dict, row_hash, resource_count
+
+
+def prepare_projection_proof_shard(
+    resources: Iterable[Mapping[str, Any]],
+    *,
+    recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
+    attempt: int,
+    partition_ordinal: int,
+    resource_type: str,
+    input_sha256: str,
+    partition_id: str | None = None,
+    partition_attempt: int = 1,
+    producer_proof: Mapping[str, Any] | None = None,
+) -> tuple[ProjectionProofShard, list[dict[str, Any]]]:
+    """Build one shard proof and return its single normalized ordered row set."""
+
+    recipe = validated_physical_projection_recipe_identity(recipe)
+    if attempt < 1 or partition_attempt < 1 or partition_ordinal < 0:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_partition_coordinate_invalid"
+        )
+    normalized_type = required_text(resource_type, "resource_type", limit=64)
+    ordered_resources = _ordered_partition_resources(
+        resources,
+        normalized_type,
+        recipe.selected_resources,
+    )
+    proof_dict, row_hash, resource_count = _projection_proof_fields(
+        recipe,
+        ordered_resources,
+        (attempt, partition_attempt, partition_ordinal),
+        normalized_type,
+        input_sha256,
+        producer_proof,
+    )
     normalized_partition_id = (
         required_hash(partition_id, "partition_id")
         if partition_id is not None

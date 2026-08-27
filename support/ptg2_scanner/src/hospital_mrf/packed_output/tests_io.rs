@@ -23,7 +23,7 @@
         assert!(output.finish().is_err());
 
         let mut output = prepared_builder(directories[4].path());
-        output.selector_block_counts = [1, 0];
+        output.selector_block_counts = [2, 0];
         assert!(output.finish().is_err());
 
         let mut output = prepared_builder(directories[5].path());
@@ -273,6 +273,11 @@
         );
         let directory = tempfile::tempdir().unwrap();
         let mut output = builder(directory.path());
+        assert!(selector_ref_capacity(&selector_code_with_type(
+            oversized.clone(),
+            "12345",
+        ))
+        .is_err());
         assert!(output
             .selector_key_ordinal(selector_code(oversized.clone()))
             .is_err());

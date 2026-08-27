@@ -98,7 +98,7 @@ WHERE attempt.attempt_id=staged.attempt_id RETURNING attempt.status"""
 
 EXISTING_VERSION_SQL = """SELECT version.content_sha256,
 version.parser_contract_sha256, content.byte_count,
-root.version_id IS NOT NULL, root.format_version=1
+root.version_id IS NOT NULL, root.format_version=2
 AND root.service_count=version.service_count
 AND root.charge_count=version.charge_count
 AND root.fact_count=version.payer_charge_count
@@ -108,10 +108,10 @@ AND root.service_block_count=(SELECT COUNT(*) FROM
 AND root.fact_block_count=(SELECT COUNT(*) FROM
     {schema}.hospital_price_data_block block
     WHERE block.version_id=version.version_id AND block.block_kind=2)
-AND root.code_selector_page_count=(SELECT COUNT(*) FROM
+AND root.code_selector_block_count=(SELECT COUNT(*) FROM
     {schema}.hospital_price_data_block block
     WHERE block.version_id=version.version_id AND block.block_kind=3)
-AND root.payer_plan_selector_page_count=(SELECT COUNT(*) FROM
+AND root.payer_plan_selector_block_count=(SELECT COUNT(*) FROM
     {schema}.hospital_price_data_block block
     WHERE block.version_id=version.version_id AND block.block_kind=4)
 FROM {schema}.hospital_price_version version

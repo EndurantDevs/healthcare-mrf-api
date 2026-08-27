@@ -169,10 +169,11 @@ async def _insert_packed_root(
         code_selector_key_count, payer_plan_selector_key_count,
         code_selector_ref_count, payer_plan_selector_ref_count,
         service_block_count, fact_block_count, code_selector_page_count,
-        payer_plan_selector_page_count)
-        VALUES (:version, 1, :services, :charges, :facts, :code_keys,
+        payer_plan_selector_page_count, code_selector_block_count,
+        payer_plan_selector_block_count)
+        VALUES (:version, 2, :services, :charges, :facts, :code_keys,
         :payer_keys, :code_refs, :payer_refs, :service_blocks, :fact_blocks,
-        :code_pages, :payer_pages)""",
+        :code_pages, :payer_pages, :code_blocks, :payer_blocks)""",
         version=receipt.version_id,
         services=root.service_count,
         charges=root.charge_count,
@@ -185,6 +186,8 @@ async def _insert_packed_root(
         fact_blocks=root.fact_block_count,
         code_pages=root.code_selector_page_count,
         payer_pages=root.payer_plan_selector_page_count,
+        code_blocks=root.code_selector_block_count,
+        payer_blocks=root.payer_plan_selector_block_count,
     )
 
 

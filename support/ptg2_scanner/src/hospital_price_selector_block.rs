@@ -143,7 +143,9 @@ fn put_text(output: &mut Vec<u8>, value: &str) {
     output.extend_from_slice(value.as_bytes());
 }
 
-fn entry_raw_len(entry: &HospitalPriceSelectorEntry) -> HospitalPriceSelectorBlockResult<usize> {
+pub(crate) fn entry_raw_len(
+    entry: &HospitalPriceSelectorEntry,
+) -> HospitalPriceSelectorBlockResult<usize> {
     if entry.refs.is_empty() {
         return Err(invalid("selector row has no references"));
     }

@@ -7,6 +7,13 @@ fn ensure_selector_key_capacity(key_count: usize) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct SelectorPackState {
+    first_ordinal: Option<u32>,
+    raw_bytes: usize,
+    entries: Vec<crate::hospital_price_selector_block::HospitalPriceSelectorEntry>,
+}
+
 impl PackedOutputBuilder {
     fn selector_key_ordinal(
         &mut self,
@@ -59,10 +66,82 @@ impl PackedOutputBuilder {
             self.selector_spool.as_mut(),
             "hospital MRF packed selector spool is already closed",
         )?;
-        writer.write_all(&[kind])?;
-        writer.write_all(&ordinal.to_be_bytes())?;
-        writer.write_all(&reference.to_be_bytes())?;
+        write_selector_spool_record(writer, kind, ordinal, reference)?;
         self.selector_spool_bytes = next_bytes;
+        Ok(())
+    }
+
+    fn reorder_selector_spool_by_digest(&mut self) -> io::Result<()> {
+        self.selector_key_ordinals.clear();
+        let mut ranked_keys = std::mem::take(&mut self.selector_keys)
+            .into_iter()
+            .enumerate()
+            .map(|(old_ordinal, key)| {
+                let digest = crate::hospital_price_selector_block::selector_key_sha256(&key);
+                (key.kind() as u32, digest, old_ordinal, key)
+            })
+            .collect::<Vec<_>>();
+        let mut kind_by_old = vec![0u8; ranked_keys.len()];
+        for (kind, _digest, old_ordinal, _key) in &ranked_keys {
+            kind_by_old[*old_ordinal] = *kind as u8;
+        }
+        ranked_keys.sort_unstable_by_key(|(kind, digest, old_ordinal, _key)| {
+            (*kind, *digest, *old_ordinal)
+        });
+        for pair in ranked_keys.windows(2) {
+            if pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1
+            {
+                return Err(invalid("hospital MRF packed selector key digest collides"));
+            }
+        }
+        let mut new_by_old = vec![0u32; ranked_keys.len()];
+        for (new_ordinal, (_kind, _digest, old_ordinal, _key)) in
+            ranked_keys.iter().enumerate()
+        {
+            new_by_old[*old_ordinal] = map_invalid(
+                u32::try_from(new_ordinal),
+                "hospital MRF packed selector key ordinal exceeds u32",
+            )?;
+        }
+        let remapped_path = self.selector_sort_directory.join("selector_refs.remapped");
+        let mut reader = std::io::BufReader::new(File::open(&self.selector_spool_path)?);
+        let mut writer = BufWriter::new(
+            OpenOptions::new().write(true).create_new(true).open(&remapped_path)?,
+        );
+        while let Some((kind, old_ordinal, reference)) =
+            read_selector_spool_record(&mut reader)?
+        {
+            let expected_kind = *or_invalid(
+                kind_by_old.get(old_ordinal as usize),
+                "hospital MRF packed selector key ordinal is invalid",
+            )?;
+            if kind != expected_kind {
+                return Err(invalid(
+                    "hospital MRF packed selector kind does not match its exact key",
+                ));
+            }
+            write_selector_spool_record(
+                &mut writer,
+                kind,
+                *or_invalid(
+                    new_by_old.get(old_ordinal as usize),
+                    "hospital MRF packed selector key ordinal is invalid",
+                )?,
+                reference,
+            )?;
+        }
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+        if fs::metadata(&remapped_path)?.len() != self.selector_spool_bytes {
+            return Err(invalid("hospital MRF packed selector remap byte count changed"));
+        }
+        fs::remove_file(&self.selector_spool_path)?;
+        fs::rename(&remapped_path, &self.selector_spool_path)?;
+        self.selector_keys = ranked_keys
+            .into_iter()
+            .map(|(_kind, _digest, _old_ordinal, key)| key)
+            .collect();
         Ok(())
     }
 
@@ -78,6 +157,7 @@ impl PackedOutputBuilder {
         if self.selector_spool_bytes == 0 {
             return Err(invalid("hospital MRF packed selector spool is empty"));
         }
+        self.reorder_selector_spool_by_digest()?;
         crate::v3_runs::external_sort_lexicographic_records(
             std::slice::from_ref(&self.selector_spool_path),
             &self.selector_sorted_path,
@@ -106,6 +186,7 @@ impl PackedOutputBuilder {
         let mut current_ordinal = None;
         let mut refs = Vec::new();
         let mut page_indexes = vec![0u32; self.selector_keys.len()];
+        let mut pack = SelectorPackState::default();
         while let Some((kind, ordinal, reference)) = read_selector_spool_record(&mut reader)? {
             let capacity = {
                 let key = or_invalid(
@@ -117,23 +198,37 @@ impl PackedOutputBuilder {
             };
             if current_ordinal != Some(ordinal) {
                 if let Some(previous) = current_ordinal {
-                    self.write_selector_ref_chunks(
+                    self.queue_selector_ref_chunk(
                         previous,
                         &mut refs,
                         page_counts,
                         &mut page_indexes,
+                        &mut pack,
                     )?;
                 }
                 current_ordinal = Some(ordinal);
             }
             refs.push(reference);
             if refs.len() == capacity {
-                self.write_selector_ref_chunks(ordinal, &mut refs, page_counts, &mut page_indexes)?;
+                self.queue_selector_ref_chunk(
+                    ordinal,
+                    &mut refs,
+                    page_counts,
+                    &mut page_indexes,
+                    &mut pack,
+                )?;
             }
         }
         if let Some(ordinal) = current_ordinal {
-            self.write_selector_ref_chunks(ordinal, &mut refs, page_counts, &mut page_indexes)?;
+            self.queue_selector_ref_chunk(
+                ordinal,
+                &mut refs,
+                page_counts,
+                &mut page_indexes,
+                &mut pack,
+            )?;
         }
+        self.flush_selector_pack(&mut pack, &mut page_indexes)?;
         if page_indexes.as_slice() != page_counts {
             return Err(invalid(
                 "hospital MRF packed selector page count does not match the preflight",
@@ -142,12 +237,13 @@ impl PackedOutputBuilder {
         Ok(())
     }
 
-    fn write_selector_ref_chunks(
+    fn queue_selector_ref_chunk(
         &mut self,
         ordinal: u32,
         refs: &mut Vec<u64>,
         page_counts: &[u32],
         page_indexes: &mut [u32],
+        pack: &mut SelectorPackState,
     ) -> io::Result<()> {
         if refs.is_empty() {
             return Ok(());
@@ -171,17 +267,101 @@ impl PackedOutputBuilder {
             key: key.clone(),
             refs: std::mem::take(refs),
         };
-        let first_ref = entry.refs[0];
+        let entry_raw_bytes = crate::hospital_price_selector_block::entry_raw_len(&entry)
+            .map_err(invalid)?;
+        let pack_kind = pack.entries.first().map(|packed| packed.key.kind());
+        let must_flush = page_count > 1
+            || pack.entries.len() == SELECTOR_PACK_MAX_ROWS
+            || pack_kind.is_some_and(|packed_kind| packed_kind != kind)
+            || pack.raw_bytes
+                .checked_add(entry_raw_bytes)
+                .is_none_or(|bytes| {
+                    bytes
+                        > crate::hospital_price_selector_block::HOSPITAL_PRICE_SELECTOR_BLOCK_MAX_RAW_BYTES
+                });
+        if must_flush {
+            self.flush_selector_pack(pack, page_indexes)?;
+        }
+        if page_count > 1 {
+            self.write_selector_pack(ordinal, page_index, page_count, &[entry])?;
+            page_indexes[slot] = page_index + 1;
+        } else {
+            if pack.entries.is_empty() {
+                pack.first_ordinal = Some(ordinal);
+            }
+            pack.raw_bytes = or_invalid(
+                pack.raw_bytes.checked_add(entry_raw_bytes),
+                "hospital MRF packed selector page byte count overflows",
+            )?;
+            pack.entries.push(entry);
+        }
+        Ok(())
+    }
+
+    fn flush_selector_pack(
+        &mut self,
+        pack: &mut SelectorPackState,
+        page_indexes: &mut [u32],
+    ) -> io::Result<()> {
+        if pack.entries.is_empty() {
+            return Ok(());
+        }
+        let first_ordinal = or_invalid(
+            pack.first_ordinal.take(),
+            "hospital MRF packed selector page ordinal is missing",
+        )?;
+        self.write_selector_pack(first_ordinal, 0, 1, &pack.entries)?;
+        for ordinal in first_ordinal..first_ordinal + pack.entries.len() as u32 {
+            *or_invalid(
+                page_indexes.get_mut(ordinal as usize),
+                "hospital MRF packed selector key ordinal is invalid",
+            )? = 1;
+        }
+        pack.entries.clear();
+        pack.raw_bytes = 0;
+        Ok(())
+    }
+
+    fn write_selector_pack(
+        &mut self,
+        first_ordinal: u32,
+        page_index: u32,
+        page_count: u32,
+        entries: &[crate::hospital_price_selector_block::HospitalPriceSelectorEntry],
+    ) -> io::Result<()> {
+        let first_entry = or_invalid(entries.first(), "hospital MRF packed selector page is empty")?;
+        let last_entry = entries.last().expect("non-empty selector page");
+        let kind = first_entry.key.kind();
+        if entries.iter().any(|entry| entry.key.kind() != kind) {
+            return Err(invalid("hospital MRF packed selector page mixes kinds"));
+        }
+        let lower_digest = crate::hospital_price_selector_block::selector_key_sha256(
+            &first_entry.key,
+        );
+        let upper_digest = crate::hospital_price_selector_block::selector_key_sha256(
+            &last_entry.key,
+        );
+        if lower_digest > upper_digest {
+            return Err(invalid("hospital MRF packed selector page digest range is invalid"));
+        }
         let payload = crate::hospital_price_selector_block::encode_selector_page(
             kind,
             page_index,
             page_count,
-            &[entry],
+            entries,
         )
         .map_err(invalid)?;
-        let ref_count = crate::hospital_price_selector_block::decode_selector_page(&payload)
-            .map_err(invalid)?
-            .ref_count();
+        let decoded = crate::hospital_price_selector_block::decode_selector_page(&payload)
+            .map_err(invalid)?;
+        if decoded.row_count() != entries.len() {
+            return Err(invalid("hospital MRF packed selector row count changed"));
+        }
+        let first_ref = entries
+            .iter()
+            .map(|entry| entry.refs[0])
+            .min()
+            .expect("non-empty selector page");
+        let ref_count = decoded.ref_count();
         let selector_slot = match kind {
             crate::hospital_price_selector_block::HospitalPriceSelectorKind::CodeToCharge => 0,
             crate::hospital_price_selector_block::HospitalPriceSelectorKind::PayerPlanToFact => 1,
@@ -196,21 +376,21 @@ impl PackedOutputBuilder {
             PackedRecordMetadata {
                 block_kind,
                 block_ordinal,
-                logical_first: ordinal as u64,
-                logical_count: 1,
+                logical_first: first_ordinal as u64,
+                logical_count: map_invalid(
+                    u32::try_from(entries.len()),
+                    "hospital MRF packed selector row count exceeds u32",
+                )?,
                 secondary_first: first_ref,
                 secondary_count: ref_count as u32,
                 page_index,
                 page_count,
-                key_sha256: Some(
-                    crate::hospital_price_selector_block::selector_key_sha256(&key),
-                ),
-                parent_sha256: selector_parent_sha256(&key),
+                key_sha256: Some(lower_digest),
+                parent_sha256: Some(upper_digest),
             },
             &payload,
         )?;
         self.selector_block_counts[selector_slot] = block_ordinal + 1;
-        page_indexes[slot] = page_index + 1;
         Ok(())
     }
 
@@ -244,8 +424,8 @@ impl PackedOutputBuilder {
                 "hospital MRF packed code selectors do not cover every charge",
             ));
         }
-        if self.selector_block_counts
-            != [preflight.code_page_count, preflight.payer_plan_page_count]
+        if self.selector_block_counts[0] > preflight.code_page_count
+            || self.selector_block_counts[1] > preflight.payer_plan_page_count
         {
             return Err(invalid(
                 "hospital MRF packed selector physical block counts differ from page counts",

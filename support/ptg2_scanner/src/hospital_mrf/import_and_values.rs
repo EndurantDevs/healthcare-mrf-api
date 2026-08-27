@@ -169,7 +169,7 @@ fn import_hospital_mrf_with_output_mode(
     let (contract, schema_revision) = match output_mode {
         HospitalMrfOutputMode::Legacy => ("hospital-mrf-copy-v3", HOSPITAL_MRF_SCHEMA_REVISION),
         HospitalMrfOutputMode::Packed => (
-            "hospital-mrf-copy-v3-packed-v1",
+            "hospital-mrf-copy-v3-packed-v2",
             HOSPITAL_MRF_PACKED_SCHEMA_REVISION,
         ),
     };

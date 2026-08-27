@@ -44,11 +44,13 @@ async def _read_storage_evidence(
     try:
         version = await connection.fetchrow(
             f"""SELECT version.version_id, content.content_sha256,
-                       content.byte_count, root.service_count,
+                       content.byte_count, root.format_version, root.service_count,
                        root.charge_count, root.fact_count,
                        root.service_block_count, root.fact_block_count,
                        root.code_selector_page_count,
-                       root.payer_plan_selector_page_count
+                       root.payer_plan_selector_page_count,
+                       root.code_selector_block_count,
+                       root.payer_plan_selector_block_count
                   FROM {quoted_schema}.hospital_price_version version
                   JOIN {quoted_schema}.hospital_price_content content
                     ON content.content_sha256=version.content_sha256
@@ -113,11 +115,13 @@ async def _read_physical_evidence(
 
 
 def _expected_block_counts(version: Mapping[str, Any]) -> dict[int, int]:
+    if int(version["format_version"]) not in (1, 2):
+        raise ValueError("unsupported hospital-price packed format")
     expected_by_kind = {
         1: int(version["service_block_count"]),
         2: int(version["fact_block_count"]),
-        3: int(version["code_selector_page_count"]),
-        4: int(version["payer_plan_selector_page_count"]),
+        3: int(version["code_selector_block_count"]),
+        4: int(version["payer_plan_selector_block_count"]),
     }
     return {kind: count for kind, count in expected_by_kind.items() if count > 0}
 
@@ -235,6 +239,7 @@ def _storage_receipt_payload(
     source_bytes = int(version["byte_count"])
     return {
         "content_sha256": str(version["content_sha256"]),
+        "format_version": int(version["format_version"]),
         "measurement": "quiescent_pre_post_hospital_relations_including_heap_toast_and_indexes",
         "database_bytes": int(physical["database_bytes"]),
         "baseline_hospital_relation_bytes": baseline_relation_bytes,
@@ -250,6 +255,14 @@ def _storage_receipt_payload(
         "service_count": int(version["service_count"]),
         "charge_count": int(version["charge_count"]),
         "fact_count": int(version["fact_count"]),
+        "code_selector_page_count": int(version["code_selector_page_count"]),
+        "payer_plan_selector_page_count": int(
+            version["payer_plan_selector_page_count"]
+        ),
+        "code_selector_block_count": int(version["code_selector_block_count"]),
+        "payer_plan_selector_block_count": int(
+            version["payer_plan_selector_block_count"]
+        ),
         "blocks": [
             {
                 "block_kind": int(block["block_kind"]),

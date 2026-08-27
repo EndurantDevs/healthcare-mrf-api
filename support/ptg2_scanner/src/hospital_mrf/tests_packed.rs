@@ -126,7 +126,7 @@ fn packed_mode_rejects_nul_in_each_packed_row_kind() {
 fn packed_mode_emits_ordered_artifacts_root_and_shared_budget() {
     let payload = fixture_json();
     let (directory, summary) = import_packed_json(&payload, TEST_MAX_OUTPUT_BYTES);
-    assert_eq!(summary.contract, "hospital-mrf-copy-v3-packed-v1");
+    assert_eq!(summary.contract, "hospital-mrf-copy-v3-packed-v2");
     assert_eq!(summary.schema_revision, HOSPITAL_MRF_PACKED_SCHEMA_REVISION);
     assert_eq!(
         summary
@@ -226,6 +226,8 @@ fn packed_selector_spool_deduplicates_codes_per_charge() {
     assert_eq!(root.code_selector_key_count, 2);
     assert_eq!(root.code_selector_ref_count, 2);
     assert_eq!(root.payer_plan_selector_ref_count, 1);
+    assert_eq!(root.code_selector_page_count, 2);
+    assert_eq!(root.code_selector_block_count, 1);
     assert_eq!(root.selector_spool_bytes, 3 * SELECTOR_SPOOL_RECORD_BYTES as u64);
     assert_eq!(root.peak_scratch_bytes, root.selector_spool_bytes * 3);
 }
