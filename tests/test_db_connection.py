@@ -429,3 +429,48 @@ async def test_create_table_and_execute_ddl(monkeypatch):
 
     await db.execute_ddl("VACUUM")
     assert run_calls_by_name["ddl"] == "VACUUM"
+
+
+@pytest.mark.asyncio
+async def test_app_startup_prewarms_configured_pool(monkeypatch):
+    listeners_by_name = {}
+
+    class App:
+        def listener(self, name):
+            def register(function):
+                listeners_by_name[name] = function
+                return function
+
+            return register
+
+        def middleware(self, _name):
+            return lambda function: function
+
+    class Connection:
+        async def __aenter__(self):
+            engine.opened += 1
+            engine.active += 1
+            engine.peak = max(engine.peak, engine.active)
+            return self
+
+        async def __aexit__(self, *_args):
+            engine.active -= 1
+
+    engine = SimpleNamespace(
+        active=0,
+        opened=0,
+        peak=0,
+        pool=SimpleNamespace(size=lambda: 4),
+        connect=lambda: Connection(),
+    )
+    database = Database(engine=engine)
+    connect = AsyncMock()
+    monkeypatch.setattr(database, "connect", connect)
+
+    database.init_app(App())
+    await listeners_by_name["before_server_start"](None, None)
+
+    connect.assert_awaited_once_with()
+    assert engine.opened == 4
+    assert engine.peak == 4
+    assert engine.active == 0

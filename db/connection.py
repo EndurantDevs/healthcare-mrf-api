@@ -8,7 +8,7 @@ import asyncio
 import contextvars
 import inspect
 import os
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Optional, Tuple
 
@@ -466,9 +466,13 @@ class Database:
                 "SQLAlchemy async support requires SQLAlchemy >= 1.4"
             ) from _ASYNC_IMPORT_ERROR
 
-        @app.listener("after_server_start")
+        @app.listener("before_server_start")
         async def _on_start(_, __):
             await self.connect()
+            assert self.engine is not None
+            async with AsyncExitStack() as connections:
+                for _ in range(self.engine.pool.size()):
+                    await connections.enter_async_context(self.engine.connect())
 
         @app.listener("before_server_stop")
         async def _on_stop(_, __):
