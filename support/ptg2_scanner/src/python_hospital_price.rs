@@ -92,33 +92,45 @@ fn hospital_price_decode_selector_page<'py>(
         ));
     }
     let payload = payload.as_bytes().to_vec();
-    let (page_index, page_count, ref_count, first_ref, refs, truncated) = py
+    let (
+        page_index,
+        page_count,
+        row_count,
+        page_ref_count,
+        found,
+        ref_count,
+        first_ref,
+        refs,
+        truncated,
+    ) = py
         .detach(move || {
             let page = decode_selector_page(&payload)?;
-            if page.row_count() != 1 {
-                return Err("hospital price selector page must contain one key".to_owned());
-            }
-            let page_refs = page
-                .exact_refs(&key)
-                .ok_or_else(|| "hospital price selector key is absent".to_owned())?;
-            let mut selected = Vec::with_capacity(max_refs.min(page_refs.len()));
+            let page_refs = page.exact_refs(&key);
+            let mut selected = Vec::with_capacity(
+                page_refs.map_or(0, |references| max_refs.min(references.len())),
+            );
             let mut truncated = false;
-            'ranges: for (range_start, range_end) in ranges {
-                let start = page_refs.partition_point(|reference| *reference < range_start);
-                let end = page_refs.partition_point(|reference| *reference < range_end);
-                for reference in &page_refs[start..end] {
-                    if selected.len() == max_refs {
-                        truncated = true;
-                        break 'ranges;
+            if let Some(page_refs) = page_refs {
+                'ranges: for (range_start, range_end) in ranges {
+                    let start = page_refs.partition_point(|reference| *reference < range_start);
+                    let end = page_refs.partition_point(|reference| *reference < range_end);
+                    for reference in &page_refs[start..end] {
+                        if selected.len() == max_refs {
+                            truncated = true;
+                            break 'ranges;
+                        }
+                        selected.push(*reference);
                     }
-                    selected.push(*reference);
                 }
             }
             Ok::<_, String>((
                 page.page_index,
                 page.page_count,
-                page_refs.len(),
-                page_refs.first().copied(),
+                page.row_count(),
+                page.ref_count(),
+                page_refs.is_some(),
+                page_refs.map_or(0, |references| references.len()),
+                page_refs.and_then(|references| references.first().copied()),
                 selected,
                 truncated,
             ))
@@ -130,6 +142,9 @@ fn hospital_price_decode_selector_page<'py>(
         &[
             ("page_index", hospital_price_py_value(py, page_index)),
             ("page_count", hospital_price_py_value(py, page_count)),
+            ("row_count", hospital_price_py_value(py, row_count)),
+            ("page_ref_count", hospital_price_py_value(py, page_ref_count)),
+            ("found", hospital_price_py_value(py, found)),
             ("ref_count", hospital_price_py_value(py, ref_count)),
             ("first_ref", hospital_price_py_value(py, first_ref)),
             ("refs", refs.into_any()),

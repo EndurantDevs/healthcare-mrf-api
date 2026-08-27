@@ -72,6 +72,35 @@ fn python_hospital_price_selector_is_canonical_and_bounded() {
                 .unwrap(),
             3,
         );
+        assert_eq!(
+            selector_page
+                .get_item("row_count")
+                .unwrap()
+                .extract::<usize>()
+                .unwrap(),
+            1,
+        );
+        assert_eq!(
+            selector_page
+                .get_item("page_ref_count")
+                .unwrap()
+                .extract::<usize>()
+                .unwrap(),
+            3,
+        );
+        assert!(selector_page
+            .get_item("found")
+            .unwrap()
+            .extract::<bool>()
+            .unwrap());
+        assert_eq!(
+            selector_page
+                .get_item("first_ref")
+                .unwrap()
+                .extract::<Option<u64>>()
+                .unwrap(),
+            Some(1),
+        );
         for (ranges, max_refs) in [
             (vec![], 2_usize),
             (vec![(0, 1)], 0),
@@ -125,16 +154,6 @@ fn python_hospital_price_selector_is_canonical_and_bounded() {
             .is_err());
         assert!(decode_selector
             .call1((
-                PyBytes::new(py, &selector_payload),
-                "code",
-                "CPT",
-                "absent",
-                vec![(0_u64, 6_u64)],
-                2_usize,
-            ))
-            .is_err());
-        assert!(decode_selector
-            .call1((
                 PyBytes::new(py, b"invalid"),
                 "code",
                 "CPT",
@@ -163,7 +182,7 @@ fn python_hospital_price_selector_is_canonical_and_bounded() {
                 ],
             )
             .unwrap();
-        assert!(decode_selector
+        let multiple_key_page = decode_selector
             .call1((
                 PyBytes::new(py, &multiple_key_payload),
                 "code",
@@ -172,7 +191,74 @@ fn python_hospital_price_selector_is_canonical_and_bounded() {
                 vec![(0_u64, 3_u64)],
                 3_usize,
             ))
-            .is_err());
+            .unwrap();
+        assert_eq!(
+            multiple_key_page
+                .get_item("refs")
+                .unwrap()
+                .extract::<Vec<u64>>()
+                .unwrap(),
+            vec![1],
+        );
+        assert_eq!(
+            multiple_key_page
+                .get_item("row_count")
+                .unwrap()
+                .extract::<usize>()
+                .unwrap(),
+            2,
+        );
+        assert_eq!(
+            multiple_key_page
+                .get_item("page_ref_count")
+                .unwrap()
+                .extract::<usize>()
+                .unwrap(),
+            2,
+        );
+        assert!(multiple_key_page
+            .get_item("found")
+            .unwrap()
+            .extract::<bool>()
+            .unwrap());
+
+        let missing_key_page = decode_selector
+            .call1((
+                PyBytes::new(py, &multiple_key_payload),
+                "code",
+                "CPT",
+                "absent",
+                vec![(0_u64, 3_u64)],
+                3_usize,
+            ))
+            .unwrap();
+        assert!(!missing_key_page
+            .get_item("found")
+            .unwrap()
+            .extract::<bool>()
+            .unwrap());
+        assert_eq!(
+            missing_key_page
+                .get_item("ref_count")
+                .unwrap()
+                .extract::<usize>()
+                .unwrap(),
+            0,
+        );
+        assert_eq!(
+            missing_key_page
+                .get_item("first_ref")
+                .unwrap()
+                .extract::<Option<u64>>()
+                .unwrap(),
+            None,
+        );
+        assert!(missing_key_page
+            .get_item("refs")
+            .unwrap()
+            .extract::<Vec<u64>>()
+            .unwrap()
+            .is_empty());
     });
 }
 

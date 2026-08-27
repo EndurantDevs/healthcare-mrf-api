@@ -25,17 +25,23 @@ class _StorageConnection:
 
     async def fetchrow(self, query, *_args):
         if "content.byte_count" in query:
+            assert "root.format_version" in query
+            assert "root.code_selector_block_count" in query
+            assert "root.payer_plan_selector_block_count" in query
             return {
                 "version_id": VERSION_ID,
                 "content_sha256": SOURCE_SHA256,
                 "byte_count": 1_000,
+                "format_version": 2,
                 "service_count": 1,
                 "charge_count": 2,
                 "fact_count": 3,
                 "service_block_count": 2,
                 "fact_block_count": 1,
-                "code_selector_page_count": 1,
-                "payer_plan_selector_page_count": 1,
+                "code_selector_page_count": 4,
+                "payer_plan_selector_page_count": 3,
+                "code_selector_block_count": 1,
+                "payer_plan_selector_block_count": 1,
             }
         return {
             "database_name": "healthporta",
@@ -281,6 +287,33 @@ async def test_storage_receipt_binds_database_blocks_and_physical_growth(monkeyp
     assert receipt["physical_growth_bytes"] == 190
     assert receipt["physical_storage_ratio_to_unique_source"] == 0.19
     assert receipt["packed_payload_ratio_to_source"] == 0.18
+    assert receipt["format_version"] == 2
+    assert receipt["code_selector_page_count"] == 4
+    assert receipt["payer_plan_selector_page_count"] == 3
+    assert receipt["code_selector_block_count"] == 1
+    assert receipt["payer_plan_selector_block_count"] == 1
+
+
+def test_storage_counts_use_physical_selector_rows():
+    counts_by_field = {
+        "service_block_count": 2,
+        "fact_block_count": 1,
+        "code_selector_block_count": 1,
+        "payer_plan_selector_block_count": 1,
+        "code_selector_page_count": 1,
+        "payer_plan_selector_page_count": 1,
+    }
+    assert storage_canary._expected_block_counts(
+        {**counts_by_field, "format_version": 1}
+    ) == {1: 2, 2: 1, 3: 1, 4: 1}
+    assert storage_canary._expected_block_counts(
+        {
+            **counts_by_field,
+            "format_version": 2,
+            "code_selector_page_count": 4,
+            "payer_plan_selector_page_count": 3,
+        }
+    ) == {1: 2, 2: 1, 3: 1, 4: 1}
 
 
 def test_storage_receipt_rejects_incomplete_or_unbound_evidence():
@@ -288,10 +321,10 @@ def test_storage_receipt_rejects_incomplete_or_unbound_evidence():
         "version_id": VERSION_ID,
         "content_sha256": SOURCE_SHA256,
         "byte_count": 1_000,
-        "service_block_count": 2,
-        "fact_block_count": 1,
-        "code_selector_page_count": 1,
-        "payer_plan_selector_page_count": 1,
+        "format_version": 2,
+        "service_block_count": 2, "fact_block_count": 1,
+        "code_selector_page_count": 4, "payer_plan_selector_page_count": 3,
+        "code_selector_block_count": 1, "payer_plan_selector_block_count": 1,
     }
     blocks = [
         {"block_kind": 1, "block_count": 2, "payload_bytes": 100},
@@ -310,17 +343,18 @@ def test_storage_receipt_rejects_incomplete_or_unbound_evidence():
         "active_runs": 0,
         "active_attempts": 0,
     }
+    baseline_by_field = _baseline_receipt()
 
     cases = [
-        (None, blocks, physical_by_field, _baseline_receipt(), "unavailable"),
+        (None, blocks, physical_by_field, baseline_by_field, "unavailable"),
         ({**version_by_field, "byte_count": 0}, blocks, physical_by_field,
-         _baseline_receipt(), "byte counts"),
-        (version_by_field, blocks, None, _baseline_receipt(), "physical"),
-        (version_by_field, blocks[:-1], physical_by_field,
-         _baseline_receipt(), "block counts"),
+         baseline_by_field, "byte counts"),
+        (version_by_field, blocks, None, baseline_by_field, "physical"),
+        (version_by_field, blocks[:-1], physical_by_field, baseline_by_field,
+         "block counts"),
         (
             version_by_field, blocks, {**physical_by_field, "active_runs": 1},
-            _baseline_receipt(), "quiescent",
+            baseline_by_field, "quiescent",
         ),
         (
             version_by_field, blocks, physical_by_field,
@@ -329,7 +363,7 @@ def test_storage_receipt_rejects_incomplete_or_unbound_evidence():
         (
             version_by_field, blocks,
             {**physical_by_field, "hospital_relation_bytes": 1_000},
-            _baseline_receipt(), "attributable",
+            baseline_by_field, "attributable",
         ),
     ]
     for version_case, blocks_case, physical_case, baseline_case, message in cases:
@@ -339,8 +373,7 @@ def test_storage_receipt_rejects_incomplete_or_unbound_evidence():
                 blocks_case,
                 physical_case,
                 baseline_case,
-                "mrf",
-                21_600.0,
+                "mrf", 21_600.0,
             )
 
 

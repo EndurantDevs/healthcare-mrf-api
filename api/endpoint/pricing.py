@@ -4207,16 +4207,12 @@ async def _load_quality_peer_targets(
         return []
 
 
-def _build_live_mode_payload_for_candidate(
-    *,
-    benchmark_mode: str,
-    observed_data: dict[str, Any],
+def _live_candidate_context(
+    selected_candidate: dict[str, Any] | None,
     specialty_key: str | None,
     taxonomy_code: str | None,
     procedure_match_threshold: float,
-    selected_candidate: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Build a live quality-score payload from observed measures and a selected peer target."""
     target_values_by_name: dict[str, float | None] = {
         "target_appropriateness": None,
         "target_rx_appropriateness": None,
@@ -4242,6 +4238,26 @@ def _build_live_mode_payload_for_candidate(
         selected_peer_count = _as_int(selected_candidate.get("peer_count"))
         selected_geography = selected_candidate.get("selected_geography")
         selected_cohort_level = selected_candidate.get("cohort_level")
+    return {
+        "target_values_by_name": target_values_by_name,
+        "cohort_context": {
+            "selected_geography": selected_geography,
+            "selected_cohort_level": selected_cohort_level,
+            "peer_count": selected_peer_count,
+            "specialty_key": selected_specialty_key,
+            "taxonomy_code": selected_taxonomy_code,
+            "procedure_bucket": selected_procedure_bucket,
+            "computed_live": True,
+            "procedure_match_threshold": procedure_match_threshold,
+        },
+    }
+
+
+def _live_measures_by_domain(
+    observed_data: dict[str, Any],
+    target_values_by_name: dict[str, float | None],
+) -> dict[str, list[dict[str, Any]]]:
+    """Build the live measures grouped by score domain."""
 
     evidence_n_claims = max(
         _as_float(observed_data.get("total_services")) or 0.0,
@@ -4253,8 +4269,7 @@ def _build_live_mode_payload_for_candidate(
         _as_float(observed_data.get("total_rx_beneficiaries")) or 0.0,
         1.0,
     )
-
-    measures_by_domain = {
+    return {
         "appropriateness": [
             _compute_live_measure(
                 observed=_as_float(observed_data.get("utilization_adjusted")),
@@ -4293,53 +4308,57 @@ def _build_live_mode_payload_for_candidate(
         ],
     }
 
-    domains_payload = _empty_domain_payloads_by_name()
-    for domain, measures in measures_by_domain.items():
-        domains_payload[domain] = _aggregate_domain(measures)
 
-    rr_appropr = _as_float(domains_payload["appropriateness"]["risk_ratio_point"]) or 1.0
-    rr_effect = _as_float(domains_payload["effectiveness"]["risk_ratio_point"]) or 1.0
-    rr_cost = _as_float(domains_payload["cost"]["risk_ratio_point"]) or 1.0
-
-    ci75_appropr_low = _as_float(domains_payload["appropriateness"]["ci_75"]["low"]) or 1.0
-    ci75_effect_low = _as_float(domains_payload["effectiveness"]["ci_75"]["low"]) or 1.0
-    ci75_cost_low = _as_float(domains_payload["cost"]["ci_75"]["low"]) or 1.0
-    ci75_appropr_high = _as_float(domains_payload["appropriateness"]["ci_75"]["high"]) or 1.0
-    ci75_effect_high = _as_float(domains_payload["effectiveness"]["ci_75"]["high"]) or 1.0
-    ci75_cost_high = _as_float(domains_payload["cost"]["ci_75"]["high"]) or 1.0
-    ci90_appropr_low = _as_float(domains_payload["appropriateness"]["ci_90"]["low"]) or 1.0
-    ci90_effect_low = _as_float(domains_payload["effectiveness"]["ci_90"]["low"]) or 1.0
-    ci90_cost_low = _as_float(domains_payload["cost"]["ci_90"]["low"]) or 1.0
-    ci90_appropr_high = _as_float(domains_payload["appropriateness"]["ci_90"]["high"]) or 1.0
-    ci90_effect_high = _as_float(domains_payload["effectiveness"]["ci_90"]["high"]) or 1.0
-    ci90_cost_high = _as_float(domains_payload["cost"]["ci_90"]["high"]) or 1.0
-
-    rr_clinical = math.sqrt(max(rr_appropr, 0.0001) * max(rr_effect, 0.0001))
-    rr_overall = math.exp(
-        0.5 * math.log(max(rr_clinical, 0.0001))
-        + 0.5 * math.log(max(rr_cost, 0.0001))
+def _combined_live_ratio(
+    appropriateness: float,
+    effectiveness: float,
+    cost: float,
+) -> float:
+    clinical = math.sqrt(
+        max(appropriateness, 0.0001) * max(effectiveness, 0.0001)
     )
-    ci75_low = math.exp(
-        0.5 * math.log(max(math.sqrt(max(ci75_appropr_low, 0.0001) * max(ci75_effect_low, 0.0001)), 0.0001))
-        + 0.5 * math.log(max(ci75_cost_low, 0.0001))
-    )
-    ci75_high = math.exp(
-        0.5 * math.log(max(math.sqrt(max(ci75_appropr_high, 0.0001) * max(ci75_effect_high, 0.0001)), 0.0001))
-        + 0.5 * math.log(max(ci75_cost_high, 0.0001))
-    )
-    ci90_low = math.exp(
-        0.5 * math.log(max(math.sqrt(max(ci90_appropr_low, 0.0001) * max(ci90_effect_low, 0.0001)), 0.0001))
-        + 0.5 * math.log(max(ci90_cost_low, 0.0001))
-    )
-    ci90_high = math.exp(
-        0.5 * math.log(max(math.sqrt(max(ci90_appropr_high, 0.0001) * max(ci90_effect_high, 0.0001)), 0.0001))
-        + 0.5 * math.log(max(ci90_cost_high, 0.0001))
+    return math.exp(
+        0.5 * math.log(max(clinical, 0.0001))
+        + 0.5 * math.log(max(cost, 0.0001))
     )
 
+
+def _live_domain_ratio(
+    domains_payload: dict[str, Any],
+    domain: str,
+    *keys: str,
+) -> float:
+    ratio_value: Any = domains_payload[domain]
+    for key in keys:
+        ratio_value = ratio_value[key]
+    return _as_float(ratio_value) or 1.0
+
+
+def _live_overall_ratios(domains_payload: dict[str, Any]) -> dict[str, float]:
+    """Combine the three score domains into overall point and interval ratios."""
+
+    def _combined(*keys: str) -> float:
+        return _combined_live_ratio(
+            _live_domain_ratio(domains_payload, "appropriateness", *keys),
+            _live_domain_ratio(domains_payload, "effectiveness", *keys),
+            _live_domain_ratio(domains_payload, "cost", *keys),
+        )
+
+    return {
+        "risk_ratio_point": _combined("risk_ratio_point"),
+        "ci75_low": _combined("ci_75", "low"),
+        "ci75_high": _combined("ci_75", "high"),
+        "ci90_low": _combined("ci_90", "low"),
+        "ci90_high": _combined("ci_90", "high"),
+    }
+
+
+def _live_tier_evidence(overall_ratios: dict[str, float]) -> dict[str, Any]:
+    rr_overall = overall_ratios["risk_ratio_point"]
     is_low_score = rr_overall >= 1.12
-    is_low_confidence = ci90_low >= 1.08
+    is_low_confidence = overall_ratios["ci90_low"] >= 1.08
     is_high_score = rr_overall <= 0.88
-    is_high_confidence = ci75_high < 1.0
+    is_high_confidence = overall_ratios["ci75_high"] < 1.0
     if is_low_score and is_low_confidence:
         tier = "low"
     elif is_high_score and is_high_confidence:
@@ -4347,6 +4366,38 @@ def _build_live_mode_payload_for_candidate(
     else:
         tier = "acceptable"
     is_borderline = (int(is_low_score) + int(is_low_confidence)) == 1
+    return {
+        "tier": tier,
+        "borderline_status": is_borderline,
+        "low_score_threshold_failed": is_low_score,
+        "low_confidence_threshold_failed": is_low_confidence,
+        "high_score_threshold_passed": is_high_score,
+        "high_confidence_threshold_passed": is_high_confidence,
+    }
+
+
+def _live_score_method(has_claims: bool, has_qpp: bool, has_rx: bool) -> str:
+    if has_claims and has_qpp:
+        return "direct"
+    if has_claims or has_qpp or has_rx:
+        return "mixed"
+    return "unavailable"
+
+
+def _live_confidence_band(confidence_0_100: float) -> str:
+    if confidence_0_100 >= 80.0:
+        return "high"
+    if confidence_0_100 >= 55.0:
+        return "medium"
+    if confidence_0_100 > 0.0:
+        return "low"
+    return "none"
+
+
+def _live_evidence_confidence(
+    observed_data: dict[str, Any],
+    cohort_context: dict[str, Any],
+) -> dict[str, Any]:
     has_claims = (
         (_as_float(observed_data.get("total_services")) or 0.0) > 0
         or (_as_float(observed_data.get("total_beneficiaries")) or 0.0) > 0
@@ -4356,6 +4407,7 @@ def _build_live_mode_payload_for_candidate(
         or _as_float(observed_data.get("qpp_cost_score")) is not None
     )
     has_rx = (_as_float(observed_data.get("total_rx_claims")) or 0.0) > 0
+    selected_peer_count = _as_int(cohort_context.get("peer_count"))
     data_coverage_0_100 = min(
         100.0,
         (
@@ -4377,64 +4429,96 @@ def _build_live_mode_payload_for_candidate(
             + (5.0 if observed_data.get("state_key") else 0.0)
         ),
     )
-    if has_claims and has_qpp:
-        score_method = "direct"
-    elif has_claims or has_qpp or has_rx:
-        score_method = "mixed"
-    else:
-        score_method = "unavailable"
-    if confidence_0_100 >= 80.0:
-        confidence_band = "high"
-    elif confidence_0_100 >= 55.0:
-        confidence_band = "medium"
-    elif confidence_0_100 > 0.0:
-        confidence_band = "low"
-    else:
-        confidence_band = "none"
-
-    quality_score_by_field = {
-        "model_version": PROVIDER_QUALITY_MODEL_VERSION,
-        "benchmark_mode": benchmark_mode,
-        "tier": tier,
-        "borderline_status": is_borderline,
-        "score_0_100": _score_from_risk_ratio(rr_overall),
-        "estimated_cost_level": _estimated_cost_level_from_risk_ratio(rr_cost),
-        "risk_ratio_point": rr_overall,
-        "ci75_low": ci75_low,
-        "ci75_high": ci75_high,
-        "ci90_low": ci90_low,
-        "ci90_high": ci90_high,
-        "low_score_threshold_failed": is_low_score,
-        "low_confidence_threshold_failed": is_low_confidence,
-        "high_score_threshold_passed": is_high_score,
-        "high_confidence_threshold_passed": is_high_confidence,
-        "score_method": score_method,
+    return {
+        "score_method": _live_score_method(has_claims, has_qpp, has_rx),
         "cost_source": "direct" if has_claims else "peer_estimated",
         "confidence_0_100": confidence_0_100,
-        "confidence_band": confidence_band,
+        "confidence_band": _live_confidence_band(confidence_0_100),
         "data_coverage_0_100": data_coverage_0_100,
-        "provider_class": observed_data.get("provider_class"),
-        "location_source": observed_data.get("location_source"),
         "has_claims": has_claims,
         "has_qpp": has_qpp,
         "has_rx": has_rx,
+    }
+
+
+def _live_score_payload(
+    benchmark_mode: str,
+    observed_data: dict[str, Any],
+    domains_payload: dict[str, Any],
+    overall_ratios: dict[str, float],
+    cohort_context: dict[str, Any],
+    evidence_by_field: dict[str, Any],
+) -> dict[str, Any]:
+    quality_score_by_field = {
+        "model_version": PROVIDER_QUALITY_MODEL_VERSION,
+        "benchmark_mode": benchmark_mode,
+        "tier": evidence_by_field["tier"],
+        "borderline_status": evidence_by_field["borderline_status"],
+        "score_0_100": _score_from_risk_ratio(overall_ratios["risk_ratio_point"]),
+        "estimated_cost_level": _estimated_cost_level_from_risk_ratio(
+            _live_domain_ratio(domains_payload, "cost", "risk_ratio_point")
+        ),
+        **overall_ratios,
+        "low_score_threshold_failed": evidence_by_field["low_score_threshold_failed"],
+        "low_confidence_threshold_failed": evidence_by_field["low_confidence_threshold_failed"],
+        "high_score_threshold_passed": evidence_by_field["high_score_threshold_passed"],
+        "high_confidence_threshold_passed": evidence_by_field["high_confidence_threshold_passed"],
+        "score_method": evidence_by_field["score_method"],
+        "cost_source": evidence_by_field["cost_source"],
+        "confidence_0_100": evidence_by_field["confidence_0_100"],
+        "confidence_band": evidence_by_field["confidence_band"],
+        "data_coverage_0_100": evidence_by_field["data_coverage_0_100"],
+        "provider_class": observed_data.get("provider_class"),
+        "location_source": observed_data.get("location_source"),
+        "has_claims": evidence_by_field["has_claims"],
+        "has_qpp": evidence_by_field["has_qpp"],
+        "has_rx": evidence_by_field["has_rx"],
         "has_enrollment": observed_data.get("has_enrollment"),
         "has_medicare_claims": observed_data.get("has_medicare_claims"),
-    }
-    cohort_context_by_field = {
-        "selected_geography": selected_geography,
-        "selected_cohort_level": selected_cohort_level,
-        "peer_count": selected_peer_count,
-        "specialty_key": selected_specialty_key,
-        "taxonomy_code": selected_taxonomy_code,
-        "procedure_bucket": selected_procedure_bucket,
-        "computed_live": True,
-        "procedure_match_threshold": procedure_match_threshold,
     }
     return _build_quality_mode_payload(
         quality_score_by_field,
         domains_payload,
-        cohort_context=cohort_context_by_field,
+        cohort_context=cohort_context,
+    )
+
+
+def _build_live_mode_payload_for_candidate(
+    *,
+    benchmark_mode: str,
+    observed_data: dict[str, Any],
+    specialty_key: str | None,
+    taxonomy_code: str | None,
+    procedure_match_threshold: float,
+    selected_candidate: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build a live quality-score payload from observed measures and a selected peer target."""
+    candidate_context = _live_candidate_context(
+        selected_candidate,
+        specialty_key,
+        taxonomy_code,
+        procedure_match_threshold,
+    )
+    measures_by_domain = _live_measures_by_domain(
+        observed_data,
+        candidate_context["target_values_by_name"],
+    )
+    domains_payload = _empty_domain_payloads_by_name()
+    for domain, measures in measures_by_domain.items():
+        domains_payload[domain] = _aggregate_domain(measures)
+    overall_ratios = _live_overall_ratios(domains_payload)
+    cohort_context = candidate_context["cohort_context"]
+    evidence_by_field = {
+        **_live_tier_evidence(overall_ratios),
+        **_live_evidence_confidence(observed_data, cohort_context),
+    }
+    return _live_score_payload(
+        benchmark_mode,
+        observed_data,
+        domains_payload,
+        overall_ratios,
+        cohort_context,
+        evidence_by_field,
     )
 
 

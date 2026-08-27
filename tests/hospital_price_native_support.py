@@ -29,8 +29,8 @@ def _packed_root_dict(fact_count: int) -> dict[str, int]:
         "payer_plan_selector_page_count": payer_page_count,
         "service_block_count": 1,
         "fact_block_count": 1 if fact_count else 0,
-        "code_selector_block_count": 2,
-        "payer_plan_selector_block_count": payer_page_count,
+        "code_selector_block_count": 1,
+        "payer_plan_selector_block_count": 1 if fact_count else 0,
         "selector_spool_bytes": 13 * (code_ref_count + fact_count),
         "peak_scratch_bytes": 39 * (code_ref_count + fact_count),
     }
@@ -48,8 +48,8 @@ def _row_counts_by_kind(packed_root_dict: dict[str, int]) -> dict[str, int]:
         "service_block": packed_root_dict["service_block_count"],
         "fact_block": packed_root_dict["fact_block_count"],
         "selector_page": (
-            packed_root_dict["code_selector_page_count"]
-            + packed_root_dict["payer_plan_selector_page_count"]
+            packed_root_dict["code_selector_block_count"]
+            + packed_root_dict["payer_plan_selector_block_count"]
         ),
     }
 
@@ -90,7 +90,7 @@ def packed_summary(
             "sha256": hashlib.sha256(copy_bytes).hexdigest(),
         })
     return {
-        "contract": "hospital-mrf-copy-v3-packed-v1",
+        "contract": native_module.HOSPITAL_MRF_SUMMARY_CONTRACT,
         "version_id": "a" * 64,
         "schema_version": "3.0.0",
         "schema_revision": native_module.HOSPITAL_MRF_SCHEMA_REVISION,

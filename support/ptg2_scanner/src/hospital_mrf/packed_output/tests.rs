@@ -298,7 +298,7 @@ mod packed_output_tests {
                 root.code_selector_block_count,
                 root.payer_plan_selector_block_count,
             ),
-            (1, 1, 2, 1)
+            (1, 1, 1, 1)
         );
         assert_eq!(
             (root.selector_spool_bytes, root.peak_scratch_bytes),
@@ -343,16 +343,9 @@ mod packed_output_tests {
         assert_eq!(facts[1].comparison_amount.as_deref(), Some("180.00"));
 
         let selector_rows = copy_rows(&first.path().join("selector_page.copy"));
-        assert_eq!(selector_rows.len(), 3);
+        assert_eq!(selector_rows.len(), 2);
         assert!(selector_rows.iter().all(|row| row[9].is_some()));
-        assert!(selector_rows
-            .iter()
-            .filter(|row| field_i16(row, 1) == HOSPITAL_PRICE_CODE_SELECTOR_BLOCK_KIND)
-            .all(|row| row[10].is_none()));
-        assert!(selector_rows
-            .iter()
-            .filter(|row| field_i16(row, 1) == HOSPITAL_PRICE_PAYER_PLAN_SELECTOR_BLOCK_KIND)
-            .all(|row| row[10].is_some()));
+        assert!(selector_rows.iter().all(|row| row[10].is_some()));
         let selectors = payloads(&first.path().join("selector_page.copy"))
             .into_iter()
             .map(|payload| {
@@ -366,8 +359,12 @@ mod packed_output_tests {
                     == crate::hospital_price_selector_block::HospitalPriceSelectorKind::CodeToCharge
             })
             .collect::<Vec<_>>();
-        assert_eq!(code_pages.len(), 2);
-        assert!(code_pages.iter().all(|page| page.entries[0].refs == [0, 1]));
+        assert_eq!(code_pages.len(), 1);
+        assert_eq!(code_pages[0].entries.len(), 2);
+        assert!(code_pages[0]
+            .entries
+            .iter()
+            .all(|entry| entry.refs == [0, 1]));
         let payer_page = selectors
             .iter()
             .find(|page| {
@@ -490,6 +487,7 @@ mod packed_output_tests {
     }
 
     include!("tests_middle.rs");
+    include!("tests_selector_limits.rs");
 
     include!("tests_tail.rs");
     include!("tests_io.rs");

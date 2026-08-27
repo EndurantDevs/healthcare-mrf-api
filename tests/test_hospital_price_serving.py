@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 from types import SimpleNamespace
 import uuid
@@ -18,11 +19,15 @@ from api.hospital_price_serving_sql import PAYER_SELECTOR_SQL
 from api.hospital_price_serving_sql import SERVICE_BLOCK_SQL
 from api.hospital_price_serving_sql import VERSION_SQL
 from support.hospital_price_native_validation import (
+    HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
 )
 
 
 VERSION_ID = "a" * 64
+LEGACY_PAYER_PARENT_SHA256 = hashlib.sha256(
+    b"payer\0" + len(b"Payer").to_bytes(8, "little") + b"Payer"
+).digest()
 
 
 class _Result:
@@ -56,7 +61,7 @@ def _version(version_id=VERSION_ID, **overrides):
         "current_service_count": 3,
         "current_charge_count": 3,
         "current_fact_count": 3,
-        "format_version": 1,
+        "format_version": 2,
         "service_count": 3,
         "charge_count": 3,
         "fact_count": 3,
@@ -130,6 +135,9 @@ class _Native:
         return {
             "page_index": 0,
             "page_count": 1,
+            "row_count": 1,
+            "page_ref_count": len(refs),
+            "found": True,
             "ref_count": len(refs),
             "first_ref": refs[0],
             "refs": selected_refs[:max_refs],
@@ -145,10 +153,52 @@ class _Native:
         return deepcopy(self.fact_rows)
 
 
+@pytest.mark.asyncio
+async def test_v2_selector_page_allows_absent_key_inside_digest_range(monkeypatch):
+    async def absent_key(*_args):
+        return {
+            "page_index": 0,
+            "page_count": 1,
+            "row_count": 2,
+            "page_ref_count": 2,
+            "found": False,
+            "ref_count": 0,
+            "first_ref": None,
+            "refs": [],
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(serving, "_native_call", absent_key)
+    selector_record_by_field = {
+        "format_version": 2,
+        "logical_first": 0,
+        "logical_count": 2,
+        "page_index": 0,
+        "page_count": 1,
+        "secondary_first": 0,
+        "secondary_count": 2,
+        "key_sha256": b"a" * 32,
+        "parent_sha256": b"z" * 32,
+        "payload": b"selector",
+    }
+
+    assert await serving._selector_refs(
+        (selector_record_by_field,), "code", "CPT", "missing", [(0, 2)], 2,
+        b"m" * 32,
+    ) == ([], False, [0], 1)
+
+
 class _Session:
-    def __init__(self, native=None):
+    def __init__(self, native=None, format_version=2):
         self.native = native or _Native()
-        self.version = _version()
+        self.version = _version(
+            format_version=format_version,
+            parser_contract_sha256=(
+                HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256
+                if format_version == 1
+                else HOSPITAL_MRF_PARSER_CONTRACT_SHA256
+            ),
+        )
         self.statements = []
 
     def begin(self):
@@ -165,8 +215,14 @@ class _Session:
             return _Result(
                 [{
                     "block_ordinal": 0, "logical_first": 0,
+                    "logical_count": 1,
                     "secondary_first": 0, "secondary_count": 3,
                     "page_index": 0, "page_count": 1, "payload": b"code",
+                    "key_sha256": b"s" * 32,
+                    "parent_sha256": (
+                        None if self.version["format_version"] == 1 else b"s" * 32
+                    ),
+                    "format_version": self.version["format_version"],
                 }]
             )
         if statement is SERVICE_BLOCK_SQL:
@@ -181,9 +237,17 @@ class _Session:
             return _Result(
                 [{
                     "block_ordinal": 2, "logical_first": 1,
+                    "logical_count": 1,
                     "secondary_first": self.native.payer_refs[0],
                     "secondary_count": len(self.native.payer_refs),
                     "page_index": 0, "page_count": 1, "payload": b"payer",
+                    "key_sha256": b"s" * 32,
+                    "parent_sha256": (
+                        LEGACY_PAYER_PARENT_SHA256
+                        if self.version["format_version"] == 1
+                        else b"s" * 32
+                    ),
+                    "format_version": self.version["format_version"],
                     "range_indexes": [0], "key_page_count": 1,
                 }]
             )
@@ -240,6 +304,28 @@ async def test_populated_payer_page_is_charge_bounded_and_version_bound(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_v1_selectors_preserve_legacy_layout_and_pagination(monkeypatch):
+    session = _Session(format_version=1)
+    monkeypatch.setattr(serving, "_NATIVE", session.native)
+
+    page = await serving.read_hospital_price_page(session, _query())
+    next_page = await serving.read_hospital_price_page(
+        session,
+        _query(cursor=page["pagination"]["next_cursor"]),
+    )
+
+    assert page["pagination"]["scanned"] == 2
+    assert page["pagination"]["next_cursor"]
+    assert [item["charge"]["charge_ordinal"] for item in page["items"]] == [10]
+    assert next_page["pagination"] == {
+        "unit": "charges", "limit": 2, "scanned": 1, "next_cursor": None,
+    }
+    assert [item["charge"]["charge_ordinal"] for item in next_page["items"]] == [12]
+    assert sum(statement is CODE_SELECTOR_SQL for statement, _ in session.statements) == 2
+    assert sum(statement is PAYER_SELECTOR_SQL for statement, _ in session.statements) == 2
+
+
+@pytest.mark.asyncio
 async def test_unfiltered_page_reads_no_fact_blocks(monkeypatch):
     session = _Session()
     monkeypatch.setattr(serving, "_NATIVE", session.native)
@@ -291,6 +377,13 @@ async def test_version_contract_and_cursor_generation_fail_closed(monkeypatch):
     session.version = _version(version_id="invalid")
     with pytest.raises(serving.HospitalPriceServingUnavailableError):
         await serving.read_hospital_price_page(session, _query())
+
+    assert serving._validated_version((
+        _version(
+            format_version=1,
+            parser_contract_sha256=HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256,
+        ),
+    ))["format_version"] == 1
 
 
 @pytest.mark.asyncio

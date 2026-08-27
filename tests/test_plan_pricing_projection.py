@@ -489,7 +489,7 @@ async def test_binding_projection_groups_numeric_cpt_hcpcs_but_keeps_g_code(
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260827120000_hospital_price_source_format"
+        "20260827160000_hospital_price_selector_page_packing"
     ]
     assert script.get_revision(
         "20260825150000_plan_pricing_card_projection"

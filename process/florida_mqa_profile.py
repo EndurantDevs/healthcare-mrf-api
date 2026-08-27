@@ -2355,7 +2355,7 @@ def _profile_data_facts(
     ]
 
 
-def _profile_master_facts(
+def _profile_master_identity_demographics_facts(
     profile_source: FloridaSource,
     source_row: Mapping[str, str],
     *,
@@ -2364,7 +2364,7 @@ def _profile_master_facts(
     npi: int | None,
     artifact: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    """Build reviewed identity and biography facts from a profile master row."""
+    """Build identity and demographic facts from one profile master row."""
     facts: list[dict[str, Any]] = []
     given_items = [
         field_value
@@ -2410,6 +2410,19 @@ def _profile_master_facts(
                 infer_effective_period=False,
             )
         )
+    return facts
+
+
+def _profile_master_state_license_facts(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
+    *,
+    run_id: str,
+    record_id: str,
+    npi: int | None,
+    artifact: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Build the Florida license fact from one profile master row."""
     rank_effective_date, _ = _normalize_source_date(source_row.get("rank_efct_dte", ""))
     original_issue_date, _ = _normalize_source_date(source_row.get("orig_dte", ""))
     expiration_date, _ = _normalize_source_date(source_row.get("expr_dte", ""))
@@ -2438,7 +2451,7 @@ def _profile_master_facts(
         )
         if field_value
     )
-    facts.append(
+    return [
         _fact_payload(
             profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
             artifact=artifact, category="licenses", fact_type="state_license",
@@ -2453,7 +2466,20 @@ def _profile_master_facts(
             assertion_type="state_reported",
             verification_status="government_source",
         )
-    )
+    ]
+
+
+def _profile_master_other_license_facts(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
+    *,
+    run_id: str,
+    record_id: str,
+    npi: int | None,
+    artifact: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Build the other-state-license indicator from one profile master row."""
+    facts: list[dict[str, Any]] = []
     other_license = source_row.get("other_license", "").upper()
     if other_license:
         other_license_labels_by_key = {
@@ -2478,6 +2504,20 @@ def _profile_master_facts(
                 infer_effective_period=False,
             )
         )
+    return facts
+
+
+def _profile_master_practice_nica_facts(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
+    *,
+    run_id: str,
+    record_id: str,
+    npi: int | None,
+    artifact: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Build practice-start and NICA facts from one profile master row."""
+    facts: list[dict[str, Any]] = []
     practice_start = source_row.get("yr_began_practice", "")
     if practice_start:
         normalized_practice_start, precision = _normalize_source_date(practice_start)
@@ -2515,6 +2555,20 @@ def _profile_master_facts(
                 infer_effective_period=False,
             )
         )
+    return facts
+
+
+def _profile_master_address_facts(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
+    *,
+    run_id: str,
+    record_id: str,
+    npi: int | None,
+    artifact: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Build deduplicated address facts from one profile master row."""
+    facts: list[dict[str, Any]] = []
     addresses_by_key: dict[str, dict[str, Any]] = {}
     for prefix, location_type in (
         ("ml_", "mailing"),
@@ -2545,6 +2599,47 @@ def _profile_master_facts(
                 infer_effective_period=False,
             )
         )
+    return facts
+
+
+def _profile_master_facts(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
+    *,
+    run_id: str,
+    record_id: str,
+    npi: int | None,
+    artifact: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Build reviewed identity and biography facts from a profile master row."""
+    facts = _profile_master_identity_demographics_facts(
+        profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
+        artifact=artifact,
+    )
+    facts.extend(
+        _profile_master_state_license_facts(
+            profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
+            artifact=artifact,
+        )
+    )
+    facts.extend(
+        _profile_master_other_license_facts(
+            profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
+            artifact=artifact,
+        )
+    )
+    facts.extend(
+        _profile_master_practice_nica_facts(
+            profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
+            artifact=artifact,
+        )
+    )
+    facts.extend(
+        _profile_master_address_facts(
+            profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
+            artifact=artifact,
+        )
+    )
     return facts
 
 

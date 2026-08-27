@@ -1,3 +1,21 @@
+    fn queue_selector_test_chunk(
+        output: &mut PackedOutputBuilder,
+        ordinal: u32,
+        refs: &mut Vec<u64>,
+        page_counts: &[u32],
+        page_indexes: &mut [u32],
+    ) -> io::Result<()> {
+        let mut pack = SelectorPackState::default();
+        output.queue_selector_ref_chunk(
+            ordinal,
+            refs,
+            page_counts,
+            page_indexes,
+            &mut pack,
+        )?;
+        output.flush_selector_pack(&mut pack, page_indexes)
+    }
+
     #[test]
     fn validation_failures_are_explicit() {
         let mut row = service();
@@ -154,25 +172,17 @@
 
         let mut output = builder(directories[3].path());
         let mut refs = Vec::new();
-        output
-            .write_selector_ref_chunks(0, &mut refs, &[], &mut [])
-            .unwrap();
+        queue_selector_test_chunk(&mut output, 0, &mut refs, &[], &mut []).unwrap();
         refs.push(0);
-        assert!(output
-            .write_selector_ref_chunks(0, &mut refs, &[], &mut [])
-            .is_err());
+        assert!(queue_selector_test_chunk(&mut output, 0, &mut refs, &[], &mut []).is_err());
 
         let mut output = builder(directories[4].path());
         output
             .selector_key_ordinal(selector_code("12345"))
             .unwrap();
         let mut refs = vec![0];
-        assert!(output
-            .write_selector_ref_chunks(0, &mut refs, &[], &mut [0])
-            .is_err());
-        assert!(output
-            .write_selector_ref_chunks(0, &mut refs, &[1], &mut [])
-            .is_err());
+        assert!(queue_selector_test_chunk(&mut output, 0, &mut refs, &[], &mut [0]).is_err());
+        assert!(queue_selector_test_chunk(&mut output, 0, &mut refs, &[1], &mut []).is_err());
 
         let directory = tempfile::tempdir().unwrap();
         let mut output = builder(directory.path());
@@ -195,9 +205,14 @@
             .selector_key_ordinal(selector_code("12345"))
             .unwrap();
         fail_next_sink_write(&mut output.sinks[2]);
-        assert!(output
-            .write_selector_ref_chunks(0, &mut vec![0], &[1], &mut [0])
-            .is_err());
+        assert!(queue_selector_test_chunk(
+            &mut output,
+            0,
+            &mut vec![0],
+            &[1],
+            &mut [0],
+        )
+        .is_err());
 
         let directory = tempfile::tempdir().unwrap();
         let mut output = builder(directory.path());

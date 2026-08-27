@@ -45,19 +45,34 @@ VERSION_SQL = text(
       )"""
 )
 CODE_SELECTOR_SQL = text(
-    f"""WITH selected AS (
-      (SELECT block_ordinal, logical_first, secondary_first, secondary_count,
-              page_index, page_count, payload
-         FROM {_SCHEMA}.hospital_price_data_block
-        WHERE version_id=:version_id AND block_kind=3
-          AND key_sha256=:key_sha256 AND secondary_first<=:after_key
+    f"""WITH selector_format AS (
+      SELECT format_version FROM {_SCHEMA}.hospital_price_packed_root
+      WHERE version_id=:version_id
+    ), predecessor AS (
+      SELECT block.logical_first, block.parent_sha256, root.format_version
+      FROM {_SCHEMA}.hospital_price_data_block block
+      CROSS JOIN selector_format root
+      WHERE block.version_id=:version_id AND block.block_kind=3
+        AND ((root.format_version=1 AND block.key_sha256=:key_sha256)
+          OR (root.format_version=2 AND block.key_sha256<=:key_sha256))
+      ORDER BY block.key_sha256 DESC, block.logical_first LIMIT 1
+    ), key_owner AS (
+      SELECT logical_first FROM predecessor
+      WHERE format_version=1 OR parent_sha256>=:key_sha256
+    ), key_pages AS (
+      SELECT block.block_ordinal, block.logical_first, block.logical_count,
+             block.secondary_first, block.secondary_count, block.page_index,
+             block.page_count, block.key_sha256, block.parent_sha256,
+             block.payload, root.format_version
+      FROM {_SCHEMA}.hospital_price_data_block block
+      JOIN key_owner owner USING (logical_first)
+      CROSS JOIN selector_format root
+      WHERE block.version_id=:version_id AND block.block_kind=3
+    ), selected AS (
+      (SELECT * FROM key_pages WHERE secondary_first<=:after_key
         ORDER BY secondary_first DESC LIMIT 1)
       UNION ALL
-      (SELECT block_ordinal, logical_first, secondary_first, secondary_count,
-              page_index, page_count, payload
-         FROM {_SCHEMA}.hospital_price_data_block
-        WHERE version_id=:version_id AND block_kind=3
-          AND key_sha256=:key_sha256 AND secondary_first>:after_key
+      (SELECT * FROM key_pages WHERE secondary_first>:after_key
         ORDER BY secondary_first LIMIT 2)
     ) SELECT * FROM selected ORDER BY secondary_first"""
 )
@@ -82,10 +97,29 @@ SERVICE_BLOCK_SQL = text(
        ORDER BY block.block_ordinal"""
 )
 PAYER_SELECTOR_SQL = text(
-    f"""WITH key_pages AS (
-      SELECT block_ordinal, secondary_first, page_index, page_count
-      FROM {_SCHEMA}.hospital_price_data_block
-      WHERE version_id=:version_id AND block_kind=4 AND key_sha256=:key_sha256
+    f"""WITH selector_format AS (
+      SELECT format_version FROM {_SCHEMA}.hospital_price_packed_root
+      WHERE version_id=:version_id
+    ), predecessor AS (
+      SELECT block.logical_first, block.parent_sha256, root.format_version
+      FROM {_SCHEMA}.hospital_price_data_block block
+      CROSS JOIN selector_format root
+      WHERE block.version_id=:version_id AND block.block_kind=4
+        AND ((root.format_version=1 AND block.key_sha256=:key_sha256)
+          OR (root.format_version=2 AND block.key_sha256<=:key_sha256))
+      ORDER BY block.key_sha256 DESC, block.logical_first LIMIT 1
+    ), key_owner AS (
+      SELECT logical_first FROM predecessor
+      WHERE format_version=1 OR parent_sha256>=:key_sha256
+    ), key_pages AS (
+      SELECT block.block_ordinal, block.logical_first, block.logical_count,
+             block.secondary_first, block.secondary_count, block.page_index,
+             block.page_count, block.key_sha256, block.parent_sha256,
+             block.payload, root.format_version
+      FROM {_SCHEMA}.hospital_price_data_block block
+      JOIN key_owner owner USING (logical_first)
+      CROSS JOIN selector_format root
+      WHERE block.version_id=:version_id AND block.block_kind=4
     ), key_census AS (
       SELECT (array_agg(block_ordinal ORDER BY page_index))[1]
                AS first_block_ordinal,
@@ -123,13 +157,13 @@ PAYER_SELECTOR_SQL = text(
                ARRAY[]::bigint[]
              ) AS range_indexes
       FROM selected GROUP BY block_ordinal
-    ) SELECT block.block_ordinal, block.logical_first,
+    ) SELECT block.block_ordinal, block.logical_first, block.logical_count,
              block.secondary_first, block.secondary_count,
              block.page_index, block.page_count, block.payload,
+             block.key_sha256, block.parent_sha256, block.format_version,
              selected_blocks.range_indexes, key_census.key_page_count
-        FROM selected_blocks JOIN {_SCHEMA}.hospital_price_data_block block
-          ON block.version_id=:version_id AND block.block_kind=4
-         AND block.block_ordinal=selected_blocks.block_ordinal
+        FROM selected_blocks JOIN key_pages block
+          ON block.block_ordinal=selected_blocks.block_ordinal
        CROSS JOIN key_census
        ORDER BY block.page_index"""
 )

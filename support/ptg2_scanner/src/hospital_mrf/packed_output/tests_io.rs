@@ -23,7 +23,7 @@
         assert!(output.finish().is_err());
 
         let mut output = prepared_builder(directories[4].path());
-        output.selector_block_counts = [1, 0];
+        output.selector_block_counts = [2, 0];
         assert!(output.finish().is_err());
 
         let mut output = prepared_builder(directories[5].path());

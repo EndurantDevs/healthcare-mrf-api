@@ -170,23 +170,29 @@ def test_version_and_selector_metadata_fail_closed():
         serving._validated_version((_version(current_charge_count=2),))
 
     with pytest.raises(serving.HospitalPriceServingUnavailableError, match="selector"):
-        serving._validated_selector_page({}, None)
+        serving._validated_selector_page({}, None, b"s" * 32)
     with pytest.raises(serving.HospitalPriceServingUnavailableError, match="selector"):
         serving._validated_selector_page(
             {"page_index": 0, "page_count": 1, "secondary_count": 1,
              "secondary_first": 0},
             {"page_index": -1, "page_count": 1, "ref_count": 1,
              "first_ref": 0, "refs": [0], "truncated": False},
+            b"s" * 32,
         )
 
 
 def _selector_records(*, duplicate_page=False):
     return tuple(
         {
+            "format_version": 2,
+            "logical_first": 0,
+            "logical_count": 1,
             "page_index": 0 if duplicate_page else index,
             "page_count": 2,
             "secondary_count": 1,
             "secondary_first": index,
+            "key_sha256": b"s" * 32,
+            "parent_sha256": b"s" * 32,
             "payload": bytes([index]),
         }
         for index in range(2)
@@ -200,6 +206,9 @@ async def _decode_selector_page(
     return {
         "page_index": index,
         "page_count": 2,
+        "row_count": 1,
+        "page_ref_count": 1,
+        "found": True,
         "ref_count": 1,
         "first_ref": index,
         "refs": [index],
@@ -211,7 +220,8 @@ async def _decode_selector_page(
 async def test_selector_page_aggregation_is_bounded_and_rejects_drift(monkeypatch):
     monkeypatch.setattr(serving, "_native_call", _decode_selector_page)
     refs, truncated, pages, count = await serving._selector_refs(
-        _selector_records(), "code", "CPT", "70551", [(0, 2)], 1
+        _selector_records(), "code", "CPT", "70551", [(0, 2)], 1,
+        b"s" * 32,
     )
     assert (refs, truncated, pages, count) == ([0], True, [0], 2)
 
@@ -234,6 +244,7 @@ async def test_selector_page_aggregation_is_bounded_and_rejects_drift(monkeypatc
         await serving._selector_refs(
             tuple(drifted_record_list),
             "code", "CPT", "70551", [(0, 2)], 3,
+            b"s" * 32,
         )
 
 
@@ -253,13 +264,15 @@ async def test_selector_page_aggregation_rejects_duplicate_or_outside_refs(
     monkeypatch.setattr(serving, "_native_call", duplicate_ref)
     with pytest.raises(serving.HospitalPriceServingUnavailableError, match="references"):
         await serving._selector_refs(
-            _selector_records(), "code", "CPT", "70551", [(0, 2)], 3
+            _selector_records(), "code", "CPT", "70551", [(0, 2)], 3,
+            b"s" * 32,
         )
 
     monkeypatch.setattr(serving, "_native_call", _decode_selector_page)
     with pytest.raises(serving.HospitalPriceServingUnavailableError, match="references"):
         await serving._selector_refs(
-            _selector_records(), "code", "CPT", "70551", [(0, 1)], 3
+            _selector_records(), "code", "CPT", "70551", [(0, 1)], 3,
+            b"s" * 32,
         )
 
     async def duplicate_page(
@@ -276,6 +289,7 @@ async def test_selector_page_aggregation_rejects_duplicate_or_outside_refs(
         await serving._selector_refs(
             _selector_records(duplicate_page=True),
             "code", "CPT", "70551", [(0, 2)], 3,
+            b"s" * 32,
         )
 
 

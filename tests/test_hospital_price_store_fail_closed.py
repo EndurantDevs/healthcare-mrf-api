@@ -69,14 +69,17 @@ async def test_packed_projection_rejects_missing_and_non_dense_rows(tmp_path) ->
             _Connection(firsts=[None]), receipt, '"mrf"'
         )
 
-    valid_rows = [(1, 1, 0, 0), (2, 1, 0, 0), (3, 1, 0, 0)]
+    valid_rows = [
+        (1, 1, 0, 0), (2, 1, 0, 0), (3, 1, 0, 0), (4, 1, 0, 0)
+    ]
     assert await copy_globals["_validate_block_ordinals"](
         _Connection(all_rows=[valid_rows]), receipt, '"mrf"'
-    ) == {1: 1, 2: 1, 3: 1, 4: 0}
+    ) == {1: 1, 2: 1, 3: 1, 4: 1}
 
+    receipt.root.payer_plan_selector_block_count = 0
     with pytest.raises(RuntimeError, match="empty block kind"):
         await copy_globals["_validate_block_ordinals"](
-            _Connection(all_rows=[[*valid_rows, (4, 1, 0, 0)]]),
+            _Connection(all_rows=[valid_rows]),
             receipt,
             '"mrf"',
         )
@@ -122,15 +125,20 @@ async def test_packed_projection_rejects_range_and_selector_drift(tmp_path) -> N
         )
     with pytest.raises(RuntimeError, match="key ordinals are not dense"):
         await copy_globals["_validate_selector_pages"](
-            _Connection(all_rows=[[(3, 1, 1, 1)]], firsts=[(1, 0, 0)]),
+            _Connection(all_rows=[
+                [(3, 1, 1), (4, 1, 1)],
+                [(3, 1, 1, 1)],
+            ]),
             receipt,
             '"mrf"',
         )
     with pytest.raises(RuntimeError, match="selector pages are incomplete"):
         await copy_globals["_validate_selector_pages"](
             _Connection(
-                all_rows=[[(3, 1, 1, 1)]],
-                firsts=[(2, 0, 1)],
+                all_rows=[
+                    [(3, 1, 1), (4, 1, 1)],
+                    [(3, 0, 1, 1), (4, 1, 1, 1)],
+                ],
                 scalars=[True],
             ),
             receipt,

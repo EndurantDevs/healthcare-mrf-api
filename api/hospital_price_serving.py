@@ -27,8 +27,10 @@ from api.hospital_price_serving_support import HOSPITAL_PRICE_PUBLIC_DATA_BYTES
 from api.hospital_price_serving_support import HospitalPriceServingUnavailableError
 from api.hospital_price_serving_support import MAX_HOSPITAL_PRICE_PUBLIC_BYTES
 from api.hospital_price_serving_support import public_hospital_price_item
+from api.hospital_price_serving_support import _validated_selector_page
 from api.hospital_price_serving_support import validate_payer_page_coverage
 from support.hospital_price_native_validation import (
+    HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
 )
 
@@ -97,10 +99,13 @@ def _validated_version(
             for character in version_record_by_field["version_id"]
         )
         or version_record_by_field.get("parser_contract_sha256")
-        != HOSPITAL_MRF_PARSER_CONTRACT_SHA256
+        != {
+            1: HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256,
+            2: HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
+        }.get(version_record_by_field.get("format_version"))
         or version_record_by_field.get("source_format") not in _SOURCE_FORMATS
         or version_record_by_field.get("template_version") != "3.0.0"
-        or version_record_by_field.get("format_version") != 1
+        or version_record_by_field.get("format_version") not in {1, 2}
         or expected_counts != (
             version_record_by_field.get("service_count"),
             version_record_by_field.get("charge_count"),
@@ -120,35 +125,6 @@ def _validated_version(
     return version_record_by_field
 
 
-def _validated_selector_page(
-    selector_record: Mapping[str, Any],
-    decoded_page_by_field: object,
-) -> tuple[list[int], int, int, bool]:
-    if type(decoded_page_by_field) is not dict:
-        raise HospitalPriceServingUnavailableError(
-            "hospital price selector metadata is invalid"
-        )
-    selected_refs = list(decoded_page_by_field.get("refs", ()))
-    page_index = decoded_page_by_field.get("page_index")
-    page_count = decoded_page_by_field.get("page_count")
-    if (
-        type(page_index) is not int or page_index < 0
-        or type(page_count) is not int or page_count <= page_index
-        or page_index != selector_record.get("page_index")
-        or page_count != selector_record.get("page_count")
-        or decoded_page_by_field.get("ref_count")
-        != selector_record.get("secondary_count")
-        or decoded_page_by_field.get("first_ref")
-        != selector_record.get("secondary_first")
-        or type(decoded_page_by_field.get("truncated")) is not bool
-        or any(type(reference) is not int or reference < 0 for reference in selected_refs)
-    ):
-        raise HospitalPriceServingUnavailableError(
-            "hospital price selector metadata is invalid"
-        )
-    return selected_refs, page_index, page_count, decoded_page_by_field["truncated"]
-
-
 async def _selector_refs(
     selector_records: tuple[Mapping[str, Any], ...],
     kind: str,
@@ -156,6 +132,7 @@ async def _selector_refs(
     second: str,
     ranges: list[tuple[int, int]],
     max_refs: int,
+    key_sha256: bytes,
 ) -> tuple[list[int], bool, list[int], int | None]:
     """Decode bounded selector references while checking stored metadata."""
 
@@ -174,7 +151,9 @@ async def _selector_refs(
             ranges, remaining,
         )
         page_refs, page_index, decoded_page_count, page_is_truncated = (
-            _validated_selector_page(selector_record, decoded_page_by_field)
+            _validated_selector_page(
+                selector_record, decoded_page_by_field, key_sha256
+            )
         )
         if page_count is None:
             page_count = decoded_page_count
@@ -221,7 +200,7 @@ async def _charge_page(
     ))
     selected_refs, is_truncated, page_indexes, page_count = await _selector_refs(
         code_selector_records, "code", query.code_type, query.code,
-        [(after_key + 1, 1 << 32)], query.limit + 1,
+        [(after_key + 1, 1 << 32)], query.limit + 1, key_sha256,
     )
     if code_selector_records and (
         page_indexes != list(range(page_indexes[0], page_indexes[-1] + 1))
@@ -356,7 +335,7 @@ async def _selected_fact_ordinals(
     selected_refs, is_truncated, page_indexes, _page_count = await _selector_refs(
         payer_selector_records, "payer_plan", query.payer_name, query.plan_name,
         [(fact_range[0], fact_range[1]) for fact_range in ranges],
-        MAX_HOSPITAL_PRICE_MATCHING_FACTS + 1,
+        MAX_HOSPITAL_PRICE_MATCHING_FACTS + 1, key_sha256,
     )
     if is_truncated or len(selected_refs) > MAX_HOSPITAL_PRICE_MATCHING_FACTS:
         raise HospitalPriceServingUnavailableError(
