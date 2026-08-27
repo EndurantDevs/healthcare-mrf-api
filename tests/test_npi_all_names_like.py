@@ -563,19 +563,10 @@ async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypat
     """Keep taxonomy, status, and enrichment reads concurrent after paging."""
     provider_npi = 1000000049
     request_session = object()
-    monkeypatch.setattr(
-        npi_module,
-        "ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION",
-        True,
-    )
     provider_record_map = _provider_directory_row_mapping()
     provider_record = (
         (provider_npi,)
-        + tuple(
-            provider_record_map.get(column.key)
-            for column in npi_module.NPIData.__table__.columns
-            if column.key != "search_taxonomy_codes"
-        )
+        + tuple(provider_record_map.get(column.key) for column in npi_module._npi_serving_columns())
         + tuple(provider_record_map.get(column.key) for column in npi_module.NPIAddress.__table__.columns)
         + (1, 52)
     )
@@ -637,11 +628,7 @@ async def test_get_all_name_taxonomy_cancels_sibling_reads_on_failure(monkeypatc
     provider_record_map = _provider_directory_row_mapping()
     provider_record = (
         (provider_npi,)
-        + tuple(
-            provider_record_map.get(column.key)
-            for column in npi_module.NPIData.__table__.columns
-            if column.key != "search_taxonomy_codes"
-        )
+        + tuple(provider_record_map.get(column.key) for column in npi_module._npi_serving_columns())
         + tuple(provider_record_map.get(column.key) for column in npi_module.NPIAddress.__table__.columns)
         + (1, 52)
     )

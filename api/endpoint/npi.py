@@ -600,7 +600,7 @@ async def _assert_npi_search_taxonomy_projection_ready() -> None:
 
 
 @blueprint.listener("before_server_start")
-async def _assert_npi_search_taxonomy_projection_before_start(_app, _loop):
+async def _assert_npi_projection_before_start(_app, _loop):
     await _assert_npi_search_taxonomy_projection_ready()
 
 
