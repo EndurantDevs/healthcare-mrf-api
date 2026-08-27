@@ -11,7 +11,7 @@ COPY process/ext/address_pub28.py /build/process/ext/address_pub28.py
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-pip \
     && python3 /build/scripts/ci/validate_python_lock_inputs /build \
-    && grep '^maturin==1\.14\.1 --hash=sha256:' /build/requirements-ci.lock > /tmp/maturin.lock \
+    && grep '^maturin==1\.15\.0 --hash=sha256:' /build/requirements-ci.lock > /tmp/maturin.lock \
     && test "$(wc -l < /tmp/maturin.lock)" -eq 1 \
     && python3 -m pip install \
         --break-system-packages \

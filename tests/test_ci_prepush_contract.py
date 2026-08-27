@@ -320,7 +320,7 @@ def test_container_and_lock_generator_use_exact_inputs() -> None:
     assert "scripts/ci/validate_python_lock_inputs" in dockerfile
     assert "--require-hashes" in dockerfile
     assert "--only-binary=:all:" in dockerfile
-    assert "maturin==1\\.14\\.1 --hash=sha256:" in dockerfile
+    assert "maturin==1\\.15\\.0 --hash=sha256:" in dockerfile
     assert "pip install --no-compile --upgrade pip" not in dockerfile
     assert "-r /wheels/requirements-dev.txt" not in dockerfile
     assert "test \"$(python -m pip --version | awk '{print $2}')\" = 26.1.2" in generator

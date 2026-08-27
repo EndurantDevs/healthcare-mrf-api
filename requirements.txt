@@ -10,7 +10,7 @@ arq>=0.28.0
 asyncpg>=0.31.0
 attrs>=26.1.0
 Brotli
-cryptography>=50.0.0,<51
+cryptography>=50.0.1,<51
 fastcrc
 frozenlist>=1.8.0
 geopandas
@@ -32,7 +32,7 @@ pylightxl
 pyogrio>=0.13.0
 pyproj>=3.7.2
 python-dateutil
-python-dotenv>=1.2.2
+python-dotenv>=1.2.3
 python-socks==3.0.0
 pytz
 PyYAML>=6.0.3
@@ -44,7 +44,7 @@ sanic_ext>=25.12.0
 shapely>=2.1.2
 socksio
 SQLAlchemy>=2.0.52
-tracerite>=2.6.4,<2.7.0
+tracerite>=2.6.5,<2.7.0
 tzdata>=2026.3
 unicode-slugify
 unidecode>=1.4.0
