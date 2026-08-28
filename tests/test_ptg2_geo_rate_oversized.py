@@ -111,6 +111,9 @@ async def test_oversized_geo_rate_finds_local_set_after_national_cap(monkeypatch
 
     assert selection == serving._GeoRateSelection((rate_rows[-1],), True)
     reads_by_kind["locations"].assert_awaited_once()
+    assert reads_by_kind["locations"].await_args.kwargs["limit"] == (
+        serving._geo_rate_selection_budget(_production_tables()).caps.maximum_provider_sets
+    )
     reads_by_kind["sets"].assert_awaited_once()
     assert reads_by_kind["sets"].await_args.args[2] == (local_npi,)
     assert reads_by_kind["sets"].await_args.kwargs["allowed_provider_set_keys"] is None
