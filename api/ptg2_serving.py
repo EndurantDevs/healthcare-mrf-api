@@ -14617,12 +14617,14 @@ async def _oversized_geo_local_provider_sets(
     if reverse_geo_scope is None:
         return None
     candidate_npis, is_source_exhausted, _candidate_limit = reverse_geo_scope
-    if not candidate_npis:
-        if not is_source_exhausted:
-            raise PTG2OnlineWorkBudgetExceeded("candidate_members")
-        return ()
     if not is_source_exhausted:
-        raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+        raise PTG2LocationScopeError(
+            "Cost-ordered geographic aggregate search is too broad for exact "
+            "online execution. Narrow the ZIP radius, add an NPI, or use "
+            "view=card with a ready projection."
+        )
+    if not candidate_npis:
+        return ()
     try:
         with v4_graph_taxonomy_projection_scope(
             maximum_members=forward_limits.maximum_projection_members,
@@ -14750,6 +14752,10 @@ async def _select_oversized_geo_rate_scope(
     if len(code_keys) > budget.caps.maximum_rate_rows:
         raise PTG2OnlineWorkBudgetExceeded("forward_scan")
     forward_limits = _v4_geo_rate_forward_limits(serving_tables)
+    budget.maximum_candidate_members = min(
+        budget.maximum_candidate_members,
+        _ptg2_manifest_location_match_limit(),
+    )
     local_provider_set_keys = await _oversized_geo_local_provider_sets(
         session,
         serving_tables,
