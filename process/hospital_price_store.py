@@ -315,8 +315,9 @@ async def _bind_evidence(
         f"SELECT EXISTS (SELECT 1 FROM {stage} staged LEFT JOIN "
         f"{schema}.hospital_price_version_hospital bound ON "
         "bound.version_id=:version AND bound.hospital_id=staged.hospital_id "
-        "WHERE bound.hospital_id IS NULL OR bound.source_location_ordinal "
-        "IS DISTINCT FROM staged.source_location_ordinal)",
+        "WHERE bound.hospital_id IS NULL OR (bound.source_location_ordinal IS NOT NULL "
+        "AND staged.source_location_ordinal IS NOT NULL AND "
+        "bound.source_location_ordinal <> staged.source_location_ordinal))",
         version=version_id,
     ):
         raise RuntimeError("hospital version binding conflicts with stored evidence")
