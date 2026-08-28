@@ -623,6 +623,10 @@ def _publish_artifact_bytes(
     final: Path,
     expected_sha256: str | None,
 ) -> None:
+    if temporary.is_symlink() or not temporary.is_file():
+        raise RuntimeError(
+            f"Retained artifact staging is not a regular file: {temporary}"
+        )
     if not final.exists():
         if expected_sha256 is not None:
             staged_sha256, _staged_size = sha256_file(temporary)
