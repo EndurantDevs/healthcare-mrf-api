@@ -214,13 +214,16 @@ fn parse_tall_payer(
         columns.median_amount,
         columns.percentile_10,
         columns.percentile_90,
-        columns.methodology,
     ]
     .iter()
     .all(|column| csv_value(record, *column).trim().is_empty())
         && csv_value(record, columns.allowed_count).trim() == "0"
         && generic_notes.is_some_and(|notes| !notes.trim().is_empty())
     {
+        let methodology = csv_value(record, columns.methodology).trim();
+        if !methodology.is_empty() {
+            canonical_methodology(methodology, true)?;
+        }
         return Ok(None);
     }
     validate_payer(

@@ -10,17 +10,33 @@
                 ("billing_class", "facility"),
                 ("standard_charge | gross", "20"),
                 ("count", "0"),
+                ("standard_charge | methodology", "fee schedule"),
+                ("additional_generic_notes", "No remittances during measurement period"),
+            ],
+        );
+        let tall = append_csv_row(
+            &tall,
+            &[
+                ("description", "Cash-only tall service without methodology"),
+                ("code | 1", "10006"),
+                ("code | 1 | type", "CPT"),
+                ("setting", "outpatient"),
+                ("billing_class", "facility"),
+                ("standard_charge | gross", "21"),
+                ("count", "0"),
                 ("additional_generic_notes", "No remittances during measurement period"),
             ],
         );
         let tall_rows = run_fixture(InputFormat::TallCsv, &tall, false);
         let tall_charges = String::from_utf8(tall_rows["charge"].clone()).unwrap();
         let tall_charge_lines = tall_charges.lines().collect::<Vec<_>>();
-        assert_eq!(tall_charge_lines.len(), 2);
-        assert_eq!(
-            tall_charge_lines[1].split('\t').nth(9),
-            Some("No remittances during measurement period")
-        );
+        assert_eq!(tall_charge_lines.len(), 3);
+        for line in &tall_charge_lines[1..] {
+            assert_eq!(
+                line.split('\t').nth(9),
+                Some("No remittances during measurement period")
+            );
+        }
         assert_eq!(
             String::from_utf8(tall_rows["payer_charge"].clone())
                 .unwrap()
@@ -72,6 +88,27 @@
             &invalid_tall,
             DEFAULT_MAX_FANOUT_ROWS,
             "payer_name",
+        );
+
+        let invalid_tall_methodology = append_csv_row(
+            &fixture_tall_csv(),
+            &[
+                ("description", "Invalid tall methodology"),
+                ("code | 1", "10005"),
+                ("code | 1 | type", "CPT"),
+                ("setting", "outpatient"),
+                ("billing_class", "facility"),
+                ("standard_charge | gross", "40"),
+                ("count", "0"),
+                ("standard_charge | methodology", "unsupported"),
+                ("additional_generic_notes", "No remittances during measurement period"),
+            ],
+        );
+        assert_import_error(
+            InputFormat::TallCsv,
+            &invalid_tall_methodology,
+            DEFAULT_MAX_FANOUT_ROWS,
+            "invalid standard charge methodology",
         );
 
         for (methodology, notes, expected) in [
