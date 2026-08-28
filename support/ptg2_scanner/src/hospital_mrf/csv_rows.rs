@@ -340,6 +340,15 @@ fn parse_wide_payers(
             if parsed.allowed_count.as_deref() == Some("0") && !has_notes {
                 return Err(invalid("count 0 requires explanatory notes"));
             }
+            let has_allowed_amounts = parsed.median_amount.is_some()
+                || parsed.percentile_10.is_some()
+                || parsed.percentile_90.is_some()
+                || parsed.allowed_count.is_some();
+            if has_allowed_amounts && !has_notes {
+                return Err(invalid(
+                    "payer allowed amounts without negotiated charge require explanatory notes",
+                ));
+            }
             continue;
         }
         payers.push(validate_payer(parsed, None, true)?);

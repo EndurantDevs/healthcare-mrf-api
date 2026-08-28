@@ -150,7 +150,7 @@
     }
 
     #[test]
-    fn wide_rows_ignore_valid_ancillary_only_payer_fields() {
+    fn wide_rows_require_notes_before_omitting_ancillary_only_payer_fields() {
         let methodology_only = append_csv_row(
             &fixture_wide_csv(),
             &[
@@ -166,7 +166,16 @@
                 ),
             ],
         );
-        let ancillary_only = append_csv_row(
+        let methodology_rows = run_fixture(InputFormat::WideCsv, &methodology_only, false);
+        assert_eq!(
+            String::from_utf8(methodology_rows["payer_charge"].clone())
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        let ancillary_without_notes = append_csv_row(
             &methodology_only,
             &[
                 ("description", "Statistics-only payer fields"),
@@ -179,6 +188,32 @@
                 ("10th_percentile|Payer, Inc.|Plan A", "40"),
                 ("90th_percentile|Payer, Inc.|Plan A", "49"),
                 ("count|Payer, Inc.|Plan A", "1 through 10"),
+            ],
+        );
+        assert_import_error(
+            InputFormat::WideCsv,
+            &ancillary_without_notes,
+            DEFAULT_MAX_FANOUT_ROWS,
+            "payer allowed amounts without negotiated charge require explanatory notes",
+        );
+
+        let ancillary_only = append_csv_row(
+            &methodology_only,
+            &[
+                ("description", "Explained statistics-only payer fields"),
+                ("code|1", "10008"),
+                ("code|1|type", "CPT"),
+                ("setting", "outpatient"),
+                ("billing_class", "facility"),
+                ("standard_charge|gross", "51"),
+                ("median_amount|Payer, Inc.|Plan A", "45"),
+                ("10th_percentile|Payer, Inc.|Plan A", "40"),
+                ("90th_percentile|Payer, Inc.|Plan A", "49"),
+                ("count|Payer, Inc.|Plan A", "1 through 10"),
+                (
+                    "additional_payer_notes|Payer, Inc.|Plan A",
+                    "No negotiated charge reported",
+                ),
             ],
         );
 
@@ -197,6 +232,13 @@
                 .count(),
             1
         );
+
+        let (_directory, packed) = import_packed(
+            InputFormat::WideCsv,
+            &ancillary_only,
+            TEST_MAX_OUTPUT_BYTES,
+        );
+        assert_eq!(packed.root.unwrap().fact_count, 1);
     }
 
     #[test]
