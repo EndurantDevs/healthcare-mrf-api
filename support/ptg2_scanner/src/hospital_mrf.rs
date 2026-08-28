@@ -1,9 +1,7 @@
 //! Streaming hospital machine-readable-file parser for the V3.0.0 contract.
 
 use crate::copy_format::{pg_text_array_field, write_copy_text_fields};
-use crate::input::{
-    open_full_scan_json_reader, open_full_scan_reader, strict_utf8_reader, RapidgzipConfig,
-};
+use crate::input::{open_full_scan_reader, RapidgzipConfig};
 use crate::normalize::{canonical_decimal_text, compare_canonical_decimal_text};
 use csv::{ReaderBuilder, StringRecord};
 use serde::de::{Error as _, SeqAccess, Visitor};
@@ -14,14 +12,14 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use struson::reader::{JsonReader, JsonStreamReader};
+use struson::reader::{JsonReader, JsonStreamReader, ValueType};
 
 include!("hospital_mrf/schema_and_output.rs");
 include!("hospital_mrf/zip_input.rs");

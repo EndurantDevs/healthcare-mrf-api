@@ -57,8 +57,11 @@ def test_resource_limits_derive_workers_from_explicit_byte_budgets(
     assert orchestrator._runtime.resource_limits(
         _ArtifactStore(tmp_path), 8, 5, 0
     ) == (
-        2, 2, 100, 120, 80, 1240,
+        2, 2, 2, 2, 100, 120, 80, 1640,
     )
+    assert orchestrator._runtime.resource_limits(
+        _ArtifactStore(tmp_path), 1, 1, 0
+    )[:4] == (1, 1, 2, 2)
 
     required_byte_counts: list[int] = []
     require_disk_capacity = orchestrator._runtime.require_disk_capacity
@@ -67,12 +70,12 @@ def test_resource_limits_derive_workers_from_explicit_byte_budgets(
         lambda _store, byte_count: required_byte_counts.append(byte_count),
     )
     orchestrator._runtime.resource_limits(_ArtifactStore(tmp_path), 8, 5, 3)
-    assert required_byte_counts == [3_001_440]
+    assert required_byte_counts == [3_001_640]
     monkeypatch.setattr(
         orchestrator._runtime, "require_disk_capacity", require_disk_capacity
     )
 
-    free_bytes = 1440
+    free_bytes = 1840
     monkeypatch.setattr(
         orchestrator._runtime.shutil,
         "disk_usage",

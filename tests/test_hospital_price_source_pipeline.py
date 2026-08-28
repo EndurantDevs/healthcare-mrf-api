@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,61 @@ from tests.hospital_price_orchestration_support import (
     DownloadedSource as _DownloadedSource,
     orchestrator_module as _orchestrator_module,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refresh_available", (False, True))
+async def test_download_worker_queues_failed_or_fully_refreshed_source(
+    tmp_path, monkeypatch, refresh_available
+):
+    orchestrator = _orchestrator_module()
+    expired_url = "https://files.example/prices.json?sig=expired"
+    fresh_url = "https://files.example/prices.json?sig=fresh"
+    attempt = _Attempt("attempt-a", "a", "Hospital A", expired_url, 0)
+    raw = SimpleNamespace(raw_sha256="a" * 64)
+    calls: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def resource_slot(_store, resource, slot_count):
+        assert (resource, slot_count) == ("fetch", 4)
+        yield
+
+    async def download(source_job, _store, _max_bytes, **kwargs):
+        url, grouped_attempts = source_job
+        calls.append(url)
+        if url == expired_url:
+            return _DownloadedSource(
+                url, None, grouped_attempts, "permission", "expired", True
+            )
+        assert kwargs == {"exact_url_only": True}
+        return _DownloadedSource(url, raw, grouped_attempts)
+
+    refresh_result = (fresh_url, (attempt,)) if refresh_available else None
+    refresh = AsyncMock(return_value=refresh_result)
+    monkeypatch.setattr(orchestrator, "download_source", download)
+    monkeypatch.setattr(orchestrator, "_hospital_resource_slot", resource_slot)
+    monkeypatch.setattr(orchestrator, "_refreshed_source_job", refresh)
+    monkeypatch.setattr(orchestrator, "_require_disk_capacity", lambda *_args: None)
+    source_jobs, downloads = asyncio.Queue(), asyncio.Queue()
+    source_jobs.put_nowait((expired_url, (attempt,)))
+    source_jobs.put_nowait(None)
+
+    worker = asyncio.create_task(orchestrator._download_worker(
+        source_jobs, downloads, _ArtifactStore(tmp_path), "hospital-prices:test",
+        1024, 1, slot_count=4,
+    ))
+    downloaded, acknowledgement = await asyncio.wait_for(
+        downloads.get(), timeout=1
+    )
+    if refresh_available:
+        assert (downloaded.raw, calls) == (raw, [expired_url, fresh_url])
+    else:
+        assert (downloaded.raw, calls) == (None, [expired_url])
+    assert downloaded.attempts == (attempt,)
+    refresh.assert_awaited_once()
+    acknowledgement.set_result(None)
+    await asyncio.wait_for(worker, timeout=1)
+
 
 @pytest.mark.asyncio
 async def test_source_pipeline_overlaps_download_and_deduplicates_invalid_content(
@@ -50,6 +106,7 @@ async def test_source_pipeline_overlaps_download_and_deduplicates_invalid_conten
         _ctx: Any, _task: Any, _store: Any, downloaded_raw: Any,
         _max_decompressed_bytes: int,
         _max_output_bytes: int,
+        _required_free_bytes: int,
     ) -> str:
         digest = downloaded_raw.raw_sha256
         calls_by_digest[digest] += 1
@@ -67,7 +124,8 @@ async def test_source_pipeline_overlaps_download_and_deduplicates_invalid_conten
 
     pipeline_metrics = await asyncio.wait_for(
         orchestrator._stream_sources(
-            {}, {}, _ArtifactStore(tmp_path), attempts_by_url, (1, 2), (None, 0, 2),
+            {}, {}, _ArtifactStore(tmp_path), attempts_by_url,
+            (1, 2, 1, 2), (None, 0, 2),
             ("hospital-prices:test", 1024, 4096, 2048, 1),
         ),
         timeout=2,
@@ -130,7 +188,7 @@ async def test_source_pipeline_deletes_private_raw_before_terminal_outcome(
 
     metrics = await orchestrator._stream_sources(
         {}, {}, _ArtifactStore(tmp_path), {attempt.source_url: [attempt]},
-        (1, 1), (None, 0, 1),
+        (1, 1, 1, 1), (None, 0, 1),
         ("hospital-prices:test", 1024, 4096, 2048, 1),
     )
 
@@ -170,8 +228,69 @@ async def test_source_cleanup_failure_blocks_publication(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="outside task-owned raw scratch"):
         await orchestrator._stream_sources(
             {}, {}, _ArtifactStore(tmp_path), {attempt.source_url: [attempt]},
-            (1, 1), (None, 0, 1),
+            (1, 1, 1, 1), (None, 0, 1),
             ("hospital-prices:test", 1024, 4096, 2048, 1),
         )
     assert unrelated_raw.read_bytes() == b"{}"
     publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mixed_403_and_500_publishes_only_the_rebound_sibling(
+    tmp_path, monkeypatch
+):
+    orchestrator = _orchestrator_module()
+    expired_url = "https://files.example/prices.json?sig=expired"
+    fresh_url = "https://files.example/prices.json?sig=fresh"
+    attempts = tuple(
+        _Attempt(f"attempt-{key}", key, f"Hospital {key.upper()}", expired_url,
+                 0, source_http_status=status)
+        for key, status in (("a", 403), ("b", 500))
+    )
+    published_attempts: list[tuple[_Attempt, ...]] = []
+    failed_attempts: list[tuple[_Attempt, ...]] = []
+
+    async def download(source_job, source_store, _max_bytes, **kwargs):
+        url, grouped_attempts = source_job
+        if url == expired_url:
+            assert [attempt.source_http_status for attempt in grouped_attempts] == [403, 500]
+            return _DownloadedSource(
+                url, None, grouped_attempts, "permission", "expired", True
+            )
+        assert kwargs == {"exact_url_only": True}
+        raw_path = Path(source_store.root) / "raw" / "source.json"
+        raw_path.parent.mkdir(parents=True)
+        raw_path.write_bytes(b"{}")
+        raw = SimpleNamespace(raw_sha256="a" * 64, raw_path=str(raw_path), byte_count=2)
+        return _DownloadedSource(url, raw, grouped_attempts)
+
+    async def fail(grouped_attempts, *_args):
+        failed_attempts.append(grouped_attempts)
+        return len(grouped_attempts)
+
+    async def publish(_ctx, _task, downloaded, _version):
+        published_attempts.append(downloaded.attempts)
+        return 1, 0, 0, 0
+
+    for name, collaborator in (
+        ("download_source", download),
+        ("_refreshed_source_job", AsyncMock(return_value=(fresh_url, (attempts[0],)))),
+        ("_ensure_content", AsyncMock(return_value=None)),
+        ("_fail_attempts", fail), ("_publish_download", publish),
+    ):
+        monkeypatch.setattr(orchestrator, name, collaborator)
+    monkeypatch.setattr(orchestrator, "_require_disk_capacity", lambda *_args: None)
+    monkeypatch.setattr(orchestrator, "_progress", lambda *_args: None)
+
+    metrics = await orchestrator._stream_sources(
+        {}, {}, _ArtifactStore(tmp_path), {expired_url: list(attempts)},
+        (1, 1, 1, 1), (None, 0, 2),
+        ("hospital-prices:test", 1024, 4096, 2048, 1),
+    )
+
+    assert metrics == {
+        "processed": 2, "published": 1, "superseded": 0,
+        "unchanged": 0, "failed": 1, "contents": 1,
+    }
+    assert published_attempts == [(attempts[0],)]
+    assert failed_attempts == [(attempts[1],)]

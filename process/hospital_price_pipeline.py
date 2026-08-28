@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, Sequence
 
 from process.formulary_fhir.async_safety import drain_operation
+from process.hospital_hpt_locator import hospital_mrf_selector
 from process.ptg_parts.canonical import canonicalize_url
 
 
@@ -28,18 +30,23 @@ async def refreshed_locator_candidates(
     locator_url: str,
     locator_attempts: tuple[Any, ...],
     store: Any,
-    canonical_url: str,
+    selector: str,
     prior_urls: set[str],
     operations: SimpleNamespace,
-) -> dict[str, Any] | None:
-    """Resolve one locator only when every requested hospital remains bound."""
+) -> dict[str, Any]:
+    """Return exact refreshed bindings for hospitals that remain resolved."""
 
     hospitals = tuple(
         {
             "hospital_id": attempt.hospital_id,
             "name": attempt.hospital_name,
-            "locator_name": attempt.locator_name or attempt.hospital_name,
             "cms_hpt_url": locator_url,
+            "locator_mrf_url": selector,
+            **(
+                {"locator_name": attempt.locator_name}
+                if attempt.locator_name is not None
+                else {}
+            ),
         }
         for attempt in locator_attempts
     )
@@ -47,10 +54,12 @@ async def refreshed_locator_candidates(
     matching_records = tuple(
         locator_record for locator_record in (locator_result.records or ())
         if locator_record.mrf_url not in prior_urls
-        and operations.canonicalize_url(locator_record.mrf_url) == canonical_url
+        and hospital_mrf_selector(
+            locator_record.mrf_url, allow_credentials=True
+        ) == selector
     )
     if not matching_records:
-        return None
+        return {}
     filtered_result = type(locator_result)(
         url=locator_result.url,
         locator_id=locator_result.locator_id,
@@ -60,26 +69,28 @@ async def refreshed_locator_candidates(
         error_code=locator_result.error_code,
         error_detail=locator_result.error_detail,
     )
-    candidate_by_hospital = {
+    return {
         candidate.hospital_id: candidate
         for candidate in operations.candidates_from_locators((filtered_result,))
         if candidate.initial_error_code is None
     }
-    expected_hospital_ids = {attempt.hospital_id for attempt in locator_attempts}
-    return (
-        candidate_by_hospital
-        if set(candidate_by_hospital) == expected_hospital_ids
-        else None
+
+
+async def _queue_download(downloads: asyncio.Queue[Any], downloaded_source: Any) -> None:
+    acknowledgement = asyncio.get_running_loop().create_future()
+
+    async def _wait_for_acknowledgement() -> None:
+        await acknowledgement
+
+    await downloads.put((downloaded_source, acknowledgement))
+    await drain_operation(
+        _wait_for_acknowledgement(), preserve_cancellation=True
     )
 
 
 async def download_worker(
-    source_jobs: asyncio.Queue[Any],
-    downloads: asyncio.Queue[Any],
-    store: Any,
-    owner: str,
-    max_raw_bytes: int,
-    required_free_bytes: int,
+    source_jobs: asyncio.Queue[Any], downloads: asyncio.Queue[Any],
+    store: Any, owner: str, max_raw_bytes: int, required_free_bytes: int,
     operations: SimpleNamespace,
 ) -> None:
     """Download sources while retaining each private lease through consumption."""
@@ -95,31 +106,45 @@ async def download_worker(
             with operations.artifact_lease_context(
                 owner=owner, store=source_store
             ) as lease:
-                acknowledgement = asyncio.get_running_loop().create_future()
-
                 async def _download_and_wait() -> None:
-                    async def _wait_for_acknowledgement() -> None:
-                        await acknowledgement
-
-                    operations.require_disk_capacity(store, required_free_bytes)
-                    downloaded = await operations.download_source(
-                        source_job, source_store, max_raw_bytes
-                    )
-                    if downloaded.raw is None and downloaded.auth_refresh_required:
-                        refreshed_job = await operations.refreshed_source_job(
-                            source_job, source_store
+                    async with operations.resource_slot(store):
+                        operations.require_disk_capacity(store, required_free_bytes)
+                        downloaded_source = await operations.download_source(
+                            source_job, source_store, max_raw_bytes
                         )
-                        if refreshed_job is not None:
-                            downloaded = await operations.download_source(
-                                refreshed_job, source_store, max_raw_bytes,
-                                exact_url_only=True,
+                        if (
+                            downloaded_source.raw is None
+                            and downloaded_source.auth_refresh_required
+                        ):
+                            refreshed_job = await operations.refreshed_source_job(
+                                source_job, source_store
                             )
-                    await downloads.put((downloaded, acknowledgement))
-                    await drain_operation(
-                        _wait_for_acknowledgement(), preserve_cancellation=True
-                    )
+                            if refreshed_job is not None:
+                                refreshed_attempt_ids = {
+                                    attempt.attempt_id for attempt in refreshed_job[1]
+                                }
+                                unresolved_attempts = tuple(
+                                    attempt for attempt in downloaded_source.attempts
+                                    if attempt.attempt_id not in refreshed_attempt_ids
+                                )
+                                if unresolved_attempts:
+                                    await _queue_download(
+                                        downloads,
+                                        replace(
+                                            downloaded_source,
+                                            attempts=unresolved_attempts,
+                                            auth_refresh_required=False,
+                                        ),
+                                    )
+                                downloaded_source = await operations.download_source(
+                                    refreshed_job, source_store, max_raw_bytes,
+                                    exact_url_only=True,
+                                )
+                        await _queue_download(downloads, downloaded_source)
 
-                await operations.guard_artifact_lease(lease, _download_and_wait())
+                await operations.guard_artifact_lease(
+                    lease, _download_and_wait()
+                )
 
 
 def _acknowledge(acknowledgement: asyncio.Future[None]) -> None:
@@ -134,7 +159,7 @@ async def _load_download(
     downloaded_source: Any,
     acknowledgement: asyncio.Future[None],
     content_pipeline: tuple[dict[str, Any], dict[str, Any], dict[str, int]],
-    parser_limits: tuple[int, int],
+    parser_limits: tuple[int, int, int],
     operations: SimpleNamespace,
 ) -> tuple[int, int, int, int]:
     if downloaded_source.raw is None:
@@ -146,13 +171,12 @@ async def _load_download(
         )
         return 0, 0, 0, failed
     locks_by_digest, errors_by_digest, _metrics_by_name = content_pipeline
-    max_decompressed_bytes, max_output_bytes = parser_limits
     digest = downloaded_source.raw.raw_sha256
     try:
         error_code, error_detail = await operations.content_ingest_error(
             ctx, task, store, downloaded_source.raw,
             locks_by_digest, errors_by_digest,
-            max_decompressed_bytes, max_output_bytes,
+            parser_limits,
         )
     finally:
         await operations.cleanup_transient_source(store, downloaded_source.raw)
@@ -174,7 +198,7 @@ async def load_worker(
     downloads: asyncio.Queue[Any],
     content_pipeline: tuple[dict[str, Any], dict[str, Any], dict[str, int]],
     progress_context: tuple[str | None, int, int],
-    parser_limits: tuple[int, int],
+    parser_limits: tuple[int, int, int],
     operations: SimpleNamespace,
 ) -> None:
     """Validate, publish, and acknowledge queued private source artifacts."""
@@ -279,7 +303,7 @@ async def stream_sources(
     load_tasks = [
         asyncio.create_task(operations.load_worker(
             ctx, task, store, downloads, content_pipeline, progress_context,
-            max_decompressed, max_output,
+            (max_decompressed, max_output, required_free),
         ))
         for _unused in range(load_count)
     ]

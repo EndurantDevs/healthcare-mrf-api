@@ -187,6 +187,15 @@ async def _assert_v3_metadata(connection, quoted: str) -> None:
     assert [tuple(location) for location in locations] == [
         ("Hospital A", "Address A"), ("Hospital B", None),
     ]
+    raw_npis = await connection.fetch(
+        f"SELECT npi_ordinal, npi FROM {quoted}.hospital_price_version_npi "
+        "ORDER BY npi_ordinal"
+    )
+    assert [tuple(npi) for npi in raw_npis] == [
+        (0, "0000000001"),
+        (1, "0000000002"),
+        (2, "taxonomy-not-an-npi"),
+    ]
     financial_aid = await connection.fetchval(
         f"SELECT financial_aid_policy FROM {quoted}.hospital_price_version"
     )
@@ -202,6 +211,51 @@ async def _assert_v3_metadata(connection, quoted: str) -> None:
     assert await connection.fetchval(
         f"SELECT billing_class FROM {quoted}.hospital_price_charge"
     ) == "professional"
+
+
+async def _assert_publication_evidence(connection, quoted: str) -> None:
+    shared = await connection.fetchrow(
+        f"SELECT count(DISTINCT hospital.locator_id) AS locators, "
+        "count(DISTINCT binding.hospital_id) AS hospitals "
+        f"FROM {quoted}.hospital_price_hospital hospital "
+        f"JOIN {quoted}.hospital_price_version_hospital binding ON true"
+    )
+    assert dict(shared) == {"locators": 1, "hospitals": 2}
+    public_npis = await connection.fetch(
+        f"SELECT source_ordinal, npi FROM {quoted}.hospital_price_hospital_npi "
+        "WHERE hospital_id='hospital-a' ORDER BY source_ordinal"
+    )
+    assert [tuple(npi) for npi in public_npis] == [
+        (0, "0000000001"),
+        (1, "0000000002"),
+    ]
+    publication = await connection.fetchrow(
+        f"SELECT current.npi_count, binding.source_location_ordinal "
+        f"FROM {quoted}.hospital_price_current current "
+        f"JOIN {quoted}.hospital_price_version_hospital binding "
+        "USING (hospital_id, version_id) WHERE current.hospital_id='hospital-a'"
+    )
+    assert dict(publication) == {
+        "npi_count": 2,
+        "source_location_ordinal": None,
+    }
+    await _assert_v3_metadata(connection, quoted)
+    observation = await connection.fetchrow(
+        f"SELECT registry_version, requested_url, final_url, result_status, http_status "
+        f"FROM {quoted}.hospital_price_locator_observation"
+    )
+    assert dict(observation) == {
+        "registry_version": 1,
+        "requested_url": "https://hospital.example/cms-hpt.txt",
+        "final_url": "https://www.hospital.example/cms-hpt.txt",
+        "result_status": "redirected_verified",
+        "http_status": 200,
+    }
+    unbound = await connection.fetchval(
+        f"SELECT facility_anchor_id IS NULL FROM {quoted}.hospital_price_hospital "
+        "WHERE hospital_id='hospital-unbound'"
+    )
+    assert unbound is True
 
 
 async def assert_lossless_values(connection, quoted: str) -> None:
@@ -238,30 +292,7 @@ async def assert_lossless_values(connection, quoted: str) -> None:
         "additional_generic_notes": "modifier generic note",
         "percentage": "93.7501",
     }
-    shared = await connection.fetchrow(
-        f"SELECT count(DISTINCT hospital.locator_id) AS locators, "
-        "count(DISTINCT binding.hospital_id) AS hospitals "
-        f"FROM {quoted}.hospital_price_hospital hospital "
-        f"JOIN {quoted}.hospital_price_version_hospital binding ON true"
-    )
-    assert dict(shared) == {"locators": 1, "hospitals": 2}
-    await _assert_v3_metadata(connection, quoted)
-    observation = await connection.fetchrow(
-        f"SELECT registry_version, requested_url, final_url, result_status, http_status "
-        f"FROM {quoted}.hospital_price_locator_observation"
-    )
-    assert dict(observation) == {
-        "registry_version": 1,
-        "requested_url": "https://hospital.example/cms-hpt.txt",
-        "final_url": "https://www.hospital.example/cms-hpt.txt",
-        "result_status": "redirected_verified",
-        "http_status": 200,
-    }
-    unbound = await connection.fetchval(
-        f"SELECT facility_anchor_id IS NULL FROM {quoted}.hospital_price_hospital "
-        "WHERE hospital_id='hospital-unbound'"
-    )
-    assert unbound is True
+    await _assert_publication_evidence(connection, quoted)
 
 
 async def assert_bad_allowed_count_rejected(connection, quoted, version_id) -> None:

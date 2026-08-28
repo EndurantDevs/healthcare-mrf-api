@@ -100,8 +100,8 @@ struct ModifierRow {
 
 #[derive(Clone, Debug)]
 struct ModifierPayerRow {
-    payer_name: String,
-    plan_name: String,
+    payer_name: Option<String>,
+    plan_name: Option<String>,
     description: Option<String>,
     standard_charge_dollar: Option<String>,
     standard_charge_percentage: Option<String>,
@@ -205,16 +205,7 @@ impl GeneralMetadata {
     fn validate(mut self, normalize_case: bool) -> io::Result<Self> {
         self.hospital_name = required_text(&self.hospital_name, "hospital_name")?.to_owned();
         self.last_updated_on = required_text(&self.last_updated_on, "last_updated_on")?.to_owned();
-        self.version = if normalize_case {
-            required_text(&self.version, "version")?.to_owned()
-        } else if self.version.is_empty() {
-            return Err(invalid("version must be a non-empty string"));
-        } else {
-            self.version
-        };
-        if self.version != HOSPITAL_MRF_SCHEMA_VERSION {
-            return Err(invalid("hospital MRF version must be 3.0.0"));
-        }
+        self.version = required_text(&self.version, "version")?.to_owned();
         self.location_names = non_empty_text_list(self.location_names, "location_name")?;
         self.hospital_addresses = non_empty_text_list(self.hospital_addresses, "hospital_address")?;
         self.type_2_npis = non_empty_text_list(self.type_2_npis, "type_2_npi")?;

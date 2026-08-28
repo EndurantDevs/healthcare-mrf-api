@@ -204,9 +204,10 @@ async def test_attempt_admission_locks_generation_and_rejects_active_attempts():
     assert rows == [("hospital-a", "attempt-a", 3)]
     assert "ON COMMIT DROP" in sql
     assert "FOR UPDATE OF current" in sql
+    assert "FOR UPDATE OF latest" in sql
     assert "NOT IN ('queued', 'running', 'verified')" in sql
     assert "error_code='lease_expired'" in sql
-    assert "attempt.lease_expires_at <= clock_timestamp()" in sql
+    assert "latest_locked.lease_expires_at <= clock_timestamp()" in sql
     assert "heartbeat_at, lease_expires_at" in sql
     assert "SET latest_attempt_id=inserted.attempt_id" in sql
     assert connection.driver.records[0][0] == "hospital-a"
@@ -267,6 +268,9 @@ async def test_evidence_is_immutable_and_publication_is_one_generation_cas():
         "(hospital_id, version_id, source_ordinal, npi, source_kind)" in sql
     )
     assert "'mrf_header_file'" in sql
+    assert "npi.npi ~ '^[0-9]{10}$'" in sql
+    assert "version.npi_count <>" in sql
+    assert sql.count("EXCEPT") == 2
     assert "tin_type, tin_value, source_kind" in sql
     assert "current.generation=staged.expected_generation" in sql
     assert "current.latest_attempt_id=staged.attempt_id" in sql

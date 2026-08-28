@@ -149,6 +149,7 @@ def _download_session(timeout: aiohttp.ClientTimeout) -> aiohttp.ClientSession:
         timeout=timeout,
         connector=_public_connector(),
         headers={"User-Agent": _HTTP_USER_AGENT},
+        max_field_size=64 * 1024,
     )
 
 

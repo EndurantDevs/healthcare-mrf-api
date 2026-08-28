@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import stat
 from pathlib import Path
 from typing import Any
@@ -107,27 +106,3 @@ def unlink_transient_source(store: Any, raw: Any) -> None:
     finally:
         for directory_fd in reversed(directory_fds):
             os.close(directory_fd)
-
-
-def sweep_transient_source_roots(store: Any) -> None:
-    """Remove stale hospital-only source roots left by a terminated run."""
-
-    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
-        raise RuntimeError(
-            "hospital source scratch requires symlink-resistant removal"
-        )
-    tmp_root = owned_tmp_root(store)
-    stale_roots: list[Path] = []
-    for candidate in sorted(tmp_root.iterdir(), key=lambda path: path.name):
-        if not candidate.name.startswith(HOSPITAL_SOURCE_TMP_PREFIX):
-            continue
-        candidate_stat = candidate.lstat()
-        if not stat.S_ISDIR(candidate_stat.st_mode) or candidate.is_symlink():
-            raise RuntimeError(
-                "hospital source scratch entry is not a regular directory"
-            )
-        if candidate.resolve(strict=True).parent != tmp_root:
-            raise RuntimeError("hospital source scratch entry is not task-owned")
-        stale_roots.append(candidate)
-    for stale_root in stale_roots:
-        shutil.rmtree(stale_root)

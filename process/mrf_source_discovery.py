@@ -5334,16 +5334,13 @@ def _magnacare_search_terms(source: dict[str, Any], resolver: dict[str, Any]) ->
     return terms
 
 
-async def _resolve_magnacare_transparency_mrf(
+async def _magnacare_grouped_results(
     source_record: dict[str, Any],
     url: str,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
-) -> list[CrawlTarget]:
-    """Resolve MagnaCare transparency search results into crawl targets."""
-    resolver_type = str(resolver.get("type") or "magnacare_transparency_mrf")
+) -> dict[tuple[str, str, str, str], dict[str, Any]]:
     max_bytes = int(resolver.get("max_bytes") or 5 * 1024 * 1024)
-    ip_address = str(resolver.get("download_ip_address") or "127.0.0.1")
     grouped_by_target_key: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     max_targets = _as_int(resolver.get("max_targets"))
     for search_term in _magnacare_search_terms(source_record, resolver):
@@ -5388,69 +5385,95 @@ async def _resolve_magnacare_transparency_mrf(
                 grouped_result["plan_info"].append(plan)
         if max_targets and len(grouped_by_target_key) >= max_targets:
             break
+    return grouped_by_target_key
+
+
+async def _magnacare_crawl_target(
+    source_record: dict[str, Any],
+    url: str,
+    resolver_type: str,
+    grouped_result: dict[str, Any],
+    ip_address: str,
+    max_bytes: int,
+    session: aiohttp.ClientSession,
+) -> CrawlTarget | None:
+    result_row = grouped_result["row"]
+    run_history_id = _clean_text(result_row.get("run_history_id"))
+    dynamic_download_url = _magnacare_download_url(url, run_history_id, ip_address)
+    download_payload = await _fetch_json(
+        dynamic_download_url, max_bytes=max_bytes, session=session
+    )
+    file_url = _clean_text(
+        download_payload.get("Data") if isinstance(download_payload, dict) else ""
+    )
+    if not file_url.startswith(("http://", "https://")):
+        return None
+    file_name = _clean_text(result_row.get("file_name")) or Path(
+        urlsplit(file_url).path
+    ).name
+    network_name = _clean_text(result_row.get("network_name"))
+    file_type = grouped_result["file_type"]
+    label = " - ".join(
+        part
+        for part in (
+            network_name,
+            _clean_text(result_row.get("file_type_label")) or file_type,
+            file_name,
+        )
+        if part
+    )
+    return CrawlTarget(
+        source=source_record,
+        url=file_url,
+        label=label,
+        resolved_from_url=url,
+        metadata={
+            "resolver": resolver_type,
+            "target_kind": "file_reference",
+            "target_file_type": file_type,
+            "container_format": _container_format(file_url),
+            "plan_info": grouped_result["plan_info"],
+            "network_name": network_name or None,
+            "file_name": file_name,
+            "file_size": _clean_text(result_row.get("file_size")) or None,
+            "size_bytes": _parse_size_bytes(result_row.get("file_size")),
+            "schema_version": _clean_text(result_row.get("file_version")) or None,
+            "run_history_id": run_history_id,
+            "dynamic_download_url": dynamic_download_url,
+            "search_terms": sorted(grouped_result["search_terms"]),
+            "results_urls": sorted(grouped_result["results_urls"]),
+            "reporting_entity_name": "MagnaCare and Brighton administered plans",
+            "reporting_entity_type": "third_party_administrator",
+        },
+    )
+
+
+async def _resolve_magnacare_transparency_mrf(
+    source_record: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    """Resolve MagnaCare transparency search results into crawl targets."""
+    grouped_by_target_key = await _magnacare_grouped_results(
+        source_record, url, resolver, session
+    )
     if not grouped_by_target_key:
         raise ValueError(f"no MagnaCare transparency MRF rows found for {url}")
-
+    resolver_type = str(resolver.get("type") or "magnacare_transparency_mrf")
+    max_bytes = int(resolver.get("max_bytes") or 5 * 1024 * 1024)
+    ip_address = str(resolver.get("download_ip_address") or "127.0.0.1")
+    max_targets = _as_int(resolver.get("max_targets"))
     crawl_targets: list[CrawlTarget] = []
     for grouped_result in list(grouped_by_target_key.values())[
         : max_targets or len(grouped_by_target_key)
     ]:
-        result_row = grouped_result["row"]
-        run_history_id = _clean_text(result_row.get("run_history_id"))
-        dynamic_download_url = _magnacare_download_url(url, run_history_id, ip_address)
-        download_payload = await _fetch_json(
-            dynamic_download_url,
-            max_bytes=max_bytes,
-            session=session,
+        crawl_target = await _magnacare_crawl_target(
+            source_record, url, resolver_type, grouped_result,
+            ip_address, max_bytes, session,
         )
-        file_url = _clean_text(
-            download_payload.get("Data")
-            if isinstance(download_payload, dict)
-            else ""
-        )
-        if not file_url.startswith(("http://", "https://")):
-            continue
-        file_name = _clean_text(result_row.get("file_name")) or Path(
-            urlsplit(file_url).path
-        ).name
-        network_name = _clean_text(result_row.get("network_name"))
-        file_type = grouped_result["file_type"]
-        label = " - ".join(
-            part
-            for part in (
-                network_name,
-                _clean_text(result_row.get("file_type_label")) or file_type,
-                file_name,
-            )
-            if part
-        )
-        crawl_targets.append(
-            CrawlTarget(
-                source=source_record,
-                url=file_url,
-                label=label,
-                resolved_from_url=url,
-                metadata={
-                    "resolver": resolver_type,
-                    "target_kind": "file_reference",
-                    "target_file_type": file_type,
-                    "container_format": _container_format(file_url),
-                    "plan_info": grouped_result["plan_info"],
-                    "network_name": network_name or None,
-                    "file_name": file_name,
-                    "file_size": _clean_text(result_row.get("file_size")) or None,
-                    "size_bytes": _parse_size_bytes(result_row.get("file_size")),
-                    "schema_version": _clean_text(result_row.get("file_version"))
-                    or None,
-                    "run_history_id": run_history_id,
-                    "dynamic_download_url": dynamic_download_url,
-                    "search_terms": sorted(grouped_result["search_terms"]),
-                    "results_urls": sorted(grouped_result["results_urls"]),
-                    "reporting_entity_name": "MagnaCare and Brighton administered plans",
-                    "reporting_entity_type": "third_party_administrator",
-                },
-            )
-        )
+        if crawl_target is not None:
+            crawl_targets.append(crawl_target)
     if not crawl_targets:
         raise ValueError(f"no downloadable MagnaCare transparency MRF files found for {url}")
     return crawl_targets
@@ -6041,6 +6064,106 @@ def _auxiant_annotated_target(
     )
 
 
+async def _auxiant_nested_link_targets(
+    source_record: dict[str, Any],
+    link: dict[str, Any],
+    network_name: str,
+    page_url: str,
+    directory_url: str,
+    resolver_type: str,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    external_url = str(link.get("url") or "").strip()
+    if not external_url:
+        return []
+    nested_source_by_field = {
+        **source_record,
+        "hosting_platform": classify_hosting_platform(external_url),
+    }
+    nested_error: str | None = None
+    try:
+        nested_targets = await _crawl_targets_for_source(
+            nested_source_by_field, external_url, session
+        )
+    except Exception as exc:
+        nested_targets = []
+        nested_error = f"{type(exc).__name__}: {exc}"
+    if nested_targets:
+        return [
+            _auxiant_annotated_target(
+                nested_target,
+                source_record=source_record,
+                network_name=network_name,
+                page_url=page_url,
+                directory_url=directory_url,
+                external_url=external_url,
+                resolver_type=resolver_type,
+            )
+            for nested_target in nested_targets
+        ]
+    return [
+        _auxiant_landing_target(
+            source_record,
+            network_name=network_name,
+            page_url=page_url,
+            directory_url=directory_url,
+            landing_url=external_url,
+            resolver_type=resolver_type,
+            landing_label=str(link.get("label") or ""),
+            nested_error=nested_error,
+        )
+    ]
+
+
+async def _auxiant_network_targets(
+    source_record: dict[str, Any],
+    network: dict[str, Any],
+    directory_url: str,
+    resolver_type: str,
+    page_max_bytes: int,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    page_url = str(network["url"])
+    network_name = str(network["label"])
+    page_html = await _fetch_text(
+        page_url, max_bytes=page_max_bytes, session=session
+    )
+    page_links = _parse_auxiant_page_links(page_html, base_url=page_url)
+    crawl_targets: list[CrawlTarget] = []
+    for link in page_links:
+        if link.get("target_kind") == "file_reference":
+            crawl_targets.append(
+                _auxiant_direct_target(
+                    source_record,
+                    link,
+                    network_name=network_name,
+                    page_url=page_url,
+                    directory_url=directory_url,
+                    resolver_type=resolver_type,
+                )
+            )
+        else:
+            crawl_targets.extend(
+                await _auxiant_nested_link_targets(
+                    source_record, link, network_name, page_url,
+                    directory_url, resolver_type, session,
+                )
+            )
+    if not page_links:
+        crawl_targets.append(
+            _auxiant_landing_target(
+                source_record,
+                network_name=network_name,
+                page_url=page_url,
+                directory_url=directory_url,
+                landing_url=page_url,
+                resolver_type=resolver_type,
+                landing_label=network_name,
+            )
+        )
+    return crawl_targets
+
+
 async def _resolve_auxiant_wordpress_directory(
     source_record: dict[str, Any],
     url: str,
@@ -6063,7 +6186,6 @@ async def _resolve_auxiant_wordpress_directory(
     max_networks = _as_int(resolver.get("max_networks"))
     if max_networks:
         networks = networks[:max_networks]
-
     crawl_targets: list[CrawlTarget] = []
     for link in _parse_auxiant_page_links(directory_html, base_url=directory_url):
         if link.get("target_kind") == "file_reference":
@@ -6079,82 +6201,13 @@ async def _resolve_auxiant_wordpress_directory(
             )
 
     for network in networks:
-        page_url = str(network["url"])
-        network_name = str(network["label"])
-        page_html = await _fetch_text(
-            page_url,
-            max_bytes=int(resolver.get("page_max_bytes") or 10 * 1024 * 1024),
-            session=session,
-        )
-        page_links = _parse_auxiant_page_links(page_html, base_url=page_url)
-        for link in page_links:
-            if link.get("target_kind") == "file_reference":
-                crawl_targets.append(
-                    _auxiant_direct_target(
-                        source_record,
-                        link,
-                        network_name=network_name,
-                        page_url=page_url,
-                        directory_url=directory_url,
-                        resolver_type=resolver_type,
-                    )
-                )
-                continue
-            external_url = str(link.get("url") or "").strip()
-            if not external_url:
-                continue
-            nested_platform = classify_hosting_platform(external_url)
-            nested_source_by_field = {
-                **source_record,
-                "hosting_platform": nested_platform,
-            }
-            nested_error: str | None = None
-            try:
-                nested_targets = await _crawl_targets_for_source(
-                    nested_source_by_field,
-                    external_url,
-                    session,
-                )
-            except Exception as exc:
-                nested_targets = []
-                nested_error = f"{type(exc).__name__}: {exc}"
-            for nested_target in nested_targets:
-                crawl_targets.append(
-                    _auxiant_annotated_target(
-                        nested_target,
-                        source_record=source_record,
-                        network_name=network_name,
-                        page_url=page_url,
-                        directory_url=directory_url,
-                        external_url=external_url,
-                        resolver_type=resolver_type,
-                    )
-                )
-            if not nested_targets:
-                crawl_targets.append(
-                    _auxiant_landing_target(
-                        source_record,
-                        network_name=network_name,
-                        page_url=page_url,
-                        directory_url=directory_url,
-                        landing_url=external_url,
-                        resolver_type=resolver_type,
-                        landing_label=str(link.get("label") or ""),
-                        nested_error=nested_error,
-                    )
-                )
-        if not page_links:
-            crawl_targets.append(
-                _auxiant_landing_target(
-                    source_record,
-                    network_name=network_name,
-                    page_url=page_url,
-                    directory_url=directory_url,
-                    landing_url=page_url,
-                    resolver_type=resolver_type,
-                    landing_label=network_name,
-                )
+        crawl_targets.extend(
+            await _auxiant_network_targets(
+                source_record, network, directory_url, resolver_type,
+                int(resolver.get("page_max_bytes") or 10 * 1024 * 1024),
+                session,
             )
+        )
     if not crawl_targets:
         raise ValueError(f"no Auxiant network MRF links found for {directory_url}")
     return crawl_targets
@@ -7412,6 +7465,81 @@ def _wordpress_elfinder_target_sort_key(target: CrawlTarget) -> tuple[int, int, 
     return (file_type_rank, date_rank, str(target.label or target.url or ""))
 
 
+async def _wordpress_elfinder_open_payload(
+    manager_config: dict[str, Any],
+    target: str | None,
+    max_bytes: int,
+    browser_session: aiohttp.ClientSession,
+) -> Any:
+    request_fields_by_name = {
+        "_wpnonce": manager_config["nonce"],
+        "data_key": manager_config["data_key"],
+        "cmd": "open",
+    }
+    if target is None:
+        request_fields_by_name.update({"init": "1", "tree": "1"})
+    else:
+        request_fields_by_name["target"] = target
+    return await _post_form_json_value(
+        manager_config["url"],
+        request_fields_by_name,
+        max_bytes=max_bytes,
+        session=browser_session,
+    )
+
+
+async def _wordpress_elfinder_manager_targets(
+    source_row_dict: dict[str, Any],
+    manager_config: dict[str, Any],
+    resolver_type: str,
+    ajax_max_bytes: int,
+    max_directories: int,
+    opened_directories: int,
+    browser_session: aiohttp.ClientSession,
+) -> tuple[list[CrawlTarget], int, Exception | None]:
+    try:
+        root_payload = await _wordpress_elfinder_open_payload(
+            manager_config, None, ajax_max_bytes, browser_session
+        )
+    except Exception as exc:
+        return [], opened_directories, exc
+    if not isinstance(root_payload, dict):
+        return [], opened_directories, None
+    root_url = _wordpress_elfinder_root_url(root_payload)
+    crawl_targets = _wordpress_elfinder_targets_from_payload(
+        source_row_dict,
+        root_payload,
+        root_url=root_url,
+        resolved_from_url=manager_config["url"],
+        resolver_type=resolver_type,
+        file_manager_id=manager_config.get("file_manager_id"),
+    )
+    last_error: Exception | None = None
+    for directory_hash in _wordpress_elfinder_directory_hashes(root_payload):
+        if opened_directories >= max_directories:
+            break
+        opened_directories += 1
+        try:
+            directory_payload = await _wordpress_elfinder_open_payload(
+                manager_config, directory_hash, ajax_max_bytes, browser_session
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
+        if isinstance(directory_payload, dict):
+            crawl_targets.extend(
+                _wordpress_elfinder_targets_from_payload(
+                    source_row_dict,
+                    directory_payload,
+                    root_url=root_url,
+                    resolved_from_url=manager_config["url"],
+                    resolver_type=resolver_type,
+                    file_manager_id=manager_config.get("file_manager_id"),
+                )
+            )
+    return crawl_targets, opened_directories, last_error
+
+
 async def _resolve_wordpress_elfinder_mrf_links(
     source_row_dict: dict[str, Any],
     url: str,
@@ -7452,66 +7580,16 @@ async def _resolve_wordpress_elfinder_mrf_links(
         opened_directories = 0
         last_error: Exception | None = None
         for manager_config in manager_configs[:max_file_managers]:
-            try:
-                root_payload = await _post_form_json_value(
-                    manager_config["url"],
-                    {
-                        "_wpnonce": manager_config["nonce"],
-                        "data_key": manager_config["data_key"],
-                        "cmd": "open",
-                        "init": "1",
-                        "tree": "1",
-                    },
-                    max_bytes=ajax_max_bytes,
-                    session=browser_session,
-                )
-            except Exception as exc:
-                last_error = exc
-                continue
-            if not isinstance(root_payload, dict):
-                continue
-            root_url = _wordpress_elfinder_root_url(root_payload)
-            crawl_targets.extend(
-                _wordpress_elfinder_targets_from_payload(
-                    source_row_dict,
-                    root_payload,
-                    root_url=root_url,
-                    resolved_from_url=manager_config["url"],
-                    resolver_type=resolver_type,
-                    file_manager_id=manager_config.get("file_manager_id"),
+            manager_targets, opened_directories, manager_error = (
+                await _wordpress_elfinder_manager_targets(
+                    source_row_dict, manager_config, resolver_type,
+                    ajax_max_bytes, max_directories, opened_directories,
+                    browser_session,
                 )
             )
-            for directory_hash in _wordpress_elfinder_directory_hashes(root_payload):
-                if opened_directories >= max_directories:
-                    break
-                opened_directories += 1
-                try:
-                    directory_payload = await _post_form_json_value(
-                        manager_config["url"],
-                        {
-                            "_wpnonce": manager_config["nonce"],
-                            "data_key": manager_config["data_key"],
-                            "cmd": "open",
-                            "target": directory_hash,
-                        },
-                        max_bytes=ajax_max_bytes,
-                        session=browser_session,
-                    )
-                except Exception as exc:
-                    last_error = exc
-                    continue
-                if not isinstance(directory_payload, dict):
-                    continue
-                crawl_targets.extend(
-                    _wordpress_elfinder_targets_from_payload(
-                        source_row_dict,
-                        directory_payload,
-                        root_url=root_url,
-                        resolved_from_url=manager_config["url"],
-                        resolver_type=resolver_type,
-                        file_manager_id=manager_config.get("file_manager_id"),
-                    )
-                )
+            crawl_targets.extend(manager_targets)
+            if manager_error is not None:
+                last_error = manager_error
         crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
         crawl_targets = _filter_crawl_targets_by_resolver_patterns(crawl_targets, resolver)
         crawl_targets = sorted(crawl_targets, key=_wordpress_elfinder_target_sort_key)
@@ -7543,6 +7621,89 @@ def _ebms_index_page_urls(html_text: str, *, base_url: str) -> list[tuple[str, s
     return urls
 
 
+async def _ebms_page_targets(
+    source_record: dict[str, Any],
+    page_url: str,
+    client_url: str,
+    client_label: str,
+    nested_url: str | None,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> tuple[list[CrawlTarget], str]:
+    configured_max_bytes = (
+        resolver.get("nested_page_max_bytes")
+        or resolver.get("client_page_max_bytes")
+        if nested_url
+        else resolver.get("client_page_max_bytes")
+    )
+    max_bytes = int(
+        configured_max_bytes or resolver.get("max_bytes") or 5 * 1024 * 1024
+    )
+    page_html = await _fetch_text(page_url, max_bytes=max_bytes, session=session)
+    page_crawl_targets = _crawl_targets_from_html_mrf_links(
+        source_record,
+        page_html,
+        base_url=page_url,
+        resolver="ebms_caa_directory",
+        target_max_bytes=_parse_size_bytes(resolver.get("toc_max_bytes")),
+    )
+    enriched_targets: list[CrawlTarget] = []
+    for page_target in page_crawl_targets:
+        metadata = {
+            **dict(page_target.metadata or {}),
+            "resolver": "ebms_caa_directory",
+            "ebms_client_url": client_url,
+        }
+        if client_label:
+            metadata["ebms_client_label"] = client_label
+        if nested_url:
+            metadata["ebms_nested_url"] = nested_url
+        enriched_targets.append(
+            CrawlTarget(
+                source=source_record,
+                url=page_target.url,
+                label=page_target.label,
+                resolved_from_url=page_url,
+                metadata=metadata,
+            )
+        )
+    return enriched_targets, page_html
+
+
+async def _ebms_client_targets(
+    source_record: dict[str, Any],
+    client_url: str,
+    client_label: str,
+    resolver: dict[str, Any],
+    target_limit: int,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    try:
+        client_targets, client_html = await _ebms_page_targets(
+            source_record, client_url, client_url, client_label,
+            None, resolver, session,
+        )
+    except Exception:
+        return []
+    if client_targets:
+        return client_targets
+    max_nested = _as_int(resolver.get("max_nested_pages_per_client")) or 20
+    for nested_url, _nested_label in _ebms_index_page_urls(
+        client_html, base_url=client_url
+    )[:max_nested]:
+        try:
+            nested_targets, _nested_html = await _ebms_page_targets(
+                source_record, nested_url, client_url, client_label,
+                nested_url, resolver, session,
+            )
+            client_targets.extend(nested_targets)
+        except Exception:
+            continue
+        if len(client_targets) >= target_limit:
+            break
+    return client_targets
+
+
 async def _resolve_ebms_caa_directory(
     source_record: dict[str, Any],
     url: str,
@@ -7555,97 +7716,37 @@ async def _resolve_ebms_caa_directory(
         max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
         session=session,
     )
+    resolver_by_key = {
+        **resolver,
+        "toc_max_bytes": _parse_size_bytes(resolver.get("toc_max_bytes")),
+        "max_nested_pages_per_client": (
+            _as_int(resolver.get("max_nested_pages_per_client")) or 20
+        ),
+        "client_page_max_bytes": int(
+            resolver.get("client_page_max_bytes")
+            or resolver.get("max_bytes")
+            or 5 * 1024 * 1024
+        ),
+        "nested_page_max_bytes": int(
+            resolver.get("nested_page_max_bytes")
+            or resolver.get("client_page_max_bytes")
+            or resolver.get("max_bytes")
+            or 5 * 1024 * 1024
+        ),
+    }
+    max_targets = _as_int(resolver_by_key.get("max_targets")) or 5000
+    max_clients = _as_int(resolver_by_key.get("max_clients")) or 500
     crawl_targets: list[CrawlTarget] = []
-    target_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes"))
-    max_targets = _as_int(resolver.get("max_targets")) or 5000
-    max_clients = _as_int(resolver.get("max_clients")) or 500
-    max_nested = _as_int(resolver.get("max_nested_pages_per_client")) or 20
-    client_page_max_bytes = int(
-        resolver.get("client_page_max_bytes")
-        or resolver.get("max_bytes")
-        or 5 * 1024 * 1024
-    )
-    nested_page_max_bytes = int(
-        resolver.get("nested_page_max_bytes")
-        or resolver.get("client_page_max_bytes")
-        or resolver.get("max_bytes")
-        or 5 * 1024 * 1024
-    )
-
-    async def page_targets(
-        page_url: str, *, client_url: str, client_label: str, nested_url: str | None
-    ) -> list[CrawlTarget]:
-        """Fetch one EBMS directory page and extract its crawl targets."""
-        page_html = await _fetch_text(
-            page_url,
-            max_bytes=nested_page_max_bytes if nested_url else client_page_max_bytes,
-            session=session,
-        )
-        page_crawl_targets = _crawl_targets_from_html_mrf_links(
-            source_record,
-            page_html,
-            base_url=page_url,
-            resolver="ebms_caa_directory",
-            target_max_bytes=target_max_bytes,
-        )
-        enriched_targets: list[CrawlTarget] = []
-        for page_target in page_crawl_targets:
-            metadata = {
-                **dict(page_target.metadata or {}),
-                "resolver": "ebms_caa_directory",
-                "ebms_client_url": client_url,
-            }
-            if client_label:
-                metadata["ebms_client_label"] = client_label
-            if nested_url:
-                metadata["ebms_nested_url"] = nested_url
-            enriched_targets.append(
-                CrawlTarget(
-                    source=source_record,
-                    url=page_target.url,
-                    label=page_target.label,
-                    resolved_from_url=page_url,
-                    metadata=metadata,
-                )
-            )
-        return enriched_targets
-
     for client_url, client_label in _ebms_index_page_urls(root_html, base_url=url)[
         :max_clients
     ]:
-        try:
-            client_targets = await page_targets(
-                client_url,
-                client_url=client_url,
-                client_label=client_label,
-                nested_url=None,
+        remaining = max_targets - len(crawl_targets)
+        crawl_targets.extend(
+            await _ebms_client_targets(
+                source_record, client_url, client_label, resolver_by_key,
+                remaining, session,
             )
-        except Exception:
-            continue
-        crawl_targets.extend(client_targets)
-        if not client_targets:
-            try:
-                client_html = await _fetch_text(
-                    client_url, max_bytes=client_page_max_bytes, session=session
-                )
-            except Exception:
-                client_html = ""
-            for nested_url, _nested_label in _ebms_index_page_urls(
-                client_html, base_url=client_url
-            )[:max_nested]:
-                try:
-                    crawl_targets.extend(
-                        await page_targets(
-                            nested_url,
-                            client_url=client_url,
-                            client_label=client_label,
-                            nested_url=nested_url,
-                        )
-                    )
-                except Exception:
-                    continue
-                if len(crawl_targets) >= max_targets:
-                    break
+        )
         if len(crawl_targets) >= max_targets:
             break
     crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
@@ -11430,7 +11531,7 @@ def _is_healthcarebluebook_item_query_match(
     )
 
 
-def _healthcarebluebook_nested_target(
+def _annotate_healthcarebluebook_nested_target(
     nested_target: CrawlTarget,
     *,
     source_record: dict[str, Any],
@@ -11462,6 +11563,120 @@ def _healthcarebluebook_nested_target(
     )
 
 
+def _healthcarebluebook_item_values(
+    listing_items: list[dict[str, Any]],
+    index: int,
+    target_query: str | None,
+) -> tuple[str, str, Any, str] | None:
+    listing_item = listing_items[index]
+    link_url = str(listing_item.get("url") or "").strip()
+    if not link_url:
+        return None
+    label = (
+        _clean_text(listing_item.get("label"))
+        or Path(urlsplit(link_url).path).name
+        or "MRF file"
+    )
+    type_text = (
+        listing_items[index + 1].get("text")
+        if index + 1 < len(listing_items)
+        else ""
+    )
+    file_type = _healthcarebluebook_file_type(type_text, label, link_url)
+    if not file_type or not _is_healthcarebluebook_item_query_match(
+        listing_item,
+        link_url=link_url,
+        label=label,
+        type_text=type_text,
+        query=target_query,
+    ):
+        return None
+    return link_url, label, type_text, file_type
+
+
+async def _healthcarebluebook_direct_target(
+    source_record: dict[str, Any],
+    listing_url: str,
+    item_values: tuple[str, str, Any, str],
+    resolver_type: str,
+    session: aiohttp.ClientSession,
+) -> CrawlTarget | None:
+    link_url, label, type_text, file_type = item_values
+    is_hbb_numeric_file = _is_healthcarebluebook_relative_file_url(link_url)
+    if not (is_hbb_numeric_file or _is_direct_mrf_body_url(link_url)):
+        return None
+    if is_hbb_numeric_file and not await _is_healthcarebluebook_numeric_url_downloadable(
+        link_url, session
+    ):
+        return None
+    metadata = {
+        "resolver": resolver_type,
+        "target_kind": "file_reference",
+        "target_file_type": file_type,
+        "container_format": _container_format(link_url)
+        or ("zip" if is_hbb_numeric_file else None),
+        "source_format": _healthcarebluebook_source_format(link_url),
+        "healthcarebluebook_listing_url": listing_url,
+        "healthcarebluebook_file_type": _clean_text(type_text),
+        "plan_info": _plan_info_from_label(label),
+    }
+    return CrawlTarget(
+        source=source_record,
+        url=link_url,
+        label=label,
+        resolved_from_url=listing_url,
+        metadata={
+            metadata_key: metadata_value
+            for metadata_key, metadata_value in metadata.items()
+            if metadata_value not in (None, "", [])
+        },
+    )
+
+
+async def _healthcarebluebook_nested_targets(
+    source_record: dict[str, Any],
+    listing_url: str,
+    item_values: tuple[str, str, Any, str],
+    resolver_type: str,
+    target_limit: int | None,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    link_url, label, _type_text, file_type = item_values
+    nested_platform = classify_hosting_platform(link_url)
+    if not nested_platform:
+        return []
+    nested_source_by_field = {
+        **source_record,
+        "hosting_platform": nested_platform,
+    }
+    try:
+        nested_targets = await _crawl_targets_for_source(
+            nested_source_by_field,
+            link_url,
+            session,
+            target_limit=target_limit,
+        )
+    except Exception:
+        return []
+    bounded_targets = (
+        nested_targets[:target_limit]
+        if target_limit is not None
+        else nested_targets
+    )
+    return [
+        _annotate_healthcarebluebook_nested_target(
+            nested_target,
+            source_record=source_record,
+            listing_url=listing_url,
+            link_url=link_url,
+            label=label,
+            file_type=file_type,
+            resolver_type=resolver_type,
+        )
+        for nested_target in bounded_targets
+    ]
+
+
 async def _resolve_healthcarebluebook_mrf(
     source_record: dict[str, Any],
     url: str,
@@ -11479,97 +11694,30 @@ async def _resolve_healthcarebluebook_mrf(
     targets_by_url: dict[str, CrawlTarget] = {}
     max_targets = _as_int(resolver.get("max_targets"))
     target_query = _source_target_payer_query(source_record)
-    for index, listing_item in enumerate(listing_items):
+    for index in range(len(listing_items)):
         if max_targets and len(targets_by_url) >= max_targets:
             break
-        link_url = str(listing_item.get("url") or "").strip()
-        if not link_url:
-            continue
-        label = (
-            _clean_text(listing_item.get("label"))
-            or Path(urlsplit(link_url).path).name
-            or "MRF file"
+        item_values = _healthcarebluebook_item_values(
+            listing_items, index, target_query
         )
-        type_text = (
-            listing_items[index + 1].get("text")
-            if index + 1 < len(listing_items)
-            else ""
-        )
-        file_type = _healthcarebluebook_file_type(type_text, label, link_url)
-        if not file_type:
+        if item_values is None:
             continue
-        if not _is_healthcarebluebook_item_query_match(
-            listing_item,
-            link_url=link_url,
-            label=label,
-            type_text=type_text,
-            query=target_query,
+        direct_target = await _healthcarebluebook_direct_target(
+            source_record, url, item_values, resolver_type, session
+        )
+        link_url = item_values[0]
+        if _is_healthcarebluebook_relative_file_url(
+            link_url
+        ) or _is_direct_mrf_body_url(link_url):
+            if direct_target is not None:
+                key = _canonical_or_none(direct_target.url) or direct_target.url
+                targets_by_url[key] = direct_target
+            continue
+        nested_target_limit = max_targets - len(targets_by_url) if max_targets else None
+        for annotated in await _healthcarebluebook_nested_targets(
+            source_record, url, item_values, resolver_type,
+            nested_target_limit, session,
         ):
-            continue
-        is_hbb_numeric_file = _is_healthcarebluebook_relative_file_url(link_url)
-        if is_hbb_numeric_file or _is_direct_mrf_body_url(link_url):
-            is_downloadable = (
-                not is_hbb_numeric_file
-                or await _is_healthcarebluebook_numeric_url_downloadable(
-                    link_url, session
-                )
-            )
-            if not is_downloadable:
-                continue
-            plan_info = _plan_info_from_label(label)
-            metadata = {
-                "resolver": resolver_type,
-                "target_kind": "file_reference",
-                "target_file_type": file_type,
-                "container_format": _container_format(link_url)
-                or ("zip" if is_hbb_numeric_file else None),
-                "source_format": _healthcarebluebook_source_format(link_url),
-                "healthcarebluebook_listing_url": url,
-                "healthcarebluebook_file_type": _clean_text(type_text),
-                "plan_info": plan_info,
-            }
-            key = _canonical_or_none(link_url) or link_url
-            targets_by_url[key] = CrawlTarget(
-                source=source_record,
-                url=link_url,
-                label=label,
-                resolved_from_url=url,
-                metadata={
-                    metadata_key: metadata_value
-                    for metadata_key, metadata_value in metadata.items()
-                    if metadata_value not in (None, "", [])
-                },
-            )
-            continue
-        nested_platform = classify_hosting_platform(link_url)
-        if not nested_platform:
-            continue
-        nested_source_by_field = {
-            **source_record,
-            "hosting_platform": nested_platform,
-        }
-        try:
-            nested_target_limit = (
-                max_targets - len(targets_by_url) if max_targets else None
-            )
-            nested_targets = await _crawl_targets_for_source(
-                nested_source_by_field,
-                link_url,
-                session,
-                target_limit=nested_target_limit,
-            )
-        except Exception:
-            nested_targets = []
-        for nested_target in nested_targets:
-            annotated = _healthcarebluebook_nested_target(
-                nested_target,
-                source_record=source_record,
-                listing_url=url,
-                link_url=link_url,
-                label=label,
-                file_type=file_type,
-                resolver_type=resolver_type,
-            )
             key = _canonical_or_none(annotated.url) or annotated.url
             targets_by_url[key] = annotated
             if max_targets and len(targets_by_url) >= max_targets:
@@ -11582,21 +11730,14 @@ async def _resolve_healthcarebluebook_mrf(
     return crawl_targets
 
 
-async def _resolve_html_mrf_with_healthcarebluebook(
+def _html_mrf_direct_targets(
     source_record: dict[str, Any],
-    url: str,
-    resolver: dict[str, Any],
-    session: aiohttp.ClientSession,
-) -> list[CrawlTarget]:
-    """Resolve an HTML MRF page and enrich targets with Healthcare Bluebook data."""
-    resolver_type = str(resolver.get("type") or "html_mrf_with_healthcarebluebook")
-    html_text = await _fetch_text(
-        url,
-        max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
-        session=session,
-    )
+    landing_url: str,
+    html_text: str,
+    resolver_type: str,
+) -> dict[str, CrawlTarget]:
     targets_by_url: dict[str, CrawlTarget] = {}
-    for parsed_target in _parse_html_mrf_links(html_text, base_url=url):
+    for parsed_target in _parse_html_mrf_links(html_text, base_url=landing_url):
         target_url = str(parsed_target["url"])
         source_format = (
             "csv" if urlsplit(target_url).path.lower().endswith(".csv") else None
@@ -11608,7 +11749,7 @@ async def _resolve_html_mrf_with_healthcarebluebook(
             "container_format": parsed_target.get("container_format"),
             "source_format": source_format,
             "html_attr": parsed_target.get("html_attr"),
-            "landing_url": url,
+            "landing_url": landing_url,
             "plan_info": parsed_target.get("plan_info"),
         }
         key = _canonical_or_none(target_url) or target_url
@@ -11620,14 +11761,51 @@ async def _resolve_html_mrf_with_healthcarebluebook(
                 or source_record.get("display_name")
                 or ""
             ),
-            resolved_from_url=url,
+            resolved_from_url=landing_url,
             metadata={
                 metadata_key: metadata_value
                 for metadata_key, metadata_value in metadata.items()
                 if metadata_value not in (None, "")
             },
         )
-    for candidate in _html_link_candidates(html_text, base_url=url):
+    return targets_by_url
+
+
+def _annotate_html_healthcarebluebook_target(
+    nested_target: CrawlTarget,
+    source_record: dict[str, Any],
+    landing_url: str,
+    link_url: str,
+    resolver_type: str,
+) -> CrawlTarget:
+    metadata = dict(nested_target.metadata or {})
+    metadata.update(
+        {
+            "resolver": resolver_type,
+            "nested_resolver": metadata.get("resolver"),
+            "landing_url": landing_url,
+            "healthcarebluebook_url": link_url,
+        }
+    )
+    return CrawlTarget(
+        source=source_record,
+        url=nested_target.url,
+        label=nested_target.label,
+        resolved_from_url=nested_target.resolved_from_url or link_url,
+        metadata=metadata,
+    )
+
+
+async def _html_healthcarebluebook_targets(
+    source_record: dict[str, Any],
+    landing_url: str,
+    html_text: str,
+    resolver: dict[str, Any],
+    resolver_type: str,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    crawl_targets: list[CrawlTarget] = []
+    for candidate in _html_link_candidates(html_text, base_url=landing_url):
         link_url = str(candidate.get("url") or "").strip()
         if _domain(link_url) != "mrf.healthcarebluebook.com":
             continue
@@ -11641,9 +11819,7 @@ async def _resolve_html_mrf_with_healthcarebluebook(
         )
         max_targets = _as_int(resolver.get("max_targets"))
         if max_targets:
-            existing_nested_max = _as_int(
-                nested_resolver_by_field.get("max_targets")
-            )
+            existing_nested_max = _as_int(nested_resolver_by_field.get("max_targets"))
             nested_resolver_by_field["max_targets"] = (
                 min(existing_nested_max, max_targets)
                 if existing_nested_max
@@ -11660,29 +11836,40 @@ async def _resolve_html_mrf_with_healthcarebluebook(
             logging.getLogger(__name__).debug(
                 "failed to resolve nested Healthcare Bluebook MRF %s from %s: %s",
                 link_url,
-                url,
+                landing_url,
                 exc,
             )
             nested_targets = []
-        for nested_target in nested_targets:
-            metadata = dict(nested_target.metadata or {})
-            metadata.update(
-                {
-                    "resolver": resolver_type,
-                    "nested_resolver": metadata.get("resolver"),
-                    "landing_url": url,
-                    "healthcarebluebook_url": link_url,
-                }
+        crawl_targets.extend(
+            _annotate_html_healthcarebluebook_target(
+                nested_target, source_record, landing_url, link_url, resolver_type
             )
-            annotated = CrawlTarget(
-                source=source_record,
-                url=nested_target.url,
-                label=nested_target.label,
-                resolved_from_url=nested_target.resolved_from_url or link_url,
-                metadata=metadata,
-            )
-            key = _canonical_or_none(annotated.url) or annotated.url
-            targets_by_url[key] = annotated
+            for nested_target in nested_targets
+        )
+    return crawl_targets
+
+
+async def _resolve_html_mrf_with_healthcarebluebook(
+    source_record: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    """Resolve an HTML MRF page and enrich targets with Healthcare Bluebook data."""
+    resolver_type = str(resolver.get("type") or "html_mrf_with_healthcarebluebook")
+    html_text = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
+        session=session,
+    )
+    targets_by_url = _html_mrf_direct_targets(
+        source_record, url, html_text, resolver_type
+    )
+    for nested_target in await _html_healthcarebluebook_targets(
+        source_record, url, html_text, resolver, resolver_type, session
+    ):
+        key = _canonical_or_none(nested_target.url) or nested_target.url
+        targets_by_url[key] = nested_target
     crawl_targets = list(targets_by_url.values())
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets:

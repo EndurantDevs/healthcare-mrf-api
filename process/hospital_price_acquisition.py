@@ -309,7 +309,11 @@ def candidates_from_locators(
                 locator_id=locator_result.locator_id,
                 observation_id=locator_result.observation_id,
                 source_url=binding.mrf_url,
-                locator_name=locator_result.records[binding.record_index].location_name,
+                locator_name=(
+                    locator_result.records[binding.record_index].location_name
+                    if binding.record_index is not None
+                    else None
+                ),
                 locator_url=locator_result.url,
             )
             for binding in match.bindings
@@ -388,7 +392,7 @@ async def download_source(
     assert last_error is not None
     return DownloadedSource(
         url, None, attempts, *last_error,
-        auth_refresh_required=bool(attempts) and all(
+        auth_refresh_required=any(
             attempt.source_http_status in {401, 403} for attempt in attempts
         ),
     )

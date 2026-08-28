@@ -43,8 +43,8 @@ def _csv(headers):
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
-        (b'\xef\xbb\xbf {"version":"3.0.0"}', "json"),
-        (_csv(["description", "payer_name"]), "csv-tall"),
+        (b'\xef\xbb\xbf {"hospital_name":"Women\x92s","version":"3.0.0"}', "json"),
+        (_csv(["description", "payer_name"]).replace(b"Example", b"Women\x92s"), "csv-tall"),
         (
             _csv([
                 "description",

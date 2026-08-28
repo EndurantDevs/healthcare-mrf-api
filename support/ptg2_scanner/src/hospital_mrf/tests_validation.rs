@@ -69,7 +69,6 @@
         );
         for (pointer, invalid_value, expected) in [
             ("/version", "", "version must be a non-empty string"),
-            ("/version", "2.0.0", "version must be 3.0.0"),
             (
                 "/license_information/state",
                 "",
@@ -151,6 +150,67 @@
             String::from_utf8(identified_rows["contract_provision"].clone()).unwrap(),
             "fixture-version\t0\tPayer, Inc.\tPlan A\tAggregate,\\nterms\n"
         );
+    }
+
+    #[test]
+    fn structurally_v3_json_preserves_declared_template_version() {
+        let mut payload: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+        payload["version"] = json!("2.0.0");
+        let rows = run_fixture(
+            InputFormat::Json,
+            &serde_json::to_vec(&payload).unwrap(),
+            false,
+        );
+        assert_eq!(
+            String::from_utf8(rows["mrf"].clone())
+                .unwrap()
+                .trim_end()
+                .split('\t')
+                .nth(3),
+            Some("2.0.0")
+        );
+    }
+
+    #[test]
+    fn csv_billing_class_aliases_do_not_relax_json_validation() {
+        for alias in ["hospital", "facilty"] {
+            assert_eq!(canonical_billing_class(alias, true).unwrap(), "facility");
+            assert!(canonical_billing_class(alias, false).is_err());
+        }
+        assert!(canonical_billing_class("hospitalized", true).is_err());
+    }
+
+    #[test]
+    fn singleton_financial_aid_policy_array_matches_scalar_copy_rows() {
+        let scalar_rows = run_fixture(InputFormat::Json, &fixture_json(), false);
+        let mut singleton: serde_json::Value =
+            serde_json::from_slice(&fixture_json()).unwrap();
+        singleton["financial_aid_policy"] = json!(["Policy,\nline"]);
+        let singleton_rows = run_fixture(
+            InputFormat::Json,
+            &serde_json::to_vec(&singleton).unwrap(),
+            false,
+        );
+        assert_eq!(singleton_rows, scalar_rows);
+    }
+
+    #[test]
+    fn invalid_financial_aid_policy_arrays_are_rejected_without_outputs() {
+        for policy in [json!([]), json!(["one", "two"]), json!([1]), json!([{}])] {
+            let mut payload: serde_json::Value =
+                serde_json::from_slice(&fixture_json()).unwrap();
+            payload["financial_aid_policy"] = policy;
+            assert_import_error(
+                InputFormat::Json,
+                &serde_json::to_vec(&payload).unwrap(),
+                DEFAULT_MAX_FANOUT_ROWS,
+                if payload["financial_aid_policy"].as_array().unwrap().len() != 1 {
+                    "financial_aid_policy array must contain exactly one string"
+                } else {
+                    "expected JSON value type String"
+                },
+            );
+        }
     }
     #[test]
     fn nul_header_gap_and_fanout_abort_without_outputs() {

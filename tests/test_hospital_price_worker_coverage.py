@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -72,13 +71,22 @@ async def test_new_content_is_staged_after_native_parse(tmp_path, monkeypatch):
     monkeypatch.setattr(
         orchestrator, "run_native_parser", AsyncMock(return_value=receipt)
     )
-    stage = AsyncMock()
+    events: list[str] = []
+
+    def capacity(_store, required_free):
+        assert required_free == 1
+        events.append("capacity")
+
+    async def stage(*_args):
+        events.append("stage")
+
+    monkeypatch.setattr(orchestrator, "_require_disk_capacity", capacity)
     monkeypatch.setattr(orchestrator, "stage_content", stage)
 
     assert await orchestrator._ensure_content(
-        {}, {}, ArtifactStore(tmp_path), raw, 2048, 1024
+        {}, {}, ArtifactStore(tmp_path), raw, 2048, 1024, 1
     ) == orchestrator.hospital_price_version_id(raw.raw_sha256)
-    stage.assert_awaited_once_with(receipt, raw)
+    assert events == ["capacity", "stage"]
 
 
 @pytest.mark.asyncio
@@ -111,6 +119,18 @@ async def test_publish_download_handles_empty_success_cancel_and_failure(monkeyp
         {}, {}, downloaded_source, "version"
     ) == (0, 0, 0, 1)
     fail.assert_awaited_with((attempt,), "invalid", "broken")
+
+    sibling = Attempt("two", "b", "B", "https://a/mrf", 0)
+    publish.side_effect = [ValueError("one bind failed"), (1, 0, 0)]
+    fail.reset_mock()
+    assert await orchestrator._publish_download(
+        {}, {}, DownloadedSource("https://a/mrf", raw, (attempt, sibling)), "version"
+    ) == (1, 0, 0, 1)
+    assert [call.args[-1] for call in publish.await_args_list[-2:]] == [
+        attempt,
+        sibling,
+    ]
+    fail.assert_awaited_once_with((attempt,), "invalid", "one bind failed")
 
 
 @pytest.mark.asyncio
@@ -149,16 +169,20 @@ async def test_resolve_attempts_groups_sources_and_initial_errors(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_successful_content_ingest_is_cached_by_digest(monkeypatch):
+async def test_successful_content_ingest_is_cached_by_digest(tmp_path, monkeypatch):
     orchestrator = orchestrator_module()
     ensure = AsyncMock()
+    monkeypatch.setattr(
+        orchestrator, "has_existing_version", AsyncMock(return_value=False)
+    )
     monkeypatch.setattr(orchestrator, "_ensure_content", ensure)
-    raw = SimpleNamespace(raw_sha256="a" * 64)
+    raw = SimpleNamespace(raw_sha256="a" * 64, byte_count=2)
     locks_by_digest, errors_by_digest = {}, {}
 
     for _unused in range(2):
         assert await orchestrator._content_ingest_error(
-            {}, {}, ArtifactStore(), raw, locks_by_digest, errors_by_digest, 2048, 1024
+            {}, {}, ArtifactStore(tmp_path), raw, locks_by_digest, errors_by_digest,
+            (2048, 1024, 1), slot_count=2,
         ) == (None, None)
     ensure.assert_awaited_once()
 
@@ -201,22 +225,22 @@ async def test_load_worker_acknowledges_download_failures_and_publishes(
         "processed": 0, "published": 0, "superseded": 0,
         "unchanged": 0, "failed": 0,
     }
-    monkeypatch.setattr(orchestrator, "_fail_attempts", AsyncMock(return_value=1))
-    monkeypatch.setattr(
-        orchestrator, "_content_ingest_error", AsyncMock(return_value=(None, None))
-    )
-    monkeypatch.setattr(
-        orchestrator, "_publish_download", AsyncMock(return_value=(1, 0, 0, 0))
-    )
+    fail_attempts = AsyncMock(return_value=1)
+    ingest = AsyncMock(return_value=(None, None))
+    publish = AsyncMock(return_value=(1, 0, 0, 0))
+    monkeypatch.setattr(orchestrator, "_fail_attempts", fail_attempts)
+    monkeypatch.setattr(orchestrator, "_content_ingest_error", ingest)
+    monkeypatch.setattr(orchestrator, "_publish_download", publish)
     monkeypatch.setattr(orchestrator, "_progress", lambda *_args: None)
 
     await orchestrator._load_worker(
         {}, {}, ArtifactStore(tmp_path), downloads,
         ({}, {}, metrics_by_name), (None, 0, 3),
-        2048, 1024,
+        (2048, 1024, 1), slot_count=2,
     )
 
     assert pending_acknowledgement.done()
+    assert ingest.await_args.kwargs == {"slot_count": 2}
     assert not raw_path.exists()
     assert metrics_by_name == {
         "processed": 3, "published": 1, "superseded": 0,
@@ -240,17 +264,11 @@ async def test_bulk_import_returns_complete_selected_cohort(tmp_path, monkeypatc
             "unchanged": 0, "failed": 0, "contents": 1,
         },
     )
-    collect = AsyncMock(return_value=0)
-    monkeypatch.setattr(
-        orchestrator, "garbage_collect_superseded_versions", collect
-    )
-
     metrics_by_name = await orchestrator._run_import(
         {}, {}, hospitals, ArtifactStore(tmp_path), [], "owner", 30
     )
 
     assert metrics_by_name["selected"] == metrics_by_name["published"] == 2
-    collect.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -308,14 +326,7 @@ async def test_refresh_lifecycle_succeeds_and_rejects_long_owner(monkeypatch):
         "selected_hospital_hpt_registry",
         lambda *_args, **_kwargs: (hospital_by_field,),
     )
-    monkeypatch.setattr(orchestrator, "ensure_database", AsyncMock())
     monkeypatch.setattr(orchestrator, "positive_env", lambda _name, default: default)
-
-    @contextlib.asynccontextmanager
-    async def resource_lock(_store):
-        yield
-
-    monkeypatch.setattr(orchestrator, "_hospital_resource_lock", resource_lock)
     run_import = AsyncMock(return_value={"published": 1})
     monkeypatch.setattr(orchestrator, "_run_import", run_import)
 
@@ -332,48 +343,6 @@ async def test_refresh_lifecycle_succeeds_and_rejects_long_owner(monkeypatch):
         await orchestrator.refresh_hospital_prices(
             {}, {"hospital_id": "a", "run_id": "x" * 128}
         )
-
-
-@pytest.mark.asyncio
-async def test_refresh_sweeps_under_resource_lock_before_database_network(
-    tmp_path, monkeypatch
-):
-    orchestrator = orchestrator_module()
-    store = ArtifactStore(tmp_path)
-    stale_root = tmp_path / "hospital-mrf-source-stale"
-    (stale_root / "raw").mkdir(parents=True)
-    (stale_root / "raw" / "source.json").write_bytes(b"{}")
-    lock_held = asyncio.Event()
-
-    monkeypatch.setattr(
-        orchestrator, "selected_hospital_hpt_registry", lambda *_args, **_kwargs: ()
-    )
-    monkeypatch.setattr(orchestrator, "_hospital_price_artifact_store", lambda: store)
-    monkeypatch.setattr(orchestrator, "positive_env", lambda _name, default: default)
-
-    @contextlib.asynccontextmanager
-    async def resource_lock(_store):
-        lock_held.set()
-        try:
-            yield
-        finally:
-            lock_held.clear()
-
-    async def ensure_database(_migrate):
-        assert lock_held.is_set()
-        assert not stale_root.exists()
-        raise RuntimeError("stop after ordered sweep")
-
-    async def guard(_ctx, _task, operation, *_args):
-        return await operation
-
-    monkeypatch.setattr(orchestrator, "_hospital_resource_lock", resource_lock)
-    monkeypatch.setattr(orchestrator, "ensure_database", ensure_database)
-    monkeypatch.setattr(orchestrator, "_guard_cancellation", guard)
-
-    with pytest.raises(RuntimeError, match="stop after ordered sweep"):
-        await orchestrator.refresh_hospital_prices({}, {"hospital_id": "a"})
-    assert not lock_held.is_set()
 
 
 @pytest.mark.asyncio
@@ -397,7 +366,6 @@ async def test_refresh_lifecycle_finishes_attempts_on_failure(
         "selected_hospital_hpt_registry",
         lambda *_args, **_kwargs: (hospital_by_field,),
     )
-    monkeypatch.setattr(orchestrator, "ensure_database", AsyncMock())
     monkeypatch.setattr(orchestrator, "positive_env", lambda _name, default: default)
     monkeypatch.setattr(orchestrator, "error_details", lambda exc: ("runtime", str(exc)))
     async def finish_attempts(*_args):
@@ -407,14 +375,6 @@ async def test_refresh_lifecycle_finishes_attempts_on_failure(
     finish = AsyncMock(side_effect=finish_attempts)
     monkeypatch.setattr(orchestrator, "_finish_failed_attempts", finish)
 
-    @contextlib.asynccontextmanager
-    async def resource_lock(_store):
-        events.append("lock")
-        try:
-            yield
-        finally:
-            events.append("unlock")
-
     async def run_import(_ctx, _task, _hospitals, _store, attempts, *_args):
         attempts.append(SimpleNamespace(attempt_id="attempt"))
         events.append("workers_drained")
@@ -423,17 +383,11 @@ async def test_refresh_lifecycle_finishes_attempts_on_failure(
     async def guard(_ctx, _task, operation, *_args):
         return await operation
 
-    async def collect():
-        events.append("gc")
-        raise RuntimeError("gc failed")
-
-    monkeypatch.setattr(orchestrator, "_hospital_resource_lock", resource_lock)
     monkeypatch.setattr(orchestrator, "_run_import", run_import)
     monkeypatch.setattr(orchestrator, "_guard_cancellation", guard)
-    monkeypatch.setattr(orchestrator, "garbage_collect_superseded_versions", collect)
 
     with pytest.raises(type(failure)) as caught:
         await orchestrator.refresh_hospital_prices({}, {"hospital_id": "a"})
     assert caught.value is failure
     finish.assert_awaited_once_with([SimpleNamespace(attempt_id="attempt")], *expected_cleanup)
-    assert events == ["lock", "workers_drained", "attempts_terminal", "gc", "unlock"]
+    assert events == ["workers_drained", "attempts_terminal"]

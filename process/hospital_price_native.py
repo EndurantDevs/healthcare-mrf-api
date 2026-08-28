@@ -159,7 +159,7 @@ def detect_hospital_mrf_format(
 
     max_decompressed_bytes = _max_decompressed_bytes(max_decompressed_bytes)
     with _open_payload(Path(path), max_decompressed_bytes) as payload_stream, io.TextIOWrapper(
-        payload_stream, encoding="utf-8-sig", errors="strict", newline=""
+        payload_stream, encoding="utf-8-sig", errors="surrogateescape", newline=""
     ) as text_source:
         text = text_source.read(4096)
     first = text.lstrip()[:1]
@@ -169,7 +169,7 @@ def detect_hospital_mrf_format(
         raise ValueError("hospital MRF input is empty")
 
     with _open_payload(Path(path), max_decompressed_bytes) as payload_stream, io.TextIOWrapper(
-        payload_stream, encoding="utf-8-sig", errors="strict", newline=""
+        payload_stream, encoding="utf-8-sig", errors="surrogateescape", newline=""
     ) as text_source:
         reader = csv.reader(text_source)
         try:

@@ -24,6 +24,7 @@ from db.models.hospital_price_facts import HospitalPricePayerCharge
 from db.models.hospital_price_header import HospitalPriceVersion
 from process import hospital_price_store
 from tests.hospital_price_storage_assertions import (
+    _StoreConnection,
     assert_bad_allowed_count_rejected as _assert_bad_allowed_count_rejected,
     assert_lossless_values as _assert_lossless_values,
     prove_unchanged_reimport as _prove_unchanged_reimport,
@@ -150,7 +151,7 @@ async def _seed_version_header(connection, quoted: str, content_sha: str, versio
         "location_count, npi_count, license_count, "
         "service_count, charge_count, payer_charge_count, financial_aid_policy) VALUES ("
         "$1, $2, $3, $4, 'json', 'Hospital System', DATE '2026-04-01', "
-        "'3.0.0', 'attestation', true, 'Attester Name', 2, 2, 2, 1, 1, 1, "
+        "'3.0.0', 'attestation', true, 'Attester Name', 2, 3, 2, 1, 1, 1, "
         "'https://hospital.example/financial-aid')",
         version_id,
         content_sha,
@@ -165,7 +166,8 @@ async def _seed_version_header(connection, quoted: str, content_sha: str, versio
     )
     await connection.execute(
         f"INSERT INTO {quoted}.hospital_price_version_npi VALUES "
-        "($1, 0, '0000000001'), ($1, 1, '0000000002')",
+        "($1, 0, '0000000001'), ($1, 1, '0000000002'), "
+        "($1, 2, 'taxonomy-not-an-npi')",
         version_id,
     )
     await connection.execute(
@@ -192,6 +194,11 @@ async def _seed_version(connection, schema: str) -> tuple[str, str, str]:
     version_id = "a" * 64
     await _seed_registry(connection, quoted)
     await _seed_version_header(connection, quoted, content_sha, version_id)
+    await connection.execute(
+        f"DELETE FROM {quoted}.hospital_price_version_hospital "
+        "WHERE version_id=$1 AND hospital_id='hospital-a'",
+        version_id,
+    )
     return content_sha, version_id, quoted
 
 
@@ -239,31 +246,16 @@ async def _seed_full_v3_facts(connection, quoted: str, version_id: str) -> None:
     )
 
 
-async def _seed_attempt_and_identity(connection, quoted: str, content_sha: str, version_id: str) -> None:
+async def _seed_attempt(connection, quoted: str) -> None:
     await connection.execute(
         f"INSERT INTO {quoted}.hospital_price_import_attempt ("
-        "attempt_id, hospital_id, locator_id, locator_observation_id, "
-        "registry_version, requested_source_url, final_source_url, "
-        "source_http_status, expected_generation, status, content_sha256, "
-        "version_id, lease_owner, heartbeat_at, lease_expires_at) VALUES "
+        "attempt_id, hospital_id, locator_id, locator_observation_id, registry_version, "
+        "requested_source_url, expected_generation, status, lease_owner, heartbeat_at, "
+        "lease_expires_at) VALUES "
         "('attempt-a', 'hospital-a', 'locator-1', "
         "'observation-1', 1, 'https://hospital.example/prices.json', "
-        "'https://cdn.hospital.example/prices.json', 200, 0, 'verified', $1, $2, "
-        "'hospital-prices:test', clock_timestamp(), "
-        "clock_timestamp() + interval '5 minutes')",
-        content_sha,
-        version_id,
-    )
-    await connection.execute(
-        f"INSERT INTO {quoted}.hospital_price_hospital_npi VALUES "
-        "('hospital-a', $1, 0, '0000000001', 'mrf_header_file'), "
-        "('hospital-a', $1, 1, '0000000002', 'mrf_header_file')",
-        version_id,
-    )
-    await connection.execute(
-        f"INSERT INTO {quoted}.hospital_price_hospital_tax_identity VALUES "
-        "('hospital-a', $1, 'attempt-a', 'ein', '001234567', 'filename', 0)",
-        version_id,
+        "0, 'running', 'hospital-prices:test', clock_timestamp(), "
+        "clock_timestamp() + interval '5 minutes')"
     )
     await connection.execute(
         f"INSERT INTO {quoted}.hospital_price_current(hospital_id, latest_attempt_id) "
@@ -272,25 +264,33 @@ async def _seed_attempt_and_identity(connection, quoted: str, content_sha: str, 
     )
 
 
-async def _publish_initial(connection, quoted: str) -> None:
-    published = await connection.fetchrow(
-        f"UPDATE {quoted}.hospital_price_current AS current SET "
-        "version_id=attempt.version_id, generation=current.generation+1, "
-        "published_attempt_id=attempt.attempt_id, latest_attempt_id=attempt.attempt_id, "
-        "service_count=1, charge_count=1, payer_charge_count=1, "
-        "npi_count=2, tax_identity_count=1, last_success_at=clock_timestamp() "
-        f"FROM {quoted}.hospital_price_import_attempt AS attempt "
-        "WHERE attempt.attempt_id='attempt-a' AND attempt.status='verified' "
-        "AND current.hospital_id=attempt.hospital_id "
-        "AND current.generation=attempt.expected_generation "
-        "RETURNING current.generation"
-    )
-    assert published["generation"] == 1
-    await connection.execute(
-        f"UPDATE {quoted}.hospital_price_import_attempt "
-        "SET status='published', finished_at=clock_timestamp() "
-        "WHERE attempt_id='attempt-a'"
-    )
+async def _publish_initial(
+    engine, content_sha: str, version_id: str
+) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            sa.text(
+                "CREATE TEMP TABLE hospital_price_initial_stage ("
+                "hospital_id varchar(64), attempt_id varchar(64), "
+                "expected_generation bigint, source_location_ordinal integer, "
+                "final_source_url text, source_http_status integer, ein varchar(9)) "
+                "ON COMMIT DROP"
+            )
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO hospital_price_initial_stage VALUES ("
+                "'hospital-a', 'attempt-a', 0, NULL, "
+                "'https://cdn.hospital.example/prices.json', 200, '001234567')"
+            )
+        )
+        adapter = _StoreConnection(connection)
+        await hospital_price_store._bind_evidence(
+            adapter, '"hospital_price_initial_stage"', version_id, content_sha, 1
+        )
+        assert await hospital_price_store._cas_publish(
+            adapter, '"hospital_price_initial_stage"', version_id
+        ) == (1, 0, 0)
 
 
 async def _record_failed_attempt(connection, quoted: str, version_id: str) -> None:
@@ -342,6 +342,10 @@ async def _prove_stale_cas(connection, quoted: str, version_id: str) -> None:
         "b" * 64,
         version_id,
     )
+    current_before = await connection.fetchrow(
+        f"SELECT * FROM {quoted}.hospital_price_current "
+        "WHERE hospital_id='hospital-a'"
+    )
     stale = await connection.fetchrow(
         f"UPDATE {quoted}.hospital_price_current AS current "
         "SET generation=current.generation+1 "
@@ -350,16 +354,18 @@ async def _prove_stale_cas(connection, quoted: str, version_id: str) -> None:
         "AND current.hospital_id=attempt.hospital_id "
         "AND current.generation=attempt.expected_generation RETURNING current.generation"
     )
-    current = await connection.fetchrow(
-        f"SELECT version_id, generation FROM {quoted}.hospital_price_current "
+    current_after = await connection.fetchrow(
+        f"SELECT * FROM {quoted}.hospital_price_current "
         "WHERE hospital_id='hospital-a'"
     )
     assert stale is None
-    assert dict(current) == {"version_id": version_id, "generation": 1}
+    assert dict(current_after) == dict(current_before)
 
 
-async def _publish_and_prove_cas(connection, quoted: str, version_id: str) -> None:
-    await _publish_initial(connection, quoted)
+async def _publish_and_prove_cas(
+    connection, engine, quoted: str, content_sha: str, version_id: str
+) -> None:
+    await _publish_initial(engine, content_sha, version_id)
     await _record_failed_attempt(connection, quoted, version_id)
     await _prove_stale_cas(connection, quoted, version_id)
 
@@ -418,8 +424,10 @@ async def test_postgres_round_trip_and_last_known_good_cas(monkeypatch) -> None:
         try:
             content_sha, version_id, quoted = await _seed_version(connection, schema)
             await _seed_full_v3_facts(connection, quoted, version_id)
-            await _seed_attempt_and_identity(connection, quoted, content_sha, version_id)
-            await _publish_and_prove_cas(connection, quoted, version_id)
+            await _seed_attempt(connection, quoted)
+            await _publish_and_prove_cas(
+                connection, engine, quoted, content_sha, version_id
+            )
             await _assert_lossless_values(connection, quoted)
             await _assert_bad_allowed_count_rejected(connection, quoted, version_id)
         finally:

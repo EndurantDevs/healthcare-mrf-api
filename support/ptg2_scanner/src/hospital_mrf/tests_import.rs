@@ -30,6 +30,33 @@
     }
 
     #[test]
+    fn mixed_cp1252_text_matches_utf8_in_every_container() {
+        let mut value: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+        value["standard_charge_information"][0]["description"] =
+            json!("MRI – Women’s\u{00a0}care");
+        let canonical = String::from_utf8(serde_json::to_vec(&value).unwrap()).unwrap();
+        let mut mixed = Vec::with_capacity(canonical.len());
+        for character in canonical.chars() {
+            match character {
+                '’' => mixed.push(0x92),
+                '–' => mixed.push(0x96),
+                '\u{00a0}' => mixed.push(0xa0),
+                _ => {
+                    let mut encoded = [0u8; 4];
+                    mixed.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+                }
+            }
+        }
+
+        let expected = run_fixture(InputFormat::Json, canonical.as_bytes(), false);
+        assert_eq!(run_fixture(InputFormat::Json, &mixed, false), expected);
+        assert_eq!(run_fixture(InputFormat::Json, &mixed, true), expected);
+        for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+            assert_eq!(run_zip_fixture(InputFormat::Json, &mixed, method), expected);
+        }
+    }
+
+    #[test]
     fn aggregate_output_cap_accepts_exact_size_and_cleans_failed_outputs() {
         let payload = fixture_json();
         let expected = run_fixture(InputFormat::Json, &payload, false);
@@ -189,7 +216,7 @@
     }
 
     #[test]
-    fn csv_modifier_adjustments_and_generic_only_rows_are_lossless() {
+    fn csv_modifier_adjustments_and_notes_are_lossless() {
         let tall = append_csv_row(
             &fixture_tall_csv(),
             &[
@@ -216,16 +243,27 @@
         let modifier_lines = modifiers.lines().collect::<Vec<_>>();
         assert_eq!(modifier_lines.len(), 2);
         assert_eq!(modifier_lines[0].split('\t').next_back(), Some("\\N"));
-        assert_eq!(
-            modifier_lines[1].split('\t').next_back(),
-            Some("Applies,\\nwhen documented")
-        );
+        assert_eq!(modifier_lines[1].split('\t').next_back(), Some("\\N"));
         let tall_payers = String::from_utf8(tall_rows["modifier_payer"].clone()).unwrap();
-        let tall_payer_fields = tall_payers.trim_end().split('\t').collect::<Vec<_>>();
-        assert_eq!(tall_payer_fields.len(), MODIFIER_PAYER_COPY_COLUMNS.len());
+        let tall_payer_fields = tall_payers
+            .lines()
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert_eq!(tall_payer_fields.len(), 2);
         assert_eq!(
-            &tall_payer_fields[5..],
+            &tall_payer_fields[0][5..],
             &["Tall payer note", "150", "\\N", "\\N"]
+        );
+        assert_eq!(
+            &tall_payer_fields[1][3..],
+            &[
+                "\\N",
+                "\\N",
+                "Applies,\\nwhen documented",
+                "\\N",
+                "\\N",
+                "\\N"
+            ]
         );
 
         let wide = append_csv_row(
@@ -328,6 +366,57 @@
             String::from_utf8(json_rows["modifier_payer"].clone()).unwrap(),
             "fixture-version\t0\t0\tPayer, Inc.\tPlan A\tContract note\t\\N\t\\N\t\\N\n"
         );
+    }
+
+    #[test]
+    fn tall_modifier_payer_identity_is_paired_optional() {
+        let anonymous = append_csv_row(
+            &fixture_tall_csv(),
+            &[
+                ("description", "Modifier adjustment"),
+                ("modifiers", "25"),
+                ("standard_charge | negotiated_dollar", "150"),
+            ],
+        );
+        let rows = run_fixture(InputFormat::TallCsv, &anonymous, false);
+        let payer = String::from_utf8(rows["modifier_payer"].clone()).unwrap();
+        let fields = payer.trim_end().split('\t').collect::<Vec<_>>();
+        assert_eq!(&fields[3..7], &["\\N", "\\N", "\\N", "150"]);
+
+        let note_only = append_csv_row(
+            &fixture_tall_csv(),
+            &[
+                ("description", "Modifier note"),
+                ("modifiers", "59"),
+                ("additional_generic_notes", "Explain adjustment"),
+            ],
+        );
+        let rows = run_fixture(InputFormat::TallCsv, &note_only, false);
+        let payer = String::from_utf8(rows["modifier_payer"].clone()).unwrap();
+        let fields = payer.trim_end().split('\t').collect::<Vec<_>>();
+        assert_eq!(&fields[3..7], &["\\N", "\\N", "Explain adjustment", "\\N"]);
+
+        for (payer_name, plan_name, expected) in [
+            ("Payer", "", "modifier payer evidence requires plan_name"),
+            ("", "Plan", "modifier payer evidence requires payer_name"),
+        ] {
+            let unpaired = append_csv_row(
+                &fixture_tall_csv(),
+                &[
+                    ("description", "Modifier adjustment"),
+                    ("modifiers", "25"),
+                    ("payer_name", payer_name),
+                    ("plan_name", plan_name),
+                    ("standard_charge | negotiated_dollar", "150"),
+                ],
+            );
+            assert_import_error(
+                InputFormat::TallCsv,
+                &unpaired,
+                DEFAULT_MAX_FANOUT_ROWS,
+                expected,
+            );
+        }
     }
 
     #[test]

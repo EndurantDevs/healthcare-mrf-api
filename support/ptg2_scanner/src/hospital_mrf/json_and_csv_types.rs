@@ -72,7 +72,24 @@ fn parse_json<R: Read>(
             "financial_aid_policy" => {
                 mark_once(&mut seen, "financial_aid_policy")?;
                 let value: JsonRetainedString =
-                    json_reader.deserialize_next().map_err(to_io_error)?;
+                    if json_reader.peek().map_err(to_io_error)? == ValueType::Array {
+                        json_reader.begin_array().map_err(to_io_error)?;
+                        if !json_reader.has_next().map_err(to_io_error)? {
+                            return Err(invalid(
+                                "financial_aid_policy array must contain exactly one string",
+                            ));
+                        }
+                        let value = json_reader.deserialize_next().map_err(to_io_error)?;
+                        if json_reader.has_next().map_err(to_io_error)? {
+                            return Err(invalid(
+                                "financial_aid_policy array must contain exactly one string",
+                            ));
+                        }
+                        json_reader.end_array().map_err(to_io_error)?;
+                        value
+                    } else {
+                        json_reader.deserialize_next().map_err(to_io_error)?
+                    };
                 financial_aid_policy = Some(value.0);
             }
             "general_contract_provisions" => {
@@ -384,8 +401,8 @@ fn emit_json_modifier(
         .enumerate()
     {
         let payer = ModifierPayerRow {
-            payer_name: required_text(&payer.payer_name, "modifier payer_name")?.to_owned(),
-            plan_name: required_text(&payer.plan_name, "modifier plan_name")?.to_owned(),
+            payer_name: Some(required_text(&payer.payer_name, "modifier payer_name")?.to_owned()),
+            plan_name: Some(required_text(&payer.plan_name, "modifier plan_name")?.to_owned()),
             description: Some(
                 required_text(&payer.description, "modifier payer description")?.to_owned(),
             ),

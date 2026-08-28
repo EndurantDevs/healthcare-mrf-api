@@ -2073,6 +2073,7 @@ async def find_active_runs_by_importer(importer: str) -> list[dict[str, Any]]:
 
 
 _PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY = "import-run-admission:provider-directory-fhir"
+_HOSPITAL_PRICE_ADMISSION_LOCK_KEY = "import-run-admission:hospital-prices"
 _NPI_ADMISSION_LOCK_KEY = "import-run-admission:npi"
 _PROVIDER_DIRECTORY_ACQUISITION = "acquisition"
 _PROVIDER_DIRECTORY_SCOPED_ARTIFACT = "scoped_artifact"
@@ -2513,6 +2514,62 @@ def _is_parallel_active_importer_run_allowed(
     return bool(source_file_import_id and idempotency_key)
 
 
+def _hospital_price_scope(params: Any) -> frozenset[str] | None:
+    """Return selected hospital IDs, or None for an all/unknown scope."""
+
+    if not isinstance(params, dict) or params.get("all_hospitals") is True:
+        return None
+    hospital_id = str(params.get("hospital_id") or "").strip()
+    if hospital_id:
+        return frozenset({hospital_id})
+    hospital_ids = params.get("hospital_ids")
+    if not isinstance(hospital_ids, list):
+        return None
+    selected_ids = frozenset(
+        str(selected_id).strip()
+        for selected_id in hospital_ids
+        if str(selected_id).strip()
+    )
+    return selected_ids or None
+
+
+def _hospital_price_blocking_run(
+    params: dict[str, Any],
+    active_runs: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    requested_scope = _hospital_price_scope(params)
+    for active_run in active_runs:
+        active_scope = _hospital_price_scope(active_run.get("params"))
+        if (
+            requested_scope is None
+            or active_scope is None
+            or not requested_scope.isdisjoint(active_scope)
+        ):
+            return active_run
+    return None
+
+
+def _is_exact_hospital_price_replay(
+    import_row: dict[str, Any],
+    active_run: dict[str, Any],
+) -> bool:
+    requested_params = import_row.get("params")
+    active_params = active_run.get("params")
+    if (
+        active_run.get("importer") != "hospital-prices"
+        or not isinstance(requested_params, dict)
+        or not isinstance(active_params, dict)
+    ):
+        return False
+    if requested_params.get("all_hospitals") is True:
+        return active_params.get("all_hospitals") is True
+    requested_scope = _hospital_price_scope(requested_params)
+    return (
+        requested_scope is not None
+        and requested_scope == _hospital_price_scope(active_params)
+    )
+
+
 def _validate_provider_directory_profile_execution_params(
     importer: str,
     params: dict[str, Any],
@@ -2575,6 +2632,49 @@ async def _admit_provider_directory_run(import_row: dict[str, Any]) -> dict[str,
                 return active_run
         active_runs = await _active_importer_runs(connection, "provider-directory-fhir")
         blocking_run = _provider_directory_blocking_run(import_row["params"], active_runs)
+        if blocking_run:
+            return blocking_run
+        await connection.status(insert(ImportRun).values(**import_row))
+    return None
+
+
+async def _admit_hospital_price_run(
+    import_row: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Atomically compare hospital scope and insert an independent run."""
+
+    async with db.acquire() as connection:
+        hospital_ids = _hospital_price_scope(import_row["params"])
+        await connection.scalar(
+            text(
+                "SELECT pg_advisory_xact_lock"
+                f"{'_shared' if hospital_ids is not None else ''}"
+                "(hashtextextended(:lock_key, 0))"
+            ),
+            lock_key=_HOSPITAL_PRICE_ADMISSION_LOCK_KEY,
+        )
+        for hospital_id in sorted(hospital_ids or ()):
+            await connection.scalar(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                lock_key=f"{_HOSPITAL_PRICE_ADMISSION_LOCK_KEY}:{hospital_id}",
+            )
+        idempotency_key = import_row.get("idempotency_key")
+        if idempotency_key:
+            active_run = await _active_idempotency_run(
+                connection,
+                str(idempotency_key),
+            )
+            if active_run:
+                if _is_exact_hospital_price_replay(import_row, active_run):
+                    return active_run
+                raise ValueError(
+                    "hospital-price idempotency key belongs to a different import request"
+                )
+        active_runs = await _active_importer_runs(connection, "hospital-prices")
+        blocking_run = _hospital_price_blocking_run(
+            import_row["params"],
+            active_runs,
+        )
         if blocking_run:
             return blocking_run
         await connection.status(insert(ImportRun).values(**import_row))
@@ -2744,6 +2844,8 @@ async def _admit_import_row(
 ) -> dict[str, Any] | None:
     if importer == "provider-directory-fhir":
         return await _admit_provider_directory_run(import_run_values_by_name)
+    if importer == "hospital-prices":
+        return await _admit_hospital_price_run(import_run_values_by_name)
     if is_ptg_source_file_admission:
         return await _admit_ptg_source_file_run(import_run_values_by_name)
     if importer in PTG_WAVE_FENCED_IMPORTERS:
@@ -2845,14 +2947,14 @@ async def create_import_run(
     )
     if (
         idempotency_key
-        and importer != "provider-directory-fhir"
+        and importer not in {"provider-directory-fhir", "hospital-prices"}
         and not is_ptg_source_file_admission
     ):
         replayed_run = await _idempotent_import_run(importer, idempotency_key)
         if replayed_run:
             return normalize_run(replayed_run), False
     if (
-        importer != "provider-directory-fhir"
+        importer not in {"provider-directory-fhir", "hospital-prices"}
         and not is_ptg_source_file_admission
         and not _is_parallel_active_importer_run_allowed(
             importer,
@@ -2926,6 +3028,17 @@ async def create_import_run(
                 idempotency_key,
             )
             if replayed_run:
+                if (
+                    importer == "hospital-prices"
+                    and not _is_exact_hospital_price_replay(
+                        import_run_values_by_name,
+                        replayed_run,
+                    )
+                ):
+                    raise ValueError(
+                        "hospital-price idempotency key belongs to a different "
+                        "import request"
+                    )
                 return normalize_run(replayed_run), False
         raise
     enqueue_result = await _enqueue_import_start(

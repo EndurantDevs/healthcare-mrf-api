@@ -7,7 +7,7 @@ import io
 import json
 import types
 import zipfile
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -2295,6 +2295,10 @@ async def test_healthcarebluebook_limits_nested_crawl(
     monkeypatch.setattr(
         discovery, "_crawl_targets_for_source", fake_crawl_targets_for_source
     )
+    annotate = Mock(wraps=discovery._annotate_healthcarebluebook_nested_target)
+    monkeypatch.setattr(
+        discovery, "_annotate_healthcarebluebook_nested_target", annotate
+    )
 
     resolved_targets = await discovery._resolve_healthcarebluebook_mrf(
         source_mapping,
@@ -2304,6 +2308,7 @@ async def test_healthcarebluebook_limits_nested_crawl(
     )
 
     assert observed_target_limits == [1]
+    assert annotate.call_count == 1
     assert [resolved_target.label for resolved_target in resolved_targets] == ["one"]
 
 
@@ -4817,8 +4822,10 @@ async def test_resolve_ebms_caa_directory_discovers_client_tocs(monkeypatch):
             </body></html>
         """,
     }
+    fetched_urls: list[str] = []
 
     async def fake_fetch_text(url, *, max_bytes, session=None):
+        fetched_urls.append(url)
         return pages_dict[url]
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
@@ -4839,6 +4846,7 @@ async def test_resolve_ebms_caa_directory_discovers_client_tocs(monkeypatch):
         "https://caa.ebms.com/Example Public Group/2026-06-01_EBMS_index.json",
         "https://caa.ebms.com/Example Nested Group/Plan A/2026-06-01_EBMS_index.json",
     ]
+    assert fetched_urls == list(pages_dict)
     assert all(
         crawl_target.metadata["resolver"] == "ebms_caa_directory" for crawl_target in crawl_targets
     )
@@ -4847,6 +4855,19 @@ async def test_resolve_ebms_caa_directory_discovers_client_tocs(monkeypatch):
         crawl_targets[1].metadata["ebms_nested_url"]
         == "https://caa.ebms.com/Example Nested Group/Plan A/index.html"
     )
+
+
+@pytest.mark.asyncio
+async def test_resolve_ebms_rejects_invalid_page_limit_before_client_errors(monkeypatch):
+    monkeypatch.setattr(discovery, "_fetch_text", AsyncMock(return_value="<html></html>"))
+
+    with pytest.raises(ValueError, match="invalid literal for int"):
+        await discovery._resolve_ebms_caa_directory(
+            {"source_id": "source_1", "display_name": "EBMS"},
+            "https://caa.ebms.com/",
+            {"client_page_max_bytes": "invalid"},
+            session=None,
+        )
 
 
 def test_crawl_target_context_metadata_carries_benefit_lines_from_source():

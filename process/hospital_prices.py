@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import tempfile
 import uuid
 from contextlib import suppress
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Sequence
@@ -17,6 +17,7 @@ from typing import Any, Sequence
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.ext.utils import ensure_database
 from process.formulary_fhir.async_safety import drain_operation
+from process.hospital_hpt_locator import hospital_mrf_selector
 from process.hospital_hpt_registry import selected_hospital_hpt_registry
 from process.hospital_price_acquisition import (
     Attempt,
@@ -47,14 +48,12 @@ from process import hospital_price_runtime as _runtime
 from process.hospital_price_scratch import (
     HOSPITAL_SOURCE_TMP_PREFIX,
     owned_tmp_root as _owned_tmp_root,
-    sweep_transient_source_roots as _sweep_transient_source_roots,
     transient_relative_path as _transient_relative_path,
     unlink_transient_source as _unlink_transient_source,
 )
 from process.hospital_price_store import (
     admit_attempts,
     fail_attempts as _fail_attempts,
-    garbage_collect_superseded_versions,
     has_existing_version,
     publish_existing,
     rebind_attempt_sources,
@@ -74,8 +73,9 @@ DEFAULT_ATTEMPT_HEARTBEAT_SECONDS = 60
 _bounded = _runtime.bounded
 _cancel_and_drain = _runtime.cancel_and_drain
 _guard_cancellation = _runtime.guard_cancellation
+_hospital_digest_lock = _runtime.hospital_digest_lock
 _hospital_price_artifact_store = _runtime.hospital_price_artifact_store
-_hospital_resource_lock = _runtime.hospital_resource_lock
+_hospital_resource_slot = _runtime.hospital_resource_slot
 _locator_groups = _runtime.locator_groups
 _progress = _runtime.progress
 _require_disk_capacity = _runtime.require_disk_capacity
@@ -107,8 +107,7 @@ async def _start_attempts(
 
 async def _ensure_content(
     ctx: dict[str, Any], task: dict[str, Any], store: PTG2ArtifactStore, raw: Any,
-    max_decompressed_bytes: int,
-    max_output_bytes: int,
+    max_decompressed_bytes: int, max_output_bytes: int, required_free_bytes: int,
 ) -> str:
     version_id = hospital_price_version_id(raw.raw_sha256)
     await raise_if_cancelled(ctx, task)
@@ -128,6 +127,7 @@ async def _ensure_content(
             max_decompressed_bytes, max_output_bytes,
         )
         await raise_if_cancelled(ctx, task)
+        _require_disk_capacity(store, required_free_bytes)
         await stage_content(receipt, raw)
     return version_id
 
@@ -140,18 +140,22 @@ async def _publish_download(
     raw = downloaded_source.raw
     if raw is None:
         return 0, 0, 0, 0
-    try:
-        await raise_if_cancelled(ctx, task)
-        published, superseded, unchanged = await publish_existing(
-            version_id, raw.raw_sha256, attempts
-        )
-        return published, superseded, unchanged, 0
-    except (ImportCancelledError, asyncio.CancelledError):
-        await _fail_attempts(attempts, "cancelled", "hospital import cancelled")
-        raise
-    except Exception as exc:
-        code, detail = error_details(exc)
-        return 0, 0, 0, await _fail_attempts(attempts, code, detail)
+    outcome_counts = [0, 0, 0, 0]
+    for attempt in attempts:
+        try:
+            await raise_if_cancelled(ctx, task)
+            published, superseded, unchanged = await publish_existing(
+                version_id, raw.raw_sha256, attempt
+            )
+            for index, count in enumerate((published, superseded, unchanged)):
+                outcome_counts[index] += count
+        except (ImportCancelledError, asyncio.CancelledError):
+            await _fail_attempts(attempts, "cancelled", "hospital import cancelled")
+            raise
+        except Exception as exc:
+            code, detail = error_details(exc)
+            outcome_counts[3] += await _fail_attempts((attempt,), code, detail)
+    return outcome_counts[0], outcome_counts[1], outcome_counts[2], outcome_counts[3]
 
 
 async def _resolve_attempts(
@@ -187,10 +191,12 @@ async def _resolve_attempts(
 async def _refreshed_source_job(
     source_job: tuple[str, tuple[Attempt, ...]], store: PTG2ArtifactStore,
 ) -> tuple[str, tuple[Attempt, ...]] | None:
-    """Refetch every locator before sharing one refreshed source download."""
+    """Refetch exact bindings and return the attempts that remain resolved."""
 
     url, attempts = source_job
-    canonical_url = canonicalize_url(url)
+    selector = hospital_mrf_selector(url, allow_credentials=True)
+    if selector is None:
+        return None
     prior_urls = {url, *(attempt.source_url for attempt in attempts)}
     refreshed_candidate_by_hospital: dict[str, Candidate] = {}
     for locator_url in dict.fromkeys(
@@ -203,37 +209,33 @@ async def _refreshed_source_job(
             locator_url,
             locator_attempts,
             store,
-            canonical_url,
+            selector,
             prior_urls,
             SimpleNamespace(
-                canonicalize_url=canonicalize_url,
                 fetch_locator=fetch_locator,
                 candidates_from_locators=candidates_from_locators,
             ),
         )
-        if candidates is None:
-            return None
         refreshed_candidate_by_hospital.update(candidates)
-    if set(refreshed_candidate_by_hospital) != {
-        attempt.hospital_id for attempt in attempts
-    }:
-        return None
     bindings = tuple(
         (attempt, refreshed_candidate_by_hospital[attempt.hospital_id])
         for attempt in attempts
+        if attempt.hospital_id in refreshed_candidate_by_hospital
     )
+    if not bindings:
+        return None
     await rebind_attempt_sources(bindings)
     for attempt, candidate in bindings:
         attempt.source_url = candidate.source_url
         attempt.locator_name = candidate.locator_name
         attempt.locator_url = candidate.locator_url
-    return bindings[0][1].source_url, attempts
+    return bindings[0][1].source_url, tuple(attempt for attempt, _candidate in bindings)
 
 
 async def _download_worker(
     source_jobs: asyncio.Queue[Any], downloads: asyncio.Queue[Any],
     store: PTG2ArtifactStore, owner: str, max_raw_bytes: int,
-    required_free_bytes: int,
+    required_free_bytes: int, *, slot_count: int,
 ) -> None:
     """Download private sources while their artifact leases remain held."""
 
@@ -244,6 +246,11 @@ async def _download_worker(
             store_factory=PTG2ArtifactStore,
             artifact_lease_context=artifact_lease_context,
             guard_artifact_lease=guard_artifact_lease,
+            resource_slot=partial(
+                _hospital_resource_slot,
+                resource="fetch",
+                slot_count=slot_count,
+            ),
             require_disk_capacity=_require_disk_capacity,
             download_source=download_source,
             refreshed_source_job=_refreshed_source_job,
@@ -276,20 +283,35 @@ async def _cleanup_transient_source(store: PTG2ArtifactStore, raw: Any) -> None:
     )
 
 
+async def _ingest_content(
+    ctx: dict[str, Any], task: dict[str, Any], store: PTG2ArtifactStore, raw: Any,
+    parser_limits: tuple[int, int, int], slot_count: int,
+) -> None:
+    digest = raw.raw_sha256
+    async with _hospital_digest_lock(store, digest):
+        version_id = hospital_price_version_id(digest)
+        if await has_existing_version(version_id, digest, raw.byte_count):
+            return
+        async with _hospital_resource_slot(store, "load", slot_count):
+            max_decompressed, max_output, required_free = parser_limits
+            _require_disk_capacity(store, required_free)
+            await _ensure_content(
+                ctx, task, store, raw, max_decompressed, max_output, required_free
+            )
+
+
 async def _content_ingest_error(
     ctx: dict[str, Any], task: dict[str, Any], store: PTG2ArtifactStore, raw: Any,
     lock_by_digest: dict[str, asyncio.Lock],
     ingest_error_by_digest: dict[str, tuple[str | None, str | None]],
-    max_decompressed_bytes: int,
-    max_output_bytes: int,
+    parser_limits: tuple[int, int, int], *, slot_count: int,
 ) -> tuple[str | None, str | None]:
     digest = raw.raw_sha256
     async with lock_by_digest.setdefault(digest, asyncio.Lock()):
         if digest not in ingest_error_by_digest:
             try:
-                await _ensure_content(
-                    ctx, task, store, raw,
-                    max_decompressed_bytes, max_output_bytes,
+                await _ingest_content(
+                    ctx, task, store, raw, parser_limits, slot_count
                 )
                 ingest_error_by_digest[digest] = (None, None)
             except (ImportCancelledError, asyncio.CancelledError):
@@ -302,21 +324,22 @@ async def _content_ingest_error(
 async def _load_worker(
     ctx: dict[str, Any], task: dict[str, Any], store: PTG2ArtifactStore,
     downloads: asyncio.Queue[Any],
-    content_pipeline: tuple[
-        dict[str, asyncio.Lock], dict[str, tuple[str | None, str | None]], dict[str, int]
-    ],
+    content_pipeline: tuple[dict[str, asyncio.Lock],
+                            dict[str, tuple[str | None, str | None]], dict[str, int]],
     progress_context: tuple[str | None, int, int],
-    max_decompressed_bytes: int,
-    max_output_bytes: int,
+    parser_limits: tuple[int, int, int], *, slot_count: int,
 ) -> None:
     """Validate and publish sources while acknowledging private source leases."""
 
     await _run_load_worker(
         ctx, task, store, downloads, content_pipeline, progress_context,
-        (max_decompressed_bytes, max_output_bytes),
+        parser_limits,
         SimpleNamespace(
             fail_attempts=_fail_attempts,
-            content_ingest_error=_content_ingest_error,
+            content_ingest_error=partial(
+                _content_ingest_error,
+                slot_count=slot_count,
+            ),
             cleanup_transient_source=_cleanup_transient_source,
             publish_download=_publish_download,
             version_id=hospital_price_version_id,
@@ -328,15 +351,17 @@ async def _load_worker(
 async def _stream_sources(
     ctx: dict[str, Any], task: dict[str, Any], store: PTG2ArtifactStore,
     attempts_by_url: dict[str, list[Attempt]],
-    concurrency: tuple[int, int], progress_context: tuple[str | None, int, int],
+    concurrency: tuple[int, int, int, int],
+    progress_context: tuple[str | None, int, int],
     resource_context: tuple[str, int, int, int, int],
 ) -> dict[str, int]:
+    fetches, loads, fetch_slots, load_slots = concurrency
     return await _run_source_pipeline(
-        ctx, task, store, attempts_by_url, concurrency, progress_context,
+        ctx, task, store, attempts_by_url, (fetches, loads), progress_context,
         resource_context,
         SimpleNamespace(
-            download_worker=_download_worker,
-            load_worker=_load_worker,
+            download_worker=partial(_download_worker, slot_count=fetch_slots),
+            load_worker=partial(_load_worker, slot_count=load_slots),
             cancel_and_drain=_cancel_and_drain,
         ),
     )
@@ -346,37 +371,32 @@ async def _run_import(
     ctx: dict[str, Any], task: dict[str, Any], hospitals: Sequence[dict[str, str]], store: PTG2ArtifactStore,
     run_attempts: list[Attempt], lease_owner: str, lease_seconds: int,
 ) -> dict[str, int]:
-    await drain_operation(
-        asyncio.to_thread(_sweep_transient_source_roots, store),
-        preserve_cancellation=True,
-        should_prefer_operation_error=True,
-    )
     await ensure_database(False)
     run_id = str(task.get("run_id") or "").strip() or None
     total = len(hospitals)
     locator_groups = _locator_groups(hospitals)
     (
-        fetches, loads, max_raw, max_decompressed, max_output, required_free,
-    ) = _resource_limits(
-        store,
-        len(locator_groups),
-    )
+        fetches, loads, fetch_slots, load_slots,
+        max_raw, max_decompressed, max_output, required_free,
+    ) = _resource_limits(store, len(locator_groups))
     _progress(run_id, "registry", 0, total, "registering hospital identities")
     await sync_registry(hospitals)
     await raise_if_cancelled(ctx, task)
     _progress(run_id, "locators", 0, total, "checking hospital MRF locators")
-    locator_results = await _bounded(
-        locator_groups,
-        fetches,
-        lambda item: _fetch_transient_locator(item, store, lease_owner),
-    )
+
+    async def _fetch_locator(item: Any) -> Any:
+        async with _hospital_resource_slot(store, "fetch", fetch_slots):
+            return await _fetch_transient_locator(item, store, lease_owner)
+
+    locator_results = await _bounded(locator_groups, fetches, _fetch_locator)
     attempts_by_url, active, failed = await _resolve_attempts(
         locator_results, run_attempts, lease_owner, lease_seconds
     )
     await raise_if_cancelled(ctx, task)
     _progress(run_id, "sources", failed, total, "downloading hospital price files")
     pipeline_metrics_by_name = await _stream_sources(
-        ctx, task, store, attempts_by_url, (fetches, loads),
+        ctx, task, store, attempts_by_url,
+        (fetches, loads, fetch_slots, load_slots),
         (run_id, failed + active, total),
         (lease_owner, max_raw, max_decompressed, max_output, required_free),
     )
@@ -390,7 +410,6 @@ async def _run_import(
         "superseded": pipeline_metrics_by_name["superseded"],
         "failed": failed, "active": active,
     }
-    await garbage_collect_superseded_versions()
     if (metrics_by_name["published"] + metrics_by_name["unchanged"] != total
             or metrics_by_name["failed"] or metrics_by_name["active"]
             or metrics_by_name["superseded"]):
@@ -432,38 +451,31 @@ async def refresh_hospital_prices(
     owner = f"hospital-prices:{task_by_name.get('run_id') or uuid.uuid4().hex}"
     if len(owner) > 128:
         raise ValueError("hospital price run owner is invalid")
-    lease_seconds = max(
-        positive_env(
-            "HLTHPRT_HOSPITAL_PRICE_ATTEMPT_LEASE_SECONDS",
-            DEFAULT_ATTEMPT_LEASE_SECONDS,
-        ),
-        2,
-    )
+    lease_seconds = max(positive_env(
+        "HLTHPRT_HOSPITAL_PRICE_ATTEMPT_LEASE_SECONDS",
+        DEFAULT_ATTEMPT_LEASE_SECONDS,
+    ), 2)
     heartbeat_seconds = min(
-        positive_env(
-            "HLTHPRT_HOSPITAL_PRICE_ATTEMPT_HEARTBEAT_SECONDS",
-            DEFAULT_ATTEMPT_HEARTBEAT_SECONDS,
-        ),
+        positive_env("HLTHPRT_HOSPITAL_PRICE_ATTEMPT_HEARTBEAT_SECONDS",
+                     DEFAULT_ATTEMPT_HEARTBEAT_SECONDS),
         max(lease_seconds // 3, 1),
     )
 
-    async def _locked_import() -> dict[str, int]:
-        async with _hospital_resource_lock(store):
-            try:
-                return await _run_import(ctx, task_by_name, hospitals, store, attempts, owner, lease_seconds)
-            except (asyncio.CancelledError, Exception) as exc:
-                failure = (("cancelled", "hospital import cancelled")
-                           if isinstance(exc, (ImportCancelledError, asyncio.CancelledError))
-                           else error_details(exc))
-                with suppress(BaseException):
-                    await _finish_failed_attempts(attempts, *failure)
-                if attempts:
-                    with suppress(BaseException):
-                        await drain_operation(garbage_collect_superseded_versions(), preserve_cancellation=False)
-                raise
+    async def _import() -> dict[str, int]:
+        try:
+            return await _run_import(
+                ctx, task_by_name, hospitals, store, attempts, owner, lease_seconds
+            )
+        except (asyncio.CancelledError, Exception) as exc:
+            failure = (("cancelled", "hospital import cancelled")
+                       if isinstance(exc, (ImportCancelledError, asyncio.CancelledError))
+                       else error_details(exc))
+            with suppress(BaseException):
+                await _finish_failed_attempts(attempts, *failure)
+            raise
 
     return await _guard_cancellation(
-        ctx, task_by_name, _locked_import(), attempts, owner, lease_seconds, heartbeat_seconds,
+        ctx, task_by_name, _import(), attempts, owner, lease_seconds, heartbeat_seconds,
     )
 
 

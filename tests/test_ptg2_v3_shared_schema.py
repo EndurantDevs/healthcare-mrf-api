@@ -153,7 +153,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260827210000_entity_address_geo_taxonomy"
+        "20260828120000_hospital_price_modifier_payer_identity"
     ]
 
 
