@@ -117,14 +117,18 @@ def _install_reconciliation_dependencies(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "importer",
-    ("plan-pricing-projection", "plan-pricing-prewarm"),
+    ("importer", "heartbeat_at"),
+    (
+        ("plan-pricing-projection", HEARTBEAT_AT),
+        ("plan-pricing-prewarm", HEARTBEAT_AT.replace(tzinfo=dt.UTC)),
+    ),
 )
 async def test_reconcile_missing_worker_terminalizes_supported_exact_attempt(
     monkeypatch,
     importer,
+    heartbeat_at,
 ):
-    run_by_field = _run(importer)
+    run_by_field = {**_run(importer), "heartbeat_at": heartbeat_at}
     body_by_field = {**EXPECTED_BODY, "expected_importer": importer}
     connection = _install_reconciliation_dependencies(monkeypatch, run_by_field)
 
@@ -226,6 +230,23 @@ async def test_reconcile_missing_worker_rejects_live_worker_residue(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_missing_worker_requires_kubernetes_lookup(monkeypatch):
+    connection = _install_reconciliation_dependencies(
+        monkeypatch,
+        _run(),
+        kubernetes={"enabled": False},
+    )
+
+    with pytest.raises(
+        control_imports.StaleWorkerReconciliationUnavailable,
+        match="Kubernetes worker lookup",
+    ):
+        await control_imports.reconcile_stale_worker_failure(RUN_ID, EXPECTED_BODY)
+
+    assert connection.updates == []
+
+
+@pytest.mark.asyncio
 async def test_reconcile_missing_worker_cas_loss_preserves_newer_attempt(
     monkeypatch,
 ):
@@ -281,6 +302,7 @@ async def test_reconcile_missing_worker_is_idempotent(monkeypatch):
         {**EXPECTED_BODY, "expected_status": "starting"},
         {**EXPECTED_BODY, "expected_attempt_id": ""},
         {**EXPECTED_BODY, "expected_heartbeat_at": "not-a-timestamp"},
+        {**EXPECTED_BODY, "expected_heartbeat_at": "2026-08-27T22:30:38"},
         {**EXPECTED_BODY, "expected_importer": []},
         {**EXPECTED_BODY, "expected_importer": {}},
     ),
@@ -288,6 +310,12 @@ async def test_reconcile_missing_worker_is_idempotent(monkeypatch):
 async def test_reconcile_missing_worker_rejects_inexact_body(payload):
     with pytest.raises(ValueError):
         await control_imports.reconcile_stale_worker_failure(RUN_ID, payload)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_missing_worker_requires_run_id():
+    with pytest.raises(ValueError, match="run_id is required"):
+        await control_imports.reconcile_stale_worker_failure(" ", EXPECTED_BODY)
 
 
 @pytest.mark.asyncio

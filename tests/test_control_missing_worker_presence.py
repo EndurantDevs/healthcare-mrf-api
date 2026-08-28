@@ -92,6 +92,11 @@ def test_exact_worker_presence_rejects_noncanonical_plan_pricing_spec(payload):
         control_workers._exact_worker_spec(payload)
 
 
+def test_exact_worker_presence_requires_exact_identity():
+    with pytest.raises(RuntimeError, match="identity is unavailable"):
+        control_workers._exact_worker_spec({})
+
+
 @pytest.mark.asyncio
 async def test_arq_presence_uses_every_exact_canonical_key(monkeypatch):
     recorded_calls: list[tuple[str, str]] = []

@@ -160,3 +160,9 @@ async def test_worker_action_lock_uses_exact_run_key():
     assert calls[0][1] == {
         "lock_name": f"control-run-worker-action:v1:{RUN_ID}"
     }
+
+
+@pytest.mark.asyncio
+async def test_worker_action_lock_requires_run_id():
+    with pytest.raises(ValueError, match="run_id is required"):
+        await acquire_control_run_worker_action_lock(object(), " ")
