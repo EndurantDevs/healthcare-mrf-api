@@ -86,58 +86,50 @@ def _install_index_states(monkeypatch, migration, operations, states):
     return calls
 
 
-def _assert_exact_checks(migration, calls, index_name, columns):
+def _assert_exact_checks(migration, calls):
     assert calls
-    assert all(call[:2] == (index_name, columns) for call in calls)
     for _name, _columns, options in calls:
         assert options["schema"] == "fixture"
         assert options["unique"] is True
         assert str(options["postgresql_where"]) == migration.ACTIVE_PREDICATE
 
 
-def test_migration_contract_matches_model():
+def test_migration_contract_keeps_global_and_composite_indexes():
     migration = _load_migration()
-    model_index = next(
-        index
+    model_indexes = {
+        index["name"]: index
         for index in ImportRun.__my_additional_indexes__
-        if index["name"] == migration.INDEX_NAME
-    )
+    }
 
     assert migration.revision == "20260829090000_import_run_idempotency_scope"
     assert (
         migration.down_revision
         == "20260828120000_hospital_price_modifier_payer_identity"
     )
-    assert model_index["index_elements"] == migration.INDEX_COLUMNS
-    assert model_index["unique"] is True
-    assert model_index["where"] == migration.ACTIVE_PREDICATE
+    assert model_indexes[migration.LEGACY_INDEX_NAME]["index_elements"] == (
+        migration.LEGACY_INDEX_COLUMNS
+    )
+    assert model_indexes[migration.INDEX_NAME]["index_elements"] == (
+        migration.INDEX_COLUMNS
+    )
+    for index_name in (migration.LEGACY_INDEX_NAME, migration.INDEX_NAME):
+        assert model_indexes[index_name]["unique"] is True
+        assert model_indexes[index_name]["where"] == migration.ACTIVE_PREDICATE
 
 
-@pytest.mark.parametrize(
-    ("method_name", "target_name", "target_columns", "obsolete_name"),
-    (
-        ("upgrade", "INDEX_NAME", "INDEX_COLUMNS", "LEGACY_INDEX_NAME"),
-        ("downgrade", "LEGACY_INDEX_NAME", "LEGACY_INDEX_COLUMNS", "INDEX_NAME"),
-    ),
-)
 @pytest.mark.parametrize("initial_state", (False, "invalid"))
-def test_online_transition_recovers_target_then_verifies_before_drop(
+def test_upgrade_repairs_composite_after_verifying_global(
     monkeypatch,
-    method_name,
-    target_name,
-    target_columns,
-    obsolete_name,
     initial_state,
 ):
     migration = _load_migration()
     operations = _Operations()
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "fixture")
     monkeypatch.delenv("DB_SCHEMA", raising=False)
-    target_name = getattr(migration, target_name)
-    target_columns = getattr(migration, target_columns)
-    obsolete_name = getattr(migration, obsolete_name)
-    first_state = (
-        RuntimeError(f"existing_schema_index_invalid:fixture.{target_name}")
+    first_composite_state = (
+        RuntimeError(
+            f"existing_schema_index_invalid:fixture.{migration.INDEX_NAME}"
+        )
         if initial_state == "invalid"
         else False
     )
@@ -145,66 +137,81 @@ def test_online_transition_recovers_target_then_verifies_before_drop(
         monkeypatch,
         migration,
         operations,
-        (first_state, True),
+        (True, first_composite_state, True),
     )
     monkeypatch.setattr(migration, "op", operations)
 
-    getattr(migration, method_name)()
+    migration.upgrade()
 
     assert operations.bind.statements == [
-        migration._drop_index_sql("fixture", target_name),
-        migration._create_index_sql("fixture", target_name, target_columns),
-        migration._drop_index_sql("fixture", obsolete_name),
+        migration._drop_index_sql("fixture", migration.INDEX_NAME),
+        migration._create_index_sql(
+            "fixture",
+            migration.INDEX_NAME,
+            migration.INDEX_COLUMNS,
+        ),
     ]
-    _assert_exact_checks(migration, calls, target_name, target_columns)
+    assert calls[0][:2] == (
+        migration.LEGACY_INDEX_NAME,
+        migration.LEGACY_INDEX_COLUMNS,
+    )
+    _assert_exact_checks(migration, calls)
 
 
-@pytest.mark.parametrize(
-    ("method_name", "target_name", "target_columns", "obsolete_name"),
-    (
-        ("upgrade", "INDEX_NAME", "INDEX_COLUMNS", "LEGACY_INDEX_NAME"),
-        ("downgrade", "LEGACY_INDEX_NAME", "LEGACY_INDEX_COLUMNS", "INDEX_NAME"),
-    ),
-)
-def test_online_retry_adopts_verified_target_before_obsolete_drop(
+@pytest.mark.parametrize("initial_state", (False, "invalid"))
+def test_upgrade_repairs_global_before_adopting_composite(
     monkeypatch,
-    method_name,
-    target_name,
-    target_columns,
-    obsolete_name,
+    initial_state,
 ):
     migration = _load_migration()
     operations = _Operations()
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "fixture")
     monkeypatch.delenv("DB_SCHEMA", raising=False)
-    target_name = getattr(migration, target_name)
-    target_columns = getattr(migration, target_columns)
-    obsolete_name = getattr(migration, obsolete_name)
+    first_global_state = (
+        RuntimeError(
+            "existing_schema_index_invalid:"
+            f"fixture.{migration.LEGACY_INDEX_NAME}"
+        )
+        if initial_state == "invalid"
+        else False
+    )
     calls = _install_index_states(
         monkeypatch,
         migration,
         operations,
-        (True,),
+        (first_global_state, True, True),
     )
     monkeypatch.setattr(migration, "op", operations)
 
-    getattr(migration, method_name)()
+    migration.upgrade()
 
     assert operations.bind.statements == [
-        migration._drop_index_sql("fixture", obsolete_name)
+        migration._drop_index_sql("fixture", migration.LEGACY_INDEX_NAME),
+        migration._create_index_sql(
+            "fixture",
+            migration.LEGACY_INDEX_NAME,
+            migration.LEGACY_INDEX_COLUMNS,
+        ),
     ]
-    _assert_exact_checks(migration, calls, target_name, target_columns)
+    _assert_exact_checks(migration, calls)
 
 
-def test_wrong_shape_target_fails_closed(monkeypatch):
+@pytest.mark.parametrize("index_name", ("LEGACY_INDEX_NAME", "INDEX_NAME"))
+def test_wrong_shape_named_index_fails_closed(monkeypatch, index_name):
     migration = _load_migration()
     operations = _Operations()
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "fixture")
     monkeypatch.delenv("DB_SCHEMA", raising=False)
+    actual_name = getattr(migration, index_name)
     mismatch = RuntimeError(
-        f"existing_schema_index_mismatch:fixture.{migration.INDEX_NAME}"
+        f"existing_schema_index_mismatch:fixture.{actual_name}"
     )
-    _install_index_states(monkeypatch, migration, operations, (mismatch,))
+    states = (
+        (mismatch,)
+        if index_name == "LEGACY_INDEX_NAME"
+        else (True, mismatch)
+    )
+    _install_index_states(monkeypatch, migration, operations, states)
     monkeypatch.setattr(migration, "op", operations)
 
     with pytest.raises(RuntimeError, match="existing_schema_index_mismatch"):
@@ -213,45 +220,120 @@ def test_wrong_shape_target_fails_closed(monkeypatch):
     assert operations.bind.statements == []
 
 
-def test_failed_downgrade_build_keeps_composite_index(monkeypatch):
+def test_matching_indexes_are_adopted_without_ddl(monkeypatch):
     migration = _load_migration()
-    create_legacy = migration._create_index_sql(
+    operations = _Operations()
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "fixture")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    calls = _install_index_states(
+        monkeypatch,
+        migration,
+        operations,
+        (True, True),
+    )
+    monkeypatch.setattr(migration, "op", operations)
+
+    migration.upgrade()
+
+    assert operations.bind.statements == []
+    _assert_exact_checks(migration, calls)
+
+
+def test_failed_composite_build_keeps_global_index(monkeypatch):
+    migration = _load_migration()
+    create_composite = migration._create_index_sql(
+        "fixture",
+        migration.INDEX_NAME,
+        migration.INDEX_COLUMNS,
+    )
+    operations = _Operations(fail_on=create_composite)
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "fixture")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    _install_index_states(
+        monkeypatch,
+        migration,
+        operations,
+        (True, False),
+    )
+    monkeypatch.setattr(migration, "op", operations)
+
+    with pytest.raises(RuntimeError, match="fixture index build failed"):
+        migration.upgrade()
+
+    assert operations.bind.statements == [
+        migration._drop_index_sql("fixture", migration.INDEX_NAME),
+        create_composite,
+    ]
+    assert migration._drop_index_sql(
+        "fixture",
+        migration.LEGACY_INDEX_NAME,
+    ) not in operations.bind.statements
+
+
+def test_downgrade_restores_global_before_dropping_composite(monkeypatch):
+    migration = _load_migration()
+    operations = _Operations()
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "fixture")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    calls = _install_index_states(
+        monkeypatch,
+        migration,
+        operations,
+        (False, True),
+    )
+    monkeypatch.setattr(migration, "op", operations)
+
+    migration.downgrade()
+
+    assert operations.bind.statements == [
+        migration._drop_index_sql("fixture", migration.LEGACY_INDEX_NAME),
+        migration._create_index_sql(
+            "fixture",
+            migration.LEGACY_INDEX_NAME,
+            migration.LEGACY_INDEX_COLUMNS,
+        ),
+        migration._drop_index_sql("fixture", migration.INDEX_NAME),
+    ]
+    _assert_exact_checks(migration, calls)
+
+
+def test_offline_sql_preserves_global_while_preparing_composite(monkeypatch):
+    migration = _load_migration()
+    output_buffer = io.StringIO()
+    context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": output_buffer},
+    )
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "fixture")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    monkeypatch.setattr(migration, "op", Operations(context))
+
+    migration.upgrade()
+
+    sql = output_buffer.getvalue()
+    global_create = migration._create_index_sql(
         "fixture",
         migration.LEGACY_INDEX_NAME,
         migration.LEGACY_INDEX_COLUMNS,
     )
-    operations = _Operations(fail_on=create_legacy)
-    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "fixture")
-    monkeypatch.delenv("DB_SCHEMA", raising=False)
-    _install_index_states(monkeypatch, migration, operations, (False,))
-    monkeypatch.setattr(migration, "op", operations)
-
-    with pytest.raises(RuntimeError, match="fixture index build failed"):
-        migration.downgrade()
-
-    assert operations.bind.statements == [
-        migration._drop_index_sql("fixture", migration.LEGACY_INDEX_NAME),
-        create_legacy,
-    ]
-    assert all(
-        migration.INDEX_NAME not in statement
-        for statement in operations.bind.statements
+    composite_drop = migration._drop_index_sql("fixture", migration.INDEX_NAME)
+    composite_create = migration._create_index_sql(
+        "fixture",
+        migration.INDEX_NAME,
+        migration.INDEX_COLUMNS,
     )
+    assert sql.index(global_create) < sql.index(composite_drop) < sql.index(
+        composite_create
+    )
+    assert migration._drop_index_sql(
+        "fixture",
+        migration.LEGACY_INDEX_NAME,
+    ) not in sql
+    assert "CONCURRENTLY" in sql
 
 
-@pytest.mark.parametrize(
-    ("method_name", "target_name", "target_columns", "obsolete_name"),
-    (
-        ("upgrade", "INDEX_NAME", "INDEX_COLUMNS", "LEGACY_INDEX_NAME"),
-        ("downgrade", "LEGACY_INDEX_NAME", "LEGACY_INDEX_COLUMNS", "INDEX_NAME"),
-    ),
-)
-def test_offline_sql_preserves_obsolete_index_until_target_build(
+def test_offline_downgrade_keeps_composite_without_exact_validation(
     monkeypatch,
-    method_name,
-    target_name,
-    target_columns,
-    obsolete_name,
 ):
     migration = _load_migration()
     output_buffer = io.StringIO()
@@ -262,19 +344,13 @@ def test_offline_sql_preserves_obsolete_index_until_target_build(
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "fixture")
     monkeypatch.delenv("DB_SCHEMA", raising=False)
     monkeypatch.setattr(migration, "op", Operations(context))
-    target_name = getattr(migration, target_name)
-    target_columns = getattr(migration, target_columns)
-    obsolete_name = getattr(migration, obsolete_name)
 
-    getattr(migration, method_name)()
+    migration.downgrade()
 
     sql = output_buffer.getvalue()
-    target_drop = migration._drop_index_sql("fixture", target_name)
-    target_create = migration._create_index_sql(
+    assert migration._create_index_sql(
         "fixture",
-        target_name,
-        target_columns,
-    )
-    obsolete_drop = migration._drop_index_sql("fixture", obsolete_name)
-    assert sql.index(target_drop) < sql.index(target_create) < sql.index(obsolete_drop)
-    assert "CONCURRENTLY" in sql
+        migration.LEGACY_INDEX_NAME,
+        migration.LEGACY_INDEX_COLUMNS,
+    ) in sql
+    assert migration._drop_index_sql("fixture", migration.INDEX_NAME) not in sql

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
+from sqlalchemy.exc import IntegrityError
 
 from api import control_imports
 from db.models import ImportRun, db
@@ -59,28 +60,67 @@ async def _assert_same_importer_integrity_recovery(monkeypatch):
     )
     replayed, created = await _create_run("run_replayed", "nucc")
     assert created is False
-    assert replayed["run_id"] == "run_second"
+    assert replayed["run_id"] == "run_first"
     assert lookup_count_by_kind["active"] == 2
     return real_find, real_find_importer
 
 
-async def test_active_idempotency_key_is_unique_per_importer(monkeypatch):
-    """Keep cross-import keys independent across races and terminal reuse."""
+async def _assert_prepared_index_definitions():
+    index_definition_by_name = {
+        str(index_record.index_name): str(index_record.index_definition)
+        for index_record in (
+            await db.execute(
+                text(
+                    """
+                    SELECT index_record.relname AS index_name,
+                           pg_get_indexdef(index_record.oid) AS index_definition
+                      FROM pg_class AS index_record
+                      JOIN pg_namespace AS namespace_record
+                        ON namespace_record.oid = index_record.relnamespace
+                     WHERE namespace_record.nspname = :schema
+                       AND index_record.relname IN (
+                           'import_run_active_idempotency_idx',
+                           'import_run_importer_active_idempotency_idx'
+                       )
+                    """
+                ),
+                schema=ImportRun.__table__.schema or "mrf",
+            )
+        ).all()
+    }
+    assert set(index_definition_by_name) == {
+        "import_run_active_idempotency_idx",
+        "import_run_importer_active_idempotency_idx",
+    }
+    assert "(idempotency_key)" in index_definition_by_name[
+        "import_run_active_idempotency_idx"
+    ]
+    assert "(importer, idempotency_key)" in index_definition_by_name[
+        "import_run_importer_active_idempotency_idx"
+    ]
+
+
+async def test_prepared_idempotency_indexes_fail_closed_until_activation(
+    monkeypatch,
+):
+    """Keep global safety while preparing importer-scoped activation."""
 
     await _reset_import_run_schema()
     try:
         monkeypatch.setattr(control_imports, "_enqueue_import_start", _fake_enqueue)
-        first, first_created = await _create_run("run_first", "npi")
-        second, second_created = await _create_run("run_second", "nucc")
+        first, first_created = await _create_run("run_first", "nucc")
         assert first_created is True and first["run_id"] == "run_first"
-        assert second_created is True and second["run_id"] == "run_second"
+
+        with pytest.raises(IntegrityError):
+            await _create_run("run_cross_importer", "npi")
+        await _assert_prepared_index_definitions()
 
         real_find, real_find_importer = await _assert_same_importer_integrity_recovery(
             monkeypatch
         )
         await db.execute(
             update(ImportRun)
-            .where(ImportRun.run_id == "run_second")
+            .where(ImportRun.run_id == "run_first")
             .values(status="succeeded", finished_at=control_imports.utc_now())
         )
         monkeypatch.setattr(
@@ -105,7 +145,6 @@ async def test_active_idempotency_key_is_unique_per_importer(monkeypatch):
         assert [run.run_id for run in import_runs] == [
             "run_after_terminal",
             "run_first",
-            "run_second",
         ]
     finally:
         await _drop_import_run_schema()

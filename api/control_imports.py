@@ -887,10 +887,25 @@ async def _ensure_import_run_table_once() -> None:
         quoted_schema = _quote_ident(schema)
         await conn.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": _IMPORT_RUN_ADVISORY_LOCK_KEY})
         await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {quoted_schema}"))
+        relation_name = f"{schema}.{ImportRun.__tablename__}"
+        table_exists = bool(
+            (
+                await conn.execute(
+                    text("SELECT to_regclass(:relation_name) IS NOT NULL"),
+                    {"relation_name": relation_name},
+                )
+            ).scalar()
+        )
         await conn.run_sync(ImportRun.__table__.create, checkfirst=True)
+        if table_exists:
+            return
         for spec in getattr(ImportRun, "__my_additional_indexes__", []) or []:
             name = str(spec.get("name") or "").strip()
-            columns = ", ".join(str(item).strip() for item in spec.get("index_elements", ()) if str(item).strip())
+            columns = ", ".join(
+                str(index_element).strip()
+                for index_element in spec.get("index_elements", ())
+                if str(index_element).strip()
+            )
             if not name or not columns:
                 continue
             unique = "UNIQUE " if spec.get("unique") else ""

@@ -1781,9 +1781,15 @@ async def test_control_startup_listener_runs_import_run_ensure(monkeypatch):
 async def test_import_run_ensure_is_memoized_and_uses_advisory_lock(monkeypatch):
     calls = []
 
+    class FakeResult:
+        @staticmethod
+        def scalar():
+            return 0
+
     class FakeConnection:
         async def execute(self, statement, params=None):
             calls.append(("execute", str(statement), params))
+            return FakeResult()
 
         async def run_sync(self, fn, **kwargs):
             calls.append(("run_sync", fn, kwargs))

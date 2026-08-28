@@ -230,7 +230,7 @@ async def test_hospital_admission_replays_only_the_exact_idempotent_scope(monkey
 async def test_hospital_admission_ignores_other_importer_families(monkeypatch):
     other_run_map = {
         "run_id": "run-npi", "importer": "npi", "status": "running",
-        "params": {}, "idempotency_key": "shared-request",
+        "params": {}, "idempotency_key": "npi-request",
     }
     database = _HospitalAdmissionDb((other_run_map,))
     _install_hospital_admission(monkeypatch, database)
@@ -238,7 +238,7 @@ async def test_hospital_admission_ignores_other_importer_families(monkeypatch):
         _hospital_request(
             "run-hospital",
             ["hospital-a"],
-            idempotency_key="shared-request",
+            idempotency_key="hospital-request",
         )
     )
     assert created is True and admitted["run_id"] == "run-hospital"

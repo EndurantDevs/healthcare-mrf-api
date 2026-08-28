@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Scope active import-run idempotency keys by importer.
+"""Prepare importer-scoped active import-run idempotency.
 
 Revision ID: 20260829090000_import_run_idempotency_scope
 Revises: 20260828120000_hospital_price_modifier_payer_identity
@@ -82,7 +82,7 @@ def _matches_index(
     )
 
 
-def _target_matches(
+def _replaceable_index_matches(
     schema: str,
     index_name: str,
     columns: tuple[str, ...],
@@ -95,35 +95,78 @@ def _target_matches(
         return False
 
 
-def _replace_index(
-    target_name: str,
-    target_columns: tuple[str, ...],
-    obsolete_name: str,
+def _ensure_index(
+    schema: str,
+    index_name: str,
+    columns: tuple[str, ...],
 ) -> None:
+    if _replaceable_index_matches(
+        schema,
+        index_name,
+        columns,
+    ):
+        return
+    with op.get_context().autocommit_block():
+        bind = op.get_bind()
+        bind.exec_driver_sql(_drop_index_sql(schema, index_name))
+        bind.exec_driver_sql(_create_index_sql(schema, index_name, columns))
+    if not _matches_index(schema, index_name, columns):
+        raise RuntimeError(f"required_index_missing:{schema}.{index_name}")
+
+
+def _prepare_indexes() -> None:
     schema = _schema()
     context = op.get_context()
     if context.as_sql:
         with context.autocommit_block():
-            op.execute(text(_drop_index_sql(schema, target_name)))
-            op.execute(text(_create_index_sql(schema, target_name, target_columns)))
-            op.execute(text(_drop_index_sql(schema, obsolete_name)))
+            op.execute(
+                text(
+                    _create_index_sql(
+                        schema,
+                        LEGACY_INDEX_NAME,
+                        LEGACY_INDEX_COLUMNS,
+                    )
+                )
+            )
+            op.execute(text(_drop_index_sql(schema, INDEX_NAME)))
+            op.execute(text(_create_index_sql(schema, INDEX_NAME, INDEX_COLUMNS)))
         return
 
-    target_matches = _target_matches(schema, target_name, target_columns)
-    if not target_matches:
-        with context.autocommit_block():
-            bind = op.get_bind()
-            bind.exec_driver_sql(_drop_index_sql(schema, target_name))
-            bind.exec_driver_sql(_create_index_sql(schema, target_name, target_columns))
-        if not _matches_index(schema, target_name, target_columns):
-            raise RuntimeError(f"required_index_missing:{schema}.{target_name}")
-    with context.autocommit_block():
-        op.get_bind().exec_driver_sql(_drop_index_sql(schema, obsolete_name))
+    _ensure_index(
+        schema,
+        LEGACY_INDEX_NAME,
+        LEGACY_INDEX_COLUMNS,
+    )
+    _ensure_index(
+        schema,
+        INDEX_NAME,
+        INDEX_COLUMNS,
+    )
 
 
 def upgrade() -> None:
-    _replace_index(INDEX_NAME, INDEX_COLUMNS, LEGACY_INDEX_NAME)
+    _prepare_indexes()
 
 
 def downgrade() -> None:
-    _replace_index(LEGACY_INDEX_NAME, LEGACY_INDEX_COLUMNS, INDEX_NAME)
+    schema = _schema()
+    context = op.get_context()
+    if context.as_sql:
+        with context.autocommit_block():
+            op.execute(
+                text(
+                    _create_index_sql(
+                        schema,
+                        LEGACY_INDEX_NAME,
+                        LEGACY_INDEX_COLUMNS,
+                    )
+                )
+            )
+        return
+    _ensure_index(
+        schema,
+        LEGACY_INDEX_NAME,
+        LEGACY_INDEX_COLUMNS,
+    )
+    with context.autocommit_block():
+        op.get_bind().exec_driver_sql(_drop_index_sql(schema, INDEX_NAME))
