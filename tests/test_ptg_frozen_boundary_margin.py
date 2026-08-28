@@ -88,7 +88,10 @@ async def test_scope_result_and_store_last_guards(monkeypatch):
         lambda _params: None,
     )
     with pytest.raises(binding.FrozenRateFileBindingMismatchError):
-        await binding_store.insert_or_compare_frozen_binding(None, {})
+        await binding_store.insert_or_compare_frozen_binding(
+            None,
+            protected_control_payload()["params"],
+        )
 
 
 def test_candidate_rejects_ambiguous_source_version_hash():
