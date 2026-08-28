@@ -90,118 +90,157 @@ def _source_effective_month_sql(pointer_alias: str, snapshot_alias: str) -> str:
     return f"COALESCE(({source_month} || '-01')::date, {pointer_alias}.import_month)"
 
 
-async def current_snapshot_id(
-    session,
-    requested_snapshot_id: str | None = None,
-    requested_source_key: str | None = None,
-    requested_plan_id: str | None = None,
-    requested_plan_market_type: str | None = None,
-    candidate_audit_access: PTG2CandidateAuditAccess | None = None,
-) -> str | None:
-    """Return a published snapshot only when every explicit selector binds."""
-    if requested_snapshot_id:
-        query_params_by_name: dict[str, object] = {
-            "snapshot_id": str(requested_snapshot_id),
-        }
-        status_sql = "status = 'published'"
-        if candidate_audit_access is not None:
-            if not candidate_audit_access.is_match(
-                snapshot_id=requested_snapshot_id,
-                source_key=requested_source_key,
-                plan_id=requested_plan_id,
-                plan_market_type=requested_plan_market_type,
-            ):
-                return None
-            query_params_by_name.update(
-                candidate_activation_contract=PTG2_CANDIDATE_ACTIVATION_CONTRACT,
-                candidate_source_key=candidate_audit_access.source_key,
-            )
-            status_sql = """
-                status = 'validated'
-                AND manifest->'activation'->>'contract'
-                    = :candidate_activation_contract
-                AND manifest->'activation'->>'state' = 'validated'
-                AND lower(btrim(COALESCE(
-                    manifest->'activation'->>'source_key', ''
-                ))) = :candidate_source_key
-            """
-            relation_available_sql = _serving_relation_available_sql(
-                "ptg2_snapshot",
-                require_activated_attestation=False,
-            )
-        else:
-            relation_available_sql = _serving_relation_available_sql(
-                "ptg2_snapshot"
-            )
-        source_sql = ""
-        normalized_source_key: str | None = None
-        if requested_source_key is not None:
-            normalized_source_key = str(requested_source_key).strip().lower()
-            if not normalized_source_key:
-                return None
-            query_params_by_name["source_key"] = normalized_source_key
-            if candidate_audit_access is not None:
-                source_sql = """
-                       AND lower(btrim(COALESCE(
-                           ptg2_snapshot.manifest->'serving_index'->>'source_key',
-                           ''
-                       ))) = :source_key
-                """
-            else:
-                source_sql = f"""
-                       AND EXISTS (
-                           SELECT 1
-                             FROM {PTG2_SCHEMA}.ptg2_v3_candidate_audit_attestation source_attestation
-                            WHERE source_attestation.snapshot_id = ptg2_snapshot.snapshot_id
-                              AND source_attestation.source_key = :source_key
-                              AND source_attestation.contract
-                                  IN ({_PTG2_ATTESTATION_CONTRACT_SQL})
-                              AND source_attestation.activated_at IS NOT NULL
-                       )
-                """
-        plan_sql = ""
-        if requested_plan_id is not None:
-            normalized_plan_id = str(requested_plan_id).strip()
-            if not normalized_plan_id:
-                return None
-            query_params_by_name["plan_ids"] = ein_plan_id_variants(
-                normalized_plan_id
-            )
-            market_sql = ""
-            normalized_market_type = str(
-                requested_plan_market_type or ""
-            ).strip().lower()
-            if normalized_market_type:
-                query_params_by_name["plan_market_type"] = normalized_market_type
-                market_sql = (
-                    "AND snapshot_scope.plan_market_type = :plan_market_type"
-                )
-            plan_sql = f"""
-                   AND EXISTS (
-                       SELECT 1
-                         FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_plan_scope snapshot_scope
-                        WHERE snapshot_scope.snapshot_id = ptg2_snapshot.snapshot_id
-                          AND snapshot_scope.plan_id = ANY(CAST(:plan_ids AS text[]))
-                          {market_sql}
-                   )
-            """
-        snapshot_result = await session.execute(
-            text(
-                f"""
-                SELECT snapshot_id
-                 FROM {PTG2_SCHEMA}.ptg2_snapshot
-                 WHERE snapshot_id = :snapshot_id
-                   AND {status_sql}
-                   AND {relation_available_sql}
-                   {source_sql}
-                   {plan_sql}
-                 LIMIT 1
-                """
-            ),
-            query_params_by_name,
+def _explicit_snapshot_status_sql(
+    *,
+    requested_snapshot_id: str,
+    requested_source_key: str | None,
+    requested_plan_id: str | None,
+    requested_plan_market_type: str | None,
+    candidate_audit_access: PTG2CandidateAuditAccess | None,
+    query_params_by_name: dict[str, object],
+) -> tuple[str, str] | None:
+    if candidate_audit_access is None:
+        return (
+            "status = 'published'",
+            _serving_relation_available_sql("ptg2_snapshot"),
         )
-        snapshot_value = snapshot_result.scalar()
-        return str(snapshot_value) if snapshot_value else None
+    if not candidate_audit_access.is_match(
+        snapshot_id=requested_snapshot_id,
+        source_key=requested_source_key,
+        plan_id=requested_plan_id,
+        plan_market_type=requested_plan_market_type,
+    ):
+        return None
+    query_params_by_name.update(
+        candidate_activation_contract=PTG2_CANDIDATE_ACTIVATION_CONTRACT,
+        candidate_source_key=candidate_audit_access.source_key,
+    )
+    return (
+        """
+            status = 'validated'
+            AND manifest->'activation'->>'contract'
+                = :candidate_activation_contract
+            AND manifest->'activation'->>'state' = 'validated'
+            AND lower(btrim(COALESCE(
+                manifest->'activation'->>'source_key', ''
+            ))) = :candidate_source_key
+        """,
+        _serving_relation_available_sql(
+            "ptg2_snapshot",
+            require_activated_attestation=False,
+        ),
+    )
+
+
+def _explicit_snapshot_source_sql(
+    requested_source_key: str | None,
+    candidate_audit_access: PTG2CandidateAuditAccess | None,
+    query_params_by_name: dict[str, object],
+) -> str | None:
+    if requested_source_key is None:
+        return ""
+    normalized_source_key = str(requested_source_key).strip().lower()
+    if not normalized_source_key:
+        return None
+    query_params_by_name["source_key"] = normalized_source_key
+    if candidate_audit_access is not None:
+        return """
+               AND lower(btrim(COALESCE(
+                   ptg2_snapshot.manifest->'serving_index'->>'source_key', ''
+               ))) = :source_key
+        """
+    return f"""
+           AND EXISTS (
+               SELECT 1
+                 FROM {PTG2_SCHEMA}.ptg2_v3_candidate_audit_attestation source_attestation
+                WHERE source_attestation.snapshot_id = ptg2_snapshot.snapshot_id
+                  AND source_attestation.source_key = :source_key
+                  AND source_attestation.contract
+                      IN ({_PTG2_ATTESTATION_CONTRACT_SQL})
+                  AND source_attestation.activated_at IS NOT NULL
+           )
+    """
+
+
+def _explicit_snapshot_plan_sql(
+    requested_plan_id: str | None,
+    requested_plan_market_type: str | None,
+    query_params_by_name: dict[str, object],
+) -> str | None:
+    if requested_plan_id is None:
+        return ""
+    normalized_plan_id = str(requested_plan_id).strip()
+    if not normalized_plan_id:
+        return None
+    query_params_by_name["plan_ids"] = ein_plan_id_variants(normalized_plan_id)
+    market_sql = ""
+    normalized_market_type = str(requested_plan_market_type or "").strip().lower()
+    if normalized_market_type:
+        query_params_by_name["plan_market_type"] = normalized_market_type
+        market_sql = "AND snapshot_scope.plan_market_type = :plan_market_type"
+    return f"""
+           AND EXISTS (
+               SELECT 1
+                 FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_plan_scope snapshot_scope
+                WHERE snapshot_scope.snapshot_id = ptg2_snapshot.snapshot_id
+                  AND snapshot_scope.plan_id = ANY(CAST(:plan_ids AS text[]))
+                  {market_sql}
+           )
+    """
+
+
+async def _explicit_snapshot_id(
+    session,
+    requested_snapshot_id: str,
+    requested_source_key: str | None,
+    requested_plan_id: str | None,
+    requested_plan_market_type: str | None,
+    candidate_audit_access: PTG2CandidateAuditAccess | None,
+) -> str | None:
+    query_params_by_name: dict[str, object] = {
+        "snapshot_id": str(requested_snapshot_id),
+    }
+    status_and_relation_sql = _explicit_snapshot_status_sql(
+        requested_snapshot_id=requested_snapshot_id,
+        requested_source_key=requested_source_key,
+        requested_plan_id=requested_plan_id,
+        requested_plan_market_type=requested_plan_market_type,
+        candidate_audit_access=candidate_audit_access,
+        query_params_by_name=query_params_by_name,
+    )
+    source_sql = _explicit_snapshot_source_sql(
+        requested_source_key,
+        candidate_audit_access,
+        query_params_by_name,
+    )
+    plan_sql = _explicit_snapshot_plan_sql(
+        requested_plan_id,
+        requested_plan_market_type,
+        query_params_by_name,
+    )
+    if status_and_relation_sql is None or source_sql is None or plan_sql is None:
+        return None
+    status_sql, relation_available_sql = status_and_relation_sql
+    snapshot_result = await session.execute(
+        text(
+            f"""
+            SELECT snapshot_id
+             FROM {PTG2_SCHEMA}.ptg2_snapshot
+             WHERE snapshot_id = :snapshot_id
+               AND {status_sql}
+               AND {relation_available_sql}
+               {source_sql}
+               {plan_sql}
+             LIMIT 1
+            """
+        ),
+        query_params_by_name,
+    )
+    snapshot_value = snapshot_result.scalar()
+    return str(snapshot_value) if snapshot_value else None
+
+
+async def _global_snapshot_id(session) -> str | None:
     snapshot_result = await session.execute(
         text(
             f"""
@@ -217,6 +256,27 @@ async def current_snapshot_id(
     )
     snapshot_value = snapshot_result.scalar()
     return str(snapshot_value) if snapshot_value else None
+
+
+async def current_snapshot_id(
+    session,
+    requested_snapshot_id: str | None = None,
+    requested_source_key: str | None = None,
+    requested_plan_id: str | None = None,
+    requested_plan_market_type: str | None = None,
+    candidate_audit_access: PTG2CandidateAuditAccess | None = None,
+) -> str | None:
+    """Return a published snapshot only when every explicit selector binds."""
+    if requested_snapshot_id:
+        return await _explicit_snapshot_id(
+            session,
+            requested_snapshot_id,
+            requested_source_key,
+            requested_plan_id,
+            requested_plan_market_type,
+            candidate_audit_access,
+        )
+    return await _global_snapshot_id(session)
 
 
 async def current_source_snapshot_id(session, source_key: str) -> str | None:

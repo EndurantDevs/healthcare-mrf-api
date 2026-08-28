@@ -11659,6 +11659,57 @@ def _is_graph_location_source_exhausted(
     return len(candidate_location_rows) < probe_limit
 
 
+def _graph_location_probe_setup(
+    candidate_limit: int,
+    batch_size: int,
+    require_provider_set_coverage: bool,
+) -> tuple[int, bool, _GraphLocationProbeState]:
+    """Return the cap, rejection policy, and request-scoped probe state."""
+    configured_match_limit = _ptg2_manifest_location_match_limit()
+    return (
+        max(configured_match_limit * 20, batch_size),
+        candidate_limit > configured_match_limit
+        and not require_provider_set_coverage,
+        _GraphLocationProbeState(
+            provider_set_coverage_required=require_provider_set_coverage
+        ),
+    )
+
+
+def _advance_unproven_graph_probe(
+    probe_state: _GraphLocationProbeState,
+    rate_provider_set_keys: frozenset[int],
+    *,
+    probe_limit: int,
+    batch_size: int,
+    max_candidates: int,
+    candidate_limit: int,
+    taxonomy_filter_requested: bool,
+    should_reject_unproven_expansion: bool,
+) -> int:
+    """Advance a bounded graph probe or reject an unprovable expansion."""
+    if should_reject_unproven_expansion:
+        raise PTG2LocationScopeError(
+            "Cost-ordered geographic provider search is too broad for exact "
+            "online expansion. Narrow the ZIP radius, add an NPI or provider "
+            "taxonomy filter, or set order_by=distance."
+        )
+    if probe_limit >= max_candidates:
+        probe_state.raise_unproven_bound()
+    return _next_graph_location_probe_limit(
+        probe_limit,
+        batch_size=batch_size,
+        max_candidates=max_candidates,
+        observed_matches=probe_state.observed_match_count(
+            taxonomy_filter_requested=taxonomy_filter_requested,
+        ),
+        required_matches=probe_state.required_match_count(
+            rate_provider_set_keys,
+            candidate_limit,
+        ),
+    )
+
+
 async def _paged_graph_candidates(
     session,
     serving_tables: PTG2ServingTables,
@@ -11673,14 +11724,12 @@ async def _paged_graph_candidates(
     batch_size = _graph_location_probe_batch_size(
         candidate_limit, taxonomy_filter_requested=is_provider_filter_requested
     )
-    configured_match_limit = _ptg2_manifest_location_match_limit()
-    max_candidates = max(configured_match_limit * 20, batch_size)
-    rejects_unproven_exhaustive_expansion = (
-        candidate_limit > configured_match_limit
-        and not require_provider_set_coverage
+    max_candidates, should_reject_unproven_expansion, probe_state = (
+        _graph_location_probe_setup(
+            candidate_limit, batch_size, require_provider_set_coverage
+        )
     )
     probe_limit = batch_size
-    probe_state = _GraphLocationProbeState(provider_set_coverage_required=require_provider_set_coverage)
     while probe_limit <= max_candidates:
         candidate_location_rows = await _membership_location_rows(
             session,
@@ -11709,25 +11758,15 @@ async def _paged_graph_candidates(
             candidate_location_rows, probe_limit
         ):
             break
-        if rejects_unproven_exhaustive_expansion:
-            raise PTG2LocationScopeError(
-                "Cost-ordered geographic provider search is too broad for exact "
-                "online expansion. Narrow the ZIP radius, add an NPI or provider "
-                "taxonomy filter, or set order_by=distance."
-            )
-        if probe_limit >= max_candidates:
-            probe_state.raise_unproven_bound()
-        probe_limit = _next_graph_location_probe_limit(
-            probe_limit,
+        probe_limit = _advance_unproven_graph_probe(
+            probe_state,
+            rate_provider_set_keys,
+            probe_limit=probe_limit,
             batch_size=batch_size,
             max_candidates=max_candidates,
-            observed_matches=probe_state.observed_match_count(
-                taxonomy_filter_requested=is_provider_filter_requested,
-            ),
-            required_matches=probe_state.required_match_count(
-                rate_provider_set_keys,
-                candidate_limit,
-            ),
+            candidate_limit=candidate_limit,
+            taxonomy_filter_requested=is_provider_filter_requested,
+            should_reject_unproven_expansion=should_reject_unproven_expansion,
         )
     return probe_state.result(taxonomy_filter_requested=is_provider_filter_requested)
 

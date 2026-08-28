@@ -17,6 +17,7 @@ from process.provider_directory_projection_types import (
     PROJECTION_RECIPE_CONTRACT_ID,
     PreparedProjectionStage,
     ProjectionLease,
+    ProjectionStage,
     ProviderDirectoryProjectionError,
     ProviderDirectoryProjectionLeaseLost,
 )
@@ -452,6 +453,47 @@ async def shared_active_recipe(
     return recipe_fields
 
 
+async def _stage_trigger_fields(
+    database: Any,
+    stage: ProjectionStage,
+) -> dict[str, Any]:
+    """Read the immutable stage trigger's exact catalog identity."""
+
+    return row_mapping(
+        await database.first(
+            """
+        SELECT trigger_record.oid::bigint AS trigger_oid,
+               relation_record.relname AS relation_name,
+               relation_schema.nspname AS relation_schema,
+               relation_record.relkind AS relation_kind,
+               function_record.proname AS function_name,
+               function_schema.nspname AS function_schema,
+               trigger_record.tgenabled, trigger_record.tgtype,
+               trigger_record.tgqual IS NULL AS has_no_when,
+               trigger_record.tgnargs,
+               trigger_record.tgoldtable,
+               trigger_record.tgnewtable,
+               trigger_record.tgattr::text AS trigger_columns,
+               pg_get_triggerdef(trigger_record.oid, true) AS trigger_definition
+          FROM pg_trigger AS trigger_record
+          JOIN pg_class AS relation_record
+            ON relation_record.oid = trigger_record.tgrelid
+          JOIN pg_namespace AS relation_schema
+            ON relation_schema.oid = relation_record.relnamespace
+          JOIN pg_proc AS function_record
+            ON function_record.oid = trigger_record.tgfoid
+          JOIN pg_namespace AS function_schema
+            ON function_schema.oid = function_record.pronamespace
+         WHERE trigger_record.tgrelid = CAST(:relation_oid AS oid)
+           AND trigger_record.tgname =
+               'provider_directory_projection_stage_immutable'
+           AND NOT trigger_record.tgisinternal;
+        """,
+            relation_oid=stage.relation_oid,
+        )
+    )
+
+
 async def assert_stage_trigger(
     database: Any,
     prepared: PreparedProjectionStage,
@@ -460,39 +502,7 @@ async def assert_stage_trigger(
 
     stages = [(prepared.stage, prepared.storage_trigger_oid)]
     for stage, expected_trigger_oid in stages:
-        trigger_fields = row_mapping(
-            await database.first(
-                """
-            SELECT trigger_record.oid::bigint AS trigger_oid,
-                   relation_record.relname AS relation_name,
-                   relation_schema.nspname AS relation_schema,
-                   relation_record.relkind AS relation_kind,
-                   function_record.proname AS function_name,
-                   function_schema.nspname AS function_schema,
-                   trigger_record.tgenabled, trigger_record.tgtype,
-                   trigger_record.tgqual IS NULL AS has_no_when,
-                   trigger_record.tgnargs,
-                   trigger_record.tgoldtable,
-                   trigger_record.tgnewtable,
-                   trigger_record.tgattr::text AS trigger_columns,
-                   pg_get_triggerdef(trigger_record.oid, true) AS trigger_definition
-              FROM pg_trigger AS trigger_record
-              JOIN pg_class AS relation_record
-                ON relation_record.oid = trigger_record.tgrelid
-              JOIN pg_namespace AS relation_schema
-                ON relation_schema.oid = relation_record.relnamespace
-              JOIN pg_proc AS function_record
-                ON function_record.oid = trigger_record.tgfoid
-              JOIN pg_namespace AS function_schema
-                ON function_schema.oid = function_record.pronamespace
-             WHERE trigger_record.tgrelid = CAST(:relation_oid AS oid)
-               AND trigger_record.tgname =
-                   'provider_directory_projection_stage_immutable'
-               AND NOT trigger_record.tgisinternal;
-            """,
-                relation_oid=stage.relation_oid,
-            )
-        )
+        trigger_fields = await _stage_trigger_fields(database, stage)
         trigger_enabled = trigger_fields.get("tgenabled")
         if isinstance(trigger_enabled, bytes):
             trigger_enabled = trigger_enabled.decode("ascii")
