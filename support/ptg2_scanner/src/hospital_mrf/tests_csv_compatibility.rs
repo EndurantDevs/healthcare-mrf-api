@@ -115,7 +115,7 @@
             (
                 "fee schedule",
                 "",
-                "payer information requires dollar, percentage, or algorithm charge",
+                "count 0 requires explanatory notes",
             ),
             (
                 "unsupported",
@@ -147,4 +147,131 @@
                 expected,
             );
         }
+    }
+
+    #[test]
+    fn wide_rows_ignore_valid_ancillary_only_payer_fields() {
+        let methodology_only = append_csv_row(
+            &fixture_wide_csv(),
+            &[
+                ("description", "Methodology-only payer fields"),
+                ("code|1", "10007"),
+                ("code|1|type", "CPT"),
+                ("setting", "outpatient"),
+                ("billing_class", "facility"),
+                ("standard_charge|gross", "50"),
+                (
+                    "standard_charge|Payer, Inc.|Plan A|methodology",
+                    "fee schedule",
+                ),
+            ],
+        );
+        let ancillary_only = append_csv_row(
+            &methodology_only,
+            &[
+                ("description", "Statistics-only payer fields"),
+                ("code|1", "10008"),
+                ("code|1|type", "CPT"),
+                ("setting", "outpatient"),
+                ("billing_class", "facility"),
+                ("standard_charge|gross", "51"),
+                ("median_amount|Payer, Inc.|Plan A", "45"),
+                ("10th_percentile|Payer, Inc.|Plan A", "40"),
+                ("90th_percentile|Payer, Inc.|Plan A", "49"),
+                ("count|Payer, Inc.|Plan A", "1 through 10"),
+            ],
+        );
+
+        let rows = run_fixture(InputFormat::WideCsv, &ancillary_only, false);
+        assert_eq!(
+            String::from_utf8(rows["charge"].clone())
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        assert_eq!(
+            String::from_utf8(rows["payer_charge"].clone())
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn wide_ancillary_only_payer_fields_preserve_validation_boundaries() {
+        let assert_wide_error = |code: &str, fields: &[(&str, &str)], expected: &str| {
+            let mut values = vec![
+                ("description", "Invalid ancillary-only payer fields"),
+                ("code|1", code),
+                ("code|1|type", "CPT"),
+                ("setting", "outpatient"),
+                ("billing_class", "facility"),
+                ("standard_charge|gross", "50"),
+            ];
+            values.extend_from_slice(fields);
+            assert_import_error(
+                InputFormat::WideCsv,
+                &append_csv_row(&fixture_wide_csv(), &values),
+                DEFAULT_MAX_FANOUT_ROWS,
+                expected,
+            );
+        };
+
+        assert_wide_error(
+            "10009",
+            &[("median_amount|Payer, Inc.|Plan A", "not-a-number")],
+            "median_amount must be an exact decimal number",
+        );
+        assert_wide_error(
+            "10010",
+            &[("count|Payer, Inc.|Plan A", "10")],
+            "count values from 1 through 10 must use the literal 1 through 10",
+        );
+        assert_wide_error(
+            "10011",
+            &[
+                (
+                    "standard_charge|Payer, Inc.|Plan A|methodology",
+                    "other",
+                ),
+            ],
+            "methodology other requires explanatory notes",
+        );
+        assert_wide_error(
+            "10012",
+            &[
+                (
+                    "standard_charge|Payer, Inc.|Plan A|negotiated_percentage",
+                    "25",
+                ),
+                (
+                    "standard_charge|Payer, Inc.|Plan A|methodology",
+                    "fee schedule",
+                ),
+            ],
+            "percentage and algorithm charges require count",
+        );
+
+        let no_standard_charge = append_csv_row(
+            &fixture_wide_csv(),
+            &[
+                ("description", "Ancillary fields without a standard charge"),
+                ("code|1", "10013"),
+                ("code|1|type", "CPT"),
+                ("setting", "outpatient"),
+                ("billing_class", "facility"),
+                (
+                    "standard_charge|Payer, Inc.|Plan A|methodology",
+                    "fee schedule",
+                ),
+            ],
+        );
+        assert_import_error(
+            InputFormat::WideCsv,
+            &no_standard_charge,
+            DEFAULT_MAX_FANOUT_ROWS,
+            "standard charge requires gross, discounted cash, or payer information",
+        );
     }
