@@ -17894,6 +17894,86 @@ async def _search_manifest_serving_table(
             storage_generation=str(serving_tables.storage_generation or ""),
         )
 
+    async def load_code_rows() -> list[dict[str, Any]]:
+        """Read and validate sealed metadata for the requested code."""
+        requested_code_values = _ptg2_reported_code_lookup_values(requested_system, requested_code)
+        scope_join_sql, code_filters, code_params, code_plan_order = _shared_v3_code_scope_sql(
+            serving_tables,
+            requested_plan=requested_plan,
+            plan_market_type=(
+                args.get("plan_market_type") or args.get("market_type") or ""
+            ),
+        )
+        code_filters.append("code_metadata.snapshot_key = :shared_snapshot_key")
+        code_params["shared_snapshot_key"] = _required_shared_snapshot_key(serving_tables)
+        _append_reported_code_system_filter(
+            code_filters,
+            code_params,
+            column="code_metadata.reported_code_system",
+            code_system=requested_system,
+        )
+        _append_reported_code_value_filter(
+            code_filters,
+            code_params,
+            column="code_metadata.reported_code",
+            param_name="reported_code",
+            values=requested_code_values,
+        )
+        code_result = await session.execute(
+            text(
+                f"""
+                SELECT code_metadata.code_key,
+                       logical_scope.plan_id,
+                       logical_scope.plan_market_type,
+                       code_metadata.reported_code_system,
+                       code_metadata.reported_code,
+                       code_metadata.negotiation_arrangement,
+                       code_metadata.billing_code_type_version,
+                       code_metadata.source_name,
+                       code_metadata.source_description,
+                       code_metadata.rate_count
+                  FROM {_shared_v3_code_table()} code_metadata
+                  {scope_join_sql}
+                 WHERE {" AND ".join(code_filters)}
+                 ORDER BY {code_plan_order},
+                          CASE WHEN code_metadata.reported_code = :reported_code THEN 0 ELSE 1 END,
+                          code_metadata.code_key
+                """
+            ),
+            code_params,
+        )
+        loaded_code_rows = [_canonical_code_metadata_row(code_record) for code_record in code_result]
+        if not all(code_row.get("code_key") is not None for code_row in loaded_code_rows):
+            raise PTG2ManifestArtifactError(
+                "PTG2 shared code dictionary contains an invalid key"
+            )
+        return loaded_code_rows
+
+    is_provider_inclusive_cost_ordered_geo = bool(
+        serving_tables.uses_v4_graph
+        and include_providers
+        and location_filter_requested
+        and not price_filter_requested
+        and requested_npi is None
+        and not explicit_provider_filter_requested
+        and str(args.get("order_by") or "total_allowed_amount").strip().lower()
+        in _PTG2_COST_ORDER_FIELDS
+    )
+    code_rows: list[dict[str, Any]] | None = None
+    if is_provider_inclusive_cost_ordered_geo:
+        code_rows = await load_code_rows()
+        if not code_rows:
+            return None
+        maximum_rate_rows = _v4_hot_prefix_limits(
+            serving_tables
+        ).maximum_provider_expansion_rate_rows
+        if _declared_geo_rate_count(code_rows) > maximum_rate_rows:
+            raise PTG2LocationScopeError(
+                "Cost-ordered geographic provider search is too broad for exact "
+                "online expansion. Narrow the ZIP radius, add an NPI or provider "
+                "taxonomy filter, or set order_by=distance."
+            )
+
     location_providers_by_set: dict[str, list[dict[str, Any]]] = {}
     is_location_selection_exhausted = False
     location_candidate_count = 0
@@ -17957,65 +18037,10 @@ async def _search_manifest_serving_table(
         if not provider_set_keys:
             return no_match_response()
 
-    requested_code_values = _ptg2_reported_code_lookup_values(
-        requested_system,
-        requested_code,
-    )
-    scope_join_sql, code_filters, code_params, code_plan_order = _shared_v3_code_scope_sql(
-        serving_tables,
-        requested_plan=requested_plan,
-        plan_market_type=args.get("plan_market_type") or args.get("market_type") or "",
-    )
-    code_filters.append("code_metadata.snapshot_key = :shared_snapshot_key")
-    code_params.update(
-        {
-            "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
-        }
-    )
-    _append_reported_code_system_filter(
-        code_filters,
-        code_params,
-        column="code_metadata.reported_code_system",
-        code_system=requested_system,
-    )
-    _append_reported_code_value_filter(
-        code_filters,
-        code_params,
-        column="code_metadata.reported_code",
-        param_name="reported_code",
-        values=requested_code_values,
-    )
-    code_result = await session.execute(
-        text(
-            f"""
-            SELECT code_metadata.code_key,
-                   logical_scope.plan_id,
-                   logical_scope.plan_market_type,
-                   code_metadata.reported_code_system,
-                   code_metadata.reported_code,
-                   code_metadata.negotiation_arrangement,
-                   code_metadata.billing_code_type_version,
-                   code_metadata.source_name,
-                   code_metadata.source_description,
-                   code_metadata.rate_count
-              FROM {_shared_v3_code_table()} code_metadata
-              {scope_join_sql}
-             WHERE {" AND ".join(code_filters)}
-             ORDER BY {code_plan_order},
-                      CASE WHEN code_metadata.reported_code = :reported_code THEN 0 ELSE 1 END,
-                      code_metadata.code_key
-            """
-        ),
-        code_params,
-    )
-    code_rows = [
-        _canonical_code_metadata_row(code_record)
-        for code_record in code_result
-    ]
+    if code_rows is None:
+        code_rows = await load_code_rows()
     if not code_rows:
         return None
-    if not all(code_row.get("code_key") is not None for code_row in code_rows):
-        raise PTG2ManifestArtifactError("PTG2 shared code dictionary contains an invalid key")
 
     total: int | None = None
     if not location_filter_requested and not direct_npi_filter_requested:
