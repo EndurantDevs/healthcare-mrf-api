@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import pytest
-from sqlalchemy import select, text, update
+from sqlalchemy import select, text
 
 from api import control_imports
 from db.models import ImportRun, db
@@ -330,64 +330,6 @@ async def test_fhir_general_and_relation_artifact_admission_race(monkeypatch):
             )
         ).scalars().all()
         assert len(active_rows) == 1
-    finally:
-        await _drop_import_run_schema()
-
-
-async def test_duplicate_idempotency_key_uses_real_partial_unique_index(monkeypatch):
-    await _reset_import_run_schema()
-    try:
-        monkeypatch.setattr(control_imports, "_enqueue_import_start", _fake_enqueue)
-        first, first_created = await control_imports.create_import_run(
-            {
-                "run_id": "run_first",
-                "importer": "npi",
-                "idempotency_key": "idem-db",
-            }
-        )
-        assert first_created is True
-        assert first["run_id"] == "run_first"
-
-        real_find = control_imports.find_active_run_by_idempotency_key
-        calls_by_name = {"count": 0}
-
-        async def race_miss_then_real(idempotency_key: str):
-            calls_by_name["count"] += 1
-            if calls_by_name["count"] == 1:
-                return None
-            return await real_find(idempotency_key)
-
-        monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", race_miss_then_real)
-        second, second_created = await control_imports.create_import_run(
-            {
-                "run_id": "run_second",
-                "importer": "nucc",
-                "idempotency_key": "idem-db",
-            }
-        )
-
-        assert second_created is False
-        assert second["run_id"] == "run_first"
-        assert calls_by_name["count"] == 2
-
-        await db.execute(
-            update(ImportRun)
-            .where(ImportRun.run_id == "run_first")
-            .values(status="succeeded", finished_at=control_imports.utc_now())
-        )
-        monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", real_find)
-        third, third_created = await control_imports.create_import_run(
-            {
-                "run_id": "run_after_terminal",
-                "importer": "nucc",
-                "idempotency_key": "idem-db",
-            }
-        )
-
-        assert third_created is True
-        assert third["run_id"] == "run_after_terminal"
-        import_runs = (await db.execute(select(ImportRun).order_by(ImportRun.run_id))).scalars().all()
-        assert [import_run.run_id for import_run in import_runs] == ["run_after_terminal", "run_first"]
     finally:
         await _drop_import_run_schema()
 

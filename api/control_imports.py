@@ -2006,11 +2006,15 @@ async def finalize_import_run(run_id: str, finalize_payload: dict[str, Any]) -> 
     return await get_import_run(run_id)
 
 
-async def find_active_run_by_idempotency_key(idempotency_key: str) -> dict[str, Any] | None:
-    """Find the active run that owns an idempotency key."""
+async def find_active_run_by_idempotency_key(
+    importer: str,
+    idempotency_key: str,
+) -> dict[str, Any] | None:
+    """Find the active importer run that owns an idempotency key."""
 
     result = await db.execute(
         select(ImportRun)
+        .where(ImportRun.importer == importer)
         .where(ImportRun.idempotency_key == idempotency_key)
         .where(ImportRun.status.in_(ACTIVE_STATUSES))
         .limit(1)
@@ -2044,7 +2048,7 @@ async def _idempotent_import_run(
             importer,
             idempotency_key,
         )
-    return await find_active_run_by_idempotency_key(idempotency_key)
+    return await find_active_run_by_idempotency_key(importer, idempotency_key)
 
 
 async def find_earliest_active_run_by_importer(importer: str) -> dict[str, Any] | None:
@@ -2094,9 +2098,14 @@ def _normalize_connection_run(connection_row: Any) -> dict[str, Any]:
     return normalize_run(dict(mapping) if mapping is not None else connection_row)
 
 
-async def _active_idempotency_run(connection: Any, idempotency_key: str) -> dict[str, Any] | None:
+async def _active_idempotency_run(
+    connection: Any,
+    importer: str,
+    idempotency_key: str,
+) -> dict[str, Any] | None:
     statement = (
         select(ImportRun.__table__)
+        .where(ImportRun.importer == importer)
         .where(ImportRun.idempotency_key == idempotency_key)
         .where(ImportRun.status.in_(ACTIVE_STATUSES))
         .limit(1)
@@ -2627,7 +2636,11 @@ async def _admit_provider_directory_run(import_row: dict[str, Any]) -> dict[str,
                 return retry_child
         idempotency_key = import_row.get("idempotency_key")
         if idempotency_key:
-            active_run = await _active_idempotency_run(connection, str(idempotency_key))
+            active_run = await _active_idempotency_run(
+                connection,
+                "provider-directory-fhir",
+                str(idempotency_key),
+            )
             if active_run:
                 return active_run
         active_runs = await _active_importer_runs(connection, "provider-directory-fhir")
@@ -2662,6 +2675,7 @@ async def _admit_hospital_price_run(
         if idempotency_key:
             active_run = await _active_idempotency_run(
                 connection,
+                "hospital-prices",
                 str(idempotency_key),
             )
             if active_run:
@@ -2691,6 +2705,7 @@ async def _locked_ptg_source_replay(
     if idempotency_key:
         active_run = await _active_idempotency_run(
             connection,
+            "ptg",
             str(idempotency_key),
         )
         if (
@@ -2787,13 +2802,21 @@ async def _admit_wave_fenced_import_run(
         await require_no_capacity_owning_wave(connection)
         idempotency_key = import_row.get("idempotency_key")
         if idempotency_key:
+            importer = str(import_row["importer"])
             # Preserve the established public deduplication contract while
             # holding the shared wave fence; the second in-transaction check
             # below still closes the ordinary-admission race.
-            existing = await find_active_run_by_idempotency_key(str(idempotency_key))
+            existing = await find_active_run_by_idempotency_key(
+                importer,
+                str(idempotency_key),
+            )
             if existing:
                 return existing
-            active_run = await _active_idempotency_run(connection, str(idempotency_key))
+            active_run = await _active_idempotency_run(
+                connection,
+                importer,
+                str(idempotency_key),
+            )
             if active_run:
                 return active_run
         existing_importer = await find_earliest_active_run_by_importer(
@@ -2825,6 +2848,7 @@ async def _admit_npi_import_run(
         if idempotency_key:
             active_run = await _active_idempotency_run(
                 connection,
+                "npi",
                 str(idempotency_key),
             )
             if active_run:

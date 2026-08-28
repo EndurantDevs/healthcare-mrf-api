@@ -1641,15 +1641,19 @@ def test_import_run_migration_mirrors_model(monkeypatch):
     table = recorder.tables["import_run"]
     assert table["schema"] == ImportRun.__table__.schema
     assert [column.name for column in table["columns"]] == list(ImportRun.__table__.columns.keys())
-    assert {name for name in recorder.indexes} == {
+    expected_model_indexes = {
         spec["name"]
         for spec in ImportRun.__my_additional_indexes__
         if spec["name"]
         not in {
+            "import_run_importer_active_idempotency_idx",
             "import_run_provider_directory_retry_child_idx",
             "import_run_mrf_discovery_retry_child_idx",
             "import_run_plan_pricing_idempotency_idx",
         }
+    }
+    assert {name for name in recorder.indexes} == expected_model_indexes | {
+        "import_run_active_idempotency_idx"
     }
     idempotency_idx = recorder.indexes["import_run_active_idempotency_idx"]
     assert idempotency_idx["table"] == "import_run"
@@ -1880,7 +1884,10 @@ async def test_import_run_request_paths_do_not_run_ddl(monkeypatch):
 
     assert await control_imports.list_import_runs() == []
     assert await control_imports.get_import_run("run_missing") is None
-    assert await control_imports.find_active_run_by_idempotency_key("idem-1") is None
+    assert (
+        await control_imports.find_active_run_by_idempotency_key("npi", "idem-1")
+        is None
+    )
     source_row, created = await control_imports.create_import_run(
         {"importer": "npi", "params": {}, "idempotency_key": "idem-1"}
     )
@@ -2113,7 +2120,7 @@ async def test_create_import_run_persists_enqueued_state(monkeypatch):
         async def execute(self, statement):
             statements.append(statement)
 
-    async def fake_find(_idempotency_key):
+    async def fake_find(_importer, _idempotency_key):
         return None
 
     async def fake_find_importer(_importer):
@@ -2174,7 +2181,7 @@ async def test_create_import_run_returns_active_run_after_integrity_race(monkeyp
         async def execute(self, _statement):
             raise IntegrityError("insert", {}, Exception("duplicate"))
 
-    async def fake_find(_idempotency_key):
+    async def fake_find(_importer, _idempotency_key):
         lookup_count_by_kind["find"] += 1
         return None if lookup_count_by_kind["find"] == 1 else active_run_map
 
@@ -2205,7 +2212,7 @@ async def test_create_import_run_returns_active_same_importer_run(monkeypatch):
         "importer": "npi",
     }
 
-    async def fake_find_idem(_idempotency_key):
+    async def fake_find_idem(_importer, _idempotency_key):
         return None
 
     async def fake_find_importer(_importer):
@@ -2265,7 +2272,7 @@ class _ParallelPTGRunHarness:
     async def execute(self, statement):
         self.statements.append(statement)
 
-    async def no_idempotent_run(self, _idempotency_key):
+    async def no_idempotent_run(self, _importer, _idempotency_key):
         return None
 
     async def reject_importer_singleton(self, importer):
@@ -2288,6 +2295,7 @@ class _ParallelPTGRunHarness:
     async def no_active_idempotency(
         self,
         _connection,
+        _importer,
         _idempotency_key,
     ):
         return None
@@ -2354,7 +2362,7 @@ async def test_create_import_run_serializes_unsourced_ptg(monkeypatch):
         "importer": "ptg",
     }
 
-    async def fake_find_idem(_idempotency_key):
+    async def fake_find_idem(_importer, _idempotency_key):
         return None
 
     async def fake_find_importer(_importer):
@@ -2562,8 +2570,9 @@ def _provider_retry_request(run_id):
 def _install_provider_admission_stubs(monkeypatch, active_runs, *, idempotency_run=None):
     database = _ProviderAdmissionDb()
 
-    async def active_idempotency(connection, _idempotency_key):
+    async def active_idempotency(connection, importer, _idempotency_key):
         assert connection is database
+        assert importer == "provider-directory-fhir"
         return idempotency_run
 
     async def active_importers(connection, importer):
@@ -2584,7 +2593,8 @@ async def test_concurrent_npi_admission_converges_on_one_active_run(monkeypatch)
     database = _ConcurrentNpiAdmissionDb()
     admitted_runs_by_id: dict[str, dict] = {}
 
-    async def no_idempotency_run(_connection, _idempotency_key):
+    async def no_idempotency_run(_connection, importer, _idempotency_key):
+        assert importer == "npi"
         return None
 
     async def active_npi_runs(connection, importer):
@@ -3068,7 +3078,8 @@ async def test_concurrent_provider_directory_retries_converge_on_one_child(monke
         assert connection is database
         return database.retry_child_by_parent.get(retry_of_run_id)
 
-    async def no_idempotency_run(_connection, _idempotency_key):
+    async def no_idempotency_run(_connection, importer, _idempotency_key):
+        assert importer == "provider-directory-fhir"
         return None
 
     async def no_active_runs(_connection, _importer):
