@@ -289,68 +289,69 @@ fn parse_wide_payers(
         {
             continue;
         }
-        if [
-            payer.standard_charge_dollar,
-            payer.standard_charge_percentage,
-            payer.standard_charge_algorithm,
-            payer.median_amount,
-            payer.percentile_10,
-            payer.percentile_90,
-        ]
-        .iter()
-        .all(|column| csv_value(record, *column).trim().is_empty())
-            && csv_value(record, payer.allowed_count).trim() == "0"
-            && !csv_value(record, payer.additional_payer_notes)
-                .trim()
-                .is_empty()
+        let parsed = PayerChargeRow {
+            payer_name: payer.payer_name.clone(),
+            plan_name: payer.plan_name.clone(),
+            standard_charge_dollar: optional_decimal(
+                csv_value(record, payer.standard_charge_dollar),
+                "standard_charge_dollar",
+            )?,
+            standard_charge_percentage: optional_decimal(
+                csv_value(record, payer.standard_charge_percentage),
+                "standard_charge_percentage",
+            )?,
+            standard_charge_algorithm: optional_text(csv_value(
+                record,
+                payer.standard_charge_algorithm,
+            )),
+            median_amount: optional_decimal(
+                csv_value(record, payer.median_amount),
+                "median_amount",
+            )?,
+            percentile_10: optional_decimal(
+                csv_value(record, payer.percentile_10),
+                "10th_percentile",
+            )?,
+            percentile_90: optional_decimal(
+                csv_value(record, payer.percentile_90),
+                "90th_percentile",
+            )?,
+            allowed_count: optional_text(csv_value(record, payer.allowed_count))
+                .as_deref()
+                .map(|value| allowed_count(value, true))
+                .transpose()?,
+            methodology: csv_value(record, payer.methodology).to_owned(),
+            additional_payer_notes: optional_text(csv_value(
+                record,
+                payer.additional_payer_notes,
+            )),
+        };
+        if parsed.standard_charge_dollar.is_none()
+            && parsed.standard_charge_percentage.is_none()
+            && parsed.standard_charge_algorithm.is_none()
         {
-            let methodology = csv_value(record, payer.methodology).trim();
-            if !methodology.is_empty() {
-                canonical_methodology(methodology, true)?;
+            let methodology = optional_text(&parsed.methodology)
+                .map(|value| canonical_methodology(&value, true))
+                .transpose()?;
+            let has_notes = parsed.additional_payer_notes.is_some();
+            if methodology.as_deref() == Some("other") && !has_notes {
+                return Err(invalid("methodology other requires explanatory notes"));
+            }
+            if parsed.allowed_count.as_deref() == Some("0") && !has_notes {
+                return Err(invalid("count 0 requires explanatory notes"));
+            }
+            let has_allowed_amounts = parsed.median_amount.is_some()
+                || parsed.percentile_10.is_some()
+                || parsed.percentile_90.is_some()
+                || parsed.allowed_count.is_some();
+            if has_allowed_amounts && !has_notes {
+                return Err(invalid(
+                    "payer allowed amounts without negotiated charge require explanatory notes",
+                ));
             }
             continue;
         }
-        payers.push(validate_payer(
-            PayerChargeRow {
-                payer_name: payer.payer_name.clone(),
-                plan_name: payer.plan_name.clone(),
-                standard_charge_dollar: optional_decimal(
-                    csv_value(record, payer.standard_charge_dollar),
-                    "standard_charge_dollar",
-                )?,
-                standard_charge_percentage: optional_decimal(
-                    csv_value(record, payer.standard_charge_percentage),
-                    "standard_charge_percentage",
-                )?,
-                standard_charge_algorithm: optional_text(csv_value(
-                    record,
-                    payer.standard_charge_algorithm,
-                )),
-                median_amount: optional_decimal(
-                    csv_value(record, payer.median_amount),
-                    "median_amount",
-                )?,
-                percentile_10: optional_decimal(
-                    csv_value(record, payer.percentile_10),
-                    "10th_percentile",
-                )?,
-                percentile_90: optional_decimal(
-                    csv_value(record, payer.percentile_90),
-                    "90th_percentile",
-                )?,
-                allowed_count: optional_text(csv_value(record, payer.allowed_count))
-                    .as_deref()
-                    .map(|value| allowed_count(value, true))
-                    .transpose()?,
-                methodology: csv_value(record, payer.methodology).to_owned(),
-                additional_payer_notes: optional_text(csv_value(
-                    record,
-                    payer.additional_payer_notes,
-                )),
-            },
-            None,
-            true,
-        )?);
+        payers.push(validate_payer(parsed, None, true)?);
     }
     Ok(payers)
 }
