@@ -359,6 +359,60 @@ async def test_download_worker_partitions_refreshed_and_unresolved_attempts(tmp_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("refresh_available", (False, True))
+async def test_download_worker_queues_failed_or_fully_refreshed_source(
+    tmp_path, monkeypatch, refresh_available
+):
+    orchestrator = _orchestrator_module()
+    expired_url = "https://files.example/prices.json?sig=expired"
+    fresh_url = "https://files.example/prices.json?sig=fresh"
+    attempt = _Attempt("attempt-a", "a", "Hospital A", expired_url, 0)
+    raw = SimpleNamespace(raw_sha256="a" * 64)
+    calls: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def resource_slot(_store, resource, slot_count):
+        assert (resource, slot_count) == ("fetch", 4)
+        yield
+
+    async def download(source_job, _store, _max_bytes, **kwargs):
+        url, grouped_attempts = source_job
+        calls.append(url)
+        if url == expired_url:
+            return _DownloadedSource(
+                url, None, grouped_attempts, "permission", "expired", True
+            )
+        assert kwargs == {"exact_url_only": True}
+        return _DownloadedSource(url, raw, grouped_attempts)
+
+    refresh_result = (fresh_url, (attempt,)) if refresh_available else None
+    refresh = AsyncMock(return_value=refresh_result)
+    monkeypatch.setattr(orchestrator, "download_source", download)
+    monkeypatch.setattr(orchestrator, "_hospital_resource_slot", resource_slot)
+    monkeypatch.setattr(orchestrator, "_refreshed_source_job", refresh)
+    monkeypatch.setattr(orchestrator, "_require_disk_capacity", lambda *_args: None)
+    source_jobs, downloads = asyncio.Queue(), asyncio.Queue()
+    source_jobs.put_nowait((expired_url, (attempt,)))
+    source_jobs.put_nowait(None)
+
+    worker = asyncio.create_task(orchestrator._download_worker(
+        source_jobs, downloads, _ArtifactStore(tmp_path), "hospital-prices:test",
+        1024, 1, slot_count=4,
+    ))
+    downloaded, acknowledgement = await asyncio.wait_for(
+        downloads.get(), timeout=1
+    )
+    if refresh_available:
+        assert (downloaded.raw, calls) == (raw, [expired_url, fresh_url])
+    else:
+        assert (downloaded.raw, calls) == (None, [expired_url])
+    assert downloaded.attempts == (attempt,)
+    refresh.assert_awaited_once()
+    acknowledgement.set_result(None)
+    await asyncio.wait_for(worker, timeout=1)
+
+
+@pytest.mark.asyncio
 async def test_parser_failure_cleans_private_directory(
     tmp_path, monkeypatch
 ):

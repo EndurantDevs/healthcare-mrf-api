@@ -315,6 +315,12 @@ def test_mrf_selector_normalizes_only_origin_and_rotating_credentials():
     ) is None
 
 
+def test_mrf_selector_rejects_control_characters():
+    assert locator.hospital_mrf_selector(
+        "https://files.example/Case/File.csv\n"
+    ) is None
+
+
 def test_selector_binds_unique_content_without_inventing_a_location():
     shared_locator = "https://hospital.example/cms-hpt.txt"
     selected = "https://files.example/Case/File.csv"
