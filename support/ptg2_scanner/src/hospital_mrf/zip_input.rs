@@ -13,6 +13,29 @@ fn is_zip(path: &Path) -> io::Result<bool> {
     Ok(file.read(&mut header)? == header.len() && ZIP_MAGICS.contains(&header))
 }
 
+fn is_appledouble_member(name: &str) -> bool {
+    name.strip_prefix("__MACOSX/")
+        .and_then(|path| path.rsplit('/').next())
+        .is_some_and(|basename| basename.starts_with("._"))
+}
+
+fn is_matching_appledouble_member(sidecar_name: &str, payload_name: &str) -> bool {
+    if payload_name.starts_with("__MACOSX/") {
+        return false;
+    }
+    let (payload_parent, payload_basename) =
+        payload_name.rsplit_once('/').unwrap_or(("", payload_name));
+    let Some(sidecar_path) = sidecar_name.strip_prefix("__MACOSX/") else {
+        return false;
+    };
+    let (sidecar_parent, sidecar_basename) = sidecar_path
+        .rsplit_once('/')
+        .unwrap_or(("", sidecar_path));
+    !payload_basename.is_empty()
+        && sidecar_parent == payload_parent
+        && sidecar_basename.strip_prefix("._") == Some(payload_basename)
+}
+
 fn import_zip_payload(
     format: InputFormat,
     version_id: &str,
@@ -23,40 +46,51 @@ fn import_zip_payload(
 ) -> io::Result<(u64, HospitalMrfArtifacts)> {
     let input_bytes = input_path.metadata()?.len();
     let mut archive = zip::ZipArchive::new(File::open(input_path)?).map_err(zip_error)?;
-    let mut selected = None;
+    let mut members = Vec::with_capacity(2);
     for index in 0..archive.len() {
         let member = archive.by_index_raw(index).map_err(zip_error)?;
         if member.is_dir() {
             continue;
         }
-        if selected.is_some() {
+        if members.len() == 2 {
             return Err(invalid("ZIP hospital MRF must contain exactly one file"));
         }
-        selected = Some((
+        members.push((
             index,
+            member.name().to_owned(),
             member.size(),
             member.compression(),
             member.encrypted(),
         ));
     }
-    let Some((index, declared_bytes, compression, encrypted)) = selected else {
-        return Err(invalid("ZIP hospital MRF must contain exactly one file"));
-    };
-    if encrypted {
+    if members.iter().any(|member| member.4) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "ZIP hospital MRF member must not be encrypted",
         ));
     }
-    if !matches!(
-        compression,
-        zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated
-    ) {
+    if members.iter().any(|member| {
+        !matches!(
+            member.3,
+            zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated
+        )
+    }) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "ZIP hospital MRF compression method is unsupported",
         ));
     }
+    let selected_index = match members.as_slice() {
+        [member] if !is_appledouble_member(&member.1) => 0,
+        [first, second] if is_matching_appledouble_member(&first.1, &second.1) => 1,
+        [first, second] if is_matching_appledouble_member(&second.1, &first.1) => 0,
+        _ => {
+            return Err(invalid(
+                "ZIP hospital MRF must contain exactly one file",
+            ))
+        }
+    };
+    let (index, _, declared_bytes, _, _) = members.swap_remove(selected_index);
     if declared_bytes == 0 {
         return Err(invalid("ZIP hospital MRF member is empty"));
     }

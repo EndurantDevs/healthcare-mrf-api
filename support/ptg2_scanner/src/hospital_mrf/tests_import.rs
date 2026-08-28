@@ -30,6 +30,43 @@
     }
 
     #[test]
+    fn matching_appledouble_member_is_ignored() {
+        let payload = fixture_json();
+        for (method, reverse) in [
+            (CompressionMethod::Stored, false),
+            (CompressionMethod::Deflated, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let input_path = directory.path().join("input.zip");
+            let mut entries = vec![
+                ("prices.json", payload.as_slice()),
+                ("__MACOSX/._prices.json", b"AppleDouble metadata".as_slice()),
+            ];
+            if reverse {
+                entries.reverse();
+            }
+            fs::write(
+                &input_path,
+                zip_bytes(&entries, method),
+            )
+            .unwrap();
+            let output_directory = directory.path().join("output");
+            fs::create_dir(&output_directory).unwrap();
+
+            let summary = import_hospital_mrf(
+                InputFormat::Json,
+                VERSION_ID,
+                &input_path,
+                &output_directory,
+                TEST_MAX_OUTPUT_BYTES,
+            )
+            .unwrap();
+
+            assert_eq!(summary.artifacts.len(), CopyKind::ALL.len());
+        }
+    }
+
+    #[test]
     fn mixed_cp1252_text_matches_utf8_in_every_container() {
         let mut value: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
         value["standard_charge_information"][0]["description"] =
