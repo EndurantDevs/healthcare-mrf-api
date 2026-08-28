@@ -302,10 +302,11 @@ async def test_worker_admission_and_binding_replay_short_circuit(monkeypatch):
     connection = object()
     monkeypatch.setattr(control_workers.db, "acquire", lambda: _Acquire(connection))
     monkeypatch.setattr(control_workers, "acquire_ptg_admission_lock", AsyncMock())
+    action_lock = AsyncMock()
     monkeypatch.setattr(
         control_workers,
         "acquire_control_run_worker_action_lock",
-        AsyncMock(),
+        action_lock,
     )
     monkeypatch.setattr(control_workers, "require_not_wave_owned_run", AsyncMock())
     monkeypatch.setattr(control_workers, "require_no_capacity_owning_wave", AsyncMock())
@@ -318,6 +319,7 @@ async def test_worker_admission_and_binding_replay_short_circuit(monkeypatch):
     assert await control_workers._guarded_ptg_family_ensure(
         {}, run_id="run", importer="ptg", selected_specs=[]
     ) is failed_by_field
+    action_lock.assert_awaited_once_with(connection, "run")
     expected_by_field = {"digest": "a" * 64}
     monkeypatch.setattr(
         bindings,
