@@ -536,3 +536,7 @@ async def assert_stage_trigger(
                 ),
             )
         )
+        if not is_exact:
+            raise ProviderDirectoryProjectionError(
+                "provider_directory_projection_stage_trigger_mismatch"
+            )
