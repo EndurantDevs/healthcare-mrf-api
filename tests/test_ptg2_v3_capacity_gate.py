@@ -213,9 +213,7 @@ def _set_unique_build_minutes(measurement, duration_minutes):
     )
     measurement["api"]["concurrent_unique_builds"] = concurrent_builds
     measurement["scratch"]["measured_concurrent_unique_builds"] = concurrent_builds
-    measurement["postgresql"]["load"][
-        "concurrent_unique_builds"
-    ] = concurrent_builds
+    measurement["postgresql"]["load"]["concurrent_unique_builds"] = concurrent_builds
 
 
 def _trust_config(trust=TEST_TRUST):
@@ -341,6 +339,52 @@ def test_passing_release_recomputes_capacity_from_signed_raw_rows():
 
 
 @pytest.mark.parametrize(
+    ("count_field", "total_field", "maximum_field"),
+    (
+        (
+            "physical_unique_builds_observed",
+            "physical_net_new_bytes_observed",
+            "physical_max_bytes_per_unique_build",
+        ),
+        (
+            "logical_imports_observed",
+            "logical_net_new_bytes_observed",
+            "logical_max_bytes_per_import",
+        ),
+    ),
+)
+def test_storage_observation_reports_the_inconsistent_maximum(
+    count_field,
+    total_field,
+    maximum_field,
+):
+    storage = copy.deepcopy(BASE_RECORD["storage"])
+    storage[total_field] = storage[count_field] * storage[maximum_field] + 1
+    with pytest.raises(gate.EvidenceError) as caught:
+        gate._validate_storage({"storage": storage})
+
+    assert (caught.value.code, caught.value.field) == (
+        "inconsistent_evidence",
+        f"storage.{maximum_field}",
+    )
+
+
+def test_storage_validation_parses_all_fields_before_consistency() -> None:
+    storage = copy.deepcopy(BASE_RECORD["storage"])
+    storage["physical_net_new_bytes_observed"] = (
+        storage["physical_unique_builds_observed"]
+        * storage["physical_max_bytes_per_unique_build"]
+        + 1
+    )
+    storage["logical_imports_observed"] = "invalid"
+
+    with pytest.raises(gate.EvidenceError) as caught:
+        gate._validate_storage({"storage": storage})
+
+    assert caught.value.field == "storage.logical_imports_observed"
+
+
+@pytest.mark.parametrize(
     ("minutes", "expected_hours"),
     [(10, 333.333333), (15, 500)],
 )
@@ -381,9 +425,10 @@ def test_insufficient_lane_headroom_fails_with_explicit_availability_factor():
     report = _evaluate(record)
 
     assert report["status"] == "fail"
-    assert report["metrics"]["monthly_capacity"][
-        "worst_case_lane_utilization_fraction"
-    ] > 0.7
+    assert (
+        report["metrics"]["monthly_capacity"]["worst_case_lane_utilization_fraction"]
+        > 0.7
+    )
     assert _gate_map(report)["worst_case_lane_utilization"] is False
 
 

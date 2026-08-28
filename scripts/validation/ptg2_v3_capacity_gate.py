@@ -2214,65 +2214,46 @@ def _validate_postgresql(root: Mapping[str, Any]) -> PostgresEvidence:
     )
 
 
-def _validate_storage(root: Mapping[str, Any]) -> StorageEvidence:
-    """Validate storage evidence, including observed count and byte consistency."""
+def _storage_observation(
+    storage_dict: Mapping[str, Any],
+    path: str,
+    count_field: str,
+    total_field: str,
+    maximum_field: str,
+) -> tuple[int, int, int]:
+    """Parse one count, total, and maximum without changing error precedence."""
 
+    count = _integer(storage_dict, count_field, path, minimum=1)
+    total = _integer(storage_dict, total_field, path, minimum=0)
+    maximum = _integer(storage_dict, maximum_field, path, minimum=1)
+    return count, total, maximum
+
+
+def _validate_storage_observations(
+    path: str,
+    *observations: tuple[str, int, int, int],
+) -> None:
+    """Validate parsed observations only after every storage field is typed."""
+
+    for maximum_field, count, total, maximum in observations:
+        if maximum * count >= total:
+            continue
+        raise EvidenceError(
+            "inconsistent_evidence",
+            f"{path}.{maximum_field}",
+        )
+
+
+def _storage_evidence(
+    storage_dict: Mapping[str, Any],
+    physical_observation: tuple[int, int, int],
+    logical_observation: tuple[int, int, int],
+) -> StorageEvidence:
+    """Build validated storage evidence from the two parsed observations."""
+
+    physical_count, physical_total, physical_max = physical_observation
+    logical_count, logical_total, logical_max = logical_observation
     path = "storage"
-    fields = (
-        "physical_unique_builds_observed",
-        "physical_net_new_bytes_observed",
-        "physical_max_bytes_per_unique_build",
-        "logical_imports_observed",
-        "logical_net_new_bytes_observed",
-        "logical_max_bytes_per_import",
-        "current_used_bytes",
-        "capacity_bytes",
-        "reserve_bytes",
-        "physical_retention_months",
-        "logical_retention_months",
-    )
-    storage_dict = _object(root[path], path, fields)
-    physical_count = _integer(
-        storage_dict,
-        "physical_unique_builds_observed",
-        path,
-        minimum=1,
-    )
-    physical_total = _integer(
-        storage_dict,
-        "physical_net_new_bytes_observed",
-        path,
-        minimum=0,
-    )
-    physical_max = _integer(
-        storage_dict,
-        "physical_max_bytes_per_unique_build",
-        path,
-        minimum=1,
-    )
-    logical_count = _integer(storage_dict, "logical_imports_observed", path, minimum=1)
-    logical_total = _integer(
-        storage_dict,
-        "logical_net_new_bytes_observed",
-        path,
-        minimum=0,
-    )
-    logical_max = _integer(
-        storage_dict,
-        "logical_max_bytes_per_import",
-        path,
-        minimum=1,
-    )
-    if physical_max * physical_count < physical_total:
-        raise EvidenceError(
-            "inconsistent_evidence",
-            f"{path}.physical_max_bytes_per_unique_build",
-        )
-    if logical_max * logical_count < logical_total:
-        raise EvidenceError(
-            "inconsistent_evidence",
-            f"{path}.logical_max_bytes_per_import",
-        )
     return StorageEvidence(
         physical_unique_builds_observed=physical_count,
         physical_net_new_bytes_observed=physical_total,
@@ -2300,6 +2281,49 @@ def _validate_storage(root: Mapping[str, Any]) -> StorageEvidence:
             minimum_inclusive=False,
         ),
     )
+
+
+def _validate_storage(root: Mapping[str, Any]) -> StorageEvidence:
+    """Validate storage evidence, including observed count and byte consistency."""
+
+    path = "storage"
+    fields = (
+        "physical_unique_builds_observed",
+        "physical_net_new_bytes_observed",
+        "physical_max_bytes_per_unique_build",
+        "logical_imports_observed",
+        "logical_net_new_bytes_observed",
+        "logical_max_bytes_per_import",
+        "current_used_bytes",
+        "capacity_bytes",
+        "reserve_bytes",
+        "physical_retention_months",
+        "logical_retention_months",
+    )
+    storage_dict = _object(root[path], path, fields)
+    physical_observation = _storage_observation(
+        storage_dict,
+        path,
+        "physical_unique_builds_observed",
+        "physical_net_new_bytes_observed",
+        "physical_max_bytes_per_unique_build",
+    )
+    logical_observation = _storage_observation(
+        storage_dict,
+        path,
+        "logical_imports_observed",
+        "logical_net_new_bytes_observed",
+        "logical_max_bytes_per_import",
+    )
+    _validate_storage_observations(
+        path,
+        (
+            "physical_max_bytes_per_unique_build",
+            *physical_observation,
+        ),
+        ("logical_max_bytes_per_import", *logical_observation),
+    )
+    return _storage_evidence(storage_dict, physical_observation, logical_observation)
 
 
 _GC_FIELDS = (
@@ -2479,25 +2503,13 @@ _API_FIELDS = (
 )
 
 
-def _api_request_counts(
-    api_dict: Mapping[str, Any], path: str
-) -> Mapping[str, int]:
+def _api_request_counts(api_dict: Mapping[str, Any], path: str) -> Mapping[str, int]:
     count_map = {
-        "planned_requests": _integer(
-            api_dict, "planned_requests", path, minimum=1
-        ),
-        "attempted_requests": _integer(
-            api_dict, "attempted_requests", path, minimum=1
-        ),
-        "succeeded_requests": _integer(
-            api_dict, "succeeded_requests", path, minimum=0
-        ),
-        "failed_requests": _integer(
-            api_dict, "failed_requests", path, minimum=0
-        ),
-        "retried_requests": _integer(
-            api_dict, "retried_requests", path, minimum=0
-        ),
+        "planned_requests": _integer(api_dict, "planned_requests", path, minimum=1),
+        "attempted_requests": _integer(api_dict, "attempted_requests", path, minimum=1),
+        "succeeded_requests": _integer(api_dict, "succeeded_requests", path, minimum=0),
+        "failed_requests": _integer(api_dict, "failed_requests", path, minimum=0),
+        "retried_requests": _integer(api_dict, "retried_requests", path, minimum=0),
         "requests": _integer(api_dict, "requests", path, minimum=1),
         "requests_while_imports_running": _integer(
             api_dict, "requests_while_imports_running", path, minimum=0
@@ -2600,9 +2612,7 @@ def _validate_api(root: Mapping[str, Any]) -> ApiEvidence:
     path = "api"
     api_dict = _object(root[path], path, _API_FIELDS)
     counts = _api_request_counts(api_dict, path)
-    classes = _api_class_evidence(
-        api_dict, path, counts["requests"], counts["errors"]
-    )
+    classes = _api_class_evidence(api_dict, path, counts["requests"], counts["errors"])
     contention_started_at, contention_ended_at, contention_seconds = (
         _api_contention_window(api_dict, path, classes)
     )
@@ -2883,9 +2893,7 @@ def _require_api_payload_value(
         raise EvidenceError(error_code, f"{path}.{name}")
 
 
-def _verify_api_protocol_contract(
-    signed_payload: Mapping[str, Any], path: str
-) -> None:
+def _verify_api_protocol_contract(signed_payload: Mapping[str, Any], path: str) -> None:
     protocol_fields_by_name = {
         "evidence_version": _API_EVIDENCE_VERSION,
         "signature_version": _API_SIGNATURE_VERSION,
@@ -2989,9 +2997,7 @@ def _validated_server_duration_ns(
     duration_ns = _integer(sample_object, "server_duration_ns", path, minimum=0)
     if duration_ns > _API_MAX_DURATION_NS:
         raise EvidenceError("invalid_value", f"{path}.server_duration_ns")
-    wall_duration_seconds = _duration_seconds(
-        server_received_at, server_observed_at
-    )
+    wall_duration_seconds = _duration_seconds(server_received_at, server_observed_at)
     monotonic_duration_seconds = Decimal(duration_ns) / Decimal(1_000_000_000)
     if abs(monotonic_duration_seconds - wall_duration_seconds) > 1:
         raise EvidenceError("duration_timestamp_mismatch", f"{path}.server_duration_ns")
@@ -3021,12 +3027,8 @@ def _validate_http_sample_context(
     _validate_http_semantics(sample, path)
 
 
-def _validated_http_response_status(
-    sample_object: Mapping[str, Any], path: str
-) -> int:
-    response_status = _integer(
-        sample_object, "response_status", path, minimum=100
-    )
+def _validated_http_response_status(sample_object: Mapping[str, Any], path: str) -> int:
+    response_status = _integer(sample_object, "response_status", path, minimum=100)
     if response_status > 599:
         raise EvidenceError("invalid_value", f"{path}.response_status")
     return response_status
@@ -3204,9 +3206,7 @@ def _threshold_concurrency_intervals(
         event_delta_by_time[clipped_start] = (
             event_delta_by_time.get(clipped_start, 0) + 1
         )
-        event_delta_by_time[clipped_end] = (
-            event_delta_by_time.get(clipped_end, 0) - 1
-        )
+        event_delta_by_time[clipped_end] = event_delta_by_time.get(clipped_end, 0) - 1
 
     active = 0
     cursor = started_at
@@ -3422,7 +3422,9 @@ def _validate_raw_sample_groups(
     peak_import_events = _validate_peak_import_event_collection(
         raw_object["peak_import_events"]
     )
-    peak_audit_events = _validate_peak_audit_event_collection(raw_object["peak_audit_events"])
+    peak_audit_events = _validate_peak_audit_event_collection(
+        raw_object["peak_audit_events"]
+    )
     matched, negative, random_samples = _validate_raw_http_samples(
         raw_object, api, trust, receipt
     )
@@ -3558,9 +3560,7 @@ def _validate_raw_samples(
         audit_threshold=coverage.audit_threshold,
         full_lane_threshold=coverage.full_lane_threshold,
         http_observation_coverage_ratio=coverage.http_observation_coverage_ratio,
-        http_observation_max_gap_seconds=(
-            coverage.http_observation_max_gap_seconds
-        ),
+        http_observation_max_gap_seconds=(coverage.http_observation_max_gap_seconds),
         http_rate_buckets=coverage.http_rate_buckets,
         concurrent_unique_builds=coverage.concurrent_unique_builds,
         concurrent_candidate_audits=coverage.concurrent_candidate_audits,
@@ -3712,23 +3712,43 @@ def _reconcile_storage_and_gc_telemetry(
     derived: RawResourceSummaries,
 ) -> None:
     _reconcile_attributes(
-        evidence.storage, derived.storage, "storage",
+        evidence.storage,
+        derived.storage,
+        "storage",
         (
-            "physical_unique_builds_observed", "physical_net_new_bytes_observed",
-            "physical_max_bytes_per_unique_build", "logical_imports_observed",
-            "logical_net_new_bytes_observed", "logical_max_bytes_per_import",
-            "current_used_bytes", "capacity_bytes", "reserve_bytes",
-            "physical_retention_months", "logical_retention_months",
+            "physical_unique_builds_observed",
+            "physical_net_new_bytes_observed",
+            "physical_max_bytes_per_unique_build",
+            "logical_imports_observed",
+            "logical_net_new_bytes_observed",
+            "logical_max_bytes_per_import",
+            "current_used_bytes",
+            "capacity_bytes",
+            "reserve_bytes",
+            "physical_retention_months",
+            "logical_retention_months",
         ),
     )
     _reconcile_attributes(
-        evidence.gc, derived.gc, "gc",
+        evidence.gc,
+        derived.gc,
+        "gc",
         (
-            "window_hours", "cycles_observed", "executed_cycles", "overlap_count",
-            "reference_recheck_failures", "starting_backlog_bytes", "starting_backlog_layouts",
-            "newly_eligible_bytes", "deleted_bytes", "ending_backlog_bytes",
-            "ending_backlog_layouts", "max_backlog_bytes", "max_clearance_hours",
-            "eligible_layouts", "deleted_layouts",
+            "window_hours",
+            "cycles_observed",
+            "executed_cycles",
+            "overlap_count",
+            "reference_recheck_failures",
+            "starting_backlog_bytes",
+            "starting_backlog_layouts",
+            "newly_eligible_bytes",
+            "deleted_bytes",
+            "ending_backlog_bytes",
+            "ending_backlog_layouts",
+            "max_backlog_bytes",
+            "max_clearance_hours",
+            "eligible_layouts",
+            "deleted_layouts",
         ),
     )
 
@@ -4364,9 +4384,24 @@ def _http_commitment_sources(
     raw_object: Mapping[str, Any], api: ApiEvidence
 ) -> tuple[tuple[str, Any, int, ApiClassEvidence], ...]:
     return (
-        ("cold_matched_positive_samples", raw_object["http_matched_positive"], api.matched_positive.samples, api.matched_positive),
-        ("cold_negative_samples", raw_object["http_negative"], api.negative.samples, api.negative),
-        ("cold_random_samples", raw_object["http_random"], api.random.samples, api.random),
+        (
+            "cold_matched_positive_samples",
+            raw_object["http_matched_positive"],
+            api.matched_positive.samples,
+            api.matched_positive,
+        ),
+        (
+            "cold_negative_samples",
+            raw_object["http_negative"],
+            api.negative.samples,
+            api.negative,
+        ),
+        (
+            "cold_random_samples",
+            raw_object["http_random"],
+            api.random.samples,
+            api.random,
+        ),
     )
 
 
@@ -5859,7 +5894,9 @@ def _example_signed_api_evidence_payload(
 ) -> dict[str, Any]:
     return {
         "api_evidence_key_id": EXAMPLE_API_EVIDENCE_KEY_ID,
-        "challenge_digest": _synthetic_digest(f"synthetic-{class_name}-challenge-{ordinal}"),
+        "challenge_digest": _synthetic_digest(
+            f"synthetic-{class_name}-challenge-{ordinal}"
+        ),
         "environment_id": EXAMPLE_ENVIRONMENT_ID,
         "evidence_version": _API_EVIDENCE_VERSION,
         "isolated": True,
@@ -5872,11 +5909,15 @@ def _example_signed_api_evidence_payload(
         "query_contract": _API_QUERY_CONTRACT_ID,
         "query_contract_digest": _API_QUERY_CONTRACT_DIGEST,
         "release_digest": EXAMPLE_RELEASE_DIGEST,
-        "response_body_sha256": _synthetic_digest(f"synthetic-{class_name}-response-{ordinal}"),
+        "response_body_sha256": _synthetic_digest(
+            f"synthetic-{class_name}-response-{ordinal}"
+        ),
         "response_status": 200,
         "run_digest": identity.run_digest,
         "scope_digest": identity.scope_digest,
-        "semantic_query_digest": _synthetic_digest(f"synthetic-{class_name}-query-{ordinal}"),
+        "semantic_query_digest": _synthetic_digest(
+            f"synthetic-{class_name}-query-{ordinal}"
+        ),
         "server_received_at": _timestamp_text(server_observed_at),
         "server_observed_at": _timestamp_text(server_observed_at),
         "server_duration_ns": latency_ms * 1_000_000,
@@ -6110,20 +6151,49 @@ def _example_resource_intervals(
     for index in range(720):
         interval_started_at = contention_started_at + timedelta(seconds=index * 5)
         step = index + 1
-        interval_rows.append({
-            "started_at": _timestamp_text(interval_started_at),
-            "ended_at": _timestamp_text(interval_started_at + timedelta(seconds=5)),
-            "config_revision_sha256": config_revision_sha256,
-            "scratch_peak_used_bytes": 400 * gigabyte,
-            "scratch_min_available_bytes": 600 * gigabyte,
-            "temp_peak_used_bytes": 100 * gigabyte,
-            "temp_min_available_bytes": 100 * gigabyte,
-            "write_counters": _example_category_counters(write_epoch_sha256, step * 1_000_000_000, step * 25_000_000, step * 75_000_000),
-            "wal_counters": _example_category_counters(wal_epoch_sha256, step * 500_000_000, step * 10_000_000, step * 90_000_000),
-            "connections": {"api_connections": 30, "import_connections": 12, "other_connections": 20},
-            "pool_wait": {"bucket_counts": [_distributed_total(200_000, 720, index), 0, 0, 0, 0, 0, 0], "overflow_count": 0, "max_ms": 0, "timeout_errors": 0},
-            "autovacuum": {"workers": 3, "oldest_pending_seconds": 900},
-        })
+        interval_rows.append(
+            {
+                "started_at": _timestamp_text(interval_started_at),
+                "ended_at": _timestamp_text(interval_started_at + timedelta(seconds=5)),
+                "config_revision_sha256": config_revision_sha256,
+                "scratch_peak_used_bytes": 400 * gigabyte,
+                "scratch_min_available_bytes": 600 * gigabyte,
+                "temp_peak_used_bytes": 100 * gigabyte,
+                "temp_min_available_bytes": 100 * gigabyte,
+                "write_counters": _example_category_counters(
+                    write_epoch_sha256,
+                    step * 1_000_000_000,
+                    step * 25_000_000,
+                    step * 75_000_000,
+                ),
+                "wal_counters": _example_category_counters(
+                    wal_epoch_sha256,
+                    step * 500_000_000,
+                    step * 10_000_000,
+                    step * 90_000_000,
+                ),
+                "connections": {
+                    "api_connections": 30,
+                    "import_connections": 12,
+                    "other_connections": 20,
+                },
+                "pool_wait": {
+                    "bucket_counts": [
+                        _distributed_total(200_000, 720, index),
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    "overflow_count": 0,
+                    "max_ms": 0,
+                    "timeout_errors": 0,
+                },
+                "autovacuum": {"workers": 3, "oldest_pending_seconds": 900},
+            }
+        )
     return interval_rows
 
 
@@ -6131,17 +6201,49 @@ def _example_resource_events(
     contention_started_at: datetime,
     imports: Sequence[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    unique_imports = [import_row for import_row in imports if import_row["kind"] == "unique_build"]
+    unique_imports = [
+        import_row for import_row in imports if import_row["kind"] == "unique_build"
+    ]
     cleanup_events = [
-        {"import_id_sha256": import_row["import_id_sha256"], "started_at": _timestamp_text(contention_started_at + timedelta(minutes=index + 1)), "ended_at": _timestamp_text(contention_started_at + timedelta(minutes=index + 1, seconds=10)), "outcome": "completed"}
+        {
+            "import_id_sha256": import_row["import_id_sha256"],
+            "started_at": _timestamp_text(
+                contention_started_at + timedelta(minutes=index + 1)
+            ),
+            "ended_at": _timestamp_text(
+                contention_started_at + timedelta(minutes=index + 1, seconds=10)
+            ),
+            "outcome": "completed",
+        }
         for index, import_row in enumerate(unique_imports)
     ]
     checkpoint_events = [
-        {"started_at": _timestamp_text(contention_started_at + timedelta(minutes=minute)), "ended_at": _timestamp_text(contention_started_at + timedelta(minutes=minute, seconds=60)), "trigger": "scheduled", "write_seconds": 50, "sync_seconds": 5}
+        {
+            "started_at": _timestamp_text(
+                contention_started_at + timedelta(minutes=minute)
+            ),
+            "ended_at": _timestamp_text(
+                contention_started_at + timedelta(minutes=minute, seconds=60)
+            ),
+            "trigger": "scheduled",
+            "write_seconds": 50,
+            "sync_seconds": 5,
+        }
         for minute in (5, 15, 25, 35, 45, 55)
     ]
     autovacuum_events = [
-        {"relation_id_sha256": _synthetic_digest(f"synthetic-autovacuum-relation-{index}"), "started_at": _timestamp_text(contention_started_at + timedelta(minutes=2 + index * 7)), "ended_at": _timestamp_text(contention_started_at + timedelta(minutes=3 + index * 7)), "outcome": "completed"}
+        {
+            "relation_id_sha256": _synthetic_digest(
+                f"synthetic-autovacuum-relation-{index}"
+            ),
+            "started_at": _timestamp_text(
+                contention_started_at + timedelta(minutes=2 + index * 7)
+            ),
+            "ended_at": _timestamp_text(
+                contention_started_at + timedelta(minutes=3 + index * 7)
+            ),
+            "outcome": "completed",
+        }
         for index in range(8)
     ]
     return cleanup_events, checkpoint_events, autovacuum_events
@@ -6154,8 +6256,14 @@ def _example_storage_deltas(
         {
             "import_id_sha256": import_row["import_id_sha256"],
             "kind": import_row["kind"],
-            "physical_layout_id_sha256": _synthetic_digest(f"synthetic-layout-{import_row['import_id_sha256']}") if import_row["kind"] == "unique_build" else _synthetic_digest("synthetic-preexisting-layout"),
-            "physical_net_new_bytes": 20 * gigabyte if import_row["kind"] == "unique_build" else 0,
+            "physical_layout_id_sha256": (
+                _synthetic_digest(f"synthetic-layout-{import_row['import_id_sha256']}")
+                if import_row["kind"] == "unique_build"
+                else _synthetic_digest("synthetic-preexisting-layout")
+            ),
+            "physical_net_new_bytes": (
+                20 * gigabyte if import_row["kind"] == "unique_build" else 0
+            ),
             "logical_net_new_bytes": 10_000_000,
         }
         for import_row in imports

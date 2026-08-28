@@ -50,9 +50,9 @@ _DEFAULT_COPY_WORK_MEM = "128MB"
 _MAX_COPY_PARALLEL_WORKERS_PER_GATHER = 8
 _MAX_DENSE_KEY_COUNT = 1 << 32
 PTG2_V3_PRICE_KEY_ORDER = "minimum_negotiated_rate_then_global_id_128_v1"
-_PRICE_PROGRESS_CALLBACK: contextvars.ContextVar[
-    Callable[[str, int], None] | None
-] = contextvars.ContextVar("ptg2_price_progress_callback", default=None)
+_PRICE_PROGRESS_CALLBACK: contextvars.ContextVar[Callable[[str, int], None] | None] = (
+    contextvars.ContextVar("ptg2_price_progress_callback", default=None)
+)
 _WORK_MEM_RE = re.compile(r"^[1-9][0-9]*(?:kB|MB|GB|TB)?$")
 _V3_ATTRIBUTE_KEY_COLUMNS = (
     "negotiated_type_key",
@@ -126,6 +126,15 @@ class PreparedSharedPriceKeyMap:
     schema_name: str
     price_key_map: str
     price_set_count: int
+
+
+@dataclass(frozen=True)
+class _StagedSharedPriceBlocks:
+    membership_summary: Mapping[str, Any]
+    atom_summary: Mapping[str, Any]
+    constant_key_by_column: Mapping[str, int]
+    constant_value_by_kind: Mapping[str, Any]
+    dictionary_table: str | None
 
 
 async def _await_cleanup_task(
@@ -237,8 +246,7 @@ def _parse_shared_price_stream_summary(stderr: bytes) -> dict[str, Any]:
         if isinstance(payload, dict):
             return payload
     raise RuntimeError(
-        "PTG2 strict price encoder did not emit a summary: "
-        f"{stderr_text[-1000:]}"
+        "PTG2 strict price encoder did not emit a summary: " f"{stderr_text[-1000:]}"
     )
 
 
@@ -501,12 +509,8 @@ async def _read_v3_dense_map_metrics(
     )
     return {
         "row_count": int(_row_value(dense_row, "row_count", 0) or 0),
-        "distinct_id_count": int(
-            _row_value(dense_row, "distinct_id_count", 1) or 0
-        ),
-        "distinct_key_count": int(
-            _row_value(dense_row, "distinct_key_count", 2) or 0
-        ),
+        "distinct_id_count": int(_row_value(dense_row, "distinct_id_count", 1) or 0),
+        "distinct_key_count": int(_row_value(dense_row, "distinct_key_count", 2) or 0),
         "minimum_key": _row_value(dense_row, "minimum_key", 3),
         "maximum_key": _row_value(dense_row, "maximum_key", 4),
     }
@@ -552,6 +556,68 @@ async def _validate_v3_dense_map(
     return dense_map_metrics
 
 
+async def _create_v3_price_key_table(
+    qualified_summary: str,
+    qualified_stage: str,
+    source_count: int | None,
+) -> Any:
+    """Create the single-source or safely canonicalized price-key table."""
+
+    if source_count == 1:
+        return await db.status(
+            f"""
+            CREATE UNLOGGED TABLE {qualified_stage} AS
+            SELECT
+                price_set_global_id_128,
+                (ROW_NUMBER() OVER (
+                    ORDER BY minimum_negotiated_rate ASC NULLS LAST,
+                             price_set_global_id_128
+                ) - 1)::bigint AS price_key,
+                minimum_negotiated_rate
+            FROM {qualified_summary}
+            ORDER BY minimum_negotiated_rate ASC NULLS LAST,
+                     price_set_global_id_128;
+            """
+        )
+    created_row_count = await db.status(
+        f"""
+        CREATE UNLOGGED TABLE {qualified_stage} AS
+        WITH canonical AS MATERIALIZED (
+            SELECT
+                price_set_global_id_128,
+                MIN(minimum_negotiated_rate) AS minimum_negotiated_rate,
+                MIN(minimum_negotiated_rate) IS DISTINCT FROM
+                    MAX(minimum_negotiated_rate) AS payload_conflict
+            FROM {qualified_summary}
+            GROUP BY price_set_global_id_128
+        )
+        SELECT
+            price_set_global_id_128,
+            (ROW_NUMBER() OVER (
+                ORDER BY minimum_negotiated_rate ASC NULLS LAST,
+                         price_set_global_id_128
+            ) - 1)::bigint AS price_key,
+            minimum_negotiated_rate,
+            payload_conflict
+        FROM canonical
+        ORDER BY minimum_negotiated_rate ASC NULLS LAST,
+                 price_set_global_id_128;
+        """
+    )
+    if bool(
+        await db.scalar(
+            f"SELECT EXISTS (SELECT 1 FROM {qualified_stage} "
+            "WHERE payload_conflict LIMIT 1)"
+        )
+    ):
+        await db.status(f"DROP TABLE IF EXISTS {qualified_stage} CASCADE;")
+        raise RuntimeError(
+            "strict V3 observed one price-set ID with conflicting minimum rates"
+        )
+    await db.status(f"ALTER TABLE {qualified_stage} DROP COLUMN payload_conflict;")
+    return created_row_count
+
+
 async def _create_v3_price_key_stage(
     *,
     schema_name: str,
@@ -571,61 +637,11 @@ async def _create_v3_price_key_stage(
     qualified_summary = _qualified(schema_name, price_set_summary_table)
     qualified_stage = _qualified(schema_name, stage_table)
     await db.status(f"ANALYZE {qualified_summary};")
-    if source_count == 1:
-        created_row_count = await db.status(
-            f"""
-            CREATE UNLOGGED TABLE {qualified_stage} AS
-            SELECT
-                price_set_global_id_128,
-                (ROW_NUMBER() OVER (
-                    ORDER BY minimum_negotiated_rate ASC NULLS LAST,
-                             price_set_global_id_128
-                ) - 1)::bigint AS price_key,
-                minimum_negotiated_rate
-            FROM {qualified_summary}
-            ORDER BY minimum_negotiated_rate ASC NULLS LAST,
-                     price_set_global_id_128;
-            """
-        )
-    else:
-        created_row_count = await db.status(
-            f"""
-            CREATE UNLOGGED TABLE {qualified_stage} AS
-            WITH canonical AS MATERIALIZED (
-                SELECT
-                    price_set_global_id_128,
-                    MIN(minimum_negotiated_rate) AS minimum_negotiated_rate,
-                    MIN(minimum_negotiated_rate) IS DISTINCT FROM
-                        MAX(minimum_negotiated_rate) AS payload_conflict
-                FROM {qualified_summary}
-                GROUP BY price_set_global_id_128
-            )
-            SELECT
-                price_set_global_id_128,
-                (ROW_NUMBER() OVER (
-                    ORDER BY minimum_negotiated_rate ASC NULLS LAST,
-                             price_set_global_id_128
-                ) - 1)::bigint AS price_key,
-                minimum_negotiated_rate,
-                payload_conflict
-            FROM canonical
-            ORDER BY minimum_negotiated_rate ASC NULLS LAST,
-                     price_set_global_id_128;
-            """
-        )
-        if bool(
-            await db.scalar(
-                f"SELECT EXISTS (SELECT 1 FROM {qualified_stage} "
-                "WHERE payload_conflict LIMIT 1)"
-            )
-        ):
-            await db.status(f"DROP TABLE IF EXISTS {qualified_stage} CASCADE;")
-            raise RuntimeError(
-                "strict V3 observed one price-set ID with conflicting minimum rates"
-            )
-        await db.status(
-            f"ALTER TABLE {qualified_stage} DROP COLUMN payload_conflict;"
-        )
+    created_row_count = await _create_v3_price_key_table(
+        qualified_summary,
+        qualified_stage,
+        source_count,
+    )
     await db.status(
         f"ALTER TABLE {qualified_stage} "
         "ALTER COLUMN price_set_global_id_128 SET NOT NULL, "
@@ -769,9 +785,7 @@ def _summary_integer(
                 raise RuntimeError(
                     f"PTG2 v3 {label} summary has invalid {field_name}"
                 ) from exc
-    raise RuntimeError(
-        f"PTG2 v3 {label} summary is missing {' or '.join(field_names)}"
-    )
+    raise RuntimeError(f"PTG2 v3 {label} summary is missing {' or '.join(field_names)}")
 
 
 def _validate_summary_kind(summary: Mapping[str, Any], expected_kind: str) -> None:
@@ -811,9 +825,7 @@ def _optional_summary_integer(
     try:
         return int(value)
     except (TypeError, ValueError) as exc:
-        raise RuntimeError(
-            f"PTG2 v3 {label} summary has invalid {field_name}"
-        ) from exc
+        raise RuntimeError(f"PTG2 v3 {label} summary has invalid {field_name}") from exc
 
 
 def _v3_membership_stats_from_summary(
@@ -871,7 +883,10 @@ def _validate_v3_atom_summary(
     atom_key_bits: int,
 ) -> None:
     _validate_summary_kind(summary, _PRICE_ATOM_ARTIFACT_KIND)
-    if _summary_integer(summary, "price atoms", "atom_count", "row_count") != atom_count:
+    if (
+        _summary_integer(summary, "price atoms", "atom_count", "row_count")
+        != atom_count
+    ):
         raise RuntimeError("PTG2 v3 price-atom stream row count mismatch")
     if _summary_integer(summary, "price atoms", "attribute_count") != len(
         _V3_ATTRIBUTE_KEY_COLUMNS
@@ -1116,9 +1131,9 @@ async def prepare_shared_price_artifacts(
         }
         parallel_started_at = time.monotonic()
 
-        async def prepare_atom_stages() -> tuple[
-            Mapping[str, Any], dict[str, int | None], float
-        ]:
+        async def prepare_atom_stages() -> (
+            tuple[Mapping[str, Any], dict[str, int | None], float]
+        ):
             """Canonicalize when needed, rewrite attributes, and build atom keys."""
 
             if normalized_summary_source_count == 1:
@@ -1139,12 +1154,10 @@ async def prepare_shared_price_artifacts(
                     time.monotonic() - stage_started_at
                 )
             stage_started_at = time.monotonic()
-            lean_price_manifest = (
-                await _rewrite_price_atom_lean_dictionary(
-                    schema_name=schema_name,
-                    price_atom_table=price_atom_table,
-                    price_atom_dictionary_table=price_attr_dictionary_table,
-                )
+            lean_price_manifest = await _rewrite_price_atom_lean_dictionary(
+                schema_name=schema_name,
+                price_atom_table=price_atom_table,
+                price_atom_dictionary_table=price_attr_dictionary_table,
             )
             stage_metrics_map["dictionary_rewrite_seconds"] = (
                 time.monotonic() - stage_started_at
@@ -1299,6 +1312,133 @@ async def cleanup_prepared_shared_price_artifacts(
     )
 
 
+async def _stage_shared_price_blocks(
+    schema_name: str,
+    block_stage: str,
+    prepared: PreparedSharedPriceArtifacts,
+) -> _StagedSharedPriceBlocks:
+    """Stream and validate compact price blocks in their publication stage."""
+
+    lean_layout_map = dict(prepared.lean_manifest)
+    constant_key_by_column = dict(lean_layout_map.get("price_atom_constant_keys") or {})
+    constant_value_by_kind = dict(lean_layout_map.get("price_atom_constant_values") or {})
+    dictionary_table = lean_layout_map.get("price_atom_dictionary_table")
+    await create_shared_block_stage(schema_name=schema_name, stage_table=block_stage)
+    membership_sql = _v3_price_membership_sql(
+        qualified_price_set_atom_table=_qualified(
+            schema_name, prepared.price_set_atom_table
+        ),
+        qualified_price_key_map=_qualified(schema_name, prepared.price_key_map),
+        qualified_atom_key_map=_qualified(schema_name, prepared.atom_key_map),
+    )
+    atom_sql = _v3_price_atom_sql(
+        qualified_price_atom_table=_qualified(schema_name, prepared.price_atom_table),
+        qualified_atom_key_map=_qualified(schema_name, prepared.atom_key_map),
+        constant_key_by_column=constant_key_by_column,
+    )
+    membership_summary, atom_summary = await asyncio.gather(
+        _stream_shared_price_copy(
+            kind=_PRICE_MEMBERSHIP_ARTIFACT_KIND,
+            sql=membership_sql,
+            schema_name=schema_name,
+            target_table=block_stage,
+            atom_key_bits=prepared.atom_key_bits,
+        ),
+        _stream_shared_price_copy(
+            kind=_PRICE_ATOM_ARTIFACT_KIND,
+            sql=atom_sql,
+            schema_name=schema_name,
+            target_table=block_stage,
+            atom_key_bits=prepared.atom_key_bits,
+        ),
+    )
+    _v3_membership_stats_from_summary(
+        membership_summary,
+        price_set_count=prepared.price_set_count,
+        atom_count=prepared.atom_count,
+        atom_key_bits=prepared.atom_key_bits,
+    )
+    _validate_v3_atom_summary(
+        atom_summary, atom_count=prepared.atom_count, atom_key_bits=prepared.atom_key_bits
+    )
+    return _StagedSharedPriceBlocks(
+        membership_summary,
+        atom_summary,
+        constant_key_by_column,
+        constant_value_by_kind,
+        str(dictionary_table) if dictionary_table else None,
+    )
+
+
+def _shared_price_publication(
+    block_publication: Any,
+    prepared: PreparedSharedPriceArtifacts,
+    staged: _StagedSharedPriceBlocks,
+    price_attribute_count: int,
+    support_digest: bytes,
+) -> SharedPricePublication:
+    return SharedPricePublication(
+        object_kinds=block_publication.object_kinds,
+        mapping_count=block_publication.mapping_count,
+        unique_block_count=block_publication.unique_block_count,
+        price_set_count=prepared.price_set_count,
+        atom_count=prepared.atom_count,
+        atom_key_bits=prepared.atom_key_bits,
+        price_attribute_count=price_attribute_count,
+        price_atom_constant_keys=staged.constant_key_by_column,
+        price_atom_constant_values=staged.constant_value_by_kind,
+        support_digest=support_digest,
+        stream_summaries={
+            _PRICE_MEMBERSHIP_ARTIFACT_KIND: staged.membership_summary,
+            _PRICE_ATOM_ARTIFACT_KIND: staged.atom_summary,
+        },
+        logical_byte_count=block_publication.logical_byte_count,
+        stored_byte_count=block_publication.stored_byte_count,
+        stage_metrics=prepared.stage_metrics,
+    )
+
+
+async def _publish_staged_price_blocks(
+    schema_name: str,
+    block_stage: str,
+    snapshot_key: int,
+    build_token: str,
+    expected_generation: str,
+    prepared: PreparedSharedPriceArtifacts,
+    staged: _StagedSharedPriceBlocks,
+) -> SharedPricePublication:
+    """Publish validated blocks and their compact attribute dictionary."""
+
+    progress_callback = _PRICE_PROGRESS_CALLBACK.get()
+    block_publication = await publish_shared_block_stage(
+        schema_name=schema_name,
+        stage_table=block_stage,
+        snapshot_key=int(snapshot_key),
+        build_token=build_token,
+        expected_generation=expected_generation,
+        **(
+            {"progress_callback": progress_callback}
+            if progress_callback is not None
+            else {}
+        ),
+    )
+    price_attribute_count, support_digest = await _publish_price_attributes(
+        schema_name=schema_name,
+        snapshot_key=int(snapshot_key),
+        build_token=build_token,
+        dictionary_table=staged.dictionary_table,
+        constant_values=staged.constant_value_by_kind,
+        expected_generation=expected_generation,
+    )
+    return _shared_price_publication(
+        block_publication,
+        prepared,
+        staged,
+        price_attribute_count,
+        support_digest,
+    )
+
+
 async def publish_shared_price_artifacts(
     *,
     schema_name: str,
@@ -1314,113 +1454,27 @@ async def publish_shared_price_artifacts(
 
     if expected_price_key_order != PTG2_V3_PRICE_KEY_ORDER:
         raise RuntimeError("strict V3 finalizer uses an unsupported price-key order")
-    if (
-        prepared.schema_name != schema_name
-        or prepared.price_set_count != int(expected_price_set_count)
+    if prepared.schema_name != schema_name or prepared.price_set_count != int(
+        expected_price_set_count
     ):
-        raise RuntimeError("strict V3 prepared price map disagrees with the direct finalizer")
-    price_atom_table = prepared.price_atom_table
-    price_set_atom_table = prepared.price_set_atom_table
-    price_attr_dictionary_table = prepared.price_attr_dictionary_table
-    price_key_map = prepared.price_key_map
-    atom_key_map = prepared.atom_key_map
+        raise RuntimeError(
+            "strict V3 prepared price map disagrees with the direct finalizer"
+        )
     block_stage = shared_block_stage_name(f"price-{snapshot_key}")
-    lean_layout_map = dict(prepared.lean_manifest)
     try:
-        price_set_count = prepared.price_set_count
-        atom_count = prepared.atom_count
-        atom_key_bits = prepared.atom_key_bits
-        price_atom_constant_key_by_column = dict(
-            lean_layout_map.get("price_atom_constant_keys") or {}
-        )
-        price_atom_constant_value_by_kind = dict(
-            lean_layout_map.get("price_atom_constant_values") or {}
-        )
-        await create_shared_block_stage(
-            schema_name=schema_name,
-            stage_table=block_stage,
-        )
-        membership_sql = _v3_price_membership_sql(
-            qualified_price_set_atom_table=_qualified(schema_name, price_set_atom_table),
-            qualified_price_key_map=_qualified(schema_name, price_key_map),
-            qualified_atom_key_map=_qualified(schema_name, atom_key_map),
-        )
-        atom_sql = _v3_price_atom_sql(
-            qualified_price_atom_table=_qualified(schema_name, price_atom_table),
-            qualified_atom_key_map=_qualified(schema_name, atom_key_map),
-            constant_key_by_column=price_atom_constant_key_by_column,
-        )
-        membership_summary, atom_summary = await asyncio.gather(
-            _stream_shared_price_copy(
-                kind=_PRICE_MEMBERSHIP_ARTIFACT_KIND,
-                sql=membership_sql,
-                schema_name=schema_name,
-                target_table=block_stage,
-                atom_key_bits=atom_key_bits,
-            ),
-            _stream_shared_price_copy(
-                kind=_PRICE_ATOM_ARTIFACT_KIND,
-                sql=atom_sql,
-                schema_name=schema_name,
-                target_table=block_stage,
-                atom_key_bits=atom_key_bits,
-            ),
-        )
-        _v3_membership_stats_from_summary(
-            membership_summary,
-            price_set_count=price_set_count,
-            atom_count=atom_count,
-            atom_key_bits=atom_key_bits,
-        )
-        _validate_v3_atom_summary(
-            atom_summary,
-            atom_count=atom_count,
-            atom_key_bits=atom_key_bits,
-        )
-        block_publication = await publish_shared_block_stage(
-            schema_name=schema_name,
-            stage_table=block_stage,
-            snapshot_key=int(snapshot_key),
-            build_token=build_token,
-            expected_generation=expected_generation,
-            **(
-                {"progress_callback": _PRICE_PROGRESS_CALLBACK.get()}
-                if _PRICE_PROGRESS_CALLBACK.get() is not None
-                else {}
-            ),
-        )
-        dictionary_table = lean_layout_map.get("price_atom_dictionary_table")
-        price_attribute_count, price_support_digest = await _publish_price_attributes(
-            schema_name=schema_name,
-            snapshot_key=int(snapshot_key),
-            build_token=build_token,
-            dictionary_table=str(dictionary_table) if dictionary_table else None,
-            constant_values=price_atom_constant_value_by_kind,
-            expected_generation=expected_generation,
-        )
-        return SharedPricePublication(
-            object_kinds=block_publication.object_kinds,
-            mapping_count=block_publication.mapping_count,
-            unique_block_count=block_publication.unique_block_count,
-            price_set_count=price_set_count,
-            atom_count=atom_count,
-            atom_key_bits=atom_key_bits,
-            price_attribute_count=price_attribute_count,
-            price_atom_constant_keys=price_atom_constant_key_by_column,
-            price_atom_constant_values=price_atom_constant_value_by_kind,
-            support_digest=price_support_digest,
-            stream_summaries={
-                _PRICE_MEMBERSHIP_ARTIFACT_KIND: membership_summary,
-                _PRICE_ATOM_ARTIFACT_KIND: atom_summary,
-            },
-            logical_byte_count=block_publication.logical_byte_count,
-            stored_byte_count=block_publication.stored_byte_count,
-            stage_metrics=prepared.stage_metrics,
+        staged = await _stage_shared_price_blocks(schema_name, block_stage, prepared)
+        return await _publish_staged_price_blocks(
+            schema_name,
+            block_stage,
+            snapshot_key,
+            build_token,
+            expected_generation,
+            prepared,
+            staged,
         )
     finally:
         await db.status(
-            f"DROP TABLE IF EXISTS "
-            f"{_qualified(schema_name, block_stage)} CASCADE;"
+            f"DROP TABLE IF EXISTS " f"{_qualified(schema_name, block_stage)} CASCADE;"
         )
 
 

@@ -8802,6 +8802,32 @@ def _uses_geo_rate_prefix_selection(
     )
 
 
+def _uses_provider_inclusive_geo_rate_gate(
+    serving_tables: PTG2ServingTables,
+    args: Mapping[str, Any],
+    *,
+    location_filter_requested: bool,
+    include_providers: bool,
+    price_filter_requested: bool,
+    requested_npi: int | None,
+    explicit_provider_filter_requested: bool,
+) -> bool:
+    """Reject oversized exact provider expansion before geographic graph work."""
+
+    return bool(
+        serving_tables.uses_v4_graph
+        and include_providers
+        and location_filter_requested
+        and not price_filter_requested
+        and requested_npi is None
+        and not explicit_provider_filter_requested
+        and str(args.get("order_by") or "total_allowed_amount")
+        .strip()
+        .lower()
+        in _PTG2_COST_ORDER_FIELDS
+    )
+
+
 def _ptg2_manifest_rate_candidate_limit(
     args: dict[str, Any],
     pagination,
@@ -17949,15 +17975,14 @@ async def _search_manifest_serving_table(
             )
         return loaded_code_rows
 
-    is_provider_inclusive_cost_ordered_geo = bool(
-        serving_tables.uses_v4_graph
-        and include_providers
-        and location_filter_requested
-        and not price_filter_requested
-        and requested_npi is None
-        and not explicit_provider_filter_requested
-        and str(args.get("order_by") or "total_allowed_amount").strip().lower()
-        in _PTG2_COST_ORDER_FIELDS
+    is_provider_inclusive_cost_ordered_geo = _uses_provider_inclusive_geo_rate_gate(
+        serving_tables,
+        args,
+        location_filter_requested=location_filter_requested,
+        include_providers=include_providers,
+        price_filter_requested=price_filter_requested,
+        requested_npi=requested_npi,
+        explicit_provider_filter_requested=explicit_provider_filter_requested,
     )
     code_rows: list[dict[str, Any]] | None = None
     if is_provider_inclusive_cost_ordered_geo:

@@ -2790,17 +2790,18 @@ async def test_geo_cost_order_requires_exhaustive_location_selection(
 
 
 @pytest.mark.parametrize(
-    ("provider_args", "rate_count", "should_reject"),
+    ("provider_args", "rate_count", "should_reject", "expected_code_queries"),
     (
-        pytest.param({}, 257, True, id="omitted-high"),
-        pytest.param({"include_providers": True}, 257, True, id="true-high"),
+        pytest.param({}, 257, True, 1, id="omitted-high"),
+        pytest.param({"include_providers": True}, 257, True, 1, id="true-high"),
         pytest.param(
             {"classification": "Internal Medicine"},
             257,
             False,
+            0,
             id="filtered-high",
         ),
-        pytest.param({}, 256, False, id="at-cap"),
+        pytest.param({}, 256, False, 1, id="at-cap"),
     ),
 )
 @pytest.mark.asyncio
@@ -2809,6 +2810,7 @@ async def test_geo_cost_order_rate_count_gate_precedes_location(
     provider_args,
     rate_count,
     should_reject,
+    expected_code_queries,
 ):
     """Reject only oversized default provider expansion before graph work."""
 
@@ -2858,6 +2860,7 @@ async def test_geo_cost_order_rate_count_gate_precedes_location(
     else:
         assert response["items"] == []
         assert len(location_call_arguments) == 1
+    assert len(session.calls) == expected_code_queries
 
 
 @pytest.mark.asyncio

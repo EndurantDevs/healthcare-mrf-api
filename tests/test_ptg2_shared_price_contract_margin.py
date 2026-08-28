@@ -11,6 +11,14 @@ import pytest
 from process.ptg_parts import ptg2_shared_price as price
 
 
+class _FalseyProgress:
+    def __bool__(self) -> bool:
+        return False
+
+    def __call__(self, _metric: str, _amount: int) -> None:
+        return None
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     (
@@ -100,13 +108,11 @@ def test_price_stream_summary_fails_closed_without_one_object(
 
 def test_price_stream_summary_uses_last_authenticated_frame() -> None:
     stderr = (
-        b"PTG2_SERVING_BINARY_COPY\t{\"row_count\":1}\n"
+        b'PTG2_SERVING_BINARY_COPY\t{"row_count":1}\n'
         b"noise\n"
-        b"PTG2_SERVING_BINARY_COPY\t{\"row_count\":2}\n"
+        b'PTG2_SERVING_BINARY_COPY\t{"row_count":2}\n'
     )
-    assert price._parse_shared_price_stream_summary(stderr) == {
-        "row_count": 2
-    }
+    assert price._parse_shared_price_stream_summary(stderr) == {"row_count": 2}
 
 
 class _BrokenWriter:
@@ -309,3 +315,120 @@ async def test_publish_price_artifacts_rejects_identity_before_db_io() -> None:
             expected_price_key_order=price.PTG2_V3_PRICE_KEY_ORDER,
             prepared=prepared,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_fails", (False, True))
+async def test_publish_price_artifacts_always_drops_its_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    stage_fails: bool,
+) -> None:
+    prepared = price.PreparedSharedPriceArtifacts(
+        schema_name="mrf",
+        price_atom_table="atoms",
+        price_set_atom_table="memberships",
+        price_attr_dictionary_table="attributes",
+        price_key_map="price_keys",
+        atom_key_map="atom_keys",
+        price_set_count=1,
+        atom_count=1,
+        atom_key_bits=32,
+        lean_manifest={},
+        stage_metrics={},
+    )
+    staged = price._StagedSharedPriceBlocks(
+        _membership_summary(),
+        _atom_summary(),
+        {},
+        {},
+        None,
+    )
+    publication = object()
+    stage_blocks = AsyncMock(
+        side_effect=RuntimeError("stream failed") if stage_fails else None,
+        return_value=staged,
+    )
+    publish_blocks = AsyncMock(return_value=publication)
+    status = AsyncMock()
+    monkeypatch.setattr(price, "_stage_shared_price_blocks", stage_blocks)
+    monkeypatch.setattr(price, "_publish_staged_price_blocks", publish_blocks)
+    monkeypatch.setattr(price.db, "status", status)
+
+    call = price.publish_shared_price_artifacts(
+        schema_name="mrf",
+        manifest_stage_table="manifest",
+        snapshot_key=7,
+        build_token="build",
+        expected_price_set_count=1,
+        expected_price_key_order=price.PTG2_V3_PRICE_KEY_ORDER,
+        prepared=prepared,
+    )
+    if stage_fails:
+        with pytest.raises(RuntimeError, match="stream failed"):
+            await call
+        publish_blocks.assert_not_awaited()
+    else:
+        assert await call is publication
+        publish_blocks.assert_awaited_once()
+    status.assert_awaited_once_with(
+        'DROP TABLE IF EXISTS "mrf"."ptg2_v3_block_stage_price7" CASCADE;'
+    )
+
+
+@pytest.mark.asyncio
+async def test_staged_publish_keeps_one_layout_snapshot_and_falsey_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = price.PreparedSharedPriceArtifacts(
+        "mrf",
+        "atoms",
+        "memberships",
+        "attributes",
+        "price_keys",
+        "atom_keys",
+        1,
+        1,
+        32,
+        {"price_atom_constant_values": {"setting": "mutated"}},
+        {},
+    )
+    staged = price._StagedSharedPriceBlocks(
+        _membership_summary(),
+        _atom_summary(),
+        {"setting_key": 7},
+        {"setting": "outpatient"},
+        "frozen_dictionary",
+    )
+    block_result = SimpleNamespace(
+        object_kinds=("price",),
+        mapping_count=1,
+        unique_block_count=1,
+        logical_byte_count=10,
+        stored_byte_count=8,
+    )
+    publish_blocks = AsyncMock(return_value=block_result)
+    publish_attributes = AsyncMock(return_value=(1, b"digest"))
+    monkeypatch.setattr(price, "publish_shared_block_stage", publish_blocks)
+    monkeypatch.setattr(price, "_publish_price_attributes", publish_attributes)
+    callback = _FalseyProgress()
+
+    with price.observe_shared_price_progress(callback):
+        price_publication = await price._publish_staged_price_blocks(
+            "mrf",
+            "stage",
+            7,
+            "build",
+            "generation",
+            prepared,
+            staged,
+        )
+
+    assert publish_blocks.await_args.kwargs["progress_callback"] is callback
+    assert (
+        publish_attributes.await_args.kwargs["dictionary_table"] == "frozen_dictionary"
+    )
+    assert publish_attributes.await_args.kwargs["constant_values"] == {
+        "setting": "outpatient"
+    }
+    assert price_publication.price_atom_constant_keys == {"setting_key": 7}
+    assert price_publication.price_atom_constant_values == {"setting": "outpatient"}
