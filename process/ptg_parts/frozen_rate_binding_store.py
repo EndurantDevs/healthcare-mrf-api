@@ -19,6 +19,7 @@ from process.ptg_parts.frozen_rate_binding import (
     frozen_internal_run_id,
     frozen_rate_binding_from_params,
     frozen_rate_binding_sha256,
+    protected_frozen_tuple_presence,
     source_file_import_id_from_params,
 )
 from process.ptg_parts.frozen_rate_files import (
@@ -215,13 +216,21 @@ def _assert_loaded_binding(
     )
 
 
+def _expected_frozen_binding(
+    params_by_name: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if not protected_frozen_tuple_presence(params_by_name):
+        return None
+    return frozen_rate_binding_from_params(params_by_name)
+
+
 async def insert_or_compare_frozen_binding(
     connection: Any,
     params_by_name: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     """Atomically insert one binding or compare the existing immutable row."""
 
-    expected_binding_by_name = frozen_rate_binding_from_params(params_by_name)
+    expected_binding_by_name = _expected_frozen_binding(params_by_name)
     source_file_import_id = source_file_import_id_from_params(params_by_name)
     if source_file_import_id is None:
         if expected_binding_by_name is not None:
@@ -252,7 +261,7 @@ async def recheck_frozen_binding(
 ) -> dict[str, Any] | None:
     """Recheck a previously admitted binding without creating one."""
 
-    expected_binding_by_name = frozen_rate_binding_from_params(params_by_name)
+    expected_binding_by_name = _expected_frozen_binding(params_by_name)
     source_file_import_id = source_file_import_id_from_params(params_by_name)
     if source_file_import_id is None:
         return expected_binding_by_name
@@ -269,7 +278,7 @@ async def recheck_frozen_binding_on_connection(
 ) -> dict[str, Any] | None:
     """Compare an existing binding through the caller's transaction only."""
 
-    expected_binding_by_name = frozen_rate_binding_from_params(params_by_name)
+    expected_binding_by_name = _expected_frozen_binding(params_by_name)
     source_file_import_id = source_file_import_id_from_params(params_by_name)
     if source_file_import_id is None:
         return expected_binding_by_name

@@ -18,6 +18,14 @@ from api.control_import_waves import (
     validate_import_wave_payload,
 )
 from api.control_imports import normalize_run
+from process.ptg import _normalized_direct_frozen_params
+from process.ptg_parts.frozen_rate_binding import (
+    FrozenRateFileBindingMismatchError,
+)
+from process.ptg_parts.frozen_rate_binding_store import (
+    insert_or_compare_frozen_binding,
+    recheck_frozen_binding_on_connection,
+)
 from process.ptg_parts.frozen_rate_files import FROZEN_RATE_FILE_SET_CONTRACT
 from process.ptg_parts.ptg2_invalid_price_exclusion import (
     invalid_price_exclusion_policy,
@@ -242,6 +250,40 @@ def test_singleton_direct_contract_binds_one_private_exclusion_policy():
     allowed_params["invalid_price_exclusion_policy"] = policy
     with pytest.raises(SingletonDirectValidationError, match="in-network"):
         normalize_protected_singleton_direct_params(allowed_params)
+
+
+@pytest.mark.asyncio
+async def test_direct_policy_checks_frozen_collision_without_inserting():
+    class BindingConnection:
+        row = None
+
+        async def scalar(self, *_args, **_kwargs):
+            return 1
+
+        async def status(self, *_args, **_kwargs):
+            raise AssertionError("direct input must not create a frozen binding")
+
+        async def all(self, *_args, **_kwargs):
+            return [self.row] if self.row is not None else []
+
+    params_by_name = _direct_params()
+    params_by_name["invalid_price_exclusion_policy"] = _invalid_price_policy()
+    params_by_name = _normalized_direct_frozen_params(params_by_name)
+    connection = BindingConnection()
+
+    assert await insert_or_compare_frozen_binding(
+        connection,
+        params_by_name,
+    ) is None
+    connection.row = {"binding_payload": {}}
+    with pytest.raises(
+        FrozenRateFileBindingMismatchError,
+        match="cannot be replayed as legacy",
+    ):
+        await recheck_frozen_binding_on_connection(
+            connection,
+            params_by_name,
+        )
 
 
 @pytest.mark.parametrize(

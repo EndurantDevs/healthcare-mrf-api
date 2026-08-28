@@ -548,14 +548,17 @@ def _validated_frozen_candidate_identity(
     candidate_run_id: str,
     raw_container_sha256: tuple[str, ...],
 ) -> str | None:
+    raw_database_binding = candidate_row.get("frozen_binding_payload")
+    database_binding = (
+        None if raw_database_binding is None else _mapping(raw_database_binding)
+    )
+    if raw_database_binding is not None and not database_binding:
+        raise ValueError("candidate frozen source-file binding changed")
     try:
         return validate_frozen_candidate_evidence(
             manifest_by_name,
             candidate_run_id=candidate_run_id,
-            database_binding=_mapping(
-                candidate_row.get("frozen_binding_payload")
-            )
-            or None,
+            database_binding=database_binding,
             database_sources=getattr(
                 raw_container_sha256,
                 "source_records",

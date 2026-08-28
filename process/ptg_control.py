@@ -27,6 +27,9 @@ from process.ptg import (
 from process.ptg_parts.ptg_source_worker_admission import (
     guard_ptg_worker_start,
 )
+from process.ptg_parts.frozen_rate_binding_store import (
+    recheck_frozen_binding,
+)
 from process.ptg_wave_claims import claim_wave_job_start, reconcile_wave_claim_exception
 from process.ptg_frozen_control import frozen_rate_main_kwargs, validated_worker_frozen_rate_params
 from process.ptg_singleton_direct_control import (
@@ -163,6 +166,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 task_payload,
                 params_by_name,
             )
+            await recheck_frozen_binding(params_by_name)
         else:
             params_by_name = await validated_worker_frozen_rate_params(
                 task_payload,

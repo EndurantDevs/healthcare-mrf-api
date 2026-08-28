@@ -797,6 +797,34 @@ async def test_candidate_scope_rejects_exclusion_evidence_without_policy(
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frozen_binding_payload", ({}, [], "[]", "{"))
+async def test_candidate_scope_rejects_malformed_frozen_binding(
+    monkeypatch,
+    frozen_binding_payload,
+):
+    candidate_row = _candidate_row()
+    candidate_row["frozen_binding_payload"] = frozen_binding_payload
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_rows",
+        AsyncMock(return_value=[candidate_row]),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_raw_sources",
+        AsyncMock(return_value=(RAW_DIGEST,)),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="candidate frozen source-file binding changed",
+    ):
+        await ptg_candidate_audit.load_candidate_audit_target(
+            candidate_run_id="ptg2:derived-import",
+        )
+
+
 @pytest.mark.parametrize(
     ("mapping_value", "expected_mapping"),
     (

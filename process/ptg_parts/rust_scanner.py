@@ -2016,7 +2016,7 @@ def _iter_compact_serving_records_rust(
         if invalid_price_exclusion.get("raw_source_sha256") != raw_source_sha256:
             raise RuntimeError("strict V3 scanner invalid-price exclusion source does not match")
         scanner_environment_map[_INVALID_PRICE_EXCLUSION_ENV] = json.dumps(
-            invalid_price_exclusion,
+            dict(invalid_price_exclusion),
             sort_keys=True,
             separators=(",", ":"),
         )

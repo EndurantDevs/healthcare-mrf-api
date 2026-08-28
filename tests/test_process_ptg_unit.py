@@ -7414,7 +7414,11 @@ def test_direct_source_params_accept_only_singleton_bound_policy():
     )
 
     assert normalized["invalid_price_exclusion_policy"] == policy
-    with pytest.raises(ValueError, match="frozen_rate_file"):
+    assert all(
+        field_name not in normalized
+        for field_name in process_ptg.FROZEN_RATE_FILE_REQUIRED_FIELDS
+    )
+    with pytest.raises(ValueError, match="frozen rate file"):
         process_ptg._normalized_direct_frozen_params(
             {
                 **normalized,

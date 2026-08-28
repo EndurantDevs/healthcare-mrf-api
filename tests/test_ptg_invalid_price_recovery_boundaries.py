@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import importlib
+
 import pytest
 
 from api import control, control_imports
@@ -14,6 +17,9 @@ from process.ptg_parts.ptg2_invalid_price_exclusion import (
 )
 from tests import test_ptg2_prepared_shared_layout as prepared_layout_tests
 from tests import test_ptg2_shared_reuse as shared_reuse_tests
+
+
+ptg = importlib.import_module("process.ptg")
 
 
 def _policy() -> dict[str, object]:
@@ -73,6 +79,34 @@ def test_invalid_price_exclusion_isolates_physical_layout_identity():
     assert recovered.payload["physical_options"] == {"invalid_price_exclusion_policy": policy["sha256"]}
     assert recovered.semantic_fingerprint != baseline.semantic_fingerprint
     assert recovered.coverage_scope_id == baseline.coverage_scope_id
+
+
+def test_invalid_price_exclusion_isolates_snapshot_identity():
+    policy = _policy()
+    baseline_options = ptg._ptg2_snapshot_content_options({})
+    explicit_none_options = ptg._ptg2_snapshot_content_options(
+        {"invalid_price_exclusion_policy": None}
+    )
+    recovered_options = ptg._ptg2_snapshot_content_options(
+        {"invalid_price_exclusion_policy": policy}
+    )
+    identity_by_option = {
+        option_name: ptg._ptg2_deterministic_snapshot_id(
+            import_month=dt.date(2026, 8, 1),
+            import_id="same-import",
+            option_by_name=option_by_name,
+        )
+        for option_name, option_by_name in {
+            "baseline": {},
+            "explicit_none": {"invalid_price_exclusion_policy": None},
+            "recovered": {"invalid_price_exclusion_policy": policy},
+        }.items()
+    }
+
+    assert baseline_options == explicit_none_options
+    assert recovered_options["invalid_price_exclusion_policy"] == policy["sha256"]
+    assert identity_by_option["baseline"] == identity_by_option["explicit_none"]
+    assert identity_by_option["recovered"] != identity_by_option["baseline"]
 
 
 def test_control_api_rejects_policy_without_frozen_source_set():

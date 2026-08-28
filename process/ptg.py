@@ -4777,6 +4777,15 @@ def _ptg2_snapshot_content_options(option_by_name: dict[str, Any]) -> dict[str, 
                 for key in _PTG2_FROZEN_SNAPSHOT_CONTENT_OPTION_KEYS
             }
         )
+    invalid_price_policy = option_by_name.get(
+        INVALID_PRICE_EXCLUSION_POLICY_FIELD
+    )
+    if invalid_price_policy is not None:
+        content_option_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = (
+            validate_invalid_price_exclusion_policy(
+                invalid_price_policy
+            )["sha256"]
+        )
     rebuild_scope_digest = normalized_full_rebuild_scope_digest(
         option_by_name.get("full_rebuild_scope_digest")
     )
@@ -7523,16 +7532,22 @@ def _normalized_direct_frozen_params(
     """Build the protected direct-input envelope without inventing optionals."""
 
     protected_values_by_name = {
-        field_name: raw_params_by_name.get(field_name) for field_name in FROZEN_RATE_FILE_REQUIRED_FIELDS
+        field_name: raw_params_by_name.get(field_name)
+        for field_name in FROZEN_RATE_FILE_REQUIRED_FIELDS
     }
     policy = raw_params_by_name.get(INVALID_PRICE_EXCLUSION_POLICY_FIELD)
     direct_intent_digest = raw_params_by_name.get(
         "direct_rate_file_intent_sha256"
     )
-    has_protected_values = (
-        any(field_value is not None for field_value in protected_values_by_name.values()) or policy is not None
+    has_frozen_values = any(
+        field_value is not None
+        for field_value in protected_values_by_name.values()
     )
-    if raw_params_by_name.get("source_file_import_id") is None and not (has_protected_values):
+    has_protected_values = has_frozen_values or policy is not None
+    if (
+        raw_params_by_name.get("source_file_import_id") is None
+        and not has_protected_values
+    ):
         return {}
     direct_params_by_name = {
         field_name: raw_params_by_name.get(field_name)
@@ -7545,15 +7560,12 @@ def _normalized_direct_frozen_params(
             "plan_market_types",
         )
     }
-    if has_protected_values:
+    if has_frozen_values:
         direct_params_by_name.update(protected_values_by_name)
     if policy is not None:
         direct_params_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = policy
     if direct_intent_digest is not None:
-        if any(
-            field_value is not None
-            for field_value in protected_values_by_name.values()
-        ):
+        if has_frozen_values:
             raise ValueError(
                 "singleton direct and frozen multipart inputs are exclusive"
             )
