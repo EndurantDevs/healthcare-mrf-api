@@ -4589,7 +4589,7 @@ async def test_omitted_false_unsupported_projection_restores_allowed_fallback(
 
 
 @pytest.mark.asyncio
-async def test_card_missing_projection_returns_503(monkeypatch):
+async def test_card_projection_runtime_unavailable_returns_503(monkeypatch):
     selection = _mixed_canonical_release_selection()
     release_resolver = AsyncMock(return_value=selection)
     strict_search = AsyncMock(
@@ -4629,6 +4629,45 @@ async def test_card_missing_projection_returns_503(monkeypatch):
         selection.plan_release_id,
         projection_only=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_card_missing_projection_returns_actionable_400(monkeypatch):
+    selection = _mixed_canonical_release_selection()
+    release_resolver = AsyncMock(return_value=selection)
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        release_resolver,
+    )
+    app = Sanic(f"pricing-card-missing-{uuid.uuid4().hex}")
+    app.add_route(
+        list_providers_by_procedure,
+        "/pricing/providers/by-procedure",
+        methods={"GET"},
+    )
+
+    @app.on_request
+    async def inject_session(request):
+        request.ctx.sa_session = FakeSession()
+
+    _request, response = await app.asgi_client.get(
+        "/pricing/providers/by-procedure",
+        params={
+            "plan_release_id": selection.plan_release_id,
+            "code": "70551",
+            "code_system": "CPT",
+            "zip5": "60601",
+            "view": "card",
+        },
+        headers={"accept": "application/json"},
+    )
+
+    assert response.status == 400
+    assert "omit view=card or use view=full" in response.json["message"]
+    assert release_resolver.await_count == 1
+    assert release_resolver.await_args.args[1] == selection.plan_release_id
+    assert release_resolver.await_args.kwargs == {"projection_only": True}
 
 
 @pytest.mark.asyncio

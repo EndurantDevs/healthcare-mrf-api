@@ -75,7 +75,7 @@ class _ResultSession:
                 "zip5": "62401",
             },
             _selection(projection_id=None),
-            projection.PlanPricingProjectionUnavailable,
+            projection.PlanPricingProjectionUnsupported,
         ),
         (
             {
