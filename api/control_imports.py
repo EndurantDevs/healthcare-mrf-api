@@ -18,6 +18,12 @@ from typing import Any
 import click
 import redis
 from arq import create_pool
+from arq.constants import (
+    in_progress_key_prefix,
+    job_key_prefix,
+    result_key_prefix,
+    retry_key_prefix,
+)
 from arq.jobs import deserialize_job as arq_deserialize_job
 from redis.exceptions import WatchError
 from sqlalchemy import and_, insert, or_, select, text, update
@@ -1583,7 +1589,7 @@ def _validated_stale_worker_reconciliation(
     attempt_started_at = payload.get("expected_attempt_started_at")
     if type(attempt_id) is not str or not attempt_id or attempt_id != attempt_id.strip():
         raise ValueError("expected_attempt_id must be a non-empty string")
-    _required_reconciliation_timestamp(
+    _ = _required_reconciliation_timestamp(
         attempt_started_at,
         "expected_attempt_started_at",
     )
@@ -1632,12 +1638,18 @@ def _is_same_lifecycle_lost_result(
 ) -> bool:
     error = run.get("error") if isinstance(run.get("error"), dict) else {}
     progress = run.get("progress") if isinstance(run.get("progress"), dict) else {}
+    try:
+        observed_heartbeat = _required_reconciliation_timestamp(
+            error.get("observed_heartbeat_at"),
+            "observed_heartbeat_at",
+        )
+    except ValueError:
+        return False
     return (
         run.get("status") == "failed"
         and error.get("code") == "worker_lifecycle_lost"
         and run.get("importer") == expected["expected_importer"]
-        and error.get("observed_heartbeat_at")
-        == expected["expected_heartbeat_at"]
+        and observed_heartbeat == expected["expected_heartbeat"]
         and error.get("attempt_id") == expected["expected_attempt_id"]
         and error.get("attempt_started_at")
         == expected["expected_attempt_started_at"]
@@ -1675,10 +1687,10 @@ async def _arq_worker_presence(run: dict[str, Any]) -> dict[str, Any]:
     try:
         async with redis_pool.pipeline(transaction=True) as pipe:
             pipe.zscore(queue, job_id)
-            pipe.exists(f"arq:job:{job_id}")
-            pipe.exists(f"arq:retry:{job_id}")
-            pipe.exists(f"arq:in-progress:{job_id}")
-            pipe.exists(f"arq:result:{job_id}")
+            pipe.exists(job_key_prefix + job_id)
+            pipe.exists(retry_key_prefix + job_id)
+            pipe.exists(in_progress_key_prefix + job_id)
+            pipe.exists(result_key_prefix + job_id)
             queue_score, job, retry, in_progress, result = await pipe.execute()
     finally:
         await redis_pool.aclose(close_connection_pool=True)
@@ -1837,7 +1849,9 @@ def _stale_worker_terminal_values(
         "code": "worker_lifecycle_lost",
         "message": "Worker lifecycle state disappeared before terminal status",
         "retryable": False,
-        "observed_heartbeat_at": expected_by_field["expected_heartbeat_at"],
+        "observed_heartbeat_at": expected_by_field["expected_heartbeat"].replace(
+            tzinfo=dt.UTC
+        ).isoformat(timespec="microseconds"),
         "attempt_id": attempt_id,
         "attempt_started_at": attempt_started_at,
         "absence": absence_by_field,

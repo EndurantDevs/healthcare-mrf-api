@@ -143,6 +143,19 @@ async def test_reconcile_missing_worker_terminalizes_supported_exact_attempt(
         "attempt_started_at": ATTEMPT_STARTED_AT,
     }
     assert len(connection.updates) == 1
+    update_values_by_name = connection.updates[0].compile().params
+    error_by_field = update_values_by_name["error"]
+    assert error_by_field["code"] == "worker_lifecycle_lost"
+    assert error_by_field["retryable"] is False
+    assert (
+        error_by_field["observed_heartbeat_at"]
+        == EXPECTED_BODY["expected_heartbeat_at"]
+    )
+    assert update_values_by_name["progress"]["attempt_id"] == ATTEMPT_ID
+    assert (
+        update_values_by_name["progress"]["attempt_started_at"]
+        == ATTEMPT_STARTED_AT
+    )
     control_imports.acquire_control_run_worker_action_lock.assert_awaited_once_with(
         connection,
         RUN_ID,
@@ -241,7 +254,7 @@ async def test_reconcile_missing_worker_is_idempotent(monkeypatch):
         "status": "failed",
         "error": {
             "code": "worker_lifecycle_lost",
-            "observed_heartbeat_at": EXPECTED_BODY["expected_heartbeat_at"],
+            "observed_heartbeat_at": "2026-08-27T22:30:38.663966Z",
             "attempt_id": ATTEMPT_ID,
             "attempt_started_at": ATTEMPT_STARTED_AT,
         },

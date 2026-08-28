@@ -20,9 +20,13 @@ async def test_generic_ptg_launch_holds_capacity_lock_through_external_start(mon
         yield connection
         events.append("transaction-exit")
 
-    async def lock(actual):
+    async def capacity_lock(actual):
         assert actual is connection
         events.append("capacity-lock")
+
+    async def worker_action_lock(actual, run_id):
+        assert actual is connection and run_id == "run-unit"
+        events.append("worker-action-lock")
 
     async def not_wave_owned(actual, run_id):
         assert actual is connection and run_id == "run-unit"
@@ -43,7 +47,10 @@ async def test_generic_ptg_launch_holds_capacity_lock_through_external_start(mon
         return {"status": "started", "items": []}
 
     monkeypatch.setattr(control_workers.db, "acquire", acquire)
-    monkeypatch.setattr(control_workers, "acquire_ptg_admission_lock", lock)
+    monkeypatch.setattr(control_workers, "acquire_ptg_admission_lock", capacity_lock)
+    monkeypatch.setattr(
+        control_workers, "acquire_control_run_worker_action_lock", worker_action_lock
+    )
     monkeypatch.setattr(control_workers, "require_not_wave_owned_run", not_wave_owned)
     monkeypatch.setattr(control_workers, "require_no_capacity_owning_wave", no_wave)
     monkeypatch.setattr(control_workers, "_admit_worker_ensure", admit)
@@ -58,8 +65,9 @@ async def test_generic_ptg_launch_holds_capacity_lock_through_external_start(mon
 
     assert launch_result["status"] == "started"
     assert events == [
-        "transaction-enter", "capacity-lock", "ownership-check", "wave-check",
-        "source-admission", "worker-launch", "transaction-exit",
+        "transaction-enter", "capacity-lock", "worker-action-lock",
+        "ownership-check", "wave-check", "source-admission", "worker-launch",
+        "transaction-exit",
     ]
 
 
@@ -80,19 +88,24 @@ async def test_generic_ptg_launch_does_not_start_when_wave_owns_capacity(monkeyp
 
     monkeypatch.setattr(control_workers.db, "acquire", acquire)
     monkeypatch.setattr(control_workers, "acquire_ptg_admission_lock", no_op)
+    monkeypatch.setattr(
+        control_workers,
+        "acquire_control_run_worker_action_lock",
+        no_op,
+    )
     monkeypatch.setattr(control_workers, "require_not_wave_owned_run", no_op)
     monkeypatch.setattr(control_workers, "require_no_capacity_owning_wave", blocked)
     monkeypatch.setattr(control_workers, "_admit_worker_ensure", unexpected)
 
-    result = await control_workers._guarded_ptg_family_ensure(
+    launch_result_by_field = await control_workers._guarded_ptg_family_ensure(
         {"run_id": "run-unit", "importer": "ptg"},
         run_id="run-unit",
         importer="ptg",
         selected_specs=[control_workers._BY_QUEUE["arq:PTGSmall"]],
     )
 
-    assert result["status"] == "failed"
-    assert result["message"] == "PTG wave capacity is reserved"
+    assert launch_result_by_field["status"] == "failed"
+    assert launch_result_by_field["message"] == "PTG wave capacity is reserved"
 
 
 @pytest.mark.asyncio

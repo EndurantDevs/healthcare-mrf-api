@@ -624,6 +624,13 @@ def _publish_artifact_bytes(
     expected_sha256: str | None,
 ) -> None:
     if not final.exists():
+        if expected_sha256 is not None:
+            staged_sha256, _staged_size = sha256_file(temporary)
+            if staged_sha256 != expected_sha256:
+                raise RuntimeError(
+                    "Retained artifact staging checksum does not match its identity: "
+                    f"{temporary}"
+                )
         os.replace(temporary, final)
         return
     if final.is_symlink() or not final.is_file():
