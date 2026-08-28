@@ -502,13 +502,8 @@ async def download_it_and_save_nostream(url, filepath):
 
 
 async def db_startup(ctx):
-    """Initialize the shared database and import-run schema."""
+    """Initialize the shared database connection."""
     await my_init_db(db)
-    from api.control_imports import (
-        ensure_import_run_table,
-    )
-
-    await ensure_import_run_table()
 
 
 async def download_it_and_save(

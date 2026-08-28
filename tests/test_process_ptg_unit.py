@@ -421,16 +421,10 @@ def test_ptg2_auto_address_refresh_enqueues_control_run(monkeypatch):
     calls = []
     monkeypatch.setenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_ENV, "true")
 
-    async def fake_ensure_import_run_table():
-        calls.append({"ensure": True})
-
     async def fake_create_import_run(payload):
         calls.append(payload)
         return {"run_id": "run-refresh", "importer": payload["importer"]}, True
 
-    monkeypatch.setattr(
-        control_imports, "ensure_import_run_table", fake_ensure_import_run_table
-    )
     monkeypatch.setattr(control_imports, "create_import_run", fake_create_import_run)
 
     enqueue_result = asyncio.run(
@@ -447,28 +441,21 @@ def test_ptg2_auto_address_refresh_enqueues_control_run(monkeypatch):
     assert enqueue_result["status"] == "queued"
     assert enqueue_result["created"] is True
     assert enqueue_result["run_id"] == "run-refresh"
-    assert calls[0] == {"ensure": True}
-    assert calls[1]["importer"] == "entity-address-unified"
-    assert calls[1]["idempotency_key"] == "entity-address-unified:source-alpha:snap-new"
-    assert calls[1]["triggered_by"] == "ptg_import"
-    assert calls[1]["params"]["refresh_mode"] == "full"
-    assert calls[1]["params"]["trigger_source_key"] == "source-alpha"
-    assert calls[1]["params"]["trigger_snapshot_id"] == "snap-new"
+    assert calls[0]["importer"] == "entity-address-unified"
+    assert calls[0]["idempotency_key"] == "entity-address-unified:source-alpha:snap-new"
+    assert calls[0]["triggered_by"] == "ptg_import"
+    assert calls[0]["params"]["refresh_mode"] == "full"
+    assert calls[0]["params"]["trigger_source_key"] == "source-alpha"
+    assert calls[0]["params"]["trigger_snapshot_id"] == "snap-new"
 
 
 def test_ptg2_auto_address_refresh_reports_existing_or_enqueue_failure(monkeypatch):
     control_imports = importlib.import_module("api.control_imports")
     monkeypatch.setenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_ENV, "true")
 
-    async def fake_ensure_import_run_table():
-        return None
-
     async def fake_existing_import_run(payload):
         return {"run_id": "run-existing", "importer": payload["importer"]}, False
 
-    monkeypatch.setattr(
-        control_imports, "ensure_import_run_table", fake_ensure_import_run_table
-    )
     monkeypatch.setattr(control_imports, "create_import_run", fake_existing_import_run)
     existing = asyncio.run(
         process_ptg._enqueue_address_refresh_after_import(

@@ -1818,21 +1818,21 @@ async def test_import_run_ensure_is_memoized_and_uses_advisory_lock(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_worker_db_startup_runs_import_run_ensure(monkeypatch):
+async def test_worker_db_startup_only_connects_database(monkeypatch):
     calls = []
 
     async def fake_init(_db):
         calls.append("init")
 
-    async def fake_ensure():
-        calls.append("ensure")
+    async def fail_ensure():
+        raise AssertionError("workers must not run schema DDL")
 
     monkeypatch.setattr(process_utils, "my_init_db", fake_init)
-    monkeypatch.setattr(control_imports, "ensure_import_run_table", fake_ensure)
+    monkeypatch.setattr(control_imports, "ensure_import_run_table", fail_ensure)
 
     await process_utils.db_startup({})
 
-    assert calls == ["init", "ensure"]
+    assert calls == ["init"]
 
 
 @pytest.mark.asyncio

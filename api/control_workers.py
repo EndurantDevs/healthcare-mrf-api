@@ -947,7 +947,6 @@ def _worker_job_spec(
     run_id: str,
 ) -> tuple[dict[str, str], dict[str, Any]]:
     """Build labels and the Kubernetes Job spec around one container."""
-
     pod_spec_dict: dict[str, Any] = {
         "restartPolicy": "Never",
         "automountServiceAccountToken": False,
@@ -956,6 +955,8 @@ def _worker_job_spec(
         ),
         "containers": [container_dict],
     }
+    if priority_class := _hospital_worker_priority_class(spec):
+        pod_spec_dict["priorityClassName"] = priority_class
     if volumes:
         pod_spec_dict["volumes"] = [volume_spec["volume"] for volume_spec in volumes]
     service_account = os.getenv("HLTHPRT_WORKER_JOB_SERVICE_ACCOUNT", "").strip()
@@ -998,6 +999,12 @@ def _worker_job_spec(
         job_spec_dict["parallelism"] = replicas
         job_spec_dict["completions"] = replicas
     return labels_by_key, job_spec_dict
+
+
+def _hospital_worker_priority_class(spec: WorkerSpec) -> str:
+    if spec.worker_class != "process.HospitalPrices":
+        return ""
+    return os.getenv("HLTHPRT_HOSPITAL_PRICE_WORKER_JOB_PRIORITY_CLASS", "").strip()
 
 
 def _worker_job_manifest(
@@ -1326,7 +1333,7 @@ def _uses_single_job_worker(spec: WorkerSpec) -> bool:
         spec.worker_class.startswith("process.PTG")
         or spec.worker_class
         in {
-            "process.MRFSourceDiscovery",
+            "process.HospitalPrices", "process.MRFSourceDiscovery",
             "process.NPI",
             "process.ProviderDirectoryFHIR",
         }

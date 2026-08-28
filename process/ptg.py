@@ -585,9 +585,8 @@ async def _enqueue_address_refresh_after_import(
         test_mode=test_mode,
     )
     try:
-        from api.control_imports import create_import_run, ensure_import_run_table
+        from api.control_imports import create_import_run
 
-        await ensure_import_run_table()
         run, created = await create_import_run(refresh_request)
         return {
             "status": "queued" if created else "existing",
