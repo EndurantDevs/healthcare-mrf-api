@@ -55,8 +55,8 @@ impl<R: Read> Read for BoundedDecompressedReader<R> {
     }
 }
 
-struct HospitalMrfTextReader<R: Read> {
-    inner: BufReader<R>,
+struct HospitalMrfTextReader<'a> {
+    inner: BufReader<Box<dyn Read + 'a>>,
     initial: [u8; 3],
     initial_pos: usize,
     initial_len: usize,
@@ -68,10 +68,10 @@ struct HospitalMrfTextReader<R: Read> {
     initialized: bool,
 }
 
-impl<R: Read> HospitalMrfTextReader<R> {
-    fn new(inner: R) -> Self {
+impl<'a> HospitalMrfTextReader<'a> {
+    fn new(inner: impl Read + 'a) -> Self {
         Self {
-            inner: BufReader::new(inner),
+            inner: BufReader::new(Box::new(inner)),
             initial: [0; 3],
             initial_pos: 0,
             initial_len: 0,
@@ -228,7 +228,7 @@ impl<R: Read> HospitalMrfTextReader<R> {
     }
 }
 
-impl<R: Read> Read for HospitalMrfTextReader<R> {
+impl Read for HospitalMrfTextReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
