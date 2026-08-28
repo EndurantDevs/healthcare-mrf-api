@@ -131,18 +131,21 @@
         let replay_cases: &[(&[u8], &str)] = &[
             (b"Caf\xe9 noir", "Café noir"),
             (b"Caf\xe9", "Café"),
-            (b"\xe9\xc2\xa0", "é\u{00a0}"),
-            (b"\xe9\x80A", "é€A"),
-            (b"\xe9\xc0A", "éÀA"),
-            (b"\xc2\xe9\xa0!", "Âé\u{00a0}!"),
-            (b"\xe9\xe2\x82\xac", "é€"),
+            (b"\xe2AB", "âAB"),
+            (b"\xe2\x80A", "â€A"),
+            (b"\xe2\xc0A", "âÀA"),
+            (b"\xe2\xc2\xa0", "â\u{00a0}"),
+            (b"\xc2\xc2\xa0", "Â\u{00a0}"),
+            (b"\xc2", "Â"),
+            (b"\xe2\x82", "â‚"),
+            (b"\xf0\x9f\x98", "ðŸ˜"),
         ];
         for &(raw, expected) in replay_cases {
             assert_eq!(decode(Cursor::new(raw)).unwrap(), expected);
             assert_eq!(decode(OneByteReader(Cursor::new(raw))).unwrap(), expected);
         }
 
-        for input in [b"\xe9\x81A".as_slice(), b"\xc2\xe9\x81A".as_slice()] {
+        for input in [b"\xe2\x81A".as_slice(), b"\xc2\xe2\x81A".as_slice()] {
             assert!(decode(Cursor::new(input)).unwrap_err().to_string().contains("UTF-8"));
             assert!(decode(OneByteReader(Cursor::new(input)))
                 .unwrap_err()
