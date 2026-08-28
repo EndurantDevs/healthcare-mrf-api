@@ -1061,7 +1061,7 @@ def _candidate_identity(database_row: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
-_CANDIDATE_SOURCE_RECORDS_SQL = """
+CANDIDATE_SOURCE_RECORDS_SQL = """
     SELECT source.source_key,
            source.raw_container_sha256,
            trace_binding.source_file_version_count,
@@ -1171,7 +1171,7 @@ async def _locked_candidate_identity(
     candidate_by_field["frozen_source_records"] = None
     if candidate_by_field.get("frozen_binding_payload") is not None:
         database_source_result = await session.execute(
-            db.text(_CANDIDATE_SOURCE_RECORDS_SQL.format(schema=quoted_schema)),
+            db.text(CANDIDATE_SOURCE_RECORDS_SQL.format(schema=quoted_schema)),
             {"snapshot_id": snapshot_id},
         )
         candidate_by_field["frozen_source_records"] = [
