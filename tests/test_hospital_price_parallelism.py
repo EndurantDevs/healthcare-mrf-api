@@ -47,6 +47,18 @@ async def test_resource_slot_yields_and_releases():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("resource", "slot_count"), (("other", 1), ("fetch", 0)))
+async def test_resource_slot_rejects_invalid_capacity(resource, slot_count):
+    orchestrator = orchestrator_module()
+
+    with pytest.raises(ValueError, match="resource slot is invalid"):
+        async with orchestrator._hospital_resource_slot(
+            ArtifactStore(), resource, slot_count
+        ):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_resource_slot_rotates_scan_start():
     orchestrator = orchestrator_module()
     acquired_keys: list[str] = []

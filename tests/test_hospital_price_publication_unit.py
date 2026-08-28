@@ -83,3 +83,22 @@ async def test_bind_and_publish_locks_current_before_attempt_evidence(
         Connection(), "v", "c", attempts, ()
     ) == (2, 0, 0)
     assert events == ["current", "attempt"]
+
+
+@pytest.mark.asyncio
+async def test_bind_and_publish_rejects_a_changed_current_set(monkeypatch) -> None:
+    store, _native = _store_module()
+
+    class Connection(_Connection):
+        async def all(self, _statement: str, **_kwargs: Any) -> list[Any]:
+            return []
+
+    async def publication(*_args: Any) -> tuple[str, str]:
+        return "stage", '"stage"'
+
+    monkeypatch.setattr(store, "_publication_stage", publication)
+
+    with pytest.raises(RuntimeError, match="current rows changed"):
+        await store._bind_and_publish(
+            Connection(), "v", "c", (SimpleNamespace(hospital_id="hospital-a"),), ()
+        )
