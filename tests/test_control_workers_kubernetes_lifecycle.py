@@ -43,6 +43,25 @@ def test_kubernetes_worker_job_uses_resource_profile(monkeypatch):
     assert env_by_name["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == "ptg_start_run_ptg"
 
 
+def test_kubernetes_hospital_worker_targets_exact_job():
+    spec = control_workers._BY_QUEUE["arq:HospitalPrices"]
+    job = control_workers._worker_job_manifest(
+        spec,
+        {
+            "run_id": "run_hospital",
+            "job_id": "hospital_prices_start_run_hospital",
+        },
+        "healthcare-mrf-api:test",
+    )
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    env_by_name = {entry["name"]: entry["value"] for entry in container["env"]}
+
+    assert container["command"][-2:] == ["worker-once", "process.HospitalPrices"]
+    assert env_by_name["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == (
+        "hospital_prices_start_run_hospital"
+    )
+
+
 def test_kubernetes_worker_job_sets_finalizer_identity_capacity_only_for_ptg_huge():
     capacity_env_by_worker = {}
 

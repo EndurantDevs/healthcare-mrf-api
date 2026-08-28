@@ -1326,7 +1326,7 @@ def _uses_single_job_worker(spec: WorkerSpec) -> bool:
         spec.worker_class.startswith("process.PTG")
         or spec.worker_class
         in {
-            "process.MRFSourceDiscovery",
+            "process.HospitalPrices", "process.MRFSourceDiscovery",
             "process.NPI",
             "process.ProviderDirectoryFHIR",
         }
