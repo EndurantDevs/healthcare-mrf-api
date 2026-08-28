@@ -302,6 +302,11 @@ async def test_worker_admission_and_binding_replay_short_circuit(monkeypatch):
     connection = object()
     monkeypatch.setattr(control_workers.db, "acquire", lambda: _Acquire(connection))
     monkeypatch.setattr(control_workers, "acquire_ptg_admission_lock", AsyncMock())
+    monkeypatch.setattr(
+        control_workers,
+        "acquire_control_run_worker_action_lock",
+        AsyncMock(),
+    )
     monkeypatch.setattr(control_workers, "require_not_wave_owned_run", AsyncMock())
     monkeypatch.setattr(control_workers, "require_no_capacity_owning_wave", AsyncMock())
     failed_by_field = {"status": "failed"}
