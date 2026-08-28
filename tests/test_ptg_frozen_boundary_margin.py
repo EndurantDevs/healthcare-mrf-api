@@ -46,6 +46,11 @@ def test_worker_argument_helpers_cover_scalar_and_list_shapes():
         "frozen_rate_file_set_sha256",
         "frozen_rate_file_count",
     }
+    params_by_name = protected_control_payload()["params"]
+    params_by_name["invalid_price_exclusion_policy"] = {"private": True}
+    assert ptg_frozen_control.frozen_rate_main_kwargs(params_by_name)[
+        "invalid_price_exclusion_policy"
+    ] == {"private": True}
 
 
 @pytest.mark.asyncio

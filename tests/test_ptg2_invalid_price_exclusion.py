@@ -37,6 +37,27 @@ def _source(raw_source_sha256: str, object_ordinal: int) -> dict[str, object]:
     )
 
 
+def _policy() -> dict[str, object]:
+    return invalid_price_exclusion_policy([_source("11" * 32, 4)])
+
+
+def _expectation() -> dict[str, object]:
+    expectation_by_field = invalid_price_exclusion_source_expectation(
+        _policy(),
+        "11" * 32,
+    )
+    assert expectation_by_field is not None
+    return expectation_by_field
+
+
+def _source_evidence() -> dict[str, object]:
+    return invalid_price_exclusion_source_evidence(_expectation())
+
+
+def _aggregate_evidence() -> dict[str, object]:
+    return invalid_price_exclusion_evidence(_policy())
+
+
 def test_policy_is_exact_canonical_private_and_fail_closed() -> None:
     """Require one private canonical policy and reject every mutation."""
 
@@ -95,102 +116,139 @@ def test_policy_is_exact_canonical_private_and_fail_closed() -> None:
 
 
 @pytest.mark.parametrize(
-    "case_name",
+    "invalid_call",
     (
-        "invalid-sha",
-        "invalid-count",
-        "empty-value",
-        "entry-fields",
-        "empty-entries",
-        "duplicate-coordinates",
-        "emptied-rate-count",
-        "source-fields",
-        "source-entries",
-        "empty-sources",
-        "duplicate-sources",
-        "policy-fields",
-        "policy-contract",
-        "expectation-type",
-        "expectation-mismatch",
-        "source-evidence-fields",
-        "source-evidence-contract",
-        "source-evidence-counts",
-        "evidence-fields",
-        "evidence-contract",
-        "evidence-counts",
+        pytest.param(
+            lambda: invalid_price_exclusion_source(
+                raw_source_sha256="x" * 64,
+                entries=[_entry(4, "2027-02-30")],
+                emptied_rate_count=0,
+            ),
+            id="invalid-sha",
+        ),
+        pytest.param(
+            lambda: invalid_price_exclusion_source(
+                raw_source_sha256="11" * 32,
+                entries=[{**_entry(4, "2027-02-30"), "object_ordinal": -1}],
+                emptied_rate_count=0,
+            ),
+            id="invalid-count",
+        ),
+        pytest.param(lambda: invalid_price_value_sha256(""), id="empty-value"),
+        pytest.param(
+            lambda: invalid_price_exclusion_source(
+                raw_source_sha256="11" * 32,
+                entries=[{}],
+                emptied_rate_count=0,
+            ),
+            id="entry-fields",
+        ),
+        pytest.param(
+            lambda: invalid_price_exclusion_source(
+                raw_source_sha256="11" * 32,
+                entries=[],
+                emptied_rate_count=0,
+            ),
+            id="empty-entries",
+        ),
+        pytest.param(
+            lambda: invalid_price_exclusion_source(
+                raw_source_sha256="11" * 32,
+                entries=[
+                    _entry(4, "2027-02-30"),
+                    _entry(4, "2027-02-30"),
+                ],
+                emptied_rate_count=0,
+            ),
+            id="duplicate-coordinates",
+        ),
+        pytest.param(
+            lambda: invalid_price_exclusion_source(
+                raw_source_sha256="11" * 32,
+                entries=[_entry(4, "2027-02-30")],
+                emptied_rate_count=2,
+            ),
+            id="emptied-rate-count",
+        ),
+        pytest.param(
+            lambda: invalid_price_exclusion_policy([{}]),
+            id="source-fields",
+        ),
+        pytest.param(
+            lambda: invalid_price_exclusion_policy(
+                [
+                    {
+                        **_source("11" * 32, 4),
+                        "entries": tuple(_source("11" * 32, 4)["entries"]),
+                    }
+                ]
+            ),
+            id="source-entries",
+        ),
+        pytest.param(lambda: invalid_price_exclusion_policy([]), id="empty-sources"),
+        pytest.param(
+            lambda: invalid_price_exclusion_policy(
+                [_source("11" * 32, 4), _source("11" * 32, 4)]
+            ),
+            id="duplicate-sources",
+        ),
+        pytest.param(
+            lambda: validate_invalid_price_exclusion_policy({}),
+            id="policy-fields",
+        ),
+        pytest.param(
+            lambda: validate_invalid_price_exclusion_policy(
+                {**_policy(), "contract": "incompatible"}
+            ),
+            id="policy-contract",
+        ),
+        pytest.param(
+            lambda: invalid_price_exclusion_source_evidence(None),
+            id="expectation-type",
+        ),
+        pytest.param(
+            lambda: invalid_price_exclusion_source_evidence(
+                {**_expectation(), "unexpected": True}
+            ),
+            id="expectation-mismatch",
+        ),
+        pytest.param(
+            lambda: validate_invalid_price_exclusion_source_evidence({}),
+            id="source-evidence-fields",
+        ),
+        pytest.param(
+            lambda: validate_invalid_price_exclusion_source_evidence(
+                {**_source_evidence(), "contract": "incompatible"}
+            ),
+            id="source-evidence-contract",
+        ),
+        pytest.param(
+            lambda: validate_invalid_price_exclusion_source_evidence(
+                {**_source_evidence(), "excluded_price_count": 0}
+            ),
+            id="source-evidence-counts",
+        ),
+        pytest.param(
+            lambda: validate_invalid_price_exclusion_evidence({}),
+            id="evidence-fields",
+        ),
+        pytest.param(
+            lambda: validate_invalid_price_exclusion_evidence(
+                {**_aggregate_evidence(), "contract": "incompatible"}
+            ),
+            id="evidence-contract",
+        ),
+        pytest.param(
+            lambda: validate_invalid_price_exclusion_evidence(
+                {**_aggregate_evidence(), "excluded_price_count": 0}
+            ),
+            id="evidence-counts",
+        ),
     ),
 )
-def test_policy_rejects_noncanonical_trust_boundary_inputs(case_name: str) -> None:
-    entry = _entry(4, "2027-02-30")
-    source = _source("11" * 32, 4)
-    policy = invalid_price_exclusion_policy([source])
-    expectation = invalid_price_exclusion_source_expectation(policy, "11" * 32)
-    source_evidence = invalid_price_exclusion_source_evidence(expectation)
-    evidence = invalid_price_exclusion_evidence(policy)
-    invalid_calls = {
-        "invalid-sha": lambda: invalid_price_exclusion_source(
-            raw_source_sha256="x" * 64,
-            entries=[entry],
-            emptied_rate_count=0,
-        ),
-        "invalid-count": lambda: invalid_price_exclusion_source(
-            raw_source_sha256="11" * 32,
-            entries=[{**entry, "object_ordinal": -1}],
-            emptied_rate_count=0,
-        ),
-        "empty-value": lambda: invalid_price_value_sha256(""),
-        "entry-fields": lambda: invalid_price_exclusion_source(
-            raw_source_sha256="11" * 32,
-            entries=[{}],
-            emptied_rate_count=0,
-        ),
-        "empty-entries": lambda: invalid_price_exclusion_source(
-            raw_source_sha256="11" * 32,
-            entries=[],
-            emptied_rate_count=0,
-        ),
-        "duplicate-coordinates": lambda: invalid_price_exclusion_source(
-            raw_source_sha256="11" * 32,
-            entries=[entry, entry],
-            emptied_rate_count=0,
-        ),
-        "emptied-rate-count": lambda: invalid_price_exclusion_source(
-            raw_source_sha256="11" * 32,
-            entries=[entry],
-            emptied_rate_count=2,
-        ),
-        "source-fields": lambda: invalid_price_exclusion_policy([{}]),
-        "source-entries": lambda: invalid_price_exclusion_policy(
-            [{**source, "entries": tuple(source["entries"])}]
-        ),
-        "empty-sources": lambda: invalid_price_exclusion_policy([]),
-        "duplicate-sources": lambda: invalid_price_exclusion_policy([source, source]),
-        "policy-fields": lambda: validate_invalid_price_exclusion_policy({}),
-        "policy-contract": lambda: validate_invalid_price_exclusion_policy(
-            {**policy, "contract": "incompatible"}
-        ),
-        "expectation-type": lambda: invalid_price_exclusion_source_evidence(None),
-        "expectation-mismatch": lambda: invalid_price_exclusion_source_evidence(
-            {**expectation, "unexpected": True}
-        ),
-        "source-evidence-fields": lambda: validate_invalid_price_exclusion_source_evidence({}),
-        "source-evidence-contract": lambda: validate_invalid_price_exclusion_source_evidence(
-            {**source_evidence, "contract": "incompatible"}
-        ),
-        "source-evidence-counts": lambda: validate_invalid_price_exclusion_source_evidence(
-            {**source_evidence, "excluded_price_count": 0}
-        ),
-        "evidence-fields": lambda: validate_invalid_price_exclusion_evidence({}),
-        "evidence-contract": lambda: validate_invalid_price_exclusion_evidence(
-            {**evidence, "contract": "incompatible"}
-        ),
-        "evidence-counts": lambda: validate_invalid_price_exclusion_evidence(
-            {**evidence, "excluded_price_count": 0}
-        ),
-    }
-
+def test_policy_rejects_noncanonical_trust_boundary_inputs(invalid_call) -> None:
     with pytest.raises(ValueError, match="invalid price exclusion"):
-        invalid_calls[case_name]()
+        invalid_call()
 
 
 def test_candidate_evidence_is_exactly_bound_to_policy_and_sources() -> None:

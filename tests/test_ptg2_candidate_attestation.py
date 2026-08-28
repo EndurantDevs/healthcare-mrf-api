@@ -786,6 +786,10 @@ def test_candidate_identity_binds_exact_invalid_price_exclusion():
     assert ptg2_candidate_attestation._candidate_identity(candidate_row_by_field)["source_set_digest"] == bytes.fromhex(
         source_set["raw_container_sha256_digest"]
     )
+    candidate_row_by_field["frozen_binding_payload"] = {}
+    with pytest.raises(ValueError, match="frozen source-file binding changed"):
+        ptg2_candidate_attestation._candidate_identity(candidate_row_by_field)
+    candidate_row_by_field["frozen_binding_payload"] = binding
     candidate_row_by_field["invalid_price_exclusion_policy"] = None
     with pytest.raises(ValueError, match="binding changed"):
         ptg2_candidate_attestation._candidate_identity(candidate_row_by_field)
