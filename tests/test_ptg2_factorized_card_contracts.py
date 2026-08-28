@@ -55,6 +55,10 @@ def test_factorized_cards_accept_zip_or_coordinates_with_bounded_window():
             {"view": "card", "zip5": "60601", "order": "desc"},
             "ascending cost",
         ),
+        (
+            {"view": "card", "zip5": "60601", "mode": "exact_source"},
+            "exact_source",
+        ),
     ],
 )
 def test_factorized_card_request_rejects_unsupported_boundaries(

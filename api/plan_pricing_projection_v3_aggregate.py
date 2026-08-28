@@ -32,32 +32,16 @@ MAX_CODE_AGGREGATE_WORK_ROWS = 200_000_000
 MAX_PROJECTION_AGGREGATE_WORK_ROWS = 50_000_000_000
 
 
-_AGGREGATE_STATS_SQL = f"""
-        WITH rate_sets AS MATERIALIZED (
-            SELECT DISTINCT binding_ordinal, provider_set_key
-              FROM plan_pricing_code_occurrence_stage
-        ), eligible_members AS MATERIALIZED (
-            SELECT member.binding_ordinal, member.provider_set_key,
-                   provider.geo_cell, member.npi
-              FROM rate_sets
-              JOIN plan_pricing_provider_member_stage member
-                USING (binding_ordinal, provider_set_key)
-              JOIN {table('plan_pricing_provider_cell')} provider
-                ON provider.projection_id = :projection_id
-               AND provider.npi = member.npi
-             WHERE TRUE {{taxonomy_filter}}
-        ), provider_stats AS MATERIALIZED (
+_AGGREGATE_STATS_SQL = """
+        WITH provider_stats AS MATERIALIZED (
             SELECT geo_cell, COUNT(DISTINCT npi)::bigint AS provider_count
-              FROM eligible_members
+              FROM plan_pricing_eligible_member_cell_stage
              GROUP BY geo_cell
-        ), set_cells AS MATERIALIZED (
-            SELECT DISTINCT binding_ordinal, provider_set_key, geo_cell
-              FROM eligible_members
         ), rate_frequency AS MATERIALIZED (
             SELECT cell.geo_cell, price.negotiated_rate,
                    SUM(occurrence.occurrence_count
                        * price.rate_multiplicity)::bigint AS frequency
-              FROM set_cells cell
+              FROM plan_pricing_set_cell_stage cell
               JOIN plan_pricing_code_occurrence_stage occurrence
                 USING (binding_ordinal, provider_set_key)
               JOIN plan_pricing_price_rate_stage price
@@ -90,55 +74,6 @@ _AGGREGATE_STATS_SQL = f"""
     """
 
 
-_AGGREGATE_WORK_SQL = f"""
-        WITH rate_sets AS MATERIALIZED (
-            SELECT DISTINCT binding_ordinal, provider_set_key
-              FROM plan_pricing_code_occurrence_stage
-        ), set_cells AS MATERIALIZED (
-            SELECT DISTINCT member.binding_ordinal, member.provider_set_key,
-                   provider.geo_cell
-              FROM rate_sets
-              JOIN plan_pricing_provider_member_stage member
-                USING (binding_ordinal, provider_set_key)
-              JOIN {table('plan_pricing_provider_cell')} provider
-                ON provider.projection_id = :projection_id
-               AND provider.npi = member.npi
-             WHERE TRUE {{taxonomy_filter}}
-        ), price_variants AS MATERIALIZED (
-            SELECT binding_ordinal, price_set_id, COUNT(*)::bigint AS count
-              FROM plan_pricing_price_rate_stage
-             GROUP BY binding_ordinal, price_set_id
-        )
-        SELECT COALESCE(SUM(price.count), 0)::bigint
-          FROM set_cells cell
-          JOIN plan_pricing_code_occurrence_stage occurrence
-            USING (binding_ordinal, provider_set_key)
-          JOIN price_variants price
-            USING (binding_ordinal, price_set_id)
-    """
-
-
-def _taxonomy_filter(has_taxonomy_rule: bool) -> str:
-    return (
-        "AND provider.entity_type_code = 1 "
-        "AND EXISTS (SELECT 1 FROM unnest(provider.taxonomy_codes) taxonomy_code "
-        "WHERE upper(btrim(taxonomy_code)) "
-        "= ANY(CAST(:taxonomy_codes AS varchar[])))"
-        if has_taxonomy_rule
-        else ""
-    )
-
-
-def _aggregate_stats_sql(
-    has_taxonomy_rule: bool,
-    *,
-    aggregate_stats_sql: str = _AGGREGATE_STATS_SQL,
-) -> str:
-    return aggregate_stats_sql.format(
-        taxonomy_filter=_taxonomy_filter(has_taxonomy_rule)
-    )
-
-
 async def _aggregate_records(
     session: Any,
     projection_id: str,
@@ -146,56 +81,10 @@ async def _aggregate_records(
     state: _BuildState | None = None,
     *,
     aggregate_stats_sql: str = _AGGREGATE_STATS_SQL,
-    aggregate_work_sql: str = _AGGREGATE_WORK_SQL,
 ) -> tuple[AggregateZipRecord, ...]:
-    """Return exact ZIP aggregates after enforcing the release work budget."""
+    """Return exact ZIP aggregates from preflighted per-code stages."""
 
-    from api import ptg2_serving as serving
-
-    taxonomy_rule = serving._inferred_provider_taxonomy_rule(
-        {"code_system": code_identity[0], "code": code_identity[1]}
-    )
-    taxonomy_codes = (
-        sorted(
-            {
-                str(taxonomy_code).strip().upper()
-                for taxonomy_code in taxonomy_rule.taxonomy_codes
-                if str(taxonomy_code).strip()
-            }
-        )
-        if taxonomy_rule is not None
-        else None
-    )
-    query_parameters_by_name = {
-        "projection_id": projection_id,
-        "taxonomy_codes": taxonomy_codes,
-    }
-    work_result = await session.execute(
-        text(
-            aggregate_work_sql.format(
-                taxonomy_filter=_taxonomy_filter(taxonomy_rule is not None)
-            )
-        ),
-        query_parameters_by_name,
-    )
-    work_rows = int(work_result.scalar_one())
-    prior_work_rows = state.aggregate_work_rows if state is not None else 0
-    if (
-        work_rows > MAX_CODE_AGGREGATE_WORK_ROWS
-        or prior_work_rows + work_rows > MAX_PROJECTION_AGGREGATE_WORK_ROWS
-    ):
-        raise ValueError("pricing projection aggregate work bound exceeded")
-    if state is not None:
-        state.aggregate_work_rows += work_rows
-    aggregate_result = await session.execute(
-        text(
-            _aggregate_stats_sql(
-                taxonomy_rule is not None,
-                aggregate_stats_sql=aggregate_stats_sql,
-            )
-        ),
-        query_parameters_by_name,
-    )
+    aggregate_result = await session.execute(text(aggregate_stats_sql))
     return _aggregate_zip_records(aggregate_result.mappings())
 
 

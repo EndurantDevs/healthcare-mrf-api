@@ -44,15 +44,14 @@ class _ProfileStream:
 
 
 class _Session:
-    def __init__(self, rows, *, work_rows: int = 2):
+    def __init__(self, rows):
         self.rows = rows
-        self.work_rows = work_rows
         self.execute_calls = []
         self.stream_calls = []
 
     async def execute(self, statement, parameters=None):
         self.execute_calls.append((str(statement), parameters))
-        return SimpleNamespace(scalar_one=lambda: self.work_rows)
+        return SimpleNamespace()
 
     async def stream(self, statement, parameters=None):
         self.stream_calls.append((statement, parameters))
@@ -90,6 +89,7 @@ async def test_rate_profile_store_is_sql_folded_streamed_and_digested() -> None:
     profile_rows = (_profile(), _profile(binding_ordinal=2, provider_set_key=9))
     session = _Session(profile_rows)
     state = _BuildState(hashlib.sha256())
+    state.rate_profile_work_rows = 2
 
     await rate_profiles._store_rate_profiles(
         session,
@@ -98,10 +98,7 @@ async def test_rate_profile_store_is_sql_folded_streamed_and_digested() -> None:
         state,
     )
 
-    work_sql, work_parameters = session.execute_calls[0]
-    assert "SUM(price.count)" in work_sql
-    assert work_parameters is None
-    insert_sql, parameters = session.execute_calls[1]
+    insert_sql, parameters = session.execute_calls[0]
     assert "SUM(occurrence.occurrence_count" in insert_sql
     assert "* price.rate_multiplicity" in insert_sql
     assert "plan_pricing_provider_set_stage" in insert_sql
@@ -124,50 +121,3 @@ def test_rate_profile_fragment_keeps_decimal_text_and_multiplicity() -> None:
     assert rate_profiles._rate_profile_fragment(
         (Decimal("10.500"), Decimal("30")), (2, 1)
     ) == b"[[10.5,2],[30,1]]"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("work_rows", "fails"), ((1, False), (2, True)))
-async def test_rate_profile_work_cap_is_inclusive(
-    monkeypatch, work_rows: int, fails: bool
-) -> None:
-    monkeypatch.setattr(rate_profiles, "MAX_CODE_RATE_PROFILE_WORK_ROWS", 1)
-    session = _Session((), work_rows=work_rows)
-    state = _BuildState(hashlib.sha256())
-
-    if not fails:
-        await rate_profiles._store_rate_profiles(
-            session,
-            PROJECTION_ID,
-            ("CPT", "27447"),
-            state,
-        )
-        assert state.rate_profile_work_rows == 1
-        assert len(session.execute_calls) == 2
-        return
-
-    with pytest.raises(ValueError, match="work bound exceeded"):
-        await rate_profiles._store_rate_profiles(
-            session,
-            PROJECTION_ID,
-            ("CPT", "27447"),
-            state,
-        )
-    assert len(session.execute_calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_rate_profile_release_work_cap_is_cumulative(monkeypatch) -> None:
-    monkeypatch.setattr(
-        rate_profiles, "MAX_PROJECTION_RATE_PROFILE_WORK_ROWS", 1
-    )
-    state = _BuildState(hashlib.sha256())
-    state.rate_profile_work_rows = 1
-    session = _Session((), work_rows=1)
-
-    with pytest.raises(ValueError, match="work bound exceeded"):
-        await rate_profiles._store_rate_profiles(
-            session, PROJECTION_ID, ("CPT", "27447"), state
-        )
-
-    assert len(session.execute_calls) == 1

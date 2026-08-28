@@ -35,6 +35,16 @@ def _binding(ordinal: int = 0) -> BindingProjection:
     )
 
 
+def _provider_metadata(*entries: tuple[str, int, int]):
+    return {
+        provider_set_id: SimpleNamespace(
+            provider_set_key=provider_set_key,
+            provider_count=provider_count,
+        )
+        for provider_set_id, provider_set_key, provider_count in entries
+    }
+
+
 def test_provider_cell_digest_binds_normalized_full_taxonomy_array() -> None:
     provider_by_field = {
         "npi": 1000000001,
@@ -70,11 +80,14 @@ async def test_stage_ddl_uses_one_statement_per_execute() -> None:
     session = _ExecuteSession()
 
     await projection._create_stage_tables(session)
-    assert len(session.calls) == 6
+    assert len(session.calls) == 9
     assert all(sql.count("CREATE TEMP TABLE") == 1 for sql, _ in session.calls)
     assert "plan_pricing_provider_set_stage" in session.calls[0][0]
     assert "plan_pricing_provider_npi_materialized_stage" in session.calls[2][0]
     assert "plan_pricing_provider_npi_pending_stage" in session.calls[3][0]
+    assert "plan_pricing_provider_cell_stage" in session.calls[6][0]
+    assert "plan_pricing_eligible_member_cell_stage" in session.calls[7][0]
+    assert "plan_pricing_set_cell_stage" in session.calls[8][0]
 
 
 @pytest.mark.asyncio
@@ -87,11 +100,23 @@ async def test_provider_set_membership_is_exactly_bounded(monkeypatch) -> None:
         }
     )
     monkeypatch.setattr(serving, "_provider_npis_for_sets", provider_npis)
+    monkeypatch.setattr(
+        serving,
+        "_provider_set_metadata_for_ids",
+        AsyncMock(
+            return_value=_provider_metadata(
+                (
+                    "1" * 32,
+                    7,
+                    projection.MAX_PROVIDER_NPIS_PER_SET + 1,
+                )
+            )
+        ),
+    )
 
     with pytest.raises(ValueError, match="membership exceeds its bound"):
         await provider_stage._stage_provider_set_batch(
             _ExecuteSession(),
-            PROJECTION_ID,
             _binding(),
             [{"provider_set_key": 7, "provider_set_id": "1" * 32}],
             projection._BuildState(hashlib.sha256()),
@@ -103,57 +128,17 @@ async def test_provider_set_membership_is_exactly_bounded(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_provider_set_membership_keeps_complete_set_semantics(
-    monkeypatch,
-) -> None:
-    provider_npis = AsyncMock(
-        return_value={"1" * 32: (12, 11), "2" * 32: (13,)}
-    )
-    inserted_rows = []
-
-    async def insert_batches(_session, statement, rows):
-        inserted_rows.append((statement, list(rows)))
-
-    monkeypatch.setattr(serving, "_provider_npis_for_sets", provider_npis)
-
-    state = projection._BuildState(hashlib.sha256())
+async def test_provider_projection_persists_only_after_admission() -> None:
     session = _ExecuteSession()
-    await provider_stage._stage_provider_set_batch(
-        session,
-        PROJECTION_ID,
-        _binding(3),
-        [
-            {"provider_set_key": 7, "provider_set_id": "1" * 32},
-            {"provider_set_key": 8, "provider_set_id": "2" * 32},
-        ],
-        state,
-        insert_batches=insert_batches,
-    )
 
-    assert [
-        membership_row["membership_count"]
-        for membership_row in inserted_rows[0][1]
-    ] == [2, 1]
-    staged_rows = inserted_rows[1][1]
-    assert staged_rows == [
-        {"binding_ordinal": 3, "provider_set_key": 7, "npi": 11},
-        {"binding_ordinal": 3, "provider_set_key": 7, "npi": 12},
-        {"binding_ordinal": 3, "provider_set_key": 8, "npi": 13},
-    ]
-    expected_digest = hashlib.sha256()
-    for provider_set_key, npi in ((7, 11), (7, 12), (8, 13)):
-        projection.digest_row(
-            expected_digest,
-            "provider-membership",
-            (3, provider_set_key, npi),
-            b"",
-        )
-    assert state.provider_membership_count == 3
-    assert state.staged_provider_set_count == 2
-    assert state.content_digest.digest() == expected_digest.digest()
-    assert "plan_pricing_provider_npi_pending_stage" in session.calls[0][0]
-    assert "plan_pricing_provider_membership" in session.calls[1][0]
-    assert session.calls[1][1]["provider_set_keys"] == [7, 8]
+    await provider_stage._persist_provider_projection(session, PROJECTION_ID)
+
+    assert len(session.calls) == 2
+    assert "plan_pricing_provider_membership" in session.calls[0][0]
+    assert "plan_pricing_provider_member_stage" in session.calls[0][0]
+    assert "plan_pricing_provider_cell" in session.calls[1][0]
+    assert "plan_pricing_provider_cell_stage" in session.calls[1][0]
+    assert all(parameters == {"projection_id": PROJECTION_ID} for _, parameters in session.calls)
 
 
 @pytest.mark.asyncio
@@ -177,7 +162,6 @@ async def test_code_provider_sets_stage_only_new_referenced_keys(monkeypatch) ->
     state.staged_provider_set_count = 1
     await provider_stage._stage_code_provider_sets(
         _ExistingSession(),
-        PROJECTION_ID,
         _binding(3),
         [
             {
@@ -195,7 +179,7 @@ async def test_code_provider_sets_stage_only_new_referenced_keys(monkeypatch) ->
     )
 
     assert stage_batch.await_count == 1
-    assert stage_batch.await_args.args[3] == [
+    assert stage_batch.await_args.args[2] == [
         {"provider_set_key": 8, "provider_set_id": "2" * 32}
     ]
 
@@ -221,7 +205,6 @@ async def test_provider_set_release_cap_is_inclusive(monkeypatch) -> None:
     accepted_stage = AsyncMock()
     await provider_stage._stage_code_provider_sets(
         _EmptySession(),
-        PROJECTION_ID,
         _binding(),
         serving_rows,
         {7},
@@ -235,7 +218,6 @@ async def test_provider_set_release_cap_is_inclusive(monkeypatch) -> None:
     with pytest.raises(ValueError, match="provider-set bound exceeded"):
         await provider_stage._stage_code_provider_sets(
             _EmptySession(),
-            PROJECTION_ID,
             _binding(),
             serving_rows,
             {7},
@@ -252,6 +234,13 @@ async def test_provider_membership_release_cap_is_inclusive(monkeypatch) -> None
         "_provider_npis_for_sets",
         AsyncMock(return_value={provider_set_id: (11, 12)}),
     )
+    monkeypatch.setattr(
+        serving,
+        "_provider_set_metadata_for_ids",
+        AsyncMock(
+            return_value=_provider_metadata((provider_set_id, 7, 2))
+        ),
+    )
     monkeypatch.setattr(provider_stage, "MAX_PROJECTION_PROVIDER_MEMBERSHIPS", 2)
 
     async def insert_batches(_session, _statement, rows):
@@ -259,7 +248,6 @@ async def test_provider_membership_release_cap_is_inclusive(monkeypatch) -> None
 
     await provider_stage._stage_provider_set_batch(
         _ExecuteSession(),
-        PROJECTION_ID,
         _binding(),
         [{"provider_set_key": 7, "provider_set_id": provider_set_id}],
         projection._BuildState(hashlib.sha256()),
@@ -271,7 +259,6 @@ async def test_provider_membership_release_cap_is_inclusive(monkeypatch) -> None
     with pytest.raises(ValueError, match="membership bound exceeded"):
         await provider_stage._stage_provider_set_batch(
             _ExecuteSession(),
-            PROJECTION_ID,
             _binding(),
             [{"provider_set_key": 7, "provider_set_id": provider_set_id}],
             full_state,
@@ -318,6 +305,9 @@ async def test_provider_materialization_drains_pending_npis_once() -> None:
         insert_batches=insert_batches,
     )
 
+    assert "plan_pricing_provider_cell_stage" in str(
+        insert_batches.await_args.args[1]
+    )
     assert "provider_npi_materialized_stage" in session.calls[0][0]
     assert "DELETE FROM plan_pricing_provider_npi_pending_stage" in (
         session.calls[1][0]

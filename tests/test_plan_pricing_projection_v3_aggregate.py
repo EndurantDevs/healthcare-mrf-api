@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 
@@ -127,16 +127,15 @@ async def test_aggregate_pack_insert_binds_hash_and_exact_receipts() -> None:
 
 
 def test_aggregate_sql_preserves_exact_old_materializer_multiplicity() -> None:
-    aggregate_sql = projection._aggregate_stats_sql(has_taxonomy_rule=True)
+    aggregate_sql = projection._AGGREGATE_STATS_SQL
 
     assert "COUNT(DISTINCT npi)" in aggregate_sql
-    assert "SELECT DISTINCT binding_ordinal, provider_set_key, geo_cell" in aggregate_sql
+    assert "plan_pricing_eligible_member_cell_stage" in aggregate_sql
+    assert "plan_pricing_set_cell_stage" in aggregate_sql
     assert "occurrence.occurrence_count" in aggregate_sql
     assert "price.rate_multiplicity" in aggregate_sql
     assert "(ranked.total + 1) / 2" in aggregate_sql
     assert "(ranked.total + 2) / 2" in aggregate_sql
-    assert "provider.entity_type_code = 1" in aggregate_sql
-    assert "upper(btrim(taxonomy_code))" in aggregate_sql
 
 
 def test_seal_counts_reject_inconsistent_builder_outputs() -> None:
@@ -157,7 +156,14 @@ def test_seal_counts_reject_inconsistent_builder_outputs() -> None:
 async def test_materializer_validates_bindings_and_yields_per_code(monkeypatch) -> None:
     create_stage = AsyncMock()
     materialize_cells = AsyncMock()
-    stage_code = AsyncMock(return_value=True)
+    stage_code = AsyncMock(side_effect=(True, True))
+    admitted_work = SimpleNamespace(
+        membership_probe_rows=1,
+        member_cell_rows=1,
+    )
+    prepare_code_work = AsyncMock(return_value=admitted_work)
+    restage_code_work = AsyncMock(return_value=admitted_work)
+    persist_provider = AsyncMock()
     store_rate_profiles = AsyncMock()
     aggregate_records = AsyncMock(return_value=())
     store_aggregate_packs = AsyncMock()
@@ -168,6 +174,11 @@ async def test_materializer_validates_bindings_and_yields_per_code(monkeypatch) 
         projection, "_materialize_provider_cells", materialize_cells
     )
     monkeypatch.setattr(projection, "_has_staged_code_inputs", stage_code)
+    monkeypatch.setattr(projection, "_prepare_code_work", prepare_code_work)
+    monkeypatch.setattr(projection, "_stage_code_work", restage_code_work)
+    monkeypatch.setattr(
+        projection, "_persist_provider_projection", persist_provider
+    )
     monkeypatch.setattr(
         projection, "_store_rate_profiles", store_rate_profiles
     )
@@ -181,17 +192,117 @@ async def test_materializer_validates_bindings_and_yields_per_code(monkeypatch) 
     await projection.materialize_factorized_projection(
         object(), PROJECTION_ID, [_binding(1)], hashlib.sha256()
     )
-    event_loop_yield.assert_awaited_once_with(0)
+    assert event_loop_yield.await_count == 2
+    event_loop_yield.assert_awaited_with(0)
     assert materialize_cells.await_count == 1
     assert materialize_cells.await_args.args[1] == PROJECTION_ID
+    prepare_code_work.assert_awaited_once_with(
+        ANY, PROJECTION_ID, ("CPT", "27447"), ANY
+    )
+    persist_provider.assert_awaited_once_with(ANY, PROJECTION_ID)
+    restage_code_work.assert_awaited_once_with(
+        ANY, PROJECTION_ID, ("CPT", "27447"), 1, 1
+    )
     store_rate_profiles.assert_awaited_once()
     store_aggregate_packs.assert_awaited_once()
 
-    with pytest.raises(ValueError, match="not unique"):
-        await projection.materialize_factorized_projection(
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "drift_kind", ("missing_input", "actual_work", "provider_counter")
+)
+async def test_materializer_rejects_second_pass_admission_drift(
+    monkeypatch, drift_kind
+) -> None:
+    admitted_work = SimpleNamespace(
+        membership_probe_rows=1,
+        member_cell_rows=1,
+    )
+    actual_work = admitted_work
+    if drift_kind == "actual_work":
+        actual_work = SimpleNamespace(
+            membership_probe_rows=1,
+            member_cell_rows=2,
+        )
+    state = projection._BuildState(hashlib.sha256())
+
+    def has_staged_inputs(*_args) -> bool:
+        if drift_kind == "provider_counter":
+            state.provider_cell_count += 1
+        return drift_kind != "missing_input"
+
+    stage_code_inputs = AsyncMock(side_effect=has_staged_inputs)
+    stage_code_work = AsyncMock(return_value=actual_work)
+    store_rate_profiles = AsyncMock()
+    aggregate_records = AsyncMock()
+    store_aggregate_packs = AsyncMock()
+    monkeypatch.setattr(
+        projection, "_has_staged_code_inputs", stage_code_inputs
+    )
+    monkeypatch.setattr(projection, "_stage_code_work", stage_code_work)
+    monkeypatch.setattr(projection, "_store_rate_profiles", store_rate_profiles)
+    monkeypatch.setattr(projection, "_aggregate_records", aggregate_records)
+    monkeypatch.setattr(
+        projection, "_store_aggregate_packs", store_aggregate_packs
+    )
+
+    with pytest.raises(ValueError, match="code admission changed"):
+        await projection._store_admitted_codes(
             object(),
             PROJECTION_ID,
-            [_binding(1), _binding(1)],
-            hashlib.sha256(),
+            [_binding()],
+            {("CPT", "27447"): admitted_work},
+            state,
         )
-    assert create_stage.await_count == 1
+
+    if drift_kind == "missing_input":
+        stage_code_work.assert_not_awaited()
+    else:
+        stage_code_work.assert_awaited_once()
+    store_rate_profiles.assert_not_awaited()
+    aggregate_records.assert_not_awaited()
+    store_aggregate_packs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_materializer_rejects_duplicate_binding_ordinals() -> None:
+    with pytest.raises(ValueError, match="not unique"):
+        await projection.materialize_factorized_projection(
+            object(), PROJECTION_ID, [_binding(1), _binding(1)], hashlib.sha256()
+        )
+
+
+@pytest.mark.asyncio
+async def test_materializer_work_rejection_precedes_both_writers(monkeypatch) -> None:
+    monkeypatch.setattr(projection, "_create_stage_tables", AsyncMock())
+    monkeypatch.setattr(
+        projection, "_has_staged_code_inputs", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(projection, "_materialize_provider_cells", AsyncMock())
+    persist_provider = AsyncMock()
+    monkeypatch.setattr(
+        projection, "_persist_provider_projection", persist_provider
+    )
+    monkeypatch.setattr(
+        projection,
+        "_prepare_code_work",
+        AsyncMock(side_effect=ValueError("member-cell work bound exceeded")),
+    )
+    store_rate_profiles = AsyncMock()
+    aggregate_records = AsyncMock()
+    store_aggregate_packs = AsyncMock()
+    monkeypatch.setattr(projection, "_store_rate_profiles", store_rate_profiles)
+    monkeypatch.setattr(projection, "_aggregate_records", aggregate_records)
+    monkeypatch.setattr(
+        projection, "_store_aggregate_packs", store_aggregate_packs
+    )
+
+    with pytest.raises(ValueError, match="member-cell work bound exceeded"):
+        await projection.materialize_factorized_projection(
+            object(), PROJECTION_ID, [_binding()], hashlib.sha256()
+        )
+
+    store_rate_profiles.assert_not_awaited()
+    aggregate_records.assert_not_awaited()
+    store_aggregate_packs.assert_not_awaited()
+    persist_provider.assert_not_awaited()

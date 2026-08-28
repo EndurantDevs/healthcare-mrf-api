@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import pytest
 
 from api import plan_pricing_projection_v3 as projection
-from api import ptg2_serving as serving
 from api.plan_pricing_aggregate_pack import AggregateZipRecord
 
 
@@ -18,19 +17,16 @@ PROJECTION_ID = "a" * 64
 
 class _Session:
     def __init__(
-        self, *, execute_result=None, stream_rows=(), work_rows: int = 1
+        self, *, execute_result=None, stream_rows=()
     ) -> None:
         self.calls: list[tuple[str, object]] = []
         self.execute_result = execute_result
         self.stream_rows = tuple(stream_rows)
-        self.work_rows = work_rows
         self.stream_calls: list[tuple[object, object]] = []
 
     async def execute(self, statement, parameters=None):
         statement_text = str(statement)
         self.calls.append((statement_text, parameters))
-        if "SUM(price.count)" in statement_text:
-            return SimpleNamespace(scalar_one=lambda: self.work_rows)
         return self.execute_result or SimpleNamespace()
 
     async def stream(self, statement, parameters=None):
@@ -174,9 +170,7 @@ async def test_prewarm_rows_extend_digest_in_final_rank_order() -> None:
 
 
 @pytest.mark.asyncio
-async def test_aggregate_taxonomy_rule_is_normalized_and_optional(
-    monkeypatch,
-) -> None:
+async def test_aggregate_reads_only_preflighted_member_and_set_cell_stages() -> None:
     aggregate_result = SimpleNamespace(
         mappings=lambda: [
             {
@@ -190,87 +184,12 @@ async def test_aggregate_taxonomy_rule_is_normalized_and_optional(
             }
         ]
     )
-    monkeypatch.setattr(
-        serving,
-        "_inferred_provider_taxonomy_rule",
-        lambda _code: SimpleNamespace(
-            taxonomy_codes=(" 207x00000x ", "207X00000X", " ")
-        ),
-    )
     ruled_session = _Session(execute_result=aggregate_result)
     await projection._aggregate_records(
         ruled_session, PROJECTION_ID, ("CPT", "27447")
     )
-    ruled_work_sql, _ = ruled_session.calls[0]
-    ruled_sql, ruled_parameters = ruled_session.calls[1]
-    assert "upper(btrim(taxonomy_code))" in ruled_work_sql
-    assert "upper(btrim(taxonomy_code))" in ruled_sql
-    assert "= ANY(CAST(:taxonomy_codes AS varchar[]))" in ruled_sql
-    assert ruled_parameters["taxonomy_codes"] == ["207X00000X"]
-
-    monkeypatch.setattr(
-        serving, "_inferred_provider_taxonomy_rule", lambda _code: None
-    )
-    unruled_session = _Session(execute_result=aggregate_result)
-    await projection._aggregate_records(
-        unruled_session, PROJECTION_ID, ("HCPCS", "G0439")
-    )
-    unruled_work_sql, _ = unruled_session.calls[0]
-    unruled_sql, unruled_parameters = unruled_session.calls[1]
-    assert "unnest(provider.taxonomy_codes)" not in unruled_work_sql
-    assert "unnest(provider.taxonomy_codes)" not in unruled_sql
-    assert unruled_parameters["taxonomy_codes"] is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("work_rows", "fails"), ((1, False), (2, True)))
-async def test_aggregate_work_cap_is_inclusive(
-    monkeypatch, work_rows: int, fails: bool
-) -> None:
-    from api import plan_pricing_projection_v3_aggregate as aggregate_build
-
-    monkeypatch.setattr(serving, "_inferred_provider_taxonomy_rule", lambda _code: None)
-    monkeypatch.setattr(aggregate_build, "MAX_CODE_AGGREGATE_WORK_ROWS", 1)
-    aggregate_result = SimpleNamespace(mappings=lambda: [])
-    session = _Session(execute_result=aggregate_result, work_rows=work_rows)
-    state = projection._BuildState(hashlib.sha256())
-
-    if not fails:
-        await aggregate_build._aggregate_records(
-            session,
-            PROJECTION_ID,
-            ("HCPCS", "G0439"),
-            state,
-        )
-        assert state.aggregate_work_rows == 1
-        assert len(session.calls) == 2
-        return
-
-    with pytest.raises(ValueError, match="aggregate work bound exceeded"):
-        await aggregate_build._aggregate_records(
-            session,
-            PROJECTION_ID,
-            ("HCPCS", "G0439"),
-            state,
-        )
-    assert len(session.calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_aggregate_release_work_cap_is_cumulative(monkeypatch) -> None:
-    from api import plan_pricing_projection_v3_aggregate as aggregate_build
-
-    monkeypatch.setattr(serving, "_inferred_provider_taxonomy_rule", lambda _code: None)
-    monkeypatch.setattr(
-        aggregate_build, "MAX_PROJECTION_AGGREGATE_WORK_ROWS", 1
-    )
-    state = projection._BuildState(hashlib.sha256())
-    state.aggregate_work_rows = 1
-    session = _Session(work_rows=1)
-
-    with pytest.raises(ValueError, match="aggregate work bound exceeded"):
-        await aggregate_build._aggregate_records(
-            session, PROJECTION_ID, ("HCPCS", "G0439"), state
-        )
-
-    assert len(session.calls) == 1
+    aggregate_sql, parameters = ruled_session.calls[0]
+    assert "plan_pricing_eligible_member_cell_stage" in aggregate_sql
+    assert "plan_pricing_set_cell_stage" in aggregate_sql
+    assert "plan_pricing_provider_member_stage" not in aggregate_sql
+    assert parameters is None

@@ -133,6 +133,7 @@ def test_plan_pricing_projection_postgres_runs_in_core_with_its_dsn() -> None:
         "tests/test_plan_pricing_projection_postgres.py",
         "tests/test_plan_pricing_projection_v3_postgres.py",
         "tests/test_plan_pricing_projection_v3_differential_postgres.py",
+        "tests/test_plan_pricing_projection_v3_work_postgres.py",
         "tests/test_ptg2_factorized_card_postgres.py",
     ):
         _assert_single_lifecycle_test(prepush, core_step, test_path)

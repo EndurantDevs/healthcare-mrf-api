@@ -21133,6 +21133,10 @@ def _uses_factorized_release_cards(
         return False
     if not _is_request_flag_enabled(args.get("include_providers"), default=True):
         return False
+    if normalize_ptg2_mode(args.get("mode")) == PTG2_MODE_EXACT_SOURCE:
+        raise PlanPricingProjectionUnsupported(
+            "factorized view=card does not support exact_source mode"
+        )
     requested_offset = max(int(getattr(pagination, "offset", 0) or 0), 0)
     requested_limit = max(int(getattr(pagination, "limit", 25) or 25), 1)
     if requested_offset + requested_limit > _FACTORIZED_CARD_MAX_WINDOW:
@@ -21634,7 +21638,11 @@ def _factorized_card_response(
         include_providers=True,
         projection_contract=PLAN_PRICING_PROJECTION_CONTRACT,
         source="plan_pricing_projection",
-        status="matched" if page_item_list else "no_match",
+        status=(
+            "matched"
+            if candidate_selection.minimum_rate_by_npi
+            else "no_match"
+        ),
     )
     response_by_field = {
         "result_type": "provider_cards",

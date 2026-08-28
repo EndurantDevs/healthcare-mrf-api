@@ -26,19 +26,6 @@ MAX_CODE_RATE_PROFILE_WORK_ROWS = 8_000_000
 MAX_PROJECTION_RATE_PROFILE_WORK_ROWS = 2_000_000_000
 
 
-_RATE_PROFILE_WORK_SQL = """
-    WITH price_variants AS MATERIALIZED (
-        SELECT binding_ordinal, price_set_id, COUNT(*)::bigint AS count
-          FROM plan_pricing_price_rate_stage
-         GROUP BY binding_ordinal, price_set_id
-    )
-    SELECT COALESCE(SUM(price.count), 0)::bigint
-      FROM plan_pricing_code_occurrence_stage occurrence
-      JOIN price_variants price
-        USING (binding_ordinal, price_set_id)
-"""
-
-
 _STORE_RATE_PROFILES_SQL = f"""
     INSERT INTO {table('plan_pricing_rate_profile')} (
         projection_id, code_system, code, binding_ordinal,
@@ -55,6 +42,10 @@ _STORE_RATE_PROFILES_SQL = f"""
           JOIN plan_pricing_price_rate_stage price
             ON price.binding_ordinal = occurrence.binding_ordinal
            AND price.price_set_id = occurrence.price_set_id
+          JOIN plan_pricing_provider_set_stage membership
+            ON membership.binding_ordinal = occurrence.binding_ordinal
+           AND membership.provider_set_key = occurrence.provider_set_key
+         WHERE membership.membership_count > 0
          GROUP BY occurrence.binding_ordinal, occurrence.provider_set_key,
                   price.negotiated_rate
     )
@@ -228,7 +219,6 @@ async def _insert_price_rates(
 
 async def _has_staged_code_inputs(
     session: Any,
-    projection_id: str,
     state: _BuildState,
     code_identity: tuple[str, str],
     bindings: list[BindingProjection],
@@ -238,45 +228,86 @@ async def _has_staged_code_inputs(
 ) -> bool:
     from api import ptg2_serving as serving
 
+    normalized_occurrence_count = sum(
+        serving._declared_geo_rate_count(
+            binding.code_rows_by_identity.get(code_identity) or ()
+        )
+        for binding in bindings
+    )
+    if normalized_occurrence_count > MAX_CODE_OCCURRENCES:
+        raise ValueError(
+            "pricing projection normalized occurrence bound exceeded"
+        )
     await session.execute(text("TRUNCATE plan_pricing_code_occurrence_stage"))
     await session.execute(text("TRUNCATE plan_pricing_price_rate_stage"))
     has_staged_rates = False
+    bounded_inputs = []
+    normalized_atom_count = 0
     for binding in sorted(bindings, key=_binding_ordinal):
-        code_rows = binding.code_rows_by_identity.get(code_identity)
-        if not code_rows:
-            continue
-        serving_rows, prices_by_set = await binding_code_rows(
-            session, binding, code_rows
+        bounded_input = await _bounded_binding_code_input(
+            session,
+            binding,
+            code_identity,
+            binding_code_rows,
         )
-        binding_ordinal = _binding_ordinal(binding)
-        occurrences = _code_occurrences(serving, serving_rows)
-        rates_by_price_id = {
-            price_set_id: _exact_numeric_rates(
-                prices_by_set.get(price_set_id, ())
+        if bounded_input is None:
+            continue
+        rates_by_price_id = bounded_input[3]
+        normalized_atom_count += sum(map(len, rates_by_price_id.values()))
+        if normalized_atom_count > MAX_CODE_PRICE_ATOMS:
+            raise ValueError(
+                "pricing projection normalized price-atom bound exceeded"
             )
-            for _provider_set_key, price_set_id in occurrences
-        }
-        occurrences = Counter(
-            {
-                key: count
-                for key, count in occurrences.items()
-                if rates_by_price_id[key[1]]
-            }
-        )
-        if not occurrences:
-            continue
+        bounded_inputs.append(bounded_input)
+    for binding, serving_rows, occurrences, rates_by_price_id in bounded_inputs:
         await stage_code_provider_sets(
             session,
-            projection_id,
             binding,
             serving_rows,
             {provider_set_key for provider_set_key, _ in occurrences},
             state,
         )
         has_staged_rates = True
+        binding_ordinal = _binding_ordinal(binding)
         await _insert_code_occurrences(session, binding_ordinal, occurrences)
         await _insert_price_rates(session, binding_ordinal, rates_by_price_id)
     return has_staged_rates
+
+
+async def _bounded_binding_code_input(
+    session: Any,
+    binding: BindingProjection,
+    code_identity: tuple[str, str],
+    binding_code_rows: Any,
+) -> tuple[
+    BindingProjection,
+    list[dict[str, Any]],
+    Counter[tuple[int, str]],
+    dict[str, tuple[Decimal, ...]],
+] | None:
+    code_rows = binding.code_rows_by_identity.get(code_identity)
+    if not code_rows:
+        return None
+    serving_rows, prices_by_set = await binding_code_rows(
+        session, binding, code_rows
+    )
+    from api import ptg2_serving as serving
+
+    occurrences = _code_occurrences(serving, serving_rows)
+    rates_by_price_id = {
+        price_set_id: _exact_numeric_rates(prices_by_set.get(price_set_id, ()))
+        for _provider_set_key, price_set_id in occurrences
+    }
+    occurrences = Counter(
+        {
+            key: count
+            for key, count in occurrences.items()
+            if rates_by_price_id[key[1]]
+        }
+    )
+    if not occurrences:
+        return None
+    return binding, serving_rows, occurrences, rates_by_price_id
 
 
 def _rate_profile_fragment(
@@ -332,15 +363,6 @@ async def _store_rate_profiles(
 ) -> None:
     """Persist one code's exact rate profiles and bind them into the receipt."""
 
-    work_result = await session.execute(text(_RATE_PROFILE_WORK_SQL))
-    work_rows = int(work_result.scalar_one())
-    if (
-        work_rows > MAX_CODE_RATE_PROFILE_WORK_ROWS
-        or state.rate_profile_work_rows + work_rows
-        > MAX_PROJECTION_RATE_PROFILE_WORK_ROWS
-    ):
-        raise ValueError("pricing projection rate-profile work bound exceeded")
-    state.rate_profile_work_rows += work_rows
     query_parameters_by_name = {
         "projection_id": projection_id,
         "code_system": code_identity[0],

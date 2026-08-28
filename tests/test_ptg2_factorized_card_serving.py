@@ -177,6 +177,27 @@ async def test_existing_geo_cell_without_rates_is_not_a_radius_miss(monkeypatch)
     assert response_by_field["result_state"] == "no_matching_rates"
 
 
+def test_page_beyond_exact_total_keeps_matched_query_state():
+    """An empty later page does not erase the release-wide match."""
+
+    response_by_field = serving._factorized_card_response(
+        factorized_selection(),
+        _card_args(),
+        card_pagination(limit=1, offset=1),
+        [_card_item(101, 10)],
+        serving._FactorizedCardCandidateSelection(
+            {101: Decimal("10")},
+            total_lower_bound=1,
+            total_is_exact=True,
+        ),
+        has_geo_cells=True,
+    )
+
+    assert response_by_field["items"] == []
+    assert response_by_field["result_state"] == "matched"
+    assert response_by_field["query"]["status"] == "matched"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("projection_id", "contract"),

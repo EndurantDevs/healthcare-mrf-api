@@ -109,6 +109,8 @@ class _BuildState:
     aggregate_raw_byte_count: int = 0
     aggregate_stored_byte_count: int = 0
     rate_profile_count: int = 0
+    membership_probe_work_rows: int = 0
+    member_cell_work_rows: int = 0
     rate_profile_work_rows: int = 0
     aggregate_work_rows: int = 0
 

@@ -8,7 +8,6 @@ from typing import Any, Iterable, Mapping
 import orjson
 from sqlalchemy import text
 
-from api.plan_pricing_projection_contract import table
 from api.plan_pricing_projection_materialize import digest_row
 from api.plan_pricing_projection_source import projection_provider_rows_for_npis
 from api.plan_pricing_projection_v3_types import _BuildState, _insert_batches
@@ -147,8 +146,8 @@ async def _materialize_provider_cells(
         )
         await insert_batches(
             session,
-            f"""
-            INSERT INTO {table('plan_pricing_provider_cell')} (
+            """
+            INSERT INTO plan_pricing_provider_cell_stage (
                 projection_id, geo_cell, npi, entity_type_code,
                 taxonomy_codes, fragment
             ) VALUES (

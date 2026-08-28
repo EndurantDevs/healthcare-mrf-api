@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import os
 import uuid
@@ -17,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from api import plan_pricing_projection_v3 as projection
 from api import plan_pricing_projection_v3_code as rate_profiles
+from api import plan_pricing_projection_v3_work as work_admission
 from api import ptg2_serving as serving
 from api.plan_pricing_aggregate_pack import AggregateZipRecord
 from api import plan_pricing_projection_contract as projection_contract
@@ -106,13 +106,12 @@ def _provider_cell(
 
 async def _insert_provider_cells(
     connection,
-    schema: str,
     projection_id: str,
 ) -> None:
     await connection.execute(
         text(
-            f"""
-            INSERT INTO "{schema}".plan_pricing_provider_cell (
+            """
+            INSERT INTO plan_pricing_provider_cell_stage (
                 projection_id, geo_cell, npi, entity_type_code,
                 taxonomy_codes, fragment
             ) VALUES (
@@ -123,6 +122,7 @@ async def _insert_provider_cells(
         ),
         [
             _provider_cell(projection_id, 1000000001, "10001", 1, " 207x00000x "),
+            _provider_cell(projection_id, 1000000001, "10003", 1, " 207x00000x "),
             _provider_cell(projection_id, 1000000002, "10001", 1, "208D00000X"),
             _provider_cell(projection_id, 1000000003, "10001", 2, "207X00000X"),
             _provider_cell(projection_id, 1000000004, "10002", 1, "207X00000X"),
@@ -207,23 +207,36 @@ async def _stage_rows(connection, memberships, occurrences, rates) -> None:
 
 async def _aggregate_records(
     connection,
+    projection_id: str,
+    code_identity: tuple[str, str],
+) -> tuple[AggregateZipRecord, ...]:
+    return await projection._aggregate_records(
+        connection, projection_id, code_identity
+    )
+
+
+async def _prepare_code_work_under_limits(
+    connection,
     monkeypatch,
     schema: str,
     projection_id: str,
     code_identity: tuple[str, str],
     taxonomy_codes: tuple[str, ...] | None,
-) -> tuple[AggregateZipRecord, ...]:
-    aggregate_sql = projection._AGGREGATE_STATS_SQL.replace(
-        table("plan_pricing_provider_cell"),
-        f'"{schema}"."plan_pricing_provider_cell"',
-    )
-    aggregate_work_sql = projection._AGGREGATE_WORK_SQL.replace(
-        table("plan_pricing_provider_cell"),
-        f'"{schema}"."plan_pricing_provider_cell"',
-    )
+    **limit_overrides: int,
+):
+    state = _BuildState(hashlib.sha256())
     with monkeypatch.context() as scoped:
-        scoped.setattr(projection, "_AGGREGATE_STATS_SQL", aggregate_sql)
-        scoped.setattr(projection, "_AGGREGATE_WORK_SQL", aggregate_work_sql)
+        scoped.setattr(projection_contract, "SCHEMA", schema)
+        scoped.setattr(work_admission, "MAX_CODE_MEMBERSHIP_PROBES", 100)
+        scoped.setattr(
+            work_admission, "MAX_PROJECTION_MEMBERSHIP_PROBES", 1_000
+        )
+        scoped.setattr(work_admission, "MAX_CODE_MEMBER_CELL_WORK_ROWS", 100)
+        scoped.setattr(
+            work_admission, "MAX_PROJECTION_MEMBER_CELL_WORK_ROWS", 1_000
+        )
+        for field_name, limit_value in limit_overrides.items():
+            scoped.setattr(work_admission, field_name, limit_value)
         scoped.setattr(
             serving,
             "_inferred_provider_taxonomy_rule",
@@ -233,9 +246,10 @@ async def _aggregate_records(
                 else None
             ),
         )
-        return await projection._aggregate_records(
-            connection, projection_id, code_identity
+        prepared_work = await work_admission._prepare_code_work(
+            connection, projection_id, code_identity, state
         )
+    return prepared_work, state
 
 
 async def _stored_rate_profiles(
@@ -291,6 +305,32 @@ def _assert_three_binding_rate_profiles(stored_profiles) -> None:
     ]
 
 
+async def _stage_three_binding_inputs(connection) -> None:
+    await _stage_rows(
+        connection,
+        [
+            _membership(0, 10, 1000000001),
+            _membership(0, 10, 1000000002),
+            _membership(1, 20, 1000000002),
+            _membership(1, 20, 1000000003),
+            _membership(2, 30, 1000000001),
+            _membership(2, 30, 1000000004),
+        ],
+        [
+            _occurrence(0, 10, "a", 2),
+            _occurrence(1, 20, "b"),
+            _occurrence(2, 30, "c"),
+        ],
+        [
+            _rate(0, "a", "10", 2),
+            _rate(0, "a", "20"),
+            _rate(1, "b", "30"),
+            _rate(2, "c", "40"),
+            _rate(2, "c", "50"),
+        ],
+    )
+
+
 @pytest.mark.asyncio
 async def test_v3_sql_preserves_three_binding_multiplicity_and_union(
     monkeypatch,
@@ -300,30 +340,16 @@ async def test_v3_sql_preserves_three_binding_multiplicity_and_union(
     projection_id = "a" * 64
     async with database.engine.begin() as connection:
         await _insert_candidate(connection, database.schema, projection_id)
-        await _insert_provider_cells(connection, database.schema, projection_id)
         await projection._create_stage_tables(connection)
-        await _stage_rows(
+        await _insert_provider_cells(connection, projection_id)
+        await _stage_three_binding_inputs(connection)
+        prepared_work, work_state = await _prepare_code_work_under_limits(
             connection,
-            [
-                _membership(0, 10, 1000000001),
-                _membership(0, 10, 1000000002),
-                _membership(1, 20, 1000000002),
-                _membership(1, 20, 1000000003),
-                _membership(2, 30, 1000000001),
-                _membership(2, 30, 1000000004),
-            ],
-            [
-                _occurrence(0, 10, "a", 2),
-                _occurrence(1, 20, "b"),
-                _occurrence(2, 30, "c"),
-            ],
-            [
-                _rate(0, "a", "10", 2),
-                _rate(0, "a", "20"),
-                _rate(1, "b", "30"),
-                _rate(2, "c", "40"),
-                _rate(2, "c", "50"),
-            ],
+            monkeypatch,
+            database.schema,
+            projection_id,
+            ("HCPCS", "G0439"),
+            None,
         )
         stored_profiles, profile_state = await _stored_rate_profiles(
             connection,
@@ -334,18 +360,49 @@ async def test_v3_sql_preserves_three_binding_multiplicity_and_union(
         )
         actual_records = await _aggregate_records(
             connection,
-            monkeypatch,
-            database.schema,
             projection_id,
             ("HCPCS", "G0439"),
-            None,
         )
     assert actual_records == (
         AggregateZipRecord("10001", 3, 9, Decimal("10"), Decimal("20"), Decimal("50")),
         AggregateZipRecord("10002", 1, 2, Decimal("40"), Decimal("45"), Decimal("50")),
+        AggregateZipRecord("10003", 1, 8, Decimal("10"), Decimal("15"), Decimal("50")),
     )
+    assert prepared_work == work_admission._CodeWork(6, 8, 6, 5, 11, 9, 6, 19, 9)
+    assert (
+        work_state.membership_probe_work_rows,
+        work_state.member_cell_work_rows,
+        work_state.rate_profile_work_rows,
+        work_state.aggregate_work_rows,
+    ) == (6, 8, 5, 11)
     assert profile_state.rate_profile_count == 3
     _assert_three_binding_rate_profiles(stored_profiles)
+
+
+async def _assert_ruled_work_caps(
+    connection,
+    monkeypatch,
+    schema: str,
+    projection_id: str,
+) -> None:
+    common_args = (
+        connection,
+        monkeypatch,
+        schema,
+        projection_id,
+        ("CPT", "27447"),
+        ("207X00000X",),
+    )
+    with pytest.raises(ValueError, match="membership-probe"):
+        await _prepare_code_work_under_limits(
+            *common_args,
+            MAX_CODE_MEMBERSHIP_PROBES=4,
+        )
+    with pytest.raises(ValueError, match="member-cell"):
+        await _prepare_code_work_under_limits(
+            *common_args,
+            MAX_CODE_MEMBER_CELL_WORK_ROWS=6,
+        )
 
 
 @pytest.mark.asyncio
@@ -357,8 +414,8 @@ async def test_v3_sql_normalizes_ruled_taxonomy_across_two_bindings(
     projection_id = "b" * 64
     async with database.engine.begin() as connection:
         await _insert_candidate(connection, database.schema, projection_id)
-        await _insert_provider_cells(connection, database.schema, projection_id)
         await projection._create_stage_tables(connection)
+        await _insert_provider_cells(connection, projection_id)
         await _stage_rows(
             connection,
             [
@@ -377,7 +434,10 @@ async def test_v3_sql_normalizes_ruled_taxonomy_across_two_bindings(
                 _rate(1, "c", "50"),
             ],
         )
-        actual_records = await _aggregate_records(
+        await _assert_ruled_work_caps(
+            connection, monkeypatch, database.schema, projection_id
+        )
+        prepared_work, _state = await _prepare_code_work_under_limits(
             connection,
             monkeypatch,
             database.schema,
@@ -385,84 +445,14 @@ async def test_v3_sql_normalizes_ruled_taxonomy_across_two_bindings(
             ("CPT", "27447"),
             ("207X00000X",),
         )
+        actual_records = await _aggregate_records(
+            connection,
+            projection_id,
+            ("CPT", "27447"),
+        )
     assert actual_records == (
         AggregateZipRecord("10001", 1, 3, Decimal("10"), Decimal("20"), Decimal("30")),
         AggregateZipRecord("10002", 1, 2, Decimal("40"), Decimal("45"), Decimal("50")),
+        AggregateZipRecord("10003", 1, 3, Decimal("10"), Decimal("20"), Decimal("30")),
     )
-
-
-async def _cancelled_build(
-    engine: AsyncEngine,
-    schema: str,
-    projection_id: str,
-    inserted: asyncio.Event,
-) -> None:
-    async with engine.begin() as connection:
-        await _insert_candidate(connection, schema, projection_id)
-        await connection.execute(
-            text(
-                f"""INSERT INTO "{schema}".plan_pricing_provider_membership
-                    (projection_id, binding_ordinal, provider_set_key, npi)
-                    VALUES (:projection_id, 0, 1, 1000000001)"""
-            ),
-            {"projection_id": projection_id},
-        )
-        await connection.execute(
-            text(
-                f"""INSERT INTO "{schema}".plan_pricing_provider_cell
-                    (projection_id, geo_cell, npi, entity_type_code,
-                     taxonomy_codes, fragment)
-                    VALUES (:projection_id, '10001', 1000000001, 1,
-                            ARRAY['207X00000X'], :fragment)"""
-            ),
-            {"projection_id": projection_id, "fragment": b"{}"},
-        )
-        await connection.execute(
-            text(
-                f"""INSERT INTO "{schema}".plan_pricing_rate_profile (
-                    projection_id, code_system, code, binding_ordinal,
-                    provider_set_key, membership_count,
-                    minimum_negotiated_rate, maximum_negotiated_rate,
-                    rate_count, negotiated_rates, rate_multiplicities
-                ) VALUES (
-                    :projection_id, 'CPT', '27447', 0, 1, 1,
-                    10, 10, 1, ARRAY[10]::numeric[], ARRAY[1]::bigint[]
-                )"""
-            ),
-            {"projection_id": projection_id},
-        )
-        inserted.set()
-        await asyncio.Future()
-
-
-@pytest.mark.asyncio
-async def test_cancelled_transaction_leaves_no_candidate_or_child_rows(
-    migrated_v3_database,
-) -> None:
-    database = migrated_v3_database
-    projection_id = "c" * 64
-    inserted = asyncio.Event()
-    build_task = asyncio.create_task(
-        _cancelled_build(database.engine, database.schema, projection_id, inserted)
-    )
-    await asyncio.wait_for(inserted.wait(), timeout=2)
-    build_task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(build_task, timeout=2)
-
-    async with database.engine.connect() as connection:
-        counts = await connection.execute(
-            text(
-                f"""SELECT
-                  (SELECT COUNT(*) FROM "{database.schema}".
-                    plan_pricing_projection_candidate WHERE projection_id = :id),
-                  (SELECT COUNT(*) FROM "{database.schema}".
-                    plan_pricing_provider_membership WHERE projection_id = :id),
-                  (SELECT COUNT(*) FROM "{database.schema}".
-                    plan_pricing_provider_cell WHERE projection_id = :id),
-                  (SELECT COUNT(*) FROM "{database.schema}".
-                    plan_pricing_rate_profile WHERE projection_id = :id)"""
-            ),
-            {"id": projection_id},
-        )
-        assert counts.one() == (0, 0, 0, 0)
+    assert prepared_work == work_admission._CodeWork(5, 7, 5, 5, 8, 5, 2, 8, 3)

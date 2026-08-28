@@ -237,6 +237,15 @@ async def test_session_builder_reuses_exact_candidate_under_lock(monkeypatch):
         "role": "in_network",
         "ordinal": 0,
     }
+    binding_digest = projection_contract.serving_revision_binding_digest(
+        [binding_by_field]
+    )
+    with pytest.raises(ValueError, match="does not match bindings"):
+        await projection_build.build_in_session(
+            object(),
+            binding_manifest_digest="b" * 64,
+            bindings=[binding_by_field],
+        )
 
     async def provider_signature(_session):
         return "c" * 64
@@ -246,11 +255,11 @@ async def test_session_builder_reuses_exact_candidate_under_lock(monkeypatch):
 
     monkeypatch.setattr(projection_build, "provider_signature", provider_signature)
     monkeypatch.setattr(projection_build, "_existing_candidate_receipt", existing)
-    candidate_id = projection_contract.projection_id("b" * 64, "c" * 64)
+    candidate_id = projection_contract.projection_id(binding_digest, "c" * 64)
     reuse_session = _ResultSession()
     assert await projection_build.build_in_session(
         reuse_session,
-        binding_manifest_digest="b" * 64,
+        binding_manifest_digest=binding_digest,
         bindings=[binding_by_field],
     ) == {"state": "ready"}
     assert "pg_advisory_xact_lock" in reuse_session.statements[0][0]
@@ -266,6 +275,9 @@ async def test_session_builder_builds_exact_candidate_under_lock(monkeypatch):
         "role": "in_network",
         "ordinal": 0,
     }
+    binding_digest = projection_contract.serving_revision_binding_digest(
+        [binding_by_field]
+    )
     calls = []
 
     async def provider_signature(_session):
@@ -303,11 +315,11 @@ async def test_session_builder_builds_exact_candidate_under_lock(monkeypatch):
         validate,
     )
     monkeypatch.setattr(projection_build, "_seal_candidate", seal)
-    candidate_id = projection_contract.projection_id("b" * 64, "c" * 64)
+    candidate_id = projection_contract.projection_id(binding_digest, "c" * 64)
     build_session = _ResultSession()
     assert await projection_build.build_in_session(
         build_session,
-        binding_manifest_digest="b" * 64,
+        binding_manifest_digest=binding_digest,
         bindings=[binding_by_field],
     ) == {"state": "ready"}
     assert "pg_advisory_xact_lock" in build_session.statements[0][0]
@@ -383,6 +395,17 @@ def test_projection_contract_identity_and_valid_binding_are_stable():
     assert projection_contract.normalized_bindings([binding_by_field]) == [
         binding_by_field
     ]
+    assert projection_contract.serving_revision_binding_digest(
+        [
+            {
+                "snapshot_id": "s",
+                "source_key": "k",
+                "plan_id": "p",
+                "role": "in_network",
+                "ordinal": 0,
+            }
+        ]
+    ) == "6df220ef20b12d220ad0fa51fc74233d0eb6377beeb503436ea0b11ef22acccc"
     assert len(projection_contract.projection_id("b" * 64, "c" * 64)) == 64
     assert projection_contract.projection_code_identity(None, "27447") is None
 
