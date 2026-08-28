@@ -43,7 +43,11 @@ def test_kubernetes_worker_job_uses_resource_profile(monkeypatch):
     assert env_by_name["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == "ptg_start_run_ptg"
 
 
-def test_kubernetes_hospital_worker_targets_exact_job():
+def test_kubernetes_hospital_worker_targets_exact_job(monkeypatch):
+    monkeypatch.setenv(
+        "HLTHPRT_HOSPITAL_PRICE_WORKER_JOB_PRIORITY_CLASS",
+        "ci-nonpreempting",
+    )
     spec = control_workers._BY_QUEUE["arq:HospitalPrices"]
     job = control_workers._worker_job_manifest(
         spec,
@@ -54,6 +58,9 @@ def test_kubernetes_hospital_worker_targets_exact_job():
         "healthcare-mrf-api:test",
     )
     container = job["spec"]["template"]["spec"]["containers"][0]
+    assert job["spec"]["template"]["spec"]["priorityClassName"] == (
+        "ci-nonpreempting"
+    )
     env_by_name = {entry["name"]: entry["value"] for entry in container["env"]}
 
     assert container["command"][-2:] == ["worker-once", "process.HospitalPrices"]

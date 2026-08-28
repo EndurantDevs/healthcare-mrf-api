@@ -87,14 +87,14 @@ async def test_main_creates_one_controlled_import_run(monkeypatch, npi_module):
     create_run = AsyncMock(
         return_value=({"run_id": "run_npi", "status": "queued"}, True)
     )
-    ensure_table = AsyncMock()
+    ensure_table = AsyncMock(side_effect=AssertionError("workers must not run schema DDL"))
     monkeypatch.setattr(control_imports, "create_import_run", create_run)
     monkeypatch.setattr(control_imports, "ensure_import_run_table", ensure_table)
 
     result = await npi_module.main()
 
     assert result == {"run_id": "run_npi", "status": "queued"}
-    ensure_table.assert_awaited_once_with()
+    ensure_table.assert_not_awaited()
     create_run.assert_awaited_once_with(
         {
             "importer": "npi",

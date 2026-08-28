@@ -2806,9 +2806,8 @@ async def main(test_mode: bool = False):  # pragma: no cover
         raise ValueError(
             "NPI test mode requires an isolated database and cannot use the live queue"
         )
-    from api.control_imports import create_import_run, ensure_import_run_table
+    from api.control_imports import create_import_run
 
-    await ensure_import_run_table()
     run, _ = await create_import_run({
         "importer": "npi",
         "params": {},
