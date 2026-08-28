@@ -4886,48 +4886,63 @@ hospitals:
 - hospital_id: hospital-001504
   name: CommonSpirit Bob Wilson Memorial Hospital
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/ugisgfupgt/original/480543721-1235826454_commonspirit-kansas-inc_standardcharges.csv
 - hospital_id: hospital-001505
   name: CommonSpirit Longmont United Hospital
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/ltomberpry/original/840460697-1366465866_longmont-united-hospital_standardcharges.csv
 - hospital_id: hospital-001506
   name: CommonSpirit Mercy Hospital
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/bhvbjmdw4x/original/840405257-1083611644_catholic-health-initiatives-colorado_standardcharges.csv
 - hospital_id: hospital-001507
   name: CommonSpirit OrthoColorado Hospital
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/ymkobav4g8/original/371577105-1306176839_orthocolorado-llc_standardcharges.csv
 - hospital_id: hospital-001508
   name: CommonSpirit St Anthony Hospital
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/jqh1qzx0xv/original/840405257-1164430567_catholic-health-initiatives-colorado_standardcharges.csv
 - hospital_id: hospital-001509
   name: CommonSpirit St Anthony North Hospital
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/cqpbwbpelz/original/840405257-1619985942_catholic-health-iniatives-colorado_standardcharges.csv
 - hospital_id: hospital-001510
   name: CommonSpirit St Anthony North Hospital ER
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/cqpbwbpelz/original/840405257-1619985942_catholic-health-iniatives-colorado_standardcharges.csv
 - hospital_id: hospital-001511
   name: CommonSpirit St Anthony Summit Hospital
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/qoo2ibsdos/original/840405257-1720096092_catholic-health-initiatives-colorado_standardcharges.csv
 - hospital_id: hospital-001512
   name: CommonSpirit St Catherine Hospital - Dodge City
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/io4ekzbiq8/original/480543721-1689317190_commonspirit-kansas-inc_standardcharges.csv
 - hospital_id: hospital-001513
   name: CommonSpirit St Catherine Hospital - Garden City
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/ms8t36akxk/original/480543721-1659360196_commonspirit-kansas-inc_standardcharges.csv
 - hospital_id: hospital-001514
   name: CommonSpirit St Elizabeth Hospital
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/awlxee7uli/original/840405257-1881337392_catholic-health-initiatives-colorado_standardcharges.csv
 - hospital_id: hospital-001515
   name: CommonSpirit St Francis Hospital
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/dhzssnfvo0/original/840405257-1932112125_catholic-health-initiatives-colorado-st-francis-medical-center_standardcharges.csv
 - hospital_id: hospital-001516
   name: CommonSpirit St Francis Hospital - Interquest
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/zvl907epn2/original/840405257-1295431765_catholic-health-initiatives-colorado_standardcharges.csv
 - hospital_id: hospital-001517
   name: CommonSpirit St Mary-Corwin Hospital
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/03nxkoxsw8/original/840405257-1306857974_catholic-health-initiatives-colorado_standardcharges.csv
 - hospital_id: hospital-001518
   name: CommonSpirit St Thomas More Hospital
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://csdam.widen.net/content/2auijugc1s/original/840405257-1922012350_catholic-health-initiatives-colorado_standardcharges.csv
 - hospital_id: hospital-001519
   name: Community Behavioral Health Center
   cms_hpt_url: https://communitymedical.org/cms-hpt.txt
