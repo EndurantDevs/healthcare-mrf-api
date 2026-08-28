@@ -31,6 +31,44 @@
                     CompressionMethod::Stored,
                 ),
             ),
+            (
+                "appledouble-only",
+                zip_bytes(
+                    &[("__MACOSX/._prices.json", b"metadata")],
+                    CompressionMethod::Stored,
+                ),
+            ),
+            (
+                "mismatched-appledouble",
+                zip_bytes(
+                    &[
+                        ("prices.json", &fixture_json()),
+                        ("__MACOSX/._other.json", b"metadata"),
+                    ],
+                    CompressionMethod::Stored,
+                ),
+            ),
+            (
+                "arbitrary-extra",
+                zip_bytes(
+                    &[
+                        ("prices.json", &fixture_json()),
+                        ("__MACOSX/._prices.json", b"metadata"),
+                        ("README.txt", b"metadata"),
+                    ],
+                    CompressionMethod::Stored,
+                ),
+            ),
+            (
+                "ooxml",
+                zip_bytes(
+                    &[
+                        ("[Content_Types].xml", b"<Types/>"),
+                        ("xl/workbook.xml", b"<workbook/>"),
+                    ],
+                    CompressionMethod::Stored,
+                ),
+            ),
             ("nested", nested),
         ];
         for (_, bytes) in cases {

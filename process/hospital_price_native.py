@@ -107,6 +107,47 @@ def _max_decompressed_bytes(value: int | None = None) -> int:
     return limit
 
 
+def _is_matching_appledouble_member(sidecar_name: str, payload_name: str) -> bool:
+    if payload_name.startswith("__MACOSX/"):
+        return False
+    payload_parent, _, payload_basename = payload_name.rpartition("/")
+    sidecar_path = sidecar_name.removeprefix("__MACOSX/")
+    sidecar_parent, _, sidecar_basename = sidecar_path.rpartition("/")
+    return (
+        sidecar_path != sidecar_name
+        and bool(payload_basename)
+        and sidecar_parent == payload_parent
+        and sidecar_basename == f"._{payload_basename}"
+    )
+
+
+def _select_zip_payload_member(archive: zipfile.ZipFile) -> zipfile.ZipInfo:
+    members = [member for member in archive.infolist() if not member.is_dir()]
+    if any(member.flag_bits & 1 for member in members):
+        raise ValueError("ZIP hospital MRF member must not be encrypted")
+    if any(
+        member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+        for member in members
+    ):
+        raise ValueError("ZIP hospital MRF compression method is unsupported")
+    if len(members) == 1:
+        member = members[0]
+        if member.filename.startswith("__MACOSX/") and member.filename.rsplit(
+            "/", 1
+        )[-1].startswith("._"):
+            raise ValueError("ZIP hospital MRF must contain exactly one file")
+        return member
+    if len(members) == 2 and _is_matching_appledouble_member(
+        members[0].filename, members[1].filename
+    ):
+        return members[1]
+    if len(members) == 2 and _is_matching_appledouble_member(
+        members[1].filename, members[0].filename
+    ):
+        return members[0]
+    raise ValueError("ZIP hospital MRF must contain exactly one file")
+
+
 @contextmanager
 def _open_payload(path: Path, max_decompressed_bytes: int) -> Iterator[BinaryIO]:
     read_limit = min(
@@ -117,18 +158,7 @@ def _open_payload(path: Path, max_decompressed_bytes: int) -> Iterator[BinaryIO]
     if magic in _ZIP_MAGICS or path.suffix.casefold() == ".zip":
         try:
             with zipfile.ZipFile(path) as archive:
-                members = [
-                    archive_entry
-                    for archive_entry in archive.infolist()
-                    if not archive_entry.is_dir()
-                ]
-                if len(members) != 1:
-                    raise ValueError("ZIP hospital MRF must contain exactly one file")
-                member = members[0]
-                if member.flag_bits & 1:
-                    raise ValueError("ZIP hospital MRF member must not be encrypted")
-                if member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
-                    raise ValueError("ZIP hospital MRF compression method is unsupported")
+                member = _select_zip_payload_member(archive)
                 if member.file_size > max_decompressed_bytes:
                     raise ValueError(
                         "ZIP hospital MRF decompressed size exceeds its configured limit"
