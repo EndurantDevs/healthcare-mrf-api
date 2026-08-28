@@ -94,6 +94,105 @@ def test_policy_is_exact_canonical_private_and_fail_closed() -> None:
     assert invalid_price_exclusion_source_expectation(policy, "33" * 32) is None
 
 
+@pytest.mark.parametrize(
+    "case_name",
+    (
+        "invalid-sha",
+        "invalid-count",
+        "empty-value",
+        "entry-fields",
+        "empty-entries",
+        "duplicate-coordinates",
+        "emptied-rate-count",
+        "source-fields",
+        "source-entries",
+        "empty-sources",
+        "duplicate-sources",
+        "policy-fields",
+        "policy-contract",
+        "expectation-type",
+        "expectation-mismatch",
+        "source-evidence-fields",
+        "source-evidence-contract",
+        "source-evidence-counts",
+        "evidence-fields",
+        "evidence-contract",
+        "evidence-counts",
+    ),
+)
+def test_policy_rejects_noncanonical_trust_boundary_inputs(case_name: str) -> None:
+    entry = _entry(4, "2027-02-30")
+    source = _source("11" * 32, 4)
+    policy = invalid_price_exclusion_policy([source])
+    expectation = invalid_price_exclusion_source_expectation(policy, "11" * 32)
+    source_evidence = invalid_price_exclusion_source_evidence(expectation)
+    evidence = invalid_price_exclusion_evidence(policy)
+    invalid_calls = {
+        "invalid-sha": lambda: invalid_price_exclusion_source(
+            raw_source_sha256="x" * 64,
+            entries=[entry],
+            emptied_rate_count=0,
+        ),
+        "invalid-count": lambda: invalid_price_exclusion_source(
+            raw_source_sha256="11" * 32,
+            entries=[{**entry, "object_ordinal": -1}],
+            emptied_rate_count=0,
+        ),
+        "empty-value": lambda: invalid_price_value_sha256(""),
+        "entry-fields": lambda: invalid_price_exclusion_source(
+            raw_source_sha256="11" * 32,
+            entries=[{}],
+            emptied_rate_count=0,
+        ),
+        "empty-entries": lambda: invalid_price_exclusion_source(
+            raw_source_sha256="11" * 32,
+            entries=[],
+            emptied_rate_count=0,
+        ),
+        "duplicate-coordinates": lambda: invalid_price_exclusion_source(
+            raw_source_sha256="11" * 32,
+            entries=[entry, entry],
+            emptied_rate_count=0,
+        ),
+        "emptied-rate-count": lambda: invalid_price_exclusion_source(
+            raw_source_sha256="11" * 32,
+            entries=[entry],
+            emptied_rate_count=2,
+        ),
+        "source-fields": lambda: invalid_price_exclusion_policy([{}]),
+        "source-entries": lambda: invalid_price_exclusion_policy(
+            [{**source, "entries": tuple(source["entries"])}]
+        ),
+        "empty-sources": lambda: invalid_price_exclusion_policy([]),
+        "duplicate-sources": lambda: invalid_price_exclusion_policy([source, source]),
+        "policy-fields": lambda: validate_invalid_price_exclusion_policy({}),
+        "policy-contract": lambda: validate_invalid_price_exclusion_policy(
+            {**policy, "contract": "incompatible"}
+        ),
+        "expectation-type": lambda: invalid_price_exclusion_source_evidence(None),
+        "expectation-mismatch": lambda: invalid_price_exclusion_source_evidence(
+            {**expectation, "unexpected": True}
+        ),
+        "source-evidence-fields": lambda: validate_invalid_price_exclusion_source_evidence({}),
+        "source-evidence-contract": lambda: validate_invalid_price_exclusion_source_evidence(
+            {**source_evidence, "contract": "incompatible"}
+        ),
+        "source-evidence-counts": lambda: validate_invalid_price_exclusion_source_evidence(
+            {**source_evidence, "excluded_price_count": 0}
+        ),
+        "evidence-fields": lambda: validate_invalid_price_exclusion_evidence({}),
+        "evidence-contract": lambda: validate_invalid_price_exclusion_evidence(
+            {**evidence, "contract": "incompatible"}
+        ),
+        "evidence-counts": lambda: validate_invalid_price_exclusion_evidence(
+            {**evidence, "excluded_price_count": 0}
+        ),
+    }
+
+    with pytest.raises(ValueError, match="invalid price exclusion"):
+        invalid_calls[case_name]()
+
+
 def test_candidate_evidence_is_exactly_bound_to_policy_and_sources() -> None:
     policy = invalid_price_exclusion_policy([_source("11" * 32, 4)])
     evidence = invalid_price_exclusion_evidence(policy)
@@ -138,11 +237,19 @@ def test_candidate_evidence_is_exactly_bound_to_policy_and_sources() -> None:
             changed_evidence_by_name,
             ("11" * 32,),
         )
+    with pytest.raises(ValueError, match="evidence is incompatible"):
+        validate_candidate_invalid_price_exclusion_evidence(
+            policy,
+            {},
+            evidence,
+            ("11" * 32,),
+        )
 
 
 def test_candidate_policy_uses_exact_singleton_or_matching_frozen_binding() -> None:
     policy = invalid_price_exclusion_policy([_source("11" * 32, 4)])
 
+    assert validated_candidate_invalid_price_exclusion_policy(None, None, ()) is None
     assert validated_candidate_invalid_price_exclusion_policy(
         policy,
         None,

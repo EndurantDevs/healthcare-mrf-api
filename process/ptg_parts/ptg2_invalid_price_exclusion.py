@@ -199,8 +199,6 @@ def invalid_price_exclusion_policy(
         _source_expectation(source_by_name)
     excluded_price_count = sum(len(source_by_field["entries"]) for source_by_field in canonical_sources)
     emptied_rate_count = sum(source_by_field["emptied_rate_count"] for source_by_field in canonical_sources)
-    if excluded_price_count >= 2**64 or emptied_rate_count >= 2**64:
-        raise ValueError("invalid price exclusion aggregate count overflows uint64")
     return {
         "contract": PTG2_INVALID_PRICE_EXCLUSION_CONTRACT,
         "reason": PTG2_INVALID_PRICE_EXCLUSION_REASON,

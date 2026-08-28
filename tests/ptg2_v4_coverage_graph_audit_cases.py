@@ -168,6 +168,23 @@ async def _assert_physical_block_reads(monkeypatch, reference) -> None:
     assert request_io.database_blocks == 1
     assert request_io.cache_hit_bytes == len(target_payload)
 
+    with pytest.raises(PTG2SharedBlockError, match="unexpected block"):
+        graph._cache_database_physical_blocks(
+            (physical_row_by_field,),
+            object_kind=reference.object_kind,
+            maximum_raw_bytes=16,
+            coordinate_by_hash={},
+            blocks_by_hash={},
+        )
+    with pytest.raises(PTG2SharedBlockError, match="entry count is inconsistent"):
+        graph._cache_database_physical_blocks(
+            ({**physical_row_by_field, "block_entry_count": 1},),
+            object_kind=reference.object_kind,
+            maximum_raw_bytes=16,
+            coordinate_by_hash={target_hash: coordinate},
+            blocks_by_hash={},
+        )
+
 
 def _assert_graph_validation_helpers(root) -> None:
     with pytest.raises(RuntimeError, match="request scope"):

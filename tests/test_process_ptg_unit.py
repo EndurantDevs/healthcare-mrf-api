@@ -230,6 +230,25 @@ def test_shared_v4_empty_npi_evidence_rejects_digest_tamper():
         process_ptg._sum_v4_tin_only_audits(file_results)
 
 
+def test_shared_v4_empty_npi_evidence_rejects_aggregate_overflow():
+    file_results = [
+        {
+            "summary": {
+                "scanner": {
+                    "summary": {
+                        "empty_npi_tin_only_normalization": (
+                            _v4_empty_npi_normalization_payload(2**63)
+                        )
+                    }
+                }
+            }
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="count overflow"):
+        process_ptg._sum_v4_tin_only_audits(file_results)
+
+
 @pytest.mark.parametrize(
     ("normalization_audit", "expected_error"),
     [
@@ -7369,6 +7388,15 @@ def test_ptg2_rust_compact_binds_exact_invalid_price_exclusion(monkeypatch, tmp_
     )
 
     assert json.loads(captured_env_map[ptg_rust_scanner._INVALID_PRICE_EXCLUSION_ENV]) == expectation
+    with pytest.raises(RuntimeError, match="unauthorized invalid-price exclusion"):
+        ptg_rust_scanner._validate_v3_scanner_summary(
+            {"invalid_price_exclusion": evidence}
+        )
+    with pytest.raises(RuntimeError, match="invalid invalid-price exclusion"):
+        ptg_rust_scanner._validate_v3_scanner_summary(
+            {"invalid_price_exclusion": {}},
+            invalid_price_exclusion=expectation,
+        )
     with pytest.raises(RuntimeError, match="evidence changed"):
         ptg_rust_scanner._validate_v3_scanner_summary(
             {
@@ -7379,6 +7407,77 @@ def test_ptg2_rust_compact_binds_exact_invalid_price_exclusion(monkeypatch, tmp_
             },
             invalid_price_exclusion=expectation,
         )
+    with pytest.raises(RuntimeError, match="expectation is invalid"):
+        _run_rust_scanner_with_exclusion(
+            monkeypatch,
+            tmp_path,
+            raw_source_sha256,
+            {},
+            evidence,
+        )
+    with pytest.raises(RuntimeError, match="source does not match"):
+        _run_rust_scanner_with_exclusion(
+            monkeypatch,
+            tmp_path,
+            "c" * 64,
+            expectation,
+            evidence,
+        )
+
+
+def test_invalid_price_exclusion_publication_is_exact_and_fail_closed():
+    raw_source_sha256, policy = _invalid_price_policy()
+    expectation = ptg_invalid_price_exclusion.invalid_price_exclusion_source_expectation(
+        policy,
+        raw_source_sha256,
+    )
+    source_evidence = ptg_invalid_price_exclusion.invalid_price_exclusion_source_evidence(
+        expectation
+    )
+    aggregate_evidence = ptg_invalid_price_exclusion.invalid_price_exclusion_evidence(policy)
+
+    def source_result(observed, *, raw_sha256=raw_source_sha256):
+        return {
+            "summary": {
+                "raw_sha256": raw_sha256,
+                "scanner": {"summary": {"invalid_price_exclusion": observed}},
+            }
+        }
+
+    assert process_ptg._invalid_price_exclusion_publication_evidence(None, []) is None
+    assert process_ptg._invalid_price_exclusion_publication_evidence(
+        policy,
+        [{"skipped": True}, source_result(source_evidence)],
+    ) == aggregate_evidence
+    with pytest.raises(RuntimeError, match="did not observe every"):
+        process_ptg._invalid_price_exclusion_publication_evidence(
+            policy,
+            [{"summary": None}],
+        )
+    with pytest.raises(RuntimeError, match="unauthorized"):
+        process_ptg._invalid_price_exclusion_publication_evidence(
+            policy,
+            [source_result(source_evidence, raw_sha256="c" * 64)],
+        )
+    with pytest.raises(RuntimeError, match="invalid invalid-price"):
+        process_ptg._invalid_price_exclusion_publication_evidence(
+            policy,
+            [source_result({})],
+        )
+    with pytest.raises(RuntimeError, match="evidence changed"):
+        process_ptg._invalid_price_exclusion_publication_evidence(
+            policy,
+            [source_result({**source_evidence, "sha256": "c" * 64})],
+        )
+
+    downloaded = SimpleNamespace(
+        raw_artifact=SimpleNamespace(raw_sha256=raw_source_sha256)
+    )
+    assert process_ptg._source_invalid_price_exclusion_expectation({}, downloaded) is None
+    assert process_ptg._source_invalid_price_exclusion_expectation(
+        {"invalid_price_exclusion_policy": policy},
+        downloaded,
+    ) == expectation
 
 
 def test_direct_frozen_params_do_not_invent_optional_policy():
@@ -7396,6 +7495,13 @@ def test_direct_frozen_params_do_not_invent_optional_policy():
     assert normalized["source_file_import_id"] == "source-file-import-001"
     assert "invalid_price_exclusion_policy" not in normalized
     assert process_ptg._normalized_direct_frozen_params({}) == {}
+    direct = process_ptg._normalized_direct_frozen_params(
+        {
+            "source_file_import_id": "source-file-import-001",
+            "direct_rate_file_intent_sha256": "d" * 64,
+        }
+    )
+    assert direct["source_file_import_id"] == "source-file-import-001"
 
 
 def test_direct_source_params_accept_only_singleton_bound_policy():
@@ -7418,6 +7524,15 @@ def test_direct_source_params_accept_only_singleton_bound_policy():
         field_name not in normalized
         for field_name in process_ptg.FROZEN_RATE_FILE_REQUIRED_FIELDS
     )
+    with pytest.raises(ValueError, match="direct and frozen multipart inputs are exclusive"):
+        process_ptg._normalized_direct_frozen_params(
+            {
+                "source_file_import_id": "source-file-import-001",
+                "direct_rate_file_intent_sha256": "d" * 64,
+                "invalid_price_exclusion_policy": policy,
+                "frozen_rate_file_count": 1,
+            }
+        )
     with pytest.raises(ValueError, match="frozen rate file"):
         process_ptg._normalized_direct_frozen_params(
             {
