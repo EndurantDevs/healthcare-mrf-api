@@ -19,6 +19,25 @@ class _FalseyProgress:
         return None
 
 
+def test_price_progress_reports_only_positive_amounts() -> None:
+    progress_events: list[tuple[str, int]] = []
+
+    with price.observe_shared_price_progress(
+        lambda metric, amount: progress_events.append((metric, amount))
+    ):
+        price._report_price_progress("rows", 0)
+        price._report_price_progress("rows", 2)
+    price._report_price_progress("rows", 3)
+
+    assert progress_events == [("rows", 2)]
+
+
+def test_row_value_supports_mapping_dict_and_position() -> None:
+    assert price._row_value(SimpleNamespace(_mapping={"field": 1}), "field", 0) == 1
+    assert price._row_value({"field": 2}, "field", 0) == 2
+    assert price._row_value((3,), "field", 0) == 3
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     (
@@ -82,6 +101,40 @@ async def test_copy_settings_apply_only_requested_limits() -> None:
         "SET LOCAL work_mem TO '16MB'",
         "SET LOCAL max_parallel_workers_per_gather TO 2",
     ]
+
+
+@pytest.mark.asyncio
+async def test_copy_settings_skip_absent_limits() -> None:
+    driver = SimpleNamespace(execute=AsyncMock())
+
+    await price._set_copy_local_settings(
+        driver,
+        work_mem=None,
+        parallel_workers=None,
+    )
+
+    driver.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_price_encoder_prerequisite_guards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chunks = price._encoder_stdout_chunks(
+        SimpleNamespace(stdout=None), metrics={}, started_at=0.0
+    )
+    with pytest.raises(RuntimeError, match="stdout is closed"):
+        await anext(chunks)
+
+    monkeypatch.setattr(price, "_ptg2_rust_scanner_binary", lambda: None)
+    with pytest.raises(RuntimeError, match="requires the Rust scanner"):
+        await price._stream_shared_price_copy(
+            kind="price_atoms",
+            sql="SELECT 1",
+            schema_name="mrf",
+            target_table="stage",
+            atom_key_bits=32,
+        )
 
 
 @pytest.mark.parametrize(
