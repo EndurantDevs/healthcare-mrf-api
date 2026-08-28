@@ -66,12 +66,10 @@ def _projection_proof(lease, shard, normalized_row):
     return projection_proof_shard(
         (normalized_row,),
         recipe=lease.recipe,
-        attempt=lease.attempt,
-        partition_ordinal=shard.partition_ordinal,
+        coordinates=(lease.attempt, 1, shard.partition_ordinal),
         resource_type=shard.resource_type,
         input_sha256=shard.input_sha256,
         partition_id=shard.partition_id,
-        partition_attempt=1,
     )
 
 

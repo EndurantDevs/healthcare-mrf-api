@@ -322,10 +322,7 @@ def test_occurrence_coordinate_guards():
     with pytest.raises(ValueError, match="layout id"):
         audit.occurrence_id(
             b"x" * 31,
-            code_key=1,
-            provider_set_key=2,
-            price_key=3,
-            source_key=0,
+            audit.AuditCandidate(1, 2, 3, 0, 1),
             npi=1_234_567_890,
             atom_ordinal=0,
             atom_key=4,

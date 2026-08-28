@@ -84,12 +84,14 @@ def shard_proof(child, label: str):
     return projection_proof_shard(
         proof_rows,
         recipe=claim.recipe_lease.recipe,
-        attempt=claim.recipe_lease.attempt,
-        partition_ordinal=claim.shard.partition_ordinal,
+        coordinates=(
+            claim.recipe_lease.attempt,
+            claim.partition_attempt,
+            claim.shard.partition_ordinal,
+        ),
         resource_type=claim.shard.resource_type,
         input_sha256=claim.shard.input_sha256,
         partition_id=claim.shard.partition_id,
-        partition_attempt=claim.partition_attempt,
     )
 
 

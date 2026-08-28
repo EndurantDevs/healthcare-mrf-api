@@ -150,12 +150,14 @@ async def _materialization_case(postgres, label: str) -> _MaterializationCase:
     proof = projection_proof_shard(
         (normalized_row,),
         recipe=lease.recipe,
-        attempt=lease.attempt,
-        partition_ordinal=claim.shard.partition_ordinal,
+        coordinates=(
+            lease.attempt,
+            claim.partition_attempt,
+            claim.shard.partition_ordinal,
+        ),
         resource_type=claim.shard.resource_type,
         input_sha256=claim.shard.input_sha256,
         partition_id=claim.shard.partition_id,
-        partition_attempt=claim.partition_attempt,
     )
     return _MaterializationCase(
         lease,

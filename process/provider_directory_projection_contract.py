@@ -1638,17 +1638,16 @@ def prepare_projection_proof_shard(
     resources: Iterable[Mapping[str, Any]],
     *,
     recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
-    attempt: int,
-    partition_ordinal: int,
+    coordinates: tuple[int, int, int],
     resource_type: str,
     input_sha256: str,
     partition_id: str | None = None,
-    partition_attempt: int = 1,
     producer_proof: Mapping[str, Any] | None = None,
 ) -> tuple[ProjectionProofShard, list[dict[str, Any]]]:
     """Build one shard proof and return its single normalized ordered row set."""
 
     recipe = validated_physical_projection_recipe_identity(recipe)
+    attempt, partition_attempt, partition_ordinal = coordinates
     if attempt < 1 or partition_attempt < 1 or partition_ordinal < 0:
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_partition_coordinate_invalid"
@@ -1909,12 +1908,10 @@ def projection_proof_shard(
     resources: Iterable[Mapping[str, Any]],
     *,
     recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
-    attempt: int,
-    partition_ordinal: int,
+    coordinates: tuple[int, int, int],
     resource_type: str,
     input_sha256: str,
     partition_id: str | None = None,
-    partition_attempt: int = 1,
     producer_proof: Mapping[str, Any] | None = None,
 ) -> ProjectionProofShard:
     """Build one source-neutral, bounded, immutable partition attestation."""
@@ -1922,12 +1919,10 @@ def projection_proof_shard(
     shard, _ordered_resources = prepare_projection_proof_shard(
         resources,
         recipe=recipe,
-        attempt=attempt,
-        partition_ordinal=partition_ordinal,
+        coordinates=coordinates,
         resource_type=resource_type,
         input_sha256=input_sha256,
         partition_id=partition_id,
-        partition_attempt=partition_attempt,
         producer_proof=producer_proof,
     )
     return shard

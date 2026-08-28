@@ -57,8 +57,7 @@ def test_proof_shard_rejects_conflicts_and_resource_scope_drift():
         prepare_projection_proof_shard(
             (organization, duplicate),
             recipe=recipe,
-            attempt=1,
-            partition_ordinal=0,
+            coordinates=(1, 1, 0),
             resource_type="Organization",
             input_sha256=block.content_sha256,
         )
@@ -67,8 +66,7 @@ def test_proof_shard_rejects_conflicts_and_resource_scope_drift():
         prepare_projection_proof_shard(
             (practitioner,),
             recipe=recipe,
-            attempt=1,
-            partition_ordinal=0,
+            coordinates=(1, 1, 0),
             resource_type="Organization",
             input_sha256=block.content_sha256,
         )
@@ -76,16 +74,14 @@ def test_proof_shard_rejects_conflicts_and_resource_scope_drift():
         prepare_projection_proof_shard(
             (organization,),
             recipe=recipe,
-            attempt=0,
-            partition_ordinal=0,
+            coordinates=(0, 1, 0),
             resource_type="Organization",
             input_sha256=block.content_sha256,
         )
     shard, ordered_resources = prepare_projection_proof_shard(
         (organization, deepcopy(organization)),
         recipe=recipe,
-        attempt=1,
-        partition_ordinal=0,
+        coordinates=(1, 1, 0),
         resource_type="Organization",
         input_sha256=block.content_sha256,
         producer_proof={"worker": "rust-v1"},
@@ -130,8 +126,7 @@ def test_physical_proof_requires_selected_and_required_resource_counts():
     one_shard, _ordered_resources = prepare_projection_proof_shard(
         (organization,),
         recipe=one_recipe,
-        attempt=1,
-        partition_ordinal=0,
+        coordinates=(1, 1, 0),
         resource_type="Organization",
         input_sha256=block.content_sha256,
     )
