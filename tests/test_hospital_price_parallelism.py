@@ -47,7 +47,7 @@ async def test_resource_slot_yields_and_releases():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("resource", "slot_count"), (("other", 1), ("fetch", 0)))
+@pytest.mark.parametrize(("resource", "slot_count"), [("other", 1), ("fetch", 0)])
 async def test_resource_slot_rejects_invalid_capacity(resource, slot_count):
     orchestrator = orchestrator_module()
 

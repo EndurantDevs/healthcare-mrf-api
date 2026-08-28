@@ -75,6 +75,11 @@
                 self.0.read(&mut buffer[..limit])
             }
         }
+        fn decode<R: Read>(inner: R) -> io::Result<String> {
+            let mut decoded = String::new();
+            HospitalMrfTextReader::new(inner).read_to_string(&mut decoded)?;
+            Ok(decoded)
+        }
 
         let extension_bytes = [
             0x80, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c,
@@ -123,20 +128,38 @@
             assert_eq!(decoded, format!("{}!", char::from(byte)));
         }
 
-        for raw in [b"Caf\xe9 noir".as_slice(), b"Caf\xe9".as_slice()] {
-            let expected = String::from("Café") + std::str::from_utf8(&raw[4..]).unwrap();
-            let mut decoded = String::new();
-            HospitalMrfTextReader::new(Cursor::new(raw))
-                .read_to_string(&mut decoded)
-                .unwrap();
-            assert_eq!(decoded, expected);
-
-            decoded.clear();
-            HospitalMrfTextReader::new(OneByteReader(Cursor::new(raw)))
-                .read_to_string(&mut decoded)
-                .unwrap();
-            assert_eq!(decoded, expected);
+        let replay_cases: &[(&[u8], &str)] = &[
+            (b"Caf\xe9 noir", "Café noir"),
+            (b"Caf\xe9", "Café"),
+            (b"\xe9\xc2\xa0", "é\u{00a0}"),
+            (b"\xe9\x80A", "é€A"),
+            (b"\xe9\xc0A", "éÀA"),
+            (b"\xc2\xe9\xa0!", "Âé\u{00a0}!"),
+            (b"\xe9\xe2\x82\xac", "é€"),
+        ];
+        for &(raw, expected) in replay_cases {
+            assert_eq!(decode(Cursor::new(raw)).unwrap(), expected);
+            assert_eq!(decode(OneByteReader(Cursor::new(raw))).unwrap(), expected);
         }
+
+        for input in [b"\xe9\x81A".as_slice(), b"\xc2\xe9\x81A".as_slice()] {
+            assert!(decode(Cursor::new(input)).unwrap_err().to_string().contains("UTF-8"));
+            assert!(decode(OneByteReader(Cursor::new(input)))
+                .unwrap_err()
+                .to_string()
+                .contains("UTF-8"));
+        }
+
+        let mut text_reader = HospitalMrfTextReader::new(Cursor::new(b"A"));
+        assert_eq!(text_reader.read(&mut []).unwrap(), 0);
+        let mut text_output = String::new();
+        text_reader.read_to_string(&mut text_output).unwrap();
+        assert_eq!(text_output, "A");
+        let mut bounded_reader = BoundedDecompressedReader::new(Cursor::new(b"A"), 1);
+        assert_eq!(bounded_reader.read(&mut []).unwrap(), 0);
+        let mut bounded_output = Vec::new();
+        bounded_reader.read_to_end(&mut bounded_output).unwrap();
+        assert_eq!(bounded_output, b"A");
 
         for invalid_bytes in [
             vec![0x81],

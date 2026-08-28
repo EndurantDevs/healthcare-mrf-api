@@ -90,10 +90,10 @@ async def test_bind_and_publish_rejects_a_changed_current_set(monkeypatch) -> No
     store, _native = _store_module()
 
     class Connection(_Connection):
-        async def all(self, _statement: str, **_kwargs: Any) -> list[Any]:
+        async def all(self, _statement: str, **_kwargs: object) -> list[Any]:
             return []
 
-    async def publication(*_args: Any) -> tuple[str, str]:
+    async def publication(*_args: object) -> tuple[str, str]:
         return "stage", '"stage"'
 
     monkeypatch.setattr(store, "_publication_stage", publication)
