@@ -24,6 +24,7 @@ from api.ptg2_candidate_audit import (
     PTG2_CANDIDATE_AUDIT_HEADER,
 )
 from api.ptg2_rate_option_refs import encode_rate_option_ref
+from api.ptg2_serving import PTG2LocationScopeError
 from process.terminology_synonyms import _procedure_rows
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "api" / "endpoint" / "pricing.py"
@@ -3704,6 +3705,13 @@ async def test_plan_pricing_translates_only_online_work_budget_to_503(
 @pytest.mark.parametrize(
     ("error_class", "error_code", "error_message"),
     (
+        (
+            PTG2LocationScopeError,
+            "ptg2_location_scope_too_broad",
+            "Cost-ordered geographic provider search is too broad for exact "
+            "online expansion. Narrow the ZIP radius, add an NPI or provider "
+            "taxonomy filter, or set order_by=distance.",
+        ),
         (
             pricing_module.PTG2ProviderFilterScopeError,
             "ptg2_provider_filter_scope_required",

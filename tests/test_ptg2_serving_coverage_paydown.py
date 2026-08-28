@@ -32,7 +32,7 @@ def _location_query(*, knn_order_sql=None):
         ("addr.location <-> :requested_location", "addr.geo_evidence_level IS NOT NULL"),
     ],
 )
-def test_membership_location_sql_keeps_snapshot_scope_probe_correlated(
+def test_membership_location_sql_keeps_snapshot_scope_join_planner_visible(
     knn_order_sql,
     address_assurance_sql,
 ):
@@ -44,10 +44,12 @@ def test_membership_location_sql_keeps_snapshot_scope_probe_correlated(
 
     statement = serving._membership_location_sql(query, limit=2, offset=0)
 
-    assert "CROSS JOIN LATERAL" in statement
+    assert (
+        "JOIN mrf.ptg2_v3_npi_scope npi_scope "
+        "ON npi_scope.npi = addr.npi"
+    ) in statement
     assert "npi_scope.snapshot_key = :shared_snapshot_key" in statement
-    assert "npi_scope.npi = addr.npi" in statement
-    assert "OFFSET 0" in statement
+    assert "SELECT npi_scope.snapshot_key, npi_scope.npi" not in statement
 
 
 def test_membership_filter_rejects_empty_scope_and_invalid_values():

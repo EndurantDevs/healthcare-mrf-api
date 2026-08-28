@@ -202,6 +202,12 @@ class PTG2ProviderFilterScopeError(ValueError):
     error_code = "ptg2_provider_filter_scope_required"
 
 
+class PTG2LocationScopeError(PTG2ProviderFilterScopeError):
+    """Reject a geographic scope that exceeds exact online expansion."""
+
+    error_code = "ptg2_location_scope_too_broad"
+
+
 class PTG2ProviderFilterUnsupportedError(ValueError):
     """Reject provider filter fields unsupported by PTG2 serving."""
 
@@ -9675,13 +9681,7 @@ WITH matched AS MATERIALIZED (
                      {location_tiebreak_sql}
         ) AS address_rank
     FROM {address_table} addr
-    CROSS JOIN LATERAL (
-        SELECT npi_scope.snapshot_key, npi_scope.npi
-        FROM {npi_scope_table} npi_scope
-        WHERE npi_scope.snapshot_key = :shared_snapshot_key
-          AND npi_scope.npi = addr.npi
-        OFFSET 0
-    ) npi_scope
+    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
     WHERE {filter_sql}
       AND {address_assurance_sql}
 )
@@ -9707,13 +9707,7 @@ WITH located AS MATERIALIZED (
         addr.type,
         addr.checksum
     FROM {address_table} addr
-    CROSS JOIN LATERAL (
-        SELECT npi_scope.snapshot_key, npi_scope.npi
-        FROM {npi_scope_table} npi_scope
-        WHERE npi_scope.snapshot_key = :shared_snapshot_key
-          AND npi_scope.npi = addr.npi
-        OFFSET 0
-    ) npi_scope
+    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
     WHERE {filter_sql}
 ), nppes_requested AS MATERIALIZED (
     SELECT DISTINCT located.npi, located.address_key
@@ -9917,13 +9911,7 @@ WITH nearest_addresses AS MATERIALIZED (
         {geo_evidence_level_sql} AS geo_evidence_level,
         {distance_sql} AS candidate_distance_miles
     FROM {address_table} addr
-    CROSS JOIN LATERAL (
-        SELECT npi_scope.snapshot_key, npi_scope.npi
-        FROM {npi_scope_table} npi_scope
-        WHERE npi_scope.snapshot_key = :shared_snapshot_key
-          AND npi_scope.npi = addr.npi
-        OFFSET 0
-    ) npi_scope
+    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
     WHERE {filter_sql}
     ORDER BY {knn_order_sql},
              addr.npi,
@@ -11685,7 +11673,12 @@ async def _paged_graph_candidates(
     batch_size = _graph_location_probe_batch_size(
         candidate_limit, taxonomy_filter_requested=is_provider_filter_requested
     )
-    max_candidates = max(_ptg2_manifest_location_match_limit() * 20, batch_size)
+    configured_match_limit = _ptg2_manifest_location_match_limit()
+    max_candidates = max(configured_match_limit * 20, batch_size)
+    rejects_unproven_exhaustive_expansion = (
+        candidate_limit > configured_match_limit
+        and not require_provider_set_coverage
+    )
     probe_limit = batch_size
     probe_state = _GraphLocationProbeState(provider_set_coverage_required=require_provider_set_coverage)
     while probe_limit <= max_candidates:
@@ -11716,6 +11709,12 @@ async def _paged_graph_candidates(
             candidate_location_rows, probe_limit
         ):
             break
+        if rejects_unproven_exhaustive_expansion:
+            raise PTG2LocationScopeError(
+                "Cost-ordered geographic provider search is too broad for exact "
+                "online expansion. Narrow the ZIP radius, add an NPI or provider "
+                "taxonomy filter, or set order_by=distance."
+            )
         if probe_limit >= max_candidates:
             probe_state.raise_unproven_bound()
         probe_limit = _next_graph_location_probe_limit(

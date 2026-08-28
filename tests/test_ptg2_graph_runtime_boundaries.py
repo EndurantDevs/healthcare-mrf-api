@@ -146,10 +146,10 @@ async def test_paged_graph_candidates_expand_after_empty_unexhausted_knn_probe(
 
 
 @pytest.mark.asyncio
-async def test_paged_graph_candidates_reject_unproven_bound_exhaustion(
+async def test_paged_graph_candidates_reject_unproven_exhaustive_expansion(
     monkeypatch,
 ):
-    """Fail closed when the maximum probe still has an unconsumed source."""
+    """Fail closed after the first bounded exhaustive probe remains unproven."""
 
     monkeypatch.setattr(
         serving,
@@ -165,13 +165,15 @@ async def test_paged_graph_candidates_reject_unproven_bound_exhaustion(
         "has_enough_after_append",
         AsyncMock(return_value=False),
     )
-    monkeypatch.setattr(serving, "_graph_location_probe_batch_size", lambda *_args, **_kwargs: 1)
-    monkeypatch.setattr(serving, "_ptg2_manifest_location_match_limit", lambda: 0)
+    monkeypatch.setattr(
+        serving, "_graph_location_probe_batch_size", lambda *_args, **_kwargs: 1
+    )
+    monkeypatch.setattr(serving, "_ptg2_manifest_location_match_limit", lambda: 1)
 
     with pytest.raises(
-        serving.PTG2ManifestArtifactError,
-        match="configured exactness bound",
-    ):
+        serving.PTG2LocationScopeError,
+        match="Narrow the ZIP radius",
+    ) as raised:
         await serving._paged_graph_candidates(
             object(),
             strict_v3_tables(),
@@ -179,6 +181,19 @@ async def test_paged_graph_candidates_reject_unproven_bound_exhaustion(
             frozenset({7}),
             2,
         )
+
+    serving._membership_location_rows.assert_awaited_once()
+    assert raised.value.error_code == "ptg2_location_scope_too_broad"
+
+
+def test_graph_probe_state_preserves_unproven_bound_error():
+    """Keep the legacy fail-closed error for ordinary bounded traversal."""
+
+    with pytest.raises(
+        serving.PTG2ManifestArtifactError,
+        match="configured exactness bound",
+    ):
+        serving._GraphLocationProbeState().raise_unproven_bound()
 
 
 @pytest.mark.asyncio
