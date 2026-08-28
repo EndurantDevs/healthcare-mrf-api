@@ -9,10 +9,41 @@ from typing import Any
 
 import pytest
 
+from process import hospital_price_scratch as scratch
 from tests.hospital_price_orchestration_support import (
     ArtifactStore as _ArtifactStore,
     orchestrator_module as _orchestrator_module,
 )
+
+
+def test_tmp_root_rejects_sibling_directory(tmp_path):
+    root = tmp_path / "root"
+    sibling = tmp_path / "sibling"
+    root.mkdir()
+    sibling.mkdir()
+
+    with pytest.raises(RuntimeError, match="tmp directory is unsafe"):
+        scratch.owned_tmp_root(SimpleNamespace(root=root, tmp_dir=sibling))
+
+
+def test_source_cleanup_requires_anchored_unlink(monkeypatch):
+    monkeypatch.setattr(scratch, "_SAFE_DIR_FD_UNLINK", False)
+
+    with pytest.raises(RuntimeError, match="anchored directory unlink"):
+        scratch.unlink_transient_source(object(), object())
+
+
+def test_source_cleanup_rejects_non_regular_file(tmp_path):
+    raw_path = tmp_path / "hospital-mrf-source-owned" / "raw" / "source.json"
+    raw_path.mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="regular non-symlink"):
+        scratch.unlink_transient_source(
+            _ArtifactStore(tmp_path), SimpleNamespace(raw_path=str(raw_path))
+        )
+
+    assert raw_path.is_dir()
+
 
 def test_source_cleanup_rejects_symlink(tmp_path):
     orchestrator = _orchestrator_module()
