@@ -367,16 +367,14 @@ def test_candidate_projection_identity_covers_content_counts_and_scope():
     organization = projection_proof_shard(
         _rows("Organization", "o-1", "o-2"),
         recipe=recipe,
-        attempt=1,
-        partition_ordinal=0,
+        coordinates=(1, 1, 0),
         resource_type="Organization",
         input_sha256=_digest("organization-input"),
     )
     practitioner = projection_proof_shard(
         _rows("Practitioner", "p-1"),
         recipe=recipe,
-        attempt=1,
-        partition_ordinal=0,
+        coordinates=(1, 1, 0),
         resource_type="Practitioner",
         input_sha256=_digest("practitioner-input"),
     )
@@ -410,8 +408,7 @@ def test_candidate_mixed_resource_shard_reports_exact_type_counts():
             *_rows("Practitioner", "p-1", "p-2"),
         ],
         recipe=recipe,
-        attempt=1,
-        partition_ordinal=0,
+        coordinates=(1, 1, 0),
         resource_type=PROJECTION_MIXED_RESOURCE_TYPE,
         input_sha256=_digest("mixed-input"),
     )
@@ -440,8 +437,7 @@ def test_candidate_projection_rejects_cross_recipe_or_incomplete_profile():
     organization = projection_proof_shard(
         _rows("Organization", "o-1"),
         recipe=other_recipe,
-        attempt=1,
-        partition_ordinal=0,
+        coordinates=(1, 1, 0),
         resource_type="Organization",
         input_sha256=_digest("organization-input"),
     )

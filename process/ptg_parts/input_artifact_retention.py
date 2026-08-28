@@ -618,6 +618,45 @@ def protect_artifact_prefix(store: PTG2ArtifactStore, path: str | Path) -> None:
                     )
 
 
+def _publish_artifact_bytes(
+    temporary: Path,
+    final: Path,
+    expected_sha256: str | None,
+) -> None:
+    if temporary.is_symlink() or not temporary.is_file():
+        raise RuntimeError(
+            f"Retained artifact staging is not a regular file: {temporary}"
+        )
+    if not final.exists():
+        if expected_sha256 is not None:
+            staged_sha256, _staged_size = sha256_file(temporary)
+            if staged_sha256 != expected_sha256:
+                raise RuntimeError(
+                    "Retained artifact staging checksum does not match its identity: "
+                    f"{temporary}"
+                )
+        os.replace(temporary, final)
+        return
+    if final.is_symlink() or not final.is_file():
+        raise RuntimeError(f"Retained artifact target is not a regular file: {final}")
+    if temporary == final:
+        return
+    if expected_sha256 is None:
+        temporary.unlink(missing_ok=True)
+        return
+    existing_sha256, _existing_size = sha256_file(final)
+    if existing_sha256 == expected_sha256:
+        temporary.unlink(missing_ok=True)
+        return
+    staged_sha256, _staged_size = sha256_file(temporary)
+    if staged_sha256 != expected_sha256:
+        raise RuntimeError(
+            "Retained artifact staging checksum does not match its identity: "
+            f"{temporary}"
+        )
+    os.replace(temporary, final)
+
+
 def publish_artifact_file(
     store: PTG2ArtifactStore,
     temporary_path: str | Path,
@@ -641,26 +680,7 @@ def publish_artifact_file(
                 prefix=False,
             )
         final.parent.mkdir(parents=True, exist_ok=True)
-        if final.exists():
-            if final.is_symlink() or not final.is_file():
-                raise RuntimeError(f"Retained artifact target is not a regular file: {final}")
-            if temporary != final:
-                if expected_sha256 is None:
-                    temporary.unlink(missing_ok=True)
-                else:
-                    existing_sha256, _existing_size = sha256_file(final)
-                    if existing_sha256 == expected_sha256:
-                        temporary.unlink(missing_ok=True)
-                    else:
-                        staged_sha256, _staged_size = sha256_file(temporary)
-                        if staged_sha256 != expected_sha256:
-                            raise RuntimeError(
-                                "Retained artifact staging checksum does not match its identity: "
-                                f"{temporary}"
-                            )
-                        os.replace(temporary, final)
-        else:
-            os.replace(temporary, final)
+        _publish_artifact_bytes(temporary, final, expected_sha256)
         if marker is not None:
             _atomic_write_json(*marker)
             _clear_unleased_locked(store, relative_path)

@@ -12,6 +12,7 @@ import shutil
 import sys
 import tempfile
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path, PurePath
 from urllib.parse import unquote, urlparse
 
@@ -473,6 +474,69 @@ def _write_mrf_chunk(chunks: list[dict], path: Path, records: list[bytes]) -> No
     )
 
 
+def _file_bytes(source_path: str) -> Iterator[int]:
+    with open(source_path, "rb") as handle:
+        while block := handle.read(1024 * 1024):
+            yield from block
+
+
+def _json_array_records(source_path: str) -> Iterator[bytes]:
+    """Yield raw records from a top-level JSON array."""
+
+    record_buffer = bytearray()
+    is_in_array = False
+    has_record_started = False
+    is_in_string = False
+    is_escaped = False
+    depth = 0
+
+    for byte in _file_bytes(source_path):
+        if not is_in_array:
+            if byte in b" \t\r\n":
+                continue
+            if byte != ord("["):
+                return
+            is_in_array = True
+            continue
+        if not has_record_started:
+            if byte in b" \t\r\n,":
+                continue
+            if byte == ord("]"):
+                return
+            has_record_started = True
+            depth = 0
+            is_in_string = False
+            is_escaped = False
+        record_buffer.append(byte)
+        if is_in_string:
+            if is_escaped:
+                is_escaped = False
+                continue
+            if byte == ord("\\"):
+                is_escaped = True
+                continue
+            if byte == ord('"'):
+                is_in_string = False
+            continue
+        if byte == ord('"'):
+            is_in_string = True
+            continue
+        if byte in (ord("{"), ord("[")):
+            depth += 1
+            continue
+        if byte not in (ord("}"), ord("]")):
+            continue
+        depth -= 1
+        if depth:
+            continue
+        has_record_started = False
+        yield bytes(record_buffer).strip()
+        record_buffer.clear()
+
+    if has_record_started:
+        raise ValueError(f"Unable to split {source_path}; unterminated top-level JSON record")
+
+
 def _split_json_array_file_to_chunks(source_path: str, chunk_dir: Path, kind: str, target_bytes: int) -> list[dict]:
     """Split a top-level JSON array into bounded valid array files."""
 
@@ -480,80 +544,14 @@ def _split_json_array_file_to_chunks(source_path: str, chunk_dir: Path, kind: st
     chunks: list[dict] = []
     buffered_records: list[bytes] = []
     chunk_bytes = 2
-    record_buffer = bytearray()
-    is_in_array = False
-    has_record_started = False
-    is_in_string = False
-    is_escaped = False
-    depth = 0
-    is_array_done = False
-
-    def flush_record(current_chunk_bytes: int) -> int:
-        """Flush the buffered record into the active output chunk."""
-
-        if not record_buffer:
-            return current_chunk_bytes
-        payload = bytes(record_buffer).strip()
-        record_buffer.clear()
-        if not payload:
-            return current_chunk_bytes
-        projected = current_chunk_bytes + len(payload) + (1 if buffered_records else 0)
+    for payload in _json_array_records(source_path):
+        projected = chunk_bytes + len(payload) + (1 if buffered_records else 0)
         if buffered_records and projected > target_bytes:
             _write_mrf_chunk(chunks, chunk_dir / f"{kind}_{len(chunks):05d}.json", buffered_records)
             buffered_records.clear()
-            current_chunk_bytes = 2
+            chunk_bytes = 2
         buffered_records.append(payload)
-        current_chunk_bytes += len(payload) + (1 if len(buffered_records) > 1 else 0)
-        return current_chunk_bytes
-
-    with open(source_path, "rb") as handle:
-        while True:
-            block = handle.read(1024 * 1024)
-            if not block or is_array_done:
-                break
-            for byte in block:
-                if not is_in_array:
-                    if byte in b" \t\r\n":
-                        continue
-                    if byte != ord("["):
-                        return []
-                    is_in_array = True
-                    continue
-
-                if not has_record_started:
-                    if byte in b" \t\r\n,":
-                        continue
-                    if byte == ord("]"):
-                        is_array_done = True
-                        break
-                    has_record_started = True
-                    depth = 0
-                    is_in_string = False
-                    is_escaped = False
-
-                record_buffer.append(byte)
-
-                if is_in_string:
-                    if is_escaped:
-                        is_escaped = False
-                    elif byte == ord("\\"):
-                        is_escaped = True
-                    elif byte == ord('"'):
-                        is_in_string = False
-                    continue
-
-                if byte == ord('"'):
-                    is_in_string = True
-                elif byte in (ord("{"), ord("[")):
-                    depth += 1
-                elif byte in (ord("}"), ord("]")):
-                    depth -= 1
-                    if depth == 0:
-                        has_record_started = False
-                        chunk_bytes = flush_record(chunk_bytes)
-
-    if has_record_started:
-        raise ValueError(f"Unable to split {source_path}; unterminated top-level JSON record")
+        chunk_bytes += len(payload) + (1 if len(buffered_records) > 1 else 0)
     if buffered_records:
         _write_mrf_chunk(chunks, chunk_dir / f"{kind}_{len(chunks):05d}.json", buffered_records)
     if len(chunks) <= 1:

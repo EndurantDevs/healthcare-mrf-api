@@ -53,12 +53,14 @@ async def _finalizer_case(postgres, label):
     proof = projection_proof_shard(
         (normalized_row_map,),
         recipe=case.lease.recipe,
-        attempt=case.lease.attempt,
-        partition_ordinal=case.claim.shard.partition_ordinal,
+        coordinates=(
+            case.lease.attempt,
+            case.claim.partition_attempt,
+            case.claim.shard.partition_ordinal,
+        ),
         resource_type=case.claim.shard.resource_type,
         input_sha256=case.claim.shard.input_sha256,
         partition_id=case.claim.shard.partition_id,
-        partition_attempt=case.claim.partition_attempt,
     )
     return replace(case, normalized_row=normalized_row_map, proof=proof)
 
@@ -155,12 +157,14 @@ async def _competing_case(postgres, label):
     proof = projection_proof_shard(
         staged_resources,
         recipe=case.lease.recipe,
-        attempt=case.lease.attempt,
-        partition_ordinal=case.claim.shard.partition_ordinal,
+        coordinates=(
+            case.lease.attempt,
+            case.claim.partition_attempt,
+            case.claim.shard.partition_ordinal,
+        ),
         resource_type=case.claim.shard.resource_type,
         input_sha256=case.claim.shard.input_sha256,
         partition_id=case.claim.shard.partition_id,
-        partition_attempt=case.claim.partition_attempt,
     )
     return replace(case, normalized_row=staged_resources[0], proof=proof), staged_resources
 

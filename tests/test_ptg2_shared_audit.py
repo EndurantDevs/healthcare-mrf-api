@@ -96,38 +96,42 @@ def test_candidate_file_rejects_key_outside_dense_dictionary(tmp_path):
 
 def test_occurrence_identity_includes_candidate_and_atom_ordinals():
     core_layout_id = b"\x9a" * 32
-    base_coordinates_dict = dict(
-        code_key=1,
-        provider_set_key=2,
-        price_key=3,
-        source_key=0,
+    first_candidate = audit.AuditCandidate(
+        1,
+        2,
+        3,
+        0,
+        1,
+        candidate_ordinal=0,
+    )
+    occurrence_coordinate_map = dict(
         npi=1_234_567_890,
         atom_key=7,
     )
 
     first = audit.occurrence_id(
         core_layout_id,
-        **base_coordinates_dict,
+        first_candidate,
+        **occurrence_coordinate_map,
         atom_ordinal=0,
-        candidate_ordinal=0,
     )
     duplicate_source_occurrence = audit.occurrence_id(
         core_layout_id,
-        **base_coordinates_dict,
+        audit.AuditCandidate(1, 2, 3, 0, 1, candidate_ordinal=1),
+        **occurrence_coordinate_map,
         atom_ordinal=0,
-        candidate_ordinal=1,
     )
     duplicate_atom_occurrence = audit.occurrence_id(
         core_layout_id,
-        **base_coordinates_dict,
+        first_candidate,
+        **occurrence_coordinate_map,
         atom_ordinal=1,
-        candidate_ordinal=0,
     )
     other_artifact_occurrence = audit.occurrence_id(
         core_layout_id,
-        **{**base_coordinates_dict, "source_key": 1},
+        audit.AuditCandidate(1, 2, 3, 1, 1, candidate_ordinal=0),
+        **occurrence_coordinate_map,
         atom_ordinal=0,
-        candidate_ordinal=0,
     )
 
     assert len(first) == 32

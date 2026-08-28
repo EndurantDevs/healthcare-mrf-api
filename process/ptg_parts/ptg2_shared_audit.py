@@ -1179,26 +1179,22 @@ async def _price_memberships(
 
 def occurrence_id(
     core_layout_id: bytes,
+    candidate: AuditCandidate,
     *,
-    code_key: int,
-    provider_set_key: int,
-    price_key: int,
-    source_key: int,
     npi: int,
     atom_ordinal: int,
     atom_key: int,
-    candidate_ordinal: int = 0,
 ) -> bytes:
     """Hash one fully qualified served occurrence into its stable identity."""
 
     if len(core_layout_id) != 32:
         raise ValueError("strict V3 audit core layout id must contain 32 bytes")
     coordinates = _OCCURRENCE_ID_COORDINATES.pack(
-        int(candidate_ordinal),
-        int(code_key),
-        int(provider_set_key),
-        int(price_key),
-        int(source_key),
+        int(candidate.candidate_ordinal),
+        int(candidate.code_key),
+        int(candidate.provider_set_key),
+        int(candidate.price_key),
+        int(candidate.source_key),
         int(npi),
         int(atom_ordinal),
         int(atom_key),
@@ -1218,14 +1214,10 @@ def _occurrence(
     return AuditOccurrence(
         occurrence_id=occurrence_id(
             core_layout_id,
-            code_key=candidate.code_key,
-            provider_set_key=candidate.provider_set_key,
-            price_key=candidate.price_key,
-            source_key=candidate.source_key,
+            candidate,
             npi=int(npi),
             atom_ordinal=int(atom_ordinal),
             atom_key=int(atom_key),
-            candidate_ordinal=candidate.candidate_ordinal,
         ),
         code_key=candidate.code_key,
         provider_set_key=candidate.provider_set_key,

@@ -316,6 +316,30 @@ def test_publish_repairs_corrupt_content_addressed_target(tmp_path):
     assert final_path.read_bytes() == expected_payload
     assert not staged_path.exists()
 
+
+def test_retention_publish_rejects_symlink_stage(tmp_path):
+    """Never publish a staged symlink at a content-addressed path."""
+
+    store = PTG2ArtifactStore(tmp_path / "publish-symlink")
+    symlink_target = tmp_path / "symlink-target"
+    symlink_target.write_bytes(b"matching payload")
+    staged_symlink = tmp_path / "staged-symlink"
+    staged_symlink.symlink_to(symlink_target)
+    expected_sha256 = hashlib.sha256(symlink_target.read_bytes()).hexdigest()
+    final = store.root / "raw" / expected_sha256
+
+    with pytest.raises(RuntimeError, match="staging is not a regular file"):
+        publish_artifact_file(
+            store,
+            staged_symlink,
+            final,
+            expected_sha256=expected_sha256,
+        )
+
+    assert staged_symlink.is_symlink()
+    assert not final.exists()
+
+
 def test_logical_reuse_rejects_same_size_corruption_and_rebuilds(tmp_path):
     root = tmp_path / "artifacts"
     store = PTG2ArtifactStore(root)

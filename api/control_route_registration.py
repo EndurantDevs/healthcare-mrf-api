@@ -5,10 +5,15 @@
 from __future__ import annotations
 
 from sanic import response
-from sanic.exceptions import BadRequest
+from sanic.exceptions import BadRequest, NotFound, SanicException
 from sanic.response import HTTPResponse
 
 from api.control_auth import require_control_auth
+from api.control_imports import (
+    reconcile_stale_worker_failure,
+    StaleWorkerReconciliationConflict,
+    StaleWorkerReconciliationUnavailable,
+)
 from api.control_wave_routes import register_control_wave_routes
 from api.hospital_price_status import (
     hospital_price_page_limit,
@@ -16,10 +21,36 @@ from api.hospital_price_status import (
 )
 
 
+async def control_reconcile_stale_worker(request, run_id: str) -> HTTPResponse:
+    """Fail one exact stale run after proving its worker state is absent."""
+
+    require_control_auth(request)
+    request_by_field = request.json if isinstance(request.json, dict) else {}
+    try:
+        receipt_by_field = await reconcile_stale_worker_failure(
+            run_id,
+            request_by_field,
+        )
+    except StaleWorkerReconciliationConflict as exc:
+        raise SanicException(str(exc), status_code=409) from exc
+    except StaleWorkerReconciliationUnavailable as exc:
+        raise SanicException(str(exc), status_code=503) from exc
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    if receipt_by_field is None:
+        raise NotFound("import run not found")
+    return response.json(receipt_by_field, default=str)
+
+
 def register_control_routes(blueprint):
     """Register wave and hospital-price control routes."""
 
     register_control_wave_routes(blueprint)
+    blueprint.add_route(
+        control_reconcile_stale_worker,
+        "/imports/<run_id>/reconcile-stale-worker",
+        methods={"POST"},
+    )
 
     @blueprint.get("/hospital-prices")
     async def control_hospital_prices(request) -> HTTPResponse:

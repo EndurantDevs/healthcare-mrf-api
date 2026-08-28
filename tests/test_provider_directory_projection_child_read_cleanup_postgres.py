@@ -100,12 +100,14 @@ async def _registered_cleanup_case(postgres):
     proof = projection_proof_shard(
         _rows(retained.family, "completed-child-cleanup-expiry"),
         recipe=lease.recipe,
-        attempt=lease.attempt,
-        partition_ordinal=claim.shard.partition_ordinal,
+        coordinates=(
+            lease.attempt,
+            claim.partition_attempt,
+            claim.shard.partition_ordinal,
+        ),
         resource_type=claim.shard.resource_type,
         input_sha256=claim.shard.input_sha256,
         partition_id=claim.shard.partition_id,
-        partition_attempt=claim.partition_attempt,
     )
     return lease, claim, proof
 

@@ -436,6 +436,20 @@ def test_retention_publish_conflict_edges(tmp_path):
             expected_sha256="0" * 64,
         )
 
+    unpublished = tmp_path / "unpublished"
+    unpublished.write_text("wrong", encoding="utf-8")
+    new_checksum_target = store.root / "raw" / "new-checksum"
+    with pytest.raises(RuntimeError, match="staging checksum"):
+        publish_artifact_file(
+            store,
+            unpublished,
+            new_checksum_target,
+            expected_sha256="0" * 64,
+        )
+    assert unpublished.exists()
+    assert not new_checksum_target.exists()
+
+
 def test_verified_publish_replaces_old_target_without_hashing_it(
     tmp_path,
     monkeypatch,

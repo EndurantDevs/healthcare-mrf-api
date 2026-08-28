@@ -92,8 +92,7 @@ def _candidate_inputs():
     shard = projection_proof_shard(
         resources,
         recipe=recipe,
-        attempt=1,
-        partition_ordinal=0,
+        coordinates=(1, 1, 0),
         resource_type=PROJECTION_MIXED_RESOURCE_TYPE,
         input_sha256=digest("raw-input"),
     )
