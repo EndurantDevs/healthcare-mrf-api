@@ -323,6 +323,11 @@ async def test_worker_admission_and_binding_replay_short_circuit(monkeypatch):
     expected_by_field = {"digest": "a" * 64}
     monkeypatch.setattr(
         bindings,
+        "protected_frozen_tuple_presence",
+        Mock(return_value=("frozen_rate_file_set_contract",)),
+    )
+    monkeypatch.setattr(
+        bindings,
         "frozen_rate_binding_from_params",
         Mock(return_value=expected_by_field),
     )
