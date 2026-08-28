@@ -7629,7 +7629,7 @@ async def _ebms_page_targets(
     nested_url: str | None,
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
-) -> list[CrawlTarget]:
+) -> tuple[list[CrawlTarget], str]:
     configured_max_bytes = (
         resolver.get("nested_page_max_bytes")
         or resolver.get("client_page_max_bytes")
@@ -7667,7 +7667,7 @@ async def _ebms_page_targets(
                 metadata=metadata,
             )
         )
-    return enriched_targets
+    return enriched_targets, page_html
 
 
 async def _ebms_client_targets(
@@ -7679,7 +7679,7 @@ async def _ebms_client_targets(
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     try:
-        client_targets = await _ebms_page_targets(
+        client_targets, client_html = await _ebms_page_targets(
             source_record, client_url, client_url, client_label,
             None, resolver, session,
         )
@@ -7687,29 +7687,16 @@ async def _ebms_client_targets(
         return []
     if client_targets:
         return client_targets
-    try:
-        client_html = await _fetch_text(
-            client_url,
-            max_bytes=int(
-                resolver.get("client_page_max_bytes")
-                or resolver.get("max_bytes")
-                or 5 * 1024 * 1024
-            ),
-            session=session,
-        )
-    except Exception:
-        client_html = ""
     max_nested = _as_int(resolver.get("max_nested_pages_per_client")) or 20
     for nested_url, _nested_label in _ebms_index_page_urls(
         client_html, base_url=client_url
     )[:max_nested]:
         try:
-            client_targets.extend(
-                await _ebms_page_targets(
-                    source_record, nested_url, client_url, client_label,
-                    nested_url, resolver, session,
-                )
+            nested_targets, _nested_html = await _ebms_page_targets(
+                source_record, nested_url, client_url, client_label,
+                nested_url, resolver, session,
             )
+            client_targets.extend(nested_targets)
         except Exception:
             continue
         if len(client_targets) >= target_limit:

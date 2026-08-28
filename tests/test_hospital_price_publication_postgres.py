@@ -133,8 +133,8 @@ async def test_expired_admission_overlaps_publication_without_deadlock(
     database = Database(engine=engine)
     resume_publication = asyncio.Event()
     publication = admission = None
-    await _prepare_schema(engine, schema)
     try:
+        await _prepare_schema(engine, schema)
         await _run_migration(engine, _load_migration(), "upgrade")
         content_sha, version_id = await _seed_expired_attempt(
             database_url, schema, quoted

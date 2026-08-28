@@ -60,14 +60,14 @@
         assert_zip_import_error(&unsupported, TEST_MAX_OUTPUT_BYTES, "compression method");
 
         let invalid_utf8 = zip_bytes(
-            &[("prices.json", b"{\"hospital_name\":\"\xff\"}")],
+            &[("prices.json", b"{\"hospital_name\":\"\x81\"}")],
             CompressionMethod::Deflated,
         );
         assert_zip_import_error(&invalid_utf8, TEST_MAX_OUTPUT_BYTES, "UTF-8");
     }
 
     #[test]
-    fn hospital_text_reader_maps_only_unambiguous_cp1252_bytes() {
+    fn hospital_text_reader_preserves_utf8_and_maps_cp1252() {
         struct OneByteReader<R>(R);
         impl<R: Read> Read for OneByteReader<R> {
             fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
@@ -90,10 +90,10 @@
         ];
         let mut raw = b"\xef\xbb\xbfA\xc2\xa0\xe1\x80\x80\xf0\x9f\x98\x80".to_vec();
         raw.extend(extension_bytes);
-        raw.extend(0xa0..=0xbf);
+        raw.extend(0xa0..=0xff);
         let mut expected = String::from("A\u{00a0}\u{1000}\u{1f600}");
         expected.extend(extension_characters);
-        expected.extend((0xa0..=0xbf).map(char::from));
+        expected.extend((0xa0..=0xff).map(char::from));
 
         let mut reader = HospitalMrfTextReader::new(OneByteReader(Cursor::new(raw.clone())));
         let mut decoded = Vec::new();
@@ -114,20 +114,36 @@
         }
         assert_eq!(String::from_utf8(decoded).unwrap(), expected);
 
+        for byte in 0xa0..=0xff {
+            let raw = [byte, b'!'];
+            let mut decoded = String::new();
+            HospitalMrfTextReader::new(Cursor::new(raw))
+                .read_to_string(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, format!("{}!", char::from(byte)));
+        }
+
+        for raw in [b"Caf\xe9 noir".as_slice(), b"Caf\xe9".as_slice()] {
+            let expected = String::from("Café") + std::str::from_utf8(&raw[4..]).unwrap();
+            let mut decoded = String::new();
+            HospitalMrfTextReader::new(Cursor::new(raw))
+                .read_to_string(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, expected);
+
+            decoded.clear();
+            HospitalMrfTextReader::new(OneByteReader(Cursor::new(raw)))
+                .read_to_string(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, expected);
+        }
+
         for invalid_bytes in [
             vec![0x81],
             vec![0x8d],
             vec![0x8f],
             vec![0x90],
             vec![0x9d],
-            vec![0xc0, 0xaf],
-            vec![0xe0, 0x80, 0x80],
-            vec![0xed, 0xa0, 0x80],
-            vec![0xf4, 0x90, 0x80, 0x80],
-            vec![0xe1, b'B'],
-            vec![0xc2],
-            vec![0xe1, 0x80],
-            vec![0xf0, 0x9f, 0x98],
         ] {
             for prefix in [&b""[..], &b"abc"[..]] {
                 let mut input = prefix.to_vec();

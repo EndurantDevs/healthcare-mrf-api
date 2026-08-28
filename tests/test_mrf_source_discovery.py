@@ -4822,8 +4822,10 @@ async def test_resolve_ebms_caa_directory_discovers_client_tocs(monkeypatch):
             </body></html>
         """,
     }
+    fetched_urls: list[str] = []
 
     async def fake_fetch_text(url, *, max_bytes, session=None):
+        fetched_urls.append(url)
         return pages_dict[url]
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
@@ -4844,6 +4846,7 @@ async def test_resolve_ebms_caa_directory_discovers_client_tocs(monkeypatch):
         "https://caa.ebms.com/Example Public Group/2026-06-01_EBMS_index.json",
         "https://caa.ebms.com/Example Nested Group/Plan A/2026-06-01_EBMS_index.json",
     ]
+    assert fetched_urls == list(pages_dict)
     assert all(
         crawl_target.metadata["resolver"] == "ebms_caa_directory" for crawl_target in crawl_targets
     )

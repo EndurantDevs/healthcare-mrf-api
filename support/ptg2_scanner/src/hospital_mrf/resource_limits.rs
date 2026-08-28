@@ -64,6 +64,7 @@ struct HospitalMrfTextReader<R: Read> {
     output_pos: usize,
     output_len: usize,
     valid_remaining: usize,
+    replay: std::collections::VecDeque<u8>,
     initialized: bool,
 }
 
@@ -78,6 +79,7 @@ impl<R: Read> HospitalMrfTextReader<R> {
             output_pos: 0,
             output_len: 0,
             valid_remaining: 0,
+            replay: std::collections::VecDeque::new(),
             initialized: false,
         }
     }
@@ -133,7 +135,7 @@ impl<R: Read> HospitalMrfTextReader<R> {
             0x9c => '\u{0153}',
             0x9e => '\u{017e}',
             0x9f => '\u{0178}',
-            0xa0..=0xbf => char::from(byte),
+            0xa0..=0xff => char::from(byte),
             _ => return Err(invalid("hospital MRF contains invalid UTF-8")),
         };
         self.output_len = character.encode_utf8(&mut self.output).len();
@@ -152,20 +154,49 @@ impl<R: Read> HospitalMrfTextReader<R> {
         sequence[0] = first;
         let retained = initial_tail.len().min(width - 1);
         sequence[1..1 + retained].copy_from_slice(&initial_tail[..retained]);
-        if retained + 1 < width {
-            self.inner
-                .read_exact(&mut sequence[1 + retained..width])
-                .map_err(|error| {
-                    if error.kind() == io::ErrorKind::UnexpectedEof {
-                        invalid("hospital MRF ends with incomplete UTF-8")
-                    } else {
-                        error
-                    }
-                })?;
+        let mut length = retained + 1;
+        while length < width {
+            let Some(byte) = self.read_raw_byte()? else {
+                break;
+            };
+            sequence[length] = byte;
+            length += 1;
         }
-        std::str::from_utf8(&sequence[..width])
-            .map_err(|_| invalid("hospital MRF contains invalid UTF-8"))?;
-        self.stage_bytes(&sequence[..width]);
+        if length == width && std::str::from_utf8(&sequence[..width]).is_ok() {
+            self.stage_bytes(&sequence[..width]);
+        } else {
+            for byte in sequence[1..length].iter().rev() {
+                self.replay.push_front(*byte);
+            }
+            self.stage_cp1252(first)?;
+        }
+        Ok(())
+    }
+
+    fn read_raw_byte(&mut self) -> io::Result<Option<u8>> {
+        if let Some(byte) = self.replay.pop_front() {
+            return Ok(Some(byte));
+        }
+        if self.initial_pos < self.initial_len {
+            let byte = self.initial[self.initial_pos];
+            self.initial_pos += 1;
+            return Ok(Some(byte));
+        }
+        let mut byte = [0u8; 1];
+        match self.inner.read(&mut byte)? {
+            0 => Ok(None),
+            _ => Ok(Some(byte[0])),
+        }
+    }
+
+    fn stage_replay(&mut self) -> io::Result<()> {
+        let first = self.replay.pop_front().expect("replay is not empty");
+        match first {
+            0x00..=0x7f => self.stage_bytes(&[first]),
+            0x80..=0xbf => self.stage_cp1252(first)?,
+            0xc2..=0xf4 => self.stage_sequence(first, &[])?,
+            _ => self.stage_cp1252(first)?,
+        }
         Ok(())
     }
 
@@ -191,7 +222,7 @@ impl<R: Read> HospitalMrfTextReader<R> {
                 self.initial_pos += retained;
                 self.stage_sequence(first, &tail[..retained])?;
             }
-            _ => return Err(invalid("hospital MRF contains invalid UTF-8")),
+            _ => self.stage_cp1252(first)?,
         }
         Ok(())
     }
@@ -219,6 +250,10 @@ impl<R: Read> Read for HospitalMrfTextReader<R> {
             }
             if !self.initialized {
                 self.initialize()?;
+                continue;
+            }
+            if !self.replay.is_empty() {
+                self.stage_replay()?;
                 continue;
             }
             if self.initial_pos < self.initial_len {
