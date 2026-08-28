@@ -11,8 +11,6 @@ from typing import Any
 
 import pytest
 
-from process.ptg_parts import artifacts as ptg_artifacts
-from process.ptg_parts.artifacts import PTG2ArtifactStore
 from tests.hospital_price_orchestration_support import (
     ArtifactStore,
     orchestrator_module,
@@ -43,59 +41,6 @@ def test_strict_positive_env_rejects_zero(monkeypatch):
 
     with pytest.raises(RuntimeError, match="must be a positive integer"):
         orchestrator._runtime.strict_positive_env("HOSPITAL_TEST_LIMIT")
-
-
-@pytest.mark.asyncio
-async def test_resource_lock_yields_and_releases():
-    orchestrator = _orchestrator_module()
-
-    class Lock:
-        releases = 0
-
-        def try_acquire(self):
-            return self
-
-        def release(self):
-            self.releases += 1
-
-    lock = Lock()
-    store = _ArtifactStore()
-    store.named_lock = lambda *_args: lock
-
-    async with orchestrator._hospital_resource_lock(store):
-        assert lock.releases == 0
-    assert lock.releases == 1
-
-
-@pytest.mark.asyncio
-async def test_cancelled_resource_acquire_does_not_release_unheld_lock():
-    orchestrator = _orchestrator_module()
-    acquire_started, allow_acquire = threading.Event(), threading.Event()
-
-    class Lock:
-        releases = 0
-
-        def try_acquire(self):
-            acquire_started.set()
-            assert allow_acquire.wait(timeout=1)
-            return None
-
-        def release(self):
-            self.releases += 1
-
-    lock = Lock()
-    store = _ArtifactStore()
-    store.named_lock = lambda *_args: lock
-    operation = asyncio.create_task(
-        orchestrator._hospital_resource_lock(store).__aenter__()
-    )
-    assert await asyncio.to_thread(acquire_started.wait, 1)
-    operation.cancel()
-    allow_acquire.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await operation
-    assert lock.releases == 0
 
 
 @pytest.mark.asyncio
@@ -231,7 +176,7 @@ async def test_resource_lock_releases_after_repeated_cancellation(tmp_path):
     store.named_lock = lambda *_args: lock
 
     async def enter_lock() -> None:
-        async with orchestrator._hospital_resource_lock(store):
+        async with orchestrator._hospital_resource_slot(store, "load", 1):
             raise AssertionError("cancelled acquisition entered the lock")
 
     lock_task = asyncio.create_task(enter_lock())
@@ -281,56 +226,6 @@ async def test_cancellation_guard_drains_operation_after_repeated_cancel():
     assert cleanup_finished.is_set()
 
 
-def test_resource_lock_supports_nonblocking_capacity_poll(tmp_path, monkeypatch):
-    store = PTG2ArtifactStore(tmp_path)
-    held = store.named_lock("hospital-price", "resource-capacity")
-    waiting = store.named_lock("hospital-price", "resource-capacity")
-
-    held.acquire()
-    try:
-        assert waiting.try_acquire() is None
-    finally:
-        held.release()
-
-    assert waiting.try_acquire() is waiting
-    waiting.release()
-
-    unavailable = store.named_lock("hospital-price", "unavailable-capacity")
-
-    def unavailable_flock(_fd, _operation):
-        raise BlockingIOError
-
-    with monkeypatch.context() as patch:
-        patch.setattr(ptg_artifacts.fcntl, "flock", unavailable_flock)
-        assert unavailable.try_acquire() is None
-    assert unavailable.try_acquire() is unavailable
-    unavailable.release()
-
-
-@pytest.mark.asyncio
-async def test_cancelled_resource_wait_does_not_wait_for_current_import(tmp_path):
-    orchestrator = _orchestrator_module()
-    store = PTG2ArtifactStore(tmp_path)
-    held = store.named_lock("hospital-price", "resource-capacity")
-    held.acquire()
-
-    entered = asyncio.Event()
-
-    async def wait_for_capacity() -> None:
-        async with orchestrator._hospital_resource_lock(store):
-            entered.set()
-
-    waiting = asyncio.create_task(wait_for_capacity())
-    try:
-        await asyncio.sleep(0.05)
-        waiting.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(waiting, timeout=0.5)
-    finally:
-        held.release()
-    assert not entered.is_set()
-
-
 @pytest.mark.asyncio
 async def test_cancelled_format_detection_is_drained(tmp_path, monkeypatch):
     orchestrator = _orchestrator_module()
@@ -348,7 +243,7 @@ async def test_cancelled_format_detection_is_drained(tmp_path, monkeypatch):
     )
     operation = asyncio.create_task(
         orchestrator._ensure_content(
-            {}, {}, _ArtifactStore(tmp_path), raw, 2048, 1024
+            {}, {}, _ArtifactStore(tmp_path), raw, 2048, 1024, 1
         )
     )
     assert await asyncio.to_thread(detection_started.wait, 1)

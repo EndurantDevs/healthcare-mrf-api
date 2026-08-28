@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from process.ptg_parts.artifacts import PTG2ArtifactStore as _FileArtifactStore
 from process.ptg_parts.canonical import canonicalize_url
 
 
@@ -54,6 +55,9 @@ class ArtifactStore:
         self.tmp_dir = tmp_dir
         self.root = tmp_dir
 
+    def named_lock(self, namespace: str, key: str) -> Any:
+        return _FileArtifactStore(self.root).named_lock(namespace, key)
+
 
 def configure_incomplete_import(
     orchestrator: Any,
@@ -82,7 +86,7 @@ def configure_incomplete_import(
     monkeypatch.setattr(orchestrator, "_progress", lambda *_args: None)
     monkeypatch.setattr(
         orchestrator, "_resource_limits",
-        lambda *_args: (1, 1, 1024, 4096, 2048, 1),
+        lambda *_args: (1, 1, 1, 1, 1024, 4096, 2048, 1),
     )
     monkeypatch.setattr(orchestrator, "_stream_sources", pipeline)
 
@@ -131,8 +135,7 @@ def _replacement_modules(noop: Any, lease_context: Any) -> dict[str, types.Modul
         ),
         "process.hospital_price_store": _module(
             "process.hospital_price_store", admit_attempts=noop,
-            fail_attempts=noop, garbage_collect_superseded_versions=noop,
-            has_existing_version=noop, publish_existing=noop,
+            fail_attempts=noop, has_existing_version=noop, publish_existing=noop,
             rebind_attempt_sources=noop, renew_attempt_leases=noop,
             stage_content=noop,
         ),

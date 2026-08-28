@@ -78,7 +78,7 @@ async def test_cancellation_during_source_cleanup_blocks_publication(
 
     pipeline = asyncio.create_task(orchestrator._stream_sources(
         {}, {}, _ArtifactStore(tmp_path), {attempt.source_url: [attempt]},
-        (1, 1), (None, 0, 1),
+        (1, 1, 1, 1), (None, 0, 1),
         ("hospital-prices:test", 1024, 4096, 2048, 1),
     ))
     assert await asyncio.to_thread(cleanup_started.wait, 1)
@@ -95,66 +95,92 @@ async def test_cancellation_during_source_cleanup_blocks_publication(
     assert not source_roots[0].exists()
 
 
-@pytest.mark.asyncio
-async def test_source_worker_holds_one_lease_until_raw_content_is_consumed(tmp_path, monkeypatch):
-    orchestrator = _orchestrator_module()
-    parse_started, allow_parse = asyncio.Event(), asyncio.Event()
-    started_download_urls: list[str] = []
-    lease_events: list[str] = []
+def _source_consumption_state(tmp_path):
     raw_path = tmp_path / "hospital-mrf-source-shared" / "raw" / "source.json"
     raw_path.parent.mkdir(parents=True)
     raw_path.write_bytes(b"{}")
-    raw = SimpleNamespace(raw_sha256="a" * 64, raw_path=str(raw_path), byte_count=2)
-    attempts_by_url = {
-        "https://a/first.json": [_Attempt("one", "a", "A", "https://a/first.json", 0)],
-        "https://b/second.json": [_Attempt("two", "b", "B", "https://b/second.json", 0)],
-    }
+    return SimpleNamespace(
+        parse_started=asyncio.Event(),
+        allow_parse=asyncio.Event(),
+        started_urls=[],
+        lease_events=[],
+        slot_events=[],
+        slot_entered=asyncio.Event(),
+        raw=SimpleNamespace(
+            raw_sha256="a" * 64, raw_path=str(raw_path), byte_count=2
+        ),
+        attempts_by_url={
+            "https://a/first.json": [
+                _Attempt("one", "a", "A", "https://a/first.json", 0)
+            ],
+            "https://b/second.json": [
+                _Attempt("two", "b", "B", "https://b/second.json", 0)
+            ],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_worker_holds_slot_and_lease_until_raw_cleanup(
+    tmp_path, monkeypatch
+):
+    """Retain fetch capacity and artifact lease through raw consumption."""
+
+    orchestrator = _orchestrator_module()
+    state = _source_consumption_state(tmp_path)
+    @contextlib.asynccontextmanager
+    async def resource_slot(_store, resource, slot_count):
+        assert slot_count == 1
+        if resource == "fetch":
+            state.slot_events.append("enter")
+            state.slot_entered.set()
+        try:
+            yield
+        finally:
+            if resource == "fetch":
+                state.slot_events.append("exit")
     @contextlib.contextmanager
     def lease_context(**_kwargs: Any):
-        lease_events.append("start")
+        state.lease_events.append("start")
         try:
             yield object()
         finally:
-            lease_events.append("release")
-
-    async def download_source(
-        item: Any, _store: Any, _max_bytes: int
-    ) -> _DownloadedSource:
+            state.lease_events.append("release")
+    async def download_source(item: Any, _store: Any, _max_bytes: int):
         url, attempts = item
-        started_download_urls.append(url)
-        return _DownloadedSource(url, raw, attempts)
-
+        state.started_urls.append(url)
+        return _DownloadedSource(url, state.raw, attempts)
     async def ensure_content(*_args: Any) -> str:
-        if len(started_download_urls) == 1:
-            parse_started.set()
-            await allow_parse.wait()
+        if len(state.started_urls) == 1:
+            state.parse_started.set()
+            await state.allow_parse.wait()
         raise ValueError("invalid content")
-
     async def fail_attempts(attempts: Any, *_args: Any) -> int:
         return len(attempts)
-
-    monkeypatch.setattr(orchestrator, "artifact_lease_context", lease_context)
-    monkeypatch.setattr(orchestrator, "download_source", download_source)
-    monkeypatch.setattr(orchestrator, "_ensure_content", ensure_content)
-    monkeypatch.setattr(orchestrator, "_fail_attempts", fail_attempts)
-    monkeypatch.setattr(orchestrator, "_require_disk_capacity", lambda *_args: None)
-    monkeypatch.setattr(orchestrator, "_progress", lambda *_args: None)
-
+    for name, collaborator in (
+        ("artifact_lease_context", lease_context),
+        ("_hospital_resource_slot", resource_slot), ("download_source", download_source),
+        ("_ensure_content", ensure_content), ("_fail_attempts", fail_attempts),
+        ("_require_disk_capacity", lambda *_args: None),
+        ("_progress", lambda *_args: None),
+    ):
+        monkeypatch.setattr(orchestrator, name, collaborator)
     pipeline = asyncio.create_task(orchestrator._stream_sources(
-        {}, {}, _ArtifactStore(tmp_path), attempts_by_url, (1, 1), (None, 0, 2),
-        ("hospital-prices:test", 1024, 4096, 2048, 1),
+        {}, {}, _ArtifactStore(tmp_path), state.attempts_by_url, (1, 1, 1, 1),
+        (None, 0, 2), ("hospital-prices:test", 1024, 4096, 2048, 1),
     ))
-    await asyncio.wait_for(parse_started.wait(), timeout=1)
+    await asyncio.wait_for(state.slot_entered.wait(), timeout=1)
+    await asyncio.wait_for(state.parse_started.wait(), timeout=1)
     await asyncio.sleep(0)
-    assert started_download_urls == ["https://a/first.json"]
-    assert lease_events == ["start"]
-
-    allow_parse.set()
+    assert state.started_urls == ["https://a/first.json"]
+    assert state.lease_events == ["start"]
+    assert state.slot_events == ["enter"]
+    state.allow_parse.set()
     metrics = await asyncio.wait_for(pipeline, timeout=2)
-
     assert metrics["failed"] == 2
-    assert started_download_urls == ["https://a/first.json", "https://b/second.json"]
-    assert lease_events == ["start", "release", "start", "release"]
+    assert state.started_urls == ["https://a/first.json", "https://b/second.json"]
+    assert state.lease_events == ["start", "release", "start", "release"]
+    assert state.slot_events == ["enter", "exit", "enter", "exit"]
 
 
 def _install_waiting_producer_pipeline(orchestrator, monkeypatch, tmp_path):
@@ -226,7 +252,7 @@ async def test_source_pipeline_cancellation_releases_waiting_producer_lease(
     pipeline = asyncio.create_task(orchestrator._stream_sources(
         {}, {}, _ArtifactStore(tmp_path),
         {attempt.source_url: [attempt] for attempt in state.attempts},
-        (2, 1), (None, 0, 2),
+        (2, 1, 2, 1), (None, 0, 2),
         ("hospital-prices:test", 1024, 4096, 2048, 1),
     ))
     await asyncio.wait_for(state.parse_started.wait(), timeout=1)

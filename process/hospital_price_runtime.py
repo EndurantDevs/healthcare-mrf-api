@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import os
 import shutil
 from contextlib import asynccontextmanager
@@ -29,6 +30,7 @@ HOSPITAL_MRF_PARSER_BASE_MEMORY_BYTES = 256 * 1024**2
 DEFAULT_FETCH_CONCURRENCY = 8
 DEFAULT_LOAD_CONCURRENCY = 2
 HOSPITAL_PRICE_ARTIFACT_DIR_ENV = "HLTHPRT_HOSPITAL_PRICE_ARTIFACT_DIR"
+_SLOT_SCAN_STARTS = itertools.count()
 
 
 def hospital_price_artifact_store() -> PTG2ArtifactStore:
@@ -63,7 +65,7 @@ def resource_limits(
     requested_fetches: int,
     requested_loads: int,
     locator_count: int,
-) -> tuple[int, int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, int, int, int]:
     """Derive worker counts and byte limits from explicit capacity budgets."""
 
     max_raw = strict_positive_env(
@@ -74,53 +76,53 @@ def resource_limits(
         HOSPITAL_MRF_MAX_DECOMPRESSED_BYTES_ENV
     )
     active_raw = strict_positive_env("HLTHPRT_HOSPITAL_PRICE_ACTIVE_RAW_BYTES")
-    active_scratch = strict_positive_env(
-        "HLTHPRT_HOSPITAL_PRICE_ACTIVE_SCRATCH_BYTES"
-    )
-    active_memory = strict_positive_env(
-        "HLTHPRT_HOSPITAL_PRICE_ACTIVE_MEMORY_BYTES"
-    )
+    active_scratch = strict_positive_env("HLTHPRT_HOSPITAL_PRICE_ACTIVE_SCRATCH_BYTES")
+    active_memory = strict_positive_env("HLTHPRT_HOSPITAL_PRICE_ACTIVE_MEMORY_BYTES")
     database_growth = strict_positive_env(
         "HLTHPRT_HOSPITAL_PRICE_DATABASE_GROWTH_BYTES"
     )
     minimum_free = strict_positive_env("HLTHPRT_HOSPITAL_PRICE_MIN_FREE_BYTES")
-    fetches = min(requested_fetches, active_raw // max_raw)
+    fetch_slots = active_raw // max_raw
     # Retained output is capped at max_output; selector sort scratch is capped at
     # another max_output. Reserve parser buffers plus its bounded selector keys.
     packed_peak = 2 * max_output
     parser_memory = HOSPITAL_MRF_PARSER_BASE_MEMORY_BYTES + min(
         max_output, HOSPITAL_MRF_SELECTOR_KEY_MEMORY_BYTES
     )
-    loads = min(
-        requested_loads,
+    load_slots = min(
         active_scratch // packed_peak,
         active_memory // parser_memory,
     )
+    fetches = min(requested_fetches, fetch_slots)
+    loads = min(requested_loads, load_slots)
     if fetches < 1 or loads < 1:
         raise RuntimeError(
             "hospital price byte and memory budgets cannot admit one source"
         )
     # DEV preflight verifies that the artifact and database paths share one
-    # capacity domain. Database growth is a one-time admission reserve; workers
-    # retain only the operating floor as committed data consumes that reserve.
+    # capacity domain. Every admitted load slot can commit its full growth while
+    # its peers are still active, so retain that aggregate reserve throughout.
     operating_free = (
         active_raw
         + active_scratch
-        + packed_peak * loads
+        + packed_peak * load_slots
+        + database_growth * load_slots
         + minimum_free
     )
     require_disk_capacity(
         store,
         operating_free
-        + database_growth
         + locator_count * MAX_HOSPITAL_HPT_LOCATOR_BYTES,
     )
-    return fetches, loads, max_raw, max_decompressed, max_output, operating_free
+    return (
+        fetches, loads, fetch_slots, load_slots,
+        max_raw, max_decompressed, max_output, operating_free,
+    )
 
 
 def configured_resource_limits(
     store: PTG2ArtifactStore, locator_count: int
-) -> tuple[int, int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, int, int, int]:
     """Apply the configured hospital worker counts to the shared capacity gate."""
 
     return resource_limits(
@@ -144,30 +146,54 @@ def require_disk_capacity(store: PTG2ArtifactStore, required_free: int) -> None:
         raise RuntimeError("hospital price artifact storage capacity is insufficient")
 
 
-@asynccontextmanager
-async def hospital_resource_lock(store: PTG2ArtifactStore):
-    """Serialize capacity admission for one shared artifact volume."""
+async def _try_acquire_slot(lock: Any) -> Any:
+    acquire_task = asyncio.create_task(asyncio.to_thread(lock.try_acquire))
+    try:
+        return await asyncio.shield(acquire_task)
+    except BaseException:
+        while not acquire_task.done():
+            try:
+                await asyncio.shield(acquire_task)
+            except asyncio.CancelledError:
+                continue
+        if acquire_task.result() is not None:
+            lock.release()
+        raise
 
-    # ponytail: one run lock protects a shared artifact volume; replace it with
-    # cross-process weighted reservations if concurrent runs become necessary.
-    lock = store.named_lock("hospital-price", "resource-capacity")
+
+@asynccontextmanager
+async def hospital_resource_slot(
+    store: PTG2ArtifactStore, resource: str, slot_count: int
+):
+    """Hold one crash-releasing cross-process resource slot."""
+
+    if resource not in {"fetch", "load"} or slot_count < 1:
+        raise ValueError("hospital resource slot is invalid")
+    locks = tuple(
+        store.named_lock("hospital-price", f"{resource}-slot-{index:03d}")
+        for index in range(slot_count)
+    )
+    scan_start = next(_SLOT_SCAN_STARTS) % slot_count
     while True:
-        acquire_task = asyncio.create_task(
-            asyncio.to_thread(lock.try_acquire)
-        )
-        try:
-            acquired = await asyncio.shield(acquire_task)
-        except BaseException:
-            while not acquire_task.done():
-                try:
-                    await asyncio.shield(acquire_task)
-                except asyncio.CancelledError:
-                    continue
-            if acquire_task.result() is not None:
+        for offset in range(slot_count):
+            lock = locks[(scan_start + offset) % slot_count]
+            if await _try_acquire_slot(lock) is None:
+                continue
+            try:
+                yield
+            finally:
                 lock.release()
-            raise
-        if acquired is not None:
-            break
+            return
+        scan_start = (scan_start + 1) % slot_count
+        await asyncio.sleep(0.1)
+
+
+@asynccontextmanager
+async def hospital_digest_lock(store: PTG2ArtifactStore, digest: str):
+    """Serialize one immutable content projection across worker processes."""
+
+    lock = store.named_lock("hospital-price", f"digest-{digest}")
+    while await _try_acquire_slot(lock) is None:
         await asyncio.sleep(0.1)
     try:
         yield

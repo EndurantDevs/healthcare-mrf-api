@@ -384,6 +384,12 @@ async def test_version_contract_and_cursor_generation_fail_closed(monkeypatch):
             parser_contract_sha256=HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256,
         ),
     ))["format_version"] == 1
+    assert serving._validated_version((
+        _version(template_version="2.0.0"),
+    ))["template_version"] == "2.0.0"
+    for template_version in ("", " 2.0.0"):
+        with pytest.raises(serving.HospitalPriceServingUnavailableError):
+            serving._validated_version((_version(template_version=template_version),))
 
 
 @pytest.mark.asyncio

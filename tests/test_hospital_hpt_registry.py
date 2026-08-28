@@ -31,6 +31,8 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
 
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
+    assert sum("locator_name" in entry for entry in hospitals) == 1_194
+    assert sum("locator_mrf_url" in entry for entry in hospitals) == 622
     assert all(
         {"hospital_id", "name", "cms_hpt_url"} <= set(entry)
         <= {
@@ -92,8 +94,33 @@ def test_optional_locator_mrf_url_is_validated_and_preserved(tmp_path):
 
     assert _load(tmp_path, text)[0]["locator_mrf_url"].endswith("current.csv")
 
-    with pytest.raises(registry.HospitalHptRegistryError, match="cms_hpt_url_invalid"):
+    with pytest.raises(
+        registry.HospitalHptRegistryError, match="locator_mrf_url_invalid"
+    ):
         _load(tmp_path, text.replace("https://files.example/current.csv", "file.csv"))
+
+
+@pytest.mark.parametrize(
+    "selector",
+    (
+        "https://files.example/current.csv?sig=credential",
+        "HTTPS://files.example/current.csv",
+        "https://FILES.example/current.csv",
+        "https://files.example:443/current.csv",
+    ),
+)
+def test_optional_locator_mrf_selector_must_be_queryless_and_canonical(
+    tmp_path, selector
+):
+    text = _document().replace(
+        "    cms_hpt_url:",
+        f"    locator_mrf_url: {selector}\n    cms_hpt_url:",
+    )
+
+    with pytest.raises(
+        registry.HospitalHptRegistryError, match="locator_mrf_url_invalid"
+    ):
+        _load(tmp_path, text)
 
 
 def test_duplicate_hospital_id_is_rejected(tmp_path):

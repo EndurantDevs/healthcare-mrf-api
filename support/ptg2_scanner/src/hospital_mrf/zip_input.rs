@@ -143,11 +143,7 @@ impl<R: Read> ZipPayloadReader<R> {
                 "nested ZIP hospital MRF input is unsupported",
             ));
         }
-        let prefix_position = if prefix[..prefix_length].starts_with(b"\xEF\xBB\xBF") {
-            3
-        } else {
-            0
-        };
+        let prefix_position = 0;
         Ok(Self {
             inner,
             prefix,

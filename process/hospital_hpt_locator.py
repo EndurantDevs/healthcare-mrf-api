@@ -8,10 +8,15 @@ import html
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
+
+from process.ptg_parts.domain import PTG2_STRIPPED_QUERY_PARAMS
 
 
 MAX_HOSPITAL_HPT_LOCATOR_BYTES = 1_000_000
+_HOSPITAL_MRF_CREDENTIAL_QUERY_KEYS = frozenset(
+    PTG2_STRIPPED_QUERY_PARAMS
+) | {"si", "sr"}
 
 
 class HospitalHptLocatorError(ValueError):
@@ -31,7 +36,7 @@ class HospitalMrfBinding:
     """Bind one project hospital to one locator record."""
 
     hospital_id: str
-    record_index: int
+    record_index: int | None
     mrf_url: str
 
 
@@ -144,6 +149,59 @@ def normalized_hospital_location_name(value: str) -> str:
     return " ".join(normalized.split()).casefold()
 
 
+def hospital_mrf_selector(
+    mrf_url: str, *, allow_credentials: bool = False
+) -> str | None:
+    """Return one exact queryless MRF identity or fail closed."""
+
+    if (
+        not mrf_url
+        or "#" in mrf_url
+        or "\\" in mrf_url
+        or any(
+            character.isspace() or unicodedata.category(character) == "Cc"
+            for character in mrf_url
+        )
+    ):
+        return None
+    try:
+        parsed = urlsplit(mrf_url)
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    if (
+        scheme not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    if parsed.query:
+        try:
+            query = parse_qsl(
+                parsed.query, keep_blank_values=True, max_num_fields=64
+            )
+        except ValueError:
+            return None
+        if (
+            not allow_credentials
+            or ";" in parsed.query
+            or not query
+            or any(
+                not key
+                or key.casefold() not in _HOSPITAL_MRF_CREDENTIAL_QUERY_KEYS
+                for key, _value in query
+            )
+        ):
+            return None
+    default_port = 443 if scheme == "https" else 80
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    netloc = host if port in {None, default_port} else f"{host}:{port}"
+    return urlunsplit((scheme, netloc, parsed.path, "", ""))
+
+
 def _indexes_by_name(values: Iterable[str]) -> dict[str, list[int]]:
     indexes_by_name: dict[str, list[int]] = {}
     for index, value in enumerate(values):
@@ -157,34 +215,70 @@ def _hospital_locator_name(hospital: Mapping[str, str]) -> str:
     return hospital.get("locator_name") or hospital["name"]
 
 
+def _selector_binding(
+    hospital: Mapping[str, str],
+    locator_records: Sequence[HospitalHptLocatorRecord],
+    named_indexes: Sequence[int],
+    selector: str,
+) -> tuple[HospitalMrfBinding | None, tuple[int, ...]]:
+    selector_indexes = tuple(
+        index
+        for index, locator_record in enumerate(locator_records)
+        if hospital_mrf_selector(
+            locator_record.mrf_url, allow_credentials=True
+        ) == selector
+    )
+    if not selector_indexes:
+        return None, ()
+    selector_index_set = set(selector_indexes)
+    named_selector_indexes = tuple(
+        index for index in named_indexes if index in selector_index_set
+    )
+    selected_index = (named_selector_indexes or selector_indexes)[0]
+    selected_names = {
+        normalized_hospital_location_name(locator_records[index].location_name)
+        for index in selector_indexes
+    }
+    return HospitalMrfBinding(
+        hospital_id=hospital["hospital_id"],
+        record_index=(
+            selected_index
+            if named_selector_indexes or len(selected_names) == 1
+            else None
+        ),
+        mrf_url=locator_records[selected_index].mrf_url,
+    ), selector_indexes
+
+
 def match_hospital_hpt_locator(
-    hospitals: Iterable[Mapping[str, str]],
-    cms_hpt_url: str,
+    hospitals: Iterable[Mapping[str, str]], cms_hpt_url: str,
     locator_records: Sequence[HospitalHptLocatorRecord],
 ) -> HospitalHptLocatorMatch:
-    """Bind exact names; one locator record may serve multiple facilities."""
-
-    cohort_hospitals = tuple(
-        hospital for hospital in hospitals if hospital.get("cms_hpt_url") == cms_hpt_url
-    )
-    record_names = _indexes_by_name(
-        locator_record.location_name for locator_record in locator_records
-    )
+    """Bind exact names or reviewed exact content selectors."""
+    cohort_hospitals = tuple(hospital for hospital in hospitals
+                             if hospital.get("cms_hpt_url") == cms_hpt_url)
+    record_names = _indexes_by_name(locator_record.location_name
+                                    for locator_record in locator_records)
     bindings: list[HospitalMrfBinding] = []
     unmatched_hospital_ids: list[str] = []
     ambiguous_hospital_ids: list[str] = []
     ambiguous_record_indexes: set[int] = set()
+    bound_record_indexes: set[int] = set()
     for hospital in cohort_hospitals:
         indexes = record_names.get(
             normalized_hospital_location_name(_hospital_locator_name(hospital)), []
         )
-        selected_mrf_url = hospital.get("locator_mrf_url")
-        if selected_mrf_url:
-            indexes = [
-                index
-                for index in indexes
-                if locator_records[index].mrf_url == selected_mrf_url
-            ]
+        selector = hospital.get("locator_mrf_url")
+        if selector:
+            binding, selector_indexes = _selector_binding(
+                hospital, locator_records, indexes, selector
+            )
+            if binding is None:
+                unmatched_hospital_ids.append(hospital["hospital_id"])
+            else:
+                bindings.append(binding)
+                bound_record_indexes.update(selector_indexes)
+            continue
         indexes_by_mrf_url = {
             locator_records[index].mrf_url: index for index in reversed(indexes)
         }
@@ -197,12 +291,12 @@ def match_hospital_hpt_locator(
                     mrf_url=locator_records[record_index].mrf_url,
                 )
             )
+            bound_record_indexes.add(record_index)
         elif indexes_by_mrf_url:
             ambiguous_hospital_ids.append(hospital["hospital_id"])
             ambiguous_record_indexes.update(indexes)
         else:
             unmatched_hospital_ids.append(hospital["hospital_id"])
-    bound_record_indexes = {binding.record_index for binding in bindings}
     return HospitalHptLocatorMatch(
         bindings=tuple(bindings),
         content_targets=tuple(dict.fromkeys(binding.mrf_url for binding in bindings)),

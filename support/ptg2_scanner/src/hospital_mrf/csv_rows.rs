@@ -112,6 +112,7 @@ fn parse_tall_modifier_payer(
         && standard_charge_dollar.is_none()
         && standard_charge_percentage.is_none()
         && standard_charge_algorithm.is_none()
+        && description.is_none()
     {
         return Ok(None);
     }
@@ -124,12 +125,13 @@ fn parse_tall_modifier_payer(
             "modifier payer requires a charge adjustment or explanatory note",
         ));
     }
-    let Some(payer_name) = payer_name else {
-        return Err(invalid("modifier payer evidence requires payer_name"));
-    };
-    let Some(plan_name) = plan_name else {
-        return Err(invalid("modifier payer evidence requires plan_name"));
-    };
+    if payer_name.is_some() != plan_name.is_some() {
+        return Err(invalid(if payer_name.is_some() {
+            "modifier payer evidence requires plan_name"
+        } else {
+            "modifier payer evidence requires payer_name"
+        }));
+    }
     Ok(Some(ModifierPayerRow {
         payer_name,
         plan_name,
@@ -160,8 +162,8 @@ fn parse_wide_modifier_payers(
             continue;
         }
         payers.push(ModifierPayerRow {
-            payer_name: payer.payer_name.clone(),
-            plan_name: payer.plan_name.clone(),
+            payer_name: Some(payer.payer_name.clone()),
+            plan_name: Some(payer.plan_name.clone()),
             description: optional_text(description),
             standard_charge_dollar: optional_decimal(
                 csv_value(record, payer.standard_charge_dollar),

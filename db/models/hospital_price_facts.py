@@ -86,9 +86,7 @@ class HospitalPricePackedRoot(Base, JSONOutputMixin):
 
     version_id = Column(String(64), nullable=False)
     format_version = Column(
-        SmallInteger,
-        nullable=False,
-        server_default=text("1"),
+        SmallInteger, nullable=False, server_default=text("1"),
     )
     service_count = Column(BigInteger, nullable=False)
     charge_count = Column(BigInteger, nullable=False)
@@ -473,7 +471,10 @@ class HospitalPriceModifierPayer(Base, JSONOutputMixin):
             ondelete="CASCADE",
         ),
         CheckConstraint(
-            "payer_ordinal >= 0 AND payer_name <> '' AND plan_name <> '' "
+            "payer_ordinal >= 0 AND "
+            "((payer_name IS NULL AND plan_name IS NULL) OR "
+            "(payer_name IS NOT NULL AND plan_name IS NOT NULL "
+            "AND btrim(payer_name) <> '' AND btrim(plan_name) <> '')) "
             "AND (description IS NULL OR btrim(description) <> '') "
             "AND (standard_charge_dollar IS NULL OR standard_charge_dollar > 0) "
             "AND (standard_charge_percentage IS NULL "
@@ -491,8 +492,8 @@ class HospitalPriceModifierPayer(Base, JSONOutputMixin):
     version_id = Column(String(64), nullable=False)
     modifier_ordinal = Column(Integer, nullable=False)
     payer_ordinal = Column(Integer, nullable=False)
-    payer_name = Column(TEXT, nullable=False)
-    plan_name = Column(TEXT, nullable=False)
+    payer_name = Column(TEXT)
+    plan_name = Column(TEXT)
     description = Column(TEXT)
     standard_charge_dollar = Column(Numeric)
     standard_charge_percentage = Column(Numeric)

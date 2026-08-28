@@ -368,3 +368,32 @@ async def test_directory_resolver_rejects_directory_without_networks_or_files(
             {"directory_path": "/networks"},
             object(),
         )
+
+
+@pytest.mark.asyncio
+async def test_directory_resolver_ignores_unused_page_limit(monkeypatch):
+    directory_url = "https://directory.example.invalid/networks"
+    monkeypatch.setattr(discovery, "_fetch_text", AsyncMock(return_value="directory"))
+    monkeypatch.setattr(
+        discovery, "_parse_auxiant_directory_networks", lambda *_args, **_kwargs: []
+    )
+    monkeypatch.setattr(
+        discovery,
+        "_parse_auxiant_page_links",
+        lambda *_args, **_kwargs: [
+            {
+                "target_kind": "file_reference",
+                "url": "https://files.example.invalid/historical.json",
+                "label": "Historical",
+            }
+        ],
+    )
+
+    [target] = await discovery._resolve_auxiant_wordpress_directory(
+        {"display_name": "Synthetic Source"},
+        directory_url,
+        {"directory_path": "/networks", "page_max_bytes": "invalid"},
+        object(),
+    )
+
+    assert target.url == "https://files.example.invalid/historical.json"

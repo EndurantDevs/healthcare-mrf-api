@@ -12,13 +12,15 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from process.hospital_hpt_locator import hospital_mrf_selector
+
 
 HOSPITAL_HPT_REGISTRY_PATH = (
     Path(__file__).resolve().parents[1] / "specs/hospital_hpt_registry.yaml"
 )
 EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT = 7_314
 EXPECTED_HOSPITAL_HPT_REGISTRY_SHA256 = (
-    "07e503108c01f391db660baa7d85754041afd37e9a4a650afe93cfe847ba700f"
+    "821ea3b4fdb23ffe58f3f65ac92299ca11b46f21dc7927134dcd2b96f372ac30"
 )
 MAX_HOSPITAL_HPT_SELECTION = 200
 _DOCUMENT_FIELDS = frozenset({"version", "hospitals"})
@@ -88,6 +90,13 @@ def _validated_locator(value: Any) -> str:
     return locator
 
 
+def _validated_mrf_selector(value: Any) -> str:
+    selector = _strict_text(value, "locator_mrf_url")
+    if hospital_mrf_selector(selector) != selector:
+        raise _registry_error("locator_mrf_url_invalid")
+    return selector
+
+
 def _load_hospital_hpt_registry_path(
     registry_path: Path,
 ) -> tuple[dict[str, str], ...]:
@@ -136,7 +145,7 @@ def _load_hospital_hpt_registry_path(
                 entry["locator_name"], "locator_name"
             )
         if "locator_mrf_url" in entry:
-            hospital_by_field["locator_mrf_url"] = _validated_locator(
+            hospital_by_field["locator_mrf_url"] = _validated_mrf_selector(
                 entry["locator_mrf_url"]
             )
         hospitals.append(hospital_by_field)
