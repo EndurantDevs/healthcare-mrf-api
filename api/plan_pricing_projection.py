@@ -9,6 +9,7 @@ from api.plan_pricing_projection_build import (
     receipt as _receipt,
 )
 from api.plan_pricing_projection_contract import (
+    LEGACY_PROJECTION_CONTRACT,
     PROJECTION_CONTRACT,
     PlanPricingProjectionUnavailable,
     PlanPricingProjectionUnsupported,
@@ -47,6 +48,7 @@ from api.plan_pricing_projection_source import (
 
 
 __all__ = [
+    "LEGACY_PROJECTION_CONTRACT",
     "PROJECTION_CONTRACT",
     "PlanPricingProjectionUnavailable",
     "PlanPricingProjectionUnsupported",

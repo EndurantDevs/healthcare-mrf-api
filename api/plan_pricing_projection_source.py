@@ -21,6 +21,7 @@ from api.ptg2_tables import snapshot_serving_tables
 
 
 PROVIDER_BATCH_SIZE = 5_000
+MAX_PROVIDER_ROWS_PER_BATCH = 100_000
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class BindingProjection:
     binding: dict[str, Any]
     serving_tables: Any
     code_rows_by_identity: dict[tuple[str, str], list[dict[str, Any]]]
+    raw_code_row_count: int = 0
 
 
 def _group_code_rows(code_result: Any, serving: Any) -> dict[
@@ -50,6 +52,8 @@ def _group_code_rows(code_result: Any, serving: Any) -> dict[
 async def binding_projection(
     session: Any,
     binding: dict[str, Any],
+    *,
+    maximum_code_rows: int | None = None,
 ) -> BindingProjection:
     """Read the sealed code scope for one release binding."""
 
@@ -60,6 +64,35 @@ async def binding_projection(
         str(binding["snapshot_id"]),
     )
     serving._require_strict_shared_v3(serving_tables)
+    code_statement, parameters_by_name = _binding_code_query(
+        serving,
+        serving_tables,
+        binding,
+        maximum_code_rows,
+    )
+    code_result = await session.execute(code_statement, parameters_by_name)
+    raw_code_rows = list(code_result)
+    if (
+        maximum_code_rows is not None
+        and len(raw_code_rows) > maximum_code_rows
+    ):
+        raise ValueError("pricing projection code-row bound exceeded")
+    return BindingProjection(
+        binding,
+        serving_tables,
+        _group_code_rows(raw_code_rows, serving),
+        len(raw_code_rows),
+    )
+
+
+def _binding_code_query(
+    serving: Any,
+    serving_tables: Any,
+    binding: Mapping[str, Any],
+    maximum_code_rows: int | None,
+) -> tuple[Any, dict[str, Any]]:
+    """Build the plan-scoped sealed-code query and its bound parameters."""
+
     scope_join_sql, filters, parameters_by_name, plan_order = (
         serving._shared_v3_code_scope_sql(
             serving_tables,
@@ -75,7 +108,13 @@ async def binding_projection(
     parameters_by_name["shared_snapshot_key"] = (
         serving._required_shared_snapshot_key(serving_tables)
     )
-    code_result = await session.execute(
+    limit_sql = ""
+    if maximum_code_rows is not None:
+        if maximum_code_rows <= 0:
+            raise ValueError("pricing projection code-row bound is invalid")
+        parameters_by_name["projection_code_row_limit"] = maximum_code_rows + 1
+        limit_sql = "LIMIT :projection_code_row_limit"
+    return (
         text(
             f"""
             SELECT code_metadata.code_key,
@@ -88,18 +127,14 @@ async def binding_projection(
                    code_metadata.source_name,
                    code_metadata.source_description,
                    code_metadata.rate_count
-              FROM {serving._shared_v3_code_table()} code_metadata
+             FROM {serving._shared_v3_code_table()} code_metadata
               {scope_join_sql}
              WHERE {' AND '.join(filters)}
              ORDER BY {plan_order}, code_metadata.code_key
+             {limit_sql}
             """
         ),
         parameters_by_name,
-    )
-    return BindingProjection(
-        binding,
-        serving_tables,
-        _group_code_rows(code_result, serving),
     )
 
 
@@ -149,13 +184,14 @@ def _provider_rows_sql() -> str:
                addr.city_name AS city,
                addr.state_name AS state,
                addr.projected_zip5 AS zip5
-          FROM source_npis
+         FROM source_npis
           LEFT JOIN {table('npi')} n ON n.npi = source_npis.npi
           JOIN ranked_addresses addr
             ON addr.npi = source_npis.npi
            AND addr.address_rank = 1
-          {taxonomy_sql}
+         {taxonomy_sql}
          ORDER BY source_npis.npi, addr.projected_zip5
+         LIMIT :provider_row_limit
     """
 
 
@@ -189,9 +225,15 @@ async def projection_provider_rows_for_npis(
         npi_batch = normalized_npis[start : start + PROVIDER_BATCH_SIZE]
         provider_result = await session.execute(
             provider_statement,
-            {"npis": npi_batch},
+            {
+                "npis": npi_batch,
+                "provider_row_limit": MAX_PROVIDER_ROWS_PER_BATCH + 1,
+            },
         )
-        _append_provider_rows(provider_rows_by_npi, provider_result)
+        provider_rows = list(provider_result)
+        if len(provider_rows) > MAX_PROVIDER_ROWS_PER_BATCH:
+            raise ValueError("pricing projection provider-row bound exceeded")
+        _append_provider_rows(provider_rows_by_npi, provider_rows)
     return {
         npi: tuple(provider_rows)
         for npi, provider_rows in provider_rows_by_npi.items()

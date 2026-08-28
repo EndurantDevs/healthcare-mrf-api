@@ -11,6 +11,7 @@ from sqlalchemy import text
 
 from api.plan_pricing_projection_contract import (
     COST_ORDER_FIELDS,
+    LEGACY_PROJECTION_CONTRACT,
     MAX_GEO_CELLS,
     PROJECTION_CONTRACT,
     ZIP5,
@@ -19,6 +20,7 @@ from api.plan_pricing_projection_contract import (
     projection_code_identity,
     table,
 )
+from api.plan_pricing_projection_aggregate_read import read_aggregate_pack_page
 from api.plan_release_serving import (
     PlanReleaseServingSelection,
     annotate_plan_release_response,
@@ -30,6 +32,7 @@ from api.ptg2_response import _is_request_flag_enabled
 class _ProjectionRequest:
     result_type: str
     projection_id: str
+    contract: str
     code_system: str
     code: str
 
@@ -225,6 +228,7 @@ def _projection_query(
     args: Mapping[str, Any],
     *,
     result_type: str,
+    contract: str = PROJECTION_CONTRACT,
 ) -> dict[str, Any]:
     return {
         "code": args.get("code") or None,
@@ -238,7 +242,7 @@ def _projection_query(
         "city": args.get("city") or None,
         "view": str(args.get("view") or "full").strip().lower(),
         "include_providers": result_type == "provider_cards",
-        "projection_contract": PROJECTION_CONTRACT,
+        "projection_contract": contract,
         "source": "plan_pricing_projection",
     }
 
@@ -272,9 +276,15 @@ def _validated_projection_request(
         raise PlanPricingProjectionUnavailable(
             "the selected release has no ready card projection"
         )
+    contract = selection.pricing_projection_contract or LEGACY_PROJECTION_CONTRACT
+    if contract not in {LEGACY_PROJECTION_CONTRACT, PROJECTION_CONTRACT}:
+        raise PlanPricingProjectionUnavailable(
+            "the selected pricing projection contract is unsupported"
+        )
     return _ProjectionRequest(
         result_type,
         selection.pricing_projection_id,
+        contract,
         *code_identity,
     )
 
@@ -335,6 +345,17 @@ async def _read_page(
     args: Mapping[str, Any],
     pagination: Any,
 ) -> tuple[list[orjson.Fragment], int]:
+    if (
+        request.result_type == "rate_aggregates"
+        and request.contract != LEGACY_PROJECTION_CONTRACT
+    ):
+        return await read_aggregate_pack_page(
+            session,
+            request,
+            geo_cells,
+            args,
+            pagination,
+        )
     order_direction = (
         "DESC"
         if str(args.get("order") or "asc").strip().lower() == "desc"
@@ -383,7 +404,11 @@ def _page_response(
             "page": int(pagination.page),
             "has_more": int(pagination.offset) + len(projected_items) < total,
         },
-        "query": _projection_query(args, result_type=request.result_type),
+        "query": _projection_query(
+            args,
+            result_type=request.result_type,
+            contract=request.contract,
+        ),
     }
 
 
@@ -397,6 +422,11 @@ async def search_plan_pricing_projection(
 
     request = _validated_projection_request(selection, args)
     if request is None:
+        return None
+    if (
+        request.result_type == "provider_cards"
+        and request.contract != LEGACY_PROJECTION_CONTRACT
+    ):
         return None
     try:
         selected_geo_cells = await geo_cells(
@@ -414,12 +444,21 @@ async def search_plan_pricing_projection(
             "resolved": True,
             "items": [],
             "pagination": _empty_pagination(pagination),
-            "query": _projection_query(args, result_type=request.result_type),
+            "query": _projection_query(
+                args,
+                result_type=request.result_type,
+                contract=request.contract,
+            ),
         }
     else:
-        projected_items, total = await _read_page(
-            session, request, selected_geo_cells, args, pagination
-        )
+        try:
+            projected_items, total = await _read_page(
+                session, request, selected_geo_cells, args, pagination
+            )
+        except PlanPricingProjectionUnsupported:
+            if request.result_type == "rate_aggregates" and args.get("view") is None:
+                return None
+            raise
         response_by_field = _page_response(
             request, args, pagination, projected_items, total
         )

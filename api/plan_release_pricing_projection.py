@@ -28,6 +28,10 @@ _PRICING_PROJECTION_ID_SQL = """
            THEN pricing_projection.projection_id
        END
 """
+_PRICING_PROJECTION_CONTRACT_SQL = _PRICING_PROJECTION_ID_SQL.replace(
+    "THEN pricing_projection.projection_id",
+    "THEN pricing_projection.contract_version",
+)
 _PLAN_RELEASE_SERVING_SQL_TEMPLATE = """
 SELECT revision.serving_revision_id,
        revision.published_at AS serving_revision_published_at,
@@ -39,6 +43,7 @@ SELECT revision.serving_revision_id,
        revision.expected_binding_count,
        revision.binding_set_digest,
 {pricing_projection_id_sql} AS pricing_projection_id,
+{pricing_projection_contract_sql} AS pricing_projection_contract,
        binding.binding_ordinal,
        binding.snapshot_id,
        binding.source_key,
@@ -97,9 +102,15 @@ def plan_release_serving_sql(
         if include_pricing_projection
         else "       NULL::varchar(64)"
     )
+    projection_contract_sql = (
+        _PRICING_PROJECTION_CONTRACT_SQL
+        if include_pricing_projection
+        else "       NULL::varchar(64)"
+    )
     return _PLAN_RELEASE_SERVING_SQL_TEMPLATE.format(
         schema=schema,
         pricing_projection_id_sql=projection_id_sql,
+        pricing_projection_contract_sql=projection_contract_sql,
         pricing_projection_join_sql=projection_join_sql,
     )
 

@@ -583,6 +583,9 @@ run_core_postgres() {
     tests/test_site_intelligence_fast_paths_postgres.py \
     tests/test_hospital_price_storage.py \
     tests/test_plan_pricing_projection_postgres.py \
+    tests/test_plan_pricing_projection_v3_postgres.py \
+    tests/test_plan_pricing_projection_v3_differential_postgres.py \
+    tests/test_ptg2_factorized_card_postgres.py \
     tests/test_provider_directory_migration_adoption_postgres.py \
     tests/test_provider_directory_observed_npi_index_migration.py \
     tests/test_provider_directory_caresource_census_db.py \

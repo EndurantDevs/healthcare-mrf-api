@@ -16,7 +16,14 @@ from decimal import Decimal, InvalidOperation
 from functools import partial
 from itertools import takewhile
 from types import MappingProxyType
-from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 
 from sqlalchemy import text
 
@@ -92,7 +99,20 @@ from api.plan_release_serving import (
     has_conflicting_release_selectors,
     resolve_plan_release_serving,
 )
-from api.plan_pricing_projection import search_plan_pricing_projection
+from api.plan_pricing_projection import (
+    PlanPricingProjectionUnavailable,
+    PlanPricingProjectionUnsupported,
+    search_plan_pricing_projection,
+)
+from api.plan_pricing_projection_contract import (
+    LEGACY_PROJECTION_CONTRACT as LEGACY_PLAN_PRICING_PROJECTION_CONTRACT,
+    PROJECTION_CONTRACT as PLAN_PRICING_PROJECTION_CONTRACT,
+    projection_code_identity as _plan_pricing_projection_code_identity,
+    table as _plan_pricing_projection_table,
+)
+from api.plan_pricing_projection_read import (
+    geo_cells as _plan_pricing_projection_geo_cells,
+)
 from api.ptg2_response import (
     _canonical_catalog_code,
     _catalog_key,
@@ -20820,6 +20840,891 @@ async def _network_tables_by_snapshot_id(
     return cached_tables_by_snapshot_id
 
 
+@dataclass(frozen=True)
+class _FactorizedCardCandidateSelection:
+    """One bounded, globally ordered provider candidate proof."""
+
+    minimum_rate_by_npi: Mapping[int, Decimal]
+    total_lower_bound: int
+    total_is_exact: bool
+
+
+@dataclass(frozen=True)
+class _FactorizedFrozenProviderCell:
+    """One nearest immutable provider cell selected for a release."""
+
+    npi: int
+    geo_cell: str
+    fragment: Mapping[str, Any]
+
+
+_FACTORIZED_CARD_MAX_WINDOW = 200
+_FACTORIZED_CARD_PROVIDER_SET_LIMIT = 65_536
+_FACTORIZED_CARD_MEMBERSHIP_LIMIT = 65_536
+_FACTORIZED_CARD_RATE_VALUE_LIMIT = 1_048_576
+_FACTORIZED_CARD_PROVIDER_FIELDS = (
+    "npi",
+    "provider_name",
+    "entity_type_code",
+    "credential",
+    "taxonomy_code",
+    "primary_specialty",
+    "classification",
+    "city",
+    "state",
+    "zip5",
+)
+
+_FACTORIZED_CARD_CANDIDATE_SQL = """
+    WITH profile_window AS MATERIALIZED (
+        SELECT binding_ordinal, provider_set_key, membership_count,
+               minimum_negotiated_rate
+          FROM {profile_table}
+         WHERE projection_id = :projection_id
+           AND code_system = :code_system
+           AND code = :code
+         ORDER BY minimum_negotiated_rate, binding_ordinal,
+                  provider_set_key
+         LIMIT :provider_set_probe_limit
+    ), ranked_profiles AS MATERIALIZED (
+        SELECT profile_window.*,
+               ROW_NUMBER() OVER (
+                   ORDER BY minimum_negotiated_rate, binding_ordinal,
+                            provider_set_key
+               ) AS profile_rank,
+               SUM(membership_count) OVER (
+                   ORDER BY minimum_negotiated_rate, binding_ordinal,
+                            provider_set_key
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+               ) AS cumulative_memberships
+          FROM profile_window
+    ), admitted_profiles AS MATERIALIZED (
+        SELECT * FROM ranked_profiles
+         WHERE profile_rank <= :provider_set_limit
+           AND cumulative_memberships <= :membership_limit
+    ), unread_profile AS MATERIALIZED (
+        SELECT minimum_negotiated_rate
+          FROM ranked_profiles
+         WHERE profile_rank > :provider_set_limit
+            OR cumulative_memberships > :membership_limit
+         ORDER BY profile_rank
+         LIMIT 1
+    ), admission AS MATERIALIZED (
+        SELECT COUNT(*)::bigint AS provider_set_count,
+               COALESCE(MAX(cumulative_memberships), 0)::bigint
+                   AS membership_count,
+               COALESCE(BOOL_AND(membership_count > 0), TRUE)
+                   AS profiles_valid
+          FROM admitted_profiles
+    ), cells AS MATERIALIZED (
+        SELECT geo_cell FROM unnest(CAST(:geo_cells AS varchar[]))
+             AS requested(geo_cell)
+    ), eligible AS MATERIALIZED (
+        SELECT member.npi,
+               MIN(profile.minimum_negotiated_rate) AS minimum_rate
+          FROM admitted_profiles profile
+          JOIN {membership_table} member
+            ON member.projection_id = :projection_id
+           AND member.binding_ordinal = profile.binding_ordinal
+           AND member.provider_set_key = profile.provider_set_key
+          JOIN {provider_table} provider
+            ON provider.projection_id = member.projection_id
+           AND provider.npi = member.npi
+          JOIN cells ON cells.geo_cell = provider.geo_cell
+         WHERE TRUE {taxonomy_sql}
+         GROUP BY member.npi
+    ), boundary AS MATERIALIZED (
+        SELECT minimum_rate FROM eligible
+         ORDER BY minimum_rate, npi
+        OFFSET :boundary_offset LIMIT 1
+    ), metadata AS MATERIALIZED (
+        SELECT (SELECT COUNT(*) FROM eligible)::bigint
+                   AS total_lower_bound,
+               NOT EXISTS (SELECT 1 FROM unread_profile)
+                   AS profile_exhausted,
+               (SELECT minimum_negotiated_rate FROM unread_profile)
+                   AS unread_minimum_rate,
+               (SELECT minimum_rate FROM boundary) AS boundary_rate,
+               admission.provider_set_count,
+               admission.membership_count,
+               admission.profiles_valid
+          FROM admission
+    ), selected AS MATERIALIZED (
+        SELECT eligible.npi, eligible.minimum_rate
+          FROM eligible
+         WHERE NOT EXISTS (SELECT 1 FROM boundary)
+            OR eligible.minimum_rate <= (
+                SELECT minimum_rate FROM boundary
+            )
+         ORDER BY eligible.minimum_rate, eligible.npi
+         LIMIT :candidate_probe_limit
+    )
+    SELECT selected.npi, selected.minimum_rate,
+           metadata.total_lower_bound, metadata.profile_exhausted,
+           metadata.unread_minimum_rate, metadata.boundary_rate,
+           metadata.provider_set_count, metadata.membership_count,
+           metadata.profiles_valid
+      FROM metadata
+      LEFT JOIN selected ON TRUE
+     ORDER BY selected.minimum_rate NULLS LAST,
+              selected.npi NULLS LAST
+"""
+
+_FACTORIZED_CARD_COMPLETION_SQL = """
+    WITH selected AS MATERIALIZED (
+        SELECT npi FROM unnest(CAST(:selected_npis AS bigint[]))
+             AS requested(npi)
+    ), cells AS MATERIALIZED (
+        SELECT geo_cell, cell_rank
+          FROM unnest(CAST(:geo_cells AS varchar[])) WITH ORDINALITY
+               AS requested(geo_cell, cell_rank)
+    ), selected_memberships AS MATERIALIZED (
+        SELECT member.npi, member.binding_ordinal,
+               member.provider_set_key
+          FROM selected
+          JOIN {membership_table} member USING (npi)
+          JOIN {profile_table} profile
+            ON profile.projection_id = member.projection_id
+           AND profile.code_system = :code_system
+           AND profile.code = :code
+           AND profile.binding_ordinal = member.binding_ordinal
+           AND profile.provider_set_key = member.provider_set_key
+         WHERE member.projection_id = :projection_id
+         ORDER BY member.npi, member.binding_ordinal,
+                  member.provider_set_key
+         LIMIT :membership_probe_limit
+    ), profile_keys AS MATERIALIZED (
+        SELECT DISTINCT binding_ordinal, provider_set_key
+          FROM selected_memberships
+         ORDER BY binding_ordinal, provider_set_key
+         LIMIT :provider_set_probe_limit
+    ), scope_admission AS MATERIALIZED (
+        SELECT (SELECT COUNT(*) FROM selected_memberships)::bigint
+                   AS membership_count,
+               (SELECT COUNT(*) FROM profile_keys)::bigint
+                   AS provider_set_count
+    ), admitted_profile_keys AS MATERIALIZED (
+        SELECT profile_keys.*
+          FROM profile_keys
+         CROSS JOIN scope_admission
+         WHERE scope_admission.membership_count <= :membership_limit
+           AND scope_admission.provider_set_count <= :provider_set_limit
+    ), profile_scope AS MATERIALIZED (
+        SELECT profile.binding_ordinal, profile.provider_set_key,
+               cardinality(profile.negotiated_rates)::bigint
+                   AS rate_value_count
+          FROM admitted_profile_keys keys
+          JOIN {profile_table} profile
+            ON profile.projection_id = :projection_id
+           AND profile.code_system = :code_system
+           AND profile.code = :code
+           AND profile.binding_ordinal = keys.binding_ordinal
+           AND profile.provider_set_key = keys.provider_set_key
+    ), rate_admission AS MATERIALIZED (
+        SELECT COALESCE(SUM(rate_value_count), 0)::bigint
+                   AS rate_value_count
+          FROM profile_scope
+    ), admitted_profiles AS MATERIALIZED (
+        SELECT profile.binding_ordinal, profile.provider_set_key,
+               profile.minimum_negotiated_rate,
+               profile.maximum_negotiated_rate, profile.rate_count,
+               profile.negotiated_rates, profile.rate_multiplicities
+          FROM profile_scope scope
+          JOIN {profile_table} profile
+            ON profile.projection_id = :projection_id
+           AND profile.code_system = :code_system
+           AND profile.code = :code
+           AND profile.binding_ordinal = scope.binding_ordinal
+           AND profile.provider_set_key = scope.provider_set_key
+         CROSS JOIN rate_admission
+         WHERE rate_admission.rate_value_count <= :rate_value_limit
+    ), profile_validation AS MATERIALIZED (
+        SELECT COALESCE(BOOL_AND(
+                   cardinality(negotiated_rates) > 0
+                   AND cardinality(negotiated_rates)
+                       = cardinality(rate_multiplicities)
+                   AND minimum_negotiated_rate = negotiated_rates[1]
+                   AND maximum_negotiated_rate = negotiated_rates[
+                       cardinality(negotiated_rates)
+                   ]
+                   AND rate_count = (
+                       SELECT SUM(multiplicity)::bigint
+                         FROM unnest(rate_multiplicities)
+                              AS listed(multiplicity)
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM generate_subscripts(
+                             negotiated_rates, 1
+                         ) AS indexes(rate_index)
+                        WHERE rate_index > 1
+                          AND negotiated_rates[rate_index]
+                              <= negotiated_rates[rate_index - 1]
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM unnest(rate_multiplicities)
+                              AS listed(multiplicity)
+                        WHERE multiplicity <= 0
+                   )
+               ), TRUE) AS profiles_valid
+          FROM admitted_profiles
+    ), admission AS MATERIALIZED (
+        SELECT scope_admission.membership_count,
+               scope_admission.provider_set_count,
+               rate_admission.rate_value_count,
+               profile_validation.profiles_valid
+          FROM scope_admission
+         CROSS JOIN rate_admission
+         CROSS JOIN profile_validation
+    ), stats AS MATERIALIZED (
+        SELECT member.npi,
+               MIN(profile.minimum_negotiated_rate) AS minimum_rate,
+               MAX(profile.maximum_negotiated_rate) AS maximum_rate,
+               SUM(profile.rate_count)::bigint AS rate_count
+          FROM selected_memberships member
+          JOIN admitted_profiles profile USING (
+               binding_ordinal, provider_set_key
+          )
+         CROSS JOIN profile_validation
+         WHERE profile_validation.profiles_valid
+         GROUP BY member.npi
+    ), ranked_provider AS MATERIALIZED (
+        SELECT provider.npi, provider.geo_cell,
+               provider.entity_type_code, provider.taxonomy_codes,
+               provider.fragment,
+               ROW_NUMBER() OVER (
+                   PARTITION BY provider.npi
+                   ORDER BY cells.cell_rank, provider.geo_cell
+               ) AS address_rank
+          FROM selected
+          JOIN {provider_table} provider USING (npi)
+          JOIN cells ON cells.geo_cell = provider.geo_cell
+         CROSS JOIN admission
+         WHERE provider.projection_id = :projection_id
+           AND admission.membership_count <= :membership_limit
+           AND admission.provider_set_count <= :provider_set_limit
+           AND admission.rate_value_count <= :rate_value_limit
+           {taxonomy_sql}
+    )
+    SELECT selected.npi, stats.minimum_rate, stats.maximum_rate,
+           stats.rate_count, ranked_provider.geo_cell,
+           ranked_provider.entity_type_code,
+           ranked_provider.taxonomy_codes, ranked_provider.fragment,
+           admission.membership_count, admission.provider_set_count,
+           admission.rate_value_count, admission.profiles_valid
+      FROM selected
+     CROSS JOIN admission
+      LEFT JOIN stats USING (npi)
+      LEFT JOIN ranked_provider
+        ON ranked_provider.npi = selected.npi
+       AND ranked_provider.address_rank = 1
+     ORDER BY selected.npi
+"""
+
+
+def _uses_factorized_release_cards(
+    args: Mapping[str, Any],
+    pagination: Any,
+) -> bool:
+    """Select only the explicit compact provider-card request contract."""
+
+    if str(args.get("view") or "").strip().lower() != "card":
+        return False
+    if not _is_request_flag_enabled(args.get("include_providers"), default=True):
+        return False
+    requested_offset = max(int(getattr(pagination, "offset", 0) or 0), 0)
+    requested_limit = max(int(getattr(pagination, "limit", 25) or 25), 1)
+    if requested_offset + requested_limit > _FACTORIZED_CARD_MAX_WINDOW:
+        raise PlanPricingProjectionUnsupported(
+            "view=card requires offset + limit to be at most 200"
+        )
+    has_zip = bool(str(args.get("zip5") or args.get("zip") or "").strip())
+    has_latitude = args.get("lat") is not None
+    has_longitude = args.get("long") is not None
+    if has_latitude != has_longitude:
+        raise PlanPricingProjectionUnsupported(
+            "factorized view=card requires both latitude and longitude"
+        )
+    if not has_zip and not (has_latitude and has_longitude):
+        raise PlanPricingProjectionUnsupported(
+            "factorized view=card requires ZIP5 or coordinates"
+        )
+    if _is_cost_order_descending(args):
+        raise PlanPricingProjectionUnsupported(
+            "factorized view=card currently supports ascending cost order only"
+        )
+    return True
+
+
+def _factorized_card_code_identity(
+    args: Mapping[str, Any],
+) -> tuple[str, str]:
+    """Return the projection's canonical CPT/HCPCS-compatible identity."""
+
+    code_identity = _plan_pricing_projection_code_identity(
+        args.get("code_system"),
+        args.get("code"),
+    )
+    if code_identity is None:
+        raise PlanPricingProjectionUnsupported(
+            "factorized view=card requires code_system and code"
+        )
+    return code_identity
+
+
+def _factorized_card_frozen_taxonomy(
+    args: Mapping[str, Any],
+    *,
+    provider_alias: str = "provider",
+) -> tuple[str, dict[str, Any]]:
+    """Bind the projection-build taxonomy rule to frozen provider cells."""
+
+    rule = _inferred_provider_taxonomy_rule(dict(args))
+    if rule is None:
+        return "", {}
+    taxonomy_codes = sorted(
+        {
+            str(taxonomy_code).strip().upper()
+            for taxonomy_code in rule.taxonomy_codes
+            if str(taxonomy_code).strip()
+        }
+    )
+    return (
+        f"AND {provider_alias}.entity_type_code = 1 "
+        "AND EXISTS ("
+        f"SELECT 1 FROM unnest({provider_alias}.taxonomy_codes) "
+        "AS stored_taxonomy(taxonomy_code) "
+        "WHERE UPPER(BTRIM(stored_taxonomy.taxonomy_code)) = ANY("
+        "CAST(:taxonomy_codes AS varchar[])))",
+        {"taxonomy_codes": taxonomy_codes},
+    )
+
+
+def _factorized_card_provider_fragment(
+    provider_by_field: Mapping[str, Any],
+) -> _FactorizedFrozenProviderCell:
+    """Validate one immutable provider fragment before serving it."""
+
+    raw_fragment = provider_by_field.get("fragment")
+    if isinstance(raw_fragment, memoryview):
+        raw_fragment = raw_fragment.tobytes()
+    try:
+        fragment_by_field = json.loads(raw_fragment)
+    except (TypeError, ValueError, UnicodeDecodeError) as exc:
+        raise PTG2ManifestArtifactError(
+            "plan-pricing provider-cell fragment is invalid"
+        ) from exc
+    required_fields = set(_FACTORIZED_CARD_PROVIDER_FIELDS)
+    if not isinstance(fragment_by_field, dict) or not required_fields.issubset(
+        fragment_by_field
+    ):
+        raise PTG2ManifestArtifactError(
+            "plan-pricing provider-cell fragment is incomplete"
+        )
+    try:
+        npi = int(provider_by_field["npi"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError(
+            "plan-pricing provider-cell NPI is invalid"
+        ) from exc
+    geo_cell = str(provider_by_field.get("geo_cell") or "")
+    taxonomy_codes = {
+        str(taxonomy_code or "").strip().upper()
+        for taxonomy_code in provider_by_field.get("taxonomy_codes") or ()
+    }
+    fragment_taxonomy = str(
+        fragment_by_field.get("taxonomy_code") or ""
+    ).strip().upper()
+    if (
+        npi <= 0
+        or fragment_by_field.get("npi") != npi
+        or fragment_by_field.get("zip5") != geo_cell
+        or fragment_by_field.get("entity_type_code")
+        != provider_by_field.get("entity_type_code")
+        or (fragment_taxonomy and fragment_taxonomy not in taxonomy_codes)
+    ):
+        raise PTG2ManifestArtifactError(
+            "plan-pricing provider-cell fragment disagrees with its key"
+        )
+    return _FactorizedFrozenProviderCell(npi, geo_cell, fragment_by_field)
+
+
+def _factorized_card_candidate_query(taxonomy_sql: str) -> Any:
+    """Build one release-wide bounded candidate query."""
+
+    return text(
+        _FACTORIZED_CARD_CANDIDATE_SQL.format(
+            profile_table=_plan_pricing_projection_table(
+                "plan_pricing_rate_profile"
+            ),
+            membership_table=_plan_pricing_projection_table(
+                "plan_pricing_provider_membership"
+            ),
+            provider_table=_plan_pricing_projection_table(
+                "plan_pricing_provider_cell"
+            ),
+            taxonomy_sql=taxonomy_sql,
+        )
+    )
+
+
+def _factorized_card_candidate_metadata(
+    candidate_rows: Sequence[Mapping[str, Any]],
+) -> tuple[Mapping[str, Any], int, bool]:
+    """Validate the one admission receipt repeated on candidate rows."""
+
+    if not candidate_rows:
+        raise PTG2ManifestArtifactError(
+            "plan-pricing candidate query returned no metadata"
+        )
+    metadata_by_field = candidate_rows[0]
+    metadata_field_names = (
+        "total_lower_bound",
+        "profile_exhausted",
+        "unread_minimum_rate",
+        "boundary_rate",
+        "provider_set_count",
+        "membership_count",
+        "profiles_valid",
+    )
+    if any(
+        any(
+            candidate_by_field.get(field_name)
+            != metadata_by_field.get(field_name)
+            for field_name in metadata_field_names
+        )
+        for candidate_by_field in candidate_rows[1:]
+    ):
+        raise PTG2ManifestArtifactError(
+            "plan-pricing candidate metadata is inconsistent"
+        )
+    try:
+        provider_set_count = int(
+            metadata_by_field.get("provider_set_count") or 0
+        )
+        membership_count = int(
+            metadata_by_field.get("membership_count") or 0
+        )
+        total_lower_bound = int(
+            metadata_by_field.get("total_lower_bound") or 0
+        )
+    except (TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError(
+            "plan-pricing candidate metadata is invalid"
+        ) from exc
+    if provider_set_count > _FACTORIZED_CARD_PROVIDER_SET_LIMIT:
+        raise PTG2OnlineWorkBudgetExceeded("code_sets")
+    if membership_count > _FACTORIZED_CARD_MEMBERSHIP_LIMIT:
+        raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+    if metadata_by_field.get("profiles_valid") is not True:
+        raise PTG2ManifestArtifactError(
+            "plan-pricing candidate rate profile is invalid"
+        )
+    profile_exhausted = metadata_by_field.get("profile_exhausted")
+    if not isinstance(profile_exhausted, bool):
+        raise PTG2ManifestArtifactError(
+            "plan-pricing candidate exhaustion proof is invalid"
+        )
+    return metadata_by_field, total_lower_bound, profile_exhausted
+
+
+def _factorized_card_candidate_selection(
+    candidate_rows: Sequence[Mapping[str, Any]],
+    *,
+    target_count: int,
+    candidate_limit: int,
+) -> _FactorizedCardCandidateSelection:
+    """Validate candidate admission, tie completeness, and progressive total."""
+
+    metadata, total_lower_bound, profile_exhausted = (
+        _factorized_card_candidate_metadata(candidate_rows)
+    )
+    minimum_rate_by_npi: dict[int, Decimal] = {}
+    for candidate_by_field in candidate_rows:
+        if candidate_by_field.get("npi") is None:
+            continue
+        try:
+            npi = int(candidate_by_field["npi"])
+            minimum_rate = Decimal(candidate_by_field["minimum_rate"])
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise PTG2ManifestArtifactError(
+                "plan-pricing candidate query returned an invalid NPI"
+            ) from exc
+        if npi <= 0 or npi in minimum_rate_by_npi:
+            raise PTG2ManifestArtifactError(
+                "plan-pricing candidate query returned an invalid NPI"
+            )
+        minimum_rate_by_npi[npi] = minimum_rate
+    if len(minimum_rate_by_npi) > candidate_limit:
+        raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+    if total_lower_bound < len(minimum_rate_by_npi):
+        raise PTG2ManifestArtifactError(
+            "plan-pricing candidate total is inconsistent"
+        )
+    boundary_rate = metadata.get("boundary_rate")
+    unread_rate = metadata.get("unread_minimum_rate")
+    if not profile_exhausted and (
+        boundary_rate is None
+        or unread_rate is None
+        or Decimal(unread_rate) <= Decimal(boundary_rate)
+        or total_lower_bound < max(int(target_count), 1)
+    ):
+        raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+    return _FactorizedCardCandidateSelection(
+        minimum_rate_by_npi,
+        total_lower_bound,
+        profile_exhausted,
+    )
+
+
+async def _factorized_card_candidates(
+    session: Any,
+    projection_id: str,
+    code_identity: tuple[str, str],
+    selected_geo_cells: Sequence[str],
+    args: Mapping[str, Any],
+    target_count: int,
+) -> _FactorizedCardCandidateSelection:
+    """Read one bounded candidate prefix across every release binding."""
+
+    if not selected_geo_cells:
+        return _FactorizedCardCandidateSelection({}, 0, True)
+    taxonomy_sql, taxonomy_parameters = _factorized_card_frozen_taxonomy(args)
+    candidate_limit = max(_ptg2_manifest_location_match_limit(), target_count)
+    candidate_result = await session.execute(
+        _factorized_card_candidate_query(taxonomy_sql),
+        {
+            "projection_id": projection_id,
+            "code_system": code_identity[0],
+            "code": code_identity[1],
+            "geo_cells": list(selected_geo_cells),
+            "provider_set_limit": _FACTORIZED_CARD_PROVIDER_SET_LIMIT,
+            "provider_set_probe_limit": _FACTORIZED_CARD_PROVIDER_SET_LIMIT + 1,
+            "membership_limit": _FACTORIZED_CARD_MEMBERSHIP_LIMIT,
+            "boundary_offset": max(int(target_count), 1) - 1,
+            "candidate_probe_limit": candidate_limit + 1,
+            **taxonomy_parameters,
+        },
+    )
+    return _factorized_card_candidate_selection(
+        candidate_result.mappings().all(),
+        target_count=target_count,
+        candidate_limit=candidate_limit,
+    )
+
+
+def _factorized_card_completion_query(taxonomy_sql: str) -> Any:
+    """Build one exact selected-NPI completion and frozen-cell query."""
+
+    return text(
+        _FACTORIZED_CARD_COMPLETION_SQL.format(
+            profile_table=_plan_pricing_projection_table(
+                "plan_pricing_rate_profile"
+            ),
+            membership_table=_plan_pricing_projection_table(
+                "plan_pricing_provider_membership"
+            ),
+            provider_table=_plan_pricing_projection_table(
+                "plan_pricing_provider_cell"
+            ),
+            taxonomy_sql=taxonomy_sql,
+        )
+    )
+
+
+def _factorized_card_payload(
+    completion_by_field: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate exact selected-NPI statistics and shape one compact card."""
+
+    try:
+        minimum_rate = Decimal(completion_by_field["minimum_rate"])
+        maximum_rate = Decimal(completion_by_field["maximum_rate"])
+        rate_count = int(completion_by_field["rate_count"])
+    except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+        raise PTG2ManifestArtifactError(
+            "plan-pricing selected-provider rates are incomplete"
+        ) from exc
+    if minimum_rate < 0 or maximum_rate < minimum_rate or rate_count <= 0:
+        raise PTG2ManifestArtifactError(
+            "plan-pricing selected-provider rates are invalid"
+        )
+    provider_cell = _factorized_card_provider_fragment(completion_by_field)
+    payload_by_field = {
+        field_name: provider_cell.fragment[field_name]
+        for field_name in _FACTORIZED_CARD_PROVIDER_FIELDS
+    }
+    payload_by_field.update(
+        {
+            "minimum_negotiated_rate": _coerce_numeric_rate(minimum_rate),
+            "maximum_negotiated_rate": _coerce_numeric_rate(maximum_rate),
+            "rate_count": rate_count,
+        }
+    )
+    return payload_by_field
+
+
+def _factorized_card_completion_metadata(
+    completion_rows: Sequence[Mapping[str, Any]],
+) -> None:
+    """Validate one repeated selected-profile admission receipt."""
+
+    metadata_by_field = completion_rows[0]
+    metadata_field_names = (
+        "membership_count",
+        "provider_set_count",
+        "rate_value_count",
+        "profiles_valid",
+    )
+    if any(
+        any(
+            completion_by_field.get(field_name)
+            != metadata_by_field.get(field_name)
+            for field_name in metadata_field_names
+        )
+        for completion_by_field in completion_rows[1:]
+    ):
+        raise PTG2ManifestArtifactError(
+            "plan-pricing selected-provider metadata is inconsistent"
+        )
+    try:
+        membership_count = int(
+            metadata_by_field.get("membership_count") or 0
+        )
+        provider_set_count = int(
+            metadata_by_field.get("provider_set_count") or 0
+        )
+        rate_value_count = int(
+            metadata_by_field.get("rate_value_count") or 0
+        )
+    except (TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError(
+            "plan-pricing selected-provider metadata is invalid"
+        ) from exc
+    if membership_count > _FACTORIZED_CARD_MEMBERSHIP_LIMIT:
+        raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+    if provider_set_count > _FACTORIZED_CARD_PROVIDER_SET_LIMIT:
+        raise PTG2OnlineWorkBudgetExceeded("code_sets")
+    if rate_value_count > _FACTORIZED_CARD_RATE_VALUE_LIMIT:
+        raise PTG2OnlineWorkBudgetExceeded("rate_values")
+    if metadata_by_field.get("profiles_valid") is not True:
+        raise PTG2ManifestArtifactError(
+            "plan-pricing selected-provider rate profile is invalid"
+        )
+
+
+def _factorized_card_completion_items(
+    completion_rows: Sequence[Mapping[str, Any]],
+    selected_npis: tuple[int, ...],
+    expected_minimum_by_npi: Mapping[int, Decimal],
+) -> list[dict[str, Any]]:
+    """Validate completion admission, frozen cells, and exact minima."""
+
+    if not completion_rows and selected_npis:
+        raise PTG2ManifestArtifactError(
+            "plan-pricing selected-provider completion returned no rows"
+        )
+    if not selected_npis:
+        return []
+    _factorized_card_completion_metadata(completion_rows)
+    item_by_npi: dict[int, dict[str, Any]] = {}
+    for completion_by_field in completion_rows:
+        npi = int(completion_by_field["npi"])
+        if npi in item_by_npi or npi not in selected_npis:
+            raise PTG2ManifestArtifactError(
+                "plan-pricing selected-provider completion is inconsistent"
+            )
+        payload_by_field = _factorized_card_payload(completion_by_field)
+        if Decimal(completion_by_field["minimum_rate"]) != (
+            expected_minimum_by_npi[npi]
+        ):
+            raise PTG2ManifestArtifactError(
+                "plan-pricing selected-provider minimum changed during completion"
+            )
+        item_by_npi[npi] = payload_by_field
+    if set(item_by_npi) != set(selected_npis):
+        raise PTG2ManifestArtifactError(
+            "plan-pricing selected-provider completion lost a provider"
+        )
+    return sorted(
+        item_by_npi.values(),
+        key=lambda item: (
+            Decimal(str(item["minimum_negotiated_rate"])),
+            int(item["npi"]),
+        ),
+    )
+
+
+async def _factorized_card_complete_selected_npis(
+    session: Any,
+    projection_id: str,
+    code_identity: tuple[str, str],
+    selected_geo_cells: Sequence[str],
+    args: Mapping[str, Any],
+    selected_npis: tuple[int, ...],
+    expected_minimum_by_npi: Mapping[int, Decimal],
+) -> list[dict[str, Any]]:
+    """Complete selected NPIs once across all bindings and frozen cells."""
+
+    if not selected_npis:
+        return []
+    taxonomy_sql, taxonomy_parameters = _factorized_card_frozen_taxonomy(args)
+    completion_result = await session.execute(
+        _factorized_card_completion_query(taxonomy_sql),
+        {
+            "projection_id": projection_id,
+            "code_system": code_identity[0],
+            "code": code_identity[1],
+            "selected_npis": list(selected_npis),
+            "geo_cells": list(selected_geo_cells),
+            "membership_limit": _FACTORIZED_CARD_MEMBERSHIP_LIMIT,
+            "membership_probe_limit": _FACTORIZED_CARD_MEMBERSHIP_LIMIT + 1,
+            "provider_set_limit": _FACTORIZED_CARD_PROVIDER_SET_LIMIT,
+            "provider_set_probe_limit": (
+                _FACTORIZED_CARD_PROVIDER_SET_LIMIT + 1
+            ),
+            "rate_value_limit": _FACTORIZED_CARD_RATE_VALUE_LIMIT,
+            **taxonomy_parameters,
+        },
+    )
+    return _factorized_card_completion_items(
+        completion_result.mappings().all(),
+        selected_npis,
+        expected_minimum_by_npi,
+    )
+
+
+def _factorized_card_projection_id(
+    release_selection: PlanReleaseServingSelection,
+) -> str:
+    """Require the exact attached factorized projection identity."""
+
+    projection_id = str(
+        release_selection.pricing_projection_id or ""
+    ).strip()
+    if (
+        release_selection.pricing_projection_contract
+        != PLAN_PRICING_PROJECTION_CONTRACT
+        or re.fullmatch(r"[0-9a-f]{64}", projection_id) is None
+    ):
+        raise PlanPricingProjectionUnavailable(
+            "the selected release has no compatible factorized projection"
+        )
+    return projection_id
+
+
+def _factorized_card_response(
+    release_selection: PlanReleaseServingSelection,
+    args: dict[str, Any],
+    pagination: Any,
+    card_items: list[dict[str, Any]],
+    candidate_selection: _FactorizedCardCandidateSelection,
+    *,
+    has_geo_cells: bool,
+) -> dict[str, Any]:
+    """Shape one compact page with progressive or exact total metadata."""
+
+    start = max(int(getattr(pagination, "offset", 0) or 0), 0)
+    limit = max(int(getattr(pagination, "limit", 25) or 25), 1)
+    page_item_list = card_items[start : start + limit]
+    query_by_field = _plan_release_no_match_query(release_selection, args)
+    query_by_field.update(
+        view="card",
+        include_providers=True,
+        projection_contract=PLAN_PRICING_PROJECTION_CONTRACT,
+        source="plan_pricing_projection",
+        status="matched" if page_item_list else "no_match",
+    )
+    response_by_field = {
+        "result_type": "provider_cards",
+        "result_state": (
+            "matched"
+            if candidate_selection.minimum_rate_by_npi
+            else (
+                "no_matching_rates" if has_geo_cells else "no_match_in_radius"
+            )
+        ),
+        "pricing_scope": "plan_scoped_ptg",
+        "resolved": True,
+        "items": page_item_list,
+        "pagination": {
+            "total": candidate_selection.total_lower_bound,
+            "total_is_exact": candidate_selection.total_is_exact,
+            "total_lower_bound": candidate_selection.total_lower_bound,
+            "limit": limit,
+            "offset": start,
+            "page": (start // limit) + 1,
+            "has_more": (
+                not candidate_selection.total_is_exact
+                or start + len(page_item_list)
+                < candidate_selection.total_lower_bound
+            ),
+        },
+        "query": query_by_field,
+    }
+    return annotate_plan_release_response(
+        response_by_field,
+        release_selection,
+    ) or response_by_field
+
+
+async def _search_factorized_plan_release_cards(
+    session: Any,
+    args: dict[str, Any],
+    pagination: Any,
+    release_selection: PlanReleaseServingSelection,
+) -> dict[str, Any]:
+    """Serve compact V3 cards with two release-wide bounded SQL reads."""
+
+    projection_id = _factorized_card_projection_id(release_selection)
+    code_identity = _factorized_card_code_identity(args)
+    selected_geo_cells = await _plan_pricing_projection_geo_cells(
+        session,
+        args,
+        result_type="provider_cards",
+    )
+    target_count = max(
+        int(getattr(pagination, "offset", 0) or 0)
+        + int(getattr(pagination, "limit", 25) or 25)
+        + 1,
+        1,
+    )
+    candidate_selection = await _factorized_card_candidates(
+        session,
+        projection_id,
+        code_identity,
+        selected_geo_cells,
+        args,
+        target_count,
+    )
+    ordered_npi_list = sorted(
+        candidate_selection.minimum_rate_by_npi,
+        key=lambda npi: (
+            candidate_selection.minimum_rate_by_npi[npi],
+            npi,
+        ),
+    )
+    selected_npis = tuple(ordered_npi_list[:target_count])
+    card_items = await _factorized_card_complete_selected_npis(
+        session,
+        projection_id,
+        code_identity,
+        selected_geo_cells,
+        args,
+        selected_npis,
+        candidate_selection.minimum_rate_by_npi,
+    )
+    return _factorized_card_response(
+        release_selection,
+        args,
+        pagination,
+        card_items,
+        candidate_selection,
+        has_geo_cells=bool(selected_geo_cells),
+    )
+
+
 async def _search_multi_ptg2_snapshots(
     session,
     network_snapshots: list[tuple[str, str]],
@@ -21021,12 +21926,14 @@ async def _read_multi_ptg2_snapshots(
     return network_responses
 
 
-async def _search_plan_release_index(
+async def _search_established_plan_release_index(
     session,
     args: dict[str, Any],
     pagination,
     release_selection: PlanReleaseServingSelection,
 ) -> dict[str, Any] | None:
+    """Serve the unchanged full or legacy-card release contract."""
+
     release_bindings = release_selection.in_network_bindings
     serving_tables_by_snapshot_id = (
         release_selection.network_tables_by_snapshot()
@@ -21068,6 +21975,47 @@ async def _search_plan_release_index(
         release_selection,
         args,
         pagination,
+    )
+
+
+async def _search_plan_release_index(
+    session,
+    args: dict[str, Any],
+    pagination,
+    release_selection: PlanReleaseServingSelection,
+) -> dict[str, Any] | None:
+    """Route one immutable release to factorized or established serving."""
+
+    projection_contract = getattr(
+        release_selection, "pricing_projection_contract", None
+    )
+    is_provider_card_request = (
+        str(args.get("view") or "").strip().lower() == "card"
+        and _is_request_flag_enabled(
+            args.get("include_providers"), default=True
+        )
+    )
+    if projection_contract == PLAN_PRICING_PROJECTION_CONTRACT and (
+        _uses_factorized_release_cards(args, pagination)
+    ):
+        return await _search_factorized_plan_release_cards(
+            session,
+            args,
+            pagination,
+            release_selection,
+        )
+    if is_provider_card_request and projection_contract not in {
+        None,
+        LEGACY_PLAN_PRICING_PROJECTION_CONTRACT,
+    }:
+        raise PlanPricingProjectionUnavailable(
+            "the selected pricing projection contract is unsupported"
+        )
+    return await _search_established_plan_release_index(
+        session,
+        args,
+        pagination,
+        release_selection,
     )
 
 

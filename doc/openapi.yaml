@@ -5154,9 +5154,9 @@ paths:
             Response detail for an immutable release-scoped pricing search.
             `full` retains the complete PTG/TiC response. `card` requires a
             resolved `plan_release_id`; representable provider expansions use
-            compact pre-rendered provider cards, while incompatible provider-card
-            filters are rejected. With `view=card`, `include_providers=false`
-            serves precomputed ZIP-cell rate aggregates for representable
+            compact release-frozen factorized provider cards, while incompatible
+            provider-card filters are rejected. With `view=card`, `include_providers=false`
+            serves exact packed ZIP-cell rate aggregates for representable
             shapes; filters not represented by the projection retain the
             existing aggregate reader. Omitting `view` with explicit
             `include_providers=false` prefers those aggregate rows and falls
@@ -5621,9 +5621,9 @@ paths:
             Response detail for an immutable release-scoped pricing search.
             `full` retains the complete PTG/TiC response. `card` requires a
             resolved `plan_release_id`; representable provider expansions use
-            compact pre-rendered provider cards, while incompatible provider-card
-            filters are rejected. With `view=card`, `include_providers=false`
-            serves precomputed ZIP-cell rate aggregates for representable
+            compact release-frozen factorized provider cards, while incompatible
+            provider-card filters are rejected. With `view=card`, `include_providers=false`
+            serves exact packed ZIP-cell rate aggregates for representable
             shapes; filters not represented by the projection retain the
             existing aggregate reader. Omitting `view` with explicit
             `include_providers=false` prefers those aggregate rows and falls
@@ -8825,6 +8825,7 @@ components:
             projection_contract:
               type: string
               nullable: true
+              enum: [plan_pricing_card_v2, plan_pricing_factorized_v3]
             state:
               type: string
               nullable: true
