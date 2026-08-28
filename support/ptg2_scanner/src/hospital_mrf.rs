@@ -40,6 +40,7 @@ include!("hospital_mrf/packed_output.rs");
 mod tests {
     include!("hospital_mrf/tests_support.rs");
     include!("hospital_mrf/tests_import.rs");
+    include!("hospital_mrf/tests_csv_compatibility.rs");
     include!("hospital_mrf/tests_validation.rs");
     include!("hospital_mrf/tests_limits.rs");
     include!("hospital_mrf/tests_packed.rs");

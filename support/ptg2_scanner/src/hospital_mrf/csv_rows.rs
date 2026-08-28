@@ -205,6 +205,27 @@ fn parse_tall_payer(
     {
         return Ok(None);
     }
+    if [
+        columns.payer_name,
+        columns.plan_name,
+        columns.standard_charge_dollar,
+        columns.standard_charge_percentage,
+        columns.standard_charge_algorithm,
+        columns.median_amount,
+        columns.percentile_10,
+        columns.percentile_90,
+    ]
+    .iter()
+    .all(|column| csv_value(record, *column).trim().is_empty())
+        && csv_value(record, columns.allowed_count).trim() == "0"
+        && generic_notes.is_some_and(|notes| !notes.trim().is_empty())
+    {
+        let methodology = csv_value(record, columns.methodology).trim();
+        if !methodology.is_empty() {
+            canonical_methodology(methodology, true)?;
+        }
+        return Ok(None);
+    }
     validate_payer(
         PayerChargeRow {
             payer_name: csv_value(record, columns.payer_name).to_owned(),
@@ -266,6 +287,27 @@ fn parse_wide_payers(
             .iter()
             .all(|column| csv_value(record, *column).is_empty())
         {
+            continue;
+        }
+        if [
+            payer.standard_charge_dollar,
+            payer.standard_charge_percentage,
+            payer.standard_charge_algorithm,
+            payer.median_amount,
+            payer.percentile_10,
+            payer.percentile_90,
+        ]
+        .iter()
+        .all(|column| csv_value(record, *column).trim().is_empty())
+            && csv_value(record, payer.allowed_count).trim() == "0"
+            && !csv_value(record, payer.additional_payer_notes)
+                .trim()
+                .is_empty()
+        {
+            let methodology = csv_value(record, payer.methodology).trim();
+            if !methodology.is_empty() {
+                canonical_methodology(methodology, true)?;
+            }
             continue;
         }
         payers.push(validate_payer(
