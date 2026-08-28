@@ -14,6 +14,7 @@ from api.plan_pricing_projection_contract import (
     MAX_GEO_CELLS,
     PROJECTION_CONTRACT,
     ZIP5,
+    PlanPricingProjectionUnavailable,
     PlanPricingProjectionUnsupported,
     projection_code_identity,
     table,
@@ -268,9 +269,8 @@ def _validated_projection_request(
     if not selection.pricing_projection_id:
         if args.get("view") is None and result_type == "rate_aggregates":
             return None
-        raise PlanPricingProjectionUnsupported(
-            "view=card is unavailable because the selected release has no ready "
-            "card projection; omit view=card or use view=full"
+        raise PlanPricingProjectionUnavailable(
+            "the selected release has no ready card projection"
         )
     return _ProjectionRequest(
         result_type,
