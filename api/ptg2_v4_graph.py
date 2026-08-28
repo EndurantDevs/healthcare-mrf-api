@@ -1613,12 +1613,39 @@ async def _load_physical_blocks(
 ) -> dict[bytes, _CachedPhysicalBlock]:
     """Fetch and authenticate distinct physical CAS blocks once per request."""
 
+    coordinate_by_hash = _coordinates_by_physical_hash(coordinates)
+    blocks_by_hash, missing_hashes = _cached_physical_blocks(
+        coordinate_by_hash, object_kind
+    )
+    if missing_hashes:
+        await _fetch_missing_physical_blocks(
+            session,
+            schema_name,
+            object_kind,
+            maximum_raw_bytes,
+            coordinate_by_hash,
+            blocks_by_hash,
+            missing_hashes,
+        )
+    if set(blocks_by_hash) != set(coordinate_by_hash):
+        raise PTG2SharedBlockError("PTG V4 layout references a missing CAS block")
+    return blocks_by_hash
+
+
+def _coordinates_by_physical_hash(coordinates: Iterable[Any]) -> dict[bytes, Any]:
     coordinate_by_hash: dict[bytes, Any] = {}
     for coordinate in coordinates:
         block_hash = bytes(coordinate.block_hash)
         previous = coordinate_by_hash.setdefault(block_hash, coordinate)
         if int(previous.entry_count) != int(coordinate.entry_count):
             raise PTG2SharedBlockError("PTG V4 aliased block has conflicting counts")
+    return coordinate_by_hash
+
+
+def _cached_physical_blocks(
+    coordinate_by_hash: Mapping[bytes, Any],
+    object_kind: str,
+) -> tuple[dict[bytes, _CachedPhysicalBlock], list[bytes]]:
     blocks_by_hash: dict[bytes, _CachedPhysicalBlock] = {}
     missing_hashes: list[bytes] = []
     for block_hash, coordinate in coordinate_by_hash.items():
@@ -1633,56 +1660,61 @@ async def _load_physical_blocks(
             raise PTG2SharedBlockError("PTG V4 cached block identity is inconsistent")
         blocks_by_hash[block_hash] = cached
         _request_io().cache_hit_bytes += len(cached.payload)
+    return blocks_by_hash, missing_hashes
 
-    if missing_hashes:
-        schema = _quote_ident(schema_name)
-        query_result = await session.execute(
-            text(
-                f"""
-                SELECT block_hash, format_version, object_kind, codec,
-                       entry_count AS block_entry_count,
-                       raw_byte_count, stored_byte_count, payload
-                  FROM {schema}.ptg2_v3_block
-                 WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))
-                """
-            ),
-            {"block_hashes": missing_hashes},
+
+async def _fetch_missing_physical_blocks(
+    session: Any,
+    schema_name: str,
+    object_kind: str,
+    maximum_raw_bytes: int,
+    coordinate_by_hash: Mapping[bytes, Any],
+    blocks_by_hash: dict[bytes, _CachedPhysicalBlock],
+    missing_hashes: list[bytes],
+) -> None:
+    schema = _quote_ident(schema_name)
+    query_result = await session.execute(
+        text(
+            f"""
+            SELECT block_hash, format_version, object_kind, codec,
+                   entry_count AS block_entry_count,
+                   raw_byte_count, stored_byte_count, payload
+              FROM {schema}.ptg2_v3_block
+             WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))
+            """
+        ),
+        {"block_hashes": missing_hashes},
+    )
+    for raw_row in query_result:
+        block_row = _row_mapping(raw_row)
+        physical = _validated_physical_block(
+            block_row,
+            expected_kind=object_kind,
+            maximum_raw_bytes=int(maximum_raw_bytes),
         )
-        for raw_row in query_result:
-            block_row = _row_mapping(raw_row)
-            physical = _validated_physical_block(
-                block_row,
-                expected_kind=object_kind,
-                maximum_raw_bytes=int(maximum_raw_bytes),
+        coordinate = coordinate_by_hash.get(physical.block_hash)
+        if coordinate is None or physical.block_hash in blocks_by_hash:
+            raise PTG2SharedBlockError(
+                "PTG V4 physical query returned an unexpected block"
             )
-            coordinate = coordinate_by_hash.get(physical.block_hash)
-            if coordinate is None or physical.block_hash in blocks_by_hash:
-                raise PTG2SharedBlockError(
-                    "PTG V4 physical query returned an unexpected block"
-                )
-            if int(physical.entry_count or 0) != int(coordinate.entry_count):
-                raise PTG2SharedBlockError(
-                    "PTG V4 physical block entry count is inconsistent"
-                )
-            cached = _CachedPhysicalBlock(
-                block_hash=physical.block_hash,
-                object_kind=physical.object_kind,
-                entry_count=int(physical.entry_count or 0),
-                payload=physical.payload,
+        if int(physical.entry_count or 0) != int(coordinate.entry_count):
+            raise PTG2SharedBlockError(
+                "PTG V4 physical block entry count is inconsistent"
             )
-            blocks_by_hash[cached.block_hash] = cached
-            _PHYSICAL_BLOCK_CACHE.put(
-                cached.block_hash,
-                cached,
-                len(cached.payload) + 128,
-            )
-            _request_io().database_bytes += int(
-                block_row.get("stored_byte_count") or 0
-            )
-            _request_io().database_blocks += 1
-    if set(blocks_by_hash) != set(coordinate_by_hash):
-        raise PTG2SharedBlockError("PTG V4 layout references a missing CAS block")
-    return blocks_by_hash
+        cached = _CachedPhysicalBlock(
+            block_hash=physical.block_hash,
+            object_kind=physical.object_kind,
+            entry_count=int(physical.entry_count or 0),
+            payload=physical.payload,
+        )
+        blocks_by_hash[cached.block_hash] = cached
+        _PHYSICAL_BLOCK_CACHE.put(
+            cached.block_hash, cached, len(cached.payload) + 128
+        )
+        _request_io().database_bytes += int(
+            block_row.get("stored_byte_count") or 0
+        )
+        _request_io().database_blocks += 1
 
 
 def _decode_locator(
@@ -1894,6 +1926,26 @@ async def _load_v4_heavy_bitmap_payloads(
         object_kind=object_kind,
         coordinate_pairs=coordinate_pairs,
     )
+    _charge_heavy_bitmap_work(relation_manifest, heavy_owners, coordinates)
+    blocks = await _load_physical_blocks(
+        session,
+        schema_name=schema_name,
+        object_kind=object_kind,
+        coordinates=coordinates.values(),
+        maximum_raw_bytes=relation_manifest.member_page_bytes,
+    )
+    payloads_by_owner = _assemble_heavy_bitmap_payloads(
+        heavy_owners, coordinates, blocks
+    )
+    _request_io().bitmap_owner_hits += len(payloads_by_owner)
+    return payloads_by_owner
+
+
+def _charge_heavy_bitmap_work(
+    relation_manifest: V4RelationManifest,
+    heavy_owners: Mapping[int, V4HeavyOwner],
+    coordinates: Mapping[tuple[int, int], Any],
+) -> None:
     member_count = sum(owner.member_count for owner in heavy_owners.values())
     page_count = len(coordinates)
     byte_count = page_count * relation_manifest.member_page_bytes
@@ -1915,13 +1967,13 @@ async def _load_v4_heavy_bitmap_payloads(
         page_count=page_count,
         byte_count=byte_count,
     )
-    blocks = await _load_physical_blocks(
-        session,
-        schema_name=schema_name,
-        object_kind=object_kind,
-        coordinates=coordinates.values(),
-        maximum_raw_bytes=relation_manifest.member_page_bytes,
-    )
+
+
+def _assemble_heavy_bitmap_payloads(
+    heavy_owners: Mapping[int, V4HeavyOwner],
+    coordinates: Mapping[tuple[int, int], Any],
+    blocks: Mapping[bytes, _CachedPhysicalBlock],
+) -> dict[int, bytes]:
     payloads_by_owner: dict[int, bytes] = {}
     for owner_key, owner in heavy_owners.items():
         fragments: list[bytes] = []
@@ -1945,7 +1997,6 @@ async def _load_v4_heavy_bitmap_payloads(
                 "PTG V4 heavy bitmap member count changed"
             )
         payloads_by_owner[owner_key] = b"".join(fragments)
-    _request_io().bitmap_owner_hits += len(payloads_by_owner)
     return payloads_by_owner
 
 

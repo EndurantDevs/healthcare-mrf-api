@@ -398,6 +398,44 @@ def test_flush_batches_dedupes_exact_pricing_rows_before_copy(monkeypatch):
     assert published_rows == [pricing_row_by_field, other_plan_by_field]
 
 
+def test_flush_batches_aggregates_activity_plans_and_address_evidence(monkeypatch):
+    captured_batches: list[tuple[type, list[dict]]] = []
+
+    async def fake_push_objects(activity_rows, model, **_kwargs):
+        captured_batches.append((model, activity_rows))
+
+    monkeypatch.setattr(module, "push_objects", fake_push_objects)
+    activity_row_by_field = {
+        "snapshot_id": "monthly:20260520:test",
+        "npi": 1234567890,
+        "year": 2026,
+        "plan_id": "S1234002000",
+        "pharmacy_name": "Example Pharmacy",
+        "address_observed_in_source": False,
+        "source_type": "monthly",
+    }
+    corroborated_row_by_field = {
+        **activity_row_by_field,
+        "plan_id": "S1234001000",
+        "address_observed_in_source": True,
+    }
+
+    asyncio.run(
+        module._flush_batches(
+            [activity_row_by_field, corroborated_row_by_field],
+            [],
+        )
+    )
+
+    assert len(captured_batches) == 1
+    model, published_rows = captured_batches[0]
+    assert model is module.PartDPharmacyActivityStage
+    assert len(published_rows) == 1
+    assert published_rows[0]["plan_ids"] == ["S1234001000", "S1234002000"]
+    assert published_rows[0]["address_observed_in_source"] is True
+    assert "_plans" not in published_rows[0]
+
+
 def test_ensure_columns_adds_missing_columns(monkeypatch):
     table = module.PartDPharmacyActivityStage.__table__
     existing_columns = {column.name for column in table.columns}

@@ -10,20 +10,52 @@ from tests.test_ptg2_geo_rate_prefix import _code_rows, _production_tables
 
 
 @pytest.mark.asyncio
+async def test_oversized_geo_rate_fails_after_one_location_bound(monkeypatch):
+    location_reads = AsyncMock(
+        return_value=[
+            {"npi": 111, "_ptg_source_exhausted": False},
+            {"npi": 222, "_ptg_source_exhausted": False},
+        ]
+    )
+    graph_reads = AsyncMock()
+    monkeypatch.setattr(serving, "_ptg2_manifest_location_match_limit", lambda: 2)
+    monkeypatch.setattr(serving, "_membership_npi_rows", location_reads)
+    monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_reads)
+
+    with pytest.raises(
+        serving.PTG2LocationScopeError,
+        match="Narrow the ZIP radius",
+    ):
+        await serving._select_geo_filtered_rate_prefix(
+            object(),
+            _production_tables(),
+            code_rows=_code_rows(257),
+            args={"zip5": "60611", "zip_radius_miles": 25},
+            network_names=[],
+            target_count=11,
+            descending=False,
+        )
+
+    location_reads.assert_awaited_once()
+    assert location_reads.await_args.kwargs["limit"] == 2
+    graph_reads.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("reverse_scope", "expected", "rejected"),
+    ("reverse_scope", "expected", "error_type"),
     (
-        (None, None, False),
-        (((), True, 1), (), False),
-        (((), False, 1), None, True),
-        (((111,), False, 1), None, True),
+        (None, None, None),
+        (((), True, 1), (), None),
+        (((), False, 1), None, serving.PTG2LocationScopeError),
+        (((111,), False, 1), None, serving.PTG2LocationScopeError),
     ),
 )
 async def test_oversized_geo_rate_handles_bounded_reverse_scope_outcomes(
     monkeypatch,
     reverse_scope,
     expected,
-    rejected,
+    error_type,
 ):
     graph_lookup = AsyncMock()
     monkeypatch.setattr(
@@ -40,10 +72,10 @@ async def test_oversized_geo_rate_handles_bounded_reverse_scope_outcomes(
         serving._v4_geo_rate_forward_limits(_production_tables()),
     )
 
-    if rejected:
-        with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as exc_info:
+    if error_type is not None:
+        with pytest.raises(error_type) as exc_info:
             await selection_call
-        assert exc_info.value.dimension == "candidate_members"
+        assert exc_info.value.error_code == "ptg2_location_scope_too_broad"
     else:
         assert await selection_call == expected
     graph_lookup.assert_not_awaited()

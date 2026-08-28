@@ -24,6 +24,7 @@ from api.ptg2_candidate_audit import (
     PTG2_CANDIDATE_AUDIT_HEADER,
 )
 from api.ptg2_rate_option_refs import encode_rate_option_ref
+from api.ptg2_serving import PTG2LocationScopeError
 from process.terminology_synonyms import _procedure_rows
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "api" / "endpoint" / "pricing.py"
@@ -3705,6 +3706,13 @@ async def test_plan_pricing_translates_only_online_work_budget_to_503(
     ("error_class", "error_code", "error_message"),
     (
         (
+            PTG2LocationScopeError,
+            "ptg2_location_scope_too_broad",
+            "Cost-ordered geographic provider search is too broad for exact "
+            "online expansion. Narrow the ZIP radius, add an NPI or provider "
+            "taxonomy filter, or set order_by=distance.",
+        ),
+        (
             pricing_module.PTG2ProviderFilterScopeError,
             "ptg2_provider_filter_scope_required",
             "Provider filters with include_providers=false require an NPI or "
@@ -3752,6 +3760,60 @@ async def test_plan_pricing_translates_provider_filter_errors_to_400(
         "error": {
             "code": error_code,
             "message": error_message,
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_aggregate_geo_scope_error_returns_actionable_400(monkeypatch):
+    message = (
+        "Cost-ordered geographic aggregate search is too broad for exact "
+        "online execution. Narrow the ZIP radius, add an NPI, or use "
+        "view=card with a ready projection."
+    )
+
+    async def rejected_search(_session, args, _pagination):
+        assert args["code"] == "97110"
+        assert args["zip5"] == "60611"
+        assert args["include_providers"] == "false"
+        raise PTG2LocationScopeError(message)
+
+    monkeypatch.setattr(
+        pricing_module,
+        "search_current_ptg2_index",
+        rejected_search,
+    )
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "zip5": "60611",
+                        "state": "IL",
+                        "city_lower": "chicago",
+                        "latitude": 41.895,
+                        "longitude": -87.621,
+                    }
+                ]
+            )
+        ],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "code": "97110",
+            "zip5": "60611",
+            "zip_radius_miles": "25",
+            "include_providers": "false",
+        },
+    )
+
+    endpoint_response = await list_providers_by_procedure(request)
+
+    assert endpoint_response.status == 400
+    assert json.loads(endpoint_response.body) == {
+        "error": {
+            "code": "ptg2_location_scope_too_broad",
+            "message": message,
         }
     }
 

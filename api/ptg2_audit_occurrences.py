@@ -270,14 +270,9 @@ def _audit_digest_coordinates(row: Mapping[str, Any]) -> dict[str, int]:
     }
 
 
-def _audit_page_sql(*, filter_market_type: bool) -> str:
-    """Build the audit-page query, optionally filtering scope by market type."""
+def _audit_page_ctes(market_filter: str) -> str:
+    """Build the bounded scope and persisted sample inputs for one page."""
 
-    market_filter = (
-        "AND logical_scope.plan_market_type = :plan_market_type"
-        if filter_market_type
-        else ""
-    )
     return f"""
         WITH matching_scope AS MATERIALIZED (
             SELECT physical_scope.coverage_scope_id
@@ -312,6 +307,19 @@ def _audit_page_sql(*, filter_market_type: bool) -> str:
              ORDER BY audit.occurrence_id ASC
              LIMIT :limit OFFSET :offset
         )
+    """
+
+
+def _audit_page_sql(*, filter_market_type: bool) -> str:
+    """Build the audit-page query, optionally filtering scope by market type."""
+
+    market_filter = (
+        "AND logical_scope.plan_market_type = :plan_market_type"
+        if filter_market_type
+        else ""
+    )
+    return f"""
+        {_audit_page_ctes(market_filter)}
         SELECT scope_summary.scope_count,
                sample_total.total,
                sample_page.occurrence_id,

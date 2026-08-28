@@ -746,17 +746,11 @@ def validated_projection_recipe_identity(
     return rebuilt_recipe
 
 
-def validated_physical_projection_recipe_identity(
-    recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
-) -> PhysicalProjectionRecipeIdentity:
-    """Return an exact campaign-blind recipe view for worker boundaries."""
+def _physical_projection_recipe_fields(
+    recipe: PhysicalProjectionRecipeIdentity,
+) -> tuple[dict[str, str], tuple[str, ...], tuple[str, ...]]:
+    """Validate the transform context and resource lists independently."""
 
-    if type(recipe) is ProjectionRecipeIdentity:
-        return validated_projection_recipe_identity(recipe).physical
-    if type(recipe) is not PhysicalProjectionRecipeIdentity:
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_physical_recipe_invalid"
-        )
     context_map = {
         "as_of_date": required_text(
             recipe.transform_context.get("as_of_date"),
@@ -787,7 +781,18 @@ def validated_physical_projection_recipe_identity(
             }
         )
     )
-    rebuilt_recipe = PhysicalProjectionRecipeIdentity(
+    return context_map, selected_resources, required_resources
+
+
+def _rebuilt_physical_projection_recipe(
+    recipe: PhysicalProjectionRecipeIdentity,
+    context_map: dict[str, str],
+    selected_resources: tuple[str, ...],
+    required_resources: tuple[str, ...],
+) -> PhysicalProjectionRecipeIdentity:
+    """Rebuild a physical recipe from independently validated fields."""
+
+    return PhysicalProjectionRecipeIdentity(
         recipe_id=required_hash(recipe.recipe_id, "recipe_id"),
         decoder_contract_id=required_text(
             recipe.decoder_contract_id,
@@ -816,6 +821,28 @@ def validated_physical_projection_recipe_identity(
         ),
         selected_resources=selected_resources,
         required_resources=required_resources,
+    )
+
+
+def validated_physical_projection_recipe_identity(
+    recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
+) -> PhysicalProjectionRecipeIdentity:
+    """Return an exact campaign-blind recipe view for worker boundaries."""
+
+    if type(recipe) is ProjectionRecipeIdentity:
+        return validated_projection_recipe_identity(recipe).physical
+    if type(recipe) is not PhysicalProjectionRecipeIdentity:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_physical_recipe_invalid"
+        )
+    context_map, selected_resources, required_resources = (
+        _physical_projection_recipe_fields(recipe)
+    )
+    rebuilt_recipe = _rebuilt_physical_projection_recipe(
+        recipe,
+        context_map,
+        selected_resources,
+        required_resources,
     )
     expected_recipe_id = stable_hash(
         rebuilt_recipe.identity_payload,

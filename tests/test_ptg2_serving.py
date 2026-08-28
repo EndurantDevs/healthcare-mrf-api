@@ -2729,8 +2729,14 @@ async def test_geo_price_filter_selects_locations_from_matching_provider_sets(mo
     assert response["query"]["radius_miles"] == 0.0
 
 
+@pytest.mark.parametrize(
+    ("code_system", "code"),
+    (("CPT", "99213"), ("HCPCS", "G0439")),
+)
 @pytest.mark.asyncio
-async def test_geo_cost_order_requires_exhaustive_location_selection(monkeypatch):
+async def test_geo_cost_order_requires_exhaustive_location_selection(
+    monkeypatch, code_system, code
+):
     location_call_by_field = {}
 
     async def fake_location(*_args, **kwargs):
@@ -2748,8 +2754,8 @@ async def test_geo_cost_order_requires_exhaustive_location_selection(monkeypatch
         "ptg2:209901:synthetic",
         {
             "plan_id": "TEST-PLAN-001",
-            "code_system": "CPT",
-            "code": "99213",
+            "code_system": code_system,
+            "code": code,
             "state": "IL",
             "lat": 0.0,
             "long": 0.0,
@@ -2766,6 +2772,8 @@ async def test_geo_cost_order_requires_exhaustive_location_selection(monkeypatch
     assert response["query"]["lat"] == 0.0
     assert response["query"]["long"] == 0.0
     assert response["query"]["radius_miles"] == 0.0
+    assert response["query"]["code_system"] == code_system
+    assert response["query"]["code"] == code
     assert location_call_by_field["require_exhaustive"] is True
     assert location_call_by_field["require_provider_set_coverage"] is False
 

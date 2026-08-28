@@ -1857,6 +1857,78 @@ def _pricing_rows_from_source(
         for cost_type, amount in cost_fields
     ]
 
+def _activity_stage_key(activity_fields: dict[str, Any]) -> tuple[Any, ...]:
+    """Return the stable identity used for chunk-local activity aggregation."""
+
+    return (
+        activity_fields.get("snapshot_id"),
+        activity_fields.get("npi"),
+        activity_fields.get("year"),
+        activity_fields.get("medicare_active"),
+        activity_fields.get("pharmacy_name"),
+        activity_fields.get("address_line1"),
+        activity_fields.get("address_line2"),
+        activity_fields.get("city"),
+        activity_fields.get("state"),
+        activity_fields.get("zip_code"),
+        activity_fields.get("pharmacy_type"),
+        activity_fields.get("mail_order"),
+        activity_fields.get("dispensing_fee_brand_30"),
+        activity_fields.get("dispensing_fee_brand_60"),
+        activity_fields.get("dispensing_fee_brand_90"),
+        activity_fields.get("dispensing_fee_generic_30"),
+        activity_fields.get("dispensing_fee_generic_60"),
+        activity_fields.get("dispensing_fee_generic_90"),
+        activity_fields.get("dispensing_fee_selected_drug_30"),
+        activity_fields.get("dispensing_fee_selected_drug_60"),
+        activity_fields.get("dispensing_fee_selected_drug_90"),
+        activity_fields.get("effective_from"),
+        activity_fields.get("effective_to"),
+        activity_fields.get("source_type"),
+    )
+
+
+def _new_activity_stage_row(activity_fields: dict[str, Any]) -> dict[str, Any]:
+    """Copy the retained activity fields for one aggregate bucket."""
+
+    return {
+        "snapshot_id": activity_fields.get("snapshot_id"),
+        "npi": activity_fields.get("npi"),
+        "year": activity_fields.get("year"),
+        "medicare_active": activity_fields.get("medicare_active"),
+        "pharmacy_name": activity_fields.get("pharmacy_name"),
+        "address_line1": activity_fields.get("address_line1"),
+        "address_line2": activity_fields.get("address_line2"),
+        "city": activity_fields.get("city"),
+        "state": activity_fields.get("state"),
+        "zip_code": activity_fields.get("zip_code"),
+        "address_observed_in_source": bool(
+            activity_fields.get("address_observed_in_source")
+        ),
+        "pharmacy_type": activity_fields.get("pharmacy_type"),
+        "mail_order": activity_fields.get("mail_order"),
+        "dispensing_fee_brand_30": activity_fields.get("dispensing_fee_brand_30"),
+        "dispensing_fee_brand_60": activity_fields.get("dispensing_fee_brand_60"),
+        "dispensing_fee_brand_90": activity_fields.get("dispensing_fee_brand_90"),
+        "dispensing_fee_generic_30": activity_fields.get("dispensing_fee_generic_30"),
+        "dispensing_fee_generic_60": activity_fields.get("dispensing_fee_generic_60"),
+        "dispensing_fee_generic_90": activity_fields.get("dispensing_fee_generic_90"),
+        "dispensing_fee_selected_drug_30": activity_fields.get(
+            "dispensing_fee_selected_drug_30"
+        ),
+        "dispensing_fee_selected_drug_60": activity_fields.get(
+            "dispensing_fee_selected_drug_60"
+        ),
+        "dispensing_fee_selected_drug_90": activity_fields.get(
+            "dispensing_fee_selected_drug_90"
+        ),
+        "effective_from": activity_fields.get("effective_from"),
+        "effective_to": activity_fields.get("effective_to"),
+        "source_type": activity_fields.get("source_type"),
+        "_plans": set(),
+    }
+
+
 async def _flush_batches(
     activity_batch_rows: list[dict[str, Any]],
     pricing_batch_rows: list[dict[str, Any]],
@@ -1872,64 +1944,10 @@ async def _flush_batches(
             plan_id = str(activity_fields.get("plan_id") or "").strip()
             if not plan_id:
                 continue
-            key = (
-                activity_fields.get("snapshot_id"),
-                activity_fields.get("npi"),
-                activity_fields.get("year"),
-                activity_fields.get("medicare_active"),
-                activity_fields.get("pharmacy_name"),
-                activity_fields.get("address_line1"),
-                activity_fields.get("address_line2"),
-                activity_fields.get("city"),
-                activity_fields.get("state"),
-                activity_fields.get("zip_code"),
-                activity_fields.get("pharmacy_type"),
-                activity_fields.get("mail_order"),
-                activity_fields.get("dispensing_fee_brand_30"),
-                activity_fields.get("dispensing_fee_brand_60"),
-                activity_fields.get("dispensing_fee_brand_90"),
-                activity_fields.get("dispensing_fee_generic_30"),
-                activity_fields.get("dispensing_fee_generic_60"),
-                activity_fields.get("dispensing_fee_generic_90"),
-                activity_fields.get("dispensing_fee_selected_drug_30"),
-                activity_fields.get("dispensing_fee_selected_drug_60"),
-                activity_fields.get("dispensing_fee_selected_drug_90"),
-                activity_fields.get("effective_from"),
-                activity_fields.get("effective_to"),
-                activity_fields.get("source_type"),
-            )
+            key = _activity_stage_key(activity_fields)
             aggregated_field_map = aggregate_by_key.get(key)
             if aggregated_field_map is None:
-                aggregated_field_map = {
-                    "snapshot_id": activity_fields.get("snapshot_id"),
-                    "npi": activity_fields.get("npi"),
-                    "year": activity_fields.get("year"),
-                    "medicare_active": activity_fields.get("medicare_active"),
-                    "pharmacy_name": activity_fields.get("pharmacy_name"),
-                    "address_line1": activity_fields.get("address_line1"),
-                    "address_line2": activity_fields.get("address_line2"),
-                    "city": activity_fields.get("city"),
-                    "state": activity_fields.get("state"),
-                    "zip_code": activity_fields.get("zip_code"),
-                    "address_observed_in_source": bool(
-                        activity_fields.get("address_observed_in_source")
-                    ),
-                    "pharmacy_type": activity_fields.get("pharmacy_type"),
-                    "mail_order": activity_fields.get("mail_order"),
-                    "dispensing_fee_brand_30": activity_fields.get("dispensing_fee_brand_30"),
-                    "dispensing_fee_brand_60": activity_fields.get("dispensing_fee_brand_60"),
-                    "dispensing_fee_brand_90": activity_fields.get("dispensing_fee_brand_90"),
-                    "dispensing_fee_generic_30": activity_fields.get("dispensing_fee_generic_30"),
-                    "dispensing_fee_generic_60": activity_fields.get("dispensing_fee_generic_60"),
-                    "dispensing_fee_generic_90": activity_fields.get("dispensing_fee_generic_90"),
-                    "dispensing_fee_selected_drug_30": activity_fields.get("dispensing_fee_selected_drug_30"),
-                    "dispensing_fee_selected_drug_60": activity_fields.get("dispensing_fee_selected_drug_60"),
-                    "dispensing_fee_selected_drug_90": activity_fields.get("dispensing_fee_selected_drug_90"),
-                    "effective_from": activity_fields.get("effective_from"),
-                    "effective_to": activity_fields.get("effective_to"),
-                    "source_type": activity_fields.get("source_type"),
-                    "_plans": set(),
-                }
+                aggregated_field_map = _new_activity_stage_row(activity_fields)
                 aggregate_by_key[key] = aggregated_field_map
             else:
                 aggregated_field_map["address_observed_in_source"] = bool(
