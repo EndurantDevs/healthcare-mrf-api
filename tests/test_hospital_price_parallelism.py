@@ -52,10 +52,9 @@ async def test_resource_slot_rejects_invalid_capacity(resource, slot_count):
     orchestrator = orchestrator_module()
 
     with pytest.raises(ValueError, match="resource slot is invalid"):
-        async with orchestrator._hospital_resource_slot(
+        await orchestrator._hospital_resource_slot(
             ArtifactStore(), resource, slot_count
-        ):
-            pass
+        ).__aenter__()
 
 
 @pytest.mark.asyncio
