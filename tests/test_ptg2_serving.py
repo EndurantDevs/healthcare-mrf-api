@@ -2,7 +2,7 @@
 
 import asyncio
 import copy
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +18,7 @@ from api.ptg2_rate_option_refs import encode_rate_option_ref
 from process.ptg_parts.address_assurance import summarize_ptg_price_address_payload
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from tests.ptg2_rate_option_ref_support import synthetic_rate_option
+from tests.ptg2_v4_provider_prefix_support import sealed_v4_hot_prefix
 
 
 def _lineage_ref(value: int) -> str:
@@ -727,6 +728,16 @@ def _strict_v3_tables(**overrides):
     }
     table_values_by_field.update(overrides)
     return ptg2_serving.PTG2ServingTables(**table_values_by_field)
+
+
+def _strict_v4_tables(*, maximum_rate_rows=256):
+    return _strict_v3_tables(
+        storage_generation="shared_blocks_v4",
+        shared_block_layout="packed_snapshot_maps_v4",
+        provider_graph_v4_hot_prefix=sealed_v4_hot_prefix(
+            max_online_provider_expansion_rate_rows=maximum_rate_rows,
+        ),
+    )
 
 
 def _compact_item(**overrides):
@@ -2776,6 +2787,80 @@ async def test_geo_cost_order_requires_exhaustive_location_selection(
     assert response["query"]["code"] == code
     assert location_call_by_field["require_exhaustive"] is True
     assert location_call_by_field["require_provider_set_coverage"] is False
+
+
+@pytest.mark.parametrize(
+    ("provider_args", "rate_count", "should_reject", "expected_code_queries"),
+    (
+        pytest.param({}, 257, True, 1, id="omitted-high"),
+        pytest.param({"include_providers": True}, 257, True, 1, id="true-high"),
+        pytest.param(
+            {"classification": "Internal Medicine"},
+            257,
+            False,
+            0,
+            id="filtered-high",
+        ),
+        pytest.param({}, 256, False, 1, id="at-cap"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_geo_cost_order_rate_count_gate_precedes_location(
+    monkeypatch,
+    provider_args,
+    rate_count,
+    should_reject,
+    expected_code_queries,
+):
+    """Reject only oversized default provider expansion before graph work."""
+
+    location_call_arguments = []
+
+    async def fake_location(*args, **kwargs):
+        location_call_arguments.append((args, kwargs))
+        return set(), {}
+
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_location_provider_matches",
+        fake_location,
+    )
+    session = FakeSession(
+        [FakeResult(result_rows=[{"code_key": 7, "rate_count": rate_count}])]
+    )
+    error_context = (
+        pytest.raises(
+            ptg2_serving.PTG2LocationScopeError,
+            match="Narrow the ZIP radius",
+        )
+        if should_reject
+        else nullcontext()
+    )
+
+    with error_context as raised:
+        response = await ptg2_serving._search_manifest_serving_table(
+            session,
+            "ptg2:209901:synthetic",
+            {
+                "plan_id": "TEST-PLAN-001",
+                "code_system": "CPT",
+                "code": "99213",
+                "state": "IL",
+                "order_by": "total_allowed_amount",
+                **provider_args,
+            },
+            SimpleNamespace(limit=10, offset=0),
+            _strict_v4_tables(maximum_rate_rows=256),
+            "product_search",
+        )
+
+    if should_reject:
+        assert raised.value.error_code == "ptg2_location_scope_too_broad"
+        assert location_call_arguments == []
+    else:
+        assert response["items"] == []
+        assert len(location_call_arguments) == 1
+    assert len(session.calls) == expected_code_queries
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,7 @@ import json
 import tempfile
 import zlib
 from dataclasses import dataclass, field
-from typing import BinaryIO, Mapping, Sequence
+from typing import BinaryIO, Iterable, Mapping, Sequence
 
 from process.ptg_parts.ptg2_source_witness_bundle import _decompress_evidence
 from process.ptg_parts.ptg2_source_witness_codec import (
@@ -422,6 +422,71 @@ def _copy_staged_payload(
     return written_byte_count
 
 
+def _projected_staged_payload_bytes(
+    header_bytes: bytes,
+    staged_records: Sequence[_StagedRecord],
+    staged_evidence: Sequence[_StagedEvidence],
+) -> int:
+    """Return the exact framed byte count before opening the output buffer."""
+
+    return (
+        len(PERSISTED_PAYLOAD_MAGIC)
+        + U32.size
+        + len(header_bytes)
+        + U32.size * 2
+        + sum(32 + U32.size + evidence.payload.length for evidence in staged_evidence)
+        + sum(32 + U32.size + record.payload.length for record in staged_records)
+    )
+
+
+def _write_staged_payload_entries(
+    stage_file: BinaryIO,
+    output_file: BinaryIO,
+    entries: Iterable[tuple[str, _StagedPayload]],
+    written_byte_count: int,
+) -> int:
+    """Write digest-framed staged entries without loading their payloads."""
+
+    for digest, staged_payload in entries:
+        for payload_part in (
+            bytes.fromhex(digest),
+            U32.pack(staged_payload.length),
+        ):
+            written_byte_count = _write_bounded(
+                output_file,
+                payload_part,
+                written_byte_count,
+            )
+        written_byte_count = _copy_staged_payload(
+            stage_file,
+            output_file,
+            staged_payload,
+            written_byte_count,
+        )
+    return written_byte_count
+
+
+def _write_staged_payload_header(
+    output_file: BinaryIO,
+    header_bytes: bytes,
+    evidence_count: int,
+) -> int:
+    """Write the persisted magic, header, and evidence count."""
+
+    written_byte_count = _write_bounded(output_file, PERSISTED_PAYLOAD_MAGIC, 0)
+    for payload_part in (
+        U32.pack(len(header_bytes)),
+        header_bytes,
+        U32.pack(evidence_count),
+    ):
+        written_byte_count = _write_bounded(
+            output_file,
+            payload_part,
+            written_byte_count,
+        )
+    return written_byte_count
+
+
 def _encode_staged_payload(
     header: Mapping[str, object],
     staged_records: Sequence[_StagedRecord],
@@ -436,72 +501,39 @@ def _encode_staged_payload(
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("ascii")
-    projected_payload_bytes = (
-        len(PERSISTED_PAYLOAD_MAGIC)
-        + U32.size
-        + len(header_bytes)
-        + U32.size * 2
-        + sum(32 + U32.size + evidence.payload.length for evidence in staged_evidence)
-        + sum(
-            32 + U32.size + staged_record.payload.length
-            for staged_record in staged_records
-        )
+    projected_payload_bytes = _projected_staged_payload_bytes(
+        header_bytes,
+        staged_records,
+        staged_evidence,
     )
     if projected_payload_bytes > PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES:
         raise _payload_limit_error("exceeds its 512 MiB logical payload safety bound")
     with tempfile.TemporaryFile(mode="w+b") as output_file:
-        written_byte_count = _write_bounded(
+        written_byte_count = _write_staged_payload_header(
             output_file,
-            PERSISTED_PAYLOAD_MAGIC,
-            0,
-        )
-        for payload_part in (
-            U32.pack(len(header_bytes)),
             header_bytes,
-            U32.pack(len(staged_evidence)),
-        ):
-            written_byte_count = _write_bounded(
-                output_file,
-                payload_part,
-                written_byte_count,
-            )
-        for evidence in staged_evidence:
-            for payload_part in (
-                bytes.fromhex(evidence.sha256),
-                U32.pack(evidence.payload.length),
-            ):
-                written_byte_count = _write_bounded(
-                    output_file,
-                    payload_part,
-                    written_byte_count,
-                )
-            written_byte_count = _copy_staged_payload(
-                stage_file,
-                output_file,
-                evidence.payload,
-                written_byte_count,
-            )
+            len(staged_evidence),
+        )
+        written_byte_count = _write_staged_payload_entries(
+            stage_file,
+            output_file,
+            ((evidence.sha256, evidence.payload) for evidence in staged_evidence),
+            written_byte_count,
+        )
         written_byte_count = _write_bounded(
             output_file,
             U32.pack(len(staged_records)),
             written_byte_count,
         )
-        for staged_record in staged_records:
-            for payload_part in (
-                bytes.fromhex(staged_record.raw_source_sha256),
-                U32.pack(staged_record.payload.length),
-            ):
-                written_byte_count = _write_bounded(
-                    output_file,
-                    payload_part,
-                    written_byte_count,
-                )
-            written_byte_count = _copy_staged_payload(
-                stage_file,
-                output_file,
-                staged_record.payload,
-                written_byte_count,
-            )
+        written_byte_count = _write_staged_payload_entries(
+            stage_file,
+            output_file,
+            (
+                (staged_record.raw_source_sha256, staged_record.payload)
+                for staged_record in staged_records
+            ),
+            written_byte_count,
+        )
         if written_byte_count != projected_payload_bytes:
             raise RuntimeError("strict V3 source witness staging byte count changed")
         output_file.seek(0)

@@ -1271,13 +1271,13 @@ def _log_ptg2_rust_scanner_binary(binary: Path) -> None:
     )
 
 
-async def convert_shared_graph_rust(
+def _prepare_shared_graph_conversion(
     *,
     shards: Iterable[SharedGraphShardBundle],
     provider_set_key_map_path: str | Path,
     output_directory: str | Path,
-) -> SharedGraphConversionResult:
-    """Convert strict-V3 graph shards with the native bounded-memory converter."""
+) -> tuple[Path, Path, Path, _SharedGraphExpected]:
+    """Validate inputs and persist the native converter manifest."""
 
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
@@ -1292,7 +1292,6 @@ async def convert_shared_graph_rust(
             f"strict V3 shared-graph scanner binary is unavailable: {binary}"
         )
     _log_ptg2_rust_scanner_binary(binary)
-
     provider_map = Path(provider_set_key_map_path).resolve()
     if not provider_map.is_file() or provider_map.stat().st_size <= 0:
         raise RuntimeError(
@@ -1327,7 +1326,22 @@ async def convert_shared_graph_rust(
         manifest_file.write(manifest_bytes)
         manifest_file.flush()
         os.fsync(manifest_file.fileno())
+    return binary, output, manifest_path, expected
 
+
+async def convert_shared_graph_rust(
+    *,
+    shards: Iterable[SharedGraphShardBundle],
+    provider_set_key_map_path: str | Path,
+    output_directory: str | Path,
+) -> SharedGraphConversionResult:
+    """Convert strict-V3 graph shards with the native bounded-memory converter."""
+
+    binary, output, manifest_path, expected = _prepare_shared_graph_conversion(
+        shards=shards,
+        provider_set_key_map_path=provider_set_key_map_path,
+        output_directory=output_directory,
+    )
     process: asyncio.subprocess.Process | None = None
     spawn_task = asyncio.create_task(
         asyncio.create_subprocess_exec(
@@ -1788,6 +1802,47 @@ def _emit_scanner_metric_progress(
         logger.debug("Failed to write PTG2 scanner metric progress", exc_info=True)
 
 
+def _start_top_level_stderr_reader(
+    process: subprocess.Popen,
+    live_progress_context: dict[str, Any] | None,
+) -> tuple[list[str], threading.Thread | None]:
+    """Start the scanner stderr reader and return its bounded shared tail."""
+
+    stderr_lines: list[str] = []
+    if process.stderr is None:
+        return stderr_lines, None
+
+    def read_scanner_stderr() -> None:
+        """Drain one scanner's stderr while retaining its bounded tail."""
+
+        assert process.stderr is not None
+        for raw_line in iter(process.stderr.readline, b""):
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            stderr_lines.append(line)
+            if len(stderr_lines) > 20:
+                del stderr_lines[:-20]
+            if line.startswith(_SCANNER_PROGRESS_PREFIX):
+                _emit_screen_line(line)
+                logger.info(line)
+                _emit_scanner_live_progress(
+                    line,
+                    phase="PTG scanner",
+                    live_progress_context=live_progress_context,
+                )
+            else:
+                logger.warning("PTG2 Rust scanner stderr: %s", line)
+
+    stderr_thread = threading.Thread(
+        target=read_scanner_stderr,
+        name="ptg2-rust-scanner-stderr",
+        daemon=True,
+    )
+    stderr_thread.start()
+    return stderr_lines, stderr_thread
+
+
 def _iter_top_level_object_bytes_rust(
     path: str | Path,
     array_names: set[str],
@@ -1813,36 +1868,10 @@ def _iter_top_level_object_bytes_rust(
     process_control = _ScannerProcessControl()
     process_control.attach(process)
     assert process.stdout is not None
-    stderr_lines: list[str] = []
-    stderr_thread: threading.Thread | None = None
-    if process.stderr is not None:
-
-        def _read_scanner_stderr() -> None:
-            assert process.stderr is not None
-            for raw_line in iter(process.stderr.readline, b""):
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                stderr_lines.append(line)
-                if len(stderr_lines) > 20:
-                    del stderr_lines[:-20]
-                if line.startswith(_SCANNER_PROGRESS_PREFIX):
-                    _emit_screen_line(line)
-                    logger.info(line)
-                    _emit_scanner_live_progress(
-                        line,
-                        phase="PTG scanner",
-                        live_progress_context=live_progress_context,
-                    )
-                else:
-                    logger.warning("PTG2 Rust scanner stderr: %s", line)
-
-        stderr_thread = threading.Thread(
-            target=_read_scanner_stderr,
-            name="ptg2-rust-scanner-stderr",
-            daemon=True,
-        )
-        stderr_thread.start()
+    stderr_lines, stderr_thread = _start_top_level_stderr_reader(
+        process,
+        live_progress_context,
+    )
     is_terminated_by_consumer = False
     try:
         while True:
