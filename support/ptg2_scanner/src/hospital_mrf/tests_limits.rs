@@ -60,10 +60,143 @@
         assert_zip_import_error(&unsupported, TEST_MAX_OUTPUT_BYTES, "compression method");
 
         let invalid_utf8 = zip_bytes(
-            &[("prices.json", b"{\"hospital_name\":\"\xff\"}")],
+            &[("prices.json", b"{\"hospital_name\":\"\x81\"}")],
             CompressionMethod::Deflated,
         );
         assert_zip_import_error(&invalid_utf8, TEST_MAX_OUTPUT_BYTES, "UTF-8");
+    }
+
+    #[test]
+    fn hospital_text_reader_preserves_utf8_and_maps_cp1252() {
+        struct OneByteReader<R>(R);
+        impl<R: Read> Read for OneByteReader<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let limit = buffer.len().min(1);
+                self.0.read(&mut buffer[..limit])
+            }
+        }
+        fn decode<R: Read>(inner: R) -> io::Result<String> {
+            let mut decoded = String::new();
+            HospitalMrfTextReader::new(inner).read_to_string(&mut decoded)?;
+            Ok(decoded)
+        }
+
+        let extension_bytes = [
+            0x80, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c,
+            0x8e, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b,
+            0x9c, 0x9e, 0x9f,
+        ];
+        let extension_characters = [
+            '\u{20ac}', '\u{201a}', '\u{0192}', '\u{201e}', '\u{2026}', '\u{2020}',
+            '\u{2021}', '\u{02c6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}',
+            '\u{017d}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}',
+            '\u{2013}', '\u{2014}', '\u{02dc}', '\u{2122}', '\u{0161}', '\u{203a}',
+            '\u{0153}', '\u{017e}', '\u{0178}',
+        ];
+        let mut raw = b"\xef\xbb\xbfA\xc2\xa0\xe1\x80\x80\xf0\x9f\x98\x80".to_vec();
+        raw.extend(extension_bytes);
+        raw.extend(0xa0..=0xff);
+        let mut expected = String::from("A\u{00a0}\u{1000}\u{1f600}");
+        expected.extend(extension_characters);
+        expected.extend((0xa0..=0xff).map(char::from));
+
+        let mut reader = HospitalMrfTextReader::new(OneByteReader(Cursor::new(raw.clone())));
+        let mut decoded = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let read = reader.read(&mut byte).unwrap();
+            if read == 0 {
+                break;
+            }
+            decoded.push(byte[0]);
+        }
+        assert_eq!(String::from_utf8(decoded).unwrap(), expected);
+
+        let mut reader = HospitalMrfTextReader::new(Cursor::new(raw));
+        let mut decoded = Vec::new();
+        while reader.read(&mut byte).unwrap() != 0 {
+            decoded.push(byte[0]);
+        }
+        assert_eq!(String::from_utf8(decoded).unwrap(), expected);
+
+        for byte in 0xa0..=0xff {
+            let raw = [byte, b'!'];
+            let mut decoded = String::new();
+            HospitalMrfTextReader::new(Cursor::new(raw))
+                .read_to_string(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, format!("{}!", char::from(byte)));
+        }
+
+        let replay_cases: &[(&[u8], &str)] = &[
+            (b"Caf\xe9 noir", "Café noir"),
+            (b"Caf\xe9", "Café"),
+            (b"\xe2AB", "âAB"),
+            (b"\xe2\x80A", "â€A"),
+            (b"\xe2\xc0A", "âÀA"),
+            (b"\xe2\xc2\xa0", "â\u{00a0}"),
+            (b"\xc2\xc2\xa0", "Â\u{00a0}"),
+            (b"\xc2", "Â"),
+            (b"\xe2\x82", "â‚"),
+            (b"\xf0\x9f\x98", "ðŸ˜"),
+        ];
+        for &(raw, expected) in replay_cases {
+            assert_eq!(decode(Cursor::new(raw)).unwrap(), expected);
+            assert_eq!(decode(OneByteReader(Cursor::new(raw))).unwrap(), expected);
+        }
+
+        for input in [b"\xe2\x81A".as_slice(), b"\xc2\xe2\x81A".as_slice()] {
+            assert!(decode(Cursor::new(input)).unwrap_err().to_string().contains("UTF-8"));
+            assert!(decode(OneByteReader(Cursor::new(input)))
+                .unwrap_err()
+                .to_string()
+                .contains("UTF-8"));
+        }
+
+        let mut text_reader = HospitalMrfTextReader::new(Cursor::new(b"A"));
+        assert_eq!(text_reader.read(&mut []).unwrap(), 0);
+        let mut text_output = String::new();
+        text_reader.read_to_string(&mut text_output).unwrap();
+        assert_eq!(text_output, "A");
+        let mut bounded_reader = BoundedDecompressedReader::new(Cursor::new(b"A"), 1);
+        assert_eq!(bounded_reader.read(&mut []).unwrap(), 0);
+        let mut bounded_output = Vec::new();
+        bounded_reader.read_to_end(&mut bounded_output).unwrap();
+        assert_eq!(bounded_output, b"A");
+
+        for invalid_bytes in [
+            vec![0x81],
+            vec![0x8d],
+            vec![0x8f],
+            vec![0x90],
+            vec![0x9d],
+        ] {
+            for prefix in [&b""[..], &b"abc"[..]] {
+                let mut input = prefix.to_vec();
+                input.extend_from_slice(&invalid_bytes);
+                let error = HospitalMrfTextReader::new(OneByteReader(Cursor::new(input)))
+                    .read_to_end(&mut Vec::new())
+                    .unwrap_err();
+                assert!(error.to_string().contains("UTF-8"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn hospital_text_reader_removes_exactly_one_bom() {
+        let raw = b"\xef\xbb\xbf\xef\xbb\xbfA";
+        let mut direct = Vec::new();
+        HospitalMrfTextReader::new(Cursor::new(raw))
+            .read_to_end(&mut direct)
+            .unwrap();
+        let mut zipped = Vec::new();
+        HospitalMrfTextReader::new(
+            ZipPayloadReader::new(Cursor::new(raw), raw.len() as u64).unwrap(),
+        )
+        .read_to_end(&mut zipped)
+        .unwrap();
+        assert_eq!(direct, b"\xef\xbb\xbfA");
+        assert_eq!(zipped, direct);
     }
 
     #[test]
@@ -160,6 +293,16 @@
             "JSON retained data exceeds 64 MiB",
         );
         drop(metadata);
+
+        let mut policy: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+        policy["financial_aid_policy"] = json!(["x".repeat(JSON_RETAINED_BYTE_LIMIT)]);
+        assert_payload_limit_error(
+            InputFormat::Json,
+            &serde_json::to_vec(&policy).unwrap(),
+            MAX_INPUT_VALUE_BYTES,
+            "JSON retained data exceeds 64 MiB",
+        );
+        drop(policy);
 
         let mut payer: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
         payer["standard_charge_information"][0]["standard_charges"][0]

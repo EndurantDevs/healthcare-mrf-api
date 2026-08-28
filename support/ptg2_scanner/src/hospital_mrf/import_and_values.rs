@@ -141,20 +141,11 @@ fn import_hospital_mrf_with_output_mode(
         )?
     } else {
         let compressed_input_bytes = Arc::new(AtomicU64::new(0));
-        let reader: Box<dyn Read> = match format {
-            InputFormat::Json => open_full_scan_json_reader(
-                input_path,
-                Arc::clone(&compressed_input_bytes),
-                &RapidgzipConfig::default(),
-            )?,
-            InputFormat::TallCsv | InputFormat::WideCsv => {
-                strict_utf8_reader(open_full_scan_reader(
-                    input_path,
-                    Arc::clone(&compressed_input_bytes),
-                    &RapidgzipConfig::default(),
-                )?)
-            }
-        };
+        let reader = open_full_scan_reader(
+            input_path,
+            Arc::clone(&compressed_input_bytes),
+            &RapidgzipConfig::default(),
+        )?;
         let outputs = parse_hospital_payload_with_output_mode(
             format,
             reader,
@@ -222,7 +213,10 @@ fn parse_hospital_payload_with_output_mode<R: Read>(
         limits.max_output_bytes,
         output_mode,
     )?;
-    let reader = BoundedDecompressedReader::new(reader, limits.max_decompressed_bytes);
+    let reader = HospitalMrfTextReader::new(BoundedDecompressedReader::new(
+        reader,
+        limits.max_decompressed_bytes,
+    ));
     match format {
         InputFormat::Json => parse_json(
             BoundedJsonStringReader::new(reader, limits.max_input_value_bytes),
@@ -449,11 +443,11 @@ fn canonical_billing_class(value: &str, normalize_case: bool) -> io::Result<Stri
     } else {
         value.to_owned()
     };
-    if matches!(value.as_str(), "professional" | "facility" | "both") {
-        Ok(value)
-    } else {
-        Err(invalid(
+    match value.as_str() {
+        "professional" | "facility" | "both" => Ok(value),
+        "hospital" | "facilty" if normalize_case => Ok("facility".to_owned()),
+        _ => Err(invalid(
             "billing_class must be professional, facility, or both",
-        ))
+        )),
     }
 }

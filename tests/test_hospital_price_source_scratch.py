@@ -9,10 +9,41 @@ from typing import Any
 
 import pytest
 
+from process import hospital_price_scratch as scratch
 from tests.hospital_price_orchestration_support import (
     ArtifactStore as _ArtifactStore,
     orchestrator_module as _orchestrator_module,
 )
+
+
+def test_tmp_root_rejects_sibling_directory(tmp_path):
+    root = tmp_path / "root"
+    sibling = tmp_path / "sibling"
+    root.mkdir()
+    sibling.mkdir()
+
+    with pytest.raises(RuntimeError, match="tmp directory is unsafe"):
+        scratch.owned_tmp_root(SimpleNamespace(root=root, tmp_dir=sibling))
+
+
+def test_source_cleanup_requires_anchored_unlink(monkeypatch):
+    monkeypatch.setattr(scratch, "_SAFE_DIR_FD_UNLINK", False)
+
+    with pytest.raises(RuntimeError, match="anchored directory unlink"):
+        scratch.unlink_transient_source(object(), object())
+
+
+def test_source_cleanup_rejects_non_regular_file(tmp_path):
+    raw_path = tmp_path / "hospital-mrf-source-owned" / "raw" / "source.json"
+    raw_path.mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="regular non-symlink"):
+        scratch.unlink_transient_source(
+            _ArtifactStore(tmp_path), SimpleNamespace(raw_path=str(raw_path))
+        )
+
+    assert raw_path.is_dir()
+
 
 def test_source_cleanup_rejects_symlink(tmp_path):
     orchestrator = _orchestrator_module()
@@ -54,66 +85,33 @@ def test_source_cleanup_uses_anchored_directory_unlink(tmp_path, monkeypatch):
     assert calls[0][1] is not None
 
 
-def test_source_sweep_rejects_an_external_tmp_symlink(tmp_path):
-    orchestrator = _orchestrator_module()
-    store_root = tmp_path / "store"
-    external = tmp_path / "external"
-    store_root.mkdir()
-    external.mkdir()
-    (external / "hospital-mrf-source-preserve").mkdir()
-    tmp_link = store_root / "tmp"
-    tmp_link.symlink_to(external, target_is_directory=True)
-
-    with pytest.raises(RuntimeError, match="tmp directory is unsafe"):
-        orchestrator._sweep_transient_source_roots(
-            SimpleNamespace(root=store_root, tmp_dir=tmp_link)
-        )
-
-    assert (external / "hospital-mrf-source-preserve").is_dir()
-
-
 @pytest.mark.asyncio
-async def test_import_sweeps_only_stale_hospital_source_roots_before_work(
+async def test_import_preserves_another_runs_active_source_root(
     tmp_path, monkeypatch
 ):
     orchestrator = _orchestrator_module()
-    stale_root = tmp_path / "hospital-mrf-source-stale"
-    (stale_root / "raw").mkdir(parents=True)
-    (stale_root / "raw" / "source.json").write_bytes(b"{}")
+    active_root = tmp_path / "hospital-mrf-source-active-run"
+    (active_root / "raw").mkdir(parents=True)
+    (active_root / "raw" / "source.json").write_bytes(b"{}")
     sentinel = tmp_path / "unrelated.tmp"
     sentinel.write_bytes(b"preserve")
 
-    monkeypatch.setattr(
-        orchestrator.shutil.rmtree, "avoids_symlink_attacks", False
-    )
-    with pytest.raises(RuntimeError, match="symlink-resistant removal"):
-        orchestrator._sweep_transient_source_roots(_ArtifactStore(tmp_path))
-    assert stale_root.is_dir()
-    assert sentinel.read_bytes() == b"preserve"
-    monkeypatch.setattr(
-        orchestrator.shutil.rmtree, "avoids_symlink_attacks", True
-    )
-
     async def sync_registry(*_args: Any) -> None:
-        assert not stale_root.exists()
+        assert active_root.is_dir()
         assert sentinel.read_bytes() == b"preserve"
-        raise RuntimeError("stop after sweep")
+        raise RuntimeError("stop after scratch check")
 
     monkeypatch.setattr(orchestrator, "sync_registry", sync_registry)
     monkeypatch.setattr(orchestrator, "_progress", lambda *_args: None)
     monkeypatch.setattr(
         orchestrator, "_resource_limits",
-        lambda *_args: (1, 1, 1024, 4096, 2048, 1),
+        lambda *_args: (1, 1, 1, 1, 1024, 4096, 2048, 1),
     )
 
-    with pytest.raises(RuntimeError, match="stop after sweep"):
+    with pytest.raises(RuntimeError, match="stop after scratch check"):
         await orchestrator._run_import(
             {}, {}, (), _ArtifactStore(tmp_path), [], "hospital-prices:test", 300
         )
 
-    reserved_file = tmp_path / "hospital-mrf-source-invalid"
-    reserved_file.write_bytes(b"do not delete")
-    with pytest.raises(RuntimeError, match="not a regular directory"):
-        orchestrator._sweep_transient_source_roots(_ArtifactStore(tmp_path))
-    assert reserved_file.read_bytes() == b"do not delete"
+    assert active_root.is_dir()
     assert sentinel.read_bytes() == b"preserve"

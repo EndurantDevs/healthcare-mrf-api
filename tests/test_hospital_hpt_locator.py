@@ -67,7 +67,6 @@ def test_parser_accepts_bom_blank_and_repeated_location_boundaries():
             b"location-name: Hospital\nmrf-url: https://files.example/mrf#\n",
             "mrf_url",
         ),
-        (b"location-name: Hos\tpital\n", "control_character"),
         (b"location-name Hospital\n", "line"),
         (b"\xff", "utf8"),
     ],
@@ -86,6 +85,12 @@ MRF-URL: https://files.example/two.json
 
     with pytest.raises(locator.HospitalHptLocatorError, match="duplicate_field"):
         locator.parse_hospital_hpt_locator(payload)
+
+
+def test_parser_normalizes_horizontal_tabs():
+    assert locator.parse_hospital_hpt_locator(
+        b"location-name:\tHospital\tOne\nmrf-url:\thttps://files.example/mrf.json\t\n"
+    ) == (_record("Hospital One"),)
 
 
 def test_parser_rejects_oversize_and_non_bytes_payloads():
@@ -287,3 +292,102 @@ def test_matcher_collapses_identical_repeated_locator_records():
 
     assert result.bindings[0].mrf_url == repeated.mrf_url
     assert result.ambiguous_hospital_ids == ()
+
+
+def test_mrf_selector_normalizes_only_origin_and_rotating_credentials():
+    selected = locator.hospital_mrf_selector(
+        "HTTPS://Files.Example:443/Case/File.csv?SIG=one&sr=c",
+        allow_credentials=True,
+    )
+
+    assert selected == "https://files.example/Case/File.csv"
+    assert locator.hospital_mrf_selector(selected) == selected
+    assert locator.hospital_mrf_selector(
+        "https://files.example/Case/File.csv?download=1",
+        allow_credentials=True,
+    ) is None
+    assert locator.hospital_mrf_selector(
+        "https://files.example/Case/File.csv?sig=one;download=1",
+        allow_credentials=True,
+    ) is None
+    assert locator.hospital_mrf_selector(
+        "https://files.example/Case/File.csv?sig=one"
+    ) is None
+
+
+def test_mrf_selector_rejects_control_characters():
+    assert locator.hospital_mrf_selector(
+        "https://files.example/Case/File.csv\n"
+    ) is None
+
+
+def test_selector_binds_unique_content_without_inventing_a_location():
+    shared_locator = "https://hospital.example/cms-hpt.txt"
+    selected = "https://files.example/Case/File.csv"
+    hospital_by_field = {
+        "hospital_id": "content-only",
+        "name": "Catalog Sublocation",
+        "locator_mrf_url": selected,
+        "cms_hpt_url": shared_locator,
+    }
+
+    result = locator.match_hospital_hpt_locator(
+        (hospital_by_field,),
+        shared_locator,
+        (
+            _record("Parent Hospital", f"{selected}?sig=one"),
+            _record("Parent Hospital Annex", f"{selected}?sig=two"),
+        ),
+    )
+
+    assert result.bindings == (
+        locator.HospitalMrfBinding(
+            "content-only", None, f"{selected}?sig=one"
+        ),
+    )
+    assert result.unmatched_hospital_ids == ()
+    assert result.unmatched_record_indexes == ()
+
+
+def test_selector_retains_a_uniquely_proven_locator_location():
+    shared_locator = "https://hospital.example/cms-hpt.txt"
+    selected = "https://files.example/mrf.csv"
+    hospital_by_field = {
+        "hospital_id": "unique-location",
+        "name": "Catalog Name",
+        "locator_mrf_url": selected,
+        "cms_hpt_url": shared_locator,
+    }
+
+    result = locator.match_hospital_hpt_locator(
+        (hospital_by_field,),
+        shared_locator,
+        (_record("Only Locator Location", f"{selected}?signature=fresh"),),
+    )
+
+    assert result.bindings[0].record_index == 0
+
+
+@pytest.mark.parametrize(
+    "actual_url",
+    (
+        "https://other.example/Case/File.csv",
+        "https://files.example/case/File.csv",
+        "https://files.example/Case/File.csv?download=1",
+    ),
+)
+def test_selector_rejects_inexact_identity_and_content_queries(actual_url):
+    shared_locator = "https://hospital.example/cms-hpt.txt"
+    hospital_by_field = {
+        "hospital_id": "selected",
+        "name": "Hospital",
+        "locator_mrf_url": "https://files.example/Case/File.csv",
+        "cms_hpt_url": shared_locator,
+    }
+
+    result = locator.match_hospital_hpt_locator(
+        (hospital_by_field,), shared_locator, (_record("Hospital", actual_url),)
+    )
+
+    assert result.bindings == ()
+    assert result.unmatched_hospital_ids == ("selected",)

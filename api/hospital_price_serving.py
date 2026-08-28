@@ -91,6 +91,7 @@ def _validated_version(
         version_record_by_field.get("version_charge_count"),
         version_record_by_field.get("version_fact_count"),
     )
+    template_version = version_record_by_field.get("template_version")
     if (
         type(version_record_by_field.get("version_id")) is not str
         or len(version_record_by_field["version_id"]) != 64
@@ -104,7 +105,9 @@ def _validated_version(
             2: HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
         }.get(version_record_by_field.get("format_version"))
         or version_record_by_field.get("source_format") not in _SOURCE_FORMATS
-        or version_record_by_field.get("template_version") != "3.0.0"
+        or type(template_version) is not str
+        or not template_version
+        or template_version != template_version.strip()
         or version_record_by_field.get("format_version") not in {1, 2}
         or expected_counts != (
             version_record_by_field.get("service_count"),

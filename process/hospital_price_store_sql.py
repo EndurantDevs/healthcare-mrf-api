@@ -5,21 +5,25 @@
 ADMIT_ATTEMPTS_SQL = """WITH locked AS MATERIALIZED (
 SELECT current.hospital_id, current.generation, current.latest_attempt_id
 FROM {schema}.hospital_price_current current JOIN {stage} staged USING (hospital_id)
-ORDER BY current.hospital_id FOR UPDATE OF current), expired AS (
+ORDER BY current.hospital_id FOR UPDATE OF current), latest_locked AS MATERIALIZED (
+SELECT locked.hospital_id, locked.generation, locked.latest_attempt_id,
+latest.status, latest.lease_expires_at
+FROM locked JOIN {schema}.hospital_price_import_attempt latest
+ON latest.attempt_id=locked.latest_attempt_id
+ORDER BY locked.hospital_id FOR UPDATE OF latest), expired AS (
 UPDATE {schema}.hospital_price_import_attempt attempt
 SET status='failed', finished_at=clock_timestamp(),
 error_code='lease_expired',
 error_detail='worker lease expired before completion'
-FROM locked WHERE attempt.attempt_id=locked.latest_attempt_id
-AND attempt.status IN ('queued', 'running', 'verified')
-AND attempt.lease_expires_at <= clock_timestamp()
+FROM latest_locked WHERE attempt.attempt_id=latest_locked.latest_attempt_id
+AND latest_locked.status IN ('queued', 'running', 'verified')
+AND latest_locked.lease_expires_at <= clock_timestamp()
 RETURNING attempt.attempt_id), eligible AS (
 SELECT staged.*, locked.generation FROM {stage} staged JOIN locked USING (hospital_id)
-LEFT JOIN {schema}.hospital_price_import_attempt latest
-ON latest.attempt_id=locked.latest_attempt_id WHERE latest.status IS NULL
+LEFT JOIN latest_locked latest USING (hospital_id) WHERE latest.status IS NULL
 OR latest.status NOT IN ('queued', 'running', 'verified')
 OR EXISTS (SELECT 1 FROM expired
-           WHERE expired.attempt_id=latest.attempt_id)), inserted AS (
+           WHERE expired.attempt_id=latest.latest_attempt_id)), inserted AS (
 INSERT INTO {schema}.hospital_price_import_attempt(
 attempt_id, hospital_id, locator_id, locator_observation_id, registry_version,
 requested_source_url, expected_generation, status, lease_owner,

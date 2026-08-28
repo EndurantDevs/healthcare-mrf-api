@@ -26,6 +26,37 @@ class _ServerError(Exception):
         self.status = status
 
 
+def test_content_only_locator_binding_preserves_unknown_location():
+    acquisition = _acquisition_module()
+    locator_url = "https://hospital.example/cms-hpt.txt"
+    selector = "https://files.example/shared.csv"
+    hospital_by_field = {
+        "hospital_id": "hospital-a",
+        "name": "Catalog Sublocation",
+        "cms_hpt_url": locator_url,
+        "locator_mrf_url": selector,
+    }
+    result = acquisition.LocatorResult(
+        locator_url,
+        "locator-a",
+        "observation-a",
+        (hospital_by_field,),
+        (
+            acquisition.HospitalHptLocatorRecord(
+                "Parent Hospital", f"{selector}?sig=fresh"
+            ),
+            acquisition.HospitalHptLocatorRecord(
+                "Parent Hospital Annex", f"{selector}?sig=fresh"
+            ),
+        ),
+    )
+
+    candidate = acquisition.candidates_from_locators((result,))[0]
+
+    assert candidate.source_url == f"{selector}?sig=fresh"
+    assert candidate.locator_name is None
+
+
 @pytest.mark.asyncio
 async def test_source_download_updates_shared_attempts_and_reports_errors(monkeypatch):
     acquisition = _acquisition_module()
@@ -106,7 +137,7 @@ async def test_source_download_marks_expired_authorization_and_exact_retry(monke
 
 
 @pytest.mark.asyncio
-async def test_source_download_refresh_requires_only_authorization_failures(monkeypatch):
+async def test_source_download_refreshes_an_authorization_sibling(monkeypatch):
     acquisition = _acquisition_module()
     expired_attempt = acquisition.Attempt(
         "expired", "a", "Hospital A", "https://a/mrf?sig=expired", 1
@@ -122,7 +153,10 @@ async def test_source_download_refresh_requires_only_authorization_failures(monk
     mixed_failure = await acquisition.download_source(
         (expired_attempt.source_url, (expired_attempt, mixed_attempt)), object(), 1024
     )
-    assert mixed_failure.auth_refresh_required is False
+    assert mixed_failure.auth_refresh_required is True
+    assert (expired_attempt.source_http_status, mixed_attempt.source_http_status) == (
+        403, 500,
+    )
 
 
 @pytest.mark.asyncio

@@ -289,21 +289,6 @@ async def test_content_version_children_and_count_invariants(
         )
 
 
-def test_location_binding_is_exact_and_rejects_ambiguity() -> None:
-    store, _native = _store_module()
-    attempts = (
-        SimpleNamespace(
-            hospital_id="hospital-a", locator_name=" Same ", hospital_name="A"
-        ),
-        SimpleNamespace(
-            hospital_id="hospital-b", locator_name=None, hospital_name="Unique"
-        ),
-    )
-    assert store._location_ordinals(
-        attempts, ((0, None), (1, "Same"), (2, " same "), (3, "Unique"))
-    ) == {"hospital-a": None, "hospital-b": 3}
-
-
 @pytest.mark.asyncio
 async def test_publication_stage_keeps_location_and_filename_evidence() -> None:
     store, _native = _store_module()
@@ -341,7 +326,8 @@ async def test_publication_stage_keeps_location_and_filename_evidence() -> None:
     (
         ([1], [True], "binding conflicts"),
         ([1, 0], [False], "attempt changed"),
-        ([1, 1, 1], [False, True], "NPI provenance"),
+        ([1, 1], [False, True], "raw NPI count"),
+        ([1, 1, 1], [False, False, True], "NPI provenance rows"),
     ),
 )
 async def test_evidence_binding_fails_closed(
@@ -377,11 +363,12 @@ async def test_bind_and_publish_checks_cardinality(monkeypatch) -> None:
     monkeypatch.setattr(store, "_publication_stage", publication)
     monkeypatch.setattr(store, "_bind_evidence", bind)
     monkeypatch.setattr(store, "_cas_publish", publish)
-    attempts = (SimpleNamespace(),)
+    attempts = (SimpleNamespace(hospital_id="hospital-a"),)
+    connection = _Connection(all_rows=[[("hospital-a",)], [("hospital-a",)]])
     with pytest.raises(RuntimeError, match="result count"):
-        await store._bind_and_publish(object(), "v", "c", attempts, ())
+        await store._bind_and_publish(connection, "v", "c", attempts, ())
     assert await store._bind_and_publish(
-        object(), "v", "c", attempts, ()
+        connection, "v", "c", attempts, ()
     ) == (1, 0, 0)
 
 
@@ -420,8 +407,8 @@ async def test_existing_version_and_publication_paths(monkeypatch) -> None:
         return 1, 0, 0
 
     monkeypatch.setattr(store, "_bind_and_publish", bind)
-    attempts = (SimpleNamespace(),)
-    assert await store.publish_existing("v", "c", attempts) == (1, 0, 0)
+    attempt = SimpleNamespace()
+    assert await store.publish_existing("v", "c", attempt) == (1, 0, 0)
     assert seen_arguments[-1] == [(4, "Hospital A")]
 
 

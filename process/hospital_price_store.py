@@ -223,14 +223,19 @@ def _location_ordinals(
     by_name: dict[str, list[int]] = {}
     for ordinal, name in rows:
         if name is not None:
-            by_name.setdefault(normalized_hospital_location_name(str(name)), []).append(int(ordinal))
-    return {
-        attempt.hospital_id: (values[0] if len(values) == 1 else None)
-        for attempt in attempts
-        for values in [by_name.get(normalized_hospital_location_name(
-            attempt.locator_name or attempt.hospital_name
-        ), [])]
-    }
+            key = normalized_hospital_location_name(str(name))
+            by_name.setdefault(key, []).append(int(ordinal))
+    ordinal_by_hospital_id: dict[str, int | None] = {}
+    for attempt in attempts:
+        values = (
+            by_name.get(normalized_hospital_location_name(attempt.locator_name), [])
+            if attempt.locator_name is not None
+            else []
+        )
+        ordinal_by_hospital_id[attempt.hospital_id] = (
+            values[0] if len(values) == 1 else None
+        )
+    return ordinal_by_hospital_id
 
 
 async def _publication_stage(
@@ -259,6 +264,43 @@ async def _publication_stage(
     return stage_name, stage
 
 
+async def _bind_npi_evidence(
+    connection: Any, schema: str, stage: str, version_id: str
+) -> None:
+    if await connection.scalar(
+        f"SELECT EXISTS (SELECT 1 FROM {schema}.hospital_price_version version "
+        "WHERE version.version_id=:version AND version.npi_count <> "
+        f"(SELECT COUNT(*) FROM {schema}.hospital_price_version_npi npi "
+        "WHERE npi.version_id=:version))",
+        version=version_id,
+    ):
+        raise RuntimeError("hospital raw NPI count is invalid")
+    await connection.status(
+        f"INSERT INTO {schema}.hospital_price_hospital_npi "
+        "(hospital_id, version_id, source_ordinal, npi, source_kind) "
+        f"SELECT staged.hospital_id, :version, npi.npi_ordinal, npi.npi, "
+        f"'mrf_header_file' FROM {stage} staged "
+        f"JOIN {schema}.hospital_price_version_npi npi ON npi.version_id=:version "
+        "WHERE npi.npi ~ '^[0-9]{10}$' "
+        "ON CONFLICT DO NOTHING", version=version_id,
+    )
+    if await connection.scalar(
+        f"WITH expected AS (SELECT staged.hospital_id, "
+        "npi.npi_ordinal AS source_ordinal, npi.npi "
+        f"FROM {stage} staged CROSS JOIN {schema}.hospital_price_version_npi npi "
+        "WHERE npi.version_id=:version AND npi.npi ~ '^[0-9]{10}$'), "
+        "stored AS (SELECT evidence.hospital_id, evidence.source_ordinal, evidence.npi "
+        f"FROM {stage} staged JOIN {schema}.hospital_price_hospital_npi evidence "
+        "ON evidence.hospital_id=staged.hospital_id "
+        "WHERE evidence.version_id=:version), "
+        "missing AS (SELECT * FROM expected EXCEPT SELECT * FROM stored), "
+        "extra AS (SELECT * FROM stored EXCEPT SELECT * FROM expected) "
+        "SELECT EXISTS (SELECT 1 FROM missing UNION ALL SELECT 1 FROM extra)",
+        version=version_id,
+    ):
+        raise RuntimeError("hospital NPI provenance rows are invalid")
+
+
 async def _bind_evidence(
     connection: Any, stage: str, version_id: str, content_sha256: str, count: int
 ) -> None:
@@ -273,8 +315,9 @@ async def _bind_evidence(
         f"SELECT EXISTS (SELECT 1 FROM {stage} staged LEFT JOIN "
         f"{schema}.hospital_price_version_hospital bound ON "
         "bound.version_id=:version AND bound.hospital_id=staged.hospital_id "
-        "WHERE bound.hospital_id IS NULL OR bound.source_location_ordinal "
-        "IS DISTINCT FROM staged.source_location_ordinal)",
+        "WHERE bound.hospital_id IS NULL OR (bound.source_location_ordinal IS NOT NULL "
+        "AND staged.source_location_ordinal IS NOT NULL AND "
+        "bound.source_location_ordinal <> staged.source_location_ordinal))",
         version=version_id,
     ):
         raise RuntimeError("hospital version binding conflicts with stored evidence")
@@ -288,24 +331,7 @@ async def _bind_evidence(
     )
     if int(verified or 0) != count:
         raise RuntimeError("hospital attempt changed before publication")
-    await connection.status(
-        f"INSERT INTO {schema}.hospital_price_hospital_npi "
-        "(hospital_id, version_id, source_ordinal, npi, source_kind) "
-        f"SELECT staged.hospital_id, :version, npi.npi_ordinal, npi.npi, "
-        f"'mrf_header_file' FROM {stage} staged "
-        f"JOIN {schema}.hospital_price_version_npi npi ON npi.version_id=:version "
-        "ON CONFLICT DO NOTHING", version=version_id,
-    )
-    if await connection.scalar(
-        f"SELECT EXISTS (SELECT staged.hospital_id FROM {stage} staged "
-        f"JOIN {schema}.hospital_price_version version ON version.version_id=:version "
-        f"LEFT JOIN {schema}.hospital_price_hospital_npi evidence ON "
-        "evidence.hospital_id=staged.hospital_id AND evidence.version_id=:version "
-        "GROUP BY staged.hospital_id, version.npi_count "
-        "HAVING COUNT(evidence.source_ordinal) <> version.npi_count)",
-        version=version_id,
-    ):
-        raise RuntimeError("hospital NPI provenance count is invalid")
+    await _bind_npi_evidence(connection, schema, stage, version_id)
     await connection.status(
         f"INSERT INTO {schema}.hospital_price_hospital_tax_identity "
         "(hospital_id, version_id, attempt_id, tin_type, tin_value, source_kind, "
@@ -346,6 +372,17 @@ async def _bind_and_publish(
     if not attempts:
         return 0, 0, 0
     _, stage = await _publication_stage(connection, attempts, location_rows)
+    locked_hospital_ids = [
+        str(row[0])
+        for row in await connection.all(
+            f"SELECT current.hospital_id FROM "
+            f"{_quote_ident(schema_name())}.hospital_price_current current "
+            f"JOIN {stage} staged USING (hospital_id) "
+            "ORDER BY current.hospital_id FOR UPDATE OF current"
+        )
+    ]
+    if locked_hospital_ids != sorted(attempt.hospital_id for attempt in attempts):
+        raise RuntimeError("hospital publication current rows changed")
     await _bind_evidence(connection, stage, version_id, content_sha256, len(attempts))
     outcome = await _cas_publish(connection, stage, version_id)
     if sum(outcome) != len(attempts):
@@ -376,9 +413,9 @@ async def has_existing_version(
 
 
 async def publish_existing(
-    version_id: str, content_sha256: str, attempts: Sequence[Attempt]
+    version_id: str, content_sha256: str, attempt: Attempt
 ) -> tuple[int, int, int]:
-    """Bind and CAS-publish a previously stored immutable version."""
+    """Bind and CAS-publish one attempt to a stored immutable version."""
 
     schema = _quote_ident(schema_name())
     async with db.acquire() as connection:
@@ -388,7 +425,7 @@ async def publish_existing(
             "ORDER BY location_ordinal", version=version_id,
         )
         return await _bind_and_publish(
-            connection, version_id, content_sha256, attempts, locations
+            connection, version_id, content_sha256, (attempt,), locations
         )
 
 
