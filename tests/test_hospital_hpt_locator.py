@@ -67,7 +67,6 @@ def test_parser_accepts_bom_blank_and_repeated_location_boundaries():
             b"location-name: Hospital\nmrf-url: https://files.example/mrf#\n",
             "mrf_url",
         ),
-        (b"location-name: Hos\tpital\n", "control_character"),
         (b"location-name Hospital\n", "line"),
         (b"\xff", "utf8"),
     ],
@@ -86,6 +85,12 @@ MRF-URL: https://files.example/two.json
 
     with pytest.raises(locator.HospitalHptLocatorError, match="duplicate_field"):
         locator.parse_hospital_hpt_locator(payload)
+
+
+def test_parser_normalizes_horizontal_tabs():
+    assert locator.parse_hospital_hpt_locator(
+        b"location-name:\tHospital\tOne\nmrf-url:\thttps://files.example/mrf.json\t\n"
+    ) == (_record("Hospital One"),)
 
 
 def test_parser_rejects_oversize_and_non_bytes_payloads():

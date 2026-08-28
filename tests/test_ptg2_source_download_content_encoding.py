@@ -34,6 +34,7 @@ def test_download_session_uses_stable_product_user_agent(monkeypatch) -> None:
         "timeout": timeout,
         "connector": connector,
         "headers": {"User-Agent": "HealthPorta-MRF/1.0"},
+        "max_field_size": 64 * 1024,
     }
 
 

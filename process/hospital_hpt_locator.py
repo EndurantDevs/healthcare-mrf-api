@@ -60,7 +60,7 @@ def _decoded_locator(payload: bytes) -> str:
         text = payload.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise _locator_error("utf8") from exc
-    text = text.replace("\r\n", "\n")
+    text = text.replace("\r\n", "\n").replace("\t", " ")
     if "\r" in text or "\ufeff" in text:
         raise _locator_error("control_character")
     if any(
