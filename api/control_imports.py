@@ -7,6 +7,7 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import logging
 import os
 import shutil
 import uuid
@@ -26,6 +27,7 @@ from process.provider_directory_profile_selection import (
     ProviderDirectoryProfileSelectionError,
     validated_profile_execution,
 )
+from api.control_workers import exact_worker_presence
 from process.hospital_hpt_registry import selected_hospital_hpt_registry
 from process.hospital_price_runtime import (
     configured_resource_limits,
@@ -82,6 +84,7 @@ from process.ptg_singleton_direct_control import (
 
 from db.models import ImportRun, PTG2ImportRun, PTG2Snapshot, db
 from process.import_status_events import enqueue_status_event, isoformat_utc
+from process.control_lifecycle import acquire_control_run_worker_action_lock
 from process.live_progress import enqueue_live_progress, estimate_payload_from_live, progress_payload_from_live, read_live_progress
 from process.ptg_allowed_amount_blank import (
     ALLOWED_AMOUNT_BLANK_ERROR,
@@ -96,11 +99,31 @@ TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "dead_letter"}
 ALL_STATUS_IDEMPOTENCY_IMPORTERS = frozenset(
     {"plan-pricing-projection", "plan-pricing-prewarm"}
 )
+STALE_WORKER_RECONCILIATION_IMPORTERS = ALL_STATUS_IDEMPOTENCY_IMPORTERS
+STALE_WORKER_RECONCILIATION_MIN_AGE_SECONDS = 60
+_STALE_WORKER_RECONCILIATION_FIELDS = frozenset(
+    {
+        "expected_importer",
+        "expected_status",
+        "expected_heartbeat_at",
+        "expected_attempt_id",
+        "expected_attempt_started_at",
+    }
+)
 CANCEL_FLAG_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_IMPORT_RUN_LIST_LIMIT = 200
 MAX_TRIGGERED_BY_LENGTH = 32
 _IMPORT_RUN_ENSURE_LOCK = asyncio.Lock()
 _IMPORT_RUN_ADVISORY_LOCK_KEY = 44_706_101_200_001
+logger = logging.getLogger(__name__)
+
+
+class StaleWorkerReconciliationConflict(RuntimeError):
+    """The exact active worker identity changed or still has live residue."""
+
+
+class StaleWorkerReconciliationUnavailable(RuntimeError):
+    """The worker absence proof could not be completed."""
 
 
 @dataclass
@@ -1327,7 +1350,7 @@ def _decode_import_run_cursor(cursor: str) -> tuple[dt.datetime, str]:
 
 
 async def get_import_run(run_id: str) -> dict[str, Any] | None:
-    """Return one import run after reconciling terminal worker failures."""
+    """Return one import run; plan-pricing terminalization stays explicit."""
 
     query_result = await db.execute(
         select(ImportRun).where(ImportRun.run_id == run_id).limit(1)
@@ -1335,7 +1358,9 @@ async def get_import_run(run_id: str) -> dict[str, Any] | None:
     durable_run = query_result.scalar_one_or_none()
     if not durable_run:
         return None
-    public_run = await _sync_terminal_worker_failure(normalize_run(durable_run))
+    public_run = normalize_run(durable_run)
+    if public_run.get("importer") not in STALE_WORKER_RECONCILIATION_IMPORTERS:
+        public_run = await _sync_terminal_worker_failure(public_run)
     blank_metrics_by_name = await _allowed_amount_blank_terminal_metrics(
         durable_run, public_run
     )
@@ -1442,7 +1467,13 @@ async def _sync_terminal_worker_failure(run: dict[str, Any]) -> dict[str, Any]:
         return run
 
     now = utc_now()
-    progress_dict = {"unit": "run", "total": 1, "done": 1, "pct": 100, "message": "worker job failed"}
+    progress_dict = {
+        "unit": "run",
+        "total": 1,
+        "done": 1,
+        "pct": 100,
+        "message": "worker job failed",
+    }
     metrics_map = dict(run.get("metrics") or {})
     metrics_map["terminal_worker_state"] = worker_status
     error_dict = _worker_job_failure_error(failed_item)
@@ -1494,9 +1525,15 @@ def _failed_worker_state_item(worker_status: dict[str, Any]) -> dict[str, Any] |
 
 
 def _worker_job_failure_error(worker_item: dict[str, Any]) -> dict[str, Any]:
-    failure = worker_item.get("failure") if isinstance(worker_item.get("failure"), dict) else {}
+    failure = (
+        worker_item.get("failure")
+        if isinstance(worker_item.get("failure"), dict)
+        else {}
+    )
     job_name = str(worker_item.get("job_name") or "worker job")
-    reason = str(failure.get("reason") or worker_item.get("job_status") or "failed").strip()
+    reason = str(
+        failure.get("reason") or worker_item.get("job_status") or "failed"
+    ).strip()
     message = f"Kubernetes worker job {job_name} failed"
     if reason:
         message = f"{message}: {reason}"
@@ -1514,6 +1551,401 @@ def _worker_job_failure_error(worker_item: dict[str, Any]) -> dict[str, Any]:
     if "exitCode" in failure:
         error_dict["exitCode"] = failure.get("exitCode")
     return error_dict
+
+
+def _required_reconciliation_timestamp(value: Any, field_name: str) -> dt.datetime:
+    if type(value) is not str or not value or value != value.strip():
+        raise ValueError(f"{field_name} must be a non-empty UTC timestamp")
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a valid UTC timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field_name} must include a UTC offset")
+    return parsed.astimezone(dt.UTC).replace(tzinfo=None)
+
+
+def _validated_stale_worker_reconciliation(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if type(payload) is not dict or set(payload) != _STALE_WORKER_RECONCILIATION_FIELDS:
+        raise ValueError(
+            "request must contain exactly expected_importer, expected_status, "
+            "expected_heartbeat_at, expected_attempt_id, and "
+            "expected_attempt_started_at"
+    )
+    importer = payload.get("expected_importer")
+    if type(importer) is not str or importer not in STALE_WORKER_RECONCILIATION_IMPORTERS:
+        raise ValueError("expected_importer does not support worker reconciliation")
+    if payload.get("expected_status") != "running":
+        raise ValueError("expected_status must be running")
+    attempt_id = payload.get("expected_attempt_id")
+    attempt_started_at = payload.get("expected_attempt_started_at")
+    if type(attempt_id) is not str or not attempt_id or attempt_id != attempt_id.strip():
+        raise ValueError("expected_attempt_id must be a non-empty string")
+    _required_reconciliation_timestamp(
+        attempt_started_at,
+        "expected_attempt_started_at",
+    )
+    return {
+        **payload,
+        "expected_heartbeat": _required_reconciliation_timestamp(
+            payload.get("expected_heartbeat_at"),
+            "expected_heartbeat_at",
+        ),
+    }
+
+
+def _raw_connection_run(connection_row: Any) -> dict[str, Any]:
+    mapping = getattr(connection_row, "_mapping", None)
+    if mapping is not None:
+        return dict(mapping)
+    return dict(connection_row) if isinstance(connection_row, dict) else {}
+
+
+async def _locked_reconciliation_run(
+    connection: Any,
+    run_id: str,
+) -> dict[str, Any] | None:
+    rows = await connection.all(
+        select(ImportRun.__table__)
+        .where(ImportRun.run_id == run_id)
+        .limit(1)
+        .with_for_update()
+    )
+    return _raw_connection_run(rows[0]) if rows else None
+
+
+def _reconciliation_attempt(run: dict[str, Any]) -> tuple[str, str]:
+    progress = run.get("progress") if isinstance(run.get("progress"), dict) else {}
+    attempt_pair = _cancel_attempt_pair(progress)
+    if attempt_pair is None:
+        raise StaleWorkerReconciliationConflict(
+            "run does not have a complete worker attempt identity"
+        )
+    return attempt_pair
+
+
+def _is_same_lifecycle_lost_result(
+    run: dict[str, Any],
+    expected: dict[str, Any],
+) -> bool:
+    error = run.get("error") if isinstance(run.get("error"), dict) else {}
+    progress = run.get("progress") if isinstance(run.get("progress"), dict) else {}
+    return (
+        run.get("status") == "failed"
+        and error.get("code") == "worker_lifecycle_lost"
+        and run.get("importer") == expected["expected_importer"]
+        and error.get("observed_heartbeat_at")
+        == expected["expected_heartbeat_at"]
+        and error.get("attempt_id") == expected["expected_attempt_id"]
+        and error.get("attempt_started_at")
+        == expected["expected_attempt_started_at"]
+        and progress.get("attempt_id") == expected["expected_attempt_id"]
+        and progress.get("attempt_started_at")
+        == expected["expected_attempt_started_at"]
+    )
+
+
+def _stale_worker_receipt(
+    run: dict[str, Any],
+    *,
+    reconciled: bool,
+) -> dict[str, Any]:
+    progress = run.get("progress") if isinstance(run.get("progress"), dict) else {}
+    error = run.get("error") if isinstance(run.get("error"), dict) else {}
+    return {
+        "run_id": run.get("run_id"),
+        "importer": run.get("importer"),
+        "status": run.get("status"),
+        "reconciled": reconciled,
+        "error_code": error.get("code"),
+        "attempt_id": progress.get("attempt_id"),
+        "attempt_started_at": progress.get("attempt_started_at"),
+    }
+
+
+async def _arq_worker_presence(run: dict[str, Any]) -> dict[str, Any]:
+    _run_id, _importer, queue, job_id = _reconciliation_arq_identity(run)
+    redis_pool = await create_pool(
+        build_redis_settings(),
+        job_serializer=serialize_job,
+        job_deserializer=deserialize_job,
+    )
+    try:
+        async with redis_pool.pipeline(transaction=True) as pipe:
+            pipe.zscore(queue, job_id)
+            pipe.exists(f"arq:job:{job_id}")
+            pipe.exists(f"arq:retry:{job_id}")
+            pipe.exists(f"arq:in-progress:{job_id}")
+            pipe.exists(f"arq:result:{job_id}")
+            queue_score, job, retry, in_progress, result = await pipe.execute()
+    finally:
+        await redis_pool.aclose(close_connection_pool=True)
+    return {
+        "queue_member": queue_score is not None,
+        "job": bool(job),
+        "retry": bool(retry),
+        "in_progress": bool(in_progress),
+        "result": bool(result),
+    }
+
+
+def _require_stale_worker_identity(
+    run: dict[str, Any],
+    expected: dict[str, Any],
+    now: dt.datetime,
+) -> tuple[str, str, dt.datetime]:
+    if run.get("importer") != expected["expected_importer"]:
+        raise StaleWorkerReconciliationConflict("importer changed during reconciliation")
+    if run.get("status") != expected["expected_status"]:
+        raise StaleWorkerReconciliationConflict("run status changed during reconciliation")
+    attempt_id, attempt_started_at = _reconciliation_attempt(run)
+    if (
+        attempt_id != expected["expected_attempt_id"]
+        or attempt_started_at != expected["expected_attempt_started_at"]
+    ):
+        raise StaleWorkerReconciliationConflict("worker attempt changed during reconciliation")
+    heartbeat_at = run.get("heartbeat_at")
+    if not isinstance(heartbeat_at, dt.datetime):
+        raise StaleWorkerReconciliationConflict("run heartbeat is unavailable")
+    if heartbeat_at.tzinfo is not None:
+        heartbeat_at = heartbeat_at.astimezone(dt.UTC).replace(tzinfo=None)
+    if heartbeat_at != expected["expected_heartbeat"]:
+        raise StaleWorkerReconciliationConflict("run heartbeat changed during reconciliation")
+    if now - heartbeat_at < dt.timedelta(
+        seconds=STALE_WORKER_RECONCILIATION_MIN_AGE_SECONDS
+    ):
+        raise StaleWorkerReconciliationConflict("run heartbeat is not stale")
+    return attempt_id, attempt_started_at, heartbeat_at
+
+
+def _require_absent_worker_state(
+    kubernetes_by_field: dict[str, Any],
+    arq_by_field: dict[str, Any],
+) -> None:
+    if kubernetes_by_field.get("enabled") is not True:
+        raise StaleWorkerReconciliationUnavailable(
+            "Kubernetes worker lookup is unavailable"
+        )
+    if int(kubernetes_by_field.get("job_count") or 0) or int(
+        kubernetes_by_field.get("pod_count") or 0
+    ):
+        raise StaleWorkerReconciliationConflict(
+            "Kubernetes worker evidence is still present"
+        )
+    if any(
+        arq_by_field.get(key)
+        for key in ("queue_member", "job", "retry", "in_progress", "result")
+    ):
+        raise StaleWorkerReconciliationConflict("ARQ worker evidence is still present")
+
+
+def _reconciliation_worker_payload(run: dict[str, Any]) -> dict[str, Any]:
+    run_id, importer, queue, _job_id = _reconciliation_arq_identity(run)
+    metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+    persisted_queue = str(metrics.get("queue") or "").strip()
+    if persisted_queue and persisted_queue != queue:
+        raise StaleWorkerReconciliationConflict(
+            "persisted worker queue conflicts with importer adapter"
+        )
+    payload = {
+        "run_id": run_id,
+        "importer": importer,
+        "queue": queue,
+        "worker_class": str(metrics.get("worker_class") or "").strip(),
+    }
+    return {key: value for key, value in payload.items() if value}
+
+
+def _reconciliation_arq_identity(
+    run: dict[str, Any],
+) -> tuple[str, str, str, str]:
+    run_id = str(run.get("run_id") or "").strip()
+    importer = str(run.get("importer") or "").strip()
+    adapter = _adapter_for_import_row(run)
+    if not run_id or not importer or adapter is None:
+        raise StaleWorkerReconciliationConflict("exact ARQ identity is unavailable")
+    queue = str(adapter["queue"])
+    canonical_job_id = _enqueue_job_options(adapter, {"run_id": run_id}).get(
+        "_job_id"
+    )
+    if not canonical_job_id:
+        raise StaleWorkerReconciliationConflict("exact ARQ job ID is unavailable")
+    metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+    persisted_job_id = str(metrics.get("job_id") or "").strip()
+    if persisted_job_id and persisted_job_id != canonical_job_id:
+        raise StaleWorkerReconciliationConflict(
+            "persisted ARQ job ID conflicts with importer adapter"
+        )
+    return run_id, importer, queue, canonical_job_id
+
+
+async def _verified_absent_worker(
+    run_by_field: dict[str, Any],
+    expected_by_field: dict[str, Any],
+    now: dt.datetime,
+) -> tuple[str, str, dt.datetime]:
+    attempt_id, attempt_started_at, heartbeat_at = _require_stale_worker_identity(
+        run_by_field,
+        expected_by_field,
+        now,
+    )
+    worker_payload_by_field = _reconciliation_worker_payload(run_by_field)
+    try:
+        kubernetes_by_field = await asyncio.to_thread(
+            exact_worker_presence,
+            worker_payload_by_field,
+        )
+        arq_by_field = await _arq_worker_presence(run_by_field)
+    except ValueError as exc:
+        raise StaleWorkerReconciliationConflict(str(exc)) from exc
+    except Exception as exc:
+        raise StaleWorkerReconciliationUnavailable(
+            "worker absence proof is unavailable"
+        ) from exc
+    _require_absent_worker_state(kubernetes_by_field, arq_by_field)
+    return attempt_id, attempt_started_at, heartbeat_at
+
+
+def _stale_worker_terminal_values(
+    run_by_field: dict[str, Any],
+    expected_by_field: dict[str, Any],
+    *,
+    attempt_id: str,
+    attempt_started_at: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    absence_by_field = {
+        "kubernetes_job_count": 0,
+        "kubernetes_pod_count": 0,
+        "arq_queue_member": False,
+        "arq_job": False,
+        "arq_retry": False,
+        "arq_in_progress": False,
+        "arq_result": False,
+    }
+    progress_by_field = {
+        "unit": "run",
+        "total": 1,
+        "done": 1,
+        "pct": 100,
+        "message": "worker lifecycle lost",
+        "attempt_id": attempt_id,
+        "attempt_started_at": attempt_started_at,
+    }
+    error_by_field = {
+        "code": "worker_lifecycle_lost",
+        "message": "Worker lifecycle state disappeared before terminal status",
+        "retryable": False,
+        "observed_heartbeat_at": expected_by_field["expected_heartbeat_at"],
+        "attempt_id": attempt_id,
+        "attempt_started_at": attempt_started_at,
+        "absence": absence_by_field,
+    }
+    metrics_by_name = {
+        **dict(run_by_field.get("metrics") or {}),
+        "terminal_worker_reconciliation": absence_by_field,
+    }
+    return progress_by_field, error_by_field, metrics_by_name
+
+
+async def _persist_stale_worker_failure(
+    connection: Any,
+    run_by_field: dict[str, Any],
+    expected_by_field: dict[str, Any],
+    *,
+    now: dt.datetime,
+    attempt_id: str,
+    attempt_started_at: str,
+    heartbeat_at: dt.datetime,
+) -> dict[str, Any]:
+    progress_by_field, error_by_field, metrics_by_name = _stale_worker_terminal_values(
+        run_by_field,
+        expected_by_field,
+        attempt_id=attempt_id,
+        attempt_started_at=attempt_started_at,
+    )
+    update_count = await connection.status(
+        update(ImportRun)
+        .where(
+            ImportRun.run_id == run_by_field["run_id"],
+            ImportRun.status == "running",
+            ImportRun.heartbeat_at == heartbeat_at,
+            ImportRun.progress["attempt_id"].as_string() == attempt_id,
+            ImportRun.progress["attempt_started_at"].as_string()
+            == attempt_started_at,
+        )
+        .values(
+            status="failed",
+            phase_detail="worker lifecycle lost",
+            heartbeat_at=now,
+            finished_at=now,
+            progress=progress_by_field,
+            metrics=metrics_by_name,
+            error=error_by_field,
+        )
+    )
+    if update_count != 1:
+        raise StaleWorkerReconciliationConflict("run changed during reconciliation")
+    return {
+        **run_by_field,
+        "status": "failed",
+        "phase_detail": "worker lifecycle lost",
+        "heartbeat_at": now,
+        "finished_at": now,
+        "progress": progress_by_field,
+        "metrics": metrics_by_name,
+        "error": error_by_field,
+    }
+
+
+async def reconcile_stale_worker_failure(
+    run_id: str,
+    request_by_field: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Fail one exact stale run only after worker and queue absence proof."""
+
+    normalized_run_id = str(run_id or "").strip()
+    if not normalized_run_id:
+        raise ValueError("run_id is required")
+    expected_by_field = _validated_stale_worker_reconciliation(request_by_field)
+    now = utc_now()
+    async with db.acquire() as connection:
+        await acquire_control_run_worker_action_lock(connection, normalized_run_id)
+        run_by_field = await _locked_reconciliation_run(
+            connection,
+            normalized_run_id,
+        )
+        if run_by_field is None:
+            return None
+        if _is_same_lifecycle_lost_result(run_by_field, expected_by_field):
+            return _stale_worker_receipt(run_by_field, reconciled=False)
+        attempt_id, attempt_started_at, heartbeat_at = await _verified_absent_worker(
+            run_by_field,
+            expected_by_field,
+            now,
+        )
+        updated_run_by_field = await _persist_stale_worker_failure(
+            connection,
+            run_by_field,
+            expected_by_field,
+            now=now,
+            attempt_id=attempt_id,
+            attempt_started_at=attempt_started_at,
+            heartbeat_at=heartbeat_at,
+        )
+
+    public_run_by_field = normalize_run(updated_run_by_field)
+    try:
+        _write_run_live_progress(public_run_by_field, publish_event=False)
+        enqueue_status_event(public_run_by_field)
+    except Exception:
+        logger.warning(
+            "stale worker reconciliation event projection failed for %s",
+            normalized_run_id,
+            exc_info=True,
+        )
+    return _stale_worker_receipt(public_run_by_field, reconciled=True)
 
 
 async def finalize_import_run(run_id: str, finalize_payload: dict[str, Any]) -> dict[str, Any] | None:

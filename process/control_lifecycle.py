@@ -17,7 +17,7 @@ from importlib import import_module
 from typing import Any, AsyncIterator
 
 import redis
-from sqlalchemy import and_, func, or_, update
+from sqlalchemy import and_, func, or_, text, update
 
 from db.models import ImportRun, db
 from process.control_cancel import ImportCancelledError
@@ -45,6 +45,24 @@ _TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_lett
 _CONTROL_RUN_MARKED = True
 _CONTROL_RUN_NOT_MARKED = False
 logger = logging.getLogger(__name__)
+
+
+async def acquire_control_run_worker_action_lock(
+    executor: Any,
+    run_id: str,
+) -> None:
+    """Serialize worker creation and terminal-loss reconciliation per run."""
+
+    normalized_run_id = str(run_id or "").strip()
+    if not normalized_run_id:
+        raise ValueError("run_id is required for the worker action lock")
+    await executor.scalar(
+        text(
+            "SELECT pg_catalog.pg_advisory_xact_lock("
+            "pg_catalog.hashtextextended(:lock_name, 0))"
+        ),
+        lock_name=f"control-run-worker-action:v1:{normalized_run_id}",
+    )
 
 
 def _committed_target_result(

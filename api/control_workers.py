@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from db.models import db
+from process.control_lifecycle import acquire_control_run_worker_action_lock
 from process.ptg_parts.ptg_wave_admission_fence import (
     PTG_WAVE_FENCED_IMPORTERS,
     PTGWaveCapacityConflict,
@@ -130,6 +131,21 @@ _NON_LAUNCHABLE_CONTROL_RUN_STATUSES = frozenset(
 WORKER_ENSURE_RUN_IDENTITY_CONTRACT = (
     "healthporta.worker-ensure-run-identity.v1"
 )
+
+
+async def _await_worker_launch(task: asyncio.Task[dict[str, Any]]) -> dict[str, Any]:
+    """Keep the transaction fence until the threaded launch has settled."""
+
+    pending_cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            pending_cancellation = exc
+    result = task.result()
+    if pending_cancellation is not None:
+        raise pending_cancellation
+    return result
 
 
 def worker_registry() -> list[dict[str, Any]]:
@@ -315,6 +331,7 @@ async def _guarded_ptg_family_ensure(
 
     async with db.acquire() as connection:
         await acquire_ptg_admission_lock(connection)
+        await acquire_control_run_worker_action_lock(connection, run_id)
         try:
             await require_not_wave_owned_run(connection, run_id)
             await require_no_capacity_owning_wave(connection)
@@ -328,7 +345,10 @@ async def _guarded_ptg_family_ensure(
         )
         if admission_failure is not None:
             return admission_failure
-        return await asyncio.to_thread(ensure_worker, worker_payload)
+        launch_task = asyncio.create_task(
+            asyncio.to_thread(ensure_worker, worker_payload)
+        )
+        return await _await_worker_launch(launch_task)
 
 
 def _worker_ensure_response(
@@ -380,6 +400,49 @@ def worker_state(payload: dict[str, Any]) -> dict[str, Any]:
     elif items and all(item.get("job_status") == "missing" for item in items):
         status = "missing"
     return {"status": status, "items": items}
+
+
+def exact_worker_presence(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return exact-run Kubernetes Job and Pod counts without mutation."""
+
+    spec = _exact_worker_spec(payload)
+    if _launcher_mode() != "kubernetes" or not _is_kubernetes_configured():
+        raise RuntimeError("Kubernetes worker lookup is unavailable")
+    namespace = _kubernetes_namespace()
+    selector = _kubernetes_label_selector(spec, payload)
+    query = urllib.parse.urlencode({"labelSelector": selector})
+    jobs = _kubernetes_job_records(
+        _kubernetes_request(
+            "GET",
+            f"/apis/batch/v1/namespaces/{namespace}/jobs?{query}",
+        )
+    )
+    pods = _kubernetes_pod_records(
+        _kubernetes_request(
+            "GET",
+            f"/api/v1/namespaces/{namespace}/pods?{query}",
+        )
+    )
+    return {
+        "enabled": True,
+        "job_count": len(jobs),
+        "pod_count": len(pods),
+    }
+
+
+def _exact_worker_spec(payload: dict[str, Any]) -> WorkerSpec:
+    run_id = str(payload.get("run_id") or "").strip()
+    importer = str(payload.get("importer") or "").strip()
+    spec = _BY_IMPORTER_ROLE.get((importer, "start"))
+    if not run_id or spec is None:
+        raise RuntimeError("exact worker identity is unavailable")
+    queue = str(payload.get("queue") or "").strip()
+    worker_class = str(payload.get("worker_class") or "").strip()
+    if (queue and queue != spec.queue) or (
+        worker_class and worker_class != spec.worker_class
+    ):
+        raise ValueError("exact worker selector conflicts with importer")
+    return spec
 
 
 def _resolve_specs(launch_request: dict[str, Any]) -> list[WorkerSpec]:
@@ -1507,4 +1570,4 @@ def _log_path(spec: WorkerSpec) -> Path:
     return _log_dir() / f"{_safe_name(spec.worker_class)}.log"
 
 
-__all__ = ["ensure_worker", "worker_registry"]
+__all__ = ["ensure_worker", "exact_worker_presence", "worker_registry"]
