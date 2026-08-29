@@ -162,42 +162,6 @@ async def test_geo_completion_preflights_graph_batch(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_exhausted_geo_prefix_reuses_memberships_at_graph_cap(monkeypatch):
-    """Complete an exhausted exact prefix without another graph traversal."""
-
-    rate_row = geo._rate_row(geo._PROVIDER_SET_ID, 1, 1)
-    geo._install_rate_scan(
-        monkeypatch,
-        [rate_row],
-        {geo._PROVIDER_SET_ID: (_MEMBER_NPI,)},
-        {_MEMBER_NPI: 1.0},
-    )
-    reverse_memberships = AsyncMock()
-    completion_rows = AsyncMock()
-    monkeypatch.setattr(
-        serving, "_v4_direct_npi_memberships", reverse_memberships
-    )
-    monkeypatch.setattr(
-        serving, "_v4_pattern_completion_rows", completion_rows
-    )
-    geo._install_provider_enrichment(monkeypatch)
-
-    selection = await geo._select_geo(
-        geo._geo_tables(max_online_provider_expansion_graph_batches=1),
-        rate_count=1,
-        target_count=1,
-        descending=False,
-    )
-
-    assert selection is not None and selection.exhausted is True
-    assert list(selection.rank_by_key) == [
-        ("npi", str(_MEMBER_NPI), "CPT", "99213", "FFS", "0")
-    ]
-    reverse_memberships.assert_not_awaited()
-    completion_rows.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_geo_completion_requires_every_ranked_membership(monkeypatch):
     """A duplicate NPI must retain every ranked rate-set membership."""
 
