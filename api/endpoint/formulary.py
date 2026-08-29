@@ -655,6 +655,13 @@ async def list_formulary_drugs(request, formulary_id):
 
     args = request.args
     # Explicit access keeps route/query introspection in sync with OpenAPI.
+    args.get("tier")
+    args.get("pharmacy_type")
+    args.get("authorization_required")
+    args.get("step_therapy")
+    args.get("quantity_limit")
+    args.get("sort")
+    args.get("order")
     args.get("page")
     args.get("page_size")
     pagination = parse_pagination(

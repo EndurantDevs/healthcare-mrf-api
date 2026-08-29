@@ -265,6 +265,14 @@ async def get_issuers(request, state=None):
     if session is None:
         raise RuntimeError("SQLAlchemy session not available on request context")
 
+    # Explicit access keeps route/query introspection in sync with OpenAPI.
+    request.args.get("state")
+    request.args.get("q")
+    request.args.get("page")
+    request.args.get("limit")
+    request.args.get("offset")
+    request.args.get("start")
+    request.args.get("page_size")
     state_filter, query_text, pagination = _parse_issuer_list_args(request.args, state)
 
     issuer_stmt = select(issuer_table)
