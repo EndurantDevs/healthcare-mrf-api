@@ -37,6 +37,7 @@ def _numeric_alias_binding() -> BindingProjection:
             uses_shared_blocks=True,
         ),
         {("CPT", "27447"): code_rows},
+        len(code_rows),
     )
 
 

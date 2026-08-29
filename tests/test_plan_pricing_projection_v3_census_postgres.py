@@ -131,14 +131,14 @@ async def _candidate_count(database, projection_id: str) -> int:
 
 async def _stage_two_code_work(session, projection_id: str) -> dict:
     setup_statements = (
-        "INSERT INTO plan_pricing_provider_set_stage VALUES (1, 2, 'set_2', 1)",
-        "INSERT INTO plan_pricing_provider_member_stage VALUES (1, 2, 3)",
+        "INSERT INTO plan_pricing_provider_set_stage (binding_ordinal, provider_set_key, provider_set_id, membership_count) VALUES (1, 2, 'set_2', 1)",
+        "INSERT INTO plan_pricing_provider_member_stage (binding_ordinal, provider_set_key, npi) VALUES (1, 2, 3)",
     )
     for setup_statement in setup_statements:
         await session.execute(text(setup_statement))
     await session.execute(
         text(
-            "INSERT INTO plan_pricing_provider_cell_stage VALUES "
+            "INSERT INTO plan_pricing_provider_cell_stage (projection_id, geo_cell, npi, entity_type_code, taxonomy_codes, fragment) VALUES "
             "(:projection_id, '10001', 3, 2, ARRAY[]::varchar[], :fragment)"
         ),
         {"projection_id": projection_id, "fragment": b"{}"},
@@ -156,14 +156,14 @@ async def _stage_two_code_work(session, projection_id: str) -> dict:
         )
         await session.execute(
             text(
-                "INSERT INTO plan_pricing_code_occurrence_stage "
+                "INSERT INTO plan_pricing_code_occurrence_stage (binding_ordinal, provider_set_key, price_set_id, occurrence_count) "
                 "VALUES (1, 2, :price_set_id, 1)"
             ),
             {"price_set_id": price_set_id},
         )
         await session.execute(
             text(
-                "INSERT INTO plan_pricing_price_rate_stage "
+                "INSERT INTO plan_pricing_price_rate_stage (binding_ordinal, price_set_id, negotiated_rate, rate_multiplicity) "
                 "VALUES (1, :price_set_id, :rate, 1)"
             ),
             {"price_set_id": price_set_id, "rate": ordinal},
@@ -305,26 +305,24 @@ async def test_census_measures_exact_provider_stage_counts(
         await census.projection._create_stage_tables(connection)
         await connection.execute(
             text(
-                "INSERT INTO plan_pricing_provider_set_stage VALUES "
+                "INSERT INTO plan_pricing_provider_set_stage (binding_ordinal, provider_set_key, provider_set_id, membership_count) VALUES "
                 "(0, 1, 'set_1', 2), (0, 2, 'set_2', 0)"
             )
         )
         await connection.execute(
             text(
-                "INSERT INTO plan_pricing_provider_member_stage VALUES "
+                "INSERT INTO plan_pricing_provider_member_stage (binding_ordinal, provider_set_key, npi) VALUES "
                 "(0, 1, 1), (0, 1, 2)"
             )
         )
         await connection.execute(
             text(
-                "INSERT INTO plan_pricing_provider_cell_stage VALUES "
+                "INSERT INTO plan_pricing_provider_cell_stage (projection_id, geo_cell, npi, entity_type_code, taxonomy_codes, fragment) VALUES "
                 "('projection', '10001', 1, 2, ARRAY[]::varchar[], :fragment)"
             ),
             {"fragment": b"{}"},
         )
-        await connection.execute(
-            text("INSERT INTO plan_pricing_provider_npi_materialized_stage VALUES (1)")
-        )
+        await connection.execute(text("INSERT INTO plan_pricing_provider_npi_materialized_stage (npi) VALUES (1)"))
         measured_counts = await census._projection_stage_counts(connection)
 
     assert measured_counts == {
@@ -470,9 +468,11 @@ async def test_census_postflight_drains_repeated_cancellation(
     operation_entered = asyncio.Event()
     cleanup_entered = asyncio.Event()
     cleanup_release = asyncio.Event()
+    backend_pids = []
     finish_rollback = support._finish_postflight_rollback
 
-    async def blocked_release_input(_session, _plan_release_id):
+    async def blocked_release_input(session, _plan_release_id):
+        backend_pids.append(int(await session.scalar(text("SELECT pg_backend_pid()"))))
         operation_entered.set()
         await asyncio.Event().wait()
 
@@ -494,3 +494,6 @@ async def test_census_postflight_drains_repeated_cancellation(
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(postflight_task, timeout=2)
+
+    async with database.engine.connect() as observer:
+        assert not await observer.scalar(text("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = :pid AND state = 'idle in transaction')"), {"pid": backend_pids[0]})

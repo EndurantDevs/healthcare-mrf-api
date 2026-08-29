@@ -7,7 +7,7 @@ import asyncio
 import hashlib
 import re
 import sys
-from typing import Any, Awaitable, Callable, Iterable, Mapping, TypeVar
+from typing import Any, Awaitable, Callable, Coroutine, Iterable, Mapping, TypeVar
 
 from sqlalchemy import text
 
@@ -283,11 +283,10 @@ async def _temporary_relation_residue(session: Any) -> list[str]:
               FROM pg_class
              WHERE relnamespace = pg_my_temp_schema()
                AND relname = ANY(CAST(:relation_names AS text[]))
-             ORDER BY relname
             """),
         {"relation_names": list(TEMP_RELATIONS)},
     )
-    return [str(name) for name in residue_result.scalars()]
+    return sorted(str(name) for name in residue_result.scalars())
 
 
 async def _finish_rollback(
@@ -396,7 +395,7 @@ async def _drain_cancelled_task(
 
 
 async def cancellation_safe(
-    operation: Awaitable[_Result],
+    operation: Coroutine[Any, Any, _Result],
     receipt_by_field: dict[str, Any] | None = None,
 ) -> _Result:
     """Cancel an owned task once, then drain it through caller cancellation."""

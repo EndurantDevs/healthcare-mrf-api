@@ -73,6 +73,10 @@ def test_factorized_migration_is_additive_bounded_and_authenticated(
     assert "build_seconds IS NOT NULL" in sql
     assert "rate_profile_count IS NOT NULL" in sql
     assert "plan_pricing_rate_profile_cost_idx" in sql
+    assert "plan_pricing_rates_strictly_increasing" in sql
+    assert "rates[position] >= rates[position + 1]" in sql
+    assert "array_ndims(negotiated_rates) = 1" in sql
+    assert "array_lower(rate_multiplicities, 1) = 1" in sql
     assert "BEFORE INSERT OR UPDATE OR DELETE" in sql
     assert "factorized plan-pricing projection receipt counts" in sql
 
@@ -103,6 +107,7 @@ def test_factorized_downgrade_refuses_immutable_v3_candidates(monkeypatch) -> No
     assert "DROP COLUMN provider_cell_count" in sql
     assert "DROP COLUMN provider_membership_count" in sql
     assert 'DROP TABLE "factorized_test"."plan_pricing_rate_profile"' in sql
+    assert '"plan_pricing_rates_strictly_increasing"(numeric[])' in sql
     assert "CHECK (contract_version = 'plan_pricing_card_v2')" in sql
 
 

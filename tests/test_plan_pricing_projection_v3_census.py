@@ -456,7 +456,11 @@ async def test_census_counts_declared_occurrences_without_staged_rates(
 def test_census_source_overlay_includes_branch_runtime_dependencies() -> None:
     assert {
         "api/plan_pricing_projection_v3.py",
+        "api/plan_pricing_projection_v3_aggregate.py",
+        "api/plan_pricing_projection_v3_code.py",
         "api/plan_pricing_projection_v3_price.py",
+        "api/plan_pricing_projection_v3_provider.py",
+        "api/plan_pricing_projection_v3_provider_cells.py",
         "api/plan_pricing_projection_v3_work.py",
         "api/ptg2_db_serving_v3.py",
         "api/ptg2_db_sidecars.py",

@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy import text
 
 
-_PRICING_PROJECTION_ID_SQL = """
+_PRICING_PROJECTION_SQL_TEMPLATE = """
        CASE
            WHEN pricing_projection.state = 'ready'
             AND pricing_projection.contract_version =
@@ -25,12 +25,14 @@ _PRICING_PROJECTION_ID_SQL = """
             AND pricing_projection.content_digest =
                 revision.source_manifest
                     -> 'pricing_projection' ->> 'content_digest'
-           THEN pricing_projection.projection_id
+           THEN pricing_projection.{selected_column}
        END
 """
-_PRICING_PROJECTION_CONTRACT_SQL = _PRICING_PROJECTION_ID_SQL.replace(
-    "THEN pricing_projection.projection_id",
-    "THEN pricing_projection.contract_version",
+_PRICING_PROJECTION_ID_SQL = _PRICING_PROJECTION_SQL_TEMPLATE.format(
+    selected_column="projection_id",
+)
+_PRICING_PROJECTION_CONTRACT_SQL = _PRICING_PROJECTION_SQL_TEMPLATE.format(
+    selected_column="contract_version",
 )
 _PLAN_RELEASE_SERVING_SQL_TEMPLATE = """
 SELECT revision.serving_revision_id,

@@ -137,6 +137,22 @@ async def test_stored_pack_readback_rejects_corrupt_receipts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stored_pack_readback_rejects_pack_count_drift() -> None:
+    _, one_pack_counts = await _stored_rows_and_counts((_aggregate("10001"),))
+    two_pack_rows, _ = await _stored_rows_and_counts(
+        (_aggregate("10001"), _aggregate("11001"))
+    )
+
+    for stored_rows in ((), two_pack_rows):
+        with pytest.raises(ValueError, match="stored aggregate pack totals"):
+            await projection.validate_stored_aggregate_packs(
+                _Session(stream_rows=stored_rows),
+                PROJECTION_ID,
+                one_pack_counts,
+            )
+
+
+@pytest.mark.asyncio
 async def test_prewarm_rows_extend_digest_in_final_rank_order() -> None:
     state = projection._BuildState(hashlib.sha256())
     projection._retain_prewarm_shape(

@@ -183,9 +183,12 @@ def test_exact_census_application_name_is_a_valid_sql_marker() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rate_profile_probe_must_match_materialized_work() -> None:
+async def test_rate_profile_probe_must_match_materialized_work(monkeypatch) -> None:
     """Reject rate-profile fanout that changes after its admission probe."""
 
+    monkeypatch.setattr(
+        serving, "_inferred_provider_taxonomy_rule", lambda _code: None
+    )
     scalar_result = Mock()
     scalar_result.scalar_one.return_value = 1
     metrics_result = Mock()

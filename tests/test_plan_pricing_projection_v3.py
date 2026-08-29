@@ -37,6 +37,7 @@ def _binding(ordinal: int = 0) -> BindingProjection:
             uses_shared_blocks=True,
         ),
         {("CPT", "27447"): [{"code_key": 1, "rate_count": 1}]},
+        1,
     )
 
 

@@ -162,6 +162,7 @@ async def test_materialize_all_codes_delegates_to_v3(monkeypatch):
         )
         return SimpleNamespace(
             binding=binding,
+            raw_code_row_count=2,
             code_rows_by_identity={
                 ("HCPCS", "G0439"): [{}],
                 ("CPT", "27447"): [{}],
@@ -221,6 +222,28 @@ async def test_materialize_all_codes_enforces_release_bounds(monkeypatch):
         await projection_build._materialize_all_codes(
             object(), PROJECTION_ID, [{"role": "in_network"}]
         )
+
+    binding_calls = []
+
+    async def exactly_full_projection(_session, binding, *, maximum_code_rows):
+        binding_calls.append(binding)
+        assert len(binding_calls) == 1
+        return SimpleNamespace(
+            binding=binding,
+            raw_code_row_count=maximum_code_rows,
+            code_rows_by_identity={("CPT", "27447"): [{}]},
+        )
+
+    monkeypatch.setattr(
+        projection_build, "binding_projection", exactly_full_projection
+    )
+    with pytest.raises(ValueError, match="code-row bound exceeded"):
+        await projection_build._materialize_all_codes(
+            object(),
+            PROJECTION_ID,
+            [{"role": "in_network"}, {"role": "in_network"}],
+        )
+    assert len(binding_calls) == 1
 
 
 @pytest.mark.asyncio

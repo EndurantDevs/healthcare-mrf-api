@@ -89,6 +89,12 @@ def _accepted_inputs() -> tuple[dict, dict]:
     )
 
 
+def test_acceptance_admits_the_unmutated_baseline() -> None:
+    receipt_by_field, measurement_by_field = _accepted_inputs()
+
+    assert contract.is_accepted(receipt_by_field, measurement_by_field, True)
+
+
 @pytest.mark.parametrize(
     ("collection_name", "mutation"),
     (

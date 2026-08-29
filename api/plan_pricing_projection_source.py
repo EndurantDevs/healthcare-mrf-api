@@ -29,7 +29,7 @@ class BindingProjection:
     binding: dict[str, Any]
     serving_tables: Any
     code_rows_by_identity: dict[tuple[str, str], list[dict[str, Any]]]
-    raw_code_row_count: int = 0
+    raw_code_row_count: int
 
 
 def _group_code_rows(code_result: Any, serving: Any) -> dict[

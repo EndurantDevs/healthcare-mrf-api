@@ -15,6 +15,7 @@ import pytest
 
 from api import plan_pricing_projection_v3 as projection
 from api import plan_pricing_projection_v3_code as code_stage
+from api import plan_pricing_projection_v3_work as work_admission
 from api import ptg2_serving as serving
 from scripts.research import plan_pricing_projection_v3_census as census
 from scripts.research import (
@@ -221,6 +222,12 @@ def test_database_identity_binds_exact_runtime_and_postgresql_limit() -> None:
             for stage in transaction.CENSUS_DATABASE_STAGE_KEYS
         )
         <= 63
+    )
+    assert all(
+        work_admission._DIAGNOSTIC_MARKER.fullmatch(
+            transaction.census_database_application_name(run_token, stage)
+        )
+        for stage in transaction.CENSUS_DATABASE_STAGE_KEYS
     )
     with pytest.raises(ValueError, match="identity is incomplete"):
         transaction.census_database_run_token({})

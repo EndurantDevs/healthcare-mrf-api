@@ -53,6 +53,8 @@ def test_projection_only_release_resolution_skips_snapshot_readiness(
     assert "revision.binding_set_digest" in sql
     assert "pricing_projection.content_digest" in sql
     assert "pricing_projection.contract_version" in sql
+    assert "THEN pricing_projection.contract_version" in sql
+    assert "AS pricing_projection_contract" in sql
 
 
 def test_guard_release_resolution_never_reads_projection_metadata():

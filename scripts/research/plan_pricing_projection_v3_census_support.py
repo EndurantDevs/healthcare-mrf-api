@@ -331,6 +331,8 @@ async def load_binding_projections(
     remaining_code_rows = MAX_PROJECTION_CODE_ROWS
     binding_projection_list: list[BindingProjection] = []
     for binding_by_field in in_network_bindings:
+        if remaining_code_rows <= 0:
+            raise ValueError("pricing projection census code-row bound exceeded")
         loaded_binding = await binding_projection(
             session,
             binding_by_field,
@@ -347,22 +349,21 @@ async def load_binding_projections(
 async def projection_row_counts(
     session: Any,
     candidate_id: str,
-) -> dict[str, int | None]:
+) -> dict[str, int]:
     """Count exact candidate rows across every known projection relation."""
 
-    schema = os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
-    counts_by_relation: dict[str, int | None] = {}
+    counts_by_relation: dict[str, int] = {}
     for relation_name in PROJECTION_RELATIONS:
+        qualified_relation = table(relation_name)
         exists_result = await session.execute(
             text("SELECT to_regclass(:relation_name) IS NOT NULL"),
-            {"relation_name": f"{schema}.{relation_name}"},
+            {"relation_name": qualified_relation},
         )
         if not bool(exists_result.scalar_one()):
-            counts_by_relation[relation_name] = None
-            continue
+            raise RuntimeError("pricing projection relation is unavailable")
         count_result = await session.execute(
             text(
-                f"SELECT COUNT(*) FROM {table(relation_name)} "
+                f"SELECT COUNT(*) FROM {qualified_relation} "
                 "WHERE projection_id = :projection_id"
             ),
             {"projection_id": candidate_id},
@@ -416,6 +417,7 @@ async def _postflight(
         try:
             await session.execute(text("SET TRANSACTION READ ONLY"))
             await session.execute(text("SET LOCAL lock_timeout = '5s'"))
+            await session.execute(text("SET LOCAL statement_timeout = '20min'"))
             await lock_provider_generation(session)
             release_input = await locked_release_input(session, plan_release_id)
             signature = await provider_signature(session)

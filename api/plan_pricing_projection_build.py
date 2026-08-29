@@ -171,16 +171,14 @@ async def _materialize_all_codes(
     remaining_code_rows = MAX_PROJECTION_CODE_ROWS
     binding_projections = []
     for binding_by_field in in_network_bindings:
+        if remaining_code_rows <= 0:
+            raise ValueError("pricing projection code-row bound exceeded")
         binding = await binding_projection(
             session,
             binding_by_field,
             maximum_code_rows=remaining_code_rows,
         )
-        code_row_count = getattr(
-            binding,
-            "raw_code_row_count",
-            sum(map(len, binding.code_rows_by_identity.values())),
-        )
+        code_row_count = binding.raw_code_row_count
         if code_row_count > remaining_code_rows:
             raise ValueError("pricing projection code-row bound exceeded")
         remaining_code_rows -= code_row_count

@@ -137,6 +137,64 @@ async def _insert_complete_pack_receipt(
     return raw_byte_count
 
 
+async def _assert_rate_profile_order_rejected(
+    admin,
+    schema: str,
+    projection_id: str,
+) -> None:
+    invalid_rate_arrays = (
+        (
+            "10",
+            "40",
+            "4",
+            "ARRAY[10, 30, 20, 40]::numeric[]",
+            "ARRAY[1, 1, 1, 1]::bigint[]",
+        ),
+        (
+            "10",
+            "10",
+            "2",
+            "ARRAY[10, 10]::numeric[]",
+            "ARRAY[1, 1]::bigint[]",
+        ),
+        (
+            "10",
+            "40",
+            "4",
+            "ARRAY[[10, 20], [30, 40]]::numeric[]",
+            "ARRAY[[1, 1], [1, 1]]::bigint[]",
+        ),
+        (
+            "20",
+            "20",
+            "2",
+            "'[0:1]={10,20}'::numeric[]",
+            "'[0:1]={1,1}'::bigint[]",
+        ),
+    )
+    for provider_set_key, rate_array_case in enumerate(
+        invalid_rate_arrays, start=8
+    ):
+        minimum_rate, maximum_rate, rate_count, rates, multiplicities = (
+            rate_array_case
+        )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await admin.execute(
+                f"""INSERT INTO {schema}.plan_pricing_rate_profile (
+                    projection_id, code_system, code, binding_ordinal,
+                    provider_set_key, membership_count,
+                    minimum_negotiated_rate, maximum_negotiated_rate,
+                    rate_count, negotiated_rates, rate_multiplicities
+                ) VALUES (
+                    $1, 'CPT', '27447', 0, $2, 1,
+                    {minimum_rate}, {maximum_rate}, {rate_count},
+                    {rates}, {multiplicities}
+                )""",
+                projection_id,
+                provider_set_key,
+            )
+
+
 async def _seal_candidate(
     admin,
     schema: str,
@@ -258,6 +316,7 @@ async def _assert_stored_size_boundary(admin, schema: str) -> None:
 
 @pytest.mark.asyncio
 async def test_factorized_pack_receipt_is_sql_bound_and_immutable(monkeypatch):
+    """Reject malformed packs, receipts, and rate profiles at the SQL boundary."""
     dsn = os.getenv(POSTGRES_DSN_ENV)
     if not dsn:
         pytest.skip(f"set {POSTGRES_DSN_ENV} for the PostgreSQL proof")
@@ -266,7 +325,6 @@ async def test_factorized_pack_receipt_is_sql_bound_and_immutable(monkeypatch):
     if TEST_DATABASE_PATTERN.search(str(database_name)) is None:
         await admin.close()
         pytest.fail(f"{POSTGRES_DSN_ENV} must target an explicit test database")
-
     schema = f"plan_pricing_v3_{uuid.uuid4().hex[:12]}"
     projection_id = "4" * 64
     digest = "d" * 64
@@ -280,6 +338,7 @@ async def test_factorized_pack_receipt_is_sql_bound_and_immutable(monkeypatch):
         for statement in _factorized_migration_statements(monkeypatch, schema):
             await admin.execute(statement)
         await _insert_candidate(admin, schema, projection_id, digest)
+        await _assert_rate_profile_order_rejected(admin, schema, projection_id)
         raw_byte_count = await _insert_complete_pack_receipt(
             admin, schema, projection_id, encoded_payload, logical_digest
         )

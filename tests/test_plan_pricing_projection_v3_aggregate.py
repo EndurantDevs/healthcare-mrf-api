@@ -38,6 +38,7 @@ def _binding(ordinal: int = 0) -> BindingProjection:
         {"ordinal": ordinal},
         SimpleNamespace(network_names=()),
         {("CPT", "27447"): [{"code_key": 1, "rate_count": 1}]},
+        1,
     )
 
 

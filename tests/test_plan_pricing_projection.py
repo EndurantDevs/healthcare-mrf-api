@@ -273,6 +273,7 @@ async def test_project_code_card_insert_matches_its_bound_row(monkeypatch):
         binding={},
         serving_tables=SimpleNamespace(network_names=[]),
         code_rows_by_identity={("HCPCS", "G0439"): [{}]},
+        raw_code_row_count=1,
     )
 
     counts = await projection._project_code(

@@ -39,6 +39,21 @@ def _table(schema: str, name: str) -> str:
     return f"{_q(schema)}.{_q(name)}"
 
 
+def _strict_rate_array_sql(schema: str) -> str:
+    function = _table(schema, "plan_pricing_rates_strictly_increasing")
+    return f"""
+        CREATE FUNCTION {function}(rates numeric[]) RETURNS boolean
+        LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+            SELECT NOT EXISTS (
+                SELECT 1
+                  FROM generate_subscripts(rates, 1) AS position
+                 WHERE position < cardinality(rates)
+                   AND rates[position] >= rates[position + 1]
+            )
+        $$
+    """
+
+
 def _candidate_guard_sql(schema: str) -> str:
     candidate = _table(schema, "plan_pricing_projection_candidate")
     card = _table(schema, "plan_pricing_card")
@@ -186,6 +201,9 @@ def upgrade() -> None:
     rate_profile = _table(schema_name, "plan_pricing_rate_profile")
     aggregate_pack = _table(schema_name, "plan_pricing_aggregate_pack")
     prewarm_shape = _table(schema_name, "plan_pricing_prewarm_shape")
+    strict_rate_array = _table(
+        schema_name, "plan_pricing_rates_strictly_increasing"
+    )
     child_guard = _table(schema_name, "plan_pricing_projection_child_guard")
     truncate_guard = _table(
         schema_name, "plan_pricing_projection_truncate_guard"
@@ -289,6 +307,7 @@ def upgrade() -> None:
         f"""CREATE INDEX plan_pricing_provider_cell_npi_idx
         ON {provider_cell} (projection_id, npi, geo_cell)"""
     )
+    op.execute(_strict_rate_array_sql(schema_name))
     op.execute(
         f"""CREATE TABLE {rate_profile} (
           projection_id varchar(64) NOT NULL REFERENCES {candidate}
@@ -316,11 +335,16 @@ def upgrade() -> None:
           CONSTRAINT plan_pricing_rate_profile_rates_ck CHECK (
             rate_count > 0
             AND cardinality(negotiated_rates) BETWEEN 1 AND 65536
+            AND array_ndims(negotiated_rates) = 1
+            AND array_lower(negotiated_rates, 1) = 1
+            AND array_ndims(rate_multiplicities) = 1
+            AND array_lower(rate_multiplicities, 1) = 1
             AND cardinality(negotiated_rates)
               = cardinality(rate_multiplicities)
             AND minimum_negotiated_rate = negotiated_rates[1]
             AND maximum_negotiated_rate
               = negotiated_rates[cardinality(negotiated_rates)]
+            AND {strict_rate_array}(negotiated_rates)
             AND 0 < ALL(rate_multiplicities)
           )
         )"""
@@ -437,6 +461,10 @@ def downgrade() -> None:
     op.execute(f"DROP TABLE {_table(schema_name, 'plan_pricing_prewarm_shape')}")
     op.execute(f"DROP TABLE {_table(schema_name, 'plan_pricing_aggregate_pack')}")
     op.execute(f"DROP TABLE {_table(schema_name, 'plan_pricing_rate_profile')}")
+    op.execute(
+        f"DROP FUNCTION {_table(schema_name, 'plan_pricing_rates_strictly_increasing')}"
+        "(numeric[])"
+    )
     op.execute(
         f"DROP TABLE {_table(schema_name, 'plan_pricing_provider_cell')}"
     )

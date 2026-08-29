@@ -41,6 +41,7 @@ def _overflow_binding() -> BindingProjection:
             uses_shared_blocks=True,
         ),
         {("CPT", "27447"): [{"code_key": 1, "rate_count": 2}]},
+        1,
     )
 
 
