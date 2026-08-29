@@ -327,7 +327,8 @@ async def test_exhausted_geo_prefix_reuses_memberships_at_graph_cap(monkeypatch)
         descending=False,
     )
 
-    assert selection is not None and selection.exhausted is True
+    assert selection is not None
+    assert selection.exhausted is True
     assert list(selection.rank_by_key) == [
         ("npi", str(_MATCHING_NPI), "CPT", "99213", "FFS", "0")
     ]
