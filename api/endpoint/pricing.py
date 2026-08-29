@@ -8479,69 +8479,59 @@ async def pricing_statistics(request):
     })
 
 
-@blueprint.get("/providers", name="pricing.providers.list")
-@blueprint.get("/physicians", name="pricing.physicians.list")
-async def list_pricing_providers(request):
-    """List providers matching pricing filters and pagination parameters."""
-    session = _get_session(request)
-    args = request.args
-
-    pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
-    npi = _parse_int(args.get("npi") or None, "npi", minimum=1)
-    year = _parse_int(args.get("year"), "year", minimum=2013)
-    min_claims = _parse_float(args.get("min_claims"), "min_claims", minimum=0)
-    min_total_cost = _parse_float(args.get("min_total_cost"), "min_total_cost", minimum=0)
-    include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
-    benchmark_mode = _parse_benchmark_mode(args.get("benchmark_mode"), "benchmark_mode")
-    query_text = str(args.get("q", "")).strip()
-    state = str(args.get("state", "")).strip().upper()
-    city = str(args.get("city", "")).strip().lower()
-    specialty = str(args.get("specialty", "")).strip().lower()
-
-    year, year_source = await _resolve_year(session, provider_table, year)
-
+async def _pricing_provider_list_where(session, args, year, list_values_by_name):
     filters = [provider_table.c.year == year]
-    if npi is not None:
-        filters.append(provider_table.c.npi == npi)
-    if state:
-        filters.append(func.upper(provider_table.c.state) == state)
-    if city:
-        filters.append(func.lower(provider_table.c.city).like(f"%{city}%"))
+    if list_values_by_name["npi"] is not None:
+        filters.append(provider_table.c.npi == list_values_by_name["npi"])
+    if list_values_by_name["state"]:
+        filters.append(func.upper(provider_table.c.state) == list_values_by_name["state"])
+    if list_values_by_name["city"]:
+        filters.append(
+            func.lower(provider_table.c.city).like(
+                f"%{list_values_by_name['city']}%"
+            )
+        )
     provider_type_clause, provider_type_resolution = await _provider_type_filter_clause(
         session,
         args,
         provider_table.c.provider_type,
-        specialty,
+        list_values_by_name["specialty"],
     )
     if provider_type_clause is not None:
         filters.append(provider_type_clause)
-    if query_text:
-        q_like = f"%{query_text.lower()}%"
+    if list_values_by_name["query_text"]:
+        query_like = f"%{list_values_by_name['query_text'].lower()}%"
         filters.append(
             or_(
-                func.lower(provider_table.c.provider_name).like(q_like),
-                func.lower(provider_table.c.provider_type).like(q_like),
-                cast(provider_table.c.npi, String).like(f"%{query_text}%"),
+                func.lower(provider_table.c.provider_name).like(query_like),
+                func.lower(provider_table.c.provider_type).like(query_like),
+                cast(provider_table.c.npi, String).like(
+                    f"%{list_values_by_name['query_text']}%"
+                ),
             )
         )
-    if min_claims is not None:
-        filters.append(provider_table.c.total_services >= min_claims)
-    if min_total_cost is not None:
-        filters.append(provider_table.c.total_allowed_amount >= min_total_cost)
+    if list_values_by_name["min_claims"] is not None:
+        filters.append(
+            provider_table.c.total_services >= list_values_by_name["min_claims"]
+        )
+    if list_values_by_name["min_total_cost"] is not None:
+        filters.append(
+            provider_table.c.total_allowed_amount
+            >= list_values_by_name["min_total_cost"]
+        )
+    return and_(*filters), provider_type_resolution
 
-    where_clause = and_(*filters)
-    count_result = await session.execute(select(func.count()).select_from(provider_table).where(where_clause))
-    total = int(count_result.scalar() or 0)
 
+async def _pricing_provider_list_query(session, args, year, where_clause, benchmark_mode):
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "total_allowed_amount")
     benchmark_mode_used = benchmark_mode
     benchmark_mode_source = "request" if benchmark_mode else None
-    if order_by == "tier_relevance" and await _is_table_available(session, QUALITY_SCORE_TABLE_NAME):
+    if order_by == "tier_relevance" and await _is_table_available(
+        session, QUALITY_SCORE_TABLE_NAME
+    ):
         benchmark_mode_used, benchmark_mode_source = await _resolve_quality_benchmark_mode(
-            session,
-            year,
-            benchmark_mode,
+            session, year, benchmark_mode
         )
         provider_with_scores = provider_table.outerjoin(
             quality_score_table,
@@ -8557,20 +8547,16 @@ async def list_pricing_providers(request):
             (quality_score_table.c.tier == "low", 2),
             else_=3,
         )
-        query = (
-            select(provider_table)
-            .select_from(provider_with_scores)
-            .where(where_clause)
-            .order_by(
-                tier_rank.asc(),
-                quality_score_table.c.score_0_100.desc(),
-                provider_table.c.total_allowed_amount.desc(),
-            )
+        query = select(provider_table).select_from(provider_with_scores).where(
+            where_clause
+        ).order_by(
+            tier_rank.asc(),
+            quality_score_table.c.score_0_100.desc(),
+            provider_table.c.total_allowed_amount.desc(),
         )
     else:
-        query = select(provider_table).where(where_clause)
         query = _apply_ordering(
-            query,
+            select(provider_table).where(where_clause),
             order_by,
             order,
             {
@@ -8586,39 +8572,120 @@ async def list_pricing_providers(request):
                 "total_benes": provider_table.c.total_beneficiaries,
             },
         )
-    query = query.limit(pagination.limit).offset(pagination.offset)
+    return query, order_by, order, benchmark_mode_used, benchmark_mode_source
 
-    query_result = await session.execute(query)
-    provider_items = [_normalize_provider_payload(_row_to_dict(provider_record), include_legacy=include_legacy_fields) for provider_record in query_result]
 
+async def _pricing_provider_list_total(session, where_clause):
+    count_result = await session.execute(
+        select(func.count()).select_from(provider_table).where(where_clause)
+    )
+    return int(count_result.scalar() or 0)
+
+
+async def _pricing_provider_list_page(
+    session, query, total, pagination, include_legacy_fields
+):
+    query_result = await session.execute(
+        query.limit(pagination.limit).offset(pagination.offset)
+    )
+    return {
+        "total": total,
+        "items": [
+            _normalize_provider_payload(
+                _row_to_dict(provider_record),
+                include_legacy=include_legacy_fields,
+            )
+            for provider_record in query_result
+        ],
+    }
+
+
+def _pricing_provider_list_document(
+    page, pagination, year, year_source, list_values_by_name,
+    provider_type_resolution, query_details,
+):
+    _query, order_by, order, benchmark_mode_used, benchmark_mode_source = query_details
+    return {
+        "items": page["items"],
+        "pagination": {
+            "total": page["total"],
+            "limit": pagination.limit,
+            "offset": pagination.offset,
+            "page": pagination.page,
+        },
+        "query": {
+            "year": year,
+            "year_used": year,
+            "year_source": year_source,
+            "benchmark_mode": benchmark_mode_used,
+            "benchmark_mode_source": benchmark_mode_source,
+            "npi": list_values_by_name["npi"],
+            "state": list_values_by_name["state"] or None,
+            "city": list_values_by_name["city"] or None,
+            "specialty": list_values_by_name["specialty"] or None,
+            "provider_type_resolution": provider_type_resolution,
+            "q": list_values_by_name["query_text"] or None,
+            "min_claims": list_values_by_name["min_claims"],
+            "min_total_cost": list_values_by_name["min_total_cost"],
+            "include_legacy_fields": list_values_by_name["include_legacy_fields"],
+            "order_by": order_by,
+            "order": order,
+        },
+    }
+
+
+@blueprint.get("/providers", name="pricing.providers.list")
+@blueprint.get("/physicians", name="pricing.physicians.list")
+async def list_pricing_providers(request):
+    """List providers matching pricing filters and pagination parameters."""
+    session = _get_session(request)
+    args = request.args
+    pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
+    list_values_by_name = {
+        "npi": _parse_int(args.get("npi") or None, "npi", minimum=1),
+        "min_claims": _parse_float(args.get("min_claims"), "min_claims", minimum=0),
+        "min_total_cost": _parse_float(
+            args.get("min_total_cost"), "min_total_cost", minimum=0
+        ),
+        "include_legacy_fields": _parse_bool(
+            args.get("include_legacy_fields"), "include_legacy_fields", default=False
+        ),
+        "benchmark_mode": _parse_benchmark_mode(
+            args.get("benchmark_mode"), "benchmark_mode"
+        ),
+        "query_text": str(args.get("q", "")).strip(),
+        "state": str(args.get("state", "")).strip().upper(),
+        "city": str(args.get("city", "")).strip().lower(),
+        "specialty": str(args.get("specialty", "")).strip().lower(),
+    }
+    year, year_source = await _resolve_year(
+        session, provider_table, _parse_int(args.get("year"), "year", minimum=2013)
+    )
+    where_clause, provider_type_resolution = await _pricing_provider_list_where(
+        session, args, year, list_values_by_name
+    )
+    total = await _pricing_provider_list_total(session, where_clause)
+    query_details = await _pricing_provider_list_query(
+        session, args, year, where_clause, list_values_by_name["benchmark_mode"]
+    )
+    query = query_details[0]
+    page = await _pricing_provider_list_page(
+        session,
+        query,
+        total,
+        pagination,
+        list_values_by_name["include_legacy_fields"],
+    )
     return response.json(
-        {
-            "items": provider_items,
-            "pagination": {
-                "total": total,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": pagination.page,
-            },
-            "query": {
-                "year": year,
-                "year_used": year,
-                "year_source": year_source,
-                "benchmark_mode": benchmark_mode_used,
-                "benchmark_mode_source": benchmark_mode_source,
-                "npi": npi,
-                "state": state or None,
-                "city": city or None,
-                "specialty": specialty or None,
-                "provider_type_resolution": provider_type_resolution,
-                "q": query_text or None,
-                "min_claims": min_claims,
-                "min_total_cost": min_total_cost,
-                "include_legacy_fields": include_legacy_fields,
-                "order_by": order_by,
-                "order": order,
-            },
-        }
+        _pricing_provider_list_document(
+            page,
+            pagination,
+            year,
+            year_source,
+            list_values_by_name,
+            provider_type_resolution,
+            query_details,
+        )
     )
 
 
@@ -9981,71 +10048,52 @@ async def list_physician_service_locations(request, npi: str, code_system: str, 
     )
 
 
-@blueprint.get("/procedures/<code_system>/<code>/providers", name="pricing.procedures.providers.list")
-async def list_procedure_providers(request, code_system: str, code: str):
-    """List providers with claims history for the requested procedure or service code."""
-    session = _get_session(request)
-    args = request.args
-
-    pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
-    year = _parse_int(args.get("year"), "year", minimum=2013)
-    min_claims = _parse_float(args.get("min_claims"), "min_claims", minimum=0)
-    min_total_cost = _parse_float(args.get("min_total_cost"), "min_total_cost", minimum=0)
-    state = str(args.get("state", "")).strip().upper()
-    city = str(args.get("city", "")).strip().lower()
-    specialty = str(args.get("specialty", "")).strip().lower()
-    query_text = str(args.get("q", "")).strip().lower()
-    include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
-    args.get("provider_type")
-    args.get("classification")
-    args.get("taxonomy_code")
-    args.get("taxonomy_codes")
-    args.get("taxonomy_classification")
-    args.get("taxonomy_specialization")
-    args.get("taxonomy_section")
-
-    year, year_source = await _resolve_year(session, provider_procedure_table, year)
-    internal_codes, code_context = await _resolve_internal_codes_for_request(
-        session,
-        code,
-        args,
-        default_system=code_system,
-    )
-
+async def _procedure_provider_list_where(
+    session, args, year, internal_codes, list_values_by_name
+):
     filters = [
         provider_procedure_table.c.procedure_code.in_(internal_codes),
         provider_procedure_table.c.year == year,
         provider_table.c.year == year,
         provider_table.c.npi == provider_procedure_table.c.npi,
     ]
-    if state:
-        filters.append(func.upper(provider_table.c.state) == state)
-    if city:
-        filters.append(func.lower(provider_table.c.city).like(f"%{city}%"))
+    if list_values_by_name["state"]:
+        filters.append(func.upper(provider_table.c.state) == list_values_by_name["state"])
+    if list_values_by_name["city"]:
+        filters.append(
+            func.lower(provider_table.c.city).like(
+                f"%{list_values_by_name['city']}%"
+            )
+        )
     provider_type_clause, provider_type_resolution = await _provider_type_filter_clause(
-        session,
-        args,
-        provider_table.c.provider_type,
-        specialty,
+        session, args, provider_table.c.provider_type, list_values_by_name["specialty"]
     )
     if provider_type_clause is not None:
         filters.append(provider_type_clause)
-    if query_text:
-        q_like = f"%{query_text}%"
+    if list_values_by_name["query_text"]:
+        query_like = f"%{list_values_by_name['query_text']}%"
         filters.append(
             or_(
-                func.lower(provider_table.c.provider_name).like(q_like),
-                func.lower(provider_table.c.provider_type).like(q_like),
-                cast(provider_table.c.npi, String).like(f"%{query_text}%"),
+                func.lower(provider_table.c.provider_name).like(query_like),
+                func.lower(provider_table.c.provider_type).like(query_like),
+                cast(provider_table.c.npi, String).like(query_like),
             )
         )
-    if min_claims is not None:
-        filters.append(provider_procedure_table.c.total_services >= min_claims)
-    if min_total_cost is not None:
-        filters.append(provider_procedure_table.c.total_allowed_amount >= min_total_cost)
-    where_clause = and_(*filters)
+    if list_values_by_name["min_claims"] is not None:
+        filters.append(
+            provider_procedure_table.c.total_services
+            >= list_values_by_name["min_claims"]
+        )
+    if list_values_by_name["min_total_cost"] is not None:
+        filters.append(
+            provider_procedure_table.c.total_allowed_amount
+            >= list_values_by_name["min_total_cost"]
+        )
+    return and_(*filters), provider_type_resolution
 
-    grouped = (
+
+def _procedure_provider_grouped_query(where_clause):
+    return (
         select(
             provider_procedure_table.c.npi.label("npi"),
             provider_table.c.provider_name.label("provider_name"),
@@ -10054,12 +10102,23 @@ async def list_procedure_providers(request, code_system: str, code: str):
             provider_table.c.state.label("state"),
             provider_table.c.zip5.label("zip5"),
             func.sum(provider_procedure_table.c.total_services).label("total_services"),
-            func.sum(provider_procedure_table.c.total_submitted_charges).label("total_submitted_charges"),
-            func.sum(provider_procedure_table.c.total_allowed_amount).label("total_allowed_amount"),
-            func.sum(provider_procedure_table.c.total_beneficiaries).label("total_beneficiaries"),
+            func.sum(provider_procedure_table.c.total_submitted_charges).label(
+                "total_submitted_charges"
+            ),
+            func.sum(provider_procedure_table.c.total_allowed_amount).label(
+                "total_allowed_amount"
+            ),
+            func.sum(provider_procedure_table.c.total_beneficiaries).label(
+                "total_beneficiaries"
+            ),
             func.count().label("matched_rows"),
         )
-        .select_from(provider_procedure_table.join(provider_table, provider_table.c.npi == provider_procedure_table.c.npi))
+        .select_from(
+            provider_procedure_table.join(
+                provider_table,
+                provider_table.c.npi == provider_procedure_table.c.npi,
+            )
+        )
         .where(where_clause)
         .group_by(
             provider_procedure_table.c.npi,
@@ -10070,15 +10129,19 @@ async def list_procedure_providers(request, code_system: str, code: str):
             provider_table.c.zip5,
         )
     )
-    grouped_subquery = grouped.subquery()
-    count_result = await session.execute(select(func.count()).select_from(grouped_subquery))
-    total = int(count_result.scalar() or 0)
 
+
+async def _procedure_provider_list_page(
+    session, args, pagination, where_clause, include_legacy_fields
+):
+    grouped_subquery = _procedure_provider_grouped_query(where_clause).subquery()
+    count_result = await session.execute(
+        select(func.count()).select_from(grouped_subquery)
+    )
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "total_allowed_amount")
-    query = select(grouped_subquery)
     query = _apply_ordering(
-        query,
+        select(grouped_subquery),
         order_by,
         order,
         {
@@ -10094,39 +10157,104 @@ async def list_procedure_providers(request, code_system: str, code: str):
             "total_drug_cost": grouped_subquery.c.total_allowed_amount,
             "total_benes": grouped_subquery.c.total_beneficiaries,
         },
-    )
-    query = query.limit(pagination.limit).offset(pagination.offset)
+    ).limit(pagination.limit).offset(pagination.offset)
     query_result = await session.execute(query)
-    provider_items = [_normalize_provider_service_aggregate(_row_to_dict(provider_record), include_legacy=include_legacy_fields) for provider_record in query_result]
+    return {
+        "total": int(count_result.scalar() or 0),
+        "order": order,
+        "order_by": order_by,
+        "items": [
+            _normalize_provider_service_aggregate(
+                _row_to_dict(provider_record),
+                include_legacy=include_legacy_fields,
+            )
+            for provider_record in query_result
+        ],
+    }
 
+
+def _procedure_provider_list_document(
+    page, pagination, year, year_source, list_values_by_name,
+    provider_type_resolution, code_context,
+):
+    return {
+        "items": page["items"],
+        "pagination": {
+            "total": page["total"],
+            "limit": pagination.limit,
+            "offset": pagination.offset,
+            "page": pagination.page,
+        },
+        "query": {
+            "year": year,
+            "year_used": year,
+            "year_source": year_source,
+            "state": list_values_by_name["state"] or None,
+            "city": list_values_by_name["city"] or None,
+            "specialty": list_values_by_name["specialty"] or None,
+            "provider_type_resolution": provider_type_resolution,
+            "q": list_values_by_name["query_text"] or None,
+            "min_claims": list_values_by_name["min_claims"],
+            "min_total_cost": list_values_by_name["min_total_cost"],
+            "include_legacy_fields": list_values_by_name["include_legacy_fields"],
+            "order_by": page["order_by"],
+            "order": page["order"],
+            "input_code": code_context["input_code"],
+            "resolved_codes": code_context["resolved_codes"],
+            "matched_via": code_context["matched_via"],
+        },
+    }
+
+
+@blueprint.get("/procedures/<code_system>/<code>/providers", name="pricing.procedures.providers.list")
+async def list_procedure_providers(request, code_system: str, code: str):
+    """List providers with claims history for the requested procedure or service code."""
+    session = _get_session(request)
+    args = request.args
+    pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
+    list_values_by_name = {
+        "min_claims": _parse_float(args.get("min_claims"), "min_claims", minimum=0),
+        "min_total_cost": _parse_float(
+            args.get("min_total_cost"), "min_total_cost", minimum=0
+        ),
+        "state": str(args.get("state", "")).strip().upper(),
+        "city": str(args.get("city", "")).strip().lower(),
+        "specialty": str(args.get("specialty", "")).strip().lower(),
+        "query_text": str(args.get("q", "")).strip().lower(),
+        "include_legacy_fields": _parse_bool(
+            args.get("include_legacy_fields"), "include_legacy_fields", default=False
+        ),
+    }
+    args.get("provider_type")
+    args.get("classification")
+    args.get("taxonomy_code")
+    args.get("taxonomy_codes")
+    args.get("taxonomy_classification")
+    args.get("taxonomy_specialization")
+    args.get("taxonomy_section")
+    year, year_source = await _resolve_year(
+        session,
+        provider_procedure_table,
+        _parse_int(args.get("year"), "year", minimum=2013),
+    )
+    internal_codes, code_context = await _resolve_internal_codes_for_request(
+        session, code, args, default_system=code_system
+    )
+    where_clause, provider_type_resolution = await _procedure_provider_list_where(
+        session, args, year, internal_codes, list_values_by_name
+    )
+    page = await _procedure_provider_list_page(
+        session,
+        args,
+        pagination,
+        where_clause,
+        list_values_by_name["include_legacy_fields"],
+    )
     return response.json(
-        {
-            "items": provider_items,
-            "pagination": {
-                "total": total,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": pagination.page,
-            },
-            "query": {
-                "year": year,
-                "year_used": year,
-                "year_source": year_source,
-                "state": state or None,
-                "city": city or None,
-                "specialty": specialty or None,
-                "provider_type_resolution": provider_type_resolution,
-                "q": query_text or None,
-                "min_claims": min_claims,
-                "min_total_cost": min_total_cost,
-                "include_legacy_fields": include_legacy_fields,
-                "order_by": order_by,
-                "order": order,
-                "input_code": code_context["input_code"],
-                "resolved_codes": code_context["resolved_codes"],
-                "matched_via": code_context["matched_via"],
-            },
-        }
+        _procedure_provider_list_document(
+            page, pagination, year, year_source, list_values_by_name,
+            provider_type_resolution, code_context,
+        )
     )
 
 
@@ -12638,90 +12766,87 @@ async def list_providers_by_prescription(request):
     )
 
 
-@blueprint.get("/providers/<npi>/prescriptions", name="pricing.providers.prescriptions.list")
-@blueprint.get("/physicians/<npi>/prescriptions", name="pricing.physicians.prescriptions.list")
-async def list_provider_prescriptions(request, npi: str):
-    """List a provider's prescription utilization records with optional filters."""
-    session = _get_session(request)
-    args = request.args
+def _provider_prescription_unavailable_document(provider_npi, year, pagination):
+    return {
+        "items": [],
+        "pagination": {
+            "total": 0,
+            "limit": pagination.limit,
+            "offset": pagination.offset,
+            "page": pagination.page,
+        },
+        "query": {
+            "npi": provider_npi,
+            "year": year,
+            "year_used": year,
+            "year_source": "request" if year is not None else "env",
+            "data_status": "unavailable",
+        },
+    }
 
-    provider_npi = _parse_int(npi, "npi", minimum=1)
-    if provider_npi is None:
-        raise InvalidUsage("Path parameter 'npi' must be provided")
 
-    pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
-    year = _parse_int(args.get("year"), "year", minimum=2013)
-    min_claims = _parse_float(args.get("min_claims"), "min_claims", minimum=0)
-    min_total_cost = _parse_float(args.get("min_total_cost"), "min_total_cost", minimum=0)
-    query_text = str(args.get("q", "")).strip().lower()
-    generic_name = str(args.get("generic_name", "")).strip().lower()
-    brand_name = str(args.get("brand_name", "")).strip().lower()
-    rx_name = str(args.get("rx_name", "")).strip().lower()
-    code = str(args.get("code", "")).strip()
-
-    if not await _is_table_available(session, provider_prescription_table.name):
-        return response.json(
-            {
-                "items": [],
-                "pagination": {
-                    "total": 0,
-                    "limit": pagination.limit,
-                    "offset": pagination.offset,
-                    "page": pagination.page,
-                },
-                "query": {
-                    "npi": provider_npi,
-                    "year": year,
-                    "year_used": year,
-                    "year_source": "request" if year is not None else "env",
-                    "data_status": "unavailable",
-                },
-            }
-        )
-
-    year, year_source = await _resolve_year(session, provider_prescription_table, year)
-    code_context = None
-
-    filters = [provider_prescription_table.c.npi == provider_npi, provider_prescription_table.c.year == year]
-    if generic_name:
-        filters.append(func.lower(provider_prescription_table.c.generic_name).like(f"%{generic_name}%"))
-    if brand_name:
-        filters.append(func.lower(provider_prescription_table.c.brand_name).like(f"%{brand_name}%"))
-    if rx_name:
-        filters.append(func.lower(provider_prescription_table.c.rx_name).like(f"%{rx_name}%"))
-    if query_text:
-        q_like = f"%{query_text}%"
+async def _provider_prescription_list_where(
+    session, args, provider_npi, year, list_values_by_name
+):
+    filters = [
+        provider_prescription_table.c.npi == provider_npi,
+        provider_prescription_table.c.year == year,
+    ]
+    for field_name in ("generic_name", "brand_name", "rx_name"):
+        if list_values_by_name[field_name]:
+            filters.append(
+                func.lower(getattr(provider_prescription_table.c, field_name)).like(
+                    f"%{list_values_by_name[field_name]}%"
+                )
+            )
+    if list_values_by_name["query_text"]:
+        query_like = f"%{list_values_by_name['query_text']}%"
         filters.append(
             or_(
-                func.lower(provider_prescription_table.c.rx_name).like(q_like),
-                func.lower(provider_prescription_table.c.generic_name).like(q_like),
-                func.lower(provider_prescription_table.c.brand_name).like(q_like),
-                func.upper(provider_prescription_table.c.rx_code).like(f"%{query_text.upper()}%"),
+                func.lower(provider_prescription_table.c.rx_name).like(query_like),
+                func.lower(provider_prescription_table.c.generic_name).like(query_like),
+                func.lower(provider_prescription_table.c.brand_name).like(query_like),
+                func.upper(provider_prescription_table.c.rx_code).like(
+                    f"%{list_values_by_name['query_text'].upper()}%"
+                ),
             )
         )
-    if code:
+    code_context = None
+    if list_values_by_name["code"]:
         internal_rx_codes, code_context = await _resolve_internal_rx_codes_for_request(
             session,
-            code,
+            list_values_by_name["code"],
             args,
             default_system=args.get("rx_code_system") or INTERNAL_RX_CODE_SYSTEM,
         )
-        filters.append(provider_prescription_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM)
-        filters.append(provider_prescription_table.c.rx_code.in_(internal_rx_codes))
-    if min_claims is not None:
-        filters.append(provider_prescription_table.c.total_claims >= min_claims)
-    if min_total_cost is not None:
-        filters.append(provider_prescription_table.c.total_drug_cost >= min_total_cost)
+        filters.extend(
+            (
+                provider_prescription_table.c.rx_code_system
+                == INTERNAL_RX_CODE_SYSTEM,
+                provider_prescription_table.c.rx_code.in_(internal_rx_codes),
+            )
+        )
+    if list_values_by_name["min_claims"] is not None:
+        filters.append(
+            provider_prescription_table.c.total_claims
+            >= list_values_by_name["min_claims"]
+        )
+    if list_values_by_name["min_total_cost"] is not None:
+        filters.append(
+            provider_prescription_table.c.total_drug_cost
+            >= list_values_by_name["min_total_cost"]
+        )
+    return and_(*filters), code_context
 
-    where_clause = and_(*filters)
-    count_result = await session.execute(select(func.count()).select_from(provider_prescription_table).where(where_clause))
-    total = int(count_result.scalar() or 0)
 
-    query = select(provider_prescription_table).where(where_clause)
+async def _provider_prescription_list_page(session, args, pagination, where_clause):
+    count_result = await session.execute(
+        select(func.count()).select_from(provider_prescription_table).where(where_clause)
+    )
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "total_drug_cost")
     query = _apply_ordering(
-        query,
+        select(provider_prescription_table).where(where_clause),
         order_by,
         order,
         {
@@ -12733,35 +12858,51 @@ async def list_provider_prescriptions(request, npi: str):
             "total_drug_cost": provider_prescription_table.c.total_drug_cost,
             "total_benes": provider_prescription_table.c.total_benes,
         },
-    )
-    query = query.limit(pagination.limit).offset(pagination.offset)
-
+    ).limit(pagination.limit).offset(pagination.offset)
     query_result = await session.execute(query)
-    prescription_items = [_normalize_prescription_payload(_row_to_dict(prescription_record)) for prescription_record in query_result]
+    prescription_items = [
+        _normalize_prescription_payload(_row_to_dict(prescription_record))
+        for prescription_record in query_result
+    ]
     if prescription_items:
         try:
             external_codes_by_internal = await _resolve_external_rx_codes_for_internal(
                 session,
-                [str(prescription_item_by_field.get("rx_code") or "") for prescription_item_by_field in prescription_items],
+                [
+                    str(prescription_item.get("rx_code") or "")
+                    for prescription_item in prescription_items
+                ],
             )
         except Exception:  # pragma: no cover - defensive fallback for missing/migrating crosswalk table
             external_codes_by_internal = {}
-        _apply_prescription_code_preferences(prescription_items, external_codes_by_internal)
+        _apply_prescription_code_preferences(
+            prescription_items, external_codes_by_internal
+        )
+    return {
+        "total": int(count_result.scalar() or 0),
+        "order": order,
+        "order_by": order_by,
+        "items": prescription_items,
+    }
 
+
+def _provider_prescription_list_document(
+    page, pagination, provider_npi, year, year_source, list_values_by_name, code_context
+):
     query_by_field: dict[str, Any] = {
         "npi": provider_npi,
         "year": year,
         "year_used": year,
         "year_source": year_source,
-        "rx_name": rx_name or None,
-        "generic_name": generic_name or None,
-        "brand_name": brand_name or None,
-        "q": query_text or None,
-        "code": code or None,
-        "min_claims": min_claims,
-        "min_total_cost": min_total_cost,
-        "order_by": order_by,
-        "order": order,
+        "rx_name": list_values_by_name["rx_name"] or None,
+        "generic_name": list_values_by_name["generic_name"] or None,
+        "brand_name": list_values_by_name["brand_name"] or None,
+        "q": list_values_by_name["query_text"] or None,
+        "code": list_values_by_name["code"] or None,
+        "min_claims": list_values_by_name["min_claims"],
+        "min_total_cost": list_values_by_name["min_total_cost"],
+        "order_by": page["order_by"],
+        "order": page["order"],
     }
     if code_context is not None:
         query_by_field.update(
@@ -12771,18 +12912,61 @@ async def list_provider_prescriptions(request, npi: str):
                 "matched_via": code_context["matched_via"],
             }
         )
+    return {
+        "items": page["items"],
+        "pagination": {
+            "total": page["total"],
+            "limit": pagination.limit,
+            "offset": pagination.offset,
+            "page": pagination.page,
+        },
+        "query": query_by_field,
+    }
 
+
+@blueprint.get("/providers/<npi>/prescriptions", name="pricing.providers.prescriptions.list")
+@blueprint.get("/physicians/<npi>/prescriptions", name="pricing.physicians.prescriptions.list")
+async def list_provider_prescriptions(request, npi: str):
+    """List a provider's prescription utilization records with optional filters."""
+    session = _get_session(request)
+    args = request.args
+    provider_npi = _parse_int(npi, "npi", minimum=1)
+    if provider_npi is None:
+        raise InvalidUsage("Path parameter 'npi' must be provided")
+    pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
+    year = _parse_int(args.get("year"), "year", minimum=2013)
+    list_values_by_name = {
+        "min_claims": _parse_float(args.get("min_claims"), "min_claims", minimum=0),
+        "min_total_cost": _parse_float(
+            args.get("min_total_cost"), "min_total_cost", minimum=0
+        ),
+        "query_text": str(args.get("q", "")).strip().lower(),
+        "generic_name": str(args.get("generic_name", "")).strip().lower(),
+        "brand_name": str(args.get("brand_name", "")).strip().lower(),
+        "rx_name": str(args.get("rx_name", "")).strip().lower(),
+        "code": str(args.get("code", "")).strip(),
+    }
+    if not await _is_table_available(session, provider_prescription_table.name):
+        return response.json(
+            _provider_prescription_unavailable_document(provider_npi, year, pagination)
+        )
+    year, year_source = await _resolve_year(session, provider_prescription_table, year)
+    where_clause, code_context = await _provider_prescription_list_where(
+        session, args, provider_npi, year, list_values_by_name
+    )
+    page = await _provider_prescription_list_page(
+        session, args, pagination, where_clause
+    )
     return response.json(
-        {
-            "items": prescription_items,
-            "pagination": {
-                "total": total,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": pagination.page,
-            },
-            "query": query_by_field,
-        }
+        _provider_prescription_list_document(
+            page,
+            pagination,
+            provider_npi,
+            year,
+            year_source,
+            list_values_by_name,
+            code_context,
+        )
     )
 
 
