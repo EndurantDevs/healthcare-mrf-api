@@ -2934,6 +2934,42 @@ async def test_provider_reverse_response_uses_page_sentinel_and_honest_total(mon
 
 
 @pytest.mark.asyncio
+async def test_provider_reverse_price_filter_values_remain_query_echo(monkeypatch):
+    async def code_context(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_resolve_ptg2_code_search_context",
+        code_context,
+    )
+    request = ptg2_serving._ProviderProcedureRequest(
+        npi=1234567890,
+        args={"plan_id": "TEST-PLAN-001", "service_code": "11"},
+        pagination=SimpleNamespace(limit=2, offset=0),
+        snapshot_id="ptg2:209901:synthetic",
+        serving_tables=_strict_v3_tables(),
+    )
+
+    search = await ptg2_serving._provider_procedure_search(
+        object(),
+        request,
+        ("01" * 16,),
+    )
+
+    assert search.price_filter_values_by_field == {
+        "service_code": ["11"],
+        "pos": "11",
+    }
+    assert search.has_price_filter is True
+    assert ptg2_serving._provider_procedure_query_fields(
+        request,
+        search,
+        status=None,
+    )["price_filter"] == {"service_code": ["11"], "pos": "11"}
+
+
+@pytest.mark.asyncio
 async def test_network_serving_tables_cache_is_revalidated_and_reloads_on_mismatch(
     monkeypatch,
 ):

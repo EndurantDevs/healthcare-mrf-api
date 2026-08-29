@@ -19889,7 +19889,7 @@ class _ProviderProcedureSearch:
     q_text: str
     market_type: str
     code_context: Any
-    price_filter_query: str
+    price_filter_values_by_field: dict[str, Any]
     has_price_filter: bool
     requested_limit: int
     requested_offset: int
@@ -19951,7 +19951,7 @@ async def _provider_procedure_search(
         code_system=args.get("code_system"),
     )
     price_filter_params_by_name: dict[str, Any] = {}
-    price_filter_query = _price_filter_clauses(
+    price_filter_values_by_field = _price_filter_clauses(
         args,
         price_filter_params_by_name,
     )[1]
@@ -19971,8 +19971,8 @@ async def _provider_procedure_search(
         q_text=q_text,
         market_type=market_type,
         code_context=code_context,
-        price_filter_query=price_filter_query,
-        has_price_filter=bool(price_filter_query),
+        price_filter_values_by_field=price_filter_values_by_field,
+        has_price_filter=bool(price_filter_values_by_field),
         requested_limit=requested_limit,
         requested_offset=requested_offset,
         sentinel_limit=requested_limit + 1,
@@ -20239,7 +20239,9 @@ def _provider_procedure_query_fields(
         "status": status,
     }
     if search is not None:
-        query_fields_by_name["price_filter"] = search.price_filter_query or None
+        query_fields_by_name["price_filter"] = (
+            search.price_filter_values_by_field or None
+        )
         query_fields_by_name.update(
             _ptg2_code_query_fields(search.code_context, args)
         )
@@ -20307,7 +20309,10 @@ async def _search_ptg2_manifest_provider_procedures(
     if not provider_set_ids:
         return _shape_provider_procedure_response(
             request,
-            _ProviderProcedurePage([], 0, False, True, 0),
+            _ProviderProcedurePage(
+                response_items=[], total=0, has_more=False,
+                is_total_exact=True, total_lower_bound=0,
+            ),
             None,
         )
     search = await _provider_procedure_search(
