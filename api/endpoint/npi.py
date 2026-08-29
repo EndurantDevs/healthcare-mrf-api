@@ -2753,17 +2753,7 @@ def _provider_directory_network_plan_ctes_sql(
     """
 
 
-def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
-    """Build CTEs that constrain provider-directory roles requested by callers."""
-    plan_id = _provider_directory_reference_resource_id_sql("plan_ref.value", "InsurancePlan")
-    service_id = _provider_directory_reference_resource_id_sql(
-        "service_ref.value", "HealthcareService"
-    )
-    endpoint_id = _provider_directory_reference_resource_id_sql(
-        "endpoint_ref.value", "Endpoint"
-    )
-    insurance_plan_active = _insurance_plan_active_sql("insurance_plan")
-    return f"""
+_PROVIDER_DIRECTORY_REQUESTED_ROLE_CTES_TEMPLATE = """
     requested_roles AS (
         SELECT source_id, role_id
           FROM unnest(CAST(:source_ids AS varchar[]), CAST(:role_ids AS varchar[]))
@@ -2831,7 +2821,7 @@ def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
                             AND endpoint.source_id = role.source_id
                             AND endpoint.resource_id = {endpoint_id}
                           ORDER BY endpoint.resource_id
-                          LIMIT {MAX_PROVIDER_DIRECTORY_ROLE_REFERENCE_DETAILS}
+                          LIMIT {role_reference_limit}
                      ) AS resolved_endpoint
                ), '[]'::jsonb) AS role_endpoints,
                COALESCE((
@@ -2871,7 +2861,7 @@ def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
                             AND service.source_id = role.source_id
                             AND service.resource_id = {service_id}
                           ORDER BY service.resource_id
-                          LIMIT {MAX_PROVIDER_DIRECTORY_ROLE_REFERENCE_DETAILS}
+                          LIMIT {role_reference_limit}
                      ) AS resolved_service
                ), '[]'::jsonb) AS role_healthcare_services
           FROM requested_roles AS requested
@@ -2894,7 +2884,24 @@ def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
            AND insurance_plan.resource_id = {plan_id}
            AND {insurance_plan_active}
     )
-    """
+"""
+
+
+def _provider_directory_requested_role_ctes_sql(_schema: str) -> str:
+    """Build CTEs that constrain provider-directory roles requested by callers."""
+    return _PROVIDER_DIRECTORY_REQUESTED_ROLE_CTES_TEMPLATE.format(
+        plan_id=_provider_directory_reference_resource_id_sql(
+            "plan_ref.value", "InsurancePlan"
+        ),
+        service_id=_provider_directory_reference_resource_id_sql(
+            "service_ref.value", "HealthcareService"
+        ),
+        endpoint_id=_provider_directory_reference_resource_id_sql(
+            "endpoint_ref.value", "Endpoint"
+        ),
+        insurance_plan_active=_insurance_plan_active_sql("insurance_plan"),
+        role_reference_limit=MAX_PROVIDER_DIRECTORY_ROLE_REFERENCE_DETAILS,
+    )
 
 
 def _provider_directory_plan_cap_ctes_sql() -> str:
@@ -4658,10 +4665,9 @@ def _public_mrf_source_url(value: Any) -> str | None:
     try:
         literal_ip = ipaddress.ip_address(normalized_hostname)
     except ValueError:
-        pass
-    else:
-        if not literal_ip.is_global:
-            return None
+        return source_url
+    if not literal_ip.is_global:
+        return None
     return source_url
 
 
@@ -4686,6 +4692,129 @@ def _mrf_source_address_pairs(
     return sorted(pairs)
 
 
+_MRF_SOURCE_DETAILS_QUERY = """
+    WITH selected(npi, address_key) AS (
+        SELECT selected_npi, selected_address_key
+          FROM UNNEST(
+                   CAST(:npis AS bigint[]),
+                   CAST(:address_keys AS uuid[])
+               ) AS selected_rows(selected_npi, selected_address_key)
+    )
+    SELECT evidence.npi,
+           evidence.address_key,
+           MIN(BTRIM(evidence.issuer_name)) AS issuer_name,
+           COALESCE(
+               ARRAY_AGG(DISTINCT evidence.issuer_id ORDER BY evidence.issuer_id)
+                   FILTER (WHERE evidence.issuer_id IS NOT NULL),
+               ARRAY[]::integer[]
+           ) AS issuer_ids,
+           COALESCE(
+               ARRAY_AGG(
+                   DISTINCT BTRIM(evidence.source_url)
+                   ORDER BY BTRIM(evidence.source_url)
+               ) FILTER (
+                   WHERE NULLIF(BTRIM(evidence.source_url), '') IS NOT NULL
+               ),
+               ARRAY[]::varchar[]
+           ) AS source_urls
+      FROM selected
+      JOIN {evidence_table} AS evidence
+        ON evidence.npi = selected.npi
+       AND evidence.address_key = selected.address_key
+     WHERE NULLIF(BTRIM(evidence.issuer_name), '') IS NOT NULL
+  GROUP BY evidence.npi,
+           evidence.address_key,
+           LOWER(BTRIM(evidence.issuer_name))
+  ORDER BY evidence.npi,
+           evidence.address_key,
+           LOWER(BTRIM(evidence.issuer_name))
+"""
+
+
+def _mrf_source_pair(source_row: Mapping[str, Any]) -> tuple[int, str] | None:
+    """Return one valid evidence address identity."""
+    address_key = _normalized_address_identity(source_row.get("address_key"))
+    if not address_key:
+        return None
+    npi_value = source_row.get("npi") or source_row.get("inferred_npi")
+    try:
+        return int(npi_value), address_key
+    except (TypeError, ValueError):
+        return None
+
+
+def _mrf_source_detail(source_row: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Build one public issuer-level MRF source detail."""
+    issuer_name = str(source_row.get("issuer_name") or "").strip()
+    if not issuer_name:
+        return None
+    issuer_ids: list[int] = []
+    for raw_issuer_id in source_row.get("issuer_ids") or []:
+        try:
+            issuer_ids.append(int(raw_issuer_id))
+        except (TypeError, ValueError):
+            continue
+    issuer_ids = sorted(set(issuer_ids))
+    if len(issuer_ids) == 1:
+        source_name = f"{issuer_name} (issuer {issuer_ids[0]})"
+    elif issuer_ids:
+        source_name = f"{issuer_name} (issuers {', '.join(map(str, issuer_ids))})"
+    else:
+        source_name = issuer_name
+    return {
+        "source": "mrf",
+        "issuer_name": issuer_name,
+        "source_name": source_name,
+        "issuer_ids": issuer_ids,
+        "source_urls": sorted(
+            {
+                public_url
+                for source_url in (source_row.get("source_urls") or [])
+                if (public_url := _public_mrf_source_url(source_url))
+            }
+        ),
+    }
+
+
+def _mrf_source_details_by_pair(
+    source_rows: Sequence[Any],
+    selected_pairs: set[tuple[int, str]],
+) -> dict[tuple[int, str], list[dict[str, Any]]]:
+    """Group valid source details by exact selected address."""
+    details_by_pair: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    for result_row in source_rows:
+        source_row = getattr(result_row, "_mapping", result_row)
+        source_pair = _mrf_source_pair(source_row)
+        if source_pair not in selected_pairs:
+            continue
+        source_detail = _mrf_source_detail(source_row)
+        if source_detail:
+            details_by_pair[source_pair].append(source_detail)
+    return details_by_pair
+
+
+def _apply_mrf_source_details(
+    addresses: Sequence[Any],
+    details_by_pair: Mapping[tuple[int, str], list[dict[str, Any]]],
+) -> None:
+    """Attach grouped source details to their exact address rows."""
+    for address in addresses:
+        if not isinstance(address, dict):
+            continue
+        source_pair = _mrf_source_pair(address)
+        source_details = details_by_pair.get(source_pair) if source_pair else None
+        if not source_details:
+            continue
+        source_details.sort(
+            key=lambda source: (
+                str(source["source_name"]).casefold(),
+                tuple(source["issuer_ids"]),
+            )
+        )
+        address[MRF_SOURCE_DETAIL_KEY] = source_details
+        address[MRF_SOURCE_COUNT_KEY] = len(source_details)
+
+
 async def _attach_mrf_source_details(
     addresses: Sequence[Any],
     *,
@@ -4699,119 +4828,15 @@ async def _attach_mrf_source_details(
         return
     evidence_table = _schema_cache_key("mrf_address_evidence")
     query_result = await _execute_stmt(
-        text(
-            f"""
-            WITH selected(npi, address_key) AS (
-                SELECT selected_npi, selected_address_key
-                  FROM UNNEST(
-                           CAST(:npis AS bigint[]),
-                           CAST(:address_keys AS uuid[])
-                       ) AS selected_rows(selected_npi, selected_address_key)
-            )
-            SELECT evidence.npi,
-                   evidence.address_key,
-                   MIN(BTRIM(evidence.issuer_name)) AS issuer_name,
-                   COALESCE(
-                       ARRAY_AGG(DISTINCT evidence.issuer_id ORDER BY evidence.issuer_id)
-                           FILTER (WHERE evidence.issuer_id IS NOT NULL),
-                       ARRAY[]::integer[]
-                   ) AS issuer_ids,
-                   COALESCE(
-                       ARRAY_AGG(
-                           DISTINCT BTRIM(evidence.source_url)
-                           ORDER BY BTRIM(evidence.source_url)
-                       ) FILTER (
-                           WHERE NULLIF(BTRIM(evidence.source_url), '') IS NOT NULL
-                       ),
-                       ARRAY[]::varchar[]
-                   ) AS source_urls
-              FROM selected
-              JOIN {evidence_table} AS evidence
-                ON evidence.npi = selected.npi
-               AND evidence.address_key = selected.address_key
-             WHERE NULLIF(BTRIM(evidence.issuer_name), '') IS NOT NULL
-          GROUP BY evidence.npi,
-                   evidence.address_key,
-                   LOWER(BTRIM(evidence.issuer_name))
-          ORDER BY evidence.npi,
-                   evidence.address_key,
-                   LOWER(BTRIM(evidence.issuer_name))
-            """
-        ),
+        text(_MRF_SOURCE_DETAILS_QUERY.format(evidence_table=evidence_table)),
         session=session,
         params={
             "npis": [npi for npi, _address_key in address_pairs],
             "address_keys": [address_key for _npi, address_key in address_pairs],
         },
     )
-    selected_pair_set = set(address_pairs)
-    source_map: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
-    for source_row in query_result.all():
-        mapping = getattr(source_row, "_mapping", source_row)
-        try:
-            source_pair = (
-                int(mapping.get("npi")),
-                _normalized_address_identity(mapping.get("address_key")),
-            )
-        except (TypeError, ValueError):
-            continue
-        if source_pair not in selected_pair_set:
-            continue
-        issuer_name = str(mapping.get("issuer_name") or "").strip()
-        if not issuer_name:
-            continue
-        issuer_ids: list[int] = []
-        for raw_issuer_id in mapping.get("issuer_ids") or []:
-            try:
-                issuer_ids.append(int(raw_issuer_id))
-            except (TypeError, ValueError):
-                continue
-        issuer_ids = sorted(set(issuer_ids))
-        if len(issuer_ids) == 1:
-            source_name = f"{issuer_name} (issuer {issuer_ids[0]})"
-        elif issuer_ids:
-            source_name = (
-                f"{issuer_name} (issuers {', '.join(map(str, issuer_ids))})"
-            )
-        else:
-            source_name = issuer_name
-        source_map[source_pair].append(
-            {
-                "source": "mrf",
-                "issuer_name": issuer_name,
-                "source_name": source_name,
-                "issuer_ids": issuer_ids,
-                "source_urls": sorted(
-                    {
-                        sanitized_url
-                        for source_url in (mapping.get("source_urls") or [])
-                        if (
-                            sanitized_url := _public_mrf_source_url(source_url)
-                        )
-                    }
-                ),
-            }
-        )
-    for address in addresses:
-        if not isinstance(address, dict):
-            continue
-        address_key = _normalized_address_identity(address.get("address_key"))
-        npi_value = address.get("npi") or address.get("inferred_npi")
-        try:
-            source_pair = (int(npi_value), address_key)
-        except (TypeError, ValueError):
-            continue
-        sources = source_map.get(source_pair)
-        if not sources:
-            continue
-        sources.sort(
-            key=lambda source: (
-                str(source["source_name"]).casefold(),
-                tuple(source["issuer_ids"]),
-            )
-        )
-        address[MRF_SOURCE_DETAIL_KEY] = sources
-        address[MRF_SOURCE_COUNT_KEY] = len(sources)
+    details_by_pair = _mrf_source_details_by_pair(query_result.all(), set(address_pairs))
+    _apply_mrf_source_details(addresses, details_by_pair)
 
 
 async def _attach_selected_address_source_details(
@@ -8523,6 +8548,28 @@ def _match_candidate_response_map(
     }
 
 
+def _include_match_candidate_source_details(
+    candidate_map: dict[str, Any],
+    public_provider_map: Mapping[str, Any],
+    fhir_sources: Sequence[Any],
+) -> None:
+    """Attach opt-in FHIR and MRF source details to one candidate."""
+    if fhir_sources:
+        candidate_map[PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY] = fhir_sources
+    mrf_sources = _json_array_value(public_provider_map.get(MRF_SOURCE_DETAIL_KEY))
+    if not mrf_sources:
+        return
+    mrf_source_count = int(
+        public_provider_map.get(MRF_SOURCE_COUNT_KEY) or len(mrf_sources)
+    )
+    candidate_map[MRF_SOURCE_DETAIL_KEY] = mrf_sources
+    candidate_map[MRF_SOURCE_COUNT_KEY] = mrf_source_count
+    candidate_map["sources"]["mrf"] = {
+        "matched": True,
+        "source_count": mrf_source_count,
+    }
+
+
 def _match_candidate_output(
     provider_row: Mapping[str, Any],
     params: Mapping[str, Any],
@@ -8570,21 +8617,7 @@ def _match_candidate_output(
     if taxonomy_list:
         candidate_map["taxonomy"] = taxonomy_list
     if params.get("include_sources"):
-        if fhir_sources:
-            candidate_map[PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY] = fhir_sources
-        mrf_sources = _json_array_value(
-            public_provider_map.get(MRF_SOURCE_DETAIL_KEY)
-        )
-        if mrf_sources:
-            mrf_source_count = int(
-                public_provider_map.get(MRF_SOURCE_COUNT_KEY) or len(mrf_sources)
-            )
-            candidate_map[MRF_SOURCE_DETAIL_KEY] = mrf_sources
-            candidate_map[MRF_SOURCE_COUNT_KEY] = mrf_source_count
-            candidate_map["sources"]["mrf"] = {
-                "matched": True,
-                "source_count": mrf_source_count,
-            }
+        _include_match_candidate_source_details(candidate_map, public_provider_map, fhir_sources)
     if params.get("include_evidence"):
         candidate_map["evidence"] = _match_candidate_evidence_map(
             provider_row,

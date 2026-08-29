@@ -18,13 +18,8 @@ class _Rows:
         return [SimpleNamespace(_mapping=row) for row in self._rows]
 
 
-@pytest.mark.asyncio
-async def test_mrf_sources_are_address_local_issuer_groups_with_exact_url_aliases(
-    monkeypatch,
-):
-    first_address_key = "11111111-1111-1111-1111-111111111111"
-    second_address_key = "22222222-2222-2222-2222-222222222222"
-    addresses = [
+def _mrf_address_entries(first_address_key, second_address_key):
+    return [
         {
             "npi": 1000000001,
             "address_key": first_address_key,
@@ -41,63 +36,40 @@ async def test_mrf_sources_are_address_local_issuer_groups_with_exact_url_aliase
             "address_sources": ["nppes"],
         },
     ]
-    execute_stmt = AsyncMock(
-        return_value=_Rows(
-            [
-                {
-                    "npi": 1000000001,
-                    "address_key": first_address_key,
-                    "issuer_name": "Bluebird Health Plan",
-                    "issuer_ids": [22222],
-                    "source_urls": ["https://bluebird.example/providers.json"],
-                },
-                {
-                    "npi": 1000000001,
-                    "address_key": first_address_key,
-                    "issuer_name": "Northstar Health Plan",
-                    "issuer_ids": [11111, 11112],
-                    "source_urls": [
-                        "https://api-user:api-secret@northstar.example/a/providers.json?token=secret#part",
-                        "https://northstar.example/a/providers.json?token=other",
-                        "https://northstar.example/b/providers.json",
-                        "file:///private/import/providers.json",
-                    ],
-                },
-                {
-                    "npi": 1000000001,
-                    "address_key": second_address_key,
-                    "issuer_name": "Cedar Health Plan",
-                    "issuer_ids": [],
-                    "source_urls": [],
-                },
-            ]
-        )
-    )
-    table_available = AsyncMock(return_value=True)
-    monkeypatch.setattr(npi_module, "_execute_stmt", execute_stmt)
-    monkeypatch.setattr(npi_module, "_is_table_available", table_available)
 
-    await npi_module._attach_mrf_source_details(addresses, session="session")
 
-    execute_stmt.assert_awaited_once()
-    table_available.assert_awaited_once_with(
-        "mrf_address_evidence",
-        session="session",
-    )
-    statement = str(execute_stmt.await_args.args[0])
-    assert "mrf_address_evidence" in statement
-    assert "mrf_address" not in statement.replace("mrf_address_evidence", "")
-    assert "LOWER(BTRIM(evidence.issuer_name))" in statement
-    assert "ARRAY_AGG(DISTINCT evidence.issuer_id" in statement
-    assert "network_tier" not in statement
-    assert "year" not in statement
-    assert execute_stmt.await_args.kwargs == {
-        "session": "session",
-        "params": {
-            "npis": [1000000001, 1000000001],
-            "address_keys": [first_address_key, second_address_key],
+def _mrf_evidence_entries(first_address_key, second_address_key):
+    return [
+        {
+            "npi": 1000000001,
+            "address_key": first_address_key,
+            "issuer_name": "Bluebird Health Plan",
+            "issuer_ids": [22222],
+            "source_urls": ["https://bluebird.example/providers.json"],
         },
-    }
+        {
+            "npi": 1000000001,
+            "address_key": first_address_key,
+            "issuer_name": "Northstar Health Plan",
+            "issuer_ids": [11111, 11112],
+            "source_urls": [
+                "https://api-user:api-secret@northstar.example/a/providers.json?token=secret#part",
+                "https://northstar.example/a/providers.json?token=other",
+                "https://northstar.example/b/providers.json",
+                "file:///private/import/providers.json",
+            ],
+        },
+        {
+            "npi": 1000000001,
+            "address_key": second_address_key,
+            "issuer_name": "Cedar Health Plan",
+            "issuer_ids": [],
+            "source_urls": [],
+        },
+    ]
+
+
+def _assert_mrf_source_groups(addresses):
     assert addresses[0]["mrf_source_count"] == 2
     assert addresses[0]["mrf_sources"] == [
         {
@@ -130,6 +102,45 @@ async def test_mrf_sources_are_address_local_issuer_groups_with_exact_url_aliase
     assert addresses[1]["mrf_source_count"] == 1
     assert "mrf_sources" not in addresses[2]
     assert "secret" not in str(addresses[0]["mrf_sources"])
+
+
+@pytest.mark.asyncio
+async def test_mrf_sources_are_address_local_issuer_groups_with_exact_url_aliases(
+    monkeypatch,
+):
+    """Attach normalized issuer groups only to their exact MRF-backed address."""
+    first_address_key = "11111111-1111-1111-1111-111111111111"
+    second_address_key = "22222222-2222-2222-2222-222222222222"
+    addresses = _mrf_address_entries(first_address_key, second_address_key)
+    execute_stmt = AsyncMock(
+        return_value=_Rows(_mrf_evidence_entries(first_address_key, second_address_key))
+    )
+    table_available = AsyncMock(return_value=True)
+    monkeypatch.setattr(npi_module, "_execute_stmt", execute_stmt)
+    monkeypatch.setattr(npi_module, "_is_table_available", table_available)
+
+    await npi_module._attach_mrf_source_details(addresses, session="session")
+
+    execute_stmt.assert_awaited_once()
+    table_available.assert_awaited_once_with(
+        "mrf_address_evidence",
+        session="session",
+    )
+    statement = str(execute_stmt.await_args.args[0])
+    assert "mrf_address_evidence" in statement
+    assert "mrf_address" not in statement.replace("mrf_address_evidence", "")
+    assert "LOWER(BTRIM(evidence.issuer_name))" in statement
+    assert "ARRAY_AGG(DISTINCT evidence.issuer_id" in statement
+    assert "network_tier" not in statement
+    assert "year" not in statement
+    assert execute_stmt.await_args.kwargs == {
+        "session": "session",
+        "params": {
+            "npis": [1000000001, 1000000001],
+            "address_keys": [first_address_key, second_address_key],
+        },
+    }
+    _assert_mrf_source_groups(addresses)
 
 
 @pytest.mark.asyncio
@@ -248,7 +259,7 @@ async def test_shared_source_attachment_skips_mrf_read_without_include_sources(
 
 
 def test_match_candidate_returns_selected_address_mrf_sources_only_when_requested():
-    provider_row = {
+    provider_map = {
         "npi": 1000000001,
         "address_key": "11111111-1111-1111-1111-111111111111",
         "address_sources": ["mrf"],
@@ -263,7 +274,7 @@ def test_match_candidate_returns_selected_address_mrf_sources_only_when_requeste
             }
         ],
     }
-    params = {
+    parameter_map = {
         "include_sources": True,
         "include_evidence": False,
         "taxonomy_exact": (),
@@ -273,17 +284,17 @@ def test_match_candidate_returns_selected_address_mrf_sources_only_when_requeste
     }
 
     candidate = npi_module._match_candidate_output(
-        provider_row,
-        params,
+        provider_map,
+        parameter_map,
         enrichment=None,
     )
 
     assert candidate["mrf_source_count"] == 1
-    assert candidate["mrf_sources"] == provider_row["mrf_sources"]
+    assert candidate["mrf_sources"] == provider_map["mrf_sources"]
     assert candidate["sources"]["mrf"] == {"matched": True, "source_count": 1}
     hidden_candidate = npi_module._match_candidate_output(
-        provider_row,
-        {**params, "include_sources": False},
+        provider_map,
+        {**parameter_map, "include_sources": False},
         enrichment=None,
     )
     assert "mrf_source_count" not in hidden_candidate

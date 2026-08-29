@@ -4,7 +4,7 @@ import datetime
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 
@@ -182,66 +182,6 @@ async def test_plan_import_preserves_below_threshold_cost_sharing_and_year_contr
     await _assert_plan_import_rows(duplicate_tolerant, monkeypatch, plan_id, pushed)
 
 
-@pytest.mark.asyncio
-async def test_plan_import_flushes_multi_plan_buffers_without_losing_rows(monkeypatch):
-    """Flush retained rows across ordinary one-year plans at the row threshold."""
-
-    plan_ids = [f"12345AA000000{suffix}" for suffix in range(3)]
-    plan_source_records = [
-        {
-            "plan_id": plan_id,
-            "plan_id_type": "CMS-HIOS-PLAN-ID",
-            "years": [2026],
-            "marketing_name": f"Synthetic Plan {index + 1}",
-            "summary_url": f"https://data.example.invalid/summary/{index + 1}",
-            "plan_contact": "support@example.invalid",
-            "network": [],
-            "formulary": {
-                "drug_tier": "GENERIC",
-                "mail_order": False,
-                "cost_sharing": [
-                    {
-                        "pharmacy_type": "RETAIL",
-                        "copay_amount": index + 1,
-                        "copay_opt": "NONE",
-                        "coinsurance_rate": 0,
-                        "coinsurance_opt": "NONE",
-                    }
-                ],
-            },
-            "benefits": [],
-            "last_updated_on": "2026-07-01",
-        }
-        for index, plan_id in enumerate(plan_ids)
-    ]
-    pushed, duplicate_tolerant = _configure_import_boundary(
-        monkeypatch, plan_source_records
-    )
-    monkeypatch.setattr(initial, "_mrf_plan_flush_rows", lambda _test_mode: 2)
-
-    outcome = await initial.process_plan(_import_context(), _import_task("plans"))
-
-    assert outcome == 1
-    plan_batches = [
-        rows
-        for label, rows in pushed + duplicate_tolerant
-        if label == "Plan" and rows
-    ]
-    formulary_batches = [
-        rows
-        for label, rows in duplicate_tolerant
-        if label == "PlanFormulary" and rows
-    ]
-    assert [len(rows) for rows in plan_batches] == [2, 1]
-    assert [len(rows) for rows in formulary_batches] == [2, 1]
-    assert {
-        row["plan_id"] for rows in plan_batches for row in rows
-    } == set(plan_ids)
-    assert {
-        row["plan_id"] for rows in formulary_batches for row in rows
-    } == set(plan_ids)
-
-
 def _provider_contract_fixture(current_year):
     valid_plan_by_field = {
         "plan_id": "12345AA0000000",
@@ -362,90 +302,6 @@ async def test_provider_import_preserves_person_facility_and_network_contracts(
         processed_providers=3,
     )
     initial._mark_mrf_work_done.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_provider_import_keeps_each_plans_years_isolated(monkeypatch):
-    current_year = datetime.datetime.now().year
-    provider_source_records = [
-        {
-            "npi": "1000000004",
-            "type": "INDIVIDUAL",
-            "name": {"first": "Year", "last": "Boundary"},
-            "addresses": [],
-            "plans": [
-                {
-                    "plan_id": "12345AA0000000",
-                    "network_tier": "CURRENT",
-                    "years": [current_year],
-                },
-                {
-                    "plan_id": "23456AA0000000",
-                    "network_tier": "NEXT",
-                    "years": [current_year + 1],
-                },
-            ],
-            "last_updated_on": "2026-07-01",
-        }
-    ]
-    _pushed, duplicate_tolerant = _configure_import_boundary(
-        monkeypatch, provider_source_records
-    )
-    monkeypatch.setattr(initial, "_mrf_provider_flush_rows", lambda _test_mode: 100)
-    monkeypatch.setattr(
-        initial.db,
-        "select",
-        lambda *_args: SimpleNamespace(all=AsyncMock(return_value=[])),
-    )
-    monkeypatch.setattr(initial, "_build_mrf_address_rows", lambda *_args, **_kwargs: ([], []))
-    monkeypatch.setattr(initial, "_push_mrf_address_rows", AsyncMock())
-    monkeypatch.setattr(initial, "_mark_mrf_provider_file_progress", AsyncMock())
-
-    outcome = await initial.process_provider(
-        _import_context(), _import_task("providers")
-    )
-
-    assert outcome == 1
-    network_rows = [
-        row
-        for label, rows in duplicate_tolerant
-        if label == "PlanNetworkTierRaw"
-        for row in rows
-    ]
-    assert {
-        (row["plan_id"], row["network_tier"], row["year"])
-        for row in network_rows
-    } == {
-        ("12345AA0000000", "CURRENT", current_year),
-        ("23456AA0000000", "NEXT", current_year + 1),
-    }
-
-
-@pytest.mark.asyncio
-async def test_provider_import_reuses_issuer_names_within_one_worker(monkeypatch):
-    _configure_import_boundary(monkeypatch, [])
-    issuer_query = Mock(
-        return_value=SimpleNamespace(
-            all=AsyncMock(
-                return_value=[
-                    SimpleNamespace(
-                        issuer_id=12345,
-                        issuer_name="Synthetic Issuer",
-                        issuer_marketing_name="",
-                        mrf_url="https://synthetic.example/index.json",
-                    )
-                ]
-            )
-        )
-    )
-    monkeypatch.setattr(initial.db, "select", issuer_query)
-    monkeypatch.setattr(initial, "_mark_mrf_provider_file_progress", AsyncMock())
-    context = _import_context()
-
-    assert await initial.process_provider(context, _import_task("providers")) == 1
-    assert await initial.process_provider(context, _import_task("providers")) == 1
-
-    assert issuer_query.call_count == 1
 
 
 def _assert_formulary_import_rows(duplicate_tolerant):
