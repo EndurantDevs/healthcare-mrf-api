@@ -434,6 +434,115 @@ async def _resolve_plan_year(session, plan_id: str, year_param: Optional[str]) -
     return year
 
 
+async def _load_formulary_plan_and_stats(session, plan_id: str, year: int):
+    plan_table = Plan.__table__
+    issuer_table = Issuer.__table__
+    plan_drug_stats_table = PlanDrugStats.__table__
+    detail_stmt = (
+        select(
+            plan_table.c.plan_id,
+            plan_table.c.year,
+            plan_table.c.marketing_name,
+            plan_table.c.state,
+            plan_table.c.summary_url,
+            plan_table.c.marketing_url,
+            plan_table.c.issuer_id,
+            issuer_table.c.issuer_name,
+            issuer_table.c.issuer_marketing_name,
+        )
+        .select_from(
+            plan_table.join(issuer_table, plan_table.c.issuer_id == issuer_table.c.issuer_id)
+        )
+        .where(and_(plan_table.c.plan_id == plan_id, plan_table.c.year == year))
+    )
+    detail_row = (await session.execute(detail_stmt)).first()
+    if detail_row is None:
+        raise NotFound("Unknown formulary identifier")
+    drug_counts_stmt = select(
+        func.coalesce(plan_drug_stats_table.c.total_drugs, 0).label("drug_count"),
+        plan_drug_stats_table.c.last_updated_on.label("last_updated"),
+    ).where(plan_drug_stats_table.c.plan_id == plan_id)
+    stats_row = (await session.execute(drug_counts_stmt)).first()
+    stats_map = None
+    if stats_row is not None:
+        stats_map = stats_row if isinstance(stats_row, dict) else getattr(stats_row, "_mapping", None)
+    if stats_map is None:
+        stats_map = {"drug_count": 0, "last_updated": None}
+    return detail_row, stats_map
+
+
+def _formulary_drug_filters(plan_id: str, year: int, args) -> List[Any]:
+    plan_drug_table = PlanDrugRaw.__table__
+    plan_formulary_table = PlanFormulary.__table__
+    filters: List[Any] = [plan_drug_table.c.plan_id == plan_id]
+    tier_filter = args.get("tier")
+    pharmacy_filter = args.get("pharmacy_type")
+    auth_filter = _parse_bool(args.get("authorization_required"), "authorization_required")
+    step_filter = _parse_bool(args.get("step_therapy"), "step_therapy")
+    quantity_filter = _parse_bool(args.get("quantity_limit"), "quantity_limit")
+    if tier_filter:
+        filters.append(plan_drug_table.c.drug_tier == tier_filter)
+    if auth_filter is not None:
+        filters.append(plan_drug_table.c.prior_authorization == auth_filter)
+    if step_filter is not None:
+        filters.append(plan_drug_table.c.step_therapy == step_filter)
+    if quantity_filter is not None:
+        filters.append(plan_drug_table.c.quantity_limit == quantity_filter)
+    if pharmacy_filter:
+        filters.append(
+            plan_drug_table.c.plan_id.in_(
+                select(plan_formulary_table.c.plan_id).where(
+                    and_(
+                        plan_formulary_table.c.plan_id == plan_id,
+                        plan_formulary_table.c.year == year,
+                        plan_formulary_table.c.pharmacy_type == pharmacy_filter,
+                    )
+                )
+            )
+        )
+    return filters
+
+
+def _formulary_drug_statements(args, pagination, filters):
+    plan_drug_table = PlanDrugRaw.__table__
+    count_stmt = select(func.count()).select_from(plan_drug_table).where(and_(*filters))
+    sort_field = _normalise_sort(args.get("sort"), {"name", "tier"}, "name")
+    sort_order = _normalise_order(args.get("order"))
+    order_column = (
+        plan_drug_table.c.drug_name if sort_field == "name" else plan_drug_table.c.drug_tier
+    )
+    if sort_order == "desc":
+        order_column = order_column.desc()
+    data_stmt = (
+        select(
+            plan_drug_table.c.rxnorm_id,
+            plan_drug_table.c.drug_name,
+            plan_drug_table.c.drug_tier,
+            plan_drug_table.c.prior_authorization,
+            plan_drug_table.c.step_therapy,
+            plan_drug_table.c.quantity_limit,
+            plan_drug_table.c.last_updated_on,
+        )
+        .where(and_(*filters))
+        .order_by(order_column, plan_drug_table.c.rxnorm_id.asc())
+        .offset(pagination.offset)
+        .limit(pagination.limit)
+    )
+    return count_stmt, data_stmt
+
+
+def _hydrate_formulary_drug_row(drug_row) -> Dict[str, Any]:
+    mapping = drug_row._mapping
+    last_updated_on = mapping["last_updated_on"]
+    if last_updated_on is not None:
+        last_updated_on = last_updated_on.isoformat()
+    return {
+        "rxnorm_id": mapping["rxnorm_id"],
+        **_drug_coverage_details(mapping),
+        "last_updated": last_updated_on,
+    }
+
+
 @blueprint.get("/ids")
 async def list_formularies(request):
     """List filtered formularies with plan, issuer, and pagination metadata."""
@@ -491,52 +600,8 @@ async def get_formulary(request, formulary_id):
     session = _get_session(request)
     plan_id, year = _decode_formulary_id(formulary_id)
 
-    plan_table = Plan.__table__
-    issuer_table = Issuer.__table__
-    plan_drug_stats_table = PlanDrugStats.__table__
+    detail_row, stats_map = await _load_formulary_plan_and_stats(session, plan_id, year)
     plan_drug_tier_stats_table = PlanDrugTierStats.__table__
-    plan_formulary_table = PlanFormulary.__table__
-
-    detail_stmt = (
-        select(
-            plan_table.c.plan_id,
-            plan_table.c.year,
-            plan_table.c.marketing_name,
-            plan_table.c.state,
-            plan_table.c.summary_url,
-            plan_table.c.marketing_url,
-            plan_table.c.issuer_id,
-            issuer_table.c.issuer_name,
-            issuer_table.c.issuer_marketing_name,
-        )
-        .select_from(
-            plan_table.join(issuer_table, plan_table.c.issuer_id == issuer_table.c.issuer_id)
-        )
-        .where(and_(plan_table.c.plan_id == plan_id, plan_table.c.year == year))
-    )
-
-    detail_result = await session.execute(detail_stmt)
-    detail_row = detail_result.first()
-    if detail_row is None:
-        raise NotFound("Unknown formulary identifier")
-
-    drug_counts_stmt = (
-        select(
-            func.coalesce(plan_drug_stats_table.c.total_drugs, 0).label("drug_count"),
-            plan_drug_stats_table.c.last_updated_on.label("last_updated"),
-        )
-        .where(plan_drug_stats_table.c.plan_id == plan_id)
-    )
-    stats_result = await session.execute(drug_counts_stmt)
-    stats_row = stats_result.first()
-    stats_map = None
-    if stats_row is not None:
-        if isinstance(stats_row, dict):
-            stats_map = stats_row
-        else:
-            stats_map = getattr(stats_row, "_mapping", None)
-    if stats_map is None:
-        stats_map = {"drug_count": 0, "last_updated": None}
 
     tiers_stmt = (
         select(plan_drug_tier_stats_table.c.drug_tier)
@@ -546,17 +611,9 @@ async def get_formulary(request, formulary_id):
     tiers_result = await session.execute(tiers_stmt)
     tiers = _build_tier_options(tier_row[0] for tier_row in tiers_result.all())
 
-    pharmacy_stmt = (
-        select(func.distinct(plan_formulary_table.c.pharmacy_type))
-        .where(
-            and_(
-                plan_formulary_table.c.plan_id == plan_id,
-                plan_formulary_table.c.year == year,
-            )
-        )
-        .order_by(plan_formulary_table.c.pharmacy_type)
+    pharmacy_types = await _collect_distinct_strings(
+        session, _pharmacy_types_statement(plan_id, year)
     )
-    pharmacy_types = await _collect_distinct_strings(session, pharmacy_stmt)
 
     last_updated = stats_map.get("last_updated")
     if last_updated is not None:
@@ -609,113 +666,24 @@ async def list_formulary_drugs(request, formulary_id):
         allow_start=True,
         allow_page_size=True,
     )
-    page = pagination.page
-    page_size = pagination.limit
-    offset = pagination.offset
-
-    tier_filter = args.get("tier")
-    pharmacy_filter = args.get("pharmacy_type")
-    auth_filter = _parse_bool(args.get("authorization_required"), "authorization_required")
-    step_filter = _parse_bool(args.get("step_therapy"), "step_therapy")
-    quantity_filter = _parse_bool(args.get("quantity_limit"), "quantity_limit")
-
-    plan_drug_table = PlanDrugRaw.__table__
-    filters: List[Any] = [plan_drug_table.c.plan_id == plan_id]
-
-    if tier_filter:
-        filters.append(plan_drug_table.c.drug_tier == tier_filter)
-    if auth_filter is not None:
-        filters.append(plan_drug_table.c.prior_authorization == auth_filter)
-    if step_filter is not None:
-        filters.append(plan_drug_table.c.step_therapy == step_filter)
-    if quantity_filter is not None:
-        filters.append(plan_drug_table.c.quantity_limit == quantity_filter)
-
-    plan_formulary_table = PlanFormulary.__table__
-
-    if pharmacy_filter:
-        filters.append(
-            plan_drug_table.c.plan_id.in_(
-                select(plan_formulary_table.c.plan_id).where(
-                    and_(
-                        plan_formulary_table.c.plan_id == plan_id,
-                        plan_formulary_table.c.year == year,
-                        plan_formulary_table.c.pharmacy_type == pharmacy_filter,
-                    )
-                )
-            )
-        )
-
-    count_stmt = select(func.count()).select_from(plan_drug_table).where(and_(*filters))
+    filters = _formulary_drug_filters(plan_id, year, args)
+    count_stmt, data_stmt = _formulary_drug_statements(args, pagination, filters)
     count_result = await session.execute(count_stmt)
     total = count_result.scalar() or 0
-
-    sort_field = _normalise_sort(args.get("sort"), {"name", "tier"}, "name")
-    sort_order = _normalise_order(args.get("order"))
-    order_column = (
-        plan_drug_table.c.drug_name if sort_field == "name" else plan_drug_table.c.drug_tier
+    drug_rows = (await session.execute(data_stmt)).all()
+    pharmacy_types = await _collect_distinct_strings(
+        session, _pharmacy_types_statement(plan_id, year)
     )
-    if sort_order == "desc":
-        order_column = order_column.desc()
-
-    data_stmt = (
-        select(
-            plan_drug_table.c.rxnorm_id,
-            plan_drug_table.c.drug_name,
-            plan_drug_table.c.drug_tier,
-            plan_drug_table.c.prior_authorization,
-            plan_drug_table.c.step_therapy,
-            plan_drug_table.c.quantity_limit,
-            plan_drug_table.c.last_updated_on,
-        )
-        .where(and_(*filters))
-        .order_by(order_column, plan_drug_table.c.rxnorm_id.asc())
-        .offset(offset)
-        .limit(page_size)
-    )
-
-    drug_result = await session.execute(data_stmt)
-    drug_rows = drug_result.all()
-
-    pharmacy_stmt = (
-        select(func.distinct(plan_formulary_table.c.pharmacy_type))
-        .where(
-            and_(
-                plan_formulary_table.c.plan_id == plan_id,
-                plan_formulary_table.c.year == year,
-            )
-        )
-        .order_by(plan_formulary_table.c.pharmacy_type)
-    )
-    pharmacy_types = await _collect_distinct_strings(session, pharmacy_stmt)
-
-    drug_items = []
-    for drug_row in drug_rows:
-        mapping = drug_row._mapping
-        last_updated_on = mapping["last_updated_on"]
-        if last_updated_on is not None:
-            last_updated_on = last_updated_on.isoformat()
-        drug_items.append(
-            {
-                "rxnorm_id": mapping["rxnorm_id"],
-                "drug_name": mapping["drug_name"],
-                "drug_tier": mapping["drug_tier"],
-                "drug_tier_slug": normalize_drug_tier_slug(mapping["drug_tier"]),
-                "prior_authorization": mapping["prior_authorization"],
-                "step_therapy": mapping["step_therapy"],
-                "quantity_limit": mapping["quantity_limit"],
-                "last_updated": last_updated_on,
-            }
-        )
+    drug_items = [_hydrate_formulary_drug_row(drug_row) for drug_row in drug_rows]
 
     return response.json(
         {
             "formulary_id": formulary_id,
             "formulary_uri": _encode_formulary_path(plan_id, year),
-            "page": page,
-            "page_size": page_size,
-            "limit": page_size,
-            "offset": offset,
+            "page": pagination.page,
+            "page_size": pagination.limit,
+            "limit": pagination.limit,
+            "offset": pagination.offset,
             "total": total,
             "available_pharmacy_types": pharmacy_types,
             "items": drug_items,
