@@ -5,6 +5,7 @@ import types
 
 import pytest
 from sanic.exceptions import InvalidUsage, NotFound
+from sqlalchemy import create_engine, select
 
 from api.endpoint import formulary
 
@@ -113,6 +114,47 @@ def test_sort_and_order_normalization_cover_valid_and_invalid_values():
         formulary._normalise_sort("cost", {"name"}, "name")
     with pytest.raises(InvalidUsage, match="Order must"):
         formulary._normalise_order("sideways")
+
+
+def test_pharmacy_filter_returns_only_tiers_available_at_that_pharmacy():
+    engine = create_engine(
+        "sqlite://", execution_options={"schema_translate_map": {"mrf": None}}
+    )
+    drug_table = formulary.PlanDrugRaw.__table__
+    pharmacy_table = formulary.PlanFormulary.__table__
+    with engine.begin() as connection:
+        drug_table.create(connection)
+        pharmacy_table.create(connection)
+        connection.execute(
+            drug_table.insert(),
+            [
+                {"plan_id": "PLAN123", "rxnorm_id": "1", "drug_tier": "Tier 1"},
+                {"plan_id": "PLAN123", "rxnorm_id": "2", "drug_tier": "Tier 2"},
+            ],
+        )
+        connection.execute(
+            pharmacy_table.insert(),
+            [
+                {
+                    "plan_id": "PLAN123",
+                    "year": 2025,
+                    "drug_tier": "Tier 1",
+                    "pharmacy_type": "RETAIL",
+                },
+                {
+                    "plan_id": "PLAN123",
+                    "year": 2025,
+                    "drug_tier": "Tier 2",
+                    "pharmacy_type": "MAIL_ORDER",
+                },
+            ],
+        )
+        filters = formulary._formulary_drug_filters(
+            "PLAN123", 2025, {"pharmacy_type": "RETAIL"}
+        )
+        statement = select(drug_table.c.drug_tier).where(*filters)
+
+        assert connection.execute(statement).scalars().all() == ["Tier 1"]
 
 
 def test_get_session_and_tier_options_cover_failure_and_duplicate_paths():

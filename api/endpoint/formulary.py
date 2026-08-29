@@ -496,6 +496,7 @@ def _formulary_drug_filters(plan_id: str, year: int, args) -> List[Any]:
                         plan_formulary_table.c.plan_id == plan_id,
                         plan_formulary_table.c.year == year,
                         plan_formulary_table.c.pharmacy_type == pharmacy_filter,
+                        plan_formulary_table.c.drug_tier == plan_drug_table.c.drug_tier,
                     )
                 )
             )
