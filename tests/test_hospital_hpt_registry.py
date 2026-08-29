@@ -10,6 +10,26 @@ import pytest
 from process import hospital_hpt_registry as registry
 
 
+_FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
+    "hospital-001163": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
+    "hospital-001503": "6c134e170f5dfe9aa4ac2ab2dae9f0523bfa17262bb97813e16f07d2bba14615",
+    "hospital-003312": "75d4e626daf0db2c1e53cc903f3669d04339bbffb8891f92dd588c7fa3d0316f",
+    "hospital-004979": "dee8d2ff24f723f64f41aa8c576ad18113657d7e11b0b59a392c58fd8acb765d",
+    "hospital-005156": "180a1ae8dfcb952d7189c1c9ffb03ad121835699375b1e4ef9734c0764151192",
+    "hospital-005608": "00f218c51149bc2237e87924d78a7e244607d53421e5cd18943a26a9f9e7c9c5",
+    "hospital-005609": "00f218c51149bc2237e87924d78a7e244607d53421e5cd18943a26a9f9e7c9c5",
+    "hospital-006471": "dc7b9213c55ff2a6d9626a7841c532b5e7ebf1dce51e17efda59ead2c3f17de4",
+    "hospital-006488": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
+    "hospital-006502": "75d4e626daf0db2c1e53cc903f3669d04339bbffb8891f92dd588c7fa3d0316f",
+    "hospital-006547": "4001360464d0b094a10df3bd688d3879f0bc0d6c07ee966021772d689f0aebf7",
+    "hospital-006620": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
+    "hospital-006621": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
+    "hospital-006622": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
+    "hospital-006635": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
+    "hospital-007195": "4001360464d0b094a10df3bd688d3879f0bc0d6c07ee966021772d689f0aebf7",
+}
+
+
 def _load(tmp_path: Path, text: str) -> tuple[dict[str, str], ...]:
     path = tmp_path / "registry.yaml"
     path.write_text(text, encoding="utf-8")
@@ -34,7 +54,10 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_214
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 637
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 10
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 16
+    assert {
+        entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry
+    } == set(_FALLBACK_URL_SHA256_BY_HOSPITAL_ID)
     assert {
         hospital_id: hospital_by_id[hospital_id]["locator_name"]
         for hospital_id in ("hospital-003082", "hospital-005234", "hospital-005243")
@@ -47,28 +70,8 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
         hospital_id: hashlib.sha256(
             hospital_by_id[hospital_id]["fallback_mrf_url"].encode()
         ).hexdigest()
-        for hospital_id in (
-            "hospital-003312",
-            "hospital-004979",
-            "hospital-005156",
-            "hospital-005608",
-            "hospital-005609",
-            "hospital-006471",
-            "hospital-006502",
-            "hospital-006547",
-            "hospital-007195",
-        )
-    } == {
-        "hospital-003312": "75d4e626daf0db2c1e53cc903f3669d04339bbffb8891f92dd588c7fa3d0316f",
-        "hospital-004979": "dee8d2ff24f723f64f41aa8c576ad18113657d7e11b0b59a392c58fd8acb765d",
-        "hospital-005156": "180a1ae8dfcb952d7189c1c9ffb03ad121835699375b1e4ef9734c0764151192",
-        "hospital-005608": "00f218c51149bc2237e87924d78a7e244607d53421e5cd18943a26a9f9e7c9c5",
-        "hospital-005609": "00f218c51149bc2237e87924d78a7e244607d53421e5cd18943a26a9f9e7c9c5",
-        "hospital-006471": "dc7b9213c55ff2a6d9626a7841c532b5e7ebf1dce51e17efda59ead2c3f17de4",
-        "hospital-006502": "75d4e626daf0db2c1e53cc903f3669d04339bbffb8891f92dd588c7fa3d0316f",
-        "hospital-006547": "4001360464d0b094a10df3bd688d3879f0bc0d6c07ee966021772d689f0aebf7",
-        "hospital-007195": "4001360464d0b094a10df3bd688d3879f0bc0d6c07ee966021772d689f0aebf7",
-    }
+        for hospital_id in _FALLBACK_URL_SHA256_BY_HOSPITAL_ID
+    } == _FALLBACK_URL_SHA256_BY_HOSPITAL_ID
     assert all(
         {"hospital_id", "name", "cms_hpt_url"} <= set(entry)
         <= {
