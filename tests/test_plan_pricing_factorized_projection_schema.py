@@ -78,6 +78,8 @@ def test_factorized_migration_is_additive_bounded_and_authenticated(
     assert "array_ndims(negotiated_rates) = 1" in sql
     assert "array_lower(rate_multiplicities, 1) = 1" in sql
     assert "BEFORE INSERT OR UPDATE OR DELETE" in sql
+    assert sql.count("BEFORE TRUNCATE ON") == 5
+    assert sql.count('"plan_pricing_projection_truncate_guard"()') == 5
     assert "factorized plan-pricing projection receipt counts" in sql
 
 

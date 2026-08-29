@@ -261,16 +261,6 @@ async def test_session_builder_reuses_authority_bound_candidate_under_lock(monke
         "ordinal": 0,
     }
     binding_digest = "b" * 64
-    binding_body = projection_contract.canonical_json(
-        {
-            "contract": "hp-plan-serving-revision-v1",
-            "bindings": [binding_by_field],
-        }
-    )
-    base_digest = hashlib.sha256(
-        f"hp_plan_serving_revision_v1:{binding_body}".encode()
-    ).hexdigest()
-    assert binding_digest != base_digest
 
     async def provider_signature(_session):
         return "c" * 64

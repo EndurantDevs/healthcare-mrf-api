@@ -115,20 +115,38 @@ async def test_stored_pack_readback_rejects_corrupt_receipts() -> None:
     corrupt_payload = bytes([0]) + valid_row["payload"][1:]
     corrupt_sha256 = hashlib.sha256(corrupt_payload).digest()
     corrupt_rows = (
-        {**valid_row, "stored_byte_count": valid_row["stored_byte_count"] + 1},
-        {**valid_row, "raw_byte_count": valid_row["raw_byte_count"] + 1},
-        {**valid_row, "payload_sha256": b"x" * 32},
-        {**valid_row, "entry_count": valid_row["entry_count"] + 1},
-        {**valid_row, "logical_digest": "f" * 64},
-        {
-            **valid_row,
-            "payload": corrupt_payload,
-            "payload_sha256": corrupt_sha256,
-            "computed_sha256": corrupt_sha256,
-        },
+        (
+            {**valid_row, "stored_byte_count": valid_row["stored_byte_count"] + 1},
+            "stored aggregate pack counts are invalid",
+        ),
+        (
+            {**valid_row, "raw_byte_count": valid_row["raw_byte_count"] + 1},
+            "aggregate pack decoded byte count does not match its SQL row",
+        ),
+        (
+            {**valid_row, "payload_sha256": b"x" * 32},
+            "stored aggregate pack SHA does not match payload",
+        ),
+        (
+            {**valid_row, "entry_count": valid_row["entry_count"] + 1},
+            "stored aggregate pack logical receipt is invalid",
+        ),
+        (
+            {**valid_row, "logical_digest": "f" * 64},
+            "stored aggregate pack logical receipt is invalid",
+        ),
+        (
+            {
+                **valid_row,
+                "payload": corrupt_payload,
+                "payload_sha256": corrupt_sha256,
+                "computed_sha256": corrupt_sha256,
+            },
+            "aggregate pack header is invalid",
+        ),
     )
-    for corrupt_row_by_field in corrupt_rows:
-        with pytest.raises(ValueError):
+    for corrupt_row_by_field, expected_message in corrupt_rows:
+        with pytest.raises(ValueError, match=expected_message):
             await projection.validate_stored_aggregate_packs(
                 _Session(stream_rows=(corrupt_row_by_field,)),
                 PROJECTION_ID,
