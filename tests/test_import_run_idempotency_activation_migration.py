@@ -390,16 +390,15 @@ def _offline_operations(monkeypatch):
     return migration, output_buffer
 
 
-def test_offline_upgrade_requires_live_index_validation(monkeypatch):
+def test_offline_upgrade_emits_only_activation_drop(monkeypatch):
     migration, output_buffer = _offline_operations(monkeypatch)
 
-    with pytest.raises(
-        RuntimeError,
-        match="offline_activation_requires_live_index_validation",
-    ):
-        migration.upgrade()
+    migration.upgrade()
 
-    assert output_buffer.getvalue() == ""
+    sql = output_buffer.getvalue()
+    assert migration._drop_legacy_index_sql("fixture") in sql
+    assert "CREATE" not in sql
+    assert migration.INDEX_NAME not in sql
 
 
 def test_offline_downgrade_restores_only_global_index(monkeypatch):

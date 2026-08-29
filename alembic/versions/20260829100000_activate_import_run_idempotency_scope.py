@@ -175,7 +175,11 @@ def upgrade() -> None:
     schema = _schema()
     context = op.get_context()
     if context.as_sql:
-        raise RuntimeError("offline_activation_requires_live_index_validation")
+        # The predecessor prepares the exact importer-scoped index before this
+        # activation revision. Live upgrades still revalidate that index below.
+        with context.autocommit_block():
+            op.execute(text(_drop_legacy_index_sql(schema)))
+        return
 
     _require_index(schema, INDEX_NAME, INDEX_COLUMNS)
     legacy_state = _require_target_index(schema, LEGACY_INDEX_NAME)
