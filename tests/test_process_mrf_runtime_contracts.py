@@ -23,6 +23,31 @@ process_openaddresses = importlib.import_module("process.openaddresses")
 utils_module = importlib.import_module("process.ext.utils")
 
 
+_MRF_STAGE_MODELS = (
+    process_initial.Issuer,
+    process_initial.Plan,
+    process_initial.PlanFormulary,
+    process_initial.PlanBenefitsMarketplace,
+    process_initial.PlanTransparency,
+    process_initial.PlanDrugRaw,
+    process_initial.PlanDrugStats,
+    process_initial.PlanDrugTierStats,
+    process_initial.ImportLog,
+    process_initial.PlanNPIRaw,
+    process_initial.PlanNetworkTierRaw,
+    process_initial.MRFAddress,
+    process_initial.MRFAddressEvidence,
+)
+
+
+@pytest.mark.parametrize("model", _MRF_STAGE_MODELS)
+def test_mrf_stage_conflict_columns_match_primary_key(model):
+    """Every staged model must publish its constraint-backed primary index."""
+    assert list(model.__my_index_elements__) == [
+        column.name for column in model.__table__.primary_key.columns
+    ]
+
+
 def test_worker_aliases_preserve_registered_names():
     assert process_npi.process_data is process_npi.execute_npi_import_attempt
     assert process_npi.shutdown is process_npi.finalize_npi_import_attempt
@@ -127,6 +152,75 @@ async def test_mrf_startup_sets_utc_time(monkeypatch):
     delta = datetime.datetime.utcnow() - context_by_field["context"]["start"]
     assert delta.total_seconds() < 2
     assert context_by_field["context"]["control_run_id"] == "run_worker_context"
+
+
+@pytest.mark.asyncio
+async def test_prepare_mrf_stages_reuses_constraint_primary_indexes(monkeypatch):
+    statements = []
+
+    async def record_status(statement, **_params):
+        statements.append(statement)
+
+    def fake_make_class(cls, suffix, schema_override=None):
+        primary_columns = [
+            SimpleNamespace(name=name)
+            for name in cls.__my_index_elements__
+        ]
+        return SimpleNamespace(
+            __tablename__=f"{cls.__tablename__}_{suffix}",
+            __table__=SimpleNamespace(
+                primary_key=SimpleNamespace(columns=primary_columns),
+            ),
+            __my_index_elements__=list(cls.__my_index_elements__),
+            __my_initial_indexes__=list(getattr(cls, "__my_initial_indexes__", []) or []),
+            __my_additional_indexes__=list(getattr(cls, "__my_additional_indexes__", []) or []),
+        )
+
+    monkeypatch.setattr(process_initial.db, "status", record_status)
+    monkeypatch.setattr(process_initial.db, "create_table", AsyncMock())
+    monkeypatch.setattr(process_initial, "make_class", fake_make_class)
+    monkeypatch.setattr(process_initial, "get_import_schema", lambda *_args: "mrf")
+
+    await process_initial._prepare_import_tables("20260829", test_mode=True)
+
+    stage_primary_renames = [
+        statement
+        for statement in statements
+        if statement.startswith("ALTER INDEX mrf.") and statement.endswith("_idx_primary;")
+    ]
+    assert len(stage_primary_renames) == 13
+    assert not any(
+        "_20260829_idx_primary ON" in statement
+        for statement in statements
+        if statement.startswith("CREATE UNIQUE INDEX")
+    )
+    assert not any(
+        statement.startswith("CREATE INDEX")
+        and "mrf_address_20260829_idx_" in statement
+        for statement in statements
+    )
+    assert not any(
+        statement.startswith("CREATE INDEX")
+        and "mrf_address_evidence_20260829_idx_" in statement
+        for statement in statements
+    )
+
+
+@pytest.mark.asyncio
+async def test_staging_primary_index_rejects_conflict_column_drift(monkeypatch):
+    status = AsyncMock()
+    monkeypatch.setattr(process_initial.db, "status", status)
+    stage = SimpleNamespace(
+        __tablename__="plan_stage",
+        __my_index_elements__=["declared_conflict"],
+        __table__=SimpleNamespace(
+            primary_key=SimpleNamespace(columns=[SimpleNamespace(name="actual_primary")]),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="conflict columns must match"):
+        await process_initial._ensure_staging_primary_index(stage, "mrf")
+    status.assert_not_awaited()
 
 
 @pytest.mark.asyncio

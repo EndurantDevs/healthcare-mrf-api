@@ -124,37 +124,50 @@ async def test_refresh_plan_drug_statistics_upserts_concurrent_refreshes(monkeyp
     assert tier_insert.table is tier_stats
     assert [column.name for column in tier_insert.index_elements] == ["plan_id", "drug_tier"]
     assert tier_insert.set_ == {"drug_count": "excluded_drug_count"}
+    assert " IN " in str(stats_insert.select_stmt)
+    assert " IN " in str(tier_insert.select_stmt)
 
 
 @pytest.mark.asyncio
-async def test_refresh_all_plan_drug_statistics_batches_from_stage(monkeypatch):
-    calls = []
+async def test_refresh_all_plan_drug_statistics_uses_two_set_based_upserts(monkeypatch):
+    plan_drug, stats, tier_stats = _plan_drug_statistics_tables()
+    inserts = []
 
     async def fake_scalar(sql, **params):
         assert "to_regclass" in sql
         assert params["qualified_name"] == "mrf.plan_drug_raw_20260612"
         return "mrf.plan_drug_raw_20260612"
 
-    async def fake_all(sql):
-        calls.append(str(sql))
-        return [SimpleNamespace(plan_id="94529WI0240007"), ("94529WI0240008",)]
+    def fake_make_class(cls, suffix, schema_override=None):
+        table_by_cls = {
+            process_initial.PlanDrugRaw: plan_drug,
+            process_initial.PlanDrugStats: stats,
+            process_initial.PlanDrugTierStats: tier_stats,
+        }
+        return SimpleNamespace(
+            __tablename__=f"{cls.__tablename__}_{suffix}",
+            __table__=table_by_cls[cls],
+        )
 
-    async def fake_refresh(plan_ids, import_date, db_schema):
-        calls.append((set(plan_ids), import_date, db_schema))
+    async def fail_all(_sql):
+        raise AssertionError("all-plan refresh must not materialize plan IDs in Python")
 
-    monkeypatch.setattr(
-        process_initial,
-        "make_class",
-        lambda cls, suffix, schema_override=None: SimpleNamespace(__tablename__=f"{cls.__tablename__}_{suffix}"),
-    )
+    monkeypatch.setattr(process_initial, "make_class", fake_make_class)
     monkeypatch.setattr(process_initial.db, "scalar", fake_scalar)
-    monkeypatch.setattr(process_initial.db, "all", fake_all)
-    monkeypatch.setattr(process_initial, "_refresh_plan_drug_statistics", fake_refresh)
+    monkeypatch.setattr(process_initial.db, "all", fail_all)
+    monkeypatch.setattr(
+        process_initial.db,
+        "insert",
+        lambda table: _AggregateInsertSpy(table, inserts),
+    )
 
     await process_initial._refresh_all_plan_drug_statistics("20260612", "mrf")
 
-    assert "SELECT DISTINCT plan_id" in calls[0]
-    assert calls[1] == ({"94529WI0240007", "94529WI0240008"}, "20260612", "mrf")
+    assert len(inserts) == 2
+    for aggregate_insert in inserts:
+        aggregate_sql = str(aggregate_insert.select_stmt)
+        assert "plan_drug_raw_test.plan_id IS NOT NULL" in aggregate_sql
+        assert " IN " not in aggregate_sql
 
 
 @pytest.mark.asyncio

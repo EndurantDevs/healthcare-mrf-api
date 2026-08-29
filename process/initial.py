@@ -11,6 +11,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path, PurePath
@@ -756,10 +757,32 @@ def _mrf_address_summary_deferred_indexes(address_cls) -> list[dict]:
     ]
 
 
-async def _create_named_indexes(stage_cls, db_schema: str) -> None:
+async def _create_named_indexes(
+    stage_cls,
+    db_schema: str,
+    names: set[str] | None = None,
+) -> None:
     for attr_name in ("__my_initial_indexes__", "__my_additional_indexes__"):
         for index in getattr(stage_cls, attr_name, []) or []:
+            if names is not None and _index_name(index) not in names:
+                continue
             await db.status(_create_index_sql(stage_cls.__tablename__, index, db_schema))
+
+
+async def _ensure_staging_primary_index(stage_cls, db_schema: str) -> None:
+    """Give a fresh stage's constraint-backed primary index its stable publish name."""
+    index_columns = list(getattr(stage_cls, "__my_index_elements__", []) or [])
+    if not index_columns:
+        return
+    primary_columns = [column.name for column in stage_cls.__table__.primary_key.columns]
+    if index_columns != primary_columns:
+        raise RuntimeError(
+            f"{stage_cls.__tablename__} conflict columns must match its primary key"
+        )
+    await db.status(
+        f"ALTER INDEX {db_schema}.{stage_cls.__tablename__}_pkey "
+        f"RENAME TO {stage_cls.__tablename__}_idx_primary;"
+    )
 
 
 def _benefit_label_from_key(key):
@@ -1326,11 +1349,16 @@ _MRF_ADDRESS_SUMMARY_UPSERT_SQL = """
 """
 
 
-async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None:
+async def _refresh_mrf_address_summary(
+    import_date: str,
+    db_schema: str,
+    *,
+    rebuild_indexes: bool = True,
+) -> None:
     """Refresh the materialized MRF address summary for one import date."""
     address_cls = make_class(MRFAddress, import_date, schema_override=db_schema)
     evidence_cls = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
-    deferred_indexes = _mrf_address_summary_deferred_indexes(address_cls)
+    deferred_indexes = _mrf_address_summary_deferred_indexes(address_cls) if rebuild_indexes else []
     work_mem = _postgres_setting_value("HLTHPRT_MRF_ADDRESS_SUMMARY_WORK_MEM", "1GB")
     statement_timeout = os.environ.get("HLTHPRT_MRF_ADDRESS_SUMMARY_STATEMENT_TIMEOUT")
     upsert_sql = _MRF_ADDRESS_SUMMARY_UPSERT_SQL.format(
@@ -1392,17 +1420,8 @@ async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
             await db.create_table(staging_cls.__table__, checkfirst=True)
         except (ProgrammingError, DuplicateTableError, IntegrityError):
             logger.debug("Import staging table already exists: %s", staging_cls.__tablename__)
-        if hasattr(staging_cls, "__my_index_elements__") and staging_cls.__my_index_elements__:
-            cols = ", ".join(staging_cls.__my_index_elements__)
-            try:
-                await db.status(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS "
-                    + f"{staging_cls.__tablename__}_idx_primary ON "
-                    + f"{db_schema}.{staging_cls.__tablename__} ({cols});"
-                )
-            except IntegrityError:
-                logger.debug("Import staging primary index has conflicting rows: %s", staging_cls.__tablename__)
-        if cls in {PlanBenefitsMarketplace, MRFAddress, MRFAddressEvidence}:
+        await _ensure_staging_primary_index(staging_cls, db_schema)
+        if cls is PlanBenefitsMarketplace:
             await _create_named_indexes(staging_cls, db_schema)
 
     print("Preparing done")
@@ -2117,43 +2136,44 @@ _PLAN_DRUG_STATS_COLUMNS = (
 )
 
 
-def _plan_drug_stats_select(plan_drug_table, plan_ids):
-    return (
-        select(
-            plan_drug_table.c.plan_id.label("plan_id"),
-            func.count().label("total_drugs"),
-            func.count().filter(plan_drug_table.c.prior_authorization.is_(True)).label("auth_required"),
-            func.count()
-            .filter(
-                or_(
-                    plan_drug_table.c.prior_authorization.is_(False),
-                    plan_drug_table.c.prior_authorization.is_(None),
-                )
+def _plan_drug_stats_select(plan_drug_table, plan_ids=None):
+    statement = select(
+        plan_drug_table.c.plan_id.label("plan_id"),
+        func.count().label("total_drugs"),
+        func.count().filter(plan_drug_table.c.prior_authorization.is_(True)).label("auth_required"),
+        func.count()
+        .filter(
+            or_(
+                plan_drug_table.c.prior_authorization.is_(False),
+                plan_drug_table.c.prior_authorization.is_(None),
             )
-            .label("auth_not_required"),
-            func.count().filter(plan_drug_table.c.step_therapy.is_(True)).label("step_required"),
-            func.count()
-            .filter(
-                or_(
-                    plan_drug_table.c.step_therapy.is_(False),
-                    plan_drug_table.c.step_therapy.is_(None),
-                )
-            )
-            .label("step_not_required"),
-            func.count().filter(plan_drug_table.c.quantity_limit.is_(True)).label("quantity_limit"),
-            func.count()
-            .filter(
-                or_(
-                    plan_drug_table.c.quantity_limit.is_(False),
-                    plan_drug_table.c.quantity_limit.is_(None),
-                )
-            )
-            .label("quantity_no_limit"),
-            func.max(plan_drug_table.c.last_updated_on).label("last_updated_on"),
         )
-        .where(plan_drug_table.c.plan_id.in_(plan_ids))
-        .group_by(plan_drug_table.c.plan_id)
+        .label("auth_not_required"),
+        func.count().filter(plan_drug_table.c.step_therapy.is_(True)).label("step_required"),
+        func.count()
+        .filter(
+            or_(
+                plan_drug_table.c.step_therapy.is_(False),
+                plan_drug_table.c.step_therapy.is_(None),
+            )
+        )
+        .label("step_not_required"),
+        func.count().filter(plan_drug_table.c.quantity_limit.is_(True)).label("quantity_limit"),
+        func.count()
+        .filter(
+            or_(
+                plan_drug_table.c.quantity_limit.is_(False),
+                plan_drug_table.c.quantity_limit.is_(None),
+            )
+        )
+        .label("quantity_no_limit"),
+        func.max(plan_drug_table.c.last_updated_on).label("last_updated_on"),
     )
+    if plan_ids is None:
+        statement = statement.where(plan_drug_table.c.plan_id.is_not(None))
+    else:
+        statement = statement.where(plan_drug_table.c.plan_id.in_(plan_ids))
+    return statement.group_by(plan_drug_table.c.plan_id)
 
 
 def _plan_drug_stats_upsert(stats_table, stats_select):
@@ -2170,17 +2190,18 @@ def _plan_drug_stats_upsert(stats_table, stats_select):
     )
 
 
-def _plan_drug_tier_upsert(plan_drug_table, tier_table, plan_ids):
+def _plan_drug_tier_upsert(plan_drug_table, tier_table, plan_ids=None):
     tier_label = func.coalesce(plan_drug_table.c.drug_tier, literal("UNKNOWN"))
-    tier_select = (
-        select(
-            plan_drug_table.c.plan_id.label("plan_id"),
-            tier_label.label("drug_tier"),
-            func.count().label("drug_count"),
-        )
-        .where(plan_drug_table.c.plan_id.in_(plan_ids))
-        .group_by(plan_drug_table.c.plan_id, tier_label)
+    tier_select = select(
+        plan_drug_table.c.plan_id.label("plan_id"),
+        tier_label.label("drug_tier"),
+        func.count().label("drug_count"),
     )
+    if plan_ids is None:
+        tier_select = tier_select.where(plan_drug_table.c.plan_id.is_not(None))
+    else:
+        tier_select = tier_select.where(plan_drug_table.c.plan_id.in_(plan_ids))
+    tier_select = tier_select.group_by(plan_drug_table.c.plan_id, tier_label)
     tier_insert = db.insert(tier_table).from_select(
         ("plan_id", "drug_tier", "drug_count"),
         tier_select,
@@ -2193,14 +2214,16 @@ def _plan_drug_tier_upsert(plan_drug_table, tier_table, plan_ids):
 
 async def _refresh_plan_drug_statistics(plan_ids, import_date, db_schema):
     """Refresh aggregate drug statistics for the selected plans."""
-    plan_ids = [plan_id for plan_id in set(plan_ids) if plan_id]
-    if not plan_ids:
-        return
+    if plan_ids is not None:
+        plan_ids = [plan_id for plan_id in set(plan_ids) if plan_id]
+        if not plan_ids:
+            return
 
     plan_drug_table = make_class(PlanDrugRaw, import_date, schema_override=db_schema).__table__
     stats_table = make_class(PlanDrugStats, import_date, schema_override=db_schema).__table__
     tier_table = make_class(PlanDrugTierStats, import_date, schema_override=db_schema).__table__
-    for plan_id_chunk in _chunked(plan_ids):
+    plan_id_chunks = (None,) if plan_ids is None else _chunked(plan_ids)
+    for plan_id_chunk in plan_id_chunks:
         stats_select = _plan_drug_stats_select(plan_drug_table, plan_id_chunk)
         await _plan_drug_stats_upsert(stats_table, stats_select).status()
         await _plan_drug_tier_upsert(plan_drug_table, tier_table, plan_id_chunk).status()
@@ -2214,22 +2237,7 @@ async def _refresh_all_plan_drug_statistics(import_date, db_schema):
         logger.info("Skipping plan-drug stats refresh; %s does not exist", qualified_name)
         return
 
-    rows = await db.all(
-        text(
-            f"""
-            SELECT DISTINCT plan_id
-              FROM {qualified_name}
-             WHERE plan_id IS NOT NULL
-            """
-        )
-    )
-    plan_ids = []
-    for row in rows:
-        if hasattr(row, "plan_id"):
-            plan_ids.append(row.plan_id)
-        else:
-            plan_ids.append(row[0])
-    await _refresh_plan_drug_statistics(plan_ids, import_date, db_schema)
+    await _refresh_plan_drug_statistics(None, import_date, db_schema)
 
 
 async def _plan_summary_dependencies_ready(db_schema: str) -> tuple[bool, list[str]]:
@@ -3448,12 +3456,52 @@ async def publish_initial_generation(ctx, task):
             print(f"Failed Import: Plans number:{plans_count}")
             sys.exit(1)
 
-    await _refresh_all_plan_drug_statistics(import_date, db_schema)
-    await _refresh_mrf_address_summary(import_date, db_schema)
+    finalize_started = time.monotonic()
+    finalize_phase_timings = []
+
+    def record_finalize_phase(phase: str, started: float) -> None:
+        """Append one successful MRF finalization timing."""
+        elapsed = round(time.monotonic() - started, 3)
+        finalize_phase_timings.append(
+            {"phase": phase, "status": "succeeded", "elapsed_seconds": elapsed}
+        )
+        logger.info("MRF finalization phase complete: phase=%s elapsed_seconds=%s", phase, elapsed)
+
+    async def timed_finalize_phase(phase: str, awaitable):
+        """Await one MRF finalization phase and retain its elapsed time."""
+        started = time.monotonic()
+        result = await awaitable
+        record_finalize_phase(phase, started)
+        return result
+
+    mrf_address_stage = make_class(MRFAddress, import_date, schema_override=db_schema)
+    mrf_evidence_stage = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
+    await timed_finalize_phase(
+        "plan_drug_statistics",
+        _refresh_all_plan_drug_statistics(import_date, db_schema),
+    )
+    await timed_finalize_phase(
+        "mrf_address_summary",
+        _refresh_mrf_address_summary(import_date, db_schema, rebuild_indexes=False),
+    )
+    await timed_finalize_phase(
+        "mrf_address_summary_analyze",
+        db.status(f"ANALYZE {db_schema}.{mrf_address_stage.__tablename__};"),
+    )
+    fast_path_indexes_started = time.monotonic()
+    await _create_named_indexes(
+        mrf_address_stage,
+        db_schema,
+        names={"address_key"},
+    )
+    await _create_named_indexes(
+        mrf_evidence_stage,
+        db_schema,
+        names={"npi_type_checksum", "address_key"},
+    )
+    record_finalize_phase("mrf_address_fast_path_indexes", fast_path_indexes_started)
     address_stats = None
     if source_enabled("mrf") and not is_test_mode_enabled:
-        mrf_address_stage = make_class(MRFAddress, import_date, schema_override=db_schema)
-        mrf_evidence_stage = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
         address_field_map = {
             "first_line": "first_line",
             "second_line": "second_line",
@@ -3466,6 +3514,7 @@ async def publish_initial_generation(ctx, task):
             os.environ.get("HLTHPRT_ADDRESS_CANON_REPAIR_EXISTING"),
             ("yes", "y", "true", "1"),
         )
+        address_resolve_started = time.monotonic()
         await stamp_address_keys(
             mrf_address_stage.__tablename__,
             address_field_map,
@@ -3502,10 +3551,19 @@ async def publish_initial_generation(ctx, task):
             )
         else:
             logger.info("Skipping OpenAddresses archive backfill during MRF publish")
+        record_finalize_phase("mrf_address_resolution", address_resolve_started)
     elif is_test_mode_enabled:
         logger.info("Skipping MRF archive address resolve in test mode")
 
+    serving_indexes_started = time.monotonic()
+    await _create_named_indexes(mrf_address_stage, db_schema)
+    await _create_named_indexes(mrf_evidence_stage, db_schema)
+    await db.status(f"ANALYZE {db_schema}.{mrf_address_stage.__tablename__};")
+    await db.status(f"ANALYZE {db_schema}.{mrf_evidence_stage.__tablename__};")
+    record_finalize_phase("mrf_serving_indexes", serving_indexes_started)
+
     staging_tables_by_main_name = {}
+    publication_started = time.monotonic()
     async with db.transaction():
         for cls in (
             Issuer,
@@ -3561,6 +3619,7 @@ async def publish_initial_generation(ctx, task):
                         f"{db_schema}.{staging_cls.__tablename__}_idx_{index_name} RENAME TO "
                         f"{table}_idx_{index_name};"
                     )
+    record_finalize_phase("mrf_table_publication", publication_started)
 
     upsert_history = (
         db.insert(ImportHistory)
@@ -3582,15 +3641,22 @@ async def publish_initial_generation(ctx, task):
             )
             summary_rows = 0
         else:
-            summary_rows = await rebuild_plan_search_summary(test_mode=is_test_mode_enabled)
+            summary_rows = await timed_finalize_phase(
+                "mrf_plan_search_summary",
+                rebuild_plan_search_summary(test_mode=is_test_mode_enabled),
+            )
     else:
-        summary_rows = await rebuild_plan_search_summary(test_mode=is_test_mode_enabled)
+        summary_rows = await timed_finalize_phase(
+            "mrf_plan_search_summary",
+            rebuild_plan_search_summary(test_mode=is_test_mode_enabled),
+        )
     print("Plan search summary rows: ", summary_rows)
     start_time = ctx.get("context", {}).get("start")
     if start_time:
         print_time_info(start_time)
     else:
         logger.info("MRF finish context missing start time; skipping elapsed time output")
+    record_finalize_phase("mrf_finalize_total", finalize_started)
     if redis and state_run_id:
         await redis.set(_mrf_state_key(state_run_id, "finalized"), "1", ex=_mrf_run_state_ttl_seconds())
         _cleanup_mrf_run_chunks(ctx)
@@ -3602,6 +3668,7 @@ async def publish_initial_generation(ctx, task):
         metrics={
             "plans_count": plans_count,
             "summary_rows": summary_rows,
+            "mrf_finalize_phase_timings": finalize_phase_timings,
             **({"address_resolve": address_stats.__dict__} if address_stats else {}),
         },
         progress={"unit": "phase", "total": 4, "done": 4, "pct": 100, "message": "succeeded", "phase": "mrf import published"},
