@@ -8,6 +8,32 @@
     const VERSION_ID: &str = "fixture-version";
     const TEST_MAX_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024;
     const TEST_MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
+    // The zip crate supports LZMA decompression but not compression, so this is
+    // a single-member ZIP_LZMA archive containing the JSON fixture below.
+    const LZMA_JSON_ZIP_HEX: &str = concat!(
+        "504b03043f0002000e00ab2c1d5d9b43bbca9b030000080700000b0000007072696365732e6a736f6e090405005d0000",
+        "8000003d88890734343f5c43a628b219bee05b500e05cc8fbd2e749fb10217991c781ee89d5cf71683e44129163883a1",
+        "d76efe763809a032542011ff308358aab23851180d71cd7ccd6a2548aa0a7ee70ce2ddb1ed08da782bbe1deeb6b68b0a",
+        "066991046631766fa383cdee991244e19e387df5b4935ae87cf4409a6e518dc6a2e47b7e04394ff5c7b4d996b1aaf27e",
+        "cb276310e43307981fd485eeba35e02aaf00fb5f82953a4848fc57cce381e8b0cc0898f81c5a3142cf3d13a3b17e4346",
+        "7e6c694c04129fcf1f71ddff3a276bb8d1efb69f79522479f80e15504a923be34bca4ab658a4514893c315a1bd5e31e6",
+        "b4512d2f7c5cecd8f94d2d14f7513cec571818b527276f679595f2d481994d88abdaa48a3dbb16f7f74f286f8317de02",
+        "f1f9529be4f93f207fc866989808e60a79faaeb050cadb76970874390c84c96fbdaa0e150a8b63423a31dca6a25f39bd",
+        "52f470e2f4f78eee9488a9195a594bef694d7593e24498d723c458701e34ed2ee1fdd737fadd10016717ea8db5b848b3",
+        "61676ab945f6ecdaa437aa07397e9382b251cb1a0018c65e91efd837e93dd9728bfc2d4c9cc10f9ee868b21c1e7921a6",
+        "ab3ec4a6ffae0082fa6a00bacedb859dd4e44070270b5238ac67a99d6057bf58319bd856f5a12a022c5a758102a26cf1",
+        "33707930b3aefa6f33b1abb29416554828d52dba6a2336e76cf745696e47b09c15e0952bdafa0fbec6efb6f515d508f5",
+        "a2db39a42d278e70bafe58112c048f94720cdff552d8c4f45341fee337fab7950228ac33b990008311225dcbbd599235",
+        "f65195ee364cc8bc836130dd9a8865049a83b7d8c18f5ee80c4174b9a702a5ee73ccca746ff4cd5419898edfb84ab97c",
+        "713ec43a9160821eaef86097c8805c8711458a8f8b1a1c29e431ac7a4fb1af65db1d35c6aaa5d7f073259a457757c7ce",
+        "a00c9f35cebf42f3fb55a98c0445075b5244fb912929a95ca2633218c50cc846336e9bb10e6129b514c36fa5304339a8",
+        "1bdaa2bc89e67424c1eeae9759dde8c305e9080d13bc1b115a79e1f9d1a6916984634380bbbfb59e511468c6021619bb",
+        "f9751c876d8264f7cd7dea0fe3d70726c99c78224b37fd9ae1ed38bb102b12a4d1a19690eb842d3f65eae7359aca0e63",
+        "607a7419a6295b10e38913479f67ec228e37ddb56612b4b52511050342f2d413e36ac032b4a33aa1c4022d9a7c040b96",
+        "82ef4cfdf1d67219eece41a6638000b64f54e19f5a356af83155f6303f229883d255b46b717799445ec8f91fc62739ff",
+        "4ce2a100504b01023f033f0002000e00ab2c1d5d9b43bbca9b030000080700000b000000000000000000000080010000",
+        "00007072696365732e6a736f6e504b0506000000000100010039000000c40300000000",
+    );
 
     fn fixture_json() -> Vec<u8> {
         serde_json::to_vec(&json!({
@@ -321,13 +347,16 @@
         payload: &[u8],
         method: CompressionMethod,
     ) -> BTreeMap<String, Vec<u8>> {
+        run_zip_archive(
+            format,
+            &zip_bytes(&[("folder/", b""), ("prices.mrf", payload)], method),
+        )
+    }
+
+    fn run_zip_archive(format: InputFormat, archive: &[u8]) -> BTreeMap<String, Vec<u8>> {
         let directory = tempfile::tempdir().unwrap();
         let input_path = directory.path().join("input.bin");
-        fs::write(
-            &input_path,
-            zip_bytes(&[("folder/", b""), ("prices.mrf", payload)], method),
-        )
-        .unwrap();
+        fs::write(&input_path, archive).unwrap();
         let output_directory = directory.path().join("output");
         fs::create_dir(&output_directory).unwrap();
         let summary = import_hospital_mrf(

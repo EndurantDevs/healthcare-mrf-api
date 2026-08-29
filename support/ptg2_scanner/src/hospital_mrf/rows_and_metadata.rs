@@ -71,7 +71,11 @@ struct ContractProvision {
         deserialize_with = "deserialize_optional_json_retained_string"
     )]
     plan_name: Option<String>,
-    #[serde(deserialize_with = "deserialize_json_retained_string")]
+    #[serde(
+        alias = "provision",
+        alias = "description",
+        deserialize_with = "deserialize_json_retained_string"
+    )]
     provisions: String,
 }
 

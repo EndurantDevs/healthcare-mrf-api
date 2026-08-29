@@ -15,7 +15,7 @@
     }
 
     #[test]
-    fn stored_and_deflated_zip_emit_identical_copy_rows() {
+    fn supported_zip_methods_emit_identical_copy_rows() {
         let mut bom_json = b"\xEF\xBB\xBF".to_vec();
         bom_json.extend(fixture_json());
         for (format, payload) in [
@@ -27,6 +27,17 @@
                 assert_eq!(run_zip_fixture(format, &payload, method), expected);
             }
         }
+        let lzma_archive = LZMA_JSON_ZIP_HEX
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            run_zip_archive(InputFormat::Json, &lzma_archive),
+            run_fixture(InputFormat::Json, &fixture_json(), false)
+        );
     }
 
     #[test]

@@ -72,7 +72,9 @@ fn import_zip_payload(
     if members.iter().any(|member| {
         !matches!(
             member.3,
-            zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated
+            zip::CompressionMethod::Stored
+                | zip::CompressionMethod::Deflated
+                | zip::CompressionMethod::Lzma
         )
     }) {
         return Err(io::Error::new(

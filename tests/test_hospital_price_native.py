@@ -48,7 +48,7 @@ def _csv(headers):
         (
             _csv([
                 "description",
-                "standard_charge|Payer|Plan|negotiated_dollar",
+                "standard_charge | Payer | Plan | negotiated_dollar",
             ]),
             "csv-wide",
         ),
@@ -60,7 +60,7 @@ def test_format_detection_plain_and_gzip(tmp_path, payload, expected):
     compressed = tmp_path / "input.gz"
     compressed.write_bytes(gzip.compress(payload))
     archived = tmp_path / "input.zip"
-    with zipfile.ZipFile(archived, "w", zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(archived, "w", zipfile.ZIP_LZMA) as archive:
         archive.writestr("folder/", b"")
         archive.writestr("prices.mrf", payload)
 

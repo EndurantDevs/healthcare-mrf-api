@@ -16,10 +16,11 @@ import stat
 import tempfile
 import threading
 import uuid
+from collections.abc import Awaitable, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Iterator, TypeVar
+from typing import Any, TypeVar
 
 from process.ptg_parts.artifacts import PTG2ArtifactStore, sha256_file
 
@@ -1151,6 +1152,27 @@ class PTG2InputArtifactGCResult:
         return max(self.total_bytes_after - self.target_bytes, 0)
 
 
+@dataclass(frozen=True)
+class _ArtifactCollectionPolicy:
+    current_time: datetime.datetime
+    retention_seconds: float
+    min_age_seconds: float
+    target_bytes: int | None
+    max_delete_bytes: int | None
+    max_delete_files: int | None
+
+
+@dataclass(frozen=True)
+class _ArtifactCollectionPlan:
+    manifest_before: int
+    active_ids: tuple[str, ...]
+    stale_leases: tuple[_StaleLease, ...]
+    stored_artifacts: list[_StoredArtifact]
+    newly_unleased_paths: set[Path]
+    eligible_artifacts: list[_StoredArtifact]
+    selected_artifacts: list[_StoredArtifact]
+
+
 def _active_lease_references_locked(
     store: PTG2ArtifactStore,
     *,
@@ -1548,6 +1570,156 @@ def _prune_unleased_metadata_locked(store: PTG2ArtifactStore) -> None:
             marker_path.unlink(missing_ok=True)
 
 
+def _resolve_artifact_collection_policy(
+    now: datetime.datetime | None,
+    retention_hours: float | None,
+    min_age_hours: float | None,
+    target_bytes: int | None,
+    max_delete_bytes: int | None,
+    max_delete_files: int | None,
+) -> _ArtifactCollectionPolicy:
+    current_time = now or _utcnow()
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=datetime.UTC)
+    current_time = current_time.astimezone(datetime.UTC)
+    retention_value = (
+        retention_hours if retention_hours is not None
+        else _env_float(PTG2_INPUT_ARTIFACT_RETENTION_HOURS_ENV, DEFAULT_RETENTION_HOURS)
+    )
+    min_age_value = (
+        min_age_hours if min_age_hours is not None
+        else _env_float(PTG2_INPUT_ARTIFACT_MIN_AGE_HOURS_ENV, DEFAULT_MIN_AGE_HOURS)
+    )
+    if target_bytes == DEFAULT_TARGET_BYTES and os.getenv(PTG2_INPUT_ARTIFACT_TARGET_BYTES_ENV):
+        target_bytes = _env_int(PTG2_INPUT_ARTIFACT_TARGET_BYTES_ENV, DEFAULT_TARGET_BYTES)
+    if max_delete_bytes == DEFAULT_MAX_DELETE_BYTES and os.getenv(PTG2_INPUT_ARTIFACT_MAX_DELETE_BYTES_ENV):
+        max_delete_bytes = _env_int(
+            PTG2_INPUT_ARTIFACT_MAX_DELETE_BYTES_ENV, DEFAULT_MAX_DELETE_BYTES,
+        )
+    if max_delete_files == DEFAULT_MAX_DELETE_FILES and os.getenv(PTG2_INPUT_ARTIFACT_MAX_DELETE_FILES_ENV):
+        max_delete_files = _env_int(
+            PTG2_INPUT_ARTIFACT_MAX_DELETE_FILES_ENV, DEFAULT_MAX_DELETE_FILES,
+        )
+    return _ArtifactCollectionPolicy(
+        current_time=current_time,
+        retention_seconds=max(float(retention_value), 0.0) * 3600,
+        min_age_seconds=max(float(min_age_value), 0.0) * 3600,
+        target_bytes=target_bytes,
+        max_delete_bytes=max_delete_bytes,
+        max_delete_files=max_delete_files,
+    )
+
+
+def _exclude_newly_discovered_artifacts(
+    store: PTG2ArtifactStore,
+    selected_artifacts: list[_StoredArtifact],
+    discovered_unleased: Iterable[Path],
+    stale_unleased: dict[str, datetime.datetime],
+) -> list[_StoredArtifact]:
+    # Unknown files first discovered by this collector always receive one
+    # complete cycle. Expired leases already have a durable unleased boundary.
+    stale_paths = {store.root / relative_path for relative_path in stale_unleased}
+    unknown_discovered_paths = set(discovered_unleased) - stale_paths
+    return [
+        artifact
+        for artifact in selected_artifacts
+        if artifact.path not in unknown_discovered_paths
+    ]
+
+
+def _plan_artifact_collection_locked(
+    store: PTG2ArtifactStore,
+    policy: _ArtifactCollectionPolicy,
+    execute: bool,
+) -> _ArtifactCollectionPlan:
+    manifest_before = _validate_manifest_locked(store)
+    exact_paths, prefixes, active_ids, stale_leases = _active_lease_references_locked(
+        store, now=policy.current_time,
+    )
+    stale_unleased = _stale_unleased_candidates_locked(
+        store, stale_leases,
+        active_exact_paths=exact_paths, active_prefixes=prefixes,
+    )
+    newly_unleased_paths: set[Path] = set()
+    if execute:
+        _prune_atomic_metadata_temps_locked(store)
+        for stale_lease in stale_leases:
+            stale_lease.path.unlink(missing_ok=True)
+        for relative_path, unleased_since in sorted(stale_unleased.items()):
+            if _mark_unleased_locked(store, relative_path, now=unleased_since):
+                newly_unleased_paths.add(store.root / relative_path)
+    stored_artifacts, discovered_unleased = _stored_artifacts_locked(
+        store, exact_paths=exact_paths, prefixes=prefixes,
+        persist_unleased=execute, observation_time=policy.current_time,
+        unleased_since_overrides=stale_unleased,
+    )
+    newly_unleased_paths.update(discovered_unleased)
+    eligible_artifacts, selected_artifacts = _select_artifacts(
+        stored_artifacts, now_timestamp=policy.current_time.timestamp(),
+        retention_seconds=policy.retention_seconds,
+        min_age_seconds=policy.min_age_seconds,
+        target_bytes=policy.target_bytes,
+        max_delete_bytes=policy.max_delete_bytes,
+        max_delete_files=policy.max_delete_files,
+    )
+    return _ArtifactCollectionPlan(
+        manifest_before=manifest_before,
+        active_ids=active_ids,
+        stale_leases=stale_leases,
+        stored_artifacts=stored_artifacts,
+        newly_unleased_paths=newly_unleased_paths,
+        eligible_artifacts=eligible_artifacts,
+        selected_artifacts=_exclude_newly_discovered_artifacts(
+            store, selected_artifacts, discovered_unleased, stale_unleased,
+        ),
+    )
+
+
+def _finish_artifact_collection_locked(
+    store: PTG2ArtifactStore,
+    policy: _ArtifactCollectionPolicy,
+    plan: _ArtifactCollectionPlan,
+    execute: bool,
+) -> PTG2InputArtifactGCResult:
+    deleted_files: list[Path] = []
+    deleted_bytes = 0
+    manifest_before = manifest_after = plan.manifest_before
+    manifest_invalid = 0
+    if execute:
+        for artifact in plan.stored_artifacts:
+            if artifact.protected:
+                _clear_unleased_locked(store, artifact.relative_path)
+        for artifact in plan.selected_artifacts:
+            try:
+                artifact.path.unlink()
+            except FileNotFoundError:
+                continue
+            _clear_unleased_locked(store, artifact.relative_path)
+            deleted_files.append(artifact.path)
+            deleted_bytes += artifact.size
+        _prune_empty_artifact_directories(store)
+        _prune_unleased_metadata_locked(store)
+        manifest_before, manifest_after, manifest_invalid = _compact_manifest_locked(store)
+    total_before = sum(artifact.size for artifact in plan.stored_artifacts)
+    return PTG2InputArtifactGCResult(
+        executed=execute, root=store.root, active_lease_ids=plan.active_ids,
+        stale_lease_files=tuple(lease.path for lease in plan.stale_leases),
+        protected_files=tuple(
+            artifact.path for artifact in plan.stored_artifacts if artifact.protected
+        ),
+        newly_unleased_files=tuple(sorted(plan.newly_unleased_paths)),
+        eligible_files=tuple(artifact.path for artifact in plan.eligible_artifacts),
+        selected_files=tuple(artifact.path for artifact in plan.selected_artifacts),
+        deleted_files=tuple(deleted_files), total_bytes_before=total_before,
+        total_bytes_after=total_before - deleted_bytes,
+        selected_bytes=sum(artifact.size for artifact in plan.selected_artifacts),
+        deleted_bytes=deleted_bytes, target_bytes=policy.target_bytes,
+        manifest_entries_before=manifest_before,
+        manifest_entries_after=manifest_after,
+        manifest_invalid_lines=manifest_invalid,
+    )
+
+
 def collect_ptg2_input_artifacts(
     *,
     root: str | Path | None = None,
@@ -1562,132 +1734,13 @@ def collect_ptg2_input_artifacts(
     """Plan or execute one race-safe, bounded retained-input collection cycle."""
 
     store = PTG2ArtifactStore(root)
-    current_time = now or _utcnow()
-    if current_time.tzinfo is None:
-        current_time = current_time.replace(tzinfo=datetime.UTC)
-    current_time = current_time.astimezone(datetime.UTC)
-    retention_value = (
-        retention_hours
-        if retention_hours is not None
-        else _env_float(PTG2_INPUT_ARTIFACT_RETENTION_HOURS_ENV, DEFAULT_RETENTION_HOURS)
+    policy = _resolve_artifact_collection_policy(
+        now, retention_hours, min_age_hours, target_bytes,
+        max_delete_bytes, max_delete_files,
     )
-    min_age_value = (
-        min_age_hours
-        if min_age_hours is not None
-        else _env_float(PTG2_INPUT_ARTIFACT_MIN_AGE_HOURS_ENV, DEFAULT_MIN_AGE_HOURS)
-    )
-    if target_bytes == DEFAULT_TARGET_BYTES and os.getenv(PTG2_INPUT_ARTIFACT_TARGET_BYTES_ENV):
-        target_bytes = _env_int(PTG2_INPUT_ARTIFACT_TARGET_BYTES_ENV, DEFAULT_TARGET_BYTES)
-    if max_delete_bytes == DEFAULT_MAX_DELETE_BYTES and os.getenv(PTG2_INPUT_ARTIFACT_MAX_DELETE_BYTES_ENV):
-        max_delete_bytes = _env_int(
-            PTG2_INPUT_ARTIFACT_MAX_DELETE_BYTES_ENV,
-            DEFAULT_MAX_DELETE_BYTES,
-        )
-    if max_delete_files == DEFAULT_MAX_DELETE_FILES and os.getenv(PTG2_INPUT_ARTIFACT_MAX_DELETE_FILES_ENV):
-        max_delete_files = _env_int(
-            PTG2_INPUT_ARTIFACT_MAX_DELETE_FILES_ENV,
-            DEFAULT_MAX_DELETE_FILES,
-        )
-    retention_seconds = max(float(retention_value), 0.0) * 3600
-    min_age_seconds = max(float(min_age_value), 0.0) * 3600
-    deleted_files: list[Path] = []
-    deleted_bytes = 0
-    manifest_before = 0
-    manifest_after = 0
-    manifest_invalid = 0
-    newly_unleased_paths: set[Path] = set()
-
     with store.retention_lock():
-        manifest_before = _validate_manifest_locked(store)
-        manifest_after = manifest_before
-        exact_paths, prefixes, active_ids, stale_leases = _active_lease_references_locked(
-            store,
-            now=current_time,
-        )
-        stale_unleased = _stale_unleased_candidates_locked(
-            store,
-            stale_leases,
-            active_exact_paths=exact_paths,
-            active_prefixes=prefixes,
-        )
-        if execute:
-            _prune_atomic_metadata_temps_locked(store)
-            for stale_lease in stale_leases:
-                stale_lease.path.unlink(missing_ok=True)
-            for relative_path, unleased_since in sorted(stale_unleased.items()):
-                if _mark_unleased_locked(store, relative_path, now=unleased_since):
-                    newly_unleased_paths.add(store.root / relative_path)
-        stored_artifacts, discovered_unleased = _stored_artifacts_locked(
-            store,
-            exact_paths=exact_paths,
-            prefixes=prefixes,
-            persist_unleased=execute,
-            observation_time=current_time,
-            unleased_since_overrides=stale_unleased,
-        )
-        newly_unleased_paths.update(discovered_unleased)
-        eligible_artifacts, selected_artifacts = _select_artifacts(
-            stored_artifacts,
-            now_timestamp=current_time.timestamp(),
-            retention_seconds=retention_seconds,
-            min_age_seconds=min_age_seconds,
-            target_bytes=target_bytes,
-            max_delete_bytes=max_delete_bytes,
-            max_delete_files=max_delete_files,
-        )
-        # Unknown files first discovered by this collector always receive one
-        # complete cycle. Expired leases are different: their explicit expiry
-        # is already a durable, heartbeat-backed unleased boundary.
-        stale_paths = {store.root / relative_path for relative_path in stale_unleased}
-        unknown_discovered_paths = set(discovered_unleased) - stale_paths
-        selected_artifacts = [
-            artifact
-            for artifact in selected_artifacts
-            if artifact.path not in unknown_discovered_paths
-        ]
-        if execute:
-            for artifact in stored_artifacts:
-                if artifact.protected:
-                    _clear_unleased_locked(store, artifact.relative_path)
-            for artifact in selected_artifacts:
-                try:
-                    artifact.path.unlink()
-                except FileNotFoundError:
-                    continue
-                _clear_unleased_locked(store, artifact.relative_path)
-                deleted_files.append(artifact.path)
-                deleted_bytes += artifact.size
-            _prune_empty_artifact_directories(store)
-            _prune_unleased_metadata_locked(store)
-            manifest_before, manifest_after, manifest_invalid = _compact_manifest_locked(store)
-
-    total_before = sum(artifact.size for artifact in stored_artifacts)
-    total_after = total_before - deleted_bytes
-    return PTG2InputArtifactGCResult(
-        executed=execute,
-        root=store.root,
-        active_lease_ids=active_ids,
-        stale_lease_files=tuple(stale_lease.path for stale_lease in stale_leases),
-        protected_files=tuple(
-            artifact.path for artifact in stored_artifacts if artifact.protected
-        ),
-        newly_unleased_files=tuple(sorted(newly_unleased_paths)),
-        eligible_files=tuple(
-            artifact.path for artifact in eligible_artifacts
-        ),
-        selected_files=tuple(
-            artifact.path for artifact in selected_artifacts
-        ),
-        deleted_files=tuple(deleted_files),
-        total_bytes_before=total_before,
-        total_bytes_after=total_after,
-        selected_bytes=sum(artifact.size for artifact in selected_artifacts),
-        deleted_bytes=deleted_bytes,
-        target_bytes=target_bytes,
-        manifest_entries_before=manifest_before,
-        manifest_entries_after=manifest_after,
-        manifest_invalid_lines=manifest_invalid,
-    )
+        plan = _plan_artifact_collection_locked(store, policy, execute)
+        return _finish_artifact_collection_locked(store, policy, plan, execute)
 
 
 def _optional_nonnegative(value: int) -> int | None:

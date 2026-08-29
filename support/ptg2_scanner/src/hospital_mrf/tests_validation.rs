@@ -153,6 +153,31 @@
     }
 
     #[test]
+    fn contract_provision_aliases_emit_canonical_text() {
+        for (alias, text) in [
+            ("provision", "Singular contract terms"),
+            ("description", "Described contract terms"),
+        ] {
+            let mut payload: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
+            let provision = payload["general_contract_provisions"][0]
+                .as_object_mut()
+                .unwrap();
+            provision.remove("provisions");
+            provision.insert(alias.to_owned(), json!(text));
+
+            let rows = run_fixture(
+                InputFormat::Json,
+                &serde_json::to_vec(&payload).unwrap(),
+                false,
+            );
+            assert_eq!(
+                String::from_utf8(rows["contract_provision"].clone()).unwrap(),
+                format!("fixture-version\t0\t\\N\t\\N\t{text}\n")
+            );
+        }
+    }
+
+    #[test]
     fn structurally_v3_json_preserves_declared_template_version() {
         let mut payload: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
         payload["version"] = json!("2.0.0");

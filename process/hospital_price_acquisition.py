@@ -42,6 +42,10 @@ from process.ptg_parts.source_download import (
 
 
 REGISTRY_VERSION = 1
+_HOSPITAL_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
 
 
 @dataclass(frozen=True)
@@ -251,6 +255,7 @@ async def fetch_locator(
             url, store=store, reuse_raw_artifacts=False,
             max_bytes=MAX_HOSPITAL_HPT_LOCATOR_BYTES,
             keep_partial_artifacts=False, exact_get_evidence=True,
+            user_agent=_HOSPITAL_USER_AGENT,
         )
         payload = await asyncio.to_thread(Path(raw.raw_path).read_bytes)
         records = parse_hospital_hpt_locator(payload)
@@ -365,6 +370,7 @@ async def download_source(
             raw = await download_raw_artifact(
                 request_url, store=store, reuse_raw_artifacts=False,
                 max_bytes=max_bytes, keep_partial_artifacts=False,
+                user_agent=_HOSPITAL_USER_AGENT,
             )
         except (ImportCancelledError, asyncio.CancelledError):
             raise

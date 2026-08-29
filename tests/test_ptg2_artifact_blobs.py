@@ -68,8 +68,14 @@ async def test_store_ptg2_artifact_honors_per_artifact_chunk_size(monkeypatch, t
     artifact_path = tmp_path / "provider-graph.ptg2sc"
     artifact_path.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
     fake_db = FakeDB()
+    resolved_schema_names = []
 
     monkeypatch.setattr(artifact_blobs, "db", fake_db)
+    monkeypatch.setattr(
+        artifact_blobs,
+        "resolve_ptg2_schema",
+        lambda schema_name: resolved_schema_names.append(schema_name) or "write_schema",
+    )
 
     stored = await artifact_blobs.store_ptg2_artifact_file_in_db(
         artifact_path,
@@ -85,6 +91,7 @@ async def test_store_ptg2_artifact_honors_per_artifact_chunk_size(monkeypatch, t
         if "INSERT INTO" in sql and "ptg2_artifact_blob_chunk" in sql
     ]
     assert len(chunk_inserts) == 3
+    assert resolved_schema_names == [None]
     assert stored["chunk_bytes"] == 1024 * 1024
     assert not any(
         sql.lstrip().upper().startswith(("CREATE ", "ALTER ", "DROP "))

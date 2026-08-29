@@ -11,6 +11,7 @@ import datetime
 import json
 import os
 import zlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -166,26 +167,34 @@ def _json_param(value: Mapping[str, Any]) -> str:
     return json.dumps(dict(value), sort_keys=True, default=str, separators=(",", ":"))
 
 
-async def store_ptg2_artifact_file(
-    path: str | Path,
-    *,
-    snapshot_id: str | None,
-    artifact_kind: str,
-    name: str | None = None,
-    import_run_id: str | None = None,
-    schema_name: str | None = None,
-    metadata: Mapping[str, Any] | None = None,
-    retain_local_cache: bool | None = None,
-) -> dict[str, Any]:
-    """Store an artifact file in PostgreSQL chunks and return manifest metadata."""
+@dataclass(frozen=True)
+class _ArtifactUpload:
+    path: Path
+    sha256: str
+    byte_count: int
+    artifact_id: str
+    chunk_size: int
+    compression_level: int
+    compression: str
+    storage_uri: str
+    schema: str
+    qualified_chunks: str
+    qualified_manifest: str
+    metadata_map: dict[str, Any]
 
+
+def _artifact_upload_input(
+    path: str | Path,
+    metadata: Mapping[str, Any] | None,
+    name: str | None,
+    artifact_kind: str,
+) -> tuple[Path, dict[str, Any], str | None, int | None]:
     artifact_path = Path(path)
     artifact_entry_map = dict(metadata or {})
     artifact_entry_map.setdefault("name", name or artifact_kind)
     artifact_entry_map.setdefault("path", str(artifact_path))
     if not artifact_path.exists() or artifact_path.stat().st_size <= 0:
-        return artifact_entry_map
-
+        return artifact_path, artifact_entry_map, None, None
     artifact_sha, byte_count = sha256_file(artifact_path)
     expected_sha = str(artifact_entry_map.get("sha256") or artifact_sha)
     expected_byte_count = int(artifact_entry_map.get("byte_count") or byte_count)
@@ -193,13 +202,20 @@ async def store_ptg2_artifact_file(
         raise ValueError(f"artifact checksum changed before PostgreSQL upload: {artifact_path}")
     if expected_byte_count != byte_count:
         raise ValueError(f"artifact byte_count changed before PostgreSQL upload: {artifact_path}")
+    return artifact_path, artifact_entry_map, artifact_sha, byte_count
 
-    if retain_local_cache is None:
-        retain_local_cache = ptg2_artifact_db_retain_local_cache()
-    if not retain_local_cache:
-        artifact_entry_map.pop("path", None)
-        artifact_entry_map.pop("cache_path", None)
 
+def _prepare_artifact_upload(
+    artifact_path: Path,
+    artifact_entry_map: dict[str, Any],
+    *,
+    snapshot_id: str | None,
+    artifact_kind: str,
+    name: str | None,
+    schema_name: str | None,
+    artifact_sha: str,
+    byte_count: int,
+) -> _ArtifactUpload:
     schema = resolve_ptg2_schema(schema_name)
     artifact_name = str(artifact_entry_map.get("name") or name or artifact_kind)
     artifact_id = _artifact_id_for(
@@ -218,9 +234,7 @@ async def store_ptg2_artifact_file(
     compression_level = _artifact_db_compression_level()
     compression = "zlib" if compression_level > 0 else "none"
     storage_uri = ptg2_db_artifact_uri(artifact_id)
-    qualified_chunks = f"{_quote_ident(schema)}.ptg2_artifact_blob_chunk"
-    qualified_manifest = f"{_quote_ident(schema)}.ptg2_artifact_manifest"
-    artifact_blob_metadata_map = {
+    metadata_map = {
         **artifact_entry_map,
         "storage": "postgresql_chunks_v1",
         "storage_uri": storage_uri,
@@ -228,89 +242,147 @@ async def store_ptg2_artifact_file(
         "compression": compression,
         "compression_level": compression_level,
     }
+    return _ArtifactUpload(
+        artifact_path, artifact_sha, byte_count, artifact_id,
+        chunk_size, compression_level, compression, storage_uri,
+        schema,
+        f"{_quote_ident(schema)}.ptg2_artifact_blob_chunk",
+        f"{_quote_ident(schema)}.ptg2_artifact_manifest",
+        metadata_map,
+    )
+
+
+async def _replace_artifact_chunks(session: Any, upload: _ArtifactUpload) -> None:
+    await session.execute(
+        text(f"DELETE FROM {upload.qualified_chunks} WHERE artifact_id = :artifact_id"),
+        {"artifact_id": upload.artifact_id},
+    )
+    chunk_no = 0
+    with upload.path.open("rb") as artifact_file:
+        for raw_chunk in iter(lambda: artifact_file.read(upload.chunk_size), b""):
+            stored_chunk_bytes = (
+                zlib.compress(raw_chunk, upload.compression_level)
+                if upload.compression == "zlib"
+                else raw_chunk
+            )
+            await session.execute(
+                text(
+                    f"""
+                    INSERT INTO {upload.qualified_chunks}
+                        (artifact_id, chunk_no, compression, payload, raw_byte_count, byte_count, created_at)
+                    VALUES
+                        (:artifact_id, :chunk_no, :compression, :payload, :raw_byte_count, :byte_count, :created_at)
+                    """
+                ),
+                {
+                    "artifact_id": upload.artifact_id,
+                    "chunk_no": chunk_no,
+                    "compression": upload.compression,
+                    "payload": stored_chunk_bytes,
+                    "raw_byte_count": len(raw_chunk),
+                    "byte_count": len(stored_chunk_bytes),
+                    "created_at": _utcnow(),
+                },
+            )
+            chunk_no += 1
+
+
+async def _upsert_artifact_manifest(
+    session: Any,
+    upload: _ArtifactUpload,
+    *,
+    snapshot_id: str | None,
+    import_run_id: str | None,
+    artifact_kind: str,
+) -> None:
+    await session.execute(
+        text(
+            f"""
+            INSERT INTO {upload.qualified_manifest}
+                (artifact_id, snapshot_id, import_run_id, artifact_kind, storage_uri, sha256, byte_count, payload, created_at)
+            VALUES
+                (:artifact_id, :snapshot_id, :import_run_id, :artifact_kind, :storage_uri, :sha256, :byte_count,
+                 CAST(:payload AS json), :created_at)
+            ON CONFLICT (artifact_id) DO UPDATE SET
+                snapshot_id = EXCLUDED.snapshot_id,
+                import_run_id = EXCLUDED.import_run_id,
+                artifact_kind = EXCLUDED.artifact_kind,
+                storage_uri = EXCLUDED.storage_uri,
+                sha256 = EXCLUDED.sha256,
+                byte_count = EXCLUDED.byte_count,
+                payload = EXCLUDED.payload,
+                created_at = EXCLUDED.created_at
+            """
+        ),
+        {
+            "artifact_id": upload.artifact_id,
+            "snapshot_id": snapshot_id,
+            "import_run_id": import_run_id,
+            "artifact_kind": artifact_kind,
+            "storage_uri": upload.storage_uri,
+            "sha256": upload.sha256,
+            "byte_count": upload.byte_count,
+            "payload": _json_param(upload.metadata_map),
+            "created_at": _utcnow(),
+        },
+    )
+
+
+async def store_ptg2_artifact_file(
+    path: str | Path,
+    *,
+    snapshot_id: str | None,
+    artifact_kind: str,
+    name: str | None = None,
+    import_run_id: str | None = None,
+    schema_name: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    retain_local_cache: bool | None = None,
+) -> dict[str, Any]:
+    """Store an artifact file in PostgreSQL chunks and return manifest metadata."""
+
+    artifact_path, artifact_entry_map, artifact_sha, byte_count = (
+        _artifact_upload_input(path, metadata, name, artifact_kind)
+    )
+    if artifact_sha is None or byte_count is None:
+        return artifact_entry_map
+
+    if retain_local_cache is None:
+        retain_local_cache = ptg2_artifact_db_retain_local_cache()
+    if not retain_local_cache:
+        artifact_entry_map.pop("path", None)
+        artifact_entry_map.pop("cache_path", None)
+
+    upload = _prepare_artifact_upload(
+        artifact_path, artifact_entry_map, snapshot_id=snapshot_id,
+        artifact_kind=artifact_kind, name=name, schema_name=schema_name,
+        artifact_sha=artifact_sha, byte_count=byte_count,
+    )
 
     async with db.transaction() as session:
         if snapshot_id or import_run_id:
             await lock_writable_snapshot(
                 session,
                 db,
-                schema_name=schema,
+                schema_name=upload.schema,
                 snapshot_id=snapshot_id or "",
                 internal_run_id=import_run_id,
             )
-        await session.execute(
-            text(f"DELETE FROM {qualified_chunks} WHERE artifact_id = :artifact_id"),
-            {"artifact_id": artifact_id},
-        )
-        chunk_no = 0
-        with artifact_path.open("rb") as fp:
-            for raw_chunk in iter(lambda: fp.read(chunk_size), b""):
-                stored_chunk_bytes = (
-                    zlib.compress(raw_chunk, compression_level)
-                    if compression == "zlib"
-                    else raw_chunk
-                )
-                await session.execute(
-                    text(
-                        f"""
-                        INSERT INTO {qualified_chunks}
-                            (artifact_id, chunk_no, compression, payload, raw_byte_count, byte_count, created_at)
-                        VALUES
-                            (:artifact_id, :chunk_no, :compression, :payload, :raw_byte_count, :byte_count, :created_at)
-                        """
-                    ),
-                    {
-                        "artifact_id": artifact_id,
-                        "chunk_no": chunk_no,
-                        "compression": compression,
-                        "payload": stored_chunk_bytes,
-                        "raw_byte_count": len(raw_chunk),
-                        "byte_count": len(stored_chunk_bytes),
-                        "created_at": _utcnow(),
-                    },
-                )
-                chunk_no += 1
-        await session.execute(
-            text(
-                f"""
-                INSERT INTO {qualified_manifest}
-                    (artifact_id, snapshot_id, import_run_id, artifact_kind, storage_uri, sha256, byte_count, payload, created_at)
-                VALUES
-                    (:artifact_id, :snapshot_id, :import_run_id, :artifact_kind, :storage_uri, :sha256, :byte_count,
-                     CAST(:payload AS json), :created_at)
-                ON CONFLICT (artifact_id) DO UPDATE SET
-                    snapshot_id = EXCLUDED.snapshot_id,
-                    import_run_id = EXCLUDED.import_run_id,
-                    artifact_kind = EXCLUDED.artifact_kind,
-                    storage_uri = EXCLUDED.storage_uri,
-                    sha256 = EXCLUDED.sha256,
-                    byte_count = EXCLUDED.byte_count,
-                    payload = EXCLUDED.payload,
-                    created_at = EXCLUDED.created_at
-                """
-            ),
-            {
-                "artifact_id": artifact_id,
-                "snapshot_id": snapshot_id,
-                "import_run_id": import_run_id,
-                "artifact_kind": artifact_kind,
-                "storage_uri": storage_uri,
-                "sha256": artifact_sha,
-                "byte_count": byte_count,
-                "payload": _json_param(artifact_blob_metadata_map),
-                "created_at": _utcnow(),
-            },
+        await _replace_artifact_chunks(session, upload)
+        await _upsert_artifact_manifest(
+            session, upload, snapshot_id=snapshot_id,
+            import_run_id=import_run_id, artifact_kind=artifact_kind,
         )
 
     artifact_entry_map.update(
         {
-            "artifact_id": artifact_id,
+            "artifact_id": upload.artifact_id,
             "storage": "postgresql_chunks_v1",
-            "storage_uri": storage_uri,
+            "storage_uri": upload.storage_uri,
             "sha256": artifact_sha,
             "byte_count": byte_count,
-            "chunk_bytes": chunk_size,
-            "compression": compression,
+            "chunk_bytes": upload.chunk_size,
+            "compression": upload.compression,
         }
     )
     if not retain_local_cache:

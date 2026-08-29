@@ -144,13 +144,20 @@ def _public_connector() -> aiohttp.TCPConnector:
     return aiohttp.TCPConnector(resolver=_PublicResolver())
 
 
-def _download_session(timeout: aiohttp.ClientTimeout) -> aiohttp.ClientSession:
+def _download_session(
+    timeout: aiohttp.ClientTimeout,
+    user_agent: str | None = None,
+) -> aiohttp.ClientSession:
     return aiohttp.ClientSession(
         timeout=timeout,
         connector=_public_connector(),
-        headers={"User-Agent": _HTTP_USER_AGENT},
+        headers={"User-Agent": user_agent or _HTTP_USER_AGENT},
         max_field_size=64 * 1024,
     )
+
+
+def _user_agent_kwargs(user_agent: str | None) -> dict[str, str]:
+    return {"user_agent": user_agent} if user_agent else {}
 
 
 @dataclass
@@ -745,12 +752,16 @@ def _progress_job_total(job: dict[str, Any], default: int) -> int:
         return max(default, 1)
 
 
-async def fetch_head_metadata(url: str, timeout_seconds: int = 30) -> PTG2HeadMetadata:
+async def fetch_head_metadata(
+    url: str,
+    timeout_seconds: int = 30,
+    user_agent: str | None = None,
+) -> PTG2HeadMetadata:
     """Return safe HTTP HEAD metadata, tolerating unavailable HEAD requests."""
     await assert_safe_url(url)
     timeout = aiohttp.ClientTimeout(total=timeout_seconds, connect=min(timeout_seconds, 10))
     try:
-        async with _download_session(timeout) as session:
+        async with _download_session(timeout, user_agent) as session:
             async with _validated_request(session, "HEAD", url) as response:
                 response_headers_by_name = response.headers
                 length = response_headers_by_name.get("Content-Length")
@@ -771,6 +782,7 @@ async def fetch_head_metadata(url: str, timeout_seconds: int = 30) -> PTG2HeadMe
 async def _probe_http_range_support(
     url: str,
     etag: str | None = None,
+    user_agent: str | None = None,
 ) -> tuple[bool, int | None, str | None, str | None]:
     await assert_safe_url(url)
     timeout = aiohttp.ClientTimeout(total=60, connect=30, sock_read=30)
@@ -779,7 +791,7 @@ async def _probe_http_range_support(
     if validator:
         headers_by_name["If-Match"] = validator
     try:
-        async with _download_session(timeout) as session:
+        async with _download_session(timeout, user_agent) as session:
             async with _validated_request(session, "GET", url, headers=headers_by_name) as response:
                 if response.status != 206:
                     return False, None, None, None
@@ -1029,9 +1041,10 @@ def _prepare_range_download(
 async def _run_range_download_tasks(
     context: _RangeDownloadContext,
     pending_ranges: list[tuple[int, int]],
+    user_agent: str | None = None,
 ) -> None:
     timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)
-    async with _download_session(timeout) as session:
+    async with _download_session(timeout, user_agent) as session:
         range_tasks = [
             asyncio.create_task(
                 context._bounded_fetch(session, byte_range)
@@ -1055,6 +1068,7 @@ async def _download_raw_artifact_ranges(
     etag: str | None,
     max_bytes: int | None,
     started_at: float,
+    user_agent: str | None = None,
 ) -> None:
     """Download a raw artifact through bounded byte ranges."""
 
@@ -1066,7 +1080,7 @@ async def _download_raw_artifact_ranges(
         max_bytes=max_bytes,
         started_at=started_at,
     )
-    await _run_range_download_tasks(context, pending_ranges)
+    await _run_range_download_tasks(context, pending_ranges, user_agent)
     context.sidecar_path.unlink(missing_ok=True)
     _emit_download_progress(
         url=url,
@@ -1232,6 +1246,7 @@ async def _run_single_get_attempt(
     started_at: float,
     timeout: aiohttp.ClientTimeout,
     allow_resume: bool = True,
+    user_agent: str | None = None,
 ) -> None:
     is_resume_request = (
         allow_resume and _can_resume_single_get_download(state)
@@ -1242,7 +1257,7 @@ async def _run_single_get_attempt(
             "Range": f"bytes={state.byte_count}-",
             "If-Match": str(state.validator),
         }
-    async with _download_session(timeout) as session:
+    async with _download_session(timeout, user_agent) as session:
         async with _validated_request(session, "GET", url, headers=request_headers_by_name) as response:
             response.raise_for_status()
             file_mode = _prepare_single_get_response(
@@ -1325,6 +1340,7 @@ async def _download_raw_artifact_single_get(
     max_bytes: int | None,
     started_at: float,
     allow_resume: bool = True,
+    user_agent: str | None = None,
 ) -> _SingleGetResult:
     """Download one artifact with retry-safe exact response evidence."""
 
@@ -1342,6 +1358,7 @@ async def _download_raw_artifact_single_get(
                 started_at=started_at,
                 timeout=timeout,
                 allow_resume=allow_resume,
+                **_user_agent_kwargs(user_agent),
             )
             return _single_get_result(state)
         except UnsafeUrlError:
@@ -1384,6 +1401,7 @@ async def download_raw_artifact(
     max_bytes: int | None = None,
     keep_partial_artifacts: bool | None = None,
     exact_get_evidence: bool = False,
+    user_agent: str | None = None,
 ) -> PTG2RawArtifact:
     """Download or reuse one raw artifact under a URL-scoped cross-process lock."""
 
@@ -1400,6 +1418,7 @@ async def download_raw_artifact(
             max_bytes=max_bytes,
             keep_partial_artifacts=keep_partial_artifacts,
             exact_get_evidence=exact_get_evidence,
+            user_agent=user_agent,
         )
 
 
@@ -1434,6 +1453,452 @@ def _publish_downloaded_raw_artifact(
     return final_path, actual_sha256, actual_size
 
 
+def _protect_reuse_candidates(
+    store: PTG2ArtifactStore,
+    candidates: list[dict[str, Any]],
+) -> None:
+    for candidate in candidates:
+        reuse_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
+        if not reuse_uri:
+            continue
+        try:
+            protect_existing_artifact(store, store.path_from_uri(str(reuse_uri)))
+        except ValueError:
+            # A migrated external path is outside this collector's authority.
+            continue
+
+
+def _select_reuse_candidate(
+    store: PTG2ArtifactStore,
+    candidates: list[dict[str, Any]],
+    head: PTG2HeadMetadata,
+) -> tuple[dict[str, Any] | None, str | None]:
+    candidate, mode = choose_reusable_raw_artifact(candidates, head, store=store)
+    if candidate is None or mode is None:
+        return None, None
+    candidate_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
+    candidate_path = store.path_from_uri(candidate_uri)
+    try:
+        is_protected = protect_existing_artifact(store, candidate_path)
+    except ValueError:
+        # Older manifests can point outside the managed root. They remain safe
+        # to reuse only while the external path still exists.
+        is_protected = candidate_path.exists()
+    return (candidate, mode) if is_protected else (None, None)
+
+
+def _record_corrupt_reuse_candidate(
+    store: PTG2ArtifactStore,
+    *,
+    canonical_url: str,
+    raw_uri: str,
+    expected_sha256: str,
+    actual_sha256: str,
+    error: str | None = None,
+) -> None:
+    manifest_map = {
+        "artifact_kind": PTG2_ARTIFACT_RAW,
+        "canonical_url": canonical_url,
+        "raw_storage_uri": raw_uri,
+        "raw_sha256": expected_sha256,
+        "status": "corrupt",
+        "actual_sha256": actual_sha256,
+    }
+    if error:
+        manifest_map["error"] = error
+    store.record_manifest(manifest_map)
+
+
+def _try_reuse_raw_artifact(
+    url: str,
+    *,
+    store: PTG2ArtifactStore,
+    canonical_url: str,
+    head: PTG2HeadMetadata,
+    started_at: float,
+) -> tuple[PTG2RawArtifact | None, bool]:
+    candidates = store.find_candidates(canonical_url)
+    _protect_reuse_candidates(store, candidates)
+    candidate, mode = _select_reuse_candidate(store, candidates, head)
+    if candidate is None or mode is None:
+        return None, False
+    raw_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
+    raw_path = store.path_from_uri(raw_uri)
+    expected = str(candidate["raw_sha256"]).lower()
+    actual, byte_count = sha256_file(raw_path)
+    if expected and actual != expected:
+        _record_corrupt_reuse_candidate(
+            store, canonical_url=canonical_url, raw_uri=raw_uri,
+            expected_sha256=expected, actual_sha256=actual,
+        )
+        return None, True
+    container_error = _artifact_container_error(
+        url,
+        raw_path,
+        validate_gzip_integrity=True,
+        gzip_max_bytes=_gzip_reuse_validate_max_bytes(),
+    )
+    if container_error:
+        _record_corrupt_reuse_candidate(
+            store, canonical_url=canonical_url, raw_uri=raw_uri,
+            expected_sha256=expected or actual, actual_sha256=actual,
+            error=container_error,
+        )
+        return None, True
+    _emit_download_progress(
+        url=url,
+        bytes_read=byte_count,
+        total_bytes=head.content_length or byte_count,
+        started_at=started_at,
+        done=True,
+    )
+    return PTG2RawArtifact(
+        original_url=url,
+        canonical_url=canonical_url,
+        raw_path=str(raw_path),
+        raw_storage_uri=raw_uri,
+        raw_sha256=actual,
+        byte_count=byte_count,
+        head=head,
+        reused=True,
+        verification_mode=mode,
+        reused_from_source_file_version_id=candidate.get("source_file_version_id"),
+    ), False
+
+
+def _raw_download_paths(
+    store: PTG2ArtifactStore,
+    *,
+    canonical_url: str,
+    url: str,
+    keep_partials: bool,
+    reuse_raw_artifacts: bool,
+) -> tuple[Path, Path, tempfile.TemporaryDirectory[str] | None]:
+    partial_path = store.partial_path(canonical_url, suffix=_safe_url_suffix(url))
+    private_stage_directory = None
+    if keep_partials:
+        temporary_path = partial_path
+    elif not reuse_raw_artifacts:
+        private_stage_directory = tempfile.TemporaryDirectory(
+            prefix="ptg2-fresh-",
+            dir=store.tmp_dir,
+        )
+        temporary_path = Path(private_stage_directory.name) / "artifact.part"
+    else:
+        temporary_path = (
+            store.tmp_dir
+            / f"ptg2-{os.getpid()}-{datetime.datetime.now(datetime.UTC).timestamp()}.part"
+        )
+    if keep_partials:
+        protect_artifact_path(store, partial_path)
+        protect_artifact_path(store, _range_sidecar_path(partial_path))
+    return partial_path, temporary_path, private_stage_directory
+
+
+def _download_local_raw_artifact(
+    url: str,
+    path: Path,
+    *,
+    head: PTG2HeadMetadata,
+    max_bytes: int | None,
+    started_at: float,
+    digest: Any,
+) -> _SingleGetResult:
+    source_path = Path(urlsplit(url).path if str(url).startswith("file://") else url)
+    total_bytes = source_path.stat().st_size if source_path.exists() else None
+    byte_count = 0
+    progress_interval_bytes = _download_progress_interval_bytes()
+    next_progress_bytes = progress_interval_bytes
+    with source_path.open("rb") as source_file, path.open("wb") as output:
+        for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+            byte_count += len(chunk)
+            if max_bytes is not None and byte_count > max_bytes:
+                raise RuntimeError(f"PTG2 max-bytes guard exceeded for {url}")
+            digest.update(chunk)
+            output.write(chunk)
+            if byte_count >= next_progress_bytes:
+                _emit_download_progress(
+                    url=url, bytes_read=byte_count, total_bytes=total_bytes,
+                    started_at=started_at, done=False,
+                )
+                while byte_count >= next_progress_bytes:
+                    next_progress_bytes += progress_interval_bytes
+    _raise_for_unexpected_artifact_container(url, path)
+    return (
+        digest, byte_count, head.etag, total_bytes, head.last_modified,
+        None, None, None, None,
+    )
+
+
+async def _try_ranged_raw_artifact(
+    url: str,
+    path: Path,
+    *,
+    head: PTG2HeadMetadata,
+    max_bytes: int | None,
+    started_at: float,
+    exact_get_evidence: bool,
+    user_agent: str | None,
+) -> _SingleGetResult | None:
+    range_total = head.content_length
+    if (
+        exact_get_evidence
+        or not _env_bool(PTG2_RANGE_DOWNLOADS_ENV, True)
+        or not range_total
+        or range_total < _range_download_min_bytes()
+    ):
+        return None
+    head_etag = head.etag if _is_strong_etag(head.etag) else None
+    range_supported, probed_total, probed_etag, _ = await _probe_http_range_support(
+        url, head_etag, **_user_agent_kwargs(user_agent),
+    )
+    if not range_supported or not probed_total or not _is_strong_etag(probed_etag):
+        return None
+    if max_bytes is not None and probed_total > max_bytes:
+        raise RuntimeError(f"PTG2 max-bytes guard exceeded for {url}")
+    try:
+        await _download_raw_artifact_ranges(
+            url=url, partial_path=path, total_bytes=probed_total,
+            etag=probed_etag, max_bytes=max_bytes, started_at=started_at,
+            **_user_agent_kwargs(user_agent),
+        )
+        _raise_for_unexpected_artifact_container(url, path)
+    except UnsafeUrlError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Falling back to a full PTG2 download after unsafe or failed ranges for %s: %s",
+            url,
+            exc,
+        )
+        _reset_partial_download(path)
+        return None
+    digest = hashlib.sha256()
+    byte_count = _hash_existing_file_into(path, digest)
+    last_modified = head.last_modified if probed_etag == head.etag else None
+    return (
+        digest, byte_count, probed_etag, probed_total, last_modified,
+        None, None, None, None,
+    )
+
+
+async def _download_raw_to_path(
+    url: str,
+    path: Path,
+    *,
+    head: PTG2HeadMetadata,
+    max_bytes: int | None,
+    started_at: float,
+    exact_get_evidence: bool,
+    user_agent: str | None,
+    failure_digest: Any,
+) -> _SingleGetResult:
+    is_local = str(url).startswith("file://") or (
+        not str(url).lower().startswith(("http://", "https://"))
+        and Path(url).exists()
+    )
+    if is_local:
+        return _download_local_raw_artifact(
+            url, path, head=head, max_bytes=max_bytes,
+            started_at=started_at, digest=failure_digest,
+        )
+    ranged = await _try_ranged_raw_artifact(
+        url, path, head=head, max_bytes=max_bytes, started_at=started_at,
+        exact_get_evidence=exact_get_evidence, user_agent=user_agent,
+    )
+    if ranged is not None:
+        return ranged
+    return await _download_raw_artifact_single_get(
+        url=url, path=path, head=head, max_bytes=max_bytes,
+        started_at=started_at, allow_resume=not exact_get_evidence,
+        **_user_agent_kwargs(user_agent),
+    )
+
+
+def _publish_raw_download(
+    store: PTG2ArtifactStore,
+    path: Path,
+    *,
+    result: _SingleGetResult,
+    reuse_raw_artifacts: bool,
+    private_stage_directory: tempfile.TemporaryDirectory[str] | None,
+) -> tuple[Path, str, int]:
+    digest, byte_count = result[:2]
+    raw_sha = digest.hexdigest()
+    if private_stage_directory is None:
+        return _publish_downloaded_raw_artifact(
+            store, path, raw_sha256=raw_sha, byte_count=byte_count,
+            reuse_raw_artifacts=reuse_raw_artifacts,
+        )
+    with _capture_streamed_artifact_stage(
+        store,
+        path,
+        streamed_sha256=raw_sha,
+        streamed_byte_count=byte_count,
+    ) as verified_stage:
+        return _publish_downloaded_raw_artifact(
+            store, path, raw_sha256=raw_sha, byte_count=byte_count,
+            reuse_raw_artifacts=reuse_raw_artifacts,
+            verified_stage=verified_stage,
+        )
+
+
+def _raw_artifact_from_download(
+    url: str,
+    canonical_url: str,
+    store: PTG2ArtifactStore,
+    head: PTG2HeadMetadata,
+    download_result: _SingleGetResult,
+    final_path: Path,
+    actual_sha: str,
+    actual_size: int,
+) -> PTG2RawArtifact:
+    _, _, etag, content_length, last_modified = download_result[:5]
+    final_url = status = content_encoding = content_type = None
+    if len(download_result) >= 9:
+        final_url, status, content_encoding, content_type = download_result[5:9]
+    raw_uri = store.storage_uri(final_path)
+    store.record_manifest(
+        {
+            "artifact_kind": PTG2_ARTIFACT_RAW,
+            "canonical_url": canonical_url,
+            "original_url": url,
+            "raw_storage_uri": raw_uri,
+            "raw_sha256": actual_sha,
+            "sha256": actual_sha,
+            "content_length": content_length or actual_size,
+            "byte_count": actual_size,
+            "etag": etag,
+            "last_modified": last_modified,
+            "status": "available",
+        }
+    )
+    verified_head = PTG2HeadMetadata(
+        url=final_url or head.url,
+        status=status if status is not None else head.status,
+        etag=etag,
+        content_length=content_length or actual_size,
+        last_modified=last_modified,
+        content_encoding=content_encoding or head.content_encoding,
+        content_type=content_type or head.content_type,
+        supports_head=head.supports_head,
+    )
+    return PTG2RawArtifact(
+        original_url=url,
+        canonical_url=canonical_url,
+        raw_path=str(final_path),
+        raw_storage_uri=raw_uri,
+        raw_sha256=actual_sha,
+        byte_count=actual_size,
+        head=verified_head,
+        reused=False,
+        verification_mode="downloaded",
+    )
+
+
+def _record_partial_raw_artifact(
+    store: PTG2ArtifactStore,
+    *,
+    url: str,
+    canonical_url: str,
+    temporary_path: Path,
+    partial_path: Path,
+    keep_partials: bool,
+    digest: Any,
+    error: BaseException,
+) -> None:
+    if temporary_path.exists() and keep_partials:
+        try:
+            store.record_manifest(
+                {
+                    "artifact_kind": "partial_raw",
+                    "canonical_url": canonical_url,
+                    "original_url": url,
+                    "raw_storage_uri": store.storage_uri(partial_path),
+                    "partial_sha256": digest.hexdigest(),
+                    "byte_count": partial_path.stat().st_size,
+                    "status": "partial",
+                    "error": str(error),
+                }
+            )
+        except Exception as preserve_error:
+            logger.warning(
+                "Failed to preserve partial PTG2 download %s: %s",
+                temporary_path,
+                preserve_error,
+            )
+    elif temporary_path.exists():
+        temporary_path.unlink(missing_ok=True)
+
+
+def _prepare_raw_download(
+    store: PTG2ArtifactStore,
+    *,
+    canonical_url: str,
+    url: str,
+    reuse_raw_artifacts: bool,
+    keep_partial_artifacts: bool | None,
+) -> tuple[bool, Path, Path, tempfile.TemporaryDirectory[str] | None]:
+    keep_partials = (
+        _env_bool(PTG2_KEEP_PARTIAL_ENV, True)
+        if keep_partial_artifacts is None
+        else keep_partial_artifacts
+    )
+    partial_path, temporary_path, private_directory = _raw_download_paths(
+        store,
+        canonical_url=canonical_url,
+        url=url,
+        keep_partials=keep_partials,
+        reuse_raw_artifacts=reuse_raw_artifacts,
+    )
+    return keep_partials, partial_path, temporary_path, private_directory
+
+
+def _emit_download_started(
+    url: str,
+    head: PTG2HeadMetadata,
+    started_at: float,
+) -> None:
+    _emit_download_progress(
+        url=url,
+        bytes_read=0,
+        total_bytes=head.content_length,
+        started_at=started_at,
+        done=False,
+    )
+
+
+def _validate_and_publish_raw_download(
+    url: str,
+    store: PTG2ArtifactStore,
+    temporary_path: Path,
+    download_result: _SingleGetResult,
+    reuse_raw_artifacts: bool,
+    private_directory: tempfile.TemporaryDirectory[str] | None,
+    started_at: float,
+    should_validate_gzip: bool,
+) -> tuple[Path, str, int]:
+    if should_validate_gzip:
+        gzip_error = _gzip_integrity_error(url, temporary_path, max_bytes=None)
+        if gzip_error:
+            raise _UnexpectedArtifactContainerError(gzip_error)
+    final_path, actual_sha, actual_size = _publish_raw_download(
+        store,
+        temporary_path,
+        result=download_result,
+        reuse_raw_artifacts=reuse_raw_artifacts,
+        private_stage_directory=private_directory,
+    )
+    _emit_download_progress(
+        url=url,
+        bytes_read=actual_size,
+        total_bytes=download_result[3] or actual_size,
+        started_at=started_at,
+        done=True,
+    )
+    return final_path, actual_sha, actual_size
+
+
 async def _download_raw_artifact_locked(
     url: str,
     *,
@@ -1443,320 +1908,52 @@ async def _download_raw_artifact_locked(
     max_bytes: int | None,
     keep_partial_artifacts: bool | None,
     exact_get_evidence: bool = False,
+    user_agent: str | None = None,
 ) -> PTG2RawArtifact:
     """Run one raw download after this canonical URL has been serialized."""
 
-    keep_partials = _env_bool(PTG2_KEEP_PARTIAL_ENV, True) if keep_partial_artifacts is None else keep_partial_artifacts
-    head = await fetch_head_metadata(url)
+    head = await fetch_head_metadata(url, **_user_agent_kwargs(user_agent))
     progress_started_at = time.monotonic()
-    progress_interval_bytes = _download_progress_interval_bytes()
-    next_progress_bytes = progress_interval_bytes
     should_validate_downloaded_gzip = _env_bool(_GZIP_VALIDATE_FRESH_ENV, False)
     if reuse_raw_artifacts:
-        candidates = store.find_candidates(canonical_url)
-        for reuse_candidate in candidates:
-            reuse_uri = reuse_candidate.get("raw_storage_uri") or reuse_candidate.get("storage_uri")
-            if not reuse_uri:
-                continue
-            reuse_path = store.path_from_uri(str(reuse_uri))
-            try:
-                protect_existing_artifact(store, reuse_path)
-            except ValueError:
-                # A migrated external path is outside this collector's authority.
-                continue
-        candidate, mode = choose_reusable_raw_artifact(candidates, head, store=store)
-        if candidate is not None and mode is not None:
-            candidate_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
-            candidate_path = store.path_from_uri(candidate_uri)
-            try:
-                is_protected = protect_existing_artifact(store, candidate_path)
-            except ValueError:
-                # Older manifests can point outside the current managed root. The
-                # collector cannot delete those paths, so normal reuse remains safe.
-                is_protected = candidate_path.exists()
-            if not is_protected:
-                candidate = None
-                mode = None
-        if candidate is not None and mode is not None:
-            raw_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
-            raw_path = store.path_from_uri(raw_uri)
-            expected = str(candidate["raw_sha256"]).lower()
-            actual, byte_count = sha256_file(raw_path)
-            container_error = _artifact_container_error(
-                url,
-                raw_path,
-                validate_gzip_integrity=True,
-                gzip_max_bytes=_gzip_reuse_validate_max_bytes(),
-            )
-            if expected and actual != expected:
-                should_validate_downloaded_gzip = True
-                store.record_manifest(
-                    {
-                        "artifact_kind": PTG2_ARTIFACT_RAW,
-                        "canonical_url": canonical_url,
-                        "raw_storage_uri": raw_uri,
-                        "raw_sha256": expected,
-                        "status": "corrupt",
-                        "actual_sha256": actual,
-                    }
-                )
-            elif container_error:
-                should_validate_downloaded_gzip = True
-                store.record_manifest(
-                    {
-                        "artifact_kind": PTG2_ARTIFACT_RAW,
-                        "canonical_url": canonical_url,
-                        "raw_storage_uri": raw_uri,
-                        "raw_sha256": expected or actual,
-                        "status": "corrupt",
-                        "actual_sha256": actual,
-                        "error": container_error,
-                    }
-                )
-            else:
-                _emit_download_progress(
-                    url=url,
-                    bytes_read=byte_count,
-                    total_bytes=head.content_length if head and head.content_length else byte_count,
-                    started_at=progress_started_at,
-                    done=True,
-                )
-                return PTG2RawArtifact(
-                    original_url=url,
-                    canonical_url=canonical_url,
-                    raw_path=str(raw_path),
-                    raw_storage_uri=raw_uri,
-                    raw_sha256=actual,
-                    byte_count=byte_count,
-                    head=head,
-                    reused=True,
-                    verification_mode=mode,
-                    reused_from_source_file_version_id=candidate.get("source_file_version_id"),
-                )
-
-    partial_path = store.partial_path(canonical_url, suffix=_safe_url_suffix(url))
-    private_stage_directory = None
-    if keep_partials:
-        tmp_path = partial_path
-    elif not reuse_raw_artifacts:
-        private_stage_directory = tempfile.TemporaryDirectory(
-            prefix="ptg2-fresh-",
-            dir=store.tmp_dir,
+        reused, corrupt_candidate = _try_reuse_raw_artifact(
+            url, store=store, canonical_url=canonical_url,
+            head=head, started_at=progress_started_at,
         )
-        tmp_path = Path(private_stage_directory.name) / "artifact.part"
-    else:
-        tmp_path = (
-            store.tmp_dir
-            / f"ptg2-{os.getpid()}-{datetime.datetime.utcnow().timestamp()}.part"
+        if reused is not None:
+            return reused
+        should_validate_downloaded_gzip |= corrupt_candidate
+    keep_partials, partial_path, temporary_path, private_stage_directory = (
+        _prepare_raw_download(
+            store, canonical_url=canonical_url, url=url,
+            reuse_raw_artifacts=reuse_raw_artifacts,
+            keep_partial_artifacts=keep_partial_artifacts,
         )
-    if keep_partials:
-        protect_artifact_path(store, partial_path)
-        protect_artifact_path(store, _range_sidecar_path(partial_path))
-    digest = hashlib.sha256()
-    byte_count = 0
-    download_etag = head.etag
-    download_content_length = head.content_length
-    download_last_modified = head.last_modified
-    download_final_url: str | None = None
-    download_status: int | None = None
-    download_content_encoding: str | None = None
-    download_content_type: str | None = None
-    _emit_download_progress(
-        url=url,
-        bytes_read=0,
-        total_bytes=head.content_length if head and head.content_length else None,
-        started_at=progress_started_at,
-        done=False,
     )
+    failure_digest = hashlib.sha256()
+    _emit_download_started(url, head, progress_started_at)
     try:
-        if str(url).startswith("file://") or (not str(url).lower().startswith(("http://", "https://")) and Path(url).exists()):
-            source_path = Path(urlsplit(url).path if str(url).startswith("file://") else url)
-            total_bytes = source_path.stat().st_size if source_path.exists() else None
-            download_content_length = total_bytes
-            with open(source_path, "rb") as src, open(tmp_path, "wb") as dst:
-                for chunk in iter(lambda: src.read(1024 * 1024), b""):
-                    byte_count += len(chunk)
-                    if max_bytes is not None and byte_count > max_bytes:
-                        raise RuntimeError(f"PTG2 max-bytes guard exceeded for {url}")
-                    digest.update(chunk)
-                    dst.write(chunk)
-                    if byte_count >= next_progress_bytes:
-                        _emit_download_progress(
-                            url=url,
-                            bytes_read=byte_count,
-                            total_bytes=total_bytes,
-                            started_at=progress_started_at,
-                            done=False,
-                        )
-                        while byte_count >= next_progress_bytes:
-                            next_progress_bytes += progress_interval_bytes
-            _raise_for_unexpected_artifact_container(url, tmp_path)
-        else:
-            use_range_download = False
-            range_total = head.content_length if head and head.content_length else None
-            if (
-                not exact_get_evidence
-                and
-                _env_bool(PTG2_RANGE_DOWNLOADS_ENV, True)
-                and range_total
-                and range_total >= _range_download_min_bytes()
-            ):
-                head_etag = head.etag if _is_strong_etag(head.etag) else None
-                range_supported, probed_total, probed_etag, _range_url = await _probe_http_range_support(
-                    url,
-                    head_etag,
-                )
-                if range_supported and probed_total and _is_strong_etag(probed_etag):
-                    if max_bytes is not None and probed_total > max_bytes:
-                        raise RuntimeError(f"PTG2 max-bytes guard exceeded for {url}")
-                    try:
-                        await _download_raw_artifact_ranges(
-                            url=url,
-                            partial_path=tmp_path,
-                            total_bytes=probed_total,
-                            etag=probed_etag,
-                            max_bytes=max_bytes,
-                            started_at=progress_started_at,
-                        )
-                        _raise_for_unexpected_artifact_container(url, tmp_path)
-                    except UnsafeUrlError:
-                        raise
-                    except Exception as exc:
-                        logger.warning(
-                            "Falling back to a full PTG2 download after unsafe or failed ranges for %s: %s",
-                            url,
-                            exc,
-                        )
-                        _reset_partial_download(tmp_path)
-                    else:
-                        digest = hashlib.sha256()
-                        byte_count = _hash_existing_file_into(tmp_path, digest)
-                        download_etag = probed_etag
-                        download_content_length = probed_total
-                        download_last_modified = head.last_modified if probed_etag == head.etag else None
-                        use_range_download = True
-            if not use_range_download:
-                single_get_result = await _download_raw_artifact_single_get(
-                    url=url,
-                    path=tmp_path,
-                    head=head,
-                    max_bytes=max_bytes,
-                    started_at=progress_started_at,
-                    allow_resume=not exact_get_evidence,
-                )
-                (
-                    digest,
-                    byte_count,
-                    download_etag,
-                    download_content_length,
-                    download_last_modified,
-                ) = single_get_result[:5]
-                if len(single_get_result) >= 9:
-                    (
-                        download_final_url,
-                        download_status,
-                        download_content_encoding,
-                        download_content_type,
-                    ) = single_get_result[5:9]
-        if should_validate_downloaded_gzip:
-            gzip_error = _gzip_integrity_error(url, tmp_path, max_bytes=None)
-            if gzip_error:
-                raise _UnexpectedArtifactContainerError(gzip_error)
-        raw_sha = digest.hexdigest()
-        # The digest is the complete physical identity. Omitting URL-derived
-        # suffixes lets different source URLs with identical bytes share one
-        # retained raw container.
-        if private_stage_directory is None:
-            final_path, actual_sha, actual_size = _publish_downloaded_raw_artifact(
-                store,
-                tmp_path,
-                raw_sha256=raw_sha,
-                byte_count=byte_count,
-                reuse_raw_artifacts=reuse_raw_artifacts,
-            )
-        else:
-            with _capture_streamed_artifact_stage(
-                store,
-                tmp_path,
-                streamed_sha256=raw_sha,
-                streamed_byte_count=byte_count,
-            ) as verified_stage:
-                final_path, actual_sha, actual_size = _publish_downloaded_raw_artifact(
-                    store,
-                    tmp_path,
-                    raw_sha256=raw_sha,
-                    byte_count=byte_count,
-                    reuse_raw_artifacts=reuse_raw_artifacts,
-                    verified_stage=verified_stage,
-                )
-        _emit_download_progress(
-            url=url,
-            bytes_read=actual_size,
-            total_bytes=download_content_length or actual_size,
-            started_at=progress_started_at,
-            done=True,
+        download_result = await _download_raw_to_path(
+            url, temporary_path, head=head, max_bytes=max_bytes,
+            started_at=progress_started_at, exact_get_evidence=exact_get_evidence,
+            user_agent=user_agent, failure_digest=failure_digest,
         )
-        raw_uri = store.storage_uri(final_path)
-        raw_artifact_manifest_map = {
-            "artifact_kind": PTG2_ARTIFACT_RAW,
-            "canonical_url": canonical_url,
-            "original_url": url,
-            "raw_storage_uri": raw_uri,
-            "raw_sha256": actual_sha,
-            "sha256": actual_sha,
-            "content_length": download_content_length or actual_size,
-            "byte_count": actual_size,
-            "etag": download_etag,
-            "last_modified": download_last_modified,
-            "status": "available",
-        }
-        store.record_manifest(raw_artifact_manifest_map)
-        verified_head = PTG2HeadMetadata(
-            url=download_final_url or head.url,
-            status=(
-                download_status
-                if download_status is not None
-                else head.status
-            ),
-            etag=download_etag,
-            content_length=download_content_length or actual_size,
-            last_modified=download_last_modified,
-            content_encoding=(
-                download_content_encoding or head.content_encoding
-            ),
-            content_type=download_content_type or head.content_type,
-            supports_head=head.supports_head,
+        failure_digest = download_result[0]
+        final_path, actual_sha, actual_size = _validate_and_publish_raw_download(
+            url, store, temporary_path, download_result,
+            reuse_raw_artifacts, private_stage_directory,
+            progress_started_at, should_validate_downloaded_gzip,
         )
-        return PTG2RawArtifact(
-            original_url=url,
-            canonical_url=canonical_url,
-            raw_path=str(final_path),
-            raw_storage_uri=raw_uri,
-            raw_sha256=actual_sha,
-            byte_count=actual_size,
-            head=verified_head,
-            reused=False,
-            verification_mode="downloaded",
+        return _raw_artifact_from_download(
+            url, canonical_url, store, head, download_result,
+            final_path, actual_sha, actual_size,
         )
     except BaseException as exc:
-        if tmp_path.exists() and keep_partials:
-            try:
-                store.record_manifest(
-                    {
-                        "artifact_kind": "partial_raw",
-                        "canonical_url": canonical_url,
-                        "original_url": url,
-                        "raw_storage_uri": store.storage_uri(partial_path),
-                        "partial_sha256": digest.hexdigest(),
-                        "byte_count": partial_path.stat().st_size,
-                        "status": "partial",
-                        "error": str(exc),
-                    }
-                )
-            except Exception as preserve_exc:
-                logger.warning("Failed to preserve partial PTG2 download %s: %s", tmp_path, preserve_exc)
-        elif tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+        _record_partial_raw_artifact(
+            store, url=url, canonical_url=canonical_url,
+            temporary_path=temporary_path, partial_path=partial_path,
+            keep_partials=keep_partials, digest=failure_digest, error=exc,
+        )
         raise
     finally:
         if private_stage_directory is not None:
