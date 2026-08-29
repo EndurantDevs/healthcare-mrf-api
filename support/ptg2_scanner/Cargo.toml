@@ -31,4 +31,4 @@ sha2 = "0.11"
 struson = { version = "0.7", features = ["serde"] }
 tempfile = "3.23"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs", "lzma"] }

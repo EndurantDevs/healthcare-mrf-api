@@ -126,7 +126,8 @@ def _select_zip_payload_member(archive: zipfile.ZipFile) -> zipfile.ZipInfo:
     if any(member.flag_bits & 1 for member in members):
         raise ValueError("ZIP hospital MRF member must not be encrypted")
     if any(
-        member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+        member.compress_type
+        not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_LZMA}
         for member in members
     ):
         raise ValueError("ZIP hospital MRF compression method is unsupported")
@@ -211,12 +212,12 @@ def detect_hospital_mrf_format(
     normalized_headers = {header.strip().casefold() for header in headers}
     if "payer_name" in normalized_headers:
         return "csv-tall"
-    if any(
-        len(header.split("|")) in {3, 4}
-        and header.strip().casefold().startswith(
-            ("standard_charge|", "median_amount|", "10th_percentile|")
-        )
-        for header in headers
-    ):
-        return "csv-wide"
+    for header in headers:
+        parts = [part.strip().casefold() for part in header.split("|")]
+        if len(parts) in {3, 4} and parts[0] in {
+            "standard_charge",
+            "median_amount",
+            "10th_percentile",
+        }:
+            return "csv-wide"
     raise ValueError("hospital CSV payer layout is not CMS v3 tall or wide")

@@ -321,6 +321,7 @@ async def test_locator_fetch_is_fresh_exact_and_bounded(tmp_path, monkeypatch):
     assert options_by_name["exact_get_evidence"] is True
     assert options_by_name["keep_partial_artifacts"] is False
     assert options_by_name["max_bytes"] == 1_000_000
+    assert options_by_name["user_agent"].startswith("Mozilla/5.0")
     assert locator_result.records[0].mrf_url.endswith("12-3456789_prices.json")
 
 

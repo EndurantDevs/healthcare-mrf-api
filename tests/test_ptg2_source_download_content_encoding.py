@@ -37,6 +37,12 @@ def test_download_session_uses_stable_product_user_agent(monkeypatch) -> None:
         "max_field_size": 64 * 1024,
     }
 
+    source_download._download_session(
+        timeout,
+        "Mozilla/5.0",
+    )
+    assert session_options_by_name["headers"] == {"User-Agent": "Mozilla/5.0"}
+
 
 def test_single_get_uses_decoded_byte_space_for_encoded_response(
     tmp_path, monkeypatch

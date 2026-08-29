@@ -44,6 +44,7 @@ from tests.ptg2_source_download_security_artifact_cases import (
 )
 
 from tests.ptg2_source_download_security_edge_cases import (
+    test_completed_http_digest_is_retained_if_publish_fails,
     test_corrupt_reuse_candidate_is_recorded_before_fresh_download,
     test_fresh_truncated_gzip_fails_full_integrity_check,
 )

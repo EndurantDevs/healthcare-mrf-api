@@ -79,6 +79,7 @@ async def test_source_download_updates_shared_attempts_and_reports_errors(monkey
     assert download_options[0]["reuse_raw_artifacts"] is False
     assert download_options[0]["max_bytes"] == 1024
     assert download_options[0]["keep_partial_artifacts"] is False
+    assert download_options[0]["user_agent"].startswith("Mozilla/5.0")
     raw.head = None
     unchanged = await acquisition.download_source(
         ("https://a/mrf", (attempt,)), object(), 1024
