@@ -329,6 +329,31 @@ async def test_list_pricing_providers_tier_relevance_ordering():
 
 
 @pytest.mark.asyncio
+async def test_list_pricing_providers_tier_relevance_falls_back_without_quality_table():
+    request = make_request(
+        [
+            FakeResult(scalar=1),
+            FakeResult(scalar=None),
+            FakeResult(
+                rows=[
+                    {
+                        "npi": 1003000126,
+                        "provider_name": "Enkeshafi, Ardalan",
+                        "total_allowed_amount": 1234.5,
+                    }
+                ]
+            ),
+        ],
+        args={"year": "2023", "limit": "10", "order_by": "tier_relevance"},
+    )
+
+    response = await list_pricing_providers(request)
+    pricing_response = json.loads(response.body)
+    assert pricing_response["items"][0]["npi"] == 1003000126
+    assert pricing_response["query"]["order_by"] == "total_allowed_amount"
+
+
+@pytest.mark.asyncio
 async def test_group_plan_providers_filters_to_ten_digit_npis(monkeypatch):
     async def fake_snapshot_id(_session, _plan_fields):
         return "ptg2:test"

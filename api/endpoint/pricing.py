@@ -8527,9 +8527,10 @@ async def _pricing_provider_list_query(
 ):
     benchmark_mode_used = benchmark_mode
     benchmark_mode_source = "request" if benchmark_mode else None
-    if order_by == "tier_relevance" and await _is_table_available(
+    quality_order_available = order_by == "tier_relevance" and await _is_table_available(
         session, QUALITY_SCORE_TABLE_NAME
-    ):
+    )
+    if quality_order_available:
         benchmark_mode_used, benchmark_mode_source = await _resolve_quality_benchmark_mode(
             session, year, benchmark_mode
         )
@@ -8555,6 +8556,8 @@ async def _pricing_provider_list_query(
             provider_table.c.total_allowed_amount.desc(),
         )
     else:
+        if order_by == "tier_relevance":
+            order_by = "total_allowed_amount"
         query = _apply_ordering(
             select(provider_table).where(where_clause),
             order_by,
