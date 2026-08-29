@@ -14606,20 +14606,29 @@ class _GeoRateSelectionBudget:
         self,
         provider_set_ids: Iterable[str],
     ) -> None:
-        """Charge one selected-NPI reverse completion graph batch."""
+        """Charge bounded batches for selected-NPI reverse completion."""
 
         new_provider_set_ids = set(provider_set_ids).difference(
             self.provider_set_ids
         )
+        required_batches = max(
+            (
+                len(new_provider_set_ids)
+                + self.caps.maximum_provider_sets
+                - 1
+            )
+            // self.caps.maximum_provider_sets,
+            1,
+        )
         if (
-            len(new_provider_set_ids) > self.caps.maximum_provider_sets
-            or len(self.provider_set_ids) + len(new_provider_set_ids)
+            len(self.provider_set_ids) + len(new_provider_set_ids)
             > self.maximum_geo_provider_sets
+            or self.graph_batches + required_batches
+            > self.caps.maximum_graph_batches
         ):
             raise PTG2OnlineWorkBudgetExceeded("candidate_members")
-        self.require_graph_batch_capacity()
         self.provider_set_ids.update(new_provider_set_ids)
-        self.graph_batches += 1
+        self.graph_batches += required_batches
 
     def require_graph_batch_capacity(self) -> None:
         """Fail before a graph traversal exceeds the sealed batch cap."""

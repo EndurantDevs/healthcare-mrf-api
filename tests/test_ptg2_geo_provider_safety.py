@@ -83,8 +83,8 @@ async def test_strict_geo_cost_rejects_short_authenticated_rate_page(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_geo_completion_respects_provider_set_cap(monkeypatch):
-    """Reject completion sets before an unbounded rate read can start."""
+async def test_geo_completion_charges_bounded_provider_set_batches(monkeypatch):
+    """Charge a large exact completion union as sealed-size graph batches."""
 
     tables = geo._geo_tables(
         max_online_provider_expansion_provider_sets=1,
@@ -103,7 +103,7 @@ async def test_geo_completion_respects_provider_set_cap(monkeypatch):
         ),
     )
 
-    with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded):
+    provider_set_id_by_key, provider_set_ids_by_npi = (
         await serving._geo_completion_memberships(
             object(),
             tables,
@@ -111,6 +111,37 @@ async def test_geo_completion_respects_provider_set_cap(monkeypatch):
             {_MEMBER_NPI: (1, 2, 3)},
             (1, 2, 3),
         )
+    )
+
+    assert set(provider_set_id_by_key.values()) == {
+        geo._PROVIDER_SET_ID,
+        _OTHER_PROVIDER_SET_ID,
+        _THIRD_PROVIDER_SET_ID,
+    }
+    assert provider_set_ids_by_npi[_MEMBER_NPI] == (
+        geo._PROVIDER_SET_ID,
+        _OTHER_PROVIDER_SET_ID,
+        _THIRD_PROVIDER_SET_ID,
+    )
+    assert request.budget.graph_batches == 3
+
+
+def test_geo_completion_rejects_insufficient_graph_batches():
+    """Keep completion atomic when its sealed graph batches are exhausted."""
+
+    tables = geo._geo_tables(
+        max_online_provider_expansion_provider_sets=1,
+        max_online_provider_expansion_graph_batches=2,
+    )
+    budget = _claimed_budget(tables)
+
+    with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded):
+        budget.claim_completion_provider_sets(
+            (geo._PROVIDER_SET_ID, _OTHER_PROVIDER_SET_ID, _THIRD_PROVIDER_SET_ID)
+        )
+
+    assert budget.provider_set_ids == {geo._PROVIDER_SET_ID}
+    assert budget.graph_batches == 1
 
 
 @pytest.mark.asyncio
