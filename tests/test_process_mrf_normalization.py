@@ -247,6 +247,22 @@ def test_build_mrf_address_rows_batches_contact_normalization(monkeypatch):
     assert address_rows[1]["phone_extension"] == "12"
 
 
+def test_build_mrf_address_rows_can_skip_deferred_aggregate_rows():
+    provider_payload, plan_lookup = _mrf_contact_batch_fixture()
+
+    address_rows, evidence_rows = process_initial._build_mrf_address_rows(
+        provider_payload,
+        plan_lookup,
+        "20260601000000",
+        "https://example.test/provider.json",
+        datetime.datetime(2026, 6, 1, 12, 0, 0),
+        include_address_rows=False,
+    )
+
+    assert address_rows == []
+    assert len(evidence_rows) == 2
+
+
 @pytest.mark.asyncio
 async def test_push_mrf_address_rows_skips_aggregate_ingest_by_default(monkeypatch):
     calls = []

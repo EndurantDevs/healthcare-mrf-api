@@ -222,11 +222,12 @@ def _assert_initial_import_catalog_result(context_by_field, pushed_batches):
         issuer_row for issuer_row in issuer_rows if issuer_row["issuer_id"] == 12345
     ) == {
         "issuer_id": 12345,
-        "issuer_name": "Catalog Issuer",
+        "issuer_name": "Synthetic Issuer",
         "issuer_marketing_name": "",
         "data_contact_email": "data@example.invalid",
         "mrf_url": "https://data.example.invalid/index-b.json",
     }
+    assert initial.db.scalar.await_count == 0
 
 
 def _assert_initial_import_queue_result(progress_events, redis):

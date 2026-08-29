@@ -173,6 +173,8 @@ PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS = {
     "group_plan_array",
 }
 PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY = "provider_directory_sources"
+MRF_SOURCE_DETAIL_KEY = "mrf_sources"
+MRF_SOURCE_COUNT_KEY = "mrf_source_count"
 _PROVIDER_DIRECTORY_OBSERVED_RESOURCE_TYPES = (
     "Practitioner",
     "PractitionerRole",
@@ -4638,6 +4640,181 @@ async def _attach_provider_directory_source_details(
             address[PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY] = endpoint_provenance
 
 
+def _public_mrf_source_url(value: Any) -> str | None:
+    """Return a credential-free public HTTP source identity."""
+    source_url = _provider_directory_fhir_url_identity(value)
+    if not source_url:
+        return None
+    parsed = urllib.parse.urlsplit(source_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    return source_url
+
+
+def _mrf_source_address_pairs(
+    addresses: Sequence[Any],
+) -> list[tuple[int, str]]:
+    """Return exact selected MRF-backed address identities."""
+    pairs: set[tuple[int, str]] = set()
+    for address in addresses:
+        if not isinstance(address, Mapping):
+            continue
+        if "mrf" not in _json_array_value(address.get("address_sources")):
+            continue
+        address_key = _normalized_address_identity(address.get("address_key"))
+        npi_value = address.get("npi") or address.get("inferred_npi")
+        if not address_key or npi_value in (None, ""):
+            continue
+        try:
+            pairs.add((int(npi_value), address_key))
+        except (TypeError, ValueError):
+            continue
+    return sorted(pairs)
+
+
+async def _attach_mrf_source_details(
+    addresses: Sequence[Any],
+    *,
+    session: Any = None,
+) -> None:
+    """Attach issuer-level MRF provenance to exact selected addresses."""
+    address_pairs = _mrf_source_address_pairs(addresses)
+    if not address_pairs:
+        return
+    evidence_table = _schema_cache_key("mrf_address_evidence")
+    query_result = await _execute_stmt(
+        text(
+            f"""
+            WITH selected(npi, address_key) AS (
+                SELECT selected_npi, selected_address_key
+                  FROM UNNEST(
+                           CAST(:npis AS bigint[]),
+                           CAST(:address_keys AS uuid[])
+                       ) AS selected_rows(selected_npi, selected_address_key)
+            )
+            SELECT evidence.npi,
+                   evidence.address_key,
+                   MIN(BTRIM(evidence.issuer_name)) AS issuer_name,
+                   COALESCE(
+                       ARRAY_AGG(DISTINCT evidence.issuer_id ORDER BY evidence.issuer_id)
+                           FILTER (WHERE evidence.issuer_id IS NOT NULL),
+                       ARRAY[]::integer[]
+                   ) AS issuer_ids,
+                   COALESCE(
+                       ARRAY_AGG(
+                           DISTINCT BTRIM(evidence.source_url)
+                           ORDER BY BTRIM(evidence.source_url)
+                       ) FILTER (
+                           WHERE NULLIF(BTRIM(evidence.source_url), '') IS NOT NULL
+                       ),
+                       ARRAY[]::varchar[]
+                   ) AS source_urls
+              FROM selected
+              JOIN {evidence_table} AS evidence
+                ON evidence.npi = selected.npi
+               AND evidence.address_key = selected.address_key
+             WHERE NULLIF(BTRIM(evidence.issuer_name), '') IS NOT NULL
+          GROUP BY evidence.npi,
+                   evidence.address_key,
+                   LOWER(BTRIM(evidence.issuer_name))
+          ORDER BY evidence.npi,
+                   evidence.address_key,
+                   LOWER(BTRIM(evidence.issuer_name))
+            """
+        ),
+        session=session,
+        params={
+            "npis": [npi for npi, _address_key in address_pairs],
+            "address_keys": [address_key for _npi, address_key in address_pairs],
+        },
+    )
+    selected_pair_set = set(address_pairs)
+    source_map: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    for source_row in query_result.all():
+        mapping = getattr(source_row, "_mapping", source_row)
+        try:
+            source_pair = (
+                int(mapping.get("npi")),
+                _normalized_address_identity(mapping.get("address_key")),
+            )
+        except (TypeError, ValueError):
+            continue
+        if source_pair not in selected_pair_set:
+            continue
+        issuer_name = str(mapping.get("issuer_name") or "").strip()
+        if not issuer_name:
+            continue
+        issuer_ids: list[int] = []
+        for raw_issuer_id in mapping.get("issuer_ids") or []:
+            try:
+                issuer_ids.append(int(raw_issuer_id))
+            except (TypeError, ValueError):
+                continue
+        issuer_ids = sorted(set(issuer_ids))
+        if len(issuer_ids) == 1:
+            source_name = f"{issuer_name} (issuer {issuer_ids[0]})"
+        elif issuer_ids:
+            source_name = (
+                f"{issuer_name} (issuers {', '.join(map(str, issuer_ids))})"
+            )
+        else:
+            source_name = issuer_name
+        source_map[source_pair].append(
+            {
+                "source": "mrf",
+                "issuer_name": issuer_name,
+                "source_name": source_name,
+                "issuer_ids": issuer_ids,
+                "source_urls": sorted(
+                    {
+                        sanitized_url
+                        for source_url in (mapping.get("source_urls") or [])
+                        if (
+                            sanitized_url := _public_mrf_source_url(source_url)
+                        )
+                    }
+                ),
+            }
+        )
+    for address in addresses:
+        if not isinstance(address, dict):
+            continue
+        address_key = _normalized_address_identity(address.get("address_key"))
+        npi_value = address.get("npi") or address.get("inferred_npi")
+        try:
+            source_pair = (int(npi_value), address_key)
+        except (TypeError, ValueError):
+            continue
+        sources = source_map.get(source_pair)
+        if not sources:
+            continue
+        sources.sort(
+            key=lambda source: (
+                str(source["source_name"]).casefold(),
+                tuple(source["issuer_ids"]),
+            )
+        )
+        address[MRF_SOURCE_DETAIL_KEY] = sources
+        address[MRF_SOURCE_COUNT_KEY] = len(sources)
+
+
+async def _attach_selected_address_source_details(
+    addresses: Sequence[Any],
+    *,
+    include_sources: bool,
+    include_role_evidence: bool = False,
+    session: Any = None,
+) -> None:
+    """Attach opt-in source details through one shared response path."""
+    await _attach_provider_directory_source_details(
+        addresses,
+        include_role_evidence=include_role_evidence,
+        session=session,
+    )
+    if include_sources:
+        await _attach_mrf_source_details(addresses, session=session)
+
+
 async def _execute_stmt(stmt: Any, *, session: Any = None, params: Optional[dict[str, Any]] = None):
     if session is not None:
         return await session.execute(stmt, params or {})
@@ -8376,8 +8553,22 @@ def _match_candidate_output(
     )
     if taxonomy_list:
         candidate_map["taxonomy"] = taxonomy_list
-    if params.get("include_sources") and fhir_sources:
-        candidate_map["provider_directory_sources"] = fhir_sources
+    if params.get("include_sources"):
+        if fhir_sources:
+            candidate_map[PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY] = fhir_sources
+        mrf_sources = _json_array_value(
+            public_provider_map.get(MRF_SOURCE_DETAIL_KEY)
+        )
+        if mrf_sources:
+            mrf_source_count = int(
+                public_provider_map.get(MRF_SOURCE_COUNT_KEY) or len(mrf_sources)
+            )
+            candidate_map[MRF_SOURCE_DETAIL_KEY] = mrf_sources
+            candidate_map[MRF_SOURCE_COUNT_KEY] = mrf_source_count
+            candidate_map["sources"]["mrf"] = {
+                "matched": True,
+                "source_count": mrf_source_count,
+            }
     if params.get("include_evidence"):
         candidate_map["evidence"] = _match_candidate_evidence_map(
             provider_row,
@@ -8397,7 +8588,7 @@ async def _attach_match_candidate_source_details(
     *,
     session: Any = None,
 ) -> None:
-    """Attach compact FHIR provenance without expanding role evidence."""
+    """Attach compact address-local provenance without role expansion."""
     await _attach_geo_candidate_record_ids(
         rows,
         params,
@@ -8405,8 +8596,9 @@ async def _attach_match_candidate_source_details(
     )
     if not (params.get("include_sources") or params.get("include_evidence")):
         return
-    await _attach_provider_directory_source_details(
+    await _attach_selected_address_source_details(
         rows,
+        include_sources=bool(params.get("include_sources")),
         include_role_evidence=False,
         session=session,
     )
@@ -10440,8 +10632,9 @@ async def list_providers(request):
             for location in (provider_result.get("address_list") or [])
             if isinstance(location, dict)
         )
-        await _attach_provider_directory_source_details(
+        await _attach_selected_address_source_details(
             source_detail_targets,
+            include_sources=include_sources,
             include_role_evidence=include_evidence,
             session=request_session,
         )
@@ -11974,8 +12167,9 @@ async def _hydrate_npi_batch_addresses(
         for address in selected_addresses_by_npi[npi]
     ]
     if selected_addresses and (include_sources or include_evidence):
-        await _attach_provider_directory_source_details(
+        await _attach_selected_address_source_details(
             selected_addresses,
+            include_sources=include_sources,
             include_role_evidence=include_evidence,
             session=session,
         )
@@ -12889,8 +13083,9 @@ async def get_npi(request, npi):
         session=request_session,
     )
     if addresses and (include_sources or include_evidence):
-        await _attach_provider_directory_source_details(
+        await _attach_selected_address_source_details(
             addresses,
+            include_sources=include_sources,
             include_role_evidence=include_evidence,
             session=request_session,
         )

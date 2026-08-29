@@ -954,7 +954,16 @@ def _normalize_marketplace_address_entry(address):
     return _apply_marketplace_contact_fields(normalized, canonical_contact)
 
 
-def _build_mrf_address_rows(provider_record, network_tiers, import_id, source_url, last_updated_on, issuer_lookup=None):
+def _build_mrf_address_rows(
+    provider_record,
+    network_tiers,
+    import_id,
+    source_url,
+    last_updated_on,
+    issuer_lookup=None,
+    *,
+    include_address_rows=True,
+):
     """Build canonical address and evidence rows from one MRF provider record."""
     addresses = provider_record.get("addresses", []) or []
     if not isinstance(addresses, list):
@@ -1046,26 +1055,27 @@ def _build_mrf_address_rows(provider_record, network_tiers, import_id, source_ur
                 "address_key": computed_address_key,
             }
 
-        addresses_by_key[address_key] = {
-            "npi": npi,
-            "type": address_type,
-            "checksum": normalized["checksum"],
-            "first_line": normalized["first_line"],
-            "second_line": normalized["second_line"],
-            "city_name": normalized["city_name"],
-            "state_name": normalized["state_name"],
-            "postal_code": normalized["postal_code"],
-            "country_code": normalized["country_code"],
-            "telephone_number": normalized["telephone_number"],
-            "fax_number": normalized["fax_number"],
-            "phone_number": normalized["phone_number"],
-            "phone_extension": normalized["phone_extension"],
-            "fax_number_digits": normalized["fax_number_digits"],
-            "fax_extension": normalized["fax_extension"],
-            "formatted_address": normalized["formatted_address"],
-            "date_added": last_updated_on.date() if last_updated_on else None,
-            "address_key": computed_address_key,
-        }
+        if include_address_rows:
+            addresses_by_key[address_key] = {
+                "npi": npi,
+                "type": address_type,
+                "checksum": normalized["checksum"],
+                "first_line": normalized["first_line"],
+                "second_line": normalized["second_line"],
+                "city_name": normalized["city_name"],
+                "state_name": normalized["state_name"],
+                "postal_code": normalized["postal_code"],
+                "country_code": normalized["country_code"],
+                "telephone_number": normalized["telephone_number"],
+                "fax_number": normalized["fax_number"],
+                "phone_number": normalized["phone_number"],
+                "phone_extension": normalized["phone_extension"],
+                "fax_number_digits": normalized["fax_number_digits"],
+                "fax_extension": normalized["fax_extension"],
+                "formatted_address": normalized["formatted_address"],
+                "date_added": last_updated_on.date() if last_updated_on else None,
+                "address_key": computed_address_key,
+            }
 
     return list(addresses_by_key.values()), list(evidence_by_checksum.values())
 
@@ -1374,7 +1384,6 @@ async def process_plan(ctx, task):
             plan_rows = []
             plan_formulary_rows = []
             marketplace_benefit_rows = []
-            count = 0
             processed_plans = 0
             should_stop_processing = False
             try:
@@ -1506,16 +1515,16 @@ async def process_plan(ctx, task):
                             if plan_limit and processed_plans >= plan_limit:
                                 should_stop_processing = True
                                 break
-                            if count > plan_flush_rows:
+                            if (
+                                len(plan_rows) >= plan_flush_rows
+                                or len(marketplace_benefit_rows) >= plan_flush_rows
+                            ):
                                 await asyncio.gather(
                                     push_objects(plan_rows, myplan),
                                     push_objects(marketplace_benefit_rows, myplanbenefitsmarketplace),
                                 )
                                 plan_rows.clear()
                                 marketplace_benefit_rows.clear()
-                                count = 0
-                            else:
-                                count += 1
                         except Exception as exc:
                             logger.debug(
                                 "Skipping malformed plan entry plan_id=%s year=%s: %s",
@@ -1524,7 +1533,6 @@ async def process_plan(ctx, task):
                                 exc,
                             )
 
-                    count = 0
                     for year in years:
                         if should_stop_processing:
                             break
@@ -1593,14 +1601,11 @@ async def process_plan(ctx, task):
                                                 "coinsurance_opt": cost_sharing.get("coinsurance_opt", ""),
                                             }
                                             plan_formulary_rows.append(formulary_row_dict)
-                                            if count > plan_flush_rows:
+                                            if len(plan_formulary_rows) >= plan_flush_rows:
                                                 await _push_mrf_duplicate_tolerant_rows(
                                                     plan_formulary_rows, myplanformulary
                                                 )
                                                 plan_formulary_rows.clear()
-                                                count = 0
-                                            else:
-                                                count += 1
                                     except Exception as exc:
                                         logger.debug(
                                             "Skipping cost sharing entry for plan %s year=%s: %s",
@@ -1609,8 +1614,6 @@ async def process_plan(ctx, task):
                                             exc,
                                         )
 
-                                    plan_formulary_rows.clear()
-                                    count = 0
                                 else:
                                     await log_error(
                                         "warn",
@@ -1702,22 +1705,31 @@ async def process_provider(ctx, task):
     myplan_networktier = make_class(PlanNetworkTierRaw, import_date, schema_override=db_schema)
     mymrfaddress = make_class(MRFAddress, import_date, schema_override=db_schema)
     mymrfaddressevidence = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
-    issuer_rows = await db.select(
-        myissuer.issuer_id,
-        myissuer.issuer_name,
-        myissuer.issuer_marketing_name,
-        myissuer.mrf_url,
-    ).all()
-    issuer_lookup = {
-        int(issuer_row.issuer_id): _issuer_display_name(
-            issuer_row.issuer_id,
-            issuer_name=issuer_row.issuer_name,
-            issuer_marketing_name=issuer_row.issuer_marketing_name,
-            issuer_url=issuer_row.mrf_url,
-        )
-        for issuer_row in issuer_rows
-        if issuer_row.issuer_id is not None
-    }
+    aggregate_addresses_during_ingest = _is_truthy(
+        os.getenv("HLTHPRT_MRF_ADDRESS_AGGREGATE_DURING_INGEST"),
+        ("yes", "y", "true", "1"),
+    )
+    issuer_cache_key = (getattr(db, "_database_name", None), db_schema, str(import_date))
+    issuer_lookup_cache = ctx.setdefault("mrf_issuer_lookup", {})
+    issuer_lookup = issuer_lookup_cache.get(issuer_cache_key)
+    if issuer_lookup is None:
+        issuer_rows = await db.select(
+            myissuer.issuer_id,
+            myissuer.issuer_name,
+            myissuer.issuer_marketing_name,
+            myissuer.mrf_url,
+        ).all()
+        issuer_lookup = {
+            int(issuer_row.issuer_id): _issuer_display_name(
+                issuer_row.issuer_id,
+                issuer_name=issuer_row.issuer_name,
+                issuer_marketing_name=issuer_row.issuer_marketing_name,
+                issuer_url=issuer_row.mrf_url,
+            )
+            for issuer_row in issuer_rows
+            if issuer_row.issuer_id is not None
+        }
+        issuer_lookup_cache[issuer_cache_key] = issuer_lookup
 
     print("Starting Provider file data download: ", source_url)
     with tempfile.TemporaryDirectory() as tmpdirname:
@@ -1751,10 +1763,10 @@ async def process_provider(ctx, task):
                         break
                     network_tiers_by_checksum = {}
                     has_invalid_plan = False
-                    my_years = set()
                     if not provider_record or not provider_record.get("plans"):
                         continue
                     for plan in provider_record["plans"]:
+                        my_years = set()
                         # try:
                         #     for k in (
                         #             'npi', 'type', 'plans', 'addresses', 'last_updated_on'):
@@ -1914,6 +1926,7 @@ async def process_provider(ctx, task):
                         source_url,
                         last_updated_on,
                         issuer_lookup=issuer_lookup,
+                        include_address_rows=aggregate_addresses_during_ingest,
                     )
                     for address_row in address_rows:
                         mrf_address_obj_dict[
@@ -2938,6 +2951,7 @@ async def init_file(ctx, task=None):
     myplantransparency = make_class(PlanTransparency, import_date, schema_override=db_schema)
 
     with tempfile.TemporaryDirectory() as tmpdirname:
+        transparency_issuer_names = {}
         transparent_files = json.loads(os.environ["HLTHPRT_CMSGOV_PLAN_TRANSPARENCY_URL_PUF"])
         for file_idx, file in enumerate(transparent_files):
             if is_test_mode_enabled and file_idx >= 1:
@@ -3010,6 +3024,9 @@ async def init_file(ctx, task=None):
                         )
                         transparency_row_dict["claims_payment_policies_url"] = str(
                             worksheet_row[column_index_by_name["claims_payment_policies_url"]]
+                        )
+                        transparency_issuer_names[transparency_row_dict["issuer_id"]] = (
+                            transparency_row_dict["issuer_name"]
                         )
 
                         obj_list.append(transparency_row_dict)
@@ -3091,10 +3108,9 @@ async def init_file(ctx, task=None):
                                 (worksheet_row[3] or "").strip() if worksheet_row[3] else ""
                             ),
                         }
-                        issuer_stmt = select(myplantransparency.issuer_name).where(
-                            myplantransparency.issuer_id == issuer_row_dict["issuer_id"]
+                        issuer_name = transparency_issuer_names.get(
+                            issuer_row_dict["issuer_id"]
                         )
-                        issuer_name = await db.scalar(issuer_stmt)
                         issuer_row_dict["issuer_name"] = issuer_name if issuer_name else "N/A"
                         for single_url in row_urls:
                             issuer_row_dict["mrf_url"] = single_url

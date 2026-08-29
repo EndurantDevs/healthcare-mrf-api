@@ -2892,6 +2892,7 @@ async def test_get_npi_debug_flags_include_sources_and_evidence(monkeypatch):
 
     monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
     monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
+    monkeypatch.setattr(npi_module, '_attach_mrf_source_details', AsyncMock())
 
     class FakeApp:
         config = {'NPI_API_UPDATE_GEOCODE': False}
@@ -2941,7 +2942,7 @@ async def test_get_npi_hides_provider_directory_source_details_by_default(monkey
                     'long': -72.0,
                     'formatted_address': None,
                     'place_id': None,
-                    'address_sources': ['provider_directory_fhir'],
+                    'address_sources': ['provider_directory_fhir', 'mrf'],
                     'source_record_ids': [
                         'provider_directory_fhir:practitioner_role:pdfhir_cigna:role-1:loc-1'
                     ],
@@ -2965,6 +2966,8 @@ async def test_get_npi_hides_provider_directory_source_details_by_default(monkey
     })
     monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
     monkeypatch.setattr(npi_module, '_fetch_provider_directory_source_detail_map', fetch_details)
+    mrf_details = AsyncMock()
+    monkeypatch.setattr(npi_module, '_attach_mrf_source_details', mrf_details)
     monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
     class FakeApp:
         config = {'NPI_API_UPDATE_GEOCODE': False}
@@ -2975,8 +2978,10 @@ async def test_get_npi_hides_provider_directory_source_details_by_default(monkey
     response_body = json.loads(response.body)
     address = response_body['address_list'][0]
     fetch_details.assert_not_awaited()
+    mrf_details.assert_not_awaited()
     assert 'provider_directory_sources' not in address
-    assert address['address_sources'] == ['provider_directory_fhir']
+    assert 'mrf_sources' not in address
+    assert address['address_sources'] == ['provider_directory_fhir', 'mrf']
     assert 'source_record_ids' not in address
 
 
