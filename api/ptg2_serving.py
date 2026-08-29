@@ -13634,6 +13634,36 @@ async def _geo_provider_expansion_completion(
 ) -> tuple[list[dict[str, Any]], dict[int, tuple[str, ...]]]:
     """Complete selected NPIs through the bounded filtered-reverse path."""
 
+    if (
+        request.is_source_exhausted
+        and request.serving_rows
+        and all(
+            (provider_set_id := _ptg2_manifest_id(
+                serving_row.get("provider_set_global_id_128")
+            ))
+            and provider_set_id in request.filtered_npis_by_set
+            for serving_row in request.serving_rows
+        )
+    ):
+        provider_set_ids_by_npi = {
+            npi: tuple(
+                provider_set_id
+                for provider_set_id, provider_npis in (
+                    request.filtered_npis_by_set.items()
+                )
+                if npi in provider_npis
+            )
+            for npi in request.selected_npis
+        }
+        if any(
+            not provider_set_ids_by_npi[npi]
+            for npi in request.selected_npis
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 exhausted geo completion lost a selected membership"
+            )
+        return list(request.serving_rows), provider_set_ids_by_npi
+
     keys_by_npi, completion_keys = await _geo_completion_provider_set_keys(
         session, serving_tables, request
     )
