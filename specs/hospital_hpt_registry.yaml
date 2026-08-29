@@ -2341,6 +2341,7 @@ hospitals:
 - hospital_id: hospital-000715
   name: Barnesville Hospital Association, Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Barnesville Hospital
 - hospital_id: hospital-000716
   name: Barrett Hospital Development Corp
   cms_hpt_url: https://www.barretthospital.org/cms-hpt.txt
@@ -3429,6 +3430,7 @@ hospitals:
 - hospital_id: hospital-001050
   name: Camden-Clark Memorial Hospital Corporation
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Camden Clark Medical Center
 - hospital_id: hospital-001051
   name: Cameron Memorial Community Hospital
   cms_hpt_url: https://www.cameronmch.com/cms-hpt.txt
@@ -4534,6 +4536,7 @@ hospitals:
 - hospital_id: hospital-001395
   name: City Hospital, Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Berkeley Medical Center
 - hospital_id: hospital-001396
   name: CITY OF CLINTON
   cms_hpt_url: https://warnerhospital.org/cms-hpt.txt
@@ -4962,6 +4965,7 @@ hospitals:
 - hospital_id: hospital-001524
   name: Community Health Association
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Jackson General Hospital
 - hospital_id: hospital-001525
   name: Community HealthCare System Hospital
   cms_hpt_url: https://www.chcsks.org/cms-hpt.txt
@@ -7906,6 +7910,7 @@ hospitals:
 - hospital_id: hospital-002441
   name: Grant Memorial Hospital Inc
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Grant Memorial Hospital
 - hospital_id: hospital-002442
   name: Grantsburg
   cms_hpt_url: https://www.burnettmedicalcenter.com/cms-hpt.txt
@@ -7993,6 +7998,7 @@ hospitals:
 - hospital_id: hospital-002466
   name: GRMC
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Garrett Regional Medical Center
 - hospital_id: hospital-002467
   name: Grossmont Hospital
   cms_hpt_url: https://www.rchsd.org/cms-hpt.txt
@@ -8250,6 +8256,7 @@ hospitals:
 - hospital_id: hospital-002547
   name: Harrison Community Hospital, Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Harrison Community Hospital
 - hospital_id: hospital-002548
   name: Harrison County Hospital
   cms_hpt_url: https://hchin.org/cms-hpt.txt
@@ -9426,6 +9433,7 @@ hospitals:
 - hospital_id: hospital-002898
   name: Herbert J Thomas Memorial Hospital Association
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Thomas Hospitals
 - hospital_id: hospital-002899
   name: Heritage Valley Beaver
   cms_hpt_url: https://www.heritagevalley.org/cms-hpt.txt
@@ -16913,6 +16921,7 @@ hospitals:
 - hospital_id: hospital-005193
   name: Potomac Valley Hospital of WV, Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Potomac Valley Hospital
 - hospital_id: hospital-005194
   name: Pottstown Hospital
   cms_hpt_url: https://towerhealth.org/cms-hpt.txt
@@ -16978,6 +16987,7 @@ hospitals:
 - hospital_id: hospital-005213
   name: Princeton Community Hospital Assn Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Princeton Community Hospital
 - hospital_id: hospital-005214
   name: Princeton House Behavioral Health
   cms_hpt_url: https://www.pennmedicine.org/cms-hpt.txt
@@ -17544,6 +17554,7 @@ hospitals:
 - hospital_id: hospital-005390
   name: Reynolds Memorial Hospital, Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Reynolds Memorial Hospital
 - hospital_id: hospital-005391
   name: REYNOLDS SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
@@ -20172,6 +20183,7 @@ hospitals:
 - hospital_id: hospital-006189
   name: St. Joseph's Hospital of Buckhannon, Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: St. Joseph's Hospital
 - hospital_id: hospital-006190
   name: St. Joseph's Medical Center of Stockton
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
@@ -22929,6 +22941,7 @@ hospitals:
 - hospital_id: hospital-007050
   name: Weirton Medical Center Inc
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Weirton Medical Center
 - hospital_id: hospital-007051
   name: Weisman Children's Outpatient Rehabilitation Center Northfield
   cms_hpt_url: https://weismanchildrens.com/cms-hpt.txt
@@ -23139,12 +23152,14 @@ hospitals:
 - hospital_id: hospital-007115
   name: West Virginia Health Care Cooperative Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Summersville Regional Medical Center
 - hospital_id: hospital-007116
   name: West Virginia University Hospitals
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
 - hospital_id: hospital-007117
   name: West Virginia University Hospitals, Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: West Virginia University Hospitals
 - hospital_id: hospital-007118
   name: Westchester Medical Center
   cms_hpt_url: https://www.wmchealth.org/cms-hpt.txt
@@ -23191,12 +23206,14 @@ hospitals:
 - hospital_id: hospital-007132
   name: Wetzel County Hospital, Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Wetzel County Hospital
 - hospital_id: hospital-007133
   name: Wheeling Hospital
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
 - hospital_id: hospital-007134
   name: Wheeling Hospital, Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
+  locator_name: Wheeling Hospital
 - hospital_id: hospital-007135
   name: Whidbey Island Public Hospital District
   cms_hpt_url: https://whidbeyhealth.org/cms-hpt.txt

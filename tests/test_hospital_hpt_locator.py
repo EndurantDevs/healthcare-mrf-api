@@ -118,6 +118,19 @@ def test_parser_flushes_final_record_without_trailing_newline():
     ) == (_record("Hospital"),)
 
 
+def test_parser_accepts_bare_absolute_mrf_url_line():
+    assert locator.parse_hospital_hpt_locator(
+        b"location-name: Hospital\n"
+        b"source-page-url: https://hospital.example/prices\n"
+        b"https://files.example/mrf.json\n"
+    ) == (_record("Hospital"),)
+
+    with pytest.raises(locator.HospitalHptLocatorError, match="mrf_url"):
+        locator.parse_hospital_hpt_locator(
+            b"location-name: Hospital\nhttps://files.example/mrf.json\n"
+        )
+
+
 def test_matcher_normalizes_exact_names_and_deduplicates_content_targets():
     shared_locator = "https://hospital.example/cms-hpt.txt"
     registry_hospitals = (

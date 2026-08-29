@@ -106,7 +106,16 @@ def _record(fields: Mapping[str, str]) -> HospitalHptLocatorRecord:
     )
 
 
-def _line_field(line: str) -> tuple[str, str]:
+def _line_field(
+    line: str, fields_by_key: Mapping[str, str]
+) -> tuple[str, str]:
+    stripped_line = line.strip()
+    if (
+        stripped_line.startswith(("http://", "https://"))
+        and {"location-name", "source-page-url"} <= fields_by_key.keys()
+        and "mrf-url" not in fields_by_key
+    ):
+        return "mrf-url", stripped_line
     raw_key, separator, raw_value = line.partition(":")
     key = raw_key.strip().casefold()
     if not separator or not key or any(character.isspace() for character in key):
@@ -127,7 +136,7 @@ def parse_hospital_hpt_locator(
                 records.append(_record(fields_by_key))
                 fields_by_key = {}
             continue
-        key, value = _line_field(line)
+        key, value = _line_field(line, fields_by_key)
         if key == "location-name" and key in fields_by_key:
             records.append(_record(fields_by_key))
             fields_by_key = {}
