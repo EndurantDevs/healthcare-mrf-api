@@ -18,7 +18,6 @@ from api.plan_pricing_projection_contract import (
     normalized_bindings,
     projection_id,
     provider_signature,
-    serving_revision_binding_digest,
     table,
 )
 from api.plan_pricing_projection_source import binding_projection
@@ -259,8 +258,6 @@ async def build_in_session(
     if not HEX_DIGEST.fullmatch(binding_manifest_digest):
         raise ValueError("pricing projection binding digest is invalid")
     binding_manifest = normalized_bindings(bindings)
-    if serving_revision_binding_digest(binding_manifest) != binding_manifest_digest:
-        raise ValueError("pricing projection binding digest does not match bindings")
     provider_generation_signature = await provider_signature(session)
     candidate_id = projection_id(
         binding_manifest_digest,

@@ -88,21 +88,6 @@ def canonical_json(serializable: Any) -> str:
     return json.dumps(serializable, sort_keys=True, separators=(",", ":"))
 
 
-def serving_revision_binding_digest(
-    binding_manifest: list[dict[str, Any]],
-) -> str:
-    """Recompute Import Control's exact physical serving-revision digest."""
-
-    payload = {
-        "contract": "hp-plan-serving-revision-v1",
-        "bindings": binding_manifest,
-    }
-    body = canonical_json(payload)
-    return hashlib.sha256(
-        f"hp_plan_serving_revision_v1:{body}".encode("utf-8")
-    ).hexdigest()
-
-
 def projection_id(binding_digest: str, provider_signature: str) -> str:
     """Derive one immutable projection identity from both bound inputs."""
 

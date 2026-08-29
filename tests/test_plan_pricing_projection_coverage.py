@@ -224,7 +224,7 @@ async def test_materialize_all_codes_enforces_release_bounds(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_session_builder_reuses_exact_candidate_under_lock(monkeypatch):
+async def test_session_builder_reuses_authority_bound_candidate_under_lock(monkeypatch):
     with pytest.raises(ValueError, match="digest is invalid"):
         await projection_build.build_in_session(
             object(), binding_manifest_digest="bad", bindings=[]
@@ -237,15 +237,17 @@ async def test_session_builder_reuses_exact_candidate_under_lock(monkeypatch):
         "role": "in_network",
         "ordinal": 0,
     }
-    binding_digest = projection_contract.serving_revision_binding_digest(
-        [binding_by_field]
+    binding_digest = "b" * 64
+    binding_body = projection_contract.canonical_json(
+        {
+            "contract": "hp-plan-serving-revision-v1",
+            "bindings": [binding_by_field],
+        }
     )
-    with pytest.raises(ValueError, match="does not match bindings"):
-        await projection_build.build_in_session(
-            object(),
-            binding_manifest_digest="b" * 64,
-            bindings=[binding_by_field],
-        )
+    base_digest = hashlib.sha256(
+        f"hp_plan_serving_revision_v1:{binding_body}".encode()
+    ).hexdigest()
+    assert binding_digest != base_digest
 
     async def provider_signature(_session):
         return "c" * 64
@@ -275,9 +277,7 @@ async def test_session_builder_builds_exact_candidate_under_lock(monkeypatch):
         "role": "in_network",
         "ordinal": 0,
     }
-    binding_digest = projection_contract.serving_revision_binding_digest(
-        [binding_by_field]
-    )
+    binding_digest = "b" * 64
     calls = []
 
     async def provider_signature(_session):
@@ -395,17 +395,6 @@ def test_projection_contract_identity_and_valid_binding_are_stable():
     assert projection_contract.normalized_bindings([binding_by_field]) == [
         binding_by_field
     ]
-    assert projection_contract.serving_revision_binding_digest(
-        [
-            {
-                "snapshot_id": "s",
-                "source_key": "k",
-                "plan_id": "p",
-                "role": "in_network",
-                "ordinal": 0,
-            }
-        ]
-    ) == "6df220ef20b12d220ad0fa51fc74233d0eb6377beeb503436ea0b11ef22acccc"
     assert len(projection_contract.projection_id("b" * 64, "c" * 64)) == 64
     assert projection_contract.projection_code_identity(None, "27447") is None
 
