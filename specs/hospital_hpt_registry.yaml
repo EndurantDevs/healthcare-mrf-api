@@ -186,6 +186,7 @@ hospitals:
 - hospital_id: hospital-000048
   name: ADAMS COUNTY MEMORIAL HOSPITAL
   cms_hpt_url: https://adamshealthnetwork.org/cms-hpt.txt
+  locator_name: ADAMS MEMORIAL HOSPITAL
 - hospital_id: hospital-000049
   name: 'Adams County Public Hospital District #2'
   cms_hpt_url: https://www.earh.org/cms-hpt.txt
