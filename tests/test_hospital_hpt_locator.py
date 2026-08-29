@@ -105,6 +105,7 @@ def test_parser_rejects_oversize_and_non_bytes_payloads():
 def test_parser_rejects_control_characters_embedded_bom_and_invalid_port():
     for payload in (
         b"location-name: Hospital\rmrf-url: https://files.example/mrf.json\n",
+        b"location-name: Hospital\x00\nmrf-url: https://files.example/mrf.json\n",
         b"location-name: Hospital\n\xef\xbb\xbfmrf-url: https://files.example/mrf.json\n",
         b"location-name: Hospital\nmrf-url: https://files.example:invalid/mrf\n",
     ):
