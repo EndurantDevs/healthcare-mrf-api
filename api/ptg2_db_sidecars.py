@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import re
 import zlib
@@ -83,15 +84,23 @@ _FORWARD_FANOUT_ROW_RETAINED_BYTES = 288
 _FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES = (
     _FORWARD_FANOUT_ROW_RETAINED_BYTES
 )
-# Packed rows, accumulator copies, the build cache, and its physical-owner
-# index can coexist briefly.
-_PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES = 512
-_PRICE_MEMBERSHIP_MAX_CACHED_RECORDS = (
+# The compact logical-block index and one transient mapping read share the
+# existing 64 MiB price-membership envelope. The per-block allowance covers
+# both persistent dictionaries, compact digests, and one incoming identity.
+PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES_PER_BLOCK = 512
+MAX_PRICE_MEMBERSHIP_ALIAS_RETAINED_BYTES = (
     _SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES
-    // (
-        3 * _SHARED_MAPPING_RECORD_RETAINED_BYTES
-        + _PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES
-    )
+)
+MAX_PRICE_MEMBERSHIP_CACHED_BLOCKS = (
+    MAX_PRICE_MEMBERSHIP_ALIAS_RETAINED_BYTES
+    // PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES_PER_BLOCK
+)
+MAX_PRICE_MEMBERSHIP_CACHED_FRAGMENTS = 131_072
+PRICE_MEMBERSHIP_TRANSIENT_BYTES_PER_FRAGMENT = (
+    3 * _SHARED_MAPPING_RECORD_RETAINED_BYTES
+)
+_PRICE_MEMBERSHIP_PHYSICAL_IDENTITY_DOMAIN = (
+    b"healthporta.ptg2.price-membership-physical.v1\x00"
 )
 # The coordinate index retains a resize-safe dict base, then one dict slot,
 # three-slot key tuple, and empty list for every logical fragment coordinate.
@@ -5050,9 +5059,21 @@ class _PriceMembershipReadPlan:
 
 
 _PriceMembershipBlockKey = tuple[str, int, str, int]
-_PriceMembershipBlockIdentity = tuple[tuple[bytes, ...], int, int]
-_PriceMembershipAliasKey = tuple[str, int, str, tuple[bytes, ...]]
+_PriceMembershipBlockIdentity = tuple[bytes, int, int]
+_PriceMembershipAliasKey = tuple[str, int, str, bytes]
 _PriceMembershipAliasOwner = tuple[_PriceMembershipBlockKey, int]
+
+
+@dataclass
+class _PriceMembershipAliasCache:
+    identity_by_block: dict[
+        _PriceMembershipBlockKey, _PriceMembershipBlockIdentity
+    ] = field(default_factory=dict)
+    owner_by_identity: dict[
+        _PriceMembershipAliasKey, _PriceMembershipAliasOwner
+    ] = field(default_factory=dict)
+    metadata_record_count: int = 0
+    maximum_fragment_count: int = 0
 
 
 def _price_membership_read_plan(
@@ -5100,14 +5121,8 @@ async def _preflight_price_membership_aliases_from_db(
     *,
     block_span: int | None = None,
     schema_name: str = "mrf",
-    identity_by_block: dict[
-        _PriceMembershipBlockKey, _PriceMembershipBlockIdentity
-    ] | None = None,
-    owner_by_identity: dict[
-        _PriceMembershipAliasKey, _PriceMembershipAliasOwner
-    ] | None = None,
-    retained_record_count: int = 0,
-) -> int:
+    cache: _PriceMembershipAliasCache | None = None,
+) -> _PriceMembershipAliasCache:
     """Reject nonempty physical aliases before bounded batch reads."""
 
     read_plan = _price_membership_read_plan(
@@ -5116,11 +5131,11 @@ async def _preflight_price_membership_aliases_from_db(
         block_span=block_span,
         maximum_selected_atom_count=None,
     )
-    cached_identity_by_block, cached_owner_by_identity = (
-        _price_membership_cache_maps(identity_by_block, owner_by_identity)
-    )
-    normalized_record_count = int(retained_record_count)
-    if normalized_record_count < 0:
+    active_cache = cache or _PriceMembershipAliasCache()
+    if (
+        active_cache.metadata_record_count < 0
+        or active_cache.maximum_fragment_count < 0
+    ):
         raise ValueError("price-membership metadata count is invalid")
     cache_keys = tuple(
         (
@@ -5134,66 +5149,115 @@ async def _preflight_price_membership_aliases_from_db(
     missing_cache_keys = tuple(
         cache_key
         for cache_key in cache_keys
-        if cache_key not in cached_identity_by_block
+        if cache_key not in active_cache.identity_by_block
     )
     if missing_cache_keys:
-        fresh_identity_by_block = await _price_membership_block_identities(
+        await _retain_missing_price_membership_identities(
             session,
             shared_snapshot_key,
             read_plan.artifact_kind,
-            tuple(cache_key[3] for cache_key in missing_cache_keys),
             schema_name,
-            _PRICE_MEMBERSHIP_MAX_CACHED_RECORDS - normalized_record_count,
-        )
-        normalized_record_count = _retain_price_membership_identities(
-            fresh_identity_by_block,
             missing_cache_keys,
-            cached_identity_by_block,
-            cached_owner_by_identity,
-            normalized_record_count,
+            active_cache,
         )
-    return normalized_record_count
+    return active_cache
 
 
-def _price_membership_cache_maps(
-    identity_by_block: dict[
-        _PriceMembershipBlockKey, _PriceMembershipBlockIdentity
-    ] | None,
-    owner_by_identity: dict[
-        _PriceMembershipAliasKey, _PriceMembershipAliasOwner
-    ] | None,
-) -> tuple[
-    dict[_PriceMembershipBlockKey, _PriceMembershipBlockIdentity],
-    dict[_PriceMembershipAliasKey, _PriceMembershipAliasOwner],
-]:
-    """Return one complete incremental alias cache or fresh local maps."""
-
-    if (identity_by_block is None) != (owner_by_identity is None):
-        raise ValueError("price-membership alias cache is incomplete")
-    return (
-        {} if identity_by_block is None else identity_by_block,
-        {} if owner_by_identity is None else owner_by_identity,
+async def _retain_missing_price_membership_identities(
+    session: Any,
+    shared_snapshot_key: int,
+    artifact_kind: str,
+    schema_name: str,
+    missing_cache_keys: tuple[_PriceMembershipBlockKey, ...],
+    cache: _PriceMembershipAliasCache,
+) -> None:
+    maximum_records = _price_membership_read_record_limit(
+        len(cache.identity_by_block),
+        len(missing_cache_keys),
+        cache.maximum_fragment_count,
     )
+    pending_batches = [missing_cache_keys]
+    while pending_batches:
+        batch = pending_batches.pop()
+        try:
+            fresh_identity_by_block = await _price_membership_block_identities(
+                session,
+                shared_snapshot_key,
+                artifact_kind,
+                tuple(cache_key[3] for cache_key in batch),
+                schema_name,
+                maximum_records,
+            )
+        except ManifestReadLimitError:
+            if len(batch) == 1:
+                raise
+            midpoint = len(batch) // 2
+            pending_batches.extend((batch[midpoint:], batch[:midpoint]))
+            continue
+        _retain_price_membership_identities(
+            fresh_identity_by_block,
+            batch,
+            cache,
+        )
+
+
+def _price_membership_read_record_limit(
+    cached_block_count: int,
+    missing_block_count: int,
+    maximum_fragment_count: int = 0,
+) -> int:
+    """Reserve the final compact index before one bounded metadata read."""
+
+    final_block_count = cached_block_count + missing_block_count
+    retained_index_bytes = (
+        final_block_count
+        * PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES_PER_BLOCK
+    )
+    remaining_bytes = (
+        MAX_PRICE_MEMBERSHIP_ALIAS_RETAINED_BYTES * 4 // 5
+        - retained_index_bytes
+    )
+    maximum_records = (
+        remaining_bytes // PRICE_MEMBERSHIP_TRANSIENT_BYTES_PER_FRAGMENT
+    )
+    if (
+        final_block_count > MAX_PRICE_MEMBERSHIP_CACHED_BLOCKS
+        or (missing_block_count > 0 and maximum_records < 1)
+        or maximum_fragment_count > maximum_records
+    ):
+        raise ManifestReadLimitError(
+            "price-membership identity index exceeds its bounded limit"
+        )
+    return maximum_records
 
 
 def _retain_price_membership_identities(
     fresh_identity_by_block: dict[int, _PriceMembershipBlockIdentity],
     cache_keys: tuple[_PriceMembershipBlockKey, ...],
-    identity_by_block: dict[
-        _PriceMembershipBlockKey, _PriceMembershipBlockIdentity
-    ],
-    owner_by_identity: dict[
-        _PriceMembershipAliasKey, _PriceMembershipAliasOwner
-    ],
-    retained_record_count: int,
-) -> int:
+    cache: _PriceMembershipAliasCache,
+) -> None:
     """Validate and incrementally retain fresh block identities."""
 
+    fresh_record_count = sum(
+        fresh_identity_by_block[cache_key[3]][2] for cache_key in cache_keys
+    )
+    if (
+        cache.metadata_record_count + fresh_record_count
+        > MAX_PRICE_MEMBERSHIP_CACHED_FRAGMENTS
+    ):
+        raise ManifestReadLimitError(
+            "price-membership metadata exceeds its bounded limit"
+        )
+    pending_owner_by_identity: dict[
+        _PriceMembershipAliasKey, _PriceMembershipAliasOwner
+    ] = {}
     for cache_key in cache_keys:
         cached_identity = fresh_identity_by_block[cache_key[3]]
-        physical_hashes, entry_count, record_count = cached_identity
-        alias_identity = (*cache_key[:3], physical_hashes)
-        existing_owner = owner_by_identity.get(alias_identity)
+        physical_identity, entry_count, _record_count = cached_identity
+        alias_identity = (*cache_key[:3], physical_identity)
+        existing_owner = cache.owner_by_identity.get(
+            alias_identity
+        ) or pending_owner_by_identity.get(alias_identity)
         if (
             existing_owner is not None
             and existing_owner[0] != cache_key
@@ -5202,10 +5266,17 @@ def _retain_price_membership_identities(
             raise PTG2ManifestArtifactError(
                 "PTG2 v3 price-membership block has an incompatible physical alias"
             )
-        identity_by_block[cache_key] = cached_identity
-        owner_by_identity[alias_identity] = (cache_key, entry_count)
-        retained_record_count += record_count
-    return retained_record_count
+        pending_owner_by_identity[alias_identity] = (cache_key, entry_count)
+    for cache_key in cache_keys:
+        cached_identity = fresh_identity_by_block[cache_key[3]]
+        physical_identity, entry_count, record_count = cached_identity
+        alias_identity = (*cache_key[:3], physical_identity)
+        cache.identity_by_block[cache_key] = cached_identity
+        cache.owner_by_identity[alias_identity] = (cache_key, entry_count)
+        cache.metadata_record_count += record_count
+        cache.maximum_fragment_count = max(
+            cache.maximum_fragment_count, record_count
+        )
 
 
 async def _price_membership_block_identities(
@@ -5271,7 +5342,7 @@ def _validated_price_membership_identity(
     mapping_records: tuple[dict[str, Any], ...],
     artifact_kind: str,
     block_key: int,
-) -> tuple[tuple[bytes, ...], int]:
+) -> tuple[bytes, int]:
     """Validate one ordered fragment sequence and copy its compact identity."""
 
     fragment_nos = tuple(
@@ -5292,13 +5363,21 @@ def _validated_price_membership_identity(
             f"PTG2 v3 {artifact_kind} block {block_key} "
             "has invalid fragment entry counts"
         )
-    return (
-        tuple(
-            memoryview(mapping_record["block_hash"]).tobytes()
-            for mapping_record in mapping_records
-        ),
-        entry_count,
+    physical_hashes = tuple(
+        memoryview(mapping_record["block_hash"]).tobytes()
+        for mapping_record in mapping_records
     )
+    if any(len(physical_hash) != 32 for physical_hash in physical_hashes):
+        raise PTG2ManifestArtifactError(
+            f"PTG2 v3 {artifact_kind} block {block_key} "
+            "has an invalid physical identity"
+        )
+    physical_identity = hashlib.sha256()
+    physical_identity.update(_PRICE_MEMBERSHIP_PHYSICAL_IDENTITY_DOMAIN)
+    physical_identity.update(len(physical_hashes).to_bytes(8, "big"))
+    for physical_hash in physical_hashes:
+        physical_identity.update(physical_hash)
+    return physical_identity.digest(), entry_count
 
 
 async def _price_membership_blocks(

@@ -14,6 +14,7 @@ from api.plan_pricing_aggregate_pack import (
     MAX_AGGREGATE_PACK_RECORDS,
 )
 from api.plan_pricing_projection_contract import INSERT_BATCH_SIZE
+from api.ptg2_db_sidecars import _PriceMembershipAliasCache
 
 
 MAX_PREWARM_SHAPES = 768
@@ -113,14 +114,9 @@ class _BuildState:
     member_cell_work_rows: int = 0
     rate_profile_work_rows: int = 0
     aggregate_work_rows: int = 0
-    price_membership_identity_by_block: dict[
-        tuple[str, int, str, int], tuple[tuple[bytes, ...], int, int]
-    ] = field(default_factory=dict)
-    price_membership_owner_by_identity: dict[
-        tuple[str, int, str, tuple[bytes, ...]],
-        tuple[tuple[str, int, str, int], int],
-    ] = field(default_factory=dict)
-    price_membership_metadata_record_count: int = 0
+    price_membership_alias_cache: _PriceMembershipAliasCache = field(
+        default_factory=_PriceMembershipAliasCache
+    )
 
 
 async def _insert_batches(

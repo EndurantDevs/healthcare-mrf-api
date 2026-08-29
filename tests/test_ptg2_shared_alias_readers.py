@@ -264,32 +264,21 @@ async def test_membership_alias_preflight_reuses_transaction_cache(
         "_stream_shared_mapping_records",
         mapping_records,
     )
-    identity_by_block = {}
-    owner_by_identity = {}
-    retained_record_count = (
+    cache = ptg2_db_sidecars._PriceMembershipAliasCache()
+    returned_cache = (
         await ptg2_db_sidecars._preflight_price_membership_aliases_from_db(
-            object(),
-            12,
-            (0,),
-            block_span=1,
-            identity_by_block=identity_by_block,
-            owner_by_identity=owner_by_identity,
+            object(), 12, (0,), block_span=1, cache=cache
         )
     )
-    repeated_record_count = (
+    repeated_cache = (
         await ptg2_db_sidecars._preflight_price_membership_aliases_from_db(
-            object(),
-            12,
-            (0,),
-            block_span=1,
-            identity_by_block=identity_by_block,
-            owner_by_identity=owner_by_identity,
-            retained_record_count=retained_record_count,
+            object(), 12, (0,), block_span=1, cache=cache
         )
     )
 
     assert mapping_calls == [(0,)]
-    assert retained_record_count == repeated_record_count == 1
+    assert returned_cache is repeated_cache is cache
+    assert cache.metadata_record_count == cache.maximum_fragment_count == 1
 
 
 @pytest.mark.asyncio
@@ -310,30 +299,16 @@ async def test_membership_alias_preflight_finds_alias_across_cached_calls(
         "_stream_shared_mapping_records",
         mapping_records,
     )
-    identity_by_block = {}
-    owner_by_identity = {}
-    retained_record_count = (
-        await ptg2_db_sidecars._preflight_price_membership_aliases_from_db(
-            object(),
-            12,
-            (0,),
-            block_span=1,
-            identity_by_block=identity_by_block,
-            owner_by_identity=owner_by_identity,
-        )
+    cache = ptg2_db_sidecars._PriceMembershipAliasCache()
+    await ptg2_db_sidecars._preflight_price_membership_aliases_from_db(
+        object(), 12, (0,), block_span=1, cache=cache
     )
     with pytest.raises(
         ptg2_db_sidecars.PTG2ManifestArtifactError,
         match="incompatible physical alias",
     ):
         await ptg2_db_sidecars._preflight_price_membership_aliases_from_db(
-            object(),
-            12,
-            (1,),
-            block_span=1,
-            identity_by_block=identity_by_block,
-            owner_by_identity=owner_by_identity,
-            retained_record_count=retained_record_count,
+            object(), 12, (1,), block_span=1, cache=cache
         )
 
 

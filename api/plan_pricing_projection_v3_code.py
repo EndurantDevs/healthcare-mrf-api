@@ -26,12 +26,21 @@ from api.plan_pricing_projection_v3_price import (
 )
 from api.plan_pricing_projection_v3_types import _BuildState, _insert_batches
 from api.ptg2_db_sidecars import _preflight_price_membership_aliases_from_db
+from process.ptg_parts.ptg2_manifest_artifacts import ManifestReadLimitError
 
 
 MAX_CODE_OCCURRENCES = 65_536
 MAX_RATE_PROFILE_RATES = 65_536
 MAX_CODE_RATE_PROFILE_WORK_ROWS = 8_000_000
 MAX_PROJECTION_RATE_PROFILE_WORK_ROWS = 2_000_000_000
+
+
+class _PriceMembershipMetadataReadLimitError(ManifestReadLimitError):
+    """Identify bounded price-membership metadata admission failures."""
+
+
+class _PriceHydrationReadLimitError(ManifestReadLimitError):
+    """Identify bounded price-hydration admission failures."""
 
 
 _PROFILE_RATE_LIMIT_SQL = """
@@ -238,20 +247,28 @@ async def _stage_bounded_binding_input(
     """Stage one binding after metadata and price-rate admission."""
 
     binding, serving_rows, occurrences, price_key_by_set_id = bounded_input
-    block_span = await _preflight_binding_price_memberships(
-        session,
-        state,
-        binding,
-        price_key_by_set_id,
-        preflight_price_membership_aliases,
-    )
-    retained_price_ids, consumed_atom_count = await _stage_binding_price_rates(
-        session,
-        binding,
-        price_key_by_set_id,
-        maximum_atom_count=remaining_atom_count,
-        block_span=block_span,
-    )
+    try:
+        block_span = await _preflight_binding_price_memberships(
+            session,
+            state,
+            binding,
+            price_key_by_set_id,
+            preflight_price_membership_aliases,
+        )
+    except ManifestReadLimitError as exc:
+        raise _PriceMembershipMetadataReadLimitError(str(exc)) from exc
+    try:
+        retained_price_ids, consumed_atom_count = (
+            await _stage_binding_price_rates(
+                session,
+                binding,
+                price_key_by_set_id,
+                maximum_atom_count=remaining_atom_count,
+                block_span=block_span,
+            )
+        )
+    except ManifestReadLimitError as exc:
+        raise _PriceHydrationReadLimitError(str(exc)) from exc
     occurrences = Counter(
         {
             key: count
@@ -289,18 +306,14 @@ async def _preflight_binding_price_memberships(
         binding.serving_tables.price_key_block_span,
         "price_key_block_span",
     )
-    retained_record_count = await preflight_price_membership_aliases(
+    await preflight_price_membership_aliases(
         session,
         serving._required_shared_snapshot_key(binding.serving_tables),
         price_key_by_set_id.values(),
         block_span=block_span,
         schema_name=serving.PTG2_SCHEMA,
-        identity_by_block=state.price_membership_identity_by_block,
-        owner_by_identity=state.price_membership_owner_by_identity,
-        retained_record_count=state.price_membership_metadata_record_count,
+        cache=state.price_membership_alias_cache,
     )
-    if type(retained_record_count) is int:
-        state.price_membership_metadata_record_count = retained_record_count
     return block_span
 
 

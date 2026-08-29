@@ -269,13 +269,11 @@ async def test_membership_alias_cache_is_reused_across_code_bindings(
     retained_counts = []
 
     async def preflight(*_args, **kwargs):
-        assert kwargs["identity_by_block"] is state.price_membership_identity_by_block
-        assert (
-            kwargs["owner_by_identity"]
-            is state.price_membership_owner_by_identity
-        )
-        retained_counts.append(kwargs["retained_record_count"])
-        return kwargs["retained_record_count"] + 1
+        cache = kwargs["cache"]
+        assert cache is state.price_membership_alias_cache
+        retained_counts.append(cache.metadata_record_count)
+        cache.metadata_record_count += 1
+        cache.maximum_fragment_count += 1
 
     assert await code_stage._has_staged_code_inputs(
         _ExecuteSession(),
@@ -288,7 +286,68 @@ async def test_membership_alias_cache_is_reused_across_code_bindings(
     )
 
     assert retained_counts == [0, 1]
-    assert state.price_membership_metadata_record_count == 2
+    assert state.price_membership_alias_cache.metadata_record_count == 2
+    assert state.price_membership_alias_cache.maximum_fragment_count == 2
+
+
+@pytest.mark.asyncio
+async def test_metadata_read_limit_wrapper_preserves_original_message(
+    monkeypatch,
+) -> None:
+    original_error = code_stage.ManifestReadLimitError("metadata detail")
+    price_hydration = AsyncMock()
+    monkeypatch.setattr(
+        code_stage,
+        "_stage_binding_price_rates",
+        price_hydration,
+    )
+    stage_code_provider_sets = AsyncMock()
+
+    with pytest.raises(
+        code_stage._PriceMembershipMetadataReadLimitError
+    ) as raised:
+        await code_stage._stage_bounded_binding_input(
+            object(),
+            projection._BuildState(hashlib.sha256()),
+            (_binding(), [], {}, {"1" * 32: 1}),
+            3,
+            stage_code_provider_sets,
+            AsyncMock(side_effect=original_error),
+        )
+
+    assert str(raised.value) == str(original_error)
+    assert raised.value.__cause__ is original_error
+    price_hydration.assert_not_awaited()
+    stage_code_provider_sets.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hydration_read_limit_wrapper_preserves_original_message(
+    monkeypatch,
+) -> None:
+    original_error = code_stage.ManifestReadLimitError("hydration detail")
+    price_hydration = AsyncMock(side_effect=original_error)
+    monkeypatch.setattr(
+        code_stage,
+        "_stage_binding_price_rates",
+        price_hydration,
+    )
+    stage_code_provider_sets = AsyncMock()
+
+    with pytest.raises(code_stage._PriceHydrationReadLimitError) as raised:
+        await code_stage._stage_bounded_binding_input(
+            object(),
+            projection._BuildState(hashlib.sha256()),
+            (_binding(), [], {}, {"1" * 32: 1}),
+            3,
+            stage_code_provider_sets,
+            AsyncMock(),
+        )
+
+    assert str(raised.value) == str(original_error)
+    assert raised.value.__cause__ is original_error
+    price_hydration.assert_awaited_once()
+    stage_code_provider_sets.assert_not_awaited()
 
 
 @pytest.mark.asyncio
