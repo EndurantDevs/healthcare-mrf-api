@@ -42,3 +42,12 @@ def test_provider_directory_adoption_migrations_compile_offline_sql():
     migration_sql = offline_sql_compile_process.stdout
     assert "provider_directory_dataset_resource_plan_lookup_idx" in migration_sql
     assert "import_run_provider_directory_retry_child_idx" in migration_sql
+    composite_create = (
+        'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS '
+        '"import_run_importer_active_idempotency_idx"'
+    )
+    legacy_drop = (
+        'DROP INDEX CONCURRENTLY IF EXISTS '
+        '"mrf"."import_run_active_idempotency_idx"'
+    )
+    assert migration_sql.index(composite_create) < migration_sql.index(legacy_drop)
