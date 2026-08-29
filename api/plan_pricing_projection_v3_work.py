@@ -87,7 +87,7 @@ _WORK_METRICS_SQL = """
          GROUP BY rate.binding_ordinal, rate.provider_set_key
     ), aggregate_by_cell AS MATERIALIZED (
         SELECT cell.geo_cell,
-               SUM(profile.join_rows)::numeric AS join_rows,
+               SUM(profile.distinct_rate_count)::numeric AS join_rows,
                SUM(profile.rate_count)::numeric AS rate_count
           FROM plan_pricing_set_cell_stage cell
           JOIN profile USING (binding_ordinal, provider_set_key)

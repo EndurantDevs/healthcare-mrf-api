@@ -159,6 +159,38 @@ async def test_v3_sql_matches_v2_empty_provider_set_semantics(
     )
 
 
+@pytest.mark.asyncio
+async def test_v3_aggregate_work_counts_distinct_rates_per_cell(
+    monkeypatch,
+    migrated_v3_database,
+) -> None:
+    database = migrated_v3_database
+    projection_id = "a" * 64
+    async with database.engine.begin() as connection:
+        await _insert_candidate(connection, database.schema, projection_id)
+        await projection._create_stage_tables(connection)
+        await _insert_provider_cells(connection, projection_id)
+        await _stage_rows(
+            connection,
+            [_membership(0, 10, 1000000001)],
+            [_occurrence(0, 10, "a"), _occurrence(0, 10, "b")],
+            [_rate(0, "a", "10"), _rate(0, "b", "10", 5)],
+        )
+
+        prepared_work, _state = await _prepare_code_work_under_limits(
+            connection,
+            monkeypatch,
+            database.schema,
+            projection_id,
+            ("HCPCS", "G0439"),
+            None,
+        )
+
+    assert prepared_work == work_admission._CodeWork(
+        1, 2, 2, 2, 2, 6, 6, 1, 12, 6
+    )
+
+
 async def _cancelled_build(
     engine: AsyncEngine,
     schema: str,
