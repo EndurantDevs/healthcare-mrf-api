@@ -369,12 +369,22 @@ async def test_health_helpers_report_success_and_invalid_sysconf(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_table_bootstrap_skips_incomplete_index_specs(monkeypatch):
+@pytest.mark.parametrize("table_exists", (False, True))
+async def test_table_bootstrap_only_creates_indexes_for_new_table(
+    monkeypatch,
+    table_exists,
+):
+    class Result:
+        @staticmethod
+        def scalar():
+            return int(table_exists)
+
     class Connection:
         execute = AsyncMock()
         run_sync = AsyncMock()
 
     connection = Connection()
+    connection.execute.return_value = Result()
 
     class Begin:
         async def __aenter__(self):
@@ -400,7 +410,16 @@ async def test_table_bootstrap_skips_incomplete_index_specs(monkeypatch):
     await control_imports._ensure_import_run_table_once()
 
     database.connect.assert_awaited_once()
-    assert connection.execute.await_count == 3
+    assert connection.execute.await_count == (3 if table_exists else 4)
+    index_statements = [
+        str(call.args[0])
+        for call in connection.execute.await_args_list
+        if "CREATE INDEX" in str(call.args[0])
+    ]
+    assert index_statements == ([] if table_exists else [
+        'CREATE INDEX IF NOT EXISTS "valid_idx" '
+        'ON "mrf"."import_run" (run_id)'
+    ])
 
 
 def test_toc_preview_rejects_non_objects_and_skips_malformed_plans(monkeypatch):

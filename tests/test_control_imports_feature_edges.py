@@ -104,14 +104,34 @@ async def test_finalize_and_active_run_boundaries(monkeypatch):
         {"run_id": "active"}
     ]
 
-    connection = SimpleNamespace(all=AsyncMock(return_value=[]))
-    assert await control_imports._active_idempotency_run(connection, "key") is None
-    connection.all.return_value = [
-        SimpleNamespace(_mapping={"run_id": "deduplicated"})
-    ]
+
+@pytest.mark.asyncio
+async def test_active_idempotency_lookups_bind_importer(monkeypatch):
+    """Keep active idempotency ownership within one importer."""
+
+    active_lookup = AsyncMock(
+        return_value=SimpleNamespace(scalar_one_or_none=lambda: None)
+    )
+    monkeypatch.setattr(control_imports.db, "execute", active_lookup)
     assert (
-        await control_imports._active_idempotency_run(connection, "key")
-    )["run_id"] == "deduplicated"
+        await control_imports.find_active_run_by_idempotency_key(
+            "profile",
+            "key",
+        )
+        is None
+    )
+    assert active_lookup.await_args.args[0].compile().params["importer_1"] == (
+        "profile"
+    )
+
+    connection = SimpleNamespace(all=AsyncMock(return_value=[]))
+    assert (
+        await control_imports._active_idempotency_run(connection, "profile", "key")
+        is None
+    )
+    assert connection.all.await_args.args[0].compile().params["importer_1"] == (
+        "profile"
+    )
 
 
 def test_provider_profile_admission_and_adapter_edge_contracts(monkeypatch):

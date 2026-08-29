@@ -122,14 +122,15 @@ def _hospital_request(
 
 
 def _install_hospital_admission(monkeypatch, database: _HospitalAdmissionDb) -> None:
-    async def active_idempotency(_connection, idempotency_key):
+    async def active_idempotency(_connection, importer, idempotency_key):
         run_snapshots = list(database.runs)
         await asyncio.sleep(0)
         return next(
             (
                 run
                 for run in run_snapshots
-                if run.get("idempotency_key") == idempotency_key
+                if run.get("importer") == importer
+                and run.get("idempotency_key") == idempotency_key
                 and run.get("status") in control_imports.ACTIVE_STATUSES
             ),
             None,
@@ -229,12 +230,16 @@ async def test_hospital_admission_replays_only_the_exact_idempotent_scope(monkey
 async def test_hospital_admission_ignores_other_importer_families(monkeypatch):
     other_run_map = {
         "run_id": "run-npi", "importer": "npi", "status": "running",
-        "params": {}, "idempotency_key": "other-request",
+        "params": {}, "idempotency_key": "npi-request",
     }
     database = _HospitalAdmissionDb((other_run_map,))
     _install_hospital_admission(monkeypatch, database)
     admitted, created = await control_imports.create_import_run(
-        _hospital_request("run-hospital", ["hospital-a"])
+        _hospital_request(
+            "run-hospital",
+            ["hospital-a"],
+            idempotency_key="hospital-request",
+        )
     )
     assert created is True and admitted["run_id"] == "run-hospital"
 
@@ -247,7 +252,7 @@ async def test_same_hospital_admission_race_has_one_winner(monkeypatch):
         asyncio.gather(*(
             control_imports.create_import_run(
                 _hospital_request(f"run-{suffix}", ["hospital-a"],
-                                  idempotency_key=f"request-{suffix}")
+                                  idempotency_key="same-request")
             )
             for suffix in ("a", "b")
         )), timeout=1,

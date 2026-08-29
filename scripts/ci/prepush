@@ -641,6 +641,7 @@ run_core_postgres() {
     PGPASSWORD="$HLTHPRT_DB_PASSWORD" \
     timeout --foreground 295s python -m pytest -q \
     tests/test_control_imports_db.py \
+    tests/test_import_run_idempotency_scope_postgres.py \
     tests/test_plan_pricing_idempotency_postgres.py \
     tests/test_control_npi_db.py \
     tests/test_control_import_attempt_fence_db.py; then

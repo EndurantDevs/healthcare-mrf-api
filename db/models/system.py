@@ -134,6 +134,12 @@ class ImportRun(Base, JSONOutputMixin):
         },
         {
             "index_elements": ("importer", "idempotency_key"),
+            "name": "import_run_importer_active_idempotency_idx",
+            "unique": True,
+            "where": "status IN ('queued', 'starting', 'running', 'finalizing', 'canceling')",
+        },
+        {
+            "index_elements": ("importer", "idempotency_key"),
             "name": "import_run_plan_pricing_idempotency_idx",
             "unique": True,
             "where": (
