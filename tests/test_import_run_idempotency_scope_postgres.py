@@ -72,7 +72,7 @@ async def _assert_same_importer_integrity_recovery(monkeypatch):
     return real_find, real_find_importer
 
 
-async def _assert_active_index_definition():
+async def _assert_active_index_definition() -> None:
     index_record_by_name = {
         str(index_record.index_name): index_record
         for index_record in (
@@ -131,10 +131,15 @@ def _run_alembic(schema: str, *arguments: str) -> subprocess.CompletedProcess[st
         capture_output=True,
         text=True,
         check=False,
+        timeout=180,
     )
 
 
-async def _index_state(connection, schema: str, index_name: str):
+async def _index_state(
+    connection: asyncpg.Connection,
+    schema: str,
+    index_name: str,
+) -> asyncpg.Record | None:
     return await connection.fetchrow(
         """
         SELECT table_record.relname AS table_name,

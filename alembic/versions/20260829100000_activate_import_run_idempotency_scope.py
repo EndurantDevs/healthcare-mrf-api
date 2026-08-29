@@ -195,9 +195,7 @@ def downgrade() -> None:
     schema = _schema()
     context = op.get_context()
     if context.as_sql:
-        with context.autocommit_block():
-            op.execute(text(_create_legacy_index_sql(schema)))
-        return
+        raise RuntimeError("offline_downgrade_requires_live_index_cleanup")
 
     if _legacy_index_needs_rebuild(schema):
         with context.autocommit_block():

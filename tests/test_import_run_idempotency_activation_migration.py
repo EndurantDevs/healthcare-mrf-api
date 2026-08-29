@@ -401,11 +401,13 @@ def test_offline_upgrade_emits_only_activation_drop(monkeypatch):
     assert migration.INDEX_NAME not in sql
 
 
-def test_offline_downgrade_restores_only_global_index(monkeypatch):
+def test_offline_downgrade_requires_live_cleanup(monkeypatch):
     migration, output_buffer = _offline_operations(monkeypatch)
 
-    migration.downgrade()
+    with pytest.raises(
+        RuntimeError,
+        match="offline_downgrade_requires_live_index_cleanup",
+    ):
+        migration.downgrade()
 
-    sql = output_buffer.getvalue()
-    assert migration._create_legacy_index_sql("fixture") in sql
-    assert migration.INDEX_NAME not in sql
+    assert output_buffer.getvalue() == ""
