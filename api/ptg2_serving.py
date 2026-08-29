@@ -19866,6 +19866,420 @@ async def search_ptg2_serving_table(
         mode_value,
     )
 
+
+@dataclass(frozen=True)
+class _ProviderProcedureRequest:
+    """Raw public inputs for one provider reverse-index search."""
+
+    npi: int
+    args: dict[str, Any]
+    pagination: Any
+    snapshot_id: str
+    serving_tables: PTG2ServingTables
+
+
+@dataclass(frozen=True)
+class _ProviderProcedureSearch:
+    """Normalized exact search inputs after code and price resolution."""
+
+    request: _ProviderProcedureRequest
+    provider_set_ids: tuple[str, ...]
+    requested_plan: str
+    code_value: str
+    q_text: str
+    market_type: str
+    code_context: Any
+    price_filter_query: str
+    has_price_filter: bool
+    requested_limit: int
+    requested_offset: int
+    sentinel_limit: int
+
+
+@dataclass(frozen=True)
+class _ProviderProcedureRows:
+    """Exact reverse rows and pagination evidence before response shaping."""
+
+    serving_rows: list[dict[str, Any]]
+    prices_by_price_set: Mapping[str | None, Any]
+    exact_total: int | None
+    observed_total_lower_bound: int
+
+
+@dataclass(frozen=True)
+class _ProviderProcedureItemContext:
+    """Request-scoped enrichment used to shape selected procedure rows."""
+
+    source_provenance_by_key: Mapping[int, Any]
+    procedure_details: Mapping[tuple[str, str], dict[str, Any]]
+    provider_context: Mapping[str, Any]
+    item_args_by_name: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _ProviderProcedurePage:
+    """One bounded response page with exact or lower-bound totals."""
+
+    response_items: list[dict[str, Any]]
+    total: int
+    has_more: bool
+    is_total_exact: bool
+    total_lower_bound: int
+
+
+async def _provider_procedure_search(
+    session,
+    request: _ProviderProcedureRequest,
+    provider_set_ids: tuple[str, ...],
+) -> _ProviderProcedureSearch:
+    """Normalize one provider procedure request without reading rate rows."""
+
+    args = request.args
+    requested_plan = str(
+        args.get("plan_id") or args.get("plan_external_id") or ""
+    ).strip()
+    code_value = str(
+        args.get("code") or args.get("reported_code") or ""
+    ).strip()
+    q_text = str(
+        args.get("q") or args.get("service_name") or ""
+    ).strip().lower()
+    market_type = str(args.get("plan_market_type") or "").strip().lower()
+    code_context = await _resolve_ptg2_code_search_context(
+        session,
+        code=code_value,
+        code_system=args.get("code_system"),
+    )
+    price_filter_params_by_name: dict[str, Any] = {}
+    price_filter_query = _price_filter_clauses(
+        args,
+        price_filter_params_by_name,
+    )[1]
+    requested_limit = max(
+        int(getattr(request.pagination, "limit", 25) or 25),
+        1,
+    )
+    requested_offset = max(
+        int(getattr(request.pagination, "offset", 0) or 0),
+        0,
+    )
+    return _ProviderProcedureSearch(
+        request=request,
+        provider_set_ids=provider_set_ids,
+        requested_plan=requested_plan,
+        code_value=code_value,
+        q_text=q_text,
+        market_type=market_type,
+        code_context=code_context,
+        price_filter_query=price_filter_query,
+        has_price_filter=bool(price_filter_query),
+        requested_limit=requested_limit,
+        requested_offset=requested_offset,
+        sentinel_limit=requested_limit + 1,
+    )
+
+
+def _provider_procedure_reverse_query(
+    search: _ProviderProcedureSearch,
+) -> _VersionThreeReverseQuery:
+    """Bind normalized inputs to one exact bounded reverse query."""
+
+    request = search.request
+    return _VersionThreeReverseQuery(
+        provider_set_ids=search.provider_set_ids,
+        requested_plan=search.requested_plan,
+        code_value=search.code_value,
+        code_system=request.args.get("code_system"),
+        q_text=search.q_text,
+        code_context=search.code_context,
+        source_trace_set_hash=None,
+        network_names=request.serving_tables.network_names or [],
+        limit=None if search.has_price_filter else search.sentinel_limit,
+        offset=0 if search.has_price_filter else search.requested_offset,
+        apply_window=not search.has_price_filter,
+        plan_market_type=search.market_type,
+    )
+
+
+async def _unfiltered_provider_procedure_rows(
+    session,
+    search: _ProviderProcedureSearch,
+    reverse_query: _VersionThreeReverseQuery,
+) -> _ProviderProcedureRows:
+    """Read one sentinel page and hydrate its selected dense price sets."""
+
+    reverse_selection = await _version_three_reverse_selection(
+        session,
+        search.request.serving_tables,
+        reverse_query,
+    )
+    serving_rows = list(reverse_selection.rows)
+    price_key_by_set_id = {
+        _ptg2_manifest_id(
+            serving_row.get("price_set_global_id_128")
+        ): int(serving_row.get("price_key"))
+        for serving_row in serving_rows
+        if serving_row.get("price_key") is not None
+        and _ptg2_manifest_id(
+            serving_row.get("price_set_global_id_128")
+        )
+    }
+    prices_by_price_set = await _prices_for_price_sets(
+        session,
+        search.request.serving_tables,
+        [
+            _ptg2_manifest_id(
+                serving_row.get("price_set_global_id_128")
+            )
+            for serving_row in serving_rows
+        ],
+        price_key_by_set_id=price_key_by_set_id,
+    )
+    return _ProviderProcedureRows(
+        serving_rows=serving_rows,
+        prices_by_price_set=prices_by_price_set,
+        exact_total=reverse_selection.total_row_count,
+        observed_total_lower_bound=(
+            search.requested_offset + len(serving_rows)
+        ),
+    )
+
+
+async def _provider_procedure_rows(
+    session,
+    search: _ProviderProcedureSearch,
+) -> _ProviderProcedureRows:
+    """Select filtered or sentinel reverse rows with equivalent totals."""
+
+    reverse_query = _provider_procedure_reverse_query(search)
+    if not search.has_price_filter:
+        return await _unfiltered_provider_procedure_rows(
+            session,
+            search,
+            reverse_query,
+        )
+    filtered_selection = await _version_three_filtered_reverse_selection(
+        session,
+        search.request.serving_tables,
+        reverse_query,
+        search.request.args,
+        offset=search.requested_offset,
+        limit=search.sentinel_limit,
+    )
+    return _ProviderProcedureRows(
+        serving_rows=list(filtered_selection.rows),
+        prices_by_price_set=dict(filtered_selection.prices_by_price_set),
+        exact_total=filtered_selection.total_row_count,
+        observed_total_lower_bound=filtered_selection.matched_rows_seen,
+    )
+
+
+async def _provider_procedure_item_context(
+    session,
+    search: _ProviderProcedureSearch,
+    procedure_rows: _ProviderProcedureRows,
+) -> _ProviderProcedureItemContext:
+    """Load source, procedure, and provider enrichment for selected rows."""
+
+    request = search.request
+    await _hydrate_provider_set_network_names(
+        session,
+        request.serving_tables,
+        procedure_rows.serving_rows,
+    )
+    source_provenance_by_key = (
+        await _ptg2_source_provenance_for_rows(
+            session,
+            request.serving_tables,
+            procedure_rows.serving_rows,
+        )
+        if _include_ptg2_sources(request.args)
+        else {}
+    )
+    procedure_details = await _procedure_details_for_rows(
+        session,
+        procedure_rows.serving_rows,
+    )
+    provider_context_rows = await _enriched_provider_rows_for_npis(
+        session,
+        npis=[request.npi],
+        limit=1,
+        plan_id=search.requested_plan or None,
+        snapshot_id=request.snapshot_id,
+        source_key=request.args.get("source_key") or None,
+    )
+    return _ProviderProcedureItemContext(
+        source_provenance_by_key=source_provenance_by_key,
+        procedure_details=procedure_details,
+        provider_context=(
+            provider_context_rows[0]
+            if provider_context_rows
+            else {"npi": request.npi}
+        ),
+        item_args_by_name={
+            **request.args,
+            "snapshot_id": request.snapshot_id,
+            "source_key": _logical_source_key(
+                request.serving_tables,
+                request.args,
+            ),
+        },
+    )
+
+
+def _provider_procedure_item(
+    search: _ProviderProcedureSearch,
+    procedure_rows: _ProviderProcedureRows,
+    item_context: _ProviderProcedureItemContext,
+    serving_row: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Shape one exact provider procedure occurrence."""
+
+    price_set_id = _ptg2_manifest_id(
+        serving_row.get("price_set_global_id_128")
+    )
+    catalog_key = _catalog_key(
+        serving_row.get("reported_code_system"),
+        serving_row.get("reported_code"),
+    ) or ("", "")
+    source_provenance = item_context.source_provenance_by_key.get(
+        int(serving_row["source_key"])
+    )
+    serving_row_with_trace_by_field = {
+        **serving_row,
+        **(
+            _item_source_provenance(source_provenance)
+            if source_provenance is not None
+            else {"source_artifact_key": int(serving_row["source_key"])}
+        ),
+    }
+    return _ptg2_manifest_provider_procedure_item(
+        npi=search.request.npi,
+        serving_data=serving_row_with_trace_by_field,
+        prices=procedure_rows.prices_by_price_set.get(price_set_id, []),
+        procedure_detail=item_context.procedure_details.get(catalog_key, {}),
+        provider_context=item_context.provider_context,
+        args=item_context.item_args_by_name,
+    )
+
+
+def _provider_procedure_page(
+    search: _ProviderProcedureSearch,
+    procedure_rows: _ProviderProcedureRows,
+    response_items: list[dict[str, Any]],
+) -> _ProviderProcedurePage:
+    """Apply the sentinel page and retain exact or lower-bound totals."""
+
+    has_more = len(response_items) > search.requested_limit
+    response_items = response_items[: search.requested_limit]
+    is_total_exact = procedure_rows.exact_total is not None
+    total_lower_bound = (
+        int(procedure_rows.exact_total)
+        if is_total_exact
+        else max(
+            procedure_rows.observed_total_lower_bound,
+            search.requested_offset + len(response_items),
+        )
+    )
+    _hide_source_artifact_key_unless_requested(
+        response_items,
+        search.request.args,
+    )
+    return _ProviderProcedurePage(
+        response_items=response_items,
+        total=(
+            int(procedure_rows.exact_total)
+            if is_total_exact
+            else total_lower_bound
+        ),
+        has_more=has_more,
+        is_total_exact=is_total_exact,
+        total_lower_bound=total_lower_bound,
+    )
+
+
+def _provider_procedure_query_fields(
+    request: _ProviderProcedureRequest,
+    search: _ProviderProcedureSearch | None,
+    *,
+    status: str | None,
+) -> dict[str, Any]:
+    """Return the compatible public query echo for one reverse search."""
+
+    args = request.args
+    query_fields_by_name = {
+        "npi": request.npi,
+        "plan_id": args.get("plan_id") or None,
+        "plan_external_id": args.get("plan_external_id") or None,
+        "plan_market_type": (
+            search.market_type
+            if search is not None
+            else str(args.get("plan_market_type") or "").strip().lower()
+        )
+        or None,
+        "source_key": args.get("source_key") or None,
+        "snapshot_id": request.snapshot_id,
+        "mode": normalize_ptg2_mode(args.get("mode")),
+        "code": (
+            search.code_value
+            if search is not None
+            else args.get("code") or args.get("reported_code")
+        )
+        or None,
+        "code_system": args.get("code_system") or None,
+        "q": (
+            search.q_text
+            if search is not None
+            else args.get("q") or args.get("service_name")
+        )
+        or None,
+        "source": "ptg2_db",
+        "serving_table": None,
+        "provider_reverse_index": True,
+        "status": status,
+    }
+    if search is not None:
+        query_fields_by_name["price_filter"] = search.price_filter_query or None
+        query_fields_by_name.update(
+            _ptg2_code_query_fields(search.code_context, args)
+        )
+    return query_fields_by_name
+
+
+def _shape_provider_procedure_response(
+    request: _ProviderProcedureRequest,
+    page: _ProviderProcedurePage,
+    search: _ProviderProcedureSearch | None,
+) -> dict[str, Any]:
+    """Shape one compatible provider-procedure response envelope."""
+
+    pagination = request.pagination
+    return _shape_ptg2_response(
+        {
+            "items": page.response_items,
+            "pagination": {
+                "total": page.total,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": (
+                    (pagination.offset // pagination.limit) + 1
+                    if pagination.limit
+                    else 1
+                ),
+                "has_more": page.has_more,
+                "total_is_exact": page.is_total_exact,
+                "total_lower_bound": page.total_lower_bound,
+            },
+            "query": _provider_procedure_query_fields(
+                request,
+                search,
+                status=None if page.total else "no_match",
+            ),
+        },
+        request.args,
+    )
+
+
 async def _search_ptg2_manifest_provider_procedures(
     session,
     npi: int,
@@ -19877,238 +20291,49 @@ async def _search_ptg2_manifest_provider_procedures(
 ) -> dict[str, Any] | None:
     """Search strict shared V3 procedures and prices for one provider NPI."""
 
-    _require_strict_shared_v3(serving_tables)
+    request = _ProviderProcedureRequest(
+        npi=npi,
+        args=args,
+        pagination=pagination,
+        snapshot_id=snapshot_id,
+        serving_tables=serving_tables,
+    )
+    _require_strict_shared_v3(request.serving_tables)
     provider_set_ids = await _provider_sets_for_npi(
         session,
-        serving_tables,
-        npi,
+        request.serving_tables,
+        request.npi,
     )
     if not provider_set_ids:
-        return _shape_ptg2_response(
-            {
-                "items": [],
-                "pagination": {
-                    "total": 0,
-                    "limit": pagination.limit,
-                    "offset": pagination.offset,
-                    "page": (pagination.offset // pagination.limit) + 1
-                    if pagination.limit
-                    else 1,
-                    "has_more": False,
-                    "total_is_exact": True,
-                    "total_lower_bound": 0,
-                },
-                "query": {
-                    "npi": npi,
-                    "plan_id": args.get("plan_id") or None,
-                    "plan_external_id": args.get("plan_external_id") or None,
-                    "plan_market_type": str(args.get("plan_market_type") or "").strip().lower()
-                    or None,
-                    "source_key": args.get("source_key") or None,
-                    "snapshot_id": snapshot_id,
-                    "mode": normalize_ptg2_mode(args.get("mode")),
-                    "code": args.get("code") or args.get("reported_code") or None,
-                    "code_system": args.get("code_system") or None,
-                    "q": args.get("q") or args.get("service_name") or None,
-                    "source": "ptg2_db",
-                    "serving_table": None,
-                    "provider_reverse_index": True,
-                    "status": "no_match",
-                },
-            },
-            args,
+        return _shape_provider_procedure_response(
+            request,
+            _ProviderProcedurePage([], 0, False, True, 0),
+            None,
         )
-
-    requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
-    code_value = str(args.get("code") or args.get("reported_code") or "").strip()
-    q_text = str(args.get("q") or args.get("service_name") or "").strip().lower()
-    market_type = str(args.get("plan_market_type") or "").strip().lower()
-    code_context = await _resolve_ptg2_code_search_context(
+    search = await _provider_procedure_search(
         session,
-        code=code_value,
-        code_system=args.get("code_system"),
+        request,
+        tuple(provider_set_ids),
     )
-    price_filter_params_by_name: dict[str, Any] = {}
-    _, price_filter_query = _price_filter_clauses(
-        args,
-        price_filter_params_by_name,
-    )
-    has_price_filter = bool(price_filter_query)
-    requested_limit = max(int(getattr(pagination, "limit", 25) or 25), 1)
-    requested_offset = max(int(getattr(pagination, "offset", 0) or 0), 0)
-    sentinel_limit = requested_limit + 1
-    reverse_query = _VersionThreeReverseQuery(
-        provider_set_ids=provider_set_ids,
-        requested_plan=requested_plan,
-        code_value=code_value,
-        code_system=args.get("code_system"),
-        q_text=q_text,
-        code_context=code_context,
-        source_trace_set_hash=None,
-        network_names=serving_tables.network_names or [],
-        limit=None if has_price_filter else sentinel_limit,
-        offset=0 if has_price_filter else requested_offset,
-        apply_window=not has_price_filter,
-        plan_market_type=market_type,
-    )
-    if has_price_filter:
-        filtered_selection = await _version_three_filtered_reverse_selection(
-            session,
-            serving_tables,
-            reverse_query,
-            args,
-            offset=requested_offset,
-            limit=sentinel_limit,
-        )
-        serving_rows = list(filtered_selection.rows)
-        prices_by_price_set = dict(filtered_selection.prices_by_price_set)
-        exact_total = filtered_selection.total_row_count
-        observed_total_lower_bound = filtered_selection.matched_rows_seen
-    else:
-        reverse_selection = await _version_three_reverse_selection(
-            session,
-            serving_tables,
-            reverse_query,
-        )
-        serving_rows = list(reverse_selection.rows)
-        exact_total = reverse_selection.total_row_count
-        observed_total_lower_bound = requested_offset + len(serving_rows)
-        price_key_by_set_id = {
-            _ptg2_manifest_id(
-                serving_row.get("price_set_global_id_128")
-            ): int(serving_row.get("price_key"))
-            for serving_row in serving_rows
-            if serving_row.get("price_key") is not None
-            and _ptg2_manifest_id(
-                serving_row.get("price_set_global_id_128")
-            )
-        }
-        prices_by_price_set = await _prices_for_price_sets(
-            session,
-            serving_tables,
-            [
-                _ptg2_manifest_id(
-                    serving_row.get("price_set_global_id_128")
-                )
-                for serving_row in serving_rows
-            ],
-            price_key_by_set_id=price_key_by_set_id,
-        )
-    await _hydrate_provider_set_network_names(
+    procedure_rows = await _provider_procedure_rows(session, search)
+    item_context = await _provider_procedure_item_context(
         session,
-        serving_tables,
-        serving_rows,
+        search,
+        procedure_rows,
     )
-
-    source_provenance_by_key = (
-        await _ptg2_source_provenance_for_rows(
-            session,
-            serving_tables,
-            serving_rows,
+    response_items = [
+        _provider_procedure_item(
+            search,
+            procedure_rows,
+            item_context,
+            serving_row,
         )
-        if _include_ptg2_sources(args)
-        else {}
-    )
-    procedure_details = await _procedure_details_for_rows(
-        session,
-        serving_rows,
-    )
-    provider_context_rows = await _enriched_provider_rows_for_npis(
-        session,
-        npis=[npi],
-        limit=1,
-        plan_id=requested_plan or None,
-        snapshot_id=snapshot_id,
-        source_key=args.get("source_key") or None,
-    )
-    provider_context = provider_context_rows[0] if provider_context_rows else {"npi": npi}
-    item_args_by_name = {
-        **args,
-        "snapshot_id": snapshot_id,
-        "source_key": _logical_source_key(serving_tables, args),
-    }
-
-    response_items: list[dict[str, Any]] = []
-    for serving_row in serving_rows:
-        prices = prices_by_price_set.get(
-            _ptg2_manifest_id(
-                serving_row.get("price_set_global_id_128")
-            ),
-            [],
-        )
-        reported_code = serving_row.get("reported_code")
-        reported_system = serving_row.get("reported_code_system")
-        procedure_detail = procedure_details.get(_catalog_key(reported_system, reported_code) or ("", ""), {})
-        source_provenance = source_provenance_by_key.get(
-            int(serving_row["source_key"])
-        )
-        serving_row_with_trace_by_field = {
-            **serving_row,
-            **(
-                _item_source_provenance(source_provenance)
-                if source_provenance is not None
-                else {
-                    "source_artifact_key": int(serving_row["source_key"])
-                }
-            ),
-        }
-        response_items.append(
-            _ptg2_manifest_provider_procedure_item(
-                npi=npi,
-                serving_data=serving_row_with_trace_by_field,
-                prices=prices,
-                procedure_detail=procedure_detail,
-                provider_context=provider_context,
-                args=item_args_by_name,
-            )
-        )
-    has_more = len(response_items) > requested_limit
-    response_items = response_items[:requested_limit]
-    is_total_exact = exact_total is not None
-    total_lower_bound = (
-        int(exact_total)
-        if is_total_exact
-        else max(
-            observed_total_lower_bound,
-            requested_offset + len(response_items),
-        )
-    )
-    total = int(exact_total) if is_total_exact else total_lower_bound
-
-    _hide_source_artifact_key_unless_requested(response_items, args)
-
-    return _shape_ptg2_response(
-        {
-            "items": response_items,
-            "pagination": {
-                "total": total,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
-                "has_more": has_more,
-                "total_is_exact": is_total_exact,
-                "total_lower_bound": total_lower_bound,
-            },
-            "query": {
-                "npi": npi,
-                "plan_id": args.get("plan_id") or None,
-                "plan_external_id": args.get("plan_external_id") or None,
-                "plan_market_type": market_type or None,
-                "source_key": args.get("source_key") or None,
-                "snapshot_id": snapshot_id,
-                "mode": normalize_ptg2_mode(args.get("mode")),
-                "code": code_value or None,
-                "code_system": args.get("code_system") or None,
-                "q": q_text or None,
-                "price_filter": price_filter_query or None,
-                "source": "ptg2_db",
-                "serving_table": None,
-                "provider_reverse_index": True,
-                "status": None if total else "no_match",
-                **_ptg2_code_query_fields(code_context, args),
-            },
-        },
-        args,
+        for serving_row in procedure_rows.serving_rows
+    ]
+    return _shape_provider_procedure_response(
+        request,
+        _provider_procedure_page(search, procedure_rows, response_items),
+        search,
     )
 
 
