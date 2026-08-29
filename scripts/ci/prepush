@@ -584,6 +584,7 @@ run_core_postgres() {
     tests/test_hospital_price_storage.py \
     tests/test_plan_pricing_projection_postgres.py \
     tests/test_plan_pricing_projection_v3_postgres.py \
+    tests/test_plan_pricing_projection_v3_staging_postgres.py \
     tests/test_plan_pricing_projection_v3_differential_postgres.py \
     tests/test_plan_pricing_projection_v3_census_postgres.py \
     tests/test_plan_pricing_projection_v3_work_postgres.py \

@@ -13,12 +13,12 @@
     "global_state_usage": 0,
     "inline_suppressions": 1,
     "long_files": 149,
-    "long_functions": 205,
+    "long_functions": 204,
     "missing_contract_docstrings": 0,
     "pass_placeholders": 0,
     "single_letter_names": 0,
     "syntax_errors": 0,
-    "too_many_locals": 82,
+    "too_many_locals": 81,
     "too_many_parameters": 35
   },
   "issue_ids": {
@@ -205,7 +205,6 @@
     "long_functions": [
       "long_function:api/control_imports.py:create_import_run",
       "long_function:api/endpoint/coverage.py:coverage_statistics",
-      "long_function:api/endpoint/geo.py:list_geo_states",
       "long_function:api/endpoint/npi.py:_build_nearby_sql",
       "long_function:api/endpoint/npi.py:_fetch_provider_enrichment_detail",
       "long_function:api/endpoint/npi.py:_match_candidate_query",
@@ -414,7 +413,6 @@
     "single_letter_names": [],
     "syntax_errors": [],
     "too_many_locals": [
-      "too_many_locals:api/endpoint/geo.py:list_geo_states",
       "too_many_locals:api/endpoint/npi.py:_match_candidate_query",
       "too_many_locals:api/endpoint/npi.py:get_facility_connected_providers",
       "too_many_locals:api/endpoint/npi.py:get_near_npi",
