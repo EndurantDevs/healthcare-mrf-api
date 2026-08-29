@@ -266,7 +266,7 @@ def test_provider_expansion_identity_and_budget_errors_fail_before_io():
         )
         is None
     )
-    for raw_count, message in (("bad", "invalid"), (-1, "negative")):
+    for raw_count, message in (("bad", "invalid"), (True, "invalid"), (-1, "negative")):
         with pytest.raises(serving.PTG2ManifestArtifactError, match=message):
             serving._rate_row_provider_count({"provider_count": raw_count})
 

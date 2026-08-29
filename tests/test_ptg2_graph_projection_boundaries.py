@@ -82,10 +82,12 @@ async def test_filtered_prefix_reuses_memberships_and_deduplicates_rank_keys(
         await serving._rank_filtered_provider_expansion_prefix(
             object(),
             strict_v3_tables(),
-            [rate_row, dict(rate_row)],
-            {},
-            target_count=2,
-            npis_by_set={},
+            serving._FilteredProviderExpansionRequest(
+                row_data=[rate_row, dict(rate_row)],
+                args={},
+                target_count=2,
+                npis_by_set={},
+            ),
         )
     )
 
@@ -103,7 +105,11 @@ async def test_filtered_prefix_rejects_missing_set_and_stops_at_target(
 
     with pytest.raises(serving.PTG2ManifestArtifactError, match="missing its provider-set"):
         await serving._rank_filtered_provider_expansion_prefix(
-            object(), strict_v3_tables(), [{}], {}, target_count=1, npis_by_set={}
+            object(),
+            strict_v3_tables(),
+            serving._FilteredProviderExpansionRequest(
+                row_data=[{}], args={}, target_count=1, npis_by_set={}
+            ),
         )
     fail_lookup = AsyncMock(side_effect=AssertionError("cached set must not reload"))
     monkeypatch.setattr(
@@ -115,10 +121,12 @@ async def test_filtered_prefix_rejects_missing_set_and_stops_at_target(
         await serving._rank_filtered_provider_expansion_prefix(
             object(),
             strict_v3_tables(),
-            [_rate_row()],
-            {},
-            target_count=2,
-            npis_by_set={_PROVIDER_SET_ID: (1234567890, 1234567891)},
+            serving._FilteredProviderExpansionRequest(
+                row_data=[_rate_row()],
+                args={},
+                target_count=2,
+                npis_by_set={_PROVIDER_SET_ID: (1234567890, 1234567891)},
+            ),
         )
     )
 
