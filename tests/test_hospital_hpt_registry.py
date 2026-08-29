@@ -67,7 +67,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
 
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 7_240
+    assert len(registry.hospital_hpt_registry_groups()) == 7_282
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_220
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 637
