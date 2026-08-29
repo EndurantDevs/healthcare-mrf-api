@@ -35,6 +35,11 @@ def _mrf_address_entries(first_address_key, second_address_key):
             "address_key": "33333333-3333-3333-3333-333333333333",
             "address_sources": ["nppes"],
         },
+        {
+            "npi": 1000000001,
+            "address_key": first_address_key,
+            "address_sources": ["mrf"],
+        },
     ]
 
 
@@ -101,6 +106,8 @@ def _assert_mrf_source_groups(addresses):
     ]
     assert addresses[1]["mrf_source_count"] == 1
     assert "mrf_sources" not in addresses[2]
+    assert addresses[3]["mrf_sources"] == addresses[0]["mrf_sources"]
+    assert addresses[3]["mrf_sources"] is not addresses[0]["mrf_sources"]
     assert "secret" not in str(addresses[0]["mrf_sources"])
 
 
@@ -303,9 +310,8 @@ def test_match_candidate_returns_selected_address_mrf_sources_only_when_requeste
 
 
 def test_openapi_documents_address_local_mrf_source_shape():
-    schemas = yaml.safe_load(Path("doc/openapi.yaml").read_text())["components"][
-        "schemas"
-    ]
+    openapi_path = Path(__file__).resolve().parents[1] / "doc" / "openapi.yaml"
+    schemas = yaml.safe_load(openapi_path.read_text())["components"]["schemas"]
 
     address_properties = schemas["NpiAddress"]["properties"]
     assert address_properties["mrf_sources"]["items"]["$ref"].endswith(

@@ -161,3 +161,6 @@ async def test_provider_import_reuses_issuer_names_within_one_worker(monkeypatch
     assert await initial.process_provider(context, _import_task("providers")) == 1
 
     assert issuer_query.call_count == 1
+    assert next(iter(context["mrf_issuer_lookup"].values())) == {
+        12345: "Synthetic Issuer"
+    }

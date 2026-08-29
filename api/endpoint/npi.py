@@ -4805,14 +4805,15 @@ def _apply_mrf_source_details(
         source_details = details_by_pair.get(source_pair) if source_pair else None
         if not source_details:
             continue
-        source_details.sort(
+        sorted_source_details = sorted(
+            source_details,
             key=lambda source: (
                 str(source["source_name"]).casefold(),
                 tuple(source["issuer_ids"]),
-            )
+            ),
         )
-        address[MRF_SOURCE_DETAIL_KEY] = source_details
-        address[MRF_SOURCE_COUNT_KEY] = len(source_details)
+        address[MRF_SOURCE_DETAIL_KEY] = sorted_source_details
+        address[MRF_SOURCE_COUNT_KEY] = len(sorted_source_details)
 
 
 async def _attach_mrf_source_details(
