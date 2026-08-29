@@ -10782,6 +10782,7 @@ hospitals:
 - hospital_id: hospital-003312
   name: Kennedy Krieger Institute
   cms_hpt_url: https://www.kennedykrieger.org/cms-hpt.txt
+  fallback_mrf_url: https://www.kennedykrieger.org/sites/default/files/library/documents/about-us/Financial%20Docs/520607971_kennedy-krieger-institute_standardcharges_0.csv
 - hospital_id: hospital-003313
   name: Kenner LA
   cms_hpt_url: https://www.perimeterhealthcare.com/cms-hpt.txt
@@ -21200,6 +21201,7 @@ hospitals:
 - hospital_id: hospital-006502
   name: The Kennedy Krieger Institute
   cms_hpt_url: https://www.kennedykrieger.org/cms-hpt.txt
+  fallback_mrf_url: https://www.kennedykrieger.org/sites/default/files/library/documents/about-us/Financial%20Docs/520607971_kennedy-krieger-institute_standardcharges_0.csv
   locator_name: Kennedy Krieger Institute
 - hospital_id: hospital-006503
   name: THE MARY LANNING MEMORIAL HOSPITAL ASSOCIATION
