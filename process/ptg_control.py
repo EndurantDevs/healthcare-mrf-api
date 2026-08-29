@@ -27,15 +27,10 @@ from process.ptg import (
 from process.ptg_parts.ptg_source_worker_admission import (
     guard_ptg_worker_start,
 )
-from process.ptg_parts.frozen_rate_binding_store import (
-    recheck_frozen_binding,
-)
 from process.ptg_wave_claims import claim_wave_job_start, reconcile_wave_claim_exception
-from process.ptg_frozen_control import frozen_rate_main_kwargs, validated_worker_frozen_rate_params
-from process.ptg_singleton_direct_control import (
-    protected_singleton_direct_presence,
-    singleton_direct_main_kwargs,
-    validated_worker_singleton_direct_params,
+from process.ptg_frozen_control import (
+    protected_rate_main_kwargs,
+    validated_worker_rate_params,
 )
 from process.ptg_control_failures import ptg_failure_error
 from process.ptg_allowed_amount_blank_evidence import load_blank_failure_metrics
@@ -50,6 +45,7 @@ from process.ptg_control_environment import (
     _optional_int,
     _ptg_lane_environment,
     _string_list,
+    assert_expected_ptg_lane,
 )
 from process.ptg_wave_worker_claim_adapter import (
     exact_wave_claim_values as _exact_wave_claim_values,
@@ -58,6 +54,7 @@ from process.ptg_wave_worker_claim_adapter import (
 PTG_CONTROL_QUEUE_NAME = "arq:PTG"
 _FULL_REBUILD_TOKEN_PARAM = "_full_rebuild_token"
 _FULL_REBUILD_SCOPE_PARAM = "_full_rebuild_scope_digest"
+_assert_expected_lane = assert_expected_ptg_lane
 async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     """Run one PTG control task with cancellation and heartbeat handling."""
     bind_status_event_loop()
@@ -161,17 +158,10 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 attempt_started_at,
                 attempt_id=attempt_id,
             )
-        if protected_singleton_direct_presence(params_by_name):
-            params_by_name = validated_worker_singleton_direct_params(
-                task_payload,
-                params_by_name,
-            )
-            await recheck_frozen_binding(params_by_name)
-        else:
-            params_by_name = await validated_worker_frozen_rate_params(
-                task_payload,
-                params_by_name,
-            )
+        params_by_name = await validated_worker_rate_params(
+            task_payload,
+            params_by_name,
+        )
         full_rebuild_scope_digest = _full_rebuild_scope_digest(
             params_by_name,
         )
@@ -204,8 +194,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 toc_list=params_by_name.get("toc_list"),
                 in_network_url=params_by_name.get("in_network_url"),
                 allowed_url=params_by_name.get("allowed_url"),
-                **frozen_rate_main_kwargs(params_by_name),
-                **singleton_direct_main_kwargs(params_by_name),
+                **protected_rate_main_kwargs(params_by_name),
                 provider_ref_url=params_by_name.get("provider_ref_url"),
                 import_id=params_by_name.get("import_id"),
                 source_key=params_by_name.get("source_key"),
@@ -449,17 +438,6 @@ async def _flush_terminal_status_events(run_id: str) -> None:
     if timeout <= 0:
         return
     await flush_terminal_status_event(run_id, timeout_seconds=timeout)
-
-
-def _assert_expected_lane(params: dict[str, Any]) -> None:
-    expected_queue = str(params.get("_expected_queue") or "").strip()
-    active_queue = os.getenv("HLTHPRT_ACTIVE_WORKER_QUEUE", "").strip()
-    if expected_queue and active_queue and expected_queue != active_queue:
-        raise RuntimeError(f"PTG payload expected {expected_queue}, but active worker queue is {active_queue}")
-    expected_class = str(params.get("_expected_worker_class") or "").strip()
-    active_class = os.getenv("HLTHPRT_ACTIVE_WORKER_CLASS", "").strip()
-    if expected_class and active_class and expected_class != active_class:
-        raise RuntimeError(f"PTG payload expected {expected_class}, but active worker class is {active_class}")
 
 
 def _full_rebuild_scope_digest(

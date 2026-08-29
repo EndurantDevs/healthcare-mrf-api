@@ -9,10 +9,8 @@ from process.ptg_parts.frozen_rate_binding import (
     FROZEN_RATE_FILE_PROTECTED_FIELDS,
     protected_frozen_field_presence,
 )
-from process.ptg_singleton_direct_control import (
-    normalize_protected_rate_params,
-    protected_singleton_direct_presence,
-)
+from process.ptg_frozen_control import normalize_protected_rate_params
+from process.ptg_singleton_direct_control import protected_singleton_direct_presence
 
 
 def ptg_import_file_payload(request_payload: dict[str, Any]) -> dict[str, Any]:

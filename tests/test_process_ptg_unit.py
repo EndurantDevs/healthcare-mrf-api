@@ -8714,7 +8714,6 @@ def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkey
         ptg_source_pointers._stage_ptg2_source_candidate(
             source_key="example_dental",
             snapshot_id="snap",
-            previous_snapshot_id="prev",
             import_month=import_month,
             updated_at=updated_at,
             snapshot_attributes=base_snapshot,
@@ -8993,7 +8992,9 @@ def _install_candidate_stage_mock(monkeypatch):
         candidate_attributes = ptg_source_pointers.candidate_snapshot_attributes(
             kwargs["snapshot_attributes"],
             source_key=kwargs["source_key"],
-            previous_snapshot_id=kwargs["previous_snapshot_id"],
+            previous_snapshot_id=kwargs["snapshot_attributes"][
+                "previous_snapshot_id"
+            ],
         )
         return {
             "status": "validated",
@@ -10014,7 +10015,9 @@ def _reused_mixed_candidate_attributes(lifecycle):
     return ptg_source_pointers.candidate_snapshot_attributes(
         stage_call_by_field["snapshot_attributes"],
         source_key=stage_call_by_field["source_key"],
-        previous_snapshot_id=stage_call_by_field["previous_snapshot_id"],
+        previous_snapshot_id=stage_call_by_field["snapshot_attributes"][
+            "previous_snapshot_id"
+        ],
     )
 
 

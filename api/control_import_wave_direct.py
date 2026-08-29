@@ -6,10 +6,10 @@ from typing import Any, Mapping
 
 from api.control_import_wave_attestation import _canonical
 from process.ptg_singleton_direct_control import (
-    normalize_protected_rate_params,
     protected_singleton_direct_presence,
     require_exact_wave_singleton_direct_params,
 )
+from process.ptg_frozen_control import normalize_protected_rate_params
 
 
 MAX_INTENT_CANONICAL_BYTES = 64 * 1024

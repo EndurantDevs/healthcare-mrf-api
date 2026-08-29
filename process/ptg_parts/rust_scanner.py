@@ -1870,7 +1870,7 @@ def _start_top_level_stderr_reader(
     return stderr_lines, stderr_thread
 
 
-def _iter_top_level_object_bytes_rust(
+def _start_top_level_scanner(
     path: str | Path,
     array_names: set[str],
 ) -> tuple[subprocess.Popen, _ScannerProcessControl]:

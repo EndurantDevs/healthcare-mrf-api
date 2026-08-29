@@ -38,6 +38,8 @@ from process.ptg_singleton_direct_control import (
     DIRECT_RATE_FILE_PUBLIC_MARKER,
     SingletonDirectValidationError,
     normalize_protected_singleton_direct_params,
+)
+from process.ptg_frozen_control import (
     singleton_direct_main_kwargs,
     validated_worker_singleton_direct_params,
 )

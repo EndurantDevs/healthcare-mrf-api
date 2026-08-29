@@ -138,7 +138,7 @@ async def test_singleton_worker_rejects_existing_frozen_binding(
         harness.no_stale_run,
     )
     monkeypatch.setattr(
-        ptg_control,
+        ptg_frozen_control,
         "recheck_frozen_binding",
         harness.reject_binding,
     )
@@ -263,7 +263,7 @@ def _install_rejected_claim_harness(
     )
     monkeypatch.setattr(
         ptg_control,
-        "validated_worker_frozen_rate_params",
+        "validated_worker_rate_params",
         harness.fail_if_validated,
     )
     monkeypatch.setattr(

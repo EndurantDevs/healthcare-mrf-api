@@ -6733,7 +6733,6 @@ async def _stage_reused_shared_v3_candidate(
     candidate_result = await _stage_ptg2_source_candidate(
         source_key=publication.source_key,
         snapshot_id=publication.snapshot_id,
-        previous_snapshot_id=publication.previous_snapshot_id,
         import_month=publication.import_month,
         updated_at=state.validated_at,
         snapshot_attributes=snapshot_values_by_field,
@@ -9329,7 +9328,6 @@ async def _main_with_artifact_lease(
         candidate_result = await _stage_ptg2_source_candidate(
             source_key=source_key_val,
             snapshot_id=snapshot_id,
-            previous_snapshot_id=previous_snapshot_id,
             import_month=import_month_value,
             updated_at=validated_at,
             snapshot_attributes=snapshot_publish_by_field,

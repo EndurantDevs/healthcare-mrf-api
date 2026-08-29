@@ -11,13 +11,16 @@ from urllib.parse import urlsplit, urlunsplit
 
 from process.ptg_parts.frozen_rate_binding import (
     INVALID_PRICE_EXCLUSION_POLICY_FIELD,
-    normalize_protected_frozen_rate_params,
     protected_frozen_tuple_presence,
 )
 from process.ptg_parts.ptg2_invalid_price_exclusion import (
     validate_invalid_price_exclusion_policy,
 )
 from process.ptg_singleton_direct_resource import PTG_SMALL_RESOURCE_CONTRACT
+from process.ptg_singleton_direct_errors import (
+    SingletonDirectValidationError,
+    singleton_direct_failure_payload,
+)
 
 
 DIRECT_RATE_FILE_INTENT_CONTRACT = "ptg_singleton_direct_file_intent_v1"
@@ -85,27 +88,6 @@ _COMPETING_SELECTOR_FIELDS = frozenset(
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 
 
-class SingletonDirectValidationError(ValueError):
-    """A signed direct selector is malformed or internally inconsistent."""
-
-
-def singleton_direct_failure_payload(
-    error_leaves: Sequence[BaseException],
-) -> dict[str, Any] | None:
-    """Classify contract failures without reflecting private selectors."""
-
-    if not any(
-        isinstance(error, SingletonDirectValidationError)
-        for error in error_leaves
-    ):
-        return None
-    return {
-        "code": "ptg_singleton_direct_contract_failed",
-        "message": "protected singleton direct input is invalid",
-        "retryable": False,
-    }
-
-
 def protected_singleton_direct_presence(
     params_by_name: Mapping[str, Any],
 ) -> tuple[str, ...]:
@@ -155,16 +137,6 @@ def normalize_protected_singleton_direct_params(
     ]
     normalized_params_by_name["max_files"] = 1
     return normalized_params_by_name
-
-
-def normalize_protected_rate_params(
-    params_by_name: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Validate exactly one protected singleton or multipart envelope."""
-
-    if protected_singleton_direct_presence(params_by_name):
-        return normalize_protected_singleton_direct_params(params_by_name)
-    return normalize_protected_frozen_rate_params(params_by_name)
 
 
 def validated_singleton_invalid_price_exclusion(
@@ -342,46 +314,6 @@ def require_exact_wave_singleton_direct_params(
         )
 
 
-def validated_worker_singleton_direct_params(
-    task_payload: Mapping[str, Any],
-    params_by_name: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Revalidate direct identities at the worker boundary before network I/O."""
-
-    normalized = normalize_protected_singleton_direct_params(params_by_name)
-    if not protected_singleton_direct_presence(normalized):
-        return normalized
-    protected_id = normalized["source_file_import_id"]
-    outer_ids = (
-        str(task_payload.get("source_file_import_id") or "").strip(),
-        str(task_payload.get("import_id") or "").strip(),
-    )
-    if any(outer_id != protected_id for outer_id in outer_ids):
-        raise SingletonDirectValidationError(
-            "singleton direct outer and nested import identities must match"
-        )
-    return normalized
-
-
-def singleton_direct_main_kwargs(
-    params_by_name: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Return the private-progress marker consumed by the PTG runtime."""
-
-    if not protected_singleton_direct_presence(params_by_name):
-        return {}
-    main_kwargs_by_name = {
-        "direct_rate_file_intent_sha256": params_by_name[
-            DIRECT_RATE_FILE_INTENT_SHA256_FIELD
-        ]
-    }
-    if INVALID_PRICE_EXCLUSION_POLICY_FIELD in params_by_name:
-        main_kwargs_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = (
-            params_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD]
-        )
-    return main_kwargs_by_name
-
-
 def singleton_direct_intent_sha256(
     direct_intent: Mapping[str, Any],
 ) -> str:
@@ -543,11 +475,8 @@ __all__ = [
     "PTG_SMALL_RESOURCE_CONTRACT",
     "SingletonDirectValidationError",
     "normalize_protected_singleton_direct_params",
-    "normalize_protected_rate_params",
     "protected_singleton_direct_presence",
     "require_exact_wave_singleton_direct_params",
     "singleton_direct_failure_payload",
-    "singleton_direct_main_kwargs",
-    "validated_worker_singleton_direct_params",
     "validated_singleton_invalid_price_exclusion",
 ]

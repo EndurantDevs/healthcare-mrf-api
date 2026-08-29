@@ -42,7 +42,7 @@ use ptg2_scanner::input::{
 use ptg2_scanner::manifest::{
     normalized_sidecar_entries, price_set_global_id_from_sorted_atom_ids,
     provider_set_global_id_from_group_hashes_and_network_names, write_dense_member_sidecar,
-    write_global_sidecar, GlobalId128, SidecarEntry, GLOBAL_ID_BYTES,
+    write_global_sidecar, GlobalId128, PriceAtomParts, SidecarEntry, GLOBAL_ID_BYTES,
 };
 #[cfg(test)]
 use ptg2_scanner::manifest::{price_set_global_id_from_atom_ids, procedure_global_id};
@@ -2388,16 +2388,16 @@ fn provider_entry_view_from_ref_keys<'a>(
 }
 
 fn price_atom_from_lite(price: &PriceLite, source_ordinal: usize) -> PriceAtomLite {
-    let global_id = GlobalId128::from_price_atom_parts(
-        price.negotiated_type.as_deref(),
-        Some(&price.negotiated_rate),
-        price.expiration_date.as_deref(),
-        &price.service_code,
-        price.billing_class.as_deref(),
-        price.setting.as_deref(),
-        &price.billing_code_modifier,
-        price.additional_information.as_deref(),
-    );
+    let global_id = GlobalId128::from_price_atom_parts(PriceAtomParts {
+        negotiated_type: price.negotiated_type.as_deref(),
+        negotiated_rate: Some(&price.negotiated_rate),
+        expiration_date: price.expiration_date.as_deref(),
+        service_code: &price.service_code,
+        billing_class: price.billing_class.as_deref(),
+        setting: price.setting.as_deref(),
+        billing_code_modifier: &price.billing_code_modifier,
+        additional_information: price.additional_information.as_deref(),
+    });
     PriceAtomLite {
         global_id,
         source_ordinal: source_ordinal as u64,
@@ -2413,16 +2413,16 @@ fn price_atom_from_lite(price: &PriceLite, source_ordinal: usize) -> PriceAtomLi
 }
 
 fn price_atom_from_validated_owned_lite(price: PriceLite, source_ordinal: usize) -> PriceAtomLite {
-    let global_id = GlobalId128::from_price_atom_parts(
-        price.negotiated_type.as_deref(),
-        Some(&price.negotiated_rate),
-        price.expiration_date.as_deref(),
-        &price.service_code,
-        price.billing_class.as_deref(),
-        price.setting.as_deref(),
-        &price.billing_code_modifier,
-        price.additional_information.as_deref(),
-    );
+    let global_id = GlobalId128::from_price_atom_parts(PriceAtomParts {
+        negotiated_type: price.negotiated_type.as_deref(),
+        negotiated_rate: Some(&price.negotiated_rate),
+        expiration_date: price.expiration_date.as_deref(),
+        service_code: &price.service_code,
+        billing_class: price.billing_class.as_deref(),
+        setting: price.setting.as_deref(),
+        billing_code_modifier: &price.billing_code_modifier,
+        additional_information: price.additional_information.as_deref(),
+    });
     PriceAtomLite {
         global_id,
         source_ordinal: source_ordinal as u64,
@@ -28117,16 +28117,16 @@ mod tests {
         let expected_atom_ids = prices
             .iter()
             .map(|price| {
-                GlobalId128::from_price_atom_parts(
-                    price.negotiated_type.as_deref(),
-                    Some(&price.negotiated_rate),
-                    price.expiration_date.as_deref(),
-                    &price.service_code,
-                    price.billing_class.as_deref(),
-                    price.setting.as_deref(),
-                    &price.billing_code_modifier,
-                    price.additional_information.as_deref(),
-                )
+                GlobalId128::from_price_atom_parts(PriceAtomParts {
+                    negotiated_type: price.negotiated_type.as_deref(),
+                    negotiated_rate: Some(&price.negotiated_rate),
+                    expiration_date: price.expiration_date.as_deref(),
+                    service_code: &price.service_code,
+                    billing_class: price.billing_class.as_deref(),
+                    setting: price.setting.as_deref(),
+                    billing_code_modifier: &price.billing_code_modifier,
+                    additional_information: price.additional_information.as_deref(),
+                })
             })
             .collect::<Vec<_>>();
         let mut expected_sorted_atom_ids = expected_atom_ids.clone();

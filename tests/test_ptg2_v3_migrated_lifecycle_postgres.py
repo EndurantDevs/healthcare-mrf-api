@@ -383,7 +383,6 @@ async def _stage_candidate(
     staged = await _stage_ptg2_source_candidate(
         source_key=source_key,
         snapshot_id=snapshot_id,
-        previous_snapshot_id=None,
         import_month=datetime.date(2026, 7, 1),
         updated_at=timestamp,
         snapshot_attributes={

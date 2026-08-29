@@ -11,12 +11,19 @@ import pytest
 from api import control, control_imports
 from process.ptg_parts import ptg2_shared_snapshot_publish as snapshot_publish
 from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    INVALID_PRICE_EXCLUSION_POLICY_FIELD,
     invalid_price_exclusion_evidence,
     invalid_price_exclusion_policy,
     invalid_price_exclusion_source,
+    invalid_price_value_sha256,
+)
+from process.ptg_wave_ordinary_terminal_receipt import (
+    PTGWaveOrdinaryTerminalConflict,
+    ordinary_terminal_receipt_payload,
 )
 from tests import test_ptg2_prepared_shared_layout as prepared_layout_tests
 from tests import test_ptg2_shared_reuse as shared_reuse_tests
+from tests.ptg_wave_ordinary_terminal_receipt_support import ordinary_result
 
 
 ptg = importlib.import_module("process.ptg")
@@ -39,6 +46,75 @@ def _policy() -> dict[str, object]:
             )
         ]
     )
+
+
+def _ordinary_result_with_exclusion_policy(monkeypatch):
+    terminal_state = ordinary_result(monkeypatch)
+    policy = invalid_price_exclusion_policy(
+        [
+            invalid_price_exclusion_source(
+                raw_source_sha256="a" * 64,
+                entries=[
+                    {
+                        "object_ordinal": 1,
+                        "rate_ordinal": 2,
+                        "price_ordinal": 3,
+                        "invalid_value_sha256": invalid_price_value_sha256(
+                            "2027-02-30"
+                        ),
+                    }
+                ],
+                emptied_rate_count=0,
+            )
+        ]
+    )
+    terminal_state["intent"].params[
+        INVALID_PRICE_EXCLUSION_POLICY_FIELD
+    ] = policy
+    terminal_state["run"].params[
+        INVALID_PRICE_EXCLUSION_POLICY_FIELD
+    ] = policy
+    terminal_state["engine_run"].options[
+        INVALID_PRICE_EXCLUSION_POLICY_FIELD
+    ] = policy
+    return terminal_state
+
+
+def test_terminal_payload_binds_matching_exclusion_policy(monkeypatch):
+    payload = ordinary_terminal_receipt_payload(
+        **_ordinary_result_with_exclusion_policy(monkeypatch)
+    )
+
+    assert payload["terminal_result"]["status"] == "succeeded"
+
+
+@pytest.mark.parametrize(
+    ("target", "tampered"),
+    (("outer", False), ("outer", True), ("engine", False), ("engine", True)),
+)
+def test_terminal_payload_rejects_missing_or_tampered_exclusion_policy(
+    monkeypatch,
+    target,
+    tampered,
+):
+    terminal_state = _ordinary_result_with_exclusion_policy(monkeypatch)
+    durable_params = (
+        terminal_state["run"].params
+        if target == "outer"
+        else terminal_state["engine_run"].options
+    )
+    if tampered:
+        durable_params[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = {}
+    else:
+        durable_params.pop(INVALID_PRICE_EXCLUSION_POLICY_FIELD)
+
+    message = (
+        "ordinary run does not match"
+        if target == "outer"
+        else "durable PTG result conflicts"
+    )
+    with pytest.raises(PTGWaveOrdinaryTerminalConflict, match=message):
+        ordinary_terminal_receipt_payload(**terminal_state)
 
 
 @pytest.mark.asyncio

@@ -87,9 +87,9 @@ from process.ptg_singleton_direct_control import (
     DIRECT_RATE_FILE_INTENT_SHA256_FIELD,
     DIRECT_RATE_FILE_PROTECTED_FIELDS,
     DIRECT_RATE_FILE_PUBLIC_MARKER,
-    normalize_protected_rate_params,
     protected_singleton_direct_presence,
 )
+from process.ptg_frozen_control import normalize_protected_rate_params
 
 from db.models import ImportRun, PTG2ImportRun, PTG2Snapshot, db
 from process.import_status_events import enqueue_status_event, isoformat_utc
