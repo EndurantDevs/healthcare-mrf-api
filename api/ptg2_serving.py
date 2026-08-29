@@ -111,6 +111,7 @@ from api.plan_pricing_projection_contract import (
     table as _plan_pricing_projection_table,
 )
 from api.plan_pricing_projection_read import (
+    _projection_query as _plan_pricing_projection_query,
     geo_cells as _plan_pricing_projection_geo_cells,
 )
 from api.ptg2_response import (
@@ -21636,6 +21637,9 @@ def _factorized_card_response(
     limit = max(int(getattr(pagination, "limit", 25) or 25), 1)
     page_item_list = card_items[start : start + limit]
     query_by_field = _plan_release_no_match_query(release_selection, args)
+    query_by_field |= _plan_pricing_projection_query(
+        args, result_type="provider_cards"
+    )
     query_by_field.update(
         view="card",
         include_providers=True,
@@ -22074,6 +22078,17 @@ async def _search_selected_plan_release(
     )
     if projected_response is not None:
         return projected_response
+    if (
+        selected_release.pricing_projection_contract
+        == PLAN_PRICING_PROJECTION_CONTRACT
+        and _uses_factorized_release_cards(args, pagination)
+    ):
+        return await _search_plan_release_index(
+            session,
+            args,
+            pagination,
+            selected_release,
+        )
     if selected_release.network_tables_by_snapshot() is None:
         selected_release = await resolve_plan_release_serving(
             session,

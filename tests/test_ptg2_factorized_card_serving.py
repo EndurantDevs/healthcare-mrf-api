@@ -198,6 +198,54 @@ def test_page_beyond_exact_total_keeps_matched_query_state():
     assert response_by_field["query"]["status"] == "matched"
 
 
+@pytest.mark.parametrize(
+    "location_by_field",
+    [
+        {
+            "zip5": "60601",
+            "zip_radius_miles": 25,
+            "state": "IL",
+            "city": "Chicago",
+        },
+        {
+            "zip5": None,
+            "lat": 41.88,
+            "long": -87.63,
+            "radius_miles": 25,
+        },
+    ],
+)
+def test_factorized_query_preserves_geo_selectors(location_by_field):
+    """Factorized cards retain the established projection query echo."""
+
+    args_by_field = {**_card_args(), **location_by_field}
+    response_by_field = serving._factorized_card_response(
+        factorized_selection(),
+        args_by_field,
+        card_pagination(),
+        [],
+        serving._FactorizedCardCandidateSelection({}, 0, True),
+        has_geo_cells=False,
+    )
+
+    location_fields = (
+        "zip5",
+        "zip_radius_miles",
+        "lat",
+        "long",
+        "radius_miles",
+        "state",
+        "city",
+    )
+    assert {
+        field_name: response_by_field["query"][field_name]
+        for field_name in location_fields
+    } == {
+        field_name: args_by_field.get(field_name)
+        for field_name in location_fields
+    }
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("projection_id", "contract"),
@@ -254,6 +302,56 @@ async def test_v3_route_avoids_919_binding_fanout(monkeypatch):
     )
 
     assert response_by_field == {"items": []}
+    factorized_reader.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_release_route_avoids_919_binding_reresolution(monkeypatch):
+    """Projection-only routing reaches V3 cards without full readiness."""
+
+    release_selection = replace(
+        factorized_selection(binding_count=919),
+        _validated_serving_tables=(),
+    )
+    factorized_reader = AsyncMock(return_value={"items": []})
+    projection_reader = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        serving,
+        "_search_factorized_plan_release_cards",
+        factorized_reader,
+    )
+    monkeypatch.setattr(
+        serving,
+        "search_plan_pricing_projection",
+        projection_reader,
+    )
+
+    async def fail_release_resolver(*_args, **_kwargs):
+        pytest.fail("factorized cards must not resolve full binding readiness")
+
+    monkeypatch.setattr(
+        serving,
+        "resolve_plan_release_serving",
+        fail_release_resolver,
+    )
+    monkeypatch.setattr(
+        type(release_selection),
+        "network_tables_by_snapshot",
+        lambda _selection: pytest.fail("binding descriptors were expanded"),
+    )
+
+    response_by_field = await serving.search_current_ptg2_index(
+        object(),
+        {
+            **_card_args(),
+            "plan_release_id": release_selection.plan_release_id,
+        },
+        card_pagination(),
+        release_selection=release_selection,
+    )
+
+    assert response_by_field == {"items": []}
+    projection_reader.assert_awaited_once()
     factorized_reader.assert_awaited_once()
 
 
