@@ -131,7 +131,7 @@ def test_provider_code_block_rejects_bounds_order_and_count(payload, entry_count
 def test_price_membership_block_rejects_key_outside_block():
     payload = encode_price_memberships(((512, (7,)),), 24)
 
-    with pytest.raises(serving.PTG2ManifestArtifactError, match="is corrupt"):
+    with pytest.raises(serving.PTG2ManifestArtifactError, match="is corrupt") as exc:
         serving._decode_price_membership_block(
             payload,
             block_key=0,
@@ -140,6 +140,7 @@ def test_price_membership_block_rejects_key_outside_block():
             block_span=512,
             requested_price_keys={512},
         )
+    assert type(exc.value) is serving.PTG2ManifestArtifactError
 
 
 def test_provider_page_count_requires_projected_rows():

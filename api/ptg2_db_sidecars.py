@@ -34,6 +34,13 @@ from api.ptg2_shared_blocks import (
     PTG2_SHARED_PROJECTION_GENERATIONS,
     PTG2SharedBlockError,
     SharedGraphReadLimitError,
+    SharedMappingReadLimitError,
+    _SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES,
+    _SHARED_MAPPING_RECORD_RETAINED_BYTES,
+    _SharedMappingAccumulator,
+    _require_complete_shared_mapping,
+    _shared_block_read_request,
+    _stream_shared_mapping_records,
     claim_shared_block_processing,
     claim_shared_logical_payload_processing,
     decode_dense_source_header,
@@ -47,8 +54,8 @@ from api.ptg2_shared_blocks import (
 )
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_manifest_artifacts import (
-    PTG2ManifestArtifactError,
     ManifestReadLimitError,
+    PTG2ManifestArtifactError,
 )
 from process.ptg_parts.ptg2_v4_finalizer_maps import (
     FinalizerMapError,
@@ -75,6 +82,16 @@ _FORWARD_OCCURRENCE_BATCH_FROZEN_ROW_RETAINED_BYTES = 8
 _FORWARD_FANOUT_ROW_RETAINED_BYTES = 288
 _FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES = (
     _FORWARD_FANOUT_ROW_RETAINED_BYTES
+)
+# Packed rows, accumulator copies, the build cache, and its physical-owner
+# index can coexist briefly.
+_PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES = 512
+_PRICE_MEMBERSHIP_MAX_CACHED_RECORDS = (
+    _SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES
+    // (
+        3 * _SHARED_MAPPING_RECORD_RETAINED_BYTES
+        + _PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES
+    )
 )
 # The coordinate index retains a resize-safe dict base, then one dict slot,
 # three-slot key tuple, and empty list for every logical fragment coordinate.
@@ -5032,6 +5049,12 @@ class _PriceMembershipReadPlan:
     decode_membership_block: Callable[..., dict[int, tuple[int, ...]]]
 
 
+_PriceMembershipBlockKey = tuple[str, int, str, int]
+_PriceMembershipBlockIdentity = tuple[tuple[bytes, ...], int, int]
+_PriceMembershipAliasKey = tuple[str, int, str, tuple[bytes, ...]]
+_PriceMembershipAliasOwner = tuple[_PriceMembershipBlockKey, int]
+
+
 def _price_membership_read_plan(
     price_keys: Iterable[int],
     atom_key_bits: int | None,
@@ -5067,6 +5090,214 @@ def _price_membership_read_plan(
         expected_bits=_expected_atom_key_bits(atom_key_bits),
         artifact_kind=PTG2_SERVING_BINARY_V3_PRICE_MEMBERSHIPS_KIND,
         decode_membership_block=_decode_price_membership_block,
+    )
+
+
+async def _preflight_price_membership_aliases_from_db(
+    session: Any,
+    shared_snapshot_key: int,
+    price_keys: Iterable[int],
+    *,
+    block_span: int | None = None,
+    schema_name: str = "mrf",
+    identity_by_block: dict[
+        _PriceMembershipBlockKey, _PriceMembershipBlockIdentity
+    ] | None = None,
+    owner_by_identity: dict[
+        _PriceMembershipAliasKey, _PriceMembershipAliasOwner
+    ] | None = None,
+    retained_record_count: int = 0,
+) -> int:
+    """Reject nonempty physical aliases before bounded batch reads."""
+
+    read_plan = _price_membership_read_plan(
+        price_keys,
+        atom_key_bits=None,
+        block_span=block_span,
+        maximum_selected_atom_count=None,
+    )
+    cached_identity_by_block, cached_owner_by_identity = (
+        _price_membership_cache_maps(identity_by_block, owner_by_identity)
+    )
+    normalized_record_count = int(retained_record_count)
+    if normalized_record_count < 0:
+        raise ValueError("price-membership metadata count is invalid")
+    cache_keys = tuple(
+        (
+            str(schema_name),
+            int(shared_snapshot_key),
+            read_plan.artifact_kind,
+            block_key,
+        )
+        for block_key in read_plan.block_keys
+    )
+    missing_cache_keys = tuple(
+        cache_key
+        for cache_key in cache_keys
+        if cache_key not in cached_identity_by_block
+    )
+    if missing_cache_keys:
+        fresh_identity_by_block = await _price_membership_block_identities(
+            session,
+            shared_snapshot_key,
+            read_plan.artifact_kind,
+            tuple(cache_key[3] for cache_key in missing_cache_keys),
+            schema_name,
+            _PRICE_MEMBERSHIP_MAX_CACHED_RECORDS - normalized_record_count,
+        )
+        normalized_record_count = _retain_price_membership_identities(
+            fresh_identity_by_block,
+            missing_cache_keys,
+            cached_identity_by_block,
+            cached_owner_by_identity,
+            normalized_record_count,
+        )
+    return normalized_record_count
+
+
+def _price_membership_cache_maps(
+    identity_by_block: dict[
+        _PriceMembershipBlockKey, _PriceMembershipBlockIdentity
+    ] | None,
+    owner_by_identity: dict[
+        _PriceMembershipAliasKey, _PriceMembershipAliasOwner
+    ] | None,
+) -> tuple[
+    dict[_PriceMembershipBlockKey, _PriceMembershipBlockIdentity],
+    dict[_PriceMembershipAliasKey, _PriceMembershipAliasOwner],
+]:
+    """Return one complete incremental alias cache or fresh local maps."""
+
+    if (identity_by_block is None) != (owner_by_identity is None):
+        raise ValueError("price-membership alias cache is incomplete")
+    return (
+        {} if identity_by_block is None else identity_by_block,
+        {} if owner_by_identity is None else owner_by_identity,
+    )
+
+
+def _retain_price_membership_identities(
+    fresh_identity_by_block: dict[int, _PriceMembershipBlockIdentity],
+    cache_keys: tuple[_PriceMembershipBlockKey, ...],
+    identity_by_block: dict[
+        _PriceMembershipBlockKey, _PriceMembershipBlockIdentity
+    ],
+    owner_by_identity: dict[
+        _PriceMembershipAliasKey, _PriceMembershipAliasOwner
+    ],
+    retained_record_count: int,
+) -> int:
+    """Validate and incrementally retain fresh block identities."""
+
+    for cache_key in cache_keys:
+        cached_identity = fresh_identity_by_block[cache_key[3]]
+        physical_hashes, entry_count, record_count = cached_identity
+        alias_identity = (*cache_key[:3], physical_hashes)
+        existing_owner = owner_by_identity.get(alias_identity)
+        if (
+            existing_owner is not None
+            and existing_owner[0] != cache_key
+            and (entry_count or existing_owner[1])
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 price-membership block has an incompatible physical alias"
+            )
+        identity_by_block[cache_key] = cached_identity
+        owner_by_identity[alias_identity] = (cache_key, entry_count)
+        retained_record_count += record_count
+    return retained_record_count
+
+
+async def _price_membership_block_identities(
+    session: Any,
+    shared_snapshot_key: int,
+    artifact_kind: str,
+    block_keys: tuple[int, ...],
+    schema_name: str,
+    maximum_records: int,
+) -> dict[int, _PriceMembershipBlockIdentity]:
+    """Read and release complete bounded metadata for requested blocks."""
+
+    if maximum_records < 1:
+        raise ManifestReadLimitError(
+            "shared PTG snapshot fragment metadata exceeds its bounded limit"
+        )
+    request = _shared_block_read_request(
+        schema_name=schema_name,
+        snapshot_key=shared_snapshot_key,
+        object_kind=artifact_kind,
+        block_keys=block_keys,
+        fragment_nos=None,
+        require_all=True,
+    )
+    retention_budget = CandidateAuditDecodedRetentionBudget(
+        maximum_bytes=_SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES
+    )
+    accumulator = _SharedMappingAccumulator(request, set(), retention_budget)
+    try:
+        async for raw_mapping_record in _stream_shared_mapping_records(
+            session,
+            request,
+            row_limit=maximum_records + 1,
+        ):
+            accumulator.append(raw_mapping_record, maximum_records)
+        selection = accumulator.selection()
+        _require_complete_shared_mapping(request, selection)
+        records_by_block: dict[int, list[dict[str, Any]]] = {
+            block_key: [] for block_key in block_keys
+        }
+        for mapping_record in selection.mapping_records:
+            records_by_block[int(mapping_record["block_key"])].append(
+                mapping_record
+            )
+        return {
+            block_key: (
+                *_validated_price_membership_identity(
+                    tuple(records_by_block[block_key]), artifact_kind, block_key
+                ),
+                len(records_by_block[block_key]),
+            )
+            for block_key in block_keys
+        }
+    except SharedMappingReadLimitError as exc:
+        raise ManifestReadLimitError(str(exc)) from exc
+    except PTG2SharedBlockError as exc:
+        raise PTG2ManifestArtifactError(str(exc)) from exc
+    finally:
+        accumulator.release()
+
+
+def _validated_price_membership_identity(
+    mapping_records: tuple[dict[str, Any], ...],
+    artifact_kind: str,
+    block_key: int,
+) -> tuple[tuple[bytes, ...], int]:
+    """Validate one ordered fragment sequence and copy its compact identity."""
+
+    fragment_nos = tuple(
+        int(mapping_record["fragment_no"])
+        for mapping_record in mapping_records
+    )
+    if fragment_nos != tuple(range(len(fragment_nos))):
+        raise PTG2ManifestArtifactError(
+            f"PTG2 v3 {artifact_kind} block {block_key} "
+            "has non-contiguous fragments"
+        )
+    entry_count = int(mapping_records[0].get("mapping_entry_count") or 0)
+    if entry_count < 0 or any(
+        int(mapping_record.get("mapping_entry_count") or 0) != 0
+        for mapping_record in mapping_records[1:]
+    ):
+        raise PTG2ManifestArtifactError(
+            f"PTG2 v3 {artifact_kind} block {block_key} "
+            "has invalid fragment entry counts"
+        )
+    return (
+        tuple(
+            memoryview(mapping_record["block_hash"]).tobytes()
+            for mapping_record in mapping_records
+        ),
+        entry_count,
     )
 
 
@@ -5127,7 +5358,7 @@ def _decode_price_membership_alias_group(
         remaining_selected_atom_count is not None
         and decoded_atom_count > remaining_selected_atom_count
     ):
-        raise PTG2ManifestArtifactError(
+        raise ManifestReadLimitError(
             "PTG2 v3 price hydration exceeds its atom limit"
         )
     return decoded_memberships, decoded_atom_count

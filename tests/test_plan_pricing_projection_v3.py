@@ -30,7 +30,12 @@ class _ExecuteSession:
 def _binding(ordinal: int = 0) -> BindingProjection:
     return BindingProjection(
         {"ordinal": ordinal},
-        SimpleNamespace(network_names=()),
+        SimpleNamespace(
+            network_names=(),
+            price_key_block_span=512,
+            shared_snapshot_key=1,
+            uses_shared_blocks=True,
+        ),
         {("CPT", "27447"): [{"code_key": 1, "rate_count": 1}]},
     )
 
@@ -80,14 +85,15 @@ async def test_stage_ddl_uses_one_statement_per_execute() -> None:
     session = _ExecuteSession()
 
     await projection._create_stage_tables(session)
-    assert len(session.calls) == 9
+    assert len(session.calls) == 10
     assert all(sql.count("CREATE TEMP TABLE") == 1 for sql, _ in session.calls)
     assert "plan_pricing_provider_set_stage" in session.calls[0][0]
     assert "plan_pricing_provider_npi_materialized_stage" in session.calls[2][0]
     assert "plan_pricing_provider_npi_pending_stage" in session.calls[3][0]
-    assert "plan_pricing_provider_cell_stage" in session.calls[6][0]
-    assert "plan_pricing_eligible_member_cell_stage" in session.calls[7][0]
-    assert "plan_pricing_set_cell_stage" in session.calls[8][0]
+    assert "plan_pricing_rate_frequency_stage" in session.calls[6][0]
+    assert "plan_pricing_provider_cell_stage" in session.calls[7][0]
+    assert "plan_pricing_eligible_member_cell_stage" in session.calls[8][0]
+    assert "plan_pricing_set_cell_stage" in session.calls[9][0]
 
 
 @pytest.mark.asyncio
@@ -381,7 +387,7 @@ async def test_code_read_fails_before_io_above_declared_bound(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_code_read_preserves_declared_rows_and_bounded_price_atoms(
+async def test_code_read_preserves_declared_rows_and_price_identities(
     monkeypatch,
 ) -> None:
     serving_rows = [
@@ -397,33 +403,18 @@ async def test_code_read_preserves_declared_rows_and_bounded_price_atoms(
         },
     ]
     merge_rows = AsyncMock(return_value=serving_rows)
-    bounded_prices = AsyncMock(
-        return_value={
-            9: [
-                {"negotiated_rate": "1.00"},
-                {"negotiated_rate": "2.00"},
-            ]
-        }
-    )
     monkeypatch.setattr(
         serving, "_declared_geo_rate_count", lambda _code_rows: 2
     )
     monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", merge_rows)
-    monkeypatch.setattr(
-        serving, "_version_three_bounded_prices_by_key", bounded_prices
-    )
-
-    selected_rows, prices_by_set = await projection._binding_code_rows(
+    selected_rows, price_keys_by_set = await projection._binding_code_rows(
         object(), _binding(), [{"code_key": 1, "rate_count": 2}]
     )
 
     assert selected_rows == serving_rows
-    assert prices_by_set == {"1" * 32: bounded_prices.return_value[9]}
+    assert price_keys_by_set == {"1" * 32: 9}
     assert merge_rows.await_args.kwargs["limit"] == (
         projection.MAX_CODE_OCCURRENCES + 1
-    )
-    assert bounded_prices.await_args.kwargs["maximum_atom_count"] == (
-        projection.MAX_CODE_PRICE_ATOMS
     )
 
 

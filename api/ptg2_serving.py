@@ -196,7 +196,10 @@ from process.ext.contact_canon import canonicalize_one
 from process.ptg_parts.address_assurance import (
     DIRECT_PAYER_LOCATION_RECORD_KEYS as PTG_DIRECT_PAYER_LOCATION_RECORD_KEYS,
 )
-from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+from process.ptg_parts.ptg2_manifest_artifacts import (
+    ManifestReadLimitError,
+    PTG2ManifestArtifactError,
+)
 from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
     V4InferredTaxonomyProjectionRule,
     inferred_provider_taxonomy_rule_digest,
@@ -8139,7 +8142,7 @@ async def _bounded_v3_price_hydration(
     if sum(len(atom_keys) for atom_keys in atom_keys_by_price_key.values()) > (
         maximum_atom_count
     ):
-        raise PTG2ManifestArtifactError(
+        raise ManifestReadLimitError(
             "PTG2 v3 price hydration exceeds its atom limit"
         )
     requested_atom_keys, _retained_atom_key_bytes = (
@@ -8206,7 +8209,7 @@ async def _version_three_bounded_prices_by_key(
     )
     cached_atom_count = sum(len(prices) for prices in cached_rows.values())
     if cached_atom_count > maximum_atom_count:
-        raise PTG2ManifestArtifactError(
+        raise ManifestReadLimitError(
             "PTG2 v3 price hydration exceeds its atom limit"
         )
     if not missing_keys:

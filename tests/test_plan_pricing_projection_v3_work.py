@@ -23,6 +23,7 @@ def _code_work(**updates_by_field) -> work_admission._CodeWork:
         "aggregate_join_rows": 1,
         "profile_rate_count_sum": 1,
         "profile_rate_count_max": 1,
+        "profile_distinct_rate_count_max": 1,
         "aggregate_rate_count_sum": 1,
         "aggregate_rate_count_max": 1,
     }
@@ -66,6 +67,14 @@ def test_code_work_caps_are_inclusive_and_recorded_together(monkeypatch) -> None
         ({"member_cell_rows": 2}, "member-cell"),
         ({"profile_join_rows": 2}, "rate-profile"),
         ({"aggregate_join_rows": 2}, "aggregate"),
+        (
+            {
+                "profile_distinct_rate_count_max": (
+                    work_admission.MAX_RATE_PROFILE_RATES + 1
+                )
+            },
+            "rate profile",
+        ),
         ({"profile_rate_count_max": work_admission.MAX_BIGINT + 1}, "bigint"),
         ({"aggregate_rate_count_max": work_admission.MAX_BIGINT + 1}, "bigint"),
     ),

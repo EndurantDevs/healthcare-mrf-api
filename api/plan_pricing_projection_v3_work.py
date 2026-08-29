@@ -15,6 +15,7 @@ from api.plan_pricing_projection_v3_aggregate import (
 from api.plan_pricing_projection_v3_code import (
     MAX_CODE_RATE_PROFILE_WORK_ROWS,
     MAX_PROJECTION_RATE_PROFILE_WORK_ROWS,
+    MAX_RATE_PROFILE_RATES,
 )
 from api.plan_pricing_projection_v3_types import _BuildState
 
@@ -30,7 +31,8 @@ MAX_BIGINT = (1 << 63) - 1
 
 _RESET_CODE_WORK_SQL = """
     TRUNCATE plan_pricing_eligible_member_cell_stage,
-             plan_pricing_set_cell_stage
+             plan_pricing_set_cell_stage,
+             plan_pricing_rate_frequency_stage
 """
 
 _MEMBERSHIP_PROBE_SQL = """
@@ -52,25 +54,37 @@ _SET_CELL_INSERT_SQL = """
       FROM plan_pricing_eligible_member_cell_stage
 """
 
+_RATE_FREQUENCY_INSERT_SQL = """
+    INSERT INTO plan_pricing_rate_frequency_stage (
+        binding_ordinal, provider_set_key, negotiated_rate,
+        join_row_count, multiplicity
+    )
+    SELECT occurrence.binding_ordinal, occurrence.provider_set_key,
+           price.negotiated_rate, COUNT(*)::bigint,
+           SUM(
+               occurrence.occurrence_count * price.rate_multiplicity
+           )::bigint
+      FROM plan_pricing_code_occurrence_stage occurrence
+      JOIN plan_pricing_price_rate_stage price
+        ON price.binding_ordinal = occurrence.binding_ordinal
+       AND price.price_set_id = occurrence.price_set_id
+      JOIN plan_pricing_provider_set_stage membership
+        ON membership.binding_ordinal = occurrence.binding_ordinal
+       AND membership.provider_set_key = occurrence.provider_set_key
+     WHERE membership.membership_count > 0
+     GROUP BY occurrence.binding_ordinal, occurrence.provider_set_key,
+              price.negotiated_rate
+"""
+
 _WORK_METRICS_SQL = """
-    WITH price AS MATERIALIZED (
-        SELECT binding_ordinal, price_set_id,
-               COUNT(*)::numeric AS variant_count,
-               SUM(rate_multiplicity)::numeric AS atom_count
-          FROM plan_pricing_price_rate_stage
-         GROUP BY binding_ordinal, price_set_id
-    ), profile AS MATERIALIZED (
-        SELECT occurrence.binding_ordinal, occurrence.provider_set_key,
-               SUM(price.variant_count)::numeric AS join_rows,
-               SUM(
-                   occurrence.occurrence_count::numeric * price.atom_count
-               )::numeric AS rate_count
-          FROM plan_pricing_code_occurrence_stage occurrence
-          JOIN price USING (binding_ordinal, price_set_id)
-          JOIN plan_pricing_provider_set_stage membership
-            USING (binding_ordinal, provider_set_key)
-         WHERE membership.membership_count > 0
-         GROUP BY occurrence.binding_ordinal, occurrence.provider_set_key
+    WITH profile AS MATERIALIZED (
+        SELECT rate.binding_ordinal, rate.provider_set_key,
+               SUM(rate.join_row_count)::numeric AS join_rows,
+               COUNT(*)::numeric
+                   AS distinct_rate_count,
+               SUM(rate.multiplicity)::numeric AS rate_count
+          FROM plan_pricing_rate_frequency_stage rate
+         GROUP BY rate.binding_ordinal, rate.provider_set_key
     ), aggregate_by_cell AS MATERIALIZED (
         SELECT cell.geo_cell,
                SUM(profile.join_rows)::numeric AS join_rows,
@@ -90,6 +104,8 @@ _WORK_METRICS_SQL = """
             AS profile_rate_count_sum,
         COALESCE((SELECT MAX(rate_count) FROM profile), 0::numeric)
             AS profile_rate_count_max,
+        COALESCE((SELECT MAX(distinct_rate_count) FROM profile), 0::numeric)
+            AS profile_distinct_rate_count_max,
         COALESCE((SELECT SUM(rate_count) FROM aggregate_by_cell), 0::numeric)
             AS aggregate_rate_count_sum,
         COALESCE((SELECT MAX(rate_count) FROM aggregate_by_cell), 0::numeric)
@@ -106,6 +122,7 @@ class _CodeWork:
     aggregate_join_rows: int
     profile_rate_count_sum: int
     profile_rate_count_max: int
+    profile_distinct_rate_count_max: int
     aggregate_rate_count_sum: int
     aggregate_rate_count_max: int
 
@@ -212,6 +229,7 @@ def _code_work_from_row(
         int(raw_work_by_field["aggregate_join_rows"]),
         int(raw_work_by_field["profile_rate_count_sum"]),
         int(raw_work_by_field["profile_rate_count_max"]),
+        int(raw_work_by_field["profile_distinct_rate_count_max"]),
         int(raw_work_by_field["aggregate_rate_count_sum"]),
         int(raw_work_by_field["aggregate_rate_count_max"]),
     )
@@ -249,6 +267,10 @@ def _record_code_work(
         > MAX_PROJECTION_AGGREGATE_WORK_ROWS
     ):
         raise ValueError("pricing projection aggregate work bound exceeded")
+    if (
+        work.profile_distinct_rate_count_max > MAX_RATE_PROFILE_RATES
+    ):
+        raise ValueError("pricing projection rate profile is too large")
     if (
         work.profile_rate_count_max > MAX_BIGINT
         or work.aggregate_rate_count_max > MAX_BIGINT
@@ -298,6 +320,7 @@ async def _stage_code_work(
             },
         )
     await session.execute(text(_SET_CELL_INSERT_SQL))
+    await session.execute(text(_RATE_FREQUENCY_INSERT_SQL))
     metrics_result = await session.execute(text(_WORK_METRICS_SQL))
     work = _code_work_from_row(
         membership_probe_rows,

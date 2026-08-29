@@ -7,10 +7,9 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from api.ptg2_db_sidecars import _decode_serving_binary_payload
-from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
-from process.ptg_parts.ptg2_serving_binary_v3_code_intersection import (
-    ProviderCodeSelection,
-    intersect_provider_code_set,
+from process.ptg_parts.ptg2_manifest_artifacts import (
+    ManifestReadLimitError,
+    PTG2ManifestArtifactError,
 )
 from process.ptg_parts.ptg2_serving_binary_v3 import (
     PTG2_V3_ATOM_KEY_24_BITS,
@@ -19,6 +18,10 @@ from process.ptg_parts.ptg2_serving_binary_v3 import (
     decode_price_memberships_for_keys,
     decode_provider_code_set,
     read_uvarint,
+)
+from process.ptg_parts.ptg2_serving_binary_v3_code_intersection import (
+    ProviderCodeSelection,
+    intersect_provider_code_set,
 )
 
 
@@ -221,7 +224,7 @@ def _decode_price_membership_block(
             raise ValueError("price membership is outside its block")
         return memberships_by_price_key
     except _PriceMembershipAtomLimitError as exc:
-        raise PTG2ManifestArtifactError(
+        raise ManifestReadLimitError(
             "PTG2 v3 price hydration exceeds its atom limit"
         ) from exc
     except Exception as exc:

@@ -351,6 +351,12 @@ async def test_v3_sql_preserves_three_binding_multiplicity_and_union(
             ("HCPCS", "G0439"),
             None,
         )
+        await connection.execute(
+            text(
+                "TRUNCATE plan_pricing_code_occurrence_stage, "
+                "plan_pricing_price_rate_stage"
+            )
+        )
         stored_profiles, profile_state = await _stored_rate_profiles(
             connection,
             monkeypatch,
@@ -368,7 +374,9 @@ async def test_v3_sql_preserves_three_binding_multiplicity_and_union(
         AggregateZipRecord("10002", 1, 2, Decimal("40"), Decimal("45"), Decimal("50")),
         AggregateZipRecord("10003", 1, 8, Decimal("10"), Decimal("15"), Decimal("50")),
     )
-    assert prepared_work == work_admission._CodeWork(6, 8, 6, 5, 11, 9, 6, 19, 9)
+    assert prepared_work == work_admission._CodeWork(
+        6, 8, 6, 5, 11, 9, 6, 2, 19, 9
+    )
     assert (
         work_state.membership_probe_work_rows,
         work_state.member_cell_work_rows,
@@ -455,4 +463,6 @@ async def test_v3_sql_normalizes_ruled_taxonomy_across_two_bindings(
         AggregateZipRecord("10002", 1, 2, Decimal("40"), Decimal("45"), Decimal("50")),
         AggregateZipRecord("10003", 1, 3, Decimal("10"), Decimal("20"), Decimal("30")),
     )
-    assert prepared_work == work_admission._CodeWork(5, 7, 5, 5, 8, 5, 2, 8, 3)
+    assert prepared_work == work_admission._CodeWork(
+        5, 7, 5, 5, 8, 5, 2, 2, 8, 3
+    )

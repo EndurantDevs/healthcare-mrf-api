@@ -132,8 +132,10 @@ def test_aggregate_sql_preserves_exact_old_materializer_multiplicity() -> None:
     assert "COUNT(DISTINCT npi)" in aggregate_sql
     assert "plan_pricing_eligible_member_cell_stage" in aggregate_sql
     assert "plan_pricing_set_cell_stage" in aggregate_sql
-    assert "occurrence.occurrence_count" in aggregate_sql
-    assert "price.rate_multiplicity" in aggregate_sql
+    assert "plan_pricing_rate_frequency_stage" in aggregate_sql
+    assert "SUM(rate.multiplicity)" in aggregate_sql
+    assert "plan_pricing_code_occurrence_stage" not in aggregate_sql
+    assert "plan_pricing_price_rate_stage" not in aggregate_sql
     assert "(ranked.total + 1) / 2" in aggregate_sql
     assert "(ranked.total + 2) / 2" in aggregate_sql
 

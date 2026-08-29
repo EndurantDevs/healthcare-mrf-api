@@ -92,6 +92,18 @@ _STAGE_TABLE_SQL = (
             ) ON COMMIT DROP
     """,
     """
+            CREATE TEMP TABLE plan_pricing_rate_frequency_stage (
+                binding_ordinal integer NOT NULL,
+                provider_set_key bigint NOT NULL,
+                negotiated_rate numeric NOT NULL,
+                join_row_count bigint NOT NULL,
+                multiplicity bigint NOT NULL,
+                PRIMARY KEY (
+                    binding_ordinal, provider_set_key, negotiated_rate
+                )
+            ) ON COMMIT DROP
+    """,
+    """
             CREATE TEMP TABLE plan_pricing_provider_cell_stage (
                 projection_id varchar(64) NOT NULL,
                 geo_cell varchar(5) NOT NULL,

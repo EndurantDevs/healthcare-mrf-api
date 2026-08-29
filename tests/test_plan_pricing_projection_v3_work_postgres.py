@@ -144,7 +144,9 @@ async def test_v3_sql_matches_v2_empty_provider_set_semantics(
             ("HCPCS", "G0439"),
         )
 
-    assert prepared_work == work_admission._CodeWork(1, 2, 2, 1, 2, 1, 1, 2, 1)
+    assert prepared_work == work_admission._CodeWork(
+        1, 2, 2, 1, 2, 1, 1, 1, 2, 1
+    )
     assert len(stored_profiles) == 1
     assert stored_profiles[0]["provider_set_key"] == 10
     assert actual_records == (

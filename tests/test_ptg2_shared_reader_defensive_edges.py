@@ -250,7 +250,7 @@ async def test_price_membership_lookup_rechecks_decoder_atom_limit(
     )
 
     with pytest.raises(
-        sidecars.PTG2ManifestArtifactError, match="exceeds its atom limit"
+        sidecars.ManifestReadLimitError, match="exceeds its atom limit"
     ):
         await sidecars.lookup_price_atom_memberships_from_db(
             object(),

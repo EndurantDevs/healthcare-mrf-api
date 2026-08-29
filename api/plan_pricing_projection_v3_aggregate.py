@@ -38,16 +38,12 @@ _AGGREGATE_STATS_SQL = """
               FROM plan_pricing_eligible_member_cell_stage
              GROUP BY geo_cell
         ), rate_frequency AS MATERIALIZED (
-            SELECT cell.geo_cell, price.negotiated_rate,
-                   SUM(occurrence.occurrence_count
-                       * price.rate_multiplicity)::bigint AS frequency
+            SELECT cell.geo_cell, rate.negotiated_rate,
+                   SUM(rate.multiplicity)::bigint AS frequency
               FROM plan_pricing_set_cell_stage cell
-              JOIN plan_pricing_code_occurrence_stage occurrence
+              JOIN plan_pricing_rate_frequency_stage rate
                 USING (binding_ordinal, provider_set_key)
-              JOIN plan_pricing_price_rate_stage price
-                ON price.binding_ordinal = occurrence.binding_ordinal
-               AND price.price_set_id = occurrence.price_set_id
-             GROUP BY cell.geo_cell, price.negotiated_rate
+             GROUP BY cell.geo_cell, rate.negotiated_rate
         ), ranked AS MATERIALIZED (
             SELECT geo_cell, negotiated_rate, frequency,
                    SUM(frequency) OVER (PARTITION BY geo_cell)::bigint AS total,

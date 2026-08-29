@@ -12,18 +12,38 @@ from sqlalchemy import text
 
 from api.plan_pricing_projection_contract import row_mapping, table
 from api.plan_pricing_projection_materialize import digest_row, rate_fragment
-from api.plan_pricing_projection_source import BindingProjection, numeric_rates
+from api.plan_pricing_projection_source import BindingProjection
 from api.plan_pricing_projection_v3_provider import (
     _binding_ordinal,
     _stage_code_provider_sets,
 )
+from api.plan_pricing_projection_v3_price import (
+    MAX_CODE_STAGED_PRICE_ATOMS,
+    MAX_PRICE_HYDRATION_ATOMS,
+    _exact_numeric_rates,
+    _insert_price_rates,
+    _stage_binding_price_rates,
+)
 from api.plan_pricing_projection_v3_types import _BuildState, _insert_batches
+from api.ptg2_db_sidecars import _preflight_price_membership_aliases_from_db
 
 
 MAX_CODE_OCCURRENCES = 65_536
-MAX_CODE_PRICE_ATOMS = MAX_CODE_OCCURRENCES
+MAX_RATE_PROFILE_RATES = 65_536
 MAX_CODE_RATE_PROFILE_WORK_ROWS = 8_000_000
 MAX_PROJECTION_RATE_PROFILE_WORK_ROWS = 2_000_000_000
+
+
+_PROFILE_RATE_LIMIT_SQL = """
+    SELECT EXISTS (
+        SELECT 1
+          FROM plan_pricing_rate_frequency_stage
+         GROUP BY binding_ordinal, provider_set_key
+        HAVING COUNT(*)
+               > :maximum_rate_profile_rates
+         LIMIT 1
+    )
+"""
 
 
 _STORE_RATE_PROFILES_SQL = f"""
@@ -33,22 +53,6 @@ _STORE_RATE_PROFILES_SQL = f"""
         maximum_negotiated_rate, rate_count, negotiated_rates,
         rate_multiplicities
     )
-    WITH rate_frequency AS MATERIALIZED (
-        SELECT occurrence.binding_ordinal, occurrence.provider_set_key,
-               price.negotiated_rate,
-               SUM(occurrence.occurrence_count
-                   * price.rate_multiplicity)::bigint AS multiplicity
-          FROM plan_pricing_code_occurrence_stage occurrence
-          JOIN plan_pricing_price_rate_stage price
-            ON price.binding_ordinal = occurrence.binding_ordinal
-           AND price.price_set_id = occurrence.price_set_id
-          JOIN plan_pricing_provider_set_stage membership
-            ON membership.binding_ordinal = occurrence.binding_ordinal
-           AND membership.provider_set_key = occurrence.provider_set_key
-         WHERE membership.membership_count > 0
-         GROUP BY occurrence.binding_ordinal, occurrence.provider_set_key,
-                  price.negotiated_rate
-    )
     SELECT :projection_id, :code_system, :code,
            rate.binding_ordinal, rate.provider_set_key,
            membership.membership_count,
@@ -56,7 +60,7 @@ _STORE_RATE_PROFILES_SQL = f"""
            SUM(rate.multiplicity)::bigint,
            ARRAY_AGG(rate.negotiated_rate ORDER BY rate.negotiated_rate),
            ARRAY_AGG(rate.multiplicity ORDER BY rate.negotiated_rate)
-      FROM rate_frequency rate
+      FROM plan_pricing_rate_frequency_stage rate
       JOIN plan_pricing_provider_set_stage membership
         USING (binding_ordinal, provider_set_key)
      GROUP BY rate.binding_ordinal, rate.provider_set_key,
@@ -73,7 +77,7 @@ async def _binding_code_rows(
     session: Any,
     binding: BindingProjection,
     code_rows: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], Mapping[str, Iterable[Mapping[str, Any]]]]:
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
     from api import ptg2_serving as serving
 
     declared_occurrences = serving._declared_geo_rate_count(code_rows)
@@ -116,26 +120,7 @@ async def _binding_code_rows(
         )
         if existing_price_key != price_key:
             raise ValueError("pricing projection price identity is inconsistent")
-    prices_by_key = await serving._version_three_bounded_prices_by_key(
-        session,
-        binding.serving_tables,
-        price_key_by_set_id.values(),
-        maximum_atom_count=MAX_CODE_PRICE_ATOMS,
-    )
-    return serving_rows, {
-        price_set_id: prices_by_key[price_key]
-        for price_set_id, price_key in price_key_by_set_id.items()
-    }
-
-
-def _exact_numeric_rates(
-    prices: Iterable[Mapping[str, Any]],
-) -> tuple[Decimal, ...]:
-    price_rows = tuple(prices)
-    rates = numeric_rates(price_rows)
-    if len(rates) != len(price_rows):
-        raise ValueError("pricing projection contains a non-numeric rate")
-    return rates
+    return serving_rows, price_key_by_set_id
 
 
 def _code_occurrences(
@@ -185,38 +170,6 @@ async def _insert_code_occurrences(
     )
 
 
-async def _insert_price_rates(
-    session: Any,
-    binding_ordinal: int,
-    rates_by_price_id: Mapping[str, tuple[Decimal, ...]],
-    *,
-    insert_batches: Any = _insert_batches,
-) -> None:
-    await insert_batches(
-        session,
-        """
-        INSERT INTO plan_pricing_price_rate_stage (
-            binding_ordinal, price_set_id, negotiated_rate, rate_multiplicity
-        ) VALUES (
-            :binding_ordinal, :price_set_id, :negotiated_rate,
-            :rate_multiplicity
-        )
-        """,
-        (
-            {
-                "binding_ordinal": binding_ordinal,
-                "price_set_id": price_set_id,
-                "negotiated_rate": rate,
-                "rate_multiplicity": multiplicity,
-            }
-            for price_set_id in sorted(rates_by_price_id)
-            for rate, multiplicity in sorted(
-                Counter(rates_by_price_id[price_set_id]).items()
-            )
-        ),
-    )
-
-
 async def _has_staged_code_inputs(
     session: Any,
     state: _BuildState,
@@ -225,7 +178,12 @@ async def _has_staged_code_inputs(
     *,
     binding_code_rows: Any = _binding_code_rows,
     stage_code_provider_sets: Any = _stage_code_provider_sets,
+    preflight_price_membership_aliases: Any = (
+        _preflight_price_membership_aliases_from_db
+    ),
 ) -> bool:
+    """Stage every bounded binding that contributes the requested code."""
+
     from api import ptg2_serving as serving
 
     normalized_occurrence_count = sum(
@@ -241,8 +199,7 @@ async def _has_staged_code_inputs(
     await session.execute(text("TRUNCATE plan_pricing_code_occurrence_stage"))
     await session.execute(text("TRUNCATE plan_pricing_price_rate_stage"))
     has_staged_rates = False
-    bounded_inputs = []
-    normalized_atom_count = 0
+    remaining_atom_count = MAX_CODE_STAGED_PRICE_ATOMS
     for binding in sorted(bindings, key=_binding_ordinal):
         bounded_input = await _bounded_binding_code_input(
             session,
@@ -252,26 +209,99 @@ async def _has_staged_code_inputs(
         )
         if bounded_input is None:
             continue
-        rates_by_price_id = bounded_input[3]
-        normalized_atom_count += sum(map(len, rates_by_price_id.values()))
-        if normalized_atom_count > MAX_CODE_PRICE_ATOMS:
-            raise ValueError(
-                "pricing projection normalized price-atom bound exceeded"
-            )
-        bounded_inputs.append(bounded_input)
-    for binding, serving_rows, occurrences, rates_by_price_id in bounded_inputs:
-        await stage_code_provider_sets(
+        staged_rates, consumed_atom_count = await _stage_bounded_binding_input(
             session,
-            binding,
-            serving_rows,
-            {provider_set_key for provider_set_key, _ in occurrences},
             state,
+            bounded_input,
+            remaining_atom_count,
+            stage_code_provider_sets,
+            preflight_price_membership_aliases,
         )
-        has_staged_rates = True
-        binding_ordinal = _binding_ordinal(binding)
-        await _insert_code_occurrences(session, binding_ordinal, occurrences)
-        await _insert_price_rates(session, binding_ordinal, rates_by_price_id)
+        remaining_atom_count -= consumed_atom_count
+        has_staged_rates = has_staged_rates or staged_rates
     return has_staged_rates
+
+
+async def _stage_bounded_binding_input(
+    session: Any,
+    state: _BuildState,
+    bounded_input: tuple[
+        BindingProjection,
+        list[dict[str, Any]],
+        Counter[tuple[int, str]],
+        dict[str, int],
+    ],
+    remaining_atom_count: int,
+    stage_code_provider_sets: Any,
+    preflight_price_membership_aliases: Any,
+) -> tuple[bool, int]:
+    """Stage one binding after metadata and price-rate admission."""
+
+    binding, serving_rows, occurrences, price_key_by_set_id = bounded_input
+    block_span = await _preflight_binding_price_memberships(
+        session,
+        state,
+        binding,
+        price_key_by_set_id,
+        preflight_price_membership_aliases,
+    )
+    retained_price_ids, consumed_atom_count = await _stage_binding_price_rates(
+        session,
+        binding,
+        price_key_by_set_id,
+        maximum_atom_count=remaining_atom_count,
+        block_span=block_span,
+    )
+    occurrences = Counter(
+        {
+            key: count
+            for key, count in occurrences.items()
+            if key[1] in retained_price_ids
+        }
+    )
+    if not occurrences:
+        return False, consumed_atom_count
+    await stage_code_provider_sets(
+        session,
+        binding,
+        serving_rows,
+        {provider_set_key for provider_set_key, _ in occurrences},
+        state,
+    )
+    await _insert_code_occurrences(
+        session, _binding_ordinal(binding), occurrences
+    )
+    return True, consumed_atom_count
+
+
+async def _preflight_binding_price_memberships(
+    session: Any,
+    state: _BuildState,
+    binding: BindingProjection,
+    price_key_by_set_id: Mapping[str, int],
+    preflight_price_membership_aliases: Any,
+) -> int:
+    """Validate and retain one binding's bounded price metadata identity."""
+
+    from api import ptg2_serving as serving
+
+    block_span = serving._required_price_cache_span(
+        binding.serving_tables.price_key_block_span,
+        "price_key_block_span",
+    )
+    retained_record_count = await preflight_price_membership_aliases(
+        session,
+        serving._required_shared_snapshot_key(binding.serving_tables),
+        price_key_by_set_id.values(),
+        block_span=block_span,
+        schema_name=serving.PTG2_SCHEMA,
+        identity_by_block=state.price_membership_identity_by_block,
+        owner_by_identity=state.price_membership_owner_by_identity,
+        retained_record_count=state.price_membership_metadata_record_count,
+    )
+    if type(retained_record_count) is int:
+        state.price_membership_metadata_record_count = retained_record_count
+    return block_span
 
 
 async def _bounded_binding_code_input(
@@ -283,31 +313,27 @@ async def _bounded_binding_code_input(
     BindingProjection,
     list[dict[str, Any]],
     Counter[tuple[int, str]],
-    dict[str, tuple[Decimal, ...]],
+    dict[str, int],
 ] | None:
     code_rows = binding.code_rows_by_identity.get(code_identity)
     if not code_rows:
         return None
-    serving_rows, prices_by_set = await binding_code_rows(
+    serving_rows, price_key_by_set_id = await binding_code_rows(
         session, binding, code_rows
     )
     from api import ptg2_serving as serving
 
     occurrences = _code_occurrences(serving, serving_rows)
-    rates_by_price_id = {
-        price_set_id: _exact_numeric_rates(prices_by_set.get(price_set_id, ()))
-        for _provider_set_key, price_set_id in occurrences
+    selected_price_ids = {price_set_id for _, price_set_id in occurrences}
+    if any(
+        price_set_id not in price_key_by_set_id
+        for price_set_id in selected_price_ids
+    ):
+        raise ValueError("pricing projection price hydration is incomplete")
+    return binding, serving_rows, occurrences, {
+        price_set_id: price_key_by_set_id[price_set_id]
+        for price_set_id in selected_price_ids
     }
-    occurrences = Counter(
-        {
-            key: count
-            for key, count in occurrences.items()
-            if rates_by_price_id[key[1]]
-        }
-    )
-    if not occurrences:
-        return None
-    return binding, serving_rows, occurrences, rates_by_price_id
 
 
 def _rate_profile_fragment(
@@ -334,7 +360,7 @@ def _validated_rate_profile(raw_profile: Mapping[str, Any]) -> tuple[Any, ...]:
     if (
         not rates
         or len(rates) != len(multiplicities)
-        or len(rates) > MAX_CODE_PRICE_ATOMS
+        or len(rates) > MAX_RATE_PROFILE_RATES
         or rates != tuple(sorted(set(rates)))
         or any(multiplicity <= 0 for multiplicity in multiplicities)
         or sum(multiplicities) != rate_count
@@ -368,6 +394,11 @@ async def _store_rate_profiles(
         "code_system": code_identity[0],
         "code": code_identity[1],
     }
+    if await session.scalar(
+        text(_PROFILE_RATE_LIMIT_SQL),
+        {"maximum_rate_profile_rates": MAX_RATE_PROFILE_RATES},
+    ):
+        raise ValueError("pricing projection rate profile is too large")
     await session.execute(text(store_sql), query_parameters_by_name)
     profile_stream = await session.stream(
         text(
@@ -381,7 +412,7 @@ async def _store_rate_profiles(
                AND code = :code
              ORDER BY binding_ordinal, provider_set_key
             """
-        ).execution_options(yield_per=32),
+        ).execution_options(yield_per=1),
         query_parameters_by_name,
     )
     async for raw_profile in profile_stream.mappings():

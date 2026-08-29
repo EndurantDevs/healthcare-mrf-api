@@ -22,7 +22,6 @@ from api.plan_pricing_projection_v3_aggregate import (
 )
 from api.plan_pricing_projection_v3_code import (
     MAX_CODE_OCCURRENCES,
-    MAX_CODE_PRICE_ATOMS,
     _binding_code_rows,
     _code_occurrences,
     _exact_numeric_rates,

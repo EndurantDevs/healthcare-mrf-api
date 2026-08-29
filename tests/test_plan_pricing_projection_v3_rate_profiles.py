@@ -44,10 +44,16 @@ class _ProfileStream:
 
 
 class _Session:
-    def __init__(self, rows):
+    def __init__(self, rows, *, oversized_profile=False):
         self.rows = rows
+        self.oversized_profile = oversized_profile
         self.execute_calls = []
         self.stream_calls = []
+        self.scalar_calls = []
+
+    async def scalar(self, statement, parameters=None):
+        self.scalar_calls.append((str(statement), parameters))
+        return self.oversized_profile
 
     async def execute(self, statement, parameters=None):
         self.execute_calls.append((str(statement), parameters))
@@ -98,10 +104,15 @@ async def test_rate_profile_store_is_sql_folded_streamed_and_digested() -> None:
         state,
     )
 
+    limit_sql, limit_parameters = session.scalar_calls[0]
+    assert "FROM plan_pricing_rate_frequency_stage" in limit_sql
+    assert "HAVING COUNT(*)" in limit_sql
+    assert limit_parameters == {
+        "maximum_rate_profile_rates": rate_profiles.MAX_RATE_PROFILE_RATES
+    }
     insert_sql, parameters = session.execute_calls[0]
-    assert "SUM(occurrence.occurrence_count" in insert_sql
-    assert "* price.rate_multiplicity" in insert_sql
-    assert "plan_pricing_provider_set_stage" in insert_sql
+    assert "plan_pricing_rate_frequency_stage" in insert_sql
+    assert "plan_pricing_code_occurrence_stage" not in insert_sql
     assert "COUNT(*)" not in insert_sql
     assert "ARRAY_AGG(rate.negotiated_rate ORDER BY" in insert_sql
     assert parameters == {
@@ -110,11 +121,27 @@ async def test_rate_profile_store_is_sql_folded_streamed_and_digested() -> None:
         "code": "27447",
     }
     stream_statement, stream_parameters = session.stream_calls[0]
-    assert stream_statement.get_execution_options()["yield_per"] == 32
+    assert stream_statement.get_execution_options()["yield_per"] == 1
     assert stream_parameters == parameters
     assert state.rate_profile_count == 2
     assert state.rate_profile_work_rows == 2
     assert state.content_digest.hexdigest() != hashlib.sha256().hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_rate_profile_store_rejects_oversized_profile_before_insert() -> None:
+    session = _Session((), oversized_profile=True)
+
+    with pytest.raises(ValueError, match="rate profile is too large"):
+        await rate_profiles._store_rate_profiles(
+            session,
+            PROJECTION_ID,
+            ("CPT", "27447"),
+            _BuildState(hashlib.sha256()),
+        )
+
+    assert session.execute_calls == []
+    assert session.stream_calls == []
 
 
 def test_rate_profile_fragment_keeps_decimal_text_and_multiplicity() -> None:

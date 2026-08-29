@@ -113,6 +113,14 @@ class _BuildState:
     member_cell_work_rows: int = 0
     rate_profile_work_rows: int = 0
     aggregate_work_rows: int = 0
+    price_membership_identity_by_block: dict[
+        tuple[str, int, str, int], tuple[tuple[bytes, ...], int, int]
+    ] = field(default_factory=dict)
+    price_membership_owner_by_identity: dict[
+        tuple[str, int, str, tuple[bytes, ...]],
+        tuple[tuple[str, int, str, int], int],
+    ] = field(default_factory=dict)
+    price_membership_metadata_record_count: int = 0
 
 
 async def _insert_batches(
