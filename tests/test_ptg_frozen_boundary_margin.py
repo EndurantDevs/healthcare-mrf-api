@@ -19,6 +19,7 @@ from tests.ptg_frozen_test_support import (
     frozen_descriptor_by_ordinal,
     protected_control_payload,
 )
+from tests.ptg_singleton_direct_test_support import _direct_params
 
 ptg = importlib.import_module("process.ptg")
 
@@ -35,6 +36,11 @@ def test_worker_argument_helpers_cover_scalar_and_list_shapes():
     assert ptg_frozen_control._normalized_optional_int("") is None
     assert ptg_frozen_control._normalized_optional_int("2") == 2
     assert ptg_frozen_control.frozen_rate_main_kwargs({}) == {}
+    assert binding.frozen_rate_binding_from_params({}) is None
+    direct_params = _direct_params()
+    assert ptg_frozen_control.protected_rate_main_kwargs(
+        direct_params
+    ) == ptg_frozen_control.singleton_direct_main_kwargs(direct_params)
     assert set(
         ptg_frozen_control.frozen_rate_main_kwargs(
             protected_control_payload()["params"]
