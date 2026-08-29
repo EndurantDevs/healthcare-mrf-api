@@ -52,7 +52,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
 
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_215
+    assert sum("locator_name" in entry for entry in hospitals) == 1_216
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 637
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 16
     assert {
@@ -62,12 +62,14 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
         hospital_id: hospital_by_id[hospital_id]["locator_name"]
         for hospital_id in (
             "hospital-000048",
+            "hospital-003026",
             "hospital-003082",
             "hospital-005234",
             "hospital-005243",
         )
     } == {
         "hospital-000048": "ADAMS MEMORIAL HOSPITAL",
+        "hospital-003026": "BARSTOW COMMUNITY HOSPITAL",
         "hospital-003082": "Hugh Chatham Health, a facility of Wilkes Regional Medical Center",
         "hospital-005234": "ProMedica Bay Park Hospital",
         "hospital-005243": "ProMedica Toledo Hospital",

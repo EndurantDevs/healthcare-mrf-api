@@ -9863,6 +9863,7 @@ hospitals:
 - hospital_id: hospital-003026
   name: HOSPITAL OF BARSTOW INC
   cms_hpt_url: https://barstowhospital.com/cms-hpt.txt
+  locator_name: BARSTOW COMMUNITY HOSPITAL
 - hospital_id: hospital-003027
   name: HOSPITAL OF LOUISA INC
   cms_hpt_url: https://threeriversmedicalcenter.com/cms-hpt.txt
