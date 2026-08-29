@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections import Counter
 from decimal import Decimal
-from typing import Any, Iterable, Mapping
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 import orjson
 from sqlalchemy import text
@@ -33,6 +33,12 @@ MAX_CODE_OCCURRENCES = 65_536
 MAX_RATE_PROFILE_RATES = 65_536
 MAX_CODE_RATE_PROFILE_WORK_ROWS = 8_000_000
 MAX_PROJECTION_RATE_PROFILE_WORK_ROWS = 2_000_000_000
+_BoundedBindingInput = tuple[
+    BindingProjection,
+    list[dict[str, Any]],
+    Counter[tuple[int, str]],
+    dict[str, int],
+]
 
 
 class _PriceMembershipMetadataReadLimitError(ManifestReadLimitError):
@@ -41,6 +47,16 @@ class _PriceMembershipMetadataReadLimitError(ManifestReadLimitError):
 
 class _PriceHydrationReadLimitError(ManifestReadLimitError):
     """Identify bounded price-hydration admission failures."""
+
+
+async def _diagnostic_checkpoint(
+    diagnostic_stage: Callable[[str], Awaitable[str | None]] | None,
+    stage: str,
+) -> None:
+    """Record one optional census-only database stage."""
+
+    if diagnostic_stage is not None:
+        await diagnostic_stage(stage)
 
 
 _PROFILE_RATE_LIMIT_SQL = """
@@ -190,6 +206,7 @@ async def _has_staged_code_inputs(
     preflight_price_membership_aliases: Any = (
         _preflight_price_membership_aliases_from_db
     ),
+    diagnostic_stage: Callable[[str], Awaitable[str | None]] | None = None,
 ) -> bool:
     """Stage every bounded binding that contributes the requested code."""
 
@@ -205,11 +222,13 @@ async def _has_staged_code_inputs(
         raise ValueError(
             "pricing projection normalized occurrence bound exceeded"
         )
+    await _diagnostic_checkpoint(diagnostic_stage, "reset_code_inputs")
     await session.execute(text("TRUNCATE plan_pricing_code_occurrence_stage"))
     await session.execute(text("TRUNCATE plan_pricing_price_rate_stage"))
     has_staged_rates = False
     remaining_atom_count = MAX_CODE_STAGED_PRICE_ATOMS
     for binding in sorted(bindings, key=_binding_ordinal):
+        await _diagnostic_checkpoint(diagnostic_stage, "code_layout")
         bounded_input = await _bounded_binding_code_input(
             session,
             binding,
@@ -225,6 +244,7 @@ async def _has_staged_code_inputs(
             remaining_atom_count,
             stage_code_provider_sets,
             preflight_price_membership_aliases,
+            diagnostic_stage,
         )
         remaining_atom_count -= consumed_atom_count
         has_staged_rates = has_staged_rates or staged_rates
@@ -234,20 +254,17 @@ async def _has_staged_code_inputs(
 async def _stage_bounded_binding_input(
     session: Any,
     state: _BuildState,
-    bounded_input: tuple[
-        BindingProjection,
-        list[dict[str, Any]],
-        Counter[tuple[int, str]],
-        dict[str, int],
-    ],
+    bounded_input: _BoundedBindingInput,
     remaining_atom_count: int,
     stage_code_provider_sets: Any,
     preflight_price_membership_aliases: Any,
+    diagnostic_stage: Callable[[str], Awaitable[str | None]] | None = None,
 ) -> tuple[bool, int]:
     """Stage one binding after metadata and price-rate admission."""
 
     binding, serving_rows, occurrences, price_key_by_set_id = bounded_input
     try:
+        await _diagnostic_checkpoint(diagnostic_stage, "price_membership_metadata")
         block_span = await _preflight_binding_price_memberships(
             session,
             state,
@@ -258,6 +275,7 @@ async def _stage_bounded_binding_input(
     except ManifestReadLimitError as exc:
         raise _PriceMembershipMetadataReadLimitError(str(exc)) from exc
     try:
+        await _diagnostic_checkpoint(diagnostic_stage, "price_hydration")
         retained_price_ids, consumed_atom_count = (
             await _stage_binding_price_rates(
                 session,
@@ -278,6 +296,7 @@ async def _stage_bounded_binding_input(
     )
     if not occurrences:
         return False, consumed_atom_count
+    await _diagnostic_checkpoint(diagnostic_stage, "provider_set_staging")
     await stage_code_provider_sets(
         session,
         binding,
@@ -285,6 +304,7 @@ async def _stage_bounded_binding_input(
         {provider_set_key for provider_set_key, _ in occurrences},
         state,
     )
+    await _diagnostic_checkpoint(diagnostic_stage, "code_occurrence_staging")
     await _insert_code_occurrences(
         session, _binding_ordinal(binding), occurrences
     )
@@ -322,12 +342,7 @@ async def _bounded_binding_code_input(
     binding: BindingProjection,
     code_identity: tuple[str, str],
     binding_code_rows: Any,
-) -> tuple[
-    BindingProjection,
-    list[dict[str, Any]],
-    Counter[tuple[int, str]],
-    dict[str, int],
-] | None:
+) -> _BoundedBindingInput | None:
     code_rows = binding.code_rows_by_identity.get(code_identity)
     if not code_rows:
         return None

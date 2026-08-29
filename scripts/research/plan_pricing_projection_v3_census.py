@@ -25,6 +25,7 @@ from api.plan_pricing_projection_v3_types import _BuildState
 from db.connection import db
 from scripts.ptg_v4_dev_canary_io import utc_now_text, write_json
 from scripts.research.plan_pricing_projection_v3_census_contract import (
+    EXPECTED_WORK_FIELD_KEYS,
     RESOURCE_PROOF_LIMITATIONS,
     census_parser as _census_parser,
     expected_target as _expected_target,
@@ -34,6 +35,10 @@ from scripts.research.plan_pricing_projection_v3_census_contract import (
     require_expected_target as _require_expected_target,
     seal_cardinality_census,
     seal_source_only,
+)
+from scripts.research.plan_pricing_projection_v3_census_diagnostics import (
+    CensusDatabaseStages,
+    run_census_process,
 )
 from scripts.research.plan_pricing_projection_v3_census_support import (
     ReleaseInput,
@@ -46,6 +51,7 @@ from scripts.research.plan_pricing_projection_v3_census_support import (
     runtime_identity,
 )
 from scripts.research.plan_pricing_projection_v3_census_transaction import (
+    census_database_run_token,
     declared_occurrence_rows as _declared_occurrence_rows,
     price_membership_cache_counts as _price_membership_cache_counts,
     projection_stage_counts as _projection_stage_counts,
@@ -58,22 +64,7 @@ CHECKPOINT_INTERVAL = 64
 MAX_CENSUS_RUNTIME_SECONDS = 12 * 60 * 60
 DIAGNOSTIC_CODE_MEMBERSHIP_LIMIT = 8_000_000
 DIAGNOSTIC_CODE_MEMBER_CELL_LIMIT = 8_000_000
-MEASURED_WORK_FIELDS = (
-    "normalized_occurrence_rows",
-    "staged_price_atom_membership_rows",
-    "maximum_price_key_atom_membership_rows",
-    "membership_probe_rows",
-    "member_cell_rows",
-    "eligible_member_cell_rows",
-    "set_cell_rows",
-    "profile_join_rows",
-    "aggregate_join_rows",
-    "profile_rate_count_sum",
-    "profile_rate_count_max",
-    "profile_distinct_rate_count_max",
-    "aggregate_rate_count_sum",
-    "aggregate_rate_count_max",
-)
+MEASURED_WORK_FIELDS = tuple(sorted(EXPECTED_WORK_FIELD_KEYS))
 _STAGED_PRICE_METRICS_SQL = """
     WITH price_set_atoms AS MATERIALIZED (
         SELECT binding_ordinal, price_set_id, SUM(rate_multiplicity)::bigint
@@ -86,10 +77,6 @@ _STAGED_PRICE_METRICS_SQL = """
                AS maximum_price_key_atom_membership_rows
       FROM price_set_atoms
 """
-_ERROR_DIMENSION_BY_TYPE = {
-    _PriceMembershipMetadataReadLimitError: "price_membership_metadata",
-    _PriceHydrationReadLimitError: "price_hydration",
-}
 
 
 @dataclass(frozen=True)
@@ -204,12 +191,16 @@ async def _has_measured_code(
         "normalized_occurrence_rows",
         _declared_occurrence_rows(context.binding_projections, code_identity),
     )
-    if set_stage is not None:
-        set_stage("measuring code inputs", "measuring bounded code inputs")
     if not await projection._has_staged_code_inputs(
-        session, context.state, code_identity, context.binding_projections
+        session,
+        context.state,
+        code_identity,
+        context.binding_projections,
+        diagnostic_stage=set_stage,
     ):
         return False
+    if set_stage is not None:
+        await set_stage("staged_price_metrics")
     staged_input_result = await session.execute(text(_STAGED_PRICE_METRICS_SQL))
     staged_input_by_field = staged_input_result.mappings().one()
     _record_metric(
@@ -218,19 +209,20 @@ async def _has_measured_code(
         int(staged_input_by_field["maximum_price_key_atom_membership_rows"]),
     )
     if set_stage is not None:
-        set_stage("measuring provider cells", "measuring frozen provider cells")
+        await set_stage("provider_cells")
     await projection._materialize_provider_cells(
         session, context.candidate_projection_id, context.state
     )
-    if set_stage is not None:
-        set_stage("measuring code work", "measuring bounded code work")
     code_work = await projection._stage_code_work(
         session,
         context.candidate_projection_id,
         code_identity,
         DIAGNOSTIC_CODE_MEMBERSHIP_LIMIT,
         DIAGNOSTIC_CODE_MEMBER_CELL_LIMIT,
+        diagnostic_stage=set_stage,
     )
+    if set_stage is not None:
+        await set_stage("eligible_member_cells")
     eligible_result = await session.execute(
         text("SELECT COUNT(*) FROM plan_pricing_eligible_member_cell_stage")
     )
@@ -293,7 +285,10 @@ async def _measurement_result(
     context: _CensusContext,
     metrics_by_field: dict[str, dict[str, int]],
     measured_code_count: int,
+    set_stage: Any = None,
 ) -> dict[str, Any]:
+    if set_stage is not None:
+        await set_stage("final_measurement")
     stage_counts_by_field = await _projection_stage_counts(session)
     stage_counts_by_field.update(_price_membership_cache_counts(context.state))
     expected_stage_counts = (
@@ -347,7 +342,7 @@ async def _measure_release(
     set_stage: Any = None,
 ) -> dict[str, Any]:
     if set_stage is not None:
-        set_stage("preparing release context", "preparing bounded release context")
+        await set_stage("preparing_release_context")
     checkpoint(
         {
             "stage": "preparing_release_context",
@@ -360,7 +355,11 @@ async def _measure_release(
         session, context, checkpoint, set_stage
     )
     return await _measurement_result(
-        session, context, metrics_by_field, measured_code_count
+        session,
+        context,
+        metrics_by_field,
+        measured_code_count,
+        set_stage,
     )
 
 
@@ -390,13 +389,34 @@ async def _execute_census(
         receipt_by_field["message"] = message
 
     receipt_by_field["runtime"] = runtime_identity(args.expected_image_digest)
+    database_run_token = census_database_run_token(receipt_by_field["runtime"])
+    database_stages = CensusDatabaseStages(
+        receipt_by_field,
+        args.receipt,
+        database_run_token,
+    )
+
     set_stage("connecting database", "connecting to the census database")
     await db.connect()
     try:
         set_stage("measuring release", "measuring the factorized release")
+
+        async def measure(session: Any) -> dict[str, Any]:
+            """Measure and close one rollback-only database session."""
+
+            measured_result = await _measure_release(
+                session,
+                args,
+                checkpoint,
+                lambda stage: database_stages.checkpoint(session, stage),
+            )
+            await database_stages.checkpoint(session, "measurement_complete")
+            return measured_result
+
         measured_result = await rollback_only(
             receipt_by_field,
-            lambda session: _measure_release(session, args, checkpoint, set_stage),
+            measure,
+            run_token=database_run_token,
         )
         receipt_by_field["measurement"] = measured_result
         set_stage("verifying rollback", "verifying census rollback")
@@ -469,26 +489,7 @@ def census_main() -> int:
         "resource_proof_admissible": False,
         "started_at": utc_now_text(),
     }
-    exit_code = 1
-    try:
-        exit_code = asyncio.run(run_census(args, receipt_by_field))
-    except BaseException as exc:
-        try:
-            receipt_by_field["source_after"] = _source_identity(args)
-        except BaseException as source_exc:
-            receipt_by_field["source_after_error"] = {"type": type(source_exc).__name__}
-        error_by_field = {"type": type(exc).__name__}
-        error_dimension = _ERROR_DIMENSION_BY_TYPE.get(type(exc))
-        if error_dimension is not None:
-            error_by_field["dimension"] = error_dimension
-        receipt_by_field.update(
-            status="failed",
-            accepted=False,
-            finished_at=utc_now_text(),
-            error=error_by_field,
-        )
-    write_json(args.receipt.resolve(), receipt_by_field)
-    return exit_code
+    return run_census_process(args, receipt_by_field, run_census, _source_identity)
 
 
 if __name__ == "__main__":

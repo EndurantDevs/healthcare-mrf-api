@@ -162,6 +162,7 @@ async def test_materializer_validates_bindings_and_yields_per_code(monkeypatch) 
     admitted_work = SimpleNamespace(
         membership_probe_rows=1,
         member_cell_rows=1,
+        profile_join_rows=1,
     )
     prepare_code_work = AsyncMock(return_value=admitted_work)
     restage_code_work = AsyncMock(return_value=admitted_work)
@@ -203,7 +204,7 @@ async def test_materializer_validates_bindings_and_yields_per_code(monkeypatch) 
     )
     persist_provider.assert_awaited_once_with(ANY, PROJECTION_ID)
     restage_code_work.assert_awaited_once_with(
-        ANY, PROJECTION_ID, ("CPT", "27447"), 1, 1
+        ANY, PROJECTION_ID, ("CPT", "27447"), 1, 1, 1
     )
     store_rate_profiles.assert_awaited_once()
     store_aggregate_packs.assert_awaited_once()
@@ -211,21 +212,24 @@ async def test_materializer_validates_bindings_and_yields_per_code(monkeypatch) 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "drift_kind", ("missing_input", "actual_work", "provider_counter")
+    "drift_kind",
+    ("missing_input", "actual_work", "rate_profile_work", "provider_counter"),
 )
 async def test_materializer_rejects_second_pass_admission_drift(
     monkeypatch, drift_kind
 ) -> None:
+    """Reject any second-pass work or provider-counter drift."""
+
     admitted_work = SimpleNamespace(
         membership_probe_rows=1,
         member_cell_rows=1,
+        profile_join_rows=1,
     )
-    actual_work = admitted_work
-    if drift_kind == "actual_work":
-        actual_work = SimpleNamespace(
-            membership_probe_rows=1,
-            member_cell_rows=2,
-        )
+    actual_work = SimpleNamespace(
+        membership_probe_rows=1,
+        member_cell_rows=2 if drift_kind == "actual_work" else 1,
+        profile_join_rows=2 if drift_kind == "rate_profile_work" else 1,
+    )
     state = projection._BuildState(hashlib.sha256())
 
     def has_staged_inputs(*_args) -> bool:
@@ -261,6 +265,7 @@ async def test_materializer_rejects_second_pass_admission_drift(
         stage_code_work.assert_not_awaited()
     else:
         stage_code_work.assert_awaited_once()
+        assert stage_code_work.await_args.args[-1] == 1
     store_rate_profiles.assert_not_awaited()
     aggregate_records.assert_not_awaited()
     store_aggregate_packs.assert_not_awaited()

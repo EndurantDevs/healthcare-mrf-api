@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import hashlib
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -174,3 +174,45 @@ def test_member_cell_stage_uses_the_exact_normalized_taxonomy_rule(
     assert "upper(btrim(taxonomy_code))" in taxonomy_sql
     assert "LIMIT :member_cell_limit" in work_admission._MEMBER_CELL_PROBE_SQL
     assert work_admission._delete_ineligible_member_cells_sql(False) is None
+
+
+def test_exact_census_application_name_is_a_valid_sql_marker() -> None:
+    marker = "hp-pv3-census:0123456789ab:rate_profile_cardinality"
+
+    assert work_admission._DIAGNOSTIC_MARKER.fullmatch(marker)
+
+
+@pytest.mark.asyncio
+async def test_rate_profile_probe_must_match_materialized_work() -> None:
+    """Reject rate-profile fanout that changes after its admission probe."""
+
+    scalar_result = Mock()
+    scalar_result.scalar_one.return_value = 1
+    metrics_result = Mock()
+    metrics_result.mappings.return_value.one.return_value = vars(
+        _code_work(profile_join_rows=2)
+    )
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                Mock(),
+                scalar_result,
+                scalar_result,
+                Mock(),
+                scalar_result,
+                Mock(),
+                Mock(),
+                metrics_result,
+            ]
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="rate-profile work changed"):
+        await work_admission._stage_code_work(
+            session,
+            "a" * 64,
+            ("HCPCS", "G0439"),
+            1,
+            1,
+            1,
+        )

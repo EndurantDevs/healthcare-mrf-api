@@ -8,6 +8,44 @@ import pytest
 from scripts.research import plan_pricing_projection_v3_census as census
 from scripts.research import plan_pricing_projection_v3_census_contract as contract
 
+_RUNTIME = {
+    "job_name": "census-job",
+    "pod_uid": "pod-uid",
+    "image_digest": "sha256:" + "c" * 64,
+}
+
+
+def _database_receipt() -> dict:
+    run_token = contract.census_database_run_token(_RUNTIME)
+    resources_by_stage = {}
+    for stage in contract.CENSUS_DATABASE_STAGE_KEYS:
+        resource_by_field = {
+            "before_count": 1,
+            "before_backend_memory_context_bytes_maximum": 1,
+            "before_temporary_relation_bytes_maximum": 0,
+        }
+        if stage != "measurement_complete":
+            resource_by_field.update(
+                after_count=1,
+                after_backend_memory_context_bytes_maximum=1,
+                after_temporary_relation_bytes_maximum=0,
+            )
+        resources_by_stage[stage] = resource_by_field
+    return {
+        "runtime": _RUNTIME,
+        "database_run_token": run_token,
+        "database_backend_pid": 123,
+        "database_session_settings": (
+            contract.expected_census_database_settings(run_token)
+        ),
+        "database_stage": "measurement_complete",
+        "database_application_name": contract.census_database_application_name(
+            run_token,
+            "measurement_complete",
+        ),
+        "database_stage_resources": resources_by_stage,
+    }
+
 
 def _staged_counts() -> dict[str, int]:
     return dict.fromkeys(
@@ -37,6 +75,7 @@ def _accepted_inputs() -> tuple[dict, dict]:
     staged_by_field = _staged_counts()
     return (
         {
+            **_database_receipt(),
             "rollback_complete": True,
             "temporary_relations_after_rollback": [],
             "postflight": {"accepted": True},
@@ -139,6 +178,35 @@ def test_acceptance_recomputes_derived_gates_and_limits() -> None:
     measurement_by_field["observed_work_limits"][
         "maximum_code_membership_probe_rows"
     ] = 2
+    assert not contract.is_accepted(receipt_by_field, measurement_by_field, True)
+
+
+def test_acceptance_requires_exact_census_database_settings() -> None:
+    receipt_by_field, measurement_by_field = _accepted_inputs()
+    receipt_by_field["database_session_settings"] = {
+        **receipt_by_field["database_session_settings"],
+        "work_mem": "32MB",
+    }
+
+    assert not contract.is_accepted(receipt_by_field, measurement_by_field, True)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda receipt: receipt.update(database_run_token="0" * 12),
+        lambda receipt: receipt.update(database_backend_pid=True),
+        lambda receipt: receipt.update(database_application_name="changed"),
+        lambda receipt: receipt["database_stage_resources"].pop("final_measurement"),
+        lambda receipt: receipt["database_stage_resources"][
+            "measurement_complete"
+        ].update(before_count=-1),
+    ),
+)
+def test_acceptance_rejects_malformed_database_attribution(mutation) -> None:
+    receipt_by_field, measurement_by_field = _accepted_inputs()
+    mutation(receipt_by_field)
+
     assert not contract.is_accepted(receipt_by_field, measurement_by_field, True)
 
 

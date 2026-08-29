@@ -63,6 +63,17 @@ async def test_v3_sql_work_caps_reject_before_persistent_projection_rows(
                 **{limit_name: limit_value},
             )
 
+        if limit_name == "MAX_CODE_RATE_PROFILE_WORK_ROWS":
+            for relation in (
+                "plan_pricing_eligible_member_cell_stage",
+                "plan_pricing_set_cell_stage",
+                "plan_pricing_rate_frequency_stage",
+            ):
+                assert (
+                    await connection.scalar(text(f"SELECT COUNT(*) FROM {relation}"))
+                    == 0
+                )
+
         stored_counts = await connection.execute(
             text(
                 f"""SELECT

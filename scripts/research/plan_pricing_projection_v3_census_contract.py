@@ -38,15 +38,27 @@ from api.ptg2_db_sidecars import (
     PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES_PER_BLOCK,
     PRICE_MEMBERSHIP_TRANSIENT_BYTES_PER_FRAGMENT,
 )
+from scripts.research.plan_pricing_projection_v3_census_diagnostics import (
+    is_database_receipt_valid as _is_database_receipt_valid,
+)
 from scripts.research.plan_pricing_projection_v3_census_support import ReleaseInput
+from scripts.research.plan_pricing_projection_v3_census_transaction import (
+    CENSUS_DATABASE_STAGE_KEYS,
+    census_database_application_name,
+    census_database_run_token,
+    expected_census_database_settings,
+)
 
 RESOURCE_PROOF_LIMITATIONS = (
-    "postgres_temp_bytes_unmeasured",
+    "postgres_temp_file_bytes_unmeasured",
     "postgres_wal_bytes_unmeasured",
     "full_build_memory_headroom_unmeasured",
     "provider_cell_batch_headroom_unmeasured",
     "provider_source_read_batch_headroom_unmeasured",
     "source_catalog_headroom_unmeasured",
+    "postgres_backend_private_memory_unmeasured",
+    "postgres_statement_peak_memory_unmeasured",
+    "postgres_host_capacity_reservation_absent",
 )
 EXPECTED_FIXED_CAP_GATE_KEYS = frozenset(
     {
@@ -389,6 +401,7 @@ def is_accepted(
     postflight = receipt_by_field.get("postflight")
     return (
         source_matches
+        and _is_database_receipt_valid(receipt_by_field)
         and receipt_by_field.get("rollback_complete") is True
         and receipt_by_field.get("temporary_relations_after_rollback") == []
         and isinstance(fixed_gates, Mapping)

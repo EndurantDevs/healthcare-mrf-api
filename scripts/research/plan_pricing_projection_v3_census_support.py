@@ -132,6 +132,7 @@ def capture_source_identity(
         driver_path,
         Path(__file__).resolve(),
         driver_path.with_name("plan_pricing_projection_v3_census_contract.py"),
+        driver_path.with_name("plan_pricing_projection_v3_census_diagnostics.py"),
         driver_path.with_name("plan_pricing_projection_v3_census_transaction.py"),
     )
     harness_files = [

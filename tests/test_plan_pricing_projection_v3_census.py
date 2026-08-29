@@ -272,7 +272,12 @@ def test_census_projects_the_four_executable_work_limits() -> None:
 
 
 def test_census_acceptance_requires_four_positive_work_limits() -> None:
+    from tests.test_plan_pricing_projection_v3_census_contract import (
+        _database_receipt,
+    )
+
     receipt_by_field = {
+        **_database_receipt(),
         "rollback_complete": True,
         "temporary_relations_after_rollback": [],
         "postflight": {"accepted": True},
@@ -429,7 +434,7 @@ async def test_census_counts_declared_occurrences_without_staged_rates(
     )
     monkeypatch.setattr(serving, "_declared_geo_rate_count", lambda rows: sum(rows))
 
-    async def has_staged_rates(*_args):
+    async def has_staged_rates(*_args, **_kwargs):
         return False
 
     monkeypatch.setattr(census.projection, "_has_staged_code_inputs", has_staged_rates)
@@ -463,10 +468,16 @@ def test_census_source_overlay_includes_branch_runtime_dependencies() -> None:
 
 def test_census_rejects_a_changed_harness_manifest(monkeypatch) -> None:
     file_digest = "e" * 64
+    hashed_paths = []
     source_manifest = support._canonical_sha256(
         [[source_path, file_digest] for source_path in support.SOURCE_PATHS]
     )
-    monkeypatch.setattr(support, "_sha256_file", lambda _path: file_digest)
+
+    def hash_file(path):
+        hashed_paths.append(Path(path).name)
+        return file_digest
+
+    monkeypatch.setattr(support, "_sha256_file", hash_file)
     monkeypatch.setattr(support, "_observed_git_head", lambda _root: "0" * 40)
 
     with pytest.raises(RuntimeError, match="harness identity changed"):
@@ -476,3 +487,4 @@ def test_census_rejects_a_changed_harness_manifest(monkeypatch) -> None:
             source_manifest,
             "f" * 64,
         )
+    assert "plan_pricing_projection_v3_census_diagnostics.py" in hashed_paths

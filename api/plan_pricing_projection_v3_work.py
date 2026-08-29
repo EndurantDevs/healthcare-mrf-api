@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import Any, Mapping
+from functools import partial
+from typing import Any, Awaitable, Callable, Mapping
 
 from sqlalchemy import text
 
@@ -27,6 +29,7 @@ MAX_PROJECTION_MEMBERSHIP_PROBES: int | None = None
 MAX_CODE_MEMBER_CELL_WORK_ROWS: int | None = None
 MAX_PROJECTION_MEMBER_CELL_WORK_ROWS: int | None = None
 MAX_BIGINT = (1 << 63) - 1
+_DIAGNOSTIC_MARKER = re.compile(r"^[a-z0-9:_-]{1,63}$")
 
 
 _RESET_CODE_WORK_SQL = """
@@ -74,6 +77,23 @@ _RATE_FREQUENCY_INSERT_SQL = """
      WHERE membership.membership_count > 0
      GROUP BY occurrence.binding_ordinal, occurrence.provider_set_key,
               price.negotiated_rate
+"""
+
+_RATE_PROFILE_WORK_PROBE_SQL = """
+    WITH price_count AS MATERIALIZED (
+        SELECT binding_ordinal, price_set_id, COUNT(*)::bigint AS rate_rows
+          FROM plan_pricing_price_rate_stage
+         GROUP BY binding_ordinal, price_set_id
+    )
+    SELECT COALESCE(SUM(price_count.rate_rows), 0)::numeric
+      FROM plan_pricing_code_occurrence_stage occurrence
+      JOIN price_count
+        ON price_count.binding_ordinal = occurrence.binding_ordinal
+       AND price_count.price_set_id = occurrence.price_set_id
+      JOIN plan_pricing_provider_set_stage membership
+        ON membership.binding_ordinal = occurrence.binding_ordinal
+       AND membership.provider_set_key = occurrence.provider_set_key
+     WHERE membership.membership_count > 0
 """
 
 _WORK_METRICS_SQL = """
@@ -282,51 +302,98 @@ def _record_code_work(
     state.aggregate_work_rows += work.aggregate_join_rows
 
 
-async def _stage_code_work(
+async def _diagnostic_statement(
+    diagnostic_stage: Callable[[str], Awaitable[str | None]] | None,
+    stage: str,
+    sql: str,
+):
+    """Bind one closed diagnostic marker to a SQL statement."""
+
+    marker = await diagnostic_stage(stage) if diagnostic_stage is not None else None
+    if marker is None:
+        return text(sql)
+    if _DIAGNOSTIC_MARKER.fullmatch(marker) is None:
+        raise ValueError("pricing projection diagnostic marker is invalid")
+    return text(f"/* {marker} */\n{sql}")
+
+
+async def _stage_member_cells(
     session: Any,
     projection_id: str,
     code_identity: tuple[str, str],
-    membership_probe_limit: int,
     member_cell_limit: int,
-) -> _CodeWork:
-    """Stage and measure one code's exact provider/rate join work."""
+    statement: Callable[[str, str], Awaitable[Any]],
+) -> int:
+    """Stage, bound, and taxonomy-filter one code's provider cells."""
 
-    has_taxonomy_rule, taxonomy_codes = _normalized_taxonomy_codes(code_identity)
-    await session.execute(text(_RESET_CODE_WORK_SQL))
-    membership_result = await session.execute(text(_MEMBERSHIP_PROBE_SQL))
-    membership_probe_rows = int(membership_result.scalar_one())
-    if membership_probe_rows > membership_probe_limit:
-        raise ValueError("pricing projection membership-probe work bound exceeded")
     await session.execute(
-        text(_MEMBER_CELL_PROBE_SQL),
+        await statement("member_cell_staging", _MEMBER_CELL_PROBE_SQL),
         {
             "projection_id": projection_id,
             "member_cell_limit": member_cell_limit + 1,
         },
     )
     count_result = await session.execute(
-        text("SELECT COUNT(*) FROM plan_pricing_eligible_member_cell_stage")
+        await statement(
+            "member_cell_count",
+            "SELECT COUNT(*) FROM plan_pricing_eligible_member_cell_stage",
+        )
     )
     member_cell_rows = int(count_result.scalar_one())
     if member_cell_rows > member_cell_limit:
         raise ValueError("pricing projection member-cell work bound exceeded")
+    has_taxonomy_rule, taxonomy_codes = _normalized_taxonomy_codes(code_identity)
     taxonomy_delete_sql = _delete_ineligible_member_cells_sql(has_taxonomy_rule)
     if taxonomy_delete_sql is not None:
         await session.execute(
-            text(taxonomy_delete_sql),
-            {
-                "projection_id": projection_id,
-                "taxonomy_codes": taxonomy_codes,
-            },
+            await statement("taxonomy_filter", taxonomy_delete_sql),
+            {"projection_id": projection_id, "taxonomy_codes": taxonomy_codes},
         )
-    await session.execute(text(_SET_CELL_INSERT_SQL))
-    await session.execute(text(_RATE_FREQUENCY_INSERT_SQL))
-    metrics_result = await session.execute(text(_WORK_METRICS_SQL))
+    return member_cell_rows
+
+
+async def _stage_code_work(
+    session: Any,
+    projection_id: str,
+    code_identity: tuple[str, str],
+    membership_probe_limit: int,
+    member_cell_limit: int,
+    rate_profile_work_limit: int = MAX_CODE_RATE_PROFILE_WORK_ROWS,
+    *,
+    diagnostic_stage: Callable[[str], Awaitable[str | None]] | None = None,
+) -> _CodeWork:
+    """Stage and measure one code's exact provider/rate join work."""
+
+    statement = partial(_diagnostic_statement, diagnostic_stage)
+    await session.execute(await statement("reset_code_work", _RESET_CODE_WORK_SQL))
+    membership_sql = await statement("membership_probe", _MEMBERSHIP_PROBE_SQL)
+    membership_result = await session.execute(membership_sql)
+    membership_probe_rows = int(membership_result.scalar_one())
+    if membership_probe_rows > membership_probe_limit:
+        raise ValueError("pricing projection membership-probe work bound exceeded")
+    rate_work_result = await session.execute(
+        await statement("rate_profile_cardinality", _RATE_PROFILE_WORK_PROBE_SQL)
+    )
+    rate_profile_work_rows = int(rate_work_result.scalar_one())
+    if rate_profile_work_rows > rate_profile_work_limit:
+        raise ValueError("pricing projection rate-profile work bound exceeded")
+    member_cell_rows = await _stage_member_cells(
+        session, projection_id, code_identity, member_cell_limit, statement
+    )
+    await session.execute(await statement("set_cell_staging", _SET_CELL_INSERT_SQL))
+    await session.execute(
+        await statement("rate_frequency_staging", _RATE_FREQUENCY_INSERT_SQL)
+    )
+    metrics_result = await session.execute(
+        await statement("work_metrics", _WORK_METRICS_SQL)
+    )
     work = _code_work_from_row(
         membership_probe_rows,
         member_cell_rows,
         metrics_result.mappings().one(),
     )
+    if work.profile_join_rows != rate_profile_work_rows:
+        raise RuntimeError("pricing projection rate-profile work changed")
     return work
 
 
@@ -347,12 +414,17 @@ async def _prepare_code_work(
         limits.code_member_cells,
         limits.projection_member_cells - state.member_cell_work_rows,
     )
+    remaining_rate_profile_limit = min(
+        MAX_CODE_RATE_PROFILE_WORK_ROWS,
+        MAX_PROJECTION_RATE_PROFILE_WORK_ROWS - state.rate_profile_work_rows,
+    )
     work = await _stage_code_work(
         session,
         projection_id,
         code_identity,
         remaining_membership_limit,
         remaining_cell_limit,
+        remaining_rate_profile_limit,
     )
     _record_code_work(state, work, limits)
     return work

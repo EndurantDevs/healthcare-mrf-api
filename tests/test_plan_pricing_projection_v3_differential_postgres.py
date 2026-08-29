@@ -350,7 +350,12 @@ async def test_v3_sql_preserves_three_binding_multiplicity_and_union(
             projection_id,
             ("HCPCS", "G0439"),
             None,
+            MAX_CODE_RATE_PROFILE_WORK_ROWS=5,
         )
+        profile_join_rows = await connection.scalar(
+            text("SELECT SUM(join_row_count) FROM plan_pricing_rate_frequency_stage")
+        )
+        assert profile_join_rows == 5
         await connection.execute(
             text(
                 "TRUNCATE plan_pricing_code_occurrence_stage, "

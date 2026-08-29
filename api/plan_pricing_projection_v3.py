@@ -110,6 +110,8 @@ async def _has_staged_code_inputs(
     state: _BuildState,
     code_identity: tuple[str, str],
     bindings: list[BindingProjection],
+    *,
+    diagnostic_stage: Any = None,
 ) -> bool:
     return await _code._has_staged_code_inputs(
         session,
@@ -118,6 +120,7 @@ async def _has_staged_code_inputs(
         bindings,
         binding_code_rows=_binding_code_rows,
         stage_code_provider_sets=_stage_code_provider_sets,
+        diagnostic_stage=diagnostic_stage,
     )
 
 
@@ -155,6 +158,9 @@ async def _stage_code_work(
     code_identity: tuple[str, str],
     membership_probe_limit: int,
     member_cell_limit: int,
+    rate_profile_work_limit: int = _code.MAX_CODE_RATE_PROFILE_WORK_ROWS,
+    *,
+    diagnostic_stage: Any = None,
 ) -> Any:
     return await _work._stage_code_work(
         session,
@@ -162,6 +168,8 @@ async def _stage_code_work(
         code_identity,
         membership_probe_limit,
         member_cell_limit,
+        rate_profile_work_limit,
+        diagnostic_stage=diagnostic_stage,
     )
 
 
@@ -257,6 +265,7 @@ async def _store_admitted_codes(
             code_identity,
             admitted_work.membership_probe_rows,
             admitted_work.member_cell_rows,
+            admitted_work.profile_join_rows,
         )
         if actual_work != admitted_work or staged_provider_counts != (
             state.staged_provider_set_count,

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,37 @@ from tests.test_plan_pricing_projection_v3_differential_postgres import (
     _insert_candidate,
     migrated_v3_database,
 )
+
+_RUN_TOKEN = "a" * 12
+
+
+async def _run_blocked_statement(session, backend_pids, query_started) -> None:
+    """Run one marked statement until the rollback owner cancels it."""
+
+    await transaction.set_census_database_stage(
+        session,
+        _RUN_TOKEN,
+        "price_hydration",
+        transaction.census_database_application_name(_RUN_TOKEN, "setup"),
+    )
+    backend_pids.append(int(await session.scalar(text("SELECT pg_backend_pid()"))))
+    query_started.set()
+    await session.execute(text("SELECT pg_sleep(60)"))
+    raise AssertionError("cancelled database statement returned")
+
+
+def _assert_rollback_receipt(receipt_by_field: dict) -> None:
+    backend_pid = receipt_by_field["database_backend_pid"]
+    assert type(backend_pid) is int and backend_pid > 0
+    assert receipt_by_field == {
+        "database_run_token": _RUN_TOKEN,
+        "database_backend_pid": backend_pid,
+        "database_session_settings": (
+            transaction.expected_census_database_settings(_RUN_TOKEN)
+        ),
+        "rollback_complete": True,
+        "temporary_relations_after_rollback": [],
+    }
 
 
 async def _configure_census_database(
@@ -39,6 +71,25 @@ async def _configure_census_database(
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
 
     monkeypatch.setattr(transaction, "lock_provider_generation", lock_repeatable_read)
+
+
+async def _temporary_relation_totals(session) -> tuple[int, int]:
+    """Return exact table-only and all-relation temporary bytes."""
+
+    size_result = await session.execute(text("""
+            SELECT COALESCE(SUM(pg_total_relation_size(oid))
+                                FILTER (WHERE relkind = 'r'), 0)::bigint
+                       AS table_total,
+                   COALESCE(SUM(pg_total_relation_size(oid)), 0)::bigint
+                       AS all_relation_total
+              FROM pg_class
+             WHERE relnamespace = pg_my_temp_schema()
+            """))
+    size_by_field = size_result.mappings().one()
+    return (
+        int(size_by_field["table_total"]),
+        int(size_by_field["all_relation_total"]),
+    )
 
 
 async def _census_operation(
@@ -143,13 +194,12 @@ async def test_census_transaction_always_rolls_back_temp_and_persistent_rows(
         )
 
     receipt_by_field: dict = {}
-    assert await transaction.rollback_only(receipt_by_field, operation) == {
-        "measured": True
-    }
-    assert receipt_by_field == {
-        "rollback_complete": True,
-        "temporary_relations_after_rollback": [],
-    }
+    assert await transaction.rollback_only(
+        receipt_by_field,
+        operation,
+        run_token=_RUN_TOKEN,
+    ) == {"measured": True}
+    _assert_rollback_receipt(receipt_by_field)
     assert await _candidate_count(database, projection_id) == 1
 
 
@@ -166,12 +216,62 @@ async def test_census_transaction_runs_two_real_code_stage_resets(
     measured_result = await transaction.rollback_only(
         receipt_by_field,
         lambda session: _stage_two_code_work(session, projection_id),
+        run_token=_RUN_TOKEN,
     )
     assert measured_result == {"measured": [(1, 1, 0), (1, 1, 1)]}
-    assert receipt_by_field == {
-        "rollback_complete": True,
-        "temporary_relations_after_rollback": [],
-    }
+    _assert_rollback_receipt(receipt_by_field)
+
+
+@pytest.mark.asyncio
+async def test_census_stage_samples_own_backend_and_temp_relations(
+    monkeypatch,
+    migrated_v3_database,
+) -> None:
+    """Measure only table-owned temporary bytes on the census backend."""
+
+    database = migrated_v3_database
+    projection_id = "b" * 64
+    await _configure_census_database(monkeypatch, database, projection_id)
+
+    async def operation(session):
+        setup_name = transaction.census_database_application_name(
+            _RUN_TOKEN,
+            "setup",
+        )
+        before = await transaction.set_census_database_stage(
+            session,
+            _RUN_TOKEN,
+            "reset_code_work",
+            setup_name,
+        )
+        await session.execute(
+            text(
+                "INSERT INTO plan_pricing_provider_set_stage "
+                "VALUES (1, 2, 'set_2', 3)"
+            )
+        )
+        after = await transaction.set_census_database_stage(
+            session,
+            _RUN_TOKEN,
+            "membership_probe",
+            str(before["application_name"]),
+        )
+        table_total, all_relation_total = await _temporary_relation_totals(session)
+        return before, after, table_total, all_relation_total
+
+    receipt_by_field: dict = {}
+    before, after, table_total, all_relation_total = await transaction.rollback_only(
+        receipt_by_field,
+        operation,
+        run_token=_RUN_TOKEN,
+    )
+
+    assert before["backend_pid"] == after["backend_pid"]
+    assert before["backend_pid"] == receipt_by_field["database_backend_pid"]
+    assert int(after["backend_memory_context_bytes"]) > 0
+    assert int(after["temporary_relation_bytes"]) == table_total
+    assert all_relation_total > table_total
+    _assert_rollback_receipt(receipt_by_field)
 
 
 @pytest.mark.asyncio
@@ -266,7 +366,11 @@ async def test_census_transaction_rolls_back_after_repeated_cancellation(
 
     receipt_by_field: dict = {}
     census_task = asyncio.create_task(
-        transaction.rollback_only(receipt_by_field, timed_out_operation)
+        transaction.rollback_only(
+            receipt_by_field,
+            timed_out_operation,
+            run_token=_RUN_TOKEN,
+        )
     )
     await asyncio.wait_for(operation_entered.wait(), timeout=1)
     census_task.cancel()
@@ -279,10 +383,70 @@ async def test_census_transaction_rolls_back_after_repeated_cancellation(
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(census_task, timeout=2)
 
-    assert receipt_by_field == {
-        "rollback_complete": True,
-        "temporary_relations_after_rollback": [],
-    }
+    _assert_rollback_receipt(receipt_by_field)
+    assert await _candidate_count(database, projection_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_census_cancellation_stops_marked_postgresql_statement(
+    monkeypatch,
+    migrated_v3_database,
+) -> None:
+    """Cancel the marked backend statement before rollback completes."""
+
+    database = migrated_v3_database
+    projection_id = "a" * 64
+    await _configure_census_database(monkeypatch, database, projection_id)
+    backend_pids = []
+    query_started = asyncio.Event()
+
+    receipt_by_field: dict = {}
+    census_task = asyncio.create_task(
+        transaction.rollback_only(
+            receipt_by_field,
+            partial(
+                _run_blocked_statement,
+                backend_pids=backend_pids,
+                query_started=query_started,
+            ),
+            run_token=_RUN_TOKEN,
+        )
+    )
+    await asyncio.wait_for(query_started.wait(), timeout=2)
+    assert len(backend_pids) == 1
+    application_name = transaction.census_database_application_name(
+        _RUN_TOKEN, "price_hydration"
+    )
+    async with database.engine.connect() as observer:
+        async with asyncio.timeout(2):
+            while not await observer.scalar(
+                text(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                    "WHERE pid = :pid AND state = 'active' "
+                    "AND application_name = :application_name "
+                    "AND query LIKE '%pg_sleep(60)%')"
+                ),
+                {
+                    "pid": backend_pids[0],
+                    "application_name": application_name,
+                },
+            ):
+                await asyncio.sleep(0.01)
+
+    census_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(census_task, timeout=5)
+
+    async with database.engine.connect() as observer:
+        assert not await observer.scalar(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                "WHERE pid = :pid AND (state = 'active' "
+                "OR application_name LIKE 'hp-pv3-census:%'))"
+            ),
+            {"pid": backend_pids[0]},
+        )
+    _assert_rollback_receipt(receipt_by_field)
     assert await _candidate_count(database, projection_id) == 1
 
 
