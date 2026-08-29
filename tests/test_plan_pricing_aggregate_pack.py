@@ -180,6 +180,10 @@ def test_decoder_rejects_corruption_trailing_data_and_wrong_key() -> None:
 
     with pytest.raises(packs.AggregatePackError, match="compression|checksum"):
         packs.decode_aggregate_pack(bytes(encoded))
+    checksum_drift = bytearray(packs.encode_aggregate_pack(aggregate_pack))
+    checksum_drift[12] ^= 1
+    with pytest.raises(packs.AggregatePackError, match="checksum"):
+        packs.decode_aggregate_pack(bytes(checksum_drift))
     with pytest.raises(packs.AggregatePackError, match="compression"):
         packs.decode_aggregate_pack(
             packs.encode_aggregate_pack(aggregate_pack) + b"trailing"
@@ -260,3 +264,70 @@ def test_logical_digest_rejects_empty_duplicate_and_out_of_order_streams() -> No
     ):
         with pytest.raises(packs.AggregatePackError, match="strictly ordered"):
             packs.aggregate_logical_digest(CODE_IDENTITY, records)
+
+
+def test_aggregate_objects_reject_wrong_runtime_types() -> None:
+    """Reject invalid objects at each aggregate-pack trust boundary."""
+
+    zero = _record("10001", minimum="-0", median="0.000", maximum=0)
+    assert zero.minimum_negotiated_rate == Decimal("0")
+    invalid_calls = (
+        lambda: packs.AggregateCodeIdentity(1, "27447"),
+        lambda: packs.AggregatePackKey(PROJECTION_ID, object(), "10"),
+        lambda: packs.AggregateZipRecord("bad", 1, 1, 1, 1, 1),
+        lambda: packs.AggregatePack(object(), (_record("10001"),)),
+        lambda: _pack(object()),
+        lambda: packs.aggregate_logical_digest(object(), (_record("10001"),)),
+        lambda: packs.aggregate_logical_digest(CODE_IDENTITY, (object(),)),
+    )
+    for invalid_call in invalid_calls:
+        with pytest.raises(packs.AggregatePackError):
+            invalid_call()
+
+
+def test_aggregate_serialized_bounds_remain_executable(monkeypatch) -> None:
+    """Keep every independent pack byte bound fail closed."""
+
+    with monkeypatch.context() as patch:
+        patch.setattr(packs, "_MAX_DECIMAL_BYTES", 0)
+        with pytest.raises(packs.AggregatePackError, match="decimal bound"):
+            packs._canonical_decimal(0)
+    with monkeypatch.context() as patch:
+        patch.setattr(packs, "MAX_AGGREGATE_RECORD_BYTES", 0)
+        with pytest.raises(packs.AggregatePackError, match="record exceeds"):
+            _pack(_record("10001"))
+    with monkeypatch.context() as patch:
+        patch.setattr(packs, "MAX_AGGREGATE_PACK_DECODED_BYTES", 0)
+        with pytest.raises(packs.AggregatePackError, match="decoded byte bound"):
+            packs.encode_aggregate_pack(_pack(_record("10001")))
+    with monkeypatch.context() as patch:
+        patch.setattr(packs, "_MAX_ENCODED_BYTES", 0)
+        with pytest.raises(packs.AggregatePackError, match="stored byte bound"):
+            packs.encode_aggregate_pack(_pack(_record("10001")))
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        ({"zip2": None}, "fields"),
+        ({"version": 2}, "format version"),
+        ({"records": {}}, "records"),
+    ],
+)
+def test_aggregate_decoder_rejects_structural_drift(update, message: str) -> None:
+    """Reject unknown fields, versions, and record containers."""
+
+    document_by_field = {
+        "code": "27447",
+        "code_system": "CPT",
+        "projection_id": PROJECTION_ID,
+        "records": [["10001", 1, 1, "1", "1", "1"]],
+        "version": packs.AGGREGATE_PACK_FORMAT_VERSION,
+        "zip2": "10",
+    }
+    if update == {"zip2": None}:
+        document_by_field.pop("zip2")
+    else:
+        document_by_field.update(update)
+    with pytest.raises(packs.AggregatePackError, match=message):
+        packs.decode_aggregate_pack(_frame(packs._canonical_json(document_by_field)))

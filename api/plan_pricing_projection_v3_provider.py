@@ -187,7 +187,7 @@ def _provider_set_ids_by_key(
         provider_set_id = serving._ptg2_manifest_id(
             serving_row.get("provider_set_global_id_128")
         )
-        if provider_set_id is None:
+        if not provider_set_id:
             raise ValueError("pricing projection provider-set identity is invalid")
         prior_id = provider_set_ids_by_key.setdefault(
             provider_set_key, provider_set_id
