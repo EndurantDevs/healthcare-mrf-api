@@ -150,7 +150,7 @@
     }
 
     #[test]
-    fn wide_rows_require_notes_before_omitting_ancillary_only_payer_fields() {
+    fn wide_rows_omit_ancillary_only_payer_fields_with_or_without_notes() {
         let methodology_only = append_csv_row(
             &fixture_wide_csv(),
             &[
@@ -190,11 +190,13 @@
                 ("count|Payer, Inc.|Plan A", "1 through 10"),
             ],
         );
-        assert_import_error(
-            InputFormat::WideCsv,
-            &ancillary_without_notes,
-            DEFAULT_MAX_FANOUT_ROWS,
-            "payer allowed amounts without negotiated charge require explanatory notes",
+        let rows = run_fixture(InputFormat::WideCsv, &ancillary_without_notes, false);
+        assert_eq!(
+            String::from_utf8(rows["payer_charge"].clone())
+                .unwrap()
+                .lines()
+                .count(),
+            1
         );
 
         let ancillary_only = append_csv_row(
