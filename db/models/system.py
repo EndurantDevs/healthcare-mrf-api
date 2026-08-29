@@ -127,12 +127,6 @@ class ImportRun(Base, JSONOutputMixin):
         {"index_elements": ("status", "heartbeat_at"), "name": "import_run_status_heartbeat_idx"},
         {"index_elements": ("importer", "created_at"), "name": "import_run_importer_created_idx"},
         {
-            "index_elements": ("idempotency_key",),
-            "name": "import_run_active_idempotency_idx",
-            "unique": True,
-            "where": "status IN ('queued', 'starting', 'running', 'finalizing', 'canceling')",
-        },
-        {
             "index_elements": ("importer", "idempotency_key"),
             "name": "import_run_importer_active_idempotency_idx",
             "unique": True,
