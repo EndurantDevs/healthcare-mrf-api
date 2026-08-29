@@ -34,7 +34,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_214
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 637
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 4
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 6
     assert {
         hospital_id: hospital_by_id[hospital_id]["locator_name"]
         for hospital_id in ("hospital-003082", "hospital-005234", "hospital-005243")
@@ -47,8 +47,16 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
         hospital_id: hashlib.sha256(
             hospital_by_id[hospital_id]["fallback_mrf_url"].encode()
         ).hexdigest()
-        for hospital_id in ("hospital-006471", "hospital-006547", "hospital-007195")
+        for hospital_id in (
+            "hospital-005608",
+            "hospital-005609",
+            "hospital-006471",
+            "hospital-006547",
+            "hospital-007195",
+        )
     } == {
+        "hospital-005608": "00f218c51149bc2237e87924d78a7e244607d53421e5cd18943a26a9f9e7c9c5",
+        "hospital-005609": "00f218c51149bc2237e87924d78a7e244607d53421e5cd18943a26a9f9e7c9c5",
         "hospital-006471": "dc7b9213c55ff2a6d9626a7841c532b5e7ebf1dce51e17efda59ead2c3f17de4",
         "hospital-006547": "4001360464d0b094a10df3bd688d3879f0bc0d6c07ee966021772d689f0aebf7",
         "hospital-007195": "4001360464d0b094a10df3bd688d3879f0bc0d6c07ee966021772d689f0aebf7",

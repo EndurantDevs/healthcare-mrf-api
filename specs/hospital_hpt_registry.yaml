@@ -18263,10 +18263,12 @@ hospitals:
 - hospital_id: hospital-005608
   name: SAN ANTONIO BEHAVIORAL HEALTHCARE
   cms_hpt_url: https://www.sanantoniobehavioral.com/cms-hpt.txt
+  fallback_mrf_url: https://www.sanantoniobehavioral.com/wp-content/uploads/2026/02/461064226_SAN-ANTONIO-BEHAVIORAL-HEALTHCARE_standardcharges.csv
   locator_mrf_url: https://www.sanantoniobehavioral.com/wp-content/uploads/2025/09/461064226_San-Antonio-Behavioral-Healthcare-Hospital_standardcharges.csv
 - hospital_id: hospital-005609
   name: San Antonio Behavioral Healthcare Hospital
   cms_hpt_url: https://www.sanantoniobehavioral.com/cms-hpt.txt
+  fallback_mrf_url: https://www.sanantoniobehavioral.com/wp-content/uploads/2026/02/461064226_SAN-ANTONIO-BEHAVIORAL-HEALTHCARE_standardcharges.csv
 - hospital_id: hospital-005610
   name: SAN ANTONIO REGIONAL HOSPITAL
   cms_hpt_url: https://www.sarh.org/cms-hpt.txt
