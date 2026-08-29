@@ -2494,6 +2494,10 @@ paths:
           in: query
           schema:
             type: boolean
+          description: |
+            Include compact address-local source details. Marketplace MRF
+            evidence is grouped by issuer identity in `mrf_sources`; source
+            URLs are aliases and do not increase `mrf_source_count`.
         - name: include_evidence
           in: query
           schema:
@@ -2515,6 +2519,10 @@ paths:
                     type: array
                     items:
                       type: object
+                      description: |
+                        With `include_sources=true`, `mrf_sources` and
+                        `mrf_source_count` describe only this candidate's
+                        selected address.
                   total:
                     type: integer
                   query:
@@ -2614,7 +2622,9 @@ paths:
           in: query
           schema:
             type: boolean
-          description: Include compact address source and provenance fields for debugging
+          description: |
+            Include compact address-local provenance. MRF sources are grouped
+            by issuer identity, with source URLs retained as aliases.
         - name: include_evidence
           in: query
           schema:
@@ -3219,6 +3229,9 @@ paths:
                 include_sources:
                   type: boolean
                   default: false
+                  description: |
+                    Include compact address-local provenance. MRF sources are
+                    grouped by issuer identity, with URLs retained as aliases.
                 include_evidence:
                   type: boolean
                   default: false
@@ -3334,7 +3347,9 @@ paths:
           in: query
           schema:
             type: boolean
-          description: Include compact address source and provenance fields for debugging
+          description: |
+            Include compact address-local provenance. MRF sources are grouped
+            by issuer identity, with source URLs retained as aliases.
         - name: include_evidence
           in: query
           schema:
@@ -11273,7 +11288,53 @@ components:
           type: number
         long:
           type: number
+        mrf_source_count:
+          type: integer
+          minimum: 1
+          description: |
+            Number of independent Marketplace MRF issuers supporting this
+            exact address. Returned only with `include_sources=true` and
+            current relational evidence.
+        mrf_sources:
+          type: array
+          description: |
+            Address-local Marketplace MRF provenance grouped by issuer. A
+            repeated issuer across networks, years, imports, or URLs remains
+            one source.
+          items:
+            $ref: '#/components/schemas/MrfAddressSource'
       additionalProperties: true
+    MrfAddressSource:
+      type: object
+      required: [source, issuer_name, source_name, issuer_ids, source_urls]
+      properties:
+        source:
+          type: string
+          enum: [mrf]
+        issuer_name:
+          type: string
+          minLength: 1
+          description: Display spelling for the normalized issuer identity.
+        source_name:
+          type: string
+          minLength: 1
+          description: Unique human label combining issuer name and ID aliases.
+          example: Northstar Health Plan (issuer 11111)
+        issuer_ids:
+          type: array
+          uniqueItems: true
+          description: Sorted Marketplace issuer-ID aliases for this source.
+          items:
+            type: integer
+        source_urls:
+          type: array
+          uniqueItems: true
+          description: |
+            Sorted public HTTP(S) URL aliases observed for this issuer and
+            address, without credentials, query strings, or fragments.
+          items:
+            type: string
+      additionalProperties: false
     NpiAddressGroup:
       type: object
       properties:

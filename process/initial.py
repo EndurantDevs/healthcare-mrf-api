@@ -954,7 +954,146 @@ def _normalize_marketplace_address_entry(address):
     return _apply_marketplace_contact_fields(normalized, canonical_contact)
 
 
-def _build_mrf_address_rows(provider_record, network_tiers, import_id, source_url, last_updated_on, issuer_lookup=None):
+def _mrf_address_evidence_row(
+    evidence_value_by_field, normalized_address, network_tier_row
+):
+    """Build one address-evidence row and its checksum."""
+    npi = evidence_value_by_field["npi"]
+    address_type = evidence_value_by_field["address_type"]
+    issuer_id = network_tier_row["issuer_id"]
+    source_record_id = ":".join(
+        [
+            str(npi),
+            address_type,
+            str(normalized_address["checksum"]),
+            str(network_tier_row["checksum_network"]),
+        ]
+    )
+    evidence_checksum = return_checksum(
+        [
+            npi,
+            address_type,
+            normalized_address["checksum"],
+            issuer_id,
+            network_tier_row["year"],
+            network_tier_row["checksum_network"],
+            evidence_value_by_field["import_id"],
+            evidence_value_by_field["source_url"],
+            source_record_id,
+        ]
+    )
+    return evidence_checksum, {
+        "evidence_checksum": evidence_checksum,
+        "npi": npi,
+        "type": address_type,
+        "checksum": normalized_address["checksum"],
+        "issuer_id": issuer_id,
+        "issuer_name": evidence_value_by_field["issuer_lookup"].get(issuer_id)
+        or str(issuer_id),
+        "year": network_tier_row["year"],
+        "checksum_network": network_tier_row["checksum_network"],
+        "network_tier": network_tier_row["network_tier"],
+        "import_id": str(evidence_value_by_field["import_id"]),
+        "import_date": evidence_value_by_field["import_date"],
+        "address_source": "marketplace_provider",
+        "source_table": "plan_npi_raw",
+        "source_url": evidence_value_by_field["source_url"],
+        "source_record_id": source_record_id,
+        "first_line": normalized_address["first_line"],
+        "second_line": normalized_address["second_line"],
+        "city_name": normalized_address["city_name"],
+        "state_name": normalized_address["state_name"],
+        "postal_code": normalized_address["postal_code"],
+        "country_code": normalized_address["country_code"],
+        "telephone_number": normalized_address["telephone_number"],
+        "phone_number": normalized_address["phone_number"],
+        "phone_extension": normalized_address["phone_extension"],
+        "fax_number_digits": normalized_address["fax_number_digits"],
+        "fax_extension": normalized_address["fax_extension"],
+        "observed_at": evidence_value_by_field["last_updated_on"],
+        "address_key": evidence_value_by_field["address_key"],
+    }
+
+
+def _mrf_aggregate_address_row(
+    npi, address_type, normalized_address, last_updated_on, computed_address_key
+):
+    """Build one compatibility aggregate address row."""
+    return (npi, address_type, normalized_address["checksum"]), {
+        "npi": npi,
+        "type": address_type,
+        "checksum": normalized_address["checksum"],
+        "first_line": normalized_address["first_line"],
+        "second_line": normalized_address["second_line"],
+        "city_name": normalized_address["city_name"],
+        "state_name": normalized_address["state_name"],
+        "postal_code": normalized_address["postal_code"],
+        "country_code": normalized_address["country_code"],
+        "telephone_number": normalized_address["telephone_number"],
+        "fax_number": normalized_address["fax_number"],
+        "phone_number": normalized_address["phone_number"],
+        "phone_extension": normalized_address["phone_extension"],
+        "fax_number_digits": normalized_address["fax_number_digits"],
+        "fax_extension": normalized_address["fax_extension"],
+        "formatted_address": normalized_address["formatted_address"],
+        "date_added": last_updated_on.date() if last_updated_on else None,
+        "address_key": computed_address_key,
+    }
+
+
+def _mrf_rows_for_normalized_address(
+    normalized_address,
+    canonical_contact,
+    network_tiers,
+    shared_evidence_value_by_field,
+    include_address_rows,
+):
+    """Build aggregate and evidence rows for one normalized address."""
+    normalized_address = _apply_marketplace_contact_fields(
+        normalized_address, canonical_contact
+    )
+    computed_address_key = address_key_v1(
+        normalized_address["first_line"],
+        normalized_address["second_line"],
+        normalized_address["city_name"],
+        normalized_address["state_name"],
+        normalized_address["postal_code"],
+        normalized_address["country_code"] or "US",
+    )
+    evidence_value_by_field = {
+        **shared_evidence_value_by_field,
+        "address_key": computed_address_key,
+    }
+    evidence_rows_by_checksum = {}
+    for network_tier_row in network_tiers.values():
+        evidence_checksum, evidence_row = _mrf_address_evidence_row(
+            evidence_value_by_field,
+            normalized_address,
+            network_tier_row,
+        )
+        evidence_rows_by_checksum[evidence_checksum] = evidence_row
+    address_row_entry = None
+    if include_address_rows:
+        address_row_entry = _mrf_aggregate_address_row(
+            shared_evidence_value_by_field["npi"],
+            shared_evidence_value_by_field["address_type"],
+            normalized_address,
+            shared_evidence_value_by_field["last_updated_on"],
+            computed_address_key,
+        )
+    return address_row_entry, evidence_rows_by_checksum
+
+
+def _build_mrf_address_rows(
+    provider_record,
+    network_tiers,
+    import_id,
+    source_url,
+    last_updated_on,
+    issuer_lookup=None,
+    *,
+    include_address_rows=True,
+):
     """Build canonical address and evidence rows from one MRF provider record."""
     addresses = provider_record.get("addresses", []) or []
     if not isinstance(addresses, list):
@@ -980,92 +1119,29 @@ def _build_mrf_address_rows(provider_record, network_tiers, import_id, source_ur
         for normalized in normalized_addresses
     )
 
-    for normalized, canonical_contact in zip(normalized_addresses, canonical_contacts):
-        normalized = _apply_marketplace_contact_fields(normalized, canonical_contact)
-        computed_address_key = address_key_v1(
-            normalized["first_line"],
-            normalized["second_line"],
-            normalized["city_name"],
-            normalized["state_name"],
-            normalized["postal_code"],
-            normalized["country_code"] or "US",
+    shared_evidence_value_by_field = {
+        "npi": npi,
+        "address_type": address_type,
+        "import_id": import_id,
+        "import_date": import_date_value,
+        "source_url": source_url,
+        "last_updated_on": last_updated_on,
+        "issuer_lookup": issuer_lookup,
+    }
+    for normalized_address, canonical_contact in zip(normalized_addresses, canonical_contacts):
+        address_row_entry, address_evidence_rows_by_checksum = (
+            _mrf_rows_for_normalized_address(
+                normalized_address,
+                canonical_contact,
+                network_tiers,
+                shared_evidence_value_by_field,
+                include_address_rows,
+            )
         )
-        address_key = (npi, address_type, normalized["checksum"])
-        for network in network_tiers.values():
-            issuer_id = network["issuer_id"]
-            issuer_name = issuer_lookup.get(issuer_id) or str(issuer_id)
-            source_record_id = ":".join(
-                [
-                    str(npi),
-                    address_type,
-                    str(normalized["checksum"]),
-                    str(network["checksum_network"]),
-                ]
-            )
-            evidence_checksum = return_checksum(
-                [
-                    npi,
-                    address_type,
-                    normalized["checksum"],
-                    network["issuer_id"],
-                    network["year"],
-                    network["checksum_network"],
-                    import_id,
-                    source_url,
-                    source_record_id,
-                ]
-            )
-            evidence_by_checksum[evidence_checksum] = {
-                "evidence_checksum": evidence_checksum,
-                "npi": npi,
-                "type": address_type,
-                "checksum": normalized["checksum"],
-                "issuer_id": issuer_id,
-                "issuer_name": issuer_name,
-                "year": network["year"],
-                "checksum_network": network["checksum_network"],
-                "network_tier": network["network_tier"],
-                "import_id": str(import_id),
-                "import_date": import_date_value,
-                "address_source": "marketplace_provider",
-                "source_table": "plan_npi_raw",
-                "source_url": source_url,
-                "source_record_id": source_record_id,
-                "first_line": normalized["first_line"],
-                "second_line": normalized["second_line"],
-                "city_name": normalized["city_name"],
-                "state_name": normalized["state_name"],
-                "postal_code": normalized["postal_code"],
-                "country_code": normalized["country_code"],
-                "telephone_number": normalized["telephone_number"],
-                "phone_number": normalized["phone_number"],
-                "phone_extension": normalized["phone_extension"],
-                "fax_number_digits": normalized["fax_number_digits"],
-                "fax_extension": normalized["fax_extension"],
-                "observed_at": last_updated_on,
-                "address_key": computed_address_key,
-            }
-
-        addresses_by_key[address_key] = {
-            "npi": npi,
-            "type": address_type,
-            "checksum": normalized["checksum"],
-            "first_line": normalized["first_line"],
-            "second_line": normalized["second_line"],
-            "city_name": normalized["city_name"],
-            "state_name": normalized["state_name"],
-            "postal_code": normalized["postal_code"],
-            "country_code": normalized["country_code"],
-            "telephone_number": normalized["telephone_number"],
-            "fax_number": normalized["fax_number"],
-            "phone_number": normalized["phone_number"],
-            "phone_extension": normalized["phone_extension"],
-            "fax_number_digits": normalized["fax_number_digits"],
-            "fax_extension": normalized["fax_extension"],
-            "formatted_address": normalized["formatted_address"],
-            "date_added": last_updated_on.date() if last_updated_on else None,
-            "address_key": computed_address_key,
-        }
+        evidence_by_checksum.update(address_evidence_rows_by_checksum)
+        if address_row_entry:
+            address_key, address_row = address_row_entry
+            addresses_by_key[address_key] = address_row
 
     return list(addresses_by_key.values()), list(evidence_by_checksum.values())
 
@@ -1114,6 +1190,142 @@ async def _push_mrf_duplicate_tolerant_rows(rows, cls) -> None:
     await push_objects(rows, cls, rewrite=False, use_copy=False)
 
 
+_MRF_ADDRESS_SUMMARY_UPSERT_SQL = """
+    INSERT INTO {db_schema}.{address_table} (
+        npi,
+        type,
+        checksum,
+        first_line,
+        second_line,
+        city_name,
+        state_name,
+        postal_code,
+        country_code,
+        telephone_number,
+        fax_number,
+        phone_number,
+        phone_extension,
+        fax_number_digits,
+        fax_extension,
+        formatted_address,
+        date_added,
+        address_key,
+        address_sources,
+        source_record_ids,
+        source_import_ids,
+        source_import_dates,
+        source_issuer_ids,
+        source_issuer_names,
+        source_urls,
+        source_count
+    )
+    SELECT
+        npi,
+        type,
+        checksum,
+        first_line,
+        second_line,
+        city_name,
+        state_name,
+        postal_code,
+        country_code,
+        telephone_number,
+        fax_number,
+        phone_number,
+        phone_extension,
+        fax_number_digits,
+        fax_extension,
+        formatted_address,
+        date_added,
+        address_key,
+        COALESCE(address_sources, ARRAY[]::varchar[]) AS address_sources,
+        COALESCE(source_record_ids, ARRAY[]::varchar[]) AS source_record_ids,
+        COALESCE(source_import_ids, ARRAY[]::varchar[]) AS source_import_ids,
+        COALESCE(source_import_dates, ARRAY[]::date[]) AS source_import_dates,
+        COALESCE(source_issuer_ids, ARRAY[]::integer[]) AS source_issuer_ids,
+        COALESCE(source_issuer_names, ARRAY[]::varchar[]) AS source_issuer_names,
+        COALESCE(source_urls, ARRAY[]::varchar[]) AS source_urls,
+        COALESCE(source_count, 0) AS source_count
+      FROM (
+            SELECT
+                npi,
+                type,
+                checksum,
+                MIN(first_line) FILTER (WHERE first_line IS NOT NULL AND first_line <> '') AS first_line,
+                MIN(second_line) FILTER (WHERE second_line IS NOT NULL AND second_line <> '') AS second_line,
+                MIN(city_name) FILTER (WHERE city_name IS NOT NULL AND city_name <> '') AS city_name,
+                MIN(state_name) FILTER (WHERE state_name IS NOT NULL AND state_name <> '') AS state_name,
+                MIN(postal_code) FILTER (WHERE postal_code IS NOT NULL AND postal_code <> '') AS postal_code,
+                COALESCE(
+                    MIN(country_code) FILTER (WHERE country_code IS NOT NULL AND country_code <> ''),
+                    'US'
+                ) AS country_code,
+                MIN(telephone_number) FILTER (WHERE telephone_number IS NOT NULL AND telephone_number <> '') AS telephone_number,
+                NULL::varchar AS fax_number,
+                MIN(phone_number) FILTER (WHERE phone_number IS NOT NULL AND phone_number <> '') AS phone_number,
+                MIN(phone_extension) FILTER (WHERE phone_extension IS NOT NULL AND phone_extension <> '') AS phone_extension,
+                MIN(fax_number_digits) FILTER (WHERE fax_number_digits IS NOT NULL AND fax_number_digits <> '') AS fax_number_digits,
+                MIN(fax_extension) FILTER (WHERE fax_extension IS NOT NULL AND fax_extension <> '') AS fax_extension,
+                concat_ws(
+                    ', ',
+                    NULLIF(
+                        concat_ws(
+                            ' ',
+                            MIN(first_line) FILTER (WHERE first_line IS NOT NULL AND first_line <> ''),
+                            MIN(second_line) FILTER (WHERE second_line IS NOT NULL AND second_line <> '')
+                        ),
+                        ''
+                    ),
+                    NULLIF(
+                        concat_ws(
+                            ' ',
+                            MIN(city_name) FILTER (WHERE city_name IS NOT NULL AND city_name <> ''),
+                            MIN(state_name) FILTER (WHERE state_name IS NOT NULL AND state_name <> ''),
+                            MIN(postal_code) FILTER (WHERE postal_code IS NOT NULL AND postal_code <> '')
+                        ),
+                        ''
+                    )
+                ) AS formatted_address,
+                MIN(observed_at)::date AS date_added,
+                MIN(address_key::text) FILTER (WHERE address_key IS NOT NULL)::uuid AS address_key,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT address_source ORDER BY address_source), NULL)::varchar[] AS address_sources,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id), NULL)::varchar[] AS source_record_ids,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT import_id ORDER BY import_id), NULL)::varchar[] AS source_import_ids,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT import_date ORDER BY import_date), NULL)::date[] AS source_import_dates,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT issuer_id ORDER BY issuer_id), NULL)::integer[] AS source_issuer_ids,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT issuer_name ORDER BY issuer_name), NULL)::varchar[] AS source_issuer_names,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT source_url ORDER BY source_url), NULL)::varchar[] AS source_urls,
+                COUNT(DISTINCT evidence_checksum)::int AS source_count
+            FROM {db_schema}.{evidence_table}
+            GROUP BY npi, type, checksum
+      ) AS src
+    ON CONFLICT (npi, type, checksum) DO UPDATE
+       SET first_line = EXCLUDED.first_line,
+           second_line = EXCLUDED.second_line,
+           city_name = EXCLUDED.city_name,
+           state_name = EXCLUDED.state_name,
+           postal_code = EXCLUDED.postal_code,
+           country_code = EXCLUDED.country_code,
+           telephone_number = EXCLUDED.telephone_number,
+           fax_number = EXCLUDED.fax_number,
+           phone_number = EXCLUDED.phone_number,
+           phone_extension = EXCLUDED.phone_extension,
+           fax_number_digits = EXCLUDED.fax_number_digits,
+           fax_extension = EXCLUDED.fax_extension,
+           formatted_address = EXCLUDED.formatted_address,
+           date_added = EXCLUDED.date_added,
+           address_key = COALESCE({address_table}.address_key, EXCLUDED.address_key),
+           address_sources = EXCLUDED.address_sources,
+           source_record_ids = EXCLUDED.source_record_ids,
+           source_import_ids = EXCLUDED.source_import_ids,
+           source_import_dates = EXCLUDED.source_import_dates,
+           source_issuer_ids = EXCLUDED.source_issuer_ids,
+           source_issuer_names = EXCLUDED.source_issuer_names,
+           source_urls = EXCLUDED.source_urls,
+           source_count = EXCLUDED.source_count;
+"""
+
+
 async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None:
     """Refresh the materialized MRF address summary for one import date."""
     address_cls = make_class(MRFAddress, import_date, schema_override=db_schema)
@@ -1121,140 +1333,11 @@ async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None
     deferred_indexes = _mrf_address_summary_deferred_indexes(address_cls)
     work_mem = _postgres_setting_value("HLTHPRT_MRF_ADDRESS_SUMMARY_WORK_MEM", "1GB")
     statement_timeout = os.environ.get("HLTHPRT_MRF_ADDRESS_SUMMARY_STATEMENT_TIMEOUT")
-    upsert_sql = f"""
-        INSERT INTO {db_schema}.{address_cls.__tablename__} (
-            npi,
-            type,
-            checksum,
-            first_line,
-            second_line,
-            city_name,
-            state_name,
-            postal_code,
-            country_code,
-            telephone_number,
-            fax_number,
-            phone_number,
-            phone_extension,
-            fax_number_digits,
-            fax_extension,
-            formatted_address,
-            date_added,
-            address_key,
-            address_sources,
-            source_record_ids,
-            source_import_ids,
-            source_import_dates,
-            source_issuer_ids,
-            source_issuer_names,
-            source_urls,
-            source_count
-        )
-        SELECT
-            npi,
-            type,
-            checksum,
-            first_line,
-            second_line,
-            city_name,
-            state_name,
-            postal_code,
-            country_code,
-            telephone_number,
-            fax_number,
-            phone_number,
-            phone_extension,
-            fax_number_digits,
-            fax_extension,
-            formatted_address,
-            date_added,
-            address_key,
-            COALESCE(address_sources, ARRAY[]::varchar[]) AS address_sources,
-            COALESCE(source_record_ids, ARRAY[]::varchar[]) AS source_record_ids,
-            COALESCE(source_import_ids, ARRAY[]::varchar[]) AS source_import_ids,
-            COALESCE(source_import_dates, ARRAY[]::date[]) AS source_import_dates,
-            COALESCE(source_issuer_ids, ARRAY[]::integer[]) AS source_issuer_ids,
-            COALESCE(source_issuer_names, ARRAY[]::varchar[]) AS source_issuer_names,
-            COALESCE(source_urls, ARRAY[]::varchar[]) AS source_urls,
-            COALESCE(source_count, 0) AS source_count
-          FROM (
-                SELECT
-                    npi,
-                    type,
-                    checksum,
-                    MIN(first_line) FILTER (WHERE first_line IS NOT NULL AND first_line <> '') AS first_line,
-                    MIN(second_line) FILTER (WHERE second_line IS NOT NULL AND second_line <> '') AS second_line,
-                    MIN(city_name) FILTER (WHERE city_name IS NOT NULL AND city_name <> '') AS city_name,
-                    MIN(state_name) FILTER (WHERE state_name IS NOT NULL AND state_name <> '') AS state_name,
-                    MIN(postal_code) FILTER (WHERE postal_code IS NOT NULL AND postal_code <> '') AS postal_code,
-                    COALESCE(
-                        MIN(country_code) FILTER (WHERE country_code IS NOT NULL AND country_code <> ''),
-                        'US'
-                    ) AS country_code,
-                    MIN(telephone_number) FILTER (WHERE telephone_number IS NOT NULL AND telephone_number <> '') AS telephone_number,
-                    NULL::varchar AS fax_number,
-                    MIN(phone_number) FILTER (WHERE phone_number IS NOT NULL AND phone_number <> '') AS phone_number,
-                    MIN(phone_extension) FILTER (WHERE phone_extension IS NOT NULL AND phone_extension <> '') AS phone_extension,
-                    MIN(fax_number_digits) FILTER (WHERE fax_number_digits IS NOT NULL AND fax_number_digits <> '') AS fax_number_digits,
-                    MIN(fax_extension) FILTER (WHERE fax_extension IS NOT NULL AND fax_extension <> '') AS fax_extension,
-                    concat_ws(
-                        ', ',
-                        NULLIF(
-                            concat_ws(
-                                ' ',
-                                MIN(first_line) FILTER (WHERE first_line IS NOT NULL AND first_line <> ''),
-                                MIN(second_line) FILTER (WHERE second_line IS NOT NULL AND second_line <> '')
-                            ),
-                            ''
-                        ),
-                        NULLIF(
-                            concat_ws(
-                                ' ',
-                                MIN(city_name) FILTER (WHERE city_name IS NOT NULL AND city_name <> ''),
-                                MIN(state_name) FILTER (WHERE state_name IS NOT NULL AND state_name <> ''),
-                                MIN(postal_code) FILTER (WHERE postal_code IS NOT NULL AND postal_code <> '')
-                            ),
-                            ''
-                        )
-                    ) AS formatted_address,
-                    MIN(observed_at)::date AS date_added,
-                    MIN(address_key::text) FILTER (WHERE address_key IS NOT NULL)::uuid AS address_key,
-                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT address_source ORDER BY address_source), NULL)::varchar[] AS address_sources,
-                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id), NULL)::varchar[] AS source_record_ids,
-                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT import_id ORDER BY import_id), NULL)::varchar[] AS source_import_ids,
-                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT import_date ORDER BY import_date), NULL)::date[] AS source_import_dates,
-                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT issuer_id ORDER BY issuer_id), NULL)::integer[] AS source_issuer_ids,
-                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT issuer_name ORDER BY issuer_name), NULL)::varchar[] AS source_issuer_names,
-                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT source_url ORDER BY source_url), NULL)::varchar[] AS source_urls,
-                    COUNT(DISTINCT evidence_checksum)::int AS source_count
-                FROM {db_schema}.{evidence_cls.__tablename__}
-                GROUP BY npi, type, checksum
-          ) AS src
-        ON CONFLICT (npi, type, checksum) DO UPDATE
-           SET first_line = EXCLUDED.first_line,
-               second_line = EXCLUDED.second_line,
-               city_name = EXCLUDED.city_name,
-               state_name = EXCLUDED.state_name,
-               postal_code = EXCLUDED.postal_code,
-               country_code = EXCLUDED.country_code,
-               telephone_number = EXCLUDED.telephone_number,
-               fax_number = EXCLUDED.fax_number,
-               phone_number = EXCLUDED.phone_number,
-               phone_extension = EXCLUDED.phone_extension,
-               fax_number_digits = EXCLUDED.fax_number_digits,
-               fax_extension = EXCLUDED.fax_extension,
-               formatted_address = EXCLUDED.formatted_address,
-               date_added = EXCLUDED.date_added,
-               address_key = COALESCE({address_cls.__tablename__}.address_key, EXCLUDED.address_key),
-               address_sources = EXCLUDED.address_sources,
-               source_record_ids = EXCLUDED.source_record_ids,
-               source_import_ids = EXCLUDED.source_import_ids,
-               source_import_dates = EXCLUDED.source_import_dates,
-               source_issuer_ids = EXCLUDED.source_issuer_ids,
-               source_issuer_names = EXCLUDED.source_issuer_names,
-               source_urls = EXCLUDED.source_urls,
-               source_count = EXCLUDED.source_count;
-        """
+    upsert_sql = _MRF_ADDRESS_SUMMARY_UPSERT_SQL.format(
+        db_schema=db_schema,
+        address_table=address_cls.__tablename__,
+        evidence_table=evidence_cls.__tablename__,
+    )
     async with db.transaction() as session:
         await session.execute(text(f"SET LOCAL work_mem = '{work_mem}';"))
         if statement_timeout is not None:
@@ -1374,7 +1457,6 @@ async def process_plan(ctx, task):
             plan_rows = []
             plan_formulary_rows = []
             marketplace_benefit_rows = []
-            count = 0
             processed_plans = 0
             should_stop_processing = False
             try:
@@ -1506,16 +1588,16 @@ async def process_plan(ctx, task):
                             if plan_limit and processed_plans >= plan_limit:
                                 should_stop_processing = True
                                 break
-                            if count > plan_flush_rows:
+                            if (
+                                len(plan_rows) >= plan_flush_rows
+                                or len(marketplace_benefit_rows) >= plan_flush_rows
+                            ):
                                 await asyncio.gather(
                                     push_objects(plan_rows, myplan),
                                     push_objects(marketplace_benefit_rows, myplanbenefitsmarketplace),
                                 )
                                 plan_rows.clear()
                                 marketplace_benefit_rows.clear()
-                                count = 0
-                            else:
-                                count += 1
                         except Exception as exc:
                             logger.debug(
                                 "Skipping malformed plan entry plan_id=%s year=%s: %s",
@@ -1524,7 +1606,6 @@ async def process_plan(ctx, task):
                                 exc,
                             )
 
-                    count = 0
                     for year in years:
                         if should_stop_processing:
                             break
@@ -1593,14 +1674,11 @@ async def process_plan(ctx, task):
                                                 "coinsurance_opt": cost_sharing.get("coinsurance_opt", ""),
                                             }
                                             plan_formulary_rows.append(formulary_row_dict)
-                                            if count > plan_flush_rows:
+                                            if len(plan_formulary_rows) >= plan_flush_rows:
                                                 await _push_mrf_duplicate_tolerant_rows(
                                                     plan_formulary_rows, myplanformulary
                                                 )
                                                 plan_formulary_rows.clear()
-                                                count = 0
-                                            else:
-                                                count += 1
                                     except Exception as exc:
                                         logger.debug(
                                             "Skipping cost sharing entry for plan %s year=%s: %s",
@@ -1609,8 +1687,6 @@ async def process_plan(ctx, task):
                                             exc,
                                         )
 
-                                    plan_formulary_rows.clear()
-                                    count = 0
                                 else:
                                     await log_error(
                                         "warn",
@@ -1702,22 +1778,31 @@ async def process_provider(ctx, task):
     myplan_networktier = make_class(PlanNetworkTierRaw, import_date, schema_override=db_schema)
     mymrfaddress = make_class(MRFAddress, import_date, schema_override=db_schema)
     mymrfaddressevidence = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
-    issuer_rows = await db.select(
-        myissuer.issuer_id,
-        myissuer.issuer_name,
-        myissuer.issuer_marketing_name,
-        myissuer.mrf_url,
-    ).all()
-    issuer_lookup = {
-        int(issuer_row.issuer_id): _issuer_display_name(
-            issuer_row.issuer_id,
-            issuer_name=issuer_row.issuer_name,
-            issuer_marketing_name=issuer_row.issuer_marketing_name,
-            issuer_url=issuer_row.mrf_url,
-        )
-        for issuer_row in issuer_rows
-        if issuer_row.issuer_id is not None
-    }
+    should_aggregate_addresses_during_ingest = _is_truthy(
+        os.getenv("HLTHPRT_MRF_ADDRESS_AGGREGATE_DURING_INGEST"),
+        ("yes", "y", "true", "1"),
+    )
+    issuer_cache_key = (getattr(db, "_database_name", None), db_schema, str(import_date))
+    issuer_lookup_cache = ctx.setdefault("mrf_issuer_lookup", {})
+    issuer_lookup = issuer_lookup_cache.get(issuer_cache_key)
+    if issuer_lookup is None:
+        issuer_rows = await db.select(
+            myissuer.issuer_id,
+            myissuer.issuer_name,
+            myissuer.issuer_marketing_name,
+            myissuer.mrf_url,
+        ).all()
+        issuer_lookup = {
+            int(issuer_row.issuer_id): _issuer_display_name(
+                issuer_row.issuer_id,
+                issuer_name=issuer_row.issuer_name,
+                issuer_marketing_name=issuer_row.issuer_marketing_name,
+                issuer_url=issuer_row.mrf_url,
+            )
+            for issuer_row in issuer_rows
+            if issuer_row.issuer_id is not None
+        }
+        issuer_lookup_cache[issuer_cache_key] = issuer_lookup
 
     print("Starting Provider file data download: ", source_url)
     with tempfile.TemporaryDirectory() as tmpdirname:
@@ -1751,10 +1836,10 @@ async def process_provider(ctx, task):
                         break
                     network_tiers_by_checksum = {}
                     has_invalid_plan = False
-                    my_years = set()
                     if not provider_record or not provider_record.get("plans"):
                         continue
                     for plan in provider_record["plans"]:
+                        my_years = set()
                         # try:
                         #     for k in (
                         #             'npi', 'type', 'plans', 'addresses', 'last_updated_on'):
@@ -1914,6 +1999,7 @@ async def process_provider(ctx, task):
                         source_url,
                         last_updated_on,
                         issuer_lookup=issuer_lookup,
+                        include_address_rows=should_aggregate_addresses_during_ingest,
                     )
                     for address_row in address_rows:
                         mrf_address_obj_dict[
@@ -2441,29 +2527,130 @@ async def save_mrf_data(ctx, task):
     await asyncio.gather(*pending_writes)
 
 
-async def process_json_index(ctx, task):
-    """
-    The process_json_index function is called by the process_index function.
-    It downloads a JSON file containing URLs to other files, and then queues up jobs for those files.
-    The JSON file contains two arrays: plan_urls and provider_urls.  The plan URLs are queued as 'process_plan' jobs,
-    and the provider URLs are queued as 'process_provider' jobs.
+_MRF_INDEX_STREAM_SPECS = (
+    {
+        "item_path": "plan_urls.item",
+        "kind": "plan",
+        "function_name": "process_plan",
+        "test_limit": TEST_PLAN_URLS,
+        "label": "Plan",
+        "deduplicate": False,
+        "separate_incomplete_error": False,
+    },
+    {
+        "item_path": "formulary_urls.item",
+        "kind": "formulary",
+        "function_name": "process_formulary",
+        "test_limit": TEST_FORMULARY_URLS,
+        "label": "Formulary",
+        "deduplicate": False,
+        "separate_incomplete_error": True,
+    },
+    {
+        "item_path": "provider_urls.item",
+        "kind": "provider",
+        "function_name": "process_provider",
+        "test_limit": TEST_PROVIDER_URLS,
+        "label": "Provider",
+        "deduplicate": True,
+        "separate_incomplete_error": True,
+    },
+)
 
-    :param ctx: Pass the redis connection to the function
-    :param task: Pass the url to download and the issuer_array
-    :return: A list of urls to the plan and provider json files
-    """
+
+async def _enqueue_mrf_index_stream_items(
+    ctx, task, stream, stream_spec_map, limit
+):
+    """Register and enqueue one class of URLs from an MRF index stream."""
     redis = ctx["redis"]
-    issuer_array = task["issuer_array"]
+    job_scope = str(
+        ctx["context"].get("control_run_id") or ctx["context"]["import_date"]
+    )
+    enqueued_count = 0
+    seen_urls = set()
+    should_deduplicate = stream_spec_map["deduplicate"]
+    async for raw_url in ijson.items(
+        stream, stream_spec_map["item_path"], use_float=True
+    ):
+        url = str(raw_url).strip() if should_deduplicate else raw_url
+        if should_deduplicate and (not url or url in seen_urls):
+            continue
+        if should_deduplicate:
+            seen_urls.add(url)
+        print(f"{stream_spec_map['label']} URL: {url}")
+        work_id = _mrf_url_job_id(stream_spec_map["kind"], job_scope, str(url))
+        child_task_map = {
+            "url": url,
+            "issuer_array": task["issuer_array"],
+            "context": ctx["context"],
+            "work_id": work_id,
+        }
+        if not await _has_registered_mrf_work(
+            redis,
+            job_scope,
+            work_id,
+            function_name=stream_spec_map["function_name"],
+            task=child_task_map,
+        ):
+            continue
+        await redis.enqueue_job(
+            stream_spec_map["function_name"],
+            child_task_map,
+            _queue_name=MRF_QUEUE_NAME,
+            _job_id=work_id,
+        )
+        enqueued_count += 1
+        if limit and enqueued_count >= limit:
+            break
+
+
+async def _has_enqueued_mrf_index_file(
+    ctx, task, tmp_filename, import_log, stream_spec_map, limit
+):
+    """Enqueue one index array and terminalize malformed input."""
+    async with async_open(tmp_filename, "rb") as stream:
+        try:
+            await _enqueue_mrf_index_stream_items(
+                ctx,
+                task,
+                stream,
+                stream_spec_map,
+                limit,
+            )
+            return True
+        except ijson.IncompleteJSONError as exc:
+            if stream_spec_map["separate_incomplete_error"]:
+                message = f"Incomplete JSON: can't read expected data. {exc}"
+                source_kind = "index"
+            else:
+                message = f"JSON Parsing Error: {exc}"
+                source_kind = "json_index"
+        except ijson.JSONError as exc:
+            message = f"JSON Parsing Error: {exc}"
+            source_kind = "json_index"
+    await log_error(
+        "err",
+        message,
+        task.get("issuer_array"),
+        task.get("url"),
+        source_kind,
+        "json",
+        import_log,
+    )
+    await _mark_mrf_task_terminal(ctx, task, "index")
+    return False
+
+
+async def process_json_index(ctx, task):
+    """Download an MRF JSON index and enqueue its plan, formulary, and provider URLs."""
     print(f"CTX: {ctx} \n TASK: {task}")
     if "context" in task:
         ctx["context"] = task["context"]
     import_date = ctx["context"]["import_date"]
-    job_scope = str(ctx["context"].get("control_run_id") or import_date)
     is_test_mode_enabled = is_test_mode(ctx)
     await ensure_database(is_test_mode_enabled)
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", is_test_mode_enabled)
-
-    myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
+    import_log = make_class(ImportLog, import_date, schema_override=db_schema)
     with tempfile.TemporaryDirectory() as tmpdirname:
         source_path = Path(task.get("url"))
         tmp_filename = str(PurePath(str(tmpdirname), source_path.name))
@@ -2472,360 +2659,230 @@ async def process_json_index(ctx, task):
                 task.get("url"),
                 tmp_filename,
                 context={"issuer_array": task["issuer_array"], "source": "json_index"},
-                logger=myimportlog,
+                logger=import_log,
             )
         except Exception as exc:
             logger.warning("Failed to download MRF index data from %s: %s", task.get("url"), exc)
             await _mark_mrf_task_terminal(ctx, task, "index")
             return
-        plan_limit = TEST_PLAN_URLS if is_test_mode_enabled else None
-        provider_limit = TEST_PROVIDER_URLS if is_test_mode_enabled else None
-        formulary_limit = TEST_FORMULARY_URLS if is_test_mode_enabled else None
-        enqueued_plans = 0
-        enqueued_providers = 0
-        enqueued_formularies = 0
-
-        async with async_open(tmp_filename, "rb") as afp:
-            try:
-                async for url in ijson.items(
-                    afp, "plan_urls.item", use_float=True
-                ):  # , 'formulary_urls', 'provider_urls'
-                    print(f"Plan URL: {url}")
-                    work_id = _mrf_url_job_id("plan", job_scope, str(url))
-                    plan_task_dict = {
-                        "url": url,
-                        "issuer_array": issuer_array,
-                        "context": ctx["context"],
-                        "work_id": work_id,
-                    }
-                    if not await _has_registered_mrf_work(
-                        redis,
-                        job_scope,
-                        work_id,
-                        function_name="process_plan",
-                        task=plan_task_dict,
-                    ):
-                        continue
-                    await redis.enqueue_job(
-                        "process_plan",
-                        plan_task_dict,
-                        _queue_name=MRF_QUEUE_NAME,
-                        _job_id=work_id,
-                    )
-                    # break
-                    enqueued_plans += 1
-                    if plan_limit and enqueued_plans >= plan_limit:
-                        break
-            except ijson.JSONError as exc:
-                await log_error(
-                    "err",
-                    f"JSON Parsing Error: {exc}",
-                    task.get("issuer_array"),
-                    task.get("url"),
-                    "json_index",
-                    "json",
-                    myimportlog,
-                )
-                await _mark_mrf_task_terminal(ctx, task, "index")
+        for stream_spec_map in _MRF_INDEX_STREAM_SPECS:
+            limit = (
+                stream_spec_map["test_limit"] if is_test_mode_enabled else None
+            )
+            if not await _has_enqueued_mrf_index_file(
+                ctx,
+                task,
+                tmp_filename,
+                import_log,
+                stream_spec_map,
+                limit,
+            ):
                 return
-        async with async_open(tmp_filename, "rb") as afp:
-            try:
-                async for url in ijson.items(
-                    afp, "formulary_urls.item", use_float=True
-                ):
-                    print(f"Formulary URL: {url}")
-                    work_id = _mrf_url_job_id("formulary", job_scope, str(url))
-                    formulary_task_dict = {
-                        "url": url,
-                        "issuer_array": issuer_array,
-                        "context": ctx["context"],
-                        "work_id": work_id,
-                    }
-                    if not await _has_registered_mrf_work(
-                        redis,
-                        job_scope,
-                        work_id,
-                        function_name="process_formulary",
-                        task=formulary_task_dict,
-                    ):
-                        continue
-                    await redis.enqueue_job(
-                        "process_formulary",
-                        formulary_task_dict,
-                        _queue_name=MRF_QUEUE_NAME,
-                        _job_id=work_id,
-                    )
-                    enqueued_formularies += 1
-                    if formulary_limit and enqueued_formularies >= formulary_limit:
-                        break
-            except ijson.IncompleteJSONError as exc:
-                await log_error(
-                    "err",
-                    f"Incomplete JSON: can't read expected data. {exc}",
-                    task.get("issuer_array"),
-                    task.get("url"),
-                    "index",
-                    "json",
-                    myimportlog,
-                )
-                await _mark_mrf_task_terminal(ctx, task, "index")
-                return
-            except ijson.JSONError as exc:
-                await log_error(
-                    "err",
-                    f"JSON Parsing Error: {exc}",
-                    task.get("issuer_array"),
-                    task.get("url"),
-                    "json_index",
-                    "json",
-                    myimportlog,
-                )
-                await _mark_mrf_task_terminal(ctx, task, "index")
-                return
-
-        seen_provider_urls = set()
-        async with async_open(tmp_filename, "rb") as afp:
-            try:
-                async for url in ijson.items(
-                    afp, "provider_urls.item", use_float=True
-                ):  # , 'formulary_urls', 'provider_urls'
-                    url = str(url).strip()
-                    if not url or url in seen_provider_urls:
-                        continue
-                    seen_provider_urls.add(url)
-                    print(f"Provider URL: {url}")
-                    work_id = _mrf_url_job_id("provider", job_scope, url)
-                    provider_task_dict = {
-                        "url": url,
-                        "issuer_array": issuer_array,
-                        "context": ctx["context"],
-                        "work_id": work_id,
-                    }
-                    if not await _has_registered_mrf_work(
-                        redis,
-                        job_scope,
-                        work_id,
-                        function_name="process_provider",
-                        task=provider_task_dict,
-                    ):
-                        continue
-                    await redis.enqueue_job(
-                        "process_provider",
-                        provider_task_dict,
-                        _queue_name=MRF_QUEUE_NAME,
-                        _job_id=work_id,
-                    )
-                    # break
-                    enqueued_providers += 1
-                    if provider_limit and enqueued_providers >= provider_limit:
-                        break
-            except ijson.IncompleteJSONError as exc:
-                await log_error(
-                    "err",
-                    f"Incomplete JSON: can't read expected data. {exc}",
-                    task.get("issuer_array"),
-                    task.get("url"),
-                    "index",
-                    "json",
-                    myimportlog,
-                )
-                await _mark_mrf_task_terminal(ctx, task, "index")
-                return
-
-            except ijson.JSONError as exc:
-                await log_error(
-                    "err",
-                    f"JSON Parsing Error: {exc}",
-                    task.get("issuer_array"),
-                    task.get("url"),
-                    "json_index",
-                    "json",
-                    myimportlog,
-                )
-                await _mark_mrf_task_terminal(ctx, task, "index")
-                return
-
         await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "index"))
+
+
+def _unknown_federal_plan_row(attribute_row):
+    """Build one federal marketplace plan identity."""
+    business_year = int(attribute_row["BusinessYear"])
+    plan_id = attribute_row["StandardComponentId"]
+    return {
+        "plan_id": plan_id,
+        "plan_id_type": "CMS-HIOS-PLAN-ID",
+        "year": business_year,
+        "issuer_id": int(attribute_row["IssuerId"]),
+        "state": str(attribute_row["StateCode"]).upper(),
+        "marketing_name": attribute_row["PlanMarketingName"],
+        "summary_url": attribute_row["URLForSummaryofBenefitsCoverage"],
+        "marketing_url": attribute_row["PlanBrochure"],
+        "formulary_url": attribute_row["FormularyURL"],
+        "plan_contact": "",
+        "network": [attribute_row["NetworkId"]],
+        "benefits": [],
+        "last_updated_on": datetime.datetime.combine(
+            parse_date(attribute_row["ImportDate"], fuzzy=True),
+            datetime.datetime.min.time(),
+        ),
+        "checksum": return_checksum([plan_id.lower(), business_year], crc=32),
+    }
+
+
+def _unknown_federal_issuer_row(attribute_row):
+    """Build one federal marketplace issuer identity."""
+    issuer_id = int(attribute_row["IssuerId"])
+    issuer_name = attribute_row["IssuerMarketPlaceMarketingName"].strip()
+    return issuer_id, {
+        "state": str(attribute_row["StateCode"]).upper(),
+        "issuer_id": issuer_id,
+        "mrf_url": "",
+        "data_contact_email": "",
+        "issuer_marketing_name": "",
+        "issuer_name": issuer_name or attribute_row["IssuerId"],
+    }
+
+
+async def _read_unknown_federal_attribute_file(source_url, plans_by_key, issuers_by_id):
+    """Merge one federal plan-attributes archive into identity maps."""
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        archive_path = str(PurePath(str(tmpdirname), "attr.csv.zip"))
+        await download_it_and_save(source_url, archive_path)
+        try:
+            await unzip(archive_path, tmpdirname)
+        except Exception as exc:
+            logger.debug("Fallback unzip for %s: %s", archive_path, exc)
+            with zipfile.ZipFile(archive_path, "r") as zip_ref:
+                zip_ref.extractall(tmpdirname)
+        csv_path = glob.glob(f"{tmpdirname}/*.csv")[0]
+        async with async_open(csv_path, "r", encoding="utf-8-sig") as stream:
+            async for attribute_row in AsyncDictReader(stream, delimiter=","):
+                if not attribute_row["StandardComponentId"] or not attribute_row["PlanId"]:
+                    continue
+                plan_key = (
+                    f"{attribute_row['StandardComponentId']}_{attribute_row['BusinessYear']}"
+                )
+                if plan_key in plans_by_key:
+                    continue
+                plans_by_key[plan_key] = _unknown_federal_plan_row(attribute_row)
+                issuer_id, issuer_row = _unknown_federal_issuer_row(attribute_row)
+                issuers_by_id[issuer_id] = issuer_row
+
+
+_STATE_ATTRIBUTE_FIELD_LABELS = (
+    "STANDARD COMPONENT ID",
+    "PLAN ID",
+    "BUSINESS YEAR",
+    "ISSUER ID",
+    "STATE CODE",
+    "PLAN MARKETING NAME",
+    "URL FOR SUMMARY OF BENEFITS COVERAGE",
+    "PLAN BROCHURE",
+    "FORMULARY URL",
+    "IMPORT DATE",
+    "NETWORK ID",
+    "ISSUER NAME",
+)
+
+
+async def _state_attribute_field_name_map(csv_path):
+    """Resolve upper-case or camel-case state attributes headers."""
+    field_name_map = {label: label for label in _STATE_ATTRIBUTE_FIELD_LABELS}
+    async with async_open(csv_path, "r", encoding="utf-8-sig") as stream:
+        async for attribute_row in AsyncDictReader(stream, delimiter=","):
+            if attribute_row.get("STANDARD COMPONENT ID") and attribute_row.get("PLAN ID"):
+                continue
+            return {
+                label: "".join(word.capitalize() for word in label.split())
+                for label in field_name_map
+            }
+    return field_name_map
+
+
+def _unknown_state_plan_row(attribute_row, field_name_map, plan_id, business_year):
+    """Build one state marketplace plan identity."""
+    issuer_id = attribute_row.get(field_name_map["ISSUER ID"])
+    return {
+        "plan_id": plan_id,
+        "plan_id_type": "STATE-HIOS-PLAN-ID",
+        "year": int(business_year),
+        "issuer_id": int(issuer_id),
+        "state": str(attribute_row.get(field_name_map["STATE CODE"])).upper(),
+        "marketing_name": attribute_row.get(field_name_map["PLAN MARKETING NAME"]),
+        "summary_url": attribute_row.get(
+            field_name_map["URL FOR SUMMARY OF BENEFITS COVERAGE"]
+        ),
+        "marketing_url": attribute_row.get(field_name_map["PLAN BROCHURE"]),
+        "formulary_url": attribute_row.get(field_name_map["FORMULARY URL"]),
+        "plan_contact": "",
+        "network": [attribute_row.get(field_name_map["NETWORK ID"])],
+        "benefits": [],
+        "last_updated_on": datetime.datetime.combine(
+            parse_date(attribute_row.get(field_name_map["IMPORT DATE"]), fuzzy=True),
+            datetime.datetime.min.time(),
+        ),
+        "checksum": return_checksum([plan_id.lower(), int(business_year)], crc=32),
+    }
+
+
+def _unknown_state_issuer_row(attribute_row, field_name_map):
+    """Build one state marketplace issuer identity."""
+    issuer_id = attribute_row.get(field_name_map["ISSUER ID"])
+    issuer_name = (attribute_row.get(field_name_map["ISSUER NAME"]) or "").strip()
+    return int(issuer_id), {
+        "state": str(attribute_row.get(field_name_map["STATE CODE"])).upper(),
+        "issuer_id": int(issuer_id),
+        "mrf_url": "",
+        "data_contact_email": "",
+        "issuer_marketing_name": "",
+        "issuer_name": issuer_name or issuer_id,
+    }
+
+
+async def _read_unknown_state_attribute_file(
+    source_url, plans_by_key, issuers_by_id, processed_rows, row_limit
+):
+    """Merge one state plan-attributes archive and return its bounded row count."""
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        archive_path = str(PurePath(str(tmpdirname), "attr.csv.zip"))
+        await download_it_and_save(source_url, archive_path)
+        try:
+            await unzip(archive_path, tmpdirname)
+        except Exception as exc:
+            logger.debug("Fallback unzip for state attributes %s: %s", archive_path, exc)
+            with zipfile.ZipFile(archive_path, "r") as zip_ref:
+                zip_ref.extractall(tmpdirname)
+        csv_files = glob.glob(f"{tmpdirname}/*Plans*.csv")
+        csv_path = csv_files[0] if csv_files else glob.glob(f"{tmpdirname}/*.csv")[0]
+        field_name_map = await _state_attribute_field_name_map(csv_path)
+        async with async_open(csv_path, "r", encoding="utf-8-sig") as stream:
+            async for attribute_row in AsyncDictReader(stream, delimiter=","):
+                plan_id = attribute_row.get(field_name_map["STANDARD COMPONENT ID"])
+                plan_identifier = attribute_row.get(field_name_map["PLAN ID"])
+                business_year = attribute_row.get(field_name_map["BUSINESS YEAR"])
+                if plan_id and plan_identifier:
+                    continue
+                if not plan_id or business_year is None:
+                    continue
+                plan_key = f"{plan_id.upper()}_{business_year}"
+                if plan_key in plans_by_key:
+                    continue
+                plans_by_key[plan_key] = _unknown_state_plan_row(
+                    attribute_row, field_name_map, plan_id, business_year
+                )
+                issuer_id, issuer_row = _unknown_state_issuer_row(
+                    attribute_row, field_name_map
+                )
+                issuers_by_id[issuer_id] = issuer_row
+                processed_rows += 1
+                if row_limit and processed_rows >= row_limit:
+                    break
+    return processed_rows
 
 
 async def import_unknown_state_issuers_data(test_mode: bool = False):
     """Import issuer and plan identities missing explicit state attribution."""
-
     plans_by_key = {}
     issuers_by_id = {}
-
     attribute_files = json.loads(os.environ["HLTHPRT_CMSGOV_PLAN_ATTRIBUTES_URL_PUF"])
+    for source in attribute_files:
+        await _read_unknown_federal_attribute_file(
+            source["url"], plans_by_key, issuers_by_id
+        )
+
     processed_rows = 0
     row_limit = TEST_UNKNOWN_STATE_ROWS if test_mode else None
-    for file in attribute_files:
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            archive_name = "attr.csv"
-            tmp_filename = str(PurePath(str(tmpdirname), archive_name + ".zip"))
-            await download_it_and_save(file["url"], tmp_filename)
-            try:
-                await unzip(tmp_filename, tmpdirname)
-            except Exception as exc:
-                logger.debug("Fallback unzip for %s: %s", tmp_filename, exc)
-                with zipfile.ZipFile(tmp_filename, "r") as zip_ref:
-                    zip_ref.extractall(tmpdirname)
-
-            tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
-
-            async with async_open(tmp_filename, "r", encoding="utf-8-sig") as afp:
-                async for attribute_row in AsyncDictReader(afp, delimiter=","):
-                    if not attribute_row["StandardComponentId"] or not attribute_row["PlanId"]:
-                        continue
-                    plan_key = f"{attribute_row['StandardComponentId']}_{attribute_row['BusinessYear']}"
-                    if plan_key in plans_by_key:
-                        continue
-                    plans_by_key[plan_key] = {
-                        "plan_id": attribute_row["StandardComponentId"],
-                        "plan_id_type": "CMS-HIOS-PLAN-ID",
-                        "year": int(attribute_row["BusinessYear"]),
-                        "issuer_id": int(attribute_row["IssuerId"]),
-                        "state": str(attribute_row["StateCode"]).upper(),
-                        "marketing_name": attribute_row["PlanMarketingName"],
-                        "summary_url": attribute_row["URLForSummaryofBenefitsCoverage"],
-                        "marketing_url": attribute_row["PlanBrochure"],
-                        "formulary_url": attribute_row["FormularyURL"],
-                        "plan_contact": "",
-                        "network": [attribute_row["NetworkId"]],
-                        "benefits": [],
-                        "last_updated_on": datetime.datetime.combine(
-                            parse_date(attribute_row["ImportDate"], fuzzy=True), datetime.datetime.min.time()
-                        ),
-                        "checksum": return_checksum(
-                            [
-                                attribute_row["StandardComponentId"].lower(),
-                                int(attribute_row["BusinessYear"]),
-                            ],
-                            crc=32,
-                        ),
-                    }
-
-                    issuers_by_id[int(attribute_row["IssuerId"])] = {
-                        "state": str(attribute_row["StateCode"]).upper(),
-                        "issuer_id": int(attribute_row["IssuerId"]),
-                        "mrf_url": "",
-                        "data_contact_email": "",
-                        "issuer_marketing_name": "",
-                        "issuer_name": (
-                            attribute_row["IssuerMarketPlaceMarketingName"].strip()
-                            if attribute_row["IssuerMarketPlaceMarketingName"].strip()
-                            else attribute_row["IssuerId"]
-                        ),
-                    }
-                    # except:
-                    #     from pprint import pprint
-                    #     pprint(row)
-
-    state_attribute_files = json.loads(os.environ["HLTHPRT_CMSGOV_STATE_PLAN_ATTRIBUTES_URL_PUF"])
-    for file in state_attribute_files:
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            archive_name = "attr.csv"
-            tmp_filename = str(PurePath(str(tmpdirname), archive_name + ".zip"))
-            await download_it_and_save(file["url"], tmp_filename)
-            try:
-                await unzip(tmp_filename, tmpdirname)
-            except Exception as exc:
-                logger.debug("Fallback unzip for state attributes %s: %s", tmp_filename, exc)
-                with zipfile.ZipFile(tmp_filename, "r") as zip_ref:
-                    zip_ref.extractall(tmpdirname)
-
-            csv_files = glob.glob(f"{tmpdirname}/*Plans*.csv")
-            tmp_filename = csv_files[0] if csv_files else glob.glob(f"{tmpdirname}/*.csv")[0]
-
-            def to_camel_case(s):
-                """Convert one whitespace-delimited label to title-cased text."""
-
-                parts = s.split()
-                return "".join(word.capitalize() for word in parts)
-
-            field_name_by_label = {
-                "STANDARD COMPONENT ID": "STANDARD COMPONENT ID",
-                "PLAN ID": "PLAN ID",
-                "BUSINESS YEAR": "BUSINESS YEAR",
-                "ISSUER ID": "ISSUER ID",
-                "STATE CODE": "STATE CODE",
-                "PLAN MARKETING NAME": "PLAN MARKETING NAME",
-                "URL FOR SUMMARY OF BENEFITS COVERAGE": "URL FOR SUMMARY OF BENEFITS COVERAGE",
-                "PLAN BROCHURE": "PLAN BROCHURE",
-                "FORMULARY URL": "FORMULARY URL",
-                "IMPORT DATE": "IMPORT DATE",
-                "NETWORK ID": "NETWORK ID",
-                "ISSUER NAME": "ISSUER NAME",
-            }
-
-            async with async_open(tmp_filename, "r", encoding="utf-8-sig") as afp:
-                async for attribute_row in AsyncDictReader(afp, delimiter=","):
-                    if attribute_row.get("STANDARD COMPONENT ID") and attribute_row.get("PLAN ID"):
-                        continue
-                    for key in field_name_by_label:
-                        field_name_by_label[key] = to_camel_case(field_name_by_label[key])
-                    break
-
-            async with async_open(tmp_filename, "r", encoding="utf-8-sig") as afp:
-                async for attribute_row in AsyncDictReader(afp, delimiter=","):
-                    standard_component_id = attribute_row.get(field_name_by_label["STANDARD COMPONENT ID"])
-                    plan_identifier = attribute_row.get(field_name_by_label["PLAN ID"])
-                    business_year = attribute_row.get(field_name_by_label["BUSINESS YEAR"])
-                    if standard_component_id and plan_identifier:
-                        continue
-                    if not standard_component_id or business_year is None:
-                        continue
-
-                    plan_key = f"{standard_component_id.upper()}_{business_year}"
-                    if plan_key in plans_by_key:
-                        continue
-
-                    issuer_id_value = attribute_row.get(field_name_by_label["ISSUER ID"])
-                    plans_by_key[plan_key] = {
-                        "plan_id": standard_component_id,
-                        "plan_id_type": "STATE-HIOS-PLAN-ID",
-                        "year": int(business_year),
-                        "issuer_id": int(issuer_id_value),
-                        "state": str(attribute_row.get(field_name_by_label["STATE CODE"])).upper(),
-                        "marketing_name": attribute_row.get(field_name_by_label["PLAN MARKETING NAME"]),
-                        "summary_url": attribute_row.get(
-                            field_name_by_label["URL FOR SUMMARY OF BENEFITS COVERAGE"]
-                        ),
-                        "marketing_url": attribute_row.get(field_name_by_label["PLAN BROCHURE"]),
-                        "formulary_url": attribute_row.get(field_name_by_label["FORMULARY URL"]),
-                        "plan_contact": "",
-                        "network": [attribute_row.get(field_name_by_label["NETWORK ID"])],
-                        "benefits": [],
-                        "last_updated_on": datetime.datetime.combine(
-                            parse_date(attribute_row.get(field_name_by_label["IMPORT DATE"]), fuzzy=True),
-                            datetime.datetime.min.time(),
-                        ),
-                        "checksum": return_checksum(
-                            [
-                                standard_component_id.lower(),
-                                int(business_year),
-                            ],
-                            crc=32,
-                        ),
-                    }
-
-                    issuer_name_value = (attribute_row.get(field_name_by_label["ISSUER NAME"]) or "").strip()
-                    issuers_by_id[int(issuer_id_value)] = {
-                        "state": str(attribute_row.get(field_name_by_label["STATE CODE"])).upper(),
-                        "issuer_id": int(issuer_id_value),
-                        "mrf_url": "",
-                        "data_contact_email": "",
-                        "issuer_marketing_name": "",
-                        "issuer_name": issuer_name_value or issuer_id_value,
-                    }
-
-                    processed_rows += 1
-                    if row_limit and processed_rows >= row_limit:
-                        break
-                if row_limit and processed_rows >= row_limit:
-                    break
+    state_attribute_files = json.loads(
+        os.environ["HLTHPRT_CMSGOV_STATE_PLAN_ATTRIBUTES_URL_PUF"]
+    )
+    for source in state_attribute_files:
+        processed_rows = await _read_unknown_state_attribute_file(
+            source["url"],
+            plans_by_key,
+            issuers_by_id,
+            processed_rows,
+            row_limit,
+        )
         if row_limit and processed_rows >= row_limit:
             break
-
-    return (issuers_by_id, plans_by_key)
+    return issuers_by_id, plans_by_key
 
 
 async def _read_rate_review_issuer_names(csv_files: list[str], row_limit: int | None) -> tuple[dict, int]:
@@ -2938,6 +2995,7 @@ async def init_file(ctx, task=None):
     myplantransparency = make_class(PlanTransparency, import_date, schema_override=db_schema)
 
     with tempfile.TemporaryDirectory() as tmpdirname:
+        transparency_issuer_name_by_id = {}
         transparent_files = json.loads(os.environ["HLTHPRT_CMSGOV_PLAN_TRANSPARENCY_URL_PUF"])
         for file_idx, file in enumerate(transparent_files):
             if is_test_mode_enabled and file_idx >= 1:
@@ -3010,6 +3068,9 @@ async def init_file(ctx, task=None):
                         )
                         transparency_row_dict["claims_payment_policies_url"] = str(
                             worksheet_row[column_index_by_name["claims_payment_policies_url"]]
+                        )
+                        transparency_issuer_name_by_id[transparency_row_dict["issuer_id"]] = (
+                            transparency_row_dict["issuer_name"]
                         )
 
                         obj_list.append(transparency_row_dict)
@@ -3091,10 +3152,9 @@ async def init_file(ctx, task=None):
                                 (worksheet_row[3] or "").strip() if worksheet_row[3] else ""
                             ),
                         }
-                        issuer_stmt = select(myplantransparency.issuer_name).where(
-                            myplantransparency.issuer_id == issuer_row_dict["issuer_id"]
+                        issuer_name = transparency_issuer_name_by_id.get(
+                            issuer_row_dict["issuer_id"]
                         )
-                        issuer_name = await db.scalar(issuer_stmt)
                         issuer_row_dict["issuer_name"] = issuer_name if issuer_name else "N/A"
                         for single_url in row_urls:
                             issuer_row_dict["mrf_url"] = single_url

@@ -4,7 +4,7 @@ import datetime
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 
@@ -122,7 +122,7 @@ async def _assert_plan_import_rows(duplicate_tolerant, monkeypatch, plan_id, pus
 
 
 @pytest.mark.asyncio
-async def test_plan_import_preserves_year_benefit_and_cost_sharing_contracts(
+async def test_plan_import_preserves_below_threshold_cost_sharing_and_year_contracts(
     monkeypatch,
 ):
     """Preserve multi-year plans, normalized benefits, and cost sharing rows."""
@@ -177,7 +177,7 @@ async def test_plan_import_preserves_year_benefit_and_cost_sharing_contracts(
     pushed, duplicate_tolerant = _configure_import_boundary(
         monkeypatch, plan_source_records
     )
-    monkeypatch.setattr(initial, "_mrf_plan_flush_rows", lambda _test_mode: 0)
+    monkeypatch.setattr(initial, "_mrf_plan_flush_rows", lambda _test_mode: 100)
 
     await _assert_plan_import_rows(duplicate_tolerant, monkeypatch, plan_id, pushed)
 

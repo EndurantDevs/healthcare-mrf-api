@@ -95,3 +95,39 @@ Examples of canonical outputs populated by this pipeline include:
 - `providers.json addresses[*]` are normalized into `mrf_address` using the same `(npi, type, checksum)` address identity pattern as `npi_address`.
 - Exact marketplace address provenance is preserved in `mrf_address_evidence`, including issuer id, issuer name, import id, import date, source file URL, and source record id.
 - Aggregated address rows in `mrf_address` expose summary provenance arrays such as `source_issuer_ids`, `source_issuer_names`, `source_import_ids`, `source_import_dates`, and `source_urls`.
+
+## NPI source details
+
+NPI responses keep the default generic `mrf` address source. Request
+`include_sources=true` to add exact address-local issuer details from
+`mrf_address_evidence`:
+
+```json
+{
+  "address_sources": ["nppes", "mrf"],
+  "mrf_source_count": 2,
+  "mrf_sources": [
+    {
+      "source": "mrf",
+      "issuer_name": "Bluebird Health Plan",
+      "source_name": "Bluebird Health Plan (issuer 22222)",
+      "issuer_ids": [22222],
+      "source_urls": ["https://bluebird.example/providers.json"]
+    },
+    {
+      "source": "mrf",
+      "issuer_name": "Northstar Health Plan",
+      "source_name": "Northstar Health Plan (issuer 11111)",
+      "issuer_ids": [11111],
+      "source_urls": ["https://northstar.example/providers.json"]
+    }
+  ]
+}
+```
+
+One independent source means one lower-cased, trimmed issuer name, matching the
+repository's existing MRF independence rule. Issuer IDs, network tiers, years,
+import runs, and URLs do not create extra sources; issuer IDs and distinct URLs
+are sorted aliases on that issuer. Public URL aliases omit credentials, query
+strings, fragments, and non-HTTP locations. Missing or stale address keys do
+not emit inferred source details.
