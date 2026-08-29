@@ -8522,9 +8522,9 @@ async def _pricing_provider_list_where(session, args, year, list_values_by_name)
     return and_(*filters), provider_type_resolution
 
 
-async def _pricing_provider_list_query(session, args, year, where_clause, benchmark_mode):
-    order = _normalize_order(args.get("order"))
-    order_by = str(args.get("order_by") or "total_allowed_amount")
+async def _pricing_provider_list_query(
+    session, year, where_clause, benchmark_mode, order_by, order
+):
     benchmark_mode_used = benchmark_mode
     benchmark_mode_source = "request" if benchmark_mode else None
     if order_by == "tier_relevance" and await _is_table_available(
@@ -8658,6 +8658,8 @@ async def list_pricing_providers(request):
         "city": str(args.get("city", "")).strip().lower(),
         "specialty": str(args.get("specialty", "")).strip().lower(),
     }
+    order = _normalize_order(args.get("order"))
+    order_by = str(args.get("order_by") or "total_allowed_amount")
     year, year_source = await _resolve_year(
         session, provider_table, _parse_int(args.get("year"), "year", minimum=2013)
     )
@@ -8666,7 +8668,12 @@ async def list_pricing_providers(request):
     )
     total = await _pricing_provider_list_total(session, where_clause)
     query_details = await _pricing_provider_list_query(
-        session, args, year, where_clause, list_values_by_name["benchmark_mode"]
+        session,
+        year,
+        where_clause,
+        list_values_by_name["benchmark_mode"],
+        order_by,
+        order,
     )
     query = query_details[0]
     page = await _pricing_provider_list_page(
@@ -10132,14 +10139,12 @@ def _procedure_provider_grouped_query(where_clause):
 
 
 async def _procedure_provider_list_page(
-    session, args, pagination, where_clause, include_legacy_fields
+    session, pagination, where_clause, include_legacy_fields, order_by, order
 ):
     grouped_subquery = _procedure_provider_grouped_query(where_clause).subquery()
     count_result = await session.execute(
         select(func.count()).select_from(grouped_subquery)
     )
-    order = _normalize_order(args.get("order"))
-    order_by = str(args.get("order_by") or "total_allowed_amount")
     query = _apply_ordering(
         select(grouped_subquery),
         order_by,
@@ -10232,6 +10237,8 @@ async def list_procedure_providers(request, code_system: str, code: str):
     args.get("taxonomy_classification")
     args.get("taxonomy_specialization")
     args.get("taxonomy_section")
+    order = _normalize_order(args.get("order"))
+    order_by = str(args.get("order_by") or "total_allowed_amount")
     year, year_source = await _resolve_year(
         session,
         provider_procedure_table,
@@ -10245,10 +10252,11 @@ async def list_procedure_providers(request, code_system: str, code: str):
     )
     page = await _procedure_provider_list_page(
         session,
-        args,
         pagination,
         where_clause,
         list_values_by_name["include_legacy_fields"],
+        order_by,
+        order,
     )
     return response.json(
         _procedure_provider_list_document(
@@ -12817,7 +12825,7 @@ async def _provider_prescription_list_where(
             session,
             list_values_by_name["code"],
             args,
-            default_system=args.get("rx_code_system") or INTERNAL_RX_CODE_SYSTEM,
+            default_system=list_values_by_name["rx_code_system"],
         )
         filters.extend(
             (
@@ -12839,12 +12847,12 @@ async def _provider_prescription_list_where(
     return and_(*filters), code_context
 
 
-async def _provider_prescription_list_page(session, args, pagination, where_clause):
+async def _provider_prescription_list_page(
+    session, pagination, where_clause, order_by, order
+):
     count_result = await session.execute(
         select(func.count()).select_from(provider_prescription_table).where(where_clause)
     )
-    order = _normalize_order(args.get("order"))
-    order_by = str(args.get("order_by") or "total_drug_cost")
     query = _apply_ordering(
         select(provider_prescription_table).where(where_clause),
         order_by,
@@ -12945,7 +12953,10 @@ async def list_provider_prescriptions(request, npi: str):
         "brand_name": str(args.get("brand_name", "")).strip().lower(),
         "rx_name": str(args.get("rx_name", "")).strip().lower(),
         "code": str(args.get("code", "")).strip(),
+        "rx_code_system": args.get("rx_code_system") or INTERNAL_RX_CODE_SYSTEM,
     }
+    order = _normalize_order(args.get("order"))
+    order_by = str(args.get("order_by") or "total_drug_cost")
     if not await _is_table_available(session, provider_prescription_table.name):
         return response.json(
             _provider_prescription_unavailable_document(provider_npi, year, pagination)
@@ -12955,7 +12966,7 @@ async def list_provider_prescriptions(request, npi: str):
         session, args, provider_npi, year, list_values_by_name
     )
     page = await _provider_prescription_list_page(
-        session, args, pagination, where_clause
+        session, pagination, where_clause, order_by, order
     )
     return response.json(
         _provider_prescription_list_document(
