@@ -5,6 +5,7 @@ import base64
 import binascii
 import contextlib
 import hashlib
+import ipaddress
 import json
 import logging
 import math
@@ -4648,6 +4649,19 @@ def _public_mrf_source_url(value: Any) -> str | None:
     parsed = urllib.parse.urlsplit(source_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return None
+    hostname = parsed.hostname.lower()
+    normalized_hostname = hostname.rstrip(".")
+    if normalized_hostname == "localhost" or normalized_hostname.endswith(
+        ".localhost"
+    ):
+        return None
+    try:
+        literal_ip = ipaddress.ip_address(normalized_hostname)
+    except ValueError:
+        pass
+    else:
+        if not literal_ip.is_global:
+            return None
     return source_url
 
 
@@ -4680,6 +4694,8 @@ async def _attach_mrf_source_details(
     """Attach issuer-level MRF provenance to exact selected addresses."""
     address_pairs = _mrf_source_address_pairs(addresses)
     if not address_pairs:
+        return
+    if not await _is_table_available("mrf_address_evidence", session=session):
         return
     evidence_table = _schema_cache_key("mrf_address_evidence")
     query_result = await _execute_stmt(

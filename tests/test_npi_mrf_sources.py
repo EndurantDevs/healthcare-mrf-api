@@ -73,11 +73,17 @@ async def test_mrf_sources_are_address_local_issuer_groups_with_exact_url_aliase
             ]
         )
     )
+    table_available = AsyncMock(return_value=True)
     monkeypatch.setattr(npi_module, "_execute_stmt", execute_stmt)
+    monkeypatch.setattr(npi_module, "_is_table_available", table_available)
 
     await npi_module._attach_mrf_source_details(addresses, session="session")
 
     execute_stmt.assert_awaited_once()
+    table_available.assert_awaited_once_with(
+        "mrf_address_evidence",
+        session="session",
+    )
     statement = str(execute_stmt.await_args.args[0])
     assert "mrf_address_evidence" in statement
     assert "mrf_address" not in statement.replace("mrf_address_evidence", "")
@@ -153,11 +159,62 @@ async def test_mrf_sources_fail_closed_for_missing_or_stale_address_keys(monkeyp
             )
         ),
     )
+    monkeypatch.setattr(
+        npi_module,
+        "_is_table_available",
+        AsyncMock(return_value=True),
+    )
 
     await npi_module._attach_mrf_source_details(addresses)
 
     assert all("mrf_sources" not in address for address in addresses)
     assert all("mrf_source_count" not in address for address in addresses)
+
+
+@pytest.mark.asyncio
+async def test_mrf_sources_fail_closed_when_evidence_table_is_unavailable(
+    monkeypatch,
+):
+    execute_stmt = AsyncMock()
+    monkeypatch.setattr(npi_module, "_execute_stmt", execute_stmt)
+    monkeypatch.setattr(
+        npi_module,
+        "_is_table_available",
+        AsyncMock(return_value=False),
+    )
+    addresses = [
+        {
+            "npi": 1000000001,
+            "address_key": "11111111-1111-1111-1111-111111111111",
+            "address_sources": ["mrf"],
+        }
+    ]
+
+    await npi_module._attach_mrf_source_details(addresses)
+
+    execute_stmt.assert_not_awaited()
+    assert "mrf_sources" not in addresses[0]
+
+
+def test_public_mrf_source_urls_reject_local_literal_hosts():
+    rejected_urls = (
+        "http://localhost/providers.json",
+        "http://imports.localhost/providers.json",
+        "http://imports.LOCALHOST./providers.json",
+        "http://127.0.0.1/providers.json",
+        "http://10.0.0.1/providers.json",
+        "http://169.254.169.254/providers.json",
+        "http://[::1]/providers.json",
+    )
+
+    assert all(
+        npi_module._public_mrf_source_url(source_url) is None
+        for source_url in rejected_urls
+    )
+    assert (
+        npi_module._public_mrf_source_url("https://8.8.8.8/providers.json")
+        == "https://8.8.8.8/providers.json"
+    )
 
 
 @pytest.mark.asyncio

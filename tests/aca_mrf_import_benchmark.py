@@ -10,15 +10,17 @@ import hashlib
 import json
 import os
 import resource
+import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 
 DATABASE = os.getenv("HLTHPRT_DB_DATABASE", "")
 PORT = os.getenv("HLTHPRT_DB_PORT", "")
 SCHEMA = "mrf_speed_test"
-SUFFIX = "aca_speed_20260829"
+SUFFIX = f"aca_speed_{uuid.uuid4().hex[:16]}"
 
 if "test" not in DATABASE or PORT != "5440":
     raise RuntimeError("benchmark requires a disposable test database on PostgreSQL port 5440")
@@ -315,7 +317,10 @@ async def _run() -> dict:
                 "whole_seconds": round(
                     plan_seconds + provider_seconds + summary_seconds, 6
                 ),
-                "max_rss_bytes": int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss),
+                "max_rss_bytes": int(
+                    resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    * (1 if sys.platform == "darwin" else 1024)
+                ),
                 "expected_counts": expected_counts,
                 "actual_counts": actual_counts,
                 "correctness_ok": actual_counts == expected_counts,
@@ -343,4 +348,7 @@ async def _run() -> dict:
 
 
 if __name__ == "__main__":
-    print(json.dumps(asyncio.run(_run()), sort_keys=True))
+    result = asyncio.run(_run())
+    print(json.dumps(result, sort_keys=True))
+    if not result["correctness_ok"]:
+        raise SystemExit("benchmark receipt validation failed")
