@@ -28,12 +28,31 @@ hospitals:
 
 def test_checked_in_registry_has_exact_source_neutral_shape():
     hospitals = registry.load_hospital_hpt_registry()
+    hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
 
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_196
+    assert sum("locator_name" in entry for entry in hospitals) == 1_197
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 637
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 4
+    assert {
+        hospital_id: hospital_by_id[hospital_id]["locator_name"]
+        for hospital_id in ("hospital-003082", "hospital-005234", "hospital-005243")
+    } == {
+        "hospital-003082": "Hugh Chatham Health, a facility of Wilkes Regional Medical Center",
+        "hospital-005234": "ProMedica Bay Park Hospital",
+        "hospital-005243": "ProMedica Toledo Hospital",
+    }
+    assert {
+        hospital_id: hashlib.sha256(
+            hospital_by_id[hospital_id]["fallback_mrf_url"].encode()
+        ).hexdigest()
+        for hospital_id in ("hospital-006471", "hospital-006547", "hospital-007195")
+    } == {
+        "hospital-006471": "dc7b9213c55ff2a6d9626a7841c532b5e7ebf1dce51e17efda59ead2c3f17de4",
+        "hospital-006547": "4001360464d0b094a10df3bd688d3879f0bc0d6c07ee966021772d689f0aebf7",
+        "hospital-007195": "4001360464d0b094a10df3bd688d3879f0bc0d6c07ee966021772d689f0aebf7",
+    }
     assert all(
         {"hospital_id", "name", "cms_hpt_url"} <= set(entry)
         <= {

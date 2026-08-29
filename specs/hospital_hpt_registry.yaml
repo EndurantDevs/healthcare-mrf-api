@@ -10032,6 +10032,7 @@ hospitals:
 - hospital_id: hospital-003082
   name: Hugh Chatham Memorial Hospital
   cms_hpt_url: https://hughchatham.org/cms-hpt.txt
+  locator_name: Hugh Chatham Health, a facility of Wilkes Regional Medical Center
 - hospital_id: hospital-003083
   name: HULL STREET SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
