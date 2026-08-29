@@ -57,6 +57,33 @@ def test_content_only_locator_binding_preserves_unknown_location():
     assert candidate.locator_name is None
 
 
+def test_matched_locator_uses_explicit_reviewed_fallback_source():
+    acquisition = _acquisition_module()
+    locator_url = "https://hospital.example/cms-hpt.txt"
+    hospital_by_field = {
+        "hospital_id": "hospital-a",
+        "name": "Hospital A",
+        "cms_hpt_url": locator_url,
+        "fallback_mrf_url": "https://files.example/current.json?sig=reviewed",
+    }
+    result = acquisition.LocatorResult(
+        locator_url,
+        "locator-a",
+        "observation-a",
+        (hospital_by_field,),
+        (
+            acquisition.HospitalHptLocatorRecord(
+                "Hospital A", "https://files.example/current.json?sig=stale"
+            ),
+        ),
+    )
+
+    candidate = acquisition.candidates_from_locators((result,))[0]
+
+    assert candidate.source_url == hospital_by_field["fallback_mrf_url"]
+    assert candidate.initial_error_code is None
+
+
 def test_fetch_failure_uses_only_an_explicit_reviewed_fallback():
     acquisition = _acquisition_module()
     hospital_by_field = {

@@ -340,7 +340,8 @@ def candidates_from_locators(
                 hospital_name=hospital_by_id[binding.hospital_id]["name"],
                 locator_id=locator_result.locator_id,
                 observation_id=locator_result.observation_id,
-                source_url=binding.mrf_url,
+                source_url=hospital_by_id[binding.hospital_id].get("fallback_mrf_url")
+                or binding.mrf_url,
                 locator_name=(
                     locator_result.records[binding.record_index].location_name
                     if binding.record_index is not None
