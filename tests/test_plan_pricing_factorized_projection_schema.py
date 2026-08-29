@@ -52,7 +52,7 @@ def test_factorized_migration_is_additive_bounded_and_authenticated(
         "20260828120000_plan_pricing_factorized_projection"
     )
     assert migration.down_revision == (
-        "20260827210000_entity_address_geo_taxonomy"
+        "20260829100000_activate_import_run_idempotency_scope"
     )
     assert "plan_pricing_card_v2" in sql
     assert "plan_pricing_factorized_v3" in sql
@@ -103,7 +103,7 @@ def test_factorized_projection_is_the_unique_repository_head() -> None:
         "20260828120000_plan_pricing_factorized_projection"
     )
     assert factorized.down_revision == (
-        "20260827210000_entity_address_geo_taxonomy"
+        "20260829100000_activate_import_run_idempotency_scope"
     )
     assert script.get_revision(
         "20260825150000_plan_pricing_card_projection"
