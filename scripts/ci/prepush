@@ -621,7 +621,8 @@ run_core_postgres() {
     tests/test_formulary_fhir_synthetic_seed_publisher_postgres.py \
     tests/test_formulary_fhir_serving_postgres.py \
     tests/test_formulary_fhir_serving_index_postgres.py \
-    tests/test_formulary_fhir_collections_postgres.py
+    tests/test_formulary_fhir_collections_postgres.py \
+    tests/test_process_mrf_address_summary_db.py
 
   HLTHPRT_PTG2_V3_LIFECYCLE_POSTGRES_DSN=$dsn \
   HLTHPRT_PTG2_ROLLBACK_POSTGRES_DSN=$dsn \

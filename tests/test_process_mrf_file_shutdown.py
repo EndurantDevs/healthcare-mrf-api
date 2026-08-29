@@ -12,7 +12,7 @@ import os
 
 from asyncpg.exceptions import DeadlockDetectedError
 import pytest
-from sqlalchemy import BigInteger
+from sqlalchemy import BigInteger, column
 
 os.environ.setdefault("HLTHPRT_REDIS_ADDRESS", "redis://localhost")
 
@@ -20,6 +20,68 @@ process_pkg = importlib.import_module("process")
 process_initial = importlib.import_module("process.initial")
 process_npi = importlib.import_module("process.npi")
 utils_module = importlib.import_module("process.ext.utils")
+
+
+class _ImportHistoryUpsert:
+    def values(self, **_kwargs):
+        return self
+
+    def on_conflict_do_update(self, **_kwargs):
+        return self
+
+    async def status(self):
+        return None
+
+
+def _mrf_shutdown_stage(cls, suffix, schema_override=None):
+    """Build the minimum dynamic-stage shape needed by shutdown."""
+    return SimpleNamespace(
+        __tablename__=f"{cls.__tablename__}_{suffix}",
+        __main_table__=getattr(cls, "__main_table__", cls.__tablename__),
+        __my_initial_indexes__=list(getattr(cls, "__my_initial_indexes__", []) or []),
+        __my_additional_indexes__=list(getattr(cls, "__my_additional_indexes__", []) or []),
+        plan_id=column("plan_id") if cls is process_initial.Plan else None,
+    )
+
+
+@asynccontextmanager
+async def _mrf_shutdown_transaction():
+    """Provide the transaction boundary used by the mocked publication swap."""
+    yield
+
+
+def _install_mrf_shutdown_finalizer_mocks(monkeypatch, operations, mark_run, create_indexes):
+    """Install focused finalizer dependencies while retaining operation order."""
+    monkeypatch.setattr(process_initial, "mark_control_run", mark_run)
+    monkeypatch.setattr(process_initial, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_initial, "get_import_schema", lambda *_args: "mrf")
+    monkeypatch.setattr(process_initial, "make_class", _mrf_shutdown_stage)
+    monkeypatch.setattr(process_initial, "flush_error_log", AsyncMock())
+    monkeypatch.setattr(
+        process_initial.db,
+        "status",
+        AsyncMock(side_effect=lambda statement, **_kwargs: operations.append(("sql", statement))),
+    )
+    monkeypatch.setattr(process_initial.db, "scalar", AsyncMock(return_value=1))
+    monkeypatch.setattr(process_initial.db, "transaction", _mrf_shutdown_transaction)
+    monkeypatch.setattr(process_initial.db, "insert", lambda _table: _ImportHistoryUpsert())
+    monkeypatch.setattr(process_initial, "_refresh_all_plan_drug_statistics", AsyncMock())
+    monkeypatch.setattr(
+        process_initial,
+        "_refresh_mrf_address_summary",
+        AsyncMock(
+            side_effect=lambda _suffix, _schema, *, rebuild_indexes=True: operations.append(
+                ("summary", rebuild_indexes)
+            )
+        ),
+    )
+    monkeypatch.setattr(process_initial, "_create_named_indexes", create_indexes)
+    monkeypatch.setattr(process_initial, "source_enabled", lambda _source: False)
+    monkeypatch.setattr(
+        process_initial,
+        "_plan_summary_dependencies_ready",
+        AsyncMock(return_value=(False, ["mrf.plan_attributes"])),
+    )
 
 @pytest.mark.asyncio
 async def test_process_json_index_marks_terminal_parse_error_done(monkeypatch):
@@ -275,3 +337,90 @@ async def test_mrf_shutdown_cleans_stale_finalize_jobs_when_already_finalized(mo
         ),
     ]
     mark_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mrf_shutdown_defers_serving_indexes_and_reports_phase_timings(monkeypatch):
+    """Shutdown builds serving indexes after summary work and reports timings."""
+    operations = []
+    mark_run = AsyncMock()
+    create_indexes = AsyncMock(
+        side_effect=lambda stage, _schema, **kwargs: operations.append(
+            ("indexes", stage.__tablename__, kwargs.get("names"))
+        )
+    )
+
+    _install_mrf_shutdown_finalizer_mocks(
+        monkeypatch,
+        operations,
+        mark_run,
+        create_indexes,
+    )
+
+    context_by_field = {
+        "import_date": "20260829",
+        "control_run_id": "mrf-speedup-contract",
+        "run": 1,
+        "test_mode": True,
+    }
+    await process_initial.shutdown(
+        {"context": context_by_field},
+        {"context": context_by_field},
+    )
+
+    assert ("summary", False) in operations
+    index_operations = [operation for operation in operations if operation[0] == "indexes"]
+    assert index_operations == [
+        ("indexes", "mrf_address_20260829", {"address_key"}),
+        (
+            "indexes",
+            "mrf_address_evidence_20260829",
+            {"npi_type_checksum", "address_key"},
+        ),
+        ("indexes", "mrf_address_20260829", None),
+        ("indexes", "mrf_address_evidence_20260829", None),
+    ]
+    terminal_metrics = mark_run.await_args.kwargs["metrics"]
+    assert terminal_metrics["plans_count"] == 1
+    assert terminal_metrics["summary_rows"] == 0
+    phase_names = [
+        timing["phase"]
+        for timing in terminal_metrics["mrf_finalize_phase_timings"]
+    ]
+    assert phase_names[:4] == [
+        "plan_drug_statistics",
+        "mrf_address_summary",
+        "mrf_address_summary_analyze",
+        "mrf_address_fast_path_indexes",
+    ]
+    assert phase_names[-1] == "mrf_finalize_total"
+
+
+@pytest.mark.asyncio
+async def test_mrf_shutdown_does_not_publish_when_fast_path_index_build_fails(monkeypatch):
+    """An index-build failure must leave the live generation untouched."""
+    operations = []
+    create_indexes = AsyncMock(side_effect=RuntimeError("index build failed"))
+    _install_mrf_shutdown_finalizer_mocks(
+        monkeypatch,
+        operations,
+        AsyncMock(),
+        create_indexes,
+    )
+    context_by_field = {
+        "import_date": "20260829",
+        "control_run_id": "mrf-speedup-failure-contract",
+        "run": 1,
+        "test_mode": True,
+    }
+
+    with pytest.raises(RuntimeError, match="index build failed"):
+        await process_initial.shutdown(
+            {"context": context_by_field},
+            {"context": context_by_field},
+        )
+
+    assert not any(
+        operation[0] == "sql" and "ALTER TABLE" in operation[1]
+        for operation in operations
+    )

@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-from db.models import MRFAddress, MRFAddressEvidence
+from db.models import MRFAddress, MRFAddressEvidence, PlanDrugStats
 from db.models import db
 from process.ext.utils import make_class
 
@@ -18,6 +18,75 @@ def _requires_test_database():
     database = os.getenv("HLTHPRT_DB_DATABASE", "")
     if "test" not in database:
         pytest.skip("DB-backed MRF summary test requires a disposable test database")
+
+
+async def _staging_primary_index_receipt(schema, table_name):
+    """Return constraint and catalog fields for every index on one stage."""
+    indexes = await db.all(
+        """
+        SELECT index_relation.relname AS index_name,
+               index_catalog.indisprimary,
+               index_catalog.indisunique,
+               constraint_catalog.conname AS constraint_name
+          FROM pg_class AS table_relation
+          JOIN pg_namespace AS table_namespace
+            ON table_namespace.oid = table_relation.relnamespace
+          JOIN pg_index AS index_catalog
+            ON index_catalog.indrelid = table_relation.oid
+          JOIN pg_class AS index_relation
+            ON index_relation.oid = index_catalog.indexrelid
+     LEFT JOIN pg_constraint AS constraint_catalog
+            ON constraint_catalog.conindid = index_relation.oid
+         WHERE table_namespace.nspname = :schema
+           AND table_relation.relname = :table_name
+         ORDER BY index_relation.relname;
+        """,
+        schema=schema,
+        table_name=table_name,
+    )
+    return [dict(index_result._mapping) for index_result in indexes]
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_staging_primary_index_keeps_constraint_and_stable_name():
+    """A stable publish name must remain attached to the primary constraint."""
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+    suffix = f"primary_fixture_{uuid.uuid4().hex[:8]}"
+    stage_cls = make_class(PlanDrugStats, suffix, schema_override=schema)
+    table_name = stage_cls.__tablename__
+    qualified_table = f"{schema}.{table_name}"
+
+    await db.status(f"DROP TABLE IF EXISTS {qualified_table};")
+    try:
+        for _attempt in range(2):
+            await db.create_table(stage_cls.__table__, checkfirst=True)
+            await process_initial._ensure_staging_primary_index(stage_cls, schema)
+
+            assert await _staging_primary_index_receipt(schema, table_name) == [
+                {
+                    "index_name": f"{table_name}_idx_primary",
+                    "indisprimary": True,
+                    "indisunique": True,
+                    "constraint_name": f"{table_name}_idx_primary",
+                }
+            ]
+
+            await db.status(
+                f"""
+                INSERT INTO {qualified_table} (
+                    plan_id, total_drugs, auth_required, auth_not_required,
+                    step_required, step_not_required, quantity_limit,
+                    quantity_no_limit
+                ) VALUES ('12345AA0000001', 1, 0, 1, 0, 1, 0, 1)
+                ON CONFLICT (plan_id) DO UPDATE
+                    SET total_drugs = EXCLUDED.total_drugs;
+                """
+            )
+            assert await db.scalar(f"SELECT count(*) FROM {qualified_table};") == 1
+            await db.status(f"DROP TABLE {qualified_table};")
+    finally:
+        await db.status(f"DROP TABLE IF EXISTS {qualified_table};")
 
 
 async def _insert_address_evidence_fixture(evidence_table):
