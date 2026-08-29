@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
@@ -66,15 +68,22 @@ async def _assert_same_importer_integrity_recovery(monkeypatch):
 
 
 async def _assert_prepared_index_definitions():
-    index_definition_by_name = {
-        str(index_record.index_name): str(index_record.index_definition)
+    index_record_by_name = {
+        str(index_record.index_name): index_record
         for index_record in (
             await db.execute(
                 text(
                     """
                     SELECT index_record.relname AS index_name,
-                           pg_get_indexdef(index_record.oid) AS index_definition
+                           pg_get_indexdef(index_record.oid) AS index_definition,
+                           index_state.indisunique AS is_unique,
+                           pg_get_expr(
+                               index_state.indpred,
+                               index_state.indrelid
+                           ) AS predicate
                       FROM pg_class AS index_record
+                      JOIN pg_index AS index_state
+                        ON index_state.indexrelid = index_record.oid
                       JOIN pg_namespace AS namespace_record
                         ON namespace_record.oid = index_record.relnamespace
                      WHERE namespace_record.nspname = :schema
@@ -88,16 +97,22 @@ async def _assert_prepared_index_definitions():
             )
         ).all()
     }
-    assert set(index_definition_by_name) == {
+    assert set(index_record_by_name) == {
         "import_run_active_idempotency_idx",
         "import_run_importer_active_idempotency_idx",
     }
-    assert "(idempotency_key)" in index_definition_by_name[
-        "import_run_active_idempotency_idx"
-    ]
-    assert "(importer, idempotency_key)" in index_definition_by_name[
+    assert "(idempotency_key)" in str(
+        index_record_by_name["import_run_active_idempotency_idx"].index_definition
+    )
+    composite_index = index_record_by_name[
         "import_run_importer_active_idempotency_idx"
     ]
+    assert "(importer, idempotency_key)" in str(composite_index.index_definition)
+    assert composite_index.is_unique is True
+    predicate = str(composite_index._mapping["predicate"])
+    assert set(re.findall(r"'([^']+)'", predicate)) == set(
+        control_imports.ACTIVE_STATUSES
+    ), predicate
 
 
 async def test_prepared_idempotency_indexes_fail_closed_until_activation(
