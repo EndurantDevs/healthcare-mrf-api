@@ -17,6 +17,7 @@ from process.ptg_parts.ptg_source_attempt_guard import (
     source_file_import_id_from_payload,
 )
 from tests.ptg_frozen_test_support import protected_control_payload
+from tests.ptg_singleton_direct_test_support import _direct_params
 
 
 ptg = importlib.import_module("process.ptg")
@@ -127,6 +128,57 @@ async def test_worker_binding_recheck_is_terminal_inside_lifecycle(
 
 
 @pytest.mark.asyncio
+async def test_singleton_worker_rejects_existing_frozen_binding(
+    monkeypatch,
+):
+    harness = _WorkerFailureHarness()
+    monkeypatch.setattr(
+        ptg_control,
+        "_stale_ptg_job_result",
+        harness.no_stale_run,
+    )
+    monkeypatch.setattr(
+        ptg_frozen_control,
+        "recheck_frozen_binding",
+        harness.reject_binding,
+    )
+    monkeypatch.setattr(
+        ptg_control,
+        "mark_control_run",
+        harness.has_claimed_control_run,
+    )
+    monkeypatch.setattr(
+        ptg_control,
+        "_flush_terminal_status_events",
+        harness.flush_status,
+    )
+    monkeypatch.setattr(ptg_control, "ptg_main", harness.run_main)
+    params_by_name = _direct_params()
+
+    with pytest.raises(
+        FrozenRateFileBindingMismatchError,
+        match="immutable retry drift",
+    ):
+        await ptg_control.ptg_control_start(
+            {},
+            {
+                "run_id": "run-direct",
+                "source_file_import_id": params_by_name[
+                    "source_file_import_id"
+                ],
+                "import_id": params_by_name["import_id"],
+                "params": params_by_name,
+            },
+        )
+
+    assert harness.main_calls == []
+    assert [call["status"] for call in harness.mark_calls] == [
+        "running",
+        "failed",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_worker_outer_identity_mismatch_is_terminal_inside_lifecycle(
     monkeypatch,
 ):
@@ -211,7 +263,7 @@ def _install_rejected_claim_harness(
     )
     monkeypatch.setattr(
         ptg_control,
-        "validated_worker_frozen_rate_params",
+        "validated_worker_rate_params",
         harness.fail_if_validated,
     )
     monkeypatch.setattr(

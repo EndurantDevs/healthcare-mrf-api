@@ -11,6 +11,9 @@ from process.ptg_singleton_direct_control import (
     DIRECT_RATE_FILE_INTENT_SHA256_FIELD,
     normalize_protected_singleton_direct_params,
 )
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    INVALID_PRICE_EXCLUSION_POLICY_FIELD,
+)
 from process.ptg_allowed_amount_blank import (
     ALLOWED_AMOUNT_BLANK_ERROR,
     allowed_amount_blank_metrics,
@@ -62,6 +65,7 @@ class _EngineRunExpectation:
     source_key: str
     plan_ids: list[str]
     market_types: list[str]
+    invalid_price_exclusion_policy: Mapping[str, Any] | None
 
 
 def _validated_abandonment(
@@ -276,6 +280,8 @@ def _validate_outer_run_params(
         != request["member_ordinal"]
         or run_params.get("ordinary_cutover_direct_input_digest")
         != frozen_params[DIRECT_RATE_FILE_INTENT_SHA256_FIELD]
+        or run_params.get(INVALID_PRICE_EXCLUSION_POLICY_FIELD)
+        != frozen_params.get(INVALID_PRICE_EXCLUSION_POLICY_FIELD)
         or run_params.get("source_key") != source_key
         or _month(run_params.get("import_month")) != frozen_params["import_month"]
         or run_params.get(expected_selector) != direct_intent["canonical_url"]
@@ -367,6 +373,9 @@ def _validated_engine_result(
         market_types=_market_types(
             expectation.run_params.get("plan_market_types")
         ),
+        invalid_price_exclusion_policy=expectation.frozen_params.get(
+            INVALID_PRICE_EXCLUSION_POLICY_FIELD
+        ),
     )
     _validate_engine_run(
         engine_run,
@@ -433,6 +442,8 @@ def _validate_engine_run(
         or options.get("source_key") != expectation.source_key
         or options.get("plan_ids") != expectation.plan_ids
         or options.get("plan_market_types") != expectation.market_types
+        or options.get(INVALID_PRICE_EXCLUSION_POLICY_FIELD)
+        != expectation.invalid_price_exclusion_policy
         or report.get("snapshot_id") != expectation.snapshot_id
     )
     is_succeeded = (

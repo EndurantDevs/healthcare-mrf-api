@@ -853,7 +853,6 @@ async def _stage_ptg2_source_candidate(
     *,
     source_key: str,
     snapshot_id: str,
-    previous_snapshot_id: str | None,
     import_month: datetime.date,
     updated_at: datetime.datetime,
     snapshot_attributes: dict[str, Any],
@@ -864,6 +863,7 @@ async def _stage_ptg2_source_candidate(
     """Bind a sealed V3 layout without changing any live serving pointer."""
 
     schema_name = resolve_ptg2_schema()
+    previous_snapshot_id = snapshot_attributes.get("previous_snapshot_id")
     candidate_attributes = candidate_snapshot_attributes(
         snapshot_attributes,
         source_key=source_key,

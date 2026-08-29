@@ -63,6 +63,9 @@ from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
 from process.ptg_parts.ptg2_provider_quarantine import (
     validate_provider_identifier_quarantine,
 )
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    validate_invalid_price_exclusion_evidence,
+)
 from process.ptg_parts.rust_scanner import (
     convert_membership_shards_to_shared_graph_rust,
 )
@@ -5182,6 +5185,7 @@ async def _publish_prepared_shared_layout(
     prepared_price: PreparedSharedPriceArtifacts,
     publication_started_at: float,
     price_prepare_seconds: float,
+    invalid_price_exclusion: Mapping[str, Any] | None = None,
     scratch_parent: str | Path | None = None,
     prepared_work_directory: str | Path | None = None,
     prepared_finalizer: _PreparedFinalizer | None = None,
@@ -5239,6 +5243,11 @@ async def _publish_prepared_shared_layout(
         )
     coverage_scope_id = _validated_coverage_scope_id(expected_coverage_scope_id)
     quarantine = validate_provider_identifier_quarantine(provider_identifier_quarantine)
+    exclusion_evidence = (
+        validate_invalid_price_exclusion_evidence(invalid_price_exclusion)
+        if invalid_price_exclusion is not None
+        else None
+    )
 
     async def touch_build() -> None:
         """Refresh the reserved layout's build heartbeat transactionally."""
@@ -5645,6 +5654,8 @@ async def _publish_prepared_shared_layout(
             "source_witness": source_witness_publication.support_digest.hex(),
             "provider_identifier_quarantine": quarantine["sha256"],
         }
+        if exclusion_evidence is not None:
+            core_support_map["invalid_price_exclusion"] = exclusion_evidence["sha256"]
         if provider_graph_v4:
             # The V4 root digest owns only the factored provider graph. Bind
             # the finalizer and rate mappings separately into support identity.
@@ -5759,6 +5770,8 @@ async def _publish_prepared_shared_layout(
                 "storage_bytes": int(stored_byte_count),
             }
         )
+        if exclusion_evidence is not None:
+            provisional_serving_index["invalid_price_exclusion"] = exclusion_evidence
         if provider_graph_v4:
             provisional_serving_index["finalizer_mapping"] = (
                 finalizer_block_publication.manifest()
@@ -5888,6 +5901,7 @@ async def publish_strict_shared_v3_layout(
     expected_raw_source_sha256: Iterable[str],
     graph_artifact_entries: Iterable[dict[str, Any]],
     provider_identifier_quarantine: Mapping[str, Any],
+    invalid_price_exclusion: Mapping[str, Any] | None = None,
     scratch_parent: str | Path | None = None,
     full_rebuild_scope_digest: str | None = None,
     provider_graph_v4: bool = False,
@@ -6050,6 +6064,7 @@ async def publish_strict_shared_v3_layout(
                 expected_raw_source_sha256=expected_raw_source_digests,
                 graph_artifact_entries=graph_artifact_entries,
                 provider_identifier_quarantine=provider_identifier_quarantine,
+                invalid_price_exclusion=invalid_price_exclusion,
                 prepared_price=prepared_price,
                 publication_started_at=publication_started_at,
                 price_prepare_seconds=price_prepare_seconds,

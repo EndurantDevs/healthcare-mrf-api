@@ -30,6 +30,7 @@ from process.ptg_parts.ptg2_batch_candidate_audit_report import (
     BatchAuditReportTarget,
 )
 from process.ptg_parts.ptg2_candidate_attestation import (
+    CANDIDATE_SOURCE_RECORDS_SQL,
     PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE,
     PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY,
     PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4,
@@ -68,9 +69,16 @@ from process.ptg_parts.ptg2_source_witness_store import load_shared_source_witne
 from process.ptg_parts.frozen_rate_candidate import (
     validate_frozen_candidate_evidence,
 )
+from process.ptg_parts.frozen_rate_binding import (
+    INVALID_PRICE_EXCLUSION_POLICY_FIELD,
+)
 from process.ptg_parts.frozen_rate_files import (
     FrozenRateFileMismatchError,
     FrozenRateFileValidationError,
+)
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    validate_candidate_invalid_price_exclusion_evidence,
+    validated_candidate_invalid_price_exclusion_policy,
 )
 from process.ptg_parts.source_snapshot_control import promote_ptg2_source_snapshot
 from scripts.validation import ptg2_v3_source_api_audit
@@ -105,6 +113,8 @@ _CANDIDATE_TARGET_SQL = """
            snapshot.status,
            snapshot.previous_snapshot_id,
            snapshot.manifest,
+           internal_run.options -> 'invalid_price_exclusion_policy'
+               AS invalid_price_exclusion_policy,
            binding.snapshot_key,
            scope.plan_id,
            scope.plan_market_type,
@@ -124,6 +134,8 @@ _CANDIDATE_TARGET_SQL = """
            current_snapshot.status AS current_status,
            current_snapshot.previous_snapshot_id AS current_previous_snapshot_id,
            current_snapshot.manifest AS current_manifest,
+           current_internal_run.options -> 'invalid_price_exclusion_policy'
+               AS current_invalid_price_exclusion_policy,
            current_binding.snapshot_key AS current_snapshot_key,
            current_scope.plan_id AS current_plan_id,
            current_scope.plan_market_type AS current_plan_market_type,
@@ -147,6 +159,8 @@ _CANDIDATE_TARGET_SQL = """
         ON scope.snapshot_id = snapshot.snapshot_id
       JOIN {schema}.ptg2_v3_snapshot_layout AS layout
         ON layout.snapshot_key = binding.snapshot_key
+      LEFT JOIN {schema}.ptg2_import_run AS internal_run
+        ON internal_run.import_run_id = snapshot.import_run_id
       LEFT JOIN {schema}.ptg2_v4_snapshot_map_root AS v4_root
         ON v4_root.snapshot_key = layout.snapshot_key
       LEFT JOIN {schema}.ptg2_current_source_snapshot AS current_pointer
@@ -155,6 +169,9 @@ _CANDIDATE_TARGET_SQL = """
         )
       LEFT JOIN {schema}.ptg2_snapshot AS current_snapshot
         ON current_snapshot.snapshot_id = current_pointer.snapshot_id
+      LEFT JOIN {schema}.ptg2_import_run AS current_internal_run
+        ON current_internal_run.import_run_id =
+           current_snapshot.import_run_id
       LEFT JOIN {schema}.ptg2_v3_snapshot_binding AS current_binding
         ON current_binding.snapshot_id = current_snapshot.snapshot_id
       LEFT JOIN {schema}.ptg2_v3_snapshot_scope AS current_scope
@@ -384,50 +401,12 @@ class _CandidateRawSources(tuple[str, ...]):
         return instance
 
 
-_CANDIDATE_RAW_SOURCES_SQL = """
-    SELECT source.source_key,
-           source.raw_container_sha256,
-           trace_binding.source_file_version_count,
-           trace_binding.source_file_version_id,
-           version.source_identity_hash AS version_source_identity_hash,
-           source_identity.source_type AS version_source_type,
-           source_identity.canonical_url AS version_canonical_url,
-           version.raw_sha256 AS version_raw_sha256,
-           version.logical_sha256 AS version_logical_sha256,
-           version.content_length AS version_content_length,
-           version.etag AS version_etag,
-           version.last_modified AS version_last_modified,
-           version.verification_mode AS version_verification_mode,
-           version.payload AS version_payload
-      FROM {schema}.ptg2_v3_snapshot_source AS source
-      JOIN {schema}.ptg2_source_trace_set AS trace_set
-        ON trace_set.source_trace_set_hash = source.source_trace_set_hash
-      LEFT JOIN LATERAL (
-          SELECT count(DISTINCT trace.source_file_version_id)::integer
-                     AS source_file_version_count,
-                 min(trace.source_file_version_id)
-                     AS source_file_version_id
-            FROM unnest(trace_set.source_trace_hashes)
-                 AS trace_hash(source_trace_hash)
-            JOIN {schema}.ptg2_source_trace AS trace
-              ON trace.source_trace_hash = trace_hash.source_trace_hash
-      ) AS trace_binding ON TRUE
-      LEFT JOIN {schema}.ptg2_source_file_version AS version
-        ON version.source_file_version_id =
-           trace_binding.source_file_version_id
-      LEFT JOIN {schema}.ptg2_source_identity AS source_identity
-        ON source_identity.source_identity_hash = version.source_identity_hash
-     WHERE source.snapshot_id = :snapshot_id
-     ORDER BY source.source_key
-"""
-
-
 async def _candidate_raw_sources(snapshot_id: str) -> tuple[str, ...]:
     """Load dense candidate sources with their complete version identities."""
 
     schema = _quote_ident(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     database_source_rows = await db.all(
-        _CANDIDATE_RAW_SOURCES_SQL.format(schema=schema),
+        CANDIDATE_SOURCE_RECORDS_SQL.format(schema=schema),
         snapshot_id=snapshot_id,
     )
     source_records = [
@@ -532,14 +511,17 @@ def _validated_frozen_candidate_identity(
     candidate_run_id: str,
     raw_container_sha256: tuple[str, ...],
 ) -> str | None:
+    raw_database_binding = candidate_row.get("frozen_binding_payload")
+    database_binding = (
+        None if raw_database_binding is None else _mapping(raw_database_binding)
+    )
+    if raw_database_binding is not None and not database_binding:
+        raise ValueError("candidate frozen source-file binding changed")
     try:
         return validate_frozen_candidate_evidence(
             manifest_by_name,
             candidate_run_id=candidate_run_id,
-            database_binding=_mapping(
-                candidate_row.get("frozen_binding_payload")
-            )
-            or None,
+            database_binding=database_binding,
             database_sources=getattr(
                 raw_container_sha256,
                 "source_records",
@@ -583,8 +565,7 @@ def _sealed_candidate_evidence(
     raw_container_sha256: tuple[str, ...],
 ) -> _SealedCandidateEvidence:
     manifest_state = _candidate_manifest_state(
-        candidate_row,
-        candidate_run_id=candidate_run_id,
+        candidate_row, candidate_run_id=candidate_run_id
     )
     quarantine_by_name = _validated_candidate_quarantine(
         manifest_state.serving_index_by_name,
@@ -608,14 +589,24 @@ def _sealed_candidate_evidence(
         candidate_run_id=candidate_run_id,
         raw_container_sha256=raw_container_sha256,
     )
+    binding_by_name = _mapping(candidate_row.get("frozen_binding_payload"))
+    invalid_price_policy = validated_candidate_invalid_price_exclusion_policy(
+        candidate_row.get(INVALID_PRICE_EXCLUSION_POLICY_FIELD),
+        binding_by_name or None,
+        raw_container_sha256,
+    )
+    validate_candidate_invalid_price_exclusion_evidence(
+        invalid_price_policy,
+        manifest_state.serving_index_by_name.get("invalid_price_exclusion"),
+        manifest_state.layout_serving_index_by_name.get("invalid_price_exclusion"),
+        raw_container_sha256,
+    )
     if (
         not manifest_state.snapshot_id
         or manifest_state.activation_by_name.get("contract")
         != PTG2_CANDIDATE_ACTIVATION_CONTRACT
     ):
-        raise ValueError(
-            "candidate is not an exact strict shared snapshot"
-        )
+        raise ValueError("candidate is not an exact strict shared snapshot")
     return _SealedCandidateEvidence(
         snapshot_id=manifest_state.snapshot_id,
         activation_by_name=manifest_state.activation_by_name,
@@ -830,6 +821,9 @@ def _current_snapshot_row(candidate_row: Mapping[str, Any]) -> dict[str, Any] | 
             "current_previous_snapshot_id"
         ),
         "manifest": candidate_row.get("current_manifest"),
+        "invalid_price_exclusion_policy": candidate_row.get(
+            "current_invalid_price_exclusion_policy"
+        ),
         "snapshot_key": candidate_row.get("current_snapshot_key"),
         "plan_id": candidate_row.get("current_plan_id"),
         "plan_market_type": candidate_row.get("current_plan_market_type"),

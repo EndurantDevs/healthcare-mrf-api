@@ -16,6 +16,12 @@ from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_evidence,
     provider_identifier_quarantine_payload,
 )
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    invalid_price_exclusion_evidence,
+    invalid_price_exclusion_policy,
+    invalid_price_exclusion_source,
+    invalid_price_value_sha256,
+)
 from process.ptg_parts.ptg2_source_witness import source_set_digest
 
 
@@ -532,6 +538,9 @@ async def test_candidate_target_query_ignores_unsupported_attestations(monkeypat
     assert query.count(":supported_contracts") == 2
     assert "ptg2_v4_snapshot_map_root AS v4_root" in query
     assert "ptg2_v4_snapshot_map_root AS current_v4_root" in query
+    assert 'LEFT JOIN "mrf".ptg2_import_run AS internal_run' in query
+    assert "ptg2_import_run AS current_internal_run" in query
+    assert query.count("invalid_price_exclusion_policy") == 4
     assert query_parameters["supported_contracts"] == list(
         ptg_candidate_audit.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
     )
@@ -700,6 +709,117 @@ async def test_candidate_scope_rejects_snapshot_layout_quarantine_mismatch(monke
     )
 
     with pytest.raises(ValueError, match="changed after layout sealing"):
+        await ptg_candidate_audit.load_candidate_audit_target(
+            candidate_run_id="ptg2:derived-import",
+        )
+
+
+@pytest.mark.asyncio
+async def test_candidate_scope_accepts_singleton_run_exclusion_policy(
+    monkeypatch,
+):
+    candidate_row_by_field = _candidate_row()
+    source_by_field = invalid_price_exclusion_source(
+        raw_source_sha256=RAW_DIGEST,
+        entries=[
+            {
+                "object_ordinal": 1,
+                "rate_ordinal": 2,
+                "price_ordinal": 3,
+                "invalid_value_sha256": invalid_price_value_sha256(
+                    "2027-02-30"
+                ),
+            }
+        ],
+        emptied_rate_count=0,
+    )
+    policy = invalid_price_exclusion_policy([source_by_field])
+    evidence = invalid_price_exclusion_evidence(policy)
+    candidate_row_by_field["invalid_price_exclusion_policy"] = policy
+    candidate_row_by_field["manifest"]["serving_index"][
+        "invalid_price_exclusion"
+    ] = evidence
+    candidate_row_by_field["layout_manifest"]["serving_index"][
+        "invalid_price_exclusion"
+    ] = evidence
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_rows",
+        AsyncMock(return_value=[candidate_row_by_field]),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_raw_sources",
+        AsyncMock(return_value=(RAW_DIGEST,)),
+    )
+
+    audit_target = await ptg_candidate_audit.load_candidate_audit_target(
+        candidate_run_id="ptg2:derived-import",
+    )
+
+    assert audit_target.raw_container_sha256 == (RAW_DIGEST,)
+
+
+@pytest.mark.asyncio
+async def test_candidate_scope_rejects_exclusion_evidence_without_policy(
+    monkeypatch,
+):
+    candidate_row = _candidate_row()
+    source_by_field = invalid_price_exclusion_source(
+        raw_source_sha256=RAW_DIGEST,
+        entries=[
+            {
+                "object_ordinal": 1,
+                "rate_ordinal": 2,
+                "price_ordinal": 3,
+                "invalid_value_sha256": invalid_price_value_sha256("2027-02-30"),
+            }
+        ],
+        emptied_rate_count=0,
+    )
+    evidence = invalid_price_exclusion_evidence(invalid_price_exclusion_policy([source_by_field]))
+    candidate_row["manifest"]["serving_index"]["invalid_price_exclusion"] = evidence
+    candidate_row["layout_manifest"]["serving_index"]["invalid_price_exclusion"] = evidence
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_rows",
+        AsyncMock(return_value=[candidate_row]),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_raw_sources",
+        AsyncMock(return_value=(RAW_DIGEST,)),
+    )
+
+    with pytest.raises(ValueError, match="no exact policy"):
+        await ptg_candidate_audit.load_candidate_audit_target(
+            candidate_run_id="ptg2:derived-import",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frozen_binding_payload", ({}, [], "[]", "{"))
+async def test_candidate_scope_rejects_malformed_frozen_binding(
+    monkeypatch,
+    frozen_binding_payload,
+):
+    candidate_row = _candidate_row()
+    candidate_row["frozen_binding_payload"] = frozen_binding_payload
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_rows",
+        AsyncMock(return_value=[candidate_row]),
+    )
+    monkeypatch.setattr(
+        ptg_candidate_audit,
+        "_candidate_raw_sources",
+        AsyncMock(return_value=(RAW_DIGEST,)),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="candidate frozen source-file binding changed",
+    ):
         await ptg_candidate_audit.load_candidate_audit_target(
             candidate_run_id="ptg2:derived-import",
         )

@@ -112,3 +112,20 @@ def _optional_int(value: Any) -> int | None:
     if value is None or value == "":
         return None
     return int(value)
+
+
+def assert_expected_ptg_lane(params: dict[str, Any]) -> None:
+    """Reject a task routed to a different configured worker lane."""
+
+    expected_queue = str(params.get("_expected_queue") or "").strip()
+    active_queue = os.getenv("HLTHPRT_ACTIVE_WORKER_QUEUE", "").strip()
+    if expected_queue and active_queue and expected_queue != active_queue:
+        raise RuntimeError(
+            f"PTG payload expected {expected_queue}, but active worker queue is {active_queue}"
+        )
+    expected_class = str(params.get("_expected_worker_class") or "").strip()
+    active_class = os.getenv("HLTHPRT_ACTIVE_WORKER_CLASS", "").strip()
+    if expected_class and active_class and expected_class != active_class:
+        raise RuntimeError(
+            f"PTG payload expected {expected_class}, but active worker class is {active_class}"
+        )

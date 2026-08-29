@@ -16,6 +16,17 @@ const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GlobalId128(pub [u8; GLOBAL_ID_BYTES]);
 
+pub struct PriceAtomParts<'a> {
+    pub negotiated_type: Option<&'a str>,
+    pub negotiated_rate: Option<&'a str>,
+    pub expiration_date: Option<&'a str>,
+    pub service_code: &'a [String],
+    pub billing_class: Option<&'a str>,
+    pub setting: Option<&'a str>,
+    pub billing_code_modifier: &'a [String],
+    pub additional_information: Option<&'a str>,
+}
+
 impl GlobalId128 {
     pub fn from_domain_payload(domain: &str, payload: &Value) -> Self {
         let mut hasher = Xxh3::new();
@@ -38,27 +49,17 @@ impl GlobalId128 {
         Self(hasher.digest128().to_le_bytes())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_price_atom_parts(
-        negotiated_type: Option<&str>,
-        negotiated_rate: Option<&str>,
-        expiration_date: Option<&str>,
-        service_code: &[String],
-        billing_class: Option<&str>,
-        setting: Option<&str>,
-        billing_code_modifier: &[String],
-        additional_information: Option<&str>,
-    ) -> Self {
+    pub fn from_price_atom_parts(parts: PriceAtomParts<'_>) -> Self {
         let mut hasher = Xxh3::new();
         hasher.update(b"price_atom_manifest");
-        update_hash_optional_str(&mut hasher, negotiated_type);
-        update_hash_optional_str(&mut hasher, negotiated_rate);
-        update_hash_optional_str(&mut hasher, expiration_date);
-        update_hash_string_list(&mut hasher, service_code);
-        update_hash_optional_str(&mut hasher, billing_class);
-        update_hash_optional_str(&mut hasher, setting);
-        update_hash_string_list(&mut hasher, billing_code_modifier);
-        update_hash_optional_str(&mut hasher, additional_information);
+        update_hash_optional_str(&mut hasher, parts.negotiated_type);
+        update_hash_optional_str(&mut hasher, parts.negotiated_rate);
+        update_hash_optional_str(&mut hasher, parts.expiration_date);
+        update_hash_string_list(&mut hasher, parts.service_code);
+        update_hash_optional_str(&mut hasher, parts.billing_class);
+        update_hash_optional_str(&mut hasher, parts.setting);
+        update_hash_string_list(&mut hasher, parts.billing_code_modifier);
+        update_hash_optional_str(&mut hasher, parts.additional_information);
         Self(hasher.digest128().to_le_bytes())
     }
 

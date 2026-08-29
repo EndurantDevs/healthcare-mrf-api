@@ -8,18 +8,18 @@
     "collection_name_mismatch": 0,
     "comment_noise": 0,
     "confusable_function_names": 0,
-    "deep_nesting": 18,
+    "deep_nesting": 16,
     "function_name_shape": 0,
     "global_state_usage": 0,
-    "inline_suppressions": 2,
-    "long_files": 150,
-    "long_functions": 221,
+    "inline_suppressions": 1,
+    "long_files": 149,
+    "long_functions": 219,
     "missing_contract_docstrings": 0,
     "pass_placeholders": 0,
     "single_letter_names": 0,
     "syntax_errors": 0,
     "too_many_locals": 88,
-    "too_many_parameters": 36
+    "too_many_parameters": 35
   },
   "issue_ids": {
     "ambiguous_function_names": [],
@@ -46,15 +46,12 @@
       "deep_nesting:process/pharmacy_license.py:pharmacy_license_start",
       "deep_nesting:process/provider_directory_fhir.py:_fetch_resource_rows",
       "deep_nesting:process/provider_directory_fhir.py:_import_resources",
-      "deep_nesting:process/ptg.py:_main_with_artifact_lease",
-      "deep_nesting:process/ptg_parts/ptg2_v4_graph_compiler.py:compile_provider_graph_v4_rust",
-      "deep_nesting:process/ptg_parts/rust_scanner.py:_iter_compact_serving_records_rust"
+      "deep_nesting:process/ptg_parts/ptg2_v4_graph_compiler.py:compile_provider_graph_v4_rust"
     ],
     "function_name_shape": [],
     "global_state_usage": [],
     "inline_suppressions": [
-      "inline_suppression:support/ptg2_scanner/src/main.rs:rust_allow:f8cf193d33c0",
-      "inline_suppression:support/ptg2_scanner/src/manifest.rs:rust_allow:ad1b2613b0a9"
+      "inline_suppression:support/ptg2_scanner/src/main.rs:rust_allow:f8cf193d33c0"
     ],
     "long_files": [
       "long_file:api/control_imports.py",
@@ -131,7 +128,6 @@
       "long_file:process/ptg_parts/ptg2_shared_graph.py",
       "long_file:process/ptg_parts/ptg2_shared_price.py",
       "long_file:process/ptg_parts/ptg2_shared_publish.py",
-      "long_file:process/ptg_parts/ptg2_shared_reuse.py",
       "long_file:process/ptg_parts/ptg2_shared_snapshot_publish.py",
       "long_file:process/ptg_parts/ptg2_source_snapshot_gc.py",
       "long_file:process/ptg_parts/ptg2_source_witness_streaming_encode.py",
@@ -391,7 +387,6 @@
       "long_function:process/ptg_parts/ptg2_shared_price.py:prepare_shared_price_artifacts",
       "long_function:process/ptg_parts/ptg2_shared_publish.py:publish_shared_finalizer_dictionaries",
       "long_function:process/ptg_parts/ptg2_shared_publish.py:publish_shared_graph",
-      "long_function:process/ptg_parts/ptg2_shared_reuse.py:shared_snapshot_source_assignments",
       "long_function:process/ptg_parts/ptg2_shared_snapshot_publish.py:_publish_prepared_shared_layout",
       "long_function:process/ptg_parts/ptg2_shared_snapshot_publish.py:_publish_v4_dictionaries_and_maps",
       "long_function:process/ptg_parts/ptg2_shared_snapshot_publish.py:_publish_v4_graph",
@@ -403,7 +398,6 @@
       "long_function:process/ptg_parts/ptg2_v4_taxonomy_candidates.py:_validate_projection_manifest",
       "long_function:process/ptg_parts/ptg2_v4_taxonomy_candidates.py:publish_v4_inferred_taxonomy_candidates",
       "long_function:process/ptg_parts/rust_scanner.py:_aiter_compact_serving_records_rust",
-      "long_function:process/ptg_parts/rust_scanner.py:_emit_scanner_live_progress",
       "long_function:process/ptg_parts/rust_scanner.py:_iter_compact_serving_records_rust",
       "long_function:process/ptg_parts/rust_scanner.py:_shared_graph_result_from_summary",
       "long_function:process/ptg_parts/source_jobs.py:parse_toc_catalog_entries",
@@ -560,8 +554,7 @@
       "too_many_parameters:process/ptg_parts/ptg2_v4_audit.py:publish_v4_audit_sample",
       "too_many_parameters:process/ptg_parts/rust_scanner.py:_aiter_compact_serving_records_rust",
       "too_many_parameters:process/ptg_parts/rust_scanner.py:_iter_compact_serving_records_rust",
-      "too_many_parameters:process/ptg_parts/source_pointers.py:_publish_ptg2_source_pointers",
-      "too_many_parameters:process/ptg_parts/source_pointers.py:_stage_ptg2_source_candidate"
+      "too_many_parameters:process/ptg_parts/source_pointers.py:_publish_ptg2_source_pointers"
     ]
   },
   "one_time_debt_reset": {

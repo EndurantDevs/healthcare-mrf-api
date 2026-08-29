@@ -193,7 +193,7 @@ async def test_control_without_run_id_never_installs_live_context(monkeypatch):
     monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", AsyncMock(return_value=None))
     monkeypatch.setattr(
         ptg_control,
-        "validated_worker_frozen_rate_params",
+        "validated_worker_rate_params",
         AsyncMock(return_value={}),
     )
     monkeypatch.setattr(ptg_control, "raise_if_cancelled", AsyncMock())

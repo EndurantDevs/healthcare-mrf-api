@@ -15,6 +15,13 @@ from typing import Any, Mapping
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.domain import PTG2_CANDIDATE_ACTIVATION_CONTRACT
+from process.ptg_parts.frozen_rate_binding import (
+    FROZEN_RATE_FILE_BINDING_OPTION,
+    INVALID_PRICE_EXCLUSION_POLICY_FIELD,
+)
+from process.ptg_parts.frozen_rate_candidate import (
+    validate_frozen_candidate_evidence,
+)
 from process.ptg_parts.ptg2_candidate_audit_contract import (
     PTG2_FAST_AUDIT_CONTRACT,
     PTG2_FAST_AUDIT_DEADLINE_SECONDS,
@@ -44,6 +51,10 @@ from process.ptg_parts.ptg2_shared_source_set import (
 )
 from process.ptg_parts.ptg2_lifecycle_lock import (
     acquire_ptg2_source_lifecycle_lock,
+)
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    validate_candidate_invalid_price_exclusion_evidence,
+    validated_candidate_invalid_price_exclusion_policy,
 )
 from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_evidence,
@@ -890,20 +901,45 @@ def _validated_candidate_quarantine(
     return layout_quarantine_by_field
 
 
-def _candidate_evidence_identity(
+def _validated_candidate_frozen_binding(
     database_row: Mapping[str, Any],
-    *,
-    activation_by_field: Mapping[str, Any],
+    manifest_by_field: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Authenticate the private frozen binding and its exact source rows."""
+
+    raw_database_binding = database_row.get("frozen_binding_payload")
+    database_binding_by_name = None if raw_database_binding is None else _mapping(raw_database_binding)
+    if raw_database_binding is not None and not database_binding_by_name:
+        raise ValueError("candidate frozen source-file binding changed")
+    raw_database_sources = database_row.get("frozen_source_records")
+    database_sources = (
+        [dict(source_by_field) for source_by_field in raw_database_sources]
+        if isinstance(raw_database_sources, list)
+        and all(isinstance(source_by_field, Mapping) for source_by_field in raw_database_sources)
+        else None
+    )
+    validate_frozen_candidate_evidence(
+        manifest_by_field,
+        candidate_run_id=str(database_row.get("import_run_id") or "").strip(),
+        database_binding=database_binding_by_name,
+        database_sources=database_sources,
+    )
+    return database_binding_by_name
+
+
+def _validated_candidate_public_evidence(
     serving_index_by_field: Mapping[str, Any],
     layout_serving_index_by_field: Mapping[str, Any],
-    storage_generation: str,
-) -> dict[str, Any]:
-    """Build immutable evidence fields after candidate contract validation."""
+    physical_identity: Any,
+    invalid_price_exclusion_policy: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any], bytes, dict[str, Any], bytes]:
+    """Authenticate exclusion, quarantine, sample, and witness evidence."""
 
-    physical_identity = _validated_candidate_physical_identity(
-        database_row,
-        serving_index_by_field,
-        layout_serving_index_by_field,
+    validate_candidate_invalid_price_exclusion_evidence(
+        invalid_price_exclusion_policy,
+        serving_index_by_field.get("invalid_price_exclusion"),
+        layout_serving_index_by_field.get("invalid_price_exclusion"),
+        physical_identity.raw_container_hashes,
     )
     quarantine_by_field = _validated_candidate_quarantine(
         serving_index_by_field,
@@ -924,12 +960,56 @@ def _candidate_evidence_identity(
             source_set_digest_hex=physical_identity.source_set_digest.hex(),
         )
     )
+    return (
+        quarantine_by_field,
+        audit_sample_by_field,
+        audit_sample_digest,
+        source_witness_by_field,
+        source_witness_digest,
+    )
+
+
+def _candidate_evidence_identity(
+    database_row: Mapping[str, Any],
+    *,
+    activation_by_field: Mapping[str, Any],
+    serving_index_by_field: Mapping[str, Any],
+    layout_serving_index_by_field: Mapping[str, Any],
+    storage_generation: str,
+) -> dict[str, Any]:
+    """Build immutable evidence fields after candidate contract validation."""
+
+    physical_identity = _validated_candidate_physical_identity(
+        database_row,
+        serving_index_by_field,
+        layout_serving_index_by_field,
+    )
+    manifest_by_field = _mapping(database_row.get("manifest"))
+    database_binding_by_name = _validated_candidate_frozen_binding(
+        database_row,
+        manifest_by_field,
+    )
+    invalid_price_policy = validated_candidate_invalid_price_exclusion_policy(
+        database_row.get(INVALID_PRICE_EXCLUSION_POLICY_FIELD),
+        database_binding_by_name,
+        physical_identity.raw_container_hashes,
+    )
+    (
+        quarantine_by_field,
+        audit_sample_by_field,
+        audit_sample_digest,
+        source_witness_by_field,
+        source_witness_digest,
+    ) = _validated_candidate_public_evidence(
+        serving_index_by_field,
+        layout_serving_index_by_field,
+        physical_identity,
+        invalid_price_policy,
+    )
     return {
         "snapshot_key": int(database_row["snapshot_key"]),
         "storage_generation": storage_generation,
-        "source_key": str(
-            activation_by_field.get("source_key") or ""
-        ).strip().lower(),
+        "source_key": str(activation_by_field.get("source_key") or "").strip().lower(),
         "plan_id": str(database_row.get("plan_id") or "").strip(),
         "plan_market_type": str(
             database_row.get("plan_market_type") or ""
@@ -981,55 +1061,103 @@ def _candidate_identity(database_row: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
+CANDIDATE_SOURCE_RECORDS_SQL = """
+    SELECT source.source_key,
+           source.raw_container_sha256,
+           trace_binding.source_file_version_count,
+           trace_binding.source_file_version_id,
+           version.source_identity_hash AS version_source_identity_hash,
+           source_identity.source_type AS version_source_type,
+           source_identity.canonical_url AS version_canonical_url,
+           version.raw_sha256 AS version_raw_sha256,
+           version.logical_sha256 AS version_logical_sha256,
+           version.content_length AS version_content_length,
+           version.etag AS version_etag,
+           version.last_modified AS version_last_modified,
+           version.verification_mode AS version_verification_mode,
+           version.payload AS version_payload
+      FROM {schema}.ptg2_v3_snapshot_source AS source
+      JOIN {schema}.ptg2_source_trace_set AS trace_set
+        ON trace_set.source_trace_set_hash = source.source_trace_set_hash
+      LEFT JOIN LATERAL (
+          SELECT count(DISTINCT trace.source_file_version_id)::integer
+                     AS source_file_version_count,
+                 min(trace.source_file_version_id)
+                     AS source_file_version_id
+            FROM unnest(trace_set.source_trace_hashes)
+                 AS trace_hash(source_trace_hash)
+            JOIN {schema}.ptg2_source_trace AS trace
+              ON trace.source_trace_hash = trace_hash.source_trace_hash
+      ) AS trace_binding ON TRUE
+      LEFT JOIN {schema}.ptg2_source_file_version AS version
+        ON version.source_file_version_id = trace_binding.source_file_version_id
+      LEFT JOIN {schema}.ptg2_source_identity AS source_identity
+        ON source_identity.source_identity_hash = version.source_identity_hash
+     WHERE source.snapshot_id = :snapshot_id
+     ORDER BY source.source_key
+"""
+
+_LOCKED_CANDIDATE_SQL = """
+    SELECT snapshot.status,
+           snapshot.import_run_id,
+           snapshot.manifest,
+           internal_run.options -> 'invalid_price_exclusion_policy'
+               AS invalid_price_exclusion_policy,
+           frozen_binding.binding_payload AS frozen_binding_payload,
+           binding.snapshot_key,
+           scope.plan_id,
+           scope.plan_market_type,
+           scope.coverage_scope_id,
+           layout.state AS layout_state,
+           layout.generation AS layout_generation,
+           layout.mapping_digest AS layout_mapping_digest,
+           layout.layout_manifest,
+           v4_root.state AS v4_root_state,
+           v4_root.map_digest AS v4_root_map_digest,
+           ARRAY(
+               SELECT source.raw_container_sha256
+                 FROM {schema}.ptg2_v3_snapshot_source source
+                WHERE source.snapshot_id = snapshot.snapshot_id
+                ORDER BY source.source_key
+           ) AS raw_container_sha256_values
+      FROM {schema}.ptg2_snapshot snapshot
+      JOIN {schema}.ptg2_v3_snapshot_binding binding
+        ON binding.snapshot_id = snapshot.snapshot_id
+      JOIN {schema}.ptg2_v3_snapshot_scope scope
+        ON scope.snapshot_id = snapshot.snapshot_id
+      JOIN {schema}.ptg2_v3_snapshot_layout layout
+        ON layout.snapshot_key = binding.snapshot_key
+      LEFT JOIN {schema}.ptg2_import_run internal_run
+        ON internal_run.import_run_id = snapshot.import_run_id
+      LEFT JOIN {schema}.ptg2_v4_snapshot_map_root v4_root
+        ON v4_root.snapshot_key = layout.snapshot_key
+      LEFT JOIN {schema}.ptg2_frozen_source_file_binding frozen_binding
+        ON frozen_binding.internal_run_id = snapshot.import_run_id
+     WHERE snapshot.snapshot_id = :snapshot_id
+       AND layout.state = 'sealed'
+       AND (
+            layout.generation = :v3_generation
+            OR (
+                layout.generation = :v4_generation
+                AND v4_root.state = 'complete'
+                AND v4_root.map_digest = layout.mapping_digest
+            )
+       )
+     FOR UPDATE OF snapshot
+"""
+
+
 async def _locked_candidate_identity(
     session: Any,
     *,
     schema_name: str,
     snapshot_id: str,
 ) -> dict[str, Any]:
+    """Load and lock one candidate with its corroborating private sources."""
+
+    quoted_schema = _quote_ident(schema_name)
     query_result = await session.execute(
-        db.text(
-            f"""
-            SELECT snapshot.status,
-                   snapshot.manifest,
-                   binding.snapshot_key,
-                   scope.plan_id,
-                   scope.plan_market_type,
-                   scope.coverage_scope_id,
-                   layout.state AS layout_state,
-                   layout.generation AS layout_generation,
-                   layout.mapping_digest AS layout_mapping_digest,
-                   layout.layout_manifest,
-                   v4_root.state AS v4_root_state,
-                   v4_root.map_digest AS v4_root_map_digest,
-                   ARRAY(
-                       SELECT source.raw_container_sha256
-                         FROM {_quote_ident(schema_name)}.ptg2_v3_snapshot_source source
-                        WHERE source.snapshot_id = snapshot.snapshot_id
-                        ORDER BY source.source_key
-                   ) AS raw_container_sha256_values
-              FROM {_quote_ident(schema_name)}.ptg2_snapshot snapshot
-              JOIN {_quote_ident(schema_name)}.ptg2_v3_snapshot_binding binding
-                ON binding.snapshot_id = snapshot.snapshot_id
-              JOIN {_quote_ident(schema_name)}.ptg2_v3_snapshot_scope scope
-                ON scope.snapshot_id = snapshot.snapshot_id
-              JOIN {_quote_ident(schema_name)}.ptg2_v3_snapshot_layout layout
-                ON layout.snapshot_key = binding.snapshot_key
-              LEFT JOIN {_quote_ident(schema_name)}.ptg2_v4_snapshot_map_root v4_root
-                ON v4_root.snapshot_key = layout.snapshot_key
-             WHERE snapshot.snapshot_id = :snapshot_id
-               AND layout.state = 'sealed'
-               AND (
-                    layout.generation = :v3_generation
-                    OR (
-                        layout.generation = :v4_generation
-                        AND v4_root.state = 'complete'
-                        AND v4_root.map_digest = layout.mapping_digest
-                    )
-               )
-             FOR UPDATE OF snapshot
-            """
-        ),
+        db.text(_LOCKED_CANDIDATE_SQL.format(schema=quoted_schema)),
         {
             "snapshot_id": snapshot_id,
             "v3_generation": PTG2_CANDIDATE_V3_GENERATION,
@@ -1039,7 +1167,17 @@ async def _locked_candidate_identity(
     candidate_row = query_result.one_or_none()
     if candidate_row is None:
         raise ValueError("validated candidate is unavailable")
-    return _candidate_identity(_row_mapping(candidate_row))
+    candidate_by_field = _row_mapping(candidate_row)
+    candidate_by_field["frozen_source_records"] = None
+    if candidate_by_field.get("frozen_binding_payload") is not None:
+        database_source_result = await session.execute(
+            db.text(CANDIDATE_SOURCE_RECORDS_SQL.format(schema=quoted_schema)),
+            {"snapshot_id": snapshot_id},
+        )
+        candidate_by_field["frozen_source_records"] = [
+            _row_mapping(source_row) for source_row in database_source_result.all()
+        ]
+    return _candidate_identity(candidate_by_field)
 
 
 async def _database_timestamp(session: Any) -> datetime.datetime:

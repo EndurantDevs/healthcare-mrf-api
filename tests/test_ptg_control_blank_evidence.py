@@ -67,7 +67,7 @@ async def test_ptg_control_preserves_failure_when_blank_lookup_fails(monkeypatch
     monkeypatch.setattr(ptg_control, "_flush_terminal_status_events", AsyncMock())
     monkeypatch.setattr(
         ptg_control,
-        "validated_worker_frozen_rate_params",
+        "validated_worker_rate_params",
         AsyncMock(side_effect=lambda _task, params_by_name: params_by_name),
     )
     monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)

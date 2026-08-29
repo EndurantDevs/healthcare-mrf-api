@@ -9,8 +9,18 @@ import re
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
-from process.ptg_parts.frozen_rate_binding import protected_frozen_tuple_presence
+from process.ptg_parts.frozen_rate_binding import (
+    INVALID_PRICE_EXCLUSION_POLICY_FIELD,
+    protected_frozen_tuple_presence,
+)
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    validate_invalid_price_exclusion_policy,
+)
 from process.ptg_singleton_direct_resource import PTG_SMALL_RESOURCE_CONTRACT
+from process.ptg_singleton_direct_errors import (
+    SingletonDirectValidationError,
+    singleton_direct_failure_payload,
+)
 
 
 DIRECT_RATE_FILE_INTENT_CONTRACT = "ptg_singleton_direct_file_intent_v1"
@@ -78,27 +88,6 @@ _COMPETING_SELECTOR_FIELDS = frozenset(
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 
 
-class SingletonDirectValidationError(ValueError):
-    """A signed direct selector is malformed or internally inconsistent."""
-
-
-def singleton_direct_failure_payload(
-    error_leaves: Sequence[BaseException],
-) -> dict[str, Any] | None:
-    """Classify contract failures without reflecting private selectors."""
-
-    if not any(
-        isinstance(error, SingletonDirectValidationError)
-        for error in error_leaves
-    ):
-        return None
-    return {
-        "code": "ptg_singleton_direct_contract_failed",
-        "message": "protected singleton direct input is invalid",
-        "retryable": False,
-    }
-
-
 def protected_singleton_direct_presence(
     params_by_name: Mapping[str, Any],
 ) -> tuple[str, ...]:
@@ -128,6 +117,16 @@ def normalize_protected_singleton_direct_params(
     )
     _require_direct_outer_matches(normalized_params_by_name, direct_intent)
     _require_singleton_selection(normalized_params_by_name)
+    if INVALID_PRICE_EXCLUSION_POLICY_FIELD in normalized_params_by_name:
+        if direct_intent["source_type"] != "in_network":
+            raise SingletonDirectValidationError(
+                "invalid price exclusion requires an in-network source"
+            )
+        normalized_params_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD] = (
+            validated_singleton_invalid_price_exclusion(
+                normalized_params_by_name[INVALID_PRICE_EXCLUSION_POLICY_FIELD]
+            )
+        )
     normalized_params_by_name[DIRECT_RATE_FILE_INTENT_FIELD] = direct_intent
     normalized_params_by_name[DIRECT_RATE_FILE_INTENT_SHA256_FIELD] = (
         direct_digest
@@ -138,6 +137,24 @@ def normalize_protected_singleton_direct_params(
     ]
     normalized_params_by_name["max_files"] = 1
     return normalized_params_by_name
+
+
+def validated_singleton_invalid_price_exclusion(
+    raw_policy: Any,
+) -> dict[str, Any]:
+    """Require one canonical policy source for one protected direct file."""
+
+    try:
+        policy_by_name = validate_invalid_price_exclusion_policy(raw_policy)
+    except ValueError as exc:
+        raise SingletonDirectValidationError(
+            "singleton direct invalid price exclusion policy is invalid"
+        ) from exc
+    if policy_by_name["source_count"] != 1:
+        raise SingletonDirectValidationError(
+            "singleton direct invalid price exclusion must bind one source"
+        )
+    return policy_by_name
 
 
 def _require_direct_marker_tuple(
@@ -253,9 +270,10 @@ def require_exact_wave_singleton_direct_params(
         else None
     )
     selector_field = _direct_selector_field(source_type)
-    if set(params_by_name) != set(_DIRECT_WAVE_PARAM_BASE_FIELDS) | {
-        selector_field
-    }:
+    expected_fields = set(_DIRECT_WAVE_PARAM_BASE_FIELDS) | {selector_field}
+    if INVALID_PRICE_EXCLUSION_POLICY_FIELD in params_by_name:
+        expected_fields.add(INVALID_PRICE_EXCLUSION_POLICY_FIELD)
+    if set(params_by_name) != expected_fields:
         raise SingletonDirectValidationError(
             "singleton direct wave parameter fields are not exact"
         )
@@ -294,41 +312,6 @@ def require_exact_wave_singleton_direct_params(
         raise SingletonDirectValidationError(
             "singleton direct wave plan scope is invalid"
         )
-
-
-def validated_worker_singleton_direct_params(
-    task_payload: Mapping[str, Any],
-    params_by_name: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Revalidate direct identities at the worker boundary before network I/O."""
-
-    normalized = normalize_protected_singleton_direct_params(params_by_name)
-    if not protected_singleton_direct_presence(normalized):
-        return normalized
-    protected_id = normalized["source_file_import_id"]
-    outer_ids = (
-        str(task_payload.get("source_file_import_id") or "").strip(),
-        str(task_payload.get("import_id") or "").strip(),
-    )
-    if any(outer_id != protected_id for outer_id in outer_ids):
-        raise SingletonDirectValidationError(
-            "singleton direct outer and nested import identities must match"
-        )
-    return normalized
-
-
-def singleton_direct_main_kwargs(
-    params_by_name: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Return the private-progress marker consumed by the PTG runtime."""
-
-    if not protected_singleton_direct_presence(params_by_name):
-        return {}
-    return {
-        "direct_rate_file_intent_sha256": params_by_name[
-            DIRECT_RATE_FILE_INTENT_SHA256_FIELD
-        ]
-    }
 
 
 def singleton_direct_intent_sha256(
@@ -495,6 +478,5 @@ __all__ = [
     "protected_singleton_direct_presence",
     "require_exact_wave_singleton_direct_params",
     "singleton_direct_failure_payload",
-    "singleton_direct_main_kwargs",
-    "validated_worker_singleton_direct_params",
+    "validated_singleton_invalid_price_exclusion",
 ]

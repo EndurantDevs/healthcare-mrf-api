@@ -234,7 +234,10 @@ def _reuse_publication_and_evidence():
         shared_snapshot_key=17,
         expected_generation=ptg.PTG2_V4_SHARED_GENERATION,
         coverage_scope_id=b"c" * 32,
-        shared_input_identity=SimpleNamespace(source_count=1),
+        shared_input_identity=SimpleNamespace(
+            source_count=1,
+            payload={"physical_options": {}},
+        ),
         snapshot_id="snapshot",
     )
     evidence = SimpleNamespace(
