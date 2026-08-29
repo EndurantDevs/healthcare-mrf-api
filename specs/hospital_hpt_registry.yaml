@@ -3801,6 +3801,7 @@ hospitals:
 - hospital_id: hospital-001163
   name: CENTENNIAL MEDICAL CENTER
   cms_hpt_url: https://www.tristarhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1113737_TRISTAR-CENTENNIAL-MEDICAL-CENTER_standardcharges.json?si=dpx-pt-json-access-policy&spr=https&sv=2026-02-06&sr=c&sig=ks%2BgfAjyEHlZmeP2PYJ%2F9NpMuCoRStjTb2bhIy9Y6LM%3D
 - hospital_id: hospital-001164
   name: CENTENNIAL MEDICAL CENTER AT ASHLAND CITY
   cms_hpt_url: https://www.tristarhealth.com/cms-hpt.txt
@@ -21155,6 +21156,7 @@ hospitals:
 - hospital_id: hospital-006488
   name: THE CHILDREN'S HOSPITAL AT TRISTAR CENTENNIAL
   cms_hpt_url: https://www.tristarhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1113737_TRISTAR-CENTENNIAL-MEDICAL-CENTER_standardcharges.json?si=dpx-pt-json-access-policy&spr=https&sv=2026-02-06&sr=c&sig=ks%2BgfAjyEHlZmeP2PYJ%2F9NpMuCoRStjTb2bhIy9Y6LM%3D
 - hospital_id: hospital-006489
   name: The Children's Hospital of Alabama
   cms_hpt_url: https://childrensal.org/cms-hpt.txt
@@ -21584,13 +21586,16 @@ hospitals:
   name: TRISTAR BELLEVUE FSER
   cms_hpt_url: https://www.tristarhealth.com/cms-hpt.txt
   locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1113737_TRISTAR-CENTENNIAL-MEDICAL-CENTER_standardcharges.json
+  fallback_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1113737_TRISTAR-CENTENNIAL-MEDICAL-CENTER_standardcharges.json?si=dpx-pt-json-access-policy&spr=https&sv=2026-02-06&sr=c&sig=ks%2BgfAjyEHlZmeP2PYJ%2F9NpMuCoRStjTb2bhIy9Y6LM%3D
 - hospital_id: hospital-006621
   name: TRISTAR CENTENNIAL PARTHENON PAVILION
   cms_hpt_url: https://www.tristarhealth.com/cms-hpt.txt
   locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1113737_TRISTAR-CENTENNIAL-MEDICAL-CENTER_standardcharges.json
+  fallback_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1113737_TRISTAR-CENTENNIAL-MEDICAL-CENTER_standardcharges.json?si=dpx-pt-json-access-policy&spr=https&sv=2026-02-06&sr=c&sig=ks%2BgfAjyEHlZmeP2PYJ%2F9NpMuCoRStjTb2bhIy9Y6LM%3D
 - hospital_id: hospital-006622
   name: TRISTAR CENTENNIAL PARTHEON PAVILION
   cms_hpt_url: https://www.tristarhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1113737_TRISTAR-CENTENNIAL-MEDICAL-CENTER_standardcharges.json?si=dpx-pt-json-access-policy&spr=https&sv=2026-02-06&sr=c&sig=ks%2BgfAjyEHlZmeP2PYJ%2F9NpMuCoRStjTb2bhIy9Y6LM%3D
 - hospital_id: hospital-006623
   name: TRISTAR CENTURY FARMS FSER
   cms_hpt_url: https://www.tristarhealth.com/cms-hpt.txt
@@ -21639,6 +21644,7 @@ hospitals:
 - hospital_id: hospital-006635
   name: Tristar Spring Hill ER
   cms_hpt_url: https://www.tristarhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1113737_TRISTAR-CENTENNIAL-MEDICAL-CENTER_standardcharges.json?si=dpx-pt-json-access-policy&spr=https&sv=2026-02-06&sr=c&sig=ks%2BgfAjyEHlZmeP2PYJ%2F9NpMuCoRStjTb2bhIy9Y6LM%3D
 - hospital_id: hospital-006636
   name: TRISTAR STONECREST MEDICAL CENTER
   cms_hpt_url: https://www.tristarhealth.com/cms-hpt.txt
