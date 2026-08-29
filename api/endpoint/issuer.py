@@ -45,6 +45,186 @@ def _row_to_dict(row):
         return {}
 
 
+async def _load_issuer_plans(session, issuer_id):
+    plans_stmt = (
+        select(
+            plan_table,
+            plan_network_tier_table.c.checksum_network.label("network_checksum"),
+            plan_network_tier_table.c.network_tier.label("network_tier_value"),
+        )
+        .select_from(
+            plan_table.outerjoin(
+                plan_network_tier_table,
+                and_(
+                    plan_table.c.plan_id == plan_network_tier_table.c.plan_id,
+                    plan_table.c.year == plan_network_tier_table.c.year,
+                ),
+            )
+        )
+        .where(plan_table.c.issuer_id == issuer_id)
+        .order_by(plan_table.c.year.desc(), plan_table.c.marketing_name.asc())
+    )
+    plans_result = await session.execute(plans_stmt)
+    plans = []
+    plan_by_key = {}
+    for plan_result_row in plans_result:
+        row_dict = _row_to_dict(plan_result_row)
+        plan_key = (row_dict.get("plan_id"), row_dict.get("year"))
+        plan_data_by_field = plan_by_key.get(plan_key)
+        if plan_data_by_field is None:
+            plan_data_by_field = {
+                column.name: row_dict.get(column.name)
+                for column in plan_table.c
+            }
+            plan_data_by_field["network"] = {
+                "cmsgov_network": plan_data_by_field.get("network")
+            }
+            plan_by_key[plan_key] = plan_data_by_field
+            plans.append(plan_data_by_field)
+        checksum_network = row_dict.get("network_checksum")
+        network_tier = row_dict.get("network_tier_value")
+        if checksum_network is not None:
+            display_name = (network_tier or "N/A").replace("-", " ").replace("  ", " ")
+            plan_data_by_field["network"].update(
+                {
+                    "network_tier": network_tier or "N/A",
+                    "display_name": display_name,
+                    "checksum": checksum_network,
+                }
+            )
+    return plans
+
+
+def _build_issuer_drug_summary(stats_map, tier_rows):
+    tiers = []
+    for tier_summary_row in tier_rows:
+        label = tier_summary_row[0] or "UNKNOWN"
+        tiers.append(
+            {
+                "tier_slug": normalize_drug_tier_slug(label),
+                "tier_label": label,
+                "drug_count": int(tier_summary_row[1] or 0),
+            }
+        )
+    tiers.sort(key=lambda entry: (-entry["drug_count"], entry["tier_slug"]))
+    return {
+        "total_drugs": int(stats_map.get("total_drugs") or 0),
+        "authorization": {
+            "required": int(stats_map.get("auth_required") or 0),
+            "not_required": int(stats_map.get("auth_not_required") or 0),
+        },
+        "step_therapy": {
+            "required": int(stats_map.get("step_required") or 0),
+            "not_required": int(stats_map.get("step_not_required") or 0),
+        },
+        "quantity_limits": {
+            "has_limit": int(stats_map.get("quantity_limit") or 0),
+            "no_limit": int(stats_map.get("quantity_no_limit") or 0),
+        },
+        "tiers": tiers,
+    }
+
+
+async def _load_issuer_drug_summary(session, issuer_id):
+    stats_stmt = (
+        select(
+            func.coalesce(func.sum(plan_drug_stats_table.c.total_drugs), 0).label("total_drugs"),
+            func.coalesce(func.sum(plan_drug_stats_table.c.auth_required), 0).label("auth_required"),
+            func.coalesce(func.sum(plan_drug_stats_table.c.auth_not_required), 0).label("auth_not_required"),
+            func.coalesce(func.sum(plan_drug_stats_table.c.step_required), 0).label("step_required"),
+            func.coalesce(func.sum(plan_drug_stats_table.c.step_not_required), 0).label("step_not_required"),
+            func.coalesce(func.sum(plan_drug_stats_table.c.quantity_limit), 0).label("quantity_limit"),
+            func.coalesce(func.sum(plan_drug_stats_table.c.quantity_no_limit), 0).label("quantity_no_limit"),
+        )
+        .select_from(
+            plan_drug_stats_table.join(
+                plan_table, plan_drug_stats_table.c.plan_id == plan_table.c.plan_id
+            )
+        )
+        .where(plan_table.c.issuer_id == issuer_id)
+    )
+    stats_row = (await session.execute(stats_stmt)).first()
+    stats_map = getattr(stats_row, "_mapping", {}) if stats_row else {}
+    tier_stmt = (
+        select(
+            plan_drug_tier_table.c.drug_tier,
+            func.coalesce(func.sum(plan_drug_tier_table.c.drug_count), 0).label("drug_count"),
+        )
+        .select_from(
+            plan_drug_tier_table.join(
+                plan_table, plan_drug_tier_table.c.plan_id == plan_table.c.plan_id
+            )
+        )
+        .where(plan_table.c.issuer_id == issuer_id)
+        .group_by(plan_drug_tier_table.c.drug_tier)
+    )
+    tier_rows = (await session.execute(tier_stmt)).all()
+    return _build_issuer_drug_summary(stats_map, tier_rows)
+
+
+def _parse_issuer_list_args(args, state):
+    requested_state = state or args.get("state")
+    state_filter = requested_state.upper() if requested_state else None
+    if state_filter and len(state_filter) != 2:
+        raise sanic.exceptions.BadRequest("state must be a 2-letter code")
+    query_text = str(args.get("q") or "").strip().lower()
+    # Explicit access keeps route/query introspection in sync with OpenAPI.
+    args.get("page")
+    args.get("limit")
+    args.get("offset")
+    args.get("start")
+    args.get("page_size")
+    pagination = None
+    if any(
+        args.get(name) not in (None, "", "null")
+        for name in ("page", "limit", "offset", "start", "page_size")
+    ):
+        pagination = parse_pagination(
+            args,
+            default_limit=50,
+            max_limit=200,
+            default_page=1,
+            allow_offset=True,
+            allow_start=True,
+            allow_page_size=True,
+        )
+    return state_filter, query_text, pagination
+
+
+async def _load_issuer_count_maps(session, state_filter):
+    error_stmt = select(
+        import_log_table.c.issuer_id,
+        sa_db.func.count(import_log_table.c.issuer_id),
+    ).group_by(import_log_table.c.issuer_id)
+    if state_filter:
+        error_stmt = error_stmt.select_from(
+            import_log_table.join(
+                issuer_table, import_log_table.c.issuer_id == issuer_table.c.issuer_id
+            )
+        ).where(issuer_table.c.state == state_filter)
+    error_rows = await session.execute(error_stmt)
+    error_count_by_issuer = {
+        error_count_row[0]: error_count_row[1]
+        for error_count_row in error_rows
+    }
+    plan_stmt = select(
+        plan_table.c.issuer_id,
+        sa_db.func.count(plan_table.c.issuer_id),
+    ).group_by(plan_table.c.issuer_id)
+    if state_filter:
+        plan_stmt = plan_stmt.select_from(
+            plan_table.join(
+                issuer_table, plan_table.c.issuer_id == issuer_table.c.issuer_id
+            )
+        ).where(issuer_table.c.state == state_filter)
+    plan_rows = await session.execute(plan_stmt)
+    plan_count_by_issuer = {
+        plan_count_row[0]: plan_count_row[1]
+        for plan_count_row in plan_rows
+    }
+    return error_count_by_issuer, plan_count_by_issuer
+
+
 @blueprint.get("/id/<issuer_id>")
 async def get_issuer_data(request, issuer_id):
     """Return the requested issuer and its related plan metadata."""
@@ -70,126 +250,10 @@ async def get_issuer_data(request, issuer_id):
     )
     issuer_data["import_errors"] = error_result.scalar() or 0
 
-    plans_stmt = (
-        select(
-            plan_table,
-            plan_network_tier_table.c.checksum_network.label("network_checksum"),
-            plan_network_tier_table.c.network_tier.label("network_tier_value"),
-        )
-        .select_from(
-            plan_table.outerjoin(
-                plan_network_tier_table,
-                and_(
-                    plan_table.c.plan_id == plan_network_tier_table.c.plan_id,
-                    plan_table.c.year == plan_network_tier_table.c.year,
-                ),
-            )
-        )
-        .where(plan_table.c.issuer_id == issuer_id)
-        .order_by(plan_table.c.year.desc(), plan_table.c.marketing_name.asc())
-    )
-
-    plans_result = await session.execute(plans_stmt)
-    plans = []
-    plan_by_key = {}
-
-    for plan_result_row in plans_result:
-        row_dict = _row_to_dict(plan_result_row)
-        plan_key = (row_dict.get("plan_id"), row_dict.get("year"))
-
-        plan_data_by_field = plan_by_key.get(plan_key)
-        if plan_data_by_field is None:
-            plan_data_by_field = {
-                column.name: row_dict.get(column.name)
-                for column in plan_table.c
-            }
-            plan_data_by_field["network"] = {
-                "cmsgov_network": plan_data_by_field.get("network")
-            }
-            plan_by_key[plan_key] = plan_data_by_field
-            plans.append(plan_data_by_field)
-
-        checksum_network = row_dict.get("network_checksum")
-        network_tier = row_dict.get("network_tier_value")
-        if checksum_network is not None:
-            display_name = (network_tier or "N/A").replace("-", " ").replace("  ", " ")
-            plan_data_by_field["network"].update(
-                {
-                    "network_tier": network_tier or "N/A",
-                    "display_name": display_name,
-                    "checksum": checksum_network,
-                }
-            )
-
+    plans = await _load_issuer_plans(session, issuer_id)
     issuer_data["plans"] = plans
     issuer_data["plans_count"] = len(plans)
-
-    stats_stmt = (
-        select(
-            func.coalesce(func.sum(plan_drug_stats_table.c.total_drugs), 0).label("total_drugs"),
-            func.coalesce(func.sum(plan_drug_stats_table.c.auth_required), 0).label("auth_required"),
-            func.coalesce(func.sum(plan_drug_stats_table.c.auth_not_required), 0).label("auth_not_required"),
-            func.coalesce(func.sum(plan_drug_stats_table.c.step_required), 0).label("step_required"),
-            func.coalesce(func.sum(plan_drug_stats_table.c.step_not_required), 0).label("step_not_required"),
-            func.coalesce(func.sum(plan_drug_stats_table.c.quantity_limit), 0).label("quantity_limit"),
-            func.coalesce(func.sum(plan_drug_stats_table.c.quantity_no_limit), 0).label("quantity_no_limit"),
-        )
-        .select_from(
-            plan_drug_stats_table.join(
-                plan_table, plan_drug_stats_table.c.plan_id == plan_table.c.plan_id
-            )
-        )
-        .where(plan_table.c.issuer_id == issuer_id)
-    )
-    stats_result = await session.execute(stats_stmt)
-    stats_row = stats_result.first()
-    stats_map = getattr(stats_row, "_mapping", {}) if stats_row else {}
-    drug_summary_by_field = {
-        "total_drugs": int(stats_map.get("total_drugs") or 0),
-        "authorization": {
-            "required": int(stats_map.get("auth_required") or 0),
-            "not_required": int(stats_map.get("auth_not_required") or 0),
-        },
-        "step_therapy": {
-            "required": int(stats_map.get("step_required") or 0),
-            "not_required": int(stats_map.get("step_not_required") or 0),
-        },
-        "quantity_limits": {
-            "has_limit": int(stats_map.get("quantity_limit") or 0),
-            "no_limit": int(stats_map.get("quantity_no_limit") or 0),
-        },
-        "tiers": [],
-    }
-
-    tier_stmt = (
-        select(
-            plan_drug_tier_table.c.drug_tier,
-            func.coalesce(func.sum(plan_drug_tier_table.c.drug_count), 0).label("drug_count"),
-        )
-        .select_from(
-            plan_drug_tier_table.join(
-                plan_table, plan_drug_tier_table.c.plan_id == plan_table.c.plan_id
-            )
-        )
-        .where(plan_table.c.issuer_id == issuer_id)
-        .group_by(plan_drug_tier_table.c.drug_tier)
-    )
-    tier_rows = (await session.execute(tier_stmt)).all()
-    tiers = []
-    for tier_summary_row in tier_rows:
-        label = tier_summary_row[0] or "UNKNOWN"
-        tiers.append(
-            {
-                "tier_slug": normalize_drug_tier_slug(label),
-                "tier_label": label,
-                "drug_count": int(tier_summary_row[1] or 0),
-            }
-        )
-    tiers.sort(key=lambda entry: (-entry["drug_count"], entry["tier_slug"]))
-    drug_summary_by_field["tiers"] = tiers
-
-    issuer_data["drug_summary"] = drug_summary_by_field
-
+    issuer_data["drug_summary"] = await _load_issuer_drug_summary(session, issuer_id)
     return response.json(issuer_data, default=str)
 
 
@@ -201,32 +265,15 @@ async def get_issuers(request, state=None):
     if session is None:
         raise RuntimeError("SQLAlchemy session not available on request context")
 
-    requested_state = state or request.args.get("state")
-    state_filter = requested_state.upper() if requested_state else None
-    if state_filter and len(state_filter) != 2:
-        raise sanic.exceptions.BadRequest("state must be a 2-letter code")
-    query_text = str(request.args.get("q") or "").strip().lower()
     # Explicit access keeps route/query introspection in sync with OpenAPI.
+    request.args.get("state")
+    request.args.get("q")
     request.args.get("page")
     request.args.get("limit")
     request.args.get("offset")
     request.args.get("start")
     request.args.get("page_size")
-
-    pagination = None
-    if any(
-        request.args.get(name) not in (None, "", "null")
-        for name in ("page", "limit", "offset", "start", "page_size")
-    ):
-        pagination = parse_pagination(
-            request.args,
-            default_limit=50,
-            max_limit=200,
-            default_page=1,
-            allow_offset=True,
-            allow_start=True,
-            allow_page_size=True,
-        )
+    state_filter, query_text, pagination = _parse_issuer_list_args(request.args, state)
 
     issuer_stmt = select(issuer_table)
     if state_filter:
@@ -254,39 +301,9 @@ async def get_issuers(request, state=None):
         if not issuers:
             raise sanic.exceptions.NotFound
 
-    error_stmt = select(
-        import_log_table.c.issuer_id,
-        sa_db.func.count(import_log_table.c.issuer_id),
-    ).group_by(import_log_table.c.issuer_id)
-    if state_filter:
-        error_stmt = error_stmt.select_from(
-            import_log_table.join(
-                issuer_table, import_log_table.c.issuer_id == issuer_table.c.issuer_id
-            )
-        ).where(issuer_table.c.state == state_filter)
-
-    error_rows = await session.execute(error_stmt)
-    error_count_by_issuer = {
-        error_count_row[0]: error_count_row[1]
-        for error_count_row in error_rows
-    }
-
-    plan_stmt = select(
-        plan_table.c.issuer_id,
-        sa_db.func.count(plan_table.c.issuer_id),
-    ).group_by(plan_table.c.issuer_id)
-    if state_filter:
-        plan_stmt = plan_stmt.select_from(
-            plan_table.join(
-                issuer_table, plan_table.c.issuer_id == issuer_table.c.issuer_id
-            )
-        ).where(issuer_table.c.state == state_filter)
-
-    plan_rows = await session.execute(plan_stmt)
-    plan_count_by_issuer = {
-        plan_count_row[0]: plan_count_row[1]
-        for plan_count_row in plan_rows
-    }
+    error_count_by_issuer, plan_count_by_issuer = await _load_issuer_count_maps(
+        session, state_filter
+    )
 
     for issuer in issuers:
         issuer_id = issuer.get("issuer_id")
