@@ -2619,20 +2619,30 @@ def _validate_provider_directory_profile_execution_params(
         raise ValueError(str(exc)) from exc
 
 
-def _validate_hospital_price_admission(params: dict[str, Any]) -> None:
+def _validate_hospital_price_admission(params: dict[str, Any]) -> dict[str, Any]:
     hospitals = selected_hospital_hpt_registry(params)
     configured_resource_limits(
         hospital_price_artifact_store(), len(locator_groups(hospitals))
     )
+    if params.get("all_hospitals") is True:
+        return dict(params)
+    return {
+        **{
+            name: value
+            for name, value in params.items()
+            if name not in {"hospital_id", "hospital_ids"}
+        },
+        "hospital_ids": [hospital["hospital_id"] for hospital in hospitals],
+    }
 
 
 async def _validate_hospital_price_params(
     importer: str, params: dict[str, Any]
-) -> None:
+) -> dict[str, Any] | None:
     if importer != "hospital-prices":
-        return
+        return None
     try:
-        await asyncio.to_thread(_validate_hospital_price_admission, params)
+        return await asyncio.to_thread(_validate_hospital_price_admission, params)
     except ValueError as exc:
         raise ValueError(str(exc)) from exc
 
@@ -2938,7 +2948,11 @@ async def create_import_run(
         importer,
         effective_params_by_name,
     )
-    await _validate_hospital_price_params(importer, effective_params_by_name)
+    validated_hospital_params = await _validate_hospital_price_params(
+        importer, effective_params_by_name
+    )
+    if validated_hospital_params is not None:
+        effective_params_by_name = validated_hospital_params
     if importer == "provider-directory-fhir":
         validated_publication_candidate_from_params(
             effective_params_by_name

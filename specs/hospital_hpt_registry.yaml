@@ -234,12 +234,13 @@ hospitals:
   name: Advanced Care Hospital of Northern Colorado, LLC
   cms_hpt_url: https://ncltah.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-000063
-  name: Advanced Specialty Hospital of Toledo
+  name: Advanced Specialty Hospitals of Toledo
   cms_hpt_url: https://www.advancedspecialtyhospitals.com/cms-hpt.txt
   locator_name: Advanced Specialty Hospitals of Toledo
 - hospital_id: hospital-000064
   name: Advanced Specialty Hospitals of Toledo
   cms_hpt_url: https://www.advancedspecialtyhospitals.com/cms-hpt.txt
+  alias_of: hospital-000063
 - hospital_id: hospital-000065
   name: Advanced Surgical Hospital
   cms_hpt_url: https://www.ashospital.net/cms-hpt.txt
@@ -414,9 +415,11 @@ hospitals:
 - hospital_id: hospital-000122
   name: ADVENTIST HEALTH DELANO
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  locator_name: ADVENTIST HEALTH DELANO
 - hospital_id: hospital-000123
   name: ADVENTIST HEALTH DELANO
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  alias_of: hospital-000122
 - hospital_id: hospital-000124
   name: ADVENTIST HEALTH MEDICAL CENTER TEHACHAPI
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
@@ -538,6 +541,7 @@ hospitals:
 - hospital_id: hospital-000162
   name: Allen County Regional Hospital
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-000161
 - hospital_id: hospital-000163
   name: Allen Hospital
   cms_hpt_url: https://www.mercy.com/cms-hpt.txt
@@ -4362,12 +4366,14 @@ hospitals:
 - hospital_id: hospital-001338
   name: CHP-LVHN JV, LLC d/b/a Lehigh Valley Hospital - Gilbertsville
   cms_hpt_url: https://www.lvhn.org/cms-hpt.txt
+  alias_of: hospital-001337
 - hospital_id: hospital-001339
   name: CHP-LVHN JV, LLC d/b/a Lehigh Valley Hospital - Macungie
   cms_hpt_url: https://www.lvhn.org/cms-hpt.txt
 - hospital_id: hospital-001340
   name: CHP-LVHN JV, LLC d/b/a Lehigh Valley Hospital - Macungie
   cms_hpt_url: https://www.lvhn.org/cms-hpt.txt
+  alias_of: hospital-001339
 - hospital_id: hospital-001341
   name: Chris Kyle Patriots Hospital
   cms_hpt_url: https://northstarbehavioral.com/cms-hpt.txt
@@ -4825,13 +4831,16 @@ hospitals:
 - hospital_id: hospital-001484
   name: COLON & RECTAL SURGERY OF LAS VEGAS
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-001483
 - hospital_id: hospital-001485
   name: COLON AND RECTAL SURGERY OF LAS VEGAS
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-001483
   locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1762537_SUNRISE-HOSPITAL-AND-MEDICAL-CENTER_standardcharges.json
 - hospital_id: hospital-001486
   name: COLON AND RECTAL SURGERY OF LAS VEGAS
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-001483
   locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1762537_SUNRISE-HOSPITAL-AND-MEDICAL-CENTER_standardcharges.json
 - hospital_id: hospital-001487
   name: Colorado River Medical Center
@@ -5457,10 +5466,12 @@ hospitals:
 - hospital_id: hospital-001679
   name: Crittenton Children’s Center
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-001678
   locator_mrf_url: https://www.saintlukeskc.org/hpt/46/440545297_SaintLukesHospitalCrittentonChildrensCenter_standardcharges.json
 - hospital_id: hospital-001680
   name: Crittenton Children’s Center
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-001678
   locator_mrf_url: https://www.saintlukeskc.org/hpt/46/440545297_SaintLukesHospitalCrittentonChildrensCenter_standardcharges.json
 - hospital_id: hospital-001681
   name: CRMC Medical Group LLC
@@ -5485,6 +5496,7 @@ hospitals:
 - hospital_id: hospital-001687
   name: CRYSTAL CLINIC ORTHOPAEDIC CENTER
   cms_hpt_url: https://crystalclinic.com/cms-hpt.txt
+  alias_of: hospital-001686
 - hospital_id: hospital-001688
   name: Cuba Memorial Hospital
   cms_hpt_url: https://www.cubamemorialhospital.com/cms-hpt.txt
@@ -5893,22 +5905,24 @@ hospitals:
   name: Doctors Memorial Hospital
   cms_hpt_url: https://www.doctorsmemorial.com/cms-hpt.txt
 - hospital_id: hospital-001813
-  name: Doctors' Center Hospital - Bayamon
+  name: Doctors' Center Hospital - Bayamón
   cms_hpt_url: https://www.doctorscenterhospital.com/cms-hpt.txt
   locator_name: Doctors' Center Hospital - Bayamón
 - hospital_id: hospital-001814
   name: Doctors' Center Hospital - Bayamón
   cms_hpt_url: https://www.doctorscenterhospital.com/cms-hpt.txt
+  alias_of: hospital-001813
 - hospital_id: hospital-001815
   name: Doctors' Center Hospital - Dorado
   cms_hpt_url: https://www.doctorscenterhospital.com/cms-hpt.txt
 - hospital_id: hospital-001816
-  name: Doctors' Center Hospital - Manati
+  name: Doctors' Center Hospital - Manatí
   cms_hpt_url: https://www.doctorscenterhospital.com/cms-hpt.txt
   locator_name: Doctors' Center Hospital - Manatí
 - hospital_id: hospital-001817
   name: Doctors' Center Hospital - Manatí
   cms_hpt_url: https://www.doctorscenterhospital.com/cms-hpt.txt
+  alias_of: hospital-001816
 - hospital_id: hospital-001818
   name: Doctors' Center Hospital - San Fernando de Carolina
   cms_hpt_url: https://www.doctorscenterhospital.com/cms-hpt.txt
@@ -6766,6 +6780,7 @@ hospitals:
 - hospital_id: hospital-002092
   name: ER AT BOULDER'S EDGE FSER
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-002091
   locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1762537_SUNRISE-HOSPITAL-AND-MEDICAL-CENTER_standardcharges.json
 - hospital_id: hospital-002093
   name: ER at Cadence
@@ -8171,9 +8186,11 @@ hospitals:
 - hospital_id: hospital-002519
   name: HANFORD COMMUNITY HOSPITAL
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  locator_name: HANFORD COMMUNITY HOSPITAL
 - hospital_id: hospital-002520
   name: HANFORD COMMUNITY HOSPITAL
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  alias_of: hospital-002519
 - hospital_id: hospital-002521
   name: Hannibal Regional Hospital
   cms_hpt_url: https://hannibalregional.org/cms-hpt.txt
@@ -11399,6 +11416,7 @@ hospitals:
 - hospital_id: hospital-003503
   name: LAS VEGAS HEART ASSOCIATES
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-003502
 - hospital_id: hospital-003504
   name: Las Vegas-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
@@ -13208,6 +13226,7 @@ hospitals:
 - hospital_id: hospital-004056
   name: Mercy Hospital St Louis
   cms_hpt_url: https://www.mercy.net/cms-hpt.txt
+  alias_of: hospital-004048
 - hospital_id: hospital-004057
   name: Mercy Hospital Stoddard
   cms_hpt_url: https://www.mercy.net/cms-hpt.txt
@@ -13795,6 +13814,7 @@ hospitals:
 - hospital_id: hospital-004231
   name: Meyer Orthopedic and Rehabilitation Hospital
   cms_hpt_url: https://www.coxhealth.com/cms-hpt.txt
+  alias_of: hospital-004230
 - hospital_id: hospital-004232
   name: MH 24 HR Emergency Center
   cms_hpt_url: https://memorialhermann.org/cms-hpt.txt
@@ -14210,6 +14230,7 @@ hospitals:
 - hospital_id: hospital-004358
   name: Mount Carmel St Anns
   cms_hpt_url: https://www.mountcarmelhealth.com/cms-hpt.txt
+  alias_of: hospital-004357
 - hospital_id: hospital-004359
   name: Mount Desert Island Hospital
   cms_hpt_url: https://www.mdihospital.org/cms-hpt.txt
@@ -14283,18 +14304,21 @@ hospitals:
   name: Mountains Community Hospital
   cms_hpt_url: https://www.mchcares.com/cms-hpt.txt
 - hospital_id: hospital-004382
-  name: MOUNTAINVIEW CARDIOVASCULAR &THORACIC
+  name: MOUNTAINVIEW CARDIOVASCULAR & THORACIC
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
 - hospital_id: hospital-004383
   name: MOUNTAINVIEW CARDIOVASCULAR &THORACIC
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-004382
 - hospital_id: hospital-004384
   name: MOUNTAINVIEW CARDIOVASCULAR ANDTHORACIC
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-004382
   locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1762537_SUNRISE-HOSPITAL-AND-MEDICAL-CENTER_standardcharges.json
 - hospital_id: hospital-004385
   name: MOUNTAINVIEW CARDIOVASCULAR ANDTHORACIC
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-004382
   locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1762537_SUNRISE-HOSPITAL-AND-MEDICAL-CENTER_standardcharges.json
 - hospital_id: hospital-004386
   name: MOUNTAINVIEW HOSPITAL
@@ -14309,6 +14333,7 @@ hospitals:
 - hospital_id: hospital-004389
   name: MOUNTAINVIEW MEDICAL ASSOCIATES
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-004388
 - hospital_id: hospital-004390
   name: Mountainview Medical Center
   cms_hpt_url: https://www.mvmc.org/cms-hpt.txt
@@ -14318,13 +14343,16 @@ hospitals:
 - hospital_id: hospital-004392
   name: MOUNTAINVIEW PM&R
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-004391
 - hospital_id: hospital-004393
   name: MOUNTAINVIEW PMANDR
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-004391
   locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1762537_SUNRISE-HOSPITAL-AND-MEDICAL-CENTER_standardcharges.json
 - hospital_id: hospital-004394
   name: MOUNTAINVIEW PMANDR
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-004391
   locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1762537_SUNRISE-HOSPITAL-AND-MEDICAL-CENTER_standardcharges.json
 - hospital_id: hospital-004395
   name: Mountainview Regional Medical Center
@@ -14759,6 +14787,7 @@ hospitals:
 - hospital_id: hospital-004520
   name: NEVADA CARDIOVASCULAR AND THORACIC INST
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-004519
 - hospital_id: hospital-004521
   name: Nevada City Hospital dba Nevada Regional Medical Center
   cms_hpt_url: https://www.nrmchealth.com/cms-hpt.txt
@@ -14768,6 +14797,7 @@ hospitals:
 - hospital_id: hospital-004523
   name: NEVADA NEUROSCIENCES INSTITUTE
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-004522
 - hospital_id: hospital-004524
   name: Nevada Regional Medical Center
   cms_hpt_url: https://www.nrmchealth.com/cms-hpt.txt
@@ -15230,9 +15260,11 @@ hospitals:
 - hospital_id: hospital-004666
   name: NORTHWEST MEDICAL FOUNDATION OF TILLAMOOK
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  locator_name: NORTHWEST MEDICAL FOUNDATION OF TILLAMOOK
 - hospital_id: hospital-004667
   name: NORTHWEST MEDICAL FOUNDATION OF TILLAMOOK
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  alias_of: hospital-004666
 - hospital_id: hospital-004668
   name: Northwest Specialty Hospital
   cms_hpt_url: https://www.northwestspecialtyhospital.com/cms-hpt.txt
@@ -17357,9 +17389,11 @@ hospitals:
 - hospital_id: hospital-005328
   name: REEDLEY COMMUNITY HOSPITAL
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  locator_name: REEDLEY COMMUNITY HOSPITAL
 - hospital_id: hospital-005329
   name: REEDLEY COMMUNITY HOSPITAL
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  alias_of: hospital-005328
 - hospital_id: hospital-005330
   name: Reeves Memorial Medical Center
   cms_hpt_url: https://reevesmemorial.com/cms-hpt.txt
@@ -18123,30 +18157,38 @@ hospitals:
 - hospital_id: hospital-005562
   name: Saint Luke's East Hospital
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-005561
 - hospital_id: hospital-005563
   name: Saint Luke's Hospital Crittenton Children's Center
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-001678
 - hospital_id: hospital-005564
   name: Saint Luke's Hospital Crittenton Children's Center
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-001678
 - hospital_id: hospital-005565
   name: Saint Luke's Hospital Crittenton Children's Center
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-001678
 - hospital_id: hospital-005566
   name: Saint Luke's Hospital of Kansas City
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
 - hospital_id: hospital-005567
   name: Saint Luke's Hospital of Kansas City
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-005566
 - hospital_id: hospital-005568
   name: Saint Luke's Hospital of Kansas City
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-005566
 - hospital_id: hospital-005569
   name: Saint Luke's Hospital of Kansas City
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-005566
 - hospital_id: hospital-005570
   name: Saint Luke's Hospital of Kansas City
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-005566
 - hospital_id: hospital-005571
   name: Saint Luke's North Hospital
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
@@ -18156,6 +18198,7 @@ hospitals:
 - hospital_id: hospital-005573
   name: Saint Luke’s North Hospital – Smithville
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-005572
 - hospital_id: hospital-005574
   name: Saint Luke's South Hospital
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
@@ -18463,6 +18506,7 @@ hospitals:
 - hospital_id: hospital-005664
   name: SARAH CANNON BMT CLINIC AT MVH
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-005663
 - hospital_id: hospital-005665
   name: Sarasota Memorial Emergency Room at North Port
   cms_hpt_url: https://www.smh.com/cms-hpt.txt
@@ -18989,18 +19033,21 @@ hospitals:
 - hospital_id: hospital-005825
   name: SLS - MOUNTAINVIEW HOSPITAL
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-005824
 - hospital_id: hospital-005826
   name: SLS - SOUTHERN HILLS & MC LV
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
 - hospital_id: hospital-005827
   name: SLS - SOUTHERN HILLS & MC LV
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-005826
 - hospital_id: hospital-005828
   name: SLS - SUNRISE HOSPITAL AND MC
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
 - hospital_id: hospital-005829
   name: SLS - SUNRISE HOSPITAL AND MC
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-005828
 - hospital_id: hospital-005830
   name: SMITH COUNTY MEMORIAL HOSPITAL
   cms_hpt_url: https://www.scmhks.org/cms-hpt.txt
@@ -19270,6 +19317,7 @@ hospitals:
 - hospital_id: hospital-005910
   name: SOUTHERN HILLS CRITICAL CARE ASSOCIATES
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-005909
 - hospital_id: hospital-005911
   name: SOUTHERN HILLS HOSPITAL & MEDICAL CENTER-LAS VEGAS
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
@@ -20319,22 +20367,27 @@ hospitals:
 - hospital_id: hospital-006229
   name: St. Lukes Hospital of Kansas City
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-005566
   locator_mrf_url: https://www.saintlukeskc.org/hpt/21/440545297_SaintLukesHospitalofKansasCity_standardcharges.json
 - hospital_id: hospital-006230
   name: St. Lukes Hospital of Kansas City
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-005566
   locator_mrf_url: https://www.saintlukeskc.org/hpt/21/440545297_SaintLukesHospitalofKansasCity_standardcharges.json
 - hospital_id: hospital-006231
   name: St. Lukes Hospital of Kansas City
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-005566
   locator_mrf_url: https://www.saintlukeskc.org/hpt/21/440545297_SaintLukesHospitalofKansasCity_standardcharges.json
 - hospital_id: hospital-006232
   name: St. Lukes Hospital of Kansas City
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-005566
   locator_mrf_url: https://www.saintlukeskc.org/hpt/21/440545297_SaintLukesHospitalofKansasCity_standardcharges.json
 - hospital_id: hospital-006233
   name: St. Lukes Hospital of Kansas City
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-005566
   locator_mrf_url: https://www.saintlukeskc.org/hpt/21/440545297_SaintLukesHospitalofKansasCity_standardcharges.json
 - hospital_id: hospital-006234
   name: St. Mary Medical Center
@@ -20453,6 +20506,7 @@ hospitals:
 - hospital_id: hospital-006268
   name: St. Vincent Health
   cms_hpt_url: https://stvincent.health/cms-hpt.txt
+  alias_of: hospital-005583
 - hospital_id: hospital-006269
   name: St. Vincent Healthcare
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
@@ -20740,6 +20794,7 @@ hospitals:
 - hospital_id: hospital-006359
   name: SUNRISE BURN
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-006358
 - hospital_id: hospital-006360
   name: SUNRISE PEDS CONGENITAL HEART
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
@@ -20747,6 +20802,7 @@ hospitals:
 - hospital_id: hospital-006361
   name: SUNRISE PEDS CONGENITAL HEART
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
+  alias_of: hospital-006360
   locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1762537_SUNRISE-HOSPITAL-AND-MEDICAL-CENTER_standardcharges.json
 - hospital_id: hospital-006362
   name: Sunrise Vista Behavioral Hospital
@@ -21867,6 +21923,7 @@ hospitals:
 - hospital_id: hospital-006703
   name: UM Rehabilitation and Orthopaedic Institute
   cms_hpt_url: https://www.umms.org/cms-hpt.txt
+  alias_of: hospital-006702
   locator_mrf_url: https://www.umms.org/standard-charges/520591639_UM-Rehabilitation-and-Orthopaedic-Institute_standardcharges.csv
 - hospital_id: hospital-006704
   name: UM Shore Emergency Center at Queenstown
@@ -23464,6 +23521,7 @@ hospitals:
 - hospital_id: hospital-007207
   name: Wright Memorial Hospital
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
+  alias_of: hospital-007206
 - hospital_id: hospital-007208
   name: Wright Ranch FED
   cms_hpt_url: https://www.doctorshosplaredo.com/cms-hpt.txt
@@ -23628,6 +23686,7 @@ hospitals:
 - hospital_id: hospital-007260
   name: Baptist Memorial Hospital-NEA
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000683
   locator_name: 26-1214372 NEA Baptist
 - hospital_id: hospital-007261
   name: OKTIBBEHA COUNTY HOSPITAL
@@ -23636,78 +23695,97 @@ hospitals:
 - hospital_id: hospital-007262
   name: Baptist Memorial Hospital - Leake
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000674
   locator_name: 45-2896080 MBMC Leake
 - hospital_id: hospital-007263
   name: Baptist Medical Center-Attala
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000672
   locator_name: 47-3684354 MBMC Attala
 - hospital_id: hospital-007264
   name: Baptist Memorial Hospital-Collierville
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000678
   locator_name: 62-0123940 BMH Collierville
 - hospital_id: hospital-007265
   name: Baptist Memorial Hospital-Women's
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000689
   locator_name: 62-0123940 BMH Women
 - hospital_id: hospital-007266
   name: Baptist Memorial Hospital-Memphis
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000682
   locator_name: 62-0123940_BMH Memphis
 - hospital_id: hospital-007267
   name: Baptist Memorial Hospital-Tipton
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000686
   locator_name: 62-1113167 BMH Tipton
 - hospital_id: hospital-007268
   name: Baptist Memorial Hospital-Union City
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000687
   locator_name: 62-1138045 BMH Union City
 - hospital_id: hospital-007269
   name: Baptist Memorial Hospital-Carroll County
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000677
   locator_name: 62-1166050 BMH Carroll County
 - hospital_id: hospital-007270
   name: Baptist Memorial Hospital-Golden Triangle
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000681
   locator_name: 62-1519754 BMH Golden Triangle
 - hospital_id: hospital-007271
   name: Baptist Memorial Hospital-Union County
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000688
   locator_name: 63-0997281 BMH Union County
 - hospital_id: hospital-007272
   name: Baptist Anderson Regional Medical Center
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000586
   locator_name: 64-0362400 Anderson Regional Main Campus
 - hospital_id: hospital-007273
   name: Baptist Anderson Regional Medical Center-South
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000587
   locator_name: 64-0362400 Anderson Regional South Campus
 - hospital_id: hospital-007274
   name: Baptist Memorial Hospital-Booneville
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000675
   locator_name: 64-0663760 BMH Booneville
 - hospital_id: hospital-007275
   name: Baptist Memorial Hospital-DeSoto
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000680
   locator_name: 64-0682111 BMH DeSoto
 - hospital_id: hospital-007276
   name: Baptist Memorial Hospital-North Mississippi
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000684
   locator_name: 64-0772726 BMH North Mississippi
 - hospital_id: hospital-007277
   name: Baptist Medical Center-Yazoo
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000673
   locator_name: 64-0844470 MBMC Yazoo
 - hospital_id: hospital-007278
   name: Mississippi Baptist Medical Center
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-004278
   locator_name: 64-0881013 MBMC Jackson
 - hospital_id: hospital-007279
   name: Baptist Memorial Hospital-Calhoun
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000676
   locator_name: 81-3257997 BMH Calhoun
 - hospital_id: hospital-007280
   name: Baptist Memorial Hospital-Crittenden
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  alias_of: hospital-000679
   locator_name: 82-3844150 BMH Crittenden
 - hospital_id: hospital-007281
   name: Arrowhead Family Health Center - Fontana

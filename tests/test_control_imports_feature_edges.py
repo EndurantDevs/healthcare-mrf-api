@@ -18,7 +18,12 @@ async def test_hospital_registry_validation_runs_off_event_loop(monkeypatch):
 
     def validate(_params):
         validation_threads.append(threading.get_ident())
-        return ({"cms_hpt_url": "https://hospital.example/cms-hpt.txt"},)
+        return (
+            {
+                "hospital_id": "hospital-000001",
+                "cms_hpt_url": "https://hospital.example/cms-hpt.txt",
+            },
+        )
 
     def capacity(store, locator_count):
         validation_threads.append(threading.get_ident())
@@ -31,10 +36,13 @@ async def test_hospital_registry_validation_runs_off_event_loop(monkeypatch):
     )
     monkeypatch.setattr(control_imports, "configured_resource_limits", capacity)
 
-    await control_imports._validate_hospital_price_params("hospital-prices", {})
+    normalized = await control_imports._validate_hospital_price_params(
+        "hospital-prices", {}
+    )
 
     assert len(validation_threads) == 2
     assert all(thread != event_loop_thread for thread in validation_threads)
+    assert normalized == {"hospital_ids": ["hospital-000001"]}
 
 
 @pytest.mark.asyncio

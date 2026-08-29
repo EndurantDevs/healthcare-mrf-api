@@ -20,13 +20,18 @@ HOSPITAL_HPT_REGISTRY_PATH = (
 )
 EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT = 7_314
 EXPECTED_HOSPITAL_HPT_REGISTRY_SHA256 = (
-    "e68a217b62e513c07d4e02a715c804c1d565c5c04cfd13d3a0589976b0695e52"
+    "5cf11fe915c0d51f7fa3b2652918405f2e63a030ff853bdd3d367c339ac64899"
 )
 MAX_HOSPITAL_HPT_SELECTION = 200
 _DOCUMENT_FIELDS = frozenset({"version", "hospitals"})
 _HOSPITAL_REQUIRED_FIELDS = frozenset({"hospital_id", "name", "cms_hpt_url"})
 _HOSPITAL_OPTIONAL_FIELDS = frozenset(
-    {"fallback_mrf_url", "locator_name", "locator_mrf_url"}
+    {
+        "alias_of",
+        "fallback_mrf_url",
+        "locator_name",
+        "locator_mrf_url",
+    }
 )
 _SELECTION_FIELDS = frozenset(
     {"hospital_id", "hospital_ids", "all_hospitals", "test_mode"}
@@ -73,6 +78,13 @@ def _strict_text(value: Any, field: str) -> str:
     return value
 
 
+def _validated_hospital_id(value: Any, field: str = "hospital_id") -> str:
+    hospital_id = _strict_text(value, field)
+    if any(character.isspace() for character in hospital_id):
+        raise _registry_error(f"{field}_invalid")
+    return hospital_id
+
+
 def _validated_http_url(value: Any, field: str) -> str:
     url = _strict_text(value, field)
     if any(character.isspace() for character in url) or "#" in url:
@@ -103,9 +115,69 @@ def _validated_mrf_selector(value: Any) -> str:
     return selector
 
 
+def _validate_hospital_aliases(hospitals: list[dict[str, str]]) -> None:
+    """Reject aliases without one same-locator canonical target."""
+
+    hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
+    for hospital in hospitals:
+        canonical_id = hospital.get("alias_of")
+        if canonical_id is None:
+            continue
+        canonical = hospital_by_id.get(canonical_id)
+        if (
+            canonical is None
+            or canonical is hospital
+            or canonical.get("alias_of") is not None
+            or canonical["cms_hpt_url"] != hospital["cms_hpt_url"]
+        ):
+            raise _registry_error("alias_of_invalid")
+
+
+def _validated_hospital_entry(
+    entry: Any, hospital_ids: set[str]
+) -> dict[str, str]:
+    """Validate one hospital entry and reserve its stable ID."""
+
+    fields = set(entry) if type(entry) is dict else set()
+    if (
+        type(entry) is not dict
+        or not _HOSPITAL_REQUIRED_FIELDS <= fields
+        or fields - _HOSPITAL_REQUIRED_FIELDS - _HOSPITAL_OPTIONAL_FIELDS
+    ):
+        raise _registry_error("hospital_fields")
+    hospital_id = _validated_hospital_id(entry["hospital_id"])
+    if hospital_id in hospital_ids:
+        raise _registry_error("duplicate_hospital_id")
+    hospital_ids.add(hospital_id)
+    hospital_by_field = {
+        "hospital_id": hospital_id,
+        "name": _strict_text(entry["name"], "name"),
+        "cms_hpt_url": _validated_locator(entry["cms_hpt_url"]),
+    }
+    if "locator_name" in entry:
+        hospital_by_field["locator_name"] = _strict_text(
+            entry["locator_name"], "locator_name"
+        )
+    if "locator_mrf_url" in entry:
+        hospital_by_field["locator_mrf_url"] = _validated_mrf_selector(
+            entry["locator_mrf_url"]
+        )
+    if "fallback_mrf_url" in entry:
+        hospital_by_field["fallback_mrf_url"] = _validated_http_url(
+            entry["fallback_mrf_url"], "fallback_mrf_url"
+        )
+    if "alias_of" in entry:
+        hospital_by_field["alias_of"] = _validated_hospital_id(
+            entry["alias_of"], "alias_of"
+        )
+    return hospital_by_field
+
+
 def _load_hospital_hpt_registry_path(
     registry_path: Path,
 ) -> tuple[dict[str, str], ...]:
+    """Load and validate one complete registry document."""
+
     try:
         document = yaml.load(
             registry_path.read_text(encoding="utf-8"),
@@ -128,37 +200,8 @@ def _load_hospital_hpt_registry_path(
     hospital_ids: set[str] = set()
     hospitals: list[dict[str, str]] = []
     for entry in document["hospitals"]:
-        fields = set(entry) if type(entry) is dict else set()
-        if (
-            type(entry) is not dict
-            or not _HOSPITAL_REQUIRED_FIELDS <= fields
-            or fields - _HOSPITAL_REQUIRED_FIELDS - _HOSPITAL_OPTIONAL_FIELDS
-        ):
-            raise _registry_error("hospital_fields")
-        hospital_id = _strict_text(entry["hospital_id"], "hospital_id")
-        if any(character.isspace() for character in hospital_id):
-            raise _registry_error("hospital_id_invalid")
-        if hospital_id in hospital_ids:
-            raise _registry_error("duplicate_hospital_id")
-        hospital_ids.add(hospital_id)
-        hospital_by_field = {
-            "hospital_id": hospital_id,
-            "name": _strict_text(entry["name"], "name"),
-            "cms_hpt_url": _validated_locator(entry["cms_hpt_url"]),
-        }
-        if "locator_name" in entry:
-            hospital_by_field["locator_name"] = _strict_text(
-                entry["locator_name"], "locator_name"
-            )
-        if "locator_mrf_url" in entry:
-            hospital_by_field["locator_mrf_url"] = _validated_mrf_selector(
-                entry["locator_mrf_url"]
-            )
-        if "fallback_mrf_url" in entry:
-            hospital_by_field["fallback_mrf_url"] = _validated_http_url(
-                entry["fallback_mrf_url"], "fallback_mrf_url"
-            )
-        hospitals.append(hospital_by_field)
+        hospitals.append(_validated_hospital_entry(entry, hospital_ids))
+    _validate_hospital_aliases(hospitals)
     return tuple(hospitals)
 
 
@@ -182,6 +225,25 @@ def load_hospital_hpt_registry() -> tuple[dict[str, str], ...]:
     """Load the fixed checked-in hospital locator registry."""
 
     return tuple(dict(hospital) for hospital in _cached_hospital_hpt_registry())
+
+
+def hospital_hpt_registry_groups() -> tuple[tuple[dict[str, str], ...], ...]:
+    """Group reviewed aliases under one canonical hospital identity."""
+
+    hospitals = load_hospital_hpt_registry()
+    groups_by_canonical_id: dict[str, list[dict[str, str]]] = {}
+    for hospital in hospitals:
+        canonical_id = hospital.get("alias_of", hospital["hospital_id"])
+        groups_by_canonical_id.setdefault(canonical_id, []).append(hospital)
+    return tuple(
+        tuple(
+            sorted(
+                groups_by_canonical_id[canonical_id],
+                key=lambda hospital: hospital["hospital_id"] != canonical_id,
+            )
+        )
+        for canonical_id in sorted(groups_by_canonical_id)
+    )
 
 
 def selected_hospital_hpt_registry(
@@ -220,12 +282,19 @@ def selected_hospital_hpt_registry(
         )
     else:
         hospital_ids = (hospital_id,)
-    selected_id_set = set(hospital_ids)
+    hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
+    if any(hospital_id not in hospital_by_id for hospital_id in hospital_ids):
+        raise _registry_error("hospital_id_unknown")
+    selected_canonical_ids = {
+        hospital_by_id[hospital_id].get("alias_of", hospital_id)
+        for hospital_id in hospital_ids
+    }
     selected_hospitals = tuple(
         hospital
         for hospital in hospitals
-        if hospital["hospital_id"] in selected_id_set
+        if hospital.get("alias_of", hospital["hospital_id"])
+        in selected_canonical_ids
     )
-    if len(selected_hospitals) != len(selected_id_set):
-        raise _registry_error("hospital_id_unknown")
+    if len(selected_hospitals) > MAX_HOSPITAL_HPT_SELECTION:
+        raise _registry_error("hospital_ids_invalid")
     return selected_hospitals
