@@ -111,8 +111,9 @@ def _line_field(
 ) -> tuple[str, str]:
     stripped_line = line.strip()
     if (
-        stripped_line.startswith(("http://", "https://"))
-        and {"location-name", "source-page-url"} <= fields_by_key.keys()
+        stripped_line.casefold().startswith(("http://", "https://"))
+        and fields_by_key.get("location-name")
+        and fields_by_key.get("source-page-url")
         and "mrf-url" not in fields_by_key
     ):
         return "mrf-url", stripped_line
