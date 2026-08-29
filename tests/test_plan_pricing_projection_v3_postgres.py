@@ -49,6 +49,7 @@ def _factorized_migration_statements(monkeypatch, schema: str) -> list[str]:
     module_spec.loader.exec_module(migration)
     statements: list[str] = []
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+    monkeypatch.setenv("DB_SCHEMA", schema)
     monkeypatch.setattr(migration.op, "execute", statements.append)
     migration.upgrade()
     return statements

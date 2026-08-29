@@ -8,6 +8,7 @@ from pathlib import Path
 
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+import pytest
 
 from tests.provider_directory_profile_capacity_v2_migration_support import (
     load_capacity_v2_migration,
@@ -74,6 +75,17 @@ def test_factorized_migration_is_additive_bounded_and_authenticated(
     assert "plan_pricing_rate_profile_cost_idx" in sql
     assert "BEFORE INSERT OR UPDATE OR DELETE" in sql
     assert "factorized plan-pricing projection receipt counts" in sql
+
+
+def test_factorized_migration_rejects_conflicting_schema_environment(
+    monkeypatch,
+) -> None:
+    migration = _migration("factorized_projection_schema_conflict")
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "factorized_test")
+    monkeypatch.setenv("DB_SCHEMA", "different_schema")
+
+    with pytest.raises(RuntimeError, match="must identify the same schema"):
+        migration.upgrade()
 
 
 def test_factorized_downgrade_refuses_immutable_v3_candidates(monkeypatch) -> None:
