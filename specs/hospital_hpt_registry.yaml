@@ -23889,3 +23889,129 @@ hospitals:
 - hospital_id: hospital-007314
   name: Craig Hospital
   cms_hpt_url: https://craighospital.org/cms-hpt.txt
+- hospital_id: hospital-007315
+  name: "AMG Specialty Hospital - Lafayette"
+  cms_hpt_url: https://amgihm.com/cms-hpt.txt
+- hospital_id: hospital-007316
+  name: "Brushy Creek Family Hospital"
+  cms_hpt_url: https://fhsmc.com/cms-hpt.txt
+- hospital_id: hospital-007317
+  name: "Lakeline Family Medical Center"
+  cms_hpt_url: https://fhsmc.com/cms-hpt.txt
+- hospital_id: hospital-007318
+  name: "Freedom Behavioral Hospital Of Plainview"
+  cms_hpt_url: https://freedombehavioral.com/cms-hpt.txt
+- hospital_id: hospital-007319
+  name: "Ascension Calumet Hospital, Inc."
+  cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
+- hospital_id: hospital-007320
+  name: "Commonwealth Regional Specialty Hospital"
+  cms_hpt_url: https://medcenterhealth.org/cms-hpt.txt
+- hospital_id: hospital-007321
+  name: "Advocate Childrens Hospital - Oak Lawn"
+  cms_hpt_url: https://www.advocatehealth.com/cms-hpt.txt
+- hospital_id: hospital-007322
+  name: "Advocate Lutheran General Hospital"
+  cms_hpt_url: https://www.advocatehealth.com/cms-hpt.txt
+- hospital_id: hospital-007323
+  name: "CHRISTUS Spohn Hospital Corpus Christi - Memorial"
+  cms_hpt_url: https://www.christushealth.org/cms-hpt.txt
+- hospital_id: hospital-007324
+  name: "FRISBIE MEMORIAL HOSPITAL"
+  cms_hpt_url: https://www.frisbiehospital.com/cms-hpt.txt
+- hospital_id: hospital-007325
+  name: "Jersey Shore University Medical Center"
+  cms_hpt_url: https://www.hackensackmeridianhealth.org/cms-hpt.txt
+- hospital_id: hospital-007326
+  name: "JFK University Medical Center"
+  cms_hpt_url: https://www.hackensackmeridianhealth.org/cms-hpt.txt
+- hospital_id: hospital-007327
+  name: "Old Bridge Medical Center"
+  cms_hpt_url: https://www.hackensackmeridianhealth.org/cms-hpt.txt
+- hospital_id: hospital-007328
+  name: "Southern Ocean Medical Center"
+  cms_hpt_url: https://www.hackensackmeridianhealth.org/cms-hpt.txt
+- hospital_id: hospital-007329
+  name: "MEDICAL CITY DENTON HOSPITAL"
+  cms_hpt_url: https://www.medicalcityhealthcare.com/cms-hpt.txt
+- hospital_id: hospital-007330
+  name: "Javon Bea Hospital - Rockton Avenue"
+  cms_hpt_url: https://www.mercyhealthsystem.org/cms-hpt.txt
+- hospital_id: hospital-007331
+  name: "Javon Bea Hospital - Rockton Avenue Childrens"
+  cms_hpt_url: https://www.mercyhealthsystem.org/cms-hpt.txt
+- hospital_id: hospital-007332
+  name: "BLUE RIDGE REGIONAL HOSPITAL"
+  cms_hpt_url: https://www.missionhealth.org/cms-hpt.txt
+- hospital_id: hospital-007333
+  name: "CAREPARTNERS REHABILITATION HOSPITAL"
+  cms_hpt_url: https://www.missionhealth.org/cms-hpt.txt
+- hospital_id: hospital-007334
+  name: "TRANSYLVANIA REGIONAL HOSPITAL"
+  cms_hpt_url: https://www.missionhealth.org/cms-hpt.txt
+- hospital_id: hospital-007335
+  name: "Penrose Hospital"
+  cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
+- hospital_id: hospital-007336
+  name: "Josie Robertson Surgery Center"
+  cms_hpt_url: https://www.mskcc.org/cms-hpt.txt
+- hospital_id: hospital-007337
+  name: "Memorial Sloan Kettering 64th Street Outpatient Center"
+  cms_hpt_url: https://www.mskcc.org/cms-hpt.txt
+- hospital_id: hospital-007338
+  name: "Rockefeller Outpatient Pavilion"
+  cms_hpt_url: https://www.mskcc.org/cms-hpt.txt
+- hospital_id: hospital-007339
+  name: "Northwestern Memorial Hospital"
+  cms_hpt_url: https://www.nm.org/cms-hpt.txt
+- hospital_id: hospital-007340
+  name: "North Mississippi Medical Center, Inc."
+  cms_hpt_url: https://www.nmhs.net/cms-hpt.txt
+- hospital_id: hospital-007341
+  name: "The Hospital of the University of Pennsylvania"
+  cms_hpt_url: https://www.pennmedicine.org/cms-hpt.txt
+- hospital_id: hospital-007342
+  name: "Hospital of the University of Pennsylvania Pavilion"
+  cms_hpt_url: https://www.pennmedicine.org/cms-hpt.txt
+- hospital_id: hospital-007343
+  name: "Hospital of the University of Pennsylvania - Cedar Avenue"
+  cms_hpt_url: https://www.pennmedicine.org/cms-hpt.txt
+- hospital_id: hospital-007344
+  name: "Penn Presbyterian Medical Center"
+  cms_hpt_url: https://www.pennmedicine.org/cms-hpt.txt
+- hospital_id: hospital-007345
+  name: "Pennsylvania Hospital"
+  cms_hpt_url: https://www.pennmedicine.org/cms-hpt.txt
+- hospital_id: hospital-007346
+  name: "Pennsylvania Hospital Hall Mercer"
+  cms_hpt_url: https://www.pennmedicine.org/cms-hpt.txt
+- hospital_id: hospital-007347
+  name: "The Women and Babies Hospital"
+  cms_hpt_url: https://www.pennmedicine.org/cms-hpt.txt
+- hospital_id: hospital-007348
+  name: "Doylestown Hospital"
+  cms_hpt_url: https://www.pennmedicine.org/cms-hpt.txt
+- hospital_id: hospital-007349
+  name: "PORTSMOUTH REGIONAL HOSPITAL"
+  cms_hpt_url: https://www.portsmouthhospital.com/cms-hpt.txt
+- hospital_id: hospital-007350
+  name: "St Lukes Orthopedic Hospital West End Campus"
+  cms_hpt_url: https://www.slhn.org/cms-hpt.txt
+- hospital_id: hospital-007351
+  name: "WellSpan Gettysburg Hospital"
+  cms_hpt_url: https://www.wellspan.org/cms-hpt.txt
+- hospital_id: hospital-007352
+  name: "WellSpan Chambersburg Hospital"
+  cms_hpt_url: https://www.wellspan.org/cms-hpt.txt
+- hospital_id: hospital-007353
+  name: "WellSpan Waynesboro Hospital"
+  cms_hpt_url: https://www.wellspan.org/cms-hpt.txt
+- hospital_id: hospital-007354
+  name: "WellSpan Ephrata Community Hospital"
+  cms_hpt_url: https://www.wellspan.org/cms-hpt.txt
+- hospital_id: hospital-007355
+  name: "WellSpan Evangelical Community Hospital"
+  cms_hpt_url: https://www.wellspan.org/cms-hpt.txt
+- hospital_id: hospital-007356
+  name: "WellSpan Surgery & Rehabilitation Hospital"
+  cms_hpt_url: https://www.wellspan.org/cms-hpt.txt
