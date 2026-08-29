@@ -16232,6 +16232,7 @@ hospitals:
 - hospital_id: hospital-004979
   name: Pana Community Hospital
   cms_hpt_url: https://panahospital.com/cms-hpt.txt
+  fallback_mrf_url: https://hospitalpricetransparencyfiles.com/pana-community-hospital-association/370602326_Pana-Community-Hospital-Association_standardcharges.csv
 - hospital_id: hospital-004980
   name: Panhandle Surgical Hospital
   cms_hpt_url: https://physurg.com/cms-hpt.txt
@@ -16805,6 +16806,7 @@ hospitals:
 - hospital_id: hospital-005156
   name: Pinckneyville Community Hospital
   cms_hpt_url: https://pvillehosp.org/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbPCAHPINCKNEYVILLEIL&type=CDMWithoutLabel&fileType=CSV
 - hospital_id: hospital-005157
   name: Pine Rest Christian Mental Health Services
   cms_hpt_url: https://www.pinerest.org/cms-hpt.txt
