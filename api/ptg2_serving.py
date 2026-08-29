@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from functools import partial
+from itertools import takewhile
 from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
@@ -8821,7 +8822,7 @@ def _uses_provider_inclusive_geo_rate_gate(
         and not price_filter_requested
         and requested_npi is None
         and not explicit_provider_filter_requested
-        and str(args.get("order_by") or "total_allowed_amount")
+        and str(args.get("order_by") or "")
         .strip()
         .lower()
         in _PTG2_COST_ORDER_FIELDS
@@ -9622,6 +9623,7 @@ class _MembershipLocationQuery:
     knn_order_sql: str | None
     address_assurance_sql: str = "TRUE"
     address_filter_sql: str | None = None
+    taxonomy_index_sql: str | None = None
 
 
 _MEMBERSHIP_NPI_SQL = """
@@ -9721,20 +9723,7 @@ LIMIT :limit OFFSET :offset
 
 _MEMBERSHIP_UNIFIED_ASSURED_LOCATION_SQL = """
 WITH located AS MATERIALIZED (
-    SELECT
-        addr.location_key,
-        addr.npi,
-        addr.address_key,
-        addr.premise_key,
-        addr.address_source_mask,
-        addr.geo_evidence_source_id,
-        addr.geo_assurance_version,
-        {distance_sql} AS distance_miles,
-        addr.type,
-        addr.checksum
-    FROM {address_table} addr
-    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
-    WHERE {filter_sql}
+    {located_scan_sql}
 ), nppes_requested AS MATERIALIZED (
     SELECT DISTINCT located.npi, located.address_key
     FROM located
@@ -10106,6 +10095,32 @@ def _membership_taxonomy_filters(
     return filter_clauses
 
 
+def _membership_taxonomy_index_sql(
+    args: Mapping[str, Any],
+    parameter_map: dict[str, Any],
+) -> str | None:
+    """Build the coarse unified-address taxonomy admission predicate."""
+
+    specialty_filter = resolve_provider_specialty_filter(args)
+    taxonomy_codes = list(specialty_filter.taxonomy_codes)
+    inferred_rule = _inferred_provider_taxonomy_rule(dict(args))
+    if inferred_rule is not None:
+        taxonomy_codes.extend(inferred_rule.taxonomy_codes)
+    normalized_codes = tuple(
+        dict.fromkeys(str(code or "").strip().upper() for code in taxonomy_codes)
+    )
+    normalized_codes = tuple(code for code in normalized_codes if code)
+    if not normalized_codes:
+        return None
+    parameter_map["membership_index_taxonomy_codes"] = list(normalized_codes)
+    return (
+        "addr.taxonomy_array && ARRAY("
+        f"SELECT nucc.int_code::integer FROM {PTG2_SCHEMA}.nucc_taxonomy nucc "
+        "WHERE nucc.code = ANY(CAST(:membership_index_taxonomy_codes AS varchar[])) "
+        "AND nucc.int_code IS NOT NULL)"
+    )
+
+
 def _membership_spatial_filter_sql(
     request_arg_map: Mapping[str, Any],
     *,
@@ -10335,6 +10350,7 @@ async def _membership_location_query(
         uses_unified_addresses=uses_unified_addresses,
         offset=offset,
     )
+    include_taxonomy_filters = knn_order_sql is None
     filter_sql_parts = _membership_filter_sql(
         args,
         candidate_npis=candidate_npis,
@@ -10342,7 +10358,7 @@ async def _membership_location_query(
         address_zip5_sql=_ptg2_address_zip5_sql("addr", unified=uses_unified_addresses),
         parameter_map=parameter_map,
         literal_service_address_types=uses_unified_addresses,
-        include_taxonomy_filters=knn_order_sql is None,
+        include_taxonomy_filters=include_taxonomy_filters,
     )
     if filter_sql_parts is None:
         return None
@@ -10361,7 +10377,32 @@ async def _membership_location_query(
         knn_order_sql=knn_order_sql,
         address_assurance_sql=_membership_address_assurance_sql(args, uses_unified_addresses),
         address_filter_sql=address_filter_sql,
+        taxonomy_index_sql=_membership_location_taxonomy_index_sql(
+            args, parameter_map, uses_unified_addresses, include_taxonomy_filters
+        ),
     )
+
+
+def _membership_location_taxonomy_index_sql(
+    args: Mapping[str, Any],
+    parameter_map: dict[str, Any],
+    uses_unified_addresses: bool,
+    include_taxonomy_filters: bool,
+) -> str | None:
+    """Use the unified taxonomy index only for spatial requests."""
+
+    has_spatial_filter = (
+        args.get("lat") not in (None, "", "null")
+        or args.get("long") not in (None, "", "null")
+        or bool(_normalize_zip5(args.get("zip5") or args.get("zip")))
+    )
+    if (
+        not uses_unified_addresses
+        or not include_taxonomy_filters
+        or not has_spatial_filter
+    ):
+        return None
+    return _membership_taxonomy_index_sql(args, parameter_map)
 
 
 async def _enable_serial_knn_planning(session) -> tuple[str, str]:
@@ -11109,6 +11150,7 @@ def _membership_sql_values(
         "ptg2_schema": PTG2_SCHEMA,
         "filter_sql": query_context.filter_sql,
         "address_assurance_sql": query_context.address_assurance_sql,
+        "located_scan_sql": _membership_unified_located_scan_sql(query_context),
         "postal_box_rank_sql": address_display_rank_sql("addr"),
         "location_tiebreak_sql": _membership_tiebreak_sql(
             uses_unified_addresses=uses_unified_addresses
@@ -11119,6 +11161,36 @@ def _membership_sql_values(
         ),
     }
     return format_values_by_name, uses_unified_addresses
+
+
+def _membership_unified_located_scan_sql(
+    query_context: _MembershipLocationQuery,
+) -> str:
+    """Render an indexed taxonomy branch plus its exact mismatch fallback."""
+
+    base_scan_sql = f"""
+        SELECT
+            addr.location_key,
+            addr.npi,
+            addr.address_key,
+            addr.premise_key,
+            addr.address_source_mask,
+            addr.geo_evidence_source_id,
+            addr.geo_assurance_version,
+            {query_context.distance_sql} AS distance_miles,
+            addr.type,
+            addr.checksum
+        FROM {query_context.address_table} addr
+        JOIN {query_context.npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
+        WHERE {query_context.filter_sql}"""
+    taxonomy_index_sql = query_context.taxonomy_index_sql
+    if taxonomy_index_sql is None:
+        return base_scan_sql
+    return (
+        f"{base_scan_sql}\n          AND {taxonomy_index_sql}\n"
+        "        UNION ALL\n"
+        f"{base_scan_sql}\n          AND ({taxonomy_index_sql}) IS NOT TRUE"
+    )
 
 
 def _membership_location_sql(
@@ -13218,14 +13290,385 @@ async def _filtered_provider_npis_for_expansion_set(
         raw_limit *= 2
 
 
+_GEO_PROVIDER_SCOPE_ERROR = (
+    "Cost-ordered geographic provider search is too broad for exact online "
+    "expansion. Narrow the ZIP radius, add an NPI or provider taxonomy filter, "
+    "or set order_by=distance."
+)
+
+
+async def _geo_matched_npis_by_set(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: Mapping[str, Any],
+    provider_set_ids_by_npi: Mapping[int, Sequence[str]],
+    matched_location_rows_by_npi: dict[int, dict[str, Any]],
+) -> dict[str, list[int]] | None:
+    """Match one exact provider-set union against bounded geo rows."""
+
+    matched_npis_by_set = {
+        provider_set_id: []
+        for provider_set_ids in provider_set_ids_by_npi.values()
+        for provider_set_id in provider_set_ids
+    }
+    candidate_npis = tuple(provider_set_ids_by_npi)
+    chunk_size = max(_ptg2_manifest_location_match_limit(), 1)
+    for chunk_start in range(0, len(candidate_npis), chunk_size):
+        candidate_chunk = candidate_npis[chunk_start : chunk_start + chunk_size]
+        location_rows = await _membership_location_rows(
+            session,
+            serving_tables,
+            dict(args),
+            candidate_npis=candidate_chunk,
+            limit=len(candidate_chunk),
+            offset=0,
+        )
+        if location_rows is None:
+            return None
+        candidate_npi_set = set(candidate_chunk)
+        for location_row in location_rows:
+            if location_row.get("npi") in (None, ""):
+                continue
+            npi = int(location_row["npi"])
+            if npi not in candidate_npi_set:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 geo membership escaped its provider-set scope"
+                )
+            matched_location_rows_by_npi.setdefault(npi, dict(location_row))
+            for provider_set_id in provider_set_ids_by_npi[npi]:
+                matched_npis_by_set[provider_set_id].append(npi)
+    return matched_npis_by_set
+
+
+async def _is_geo_provider_expansion_batch_loaded(
+    session,
+    serving_tables: PTG2ServingTables,
+    rate_rows: Sequence[Mapping[str, Any]],
+    args: Mapping[str, Any],
+    budget: _GeoRateSelectionBudget,
+    npis_by_set: dict[str, tuple[int, ...]],
+    matched_location_rows_by_npi: dict[int, dict[str, Any]],
+) -> bool:
+    """Batch one sealed rate page through exact membership and geography."""
+
+    provider_counts_by_id = _geo_rate_provider_counts(
+        rate_rows,
+        budget.provider_counts_by_id,
+    )
+    if not provider_counts_by_id:
+        return True
+    if budget.claim_provider_sets(provider_counts_by_id) is None:
+        raise PTG2LocationScopeError(_GEO_PROVIDER_SCOPE_ERROR)
+    complete_npis_by_set = await _exact_geo_rate_member_npis(
+        session,
+        serving_tables,
+        provider_counts_by_id,
+    )
+    provider_set_ids_by_npi: dict[int, list[str]] = defaultdict(list)
+    for provider_set_id, provider_npis in complete_npis_by_set.items():
+        npis_by_set[provider_set_id] = ()
+        for npi in provider_npis:
+            provider_set_ids_by_npi[int(npi)].append(provider_set_id)
+    matched_npis_by_set = await _geo_matched_npis_by_set(
+        session,
+        serving_tables,
+        args,
+        provider_set_ids_by_npi,
+        matched_location_rows_by_npi,
+    )
+    if matched_npis_by_set is None:
+        return False
+    npis_by_set.update(
+        {
+            provider_set_id: tuple(matched_npis)
+            for provider_set_id, matched_npis in matched_npis_by_set.items()
+        }
+    )
+    return True
+
+
+def _next_geo_provider_expansion_batch(
+    rate_rows: Sequence[Mapping[str, Any]],
+    start: int,
+    budget: _GeoRateSelectionBudget,
+    *,
+    maximum_possible_results: int | None,
+) -> list[Mapping[str, Any]]:
+    """Take the largest ordered set batch that fits the remaining sealed caps."""
+
+    remaining_members = budget.maximum_candidate_members - budget.candidate_members
+    remaining_sets = min(
+        budget.caps.maximum_provider_sets,
+        budget.maximum_geo_provider_sets - len(budget.provider_set_ids),
+    )
+    new_provider_counts_by_id: dict[str, int] = {}
+    batch_rows: list[Mapping[str, Any]] = []
+    possible_results = 0
+    for rate_row in rate_rows[max(int(start), 0) :]:
+        provider_set_id = _ptg2_manifest_id(
+            rate_row.get("provider_set_global_id_128")
+        )
+        if not provider_set_id:
+            raise PTG2ManifestArtifactError(
+                "PTG2 geo rate row is missing its provider-set identity"
+            )
+        provider_count = _rate_row_provider_count(rate_row)
+        if provider_count is None:
+            raise PTG2ManifestArtifactError(
+                "PTG2 geo rate row is missing its provider count"
+            )
+        known_count = budget.provider_counts_by_id.get(provider_set_id)
+        batch_count = new_provider_counts_by_id.get(provider_set_id)
+        if known_count is not None and known_count != provider_count:
+            raise PTG2ManifestArtifactError(
+                "PTG2 geo rate rows disagree on their provider-set count"
+            )
+        if batch_count is not None and batch_count != provider_count:
+            raise PTG2ManifestArtifactError(
+                "PTG2 geo rate rows disagree on their provider-set count"
+            )
+        if known_count is None and batch_count is None:
+            if (
+                len(new_provider_counts_by_id) >= remaining_sets
+                or sum(new_provider_counts_by_id.values()) + provider_count
+                > remaining_members
+            ):
+                break
+            new_provider_counts_by_id[provider_set_id] = provider_count
+        batch_rows.append(rate_row)
+        possible_results += provider_count
+        if (
+            maximum_possible_results is not None
+            and possible_results >= max(int(maximum_possible_results), 1)
+        ):
+            break
+    if not batch_rows:
+        raise PTG2LocationScopeError(_GEO_PROVIDER_SCOPE_ERROR)
+    return batch_rows
+
+
+@dataclass(frozen=True)
+class _GeoProviderCompletionRequest:
+    code_rows: list[Mapping[str, Any]]
+    serving_rows: list[dict[str, Any]]
+    selected_npis: tuple[int, ...]
+    filtered_npis_by_set: Mapping[str, tuple[int, ...]]
+    source_trace_set_hash: str | None
+    network_names: list[str]
+    descending: bool
+    is_source_exhausted: bool
+    budget: _GeoRateSelectionBudget
+    forward_limits: _V4GeoRateForwardLimits
+
+
+async def _geo_completion_provider_set_keys(
+    session,
+    serving_tables: PTG2ServingTables,
+    request: _GeoProviderCompletionRequest,
+) -> tuple[dict[int, tuple[int, ...]], tuple[int, ...]]:
+    """Resolve selected-NPI memberships and their exact code intersection."""
+
+    request.budget.require_graph_batch_capacity()
+    with (
+        v4_graph_request_scope(),
+        v4_graph_taxonomy_projection_scope(
+            maximum_members=request.forward_limits.maximum_projection_members,
+            maximum_pages=request.forward_limits.scan_budget.maximum_fragments,
+            maximum_bytes=request.forward_limits.scan_budget.maximum_raw_payload_bytes,
+            maximum_batches=request.forward_limits.maximum_graph_batches,
+        ),
+    ):
+        provider_set_keys_by_npi = await _v4_direct_npi_memberships(
+            session,
+            serving_tables,
+            request.selected_npis,
+            max_members=request.forward_limits.maximum_retained_memberships,
+        )
+    candidate_provider_set_keys = tuple(
+        sorted(
+            {
+                int(provider_set_key)
+                for provider_set_keys in provider_set_keys_by_npi.values()
+                for provider_set_key in provider_set_keys
+            }
+        )
+    )
+    if not candidate_provider_set_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 geo selected-provider completion has no provider sets"
+        )
+    completion_provider_set_keys = await _oversized_geo_code_provider_sets(
+        session,
+        serving_tables,
+        tuple(_manifest_code_rows_by_key(request.code_rows)),
+        candidate_provider_set_keys,
+        request.budget,
+        request.forward_limits.maximum_retained_memberships,
+        request.forward_limits.maximum_code_sets,
+    )
+    return provider_set_keys_by_npi, completion_provider_set_keys
+
+
+async def _geo_completion_memberships(
+    session,
+    serving_tables: PTG2ServingTables,
+    request: _GeoProviderCompletionRequest,
+    provider_set_keys_by_npi: Mapping[int, tuple[int, ...]],
+    completion_provider_set_keys: tuple[int, ...],
+) -> tuple[dict[int, str], dict[int, tuple[str, ...]]]:
+    """Validate exact selected-provider memberships and charge their union."""
+
+    provider_set_id_by_key = await _provider_set_ids_for_keys(
+        session,
+        serving_tables,
+        completion_provider_set_keys,
+    )
+    if set(provider_set_id_by_key) != set(completion_provider_set_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 geo completion references an unknown provider set"
+        )
+    provider_set_ids_by_npi = _v4_direct_set_ids(
+        request.selected_npis,
+        provider_set_keys_by_npi,
+        provider_set_id_by_key,
+    )
+    if any(
+        not {
+            provider_set_id
+            for provider_set_id, provider_npis in request.filtered_npis_by_set.items()
+            if npi in provider_npis
+        }.issubset(provider_set_ids_by_npi.get(npi, ()))
+        for npi in request.selected_npis
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 scoped NPI completion is missing a ranked membership"
+        )
+    completion_provider_set_ids = tuple(
+        dict.fromkeys(
+            provider_set_id
+            for npi in request.selected_npis
+            for provider_set_id in provider_set_ids_by_npi[npi]
+        )
+    )
+    request.budget.claim_completion_provider_sets(completion_provider_set_ids)
+    return provider_set_id_by_key, provider_set_ids_by_npi
+
+
+async def _geo_completion_rate_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    request: _GeoProviderCompletionRequest,
+    completion_provider_set_keys: tuple[int, ...],
+    provider_set_id_by_key: Mapping[int, str],
+) -> list[dict[str, Any]]:
+    """Read the exact completion rows under the sealed forward budget."""
+
+    try:
+        completion_rows, completion_provider_set_id_by_key = (
+            await _v4_pattern_completion_rows(
+                session,
+                serving_tables,
+                _V4PatternCompletionRequest(
+                    code_rows=request.code_rows,
+                    prefix_rows=request.serving_rows,
+                    candidate_provider_set_keys=completion_provider_set_keys,
+                    source_trace_set_hash=request.source_trace_set_hash,
+                    network_names=request.network_names,
+                    descending=request.descending,
+                    is_source_exhausted=request.is_source_exhausted,
+                    maximum_occurrences=(
+                        len(request.serving_rows)
+                        + max(
+                            request.budget.caps.maximum_rate_rows
+                            - request.budget.rate_rows,
+                            0,
+                        )
+                    ),
+                    maximum_code_sets=min(
+                        request.forward_limits.maximum_code_sets,
+                        request.budget.maximum_geo_provider_sets,
+                    ),
+                    scan_budget=request.forward_limits.scan_budget,
+                ),
+            )
+        )
+    except ForwardReadBudgetExceeded as exc:
+        raise PTG2OnlineWorkBudgetExceeded("forward_scan") from exc
+    if completion_provider_set_id_by_key != provider_set_id_by_key:
+        raise PTG2ManifestArtifactError(
+            "PTG2 geo completion disagrees with its provider-code scope"
+        )
+    if not request.is_source_exhausted:
+        request.budget.claim_rate_page(len(completion_rows))
+    return completion_rows
+
+
+async def _geo_provider_expansion_completion(
+    session,
+    serving_tables: PTG2ServingTables,
+    request: _GeoProviderCompletionRequest,
+) -> tuple[list[dict[str, Any]], dict[int, tuple[str, ...]]]:
+    """Complete selected NPIs through the bounded filtered-reverse path."""
+
+    keys_by_npi, completion_keys = await _geo_completion_provider_set_keys(
+        session, serving_tables, request
+    )
+    set_id_by_key, set_ids_by_npi = await _geo_completion_memberships(
+        session, serving_tables, request, keys_by_npi, completion_keys
+    )
+    completion_rows = await _geo_completion_rate_rows(
+        session, serving_tables, request, completion_keys, set_id_by_key
+    )
+    return completion_rows, set_ids_by_npi
+
+
+@dataclass(frozen=True)
+class _FilteredProviderExpansionRequest:
+    row_data: list[dict[str, Any]]
+    args: Mapping[str, Any]
+    target_count: int
+    npis_by_set: dict[str, tuple[int, ...]]
+    geo_budget: _GeoRateSelectionBudget | None = None
+    complete_price_key_boundary: bool = False
+    scan_to_exhaustion: bool = False
+
+
+async def _provider_expansion_npis_for_row(
+    session,
+    serving_tables: PTG2ServingTables,
+    request: _FilteredProviderExpansionRequest,
+    serving_row: Mapping[str, Any],
+) -> tuple[str, tuple[int, ...]]:
+    """Return the authenticated set identity and filtered provider members."""
+
+    provider_set_id = _ptg2_manifest_id(
+        serving_row.get("provider_set_global_id_128")
+    )
+    if not provider_set_id:
+        raise PTG2ManifestArtifactError(
+            "PTG2 strict V3 rate is missing its provider-set identity"
+        )
+    if provider_set_id not in request.npis_by_set:
+        if request.geo_budget is not None:
+            raise PTG2ManifestArtifactError(
+                "PTG2 geo provider expansion missed its sealed set batch"
+            )
+        request.npis_by_set[provider_set_id] = (
+            await _filtered_provider_npis_for_expansion_set(
+                session,
+                serving_tables,
+                provider_set_id,
+                request.args,
+                target_count=request.target_count,
+            )
+        )
+    return provider_set_id, request.npis_by_set[provider_set_id]
+
+
 async def _rank_filtered_provider_expansion_prefix(
     session,
     serving_tables: PTG2ServingTables,
-    row_data: list[dict[str, Any]],
-    args: Mapping[str, Any],
-    *,
-    target_count: int,
-    npis_by_set: dict[str, tuple[int, ...]],
+    request: _FilteredProviderExpansionRequest,
 ) -> tuple[
     dict[_ProviderExpansionKey, int],
     tuple[int, ...],
@@ -13236,37 +13679,37 @@ async def _rank_filtered_provider_expansion_prefix(
     rank_by_key: dict[_ProviderExpansionKey, int] = {}
     selected_npi_order_by_value: dict[int, None] = {}
     selected_provider_set_order_by_id: dict[str, None] = {}
-    for serving_row in row_data:
-        provider_set_id = _ptg2_manifest_id(
-            serving_row.get("provider_set_global_id_128")
+    boundary_price_key: int | None = None
+    for serving_row in request.row_data:
+        row_price_key = _manifest_response_row_order(serving_row)[0]
+        if (
+            request.complete_price_key_boundary
+            and boundary_price_key is not None
+            and row_price_key != boundary_price_key
+        ):
+            break
+        provider_set_id, provider_npis = await _provider_expansion_npis_for_row(
+            session, serving_tables, request, serving_row
         )
-        if not provider_set_id:
-            raise PTG2ManifestArtifactError(
-                "PTG2 strict V3 rate is missing its provider-set identity"
-            )
-        if provider_set_id not in npis_by_set:
-            npis_by_set[provider_set_id] = (
-                await _filtered_provider_npis_for_expansion_set(
-                    session,
-                    serving_tables,
-                    provider_set_id,
-                    args,
-                    target_count=target_count,
-                )
-            )
-        for npi in npis_by_set[provider_set_id]:
+        for npi in provider_npis:
             key = _provider_expansion_key(serving_row, npi=npi)
             if key in rank_by_key:
                 continue
             rank_by_key[key] = len(rank_by_key)
             selected_provider_set_order_by_id[provider_set_id] = None
             selected_npi_order_by_value[int(npi)] = None
-            if len(rank_by_key) >= target_count:
-                return (
-                    rank_by_key,
-                    tuple(selected_npi_order_by_value),
-                    tuple(selected_provider_set_order_by_id),
-                )
+            if len(rank_by_key) < request.target_count:
+                continue
+            if request.scan_to_exhaustion:
+                continue
+            if request.complete_price_key_boundary:
+                boundary_price_key = row_price_key
+                continue
+            return (
+                rank_by_key,
+                tuple(selected_npi_order_by_value),
+                tuple(selected_provider_set_order_by_id),
+            )
     return (
         rank_by_key,
         tuple(selected_npi_order_by_value),
@@ -13494,6 +13937,7 @@ async def _selected_provider_rows_by_set(
     provider_set_ids_by_npi: Mapping[int, tuple[str, ...]],
     args: Mapping[str, Any],
     snapshot_id: str,
+    matched_location_rows_by_npi: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]] | None:
     provider_rows = await _enriched_provider_rows_for_npis(
         session,
@@ -13513,6 +13957,20 @@ async def _selected_provider_rows_by_set(
         for provider_row in provider_rows
         if provider_row.get("npi") is not None
     }
+    if matched_location_rows_by_npi is not None:
+        missing_location_npis = set(npis).difference(matched_location_rows_by_npi)
+        if missing_location_npis:
+            raise PTG2ManifestArtifactError(
+                "PTG2 geo provider expansion lost a selected location witness"
+            )
+        provider_by_npi = {
+            npi: _graph_provider_data(
+                dict(matched_location_rows_by_npi[npi]),
+                provider_by_npi.get(npi),
+                "entity_address_unified",
+            )
+            for npi in npis
+        }
     provider_set_ids = tuple(
         dict.fromkeys(
             provider_set_id
@@ -14144,6 +14602,31 @@ class _GeoRateSelectionBudget:
         self.graph_batches += 1
         return claimed_candidate_members
 
+    def claim_completion_provider_sets(
+        self,
+        provider_set_ids: Iterable[str],
+    ) -> None:
+        """Charge one selected-NPI reverse completion graph batch."""
+
+        new_provider_set_ids = set(provider_set_ids).difference(
+            self.provider_set_ids
+        )
+        if (
+            len(new_provider_set_ids) > self.caps.maximum_provider_sets
+            or len(self.provider_set_ids) + len(new_provider_set_ids)
+            > self.maximum_geo_provider_sets
+        ):
+            raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+        self.require_graph_batch_capacity()
+        self.provider_set_ids.update(new_provider_set_ids)
+        self.graph_batches += 1
+
+    def require_graph_batch_capacity(self) -> None:
+        """Fail before a graph traversal exceeds the sealed batch cap."""
+
+        if self.graph_batches >= self.caps.maximum_graph_batches:
+            raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+
 
 def _geo_rate_selection_budget(
     serving_tables: PTG2ServingTables,
@@ -14255,10 +14738,6 @@ def _geo_rate_provider_counts(
         if not provider_set_id:
             raise PTG2ManifestArtifactError(
                 "PTG2 geo rate row is missing its provider-set identity"
-            )
-        if isinstance(rate_row.get("provider_count"), bool):
-            raise PTG2ManifestArtifactError(
-                "PTG2 geo rate row has an invalid provider count"
             )
         provider_count = _rate_row_provider_count(rate_row)
         if provider_count is None:
@@ -15429,6 +15908,10 @@ def _rate_row_provider_count(serving_row: Mapping[str, Any]) -> int | None:
     raw_provider_count = serving_row.get("provider_count")
     if raw_provider_count is None:
         return None
+    if isinstance(raw_provider_count, bool):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 incremental rate row has an invalid provider count"
+        )
     try:
         provider_count = int(raw_provider_count)
     except (TypeError, ValueError) as exc:
@@ -17443,23 +17926,35 @@ async def _strict_cost_provider_expansion_selection(
         request.target_count,
         request.descending,
     )
-    cache_key = _provider_expansion_selection_cache_key(
-        serving_tables,
-        code_rows=code_rows,
-        args=args,
-        snapshot_id=snapshot_id,
-        source_trace_set_hash=source_trace_set_hash,
-        network_names=network_names,
-        target_count=target_count,
-        descending=descending,
+    is_geo_filter_requested = _has_location_filter(
+        dict(args),
+        include_npi=False,
+    )
+    cache_key = (
+        None
+        if is_geo_filter_requested
+        else _provider_expansion_selection_cache_key(
+            serving_tables,
+            code_rows=code_rows,
+            args=args,
+            snapshot_id=snapshot_id,
+            source_trace_set_hash=source_trace_set_hash,
+            network_names=network_names,
+            target_count=target_count,
+            descending=descending,
+        )
     )
     if cache_key is not None:
         cached_selection = _provider_expansion_selection_from_cache(cache_key)
         if cached_selection is not None:
             return cached_selection
-    declared_rate_count = sum(
-        max(int(code_row.get("rate_count") or 0), 0)
-        for code_row in code_rows
+    declared_rate_count = (
+        _declared_geo_rate_count(code_rows)
+        if is_geo_filter_requested
+        else sum(
+            max(int(code_row.get("rate_count") or 0), 0)
+            for code_row in code_rows
+        )
     )
     if declared_rate_count <= 0:
         return _ProviderExpansionSelection([], {}, {}, True)
@@ -17470,7 +17965,7 @@ async def _strict_cost_provider_expansion_selection(
         serving_tables,
         args,
     )
-    if inferred_taxonomy_projection is not None:
+    if inferred_taxonomy_projection is not None and not is_geo_filter_requested:
         projection_manifest, projection_rule = inferred_taxonomy_projection
         exact_inferred_selection = (
             await _select_v4_taxonomy_expansion(
@@ -17494,6 +17989,7 @@ async def _strict_cost_provider_expansion_selection(
     if (
         bool(getattr(serving_tables, "uses_v4_graph", False))
         and not is_provider_filter_requested
+        and not is_geo_filter_requested
     ):
         incremental_selection = (
             await _select_v4_provider_expansion(
@@ -17517,145 +18013,372 @@ async def _strict_cost_provider_expansion_selection(
                 incremental_selection,
             )
         return None
+    if is_geo_filter_requested:
+        _v4_provider_expansion_request_caps(
+            serving_tables,
+            target_count=max(int(target_count), 1),
+        )
+    geo_budget = (
+        _geo_rate_selection_budget(serving_tables)
+        if is_geo_filter_requested
+        else None
+    )
+    geo_forward_limits = (
+        _v4_geo_rate_forward_limits(serving_tables)
+        if geo_budget is not None
+        else None
+    )
     rate_window = min(
         declared_rate_count,
         max(PTG2_SERVING_BINARY_V3_PAGE_ROWS, max(int(target_count), 1)),
     )
+    if geo_budget is not None:
+        rate_window = min(
+            declared_rate_count,
+            geo_budget.caps.rate_page_rows if descending else 1,
+        )
     rank_by_key: dict[_ProviderExpansionKey, int] = {}
     selected_npis: tuple[int, ...] = ()
     selected_provider_set_ids: tuple[str, ...] = ()
     is_exhausted = False
     serving_rows: list[dict[str, Any]] = []
+    ranked_serving_rows: list[dict[str, Any]] = []
     filtered_npis_by_set: dict[str, tuple[int, ...]] = {}
+    matched_location_rows_by_npi: dict[int, dict[str, Any]] = {}
+    geo_rate_offset = 0
+    geo_boundary_price_key: int | None = None
+    is_geo_boundary_closed = False
     while True:
-        serving_rows = await _merge_manifest_code_variant_rows(
-            session,
-            serving_tables,
-            code_rows=code_rows,
-            provider_set_keys=None,
-            source_trace_set_hash=source_trace_set_hash,
-            network_names=network_names,
-            limit=rate_window,
-            offset=0,
-            descending=descending,
-        )
-        if serving_rows is None:
-            return None
-        provider_set_ids = tuple(
-            dict.fromkeys(
-                provider_set_id
-                for serving_row in serving_rows
-                if (
-                    provider_set_id := _ptg2_manifest_id(
-                        serving_row.get("provider_set_global_id_128")
+        if geo_budget is None:
+            serving_rows = await _merge_manifest_code_variant_rows(
+                session,
+                serving_tables,
+                code_rows=code_rows,
+                provider_set_keys=None,
+                source_trace_set_hash=source_trace_set_hash,
+                network_names=network_names,
+                limit=rate_window,
+                offset=0,
+                descending=descending,
+            )
+            if serving_rows is None:
+                return None
+            provider_set_ids = tuple(
+                dict.fromkeys(
+                    provider_set_id
+                    for serving_row in serving_rows
+                    if (
+                        provider_set_id := _ptg2_manifest_id(
+                            serving_row.get("provider_set_global_id_128")
+                        )
                     )
                 )
             )
+            if is_provider_filter_requested:
+                filtered_ranking = await _rank_filtered_provider_expansion_prefix(
+                    session,
+                    serving_tables,
+                    _FilteredProviderExpansionRequest(
+                        row_data=serving_rows,
+                        args=args,
+                        target_count=max(int(target_count), 1),
+                        npis_by_set=filtered_npis_by_set,
+                    ),
+                )
+                rank_by_key, selected_npis, selected_provider_set_ids = (
+                    filtered_ranking
+                )
+            else:
+                npis_by_set = await _provider_npis_for_sets(
+                    session,
+                    serving_tables,
+                    provider_set_ids,
+                    limit_per_set=max(int(target_count), 1),
+                )
+                rank_by_key, selected_npis, selected_provider_set_ids = (
+                    _rank_provider_expansion_prefix(
+                        serving_rows,
+                        npis_by_set,
+                        target_count=max(int(target_count), 1),
+                    )
+                )
+            is_exhausted = (
+                rate_window >= declared_rate_count
+                or len(serving_rows) < rate_window
+            )
+            if len(rank_by_key) >= target_count or is_exhausted:
+                break
+            next_window = _next_provider_expansion_rate_window(
+                rate_window,
+                target_count=target_count,
+                distinct_count=len(rank_by_key),
+                declared_rate_count=declared_rate_count,
+            )
+            if next_window <= rate_window:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 strict V3 provider expansion did not make progress"
+                )
+            rate_window = next_window
+            continue
+        if geo_forward_limits is None:
+            raise PTG2ManifestArtifactError(
+                "PTG2 geo provider expansion lost its forward limits"
+            )
+        page_limit = min(
+            rate_window,
+            _geo_rate_page_limit(
+                geo_budget,
+                declared_rate_count,
+                geo_rate_offset,
+            ),
         )
-        if is_provider_filter_requested:
-            rank_by_key, selected_npis, selected_provider_set_ids = (
+        geo_budget.claim_rate_page(page_limit)
+        try:
+            geo_page_rows = await _merge_manifest_code_variant_rows(
+                session,
+                serving_tables,
+                code_rows=code_rows,
+                provider_set_keys=None,
+                source_trace_set_hash=source_trace_set_hash,
+                network_names=network_names,
+                limit=page_limit,
+                offset=geo_rate_offset,
+                descending=descending,
+                scan_budget=geo_forward_limits.scan_budget,
+            )
+        except ForwardReadBudgetExceeded as exc:
+            raise PTG2OnlineWorkBudgetExceeded("forward_scan") from exc
+        if geo_page_rows is None:
+            return None
+        if len(geo_page_rows) != page_limit:
+            raise PTG2ManifestArtifactError(
+                "PTG2 geo provider rate page is incomplete"
+            )
+        serving_rows.extend(geo_page_rows)
+        is_exhausted = (
+            geo_rate_offset + page_limit >= declared_rate_count
+        )
+        page_start = 0
+        geo_batch_result_limit = max(
+            int(target_count) - len(rank_by_key),
+            1,
+        )
+        while page_start < len(geo_page_rows):
+            if (
+                not descending
+                and geo_boundary_price_key is not None
+                and _manifest_response_row_order(
+                    geo_page_rows[page_start]
+                )[0]
+                != geo_boundary_price_key
+            ):
+                is_geo_boundary_closed = True
+                break
+            batch_rows = _next_geo_provider_expansion_batch(
+                geo_page_rows,
+                page_start,
+                geo_budget,
+                maximum_possible_results=(
+                    None
+                    if descending or geo_boundary_price_key is not None
+                    else geo_batch_result_limit
+                ),
+            )
+            if not descending and geo_boundary_price_key is not None:
+                batch_rows = list(
+                    takewhile(
+                        lambda rate_row: _manifest_response_row_order(
+                            rate_row
+                        )[0]
+                        == geo_boundary_price_key,
+                        batch_rows,
+                    )
+                )
+            if not batch_rows:
+                is_geo_boundary_closed = True
+                break
+            if not await _is_geo_provider_expansion_batch_loaded(
+                session,
+                serving_tables,
+                batch_rows,
+                args,
+                geo_budget,
+                filtered_npis_by_set,
+                matched_location_rows_by_npi,
+            ):
+                return None
+            ranked_serving_rows.extend(batch_rows)
+            page_start += len(batch_rows)
+            filtered_ranking = (
                 await _rank_filtered_provider_expansion_prefix(
                     session,
                     serving_tables,
-                    serving_rows,
-                    args,
-                    target_count=max(int(target_count), 1),
-                    npis_by_set=filtered_npis_by_set,
+                    _FilteredProviderExpansionRequest(
+                        row_data=ranked_serving_rows,
+                        args=args,
+                        target_count=max(int(target_count), 1),
+                        npis_by_set=filtered_npis_by_set,
+                        geo_budget=geo_budget,
+                        complete_price_key_boundary=not descending,
+                        scan_to_exhaustion=descending,
+                    ),
+                )
+            )
+            rank_by_key, selected_npis, selected_provider_set_ids = (
+                filtered_ranking
+            )
+            if (
+                not descending
+                and geo_boundary_price_key is None
+                and len(rank_by_key) >= target_count
+            ):
+                boundary_rank = max(int(target_count), 1) - 1
+                geo_boundary_price_key = next(
+                    (
+                        _manifest_response_row_order(serving_row)[0]
+                        for serving_row in ranked_serving_rows
+                        for npi in filtered_npis_by_set.get(
+                            _ptg2_manifest_id(
+                                serving_row.get(
+                                    "provider_set_global_id_128"
+                                )
+                            )
+                            or "",
+                            (),
+                        )
+                        if rank_by_key.get(
+                            _provider_expansion_key(
+                                serving_row,
+                                npi=npi,
+                            )
+                        )
+                        == boundary_rank
+                    ),
+                    None,
+                )
+                if geo_boundary_price_key is None:
+                    raise PTG2ManifestArtifactError(
+                        "PTG2 geo provider expansion lost its price boundary"
+                    )
+                rate_window = geo_budget.caps.rate_page_rows
+            if (
+                not descending
+                and geo_boundary_price_key is not None
+                and _manifest_response_row_order(
+                    ranked_serving_rows[-1]
+                )[0]
+                != geo_boundary_price_key
+            ):
+                is_geo_boundary_closed = True
+                break
+            if not descending and geo_boundary_price_key is None:
+                geo_batch_result_limit = min(
+                    max(
+                        geo_batch_result_limit * 2,
+                        int(target_count) - len(rank_by_key),
+                        1,
+                    ),
+                    geo_budget.maximum_candidate_members,
+                )
+        if descending:
+            if is_exhausted:
+                break
+        elif is_exhausted or is_geo_boundary_closed:
+            break
+        geo_rate_offset += page_limit
+        if not descending and geo_boundary_price_key is None:
+            rate_window = min(
+                geo_budget.caps.rate_page_rows,
+                max(rate_window * 2, 1),
+            )
+        continue
+
+    if geo_budget is not None:
+        if selected_npis:
+            completion_rows, provider_set_ids_by_npi = (
+                await _geo_provider_expansion_completion(
+                    session,
+                    serving_tables,
+                    _GeoProviderCompletionRequest(
+                        code_rows=code_rows,
+                        serving_rows=serving_rows,
+                        selected_npis=selected_npis,
+                        filtered_npis_by_set=filtered_npis_by_set,
+                        source_trace_set_hash=source_trace_set_hash,
+                        network_names=network_names,
+                        descending=descending,
+                        is_source_exhausted=(
+                            len(serving_rows) == declared_rate_count
+                        ),
+                        budget=geo_budget,
+                        forward_limits=geo_forward_limits,
+                    ),
                 )
             )
         else:
-            npis_by_set = await _provider_npis_for_sets(
+            completion_rows, provider_set_ids_by_npi = [], {}
+    else:
+        allowed_provider_set_keys: frozenset[int] | None = None
+        if bool(getattr(serving_tables, "uses_v4_graph", False)) and selected_npis:
+            code_scope_entries = await _shared_forward_entries_for_code_rows(
                 session,
                 serving_tables,
-                provider_set_ids,
-                limit_per_set=max(int(target_count), 1),
+                code_rows,
             )
-            rank_by_key, selected_npis, selected_provider_set_ids = (
-                _rank_provider_expansion_prefix(
-                    serving_rows,
-                    npis_by_set,
-                    target_count=max(int(target_count), 1),
+            allowed_provider_set_keys = frozenset(
+                _incremental_code_scope_provider_set_keys(code_scope_entries)
+            )
+            if not allowed_provider_set_keys:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 V4 code scope is missing its provider sets"
                 )
+        if allowed_provider_set_keys is None:
+            provider_set_ids_by_npi = await _provider_set_ids_for_selected_npis(
+                session,
+                serving_tables,
+                selected_npis,
             )
-        is_exhausted = (
-            rate_window >= declared_rate_count
-            or len(serving_rows) < rate_window
-        )
-        if len(rank_by_key) >= target_count or is_exhausted:
-            break
-        next_window = _next_provider_expansion_rate_window(
-            rate_window,
-            target_count=target_count,
-            distinct_count=len(rank_by_key),
-            declared_rate_count=declared_rate_count,
-        )
-        if next_window <= rate_window:
-            raise PTG2ManifestArtifactError(
-                "PTG2 strict V3 provider expansion did not make progress"
+        else:
+            provider_set_ids_by_npi = await _provider_set_ids_for_selected_npis(
+                session,
+                serving_tables,
+                selected_npis,
+                allowed_provider_set_keys=allowed_provider_set_keys,
             )
-        rate_window = next_window
-
-    allowed_provider_set_keys: frozenset[int] | None = None
-    if bool(getattr(serving_tables, "uses_v4_graph", False)) and selected_npis:
-        code_scope_entries = await _shared_forward_entries_for_code_rows(
-            session,
-            serving_tables,
-            code_rows,
-        )
-        allowed_provider_set_keys = frozenset(
-            int(entry.provider_set_key) for entry in code_scope_entries
-        )
-        if not allowed_provider_set_keys:
-            raise PTG2ManifestArtifactError(
-                "PTG2 V4 code scope is missing its provider sets"
-            )
-    if allowed_provider_set_keys is None:
-        provider_set_ids_by_npi = await _provider_set_ids_for_selected_npis(
-            session,
-            serving_tables,
-            selected_npis,
-        )
-    else:
-        provider_set_ids_by_npi = await _provider_set_ids_for_selected_npis(
-            session,
-            serving_tables,
-            selected_npis,
-            allowed_provider_set_keys=allowed_provider_set_keys,
-        )
-    completion_provider_set_ids = tuple(
-        dict.fromkeys(
-            (
+        completion_provider_set_ids = tuple(
+            dict.fromkeys(
                 provider_set_id
                 for npi in selected_npis
                 for provider_set_id in provider_set_ids_by_npi.get(npi, ())
             )
         )
-    )
-    completion_provider_set_ids = tuple(
-        dict.fromkeys((*completion_provider_set_ids, *selected_provider_set_ids))
-    )
-    provider_set_key_by_id = await _provider_set_keys_for_ids(
-        session,
-        serving_tables,
-        completion_provider_set_ids,
-    )
-    if set(provider_set_key_by_id) != set(completion_provider_set_ids):
-        raise PTG2ManifestArtifactError(
-            "PTG2 strict V3 provider expansion references an unknown provider set"
+        completion_provider_set_ids = tuple(
+            dict.fromkeys(
+                (*completion_provider_set_ids, *selected_provider_set_ids)
+            )
         )
-    completion_rows = await _merge_manifest_code_variant_rows(
-        session,
-        serving_tables,
-        code_rows=code_rows,
-        provider_set_keys=provider_set_key_by_id.values(),
-        source_trace_set_hash=source_trace_set_hash,
-        network_names=network_names,
-        limit=None,
-        offset=0,
-        descending=descending,
-    )
-    if completion_rows is None:
-        return None
+        provider_set_key_by_id = await _provider_set_keys_for_ids(
+            session,
+            serving_tables,
+            completion_provider_set_ids,
+        )
+        if set(provider_set_key_by_id) != set(completion_provider_set_ids):
+            raise PTG2ManifestArtifactError(
+                "PTG2 strict V3 provider expansion references an unknown provider set"
+            )
+        completion_rows = await _merge_manifest_code_variant_rows(
+            session,
+            serving_tables,
+            code_rows=code_rows,
+            provider_set_keys=provider_set_key_by_id.values(),
+            source_trace_set_hash=source_trace_set_hash,
+            network_names=network_names,
+            limit=None,
+            offset=0,
+            descending=descending,
+        )
+        if completion_rows is None:
+            return None
     providers_by_set = await _selected_provider_rows_by_set(
         session,
         serving_tables,
@@ -17663,6 +18386,11 @@ async def _strict_cost_provider_expansion_selection(
         provider_set_ids_by_npi=provider_set_ids_by_npi,
         args=args,
         snapshot_id=snapshot_id,
+        matched_location_rows_by_npi=(
+            matched_location_rows_by_npi
+            if is_geo_filter_requested
+            else None
+        ),
     )
     if providers_by_set is None:
         return None
@@ -17672,7 +18400,11 @@ async def _strict_cost_provider_expansion_selection(
         row_data=completion_rows,
         providers_by_set=providers_by_set,
         rank_by_key=rank_by_key,
-        exhausted=is_exhausted and len(rank_by_key) < target_count,
+        exhausted=(
+            is_exhausted
+            if geo_budget is not None
+            else is_exhausted and len(rank_by_key) < target_count
+        ),
     )
     return _cache_provider_expansion_selection(cache_key, selection)
 
@@ -17840,6 +18572,26 @@ async def _search_manifest_serving_table(
         price_filter_requested=price_filter_requested,
         direct_npi_filter_requested=direct_npi_filter_requested,
     )
+    effective_provider_order = requested_order or (
+        "distance" if location_filter_requested else "total_allowed_amount"
+    )
+    strict_cost_provider_expansion = bool(
+        include_providers
+        and not direct_npi_filter_requested
+        and not price_filter_requested
+        and effective_provider_order in _PTG2_COST_ORDER_FIELDS
+        and (
+            not location_filter_requested
+            or (
+                requested_npi is None
+                and bool(getattr(serving_tables, "uses_v4_graph", False))
+                and isinstance(
+                    serving_tables.provider_graph_v4_inferred_taxonomy_candidates,
+                    Mapping,
+                )
+            )
+        )
+    )
     if (
         not include_providers
         and explicit_provider_filter_requested
@@ -17986,7 +18738,10 @@ async def _search_manifest_serving_table(
         explicit_provider_filter_requested=explicit_provider_filter_requested,
     )
     code_rows: list[dict[str, Any]] | None = None
-    if is_provider_inclusive_cost_ordered_geo:
+    if (
+        is_provider_inclusive_cost_ordered_geo
+        and not strict_cost_provider_expansion
+    ):
         code_rows = await load_code_rows()
         if not code_rows:
             return None
@@ -18017,6 +18772,7 @@ async def _search_manifest_serving_table(
         location_filter_requested
         and not deferred_location_selection
         and not use_geo_rate_prefix_selection
+        and not strict_cost_provider_expansion
     ):
         location_matches = await _ptg2_manifest_location_provider_matches(
             session,
@@ -18080,14 +18836,6 @@ async def _search_manifest_serving_table(
         _RankedProviderExpansionMaterialization | None
     ) = None
     geo_rate_selection: _GeoRateSelection | None = None
-    strict_cost_provider_expansion = (
-        include_providers
-        and not location_filter_requested
-        and not direct_npi_filter_requested
-        and not price_filter_requested
-        and str(args.get("order_by") or "total_allowed_amount").strip().lower()
-        in _PTG2_COST_ORDER_FIELDS
-    )
     if use_geo_rate_prefix_selection:
         geo_rate_selection = await _select_geo_filtered_rate_prefix(
             session,
@@ -18125,6 +18873,8 @@ async def _search_manifest_serving_table(
             )
         )
         serving_rows = list(exact_provider_materialization.row_data)
+        if location_filter_requested:
+            is_location_selection_exhausted = exact_provider_selection.exhausted
     else:
         serving_rows = await _merge_manifest_code_variant_rows(
             session,
@@ -18151,13 +18901,24 @@ async def _search_manifest_serving_table(
     is_serving_row_selection_exhausted = (
         geo_rate_selection.exhausted
         if geo_rate_selection is not None
+        else exact_provider_selection.exhausted
+        if exact_provider_selection is not None
         else serving_row_limit is None
         or len(serving_rows) < int(serving_row_limit)
     )
 
     response_items: list[dict[str, Any]] = []
     if not serving_rows:
-        return no_match_response() if geo_rate_selection is not None else None
+        return (
+            no_match_response()
+            if geo_rate_selection is not None
+            or (
+                exact_provider_selection is not None
+                and location_filter_requested
+                and exact_provider_selection.exhausted
+            )
+            else None
+        )
     await _hydrate_provider_set_network_names(
         session,
         serving_tables,
@@ -18528,7 +19289,8 @@ async def _search_manifest_serving_table(
             rank = exact_provider_selection.rank_by_key.get(item_key)
             if rank is None:
                 continue
-            response_item_by_field["_ptg_provider_rank"] = rank
+            if not location_filter_requested:
+                response_item_by_field["_ptg_provider_rank"] = rank
             selected_items.append(response_item_by_field)
             materialized_keys.add(item_key)
         if materialized_keys != set(exact_provider_selection.rank_by_key):
