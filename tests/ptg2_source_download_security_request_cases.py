@@ -126,6 +126,37 @@ def test_redirect_rewrites_303_and_rejects_missing_or_excessive_locations(monkey
     assert len(looping.calls) == source_download._MAX_REDIRECTS + 1
 
 
+def test_redirect_preserves_signed_location_bytes(monkeypatch) -> None:
+    async def safe(_url):
+        return None
+
+    signed_url = (
+        "https://cdn.example.test/rates.csv?"
+        "response-content-disposition=inline%3B%20filename%3D%22rates.csv%22"
+        "&Signature=a~b__&Key-Pair-Id=test"
+    )
+    monkeypatch.setattr(source_download, "assert_safe_url", safe)
+    responses = iter(
+        [
+            _Response(status=302, headers={"Location": signed_url}),
+            _Response(status=206, url=signed_url),
+        ]
+    )
+    session = _Session(lambda *_args: next(responses))
+
+    response = asyncio.run(
+        source_download._open_validated_request(
+            session,
+            "GET",
+            "https://example.test/start",
+        )
+    )
+
+    assert response.status == 206
+    assert str(session.calls[1][1]) == signed_url
+    assert session.calls[1][1].raw_query_string == signed_url.split("?", 1)[1]
+
+
 def test_public_resolver_rejects_rebound_private_address(monkeypatch) -> None:
     class RebindingResolver:
         def __init__(self) -> None:

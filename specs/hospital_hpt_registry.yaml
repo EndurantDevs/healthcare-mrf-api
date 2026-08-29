@@ -4883,6 +4883,7 @@ hospitals:
 - hospital_id: hospital-001503
   name: Comanche County Medical Center
   cms_hpt_url: https://comanchecmc.com/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbCCMCCOMANCHETX&type=CDMWithoutLabel&fileType=CSV
 - hospital_id: hospital-001504
   name: CommonSpirit Bob Wilson Memorial Hospital
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt

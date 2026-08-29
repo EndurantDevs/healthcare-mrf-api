@@ -338,12 +338,19 @@ async def test_locator_fetch_records_download_parse_and_cancellation_errors(
         observations.append((args, kwargs))
 
     async def fail_download(*_args, **_kwargs):
-        raise ValueError("download failed")
+        error = ValueError("download failed")
+        setattr(error, "_ptg2_response_body_started", False)
+        raise error
 
     monkeypatch.setattr(acquisition, "_record_locator_observation", record)
     monkeypatch.setattr(acquisition, "download_raw_artifact", fail_download)
     failed = await acquisition.fetch_locator(locator_input, object())
     assert failed.error_code == "value"
+    assert failed.fetch_failed is True
+    assert (
+        acquisition.candidates_from_locators((failed,))[0].initial_error_code
+        == "value"
+    )
     assert observations[-1][0][3] == "fetch_failed"
 
     locator_path = tmp_path / "cms-hpt.txt"
@@ -356,6 +363,7 @@ async def test_locator_fetch_records_download_parse_and_cancellation_errors(
     monkeypatch.setattr(acquisition, "download_raw_artifact", download)
     invalid = await acquisition.fetch_locator(locator_input, object())
     assert invalid.error_code == "hospitalhptlocator"
+    assert invalid.fetch_failed is False
     assert observations[-1][0][3] == "invalid"
 
     async def cancel(*_args, **_kwargs):

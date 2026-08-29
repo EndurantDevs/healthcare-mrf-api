@@ -20,12 +20,14 @@ HOSPITAL_HPT_REGISTRY_PATH = (
 )
 EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT = 7_314
 EXPECTED_HOSPITAL_HPT_REGISTRY_SHA256 = (
-    "b55db5a55155d062f15d53ccc96c9ba08e82f38ddffdbd34e52a88770bde3a02"
+    "c3155b091c94bdb8c8e2766e657b67410eb88daf7d8f59967dd118cbc66a539e"
 )
 MAX_HOSPITAL_HPT_SELECTION = 200
 _DOCUMENT_FIELDS = frozenset({"version", "hospitals"})
 _HOSPITAL_REQUIRED_FIELDS = frozenset({"hospital_id", "name", "cms_hpt_url"})
-_HOSPITAL_OPTIONAL_FIELDS = frozenset({"locator_name", "locator_mrf_url"})
+_HOSPITAL_OPTIONAL_FIELDS = frozenset(
+    {"fallback_mrf_url", "locator_name", "locator_mrf_url"}
+)
 _SELECTION_FIELDS = frozenset(
     {"hospital_id", "hospital_ids", "all_hospitals", "test_mode"}
 )
@@ -71,23 +73,27 @@ def _strict_text(value: Any, field: str) -> str:
     return value
 
 
-def _validated_locator(value: Any) -> str:
-    locator = _strict_text(value, "cms_hpt_url")
-    if any(character.isspace() for character in locator) or "#" in locator:
-        raise _registry_error("cms_hpt_url_invalid")
+def _validated_http_url(value: Any, field: str) -> str:
+    url = _strict_text(value, field)
+    if any(character.isspace() for character in url) or "#" in url:
+        raise _registry_error(f"{field}_invalid")
     try:
-        parsed = urlsplit(locator)
+        parsed = urlsplit(url)
         _validated_port = parsed.port
     except ValueError as exc:
-        raise _registry_error("cms_hpt_url_invalid") from exc
+        raise _registry_error(f"{field}_invalid") from exc
     if (
         parsed.scheme not in {"http", "https"}
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
     ):
-        raise _registry_error("cms_hpt_url_invalid")
-    return locator
+        raise _registry_error(f"{field}_invalid")
+    return url
+
+
+def _validated_locator(value: Any) -> str:
+    return _validated_http_url(value, "cms_hpt_url")
 
 
 def _validated_mrf_selector(value: Any) -> str:
@@ -147,6 +153,10 @@ def _load_hospital_hpt_registry_path(
         if "locator_mrf_url" in entry:
             hospital_by_field["locator_mrf_url"] = _validated_mrf_selector(
                 entry["locator_mrf_url"]
+            )
+        if "fallback_mrf_url" in entry:
+            hospital_by_field["fallback_mrf_url"] = _validated_http_url(
+                entry["fallback_mrf_url"], "fallback_mrf_url"
             )
         hospitals.append(hospital_by_field)
     return tuple(hospitals)

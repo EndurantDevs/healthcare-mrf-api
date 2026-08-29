@@ -33,11 +33,12 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert sum("locator_name" in entry for entry in hospitals) == 1_194
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 637
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 1
     assert all(
         {"hospital_id", "name", "cms_hpt_url"} <= set(entry)
         <= {
-            "hospital_id", "name", "cms_hpt_url", "locator_name",
-            "locator_mrf_url",
+            "fallback_mrf_url", "hospital_id", "name", "cms_hpt_url",
+            "locator_name", "locator_mrf_url",
         }
         for entry in hospitals
     )
@@ -98,6 +99,21 @@ def test_optional_locator_mrf_url_is_validated_and_preserved(tmp_path):
         registry.HospitalHptRegistryError, match="locator_mrf_url_invalid"
     ):
         _load(tmp_path, text.replace("https://files.example/current.csv", "file.csv"))
+
+
+def test_optional_fallback_mrf_url_preserves_stable_query(tmp_path):
+    fallback = "https://files.example/report?facility=one&type=csv"
+    text = _document().replace(
+        "    cms_hpt_url:",
+        f"    fallback_mrf_url: {fallback}\n    cms_hpt_url:",
+    )
+
+    assert _load(tmp_path, text)[0]["fallback_mrf_url"] == fallback
+
+    with pytest.raises(
+        registry.HospitalHptRegistryError, match="fallback_mrf_url_invalid"
+    ):
+        _load(tmp_path, text.replace("https://files.example", "file://local"))
 
 
 @pytest.mark.parametrize(

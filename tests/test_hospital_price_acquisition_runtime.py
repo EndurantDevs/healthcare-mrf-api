@@ -57,6 +57,84 @@ def test_content_only_locator_binding_preserves_unknown_location():
     assert candidate.locator_name is None
 
 
+def test_fetch_failure_uses_only_an_explicit_reviewed_fallback():
+    acquisition = _acquisition_module()
+    hospital_by_field = {
+        "hospital_id": "a",
+        "name": "Hospital A",
+        "fallback_mrf_url": "https://files.example/report?facility=a",
+    }
+    failed_fetch = acquisition.LocatorResult(
+        "https://a/cms-hpt.txt", "locator", "fetch-observation",
+        (hospital_by_field,), None, "clientresponse", "403", fetch_failed=True,
+    )
+    invalid_body = acquisition.LocatorResult(
+        "https://a/cms-hpt.txt", "locator", "parse-observation",
+        (hospital_by_field,), None, "hospitalhptlocator", "invalid",
+        fetch_failed=False,
+    )
+
+    fallback = acquisition.candidates_from_locators((failed_fetch,))[0]
+    rejected = acquisition.candidates_from_locators((invalid_body,))[0]
+
+    assert fallback.source_url == hospital_by_field["fallback_mrf_url"]
+    assert fallback.initial_error_code is None
+    assert fallback.observation_id == "fetch-observation"
+    assert rejected.source_url == invalid_body.url
+    assert rejected.initial_error_code == "hospitalhptlocator"
+
+
+@pytest.mark.parametrize(
+    ("response_body_started", "expected_fetch_failure"),
+    ((True, False), (False, True), (None, False)),
+)
+@pytest.mark.asyncio
+async def test_locator_fallback_requires_explicit_prebody_failure(
+    monkeypatch,
+    response_body_started,
+    expected_fetch_failure,
+):
+    acquisition = _acquisition_module()
+    locator_url = "https://a/cms-hpt.txt"
+    hospital_by_field = {
+        "hospital_id": "a",
+        "name": "Hospital A",
+        "fallback_mrf_url": "https://files.example/report?facility=a",
+    }
+    partial_error = OSError("partial locator body")
+    if response_body_started is not None:
+        setattr(
+            partial_error,
+            "_ptg2_response_body_started",
+            response_body_started,
+        )
+
+    async def fail_download(*_args, **_kwargs):
+        raise partial_error
+
+    async def record_observation(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", fail_download)
+    monkeypatch.setattr(acquisition, "_record_locator_observation", record_observation)
+
+    locator_result = await acquisition.fetch_locator(
+        (locator_url, (hospital_by_field,)),
+        object(),
+    )
+    candidate = acquisition.candidates_from_locators((locator_result,))[0]
+
+    assert locator_result.fetch_failed is expected_fetch_failure
+    assert locator_result.error_code == "os"
+    assert locator_result.error_detail == "partial locator body"
+    assert candidate.source_url == (
+        hospital_by_field["fallback_mrf_url"]
+        if expected_fetch_failure
+        else locator_url
+    )
+    assert candidate.initial_error_code == (None if expected_fetch_failure else "os")
+
+
 @pytest.mark.asyncio
 async def test_source_download_updates_shared_attempts_and_reports_errors(monkeypatch):
     acquisition = _acquisition_module()

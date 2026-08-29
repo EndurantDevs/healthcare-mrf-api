@@ -14941,7 +14941,9 @@ async def test_linked_rows_use_compatibility_owner(monkeypatch):
         per_source_limit=5,
         timeout=3,
         run_id="run_1",
-        source_ids=["source_b", "source_a"],
+        runtime_options=importer.LinkedResourceRuntimeOptions(
+            source_ids=("source_b", "source_a"),
+        ),
     )
 
     assert linked_resource_counts == {"Practitioner": 1}
@@ -15060,8 +15062,10 @@ async def test_import_linked_resource_rows_reports_progress_when_flushing(monkey
         per_source_limit=5,
         timeout=3,
         run_id="run_1",
-        progress_callback=linked_progress,
-        flush_rows=1,
+        runtime_options=importer.LinkedResourceRuntimeOptions(
+            progress_callback=linked_progress,
+            flush_rows=1,
+        ),
     )
 
     assert counts == {"Practitioner": 1, "Location": 1}
@@ -15133,11 +15137,12 @@ async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
     assert linked_kwargs[0]["concurrency"] == 5
     assert linked_kwargs[0]["timeout"] == 3
     assert linked_kwargs[0]["run_id"] == "run_1"
-    assert linked_kwargs[0]["source_ids"] == ["source_a"]
-    assert linked_kwargs[0]["track_seen"] is False
-    assert linked_kwargs[0]["seen_table"] is None
-    assert linked_kwargs[0]["deadline_seconds"] == 0
-    assert callable(linked_kwargs[0]["progress_callback"])
+    runtime_options = linked_kwargs[0]["runtime_options"]
+    assert runtime_options.source_ids == ("source_a",)
+    assert runtime_options.track_seen is False
+    assert runtime_options.seen_table is None
+    assert runtime_options.deadline_seconds == 0
+    assert callable(runtime_options.progress_callback)
 
 
 def _complete_resource_fetch(model, rows):
@@ -32529,9 +32534,32 @@ async def test_linked_resource_import_is_bounded_and_cancels_deadline_work(monke
         per_source_limit=1,
         timeout=1,
         run_id="run",
-        deadline_seconds=1,
+        runtime_options=importer.LinkedResourceRuntimeOptions(
+            deadline_seconds=1,
+        ),
     )
     assert import_counts == {}
+
+
+@pytest.mark.asyncio
+async def test_linked_resource_fetch_logs_isolated_failure(monkeypatch, caplog):
+    monkeypatch.setattr(
+        importer,
+        "_fetch_linked_resource_row",
+        AsyncMock(side_effect=RuntimeError("unavailable")),
+    )
+
+    with caplog.at_level("DEBUG"):
+        result = await importer._fetch_linked_resource_reference(
+            {"source_id": "source-a"},
+            ("Organization", "org-a", "Organization/org-a", "org_refs"),
+            asyncio.Semaphore(1),
+            timeout=1,
+            run_id="run",
+        )
+
+    assert result is None
+    assert "Organization/org-a" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -32566,7 +32594,9 @@ async def test_linked_resource_import_stops_after_wait_timeout(monkeypatch):
         per_source_limit=1,
         timeout=1,
         run_id="run",
-        deadline_seconds=1,
+        runtime_options=importer.LinkedResourceRuntimeOptions(
+            deadline_seconds=1,
+        ),
     )
     assert import_counts == {}
     wait_for.assert_awaited_once()
@@ -35872,7 +35902,7 @@ async def test_import_linked_resource_rows_ignores_zero_upsert(monkeypatch):
         per_source_limit=1,
         timeout=1,
         run_id="run-a",
-        flush_rows=1,
+        runtime_options=importer.LinkedResourceRuntimeOptions(flush_rows=1),
     ) == {}
 
 
