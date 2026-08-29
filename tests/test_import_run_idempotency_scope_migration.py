@@ -94,7 +94,7 @@ def _assert_exact_checks(migration, calls):
         assert str(options["postgresql_where"]) == migration.ACTIVE_PREDICATE
 
 
-def test_migration_contract_keeps_global_and_composite_indexes():
+def test_preparation_contract_matches_activation_model_boundary():
     migration = _load_migration()
     model_indexes = {
         index["name"]: index
@@ -106,15 +106,16 @@ def test_migration_contract_keeps_global_and_composite_indexes():
         migration.down_revision
         == "20260828120000_hospital_price_modifier_payer_identity"
     )
-    assert model_indexes[migration.LEGACY_INDEX_NAME]["index_elements"] == (
-        migration.LEGACY_INDEX_COLUMNS
-    )
+    assert migration.LEGACY_INDEX_NAME not in model_indexes
+    assert migration.LEGACY_INDEX_COLUMNS == ("idempotency_key",)
     assert model_indexes[migration.INDEX_NAME]["index_elements"] == (
         migration.INDEX_COLUMNS
     )
-    for index_name in (migration.LEGACY_INDEX_NAME, migration.INDEX_NAME):
-        assert model_indexes[index_name]["unique"] is True
-        assert model_indexes[index_name]["where"] == migration.ACTIVE_PREDICATE
+    assert model_indexes[migration.INDEX_NAME]["unique"] is True
+    assert (
+        model_indexes[migration.INDEX_NAME]["where"]
+        == migration.ACTIVE_PREDICATE
+    )
 
 
 @pytest.mark.parametrize("initial_state", (False, "invalid"))

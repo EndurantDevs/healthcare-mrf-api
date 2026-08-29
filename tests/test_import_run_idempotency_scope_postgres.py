@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 import re
+import subprocess
+import sys
+import uuid
 
+import asyncpg
 import pytest
 from sqlalchemy import select, text, update
-from sqlalchemy.exc import IntegrityError
 
 from api import control_imports
 from db.models import ImportRun, db
@@ -67,7 +72,7 @@ async def _assert_same_importer_integrity_recovery(monkeypatch):
     return real_find, real_find_importer
 
 
-async def _assert_prepared_index_definitions():
+async def _assert_active_index_definition() -> None:
     index_record_by_name = {
         str(index_record.index_name): index_record
         for index_record in (
@@ -98,12 +103,8 @@ async def _assert_prepared_index_definitions():
         ).all()
     }
     assert set(index_record_by_name) == {
-        "import_run_active_idempotency_idx",
         "import_run_importer_active_idempotency_idx",
     }
-    assert "(idempotency_key)" in str(
-        index_record_by_name["import_run_active_idempotency_idx"].index_definition
-    )
     composite_index = index_record_by_name[
         "import_run_importer_active_idempotency_idx"
     ]
@@ -115,10 +116,181 @@ async def _assert_prepared_index_definitions():
     ), predicate
 
 
-async def test_prepared_idempotency_indexes_fail_closed_until_activation(
+def _alembic_env(schema: str) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["HLTHPRT_DB_SCHEMA"] = schema
+    environment.pop("DB_SCHEMA", None)
+    return environment
+
+
+def _run_alembic(schema: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "alembic", *arguments],
+        cwd=Path(__file__).resolve().parents[1],
+        env=_alembic_env(schema),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=180,
+    )
+
+
+async def _index_state(
+    connection: asyncpg.Connection,
+    schema: str,
+    index_name: str,
+) -> asyncpg.Record | None:
+    return await connection.fetchrow(
+        """
+        SELECT table_record.relname AS table_name,
+               index_state.indisvalid,
+               index_state.indisready,
+               index_state.indislive
+          FROM pg_class AS index_record
+          JOIN pg_namespace AS index_namespace
+            ON index_namespace.oid = index_record.relnamespace
+          JOIN pg_index AS index_state
+            ON index_state.indexrelid = index_record.oid
+          JOIN pg_class AS table_record
+            ON table_record.oid = index_state.indrelid
+         WHERE index_namespace.nspname = $1
+           AND index_record.relname = $2
+        """,
+        schema,
+        index_name,
+    )
+
+
+async def _create_activation_schema(connection, schema: str) -> None:
+    predicate = (
+        "status IN ('queued', 'starting', 'running', "
+        "'finalizing', 'canceling')"
+    )
+    await connection.execute(f'CREATE SCHEMA "{schema}"')
+    await connection.execute(
+        f"""
+        CREATE TABLE "{schema}".import_run (
+            importer text NOT NULL,
+            idempotency_key text,
+            status text NOT NULL
+        )
+        """
+    )
+    await connection.execute(
+        f"""
+        CREATE UNIQUE INDEX import_run_active_idempotency_idx
+            ON "{schema}".import_run (idempotency_key)
+         WHERE {predicate}
+        """
+    )
+    await connection.execute(
+        f"""
+        CREATE UNIQUE INDEX import_run_importer_active_idempotency_idx
+            ON "{schema}".import_run (importer, idempotency_key)
+         WHERE {predicate}
+        """
+    )
+
+
+async def _assert_activation_upgrade(connection, schema: str) -> None:
+    stamped = _run_alembic(
+        schema,
+        "stamp",
+        "20260829090000_import_run_idempotency_scope",
+    )
+    assert stamped.returncode == 0, stamped.stdout + stamped.stderr
+    upgraded = _run_alembic(
+        schema,
+        "upgrade",
+        "20260829100000_activate_import_run_idempotency_scope",
+    )
+    assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+    assert await _index_state(
+        connection,
+        schema,
+        "import_run_active_idempotency_idx",
+    ) is None
+
+
+async def _assert_failed_restore_cleanup(connection, schema: str) -> None:
+    await connection.execute(
+        f"""
+        INSERT INTO "{schema}".import_run (importer, idempotency_key, status)
+        VALUES ('hospital-prices', 'shared', 'running'),
+               ('npi', 'shared', 'running')
+        """
+    )
+    failed = _run_alembic(
+        schema,
+        "downgrade",
+        "20260829090000_import_run_idempotency_scope",
+    )
+    assert failed.returncode != 0
+    assert await _index_state(
+        connection,
+        schema,
+        "import_run_active_idempotency_idx",
+    ) is None
+    composite_state = await _index_state(
+        connection,
+        schema,
+        "import_run_importer_active_idempotency_idx",
+    )
+    assert tuple(composite_state) == ("import_run", True, True, True)
+    assert await connection.fetchval(
+        f'SELECT version_num FROM "{schema}".alembic_version'
+    ) == "20260829100000_activate_import_run_idempotency_scope"
+
+
+async def _assert_restore_recovery(connection, schema: str) -> None:
+    await connection.execute(f'DELETE FROM "{schema}".import_run')
+    downgraded = _run_alembic(
+        schema,
+        "downgrade",
+        "20260829090000_import_run_idempotency_scope",
+    )
+    assert downgraded.returncode == 0, downgraded.stdout + downgraded.stderr
+    global_state = await _index_state(
+        connection,
+        schema,
+        "import_run_active_idempotency_idx",
+    )
+    assert tuple(global_state) == ("import_run", True, True, True)
+    assert await _index_state(
+        connection,
+        schema,
+        "import_run_importer_active_idempotency_idx",
+    ) is not None
+
+
+async def test_activation_migration_cleans_failed_global_restore():
+    """Run the activation and failed downgrade against real PostgreSQL."""
+
+    database = os.getenv("HLTHPRT_DB_DATABASE", "")
+    if "test" not in database.lower():
+        pytest.skip("activation migration requires a disposable test database")
+    schema = f"idempotency_activation_{uuid.uuid4().hex[:12]}"
+    connection = await asyncpg.connect(
+        host=os.getenv("HLTHPRT_DB_HOST", "127.0.0.1"),
+        port=int(os.getenv("HLTHPRT_DB_PORT", "5432")),
+        user=os.getenv("HLTHPRT_DB_USER", "postgres"),
+        password=os.getenv("HLTHPRT_DB_PASSWORD", ""),
+        database=database,
+    )
+    try:
+        await _create_activation_schema(connection, schema)
+        await _assert_activation_upgrade(connection, schema)
+        await _assert_failed_restore_cleanup(connection, schema)
+        await _assert_restore_recovery(connection, schema)
+    finally:
+        await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        await connection.close()
+
+
+async def test_active_idempotency_key_is_unique_per_importer(
     monkeypatch,
 ):
-    """Keep global safety while preparing importer-scoped activation."""
+    """Keep cross-import keys independent across races and terminal reuse."""
 
     await _reset_import_run_schema()
     try:
@@ -126,9 +298,13 @@ async def test_prepared_idempotency_indexes_fail_closed_until_activation(
         first, first_created = await _create_run("run_first", "nucc")
         assert first_created is True and first["run_id"] == "run_first"
 
-        with pytest.raises(IntegrityError):
-            await _create_run("run_cross_importer", "npi")
-        await _assert_prepared_index_definitions()
+        cross_importer, cross_created = await _create_run(
+            "run_cross_importer",
+            "npi",
+        )
+        assert cross_created is True
+        assert cross_importer["run_id"] == "run_cross_importer"
+        await _assert_active_index_definition()
 
         real_find, real_find_importer = await _assert_same_importer_integrity_recovery(
             monkeypatch
@@ -159,6 +335,7 @@ async def test_prepared_idempotency_indexes_fail_closed_until_activation(
         )
         assert [run.run_id for run in import_runs] == [
             "run_after_terminal",
+            "run_cross_importer",
             "run_first",
         ]
     finally:
