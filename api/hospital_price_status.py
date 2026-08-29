@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from db.models import db
-from process.hospital_hpt_registry import load_hospital_hpt_registry
+from process.hospital_hpt_registry import hospital_hpt_registry_groups
 
 
 DEFAULT_HOSPITAL_PRICE_PAGE_SIZE = 50
@@ -102,16 +102,45 @@ def _publication_item(row: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _latest_row(
+    rows: list[Mapping[str, Any]], identity_field: str, timestamp_field: str
+) -> Mapping[str, Any]:
+    candidates = [row for row in rows if row.get(identity_field)]
+    return max(
+        candidates,
+        key=lambda row: row.get(timestamp_field)
+        or dt.datetime.min.replace(tzinfo=dt.UTC),
+        default={},
+    )
+
+
 def _status_item(
-    hospital: Mapping[str, str], row: Mapping[str, Any]
+    hospitals: tuple[Mapping[str, str], ...],
+    rows_by_hospital_id: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
+    hospital = hospitals[0]
+    rows = [
+        rows_by_hospital_id.get(alias["hospital_id"], {}) for alias in hospitals
+    ]
+    attempt_row = _latest_row(rows, "attempt_id", "started_at")
+    publication_row = _latest_row(rows, "version_id", "last_success_at")
     return {
         "hospital_id": hospital["hospital_id"],
+        "alias_hospital_ids": [
+            alias["hospital_id"] for alias in hospitals[1:]
+        ],
         "name": hospital["name"],
         "cms_hpt_url": hospital["cms_hpt_url"],
-        "facility_anchor_id": row.get("facility_anchor_id"),
-        "latest_attempt": _attempt_item(row),
-        "publication": _publication_item(row),
+        "facility_anchor_id": next(
+            (
+                row.get("facility_anchor_id")
+                for row in rows
+                if row.get("facility_anchor_id")
+            ),
+            None,
+        ),
+        "latest_attempt": _attempt_item(attempt_row),
+        "publication": _publication_item(publication_row),
     }
 
 
@@ -164,8 +193,8 @@ async def list_hospital_price_status_page(
     if normalized_cursor and _CURSOR_PATTERN.fullmatch(normalized_cursor) is None:
         raise ValueError("cursor is invalid")
     normalized_query = str(query or "").strip().casefold()
-    hospitals, status_rows = await asyncio.gather(
-        asyncio.to_thread(load_hospital_hpt_registry),
+    hospital_groups, status_rows = await asyncio.gather(
+        asyncio.to_thread(hospital_hpt_registry_groups),
         db.all(_STATUS_SQL),
     )
     rows_by_hospital_id = {
@@ -174,10 +203,15 @@ async def list_hospital_price_status_page(
         if mapping.get("hospital_id")
     }
     status_items = [
-        _status_item(hospital, rows_by_hospital_id.get(hospital["hospital_id"], {}))
-        for hospital in hospitals
+        _status_item(hospitals, rows_by_hospital_id)
+        for hospitals in hospital_groups
         if not normalized_query
-        or normalized_query in "\n".join(hospital.values()).casefold()
+        or normalized_query
+        in "\n".join(
+            registry_value
+            for hospital in hospitals
+            for registry_value in hospital.values()
+        ).casefold()
     ]
     summary = _summary(status_items)
     status_items = [

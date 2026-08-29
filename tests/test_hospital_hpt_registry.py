@@ -29,6 +29,22 @@ _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-007195": "4001360464d0b094a10df3bd688d3879f0bc0d6c07ee966021772d689f0aebf7",
 }
 
+_REVIEWED_ALIAS_SAMPLES = {
+    "hospital-000064": "hospital-000063",
+    "hospital-000123": "hospital-000122",
+    "hospital-000162": "hospital-000161",
+    "hospital-001486": "hospital-001483",
+    "hospital-002520": "hospital-002519",
+    "hospital-004667": "hospital-004666",
+    "hospital-005329": "hospital-005328",
+    "hospital-005563": "hospital-001678",
+    "hospital-005564": "hospital-001678",
+    "hospital-005565": "hospital-001678",
+    "hospital-006233": "hospital-005566",
+    "hospital-007207": "hospital-007206",
+    "hospital-007272": "hospital-000586",
+}
+
 
 def _load(tmp_path: Path, text: str) -> tuple[dict[str, str], ...]:
     path = tmp_path / "registry.yaml"
@@ -51,8 +67,9 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
 
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
+    assert len(registry.hospital_hpt_registry_groups()) == 7_240
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_216
+    assert sum("locator_name" in entry for entry in hospitals) == 1_220
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 637
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 16
     assert {
@@ -83,10 +100,31 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert all(
         {"hospital_id", "name", "cms_hpt_url"} <= set(entry)
         <= {
-            "fallback_mrf_url", "hospital_id", "name", "cms_hpt_url",
-            "locator_name", "locator_mrf_url",
+            "alias_of", "fallback_mrf_url", "hospital_id", "name",
+            "cms_hpt_url", "locator_name", "locator_mrf_url",
         }
         for entry in hospitals
+    )
+
+
+def test_checked_in_registry_has_reviewed_canonical_aliases():
+    """Keep reviewed alias identities explicit while preserving every raw ID."""
+
+    hospitals = registry.load_hospital_hpt_registry()
+    hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
+    aliases_by_id = {
+        entry["hospital_id"]: entry["alias_of"]
+        for entry in hospitals
+        if "alias_of" in entry
+    }
+
+    assert len(aliases_by_id) == 74
+    assert {
+        hospital_id: aliases_by_id[hospital_id]
+        for hospital_id in _REVIEWED_ALIAS_SAMPLES
+    } == _REVIEWED_ALIAS_SAMPLES
+    assert hospital_by_id["hospital-000063"]["name"] == (
+        "Advanced Specialty Hospitals of Toledo"
     )
 
 
@@ -148,6 +186,67 @@ def test_duplicate_names_and_locators_are_preserved(tmp_path):
         "Example Hospital",
         "Example Hospital",
     ]
+
+
+def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypatch):
+    locator = "https://hospital.example/cms-hpt.txt"
+    hospitals = _load(
+        tmp_path,
+        _document(locator)
+        + f"""\
+  - hospital_id: hospital-000002
+    name: Example Hospital Alias
+    cms_hpt_url: {locator}
+    alias_of: hospital-000001
+""",
+    )
+    monkeypatch.setattr(registry, "load_hospital_hpt_registry", lambda: hospitals)
+
+    assert registry.hospital_hpt_registry_groups() == (hospitals,)
+    assert registry.selected_hospital_hpt_registry(
+        {"hospital_id": "hospital-000001"}
+    ) == hospitals
+    assert registry.selected_hospital_hpt_registry(
+        {"hospital_id": "hospital-000002"}
+    ) == hospitals
+
+
+@pytest.mark.parametrize(
+    "extra_rows",
+    [
+        """\
+  - hospital_id: hospital-000002
+    name: Alias
+    cms_hpt_url: https://hospital.example/cms-hpt.txt
+    alias_of: hospital-missing
+""",
+        """\
+  - hospital_id: hospital-000002
+    name: Alias
+    cms_hpt_url: https://hospital.example/cms-hpt.txt
+    alias_of: hospital-000002
+""",
+        """\
+  - hospital_id: hospital-000002
+    name: Alias
+    cms_hpt_url: https://other.example/cms-hpt.txt
+    alias_of: hospital-000001
+""",
+        """\
+  - hospital_id: hospital-000002
+    name: Alias
+    cms_hpt_url: https://hospital.example/cms-hpt.txt
+    alias_of: hospital-000001
+  - hospital_id: hospital-000003
+    name: Chained Alias
+    cms_hpt_url: https://hospital.example/cms-hpt.txt
+    alias_of: hospital-000002
+""",
+    ],
+)
+def test_invalid_alias_relationships_fail_closed(tmp_path, extra_rows):
+    with pytest.raises(registry.HospitalHptRegistryError, match="alias_of_invalid"):
+        _load(tmp_path, _document() + extra_rows)
 
 
 def test_optional_locator_name_is_strict_and_preserved(tmp_path):

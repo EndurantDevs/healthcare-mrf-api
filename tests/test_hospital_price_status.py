@@ -25,13 +25,14 @@ _registry = (
     {"hospital_id": "hospital-000002", "name": "Beta", "cms_hpt_url": "https://b.example/cms-hpt.txt"},
     {"hospital_id": "hospital-000003", "name": "Gamma", "cms_hpt_url": "https://c.example/cms-hpt.txt"},
 )
+_registry_groups = tuple((hospital,) for hospital in _registry)
 
 
 def _load_module():
     fake_db_models = types.ModuleType("db.models")
     fake_db_models.db = _FakeDb()
     fake_registry = types.ModuleType("process.hospital_hpt_registry")
-    fake_registry.load_hospital_hpt_registry = lambda: _registry
+    fake_registry.hospital_hpt_registry_groups = lambda: _registry_groups
     replacement_by_module = {
         "db.models": fake_db_models,
         "process.hospital_hpt_registry": fake_registry,
@@ -98,9 +99,9 @@ async def test_registry_load_does_not_block_status_event_loop(monkeypatch):
 
     def load_registry():
         registry_threads.append(threading.get_ident())
-        return _registry
+        return _registry_groups
 
-    monkeypatch.setattr(status_api, "load_hospital_hpt_registry", load_registry)
+    monkeypatch.setattr(status_api, "hospital_hpt_registry_groups", load_registry)
     status_api.db.rows = []
 
     await status_api.list_hospital_price_status_page(limit=1)
@@ -153,6 +154,51 @@ async def test_page_keeps_latest_attempt_separate_from_last_good_publication():
         "failed": 1,
         "unpublished": 2,
     }
+
+
+@pytest.mark.asyncio
+async def test_reviewed_aliases_render_once_and_keep_latest_group_state(monkeypatch):
+    hospitals = (
+        {
+            "hospital_id": "hospital-000001",
+            "name": "Canonical Hospital",
+            "cms_hpt_url": "https://hospital.example/cms-hpt.txt",
+        },
+        {
+            "hospital_id": "hospital-000002",
+            "name": "Canonical Hospitals",
+            "cms_hpt_url": "https://hospital.example/cms-hpt.txt",
+            "alias_of": "hospital-000001",
+        },
+    )
+    monkeypatch.setattr(
+        status_api, "hospital_hpt_registry_groups", lambda: (hospitals,)
+    )
+    status_api.db.rows = [
+        {
+            "hospital_id": "hospital-000001",
+            "version_id": "a" * 64,
+            "generation": 1,
+            "last_success_at": dt.datetime(2026, 8, 24, tzinfo=dt.UTC),
+        },
+        {
+            "hospital_id": "hospital-000002",
+            "attempt_id": "attempt-2",
+            "attempt_status": "failed",
+            "started_at": dt.datetime(2026, 8, 25, tzinfo=dt.UTC),
+        },
+    ]
+
+    page = await status_api.list_hospital_price_status_page(
+        query="hospital-000002", limit=10
+    )
+
+    assert len(page["items"]) == 1
+    assert page["items"][0]["hospital_id"] == "hospital-000001"
+    assert page["items"][0]["alias_hospital_ids"] == ["hospital-000002"]
+    assert page["items"][0]["latest_attempt"]["attempt_id"] == "attempt-2"
+    assert page["items"][0]["publication"]["generation"] == 1
+    assert page["summary"]["total"] == 1
 
 
 @pytest.mark.asyncio

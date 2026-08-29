@@ -163,7 +163,9 @@ def _install_hospital_admission(monkeypatch, database: _HospitalAdmissionDb) -> 
     monkeypatch.setattr(control_imports, "db", database)
     monkeypatch.setattr(control_imports, "importer_names", lambda: {"hospital-prices"})
     monkeypatch.setattr(
-        control_imports, "_validate_hospital_price_params", AsyncMock()
+        control_imports,
+        "_validate_hospital_price_params",
+        AsyncMock(return_value=None),
     )
     monkeypatch.setattr(control_imports, "_active_idempotency_run", active_idempotency)
     monkeypatch.setattr(control_imports, "_active_importer_runs", active_hospital_runs)
@@ -203,6 +205,42 @@ def test_hospital_exact_replay_requires_the_same_canonical_scope():
     assert not control_imports._is_exact_hospital_price_replay(
         {"params": {"all_hospitals": True}},
         _hospital_run("run-selected", {"hospital_id": "hospital-a"}),
+    )
+
+
+def test_reviewed_aliases_share_admission_and_replay_scope(monkeypatch):
+    def expanded_registry(params):
+        requested = params.get("hospital_id")
+        if requested in {"hospital-canonical", "hospital-alias"}:
+            return (
+                {"hospital_id": "hospital-canonical"},
+                {"hospital_id": "hospital-alias"},
+            )
+        raise ValueError("unknown hospital")
+
+    monkeypatch.setattr(
+        control_imports, "selected_hospital_hpt_registry", expanded_registry
+    )
+    monkeypatch.setattr(
+        control_imports, "hospital_price_artifact_store", lambda: object()
+    )
+    monkeypatch.setattr(control_imports, "locator_groups", lambda _hospitals: ())
+    monkeypatch.setattr(
+        control_imports, "configured_resource_limits", lambda *_args: None
+    )
+    canonical_params = control_imports._validate_hospital_price_admission(
+        {"hospital_id": "hospital-canonical"}
+    )
+    alias_params = control_imports._validate_hospital_price_admission(
+        {"hospital_id": "hospital-alias"}
+    )
+    active = _hospital_run("run-active", alias_params)
+
+    assert control_imports._hospital_price_blocking_run(
+        canonical_params, [active]
+    ) is active
+    assert control_imports._is_exact_hospital_price_replay(
+        {"params": canonical_params}, active
     )
 
 
