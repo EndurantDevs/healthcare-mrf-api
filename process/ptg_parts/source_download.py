@@ -28,6 +28,7 @@ from urllib.parse import parse_qsl, urljoin, urlsplit
 
 import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
+from yarl import URL
 
 from process.ptg_parts.artifact_streams import logical_artifact_identity, stream_logical_artifact
 from process.ptg_parts.artifacts import (
@@ -500,13 +501,16 @@ async def _open_validated_request(
 ) -> aiohttp.ClientResponse:
     current_url = str(url)
     current_method = method.upper()
+    should_preserve_url_bytes = False
     for _ in range(_MAX_REDIRECTS + 1):
         await assert_safe_url(current_url)
         request_options_map = dict(kwargs)
         request_options_map.update(_request_ssl_kwargs(current_url))
         response = await session.request(
             current_method,
-            current_url,
+            URL(current_url, encoded=True)
+            if should_preserve_url_bytes
+            else current_url,
             allow_redirects=False,
             **request_options_map,
         )
@@ -520,6 +524,7 @@ async def _open_validated_request(
         next_url = urljoin(str(response.url), location)
         await assert_safe_url(next_url)
         current_url = next_url
+        should_preserve_url_bytes = True
         if response.status == 303 and current_method != "HEAD":
             current_method = "GET"
             kwargs.pop("data", None)
@@ -1104,6 +1109,7 @@ class _SingleGetDownloadState:
     response_status: int | None = None
     content_encoding: str | None = None
     content_type: str | None = None
+    response_body_started: bool = False
 
 
 class _DownloadSizeLimitError(RuntimeError):
@@ -1221,6 +1227,7 @@ async def _stream_single_get_response(
         async for chunk in response.content.iter_chunked(1024 * 1024):
             if not chunk:
                 continue
+            state.response_body_started = True
             state.byte_count += len(chunk)
             if max_bytes is not None and state.byte_count > max_bytes:
                 raise _DownloadSizeLimitError(f"PTG2 max-bytes guard exceeded for {url}")
@@ -1318,6 +1325,34 @@ def _discard_single_get_partial(state: _SingleGetDownloadState) -> None:
     state.next_progress_bytes = _download_progress_interval_bytes()
 
 
+def _annotate_single_get_failure(
+    error: BaseException,
+    state: _SingleGetDownloadState,
+) -> None:
+    setattr(error, "_ptg2_response_body_started", state.response_body_started)
+
+
+def _prepare_single_get_failure(
+    error: Exception,
+    state: _SingleGetDownloadState,
+    *,
+    allow_resume: bool,
+) -> None:
+    _annotate_single_get_failure(error, state)
+    if allow_resume:
+        _preserve_single_get_partial(state, error)
+    else:
+        _discard_single_get_partial(state)
+
+
+def _ensure_download_body_marker(
+    error: BaseException,
+    byte_count: int,
+) -> None:
+    if not hasattr(error, "_ptg2_response_body_started"):
+        setattr(error, "_ptg2_response_body_started", bool(byte_count))
+
+
 def _single_get_result(state: _SingleGetDownloadState) -> _SingleGetResult:
     return (
         state.digest,
@@ -1361,19 +1396,14 @@ async def _download_raw_artifact_single_get(
                 **_user_agent_kwargs(user_agent),
             )
             return _single_get_result(state)
-        except UnsafeUrlError:
+        except UnsafeUrlError as exc:
+            _annotate_single_get_failure(exc, state)
             raise
         except _DownloadSizeLimitError as exc:
-            if allow_resume:
-                _preserve_single_get_partial(state, exc)
-            else:
-                _discard_single_get_partial(state)
+            _prepare_single_get_failure(exc, state, allow_resume=allow_resume)
             raise
         except Exception as exc:
-            if allow_resume:
-                _preserve_single_get_partial(state, exc)
-            else:
-                _discard_single_get_partial(state)
+            _prepare_single_get_failure(exc, state, allow_resume=allow_resume)
             if attempt >= retries:
                 raise
             delay = _download_retry_delay_seconds() * (2 ** attempt)
@@ -1409,17 +1439,21 @@ async def download_raw_artifact(
     await assert_safe_url(url)
     canonical_url = canonicalize_url(url)
     download_key = semantic_hash(canonical_url, domain="ptg2_retained_download_lock")
-    async with async_named_artifact_lock(store, "download", download_key):
-        return await _download_raw_artifact_locked(
-            url,
-            store=store,
-            canonical_url=canonical_url,
-            reuse_raw_artifacts=reuse_raw_artifacts,
-            max_bytes=max_bytes,
-            keep_partial_artifacts=keep_partial_artifacts,
-            exact_get_evidence=exact_get_evidence,
-            user_agent=user_agent,
-        )
+    try:
+        async with async_named_artifact_lock(store, "download", download_key):
+            return await _download_raw_artifact_locked(
+                url,
+                store=store,
+                canonical_url=canonical_url,
+                reuse_raw_artifacts=reuse_raw_artifacts,
+                max_bytes=max_bytes,
+                keep_partial_artifacts=keep_partial_artifacts,
+                exact_get_evidence=exact_get_evidence,
+                user_agent=user_agent,
+            )
+    except BaseException as exc:
+        _ensure_download_body_marker(exc, 0)
+        raise
 
 
 def _publish_downloaded_raw_artifact(
@@ -1930,7 +1964,7 @@ async def _download_raw_artifact_locked(
             keep_partial_artifacts=keep_partial_artifacts,
         )
     )
-    failure_digest = hashlib.sha256()
+    failure_digest, downloaded_byte_count = hashlib.sha256(), 0
     _emit_download_started(url, head, progress_started_at)
     try:
         download_result = await _download_raw_to_path(
@@ -1938,7 +1972,7 @@ async def _download_raw_artifact_locked(
             started_at=progress_started_at, exact_get_evidence=exact_get_evidence,
             user_agent=user_agent, failure_digest=failure_digest,
         )
-        failure_digest = download_result[0]
+        failure_digest, downloaded_byte_count = download_result[:2]
         final_path, actual_sha, actual_size = _validate_and_publish_raw_download(
             url, store, temporary_path, download_result,
             reuse_raw_artifacts, private_stage_directory,
@@ -1949,6 +1983,7 @@ async def _download_raw_artifact_locked(
             final_path, actual_sha, actual_size,
         )
     except BaseException as exc:
+        _ensure_download_body_marker(exc, downloaded_byte_count)
         _record_partial_raw_artifact(
             store, url=url, canonical_url=canonical_url,
             temporary_path=temporary_path, partial_path=partial_path,

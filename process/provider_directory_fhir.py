@@ -2228,6 +2228,9 @@ class BulkExportStreamState:
     retained_resource_rows: list[dict[str, Any]] = field(default_factory=list)
     rows_written_this_run: int = 0
     outputs_processed: int = 0
+    rows_fetched_this_run: int = 0
+    row_limit_reached: bool = False
+    error: str | None = None
 
 
 @dataclass
@@ -2616,6 +2619,19 @@ class ScanPractitionerRoleFetchOptions:
     seed_page_size: int = 5000
     resume_completed_seeds: bool = False
     seen_table: str | None = None
+
+
+@dataclass(frozen=True)
+class LinkedResourceRuntimeOptions:
+    """Optional persistence, progress, and deadline controls for linked rows."""
+
+    source_ids: tuple[str, ...] = ()
+    track_seen: bool = False
+    seen_table: str | None = None
+    progress_callback: Callable[[str, int], Awaitable[None]] | None = None
+    deadline_seconds: int = 0
+    flush_rows: int | None = None
+    dataset_id: str | None = None
 
 
 @dataclass
@@ -53307,6 +53323,303 @@ def _bulk_fetch_runtime_probes(
     return cancel_probe, runtime_probe
 
 
+_LegacyBulkExportOutputs = tuple[list[str], bool | None, int]
+
+
+def _legacy_bulk_cancel_probe(
+    runtime_options: BulkExportRuntimeOptions,
+) -> Callable[[], Awaitable[None]]:
+    """Build the cancellation probe shared by legacy bulk requests."""
+
+    return partial(
+        _bulk_cancel_probe,
+        runtime_options.cancel_ctx,
+        runtime_options.cancel_task,
+        _bulk_deadline_at(runtime_options.deadline_seconds),
+    )
+
+
+def _legacy_bulk_export_result(
+    model: type,
+    stream_state: BulkExportStreamState,
+    polls: int,
+    *,
+    has_next_url_remaining: bool | None = None,
+) -> ResourceFetchResult:
+    """Build the legacy bulk result without changing its accounting contract."""
+
+    return ResourceFetchResult(
+        model=model,
+        rows=stream_state.retained_resource_rows,
+        rows_fetched=stream_state.rows_fetched_this_run,
+        rows_written=stream_state.rows_written_this_run,
+        pages_fetched=stream_state.outputs_processed + polls,
+        complete=not stream_state.error and not stream_state.row_limit_reached,
+        row_limit_reached=stream_state.row_limit_reached,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=(
+            stream_state.row_limit_reached
+            if has_next_url_remaining is None
+            else has_next_url_remaining
+        ),
+        error=stream_state.error,
+        fetch_mode="bulk_export",
+    )
+
+
+def _ready_legacy_bulk_export_outputs(
+    response_payload: dict[str, Any] | None,
+    resource_type: str,
+    model: type,
+) -> _LegacyBulkExportOutputs | ResourceFetchResult | None:
+    """Read output URLs from an immediately ready bulk response."""
+
+    if not _is_bulk_export_status_payload(response_payload):
+        return None
+    output_urls = _bulk_export_output_urls(response_payload, resource_type)
+    requires_access_token = (
+        response_payload["requiresAccessToken"]
+        if isinstance(response_payload.get("requiresAccessToken"), bool)
+        else None
+    )
+    payload_error = _bulk_export_payload_error(response_payload)
+    if payload_error and not output_urls:
+        return _legacy_bulk_export_result(
+            model,
+            BulkExportStreamState(error=payload_error),
+            1,
+        )
+    return output_urls, requires_access_token, 0
+
+
+async def _poll_legacy_bulk_export_outputs(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    start_url: str,
+    status_location: str | None,
+    timeout: int,
+    cancel_probe: Callable[[], Awaitable[None]],
+) -> _LegacyBulkExportOutputs | ResourceFetchResult:
+    """Resolve and poll one accepted legacy bulk export."""
+
+    try:
+        status_url = _resolved_bulk_export_status_url(
+            source_record,
+            start_url,
+            status_location,
+        )
+    except ValueError as exc:
+        return _legacy_bulk_export_result(
+            model,
+            BulkExportStreamState(error=str(exc)),
+            1,
+        )
+    output_urls, poll_error, polls = await _bulk_export_poll_outputs(
+        session,
+        source_record,
+        status_url,
+        resource_type=resource_type,
+        timeout=timeout,
+        cancel_probe=cancel_probe,
+    )
+    if poll_error is not None:
+        return _legacy_bulk_export_result(
+            model,
+            BulkExportStreamState(error=poll_error),
+            max(1, polls),
+            has_next_url_remaining=True,
+        )
+    return output_urls, None, polls
+
+
+async def _legacy_bulk_export_outputs(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    start_url: str,
+    timeout: int,
+    cancel_probe: Callable[[], Awaitable[None]],
+) -> _LegacyBulkExportOutputs | ResourceFetchResult | None:
+    """Start one legacy bulk export and return its output URLs."""
+
+    status_code, headers, response_payload, error = await _bulk_http_get_json(
+        session,
+        source_record,
+        start_url,
+        timeout=timeout,
+        prefer_async=True,
+    )
+    status_location = _clean_text(
+        headers.get("content-location") or headers.get("location")
+    )
+    _bulk_export_log(
+        "start",
+        source_id=source_record.get("source_id"),
+        resource=resource_type,
+        status=status_code,
+        error=error,
+        start_url=_bulk_export_log_url(start_url),
+        status_url=_bulk_capability_log_identity(status_location),
+    )
+    if _should_bulk_export_pre_stream_fallback(status_code, error):
+        return None
+    if status_code == 200:
+        return _ready_legacy_bulk_export_outputs(
+            response_payload,
+            resource_type,
+            model,
+        )
+    return await _poll_legacy_bulk_export_outputs(
+        session,
+        source_record,
+        resource_type,
+        model,
+        start_url,
+        status_location,
+        timeout,
+        cancel_probe,
+    )
+
+
+async def _collect_legacy_bulk_export_outputs(
+    output_urls: list[str],
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    polls: int,
+    per_resource_limit: int,
+    stream_output: Callable[..., Awaitable[tuple[list[dict[str, Any]], int, int, bool, str | None]]],
+) -> ResourceFetchResult | None:
+    """Collect legacy output rows while preserving bounded-stop semantics."""
+
+    stream_state = BulkExportStreamState()
+    for output_url in output_urls:
+        remaining_limit = (
+            max(0, per_resource_limit - stream_state.rows_fetched_this_run)
+            if per_resource_limit > 0
+            else 0
+        )
+        batch_rows, fetched, written, limited, error = await stream_output(
+            output_url,
+            per_resource_limit=remaining_limit,
+        )
+        stream_state.outputs_processed += 1
+        _bulk_export_log(
+            "stream_output",
+            source_id=source_record.get("source_id"),
+            resource=resource_type,
+            fetched=fetched,
+            written=written,
+            limited=limited,
+            error=error,
+        )
+        stream_state.retained_resource_rows.extend(batch_rows)
+        stream_state.rows_fetched_this_run += fetched
+        stream_state.rows_written_this_run += written
+        if error:
+            stream_state.error = error
+            break
+        if limited:
+            stream_state.row_limit_reached = True
+            break
+    if (
+        stream_state.error
+        and stream_state.rows_fetched_this_run == 0
+        and stream_state.rows_written_this_run == 0
+    ):
+        return None
+    return _legacy_bulk_export_result(model, stream_state, polls)
+
+
+async def _fetch_legacy_bulk_export_resource_rows(
+    source_record: dict[str, Any],
+    resource_type: str,
+    *,
+    per_resource_limit: int,
+    timeout: int,
+    run_id: str | None,
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None = None,
+    runtime_options: BulkExportRuntimeOptions = BulkExportRuntimeOptions(),
+) -> ResourceFetchResult | None:
+    """Fetch rows from the non-checkpointed bulk export path."""
+
+    model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
+    start_url = _bulk_export_start_url(source_record, resource_type)
+    if model is None or not start_url:
+        return None
+    cancel_probe = _legacy_bulk_cancel_probe(runtime_options)
+    await cancel_probe()
+    async with _bulk_client_session() as session:
+        output_result = await _legacy_bulk_export_outputs(
+            session, source_record, resource_type, model,
+            start_url, timeout, cancel_probe,
+        )
+        if not isinstance(output_result, tuple):
+            return output_result
+        output_urls, requires_access_token, polls = output_result
+        stream_output = partial(
+            _stream_bulk_export_output_rows,
+            session,
+            source_record,
+            model=model,
+            resource_type=resource_type,
+            timeout=timeout,
+            run_id=run_id,
+            row_batch_handler=row_batch_handler,
+            row_batch_size=runtime_options.row_batch_size,
+            retain_rows=runtime_options.retain_rows,
+            requires_access_token=requires_access_token,
+            resume_options=BulkOutputResumeOptions(
+                row_progress_handler=None,
+                resume_offset=0,
+                expected_etag=None,
+                expected_content_length=None,
+                cancel_probe=cancel_probe,
+            ),
+        )
+        return await _collect_legacy_bulk_export_outputs(
+            output_urls,
+            source_record,
+            resource_type,
+            model,
+            polls,
+            per_resource_limit,
+            stream_output,
+        )
+
+
+def _checkpointed_bulk_fetch_options(
+    source_record: dict[str, Any],
+    timeout: int,
+    run_id: str | None,
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]],
+    runtime_options: BulkExportRuntimeOptions,
+) -> BulkExportFetchOptions:
+    """Build the durable checkpoint options from shared runtime controls."""
+
+    return BulkExportFetchOptions(
+        timeout=timeout,
+        bulk_export_max_pending_seconds=max(
+            1,
+            int(
+                source_record.get("_bulk_export_max_pending_seconds")
+                or DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS
+            ),
+        ),
+        run_id=run_id,
+        row_batch_handler=row_batch_handler,
+        row_batch_size=runtime_options.row_batch_size,
+        retain_rows=runtime_options.retain_rows,
+        cancel_ctx=runtime_options.cancel_ctx,
+        cancel_task=runtime_options.cancel_task,
+        deadline_seconds=runtime_options.deadline_seconds,
+    )
+
+
 async def _fetch_bulk_export_resource_rows(
     source_record: dict[str, Any],
     resource_type: str,
@@ -53318,6 +53631,7 @@ async def _fetch_bulk_export_resource_rows(
     runtime_options: BulkExportRuntimeOptions = BulkExportRuntimeOptions(),
 ) -> ResourceFetchResult | None:
     """Fetch bulk export resource rows for provider-directory ingestion."""
+
     checkpoint_context = source_record.get("_pagination_checkpoint_context")
     if (
         per_resource_limit <= 0
@@ -53328,190 +53642,22 @@ async def _fetch_bulk_export_resource_rows(
             source_record,
             resource_type,
             checkpoint_context,
-            BulkExportFetchOptions(
-                timeout=timeout,
-                bulk_export_max_pending_seconds=(
-                    max(
-                        1,
-                        int(
-                            source_record.get("_bulk_export_max_pending_seconds")
-                            or DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS
-                        ),
-                    )
-                ),
-                run_id=run_id,
-                row_batch_handler=row_batch_handler,
-                row_batch_size=runtime_options.row_batch_size,
-                retain_rows=runtime_options.retain_rows,
-                cancel_ctx=runtime_options.cancel_ctx,
-                cancel_task=runtime_options.cancel_task,
-                deadline_seconds=runtime_options.deadline_seconds,
+            _checkpointed_bulk_fetch_options(
+                source_record,
+                timeout,
+                run_id,
+                row_batch_handler,
+                runtime_options,
             ),
         )
-    model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
-    url = _bulk_export_start_url(source_record, resource_type)
-    if model is None or not url:
-        return None
-    cancel_probe = partial(
-        _bulk_cancel_probe,
-        runtime_options.cancel_ctx,
-        runtime_options.cancel_task,
-        _bulk_deadline_at(runtime_options.deadline_seconds),
-    )
-    await cancel_probe()
-    async with _bulk_client_session() as session:
-        status_code, headers, _payload, error = await _bulk_http_get_json(
-            session,
-            source_record,
-            url,
-            timeout=timeout,
-            prefer_async=True,
-        )
-        status_location = _clean_text(
-            headers.get("content-location") or headers.get("location")
-        )
-        _bulk_export_log(
-            "start",
-            source_id=source_record.get("source_id"),
-            resource=resource_type,
-            status=status_code,
-            error=error,
-            start_url=_bulk_export_log_url(url),
-            status_url=_bulk_capability_log_identity(status_location),
-        )
-        if _should_bulk_export_pre_stream_fallback(status_code, error):
-            return None
-
-        polls = 0
-        requires_access_token: bool | None = None
-        if status_code == 200:
-            if not _is_bulk_export_status_payload(_payload):
-                return None
-            output_urls = _bulk_export_output_urls(_payload, resource_type)
-            if isinstance(_payload.get("requiresAccessToken"), bool):
-                requires_access_token = _payload["requiresAccessToken"]
-            payload_error = _bulk_export_payload_error(_payload)
-            if payload_error and not output_urls:
-                return ResourceFetchResult(
-                    model=model,
-                    rows=[],
-                    rows_fetched=0,
-                    rows_written=0,
-                    pages_fetched=1,
-                    complete=False,
-                    row_limit_reached=False,
-                    page_limit_reached=False,
-                    hard_page_limit_reached=False,
-                    next_url_remaining=False,
-                    error=payload_error,
-                    fetch_mode="bulk_export",
-                )
-        else:
-            try:
-                status_url = _resolved_bulk_export_status_url(
-                    source_record,
-                    url,
-                    status_location,
-                )
-            except ValueError as exc:
-                return ResourceFetchResult(
-                    model=model,
-                    rows=[],
-                    rows_fetched=0,
-                    rows_written=0,
-                    pages_fetched=1,
-                    complete=False,
-                    row_limit_reached=False,
-                    page_limit_reached=False,
-                    hard_page_limit_reached=False,
-                    next_url_remaining=False,
-                    error=str(exc),
-                    fetch_mode="bulk_export",
-                )
-            output_urls, poll_error, polls = await _bulk_export_poll_outputs(
-                session,
-                source_record,
-                status_url,
-                resource_type=resource_type,
-                timeout=timeout,
-                cancel_probe=cancel_probe,
-            )
-            if poll_error is not None:
-                return ResourceFetchResult(
-                    model=model,
-                    rows=[],
-                    rows_fetched=0,
-                    rows_written=0,
-                    pages_fetched=max(1, polls),
-                    complete=False,
-                    row_limit_reached=False,
-                    page_limit_reached=False,
-                    hard_page_limit_reached=False,
-                    next_url_remaining=True,
-                    error=poll_error,
-                    fetch_mode="bulk_export",
-                )
-        retained_resource_rows: list[dict[str, Any]] = []
-        rows_fetched = 0
-        rows_written = 0
-        has_reached_row_limit = False
-        output_error: str | None = None
-        for output_url in output_urls or []:
-            batch_rows, fetched, written, limited, error = await _stream_bulk_export_output_rows(
-                session,
-                source_record,
-                output_url,
-                model=model,
-                resource_type=resource_type,
-                per_resource_limit=max(0, per_resource_limit - rows_fetched) if per_resource_limit > 0 else 0,
-                timeout=timeout,
-                run_id=run_id,
-                row_batch_handler=row_batch_handler,
-                row_batch_size=runtime_options.row_batch_size,
-                retain_rows=runtime_options.retain_rows,
-                requires_access_token=requires_access_token,
-                resume_options=BulkOutputResumeOptions(
-                    row_progress_handler=None,
-                    resume_offset=0,
-                    expected_etag=None,
-                    expected_content_length=None,
-                    cancel_probe=cancel_probe,
-                ),
-            )
-            _bulk_export_log(
-                "stream_output",
-                source_id=source_record.get("source_id"),
-                resource=resource_type,
-                fetched=fetched,
-                written=written,
-                limited=limited,
-                error=error,
-            )
-            retained_resource_rows.extend(batch_rows)
-            rows_fetched += fetched
-            rows_written += written
-            if error:
-                output_error = error
-                break
-            if limited:
-                has_reached_row_limit = True
-                break
-        if output_error and rows_fetched == 0 and rows_written == 0:
-            return None
-        is_complete = not output_error and not has_reached_row_limit
-    return ResourceFetchResult(
-        model=model,
-        rows=retained_resource_rows,
-        rows_fetched=rows_fetched,
-        rows_written=rows_written,
-        pages_fetched=(output_urls and len(output_urls) or 0) + polls,
-        complete=is_complete,
-        row_limit_reached=has_reached_row_limit,
-        page_limit_reached=False,
-        hard_page_limit_reached=False,
-        next_url_remaining=has_reached_row_limit,
-        error=output_error,
-        fetch_mode="bulk_export",
+    return await _fetch_legacy_bulk_export_resource_rows(
+        source_record,
+        resource_type,
+        per_resource_limit=per_resource_limit,
+        timeout=timeout,
+        run_id=run_id,
+        row_batch_handler=row_batch_handler,
+        runtime_options=runtime_options,
     )
 
 
@@ -60577,25 +60723,13 @@ async def _fetch_linked_resource_row(
     return None
 
 
-async def _import_linked_resource_rows(
+def _linked_resource_import_plan(
     source_record: dict[str, Any],
     rows_by_resource: dict[str, list[dict[str, Any]]],
-    *,
     per_source_limit: int,
-    concurrency: int = 5,
-    timeout: int,
-    run_id: str | None,
-    source_ids: list[str] | None = None,
-    track_seen: bool = False,
-    seen_table: str | None = None,
-    progress_callback: Callable[[str, int], Awaitable[None]] | None = None,
-    deadline_seconds: int = 0,
-    flush_rows: int | None = None,
-    dataset_id: str | None = None,
-) -> dict[str, int]:
-    """Import linked resource rows into the provider-directory snapshot."""
-    if per_source_limit <= 0:
-        return {}
+) -> tuple[set[tuple[str, Any]], list[tuple[str, str, str, str]]]:
+    """Return existing keys and the bounded linked-reference fetch plan."""
+
     existing_resource_keys = {
         (resource_type, resource_row.get("resource_id"))
         for resource_type, resource_rows in rows_by_resource.items()
@@ -60604,24 +60738,29 @@ async def _import_linked_resource_rows(
     }
     linked_references: list[tuple[str, str, str, str]] = []
     proof_resource_scope = _source_proof_resource_scope(source_record)
-    for resource_type, resource_id, reference, reference_field in _linked_resource_refs(rows_by_resource):
+    for linked_reference in _linked_resource_refs(rows_by_resource):
+        resource_type, resource_id, _reference, _reference_field = linked_reference
         if len(linked_references) >= per_source_limit:
             break
-        if (
-            proof_resource_scope is not None
-            and resource_type not in proof_resource_scope
-        ):
+        if proof_resource_scope is not None and resource_type not in proof_resource_scope:
             continue
-        if (resource_type, resource_id) in existing_resource_keys:
-            continue
-        linked_references.append(
-            (resource_type, resource_id, reference, reference_field)
-        )
+        if (resource_type, resource_id) not in existing_resource_keys:
+            linked_references.append(linked_reference)
+    return existing_resource_keys, linked_references
 
-    semaphore = asyncio.Semaphore(max(1, concurrency))
 
-    async def _fetch_one(ref: tuple[str, str, str, str]) -> tuple[str, type, dict[str, Any]] | None:
-        resource_type, resource_id, reference, reference_field = ref
+async def _fetch_linked_resource_reference(
+    source_record: dict[str, Any],
+    linked_reference: tuple[str, str, str, str],
+    semaphore: asyncio.Semaphore,
+    *,
+    timeout: int,
+    run_id: str | None,
+) -> tuple[str, type, dict[str, Any]] | None:
+    """Fetch one linked reference under the shared concurrency bound."""
+
+    resource_type, resource_id, reference, reference_field = linked_reference
+    try:
         async with semaphore:
             fetch_result = await _fetch_linked_resource_row(
                 source_record,
@@ -60632,99 +60771,193 @@ async def _import_linked_resource_rows(
                 timeout=timeout,
                 run_id=run_id,
             )
-            if not fetch_result:
-                return None
-            model, resource_row = fetch_result
-            return resource_type, model, resource_row
+        if not fetch_result:
+            return None
+        model, resource_row = fetch_result
+        return resource_type, model, resource_row
+    except Exception:
+        LOGGER.debug(
+            "Failed to fetch linked Provider Directory resource %s/%s",
+            resource_type,
+            resource_id,
+            exc_info=True,
+        )
+        return None
 
-    counts_by_resource: dict[str, int] = {}
-    logical_source_ids = source_ids or [source_record["source_id"]]
-    compatibility_source_id = _compatibility_storage_source_id(logical_source_ids)
-    edge_source_ids = [compatibility_source_id]
-    canonical_api_base = (
-        source_record.get("canonical_api_base") or source_record.get("api_base")
-    )
-    by_model: dict[type, list[dict[str, Any]]] = {}
-    linked_counts_by_name = {"pending_rows": 0}
-    flush_threshold = max(int(flush_rows or _linked_resource_flush_rows()), 1)
 
-    async def flush_pending_rows() -> None:
+@dataclass
+class _LinkedResourceRowBuffer:
+    """Buffer fetched linked rows and persist exact compatibility ownership."""
+
+    existing_resource_keys: set[tuple[str, Any]]
+    compatibility_source_id: str
+    write_options: ProviderDirectoryResourceWriteOptions
+    progress_callback: Callable[[str, int], Awaitable[None]] | None
+    flush_threshold: int
+    rows_by_model: dict[type, list[dict[str, Any]]] = field(default_factory=dict)
+    counts_by_resource: dict[str, int] = field(default_factory=dict)
+    pending_row_count: int = 0
+
+    async def add(
+        self,
+        resource_type: str,
+        model: type,
+        resource_row: dict[str, Any],
+    ) -> None:
+        """Buffer one fetched row and flush at the configured threshold."""
+
+        self.rows_by_model.setdefault(model, []).append(resource_row)
+        self.pending_row_count += 1
+        self.existing_resource_keys.add(
+            (resource_type, resource_row.get("resource_id"))
+        )
+        if self.pending_row_count >= self.flush_threshold:
+            await self.flush()
+
+    async def flush(self) -> None:
         """Persist buffered linked resources and clear the pending batch."""
-        if not by_model:
+
+        if not self.rows_by_model:
             return
-        pending = by_model.copy()
-        by_model.clear()
-        linked_counts_by_name["pending_rows"] = 0
-        for model, resource_rows in pending.items():
+        pending_rows_by_model = self.rows_by_model.copy()
+        self.rows_by_model.clear()
+        self.pending_row_count = 0
+        for model, resource_rows in pending_rows_by_model.items():
             if not resource_rows:
                 continue
-            resource_rows = _rows_for_compatibility_source(
+            compatible_rows = _rows_for_compatibility_source(
                 resource_rows,
-                compatibility_source_id,
+                self.compatibility_source_id,
             )
             imported = await _upsert_resource_rows(
                 model,
-                resource_rows,
-                options=ProviderDirectoryResourceWriteOptions(
-                    run_id=run_id,
-                    track_seen=track_seen,
-                    seen_table=seen_table,
-                    canonical_api_base=canonical_api_base,
-                    source_ids=edge_source_ids,
-                    dataset_scope=_endpoint_dataset_write_scope(
-                        source_record,
-                        dataset_id,
-                    ),
-                ),
+                compatible_rows,
+                options=self.write_options,
             )
-            if imported:
-                resource_name = model.__name__.removeprefix("ProviderDirectory")
-                counts_by_resource[resource_name] = (
-                    counts_by_resource.get(resource_name, 0) + imported
-                )
-                if progress_callback is not None:
-                    await progress_callback(resource_name, imported)
+            if not imported:
+                continue
+            resource_name = model.__name__.removeprefix("ProviderDirectory")
+            self.counts_by_resource[resource_name] = (
+                self.counts_by_resource.get(resource_name, 0) + imported
+            )
+            if self.progress_callback is not None:
+                await self.progress_callback(resource_name, imported)
 
-    tasks = [
-        asyncio.create_task(_fetch_one(linked_reference))
-        for linked_reference in linked_references
-    ]
-    deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
+
+async def _consume_linked_resource_tasks(
+    tasks: list[asyncio.Task],
+    row_buffer: _LinkedResourceRowBuffer,
+    deadline_seconds: int,
+) -> None:
+    """Consume linked fetches until completion or the shared deadline."""
+
+    deadline_at = (
+        time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
+    )
     try:
         for future in asyncio.as_completed(tasks):
             try:
                 if deadline_at is None:
                     fetch_result = await future
                 else:
-                    remaining = deadline_at - time.monotonic()
-                    if remaining <= 0:
-                        break
                     fetch_result = await asyncio.wait_for(
                         future,
-                        timeout=remaining,
+                        timeout=max(0.0, deadline_at - time.monotonic()),
                     )
             except TimeoutError:
                 break
-            except Exception:  # pragma: no cover - defensive per-reference isolation
-                continue
             if not fetch_result:
                 continue
-            fetched_resource_type, model, resource_row = fetch_result
-            by_model.setdefault(model, []).append(resource_row)
-            linked_counts_by_name["pending_rows"] += 1
-            existing_resource_keys.add(
-                (fetched_resource_type, resource_row.get("resource_id"))
-            )
-            if linked_counts_by_name["pending_rows"] >= flush_threshold:
-                await flush_pending_rows()
+            resource_type, model, resource_row = fetch_result
+            await row_buffer.add(resource_type, model, resource_row)
     finally:
         for task in tasks:
             if not task.done():
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-    await flush_pending_rows()
-    return counts_by_resource
+
+
+def _linked_resource_row_buffer(
+    source_record: dict[str, Any],
+    existing_resource_keys: set[tuple[str, Any]],
+    run_id: str | None,
+    runtime_options: LinkedResourceRuntimeOptions,
+) -> _LinkedResourceRowBuffer:
+    """Build the linked-row buffer with one shared write contract."""
+
+    source_ids = list(runtime_options.source_ids) or [source_record["source_id"]]
+    compatibility_source_id = _compatibility_storage_source_id(source_ids)
+    return _LinkedResourceRowBuffer(
+        existing_resource_keys=existing_resource_keys,
+        compatibility_source_id=compatibility_source_id,
+        write_options=ProviderDirectoryResourceWriteOptions(
+            run_id=run_id,
+            track_seen=runtime_options.track_seen,
+            seen_table=runtime_options.seen_table,
+            canonical_api_base=(
+                source_record.get("canonical_api_base")
+                or source_record.get("api_base")
+            ),
+            source_ids=[compatibility_source_id],
+            dataset_scope=_endpoint_dataset_write_scope(
+                source_record,
+                runtime_options.dataset_id,
+            ),
+        ),
+        progress_callback=runtime_options.progress_callback,
+        flush_threshold=max(
+            int(runtime_options.flush_rows or _linked_resource_flush_rows()),
+            1,
+        ),
+    )
+
+
+async def _import_linked_resource_rows(
+    source_record: dict[str, Any],
+    rows_by_resource: dict[str, list[dict[str, Any]]],
+    *,
+    per_source_limit: int,
+    concurrency: int = 5,
+    timeout: int,
+    run_id: str | None,
+    runtime_options: LinkedResourceRuntimeOptions = LinkedResourceRuntimeOptions(),
+) -> dict[str, int]:
+    """Import linked resource rows into the provider-directory snapshot."""
+
+    if per_source_limit <= 0:
+        return {}
+    existing_resource_keys, linked_references = _linked_resource_import_plan(
+        source_record,
+        rows_by_resource,
+        per_source_limit,
+    )
+    row_buffer = _linked_resource_row_buffer(
+        source_record,
+        existing_resource_keys,
+        run_id,
+        runtime_options,
+    )
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    tasks = [
+        asyncio.create_task(
+            _fetch_linked_resource_reference(
+                source_record,
+                linked_reference,
+                semaphore,
+                timeout=timeout,
+                run_id=run_id,
+            )
+        )
+        for linked_reference in linked_references
+    ]
+    await _consume_linked_resource_tasks(
+        tasks,
+        row_buffer,
+        runtime_options.deadline_seconds,
+    )
+    await row_buffer.flush()
+    return row_buffer.counts_by_resource
 
 
 def _uhc_plan_graph_network_predicate_error(
@@ -75351,12 +75584,14 @@ async def _import_resources(
                 concurrency=linked_resource_concurrency,
                 timeout=timeout,
                 run_id=run_id,
-                source_ids=[partition_source["source_id"]],
-                track_seen=stale_cleanup,
-                seen_table=seen_stage_table,
-                progress_callback=linked_progress,
-                deadline_seconds=linked_resource_deadline_seconds,
-                dataset_id=partition_source.get("_endpoint_dataset_id"),
+                runtime_options=LinkedResourceRuntimeOptions(
+                    source_ids=(partition_source["source_id"],),
+                    track_seen=stale_cleanup,
+                    seen_table=seen_stage_table,
+                    progress_callback=linked_progress,
+                    deadline_seconds=linked_resource_deadline_seconds,
+                    dataset_id=partition_source.get("_endpoint_dataset_id"),
+                ),
             )
         await _finalize_source_pagination_checkpoints(
             partition_source,

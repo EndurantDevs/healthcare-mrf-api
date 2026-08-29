@@ -140,7 +140,7 @@ def test_completed_http_digest_is_retained_if_publish_fails(tmp_path, monkeypatc
         lambda *_args, digest, **_kwargs: recorded_digests.append(digest.hexdigest()),
     )
 
-    with pytest.raises(RuntimeError, match="publish failed"):
+    with pytest.raises(RuntimeError, match="publish failed") as failure:
         asyncio.run(
             source_download._download_raw_artifact_locked(
                 "https://example.test/rates.json",
@@ -153,3 +153,4 @@ def test_completed_http_digest_is_retained_if_publish_fails(tmp_path, monkeypatc
         )
 
     assert recorded_digests == [completed_digest.hexdigest()]
+    assert getattr(failure.value, "_ptg2_response_body_started", False) is True

@@ -57,6 +57,7 @@ class LocatorResult:
     records: tuple[HospitalHptLocatorRecord, ...] | None
     error_code: str | None = None
     error_detail: str | None = None
+    fetch_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -244,11 +245,11 @@ async def _record_locator_observation(
 
 
 async def fetch_locator(
-    item: tuple[str, tuple[dict[str, str], ...]], store: PTG2ArtifactStore
+    locator_group: tuple[str, tuple[dict[str, str], ...]], store: PTG2ArtifactStore
 ) -> LocatorResult:
     """Fetch, parse, and persist one deduplicated locator observation."""
 
-    url, hospitals = item
+    url, hospitals = locator_group
     locator, observation, raw = locator_id(url), uuid.uuid4().hex, None
     try:
         raw = await download_raw_artifact(
@@ -257,37 +258,63 @@ async def fetch_locator(
             keep_partial_artifacts=False, exact_get_evidence=True,
             user_agent=_HOSPITAL_USER_AGENT,
         )
-        payload = await asyncio.to_thread(Path(raw.raw_path).read_bytes)
-        records = parse_hospital_hpt_locator(payload)
+        locator_payload = await asyncio.to_thread(Path(raw.raw_path).read_bytes)
+        locator_records = parse_hospital_hpt_locator(locator_payload)
         status = "redirected_verified" if raw.head and raw.head.url != url else "verified"
         await _record_locator_observation(url, locator, observation, status, raw)
-        return LocatorResult(url, locator, observation, hospitals, records)
+        return LocatorResult(url, locator, observation, hospitals, locator_records)
     except (ImportCancelledError, asyncio.CancelledError):
         raise
     except Exception as exc:
         code, detail = error_details(exc)
+        is_fetch_failure = raw is None and (
+            getattr(exc, "_ptg2_response_body_started", None) is False
+        )
         await _record_locator_observation(
-            url, locator, observation, "invalid" if raw else "fetch_failed",
+            url, locator, observation,
+            "fetch_failed" if is_fetch_failure else "invalid",
             raw, code, detail,
         )
-        return LocatorResult(url, locator, observation, hospitals, None, code, detail)
+        return LocatorResult(
+            url,
+            locator,
+            observation,
+            hospitals,
+            None,
+            code,
+            detail,
+            fetch_failed=is_fetch_failure,
+        )
 
 
 def _locator_error_candidates(locator_result: LocatorResult) -> tuple[Candidate, ...]:
-    return tuple(
-        Candidate(
-            hospital_id=hospital["hospital_id"],
-            hospital_name=hospital["name"],
-            locator_id=locator_result.locator_id,
-            observation_id=locator_result.observation_id,
-            source_url=locator_result.url,
-            locator_name=hospital.get("locator_name") or hospital["name"],
-            locator_url=locator_result.url,
-            initial_error_code=locator_result.error_code or "locator_invalid",
-            initial_error_detail=locator_result.error_detail,
+    candidates: list[Candidate] = []
+    for hospital in locator_result.hospitals:
+        fallback_url = (
+            hospital.get("fallback_mrf_url")
+            if locator_result.fetch_failed
+            else None
         )
-        for hospital in locator_result.hospitals
-    )
+        candidates.append(
+            Candidate(
+                hospital_id=hospital["hospital_id"],
+                hospital_name=hospital["name"],
+                locator_id=locator_result.locator_id,
+                observation_id=locator_result.observation_id,
+                source_url=fallback_url or locator_result.url,
+                locator_name=hospital.get("locator_name") or hospital["name"],
+                locator_url=locator_result.url,
+                initial_error_code=(
+                    None
+                    if fallback_url
+                    else locator_result.error_code or "locator_invalid"
+                ),
+                initial_error_detail=(
+                    None if fallback_url else locator_result.error_detail
+                ),
+            )
+        )
+    return tuple(candidates)
 
 
 def candidates_from_locators(

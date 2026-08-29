@@ -177,7 +177,7 @@ async def test_legacy_bulk_fetch_handles_ready_outputs_and_limit(monkeypatch):
                 "type": "Practitioner",
                 "url": f"https://storage.googleapis.com/aetna/{index}.ndjson",
             }
-            for index in range(2)
+            for index in range(3)
         ]
     )
     importer._bulk_http_get_json.return_value = (200, {}, manifest_payload, None)
@@ -193,6 +193,7 @@ async def test_legacy_bulk_fetch_handles_ready_outputs_and_limit(monkeypatch):
     assert fetch_result.rows_written == 2
     assert fetch_result.row_limit_reached is True
     assert fetch_result.complete is False
+    assert fetch_result.pages_fetched == 2
     assert stream_output.await_count == 2
 
 

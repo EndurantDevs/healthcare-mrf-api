@@ -211,3 +211,17 @@ async def test_exact_get_retry_discards_sidecar_and_partial_prefix(
         sidecar_path,
         private_values,
     )
+
+
+@pytest.mark.asyncio
+async def test_exact_get_failure_marks_started_response_body(monkeypatch, tmp_path):
+    partial_path = tmp_path / "artifact.part"
+    harness = _ExactGetRetryHarness(partial_path, "partial body")
+    harness.install(monkeypatch)
+    monkeypatch.setattr(source_download, "_download_retry_count", lambda: 0)
+
+    with pytest.raises(RuntimeError, match="partial body") as failure:
+        await harness.download("https://rates.example.test/part.json")
+
+    assert getattr(failure.value, "_ptg2_response_body_started", False) is True
+    assert not partial_path.exists()
