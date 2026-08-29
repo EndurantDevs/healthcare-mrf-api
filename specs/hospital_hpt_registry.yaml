@@ -17045,6 +17045,7 @@ hospitals:
 - hospital_id: hospital-005234
   name: ProMedica Bay Park Community Hospital
   cms_hpt_url: https://www.promedica.org/cms-hpt.txt
+  locator_name: ProMedica Bay Park Hospital
 - hospital_id: hospital-005235
   name: ProMedica Bay Park Hospital
   cms_hpt_url: https://www.promedica.org/cms-hpt.txt
@@ -17072,6 +17073,7 @@ hospitals:
 - hospital_id: hospital-005243
   name: ProMedica Toledo Hospital Emergency and Urgent Care
   cms_hpt_url: https://www.promedica.org/cms-hpt.txt
+  locator_name: ProMedica Toledo Hospital
 - hospital_id: hospital-005244
   name: ProMedica Wildwood Orthopaedic and Spine Hospital
   cms_hpt_url: https://www.promedica.org/cms-hpt.txt
@@ -21080,6 +21082,7 @@ hospitals:
 - hospital_id: hospital-006471
   name: TEXAS ORTHOPEDIC HOSPITAL
   cms_hpt_url: https://www.texasorthopedic.com/cms-hpt.txt
+  fallback_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/76-0418502_TEXAS-ORTHOPEDIC-HOSPITAL_standardcharges.json?si=dpx-pt-json-access-policy&spr=https&sv=2026-02-06&sr=c&sig=ks%2BgfAjyEHlZmeP2PYJ%2F9NpMuCoRStjTb2bhIy9Y6LM%3D
 - hospital_id: hospital-006472
   name: Texas Rehabilitation Hospital of Arlington
   cms_hpt_url: https://www.texasrehabarlington.com/cms-hpt.txt
@@ -21332,6 +21335,7 @@ hospitals:
 - hospital_id: hospital-006547
   name: THE WOMANS HOSPITAL OF TEXAS
   cms_hpt_url: https://www.womanshospital.com/cms-hpt.txt
+  fallback_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1810381_THE-WOMANS-HOSPITAL-OF-TEXAS_standardcharges.json?si=dpx-pt-json-access-policy&spr=https&sv=2026-02-06&sr=c&sig=ks%2BgfAjyEHlZmeP2PYJ%2F9NpMuCoRStjTb2bhIy9Y6LM%3D
   locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1810381_THE-WOMANS-HOSPITAL-OF-TEXAS_standardcharges.json
 - hospital_id: hospital-006548
   name: The Women's Hospital
@@ -23391,6 +23395,7 @@ hospitals:
 - hospital_id: hospital-007195
   name: WOMAN'S HOSPITAL OF TEXAS
   cms_hpt_url: https://www.womanshospital.com/cms-hpt.txt
+  fallback_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1810381_THE-WOMANS-HOSPITAL-OF-TEXAS_standardcharges.json?si=dpx-pt-json-access-policy&spr=https&sv=2026-02-06&sr=c&sig=ks%2BgfAjyEHlZmeP2PYJ%2F9NpMuCoRStjTb2bhIy9Y6LM%3D
 - hospital_id: hospital-007196
   name: Womens Hospitalat Renaissance
   cms_hpt_url: https://dhrhealth.com/cms-hpt.txt
