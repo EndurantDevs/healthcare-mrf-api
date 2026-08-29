@@ -105,6 +105,7 @@ def test_parser_rejects_oversize_and_non_bytes_payloads():
 def test_parser_rejects_control_characters_embedded_bom_and_invalid_port():
     for payload in (
         b"location-name: Hospital\rmrf-url: https://files.example/mrf.json\n",
+        b"location-name: Hospital\x00\nmrf-url: https://files.example/mrf.json\n",
         b"location-name: Hospital\n\xef\xbb\xbfmrf-url: https://files.example/mrf.json\n",
         b"location-name: Hospital\nmrf-url: https://files.example:invalid/mrf\n",
     ):
@@ -116,6 +117,32 @@ def test_parser_flushes_final_record_without_trailing_newline():
     assert locator.parse_hospital_hpt_locator(
         b"location-name: Hospital\nmrf-url: https://files.example/mrf.json"
     ) == (_record("Hospital"),)
+
+
+def test_parser_accepts_bare_absolute_mrf_url_line():
+    assert locator.parse_hospital_hpt_locator(
+        b"location-name: Hospital\n"
+        b"source-page-url: https://hospital.example/prices\n"
+        b"https://files.example/mrf.json\n"
+    ) == (_record("Hospital"),)
+
+    assert locator.parse_hospital_hpt_locator(
+        b"location-name: Hospital\n"
+        b"source-page-url: https://hospital.example/prices\n"
+        b"HTTPS://files.example/mrf.json\n"
+    ) == (_record("Hospital", "HTTPS://files.example/mrf.json"),)
+
+    with pytest.raises(locator.HospitalHptLocatorError, match="mrf_url"):
+        locator.parse_hospital_hpt_locator(
+            b"location-name: Hospital\nhttps://files.example/mrf.json\n"
+        )
+
+    with pytest.raises(locator.HospitalHptLocatorError, match="mrf_url"):
+        locator.parse_hospital_hpt_locator(
+            b"location-name: Hospital\n"
+            b"source-page-url:\n"
+            b"https://files.example/mrf.json\n"
+        )
 
 
 def test_matcher_normalizes_exact_names_and_deduplicates_content_targets():

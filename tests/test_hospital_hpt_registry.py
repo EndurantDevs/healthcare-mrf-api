@@ -32,7 +32,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
 
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_197
+    assert sum("locator_name" in entry for entry in hospitals) == 1_214
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 637
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 4
     assert {
@@ -61,6 +61,35 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
         }
         for entry in hospitals
     )
+
+
+def test_checked_in_registry_has_reviewed_wvu_legal_name_aliases():
+    hospitals = registry.load_hospital_hpt_registry()
+    hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
+
+    aliases_by_id = {
+        "hospital-000715": "Barnesville Hospital",
+        "hospital-001050": "Camden Clark Medical Center",
+        "hospital-001395": "Berkeley Medical Center",
+        "hospital-001524": "Jackson General Hospital",
+        "hospital-002441": "Grant Memorial Hospital",
+        "hospital-002466": "Garrett Regional Medical Center",
+        "hospital-002547": "Harrison Community Hospital",
+        "hospital-002898": "Thomas Hospitals",
+        "hospital-005193": "Potomac Valley Hospital",
+        "hospital-005213": "Princeton Community Hospital",
+        "hospital-005390": "Reynolds Memorial Hospital",
+        "hospital-006189": "St. Joseph's Hospital",
+        "hospital-007050": "Weirton Medical Center",
+        "hospital-007115": "Summersville Regional Medical Center",
+        "hospital-007117": "West Virginia University Hospitals",
+        "hospital-007132": "Wetzel County Hospital",
+        "hospital-007134": "Wheeling Hospital",
+    }
+    assert {
+        hospital_id: hospital_by_id[hospital_id]["locator_name"]
+        for hospital_id in aliases_by_id
+    } == aliases_by_id
 
 
 def test_checked_in_registry_is_checksum_gated(tmp_path, monkeypatch):
