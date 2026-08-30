@@ -465,7 +465,6 @@ def test_runtime_selection_is_exact_and_source_neutral(monkeypatch):
         {"hospital_id": "hospital-000002", "name": "Two", "cms_hpt_url": "https://two.example/cms-hpt.txt"},
     )
     monkeypatch.setattr(registry, "load_hospital_hpt_registry", lambda: hospitals)
-
     assert registry.selected_hospital_hpt_registry(
         {"hospital_id": "hospital-000002", "test_mode": False, "run_id": "run-1"},
         runtime=True,
@@ -497,6 +496,5 @@ def test_invalid_runtime_selection_fails_closed(monkeypatch, params):
         "load_hospital_hpt_registry",
         lambda: ({"hospital_id": "hospital-000001"},),
     )
-
     with pytest.raises(registry.HospitalHptRegistryError):
         registry.selected_hospital_hpt_registry(params)
