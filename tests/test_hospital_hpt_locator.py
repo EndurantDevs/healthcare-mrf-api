@@ -93,6 +93,26 @@ def test_parser_normalizes_horizontal_tabs():
     ) == (_record("Hospital One"),)
 
 
+def test_parser_normalizes_cr_runs_blank_lines_and_unknown_fields():
+    payload = b"""\
+location-name: Hospital One\r\r
+
+source-page-url: https://hospital.example/prices\r\r
+contact email: billing@hospital.example\r\r
+
+mrf-url: https://files.example/mrf.json\r\r
+"""
+
+    assert locator.parse_hospital_hpt_locator(payload) == (_record("Hospital One"),)
+
+
+def test_parser_keeps_required_field_names_exact():
+    with pytest.raises(locator.HospitalHptLocatorError, match="location_name"):
+        locator.parse_hospital_hpt_locator(
+            b"location name: Hospital\nmrf-url: https://files.example/mrf.json\n"
+        )
+
+
 def test_parser_rejects_oversize_and_non_bytes_payloads():
     with pytest.raises(locator.HospitalHptLocatorError, match="payload_too_large"):
         locator.parse_hospital_hpt_locator(

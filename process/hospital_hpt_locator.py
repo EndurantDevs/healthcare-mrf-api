@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import html
+import re
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -65,7 +66,7 @@ def _decoded_locator(payload: bytes) -> str:
         text = payload.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise _locator_error("utf8") from exc
-    text = text.replace("\r\n", "\n").replace("\t", " ")
+    text = re.sub(r"\r+\n", "\n", text).replace("\t", " ")
     if "\r" in text or "\ufeff" in text:
         raise _locator_error("control_character")
     if any(
@@ -119,7 +120,7 @@ def _line_field(
         return "mrf-url", stripped_line
     raw_key, separator, raw_value = line.partition(":")
     key = raw_key.strip().casefold()
-    if not separator or not key or any(character.isspace() for character in key):
+    if not separator or not key:
         raise _locator_error("line")
     return key, raw_value.strip()
 
@@ -133,9 +134,6 @@ def parse_hospital_hpt_locator(
     fields_by_key: dict[str, str] = {}
     for line in _decoded_locator(payload).split("\n"):
         if not line.strip():
-            if fields_by_key:
-                records.append(_record(fields_by_key))
-                fields_by_key = {}
             continue
         key, value = _line_field(line, fields_by_key)
         if key == "location-name" and key in fields_by_key:
