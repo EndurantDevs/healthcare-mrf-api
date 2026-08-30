@@ -45,7 +45,6 @@ _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-007318": "923f885b47e27d492d193557d2cd671f0d0a63becb3c971ad9092f794fea2b36",
     "hospital-007340": "0e057fbfbc92c7cdfa98bfdd02a06c7f2ce7eb5fe9b48eddac785ed1686fe27c",
 } | dict.fromkeys("hospital-002089 hospital-005970 hospital-005971 hospital-005972 hospital-005973 hospital-005974".split(), "7ba5d031cb09651b7e02fab6d11dadc423e561c6d2649835f276188521688ac1")
-
 _REVIEWED_ALIAS_SAMPLES = {
     f"hospital-{alias}": f"hospital-{canonical}"
     for pair in (
@@ -57,7 +56,6 @@ _REVIEWED_ALIAS_SAMPLES = {
     ).split()
     for alias, canonical in (pair.split(":"),)
 }
-
 _REVIEWED_LOCATOR_NAMES = {
     "hospital-000047": "Adair County Memorial Hospital",
     "hospital-000126": "HANFORD COMMUNITY HOSPITAL",
@@ -67,7 +65,9 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-001880": "Edgerton Hospital and Health Services - Fulton Square Clinic",
     "hospital-001881": "Edgerton Hospital and Health Services - Milton Clinic",
     "hospital-002421": "Grady Health System",
+    "hospital-003240": "Jersey Community Hospital",
     "hospital-005162": "Pioneer Memorial Hospital & Health Services",
+    "hospital-005304": "Ramapo Ridge Behavioral Health",
     "hospital-005915": "Mee Memorial Hospital",
     "hospital-006345": "Summa Rehab Hospital, LLC",
 }
@@ -96,7 +96,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(registry.hospital_hpt_registry_groups()) == 7_108
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
-    assert sum("locator_name" in entry for entry in hospitals) == 1_422
+    assert sum("locator_name" in entry for entry in hospitals) == 1_424
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 644
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 40
     assert {entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry} == set(
