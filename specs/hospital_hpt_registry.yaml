@@ -1696,13 +1696,10 @@ hospitals:
 - hospital_id: hospital-000510
   name: Avera Marshall Regional Medical Center
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
-- hospital_id: hospital-000511
-  name: Avera McKennan
-  cms_hpt_url: https://www.avera.org/cms-hpt.txt
-- hospital_id: hospital-000512
-  name: Avera McKennan
-  cms_hpt_url: https://www.avera.org/cms-hpt.txt
-- hospital_id: hospital-000513
+- hospital_ids:
+  - hospital-000511
+  - hospital-000512
+  - hospital-000513
   name: Avera McKennan
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000514
@@ -2735,10 +2732,9 @@ hospitals:
 - hospital_id: hospital-000824
   name: Beacon Behavioral Hospital LLC
   cms_hpt_url: https://www.perimeterhealthcare.com/cms-hpt.txt
-- hospital_id: hospital-000825
-  name: Beacon Behavioral Hospital New Orleans
-  cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
-- hospital_id: hospital-000826
+- hospital_ids:
+  - hospital-000825
+  - hospital-000826
   name: Beacon Behavioral Hospital New Orleans
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-000827
@@ -4714,10 +4710,9 @@ hospitals:
 - hospital_id: hospital-001432
   name: ClearVista Behavioral Health
   cms_hpt_url: https://newvistahealth.com/cms-hpt.txt
-- hospital_id: hospital-001433
-  name: Clearwater Valley Health
-  cms_hpt_url: https://smh-cvh.org/cms-hpt.txt
-- hospital_id: hospital-001434
+- hospital_ids:
+  - hospital-001433
+  - hospital-001434
   name: Clearwater Valley Health
   cms_hpt_url: https://smh-cvh.org/cms-hpt.txt
 - hospital_id: hospital-001435
@@ -4886,12 +4881,9 @@ hospitals:
   name: COLON & RECTAL SURGERY OF LAS VEGAS
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
   alias_of: hospital-001483
-- hospital_id: hospital-001485
-  name: COLON AND RECTAL SURGERY OF LAS VEGAS
-  cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
-  alias_of: hospital-001483
-  locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1762537_SUNRISE-HOSPITAL-AND-MEDICAL-CENTER_standardcharges.json
-- hospital_id: hospital-001486
+- hospital_ids:
+  - hospital-001485
+  - hospital-001486
   name: COLON AND RECTAL SURGERY OF LAS VEGAS
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
   alias_of: hospital-001483
@@ -5519,12 +5511,9 @@ hospitals:
   name: Crittenton Children’s Center
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
   locator_mrf_url: https://www.saintlukeskc.org/hpt/46/440545297_SaintLukesHospitalCrittentonChildrensCenter_standardcharges.json
-- hospital_id: hospital-001679
-  name: Crittenton Children’s Center
-  cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
-  alias_of: hospital-001678
-  locator_mrf_url: https://www.saintlukeskc.org/hpt/46/440545297_SaintLukesHospitalCrittentonChildrensCenter_standardcharges.json
-- hospital_id: hospital-001680
+- hospital_ids:
+  - hospital-001679
+  - hospital-001680
   name: Crittenton Children’s Center
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
   alias_of: hospital-001678
@@ -7189,10 +7178,9 @@ hospitals:
 - hospital_id: hospital-002198
   name: Falls Community Hospital and Clinic
   cms_hpt_url: https://fallshospital.com/cms-hpt.txt
-- hospital_id: hospital-002199
-  name: Family Care Center at Bogata
-  cms_hpt_url: https://titusregional.com/cms-hpt.txt
-- hospital_id: hospital-002200
+- hospital_ids:
+  - hospital-002199
+  - hospital-002200
   name: Family Care Center at Bogata
   cms_hpt_url: https://titusregional.com/cms-hpt.txt
 - hospital_id: hospital-002201
@@ -10395,13 +10383,10 @@ hospitals:
 - hospital_id: hospital-003157
   name: INTERMOUNTAIN HEALTH PLATTE VALLEY MEDICAL CENTER
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
-- hospital_id: hospital-003158
-  name: Intermountain Health Primary Children's Hospital
-  cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
-- hospital_id: hospital-003159
-  name: Intermountain Health Primary Children's Hospital
-  cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
-- hospital_id: hospital-003160
+- hospital_ids:
+  - hospital-003158
+  - hospital-003159
+  - hospital-003160
   name: Intermountain Health Primary Children's Hospital
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
 - hospital_id: hospital-003161
@@ -11523,12 +11508,9 @@ hospitals:
   name: Las Vegas-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
   locator_name: AMG Specialty Hospital - Las Vegas
-- hospital_id: hospital-003505
-  name: Las Vegas-AMG Specialty Hospital
-  cms_hpt_url: https://amgihm.com/cms-hpt.txt
-  alias_of: hospital-003504
-  locator_name: AMG Specialty Hospital - Las Vegas
-- hospital_id: hospital-003506
+- hospital_ids:
+  - hospital-003505
+  - hospital-003506
   name: Las Vegas-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
   alias_of: hospital-003504
@@ -11926,10 +11908,9 @@ hospitals:
 - hospital_id: hospital-003629
   name: Louisiana Behavioral Health
   cms_hpt_url: https://oceanshealthcare.com/cms-hpt.txt
-- hospital_id: hospital-003630
-  name: Lourdes Counseling Center
-  cms_hpt_url: https://www.yourlourdes.com/cms-hpt.txt
-- hospital_id: hospital-003631
+- hospital_ids:
+  - hospital-003630
+  - hospital-003631
   name: Lourdes Counseling Center
   cms_hpt_url: https://www.yourlourdes.com/cms-hpt.txt
 - hospital_id: hospital-003632
@@ -14435,12 +14416,9 @@ hospitals:
   name: MOUNTAINVIEW CARDIOVASCULAR &THORACIC
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
   alias_of: hospital-004382
-- hospital_id: hospital-004384
-  name: MOUNTAINVIEW CARDIOVASCULAR ANDTHORACIC
-  cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
-  alias_of: hospital-004382
-  locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1762537_SUNRISE-HOSPITAL-AND-MEDICAL-CENTER_standardcharges.json
-- hospital_id: hospital-004385
+- hospital_ids:
+  - hospital-004384
+  - hospital-004385
   name: MOUNTAINVIEW CARDIOVASCULAR ANDTHORACIC
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
   alias_of: hospital-004382
@@ -14469,12 +14447,9 @@ hospitals:
   name: MOUNTAINVIEW PM&R
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
   alias_of: hospital-004391
-- hospital_id: hospital-004393
-  name: MOUNTAINVIEW PMANDR
-  cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
-  alias_of: hospital-004391
-  locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1762537_SUNRISE-HOSPITAL-AND-MEDICAL-CENTER_standardcharges.json
-- hospital_id: hospital-004394
+- hospital_ids:
+  - hospital-004393
+  - hospital-004394
   name: MOUNTAINVIEW PMANDR
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
   alias_of: hospital-004391
@@ -16699,59 +16674,21 @@ hospitals:
 - hospital_id: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
-- hospital_id: hospital-005064
-  alias_of: hospital-005063
-  name: Peconic Bay Medical Center
-  cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
-- hospital_id: hospital-005065
-  alias_of: hospital-005063
-  name: Peconic Bay Medical Center
-  cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
-- hospital_id: hospital-005066
-  alias_of: hospital-005063
-  name: Peconic Bay Medical Center
-  cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
-- hospital_id: hospital-005067
-  alias_of: hospital-005063
-  name: Peconic Bay Medical Center
-  cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
-- hospital_id: hospital-005068
-  alias_of: hospital-005063
-  name: Peconic Bay Medical Center
-  cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
-- hospital_id: hospital-005069
-  alias_of: hospital-005063
-  name: Peconic Bay Medical Center
-  cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
-- hospital_id: hospital-005070
-  alias_of: hospital-005063
-  name: Peconic Bay Medical Center
-  cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
-- hospital_id: hospital-005071
-  alias_of: hospital-005063
-  name: Peconic Bay Medical Center
-  cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
-- hospital_id: hospital-005072
-  alias_of: hospital-005063
-  name: Peconic Bay Medical Center
-  cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
-- hospital_id: hospital-005073
-  alias_of: hospital-005063
-  name: Peconic Bay Medical Center
-  cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
-- hospital_id: hospital-005074
-  alias_of: hospital-005063
-  name: Peconic Bay Medical Center
-  cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
-- hospital_id: hospital-005075
-  alias_of: hospital-005063
-  name: Peconic Bay Medical Center
-  cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
-- hospital_id: hospital-005076
-  alias_of: hospital-005063
-  name: Peconic Bay Medical Center
-  cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
-- hospital_id: hospital-005077
+- hospital_ids:
+  - hospital-005064
+  - hospital-005065
+  - hospital-005066
+  - hospital-005067
+  - hospital-005068
+  - hospital-005069
+  - hospital-005070
+  - hospital-005071
+  - hospital-005072
+  - hospital-005073
+  - hospital-005074
+  - hospital-005075
+  - hospital-005076
+  - hospital-005077
   alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
@@ -18002,12 +17939,9 @@ hospitals:
   name: RML Specialty Hospital Chicago
   cms_hpt_url: https://www.rmlspecialtyhospital.org/cms-hpt.txt
   locator_mrf_url: https://www.rmlspecialtyhospital.org/wp-content/uploads/2026/04/364113692_RMLHealthProvidersLP_standardcharges.csv
-- hospital_id: hospital-005462
-  alias_of: hospital-005461
-  name: RML Specialty Hospital Chicago
-  cms_hpt_url: https://www.rmlspecialtyhospital.org/cms-hpt.txt
-  locator_mrf_url: https://www.rmlspecialtyhospital.org/wp-content/uploads/2026/03/364113692_RMLHealthProvidersLP_shoppableservices.csv
-- hospital_id: hospital-005463
+- hospital_ids:
+  - hospital-005462
+  - hospital-005463
   alias_of: hospital-005461
   name: RML Specialty Hospital Chicago
   cms_hpt_url: https://www.rmlspecialtyhospital.org/cms-hpt.txt
@@ -18016,12 +17950,9 @@ hospitals:
   name: RML Specialty Hospital Hinsdale
   cms_hpt_url: https://www.rmlspecialtyhospital.org/cms-hpt.txt
   locator_mrf_url: https://www.rmlspecialtyhospital.org/wp-content/uploads/2026/04/364113692_RMLHealthProvidersLP_standardcharges.csv
-- hospital_id: hospital-005465
-  alias_of: hospital-005464
-  name: RML Specialty Hospital Hinsdale
-  cms_hpt_url: https://www.rmlspecialtyhospital.org/cms-hpt.txt
-  locator_mrf_url: https://www.rmlspecialtyhospital.org/wp-content/uploads/2026/03/364113692_RMLHealthProvidersLP_shoppableservices.csv
-- hospital_id: hospital-005466
+- hospital_ids:
+  - hospital-005465
+  - hospital-005466
   alias_of: hospital-005464
   name: RML Specialty Hospital Hinsdale
   cms_hpt_url: https://www.rmlspecialtyhospital.org/cms-hpt.txt
@@ -18336,34 +18267,21 @@ hospitals:
   name: Saint Luke's East Hospital
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
   alias_of: hospital-005561
-- hospital_id: hospital-005563
-  name: Saint Luke's Hospital Crittenton Children's Center
-  cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
-  alias_of: hospital-001678
-- hospital_id: hospital-005564
-  name: Saint Luke's Hospital Crittenton Children's Center
-  cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
-  alias_of: hospital-001678
-- hospital_id: hospital-005565
+- hospital_ids:
+  - hospital-005563
+  - hospital-005564
+  - hospital-005565
   name: Saint Luke's Hospital Crittenton Children's Center
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
   alias_of: hospital-001678
 - hospital_id: hospital-005566
   name: Saint Luke's Hospital of Kansas City
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
-- hospital_id: hospital-005567
-  name: Saint Luke's Hospital of Kansas City
-  cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
-  alias_of: hospital-005566
-- hospital_id: hospital-005568
-  name: Saint Luke's Hospital of Kansas City
-  cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
-  alias_of: hospital-005566
-- hospital_id: hospital-005569
-  name: Saint Luke's Hospital of Kansas City
-  cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
-  alias_of: hospital-005566
-- hospital_id: hospital-005570
+- hospital_ids:
+  - hospital-005567
+  - hospital-005568
+  - hospital-005569
+  - hospital-005570
   name: Saint Luke's Hospital of Kansas City
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
   alias_of: hospital-005566
@@ -20558,27 +20476,12 @@ hospitals:
 - hospital_id: hospital-006228
   name: St. Luke's Wood River Standard Charges
   cms_hpt_url: https://stlukesonline.org/cms-hpt.txt
-- hospital_id: hospital-006229
-  name: St. Lukes Hospital of Kansas City
-  cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
-  alias_of: hospital-005566
-  locator_mrf_url: https://www.saintlukeskc.org/hpt/21/440545297_SaintLukesHospitalofKansasCity_standardcharges.json
-- hospital_id: hospital-006230
-  name: St. Lukes Hospital of Kansas City
-  cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
-  alias_of: hospital-005566
-  locator_mrf_url: https://www.saintlukeskc.org/hpt/21/440545297_SaintLukesHospitalofKansasCity_standardcharges.json
-- hospital_id: hospital-006231
-  name: St. Lukes Hospital of Kansas City
-  cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
-  alias_of: hospital-005566
-  locator_mrf_url: https://www.saintlukeskc.org/hpt/21/440545297_SaintLukesHospitalofKansasCity_standardcharges.json
-- hospital_id: hospital-006232
-  name: St. Lukes Hospital of Kansas City
-  cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
-  alias_of: hospital-005566
-  locator_mrf_url: https://www.saintlukeskc.org/hpt/21/440545297_SaintLukesHospitalofKansasCity_standardcharges.json
-- hospital_id: hospital-006233
+- hospital_ids:
+  - hospital-006229
+  - hospital-006230
+  - hospital-006231
+  - hospital-006232
+  - hospital-006233
   name: St. Lukes Hospital of Kansas City
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
   alias_of: hospital-005566
@@ -21112,10 +21015,9 @@ hospitals:
 - hospital_id: hospital-006395
   name: Tahoe Forest Health System
   cms_hpt_url: https://www.tfhd.com/cms-hpt.txt
-- hospital_id: hospital-006396
-  name: Tahoe Forest Hospital District
-  cms_hpt_url: https://www.tfhd.com/cms-hpt.txt
-- hospital_id: hospital-006397
+- hospital_ids:
+  - hospital-006396
+  - hospital-006397
   name: Tahoe Forest Hospital District
   cms_hpt_url: https://www.tfhd.com/cms-hpt.txt
 - hospital_id: hospital-006398
@@ -23740,64 +23642,27 @@ hospitals:
   name: Wright Ranch FED
   cms_hpt_url: https://www.doctorshosplaredo.com/cms-hpt.txt
   locator_mrf_url: https://uhsfilecdn.eskycity.net/ac/233001904_doctors-hospital-of-laredo_standardcharges.csv
-- hospital_id: hospital-007209
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007210
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007211
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007212
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007213
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007214
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007215
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007216
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007217
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007218
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007219
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007220
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007221
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007222
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007223
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007224
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007225
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007226
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007227
-  name: WVU Medicine
-  cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
-- hospital_id: hospital-007228
+- hospital_ids:
+  - hospital-007209
+  - hospital-007210
+  - hospital-007211
+  - hospital-007212
+  - hospital-007213
+  - hospital-007214
+  - hospital-007215
+  - hospital-007216
+  - hospital-007217
+  - hospital-007218
+  - hospital-007219
+  - hospital-007220
+  - hospital-007221
+  - hospital-007222
+  - hospital-007223
+  - hospital-007224
+  - hospital-007225
+  - hospital-007226
+  - hospital-007227
+  - hospital-007228
   name: WVU Medicine
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
 - hospital_id: hospital-007229

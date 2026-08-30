@@ -84,8 +84,8 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(registry.hospital_hpt_registry_groups()) == 7_112
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
-    assert sum("locator_name" in entry for entry in hospitals) == 1_259
-    assert sum("locator_mrf_url" in entry for entry in hospitals) == 636
+    assert sum("locator_name" in entry for entry in hospitals) == 1_410
+    assert sum("locator_mrf_url" in entry for entry in hospitals) == 644
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 31
     assert {entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry} == set(
         _FALLBACK_URL_SHA256_BY_HOSPITAL_ID
@@ -190,12 +190,10 @@ def test_duplicate_names_and_locators_are_preserved(tmp_path):
     locator = "http://hospital.example:8080/nonstandard/path?view=current"
     hospitals = _load(
         tmp_path,
-        _document(locator)
-        + f"""\
-  - hospital_id: hospital-000002
-    name: Example Hospital
-    cms_hpt_url: {locator}
-""",
+        _document(locator).replace(
+            "hospital_id: hospital-000001",
+            "hospital_ids:\n    - hospital-000001\n    - hospital-000002",
+        ),
     )
     assert [entry["cms_hpt_url"] for entry in hospitals] == [locator, locator]
     assert [entry["name"] for entry in hospitals] == [
@@ -208,7 +206,9 @@ def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypat
     locator = "https://hospital.example/cms-hpt.txt"
     hospitals = _load(
         tmp_path,
-        _document(locator)
+        _document(locator).replace(
+            "    cms_hpt_url:", "    locator_mrf_url: https://f.test/a\n    cms_hpt_url:"
+        )
         + f"""\
   - hospital_id: hospital-000002
     name: Example Hospital Alias
@@ -218,6 +218,8 @@ def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypat
     )
     monkeypatch.setattr(registry, "load_hospital_hpt_registry", lambda: hospitals)
 
+    assert hospitals[1]["locator_name"] == "Example Hospital"
+    assert hospitals[1]["locator_mrf_url"] == "https://f.test/a"
     assert registry.hospital_hpt_registry_groups() == (hospitals,)
     assert registry.selected_hospital_hpt_registry(
         {"hospital_id": "hospital-000001"}
@@ -225,7 +227,6 @@ def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypat
     assert registry.selected_hospital_hpt_registry(
         {"hospital_id": "hospital-000002"}
     ) == hospitals
-
 
 @pytest.mark.parametrize(
     "extra_rows",
@@ -330,11 +331,10 @@ def test_optional_locator_mrf_selector_must_be_queryless_and_canonical(
 
 
 def test_duplicate_hospital_id_is_rejected(tmp_path):
-    text = _document() + """\
-  - hospital_id: hospital-000001
-    name: Another Hospital
-    cms_hpt_url: https://another.example/locator
-"""
+    text = _document().replace(
+        "hospital_id: hospital-000001",
+        "hospital_ids:\n    - hospital-000001\n    - hospital-000001",
+    )
 
     with pytest.raises(registry.HospitalHptRegistryError, match="duplicate_hospital_id"):
         _load(tmp_path, text)

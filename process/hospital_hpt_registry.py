@@ -20,11 +20,12 @@ HOSPITAL_HPT_REGISTRY_PATH = (
 )
 EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT = 7_356
 EXPECTED_HOSPITAL_HPT_REGISTRY_SHA256 = (
-    "e2bdb69fdc64cdc9f8746c7070196c46781c8e0ad34ae19f7f341d93feeb9ff2"
+    "de36a93ccb9c1745f97a644351b57527efdc004a6d3d94e209fe8c683413913f"
 )
 MAX_HOSPITAL_HPT_SELECTION = 200
 _DOCUMENT_FIELDS = frozenset({"version", "hospitals"})
-_HOSPITAL_REQUIRED_FIELDS = frozenset({"hospital_id", "name", "cms_hpt_url"})
+_HOSPITAL_REQUIRED_FIELDS = frozenset({"name", "cms_hpt_url"})
+_HOSPITAL_ID_FIELDS = frozenset({"hospital_id", "hospital_ids"})
 _HOSPITAL_OPTIONAL_FIELDS = frozenset(
     {
         "alias_of",
@@ -131,26 +132,39 @@ def _validate_hospital_aliases(hospitals: list[dict[str, str]]) -> None:
             or canonical["cms_hpt_url"] != hospital["cms_hpt_url"]
         ):
             raise _registry_error("alias_of_invalid")
+        hospital.setdefault(
+            "locator_name", canonical.get("locator_name") or canonical["name"]
+        )
+        if "locator_mrf_url" in canonical:
+            hospital.setdefault(
+                "locator_mrf_url", canonical["locator_mrf_url"]
+            )
 
 
-def _validated_hospital_entry(
+def _validated_hospital_entries(
     entry: Any, hospital_ids: set[str]
-) -> dict[str, str]:
-    """Validate one hospital entry and reserve its stable ID."""
+) -> tuple[dict[str, str], ...]:
+    """Validate one shared catalog entry and expand its stable IDs."""
 
     fields = set(entry) if type(entry) is dict else set()
     if (
         type(entry) is not dict
         or not _HOSPITAL_REQUIRED_FIELDS <= fields
-        or fields - _HOSPITAL_REQUIRED_FIELDS - _HOSPITAL_OPTIONAL_FIELDS
+        or len(fields & _HOSPITAL_ID_FIELDS) != 1
+        or fields
+        - _HOSPITAL_REQUIRED_FIELDS
+        - _HOSPITAL_ID_FIELDS
+        - _HOSPITAL_OPTIONAL_FIELDS
     ):
         raise _registry_error("hospital_fields")
-    hospital_id = _validated_hospital_id(entry["hospital_id"])
-    if hospital_id in hospital_ids:
-        raise _registry_error("duplicate_hospital_id")
-    hospital_ids.add(hospital_id)
+    entry_ids = (
+        [entry["hospital_id"]]
+        if "hospital_id" in entry
+        else entry["hospital_ids"]
+    )
+    if type(entry_ids) is not list or not entry_ids:
+        raise _registry_error("hospital_ids_invalid")
     hospital_by_field = {
-        "hospital_id": hospital_id,
         "name": _strict_text(entry["name"], "name"),
         "cms_hpt_url": _validated_locator(entry["cms_hpt_url"]),
     }
@@ -170,7 +184,14 @@ def _validated_hospital_entry(
         hospital_by_field["alias_of"] = _validated_hospital_id(
             entry["alias_of"], "alias_of"
         )
-    return hospital_by_field
+    expanded_hospitals = []
+    for raw_hospital_id in entry_ids:
+        hospital_id = _validated_hospital_id(raw_hospital_id)
+        if hospital_id in hospital_ids:
+            raise _registry_error("duplicate_hospital_id")
+        hospital_ids.add(hospital_id)
+        expanded_hospitals.append({"hospital_id": hospital_id, **hospital_by_field})
+    return tuple(expanded_hospitals)
 
 
 def _load_hospital_hpt_registry_path(
@@ -200,7 +221,7 @@ def _load_hospital_hpt_registry_path(
     hospital_ids: set[str] = set()
     hospitals: list[dict[str, str]] = []
     for entry in document["hospitals"]:
-        hospitals.append(_validated_hospital_entry(entry, hospital_ids))
+        hospitals.extend(_validated_hospital_entries(entry, hospital_ids))
     _validate_hospital_aliases(hospitals)
     return tuple(hospitals)
 
