@@ -17428,6 +17428,7 @@ hospitals:
 - hospital_id: hospital-005304
   name: Ramapo Ridge Psychiatric Hopsital
   cms_hpt_url: https://www.christianhealthnj.org/cms-hpt.txt
+  locator_name: Ramapo Ridge Behavioral Health
 - hospital_id: hospital-005305
   name: Rancho Los Amigos National Rehabilitation Center
   cms_hpt_url: https://dhs.lacounty.gov/cms-hpt.txt
