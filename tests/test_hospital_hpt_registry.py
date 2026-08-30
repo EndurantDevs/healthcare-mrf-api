@@ -41,7 +41,7 @@ _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
 }
 
 _REVIEWED_ALIAS_SAMPLES = {
-    "hospital-000064": "hospital-000063",
+    "hospital-000061": "hospital-000060", "hospital-000064": "hospital-000063",
     "hospital-000123": "hospital-000122", "hospital-000162": "hospital-000161",
     "hospital-001486": "hospital-001483", "hospital-002520": "hospital-002519",
     "hospital-004667": "hospital-004666", "hospital-005329": "hospital-005328",
@@ -53,7 +53,7 @@ _REVIEWED_ALIAS_SAMPLES = {
     "hospital-000655": "hospital-000600", "hospital-000656": "hospital-000592",
     "hospital-000657": "hospital-000606", "hospital-000745": "hospital-000744",
     "hospital-002911": "hospital-000189", "hospital-005797": "hospital-005798",
-    "hospital-006650": "hospital-006649",
+    "hospital-005077": "hospital-005063", "hospital-006650": "hospital-006649",
 }
 
 
@@ -77,7 +77,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 7_256
+    assert len(registry.hospital_hpt_registry_groups()) == 7_127
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
     assert sum("locator_name" in entry for entry in hospitals) == 1_259
@@ -135,7 +135,7 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 100
+    assert len(aliases_by_id) == 229
     assert {
         hospital_id: aliases_by_id[hospital_id]
         for hospital_id in _REVIEWED_ALIAS_SAMPLES
