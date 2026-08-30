@@ -20,8 +20,7 @@ def _script_definitions(tmp_path: Path) -> Path:
     return definitions
 
 
-_PRE_CHILD_INTERRUPT_SCRIPT = r"""
-export HLTHPRT_PLAN_PRICING_V3_CENSUS_STATE_ROOT=$3
+_PRE_CHILD_INTERRUPT_SCRIPT = r"""export HLTHPRT_PLAN_PRICING_V3_CENSUS_STATE_ROOT=$3
 source "$1"
 require_command() { :; }
 verify_reviewed_hashes() { :; }
@@ -73,6 +72,7 @@ def _run_pre_child_interrupt(
         check=False,
         capture_output=True,
         text=True,
+        timeout=10,
     )
 
 
@@ -448,7 +448,7 @@ finish 0
 
 
 @pytest.mark.parametrize(
-    "signal_number, expected_exit",
+    ("signal_number", "expected_exit"),
     [(signal.SIGINT, 130), (signal.SIGTERM, 143)],
 )
 def test_signal_forwards_once_and_finishes_cleanup(

@@ -11,14 +11,13 @@ from scripts.research import plan_pricing_projection_v3_census_contract as contr
 from scripts.research import (
     plan_pricing_projection_v3_census_diagnostics as diagnostics,
 )
+from scripts.research import plan_pricing_projection_v3_census_identity as identity
 
 CENSUS_ENVELOPE_CONTRACT = "healthporta.plan-pricing-v3-census-envelope.v1"
 CENSUS_RUNTIME_ATTESTATION_CONTRACT = (
     "healthporta.plan-pricing-v3-census-runtime-attestation.v1"
 )
-CENSUS_ENVELOPE_SCRIPT_PATH = (
-    "scripts/research/run_plan_pricing_projection_v3_census_envelope.sh"
-)
+CENSUS_ENVELOPE_SCRIPT_PATH = identity.CENSUS_ENVELOPE_SCRIPT_PATH
 _EXPECTED_ENVELOPE_KEYS = frozenset(
     {
         "contract",
@@ -34,8 +33,12 @@ _EXPECTED_ENVELOPE_KEYS = frozenset(
         "expected_child_command_sha256",
         "child_executable_sha256",
         "expected_child_executable_sha256",
+        "expected_source_manifest_sha256",
+        "expected_harness_manifest_sha256",
+        "expected_source_overlay_sha256",
         "child_exit_code",
         "census_job",
+        "census_configmap",
         "census_receipt_sha256",
         "timed_out",
         "probe_verified",
@@ -60,13 +63,28 @@ _EXPECTED_RUNTIME_ATTESTATION_KEYS = frozenset(
         "pod_owner_job_uid",
         "container_name",
         "image_id",
+        "source_sha",
+        "source_manifest_sha256",
+        "harness_manifest_sha256",
+        "source_overlay_sha256",
+        "configmap_name",
+        "configmap_uid",
+        "job_source_configmap_name",
+        "pod_source_configmap_name",
     }
 )
 _EXPECTED_AUTHORITY_KEYS = frozenset(
     {
+        "expected_source_sha",
         "expected_envelope_script_sha256",
         "expected_child_command_sha256",
         "expected_child_executable_sha256",
+        "expected_source_manifest_sha256",
+        "expected_harness_manifest_sha256",
+        "expected_source_overlay_sha256",
+        "expected_census_job",
+        "expected_census_configmap",
+        "expected_target",
         "runtime_attestation",
         "capacity",
     }
@@ -117,6 +135,14 @@ def _is_sha256(field_value: Any) -> bool:
     return (
         isinstance(field_value, str)
         and len(field_value) == 64
+        and not (set(field_value) - set("0123456789abcdef"))
+    )
+
+
+def _is_git_sha(field_value: Any) -> bool:
+    return (
+        isinstance(field_value, str)
+        and len(field_value) == 40
         and not (set(field_value) - set("0123456789abcdef"))
     )
 
@@ -181,9 +207,16 @@ def _is_successful_envelope(envelope_by_field: Mapping[str, Any]) -> bool:
                 "expected_child_command_sha256",
                 "child_executable_sha256",
                 "expected_child_executable_sha256",
+                "expected_source_manifest_sha256",
+                "expected_harness_manifest_sha256",
+                "expected_source_overlay_sha256",
                 "runtime_attestation_sha256",
             )
         )
+        and isinstance(envelope_by_field.get("census_job"), str)
+        and bool(envelope_by_field["census_job"])
+        and isinstance(envelope_by_field.get("census_configmap"), str)
+        and bool(envelope_by_field["census_configmap"])
         and envelope_by_field.get("postgresql_boundary")
         == "Kubernetes QoS does not reserve or cap off-node PostgreSQL"
         and isinstance(cleanup_by_field, Mapping)
@@ -224,24 +257,10 @@ def _is_capacity_authority_match(
     )
 
 
-def _harness_digest(source_by_field: Mapping[str, Any]) -> str | None:
-    harness_files = source_by_field.get("harness_files")
-    if not isinstance(harness_files, list):
-        return None
-    matches = [
-        file_digest
-        for file_entry in harness_files
-        if isinstance(file_entry, list)
-        and len(file_entry) == 2
-        and file_entry[0] == CENSUS_ENVELOPE_SCRIPT_PATH
-        and isinstance((file_digest := file_entry[1]), str)
-    ]
-    return matches[0] if len(matches) == 1 and _is_sha256(matches[0]) else None
-
-
 def _is_runtime_attestation_match(
     runtime_by_field: Mapping[str, Any],
     envelope_by_field: Mapping[str, Any],
+    authority_by_field: Mapping[str, Any],
     attestation_by_field: Any,
 ) -> bool:
     if (
@@ -259,6 +278,8 @@ def _is_runtime_attestation_match(
         attestation_by_field["contract"] == CENSUS_RUNTIME_ATTESTATION_CONTRACT
         and attestation_by_field["job_name"] == runtime_by_field.get("job_name")
         and attestation_by_field["job_name"] == envelope_by_field.get("census_job")
+        and attestation_by_field["job_name"]
+        == authority_by_field.get("expected_census_job")
         and attestation_by_field["pod_name"] == runtime_by_field.get("pod_name")
         and attestation_by_field["pod_uid"] == runtime_by_field.get("pod_uid")
         and attestation_by_field["pod_owner_job_name"]
@@ -266,6 +287,25 @@ def _is_runtime_attestation_match(
         and attestation_by_field["pod_owner_job_uid"] == attestation_by_field["job_uid"]
         and attestation_by_field["container_name"]
         == runtime_by_field.get("container_name")
+        and attestation_by_field["source_sha"]
+        == envelope_by_field.get("reviewed_source_sha")
+        == authority_by_field.get("expected_source_sha")
+        and attestation_by_field["source_manifest_sha256"]
+        == envelope_by_field.get("expected_source_manifest_sha256")
+        == authority_by_field.get("expected_source_manifest_sha256")
+        and attestation_by_field["harness_manifest_sha256"]
+        == envelope_by_field.get("expected_harness_manifest_sha256")
+        == authority_by_field.get("expected_harness_manifest_sha256")
+        and attestation_by_field["source_overlay_sha256"]
+        == envelope_by_field.get("expected_source_overlay_sha256")
+        == authority_by_field.get("expected_source_overlay_sha256")
+        and attestation_by_field["configmap_name"]
+        == envelope_by_field.get("census_configmap")
+        == authority_by_field.get("expected_census_configmap")
+        and attestation_by_field["job_source_configmap_name"]
+        == attestation_by_field["configmap_name"]
+        and attestation_by_field["pod_source_configmap_name"]
+        == attestation_by_field["configmap_name"]
         and isinstance(image_digest, str)
         and (
             image_id == f"containerd://{image_digest}"
@@ -291,7 +331,16 @@ def _external_evidence(
                 "expected_envelope_script_sha256",
                 "expected_child_command_sha256",
                 "expected_child_executable_sha256",
+                "expected_source_manifest_sha256",
+                "expected_harness_manifest_sha256",
+                "expected_source_overlay_sha256",
             )
+        )
+        or not _is_git_sha(authority_by_field.get("expected_source_sha"))
+        or not all(
+            isinstance(authority_by_field.get(field_name), str)
+            and bool(authority_by_field[field_name])
+            for field_name in ("expected_census_job", "expected_census_configmap")
         )
     ):
         return None
@@ -301,6 +350,7 @@ def _external_evidence(
     try:
         attestation_by_field = json.loads(attestation_bytes)
         receipt_sha256 = census_receipt_sha256(receipt_by_field)
+        identity.validated_target(authority_by_field.get("expected_target"))
     except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if hashlib.sha256(attestation_bytes).hexdigest() != envelope_by_field.get(
@@ -319,10 +369,9 @@ def _is_reviewed_identity_bound(
     attestation_by_field: Mapping[str, Any],
     receipt_sha256: str,
 ) -> bool:
+    """Bind reviewed process, runtime, source, target, and resource identity."""
+
     runtime_by_field = receipt_by_field.get("runtime")
-    source_before = receipt_by_field.get("source_before")
-    source_after = receipt_by_field.get("source_after")
-    reviewed_source_sha = envelope_by_field.get("reviewed_source_sha")
     return (
         isinstance(runtime_by_field, Mapping)
         and authority_by_field["expected_envelope_script_sha256"]
@@ -338,18 +387,32 @@ def _is_reviewed_identity_bound(
         and _is_runtime_attestation_match(
             runtime_by_field,
             envelope_by_field,
+            authority_by_field,
             attestation_by_field,
         )
         and envelope_by_field.get("census_job") == runtime_by_field.get("job_name")
         and envelope_by_field.get("census_receipt_sha256") == receipt_sha256
-        and isinstance(source_before, Mapping)
-        and isinstance(source_after, Mapping)
-        and _harness_digest(source_before)
-        == authority_by_field["expected_envelope_script_sha256"]
-        and _harness_digest(source_after)
-        == authority_by_field["expected_envelope_script_sha256"]
-        and source_before.get("declared_git_head") == reviewed_source_sha
-        and source_after.get("declared_git_head") == reviewed_source_sha
+        and authority_by_field["expected_source_sha"]
+        == envelope_by_field.get("reviewed_source_sha")
+        and authority_by_field["expected_source_manifest_sha256"]
+        == envelope_by_field.get("expected_source_manifest_sha256")
+        and authority_by_field["expected_harness_manifest_sha256"]
+        == envelope_by_field.get("expected_harness_manifest_sha256")
+        and authority_by_field["expected_source_overlay_sha256"]
+        == envelope_by_field.get("expected_source_overlay_sha256")
+        and identity.is_source_pair_bound(
+            receipt_by_field,
+            envelope_by_field.get("reviewed_source_sha"),
+            authority_by_field["expected_source_manifest_sha256"],
+            authority_by_field["expected_harness_manifest_sha256"],
+            authority_by_field["expected_envelope_script_sha256"],
+        )
+        and authority_by_field["expected_census_job"]
+        == envelope_by_field.get("census_job")
+        and authority_by_field["expected_census_configmap"]
+        == envelope_by_field.get("census_configmap")
+        and authority_by_field["expected_target"]
+        == receipt_by_field.get("expected_target")
     )
 
 
@@ -403,10 +466,10 @@ def is_accepted(
         isinstance(measured_result, Mapping)
         and isinstance(source_before, Mapping)
         and source_before == source_after
-        and contract._is_cardinality_candidate_accepted(
+        and contract.is_cardinality_candidate_accepted(
             receipt_by_field,
             measured_result,
-            True,
+            source_before == source_after,
         )
         and is_authoritative_envelope(
             receipt_by_field,

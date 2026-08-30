@@ -1,0 +1,646 @@
+#!/usr/bin/env -S python3 -S
+from __future__ import annotations
+
+import base64, json, os, signal, sys, time
+from pathlib import Path
+name = Path(sys.argv[0]).name; args = sys.argv[1:]
+state = Path(os.environ["FAKE_STATE"]); events = state / "events"
+def event(value: str) -> None:
+    with events.open("a", encoding="utf-8") as target:
+        target.write(value + "\n")
+def raise_exit(code: int) -> None: raise SystemExit(code)
+def resource_path(kind: str) -> Path: return state / kind
+if name == "timeout":
+    command_index = next(
+        index + 1
+        for index, argument in enumerate(args)
+        if not argument.startswith("-")
+    )
+    command_path = args[command_index]
+    command = Path(command_path).name
+    forwarded = args[command_index + 1:]
+    if command == "python3" and forwarded[:2] == ["-", "reviewed-child-copy"]:
+        mode = os.environ.get("FAKE_REPLACE_CHILD_DURING_COPY")
+        if mode:
+            child = Path(forwarded[2])
+            child.unlink()
+            if mode == "fifo":
+                os.mkfifo(child)
+            else:
+                child.symlink_to("/dev/zero")
+            event("child_executable_replaced_during_copy")
+        os.execvp(command_path, [command_path, *forwarded])
+    if command == "python3" and forwarded[:1] == ["-"]:
+        observed = tuple(
+            int(os.environ.get(field, "2"))
+            for field in (
+                "FAKE_HOST_AVAILABLE_MEMORY_BYTES",
+                "FAKE_HOST_SWAP_FREE_BYTES",
+                "FAKE_POSTGRESQL_TABLESPACE_FREE_BYTES",
+            )
+        )
+        minimums = tuple(int(value) for value in forwarded[-3:])
+        event("capacity")
+        if os.environ.get("FAKE_REPLACE_CHILD_DURING_CAPACITY") == "1":
+            child = Path(os.environ["FAKE_CHILD_EXECUTABLE"])
+            child.write_text("#!/bin/sh\nexit 0\n")
+            child.chmod(0o755)
+            event("child_executable_replaced")
+        if any(value < minimum for value, minimum in zip(observed, minimums)):
+            raise SystemExit("host or PostgreSQL capacity is below the reviewed minimum")
+        print(*observed)
+        raise SystemExit(0)
+    if command in {"k3s", "systemctl", "systemd-run"}:
+        name, args = command, forwarded
+    else:
+        os.execvp(command_path, [command_path, *forwarded])
+if name == "hostname": print("ns1033171")
+elif name == "git":
+    if "rev-parse" in args:
+        if os.environ.get("FAKE_REPLACE_STATE_ROOT_DURING_GIT") == "1":
+            root = Path(os.environ["FAKE_STATE_ROOT"])
+            root.rename(root.with_name(root.name + ".original"))
+            root.symlink_to(os.environ["FAKE_OUTSIDE_STATE_ROOT"], target_is_directory=True)
+            event("state_root_replaced")
+        print(os.environ["FAKE_SOURCE_SHA"])
+elif name == "sleep": time.sleep(min(float(args[0]), 0.01))
+elif name == "systemd-run":
+    event("lock_create")
+    resource_path("lock").touch()
+    if os.environ.get("FAKE_LOCK_CONTENDED") != "1":
+        Path(args[-1]).write_text(
+            "lock-invocation-uid:" + args[-2] + "\n", encoding="utf-8"
+        )
+    if os.environ.get("FAKE_LOCK_CLIENT_ERROR") == "1": raise SystemExit(75)
+elif name == "systemctl":
+    operation = args[0]
+    after_child = events.exists() and "child" in events.read_text()
+    lock_drift = os.environ.get("FAKE_LOCK_DRIFT_AFTER_CHILD") if after_child else None
+    lock_exists = resource_path("lock").exists() and lock_drift != "gone"
+    if operation == "is-active":
+        if lock_exists:
+            print("active")
+        raise SystemExit(0 if lock_exists else 3)
+    if operation == "show":
+        if any("LoadState" in argument for argument in args):
+            print("loaded" if lock_exists else "not-found")
+        else:
+            print("replacement-invocation" if lock_drift == "replaced" else "lock-invocation-uid")
+    elif operation == "stop":
+        event("lock_stop")
+        resource_path("lock").unlink(missing_ok=True)
+    elif operation == "reset-failed":
+        pass
+elif name == "setsid":
+    os.setsid()
+    if os.environ.get("FAKE_REPLACE_CHILD_AT_SETSID") == "1":
+        child = Path(os.environ["FAKE_CHILD_EXECUTABLE"])
+        replacement = child.with_suffix(".replacement")
+        replacement.write_text("#!/bin/sh\nexit 0\n"); replacement.chmod(0o755)
+        os.replace(replacement, child)
+        event("child_executable_replaced_at_setsid")
+    if os.environ.get("FAKE_MUTATE_CHILD_IN_PLACE_AT_SETSID") == "1":
+        child = Path(os.environ["FAKE_CHILD_EXECUTABLE"])
+        child.write_text("#!/bin/sh\nexit 0\n")
+        event("child_executable_mutated_in_place_at_setsid")
+    if args[0] in {"/dev/fd/9", "/proc/self/fd/9"}:
+        os.lseek(9, 0, os.SEEK_SET)
+        source = os.fdopen(os.dup(9), encoding="utf-8").read()
+        sys.argv = [os.environ["FAKE_CHILD_EXECUTABLE"], *args[1:]]
+        exec(
+            compile(source, "<reviewed-census-child>", "exec"),
+            {"__name__": "__main__"},
+        )
+        raise SystemExit(0)
+    os.execvp(args[0], args)
+elif name == "census-child":
+    event("child")
+    if args[:1] != ["--receipt"]: raise SystemExit("missing census receipt path")
+    receipt_path = Path(args[1])
+    receipt_path.write_text(json.dumps({"accepted": False, "status": "provisional"}, indent=2, sort_keys=True) + "\n")
+    attestation_path = receipt_path.with_name("runtime-attestation.json")
+    attestation_mode = os.environ.get("FAKE_ATTESTATION_MODE", "valid")
+    if attestation_mode == "symlink":
+        target = attestation_path.with_suffix(".target")
+        target.write_text("child-controlled\n"); attestation_path.symlink_to(target)
+        while True: time.sleep(0.1)
+    elif attestation_mode == "missing":
+        time.sleep(0.1)
+        raise SystemExit(1)
+    elif attestation_mode not in {
+        "valid", "malformed", "bare-digest", "empty-image", "job-replaced",
+        "pod-replaced", "annotation-mismatch", "job-source-mismatch",
+        "pod-source-mismatch", "configmap-mutable", "overlay-mismatch",
+        "configmap-replaced", "configmap-replaced-before-first-read",
+    }:
+        raise SystemExit("unexpected attestation mode")
+    while not attestation_path.exists():
+        time.sleep(0.01)
+    args = args[2:]
+    if os.environ.get("FAKE_CHILD_MODE") == "mutate-attestation":
+        mutated = json.loads(attestation_path.read_text()); mutated["job_uid"] = "mutated-job-uid"; mutated["pod_owner_job_uid"] = "mutated-job-uid"; attestation_path.write_text(json.dumps(mutated)); raise SystemExit(0)
+    if os.environ.get("FAKE_CHILD_MODE") == "exit7":
+        raise SystemExit(7)
+    if os.environ.get("FAKE_CHILD_MODE") == "native124":
+        if os.environ.get("FAKE_CHILD_ORPHAN") == "1":
+            resource_path("job").touch()
+            resource_path("configmap").touch()
+        raise SystemExit(124)
+    if os.environ.get("FAKE_CHILD_MODE") == "linger":
+        if os.fork() == 0:
+            signal.signal(signal.SIGTERM, lambda *_: raise_exit(0))
+            signal.signal(signal.SIGALRM, lambda *_: raise_exit(0))
+            signal.alarm(3)
+            while True:
+                signal.pause()
+        raise SystemExit(0)
+    if os.environ.get("FAKE_CHILD_ORPHAN_POD") == "1":
+        resource_path("pod").touch()
+    if os.environ.get("FAKE_DRAIN_DRIFT_AFTER_CHILD") == "1":
+        resource_path("drain").write_text("false")
+    if os.environ.get("FAKE_CHILD_MODE") == "wait":
+        def finish(number, _frame):
+            event("child_signal_" + str(number))
+            raise SystemExit(128 + number)
+        signal.signal(signal.SIGTERM, finish); signal.signal(signal.SIGINT, finish)
+        event("child_ready")
+        while True: signal.pause()
+elif name == "k3s":
+    if not args or args.pop(0) != "kubectl":
+        raise SystemExit("expected kubectl")
+    args = [arg for arg in args if not arg.startswith("--kubeconfig=")
+            and not arg.startswith("--request-timeout=")]
+    namespace = None
+    cleaned: list[str] = []
+    index = 0
+    while index < len(args):
+        if args[index] in {"-n", "--namespace"}:
+            namespace = args[index + 1]
+            index += 2
+        elif args[index].startswith("--as="):
+            index += 1
+        else:
+            cleaned.append(args[index])
+            index += 1
+    args = cleaned
+    operation = args[0]
+    if operation == "config":
+        print("default")
+    elif operation == "exec":
+        desired, node_id, token_env = args[-3:]
+        if node_id != os.environ["FAKE_IMPORT_NODE_ID"]:
+            raise SystemExit("unexpected import node")
+        if token_env != os.environ["FAKE_IMPORT_TOKEN_ENV"]:
+            raise SystemExit("unexpected import token environment")
+        drain_path = resource_path("drain")
+        current = drain_path.read_text().strip() if drain_path.exists() else "false"
+        if desired in {"true", "false"}:
+            restore_error = os.environ.get("FAKE_DRAIN_RESTORE_ERROR")
+            after_child = events.exists() and "child" in events.read_text()
+            if desired == "false" and after_child and restore_error == "before":
+                event("drain_restore_timeout_before")
+                raise SystemExit(75)
+            current = desired
+            drain_path.write_text(current)
+            event("drain_set_" + current)
+            if desired == "false" and after_child and restore_error == "after":
+                event("drain_restore_timeout_after")
+                raise SystemExit(75)
+        else:
+            event("drain_read")
+            final_replace_marker = resource_path("child-replaced-final-fence")
+            if (os.environ.get("FAKE_REPLACE_CHILD_DURING_FINAL_FENCE") == "1"
+                    and events.exists() and "capacity" in events.read_text()
+                    and "child" not in events.read_text()
+                    and not final_replace_marker.exists()):
+                child = Path(os.environ["FAKE_CHILD_EXECUTABLE"])
+                child.write_text("#!/bin/sh\nexit 0\n"); child.chmod(0o755)
+                final_replace_marker.touch()
+                event("child_executable_replaced_during_final_fence")
+        print(current)
+    elif operation == "create":
+        manifest = sys.stdin.read()
+        if "--dry-run=server" in args:
+            if "namespace: arc-runners" in manifest:
+                if os.environ.get("FAKE_QUOTA_PROBE_ALLOWED") == "1":
+                    event("quota_probe_allowed")
+                    print("pod/quota-probe created (server dry run)")
+                    raise SystemExit(0)
+                else:
+                    event("quota_probe_denied")
+                    print("exceeded quota: " + os.environ["FAKE_QUOTA"], file=sys.stderr)
+                    raise SystemExit(1)
+            else:
+                event("probe_denied")
+                print(os.environ["FAKE_DENIAL_MARKER"], file=sys.stderr)
+                raise SystemExit(1)
+        if "kind: ResourceQuota" in manifest:
+            kind = "quota"
+        elif "kind: ValidatingAdmissionPolicyBinding" in manifest:
+            kind = "binding"
+        elif "kind: ValidatingAdmissionPolicy" in manifest:
+            kind = "policy"
+        else:
+            raise SystemExit("unexpected manifest")
+        resource_path(kind).touch()
+        event(kind + "_create")
+        if os.environ.get("FAKE_CREATE_ERROR") == kind:
+            raise SystemExit(75)
+    elif operation == "delete":
+        raw_path = next(
+            argument.removeprefix("--raw=")
+            for argument in args
+            if argument.startswith("--raw=")
+        )
+        if "/resourcequotas/" in raw_path:
+            kind = "quota"
+        elif "/validatingadmissionpolicies/" in raw_path:
+            kind = "policy"
+        elif "/validatingadmissionpolicybindings/" in raw_path:
+            kind = "binding"
+        else:
+            raise SystemExit("unexpected raw delete path")
+        options = json.load(sys.stdin)
+        if options != {
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "preconditions": {"uid": kind + "-uid"},
+            "propagationPolicy": "Foreground",
+        }:
+            raise SystemExit("missing UID delete precondition")
+        if os.environ.get("FAKE_REPLACE_ON_DELETE") == kind:
+            event(kind + "_replace")
+            raise SystemExit("UID precondition failed")
+        if os.environ.get("FAKE_DELETE_LINGER") == kind: resource_path(kind + "-deleting").touch()
+        else: resource_path(kind).unlink(missing_ok=True)
+        event(kind + "_delete")
+    elif operation == "get":
+        kind = args[1]
+        if kind == "--raw":
+            if args[2] == "/version":
+                print(json.dumps({"major": os.environ.get("FAKE_SERVER_MAJOR", "1"), "minor": os.environ.get("FAKE_SERVER_MINOR", "35")}))
+                raise SystemExit(0)
+            resources = ["validatingadmissionpolicies"]
+            if os.environ.get("FAKE_V1_ADMISSION_MISSING") != "1":
+                resources.append("validatingadmissionpolicybindings")
+            print(json.dumps({"resources": [{"name": value} for value in resources]}))
+            raise SystemExit(0)
+        elif (
+            os.environ.get("FAKE_GET_ERROR_AFTER_CHILD") == kind
+            and events.exists()
+            and "child" in events.read_text()
+        ):
+            raise SystemExit(75)
+        if kind == "nodes":
+            print("ns1033171")
+        elif kind == "namespace":
+            pass
+        elif kind == "pods" and "-A" in args:
+            items = []
+            if os.environ.get("FAKE_ARC_LISTENER") == "1":
+                items.append({
+                    "metadata": {
+                        "namespace": "arc-runners",
+                        "labels": {"app.kubernetes.io/component": "listener"},
+                    },
+                    "status": {"phase": "Running"},
+                })
+            drain_kind = os.environ.get("FAKE_ARC_DRAIN")
+            drain_marker = resource_path("arc-drained")
+            if drain_kind and not drain_marker.exists():
+                if drain_kind == "runner":
+                    namespace = "arc-runners"
+                    labels = {"actions-ephemeral-runner": "True"}
+                elif drain_kind == "import":
+                    namespace, labels = "arc-import-jobs", {}
+                elif drain_kind == "mrf":
+                    namespace, labels = "arc-mrf-jobs", {}
+                else:
+                    raise SystemExit("unexpected ARC drain fixture")
+                items.append({
+                    "metadata": {"namespace": namespace, "labels": labels},
+                    "status": {"phase": "Running"},
+                })
+                drain_marker.touch()
+                event("arc_active_" + drain_kind)
+            late_call = int(os.environ.get("FAKE_ARC_LATE_CALL", "0"))
+            late_counter = resource_path("arc-call-count")
+            call_count = int(late_counter.read_text()) + 1 if late_counter.exists() else 1
+            late_counter.write_text(str(call_count))
+            if late_call == call_count:
+                items.append({
+                    "metadata": {
+                        "namespace": "arc-runners",
+                        "labels": {"actions-ephemeral-runner": "true"},
+                    },
+                    "status": {"phase": "Running"},
+                })
+                event("arc_late_" + str(call_count))
+            if (
+                os.environ.get("FAKE_ARC_AFTER_CHILD") == "1"
+                and events.exists()
+                and "child" in events.read_text()
+            ):
+                items.append({
+                    "metadata": {
+                        "namespace": "arc-runners",
+                        "labels": {"actions-ephemeral-runner": "true"},
+                    },
+                    "status": {"phase": "Running"},
+                })
+            print(json.dumps({"items": items}))
+        elif kind == "jobs,pods":
+            event("zero_sample")
+            active_after_child = (
+                os.environ.get("FAKE_ACTIVE_WORK_AFTER_CHILD") == "1"
+                and events.exists()
+                and "child" in events.read_text()
+            )
+            if os.environ.get("FAKE_ACTIVE_WORK") == "1" or active_after_child:
+                print('{"items":[{"kind":"Pod","status":{"phase":"Running"}}]}')
+            else:
+                print('{"items":[]}')
+        elif kind == "jobs,pods,configmaps":
+            residue = os.environ.get("FAKE_PREEXISTING_CENSUS_KIND")
+            if (
+                os.environ.get("FAKE_CENSUS_RESIDUE_AFTER_CHILD_KIND")
+                and events.exists()
+                and "child" in events.read_text()
+            ):
+                residue = os.environ["FAKE_CENSUS_RESIDUE_AFTER_CHILD_KIND"]
+            if resource_path("pod").exists():
+                residue = "pod"
+            print(f"{residue}/other-census-resource" if residue else "")
+        elif kind == "deployment" and args[2] == os.environ["FAKE_IMPORT_SCHEDULER"]:
+            scheduler_drift = (
+                os.environ.get("FAKE_SCHEDULER_DRIFT_AFTER_CHILD") == "1"
+                and events.exists()
+                and "child" in events.read_text()
+            )
+            print("1" if scheduler_drift else "0", end="")
+        elif kind in {"job", "configmap"}:
+            if (
+                kind == "job"
+                and args[2] == "seed-import-nodes"
+                and os.environ.get("FAKE_SEED_REAPPEAR") == "cleanup"
+                and events.exists()
+            ):
+                after_child = "child" in events.read_text()
+                counter = resource_path("seed-cleanup-reads")
+                count = int(counter.read_text()) + 1 if counter.exists() else 1
+                if after_child:
+                    counter.write_text(str(count))
+                if after_child and count >= 3:
+                    print("job/seed-import-nodes")
+            elif (
+                kind == "job"
+                and args[2] == "plan-pricing-v3-census-test"
+                and args[-1] == "json"
+                and events.exists()
+                and "child" in events.read_text()
+            ):
+                job_reads = resource_path("attestation-job-reads")
+                read_count = int(job_reads.read_text()) + 1 if job_reads.exists() else 1
+                job_reads.write_text(str(read_count))
+                job_uid = "job-uid"
+                if os.environ.get("FAKE_ATTESTATION_MODE") == "job-replaced" \
+                        and read_count > 1:
+                    job_uid = "replacement-job-uid"
+                mode = os.environ.get("FAKE_ATTESTATION_MODE", "valid")
+                source_configmap = (
+                    "other-configmap"
+                    if mode == "job-source-mismatch"
+                    else "plan-pricing-v3-census-src-test"
+                )
+                annotations = {
+                    "healthporta.com/source-sha": os.environ["FAKE_SOURCE_SHA"],
+                    "healthporta.com/source-manifest-sha256": os.environ[
+                        "FAKE_SOURCE_MANIFEST_SHA256"
+                    ],
+                    "healthporta.com/harness-manifest-sha256": os.environ[
+                        "FAKE_HARNESS_MANIFEST_SHA256"
+                    ],
+                    "healthporta.com/source-overlay-sha256": os.environ[
+                        "FAKE_SOURCE_OVERLAY_SHA256"
+                    ],
+                    "healthporta.com/source-configmap-uid": "configmap-uid",
+                }
+                if mode == "annotation-mismatch":
+                    annotations["healthporta.com/source-sha"] = "b" * 40
+                print(json.dumps({
+                    "apiVersion": "batch/v1", "kind": "Job",
+                    "metadata": {
+                        "name": args[2], "namespace": namespace, "uid": job_uid,
+                        "annotations": annotations,
+                    },
+                    "spec": {"template": {
+                        "metadata": {"annotations": annotations},
+                        "spec": {
+                            "volumes": [{
+                                "name": "source",
+                                "configMap": {"name": source_configmap},
+                            }],
+                            "containers": [{
+                                "name": "census",
+                                "volumeMounts": [{
+                                    "name": "source", "mountPath": "/source",
+                                    "readOnly": True,
+                                }],
+                            }],
+                        },
+                    }},
+                }))
+            elif (
+                kind == "configmap"
+                and args[2] == "plan-pricing-v3-census-src-test"
+                and args[-1] == "json"
+                and events.exists()
+                and "child" in events.read_text()
+            ):
+                mode = os.environ.get("FAKE_ATTESTATION_MODE", "valid")
+                configmap_reads = resource_path("attestation-configmap-reads")
+                read_count = (
+                    int(configmap_reads.read_text()) + 1
+                    if configmap_reads.exists() else 1
+                )
+                configmap_reads.write_text(str(read_count))
+                configmap_uid = (
+                    "replacement-configmap-uid"
+                    if (
+                        mode == "configmap-replaced-before-first-read"
+                        or (mode == "configmap-replaced" and read_count > 1)
+                    )
+                    else "configmap-uid"
+                )
+                overlay = base64.b64encode(
+                    resource_path("source-overlay.tar.gz").read_bytes()
+                ).decode()
+                if mode == "overlay-mismatch":
+                    overlay = base64.b64encode(b"other overlay").decode()
+                print(json.dumps({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": {
+                        "name": args[2], "namespace": namespace,
+                        "uid": configmap_uid,
+                    },
+                    "immutable": mode != "configmap-mutable",
+                    "binaryData": {"overlay.tar.gz": overlay},
+                }))
+            elif resource_path(kind).exists():
+                print(f"{kind}/{args[2]}")
+        elif kind == "pods":
+            controller_selector = next((argument for argument in args if argument.startswith(
+                "batch.kubernetes.io/controller-uid=")), None)
+            if controller_selector is not None:
+                mode = os.environ.get("FAKE_ATTESTATION_MODE", "valid")
+                pod_reads = resource_path("attestation-pod-reads")
+                read_count = int(pod_reads.read_text()) + 1 if pod_reads.exists() else 1
+                pod_reads.write_text(str(read_count))
+                image_id = "docker-pullable://example@sha256:" + "c" * 64
+                owner_uid = "job-uid"
+                pod_uid = "pod-uid"
+                if mode == "bare-digest":
+                    image_id = "sha256:" + "c" * 64
+                elif mode == "empty-image":
+                    image_id = ""
+                elif mode == "malformed":
+                    owner_uid = "other-job-uid"
+                elif mode == "pod-replaced" and read_count > 1:
+                    pod_uid = "replacement-pod-uid"
+                source_configmap = (
+                    "other-configmap"
+                    if mode == "pod-source-mismatch"
+                    else "plan-pricing-v3-census-src-test"
+                )
+                items = [] if mode == "missing" else [{
+                    "metadata": {
+                        "name": "plan-pricing-v3-census-test-pod",
+                        "namespace": namespace, "uid": pod_uid,
+                        "annotations": {
+                            "healthporta.com/source-sha": os.environ[
+                                "FAKE_SOURCE_SHA"
+                            ],
+                            "healthporta.com/source-manifest-sha256": os.environ[
+                                "FAKE_SOURCE_MANIFEST_SHA256"
+                            ],
+                            "healthporta.com/harness-manifest-sha256": os.environ[
+                                "FAKE_HARNESS_MANIFEST_SHA256"
+                            ],
+                            "healthporta.com/source-overlay-sha256": os.environ[
+                                "FAKE_SOURCE_OVERLAY_SHA256"
+                            ],
+                            "healthporta.com/source-configmap-uid": "configmap-uid",
+                        },
+                        "ownerReferences": [{
+                            "apiVersion": "batch/v1", "kind": "Job",
+                            "name": "plan-pricing-v3-census-test",
+                            "uid": owner_uid, "controller": True,
+                            "blockOwnerDeletion": True,
+                        }],
+                    },
+                    "spec": {
+                        "volumes": [{
+                            "name": "source",
+                            "configMap": {"name": source_configmap},
+                        }],
+                        "containers": [{
+                            "name": "census",
+                            "volumeMounts": [{
+                                "name": "source", "mountPath": "/source",
+                                "readOnly": True,
+                            }],
+                        }],
+                    },
+                    "status": {"containerStatuses": [{"name": "census", "imageID": image_id}]},
+                }]
+                print(json.dumps({"items": items}))
+            elif (
+                resource_path("pod").exists()
+                or os.environ.get("FAKE_PREEXISTING_CENSUS_POD") == "1"
+            ):
+                print("pod/plan-pricing-v3-census-test-orphan")
+        elif kind == "pod":
+            if (
+                args[2] == "plan-pricing-v3-census-test-pod"
+                and os.environ.get("FAKE_UNLABELED_ATTESTED_POD_AFTER_CHILD") == "1"
+                and events.exists()
+                and "child" in events.read_text()
+            ):
+                print("pod/plan-pricing-v3-census-test-pod")
+        else:
+            file_kind = {
+                "resourcequota": "quota",
+                "validatingadmissionpolicy": "policy",
+                "validatingadmissionpolicybinding": "binding",
+            }.get(kind)
+            if file_kind is None or not resource_path(file_kind).exists():
+                if os.environ.get("FAKE_PREEXISTING") == file_kind:
+                    print(f"{kind}/{args[2]}")
+            elif "name" in args[-1]:
+                print(f"{kind}/{args[2]}")
+            elif "jsonpath" in args[-1]:
+                deleting = resource_path(file_kind + "-deleting")
+                if deleting.exists():
+                    delete_reads = resource_path(file_kind + "-delete-reads")
+                    count = int(delete_reads.read_text()) if delete_reads.exists() else 0
+                    if count == 2:
+                        resource_path(file_kind).unlink(missing_ok=True); deleting.unlink(); delete_reads.unlink(missing_ok=True)
+                    else:
+                        delete_reads.write_text(str(count + 1)); print(file_kind + "-uid", end="")
+                else:
+                    drift = os.environ.get("FAKE_DRIFT") == file_kind \
+                        and "binding_delete" in events.read_text()
+                    print("drifted-uid" if drift else file_kind + "-uid", end="")
+            elif args[-1] == "json":
+                owner = os.environ["FAKE_OWNER"]
+                uid = file_kind + "-uid"
+                metadata = {"name": args[2], "uid": uid,
+                            "labels": {"healthporta.com/task-owner": owner}}
+                if file_kind == "quota":
+                    metadata["namespace"] = namespace
+                    payload = {"metadata": metadata,
+                               "spec": {"hard": {"pods": "0"}}}
+                elif file_kind == "policy":
+                    payload = {
+                        "metadata": metadata,
+                        "spec": {
+                            "failurePolicy": "Fail",
+                            "matchConstraints": {"matchPolicy": "Exact",
+                                "resourceRules": [{"apiGroups": ["batch"],
+                                    "apiVersions": ["v1"], "operations": ["CREATE"],
+                                    "resources": ["jobs"], "scope": "Namespaced"}]},
+                            "matchConditions": [{
+                                "name": "exact-engine-worker-launcher",
+                                "expression": "request.namespace == 'healthporta-dev' && "
+                                    "request.userInfo.username == 'system:serviceaccount:"
+                                    "healthporta-dev:engine-worker-launcher'"}],
+                            "validations": [{
+                                "expression": "false", "reason": "Forbidden",
+                                "message": os.environ["FAKE_DENIAL_MARKER"]}],
+                        },
+                    }
+                else:
+                    payload = {
+                        "metadata": metadata,
+                        "spec": {"policyName": os.environ["FAKE_POLICY"],
+                            "validationActions": ["Deny"], "matchResources": {
+                                "matchPolicy": "Exact", "namespaceSelector": {
+                                    "matchLabels": {"kubernetes.io/metadata.name":
+                                                    "healthporta-dev"}}}},
+                    }
+                if (
+                    os.environ.get("FAKE_SPEC_DRIFT") == file_kind
+                    and events.exists()
+                    and "child" in events.read_text()
+                ):
+                    if file_kind == "quota":
+                        payload["spec"]["scopeSelector"] = {}
+                    elif file_kind == "policy":
+                        payload["spec"]["validations"][0]["expression"] = "true"
+                    else:
+                        payload["spec"]["matchResources"]["objectSelector"] = {}
+                print(json.dumps(payload))
+    else:
+        raise SystemExit("unexpected kubectl operation: " + operation)
+else:
+    raise SystemExit("unexpected fake command: " + name)

@@ -26,6 +26,9 @@ RUNTIME_ATTESTATION=
 EXPECTED_ENVELOPE_SCRIPT_SHA256=
 EXPECTED_CHILD_COMMAND_SHA256=
 EXPECTED_CHILD_EXECUTABLE_SHA256=
+EXPECTED_SOURCE_MANIFEST_SHA256=
+EXPECTED_HARNESS_MANIFEST_SHA256=
+EXPECTED_SOURCE_OVERLAY_SHA256=
 POSTGRESQL_TABLESPACE_PATH=
 MINIMUM_HOST_AVAILABLE_MEMORY_BYTES=
 MINIMUM_HOST_SWAP_FREE_BYTES=
@@ -50,6 +53,7 @@ DENIAL_MARKER=
 PRIOR_DRAIN_MODE=
 CHILD_COMMAND_SHA256=
 CHILD_EXECUTABLE_SHA256=
+CHILD_EXECUTABLE_DESCRIPTOR=
 CENSUS_RECEIPT_SHA256=
 RUNTIME_ATTESTATION_SHA256=
 CAPTURED_RUNTIME_ATTESTATION_SHA256=
@@ -102,6 +106,9 @@ usage() {
     '  --expected-envelope-script-sha256 SHA256' \
     '  --expected-child-command-sha256 SHA256' \
     '  --expected-child-executable-sha256 SHA256' \
+    '  --expected-source-manifest-sha256 SHA256' \
+    '  --expected-harness-manifest-sha256 SHA256' \
+    '  --expected-source-overlay-sha256 SHA256' \
     '  --postgresql-tablespace-path PATH' \
     '  --minimum-host-available-memory-bytes BYTES' \
     '  --minimum-host-swap-free-bytes BYTES' \
@@ -155,6 +162,12 @@ parse_args() {
         require_value "$@"; EXPECTED_CHILD_COMMAND_SHA256=$2; shift 2 ;;
       --expected-child-executable-sha256)
         require_value "$@"; EXPECTED_CHILD_EXECUTABLE_SHA256=$2; shift 2 ;;
+      --expected-source-manifest-sha256)
+        require_value "$@"; EXPECTED_SOURCE_MANIFEST_SHA256=$2; shift 2 ;;
+      --expected-harness-manifest-sha256)
+        require_value "$@"; EXPECTED_HARNESS_MANIFEST_SHA256=$2; shift 2 ;;
+      --expected-source-overlay-sha256)
+        require_value "$@"; EXPECTED_SOURCE_OVERLAY_SHA256=$2; shift 2 ;;
       --postgresql-tablespace-path)
         require_value "$@"; POSTGRESQL_TABLESPACE_PATH=$2; shift 2 ;;
       --minimum-host-available-memory-bytes)
@@ -183,7 +196,60 @@ parse_args() {
   done
 }
 
+create_state_directory() {
+  python3 - "${STATE_ROOT}" "${STATE_DIR}" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+root_argument, state_argument = map(pathlib.Path, sys.argv[1:])
+if not root_argument.is_absolute() or not state_argument.is_absolute():
+    raise SystemExit(1)
+if state_argument.parent != root_argument:
+    raise SystemExit(1)
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+root_fd = os.open("/", flags)
+try:
+    for component in root_argument.parts[1:]:
+        next_fd = os.open(component, flags, dir_fd=root_fd)
+        os.close(root_fd)
+        root_fd = next_fd
+    descriptor_path = pathlib.Path(f"/proc/self/fd/{root_fd}")
+    if descriptor_path.exists() and pathlib.Path(os.path.realpath(descriptor_path)) != root_argument:
+        raise SystemExit(1)
+    os.mkdir(state_argument.name, mode=0o700, dir_fd=root_fd)
+    state_fd = os.open(state_argument.name, flags, dir_fd=root_fd)
+    try:
+        state_stat = os.fstat(state_fd)
+        path_stat = os.stat(state_argument, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(path_stat.st_mode)
+            or stat.S_IMODE(path_stat.st_mode) != 0o700
+            or (state_stat.st_dev, state_stat.st_ino)
+            != (path_stat.st_dev, path_stat.st_ino)
+        ):
+            raise SystemExit(1)
+    finally:
+        os.close(state_fd)
+finally:
+    os.close(root_fd)
+PY
+}
+
+state_dir_is_confined() {
+  python3 - "${STATE_ROOT}" "${STATE_DIR}" <<'PY'
+import pathlib
+import sys
+
+root, state = map(pathlib.Path, sys.argv[1:])
+if not root.is_absolute() or state.parent != root:
+    raise SystemExit(1)
+PY
+}
+
 validate_args() {
+  local state_leaf
   [[ "${OWNER_TOKEN}" =~ ^[a-z0-9][a-z0-9-]{7,31}$ ]] \
     || die "owner token must be 8-32 lowercase DNS-label characters"
   [[ "${SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]] \
@@ -193,8 +259,10 @@ validate_args() {
     && [ "${DEADLINE_SECONDS}" -le 86400 ] \
     || die "deadline must be 900-86400 seconds"
   [[ "${REPO_DIR}" = /* ]] || die "repo directory must be absolute"
+  state_leaf=${STATE_DIR#"${STATE_ROOT}/"}
   [[ "${STATE_DIR}" = "${STATE_ROOT}/"* ]] \
-    && [ "${STATE_DIR}" != "${STATE_ROOT}/" ] \
+    && [ -n "${state_leaf}" ] \
+    && [[ "${state_leaf}" != */* ]] \
     || die "state directory must be a child of ${STATE_ROOT}"
   [[ "${CENSUS_JOB}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
     && [ "${#CENSUS_JOB}" -le 63 ] \
@@ -212,6 +280,12 @@ validate_args() {
     || die "reviewed child command SHA-256 is invalid"
   [[ "${EXPECTED_CHILD_EXECUTABLE_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
     || die "reviewed child executable SHA-256 is invalid"
+  [[ "${EXPECTED_SOURCE_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+    || die "reviewed source manifest SHA-256 is invalid"
+  [[ "${EXPECTED_HARNESS_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+    || die "reviewed harness manifest SHA-256 is invalid"
+  [[ "${EXPECTED_SOURCE_OVERLAY_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+    || die "reviewed source overlay SHA-256 is invalid"
   [[ "${POSTGRESQL_TABLESPACE_PATH}" = /* ]] \
     || die "PostgreSQL tablespace path must be absolute"
   [[ "${MINIMUM_HOST_AVAILABLE_MEMORY_BYTES}" =~ ^[0-9]+$ ]] \
@@ -501,6 +575,67 @@ verify_reviewed_hashes() {
   [ "${observed_executable_sha}" = "${EXPECTED_CHILD_EXECUTABLE_SHA256}" ] \
     || die "reviewed child executable identity changed"
   CHILD_COMMAND_SHA256=${observed_child_sha}
+  CHILD_EXECUTABLE_SHA256=${observed_executable_sha}
+}
+
+open_reviewed_child_descriptor() {
+  local copy_path="${STATE_DIR}/reviewed-child-executable"
+  local observed_executable_sha
+  [ ! -e "${copy_path}" ] && [ ! -L "${copy_path}" ] || return 1
+  run_bounded python3 - reviewed-child-copy "${CHILD_COMMAND[0]}" \
+    "${copy_path}" "${EXPECTED_CHILD_EXECUTABLE_SHA256}" <<'PY' || return 1
+import hashlib
+import os
+import stat
+import sys
+
+_, source_path, copy_path, expected_sha256 = sys.argv[1:]
+maximum_bytes = 16 * 1024 * 1024
+source_fd = os.open(
+    source_path,
+    os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+)
+try:
+    source_stat = os.fstat(source_fd)
+    if not stat.S_ISREG(source_stat.st_mode) or not 0 < source_stat.st_size <= maximum_bytes:
+        raise SystemExit("reviewed child executable is not a bounded regular file")
+    chunks, total = [], 0
+    while chunk := os.read(source_fd, min(1024 * 1024, maximum_bytes + 1 - total)):
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > maximum_bytes:
+            raise SystemExit("reviewed child executable exceeds the byte limit")
+finally:
+    os.close(source_fd)
+payload = b"".join(chunks)
+if len(payload) != source_stat.st_size or hashlib.sha256(payload).hexdigest() != expected_sha256:
+    raise SystemExit("reviewed child executable changed during bounded copy")
+copy_fd = os.open(
+    copy_path,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+    0o500,
+)
+try:
+    with os.fdopen(copy_fd, "wb", closefd=False) as target:
+        target.write(payload)
+        target.flush()
+        os.fsync(copy_fd)
+finally:
+    os.close(copy_fd)
+PY
+  exec 9<"${copy_path}" || return 1
+  rm -f -- "${copy_path}" || return 1
+  if [ -r /proc/self/fd/9 ]; then
+    CHILD_EXECUTABLE_DESCRIPTOR=/proc/self/fd/9
+  else
+    CHILD_EXECUTABLE_DESCRIPTOR=/dev/fd/9
+  fi
+  read -r observed_executable_sha _ \
+    < <(sha256sum "${CHILD_EXECUTABLE_DESCRIPTOR}") || return 1
+  if [ "${observed_executable_sha}" != "${EXPECTED_CHILD_EXECUTABLE_SHA256}" ]; then
+    exec 9<&-
+    return 1
+  fi
   CHILD_EXECUTABLE_SHA256=${observed_executable_sha}
 }
 
@@ -1085,7 +1220,10 @@ PY
 }
 
 validate_runtime_attestation() {
-  python3 - "${RUNTIME_ATTESTATION}" "${CENSUS_JOB}" <<'PY'
+  python3 - "${RUNTIME_ATTESTATION}" "${CENSUS_JOB}" "${CENSUS_CONFIGMAP}" \
+    "${SOURCE_SHA}" "${EXPECTED_SOURCE_MANIFEST_SHA256}" \
+    "${EXPECTED_HARNESS_MANIFEST_SHA256}" \
+    "${EXPECTED_SOURCE_OVERLAY_SHA256}" <<'PY'
 import json
 import re
 import sys
@@ -1095,6 +1233,9 @@ with open(sys.argv[1], encoding="utf-8") as source:
 expected = {
     "contract", "job_name", "job_uid", "pod_name", "pod_uid",
     "pod_owner_job_name", "pod_owner_job_uid", "container_name", "image_id",
+    "source_sha", "source_manifest_sha256", "harness_manifest_sha256",
+    "source_overlay_sha256", "configmap_name", "configmap_uid",
+    "job_source_configmap_name", "pod_source_configmap_name",
 }
 if set(attestation) != expected or not all(
     isinstance(value, str) and value for value in attestation.values()
@@ -1104,6 +1245,13 @@ if (
     attestation["contract"]
     != "healthporta.plan-pricing-v3-census-runtime-attestation.v1"
     or attestation["job_name"] != sys.argv[2]
+    or attestation["configmap_name"] != sys.argv[3]
+    or attestation["job_source_configmap_name"] != sys.argv[3]
+    or attestation["pod_source_configmap_name"] != sys.argv[3]
+    or attestation["source_sha"] != sys.argv[4]
+    or attestation["source_manifest_sha256"] != sys.argv[5]
+    or attestation["harness_manifest_sha256"] != sys.argv[6]
+    or attestation["source_overlay_sha256"] != sys.argv[7]
     or attestation["pod_owner_job_name"] != attestation["job_name"]
     or attestation["pod_owner_job_uid"] != attestation["job_uid"]
     or attestation["container_name"] != "census"
@@ -1133,8 +1281,9 @@ child_job_is_running() {
 }
 
 capture_runtime_attestation() {
-  local attempt attested_identity attestation_file_sha256 job_after_json job_json
-  local job_uid pods_after_json pods_json remaining status
+  local attempt attested_identity attestation_file_sha256 configmap_after_json
+  local configmap_json job_after_json job_json job_uid pods_after_json pods_json
+  local remaining status
   for ((attempt = 1; attempt <= 60; attempt++)); do
     [ "${INTERRUPT_EXIT}" -eq 0 ] || return 1
     child_job_is_running || return 1
@@ -1148,9 +1297,9 @@ capture_runtime_attestation() {
       sleep 1
       continue
     fi
-    job_uid=$(JOB_JSON="${job_json}" python3 -c '
-import json, os, sys
-job = json.loads(os.environ["JOB_JSON"])
+    job_uid=$(python3 -c '
+import json, sys
+job = json.load(sys.stdin)
 metadata = job.get("metadata") if isinstance(job, dict) else None
 if (
     job.get("apiVersion") != "batch/v1"
@@ -1163,7 +1312,12 @@ if (
 ):
     raise SystemExit("exact census Job identity is invalid")
 print(metadata["uid"])
-' "${CENSUS_JOB}" "${DEV_NAMESPACE}") || return 1
+' "${CENSUS_JOB}" "${DEV_NAMESPACE}" <<<"${job_json}") || return 1
+    remaining=$(operation_timeout) || return $?
+    configmap_json=$(kctl_with_limit "${remaining}" -n "${DEV_NAMESPACE}" \
+      get configmap "${CENSUS_CONFIGMAP}" --ignore-not-found -o json) || return 1
+    child_job_is_running || return 1
+    [ -n "${configmap_json}" ] || return 1
     remaining=$(operation_timeout) || return $?
     pods_json=$(kctl_with_limit "${remaining}" -n "${DEV_NAMESPACE}" \
       get pods -l "batch.kubernetes.io/controller-uid=${job_uid}" \
@@ -1174,22 +1328,100 @@ print(metadata["uid"])
       get job "${CENSUS_JOB}" --ignore-not-found -o json) || return 1
     child_job_is_running || return 1
     remaining=$(operation_timeout) || return $?
+    configmap_after_json=$(kctl_with_limit "${remaining}" -n "${DEV_NAMESPACE}" \
+      get configmap "${CENSUS_CONFIGMAP}" --ignore-not-found -o json) || return 1
+    child_job_is_running || return 1
+    remaining=$(operation_timeout) || return $?
     pods_after_json=$(kctl_with_limit "${remaining}" -n "${DEV_NAMESPACE}" \
       get pods -l "batch.kubernetes.io/controller-uid=${job_uid}" \
       -o json) || return 1
     child_job_is_running || return 1
-    if attested_identity=$(JOB_JSON="${job_json}" PODS_JSON="${pods_json}" \
-      JOB_AFTER_JSON="${job_after_json}" PODS_AFTER_JSON="${pods_after_json}" \
-      python3 - "${RUNTIME_ATTESTATION}.tmp" "${CENSUS_JOB}" \
-        "${DEV_NAMESPACE}" <<'PY'
+    if attested_identity=$(printf '%s\0' \
+      "${job_json}" "${pods_json}" "${configmap_json}" \
+      "${job_after_json}" "${pods_after_json}" "${configmap_after_json}" \
+      | python3 /dev/fd/3 "${RUNTIME_ATTESTATION}.tmp" "${CENSUS_JOB}" \
+        "${DEV_NAMESPACE}" "${CENSUS_CONFIGMAP}" "${SOURCE_SHA}" \
+        "${EXPECTED_SOURCE_MANIFEST_SHA256}" \
+        "${EXPECTED_HARNESS_MANIFEST_SHA256}" \
+        "${EXPECTED_SOURCE_OVERLAY_SHA256}" 3<<'PY'
+import base64
+import binascii
 import hashlib
 import json
-import os
-from pathlib import Path
 import re
 import sys
+from pathlib import Path
 
-def attestation_from(job, pods):
+expected_source_annotations = {
+    "healthporta.com/source-sha": sys.argv[5],
+    "healthporta.com/source-manifest-sha256": sys.argv[6],
+    "healthporta.com/harness-manifest-sha256": sys.argv[7],
+    "healthporta.com/source-overlay-sha256": sys.argv[8],
+}
+
+
+def source_configmap_name(spec):
+    if not isinstance(spec, dict):
+        raise SystemExit("census source spec is invalid")
+    volumes = spec.get("volumes")
+    source_volumes = [
+        row for row in volumes
+        if isinstance(row, dict) and row.get("name") == "source"
+    ] if isinstance(volumes, list) else []
+    containers = spec.get("containers")
+    census_containers = [
+        row for row in containers
+        if isinstance(row, dict) and row.get("name") == "census"
+    ] if isinstance(containers, list) else []
+    if len(source_volumes) != 1 or len(census_containers) != 1:
+        raise SystemExit("census source volume is not singular")
+    configmap = source_volumes[0].get("configMap")
+    mounts = census_containers[0].get("volumeMounts")
+    source_mounts = [
+        row for row in mounts
+        if isinstance(row, dict) and row.get("name") == "source"
+    ] if isinstance(mounts, list) else []
+    if (
+        not isinstance(configmap, dict)
+        or configmap.get("name") != sys.argv[4]
+        or configmap.get("optional") is True
+        or len(source_mounts) != 1
+        or source_mounts[0].get("mountPath") != "/source"
+        or source_mounts[0].get("readOnly") is not True
+    ):
+        raise SystemExit("census source volume identity is invalid")
+    return configmap["name"]
+
+
+def configmap_identity(configmap):
+    metadata = configmap.get("metadata") if isinstance(configmap, dict) else None
+    binary_data = configmap.get("binaryData") if isinstance(configmap, dict) else None
+    if (
+        configmap.get("apiVersion") != "v1"
+        or configmap.get("kind") != "ConfigMap"
+        or not isinstance(metadata, dict)
+        or metadata.get("name") != sys.argv[4]
+        or metadata.get("namespace") != sys.argv[3]
+        or not isinstance(metadata.get("uid"), str)
+        or not metadata["uid"]
+        or configmap.get("immutable") is not True
+        or configmap.get("data") not in (None, {})
+        or not isinstance(binary_data, dict)
+        or set(binary_data) != {"overlay.tar.gz"}
+        or not isinstance(binary_data["overlay.tar.gz"], str)
+    ):
+        raise SystemExit("census source ConfigMap identity is invalid")
+    try:
+        overlay = base64.b64decode(binary_data["overlay.tar.gz"], validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise SystemExit("census source overlay is invalid") from exc
+    overlay_sha256 = hashlib.sha256(overlay).hexdigest()
+    if overlay_sha256 != sys.argv[8]:
+        raise SystemExit("census source overlay identity changed")
+    return metadata["uid"], overlay_sha256
+
+
+def attestation_from(job, pods, configmap):
     job_metadata = job.get("metadata") if isinstance(job, dict) else None
     if (
         job.get("apiVersion") != "batch/v1"
@@ -1201,6 +1433,31 @@ def attestation_from(job, pods):
         or not job_metadata["uid"]
     ):
         raise SystemExit("exact census Job identity is invalid")
+    job_spec = job.get("spec")
+    template = job_spec.get("template") if isinstance(job_spec, dict) else None
+    template_spec = template.get("spec") if isinstance(template, dict) else None
+    job_source_configmap_name = source_configmap_name(template_spec)
+    configmap_uid, source_overlay_sha256 = configmap_identity(configmap)
+    expected_annotations = {
+        **expected_source_annotations,
+        "healthporta.com/source-configmap-uid": configmap_uid,
+    }
+    job_annotations = job_metadata.get("annotations")
+    template_metadata = template.get("metadata") if isinstance(template, dict) else None
+    template_annotations = (
+        template_metadata.get("annotations")
+        if isinstance(template_metadata, dict)
+        else None
+    )
+    if not all(
+        isinstance(annotations, dict)
+        and all(
+            annotations.get(key) == value
+            for key, value in expected_annotations.items()
+        )
+        for annotations in (job_annotations, template_annotations)
+    ):
+        raise SystemExit("census Job source identity is invalid")
     pod_rows = pods.get("items") if isinstance(pods, dict) else None
     if not isinstance(pod_rows, list):
         raise SystemExit("census Pod inventory is invalid")
@@ -1210,9 +1467,21 @@ def attestation_from(job, pods):
         raise SystemExit("census Pod inventory is not singular")
     pod = pod_rows[0]
     pod_metadata = pod.get("metadata")
+    pod_spec = pod.get("spec")
     pod_status = pod.get("status")
-    if not isinstance(pod_metadata, dict) or not isinstance(pod_status, dict):
+    if (
+        not isinstance(pod_metadata, dict)
+        or not isinstance(pod_spec, dict)
+        or not isinstance(pod_status, dict)
+    ):
         raise SystemExit("census Pod identity is invalid")
+    pod_source_configmap_name = source_configmap_name(pod_spec)
+    pod_annotations = pod_metadata.get("annotations")
+    if not isinstance(pod_annotations, dict) or any(
+        pod_annotations.get(key) != value
+        for key, value in expected_annotations.items()
+    ):
+        raise SystemExit("census Pod source identity is invalid")
     owners = pod_metadata.get("ownerReferences")
     controllers = [
         owner
@@ -1274,19 +1543,29 @@ def attestation_from(job, pods):
         "pod_owner_job_uid": job_metadata["uid"],
         "container_name": "census",
         "image_id": image_id,
+        "source_sha": sys.argv[5],
+        "source_manifest_sha256": sys.argv[6],
+        "harness_manifest_sha256": sys.argv[7],
+        "source_overlay_sha256": source_overlay_sha256,
+        "configmap_name": sys.argv[4],
+        "configmap_uid": configmap_uid,
+        "job_source_configmap_name": job_source_configmap_name,
+        "pod_source_configmap_name": pod_source_configmap_name,
     }
 
 
-attestation = attestation_from(
-    json.loads(os.environ["JOB_JSON"]),
-    json.loads(os.environ["PODS_JSON"]),
+payloads = sys.stdin.buffer.read().split(b"\0")
+if payloads[-1:] == [b""]:
+    payloads.pop()
+if len(payloads) != 6:
+    raise SystemExit("census Kubernetes snapshots are incomplete")
+job, pods, configmap, job_after, pods_after, configmap_after = (
+    json.loads(payload) for payload in payloads
 )
-attestation_after = attestation_from(
-    json.loads(os.environ["JOB_AFTER_JSON"]),
-    json.loads(os.environ["PODS_AFTER_JSON"]),
-)
+attestation = attestation_from(job, pods, configmap)
+attestation_after = attestation_from(job_after, pods_after, configmap_after)
 if attestation_after != attestation:
-    raise SystemExit("census Job or Pod identity changed during attestation")
+    raise SystemExit("census Job, Pod, or ConfigMap changed during attestation")
 serialized = (json.dumps(attestation, sort_keys=True, separators=(",", ":")) + "\n").encode()
 with Path(sys.argv[1]).open("xb") as target:
     target.write(serialized)
@@ -1339,8 +1618,11 @@ run_child() {
     || die "runtime attestation already exists"
   check_interrupted
   verify_reviewed_hashes
-  setsid "${CHILD_COMMAND[@]}" &
+  open_reviewed_child_descriptor \
+    || die "reviewed child executable descriptor changed"
+  setsid "${CHILD_EXECUTABLE_DESCRIPTOR}" "${CHILD_COMMAND[@]:1}" &
   capture_child_pid "$!"
+  exec 9<&-
   CHILD_LAUNCHED=true
   start_child_deadline_timer "${CHILD_PID}" "${remaining}" \
     "${CHILD_DEADLINE_MARKER}"
@@ -1545,7 +1827,8 @@ release_lock() {
 
 cleanup_envelope() {
   set +e
-  rm -f -- "${STATE_DIR}/child-jobs.tmp"
+  rm -f -- "${STATE_DIR}/child-jobs.tmp" \
+    "${STATE_DIR}/reviewed-child-executable"
   if [ -n "${CHILD_PID}" ] \
       && { kill -0 "${CHILD_PID}" >/dev/null 2>&1 \
         || ! child_group_absent "${CHILD_PID}"; }; then
@@ -1591,9 +1874,15 @@ cleanup_envelope() {
     POLICY_REMOVED=true
   fi
   if [ "${QUOTA_CREATED}" = true ]; then
-    [ "$(quota_identity)" = "${QUOTA_UID}" ] || return 1
+    [ "$(quota_identity)" = "${QUOTA_UID}" ] || {
+      retain_import_drain
+      return 1
+    }
     delete_uid_bound resourcequota "${QUOTA_NAME}" "${QUOTA_UID}" \
-      "${ARC_HOLD_NAMESPACE}" || return 1
+      "${ARC_HOLD_NAMESPACE}" || {
+        retain_import_drain
+        return 1
+      }
     QUOTA_REMOVED=true
   fi
   if [ "${LOCK_STARTED}" = true ]; then
@@ -1623,7 +1912,11 @@ write_receipt() {
   RECEIPT_EXPECTED_CHILD_COMMAND_SHA=${EXPECTED_CHILD_COMMAND_SHA256} \
   RECEIPT_CHILD_EXECUTABLE_SHA=${CHILD_EXECUTABLE_SHA256} \
   RECEIPT_EXPECTED_CHILD_EXECUTABLE_SHA=${EXPECTED_CHILD_EXECUTABLE_SHA256} \
+  RECEIPT_EXPECTED_SOURCE_MANIFEST_SHA=${EXPECTED_SOURCE_MANIFEST_SHA256} \
+  RECEIPT_EXPECTED_HARNESS_MANIFEST_SHA=${EXPECTED_HARNESS_MANIFEST_SHA256} \
+  RECEIPT_EXPECTED_SOURCE_OVERLAY_SHA=${EXPECTED_SOURCE_OVERLAY_SHA256} \
   RECEIPT_CENSUS_JOB=${CENSUS_JOB} \
+  RECEIPT_CENSUS_CONFIGMAP=${CENSUS_CONFIGMAP} \
   RECEIPT_CENSUS_RECEIPT_SHA=${CENSUS_RECEIPT_SHA256} \
   RECEIPT_RUNTIME_ATTESTATION_PATH=${RUNTIME_ATTESTATION} \
   RECEIPT_RUNTIME_ATTESTATION_SHA=${RUNTIME_ATTESTATION_SHA256} \
@@ -1693,7 +1986,17 @@ receipt = {
     "expected_child_executable_sha256": os.environ[
         "RECEIPT_EXPECTED_CHILD_EXECUTABLE_SHA"
     ],
+    "expected_source_manifest_sha256": os.environ[
+        "RECEIPT_EXPECTED_SOURCE_MANIFEST_SHA"
+    ],
+    "expected_harness_manifest_sha256": os.environ[
+        "RECEIPT_EXPECTED_HARNESS_MANIFEST_SHA"
+    ],
+    "expected_source_overlay_sha256": os.environ[
+        "RECEIPT_EXPECTED_SOURCE_OVERLAY_SHA"
+    ],
     "census_job": os.environ["RECEIPT_CENSUS_JOB"],
+    "census_configmap": os.environ["RECEIPT_CENSUS_CONFIGMAP"],
     "census_receipt_sha256": os.environ["RECEIPT_CENSUS_RECEIPT_SHA"],
     "runtime_attestation": runtime_attestation,
     "runtime_attestation_sha256": os.environ[
@@ -1787,7 +2090,10 @@ run_envelope() {
   done
   verify_reviewed_hashes
   verify_source_and_target
-  mkdir -m 0700 "${STATE_DIR}"
+  state_dir_is_confined \
+    || die "state directory escaped its reviewed root"
+  create_state_directory \
+    || die "state directory could not be created inside its reviewed root"
   START_SECONDS=${SECONDS}
   EXIT_TRAP_ACTIVE=true
   trap 'on_signal TERM 143' TERM

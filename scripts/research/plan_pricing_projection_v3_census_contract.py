@@ -41,6 +41,7 @@ from api.ptg2_db_sidecars import (
 from scripts.research import (
     plan_pricing_projection_v3_census_diagnostics as diagnostics,
 )
+from scripts.research import plan_pricing_projection_v3_census_identity as identity
 from scripts.research.plan_pricing_projection_v3_census_support import (
     PROJECTION_RELATIONS,
     ReleaseInput,
@@ -261,40 +262,18 @@ def fixed_cap_gates(
 def expected_target(args: argparse.Namespace) -> dict[str, Any]:
     """Return the exact operator-declared release and serving shape."""
 
-    target_by_field = {
-        "healthporta_plan_id": str(args.expected_healthporta_plan_id).strip(),
-        "plan_release_id": str(args.plan_release_id).strip(),
-        "serving_revision_id": str(args.expected_serving_revision_id).strip(),
-        "binding_set_digest": str(args.expected_binding_set_digest).strip(),
-        "binding_count": int(args.expected_binding_count),
-        "in_network_binding_count": int(args.expected_in_network_binding_count),
-        "distinct_snapshot_count": int(args.expected_snapshot_count),
-        "distinct_plan_count": int(args.expected_plan_count),
-    }
-    identity_fields = (
-        "healthporta_plan_id",
-        "plan_release_id",
-        "serving_revision_id",
+    return identity.validated_target(
+        {
+            "healthporta_plan_id": str(args.expected_healthporta_plan_id).strip(),
+            "plan_release_id": str(args.plan_release_id).strip(),
+            "serving_revision_id": str(args.expected_serving_revision_id).strip(),
+            "binding_set_digest": str(args.expected_binding_set_digest).strip(),
+            "binding_count": int(args.expected_binding_count),
+            "in_network_binding_count": int(args.expected_in_network_binding_count),
+            "distinct_snapshot_count": int(args.expected_snapshot_count),
+            "distinct_plan_count": int(args.expected_plan_count),
+        }
     )
-    if not all(target_by_field[field_name] for field_name in identity_fields):
-        raise ValueError("pricing projection census target identity is invalid")
-    binding_digest = target_by_field["binding_set_digest"]
-    if len(binding_digest) != 64 or any(
-        character not in "0123456789abcdef" for character in binding_digest
-    ):
-        raise ValueError("pricing projection census binding digest is invalid")
-    count_fields = (
-        "binding_count",
-        "in_network_binding_count",
-        "distinct_snapshot_count",
-        "distinct_plan_count",
-    )
-    binding_count = target_by_field["binding_count"]
-    if any(target_by_field[field_name] <= 0 for field_name in count_fields) or any(
-        target_by_field[field_name] > binding_count for field_name in count_fields[1:]
-    ):
-        raise ValueError("pricing projection census target shape is invalid")
-    return target_by_field
 
 
 def require_expected_target(
@@ -399,7 +378,7 @@ def _is_measurement_schema_valid(measured_result: Mapping[str, Any]) -> bool:
     )
 
 
-def _is_cardinality_candidate_accepted(
+def is_cardinality_candidate_accepted(
     receipt_by_field: Mapping[str, Any],
     measured_result: Mapping[str, Any],
     source_matches: bool,
@@ -421,6 +400,7 @@ def _is_cardinality_candidate_accepted(
         and frozenset(fixed_gates) == EXPECTED_FIXED_CAP_GATE_KEYS
         and all(gate_passed is True for gate_passed in fixed_gates.values())
         and _is_measurement_schema_valid(measured_result)
+        and identity.is_measurement_identity_valid(receipt_by_field, measured_result)
         and fixed_gates == fixed_cap_gates(work_by_field, staged_by_field)
         and isinstance(observed_limits, Mapping)
         and frozenset(observed_limits) == EXPECTED_OBSERVED_WORK_LIMIT_KEYS

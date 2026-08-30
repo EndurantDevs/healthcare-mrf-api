@@ -30,7 +30,7 @@ from scripts.research.plan_pricing_projection_v3_census_contract import (
     census_parser as _census_parser,
     expected_target as _expected_target,
     fixed_cap_gates as _fixed_cap_gates,
-    _is_cardinality_candidate_accepted as _is_accepted,
+    is_cardinality_candidate_accepted as _is_accepted,
     observed_work_limits as _observed_work_limits,
     require_expected_target as _require_expected_target,
     seal_cardinality_census,

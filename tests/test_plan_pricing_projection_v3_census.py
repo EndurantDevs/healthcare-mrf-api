@@ -273,39 +273,10 @@ def test_census_projects_the_four_executable_work_limits() -> None:
 
 def test_census_acceptance_requires_four_positive_work_limits() -> None:
     from tests.test_plan_pricing_projection_v3_census_contract import (
-        _database_receipt,
+        _accepted_inputs,
     )
 
-    persistent_counts = dict.fromkeys(support.PROJECTION_RELATIONS, 0)
-    receipt_by_field = {
-        **_database_receipt(),
-        "rollback_complete": True,
-        "temporary_relations_after_rollback": [],
-        "postflight": {
-            "release_matches": True,
-            "provider_signature_matches": True,
-            "persistent_counts_match": True,
-            "persistent_counts_after": persistent_counts,
-            "accepted": True,
-        },
-    }
-    work_by_field = census._empty_metrics()
-    work_by_field["membership_probe_rows"] = {
-        "total": 2,
-        "maximum_per_code": 1,
-    }
-    work_by_field["member_cell_rows"] = {
-        "total": 4,
-        "maximum_per_code": 3,
-    }
-    staged_by_field = _empty_staged_counts()
-    measurement_by_field = {
-        "work": work_by_field,
-        "staged": staged_by_field,
-        "fixed_cap_gates": contract.fixed_cap_gates(work_by_field, staged_by_field),
-        "observed_work_limits": contract.observed_work_limits(work_by_field),
-        "persistent_counts_before": persistent_counts,
-    }
+    receipt_by_field, measurement_by_field = _accepted_inputs()
 
     assert census._is_accepted(receipt_by_field, measurement_by_field, True)
     measurement_by_field["observed_work_limits"][

@@ -18,6 +18,13 @@ from . import plan_pricing_projection_v3_census_envelope_harness as envelope
         ("symlink", 143),
         ("job-replaced", 143),
         ("pod-replaced", 143),
+        ("annotation-mismatch", 143),
+        ("job-source-mismatch", 143),
+        ("pod-source-mismatch", 143),
+        ("configmap-mutable", 143),
+        ("overlay-mismatch", 143),
+        ("configmap-replaced", 143),
+        ("configmap-replaced-before-first-read", 143),
     ],
 )
 def test_invalid_runtime_attestation_cannot_complete_envelope(
@@ -34,8 +41,9 @@ def test_invalid_runtime_attestation_cannot_complete_envelope(
     )
 
     assert result.returncode == expected_exit
-    if mode == "missing":
+    if mode != "empty-image":
         assert time.monotonic() - started < 10
+    if mode == "missing":
         assert not (state_root / "run/child-jobs.tmp").exists()
         assert not (state_root / "run/child-deadline-fired").exists()
     receipt = envelope._receipt(state_root)
@@ -249,7 +257,7 @@ def test_post_child_api_error_retains_every_outer_fence(tmp_path: Path) -> None:
         FAKE_GET_ERROR_AFTER_CHILD="configmap",
     )
 
-    assert result.returncode == 1
+    assert result.returncode == 143
     events = (tmp_path / "fake-state/events").read_text().splitlines()
     assert not any(event.endswith("_delete") for event in events)
     assert "drain_set_false" not in events
@@ -310,12 +318,14 @@ def test_arc_workload_must_naturally_drain(
 ) -> None:
     """Each ephemeral runner and workflow namespace must delay admission."""
 
+    started = time.monotonic()
     result, state_root = envelope._run_envelope(
         tmp_path,
         FAKE_ARC_DRAIN=arc_kind,
     )
 
     assert result.returncode == 0
+    assert time.monotonic() - started < 20
     events = (tmp_path / "fake-state/events").read_text().splitlines()
     assert f"arc_active_{arc_kind}" in events
     assert events.index(f"arc_active_{arc_kind}") < events.index("child")
