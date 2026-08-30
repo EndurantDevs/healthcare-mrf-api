@@ -9,7 +9,6 @@ import pytest
 
 from process import hospital_hpt_registry as registry
 
-
 _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-000188": "a6632acf6862be3c7ff2ae19b51a2fa0a5da283b7d6a0954ced59e323408f1bc",
     "hospital-000189": "dff5b72c99a19b8989184eb65b37de4246c4dd3649097b697830fcd8b22638ab",
