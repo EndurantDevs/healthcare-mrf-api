@@ -6820,6 +6820,7 @@ hospitals:
 - hospital_id: hospital-002089
   name: ER at Blue Diamond, an Extension of Spring Valley Hospital
   cms_hpt_url: https://www.springvalleyhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/721549752_spring-valley-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-002090
   name: ER at Boulder's Edge
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
@@ -19627,18 +19628,25 @@ hospitals:
 - hospital_id: hospital-005970
   name: Spring Mountain Sahara
   cms_hpt_url: https://www.springvalleyhospital.com/cms-hpt.txt
+  locator_name: Spring Mountain Sahara, an Extension of Spring Valley Hospital
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/721549752_spring-valley-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-005971
   name: Spring Mountain Sahara, an Extension of Spring Valley Hospital
   cms_hpt_url: https://www.springvalleyhospital.com/cms-hpt.txt
+  alias_of: hospital-005970
 - hospital_id: hospital-005972
   name: Spring Mountain Treatment Center
   cms_hpt_url: https://www.springvalleyhospital.com/cms-hpt.txt
+  locator_name: Spring Mountain Treatment Center, an Extension of Spring Valley Hospital
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/721549752_spring-valley-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-005973
   name: Spring Mountain Treatment Center, an Extension of Spring Valley Hospital
   cms_hpt_url: https://www.springvalleyhospital.com/cms-hpt.txt
+  alias_of: hospital-005972
 - hospital_id: hospital-005974
   name: Spring Valley Hospital Medical Center
   cms_hpt_url: https://www.springvalleyhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/721549752_spring-valley-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-005975
   name: Spring Valley Specilty Hospital
   cms_hpt_url: https://www.springvalleyhospital.com/cms-hpt.txt

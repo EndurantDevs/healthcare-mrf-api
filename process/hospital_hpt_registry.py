@@ -20,7 +20,7 @@ HOSPITAL_HPT_REGISTRY_PATH = (
 )
 EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT = 7_356
 EXPECTED_HOSPITAL_HPT_REGISTRY_SHA256 = (
-    "3220966f41df3bd13d8508e7518adeae278ca19fe3bb1ff25566843f40b325da"
+    "1ff43d9ac65cb7985b70f99133ad86d38fdf45263260f2d14c9556d19722b8a7"
 )
 MAX_HOSPITAL_HPT_SELECTION = 200
 _DOCUMENT_FIELDS = frozenset({"version", "hospitals"})
@@ -138,6 +138,10 @@ def _validate_hospital_aliases(hospitals: list[dict[str, str]]) -> None:
         if "locator_mrf_url" in canonical:
             hospital.setdefault(
                 "locator_mrf_url", canonical["locator_mrf_url"]
+            )
+        if "fallback_mrf_url" in canonical:
+            hospital.setdefault(
+                "fallback_mrf_url", canonical["fallback_mrf_url"]
             )
 
 
