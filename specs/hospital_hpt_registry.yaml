@@ -8132,6 +8132,7 @@ hospitals:
 - hospital_id: hospital-002491
   name: Guthrie Lourdes Hospital
   cms_hpt_url: https://www.guthrie.org/cms-hpt.txt
+  fallback_mrf_url: https://rca.elevatepfs.com/ptapp/api/cdm/export/oneclick?recno=151e59cbd2694c13781019a3d8b1498b7b19d03390dd0d09f12c47078097ecad
 - hospital_id: hospital-002492
   name: Guthrie Robert Packer Hospital
   cms_hpt_url: https://www.guthrie.org/cms-hpt.txt

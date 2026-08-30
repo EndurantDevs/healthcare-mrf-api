@@ -15,6 +15,7 @@ _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-000189": "dff5b72c99a19b8989184eb65b37de4246c4dd3649097b697830fcd8b22638ab",
     "hospital-001163": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
     "hospital-001503": "6c134e170f5dfe9aa4ac2ab2dae9f0523bfa17262bb97813e16f07d2bba14615",
+    "hospital-002491": "f7e5a19c5a44e85520da233d3d17025d9c834a8f7b817d9f5b7c4ef6596b6e64",
     "hospital-002911": "dff5b72c99a19b8989184eb65b37de4246c4dd3649097b697830fcd8b22638ab",
     "hospital-003312": "75d4e626daf0db2c1e53cc903f3669d04339bbffb8891f92dd588c7fa3d0316f",
     "hospital-004979": "dee8d2ff24f723f64f41aa8c576ad18113657d7e11b0b59a392c58fd8acb765d",
@@ -83,7 +84,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert "alias_of" not in hospital_by_id["hospital-005625"]
     assert sum("locator_name" in entry for entry in hospitals) == 1_258
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 636
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 22
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 23
     assert {
         entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry
     } == set(_FALLBACK_URL_SHA256_BY_HOSPITAL_ID)
