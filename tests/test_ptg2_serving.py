@@ -807,12 +807,7 @@ def test_provider_expansion_candidate_window_includes_deep_offset():
     ) == 125
 
 
-def test_location_provider_window_includes_has_more_sentinel(monkeypatch):
-    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_FLOOR", "1")
-    monkeypatch.setenv(
-        "HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER",
-        "1",
-    )
+def test_distance_location_window_includes_deep_offset_sentinel():
     pagination = SimpleNamespace(limit=25, offset=100)
 
     assert ptg2_serving._ptg2_manifest_rate_candidate_limit(
@@ -821,6 +816,47 @@ def test_location_provider_window_includes_has_more_sentinel(monkeypatch):
         expand_providers=True,
         location_filter_requested=True,
     ) == 126
+
+
+@pytest.mark.parametrize(
+    "order_args",
+    ({}, {"order_by": "distance"}, {"order_by": "distance_miles"}),
+)
+def test_ascending_distance_location_window_stops_at_page_sentinel(order_args):
+    pagination = SimpleNamespace(limit=10, offset=0)
+
+    assert ptg2_serving._ptg2_manifest_rate_candidate_limit(
+        order_args,
+        pagination,
+        expand_providers=True,
+        location_filter_requested=True,
+    ) == 11
+
+
+@pytest.mark.parametrize(
+    "order_args",
+    (
+        {"order_by": "total_allowed_amount"},
+        {"order_by": "distance", "order": "desc"},
+    ),
+)
+def test_nonascending_location_window_retains_density_floor(
+    order_args, monkeypatch
+):
+    monkeypatch.delenv(
+        "HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER", raising=False
+    )
+    monkeypatch.delenv(
+        "HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_FLOOR", raising=False
+    )
+    pagination = SimpleNamespace(limit=10, offset=0)
+
+    assert ptg2_serving._ptg2_manifest_rate_candidate_limit(
+        order_args,
+        pagination,
+        expand_providers=True,
+        location_filter_requested=True,
+    ) == 100
 
 
 def test_location_rate_window_without_provider_expansion_includes_sentinel():
@@ -1531,6 +1567,20 @@ async def test_inferred_taxonomy_filter_requires_individual_npi():
     assert "207X00000X" in str(params_by_name)
 
 
+def test_inferred_taxonomy_knn_prefilter_is_exact():
+    params_by_name = {}
+
+    filters = ptg2_serving._membership_inferred_taxonomy_filters(
+        {"code": "73721", "code_system": "CPT"},
+        params_by_name,
+    )
+
+    assert len(filters) == 2
+    assert "FROM mrf.npi_taxonomy membership_location_nt" in filters[0]
+    assert "n_entity.entity_type_code" in filters[1]
+    assert "2085R0202X" in str(params_by_name)
+
+
 @pytest.mark.parametrize(
     ("code", "expected_taxonomy"),
     [
@@ -1752,6 +1802,18 @@ def test_knn_query_carries_bounded_raw_probe_exhaustion_marker():
     assert "_ptg_source_exhausted" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
     assert "_ptg_probe_empty" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
     assert "LEFT JOIN LATERAL" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
+    assert ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL.count(
+        "{knn_prefilter_sql}"
+    ) == 3
+    assert "WHEN (SELECT npi_count <" in (
+        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
+    )
+    assert "WHEN (SELECT npi_count >=" in (
+        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
+    )
+    assert "WHEN geocoded_probe_stats.raw_probe_count <" in (
+        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
+    )
     assert "geocoded_probe_stats.raw_probe_count < :raw_probe_limit" in (
         ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
     )

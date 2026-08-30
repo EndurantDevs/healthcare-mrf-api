@@ -377,6 +377,7 @@ async def test_knn_planner_settings_are_applied_and_restored() -> None:
                     {
                         "plan_cache_mode": "auto",
                         "parallel_workers": "2",
+                        "jit": "on",
                     }
                 ]
             ),
@@ -384,12 +385,13 @@ async def test_knn_planner_settings_are_applied_and_restored() -> None:
         ]
     )
     prior_settings = await serving._enable_serial_knn_planning(session)
-    assert prior_settings == ("auto", "2")
+    assert prior_settings == ("auto", "2", "on")
     await serving._restore_knn_planning(session, prior_settings)
     assert len(session.calls) == 2
     assert session.calls[1][0][1] == {
         "plan_cache_mode": "auto",
         "parallel_workers": "2",
+        "jit": "on",
     }
 
 

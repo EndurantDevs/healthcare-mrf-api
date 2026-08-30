@@ -172,12 +172,14 @@ async def test_membership_location_query_builds_bounded_context(monkeypatch, uni
         "_ptg2_address_serving_table",
         AsyncMock(return_value=address_table),
     )
-    args = {"lat": "41.9", "long": "-87.6"} if unified else {}
+    args_by_name = {"code": "73721", "code_system": "CPT"}
+    if unified:
+        args_by_name.update(lat="41.9", long="-87.6")
 
     query = await serving._membership_location_query(
         object(),
         strict_v3_tables(),
-        args,
+        args_by_name,
         candidate_npis=None,
         limit=0,
         offset=0 if unified else -1,
@@ -201,8 +203,13 @@ async def test_membership_location_query_builds_bounded_context(monkeypatch, uni
         assert "WHERE addr.geo_evidence_level IS NOT NULL" in rendered_sql
         assert "addr.checksum,\n             addr.location_key" in rendered_sql
         assert "addr.checksum,\n                     addr.location_key" in rendered_sql
+        assert rendered_sql.count(
+            "addr.npi IN (SELECT membership_location_nt.npi"
+        ) == 3
+        assert rendered_sql.count("n_entity.entity_type_code") == 3
     else:
         assert query.knn_order_sql is None
+        assert query.knn_prefilter_sql == "TRUE"
         rendered_sql = serving._membership_location_sql(query, limit=1, offset=0)
         assert (
             "COALESCE(addr.address_key::text, ''), "

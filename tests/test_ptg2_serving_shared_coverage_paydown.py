@@ -321,3 +321,43 @@ async def test_filtered_bounded_rows_materialize_only_retained_prefix(
     assert prefix_lookup.await_args.kwargs["scan_budget"] is scan_budget
     full_lookup.assert_not_awaited()
     assert tuple(materialize.call_args.args[0]) == selected_rows
+
+
+@pytest.mark.asyncio
+async def test_local_distance_caps_cumulative_forward_occurrences(monkeypatch):
+    request = serving._LocalDistanceGraphRequest(
+        1,
+        [{"code_key": 7}, {"code_key": 7}],
+        serving._V4GeoRateForwardLimits(
+            10, 100, 2, 10, 10, serving.ForwardReadBudget(10, 10_000, 3)
+        ),
+    )
+    state = serving._LocalDistanceGraphState()
+    provider_pages = AsyncMock(
+        side_effect=AssertionError("bounded reads must skip provider pages")
+    )
+    full_lookup = AsyncMock(
+        side_effect=AssertionError("bounded reads must skip full forward blocks")
+    )
+    prefix_lookup = AsyncMock(side_effect=[
+        (SimpleNamespace(provider_set_key=10),) * 2,
+        (SimpleNamespace(provider_set_key=20),),
+    ])
+    monkeypatch.setattr(
+        serving, "_version_three_provider_counts_for_keys", provider_pages
+    )
+    monkeypatch.setattr(serving, "_lookup_shared_forward_rows", full_lookup)
+    monkeypatch.setattr(
+        serving, "_lookup_shared_forward_prefix_rows", prefix_lookup
+    )
+    await serving._classify_local_code_sets(
+        object(), strict_v3_tables(), {1: (10,)}, request, state
+    )
+    with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as exc_info:
+        await serving._classify_local_code_sets(
+            object(), strict_v3_tables(), {2: (20,)}, request, state
+        )
+    assert exc_info.value.dimension == "code_occurrences"
+    assert [call.kwargs["limit"] for call in prefix_lookup.await_args_list] == [3, 1]
+    provider_pages.assert_not_awaited()
+    full_lookup.assert_not_awaited()

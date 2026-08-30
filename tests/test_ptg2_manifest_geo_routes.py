@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Route geographic provider searches through the bounded selector."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -187,3 +188,99 @@ async def test_manifest_geo_without_projection_keeps_location_first_route(
     assert response["items"][0]["npi"] == _NPI
     location_lookup.assert_awaited_once()
     strict_selector.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manifest_distance_page_uses_deep_offset_sentinel(monkeypatch):
+    _install_base_dependencies(monkeypatch)
+    providers = [
+        {**_PROVIDER_ROW, "npi": _NPI + index, "distance_miles": float(index)}
+        for index in range(3)
+    ]
+    location_lookup = AsyncMock(
+        return_value=({_PROVIDER_SET_ID}, {_PROVIDER_SET_ID: providers})
+    )
+    monkeypatch.setattr(
+        serving, "_ptg2_manifest_location_provider_matches", location_lookup
+    )
+
+    response, _session = await _search(
+        args=_query_args(
+            include_providers=True, lat=41.9, long=-87.65, order_by="distance"
+        ),
+        pagination=SimpleNamespace(limit=1, offset=1),
+    )
+
+    assert location_lookup.await_args.kwargs["candidate_limit"] == 3
+    assert [provider_item["npi"] for provider_item in response["items"]] == [
+        _NPI + 1
+    ]
+    assert response["pagination"] == {
+        "total": 3,
+        "total_is_exact": False,
+        "total_lower_bound": 3,
+        "limit": 1,
+        "offset": 1,
+        "page": 2,
+        "has_more": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_manifest_descending_distance_keeps_exhaustive_floor(monkeypatch):
+    _install_base_dependencies(monkeypatch)
+    monkeypatch.delenv(
+        "HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER", raising=False
+    )
+    monkeypatch.delenv(
+        "HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_FLOOR", raising=False
+    )
+    location_lookup = AsyncMock(return_value=(set(), {}))
+    monkeypatch.setattr(
+        serving, "_ptg2_manifest_location_provider_matches", location_lookup
+    )
+
+    response, _session = await _search(
+        args=_query_args(
+            include_providers=True,
+            state="IL",
+            order_by="distance",
+            order="desc",
+        ),
+        pagination=SimpleNamespace(limit=1, offset=0),
+    )
+
+    assert response["items"] == []
+    assert location_lookup.await_args.kwargs["candidate_limit"] == 100
+    assert location_lookup.await_args.kwargs["require_exhaustive"] is True
+
+
+@pytest.mark.asyncio
+async def test_local_distance_converts_pattern_member_limit_to_budget(monkeypatch):
+    """Normalize pattern membership overflow to the sealed online budget."""
+
+    monkeypatch.setattr(
+        serving,
+        "_v4_sets_by_npi",
+        AsyncMock(
+            side_effect=serving.PTG2ManifestArtifactError(
+                "PTG2 V4 graph selection exceeds max_members"
+            )
+        ),
+    )
+    request = serving._LocalDistanceGraphRequest(
+        1,
+        [{"code_key": 7}],
+        serving._v4_geo_rate_forward_limits(_production_tables()),
+    )
+
+    with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as exc_info:
+        await serving._local_v4_memberships(
+            object(),
+            _production_tables(),
+            (1,),
+            request,
+            serving._LocalDistanceGraphState(),
+        )
+
+    assert exc_info.value.dimension == "retained_memberships"
