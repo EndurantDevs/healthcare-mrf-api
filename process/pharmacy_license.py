@@ -482,10 +482,29 @@ class StateImportStats:
     metadata: dict[str, Any]
 
 
+@dataclass
+class _StateImportState:
+    raw_rows: list[dict[str, Any]] = field(default_factory=list)
+    selected_source_url: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    adapter_error: str | None = None
+    row_count_parsed: int = 0
+    row_count_matched: int = 0
+    row_count_dropped: int = 0
+    inserted: int = 0
+
+
 @dataclass(frozen=True)
 class AspNetStateAdapterSpec:
     state_code: str
     search_url: str
+
+
+@dataclass(frozen=True)
+class _AspNetPage:
+    html: str
+    url: str
+    number: int
 
 
 @dataclass
@@ -1103,6 +1122,186 @@ async def _find_table_schema(table_name: str, preferred_schema: str | None = Non
     return chosen
 
 
+async def _load_state_license_index(
+    resolver: StateNpiResolver, normalized_state: str, taxonomy_schema: str | None
+) -> None:
+    if not taxonomy_schema:
+        return
+    taxonomy_records = await db.all(
+        f"""
+        SELECT npi, provider_license_number
+        FROM {taxonomy_schema}.{NPIDataTaxonomy.__tablename__}
+        WHERE provider_license_number IS NOT NULL
+          AND provider_license_number_state_code IS NOT NULL
+          AND upper(provider_license_number_state_code) = :state_code
+        """,
+        state_code=normalized_state,
+    )
+    by_license: dict[str, set[int]] = {}
+    for taxonomy_record in taxonomy_records:
+        if not taxonomy_record:
+            continue
+        npi = _to_npi(taxonomy_record[0])
+        if npi is None:
+            continue
+        key = _normalize_license_for_match(taxonomy_record[1])
+        if key:
+            by_license.setdefault(key, set()).add(npi)
+    resolver.by_license = _unique_mapping(by_license)
+
+
+async def _load_state_identifier_indexes(
+    resolver: StateNpiResolver, normalized_state: str, preferred_schema: str
+) -> None:
+    identifier_schema = await _find_table_schema(
+        NPIDataOtherIdentifier.__tablename__, preferred_schema
+    )
+    if not identifier_schema:
+        return
+    identifier_records = await db.all(
+        f"""
+        SELECT npi, other_provider_identifier, other_provider_identifier_issuer
+        FROM {identifier_schema}.{NPIDataOtherIdentifier.__tablename__}
+        WHERE other_provider_identifier IS NOT NULL
+          AND other_provider_identifier_state IS NOT NULL
+          AND upper(other_provider_identifier_state) = :state_code
+        """,
+        state_code=normalized_state,
+    )
+    by_identifier: dict[str, set[int]] = {}
+    by_identifier_digits: dict[str, set[int]] = {}
+    for identifier_record in identifier_records:
+        if not identifier_record:
+            continue
+        npi = _to_npi(identifier_record[0])
+        if npi is None or not _is_license_like_identifier_issuer(identifier_record[2]):
+            continue
+        identifier_key = _normalize_license_for_match(identifier_record[1])
+        if identifier_key:
+            by_identifier.setdefault(identifier_key, set()).add(npi)
+        digits_key = _normalize_digits_for_match(identifier_record[1])
+        if digits_key:
+            by_identifier_digits.setdefault(digits_key, set()).add(npi)
+    resolver.by_other_identifier = _unique_mapping(by_identifier)
+    resolver.by_other_identifier_digits = _unique_mapping(by_identifier_digits)
+
+
+async def _load_state_registry_index(
+    resolver: StateNpiResolver,
+    normalized_state: str,
+    preferred_schema: str,
+    taxonomy_schema: str | None,
+) -> None:
+    npi_data_schema = await _find_table_schema(NPIData.__tablename__, preferred_schema)
+    address_schema = await _find_table_schema(NPIAddress.__tablename__, preferred_schema)
+    if not (npi_data_schema and address_schema and taxonomy_schema):
+        return
+    registry_records = await db.all(
+        f"""
+        SELECT DISTINCT a.npi, a.city_name, n.provider_organization_name,
+                        n.provider_other_organization_name, n.do_business_as_text
+        FROM {address_schema}.{NPIAddress.__tablename__} a
+        JOIN {npi_data_schema}.{NPIData.__tablename__} n ON n.npi = a.npi
+        JOIN {taxonomy_schema}.{NPIDataTaxonomy.__tablename__} t ON t.npi = a.npi
+        WHERE a.state_name IS NOT NULL
+          AND upper(a.state_name) = :state_code
+          AND a.city_name IS NOT NULL
+          AND t.healthcare_provider_taxonomy_code IS NOT NULL
+          AND t.healthcare_provider_taxonomy_code LIKE :taxonomy_like
+          AND n.entity_type_code = 2
+        """,
+        state_code=normalized_state,
+        taxonomy_like=f"{PHARM_LICENSE_REGISTRY_TAXONOMY_PREFIX}%",
+    )
+    by_name_city: dict[tuple[str, str], set[int]] = {}
+    for registry_record in registry_records:
+        if not registry_record:
+            continue
+        npi = _to_npi(registry_record[0])
+        city_key = _normalize_city_for_match(registry_record[1])
+        if npi is None or not city_key:
+            continue
+        name_keys = _name_candidates_for_match(registry_record[2], registry_record[3])
+        name_keys.extend(_name_candidates_for_match(registry_record[4], None))
+        for name_key in name_keys:
+            by_name_city.setdefault((name_key, city_key), set()).add(npi)
+    resolver.by_registry_name_city = _unique_mapping(by_name_city)
+
+
+def _index_state_partd_records(
+    resolver: StateNpiResolver, partd_records: list[Any]
+) -> None:
+    by_name_zip: dict[tuple[str, str], set[int]] = {}
+    by_name_city: dict[tuple[str, str], set[int]] = {}
+    by_name: dict[str, set[int]] = {}
+    named_rows = city_rows = zip_rows = 0
+    for partd_record in partd_records:
+        if not partd_record:
+            continue
+        npi = _to_npi(partd_record[0])
+        if npi is None:
+            continue
+        name_values = _name_candidates_for_match(partd_record[1], None)
+        if any(name_values):
+            named_rows += 1
+        city_key = _normalize_city_for_match(partd_record[2])
+        if city_key:
+            city_rows += 1
+        zip_key = _normalize_zip_for_match(partd_record[3])
+        if zip_key:
+            zip_rows += 1
+        for name_key in name_values:
+            if not name_key:
+                continue
+            by_name.setdefault(name_key, set()).add(npi)
+            if city_key:
+                by_name_city.setdefault((name_key, city_key), set()).add(npi)
+            if zip_key:
+                by_name_zip.setdefault((name_key, zip_key), set()).add(npi)
+    is_quality_acceptable = _is_partd_name_fallback_acceptable(
+        total_rows=len(partd_records),
+        named_rows=named_rows,
+        city_rows=city_rows,
+        zip_rows=zip_rows,
+    )
+    resolver.partd_quality = {
+        "rows": len(partd_records),
+        "named_rows": named_rows,
+        "city_rows": city_rows,
+        "zip_rows": zip_rows,
+        "quality_ok": is_quality_acceptable,
+    }
+    if not is_quality_acceptable:
+        return
+    resolver.by_name = _unique_mapping(by_name)
+    resolver.by_name_city = _unique_mapping(by_name_city)
+    resolver.by_name_zip = _unique_mapping(by_name_zip)
+    resolver.partd_name_fallback_enabled = bool(
+        resolver.by_name or resolver.by_name_city or resolver.by_name_zip
+    )
+
+
+async def _load_state_partd_indexes(
+    resolver: StateNpiResolver, normalized_state: str, preferred_schema: str
+) -> None:
+    partd_schema = await _find_table_schema(
+        PartDPharmacyActivity.__tablename__, preferred_schema
+    )
+    if not partd_schema:
+        return
+    partd_records = await db.all(
+        f"""
+        SELECT DISTINCT npi, pharmacy_name, city, zip_code
+        FROM {partd_schema}.{PartDPharmacyActivity.__tablename__}
+        WHERE state IS NOT NULL
+          AND upper(state) = :state_code
+          AND medicare_active IS TRUE
+        """,
+        state_code=normalized_state,
+    )
+    _index_state_partd_records(resolver, partd_records)
+
+
 async def _build_state_npi_resolver(state_code: str) -> StateNpiResolver | None:
     """Build state-scoped license and name indexes for NPI resolution."""
     normalized_state = (state_code or "").strip().upper()
@@ -1110,174 +1309,24 @@ async def _build_state_npi_resolver(state_code: str) -> StateNpiResolver | None:
         return None
     preferred_schema = PharmacyLicenseImportRun.__table__.schema or "mrf"
     resolver = StateNpiResolver(state_code=normalized_state)
-    has_resolved_indexes = False
-
-    npi_taxonomy_schema = await _find_table_schema(NPIDataTaxonomy.__tablename__, preferred_schema)
-    if npi_taxonomy_schema:
-        taxonomy_records = await db.all(
-            f"""
-            SELECT npi, provider_license_number
-            FROM {npi_taxonomy_schema}.{NPIDataTaxonomy.__tablename__}
-            WHERE provider_license_number IS NOT NULL
-              AND provider_license_number_state_code IS NOT NULL
-              AND upper(provider_license_number_state_code) = :state_code
-            """,
-            state_code=normalized_state,
-        )
-        by_license: dict[str, set[int]] = {}
-        for taxonomy_record in taxonomy_records:
-            if not taxonomy_record:
-                continue
-            npi = _to_npi(taxonomy_record[0])
-            if npi is None:
-                continue
-            key = _normalize_license_for_match(taxonomy_record[1])
-            if not key:
-                continue
-            by_license.setdefault(key, set()).add(npi)
-        resolver.by_license = _unique_mapping(by_license)
-        has_resolved_indexes = has_resolved_indexes or bool(resolver.by_license)
-
-    npi_other_identifier_schema = await _find_table_schema(NPIDataOtherIdentifier.__tablename__, preferred_schema)
-    if npi_other_identifier_schema:
-        identifier_records = await db.all(
-            f"""
-            SELECT npi, other_provider_identifier, other_provider_identifier_issuer
-            FROM {npi_other_identifier_schema}.{NPIDataOtherIdentifier.__tablename__}
-            WHERE other_provider_identifier IS NOT NULL
-              AND other_provider_identifier_state IS NOT NULL
-              AND upper(other_provider_identifier_state) = :state_code
-            """,
-            state_code=normalized_state,
-        )
-        by_other_identifier: dict[str, set[int]] = {}
-        by_other_identifier_digits: dict[str, set[int]] = {}
-        for identifier_record in identifier_records:
-            if not identifier_record:
-                continue
-            npi = _to_npi(identifier_record[0])
-            if npi is None:
-                continue
-            if not _is_license_like_identifier_issuer(identifier_record[2]):
-                continue
-            identifier_key = _normalize_license_for_match(identifier_record[1])
-            if identifier_key:
-                by_other_identifier.setdefault(identifier_key, set()).add(npi)
-            identifier_digits_key = _normalize_digits_for_match(identifier_record[1])
-            if identifier_digits_key:
-                by_other_identifier_digits.setdefault(identifier_digits_key, set()).add(npi)
-        resolver.by_other_identifier = _unique_mapping(by_other_identifier)
-        resolver.by_other_identifier_digits = _unique_mapping(by_other_identifier_digits)
-        has_resolved_indexes = has_resolved_indexes or bool(
-            resolver.by_other_identifier or resolver.by_other_identifier_digits
-        )
-
-    npi_data_schema = await _find_table_schema(NPIData.__tablename__, preferred_schema)
-    npi_address_schema = await _find_table_schema(NPIAddress.__tablename__, preferred_schema)
-    if npi_data_schema and npi_address_schema and npi_taxonomy_schema:
-        registry_records = await db.all(
-            f"""
-            SELECT DISTINCT a.npi, a.city_name, n.provider_organization_name,
-                            n.provider_other_organization_name, n.do_business_as_text
-            FROM {npi_address_schema}.{NPIAddress.__tablename__} a
-            JOIN {npi_data_schema}.{NPIData.__tablename__} n
-              ON n.npi = a.npi
-            JOIN {npi_taxonomy_schema}.{NPIDataTaxonomy.__tablename__} t
-              ON t.npi = a.npi
-            WHERE a.state_name IS NOT NULL
-              AND upper(a.state_name) = :state_code
-              AND a.city_name IS NOT NULL
-              AND t.healthcare_provider_taxonomy_code IS NOT NULL
-              AND t.healthcare_provider_taxonomy_code LIKE :taxonomy_like
-              AND n.entity_type_code = 2
-            """,
-            state_code=normalized_state,
-            taxonomy_like=f"{PHARM_LICENSE_REGISTRY_TAXONOMY_PREFIX}%",
-        )
-        by_registry_name_city: dict[tuple[str, str], set[int]] = {}
-        for registry_record in registry_records:
-            if not registry_record:
-                continue
-            npi = _to_npi(registry_record[0])
-            if npi is None:
-                continue
-            city_key = _normalize_city_for_match(registry_record[1])
-            if not city_key:
-                continue
-            name_keys = _name_candidates_for_match(registry_record[2], registry_record[3])
-            name_keys.extend(_name_candidates_for_match(registry_record[4], None))
-            for name_key in name_keys:
-                by_registry_name_city.setdefault((name_key, city_key), set()).add(npi)
-        resolver.by_registry_name_city = _unique_mapping(by_registry_name_city)
-        has_resolved_indexes = has_resolved_indexes or bool(resolver.by_registry_name_city)
-
-    partd_schema = await _find_table_schema(PartDPharmacyActivity.__tablename__, preferred_schema)
-    if partd_schema:
-        partd_records = await db.all(
-            f"""
-            SELECT DISTINCT npi, pharmacy_name, city, zip_code
-            FROM {partd_schema}.{PartDPharmacyActivity.__tablename__}
-            WHERE state IS NOT NULL
-              AND upper(state) = :state_code
-              AND medicare_active IS TRUE
-            """,
-            state_code=normalized_state,
-        )
-        by_name_zip: dict[tuple[str, str], set[int]] = {}
-        by_name_city: dict[tuple[str, str], set[int]] = {}
-        by_name: dict[str, set[int]] = {}
-        named_rows = 0
-        city_rows = 0
-        zip_rows = 0
-        for partd_record in partd_records:
-            if not partd_record:
-                continue
-            npi = _to_npi(partd_record[0])
-            if npi is None:
-                continue
-            name_values = _name_candidates_for_match(partd_record[1], None)
-            has_name = any(name_values)
-            if has_name:
-                named_rows += 1
-            city_key = _normalize_city_for_match(partd_record[2])
-            if city_key:
-                city_rows += 1
-            zip_key = _normalize_zip_for_match(partd_record[3])
-            if zip_key:
-                zip_rows += 1
-            for name_key in name_values:
-                if not name_key:
-                    continue
-                by_name.setdefault(name_key, set()).add(npi)
-                if city_key:
-                    by_name_city.setdefault((name_key, city_key), set()).add(npi)
-                if zip_key:
-                    by_name_zip.setdefault((name_key, zip_key), set()).add(npi)
-        is_quality_acceptable = _is_partd_name_fallback_acceptable(
-            total_rows=len(partd_records),
-            named_rows=named_rows,
-            city_rows=city_rows,
-            zip_rows=zip_rows,
-        )
-        resolver.partd_quality = {
-            "rows": len(partd_records),
-            "named_rows": named_rows,
-            "city_rows": city_rows,
-            "zip_rows": zip_rows,
-            "quality_ok": is_quality_acceptable,
-        }
-        if is_quality_acceptable:
-            resolver.by_name = _unique_mapping(by_name)
-            resolver.by_name_city = _unique_mapping(by_name_city)
-            resolver.by_name_zip = _unique_mapping(by_name_zip)
-            resolver.partd_name_fallback_enabled = bool(
-                resolver.by_name or resolver.by_name_city or resolver.by_name_zip
-            )
-            has_resolved_indexes = has_resolved_indexes or resolver.partd_name_fallback_enabled
-
-    if not has_resolved_indexes:
-        return None
-    return resolver
+    taxonomy_schema = await _find_table_schema(
+        NPIDataTaxonomy.__tablename__, preferred_schema
+    )
+    await _load_state_license_index(resolver, normalized_state, taxonomy_schema)
+    await _load_state_identifier_indexes(
+        resolver, normalized_state, preferred_schema
+    )
+    await _load_state_registry_index(
+        resolver, normalized_state, preferred_schema, taxonomy_schema
+    )
+    await _load_state_partd_indexes(
+        resolver, normalized_state, preferred_schema
+    )
+    has_resolved_indexes = any((
+        resolver.by_license, resolver.by_other_identifier, resolver.by_other_identifier_digits,
+        resolver.by_registry_name_city, resolver.partd_name_fallback_enabled,
+    ))
+    return resolver if has_resolved_indexes else None
 
 
 def _extract_city_state_zip_from_freeform(address: Any) -> tuple[str | None, str | None, str | None]:
@@ -1894,6 +1943,122 @@ def _create_aspnet_adapter_spec(state_source: StateSource) -> AspNetStateAdapter
     )
 
 
+def _is_aspnet_search_form_configured(
+    decoded_search_page: str,
+    metadata: dict[str, Any],
+    form_fields_by_name: dict[str, str],
+) -> bool:
+    lookup_fields = _extract_lookup_field_names(decoded_search_page)
+    for field_name in sorted(lookup_fields):
+        form_fields_by_name[field_name] = ""
+    profession_options = _extract_select_options(
+        decoded_search_page, "t_web_lookup__profession_name"
+    )
+    profession_value = _pick_pharmacy_option(profession_options)
+    if profession_value and "t_web_lookup__profession_name" in lookup_fields:
+        form_fields_by_name["t_web_lookup__profession_name"] = profession_value
+    license_type_options = _extract_select_options(
+        decoded_search_page, "t_web_lookup__license_type_name"
+    )
+    license_type_value = _pick_exact_option(license_type_options, "Pharmacy")
+    if license_type_value and "t_web_lookup__license_type_name" in lookup_fields:
+        form_fields_by_name["t_web_lookup__license_type_name"] = license_type_value
+    if profession_value is None:
+        if "t_web_lookup__full_name" in lookup_fields:
+            form_fields_by_name["t_web_lookup__full_name"] = "PHARM"
+        elif "t_web_lookup__doing_business_as" in lookup_fields:
+            form_fields_by_name["t_web_lookup__doing_business_as"] = "PHARM"
+        else:
+            return False
+    metadata["selected_profession"] = profession_value
+    metadata["selected_license_type"] = license_type_value
+    form_fields_by_name["sch_button"] = "Search"
+    return True
+
+
+def _append_aspnet_page_records(
+    parsed_page_rows: list[dict[str, Any]],
+    state_code: str,
+    seen_signatures: set[tuple[str, str, str]],
+    license_records: list[dict[str, Any]],
+) -> None:
+    for raw_row in parsed_page_rows:
+        hydrated_row = _hydrate_row_with_address_parts(raw_row)
+        signature = (
+            _safe_text(hydrated_row.get("Name")) or "",
+            _safe_text(hydrated_row.get("License #") or hydrated_row.get("License Number")) or "",
+            _safe_text(hydrated_row.get("State")) or state_code,
+        )
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        license_records.append(hydrated_row)
+        if len(license_records) >= PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
+            break
+
+
+async def _load_aspnet_result_pages(
+    session: aiohttp.ClientSession, state_source: StateSource,
+    current_page: _AspNetPage, metadata: dict[str, Any],
+    license_records: list[dict[str, Any]],
+) -> _AspNetPage | str:
+    """Load bounded ASP.NET result pages into the supplied record list."""
+    page_count = 0
+    seen_signatures: set[tuple[str, str, str]] = set()
+    while page_count < PHARM_LICENSE_STATE_ADAPTER_MAX_PAGES and len(
+        license_records
+    ) < PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
+        page_count += 1
+        parsed_page_rows = _parse_datagrid_rows(current_page.html)
+        if not parsed_page_rows:
+            lowered = current_page.html.lower()
+            if any(token in lowered for token in ("no records", "no record", "no results", "not found")):
+                break
+            if page_count == 1:
+                return "state_adapter_no_results_grid"
+            break
+        _append_aspnet_page_records(parsed_page_rows, state_source.state_code, seen_signatures, license_records)
+        postback_targets = _extract_postback_targets(current_page.html)
+        next_page = min(
+            (page for page in postback_targets if page > current_page.number), default=None
+        )
+        if next_page is None:
+            break
+        postback_target = postback_targets.get(next_page)
+        if not postback_target:
+            break
+        postback_fields_by_name = _extract_hidden_fields(current_page.html)
+        postback_fields_by_name["__EVENTTARGET"] = postback_target
+        postback_fields_by_name["__EVENTARGUMENT"] = ""
+        try:
+            async with session.post(
+                current_page.url,
+                data=postback_fields_by_name,
+                allow_redirects=True,
+                ssl=False,
+            ) as next_response:
+                current_page = _AspNetPage(
+                    html=_decode_text(
+                        await _read_response_bytes(
+                            next_response,
+                            max_bytes=min(PHARM_LICENSE_MAX_DOWNLOAD_BYTES, 3_000_000),
+                        )
+                    ),
+                    url=str(next_response.url),
+                    number=next_page,
+                )
+        except Exception as exc:
+            metadata["pagination_error"] = str(exc)
+            break
+    metadata["pages_fetched"] = page_count
+    metadata["rows_loaded"] = len(license_records)
+    if page_count >= PHARM_LICENSE_STATE_ADAPTER_MAX_PAGES:
+        metadata["page_limit_reached"] = True
+    if len(license_records) >= PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
+        metadata["row_limit_reached"] = True
+    return current_page
+
+
 async def _load_rows_from_aspnet_search_state(
     session: aiohttp.ClientSession,
     state_source: StateSource,
@@ -1917,34 +2082,11 @@ async def _load_rows_from_aspnet_search_state(
 
     decoded_search_page = _decode_text(search_page)
     form_action = _extract_form_action(decoded_search_page, search_final_url)
-    hidden_fields = _extract_hidden_fields(decoded_search_page)
-    lookup_fields = _extract_lookup_field_names(decoded_search_page)
-    form_fields_by_name = dict(hidden_fields)
-    for field_name in sorted(lookup_fields):
-        form_fields_by_name[field_name] = ""
-
-    profession_options = _extract_select_options(decoded_search_page, "t_web_lookup__profession_name")
-    profession_value = _pick_pharmacy_option(profession_options)
-    if profession_value and "t_web_lookup__profession_name" in lookup_fields:
-        form_fields_by_name["t_web_lookup__profession_name"] = profession_value
-
-    license_type_options = _extract_select_options(decoded_search_page, "t_web_lookup__license_type_name")
-    license_type_value = _pick_exact_option(license_type_options, "Pharmacy")
-    if license_type_value and "t_web_lookup__license_type_name" in lookup_fields:
-        form_fields_by_name["t_web_lookup__license_type_name"] = license_type_value
-
-    if profession_value is None:
-        if "t_web_lookup__full_name" in lookup_fields:
-            form_fields_by_name["t_web_lookup__full_name"] = "PHARM"
-        elif "t_web_lookup__doing_business_as" in lookup_fields:
-            form_fields_by_name["t_web_lookup__doing_business_as"] = "PHARM"
-        else:
-            return [], search_final_url, metadata, "state_adapter_no_pharmacy_filter"
-
-    metadata["selected_profession"] = profession_value
-    metadata["selected_license_type"] = license_type_value
-
-    form_fields_by_name["sch_button"] = "Search"
+    form_fields_by_name = _extract_hidden_fields(decoded_search_page)
+    if not _is_aspnet_search_form_configured(
+        decoded_search_page, metadata, form_fields_by_name
+    ):
+        return [], search_final_url, metadata, "state_adapter_no_pharmacy_filter"
     try:
         async with session.post(form_action, data=form_fields_by_name, allow_redirects=True, ssl=False) as response:
             result_html = await _read_response_bytes(
@@ -1958,76 +2100,16 @@ async def _load_rows_from_aspnet_search_state(
     current_html = _decode_text(result_html)
     if _is_captcha_page(current_html):
         return [], result_url, metadata, "captcha_required"
-    current_url = result_url
-    current_page = 1
-    page_count = 0
-    seen_signatures: set[tuple[str, str, str]] = set()
-
-    while (
-        page_count < PHARM_LICENSE_STATE_ADAPTER_MAX_PAGES
-        and len(license_records) < PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS
-    ):
-        page_count += 1
-        parsed_page_rows = _parse_datagrid_rows(current_html)
-        if not parsed_page_rows:
-            lowered = current_html.lower()
-            if any(token in lowered for token in ("no records", "no record", "no results", "not found")):
-                break
-            if page_count == 1:
-                return [], current_url, metadata, "state_adapter_no_results_grid"
-            break
-
-        for raw_row in parsed_page_rows:
-            hydrated_row = _hydrate_row_with_address_parts(raw_row)
-            signature = (
-                _safe_text(hydrated_row.get("Name")) or "",
-                _safe_text(hydrated_row.get("License #") or hydrated_row.get("License Number")) or "",
-                _safe_text(hydrated_row.get("State")) or state_source.state_code,
-            )
-            if signature in seen_signatures:
-                continue
-            seen_signatures.add(signature)
-            license_records.append(hydrated_row)
-            if len(license_records) >= PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
-                break
-
-        postback_targets = _extract_postback_targets(current_html)
-        next_page = min((page for page in postback_targets if page > current_page), default=None)
-        if next_page is None:
-            break
-        postback_target = postback_targets.get(next_page)
-        if not postback_target:
-            break
-
-        postback_fields_by_name = _extract_hidden_fields(current_html)
-        postback_fields_by_name["__EVENTTARGET"] = postback_target
-        postback_fields_by_name["__EVENTARGUMENT"] = ""
-        try:
-            async with session.post(
-                current_url,
-                data=postback_fields_by_name,
-                allow_redirects=True,
-                ssl=False,
-            ) as next_response:
-                current_html = _decode_text(
-                    await _read_response_bytes(
-                        next_response,
-                        max_bytes=min(PHARM_LICENSE_MAX_DOWNLOAD_BYTES, 3_000_000),
-                    )
-                )
-                current_url = str(next_response.url)
-        except Exception as exc:
-            metadata["pagination_error"] = str(exc)
-            break
-        current_page = next_page
-
-    metadata["pages_fetched"] = page_count
-    metadata["rows_loaded"] = len(license_records)
-    if page_count >= PHARM_LICENSE_STATE_ADAPTER_MAX_PAGES:
-        metadata["page_limit_reached"] = True
-    if len(license_records) >= PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
-        metadata["row_limit_reached"] = True
-    return license_records, current_url or search_final_url, metadata, None
+    final_page = await _load_aspnet_result_pages(
+        session,
+        state_source,
+        _AspNetPage(html=current_html, url=result_url, number=1),
+        metadata,
+        license_records,
+    )
+    if isinstance(final_page, str):
+        return [], result_url, metadata, final_page
+    return license_records, final_page.url or search_final_url, metadata, None
 
 
 def _row_index(row: dict[str, Any]) -> dict[str, Any]:
@@ -2468,6 +2550,170 @@ def _test_rows_for_state(state_source: StateSource) -> list[dict[str, Any]]:
     ]
 
 
+def _unsupported_state_import_stats(
+    reason: str, metadata: dict[str, Any]
+) -> StateImportStats:
+    return StateImportStats(
+        supported=False,
+        status="unsupported",
+        source_url=None,
+        unsupported_reason=reason,
+        error_text=None,
+        row_count_parsed=0,
+        row_count_matched=0,
+        row_count_dropped=0,
+        row_count_inserted=0,
+        metadata=metadata,
+    )
+
+
+async def _load_state_adapter_payload(
+    session: aiohttp.ClientSession, state_source: StateSource, test_mode: bool
+) -> _StateImportState | StateImportStats:
+    source_state = _StateImportState()
+    if test_mode:
+        source_state.raw_rows = _test_rows_for_state(state_source)
+        source_state.selected_source_url = state_source.board_url
+        source_state.metadata["test_mode"] = True
+        return source_state
+    configured = await _load_rows_from_configured_source(session, state_source)
+    configured_handled, cfg_rows, cfg_source_url, cfg_metadata, cfg_error = configured
+    if configured_handled:
+        source_state.metadata.update(cfg_metadata)
+        if cfg_error:
+            source_state.adapter_error = cfg_error
+            source_state.metadata["adapter_error"] = cfg_error
+            if source_state.metadata.get("terminal_error"):
+                return _unsupported_state_import_stats(cfg_error, source_state.metadata)
+        else:
+            source_state.raw_rows = cfg_rows
+            source_state.selected_source_url = cfg_source_url or state_source.board_url
+            source_state.metadata["source_adapter"] = source_state.metadata.get("adapter")
+    adapter_spec = None if configured_handled else _create_aspnet_adapter_spec(state_source)
+    if adapter_spec:
+        adapter_result = await _load_rows_from_aspnet_search_state(
+            session, state_source, adapter_spec
+        )
+        adapter_rows, adapter_source_url, adapter_metadata, source_state.adapter_error = adapter_result
+        source_state.metadata.update(adapter_metadata)
+        source_state.metadata["adapter_source_url"] = adapter_source_url
+        if source_state.adapter_error:
+            source_state.metadata["adapter_error"] = source_state.adapter_error
+        else:
+            source_state.raw_rows = adapter_rows
+            source_state.selected_source_url = adapter_source_url or state_source.board_url
+            source_state.metadata["source_adapter"] = _STATE_ADAPTER_ASPNET_SEARCH
+    return source_state
+
+
+async def _discover_state_source_payload(
+    session: aiohttp.ClientSession,
+    state_source: StateSource,
+    source_state: _StateImportState,
+) -> StateImportStats | None:
+    candidate_urls, discover_error = await _discover_machine_readable_sources(
+        session, state_source
+    )
+    source_state.metadata["candidate_urls"] = candidate_urls
+    if discover_error:
+        return _unsupported_state_import_stats(
+            source_state.adapter_error or discover_error, source_state.metadata
+        )
+    for candidate_url in candidate_urls[:PHARM_LICENSE_MAX_CANDIDATE_URLS]:
+        candidate_records, load_error = await _load_records_from_source(
+            session, candidate_url
+        )
+        if load_error:
+            source_state.metadata.setdefault("source_errors", []).append(
+                {"url": candidate_url, "error": load_error}
+            )
+            continue
+        if candidate_records:
+            source_state.raw_rows = candidate_records
+            source_state.selected_source_url = candidate_url
+            source_state.metadata["source_adapter"] = _STATE_ADAPTER_FALLBACK_MACHINE_READABLE
+            break
+    if source_state.selected_source_url is not None:
+        return None
+    reason = source_state.adapter_error or "no_parseable_machine_readable_source"
+    if source_state.metadata.get("source_errors"):
+        reason = f"no_parseable_machine_readable_source:{source_state.metadata['source_errors'][0]['error']}"
+    return _unsupported_state_import_stats(reason, source_state.metadata)
+
+
+async def _stage_state_source_rows(
+    source_state: _StateImportState,
+    state_source: StateSource,
+    run_id: str,
+    snapshot_id: str,
+    test_mode: bool,
+    imported_at: datetime.datetime,
+    npi_resolver: StateNpiResolver | None,
+) -> None:
+    staged_records: list[dict[str, Any]] = []
+    for source_record in source_state.raw_rows:
+        source_state.row_count_parsed += 1
+        normalized_record, drop_reason = _normalize_stage_row(
+            source_record,
+            run_id=run_id,
+            snapshot_id=snapshot_id,
+            state_source=state_source,
+            source_url=source_state.selected_source_url or state_source.board_url,
+            imported_at=imported_at,
+            npi_resolver=npi_resolver,
+        )
+        if normalized_record is None:
+            source_state.row_count_dropped += 1
+            if drop_reason:
+                source_state.metadata.setdefault("drop_reasons", {})
+                source_state.metadata["drop_reasons"][drop_reason] = (
+                    source_state.metadata["drop_reasons"].get(drop_reason, 0) + 1
+                )
+            if test_mode and source_state.row_count_parsed >= PHARM_LICENSE_TEST_MAX_ROWS_PER_STATE:
+                break
+            continue
+        source_state.row_count_matched += 1
+        staged_records.append(normalized_record)
+        if len(staged_records) >= PHARM_LICENSE_BATCH_SIZE:
+            await _flush_stage_batch(staged_records)
+            source_state.inserted += PHARM_LICENSE_BATCH_SIZE
+        if test_mode and source_state.row_count_parsed >= PHARM_LICENSE_TEST_MAX_ROWS_PER_STATE:
+            break
+    if staged_records:
+        source_state.inserted += len(staged_records)
+        await _flush_stage_batch(staged_records)
+    if npi_resolver and npi_resolver.stats:
+        source_state.metadata["npi_match_stats"] = dict(sorted(npi_resolver.stats.items()))
+
+
+def _completed_state_import_stats(source_state: _StateImportState) -> StateImportStats:
+    if source_state.row_count_matched == 0:
+        return StateImportStats(
+            supported=True,
+            status="completed_no_match",
+            source_url=source_state.selected_source_url,
+            unsupported_reason="no_npi_matchable_rows",
+            error_text=None,
+            row_count_parsed=source_state.row_count_parsed,
+            row_count_matched=0,
+            row_count_dropped=source_state.row_count_dropped,
+            row_count_inserted=0,
+            metadata=source_state.metadata,
+        )
+    return StateImportStats(
+        supported=True,
+        status="completed",
+        source_url=source_state.selected_source_url,
+        unsupported_reason=None,
+        error_text=None,
+        row_count_parsed=source_state.row_count_parsed,
+        row_count_matched=source_state.row_count_matched,
+        row_count_dropped=source_state.row_count_dropped,
+        row_count_inserted=source_state.inserted,
+        metadata=source_state.metadata,
+    )
+
+
 async def _import_state_source(
     session: aiohttp.ClientSession,
     state_source: StateSource,
@@ -2478,111 +2724,20 @@ async def _import_state_source(
 ) -> StateImportStats:
     """Fetch, normalize, and stage one state's pharmacy-license source."""
     imported_at = datetime.datetime.utcnow()
-
-    raw_rows: list[dict[str, Any]] = []
-    selected_source_url: str | None = None
-    metadata: dict[str, Any] = {}
-
-    if test_mode:
-        raw_rows = _test_rows_for_state(state_source)
-        selected_source_url = state_source.board_url
-        metadata["test_mode"] = True
-    else:
-        adapter_error: str | None = None
-        configured_handled, cfg_rows, cfg_source_url, cfg_metadata, cfg_error = await _load_rows_from_configured_source(
-            session,
-            state_source,
+    source_state = await _load_state_adapter_payload(session, state_source, test_mode)
+    if isinstance(source_state, StateImportStats):
+        return source_state
+    if not source_state.raw_rows and source_state.selected_source_url is None:
+        terminal_stats = await _discover_state_source_payload(
+            session, state_source, source_state
         )
-        if configured_handled:
-            metadata.update(cfg_metadata)
-            if cfg_error:
-                adapter_error = cfg_error
-                metadata["adapter_error"] = cfg_error
-                if metadata.get("terminal_error"):
-                    return StateImportStats(
-                        supported=False,
-                        status="unsupported",
-                        source_url=None,
-                        unsupported_reason=cfg_error,
-                        error_text=None,
-                        row_count_parsed=0,
-                        row_count_matched=0,
-                        row_count_dropped=0,
-                        row_count_inserted=0,
-                        metadata=metadata,
-                    )
-            else:
-                raw_rows = cfg_rows
-                selected_source_url = cfg_source_url or state_source.board_url
-                metadata["source_adapter"] = metadata.get("adapter")
-
-        adapter_spec = None if configured_handled else _create_aspnet_adapter_spec(state_source)
-        if adapter_spec:
-            adapter_rows, adapter_source_url, adapter_metadata, adapter_error = await _load_rows_from_aspnet_search_state(
-                session,
-                state_source,
-                adapter_spec,
-            )
-            metadata.update(adapter_metadata)
-            metadata["adapter_source_url"] = adapter_source_url
-            if adapter_error:
-                metadata["adapter_error"] = adapter_error
-            else:
-                raw_rows = adapter_rows
-                selected_source_url = adapter_source_url or state_source.board_url
-                metadata["source_adapter"] = _STATE_ADAPTER_ASPNET_SEARCH
-
-        if not raw_rows and selected_source_url is None:
-            candidate_urls, discover_error = await _discover_machine_readable_sources(session, state_source)
-            metadata["candidate_urls"] = candidate_urls
-            if discover_error:
-                reason = adapter_error or discover_error
-                return StateImportStats(
-                    supported=False,
-                    status="unsupported",
-                    source_url=None,
-                    unsupported_reason=reason,
-                    error_text=None,
-                    row_count_parsed=0,
-                    row_count_matched=0,
-                    row_count_dropped=0,
-                    row_count_inserted=0,
-                    metadata=metadata,
-                )
-
-            for candidate_url in candidate_urls[:PHARM_LICENSE_MAX_CANDIDATE_URLS]:
-                candidate_records, load_error = await _load_records_from_source(session, candidate_url)
-                if load_error:
-                    metadata.setdefault("source_errors", []).append({"url": candidate_url, "error": load_error})
-                    continue
-                if candidate_records:
-                    raw_rows = candidate_records
-                    selected_source_url = candidate_url
-                    metadata["source_adapter"] = _STATE_ADAPTER_FALLBACK_MACHINE_READABLE
-                    break
-
-            if selected_source_url is None:
-                reason = adapter_error or "no_parseable_machine_readable_source"
-                if metadata.get("source_errors"):
-                    reason = f"no_parseable_machine_readable_source:{metadata['source_errors'][0]['error']}"
-                return StateImportStats(
-                    supported=False,
-                    status="unsupported",
-                    source_url=None,
-                    unsupported_reason=reason,
-                    error_text=None,
-                    row_count_parsed=0,
-                    row_count_matched=0,
-                    row_count_dropped=0,
-                    row_count_inserted=0,
-                    metadata=metadata,
-                )
-
+        if terminal_stats is not None:
+            return terminal_stats
     npi_resolver: StateNpiResolver | None = None
-    if not test_mode and raw_rows:
+    if not test_mode and source_state.raw_rows:
         npi_resolver = await _build_state_npi_resolver(state_source.state_code)
         if npi_resolver:
-            metadata["npi_resolver"] = {
+            source_state.metadata["npi_resolver"] = {
                 "license_keys": len(npi_resolver.by_license),
                 "other_identifier_keys": len(npi_resolver.by_other_identifier),
                 "other_identifier_digits_keys": len(npi_resolver.by_other_identifier_digits),
@@ -2593,76 +2748,11 @@ async def _import_state_source(
                 "partd_name_fallback_enabled": npi_resolver.partd_name_fallback_enabled,
             }
             if npi_resolver.partd_quality:
-                metadata["npi_resolver"]["partd_quality"] = npi_resolver.partd_quality
-
-    row_count_parsed = 0
-    row_count_matched = 0
-    row_count_dropped = 0
-    inserted = 0
-    staged_records: list[dict[str, Any]] = []
-
-    for source_record in raw_rows:
-        row_count_parsed += 1
-        normalized_record, drop_reason = _normalize_stage_row(
-            source_record,
-            run_id=run_id,
-            snapshot_id=snapshot_id,
-            state_source=state_source,
-            source_url=selected_source_url or state_source.board_url,
-            imported_at=imported_at,
-            npi_resolver=npi_resolver,
-        )
-        if normalized_record is None:
-            row_count_dropped += 1
-            if drop_reason:
-                metadata.setdefault("drop_reasons", {})
-                metadata["drop_reasons"][drop_reason] = metadata["drop_reasons"].get(drop_reason, 0) + 1
-            if test_mode and row_count_parsed >= PHARM_LICENSE_TEST_MAX_ROWS_PER_STATE:
-                break
-            continue
-
-        row_count_matched += 1
-        staged_records.append(normalized_record)
-        if len(staged_records) >= PHARM_LICENSE_BATCH_SIZE:
-            await _flush_stage_batch(staged_records)
-            inserted += PHARM_LICENSE_BATCH_SIZE
-
-        if test_mode and row_count_parsed >= PHARM_LICENSE_TEST_MAX_ROWS_PER_STATE:
-            break
-
-    if staged_records:
-        inserted += len(staged_records)
-        await _flush_stage_batch(staged_records)
-
-    if npi_resolver and npi_resolver.stats:
-        metadata["npi_match_stats"] = dict(sorted(npi_resolver.stats.items()))
-
-    if row_count_matched == 0:
-        return StateImportStats(
-            supported=True,
-            status="completed_no_match",
-            source_url=selected_source_url,
-            unsupported_reason="no_npi_matchable_rows",
-            error_text=None,
-            row_count_parsed=row_count_parsed,
-            row_count_matched=0,
-            row_count_dropped=row_count_dropped,
-            row_count_inserted=0,
-            metadata=metadata,
-        )
-
-    return StateImportStats(
-        supported=True,
-        status="completed",
-        source_url=selected_source_url,
-        unsupported_reason=None,
-        error_text=None,
-        row_count_parsed=row_count_parsed,
-        row_count_matched=row_count_matched,
-        row_count_dropped=row_count_dropped,
-        row_count_inserted=inserted,
-        metadata=metadata,
+                source_state.metadata["npi_resolver"]["partd_quality"] = npi_resolver.partd_quality
+    await _stage_state_source_rows(
+        source_state, state_source, run_id, snapshot_id, test_mode, imported_at, npi_resolver
     )
+    return _completed_state_import_stats(source_state)
 
 
 def _iter_additional_indexes(obj: type) -> list[dict[str, Any]]:
