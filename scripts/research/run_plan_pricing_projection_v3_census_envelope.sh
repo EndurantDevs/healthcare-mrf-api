@@ -57,6 +57,7 @@ PRIOR_DRAIN_MODE=
 CHILD_COMMAND_SHA256=
 CHILD_EXECUTABLE_SHA256=
 CHILD_EXECUTABLE_DESCRIPTOR=
+CHILD_CLEANUP_PROOF=
 CENSUS_RECEIPT_SHA256=
 RUNTIME_ATTESTATION_SHA256=
 CAPTURED_RUNTIME_ATTESTATION_SHA256=
@@ -80,12 +81,15 @@ INTERRUPT_EXIT=0
 INTERRUPT_SIGNAL=
 TIMED_OUT=false
 QUOTA_ATTEMPTED=false
+QUOTA_CREATE_UNCERTAIN=false
 QUOTA_CREATED=false
 QUOTA_PROBE_VERIFIED=false
 DRAIN_CAPTURED=false
 POLICY_ATTEMPTED=false
+POLICY_CREATE_UNCERTAIN=false
 POLICY_CREATED=false
 BINDING_ATTEMPTED=false
+BINDING_CREATE_UNCERTAIN=false
 BINDING_CREATED=false
 PROBE_VERIFIED=false
 PRE_CHILD_FENCE_VERIFIED=false
@@ -315,6 +319,7 @@ validate_args() {
   LOCK_UNIT="hp-pv3-census-${OWNER_TOKEN}-lock.service"
   LOCK_MARKER="${STATE_DIR}/build-lock.acquired"
   LOCK_OWNERSHIP="${STATE_DIR}/build-lock.ownership"
+  CHILD_CLEANUP_PROOF="${STATE_DIR}/packet-cleanup-complete"
   QUOTA_NAME="hp-pv3-census-${OWNER_TOKEN}"
   POLICY_NAME="hp-pv3-census-${OWNER_TOKEN}.healthporta.com"
   BINDING_NAME="${POLICY_NAME}"
@@ -794,6 +799,7 @@ print(meta.get("uid") or "")
 create_quota() {
   local create_exit=0 observed_uid
   QUOTA_ATTEMPTED=true
+  QUOTA_CREATE_UNCERTAIN=true
   set +e
   quota_manifest | kctl create -f - >/dev/null
   create_exit=$?
@@ -807,6 +813,7 @@ create_quota() {
   QUOTA_UID=$(quota_identity)
   [ -n "${QUOTA_UID}" ] || die "quota UID is unavailable"
   QUOTA_CREATED=true
+  QUOTA_CREATE_UNCERTAIN=false
   [ "${create_exit}" -eq 0 ] \
     || die "quota appeared after its create command failed"
 }
@@ -1000,6 +1007,7 @@ print(meta.get("uid") or "")
 create_worker_fence() {
   local create_exit=0 observed_uid
   POLICY_ATTEMPTED=true
+  POLICY_CREATE_UNCERTAIN=true
   set +e
   policy_manifest | kctl create -f - >/dev/null
   create_exit=$?
@@ -1013,10 +1021,12 @@ create_worker_fence() {
   POLICY_UID=$(policy_identity)
   [ -n "${POLICY_UID}" ] || die "policy UID is unavailable"
   POLICY_CREATED=true
+  POLICY_CREATE_UNCERTAIN=false
   [ "${create_exit}" -eq 0 ] \
     || die "policy appeared after its create command failed"
 
   BINDING_ATTEMPTED=true
+  BINDING_CREATE_UNCERTAIN=true
   set +e
   binding_manifest | kctl create -f - >/dev/null
   create_exit=$?
@@ -1030,6 +1040,7 @@ create_worker_fence() {
   BINDING_UID=$(binding_identity)
   [ -n "${BINDING_UID}" ] || die "binding UID is unavailable"
   BINDING_CREATED=true
+  BINDING_CREATE_UNCERTAIN=false
   [ "${create_exit}" -eq 0 ] \
     || die "binding appeared after its create command failed"
 
@@ -1085,6 +1096,15 @@ census_resources_absent() {
     && resource_is_absent configmap "${CENSUS_CONFIGMAP}" "${DEV_NAMESPACE}" \
     && attested_pod_is_absent \
     && census_inventory_absent
+}
+
+child_cleanup_is_complete() {
+  local observed
+  [ -f "${CHILD_CLEANUP_PROOF}" ] \
+    && [ ! -L "${CHILD_CLEANUP_PROOF}" ] || return 1
+  read -r observed _ < <(sha256sum "${CHILD_CLEANUP_PROOF}") || return 1
+  [ "${observed}" \
+    = a17fcf0a2f50e2d495e4f90ce263410edc183add6c62699a2facbccf60410f74 ]
 }
 
 attested_pod_is_absent() {
@@ -1702,6 +1722,8 @@ run_child() {
   fi
   reap_child_group "${CHILD_PID}" \
     || die "census process group did not terminate"
+  child_cleanup_is_complete \
+    || die "census child cleanup was not proven complete"
   if [ -e "${CENSUS_RECEIPT}" ] || [ -L "${CENSUS_RECEIPT}" ]; then
     [ -f "${CENSUS_RECEIPT}" ] && [ ! -L "${CENSUS_RECEIPT}" ] \
       || die "census receipt is not a regular file"
@@ -1803,41 +1825,15 @@ json.dump({
 }
 
 reconcile_ambiguous_creates() {
-  local observed
-  if [ "${BINDING_ATTEMPTED}" = true ] \
-      && [ "${BINDING_CREATED}" = false ]; then
-    observed=$(kctl get validatingadmissionpolicybinding "${BINDING_NAME}" \
-      --ignore-not-found -o jsonpath='{.metadata.uid}') || return 1
-    if [ -n "${observed}" ]; then
-      BINDING_UID=$(binding_identity) || return 1
-      BINDING_CREATED=true
-    else
-      BINDING_REMOVED=true
-    fi
-  fi
-  if [ "${POLICY_ATTEMPTED}" = true ] \
-      && [ "${POLICY_CREATED}" = false ]; then
-    observed=$(kctl get validatingadmissionpolicy "${POLICY_NAME}" \
-      --ignore-not-found -o jsonpath='{.metadata.uid}') || return 1
-    if [ -n "${observed}" ]; then
-      POLICY_UID=$(policy_identity) || return 1
-      POLICY_CREATED=true
-    else
-      POLICY_REMOVED=true
-    fi
-  fi
-  if [ "${QUOTA_ATTEMPTED}" = true ] \
-      && [ "${QUOTA_CREATED}" = false ]; then
-    observed=$(kctl -n "${ARC_HOLD_NAMESPACE}" get resourcequota \
-      "${QUOTA_NAME}" --ignore-not-found \
-      -o jsonpath='{.metadata.uid}') || return 1
-    if [ -n "${observed}" ]; then
-      QUOTA_UID=$(quota_identity) || return 1
-      QUOTA_CREATED=true
-    else
-      QUOTA_REMOVED=true
-    fi
-  fi
+  [ "${BINDING_CREATE_UNCERTAIN}" = false ] || return 1
+  [ "${POLICY_CREATE_UNCERTAIN}" = false ] || return 1
+  [ "${QUOTA_CREATE_UNCERTAIN}" = false ] || return 1
+  { [ "${BINDING_ATTEMPTED}" = false ] \
+      || [ "${BINDING_CREATED}" = true ]; } || return 1
+  { [ "${POLICY_ATTEMPTED}" = false ] \
+      || [ "${POLICY_CREATED}" = true ]; } || return 1
+  { [ "${QUOTA_ATTEMPTED}" = false ] \
+      || [ "${QUOTA_CREATED}" = true ]; } || return 1
 }
 
 outer_fence_identities_match() {
@@ -1890,6 +1886,12 @@ cleanup_envelope() {
         || ! child_group_absent "${CHILD_PID}"; }; then
     log 'cleanup retained every outer fence because the census process remains'
     return 1
+  fi
+  if [ "${CHILD_LAUNCHED}" = true ]; then
+    child_cleanup_is_complete || {
+      log 'cleanup retained every outer fence because child cleanup is unproven'
+      return 1
+    }
   fi
   census_resources_absent || {
     log 'cleanup retained every outer fence because census resources remain'
