@@ -38,15 +38,18 @@ def _install_local_scope_reads(monkeypatch, rate_rows, local_npis):
             else matching_rates[offset : offset + limit]
         )
 
+    async def location_read(*_args, **kwargs):
+        limit = kwargs["limit"]
+        source_exhausted = len(local_npis) < limit
+        return [
+            {"npi": npi, "_ptg_source_exhausted": source_exhausted}
+            for npi in local_npis[:limit]
+        ]
+
     reads_by_kind = {
         "rates": AsyncMock(side_effect=rate_read),
         "members": AsyncMock(),
-        "locations": AsyncMock(
-            return_value=[
-                {"npi": npi, "_ptg_source_exhausted": True}
-                for npi in local_npis
-            ]
-        ),
+        "locations": AsyncMock(side_effect=location_read),
         "sets": AsyncMock(
             return_value={
                 npi: (local_provider_set_keys[index % 68],)
