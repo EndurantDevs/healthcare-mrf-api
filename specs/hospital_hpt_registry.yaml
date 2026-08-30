@@ -632,9 +632,11 @@ hospitals:
   name: Amberwell Atchison Association
   cms_hpt_url: https://amberwellhealth.org/cms-hpt.txt
   locator_name: Amberwell Atchison Association
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbAHAATCHISONKS&fileType=CSV&type=CDMWithoutLabel
 - hospital_id: hospital-000189
   name: Amberwell Hiawatha Association
   cms_hpt_url: https://amberwellhealth.org/cms-hpt.txt
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbHiawathaCommunity&fileType=CSV&type=CDMWithoutLabel
 - hospital_id: hospital-000190
   name: American Family Children's Hospital
   cms_hpt_url: https://www.uwhealth.org/cms-hpt.txt
@@ -9536,6 +9538,7 @@ hospitals:
   cms_hpt_url: https://amberwellhealth.org/cms-hpt.txt
   alias_of: hospital-000189
   locator_name: Amberwell Hiawatha Association
+  fallback_mrf_url: https://apps.para-hcfs.com/PTT/FinalLinks/Reports.aspx?dbName=dbHiawathaCommunity&fileType=CSV&type=CDMWithoutLabel
 - hospital_id: hospital-002912
   name: Higgins General Hospital
   cms_hpt_url: https://www.tanner.org/cms-hpt.txt
