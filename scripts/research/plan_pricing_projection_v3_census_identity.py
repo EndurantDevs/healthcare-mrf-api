@@ -111,7 +111,7 @@ def harness_digest(source_by_field: Mapping[str, Any]) -> str | None:
     harness_files = source_by_field.get("harness_files")
     if not _is_file_inventory(harness_files, HARNESS_PATHS):
         return None
-    return dict(harness_files)[CENSUS_ENVELOPE_SCRIPT_PATH]
+    return dict(harness_files).get(CENSUS_ENVELOPE_SCRIPT_PATH)
 
 
 def is_source_pair_bound(

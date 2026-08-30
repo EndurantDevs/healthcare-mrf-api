@@ -359,8 +359,7 @@ def test_pre_child_signal_never_starts_census(
 
     definitions = _script_definitions(tmp_path)
     marker = tmp_path / "child-started"
-    state_root = tmp_path / "state"
-    state_root.mkdir()
+    state_root = envelope._state_root(tmp_path, "state")
     run_result = _run_pre_child_interrupt(
         definitions,
         marker,

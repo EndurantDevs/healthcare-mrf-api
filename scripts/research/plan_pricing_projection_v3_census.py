@@ -260,10 +260,10 @@ async def _measure_codes(
     save_progress(None, None, 0)
     for code_ordinal, code_identity in enumerate(context.code_identities, start=1):
 
-        async def code_stage(stage: str) -> Any:
+        async def code_stage(stage: str, ordinal: int = code_ordinal) -> Any:
             """Bind one database stage to the active code ordinal."""
 
-            return await set_stage(stage, code_ordinal)
+            return await set_stage(stage, ordinal)
 
         save_progress(code_ordinal, "before", code_ordinal - 1)
         measured_code_count += int(

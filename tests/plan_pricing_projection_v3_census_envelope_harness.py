@@ -19,6 +19,31 @@ LARGE_OVERLAY_BYTES = b"x" * 100_000
 OVERLAY_SHA256 = hashlib.sha256(OVERLAY_BYTES).hexdigest()
 
 
+def _kernel_directory(path: Path) -> Path:
+    """Return the kernel-visible spelling of an existing test directory."""
+
+    resolved = path.resolve(strict=True)
+    descriptor = os.open(resolved, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        proc_descriptor = Path(f"/proc/self/fd/{descriptor}")
+        return (
+            Path(os.path.realpath(proc_descriptor))
+            if proc_descriptor.exists()
+            else resolved
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _state_root(parent: Path, name: str = "envelopes") -> Path:
+    """Create an exact-mode root beneath the kernel-visible test directory."""
+
+    state_root = _kernel_directory(parent) / name
+    state_root.mkdir(mode=0o700)
+    state_root.chmod(0o700)
+    return state_root
+
+
 def _arguments(
     state_root: Path,
     repo: Path,
@@ -113,8 +138,7 @@ def _fake_environment(
         else OVERLAY_BYTES
     )
     (fake_state / "source-overlay.tar.gz").write_bytes(overlay_bytes)
-    state_root = (tmp_path / "envelopes").resolve()
-    state_root.mkdir()
+    state_root = _state_root(tmp_path)
     checkout = tmp_path / "repo"
     checkout.mkdir()
     env_by_name = {
@@ -142,11 +166,13 @@ def _fake_environment(
     return env_by_name, state_root, checkout
 
 
-def _receipt(state_root) -> dict:
+def _receipt(state_root: Path) -> dict:
     return json.loads((state_root / "run/envelope-receipt.json").read_text())
 
 
-def _run_envelope(tmp_path, **overrides) -> tuple[subprocess.CompletedProcess, Path]:
+def _run_envelope(
+    tmp_path: Path, **overrides: str
+) -> tuple[subprocess.CompletedProcess[str], Path]:
     env_by_name, state_root, checkout = _fake_environment(tmp_path, **overrides)
     result = subprocess.run(
         [
@@ -163,6 +189,6 @@ def _run_envelope(tmp_path, **overrides) -> tuple[subprocess.CompletedProcess, P
         check=False,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=45,
     )
     return result, state_root

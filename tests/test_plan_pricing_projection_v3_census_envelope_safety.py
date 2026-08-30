@@ -1,6 +1,7 @@
 """Failure-safety checks for the plan-pricing census envelope."""
 
 import hashlib
+import stat
 import subprocess
 from pathlib import Path
 
@@ -14,20 +15,23 @@ def test_harness_uses_a_canonical_state_root(tmp_path: Path) -> None:
 
     canonical_root = tmp_path / "canonical"
     canonical_root.mkdir()
+    canonical_root.chmod(0o2700)
     aliased_root = tmp_path / "aliased"
     aliased_root.symlink_to(canonical_root, target_is_directory=True)
 
     result, state_root = envelope._run_envelope(aliased_root)
 
     assert result.returncode == 0, result.stderr
-    assert state_root == canonical_root / "envelopes"
+    assert state_root.samefile(canonical_root / "envelopes")
+    assert envelope._kernel_directory(state_root) == state_root
+    assert stat.S_IMODE(state_root.stat().st_mode) == 0o700
 
 
 def test_aliased_state_root_is_rejected_before_mutation(tmp_path: Path) -> None:
     """The production root walk must reject a direct symlink alias."""
 
     env_by_name, state_root, checkout = envelope._fake_environment(tmp_path)
-    aliased_root = tmp_path / "aliased-envelopes"
+    aliased_root = state_root.parent / "aliased-envelopes"
     aliased_root.symlink_to(state_root, target_is_directory=True)
     env_by_name["HLTHPRT_PLAN_PRICING_V3_CENSUS_STATE_ROOT"] = str(aliased_root)
 

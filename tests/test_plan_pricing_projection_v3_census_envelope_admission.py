@@ -34,8 +34,10 @@ def test_state_root_replacement_fails_before_any_outer_fence(tmp_path: Path) -> 
     assert (tmp_path / "fake-state/events").read_text().splitlines() == [
         "state_root_replaced"
     ]
+    original_root = state_root.with_name(state_root.name + ".original")
+    assert original_root.is_dir()
     assert not (outside / "run").exists()
-    assert not (state_root.with_name(state_root.name + ".original") / "run").exists()
+    assert not (original_root / "run").exists()
 
 
 @pytest.mark.parametrize("replacement", ["symlink", "fifo"])
@@ -74,7 +76,7 @@ def test_unsupported_server_version_fails_before_any_mutation(
     assert not (state_root / "run").exists()
 
 
-@pytest.mark.parametrize("kind", ("job", "pod", "configmap"))
+@pytest.mark.parametrize("kind", ["job", "pod", "configmap"])
 def test_preexisting_census_resource_fails_before_any_mutation(
     tmp_path: Path, kind: str
 ) -> None:

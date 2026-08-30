@@ -293,10 +293,12 @@ def _accepted_inputs() -> tuple[dict, dict]:
 
 def _is_accepted(
     receipt_by_field: dict,
-    _measurement_by_field: dict,
+    measurement_by_field: dict,
     envelope_by_field: dict | None = None,
     authority_by_field: dict | None = None,
 ) -> bool:
+    if receipt_by_field.get("measurement") is not measurement_by_field:
+        return False
     return authority.is_accepted(
         receipt_by_field,
         (
