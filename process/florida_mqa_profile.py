@@ -20,6 +20,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from http.cookiejar import CookieJar
+from itertools import islice
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Iterator, Mapping
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
@@ -1661,20 +1662,16 @@ def _iter_rows(
                     and len(physical_values) == 11
                     and len("|".join(physical_values)) == 125
                 ):
-                    lookahead_items: list[tuple[int, list[str]]] = []
-                    for _ in range(2):
-                        try:
-                            lookahead_items.append(next(numbered_rows))
-                        except StopIteration:
-                            break
+                    lookahead_items = list(islice(numbered_rows, 2))
                     continuation = _license_status_continuation_values(
                         header_items,
                         [(row_number, physical_values), *lookahead_items],
                         artifact_member=artifact_member,
                         parser_metrics=parser_metrics,
                     )
-                    if continuation is None:
-                        pending_rows.extend(lookahead_items)
+                    pending_rows.extend(
+                        lookahead_items if continuation is None else ()
+                    )
                 if continuation is not None:
                     field_values, parse_metadata = continuation
                 else:
@@ -1697,13 +1694,17 @@ def _iter_rows(
                     }
                 else:
                     raw_row_by_key = dict(zip(header_items, field_values, strict=True))
-                    if parse_metadata:
-                        raw_row_by_key["_source_parse_metadata"] = parse_metadata
+                    raw_row_by_key.update(
+                        {"_source_parse_metadata": parse_metadata}
+                        if parse_metadata
+                        else {}
+                    )
                     cleaned_by_key = _clean_row(raw_row_by_key)
-                    if parse_metadata:
-                        cleaned_by_key["_source_parse_repair"] = str(
-                            parse_metadata["kind"]
-                        )
+                    cleaned_by_key.update(
+                        {"_source_parse_repair": str(parse_metadata["kind"])}
+                        if parse_metadata
+                        else {}
+                    )
                 if any(cleaned_by_key.values()):
                     yield row_number, raw_row_by_key, cleaned_by_key, header_items
             continue

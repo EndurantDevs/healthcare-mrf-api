@@ -696,6 +696,28 @@ async def test_get_near_npi_uses_unified_address_table_when_compatible(monkeypat
     assert "min_lat" not in captured_query_map["params"]
 
 
+def test_provider_mapping_helpers_keep_resolved_npi():
+    row_mapping = {"npi": None}
+    resolved_npi = 1112223334
+
+    list_provider = npi_module._new_provider_from_search_mapping(
+        row_mapping,
+        resolved_npi,
+        "mrf.entity_address_unified",
+    )
+    near_provider_by_field = {"taxonomy_list": []}
+    npi_module._populate_near_provider_mapping(
+        near_provider_by_field,
+        row_mapping,
+        resolved_npi,
+        "00000000-0000-0000-0000-000000000001",
+        "mrf.entity_address_unified",
+    )
+
+    assert list_provider["npi"] == resolved_npi
+    assert near_provider_by_field["npi"] == resolved_npi
+
+
 @pytest.mark.asyncio
 async def test_address_serving_table_falls_back_to_legacy_when_unified_incompatible(monkeypatch):
     async def fake_table_columns(table_name, *, session=None):

@@ -1897,6 +1897,7 @@ async def test_npi_all_returns_three_ranked_locations_with_honest_total(monkeypa
         "npi": 1000000007,
         "checksum": 1,
         "healthcare_provider_taxonomy_code": "207Q00000X",
+        "provider_license_number": None,
     }
     location_maps[0]["taxonomy_rows"] = [nested_taxonomy_map]
     location_maps[1]["taxonomy_rows"] = [nested_taxonomy_map]

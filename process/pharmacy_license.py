@@ -3286,6 +3286,26 @@ async def _upsert_coverage(payload: dict[str, Any]) -> None:
     await push_objects([payload], PharmacyLicenseStateCoverage, rewrite=True, use_copy=False)
 
 
+async def _materialize_matched_snapshot(
+    schema: str,
+    snapshot_id: str,
+    run_id: str,
+    matched_count: int,
+) -> int:
+    """Materialize only snapshots with matched source rows."""
+
+    if matched_count <= 0:
+        return 0
+    return await _materialize_snapshot(schema, snapshot_id, run_id)
+
+
+def _raise_canonical_address_error(error: Exception) -> None:
+    """Preserve the fail-fast boundary for canonical-address failures."""
+
+    if isinstance(error, PharmacyLicenseCanonicalAddressError):
+        raise error
+
+
 async def pharmacy_license_start(ctx, task=None):
     """Run one pharmacy-license import and publish its control state."""
     del ctx
@@ -3415,9 +3435,12 @@ async def pharmacy_license_start(ctx, task=None):
                         snapshot_id=snapshot_id,
                         test_mode=test_mode,
                     )
-                    inserted_rows = 0
-                    if stats.row_count_matched > 0:
-                        inserted_rows = await _materialize_snapshot(schema, snapshot_id, run_id)
+                    inserted_rows = await _materialize_matched_snapshot(
+                        schema,
+                        snapshot_id,
+                        run_id,
+                        stats.row_count_matched,
+                    )
 
                     await _upsert_snapshot(
                         {
@@ -3464,10 +3487,12 @@ async def pharmacy_license_start(ctx, task=None):
                     summary_total_map["matched_rows"] += stats.row_count_matched
                     summary_total_map["dropped_rows"] += stats.row_count_dropped
                     summary_total_map["inserted_rows"] += inserted_rows
-                    if stats.supported:
-                        summary_total_map["supported_states"] += 1
-                    else:
-                        summary_total_map["unsupported_states"] += 1
+                    support_total_key = (
+                        "supported_states"
+                        if stats.supported
+                        else "unsupported_states"
+                    )
+                    summary_total_map[support_total_key] += 1
                     enqueue_live_progress(
                         run_id=run_id,
                         importer="pharmacy-license",
@@ -3535,8 +3560,7 @@ async def pharmacy_license_start(ctx, task=None):
                             else f"failed {state_source.state_code}; continuing"
                         ),
                     )
-                    if isinstance(exc, PharmacyLicenseCanonicalAddressError):
-                        raise
+                    _raise_canonical_address_error(exc)
 
         if PHARM_LICENSE_DEFER_ADDITIONAL_INDEXES:
             enqueue_live_progress(

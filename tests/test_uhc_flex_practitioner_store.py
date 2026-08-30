@@ -309,7 +309,7 @@ async def test_general_claim_prefers_fresh_and_requested_claim_stays_exact() -> 
     assert "AND work.attempt_count = 0" not in general_claim_statements[1][0]
     general_sql, general_parameters = general_claim_statements[-1]
     assert "work.npi <> ALL(CAST(:excluded_npis AS bigint[]))" in general_sql
-    assert "ORDER BY work.npi" in general_sql
+    assert "ORDER BY work.attempt_count, work.npi" in general_sql
     assert general_parameters["excluded_npis"] == [NPI]
 
     database.statements.clear()
@@ -327,7 +327,7 @@ async def test_general_claim_prefers_fresh_and_requested_claim_stays_exact() -> 
         database=database,
     ) is None
     exact_sql, exact_parameters = database.statements[-1]
-    assert "ORDER BY work.npi" in exact_sql
+    assert "ORDER BY work.attempt_count, work.npi" in exact_sql
     assert "work.attempt_count = 0" not in exact_sql
     assert "excluded_npis" not in exact_parameters
     assert exact_parameters["requested_npi"] == NPI

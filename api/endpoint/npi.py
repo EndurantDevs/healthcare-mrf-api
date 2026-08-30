@@ -8894,6 +8894,109 @@ async def match_candidates(request):
     )
 
 
+def _new_provider_from_search_mapping(
+    row_mapping: Mapping[str, Any],
+    npi_value: Any,
+    address_table_sql: str,
+) -> dict[str, Any]:
+    """Build one list-search provider from a keyed database row."""
+
+    provider_by_field: dict[str, Any] = {
+        "taxonomy_list": [],
+        "_taxonomy_identities": set(),
+        "_address_candidates_complete": True,
+    }
+    for column in NPIData.__table__.columns:
+        if column.key not in PUBLIC_NPI_EXCLUDED_COLUMNS and column.key in row_mapping:
+            provider_by_field[column.key] = row_mapping.get(column.key)
+    if not provider_by_field.get("provider_organization_name"):
+        provider_by_field["provider_organization_name"] = row_mapping.get("entity_name")
+    if provider_by_field.get("entity_type_code") is None:
+        provider_by_field["entity_type_code"] = (
+            1
+            if any(
+                ":practitioner_role:" in str(record_id or "").lower()
+                for record_id in (row_mapping.get("source_record_ids") or [])
+            )
+            else 2
+        )
+    for column in NPIAddress.__table__.columns:
+        if column.key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS and column.key in row_mapping:
+            provider_by_field[column.key] = row_mapping.get(column.key)
+    _attach_public_address_site_key(provider_by_field, row_mapping)
+    if address_table_sql.endswith(".entity_address_unified"):
+        for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
+            if key in row_mapping and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                provider_by_field[key] = row_mapping.get(key)
+        if "source_record_ids" in row_mapping:
+            provider_by_field["source_record_ids"] = row_mapping.get("source_record_ids")
+    provider_by_field["npi"] = npi_value
+    provider_by_field["do_business_as"] = provider_by_field.get("do_business_as") or []
+    provider_by_field.setdefault("procedures_array", [])
+    provider_by_field.setdefault("medications_array", [])
+    return provider_by_field
+
+
+def _merge_search_provider_mapping(
+    provider_by_field: dict[str, Any],
+    row_mapping: Mapping[str, Any],
+    address_candidate: dict[str, Any],
+) -> None:
+    """Merge one list-search address and its unique taxonomies."""
+
+    provider_by_field.setdefault("_address_candidates", []).append(
+        address_candidate
+    )
+    provider_by_field["_address_total"] = max(
+        int(provider_by_field.get("_address_total") or 0),
+        int(row_mapping.get("provider_address_total") or 0),
+    )
+    taxonomy_rows = row_mapping.get("taxonomy_rows")
+    if isinstance(taxonomy_rows, list):
+        taxonomy_payloads = _public_nested_taxonomy_rows(taxonomy_rows)
+    else:
+        taxonomy_by_field = {
+            column.key: row_mapping.get(column.key)
+            for column in NPIDataTaxonomy.__table__.columns
+            if column.key not in ("npi", "checksum")
+            and column.key in row_mapping
+        }
+        taxonomy_payloads = [taxonomy_by_field] if taxonomy_by_field else []
+    for taxonomy_by_field in taxonomy_payloads:
+        _append_unique_search_taxonomy(provider_by_field, taxonomy_by_field)
+
+
+def _append_unique_search_taxonomy(
+    provider_by_field: dict[str, Any],
+    taxonomy_by_field: Mapping[str, Any],
+) -> None:
+    """Append one public taxonomy after null-normalized deduplication."""
+
+    taxonomy_by_field = {
+        key: field_value
+        for key, field_value in taxonomy_by_field.items()
+        if field_value is not None
+    }
+    if not taxonomy_by_field:
+        return
+    taxonomy_identity_parts = tuple(
+        sorted(
+            (
+                key,
+                json.dumps(field_value, sort_keys=True, default=str),
+            )
+            for key, field_value in taxonomy_by_field.items()
+        )
+    )
+    taxonomy_identities = provider_by_field.setdefault(
+        "_taxonomy_identities", set()
+    )
+    if taxonomy_identity_parts in taxonomy_identities:
+        return
+    taxonomy_identities.add(taxonomy_identity_parts)
+    provider_by_field["taxonomy_list"].append(taxonomy_by_field)
+
+
 @blueprint.get("/all")
 async def list_providers(request):
     """Search, count, or page through public NPI provider records."""
@@ -10194,101 +10297,18 @@ async def list_providers(request):
 
                     provider_by_field = providers_by_npi.get(npi_value)
                     if provider_by_field is None:
-                        provider_by_field = {
-                            "taxonomy_list": [],
-                            "_taxonomy_identities": set(),
-                            "_address_candidates_complete": True,
-                        }
-                        for column in NPIData.__table__.columns:
-                            if column.key in PUBLIC_NPI_EXCLUDED_COLUMNS:
-                                continue
-                            if column.key in row_mapping:
-                                provider_by_field[column.key] = row_mapping.get(column.key)
-                        provider_by_field["npi"] = npi_value
-                        if not provider_by_field.get("provider_organization_name"):
-                            provider_by_field["provider_organization_name"] = (
-                                row_mapping.get("entity_name")
-                            )
-                        if provider_by_field.get("entity_type_code") is None:
-                            provider_by_field["entity_type_code"] = (
-                                1
-                                if any(
-                                    ":practitioner_role:"
-                                    in str(record_id or "").lower()
-                                    for record_id in (
-                                        row_mapping.get("source_record_ids") or []
-                                    )
-                                )
-                                else 2
-                            )
-                        for column in NPIAddress.__table__.columns:
-                            if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
-                                continue
-                            if column.key in row_mapping:
-                                provider_by_field[column.key] = row_mapping.get(column.key)
-                        _attach_public_address_site_key(provider_by_field, row_mapping)
-                        # Unified serving: include per-address source/plan attribution
-                        # (not declared on the legacy NPIAddress model) so list results
-                        # match the detail + geo endpoints.
-                        if address_table_sql.endswith(".entity_address_unified"):
-                            for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
-                                if key in row_mapping and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
-                                    provider_by_field[key] = row_mapping.get(key)
-                            if "source_record_ids" in row_mapping:
-                                provider_by_field["source_record_ids"] = row_mapping.get("source_record_ids")
-                        provider_by_field["do_business_as"] = provider_by_field.get("do_business_as") or []
-                        provider_by_field.setdefault("procedures_array", [])
-                        provider_by_field.setdefault("medications_array", [])
+                        provider_by_field = _new_provider_from_search_mapping(
+                            row_mapping,
+                            npi_value,
+                            address_table_sql,
+                        )
 
                     address_candidate = _search_location_from_mapping(row_mapping)
-                    provider_by_field.setdefault("_address_candidates", []).append(
-                        address_candidate
+                    _merge_search_provider_mapping(
+                        provider_by_field,
+                        row_mapping,
+                        address_candidate,
                     )
-                    provider_by_field["_address_total"] = max(
-                        int(provider_by_field.get("_address_total") or 0),
-                        int(row_mapping.get("provider_address_total") or 0),
-                    )
-
-                    taxonomy_rows = row_mapping.get("taxonomy_rows")
-                    if isinstance(taxonomy_rows, list):
-                        taxonomy_payloads = _public_nested_taxonomy_rows(
-                            taxonomy_rows
-                        )
-                    else:
-                        taxonomy_by_field = {}
-                        for column in NPIDataTaxonomy.__table__.columns:
-                            if column.key in ("npi", "checksum"):
-                                continue
-                            if column.key in row_mapping:
-                                taxonomy_by_field[column.key] = row_mapping.get(
-                                    column.key
-                                )
-                        taxonomy_payloads = (
-                            [taxonomy_by_field] if taxonomy_by_field else []
-                        )
-                    for taxonomy_by_field in taxonomy_payloads:
-                        taxonomy_identity_parts = tuple(
-                            sorted(
-                                (
-                                    key,
-                                    json.dumps(
-                                        field_value,
-                                        sort_keys=True,
-                                        default=str,
-                                    ),
-                                )
-                                for key, field_value in taxonomy_by_field.items()
-                            )
-                        )
-                        taxonomy_identities = provider_by_field.setdefault(
-                            "_taxonomy_identities", set()
-                        )
-                        if taxonomy_identity_parts not in taxonomy_identities:
-                            taxonomy_identities.add(taxonomy_identity_parts)
-                            provider_by_field["taxonomy_list"].append(
-                                taxonomy_by_field
-                            )
-
                     providers_by_npi[npi_value] = provider_by_field
                     continue
 
@@ -10371,36 +10391,15 @@ async def list_providers(request):
                 column.key: taxonomy_mapping.get(column.key)
                 for column in NPIDataTaxonomy.__table__.columns
                 if column.key not in ("npi", "checksum")
-                and taxonomy_mapping.get(column.key) is not None
             }
             if taxonomy_mapping.get("taxonomy_display") is not None:
                 taxonomy_by_field["display"] = taxonomy_mapping.get(
                     "taxonomy_display"
                 )
-            if not taxonomy_by_field:
-                continue
-            taxonomy_identity_parts = tuple(
-                sorted(
-                    (
-                        key,
-                        json.dumps(
-                            field_value,
-                            sort_keys=True,
-                            default=str,
-                        ),
-                    )
-                    for key, field_value in taxonomy_by_field.items()
-                )
+            _append_unique_search_taxonomy(
+                provider_by_field,
+                taxonomy_by_field,
             )
-            taxonomy_identities = provider_by_field.setdefault(
-                "_taxonomy_identities",
-                set(),
-            )
-            if taxonomy_identity_parts not in taxonomy_identities:
-                taxonomy_identities.add(taxonomy_identity_parts)
-                provider_by_field["taxonomy_list"].append(
-                    taxonomy_by_field
-                )
         for provider_result in provider_results:
             provider_result["do_business_as"] = provider_result.get("do_business_as") or []
             address_candidates = provider_result.pop("_address_candidates", [])
@@ -11080,6 +11079,42 @@ async def get_facility_connected_providers(request):
     return response.json(response_map, default=str)
 
 
+def _populate_near_provider_mapping(
+    provider_by_field: dict[str, Any],
+    row_dict: Mapping[str, Any],
+    npi_value: int,
+    address_key_value: Any,
+    address_table_sql: str,
+) -> None:
+    """Populate one newly seen keyed geo provider row."""
+
+    if row_dict.get("distance") is not None:
+        provider_by_field["distance"] = row_dict.get("distance")
+    provider_by_field["_cursor_distance_meters"] = row_dict.get(
+        "cursor_distance_meters"
+    )
+    provider_by_field["_cursor_npi"] = npi_value
+    provider_by_field["_cursor_address_key"] = str(address_key_value)
+    for column in NPIAddress.__table__.columns:
+        if column.key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS and column.key in row_dict:
+            provider_by_field[column.key] = row_dict[column.key]
+    _attach_public_address_site_key(provider_by_field, row_dict)
+    if address_table_sql.endswith(".entity_address_unified"):
+        for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
+            if key in row_dict and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                provider_by_field[key] = row_dict[key]
+    excluded_npi_columns = {
+        "npi",
+        "checksum",
+        "do_business_as_text",
+        *PUBLIC_NPI_EXCLUDED_COLUMNS,
+    }
+    for column in NPIData.__table__.columns:
+        if column.key not in excluded_npi_columns and column.key in row_dict:
+            provider_by_field[column.key] = row_dict[column.key]
+    provider_by_field["npi"] = npi_value
+
+
 @blueprint.get("/near/")
 async def get_near_npi(request):
     """Return providers near coordinates under optional taxonomy filters."""
@@ -11517,38 +11552,13 @@ async def get_near_npi(request):
             is_new_identity = identity not in providers_by_identity
             provider_by_field = providers_by_identity.get(identity, {"taxonomy_list": []})
             if is_new_identity:
-                if "distance" in row_dict and row_dict.get("distance") is not None:
-                    provider_by_field["distance"] = row_dict.get("distance")
-                provider_by_field["_cursor_distance_meters"] = row_dict.get(
-                    "cursor_distance_meters"
+                _populate_near_provider_mapping(
+                    provider_by_field,
+                    row_dict,
+                    npi_value,
+                    address_key_value,
+                    address_table_sql,
                 )
-                provider_by_field["_cursor_npi"] = npi_value
-                provider_by_field["_cursor_address_key"] = str(address_key_value)
-
-                for column in NPIAddress.__table__.columns:
-                    if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
-                        continue
-                    if column.key in row_dict:
-                        provider_by_field[column.key] = row_dict[column.key]
-                _attach_public_address_site_key(provider_by_field, row_dict)
-                # Unified serving carries per-address source/plan attribution that the
-                # legacy NPIAddress model doesn't declare, so the loop above skips it.
-                # Surface it here so geo results show WHERE each address came from and
-                # which plans/networks confirm it (parity with the detail endpoint).
-                if address_table_sql.endswith(".entity_address_unified"):
-                    for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
-                        if key in row_dict and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
-                            provider_by_field[key] = row_dict[key]
-                for column in NPIData.__table__.columns:
-                    if column.key in {
-                        "npi",
-                        "checksum",
-                        "do_business_as_text",
-                        *PUBLIC_NPI_EXCLUDED_COLUMNS,
-                    }:
-                        continue
-                    if column.key in row_dict:
-                        provider_by_field[column.key] = row_dict[column.key]
 
             taxonomy_by_field = {}
             for column in NPIDataTaxonomy.__table__.columns:

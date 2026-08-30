@@ -60,11 +60,19 @@ async def _claim_exact(database, acquisition_id, requested_npi):
     return claim
 
 
+async def _claim_general(database, acquisition_id, *, fresh_only=None):
+    claim = await claim_uhc_flex_practitioner_work(
+        acquisition_id, fresh_only=fresh_only, database=database
+    )
+    assert claim is not None
+    return claim
+
+
 @pytest.mark.asyncio
 async def test_general_claim_prefers_fresh_work_but_exact_retry_stays_exact(
     monkeypatch,
 ) -> None:
-    """Claim untouched work before a retry without changing exact claims."""
+    """Claim fresh then least-attempted work without changing exact claims."""
 
     url = database_url()
     schema_name = f"fhir_twin_test_{uuid.uuid4().hex}"
@@ -81,33 +89,38 @@ async def test_general_claim_prefers_fresh_work_but_exact_retry_stays_exact(
         ) == 1
         retried_npi, fresh_npi = MEMBER_NPIS
         for expected_attempt in (1, 2):
-            retry_claim = await claim_uhc_flex_practitioner_work(
-                baseline.acquisition_id,
-                requested_npi=retried_npi,
-                database=database,
+            retry_claim = await _claim_exact(
+                database, baseline.acquisition_id, retried_npi
             )
-            assert retry_claim is not None
             assert retry_claim.attempt == expected_attempt
             await release_uhc_flex_practitioner_work(
                 retry_claim,
                 database=database,
             )
 
-        general_claim = await claim_uhc_flex_practitioner_work(
-            baseline.acquisition_id,
-            database=database,
+        general_claim = await _claim_general(
+            database, baseline.acquisition_id
         )
-        assert general_claim is not None
         assert (general_claim.requested_npi, general_claim.attempt) == (
             fresh_npi,
             1,
         )
-        exact_retry = await claim_uhc_flex_practitioner_work(
-            baseline.acquisition_id,
-            requested_npi=retried_npi,
+        await release_uhc_flex_practitioner_work(
+            general_claim,
             database=database,
         )
-        assert exact_retry is not None
+        tail_claim = await _claim_general(
+            database,
+            baseline.acquisition_id,
+            fresh_only=False,
+        )
+        assert (tail_claim.requested_npi, tail_claim.attempt) == (
+            fresh_npi,
+            2,
+        )
+        exact_retry = await _claim_exact(
+            database, baseline.acquisition_id, retried_npi
+        )
         assert (exact_retry.requested_npi, exact_retry.attempt) == (
             retried_npi,
             3,
