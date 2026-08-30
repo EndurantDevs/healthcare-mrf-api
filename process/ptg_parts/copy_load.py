@@ -89,9 +89,11 @@ def _sqlalchemy_copy_records(object_rows, cls, columns, dialect):
     ]
     return [
         tuple(
-            processor(_strip_postgres_nuls(object_row.get(column)))
-            if processor is not None
-            else _strip_postgres_nuls(object_row.get(column))
+            _strip_postgres_nuls(
+                processor(object_row.get(column))
+                if processor is not None
+                else object_row.get(column)
+            )
             for column, processor in zip(columns, processors)
         )
         for object_row in object_rows
@@ -101,7 +103,10 @@ def _sqlalchemy_copy_records(object_rows, cls, columns, dialect):
 def _first_rows_by_conflict(object_rows, conflict_targets):
     first_row_by_conflict = {}
     for object_row in object_rows:
-        conflict_values = tuple(object_row.get(column) for column in conflict_targets)
+        conflict_values = tuple(
+            _strip_postgres_nuls(object_row.get(column))
+            for column in conflict_targets
+        )
         first_row_by_conflict.setdefault(conflict_values, object_row)
     return list(first_row_by_conflict.values())
 

@@ -61,16 +61,21 @@ def test_sqlalchemy_copy_records_preserve_mrf_bind_semantics():
         dialect,
     ) == [(['"{\\"b\\": 1}"'], "AB")]
     assert copy_load._sqlalchemy_copy_records(
-        [{"benefit_value_json": None, "benefit_item_json": {"answer": "A\x00B"}}],
+        [
+            {
+                "benefit_value_json": None,
+                "benefit_item_json": {"a\x00b": "A\x00B", "ab": "other"},
+            }
+        ],
         PlanBenefitsMarketplace,
         ["benefit_value_json", "benefit_item_json"],
         dialect,
-    ) == [("null", '{"answer": "AB"}')]
+    ) == [("null", '{"a\\u0000b": "A\\u0000B", "ab": "other"}')]
 
 
 def test_copy_ignore_keeps_the_first_row_for_each_conflict_key():
     rows = [
-        {"id": "same", "label": "Northstar First"},
+        {"id": "same\x00", "label": "Northstar First"},
         {"id": "other", "label": "Bluebird"},
         {"id": "same", "label": "Northstar Duplicate"},
     ]
