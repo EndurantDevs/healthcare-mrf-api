@@ -7,6 +7,7 @@ from copy import deepcopy
 
 import pytest
 
+from scripts.research import plan_pricing_projection_v3_census_contract as contract
 from scripts.research import plan_pricing_projection_v3_census_support as support
 from tests.test_plan_pricing_projection_v3_census_contract import (
     _TARGET,
@@ -131,6 +132,43 @@ def test_acceptance_binds_exact_external_runtime_attestation(
     ).encode()
     authority_by_field["runtime_attestation"] = attestation_bytes
     envelope_by_field["runtime_attestation"] = attestation
+    envelope_by_field["runtime_attestation_sha256"] = hashlib.sha256(
+        attestation_bytes
+    ).hexdigest()
+
+    assert not _is_accepted(
+        receipt_by_field,
+        measurement_by_field,
+        envelope_by_field,
+        authority_by_field,
+    )
+
+
+def test_acceptance_rejects_a_self_consistent_malformed_image_digest() -> None:
+    """A fabricated image scheme cannot become authoritative by matching itself."""
+
+    receipt_by_field, measurement_by_field = _accepted_inputs()
+    runtime_by_field = {**receipt_by_field["runtime"], "image_digest": "x"}
+    receipt_by_field["runtime"] = runtime_by_field
+    run_token = contract.census_database_run_token(runtime_by_field)
+    receipt_by_field.update(
+        database_run_token=run_token,
+        database_application_name=contract.census_database_application_name(
+            run_token, "measurement_complete"
+        ),
+        database_session_settings=contract.expected_census_database_settings(run_token),
+    )
+    envelope_by_field = _successful_envelope(receipt_by_field)
+    authority_by_field = _authority()
+    attestation_by_field = {
+        **_runtime_attestation(),
+        "image_id": "containerd://x",
+    }
+    attestation_bytes = (
+        json.dumps(attestation_by_field, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    authority_by_field["runtime_attestation"] = attestation_bytes
+    envelope_by_field["runtime_attestation"] = attestation_by_field
     envelope_by_field["runtime_attestation_sha256"] = hashlib.sha256(
         attestation_bytes
     ).hexdigest()

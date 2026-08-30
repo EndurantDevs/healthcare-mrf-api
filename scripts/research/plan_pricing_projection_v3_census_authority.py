@@ -257,12 +257,29 @@ def _is_capacity_authority_match(
     )
 
 
+def _is_image_identity_match(image_digest: Any, image_id: str) -> bool:
+    """Require one exact Kubernetes image ID for a sha256 digest."""
+
+    return (
+        isinstance(image_digest, str)
+        and image_digest.startswith("sha256:")
+        and len(image_digest) == 71
+        and not (set(image_digest[7:]) - set("0123456789abcdef"))
+        and (
+            image_id == f"containerd://{image_digest}"
+            or image_id.endswith(f"@{image_digest}")
+        )
+    )
+
+
 def _is_runtime_attestation_match(
     runtime_by_field: Mapping[str, Any],
     envelope_by_field: Mapping[str, Any],
     authority_by_field: Mapping[str, Any],
     attestation_by_field: Any,
 ) -> bool:
+    """Bind the inner runtime identity to exact external Kubernetes evidence."""
+
     if (
         not isinstance(attestation_by_field, Mapping)
         or frozenset(attestation_by_field) != _EXPECTED_RUNTIME_ATTESTATION_KEYS
@@ -306,11 +323,7 @@ def _is_runtime_attestation_match(
         == attestation_by_field["configmap_name"]
         and attestation_by_field["pod_source_configmap_name"]
         == attestation_by_field["configmap_name"]
-        and isinstance(image_digest, str)
-        and (
-            image_id == f"containerd://{image_digest}"
-            or image_id.endswith(f"@{image_digest}")
-        )
+        and _is_image_identity_match(image_digest, image_id)
         and runtime_by_field.get("identity_contract")
         == "immutable-image-plus-source-overlay-v1"
         and runtime_by_field.get("external_pod_image_id_attestation_required") is True
