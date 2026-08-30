@@ -189,7 +189,7 @@ run_capacity() {
   install_python_dependencies
   mapfile -t capacity_tests <<< "$capacity_test_paths"
   export COVERAGE_FILE=${COVERAGE_FILE:-$(artifact_path .coverage.capacity)}
-  timeout --foreground 295s python -m pytest -q -n 4 --dist load --durations=20 \
+  timeout --foreground 295s python -m pytest -q -n 4 --dist worksteal --durations=20 \
     --cov-config=test-coverage.ini \
     --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main \
     --cov-branch --cov-report= \

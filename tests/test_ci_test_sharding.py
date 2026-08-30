@@ -73,7 +73,7 @@ def test_slow_envelope_suites_run_once_in_the_parallel_capacity_lane() -> None:
     assert set(expected).isdisjoint(base_capacity_paths)
     assert expected_append in prepush
     assert 'collection_args+=(--ignore "$test_path")' in python_main
-    assert "python -m pytest -q -n 4 --dist load" in capacity
+    assert "python -m pytest -q -n 4 --dist worksteal" in capacity
     assert '"${capacity_tests[@]}"' in capacity
     for test_path in expected:
         assert prepush.count(test_path) == 1
