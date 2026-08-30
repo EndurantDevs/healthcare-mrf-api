@@ -106,14 +106,14 @@ def test_downgrade_fails_closed_after_partial_evidence() -> None:
 
 
 def test_models_match_partial_root_constraints() -> None:
-    acquisition_constraints = {
+    acquisition_constraints_by_name = {
         constraint.name: _normalized(str(constraint.sqltext))
         for constraint in (
             ProviderDirectoryUHCFlexPractitionerAcquisition.__table__.constraints
         )
         if isinstance(constraint, sa.CheckConstraint)
     }
-    publication_constraints = {
+    publication_constraints_by_name = {
         constraint.name: _normalized(str(constraint.sqltext))
         for constraint in (
             ProviderDirectoryUHCFlexPractitionerDataset.__table__.constraints
@@ -121,10 +121,10 @@ def test_models_match_partial_root_constraints() -> None:
         if isinstance(constraint, sa.CheckConstraint)
     }
 
-    acquisition = acquisition_constraints[
+    acquisition = acquisition_constraints_by_name[
         "pd_uhc_flex_practitioner_acquisition_state_check"
     ]
-    publication = publication_constraints[
+    publication = publication_constraints_by_name[
         "pd_uhc_flex_practitioner_dataset_check"
     ]
     assert "matched_count + unmatched_count + error_count" in acquisition

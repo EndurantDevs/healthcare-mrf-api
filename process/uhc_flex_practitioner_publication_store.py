@@ -14,13 +14,8 @@ from process.provider_directory_dataset_scoped_publication import (
     ProviderDirectoryDatasetScopedPublicationError,
     supersede_exact_current_dataset,
 )
-from process.provider_directory_resource_hash import (
-    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-)
-from process.uhc_flex_official_cohort_contract import (
-    UHC_FLEX_OFFICIAL_AUTHORITY_ID,
-    UHC_FLEX_OFFICIAL_RESOURCE_TYPE,
-)
+from process.provider_directory_resource_hash import SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+from process.uhc_flex_official_cohort_contract import UHC_FLEX_OFFICIAL_AUTHORITY_ID, UHC_FLEX_OFFICIAL_RESOURCE_TYPE
 from process.uhc_flex_practitioner_contract import (
     UHC_FLEX_PRACTITIONER_CONNECTOR_ID,
     UHC_FLEX_PRACTITIONER_PUBLICATION_LOCK_IDENTITY,
@@ -45,19 +40,14 @@ from process.uhc_flex_practitioner_publication import (
     UHCFlexPractitionerPublicationError,
     UHCFlexPractitionerPublicationResult,
 )
-from process.uhc_flex_practitioner_publication_materialization import (
-    _materialize_candidate,
-    _validate_candidate,
-)
+from process.uhc_flex_practitioner_publication_materialization import _materialize_candidate, _validate_candidate
 from process.uhc_flex_practitioner_single_root_contract import (
     UHCFlexPractitionerAdmission,
     UHCFlexPractitionerSingleRootAdmission,
     UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
 )
 from process.uhc_flex_practitioner_store_support import ACQUISITION_TABLE
-from process.uhc_flex_practitioner_twin_store import (
-    require_uhc_flex_practitioner_admission,
-)
+from process.uhc_flex_practitioner_twin_store import require_uhc_flex_practitioner_admission
 from process.uhc_flex_practitioner_twin_store_contract import (
     UHCFlexPractitionerTwinAdmission,
     UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID,

@@ -234,61 +234,73 @@ async def _locked_building_header(
     return assert_identity_row(identity, header)
 
 
+_SEAL_BUILDING_HEADER_SQL = """
+    WITH census AS (
+        SELECT count(*) FILTER (WHERE status = 'pending')::bigint
+                   AS pending_count,
+               count(*) FILTER (WHERE status = 'leased')::bigint
+                   AS leased_count,
+               count(*) FILTER (WHERE status = 'matched')::bigint
+                   AS matched_count,
+               count(*) FILTER (WHERE status = 'unmatched')::bigint
+                   AS unmatched_count,
+               count(*) FILTER (WHERE status = 'error')::bigint AS error_count
+          FROM {work_table} WHERE acquisition_id = :acquisition_id
+    ), resource_census AS (
+        SELECT count(*)::bigint AS resource_count
+          FROM {resource_table} AS resource
+          JOIN {work_table} AS work
+            ON work.acquisition_id = resource.acquisition_id
+           AND work.cohort_id = resource.cohort_id
+           AND work.npi = resource.npi AND work.attempt_count = resource.attempt
+         WHERE resource.acquisition_id = :acquisition_id
+           AND work.status = 'matched'
+    )
+    UPDATE {acquisition_table} AS acquisition
+       SET status = 'sealed',
+           cohort_complete = (census.error_count = 0),
+           pending_count = census.pending_count,
+           leased_count = census.leased_count,
+           matched_count = census.matched_count,
+           unmatched_count = census.unmatched_count,
+           error_count = census.error_count,
+           resource_count = resource_census.resource_count,
+           terminal_set_sha256 = {terminal_set_function}(
+               acquisition.acquisition_id
+           ), sealed_at = transaction_timestamp(),
+           updated_at = transaction_timestamp()
+      FROM census, resource_census
+     WHERE acquisition.acquisition_id = :acquisition_id
+       AND acquisition.status = 'building'
+       AND NOT EXISTS (
+            SELECT 1 FROM {work_table} AS exhausted
+             WHERE exhausted.acquisition_id = acquisition.acquisition_id
+               AND exhausted.status = 'error'
+               AND (
+                    exhausted.error_code IS DISTINCT FROM
+                        :retry_exhausted_error_code
+                    OR exhausted.attempt_count < :max_attempts
+               )
+       )
+    RETURNING acquisition.*;
+"""
+
+
+def _seal_building_header_sql() -> str:
+    return _SEAL_BUILDING_HEADER_SQL.format(
+        acquisition_table=table_ref(ACQUISITION_TABLE),
+        resource_table=table_ref(RESOURCE_TABLE),
+        terminal_set_function=function_ref(TERMINAL_SET_FUNCTION),
+        work_table=table_ref(WORK_TABLE),
+    )
+
+
 async def _seal_building_header(
     database: Any,
     acquisition_id: str,
 ) -> Any:
     return await database.first(
-        f"""
-        WITH census AS (
-            SELECT count(*) FILTER (WHERE status = 'pending')::bigint
-                       AS pending_count,
-                   count(*) FILTER (WHERE status = 'leased')::bigint
-                       AS leased_count,
-                   count(*) FILTER (WHERE status = 'matched')::bigint
-                       AS matched_count,
-                   count(*) FILTER (WHERE status = 'unmatched')::bigint
-                       AS unmatched_count,
-                   count(*) FILTER (WHERE status = 'error')::bigint AS error_count
-              FROM {table_ref(WORK_TABLE)} WHERE acquisition_id = :acquisition_id
-        ), resource_census AS (
-            SELECT count(*)::bigint AS resource_count
-              FROM {table_ref(RESOURCE_TABLE)} AS resource
-              JOIN {table_ref(WORK_TABLE)} AS work
-                ON work.acquisition_id = resource.acquisition_id
-               AND work.cohort_id = resource.cohort_id
-               AND work.npi = resource.npi AND work.attempt_count = resource.attempt
-             WHERE resource.acquisition_id = :acquisition_id
-               AND work.status = 'matched'
-        )
-        UPDATE {table_ref(ACQUISITION_TABLE)} AS acquisition
-           SET status = 'sealed',
-               cohort_complete = (census.error_count = 0),
-               pending_count = census.pending_count,
-               leased_count = census.leased_count,
-               matched_count = census.matched_count,
-               unmatched_count = census.unmatched_count,
-               error_count = census.error_count,
-               resource_count = resource_census.resource_count,
-               terminal_set_sha256 = {function_ref(TERMINAL_SET_FUNCTION)}(
-                   acquisition.acquisition_id
-               ), sealed_at = transaction_timestamp(),
-               updated_at = transaction_timestamp()
-          FROM census, resource_census
-         WHERE acquisition.acquisition_id = :acquisition_id
-           AND acquisition.status = 'building'
-           AND NOT EXISTS (
-                SELECT 1 FROM {table_ref(WORK_TABLE)} AS exhausted
-                 WHERE exhausted.acquisition_id = acquisition.acquisition_id
-                   AND exhausted.status = 'error'
-                   AND (
-                        exhausted.error_code IS DISTINCT FROM
-                            :retry_exhausted_error_code
-                        OR exhausted.attempt_count < :max_attempts
-                   )
-           )
-        RETURNING acquisition.*;
-        """,
+        _seal_building_header_sql(),
         acquisition_id=acquisition_id,
         retry_exhausted_error_code=(
             UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE

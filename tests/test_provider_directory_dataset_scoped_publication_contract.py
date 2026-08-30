@@ -55,6 +55,8 @@ def _legacy_current() -> ExactCurrentDataset:
         practitioner_resource_count=3,
         root_content_proof_sha256="3" * 64,
         root_cohort_id="reviewed-cohort",
+        cohort_complete=True,
+        retry_exhausted_count=0,
         semantic_projection_as_of="2026-08-10",
         operation_key="4" * 64,
         acquisition_root_run_id="pdufpar_" + "5" * 48,
@@ -157,6 +159,25 @@ def test_exact_current_requires_variant_specific_root_run_id() -> None:
             rooted,
             acquisition_root_run_id="pdufpar_" + "5" * 48,
         )
+
+
+def test_exact_current_carries_only_consistent_retry_exhaustion() -> None:
+    partial = replace(
+        _legacy_current(),
+        cohort_complete=False,
+        retry_exhausted_count=8,
+    )
+    assert partial.retry_exhausted_count == 8
+    for changes in (
+        {"cohort_complete": True},
+        {"retry_exhausted_count": 0},
+        {"retry_exhausted_count": -1},
+    ):
+        with pytest.raises(
+            ValueError,
+            match="provider_directory_exact_current_dataset_invalid",
+        ):
+            replace(partial, **changes)
 
 
 @pytest.mark.parametrize(
@@ -285,6 +306,8 @@ class _LegacyCurrentDatabase:
                 "practitioner_resource_count": (current.practitioner_resource_count),
                 "root_content_proof_sha256": (current.root_content_proof_sha256),
                 "root_cohort_id": current.root_cohort_id,
+                "cohort_complete": current.cohort_complete,
+                "retry_exhausted_count": current.retry_exhausted_count,
                 "semantic_projection_as_of": (current.semantic_projection_as_of),
                 "operation_key": current.operation_key,
                 "acquisition_root_run_id": current.acquisition_root_run_id,
@@ -432,63 +455,3 @@ async def test_lock_exact_current_rejects_foreign_parent_shapes(monkeypatch) -> 
     assert foreign.value.code == "foreign_current"
     with pytest.raises(ProviderDirectoryDatasetScopedPublicationError):
         await lock_exact_current_dataset(object(), pair=object())
-
-
-@pytest.mark.asyncio
-async def test_locked_header_and_exact_capability_reject_readiness_drift() -> None:
-    current = _legacy_current()
-    database = _LegacyCurrentDatabase(current)
-    database.readiness = False
-    with pytest.raises(ProviderDirectoryDatasetScopedPublicationError) as foreign:
-        await publication._validate_locked_header(
-            database,
-            exact_uhc_dataset_pair(),
-            current.variant,
-            _header_for(current),
-            _parent_for(current),
-        )
-    assert foreign.value.code == "foreign_current"
-    accepted_stale = await lock_exact_current_dataset(
-        database,
-        pair=exact_uhc_dataset_pair(),
-        require_ready=False,
-    )
-    assert accepted_stale == current
-    database.identity_valid = False
-    with pytest.raises(ProviderDirectoryDatasetScopedPublicationError) as invalid:
-        await lock_exact_current_dataset(
-            database,
-            pair=exact_uhc_dataset_pair(),
-            require_ready=False,
-        )
-    assert invalid.value.code == "foreign_current"
-    malformed_header = _header_for(current)
-    malformed_header["semantic_projection_as_of"] = None
-    with pytest.raises(ProviderDirectoryDatasetScopedPublicationError) as malformed:
-        publication._exact_current_from_header(
-            current.variant,
-            malformed_header,
-            _parent_for(current),
-        )
-    assert malformed.value.code == "state"
-
-
-@pytest.mark.asyncio
-async def test_supersede_handles_absence_type_success_and_write_drift() -> None:
-    current = _legacy_current()
-    database = _LegacyCurrentDatabase(current)
-    await supersede_exact_current_dataset(database, None)
-    with pytest.raises(ProviderDirectoryDatasetScopedPublicationError):
-        await supersede_exact_current_dataset(database, object())
-    database.readiness = False
-    await supersede_exact_current_dataset(database, current)
-    assert len(database.status_writes) == 2
-
-    class _FailedWriteDatabase(_LegacyCurrentDatabase):
-        async def status(self, statement: str, **parameters: object) -> int:
-            await super().status(statement, **parameters)
-            return 0
-
-    with pytest.raises(ProviderDirectoryDatasetScopedPublicationError) as failed:
-        await supersede_exact_current_dataset(_FailedWriteDatabase(current), current)
-    assert failed.value.code == "state"

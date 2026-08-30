@@ -207,7 +207,7 @@ def _single_root_acquisition_result_json(receipt: Any) -> str:
 def _publication_result_json(publication_result: Any) -> str:
     dataset_readiness = publication_result.readiness
     if dataset_readiness.cohort_complete:
-        profile_delta_dispatch = {
+        profile_delta_dispatch_by_field = {
             **profile_followup_receipt_metadata(),
             "external_followup": (
                 build_provider_directory_global_profile_followup(
@@ -221,12 +221,12 @@ def _publication_result_json(publication_result: Any) -> str:
             "status": "not_dispatched",
         }
     else:
-        profile_delta_dispatch = {
+        profile_delta_dispatch_by_field = {
             "operator_command_available": False,
             "required_external_global_dispatch": False,
             "status": "not_applicable_incomplete_cohort",
         }
-    payload = {
+    publication_by_field = {
         "admission_id": dataset_readiness.admission_id,
         "candidate_acquisition_id": dataset_readiness.candidate_acquisition_id,
         "cohort_complete": dataset_readiness.cohort_complete,
@@ -240,15 +240,17 @@ def _publication_result_json(publication_result: Any) -> str:
         "endpoint_complete": dataset_readiness.endpoint_complete,
         "operation_key": dataset_readiness.operation_key,
         "previous_dataset_id": dataset_readiness.previous_dataset_id,
-        "profile_delta_dispatch": profile_delta_dispatch,
+        "profile_delta_dispatch": profile_delta_dispatch_by_field,
         "replayed": publication_result.replayed,
         "resource_count": dataset_readiness.resource_count,
         "semantic_projection_as_of": dataset_readiness.semantic_projection_as_of,
         "status": "published",
     }
     if not dataset_readiness.cohort_complete:
-        payload["retry_exhausted_count"] = dataset_readiness.retry_exhausted_count
-    return _json_text(payload)
+        publication_by_field["retry_exhausted_count"] = (
+            dataset_readiness.retry_exhausted_count
+        )
+    return _json_text(publication_by_field)
 
 
 def _operation_error(error: Exception, default_code: str) -> Exception:

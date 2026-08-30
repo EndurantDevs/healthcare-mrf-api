@@ -145,6 +145,7 @@ def twin_admission(
 def exact_current(
     *,
     variant: str = LEGACY_PRACTITIONER_VARIANT,
+    retry_exhausted_count: int = 0,
 ) -> ExactCurrentDataset:
     """Build one exact ready root capability for either closed variant."""
 
@@ -171,6 +172,8 @@ def exact_current(
         practitioner_resource_count=1,
         root_content_proof_sha256="6" * 64,
         root_cohort_id="synthetic-root-cohort",
+        cohort_complete=retry_exhausted_count == 0,
+        retry_exhausted_count=retry_exhausted_count,
         semantic_projection_as_of="2026-08-10",
         operation_key="e" * 64,
         acquisition_root_run_id=("pdrgpr_" if is_rooted else "pdufpar_") + "f" * 48,
@@ -201,9 +204,9 @@ def resource_counts() -> dict[str, int]:
 def readiness(
     *,
     variant: str = LEGACY_PRACTITIONER_VARIANT,
+    retry_exhausted_count: int = 0,
 ) -> ProviderDirectoryRootedGraphDatasetReadiness:
     identity = dataset_identity(variant=variant)
-    admission = twin_admission(variant=variant)
     counts = resource_counts()
     return ProviderDirectoryRootedGraphDatasetReadiness(
         dataset_id=identity.dataset_id,
@@ -227,7 +230,8 @@ def readiness(
         resource_count=sum(counts.values()),
         resource_counts=counts,
         publication_kind=PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND,
-        cohort_complete=True,
+        cohort_complete=retry_exhausted_count == 0,
+        retry_exhausted_count=retry_exhausted_count,
         rooted_graph_complete=True,
         endpoint_collection_complete=False,
         endpoint_complete=False,

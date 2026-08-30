@@ -172,6 +172,18 @@ def test_rooted_summary_projects_the_closed_readiness_contract():
     }
 
 
+def test_rooted_summary_marks_retry_exhaustion_partial_not_closed():
+    proof = readiness(retry_exhausted_count=8)
+
+    summary = rooted_fhir_publication_summary(_current_dataset(proof), proof)
+
+    assert summary["state"] == "partial"
+    assert summary["cohort_complete"] is False
+    assert summary["rooted_graph_complete"] is True
+    assert summary["retry_exhausted_count"] == 8
+    assert len(summary) == 27
+
+
 @pytest.mark.asyncio
 async def test_catalog_enrichment_joins_rooted_readiness_without_scope_drift(
     monkeypatch,
@@ -189,9 +201,7 @@ async def test_catalog_enrichment_joins_rooted_readiness_without_scope_drift(
     )
     catalog = _direct_catalog()
 
-    enriched = await catalog_outcomes.enrich_provider_directory_source_catalog(
-        catalog
-    )
+    enriched = await catalog_outcomes.enrich_provider_directory_source_catalog(catalog)
 
     entry = enriched["items"][0]
     assert tuple(entry["source_ids"]) == ROOTED_FHIR_CATALOG_SOURCE_IDS
@@ -200,6 +210,32 @@ async def test_catalog_enrichment_joins_rooted_readiness_without_scope_drift(
     readiness_loader.assert_awaited_once_with(proof.dataset_id)
     assert database_execute.await_count == 2
     assert enriched["catalog_digest"] == catalog["catalog_digest"]
+
+
+@pytest.mark.asyncio
+async def test_catalog_enrichment_surfaces_partial_rooted_readiness(monkeypatch):
+    proof = readiness(retry_exhausted_count=8)
+    database_execute = AsyncMock(
+        return_value=_MappingResult([_rooted_dataset_row(proof)])
+    )
+    readiness_loader = AsyncMock(return_value=proof)
+    monkeypatch.setattr(outcomes.db, "execute", database_execute)
+    monkeypatch.setattr(
+        catalog_outcomes,
+        "load_provider_directory_rooted_graph_dataset_readiness",
+        readiness_loader,
+    )
+
+    enriched = await catalog_outcomes.enrich_provider_directory_source_catalog(
+        _direct_catalog()
+    )
+
+    summary = enriched["items"][0][ROOTED_FHIR_PUBLICATION_FIELD]
+    assert summary["state"] == "partial"
+    assert summary["cohort_complete"] is False
+    assert summary["rooted_graph_complete"] is True
+    assert summary["retry_exhausted_count"] == 8
+    readiness_loader.assert_awaited_once_with(proof.dataset_id)
 
 
 @pytest.mark.asyncio

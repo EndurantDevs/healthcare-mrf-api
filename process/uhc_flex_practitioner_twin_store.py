@@ -5,8 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
-from datetime import date
-from datetime import datetime
+from datetime import date, datetime
 import json
 from typing import Any
 
@@ -30,11 +29,7 @@ from process.uhc_flex_practitioner_twin_store_contract import (
     UHCFlexPractitionerTwinAdmission,
     UHCFlexPractitionerTwinAttempt,
     UHCFlexPractitionerTwinStoreError,
-)
-from process.uhc_flex_practitioner_twin_store_contract import (
     UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID,
-)
-from process.uhc_flex_practitioner_twin_store_contract import (
     UHC_FLEX_PRACTITIONER_TWIN_ATTEMPT_CONTRACT_ID,
 )
 

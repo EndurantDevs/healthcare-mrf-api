@@ -110,6 +110,8 @@ def _has_valid_exact_current_types(candidate: object) -> bool:
         )
         and type(getattr(candidate, "resource_count", None)) is int
         and type(getattr(candidate, "practitioner_resource_count", None)) is int
+        and type(getattr(candidate, "cohort_complete", None)) is bool
+        and type(getattr(candidate, "retry_exhausted_count", None)) is int
         and getattr(candidate, "variant", None) in EXACT_DATASET_VARIANTS
     )
 
@@ -188,6 +190,8 @@ def _has_valid_exact_current_content(candidate: object) -> bool:
         )
         and 0 <= candidate.practitioner_resource_count <= candidate.resource_count
         and candidate.practitioner_resource_count >= 1
+        and candidate.retry_exhausted_count >= 0
+        and candidate.cohort_complete is (candidate.retry_exhausted_count == 0)
         and 1 <= len(candidate.root_cohort_id) <= 128
         and run_pattern.fullmatch(candidate.acquisition_root_run_id) is not None
     )
@@ -213,6 +217,8 @@ class ExactCurrentDataset:
     practitioner_resource_count: int
     root_content_proof_sha256: str
     root_cohort_id: str
+    cohort_complete: bool
+    retry_exhausted_count: int
     semantic_projection_as_of: str
     operation_key: str
     acquisition_root_run_id: str

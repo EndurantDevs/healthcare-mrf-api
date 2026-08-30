@@ -88,8 +88,9 @@ def rooted_fhir_publication_summary(
     published_at = isoformat_utc(getattr(dataset, "published_at"))
     if not isinstance(published_at, str):
         return _summary_state("not_ready")
-    return {
-        **_summary_state("closed"),
+    state = "closed" if readiness.cohort_complete else "partial"
+    summary_by_field = {
+        **_summary_state(state),
         "publication_contract_id": (
             PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID
         ),
@@ -117,6 +118,9 @@ def rooted_fhir_publication_summary(
         "endpoint_collection_complete": readiness.endpoint_collection_complete,
         "endpoint_complete": readiness.endpoint_complete,
     }
+    if state == "partial":
+        summary_by_field["retry_exhausted_count"] = readiness.retry_exhausted_count
+    return summary_by_field
 
 
 __all__ = (

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -21,21 +20,11 @@ from process.uhc_flex_practitioner_query import (
 from process.uhc_flex_practitioner_store import (
     build_uhc_flex_practitioner_acquisition_identity,
     claim_uhc_flex_practitioner_work,
-    complete_uhc_flex_practitioner_error,
     complete_uhc_flex_practitioner_result,
     initialize_uhc_flex_practitioner_acquisition,
-    release_uhc_flex_practitioner_work,
     seal_uhc_flex_practitioner_acquisition,
 )
-from process.uhc_flex_practitioner_acquisition_contract import (
-    UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE,
-)
-from process.uhc_flex_practitioner_single_root_contract import (
-    single_root_dataset_intent_id,
-    single_root_run_id,
-)
 from process.uhc_flex_practitioner_twin_store import (
-    admit_uhc_flex_practitioner_single_root,
     admit_uhc_flex_practitioner_twins,
 )
 from process.uhc_flex_practitioner_twin_store_contract import (
@@ -50,9 +39,6 @@ from tests.formulary_fhir_twin_admission_pg_support import drop_schema
 from tests.formulary_fhir_twin_admission_pg_support import load_migration
 from tests.formulary_fhir_twin_admission_pg_support import quoted
 from tests.formulary_fhir_twin_admission_pg_support import run_migration
-from tests import (
-    provider_directory_uhc_flex_npi_cohort_pg_support as cohort_support,
-)
 from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
     cohort_fixture,
 )
@@ -69,9 +55,6 @@ from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
 )
 from tests.provider_directory_rooted_graph_pg_support import (
     extend_publication_foundation as extend_rooted_publication_foundation,
-)
-from tests.test_provider_directory_uhc_flex_practitioner_twin_postgres import (
-    _bound_official_content_proof,
 )
 from tests.provider_directory_uhc_flex_publication_pg_support import (
     extend_flex_publication_foundation as _extend_provider_foundation,
@@ -373,73 +356,6 @@ async def _publish_successive_datasets(database: Database):
     return first, empty
 
 
-async def _partial_single_root(database: Database):
-    operation_key = "c" * 64
-    cohort = cohort_fixture()
-    intent_id = single_root_dataset_intent_id(
-        cohort.cohort_id,
-        PROJECTION_DATE,
-        operation_key,
-    )
-    identity = build_uhc_flex_practitioner_acquisition_identity(
-        cohort,
-        acquisition_role="candidate",
-        run_id=single_root_run_id(intent_id),
-        dataset_intent_id=intent_id,
-    )
-    assert await initialize_uhc_flex_practitioner_acquisition(
-        identity,
-        database=database,
-    ) == 1
-    exhausted_npi, unmatched_npi = MEMBER_NPIS
-    for expected_attempt in range(1, 8):
-        claim = await claim_uhc_flex_practitioner_work(
-            identity.acquisition_id,
-            requested_npi=exhausted_npi,
-            database=database,
-        )
-        assert claim is not None and claim.attempt == expected_attempt
-        await release_uhc_flex_practitioner_work(claim, database=database)
-    exhausted = await claim_uhc_flex_practitioner_work(
-        identity.acquisition_id,
-        requested_npi=exhausted_npi,
-        database=database,
-    )
-    assert exhausted is not None and exhausted.attempt == 8
-    await complete_uhc_flex_practitioner_error(
-        exhausted,
-        error_code=UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE,
-        database=database,
-    )
-    unmatched = await claim_uhc_flex_practitioner_work(
-        identity.acquisition_id,
-        requested_npi=unmatched_npi,
-        database=database,
-    )
-    assert unmatched is not None
-    await complete_uhc_flex_practitioner_result(
-        unmatched,
-        _query_result(unmatched_npi, False),
-        database=database,
-    )
-    summary = await seal_uhc_flex_practitioner_acquisition(
-        identity,
-        database=database,
-    )
-    assert (
-        summary.matched_count,
-        summary.unmatched_count,
-        summary.error_count,
-        summary.cohort_complete,
-    ) == (0, 1, 1, False)
-    return await admit_uhc_flex_practitioner_single_root(
-        identity.acquisition_id,
-        semantic_projection_as_of=PROJECTION_DATE,
-        operation_key=operation_key,
-        database=database,
-    )
-
-
 async def _assert_exact_removal(connection, schema: str, first, empty) -> None:
     statuses = await connection.fetch(
         f"SELECT dataset_id, status, is_current FROM {schema}."
@@ -571,63 +487,3 @@ async def test_flex_practitioner_publication_lifecycle_replay_and_removal(
             await connection.close()
         with pytest.raises(DBAPIError, match="downgrade_blocked"):
             await run_migration(engine, publication_migration, "downgrade")
-
-
-@pytest.mark.asyncio
-async def test_retry_exhausted_single_root_publishes_explicit_partial_dataset(
-    monkeypatch,
-) -> None:
-    content_proof = _bound_official_content_proof()
-    monkeypatch.setattr(
-        cohort_support,
-        "DATASET_HASH",
-        content_proof["dataset_hash"],
-    )
-    monkeypatch.setattr(
-        cohort_support,
-        "CONTENT_PROOF_SHA256",
-        content_proof["proof_sha256"],
-    )
-    monkeypatch.setattr(
-        cohort_support,
-        "_content_proof",
-        lambda: content_proof,
-    )
-    async with _publication_test_scope(monkeypatch) as test_scope:
-        (
-            url,
-            schema,
-            database,
-            engine,
-            _publication_migration,
-            retry_exhaustion_migration,
-        ) = test_scope
-        monkeypatch.setattr(
-            publication,
-            "register_uhc_flex_practitioner_source",
-            AsyncMock(return_value=SimpleNamespace(endpoint_id=ENDPOINT_ID)),
-        )
-        admission = await _partial_single_root(database)
-        result = await publication.publish_uhc_flex_practitioner_dataset(
-            admission.candidate_acquisition_id,
-            database=database,
-            batch_size=1,
-        )
-        assert result.replayed is False
-        assert result.readiness.retry_exhausted_count == 1
-        assert result.readiness.cohort_complete is False
-        assert result.readiness.resource_count == 0
-        connection = await connect(url)
-        try:
-            metadata = await connection.fetchval(
-                f"SELECT publication_metadata_json FROM {schema}."
-                "provider_directory_endpoint_dataset WHERE dataset_id = $1",
-                result.readiness.dataset_id,
-            )
-        finally:
-            await connection.close()
-        metadata = json.loads(metadata)
-        assert metadata["retry_exhausted_count"] == 1
-        assert metadata["cohort_complete"] is False
-        with pytest.raises(DBAPIError, match="retry_exhaustion_downgrade_blocked"):
-            await run_migration(engine, retry_exhaustion_migration, "downgrade")

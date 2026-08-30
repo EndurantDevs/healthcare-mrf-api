@@ -213,10 +213,8 @@ async def test_root_and_admission_validation_reject_every_drift():
 
     partial_summary = replace(
         summary_by_role["candidate"],
-        matched_count=0,
-        unmatched_count=0,
-        error_count=1,
-        cohort_complete=False,
+        matched_count=0, unmatched_count=0,
+        error_count=1, cohort_complete=False,
     )
     partial_receipt = acquisition._root_receipt(
         identity_by_role["candidate"],

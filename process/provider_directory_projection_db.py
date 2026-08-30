@@ -6,13 +6,18 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Mapping
+from typing import Any, Mapping, Unpack
 
 from process.provider_directory_projection_contract import (
     validated_physical_projection_recipe_identity,
 )
+from process.provider_directory_projection_action import (
+    PROJECTION_ACTION_IDENTITY_FIELDS,
+    ProjectionActionIdentity,
+    projection_action_settings,
+    validate_projection_action_identity,
+)
 from process.provider_directory_projection_types import (
-    HASH_PATTERN,
     IDENTIFIER_PATTERN,
     PROJECTION_RECIPE_CONTRACT_ID,
     PreparedProjectionStage,
@@ -136,147 +141,32 @@ async def set_local_projection_action(
     *,
     recipe_id: str,
     recipe_attempt: int,
-    recipe_lease_token: str | None = None,
-    partition_id: str | None = None,
-    partition_attempt: int | None = None,
-    shard_lease_token: str | None = None,
-    physical_projection_id: str | None = None,
-    reference_owner_kind: str | None = None,
-    reference_owner_id: str | None = None,
-    reference_identity_hash: str | None = None,
-    reference_lease_token: str | None = None,
-    previous_reference_lease_token: str | None = None,
-    admission_id: str | None = None,
-    admission_attempt: int | None = None,
-    admission_lease_token: str | None = None,
+    **identity_by_field: Unpack[ProjectionActionIdentity],
 ) -> None:
     """Fence one exact projection database transition in this transaction."""
 
+    unknown_fields = set(identity_by_field) - PROJECTION_ACTION_IDENTITY_FIELDS
+    if unknown_fields:
+        raise TypeError(
+            "set_local_projection_action() got an unexpected keyword "
+            f"argument '{sorted(unknown_fields)[0]}'"
+        )
     if action not in PROJECTION_DATABASE_ACTIONS:
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_action_invalid"
         )
-    hash_values = (recipe_id,)
-    optional_hash_values = (
-        recipe_lease_token,
-        partition_id,
-        shard_lease_token,
-        physical_projection_id,
-        reference_identity_hash,
-        reference_lease_token,
-        previous_reference_lease_token,
-        admission_id,
-        admission_lease_token,
+    validate_projection_action_identity(
+        action,
+        recipe_id,
+        recipe_attempt,
+        identity_by_field,
     )
-    if (
-        any(HASH_PATTERN.fullmatch(required_hash) is None for required_hash in hash_values)
-        or any(
-            candidate_hash is not None
-            and HASH_PATTERN.fullmatch(candidate_hash) is None
-            for candidate_hash in optional_hash_values
-        )
-        or recipe_attempt < 1
-        or (partition_attempt is not None and partition_attempt < 0)
-    ):
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_action_identity_invalid"
-        )
-    reference_actions = {
-        "reference_heartbeat",
-        "reference_insert",
-        "reference_reclaim",
-        "reference_release",
-    }
-    reference_values = (
-        reference_owner_kind,
-        reference_owner_id,
-        reference_identity_hash,
-        reference_lease_token,
-        previous_reference_lease_token,
+    setting_by_name = projection_action_settings(
+        action,
+        recipe_id,
+        recipe_attempt,
+        identity_by_field,
     )
-    admission_actions = {
-        "admission_heartbeat",
-        "admission_insert",
-        "admission_map",
-        "admission_reclaim",
-        "admission_seal",
-    }
-    admission_values = (
-        admission_id,
-        admission_attempt,
-        admission_lease_token,
-    )
-    if action in admission_actions:
-        if (
-            admission_id is None
-            or admission_attempt is None
-            or admission_attempt < 1
-            or admission_lease_token is None
-            or recipe_lease_token is not None
-            or partition_id is not None
-            or partition_attempt is not None
-            or shard_lease_token is not None
-            or physical_projection_id is not None
-            or any(reference_value is not None for reference_value in reference_values)
-        ):
-            raise ProviderDirectoryProjectionError(
-                "provider_directory_projection_action_identity_invalid"
-            )
-    elif action in reference_actions:
-        reference_identity_is_valid = all(
-            (
-                physical_projection_id is not None,
-                reference_owner_kind in {"dataset", "build", "artifact"},
-                isinstance(reference_owner_id, str),
-                bool(reference_owner_id),
-                len(reference_owner_id or "") <= 128,
-                reference_identity_hash is not None,
-                reference_lease_token is not None,
-                recipe_lease_token is None,
-                partition_id is None,
-                partition_attempt is None,
-                shard_lease_token is None,
-            )
-        )
-        previous_token_is_valid = (
-            previous_reference_lease_token is not None
-            if action == "reference_reclaim"
-            else previous_reference_lease_token is None
-        )
-        if not reference_identity_is_valid or not previous_token_is_valid:
-            raise ProviderDirectoryProjectionError(
-                "provider_directory_projection_action_identity_invalid"
-            )
-    elif any(reference_value is not None for reference_value in reference_values) or any(
-        admission_value is not None for admission_value in admission_values
-    ):
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_action_identity_invalid"
-        )
-    setting_by_name = {
-        "action": action,
-        "recipe_id": recipe_id,
-        "recipe_attempt": str(recipe_attempt),
-        "recipe_lease_token": recipe_lease_token or "",
-        "partition_id": partition_id or "",
-        "partition_attempt": (
-            "" if partition_attempt is None else str(partition_attempt)
-        ),
-        "shard_lease_token": shard_lease_token or "",
-        "physical_id": physical_projection_id or "",
-        "reference_owner_kind": reference_owner_kind or "",
-        "reference_owner_id": reference_owner_id or "",
-        "reference_identity_hash": reference_identity_hash or "",
-        "reference_lease_token": reference_lease_token or "",
-        "reference_previous_lease_token": (
-            previous_reference_lease_token or ""
-        ),
-        "admission_id": admission_id or "",
-        "admission_attempt": (
-            "" if admission_attempt is None else str(admission_attempt)
-        ),
-        "admission_lease_token": admission_lease_token or "",
-    }
     for setting_name, setting_value in setting_by_name.items():
         stored_value = await database.scalar(
             "SELECT set_config("

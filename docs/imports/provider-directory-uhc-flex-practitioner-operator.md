@@ -106,9 +106,13 @@ Historical publication receipts do not dispatch the global Provider Directory
 Profile delta.
 The repository has a public Profile builder, but it is not a safe source-local
 dispatcher: it requires a complete global dataset-selection fence and a
-separately admitted capacity plan. The publication receipt embeds the exact
-external controller payload at `profile_delta_dispatch.external_followup`.
-Extract it from the recorded receipt without changing any field:
+separately admitted capacity plan. Only a cohort-complete publication receipt
+embeds the exact external controller payload at
+`profile_delta_dispatch.external_followup`. An admitted retry-exhausted partial
+publication instead reports `cohort_complete=false`, the exact
+`retry_exhausted_count`, and `required_external_global_dispatch=false`; it is
+valid source-local evidence but is not a Profile follow-up authority. Extract a
+complete receipt's payload without changing any field:
 
 ```bash
 GLOBAL_PROFILE_FOLLOWUP_JSON="$(

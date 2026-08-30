@@ -82,6 +82,7 @@ def _readiness_from_row(
             resource_counts=resource_counts,
             publication_kind=fields.get("publication_kind"),
             cohort_complete=fields.get("cohort_complete"),
+            retry_exhausted_count=fields.get("retry_exhausted_count"),
             rooted_graph_complete=fields.get("rooted_graph_complete"),
             endpoint_collection_complete=fields.get("endpoint_collection_complete"),
             endpoint_complete=fields.get("endpoint_complete"),
@@ -120,9 +121,15 @@ def _readiness_select(filter_sql: str) -> str:
                header.semantic_projection_as_of, header.operation_key,
                header.dataset_hash, header.resource_count,
                {counts} AS resource_counts, header.publication_kind,
-               header.cohort_complete, header.rooted_graph_complete,
+               header.cohort_complete,
+               COALESCE((parent.publication_metadata_json::jsonb
+                   ->> 'retry_exhausted_count')::bigint, 0)
+                   AS retry_exhausted_count,
+               header.rooted_graph_complete,
                header.endpoint_collection_complete, header.endpoint_complete
           FROM {_table('provider_directory_rooted_graph_dataset')} AS header
+          JOIN {_table('provider_directory_endpoint_dataset')} AS parent
+            ON parent.dataset_id = header.dataset_id
          WHERE {filter_sql}
            AND header.status = 'published'
            AND header.is_current IS TRUE

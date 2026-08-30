@@ -92,9 +92,14 @@ size is 4096 and the accepted range is 1-4096. Each graph batch is also capped
 at 32 MiB by the publication materializer.
 
 The publication process does not statically load the HTTP acquisition runtime.
-Its receipt reports Profile dispatch as `not_dispatched` and embeds the exact
-external controller payload at `profile_dispatch.external_followup`. Extract
-that immutable payload from the recorded publication receipt:
+A cohort-complete receipt reports Profile dispatch as `not_dispatched` and
+embeds the exact external controller payload at
+`profile_dispatch.external_followup`. A rooted publication over an admitted
+retry-exhausted Flex root instead carries `cohort_complete=false` and the exact
+`retry_exhausted_count`, remains available as source-local rooted evidence, and
+reports `required_external_global_dispatch=false`; it is not a Profile
+follow-up authority. Extract a complete receipt's immutable payload without
+changing any field:
 
 ```bash
 GLOBAL_PROFILE_FOLLOWUP_JSON="$(

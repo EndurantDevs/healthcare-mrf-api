@@ -88,6 +88,10 @@ async def _locked_legacy_header(
                    header.resource_count AS practitioner_resource_count,
                    header.terminal_set_sha256 AS root_content_proof_sha256,
                    header.cohort_id AS root_cohort_id,
+                   header.cohort_complete,
+                   COALESCE((parent.publication_metadata_json::jsonb
+                       ->> 'retry_exhausted_count')::bigint, 0)
+                       AS retry_exhausted_count,
                    header.semantic_projection_as_of,
                    header.operation_key, header.acquisition_root_run_id
               FROM {_qualified(LEGACY_DATASET_TABLE)} AS header
@@ -95,6 +99,8 @@ async def _locked_legacy_header(
                 ON endpoint.endpoint_id = header.endpoint_id
               JOIN {_qualified('provider_directory_api_endpoint')} AS graph_endpoint
                 ON graph_endpoint.endpoint_id = :rooted_endpoint_id
+              JOIN {_qualified(ENDPOINT_DATASET_TABLE)} AS parent
+                ON parent.dataset_id = header.dataset_id
              WHERE header.source_id = :legacy_source_id
                AND header.endpoint_id = :legacy_endpoint_id
                AND header.is_current IS TRUE
@@ -130,9 +136,15 @@ async def _locked_rooted_header(
                    header.resource_count, header.practitioner_resource_count,
                    header.root_content_proof_sha256,
                    header.root_cohort_id,
+                   header.cohort_complete,
+                   COALESCE((parent.publication_metadata_json::jsonb
+                       ->> 'retry_exhausted_count')::bigint, 0)
+                       AS retry_exhausted_count,
                    header.semantic_projection_as_of,
                    header.operation_key, header.acquisition_root_run_id
               FROM {_qualified(ROOTED_DATASET_TABLE)} AS header
+              JOIN {_qualified(ENDPOINT_DATASET_TABLE)} AS parent
+                ON parent.dataset_id = header.dataset_id
              WHERE header.practitioner_origin_source_id = :legacy_source_id
                AND header.practitioner_origin_endpoint_id = :legacy_endpoint_id
                AND header.source_id = :rooted_source_id
@@ -293,6 +305,8 @@ def _exact_current_from_header(
             practitioner_resource_count=header.get("practitioner_resource_count"),
             root_content_proof_sha256=header.get("root_content_proof_sha256"),
             root_cohort_id=header.get("root_cohort_id"),
+            cohort_complete=header.get("cohort_complete"),
+            retry_exhausted_count=header.get("retry_exhausted_count"),
             semantic_projection_as_of=_projection_text(
                 header.get("semantic_projection_as_of")
             ),

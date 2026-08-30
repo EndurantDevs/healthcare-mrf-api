@@ -12,9 +12,7 @@ import re
 from typing import Any, Mapping
 
 from db.connection import db
-from process.provider_directory_dataset_scoped_publication import (
-    exact_dataset_variant,
-)
+from process.provider_directory_dataset_scoped_publication import exact_dataset_variant
 from process.provider_directory_resource_hash import (
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
 )
@@ -272,19 +270,14 @@ def build_uhc_flex_practitioner_dataset_identity(
     )
 
 
-def uhc_flex_practitioner_publication_metadata(
+def _require_publication_metadata_identity(
     identity: UHCFlexPractitionerDatasetIdentity,
     admission: UHCFlexPractitionerAdmission,
-    retry_exhausted_count: int = 0,
-) -> dict[str, Any]:
-    """Return the exact closed metadata object checked by PostgreSQL."""
-
+    retry_exhausted_count: int,
+) -> None:
     if (
         type(identity) is not UHCFlexPractitionerDatasetIdentity
-        or type(admission) not in {
-            UHCFlexPractitionerTwinAdmission,
-            UHCFlexPractitionerSingleRootAdmission,
-        }
+        or type(admission) not in {UHCFlexPractitionerTwinAdmission, UHCFlexPractitionerSingleRootAdmission}
         or identity.admission_id != admission.admission_id
         or identity.candidate_acquisition_id != admission.candidate_acquisition_id
         or identity.cohort_id != admission.cohort_id
@@ -296,12 +289,19 @@ def uhc_flex_practitioner_publication_metadata(
         or identity.source_id != admission.source_id
         or type(retry_exhausted_count) is not int
         or retry_exhausted_count < 0
-        or (
-            retry_exhausted_count > 0
-            and type(admission) is not UHCFlexPractitionerSingleRootAdmission
-        )
+        or (retry_exhausted_count > 0 and type(admission) is not UHCFlexPractitionerSingleRootAdmission)
     ):
         raise ValueError("Flex Practitioner publication identity is invalid")
+
+
+def uhc_flex_practitioner_publication_metadata(
+    identity: UHCFlexPractitionerDatasetIdentity,
+    admission: UHCFlexPractitionerAdmission,
+    retry_exhausted_count: int = 0,
+) -> dict[str, Any]:
+    """Return the exact closed metadata object checked by PostgreSQL."""
+
+    _require_publication_metadata_identity(identity, admission, retry_exhausted_count)
     metadata = {
         "acquisition_root_run_id": identity.acquisition_root_run_id,
         "admission_contract_id": admission.admission_contract_id,

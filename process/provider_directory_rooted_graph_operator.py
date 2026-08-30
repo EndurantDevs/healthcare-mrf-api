@@ -137,11 +137,11 @@ def _acquisition_json(
                 PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256
             ),
             "operation_key": operation_key,
-            "publication_acquisition_id": (admission.publication_acquisition_id),
+            "publication_acquisition_id": admission.publication_acquisition_id,
             "root_dataset_hash": current.dataset_hash,
             "root_dataset_id": current.dataset_id,
             "root_dataset_variant": current.variant,
-            "root_practitioner_resource_count": (current.practitioner_resource_count),
+            "root_practitioner_resource_count": current.practitioner_resource_count,
             "rooted_graph_sha256": admission.rooted_graph_sha256,
             "status": "admitted",
             "twin_attempt_id": admission.attempt_id,
@@ -398,36 +398,46 @@ async def acquire_single_root_operation(
 
 def _publication_json(publication_result: Any) -> str:
     readiness = publication_result.readiness
-    return _canonical_json(
-        {
-            "admission_id": readiness.admission_id,
-            "dataset_hash": readiness.dataset_hash,
-            "dataset_id": readiness.dataset_id,
-            "operator_contract_sha256": (
-                PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256
+    if readiness.cohort_complete:
+        profile_dispatch_by_field = {
+            **profile_followup_receipt_metadata(),
+            "external_followup": (
+                build_provider_directory_global_profile_followup(
+                    source_id=readiness.source_id,
+                    dataset_id=readiness.dataset_id,
+                    parent_run_id=readiness.acquisition_root_run_id,
+                )
             ),
-            "previous_dataset_id": readiness.previous_dataset_id,
-            "profile_dispatch": {
-                **profile_followup_receipt_metadata(),
-                "external_followup": (
-                    build_provider_directory_global_profile_followup(
-                        source_id=readiness.source_id,
-                        dataset_id=readiness.dataset_id,
-                        parent_run_id=readiness.acquisition_root_run_id,
-                    )
-                ),
-                "operator_command_available": False,
-                "required_external_global_dispatch": True,
-                "status": "not_dispatched",
-            },
-            "publication_acquisition_id": (readiness.publication_acquisition_id),
-            "replayed": publication_result.replayed,
-            "resource_count": readiness.resource_count,
-            "root_dataset_variant": readiness.root_dataset_variant,
-            "rooted_graph_complete": readiness.rooted_graph_complete,
-            "status": "published",
+            "operator_command_available": False,
+            "required_external_global_dispatch": True,
+            "status": "not_dispatched",
         }
-    )
+    else:
+        profile_dispatch_by_field = {
+            "operator_command_available": False,
+            "required_external_global_dispatch": False,
+            "status": "not_applicable_incomplete_cohort",
+        }
+    publication_by_field = {
+        "admission_id": readiness.admission_id,
+        "dataset_hash": readiness.dataset_hash,
+        "dataset_id": readiness.dataset_id,
+        "operator_contract_sha256": (
+            PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256
+        ),
+        "previous_dataset_id": readiness.previous_dataset_id,
+        "profile_dispatch": profile_dispatch_by_field,
+        "publication_acquisition_id": readiness.publication_acquisition_id,
+        "replayed": publication_result.replayed,
+        "resource_count": readiness.resource_count,
+        "root_dataset_variant": readiness.root_dataset_variant,
+        "rooted_graph_complete": readiness.rooted_graph_complete,
+        "status": "published",
+    }
+    if not readiness.cohort_complete:
+        publication_by_field["cohort_complete"] = False
+        publication_by_field["retry_exhausted_count"] = readiness.retry_exhausted_count
+    return _canonical_json(publication_by_field)
 
 
 async def publish_admitted_rooted_graph_operation(
@@ -471,24 +481,18 @@ async def publish_admitted_rooted_graph_operation(
         raise _operation_error(error, "publication") from None
 
 
-__all__ = (
-    "ACQUISITION_ENABLED_ENV",
-    "OPERATOR_PHASES",
-    "PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_ID",
-    "PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256",
-    "PUBLICATION_ENABLED_ENV",
-    "ProviderDirectoryRootedGraphOperatorError",
-    "ProviderDirectoryRootedGraphOperatorIdentities",
-    "RootedGraphSingleIdentity",
-    "REGISTRATION_ENABLED_ENV",
-    "SINGLE_ROOT_ACQUISITION_ENABLED_ENV",
-    "SINGLE_ROOT_ACQUISITION_PHASE",
-    "acquire_admit_rooted_graph_operation",
-    "acquire_single_root_operation",
-    "build_rooted_graph_operator_identities",
-    "build_rooted_graph_single_root_identity",
-    "publish_admitted_rooted_graph_operation",
-    "register_rooted_graph_source_operation",
-    "require_rooted_graph_operator_gate",
-    "rooted_graph_operator_contract_payload",
+__all__ = tuple(
+    (
+        "ACQUISITION_ENABLED_ENV OPERATOR_PHASES "
+        "PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_ID "
+        "PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256 "
+        "PUBLICATION_ENABLED_ENV ProviderDirectoryRootedGraphOperatorError "
+        "ProviderDirectoryRootedGraphOperatorIdentities RootedGraphSingleIdentity "
+        "REGISTRATION_ENABLED_ENV SINGLE_ROOT_ACQUISITION_ENABLED_ENV "
+        "SINGLE_ROOT_ACQUISITION_PHASE acquire_admit_rooted_graph_operation "
+        "acquire_single_root_operation build_rooted_graph_operator_identities "
+        "build_rooted_graph_single_root_identity "
+        "publish_admitted_rooted_graph_operation register_rooted_graph_source_operation "
+        "require_rooted_graph_operator_gate rooted_graph_operator_contract_payload"
+    ).split()
 )

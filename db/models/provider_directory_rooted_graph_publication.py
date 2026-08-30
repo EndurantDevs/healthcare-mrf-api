@@ -160,7 +160,7 @@ class ProviderDirectoryRootedGraphDataset(Base, JSONOutputMixin):
             "operation_key ~ '^[0-9a-f]{64}$' AND "
             "rooted_graph_sha256 ~ '^[0-9a-f]{64}$' AND "
             "resource_hash_contract = 'semantic_content_v3' AND "
-            "cohort_complete IS TRUE AND rooted_graph_complete IS TRUE AND "
+            "cohort_complete IN (TRUE, FALSE) AND rooted_graph_complete IS TRUE AND "
             "endpoint_collection_complete IS FALSE AND endpoint_complete IS FALSE "
             "AND max_work_items > root_practitioner_resource_count "
             "AND max_work_items BETWEEN 1 AND 16500000 "
