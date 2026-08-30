@@ -6178,12 +6178,15 @@ hospitals:
 - hospital_id: hospital-001880
   name: EHHS Fulton Square Clinic
   cms_hpt_url: https://www.edgertonhospital.com/cms-hpt.txt
+  locator_name: Edgerton Hospital and Health Services - Fulton Square Clinic
 - hospital_id: hospital-001881
   name: EHHS Milton Clinic
   cms_hpt_url: https://www.edgertonhospital.com/cms-hpt.txt
+  locator_name: Edgerton Hospital and Health Services - Milton Clinic
 - hospital_id: hospital-001882
   name: EHHS Milton Clinic Medicare
   cms_hpt_url: https://www.edgertonhospital.com/cms-hpt.txt
+  alias_of: hospital-001881
 - hospital_id: hospital-001883
   name: Eisenhower Medical Center
   cms_hpt_url: https://eisenhowerhealth.org/cms-hpt.txt
@@ -16969,10 +16972,12 @@ hospitals:
   cms_hpt_url: https://www.pinnaclehealthcare.net/cms-hpt.txt
 - hospital_id: hospital-005162
   name: Pioneer Memorial Hospital & Health Services
-  cms_hpt_url: https://pioneermemorial.org/cms-hpt.txt
+  cms_hpt_url: https://www.pioneermemorial.org/cms-hpt.txt
+  locator_name: Pioneer Memorial Hospital & Health Services
 - hospital_id: hospital-005163
   name: Pioneer Memorial Hospital and Health Services
-  cms_hpt_url: https://pioneermemorial.org/cms-hpt.txt
+  cms_hpt_url: https://www.pioneermemorial.org/cms-hpt.txt
+  alias_of: hospital-005162
 - hospital_id: hospital-005164
   name: Pioneer Specialty Hospital - Garden City MI
   cms_hpt_url: https://www.pioneerspecialtyhospital.com/cms-hpt.txt
