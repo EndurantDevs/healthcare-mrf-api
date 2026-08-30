@@ -42,14 +42,22 @@ async def _fetch_optimized_locations(
     return await database.all(location_sql, **location_query.parameter_map)
 
 
-def _knn_query(schema: str) -> serving._MembershipLocationQuery:
+def _knn_query(
+    schema: str,
+    *,
+    zip5: str | None = None,
+    radius_miles: str = "30",
+    limit: int = 2,
+) -> serving._MembershipLocationQuery:
     request_arg_map = {
         "lat": "42.3314",
         "long": "-83.0458",
-        "radius_miles": "30",
+        "radius_miles": radius_miles,
     }
+    if zip5 is not None:
+        request_arg_map["zip5"] = zip5
     query_parameter_map = {
-        "limit": 2,
+        "limit": limit,
         "offset": 0,
         "shared_snapshot_key": 41,
     }
