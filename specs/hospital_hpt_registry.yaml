@@ -10648,6 +10648,7 @@ hospitals:
 - hospital_id: hospital-003240
   name: Jersey Community Hospial
   cms_hpt_url: https://www.jch.org/cms-hpt.txt
+  locator_name: Jersey Community Hospital
 - hospital_id: hospital-003241
   name: Jersey Community Hospital
   cms_hpt_url: https://www.jch.org/cms-hpt.txt

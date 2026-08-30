@@ -67,6 +67,7 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-001880": "Edgerton Hospital and Health Services - Fulton Square Clinic",
     "hospital-001881": "Edgerton Hospital and Health Services - Milton Clinic",
     "hospital-002421": "Grady Health System",
+    "hospital-003240": "Jersey Community Hospital",
     "hospital-005162": "Pioneer Memorial Hospital & Health Services",
     "hospital-005915": "Mee Memorial Hospital",
     "hospital-006345": "Summa Rehab Hospital, LLC",
@@ -96,7 +97,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(registry.hospital_hpt_registry_groups()) == 7_108
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
-    assert sum("locator_name" in entry for entry in hospitals) == 1_422
+    assert sum("locator_name" in entry for entry in hospitals) == 1_423
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 644
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 40
     assert {entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry} == set(
