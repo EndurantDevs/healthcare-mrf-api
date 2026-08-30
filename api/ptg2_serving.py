@@ -19149,7 +19149,10 @@ async def _search_manifest_serving_table(
     code_rows: list[dict[str, Any]] | None = None
     if (
         is_provider_inclusive_cost_ordered_geo
-        and not strict_cost_provider_expansion
+        and not (
+            strict_cost_provider_expansion
+            and is_provider_filter_requested
+        )
     ):
         code_rows = await load_code_rows()
         if not code_rows:

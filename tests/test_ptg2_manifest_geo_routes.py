@@ -49,7 +49,7 @@ def _bounded_geo_selection(nearer_npi: int) -> serving._ProviderExpansionSelecti
 
 @pytest.mark.asyncio
 async def test_manifest_cost_geo_uses_strict_rate_first_route(monkeypatch):
-    """Skip broad geo traversal when the indexed projection is available."""
+    """Keep inferred-taxonomy scopes on the strict local-first route."""
 
     _install_base_dependencies(monkeypatch)
     broad_location_lookup = AsyncMock(
@@ -62,7 +62,11 @@ async def test_manifest_cost_geo_uses_strict_rate_first_route(monkeypatch):
     )
     nearer_npi = _NPI + 1
     selector = AsyncMock(return_value=_bounded_geo_selection(nearer_npi))
-    monkeypatch.setattr(serving, "_strict_cost_provider_expansion_selection", selector)
+    monkeypatch.setattr(
+        serving,
+        "_strict_cost_provider_expansion_selection",
+        selector,
+    )
     serving_tables = _production_tables()
     rate_count = (
         serving._v4_hot_prefix_limits(
@@ -73,13 +77,16 @@ async def test_manifest_cost_geo_uses_strict_rate_first_route(monkeypatch):
 
     response, _session = await _search(
         args=_query_args(
+            code="27447",
             include_providers=True,
             lat=41.8781,
             long=-87.6298,
             radius_miles=25,
             order_by="total_allowed_amount",
         ),
-        code_rows=[{**_CODE_ROW, "rate_count": rate_count}],
+        code_rows=[
+            {**_CODE_ROW, "reported_code": "27447", "rate_count": rate_count}
+        ],
         serving_tables=serving_tables,
     )
 
@@ -87,6 +94,44 @@ async def test_manifest_cost_geo_uses_strict_rate_first_route(monkeypatch):
     assert response["items"][0]["distance_miles"] == 1.25
     broad_location_lookup.assert_not_awaited()
     selector.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_manifest_cost_geo_refuses_oversized_unfiltered_scope(monkeypatch):
+    """Refuse broad unfiltered work before the reverse-geo database scan."""
+
+    _install_base_dependencies(monkeypatch)
+    selector = AsyncMock(
+        side_effect=AssertionError("oversized unfiltered scope must be refused")
+    )
+    monkeypatch.setattr(serving, "_strict_cost_provider_expansion_selection", selector)
+    serving_tables = _production_tables()
+    rate_count = (
+        serving._v4_hot_prefix_limits(
+            serving_tables
+        ).maximum_provider_expansion_rate_rows
+        + 1
+    )
+
+    with pytest.raises(serving.PTG2LocationScopeError) as exc_info:
+        await _search(
+            args=_query_args(
+                code="36415",
+                include_providers=True,
+                lat=41.8781,
+                long=-87.6298,
+                radius_miles=25,
+                order_by="total_allowed_amount",
+            ),
+            code_rows=[
+                {**_CODE_ROW, "reported_code": "36415", "rate_count": rate_count}
+            ],
+            serving_tables=serving_tables,
+        )
+
+    assert exc_info.value.error_code == "ptg2_location_scope_too_broad"
+    assert "order_by=distance" in str(exc_info.value)
+    selector.assert_not_awaited()
 
 
 @pytest.mark.asyncio
