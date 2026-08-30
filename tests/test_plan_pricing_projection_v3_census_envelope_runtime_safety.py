@@ -51,6 +51,9 @@ def test_invalid_runtime_attestation_cannot_complete_envelope(
         assert receipt["child_exit_code"] == 1
     if mode == "empty-image":
         assert int((tmp_path / "fake-state/attestation-pod-reads").read_text()) > 2
+    if expected_exit == 143:
+        events = (tmp_path / "fake-state/events").read_text().splitlines()
+        assert events.count("child_signal_15") == 1
     assert receipt["status"] == "failed"
     assert receipt["runtime_attestation"] is None
     assert receipt["cleanup"]["complete"] is False

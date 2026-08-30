@@ -62,19 +62,50 @@ def test_slow_envelope_suites_run_once_in_the_parallel_capacity_lane() -> None:
         "tests/test_plan_pricing_projection_v3_census_envelope_safety.py",
     )
     base_capacity_paths = tuple(workflow["env"]["CAPACITY_TEST_PATHS"].splitlines())
-    expected_append = "capacity_test_paths+=$'\\n" + "\\n".join(expected) + "'"
+    expected_definition = "envelope_capacity_test_paths=$'" + "\\n".join(expected) + "'"
     python_main = prepush.split("run_python_main() {", 1)[1].split(
         "run_capacity() {", 1
     )[0]
     capacity = prepush.split("run_capacity() {", 1)[1].split(
         "run_python_coverage() {", 1
     )[0]
+    capacity_job = workflow["jobs"]["capacity-evidence"]
+    capacity_uploads = [
+        step
+        for step in capacity_job["steps"]
+        if step.get("uses", "").startswith("actions/upload-artifact@")
+    ]
 
     assert set(expected).isdisjoint(base_capacity_paths)
-    assert expected_append in prepush
+    assert "base_capacity_test_paths=$capacity_test_paths" in prepush
+    assert expected_definition in prepush
+    assert "capacity_test_paths+=$'\\n'\"$envelope_capacity_test_paths\"" in prepush
     assert 'collection_args+=(--ignore "$test_path")' in python_main
-    assert "python -m pytest -q -n 4 --dist worksteal" in capacity
+    assert 'mapfile -t capacity_tests <<< "$base_capacity_test_paths"' in capacity
+    assert (
+        'mapfile -t envelope_capacity_tests <<< "$envelope_capacity_test_paths"'
+        in capacity
+    )
+    assert capacity.count("python -m pytest -q -n 4 --dist worksteal") == 2
+    assert capacity.count("--cov-append") == 1
+    assert capacity.count("export COVERAGE_FILE=") == 1
+    assert capacity.count("write-shard-provenance") == 1
     assert '"${capacity_tests[@]}"' in capacity
+    assert '"${envelope_capacity_tests[@]}"' in capacity
+    assert capacity.index('"${capacity_tests[@]}"') < capacity.index("--cov-append")
+    assert capacity.index("--cov-append") < capacity.index(
+        '"${envelope_capacity_tests[@]}"'
+    )
+    assert capacity.index('"${envelope_capacity_tests[@]}"') < capacity.index(
+        "write-shard-provenance"
+    )
+    assert capacity_job["timeout-minutes"] == 10
+    assert len(capacity_uploads) == 1
+    assert capacity_uploads[0]["with"]["name"] == "mrf-python-coverage-capacity"
+    assert capacity_uploads[0]["with"]["path"].splitlines() == [
+        ".coverage.capacity",
+        ".coverage-provenance.capacity.json",
+    ]
     for test_path in expected:
         assert prepush.count(test_path) == 1
 

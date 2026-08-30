@@ -114,6 +114,10 @@ elif name == "setsid":
         raise SystemExit(0)
     os.execvp(args[0], args)
 elif name == "census-child":
+    def finish(number, _frame):
+        event("child_signal_" + str(number))
+        raise SystemExit(128 + number)
+    signal.signal(signal.SIGTERM, finish); signal.signal(signal.SIGINT, finish)
     event("child")
     if args[:1] != ["--receipt"]: raise SystemExit("missing census receipt path")
     receipt_path = Path(args[1])
@@ -159,10 +163,6 @@ elif name == "census-child":
     if os.environ.get("FAKE_DRAIN_DRIFT_AFTER_CHILD") == "1":
         resource_path("drain").write_text("false")
     if os.environ.get("FAKE_CHILD_MODE") == "wait":
-        def finish(number, _frame):
-            event("child_signal_" + str(number))
-            raise SystemExit(128 + number)
-        signal.signal(signal.SIGTERM, finish); signal.signal(signal.SIGINT, finish)
         event("child_ready")
         while True: signal.pause()
 elif name == "k3s":
@@ -502,7 +502,7 @@ elif name == "k3s":
                 if mode == "bare-digest":
                     image_id = "sha256:" + "c" * 64
                 elif mode == "empty-image":
-                    image_id = ""
+                    image_id = "" if read_count <= 2 else "invalid-image-id"
                 elif mode == "malformed":
                     owner_uid = "other-job-uid"
                 elif mode == "pod-replaced" and read_count > 1:
