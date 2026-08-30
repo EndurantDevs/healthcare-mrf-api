@@ -962,6 +962,118 @@ async def _lookup_zip_context(session, zip5: str | None) -> dict[str, Any] | Non
     return payload
 
 
+async def _query_zip_radius_rows(
+    session,
+    *,
+    normalized_zip: str,
+    radius_miles: float,
+    state_filter: str | None,
+    anchor: dict[str, Any],
+    limit: int,
+) -> list[dict[str, Any]]:
+    distance_expr = _distance_miles_expression(
+        _as_float(anchor.get("latitude")), _as_float(anchor.get("longitude"))
+    ).label("distance_miles")
+    filters = [
+        geo_zip_table.c.latitude.isnot(None),
+        geo_zip_table.c.longitude.isnot(None),
+        distance_expr <= max(radius_miles, 0.0),
+    ]
+    if state_filter:
+        filters.append(geo_zip_table.c.state == state_filter)
+    query_result = await session.execute(
+        select(
+            geo_zip_table.c.zip_code.label("zip5"),
+            geo_zip_table.c.state.label("state"),
+            geo_zip_table.c.city_lower.label("city_lower"),
+            distance_expr,
+        )
+        .where(and_(*filters))
+        .order_by(distance_expr.asc(), geo_zip_table.c.zip_code.asc())
+        .limit(limit)
+    )
+    radius_zip_entries: list[dict[str, Any]] = []
+    seen_zip_codes: set[str] = set()
+    for zip_query_row in query_result:
+        zip_record = _row_to_dict(zip_query_row)
+        candidate_zip = _normalize_zip5(zip_record.get("zip5"))
+        if candidate_zip is None or candidate_zip in seen_zip_codes:
+            continue
+        seen_zip_codes.add(candidate_zip)
+        radius_zip_entries.append(
+            {
+                "zip5": candidate_zip,
+                "state": str(zip_record.get("state") or "").strip().upper() or None,
+                "city_lower": str(zip_record.get("city_lower") or "").strip().lower() or None,
+                "distance_miles": _as_float(zip_record.get("distance_miles")),
+                "is_anchor": candidate_zip == normalized_zip,
+            }
+        )
+    if normalized_zip not in seen_zip_codes:
+        radius_zip_entries.insert(
+            0,
+            {
+                "zip5": normalized_zip,
+                "state": state_filter,
+                "city_lower": anchor.get("city_lower"),
+                "distance_miles": 0.0,
+                "is_anchor": True,
+            },
+        )
+    return radius_zip_entries
+
+
+async def _uncached_zip_radius_rows(
+    session,
+    *,
+    normalized_zip: str,
+    radius_miles: float,
+    state_hint_normalized: str | None,
+    anchor_context: dict[str, Any] | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    anchor = (
+        anchor_context
+        if anchor_context is not None
+        and _normalize_zip5(anchor_context.get("zip5")) == normalized_zip
+        else None
+    )
+    if anchor is None:
+        anchor = await _lookup_zip_context(session, normalized_zip)
+    if anchor is None:
+        return [
+            {
+                "zip5": normalized_zip,
+                "state": state_hint_normalized,
+                "city_lower": None,
+                "distance_miles": 0.0,
+                "is_anchor": True,
+            }
+        ]
+    anchor_lat = _as_float(anchor.get("latitude"))
+    anchor_long = _as_float(anchor.get("longitude"))
+    anchor_state = str(anchor.get("state") or "").strip().upper() or None
+    state_filter = state_hint_normalized or anchor_state
+    if anchor_lat is None or anchor_long is None:
+        return [
+            {
+                "zip5": normalized_zip,
+                "state": state_filter,
+                "city_lower": anchor.get("city_lower"),
+                "distance_miles": 0.0,
+                "is_anchor": True,
+            }
+        ]
+    return await _query_zip_radius_rows(
+        session,
+        normalized_zip=normalized_zip,
+        radius_miles=radius_miles,
+        state_filter=state_filter,
+        anchor=anchor,
+        limit=limit,
+    )
+
+
 async def _zip_radius_rows(
     session,
     *,
@@ -975,9 +1087,9 @@ async def _zip_radius_rows(
     normalized_zip = _normalize_zip5(zip5)
     if not normalized_zip:
         return []
-
     state_hint_normalized = str(state_hint or "").strip().upper() or None
-    cache_key: tuple[str, float, str, int] | None = None
+    cache_key = None
+    cached_radius_entries = None
     if anchor_context is None:
         cache_key = _zip_radius_cache_key(
             zip5=normalized_zip,
@@ -985,100 +1097,17 @@ async def _zip_radius_rows(
             state_filter=state_hint_normalized,
             limit=limit,
         )
-        cached_rows = _zip_radius_rows_cache_get(cache_key)
-        if cached_rows is not None:
-            return cached_rows
-
-    anchor = anchor_context
-    if anchor is not None:
-        anchor_zip = _normalize_zip5(anchor.get("zip5"))
-        if anchor_zip != normalized_zip:
-            anchor = None
-    if anchor is None:
-        anchor = await _lookup_zip_context(session, normalized_zip)
-    if anchor is None:
-        radius_zip_entries = [
-            {
-                "zip5": normalized_zip,
-                "state": state_hint_normalized,
-                "city_lower": None,
-                "distance_miles": 0.0,
-                "is_anchor": True,
-            }
-        ]
-        if cache_key is not None:
-            _zip_radius_rows_cache_put(cache_key, radius_zip_entries)
-        return radius_zip_entries
-
-    anchor_lat = _as_float(anchor.get("latitude"))
-    anchor_long = _as_float(anchor.get("longitude"))
-    anchor_state = str(anchor.get("state") or "").strip().upper() or None
-    state_filter = state_hint_normalized or anchor_state
-    if anchor_lat is None or anchor_long is None:
-        radius_zip_entries = [
-            {
-                "zip5": normalized_zip,
-                "state": state_filter,
-                "city_lower": anchor.get("city_lower"),
-                "distance_miles": 0.0,
-                "is_anchor": True,
-            }
-        ]
-        if cache_key is not None:
-            _zip_radius_rows_cache_put(cache_key, radius_zip_entries)
-        return radius_zip_entries
-
-    distance_expr = _distance_miles_expression(anchor_lat, anchor_long).label("distance_miles")
-    filters = [
-        geo_zip_table.c.latitude.isnot(None),
-        geo_zip_table.c.longitude.isnot(None),
-        distance_expr <= max(radius_miles, 0.0),
-    ]
-    if state_filter:
-        filters.append(geo_zip_table.c.state == state_filter)
-
-    radius_query_result = await session.execute(
-        select(
-            geo_zip_table.c.zip_code.label("zip5"),
-            geo_zip_table.c.state.label("state"),
-            geo_zip_table.c.city_lower.label("city_lower"),
-            distance_expr,
-        )
-        .where(and_(*filters))
-        .order_by(distance_expr.asc(), geo_zip_table.c.zip_code.asc())
-        .limit(limit)
+        cached_radius_entries = _zip_radius_rows_cache_get(cache_key)
+    if cached_radius_entries is not None:
+        return cached_radius_entries
+    radius_zip_entries = await _uncached_zip_radius_rows(
+        session,
+        normalized_zip=normalized_zip,
+        radius_miles=radius_miles,
+        state_hint_normalized=state_hint_normalized,
+        anchor_context=anchor_context,
+        limit=limit,
     )
-
-    seen_zip_codes: set[str] = set()
-    radius_zip_entries: list[dict[str, Any]] = []
-    for zip_query_row in radius_query_result:
-        zip_record = _row_to_dict(zip_query_row)
-        candidate_zip = _normalize_zip5(zip_record.get("zip5"))
-        if candidate_zip is None or candidate_zip in seen_zip_codes:
-            continue
-        seen_zip_codes.add(candidate_zip)
-        distance_value = _as_float(zip_record.get("distance_miles"))
-        radius_zip_entries.append(
-            {
-                "zip5": candidate_zip,
-                "state": str(zip_record.get("state") or "").strip().upper() or None,
-                "city_lower": str(zip_record.get("city_lower") or "").strip().lower() or None,
-                "distance_miles": distance_value,
-                "is_anchor": candidate_zip == normalized_zip,
-            }
-        )
-
-    if normalized_zip not in seen_zip_codes:
-        radius_zip_entries.insert(
-            0,
-            {
-                "zip5": normalized_zip,
-                "state": state_filter,
-                "city_lower": anchor.get("city_lower"),
-                "distance_miles": 0.0,
-                "is_anchor": True,
-            },
-        )
     if cache_key is not None:
         _zip_radius_rows_cache_put(cache_key, radius_zip_entries)
     return radius_zip_entries
@@ -4249,15 +4278,13 @@ async def _load_provider_quality_observed(session, *, npi: int, year: int) -> di
     }
 
 
-async def _load_quality_peer_targets(
-    session,
+def _quality_peer_target_query_context(
     *,
     year: int,
     benchmark_modes: list[str] | tuple[str, ...] | None = None,
     state_key: str | None = None,
     zip5: str | None = None,
-) -> list[dict[str, Any]]:
-    """Load quality peer targets for the requested benchmark modes and geographic scopes."""
+) -> tuple[str, dict[str, Any], bool, bool]:
     normalized_modes = [
         mode
         for mode in (benchmark_modes or QUALITY_BENCHMARK_MODE_ORDER)
@@ -4305,7 +4332,12 @@ async def _load_quality_peer_targets(
         WHERE year = :year
           AND benchmark_mode IN ({mode_placeholders})
     """
+    return select_sql, parameter_map, state_enabled, zip_enabled
 
+
+def _quality_peer_target_query_variants(
+    select_sql: str, state_enabled: bool, zip_enabled: bool
+) -> tuple[str, str]:
     # Fast path: run index-friendly scope-specific probes.
     query_parts = [select_sql + "\n          AND geography_scope = 'national'"]
     if state_enabled:
@@ -4316,8 +4348,6 @@ async def _load_quality_peer_targets(
         query_parts.append(
             select_sql + "\n          AND geography_scope = 'zip'\n          AND geography_value = :zip5"
         )
-    fast_query = "\n        UNION ALL\n".join(query_parts)
-
     geography_clause = """
           AND (
                 geography_scope IS NULL
@@ -4334,6 +4364,29 @@ async def _load_quality_peer_targets(
                 )
           )
     """
+    return "\n        UNION ALL\n".join(query_parts), select_sql + geography_clause
+
+
+async def _load_quality_peer_targets(
+    session,
+    *,
+    year: int,
+    benchmark_modes: list[str] | tuple[str, ...] | None = None,
+    state_key: str | None = None,
+    zip5: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load quality peer targets for the requested benchmark modes and geographic scopes."""
+    select_sql, parameter_map, state_enabled, zip_enabled = (
+        _quality_peer_target_query_context(
+            year=year,
+            benchmark_modes=benchmark_modes,
+            state_key=state_key,
+            zip5=zip5,
+        )
+    )
+    fast_query, scoped_fallback_query = _quality_peer_target_query_variants(
+        select_sql, state_enabled, zip_enabled
+    )
 
     try:
         peer_target_query_result = await session.execute(text(fast_query), parameter_map)
@@ -4344,7 +4397,9 @@ async def _load_quality_peer_targets(
         if peer_target_rows:
             return peer_target_rows
         # Safety fallback for unexpected geography-key formats.
-        fallback_result = await session.execute(text(select_sql + geography_clause), parameter_map)
+        fallback_result = await session.execute(
+            text(scoped_fallback_query), parameter_map
+        )
         fallback_rows = [
             _row_to_dict(peer_target_row)
             for peer_target_row in fallback_result
@@ -10422,37 +10477,7 @@ async def list_procedure_providers(request, code_system: str, code: str):
     )
 
 
-@blueprint.get("/procedures/<code_system>/<code>/benchmarks", name="pricing.procedures.benchmarks.get")
-async def get_procedure_benchmarks(request, code_system: str, code: str):
-    """Return national and state pricing benchmarks for a procedure or service code."""
-    session = _get_session(request)
-    args = request.args
-
-    year = _parse_int(args.get("year"), "year", minimum=2013)
-    state = str(args.get("state", "")).strip().upper()
-    city = str(args.get("city", "")).strip().lower()
-    include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
-
-    year, year_source = await _resolve_year(session, provider_procedure_table, year)
-    internal_codes, code_context = await _resolve_internal_codes_for_request(
-        session,
-        code,
-        args,
-        default_system=code_system,
-    )
-
-    filters = [
-        provider_procedure_table.c.procedure_code.in_(internal_codes),
-        provider_procedure_table.c.year == year,
-        provider_table.c.npi == provider_procedure_table.c.npi,
-        provider_table.c.year == provider_procedure_table.c.year,
-    ]
-    if state:
-        filters.append(func.upper(provider_table.c.state) == state)
-    if city:
-        filters.append(func.lower(provider_table.c.city).like(f"%{city}%"))
-    where_clause = and_(*filters)
-
+async def _procedure_benchmark_values(session, where_clause):
     aggregate_query = (
         select(
             func.count().label("matched_rows"),
@@ -10488,7 +10513,12 @@ async def get_procedure_benchmarks(request, code_system: str, code: str):
     )
     threshold_result = await session.execute(threshold_query)
     thresholds = _row_to_dict(threshold_result.first() or {})
+    return aggregate, thresholds
 
+
+def _procedure_benchmark_payload(
+    aggregate: dict[str, Any], thresholds: dict[str, Any], include_legacy_fields: bool
+) -> dict[str, Any]:
     benchmark_payload_map: dict[str, Any] = {
         "matched_rows": int(aggregate.get("matched_rows") or 0),
         "provider_count": int(aggregate.get("provider_count") or 0),
@@ -10517,6 +10547,40 @@ async def get_procedure_benchmarks(request, code_system: str, code: str):
                 "max_total_drug_cost": benchmark_payload_map["max_total_allowed_amount"],
             }
         )
+    return benchmark_payload_map
+
+
+@blueprint.get("/procedures/<code_system>/<code>/benchmarks", name="pricing.procedures.benchmarks.get")
+async def get_procedure_benchmarks(request, code_system: str, code: str):
+    """Return national and state pricing benchmarks for a procedure or service code."""
+    session = _get_session(request)
+    args = request.args
+    year = _parse_int(args.get("year"), "year", minimum=2013)
+    state = str(args.get("state", "")).strip().upper()
+    city = str(args.get("city", "")).strip().lower()
+    include_legacy_fields = _parse_bool(
+        args.get("include_legacy_fields"), "include_legacy_fields", default=False
+    )
+    year, year_source = await _resolve_year(session, provider_procedure_table, year)
+    internal_codes, code_context = await _resolve_internal_codes_for_request(
+        session, code, args, default_system=code_system,
+    )
+    filters = [
+        provider_procedure_table.c.procedure_code.in_(internal_codes),
+        provider_procedure_table.c.year == year,
+        provider_table.c.npi == provider_procedure_table.c.npi,
+        provider_table.c.year == provider_procedure_table.c.year,
+    ]
+    if state:
+        filters.append(func.upper(provider_table.c.state) == state)
+    if city:
+        filters.append(func.lower(provider_table.c.city).like(f"%{city}%"))
+    aggregate, thresholds = await _procedure_benchmark_values(
+        session, and_(*filters)
+    )
+    benchmark_payload_map = _procedure_benchmark_payload(
+        aggregate, thresholds, include_legacy_fields
+    )
     return response.json(
         {
             "query": {
@@ -10535,32 +10599,99 @@ async def get_procedure_benchmarks(request, code_system: str, code: str):
     )
 
 
+def _procedure_geo_benchmark_payload(
+    benchmark_row: dict[str, Any], scope: str, geography_value: str | None
+) -> dict[str, Any] | None:
+    if int(benchmark_row.get("rows") or 0) <= 0:
+        return None
+    return {
+        "geography_scope": scope,
+        "geography_value": geography_value or ("US" if scope == "national" else None),
+        "total_services": _as_float(benchmark_row.get("total_services")),
+        "avg_submitted_charge": _as_float(benchmark_row.get("avg_submitted_charge")),
+        "avg_payment_amount": _as_float(benchmark_row.get("avg_payment_amount")),
+        "avg_standardized_amount": _as_float(benchmark_row.get("avg_standardized_amount")),
+    }
+
+
+async def _procedure_geo_scope_benchmark(
+    session,
+    *,
+    year: int,
+    internal_codes: list[str],
+    scope: str,
+    geography_value: str | None,
+) -> dict[str, Any] | None:
+    filters = [
+        procedure_geo_benchmark_table.c.year == year,
+        procedure_geo_benchmark_table.c.procedure_code.in_(internal_codes),
+        procedure_geo_benchmark_table.c.geography_scope == scope,
+    ]
+    if geography_value is not None:
+        filters.append(
+            procedure_geo_benchmark_table.c.geography_value == geography_value
+        )
+    total_services_expr = func.sum(procedure_geo_benchmark_table.c.total_services)
+
+    def _weighted_average(column):
+        return (
+            func.sum(column * procedure_geo_benchmark_table.c.total_services)
+            / func.nullif(total_services_expr, 0)
+        )
+    query = (
+        select(
+            func.count().label("rows"),
+            total_services_expr.label("total_services"),
+            _weighted_average(
+                procedure_geo_benchmark_table.c.avg_submitted_charge
+            ).label("avg_submitted_charge"),
+            _weighted_average(
+                procedure_geo_benchmark_table.c.avg_payment_amount
+            ).label("avg_payment_amount"),
+            _weighted_average(
+                procedure_geo_benchmark_table.c.avg_standardized_amount
+            ).label("avg_standardized_amount"),
+        )
+        .select_from(procedure_geo_benchmark_table)
+        .where(and_(*filters))
+    )
+    benchmark_query_result = await session.execute(query)
+    benchmark_row = _row_to_dict(benchmark_query_result.first() or {})
+    return _procedure_geo_benchmark_payload(benchmark_row, scope, geography_value)
+
+
+def _unavailable_procedure_geo_benchmarks(
+    year: int | None, state: str, code_system: str, code: str
+):
+    return response.json(
+        {
+            "query": {
+                "year": year,
+                "year_used": year,
+                "year_source": "request" if year is not None else "env",
+                "state": state or None,
+                "data_status": "unavailable",
+                "input_code": {
+                    "code_system": _normalize_code_system(code_system),
+                    "code": _normalize_code(code),
+                },
+                "resolved_codes": [],
+                "matched_via": [],
+            },
+            "benchmarks": {"national": None, "state": None},
+        }
+    )
+
+
 @blueprint.get("/procedures/<code_system>/<code>/geo-benchmarks", name="pricing.procedures.geo_benchmarks.get")
 async def get_procedure_geo_benchmarks(request, code_system: str, code: str):
     """Return geographic pricing benchmarks for a procedure or service code."""
     session = _get_session(request)
     args = request.args
-
     year = _parse_int(args.get("year"), "year", minimum=2013)
     state = str(args.get("state", "")).strip().upper()
-
     if not await _is_table_available(session, procedure_geo_benchmark_table.name):
-        return response.json(
-            {
-                "query": {
-                    "year": year,
-                    "year_used": year,
-                    "year_source": "request" if year is not None else "env",
-                    "state": state or None,
-                    "data_status": "unavailable",
-                    "input_code": {"code_system": _normalize_code_system(code_system), "code": _normalize_code(code)},
-                    "resolved_codes": [],
-                    "matched_via": [],
-                },
-                "benchmarks": {"national": None, "state": None},
-            }
-        )
-
+        return _unavailable_procedure_geo_benchmarks(year, state, code_system, code)
     year, year_source = await _resolve_year(session, procedure_geo_benchmark_table, year)
     internal_codes, code_context = await _resolve_internal_codes_for_request(
         session,
@@ -10568,68 +10699,22 @@ async def get_procedure_geo_benchmarks(request, code_system: str, code: str):
         args,
         default_system=code_system,
     )
-
-    async def _fetch_scope(
-        scope: str,
-        geography_value: str | None,
-    ) -> dict[str, Any] | None:
-        filters = [
-            procedure_geo_benchmark_table.c.year == year,
-            procedure_geo_benchmark_table.c.procedure_code.in_(internal_codes),
-            procedure_geo_benchmark_table.c.geography_scope == scope,
-        ]
-        if geography_value is not None:
-            filters.append(
-                procedure_geo_benchmark_table.c.geography_value == geography_value
-            )
-
-        total_services_expr = func.sum(procedure_geo_benchmark_table.c.total_services)
-        query = (
-            select(
-                func.count().label("rows"),
-                total_services_expr.label("total_services"),
-                (
-                    func.sum(
-                        procedure_geo_benchmark_table.c.avg_submitted_charge
-                        * procedure_geo_benchmark_table.c.total_services
-                    ) / func.nullif(total_services_expr, 0)
-                ).label("avg_submitted_charge"),
-                (
-                    func.sum(
-                        procedure_geo_benchmark_table.c.avg_payment_amount
-                        * procedure_geo_benchmark_table.c.total_services
-                    ) / func.nullif(total_services_expr, 0)
-                ).label("avg_payment_amount"),
-                (
-                    func.sum(
-                        procedure_geo_benchmark_table.c.avg_standardized_amount
-                        * procedure_geo_benchmark_table.c.total_services
-                    ) / func.nullif(total_services_expr, 0)
-                ).label("avg_standardized_amount"),
-            )
-            .select_from(procedure_geo_benchmark_table)
-            .where(and_(*filters))
+    benchmark_args_by_name = {"year": year, "internal_codes": internal_codes}
+    national = await _procedure_geo_scope_benchmark(
+        session,
+        scope="national",
+        geography_value="US",
+        **benchmark_args_by_name,
+    )
+    state_benchmark = (
+        await _procedure_geo_scope_benchmark(
+            session,
+            scope="state",
+            geography_value=state,
+            **benchmark_args_by_name,
         )
-        benchmark_query_result = await session.execute(query)
-        benchmark_row = _row_to_dict(benchmark_query_result.first() or {})
-        if int(benchmark_row.get("rows") or 0) <= 0:
-            return None
-        return {
-            "geography_scope": scope,
-            "geography_value": geography_value
-            or ("US" if scope == "national" else None),
-            "total_services": _as_float(benchmark_row.get("total_services")),
-            "avg_submitted_charge": _as_float(
-                benchmark_row.get("avg_submitted_charge")
-            ),
-            "avg_payment_amount": _as_float(benchmark_row.get("avg_payment_amount")),
-            "avg_standardized_amount": _as_float(
-                benchmark_row.get("avg_standardized_amount")
-            ),
-        }
-
-    national = await _fetch_scope("national", "US")
-    state_benchmark = await _fetch_scope("state", state) if state else None
+        if state else None
+    )
 
     return response.json(
         {
@@ -13691,68 +13776,7 @@ async def list_prescription_providers(request, rx_code_system: str, rx_code: str
     )
 
 
-@blueprint.get(
-    "/prescriptions/<rx_code_system>/<rx_code>/benchmarks",
-    name="pricing.prescriptions.benchmarks.get",
-)
-async def get_prescription_benchmarks(request, rx_code_system: str, rx_code: str):
-    """Return aggregate prescription benchmarks for a code and optional geography."""
-    session = _get_session(request)
-    args = request.args
-
-    year = _parse_int(args.get("year"), "year", minimum=2013)
-    state = str(args.get("state", "")).strip().upper()
-    city = str(args.get("city", "")).strip().lower()
-
-    if not await _is_table_available(session, provider_prescription_table.name):
-        return response.json(
-            {
-                "query": {
-                    "year": year,
-                    "year_used": year,
-                    "year_source": "request" if year is not None else "env",
-                    "state": state or None,
-                    "city": city or None,
-                    "data_status": "unavailable",
-                    "input_code": {
-                        "code_system": _normalize_code_system(rx_code_system),
-                        "code": str(rx_code).strip().upper(),
-                    },
-                    "resolved_codes": [],
-                    "matched_via": [],
-                },
-                "benchmark": {
-                    "matched_rows": 0,
-                    "provider_count": 0,
-                    "total_prescriptions": 0.0,
-                    "total_allowed_amount": 0.0,
-                    "avg_total_allowed_amount": 0.0,
-                    "min_total_allowed_amount": 0.0,
-                    "max_total_allowed_amount": 0.0,
-                    "estimated_cost_level_thresholds": {},
-                },
-            }
-        )
-
-    year, year_source = await _resolve_year(session, provider_prescription_table, year)
-    internal_rx_codes, code_context = await _resolve_internal_rx_codes_for_request(
-        session,
-        rx_code,
-        dict({"rx_code_system": rx_code_system}, **dict(args)),
-        default_system=rx_code_system,
-    )
-
-    filters = [
-        provider_prescription_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
-        provider_prescription_table.c.rx_code.in_(internal_rx_codes),
-        provider_prescription_table.c.year == year,
-    ]
-    if state:
-        filters.append(func.upper(provider_prescription_table.c.state) == state)
-    if city:
-        filters.append(func.lower(provider_prescription_table.c.city).like(f"%{city}%"))
-    where_clause = and_(*filters)
-
+async def _prescription_benchmark_values(session, where_clause):
     aggregate_query = (
         select(
             func.count().label("matched_rows"),
@@ -13787,7 +13811,99 @@ async def get_prescription_benchmarks(request, rx_code_system: str, rx_code: str
     )
     threshold_result = await session.execute(threshold_query)
     thresholds = _row_to_dict(threshold_result.first() or {})
+    return aggregate, thresholds
 
+
+def _prescription_benchmark_payload(
+    aggregate: dict[str, Any], thresholds: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "matched_rows": int(aggregate.get("matched_rows") or 0),
+        "provider_count": int(aggregate.get("provider_count") or 0),
+        "total_prescriptions": float(aggregate.get("total_claims") or 0.0),
+        "total_allowed_amount": float(aggregate.get("total_drug_cost") or 0.0),
+        "avg_total_allowed_amount": float(aggregate.get("avg_total_drug_cost") or 0.0),
+        "min_total_allowed_amount": float(aggregate.get("min_total_drug_cost") or 0.0),
+        "max_total_allowed_amount": float(aggregate.get("max_total_drug_cost") or 0.0),
+        "estimated_cost_level_thresholds": {
+            "$": {"max_total_allowed_amount": thresholds.get("p20")},
+            "$$": {"max_total_allowed_amount": thresholds.get("p40")},
+            "$$$": {"max_total_allowed_amount": thresholds.get("p60")},
+            "$$$$": {"max_total_allowed_amount": thresholds.get("p80")},
+            "$$$$$": {"min_total_allowed_amount": thresholds.get("p80")},
+        },
+    }
+
+
+def _unavailable_prescription_benchmarks(
+    year: int | None, state: str, city: str, rx_code_system: str, rx_code: str
+):
+    return response.json(
+        {
+            "query": {
+                "year": year,
+                "year_used": year,
+                "year_source": "request" if year is not None else "env",
+                "state": state or None,
+                "city": city or None,
+                "data_status": "unavailable",
+                "input_code": {
+                    "code_system": _normalize_code_system(rx_code_system),
+                    "code": str(rx_code).strip().upper(),
+                },
+                "resolved_codes": [],
+                "matched_via": [],
+            },
+            "benchmark": {
+                "matched_rows": 0,
+                "provider_count": 0,
+                "total_prescriptions": 0.0,
+                "total_allowed_amount": 0.0,
+                "avg_total_allowed_amount": 0.0,
+                "min_total_allowed_amount": 0.0,
+                "max_total_allowed_amount": 0.0,
+                "estimated_cost_level_thresholds": {},
+            },
+        }
+    )
+
+
+@blueprint.get(
+    "/prescriptions/<rx_code_system>/<rx_code>/benchmarks",
+    name="pricing.prescriptions.benchmarks.get",
+)
+async def get_prescription_benchmarks(request, rx_code_system: str, rx_code: str):
+    """Return aggregate prescription benchmarks for a code and optional geography."""
+    session = _get_session(request)
+    args = request.args
+    year = _parse_int(args.get("year"), "year", minimum=2013)
+    state = str(args.get("state", "")).strip().upper()
+    city = str(args.get("city", "")).strip().lower()
+    if not await _is_table_available(session, provider_prescription_table.name):
+        return _unavailable_prescription_benchmarks(
+            year, state, city, rx_code_system, rx_code
+        )
+    year, year_source = await _resolve_year(session, provider_prescription_table, year)
+    internal_rx_codes, code_context = await _resolve_internal_rx_codes_for_request(
+        session,
+        rx_code,
+        dict({"rx_code_system": rx_code_system}, **dict(args)),
+        default_system=rx_code_system,
+    )
+    filters = [
+        provider_prescription_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
+        provider_prescription_table.c.rx_code.in_(internal_rx_codes),
+        provider_prescription_table.c.year == year,
+    ]
+    if state:
+        filters.append(func.upper(provider_prescription_table.c.state) == state)
+    if city:
+        filters.append(
+            func.lower(provider_prescription_table.c.city).like(f"%{city}%")
+        )
+    aggregate, thresholds = await _prescription_benchmark_values(
+        session, and_(*filters)
+    )
     return response.json(
         {
             "query": {
@@ -13800,21 +13916,6 @@ async def get_prescription_benchmarks(request, rx_code_system: str, rx_code: str
                 "resolved_codes": code_context["resolved_codes"],
                 "matched_via": code_context["matched_via"],
             },
-            "benchmark": {
-                "matched_rows": int(aggregate.get("matched_rows") or 0),
-                "provider_count": int(aggregate.get("provider_count") or 0),
-                "total_prescriptions": float(aggregate.get("total_claims") or 0.0),
-                "total_allowed_amount": float(aggregate.get("total_drug_cost") or 0.0),
-                "avg_total_allowed_amount": float(aggregate.get("avg_total_drug_cost") or 0.0),
-                "min_total_allowed_amount": float(aggregate.get("min_total_drug_cost") or 0.0),
-                "max_total_allowed_amount": float(aggregate.get("max_total_drug_cost") or 0.0),
-                "estimated_cost_level_thresholds": {
-                    "$": {"max_total_allowed_amount": thresholds.get("p20")},
-                    "$$": {"max_total_allowed_amount": thresholds.get("p40")},
-                    "$$$": {"max_total_allowed_amount": thresholds.get("p60")},
-                    "$$$$": {"max_total_allowed_amount": thresholds.get("p80")},
-                    "$$$$$": {"min_total_allowed_amount": thresholds.get("p80")},
-                },
-            },
+            "benchmark": _prescription_benchmark_payload(aggregate, thresholds),
         }
     )

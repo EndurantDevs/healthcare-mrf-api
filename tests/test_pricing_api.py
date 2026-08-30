@@ -37,6 +37,7 @@ get_provider_procedure = pricing_module.get_provider_procedure
 get_provider_procedure_estimated_cost_level_internal = (
     pricing_module.get_provider_procedure_cost_level
 )
+get_procedure_benchmarks = pricing_module.get_procedure_benchmarks
 get_procedure_geo_benchmarks = pricing_module.get_procedure_geo_benchmarks
 get_provider_prescription = pricing_module.get_provider_prescription
 get_prescription_benchmarks = pricing_module.get_prescription_benchmarks
@@ -1608,6 +1609,39 @@ async def test_get_pricing_provider_score_success():
 
     response = await get_pricing_provider_score(request, "1003000126")
     _assert_pricing_score_response(json.loads(response.body))
+
+
+@pytest.mark.asyncio
+async def test_quality_peer_targets_preserve_scoped_and_unscoped_fallbacks():
+    peer_target_by_field = {
+        "year": 2023,
+        "benchmark_mode": "national",
+        "geography_scope": None,
+    }
+    session = FakeSession(
+        [
+            FakeResult(rows=[]),
+            FakeResult(rows=[]),
+            FakeResult(rows=[peer_target_by_field]),
+        ]
+    )
+
+    peer_targets = await pricing_module._load_quality_peer_targets(
+        session,
+        year=2023,
+        benchmark_modes=["zip", "state", "national"],
+        state_key="MD",
+        zip5="20814",
+    )
+
+    assert peer_targets == [peer_target_by_field]
+    executed_sql_statements = [
+        str(args[0]) for args, _kwargs in session.executions
+    ]
+    assert len(executed_sql_statements) == 3
+    assert "UNION ALL" in executed_sql_statements[0]
+    assert "geography_scope IS NULL" in executed_sql_statements[1]
+    assert "geography_scope IS NULL" not in executed_sql_statements[2]
 
 
 @pytest.mark.asyncio
@@ -6924,6 +6958,55 @@ async def test_get_provider_procedure_estimated_cost_level_invalid_cohort_strate
         await get_provider_procedure_estimated_cost_level_internal(request, "1003000126", "123")
 
     assert "cohort_strategy" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_get_procedure_benchmarks_success():
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "from_system": "CPT",
+                        "from_code": "70553",
+                        "to_system": "HP_PROCEDURE_CODE",
+                        "to_code": "123",
+                        "match_type": "exact",
+                        "confidence": 1.0,
+                        "source": "test",
+                    }
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {
+                        "matched_rows": 10,
+                        "provider_count": 5,
+                        "total_services": 300.0,
+                        "total_submitted_charges": 4000.0,
+                        "total_allowed_amount": 2500.0,
+                        "avg_total_allowed_amount": 500.0,
+                        "min_total_allowed_amount": 100.0,
+                        "max_total_allowed_amount": 1000.0,
+                    }
+                ]
+            ),
+            FakeResult(
+                rows=[{"p20": 200.0, "p40": 400.0, "p60": 600.0, "p80": 800.0}]
+            ),
+        ],
+        args={"year": "2023", "state": "MD", "include_legacy_fields": "true"},
+    )
+
+    response = await get_procedure_benchmarks(request, "CPT", "70553")
+    pricing_response = json.loads(response.body)
+    assert pricing_response["query"]["input_code"]["code_system"] == "CPT"
+    assert pricing_response["benchmark"]["provider_count"] == 5
+    assert pricing_response["benchmark"]["total_services"] == 300.0
+    assert pricing_response["benchmark"]["total_claims"] == 300.0
+    assert pricing_response["benchmark"]["estimated_cost_level_thresholds"]["$$$$"] == {
+        "max_total_allowed_amount": 800.0
+    }
 
 
 @pytest.mark.asyncio
