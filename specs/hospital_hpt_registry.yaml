@@ -964,6 +964,7 @@ hospitals:
 - hospital_id: hospital-000290
   name: Ascension Saint Thomas Stones River
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
+  fallback_mrf_url: https://healthcare.ascension.org/-/media/project/ascension/healthcare/price-transparency-files/tn-csv/620475842_saint-thomas-stones-river-hospital-llc_standardcharges.csv
 - hospital_id: hospital-000291
   name: Ascension Saint Thomas Three Rivers
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
@@ -8132,6 +8133,7 @@ hospitals:
 - hospital_id: hospital-002491
   name: Guthrie Lourdes Hospital
   cms_hpt_url: https://www.guthrie.org/cms-hpt.txt
+  fallback_mrf_url: https://rca.elevatepfs.com/ptapp/api/cdm/export/oneclick?recno=151e59cbd2694c13781019a3d8b1498b7b19d03390dd0d09f12c47078097ecad
 - hospital_id: hospital-002492
   name: Guthrie Robert Packer Hospital
   cms_hpt_url: https://www.guthrie.org/cms-hpt.txt
@@ -16284,6 +16286,7 @@ hospitals:
 - hospital_id: hospital-004965
   name: PAM Specialty Hospital of Covington
   cms_hpt_url: https://pamhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://sthpiprd.blob.core.windows.net/machine-readable-files/10982/271148063_pam-ii-of-covington-llc_standardcharges.csv
 - hospital_id: hospital-004966
   name: PAM Specialty Hospital of Denver
   cms_hpt_url: https://pamhealth.com/cms-hpt.txt
@@ -16308,6 +16311,7 @@ hospitals:
 - hospital_id: hospital-004973
   name: PAM Specialty Hospital of Texarkana North
   cms_hpt_url: https://pamhealth.com/cms-hpt.txt
+  locator_name: PAM Specialty Hospital of Texarkana
 - hospital_id: hospital-004974
   name: PAM Specialty Hospital of Tulsa
   cms_hpt_url: https://pamhealth.com/cms-hpt.txt
@@ -16320,6 +16324,7 @@ hospitals:
 - hospital_id: hospital-004977
   name: PAM Specialty Hospital of Wilkes-Barre
   cms_hpt_url: https://pamhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://sthpiprd.blob.core.windows.net/machine-readable-files/10972/464942828_post-acute-medical-at-nanticoke-llc_standardcharges.csv
 - hospital_id: hospital-004978
   name: Pampa Regional Medical Center
   cms_hpt_url: https://prmctx.com/cms-hpt.txt
@@ -19537,6 +19542,7 @@ hospitals:
 - hospital_id: hospital-005957
   name: Specialty Hospital of San Antonio
   cms_hpt_url: https://pamhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://sthpiprd.blob.core.windows.net/machine-readable-files/10755/455496771_warm-springs-specialty-hospital-of-san-antonio-llc_standardcharges.csv
 - hospital_id: hospital-005958
   name: Specialty Hospital of San Antonio Medical Center South
   cms_hpt_url: https://pamhealth.com/cms-hpt.txt
@@ -19854,6 +19860,7 @@ hospitals:
 - hospital_id: hospital-006053
   name: St Luke's Hospital Allentown Campus
   cms_hpt_url: https://www.slhn.org/cms-hpt.txt
+  fallback_mrf_url: https://www.slhn.org/-/media/sluhn/billing/pdf/standard-charges/23-1352213_stlukeshospitalallentowncampus_standardcharges.ashx
 - hospital_id: hospital-006054
   name: St Luke's Magic Valley Regional Medical Center, LTD
   cms_hpt_url: https://stlukesonline.org/cms-hpt.txt
@@ -23967,6 +23974,7 @@ hospitals:
 - hospital_id: hospital-007318
   name: "Freedom Behavioral Hospital Of Plainview"
   cms_hpt_url: https://freedombehavioral.com/cms-hpt.txt
+  fallback_mrf_url: https://freedombehavioral.com/wp-content/uploads/2026/07/201871394_allegiance-behavioral-health-center-of-plainview_standardchargesupdated.csv
 - hospital_id: hospital-007319
   name: "Ascension Calumet Hospital, Inc."
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
@@ -24033,6 +24041,7 @@ hospitals:
 - hospital_id: hospital-007340
   name: "North Mississippi Medical Center, Inc."
   cms_hpt_url: https://www.nmhs.net/cms-hpt.txt
+  fallback_mrf_url: https://apps.nmhs.net/files/pt_mrf/640662976_north-mississippi-medical-center_standardcharges.json
 - hospital_id: hospital-007341
   name: "The Hospital of the University of Pennsylvania"
   cms_hpt_url: https://www.pennmedicine.org/cms-hpt.txt
