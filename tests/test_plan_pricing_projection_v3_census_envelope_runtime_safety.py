@@ -1,6 +1,5 @@
 """Runtime-boundary checks for the plan-pricing census envelope."""
 
-import time
 from pathlib import Path
 
 import pytest
@@ -321,14 +320,13 @@ def test_arc_workload_must_naturally_drain(
 ) -> None:
     """Each ephemeral runner and workflow namespace must delay admission."""
 
-    started = time.monotonic()
     result, state_root = envelope._run_envelope(
         tmp_path,
         FAKE_ARC_DRAIN=arc_kind,
     )
 
     assert result.returncode == 0
-    assert time.monotonic() - started < 20
+    assert (tmp_path / "fake-state/arc-call-count").read_text() == "6"
     events = (tmp_path / "fake-state/events").read_text().splitlines()
     assert f"arc_active_{arc_kind}" in events
     assert events.index(f"arc_active_{arc_kind}") < events.index("child")
