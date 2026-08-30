@@ -84,8 +84,8 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(registry.hospital_hpt_registry_groups()) == 7_112
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
-    assert sum("locator_name" in entry for entry in hospitals) == 1_259
-    assert sum("locator_mrf_url" in entry for entry in hospitals) == 636
+    assert sum("locator_name" in entry for entry in hospitals) == 1_410
+    assert sum("locator_mrf_url" in entry for entry in hospitals) == 644
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 31
     assert {entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry} == set(
         _FALLBACK_URL_SHA256_BY_HOSPITAL_ID
@@ -218,6 +218,7 @@ def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypat
     )
     monkeypatch.setattr(registry, "load_hospital_hpt_registry", lambda: hospitals)
 
+    assert hospitals[1]["locator_name"] == "Example Hospital"
     assert registry.hospital_hpt_registry_groups() == (hospitals,)
     assert registry.selected_hospital_hpt_registry(
         {"hospital_id": "hospital-000001"}
@@ -225,6 +226,42 @@ def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypat
     assert registry.selected_hospital_hpt_registry(
         {"hospital_id": "hospital-000002"}
     ) == hospitals
+
+
+def test_reviewed_aliases_inherit_canonical_locator_identity(tmp_path):
+    locator = "https://hospital.example/cms-hpt.txt"
+    hospitals = _load(
+        tmp_path,
+        _document(locator).replace(
+            "    cms_hpt_url:",
+            "    locator_name: Exact Canonical Name\n"
+            "    locator_mrf_url: https://files.example/current.csv\n"
+            "    cms_hpt_url:",
+        )
+        + f"""\
+  - hospital_id: hospital-000002
+    name: Legal Entity Alias
+    cms_hpt_url: {locator}
+    alias_of: hospital-000001
+  - hospital_id: hospital-000003
+    name: Named Alias
+    locator_name: Exact Alias Name
+    cms_hpt_url: {locator}
+    alias_of: hospital-000001
+  - hospital_id: hospital-000004
+    name: Selected Alias
+    locator_mrf_url: https://files.example/alias.csv
+    cms_hpt_url: {locator}
+    alias_of: hospital-000001
+""",
+    )
+
+    assert hospitals[1]["locator_name"] == "Exact Canonical Name"
+    assert hospitals[1]["locator_mrf_url"].endswith("current.csv")
+    assert hospitals[2]["locator_name"] == "Exact Alias Name"
+    assert hospitals[2]["locator_mrf_url"].endswith("current.csv")
+    assert hospitals[3]["locator_name"] == "Exact Canonical Name"
+    assert hospitals[3]["locator_mrf_url"].endswith("alias.csv")
 
 
 @pytest.mark.parametrize(

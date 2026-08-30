@@ -131,6 +131,13 @@ def _validate_hospital_aliases(hospitals: list[dict[str, str]]) -> None:
             or canonical["cms_hpt_url"] != hospital["cms_hpt_url"]
         ):
             raise _registry_error("alias_of_invalid")
+        hospital.setdefault(
+            "locator_name", canonical.get("locator_name") or canonical["name"]
+        )
+        if "locator_mrf_url" in canonical:
+            hospital.setdefault(
+                "locator_mrf_url", canonical["locator_mrf_url"]
+            )
 
 
 def _validated_hospital_entry(
