@@ -1495,32 +1495,7 @@ async def fetch_snapshot_source_set_identity(
         raise
 
 
-async def fetch_snapshot_source_provenance(
-    session: Any,
-    *,
-    schema_name: str,
-    logical_snapshot_id: str,
-    source_keys: Iterable[int],
-    expected_source_count: int,
-) -> dict[int, dict[str, Any]]:
-    """Load exact source identities and traces for selected dense source keys."""
-
-    source_count = int(expected_source_count)
-    dense_source_key_bits(source_count)
-    requested_keys = tuple(sorted({int(source_key) for source_key in source_keys}))
-    if not requested_keys:
-        return {}
-    if requested_keys[0] < 0 or requested_keys[-1] >= source_count:
-        raise PTG2SharedBlockError(
-            "shared PTG response contains a source key outside the manifest dictionary"
-        )
-    snapshot_id = str(logical_snapshot_id or "").strip()
-    if not snapshot_id:
-        raise PTG2SharedBlockError("shared PTG logical snapshot id is missing")
-    schema = _quote_ident(schema_name)
-    query_result = await session.execute(
-        text(
-            f"""
+_SNAPSHOT_SOURCE_PROVENANCE_SQL = """
             WITH source_summary AS MATERIALIZED (
                 SELECT COUNT(*)::bigint AS source_count,
                        COUNT(DISTINCT source_key)::bigint AS distinct_source_count,
@@ -1576,7 +1551,120 @@ async def fetch_snapshot_source_provenance(
                       summary.maximum_source_key, trace_set.source_trace_hashes
              ORDER BY source.source_key
             """
-        ),
+
+
+def _validate_source_provenance_summary(
+    provenance_row: Mapping[str, Any],
+    source_count: int,
+) -> None:
+    minimum_source_key = provenance_row.get("minimum_source_key")
+    maximum_source_key = provenance_row.get("maximum_source_key")
+    if (
+        int(provenance_row.get("source_count") or 0) != source_count
+        or int(provenance_row.get("distinct_source_count") or 0) != source_count
+        or minimum_source_key is None
+        or int(minimum_source_key) != 0
+        or maximum_source_key is None
+        or int(maximum_source_key) != source_count - 1
+    ):
+        raise PTG2SharedBlockError(
+            "shared PTG source metadata is not complete and dense"
+        )
+
+
+def _source_provenance_traces(
+    provenance_row: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    source_traces = provenance_row.get("source_trace")
+    if isinstance(source_traces, str):
+        try:
+            source_traces = json.loads(source_traces)
+        except json.JSONDecodeError as exc:
+            raise PTG2SharedBlockError(
+                "shared PTG source trace payload is malformed"
+            ) from exc
+    if not isinstance(source_traces, list) or not all(
+        isinstance(trace, Mapping) for trace in source_traces
+    ):
+        raise PTG2SharedBlockError(
+            "shared PTG source trace payload is malformed"
+        )
+    return source_traces
+
+
+def _source_provenance_payload(
+    provenance_row: Mapping[str, Any],
+    *,
+    source_count: int,
+    existing_provenance_by_key: Mapping[int, Any],
+) -> tuple[int, dict[str, Any]]:
+    _validate_source_provenance_summary(provenance_row, source_count)
+    source_key = int(provenance_row.get("source_key"))
+    identity_sha256 = str(provenance_row.get("identity_sha256") or "")
+    raw_sha256 = str(provenance_row.get("raw_container_sha256") or "")
+    logical_sha256_value = provenance_row.get("logical_json_sha256")
+    logical_sha256 = (
+        str(logical_sha256_value) if logical_sha256_value is not None else None
+    )
+    trace_set_hash = str(provenance_row.get("source_trace_set_hash") or "")
+    deferred = bool(provenance_row.get("logical_hash_deferred"))
+    if (
+        not str(provenance_row.get("source_type") or "").strip()
+        or not str(provenance_row.get("identity_kind") or "").strip()
+        or not _SHA256_RE.fullmatch(identity_sha256)
+        or not _SHA256_RE.fullmatch(raw_sha256)
+        or not _SHA256_RE.fullmatch(trace_set_hash)
+        or (deferred and logical_sha256 is not None)
+        or (not deferred and not _SHA256_RE.fullmatch(logical_sha256 or ""))
+        or int(provenance_row.get("resolved_trace_count") or 0)
+        != int(provenance_row.get("trace_hash_count") or 0)
+    ):
+        raise PTG2SharedBlockError(
+            "shared PTG source identity or trace mapping is invalid"
+        )
+    source_traces = _source_provenance_traces(provenance_row)
+    if source_key in existing_provenance_by_key:
+        raise PTG2SharedBlockError(
+            "shared PTG source metadata contains a duplicate source key"
+        )
+    return source_key, {
+        "source_key": source_key,
+        "source_type": str(provenance_row["source_type"]),
+        "identity_kind": str(provenance_row["identity_kind"]),
+        "identity_sha256": identity_sha256,
+        "raw_container_sha256": raw_sha256,
+        "logical_json_sha256": logical_sha256,
+        "logical_hash_deferred": deferred,
+        "source_trace_set_hash": trace_set_hash,
+        "source_trace": [dict(trace) for trace in source_traces],
+    }
+
+
+async def fetch_snapshot_source_provenance(
+    session: Any,
+    *,
+    schema_name: str,
+    logical_snapshot_id: str,
+    source_keys: Iterable[int],
+    expected_source_count: int,
+) -> dict[int, dict[str, Any]]:
+    """Load exact source identities and traces for selected dense source keys."""
+
+    source_count = int(expected_source_count)
+    dense_source_key_bits(source_count)
+    requested_keys = tuple(sorted({int(source_key) for source_key in source_keys}))
+    if not requested_keys:
+        return {}
+    if requested_keys[0] < 0 or requested_keys[-1] >= source_count:
+        raise PTG2SharedBlockError(
+            "shared PTG response contains a source key outside the manifest dictionary"
+        )
+    snapshot_id = str(logical_snapshot_id or "").strip()
+    if not snapshot_id:
+        raise PTG2SharedBlockError("shared PTG logical snapshot id is missing")
+    schema = _quote_ident(schema_name)
+    query_result = await session.execute(
+        text(_SNAPSHOT_SOURCE_PROVENANCE_SQL.format(schema=schema)),
         {
             "snapshot_id": snapshot_id,
             "source_keys": requested_keys,
@@ -1585,69 +1673,12 @@ async def fetch_snapshot_source_provenance(
     provenance_by_key: dict[int, dict[str, Any]] = {}
     for raw_row in query_result:
         provenance_row = _row_mapping(raw_row)
-        minimum_source_key = provenance_row.get("minimum_source_key")
-        maximum_source_key = provenance_row.get("maximum_source_key")
-        if (
-            int(provenance_row.get("source_count") or 0) != source_count
-            or int(provenance_row.get("distinct_source_count") or 0) != source_count
-            or minimum_source_key is None
-            or int(minimum_source_key) != 0
-            or maximum_source_key is None
-            or int(maximum_source_key) != source_count - 1
-        ):
-            raise PTG2SharedBlockError(
-                "shared PTG source metadata is not complete and dense"
-            )
-        source_key = int(provenance_row.get("source_key"))
-        identity_sha256 = str(provenance_row.get("identity_sha256") or "")
-        raw_sha256 = str(provenance_row.get("raw_container_sha256") or "")
-        logical_sha256 = provenance_row.get("logical_json_sha256")
-        logical_sha256 = str(logical_sha256) if logical_sha256 is not None else None
-        trace_set_hash = str(provenance_row.get("source_trace_set_hash") or "")
-        deferred = bool(provenance_row.get("logical_hash_deferred"))
-        if (
-            not str(provenance_row.get("source_type") or "").strip()
-            or not str(provenance_row.get("identity_kind") or "").strip()
-            or not _SHA256_RE.fullmatch(identity_sha256)
-            or not _SHA256_RE.fullmatch(raw_sha256)
-            or not _SHA256_RE.fullmatch(trace_set_hash)
-            or (deferred and logical_sha256 is not None)
-            or (not deferred and not _SHA256_RE.fullmatch(logical_sha256 or ""))
-            or int(provenance_row.get("resolved_trace_count") or 0)
-            != int(provenance_row.get("trace_hash_count") or 0)
-        ):
-            raise PTG2SharedBlockError(
-                "shared PTG source identity or trace mapping is invalid"
-            )
-        source_trace = provenance_row.get("source_trace")
-        if isinstance(source_trace, str):
-            try:
-                source_trace = json.loads(source_trace)
-            except json.JSONDecodeError as exc:
-                raise PTG2SharedBlockError(
-                    "shared PTG source trace payload is malformed"
-                ) from exc
-        if not isinstance(source_trace, list) or not all(
-            isinstance(trace, Mapping) for trace in source_trace
-        ):
-            raise PTG2SharedBlockError(
-                "shared PTG source trace payload is malformed"
-            )
-        if source_key in provenance_by_key:
-            raise PTG2SharedBlockError(
-                "shared PTG source metadata contains a duplicate source key"
-            )
-        provenance_by_key[source_key] = {
-            "source_key": source_key,
-            "source_type": str(provenance_row["source_type"]),
-            "identity_kind": str(provenance_row["identity_kind"]),
-            "identity_sha256": identity_sha256,
-            "raw_container_sha256": raw_sha256,
-            "logical_json_sha256": logical_sha256,
-            "logical_hash_deferred": deferred,
-            "source_trace_set_hash": trace_set_hash,
-            "source_trace": [dict(trace) for trace in source_trace],
-        }
+        source_key, provenance_payload = _source_provenance_payload(
+            provenance_row,
+            source_count=source_count,
+            existing_provenance_by_key=provenance_by_key,
+        )
+        provenance_by_key[source_key] = provenance_payload
     if set(provenance_by_key) != set(requested_keys):
         raise PTG2SharedBlockError(
             "shared PTG source mapping is missing a selected source key"

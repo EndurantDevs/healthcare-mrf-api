@@ -300,6 +300,43 @@ async def test_strict_geo_ascending_completes_tie_and_stops_at_boundary(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_exhausted_geo_prefix_reuses_memberships_at_graph_cap(monkeypatch):
+    """Complete an exhausted exact prefix without another graph traversal."""
+
+    rate_row = _rate_row(_PROVIDER_SET_ID, 1, 1)
+    _install_rate_scan(
+        monkeypatch,
+        [rate_row],
+        {_PROVIDER_SET_ID: (_MATCHING_NPI,)},
+        {_MATCHING_NPI: 1.0},
+    )
+    reverse_memberships = AsyncMock()
+    completion_rows = AsyncMock()
+    monkeypatch.setattr(
+        serving, "_v4_direct_npi_memberships", reverse_memberships
+    )
+    monkeypatch.setattr(
+        serving, "_v4_pattern_completion_rows", completion_rows
+    )
+    _install_provider_enrichment(monkeypatch)
+
+    selection = await _select_geo(
+        _geo_tables(max_online_provider_expansion_graph_batches=1),
+        rate_count=1,
+        target_count=1,
+        descending=False,
+    )
+
+    assert selection is not None
+    assert selection.exhausted is True
+    assert list(selection.rank_by_key) == [
+        ("npi", str(_MATCHING_NPI), "CPT", "99213", "FFS", "0")
+    ]
+    reverse_memberships.assert_not_awaited()
+    completion_rows.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_strict_geo_descending_scans_to_source_exhaustion(monkeypatch):
     """Descending provider minima remain exact by scanning every price page."""
 

@@ -13634,6 +13634,36 @@ async def _geo_provider_expansion_completion(
 ) -> tuple[list[dict[str, Any]], dict[int, tuple[str, ...]]]:
     """Complete selected NPIs through the bounded filtered-reverse path."""
 
+    if (
+        request.is_source_exhausted
+        and request.serving_rows
+        and all(
+            (provider_set_id := _ptg2_manifest_id(
+                serving_row.get("provider_set_global_id_128")
+            ))
+            and provider_set_id in request.filtered_npis_by_set
+            for serving_row in request.serving_rows
+        )
+    ):
+        provider_set_ids_by_npi = {
+            npi: tuple(
+                provider_set_id
+                for provider_set_id, provider_npis in (
+                    request.filtered_npis_by_set.items()
+                )
+                if npi in provider_npis
+            )
+            for npi in request.selected_npis
+        }
+        if any(
+            not provider_set_ids_by_npi[npi]
+            for npi in request.selected_npis
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 exhausted geo completion lost a selected membership"
+            )
+        return list(request.serving_rows), provider_set_ids_by_npi
+
     keys_by_npi, completion_keys = await _geo_completion_provider_set_keys(
         session, serving_tables, request
     )
@@ -17020,6 +17050,44 @@ class _V4PatternTaxonomyRequest(_ProviderExpansionRequest):
 
 
 @dataclass(frozen=True)
+class _V4PatternContext:
+    """Sealed coordinates and caps for one pattern-quotient selection."""
+
+    request: _V4PatternTaxonomyRequest
+    normalized_target_count: int
+    maximum_occurrences: int
+    declared_occurrences: int
+    scan_budget: ForwardReadBudget
+    pattern_keys: tuple[int, ...]
+    snapshot_key: int
+
+
+@dataclass
+class _V4PatternPrefixState:
+    """Mutable state for the bounded pattern rate-prefix loop."""
+
+    rate_window: int
+    serving_rows: list[dict[str, Any]] = field(default_factory=list)
+    pattern_keys_by_set: dict[int, tuple[int, ...]] = field(default_factory=dict)
+    selected_occurrences: tuple[tuple[int, int], ...] = ()
+    is_candidate_prefix_exhausted: bool = False
+    is_source_exhausted: bool = False
+
+
+@dataclass(frozen=True)
+class _V4PatternPrefix:
+    """Authenticated pattern prefix and its selected completion scope."""
+
+    serving_rows: list[dict[str, Any]]
+    selected_occurrences: tuple[tuple[int, int], ...]
+    selected_npi_keys: tuple[int, ...]
+    completion_provider_set_keys: tuple[int, ...]
+    completion_pattern_keys_by_set: dict[int, tuple[int, ...]]
+    is_candidate_prefix_exhausted: bool
+    is_source_exhausted: bool
+
+
+@dataclass(frozen=True)
 class _V4TaxonomyRequest(_ProviderExpansionRequest):
     """Inputs for an exact inferred-taxonomy expansion."""
 
@@ -17144,280 +17212,272 @@ async def _v4_pattern_completion_rows(
     return completion_rows, provider_set_id_by_key
 
 
-async def _select_v4_pattern_taxonomy_expansion(
-    session,
+def _v4_pattern_context(
     serving_tables: PTG2ServingTables,
-    **request_options: Any,
-) -> _ProviderExpansionSelection:
-    """Serve one exact pattern quotient with bounded, target-first work."""
+    request: _V4PatternTaxonomyRequest,
+) -> _V4PatternContext | None:
+    """Validate one request and bind its immutable online-work limits."""
 
-    request = _V4PatternTaxonomyRequest(**request_options)
-    (
-        code_rows,
-        args,
-        snapshot_id,
-        source_trace_set_hash,
-        network_names,
-        target_count,
-        descending,
-        projection_rule,
-        candidates,
-    ) = (
-        request.code_rows,
-        request.args,
-        request.snapshot_id,
-        request.source_trace_set_hash,
-        request.network_names,
-        request.target_count,
-        request.descending,
-        request.projection_rule,
-        request.candidates,
-    )
-    normalized_target_count = max(int(target_count), 1)
+    normalized_target_count = max(int(request.target_count), 1)
     _v4_provider_expansion_request_caps(
         serving_tables,
         target_count=normalized_target_count,
     )
     maximum_occurrences = int(
-        projection_rule.max_online_filtered_reverse_code_occurrences
+        request.projection_rule.max_online_filtered_reverse_code_occurrences
     )
     if maximum_occurrences <= 0:
         raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
     declared_occurrences = sum(
         max(int(code_row.get("rate_count") or 0), 0)
-        for code_row in code_rows
+        for code_row in request.code_rows
     )
     if declared_occurrences == 0:
-        return _ProviderExpansionSelection([], {}, {}, True)
-    scan_budget = ForwardReadBudget(
-        maximum_fragments=int(
-            projection_rule.max_online_inferred_taxonomy_graph_pages
+        return None
+    return _V4PatternContext(
+        request=request,
+        normalized_target_count=normalized_target_count,
+        maximum_occurrences=maximum_occurrences,
+        declared_occurrences=declared_occurrences,
+        scan_budget=ForwardReadBudget(
+            maximum_fragments=int(
+                request.projection_rule.max_online_inferred_taxonomy_graph_pages
+            ),
+            maximum_raw_payload_bytes=int(
+                request.projection_rule.max_online_inferred_taxonomy_graph_bytes
+            ),
+            maximum_row_capacity=maximum_occurrences + 1,
         ),
-        maximum_raw_payload_bytes=int(
-            projection_rule.max_online_inferred_taxonomy_graph_bytes
+        pattern_keys=tuple(
+            sorted(request.candidates.npi_keys_by_pattern)
         ),
-        maximum_row_capacity=maximum_occurrences + 1,
+        snapshot_key=_required_shared_snapshot_key(serving_tables),
     )
-    rate_window = min(
-        maximum_occurrences,
-        PTG2_SERVING_BINARY_V3_PAGE_ROWS,
-        declared_occurrences,
+
+
+async def _v4_pattern_update_candidates(
+    session,
+    context: _V4PatternContext,
+    serving_rows: list[dict[str, Any]],
+    pattern_keys_by_set: dict[int, tuple[int, ...]],
+) -> None:
+    """Load and validate candidate patterns for newly reached rate sets."""
+
+    provider_set_keys = tuple(
+        sorted(_v4_rate_scope_set_ids(serving_rows, None))
     )
-    pattern_keys = tuple(sorted(candidates.npi_keys_by_pattern))
-    snapshot_key = _required_shared_snapshot_key(serving_tables)
-    serving_rows: list[dict[str, Any]] = []
-    provider_set_id_by_key: dict[int, str] = {}
-    pattern_keys_by_set: dict[int, tuple[int, ...]] = {}
-    selected_occurrences: tuple[tuple[int, int], ...] = ()
-    selected_npi_keys: tuple[int, ...] = ()
+    if len(provider_set_keys) > int(
+        context.request.projection_rule.max_online_filtered_reverse_code_sets
+    ):
+        raise PTG2OnlineWorkBudgetExceeded("code_sets")
+    new_provider_set_keys = tuple(
+        provider_set_key
+        for provider_set_key in provider_set_keys
+        if provider_set_key not in pattern_keys_by_set
+    )
+    if not new_provider_set_keys:
+        return
+    new_pattern_keys_by_set = await lookup_v4_relation_intersections(
+        session,
+        snapshot_key=context.snapshot_key,
+        relation="set_patterns",
+        owner_keys=new_provider_set_keys,
+        allowed_member_keys=context.pattern_keys,
+        schema_name=PTG2_SCHEMA,
+        max_members=None,
+    )
+    if set(new_pattern_keys_by_set) != set(new_provider_set_keys) or any(
+        not set(set_pattern_keys).issubset(context.pattern_keys)
+        for set_pattern_keys in new_pattern_keys_by_set.values()
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy set-pattern projection is incomplete"
+        )
+    pattern_keys_by_set.update(new_pattern_keys_by_set)
+
+
+async def _v4_pattern_read_window(
+    session,
+    serving_tables: PTG2ServingTables,
+    context: _V4PatternContext,
+    state: _V4PatternPrefixState,
+) -> None:
+    """Read, authenticate, and rank one bounded pattern rate window."""
+
+    request = context.request
+    serving_rows = await _merge_manifest_code_variant_rows(
+        session,
+        serving_tables,
+        code_rows=request.code_rows,
+        provider_set_keys=None,
+        source_trace_set_hash=request.source_trace_set_hash,
+        network_names=request.network_names,
+        limit=state.rate_window,
+        offset=0,
+        descending=request.descending,
+        scan_budget=context.scan_budget,
+    )
+    if serving_rows is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 filtered reverse rate rows are unavailable"
+        )
+    state.serving_rows = serving_rows
+    await _v4_pattern_update_candidates(
+        session,
+        context,
+        serving_rows,
+        state.pattern_keys_by_set,
+    )
+    (
+        state.selected_occurrences,
+        state.is_candidate_prefix_exhausted,
+    ) = _v4_pattern_candidate_prefix(
+        serving_rows,
+        state.pattern_keys_by_set,
+        request.candidates.npi_keys_by_pattern,
+        target_count=context.normalized_target_count,
+    )
+    state.is_source_exhausted = _is_v4_rate_prefix_exhausted(
+        request.code_rows,
+        serving_rows,
+        rate_window=state.rate_window,
+    )
+
+
+def _should_advance_v4_pattern_window(
+    context: _V4PatternContext,
+    state: _V4PatternPrefixState,
+) -> bool:
+    """Return completion or grow the next bounded rate window."""
+
+    if (
+        len(state.selected_occurrences) >= context.normalized_target_count
+        or state.is_source_exhausted
+    ):
+        return False
+    if state.rate_window >= context.maximum_occurrences:
+        raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
+    next_window = _next_pattern_rate_window(
+        state.rate_window,
+        target_count=context.normalized_target_count,
+        distinct_count=len(state.selected_occurrences),
+        declared_occurrences=context.declared_occurrences,
+        maximum_occurrences=context.maximum_occurrences,
+    )
+    if next_window <= state.rate_window:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy rate prefix did not make progress"
+        )
+    state.serving_rows.clear()
+    state.rate_window = next_window
+    return True
+
+
+async def _v4_pattern_ranked_prefix(
+    session,
+    serving_tables: PTG2ServingTables,
+    context: _V4PatternContext,
+) -> _V4PatternPrefix:
+    """Grow one authenticated prefix and resolve its selected patterns."""
+
+    state = _V4PatternPrefixState(
+        rate_window=min(
+            context.maximum_occurrences,
+            PTG2_SERVING_BINARY_V3_PAGE_ROWS,
+            context.declared_occurrences,
+        )
+    )
+    while True:
+        await _v4_pattern_read_window(
+            session,
+            serving_tables,
+            context,
+            state,
+        )
+        if not _should_advance_v4_pattern_window(context, state):
+            break
+    selected_npi_keys = tuple(
+        dict.fromkeys(
+            npi_key
+            for _row_index, npi_key in state.selected_occurrences
+        )
+    )
     completion_provider_set_keys: tuple[int, ...] = ()
     completion_pattern_keys_by_set: dict[int, tuple[int, ...]] = {}
-    is_candidate_prefix_exhausted = False
-    is_source_exhausted = False
-    with (
-        v4_graph_request_scope(),
-        v4_graph_taxonomy_projection_scope(
-            maximum_members=int(
-                projection_rule.max_online_candidate_pattern_projection_members
+    if selected_npi_keys:
+        (
+            completion_provider_set_keys,
+            completion_pattern_keys_by_set,
+        ) = await _v4_pattern_completion_projection(
+            session,
+            snapshot_key=context.snapshot_key,
+            selected_npi_keys=selected_npi_keys,
+            npi_keys_by_pattern=(
+                context.request.candidates.npi_keys_by_pattern
             ),
-            maximum_pages=int(
-                projection_rule.max_online_inferred_taxonomy_graph_pages
+            max_members=int(
+                context.request.projection_rule.max_online_inferred_taxonomy_retained_memberships
             ),
-            maximum_bytes=int(
-                projection_rule.max_online_inferred_taxonomy_graph_bytes
-            ),
-            maximum_batches=int(
-                projection_rule.max_online_inferred_taxonomy_graph_batches
-            ),
-        ),
-    ):
-        while True:
-            serving_rows = await _merge_manifest_code_variant_rows(
-                session,
-                serving_tables,
-                code_rows=code_rows,
-                provider_set_keys=None,
-                source_trace_set_hash=source_trace_set_hash,
-                network_names=network_names,
-                limit=rate_window,
-                offset=0,
-                descending=descending,
-                scan_budget=scan_budget,
-            )
-            if serving_rows is None:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 V4 filtered reverse rate rows are unavailable"
-                )
-            provider_set_id_by_key = _v4_rate_scope_set_ids(
-                serving_rows,
-                None,
-            )
-            provider_set_keys = tuple(sorted(provider_set_id_by_key))
-            if len(provider_set_keys) > int(
-                projection_rule.max_online_filtered_reverse_code_sets
-            ):
-                raise PTG2OnlineWorkBudgetExceeded("code_sets")
-            new_provider_set_keys = tuple(
-                provider_set_key
-                for provider_set_key in provider_set_keys
-                if provider_set_key not in pattern_keys_by_set
-            )
-            if new_provider_set_keys:
-                new_pattern_keys_by_set = (
-                    await lookup_v4_relation_intersections(
-                        session,
-                        snapshot_key=snapshot_key,
-                        relation="set_patterns",
-                        owner_keys=new_provider_set_keys,
-                        allowed_member_keys=pattern_keys,
-                        schema_name=PTG2_SCHEMA,
-                        max_members=None,
-                    )
-                )
-                if set(new_pattern_keys_by_set) != set(
-                    new_provider_set_keys
-                ) or any(
-                    not set(set_pattern_keys).issubset(pattern_keys)
-                    for set_pattern_keys in new_pattern_keys_by_set.values()
-                ):
-                    raise PTG2ManifestArtifactError(
-                        "PTG2 V4 inferred-taxonomy set-pattern projection is incomplete"
-                    )
-                pattern_keys_by_set.update(new_pattern_keys_by_set)
-            selected_occurrences, is_candidate_prefix_exhausted = (
-                _v4_pattern_candidate_prefix(
-                    serving_rows,
-                    pattern_keys_by_set,
-                    candidates.npi_keys_by_pattern,
-                    target_count=normalized_target_count,
-                )
-            )
-            is_source_exhausted = _is_v4_rate_prefix_exhausted(
-                code_rows,
-                serving_rows,
-                rate_window=rate_window,
-            )
-            if (
-                len(selected_occurrences) >= normalized_target_count
-                or is_source_exhausted
-            ):
-                break
-            if rate_window >= maximum_occurrences:
-                raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
-            next_window = _next_pattern_rate_window(
-                rate_window,
-                target_count=normalized_target_count,
-                distinct_count=len(selected_occurrences),
-                declared_occurrences=declared_occurrences,
-                maximum_occurrences=maximum_occurrences,
-            )
-            if next_window <= rate_window:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 V4 inferred-taxonomy rate prefix did not make progress"
-                )
-            serving_rows.clear()
-            rate_window = next_window
-        if selected_occurrences:
-            selected_npi_keys = tuple(
-                dict.fromkeys(
-                    npi_key
-                    for _row_index, npi_key in selected_occurrences
-                )
-            )
-            (
-                completion_provider_set_keys,
-                completion_pattern_keys_by_set,
-            ) = await _v4_pattern_completion_projection(
-                session,
-                snapshot_key=snapshot_key,
-                selected_npi_keys=selected_npi_keys,
-                npi_keys_by_pattern=candidates.npi_keys_by_pattern,
-                max_members=int(
-                    projection_rule.max_online_inferred_taxonomy_retained_memberships
-                ),
-            )
-    if not selected_occurrences:
-        return _ProviderExpansionSelection(
-            [],
-            {},
-            {},
-            is_source_exhausted and is_candidate_prefix_exhausted,
         )
+    return _V4PatternPrefix(
+        serving_rows=state.serving_rows,
+        selected_occurrences=state.selected_occurrences,
+        selected_npi_keys=selected_npi_keys,
+        completion_provider_set_keys=completion_provider_set_keys,
+        completion_pattern_keys_by_set=completion_pattern_keys_by_set,
+        is_candidate_prefix_exhausted=state.is_candidate_prefix_exhausted,
+        is_source_exhausted=state.is_source_exhausted,
+    )
+
+
+async def _v4_pattern_npi_identity(
+    session,
+    context: _V4PatternContext,
+    prefix: _V4PatternPrefix,
+) -> tuple[dict[int, int], dict[_ProviderExpansionKey, int]]:
+    """Resolve selected dense NPIs and restore their exact response ranks."""
+
     npi_by_key = await v4_npi_values_for_keys(
         session,
-        snapshot_key=snapshot_key,
-        npi_keys=selected_npi_keys,
+        snapshot_key=context.snapshot_key,
+        npi_keys=prefix.selected_npi_keys,
         schema_name=PTG2_SCHEMA,
     )
     if (
-        set(npi_by_key) != set(selected_npi_keys)
-        or len(set(npi_by_key.values())) != len(selected_npi_keys)
+        set(npi_by_key) != set(prefix.selected_npi_keys)
+        or len(set(npi_by_key.values())) != len(prefix.selected_npi_keys)
     ):
         raise PTG2ManifestArtifactError(
             "PTG2 V4 inferred-taxonomy NPI dictionary is incomplete"
         )
     rank_by_key = {
         _provider_expansion_key(
-            serving_rows[row_index],
+            prefix.serving_rows[row_index],
             npi=int(npi_by_key[npi_key]),
         ): rank
-        for rank, (row_index, npi_key) in enumerate(selected_occurrences)
+        for rank, (row_index, npi_key) in enumerate(
+            prefix.selected_occurrences
+        )
     }
-    if len(rank_by_key) != len(selected_occurrences):
+    if len(rank_by_key) != len(prefix.selected_occurrences):
         raise PTG2ManifestArtifactError(
             "PTG2 V4 inferred-taxonomy dense ranking is not unique"
         )
-    completion_rows, provider_set_id_by_key = (
-        await _v4_pattern_completion_rows(
-            session,
-            serving_tables,
-            _V4PatternCompletionRequest(
-                code_rows=code_rows,
-                prefix_rows=serving_rows,
-                candidate_provider_set_keys=completion_provider_set_keys,
-                source_trace_set_hash=source_trace_set_hash,
-                network_names=network_names,
-                descending=descending,
-                is_source_exhausted=is_source_exhausted,
-                maximum_occurrences=maximum_occurrences,
-                maximum_code_sets=int(
-                    projection_rule.max_online_filtered_reverse_code_sets
-                ),
-                scan_budget=scan_budget,
-            ),
-        )
-    )
-    memberships_by_npi_key = _v4_selected_pattern_memberships(
-        selected_npi_keys,
-        candidates.npi_keys_by_pattern,
-        {
-            provider_set_key: completion_pattern_keys_by_set[
-                provider_set_key
-            ]
-            for provider_set_key in provider_set_id_by_key
-        },
-        provider_set_id_by_key,
-        max_members=int(
-            projection_rule.max_online_inferred_taxonomy_retained_memberships
-        ),
-    )
-    _validate_v4_pattern_ranked_memberships(
-        selected_occurrences,
-        serving_rows,
-        memberships_by_npi_key,
-        provider_set_id_by_key,
-    )
-    selected_npis = tuple(int(npi_by_key[npi_key]) for npi_key in selected_npi_keys)
-    provider_set_ids_by_npi = {
-        int(npi_by_key[npi_key]): memberships_by_npi_key[npi_key]
-        for npi_key in selected_npi_keys
-    }
+    return npi_by_key, rank_by_key
+
+
+def _v4_pattern_retained_rows(
+    completion_rows: list[dict[str, Any]],
+    provider_set_ids_by_npi: Mapping[int, tuple[str, ...]],
+) -> list[dict[str, Any]]:
+    """Retain completion rates reached by at least one selected provider."""
+
     retained_provider_set_ids = {
         provider_set_id
         for provider_set_ids in provider_set_ids_by_npi.values()
         for provider_set_id in provider_set_ids
     }
-    completion_rows = [
+    return [
         serving_row
         for serving_row in completion_rows
         if _ptg2_manifest_id(
@@ -17425,13 +17485,121 @@ async def _select_v4_pattern_taxonomy_expansion(
         )
         in retained_provider_set_ids
     ]
+
+
+def _v4_pattern_memberships(
+    context: _V4PatternContext,
+    prefix: _V4PatternPrefix,
+    provider_set_id_by_key: Mapping[int, str],
+) -> dict[int, tuple[str, ...]]:
+    """Resolve and authenticate selected pattern memberships."""
+
+    memberships_by_npi_key = _v4_selected_pattern_memberships(
+        prefix.selected_npi_keys,
+        context.request.candidates.npi_keys_by_pattern,
+        {
+            provider_set_key: prefix.completion_pattern_keys_by_set[
+                provider_set_key
+            ]
+            for provider_set_key in provider_set_id_by_key
+        },
+        provider_set_id_by_key,
+        max_members=int(
+            context.request.projection_rule.max_online_inferred_taxonomy_retained_memberships
+        ),
+    )
+    _validate_v4_pattern_ranked_memberships(
+        prefix.selected_occurrences,
+        prefix.serving_rows,
+        memberships_by_npi_key,
+        provider_set_id_by_key,
+    )
+    return memberships_by_npi_key
+
+
+async def _v4_pattern_completion(
+    session,
+    serving_tables: PTG2ServingTables,
+    context: _V4PatternContext,
+    prefix: _V4PatternPrefix,
+    npi_by_key: Mapping[int, int],
+) -> tuple[list[dict[str, Any]], tuple[int, ...], dict[int, tuple[str, ...]]]:
+    """Complete exact rate memberships for the selected dense NPIs."""
+
+    request = context.request
+    completion_rows, provider_set_id_by_key = (
+        await _v4_pattern_completion_rows(
+            session,
+            serving_tables,
+            _V4PatternCompletionRequest(
+                code_rows=request.code_rows,
+                prefix_rows=prefix.serving_rows,
+                candidate_provider_set_keys=(
+                    prefix.completion_provider_set_keys
+                ),
+                source_trace_set_hash=request.source_trace_set_hash,
+                network_names=request.network_names,
+                descending=request.descending,
+                is_source_exhausted=prefix.is_source_exhausted,
+                maximum_occurrences=context.maximum_occurrences,
+                maximum_code_sets=int(
+                    request.projection_rule.max_online_filtered_reverse_code_sets
+                ),
+                scan_budget=context.scan_budget,
+            ),
+        )
+    )
+    memberships_by_npi_key = _v4_pattern_memberships(
+        context,
+        prefix,
+        provider_set_id_by_key,
+    )
+    selected_npis = tuple(
+        int(npi_by_key[npi_key]) for npi_key in prefix.selected_npi_keys
+    )
+    provider_set_ids_by_npi = {
+        int(npi_by_key[npi_key]): memberships_by_npi_key[npi_key]
+        for npi_key in prefix.selected_npi_keys
+    }
+    return (
+        _v4_pattern_retained_rows(
+            completion_rows,
+            provider_set_ids_by_npi,
+        ),
+        selected_npis,
+        provider_set_ids_by_npi,
+    )
+
+
+async def _v4_pattern_selection(
+    session,
+    serving_tables: PTG2ServingTables,
+    context: _V4PatternContext,
+    prefix: _V4PatternPrefix,
+) -> _ProviderExpansionSelection:
+    """Materialize one completed pattern-prefix provider selection."""
+
+    npi_by_key, rank_by_key = await _v4_pattern_npi_identity(
+        session,
+        context,
+        prefix,
+    )
+    completion_rows, selected_npis, provider_set_ids_by_npi = (
+        await _v4_pattern_completion(
+            session,
+            serving_tables,
+            context,
+            prefix,
+            npi_by_key,
+        )
+    )
     providers_by_set = await _selected_provider_rows_by_set(
         session,
         serving_tables,
         npis=selected_npis,
         provider_set_ids_by_npi=provider_set_ids_by_npi,
-        args=args,
-        snapshot_id=snapshot_id,
+        args=context.request.args,
+        snapshot_id=context.request.snapshot_id,
     )
     if providers_by_set is None:
         raise PTG2ManifestArtifactError(
@@ -17441,7 +17609,62 @@ async def _select_v4_pattern_taxonomy_expansion(
         row_data=completion_rows,
         providers_by_set=providers_by_set,
         rank_by_key=rank_by_key,
-        exhausted=is_source_exhausted and is_candidate_prefix_exhausted,
+        exhausted=(
+            prefix.is_source_exhausted
+            and prefix.is_candidate_prefix_exhausted
+        ),
+    )
+
+
+async def _select_v4_pattern_taxonomy_expansion(
+    session,
+    serving_tables: PTG2ServingTables,
+    **request_options: Any,
+) -> _ProviderExpansionSelection:
+    """Serve one exact pattern quotient with bounded, target-first work."""
+
+    context = _v4_pattern_context(
+        serving_tables,
+        _V4PatternTaxonomyRequest(**request_options),
+    )
+    if context is None:
+        return _ProviderExpansionSelection([], {}, {}, True)
+    request = context.request
+    with (
+        v4_graph_request_scope(),
+        v4_graph_taxonomy_projection_scope(
+            maximum_members=int(
+                request.projection_rule.max_online_candidate_pattern_projection_members
+            ),
+            maximum_pages=int(
+                request.projection_rule.max_online_inferred_taxonomy_graph_pages
+            ),
+            maximum_bytes=int(
+                request.projection_rule.max_online_inferred_taxonomy_graph_bytes
+            ),
+            maximum_batches=int(
+                request.projection_rule.max_online_inferred_taxonomy_graph_batches
+            ),
+        ),
+    ):
+        prefix = await _v4_pattern_ranked_prefix(
+            session,
+            serving_tables,
+            context,
+        )
+    if not prefix.selected_occurrences:
+        return _ProviderExpansionSelection(
+            [],
+            {},
+            {},
+            prefix.is_source_exhausted
+            and prefix.is_candidate_prefix_exhausted,
+        )
+    return await _v4_pattern_selection(
+        session,
+        serving_tables,
+        context,
+        prefix,
     )
 
 
@@ -19836,6 +20059,422 @@ async def search_ptg2_serving_table(
         mode_value,
     )
 
+
+@dataclass(frozen=True)
+class _ProviderProcedureRequest:
+    """Raw public inputs for one provider reverse-index search."""
+
+    npi: int
+    args: dict[str, Any]
+    pagination: Any
+    snapshot_id: str
+    serving_tables: PTG2ServingTables
+
+
+@dataclass(frozen=True)
+class _ProviderProcedureSearch:
+    """Normalized exact search inputs after code and price resolution."""
+
+    request: _ProviderProcedureRequest
+    provider_set_ids: tuple[str, ...]
+    requested_plan: str
+    code_value: str
+    q_text: str
+    market_type: str
+    code_context: Any
+    price_filter_values_by_field: dict[str, Any]
+    has_price_filter: bool
+    requested_limit: int
+    requested_offset: int
+    sentinel_limit: int
+
+
+@dataclass(frozen=True)
+class _ProviderProcedureRows:
+    """Exact reverse rows and pagination evidence before response shaping."""
+
+    serving_rows: list[dict[str, Any]]
+    prices_by_price_set: Mapping[str | None, Any]
+    exact_total: int | None
+    observed_total_lower_bound: int
+
+
+@dataclass(frozen=True)
+class _ProviderProcedureItemContext:
+    """Request-scoped enrichment used to shape selected procedure rows."""
+
+    source_provenance_by_key: Mapping[int, Any]
+    procedure_details: Mapping[tuple[str, str], dict[str, Any]]
+    provider_context: Mapping[str, Any]
+    item_args_by_name: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _ProviderProcedurePage:
+    """One bounded response page with exact or lower-bound totals."""
+
+    response_items: list[dict[str, Any]]
+    total: int
+    has_more: bool
+    is_total_exact: bool
+    total_lower_bound: int
+
+
+async def _provider_procedure_search(
+    session,
+    request: _ProviderProcedureRequest,
+    provider_set_ids: tuple[str, ...],
+) -> _ProviderProcedureSearch:
+    """Normalize one provider procedure request without reading rate rows."""
+
+    args = request.args
+    requested_plan = str(
+        args.get("plan_id") or args.get("plan_external_id") or ""
+    ).strip()
+    code_value = str(
+        args.get("code") or args.get("reported_code") or ""
+    ).strip()
+    q_text = str(
+        args.get("q") or args.get("service_name") or ""
+    ).strip().lower()
+    market_type = str(args.get("plan_market_type") or "").strip().lower()
+    code_context = await _resolve_ptg2_code_search_context(
+        session,
+        code=code_value,
+        code_system=args.get("code_system"),
+    )
+    price_filter_params_by_name: dict[str, Any] = {}
+    price_filter_values_by_field = _price_filter_clauses(
+        args,
+        price_filter_params_by_name,
+    )[1]
+    requested_limit = max(
+        int(getattr(request.pagination, "limit", 25) or 25),
+        1,
+    )
+    requested_offset = max(
+        int(getattr(request.pagination, "offset", 0) or 0),
+        0,
+    )
+    return _ProviderProcedureSearch(
+        request=request,
+        provider_set_ids=provider_set_ids,
+        requested_plan=requested_plan,
+        code_value=code_value,
+        q_text=q_text,
+        market_type=market_type,
+        code_context=code_context,
+        price_filter_values_by_field=price_filter_values_by_field,
+        has_price_filter=bool(price_filter_values_by_field),
+        requested_limit=requested_limit,
+        requested_offset=requested_offset,
+        sentinel_limit=requested_limit + 1,
+    )
+
+
+def _provider_procedure_reverse_query(
+    search: _ProviderProcedureSearch,
+) -> _VersionThreeReverseQuery:
+    """Bind normalized inputs to one exact bounded reverse query."""
+
+    request = search.request
+    return _VersionThreeReverseQuery(
+        provider_set_ids=search.provider_set_ids,
+        requested_plan=search.requested_plan,
+        code_value=search.code_value,
+        code_system=request.args.get("code_system"),
+        q_text=search.q_text,
+        code_context=search.code_context,
+        source_trace_set_hash=None,
+        network_names=request.serving_tables.network_names or [],
+        limit=None if search.has_price_filter else search.sentinel_limit,
+        offset=0 if search.has_price_filter else search.requested_offset,
+        apply_window=not search.has_price_filter,
+        plan_market_type=search.market_type,
+    )
+
+
+async def _unfiltered_provider_procedure_rows(
+    session,
+    search: _ProviderProcedureSearch,
+    reverse_query: _VersionThreeReverseQuery,
+) -> _ProviderProcedureRows:
+    """Read one sentinel page and hydrate its selected dense price sets."""
+
+    reverse_selection = await _version_three_reverse_selection(
+        session,
+        search.request.serving_tables,
+        reverse_query,
+    )
+    serving_rows = list(reverse_selection.rows)
+    price_key_by_set_id = {
+        _ptg2_manifest_id(
+            serving_row.get("price_set_global_id_128")
+        ): int(serving_row.get("price_key"))
+        for serving_row in serving_rows
+        if serving_row.get("price_key") is not None
+        and _ptg2_manifest_id(
+            serving_row.get("price_set_global_id_128")
+        )
+    }
+    prices_by_price_set = await _prices_for_price_sets(
+        session,
+        search.request.serving_tables,
+        [
+            _ptg2_manifest_id(
+                serving_row.get("price_set_global_id_128")
+            )
+            for serving_row in serving_rows
+        ],
+        price_key_by_set_id=price_key_by_set_id,
+    )
+    return _ProviderProcedureRows(
+        serving_rows=serving_rows,
+        prices_by_price_set=prices_by_price_set,
+        exact_total=reverse_selection.total_row_count,
+        observed_total_lower_bound=(
+            search.requested_offset + len(serving_rows)
+        ),
+    )
+
+
+async def _provider_procedure_rows(
+    session,
+    search: _ProviderProcedureSearch,
+) -> _ProviderProcedureRows:
+    """Select filtered or sentinel reverse rows with equivalent totals."""
+
+    reverse_query = _provider_procedure_reverse_query(search)
+    if not search.has_price_filter:
+        return await _unfiltered_provider_procedure_rows(
+            session,
+            search,
+            reverse_query,
+        )
+    filtered_selection = await _version_three_filtered_reverse_selection(
+        session,
+        search.request.serving_tables,
+        reverse_query,
+        search.request.args,
+        offset=search.requested_offset,
+        limit=search.sentinel_limit,
+    )
+    return _ProviderProcedureRows(
+        serving_rows=list(filtered_selection.rows),
+        prices_by_price_set=dict(filtered_selection.prices_by_price_set),
+        exact_total=filtered_selection.total_row_count,
+        observed_total_lower_bound=filtered_selection.matched_rows_seen,
+    )
+
+
+async def _provider_procedure_item_context(
+    session,
+    search: _ProviderProcedureSearch,
+    procedure_rows: _ProviderProcedureRows,
+) -> _ProviderProcedureItemContext:
+    """Load source, procedure, and provider enrichment for selected rows."""
+
+    request = search.request
+    await _hydrate_provider_set_network_names(
+        session,
+        request.serving_tables,
+        procedure_rows.serving_rows,
+    )
+    source_provenance_by_key = (
+        await _ptg2_source_provenance_for_rows(
+            session,
+            request.serving_tables,
+            procedure_rows.serving_rows,
+        )
+        if _include_ptg2_sources(request.args)
+        else {}
+    )
+    procedure_details = await _procedure_details_for_rows(
+        session,
+        procedure_rows.serving_rows,
+    )
+    provider_context_rows = await _enriched_provider_rows_for_npis(
+        session,
+        npis=[request.npi],
+        limit=1,
+        plan_id=search.requested_plan or None,
+        snapshot_id=request.snapshot_id,
+        source_key=request.args.get("source_key") or None,
+    )
+    return _ProviderProcedureItemContext(
+        source_provenance_by_key=source_provenance_by_key,
+        procedure_details=procedure_details,
+        provider_context=(
+            provider_context_rows[0]
+            if provider_context_rows
+            else {"npi": request.npi}
+        ),
+        item_args_by_name={
+            **request.args,
+            "snapshot_id": request.snapshot_id,
+            "source_key": _logical_source_key(
+                request.serving_tables,
+                request.args,
+            ),
+        },
+    )
+
+
+def _provider_procedure_item(
+    search: _ProviderProcedureSearch,
+    procedure_rows: _ProviderProcedureRows,
+    item_context: _ProviderProcedureItemContext,
+    serving_row: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Shape one exact provider procedure occurrence."""
+
+    price_set_id = _ptg2_manifest_id(
+        serving_row.get("price_set_global_id_128")
+    )
+    catalog_key = _catalog_key(
+        serving_row.get("reported_code_system"),
+        serving_row.get("reported_code"),
+    ) or ("", "")
+    source_provenance = item_context.source_provenance_by_key.get(
+        int(serving_row["source_key"])
+    )
+    serving_row_with_trace_by_field = {
+        **serving_row,
+        **(
+            _item_source_provenance(source_provenance)
+            if source_provenance is not None
+            else {"source_artifact_key": int(serving_row["source_key"])}
+        ),
+    }
+    return _ptg2_manifest_provider_procedure_item(
+        npi=search.request.npi,
+        serving_data=serving_row_with_trace_by_field,
+        prices=procedure_rows.prices_by_price_set.get(price_set_id, []),
+        procedure_detail=item_context.procedure_details.get(catalog_key, {}),
+        provider_context=item_context.provider_context,
+        args=item_context.item_args_by_name,
+    )
+
+
+def _provider_procedure_page(
+    search: _ProviderProcedureSearch,
+    procedure_rows: _ProviderProcedureRows,
+    response_items: list[dict[str, Any]],
+) -> _ProviderProcedurePage:
+    """Apply the sentinel page and retain exact or lower-bound totals."""
+
+    has_more = len(response_items) > search.requested_limit
+    response_items = response_items[: search.requested_limit]
+    is_total_exact = procedure_rows.exact_total is not None
+    total_lower_bound = (
+        int(procedure_rows.exact_total)
+        if is_total_exact
+        else max(
+            procedure_rows.observed_total_lower_bound,
+            search.requested_offset + len(response_items),
+        )
+    )
+    _hide_source_artifact_key_unless_requested(
+        response_items,
+        search.request.args,
+    )
+    return _ProviderProcedurePage(
+        response_items=response_items,
+        total=(
+            int(procedure_rows.exact_total)
+            if is_total_exact
+            else total_lower_bound
+        ),
+        has_more=has_more,
+        is_total_exact=is_total_exact,
+        total_lower_bound=total_lower_bound,
+    )
+
+
+def _provider_procedure_query_fields(
+    request: _ProviderProcedureRequest,
+    search: _ProviderProcedureSearch | None,
+    *,
+    status: str | None,
+) -> dict[str, Any]:
+    """Return the compatible public query echo for one reverse search."""
+
+    args = request.args
+    query_fields_by_name = {
+        "npi": request.npi,
+        "plan_id": args.get("plan_id") or None,
+        "plan_external_id": args.get("plan_external_id") or None,
+        "plan_market_type": (
+            search.market_type
+            if search is not None
+            else str(args.get("plan_market_type") or "").strip().lower()
+        )
+        or None,
+        "source_key": args.get("source_key") or None,
+        "snapshot_id": request.snapshot_id,
+        "mode": normalize_ptg2_mode(args.get("mode")),
+        "code": (
+            search.code_value
+            if search is not None
+            else args.get("code") or args.get("reported_code")
+        )
+        or None,
+        "code_system": args.get("code_system") or None,
+        "q": (
+            search.q_text
+            if search is not None
+            else args.get("q") or args.get("service_name")
+        )
+        or None,
+        "source": "ptg2_db",
+        "serving_table": None,
+        "provider_reverse_index": True,
+        "status": status,
+    }
+    if search is not None:
+        query_fields_by_name["price_filter"] = (
+            search.price_filter_values_by_field or None
+        )
+        query_fields_by_name.update(
+            _ptg2_code_query_fields(search.code_context, args)
+        )
+    return query_fields_by_name
+
+
+def _shape_provider_procedure_response(
+    request: _ProviderProcedureRequest,
+    page: _ProviderProcedurePage,
+    search: _ProviderProcedureSearch | None,
+) -> dict[str, Any]:
+    """Shape one compatible provider-procedure response envelope."""
+
+    pagination = request.pagination
+    return _shape_ptg2_response(
+        {
+            "items": page.response_items,
+            "pagination": {
+                "total": page.total,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": (
+                    (pagination.offset // pagination.limit) + 1
+                    if pagination.limit
+                    else 1
+                ),
+                "has_more": page.has_more,
+                "total_is_exact": page.is_total_exact,
+                "total_lower_bound": page.total_lower_bound,
+            },
+            "query": _provider_procedure_query_fields(
+                request,
+                search,
+                status=None if page.total else "no_match",
+            ),
+        },
+        request.args,
+    )
+
+
 async def _search_ptg2_manifest_provider_procedures(
     session,
     npi: int,
@@ -19847,238 +20486,52 @@ async def _search_ptg2_manifest_provider_procedures(
 ) -> dict[str, Any] | None:
     """Search strict shared V3 procedures and prices for one provider NPI."""
 
-    _require_strict_shared_v3(serving_tables)
+    request = _ProviderProcedureRequest(
+        npi=npi,
+        args=args,
+        pagination=pagination,
+        snapshot_id=snapshot_id,
+        serving_tables=serving_tables,
+    )
+    _require_strict_shared_v3(request.serving_tables)
     provider_set_ids = await _provider_sets_for_npi(
         session,
-        serving_tables,
-        npi,
+        request.serving_tables,
+        request.npi,
     )
     if not provider_set_ids:
-        return _shape_ptg2_response(
-            {
-                "items": [],
-                "pagination": {
-                    "total": 0,
-                    "limit": pagination.limit,
-                    "offset": pagination.offset,
-                    "page": (pagination.offset // pagination.limit) + 1
-                    if pagination.limit
-                    else 1,
-                    "has_more": False,
-                    "total_is_exact": True,
-                    "total_lower_bound": 0,
-                },
-                "query": {
-                    "npi": npi,
-                    "plan_id": args.get("plan_id") or None,
-                    "plan_external_id": args.get("plan_external_id") or None,
-                    "plan_market_type": str(args.get("plan_market_type") or "").strip().lower()
-                    or None,
-                    "source_key": args.get("source_key") or None,
-                    "snapshot_id": snapshot_id,
-                    "mode": normalize_ptg2_mode(args.get("mode")),
-                    "code": args.get("code") or args.get("reported_code") or None,
-                    "code_system": args.get("code_system") or None,
-                    "q": args.get("q") or args.get("service_name") or None,
-                    "source": "ptg2_db",
-                    "serving_table": None,
-                    "provider_reverse_index": True,
-                    "status": "no_match",
-                },
-            },
-            args,
-        )
-
-    requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
-    code_value = str(args.get("code") or args.get("reported_code") or "").strip()
-    q_text = str(args.get("q") or args.get("service_name") or "").strip().lower()
-    market_type = str(args.get("plan_market_type") or "").strip().lower()
-    code_context = await _resolve_ptg2_code_search_context(
-        session,
-        code=code_value,
-        code_system=args.get("code_system"),
-    )
-    price_filter_params_by_name: dict[str, Any] = {}
-    _, price_filter_query = _price_filter_clauses(
-        args,
-        price_filter_params_by_name,
-    )
-    has_price_filter = bool(price_filter_query)
-    requested_limit = max(int(getattr(pagination, "limit", 25) or 25), 1)
-    requested_offset = max(int(getattr(pagination, "offset", 0) or 0), 0)
-    sentinel_limit = requested_limit + 1
-    reverse_query = _VersionThreeReverseQuery(
-        provider_set_ids=provider_set_ids,
-        requested_plan=requested_plan,
-        code_value=code_value,
-        code_system=args.get("code_system"),
-        q_text=q_text,
-        code_context=code_context,
-        source_trace_set_hash=None,
-        network_names=serving_tables.network_names or [],
-        limit=None if has_price_filter else sentinel_limit,
-        offset=0 if has_price_filter else requested_offset,
-        apply_window=not has_price_filter,
-        plan_market_type=market_type,
-    )
-    if has_price_filter:
-        filtered_selection = await _version_three_filtered_reverse_selection(
-            session,
-            serving_tables,
-            reverse_query,
-            args,
-            offset=requested_offset,
-            limit=sentinel_limit,
-        )
-        serving_rows = list(filtered_selection.rows)
-        prices_by_price_set = dict(filtered_selection.prices_by_price_set)
-        exact_total = filtered_selection.total_row_count
-        observed_total_lower_bound = filtered_selection.matched_rows_seen
-    else:
-        reverse_selection = await _version_three_reverse_selection(
-            session,
-            serving_tables,
-            reverse_query,
-        )
-        serving_rows = list(reverse_selection.rows)
-        exact_total = reverse_selection.total_row_count
-        observed_total_lower_bound = requested_offset + len(serving_rows)
-        price_key_by_set_id = {
-            _ptg2_manifest_id(
-                serving_row.get("price_set_global_id_128")
-            ): int(serving_row.get("price_key"))
-            for serving_row in serving_rows
-            if serving_row.get("price_key") is not None
-            and _ptg2_manifest_id(
-                serving_row.get("price_set_global_id_128")
-            )
-        }
-        prices_by_price_set = await _prices_for_price_sets(
-            session,
-            serving_tables,
-            [
-                _ptg2_manifest_id(
-                    serving_row.get("price_set_global_id_128")
-                )
-                for serving_row in serving_rows
-            ],
-            price_key_by_set_id=price_key_by_set_id,
-        )
-    await _hydrate_provider_set_network_names(
-        session,
-        serving_tables,
-        serving_rows,
-    )
-
-    source_provenance_by_key = (
-        await _ptg2_source_provenance_for_rows(
-            session,
-            serving_tables,
-            serving_rows,
-        )
-        if _include_ptg2_sources(args)
-        else {}
-    )
-    procedure_details = await _procedure_details_for_rows(
-        session,
-        serving_rows,
-    )
-    provider_context_rows = await _enriched_provider_rows_for_npis(
-        session,
-        npis=[npi],
-        limit=1,
-        plan_id=requested_plan or None,
-        snapshot_id=snapshot_id,
-        source_key=args.get("source_key") or None,
-    )
-    provider_context = provider_context_rows[0] if provider_context_rows else {"npi": npi}
-    item_args_by_name = {
-        **args,
-        "snapshot_id": snapshot_id,
-        "source_key": _logical_source_key(serving_tables, args),
-    }
-
-    response_items: list[dict[str, Any]] = []
-    for serving_row in serving_rows:
-        prices = prices_by_price_set.get(
-            _ptg2_manifest_id(
-                serving_row.get("price_set_global_id_128")
+        return _shape_provider_procedure_response(
+            request,
+            _ProviderProcedurePage(
+                response_items=[], total=0, has_more=False,
+                is_total_exact=True, total_lower_bound=0,
             ),
-            [],
+            None,
         )
-        reported_code = serving_row.get("reported_code")
-        reported_system = serving_row.get("reported_code_system")
-        procedure_detail = procedure_details.get(_catalog_key(reported_system, reported_code) or ("", ""), {})
-        source_provenance = source_provenance_by_key.get(
-            int(serving_row["source_key"])
-        )
-        serving_row_with_trace_by_field = {
-            **serving_row,
-            **(
-                _item_source_provenance(source_provenance)
-                if source_provenance is not None
-                else {
-                    "source_artifact_key": int(serving_row["source_key"])
-                }
-            ),
-        }
-        response_items.append(
-            _ptg2_manifest_provider_procedure_item(
-                npi=npi,
-                serving_data=serving_row_with_trace_by_field,
-                prices=prices,
-                procedure_detail=procedure_detail,
-                provider_context=provider_context,
-                args=item_args_by_name,
-            )
-        )
-    has_more = len(response_items) > requested_limit
-    response_items = response_items[:requested_limit]
-    is_total_exact = exact_total is not None
-    total_lower_bound = (
-        int(exact_total)
-        if is_total_exact
-        else max(
-            observed_total_lower_bound,
-            requested_offset + len(response_items),
-        )
+    search = await _provider_procedure_search(
+        session,
+        request,
+        tuple(provider_set_ids),
     )
-    total = int(exact_total) if is_total_exact else total_lower_bound
-
-    _hide_source_artifact_key_unless_requested(response_items, args)
-
-    return _shape_ptg2_response(
-        {
-            "items": response_items,
-            "pagination": {
-                "total": total,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
-                "has_more": has_more,
-                "total_is_exact": is_total_exact,
-                "total_lower_bound": total_lower_bound,
-            },
-            "query": {
-                "npi": npi,
-                "plan_id": args.get("plan_id") or None,
-                "plan_external_id": args.get("plan_external_id") or None,
-                "plan_market_type": market_type or None,
-                "source_key": args.get("source_key") or None,
-                "snapshot_id": snapshot_id,
-                "mode": normalize_ptg2_mode(args.get("mode")),
-                "code": code_value or None,
-                "code_system": args.get("code_system") or None,
-                "q": q_text or None,
-                "price_filter": price_filter_query or None,
-                "source": "ptg2_db",
-                "serving_table": None,
-                "provider_reverse_index": True,
-                "status": None if total else "no_match",
-                **_ptg2_code_query_fields(code_context, args),
-            },
-        },
-        args,
+    procedure_rows = await _provider_procedure_rows(session, search)
+    item_context = await _provider_procedure_item_context(
+        session,
+        search,
+        procedure_rows,
+    )
+    response_items = [
+        _provider_procedure_item(
+            search,
+            procedure_rows,
+            item_context,
+            serving_row,
+        )
+        for serving_row in procedure_rows.serving_rows
+    ]
+    return _shape_provider_procedure_response(
+        request,
+        _provider_procedure_page(search, procedure_rows, response_items),
+        search,
     )
 
 
