@@ -19854,6 +19854,7 @@ hospitals:
 - hospital_id: hospital-006053
   name: St Luke's Hospital Allentown Campus
   cms_hpt_url: https://www.slhn.org/cms-hpt.txt
+  fallback_mrf_url: https://www.slhn.org/-/media/sluhn/billing/pdf/standard-charges/23-1352213_stlukeshospitalallentowncampus_standardcharges.ashx
 - hospital_id: hospital-006054
   name: St Luke's Magic Valley Regional Medical Center, LTD
   cms_hpt_url: https://stlukesonline.org/cms-hpt.txt
@@ -23967,6 +23968,7 @@ hospitals:
 - hospital_id: hospital-007318
   name: "Freedom Behavioral Hospital Of Plainview"
   cms_hpt_url: https://freedombehavioral.com/cms-hpt.txt
+  fallback_mrf_url: https://freedombehavioral.com/wp-content/uploads/2026/07/201871394_allegiance-behavioral-health-center-of-plainview_standardchargesupdated.csv
 - hospital_id: hospital-007319
   name: "Ascension Calumet Hospital, Inc."
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
@@ -24033,6 +24035,7 @@ hospitals:
 - hospital_id: hospital-007340
   name: "North Mississippi Medical Center, Inc."
   cms_hpt_url: https://www.nmhs.net/cms-hpt.txt
+  fallback_mrf_url: https://apps.nmhs.net/files/pt_mrf/640662976_north-mississippi-medical-center_standardcharges.json
 - hospital_id: hospital-007341
   name: "The Hospital of the University of Pennsylvania"
   cms_hpt_url: https://www.pennmedicine.org/cms-hpt.txt

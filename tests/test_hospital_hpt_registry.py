@@ -21,6 +21,7 @@ _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-005156": "180a1ae8dfcb952d7189c1c9ffb03ad121835699375b1e4ef9734c0764151192",
     "hospital-005608": "00f218c51149bc2237e87924d78a7e244607d53421e5cd18943a26a9f9e7c9c5",
     "hospital-005609": "00f218c51149bc2237e87924d78a7e244607d53421e5cd18943a26a9f9e7c9c5",
+    "hospital-006053": "4d983a60e26bb91ee01c54bf194c91bc6a5d2b6215807af651dc96950ff55a6b",
     "hospital-006471": "dc7b9213c55ff2a6d9626a7841c532b5e7ebf1dce51e17efda59ead2c3f17de4",
     "hospital-006488": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
     "hospital-006502": "75d4e626daf0db2c1e53cc903f3669d04339bbffb8891f92dd588c7fa3d0316f",
@@ -30,6 +31,8 @@ _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-006622": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
     "hospital-006635": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
     "hospital-007195": "4001360464d0b094a10df3bd688d3879f0bc0d6c07ee966021772d689f0aebf7",
+    "hospital-007318": "923f885b47e27d492d193557d2cd671f0d0a63becb3c971ad9092f794fea2b36",
+    "hospital-007340": "0e057fbfbc92c7cdfa98bfdd02a06c7f2ce7eb5fe9b48eddac785ed1686fe27c",
 }
 
 _REVIEWED_ALIAS_SAMPLES = {
@@ -80,7 +83,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert "alias_of" not in hospital_by_id["hospital-005625"]
     assert sum("locator_name" in entry for entry in hospitals) == 1_258
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 636
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 19
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 22
     assert {
         entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry
     } == set(_FALLBACK_URL_SHA256_BY_HOSPITAL_ID)
