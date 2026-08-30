@@ -26,7 +26,7 @@ from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, c
 from api.billing_search_http import serve_billing_search_get
 from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
 from api.control_auth import require_control_auth
-from api.endpoint.pagination import parse_pagination
+from api.endpoint.pagination import PaginationParams, parse_pagination
 from api.ptg2_candidate_audit import (
     PTG2_CANDIDATE_AUDIT_HEADER,
     attach_candidate_audit_access,
@@ -11199,7 +11199,7 @@ async def resolve_procedure_taxonomy(request):
 
 
 class _ProviderSpecialtyRequest(NamedTuple):
-    pagination: Any
+    pagination: PaginationParams
     requested_year: int | None
     search_query: str
     state: str
@@ -11362,7 +11362,7 @@ async def _provider_specialty_code_scope(
 async def _load_provider_specialty_page(
     session,
     scope: _ProviderSpecialtyScope,
-    pagination: Any,
+    pagination: PaginationParams,
 ) -> _ProviderSpecialtyPage:
     """Execute the specialty page before its exact grouped count."""
 
@@ -13385,7 +13385,7 @@ class _PrescriptionProviderFilters(NamedTuple):
 
 
 class _PrescriptionProviderRequest(NamedTuple):
-    pagination: Any
+    pagination: PaginationParams
     requested_year: int | None
     filters: _PrescriptionProviderFilters
 
@@ -13533,7 +13533,7 @@ async def _prescription_provider_total(session, grouped_subquery) -> int:
 async def _load_prescription_provider_entries(
     session,
     grouped_subquery,
-    pagination: Any,
+    pagination: PaginationParams,
     order_by: str,
     order: str,
 ) -> list[dict[str, Any]]:
