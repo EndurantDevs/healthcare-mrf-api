@@ -11,6 +11,7 @@ from tests.test_ptg2_geo_rate_prefix import _production_tables, _tables as _v4_t
 from tests.test_ptg2_manifest_search_transitions import (
     _CODE_ROW,
     _NPI,
+    _PRICE_SET_ID,
     _PROVIDER_ROW,
     _PROVIDER_SET_ID,
     _RATE_ROW,
@@ -264,6 +265,90 @@ async def test_manifest_geo_without_projection_keeps_location_first_route(
     assert response["items"][0]["npi"] == _NPI
     location_lookup.assert_awaited_once()
     strict_selector.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exhaustive_rate_only_geo_scopes_merge_with_local_graph(monkeypatch):
+    _install_base_dependencies(monkeypatch)
+    local_scope = AsyncMock(
+        return_value=serving._GraphLocationCandidates(
+            [{"npi": _NPI}],
+            {_NPI: {3}},
+            taxonomy_filtered=True,
+        )
+    )
+    projection = AsyncMock(
+        return_value=({_PROVIDER_SET_ID}, {_PROVIDER_SET_ID: [_PROVIDER_ROW]})
+    )
+    national_scope = AsyncMock(side_effect=AssertionError("national scope used"))
+    monkeypatch.setattr(
+        serving,
+        "_local_inferred_distance_graph_candidates",
+        local_scope,
+    )
+    monkeypatch.setattr(serving, "_project_graph_candidates", projection)
+    monkeypatch.setattr(serving, "_request_rate_provider_set_keys", national_scope)
+    monkeypatch.setattr(serving, "_ptg2_manifest_location_match_limit", lambda: 5_000)
+    monkeypatch.setattr(
+        serving,
+        "_prices_for_price_sets",
+        AsyncMock(return_value={_PRICE_SET_ID: [{"negotiated_rate": "125.00"}]}),
+    )
+    tables = _production_tables()
+
+    response, _session = await _search(
+        serving_tables=tables,
+        args=_query_args(
+            state="IL",
+            order_by="total_allowed_amount",
+            negotiated_rate="125.00",
+        ),
+    )
+
+    assert response["items"][0]["prices"] == [{"negotiated_rate": 125}]
+    assert local_scope.await_args.kwargs["candidate_limit"] == 5_001
+    national_scope.assert_not_awaited()
+    projection.assert_awaited_once()
+    assert serving._merge_manifest_code_variant_rows.await_args.kwargs[
+        "provider_set_keys"
+    ] == [3]
+
+
+@pytest.mark.asyncio
+async def test_non_v4_exact_rate_geo_keeps_price_first_order(monkeypatch):
+    events = []
+    _install_base_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        serving,
+        "_prices_for_price_sets",
+        AsyncMock(return_value={_PRICE_SET_ID: [{"negotiated_rate": "125.00"}]}),
+    )
+    merge = AsyncMock(
+        side_effect=lambda *_args, **_kwargs: events.append("merge")
+        or [dict(_RATE_ROW)]
+    )
+    location = AsyncMock(
+        side_effect=lambda *_args, **_kwargs: events.append("location")
+        or ({_PROVIDER_SET_ID}, {_PROVIDER_SET_ID: [_PROVIDER_ROW]})
+    )
+    monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", merge)
+    monkeypatch.setattr(
+        serving,
+        "_ptg2_manifest_location_provider_matches",
+        location,
+    )
+
+    response, _session = await _search(
+        args=_query_args(
+            state="IL",
+            order_by="total_allowed_amount",
+            negotiated_rate="125.00",
+        )
+    )
+
+    assert response["items"][0]["prices"] == [{"negotiated_rate": 125}]
+    assert events == ["merge", "location"]
+    assert location.await_args.kwargs["provider_set_keys"] == {3}
 
 
 @pytest.mark.asyncio
