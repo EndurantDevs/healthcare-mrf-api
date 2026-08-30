@@ -299,11 +299,11 @@ def test_census_acceptance_requires_four_positive_work_limits() -> None:
         "observed_work_limits": contract.observed_work_limits(work_by_field),
     }
 
-    assert contract.is_accepted(receipt_by_field, measurement_by_field, True)
+    assert census._is_accepted(receipt_by_field, measurement_by_field, True)
     measurement_by_field["observed_work_limits"][
         "maximum_code_membership_probe_rows"
     ] = 0
-    assert not contract.is_accepted(receipt_by_field, measurement_by_field, True)
+    assert not census._is_accepted(receipt_by_field, measurement_by_field, True)
 
 
 def test_census_runtime_binds_the_expected_image_digest(monkeypatch) -> None:

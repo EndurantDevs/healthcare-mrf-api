@@ -1,6 +1,7 @@
 """Signal and deadline checks for the plan-pricing census envelope."""
 
 import signal
+import json
 import subprocess
 import time
 from pathlib import Path
@@ -39,6 +40,128 @@ def test_zero_second_start_enforces_global_deadline(tmp_path: Path) -> None:
 
     assert deadline_result.returncode == 124
     assert deadline_result.stdout == ""
+
+
+def test_quota_admission_probe_uses_remaining_envelope_time(tmp_path: Path) -> None:
+    """Quota admission must stop at the cleanup reserve, not a retry count."""
+
+    definitions = _script_definitions(tmp_path)
+    counter = tmp_path / "probe-count"
+    limits = tmp_path / "probe-limits"
+    counter.write_text("0", encoding="utf-8")
+    limits.write_text("", encoding="utf-8")
+    probe_result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            """
+source "$1"
+STATE_DIR=$2
+COUNTER=$3
+LIMITS=$4
+OWNER_TOKEN=testowner1
+QUOTA_NAME=hp-pv3-census-testowner1
+quota_probe_manifest() { :; }
+kctl_with_limit() {
+  printf '%s\n' "$1" >>"$LIMITS"
+  shift
+  cat >/dev/null
+  count=$(<"$COUNTER")
+  printf '%s\n' "$((count + 1))" >"$COUNTER"
+  [ "$((count % 2))" -eq 0 ] && return 124
+  return 0
+}
+sleep() { :; }
+seconds_before_cleanup() {
+  count=$(<"$COUNTER")
+  [ "$count" -lt 4 ] && printf 1 || printf 0
+}
+prove_quota_admission
+""",
+            "bash",
+            str(definitions),
+            str(tmp_path),
+            str(counter),
+            str(limits),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert probe_result.returncode == 1
+    assert counter.read_text(encoding="utf-8") == "4\n"
+    assert limits.read_text(encoding="utf-8") == "1\n1\n1\n1\n"
+    assert "did not prove" in probe_result.stderr
+
+
+def test_receipt_treats_shell_values_as_data(tmp_path: Path) -> None:
+    """Cluster-derived receipt values must never become Python source."""
+
+    definitions = _script_definitions(tmp_path)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    receipt_write_result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            """
+source "$0"
+STATE_DIR=$1
+SOURCE_SHA=$(printf 'a%.0s' {1..40})
+OWNER_TOKEN=testowner1
+QUOTA_UID='uid"quoted'
+write_receipt 1
+""",
+            str(definitions),
+            str(state_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert receipt_write_result.returncode == 0, receipt_write_result.stderr
+    receipt = json.loads((state_dir / "envelope-receipt.json").read_text())
+    assert receipt["resource_uids"]["quota"] == 'uid"quoted'
+
+
+@pytest.mark.parametrize("failure_stage", ["writer", "chmod"])
+def test_receipt_write_failures_never_publish_success(
+    tmp_path: Path,
+    failure_stage: str,
+) -> None:
+    """Every receipt publication step must return nonzero before final rename."""
+
+    definitions = _script_definitions(tmp_path)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    failed_write_result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            """
+source "$0"
+STATE_DIR=$1
+SOURCE_SHA=$(printf 'a%.0s' {1..40})
+if [ "$2" = writer ]; then
+  python3() { : >"${STATE_DIR}/envelope-receipt.json.tmp"; return 1; }
+else
+  chmod() { return 1; }
+fi
+if write_receipt 1; then exit 97; fi
+[ ! -e "${STATE_DIR}/envelope-receipt.json" ]
+""",
+            str(definitions),
+            str(state_dir),
+            failure_stage,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert failed_write_result.returncode == 0, failed_write_result.stderr
 
 
 def _run_ignoring_child_probe(
@@ -147,12 +270,13 @@ def test_signal_handler_never_launches_a_timer(tmp_path: Path) -> None:
             "-c",
             """
 source "$1"
+timer_path=$2
 signal_child_group() { :; }
-arm_child_shutdown() { : >"$2"; }
+arm_child_shutdown() { : >"$timer_path"; }
 CHILD_PID=123
 on_signal TERM 143
 [ "${CHILD_SIGNAL_FORWARDED}" = true ]
-[ ! -e "$2" ]
+[ ! -e "${timer_path}" ]
 """,
             "bash",
             str(definitions),
@@ -263,6 +387,44 @@ finish 0
 
     assert finish_result.returncode == 143, finish_result.stderr
     assert not receipt.exists()
+
+
+def test_signal_before_receipt_boundary_changes_final_exit(tmp_path: Path) -> None:
+    """The final interrupt decision must follow the receipt boundary."""
+
+    definitions = _script_definitions(tmp_path)
+    written_exit = tmp_path / "written-exit"
+    finish_result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            """
+source "$1"
+set -T
+WRITTEN_EXIT=$2
+EXIT_TRAP_ACTIVE=true
+cleanup_envelope() { CLEANUP_COMPLETE=true; }
+write_receipt() { printf '%s\n' "$1" >"${WRITTEN_EXIT}"; }
+inject_before_boundary() {
+  if [ "${BASH_COMMAND}" = RECEIPT_FINALIZING=true ]; then
+    trap - DEBUG
+    on_signal TERM 143
+  fi
+}
+trap inject_before_boundary DEBUG
+finish 0
+""",
+            "bash",
+            str(definitions),
+            str(written_exit),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert finish_result.returncode == 143, finish_result.stderr
+    assert written_exit.read_text(encoding="utf-8") == "143\n"
 
 
 @pytest.mark.parametrize(

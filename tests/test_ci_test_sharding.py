@@ -9,7 +9,6 @@ from pathlib import Path
 
 import yaml
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPOSITORY_ROOT / "scripts" / "ci" / "shard_pytest_nodeids.py"
 SPEC = importlib.util.spec_from_file_location("shard_pytest_nodeids", SCRIPT_PATH)
@@ -135,6 +134,7 @@ def test_plan_pricing_projection_postgres_runs_in_core_with_its_dsn() -> None:
         "tests/test_plan_pricing_projection_v3_staging_postgres.py",
         "tests/test_plan_pricing_projection_v3_differential_postgres.py",
         "tests/test_plan_pricing_projection_v3_census_postgres.py",
+        "tests/test_plan_pricing_projection_v3_census_signal_postgres.py",
         "tests/test_plan_pricing_projection_v3_work_postgres.py",
         "tests/test_ptg2_factorized_card_postgres.py",
     ):
@@ -170,9 +170,12 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
     assert "scripts/ci/shard_pytest_nodeids.py" in prepush
     assert "mrf-python-coverage-main-${{ matrix.shard-index }}" in workflow
     assert "pattern: mrf-python-coverage-main-*" in workflow
-    assert yaml.safe_load(workflow)["jobs"]["address-canonical-db-tests"][
-        "timeout-minutes"
-    ] == 15
+    assert (
+        yaml.safe_load(workflow)["jobs"]["address-canonical-db-tests"][
+            "timeout-minutes"
+        ]
+        == 15
+    )
     assert "mrf-python-coverage-postgres-${{ matrix.shard }}" in workflow
     assert "pattern: mrf-python-coverage-postgres-*" in workflow
     assert 'scripts/ci/prepush postgres "${{ matrix.shard }}"' in workflow

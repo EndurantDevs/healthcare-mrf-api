@@ -1,11 +1,57 @@
 """Failure-safety checks for the plan-pricing census envelope."""
 
+import hashlib
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from . import test_plan_pricing_projection_v3_census_envelope as envelope
+
+
+def test_envelope_uses_ordered_fences_and_reverse_uid_cleanup(tmp_path: Path) -> None:
+    """A successful foreground census must release every exact outer fence."""
+
+    run_result, state_root = envelope._run_envelope(tmp_path, FAKE_ARC_LISTENER="1")
+
+    assert run_result.returncode == 0, run_result.stderr
+    events = (tmp_path / "fake-state/events").read_text().splitlines()
+    expected_events = [
+        "lock_create",
+        "quota_create",
+        "quota_probe_denied",
+        "drain_read",
+        "drain_set_true",
+        "drain_read",
+        "policy_create",
+        "binding_create",
+        "probe_denied",
+        "drain_read",
+        "child",
+        "drain_read",
+        "binding_delete",
+        "policy_delete",
+        "drain_set_false",
+        "quota_delete",
+        "lock_stop",
+    ]
+    assert [event for event in events if event in expected_events] == expected_events
+    assert events.count("zero_sample") == 5
+    receipt = envelope._receipt(state_root)
+    assert receipt["status"] == "complete"
+    assert receipt["cleanup"]["complete"] is True
+    assert receipt["probe_verified"] is True
+    assert receipt["quota_probe_verified"] is True
+    assert receipt["pre_child_fence_verified"] is True
+    assert receipt["post_child_fence_verified"] is True
+    assert receipt["prior_drain_mode"] is False
+    receipt_path = state_root / "run/census-receipt.json"
+    assert (
+        receipt["census_receipt_sha256"]
+        == hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+    )
+    assert receipt["census_job"] == "plan-pricing-v3-census-test"
+    assert "off-node PostgreSQL" in receipt["postgresql_boundary"]
 
 
 def test_plan_renders_exact_fences_without_external_commands(tmp_path: Path) -> None:
@@ -59,6 +105,39 @@ def test_uid_drift_retains_outer_fences(tmp_path: Path) -> None:
         "policy_removed": False,
         "quota_removed": False,
     }
+
+
+def test_uid_replacement_during_delete_retains_outer_fences(tmp_path: Path) -> None:
+    """A server-side UID precondition must retain a replacement resource."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        FAKE_REPLACE_ON_DELETE="policy",
+    )
+
+    assert result.returncode == 1
+    events = (tmp_path / "fake-state/events").read_text().splitlines()
+    assert "binding_delete" in events
+    assert "policy_replace" in events
+    assert "policy_delete" not in events
+    assert "drain_set_false" not in events
+    assert "quota_delete" not in events
+    assert "lock_stop" not in events
+    receipt = envelope._receipt(state_root)
+    assert receipt["cleanup"]["binding_removed"] is True
+    assert receipt["cleanup"]["complete"] is False
+
+
+def test_uid_bound_delete_waits_for_same_uid_finalization(tmp_path: Path) -> None:
+    """Foreground deletion must wait through same-UID terminating reads."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        FAKE_DELETE_LINGER="policy",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert envelope._receipt(state_root)["cleanup"]["complete"] is True
 
 
 def test_native_124_is_not_misclassified_as_owned_deadline(tmp_path: Path) -> None:
@@ -117,6 +196,36 @@ def test_preexisting_resource_fails_before_any_mutation(tmp_path: Path) -> None:
     assert not (state_root / "run").exists()
 
 
+def test_missing_v1_admission_api_fails_before_any_mutation(tmp_path: Path) -> None:
+    """The exact admission API must exist before any outer fence is created."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        FAKE_V1_ADMISSION_MISSING="1",
+    )
+
+    assert result.returncode == 1
+    assert not (tmp_path / "fake-state/events").exists()
+    assert not (state_root / "run").exists()
+
+
+@pytest.mark.parametrize("server_minor", ["29", "35+", "invalid"])
+def test_unsupported_server_version_fails_before_any_mutation(
+    tmp_path: Path,
+    server_minor: str,
+) -> None:
+    """An old or malformed Kubernetes version must fail before the lock."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        FAKE_SERVER_MINOR=server_minor,
+    )
+
+    assert result.returncode == 1
+    assert not (tmp_path / "fake-state/events").exists()
+    assert not (state_root / "run").exists()
+
+
 def test_preexisting_census_pod_fails_before_any_mutation(tmp_path: Path) -> None:
     """A labeled census Pod must fail before acquiring any outer fence."""
 
@@ -128,24 +237,6 @@ def test_preexisting_census_pod_fails_before_any_mutation(tmp_path: Path) -> Non
     assert result.returncode == 1
     assert not (tmp_path / "fake-state/events").exists()
     assert not (state_root / "run").exists()
-
-
-def test_quota_must_deny_a_server_dry_run_before_arc_drain(tmp_path: Path) -> None:
-    """The ARC hold must prove its exact admission path before progressing."""
-
-    result, state_root = envelope._run_envelope(
-        tmp_path,
-        FAKE_QUOTA_PROBE_ALLOWED="1",
-    )
-
-    assert result.returncode == 1
-    events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert events.count("quota_probe_allowed") == 20
-    assert "drain_read" not in events
-    assert events[-2:] == ["quota_delete", "lock_stop"]
-    receipt = envelope._receipt(state_root)
-    assert receipt["quota_probe_verified"] is False
-    assert receipt["cleanup"]["complete"] is True
 
 
 def test_seed_reappearance_retains_drain_quota_and_lock(tmp_path: Path) -> None:

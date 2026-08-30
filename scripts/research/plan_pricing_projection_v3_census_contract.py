@@ -38,8 +38,8 @@ from api.ptg2_db_sidecars import (
     PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES_PER_BLOCK,
     PRICE_MEMBERSHIP_TRANSIENT_BYTES_PER_FRAGMENT,
 )
-from scripts.research.plan_pricing_projection_v3_census_diagnostics import (
-    is_database_receipt_valid as _is_database_receipt_valid,
+from scripts.research import (
+    plan_pricing_projection_v3_census_diagnostics as diagnostics,
 )
 from scripts.research.plan_pricing_projection_v3_census_support import ReleaseInput
 from scripts.research.plan_pricing_projection_v3_census_transaction import (
@@ -387,12 +387,12 @@ def _is_measurement_schema_valid(measured_result: Mapping[str, Any]) -> bool:
     )
 
 
-def is_accepted(
+def _is_cardinality_candidate_accepted(
     receipt_by_field: Mapping[str, Any],
     measured_result: Mapping[str, Any],
     source_matches: bool,
 ) -> bool:
-    """Return whether one full cardinality receipt passed every safe gate."""
+    """Return whether one inner receipt passed every cardinality gate."""
 
     fixed_gates = measured_result.get("fixed_cap_gates")
     observed_limits = measured_result.get("observed_work_limits")
@@ -401,7 +401,7 @@ def is_accepted(
     postflight = receipt_by_field.get("postflight")
     return (
         source_matches
-        and _is_database_receipt_valid(receipt_by_field)
+        and diagnostics.is_database_receipt_valid(receipt_by_field)
         and receipt_by_field.get("rollback_complete") is True
         and receipt_by_field.get("temporary_relations_after_rollback") == []
         and isinstance(fixed_gates, Mapping)
@@ -415,6 +415,24 @@ def is_accepted(
         and observed_limits == observed_work_limits(work_by_field)
         and isinstance(postflight, Mapping)
         and postflight.get("accepted") is True
+    )
+
+
+def is_accepted(
+    receipt_by_field: Mapping[str, Any],
+    measured_result: Mapping[str, Any],
+    source_matches: bool,
+    envelope_by_field: Mapping[str, Any],
+) -> bool:
+    """Accept evidence only when its outer process envelope also succeeded."""
+
+    return _is_cardinality_candidate_accepted(
+        receipt_by_field,
+        measured_result,
+        source_matches,
+    ) and diagnostics.is_authoritative_envelope(
+        receipt_by_field,
+        envelope_by_field,
     )
 
 
@@ -474,6 +492,7 @@ def seal_cardinality_census(
         accepted=is_accepted,
         cap_calibration_admissible=is_accepted,
         resource_proof_admissible=False,
+        acceptance_authority=diagnostics.CENSUS_ACCEPTANCE_AUTHORITY,
         proof_scope="row_count_limits_only",
         finished_at=finished_at,
         phase="complete",

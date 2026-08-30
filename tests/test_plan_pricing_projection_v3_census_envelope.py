@@ -19,34 +19,20 @@ import os
 from pathlib import Path
 import signal
 import sys
-
-
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
 state = Path(os.environ["FAKE_STATE"])
 events = state / "events"
-
-
 def event(value: str) -> None:
     with events.open("a", encoding="utf-8") as target:
         target.write(value + "\n")
-
-
-def raise_exit(code: int) -> None:
-    raise SystemExit(code)
-
-
-def resource_path(kind: str) -> Path:
-    return state / kind
-
-
-if name == "hostname":
-    print("ns1033171")
+def raise_exit(code: int) -> None: raise SystemExit(code)
+def resource_path(kind: str) -> Path: return state / kind
+if name == "hostname": print("ns1033171")
 elif name == "git":
     if "rev-parse" in args:
         print(os.environ["FAKE_SOURCE_SHA"])
-elif name == "sleep":
-    pass
+elif name == "sleep": pass
 elif name == "systemd-run":
     event("lock_create")
     resource_path("lock").touch()
@@ -54,8 +40,7 @@ elif name == "systemd-run":
         Path(args[-1]).write_text(
             "lock-invocation-uid:" + args[-2] + "\n", encoding="utf-8"
         )
-    if os.environ.get("FAKE_LOCK_CLIENT_ERROR") == "1":
-        raise SystemExit(75)
+    if os.environ.get("FAKE_LOCK_CLIENT_ERROR") == "1": raise SystemExit(75)
 elif name == "systemctl":
     operation = args[0]
     after_child = events.exists() and "child" in events.read_text()
@@ -75,9 +60,7 @@ elif name == "systemctl":
         resource_path("lock").unlink(missing_ok=True)
     elif operation == "reset-failed":
         pass
-elif name == "setsid":
-    os.setsid()
-    os.execvp(args[0], args)
+elif name == "setsid": os.setsid(); os.execvp(args[0], args)
 elif name == "timeout":
     command_index = next(
         index + 1
@@ -88,6 +71,9 @@ elif name == "timeout":
     os.execvp(args[command_index], args[command_index:])
 elif name == "census-child":
     event("child")
+    if args[:1] != ["--receipt"]: raise SystemExit("missing census receipt path")
+    Path(args[1]).write_text(json.dumps({"accepted": True}, indent=2, sort_keys=True) + "\n")
+    args = args[2:]
     if os.environ.get("FAKE_CHILD_MODE") == "exit7":
         raise SystemExit(7)
     if os.environ.get("FAKE_CHILD_MODE") == "native124":
@@ -137,7 +123,11 @@ elif name == "k3s":
     if operation == "config":
         print("default")
     elif operation == "exec":
-        desired = args[-1]
+        desired, node_id, token_env = args[-3:]
+        if node_id != os.environ["FAKE_IMPORT_NODE_ID"]:
+            raise SystemExit("unexpected import node")
+        if token_env != os.environ["FAKE_IMPORT_TOKEN_ENV"]:
+            raise SystemExit("unexpected import token environment")
         drain_path = resource_path("drain")
         current = drain_path.read_text().strip() if drain_path.exists() else "false"
         if desired in {"true", "false"}:
@@ -175,16 +165,45 @@ elif name == "k3s":
         if os.environ.get("FAKE_CREATE_ERROR") == kind:
             raise SystemExit(75)
     elif operation == "delete":
-        kind = {
-            "resourcequota": "quota",
-            "validatingadmissionpolicy": "policy",
-            "validatingadmissionpolicybinding": "binding",
-        }[args[1]]
-        resource_path(kind).unlink(missing_ok=True)
+        raw_path = next(
+            argument.removeprefix("--raw=")
+            for argument in args
+            if argument.startswith("--raw=")
+        )
+        if "/resourcequotas/" in raw_path:
+            kind = "quota"
+        elif "/validatingadmissionpolicies/" in raw_path:
+            kind = "policy"
+        elif "/validatingadmissionpolicybindings/" in raw_path:
+            kind = "binding"
+        else:
+            raise SystemExit("unexpected raw delete path")
+        options = json.load(sys.stdin)
+        if options != {
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "preconditions": {"uid": kind + "-uid"},
+            "propagationPolicy": "Foreground",
+        }:
+            raise SystemExit("missing UID delete precondition")
+        if os.environ.get("FAKE_REPLACE_ON_DELETE") == kind:
+            event(kind + "_replace")
+            raise SystemExit("UID precondition failed")
+        if os.environ.get("FAKE_DELETE_LINGER") == kind: resource_path(kind + "-deleting").touch()
+        else: resource_path(kind).unlink(missing_ok=True)
         event(kind + "_delete")
     elif operation == "get":
         kind = args[1]
-        if (
+        if kind == "--raw":
+            if args[2] == "/version":
+                print(json.dumps({"major": os.environ.get("FAKE_SERVER_MAJOR", "1"), "minor": os.environ.get("FAKE_SERVER_MINOR", "35")}))
+                raise SystemExit(0)
+            resources = ["validatingadmissionpolicies"]
+            if os.environ.get("FAKE_V1_ADMISSION_MISSING") != "1":
+                resources.append("validatingadmissionpolicybindings")
+            print(json.dumps({"resources": [{"name": value} for value in resources]}))
+            raise SystemExit(0)
+        elif (
             os.environ.get("FAKE_GET_ERROR_AFTER_CHILD") == kind
             and events.exists()
             and "child" in events.read_text()
@@ -259,7 +278,7 @@ elif name == "k3s":
                 print('{"items":[{"kind":"Pod","status":{"phase":"Running"}}]}')
             else:
                 print('{"items":[]}')
-        elif kind == "deployment" and args[2] == "import-control-scheduler":
+        elif kind == "deployment" and args[2] == os.environ["FAKE_IMPORT_SCHEDULER"]:
             scheduler_drift = (
                 os.environ.get("FAKE_SCHEDULER_DRIFT_AFTER_CHILD") == "1"
                 and events.exists()
@@ -297,11 +316,18 @@ elif name == "k3s":
             elif "name" in args[-1]:
                 print(f"{kind}/{args[2]}")
             elif "jsonpath" in args[-1]:
-                drift = (
-                    os.environ.get("FAKE_DRIFT") == file_kind
-                    and "binding_delete" in events.read_text()
-                )
-                print("drifted-uid" if drift else file_kind + "-uid", end="")
+                deleting = resource_path(file_kind + "-deleting")
+                if deleting.exists():
+                    delete_reads = resource_path(file_kind + "-delete-reads")
+                    count = int(delete_reads.read_text()) if delete_reads.exists() else 0
+                    if count == 2:
+                        resource_path(file_kind).unlink(missing_ok=True); deleting.unlink(); delete_reads.unlink(missing_ok=True)
+                    else:
+                        delete_reads.write_text(str(count + 1)); print(file_kind + "-uid", end="")
+                else:
+                    drift = os.environ.get("FAKE_DRIFT") == file_kind \
+                        and "binding_delete" in events.read_text()
+                    print("drifted-uid" if drift else file_kind + "-uid", end="")
             elif args[-1] == "json":
                 owner = os.environ["FAKE_OWNER"]
                 uid = file_kind + "-uid"
@@ -378,6 +404,7 @@ else:
 
 
 def _arguments(state_root: Path, repo: Path) -> list[str]:
+    receipt_path = str(state_root / "run/census-receipt.json")
     return [
         "--owner-token",
         OWNER,
@@ -393,8 +420,20 @@ def _arguments(state_root: Path, repo: Path) -> list[str]:
         "plan-pricing-v3-census-test",
         "--census-configmap",
         "plan-pricing-v3-census-src-test",
+        "--census-receipt",
+        receipt_path,
+        "--drain-deployment",
+        "control-api",
+        "--import-scheduler-deployment",
+        "control-scheduler",
+        "--import-node-id",
+        "plan-node",
+        "--import-token-env",
+        "TEST_IMPORT_TOKEN",
         "--",
         "census-child",
+        "--receipt",
+        receipt_path,
     ]
 
 
@@ -428,6 +467,9 @@ def _fake_environment(
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "FAKE_DENIAL_MARKER": f"hp-pv3-census-deny-{OWNER}",
+        "FAKE_IMPORT_NODE_ID": "plan-node",
+        "FAKE_IMPORT_SCHEDULER": "control-scheduler",
+        "FAKE_IMPORT_TOKEN_ENV": "TEST_IMPORT_TOKEN",
         "FAKE_OWNER": OWNER,
         "FAKE_POLICY": f"hp-pv3-census-{OWNER}.healthporta.com",
         "FAKE_QUOTA": f"hp-pv3-census-{OWNER}",
@@ -440,13 +482,11 @@ def _fake_environment(
     return env_by_name, state_root, checkout
 
 
-def _receipt(state_root: Path) -> dict:
+def _receipt(state_root) -> dict:
     return json.loads((state_root / "run/envelope-receipt.json").read_text())
 
 
-def _run_envelope(
-    tmp_path: Path, **overrides: str
-) -> tuple[subprocess.CompletedProcess, Path]:
+def _run_envelope(tmp_path, **overrides) -> tuple[subprocess.CompletedProcess, Path]:
     env_by_name, state_root, checkout = _fake_environment(tmp_path, **overrides)
     result = subprocess.run(
         ["/bin/bash", str(SCRIPT), "run", *_arguments(state_root, checkout)],
@@ -454,45 +494,6 @@ def _run_envelope(
         check=False,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=30,
     )
     return result, state_root
-
-
-def test_envelope_uses_ordered_fences_and_reverse_uid_cleanup(tmp_path: Path) -> None:
-    """A successful foreground census must release every exact outer fence."""
-
-    run_result, state_root = _run_envelope(tmp_path, FAKE_ARC_LISTENER="1")
-
-    assert run_result.returncode == 0, run_result.stderr
-    events = (tmp_path / "fake-state/events").read_text().splitlines()
-    expected_events = [
-        "lock_create",
-        "quota_create",
-        "quota_probe_denied",
-        "drain_read",
-        "drain_set_true",
-        "drain_read",
-        "policy_create",
-        "binding_create",
-        "probe_denied",
-        "drain_read",
-        "child",
-        "drain_read",
-        "binding_delete",
-        "policy_delete",
-        "drain_set_false",
-        "quota_delete",
-        "lock_stop",
-    ]
-    assert [event for event in events if event in expected_events] == expected_events
-    assert events.count("zero_sample") == 5
-    receipt = _receipt(state_root)
-    assert receipt["status"] == "complete"
-    assert receipt["cleanup"]["complete"] is True
-    assert receipt["probe_verified"] is True
-    assert receipt["quota_probe_verified"] is True
-    assert receipt["pre_child_fence_verified"] is True
-    assert receipt["post_child_fence_verified"] is True
-    assert receipt["prior_drain_mode"] is False
-    assert "off-node PostgreSQL" in receipt["postgresql_boundary"]

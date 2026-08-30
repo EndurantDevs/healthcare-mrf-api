@@ -7,12 +7,54 @@ import pytest
 
 from scripts.research import plan_pricing_projection_v3_census as census
 from scripts.research import plan_pricing_projection_v3_census_contract as contract
+from scripts.research import (
+    plan_pricing_projection_v3_census_diagnostics as diagnostics,
+)
 
 _RUNTIME = {
     "job_name": "census-job",
     "pod_uid": "pod-uid",
     "image_digest": "sha256:" + "c" * 64,
 }
+_SOURCE_SHA = "a" * 40
+
+
+def _successful_envelope(receipt_by_field: dict) -> dict:
+    return {
+        "contract": diagnostics.CENSUS_ENVELOPE_CONTRACT,
+        "status": "complete",
+        "exit_code": 0,
+        "reviewed_source_sha": _SOURCE_SHA,
+        "envelope_script_sha256": "b" * 64,
+        "owner_token": "testowner1",
+        "resource_uids": {
+            "quota": "quota-uid",
+            "policy": "policy-uid",
+            "binding": "binding-uid",
+            "lock_invocation": "lock-uid",
+        },
+        "prior_drain_mode": False,
+        "child_command_sha256": "c" * 64,
+        "child_exit_code": 0,
+        "census_job": receipt_by_field["runtime"]["job_name"],
+        "census_receipt_sha256": diagnostics.census_receipt_sha256(receipt_by_field),
+        "timed_out": False,
+        "probe_verified": True,
+        "quota_probe_verified": True,
+        "pre_child_fence_verified": True,
+        "post_child_fence_verified": True,
+        "cleanup": {
+            "binding_removed": True,
+            "policy_removed": True,
+            "drain_restored": True,
+            "quota_removed": True,
+            "lock_released": True,
+            "complete": True,
+        },
+        "postgresql_boundary": (
+            "Kubernetes QoS does not reserve or cap off-node PostgreSQL"
+        ),
+    }
 
 
 def _database_receipt() -> dict:
@@ -76,6 +118,16 @@ def _accepted_inputs() -> tuple[dict, dict]:
     return (
         {
             **_database_receipt(),
+            "contract": diagnostics.CENSUS_RECEIPT_CONTRACT,
+            "status": "complete",
+            "accepted": True,
+            "mode": "cardinality_census",
+            "cap_calibration_admissible": True,
+            "resource_proof_admissible": False,
+            "acceptance_authority": diagnostics.CENSUS_ACCEPTANCE_AUTHORITY,
+            "proof_scope": "row_count_limits_only",
+            "source_before": {"declared_git_head": _SOURCE_SHA},
+            "source_after": {"declared_git_head": _SOURCE_SHA},
             "rollback_complete": True,
             "temporary_relations_after_rollback": [],
             "postflight": {"accepted": True},
@@ -89,10 +141,77 @@ def _accepted_inputs() -> tuple[dict, dict]:
     )
 
 
+def _is_accepted(
+    receipt_by_field: dict,
+    measurement_by_field: dict,
+    envelope_by_field: dict | None = None,
+) -> bool:
+    return contract.is_accepted(
+        receipt_by_field,
+        measurement_by_field,
+        True,
+        envelope_by_field or _successful_envelope(receipt_by_field),
+    )
+
+
 def test_acceptance_admits_the_unmutated_baseline() -> None:
     receipt_by_field, measurement_by_field = _accepted_inputs()
 
-    assert contract.is_accepted(receipt_by_field, measurement_by_field, True)
+    assert _is_accepted(receipt_by_field, measurement_by_field)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda envelope: envelope.update(status="failed"),
+        lambda envelope: envelope.update(exit_code=True),
+        lambda envelope: envelope.update(child_exit_code=143),
+        lambda envelope: envelope.update(census_job="stale-job"),
+        lambda envelope: envelope.update(census_receipt_sha256="d" * 64),
+        lambda envelope: envelope.update(timed_out=True),
+        lambda envelope: envelope.update(post_child_fence_verified=False),
+        lambda envelope: envelope["cleanup"].update(complete=False),
+        lambda envelope: envelope.update(reviewed_source_sha="d" * 40),
+    ],
+)
+def test_acceptance_requires_the_successful_outer_envelope(mutation) -> None:
+    """Inner evidence is provisional until the outer child exit is accepted."""
+
+    receipt_by_field, measurement_by_field = _accepted_inputs()
+    envelope_by_field = _successful_envelope(receipt_by_field)
+    mutation(envelope_by_field)
+
+    assert not _is_accepted(
+        receipt_by_field,
+        measurement_by_field,
+        envelope_by_field,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda receipt: receipt.pop("contract"),
+        lambda receipt: receipt.update(contract="unknown"),
+    ],
+)
+def test_acceptance_requires_the_exact_inner_contract(mutation) -> None:
+    receipt_by_field, measurement_by_field = _accepted_inputs()
+    mutation(receipt_by_field)
+
+    assert not _is_accepted(receipt_by_field, measurement_by_field)
+
+
+def test_acceptance_rejects_a_stale_same_source_inner_receipt() -> None:
+    receipt_by_field, measurement_by_field = _accepted_inputs()
+    envelope_by_field = _successful_envelope(receipt_by_field)
+    receipt_by_field["finished_at"] = "later"
+
+    assert not _is_accepted(
+        receipt_by_field,
+        measurement_by_field,
+        envelope_by_field,
+    )
 
 
 @pytest.mark.parametrize(
@@ -124,7 +243,7 @@ def test_acceptance_rejects_malformed_gate_or_limit_contract(
     receipt_by_field, measurement_by_field = _accepted_inputs()
     mutation(measurement_by_field[collection_name])
 
-    assert not contract.is_accepted(receipt_by_field, measurement_by_field, True)
+    assert not _is_accepted(receipt_by_field, measurement_by_field)
 
 
 @pytest.mark.parametrize(
@@ -168,7 +287,7 @@ def test_acceptance_rejects_malformed_measurement_contract(mutation) -> None:
     receipt_by_field, measurement_by_field = _accepted_inputs()
     mutation(measurement_by_field)
 
-    assert not contract.is_accepted(receipt_by_field, measurement_by_field, True)
+    assert not _is_accepted(receipt_by_field, measurement_by_field)
 
 
 def test_acceptance_recomputes_derived_gates_and_limits() -> None:
@@ -178,13 +297,13 @@ def test_acceptance_recomputes_derived_gates_and_limits() -> None:
         "total": oversized_occurrence_count,
         "maximum_per_code": oversized_occurrence_count,
     }
-    assert not contract.is_accepted(receipt_by_field, measurement_by_field, True)
+    assert not _is_accepted(receipt_by_field, measurement_by_field)
 
     receipt_by_field, measurement_by_field = _accepted_inputs()
     measurement_by_field["observed_work_limits"][
         "maximum_code_membership_probe_rows"
     ] = 2
-    assert not contract.is_accepted(receipt_by_field, measurement_by_field, True)
+    assert not _is_accepted(receipt_by_field, measurement_by_field)
 
 
 def test_acceptance_requires_exact_census_database_settings() -> None:
@@ -194,7 +313,7 @@ def test_acceptance_requires_exact_census_database_settings() -> None:
         "work_mem": "32MB",
     }
 
-    assert not contract.is_accepted(receipt_by_field, measurement_by_field, True)
+    assert not _is_accepted(receipt_by_field, measurement_by_field)
 
 
 @pytest.mark.parametrize(
@@ -213,7 +332,7 @@ def test_acceptance_rejects_malformed_database_attribution(mutation) -> None:
     receipt_by_field, measurement_by_field = _accepted_inputs()
     mutation(receipt_by_field)
 
-    assert not contract.is_accepted(receipt_by_field, measurement_by_field, True)
+    assert not _is_accepted(receipt_by_field, measurement_by_field)
 
 
 @pytest.mark.parametrize(

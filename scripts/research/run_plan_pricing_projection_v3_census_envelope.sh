@@ -21,6 +21,11 @@ REPO_DIR=
 DEADLINE_SECONDS=
 CENSUS_JOB=
 CENSUS_CONFIGMAP=
+CENSUS_RECEIPT=
+DRAIN_DEPLOYMENT=
+IMPORT_SCHEDULER_DEPLOYMENT=
+IMPORT_NODE_ID=
+IMPORT_TOKEN_ENV=
 CHILD_COMMAND=()
 
 LOCK_UNIT=
@@ -36,6 +41,7 @@ BINDING_UID=
 DENIAL_MARKER=
 PRIOR_DRAIN_MODE=
 CHILD_COMMAND_SHA256=
+CENSUS_RECEIPT_SHA256=
 CHILD_EXIT_CODE=
 CHILD_PID=
 CHILD_KILL_TIMER_PID=
@@ -73,6 +79,9 @@ usage() {
     'usage: run_plan_pricing_projection_v3_census_envelope.sh [plan|run]' \
     '  --owner-token TOKEN --state-dir PATH --source-sha SHA --repo-dir PATH' \
     '  --deadline-seconds SECONDS --census-job NAME --census-configmap NAME' \
+    '  --census-receipt PATH' \
+    '  --drain-deployment NAME --import-scheduler-deployment NAME' \
+    '  --import-node-id ID --import-token-env NAME' \
     '  -- CENSUS_COMMAND [ARG ...]'
 }
 
@@ -110,6 +119,16 @@ parse_args() {
         require_value "$@"; CENSUS_JOB=$2; shift 2 ;;
       --census-configmap)
         require_value "$@"; CENSUS_CONFIGMAP=$2; shift 2 ;;
+      --census-receipt)
+        require_value "$@"; CENSUS_RECEIPT=$2; shift 2 ;;
+      --drain-deployment)
+        require_value "$@"; DRAIN_DEPLOYMENT=$2; shift 2 ;;
+      --import-scheduler-deployment)
+        require_value "$@"; IMPORT_SCHEDULER_DEPLOYMENT=$2; shift 2 ;;
+      --import-node-id)
+        require_value "$@"; IMPORT_NODE_ID=$2; shift 2 ;;
+      --import-token-env)
+        require_value "$@"; IMPORT_TOKEN_ENV=$2; shift 2 ;;
       --)
         shift
         CHILD_COMMAND=("$@")
@@ -141,6 +160,18 @@ validate_args() {
   [[ "${CENSUS_CONFIGMAP}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
     && [ "${#CENSUS_CONFIGMAP}" -le 63 ] \
     || die "exact census ConfigMap name is invalid"
+  [ "${CENSUS_RECEIPT}" = "${STATE_DIR}/census-receipt.json" ] \
+    || die "exact census receipt must be the task state receipt"
+  [[ "${DRAIN_DEPLOYMENT}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
+    && [ "${#DRAIN_DEPLOYMENT}" -le 63 ] \
+    || die "import API deployment name is invalid"
+  [[ "${IMPORT_SCHEDULER_DEPLOYMENT}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
+    && [ "${#IMPORT_SCHEDULER_DEPLOYMENT}" -le 63 ] \
+    || die "import scheduler deployment name is invalid"
+  [[ "${IMPORT_NODE_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] \
+    || die "import node identity is invalid"
+  [[ "${IMPORT_TOKEN_ENV}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+    || die "import token environment name is invalid"
   [ "${#CHILD_COMMAND[@]}" -gt 0 ] || die "foreground census command is required"
 
   LOCK_UNIT="hp-pv3-census-${OWNER_TOKEN}-lock.service"
@@ -268,7 +299,7 @@ render_plan() {
     '  - validate exact DEV/source/resource absence' \
     '  - acquire bounded dev-build flock' \
     '  - create UID-bound ARC pods=0 quota, prove admission, and drain ARC naturally' \
-    '  - capture and set Import Control local_mrf drain_mode' \
+    '  - capture and set the exact import-node drain state' \
     '  - create UID-bound engine-worker deny policy and prove denial marker' \
     '  - require scheduler=0 and three stable zero-work samples' \
     '  - run foreground census command under remaining deadline' \
@@ -305,6 +336,15 @@ run_bounded() {
 kctl() {
   local limit
   limit=$(operation_timeout) || return $?
+  kctl_with_limit "${limit}" "$@"
+}
+
+kctl_with_limit() {
+  local limit=$1
+  shift
+  [ "${limit}" -gt 0 ] || return 124
+  [ "${limit}" -le "${OPERATION_TIMEOUT_SECONDS}" ] \
+    || limit=${OPERATION_TIMEOUT_SECONDS}
   timeout --foreground --signal=TERM --kill-after=2s "${limit}s" \
     k3s kubectl --kubeconfig="${KUBECONFIG}" \
     --request-timeout="${limit}s" "$@"
@@ -315,12 +355,19 @@ require_command() {
 }
 
 resource_is_absent() {
-  local kind=$1 name=$2 namespace=${3:-} observed
+  local limit
+  limit=$(operation_timeout) || return $?
+  resource_is_absent_with_limit "${limit}" "$@"
+}
+
+resource_is_absent_with_limit() {
+  local limit=$1 kind=$2 name=$3 namespace=${4:-} observed
   if [ -n "${namespace}" ]; then
-    observed=$(kctl -n "${namespace}" get "${kind}" "${name}" \
+    observed=$(kctl_with_limit "${limit}" -n "${namespace}" \
+      get "${kind}" "${name}" \
       --ignore-not-found -o name) || return 1
   else
-    observed=$(kctl get "${kind}" "${name}" \
+    observed=$(kctl_with_limit "${limit}" get "${kind}" "${name}" \
       --ignore-not-found -o name) || return 1
   fi
   [ -z "${observed}" ]
@@ -348,6 +395,31 @@ unit_load_state() {
   printf '%s\n' "${state}"
 }
 
+verify_admission_v1() {
+  kctl get --raw /version | python3 -c '
+import json, re, sys
+
+version = json.load(sys.stdin)
+major = version.get("major")
+minor = version.get("minor")
+if (not isinstance(major, str) or not re.fullmatch(r"[0-9]+", major)
+    or not isinstance(minor, str) or not re.fullmatch(r"[0-9]+", minor)
+    or (int(major), int(minor)) < (1, 30)):
+    raise SystemExit("Kubernetes server must be an exact version at least 1.30")
+'
+  kctl get --raw /apis/admissionregistration.k8s.io/v1 | python3 -c '
+import json, sys
+
+required = {
+    "validatingadmissionpolicies",
+    "validatingadmissionpolicybindings",
+}
+available = {item.get("name") for item in json.load(sys.stdin).get("resources", [])}
+if not required <= available:
+    raise SystemExit("required admissionregistration.k8s.io/v1 resources are absent")
+'
+}
+
 verify_source_and_target() {
   local host live_head status nodes context
   host=$(hostname -s)
@@ -364,6 +436,7 @@ verify_source_and_target() {
   [ -z "${status}" ] || die "reviewed source checkout is not clean"
   [ ! -e "${STATE_DIR}" ] || die "state directory already exists"
   [ -d "${STATE_ROOT}" ] || die "state root is unavailable"
+  verify_admission_v1
   verify_absent resourcequota "${QUOTA_NAME}" "${ARC_HOLD_NAMESPACE}"
   verify_absent validatingadmissionpolicy "${POLICY_NAME}"
   verify_absent validatingadmissionpolicybinding "${BINDING_NAME}"
@@ -454,24 +527,33 @@ create_quota() {
 }
 
 prove_quota_admission() {
-  local attempt exit_code=0 probe_name
+  local exit_code=0 probe_name remaining
   probe_name="hp-pv3-census-quota-probe-${OWNER_TOKEN}"
-  for attempt in {1..20}; do
+  while :; do
+    remaining=$(seconds_before_cleanup)
+    [ "${remaining}" -gt 0 ] || break
     check_interrupted
     set +e
-    quota_probe_manifest | kctl -n "${ARC_HOLD_NAMESPACE}" create \
-      --dry-run=server -f - >"${STATE_DIR}/quota-probe.stdout" \
+    quota_probe_manifest | kctl_with_limit "${remaining}" \
+      -n "${ARC_HOLD_NAMESPACE}" create --dry-run=server -f - \
+      >"${STATE_DIR}/quota-probe.stdout" \
       2>"${STATE_DIR}/quota-probe.stderr"
     exit_code=$?
     set -e
-    verify_absent pod "${probe_name}" "${ARC_HOLD_NAMESPACE}"
+    remaining=$(seconds_before_cleanup)
+    [ "${remaining}" -gt 0 ] || break
+    resource_is_absent_with_limit "${remaining}" pod "${probe_name}" \
+      "${ARC_HOLD_NAMESPACE}" \
+      || die "quota probe Pod absence is unreadable"
     if [ "${exit_code}" -ne 0 ] \
         && [[ "$(<"${STATE_DIR}/quota-probe.stderr")" \
           = *"exceeded quota: ${QUOTA_NAME}"* ]]; then
       QUOTA_PROBE_VERIFIED=true
       return 0
     fi
-    [ "${attempt}" -eq 20 ] || sleep 0.25
+    remaining=$(seconds_before_cleanup)
+    [ "${remaining}" -gt 0 ] || break
+    sleep 0.25
   done
   die "ARC quota admission did not prove the exact owner quota"
 }
@@ -527,19 +609,21 @@ wait_for_arc_idle() {
 
 node_drain_mode() {
   local desired=$1
-  kctl -n "${DEV_NAMESPACE}" exec deployment/import-control -- \
+  kctl -n "${DEV_NAMESPACE}" exec "deployment/${DRAIN_DEPLOYMENT}" -- \
     python -c '
 import json, os, sys, urllib.request
+from urllib.parse import quote
 
 desired = sys.argv[1]
-token = os.environ["HP_IMPORT_CONTROL_API_TOKEN"]
+node_id = sys.argv[2]
+token = os.environ[sys.argv[3]]
 data = None
 method = "GET"
 if desired in {"true", "false"}:
     method = "PATCH"
     data = json.dumps({"drain_mode": desired == "true"}).encode()
 request = urllib.request.Request(
-    "http://127.0.0.1:8095/v1/nodes/local_mrf",
+    "http://127.0.0.1:8095/v1/nodes/" + quote(node_id, safe=""),
     data=data,
     method=method,
     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
@@ -547,12 +631,12 @@ request = urllib.request.Request(
 with urllib.request.urlopen(request, timeout=15) as response:
     payload = json.load(response)
 mode = payload.get("drain_mode")
-if payload.get("node_id") != "local_mrf" or type(mode) is not bool:
-    raise SystemExit("import-control returned an invalid node identity")
+if payload.get("node_id") != node_id or type(mode) is not bool:
+    raise SystemExit("import API returned an invalid node identity")
 if desired in {"true", "false"} and mode is not (desired == "true"):
-    raise SystemExit("import-control drain update did not persist")
+    raise SystemExit("import API drain update did not persist")
 print(str(mode).lower())
-' "${desired}"
+' "${desired}" "${IMPORT_NODE_ID}" "${IMPORT_TOKEN_ENV}"
 }
 
 set_import_drain() {
@@ -699,8 +783,8 @@ print(count)
 verify_stable_zero_work() {
   local scheduler count check
   scheduler=$(kctl -n "${DEV_NAMESPACE}" get deployment \
-    import-control-scheduler -o jsonpath='{.spec.replicas}')
-  [ "${scheduler}" = 0 ] || die "Import Control scheduler is not held at zero"
+    "${IMPORT_SCHEDULER_DEPLOYMENT}" -o jsonpath='{.spec.replicas}')
+  [ "${scheduler}" = 0 ] || die "import scheduler is not held at zero"
   for check in 1 2 3; do
     check_interrupted
     count=$(active_engine_count)
@@ -734,7 +818,7 @@ verify_child_fences() {
     && seed_is_absent \
     && [ "$(node_drain_mode read)" = true ] \
     && [ "$(kctl -n "${DEV_NAMESPACE}" get deployment \
-      import-control-scheduler -o jsonpath='{.spec.replicas}')" = 0 ] \
+      "${IMPORT_SCHEDULER_DEPLOYMENT}" -o jsonpath='{.spec.replicas}')" = 0 ] \
     && [ "$(active_engine_count)" -eq 0 ] \
     && [ "$(active_arc_count)" -eq 0 ] \
     && census_resources_absent
@@ -876,6 +960,8 @@ run_child() {
   read -r CHILD_COMMAND_SHA256 _ \
     < <(printf '%q\0' "${CHILD_COMMAND[@]}" | sha256sum)
   CHILD_DEADLINE_MARKER="${STATE_DIR}/child-deadline-fired"
+  [ ! -e "${CENSUS_RECEIPT}" ] && [ ! -L "${CENSUS_RECEIPT}" ] \
+    || die "census receipt already exists"
   check_interrupted
   setsid "${CHILD_COMMAND[@]}" &
   capture_child_pid "$!"
@@ -883,6 +969,13 @@ run_child() {
     "${CHILD_DEADLINE_MARKER}"
   reap_child_group "${CHILD_PID}" \
     || die "census process group did not terminate"
+  if [ -e "${CENSUS_RECEIPT}" ] || [ -L "${CENSUS_RECEIPT}" ]; then
+    [ -f "${CENSUS_RECEIPT}" ] && [ ! -L "${CENSUS_RECEIPT}" ] \
+      || die "census receipt is not a regular file"
+    read -r CENSUS_RECEIPT_SHA256 _ < <(sha256sum "${CENSUS_RECEIPT}")
+  elif [ "${CHILD_EXIT_CODE}" -eq 0 ]; then
+    die "successful census process did not write its receipt"
+  fi
   verify_child_fences || die "post-child envelope fence changed"
   POST_CHILD_FENCE_VERIFIED=true
 }
@@ -905,7 +998,7 @@ on_signal() {
 }
 
 delete_uid_bound() {
-  local kind=$1 name=$2 expected_uid=$3 namespace=${4:-} observed
+  local kind=$1 name=$2 expected_uid=$3 namespace=${4:-} observed path remaining
   if [ -n "${namespace}" ]; then
     observed=$(kctl -n "${namespace}" get "${kind}" "${name}" \
       --ignore-not-found -o jsonpath='{.metadata.uid}')
@@ -915,14 +1008,48 @@ delete_uid_bound() {
   fi
   [ "${observed}" = "${expected_uid}" ] \
     || { log "cleanup retained outer fences after ${kind} UID drift"; return 1; }
-  if [ -n "${namespace}" ]; then
-    kctl -n "${namespace}" delete "${kind}" "${name}" --wait=true \
-      >/dev/null || return 1
-    resource_is_absent "${kind}" "${name}" "${namespace}" || return 1
-  else
-    kctl delete "${kind}" "${name}" --wait=true >/dev/null || return 1
-    resource_is_absent "${kind}" "${name}" || return 1
-  fi
+  case "${kind}" in
+    resourcequota)
+      [ -n "${namespace}" ] || return 1
+      path="/api/v1/namespaces/${namespace}/resourcequotas/${name}"
+      ;;
+    validatingadmissionpolicy)
+      [ -z "${namespace}" ] || return 1
+      path="/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/${name}"
+      ;;
+    validatingadmissionpolicybinding)
+      [ -z "${namespace}" ] || return 1
+      path="/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/${name}"
+      ;;
+    *) return 1 ;;
+  esac
+  python3 -c '
+import json, sys
+json.dump({
+    "apiVersion": "v1",
+    "kind": "DeleteOptions",
+    "preconditions": {"uid": sys.argv[1]},
+    "propagationPolicy": "Foreground",
+}, sys.stdout, separators=(",", ":"))
+' "${expected_uid}" | kctl delete --raw="${path}" -f - >/dev/null \
+    || return 1
+  while :; do
+    remaining=$(operation_timeout) || return $?
+    if [ -n "${namespace}" ]; then
+      observed=$(kctl_with_limit "${remaining}" -n "${namespace}" \
+        get "${kind}" "${name}" --ignore-not-found \
+        -o jsonpath='{.metadata.uid}') || return 1
+    else
+      observed=$(kctl_with_limit "${remaining}" get "${kind}" "${name}" \
+        --ignore-not-found -o jsonpath='{.metadata.uid}') || return 1
+    fi
+    [ -n "${observed}" ] || return 0
+    [ "${observed}" = "${expected_uid}" ] \
+      || { log "cleanup retained outer fences after ${kind} UID drift"; return 1; }
+    remaining=$(operation_timeout) || return $?
+    [ "${remaining}" -gt 1 ] || return 1
+    sleep 0.25
+  done
 }
 
 reconcile_ambiguous_creates() {
@@ -1051,49 +1178,85 @@ cleanup_envelope() {
   return 0
 }
 
-python_bool() {
-  [ "$1" = true ] && printf True || printf False
-}
-
 write_receipt() {
-  local exit_code=$1 script_sha child_exit=None prior=None status=failed
-  script_sha=$(sha256sum "$0")
+  local exit_code=$1 script_sha status=failed
+  script_sha=$(sha256sum "$0") || return 1
   script_sha=${script_sha%% *}
-  [ -z "${CHILD_EXIT_CODE}" ] || child_exit=${CHILD_EXIT_CODE}
-  if [ "${PRIOR_DRAIN_MODE}" = true ]; then
-    prior=True
-  elif [ "${PRIOR_DRAIN_MODE}" = false ]; then
-    prior=False
-  fi
   [ "${exit_code}" -eq 0 ] && [ "${CLEANUP_COMPLETE}" = true ] && status=complete
-  python3 - "${STATE_DIR}/envelope-receipt.json.tmp" <<PY
-import json, sys
+  RECEIPT_STATUS=${status} \
+  RECEIPT_EXIT_CODE=${exit_code} \
+  RECEIPT_SOURCE_SHA=${SOURCE_SHA} \
+  RECEIPT_SCRIPT_SHA=${script_sha} \
+  RECEIPT_OWNER_TOKEN=${OWNER_TOKEN} \
+  RECEIPT_QUOTA_UID=${QUOTA_UID} \
+  RECEIPT_POLICY_UID=${POLICY_UID} \
+  RECEIPT_BINDING_UID=${BINDING_UID} \
+  RECEIPT_LOCK_INVOCATION_ID=${LOCK_INVOCATION_ID} \
+  RECEIPT_PRIOR_DRAIN_MODE=${PRIOR_DRAIN_MODE} \
+  RECEIPT_CHILD_COMMAND_SHA=${CHILD_COMMAND_SHA256} \
+  RECEIPT_CENSUS_JOB=${CENSUS_JOB} \
+  RECEIPT_CENSUS_RECEIPT_SHA=${CENSUS_RECEIPT_SHA256} \
+  RECEIPT_CHILD_EXIT_CODE=${CHILD_EXIT_CODE} \
+  RECEIPT_TIMED_OUT=${TIMED_OUT} \
+  RECEIPT_PROBE_VERIFIED=${PROBE_VERIFIED} \
+  RECEIPT_QUOTA_PROBE_VERIFIED=${QUOTA_PROBE_VERIFIED} \
+  RECEIPT_PRE_CHILD_FENCE_VERIFIED=${PRE_CHILD_FENCE_VERIFIED} \
+  RECEIPT_POST_CHILD_FENCE_VERIFIED=${POST_CHILD_FENCE_VERIFIED} \
+  RECEIPT_BINDING_REMOVED=${BINDING_REMOVED} \
+  RECEIPT_POLICY_REMOVED=${POLICY_REMOVED} \
+  RECEIPT_DRAIN_RESTORED=${DRAIN_RESTORED} \
+  RECEIPT_QUOTA_REMOVED=${QUOTA_REMOVED} \
+  RECEIPT_LOCK_RELEASED=${LOCK_RELEASED} \
+  RECEIPT_CLEANUP_COMPLETE=${CLEANUP_COMPLETE} \
+    python3 - "${STATE_DIR}/envelope-receipt.json.tmp" <<'PY' || return 1
+import json, os, sys
+
+def optional_bool(value):
+    if value == "":
+        return None
+    if value not in {"false", "true"}:
+        raise ValueError("invalid receipt boolean")
+    return value == "true"
+
+def optional_int(value):
+    return None if value == "" else int(value)
+
 receipt = {
     "contract": "healthporta.plan-pricing-v3-census-envelope.v1",
-    "status": "${status}",
-    "exit_code": ${exit_code},
-    "reviewed_source_sha": "${SOURCE_SHA}",
-    "envelope_script_sha256": "${script_sha}",
-    "owner_token": "${OWNER_TOKEN}",
+    "status": os.environ["RECEIPT_STATUS"],
+    "exit_code": int(os.environ["RECEIPT_EXIT_CODE"]),
+    "reviewed_source_sha": os.environ["RECEIPT_SOURCE_SHA"],
+    "envelope_script_sha256": os.environ["RECEIPT_SCRIPT_SHA"],
+    "owner_token": os.environ["RECEIPT_OWNER_TOKEN"],
     "resource_uids": {
-        "quota": "${QUOTA_UID}", "policy": "${POLICY_UID}",
-        "binding": "${BINDING_UID}", "lock_invocation": "${LOCK_INVOCATION_ID}",
+        "quota": os.environ["RECEIPT_QUOTA_UID"],
+        "policy": os.environ["RECEIPT_POLICY_UID"],
+        "binding": os.environ["RECEIPT_BINDING_UID"],
+        "lock_invocation": os.environ["RECEIPT_LOCK_INVOCATION_ID"],
     },
-    "prior_drain_mode": ${prior},
-    "child_command_sha256": "${CHILD_COMMAND_SHA256}",
-    "child_exit_code": ${child_exit},
-    "timed_out": $(python_bool "${TIMED_OUT}"),
-    "probe_verified": $(python_bool "${PROBE_VERIFIED}"),
-    "quota_probe_verified": $(python_bool "${QUOTA_PROBE_VERIFIED}"),
-    "pre_child_fence_verified": $(python_bool "${PRE_CHILD_FENCE_VERIFIED}"),
-    "post_child_fence_verified": $(python_bool "${POST_CHILD_FENCE_VERIFIED}"),
+    "prior_drain_mode": optional_bool(os.environ["RECEIPT_PRIOR_DRAIN_MODE"]),
+    "child_command_sha256": os.environ["RECEIPT_CHILD_COMMAND_SHA"],
+    "census_job": os.environ["RECEIPT_CENSUS_JOB"],
+    "census_receipt_sha256": os.environ["RECEIPT_CENSUS_RECEIPT_SHA"],
+    "child_exit_code": optional_int(os.environ["RECEIPT_CHILD_EXIT_CODE"]),
+    "timed_out": optional_bool(os.environ["RECEIPT_TIMED_OUT"]),
+    "probe_verified": optional_bool(os.environ["RECEIPT_PROBE_VERIFIED"]),
+    "quota_probe_verified": optional_bool(
+        os.environ["RECEIPT_QUOTA_PROBE_VERIFIED"]
+    ),
+    "pre_child_fence_verified": optional_bool(
+        os.environ["RECEIPT_PRE_CHILD_FENCE_VERIFIED"]
+    ),
+    "post_child_fence_verified": optional_bool(
+        os.environ["RECEIPT_POST_CHILD_FENCE_VERIFIED"]
+    ),
     "cleanup": {
-        "binding_removed": $(python_bool "${BINDING_REMOVED}"),
-        "policy_removed": $(python_bool "${POLICY_REMOVED}"),
-        "drain_restored": $(python_bool "${DRAIN_RESTORED}"),
-        "quota_removed": $(python_bool "${QUOTA_REMOVED}"),
-        "lock_released": $(python_bool "${LOCK_RELEASED}"),
-        "complete": $(python_bool "${CLEANUP_COMPLETE}"),
+        "binding_removed": optional_bool(os.environ["RECEIPT_BINDING_REMOVED"]),
+        "policy_removed": optional_bool(os.environ["RECEIPT_POLICY_REMOVED"]),
+        "drain_restored": optional_bool(os.environ["RECEIPT_DRAIN_RESTORED"]),
+        "quota_removed": optional_bool(os.environ["RECEIPT_QUOTA_REMOVED"]),
+        "lock_released": optional_bool(os.environ["RECEIPT_LOCK_RELEASED"]),
+        "complete": optional_bool(os.environ["RECEIPT_CLEANUP_COMPLETE"]),
     },
     "postgresql_boundary": (
         "Kubernetes QoS does not reserve or cap off-node PostgreSQL"
@@ -1103,9 +1266,9 @@ with open(sys.argv[1], "w", encoding="utf-8") as target:
     json.dump(receipt, target, sort_keys=True, separators=(",", ":"))
     target.write("\n")
 PY
-  chmod 0600 "${STATE_DIR}/envelope-receipt.json.tmp"
+  chmod 0600 "${STATE_DIR}/envelope-receipt.json.tmp" || return 1
   mv "${STATE_DIR}/envelope-receipt.json.tmp" \
-    "${STATE_DIR}/envelope-receipt.json"
+    "${STATE_DIR}/envelope-receipt.json" || return 1
 }
 
 finish() {
@@ -1114,6 +1277,7 @@ finish() {
   [ "${EXIT_TRAP_ACTIVE}" = true ] || return 0
   EXIT_TRAP_ACTIVE=false
   cleanup_envelope || cleanup_exit=$?
+  RECEIPT_FINALIZING=true
   if [ "${INTERRUPT_EXIT}" -ne 0 ]; then
     final_exit=${INTERRUPT_EXIT}
   elif [ "${TIMED_OUT}" = true ]; then
@@ -1123,7 +1287,6 @@ finish() {
   elif [ "${cleanup_exit}" -ne 0 ]; then
     final_exit=1
   fi
-  RECEIPT_FINALIZING=true
   write_receipt "${final_exit}" || final_exit=1
   trap '' INT TERM
   RECEIPT_FINALIZING=false
@@ -1154,7 +1317,7 @@ run_envelope() {
   prove_quota_admission
   wait_for_arc_idle
   check_interrupted
-  log 'draining the supported local_mrf import node'
+  log 'draining the supported import node'
   set_import_drain
   check_interrupted
   log 'installing the exact engine-worker creation fence'
