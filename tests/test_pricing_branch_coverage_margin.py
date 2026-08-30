@@ -70,6 +70,20 @@ async def test_estimated_quality_modes_skip_empty_and_unknown_cohorts():
     assert scores_by_mode["state"] is None
     assert scores_by_mode["national"]["score_method"] == "estimated"
     assert scores_by_mode["national"]["domains"]["cost"]["score_0_100"] == 85.0
+    parameter_maps = [
+        execution_args[1]
+        for execution_args, _execution_kwargs in session.executions
+    ]
+    assert [parameters["benchmark_mode"] for parameters in parameter_maps] == [
+        "zip",
+        "state",
+        "national",
+        "national",
+    ]
+    assert parameter_maps[0]["zip5"] == "60654"
+    assert "state_key" not in parameter_maps[0]
+    assert parameter_maps[1]["state_key"] == "IL"
+    assert "zip5" not in parameter_maps[1]
 
 
 @pytest.mark.asyncio

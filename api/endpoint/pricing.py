@@ -14,7 +14,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
 from functools import lru_cache
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, NamedTuple
 
 import orjson
 import sanic.exceptions
@@ -26,7 +26,7 @@ from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, c
 from api.billing_search_http import serve_billing_search_get
 from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
 from api.control_auth import require_control_auth
-from api.endpoint.pagination import parse_pagination
+from api.endpoint.pagination import PaginationParams, parse_pagination
 from api.ptg2_candidate_audit import (
     PTG2_CANDIDATE_AUDIT_HEADER,
     attach_candidate_audit_access,
@@ -3754,6 +3754,278 @@ def _estimated_benchmark_modes_for_profile(
     return modes
 
 
+class _EstimatedQualityCohort(NamedTuple):
+    mode: str
+    taxonomy_code: str | None
+    specialty_key: str | None
+    feature_filters: tuple[str, ...]
+    parameter_map: dict[str, Any]
+
+
+class _EstimatedQualityScore(NamedTuple):
+    row_by_field: dict[str, Any]
+    peer_count: int
+
+
+class _EstimatedQualityIdentity(NamedTuple):
+    taxonomy_code: str | None
+    specialty_key: str | None
+    provider_class: str | None
+
+
+def _estimated_quality_identity(
+    profile: dict[str, Any],
+    taxonomy_code_override: str | None,
+    specialty_key_override: str | None,
+) -> _EstimatedQualityIdentity:
+    """Normalize the provider identity used by estimated peer cohorts."""
+
+    taxonomy_code = str(
+        taxonomy_code_override or profile.get("taxonomy_code") or ""
+    ).strip().upper() or None
+    return _EstimatedQualityIdentity(
+        taxonomy_code=taxonomy_code,
+        specialty_key=_parse_specialty_key(
+            specialty_key_override or profile.get("specialty_key")
+        ),
+        provider_class=_normalize_provider_class(profile.get("provider_class")),
+    )
+
+
+def _estimated_quality_cohort(
+    profile: dict[str, Any],
+    year: int,
+    mode: str,
+    identity: _EstimatedQualityIdentity,
+) -> _EstimatedQualityCohort | None:
+    """Bind one estimated benchmark mode to its exact peer filters."""
+
+    feature_filters: list[str] = []
+    parameter_map: dict[str, Any] = {"year": year, "benchmark_mode": mode}
+    if identity.provider_class not in {None, "unknown"}:
+        feature_filters.append(
+            "COALESCE(LOWER(BTRIM(COALESCE(f.provider_class, ''))), "
+            "'unknown') = :provider_class"
+        )
+        parameter_map["provider_class"] = identity.provider_class
+    if identity.taxonomy_code:
+        feature_filters.append(
+            "UPPER(BTRIM(COALESCE(f.taxonomy_code, ''))) = :taxonomy_code"
+        )
+        parameter_map["taxonomy_code"] = identity.taxonomy_code
+    elif identity.specialty_key:
+        feature_filters.append(
+            "LOWER(BTRIM(COALESCE(f.specialty_key, ''))) = :specialty_key"
+        )
+        parameter_map["specialty_key"] = identity.specialty_key
+    else:
+        return None
+    if mode == "zip":
+        feature_filters.append("f.zip5 = :zip5")
+        parameter_map["zip5"] = profile.get("zip5")
+    elif mode == "state":
+        feature_filters.append(
+            "UPPER(BTRIM(COALESCE(f.state, ''))) = :state_key"
+        )
+        parameter_map["state_key"] = profile.get("state_key")
+    return _EstimatedQualityCohort(
+        mode=mode,
+        taxonomy_code=identity.taxonomy_code,
+        specialty_key=identity.specialty_key,
+        feature_filters=tuple(feature_filters),
+        parameter_map=parameter_map,
+    )
+
+
+async def _load_estimated_score_row(
+    session,
+    cohort: _EstimatedQualityCohort,
+) -> _EstimatedQualityScore | None:
+    """Load the aggregate score row for one estimated peer cohort."""
+
+    score_filters = [
+        "s.year = :year",
+        "s.benchmark_mode = :benchmark_mode",
+        "COALESCE(LOWER(BTRIM(COALESCE(s.score_method, 'direct'))), "
+        "'direct') <> 'unavailable'",
+    ]
+    where_sql = " AND ".join([*score_filters, *cohort.feature_filters])
+    score_result = await session.execute(
+        text(
+            f"""
+            SELECT
+                COUNT(*)::int AS peer_count,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY s.risk_ratio_point) AS risk_ratio_point,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY s.ci75_low) AS ci75_low,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY s.ci75_high) AS ci75_high,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY s.ci90_low) AS ci90_low,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY s.ci90_high) AS ci90_high,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY s.score_0_100) AS score_0_100
+            FROM {PRICING_SCHEMA}.{QUALITY_SCORE_TABLE_NAME} s
+            JOIN {PRICING_SCHEMA}.{QUALITY_FEATURE_TABLE_NAME} f
+              ON f.npi = s.npi
+             AND f.year = s.year
+            WHERE {where_sql}
+            """
+        ),
+        cohort.parameter_map,
+    )
+    score_row = score_result.first()
+    if score_row is None:
+        return None
+    score_row_by_field = _row_to_dict(score_row)
+    peer_count = _as_int(score_row_by_field.get("peer_count")) or 0
+    if peer_count <= 0:
+        return None
+    return _EstimatedQualityScore(
+        row_by_field=score_row_by_field,
+        peer_count=peer_count,
+    )
+
+
+async def _load_estimated_domain_payloads(
+    session,
+    cohort: _EstimatedQualityCohort,
+    peer_count: int,
+) -> dict[str, dict[str, Any]]:
+    """Load per-domain medians for one estimated peer cohort."""
+
+    domain_payloads_by_name = _empty_domain_payloads_by_name()
+    domain_result = await session.execute(
+        text(
+            f"""
+            SELECT
+                d.domain,
+                COUNT(*)::int AS peer_count,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY d.risk_ratio) AS risk_ratio,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY d.score_0_100) AS score_0_100,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY d.ci75_low) AS ci75_low,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY d.ci75_high) AS ci75_high,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY d.ci90_low) AS ci90_low,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY d.ci90_high) AS ci90_high
+            FROM {PRICING_SCHEMA}.{QUALITY_DOMAIN_TABLE_NAME} d
+            JOIN {PRICING_SCHEMA}.{QUALITY_FEATURE_TABLE_NAME} f
+              ON f.npi = d.npi
+             AND f.year = d.year
+            WHERE d.year = :year
+              AND d.benchmark_mode = :benchmark_mode
+              AND {' AND '.join(cohort.feature_filters)}
+            GROUP BY d.domain
+            """
+        ),
+        cohort.parameter_map,
+    )
+    for domain_row in domain_result:
+        domain_data = _row_to_dict(domain_row)
+        domain_name = str(domain_data.get("domain") or "").strip().lower()
+        if domain_name not in domain_payloads_by_name:
+            continue
+        domain_payloads_by_name[domain_name] = {
+            "risk_ratio_point": _as_float(domain_data.get("risk_ratio")),
+            "score_0_100": _as_float(domain_data.get("score_0_100")),
+            "evidence_n": float(
+                _as_int(domain_data.get("peer_count")) or peer_count
+            ),
+            "ci_75": _ci_payload(
+                domain_data.get("ci75_low"),
+                domain_data.get("ci75_high"),
+            ),
+            "ci_90": _ci_payload(
+                domain_data.get("ci90_low"),
+                domain_data.get("ci90_high"),
+            ),
+        }
+    return domain_payloads_by_name
+
+
+def _estimated_quality_score_map(
+    profile: dict[str, Any],
+    cohort: _EstimatedQualityCohort,
+    score: _EstimatedQualityScore,
+    domain_payloads_by_name: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Shape the stable public score fields for one estimated cohort."""
+
+    score_row_by_field = score.row_by_field
+    cost_risk_ratio = _as_float(
+        domain_payloads_by_name["cost"].get("risk_ratio_point")
+    )
+    confidence_0_100 = _estimated_confidence_score(profile, score.peer_count)
+    risk_ratio_point = _as_float(score_row_by_field.get("risk_ratio_point"))
+    ci75_high = _as_float(score_row_by_field.get("ci75_high"))
+    ci90_low = _as_float(score_row_by_field.get("ci90_low"))
+    return {
+        "model_version": PROVIDER_QUALITY_MODEL_VERSION,
+        "benchmark_mode": cohort.mode,
+        "tier": _tier_from_quality_summary(
+            risk_ratio_point=risk_ratio_point,
+            ci75_high=ci75_high,
+            ci90_low=ci90_low,
+            confidence_0_100=confidence_0_100,
+        ),
+        "borderline_status": False,
+        "score_0_100": _as_float(score_row_by_field.get("score_0_100"))
+        or _score_from_risk_ratio(risk_ratio_point),
+        "estimated_cost_level": _estimated_cost_level_from_risk_ratio(
+            cost_risk_ratio
+        ),
+        "score_method": "estimated",
+        "confidence_0_100": confidence_0_100,
+        "confidence_band": "low",
+        "cost_source": "peer_estimated",
+        "data_coverage_0_100": _estimated_data_coverage_score(profile),
+        "provider_class": profile.get("provider_class"),
+        "location_source": profile.get("location_source"),
+        "has_claims": False,
+        "has_qpp": False,
+        "has_rx": False,
+        "has_enrollment": profile.get("has_enrollment"),
+        "has_medicare_claims": profile.get("has_medicare_claims"),
+        "risk_ratio_point": risk_ratio_point,
+        "ci75_low": _as_float(score_row_by_field.get("ci75_low")),
+        "ci75_high": ci75_high,
+        "ci90_low": ci90_low,
+        "ci90_high": _as_float(score_row_by_field.get("ci90_high")),
+        "low_score_threshold_failed": (risk_ratio_point or 0.0) >= 1.12,
+        "low_confidence_threshold_failed": (ci90_low or 0.0) >= 1.08,
+        "high_score_threshold_passed": (risk_ratio_point or 1.0) <= 0.88,
+        "high_confidence_threshold_passed": (
+            ci75_high is not None and (ci75_high or 0.0) < 1.0
+        ),
+    }
+
+
+def _estimated_quality_cohort_context(
+    profile: dict[str, Any],
+    cohort: _EstimatedQualityCohort,
+    peer_count: int,
+) -> dict[str, Any]:
+    """Shape the peer-cohort evidence for one estimated score."""
+
+    geography_value = (
+        "US"
+        if cohort.mode == "national"
+        else (
+            profile.get("zip5")
+            if cohort.mode == "zip"
+            else profile.get("state_key")
+        )
+    )
+    return {
+        "selected_geography": _selected_geography_label(
+            "national" if cohort.mode == "national" else cohort.mode,
+            geography_value,
+        ),
+        "selected_cohort_level": None,
+        "peer_count": peer_count,
+        "specialty_key": cohort.specialty_key,
+        "taxonomy_code": cohort.taxonomy_code,
+        "procedure_bucket": None,
+        "computed_live": False,
+        "procedure_match_threshold": None,
+    }
+
+
 async def _load_estimated_quality_modes(
     session,
     *,
@@ -3764,171 +4036,51 @@ async def _load_estimated_quality_modes(
     specialty_key_override: str | None = None,
 ) -> dict[str, dict[str, Any] | None]:
     """Load estimated quality scores for the profile's eligible benchmark modes."""
-    scores_by_benchmark_mode: dict[str, dict[str, Any] | None] = {
-        mode: None
-        for mode in QUALITY_BENCHMARK_MODE_ORDER
-    }
 
-    candidate_modes = _estimated_benchmark_modes_for_profile(profile, benchmark_mode=benchmark_mode)
+    scores_by_benchmark_mode: dict[str, dict[str, Any] | None] = dict.fromkeys(
+        QUALITY_BENCHMARK_MODE_ORDER
+    )
+    candidate_modes = _estimated_benchmark_modes_for_profile(
+        profile, benchmark_mode=benchmark_mode
+    )
     if not candidate_modes:
         return scores_by_benchmark_mode
-
-    taxonomy_code = str(taxonomy_code_override or profile.get("taxonomy_code") or "").strip().upper() or None
-    specialty_key = _parse_specialty_key(specialty_key_override or profile.get("specialty_key"))
-    provider_class = _normalize_provider_class(profile.get("provider_class"))
-
+    identity = _estimated_quality_identity(
+        profile,
+        taxonomy_code_override,
+        specialty_key_override,
+    )
     for mode in candidate_modes:
-        score_filters = [
-            "s.year = :year",
-            "s.benchmark_mode = :benchmark_mode",
-            "COALESCE(LOWER(BTRIM(COALESCE(s.score_method, 'direct'))), 'direct') <> 'unavailable'",
-        ]
-        feature_filters: list[str] = []
-        parameter_map: dict[str, Any] = {"year": year, "benchmark_mode": mode}
-        if provider_class not in {None, "unknown"}:
-            feature_filters.append("COALESCE(LOWER(BTRIM(COALESCE(f.provider_class, ''))), 'unknown') = :provider_class")
-            parameter_map["provider_class"] = provider_class
-        if taxonomy_code:
-            feature_filters.append("UPPER(BTRIM(COALESCE(f.taxonomy_code, ''))) = :taxonomy_code")
-            parameter_map["taxonomy_code"] = taxonomy_code
-        elif specialty_key:
-            feature_filters.append("LOWER(BTRIM(COALESCE(f.specialty_key, ''))) = :specialty_key")
-            parameter_map["specialty_key"] = specialty_key
-        else:
-            continue
-        if mode == "zip":
-            feature_filters.append("f.zip5 = :zip5")
-            parameter_map["zip5"] = profile.get("zip5")
-        elif mode == "state":
-            feature_filters.append("UPPER(BTRIM(COALESCE(f.state, ''))) = :state_key")
-            parameter_map["state_key"] = profile.get("state_key")
-
-        where_sql = " AND ".join(score_filters + feature_filters)
-        score_result = await session.execute(
-            text(
-                f"""
-                SELECT
-                    COUNT(*)::int AS peer_count,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY s.risk_ratio_point) AS risk_ratio_point,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY s.ci75_low) AS ci75_low,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY s.ci75_high) AS ci75_high,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY s.ci90_low) AS ci90_low,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY s.ci90_high) AS ci90_high,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY s.score_0_100) AS score_0_100
-                FROM {PRICING_SCHEMA}.{QUALITY_SCORE_TABLE_NAME} s
-                JOIN {PRICING_SCHEMA}.{QUALITY_FEATURE_TABLE_NAME} f
-                  ON f.npi = s.npi
-                 AND f.year = s.year
-                WHERE {where_sql}
-                """
-            ),
-            parameter_map,
+        cohort = _estimated_quality_cohort(
+            profile,
+            year,
+            mode,
+            identity,
         )
-        score_row = score_result.first()
-        if score_row is None:
+        if cohort is None:
             continue
-        score_data_raw = _row_to_dict(score_row)
-        peer_count = _as_int(score_data_raw.get("peer_count")) or 0
-        if peer_count <= 0:
+        score = await _load_estimated_score_row(session, cohort)
+        if score is None:
             continue
-
-        domains_payload = _empty_domain_payloads_by_name()
-        domain_result = await session.execute(
-            text(
-                f"""
-                SELECT
-                    d.domain,
-                    COUNT(*)::int AS peer_count,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY d.risk_ratio) AS risk_ratio,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY d.score_0_100) AS score_0_100,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY d.ci75_low) AS ci75_low,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY d.ci75_high) AS ci75_high,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY d.ci90_low) AS ci90_low,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY d.ci90_high) AS ci90_high
-                FROM {PRICING_SCHEMA}.{QUALITY_DOMAIN_TABLE_NAME} d
-                JOIN {PRICING_SCHEMA}.{QUALITY_FEATURE_TABLE_NAME} f
-                  ON f.npi = d.npi
-                 AND f.year = d.year
-                WHERE d.year = :year
-                  AND d.benchmark_mode = :benchmark_mode
-                  AND {' AND '.join(feature_filters)}
-                GROUP BY d.domain
-                """
-            ),
-            parameter_map,
+        domain_payloads = await _load_estimated_domain_payloads(
+            session,
+            cohort,
+            score.peer_count,
         )
-        for domain_row in domain_result:
-            domain_data = _row_to_dict(domain_row)
-            domain_name = str(domain_data.get("domain") or "").strip().lower()
-            if domain_name not in domains_payload:
-                continue
-            domains_payload[domain_name] = {
-                "risk_ratio_point": _as_float(domain_data.get("risk_ratio")),
-                "score_0_100": _as_float(domain_data.get("score_0_100")),
-                "evidence_n": float(_as_int(domain_data.get("peer_count")) or peer_count),
-                "ci_75": _ci_payload(domain_data.get("ci75_low"), domain_data.get("ci75_high")),
-                "ci_90": _ci_payload(domain_data.get("ci90_low"), domain_data.get("ci90_high")),
-            }
-
-        rr_cost = _as_float(domains_payload["cost"].get("risk_ratio_point"))
-        confidence_0_100 = _estimated_confidence_score(profile, peer_count)
-        score_row_map = {
-            "model_version": PROVIDER_QUALITY_MODEL_VERSION,
-            "benchmark_mode": mode,
-            "tier": _tier_from_quality_summary(
-                risk_ratio_point=_as_float(score_data_raw.get("risk_ratio_point")),
-                ci75_high=_as_float(score_data_raw.get("ci75_high")),
-                ci90_low=_as_float(score_data_raw.get("ci90_low")),
-                confidence_0_100=confidence_0_100,
-            ),
-            "borderline_status": False,
-            "score_0_100": _as_float(score_data_raw.get("score_0_100"))
-            or _score_from_risk_ratio(_as_float(score_data_raw.get("risk_ratio_point"))),
-            "estimated_cost_level": _estimated_cost_level_from_risk_ratio(rr_cost),
-            "score_method": "estimated",
-            "confidence_0_100": confidence_0_100,
-            "confidence_band": "low",
-            "cost_source": "peer_estimated",
-            "data_coverage_0_100": _estimated_data_coverage_score(profile),
-            "provider_class": profile.get("provider_class"),
-            "location_source": profile.get("location_source"),
-            "has_claims": False,
-            "has_qpp": False,
-            "has_rx": False,
-            "has_enrollment": profile.get("has_enrollment"),
-            "has_medicare_claims": profile.get("has_medicare_claims"),
-            "risk_ratio_point": _as_float(score_data_raw.get("risk_ratio_point")),
-            "ci75_low": _as_float(score_data_raw.get("ci75_low")),
-            "ci75_high": _as_float(score_data_raw.get("ci75_high")),
-            "ci90_low": _as_float(score_data_raw.get("ci90_low")),
-            "ci90_high": _as_float(score_data_raw.get("ci90_high")),
-            "low_score_threshold_failed": (_as_float(score_data_raw.get("risk_ratio_point")) or 0.0) >= 1.12,
-            "low_confidence_threshold_failed": (_as_float(score_data_raw.get("ci90_low")) or 0.0) >= 1.08,
-            "high_score_threshold_passed": (_as_float(score_data_raw.get("risk_ratio_point")) or 1.0) <= 0.88,
-            "high_confidence_threshold_passed": (
-                _as_float(score_data_raw.get("ci75_high")) is not None
-                and (_as_float(score_data_raw.get("ci75_high")) or 0.0) < 1.0
-            ),
-        }
-        cohort_context_map = {
-            "selected_geography": _selected_geography_label(
-                "national" if mode == "national" else mode,
-                "US" if mode == "national" else (profile.get("zip5") if mode == "zip" else profile.get("state_key")),
-            ),
-            "selected_cohort_level": None,
-            "peer_count": peer_count,
-            "specialty_key": specialty_key,
-            "taxonomy_code": taxonomy_code,
-            "procedure_bucket": None,
-            "computed_live": False,
-            "procedure_match_threshold": None,
-        }
         scores_by_benchmark_mode[mode] = _build_quality_mode_payload(
-            score_row_map,
-            domains_payload,
-            cohort_context=cohort_context_map,
+            _estimated_quality_score_map(
+                profile,
+                cohort,
+                score,
+                domain_payloads,
+            ),
+            domain_payloads,
+            cohort_context=_estimated_quality_cohort_context(
+                profile,
+                cohort,
+                score.peer_count,
+            ),
         )
-
     return scores_by_benchmark_mode
 
 
@@ -11046,26 +11198,303 @@ async def resolve_procedure_taxonomy(request):
     )
 
 
+class _ProviderSpecialtyRequest(NamedTuple):
+    pagination: PaginationParams
+    requested_year: int | None
+    search_query: str
+    state: str
+    city: str
+    zip5: str | None
+    zip_radius_miles: float
+    code: str
+
+
+class _ProviderSpecialtyScope(NamedTuple):
+    year: int
+    year_source: str
+    zip_filter_values: tuple[str, ...]
+    filters: tuple[Any, ...]
+    from_clause: Any
+    total_services_expression: Any
+    provider_type_resolution: Any
+    code_context_by_field: dict[str, Any] | None
+
+
+class _ProviderSpecialtyPage(NamedTuple):
+    specialty_rows: list[dict[str, Any]]
+    total: int
+
+
+class _ProviderSpecialtyCodeScope(NamedTuple):
+    filters: tuple[Any, ...]
+    from_clause: Any
+    total_services_expression: Any
+    code_context_by_field: dict[str, Any] | None
+
+
+async def _load_provider_specialty_zip_scope(
+    session,
+    request: _ProviderSpecialtyRequest,
+) -> tuple[str, ...]:
+    """Load ordered unique ZIPs for one positive-radius specialty request."""
+
+    if not request.zip5 or request.zip_radius_miles <= 0:
+        return ()
+    zip_rows = await _zip_radius_rows(
+        session,
+        zip5=request.zip5,
+        radius_miles=request.zip_radius_miles,
+        state_hint=request.state or None,
+    )
+    zip_filter_values: list[str] = []
+    for zip_row in sorted(
+        zip_rows,
+        key=lambda item: (
+            _as_float(item.get("distance_miles")) or 0.0,
+            str(item.get("zip5") or ""),
+        ),
+    ):
+        candidate_zip = _normalize_zip5(zip_row.get("zip5"))
+        if candidate_zip is None or candidate_zip in zip_filter_values:
+            continue
+        zip_filter_values.append(candidate_zip)
+    if request.zip5 not in zip_filter_values:
+        zip_filter_values.insert(0, request.zip5)
+    return tuple(zip_filter_values)
+
+
+async def _build_provider_specialty_scope(
+    session,
+    args: Mapping[str, Any],
+    request: _ProviderSpecialtyRequest,
+    year: int,
+    year_source: str,
+    zip_filter_values: tuple[str, ...],
+) -> _ProviderSpecialtyScope:
+    """Build the unchanged specialty filters and optional procedure join."""
+
+    filters = [
+        provider_table.c.year == year,
+        provider_table.c.provider_type.isnot(None),
+        func.length(func.trim(provider_table.c.provider_type)) > 0,
+    ]
+    if request.state:
+        filters.append(func.upper(provider_table.c.state) == request.state)
+    if request.city and not (
+        request.zip5 and request.zip_radius_miles > 0
+    ):
+        filters.append(
+            func.lower(provider_table.c.city).like(f"%{request.city}%")
+        )
+    if zip_filter_values:
+        filters.append(provider_table.c.zip5.in_(zip_filter_values))
+    elif request.zip5:
+        filters.append(provider_table.c.zip5 == request.zip5)
+    provider_type_clause, provider_type_resolution = (
+        await _provider_type_filter_clause(
+            session,
+            args,
+            provider_table.c.provider_type,
+            request.search_query,
+        )
+    )
+    if provider_type_clause is not None:
+        filters.append(provider_type_clause)
+    code_scope = await _provider_specialty_code_scope(
+        session,
+        args,
+        request,
+        year,
+        filters,
+    )
+    return _ProviderSpecialtyScope(
+        year=year,
+        year_source=year_source,
+        zip_filter_values=zip_filter_values,
+        filters=code_scope.filters,
+        from_clause=code_scope.from_clause,
+        total_services_expression=code_scope.total_services_expression,
+        provider_type_resolution=provider_type_resolution,
+        code_context_by_field=code_scope.code_context_by_field,
+    )
+
+
+async def _provider_specialty_code_scope(
+    session,
+    args: Mapping[str, Any],
+    request: _ProviderSpecialtyRequest,
+    year: int,
+    filters: list[Any],
+) -> _ProviderSpecialtyCodeScope:
+    """Add the optional procedure join after common specialty filters."""
+
+    if not request.code:
+        return _ProviderSpecialtyCodeScope(
+            filters=tuple(filters),
+            from_clause=provider_table,
+            total_services_expression=func.sum(provider_table.c.total_services),
+            code_context_by_field=None,
+        )
+    internal_codes, code_context_by_field = (
+        await _resolve_internal_codes_for_request(session, request.code, args)
+    )
+    from_clause = provider_procedure_table.join(
+        provider_table,
+        and_(
+            provider_table.c.npi == provider_procedure_table.c.npi,
+            provider_table.c.year == provider_procedure_table.c.year,
+        ),
+    )
+    return _ProviderSpecialtyCodeScope(
+        filters=(
+            *filters,
+            provider_procedure_table.c.year == year,
+            provider_procedure_table.c.procedure_code.in_(internal_codes),
+        ),
+        from_clause=from_clause,
+        total_services_expression=func.sum(
+            provider_procedure_table.c.total_services
+        ),
+        code_context_by_field=code_context_by_field,
+    )
+
+
+async def _load_provider_specialty_page(
+    session,
+    scope: _ProviderSpecialtyScope,
+    pagination: PaginationParams,
+) -> _ProviderSpecialtyPage:
+    """Execute the specialty page before its exact grouped count."""
+
+    page_query = (
+        select(
+            provider_table.c.provider_type.label("specialty"),
+            func.lower(func.trim(provider_table.c.provider_type)).label(
+                "specialty_key"
+            ),
+            func.count(func.distinct(provider_table.c.npi)).label(
+                "provider_count"
+            ),
+            scope.total_services_expression.label("total_services"),
+        )
+        .select_from(scope.from_clause)
+        .where(and_(*scope.filters))
+        .group_by(provider_table.c.provider_type)
+        .order_by(
+            func.count(func.distinct(provider_table.c.npi)).desc(),
+            provider_table.c.provider_type.asc(),
+        )
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    )
+    specialty_rows = [
+        _row_to_dict(specialty_row)
+        for specialty_row in await session.execute(page_query)
+    ]
+    count_query = select(func.count()).select_from(
+        select(provider_table.c.provider_type)
+        .select_from(scope.from_clause)
+        .where(and_(*scope.filters))
+        .group_by(provider_table.c.provider_type)
+        .subquery()
+    )
+    count_result = await session.execute(count_query)
+    return _ProviderSpecialtyPage(
+        specialty_rows=specialty_rows,
+        total=int(count_result.scalar() or 0),
+    )
+
+
+def _provider_specialty_entries(
+    page: _ProviderSpecialtyPage,
+) -> list[dict[str, Any]]:
+    """Normalize one specialty page without changing its row order."""
+
+    return [
+        {
+            "specialty": str(specialty_row.get("specialty") or "").strip(),
+            "specialty_key": str(
+                specialty_row.get("specialty_key") or ""
+            ).strip().lower(),
+            "provider_count": int(specialty_row.get("provider_count") or 0),
+            "total_services": _as_float(
+                specialty_row.get("total_services")
+            ),
+        }
+        for specialty_row in page.specialty_rows
+    ]
+
+
+def _provider_specialty_response(
+    request: _ProviderSpecialtyRequest,
+    scope: _ProviderSpecialtyScope,
+    page: _ProviderSpecialtyPage,
+):
+    """Shape the existing specialty response without changing query evidence."""
+
+    query_payload_map: dict[str, Any] = {
+        "q": request.search_query or None,
+        "code": request.code or None,
+        "year": scope.year,
+        "year_used": scope.year,
+        "year_source": scope.year_source,
+        "state": request.state or None,
+        "city": request.city or None,
+        "zip5": request.zip5 or None,
+        "zip_radius_miles": (
+            request.zip_radius_miles if request.zip5 else None
+        ),
+        "zip_candidate_count": (
+            len(scope.zip_filter_values)
+            if scope.zip_filter_values
+            else (1 if request.zip5 else None)
+        ),
+        "provider_type_resolution": scope.provider_type_resolution,
+    }
+    if scope.code_context_by_field is not None:
+        query_payload_map.update(
+            {
+                "input_code": scope.code_context_by_field["input_code"],
+                "resolved_codes": scope.code_context_by_field["resolved_codes"],
+                "matched_via": scope.code_context_by_field["matched_via"],
+            }
+        )
+    return response.json(
+        {
+            "items": _provider_specialty_entries(page),
+            "pagination": {
+                "total": page.total,
+                "limit": request.pagination.limit,
+                "offset": request.pagination.offset,
+                "page": request.pagination.page,
+            },
+            "query": query_payload_map,
+        }
+    )
+
+
 @blueprint.get("/provider-specialties", name="pricing.provider_specialties.list")
 @blueprint.get("/providers/specialties", name="pricing.providers.specialties.list")
 async def list_provider_specialties(request):
     """List provider specialties with optional search and geographic filters."""
+
     session = _get_session(request)
     args = request.args
-
-    pagination = parse_pagination(args, default_limit=50, max_limit=MAX_LIMIT)
-    year = _parse_int(args.get("year"), "year", minimum=2013)
-    search_query = str(args.get("q", "")).strip().lower()
-    state = str(args.get("state", "")).strip().upper()
-    city = str(args.get("city", "")).strip().lower()
-    zip5 = _normalize_zip5(args.get("zip5"))
-    zip_radius_miles = _parse_zip_radius_miles(
-        args.get("zip_radius_miles"),
-        param="zip_radius_miles",
-        default=PROCEDURE_SEARCH_ZIP_RADIUS_DEFAULT_MILES,
+    specialty_request = _ProviderSpecialtyRequest(
+        pagination=parse_pagination(args, default_limit=50, max_limit=MAX_LIMIT),
+        requested_year=_parse_int(args.get("year"), "year", minimum=2013),
+        search_query=str(args.get("q", "")).strip().lower(),
+        state=str(args.get("state", "")).strip().upper(),
+        city=str(args.get("city", "")).strip().lower(),
+        zip5=_normalize_zip5(args.get("zip5")),
+        zip_radius_miles=_parse_zip_radius_miles(
+            args.get("zip_radius_miles"),
+            param="zip_radius_miles",
+            default=PROCEDURE_SEARCH_ZIP_RADIUS_DEFAULT_MILES,
+        ),
+        code=str(args.get("code", "")).strip(),
     )
-    code = str(args.get("code", "")).strip()
-    # Keep this explicit so OpenAPI contract tests see the query parameter.
+    # Keep these explicit so OpenAPI contract tests see the query parameters.
     args.get("code_system")
     args.get("expand_codes")
     args.get("provider_type")
@@ -11077,150 +11506,32 @@ async def list_provider_specialties(request):
     args.get("taxonomy_section")
     args.get("page")
     args.get("limit")
-
-    year_table = provider_procedure_table if code else provider_table
-    year, year_source = await _resolve_year(session, year_table, year)
-
-    zip_filter_values: list[str] = []
-    if zip5 and zip_radius_miles > 0:
-        zip_rows = await _zip_radius_rows(
-            session,
-            zip5=zip5,
-            radius_miles=zip_radius_miles,
-            state_hint=state or None,
-        )
-        for zip_row in sorted(
-            zip_rows,
-            key=lambda item: (_as_float(item.get("distance_miles")) or 0.0, str(item.get("zip5") or "")),
-        ):
-            candidate_zip = _normalize_zip5(zip_row.get("zip5"))
-            if candidate_zip is None or candidate_zip in zip_filter_values:
-                continue
-            zip_filter_values.append(candidate_zip)
-        if zip5 not in zip_filter_values:
-            zip_filter_values.insert(0, zip5)
-
-    filters = [
-        provider_table.c.year == year,
-        provider_table.c.provider_type.isnot(None),
-        func.length(func.trim(provider_table.c.provider_type)) > 0,
-    ]
-    if state:
-        filters.append(func.upper(provider_table.c.state) == state)
-    if city and not (zip5 and zip_radius_miles > 0):
-        filters.append(func.lower(provider_table.c.city).like(f"%{city}%"))
-    if zip_filter_values:
-        filters.append(provider_table.c.zip5.in_(zip_filter_values))
-    elif zip5:
-        filters.append(provider_table.c.zip5 == zip5)
-    provider_type_clause, provider_type_resolution = await _provider_type_filter_clause(
+    year_table = (
+        provider_procedure_table if specialty_request.code else provider_table
+    )
+    year, year_source = await _resolve_year(
+        session,
+        year_table,
+        specialty_request.requested_year,
+    )
+    zip_filter_values = await _load_provider_specialty_zip_scope(
+        session,
+        specialty_request,
+    )
+    scope = await _build_provider_specialty_scope(
         session,
         args,
-        provider_table.c.provider_type,
-        search_query,
+        specialty_request,
+        year,
+        year_source,
+        zip_filter_values,
     )
-    if provider_type_clause is not None:
-        filters.append(provider_type_clause)
-
-    code_context = None
-    from_clause = provider_table
-    if code:
-        internal_codes, code_context = await _resolve_internal_codes_for_request(session, code, args)
-        from_clause = provider_procedure_table.join(
-            provider_table,
-            and_(
-                provider_table.c.npi == provider_procedure_table.c.npi,
-                provider_table.c.year == provider_procedure_table.c.year,
-            ),
-        )
-        filters.extend(
-            [
-                provider_procedure_table.c.year == year,
-                provider_procedure_table.c.procedure_code.in_(internal_codes),
-            ]
-        )
-        total_services_expr = func.sum(provider_procedure_table.c.total_services)
-    else:
-        total_services_expr = func.sum(provider_table.c.total_services)
-
-    query = (
-        select(
-            provider_table.c.provider_type.label("specialty"),
-            func.lower(func.trim(provider_table.c.provider_type)).label("specialty_key"),
-            func.count(func.distinct(provider_table.c.npi)).label("provider_count"),
-            total_services_expr.label("total_services"),
-        )
-        .select_from(from_clause)
-        .where(and_(*filters))
-        .group_by(provider_table.c.provider_type)
-        .order_by(func.count(func.distinct(provider_table.c.npi)).desc(), provider_table.c.provider_type.asc())
-        .limit(pagination.limit)
-        .offset(pagination.offset)
+    page = await _load_provider_specialty_page(
+        session,
+        scope,
+        specialty_request.pagination,
     )
-    specialty_rows = [
-        _row_to_dict(specialty_row)
-        for specialty_row in await session.execute(query)
-    ]
-
-    count_query = (
-        select(func.count())
-        .select_from(
-            select(provider_table.c.provider_type)
-            .select_from(from_clause)
-            .where(and_(*filters))
-            .group_by(provider_table.c.provider_type)
-            .subquery()
-        )
-    )
-    count_result = await session.execute(count_query)
-    total = int(count_result.scalar() or 0)
-
-    specialty_entries = [
-        {
-            "specialty": str(specialty_row.get("specialty") or "").strip(),
-            "specialty_key": str(specialty_row.get("specialty_key") or "")
-            .strip()
-            .lower(),
-            "provider_count": int(specialty_row.get("provider_count") or 0),
-            "total_services": _as_float(specialty_row.get("total_services")),
-        }
-        for specialty_row in specialty_rows
-    ]
-
-    query_payload_map: dict[str, Any] = {
-        "q": search_query or None,
-        "code": code or None,
-        "year": year,
-        "year_used": year,
-        "year_source": year_source,
-        "state": state or None,
-        "city": city or None,
-        "zip5": zip5 or None,
-        "zip_radius_miles": zip_radius_miles if zip5 else None,
-        "zip_candidate_count": len(zip_filter_values) if zip_filter_values else (1 if zip5 else None),
-        "provider_type_resolution": provider_type_resolution,
-    }
-    if code_context is not None:
-        query_payload_map.update(
-            {
-                "input_code": code_context["input_code"],
-                "resolved_codes": code_context["resolved_codes"],
-                "matched_via": code_context["matched_via"],
-            }
-        )
-
-    return response.json(
-        {
-            "items": specialty_entries,
-            "pagination": {
-                "total": total,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": pagination.page,
-            },
-            "query": query_payload_map,
-        }
-    )
+    return _provider_specialty_response(specialty_request, scope, page)
 
 
 def _prescription_autocomplete_grouped_subquery(
@@ -13064,86 +13375,121 @@ async def get_physician_prescription(request, npi: str, rx_code_system: str, rx_
     return await _provider_prescription_detail(request, npi, rx_code_system, rx_code)
 
 
-@blueprint.get(
-    "/prescriptions/<rx_code_system>/<rx_code>/providers",
-    name="pricing.prescriptions.providers.list",
-)
-async def list_prescription_providers(request, rx_code_system: str, rx_code: str):
-    """List providers with prescription records matching a code and optional filters."""
-    session = _get_session(request)
-    args = request.args
+class _PrescriptionProviderFilters(NamedTuple):
+    state: str
+    city: str
+    specialty: str
+    search_query: str
+    min_claims: float | None
+    min_total_cost: float | None
 
-    pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
-    year = _parse_int(args.get("year"), "year", minimum=2013)
-    min_claims = _parse_float(args.get("min_claims"), "min_claims", minimum=0)
-    min_total_cost = _parse_float(args.get("min_total_cost"), "min_total_cost", minimum=0)
-    state = str(args.get("state", "")).strip().upper()
-    city = str(args.get("city", "")).strip().lower()
-    specialty = str(args.get("specialty", "")).strip().lower()
-    search_query = str(args.get("q", "")).strip().lower()
 
-    if not await _is_table_available(session, provider_prescription_table.name):
-        return response.json(
-            {
-                "items": [],
-                "pagination": {
-                    "total": 0,
-                    "limit": pagination.limit,
-                    "offset": pagination.offset,
-                    "page": pagination.page,
+class _PrescriptionProviderRequest(NamedTuple):
+    pagination: PaginationParams
+    requested_year: int | None
+    filters: _PrescriptionProviderFilters
+
+
+class _PrescriptionProviderResult(NamedTuple):
+    entries: list[dict[str, Any]]
+    total: int
+    year: int
+    year_source: str
+    order_by: str
+    order: str
+    code_context: dict[str, Any]
+
+
+def _unavailable_prescription_provider_response(
+    provider_request: _PrescriptionProviderRequest,
+    rx_code_system: str,
+    rx_code: str,
+):
+    """Return the existing empty response before code resolution."""
+
+    pagination = provider_request.pagination
+    year = provider_request.requested_year
+    return response.json(
+        {
+            "items": [],
+            "pagination": {
+                "total": 0,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {
+                "year": year,
+                "year_used": year,
+                "year_source": "request" if year is not None else "env",
+                "data_status": "unavailable",
+                "input_code": {
+                    "code_system": _normalize_code_system(rx_code_system),
+                    "code": str(rx_code).strip().upper(),
                 },
-                "query": {
-                    "year": year,
-                    "year_used": year,
-                    "year_source": "request" if year is not None else "env",
-                    "data_status": "unavailable",
-                    "input_code": {
-                        "code_system": _normalize_code_system(rx_code_system),
-                        "code": str(rx_code).strip().upper(),
-                    },
-                    "resolved_codes": [],
-                    "matched_via": [],
-                },
-            }
-        )
-
-    year, year_source = await _resolve_year(session, provider_prescription_table, year)
-    internal_rx_codes, code_context = await _resolve_internal_rx_codes_for_request(
-        session,
-        rx_code,
-        dict({"rx_code_system": rx_code_system}, **dict(args)),
-        default_system=rx_code_system,
+                "resolved_codes": [],
+                "matched_via": [],
+            },
+        }
     )
 
+
+def _prescription_provider_where_clause(
+    internal_rx_codes: list[str],
+    year: int,
+    request_filters: _PrescriptionProviderFilters,
+):
+    """Build the unchanged prescription-provider filters."""
+
     filters = [
-        provider_prescription_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
+        provider_prescription_table.c.rx_code_system
+        == INTERNAL_RX_CODE_SYSTEM,
         provider_prescription_table.c.rx_code.in_(internal_rx_codes),
         provider_prescription_table.c.year == year,
     ]
-    if state:
-        filters.append(func.upper(provider_prescription_table.c.state) == state)
-    if city:
-        filters.append(func.lower(provider_prescription_table.c.city).like(f"%{city}%"))
-    if specialty:
-        filters.append(func.lower(provider_prescription_table.c.provider_type).like(f"%{specialty}%"))
-    if search_query:
-        q_like = f"%{search_query}%"
+    if request_filters.state:
+        filters.append(
+            func.upper(provider_prescription_table.c.state)
+            == request_filters.state
+        )
+    if request_filters.city:
+        filters.append(
+            func.lower(provider_prescription_table.c.city).like(
+                f"%{request_filters.city}%"
+            )
+        )
+    if request_filters.specialty:
+        filters.append(
+            func.lower(provider_prescription_table.c.provider_type).like(
+                f"%{request_filters.specialty}%"
+            )
+        )
+    if request_filters.search_query:
+        q_like = f"%{request_filters.search_query}%"
         filters.append(
             or_(
                 func.lower(provider_prescription_table.c.provider_name).like(q_like),
                 func.lower(provider_prescription_table.c.provider_type).like(q_like),
-                cast(provider_prescription_table.c.npi, String).like(
-                    f"%{search_query}%"
-                ),
+                cast(provider_prescription_table.c.npi, String).like(q_like),
             )
         )
-    if min_claims is not None:
-        filters.append(provider_prescription_table.c.total_claims >= min_claims)
-    if min_total_cost is not None:
-        filters.append(provider_prescription_table.c.total_drug_cost >= min_total_cost)
+    if request_filters.min_claims is not None:
+        filters.append(
+            provider_prescription_table.c.total_claims
+            >= request_filters.min_claims
+        )
+    if request_filters.min_total_cost is not None:
+        filters.append(
+            provider_prescription_table.c.total_drug_cost
+            >= request_filters.min_total_cost
+        )
+    return and_(*filters)
 
-    where_clause = and_(*filters)
-    grouped = (
+
+def _prescription_provider_grouped_query(where_clause):
+    """Build the grouped provider aggregate used by count and page reads."""
+
+    return (
         select(
             provider_prescription_table.c.npi.label("npi"),
             provider_prescription_table.c.provider_name.label("provider_name"),
@@ -13151,9 +13497,15 @@ async def list_prescription_providers(request, rx_code_system: str, rx_code: str
             provider_prescription_table.c.city.label("city"),
             provider_prescription_table.c.state.label("state"),
             provider_prescription_table.c.zip5.label("zip5"),
-            func.sum(provider_prescription_table.c.total_claims).label("total_claims"),
-            func.sum(provider_prescription_table.c.total_drug_cost).label("total_drug_cost"),
-            func.sum(provider_prescription_table.c.total_benes).label("total_benes"),
+            func.sum(provider_prescription_table.c.total_claims).label(
+                "total_claims"
+            ),
+            func.sum(provider_prescription_table.c.total_drug_cost).label(
+                "total_drug_cost"
+            ),
+            func.sum(provider_prescription_table.c.total_benes).label(
+                "total_benes"
+            ),
             func.count().label("matched_rows"),
         )
         .select_from(provider_prescription_table)
@@ -13166,16 +13518,29 @@ async def list_prescription_providers(request, rx_code_system: str, rx_code: str
             provider_prescription_table.c.state,
             provider_prescription_table.c.zip5,
         )
+        .subquery()
     )
-    grouped_subquery = grouped.subquery()
-    count_result = await session.execute(select(func.count()).select_from(grouped_subquery))
-    total = int(count_result.scalar() or 0)
 
-    order = _normalize_order(args.get("order"))
-    order_by = str(args.get("order_by") or "total_drug_cost")
-    query = select(grouped_subquery)
+
+async def _prescription_provider_total(session, grouped_subquery) -> int:
+    """Count grouped providers before validating page ordering."""
+
+    count_query = select(func.count()).select_from(grouped_subquery)
+    count_result = await session.execute(count_query)
+    return int(count_result.scalar() or 0)
+
+
+async def _load_prescription_provider_entries(
+    session,
+    grouped_subquery,
+    pagination: PaginationParams,
+    order_by: str,
+    order: str,
+) -> list[dict[str, Any]]:
+    """Load and normalize one ordered prescription-provider page."""
+
     query = _apply_ordering(
-        query,
+        select(grouped_subquery),
         order_by,
         order,
         {
@@ -13186,42 +13551,107 @@ async def list_prescription_providers(request, rx_code_system: str, rx_code: str
             "total_benes": grouped_subquery.c.total_benes,
             "matched_rows": grouped_subquery.c.matched_rows,
         },
-    )
-    query = query.limit(pagination.limit).offset(pagination.offset)
-    prescription_provider_query_result = await session.execute(query)
-    prescription_provider_entries = [
-        _normalize_prescription_provider_aggregate(
-            _row_to_dict(prescription_provider_row)
-        )
-        for prescription_provider_row in prescription_provider_query_result
+    ).limit(pagination.limit).offset(pagination.offset)
+    query_result = await session.execute(query)
+    return [
+        _normalize_prescription_provider_aggregate(_row_to_dict(row))
+        for row in query_result
     ]
 
+
+def _prescription_provider_response(
+    provider_request: _PrescriptionProviderRequest,
+    provider_result: _PrescriptionProviderResult,
+):
+    """Shape the existing prescription-provider response document."""
+
+    request_filters = provider_request.filters
+    pagination = provider_request.pagination
     return response.json(
         {
-            "items": prescription_provider_entries,
+            "items": provider_result.entries,
             "pagination": {
-                "total": total,
+                "total": provider_result.total,
                 "limit": pagination.limit,
                 "offset": pagination.offset,
                 "page": pagination.page,
             },
             "query": {
-                "year": year,
-                "year_used": year,
-                "year_source": year_source,
-                "state": state or None,
-                "city": city or None,
-                "specialty": specialty or None,
-                "q": search_query or None,
-                "min_claims": min_claims,
-                "min_total_cost": min_total_cost,
-                "order_by": order_by,
-                "order": order,
-                "input_code": code_context["input_code"],
-                "resolved_codes": code_context["resolved_codes"],
-                "matched_via": code_context["matched_via"],
+                "year": provider_result.year,
+                "year_used": provider_result.year,
+                "year_source": provider_result.year_source,
+                "state": request_filters.state or None,
+                "city": request_filters.city or None,
+                "specialty": request_filters.specialty or None,
+                "q": request_filters.search_query or None,
+                "min_claims": request_filters.min_claims,
+                "min_total_cost": request_filters.min_total_cost,
+                "order_by": provider_result.order_by,
+                "order": provider_result.order,
+                "input_code": provider_result.code_context["input_code"],
+                "resolved_codes": provider_result.code_context["resolved_codes"],
+                "matched_via": provider_result.code_context["matched_via"],
             },
         }
+    )
+
+
+@blueprint.get(
+    "/prescriptions/<rx_code_system>/<rx_code>/providers",
+    name="pricing.prescriptions.providers.list",
+)
+async def list_prescription_providers(request, rx_code_system: str, rx_code: str):
+    """List providers with prescription records matching a code and optional filters."""
+    session = _get_session(request)
+    args = request.args
+    provider_request = _PrescriptionProviderRequest(
+        pagination=parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT),
+        requested_year=_parse_int(args.get("year"), "year", minimum=2013),
+        filters=_PrescriptionProviderFilters(
+            state=str(args.get("state", "")).strip().upper(),
+            city=str(args.get("city", "")).strip().lower(),
+            specialty=str(args.get("specialty", "")).strip().lower(),
+            search_query=str(args.get("q", "")).strip().lower(),
+            min_claims=_parse_float(args.get("min_claims"), "min_claims", minimum=0),
+            min_total_cost=_parse_float(
+                args.get("min_total_cost"), "min_total_cost", minimum=0
+            ),
+        ),
+    )
+    if not await _is_table_available(session, provider_prescription_table.name):
+        return _unavailable_prescription_provider_response(
+            provider_request, rx_code_system, rx_code
+        )
+    year, year_source = await _resolve_year(
+        session, provider_prescription_table, provider_request.requested_year
+    )
+    internal_rx_codes, code_context = await _resolve_internal_rx_codes_for_request(
+        session,
+        rx_code,
+        dict({"rx_code_system": rx_code_system}, **dict(args)),
+        default_system=rx_code_system,
+    )
+    where_clause = _prescription_provider_where_clause(
+        internal_rx_codes, year, provider_request.filters
+    )
+    grouped_subquery = _prescription_provider_grouped_query(where_clause)
+    total = await _prescription_provider_total(session, grouped_subquery)
+    order = _normalize_order(args.get("order"))
+    order_by = str(args.get("order_by") or "total_drug_cost")
+    entries = await _load_prescription_provider_entries(
+        session, grouped_subquery, provider_request.pagination, order_by, order
+    )
+    return _prescription_provider_response(
+        provider_request,
+        _PrescriptionProviderResult(
+            entries=entries,
+            total=total,
+            year=year,
+            year_source=year_source,
+            order_by=order_by,
+            order=order,
+            code_context=code_context,
+        ),
     )
 
 

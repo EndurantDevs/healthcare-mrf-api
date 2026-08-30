@@ -14594,6 +14594,9 @@ class _GeoRateSelectionBudget:
     provider_set_ids: set[str] = field(default_factory=set)
     provider_counts_by_id: dict[str, int] = field(default_factory=dict)
     reverse_geo_scope: tuple[tuple[int, ...], bool, int] | None = None
+    reverse_provider_set_keys_by_npi: dict[int, tuple[int, ...]] = field(
+        default_factory=dict
+    )
 
     @property
     def maximum_geo_provider_sets(self) -> int:
@@ -15042,6 +15045,7 @@ async def _read_geo_rate_page(
     page_limit: int,
     rate_offset: int,
     descending: bool,
+    source_trace_set_hash: str | None,
 ) -> list[dict[str, Any]] | None:
     """Read one complete disjoint page in the requested cost order."""
 
@@ -15050,7 +15054,7 @@ async def _read_geo_rate_page(
         serving_tables,
         code_rows=code_rows,
         provider_set_keys=None,
-        source_trace_set_hash=None,
+        source_trace_set_hash=source_trace_set_hash,
         network_names=network_names,
         limit=page_limit,
         offset=rate_offset,
@@ -15164,6 +15168,7 @@ class _GeoRateSelectionRequest:
     network_names: list[str]
     target_count: int
     descending: bool
+    source_trace_set_hash: str | None = None
 
 
 def _declared_geo_rate_count(code_rows: Sequence[Mapping[str, Any]]) -> int:
@@ -15190,6 +15195,7 @@ async def _select_geo_filtered_rate_prefix(
     network_names: list[str],
     target_count: int,
     descending: bool,
+    source_trace_set_hash: str | None = None,
 ) -> _GeoRateSelection | None:
     """Read disjoint cost pages until one geo-filtered response page is proven."""
 
@@ -15202,7 +15208,40 @@ async def _select_geo_filtered_rate_prefix(
             network_names=network_names,
             target_count=target_count,
             descending=descending,
+            source_trace_set_hash=source_trace_set_hash,
         ),
+    )
+
+
+def _retain_reverse_provider_set_keys(
+    candidate_npis: tuple[int, ...],
+    provider_set_keys_by_npi: Mapping[int, Sequence[int]],
+    budget: _GeoRateSelectionBudget,
+) -> tuple[int, ...]:
+    """Retain the bounded local membership map for provider materialization."""
+
+    candidate_npi_set = set(candidate_npis)
+    if not set(provider_set_keys_by_npi).issubset(candidate_npi_set):
+        raise PTG2ManifestArtifactError(
+            "PTG2 oversized geo provider membership escaped its local scope"
+        )
+    budget.reverse_provider_set_keys_by_npi = {
+        int(npi): tuple(
+            int(provider_set_key)
+            for provider_set_key in provider_set_keys_by_npi.get(npi, ())
+        )
+        for npi in candidate_npis
+    }
+    return tuple(
+        sorted(
+            {
+                provider_set_key
+                for provider_set_keys in (
+                    budget.reverse_provider_set_keys_by_npi.values()
+                )
+                for provider_set_key in provider_set_keys
+            }
+        )
     )
 
 
@@ -15253,14 +15292,10 @@ async def _oversized_geo_local_provider_sets(
         if not _is_v4_member_limit(exc):
             raise
         raise PTG2OnlineWorkBudgetExceeded("candidate_members") from exc
-    return tuple(
-        sorted(
-            {
-                int(provider_set_key)
-                for npi_provider_set_keys in provider_set_keys_by_npi.values()
-                for provider_set_key in npi_provider_set_keys
-            }
-        )
+    return _retain_reverse_provider_set_keys(
+        candidate_npis,
+        provider_set_keys_by_npi,
+        budget,
     )
 
 
@@ -15329,7 +15364,7 @@ async def _read_oversized_geo_rate_rows(
         serving_tables,
         code_rows=request.code_rows,
         provider_set_keys=provider_set_keys,
-        source_trace_set_hash=None,
+        source_trace_set_hash=request.source_trace_set_hash,
         network_names=request.network_names,
         limit=read_limit,
         offset=0,
@@ -15423,6 +15458,7 @@ async def _select_bounded_geo_rate_scope(
             page_limit=page_limit,
             rate_offset=rate_offset,
             descending=request.descending,
+            source_trace_set_hash=request.source_trace_set_hash,
         )
         if rate_rows is None:
             return None
@@ -18284,6 +18320,28 @@ async def _strict_cost_provider_expansion_selection(
         if geo_budget is not None
         else None
     )
+    use_oversized_geo_scope = bool(
+        geo_budget is not None
+        and declared_rate_count > geo_budget.caps.maximum_rate_rows
+        and serving_tables.provider_graph_v4_inferred_taxonomy_candidates is not None
+    )
+    oversized_geo_selection: _GeoRateSelection | None = None
+    if use_oversized_geo_scope:
+        oversized_geo_selection = await _select_oversized_geo_rate_scope(
+            session,
+            serving_tables,
+            _GeoRateSelectionRequest(
+                code_rows=code_rows,
+                args=dict(args),
+                network_names=network_names,
+                target_count=max(geo_budget.caps.maximum_rate_rows - 1, 1),
+                descending=descending,
+                source_trace_set_hash=source_trace_set_hash,
+            ),
+            geo_budget,
+        )
+        if oversized_geo_selection is None:
+            return None
     rate_window = min(
         declared_rate_count,
         max(PTG2_SERVING_BINARY_V3_PAGE_ROWS, max(int(target_count), 1)),
@@ -18306,6 +18364,90 @@ async def _strict_cost_provider_expansion_selection(
     is_geo_boundary_closed = False
     geo_batch_result_limit = max(int(target_count), 1)
     while True:
+        if use_oversized_geo_scope:
+            if oversized_geo_selection is None:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 oversized geo provider selection is unavailable"
+                )
+            if not oversized_geo_selection.exhausted:
+                raise PTG2LocationScopeError(_GEO_PROVIDER_SCOPE_ERROR)
+            serving_rows = list(oversized_geo_selection.row_data)
+            if not serving_rows:
+                is_exhausted = True
+                break
+            if geo_budget is None or geo_budget.reverse_geo_scope is None:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 oversized geo provider selection lost its local scope"
+                )
+            local_npis, is_local_scope_exhausted, _candidate_limit = (
+                geo_budget.reverse_geo_scope
+            )
+            if not is_local_scope_exhausted:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 oversized geo provider selection is not exact"
+                )
+            provider_set_id_by_key = _v4_rate_scope_set_ids(
+                serving_rows,
+                None,
+            )
+            scoped_provider_set_ids_by_npi = {
+                npi: tuple(
+                    provider_set_id_by_key[provider_set_key]
+                    for provider_set_key in (
+                        geo_budget.reverse_provider_set_keys_by_npi.get(npi, ())
+                    )
+                    if provider_set_key in provider_set_id_by_key
+                )
+                for npi in local_npis
+            }
+            if set(geo_budget.reverse_provider_set_keys_by_npi) != set(local_npis):
+                raise PTG2ManifestArtifactError(
+                    "PTG2 oversized geo provider membership is incomplete"
+                )
+            filtered_npis_by_set = {
+                provider_set_id: tuple(
+                    npi
+                    for npi in local_npis
+                    if provider_set_id
+                    in scoped_provider_set_ids_by_npi.get(npi, ())
+                )
+                for provider_set_id in provider_set_id_by_key.values()
+            }
+            if any(not provider_npis for provider_npis in filtered_npis_by_set.values()):
+                raise PTG2ManifestArtifactError(
+                    "PTG2 oversized geo rate lost its local provider membership"
+                )
+            ranked_serving_rows.extend(serving_rows)
+            rank_by_key, selected_npis, selected_provider_set_ids = (
+                await _rank_filtered_provider_expansion_prefix(
+                    session,
+                    serving_tables,
+                    _FilteredProviderExpansionRequest(
+                        row_data=ranked_serving_rows,
+                        args=args,
+                        target_count=max(int(target_count), 1),
+                        npis_by_set=filtered_npis_by_set,
+                        geo_budget=geo_budget,
+                        complete_price_key_boundary=not descending,
+                        scan_to_exhaustion=descending,
+                    ),
+                )
+            )
+            is_exhausted = len(rank_by_key) < max(int(target_count), 1)
+            if selected_npis:
+                matched_npis_by_set = await _geo_matched_npis_by_set(
+                    session,
+                    serving_tables,
+                    args,
+                    {
+                        npi: scoped_provider_set_ids_by_npi[npi]
+                        for npi in selected_npis
+                    },
+                    matched_location_rows_by_npi,
+                )
+                if matched_npis_by_set is None:
+                    return None
+            break
         if geo_budget is None:
             serving_rows = await _merge_manifest_code_variant_rows(
                 session,
@@ -18561,7 +18703,10 @@ async def _strict_cost_provider_expansion_selection(
                         network_names=network_names,
                         descending=descending,
                         is_source_exhausted=(
-                            len(serving_rows) == declared_rate_count
+                            oversized_geo_selection.exhausted
+                            if use_oversized_geo_scope
+                            and oversized_geo_selection is not None
+                            else len(serving_rows) == declared_rate_count
                         ),
                         budget=geo_budget,
                         forward_limits=geo_forward_limits,
