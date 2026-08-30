@@ -41,8 +41,11 @@ CHILD_COMMAND=()
 
 LOCK_UNIT=
 LOCK_INVOCATION_ID=
+LOCK_EXEC_START_SHA256=
 LOCK_MARKER=
+LOCK_OWNERSHIP=
 LOCK_STARTED=false
+LOCK_START_UNCERTAIN=false
 QUOTA_NAME=
 QUOTA_UID=
 POLICY_NAME=
@@ -311,6 +314,7 @@ validate_args() {
 
   LOCK_UNIT="hp-pv3-census-${OWNER_TOKEN}-lock.service"
   LOCK_MARKER="${STATE_DIR}/build-lock.acquired"
+  LOCK_OWNERSHIP="${STATE_DIR}/build-lock.ownership"
   QUOTA_NAME="hp-pv3-census-${OWNER_TOKEN}"
   POLICY_NAME="hp-pv3-census-${OWNER_TOKEN}.healthporta.com"
   BINDING_NAME="${POLICY_NAME}"
@@ -669,22 +673,71 @@ verify_source_and_target() {
 }
 
 require_lock_held() {
-  local active invocation marker
+  local active exec_start_sha invocation marker ownership
+  [ -n "${LOCK_INVOCATION_ID}" ] \
+    && [ -n "${LOCK_EXEC_START_SHA256}" ] || return 1
   active=$(run_bounded systemctl is-active "${LOCK_UNIT}" 2>/dev/null) \
     || return 1
   [ "${active}" = active ] || return 1
   invocation=$(run_bounded systemctl show "${LOCK_UNIT}" \
     --property=InvocationID --value) || return 1
-  [ -n "${LOCK_INVOCATION_ID}" ] \
-    && [ "${invocation}" = "${LOCK_INVOCATION_ID}" ] || return 1
+  [ "${invocation}" = "${LOCK_INVOCATION_ID}" ] || return 1
+  exec_start_sha=$(lock_exec_start_sha256) || return 1
+  [ "${exec_start_sha}" = "${LOCK_EXEC_START_SHA256}" ] || return 1
   [ -f "${LOCK_MARKER}" ] || return 1
   marker=$(<"${LOCK_MARKER}")
-  [ "${marker}" = "${LOCK_INVOCATION_ID}:${OWNER_TOKEN}" ]
+  [ "${marker}" = "${LOCK_INVOCATION_ID}:${OWNER_TOKEN}" ] || return 1
+  [ -f "${LOCK_OWNERSHIP}" ] && [ ! -L "${LOCK_OWNERSHIP}" ] || return 1
+  ownership=$(<"${LOCK_OWNERSHIP}")
+  [ "${ownership}" \
+    = "${LOCK_INVOCATION_ID}:${OWNER_TOKEN}:${LOCK_EXEC_START_SHA256}" ]
+}
+
+lock_exec_start_sha256() {
+  local exec_start observed_sha
+  exec_start=$(run_bounded systemctl show "${LOCK_UNIT}" \
+    --property=ExecStart --value) || return 1
+  [ -n "${exec_start}" ] || return 1
+  read -r observed_sha _ < <(printf '%s' "${exec_start}" | sha256sum) \
+    || return 1
+  [[ "${observed_sha}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "${observed_sha}"
+}
+
+persist_lock_ownership() {
+  local invocation=$1 exec_start_sha=$2
+  python3 - "${LOCK_OWNERSHIP}" "${invocation}" "${OWNER_TOKEN}" \
+    "${exec_start_sha}" <<'PY'
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = (":".join(sys.argv[2:]) + "\n").encode()
+descriptor = os.open(
+    path,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+    0o600,
+)
+try:
+    view = memoryview(payload)
+    while view:
+        view = view[os.write(descriptor, view) :]
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
 }
 
 start_lock() {
-  local create_exit=0 marker
+  local active create_exit=0 exec_start_sha invocation marker
   LOCK_STARTED=true
+  LOCK_START_UNCERTAIN=true
   set +e
   run_bounded systemd-run --quiet --unit="${LOCK_UNIT}" --property=Type=exec \
     --property=Restart=no \
@@ -694,15 +747,27 @@ start_lock() {
     sh "${OWNER_TOKEN}" "${LOCK_MARKER}"
   create_exit=$?
   set -e
+  [ "${create_exit}" -eq 0 ] \
+    || die "build lock creation returned an ambiguous failure"
   for _ in {1..20}; do
     if [ -f "${LOCK_MARKER}" ]; then
       marker=$(<"${LOCK_MARKER}")
-      LOCK_INVOCATION_ID=${marker%%:*}
-      if [ -n "${LOCK_INVOCATION_ID}" ] \
-          && [ "${marker}" = "${LOCK_INVOCATION_ID}:${OWNER_TOKEN}" ] \
-          && require_lock_held; then
-        [ "${create_exit}" -eq 0 ] \
-          || die "build lock appeared after its create command failed"
+      invocation=${marker%%:*}
+      active=$(run_bounded systemctl is-active "${LOCK_UNIT}" 2>/dev/null) \
+        || active=
+      if [ -n "${invocation}" ] \
+          && [ "${marker}" = "${invocation}:${OWNER_TOKEN}" ] \
+          && [ "${active}" = active ] \
+          && [ "$(run_bounded systemctl show "${LOCK_UNIT}" \
+            --property=InvocationID --value)" = "${invocation}" ]; then
+        exec_start_sha=$(lock_exec_start_sha256) \
+          || die "build lock ExecStart identity is unavailable"
+        persist_lock_ownership "${invocation}" "${exec_start_sha}" \
+          || die "build lock ownership could not be recorded"
+        LOCK_INVOCATION_ID=${invocation}
+        LOCK_EXEC_START_SHA256=${exec_start_sha}
+        require_lock_held || die "build lock ownership changed after recording"
+        LOCK_START_UNCERTAIN=false
         return 0
       fi
     fi
@@ -1800,24 +1865,15 @@ retain_import_drain() {
 }
 
 release_lock() {
-  local invocation marker state
+  local state
+  [ "${LOCK_START_UNCERTAIN}" = false ] || return 1
   state=$(unit_load_state) || return 1
   if [ "${state}" = not-found ]; then
     [ -z "${LOCK_INVOCATION_ID}" ] || return 1
     LOCK_RELEASED=true
     return 0
   fi
-  invocation=$(run_bounded systemctl show "${LOCK_UNIT}" \
-    --property=InvocationID --value) || return 1
-  [ -n "${invocation}" ] || return 1
-  if [ -n "${LOCK_INVOCATION_ID}" ]; then
-    [ "${invocation}" = "${LOCK_INVOCATION_ID}" ] || return 1
-    [ -f "${LOCK_MARKER}" ] || return 1
-    marker=$(<"${LOCK_MARKER}")
-    [ "${marker}" = "${LOCK_INVOCATION_ID}:${OWNER_TOKEN}" ] || return 1
-  else
-    LOCK_INVOCATION_ID=${invocation}
-  fi
+  require_lock_held || return 1
   run_bounded systemctl stop "${LOCK_UNIT}" >/dev/null 2>&1 || return 1
   run_bounded systemctl reset-failed "${LOCK_UNIT}" >/dev/null 2>&1 || true
   state=$(unit_load_state) || return 1

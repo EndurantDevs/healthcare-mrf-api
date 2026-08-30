@@ -216,24 +216,32 @@ def test_create_then_client_failure_reconciles_exact_resource(
     assert envelope._receipt(state_root)["cleanup"]["complete"] is True
 
 
-@pytest.mark.parametrize("failure_mode", ("contended", "client-error"))
+@pytest.mark.parametrize(
+    "environment",
+    [
+        pytest.param({"FAKE_LOCK_CONTENDED": "1"}, id="contended"),
+        pytest.param(
+            {"FAKE_LOCK_CREATE_ERROR_WITHOUT_UNIT": "1"},
+            id="ambiguous-no-unit",
+        ),
+        pytest.param({"FAKE_LOCK_PREEXISTING": "1"}, id="preexisting-name"),
+        pytest.param({"FAKE_LOCK_CLIENT_ERROR": "1"}, id="interrupted-start"),
+    ],
+)
 def test_lock_must_be_proven_before_admission(
     tmp_path: Path,
-    failure_mode: str,
+    environment: dict[str, str],
 ) -> None:
-    """A transient unit without a proven flock cannot admit later fences."""
+    """An ambiguous lock start must preserve the unproven exact-name unit."""
 
-    environment = (
-        {"FAKE_LOCK_CONTENDED": "1"}
-        if failure_mode == "contended"
-        else {"FAKE_LOCK_CLIENT_ERROR": "1"}
-    )
     result, state_root = envelope._run_envelope(tmp_path, **environment)
 
     assert result.returncode == 1
     events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert events == ["lock_create", "lock_stop"]
-    assert envelope._receipt(state_root)["cleanup"]["lock_released"] is True
+    assert events == ["lock_create"]
+    receipt = envelope._receipt(state_root)
+    assert receipt["cleanup"]["lock_released"] is False
+    assert receipt["cleanup"]["complete"] is False
 
 
 def test_child_drain_drift_fails_receipt_before_release(tmp_path: Path) -> None:
@@ -269,7 +277,7 @@ def test_post_child_api_error_retains_every_outer_fence(tmp_path: Path) -> None:
     assert receipt["cleanup"]["complete"] is False
 
 
-@pytest.mark.parametrize("drift", ["gone", "replaced"])
+@pytest.mark.parametrize("drift", ["gone", "replaced", "exec-replaced"])
 def test_post_child_lock_drift_retains_every_outer_fence(
     tmp_path: Path,
     drift: str,
