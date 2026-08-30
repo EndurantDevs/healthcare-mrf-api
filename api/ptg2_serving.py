@@ -7747,6 +7747,24 @@ def _ptg2_manifest_filter_prices(prices: list[dict[str, Any]], args: dict[str, A
     return [price for price in prices if _is_price_filter_match(price, args)]
 
 
+def _uses_negotiated_rate_only_filter(args: Mapping[str, Any]) -> bool:
+    return bool(
+        _optional_decimal(args.get("rate") or args.get("negotiated_rate"))
+        is not None
+        and not any(
+            args.get(field)
+            for field in (
+                "pos",
+                "place_of_service",
+                "service_code",
+                "modifier",
+                "modifiers",
+                "billing_code_modifier",
+            )
+        )
+    )
+
+
 def _ptg2_price_atom_attr_specs() -> tuple[tuple[str, str, str, str], ...]:
     """Describe lean price-atom dictionary attributes in response order."""
     return (
@@ -13022,10 +13040,21 @@ def _uses_local_distance_rate_scope(
     explicit_npi_scope: _ExplicitNpiGraphScope | None,
     candidate_limit: int,
 ) -> bool:
-    """Admit bounded V4 unfiltered or inferred-taxonomy distance requests."""
+    """Admit bounded V4 distance or exhaustive exact-rate location scopes."""
 
     requested_order = str(args.get("order_by") or "").strip().lower()
     requested_direction = str(args.get("order") or "asc").strip().lower()
+    configured_match_limit = _ptg2_manifest_location_match_limit()
+    uses_distance_order = bool(
+        requested_order in {"", "distance", "distance_miles"}
+        and requested_direction == "asc"
+        and candidate_limit <= configured_match_limit
+    )
+    uses_exhaustive_rate_scope = bool(
+        request_options.get("require_exhaustive", False)
+        and _uses_negotiated_rate_only_filter(args)
+        and candidate_limit <= configured_match_limit + 1
+    )
     return bool(
         serving_tables.uses_v4_graph
         and serving_tables.provider_graph_v4_inferred_taxonomy_candidates
@@ -13034,11 +13063,9 @@ def _uses_local_distance_rate_scope(
             not _is_ptg2_provider_filter_requested(dict(args))
             or _is_inferred_taxonomy_only_provider_filter(args)
         )
-        and requested_order in {"", "distance", "distance_miles"}
-        and requested_direction == "asc"
+        and (uses_distance_order or uses_exhaustive_rate_scope)
         and provider_set_keys is None
         and explicit_npi_scope is None
-        and candidate_limit <= _ptg2_manifest_location_match_limit()
         and not request_options.get("require_provider_set_coverage", False)
     )
 
@@ -13056,9 +13083,7 @@ async def _graph_location_matches(
     source_key = request_options.get("source_key")
     provider_set_keys = request_options.get("provider_set_keys")
     explicit_npi_scope = request_options.get("explicit_npi_scope")
-    require_provider_set_coverage = bool(
-        request_options.get("require_provider_set_coverage", False)
-    )
+    require_provider_set_coverage = bool(request_options.get("require_provider_set_coverage", False))
     requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
     requested_code = (
         canonical_catalog_code(requested_system, args.get("code") or args.get("reported_code"))
@@ -13078,6 +13103,7 @@ async def _graph_location_matches(
         provider_set_keys=provider_set_keys,
         explicit_npi_scope=explicit_npi_scope,
         require_provider_set_coverage=require_provider_set_coverage,
+        require_exhaustive=bool(request_options.get("require_exhaustive", False)),
     )
     if candidates is None:
         return None
@@ -13119,9 +13145,7 @@ async def _ptg2_manifest_location_provider_matches(
     provider_set_keys = request_options.get("provider_set_keys")
     explicit_npi_scope = request_options.get("explicit_npi_scope")
     require_exhaustive = bool(request_options.get("require_exhaustive", False))
-    require_provider_set_coverage = bool(
-        request_options.get("require_provider_set_coverage", False)
-    )
+    require_provider_set_coverage = bool(request_options.get("require_provider_set_coverage", False))
     _require_strict_shared_v3(serving_tables)
     configured_match_limit = _ptg2_manifest_location_match_limit()
     graph_candidate_limit = configured_match_limit
@@ -13145,6 +13169,7 @@ async def _ptg2_manifest_location_provider_matches(
         provider_set_keys=provider_set_keys,
         explicit_npi_scope=explicit_npi_scope,
         require_provider_set_coverage=require_provider_set_coverage,
+        require_exhaustive=require_exhaustive,
     )
     if (
         matches is None
@@ -19591,8 +19616,27 @@ async def _search_manifest_serving_table(
             or requested_direction == "desc"
         )
     )
+    uses_local_exhaustive_rate_scope = bool(
+        requested_npi is None
+        and location_requires_exhaustive
+        and _uses_local_distance_rate_scope(
+            serving_tables,
+            args,
+            {
+                "require_exhaustive": location_requires_exhaustive,
+                "require_provider_set_coverage": (
+                    location_requires_exhaustive and not include_providers
+                ),
+            },
+            None,
+            None,
+            _ptg2_manifest_location_match_limit() + 1,
+        )
+    )
     deferred_location_selection = bool(
-        location_filter_requested and price_filter_requested
+        location_filter_requested
+        and price_filter_requested
+        and not uses_local_exhaustive_rate_scope
     )
     use_geo_rate_prefix_selection = _uses_geo_rate_prefix_selection(
         serving_tables,
