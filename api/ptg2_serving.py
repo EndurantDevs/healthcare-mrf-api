@@ -18304,6 +18304,7 @@ async def _strict_cost_provider_expansion_selection(
     geo_rate_offset = 0
     geo_boundary_price_key: int | None = None
     is_geo_boundary_closed = False
+    geo_batch_result_limit = max(int(target_count), 1)
     while True:
         if geo_budget is None:
             serving_rows = await _merge_manifest_code_variant_rows(
@@ -18415,10 +18416,6 @@ async def _strict_cost_provider_expansion_selection(
             geo_rate_offset + page_limit >= declared_rate_count
         )
         page_start = 0
-        geo_batch_result_limit = max(
-            int(target_count) - len(rank_by_key),
-            1,
-        )
         while page_start < len(geo_page_rows):
             if (
                 not descending
