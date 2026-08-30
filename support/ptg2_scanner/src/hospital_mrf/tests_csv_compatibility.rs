@@ -244,6 +244,86 @@
     }
 
     #[test]
+    fn wide_rows_omit_anonymous_ancillary_only_payer_groups() {
+        let anonymous = String::from_utf8(fixture_wide_csv())
+            .unwrap()
+            .replace("Payer, Inc.|Plan A", "|Anonymous Plan")
+            .replacen("9.125", "", 1)
+            .into_bytes();
+        let statistics_only = append_csv_row(
+            &anonymous,
+            &[
+                ("description", "Statistics without payer identity"),
+                ("code|1", "10009"),
+                ("code|1|type", "CPT"),
+                ("setting", "outpatient"),
+                ("billing_class", "facility"),
+                ("standard_charge|gross", "51"),
+                ("median_amount||Anonymous Plan", "45"),
+                ("10th_percentile||Anonymous Plan", "40"),
+                ("90th_percentile||Anonymous Plan", "49"),
+                ("count||Anonymous Plan", "1 through 10"),
+                (
+                    "standard_charge||Anonymous Plan|methodology",
+                    "fee schedule",
+                ),
+                (
+                    "additional_payer_notes||Anonymous Plan",
+                    "No negotiated charge reported",
+                ),
+            ],
+        );
+
+        let rows = run_fixture(InputFormat::WideCsv, &statistics_only, false);
+        assert_eq!(
+            String::from_utf8(rows["charge"].clone())
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        assert!(rows["payer_charge"].is_empty());
+    }
+
+    #[test]
+    fn wide_anonymous_payer_evidence_fails_closed() {
+        let negotiated_charge = String::from_utf8(fixture_wide_csv())
+            .unwrap()
+            .replace("Payer, Inc.|Plan A", "|Anonymous Plan")
+            .into_bytes();
+        assert_import_error(
+            InputFormat::WideCsv,
+            &negotiated_charge,
+            DEFAULT_MAX_FANOUT_ROWS,
+            "payer_name must be a non-empty string",
+        );
+
+        let anonymous_plan = String::from_utf8(fixture_wide_csv())
+            .unwrap()
+            .replace("Payer, Inc.|Plan A", "Anonymous Payer|")
+            .replacen("9.125", "", 1)
+            .into_bytes();
+        let modifier_evidence = append_csv_row(
+            &anonymous_plan,
+            &[
+                ("description", "Modifier evidence without payer identity"),
+                ("modifiers", "25"),
+                ("setting", "outpatient"),
+                (
+                    "additional_payer_notes|Anonymous Payer|",
+                    "Payer-specific modifier note",
+                ),
+            ],
+        );
+        assert_import_error(
+            InputFormat::WideCsv,
+            &modifier_evidence,
+            DEFAULT_MAX_FANOUT_ROWS,
+            "modifier plan_name must be a non-empty string",
+        );
+    }
+
+    #[test]
     fn wide_ancillary_only_payer_fields_preserve_validation_boundaries() {
         let assert_wide_error = |code: &str, fields: &[(&str, &str)], expected: &str| {
             let mut values = vec![
