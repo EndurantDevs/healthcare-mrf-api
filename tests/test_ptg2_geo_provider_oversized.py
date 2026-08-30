@@ -142,7 +142,11 @@ async def test_strict_geo_oversized_scope_finds_local_provider_after_rate_cap(
     assert providers[0]["location_hash"] == _LOCAL_LOCATION_ROW["location_hash"]
     assert fixture.budget.rate_rows == 1
     assert fixture.budget.caps.maximum_rate_rows - fixture.budget.rate_rows == 7
-    assert fixture.budget.reverse_geo_scope == ((_LOCAL_NPI,), True, 8)
+    assert fixture.budget.reverse_geo_scope == (
+        (_LOCAL_NPI,),
+        True,
+        serving._ptg2_manifest_location_match_limit(),
+    )
     assert all(
         call.kwargs["provider_set_keys"] is not None
         for call in fixture.rate_reads.await_args_list

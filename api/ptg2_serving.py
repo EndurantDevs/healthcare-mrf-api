@@ -11417,6 +11417,10 @@ async def _membership_npi_rows(
         or query_context.knn_order_sql is not None
         or not _is_unified_address_table(query_context.address_table)
         or query_context.address_assurance_sql == "TRUE"
+        or (
+            candidate_npis is None
+            and query_context.taxonomy_index_sql is not None
+        )
     ):
         return await _membership_location_rows(
             session,
@@ -15397,7 +15401,6 @@ async def _select_oversized_geo_rate_scope(
     budget.maximum_candidate_members = min(
         budget.maximum_candidate_members,
         _ptg2_manifest_location_match_limit(),
-        budget.caps.maximum_provider_sets,
     )
     local_provider_set_keys = await _oversized_geo_local_provider_sets(
         session,
