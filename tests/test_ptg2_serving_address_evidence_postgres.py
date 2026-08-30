@@ -9,6 +9,13 @@ from tests.ptg2_serving_address_evidence_postgres_geo import (
     test_knn_template_executes_precedence_and_empty_probe_shape,
     test_optimized_membership_rejects_npi_wide_cms_anchor,
 )
+from tests.ptg2_serving_address_evidence_postgres_knn import (
+    test_knn_assurance_precedes_per_npi_distance_rank,
+    test_knn_broad_underfilled_radius_reaches_exact_zip,
+    test_knn_exact_zip_runs_after_out_of_radius_source_exhaustion,
+    test_knn_radius_fence_preserves_spheroid_boundary,
+    test_knn_withholds_exact_zip_while_radius_source_is_capped,
+)
 from tests.ptg2_serving_address_evidence_postgres_coverage import (
     test_provider_set_geo_candidate_scope_executes_beyond_old_prefix,
 )

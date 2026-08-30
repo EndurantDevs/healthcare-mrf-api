@@ -373,7 +373,7 @@ def _ptg2_geo_dwithin_sql(lat_sql: str, long_sql: str) -> str:
         "ST_DWithin("
         f"Geography(ST_MakePoint(({long_sql})::double precision, ({lat_sql})::double precision)), "
         f"Geography(ST_MakePoint({request_long}, {request_lat})), "
-        "CAST(:geo_radius_miles AS double precision) * 1609.34"
+        "CAST(:geo_radius_miles AS double precision) * 1609.34, true"
         ")"
     )
 
@@ -9917,8 +9917,98 @@ ORDER BY selected.distance_miles ASC NULLS LAST, addr.npi
 """
 
 
+_MEMBERSHIP_KNN_SPARSE_SCOPE_LIMIT = 4096
+
+
 _MEMBERSHIP_LOCATION_KNN_SQL = """
-WITH nearest_addresses AS MATERIALIZED (
+WITH scope_probe AS MATERIALIZED (
+    SELECT COUNT(*)::bigint AS npi_count
+    FROM (
+        SELECT 1
+        FROM {npi_scope_table}
+        WHERE snapshot_key = :shared_snapshot_key
+        LIMIT {scope_probe_limit}
+    ) scoped_npis
+), sparse_geocoded_candidates AS MATERIALIZED (
+    SELECT
+        addr.location_key,
+        {distance_sql} AS candidate_distance_miles
+    FROM {address_table} addr
+    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
+    WHERE (SELECT npi_count < {scope_probe_limit} FROM scope_probe)
+      AND npi_scope.snapshot_key = :shared_snapshot_key
+      AND addr.npi IS NOT NULL
+      AND addr.type IN ('primary', 'secondary', 'practice', 'site')
+      AND COALESCE(addr.address_precision, '') <> 'city_zip'
+      AND addr.lat IS NOT NULL
+      AND addr.long IS NOT NULL
+      -- A scalar fence keeps sparse scopes on their NPI-first plan.
+      AND (SELECT {raw_geo_radius_sql} OFFSET 0)
+    ORDER BY {knn_order_sql},
+             addr.npi,
+             CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
+             addr.checksum,
+             addr.location_key
+    LIMIT :raw_probe_limit
+), broad_geocoded_candidates AS MATERIALIZED (
+    SELECT
+        addr.location_key,
+        {distance_sql} AS candidate_distance_miles
+    FROM {address_table} addr
+    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
+    WHERE (SELECT npi_count >= {scope_probe_limit} FROM scope_probe)
+      AND npi_scope.snapshot_key = :shared_snapshot_key
+      AND addr.npi IS NOT NULL
+      AND addr.type IN ('primary', 'secondary', 'practice', 'site')
+      AND COALESCE(addr.address_precision, '') <> 'city_zip'
+      AND addr.lat IS NOT NULL
+      AND addr.long IS NOT NULL
+      -- Keep the radius planner-visible so underfilled broad scans can stop.
+      AND {raw_geo_radius_sql}
+    ORDER BY {knn_order_sql},
+             addr.npi,
+             CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
+             addr.checksum,
+             addr.location_key
+    LIMIT :raw_probe_limit
+), geocoded_candidates AS MATERIALIZED (
+    SELECT * FROM sparse_geocoded_candidates
+    UNION ALL
+    SELECT * FROM broad_geocoded_candidates
+), geocoded_probe_stats AS MATERIALIZED (
+    SELECT COUNT(*)::bigint AS raw_probe_count
+    FROM geocoded_candidates
+), exact_zip_candidates AS MATERIALIZED (
+    SELECT
+        exact_zip.location_key,
+        NULL::double precision AS candidate_distance_miles
+    FROM geocoded_probe_stats
+    CROSS JOIN LATERAL (
+        SELECT addr.location_key
+        FROM {address_table} addr
+        JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
+        WHERE geocoded_probe_stats.raw_probe_count < :raw_probe_limit
+          AND npi_scope.snapshot_key = :shared_snapshot_key
+          AND addr.npi IS NOT NULL
+          AND addr.type IN ('primary', 'secondary', 'practice', 'site')
+          AND {exact_zip_candidate_filter_sql}
+        ORDER BY addr.npi,
+                 CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
+                 addr.checksum,
+                 addr.location_key
+        LIMIT GREATEST(
+            :raw_probe_limit - geocoded_probe_stats.raw_probe_count,
+            0
+        )
+    ) exact_zip
+), exact_zip_probe_stats AS MATERIALIZED (
+    SELECT COUNT(*)::bigint AS raw_probe_count
+    FROM exact_zip_candidates
+), candidate_keys AS MATERIALIZED (
+    SELECT * FROM geocoded_candidates
+    UNION ALL
+    SELECT * FROM exact_zip_candidates
+), nearest_addresses AS MATERIALIZED (
     SELECT
         addr.npi,
         addr.state_name,
@@ -9948,19 +10038,17 @@ WITH nearest_addresses AS MATERIALIZED (
         {address_source_mask_sql} AS address_source_mask,
         {location_confidence_sql} AS location_confidence_id,
         {geo_evidence_level_sql} AS geo_evidence_level,
-        {distance_sql} AS candidate_distance_miles
-    FROM {address_table} addr
+        candidate.candidate_distance_miles
+    FROM candidate_keys candidate
+    JOIN {address_table} addr ON addr.location_key = candidate.location_key
     JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
     WHERE {filter_sql}
-    ORDER BY {knn_order_sql},
-             addr.npi,
-             CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
-             addr.checksum,
-             addr.location_key
-    LIMIT :raw_probe_limit
 ), probe_stats AS MATERIALIZED (
-    SELECT COUNT(*)::bigint AS raw_probe_count
-    FROM nearest_addresses
+    SELECT
+        geocoded.raw_probe_count AS geocoded_probe_count,
+        exact_zip.raw_probe_count AS exact_zip_probe_count
+    FROM geocoded_probe_stats geocoded
+    CROSS JOIN exact_zip_probe_stats exact_zip
 ), matched AS MATERIALIZED (
     SELECT
         addr.npi,
@@ -10016,7 +10104,11 @@ WITH nearest_addresses AS MATERIALIZED (
     WHERE addr.geo_evidence_level IS NOT NULL
 )
 SELECT selected.*,
-       (probe_stats.raw_probe_count < :raw_probe_limit) AS _ptg_source_exhausted,
+       (
+           probe_stats.geocoded_probe_count
+           + probe_stats.exact_zip_probe_count
+           < :raw_probe_limit
+       ) AS _ptg_source_exhausted,
        (selected.npi IS NULL) AS _ptg_probe_empty
 FROM probe_stats
 LEFT JOIN LATERAL (
@@ -10260,11 +10352,11 @@ def _membership_knn_order_sql(
         args.get(field) not in (None, "", "null")
         for field in ("lat", "long")
     )
-    has_non_coordinate_locator = any(
+    has_conflicting_locator = any(
         args.get(field) not in (None, "", "null")
-        for field in ("state", "city", "zip5", "zip", "npi")
+        for field in ("state", "city", "npi")
     )
-    if not has_coordinate_pair or has_non_coordinate_locator:
+    if not has_coordinate_pair or has_conflicting_locator:
         return None
     return _ptg2_geo_knn_meters_sql("addr.lat", "addr.long")
 
@@ -11242,9 +11334,18 @@ def _membership_location_sql(
     requested_limit = max(int(limit), 1)
     probe_limit = requested_limit + max(requested_limit // 2, 64)
     query_context.parameter_map["raw_probe_limit"] = probe_limit + 1
+    exact_zip_candidate_filter_sql = "FALSE"
+    if query_context.parameter_map.get("zip5") is not None:
+        exact_zip_candidate_filter_sql = (
+            f"{_ptg2_address_zip5_sql('addr', unified=True)} = :zip5 "
+            "AND addr.lat IS NULL AND addr.long IS NULL"
+        )
     return _MEMBERSHIP_LOCATION_KNN_SQL.format(
         **format_values_by_name,
         knn_order_sql=query_context.knn_order_sql,
+        raw_geo_radius_sql=_ptg2_geo_dwithin_sql("addr.lat", "addr.long"),
+        scope_probe_limit=_MEMBERSHIP_KNN_SPARSE_SCOPE_LIMIT + 1,
+        exact_zip_candidate_filter_sql=exact_zip_candidate_filter_sql,
     )
 
 

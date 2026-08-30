@@ -238,32 +238,35 @@ async def test_membership_location_query_does_not_let_exact_zip_bypass_assurance
     assert "source_issuer_names" in query.address_assurance_sql
     assert "geo_nppes_anchor.premise_key = addr.premise_key" in query.address_assurance_sql
     rendered_sql = serving._membership_location_sql(query, limit=10, offset=0)
-    assert "mrf_requested AS MATERIALIZED" in rendered_sql
-    assert "cms_assured AS MATERIALIZED" in rendered_sql
-    assert "classified_locations AS MATERIALIZED" in rendered_sql
-    assert "assured_location_keys AS MATERIALIZED" not in rendered_sql
-    assert "SELECT DISTINCT located.npi, located.address_key" in rendered_sql
-    assert "candidate.type IN ('primary', 'secondary', 'practice', 'site')" in rendered_sql
-    assert "JOIN mrf.npi_address anchor_source" in rendered_sql
-    assert "selected.geo_evidence_level AS _geo_evidence_level" in rendered_sql
+    assert "scope_probe AS MATERIALIZED" in rendered_sql
+    assert "npi_count < 4097" in rendered_sql
+    assert "npi_count >= 4097" in rendered_sql
+    assert "geocoded_candidates AS MATERIALIZED" in rendered_sql
+    assert "exact_zip_candidates AS MATERIALIZED" in rendered_sql
+    assert "candidate_keys AS MATERIALIZED" in rendered_sql
+    assert "nearest_addresses AS MATERIALIZED" in rendered_sql
+    assert "(SELECT ST_DWithin(" in rendered_sql
+    assert "OFFSET 0)" in rendered_sql
+    assert ":raw_probe_limit - geocoded_probe_stats.raw_probe_count" in rendered_sql
+    assert "addr.lat IS NULL AND addr.long IS NULL" in rendered_sql
+    assert "addr.geo_evidence_level AS _geo_evidence_level" in rendered_sql
     assert "_geo_evidence_source_id" in rendered_sql
     assert "ROW_NUMBER() OVER" in rendered_sql
-    assert "classified.checksum,\n                     classified.location_key" in rendered_sql
+    assert "addr.checksum,\n                     addr.location_key" in rendered_sql
     assert "geo_doctor_anchor" not in rendered_sql
-    nppes_requested_sql = rendered_sql.split(
-        "nppes_requested AS MATERIALIZED (", 1
-    )[1].split("), nppes_assured", 1)[0]
-    mrf_requested_sql = rendered_sql.split(
-        "mrf_requested AS MATERIALIZED (", 1
-    )[1].split("), mrf_assured", 1)[0]
-    cms_requested_sql = rendered_sql.split(
-        "cms_requested AS MATERIALIZED (", 1
-    )[1].split("), cms_assured", 1)[0]
-    assert "location_key" not in nppes_requested_sql
-    assert "location_key" not in mrf_requested_sql
-    assert "location_key" not in cms_requested_sql
-    assert "LEFT JOIN nppes_assured nppes" in mrf_requested_sql
-    assert "LEFT JOIN mrf_assured mrf" in cms_requested_sql
+    exact_zip_sql = rendered_sql.split(
+        "exact_zip_candidates AS MATERIALIZED (", 1
+    )[1].split("), exact_zip_probe_stats", 1)[0]
+    assert "source_issuer_names" not in exact_zip_sql
+    assert "geo_nppes_anchor" not in exact_zip_sql
+    assert rendered_sql.index("candidate_keys AS MATERIALIZED") < rendered_sql.index(
+        "nearest_addresses AS MATERIALIZED"
+    ) < rendered_sql.index("ROW_NUMBER() OVER")
+    matched_sql = rendered_sql.split("matched AS MATERIALIZED (", 1)[1].split(
+        ")\nSELECT selected.*", 1
+    )[0]
+    assert "ROW_NUMBER() OVER" in matched_sql
+    assert "WHERE addr.geo_evidence_level IS NOT NULL" in matched_sql
 
 
 @pytest.mark.asyncio

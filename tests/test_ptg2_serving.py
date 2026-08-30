@@ -1721,7 +1721,7 @@ def test_membership_filter_requires_coherence_before_zip_or_radius():
     assert "asin" in distance_sql
 
 
-def test_knn_order_requires_unscoped_first_page_coordinate_search():
+def test_knn_order_allows_exact_zip_on_unscoped_first_page_coordinate_search():
     query_by_name = {"lat": "41.90", "long": "-87.65"}
 
     assert ptg2_serving._membership_knn_order_sql(
@@ -1730,15 +1730,12 @@ def test_knn_order_requires_unscoped_first_page_coordinate_search():
         uses_unified_addresses=True,
         offset=0,
     ) == ptg2_serving._ptg2_geo_knn_meters_sql("addr.lat", "addr.long")
-    assert (
-        ptg2_serving._membership_knn_order_sql(
-            {**query_by_name, "zip5": "60601"},
-            candidate_npis=None,
-            uses_unified_addresses=True,
-            offset=0,
-        )
-        is None
-    )
+    assert ptg2_serving._membership_knn_order_sql(
+        {**query_by_name, "zip5": "60601"},
+        candidate_npis=None,
+        uses_unified_addresses=True,
+        offset=0,
+    ) == ptg2_serving._ptg2_geo_knn_meters_sql("addr.lat", "addr.long")
     assert (
         ptg2_serving._membership_knn_order_sql(
             query_by_name,
@@ -1755,7 +1752,23 @@ def test_knn_query_carries_bounded_raw_probe_exhaustion_marker():
     assert "_ptg_source_exhausted" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
     assert "_ptg_probe_empty" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
     assert "LEFT JOIN LATERAL" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
-    assert "probe_stats.raw_probe_count < :raw_probe_limit" in (
+    assert "geocoded_probe_stats.raw_probe_count < :raw_probe_limit" in (
+        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
+    )
+    assert "(SELECT {raw_geo_radius_sql} OFFSET 0)" in (
+        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
+    )
+    assert "AND {raw_geo_radius_sql}" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
+    assert "sparse_geocoded_candidates AS MATERIALIZED" in (
+        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
+    )
+    assert "broad_geocoded_candidates AS MATERIALIZED" in (
+        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
+    )
+    assert ":raw_probe_limit - geocoded_probe_stats.raw_probe_count" in (
+        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
+    )
+    assert "probe_stats.geocoded_probe_count\n           + probe_stats.exact_zip_probe_count" in (
         ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
     )
 
