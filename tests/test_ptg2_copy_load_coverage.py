@@ -59,13 +59,13 @@ def test_sqlalchemy_copy_records_preserve_mrf_bind_semantics():
         PlanNPIRaw,
         ["addresses", "first_name"],
         dialect,
-    ) == [(['"{\\"b\\": 1}"'], "A\x00B")]
+    ) == [(['"{\\"b\\": 1}"'], "AB")]
     assert copy_load._sqlalchemy_copy_records(
-        [{"benefit_value_json": None, "benefit_item_json": {"answer": True}}],
+        [{"benefit_value_json": None, "benefit_item_json": {"answer": "A\x00B"}}],
         PlanBenefitsMarketplace,
         ["benefit_value_json", "benefit_item_json"],
         dialect,
-    ) == [("null", '{"answer": true}')]
+    ) == [("null", '{"answer": "AB"}')]
 
 
 def test_copy_ignore_keeps_the_first_row_for_each_conflict_key():

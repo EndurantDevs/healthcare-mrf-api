@@ -89,9 +89,9 @@ def _sqlalchemy_copy_records(object_rows, cls, columns, dialect):
     ]
     return [
         tuple(
-            processor(object_row.get(column))
+            processor(_strip_postgres_nuls(object_row.get(column)))
             if processor is not None
-            else object_row.get(column)
+            else _strip_postgres_nuls(object_row.get(column))
             for column, processor in zip(columns, processors)
         )
         for object_row in object_rows
