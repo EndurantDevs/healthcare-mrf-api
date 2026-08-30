@@ -15276,10 +15276,18 @@ async def _oversized_geo_local_provider_sets(
     if not candidate_npis:
         return ()
     try:
+        graph_root = await load_v4_graph_root(
+            session, _required_shared_snapshot_key(serving_tables), schema_name=PTG2_SCHEMA
+        )
+        physical_work_multiplier = _v4_direct_io_multiplier(
+            serving_tables
+        ) if graph_root.representation == "direct_v1" else 1
         with v4_graph_taxonomy_projection_scope(
             maximum_members=forward_limits.maximum_projection_members,
-            maximum_pages=forward_limits.scan_budget.maximum_fragments,
-            maximum_bytes=forward_limits.scan_budget.maximum_raw_payload_bytes,
+            maximum_pages=forward_limits.scan_budget.maximum_fragments
+            * physical_work_multiplier,
+            maximum_bytes=forward_limits.scan_budget.maximum_raw_payload_bytes
+            * physical_work_multiplier,
             maximum_batches=forward_limits.maximum_graph_batches,
         ):
             provider_set_keys_by_npi = await _v4_sets_by_npi(

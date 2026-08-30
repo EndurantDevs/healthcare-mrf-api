@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import ptg2_serving as serving
+from api.ptg2_v4_graph import V4GraphRoot
 from tests.test_ptg2_geo_rate_prefix import _code_rows, _production_tables
 
 
@@ -83,6 +84,11 @@ async def test_oversized_geo_rate_handles_bounded_reverse_scope_outcomes(
 
 @pytest.mark.asyncio
 async def test_oversized_geo_rate_preserves_unrelated_graph_errors(monkeypatch):
+    monkeypatch.setattr(
+        serving,
+        "load_v4_graph_root",
+        AsyncMock(return_value=V4GraphRoot(17, "direct_v1", b"r" * 32)),
+    )
     monkeypatch.setattr(
         serving,
         "_cached_reverse_geo_scope",
