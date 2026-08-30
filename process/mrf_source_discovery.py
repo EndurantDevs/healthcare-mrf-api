@@ -14496,7 +14496,7 @@ async def _resolve_uhc_blob_listing(
         parsed_targets = _uhc_blob_targets_matching_query(
             _parse_uhc_blob_listing(listing), target_query
         )
-        max_targets = _as_int(resolver.get("max_targets")) if target_query else None
+        max_targets = _as_int(resolver.get("max_targets"))
         if max_targets and max_targets > 0:
             parsed_targets = parsed_targets[:max_targets]
         crawl_targets.extend(

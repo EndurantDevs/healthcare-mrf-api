@@ -7964,6 +7964,40 @@ async def test_uhc_blob_query_finds_late_match_before_target_limit(monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+async def test_uhc_blob_target_limit_applies_without_query(monkeypatch):
+    root_url = "https://transparency-in-coverage.uhc.com/"
+    listing_url = f"{root_url}api/v1/uhc/blobs/"
+
+    async def fake_fetch_json(url, *, max_bytes, session):
+        assert (url, max_bytes, session) == (listing_url, 67108864, "session")
+        return {
+            "blobs": [
+                {
+                    "name": f"2026-07-01_Employer-{number}_index.json",
+                    "downloadUrl": f"{listing_url}download/employer-{number}.json",
+                }
+                for number in (1, 2)
+            ]
+        }
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+    crawl_targets = await discovery._crawl_targets_for_source(
+        {
+            "source_id": "source_uhc_unscoped",
+            "display_name": "Example Carrier",
+            "hosting_platform": "uhc_public_blobs",
+            "metadata_json": {},
+        },
+        root_url,
+        session="session",
+        target_limit=1,
+    )
+
+    assert len(crawl_targets) == 1
+    assert crawl_targets[0].metadata["blob_name"].endswith("Employer-1_index.json")
+
+
 def _uhc_provider_listing_response() -> dict:
     return {
         "providers": [
