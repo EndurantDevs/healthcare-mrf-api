@@ -7,7 +7,9 @@ from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
 
 import pytest
+from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
 
+from db.models import PlanBenefitsMarketplace, PlanNPIRaw
 from process.ptg_parts import copy_load
 from tests.ptg2_copy_load_coverage_support import (
     CopyConnection,
@@ -46,6 +48,38 @@ def test_copy_value_helpers_coerce_json_defaults_and_postgres_nuls():
         json_columns,
     )
     assert record == ("a", '{"value": "4.2"}', None)
+
+
+def test_sqlalchemy_copy_records_preserve_mrf_bind_semantics():
+    """Use SQLAlchemy's asyncpg bindings for exact MRF JSON behavior."""
+
+    dialect = PGDialect_asyncpg()
+    assert copy_load._sqlalchemy_copy_records(
+        [{"addresses": ['{"b": 1}'], "first_name": "A\x00B"}],
+        PlanNPIRaw,
+        ["addresses", "first_name"],
+        dialect,
+    ) == [(['"{\\"b\\": 1}"'], "AB")]
+    assert copy_load._sqlalchemy_copy_records(
+        [
+            {
+                "benefit_value_json": None,
+                "benefit_item_json": {"a\x00b": "A\x00B", "ab": "other"},
+            }
+        ],
+        PlanBenefitsMarketplace,
+        ["benefit_value_json", "benefit_item_json"],
+        dialect,
+    ) == [("null", '{"a\\u0000b": "A\\u0000B", "ab": "other"}')]
+
+
+def test_copy_ignore_keeps_the_first_row_for_each_conflict_key():
+    rows = [
+        {"id": "same\x00", "label": "Northstar First"},
+        {"id": "other", "label": "Bluebird"},
+        {"id": "same", "label": "Northstar Duplicate"},
+    ]
+    assert copy_load._first_rows_by_conflict(rows, ["id"]) == rows[:2]
 
 
 def test_conflict_target_resolution_obeys_model_metadata():
@@ -143,6 +177,20 @@ async def test_copy_upsert_emits_do_nothing_for_key_only_rows(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_copy_ignore_fails_closed_without_copy_driver(monkeypatch):
+    """Let callers choose the fallback when the driver has no COPY API."""
+
+    capture = install_capture(monkeypatch, copy_load)
+    capture.connection.raw_connection.driver_connection = SimpleNamespace()
+
+    with pytest.raises(NotImplementedError, match="copy_records_to_table"):
+        await copy_load._copy_ignore_ptg2_objects(
+            [{"id": "one"}],
+            model("id", conflict_targets=("id",)),
+        )
+
+
+@pytest.mark.asyncio
 async def test_copy_insert_uses_raw_driver_and_guards_attempt(monkeypatch):
     """Support direct raw drivers while preserving guard and COPY data."""
 
@@ -205,6 +253,7 @@ async def test_copy_ignore_emits_conflict_safe_stage_insert(monkeypatch):
     assert capture.guard_calls[0]["attempt_rows"] == rows
     emitted_sql = "\n".join(capture.connection.status_calls)
     assert 'ON CONFLICT ("id") DO NOTHING' in emitted_sql
+    assert 'ORDER BY "id"' in emitted_sql
 
 
 @pytest.mark.asyncio

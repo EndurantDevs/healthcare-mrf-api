@@ -82,6 +82,35 @@ def _ptg2_copy_record(row: dict[str, Any], columns: list[str], json_columns: set
     return tuple(values)
 
 
+def _sqlalchemy_copy_records(object_rows, cls, columns, dialect):
+    processors = [
+        cls.__table__.c[column].type.dialect_impl(dialect).bind_processor(dialect)
+        for column in columns
+    ]
+    return [
+        tuple(
+            _strip_postgres_nuls(
+                processor(object_row.get(column))
+                if processor is not None
+                else object_row.get(column)
+            )
+            for column, processor in zip(columns, processors)
+        )
+        for object_row in object_rows
+    ]
+
+
+def _first_rows_by_conflict(object_rows, conflict_targets):
+    first_row_by_conflict = {}
+    for object_row in object_rows:
+        conflict_values = tuple(
+            _strip_postgres_nuls(object_row.get(column))
+            for column in conflict_targets
+        )
+        first_row_by_conflict.setdefault(conflict_values, object_row)
+    return list(first_row_by_conflict.values())
+
+
 async def _guard_copy_attempt(
     connection: Any,
     schema_name: str,
@@ -181,13 +210,16 @@ async def _copy_insert_ptg2_objects(rows: list[dict[str, Any]], cls) -> None:
         )
 
 
-async def _copy_ignore_ptg2_objects(object_rows: list[dict[str, Any]], cls) -> None:
+async def _copy_ignore_objects(
+    object_rows: list[dict[str, Any]], cls, *, bind_sqlalchemy_types: bool = False
+) -> None:
     if not object_rows:
         return
     conflict_targets = list(getattr(cls, "__my_index_elements__", []) or [])
     if not conflict_targets:
         await _copy_insert_ptg2_objects(object_rows, cls)
         return
+    object_rows = _first_rows_by_conflict(object_rows, conflict_targets)
     columns = list(object_rows[0].keys())
     json_columns = _ptg2_json_columns(cls)
     schema_name = resolve_ptg2_schema(cls.__table__.schema)
@@ -197,17 +229,26 @@ async def _copy_ignore_ptg2_objects(object_rows: list[dict[str, Any]], cls) -> N
     quoted_target = f"{_quote_ident(schema_name)}.{_quote_ident(table_name)}"
     quoted_columns = ", ".join(_quote_ident(column) for column in columns)
     quoted_conflict = ", ".join(_quote_ident(column) for column in conflict_targets)
-    copy_records = [
-        _ptg2_copy_record(object_row, columns, json_columns)
-        for object_row in object_rows
-    ]
     async with db.acquire() as conn:
         await _guard_copy_attempt(conn, schema_name, table_name, object_rows)
         await conn.status(
             f"CREATE TEMP TABLE {quoted_temp} (LIKE {quoted_target} INCLUDING DEFAULTS) ON COMMIT DROP;"
         )
         driver_conn = _copy_driver_connection(conn)
-        await driver_conn.copy_records_to_table(
+        copy_method = getattr(driver_conn, "copy_records_to_table", None)
+        if copy_method is None:
+            raise NotImplementedError(
+                "Active database driver does not expose copy_records_to_table"
+            )
+        copy_records = (
+            _sqlalchemy_copy_records(object_rows, cls, columns, db.engine.dialect)
+            if bind_sqlalchemy_types
+            else [
+                _ptg2_copy_record(object_row, columns, json_columns)
+                for object_row in object_rows
+            ]
+        )
+        await copy_method(
             temp_table,
             columns=columns,
             records=copy_records,
@@ -217,9 +258,13 @@ async def _copy_ignore_ptg2_objects(object_rows: list[dict[str, Any]], cls) -> N
             INSERT INTO {quoted_target} ({quoted_columns})
             SELECT {quoted_columns}
             FROM {quoted_temp}
+            ORDER BY {quoted_conflict}
             ON CONFLICT ({quoted_conflict}) DO NOTHING;
             """
         )
+
+
+_copy_ignore_ptg2_objects = _copy_ignore_objects
 
 
 async def _copy_stage_price_set_rows(
