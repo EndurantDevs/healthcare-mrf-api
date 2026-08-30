@@ -182,7 +182,8 @@ hospitals:
   locator_name: Essentia Health-Ada
 - hospital_id: hospital-000047
   name: Adair County Memorial Hospital
-  cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  cms_hpt_url: https://www.achsiowa.org/cms-hpt.txt
+  locator_name: Adair County Memorial Hospital
 - hospital_id: hospital-000048
   name: ADAMS COUNTY MEMORIAL HOSPITAL
   cms_hpt_url: https://adamshealthnetwork.org/cms-hpt.txt
@@ -412,6 +413,8 @@ hospitals:
 - hospital_id: hospital-000121
   name: ADVENTIST HEALTH CLEARLAKE HOSPITAL INC
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  alias_of: hospital-000120
+  locator_name: ADVENTIST HEALTH CLEARLAKE HOSPITAL
 - hospital_id: hospital-000122
   name: ADVENTIST HEALTH DELANO
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
@@ -429,6 +432,7 @@ hospitals:
 - hospital_id: hospital-000126
   name: ADVENTIST HEALTH SELMA
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  locator_name: HANFORD COMMUNITY HOSPITAL
 - hospital_id: hospital-000127
   name: ADVENTIST HEALTH TULARE
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
@@ -626,7 +630,8 @@ hospitals:
   cms_hpt_url: https://bsahs.org/cms-hpt.txt
 - hospital_id: hospital-000188
   name: Amberwell Atchison Association
-  cms_hpt_url: https://www.baptisthealth.com/cms-hpt.txt
+  cms_hpt_url: https://amberwellhealth.org/cms-hpt.txt
+  locator_name: Amberwell Atchison Association
 - hospital_id: hospital-000189
   name: Amberwell Hiawatha Association
   cms_hpt_url: https://amberwellhealth.org/cms-hpt.txt
@@ -1133,7 +1138,9 @@ hospitals:
   cms_hpt_url: https://ascensionwisconsinhospital.org/cms-hpt.txt
 - hospital_id: hospital-000342
   name: ASHLAND DISTRICT HOSPITAL
-  cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  cms_hpt_url: https://ashlandhealthcenter.com/cms-hpt.txt
+  alias_of: hospital-000343
+  locator_name: Ashland Health Center
 - hospital_id: hospital-000343
   name: Ashland Health Center
   cms_hpt_url: https://ashlandhealthcenter.com/cms-hpt.txt
@@ -1936,7 +1943,9 @@ hospitals:
   cms_hpt_url: https://www.baptisthealth.com/cms-hpt.txt
 - hospital_id: hospital-000593
   name: BAPTIST HEALTH CORBIN
-  cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  cms_hpt_url: https://www.baptisthealth.com/cms-hpt.txt
+  alias_of: hospital-000592
+  locator_name: Baptist Health Corbin
 - hospital_id: hospital-000594
   name: Baptist Health Deaconess Madisonville, Inc
   cms_hpt_url: https://baptisthealthdeaconess.com/cms-hpt.txt
@@ -1960,7 +1969,8 @@ hospitals:
   cms_hpt_url: https://www.baptisthealth.com/cms-hpt.txt
 - hospital_id: hospital-000600
   name: BAPTIST HEALTH HARDIN
-  cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  cms_hpt_url: https://www.baptisthealth.com/cms-hpt.txt
+  locator_name: Baptist Health Hardin
 - hospital_id: hospital-000601
   name: Baptist Health Hospital Doral
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
@@ -2140,15 +2150,23 @@ hospitals:
 - hospital_id: hospital-000654
   name: BAPTIST HEALTHCARE SYSTEM INC
   cms_hpt_url: https://www.baptisthealth.com/cms-hpt.txt
+  alias_of: hospital-000604
+  locator_name: Baptist Health La Grange
 - hospital_id: hospital-000655
   name: BAPTIST HEALTHCARE SYSTEM INC
-  cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  cms_hpt_url: https://www.baptisthealth.com/cms-hpt.txt
+  alias_of: hospital-000600
+  locator_name: Baptist Health Hardin
 - hospital_id: hospital-000656
   name: BAPTIST HEALTHCARE SYSTEM INC
-  cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  cms_hpt_url: https://www.baptisthealth.com/cms-hpt.txt
+  alias_of: hospital-000592
+  locator_name: Baptist Health Corbin
 - hospital_id: hospital-000657
   name: BAPTIST HEALTHCARE SYSTEM INC.
   cms_hpt_url: https://www.baptisthealth.com/cms-hpt.txt
+  alias_of: hospital-000606
+  locator_name: Baptist Health Louisville
 - hospital_id: hospital-000658
   name: Baptist Hospital
   cms_hpt_url: https://ebaptisthealthcare.org/cms-hpt.txt
@@ -2450,7 +2468,9 @@ hospitals:
   cms_hpt_url: https://bayareahospital.org/cms-hpt.txt
 - hospital_id: hospital-000745
   name: Bay Area Hospital District
-  cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  cms_hpt_url: https://bayareahospital.org/cms-hpt.txt
+  alias_of: hospital-000744
+  locator_name: Bay Area Hospital
 - hospital_id: hospital-000746
   name: BayCare Alliant Hospital
   cms_hpt_url: https://baycare.org/cms-hpt.txt
@@ -9513,7 +9533,9 @@ hospitals:
   cms_hpt_url: https://hialeahhosp.org/cms-hpt.txt
 - hospital_id: hospital-002911
   name: HIAWATHA HOSPITAL ASSOCIATION INC
-  cms_hpt_url: https://www.baptisthealth.com/cms-hpt.txt
+  cms_hpt_url: https://amberwellhealth.org/cms-hpt.txt
+  alias_of: hospital-000189
+  locator_name: Amberwell Hiawatha Association
 - hospital_id: hospital-002912
   name: Higgins General Hospital
   cms_hpt_url: https://www.tanner.org/cms-hpt.txt
@@ -18405,7 +18427,8 @@ hospitals:
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
 - hospital_id: hospital-005625
   name: SAN JOAQUIN COMMUNITY HOSPITAL
-  cms_hpt_url: https://www.baptisthealth.com/cms-hpt.txt
+  cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  locator_name: SAN JOAQUIN COMMUNITY HOSPITAL
 - hospital_id: hospital-005626
   name: San Joaquin General Hospital
   cms_hpt_url: https://www.sanjoaquingeneral.org/cms-hpt.txt
@@ -18978,7 +19001,9 @@ hospitals:
   cms_hpt_url: https://silveroaksbehavioralhospital.com/cms-hpt.txt
 - hospital_id: hospital-005797
   name: SIMI VALLEY HOSPITAL AND HEALTH CARE SERVICES
-  cms_hpt_url: https://www.baptisthealth.com/cms-hpt.txt
+  cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  alias_of: hospital-005798
+  locator_name: SIMI VALLEY HOSPITAL AND HEALTH CARE SERVICES
 - hospital_id: hospital-005798
   name: SIMI VALLEY HOSPITAL AND HEALTH CARE SERVICES
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
@@ -21791,6 +21816,8 @@ hospitals:
 - hospital_id: hospital-006650
   name: TWIN CITIES COMMUNITY HOSPITAL INC
   cms_hpt_url: https://www.adventisthealth.org/cms-hpt.txt
+  alias_of: hospital-006649
+  locator_name: TWIN CITIES COMMUNITY HOSPITAL
 - hospital_id: hospital-006651
   name: Twin County Regional Healthcare
   cms_hpt_url: https://www.tcrh.org/cms-hpt.txt

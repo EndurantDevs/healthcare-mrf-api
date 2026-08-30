@@ -31,18 +31,23 @@ _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
 
 _REVIEWED_ALIAS_SAMPLES = {
     "hospital-000064": "hospital-000063",
-    "hospital-000123": "hospital-000122",
-    "hospital-000162": "hospital-000161",
-    "hospital-001486": "hospital-001483",
-    "hospital-002520": "hospital-002519",
-    "hospital-004667": "hospital-004666",
-    "hospital-005329": "hospital-005328",
-    "hospital-005563": "hospital-001678",
-    "hospital-005564": "hospital-001678",
-    "hospital-005565": "hospital-001678",
-    "hospital-006233": "hospital-005566",
-    "hospital-007207": "hospital-007206",
-    "hospital-007272": "hospital-000586",
+    "hospital-000123": "hospital-000122", "hospital-000162": "hospital-000161",
+    "hospital-001486": "hospital-001483", "hospital-002520": "hospital-002519",
+    "hospital-004667": "hospital-004666", "hospital-005329": "hospital-005328",
+    "hospital-005563": "hospital-001678", "hospital-005564": "hospital-001678",
+    "hospital-005565": "hospital-001678", "hospital-006233": "hospital-005566",
+    "hospital-007207": "hospital-007206", "hospital-007272": "hospital-000586",
+    "hospital-000121": "hospital-000120",
+    "hospital-000342": "hospital-000343",
+    "hospital-000593": "hospital-000592",
+    "hospital-000654": "hospital-000604",
+    "hospital-000655": "hospital-000600",
+    "hospital-000656": "hospital-000592",
+    "hospital-000657": "hospital-000606",
+    "hospital-000745": "hospital-000744",
+    "hospital-002911": "hospital-000189",
+    "hospital-005797": "hospital-005798",
+    "hospital-006650": "hospital-006649",
 }
 
 
@@ -67,9 +72,10 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
 
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 7_267
+    assert len(registry.hospital_hpt_registry_groups()) == 7_256
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_242
+    assert "alias_of" not in hospital_by_id["hospital-005625"]
+    assert sum("locator_name" in entry for entry in hospitals) == 1_258
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 636
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 16
     assert {
@@ -78,19 +84,26 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert {
         hospital_id: hospital_by_id[hospital_id]["locator_name"]
         for hospital_id in (
-            "hospital-000048",
-            "hospital-003026",
-            "hospital-003082",
-            "hospital-005234",
-            "hospital-005243",
+            "hospital-000047",
+            "hospital-000126",
+            "hospital-000188",
+            "hospital-000342",
+            "hospital-000600",
         )
     } == {
-        "hospital-000048": "ADAMS MEMORIAL HOSPITAL",
-        "hospital-003026": "BARSTOW COMMUNITY HOSPITAL",
-        "hospital-003082": "Hugh Chatham Health, a facility of Wilkes Regional Medical Center",
-        "hospital-005234": "ProMedica Bay Park Hospital",
-        "hospital-005243": "ProMedica Toledo Hospital",
+        "hospital-000047": "Adair County Memorial Hospital",
+        "hospital-000126": "HANFORD COMMUNITY HOSPITAL",
+        "hospital-000188": "Amberwell Atchison Association",
+        "hospital-000342": "Ashland Health Center",
+        "hospital-000600": "Baptist Health Hardin",
     }
+    assert [hospital_by_id[hospital_id]["cms_hpt_url"] for hospital_id in (
+        "hospital-000047", "hospital-000188", "hospital-000600",
+    )] == [
+        "https://www.achsiowa.org/cms-hpt.txt",
+        "https://amberwellhealth.org/cms-hpt.txt",
+        "https://www.baptisthealth.com/cms-hpt.txt",
+    ]
     assert {
         hospital_id: hashlib.sha256(
             hospital_by_id[hospital_id]["fallback_mrf_url"].encode()
@@ -118,7 +131,7 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         if "alias_of" in entry
     }
 
-    assert len(aliases_by_id) == 89
+    assert len(aliases_by_id) == 100
     assert {
         hospital_id: aliases_by_id[hospital_id]
         for hospital_id in _REVIEWED_ALIAS_SAMPLES
