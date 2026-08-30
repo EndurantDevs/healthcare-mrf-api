@@ -54,9 +54,22 @@ _REVIEWED_ALIAS_SAMPLES = {
         "005564:001678 005565:001678 006233:005566 007207:007206 007272:000586 000121:000120 000342:000343 000593:000592 000654:000604 "
         "000655:000600 000656:000592 000657:000606 000745:000744 002911:000189 005797:005798 005077:005063 006650:006649 003017:003012 "
         "003068:003013 003069:003014 003070:003015 003071:003016 003072:003019 003073:003018 003074:003020 003075:003021 003076:003022 "
-        "003077:003023 003078:003024 003079:003025 002432:002433 006299:006300 005971:005970 005973:005972"
+        "003077:003023 003078:003024 003079:003025 002432:002433 006299:006300 005971:005970 005973:005972 001882:001881 005163:005162"
     ).split()
     for alias, canonical in (pair.split(":"),)
+}
+
+_REVIEWED_LOCATOR_NAMES = {
+    "hospital-000047": "Adair County Memorial Hospital",
+    "hospital-000126": "HANFORD COMMUNITY HOSPITAL",
+    "hospital-000188": "Amberwell Atchison Association",
+    "hospital-000342": "Ashland Health Center",
+    "hospital-000600": "Baptist Health Hardin",
+    "hospital-001880": "Edgerton Hospital and Health Services - Fulton Square Clinic",
+    "hospital-001881": "Edgerton Hospital and Health Services - Milton Clinic",
+    "hospital-002421": "Grady Health System",
+    "hospital-005162": "Pioneer Memorial Hospital & Health Services",
+    "hospital-006345": "Summa Rehab Hospital, LLC",
 }
 
 
@@ -80,10 +93,10 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 7_110
+    assert len(registry.hospital_hpt_registry_groups()) == 7_108
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
-    assert sum("locator_name" in entry for entry in hospitals) == 1_416
+    assert sum("locator_name" in entry for entry in hospitals) == 1_421
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 644
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 40
     assert {entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry} == set(
@@ -91,30 +104,17 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     )
     assert {
         hospital_id: hospital_by_id[hospital_id]["locator_name"]
-        for hospital_id in (
-            "hospital-000047",
-            "hospital-000126",
-            "hospital-000188",
-            "hospital-000342",
-            "hospital-000600",
-            "hospital-002421",
-            "hospital-006345",
-        )
-    } == {
-        "hospital-000047": "Adair County Memorial Hospital",
-        "hospital-000126": "HANFORD COMMUNITY HOSPITAL",
-        "hospital-000188": "Amberwell Atchison Association",
-        "hospital-000342": "Ashland Health Center",
-        "hospital-000600": "Baptist Health Hardin",
-        "hospital-002421": "Grady Health System",
-        "hospital-006345": "Summa Rehab Hospital, LLC",
-    }
+        for hospital_id in _REVIEWED_LOCATOR_NAMES
+    } == _REVIEWED_LOCATOR_NAMES
     assert [hospital_by_id[hospital_id]["cms_hpt_url"] for hospital_id in (
         "hospital-000047", "hospital-000188", "hospital-000600",
+        "hospital-005162", "hospital-005163",
     )] == [
         "https://www.achsiowa.org/cms-hpt.txt",
         "https://amberwellhealth.org/cms-hpt.txt",
         "https://www.baptisthealth.com/cms-hpt.txt",
+        "https://www.pioneermemorial.org/cms-hpt.txt",
+        "https://www.pioneermemorial.org/cms-hpt.txt",
     ]
     assert {
         hospital_id: hashlib.sha256(
@@ -141,7 +141,7 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 246
+    assert len(aliases_by_id) == 248
     assert {
         hospital_id: aliases_by_id[hospital_id] for hospital_id in _REVIEWED_ALIAS_SAMPLES
     } == _REVIEWED_ALIAS_SAMPLES
