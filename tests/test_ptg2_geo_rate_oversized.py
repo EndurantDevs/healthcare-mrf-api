@@ -16,9 +16,16 @@ from tests.test_ptg2_geo_rate_prefix import (
 )
 
 
+def _bounded_location_rows(local_npis, limit):
+    is_source_exhausted = len(local_npis) < limit
+    return [
+        {"npi": npi, "_ptg_source_exhausted": is_source_exhausted}
+        for npi in local_npis[:limit]
+    ]
+
+
 def _install_local_scope_reads(monkeypatch, rate_rows, local_npis):
     local_provider_set_keys = tuple(range(1, 69))
-
     async def rate_read(*_args, **kwargs):
         provider_set_keys = kwargs["provider_set_keys"]
         matching_rates = (
@@ -32,24 +39,18 @@ def _install_local_scope_reads(monkeypatch, rate_rows, local_npis):
         )
         offset = kwargs["offset"]
         limit = kwargs["limit"]
-        return (
-            matching_rates[offset:]
-            if limit is None
-            else matching_rates[offset : offset + limit]
-        )
-
-    async def location_read(*_args, **kwargs):
-        limit = kwargs["limit"]
-        source_exhausted = len(local_npis) < limit
-        return [
-            {"npi": npi, "_ptg_source_exhausted": source_exhausted}
-            for npi in local_npis[:limit]
-        ]
+        if limit is None:
+            return matching_rates[offset:]
+        return matching_rates[offset : offset + limit]
 
     reads_by_kind = {
         "rates": AsyncMock(side_effect=rate_read),
         "members": AsyncMock(),
-        "locations": AsyncMock(side_effect=location_read),
+        "locations": AsyncMock(
+            side_effect=lambda *_args, **kwargs: _bounded_location_rows(
+                local_npis, kwargs["limit"]
+            )
+        ),
         "sets": AsyncMock(
             return_value={
                 npi: (local_provider_set_keys[index % 68],)
