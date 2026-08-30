@@ -74959,6 +74959,19 @@ class ResourceGroupScanRunner:
         return zero_role_result
 
 
+def _merge_stale_deleted_count(
+    stale_counts: dict[str, int] | None,
+    resource_type: str,
+    stale_deleted: int,
+) -> None:
+    """Add one completed stale-row cleanup to its resource count."""
+
+    if stale_counts is not None and stale_deleted:
+        stale_counts[resource_type] = (
+            stale_counts.get(resource_type, 0) + stale_deleted
+        )
+
+
 async def _import_resources(
     source_records: list[dict[str, Any]],
     *,
@@ -75811,8 +75824,11 @@ async def _import_resources(
                         run_id,
                         seen_table=seen_stage_table,
                     )
-                    if stale_deleted and stale_counts is not None:
-                        stale_counts[resource_type] = stale_counts.get(resource_type, 0) + stale_deleted
+                    _merge_stale_deleted_count(
+                        stale_counts,
+                        resource_type,
+                        stale_deleted,
+                    )
         if failed_source_ids:
             raise RuntimeError(
                 "provider_directory_source_groups_failed:"

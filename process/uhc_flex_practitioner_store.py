@@ -214,7 +214,7 @@ def _uhc_flex_practitioner_claim_sql(
                    AND work.attempt_count = 1
                ))
                {fresh_filter}
-             ORDER BY work.npi
+             ORDER BY work.attempt_count, work.npi
              FOR UPDATE OF work SKIP LOCKED LIMIT 1
         )
         UPDATE {table_ref(WORK_TABLE)} AS work
