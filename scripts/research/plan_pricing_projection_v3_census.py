@@ -34,12 +34,12 @@ from scripts.research.plan_pricing_projection_v3_census_contract import (
     observed_work_limits as _observed_work_limits,
     require_expected_target as _require_expected_target,
     seal_cardinality_census,
-    seal_source_only,
 )
 from scripts.research.plan_pricing_projection_v3_census_diagnostics import (
     CENSUS_RECEIPT_CONTRACT,
     CensusDatabaseStages,
     run_census_process,
+    seal_source_only,
 )
 from scripts.research.plan_pricing_projection_v3_census_support import (
     ReleaseInput,

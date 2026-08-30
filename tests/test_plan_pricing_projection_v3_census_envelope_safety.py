@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from . import test_plan_pricing_projection_v3_census_envelope as envelope
+from . import plan_pricing_projection_v3_census_envelope_harness as envelope
 
 
 def test_envelope_uses_ordered_fences_and_reverse_uid_cleanup(tmp_path: Path) -> None:
@@ -16,27 +16,17 @@ def test_envelope_uses_ordered_fences_and_reverse_uid_cleanup(tmp_path: Path) ->
 
     assert run_result.returncode == 0, run_result.stderr
     events = (tmp_path / "fake-state/events").read_text().splitlines()
-    expected_events = [
-        "lock_create",
-        "quota_create",
-        "quota_probe_denied",
-        "drain_read",
-        "drain_set_true",
-        "drain_read",
-        "policy_create",
-        "binding_create",
-        "probe_denied",
-        "drain_read",
-        "child",
-        "drain_read",
-        "binding_delete",
-        "policy_delete",
-        "drain_set_false",
-        "quota_delete",
-        "lock_stop",
-    ]
+    expected_events = (
+        "lock_create quota_create quota_probe_denied drain_read drain_set_true "
+        "drain_read policy_create binding_create probe_denied capacity drain_read "
+        "child drain_read drain_set_false drain_read binding_delete policy_delete "
+        "quota_delete lock_stop"
+    ).split()
     assert [event for event in events if event in expected_events] == expected_events
     assert events.count("zero_sample") == 5
+    capacity_index = events.index("capacity")
+    child_index = events.index("child")
+    assert events[capacity_index + 1 : child_index] == ["drain_read", "zero_sample"]
     receipt = envelope._receipt(state_root)
     assert receipt["status"] == "complete"
     assert receipt["cleanup"]["complete"] is True
@@ -51,6 +41,21 @@ def test_envelope_uses_ordered_fences_and_reverse_uid_cleanup(tmp_path: Path) ->
         == hashlib.sha256(receipt_path.read_bytes()).hexdigest()
     )
     assert receipt["census_job"] == "plan-pricing-v3-census-test"
+    assert receipt["runtime_attestation"]["pod_uid"] == "pod-uid"
+    assert (
+        receipt["child_executable_sha256"]
+        == receipt["expected_child_executable_sha256"]
+    )
+    assert receipt["capacity"] == {
+        "verified": True,
+        "host_available_memory_bytes": 2,
+        "minimum_host_available_memory_bytes": 1,
+        "host_swap_free_bytes": 2,
+        "minimum_host_swap_free_bytes": 1,
+        "postgresql_tablespace_path": str(tmp_path / "repo"),
+        "postgresql_tablespace_free_bytes": 2,
+        "minimum_postgresql_tablespace_free_bytes": 1,
+    }
     assert "off-node PostgreSQL" in receipt["postgresql_boundary"]
 
 
@@ -93,7 +98,9 @@ def test_uid_drift_retains_outer_fences(tmp_path: Path) -> None:
     events = (tmp_path / "fake-state/events").read_text().splitlines()
     assert "binding_delete" in events
     assert "policy_delete" not in events
-    assert "drain_set_false" not in events
+    assert "drain_set_false" in events
+    assert events[-2:] == ["drain_set_true", "drain_read"]
+    assert (tmp_path / "fake-state/drain").read_text() == "true"
     assert "quota_delete" not in events
     assert "lock_stop" not in events
     receipt = envelope._receipt(state_root)
@@ -120,12 +127,77 @@ def test_uid_replacement_during_delete_retains_outer_fences(tmp_path: Path) -> N
     assert "binding_delete" in events
     assert "policy_replace" in events
     assert "policy_delete" not in events
-    assert "drain_set_false" not in events
+    assert "drain_set_false" in events
+    assert events[-2:] == ["drain_set_true", "drain_read"]
+    assert (tmp_path / "fake-state/drain").read_text() == "true"
     assert "quota_delete" not in events
     assert "lock_stop" not in events
     receipt = envelope._receipt(state_root)
     assert receipt["cleanup"]["binding_removed"] is True
     assert receipt["cleanup"]["complete"] is False
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "FAKE_HOST_AVAILABLE_MEMORY_BYTES",
+        "FAKE_HOST_SWAP_FREE_BYTES",
+        "FAKE_POSTGRESQL_TABLESPACE_FREE_BYTES",
+    ],
+)
+def test_capacity_below_any_reviewed_minimum_never_starts_child(
+    tmp_path: Path,
+    field_name: str,
+) -> None:
+    """Every host and PostgreSQL minimum is a fail-closed final admission gate."""
+
+    result, state_root = envelope._run_envelope(tmp_path, **{field_name: "0"})
+
+    assert result.returncode == 1
+    events = (tmp_path / "fake-state/events").read_text().splitlines()
+    assert "capacity" in events
+    assert "child" not in events
+    receipt = envelope._receipt(state_root)
+    assert receipt["status"] == "failed"
+    assert receipt["capacity"]["verified"] is False
+    assert receipt["cleanup"]["complete"] is True
+
+
+def test_child_executable_change_during_capacity_never_starts_child(
+    tmp_path: Path,
+) -> None:
+    """The reviewed executable is rehashed after the final capacity sample."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        FAKE_REPLACE_CHILD_DURING_CAPACITY="1",
+    )
+
+    assert result.returncode == 1
+    events = (tmp_path / "fake-state/events").read_text().splitlines()
+    replacement_index = events.index("child_executable_replaced")
+    assert events[replacement_index - 1] == "capacity"
+    assert "child" not in events
+    assert envelope._receipt(state_root)["cleanup"]["complete"] is True
+
+
+def test_child_executable_change_during_final_fence_never_starts_child(
+    tmp_path: Path,
+) -> None:
+    """The executable is rehashed after the final mutable fence reads."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        FAKE_REPLACE_CHILD_DURING_FINAL_FENCE="1",
+    )
+
+    assert result.returncode == 1
+    events = (tmp_path / "fake-state/events").read_text().splitlines()
+    assert events.index("capacity") < events.index(
+        "child_executable_replaced_during_final_fence"
+    )
+    assert "child" not in events
+    assert envelope._receipt(state_root)["cleanup"]["complete"] is True
 
 
 def test_uid_bound_delete_waits_for_same_uid_finalization(tmp_path: Path) -> None:
@@ -196,6 +268,75 @@ def test_preexisting_resource_fails_before_any_mutation(tmp_path: Path) -> None:
     assert not (state_root / "run").exists()
 
 
+def test_wrong_reviewed_envelope_hash_fails_before_any_mutation(tmp_path: Path) -> None:
+    """A changed envelope script must fail before acquiring any outer fence."""
+
+    env_by_name, state_root, checkout = envelope._fake_environment(tmp_path)
+    arguments = envelope._arguments(state_root, checkout)
+    hash_index = arguments.index("--expected-envelope-script-sha256") + 1
+    arguments[hash_index] = "0" * 64
+    result = subprocess.run(
+        ["/bin/bash", str(envelope.SCRIPT), "run", *arguments],
+        env=env_by_name,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 1
+    assert not (tmp_path / "fake-state/events").exists()
+    assert not (state_root / "run").exists()
+
+
+def test_zero_minimum_swap_fails_before_any_mutation(tmp_path: Path) -> None:
+    """Packet authority cannot disable the host-swap admission gate."""
+
+    env_by_name, state_root, checkout = envelope._fake_environment(tmp_path)
+    arguments = envelope._arguments(state_root, checkout)
+    swap_index = arguments.index("--minimum-host-swap-free-bytes") + 1
+    arguments[swap_index] = "0"
+    result = subprocess.run(
+        ["/bin/bash", str(envelope.SCRIPT), "run", *arguments],
+        env=env_by_name,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 1
+    assert not (tmp_path / "fake-state/events").exists()
+    assert not (state_root / "run").exists()
+
+
+def test_path_resolved_child_executable_fails_before_any_mutation(
+    tmp_path: Path,
+) -> None:
+    """The reviewed launcher must not be replaceable through PATH lookup."""
+
+    env_by_name, state_root, checkout = envelope._fake_environment(tmp_path)
+    arguments = envelope._arguments(state_root, checkout)
+    separator = arguments.index("--")
+    arguments[separator + 1] = "census-child"
+    child_command = arguments[separator + 1 :]
+    command_bytes = b"".join(value.encode() + b"\0" for value in child_command)
+    command_index = arguments.index("--expected-child-command-sha256") + 1
+    arguments[command_index] = hashlib.sha256(command_bytes).hexdigest()
+    result = subprocess.run(
+        ["/bin/bash", str(envelope.SCRIPT), "run", *arguments],
+        env=env_by_name,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 1
+    assert not (tmp_path / "fake-state/events").exists()
+    assert not (state_root / "run").exists()
+
+
 def test_missing_v1_admission_api_fails_before_any_mutation(tmp_path: Path) -> None:
     """The exact admission API must exist before any outer fence is created."""
 
@@ -226,17 +367,43 @@ def test_unsupported_server_version_fails_before_any_mutation(
     assert not (state_root / "run").exists()
 
 
-def test_preexisting_census_pod_fails_before_any_mutation(tmp_path: Path) -> None:
-    """A labeled census Pod must fail before acquiring any outer fence."""
+@pytest.mark.parametrize("kind", ("job", "pod", "configmap"))
+def test_preexisting_census_resource_fails_before_any_mutation(
+    tmp_path: Path, kind: str
+) -> None:
+    """Any labeled census resource must fail before acquiring an outer fence."""
 
     result, state_root = envelope._run_envelope(
         tmp_path,
-        FAKE_PREEXISTING_CENSUS_POD="1",
+        FAKE_PREEXISTING_CENSUS_KIND=kind,
     )
 
     assert result.returncode == 1
     assert not (tmp_path / "fake-state/events").exists()
     assert not (state_root / "run").exists()
+
+
+@pytest.mark.parametrize("kind", ["job", "pod", "configmap"])
+def test_labeled_census_residue_retains_every_outer_fence(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    """Any differently named census residue blocks teardown of all fences."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        FAKE_CENSUS_RESIDUE_AFTER_CHILD_KIND=kind,
+    )
+
+    assert result.returncode == 1
+    events = (tmp_path / "fake-state/events").read_text().splitlines()
+    assert "child" in events
+    assert "drain_set_false" not in events
+    assert "binding_delete" not in events
+    assert "policy_delete" not in events
+    assert "quota_delete" not in events
+    assert "lock_stop" not in events
+    assert envelope._receipt(state_root)["cleanup"]["complete"] is False
 
 
 def test_seed_reappearance_retains_drain_quota_and_lock(tmp_path: Path) -> None:
@@ -249,10 +416,45 @@ def test_seed_reappearance_retains_drain_quota_and_lock(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert "binding_delete" in events and "policy_delete" in events
-    assert "drain_set_false" not in events
+    assert "binding_delete" not in events and "policy_delete" not in events
+    assert "drain_set_false" in events and "drain_set_true" in events
+    assert (tmp_path / "fake-state/drain").read_text() == "true"
     assert "quota_delete" not in events
     assert "lock_stop" not in events
+    receipt = envelope._receipt(state_root)
+    assert receipt["cleanup"]["drain_restored"] is False
+    assert receipt["cleanup"]["complete"] is False
+
+
+def test_restore_timeout_after_commit_continues_from_readback(tmp_path: Path) -> None:
+    """An ambiguous restore PATCH is safe when exact readback proves commit."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        FAKE_DRAIN_RESTORE_ERROR="after",
+    )
+
+    assert result.returncode == 0, result.stderr
+    events = (tmp_path / "fake-state/events").read_text().splitlines()
+    assert "drain_restore_timeout_after" in events
+    assert "binding_delete" in events and "policy_delete" in events
+    assert envelope._receipt(state_root)["cleanup"]["complete"] is True
+
+
+def test_restore_timeout_before_commit_retains_the_hard_fence(tmp_path: Path) -> None:
+    """An uncommitted restore PATCH must retain VAP, quota, lock, and drain."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        FAKE_DRAIN_RESTORE_ERROR="before",
+    )
+
+    assert result.returncode == 1
+    events = (tmp_path / "fake-state/events").read_text().splitlines()
+    assert "drain_restore_timeout_before" in events
+    assert "binding_delete" not in events and "policy_delete" not in events
+    assert "quota_delete" not in events and "lock_stop" not in events
+    assert (tmp_path / "fake-state/drain").read_text() == "true"
     assert envelope._receipt(state_root)["cleanup"]["complete"] is False
 
 
@@ -269,229 +471,12 @@ def test_active_engine_work_fails_before_child_and_cleans_fences(
     assert result.returncode == 1
     events = (tmp_path / "fake-state/events").read_text().splitlines()
     assert "child" not in events
-    assert events[-5:] == [
+    assert events[-6:] == [
+        "drain_set_false",
+        "drain_read",
         "binding_delete",
         "policy_delete",
-        "drain_set_false",
         "quota_delete",
         "lock_stop",
     ]
-    assert envelope._receipt(state_root)["cleanup"]["complete"] is True
-
-
-def test_arc_zero_must_be_stable_before_import_drain(tmp_path: Path) -> None:
-    """A late ARC Pod between zero samples must restart the idle proof."""
-
-    result, state_root = envelope._run_envelope(
-        tmp_path,
-        FAKE_ARC_LATE_CALL="2",
-    )
-
-    assert result.returncode == 0
-    events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert events.index("arc_late_2") < events.index("drain_set_true")
-    assert envelope._receipt(state_root)["cleanup"]["complete"] is True
-
-
-def test_arc_reappearance_at_pre_child_fence_blocks_run(tmp_path: Path) -> None:
-    """ARC work appearing after the idle proof must block the census child."""
-
-    result, state_root = envelope._run_envelope(
-        tmp_path,
-        FAKE_ARC_LATE_CALL="4",
-    )
-
-    assert result.returncode == 1
-    events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert "arc_late_4" in events
-    assert "child" not in events
-    assert envelope._receipt(state_root)["cleanup"]["complete"] is True
-
-
-@pytest.mark.parametrize(
-    "drift",
-    [
-        {"FAKE_ACTIVE_WORK_AFTER_CHILD": "1"},
-        {"FAKE_ARC_AFTER_CHILD": "1"},
-        {"FAKE_SCHEDULER_DRIFT_AFTER_CHILD": "1"},
-    ],
-)
-def test_post_child_work_drift_rejects_receipt(
-    tmp_path: Path, drift: dict[str, str]
-) -> None:
-    """Scheduler, engine, or ARC drift must reject post-child acceptance."""
-
-    result, state_root = envelope._run_envelope(tmp_path, **drift)
-
-    assert result.returncode == 1
-    assert "child" in (tmp_path / "fake-state/events").read_text().splitlines()
-    receipt = envelope._receipt(state_root)
-    assert receipt["post_child_fence_verified"] is False
-    assert receipt["cleanup"]["complete"] is True
-
-
-def test_timeout_with_census_objects_retains_every_outer_fence(
-    tmp_path: Path,
-) -> None:
-    """An orphaned census must never outlive the admission protections."""
-
-    result, state_root = envelope._run_envelope(
-        tmp_path,
-        FAKE_CHILD_MODE="native124",
-        FAKE_CHILD_ORPHAN="1",
-    )
-
-    assert result.returncode == 124
-    events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert not any(event.endswith("_delete") for event in events)
-    assert "drain_set_false" not in events
-    assert "lock_stop" not in events
-    assert envelope._receipt(state_root)["cleanup"]["complete"] is False
-
-
-def test_orphaned_census_pod_retains_every_outer_fence(tmp_path: Path) -> None:
-    """A census Pod must keep the envelope even after Job and ConfigMap vanish."""
-
-    result, state_root = envelope._run_envelope(
-        tmp_path,
-        FAKE_CHILD_ORPHAN_POD="1",
-    )
-
-    assert result.returncode == 1
-    events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert not any(event.endswith("_delete") for event in events)
-    assert "drain_set_false" not in events
-    assert "lock_stop" not in events
-    assert envelope._receipt(state_root)["cleanup"]["complete"] is False
-
-
-@pytest.mark.parametrize("resource", ("quota", "policy", "binding"))
-def test_create_then_client_failure_reconciles_exact_resource(
-    tmp_path: Path,
-    resource: str,
-) -> None:
-    """An ambiguous create result must still UID-clean its exact resource."""
-
-    result, state_root = envelope._run_envelope(tmp_path, FAKE_CREATE_ERROR=resource)
-
-    assert result.returncode == 1
-    events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert f"{resource}_create" in events
-    assert f"{resource}_delete" in events
-    assert envelope._receipt(state_root)["cleanup"]["complete"] is True
-
-
-@pytest.mark.parametrize("failure_mode", ("contended", "client-error"))
-def test_lock_must_be_proven_before_admission(
-    tmp_path: Path,
-    failure_mode: str,
-) -> None:
-    """A transient unit without a proven flock cannot admit later fences."""
-
-    environment = (
-        {"FAKE_LOCK_CONTENDED": "1"}
-        if failure_mode == "contended"
-        else {"FAKE_LOCK_CLIENT_ERROR": "1"}
-    )
-    result, state_root = envelope._run_envelope(tmp_path, **environment)
-
-    assert result.returncode == 1
-    events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert events == ["lock_create", "lock_stop"]
-    assert envelope._receipt(state_root)["cleanup"]["lock_released"] is True
-
-
-def test_child_drain_drift_fails_receipt_before_release(tmp_path: Path) -> None:
-    """The child boundary must re-attest semantic import drain continuity."""
-
-    result, state_root = envelope._run_envelope(
-        tmp_path,
-        FAKE_DRAIN_DRIFT_AFTER_CHILD="1",
-    )
-
-    assert result.returncode == 1
-    receipt = envelope._receipt(state_root)
-    assert receipt["pre_child_fence_verified"] is True
-    assert receipt["post_child_fence_verified"] is False
-    assert receipt["cleanup"]["complete"] is True
-
-
-def test_post_child_api_error_retains_every_outer_fence(tmp_path: Path) -> None:
-    """An unreadable absence check must retain every outer protection."""
-
-    result, state_root = envelope._run_envelope(
-        tmp_path,
-        FAKE_GET_ERROR_AFTER_CHILD="configmap",
-    )
-
-    assert result.returncode == 1
-    events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert not any(event.endswith("_delete") for event in events)
-    assert "drain_set_false" not in events
-    assert "lock_stop" not in events
-    receipt = envelope._receipt(state_root)
-    assert receipt["post_child_fence_verified"] is False
-    assert receipt["cleanup"]["complete"] is False
-
-
-@pytest.mark.parametrize("drift", ["gone", "replaced"])
-def test_post_child_lock_drift_retains_every_outer_fence(
-    tmp_path: Path,
-    drift: str,
-) -> None:
-    """A lost or replaced build flock must block every fence deletion."""
-
-    result, state_root = envelope._run_envelope(
-        tmp_path,
-        FAKE_LOCK_DRIFT_AFTER_CHILD=drift,
-    )
-
-    assert result.returncode == 1
-    events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert not any(event.endswith("_delete") for event in events)
-    assert "drain_set_false" not in events
-    assert "lock_stop" not in events
-    receipt = envelope._receipt(state_root)
-    assert receipt["post_child_fence_verified"] is False
-    assert receipt["cleanup"]["complete"] is False
-
-
-@pytest.mark.parametrize("resource", ("quota", "policy", "binding"))
-def test_same_uid_spec_drift_retains_every_outer_fence(
-    tmp_path: Path,
-    resource: str,
-) -> None:
-    """A same-UID semantic change must stop before any fence is released."""
-
-    result, state_root = envelope._run_envelope(
-        tmp_path,
-        FAKE_SPEC_DRIFT=resource,
-    )
-
-    assert result.returncode == 1
-    events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert not any(event.endswith("_delete") for event in events)
-    assert "drain_set_false" not in events
-    assert "lock_stop" not in events
-    receipt = envelope._receipt(state_root)
-    assert receipt["post_child_fence_verified"] is False
-    assert receipt["cleanup"]["complete"] is False
-
-
-@pytest.mark.parametrize("arc_kind", ("runner", "import", "mrf"))
-def test_arc_workload_must_naturally_drain(
-    tmp_path: Path,
-    arc_kind: str,
-) -> None:
-    """Each ephemeral runner and workflow namespace must delay admission."""
-
-    result, state_root = envelope._run_envelope(
-        tmp_path,
-        FAKE_ARC_DRAIN=arc_kind,
-    )
-
-    assert result.returncode == 0
-    events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert f"arc_active_{arc_kind}" in events
-    assert events.index(f"arc_active_{arc_kind}") < events.index("child")
     assert envelope._receipt(state_root)["cleanup"]["complete"] is True

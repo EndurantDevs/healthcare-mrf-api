@@ -131,9 +131,11 @@ def capture_source_identity(
     harness_paths = (
         driver_path,
         Path(__file__).resolve(),
+        driver_path.with_name("plan_pricing_projection_v3_census_authority.py"),
         driver_path.with_name("plan_pricing_projection_v3_census_contract.py"),
         driver_path.with_name("plan_pricing_projection_v3_census_diagnostics.py"),
         driver_path.with_name("plan_pricing_projection_v3_census_transaction.py"),
+        driver_path.with_name("run_plan_pricing_projection_v3_census_envelope.sh"),
     )
     harness_files = [
         [str(path.relative_to(root)), _sha256_file(path)] for path in harness_paths
@@ -488,6 +490,7 @@ def runtime_identity(expected_image_digest: str) -> dict[str, Any]:
         raise RuntimeError("pricing projection census image identity changed")
     return {
         **identity_by_field,
+        "container_name": "census",
         "identity_contract": "immutable-image-plus-source-overlay-v1",
         "external_pod_image_id_attestation_required": True,
     }

@@ -22,6 +22,14 @@ DEADLINE_SECONDS=
 CENSUS_JOB=
 CENSUS_CONFIGMAP=
 CENSUS_RECEIPT=
+RUNTIME_ATTESTATION=
+EXPECTED_ENVELOPE_SCRIPT_SHA256=
+EXPECTED_CHILD_COMMAND_SHA256=
+EXPECTED_CHILD_EXECUTABLE_SHA256=
+POSTGRESQL_TABLESPACE_PATH=
+MINIMUM_HOST_AVAILABLE_MEMORY_BYTES=
+MINIMUM_HOST_SWAP_FREE_BYTES=
+MINIMUM_POSTGRESQL_TABLESPACE_FREE_BYTES=
 DRAIN_DEPLOYMENT=
 IMPORT_SCHEDULER_DEPLOYMENT=
 IMPORT_NODE_ID=
@@ -41,9 +49,20 @@ BINDING_UID=
 DENIAL_MARKER=
 PRIOR_DRAIN_MODE=
 CHILD_COMMAND_SHA256=
+CHILD_EXECUTABLE_SHA256=
 CENSUS_RECEIPT_SHA256=
+RUNTIME_ATTESTATION_SHA256=
+CAPTURED_RUNTIME_ATTESTATION_SHA256=
+RUNTIME_ATTESTATION_VALIDATED=false
+ATTESTED_POD_NAME=
+ATTESTED_POD_UID=
+HOST_AVAILABLE_MEMORY_BYTES=
+HOST_SWAP_FREE_BYTES=
+POSTGRESQL_TABLESPACE_FREE_BYTES=
+CAPACITY_VERIFIED=false
 CHILD_EXIT_CODE=
 CHILD_PID=
+CHILD_LAUNCHED=false
 CHILD_KILL_TIMER_PID=
 CHILD_DEADLINE_TIMER_PID=
 CHILD_DEADLINE_MARKER=
@@ -79,7 +98,14 @@ usage() {
     'usage: run_plan_pricing_projection_v3_census_envelope.sh [plan|run]' \
     '  --owner-token TOKEN --state-dir PATH --source-sha SHA --repo-dir PATH' \
     '  --deadline-seconds SECONDS --census-job NAME --census-configmap NAME' \
-    '  --census-receipt PATH' \
+    '  --census-receipt PATH --runtime-attestation PATH' \
+    '  --expected-envelope-script-sha256 SHA256' \
+    '  --expected-child-command-sha256 SHA256' \
+    '  --expected-child-executable-sha256 SHA256' \
+    '  --postgresql-tablespace-path PATH' \
+    '  --minimum-host-available-memory-bytes BYTES' \
+    '  --minimum-host-swap-free-bytes BYTES' \
+    '  --minimum-postgresql-tablespace-free-bytes BYTES' \
     '  --drain-deployment NAME --import-scheduler-deployment NAME' \
     '  --import-node-id ID --import-token-env NAME' \
     '  -- CENSUS_COMMAND [ARG ...]'
@@ -121,6 +147,22 @@ parse_args() {
         require_value "$@"; CENSUS_CONFIGMAP=$2; shift 2 ;;
       --census-receipt)
         require_value "$@"; CENSUS_RECEIPT=$2; shift 2 ;;
+      --runtime-attestation)
+        require_value "$@"; RUNTIME_ATTESTATION=$2; shift 2 ;;
+      --expected-envelope-script-sha256)
+        require_value "$@"; EXPECTED_ENVELOPE_SCRIPT_SHA256=$2; shift 2 ;;
+      --expected-child-command-sha256)
+        require_value "$@"; EXPECTED_CHILD_COMMAND_SHA256=$2; shift 2 ;;
+      --expected-child-executable-sha256)
+        require_value "$@"; EXPECTED_CHILD_EXECUTABLE_SHA256=$2; shift 2 ;;
+      --postgresql-tablespace-path)
+        require_value "$@"; POSTGRESQL_TABLESPACE_PATH=$2; shift 2 ;;
+      --minimum-host-available-memory-bytes)
+        require_value "$@"; MINIMUM_HOST_AVAILABLE_MEMORY_BYTES=$2; shift 2 ;;
+      --minimum-host-swap-free-bytes)
+        require_value "$@"; MINIMUM_HOST_SWAP_FREE_BYTES=$2; shift 2 ;;
+      --minimum-postgresql-tablespace-free-bytes)
+        require_value "$@"; MINIMUM_POSTGRESQL_TABLESPACE_FREE_BYTES=$2; shift 2 ;;
       --drain-deployment)
         require_value "$@"; DRAIN_DEPLOYMENT=$2; shift 2 ;;
       --import-scheduler-deployment)
@@ -162,6 +204,25 @@ validate_args() {
     || die "exact census ConfigMap name is invalid"
   [ "${CENSUS_RECEIPT}" = "${STATE_DIR}/census-receipt.json" ] \
     || die "exact census receipt must be the task state receipt"
+  [ "${RUNTIME_ATTESTATION}" = "${STATE_DIR}/runtime-attestation.json" ] \
+    || die "exact runtime attestation must be the task state attestation"
+  [[ "${EXPECTED_ENVELOPE_SCRIPT_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+    || die "reviewed envelope script SHA-256 is invalid"
+  [[ "${EXPECTED_CHILD_COMMAND_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+    || die "reviewed child command SHA-256 is invalid"
+  [[ "${EXPECTED_CHILD_EXECUTABLE_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+    || die "reviewed child executable SHA-256 is invalid"
+  [[ "${POSTGRESQL_TABLESPACE_PATH}" = /* ]] \
+    || die "PostgreSQL tablespace path must be absolute"
+  [[ "${MINIMUM_HOST_AVAILABLE_MEMORY_BYTES}" =~ ^[0-9]+$ ]] \
+    && [ "${MINIMUM_HOST_AVAILABLE_MEMORY_BYTES}" -gt 0 ] \
+    || die "minimum host available memory must be positive bytes"
+  [[ "${MINIMUM_HOST_SWAP_FREE_BYTES}" =~ ^[0-9]+$ ]] \
+    && [ "${MINIMUM_HOST_SWAP_FREE_BYTES}" -gt 0 ] \
+    || die "minimum host swap must be positive bytes"
+  [[ "${MINIMUM_POSTGRESQL_TABLESPACE_FREE_BYTES}" =~ ^[0-9]+$ ]] \
+    && [ "${MINIMUM_POSTGRESQL_TABLESPACE_FREE_BYTES}" -gt 0 ] \
+    || die "minimum PostgreSQL tablespace free space must be positive bytes"
   [[ "${DRAIN_DEPLOYMENT}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
     && [ "${#DRAIN_DEPLOYMENT}" -le 63 ] \
     || die "import API deployment name is invalid"
@@ -302,8 +363,9 @@ render_plan() {
     '  - capture and set the exact import-node drain state' \
     '  - create UID-bound engine-worker deny policy and prove denial marker' \
     '  - require scheduler=0 and three stable zero-work samples' \
+    '  - require reviewed host memory, swap, and PostgreSQL tablespace headroom' \
     '  - run foreground census command under remaining deadline' \
-    '  - remove binding, policy, restore drain, remove quota, release flock'
+    '  - restore drain, remove binding and policy, remove quota, release flock'
   printf '%s\n' '--- quota ---'
   quota_manifest
   printf '%s\n' '--- quota server-dry-run probe ---'
@@ -420,6 +482,28 @@ if not required <= available:
 '
 }
 
+verify_reviewed_hashes() {
+  local child_executable observed_executable_sha observed_script_sha observed_child_sha
+  read -r observed_script_sha _ < <(sha256sum "$0")
+  [ "${observed_script_sha}" = "${EXPECTED_ENVELOPE_SCRIPT_SHA256}" ] \
+    || die "reviewed envelope script identity changed"
+  read -r observed_child_sha _ \
+    < <(printf '%s\0' "${CHILD_COMMAND[@]}" | sha256sum)
+  [ "${observed_child_sha}" = "${EXPECTED_CHILD_COMMAND_SHA256}" ] \
+    || die "reviewed child command identity changed"
+  child_executable=${CHILD_COMMAND[0]}
+  [[ "${child_executable}" = /* ]] \
+    && [ -f "${child_executable}" ] \
+    && [ ! -L "${child_executable}" ] \
+    && [ -x "${child_executable}" ] \
+    || die "reviewed child executable is not an absolute regular executable"
+  read -r observed_executable_sha _ < <(sha256sum "${child_executable}")
+  [ "${observed_executable_sha}" = "${EXPECTED_CHILD_EXECUTABLE_SHA256}" ] \
+    || die "reviewed child executable identity changed"
+  CHILD_COMMAND_SHA256=${observed_child_sha}
+  CHILD_EXECUTABLE_SHA256=${observed_executable_sha}
+}
+
 verify_source_and_target() {
   local host live_head status nodes context
   host=$(hostname -s)
@@ -442,7 +526,8 @@ verify_source_and_target() {
   verify_absent validatingadmissionpolicybinding "${BINDING_NAME}"
   verify_absent job "${CENSUS_JOB}" "${DEV_NAMESPACE}"
   verify_absent configmap "${CENSUS_CONFIGMAP}" "${DEV_NAMESPACE}"
-  census_pods_absent || die "preexisting census Pod blocks the envelope"
+  census_inventory_absent \
+    || die "preexisting labeled census resource blocks the envelope"
   verify_seed_absent
   [ "$(unit_load_state)" = not-found ] \
     || die "owner lock unit already exists"
@@ -798,12 +883,19 @@ verify_stable_zero_work() {
 census_resources_absent() {
   resource_is_absent job "${CENSUS_JOB}" "${DEV_NAMESPACE}" \
     && resource_is_absent configmap "${CENSUS_CONFIGMAP}" "${DEV_NAMESPACE}" \
-    && census_pods_absent
+    && attested_pod_is_absent \
+    && census_inventory_absent
 }
 
-census_pods_absent() {
+attested_pod_is_absent() {
+  [ "${CHILD_LAUNCHED}" = true ] || return 0
+  [ "${RUNTIME_ATTESTATION_VALIDATED}" = true ] || return 1
+  resource_is_absent pod "${ATTESTED_POD_NAME}" "${DEV_NAMESPACE}"
+}
+
+census_inventory_absent() {
   local observed
-  observed=$(kctl -n "${DEV_NAMESPACE}" get pods \
+  observed=$(kctl -n "${DEV_NAMESPACE}" get jobs,pods,configmaps \
     -l "app.kubernetes.io/name=healthporta-plan-pricing-v3-census" \
     -o name) || return 1
   [ -z "${observed}" ]
@@ -953,20 +1045,314 @@ reap_child_group() {
   CHILD_PID=
 }
 
+capture_capacity() {
+  local limit observed
+  limit=$(seconds_before_cleanup)
+  [ "${limit}" -gt 0 ] || die "no time remains for the capacity admission"
+  [ "${limit}" -le "${OPERATION_TIMEOUT_SECONDS}" ] \
+    || limit=${OPERATION_TIMEOUT_SECONDS}
+  observed=$(timeout --foreground --signal=TERM --kill-after=2s "${limit}s" \
+    python3 - "${POSTGRESQL_TABLESPACE_PATH}" \
+      "${MINIMUM_HOST_AVAILABLE_MEMORY_BYTES}" \
+      "${MINIMUM_HOST_SWAP_FREE_BYTES}" \
+      "${MINIMUM_POSTGRESQL_TABLESPACE_FREE_BYTES}" <<'PY'
+import os
+import sys
+
+values = {}
+with open("/proc/meminfo", encoding="utf-8") as source:
+    for line in source:
+        name, value = line.split(":", 1)
+        if name in {"MemAvailable", "SwapFree"}:
+            amount, unit = value.split()
+            if unit != "kB":
+                raise SystemExit("unexpected host memory unit")
+            values[name] = int(amount) * 1024
+if set(values) != {"MemAvailable", "SwapFree"}:
+    raise SystemExit("host memory admission values are incomplete")
+filesystem = os.statvfs(sys.argv[1])
+tablespace_free = filesystem.f_bavail * filesystem.f_frsize
+observed = (values["MemAvailable"], values["SwapFree"], tablespace_free)
+minimums = tuple(int(value) for value in sys.argv[2:])
+if any(value < minimum for value, minimum in zip(observed, minimums, strict=True)):
+    raise SystemExit("host or PostgreSQL capacity is below the reviewed minimum")
+print(*observed)
+PY
+  ) || die "host and PostgreSQL capacity admission failed"
+  read -r HOST_AVAILABLE_MEMORY_BYTES HOST_SWAP_FREE_BYTES \
+    POSTGRESQL_TABLESPACE_FREE_BYTES <<<"${observed}"
+  CAPACITY_VERIFIED=true
+}
+
+validate_runtime_attestation() {
+  python3 - "${RUNTIME_ATTESTATION}" "${CENSUS_JOB}" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    attestation = json.load(source)
+expected = {
+    "contract", "job_name", "job_uid", "pod_name", "pod_uid",
+    "pod_owner_job_name", "pod_owner_job_uid", "container_name", "image_id",
+}
+if set(attestation) != expected or not all(
+    isinstance(value, str) and value for value in attestation.values()
+):
+    raise SystemExit("runtime attestation schema is invalid")
+if (
+    attestation["contract"]
+    != "healthporta.plan-pricing-v3-census-runtime-attestation.v1"
+    or attestation["job_name"] != sys.argv[2]
+    or attestation["pod_owner_job_name"] != attestation["job_name"]
+    or attestation["pod_owner_job_uid"] != attestation["job_uid"]
+    or attestation["container_name"] != "census"
+    or not re.fullmatch(r"[a-z0-9](?:[-.a-z0-9]*[a-z0-9])?", attestation["pod_name"])
+    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", attestation["pod_uid"])
+    or not re.fullmatch(
+        r"(?:containerd://sha256:[0-9a-f]{64}|[^\s@]+@sha256:[0-9a-f]{64})",
+        attestation["image_id"],
+    )
+):
+    raise SystemExit("runtime attestation identity is invalid")
+print(attestation["pod_name"], attestation["pod_uid"], sep="\t")
+PY
+}
+
+child_job_is_running() {
+  local job_pid jobs_path="${STATE_DIR}/child-jobs.tmp"
+  jobs -pr >"${jobs_path}" || return 1
+  while IFS= read -r job_pid; do
+    if [ "${job_pid}" = "${CHILD_PID}" ]; then
+      rm -f -- "${jobs_path}"
+      return 0
+    fi
+  done <"${jobs_path}"
+  rm -f -- "${jobs_path}"
+  return 1
+}
+
+capture_runtime_attestation() {
+  local attempt attested_identity attestation_file_sha256 job_after_json job_json
+  local job_uid pods_after_json pods_json remaining status
+  for ((attempt = 1; attempt <= 60; attempt++)); do
+    [ "${INTERRUPT_EXIT}" -eq 0 ] || return 1
+    child_job_is_running || return 1
+    [ ! -e "${RUNTIME_ATTESTATION}" ] \
+      && [ ! -L "${RUNTIME_ATTESTATION}" ] || return 1
+    remaining=$(operation_timeout) || return $?
+    job_json=$(kctl_with_limit "${remaining}" -n "${DEV_NAMESPACE}" \
+      get job "${CENSUS_JOB}" --ignore-not-found -o json) || return 1
+    child_job_is_running || return 1
+    if [ -z "${job_json}" ]; then
+      sleep 1
+      continue
+    fi
+    job_uid=$(JOB_JSON="${job_json}" python3 -c '
+import json, os, sys
+job = json.loads(os.environ["JOB_JSON"])
+metadata = job.get("metadata") if isinstance(job, dict) else None
+if (
+    job.get("apiVersion") != "batch/v1"
+    or job.get("kind") != "Job"
+    or not isinstance(metadata, dict)
+    or metadata.get("name") != sys.argv[1]
+    or metadata.get("namespace") != sys.argv[2]
+    or not isinstance(metadata.get("uid"), str)
+    or not metadata["uid"]
+):
+    raise SystemExit("exact census Job identity is invalid")
+print(metadata["uid"])
+' "${CENSUS_JOB}" "${DEV_NAMESPACE}") || return 1
+    remaining=$(operation_timeout) || return $?
+    pods_json=$(kctl_with_limit "${remaining}" -n "${DEV_NAMESPACE}" \
+      get pods -l "batch.kubernetes.io/controller-uid=${job_uid}" \
+      -o json) || return 1
+    child_job_is_running || return 1
+    remaining=$(operation_timeout) || return $?
+    job_after_json=$(kctl_with_limit "${remaining}" -n "${DEV_NAMESPACE}" \
+      get job "${CENSUS_JOB}" --ignore-not-found -o json) || return 1
+    child_job_is_running || return 1
+    remaining=$(operation_timeout) || return $?
+    pods_after_json=$(kctl_with_limit "${remaining}" -n "${DEV_NAMESPACE}" \
+      get pods -l "batch.kubernetes.io/controller-uid=${job_uid}" \
+      -o json) || return 1
+    child_job_is_running || return 1
+    if attested_identity=$(JOB_JSON="${job_json}" PODS_JSON="${pods_json}" \
+      JOB_AFTER_JSON="${job_after_json}" PODS_AFTER_JSON="${pods_after_json}" \
+      python3 - "${RUNTIME_ATTESTATION}.tmp" "${CENSUS_JOB}" \
+        "${DEV_NAMESPACE}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sys
+
+def attestation_from(job, pods):
+    job_metadata = job.get("metadata") if isinstance(job, dict) else None
+    if (
+        job.get("apiVersion") != "batch/v1"
+        or job.get("kind") != "Job"
+        or not isinstance(job_metadata, dict)
+        or job_metadata.get("name") != sys.argv[2]
+        or job_metadata.get("namespace") != sys.argv[3]
+        or not isinstance(job_metadata.get("uid"), str)
+        or not job_metadata["uid"]
+    ):
+        raise SystemExit("exact census Job identity is invalid")
+    pod_rows = pods.get("items") if isinstance(pods, dict) else None
+    if not isinstance(pod_rows, list):
+        raise SystemExit("census Pod inventory is invalid")
+    if not pod_rows:
+        raise SystemExit(75)
+    if len(pod_rows) != 1 or not isinstance(pod_rows[0], dict):
+        raise SystemExit("census Pod inventory is not singular")
+    pod = pod_rows[0]
+    pod_metadata = pod.get("metadata")
+    pod_status = pod.get("status")
+    if not isinstance(pod_metadata, dict) or not isinstance(pod_status, dict):
+        raise SystemExit("census Pod identity is invalid")
+    owners = pod_metadata.get("ownerReferences")
+    controllers = [
+        owner
+        for owner in owners
+        if isinstance(owner, dict) and owner.get("controller") is True
+    ] if isinstance(owners, list) else []
+    expected_controller = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "name": sys.argv[2],
+        "uid": job_metadata["uid"],
+        "controller": True,
+    }
+    if len(controllers) != 1:
+        raise SystemExit("census Pod owner identity is invalid")
+    controller = controllers[0]
+    if (
+        any(controller.get(key) != value for key, value in expected_controller.items())
+        or set(controller) - set(expected_controller) - {"blockOwnerDeletion"}
+        or (
+            "blockOwnerDeletion" in controller
+            and type(controller["blockOwnerDeletion"]) is not bool
+        )
+    ):
+        raise SystemExit("census Pod owner identity is invalid")
+    container_rows = pod_status.get("containerStatuses")
+    census_rows = [
+        row
+        for row in container_rows
+        if isinstance(row, dict) and row.get("name") == "census"
+    ] if isinstance(container_rows, list) else []
+    if not census_rows:
+        raise SystemExit(75)
+    if len(census_rows) != 1:
+        raise SystemExit("census container status is not singular")
+    image_id = census_rows[0].get("imageID")
+    if image_id in (None, ""):
+        raise SystemExit(75)
+    if (
+        pod_metadata.get("namespace") != sys.argv[3]
+        or not isinstance(pod_metadata.get("name"), str)
+        or not pod_metadata["name"]
+        or not isinstance(pod_metadata.get("uid"), str)
+        or not pod_metadata["uid"]
+        or not isinstance(image_id, str)
+        or re.fullmatch(
+            r"(?:containerd://sha256:[0-9a-f]{64}|[^\s@]+@sha256:[0-9a-f]{64})",
+            image_id,
+        ) is None
+    ):
+        raise SystemExit("census Pod runtime identity is invalid")
+    return {
+        "contract": "healthporta.plan-pricing-v3-census-runtime-attestation.v1",
+        "job_name": sys.argv[2],
+        "job_uid": job_metadata["uid"],
+        "pod_name": pod_metadata["name"],
+        "pod_uid": pod_metadata["uid"],
+        "pod_owner_job_name": sys.argv[2],
+        "pod_owner_job_uid": job_metadata["uid"],
+        "container_name": "census",
+        "image_id": image_id,
+    }
+
+
+attestation = attestation_from(
+    json.loads(os.environ["JOB_JSON"]),
+    json.loads(os.environ["PODS_JSON"]),
+)
+attestation_after = attestation_from(
+    json.loads(os.environ["JOB_AFTER_JSON"]),
+    json.loads(os.environ["PODS_AFTER_JSON"]),
+)
+if attestation_after != attestation:
+    raise SystemExit("census Job or Pod identity changed during attestation")
+serialized = (json.dumps(attestation, sort_keys=True, separators=(",", ":")) + "\n").encode()
+with Path(sys.argv[1]).open("xb") as target:
+    target.write(serialized)
+print(
+    attestation["pod_name"],
+    attestation["pod_uid"],
+    hashlib.sha256(serialized).hexdigest(),
+    sep="\t",
+)
+PY
+    ); then
+      [ ! -e "${RUNTIME_ATTESTATION}" ] \
+        && [ ! -L "${RUNTIME_ATTESTATION}" ] || {
+          rm -f "${RUNTIME_ATTESTATION}.tmp"
+          return 1
+      }
+      IFS=$'\t' read -r ATTESTED_POD_NAME ATTESTED_POD_UID \
+        CAPTURED_RUNTIME_ATTESTATION_SHA256 <<<"${attested_identity}"
+      chmod 0600 "${RUNTIME_ATTESTATION}.tmp" || return 1
+      read -r attestation_file_sha256 _ \
+        < <(sha256sum "${RUNTIME_ATTESTATION}.tmp") || return 1
+      [ "${attestation_file_sha256}" \
+          = "${CAPTURED_RUNTIME_ATTESTATION_SHA256}" ] || return 1
+      mv "${RUNTIME_ATTESTATION}.tmp" "${RUNTIME_ATTESTATION}" || return 1
+      return 0
+    else
+      status=$?
+      rm -f "${RUNTIME_ATTESTATION}.tmp"
+      [ "${status}" -eq 75 ] || return 1
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 run_child() {
-  local remaining
+  local attested_pod_identity remaining shutdown_signal
+  verify_reviewed_hashes
+  capture_capacity
+  verify_reviewed_hashes
+  verify_child_fences || die "final pre-child envelope fence changed"
+  PRE_CHILD_FENCE_VERIFIED=true
+  check_interrupted
   remaining=$(seconds_before_cleanup)
   [ "${remaining}" -gt 0 ] || die "no execution time remains before cleanup reserve"
-  read -r CHILD_COMMAND_SHA256 _ \
-    < <(printf '%q\0' "${CHILD_COMMAND[@]}" | sha256sum)
   CHILD_DEADLINE_MARKER="${STATE_DIR}/child-deadline-fired"
   [ ! -e "${CENSUS_RECEIPT}" ] && [ ! -L "${CENSUS_RECEIPT}" ] \
     || die "census receipt already exists"
+  [ ! -e "${RUNTIME_ATTESTATION}" ] && [ ! -L "${RUNTIME_ATTESTATION}" ] \
+    || die "runtime attestation already exists"
   check_interrupted
+  verify_reviewed_hashes
   setsid "${CHILD_COMMAND[@]}" &
   capture_child_pid "$!"
+  CHILD_LAUNCHED=true
   start_child_deadline_timer "${CHILD_PID}" "${remaining}" \
     "${CHILD_DEADLINE_MARKER}"
+  if ! capture_runtime_attestation; then
+    shutdown_signal=${INTERRUPT_SIGNAL:-TERM}
+    if child_job_is_running; then
+      arm_child_shutdown "${CHILD_PID}" "${shutdown_signal}"
+    fi
+    reap_child_group "${CHILD_PID}" \
+      || die "census process group did not terminate after attestation failure"
+    die "independent census runtime attestation failed"
+  fi
   reap_child_group "${CHILD_PID}" \
     || die "census process group did not terminate"
   if [ -e "${CENSUS_RECEIPT}" ] || [ -L "${CENSUS_RECEIPT}" ]; then
@@ -975,6 +1361,23 @@ run_child() {
     read -r CENSUS_RECEIPT_SHA256 _ < <(sha256sum "${CENSUS_RECEIPT}")
   elif [ "${CHILD_EXIT_CODE}" -eq 0 ]; then
     die "successful census process did not write its receipt"
+  fi
+  if [ -e "${RUNTIME_ATTESTATION}" ] || [ -L "${RUNTIME_ATTESTATION}" ]; then
+    [ -f "${RUNTIME_ATTESTATION}" ] && [ ! -L "${RUNTIME_ATTESTATION}" ] \
+      || die "census process did not write a regular runtime attestation"
+    read -r RUNTIME_ATTESTATION_SHA256 _ \
+      < <(sha256sum "${RUNTIME_ATTESTATION}")
+    [ "${RUNTIME_ATTESTATION_SHA256}" \
+        = "${CAPTURED_RUNTIME_ATTESTATION_SHA256}" ] \
+      || die "census runtime attestation changed after capture"
+    attested_pod_identity=$(validate_runtime_attestation) \
+      || die "census runtime attestation is invalid"
+    [ "${attested_pod_identity}" \
+        = "${ATTESTED_POD_NAME}"$'\t'"${ATTESTED_POD_UID}" ] \
+      || die "census runtime attestation changed after capture"
+    RUNTIME_ATTESTATION_VALIDATED=true
+  elif [ "${CHILD_EXIT_CODE}" -eq 0 ]; then
+    die "successful census process did not write a regular runtime attestation"
   fi
   verify_child_fences || die "post-child envelope fence changed"
   POST_CHILD_FENCE_VERIFIED=true
@@ -1105,6 +1508,15 @@ outer_fence_identities_match() {
   fi
 }
 
+retain_import_drain() {
+  [ "${DRAIN_CAPTURED}" = true ] || return 0
+  [ "${PRIOR_DRAIN_MODE}" = false ] || return 0
+  DRAIN_RESTORED=false
+  node_drain_mode true >/dev/null 2>&1 || true
+  [ "$(node_drain_mode read)" = true ] || return 1
+  seed_is_absent || return 1
+}
+
 release_lock() {
   local invocation marker state
   state=$(unit_load_state) || return 1
@@ -1133,6 +1545,7 @@ release_lock() {
 
 cleanup_envelope() {
   set +e
+  rm -f -- "${STATE_DIR}/child-jobs.tmp"
   if [ -n "${CHILD_PID}" ] \
       && { kill -0 "${CHILD_PID}" >/dev/null 2>&1 \
         || ! child_group_absent "${CHILD_PID}"; }; then
@@ -1148,22 +1561,34 @@ cleanup_envelope() {
     log 'cleanup retained every outer fence after semantic identity drift'
     return 1
   }
+  if [ "${DRAIN_CAPTURED}" = true ]; then
+    seed_is_absent || return 1
+    node_drain_mode "${PRIOR_DRAIN_MODE}" >/dev/null 2>&1 || true
+    seed_is_absent || {
+      retain_import_drain
+      return 1
+    }
+    [ "$(node_drain_mode read)" = "${PRIOR_DRAIN_MODE}" ] || {
+      retain_import_drain
+      return 1
+    }
+    DRAIN_RESTORED=true
+  fi
   if [ "${BINDING_CREATED}" = true ]; then
     delete_uid_bound validatingadmissionpolicybinding "${BINDING_NAME}" \
-      "${BINDING_UID}" || return 1
+      "${BINDING_UID}" || {
+        retain_import_drain
+        return 1
+      }
     BINDING_REMOVED=true
   fi
   if [ "${POLICY_CREATED}" = true ]; then
     delete_uid_bound validatingadmissionpolicy "${POLICY_NAME}" \
-      "${POLICY_UID}" || return 1
+      "${POLICY_UID}" || {
+        retain_import_drain
+        return 1
+      }
     POLICY_REMOVED=true
-  fi
-  if [ "${DRAIN_CAPTURED}" = true ]; then
-    seed_is_absent || return 1
-    [ "$(node_drain_mode "${PRIOR_DRAIN_MODE}")" = "${PRIOR_DRAIN_MODE}" ] \
-      || return 1
-    seed_is_absent || return 1
-    DRAIN_RESTORED=true
   fi
   if [ "${QUOTA_CREATED}" = true ]; then
     [ "$(quota_identity)" = "${QUOTA_UID}" ] || return 1
@@ -1187,6 +1612,7 @@ write_receipt() {
   RECEIPT_EXIT_CODE=${exit_code} \
   RECEIPT_SOURCE_SHA=${SOURCE_SHA} \
   RECEIPT_SCRIPT_SHA=${script_sha} \
+  RECEIPT_EXPECTED_SCRIPT_SHA=${EXPECTED_ENVELOPE_SCRIPT_SHA256} \
   RECEIPT_OWNER_TOKEN=${OWNER_TOKEN} \
   RECEIPT_QUOTA_UID=${QUOTA_UID} \
   RECEIPT_POLICY_UID=${POLICY_UID} \
@@ -1194,14 +1620,28 @@ write_receipt() {
   RECEIPT_LOCK_INVOCATION_ID=${LOCK_INVOCATION_ID} \
   RECEIPT_PRIOR_DRAIN_MODE=${PRIOR_DRAIN_MODE} \
   RECEIPT_CHILD_COMMAND_SHA=${CHILD_COMMAND_SHA256} \
+  RECEIPT_EXPECTED_CHILD_COMMAND_SHA=${EXPECTED_CHILD_COMMAND_SHA256} \
+  RECEIPT_CHILD_EXECUTABLE_SHA=${CHILD_EXECUTABLE_SHA256} \
+  RECEIPT_EXPECTED_CHILD_EXECUTABLE_SHA=${EXPECTED_CHILD_EXECUTABLE_SHA256} \
   RECEIPT_CENSUS_JOB=${CENSUS_JOB} \
   RECEIPT_CENSUS_RECEIPT_SHA=${CENSUS_RECEIPT_SHA256} \
+  RECEIPT_RUNTIME_ATTESTATION_PATH=${RUNTIME_ATTESTATION} \
+  RECEIPT_RUNTIME_ATTESTATION_SHA=${RUNTIME_ATTESTATION_SHA256} \
+  RECEIPT_RUNTIME_ATTESTATION_VALIDATED=${RUNTIME_ATTESTATION_VALIDATED} \
   RECEIPT_CHILD_EXIT_CODE=${CHILD_EXIT_CODE} \
   RECEIPT_TIMED_OUT=${TIMED_OUT} \
   RECEIPT_PROBE_VERIFIED=${PROBE_VERIFIED} \
   RECEIPT_QUOTA_PROBE_VERIFIED=${QUOTA_PROBE_VERIFIED} \
   RECEIPT_PRE_CHILD_FENCE_VERIFIED=${PRE_CHILD_FENCE_VERIFIED} \
   RECEIPT_POST_CHILD_FENCE_VERIFIED=${POST_CHILD_FENCE_VERIFIED} \
+  RECEIPT_CAPACITY_VERIFIED=${CAPACITY_VERIFIED} \
+  RECEIPT_HOST_AVAILABLE_MEMORY_BYTES=${HOST_AVAILABLE_MEMORY_BYTES} \
+  RECEIPT_MINIMUM_HOST_AVAILABLE_MEMORY_BYTES=${MINIMUM_HOST_AVAILABLE_MEMORY_BYTES} \
+  RECEIPT_HOST_SWAP_FREE_BYTES=${HOST_SWAP_FREE_BYTES} \
+  RECEIPT_MINIMUM_HOST_SWAP_FREE_BYTES=${MINIMUM_HOST_SWAP_FREE_BYTES} \
+  RECEIPT_POSTGRESQL_TABLESPACE_PATH=${POSTGRESQL_TABLESPACE_PATH} \
+  RECEIPT_POSTGRESQL_TABLESPACE_FREE_BYTES=${POSTGRESQL_TABLESPACE_FREE_BYTES} \
+  RECEIPT_MINIMUM_POSTGRESQL_TABLESPACE_FREE_BYTES=${MINIMUM_POSTGRESQL_TABLESPACE_FREE_BYTES} \
   RECEIPT_BINDING_REMOVED=${BINDING_REMOVED} \
   RECEIPT_POLICY_REMOVED=${POLICY_REMOVED} \
   RECEIPT_DRAIN_RESTORED=${DRAIN_RESTORED} \
@@ -1221,12 +1661,22 @@ def optional_bool(value):
 def optional_int(value):
     return None if value == "" else int(value)
 
+runtime_attestation = None
+if optional_bool(os.environ["RECEIPT_RUNTIME_ATTESTATION_VALIDATED"]):
+    with open(
+        os.environ["RECEIPT_RUNTIME_ATTESTATION_PATH"], encoding="utf-8"
+    ) as source:
+        runtime_attestation = json.load(source)
+
 receipt = {
     "contract": "healthporta.plan-pricing-v3-census-envelope.v1",
     "status": os.environ["RECEIPT_STATUS"],
     "exit_code": int(os.environ["RECEIPT_EXIT_CODE"]),
     "reviewed_source_sha": os.environ["RECEIPT_SOURCE_SHA"],
     "envelope_script_sha256": os.environ["RECEIPT_SCRIPT_SHA"],
+    "expected_envelope_script_sha256": os.environ[
+        "RECEIPT_EXPECTED_SCRIPT_SHA"
+    ],
     "owner_token": os.environ["RECEIPT_OWNER_TOKEN"],
     "resource_uids": {
         "quota": os.environ["RECEIPT_QUOTA_UID"],
@@ -1236,8 +1686,19 @@ receipt = {
     },
     "prior_drain_mode": optional_bool(os.environ["RECEIPT_PRIOR_DRAIN_MODE"]),
     "child_command_sha256": os.environ["RECEIPT_CHILD_COMMAND_SHA"],
+    "expected_child_command_sha256": os.environ[
+        "RECEIPT_EXPECTED_CHILD_COMMAND_SHA"
+    ],
+    "child_executable_sha256": os.environ["RECEIPT_CHILD_EXECUTABLE_SHA"],
+    "expected_child_executable_sha256": os.environ[
+        "RECEIPT_EXPECTED_CHILD_EXECUTABLE_SHA"
+    ],
     "census_job": os.environ["RECEIPT_CENSUS_JOB"],
     "census_receipt_sha256": os.environ["RECEIPT_CENSUS_RECEIPT_SHA"],
+    "runtime_attestation": runtime_attestation,
+    "runtime_attestation_sha256": os.environ[
+        "RECEIPT_RUNTIME_ATTESTATION_SHA"
+    ],
     "child_exit_code": optional_int(os.environ["RECEIPT_CHILD_EXIT_CODE"]),
     "timed_out": optional_bool(os.environ["RECEIPT_TIMED_OUT"]),
     "probe_verified": optional_bool(os.environ["RECEIPT_PROBE_VERIFIED"]),
@@ -1250,6 +1711,30 @@ receipt = {
     "post_child_fence_verified": optional_bool(
         os.environ["RECEIPT_POST_CHILD_FENCE_VERIFIED"]
     ),
+    "capacity": {
+        "verified": optional_bool(os.environ["RECEIPT_CAPACITY_VERIFIED"]),
+        "host_available_memory_bytes": optional_int(
+            os.environ["RECEIPT_HOST_AVAILABLE_MEMORY_BYTES"]
+        ),
+        "minimum_host_available_memory_bytes": optional_int(
+            os.environ["RECEIPT_MINIMUM_HOST_AVAILABLE_MEMORY_BYTES"]
+        ),
+        "host_swap_free_bytes": optional_int(
+            os.environ["RECEIPT_HOST_SWAP_FREE_BYTES"]
+        ),
+        "minimum_host_swap_free_bytes": optional_int(
+            os.environ["RECEIPT_MINIMUM_HOST_SWAP_FREE_BYTES"]
+        ),
+        "postgresql_tablespace_path": os.environ[
+            "RECEIPT_POSTGRESQL_TABLESPACE_PATH"
+        ],
+        "postgresql_tablespace_free_bytes": optional_int(
+            os.environ["RECEIPT_POSTGRESQL_TABLESPACE_FREE_BYTES"]
+        ),
+        "minimum_postgresql_tablespace_free_bytes": optional_int(
+            os.environ["RECEIPT_MINIMUM_POSTGRESQL_TABLESPACE_FREE_BYTES"]
+        ),
+    },
     "cleanup": {
         "binding_removed": optional_bool(os.environ["RECEIPT_BINDING_REMOVED"]),
         "policy_removed": optional_bool(os.environ["RECEIPT_POLICY_REMOVED"]),
@@ -1300,6 +1785,7 @@ run_envelope() {
   for command in git hostname k3s python3 setsid sha256sum systemctl systemd-run timeout; do
     require_command "${command}"
   done
+  verify_reviewed_hashes
   verify_source_and_target
   mkdir -m 0700 "${STATE_DIR}"
   START_SECONDS=${SECONDS}
@@ -1326,9 +1812,6 @@ run_envelope() {
   log 'proving stable zero engine work'
   verify_stable_zero_work
   check_interrupted
-  verify_child_fences || die "pre-child envelope fence changed"
-  check_interrupted
-  PRE_CHILD_FENCE_VERIFIED=true
   log 'running the foreground census lifecycle'
   run_child
 }

@@ -41,7 +41,10 @@ from api.ptg2_db_sidecars import (
 from scripts.research import (
     plan_pricing_projection_v3_census_diagnostics as diagnostics,
 )
-from scripts.research.plan_pricing_projection_v3_census_support import ReleaseInput
+from scripts.research.plan_pricing_projection_v3_census_support import (
+    PROJECTION_RELATIONS,
+    ReleaseInput,
+)
 from scripts.research.plan_pricing_projection_v3_census_transaction import (
     CENSUS_DATABASE_STAGE_KEYS,
     census_database_application_name,
@@ -127,6 +130,15 @@ EXPECTED_STAGED_FIELD_KEYS = frozenset(
     }
 )
 _WORK_VALUE_KEYS = frozenset({"total", "maximum_per_code"})
+_POSTFLIGHT_KEYS = frozenset(
+    {
+        "release_matches",
+        "provider_signature_matches",
+        "persistent_counts_match",
+        "persistent_counts_after",
+        "accepted",
+    }
+)
 
 
 def _has_headroom(observed: int, cap: int) -> bool:
@@ -399,6 +411,7 @@ def _is_cardinality_candidate_accepted(
     work_by_field = measured_result.get("work")
     staged_by_field = measured_result.get("staged")
     postflight = receipt_by_field.get("postflight")
+    persistent_counts_before = measured_result.get("persistent_counts_before")
     return (
         source_matches
         and diagnostics.is_database_receipt_valid(receipt_by_field)
@@ -406,33 +419,29 @@ def _is_cardinality_candidate_accepted(
         and receipt_by_field.get("temporary_relations_after_rollback") == []
         and isinstance(fixed_gates, Mapping)
         and frozenset(fixed_gates) == EXPECTED_FIXED_CAP_GATE_KEYS
-        and all(value is True for value in fixed_gates.values())
+        and all(gate_passed is True for gate_passed in fixed_gates.values())
         and _is_measurement_schema_valid(measured_result)
         and fixed_gates == fixed_cap_gates(work_by_field, staged_by_field)
         and isinstance(observed_limits, Mapping)
         and frozenset(observed_limits) == EXPECTED_OBSERVED_WORK_LIMIT_KEYS
-        and all(type(value) is int and value > 0 for value in observed_limits.values())
+        and all(
+            type(observed_limit) is int and observed_limit > 0
+            for observed_limit in observed_limits.values()
+        )
         and observed_limits == observed_work_limits(work_by_field)
+        and isinstance(persistent_counts_before, Mapping)
+        and frozenset(persistent_counts_before) == frozenset(PROJECTION_RELATIONS)
+        and all(
+            type(count) is int and count >= 0
+            for count in persistent_counts_before.values()
+        )
         and isinstance(postflight, Mapping)
+        and frozenset(postflight) == _POSTFLIGHT_KEYS
+        and postflight.get("release_matches") is True
+        and postflight.get("provider_signature_matches") is True
+        and postflight.get("persistent_counts_match") is True
+        and postflight.get("persistent_counts_after") == persistent_counts_before
         and postflight.get("accepted") is True
-    )
-
-
-def is_accepted(
-    receipt_by_field: Mapping[str, Any],
-    measured_result: Mapping[str, Any],
-    source_matches: bool,
-    envelope_by_field: Mapping[str, Any],
-) -> bool:
-    """Accept evidence only when its outer process envelope also succeeded."""
-
-    return _is_cardinality_candidate_accepted(
-        receipt_by_field,
-        measured_result,
-        source_matches,
-    ) and diagnostics.is_authoritative_envelope(
-        receipt_by_field,
-        envelope_by_field,
     )
 
 
@@ -457,44 +466,21 @@ def census_parser(description: str) -> argparse.ArgumentParser:
     return parser
 
 
-def seal_source_only(
-    receipt_by_field: dict[str, Any],
-    source_identity: Mapping[str, Any],
-    finished_at: str,
-    elapsed_seconds: float,
-) -> int:
-    """Seal a successful source check as explicitly inadmissible evidence."""
-
-    receipt_by_field.update(
-        status="source_only",
-        mode="source_only",
-        accepted=False,
-        cap_calibration_admissible=False,
-        resource_proof_admissible=False,
-        proof_scope="source_identity_only",
-        finished_at=finished_at,
-        source_after=source_identity,
-        phase="complete",
-        elapsed_seconds=elapsed_seconds,
-    )
-    return 0
-
-
 def seal_cardinality_census(
     receipt_by_field: dict[str, Any],
-    is_accepted: bool,
+    candidate_accepted: bool,
     finished_at: str,
 ) -> int:
-    """Seal a full receipt as row-limit evidence, never resource proof."""
+    """Seal inner row-limit evidence as provisional pending outer authority."""
 
     receipt_by_field.update(
-        status="complete" if is_accepted else "gate_failed",
-        accepted=is_accepted,
-        cap_calibration_admissible=is_accepted,
+        status="provisional" if candidate_accepted else "gate_failed",
+        accepted=False,
+        cap_calibration_admissible=False,
         resource_proof_admissible=False,
         acceptance_authority=diagnostics.CENSUS_ACCEPTANCE_AUTHORITY,
         proof_scope="row_count_limits_only",
         finished_at=finished_at,
         phase="complete",
     )
-    return 0 if is_accepted else 2
+    return 0 if candidate_accepted else 2

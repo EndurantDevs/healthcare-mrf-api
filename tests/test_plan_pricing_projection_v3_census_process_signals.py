@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from itertools import count
 import os
 from pathlib import Path
 import signal
@@ -32,6 +33,44 @@ async def _complete_census(_args, receipt_by_field):
         resource_proof_admissible=True,
     )
     return 0
+
+
+def _install_signal_boundary_injections(
+    monkeypatch,
+    signal_point: str,
+    signal_number: int,
+):
+    original_signal = diagnostics.signal.signal
+    original_apply = diagnostics._CensusSignalState.apply_interruption
+    original_utc_now = diagnostics.utc_now_text
+    install_counts = count(1)
+    apply_counts = count(1)
+    utc_counts = count(1)
+
+    def install_then_signal(number, handler):
+        previous = original_signal(number, handler)
+        if signal_point == "first_install" and next(install_counts) == 1:
+            os.kill(os.getpid(), signal_number)
+        return previous
+
+    def apply_then_signal(state, exit_code):
+        updated = original_apply(state, exit_code)
+        if signal_point == "first_apply" and next(apply_counts) == 1:
+            os.kill(os.getpid(), signal_number)
+        return updated
+
+    def utc_then_signal():
+        if signal_point == "failure_seal" and next(utc_counts) == 1:
+            os.kill(os.getpid(), signal_number)
+        return original_utc_now()
+
+    monkeypatch.setattr(diagnostics.signal, "signal", install_then_signal)
+    monkeypatch.setattr(
+        diagnostics._CensusSignalState,
+        "apply_interruption",
+        apply_then_signal,
+    )
+    monkeypatch.setattr(diagnostics, "utc_now_text", utc_then_signal)
 
 
 def _run_after_sigterm_restore_child() -> None:
@@ -71,6 +110,7 @@ def test_sigterm_after_restore_leaves_only_provisional_receipt(tmp_path) -> None
             ),
         ],
         env={**os.environ, _RESTORE_RECEIPT_ENV: str(receipt_path)},
+        cwd=Path(__file__).resolve().parents[1],
         check=False,
         capture_output=True,
         text=True,
@@ -183,3 +223,60 @@ def test_process_late_signals_keep_failed_receipt(
         "type": "_CensusInterrupted",
         "signal": signal.Signals(expected_signal).name,
     }
+
+
+@pytest.mark.parametrize(
+    ("signal_point", "signal_number"),
+    [
+        ("first_install", signal.SIGINT),
+        ("first_install", signal.SIGTERM),
+        ("first_apply", signal.SIGINT),
+        ("first_apply", signal.SIGTERM),
+        ("failure_seal", signal.SIGINT),
+        ("failure_seal", signal.SIGTERM),
+    ],
+)
+def test_process_signals_cover_the_complete_owned_handler_lifetime(
+    monkeypatch,
+    tmp_path,
+    signal_number,
+    signal_point,
+) -> None:
+    """Every first signal under an owned handler must seal a failed receipt."""
+
+    receipt_path = tmp_path / f"{signal_point}-{signal_number}.json"
+    receipt_by_field = {
+        "status": "complete",
+        "accepted": True,
+        "cap_calibration_admissible": True,
+        "resource_proof_admissible": True,
+    }
+
+    async def runner(_args, _receipt_by_field):
+        if signal_point == "failure_seal":
+            raise RuntimeError("private failure")
+        return await _complete_census(_args, _receipt_by_field)
+
+    _install_signal_boundary_injections(monkeypatch, signal_point, signal_number)
+    previous_handler_by_signal = {
+        number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)
+    }
+
+    assert (
+        diagnostics.run_census_process(
+            SimpleNamespace(receipt=receipt_path),
+            receipt_by_field,
+            runner,
+            lambda _args: {},
+        )
+        == 128 + signal_number
+    )
+    assert all(
+        signal.getsignal(number) == previous_handler
+        for number, previous_handler in previous_handler_by_signal.items()
+    )
+    final_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert final_receipt["status"] == "failed"
+    assert final_receipt["accepted"] is False
+    assert final_receipt["cap_calibration_admissible"] is False
+    assert final_receipt["resource_proof_admissible"] is False

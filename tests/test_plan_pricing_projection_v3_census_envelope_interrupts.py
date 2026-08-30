@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from . import test_plan_pricing_projection_v3_census_envelope as envelope
+from . import plan_pricing_projection_v3_census_envelope_harness as envelope
 
 
 def _script_definitions(tmp_path: Path) -> Path:
@@ -20,6 +20,62 @@ def _script_definitions(tmp_path: Path) -> Path:
     return definitions
 
 
+_PRE_CHILD_INTERRUPT_SCRIPT = r"""
+export HLTHPRT_PLAN_PRICING_V3_CENSUS_STATE_ROOT=$3
+source "$1"
+require_command() { :; }
+verify_reviewed_hashes() { :; }
+verify_source_and_target() { :; }
+start_lock() { :; }; require_lock_held() { :; }
+create_quota() { :; }; prove_quota_admission() { :; }
+wait_for_arc_idle() { :; }; set_import_drain() { :; }
+create_worker_fence() { :; }
+verify_stable_zero_work() { :; }
+capture_capacity() { :; }
+INJECT_INTERRUPT=$4
+verify_child_fences() {
+  [ "${INJECT_INTERRUPT}" != fence ] || on_signal TERM 143
+}
+log() {
+  if [ "${INJECT_INTERRUPT}" = log ] \
+      && [[ "$*" = 'running the foreground census lifecycle' ]]; then
+    on_signal TERM 143
+  fi
+}
+cleanup_envelope() { CLEANUP_COMPLETE=true; }
+write_receipt() { :; }
+export HLTHPRT_PLAN_PRICING_V3_CENSUS_ENVELOPE_RUN=run
+TEST_CHILD_MARKER=$2
+CHILD_COMMAND=(/usr/bin/touch "${TEST_CHILD_MARKER}")
+STATE_DIR=$3/run
+DEADLINE_SECONDS=900
+run_envelope
+"""
+
+
+def _run_pre_child_interrupt(
+    definitions: Path,
+    marker: Path,
+    state_root: Path,
+    interrupt_stage: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            _PRE_CHILD_INTERRUPT_SCRIPT,
+            "bash",
+            str(definitions),
+            str(marker),
+            str(state_root),
+            interrupt_stage,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_zero_second_start_enforces_global_deadline(tmp_path: Path) -> None:
     """A start at Bash second zero must still activate the global deadline."""
 
@@ -28,14 +84,17 @@ def test_zero_second_start_enforces_global_deadline(tmp_path: Path) -> None:
         [
             "bash",
             "-c",
-            'source "$1"; START_SECONDS=0; DEADLINE_SECONDS=10; '
-            "SECONDS=11; operation_timeout",
+            (
+                'source "$1"; START_SECONDS=0; DEADLINE_SECONDS=10; '
+                "SECONDS=11; operation_timeout"
+            ),
             "bash",
             str(definitions),
         ],
         check=False,
         capture_output=True,
         text=True,
+        timeout=10,
     )
 
     assert deadline_result.returncode == 124
@@ -253,6 +312,7 @@ stop_child_deadline_timer
         check=False,
         capture_output=True,
         text=True,
+        timeout=10,
     )
 
     assert timer_result.returncode == 0, timer_result.stderr
@@ -301,51 +361,11 @@ def test_pre_child_signal_never_starts_census(
     marker = tmp_path / "child-started"
     state_root = tmp_path / "state"
     state_root.mkdir()
-    run_result = subprocess.run(
-        [
-            "bash",
-            "-c",
-            """
-export HLTHPRT_PLAN_PRICING_V3_CENSUS_STATE_ROOT=$3
-source "$1"
-require_command() { :; }
-verify_source_and_target() { :; }
-start_lock() { :; }
-require_lock_held() { :; }
-create_quota() { :; }
-prove_quota_admission() { :; }
-wait_for_arc_idle() { :; }
-set_import_drain() { :; }
-create_worker_fence() { :; }
-verify_stable_zero_work() { :; }
-INJECT_INTERRUPT=$4
-verify_child_fences() {
-  [ "${INJECT_INTERRUPT}" != fence ] || on_signal TERM 143
-}
-log() {
-  if [ "${INJECT_INTERRUPT}" = log ] \
-      && [[ "$*" = 'running the foreground census lifecycle' ]]; then
-    on_signal TERM 143
-  fi
-}
-cleanup_envelope() { CLEANUP_COMPLETE=true; }
-write_receipt() { :; }
-export HLTHPRT_PLAN_PRICING_V3_CENSUS_ENVELOPE_RUN=run
-TEST_CHILD_MARKER=$2
-CHILD_COMMAND=(/usr/bin/touch "${TEST_CHILD_MARKER}")
-STATE_DIR=$3/run
-DEADLINE_SECONDS=900
-run_envelope
-""",
-            "bash",
-            str(definitions),
-            str(marker),
-            str(state_root),
-            interrupt_stage,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
+    run_result = _run_pre_child_interrupt(
+        definitions,
+        marker,
+        state_root,
+        interrupt_stage,
     )
 
     assert run_result.returncode == 143, run_result.stderr
@@ -452,13 +472,20 @@ def test_signal_forwards_once_and_finishes_cleanup(
         text=True,
     )
     events = tmp_path / "fake-state/events"
-    for _ in range(1500):
-        if events.exists() and "child" in events.read_text():
+    startup_deadline = time.monotonic() + 30
+    while time.monotonic() < startup_deadline:
+        if events.exists() and "child_ready" in events.read_text():
             break
+        if process.poll() is not None:
+            _stdout, stderr = process.communicate()
+            raise AssertionError(
+                f"foreground census child exited {process.returncode}: {stderr}"
+            )
         time.sleep(0.02)
     else:
         process.kill()
-        raise AssertionError("foreground census child did not start")
+        _stdout, stderr = process.communicate()
+        raise AssertionError(f"foreground census child did not start: {stderr}")
     process.send_signal(signal_number)
     process.send_signal(signal_number)
     _stdout, stderr = process.communicate(timeout=30)

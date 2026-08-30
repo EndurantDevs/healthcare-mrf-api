@@ -135,10 +135,7 @@ async def _wait_for_backend_exit(observer, backend_pid: int) -> None:
             await asyncio.sleep(0.01)
 
 
-@pytest.mark.asyncio
-async def test_sigterm_cancels_sql_rolls_back_and_seals_receipt(tmp_path: Path) -> None:
-    """SIGTERM must drain the active backend before sealing exit 143."""
-
+async def _connect_test_database():
     dsn = os.getenv(POSTGRES_DSN_ENV)
     if not dsn:
         pytest.skip(f"set {POSTGRES_DSN_ENV} for the PostgreSQL proof")
@@ -147,6 +144,14 @@ async def test_sigterm_cancels_sql_rolls_back_and_seals_receipt(tmp_path: Path) 
     if TEST_DATABASE_PATTERN.search(str(database_name)) is None:
         await observer.close()
         pytest.fail(f"{POSTGRES_DSN_ENV} must target an explicit test database")
+    return dsn, observer
+
+
+@pytest.mark.asyncio
+async def test_sigterm_cancels_sql_rolls_back_and_seals_receipt(tmp_path: Path) -> None:
+    """SIGTERM must drain the active backend before sealing exit 143."""
+
+    dsn, observer = await _connect_test_database()
 
     receipt_path = tmp_path / "signal-receipt.json"
     run_token = uuid.uuid4().hex[:12]
@@ -156,13 +161,16 @@ async def test_sigterm_cancels_sql_rolls_back_and_seals_receipt(tmp_path: Path) 
         1,
     )
     schema = f"census_signal_{uuid.uuid4().hex}"
-    await observer.execute(f'CREATE SCHEMA "{schema}"')
-    await observer.execute(f'CREATE TABLE "{schema}".marker (value integer NOT NULL)')
-    await observer.execute(f'INSERT INTO "{schema}".marker VALUES (1)')
-    process = await _start_signal_child(receipt_path, run_token, schema)
     backend_pid = None
     persistent_value = None
+    process = None
     try:
+        await observer.execute(f'CREATE SCHEMA "{schema}"')
+        await observer.execute(
+            f'CREATE TABLE "{schema}".marker (value integer NOT NULL)'
+        )
+        await observer.execute(f'INSERT INTO "{schema}".marker VALUES (1)')
+        process = await _start_signal_child(receipt_path, run_token, schema)
         backend_pid = await _wait_for_marked_backend(observer, application_name)
         process.send_signal(signal.SIGTERM)
         await asyncio.wait_for(process.communicate(), timeout=10)
@@ -171,7 +179,7 @@ async def test_sigterm_cancels_sql_rolls_back_and_seals_receipt(tmp_path: Path) 
             f'SELECT value FROM "{schema}".marker'
         )
     finally:
-        if process.returncode is None:
+        if process is not None and process.returncode is None:
             process.kill()
             await process.wait()
         await observer.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

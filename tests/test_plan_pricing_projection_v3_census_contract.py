@@ -3,9 +3,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from copy import deepcopy
+
 import pytest
 
 from scripts.research import plan_pricing_projection_v3_census as census
+from scripts.research import plan_pricing_projection_v3_census_authority as authority
 from scripts.research import plan_pricing_projection_v3_census_contract as contract
 from scripts.research import (
     plan_pricing_projection_v3_census_diagnostics as diagnostics,
@@ -13,19 +18,52 @@ from scripts.research import (
 
 _RUNTIME = {
     "job_name": "census-job",
+    "pod_name": "census-pod",
     "pod_uid": "pod-uid",
     "image_digest": "sha256:" + "c" * 64,
+    "container_name": "census",
+    "identity_contract": "immutable-image-plus-source-overlay-v1",
+    "external_pod_image_id_attestation_required": True,
 }
 _SOURCE_SHA = "a" * 40
+_ENVELOPE_SHA = "b" * 64
+_COMMAND_SHA = "c" * 64
+_EXECUTABLE_SHA = "d" * 64
+
+
+def _runtime_attestation() -> dict:
+    return {
+        "contract": authority.CENSUS_RUNTIME_ATTESTATION_CONTRACT,
+        "job_name": _RUNTIME["job_name"],
+        "job_uid": "job-uid",
+        "pod_name": _RUNTIME["pod_name"],
+        "pod_uid": _RUNTIME["pod_uid"],
+        "pod_owner_job_name": _RUNTIME["job_name"],
+        "pod_owner_job_uid": "job-uid",
+        "container_name": _RUNTIME["container_name"],
+        "image_id": "docker-pullable://example@" + _RUNTIME["image_digest"],
+    }
+
+
+def _runtime_attestation_bytes() -> bytes:
+    serialized = json.dumps(
+        _runtime_attestation(), sort_keys=True, separators=(",", ":")
+    )
+    return f"{serialized}\n".encode()
+
+
+def _runtime_attestation_sha256() -> str:
+    return hashlib.sha256(_runtime_attestation_bytes()).hexdigest()
 
 
 def _successful_envelope(receipt_by_field: dict) -> dict:
     return {
-        "contract": diagnostics.CENSUS_ENVELOPE_CONTRACT,
+        "contract": authority.CENSUS_ENVELOPE_CONTRACT,
         "status": "complete",
         "exit_code": 0,
         "reviewed_source_sha": _SOURCE_SHA,
-        "envelope_script_sha256": "b" * 64,
+        "envelope_script_sha256": _ENVELOPE_SHA,
+        "expected_envelope_script_sha256": _ENVELOPE_SHA,
         "owner_token": "testowner1",
         "resource_uids": {
             "quota": "quota-uid",
@@ -34,15 +72,30 @@ def _successful_envelope(receipt_by_field: dict) -> dict:
             "lock_invocation": "lock-uid",
         },
         "prior_drain_mode": False,
-        "child_command_sha256": "c" * 64,
+        "child_command_sha256": _COMMAND_SHA,
+        "expected_child_command_sha256": _COMMAND_SHA,
+        "child_executable_sha256": _EXECUTABLE_SHA,
+        "expected_child_executable_sha256": _EXECUTABLE_SHA,
         "child_exit_code": 0,
         "census_job": receipt_by_field["runtime"]["job_name"],
-        "census_receipt_sha256": diagnostics.census_receipt_sha256(receipt_by_field),
+        "census_receipt_sha256": authority.census_receipt_sha256(receipt_by_field),
         "timed_out": False,
         "probe_verified": True,
         "quota_probe_verified": True,
         "pre_child_fence_verified": True,
         "post_child_fence_verified": True,
+        "capacity": {
+            "verified": True,
+            "host_available_memory_bytes": 2,
+            "minimum_host_available_memory_bytes": 1,
+            "host_swap_free_bytes": 2,
+            "minimum_host_swap_free_bytes": 1,
+            "postgresql_tablespace_path": "/data/postgresql",
+            "postgresql_tablespace_free_bytes": 2,
+            "minimum_postgresql_tablespace_free_bytes": 1,
+        },
+        "runtime_attestation": _runtime_attestation(),
+        "runtime_attestation_sha256": _runtime_attestation_sha256(),
         "cleanup": {
             "binding_removed": True,
             "policy_removed": True,
@@ -54,6 +107,21 @@ def _successful_envelope(receipt_by_field: dict) -> dict:
         "postgresql_boundary": (
             "Kubernetes QoS does not reserve or cap off-node PostgreSQL"
         ),
+    }
+
+
+def _authority() -> dict:
+    return {
+        "expected_envelope_script_sha256": _ENVELOPE_SHA,
+        "expected_child_command_sha256": _COMMAND_SHA,
+        "expected_child_executable_sha256": _EXECUTABLE_SHA,
+        "runtime_attestation": _runtime_attestation_bytes(),
+        "capacity": {
+            "minimum_host_available_memory_bytes": 1,
+            "minimum_host_swap_free_bytes": 1,
+            "postgresql_tablespace_path": "/data/postgresql",
+            "minimum_postgresql_tablespace_free_bytes": 1,
+        },
     }
 
 
@@ -115,42 +183,63 @@ def _accepted_inputs() -> tuple[dict, dict]:
     for field_name in ("membership_probe_rows", "member_cell_rows"):
         work_by_field[field_name] = {"total": 1, "maximum_per_code": 1}
     staged_by_field = _staged_counts()
-    return (
-        {
-            **_database_receipt(),
-            "contract": diagnostics.CENSUS_RECEIPT_CONTRACT,
-            "status": "complete",
-            "accepted": True,
-            "mode": "cardinality_census",
-            "cap_calibration_admissible": True,
-            "resource_proof_admissible": False,
-            "acceptance_authority": diagnostics.CENSUS_ACCEPTANCE_AUTHORITY,
-            "proof_scope": "row_count_limits_only",
-            "source_before": {"declared_git_head": _SOURCE_SHA},
-            "source_after": {"declared_git_head": _SOURCE_SHA},
-            "rollback_complete": True,
-            "temporary_relations_after_rollback": [],
-            "postflight": {"accepted": True},
-        },
-        {
-            "work": work_by_field,
-            "staged": staged_by_field,
-            "fixed_cap_gates": contract.fixed_cap_gates(work_by_field, staged_by_field),
-            "observed_work_limits": contract.observed_work_limits(work_by_field),
-        },
+    persistent_counts = dict.fromkeys(
+        contract.PROJECTION_RELATIONS,
+        0,
     )
+    measurement_by_field = {
+        "work": work_by_field,
+        "staged": staged_by_field,
+        "fixed_cap_gates": contract.fixed_cap_gates(work_by_field, staged_by_field),
+        "observed_work_limits": contract.observed_work_limits(work_by_field),
+        "persistent_counts_before": persistent_counts,
+    }
+    source_by_field = {
+        "declared_git_head": _SOURCE_SHA,
+        "harness_files": [
+            [authority.CENSUS_ENVELOPE_SCRIPT_PATH, _ENVELOPE_SHA],
+        ],
+    }
+    receipt_by_field = {
+        **_database_receipt(),
+        "contract": diagnostics.CENSUS_RECEIPT_CONTRACT,
+        "status": "provisional",
+        "accepted": False,
+        "mode": "cardinality_census",
+        "cap_calibration_admissible": False,
+        "resource_proof_admissible": False,
+        "acceptance_authority": diagnostics.CENSUS_ACCEPTANCE_AUTHORITY,
+        "proof_scope": "row_count_limits_only",
+        "source_before": source_by_field,
+        "source_after": source_by_field,
+        "rollback_complete": True,
+        "temporary_relations_after_rollback": [],
+        "postflight": {
+            "release_matches": True,
+            "provider_signature_matches": True,
+            "persistent_counts_match": True,
+            "persistent_counts_after": dict(persistent_counts),
+            "accepted": True,
+        },
+        "measurement": measurement_by_field,
+    }
+    return receipt_by_field, measurement_by_field
 
 
 def _is_accepted(
     receipt_by_field: dict,
     measurement_by_field: dict,
     envelope_by_field: dict | None = None,
+    authority_by_field: dict | None = None,
 ) -> bool:
-    return contract.is_accepted(
+    return authority.is_accepted(
         receipt_by_field,
-        measurement_by_field,
-        True,
-        envelope_by_field or _successful_envelope(receipt_by_field),
+        (
+            _successful_envelope(receipt_by_field)
+            if envelope_by_field is None
+            else envelope_by_field
+        ),
+        _authority() if authority_by_field is None else authority_by_field,
     )
 
 
@@ -160,58 +249,58 @@ def test_acceptance_admits_the_unmutated_baseline() -> None:
     assert _is_accepted(receipt_by_field, measurement_by_field)
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        lambda envelope: envelope.update(status="failed"),
-        lambda envelope: envelope.update(exit_code=True),
-        lambda envelope: envelope.update(child_exit_code=143),
-        lambda envelope: envelope.update(census_job="stale-job"),
-        lambda envelope: envelope.update(census_receipt_sha256="d" * 64),
-        lambda envelope: envelope.update(timed_out=True),
-        lambda envelope: envelope.update(post_child_fence_verified=False),
-        lambda envelope: envelope["cleanup"].update(complete=False),
-        lambda envelope: envelope.update(reviewed_source_sha="d" * 40),
-    ],
-)
-def test_acceptance_requires_the_successful_outer_envelope(mutation) -> None:
-    """Inner evidence is provisional until the outer child exit is accepted."""
+def test_successful_inner_candidate_remains_provisional() -> None:
+    receipt_by_field = {}
 
+    assert contract.seal_cardinality_census(receipt_by_field, True, "finished") == 0
+    assert receipt_by_field["status"] == "provisional"
+    assert receipt_by_field["accepted"] is False
+    assert receipt_by_field["cap_calibration_admissible"] is False
+
+
+def test_acceptance_binds_the_hashed_inner_measurement() -> None:
     receipt_by_field, measurement_by_field = _accepted_inputs()
-    envelope_by_field = _successful_envelope(receipt_by_field)
-    mutation(envelope_by_field)
-
-    assert not _is_accepted(
-        receipt_by_field,
-        measurement_by_field,
-        envelope_by_field,
-    )
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        lambda receipt: receipt.pop("contract"),
-        lambda receipt: receipt.update(contract="unknown"),
-    ],
-)
-def test_acceptance_requires_the_exact_inner_contract(mutation) -> None:
-    receipt_by_field, measurement_by_field = _accepted_inputs()
-    mutation(receipt_by_field)
+    receipt_by_field["measurement"] = {}
 
     assert not _is_accepted(receipt_by_field, measurement_by_field)
 
 
-def test_acceptance_rejects_a_stale_same_source_inner_receipt() -> None:
+def test_acceptance_validates_the_embedded_measurement_not_an_equal_detached_copy() -> (
+    None
+):
     receipt_by_field, measurement_by_field = _accepted_inputs()
-    envelope_by_field = _successful_envelope(receipt_by_field)
-    receipt_by_field["finished_at"] = "later"
+    detached_measurement = deepcopy(measurement_by_field)
+    receipt_by_field["measurement"]["work"]["membership_probe_rows"]["total"] = True
 
-    assert not _is_accepted(
-        receipt_by_field,
-        measurement_by_field,
-        envelope_by_field,
-    )
+    assert not _is_accepted(receipt_by_field, detached_measurement)
+
+
+def test_acceptance_derives_source_equality_from_the_hashed_receipt() -> None:
+    receipt_by_field, measurement_by_field = _accepted_inputs()
+    receipt_by_field["source_after"] = {
+        **receipt_by_field["source_after"],
+        "unexpected": True,
+    }
+
+    assert not _is_accepted(receipt_by_field, measurement_by_field)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda postflight: postflight.pop("release_matches"),
+        lambda postflight: postflight.update(release_matches=False),
+        lambda postflight: postflight.update(persistent_counts_match=False),
+        lambda postflight: postflight["persistent_counts_after"].update(
+            plan_pricing_card=1
+        ),
+    ],
+)
+def test_acceptance_recomputes_the_complete_postflight_contract(mutation) -> None:
+    receipt_by_field, measurement_by_field = _accepted_inputs()
+    mutation(receipt_by_field["postflight"])
+
+    assert not _is_accepted(receipt_by_field, measurement_by_field)
 
 
 @pytest.mark.parametrize(

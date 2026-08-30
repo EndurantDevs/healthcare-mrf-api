@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
-import os
 from pathlib import Path
-import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/research/run_plan_pricing_projection_v3_census_envelope.sh"
@@ -14,15 +11,10 @@ OWNER = "testowner1"
 _FAKE_COMMAND = r"""#!/usr/bin/env python3
 from __future__ import annotations
 
-import json
-import os
+import json, os, signal, sys, time
 from pathlib import Path
-import signal
-import sys
-name = Path(sys.argv[0]).name
-args = sys.argv[1:]
-state = Path(os.environ["FAKE_STATE"])
-events = state / "events"
+name = Path(sys.argv[0]).name; args = sys.argv[1:]
+state = Path(os.environ["FAKE_STATE"]); events = state / "events"
 def event(value: str) -> None:
     with events.open("a", encoding="utf-8") as target:
         target.write(value + "\n")
@@ -30,9 +22,8 @@ def raise_exit(code: int) -> None: raise SystemExit(code)
 def resource_path(kind: str) -> Path: return state / kind
 if name == "hostname": print("ns1033171")
 elif name == "git":
-    if "rev-parse" in args:
-        print(os.environ["FAKE_SOURCE_SHA"])
-elif name == "sleep": pass
+    if "rev-parse" in args: print(os.environ["FAKE_SOURCE_SHA"])
+elif name == "sleep": time.sleep(min(float(args[0]), 0.01))
 elif name == "systemd-run":
     event("lock_create")
     resource_path("lock").touch()
@@ -68,12 +59,48 @@ elif name == "timeout":
         if not argument.startswith("-")
     )
     command = Path(args[command_index]).name
+    if command == "python3" and args[command_index + 1] == "-":
+        observed = tuple(
+            int(os.environ.get(field, "2"))
+            for field in (
+                "FAKE_HOST_AVAILABLE_MEMORY_BYTES",
+                "FAKE_HOST_SWAP_FREE_BYTES",
+                "FAKE_POSTGRESQL_TABLESPACE_FREE_BYTES",
+            )
+        )
+        minimums = tuple(int(value) for value in args[-3:])
+        event("capacity")
+        if os.environ.get("FAKE_REPLACE_CHILD_DURING_CAPACITY") == "1":
+            child = Path(os.environ["FAKE_CHILD_EXECUTABLE"])
+            child.write_text("#!/bin/sh\nexit 0\n")
+            child.chmod(0o755)
+            event("child_executable_replaced")
+        if any(value < minimum for value, minimum in zip(observed, minimums)):
+            raise SystemExit("host or PostgreSQL capacity is below the reviewed minimum")
+        print(*observed)
+        raise SystemExit(0)
     os.execvp(args[command_index], args[command_index:])
 elif name == "census-child":
     event("child")
     if args[:1] != ["--receipt"]: raise SystemExit("missing census receipt path")
-    Path(args[1]).write_text(json.dumps({"accepted": True}, indent=2, sort_keys=True) + "\n")
+    receipt_path = Path(args[1])
+    receipt_path.write_text(json.dumps({"accepted": False, "status": "provisional"}, indent=2, sort_keys=True) + "\n")
+    attestation_path = receipt_path.with_name("runtime-attestation.json")
+    attestation_mode = os.environ.get("FAKE_ATTESTATION_MODE", "valid")
+    if attestation_mode == "symlink":
+        target = attestation_path.with_suffix(".target")
+        target.write_text("child-controlled\n"); attestation_path.symlink_to(target)
+        while True: time.sleep(0.1)
+    elif attestation_mode == "missing":
+        time.sleep(0.1)
+        raise SystemExit(1)
+    elif attestation_mode not in {"valid", "malformed", "bare-digest", "empty-image", "job-replaced", "pod-replaced"}:
+        raise SystemExit("unexpected attestation mode")
+    while not attestation_path.exists():
+        time.sleep(0.01)
     args = args[2:]
+    if os.environ.get("FAKE_CHILD_MODE") == "mutate-attestation":
+        mutated = json.loads(attestation_path.read_text()); mutated["job_uid"] = "mutated-job-uid"; mutated["pod_owner_job_uid"] = "mutated-job-uid"; attestation_path.write_text(json.dumps(mutated)); raise SystemExit(0)
     if os.environ.get("FAKE_CHILD_MODE") == "exit7":
         raise SystemExit(7)
     if os.environ.get("FAKE_CHILD_MODE") == "native124":
@@ -97,10 +124,9 @@ elif name == "census-child":
         def finish(number, _frame):
             event("child_signal_" + str(number))
             raise SystemExit(128 + number)
-        signal.signal(signal.SIGTERM, finish)
-        signal.signal(signal.SIGINT, finish)
-        while True:
-            signal.pause()
+        signal.signal(signal.SIGTERM, finish); signal.signal(signal.SIGINT, finish)
+        event("child_ready")
+        while True: signal.pause()
 elif name == "k3s":
     if not args or args.pop(0) != "kubectl":
         raise SystemExit("expected kubectl")
@@ -131,11 +157,28 @@ elif name == "k3s":
         drain_path = resource_path("drain")
         current = drain_path.read_text().strip() if drain_path.exists() else "false"
         if desired in {"true", "false"}:
+            restore_error = os.environ.get("FAKE_DRAIN_RESTORE_ERROR")
+            after_child = events.exists() and "child" in events.read_text()
+            if desired == "false" and after_child and restore_error == "before":
+                event("drain_restore_timeout_before")
+                raise SystemExit(75)
             current = desired
             drain_path.write_text(current)
             event("drain_set_" + current)
+            if desired == "false" and after_child and restore_error == "after":
+                event("drain_restore_timeout_after")
+                raise SystemExit(75)
         else:
             event("drain_read")
+            final_replace_marker = resource_path("child-replaced-final-fence")
+            if (os.environ.get("FAKE_REPLACE_CHILD_DURING_FINAL_FENCE") == "1"
+                    and events.exists() and "capacity" in events.read_text()
+                    and "child" not in events.read_text()
+                    and not final_replace_marker.exists()):
+                child = Path(os.environ["FAKE_CHILD_EXECUTABLE"])
+                child.write_text("#!/bin/sh\nexit 0\n"); child.chmod(0o755)
+                final_replace_marker.touch()
+                event("child_executable_replaced_during_final_fence")
         print(current)
     elif operation == "create":
         manifest = sys.stdin.read()
@@ -144,6 +187,7 @@ elif name == "k3s":
                 if os.environ.get("FAKE_QUOTA_PROBE_ALLOWED") == "1":
                     event("quota_probe_allowed")
                     print("pod/quota-probe created (server dry run)")
+                    raise SystemExit(0)
                 else:
                     event("quota_probe_denied")
                     print("exceeded quota: " + os.environ["FAKE_QUOTA"], file=sys.stderr)
@@ -278,6 +322,17 @@ elif name == "k3s":
                 print('{"items":[{"kind":"Pod","status":{"phase":"Running"}}]}')
             else:
                 print('{"items":[]}')
+        elif kind == "jobs,pods,configmaps":
+            residue = os.environ.get("FAKE_PREEXISTING_CENSUS_KIND")
+            if (
+                os.environ.get("FAKE_CENSUS_RESIDUE_AFTER_CHILD_KIND")
+                and events.exists()
+                and "child" in events.read_text()
+            ):
+                residue = os.environ["FAKE_CENSUS_RESIDUE_AFTER_CHILD_KIND"]
+            if resource_path("pod").exists():
+                residue = "pod"
+            print(f"{residue}/other-census-resource" if residue else "")
         elif kind == "deployment" and args[2] == os.environ["FAKE_IMPORT_SCHEDULER"]:
             scheduler_drift = (
                 os.environ.get("FAKE_SCHEDULER_DRIFT_AFTER_CHILD") == "1"
@@ -291,19 +346,80 @@ elif name == "k3s":
                 and args[2] == "seed-import-nodes"
                 and os.environ.get("FAKE_SEED_REAPPEAR") == "cleanup"
                 and events.exists()
-                and "policy_delete" in events.read_text()
             ):
-                print("job/seed-import-nodes")
+                after_child = "child" in events.read_text()
+                counter = resource_path("seed-cleanup-reads")
+                count = int(counter.read_text()) + 1 if counter.exists() else 1
+                if after_child:
+                    counter.write_text(str(count))
+                if after_child and count >= 3:
+                    print("job/seed-import-nodes")
+            elif (
+                kind == "job"
+                and args[2] == "plan-pricing-v3-census-test"
+                and args[-1] == "json"
+                and events.exists()
+                and "child" in events.read_text()
+            ):
+                job_reads = resource_path("attestation-job-reads")
+                read_count = int(job_reads.read_text()) + 1 if job_reads.exists() else 1
+                job_reads.write_text(str(read_count))
+                job_uid = "job-uid"
+                if os.environ.get("FAKE_ATTESTATION_MODE") == "job-replaced" \
+                        and read_count > 1:
+                    job_uid = "replacement-job-uid"
+                print(json.dumps({
+                    "apiVersion": "batch/v1", "kind": "Job",
+                    "metadata": {"name": args[2], "namespace": namespace, "uid": job_uid},
+                }))
             elif resource_path(kind).exists():
                 print(f"{kind}/{args[2]}")
         elif kind == "pods":
-            if (
+            controller_selector = next((argument for argument in args if argument.startswith(
+                "batch.kubernetes.io/controller-uid=")), None)
+            if controller_selector is not None:
+                mode = os.environ.get("FAKE_ATTESTATION_MODE", "valid")
+                pod_reads = resource_path("attestation-pod-reads")
+                read_count = int(pod_reads.read_text()) + 1 if pod_reads.exists() else 1
+                pod_reads.write_text(str(read_count))
+                image_id = "docker-pullable://example@sha256:" + "c" * 64
+                owner_uid = "job-uid"
+                pod_uid = "pod-uid"
+                if mode == "bare-digest":
+                    image_id = "sha256:" + "c" * 64
+                elif mode == "empty-image":
+                    image_id = ""
+                elif mode == "malformed":
+                    owner_uid = "other-job-uid"
+                elif mode == "pod-replaced" and read_count > 1:
+                    pod_uid = "replacement-pod-uid"
+                items = [] if mode == "missing" else [{
+                    "metadata": {
+                        "name": "plan-pricing-v3-census-test-pod",
+                        "namespace": namespace, "uid": pod_uid,
+                        "ownerReferences": [{
+                            "apiVersion": "batch/v1", "kind": "Job",
+                            "name": "plan-pricing-v3-census-test",
+                            "uid": owner_uid, "controller": True,
+                            "blockOwnerDeletion": True,
+                        }],
+                    },
+                    "status": {"containerStatuses": [{"name": "census", "imageID": image_id}]},
+                }]
+                print(json.dumps({"items": items}))
+            elif (
                 resource_path("pod").exists()
                 or os.environ.get("FAKE_PREEXISTING_CENSUS_POD") == "1"
             ):
                 print("pod/plan-pricing-v3-census-test-orphan")
         elif kind == "pod":
-            pass
+            if (
+                args[2] == "plan-pricing-v3-census-test-pod"
+                and os.environ.get("FAKE_UNLABELED_ATTESTED_POD_AFTER_CHILD") == "1"
+                and events.exists()
+                and "child" in events.read_text()
+            ):
+                print("pod/plan-pricing-v3-census-test-pod")
         else:
             file_kind = {
                 "resourcequota": "quota",
@@ -331,58 +447,39 @@ elif name == "k3s":
             elif args[-1] == "json":
                 owner = os.environ["FAKE_OWNER"]
                 uid = file_kind + "-uid"
+                metadata = {"name": args[2], "uid": uid,
+                            "labels": {"healthporta.com/task-owner": owner}}
                 if file_kind == "quota":
-                    payload = {
-                        "metadata": {"name": args[2], "namespace": namespace,
-                                     "uid": uid,
-                                     "labels": {"healthporta.com/task-owner": owner}},
-                        "spec": {"hard": {"pods": "0"}},
-                    }
+                    metadata["namespace"] = namespace
+                    payload = {"metadata": metadata,
+                               "spec": {"hard": {"pods": "0"}}}
                 elif file_kind == "policy":
                     payload = {
-                        "metadata": {"name": args[2], "uid": uid,
-                                     "labels": {"healthporta.com/task-owner": owner}},
+                        "metadata": metadata,
                         "spec": {
                             "failurePolicy": "Fail",
-                            "matchConstraints": {
-                                "matchPolicy": "Exact",
-                                "resourceRules": [{
-                                    "apiGroups": ["batch"],
-                                    "apiVersions": ["v1"],
-                                    "operations": ["CREATE"],
-                                    "resources": ["jobs"],
-                                    "scope": "Namespaced",
-                                }],
-                            },
+                            "matchConstraints": {"matchPolicy": "Exact",
+                                "resourceRules": [{"apiGroups": ["batch"],
+                                    "apiVersions": ["v1"], "operations": ["CREATE"],
+                                    "resources": ["jobs"], "scope": "Namespaced"}]},
                             "matchConditions": [{
                                 "name": "exact-engine-worker-launcher",
-                                "expression": (
-                                    "request.namespace == 'healthporta-dev' && "
-                                    "request.userInfo.username == "
-                                    "'system:serviceaccount:healthporta-dev:"
-                                    "engine-worker-launcher'"
-                                ),
-                            }],
+                                "expression": "request.namespace == 'healthporta-dev' && "
+                                    "request.userInfo.username == 'system:serviceaccount:"
+                                    "healthporta-dev:engine-worker-launcher'"}],
                             "validations": [{
-                                "expression": "false",
-                                "message": os.environ["FAKE_DENIAL_MARKER"],
-                                "reason": "Forbidden",
-                            }],
+                                "expression": "false", "reason": "Forbidden",
+                                "message": os.environ["FAKE_DENIAL_MARKER"]}],
                         },
                     }
                 else:
                     payload = {
-                        "metadata": {"name": args[2], "uid": uid,
-                                     "labels": {"healthporta.com/task-owner": owner}},
+                        "metadata": metadata,
                         "spec": {"policyName": os.environ["FAKE_POLICY"],
-                                 "validationActions": ["Deny"],
-                                 "matchResources": {
-                                     "matchPolicy": "Exact",
-                                     "namespaceSelector": {"matchLabels": {
-                                         "kubernetes.io/metadata.name":
-                                             "healthporta-dev"
-                                     }},
-                                 }},
+                            "validationActions": ["Deny"], "matchResources": {
+                                "matchPolicy": "Exact", "namespaceSelector": {
+                                    "matchLabels": {"kubernetes.io/metadata.name":
+                                                    "healthporta-dev"}}}},
                     }
                 if (
                     os.environ.get("FAKE_SPEC_DRIFT") == file_kind
@@ -401,99 +498,3 @@ elif name == "k3s":
 else:
     raise SystemExit("unexpected fake command: " + name)
 """
-
-
-def _arguments(state_root: Path, repo: Path) -> list[str]:
-    receipt_path = str(state_root / "run/census-receipt.json")
-    return [
-        "--owner-token",
-        OWNER,
-        "--state-dir",
-        str(state_root / "run"),
-        "--source-sha",
-        SOURCE_SHA,
-        "--repo-dir",
-        str(repo),
-        "--deadline-seconds",
-        "900",
-        "--census-job",
-        "plan-pricing-v3-census-test",
-        "--census-configmap",
-        "plan-pricing-v3-census-src-test",
-        "--census-receipt",
-        receipt_path,
-        "--drain-deployment",
-        "control-api",
-        "--import-scheduler-deployment",
-        "control-scheduler",
-        "--import-node-id",
-        "plan-node",
-        "--import-token-env",
-        "TEST_IMPORT_TOKEN",
-        "--",
-        "census-child",
-        "--receipt",
-        receipt_path,
-    ]
-
-
-def _fake_environment(
-    tmp_path: Path, **overrides: str
-) -> tuple[dict[str, str], Path, Path]:
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    dispatcher = fake_bin / "fake-command"
-    dispatcher.write_text(_FAKE_COMMAND, encoding="utf-8")
-    dispatcher.chmod(0o755)
-    for command in (
-        "census-child",
-        "git",
-        "hostname",
-        "k3s",
-        "setsid",
-        "sleep",
-        "systemctl",
-        "systemd-run",
-        "timeout",
-    ):
-        (fake_bin / command).symlink_to(dispatcher)
-    fake_state = tmp_path / "fake-state"
-    fake_state.mkdir()
-    state_root = tmp_path / "envelopes"
-    state_root.mkdir()
-    checkout = tmp_path / "repo"
-    checkout.mkdir()
-    env_by_name = {
-        **os.environ,
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "FAKE_DENIAL_MARKER": f"hp-pv3-census-deny-{OWNER}",
-        "FAKE_IMPORT_NODE_ID": "plan-node",
-        "FAKE_IMPORT_SCHEDULER": "control-scheduler",
-        "FAKE_IMPORT_TOKEN_ENV": "TEST_IMPORT_TOKEN",
-        "FAKE_OWNER": OWNER,
-        "FAKE_POLICY": f"hp-pv3-census-{OWNER}.healthporta.com",
-        "FAKE_QUOTA": f"hp-pv3-census-{OWNER}",
-        "FAKE_SOURCE_SHA": SOURCE_SHA,
-        "FAKE_STATE": str(fake_state),
-        "HLTHPRT_PLAN_PRICING_V3_CENSUS_ENVELOPE_RUN": "run",
-        "HLTHPRT_PLAN_PRICING_V3_CENSUS_STATE_ROOT": str(state_root),
-        **overrides,
-    }
-    return env_by_name, state_root, checkout
-
-
-def _receipt(state_root) -> dict:
-    return json.loads((state_root / "run/envelope-receipt.json").read_text())
-
-
-def _run_envelope(tmp_path, **overrides) -> tuple[subprocess.CompletedProcess, Path]:
-    env_by_name, state_root, checkout = _fake_environment(tmp_path, **overrides)
-    result = subprocess.run(
-        ["/bin/bash", str(SCRIPT), "run", *_arguments(state_root, checkout)],
-        env=env_by_name,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    return result, state_root
