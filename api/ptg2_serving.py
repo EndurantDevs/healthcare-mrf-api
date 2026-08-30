@@ -6127,7 +6127,6 @@ async def _shared_forward_entries_for_code_rows(
             int(code_key),
             provider_set_keys=normalized_provider_set_keys,
             provider_counts_by_key=provider_counts_by_key,
-            scan_budget=None,
         )
         forward_entries.extend(code_entries)
     return forward_entries
