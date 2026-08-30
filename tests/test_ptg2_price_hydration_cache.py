@@ -126,7 +126,7 @@ async def test_bounded_price_hydration_rejects_all_cache_overflow_without_decode
         decode_missing,
     )
 
-    with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="atom limit"):
+    with pytest.raises(ptg2_serving.ManifestReadLimitError, match="atom limit"):
         await ptg2_serving._version_three_bounded_prices_by_key(
             object(),
             tables,
@@ -167,7 +167,7 @@ async def test_bounded_price_hydration_rejects_mixed_overflow_before_decode_or_a
         atom_reader,
     )
 
-    with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="atom limit"):
+    with pytest.raises(ptg2_serving.ManifestReadLimitError, match="atom limit"):
         await ptg2_serving._version_three_bounded_prices_by_key(
             object(),
             tables,

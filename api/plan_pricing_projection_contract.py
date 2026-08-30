@@ -19,7 +19,8 @@ from api.code_systems import (
 )
 
 
-PROJECTION_CONTRACT = "plan_pricing_card_v2"
+LEGACY_PROJECTION_CONTRACT = "plan_pricing_card_v2"
+PROJECTION_CONTRACT = "plan_pricing_factorized_v3"
 
 
 def _projection_schema() -> str:
@@ -56,6 +57,7 @@ PROVIDER_RELATIONS = (
     "npi_taxonomy",
     "nucc_taxonomy",
     "entity_address_unified",
+    "geo_zip_lookup",
     "entity_address_geo_assurance_state",
 )
 

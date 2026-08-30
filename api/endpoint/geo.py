@@ -592,39 +592,8 @@ async def get_places_by_zip(request, zip_code):
     )
 
 
-@blueprint.get('/states', name='list_geo_states')
-async def list_geo_states(request):
-    """List paginated state aggregates with each state's most populous ZIPs."""
-
-    session = _get_session(request)
-    args = request.args
-
-    sort = (args.get("sort") or "population").lower()
-    if sort not in {"population", "zip_count", "state"}:
-        raise InvalidUsage("sort must be one of: population, zip_count, state")
-    order = (args.get("order") or "desc").lower()
-    if order not in {"asc", "desc"}:
-        raise InvalidUsage("order must be 'asc' or 'desc'")
-    # Explicit access keeps route/query introspection in sync with OpenAPI.
-    args.get("limit")
-
-    pagination = parse_pagination(
-        args,
-        default_limit=50,
-        max_limit=100,
-        default_page=1,
-        allow_offset=True,
-        allow_start=True,
-        allow_page_size=True,
-    )
-    limit = pagination.limit
-    offset = pagination.offset
-
-    top_zip_param = args.get("top_zip_limit")
-    try:
-        top_zip_limit = max(1, min(int(top_zip_param), 10)) if top_zip_param else 5
-    except (TypeError, ValueError) as exc:
-        raise InvalidUsage("top_zip_limit must be an integer") from exc
+def _state_aggregate_statements(sort: str, order: str):
+    """Build the state page and count statements."""
 
     state_col = geo_zip_table.c.state.label("state")
     state_name_col = func.max(geo_zip_table.c.state_name).label("state_name")
@@ -661,10 +630,11 @@ async def list_geo_states(request):
     total_states_stmt = select(func.count()).select_from(
         select(geo_zip_table.c.state).group_by(geo_zip_table.c.state).subquery()
     )
-    total_states_result = await session.execute(total_states_stmt)
-    total_states = int(total_states_result.scalar() or 0)
+    return state_stmt, total_states_stmt
 
-    state_stmt = state_stmt.offset(offset).limit(limit)
+
+def _top_zip_statement(top_zip_limit: int):
+    """Build the bounded top-ZIP statement for every state."""
 
     population_expr = func.coalesce(geo_zip_table.c.population, 0)
     rank_expr = func.row_number().over(
@@ -683,7 +653,7 @@ async def list_geo_states(request):
         )
     ).subquery()
 
-    top_zip_stmt = (
+    return (
         select(
             top_zip_subquery.c.state,
             top_zip_subquery.c.zip_code,
@@ -696,8 +666,9 @@ async def list_geo_states(request):
         .order_by(top_zip_subquery.c.state.asc(), top_zip_subquery.c.population.desc())
     )
 
-    state_rows = (await session.execute(state_stmt)).all()
-    top_zip_rows = (await session.execute(top_zip_stmt)).all()
+
+def _serialize_state_items(state_rows, top_zip_rows):
+    """Attach each state's bounded top-ZIP rows to its aggregate."""
 
     zip_map = {}
     for top_zip_row in top_zip_rows:
@@ -731,15 +702,56 @@ async def list_geo_states(request):
                 "top_zips": zip_map.get(state_key, []),
             }
         )
+    return state_items
+
+
+@blueprint.get('/states', name='list_geo_states')
+async def list_geo_states(request):
+    """List paginated state aggregates with each state's most populous ZIPs."""
+
+    session = _get_session(request)
+    args = request.args
+    sort = (args.get("sort") or "population").lower()
+    if sort not in {"population", "zip_count", "state"}:
+        raise InvalidUsage("sort must be one of: population, zip_count, state")
+    order = (args.get("order") or "desc").lower()
+    if order not in {"asc", "desc"}:
+        raise InvalidUsage("order must be 'asc' or 'desc'")
+    # Explicit access keeps route/query introspection in sync with OpenAPI.
+    args.get("limit")
+    pagination = parse_pagination(
+        args,
+        default_limit=50,
+        max_limit=100,
+        default_page=1,
+        allow_offset=True,
+        allow_start=True,
+        allow_page_size=True,
+    )
+    top_zip_param = args.get("top_zip_limit")
+    try:
+        top_zip_limit = max(1, min(int(top_zip_param), 10)) if top_zip_param else 5
+    except (TypeError, ValueError) as exc:
+        raise InvalidUsage("top_zip_limit must be an integer") from exc
+
+    state_stmt, total_states_stmt = _state_aggregate_statements(sort, order)
+    total_states_result = await session.execute(total_states_stmt)
+    total_states = int(total_states_result.scalar() or 0)
+    state_rows = (
+        await session.execute(
+            state_stmt.offset(pagination.offset).limit(pagination.limit)
+        )
+    ).all()
+    top_zip_rows = (await session.execute(_top_zip_statement(top_zip_limit))).all()
 
     return response.json(
         {
             "generated": datetime.utcnow().isoformat(),
             "total_states": total_states,
             "page": pagination.page,
-            "limit": limit,
-            "offset": offset,
-            "states": state_items,
+            "limit": pagination.limit,
+            "offset": pagination.offset,
+            "states": _serialize_state_items(state_rows, top_zip_rows),
         }
     )
 

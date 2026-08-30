@@ -321,7 +321,7 @@ async def test_sealed_layout_must_exist(monkeypatch):
 
     monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", no_rows)
     binding = projection_source.BindingProjection(
-        {}, SimpleNamespace(network_names=[]), {}
+        {}, SimpleNamespace(network_names=[]), {}, 0
     )
     assert await materialize.project_code(
         object(), PROJECTION_ID, ("HCPCS", "G0439"), [binding], SimpleNamespace()

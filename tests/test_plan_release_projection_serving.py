@@ -17,7 +17,15 @@ def test_projection_only_release_resolution_skips_snapshot_readiness(
     monkeypatch,
 ):
     projection_id = "f" * 64
-    session = _Session([_binding_row(pricing_projection_id=projection_id)])
+    projection_contract = "plan_pricing_factorized_v3"
+    session = _Session(
+        [
+            _binding_row(
+                pricing_projection_id=projection_id,
+                pricing_projection_contract=projection_contract,
+            )
+        ]
+    )
 
     async def fail_readiness(*_args, **_kwargs):
         raise AssertionError("the immutable projection does not read PTG tables")
@@ -38,11 +46,15 @@ def test_projection_only_release_resolution_skips_snapshot_readiness(
 
     assert selection is not None
     assert selection.pricing_projection_id == projection_id
+    assert selection.pricing_projection_contract == projection_contract
     assert selection._validated_serving_tables == ()
     sql = session.calls[-1][0]
     assert "plan_pricing_projection_candidate" in sql
     assert "revision.binding_set_digest" in sql
     assert "pricing_projection.content_digest" in sql
+    assert "pricing_projection.contract_version" in sql
+    assert "THEN pricing_projection.contract_version" in sql
+    assert "AS pricing_projection_contract" in sql
 
 
 def test_guard_release_resolution_never_reads_projection_metadata():
@@ -87,4 +99,5 @@ def test_release_resolution_without_projection_relation_keeps_full_path(
     assert selection.pricing_projection_id is None
     release_sql = session.calls[-1][0]
     assert "NULL::varchar(64) AS pricing_projection_id" in release_sql
+    assert "NULL::varchar(64) AS pricing_projection_contract" in release_sql
     assert "plan_pricing_projection_candidate" not in release_sql

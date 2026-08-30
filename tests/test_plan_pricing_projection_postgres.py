@@ -15,6 +15,7 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from api import plan_pricing_projection_contract as projection_contract
 
 asyncpg = pytest.importorskip("asyncpg")
 
@@ -26,8 +27,6 @@ MIGRATION_PATH = (
     / "versions"
     / "20260825150000_plan_pricing_card_projection.py"
 )
-
-
 def _load_projection_migration(label: str):
     module_spec = importlib.util.spec_from_file_location(
         f"plan_pricing_projection_migration_{label}",
@@ -307,6 +306,60 @@ async def test_ready_seal_serializes_against_child_writes(monkeypatch):
             if not connection.is_closed():
                 await connection.close()
         await admin.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_generation_lock_blocks_zip_relation_replacement(
+    monkeypatch,
+):
+    dsn = os.getenv(POSTGRES_DSN_ENV)
+    if not dsn:
+        pytest.skip(f"set {POSTGRES_DSN_ENV} for the PostgreSQL proof")
+
+    admin = await asyncpg.connect(dsn)
+    database_name = await admin.fetchval("SELECT current_database()")
+    if TEST_DATABASE_PATTERN.search(str(database_name)) is None:
+        await admin.close()
+        pytest.fail(f"{POSTGRES_DSN_ENV} must target an explicit test database")
+    schema = f"plan_pricing_provider_lock_{uuid.uuid4().hex[:12]}"
+    quoted_schema = f'"{schema}"'
+    async_engine = create_async_engine(_sqlalchemy_async_dsn(dsn))
+    replacement = await asyncpg.connect(dsn)
+    replacement_task = None
+    try:
+        await admin.execute(f"CREATE SCHEMA {quoted_schema}")
+        for relation in projection_contract.PROVIDER_RELATIONS:
+            await admin.execute(
+                f'CREATE TABLE {quoted_schema}."{relation}" (value integer)'
+            )
+        monkeypatch.setattr(projection_contract, "SCHEMA", schema)
+        monkeypatch.setattr(
+            projection_contract.geo_projection,
+            "projection_dependency_lock_sql",
+            lambda _schema: "SELECT 1",
+        )
+
+        async with async_engine.connect() as lock_connection:
+            transaction = await lock_connection.begin()
+            await projection_contract.lock_provider_generation(lock_connection)
+            replacement_task = asyncio.create_task(
+                replacement.execute(
+                    f"ALTER TABLE {quoted_schema}.geo_zip_lookup "
+                    "ADD COLUMN replacement_marker integer"
+                )
+            )
+            await asyncio.sleep(0.05)
+            assert replacement_task.done() is False
+            await transaction.rollback()
+            await asyncio.wait_for(replacement_task, timeout=2)
+    finally:
+        if replacement_task is not None and not replacement_task.done():
+            replacement_task.cancel()
+            await asyncio.gather(replacement_task, return_exceptions=True)
+        await replacement.close()
+        await async_engine.dispose()
+        await admin.execute(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
         await admin.close()
 
 

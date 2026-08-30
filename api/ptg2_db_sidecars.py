@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import re
 import zlib
 from array import array
 from collections.abc import Sized
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import AbstractSet, Any, Callable, Iterable, Mapping
 
@@ -34,6 +35,13 @@ from api.ptg2_shared_blocks import (
     PTG2_SHARED_PROJECTION_GENERATIONS,
     PTG2SharedBlockError,
     SharedGraphReadLimitError,
+    SharedMappingReadLimitError,
+    _SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES,
+    _SHARED_MAPPING_RECORD_RETAINED_BYTES,
+    _SharedMappingAccumulator,
+    _require_complete_shared_mapping,
+    _shared_block_read_request,
+    _stream_shared_mapping_records,
     claim_shared_block_processing,
     claim_shared_logical_payload_processing,
     decode_dense_source_header,
@@ -47,8 +55,8 @@ from api.ptg2_shared_blocks import (
 )
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_manifest_artifacts import (
-    PTG2ManifestArtifactError,
     ManifestReadLimitError,
+    PTG2ManifestArtifactError,
 )
 from process.ptg_parts.ptg2_v4_finalizer_maps import (
     FinalizerMapError,
@@ -75,6 +83,24 @@ _FORWARD_OCCURRENCE_BATCH_FROZEN_ROW_RETAINED_BYTES = 8
 _FORWARD_FANOUT_ROW_RETAINED_BYTES = 288
 _FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES = (
     _FORWARD_FANOUT_ROW_RETAINED_BYTES
+)
+# The compact logical-block index and one transient mapping read share the
+# existing 64 MiB price-membership envelope. The per-block allowance covers
+# both persistent dictionaries, compact digests, and one incoming identity.
+PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES_PER_BLOCK = 512
+MAX_PRICE_MEMBERSHIP_ALIAS_RETAINED_BYTES = (
+    _SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES
+)
+MAX_PRICE_MEMBERSHIP_CACHED_BLOCKS = (
+    MAX_PRICE_MEMBERSHIP_ALIAS_RETAINED_BYTES
+    // PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES_PER_BLOCK
+)
+MAX_PRICE_MEMBERSHIP_CACHED_FRAGMENTS = 131_072
+PRICE_MEMBERSHIP_TRANSIENT_BYTES_PER_FRAGMENT = (
+    3 * _SHARED_MAPPING_RECORD_RETAINED_BYTES
+)
+_PRICE_MEMBERSHIP_PHYSICAL_IDENTITY_DOMAIN = (
+    b"healthporta.ptg2.price-membership-physical.v1\x00"
 )
 # The coordinate index retains a resize-safe dict base, then one dict slot,
 # three-slot key tuple, and empty list for every logical fragment coordinate.
@@ -2257,6 +2283,243 @@ def _forward_prefix_rank(
     )
 
 
+_RetainedForwardPrefixOccurrence = tuple[
+    tuple[int, int, int, int],
+    int,
+    int,
+    int,
+    int,
+]
+
+
+@dataclass
+class _ForwardPrefixCollector:
+    code_key: int
+    provider_filter: set[int] | None
+    source_count: int | None
+    price_item_count: int
+    provider_shard_span: int | None
+    descending: bool
+    limit: int
+    expected_block_keys: set[int]
+    retained_occurrences: list[_RetainedForwardPrefixOccurrence] = field(
+        default_factory=list
+    )
+    occurrence_ordinal: int = 0
+    current_block_key: int | None = None
+    previous_provider_set_key: int | None = None
+    previous_occurrence: tuple[int, int] | None = None
+    provider_key_min: int = 0
+    provider_key_max: int = 0
+    observed_source_count: int | None = None
+    expected_fragment_no: int = 0
+
+    def retain(self, provider_set_key: int, price_key: int, source_key: int) -> None:
+        """Retain one occurrence only when it crosses the bounded heap."""
+
+        ordinal = self.occurrence_ordinal
+        self.occurrence_ordinal += 1
+        rank = _forward_prefix_rank(
+            provider_set_key,
+            price_key,
+            source_key,
+            descending=self.descending,
+        )
+        candidate = (
+            (-rank[0], -rank[1], -rank[2], -ordinal),
+            int(provider_set_key),
+            int(price_key),
+            int(source_key),
+            ordinal,
+        )
+        if len(self.retained_occurrences) < self.limit:
+            heapq.heappush(self.retained_occurrences, candidate)
+        elif candidate > self.retained_occurrences[0]:
+            heapq.heapreplace(self.retained_occurrences, candidate)
+
+    def _start_block(self, block_key: int) -> None:
+        if (
+            self.current_block_key is not None
+            and block_key <= self.current_block_key
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 forward shard blocks are not ordered"
+            )
+        self.current_block_key = block_key
+        self.expected_fragment_no = 0
+        self.previous_provider_set_key = None
+        self.previous_occurrence = None
+        self.provider_key_min, self.provider_key_max = (
+            _forward_provider_range_for_block(
+                self.code_key,
+                block_key,
+                self.provider_shard_span,
+            )
+        )
+
+    def consume(self, fragment: Any) -> None:
+        """Validate and visit one ordered streamed forward fragment."""
+
+        if fragment.block_key not in self.expected_block_keys:
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 forward stream returned an unexpected shard block"
+            )
+        if fragment.block_key != self.current_block_key:
+            self._start_block(fragment.block_key)
+        if fragment.fragment_no != self.expected_fragment_no:
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 provider-shard fragments are not contiguous"
+            )
+        self.expected_fragment_no += 1
+        fragment_cursor, fragment_source_count = _visit_serving_binary_by_code_record(
+            {
+                "block_no": fragment.fragment_no,
+                "entry_count": fragment.entry_count,
+                "_decoded_payload": fragment.payload,
+            },
+            provider_filter=self.provider_filter,
+            fragment_cursor=_ForwardFragmentCursor(
+                provider_set_key=self.previous_provider_set_key,
+                occurrence=self.previous_occurrence,
+            ),
+            validation=_ForwardFragmentValidation(
+                expected_source_count=self.source_count,
+                price_item_count=self.price_item_count,
+                provider_key_min=self.provider_key_min,
+                provider_key_max=self.provider_key_max,
+            ),
+            occurrence_consumer=self.retain,
+        )
+        self.previous_provider_set_key = fragment_cursor.provider_set_key
+        self.previous_occurrence = fragment_cursor.occurrence
+        if self.observed_source_count not in (None, fragment_source_count):
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 grouped by-code fragments disagree on source_count"
+            )
+        self.observed_source_count = fragment_source_count
+
+    def selected_keys(self) -> list[tuple[int, int, int]]:
+        """Return retained occurrences in the exact public response order."""
+
+        selected = sorted(
+            (
+                (provider_set_key, price_key, source_key, ordinal)
+                for (
+                    _heap_rank,
+                    provider_set_key,
+                    price_key,
+                    source_key,
+                    ordinal,
+                ) in self.retained_occurrences
+            ),
+            key=lambda item: (
+                _forward_prefix_rank(
+                    item[0], item[1], item[2], descending=self.descending
+                ),
+                item[3],
+            ),
+        )
+        return [
+            (provider_set_key, price_key, source_key)
+            for provider_set_key, price_key, source_key, _ordinal in selected
+        ]
+
+
+async def _collect_forward_prefix(
+    session: Any,
+    options: _ForwardLookupOptions,
+    block_keys: Iterable[int],
+    require_all: bool,
+    collector: _ForwardPrefixCollector,
+) -> None:
+    try:
+        async for fragment in stream_shared_blocks(
+            session,
+            schema_name=options.schema_name,
+            snapshot_key=_required_shared_snapshot_key(options.shared_snapshot_key),
+            object_kind=_SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND,
+            block_keys=block_keys,
+            require_all=require_all,
+        ):
+            if options.scan_budget is not None:
+                options.scan_budget.claim(len(fragment.payload))
+            collector.consume(fragment)
+    except PTG2SharedBlockError as exc:
+        raise PTG2ManifestArtifactError(str(exc)) from exc
+
+
+def _forward_response_rank(
+    row: PTG2ServingBinaryRow,
+    *,
+    descending: bool,
+) -> tuple[int, int, int, int]:
+    if row.price_key is None or row.provider_count is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 bounded forward row is missing a dense rank field"
+        )
+    return (
+        -row.price_key if descending else row.price_key,
+        row.provider_set_key,
+        row.source_key,
+        row.provider_count,
+    )
+
+
+def _forward_prefix_collector(
+    options: _ForwardLookupOptions,
+    code_key: int,
+    provider_filter: Iterable[int] | None,
+    block_keys: Iterable[int],
+    descending: bool,
+    limit: int,
+) -> _ForwardPrefixCollector:
+    return _ForwardPrefixCollector(
+        code_key=code_key,
+        provider_filter=(
+            set(provider_filter) if provider_filter is not None else None
+        ),
+        source_count=options.source_count,
+        price_item_count=_normalized_price_item_count(
+            options.price_dictionary_item_count
+        ),
+        provider_shard_span=options.provider_shard_span,
+        descending=descending,
+        limit=limit,
+        expected_block_keys=set(block_keys),
+    )
+
+
+async def _materialize_forward_prefix(
+    session: Any,
+    options: _ForwardLookupOptions,
+    code_key: int,
+    decoded_keys: list[tuple[int, int, int]],
+    descending: bool,
+) -> tuple[PTG2ServingBinaryRow, ...]:
+    provider_counts_by_key, price_ids_by_key = await _lookup_forward_references(
+        session,
+        options,
+        decoded_keys,
+    )
+    # provider_count is functionally dependent on provider_set_key, so adding it
+    # cannot change which occurrences crossed the bounded heap boundary.
+    response_rows = _materialize_forward_rows(
+        code_key,
+        decoded_keys,
+        provider_counts_by_key,
+        price_ids_by_key,
+    )
+    return tuple(
+        sorted(
+            response_rows,
+            key=lambda row: _forward_response_rank(
+                row,
+                descending=descending,
+            ),
+        )
+    )
+
+
 async def lookup_code_prefix_rows_from_db(
     session: Any,
     code_key: int,
@@ -2271,9 +2534,6 @@ async def lookup_code_prefix_rows_from_db(
         raise ValueError("PTG2 serving binary prefix limit must be positive")
     normalized_limit = int(limit)
     options = _ForwardLookupOptions(**read_options)
-    price_item_count = _normalized_price_item_count(
-        options.price_dictionary_item_count
-    )
     normalized_code_key = _normalized_code_key(code_key)
     shard_keys_by_code, normalized_provider_filter, require_all = (
         await _forward_shard_keys_for_read(
@@ -2285,162 +2545,31 @@ async def lookup_code_prefix_rows_from_db(
     block_keys = shard_keys_by_code[normalized_code_key]
     if not block_keys:
         return ()
-    expected_block_keys = set(block_keys)
-    provider_filter = (
-        set(normalized_provider_filter)
-        if normalized_provider_filter is not None
-        else None
+    collector = _forward_prefix_collector(
+        options,
+        normalized_code_key,
+        normalized_provider_filter,
+        block_keys,
+        bool(descending),
+        normalized_limit,
     )
-    retained_occurrences: list[tuple[tuple[int, int, int, int], int, int, int, int]] = []
-    occurrence_ordinals = [0]
-
-    def _retain(provider_set_key: int, price_key: int, source_key: int) -> None:
-        ordinal = occurrence_ordinals[0]
-        occurrence_ordinals[0] += 1
-        rank = _forward_prefix_rank(
-            provider_set_key,
-            price_key,
-            source_key,
-            descending=bool(descending),
-        )
-        # Negating the rank makes heap[0] the worst retained occurrence.
-        heap_rank = (-rank[0], -rank[1], -rank[2], -ordinal)
-        candidate = (
-            heap_rank,
-            int(provider_set_key),
-            int(price_key),
-            int(source_key),
-            ordinal,
-        )
-        if len(retained_occurrences) < normalized_limit:
-            heapq.heappush(retained_occurrences, candidate)
-        elif candidate > retained_occurrences[0]:
-            heapq.heapreplace(retained_occurrences, candidate)
-
-    current_block_key: int | None = None
-    previous_provider_set_key: int | None = None
-    previous_occurrence: tuple[int, int] | None = None
-    provider_key_min = 0
-    provider_key_max = 0
-    observed_source_count: int | None = None
-    expected_fragment_no = 0
-    try:
-        async for fragment in stream_shared_blocks(
-            session,
-            schema_name=options.schema_name,
-            snapshot_key=_required_shared_snapshot_key(
-                options.shared_snapshot_key
-            ),
-            object_kind=_SERVING_BINARY_BY_CODE_PROVIDER_SHARD_KIND,
-            block_keys=block_keys,
-            require_all=require_all,
-        ):
-            if options.scan_budget is not None:
-                options.scan_budget.claim(len(fragment.payload))
-            if fragment.block_key not in expected_block_keys:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 v3 forward stream returned an unexpected shard block"
-                )
-            if fragment.block_key != current_block_key:
-                if (
-                    current_block_key is not None
-                    and fragment.block_key <= current_block_key
-                ):
-                    raise PTG2ManifestArtifactError(
-                        "PTG2 v3 forward shard blocks are not ordered"
-                    )
-                current_block_key = fragment.block_key
-                expected_fragment_no = 0
-                previous_provider_set_key = None
-                previous_occurrence = None
-                provider_key_min, provider_key_max = (
-                    _forward_provider_range_for_block(
-                        normalized_code_key,
-                        fragment.block_key,
-                        options.provider_shard_span,
-                    )
-                )
-            if fragment.fragment_no != expected_fragment_no:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 v3 provider-shard fragments are not contiguous"
-                )
-            expected_fragment_no += 1
-            fragment_cursor, fragment_source_count = (
-                _visit_serving_binary_by_code_record(
-                    {
-                        "block_no": fragment.fragment_no,
-                        "entry_count": fragment.entry_count,
-                        "_decoded_payload": fragment.payload,
-                    },
-                    provider_filter=provider_filter,
-                    fragment_cursor=_ForwardFragmentCursor(
-                        provider_set_key=previous_provider_set_key,
-                        occurrence=previous_occurrence,
-                    ),
-                    validation=_ForwardFragmentValidation(
-                        expected_source_count=options.source_count,
-                        price_item_count=price_item_count,
-                        provider_key_min=provider_key_min,
-                        provider_key_max=provider_key_max,
-                    ),
-                    occurrence_consumer=_retain,
-                )
-            )
-            previous_provider_set_key = fragment_cursor.provider_set_key
-            previous_occurrence = fragment_cursor.occurrence
-            if observed_source_count not in (None, fragment_source_count):
-                raise PTG2ManifestArtifactError(
-                    "PTG2 v3 grouped by-code fragments disagree on source_count"
-                )
-            observed_source_count = fragment_source_count
-    except PTG2SharedBlockError as exc:
-        raise PTG2ManifestArtifactError(str(exc)) from exc
-
-    if not retained_occurrences:
-        return ()
-    selected = sorted(
-        (
-            (provider_set_key, price_key, source_key, ordinal)
-            for _heap_rank, provider_set_key, price_key, source_key, ordinal in retained_occurrences
-        ),
-        key=lambda item: (
-            _forward_prefix_rank(
-                item[0], item[1], item[2], descending=bool(descending)
-            ),
-            item[3],
-        ),
-    )
-    decoded_keys = [
-        (provider_set_key, price_key, source_key)
-        for provider_set_key, price_key, source_key, _ordinal in selected
-    ]
-    provider_counts_by_key, price_ids_by_key = await _lookup_forward_references(
+    await _collect_forward_prefix(
         session,
         options,
-        decoded_keys,
+        block_keys,
+        require_all,
+        collector,
     )
-    response_rows = _materialize_forward_rows(
+    decoded_keys = collector.selected_keys()
+    if not decoded_keys:
+        return ()
+    return await _materialize_forward_prefix(
+        session,
+        options,
         normalized_code_key,
         decoded_keys,
-        provider_counts_by_key,
-        price_ids_by_key,
+        bool(descending),
     )
-
-    def _row_rank(row: PTG2ServingBinaryRow) -> tuple[int, int, int, int]:
-        if row.price_key is None or row.provider_count is None:
-            raise PTG2ManifestArtifactError(
-                "PTG2 bounded forward row is missing a dense rank field"
-            )
-        return (
-            -row.price_key if descending else row.price_key,
-            row.provider_set_key,
-            row.source_key,
-            row.provider_count,
-        )
-
-    # provider_count is functionally dependent on provider_set_key, so adding it
-    # here cannot change which occurrences crossed the bounded heap boundary.
-    return tuple(sorted(response_rows, key=_row_rank))
 
 
 async def lookup_price_ids_from_db(
@@ -4919,19 +5048,40 @@ def _claim_price_membership_retention(
     return membership_bytes
 
 
-async def lookup_price_atom_memberships_from_db(
-    session: Any,
-    shared_snapshot_key: int,
-    price_keys: Iterable[int],
-    *,
-    atom_key_bits: int | None = None,
-    block_span: int | None = None,
-    schema_name: str = "mrf",
-    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
-    maximum_selected_atom_count: int | None = None,
-) -> dict[int, tuple[int, ...]]:
-    """Read requested price-to-atom memberships from fresh shared blocks."""
+@dataclass(frozen=True)
+class _PriceMembershipReadPlan:
+    requested_keys: tuple[int, ...]
+    block_keys: tuple[int, ...]
+    effective_span: int
+    expected_bits: int | None
+    artifact_kind: str
+    decode_membership_block: Callable[..., dict[int, tuple[int, ...]]]
 
+
+_PriceMembershipBlockKey = tuple[str, int, str, int]
+_PriceMembershipBlockIdentity = tuple[bytes, int, int]
+_PriceMembershipAliasKey = tuple[str, int, str, bytes]
+_PriceMembershipAliasOwner = tuple[_PriceMembershipBlockKey, int]
+
+
+@dataclass
+class _PriceMembershipAliasCache:
+    identity_by_block: dict[
+        _PriceMembershipBlockKey, _PriceMembershipBlockIdentity
+    ] = field(default_factory=dict)
+    owner_by_identity: dict[
+        _PriceMembershipAliasKey, _PriceMembershipAliasOwner
+    ] = field(default_factory=dict)
+    metadata_record_count: int = 0
+    maximum_fragment_count: int = 0
+
+
+def _price_membership_read_plan(
+    price_keys: Iterable[int],
+    atom_key_bits: int | None,
+    block_span: int | None,
+    maximum_selected_atom_count: int | None,
+) -> _PriceMembershipReadPlan:
     from api.ptg2_db_serving_v3 import (
         PTG2_SERVING_BINARY_V3_PRICE_KEY_BLOCK_SPAN,
         PTG2_SERVING_BINARY_V3_PRICE_MEMBERSHIPS_KIND,
@@ -4951,17 +5101,356 @@ async def lookup_price_atom_memberships_from_db(
         )
     requested_keys = _requested_keys(price_keys)
     effective_span = _effective_block_span(
-        block_span, PTG2_SERVING_BINARY_V3_PRICE_KEY_BLOCK_SPAN
+        block_span,
+        PTG2_SERVING_BINARY_V3_PRICE_KEY_BLOCK_SPAN,
     )
-    expected_bits = _expected_atom_key_bits(atom_key_bits)
-    logical_blocks = await _shared_logical_blocks_by_key(
+    return _PriceMembershipReadPlan(
+        requested_keys=requested_keys,
+        block_keys=_block_keys_for(requested_keys, effective_span),
+        effective_span=effective_span,
+        expected_bits=_expected_atom_key_bits(atom_key_bits),
+        artifact_kind=PTG2_SERVING_BINARY_V3_PRICE_MEMBERSHIPS_KIND,
+        decode_membership_block=_decode_price_membership_block,
+    )
+
+
+async def _preflight_price_membership_aliases_from_db(
+    session: Any,
+    shared_snapshot_key: int,
+    price_keys: Iterable[int],
+    *,
+    block_span: int | None = None,
+    schema_name: str = "mrf",
+    cache: _PriceMembershipAliasCache | None = None,
+) -> _PriceMembershipAliasCache:
+    """Reject nonempty physical aliases before bounded batch reads."""
+
+    read_plan = _price_membership_read_plan(
+        price_keys,
+        atom_key_bits=None,
+        block_span=block_span,
+        maximum_selected_atom_count=None,
+    )
+    active_cache = cache or _PriceMembershipAliasCache()
+    if (
+        active_cache.metadata_record_count < 0
+        or active_cache.maximum_fragment_count < 0
+    ):
+        raise ValueError("price-membership metadata count is invalid")
+    cache_keys = tuple(
+        (
+            str(schema_name),
+            int(shared_snapshot_key),
+            read_plan.artifact_kind,
+            block_key,
+        )
+        for block_key in read_plan.block_keys
+    )
+    missing_cache_keys = tuple(
+        cache_key
+        for cache_key in cache_keys
+        if cache_key not in active_cache.identity_by_block
+    )
+    if missing_cache_keys:
+        await _retain_missing_price_membership_identities(
+            session,
+            shared_snapshot_key,
+            read_plan.artifact_kind,
+            schema_name,
+            missing_cache_keys,
+            active_cache,
+        )
+    return active_cache
+
+
+async def _retain_missing_price_membership_identities(
+    session: Any,
+    shared_snapshot_key: int,
+    artifact_kind: str,
+    schema_name: str,
+    missing_cache_keys: tuple[_PriceMembershipBlockKey, ...],
+    cache: _PriceMembershipAliasCache,
+) -> None:
+    maximum_records = _price_membership_read_record_limit(
+        len(cache.identity_by_block),
+        len(missing_cache_keys),
+        cache.maximum_fragment_count,
+    )
+    pending_batches = [missing_cache_keys]
+    while pending_batches:
+        batch = pending_batches.pop()
+        try:
+            fresh_identity_by_block = await _price_membership_block_identities(
+                session,
+                shared_snapshot_key,
+                artifact_kind,
+                tuple(cache_key[3] for cache_key in batch),
+                schema_name,
+                maximum_records,
+            )
+        except ManifestReadLimitError:
+            if len(batch) == 1:
+                raise
+            midpoint = len(batch) // 2
+            pending_batches.extend((batch[midpoint:], batch[:midpoint]))
+            continue
+        _retain_price_membership_identities(
+            fresh_identity_by_block,
+            batch,
+            cache,
+        )
+
+
+def _price_membership_read_record_limit(
+    cached_block_count: int,
+    missing_block_count: int,
+    maximum_fragment_count: int = 0,
+) -> int:
+    """Reserve the final compact index before one bounded metadata read."""
+
+    final_block_count = cached_block_count + missing_block_count
+    retained_index_bytes = (
+        final_block_count
+        * PRICE_MEMBERSHIP_ALIAS_INDEX_RETAINED_BYTES_PER_BLOCK
+    )
+    remaining_bytes = (
+        MAX_PRICE_MEMBERSHIP_ALIAS_RETAINED_BYTES * 4 // 5
+        - retained_index_bytes
+    )
+    maximum_records = (
+        remaining_bytes // PRICE_MEMBERSHIP_TRANSIENT_BYTES_PER_FRAGMENT
+    )
+    if (
+        final_block_count > MAX_PRICE_MEMBERSHIP_CACHED_BLOCKS
+        or (missing_block_count > 0 and maximum_records < 1)
+        or maximum_fragment_count > maximum_records
+    ):
+        raise ManifestReadLimitError(
+            "price-membership identity index exceeds its bounded limit"
+        )
+    return maximum_records
+
+
+def _retain_price_membership_identities(
+    fresh_identity_by_block: dict[int, _PriceMembershipBlockIdentity],
+    cache_keys: tuple[_PriceMembershipBlockKey, ...],
+    cache: _PriceMembershipAliasCache,
+) -> None:
+    """Validate and incrementally retain fresh block identities."""
+
+    fresh_record_count = sum(
+        fresh_identity_by_block[cache_key[3]][2] for cache_key in cache_keys
+    )
+    if (
+        cache.metadata_record_count + fresh_record_count
+        > MAX_PRICE_MEMBERSHIP_CACHED_FRAGMENTS
+    ):
+        raise ManifestReadLimitError(
+            "price-membership metadata exceeds its bounded limit"
+        )
+    pending_owner_by_identity: dict[
+        _PriceMembershipAliasKey, _PriceMembershipAliasOwner
+    ] = {}
+    for cache_key in cache_keys:
+        cached_identity = fresh_identity_by_block[cache_key[3]]
+        physical_identity, entry_count, _record_count = cached_identity
+        alias_identity = (*cache_key[:3], physical_identity)
+        existing_owner = cache.owner_by_identity.get(
+            alias_identity
+        ) or pending_owner_by_identity.get(alias_identity)
+        if (
+            existing_owner is not None
+            and existing_owner[0] != cache_key
+            and (entry_count or existing_owner[1])
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 price-membership block has an incompatible physical alias"
+            )
+        pending_owner_by_identity[alias_identity] = (cache_key, entry_count)
+    for cache_key in cache_keys:
+        cached_identity = fresh_identity_by_block[cache_key[3]]
+        physical_identity, entry_count, record_count = cached_identity
+        alias_identity = (*cache_key[:3], physical_identity)
+        cache.identity_by_block[cache_key] = cached_identity
+        cache.owner_by_identity[alias_identity] = (cache_key, entry_count)
+        cache.metadata_record_count += record_count
+        cache.maximum_fragment_count = max(
+            cache.maximum_fragment_count, record_count
+        )
+
+
+async def _price_membership_block_identities(
+    session: Any,
+    shared_snapshot_key: int,
+    artifact_kind: str,
+    block_keys: tuple[int, ...],
+    schema_name: str,
+    maximum_records: int,
+) -> dict[int, _PriceMembershipBlockIdentity]:
+    """Read and release complete bounded metadata for requested blocks."""
+
+    if maximum_records < 1:
+        raise ManifestReadLimitError(
+            "shared PTG snapshot fragment metadata exceeds its bounded limit"
+        )
+    request = _shared_block_read_request(
+        schema_name=schema_name,
+        snapshot_key=shared_snapshot_key,
+        object_kind=artifact_kind,
+        block_keys=block_keys,
+        fragment_nos=None,
+        require_all=True,
+    )
+    retention_budget = CandidateAuditDecodedRetentionBudget(
+        maximum_bytes=_SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES
+    )
+    accumulator = _SharedMappingAccumulator(request, set(), retention_budget)
+    try:
+        async for raw_mapping_record in _stream_shared_mapping_records(
+            session,
+            request,
+            row_limit=maximum_records + 1,
+        ):
+            accumulator.append(raw_mapping_record, maximum_records)
+        selection = accumulator.selection()
+        _require_complete_shared_mapping(request, selection)
+        records_by_block: dict[int, list[dict[str, Any]]] = {
+            block_key: [] for block_key in block_keys
+        }
+        for mapping_record in selection.mapping_records:
+            records_by_block[int(mapping_record["block_key"])].append(
+                mapping_record
+            )
+        return {
+            block_key: (
+                *_validated_price_membership_identity(
+                    tuple(records_by_block[block_key]), artifact_kind, block_key
+                ),
+                len(records_by_block[block_key]),
+            )
+            for block_key in block_keys
+        }
+    except SharedMappingReadLimitError as exc:
+        raise ManifestReadLimitError(str(exc)) from exc
+    except PTG2SharedBlockError as exc:
+        raise PTG2ManifestArtifactError(str(exc)) from exc
+    finally:
+        accumulator.release()
+
+
+def _validated_price_membership_identity(
+    mapping_records: tuple[dict[str, Any], ...],
+    artifact_kind: str,
+    block_key: int,
+) -> tuple[bytes, int]:
+    """Validate one ordered fragment sequence and copy its compact identity."""
+
+    fragment_nos = tuple(
+        int(mapping_record["fragment_no"])
+        for mapping_record in mapping_records
+    )
+    if fragment_nos != tuple(range(len(fragment_nos))):
+        raise PTG2ManifestArtifactError(
+            f"PTG2 v3 {artifact_kind} block {block_key} "
+            "has non-contiguous fragments"
+        )
+    entry_count = int(mapping_records[0].get("mapping_entry_count") or 0)
+    if entry_count < 0 or any(
+        int(mapping_record.get("mapping_entry_count") or 0) != 0
+        for mapping_record in mapping_records[1:]
+    ):
+        raise PTG2ManifestArtifactError(
+            f"PTG2 v3 {artifact_kind} block {block_key} "
+            "has invalid fragment entry counts"
+        )
+    physical_hashes = tuple(
+        memoryview(mapping_record["block_hash"]).tobytes()
+        for mapping_record in mapping_records
+    )
+    if any(len(physical_hash) != 32 for physical_hash in physical_hashes):
+        raise PTG2ManifestArtifactError(
+            f"PTG2 v3 {artifact_kind} block {block_key} "
+            "has an invalid physical identity"
+        )
+    physical_identity = hashlib.sha256()
+    physical_identity.update(_PRICE_MEMBERSHIP_PHYSICAL_IDENTITY_DOMAIN)
+    physical_identity.update(len(physical_hashes).to_bytes(8, "big"))
+    for physical_hash in physical_hashes:
+        physical_identity.update(physical_hash)
+    return physical_identity.digest(), entry_count
+
+
+async def _price_membership_blocks(
+    session: Any,
+    shared_snapshot_key: int,
+    schema_name: str,
+    read_plan: _PriceMembershipReadPlan,
+) -> dict[int, _SharedLogicalBlock]:
+    return await _shared_logical_blocks_by_key(
         session,
         shared_snapshot_key=shared_snapshot_key,
         schema_name=schema_name,
-        artifact_kind=PTG2_SERVING_BINARY_V3_PRICE_MEMBERSHIPS_KIND,
-        block_keys=_block_keys_for(requested_keys, effective_span),
+        artifact_kind=read_plan.artifact_kind,
+        block_keys=read_plan.block_keys,
     )
-    requested_key_set = set(requested_keys)
+
+
+def _decode_price_membership_alias_group(
+    physical_aliases: list[tuple[int, _SharedLogicalBlock]],
+    requested_key_set: AbstractSet[int],
+    effective_span: int,
+    expected_bits: int | None,
+    schema_name: str,
+    remaining_selected_atom_count: int | None,
+    decode_membership_block: Callable[..., dict[int, tuple[int, ...]]],
+) -> tuple[dict[int, tuple[int, ...]], int]:
+    representative_key, logical_block = physical_aliases[0]
+    group_requested_keys = _price_keys_for_membership_aliases(
+        physical_aliases,
+        requested_key_set,
+        effective_span,
+    )
+    _claim_logical_block_processing(logical_block, schema_name=schema_name)
+    decode_arguments_by_name: dict[str, Any] = {
+        "block_key": representative_key,
+        "entry_count": logical_block.entry_count,
+        "atom_key_bits": expected_bits,
+        "block_span": effective_span,
+        "requested_price_keys": group_requested_keys,
+    }
+    if remaining_selected_atom_count is not None:
+        decode_arguments_by_name["maximum_selected_atom_count"] = (
+            remaining_selected_atom_count
+        )
+    decoded_memberships = decode_membership_block(
+        logical_block.payload,
+        **decode_arguments_by_name,
+    )
+    if len(physical_aliases) > 1 and logical_block.entry_count:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price-membership block has an incompatible physical alias"
+        )
+    decoded_atom_count = sum(
+        len(atom_keys) for atom_keys in decoded_memberships.values()
+    )
+    if (
+        remaining_selected_atom_count is not None
+        and decoded_atom_count > remaining_selected_atom_count
+    ):
+        raise ManifestReadLimitError(
+            "PTG2 v3 price hydration exceeds its atom limit"
+        )
+    return decoded_memberships, decoded_atom_count
+
+
+def _retained_price_memberships(
+    logical_blocks: Mapping[int, _SharedLogicalBlock],
+    read_plan: _PriceMembershipReadPlan,
+    schema_name: str,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+    maximum_selected_atom_count: int | None,
+) -> dict[int, tuple[int, ...]]:
+    requested_key_set = set(read_plan.requested_keys)
     memberships_by_price_key: dict[int, tuple[int, ...]] = {}
     retained_membership_bytes = 0
     remaining_selected_atom_count = maximum_selected_atom_count
@@ -4969,52 +5458,23 @@ async def lookup_price_atom_memberships_from_db(
         for physical_aliases in _logical_blocks_by_physical_identity(
             logical_blocks
         ).values():
-            representative_key, logical_block = physical_aliases[0]
-            group_requested_keys = _price_keys_for_membership_aliases(
-                physical_aliases,
-                requested_key_set,
-                effective_span,
-            )
-            _claim_logical_block_processing(
-                logical_block,
-                schema_name=schema_name,
-            )
-            membership_decode_argument_map: dict[str, Any] = {
-                "block_key": representative_key,
-                "entry_count": logical_block.entry_count,
-                "atom_key_bits": expected_bits,
-                "block_span": effective_span,
-                "requested_price_keys": group_requested_keys,
-            }
-            if remaining_selected_atom_count is not None:
-                membership_decode_argument_map["maximum_selected_atom_count"] = (
-                    remaining_selected_atom_count
+            decoded_memberships, decoded_atom_count = (
+                _decode_price_membership_alias_group(
+                    physical_aliases,
+                    requested_key_set,
+                    read_plan.effective_span,
+                    read_plan.expected_bits,
+                    schema_name,
+                    remaining_selected_atom_count,
+                    read_plan.decode_membership_block,
                 )
-            decoded_memberships = _decode_price_membership_block(
-                logical_block.payload,
-                **membership_decode_argument_map,
             )
-            if len(physical_aliases) > 1 and logical_block.entry_count:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 v3 price-membership block has an incompatible "
-                    "physical alias"
-                )
-            decoded_atom_count = sum(
-                len(atom_keys) for atom_keys in decoded_memberships.values()
-            )
-            if (
-                remaining_selected_atom_count is not None
-                and decoded_atom_count > remaining_selected_atom_count
-            ):
-                raise PTG2ManifestArtifactError(
-                    "PTG2 v3 price hydration exceeds its atom limit"
-                )
             if remaining_selected_atom_count is not None:
                 remaining_selected_atom_count -= decoded_atom_count
             for price_key, atom_keys in decoded_memberships.items():
                 if price_key in memberships_by_price_key:
                     raise PTG2ManifestArtifactError(
-                        "PTG2 v3 price-membership artifact contains a " "duplicate key"
+                        "PTG2 v3 price-membership artifact contains a duplicate key"
                     )
                 retained_membership_bytes += _claim_price_membership_retention(
                     retention_budget,
@@ -5026,6 +5486,40 @@ async def lookup_price_atom_memberships_from_db(
             retention_budget.release(retained_membership_bytes)
         raise
     return memberships_by_price_key
+
+
+async def lookup_price_atom_memberships_from_db(
+    session: Any,
+    shared_snapshot_key: int,
+    price_keys: Iterable[int],
+    *,
+    atom_key_bits: int | None = None,
+    block_span: int | None = None,
+    schema_name: str = "mrf",
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
+    maximum_selected_atom_count: int | None = None,
+) -> dict[int, tuple[int, ...]]:
+    """Read requested price-to-atom memberships from fresh shared blocks."""
+
+    read_plan = _price_membership_read_plan(
+        price_keys,
+        atom_key_bits,
+        block_span,
+        maximum_selected_atom_count,
+    )
+    logical_blocks = await _price_membership_blocks(
+        session,
+        shared_snapshot_key,
+        schema_name,
+        read_plan,
+    )
+    return _retained_price_memberships(
+        logical_blocks,
+        read_plan,
+        schema_name,
+        retention_budget,
+        maximum_selected_atom_count,
+    )
 
 
 lookup_shared_price_atom_memberships_from_db = lookup_price_atom_memberships_from_db

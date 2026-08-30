@@ -29,7 +29,8 @@ def test_openapi_documents_projection_view_routing():
         }
         assert "default" not in view_parameter["schema"]
         description = " ".join(view_parameter["description"].split())
-        assert "pre-rendered provider cards" in description
+        assert "release-frozen factorized provider cards" in description
+        assert "exact packed ZIP-cell rate aggregates" in description
         assert "With `view=card`, `include_providers=false`" in description
         assert "retain the existing aggregate reader" in description
         assert "Omitting `view` with explicit" in description
@@ -65,6 +66,13 @@ def test_openapi_documents_projection_response_shapes():
         "provider_cards",
         "rate_aggregates",
     ]
+    assert schemas["PricingProcedureProviderListResponse"]["properties"][
+        "query"
+    ]["properties"]["projection_contract"] == {
+        "type": "string",
+        "nullable": True,
+        "enum": ["plan_pricing_card_v2", "plan_pricing_factorized_v3"],
+    }
     item_refs = {
         variant["$ref"]
         for variant in response["properties"]["items"]["items"]["anyOf"]

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import time
 from typing import Any, Mapping
@@ -12,6 +11,7 @@ from sqlalchemy import text
 
 from api.plan_pricing_projection_contract import (
     HEX_DIGEST,
+    LEGACY_PROJECTION_CONTRACT,
     PROJECTION_CONTRACT,
     canonical_json,
     lock_provider_generation,
@@ -20,28 +20,65 @@ from api.plan_pricing_projection_contract import (
     provider_signature,
     table,
 )
-from api.plan_pricing_projection_materialize import project_code
 from api.plan_pricing_projection_source import binding_projection
+from api.plan_pricing_projection_v3 import (
+    ProjectionV3Counts,
+    materialize_factorized_projection,
+    validate_stored_aggregate_packs,
+)
 from db.connection import db
+
+
+MAX_PROJECTION_BINDINGS = 16
+MAX_PROJECTION_CODE_ROWS = 65_536
 
 
 def receipt(candidate_by_field: Mapping[str, Any]) -> dict[str, Any]:
     """Return the stable public receipt for a ready candidate."""
 
-    return {
-        "contract": PROJECTION_CONTRACT,
+    contract = str(candidate_by_field.get("contract_version") or "")
+    receipt_by_field = {
+        "contract": contract,
         "projection_id": str(candidate_by_field["projection_id"]),
         "binding_manifest_digest": str(
             candidate_by_field["binding_manifest_digest"]
         ),
         "provider_signature": str(candidate_by_field["provider_signature"]),
         "content_digest": str(candidate_by_field["content_digest"]),
-        "card_row_count": int(candidate_by_field["card_row_count"]),
-        "aggregate_row_count": int(candidate_by_field["aggregate_row_count"]),
-        "fragment_byte_count": int(candidate_by_field["fragment_byte_count"]),
         "build_seconds": float(candidate_by_field["build_seconds"]),
         "state": "ready",
     }
+    if contract == LEGACY_PROJECTION_CONTRACT:
+        receipt_by_field.update(
+            card_row_count=int(candidate_by_field["card_row_count"]),
+            aggregate_row_count=int(candidate_by_field["aggregate_row_count"]),
+            fragment_byte_count=int(candidate_by_field["fragment_byte_count"]),
+        )
+    elif contract == PROJECTION_CONTRACT:
+        receipt_by_field.update(
+            provider_membership_count=int(
+                candidate_by_field["provider_membership_count"]
+            ),
+            provider_cell_count=int(candidate_by_field["provider_cell_count"]),
+            provider_fragment_byte_count=int(
+                candidate_by_field["provider_fragment_byte_count"]
+            ),
+            rate_profile_count=int(candidate_by_field["rate_profile_count"]),
+            aggregate_entry_count=int(
+                candidate_by_field["aggregate_entry_count"]
+            ),
+            aggregate_pack_count=int(candidate_by_field["aggregate_pack_count"]),
+            aggregate_raw_byte_count=int(
+                candidate_by_field["aggregate_raw_byte_count"]
+            ),
+            aggregate_stored_byte_count=int(
+                candidate_by_field["aggregate_stored_byte_count"]
+            ),
+            prewarm_shape_count=int(candidate_by_field["prewarm_shape_count"]),
+        )
+    else:
+        raise ValueError("pricing projection contract is unsupported")
+    return receipt_by_field
 
 
 async def _existing_candidate_receipt(
@@ -121,7 +158,7 @@ async def _materialize_all_codes(
     session: Any,
     candidate_id: str,
     binding_manifest: list[dict[str, Any]],
-) -> tuple[Any, int, int, int]:
+) -> tuple[Any, ProjectionV3Counts]:
     in_network_bindings = [
         binding_by_field
         for binding_by_field in binding_manifest
@@ -129,56 +166,55 @@ async def _materialize_all_codes(
     ]
     if not in_network_bindings:
         raise ValueError("pricing projection requires an in-network binding")
-    binding_projections = [
-        await binding_projection(session, binding_by_field)
-        for binding_by_field in in_network_bindings
-    ]
-    code_identities = sorted(
-        {
-            code_identity
-            for projected_binding in binding_projections
-            for code_identity in projected_binding.code_rows_by_identity
-        }
-    )
-    content_digest = hashlib.sha256()
-    card_row_count = aggregate_row_count = fragment_byte_count = 0
-    for code_identity in code_identities:
-        card_count, aggregate_count, fragment_bytes = await project_code(
+    if len(in_network_bindings) > MAX_PROJECTION_BINDINGS:
+        raise ValueError("pricing projection binding bound exceeded")
+    remaining_code_rows = MAX_PROJECTION_CODE_ROWS
+    binding_projections = []
+    for binding_by_field in in_network_bindings:
+        if remaining_code_rows <= 0:
+            raise ValueError("pricing projection code-row bound exceeded")
+        binding = await binding_projection(
             session,
-            candidate_id,
-            code_identity,
-            binding_projections,
-            content_digest,
+            binding_by_field,
+            maximum_code_rows=remaining_code_rows,
         )
-        card_row_count += card_count
-        aggregate_row_count += aggregate_count
-        fragment_byte_count += fragment_bytes
-        await asyncio.sleep(0)
-    return (
+        code_row_count = binding.raw_code_row_count
+        if code_row_count > remaining_code_rows:
+            raise ValueError("pricing projection code-row bound exceeded")
+        remaining_code_rows -= code_row_count
+        binding_projections.append(binding)
+    content_digest = hashlib.sha256()
+    counts = await materialize_factorized_projection(
+        session,
+        candidate_id,
+        binding_projections,
         content_digest,
-        card_row_count,
-        aggregate_row_count,
-        fragment_byte_count,
     )
+    return content_digest, counts
 
 
 async def _seal_candidate(
     session: Any,
     candidate_id: str,
     content_digest: Any,
-    row_counts: tuple[int, int, int],
+    row_counts: ProjectionV3Counts,
     build_seconds: float,
 ) -> dict[str, Any]:
-    card_row_count, aggregate_row_count, fragment_byte_count = row_counts
     ready_result = await session.execute(
         text(
             f"""
             UPDATE {table('plan_pricing_projection_candidate')}
                SET state = 'ready',
                    content_digest = :content_digest,
-                   card_row_count = :card_row_count,
-                   aggregate_row_count = :aggregate_row_count,
-                   fragment_byte_count = :fragment_byte_count,
+                   provider_membership_count = :provider_membership_count,
+                   provider_cell_count = :provider_cell_count,
+                   provider_fragment_byte_count = :provider_fragment_byte_count,
+                   rate_profile_count = :rate_profile_count,
+                   aggregate_entry_count = :aggregate_entry_count,
+                   aggregate_pack_count = :aggregate_pack_count,
+                   aggregate_raw_byte_count = :aggregate_raw_byte_count,
+                   aggregate_stored_byte_count = :aggregate_stored_byte_count,
+                   prewarm_shape_count = :prewarm_shape_count,
                    build_seconds = :build_seconds,
                    completed_at = transaction_timestamp()
              WHERE projection_id = :projection_id
@@ -188,9 +224,21 @@ async def _seal_candidate(
         {
             "projection_id": candidate_id,
             "content_digest": content_digest.hexdigest(),
-            "card_row_count": card_row_count,
-            "aggregate_row_count": aggregate_row_count,
-            "fragment_byte_count": fragment_byte_count,
+            "provider_membership_count": (
+                row_counts.provider_membership_count
+            ),
+            "provider_cell_count": row_counts.provider_cell_count,
+            "provider_fragment_byte_count": (
+                row_counts.provider_fragment_byte_count
+            ),
+            "rate_profile_count": row_counts.rate_profile_count,
+            "aggregate_entry_count": row_counts.aggregate_entry_count,
+            "aggregate_pack_count": row_counts.aggregate_pack_count,
+            "aggregate_raw_byte_count": row_counts.aggregate_raw_byte_count,
+            "aggregate_stored_byte_count": (
+                row_counts.aggregate_stored_byte_count
+            ),
+            "prewarm_shape_count": row_counts.prewarm_shape_count,
             "build_seconds": build_seconds,
         },
     )
@@ -234,16 +282,21 @@ async def build_in_session(
         provider_generation_signature,
     )
     started_at = time.perf_counter()
-    content_digest, *row_counts = await _materialize_all_codes(
+    content_digest, row_counts = await _materialize_all_codes(
         session,
         candidate_id,
         binding_manifest,
+    )
+    await validate_stored_aggregate_packs(
+        session,
+        candidate_id,
+        row_counts,
     )
     return await _seal_candidate(
         session,
         candidate_id,
         content_digest,
-        tuple(row_counts),
+        row_counts,
         time.perf_counter() - started_at,
     )
 

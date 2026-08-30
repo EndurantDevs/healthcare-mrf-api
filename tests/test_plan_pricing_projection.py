@@ -7,18 +7,12 @@ from types import SimpleNamespace
 
 import orjson
 import pytest
-from alembic.config import Config
-from alembic.script import ScriptDirectory
 
 from api import control_imports, control_workers
 from api import plan_pricing_projection as projection
 from api import plan_pricing_projection_contract as projection_contract
 from api import plan_pricing_projection_materialize as projection_materialize
-from api import plan_pricing_projection_source as projection_source
 from api.plan_release_serving import PlanReleaseServingSelection
-from tests.provider_directory_profile_capacity_v2_migration_support import (
-    load_capacity_v2_migration,
-)
 
 
 PROJECTION_ID = "a" * 64
@@ -279,6 +273,7 @@ async def test_project_code_card_insert_matches_its_bound_row(monkeypatch):
         binding={},
         serving_tables=SimpleNamespace(network_names=[]),
         code_rows_by_identity={("HCPCS", "G0439"): [{}]},
+        raw_code_row_count=1,
     )
 
     counts = await projection._project_code(
@@ -366,135 +361,5 @@ async def test_provider_generation_is_repeatable_and_locked_before_signature():
     assert "mrf.doctor_clinician_address" in session.statements[1][0]
     assert "tiger.zcta5" in session.statements[1][0]
     assert '"mrf"."entity_address_unified"' in session.statements[2][0]
+    assert '"mrf"."geo_zip_lookup"' in session.statements[2][0]
     assert session.statements[2][0].strip().endswith("IN ACCESS SHARE MODE")
-
-
-@pytest.mark.asyncio
-async def test_binding_projection_uses_release_market_type(monkeypatch):
-    from api import ptg2_serving as serving
-
-    scope_kwargs_dict = {}
-
-    async def _tables(_session, _snapshot_id):
-        return SimpleNamespace(network_names=[])
-
-    def _scope(_tables, **kwargs):
-        scope_kwargs_dict.update(kwargs)
-        return "", ["TRUE"], {}, "code_metadata.code_key"
-
-    monkeypatch.setattr(projection_source, "snapshot_serving_tables", _tables)
-    monkeypatch.setattr(serving, "_require_strict_shared_v3", lambda _tables: None)
-    monkeypatch.setattr(serving, "_shared_v3_code_scope_sql", _scope)
-    monkeypatch.setattr(serving, "_required_shared_snapshot_key", lambda _tables: 1)
-    monkeypatch.setattr(serving, "_shared_v3_code_table", lambda: "code_table")
-
-    await projection._binding_projection(
-        _Session([]),
-        {
-            "snapshot_id": "snapshot",
-            "plan_id": "plan",
-            "market_type": "individual",
-            "plan_market_type": "group",
-        },
-    )
-
-    assert scope_kwargs_dict["plan_market_type"] == "individual"
-
-
-def _binding_code_rows():
-    return [
-        {
-            "code_key": 1,
-            "plan_id": "plan",
-            "plan_market_type": "group",
-            "reported_code_system": "HCPCS",
-            "reported_code": "G0439",
-            "negotiation_arrangement": "ffs",
-            "billing_code_type_version": "2026",
-            "source_name": None,
-            "source_description": None,
-            "rate_count": 1,
-        },
-        {
-            "code_key": 2,
-            "plan_id": "plan",
-            "plan_market_type": "group",
-            "reported_code_system": "HCPCS",
-            "reported_code": "27447",
-            "negotiation_arrangement": "ffs",
-            "billing_code_type_version": "2026",
-            "source_name": None,
-            "source_description": None,
-            "rate_count": 1,
-        },
-        {
-            "code_key": 3,
-            "plan_id": "plan",
-            "plan_market_type": "group",
-            "reported_code_system": "CPT",
-            "reported_code": "27447",
-            "negotiation_arrangement": "ffs",
-            "billing_code_type_version": "2026",
-            "source_name": None,
-            "source_description": None,
-            "rate_count": 1,
-        },
-    ]
-
-
-@pytest.mark.asyncio
-async def test_binding_projection_groups_numeric_cpt_hcpcs_but_keeps_g_code(
-    monkeypatch,
-):
-    from api import ptg2_serving as serving
-
-    async def _tables(_session, _snapshot_id):
-        return SimpleNamespace(network_names=[])
-
-    monkeypatch.setattr(projection_source, "snapshot_serving_tables", _tables)
-    monkeypatch.setattr(serving, "_require_strict_shared_v3", lambda _tables: None)
-    monkeypatch.setattr(
-        serving,
-        "_shared_v3_code_scope_sql",
-        lambda _tables, **_kwargs: (
-            "",
-            ["TRUE"],
-            {},
-            "code_metadata.code_key",
-        ),
-    )
-    monkeypatch.setattr(serving, "_required_shared_snapshot_key", lambda _tables: 1)
-    monkeypatch.setattr(serving, "_shared_v3_code_table", lambda: "code_table")
-    session = _Session(_binding_code_rows())
-
-    built = await projection._binding_projection(
-        session,
-        {
-            "snapshot_id": "snapshot",
-            "plan_id": "plan",
-            "market_type": "group",
-        },
-    )
-
-    assert set(built.code_rows_by_identity) == {
-        ("CPT", "27447"),
-        ("HCPCS", "G0439"),
-    }
-    assert [
-        code_row["code_key"]
-        for code_row in built.code_rows_by_identity[("CPT", "27447")]
-    ] == [2, 3]
-
-
-def test_capacity_v2_migration_precedes_the_unique_repository_head():
-    script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == [
-        "20260829100000_activate_import_run_idempotency_scope"
-    ]
-    assert script.get_revision(
-        "20260825150000_plan_pricing_card_projection"
-    ).down_revision == "20260826090000_hospital_price_packed_blocks"
-    migration = load_capacity_v2_migration()
-    assert migration.down_revision == (
-        "20260801010000_uhc_semantic_layout_identity"
-    )

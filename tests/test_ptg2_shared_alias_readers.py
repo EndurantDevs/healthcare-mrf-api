@@ -64,6 +64,255 @@ async def test_membership_reader_parses_once_and_rejects_nonempty_aliases(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("entry_count", (0, 1))
+async def test_membership_alias_preflight_rejects_only_nonempty_aliases(
+    monkeypatch,
+    entry_count: int,
+) -> None:
+    async def mapping_records(_session, request, **_kwargs):
+        assert request.requires_all
+        for block_key in request.block_keys:
+            yield {
+                "object_kind": "price_set_atom_memberships_v3",
+                "block_key": block_key,
+                "fragment_no": 0,
+                "mapping_entry_count": entry_count,
+                "block_hash": b"a" * 32,
+            }
+
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_stream_shared_mapping_records",
+        mapping_records,
+    )
+    call = ptg2_db_sidecars._preflight_price_membership_aliases_from_db(
+        object(),
+        12,
+        (0, 1),
+        block_span=1,
+    )
+    if entry_count:
+        with pytest.raises(
+            ptg2_db_sidecars.PTG2ManifestArtifactError,
+            match="incompatible physical alias",
+        ):
+            await call
+    else:
+        await call
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("second_tail_hash", "rejected"),
+    ((b"b" * 32, True), (b"c" * 32, False)),
+)
+async def test_membership_alias_preflight_compares_complete_fragment_identity(
+    monkeypatch,
+    second_tail_hash: bytes,
+    rejected: bool,
+) -> None:
+    async def mapping_records(_session, request, **_kwargs):
+        tail_hash_by_block = {0: b"b" * 32, 1: second_tail_hash}
+        for block_key in request.block_keys:
+            tail_hash = tail_hash_by_block[block_key]
+            yield {
+                "object_kind": "price_set_atom_memberships_v3",
+                "block_key": block_key,
+                "fragment_no": 0,
+                "mapping_entry_count": 1,
+                "block_hash": b"a" * 32,
+            }
+            yield {
+                "object_kind": "price_set_atom_memberships_v3",
+                "block_key": block_key,
+                "fragment_no": 1,
+                "mapping_entry_count": 0,
+                "block_hash": tail_hash,
+            }
+
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_stream_shared_mapping_records",
+        mapping_records,
+    )
+    call = ptg2_db_sidecars._preflight_price_membership_aliases_from_db(
+        object(),
+        12,
+        (0, 1),
+        block_span=1,
+    )
+    if rejected:
+        with pytest.raises(
+            ptg2_db_sidecars.PTG2ManifestArtifactError,
+            match="incompatible physical alias",
+        ):
+            await call
+    else:
+        await call
+
+
+@pytest.mark.asyncio
+async def test_membership_alias_preflight_requires_each_requested_block(
+    monkeypatch,
+) -> None:
+    async def no_mapping_records(*_args, **_kwargs):
+        if False:
+            yield None
+
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_stream_shared_mapping_records",
+        no_mapping_records,
+    )
+    with pytest.raises(
+        ptg2_db_sidecars.PTG2ManifestArtifactError,
+        match="missing block keys",
+    ):
+        await ptg2_db_sidecars._preflight_price_membership_aliases_from_db(
+            object(), 12, (0,), block_span=1
+        )
+
+
+@pytest.mark.asyncio
+async def test_membership_alias_preflight_preserves_mapping_read_limits(
+    monkeypatch,
+) -> None:
+    async def limited_mapping_records(*_args, **_kwargs):
+        raise ptg2_db_sidecars.SharedMappingReadLimitError("bounded metadata")
+        yield None
+
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_stream_shared_mapping_records",
+        limited_mapping_records,
+    )
+    with pytest.raises(
+        ptg2_db_sidecars.ManifestReadLimitError,
+        match="bounded metadata",
+    ):
+        await ptg2_db_sidecars._preflight_price_membership_aliases_from_db(
+            object(), 12, (0,), block_span=1
+        )
+
+
+@pytest.mark.asyncio
+async def test_membership_alias_preflight_releases_each_metadata_budget(
+    monkeypatch,
+) -> None:
+    budgets = []
+    mapping_calls = []
+    budget_type = ptg2_db_sidecars.CandidateAuditDecodedRetentionBudget
+
+    def tracking_budget(**kwargs):
+        budget = budget_type(**kwargs)
+        budgets.append(budget)
+        return budget
+
+    async def mapping_records(_session, request, **_kwargs):
+        mapping_calls.append(request.block_keys)
+        for block_key in request.block_keys:
+            yield {
+                "object_kind": "price_set_atom_memberships_v3",
+                "block_key": block_key,
+                "fragment_no": 0,
+                "mapping_entry_count": 0,
+                "block_hash": bytes([block_key + 1]) * 32,
+            }
+
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "CandidateAuditDecodedRetentionBudget",
+        tracking_budget,
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_stream_shared_mapping_records",
+        mapping_records,
+    )
+    await ptg2_db_sidecars._preflight_price_membership_aliases_from_db(
+        object(), 12, (0, 1), block_span=1
+    )
+
+    assert len(budgets) == 1
+    assert mapping_calls == [(0, 1)]
+    assert all(budget.retained_bytes == 0 for budget in budgets)
+    assert all(
+        budget.peak_retained_bytes
+        <= ptg2_db_sidecars._SHARED_MAPPING_DEFAULT_MAX_RETAINED_BYTES
+        for budget in budgets
+    )
+
+
+@pytest.mark.asyncio
+async def test_membership_alias_preflight_reuses_transaction_cache(
+    monkeypatch,
+) -> None:
+    mapping_calls = []
+
+    async def mapping_records(_session, request, **_kwargs):
+        mapping_calls.append(request.block_keys)
+        yield {
+            "object_kind": "price_set_atom_memberships_v3",
+            "block_key": request.block_keys[0],
+            "fragment_no": 0,
+            "mapping_entry_count": 0,
+            "block_hash": b"a" * 32,
+        }
+
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_stream_shared_mapping_records",
+        mapping_records,
+    )
+    cache = ptg2_db_sidecars._PriceMembershipAliasCache()
+    returned_cache = (
+        await ptg2_db_sidecars._preflight_price_membership_aliases_from_db(
+            object(), 12, (0,), block_span=1, cache=cache
+        )
+    )
+    repeated_cache = (
+        await ptg2_db_sidecars._preflight_price_membership_aliases_from_db(
+            object(), 12, (0,), block_span=1, cache=cache
+        )
+    )
+
+    assert mapping_calls == [(0,)]
+    assert returned_cache is repeated_cache is cache
+    assert cache.metadata_record_count == cache.maximum_fragment_count == 1
+
+
+@pytest.mark.asyncio
+async def test_membership_alias_preflight_finds_alias_across_cached_calls(
+    monkeypatch,
+) -> None:
+    async def mapping_records(_session, request, **_kwargs):
+        yield {
+            "object_kind": "price_set_atom_memberships_v3",
+            "block_key": request.block_keys[0],
+            "fragment_no": 0,
+            "mapping_entry_count": 1,
+            "block_hash": b"a" * 32,
+        }
+
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_stream_shared_mapping_records",
+        mapping_records,
+    )
+    cache = ptg2_db_sidecars._PriceMembershipAliasCache()
+    await ptg2_db_sidecars._preflight_price_membership_aliases_from_db(
+        object(), 12, (0,), block_span=1, cache=cache
+    )
+    with pytest.raises(
+        ptg2_db_sidecars.PTG2ManifestArtifactError,
+        match="incompatible physical alias",
+    ):
+        await ptg2_db_sidecars._preflight_price_membership_aliases_from_db(
+            object(), 12, (1,), block_span=1, cache=cache
+        )
+
+
+@pytest.mark.asyncio
 async def test_membership_reader_enforces_one_atom_limit_across_physical_blocks(
     monkeypatch,
 ):
@@ -89,7 +338,7 @@ async def test_membership_reader_enforces_one_atom_limit_across_physical_blocks(
     monkeypatch.setattr(codec, "decode_dense_keys", dense_decode)
 
     with pytest.raises(
-        ptg2_db_sidecars.PTG2ManifestArtifactError,
+        ptg2_db_sidecars.ManifestReadLimitError,
         match="atom limit",
     ):
         await ptg2_db_sidecars.lookup_price_atom_memberships_from_db(

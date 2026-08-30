@@ -11,15 +11,17 @@ from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
-from sqlalchemy import text
-
 from api.plan_pricing_projection_contract import (
     HEX_DIGEST,
-    ZIP5,
+    LEGACY_PROJECTION_CONTRACT,
+    PROJECTION_CONTRACT,
     canonical_json,
-    projection_code_identity,
-    row_mapping,
-    table,
+)
+from api.plan_pricing_prewarm_selection import (
+    MAX_PREWARM_SHAPES,
+    PrewarmShape,
+    is_broad_em_shape as _is_broad_em_shape,
+    select_shapes as _select_shapes,
 )
 from api.plan_pricing_prewarm_http import (
     PREWARM_API_BASE_URL_ENV,
@@ -37,26 +39,12 @@ from db.connection import db
 
 
 PREWARM_CONTRACT = "plan_pricing_prewarm_v1"
-# Four 768-entry current-revision sets plus 512 entries of overlap headroom
-# fit API Layer's 3,584-entry shared cache lane.
-MAX_PREWARM_SHAPES = 768
 PREWARM_CONCURRENCY = 8
 _SERVING_REVISION_ID = re.compile(r"^hpserve_[0-9A-HJKMNP-TV-Z]{26}$")
 _SERVING_REVISION_PUBLISHED_AT = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:"
     r"[0-9]{2}\.[0-9]{6}Z$"
 )
-_BROAD_EM_CODE = re.compile(r"^992(?:0[2-9]|1[0-5])$")
-
-
-@dataclass(frozen=True)
-class PrewarmShape:
-    code_system: str
-    code: str
-    geo_cell: str
-    provider_count: int
-
-
 @dataclass(frozen=True)
 class _PrewarmResult:
     error: dict[str, str] | None = None
@@ -109,61 +97,6 @@ async def _exact_ready_selection(
             "plan-pricing prewarm requires the exact current ready projection"
         )
     return selection
-
-
-async def _select_shapes(
-    session: Any,
-    projection_id: str,
-) -> tuple[PrewarmShape, ...]:
-    aggregate_query_result = await session.execute(
-        text(
-            f"""
-            SELECT projection_id, code_system, code, geo_cell, provider_count
-              FROM {table('plan_pricing_cell_aggregate')}
-             WHERE projection_id = :projection_id
-               AND NOT (
-                   code_system IN ('CPT', 'HCPCS')
-                   AND code ~ '^992(0[2-9]|1[0-5])$'
-               )
-          ORDER BY provider_count DESC, code_system, code, geo_cell
-             LIMIT {MAX_PREWARM_SHAPES}
-            """
-        ),
-        {"projection_id": projection_id},
-    )
-    shapes: list[PrewarmShape] = []
-    for raw_row in aggregate_query_result.mappings().all()[:MAX_PREWARM_SHAPES]:
-        row_by_field = row_mapping(raw_row)
-        if str(row_by_field.get("projection_id") or "") != projection_id:
-            raise ValueError("plan-pricing prewarm selected a foreign projection row")
-        code_identity = projection_code_identity(
-            row_by_field.get("code_system"),
-            row_by_field.get("code"),
-        )
-        geo_cell = str(row_by_field.get("geo_cell") or "")
-        provider_count = row_by_field.get("provider_count")
-        if (
-            code_identity is None
-            or not ZIP5.fullmatch(geo_cell)
-            or not isinstance(provider_count, int)
-            or isinstance(provider_count, bool)
-            or provider_count <= 0
-        ):
-            raise ValueError("plan-pricing prewarm aggregate row is invalid")
-        shape = PrewarmShape(
-            code_system=code_identity[0],
-            code=code_identity[1],
-            geo_cell=geo_cell,
-            provider_count=provider_count,
-        )
-        if _is_broad_em_shape(shape):
-            continue
-        shapes.append(shape)
-    return tuple(shapes)
-
-
-def _is_broad_em_shape(shape: PrewarmShape) -> bool:
-    return shape.code_system == "CPT" and bool(_BROAD_EM_CODE.fullmatch(shape.code))
 
 
 def _shape_error(shape: PrewarmShape, error: str) -> dict[str, str]:
@@ -436,7 +369,12 @@ async def prewarm_plan_pricing(
             serving_revision_id=revision_id,
             projection_id=candidate_id,
         )
-        shapes = await _select_shapes(session, candidate_id)
+        shapes = await _select_shapes(
+            session,
+            candidate_id,
+            selection.pricing_projection_contract
+            or LEGACY_PROJECTION_CONTRACT,
+        )
     timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(timeout=timeout) as http_session:
         receipt_by_field = await _prewarm_shapes(

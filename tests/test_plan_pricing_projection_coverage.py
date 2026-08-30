@@ -46,9 +46,16 @@ def _candidate(**updates):
         "binding_manifest": [{"snapshot_id": "snapshot"}],
         "provider_signature": "c" * 64,
         "content_digest": "d" * 64,
-        "card_row_count": 2,
-        "aggregate_row_count": 1,
-        "fragment_byte_count": 80,
+        "contract_version": projection_contract.PROJECTION_CONTRACT,
+        "provider_membership_count": 3,
+        "provider_cell_count": 2,
+        "provider_fragment_byte_count": 80,
+        "rate_profile_count": 4,
+        "aggregate_entry_count": 1,
+        "aggregate_pack_count": 1,
+        "aggregate_raw_byte_count": 70,
+        "aggregate_stored_byte_count": 60,
+        "prewarm_shape_count": 1,
         "build_seconds": 1.5,
         "state": "ready",
     }
@@ -75,7 +82,7 @@ async def test_existing_projection_candidates_are_reused_or_replaced():
         "c" * 64,
     )
     assert ready["state"] == "ready"
-    assert ready["card_row_count"] == 2
+    assert ready["provider_cell_count"] == 2
 
     with pytest.raises(ValueError, match="identity collision"):
         await projection_build._existing_candidate_receipt(
@@ -114,36 +121,48 @@ async def test_projection_candidate_insert_and_seal_keep_receipt_counts():
         session,
         PROJECTION_ID,
         hashlib.sha256(b"content"),
-        (2, 1, 80),
+        projection_build.ProjectionV3Counts(3, 2, 80, 1, 1, 70, 60, 1, 4),
         1.5,
     )
     assert "INSERT INTO" in session.statements[0][0]
     assert session.statements[0][1]["binding_manifest"] == (
         '[{"snapshot_id":"snapshot"}]'
     )
-    assert receipt["aggregate_row_count"] == 1
+    assert receipt["aggregate_entry_count"] == 1
+    assert receipt["rate_profile_count"] == 4
     assert session.statements[1][1] == {
         "projection_id": PROJECTION_ID,
         "content_digest": hashlib.sha256(b"content").hexdigest(),
-        "card_row_count": 2,
-        "aggregate_row_count": 1,
-        "fragment_byte_count": 80,
+        "provider_membership_count": 3,
+        "provider_cell_count": 2,
+        "provider_fragment_byte_count": 80,
+        "rate_profile_count": 4,
+        "aggregate_entry_count": 1,
+        "aggregate_pack_count": 1,
+        "aggregate_raw_byte_count": 70,
+        "aggregate_stored_byte_count": 60,
+        "prewarm_shape_count": 1,
         "build_seconds": 1.5,
     }
 
 
 @pytest.mark.asyncio
-async def test_materialize_all_codes_requires_rates_and_sorts_identity(
-    monkeypatch,
-):
+async def test_materialize_all_codes_requires_in_network_binding():
     with pytest.raises(ValueError, match="in-network binding"):
         await projection_build._materialize_all_codes(
             object(), PROJECTION_ID, [{"role": "allowed_amounts"}]
         )
 
-    async def binding_projection(_session, binding):
+
+@pytest.mark.asyncio
+async def test_materialize_all_codes_delegates_to_v3(monkeypatch):
+    async def binding_projection(_session, binding, *, maximum_code_rows):
+        assert maximum_code_rows == (
+            projection_build.MAX_PROJECTION_CODE_ROWS
+        )
         return SimpleNamespace(
             binding=binding,
+            raw_code_row_count=2,
             code_rows_by_identity={
                 ("HCPCS", "G0439"): [{}],
                 ("CPT", "27447"): [{}],
@@ -151,24 +170,84 @@ async def test_materialize_all_codes_requires_rates_and_sorts_identity(
         )
 
     calls = []
+    expected_counts = projection_build.ProjectionV3Counts(
+        3, 2, 80, 1, 1, 70, 60, 1
+    )
 
-    async def project_code(_session, _candidate_id, code_identity, *_args):
-        calls.append(code_identity)
-        return (1, 2, 3)
+    async def materialize(
+        _session, candidate_id, bindings, content_digest
+    ):
+        calls.append((candidate_id, bindings, content_digest))
+        return expected_counts
 
     monkeypatch.setattr(projection_build, "binding_projection", binding_projection)
-    monkeypatch.setattr(projection_build, "project_code", project_code)
-    _digest, card_count, aggregate_count, fragment_bytes = (
+    monkeypatch.setattr(
+        projection_build, "materialize_factorized_projection", materialize
+    )
+    digest, counts = (
         await projection_build._materialize_all_codes(
             object(), PROJECTION_ID, [{"role": "in_network"}]
         )
     )
-    assert calls == [("CPT", "27447"), ("HCPCS", "G0439")]
-    assert (card_count, aggregate_count, fragment_bytes) == (2, 4, 6)
+    assert calls[0][0] == PROJECTION_ID
+    assert len(calls[0][1]) == 1
+    assert calls[0][2] is digest
+    assert counts == expected_counts
 
 
 @pytest.mark.asyncio
-async def test_session_builder_reuses_exact_candidate_under_lock(monkeypatch):
+async def test_materialize_all_codes_enforces_release_bounds(monkeypatch):
+    too_many_bindings = [
+        {"role": "in_network"}
+        for _ in range(projection_build.MAX_PROJECTION_BINDINGS + 1)
+    ]
+    with pytest.raises(ValueError, match="binding bound exceeded"):
+        await projection_build._materialize_all_codes(
+            object(), PROJECTION_ID, too_many_bindings
+        )
+
+    async def oversized_projection(_session, binding, *, maximum_code_rows):
+        return SimpleNamespace(
+            binding=binding,
+            raw_code_row_count=maximum_code_rows + 1,
+            code_rows_by_identity={
+                ("CPT", "27447"): [{}]
+            },
+        )
+
+    monkeypatch.setattr(
+        projection_build, "binding_projection", oversized_projection
+    )
+    with pytest.raises(ValueError, match="code-row bound exceeded"):
+        await projection_build._materialize_all_codes(
+            object(), PROJECTION_ID, [{"role": "in_network"}]
+        )
+
+    binding_calls = []
+
+    async def exactly_full_projection(_session, binding, *, maximum_code_rows):
+        binding_calls.append(binding)
+        assert len(binding_calls) == 1
+        return SimpleNamespace(
+            binding=binding,
+            raw_code_row_count=maximum_code_rows,
+            code_rows_by_identity={("CPT", "27447"): [{}]},
+        )
+
+    monkeypatch.setattr(
+        projection_build, "binding_projection", exactly_full_projection
+    )
+    with pytest.raises(ValueError, match="code-row bound exceeded"):
+        await projection_build._materialize_all_codes(
+            object(),
+            PROJECTION_ID,
+            [{"role": "in_network"}, {"role": "in_network"}],
+        )
+    assert len(binding_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_session_builder_reuses_authority_bound_candidate_under_lock(monkeypatch):
     with pytest.raises(ValueError, match="digest is invalid"):
         await projection_build.build_in_session(
             object(), binding_manifest_digest="bad", bindings=[]
@@ -181,6 +260,7 @@ async def test_session_builder_reuses_exact_candidate_under_lock(monkeypatch):
         "role": "in_network",
         "ordinal": 0,
     }
+    binding_digest = "b" * 64
 
     async def provider_signature(_session):
         return "c" * 64
@@ -190,11 +270,11 @@ async def test_session_builder_reuses_exact_candidate_under_lock(monkeypatch):
 
     monkeypatch.setattr(projection_build, "provider_signature", provider_signature)
     monkeypatch.setattr(projection_build, "_existing_candidate_receipt", existing)
-    candidate_id = projection_contract.projection_id("b" * 64, "c" * 64)
+    candidate_id = projection_contract.projection_id(binding_digest, "c" * 64)
     reuse_session = _ResultSession()
     assert await projection_build.build_in_session(
         reuse_session,
-        binding_manifest_digest="b" * 64,
+        binding_manifest_digest=binding_digest,
         bindings=[binding_by_field],
     ) == {"state": "ready"}
     assert "pg_advisory_xact_lock" in reuse_session.statements[0][0]
@@ -210,6 +290,7 @@ async def test_session_builder_builds_exact_candidate_under_lock(monkeypatch):
         "role": "in_network",
         "ordinal": 0,
     }
+    binding_digest = "b" * 64
     calls = []
 
     async def provider_signature(_session):
@@ -223,27 +304,40 @@ async def test_session_builder_builds_exact_candidate_under_lock(monkeypatch):
 
     async def materialize(*_args):
         calls.append("materialize")
-        return hashlib.sha256(), 1, 2, 3
+        return (
+            hashlib.sha256(),
+            projection_build.ProjectionV3Counts(
+                3, 2, 80, 1, 1, 70, 60, 1
+            ),
+        )
 
     async def seal(*_args):
         calls.append("seal")
         return {"state": "ready"}
 
+    async def validate(*_args):
+        calls.append("validate")
+
     monkeypatch.setattr(projection_build, "provider_signature", provider_signature)
     monkeypatch.setattr(projection_build, "_existing_candidate_receipt", absent)
     monkeypatch.setattr(projection_build, "_insert_candidate", insert)
     monkeypatch.setattr(projection_build, "_materialize_all_codes", materialize)
+    monkeypatch.setattr(
+        projection_build,
+        "validate_stored_aggregate_packs",
+        validate,
+    )
     monkeypatch.setattr(projection_build, "_seal_candidate", seal)
-    candidate_id = projection_contract.projection_id("b" * 64, "c" * 64)
+    candidate_id = projection_contract.projection_id(binding_digest, "c" * 64)
     build_session = _ResultSession()
     assert await projection_build.build_in_session(
         build_session,
-        binding_manifest_digest="b" * 64,
+        binding_manifest_digest=binding_digest,
         bindings=[binding_by_field],
     ) == {"state": "ready"}
     assert "pg_advisory_xact_lock" in build_session.statements[0][0]
     assert build_session.statements[0][1] == {"key": candidate_id}
-    assert calls == ["insert", "materialize", "seal"]
+    assert calls == ["insert", "materialize", "validate", "seal"]
 
 
 @pytest.mark.asyncio

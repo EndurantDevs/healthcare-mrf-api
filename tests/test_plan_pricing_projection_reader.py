@@ -12,6 +12,7 @@ import orjson
 import pytest
 
 from api import plan_pricing_projection as projection
+from api import plan_pricing_projection_source as projection_source
 
 from .test_plan_pricing_projection import PROJECTION_ID, _selection, _Session
 
@@ -71,6 +72,27 @@ async def test_provider_projection_keeps_one_address_per_npi_and_zip():
         provider_row["zip5"] for provider_row in providers_by_npi[1234567890]
     ] == ["60601", "60602"]
     assert "PARTITION BY addr.npi, COALESCE" in session.statements[0][0]
+    assert session.statements[0][1]["provider_row_limit"] == (
+        projection_source.MAX_PROVIDER_ROWS_PER_BATCH + 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_provider_projection_rejects_row_overflow_before_grouping(
+    monkeypatch,
+):
+    monkeypatch.setattr(projection_source, "MAX_PROVIDER_ROWS_PER_BATCH", 1)
+    provider_row_by_field = {
+        "npi": 1234567890,
+        "zip5": "60601",
+        "state": "IL",
+    }
+
+    with pytest.raises(ValueError, match="provider-row bound exceeded"):
+        await projection._projection_provider_rows_for_npis(
+            _Session([provider_row_by_field, provider_row_by_field]),
+            [1234567890],
+        )
 
 
 @pytest.mark.asyncio
@@ -155,7 +177,7 @@ async def test_projection_reader_embeds_pre_rendered_fragments(
     assert wire_response["result_type"] == expected_result_type
     assert wire_response["items"] == [orjson.loads(fragment)]
     assert wire_response["query"]["projection_contract"] == (
-        projection.PROJECTION_CONTRACT
+        projection.LEGACY_PROJECTION_CONTRACT
     )
     assert wire_response["query"]["include_providers"] is (
         expected_result_type == "provider_cards"
