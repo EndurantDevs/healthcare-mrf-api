@@ -34,7 +34,6 @@ def test_invalid_runtime_attestation_cannot_complete_envelope(
 ) -> None:
     """Only a regular exact Kubernetes runtime attestation is admissible."""
 
-    started = time.monotonic()
     result, state_root = envelope._run_envelope(
         tmp_path,
         FAKE_ATTESTATION_MODE=mode,
@@ -42,7 +41,8 @@ def test_invalid_runtime_attestation_cannot_complete_envelope(
 
     assert result.returncode == expected_exit
     if mode != "empty-image":
-        assert time.monotonic() - started < 10
+        pod_reads = tmp_path / "fake-state/attestation-pod-reads"
+        assert not pod_reads.exists() or int(pod_reads.read_text()) <= 2
     if mode == "missing":
         assert not (state_root / "run/child-jobs.tmp").exists()
         assert not (state_root / "run/child-deadline-fired").exists()

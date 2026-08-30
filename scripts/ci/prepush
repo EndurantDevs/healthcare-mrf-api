@@ -12,6 +12,7 @@ container_rust_image='docker.io/library/rust:1.97.1-slim-trixie@sha256:fc0648ac2
 container_python_image='docker.io/library/python:3.14.6-slim-trixie@sha256:b921fe7e7522f828d45197a47656ec465a9b15689b27fa8e1fba2864fca5b967'
 
 capacity_test_paths=${CAPACITY_TEST_PATHS:-$'tests/test_ptg2_capacity_evidence.py\ntests/test_ptg2_v3_bounded_readers.py\ntests/test_ptg2_v3_capacity_gate.py\ntests/test_ptg2_v3_capacity_gate_adversarial.py\ntests/test_ptg2_v3_capacity_resources.py'}
+capacity_test_paths+=$'\ntests/test_plan_pricing_projection_v3_census_envelope_admission.py\ntests/test_plan_pricing_projection_v3_census_envelope_interrupts.py\ntests/test_plan_pricing_projection_v3_census_envelope_runtime_safety.py\ntests/test_plan_pricing_projection_v3_census_envelope_safety.py'
 artifact_root=${PREPUSH_ARTIFACT_ROOT:-.}
 
 artifact_path() {

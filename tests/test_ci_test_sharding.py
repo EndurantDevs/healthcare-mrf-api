@@ -44,6 +44,41 @@ def test_collection_command_has_the_hard_test_process_limit() -> None:
     assert command[-2:] == ["--ignore", "tests/capacity.py"]
 
 
+def test_slow_envelope_suites_run_once_in_the_parallel_capacity_lane() -> None:
+    """Keep subprocess-heavy envelope proofs out of the serial main shards."""
+
+    workflow = yaml.safe_load(
+        (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    prepush = (REPOSITORY_ROOT / "scripts" / "ci" / "prepush").read_text(
+        encoding="utf-8"
+    )
+    expected = (
+        "tests/test_plan_pricing_projection_v3_census_envelope_admission.py",
+        "tests/test_plan_pricing_projection_v3_census_envelope_interrupts.py",
+        "tests/test_plan_pricing_projection_v3_census_envelope_runtime_safety.py",
+        "tests/test_plan_pricing_projection_v3_census_envelope_safety.py",
+    )
+    base_capacity_paths = tuple(workflow["env"]["CAPACITY_TEST_PATHS"].splitlines())
+    expected_append = "capacity_test_paths+=$'\\n" + "\\n".join(expected) + "'"
+    python_main = prepush.split("run_python_main() {", 1)[1].split(
+        "run_capacity() {", 1
+    )[0]
+    capacity = prepush.split("run_capacity() {", 1)[1].split(
+        "run_python_coverage() {", 1
+    )[0]
+
+    assert set(expected).isdisjoint(base_capacity_paths)
+    assert expected_append in prepush
+    assert 'collection_args+=(--ignore "$test_path")' in python_main
+    assert "python -m pytest -q -n 4 --dist load" in capacity
+    assert '"${capacity_tests[@]}"' in capacity
+    for test_path in expected:
+        assert prepush.count(test_path) == 1
+
+
 def test_cli_collects_and_assigns_each_temporary_test_once(tmp_path: Path) -> None:
     test_root = tmp_path / "tests"
     test_root.mkdir()
