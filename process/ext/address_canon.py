@@ -2539,6 +2539,11 @@ async def resolve_into_archive(
                     LEFT JOIN address_strict_source_observations AS strict
                       ON strict.address_key = d.address_key
                      AND strict.identity_key = d.identity_key
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM {archive} AS existing
+                        WHERE existing.address_key = d.address_key
+                    )
                     ON CONFLICT (address_key) DO NOTHING
                     RETURNING 1
                 )
