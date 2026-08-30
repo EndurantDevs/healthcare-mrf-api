@@ -7915,6 +7915,7 @@ hospitals:
 - hospital_id: hospital-002421
   name: Grady Memorial
   cms_hpt_url: https://www.gradyhealth.org/cms-hpt.txt
+  locator_name: Grady Health System
 - hospital_id: hospital-002422
   name: Grady Memorial Hospital
   cms_hpt_url: https://www.gradymem.org/cms-hpt.txt
@@ -20852,6 +20853,7 @@ hospitals:
 - hospital_id: hospital-006345
   name: Summa Rehabilitation Hospital
   cms_hpt_url: https://summarehabhospital.com/cms-hpt.txt
+  locator_name: Summa Rehab Hospital, LLC
 - hospital_id: hospital-006346
   name: Summer Creek Convenient Care Center ED
   cms_hpt_url: https://memorialhermann.org/cms-hpt.txt

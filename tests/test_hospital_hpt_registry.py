@@ -84,7 +84,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(registry.hospital_hpt_registry_groups()) == 7_112
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
-    assert sum("locator_name" in entry for entry in hospitals) == 1_410
+    assert sum("locator_name" in entry for entry in hospitals) == 1_412
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 644
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 31
     assert {entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry} == set(
@@ -98,6 +98,8 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
             "hospital-000188",
             "hospital-000342",
             "hospital-000600",
+            "hospital-002421",
+            "hospital-006345",
         )
     } == {
         "hospital-000047": "Adair County Memorial Hospital",
@@ -105,6 +107,8 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
         "hospital-000188": "Amberwell Atchison Association",
         "hospital-000342": "Ashland Health Center",
         "hospital-000600": "Baptist Health Hardin",
+        "hospital-002421": "Grady Health System",
+        "hospital-006345": "Summa Rehab Hospital, LLC",
     }
     assert [hospital_by_id[hospital_id]["cms_hpt_url"] for hospital_id in (
         "hospital-000047", "hospital-000188", "hospital-000600",
