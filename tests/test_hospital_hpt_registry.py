@@ -9,7 +9,6 @@ import pytest
 
 from process import hospital_hpt_registry as registry
 
-
 _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-000188": "a6632acf6862be3c7ff2ae19b51a2fa0a5da283b7d6a0954ced59e323408f1bc",
     "hospital-000189": "dff5b72c99a19b8989184eb65b37de4246c4dd3649097b697830fcd8b22638ab",
@@ -69,6 +68,7 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-001881": "Edgerton Hospital and Health Services - Milton Clinic",
     "hospital-002421": "Grady Health System",
     "hospital-005162": "Pioneer Memorial Hospital & Health Services",
+    "hospital-005915": "Mee Memorial Hospital",
     "hospital-006345": "Summa Rehab Hospital, LLC",
 }
 
@@ -96,7 +96,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(registry.hospital_hpt_registry_groups()) == 7_108
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
-    assert sum("locator_name" in entry for entry in hospitals) == 1_421
+    assert sum("locator_name" in entry for entry in hospitals) == 1_422
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 644
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 40
     assert {entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry} == set(
