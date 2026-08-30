@@ -66,6 +66,7 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-001881": "Edgerton Hospital and Health Services - Milton Clinic",
     "hospital-002421": "Grady Health System",
     "hospital-003240": "Jersey Community Hospital",
+    "hospital-003592": "Little River Medical Center, INC DBA Little River Memorial Hospital",
     "hospital-005162": "Pioneer Memorial Hospital & Health Services",
     "hospital-005304": "Ramapo Ridge Behavioral Health",
     "hospital-005915": "Mee Memorial Hospital",
@@ -96,7 +97,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(registry.hospital_hpt_registry_groups()) == 7_108
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
-    assert sum("locator_name" in entry for entry in hospitals) == 1_424
+    assert sum("locator_name" in entry for entry in hospitals) == 1_425
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 644
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 40
     assert {entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry} == set(
@@ -151,7 +152,6 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
 def test_checked_in_registry_has_reviewed_wvu_legal_name_aliases():
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
-
     aliases_by_id = {
         "hospital-000715": "Barnesville Hospital",
         "hospital-001050": "Camden Clark Medical Center",

@@ -11797,6 +11797,7 @@ hospitals:
 - hospital_id: hospital-003592
   name: Little River Memorial Hospital
   cms_hpt_url: https://lrmh.org/cms-hpt.txt
+  locator_name: Little River Medical Center, INC DBA Little River Memorial Hospital
 - hospital_id: hospital-003593
   name: Little River Tidelands Health Rehabilitation Hospital, an affiliate of Encompass Health
   cms_hpt_url: https://www.encompasshealth.com/cms-hpt.txt
