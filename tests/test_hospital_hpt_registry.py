@@ -190,12 +190,10 @@ def test_duplicate_names_and_locators_are_preserved(tmp_path):
     locator = "http://hospital.example:8080/nonstandard/path?view=current"
     hospitals = _load(
         tmp_path,
-        _document(locator)
-        + f"""\
-  - hospital_id: hospital-000002
-    name: Example Hospital
-    cms_hpt_url: {locator}
-""",
+        _document(locator).replace(
+            "hospital_id: hospital-000001",
+            "hospital_ids:\n    - hospital-000001\n    - hospital-000002",
+        ),
     )
     assert [entry["cms_hpt_url"] for entry in hospitals] == [locator, locator]
     assert [entry["name"] for entry in hospitals] == [
@@ -333,11 +331,10 @@ def test_optional_locator_mrf_selector_must_be_queryless_and_canonical(
 
 
 def test_duplicate_hospital_id_is_rejected(tmp_path):
-    text = _document() + """\
-  - hospital_id: hospital-000001
-    name: Another Hospital
-    cms_hpt_url: https://another.example/locator
-"""
+    text = _document().replace(
+        "hospital_id: hospital-000001",
+        "hospital_ids:\n    - hospital-000001\n    - hospital-000001",
+    )
 
     with pytest.raises(registry.HospitalHptRegistryError, match="duplicate_hospital_id"):
         _load(tmp_path, text)

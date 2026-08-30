@@ -12157,6 +12157,101 @@ def _cigna_file_url(item: dict[str, Any]) -> str | None:
     return str(value).strip() if value else None
 
 
+def _cigna_group_value(
+    file_item: dict[str, Any], group: dict[str, Any], keys: tuple[str, ...]
+) -> Any:
+    return _first_dict_value(file_item, keys) or _first_dict_value(group, keys)
+
+
+def _cigna_lookup_metadata(
+    file_item: dict[str, Any],
+    group: dict[str, Any],
+    *,
+    file_url: str,
+    file_name: str,
+    lookup_url: str,
+    toc_max_bytes: int,
+) -> dict[str, Any]:
+    container_format = _container_format(file_url) or _container_format(file_name)
+    return {
+        "resolver": "cigna_static_mrf_lookup",
+        "target_kind": "file_reference" if container_format == "zip" else "toc_json",
+        "target_file_type": "table-of-contents",
+        "container_format": container_format,
+        "target_max_bytes": toc_max_bytes,
+        "lookup_url": lookup_url,
+        "file_name": file_name,
+        "blob_size": _parse_size_bytes(
+            _cigna_group_value(
+                file_item,
+                group,
+                ("file_size", "fileSize", "size", "content_length", "contentLength"),
+            )
+        ),
+        "reporting_entity_name": _cigna_group_value(
+            file_item,
+            group,
+            ("reporting_entity_name", "reportingEntityName", "entity_name", "entityName"),
+        ),
+        "reporting_entity_type": _cigna_group_value(
+            file_item,
+            group,
+            ("reporting_entity_type", "reportingEntityType", "entity_type", "entityType"),
+        ),
+        "last_updated_on": _cigna_group_value(
+            file_item, group, ("last_updated_on", "lastUpdatedOn")
+        ),
+        "reporting_month": _cigna_group_value(
+            file_item, group, ("reporting_month", "reportingMonth")
+        ),
+        "product_type": _cigna_group_value(
+            file_item, group, ("product_type", "productType")
+        ),
+    }
+
+
+def _cigna_lookup_target(
+    file_item: dict[str, Any],
+    group: dict[str, Any],
+    *,
+    lookup_url: str,
+    source_row_dict: dict[str, Any],
+    toc_max_bytes: int,
+) -> CrawlTarget | None:
+    file_url = _cigna_file_url(file_item)
+    if not file_url:
+        return None
+    file_url = urljoin(lookup_url, file_url)
+    file_name = _clean_text(
+        _cigna_group_value(file_item, group, ("file_name", "fileName", "name", "label"))
+        or Path(urlsplit(file_url).path).name
+    )
+    if not (
+        _is_direct_toc_url(file_url)
+        or _mrf_file_type_from_text(file_url, file_name) == "table-of-contents"
+    ):
+        return None
+    metadata = _cigna_lookup_metadata(
+        file_item,
+        group,
+        file_url=file_url,
+        file_name=file_name,
+        lookup_url=lookup_url,
+        toc_max_bytes=toc_max_bytes,
+    )
+    return CrawlTarget(
+        source=source_row_dict,
+        url=file_url,
+        label=file_name or str(source_row_dict.get("display_name") or "Cigna MRF index"),
+        resolved_from_url=lookup_url,
+        metadata={
+            key: metadata_value
+            for key, metadata_value in metadata.items()
+            if metadata_value not in (None, "")
+        },
+    )
+
+
 def _parse_cigna_lookup_targets(
     lookup_payload: dict[str, Any],
     *,
@@ -12185,123 +12280,20 @@ def _parse_cigna_lookup_targets(
     for group in groups:
         if not isinstance(group, dict):
             continue
-        group_files = (
-            group.get("files") if isinstance(group.get("files"), list) else None
-        )
-        files = group_files or [group]
-        for file_item in files:
+        files = group.get("files") if isinstance(group.get("files"), list) else None
+        for file_item in files or [group]:
             if not isinstance(file_item, dict):
                 continue
-            file_url = _cigna_file_url(file_item)
-            if not file_url:
-                continue
-            file_url = urljoin(lookup_url, file_url)
-            file_name = _clean_text(
-                _first_dict_value(file_item, ("file_name", "fileName", "name", "label"))
-                or _first_dict_value(group, ("file_name", "fileName", "name", "label"))
-                or Path(urlsplit(file_url).path).name
-            )
-            if not (
-                _is_direct_toc_url(file_url)
-                or _mrf_file_type_from_text(file_url, file_name) == "table-of-contents"
-            ):
-                continue
-            size_bytes = _parse_size_bytes(
-                _first_dict_value(
-                    file_item,
-                    (
-                        "file_size",
-                        "fileSize",
-                        "size",
-                        "content_length",
-                        "contentLength",
-                    ),
-                )
-                or _first_dict_value(
-                    group,
-                    (
-                        "file_size",
-                        "fileSize",
-                        "size",
-                        "content_length",
-                        "contentLength",
-                    ),
-                )
-            )
-            reporting_entity_name = _first_dict_value(
+            crawl_target = _cigna_lookup_target(
                 file_item,
-                (
-                    "reporting_entity_name",
-                    "reportingEntityName",
-                    "entity_name",
-                    "entityName",
-                ),
-            ) or _first_dict_value(
                 group,
-                (
-                    "reporting_entity_name",
-                    "reportingEntityName",
-                    "entity_name",
-                    "entityName",
-                ),
+                lookup_url=lookup_url,
+                source_row_dict=source_row_dict,
+                toc_max_bytes=toc_max_bytes,
             )
-            reporting_entity_type = _first_dict_value(
-                file_item,
-                (
-                    "reporting_entity_type",
-                    "reportingEntityType",
-                    "entity_type",
-                    "entityType",
-                ),
-            ) or _first_dict_value(
-                group,
-                (
-                    "reporting_entity_type",
-                    "reportingEntityType",
-                    "entity_type",
-                    "entityType",
-                ),
-            )
-            container_format = _container_format(file_url) or _container_format(file_name)
-            metadata = {
-                "resolver": "cigna_static_mrf_lookup",
-                "target_kind": (
-                    "file_reference" if container_format == "zip" else "toc_json"
-                ),
-                "target_file_type": "table-of-contents",
-                "container_format": container_format,
-                "target_max_bytes": toc_max_bytes,
-                "lookup_url": lookup_url,
-                "file_name": file_name,
-                "blob_size": size_bytes,
-                "reporting_entity_name": reporting_entity_name,
-                "reporting_entity_type": reporting_entity_type,
-                "last_updated_on": _first_dict_value(
-                    file_item, ("last_updated_on", "lastUpdatedOn")
-                )
-                or _first_dict_value(group, ("last_updated_on", "lastUpdatedOn")),
-                "reporting_month": _first_dict_value(
-                    file_item, ("reporting_month", "reportingMonth")
-                )
-                or _first_dict_value(group, ("reporting_month", "reportingMonth")),
-                "product_type": _first_dict_value(
-                    file_item, ("product_type", "productType")
-                )
-                or _first_dict_value(group, ("product_type", "productType")),
-            }
-            key = _canonical_or_none(file_url) or file_url
-            targets_by_url[key] = CrawlTarget(
-                source=source_row_dict,
-                url=file_url,
-                label=file_name
-                or str(source_row_dict.get("display_name") or "Cigna MRF index"),
-                resolved_from_url=lookup_url,
-                metadata={
-                    key: metadata_value
-                    for key, metadata_value in metadata.items()
-                    if metadata_value not in (None, "")
-                },
-            )
+            if crawl_target is not None:
+                key = _canonical_or_none(crawl_target.url) or crawl_target.url
+                targets_by_url[key] = crawl_target
     return list(targets_by_url.values())
 
 
@@ -14479,6 +14471,61 @@ def _is_direct_toc_url(url: str | None) -> bool:
     )
 
 
+async def _resolve_uhc_blob_listing(
+    source_row: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    host = _domain(url) or ""
+    configured_paths = (
+        resolver.get("optum_path_templates")
+        if "optum.com" in host
+        else resolver.get("path_templates")
+    )
+    paths = [str(path) for path in configured_paths or () if str(path).strip()]
+    target_query = _source_target_payer_query(source_row)
+    crawl_targets: list[CrawlTarget] = []
+    for path in paths:
+        listing_url = urljoin(url, path)
+        listing = await _fetch_json(
+            listing_url,
+            max_bytes=int(resolver.get("max_bytes") or 64 * 1024 * 1024),
+            session=session,
+        )
+        parsed_targets = _uhc_blob_targets_matching_query(
+            _parse_uhc_blob_listing(listing), target_query
+        )
+        max_targets = _as_int(resolver.get("max_targets")) if target_query else None
+        if max_targets and max_targets > 0:
+            parsed_targets = parsed_targets[:max_targets]
+        crawl_targets.extend(
+            CrawlTarget(
+                source=source_row,
+                url=str(parsed_target["url"]),
+                label=str(
+                    parsed_target.get("label")
+                    or source_row.get("display_name")
+                    or ""
+                ),
+                resolved_from_url=listing_url,
+                metadata={
+                    "resolver": "uhc_blob_listing",
+                    "blob_name": parsed_target.get("name"),
+                    "blob_size": parsed_target.get("size"),
+                    "target_kind": parsed_target.get("target_kind"),
+                    "target_file_type": parsed_target.get("target_file_type"),
+                    "container_format": parsed_target.get("container_format"),
+                },
+            )
+            for parsed_target in parsed_targets
+        )
+    if not crawl_targets:
+        suffix = f" matching target payer query {target_query!r}" if target_query else ""
+        raise ValueError(f"no UHC blob index links found for {url}{suffix}")
+    return crawl_targets
+
+
 async def _crawl_targets_for_source(
     source_row: dict[str, Any],
     url: str,
@@ -14655,57 +14702,9 @@ async def _crawl_targets_for_source(
             raise ValueError(f"no UHC provider MRF files found for {url}")
         return crawl_targets
     if resolver_type == "uhc_blob_listing":
-        host = _domain(url) or ""
-        configured_paths = (
-            resolver_by_key.get("optum_path_templates")
-            if "optum.com" in host
-            else resolver_by_key.get("path_templates")
+        return await _resolve_uhc_blob_listing(
+            source_row, url, resolver_by_key, session
         )
-        paths = [str(resolver_entry) for resolver_entry in (configured_paths or ()) if str(resolver_entry).strip()]
-        target_query = _source_target_payer_query(source_row)
-        crawl_targets: list[CrawlTarget] = []
-        for path in paths:
-            listing_url = urljoin(url, path)
-            listing = await _fetch_json(
-                listing_url,
-                max_bytes=int(resolver_by_key.get("max_bytes") or 64 * 1024 * 1024),
-                session=session,
-            )
-            parsed_targets = _uhc_blob_targets_matching_query(
-                _parse_uhc_blob_listing(listing),
-                target_query,
-            )
-            if target_query:
-                max_targets = _as_int(resolver_by_key.get("max_targets"))
-                if max_targets and max_targets > 0:
-                    parsed_targets = parsed_targets[:max_targets]
-            for crawl_target in parsed_targets:
-                crawl_targets.append(
-                    CrawlTarget(
-                        source=source_row,
-                        url=str(crawl_target["url"]),
-                        label=str(
-                            crawl_target.get("label") or source_row.get("display_name") or ""
-                        ),
-                        resolved_from_url=listing_url,
-                        metadata={
-                            "resolver": resolver_type,
-                            "blob_name": crawl_target.get("name"),
-                            "blob_size": crawl_target.get("size"),
-                            "target_kind": crawl_target.get("target_kind"),
-                            "target_file_type": crawl_target.get("target_file_type"),
-                            "container_format": crawl_target.get("container_format"),
-                        },
-                    )
-                )
-        if not crawl_targets:
-            suffix = (
-                f" matching target payer query {target_query!r}"
-                if target_query
-                else ""
-            )
-            raise ValueError(f"no UHC blob index links found for {url}{suffix}")
-        return crawl_targets
     if resolver_type == "sapphire_html_tocs":
         if _is_direct_toc_url(url):
             return [
@@ -14747,61 +14746,6 @@ async def _crawl_targets_for_source(
             )
             for crawl_target in crawl_targets
         ]
-    if resolver_type == "anthem_s3_mrf":
-        return await _resolve_anthem_s3_mrf(source_row, url, resolver_by_key, session)
-    if resolver_type == "hcsc_asomrf_landing":
-        return await _resolve_hcsc_asomrf_landing(source_row, url, resolver_by_key, session)
-    if resolver_type == "point32_azure_mrf_directory":
-        return await _resolve_point32_azure_mrf_directory(
-            source_row, url, resolver_by_key, session
-        )
-    if resolver_type == "html_delegated_mrf_links":
-        return await _resolve_html_delegated_mrf_links(source_row, url, resolver_by_key, session)
-    if resolver_type == "wordpress_elfinder_mrf_links":
-        return await _resolve_wordpress_elfinder_mrf_links(
-            source_row, url, resolver_by_key, session
-        )
-    if resolver_type == "html_mrf_links":
-        return await _resolve_html_mrf_links(source_row, url, resolver_by_key, session)
-    if resolver_type == "socrata_data_json_mrf_catalog":
-        return await _resolve_socrata_data_json_mrf_catalog(
-            source_row, url, resolver_by_key, session
-        )
-    if resolver_type == "json_mrf_directory_links":
-        return await _resolve_json_mrf_directory_links(source_row, url, resolver_by_key, session)
-    if resolver_type == "healthspace_machine_readable_files":
-        return await _resolve_healthspace_machine_readable_files(
-            source_row, url, resolver_by_key, session
-        )
-    if resolver_type == "humana_pct_file_list":
-        return await _resolve_humana_pct_file_list(source_row, url, resolver_by_key, session)
-    if resolver_type == "fchn_payor_search":
-        return await _resolve_fchn_payor_search(source_row, url, resolver_by_key, session)
-    if resolver_type == "payercompass_mrf":
-        return await _resolve_payercompass_mrf(source_row, url, resolver_by_key, session)
-    if resolver_type == "webtpa_mrf_api":
-        return await _resolve_webtpa_mrf_api(source_row, url, resolver_by_key, session)
-    if resolver_type == "cmstic_file_info":
-        return await _resolve_cmstic_file_info(source_row, url, resolver_by_key, session)
-    if resolver_type == "cmstic_keyed_toc_redirect":
-        return await _resolve_cmstic_keyed_toc_redirect(
-            source_row, url, resolver_by_key, session
-        )
-    if resolver_type == "direct_toc":
-        crawl_target = _direct_toc_crawl_target(
-            source_row,
-            url,
-            resolver=resolver_type,
-            target_max_bytes=_parse_size_bytes(resolver_by_key.get("toc_max_bytes")),
-        )
-        if crawl_target:
-            return [crawl_target]
-        raise ValueError(f"no direct MRF TOC target found for {url}")
-    if resolver_type == "direct_mrf_body":
-        crawl_target = _direct_mrf_body_crawl_target(source_row, url, resolver=resolver_type)
-        if crawl_target:
-            return [crawl_target]
-        raise ValueError(f"no direct MRF body target found for {url}")
     direct_toc_target = _direct_toc_crawl_target(source_row, url)
     if direct_toc_target:
         return [direct_toc_target]
@@ -15118,6 +15062,103 @@ def _filter_query_expansion_targets(
     return matched_targets[:limit] if limit and limit > 0 else matched_targets
 
 
+@dataclass(frozen=True)
+class _CrawlTargetResolverContext:
+    session: aiohttp.ClientSession
+    run_id: str | None
+    crawl_target_limit: int | None
+    source_resolve_timeout: float
+    semaphore: asyncio.Semaphore
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+async def _query_probe_targets(
+    source_row: dict[str, Any],
+    url_text: str,
+    query: str | None,
+    context: _CrawlTargetResolverContext,
+) -> list[CrawlTarget]:
+    if not query:
+        return []
+    try:
+        probe_targets = await _sapphire_query_probe_targets(
+            source_row, url_text, query, context.session
+        )
+    except Exception:
+        return []
+    return [
+        matched
+        for target in probe_targets
+        if (matched := _matched_query_expansion_target(target, query)) is not None
+    ]
+
+
+async def _resolve_one_crawl_source(
+    idx: int,
+    source_row: dict[str, Any],
+    url: Any,
+    context: _CrawlTargetResolverContext,
+) -> tuple[int, list[CrawlTarget], list[dict[str, Any]]]:
+    url_text = str(url)
+    target_query = _source_target_payer_query(source_row)
+
+    async def resolve_body() -> tuple[int, list[CrawlTarget], list[dict[str, Any]]]:
+        """Expand and filter one source URL under the shared resolver context."""
+        resolved_targets = await _crawl_targets_for_source(
+            source_row,
+            url_text,
+            context.session,
+            target_limit=context.crawl_target_limit,
+        )
+        had_resolved_targets = bool(resolved_targets)
+        if target_query:
+            resolved_targets.extend(
+                await _query_probe_targets(source_row, url_text, target_query, context)
+            )
+            resolved_targets = _filter_query_expansion_targets(
+                resolved_targets,
+                target_query,
+                limit=context.crawl_target_limit,
+            )
+        if resolved_targets:
+            return idx, resolved_targets, []
+        skip_reason = (
+            "resolved crawl targets did not match the target payer query"
+            if target_query and had_resolved_targets
+            else "no configured resolver and URL is not a direct JSON TOC"
+        )
+        return idx, [], [
+            _crawl_skipped_observation(source_row, url_text, skip_reason, context.run_id)
+        ]
+
+    async with context.semaphore:
+        try:
+            if context.source_resolve_timeout > 0:
+                return await asyncio.wait_for(
+                    resolve_body(), timeout=context.source_resolve_timeout
+                )
+            return await resolve_body()
+        except TimeoutError as exc:
+            return idx, [], [
+                _crawl_failed_observation(source_row, url_text, exc, context.run_id)
+            ]
+        except Exception as exc:
+            probe_targets = await _query_probe_targets(
+                source_row, url_text, target_query, context
+            )
+            if probe_targets:
+                return idx, probe_targets, []
+            return idx, [], [
+                _crawl_failed_observation(source_row, url_text, exc, context.run_id)
+            ]
+
+
 async def _resolve_crawl_targets(
     source_rows: list[dict[str, Any]],
     *,
@@ -15136,105 +15177,22 @@ async def _resolve_crawl_targets(
     total = len(source_items)
     crawl_targets: list[CrawlTarget] = []
     observations: list[dict[str, Any]] = []
-    semaphore = asyncio.Semaphore(max(1, int(concurrency or DEFAULT_CONCURRENCY)))
-    try:
-        source_resolve_timeout = float(
-            os.getenv("HLTHPRT_MRF_SOURCE_RESOLVE_TIMEOUT_SECONDS", "60")
-        )
-    except ValueError:
-        source_resolve_timeout = 60.0
+    source_resolve_timeout = _float_env(
+        "HLTHPRT_MRF_SOURCE_RESOLVE_TIMEOUT_SECONDS", 60.0
+    )
     pending_label_by_index = {
         idx: _source_progress_label(source_row, url)
         for idx, source_row, url in source_items
     }
-
-    def pending_detail() -> str | None:
-        """Format a compact description of pending crawl work."""
-        if not pending_label_by_index:
-            return None
-        sample = list(pending_label_by_index.values())[:5]
-        remaining = len(pending_label_by_index) - len(sample)
-        suffix = f" +{remaining}" if remaining > 0 else ""
-        return f"waiting on: {', '.join(sample)}{suffix}"
-
-    async def query_probe_targets(
-        source_row: dict[str, Any], url_text: str, query: str | None
-    ) -> list[CrawlTarget]:
-        """Probe a source query endpoint and return matching crawl targets."""
-        if not query:
-            return []
-        try:
-            probe_targets = await _sapphire_query_probe_targets(
-                source_row, url_text, query, session
-            )
-        except Exception:
-            return []
-        return [
-            matched
-            for target in probe_targets
-            if (matched := _matched_query_expansion_target(target, query)) is not None
-        ]
-
-    async def resolve_one(
-        idx: int, source_row: dict[str, Any], url: Any
-    ) -> tuple[int, list[CrawlTarget], list[dict[str, Any]]]:
-        """Resolve one source URL and capture failures as observations."""
-        url_text = str(url)
-        target_query = _source_target_payer_query(source_row)
-
-        async def resolve_body() -> tuple[int, list[CrawlTarget], list[dict[str, Any]]]:
-            """Crawl the source URL and expand its target-payer query results."""
-            resolved_targets = await _crawl_targets_for_source(
-                source_row,
-                url_text,
-                session,
-                target_limit=crawl_target_limit,
-            )
-            had_resolved_targets = bool(resolved_targets)
-            if target_query:
-                resolved_targets.extend(
-                    await query_probe_targets(source_row, url_text, target_query)
-                )
-                resolved_targets = _filter_query_expansion_targets(
-                    resolved_targets,
-                    target_query,
-                    limit=crawl_target_limit,
-                )
-            if not resolved_targets:
-                skip_reason = (
-                    "resolved crawl targets did not match the target payer query"
-                    if target_query and had_resolved_targets
-                    else "no configured resolver and URL is not a direct JSON TOC"
-                )
-                return idx, [], [
-                    _crawl_skipped_observation(
-                        source_row,
-                        url_text,
-                        skip_reason,
-                        run_id,
-                    )
-                ]
-            return idx, resolved_targets, []
-
-        async with semaphore:
-            try:
-                if source_resolve_timeout > 0:
-                    return await asyncio.wait_for(
-                        resolve_body(), timeout=source_resolve_timeout
-                    )
-                return await resolve_body()
-            except TimeoutError as exc:
-                return idx, [], [_crawl_failed_observation(source_row, url_text, exc, run_id)]
-            except Exception as exc:
-                probe_targets = await query_probe_targets(
-                    source_row, url_text, target_query
-                )
-                if probe_targets:
-                    return idx, probe_targets, []
-                return idx, [], [_crawl_failed_observation(source_row, url_text, exc, run_id)]
-
+    context = _CrawlTargetResolverContext(
+        session=session,
+        run_id=run_id,
+        crawl_target_limit=crawl_target_limit,
+        source_resolve_timeout=source_resolve_timeout,
+        semaphore=asyncio.Semaphore(max(1, int(concurrency or DEFAULT_CONCURRENCY))),
+    )
     tasks = [
-        asyncio.create_task(resolve_one(idx, source_row, url))
+        asyncio.create_task(_resolve_one_crawl_source(idx, source_row, url, context))
         for idx, source_row, url in source_items
     ]
     for done, task in enumerate(asyncio.as_completed(tasks), start=1):
@@ -15243,6 +15201,11 @@ async def _resolve_crawl_targets(
         crawl_targets.extend(resolved_targets)
         observations.extend(resolved_observations)
         if progress_run_id:
+            sample = list(pending_label_by_index.values())[:5]
+            remaining = len(pending_label_by_index) - len(sample)
+            pending_detail = f"waiting on: {', '.join(sample)}"
+            if remaining > 0:
+                pending_detail = f"{pending_detail} +{remaining}"
             enqueue_live_progress(
                 run_id=progress_run_id,
                 importer="mrf-source-discovery",
@@ -15252,7 +15215,7 @@ async def _resolve_crawl_targets(
                 done=done,
                 total=total,
                 message=f"resolved {done}/{total} source pages",
-                detail=pending_detail(),
+                detail=pending_detail if sample else None,
             )
     return crawl_targets, observations
 
@@ -16155,6 +16118,144 @@ class _CrawlExecutionContext:
     target_semaphore: asyncio.Semaphore | None = None
 
 
+async def _crawl_toc_file_reference_rows(
+    toc_target: CrawlTarget,
+    session: aiohttp.ClientSession,
+    *,
+    target_max_bytes: int,
+    should_filter_to_target_query: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if (toc_target.metadata or {}).get("container_format") == "zip":
+        toc_values = await _fetch_zip_json_values(
+            toc_target.url,
+            max_bytes=target_max_bytes,
+            session=session,
+        )
+    else:
+        toc_values = [
+            (
+                Path(urlsplit(toc_target.url).path).name,
+                await _fetch_query_filtered_toc(
+                    toc_target,
+                    max_bytes=target_max_bytes,
+                    session=session,
+                )
+                if should_filter_to_target_query
+                else await _fetch_json(
+                    toc_target.url,
+                    max_bytes=target_max_bytes,
+                    session=session,
+                ),
+            )
+        ]
+    plan_rows: list[dict[str, Any]] = []
+    file_rows: list[dict[str, Any]] = []
+    for _member_name, toc in toc_values:
+        if not isinstance(toc, dict):
+            raise ValueError("expected JSON object")
+        if should_filter_to_target_query:
+            member_plan_rows, member_file_rows = _toc_rows_from_content(
+                toc_target.source,
+                toc_target.url,
+                toc,
+                filter_to_target_query=True,
+            )
+        else:
+            member_plan_rows, member_file_rows = _toc_rows_from_content(
+                toc_target.source, toc_target.url, toc
+            )
+        plan_rows.extend(member_plan_rows)
+        file_rows.extend(
+            _apply_crawl_target_context_to_file_rows(member_file_rows, toc_target)
+        )
+    return plan_rows, file_rows
+
+
+async def _crawl_target_rows(
+    toc_target: CrawlTarget,
+    session: aiohttp.ClientSession,
+    *,
+    target_max_bytes: int,
+    should_filter_to_target_query: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    target_kind = (toc_target.metadata or {}).get("target_kind")
+    target_file_type = (toc_target.metadata or {}).get("target_file_type")
+    if target_kind == "file_reference" and target_file_type == "table-of-contents":
+        plan_rows, file_rows = await _crawl_toc_file_reference_rows(
+            toc_target,
+            session,
+            target_max_bytes=target_max_bytes,
+            should_filter_to_target_query=should_filter_to_target_query,
+        )
+        return plan_rows, file_rows, len(file_rows)
+    if target_kind in {"file_reference", "source_landing_page"}:
+        return _plan_rows_from_target_metadata(toc_target), [], 1
+    if target_kind == "metadata_text":
+        text = await _fetch_text(
+            toc_target.url, max_bytes=target_max_bytes, session=session
+        )
+        plan_rows, file_rows = _metadata_text_rows_from_content(
+            toc_target.source, toc_target.url, text
+        )
+    else:
+        toc = (
+            await _fetch_query_filtered_toc(
+                toc_target,
+                max_bytes=target_max_bytes,
+                session=session,
+            )
+            if should_filter_to_target_query
+            else await _fetch_json(
+                toc_target.url, max_bytes=target_max_bytes, session=session
+            )
+        )
+        if should_filter_to_target_query:
+            plan_rows, file_rows = _toc_rows_from_content(
+                toc_target.source,
+                toc_target.url,
+                toc,
+                filter_to_target_query=True,
+            )
+        else:
+            plan_rows, file_rows = _toc_rows_from_content(
+                toc_target.source, toc_target.url, toc
+            )
+        file_rows = _apply_crawl_target_context_to_file_rows(file_rows, toc_target)
+    return plan_rows, file_rows, len(file_rows)
+
+
+async def _crawl_one_toc_target(
+    toc_target: CrawlTarget,
+    session: aiohttp.ClientSession,
+    *,
+    max_toc_bytes: int,
+    run_id: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
+    try:
+        should_filter_to_target_query = (
+            (toc_target.metadata or {}).get("query_expansion_match_scope") == "toc_plan"
+            and _supports_toc_plan_query_scan(toc_target)
+        )
+        plan_rows, file_rows, observed_file_count = await _crawl_target_rows(
+            toc_target,
+            session,
+            target_max_bytes=_target_fetch_max_bytes(toc_target, max_toc_bytes),
+            should_filter_to_target_query=should_filter_to_target_query,
+        )
+        observation = _crawl_ok_observation(
+            toc_target,
+            run_id=run_id,
+            plans=len(plan_rows),
+            files=observed_file_count,
+        )
+        return plan_rows, file_rows, [observation], toc_target.url
+    except Exception as exc:
+        observation = _crawl_failed_observation(
+            toc_target.source, toc_target.url, exc, run_id
+        )
+        return [], [], [observation], toc_target.url
+
+
 async def _crawl_toc_metadata(
     source_rows: list[dict[str, Any]],
     *,
@@ -16178,156 +16279,8 @@ async def _crawl_toc_metadata(
     )
     crawl_source_rows = _dedupe_source_rows_for_crawl(source_rows)
     active_context = execution_context or _CrawlExecutionContext()
-    try:
-        target_crawl_timeout = float(
-            os.getenv("HLTHPRT_MRF_TOC_TARGET_TIMEOUT_SECONDS", "180")
-        )
-    except ValueError:
-        target_crawl_timeout = 180.0
-    try:
-        row_write_timeout = float(
-            os.getenv("HLTHPRT_MRF_CRAWL_ROW_WRITE_TIMEOUT_SECONDS", "0")
-        )
-    except ValueError:
-        row_write_timeout = 0.0
-
-    async def crawl_one(
-        toc_target: CrawlTarget, session: aiohttp.ClientSession
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
-        """Crawl one TOC target and return rows with its observation."""
-        try:
-            target_kind = (toc_target.metadata or {}).get("target_kind")
-            target_file_type = (toc_target.metadata or {}).get("target_file_type")
-            target_max_bytes = _target_fetch_max_bytes(toc_target, max_toc_bytes)
-            should_filter_to_target_query = (
-                (toc_target.metadata or {}).get("query_expansion_match_scope")
-                == "toc_plan"
-                and _supports_toc_plan_query_scan(toc_target)
-            )
-            if (
-                target_kind == "file_reference"
-                and target_file_type == "table-of-contents"
-            ):
-                if (toc_target.metadata or {}).get("container_format") == "zip":
-                    toc_values = await _fetch_zip_json_values(
-                        toc_target.url,
-                        max_bytes=target_max_bytes,
-                        session=session,
-                    )
-                else:
-                    toc_values = [
-                        (
-                            Path(urlsplit(toc_target.url).path).name,
-                            await _fetch_query_filtered_toc(
-                                toc_target,
-                                max_bytes=target_max_bytes,
-                                session=session,
-                            )
-                            if should_filter_to_target_query
-                            else await _fetch_json(
-                                toc_target.url,
-                                max_bytes=target_max_bytes,
-                                session=session,
-                            ),
-                        )
-                    ]
-                plan_rows: list[dict[str, Any]] = []
-                file_rows: list[dict[str, Any]] = []
-                for _member_name, toc in toc_values:
-                    if not isinstance(toc, dict):
-                        raise ValueError("expected JSON object")
-                    if should_filter_to_target_query:
-                        member_plan_rows, member_file_rows = _toc_rows_from_content(
-                            toc_target.source,
-                            toc_target.url,
-                            toc,
-                            filter_to_target_query=True,
-                        )
-                    else:
-                        member_plan_rows, member_file_rows = _toc_rows_from_content(
-                            toc_target.source, toc_target.url, toc
-                        )
-                    plan_rows.extend(member_plan_rows)
-                    file_rows.extend(
-                        _apply_crawl_target_context_to_file_rows(
-                            member_file_rows, toc_target
-                        )
-                    )
-                return (
-                    plan_rows,
-                    file_rows,
-                    [
-                        _crawl_ok_observation(
-                            toc_target,
-                            run_id=run_id,
-                            plans=len(plan_rows),
-                            files=len(file_rows),
-                        )
-                    ],
-                    toc_target.url,
-                )
-            if target_kind in {"file_reference", "source_landing_page"}:
-                plan_rows = _plan_rows_from_target_metadata(toc_target)
-                return (
-                    plan_rows,
-                    [],
-                    [
-                        _crawl_ok_observation(
-                            toc_target, run_id=run_id, plans=len(plan_rows), files=1
-                        )
-                    ],
-                    toc_target.url,
-                )
-            if target_kind == "metadata_text":
-                text = await _fetch_text(
-                    toc_target.url, max_bytes=target_max_bytes, session=session
-                )
-                plan_rows, file_rows = _metadata_text_rows_from_content(
-                    toc_target.source, toc_target.url, text
-                )
-            else:
-                if should_filter_to_target_query:
-                    toc = await _fetch_query_filtered_toc(
-                        toc_target,
-                        max_bytes=target_max_bytes,
-                        session=session,
-                    )
-                else:
-                    toc = await _fetch_json(
-                        toc_target.url, max_bytes=target_max_bytes, session=session
-                    )
-                if should_filter_to_target_query:
-                    plan_rows, file_rows = _toc_rows_from_content(
-                        toc_target.source,
-                        toc_target.url,
-                        toc,
-                        filter_to_target_query=True,
-                    )
-                else:
-                    plan_rows, file_rows = _toc_rows_from_content(
-                        toc_target.source, toc_target.url, toc
-                    )
-                file_rows = _apply_crawl_target_context_to_file_rows(file_rows, toc_target)
-            return (
-                plan_rows,
-                file_rows,
-                [
-                    _crawl_ok_observation(
-                        toc_target,
-                        run_id=run_id,
-                        plans=len(plan_rows),
-                        files=len(file_rows),
-                    )
-                ],
-                toc_target.url,
-            )
-        except Exception as exc:
-            return (
-                [],
-                [],
-                [_crawl_failed_observation(toc_target.source, toc_target.url, exc, run_id)],
-                toc_target.url,
-            )
+    target_crawl_timeout = _float_env("HLTHPRT_MRF_TOC_TARGET_TIMEOUT_SECONDS", 180.0)
+    row_write_timeout = _float_env("HLTHPRT_MRF_CRAWL_ROW_WRITE_TIMEOUT_SECONDS", 0.0)
 
     async with _discovery_http_session(
         existing_session=active_context.session,
@@ -16387,10 +16340,20 @@ async def _crawl_toc_metadata(
                 try:
                     if target_crawl_timeout > 0:
                         return await asyncio.wait_for(
-                            crawl_one(crawl_target, active_session),
+                            _crawl_one_toc_target(
+                                crawl_target,
+                                active_session,
+                                max_toc_bytes=max_toc_bytes,
+                                run_id=run_id,
+                            ),
                             timeout=target_crawl_timeout,
                         )
-                    return await crawl_one(crawl_target, active_session)
+                    return await _crawl_one_toc_target(
+                        crawl_target,
+                        active_session,
+                        max_toc_bytes=max_toc_bytes,
+                        run_id=run_id,
+                    )
                 except TimeoutError:
                     return (
                         [],
@@ -16581,47 +16544,6 @@ def _is_signed(url: str | None) -> bool:
     )
 
 
-def _discovery_run_params(
-    *,
-    test_mode: bool,
-    provider: str | None,
-    limit: int | None,
-    source_entity_types: tuple[str, ...],
-    source_payer_query: str | None,
-    check_urls: bool,
-    crawl: bool,
-    probe_files: bool,
-    file_probe_limit: int | None,
-    file_probe_types: tuple[str, ...],
-    file_probe_entity_types: tuple[str, ...],
-    file_probe_payer_query: str | None,
-    max_toc_bytes: int,
-    concurrency: int,
-    crawl_target_limit: int | None,
-    retry_of_run_id: str | None,
-    mrf_discovery_root_run_id: str | None,
-) -> dict[str, Any]:
-    return {
-        "test_mode": test_mode,
-        "provider": provider,
-        "limit": limit,
-        "source_entity_types": list(source_entity_types),
-        "source_payer_query": source_payer_query,
-        "check_urls": check_urls,
-        "crawl": crawl,
-        "probe_files": probe_files,
-        "file_probe_limit": file_probe_limit,
-        "file_probe_types": list(file_probe_types),
-        "file_probe_entity_types": list(file_probe_entity_types),
-        "file_probe_payer_query": file_probe_payer_query,
-        "max_toc_bytes": max_toc_bytes,
-        "concurrency": concurrency,
-        "crawl_target_limit": crawl_target_limit,
-        "retry_of_run_id": retry_of_run_id,
-        "mrf_discovery_root_run_id": mrf_discovery_root_run_id,
-    }
-
-
 def _control_status_from_crawl_status(crawl_status: str) -> str:
     return "succeeded" if crawl_status == "succeeded_with_errors" else crawl_status
 
@@ -16744,12 +16666,10 @@ async def _publish_failed_discovery_state(
     if not failure_context_dict["emit_standalone_control_events"]:
         return
     _emit_discovery_control_event(
-        control_run_id=control_run_id,
-        crawl_run_id=run_context_dict["crawl_run_id"],
+        run_context_dict,
         status="failed",
         phase_detail="mrf source discovery failed",
         progress=progress_dict,
-        params=run_context_dict["run_params"],
         metrics=_discovery_control_metrics(
             discovery_result,
             crawl_status="failed",
@@ -16757,7 +16677,6 @@ async def _publish_failed_discovery_state(
             run_mode=run_context_dict["run_mode"],
         ),
         error=error_dict,
-        started_at=run_context_dict["started_at"],
         finished_at=finished_at,
         triggered_by=failure_context_dict["triggered_by"],
     )
@@ -16773,30 +16692,29 @@ async def _record_failed_discovery_state(
 
 
 def _emit_discovery_control_event(
+    run_context_dict: dict[str, Any],
     *,
-    control_run_id: str,
-    crawl_run_id: str,
     status: str,
     phase_detail: str,
     progress: dict[str, Any],
-    params: dict[str, Any],
-    started_at: dt.datetime,
     finished_at: dt.datetime | None = None,
     triggered_by: str | None = None,
     metrics: dict[str, Any] | None = None,
     error: dict[str, Any] | None = None,
 ) -> None:
+    control_run_id = run_context_dict["control_run_id"]
     if not control_run_id:
         return
+    started_at = run_context_dict["started_at"]
     heartbeat_at = finished_at or _utc_now()
     event_by_field = {
         "run_id": control_run_id,
         "importer": "mrf-source-discovery",
         "status": status,
         "phase_detail": phase_detail,
-        "params": params,
+        "params": run_context_dict["run_params"],
         "progress": progress,
-        "metrics": {"crawl_run_id": crawl_run_id, **(metrics or {})},
+        "metrics": {"crawl_run_id": run_context_dict["crawl_run_id"], **(metrics or {})},
         "error": error,
         "created_at": started_at,
         "started_at": started_at,
@@ -17282,47 +17200,46 @@ async def run_mrf_source_discovery_command(
     )
     discovery_result.crawl_run_id = crawl_run_id
     control_run_id = run_id or crawl_run_id
-    run_params = _discovery_run_params(
-        test_mode=test_mode,
-        provider=provider,
-        limit=limit,
-        source_entity_types=parsed_source_entity_types,
-        source_payer_query=parsed_source_payer_query,
-        check_urls=check_urls,
-        crawl=crawl,
-        probe_files=probe_files,
-        file_probe_limit=file_probe_limit,
-        file_probe_types=parsed_file_probe_types,
-        file_probe_entity_types=parsed_file_probe_entity_types,
-        file_probe_payer_query=parsed_file_probe_payer_query,
-        max_toc_bytes=max_toc_bytes,
-        concurrency=concurrency,
-        crawl_target_limit=crawl_target_limit,
-        retry_of_run_id=retry_of_run_id,
-        mrf_discovery_root_run_id=mrf_discovery_root_run_id,
-    )
-    run_params["process_workers"] = process_workers
-    run_params["target_concurrency"] = target_concurrency
-    run_params["http_connection_limit"] = source_http_connection_limit
-    run_params["http_per_host_limit"] = source_http_per_host_limit
-    run_params["http_limit_scope"] = (
+    run_params_dict = {
+        "test_mode": test_mode,
+        "provider": provider,
+        "limit": limit,
+        "source_entity_types": list(parsed_source_entity_types),
+        "source_payer_query": parsed_source_payer_query,
+        "check_urls": check_urls,
+        "crawl": crawl,
+        "probe_files": probe_files,
+        "file_probe_limit": file_probe_limit,
+        "file_probe_types": list(parsed_file_probe_types),
+        "file_probe_entity_types": list(parsed_file_probe_entity_types),
+        "file_probe_payer_query": parsed_file_probe_payer_query,
+        "max_toc_bytes": max_toc_bytes,
+        "concurrency": concurrency,
+        "crawl_target_limit": crawl_target_limit,
+        "retry_of_run_id": retry_of_run_id,
+        "mrf_discovery_root_run_id": mrf_discovery_root_run_id,
+    }
+    run_params_dict["process_workers"] = process_workers
+    run_params_dict["target_concurrency"] = target_concurrency
+    run_params_dict["http_connection_limit"] = source_http_connection_limit
+    run_params_dict["http_per_host_limit"] = source_http_per_host_limit
+    run_params_dict["http_limit_scope"] = (
         "shared_session" if process_workers == 1 else "per_process"
     )
-    run_params["http_global_connection_budget"] = global_http_connection_limit
-    run_params["http_global_per_host_budget"] = global_http_per_host_limit
+    run_params_dict["http_global_connection_budget"] = global_http_connection_limit
+    run_params_dict["http_global_per_host_budget"] = global_http_per_host_limit
     run_context_dict = {
         "crawl_run_id": crawl_run_id,
         "control_run_id": control_run_id,
         "providers": providers,
         "run_mode": run_mode,
         "started_at": started_at,
-        "run_params": run_params,
+        "run_params": run_params_dict,
     }
     emit_standalone_control_events = bool(not dry_run and not run_id)
     if emit_standalone_control_events:
         _emit_discovery_control_event(
-            control_run_id=control_run_id,
-            crawl_run_id=crawl_run_id,
+            run_context_dict,
             status="running",
             phase_detail="loading source providers",
             progress={
@@ -17333,8 +17250,6 @@ async def run_mrf_source_discovery_command(
                 "message": "loading source providers",
                 "phase": "loading source providers",
             },
-            params=run_params,
-            started_at=started_at,
             triggered_by="direct_cli" if not run_id else None,
         )
     if control_run_id and not dry_run:
@@ -17400,7 +17315,7 @@ async def run_mrf_source_discovery_command(
         except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
             await record_discovery_failure(exc)
             raise
-    run_params["mrf_discovery_root_run_id"] = checkpoint_root_run_id
+    run_params_dict["mrf_discovery_root_run_id"] = checkpoint_root_run_id
 
     needs_source_load = bool(dry_run or check_urls or crawl or not probe_files)
     candidates: list[SourceCandidate] = []
@@ -17626,8 +17541,7 @@ async def run_mrf_source_discovery_command(
         )
         if emit_standalone_control_events:
             _emit_discovery_control_event(
-                control_run_id=control_run_id,
-                crawl_run_id=crawl_run_id,
+                run_context_dict,
                 status=_control_status_from_crawl_status(crawl_status),
                 phase_detail="mrf source discovery complete",
                 progress={
@@ -17638,7 +17552,6 @@ async def run_mrf_source_discovery_command(
                     "message": "mrf source discovery complete",
                     "phase": "mrf source discovery complete",
                 },
-                params=run_params,
                 metrics=_discovery_control_metrics(
                     discovery_result,
                     crawl_status=crawl_status,
@@ -17646,7 +17559,6 @@ async def run_mrf_source_discovery_command(
                     run_mode=run_mode,
                     bytes_streamed=bytes_streamed,
                 ),
-                started_at=started_at,
                 finished_at=finished_at,
             )
             await _flush_discovery_control_events(control_run_id)
