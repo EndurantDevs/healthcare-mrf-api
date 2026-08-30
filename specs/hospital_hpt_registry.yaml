@@ -229,6 +229,7 @@ hospitals:
   cms_hpt_url: https://achm.ernesthealth.com/cms-hpt.txt
   locator_name: Advanced Care Hospital of Montana, Inc.
 - hospital_id: hospital-000061
+  alias_of: hospital-000060
   name: Advanced Care Hospital of Montana, Inc.
   cms_hpt_url: https://achm.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-000062
@@ -1012,6 +1013,7 @@ hospitals:
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
   locator_name: Ascension St. Francis Hospital, Inc.
 - hospital_id: hospital-000304
+  alias_of: hospital-000303
   name: Ascension St. Francis Hospital, Inc.
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
 - hospital_id: hospital-000305
@@ -1127,6 +1129,7 @@ hospitals:
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
   locator_name: Ascension Via Christi Rehabilitation Hospital, Inc.
 - hospital_id: hospital-000338
+  alias_of: hospital-000337
   name: Ascension Via Christi Rehabilitation Hospital, Inc.
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
 - hospital_id: hospital-000339
@@ -1525,6 +1528,7 @@ hospitals:
   cms_hpt_url: https://www.lasencinashospital.com/cms-hpt.txt
   locator_name: Aurora Las Encinas, LLC
 - hospital_id: hospital-000460
+  alias_of: hospital-000459
   name: Aurora Las Encinas, LLC
   cms_hpt_url: https://www.lasencinashospital.com/cms-hpt.txt
 - hospital_id: hospital-000461
@@ -1569,6 +1573,7 @@ hospitals:
   locator_name: Aurora San Diego LLC
   locator_mrf_url: https://www.aurorasandiego.com/sites/default/files/943369426_aurora-san-diego_standardcharges_updated.csv
 - hospital_id: hospital-000474
+  alias_of: hospital-000473
   name: Aurora San Diego LLC
   cms_hpt_url: https://www.aurorasandiego.com/cms-hpt.txt
   locator_mrf_url: https://www.aurorasandiego.com/sites/default/files/943369426_aurora-san-diego_standardcharges_updated.csv
@@ -1576,6 +1581,7 @@ hospitals:
   name: Aurora Sinai Medical Center of Aurora Health Care Metro
   cms_hpt_url: https://www.aurorahealthcare.org/cms-hpt.txt
 - hospital_id: hospital-000476
+  alias_of: hospital-000475
   name: Aurora Sinai Medical Center of Aurora Health Care Metro, Inc.
   cms_hpt_url: https://www.aurorahealthcare.org/cms-hpt.txt
   locator_name: Aurora Sinai Medical Center of Aurora Health Care Metro
@@ -1583,6 +1589,7 @@ hospitals:
   name: Aurora St. Luke's Medical Center of Aurora Health Care Metro
   cms_hpt_url: https://www.aurorahealthcare.org/cms-hpt.txt
 - hospital_id: hospital-000478
+  alias_of: hospital-000477
   name: Aurora St. Luke's Medical Center of Aurora Health Care Metro, Inc.
   cms_hpt_url: https://www.aurorahealthcare.org/cms-hpt.txt
   locator_name: Aurora St. Luke's Medical Center of Aurora Health Care Metro
@@ -1590,6 +1597,7 @@ hospitals:
   name: Aurora St. Luke's South Shore of Aurora Health Care Metro
   cms_hpt_url: https://www.aurorahealthcare.org/cms-hpt.txt
 - hospital_id: hospital-000480
+  alias_of: hospital-000479
   name: Aurora St. Luke's South Shore of Aurora Health Care Metro, Inc.
   cms_hpt_url: https://www.aurorahealthcare.org/cms-hpt.txt
   locator_name: Aurora St. Luke's South Shore of Aurora Health Care Metro
@@ -1796,6 +1804,7 @@ hospitals:
   name: Bakersfield Behavioral Healthcare Hospital
   cms_hpt_url: https://www.bakersfieldbehavioral.com/cms-hpt.txt
 - hospital_id: hospital-000545
+  alias_of: hospital-000544
   name: BAKERSFIELD BEHAVIORAL HEALTHCARE HOSPITAL LLC
   cms_hpt_url: https://www.bakersfieldbehavioral.com/cms-hpt.txt
   locator_name: Bakersfield Behavioral Healthcare Hospital
@@ -2378,6 +2387,7 @@ hospitals:
   name: Barrett Hospital Development Corp
   cms_hpt_url: https://www.barretthospital.org/cms-hpt.txt
 - hospital_id: hospital-000717
+  alias_of: hospital-000716
   name: Barrett Hospital Development Corporation
   cms_hpt_url: https://www.barretthospital.org/cms-hpt.txt
   locator_name: Barrett Hospital Development Corp
@@ -2784,6 +2794,7 @@ hospitals:
   name: Bellevue Medical Center
   cms_hpt_url: https://www.nebraskamed.com/cms-hpt.txt
 - hospital_id: hospital-000843
+  alias_of: hospital-000842
   name: BELLEVUE MEDICAL CENTER LLC
   cms_hpt_url: https://www.nebraskamed.com/cms-hpt.txt
   locator_name: Bellevue Medical Center
@@ -2869,6 +2880,7 @@ hospitals:
   cms_hpt_url: https://www.berkshirehealthsystems.org/cms-hpt.txt
   locator_mrf_url: https://bhs-publicdownload.s3.us-east-1.amazonaws.com/Public/042791396_Berkshire-Medical-Center_StandardCharges.csv
 - hospital_id: hospital-000868
+  alias_of: hospital-000866
   name: Berkshire Medical Center, Inc
   cms_hpt_url: https://www.berkshirehealthsystems.org/cms-hpt.txt
   locator_mrf_url: https://bhs-publicdownload.s3.us-east-1.amazonaws.com/Public/042791396_Berkshire-Medical-Center_StandardCharges.csv
@@ -2887,6 +2899,7 @@ hospitals:
   name: Beth Israel Deaconess Hospital-Milton Inc
   cms_hpt_url: https://bilh.org/cms-hpt.txt
 - hospital_id: hospital-000873
+  alias_of: hospital-000872
   name: Beth Israel Deaconess Hospital–Milton
   cms_hpt_url: https://bilh.org/cms-hpt.txt
 - hospital_id: hospital-000874
@@ -2941,6 +2954,7 @@ hospitals:
   name: Beverly Hospital
   cms_hpt_url: https://beverlyhospital.org/cms-hpt.txt
 - hospital_id: hospital-000890
+  alias_of: hospital-000889
   name: Beverly Hospital Corporation
   cms_hpt_url: https://beverlyhospital.org/cms-hpt.txt
 - hospital_id: hospital-000891
@@ -3002,6 +3016,7 @@ hospitals:
   cms_hpt_url: https://brrh.ernesthealth.com/cms-hpt.txt
   locator_name: Bloomington Regional Rehabilitation Hospital, LLC
 - hospital_id: hospital-000909
+  alias_of: hospital-000908
   name: Bloomington Regional Rehabilitation Hospital, LLC
   cms_hpt_url: https://brrh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-000910
@@ -3293,6 +3308,7 @@ hospitals:
   cms_hpt_url: https://traumaticbraininjury.net/cms-hpt.txt
   locator_name: Brookhaven Hospital LLC
 - hospital_id: hospital-000998
+  alias_of: hospital-000997
   name: Brookhaven Hospital LLC
   cms_hpt_url: https://traumaticbraininjury.net/cms-hpt.txt
 - hospital_id: hospital-000999
@@ -3715,6 +3731,7 @@ hospitals:
   name: Carrus Behavioral Hospital
   cms_hpt_url: https://carrushealth.com/cms-hpt.txt
 - hospital_id: hospital-001127
+  alias_of: hospital-001126
   name: Carrus Behavioral Hospital LLC
   cms_hpt_url: https://carrushealth.com/cms-hpt.txt
 - hospital_id: hospital-001128
@@ -3905,6 +3922,7 @@ hospitals:
   name: CENTRAL PENINSULA GENERAL HOSPITAL
   cms_hpt_url: https://www.cpgh.org/cms-hpt.txt
 - hospital_id: hospital-001184
+  alias_of: hospital-001183
   name: CENTRAL PENINSULA GENERAL HOSPITAL INC
   cms_hpt_url: https://www.cpgh.org/cms-hpt.txt
   locator_name: CENTRAL PENINSULA GENERAL HOSPITAL
@@ -3918,6 +3936,7 @@ hospitals:
   name: Central Valley Specialty Hospital
   cms_hpt_url: https://centralvalleyspecialty.com/cms-hpt.txt
 - hospital_id: hospital-001188
+  alias_of: hospital-001187
   name: CENTRAL VALLEY SPECIALTY HOSPITAL INC
   cms_hpt_url: https://centralvalleyspecialty.com/cms-hpt.txt
   locator_name: Central Valley Specialty Hospital
@@ -3925,6 +3944,7 @@ hospitals:
   name: Central Vermont Medical Center
   cms_hpt_url: https://www.uvmhealth.org/cms-hpt.txt
 - hospital_id: hospital-001190
+  alias_of: hospital-001189
   name: Central Vermont Medical Center Inc
   cms_hpt_url: https://www.uvmhealth.org/cms-hpt.txt
   locator_name: Central Vermont Medical Center
@@ -5352,6 +5372,7 @@ hospitals:
   cms_hpt_url: https://ccrh.ernesthealth.com/cms-hpt.txt
   locator_name: Corpus Christi Rehabilitation Hospital, LLC
 - hospital_id: hospital-001634
+  alias_of: hospital-001633
   name: Corpus Christi Rehabilitation Hospital, LLC
   cms_hpt_url: https://ccrh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-001635
@@ -5537,6 +5558,7 @@ hospitals:
   cms_hpt_url: https://www.cubamemorialhospital.com/cms-hpt.txt
   locator_name: Cuba Memorial Hospital Inc.
 - hospital_id: hospital-001689
+  alias_of: hospital-001688
   name: Cuba Memorial Hospital Inc.
   cms_hpt_url: https://www.cubamemorialhospital.com/cms-hpt.txt
 - hospital_id: hospital-001690
@@ -6131,6 +6153,7 @@ hospitals:
   name: Eastern Oklahoma Medical Center
   cms_hpt_url: https://eomchospital.com/cms-hpt.txt
 - hospital_id: hospital-001870
+  alias_of: hospital-001869
   name: EASTERN OKLAHOMA MEDICAL CENTER INC
   cms_hpt_url: https://eomchospital.com/cms-hpt.txt
   locator_name: Eastern Oklahoma Medical Center
@@ -6210,6 +6233,7 @@ hospitals:
   cms_hpt_url: https://evrh.ernesthealth.com/cms-hpt.txt
   locator_name: Elkhorn Valley Rehabilitation Hospital, LLC
 - hospital_id: hospital-001894
+  alias_of: hospital-001893
   name: Elkhorn Valley Rehabilitation Hospital, LLC
   cms_hpt_url: https://evrh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-001895
@@ -6942,6 +6966,7 @@ hospitals:
   cms_hpt_url: https://www.ecmc.edu/cms-hpt.txt
   locator_name: Erie County Medical Center Corporation
 - hospital_id: hospital-002130
+  alias_of: hospital-002129
   name: Erie County Medical Center Corporation
   cms_hpt_url: https://www.ecmc.edu/cms-hpt.txt
 - hospital_id: hospital-002131
@@ -7060,6 +7085,7 @@ hospitals:
   name: Exeter Hospital
   cms_hpt_url: https://bilh.org/cms-hpt.txt
 - hospital_id: hospital-002168
+  alias_of: hospital-002167
   name: Exeter Hospital Inc
   cms_hpt_url: https://bilh.org/cms-hpt.txt
 - hospital_id: hospital-002169
@@ -7073,6 +7099,7 @@ hospitals:
   name: FAIRBANKS MEMORIAL HOSPITAL
   cms_hpt_url: https://www.foundationhealth.org/cms-hpt.txt
 - hospital_id: hospital-002172
+  alias_of: hospital-002171
   name: FAIRBANKS MEMORIAL HOSPITAL LLC
   cms_hpt_url: https://www.foundationhealth.org/cms-hpt.txt
   locator_name: FAIRBANKS MEMORIAL HOSPITAL
@@ -7326,6 +7353,7 @@ hospitals:
   cms_hpt_url: https://www.centralvalleymedicalcenter.com/cms-hpt.txt
   locator_name: Central Valley medical Center
 - hospital_id: hospital-002248
+  alias_of: hospital-002247
   name: Fountain Green Medical Clinic
   cms_hpt_url: https://www.centralvalleymedicalcenter.com/cms-hpt.txt
   locator_mrf_url: https://cvmc.goredde.com/Estimator/Files/87-0419324_Central_Valley_Medical_Center_Clinics_standardcharges.csv
@@ -7962,6 +7990,7 @@ hospitals:
   name: Grant Memorial Hospital
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
 - hospital_id: hospital-002441
+  alias_of: hospital-002440
   name: Grant Memorial Hospital Inc
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
   locator_name: Grant Memorial Hospital
@@ -8043,6 +8072,7 @@ hospitals:
   cms_hpt_url: https://grrh.ernesthealth.com/cms-hpt.txt
   locator_name: Greenwood Regional Rehabilitation Hospital, LLC
 - hospital_id: hospital-002464
+  alias_of: hospital-002463
   name: Greenwood Regional Rehabilitation Hospital, LLC
   cms_hpt_url: https://grrh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-002465
@@ -8311,6 +8341,7 @@ hospitals:
   name: Harrison Community Hospital
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
 - hospital_id: hospital-002547
+  alias_of: hospital-002546
   name: Harrison Community Hospital, Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
   locator_name: Harrison Community Hospital
@@ -9585,6 +9616,7 @@ hospitals:
   name: Highland Springs Changes
   cms_hpt_url: https://www.highlandspringshealth.com/cms-hpt.txt
 - hospital_id: hospital-002925
+  alias_of: hospital-002914
   name: Highland-Clarksburg Hospital, Inc.
   cms_hpt_url: https://www.highlandclarksburghospital.com/cms-hpt.txt
 - hospital_id: hospital-002926
@@ -9701,6 +9733,7 @@ hospitals:
   name: Hoag Orthopedic Institute
   cms_hpt_url: https://www.hoagorthopedicinstitute.com/cms-hpt.txt
 - hospital_id: hospital-002961
+  alias_of: hospital-002960
   name: Hoag Orthopedic Institute LLC
   cms_hpt_url: https://www.hoagorthopedicinstitute.com/cms-hpt.txt
   locator_name: Hoag Orthopedic Institute
@@ -10579,6 +10612,7 @@ hospitals:
   name: Jefferson Moss-Magee Rehabilitation Hospital – Elkins Park
   cms_hpt_url: https://www.jeffersonhealth.org/cms-hpt.txt
 - hospital_id: hospital-003231
+  alias_of: hospital-003230
   name: Jefferson Moss-Magee Rehabilitation Hospital-Elkins Park
   cms_hpt_url: https://www.jeffersonhealth.org/cms-hpt.txt
 - hospital_id: hospital-003232
@@ -10652,6 +10686,7 @@ hospitals:
   cms_hpt_url: https://www.fitzgibbon.org/cms-hpt.txt
   locator_name: John Fitzgibbon Memorial Hospital LLC
 - hospital_id: hospital-003253
+  alias_of: hospital-003252
   name: John Fitzgibbon Memorial Hospital LLC
   cms_hpt_url: https://www.fitzgibbon.org/cms-hpt.txt
 - hospital_id: hospital-003254
@@ -11223,6 +11258,7 @@ hospitals:
   cms_hpt_url: https://lrrh.ernesthealth.com/cms-hpt.txt
   locator_name: Lafayette Regional Rehabilitation Hospital LLC
 - hospital_id: hospital-003429
+  alias_of: hospital-003428
   name: Lafayette Regional Rehabilitation Hospital LLC
   cms_hpt_url: https://lrrh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-003430
@@ -11415,6 +11451,7 @@ hospitals:
   cms_hpt_url: https://lrh.ernesthealth.com/cms-hpt.txt
   locator_name: Laredo Rehabilitation Hospital, LLC
 - hospital_id: hospital-003489
+  alias_of: hospital-003488
   name: Laredo Rehabilitation Hospital, LLC
   cms_hpt_url: https://lrh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-003490
@@ -11424,10 +11461,12 @@ hospitals:
   name: Larkin Community Hospital Behavioral Health Services
   cms_hpt_url: https://larkinhealth.com/cms-hpt.txt
 - hospital_id: hospital-003492
+  alias_of: hospital-003491
   name: LARKIN COMMUNITY HOSPITAL BEHAVIORAL HEALTH SERVICES INC
   cms_hpt_url: https://larkinhealth.com/cms-hpt.txt
   locator_name: Larkin Community Hospital Behavioral Health Services
 - hospital_id: hospital-003493
+  alias_of: hospital-003490
   name: Larkin Community Hospital Inc
   cms_hpt_url: https://larkinhealth.com/cms-hpt.txt
   locator_name: Larkin Community Hospital
@@ -11492,6 +11531,7 @@ hospitals:
   name: Laureate Psychiatric Clinic and Hospital
   cms_hpt_url: https://www.saintfrancis.com/cms-hpt.txt
 - hospital_id: hospital-003511
+  alias_of: hospital-003510
   name: Laureate Psychiatric Clinic And Hospital, Inc
   cms_hpt_url: https://www.saintfrancis.com/cms-hpt.txt
   locator_name: Laureate Psychiatric Clinic and Hospital
@@ -12150,6 +12190,7 @@ hospitals:
   name: Manhattan Surgical Hospital
   cms_hpt_url: https://www.manhattansurgical.com/cms-hpt.txt
 - hospital_id: hospital-003714
+  alias_of: hospital-003713
   name: Manhattan Surgical Hospital LLC
   cms_hpt_url: https://www.manhattansurgical.com/cms-hpt.txt
 - hospital_id: hospital-003715
@@ -12429,6 +12470,7 @@ hospitals:
   name: McCone County Health Center
   cms_hpt_url: https://mcconehealth.org/cms-hpt.txt
 - hospital_id: hospital-003800
+  alias_of: hospital-003799
   name: McCone County Health Center Inc
   cms_hpt_url: https://mcconehealth.org/cms-hpt.txt
   locator_name: McCone County Health Center
@@ -12582,6 +12624,7 @@ hospitals:
   name: Medical Behavioral Hospital of Indianapolis
   cms_hpt_url: https://www.neuropsychiatrichospitals.net/cms-hpt.txt
 - hospital_id: hospital-003847
+  alias_of: hospital-003846
   name: Medical Behavioral Hospital of Indianapolis, LLC
   cms_hpt_url: https://www.neuropsychiatrichospitals.net/cms-hpt.txt
   locator_name: Medical Behavioral Hospital of Indianapolis
@@ -12843,6 +12886,7 @@ hospitals:
   name: Memorial Community Hospital
   cms_hpt_url: https://mchhs.org/cms-hpt.txt
 - hospital_id: hospital-003924
+  alias_of: hospital-003923
   name: Memorial Community Hospital Corporation
   cms_hpt_url: https://mchhs.org/cms-hpt.txt
   locator_name: Memorial Community Hospital
@@ -13133,6 +13177,7 @@ hospitals:
   name: Mercy Hospital Ardmore
   cms_hpt_url: https://www.mercy.net/cms-hpt.txt
 - hospital_id: hospital-004013
+  alias_of: hospital-004012
   name: Mercy Hospital Ardmore Inc
   cms_hpt_url: https://www.mercy.net/cms-hpt.txt
   locator_name: Mercy Hospital Ardmore
@@ -13184,6 +13229,7 @@ hospitals:
   name: Mercy Hospital Healdton
   cms_hpt_url: https://www.mercy.net/cms-hpt.txt
 - hospital_id: hospital-004028
+  alias_of: hospital-004027
   name: Mercy Hospital Healdton Inc
   cms_hpt_url: https://www.mercy.net/cms-hpt.txt
   locator_name: Mercy Hospital Healdton
@@ -13242,6 +13288,7 @@ hospitals:
   name: Mercy Hospital Pittsburg
   cms_hpt_url: https://www.mercy.net/cms-hpt.txt
 - hospital_id: hospital-004046
+  alias_of: hospital-004045
   name: Mercy Hospital Pittsburg Inc
   cms_hpt_url: https://www.mercy.net/cms-hpt.txt
   locator_name: Mercy Hospital Pittsburg
@@ -13391,10 +13438,12 @@ hospitals:
   name: Mercy Rehabilitation Hospital Oklahoma City South
   cms_hpt_url: https://www.mercy.net/cms-hpt.txt
 - hospital_id: hospital-004089
+  alias_of: hospital-004088
   name: Mercy Rehabilitation Hospital Oklahoma City South, LLC
   cms_hpt_url: https://www.mercy.net/cms-hpt.txt
   locator_name: Mercy Rehabilitation Hospital Oklahoma City South
 - hospital_id: hospital-004090
+  alias_of: hospital-004087
   name: Mercy Rehabilitation Hospital Oklahoma City, LLC
   cms_hpt_url: https://www.mercy.net/cms-hpt.txt
   locator_name: Mercy Rehabilitation Hospital Oklahoma City
@@ -13593,6 +13642,7 @@ hospitals:
   cms_hpt_url: https://www.meritushealth.com/cms-hpt.txt
   locator_name: Meritus Medical Center, Inc.
 - hospital_id: hospital-004149
+  alias_of: hospital-004148
   name: Meritus Medical Center, Inc.
   cms_hpt_url: https://www.meritushealth.com/cms-hpt.txt
 - hospital_id: hospital-004150
@@ -13610,6 +13660,7 @@ hospitals:
   cms_hpt_url: https://msh.ernesthealth.com/cms-hpt.txt
   locator_name: Mesquite Specialty Hospital, LP
 - hospital_id: hospital-004154
+  alias_of: hospital-004153
   name: Mesquite Specialty Hospital, LP
   cms_hpt_url: https://msh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-004155
@@ -13937,6 +13988,7 @@ hospitals:
   cms_hpt_url: https://mrrh.ernesthealth.com/cms-hpt.txt
   locator_name: Midlands Regional Rehabilitation Hospital, LLC
 - hospital_id: hospital-004253
+  alias_of: hospital-004252
   name: Midlands Regional Rehabilitation Hospital, LLC
   cms_hpt_url: https://mrrh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-004254
@@ -13963,6 +14015,7 @@ hospitals:
   cms_hpt_url: https://www.milebluff.com/cms-hpt.txt
   locator_name: Mile Bluff Medical Center, Inc.
 - hospital_id: hospital-004261
+  alias_of: hospital-004260
   name: Mile Bluff Medical Center, Inc.
   cms_hpt_url: https://www.milebluff.com/cms-hpt.txt
 - hospital_id: hospital-004262
@@ -14317,6 +14370,7 @@ hospitals:
   name: Mount Sinai Rehabilitation Hospital
   cms_hpt_url: https://www.trinityhealthofne.org/cms-hpt.txt
 - hospital_id: hospital-004369
+  alias_of: hospital-004368
   name: Mount Sinai Rehabilitation Hospital, Inc.
   cms_hpt_url: https://www.trinityhealthofne.org/cms-hpt.txt
 - hospital_id: hospital-004370
@@ -14343,6 +14397,7 @@ hospitals:
   cms_hpt_url: https://mvrrh.ernesthealth.com/cms-hpt.txt
   locator_name: Mountain Valley Regional Rehabilitation Hospital, Inc.
 - hospital_id: hospital-004377
+  alias_of: hospital-004376
   name: Mountain Valley Regional Rehabilitation Hospital, Inc.
   cms_hpt_url: https://mvrrh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-004378
@@ -14729,6 +14784,7 @@ hospitals:
   name: Nebraska Spine Hospital
   cms_hpt_url: https://nebraskaspinehospital.com/cms-hpt.txt
 - hospital_id: hospital-004494
+  alias_of: hospital-004493
   name: Nebraska Spine Hospital LLC
   cms_hpt_url: https://nebraskaspinehospital.com/cms-hpt.txt
   locator_name: Nebraska Spine Hospital
@@ -14872,6 +14928,7 @@ hospitals:
   cms_hpt_url: https://nbrrh.ernesthealth.com/cms-hpt.txt
   locator_name: New Braunfels Regional Rehabilitation Hospital, Inc.
 - hospital_id: hospital-004529
+  alias_of: hospital-004527
   name: New Braunfels Regional Rehabilitation Hospital, Inc.
   cms_hpt_url: https://nbrrh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-004530
@@ -14963,6 +15020,7 @@ hospitals:
   name: Nexus Children's Hospital - The Woodlands Campus
   cms_hpt_url: https://nexushealthsystems.com/cms-hpt.txt
 - hospital_id: hospital-004559
+  alias_of: hospital-004554
   name: NEXUS CHILDRENS HOSPITAL DALLAS LLC
   cms_hpt_url: https://nexushealthsystems.com/cms-hpt.txt
   locator_name: Nexus Children's Hospital - Dallas
@@ -15027,6 +15085,7 @@ hospitals:
   name: North Adams Regional Hospital
   cms_hpt_url: https://www.berkshirehealthsystems.org/cms-hpt.txt
 - hospital_id: hospital-004579
+  alias_of: hospital-004578
   name: North Adams Regional Hospital Corporation
   cms_hpt_url: https://www.berkshirehealthsystems.org/cms-hpt.txt
   locator_mrf_url: https://bhs-publicdownload.s3.us-east-1.amazonaws.com/Public/932484732_North-Adams-Regional-Hospital_StandardCharges.csv
@@ -15138,6 +15197,7 @@ hospitals:
   cms_hpt_url: https://www.nghs.com/cms-hpt.txt
   locator_name: Northeast Georgia Medical Center Barrow, LLC
 - hospital_id: hospital-004613
+  alias_of: hospital-004612
   name: Northeast Georgia Medical Center Barrow, LLC
   cms_hpt_url: https://www.nghs.com/cms-hpt.txt
 - hospital_id: hospital-004614
@@ -15211,6 +15271,7 @@ hospitals:
   cms_hpt_url: https://ncrh.ernesthealth.com/cms-hpt.txt
   locator_name: Northern Colorado Rehabilitation Hospital, Inc.
 - hospital_id: hospital-004635
+  alias_of: hospital-004634
   name: Northern Colorado Rehabilitation Hospital, Inc.
   cms_hpt_url: https://ncrh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-004636
@@ -15218,6 +15279,7 @@ hospitals:
   cms_hpt_url: https://niach.ernesthealth.com/cms-hpt.txt
   locator_name: Northern Idaho Advanced Care Hospital, Inc.
 - hospital_id: hospital-004637
+  alias_of: hospital-004636
   name: Northern Idaho Advanced Care Hospital, Inc.
   cms_hpt_url: https://niach.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-004638
@@ -15258,6 +15320,7 @@ hospitals:
   cms_hpt_url: https://nurh.ernesthealth.com/cms-hpt.txt
   locator_name: Northern Utah Rehabilitation Hospital, LLC
 - hospital_id: hospital-004649
+  alias_of: hospital-004648
   name: Northern Utah Rehabilitation Hospital, LLC
   cms_hpt_url: https://nurh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-004650
@@ -15408,6 +15471,7 @@ hospitals:
   name: Norton Hospital
   cms_hpt_url: https://nortonhealthcare.org/cms-hpt.txt
 - hospital_id: hospital-004694
+  alias_of: hospital-004686
   name: Norton Kings Daughters Health
   cms_hpt_url: https://nortonhealthcare.org/cms-hpt.txt
 - hospital_id: hospital-004695
@@ -15869,10 +15933,12 @@ hospitals:
   cms_hpt_url: https://www.okheart.com/cms-hpt.txt
   locator_name: Oklahoma Heart Hospital South
 - hospital_id: hospital-004834
+  alias_of: hospital-004831
   name: Oklahoma Heart Hospital South, LLC
   cms_hpt_url: https://www.okheart.com/cms-hpt.txt
   locator_name: Oklahoma Heart Hospital South
 - hospital_id: hospital-004835
+  alias_of: hospital-004828
   name: Oklahoma Heart Hospital, LLC
   cms_hpt_url: https://www.okheart.com/cms-hpt.txt
   locator_name: Oklahoma Heart Hospital
@@ -15976,6 +16042,7 @@ hospitals:
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
   locator_name: Orthopaedic Hospital of Wisconsin, LLC
 - hospital_id: hospital-004866
+  alias_of: hospital-004865
   name: Orthopaedic Hospital of Wisconsin, LLC
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
 - hospital_id: hospital-004867
@@ -16062,6 +16129,7 @@ hospitals:
   name: Osmond General Hospital
   cms_hpt_url: https://osmondhospital.org/cms-hpt.txt
 - hospital_id: hospital-004894
+  alias_of: hospital-004893
   name: OSMOND GENERAL HOSPITAL INC
   cms_hpt_url: https://osmondhospital.org/cms-hpt.txt
   locator_name: Osmond General Hospital
@@ -16102,6 +16170,7 @@ hospitals:
   name: Our Lady of the Angels Hospital
   cms_hpt_url: https://fmolhs.org/cms-hpt.txt
 - hospital_id: hospital-004906
+  alias_of: hospital-004905
   name: OUR LADY OF THE ANGELS HOSPITAL INC
   cms_hpt_url: https://fmolhs.org/cms-hpt.txt
   locator_name: Our Lady of the Angels Hospital
@@ -16461,6 +16530,7 @@ hospitals:
   name: Parkview Montpelier Hospital
   cms_hpt_url: https://www.parkview.com/cms-hpt.txt
 - hospital_id: hospital-005019
+  alias_of: hospital-005018
   name: Parkview Montpelier Hospital
   cms_hpt_url: https://www.parkview.com/cms-hpt.txt
 - hospital_id: hospital-005020
@@ -16487,6 +16557,7 @@ hospitals:
   name: Parkview Wabash Hospital
   cms_hpt_url: https://www.parkview.com/cms-hpt.txt
 - hospital_id: hospital-005027
+  alias_of: hospital-005026
   name: Parkview Wabash Hospital, Inc
   cms_hpt_url: https://www.parkview.com/cms-hpt.txt
   locator_name: Parkview Wabash Hospital
@@ -16613,45 +16684,59 @@ hospitals:
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005064
+  alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005065
+  alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005066
+  alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005067
+  alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005068
+  alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005069
+  alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005070
+  alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005071
+  alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005072
+  alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005073
+  alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005074
+  alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005075
+  alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005076
+  alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005077
+  alias_of: hospital-005063
   name: Peconic Bay Medical Center
   cms_hpt_url: https://www.northwell.edu/cms-hpt.txt
 - hospital_id: hospital-005078
@@ -17053,6 +17138,7 @@ hospitals:
   cms_hpt_url: https://prairieridge.health/cms-hpt.txt
   locator_name: Prairie Ridge Health, Inc.
 - hospital_id: hospital-005202
+  alias_of: hospital-005201
   name: Prairie Ridge Health, Inc.
   cms_hpt_url: https://prairieridge.health/cms-hpt.txt
 - hospital_id: hospital-005203
@@ -17577,6 +17663,7 @@ hospitals:
   cms_hpt_url: https://rhni.ernesthealth.com/cms-hpt.txt
   locator_name: Rehabilitation Hospital of Northern Indiana, LLC
 - hospital_id: hospital-005366
+  alias_of: hospital-005365
   name: Rehabilitation Hospital of Northern Indiana, LLC
   cms_hpt_url: https://rhni.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-005367
@@ -17600,6 +17687,7 @@ hospitals:
   cms_hpt_url: https://rhsc.ernesthealth.com/cms-hpt.txt
   locator_name: Rehabilitation Hospital of Southern California, LLC
 - hospital_id: hospital-005373
+  alias_of: hospital-005372
   name: Rehabilitation Hospital of Southern California, LLC
   cms_hpt_url: https://rhsc.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-005374
@@ -17607,6 +17695,7 @@ hospitals:
   cms_hpt_url: https://rhsnm.ernesthealth.com/cms-hpt.txt
   locator_name: Rehabilitation Hospital of Southern New Mexico, Inc.
 - hospital_id: hospital-005375
+  alias_of: hospital-005374
   name: Rehabilitation Hospital of Southern New Mexico, Inc.
   cms_hpt_url: https://rhsnm.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-005376
@@ -17614,6 +17703,7 @@ hospitals:
   cms_hpt_url: https://rhn.ernesthealth.com/cms-hpt.txt
   locator_name: Rehabilitation Hospital of the Northwest, LLC
 - hospital_id: hospital-005377
+  alias_of: hospital-005376
   name: Rehabilitation Hospital of the Northwest, LLC
   cms_hpt_url: https://rhn.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-005378
@@ -17657,6 +17747,7 @@ hospitals:
   name: Reynolds Memorial Hospital
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
 - hospital_id: hospital-005390
+  alias_of: hospital-005389
   name: Reynolds Memorial Hospital, Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
   locator_name: Reynolds Memorial Hospital
@@ -17896,10 +17987,12 @@ hospitals:
   cms_hpt_url: https://www.rmlspecialtyhospital.org/cms-hpt.txt
   locator_mrf_url: https://www.rmlspecialtyhospital.org/wp-content/uploads/2026/04/364113692_RMLHealthProvidersLP_standardcharges.csv
 - hospital_id: hospital-005462
+  alias_of: hospital-005461
   name: RML Specialty Hospital Chicago
   cms_hpt_url: https://www.rmlspecialtyhospital.org/cms-hpt.txt
   locator_mrf_url: https://www.rmlspecialtyhospital.org/wp-content/uploads/2026/03/364113692_RMLHealthProvidersLP_shoppableservices.csv
 - hospital_id: hospital-005463
+  alias_of: hospital-005461
   name: RML Specialty Hospital Chicago
   cms_hpt_url: https://www.rmlspecialtyhospital.org/cms-hpt.txt
   locator_mrf_url: https://www.rmlspecialtyhospital.org/wp-content/uploads/2026/03/364113692_RMLHealthProvidersLP_shoppableservices.csv
@@ -17908,10 +18001,12 @@ hospitals:
   cms_hpt_url: https://www.rmlspecialtyhospital.org/cms-hpt.txt
   locator_mrf_url: https://www.rmlspecialtyhospital.org/wp-content/uploads/2026/04/364113692_RMLHealthProvidersLP_standardcharges.csv
 - hospital_id: hospital-005465
+  alias_of: hospital-005464
   name: RML Specialty Hospital Hinsdale
   cms_hpt_url: https://www.rmlspecialtyhospital.org/cms-hpt.txt
   locator_mrf_url: https://www.rmlspecialtyhospital.org/wp-content/uploads/2026/03/364113692_RMLHealthProvidersLP_shoppableservices.csv
 - hospital_id: hospital-005466
+  alias_of: hospital-005464
   name: RML Specialty Hospital Hinsdale
   cms_hpt_url: https://www.rmlspecialtyhospital.org/cms-hpt.txt
   locator_mrf_url: https://www.rmlspecialtyhospital.org/wp-content/uploads/2026/03/364113692_RMLHealthProvidersLP_shoppableservices.csv
@@ -18058,6 +18153,7 @@ hospitals:
   name: Rush Oak Park Hospital
   cms_hpt_url: https://www.rush.edu/cms-hpt.txt
 - hospital_id: hospital-005513
+  alias_of: hospital-005512
   name: Rush Oak Park Hospital Inc
   cms_hpt_url: https://www.rush.edu/cms-hpt.txt
 - hospital_id: hospital-005514
@@ -18094,6 +18190,7 @@ hospitals:
   cms_hpt_url: https://srh.ernesthealth.com/cms-hpt.txt
   locator_name: Sacramento Rehabilitation Hospital, LLC
 - hospital_id: hospital-005524
+  alias_of: hospital-005523
   name: Sacramento Rehabilitation Hospital, LLC
   cms_hpt_url: https://srh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-005525
@@ -18268,6 +18365,7 @@ hospitals:
   name: Saint Luke's South Hospital
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
 - hospital_id: hospital-005575
+  alias_of: hospital-005574
   name: Saint Luke’s South Hospital, Inc
   cms_hpt_url: https://www.saintlukeskc.org/cms-hpt.txt
   locator_mrf_url: https://www.saintlukeskc.org/hpt/31/481203262_SaintLukesSouthHospital_standardcharges.json
@@ -18334,6 +18432,7 @@ hospitals:
   name: Salina Regional Health Center
   cms_hpt_url: https://www.srhc.com/cms-hpt.txt
 - hospital_id: hospital-005595
+  alias_of: hospital-005594
   name: Salina Regional Health Center Inc
   cms_hpt_url: https://www.srhc.com/cms-hpt.txt
   locator_name: Salina Regional Health Center
@@ -18549,6 +18648,7 @@ hospitals:
   cms_hpt_url: https://www.centralvalleymedicalcenter.com/cms-hpt.txt
   locator_mrf_url: https://cvmc.goredde.com/Estimator/Files/87-0419324_Central_Valley_Medical_Center_Clinics_standardcharges.csv
 - hospital_id: hospital-005658
+  alias_of: hospital-005657
   name: Santaquin Clinic
   cms_hpt_url: https://www.centralvalleymedicalcenter.com/cms-hpt.txt
   locator_name: Central Valley medical Center
@@ -18713,6 +18813,7 @@ hospitals:
   name: Sentara Albemarle Regional Medical Center
   cms_hpt_url: https://www.sentara.com/cms-hpt.txt
 - hospital_id: hospital-005707
+  alias_of: hospital-005706
   name: Sentara Albemarle Regional Medical Center, LLC
   cms_hpt_url: https://www.sentara.com/cms-hpt.txt
   locator_name: Sentara Albemarle Regional Medical Center
@@ -19254,6 +19355,7 @@ hospitals:
   name: SOUTH PENINSULA HOSPITAL
   cms_hpt_url: https://sphosp.org/cms-hpt.txt
 - hospital_id: hospital-005872
+  alias_of: hospital-005871
   name: SOUTH PENINSULA HOSPITAL INC
   cms_hpt_url: https://sphosp.org/cms-hpt.txt
   locator_name: SOUTH PENINSULA HOSPITAL
@@ -19303,6 +19405,7 @@ hospitals:
   cms_hpt_url: https://strh.ernesthealth.com/cms-hpt.txt
   locator_name: South Texas Rehabilitation Hospital, LP
 - hospital_id: hospital-005887
+  alias_of: hospital-005886
   name: South Texas Rehabilitation Hospital, LP
   cms_hpt_url: https://strh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-005888
@@ -19511,6 +19614,7 @@ hospitals:
   cms_hpt_url: https://sri.ernesthealth.com/cms-hpt.txt
   locator_mrf_url: https://ernesthealth.com/pricing/2026/263108840_spartanburg-rehabilitation-institute_standard-charges.json
 - hospital_id: hospital-005948
+  alias_of: hospital-005947
   name: Spartanburg Rehabilitation Institute, Inc.
   cms_hpt_url: https://sri.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-005949
@@ -20044,6 +20148,7 @@ hospitals:
   name: St. Bernardine Medical Center
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
 - hospital_id: hospital-006108
+  alias_of: hospital-006012
   name: St. Catherine Hospital
   cms_hpt_url: https://www.powershealth.org/cms-hpt.txt
 - hospital_id: hospital-006109
@@ -20197,6 +20302,7 @@ hospitals:
   cms_hpt_url: https://www.trinityhealthma.org/cms-hpt.txt
   locator_mrf_url: https://hpt.trinity-health.org/510064326_st-francis-hospital-inc_standardcharges.zip
 - hospital_id: hospital-006155
+  alias_of: hospital-006028
   name: St. Francis Medical Center
   cms_hpt_url: https://fmolhs.org/cms-hpt.txt
 - hospital_id: hospital-006156
@@ -20412,6 +20518,7 @@ hospitals:
   name: St. Luke's Meridian Standard Charges
   cms_hpt_url: https://stlukesonline.org/cms-hpt.txt
 - hospital_id: hospital-006222
+  alias_of: hospital-006056
   name: St. Luke's Nampa Medical Center
   cms_hpt_url: https://stlukesonline.org/cms-hpt.txt
   locator_name: St. Luke's Nampa Standard Charges
@@ -20428,6 +20535,7 @@ hospitals:
   name: St. Luke's The Woodlands Hospital
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
 - hospital_id: hospital-006227
+  alias_of: hospital-006059
   name: St. Luke's Wood River Medical Center
   cms_hpt_url: https://stlukesonline.org/cms-hpt.txt
   locator_name: St. Luke's Wood River Standard Charges
@@ -20466,6 +20574,7 @@ hospitals:
   name: St. Mary Medical Center
   cms_hpt_url: https://www.trinityhealthma.org/cms-hpt.txt
 - hospital_id: hospital-006236
+  alias_of: hospital-006073
   name: St. Mary Medical Center
   cms_hpt_url: https://www.powershealth.org/cms-hpt.txt
 - hospital_id: hospital-006237
@@ -20714,6 +20823,7 @@ hospitals:
   cms_hpt_url: https://stocktonrehab.com/cms-hpt.txt
   locator_name: Stockton Regional Rehabilitation Hospital, LLC
 - hospital_id: hospital-006312
+  alias_of: hospital-006311
   name: Stockton Regional Rehabilitation Hospital, LLC
   cms_hpt_url: https://stocktonrehab.com/cms-hpt.txt
 - hospital_id: hospital-006313
@@ -20842,6 +20952,7 @@ hospitals:
   name: Summit Surgical
   cms_hpt_url: https://summitks.com/cms-hpt.txt
 - hospital_id: hospital-006353
+  alias_of: hospital-006352
   name: Summit Surgical, LLC
   cms_hpt_url: https://summitks.com/cms-hpt.txt
   locator_name: Summit Surgical
@@ -21123,6 +21234,7 @@ hospitals:
   name: Teton Valley Health Care
   cms_hpt_url: https://tvhcare.org/cms-hpt.txt
 - hospital_id: hospital-006437
+  alias_of: hospital-006436
   name: TETON VALLEY HEALTH CARE INC
   cms_hpt_url: https://tvhcare.org/cms-hpt.txt
 - hospital_id: hospital-006438
@@ -21560,6 +21672,7 @@ hospitals:
   name: TJ HEALTH COLUMBIA
   cms_hpt_url: https://www.tjregionalhealth.org/cms-hpt.txt
 - hospital_id: hospital-006572
+  alias_of: hospital-006571
   name: TJ HEALTH COLUMBIA INC
   cms_hpt_url: https://www.tjregionalhealth.org/cms-hpt.txt
 - hospital_id: hospital-006573
@@ -21576,6 +21689,7 @@ hospitals:
   name: TOMAH MEMORIAL HOSPITAL
   cms_hpt_url: https://tomahhealth.org/cms-hpt.txt
 - hospital_id: hospital-006577
+  alias_of: hospital-006576
   name: TOMAH MEMORIAL HOSPITAL INC
   cms_hpt_url: https://tomahhealth.org/cms-hpt.txt
 - hospital_id: hospital-006578
@@ -22423,6 +22537,7 @@ hospitals:
   cms_hpt_url: https://www.uvmhealth.org/cms-hpt.txt
   locator_name: University of Vermont Medical Center
 - hospital_id: hospital-006840
+  alias_of: hospital-006838
   name: University of Vermont Medical Center Inc
   cms_hpt_url: https://www.uvmhealth.org/cms-hpt.txt
   locator_name: University of Vermont Medical Center
@@ -22668,6 +22783,7 @@ hospitals:
   name: USMD Hospital at Arlington
   cms_hpt_url: https://usmdarlington.com/cms-hpt.txt
 - hospital_id: hospital-006919
+  alias_of: hospital-006918
   name: USMD Hospital at Arlington LLC
   cms_hpt_url: https://usmdarlington.com/cms-hpt.txt
 - hospital_id: hospital-006920
@@ -23082,6 +23198,7 @@ hospitals:
   name: Weirton Medical Center
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
 - hospital_id: hospital-007050
+  alias_of: hospital-007049
   name: Weirton Medical Center Inc
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
   locator_name: Weirton Medical Center
@@ -23177,6 +23294,7 @@ hospitals:
   cms_hpt_url: https://wrrh.ernesthealth.com/cms-hpt.txt
   locator_name: Weslaco Regional Rehabilitation Hospital, LLC
 - hospital_id: hospital-007080
+  alias_of: hospital-007079
   name: Weslaco Regional Rehabilitation Hospital, LLC
   cms_hpt_url: https://wrrh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-007081
@@ -23223,6 +23341,7 @@ hospitals:
   name: West Chester Hospital
   cms_hpt_url: https://www.uchealth.com/cms-hpt.txt
 - hospital_id: hospital-007094
+  alias_of: hospital-007093
   name: West Chester Hospital, LLC
   cms_hpt_url: https://www.uchealth.com/cms-hpt.txt
   locator_mrf_url: https://www.uchealth.com/content/dam/uchealth/json-files/311588499_West-Chester-Hospital_StandardCharges.json
@@ -23300,6 +23419,7 @@ hospitals:
   name: West Virginia University Hospitals
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
 - hospital_id: hospital-007117
+  alias_of: hospital-007116
   name: West Virginia University Hospitals, Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
   locator_name: West Virginia University Hospitals
@@ -23347,6 +23467,7 @@ hospitals:
   name: Wetzel County Hospital
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
 - hospital_id: hospital-007132
+  alias_of: hospital-007131
   name: Wetzel County Hospital, Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
   locator_name: Wetzel County Hospital
@@ -23354,6 +23475,7 @@ hospitals:
   name: Wheeling Hospital
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
 - hospital_id: hospital-007134
+  alias_of: hospital-007133
   name: Wheeling Hospital, Inc.
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
   locator_name: Wheeling Hospital
@@ -23451,6 +23573,7 @@ hospitals:
   cms_hpt_url: https://willingway.com/cms-hpt.txt
   locator_name: Willingway, Inc.
 - hospital_id: hospital-007163
+  alias_of: hospital-007162
   name: Willingway, Inc.
   cms_hpt_url: https://willingway.com/cms-hpt.txt
 - hospital_id: hospital-007164
@@ -23876,15 +23999,18 @@ hospitals:
   name: Bonesteel Medical Clinic
   cms_hpt_url: https://www.cmhburke.org/cms-hpt.txt
 - hospital_id: hospital-007286
+  alias_of: hospital-000982
   name: Bristol Hospital, Incorporated
   cms_hpt_url: https://www.bristolhealth.org/cms-hpt.txt
 - hospital_id: hospital-007287
   name: Broaddus Hospital Association Inc
   cms_hpt_url: https://davishealthsystem.org/cms-hpt.txt
 - hospital_id: hospital-007288
+  alias_of: hospital-007047
   name: Webster County Memorial Hospital
   cms_hpt_url: https://davishealthsystem.org/cms-hpt.txt
 - hospital_id: hospital-007289
+  alias_of: hospital-003681
   name: Mackinac Straits Health System
   cms_hpt_url: https://mackinacstraitshealth.org/cms-hpt.txt
 - hospital_id: hospital-007290
@@ -23933,9 +24059,11 @@ hospitals:
   name: Orlando Health Joe H and Loretta Scott Emergency Room – Four Corners
   cms_hpt_url: https://www.southlakehospital.com/cms-hpt.txt
 - hospital_id: hospital-007305
+  alias_of: hospital-005332
   name: Refugio County Memorial Hospital
   cms_hpt_url: https://www.refugiohospital.com/cms-hpt.txt
 - hospital_id: hospital-007306
+  alias_of: hospital-005480
   name: Rockcastle Regional Hospital
   cms_hpt_url: https://www.rockcastleregional.org/cms-hpt.txt
 - hospital_id: hospital-007307
@@ -23951,6 +24079,7 @@ hospitals:
   name: University Health Dialysis Southeast
   cms_hpt_url: https://www.universityhealth.com/cms-hpt.txt
 - hospital_id: hospital-007311
+  alias_of: hospital-006920
   name: William P Clements Jr University Hospital
   cms_hpt_url: https://www.utswmed.org/cms-hpt.txt
 - hospital_id: hospital-007312
