@@ -16,7 +16,7 @@ from tests.test_ptg2_geo_rate_prefix import (
 )
 
 
-def _bounded_location_rows(local_npis, limit):
+def _bounded_location_rows(local_npis, limit) -> list[dict[str, int | bool]]:
     is_source_exhausted = len(local_npis) < limit
     return [
         {"npi": npi, "_ptg_source_exhausted": is_source_exhausted}
