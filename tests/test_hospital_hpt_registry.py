@@ -67,10 +67,10 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
 
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 7_282
+    assert len(registry.hospital_hpt_registry_groups()) == 7_267
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
-    assert sum("locator_name" in entry for entry in hospitals) == 1_220
-    assert sum("locator_mrf_url" in entry for entry in hospitals) == 637
+    assert sum("locator_name" in entry for entry in hospitals) == 1_242
+    assert sum("locator_mrf_url" in entry for entry in hospitals) == 636
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 16
     assert {
         entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry
@@ -118,7 +118,7 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         if "alias_of" in entry
     }
 
-    assert len(aliases_by_id) == 74
+    assert len(aliases_by_id) == 89
     assert {
         hospital_id: aliases_by_id[hospital_id]
         for hospital_id in _REVIEWED_ALIAS_SAMPLES
