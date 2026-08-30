@@ -16,6 +16,8 @@ _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-000290": "6c50dd498f71ee43bf7c440e1af0d793fdd27a9c593e0adda4121df714cd7740",
     "hospital-001163": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
     "hospital-001503": "6c134e170f5dfe9aa4ac2ab2dae9f0523bfa17262bb97813e16f07d2bba14615",
+    "hospital-002432": "f7dde437cb02b9b9662f846b720a82322688a8b682ef402033fcec699e990e59",
+    "hospital-002433": "f7dde437cb02b9b9662f846b720a82322688a8b682ef402033fcec699e990e59",
     "hospital-002491": "f7e5a19c5a44e85520da233d3d17025d9c834a8f7b817d9f5b7c4ef6596b6e64",
     "hospital-002911": "dff5b72c99a19b8989184eb65b37de4246c4dd3649097b697830fcd8b22638ab",
     "hospital-003312": "75d4e626daf0db2c1e53cc903f3669d04339bbffb8891f92dd588c7fa3d0316f",
@@ -27,6 +29,8 @@ _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-005609": "00f218c51149bc2237e87924d78a7e244607d53421e5cd18943a26a9f9e7c9c5",
     "hospital-005957": "a64e4900fd1c12cb9cb2837bca90a411dfaf72387cf4f2a135cfbd5922c0274c",
     "hospital-006053": "4d983a60e26bb91ee01c54bf194c91bc6a5d2b6215807af651dc96950ff55a6b",
+    "hospital-006299": "ec8f9399aa1d3a3664558303ab68213f7ee92dbc4c84ecbe39f675b54efee075",
+    "hospital-006300": "ec8f9399aa1d3a3664558303ab68213f7ee92dbc4c84ecbe39f675b54efee075",
     "hospital-006471": "dc7b9213c55ff2a6d9626a7841c532b5e7ebf1dce51e17efda59ead2c3f17de4",
     "hospital-006488": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
     "hospital-006502": "75d4e626daf0db2c1e53cc903f3669d04339bbffb8891f92dd588c7fa3d0316f",
@@ -41,19 +45,19 @@ _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
 }
 
 _REVIEWED_ALIAS_SAMPLES = {
-    "hospital-000061": "hospital-000060", "hospital-000064": "hospital-000063",
-    "hospital-000123": "hospital-000122", "hospital-000162": "hospital-000161",
-    "hospital-001486": "hospital-001483", "hospital-002520": "hospital-002519",
-    "hospital-004667": "hospital-004666", "hospital-005329": "hospital-005328",
-    "hospital-005563": "hospital-001678", "hospital-005564": "hospital-001678",
-    "hospital-005565": "hospital-001678", "hospital-006233": "hospital-005566",
-    "hospital-007207": "hospital-007206", "hospital-007272": "hospital-000586",
-    "hospital-000121": "hospital-000120", "hospital-000342": "hospital-000343",
-    "hospital-000593": "hospital-000592", "hospital-000654": "hospital-000604",
-    "hospital-000655": "hospital-000600", "hospital-000656": "hospital-000592",
-    "hospital-000657": "hospital-000606", "hospital-000745": "hospital-000744",
-    "hospital-002911": "hospital-000189", "hospital-005797": "hospital-005798",
-    "hospital-005077": "hospital-005063", "hospital-006650": "hospital-006649",
+    f"hospital-{alias}": f"hospital-{canonical}"
+    for alias, canonical in (
+        ("000061", "000060"), ("000064", "000063"), ("000123", "000122"), ("000162", "000161"),
+        ("001486", "001483"), ("002520", "002519"), ("004667", "004666"), ("005329", "005328"),
+        ("005563", "001678"), ("005564", "001678"), ("005565", "001678"), ("006233", "005566"),
+        ("007207", "007206"), ("007272", "000586"), ("000121", "000120"), ("000342", "000343"),
+        ("000593", "000592"), ("000654", "000604"), ("000655", "000600"), ("000656", "000592"),
+        ("000657", "000606"), ("000745", "000744"), ("002911", "000189"), ("005797", "005798"),
+        ("005077", "005063"), ("006650", "006649"), ("003017", "003012"), ("003068", "003013"),
+        ("003069", "003014"), ("003070", "003015"), ("003071", "003016"), ("003072", "003019"),
+        ("003073", "003018"), ("003074", "003020"), ("003075", "003021"), ("003076", "003022"),
+        ("003077", "003023"), ("003078", "003024"), ("003079", "003025"), ("002432", "002433"), ("006299", "006300"),
+    )
 }
 
 
@@ -77,15 +81,15 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 7_127
+    assert len(registry.hospital_hpt_registry_groups()) == 7_112
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
     assert sum("locator_name" in entry for entry in hospitals) == 1_259
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 636
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 27
-    assert {
-        entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry
-    } == set(_FALLBACK_URL_SHA256_BY_HOSPITAL_ID)
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 31
+    assert {entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry} == set(
+        _FALLBACK_URL_SHA256_BY_HOSPITAL_ID
+    )
     assert {
         hospital_id: hospital_by_id[hospital_id]["locator_name"]
         for hospital_id in (
@@ -127,7 +131,6 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
 
 def test_checked_in_registry_has_reviewed_canonical_aliases():
     """Keep reviewed alias identities explicit while preserving every raw ID."""
-
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
     aliases_by_id = {
@@ -135,14 +138,11 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 229
+    assert len(aliases_by_id) == 244
     assert {
-        hospital_id: aliases_by_id[hospital_id]
-        for hospital_id in _REVIEWED_ALIAS_SAMPLES
+        hospital_id: aliases_by_id[hospital_id] for hospital_id in _REVIEWED_ALIAS_SAMPLES
     } == _REVIEWED_ALIAS_SAMPLES
-    assert hospital_by_id["hospital-000063"]["name"] == (
-        "Advanced Specialty Hospitals of Toledo"
-    )
+    assert hospital_by_id["hospital-000063"]["name"] == "Advanced Specialty Hospitals of Toledo"
 
 
 def test_checked_in_registry_has_reviewed_wvu_legal_name_aliases():
@@ -433,9 +433,7 @@ def test_checked_in_registry_read_failure_is_normalized(tmp_path, monkeypatch):
     monkeypatch.setattr(registry, "HOSPITAL_HPT_REGISTRY_PATH", tmp_path / "missing")
     registry._cached_hospital_hpt_registry.cache_clear()
     try:
-        with pytest.raises(
-            registry.HospitalHptRegistryError, match="document_unreadable"
-        ):
+        with pytest.raises(registry.HospitalHptRegistryError, match="document_unreadable"):
             registry.load_hospital_hpt_registry()
     finally:
         registry._cached_hospital_hpt_registry.cache_clear()
@@ -492,9 +490,7 @@ def test_runtime_selection_is_exact_and_source_neutral(monkeypatch):
 )
 def test_invalid_runtime_selection_fails_closed(monkeypatch, params):
     monkeypatch.setattr(
-        registry,
-        "load_hospital_hpt_registry",
-        lambda: ({"hospital_id": "hospital-000001"},),
+        registry, "load_hospital_hpt_registry", lambda: ({"hospital_id": "hospital-000001"},)
     )
     with pytest.raises(registry.HospitalHptRegistryError):
         registry.selected_hospital_hpt_registry(params)

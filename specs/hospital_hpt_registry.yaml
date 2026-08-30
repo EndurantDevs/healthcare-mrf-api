@@ -7960,12 +7960,15 @@ hospitals:
   name: GRAND STRAND MEDICAL CENTER
   cms_hpt_url: https://www.mygrandstrandhealth.com/cms-hpt.txt
 - hospital_id: hospital-002432
+  alias_of: hospital-002433
   name: Grande Ronde Hospital
   cms_hpt_url: https://www.grh.org/cms-hpt.txt
+  fallback_mrf_url: https://www.grh.org/clientfiles/GetFile/08-2026_930505325_grande-ronde-hospital_standardcharges.csv
   locator_mrf_url: https://www.grh.org/clientfiles/GetFile/930505325_grande-ronde-hospital_standardcharges.csv
 - hospital_id: hospital-002433
   name: Grande Ronde Hospital and Clinics
   cms_hpt_url: https://www.grh.org/cms-hpt.txt
+  fallback_mrf_url: https://www.grh.org/clientfiles/GetFile/08-2026_930505325_grande-ronde-hospital_standardcharges.csv
 - hospital_id: hospital-002434
   name: Grandview Clinic RHC
   cms_hpt_url: https://www.prosserhealth.org/cms-hpt.txt
@@ -9916,6 +9919,7 @@ hospitals:
   cms_hpt_url: https://www.hss.edu/cms-hpt.txt
   locator_name: HSS Long Island Outpatient Center
 - hospital_id: hospital-003017
+  alias_of: hospital-003012
   name: Hospital for Special Surgery, MAIN
   cms_hpt_url: https://www.hss.edu/cms-hpt.txt
   locator_name: Hospital for Special Surgery Main Hospital
@@ -10095,39 +10099,51 @@ hospitals:
   name: HSHS St. Vincent Hospital
   cms_hpt_url: https://www.hshs.org/cms-hpt.txt
 - hospital_id: hospital-003068
+  alias_of: hospital-003013
   name: HSS Brooklyn Outpatient Center
   cms_hpt_url: https://www.hss.edu/cms-hpt.txt
 - hospital_id: hospital-003069
+  alias_of: hospital-003014
   name: HSS East Side Outpatient Center
   cms_hpt_url: https://www.hss.edu/cms-hpt.txt
 - hospital_id: hospital-003070
+  alias_of: hospital-003015
   name: HSS Hudson Yards Outpatient Center
   cms_hpt_url: https://www.hss.edu/cms-hpt.txt
 - hospital_id: hospital-003071
+  alias_of: hospital-003016
   name: HSS Long Island Outpatient Center
   cms_hpt_url: https://www.hss.edu/cms-hpt.txt
 - hospital_id: hospital-003072
+  alias_of: hospital-003019
   name: HSS Midtown Outpatient Center
   cms_hpt_url: https://www.hss.edu/cms-hpt.txt
 - hospital_id: hospital-003073
+  alias_of: hospital-003018
   name: HSS Paramus Midland Outpatient Center
   cms_hpt_url: https://www.hss.edu/cms-hpt.txt
 - hospital_id: hospital-003074
+  alias_of: hospital-003020
   name: HSS Paramus Outpatient Center
   cms_hpt_url: https://www.hss.edu/cms-hpt.txt
 - hospital_id: hospital-003075
+  alias_of: hospital-003021
   name: HSS Queens Outpatient Center
   cms_hpt_url: https://www.hss.edu/cms-hpt.txt
 - hospital_id: hospital-003076
+  alias_of: hospital-003022
   name: HSS Southampton Outpatient Center
   cms_hpt_url: https://www.hss.edu/cms-hpt.txt
 - hospital_id: hospital-003077
+  alias_of: hospital-003023
   name: HSS Stamford Outpatient Center
   cms_hpt_url: https://www.hss.edu/cms-hpt.txt
 - hospital_id: hospital-003078
+  alias_of: hospital-003024
   name: HSS West Side Outpatient Center
   cms_hpt_url: https://www.hss.edu/cms-hpt.txt
 - hospital_id: hospital-003079
+  alias_of: hospital-003025
   name: HSS Westchester Outpatient Center
   cms_hpt_url: https://www.hss.edu/cms-hpt.txt
 - hospital_id: hospital-003080
@@ -20779,12 +20795,15 @@ hospitals:
   name: Sterling Regional Medical Center
   cms_hpt_url: https://www.bannerhealth.com/cms-hpt.txt
 - hospital_id: hospital-006299
+  alias_of: hospital-006300
   name: STERLINGTON REHAB
   cms_hpt_url: https://sterlingtonrehab.com/cms-hpt.txt
+  fallback_mrf_url: https://sterlingtonrehab.com/wp-content/uploads/2026/07/STERLNGTON-REHAB-STANDARD-CHARGES-1in.csv
   locator_name: Sterlington Rehabilitation Hospital & Rural Health Clinics
 - hospital_id: hospital-006300
   name: Sterlington Rehabilitation Hospital & Rural Health Clinics
   cms_hpt_url: https://sterlingtonrehab.com/cms-hpt.txt
+  fallback_mrf_url: https://sterlingtonrehab.com/wp-content/uploads/2026/07/STERLNGTON-REHAB-STANDARD-CHARGES-1in.csv
 - hospital_id: hospital-006301
   name: STEVENS COMMUNITY MEDICAL CENTER INC
   cms_hpt_url: https://www.sarahbush.org/cms-hpt.txt
