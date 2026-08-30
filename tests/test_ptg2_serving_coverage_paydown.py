@@ -348,7 +348,7 @@ async def test_membership_location_rows_bounds_knn_and_restores_planner(monkeypa
         "_membership_location_query",
         AsyncMock(return_value=query),
     )
-    enable = AsyncMock(return_value=("auto", "2"))
+    enable = AsyncMock(return_value=("auto", "2", "on"))
     restore = AsyncMock()
     monkeypatch.setattr(serving, "_enable_serial_knn_planning", enable)
     monkeypatch.setattr(serving, "_restore_knn_planning", restore)
@@ -371,7 +371,7 @@ async def test_membership_location_rows_bounds_knn_and_restores_planner(monkeypa
     ]
     assert query.parameter_map["raw_probe_limit"] == 67
     enable.assert_awaited_once_with(session)
-    restore.assert_awaited_once_with(session, ("auto", "2"))
+    restore.assert_awaited_once_with(session, ("auto", "2", "on"))
 
 
 @pytest.mark.asyncio
@@ -384,7 +384,7 @@ async def test_membership_location_rows_preserves_knn_query_failure(monkeypatch)
     monkeypatch.setattr(
         serving,
         "_enable_serial_knn_planning",
-        AsyncMock(return_value=("auto", "2")),
+        AsyncMock(return_value=("auto", "2", "on")),
     )
     restore = AsyncMock()
     monkeypatch.setattr(serving, "_restore_knn_planning", restore)

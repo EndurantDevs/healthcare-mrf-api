@@ -6094,14 +6094,23 @@ async def _shared_forward_entries_for_code_rows(
     code_rows: Iterable[Mapping[str, Any]],
     *,
     provider_set_keys: Iterable[int] | None = None,
+    scan_budget: ForwardReadBudget | None = None,
 ) -> list[Any]:
-    """Load complete forward entries for each compatible code dictionary row."""
+    """Load compatible forward entries, bounding filtered reads when requested."""
 
     normalized_provider_set_keys = (
         tuple(sorted({int(provider_set_key) for provider_set_key in provider_set_keys}))
         if provider_set_keys is not None
         else None
     )
+    if scan_budget is not None:
+        return await _bounded_shared_forward_entries(
+            session,
+            serving_tables,
+            code_rows,
+            normalized_provider_set_keys,
+            scan_budget,
+        )
     provider_counts_by_key = await _version_three_provider_counts_for_keys(
         session,
         serving_tables,
@@ -6112,15 +6121,63 @@ async def _shared_forward_entries_for_code_rows(
         code_key = code_row.get("code_key")
         if code_key is None:
             continue
-        forward_entries.extend(
-            await _lookup_shared_forward_rows(
-                session,
-                serving_tables,
-                int(code_key),
-                provider_set_keys=normalized_provider_set_keys,
-                provider_counts_by_key=provider_counts_by_key,
-            )
+        code_entries = await _lookup_shared_forward_rows(
+            session,
+            serving_tables,
+            int(code_key),
+            provider_set_keys=normalized_provider_set_keys,
+            provider_counts_by_key=provider_counts_by_key,
+            scan_budget=None,
         )
+        forward_entries.extend(code_entries)
+    return forward_entries
+
+
+async def _bounded_shared_forward_entries(
+    session,
+    serving_tables: PTG2ServingTables,
+    code_rows: Iterable[Mapping[str, Any]],
+    provider_set_keys: tuple[int, ...] | None,
+    scan_budget: ForwardReadBudget,
+) -> list[Any]:
+    """Retain at most one authenticated occurrence sentinel across code reads."""
+
+    maximum_rows = scan_budget.maximum_row_capacity
+    if maximum_rows is None:
+        raise ForwardReadBudgetExceeded(
+            "PTG2 bounded forward read is missing its row-capacity budget"
+        )
+    forward_entries: list[Any] = []
+    seen_code_keys: set[int] = set()
+    for code_row in code_rows:
+        code_key = code_row.get("code_key")
+        if code_key is None or int(code_key) in seen_code_keys:
+            continue
+        normalized_code_key = int(code_key)
+        seen_code_keys.add(normalized_code_key)
+        remaining_rows = maximum_rows - max(
+            scan_budget.active_read_row_capacity,
+            scan_budget.active_result_row_capacity,
+        )
+        if remaining_rows <= 0:
+            raise ForwardReadBudgetExceeded(
+                "PTG2 forward read exceeds its sealed row-capacity budget"
+            )
+        code_entries = await _lookup_shared_forward_prefix_rows(
+            session,
+            serving_tables,
+            normalized_code_key,
+            provider_set_keys=provider_set_keys,
+            provider_counts_by_key=None,
+            limit=remaining_rows,
+            descending=False,
+            scan_budget=scan_budget,
+        )
+        scan_budget.reserve_row_capacity(
+            read_rows=len(code_entries),
+            result_rows=len(code_entries),
+        )
+        forward_entries.extend(code_entries)
     return forward_entries
 
 
@@ -6256,21 +6313,20 @@ async def _shared_rate_code_rows(
     ]
 
 
-async def _shared_rate_provider_set_keys(
+async def _shared_rate_code_scope_rows(
     session,
     serving_tables: PTG2ServingTables,
     *,
     plan_id: str,
-    plan_market_type: str = "",
+    plan_market_type: str,
     reported_code: str,
     code_system: str | None,
-    provider_set_keys: Iterable[int] | None = None,
-) -> tuple[int, ...]:
-    """Resolve a plan/code rate to dense provider-set keys only."""
+) -> list[dict[str, Any]]:
+    """Resolve exact logical plan/code metadata without reading its rate block."""
 
     _require_strict_shared_v3(serving_tables)
     if not plan_id or not reported_code:
-        return ()
+        return []
     scope_join_sql, filters, params, plan_order = _shared_v3_code_scope_sql(
         serving_tables,
         requested_plan=plan_id,
@@ -6291,13 +6347,55 @@ async def _shared_rate_provider_set_keys(
         column="code_metadata.reported_code_system",
         code_system=code_system,
     )
-    code_rows = await _shared_rate_code_rows(
+    return await _shared_rate_code_rows(
         session,
         scope_join_sql,
         filters,
         params,
         plan_order,
     )
+
+
+async def _shared_rate_provider_set_keys(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    plan_id: str,
+    plan_market_type: str = "",
+    reported_code: str,
+    code_system: str | None,
+    provider_set_keys: Iterable[int] | None = None,
+    scan_budget: ForwardReadBudget | None = None,
+) -> tuple[int, ...]:
+    """Resolve a plan/code rate to dense provider-set keys only."""
+
+    code_rows = await _shared_rate_code_scope_rows(
+        session,
+        serving_tables,
+        plan_id=plan_id,
+        plan_market_type=plan_market_type,
+        reported_code=reported_code,
+        code_system=code_system,
+    )
+    return await _scoped_rate_provider_set_keys(
+        session,
+        serving_tables,
+        code_rows,
+        provider_set_keys=provider_set_keys,
+        scan_budget=scan_budget,
+    )
+
+
+async def _scoped_rate_provider_set_keys(
+    session,
+    serving_tables: PTG2ServingTables,
+    code_rows: Sequence[Mapping[str, Any]],
+    *,
+    provider_set_keys: Iterable[int] | None,
+    scan_budget: ForwardReadBudget | None,
+) -> tuple[int, ...]:
+    """Intersect preloaded exact code rows with an optional provider-set scope."""
+
     if not code_rows:
         return ()
     forward_rows = await _shared_forward_entries_for_code_rows(
@@ -6305,6 +6403,7 @@ async def _shared_rate_provider_set_keys(
         serving_tables,
         code_rows,
         provider_set_keys=provider_set_keys,
+        scan_budget=scan_budget,
     )
     return tuple(
         sorted(
@@ -8865,6 +8964,13 @@ def _ptg2_manifest_rate_candidate_limit(
     if location_filter_requested and not expand_providers:
         return requested_offset + requested_limit + 1
     if expand_providers and location_filter_requested:
+        requested_order = str(args.get("order_by") or "").strip().lower()
+        requested_direction = str(args.get("order") or "asc").strip().lower()
+        if (
+            requested_order in {"", "distance", "distance_miles"}
+            and requested_direction == "asc"
+        ):
+            return requested_offset + requested_limit + 1
         # Bound the nearby-candidate pool the location expansion materializes.
         # The downstream provider_group_member fan-out + per-row enrichment cost
         # scales with this pool. Keep the default close to the requested page,
@@ -9648,6 +9754,7 @@ class _MembershipLocationQuery:
     address_assurance_sql: str = "TRUE"
     address_filter_sql: str | None = None
     taxonomy_index_sql: str | None = None
+    knn_prefilter_sql: str = "TRUE"
 
 
 _MEMBERSHIP_NPI_SQL = """
@@ -9938,6 +10045,11 @@ WITH scope_probe AS MATERIALIZED (
     WHERE (SELECT npi_count < {scope_probe_limit} FROM scope_probe)
       AND npi_scope.snapshot_key = :shared_snapshot_key
       AND addr.npi IS NOT NULL
+      AND CASE
+              WHEN (SELECT npi_count < {scope_probe_limit} FROM scope_probe)
+              THEN ({knn_prefilter_sql})
+              ELSE FALSE
+          END
       AND addr.type IN ('primary', 'secondary', 'practice', 'site')
       AND COALESCE(addr.address_precision, '') <> 'city_zip'
       AND addr.lat IS NOT NULL
@@ -9959,6 +10071,11 @@ WITH scope_probe AS MATERIALIZED (
     WHERE (SELECT npi_count >= {scope_probe_limit} FROM scope_probe)
       AND npi_scope.snapshot_key = :shared_snapshot_key
       AND addr.npi IS NOT NULL
+      AND CASE
+              WHEN (SELECT npi_count >= {scope_probe_limit} FROM scope_probe)
+              THEN ({knn_prefilter_sql})
+              ELSE FALSE
+          END
       AND addr.type IN ('primary', 'secondary', 'practice', 'site')
       AND COALESCE(addr.address_precision, '') <> 'city_zip'
       AND addr.lat IS NOT NULL
@@ -9990,6 +10107,11 @@ WITH scope_probe AS MATERIALIZED (
         WHERE geocoded_probe_stats.raw_probe_count < :raw_probe_limit
           AND npi_scope.snapshot_key = :shared_snapshot_key
           AND addr.npi IS NOT NULL
+          AND CASE
+                  WHEN geocoded_probe_stats.raw_probe_count < :raw_probe_limit
+                  THEN ({knn_prefilter_sql})
+                  ELSE FALSE
+              END
           AND addr.type IN ('primary', 'secondary', 'practice', 'site')
           AND {exact_zip_candidate_filter_sql}
         ORDER BY addr.npi,
@@ -10195,8 +10317,21 @@ def _membership_taxonomy_filters(
             )
             + ")"
         )
+    filter_clauses.extend(
+        _membership_inferred_taxonomy_filters(args, parameter_map)
+    )
+    return filter_clauses
+
+
+def _membership_inferred_taxonomy_filters(
+    args: Mapping[str, Any],
+    parameter_map: dict[str, Any],
+) -> list[str]:
+    """Build the exact inferred-taxonomy predicates shared by geo paths."""
+
+    filter_clauses: list[str] = []
     inferred_taxonomy_sql = _inferred_provider_taxonomy_code_sql(
-        args,
+        dict(args),
         nt_alias="membership_location_nt",
         schema=PTG2_SCHEMA,
         params=parameter_map,
@@ -10437,6 +10572,20 @@ async def _membership_address_table_for_request(
     return address_table
 
 
+def _membership_location_parameters(
+    *, uses_unified_addresses: bool, limit: int, offset: int
+) -> dict[str, Any]:
+    """Build the bounded location-query parameters."""
+
+    return {
+        "limit": max(int(limit), 1),
+        "offset": max(int(offset), 0),
+        "address_types": ["practice", "primary", "secondary", "site"]
+        if uses_unified_addresses
+        else ["primary", "secondary"],
+    }
+
+
 async def _membership_location_query(
     session,
     serving_tables: PTG2ServingTables,
@@ -10453,13 +10602,9 @@ async def _membership_location_query(
     if not address_table:
         return None
     uses_unified_addresses = _is_unified_address_table(address_table)
-    parameter_map: dict[str, Any] = {
-        "limit": max(int(limit), 1),
-        "offset": max(int(offset), 0),
-        "address_types": ["practice", "primary", "secondary", "site"]
-        if uses_unified_addresses
-        else ["primary", "secondary"],
-    }
+    parameter_map = _membership_location_parameters(
+        uses_unified_addresses=uses_unified_addresses, limit=limit, offset=offset
+    )
     knn_order_sql = _membership_knn_order_sql(
         args,
         candidate_npis=candidate_npis,
@@ -10467,6 +10612,7 @@ async def _membership_location_query(
         offset=offset,
     )
     include_taxonomy_filters = knn_order_sql is None
+    knn_prefilter_sql = _membership_knn_prefilter_sql(args, parameter_map, knn_order_sql)
     filter_sql_parts = _membership_filter_sql(
         args,
         candidate_npis=candidate_npis,
@@ -10496,7 +10642,22 @@ async def _membership_location_query(
         taxonomy_index_sql=_membership_location_taxonomy_index_sql(
             args, parameter_map, uses_unified_addresses, include_taxonomy_filters
         ),
+        knn_prefilter_sql=knn_prefilter_sql,
     )
+
+
+def _membership_knn_prefilter_sql(
+    args: Mapping[str, Any],
+    parameter_map: dict[str, Any],
+    knn_order_sql: str | None,
+) -> str:
+    """Render the exact inferred-taxonomy predicate before raw KNN limits."""
+
+    return " AND ".join(
+        _membership_inferred_taxonomy_filters(args, parameter_map)
+        if knn_order_sql is not None
+        else ()
+    ) or "TRUE"
 
 
 def _membership_location_taxonomy_index_sql(
@@ -10521,39 +10682,50 @@ def _membership_location_taxonomy_index_sql(
     return _membership_taxonomy_index_sql(args, parameter_map)
 
 
-async def _enable_serial_knn_planning(session) -> tuple[str, str]:
+async def _enable_serial_knn_planning(session) -> tuple[str, str, str]:
     """Apply request-local KNN planner settings and return their prior values."""
     settings_result = await session.execute(
         text(
             """
             WITH previous_settings AS MATERIALIZED (
                 SELECT current_setting('plan_cache_mode') AS plan_cache_mode,
-                       current_setting('max_parallel_workers_per_gather') AS parallel_workers
+                       current_setting('max_parallel_workers_per_gather') AS parallel_workers,
+                       current_setting('jit') AS jit
             )
             SELECT previous_settings.plan_cache_mode,
                    previous_settings.parallel_workers,
+                   previous_settings.jit,
                    set_config('plan_cache_mode', 'force_custom_plan', true),
-                   set_config('max_parallel_workers_per_gather', '0', true)
+                   set_config('max_parallel_workers_per_gather', '0', true),
+                   set_config('jit', 'off', true)
               FROM previous_settings
             """
         )
     )
     settings_row = _row_mapping(settings_result.first())
-    return str(settings_row["plan_cache_mode"]), str(settings_row["parallel_workers"])
+    return (
+        str(settings_row["plan_cache_mode"]),
+        str(settings_row["parallel_workers"]),
+        str(settings_row["jit"]),
+    )
 
 
-async def _restore_knn_planning(session, prior_settings: tuple[str, str]) -> None:
+async def _restore_knn_planning(
+    session, prior_settings: tuple[str, str, str]
+) -> None:
     """Restore planner settings after the bounded KNN statement finishes."""
     await session.execute(
         text(
             """
             SELECT set_config('plan_cache_mode', :plan_cache_mode, true),
-                   set_config('max_parallel_workers_per_gather', :parallel_workers, true)
+                   set_config('max_parallel_workers_per_gather', :parallel_workers, true),
+                   set_config('jit', :jit, true)
             """
         ),
         {
             "plan_cache_mode": prior_settings[0],
             "parallel_workers": prior_settings[1],
+            "jit": prior_settings[2],
         },
     )
 
@@ -11343,6 +11515,7 @@ def _membership_location_sql(
     return _MEMBERSHIP_LOCATION_KNN_SQL.format(
         **format_values_by_name,
         knn_order_sql=query_context.knn_order_sql,
+        knn_prefilter_sql=query_context.knn_prefilter_sql,
         raw_geo_radius_sql=_ptg2_geo_dwithin_sql("addr.lat", "addr.long"),
         scope_probe_limit=_MEMBERSHIP_KNN_SPARSE_SCOPE_LIMIT + 1,
         exact_zip_candidate_filter_sql=exact_zip_candidate_filter_sql,
@@ -12465,9 +12638,312 @@ def _scoped_graph_provider_set_keys(
     return normalized_provider_set_keys.intersection(explicit_provider_set_keys)
 
 
-async def _graph_candidates_for_request(
+@dataclass(frozen=True)
+class _LocalDistanceGraphRequest:
+    candidate_limit: int
+    code_rows: Sequence[Mapping[str, Any]]
+    forward_limits: _V4GeoRateForwardLimits
+
+
+@dataclass
+class _LocalDistanceGraphState:
+    seen_npis: set[int] = field(default_factory=set)
+    observed_prefix: tuple[int, ...] = ()
+    matched_locations: list[dict[str, Any]] = field(default_factory=list)
+    matching_sets_by_npi: dict[int, set[int]] = field(default_factory=dict)
+    code_sets: set[int] = field(default_factory=set)
+    noncode_sets: set[int] = field(default_factory=set)
+    retained_memberships: int = 0
+
+    def candidates(self) -> _GraphLocationCandidates:
+        """Return the exact code-matched prefix accumulated so far."""
+
+        return _GraphLocationCandidates(
+            self.matched_locations,
+            self.matching_sets_by_npi,
+            taxonomy_filtered=True,
+        )
+
+
+def _new_local_taxonomy_locations(
+    locations: Sequence[dict[str, Any]],
+    state: _LocalDistanceGraphState,
+) -> list[dict[str, Any]]:
+    """Validate one stable ordered prefix and return its newly seen rows."""
+
+    current_npis = tuple(
+        int(location["npi"])
+        for location in locations
+        if location.get("npi") not in (None, "")
+    )
+    if current_npis[: len(state.observed_prefix)] != state.observed_prefix:
+        raise PTG2ManifestArtifactError(
+            "PTG2 nearby location prefix changed during bounded traversal"
+        )
+    state.observed_prefix = current_npis
+    new_locations = [
+        location
+        for location in locations
+        if location.get("npi") not in (None, "")
+        and int(location["npi"]) not in state.seen_npis
+    ]
+    new_npis = tuple(int(location["npi"]) for location in new_locations)
+    state.seen_npis.update(new_npis)
+    return new_locations
+
+
+async def _local_v4_memberships(
     session,
     serving_tables: PTG2ServingTables,
+    npis: tuple[int, ...],
+    request: _LocalDistanceGraphRequest,
+    state: _LocalDistanceGraphState,
+) -> dict[int, tuple[int, ...]]:
+    """Resolve exact new-NPI memberships under the cumulative sealed cap."""
+
+    remaining = (
+        request.forward_limits.maximum_retained_memberships
+        - state.retained_memberships
+    )
+    try:
+        memberships = await _v4_sets_by_npi(
+            session,
+            serving_tables,
+            npis,
+            max_members=max(remaining, 0),
+            max_projection_members=request.forward_limits.maximum_projection_members,
+        )
+    except PTG2SharedBlockError as exc:
+        if not _is_v4_member_limit(exc):
+            raise
+        raise PTG2OnlineWorkBudgetExceeded("retained_memberships") from exc
+    if set(memberships) != set(npis):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 nearby NPI membership is incomplete"
+        )
+    state.retained_memberships += sum(map(len, memberships.values()))
+    return memberships
+
+
+async def _classify_local_code_sets(
+    session,
+    serving_tables: PTG2ServingTables,
+    memberships: Mapping[int, Sequence[int]],
+    request: _LocalDistanceGraphRequest,
+    state: _LocalDistanceGraphState,
+) -> None:
+    """Classify each first-seen local provider set under one forward budget."""
+
+    unknown_sets = tuple(
+        sorted(
+            {
+                int(provider_set_key)
+                for provider_set_keys in memberships.values()
+                for provider_set_key in provider_set_keys
+            }.difference(state.code_sets, state.noncode_sets)
+        )
+    )
+    if len(state.code_sets) + len(state.noncode_sets) + len(unknown_sets) > (
+        request.forward_limits.maximum_code_sets
+    ):
+        raise PTG2OnlineWorkBudgetExceeded("code_sets")
+    if not unknown_sets:
+        return
+    try:
+        new_code_sets = set(
+            await _scoped_rate_provider_set_keys(
+                session,
+                serving_tables,
+                request.code_rows,
+                provider_set_keys=unknown_sets,
+                scan_budget=request.forward_limits.scan_budget,
+            )
+        )
+    except ForwardReadBudgetExceeded as exc:
+        scan_budget = request.forward_limits.scan_budget
+        if max(
+            scan_budget.active_read_row_capacity,
+            scan_budget.active_result_row_capacity,
+        ) > request.forward_limits.maximum_code_occurrences:
+            raise PTG2OnlineWorkBudgetExceeded("code_occurrences") from exc
+        raise PTG2OnlineWorkBudgetExceeded("forward_scan") from exc
+    scan_budget = request.forward_limits.scan_budget
+    if max(
+        scan_budget.active_read_row_capacity,
+        scan_budget.active_result_row_capacity,
+    ) > request.forward_limits.maximum_code_occurrences:
+        raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
+    if not new_code_sets.issubset(unknown_sets):
+        raise PTG2ManifestArtifactError(
+            "PTG2 local code intersection escaped its provider-set scope"
+        )
+    state.code_sets.update(new_code_sets)
+    state.noncode_sets.update(set(unknown_sets).difference(new_code_sets))
+
+
+def _append_local_code_matches(
+    locations: Sequence[dict[str, Any]],
+    memberships: Mapping[int, Sequence[int]],
+    candidate_limit: int,
+    state: _LocalDistanceGraphState,
+) -> None:
+    """Append complete local-code matches through the requested page prefix."""
+
+    for location in locations:
+        npi = int(location["npi"])
+        matching_sets = set(memberships[npi]).intersection(state.code_sets)
+        if not matching_sets:
+            continue
+        state.matching_sets_by_npi[npi] = matching_sets
+        state.matched_locations.append(location)
+        if len(state.matched_locations) >= candidate_limit:
+            return
+
+
+async def _scan_local_distance_graph(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    request: _LocalDistanceGraphRequest,
+    batch_size: int,
+    max_candidates: int,
+) -> _GraphLocationCandidates | None:
+    """Grow one stable distance prefix until its code-matched page is proven."""
+
+    state = _LocalDistanceGraphState()
+    probe_limit = batch_size
+    while probe_limit <= max_candidates:
+        locations = await _membership_location_rows(
+            session,
+            serving_tables,
+            args,
+            candidate_npis=None,
+            limit=probe_limit,
+            offset=0,
+        )
+        if locations is None:
+            return None
+        new_locations = _new_local_taxonomy_locations(locations, state)
+        new_npis = tuple(int(location["npi"]) for location in new_locations)
+        memberships = await _local_v4_memberships(
+            session, serving_tables, new_npis, request, state
+        )
+        await _classify_local_code_sets(
+            session, serving_tables, memberships, request, state
+        )
+        _append_local_code_matches(
+            new_locations, memberships, request.candidate_limit, state
+        )
+        if len(state.matched_locations) >= request.candidate_limit:
+            return state.candidates()
+        if not locations or _is_graph_location_source_exhausted(
+            locations, probe_limit
+        ):
+            break
+        if probe_limit >= max_candidates:
+            raise PTG2ManifestArtifactError(
+                "PTG2 location traversal reached its configured exactness bound"
+            )
+        probe_limit = _next_graph_location_probe_limit(
+            probe_limit,
+            batch_size=batch_size,
+            max_candidates=max_candidates,
+            observed_matches=len(state.matched_locations),
+            required_matches=request.candidate_limit,
+        )
+    return state.candidates()
+
+
+async def _local_inferred_distance_graph_candidates(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    *,
+    plan_id: str,
+    requested_code: str,
+    requested_system: str | None,
+    candidate_limit: int,
+) -> _GraphLocationCandidates | None:
+    """Intersect one exact nearby taxonomy prefix with its bounded code sets."""
+
+    plan_market_type = str(
+        args.get("plan_market_type") or args.get("market_type") or ""
+    )
+    code_rows = await _shared_rate_code_scope_rows(
+        session,
+        serving_tables,
+        plan_id=plan_id,
+        plan_market_type=plan_market_type,
+        reported_code=requested_code,
+        code_system=requested_system,
+    )
+    if not code_rows:
+        return _GraphLocationCandidates([], {}, taxonomy_filtered=True)
+    forward_limits = _v4_geo_rate_forward_limits(serving_tables)
+    graph_root = await load_v4_graph_root(
+        session,
+        _required_shared_snapshot_key(serving_tables),
+        schema_name=PTG2_SCHEMA,
+    )
+    multiplier = (
+        _v4_direct_io_multiplier(serving_tables)
+        if graph_root.representation == "direct_v1"
+        else 1
+    )
+    request = _LocalDistanceGraphRequest(
+        candidate_limit,
+        code_rows,
+        forward_limits,
+    )
+    batch_size = _graph_location_probe_batch_size(
+        candidate_limit, taxonomy_filter_requested=False
+    )
+    with v4_graph_taxonomy_projection_scope(
+        maximum_members=forward_limits.maximum_projection_members,
+        maximum_pages=forward_limits.scan_budget.maximum_fragments * multiplier,
+        maximum_bytes=forward_limits.scan_budget.maximum_raw_payload_bytes * multiplier,
+        maximum_batches=forward_limits.maximum_graph_batches,
+    ):
+        return await _scan_local_distance_graph(
+            session,
+            serving_tables,
+            args,
+            request,
+            batch_size,
+            max(_ptg2_manifest_location_match_limit() * 20, batch_size),
+        )
+
+
+async def _request_rate_provider_set_keys(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: Mapping[str, Any],
+    request_options: Mapping[str, Any],
+    provider_set_keys: set[int] | None,
+) -> frozenset[int]:
+    """Read the exact code-bearing provider sets for the broad graph path."""
+
+    return frozenset(
+        await _shared_rate_provider_set_keys(
+            session,
+            serving_tables,
+            plan_id=request_options["plan_id"],
+            plan_market_type=(
+                args.get("plan_market_type") or args.get("market_type") or ""
+            ),
+            reported_code=request_options["requested_code"],
+            code_system=request_options.get("requested_system"),
+            provider_set_keys=(
+                tuple(sorted(provider_set_keys))
+                if provider_set_keys is not None
+                else None
+            ),
+        )
+    )
+
+
+async def _graph_candidates_for_request(
+    session, serving_tables: PTG2ServingTables,
     args: dict[str, Any],
     **request_options: Any,
 ) -> _GraphLocationCandidates | None:
@@ -12481,9 +12957,7 @@ async def _graph_candidates_for_request(
     explicit_npi_scope = request_options.get("explicit_npi_scope")
     if explicit_npi_scope is None:
         explicit_npi_scope = await _version_three_explicit_npi_graph_scope(
-            session,
-            serving_tables,
-            args,
+            session, serving_tables, args
         )
     if explicit_npi_scope is not None and not explicit_npi_scope.provider_set_keys:
         return _GraphLocationCandidates([], {})
@@ -12493,24 +12967,25 @@ async def _graph_candidates_for_request(
     )
     if scoped_provider_set_keys is not None and not scoped_provider_set_keys:
         return _GraphLocationCandidates([], {})
-    rate_provider_set_keys = frozenset(
-        await _shared_rate_provider_set_keys(
+    if _uses_local_distance_rate_scope(
+        serving_tables,
+        args,
+        request_options,
+        scoped_provider_set_keys,
+        explicit_npi_scope,
+        candidate_limit,
+    ):
+        return await _local_inferred_distance_graph_candidates(
             session,
             serving_tables,
+            args,
             plan_id=plan_id,
-            plan_market_type=(
-                args.get("plan_market_type")
-                or args.get("market_type")
-                or ""
-            ),
-            reported_code=requested_code,
-            code_system=requested_system,
-            provider_set_keys=(
-                tuple(sorted(scoped_provider_set_keys))
-                if scoped_provider_set_keys is not None
-                else None
-            ),
+            requested_code=requested_code,
+            requested_system=requested_system,
+            candidate_limit=candidate_limit,
         )
+    rate_provider_set_keys = await _request_rate_provider_set_keys(
+        session, serving_tables, args, request_options, scoped_provider_set_keys
     )
     if not rate_provider_set_keys:
         return _GraphLocationCandidates([], {})
@@ -12524,6 +12999,32 @@ async def _graph_candidates_for_request(
         require_provider_set_coverage=bool(
             request_options.get("require_provider_set_coverage", False)
         ),
+    )
+
+
+def _uses_local_distance_rate_scope(
+    serving_tables: PTG2ServingTables,
+    args: Mapping[str, Any],
+    request_options: Mapping[str, Any],
+    provider_set_keys: set[int] | None,
+    explicit_npi_scope: _ExplicitNpiGraphScope | None,
+    candidate_limit: int,
+) -> bool:
+    """Admit only bounded V4 inferred-taxonomy ascending-distance requests."""
+
+    requested_order = str(args.get("order_by") or "").strip().lower()
+    requested_direction = str(args.get("order") or "asc").strip().lower()
+    return bool(
+        serving_tables.uses_v4_graph
+        and serving_tables.provider_graph_v4_inferred_taxonomy_candidates
+        is not None
+        and _is_inferred_taxonomy_only_provider_filter(args)
+        and requested_order in {"", "distance", "distance_miles"}
+        and requested_direction == "asc"
+        and provider_set_keys is None
+        and explicit_npi_scope is None
+        and candidate_limit <= _ptg2_manifest_location_match_limit()
+        and not request_options.get("require_provider_set_coverage", False)
     )
 
 
@@ -14827,6 +15328,7 @@ def _geo_rate_selection_budget(
 class _V4GeoRateForwardLimits:
     maximum_retained_memberships: int
     maximum_projection_members: int
+    maximum_code_occurrences: int
     maximum_code_sets: int
     maximum_graph_batches: int
     scan_budget: ForwardReadBudget
@@ -14876,6 +15378,9 @@ def _v4_geo_rate_forward_limits(
         ],
         maximum_projection_members=limits_by_name[
             "max_online_candidate_pattern_projection_members"
+        ],
+        maximum_code_occurrences=limits_by_name[
+            "max_online_filtered_reverse_code_occurrences"
         ],
         maximum_code_sets=limits_by_name["max_online_filtered_reverse_code_sets"],
         maximum_graph_batches=limits_by_name[
