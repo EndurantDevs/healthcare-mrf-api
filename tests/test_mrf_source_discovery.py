@@ -7998,6 +7998,34 @@ async def test_uhc_blob_target_limit_applies_without_query(monkeypatch):
     assert crawl_targets[0].metadata["blob_name"].endswith("Employer-1_index.json")
 
 
+@pytest.mark.asyncio
+async def test_uhc_blob_target_limit_applies_across_listing_paths(monkeypatch):
+    root_url = "https://example.test/"
+    calls = []
+
+    async def fake_fetch_json(url, *, max_bytes, session):
+        calls.append(url)
+        return {
+            "blobs": [
+                {
+                    "name": "2026-07-01_Employer_index.json",
+                    "downloadUrl": f"{url}download/employer.json",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+    crawl_targets = await discovery._resolve_uhc_blob_listing(
+        {"source_id": "source_uhc_unscoped", "metadata_json": {}},
+        root_url,
+        {"path_templates": ["first/", "second/"], "max_targets": 1},
+        session="session",
+    )
+
+    assert len(crawl_targets) == 1
+    assert calls == [f"{root_url}first/"]
+
+
 def _uhc_provider_listing_response() -> dict:
     return {
         "providers": [

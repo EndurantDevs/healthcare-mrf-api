@@ -14485,6 +14485,7 @@ async def _resolve_uhc_blob_listing(
     )
     paths = [str(path) for path in configured_paths or () if str(path).strip()]
     target_query = _source_target_payer_query(source_row)
+    max_targets = _as_int(resolver.get("max_targets"))
     crawl_targets: list[CrawlTarget] = []
     for path in paths:
         listing_url = urljoin(url, path)
@@ -14496,9 +14497,8 @@ async def _resolve_uhc_blob_listing(
         parsed_targets = _uhc_blob_targets_matching_query(
             _parse_uhc_blob_listing(listing), target_query
         )
-        max_targets = _as_int(resolver.get("max_targets"))
         if max_targets and max_targets > 0:
-            parsed_targets = parsed_targets[:max_targets]
+            parsed_targets = parsed_targets[: max_targets - len(crawl_targets)]
         crawl_targets.extend(
             CrawlTarget(
                 source=source_row,
@@ -14520,6 +14520,8 @@ async def _resolve_uhc_blob_listing(
             )
             for parsed_target in parsed_targets
         )
+        if max_targets and max_targets > 0 and len(crawl_targets) >= max_targets:
+            break
     if not crawl_targets:
         suffix = f" matching target payer query {target_query!r}" if target_query else ""
         raise ValueError(f"no UHC blob index links found for {url}{suffix}")
