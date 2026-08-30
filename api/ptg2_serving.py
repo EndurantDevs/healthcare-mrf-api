@@ -13009,7 +13009,7 @@ def _uses_local_distance_rate_scope(
     explicit_npi_scope: _ExplicitNpiGraphScope | None,
     candidate_limit: int,
 ) -> bool:
-    """Admit only bounded V4 inferred-taxonomy ascending-distance requests."""
+    """Admit bounded V4 unfiltered or inferred-taxonomy distance requests."""
 
     requested_order = str(args.get("order_by") or "").strip().lower()
     requested_direction = str(args.get("order") or "asc").strip().lower()
@@ -13017,7 +13017,10 @@ def _uses_local_distance_rate_scope(
         serving_tables.uses_v4_graph
         and serving_tables.provider_graph_v4_inferred_taxonomy_candidates
         is not None
-        and _is_inferred_taxonomy_only_provider_filter(args)
+        and (
+            not _is_ptg2_provider_filter_requested(dict(args))
+            or _is_inferred_taxonomy_only_provider_filter(args)
+        )
         and requested_order in {"", "distance", "distance_miles"}
         and requested_direction == "asc"
         and provider_set_keys is None
