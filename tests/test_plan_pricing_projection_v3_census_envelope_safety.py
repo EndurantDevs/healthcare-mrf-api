@@ -9,6 +9,50 @@ import pytest
 from . import plan_pricing_projection_v3_census_envelope_harness as envelope
 
 
+def test_harness_uses_a_canonical_state_root(tmp_path: Path) -> None:
+    """The test harness must honor the production no-symlink root contract."""
+
+    canonical_root = tmp_path / "canonical"
+    canonical_root.mkdir()
+    aliased_root = tmp_path / "aliased"
+    aliased_root.symlink_to(canonical_root, target_is_directory=True)
+
+    result, state_root = envelope._run_envelope(aliased_root)
+
+    assert result.returncode == 0, result.stderr
+    assert state_root == canonical_root / "envelopes"
+
+
+def test_aliased_state_root_is_rejected_before_mutation(tmp_path: Path) -> None:
+    """The production root walk must reject a direct symlink alias."""
+
+    env_by_name, state_root, checkout = envelope._fake_environment(tmp_path)
+    aliased_root = tmp_path / "aliased-envelopes"
+    aliased_root.symlink_to(state_root, target_is_directory=True)
+    env_by_name["HLTHPRT_PLAN_PRICING_V3_CENSUS_STATE_ROOT"] = str(aliased_root)
+
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(envelope.SCRIPT),
+            "run",
+            *envelope._arguments(
+                aliased_root,
+                checkout,
+                env_by_name["FAKE_SOURCE_OVERLAY_SHA256"],
+            ),
+        ],
+        env=env_by_name,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 1
+    assert not (state_root / "run").exists()
+
+
 def test_envelope_uses_ordered_fences_and_reverse_uid_cleanup(tmp_path: Path) -> None:
     """A successful foreground census must release every exact outer fence."""
 

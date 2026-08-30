@@ -113,7 +113,7 @@ def _fake_environment(
         else OVERLAY_BYTES
     )
     (fake_state / "source-overlay.tar.gz").write_bytes(overlay_bytes)
-    state_root = tmp_path / "envelopes"
+    state_root = (tmp_path / "envelopes").resolve()
     state_root.mkdir()
     checkout = tmp_path / "repo"
     checkout.mkdir()
