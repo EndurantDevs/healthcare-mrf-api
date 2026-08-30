@@ -37,6 +37,7 @@ get_provider_procedure = pricing_module.get_provider_procedure
 get_provider_procedure_estimated_cost_level_internal = (
     pricing_module.get_provider_procedure_cost_level
 )
+get_procedure_benchmarks = pricing_module.get_procedure_benchmarks
 get_procedure_geo_benchmarks = pricing_module.get_procedure_geo_benchmarks
 get_provider_prescription = pricing_module.get_provider_prescription
 get_prescription_benchmarks = pricing_module.get_prescription_benchmarks
@@ -1608,6 +1609,39 @@ async def test_get_pricing_provider_score_success():
 
     response = await get_pricing_provider_score(request, "1003000126")
     _assert_pricing_score_response(json.loads(response.body))
+
+
+@pytest.mark.asyncio
+async def test_quality_peer_targets_preserve_scoped_and_unscoped_fallbacks():
+    peer_target_by_field = {
+        "year": 2023,
+        "benchmark_mode": "national",
+        "geography_scope": None,
+    }
+    session = FakeSession(
+        [
+            FakeResult(rows=[]),
+            FakeResult(rows=[]),
+            FakeResult(rows=[peer_target_by_field]),
+        ]
+    )
+
+    peer_targets = await pricing_module._load_quality_peer_targets(
+        session,
+        year=2023,
+        benchmark_modes=["zip", "state", "national"],
+        state_key="MD",
+        zip5="20814",
+    )
+
+    assert peer_targets == [peer_target_by_field]
+    executed_sql_statements = [
+        str(args[0]) for args, _kwargs in session.executions
+    ]
+    assert len(executed_sql_statements) == 3
+    assert "UNION ALL" in executed_sql_statements[0]
+    assert "geography_scope IS NULL" in executed_sql_statements[1]
+    assert "geography_scope IS NULL" not in executed_sql_statements[2]
 
 
 @pytest.mark.asyncio
@@ -3793,39 +3827,17 @@ async def test_plan_pricing_translates_only_online_work_budget_to_503(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("error_class", "error_code", "error_message"),
-    (
-        (
-            PTG2LocationScopeError,
-            "ptg2_location_scope_too_broad",
-            "Cost-ordered geographic provider search is too broad for exact "
-            "online expansion. Narrow the ZIP radius, add an NPI or provider "
-            "taxonomy filter, or set order_by=distance.",
-        ),
-        (
-            pricing_module.PTG2ProviderFilterScopeError,
-            "ptg2_provider_filter_scope_required",
-            "Provider filters with include_providers=false require an NPI or "
-            "supported cost-ordered geographic scope.",
-        ),
-        (
-            pricing_module.PTG2ProviderFilterUnsupportedError,
-            "ptg2_provider_filter_unsupported",
-            "Unsupported PTG2 provider filters: provider_type. Use specialty, "
-            "classification, taxonomy_code, or taxonomy_codes.",
-        ),
-    ),
-)
-async def test_plan_pricing_translates_provider_filter_errors_to_400(
+async def test_plan_pricing_translates_unsupported_provider_filter_to_400(
     monkeypatch,
-    error_class,
-    error_code,
-    error_message,
 ):
+    error_message = (
+        "Unsupported PTG2 provider filters: provider_type. Use specialty, "
+        "classification, taxonomy_code, or taxonomy_codes."
+    )
+
     async def rejected_search(*_args, **_kwargs):
         assert _args[1]["provider_type"] == "Unsupported provider type"
-        raise error_class(error_message)
+        raise pricing_module.PTG2ProviderFilterUnsupportedError(error_message)
 
     monkeypatch.setattr(
         pricing_module,
@@ -3849,25 +3861,49 @@ async def test_plan_pricing_translates_provider_filter_errors_to_400(
     assert endpoint_response.status == 400
     assert json.loads(endpoint_response.body) == {
         "error": {
-            "code": error_code,
+            "code": "ptg2_provider_filter_unsupported",
             "message": error_message,
         }
     }
 
 
 @pytest.mark.asyncio
-async def test_aggregate_geo_scope_error_returns_actionable_400(monkeypatch):
-    message = (
-        "Cost-ordered geographic aggregate search is too broad for exact "
-        "online execution. Narrow the ZIP radius, add an NPI, or use "
-        "view=card with a ready projection."
-    )
-
+@pytest.mark.parametrize(
+    ("rejected_error", "expected_code", "expected_retry_options"),
+    (
+        (
+            PTG2LocationScopeError(
+                "Internal detail must not escape.",
+                allows_distance_retry=True,
+            ),
+            "ptg2_location_scope_too_broad",
+            [{"order_by": "distance", "include_providers": True}],
+        ),
+        (
+            PTG2LocationScopeError("Internal detail must not escape."),
+            "ptg2_location_scope_too_broad",
+            [],
+        ),
+        (
+            pricing_module.PTG2ProviderFilterScopeError(
+                "Internal detail must not escape."
+            ),
+            "ptg2_provider_filter_scope_required",
+            [],
+        ),
+    ),
+)
+async def test_plan_pricing_translates_scope_refusal_to_structured_422(
+    monkeypatch,
+    rejected_error,
+    expected_code,
+    expected_retry_options,
+):
     async def rejected_search(_session, args, _pagination):
         assert args["code"] == "97110"
         assert args["zip5"] == "60611"
         assert args["include_providers"] == "false"
-        raise PTG2LocationScopeError(message)
+        raise rejected_error
 
     monkeypatch.setattr(
         pricing_module,
@@ -3900,13 +3936,13 @@ async def test_aggregate_geo_scope_error_returns_actionable_400(monkeypatch):
 
     endpoint_response = await list_providers_by_procedure(request)
 
-    assert endpoint_response.status == 400
-    assert json.loads(endpoint_response.body) == {
-        "error": {
-            "code": "ptg2_location_scope_too_broad",
-            "message": message,
-        }
-    }
+    assert endpoint_response.status == 422
+    error_document = json.loads(endpoint_response.body)
+    assert error_document["status"] == 422
+    assert error_document["code"] == expected_code
+    assert "error" not in error_document
+    assert "Internal detail" not in error_document["message"]
+    assert error_document["fix_it"]["retry_options"] == expected_retry_options
 
 
 @pytest.mark.asyncio
@@ -6922,6 +6958,55 @@ async def test_get_provider_procedure_estimated_cost_level_invalid_cohort_strate
         await get_provider_procedure_estimated_cost_level_internal(request, "1003000126", "123")
 
     assert "cohort_strategy" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_get_procedure_benchmarks_success():
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "from_system": "CPT",
+                        "from_code": "70553",
+                        "to_system": "HP_PROCEDURE_CODE",
+                        "to_code": "123",
+                        "match_type": "exact",
+                        "confidence": 1.0,
+                        "source": "test",
+                    }
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {
+                        "matched_rows": 10,
+                        "provider_count": 5,
+                        "total_services": 300.0,
+                        "total_submitted_charges": 4000.0,
+                        "total_allowed_amount": 2500.0,
+                        "avg_total_allowed_amount": 500.0,
+                        "min_total_allowed_amount": 100.0,
+                        "max_total_allowed_amount": 1000.0,
+                    }
+                ]
+            ),
+            FakeResult(
+                rows=[{"p20": 200.0, "p40": 400.0, "p60": 600.0, "p80": 800.0}]
+            ),
+        ],
+        args={"year": "2023", "state": "MD", "include_legacy_fields": "true"},
+    )
+
+    response = await get_procedure_benchmarks(request, "CPT", "70553")
+    pricing_response = json.loads(response.body)
+    assert pricing_response["query"]["input_code"]["code_system"] == "CPT"
+    assert pricing_response["benchmark"]["provider_count"] == 5
+    assert pricing_response["benchmark"]["total_services"] == 300.0
+    assert pricing_response["benchmark"]["total_claims"] == 300.0
+    assert pricing_response["benchmark"]["estimated_cost_level_thresholds"]["$$$$"] == {
+        "max_total_allowed_amount": 800.0
+    }
 
 
 @pytest.mark.asyncio

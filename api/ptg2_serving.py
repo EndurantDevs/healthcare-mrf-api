@@ -232,6 +232,15 @@ class PTG2LocationScopeError(PTG2ProviderFilterScopeError):
 
     error_code = "ptg2_location_scope_too_broad"
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        allows_distance_retry: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.allows_distance_retry = bool(allows_distance_retry)
+
 
 class PTG2ProviderFilterUnsupportedError(ValueError):
     """Reject provider filter fields unsupported by PTG2 serving."""
@@ -8925,7 +8934,7 @@ def _uses_geo_rate_prefix_selection(
     )
 
 
-def _uses_provider_inclusive_geo_rate_gate(
+def _uses_oversized_cost_ordered_geo_gate(
     serving_tables: PTG2ServingTables,
     args: Mapping[str, Any],
     *,
@@ -8935,19 +8944,23 @@ def _uses_provider_inclusive_geo_rate_gate(
     requested_npi: int | None,
     explicit_provider_filter_requested: bool,
 ) -> bool:
-    """Reject oversized exact provider expansion before geographic graph work."""
+    """Identify cost lanes whose sealed size must be checked before geo work."""
 
+    order_by = str(
+        args.get("order_by")
+        or ("total_allowed_amount" if not include_providers else "")
+    ).strip().lower()
     return bool(
         serving_tables.uses_v4_graph
-        and include_providers
         and location_filter_requested
         and not price_filter_requested
         and requested_npi is None
-        and not explicit_provider_filter_requested
-        and str(args.get("order_by") or "")
-        .strip()
-        .lower()
-        in _PTG2_COST_ORDER_FIELDS
+        and order_by in _PTG2_COST_ORDER_FIELDS
+        and not (
+            include_providers
+            and not explicit_provider_filter_requested
+            and _is_inferred_taxonomy_only_provider_filter(args)
+        )
     )
 
 
@@ -19745,7 +19758,7 @@ async def _search_manifest_serving_table(
             )
         return loaded_code_rows
 
-    is_provider_inclusive_cost_ordered_geo = _uses_provider_inclusive_geo_rate_gate(
+    uses_oversized_cost_ordered_geo_gate = _uses_oversized_cost_ordered_geo_gate(
         serving_tables,
         args,
         location_filter_requested=location_filter_requested,
@@ -19755,13 +19768,7 @@ async def _search_manifest_serving_table(
         explicit_provider_filter_requested=explicit_provider_filter_requested,
     )
     code_rows: list[dict[str, Any]] | None = None
-    if (
-        is_provider_inclusive_cost_ordered_geo
-        and not (
-            strict_cost_provider_expansion
-            and is_provider_filter_requested
-        )
-    ):
+    if uses_oversized_cost_ordered_geo_gate:
         code_rows = await load_code_rows()
         if not code_rows:
             return None
@@ -19770,9 +19777,9 @@ async def _search_manifest_serving_table(
         ).maximum_provider_expansion_rate_rows
         if _declared_geo_rate_count(code_rows) > maximum_rate_rows:
             raise PTG2LocationScopeError(
-                "Cost-ordered geographic provider search is too broad for exact "
-                "online expansion. Narrow the ZIP radius, add an NPI or provider "
-                "taxonomy filter, or set order_by=distance."
+                "Cost-ordered geographic procedure search exceeds the sealed "
+                "online rate-row limit.",
+                allows_distance_retry=not explicit_provider_filter_requested,
             )
 
     location_providers_by_set: dict[str, list[dict[str, Any]]] = {}
