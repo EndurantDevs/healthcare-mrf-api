@@ -193,6 +193,7 @@ async def test_reverse_geo_requests_only_npis(monkeypatch):
         {"address_table": "mrf.npi_address"},
         {"address_assurance_sql": "TRUE"},
         {"address_filter_sql": None},
+        {"taxonomy_index_sql": "addr.taxonomy_array && ARRAY[1]"},
     ],
 )
 async def test_npi_reader_falls_back_when_compact_lookup_is_unsafe(
@@ -218,6 +219,36 @@ async def test_npi_reader_falls_back_when_compact_lookup_is_unsafe(
 
     assert result == [{"npi": 101}]
     full_reader.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_npi_reader_keeps_compact_taxonomy_lookup_for_bounded_npis(monkeypatch):
+    query = replace(
+        _location_query("mrf"),
+        taxonomy_index_sql="addr.taxonomy_array && ARRAY[1]",
+    )
+    compact_reader = AsyncMock(return_value=[{"npi": 101}])
+    full_reader = AsyncMock()
+    monkeypatch.setattr(
+        serving,
+        "_membership_location_query",
+        AsyncMock(return_value=query),
+    )
+    monkeypatch.setattr(serving, "_execute_membership_location_sql", compact_reader)
+    monkeypatch.setattr(serving, "_is_relation_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(serving, "_membership_location_rows", full_reader)
+
+    result = await serving._membership_npi_rows(
+        object(),
+        strict_v3_tables(),
+        {"lat": 42.0, "long": -83.0},
+        candidate_npis=(101,),
+        limit=10,
+    )
+
+    assert result == [{"npi": 101}]
+    compact_reader.assert_awaited_once()
+    full_reader.assert_not_awaited()
 
 
 @pytest.mark.asyncio
