@@ -520,6 +520,8 @@ hospitals:
 - hospital_id: hospital-000155
   name: Albuquerque-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  alias_of: hospital-000193
+  locator_name: AMG Specialty Hospital - Albuquerque
 - hospital_id: hospital-000156
   name: Alexandria IOP
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
@@ -649,6 +651,7 @@ hospitals:
 - hospital_id: hospital-000196
   name: AMG Specialty Hospital - Houma
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  locator_name: HAMG Specialty Hospital - Houma
 - hospital_id: hospital-000197
   name: AMG Specialty Hospital - North Mississippi
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
@@ -972,16 +975,19 @@ hospitals:
 - hospital_id: hospital-000296
   name: Ascension Seton Bastrop
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
-  locator_name: Ascension Seton Hays (Ascension Seton)
 - hospital_id: hospital-000297
   name: Ascension Seton Hays
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
+  alias_of: hospital-000298
+  locator_name: Ascension Seton Hays (Ascension Seton)
 - hospital_id: hospital-000298
   name: Ascension Seton Hays (Ascension Seton)
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
 - hospital_id: hospital-000299
   name: Ascension Seton Williamson
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
+  alias_of: hospital-000300
+  locator_name: Ascension Seton Williamson (Ascension Seton)
 - hospital_id: hospital-000300
   name: Ascension Seton Williamson (Ascension Seton)
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
@@ -3857,6 +3863,8 @@ hospitals:
 - hospital_id: hospital-001178
   name: Central Indiana-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  alias_of: hospital-000194
+  locator_name: AMG Specialty Hospital - Central Indiana
 - hospital_id: hospital-001179
   name: Central Louisiana Surgical Hospital
   cms_hpt_url: https://www.christushealth.org/cms-hpt.txt
@@ -3949,6 +3957,8 @@ hospitals:
 - hospital_id: hospital-001207
   name: Charleston-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  alias_of: hospital-000195
+  locator_name: AMG Specialty Hospital - Charleston
 - hospital_id: hospital-001208
   name: CHARLOTTE HUNGERFORD HOSPITAL
   cms_hpt_url: https://charlottehungerford.org/cms-hpt.txt
@@ -4606,6 +4616,7 @@ hospitals:
 - hospital_id: hospital-001414
   name: Clear Lake - AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  locator_name: AMG Specialty Hospital - Clear Lake
 - hospital_id: hospital-001415
   name: Clear Lake Campus
   cms_hpt_url: https://www.utmbhealth.com/cms-hpt.txt
@@ -5387,6 +5398,7 @@ hospitals:
 - hospital_id: hospital-001655
   name: Covington-AMG Physical Rehabilitation Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  locator_name: AMG Physical Rehabilitation Hospital - Covington
 - hospital_id: hospital-001656
   name: Cox Barton County Hospital
   cms_hpt_url: https://www.coxhealth.com/cms-hpt.txt
@@ -5737,6 +5749,8 @@ hospitals:
 - hospital_id: hospital-001760
   name: Dell Children's Medical Center North Campus
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
+  alias_of: hospital-001761
+  locator_name: Dell Children's Medical Center North Campus (Ascension Seton)
 - hospital_id: hospital-001761
   name: Dell Children's Medical Center North Campus (Ascension Seton)
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
@@ -9912,9 +9926,12 @@ hospitals:
 - hospital_id: hospital-003035
   name: Houma-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  alias_of: hospital-000196
+  locator_name: HAMG Specialty Hospital - Houma
 - hospital_id: hospital-003036
   name: Houston - AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  locator_name: AMG Specialty Hospital - Houston
 - hospital_id: hospital-003037
   name: Houston Behavioral Healthcare Hospital
   cms_hpt_url: https://www.houstonbehavioralhealth.com/cms-hpt.txt
@@ -9929,6 +9946,8 @@ hospitals:
 - hospital_id: hospital-003040
   name: Houston Medical Center-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  alias_of: hospital-003036
+  locator_name: AMG Specialty Hospital - Houston
 - hospital_id: hospital-003041
   name: Howard County Medical Center
   cms_hpt_url: https://hcmc.us.com/cms-hpt.txt
@@ -11168,6 +11187,7 @@ hospitals:
 - hospital_id: hospital-003426
   name: Lafayette - AMG Physical Rehabilitation Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  locator_name: AMG Physical Rehabilitation Hospital - Lafayette
 - hospital_id: hospital-003427
   name: LAFAYETTE REGIONAL HEALTH CENTER
   cms_hpt_url: https://www.hcamidwest.com/cms-hpt.txt
@@ -11420,12 +11440,17 @@ hospitals:
 - hospital_id: hospital-003504
   name: Las Vegas-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  locator_name: AMG Specialty Hospital - Las Vegas
 - hospital_id: hospital-003505
   name: Las Vegas-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  alias_of: hospital-003504
+  locator_name: AMG Specialty Hospital - Las Vegas
 - hospital_id: hospital-003506
   name: Las Vegas-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  alias_of: hospital-003504
+  locator_name: AMG Specialty Hospital - Las Vegas
 - hospital_id: hospital-003507
   name: LAST FRONTIER HEALTHCARE DISTRICT
   cms_hpt_url: https://modocmedicalcenter.org/cms-hpt.txt
@@ -12681,6 +12706,8 @@ hospitals:
 - hospital_id: hospital-003891
   name: MEDICAL CITY MH FRISCO
   cms_hpt_url: https://www.medicalcityhealthcare.com/cms-hpt.txt
+  alias_of: hospital-003890
+  locator_name: MEDICAL CITY MENTAL HEALTH AND WELLNESS CENTER FRISCO
 - hospital_id: hospital-003892
   name: MEDICAL CITY NORTH HILLS
   cms_hpt_url: https://www.medicalcityhealthcare.com/cms-hpt.txt
@@ -15027,6 +15054,8 @@ hospitals:
 - hospital_id: hospital-004595
   name: North Mississippi - AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  alias_of: hospital-000197
+  locator_name: AMG Specialty Hospital - North Mississippi
 - hospital_id: hospital-004596
   name: North Oaks Medical Center
   cms_hpt_url: https://www.northoaks.org/cms-hpt.txt
@@ -15433,9 +15462,12 @@ hospitals:
 - hospital_id: hospital-004720
   name: NW Indiana-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  locator_name: AMG Specialty Hospital - Northwest Indiana
 - hospital_id: hospital-004721
   name: NW Indiana-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  alias_of: hospital-004720
+  locator_name: AMG Specialty Hospital - Northwest Indiana
 - hospital_id: hospital-004722
   name: NYU Langone
   cms_hpt_url: https://nyulangone.org/cms-hpt.txt
@@ -15771,6 +15803,8 @@ hospitals:
 - hospital_id: hospital-004823
   name: OKC-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  alias_of: hospital-000198
+  locator_name: AMG Specialty Hospital - Oklahoma City
 - hospital_id: hospital-004824
   name: OKEENE MUNICIPAL HOSPITAL
   cms_hpt_url: https://okeenehospital.com/cms-hpt.txt
@@ -16625,7 +16659,8 @@ hospitals:
 - hospital_id: hospital-005088
   name: Penn Medicine Princeton Medical Center
   cms_hpt_url: https://www.pennmedicine.org/cms-hpt.txt
-  locator_mrf_url: https://www1.pennmedicine.org/images/pricing/210635009_Penn-Medicine-Princeton-Medical-Center_standardcharges.csv
+  alias_of: hospital-005087
+  locator_name: Penn Medicine Princeton Health
 - hospital_id: hospital-005089
   name: Penn State Health Hampden Medical Center
   cms_hpt_url: https://www.pennstatehealth.org/cms-hpt.txt
@@ -23673,6 +23708,7 @@ hospitals:
 - hospital_id: hospital-007256
   name: Zachary-AMG Specialty Hospital
   cms_hpt_url: https://amgihm.com/cms-hpt.txt
+  locator_name: AMG Specialty Hospital - Zachary
 - hospital_id: hospital-007257
   name: ZION MEDICAL CENTER
   cms_hpt_url: https://healthy.kaiserpermanente.org/cms-hpt.txt
