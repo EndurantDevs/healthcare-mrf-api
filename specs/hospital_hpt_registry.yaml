@@ -19449,6 +19449,7 @@ hospitals:
 - hospital_id: hospital-005915
   name: SOUTHERN MONTEREY COUNTY MEMORIAL HOSPITAL
   cms_hpt_url: https://www.meememorial.com/cms-hpt.txt
+  locator_name: Mee Memorial Hospital
 - hospital_id: hospital-005916
   name: Southern New Hampshire Medical Center
   cms_hpt_url: https://www.snhhealth.org/cms-hpt.txt
