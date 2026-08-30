@@ -964,6 +964,7 @@ hospitals:
 - hospital_id: hospital-000290
   name: Ascension Saint Thomas Stones River
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
+  fallback_mrf_url: https://healthcare.ascension.org/-/media/project/ascension/healthcare/price-transparency-files/tn-csv/620475842_saint-thomas-stones-river-hospital-llc_standardcharges.csv
 - hospital_id: hospital-000291
   name: Ascension Saint Thomas Three Rivers
   cms_hpt_url: https://healthcare.ascension.org/cms-hpt.txt
