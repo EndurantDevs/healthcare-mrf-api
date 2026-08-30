@@ -60,6 +60,8 @@ class UHCFlexPractitionerSealedRoot:
     expected_npi_count: int
     resource_count: int
     terminal_set_sha256: str
+    error_count: int = 0
+    cohort_complete: bool = True
 
     def __post_init__(self) -> None:
         if (
@@ -86,6 +88,9 @@ class UHCFlexPractitionerSealedRoot:
             or self.resource_count < 0
             or type(self.terminal_set_sha256) is not str
             or HASH_PATTERN.fullmatch(self.terminal_set_sha256) is None
+            or type(self.error_count) is not int
+            or not 0 <= self.error_count <= self.expected_npi_count
+            or self.cohort_complete is not (self.error_count == 0)
         ):
             raise ValueError("Flex Practitioner sealed root is invalid")
 
@@ -120,6 +125,13 @@ def _validated_pair_context(
         for field_name in shared_fields
     ):
         raise UHCFlexPractitionerTwinStoreError("identity")
+    if (
+        baseline.error_count != 0
+        or baseline.cohort_complete is not True
+        or candidate.error_count != 0
+        or candidate.cohort_complete is not True
+    ):
+        raise UHCFlexPractitionerTwinStoreError("state")
     projection_date = canonical_semantic_projection_as_of(
         semantic_projection_as_of
     )

@@ -114,7 +114,7 @@ class ProviderDirectoryUHCFlexPractitionerDataset(Base, JSONOutputMixin):
             "resource_hash_contract = 'semantic_content_v3' AND "
             "selected_resource_type = 'Practitioner' AND "
             "expected_resource_type = 'Practitioner' AND "
-            "cohort_complete IS TRUE AND "
+            "cohort_complete IN (TRUE, FALSE) AND "
             "endpoint_collection_complete IS FALSE AND "
             "endpoint_complete IS FALSE AND resource_count >= 0 AND "
             "semantic_projection_as_of BETWEEN DATE '0001-01-01' "

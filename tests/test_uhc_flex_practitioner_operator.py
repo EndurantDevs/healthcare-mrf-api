@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -162,7 +163,9 @@ def _root(role: str, character: str) -> SimpleNamespace:
     return SimpleNamespace(
         acquisition_role=role,
         acquisition_id="pdufpa_" + character * 48,
+        cohort_complete=True,
         elapsed_seconds=2.5,
+        error_count=0,
         matched_count=7,
         resource_count=8,
         run_id="pdufpr_" + character * 48,
@@ -437,7 +440,7 @@ async def test_publication_is_explicit_and_does_not_claim_profile_dispatch(
                 admission_id="pdufpad_" + "1" * 48,
                 candidate_acquisition_id=CANDIDATE_ACQUISITION_ID,
                 acquisition_root_run_id="pdufpar_" + "6" * 48,
-                cohort_complete=True,
+                cohort_complete=False,
                 cohort_id="pdufc_" + "2" * 48,
                 dataset_hash="3" * 64,
                 dataset_id="pdufpd_" + "4" * 48,
@@ -447,6 +450,7 @@ async def test_publication_is_explicit_and_does_not_claim_profile_dispatch(
                 operation_key=OPERATION_KEY,
                 previous_dataset_id=None,
                 resource_count=8,
+                retry_exhausted_count=1,
                 semantic_projection_as_of="2026-08-10",
                 source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
             )
@@ -475,7 +479,20 @@ async def test_publication_is_explicit_and_does_not_claim_profile_dispatch(
     ]
     assert receipt_by_field["status"] == "published"
     assert receipt_by_field["replayed"] is True
-    _assert_external_profile_followup(receipt_by_field)
+    assert receipt_by_field["retry_exhausted_count"] == 1
+    assert receipt_by_field["cohort_complete"] is False
+    assert receipt_by_field["profile_delta_dispatch"] == {
+        "operator_command_available": False,
+        "required_external_global_dispatch": False,
+        "status": "not_applicable_incomplete_cohort",
+    }
+
+    exact = PublicationResult()
+    exact.readiness.cohort_complete = True
+    exact.readiness.retry_exhausted_count = 0
+    exact_receipt = json.loads(operator._publication_result_json(exact))
+    assert "retry_exhausted_count" not in exact_receipt
+    _assert_external_profile_followup(exact_receipt)
 
 
 @pytest.mark.asyncio

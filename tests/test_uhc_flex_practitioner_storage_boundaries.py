@@ -282,6 +282,16 @@ async def test_seal_replay_and_manifest_cursor_boundaries():
     )
     assert summary.cohort_complete is True
 
+    database = _Database(first_rows=(sealed_header,))
+    await result_store._seal_building_header(database, identity.acquisition_id)
+    seal_sql, parameters = database.statements[-1]
+    assert "cohort_complete = (census.error_count = 0)" in seal_sql
+    assert "exhausted.attempt_count < :max_attempts" in seal_sql
+    assert parameters["max_attempts"] == 8
+    assert parameters["retry_exhausted_error_code"] == (
+        "retry_exhausted_transport"
+    )
+
     summary = await result_store.seal_uhc_flex_practitioner_acquisition(
         identity,
         database=_Database(

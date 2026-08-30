@@ -21,7 +21,9 @@ from process.uhc_flex_practitioner_acquisition_contract import (
     UHCFlexPractitionerAcquisitionDependencies,
     UHCFlexPractitionerAcquisitionError,
     UHCFlexPractitionerAcquisitionProgress,
+    UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_ATTEMPTS,
     UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_RETRY_SECONDS,
+    UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE,
 )
 from process.uhc_flex_official_cohort_store import (
     sync_uhc_flex_official_cohort,
@@ -378,6 +380,12 @@ class _RootRunner:
     ) -> tuple[int, float] | None:
         """Fetch and terminalize a claim or return its retry request."""
 
+        if claim.attempt > UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_ATTEMPTS:
+            await self.terminal_error(
+                claim,
+                UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE,
+            )
+            return None
         try:
             query_result = await self.dependencies.fetch(
                 session,
@@ -388,6 +396,12 @@ class _RootRunner:
             raise
         except UHCFlexPractitionerTransportError as error:
             if error.retryable:
+                if claim.attempt >= UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_ATTEMPTS:
+                    await self.terminal_error(
+                        claim,
+                        UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE,
+                    )
+                    return None
                 if invocation_attempt < self.config.max_attempts:
                     retry_delay = self.retry_delay(error, invocation_attempt)
                     await self.release_for_retry(claim)

@@ -24,6 +24,9 @@ from process.uhc_flex_practitioner_single_root_contract import (
     UHCFlexPractitionerSingleRootError,
     UHCFlexPractitionerSingleRootReceipt,
 )
+from process.uhc_flex_practitioner_acquisition_contract import (
+    UHCFlexPractitionerRootReceipt,
+)
 from process.uhc_flex_practitioner_store_contract import _acquisition_id
 from tests.provider_directory_uhc_flex_npi_cohort_pg_support import cohort_fixture
 from tests.test_uhc_flex_practitioner_twin_store_contract import (
@@ -76,10 +79,10 @@ def _sealed_database_row(root):
     return {
         **_field_map(root),
         "status": "sealed",
-        "cohort_complete": True,
+        "cohort_complete": root.cohort_complete,
         "pending_count": 0,
         "leased_count": 0,
-        "error_count": 0,
+        "error_count": root.error_count,
         "endpoint_collection_complete": False,
         "endpoint_complete": False,
         "sealed_at": TIMESTAMP,
@@ -235,6 +238,17 @@ def test_twin_store_row_and_exact_replay_validation_boundaries():
     with pytest.raises(twin_contract.UHCFlexPractitionerTwinStoreError):
         twin_store._sealed_root(malformed_root)
 
+    partial_root = replace(
+        _root("candidate"),
+        error_count=1,
+        cohort_complete=False,
+    )
+    assert twin_store._sealed_root(_sealed_database_row(partial_root)) == partial_root
+    inconsistent_partial_row = _sealed_database_row(partial_root)
+    inconsistent_partial_row["cohort_complete"] = True
+    with pytest.raises(twin_contract.UHCFlexPractitionerTwinStoreError):
+        twin_store._sealed_root(inconsistent_partial_row)
+
     with pytest.raises(twin_contract.UHCFlexPractitionerTwinStoreError):
         twin_store._attempt_from_row(None)
     malformed_attempt = _field_map(attempt)
@@ -365,6 +379,61 @@ async def test_single_root_admission_replay_returns_stored_identity(monkeypatch)
     )
 
     assert replay is stored_admission
+
+
+def test_reviewed_single_root_admits_and_receipts_partial_census() -> None:
+    cohort = cohort_fixture()
+    candidate = replace(
+        _single_root(cohort.cohort_id, cohort.npi_count),
+        error_count=1,
+        cohort_complete=False,
+    )
+    admission = build_single_root_admission(
+        candidate,
+        semantic_projection_as_of=PROJECTION_DATE,
+        operation_key=OPERATION_KEY,
+        admitted_at=TIMESTAMP,
+    )
+    candidate_receipt = UHCFlexPractitionerRootReceipt(
+        acquisition_role="candidate",
+        acquisition_id=candidate.acquisition_id,
+        run_id=candidate.run_id,
+        matched_count=cohort.npi_count - 1,
+        unmatched_count=0,
+        resource_count=candidate.resource_count,
+        terminal_set_sha256=candidate.terminal_set_sha256,
+        elapsed_seconds=1.0,
+        error_count=1,
+        cohort_complete=False,
+    )
+    receipt = UHCFlexPractitionerSingleRootReceipt(
+        operation_key=OPERATION_KEY,
+        semantic_projection_as_of=PROJECTION_DATE,
+        source_id=candidate.source_id,
+        endpoint_id="0" * 64,
+        cohort_id=cohort.cohort_id,
+        official_dataset_id=cohort.official_dataset_id,
+        official_dataset_hash=cohort.official_dataset_hash,
+        official_content_proof_sha256=cohort.official_content_proof_sha256,
+        dataset_intent_id=candidate.dataset_intent_id,
+        expected_npi_count=cohort.npi_count,
+        candidate=candidate_receipt,
+        admission_id=admission.admission_id,
+        reviewed_root_policy_json=admission.reviewed_root_policy_json,
+        elapsed_seconds=1.0,
+    )
+
+    assert receipt.candidate.error_count == 1
+    assert receipt.candidate.cohort_complete is False
+    with pytest.raises(ValueError):
+        replace(
+            receipt,
+            candidate=replace(
+                candidate_receipt,
+                error_count=0,
+                cohort_complete=True,
+            ),
+        )
 
 
 @pytest.mark.asyncio

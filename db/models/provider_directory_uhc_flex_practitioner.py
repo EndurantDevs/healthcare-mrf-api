@@ -99,10 +99,11 @@ class ProviderDirectoryUHCFlexPractitionerAcquisition(Base, JSONOutputMixin):
             "matched_count IS NULL AND unmatched_count IS NULL AND "
             "error_count IS NULL AND resource_count IS NULL AND "
             "terminal_set_sha256 IS NULL AND sealed_at IS NULL) OR "
-            "(status = 'sealed' AND cohort_complete IS TRUE AND "
+            "(status = 'sealed' AND "
             "pending_count = 0 AND leased_count = 0 AND matched_count >= 0 "
-            "AND unmatched_count >= 0 AND error_count = 0 AND "
-            "matched_count + unmatched_count = "
+            "AND unmatched_count >= 0 AND error_count >= 0 AND "
+            "cohort_complete = (error_count = 0) AND "
+            "matched_count + unmatched_count + error_count = "
             "expected_npi_count AND resource_count >= 0 AND "
             "terminal_set_sha256 ~ '^[0-9a-f]{64}$' AND sealed_at IS NOT NULL)",
             name="pd_uhc_flex_practitioner_acquisition_state_check",

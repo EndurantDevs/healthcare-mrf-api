@@ -207,7 +207,7 @@ class UHCFlexPractitionerWorkClaim:
 
 @dataclass(frozen=True, slots=True)
 class UHCFlexPractitionerAcquisitionSummary:
-    """Return one successful sealed exact-cohort census."""
+    """Return one sealed exact or retry-exhausted cohort census."""
 
     acquisition_id: str
     expected_npi_count: int
@@ -233,12 +233,11 @@ class UHCFlexPractitionerAcquisitionSummary:
             or ACQUISITION_PATTERN.fullmatch(self.acquisition_id) is None
             or any(type(count) is not int or count < 0 for count in counts)
             or self.expected_npi_count < 1
-            or self.error_count != 0
-            or self.matched_count + self.unmatched_count
+            or self.matched_count + self.unmatched_count + self.error_count
             != self.expected_npi_count
             or type(self.terminal_set_sha256) is not str
             or HASH_PATTERN.fullmatch(self.terminal_set_sha256) is None
-            or self.cohort_complete is not True
+            or self.cohort_complete is not (self.error_count == 0)
             or self.endpoint_collection_complete is not False
             or self.endpoint_complete is not False
         ):

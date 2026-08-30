@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Contract and public API for exact-cohort Flex Practitioner publication."""
+"""Contract and public API for sealed-cohort Flex Practitioner publication."""
 
 from __future__ import annotations
 
@@ -275,6 +275,7 @@ def build_uhc_flex_practitioner_dataset_identity(
 def uhc_flex_practitioner_publication_metadata(
     identity: UHCFlexPractitionerDatasetIdentity,
     admission: UHCFlexPractitionerAdmission,
+    retry_exhausted_count: int = 0,
 ) -> dict[str, Any]:
     """Return the exact closed metadata object checked by PostgreSQL."""
 
@@ -293,6 +294,12 @@ def uhc_flex_practitioner_publication_metadata(
         or identity.terminal_set_sha256 != admission.terminal_set_sha256
         or identity.resource_count != admission.resource_count
         or identity.source_id != admission.source_id
+        or type(retry_exhausted_count) is not int
+        or retry_exhausted_count < 0
+        or (
+            retry_exhausted_count > 0
+            and type(admission) is not UHCFlexPractitionerSingleRootAdmission
+        )
     ):
         raise ValueError("Flex Practitioner publication identity is invalid")
     metadata = {
@@ -331,12 +338,15 @@ def uhc_flex_practitioner_publication_metadata(
         metadata["provider_directory_reviewed_root_policy_v1"] = (
             admission.reviewed_root_policy_json
         )
+    if retry_exhausted_count:
+        metadata["cohort_complete"] = False
+        metadata["retry_exhausted_count"] = retry_exhausted_count
     return metadata
 
 
 @dataclass(frozen=True, slots=True)
 class UHCFlexPractitionerDatasetReadiness:
-    """Public bounded readiness for the current exact-cohort dataset."""
+    """Public bounded readiness for the current Flex dataset."""
 
     dataset_id: str
     previous_dataset_id: str | None
@@ -355,6 +365,7 @@ class UHCFlexPractitionerDatasetReadiness:
     cohort_complete: bool
     endpoint_collection_complete: bool
     endpoint_complete: bool
+    retry_exhausted_count: int = 0
 
     def __post_init__(self) -> None:
         try:
@@ -383,7 +394,9 @@ class UHCFlexPractitionerDatasetReadiness:
             or self.resource_count < 0
             or self.source_id != UHC_FLEX_PRACTITIONER_SOURCE_ID
             or self.source_authority_id != UHC_FLEX_OFFICIAL_AUTHORITY_ID
-            or self.cohort_complete is not True
+            or type(self.retry_exhausted_count) is not int
+            or self.retry_exhausted_count < 0
+            or self.cohort_complete is not (self.retry_exhausted_count == 0)
             or self.endpoint_collection_complete is not False
             or self.endpoint_complete is not False
         ):
@@ -445,7 +458,7 @@ async def publish_uhc_flex_practitioner_dataset(
     database: Any = db,
     batch_size: int = _DEFAULT_BATCH_SIZE,
 ) -> UHCFlexPractitionerPublicationResult:
-    """Publish only a DB-admitted, exact, error-free candidate generation."""
+    """Publish only a DB-admitted sealed candidate generation."""
 
     if (
         type(candidate_acquisition_id) is not str

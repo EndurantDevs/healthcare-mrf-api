@@ -8,6 +8,10 @@ import json
 from typing import Any
 
 from db.connection import db
+from process.uhc_flex_practitioner_acquisition_contract import (
+    UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_ATTEMPTS,
+    UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE,
+)
 from process.uhc_flex_practitioner_query import UHCFlexPractitionerQueryResult
 from process.uhc_flex_practitioner_store_contract import (
     ACQUISITION_PATTERN,
@@ -258,7 +262,8 @@ async def _seal_building_header(
                AND work.status = 'matched'
         )
         UPDATE {table_ref(ACQUISITION_TABLE)} AS acquisition
-           SET status = 'sealed', cohort_complete = true,
+           SET status = 'sealed',
+               cohort_complete = (census.error_count = 0),
                pending_count = census.pending_count,
                leased_count = census.leased_count,
                matched_count = census.matched_count,
@@ -272,9 +277,23 @@ async def _seal_building_header(
           FROM census, resource_census
          WHERE acquisition.acquisition_id = :acquisition_id
            AND acquisition.status = 'building'
+           AND NOT EXISTS (
+                SELECT 1 FROM {table_ref(WORK_TABLE)} AS exhausted
+                 WHERE exhausted.acquisition_id = acquisition.acquisition_id
+                   AND exhausted.status = 'error'
+                   AND (
+                        exhausted.error_code IS DISTINCT FROM
+                            :retry_exhausted_error_code
+                        OR exhausted.attempt_count < :max_attempts
+                   )
+           )
         RETURNING acquisition.*;
         """,
         acquisition_id=acquisition_id,
+        retry_exhausted_error_code=(
+            UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE
+        ),
+        max_attempts=UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_ATTEMPTS,
     )
 
 
@@ -283,7 +302,7 @@ async def seal_uhc_flex_practitioner_acquisition(
     *,
     database: Any = db,
 ) -> UHCFlexPractitionerAcquisitionSummary:
-    """Seal only matched/unmatched exact coverage; reject every error."""
+    """Seal exact or retry-exhausted coverage after every member terminates."""
 
     if type(identity) is not UHCFlexPractitionerAcquisitionIdentity:
         raise ValueError("Flex Practitioner acquisition identity is invalid")

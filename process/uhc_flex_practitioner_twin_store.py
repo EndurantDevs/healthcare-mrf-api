@@ -92,12 +92,15 @@ def _timestamp(value: object) -> datetime:
 
 
 def _sealed_root(database_fields: dict[str, Any]) -> UHCFlexPractitionerSealedRoot:
+    error_count = database_fields.get("error_count")
+    cohort_complete = database_fields.get("cohort_complete")
     if (
         database_fields.get("status") != "sealed"
-        or database_fields.get("cohort_complete") is not True
         or database_fields.get("pending_count") != 0
         or database_fields.get("leased_count") != 0
-        or database_fields.get("error_count") != 0
+        or type(error_count) is not int
+        or error_count < 0
+        or cohort_complete is not (error_count == 0)
         or database_fields.get("endpoint_collection_complete") is not False
         or database_fields.get("endpoint_complete") is not False
         or database_fields.get("sealed_at") is None
@@ -117,6 +120,8 @@ def _sealed_root(database_fields: dict[str, Any]) -> UHCFlexPractitionerSealedRo
             expected_npi_count=database_fields.get("expected_npi_count"),
             resource_count=database_fields.get("resource_count"),
             terminal_set_sha256=database_fields.get("terminal_set_sha256"),
+            error_count=error_count,
+            cohort_complete=cohort_complete,
         )
     except ValueError as error:
         raise UHCFlexPractitionerTwinStoreError("state") from error

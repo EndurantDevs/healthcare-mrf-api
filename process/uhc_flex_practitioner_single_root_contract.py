@@ -352,7 +352,9 @@ class UHCFlexPractitionerSingleRootReceipt:
             or type(self.candidate) is not UHCFlexPractitionerRootReceipt
             or self.candidate.acquisition_role != "candidate"
             or self.candidate.run_id != single_root_run_id(self.dataset_intent_id)
-            or self.candidate.matched_count + self.candidate.unmatched_count
+            or self.candidate.matched_count
+            + self.candidate.unmatched_count
+            + self.candidate.error_count
             != self.expected_npi_count
             or ADMISSION_PATTERN.fullmatch(self.admission_id) is None
             or self.reviewed_root_policy_json

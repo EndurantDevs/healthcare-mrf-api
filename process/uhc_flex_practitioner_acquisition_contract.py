@@ -32,6 +32,9 @@ UHC_FLEX_PRACTITIONER_ACQUISITION_DEFAULT_CONCURRENCY = 4
 UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_CONCURRENCY = 32
 UHC_FLEX_PRACTITIONER_ACQUISITION_DEFAULT_ATTEMPTS = 3
 UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_ATTEMPTS = 8
+UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE = (
+    "retry_exhausted_transport"
+)
 UHC_FLEX_PRACTITIONER_ACQUISITION_DEFAULT_RETRY_SECONDS = 1.0
 UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_RETRY_SECONDS = (
     UHC_FLEX_PRACTITIONER_MAX_RETRY_AFTER_SECONDS
@@ -150,7 +153,7 @@ class UHCFlexPractitionerAcquisitionProgress:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class UHCFlexPractitionerRootReceipt:
-    """Compact proof that one role reached an error-free sealed census."""
+    """Compact proof that one role reached a sealed census."""
 
     acquisition_role: str
     acquisition_id: str = field(repr=False)
@@ -160,6 +163,8 @@ class UHCFlexPractitionerRootReceipt:
     resource_count: int
     terminal_set_sha256: str = field(repr=False)
     elapsed_seconds: float
+    error_count: int = 0
+    cohort_complete: bool = True
 
     def __post_init__(self) -> None:
         if (
@@ -174,8 +179,10 @@ class UHCFlexPractitionerRootReceipt:
                     self.matched_count,
                     self.unmatched_count,
                     self.resource_count,
+                    self.error_count,
                 )
             )
+            or self.cohort_complete is not (self.error_count == 0)
             or type(self.terminal_set_sha256) is not str
             or SHA256_PATTERN.fullmatch(self.terminal_set_sha256) is None
         ):
@@ -242,8 +249,12 @@ class UHCFlexPractitionerAcquisitionReceipt:
             )
             or self.baseline.matched_count + self.baseline.unmatched_count
             != self.expected_npi_count
+            or self.baseline.error_count != 0
+            or self.baseline.cohort_complete is not True
             or self.candidate.matched_count + self.candidate.unmatched_count
             != self.expected_npi_count
+            or self.candidate.error_count != 0
+            or self.candidate.cohort_complete is not True
             or type(self.twin_attempt_id) is not str
             or ATTEMPT_PATTERN.fullmatch(self.twin_attempt_id) is None
             or type(self.admission_id) is not str

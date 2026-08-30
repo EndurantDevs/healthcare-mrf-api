@@ -18,7 +18,10 @@ from process.provider_directory_dataset_scoped_publication import (
 from tests.test_provider_directory_dataset_scoped_publication_contract import (
     _legacy_current,
 )
-from tests.test_uhc_flex_practitioner_publication import _admission
+from tests.test_uhc_flex_practitioner_publication import (
+    _admission,
+    _single_root_admission,
+)
 from tests.test_uhc_flex_practitioner_publication_contract_boundaries import (
     _readiness,
 )
@@ -50,6 +53,7 @@ async def test_readiness_rows_and_loaders_are_bounded() -> None:
     assert "status = 'published'" in sql
     assert "is_current IS TRUE" in sql
     assert "dataset_ready" in sql
+    assert "candidate.error_count AS retry_exhausted_count" in sql
 
     database = SimpleNamespace(
         first=AsyncMock(side_effect=[None, _readiness_row(), None, _readiness_row()])
@@ -196,14 +200,21 @@ async def test_header_inserts_require_one_row_and_compose_metadata(
     dedicated_insert = AsyncMock()
     monkeypatch.setattr(store, "_insert_parent_header", parent_insert)
     monkeypatch.setattr(store, "_insert_dedicated_header", dedicated_insert)
+    database = object()
+    admission = _single_root_admission(error_count=1)
+    identity = publication.build_uhc_flex_practitioner_dataset_identity(admission)
     await store._insert_building_headers(
-        object(),
+        database,
         identity,
         admission,
         "pdufpd_" + "8" * 48,
+        1,
     )
-    assert '"endpoint_complete":false' in parent_insert.await_args.args[4]
-    dedicated_insert.assert_awaited_once()
+    assert '"cohort_complete":false' in parent_insert.await_args.args[4]
+    assert '"retry_exhausted_count":1' in parent_insert.await_args.args[4]
+    dedicated_insert.assert_awaited_once_with(
+        database, identity, admission, "pdufpd_" + "8" * 48, 1
+    )
 
 
 @pytest.mark.asyncio
@@ -272,9 +283,10 @@ async def test_admission_lock_requires_registered_source_and_exact_authority(
             identity.endpoint_id,
         )
 
+    source_row = {"source_id": admission.source_id}
     source_database = SimpleNamespace(
         scalar=AsyncMock(),
-        first=AsyncMock(return_value={"source_id": admission.source_id}),
+        first=AsyncMock(side_effect=[source_row]),
     )
     admission_loader = AsyncMock(return_value=object())
     monkeypatch.setattr(
@@ -293,14 +305,92 @@ async def test_admission_lock_requires_registered_source_and_exact_authority(
         )
 
     admission_loader.return_value = admission
+    source_database.first.side_effect = [
+        source_row,
+        {
+            "status": "sealed",
+            "cohort_complete": True,
+            "error_count": 0,
+            "terminal_set_sha256": admission.terminal_set_sha256,
+            "resource_count": admission.resource_count,
+        },
+    ]
     assert (
         await store._lock_admission(
             source_database,
             admission.candidate_acquisition_id,
             identity.endpoint_id,
         )
-        is admission
+        == (admission, 0)
     )
+
+    partial = _single_root_admission(error_count=1)
+    admission_loader.return_value = partial
+    source_database.first.side_effect = [
+        source_row,
+        {
+            "status": "sealed",
+            "cohort_complete": False,
+            "error_count": 1,
+            "terminal_set_sha256": partial.terminal_set_sha256,
+            "resource_count": partial.resource_count,
+        },
+    ]
+    assert (
+        await store._lock_admission(
+            source_database,
+            partial.candidate_acquisition_id,
+            identity.endpoint_id,
+        )
+        == (partial, 1)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "drift",
+    (
+        {"status": "building"},
+        {"cohort_complete": True},
+        {"error_count": -1},
+        {"terminal_set_sha256": "d" * 64},
+        {"resource_count": 2},
+    ),
+)
+async def test_admission_lock_rejects_candidate_state_drift(
+    monkeypatch,
+    drift,
+) -> None:
+    admission = _single_root_admission(error_count=1)
+    candidate = {
+        "status": "sealed",
+        "cohort_complete": False,
+        "error_count": 1,
+        "terminal_set_sha256": admission.terminal_set_sha256,
+        "resource_count": admission.resource_count,
+        **drift,
+    }
+    database = SimpleNamespace(
+        scalar=AsyncMock(),
+        first=AsyncMock(
+            side_effect=[{"source_id": admission.source_id}, candidate]
+        ),
+    )
+    monkeypatch.setattr(
+        store,
+        "require_uhc_flex_practitioner_admission",
+        AsyncMock(return_value=admission),
+    )
+
+    with pytest.raises(
+        publication.UHCFlexPractitionerPublicationError,
+        match="admission is invalid",
+    ):
+        await store._lock_admission(
+            database,
+            admission.candidate_acquisition_id,
+            publication.uhc_flex_practitioner_endpoint_identity().endpoint_id,
+        )
 
 
 @pytest.mark.asyncio
@@ -408,7 +498,7 @@ async def test_public_store_wraps_lock_and_publication_in_one_transaction(
         readiness,
         replayed=False,
     )
-    admission_lock = AsyncMock(return_value=admission)
+    admission_lock = AsyncMock(return_value=(admission, 0))
     admitted_publisher = AsyncMock(return_value=expected)
     monkeypatch.setattr(store, "_lock_admission", admission_lock)
     monkeypatch.setattr(
@@ -434,4 +524,5 @@ async def test_public_store_wraps_lock_and_publication_in_one_transaction(
         admission,
         identity.endpoint_id,
         11,
+        0,
     )
