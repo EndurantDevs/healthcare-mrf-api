@@ -16286,6 +16286,7 @@ hospitals:
 - hospital_id: hospital-004965
   name: PAM Specialty Hospital of Covington
   cms_hpt_url: https://pamhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://sthpiprd.blob.core.windows.net/machine-readable-files/10982/271148063_pam-ii-of-covington-llc_standardcharges.csv
 - hospital_id: hospital-004966
   name: PAM Specialty Hospital of Denver
   cms_hpt_url: https://pamhealth.com/cms-hpt.txt
@@ -16310,6 +16311,7 @@ hospitals:
 - hospital_id: hospital-004973
   name: PAM Specialty Hospital of Texarkana North
   cms_hpt_url: https://pamhealth.com/cms-hpt.txt
+  locator_name: PAM Specialty Hospital of Texarkana
 - hospital_id: hospital-004974
   name: PAM Specialty Hospital of Tulsa
   cms_hpt_url: https://pamhealth.com/cms-hpt.txt
@@ -16322,6 +16324,7 @@ hospitals:
 - hospital_id: hospital-004977
   name: PAM Specialty Hospital of Wilkes-Barre
   cms_hpt_url: https://pamhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://sthpiprd.blob.core.windows.net/machine-readable-files/10972/464942828_post-acute-medical-at-nanticoke-llc_standardcharges.csv
 - hospital_id: hospital-004978
   name: Pampa Regional Medical Center
   cms_hpt_url: https://prmctx.com/cms-hpt.txt
@@ -19539,6 +19542,7 @@ hospitals:
 - hospital_id: hospital-005957
   name: Specialty Hospital of San Antonio
   cms_hpt_url: https://pamhealth.com/cms-hpt.txt
+  fallback_mrf_url: https://sthpiprd.blob.core.windows.net/machine-readable-files/10755/455496771_warm-springs-specialty-hospital-of-san-antonio-llc_standardcharges.csv
 - hospital_id: hospital-005958
   name: Specialty Hospital of San Antonio Medical Center South
   cms_hpt_url: https://pamhealth.com/cms-hpt.txt

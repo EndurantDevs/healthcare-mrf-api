@@ -19,10 +19,13 @@ _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-002491": "f7e5a19c5a44e85520da233d3d17025d9c834a8f7b817d9f5b7c4ef6596b6e64",
     "hospital-002911": "dff5b72c99a19b8989184eb65b37de4246c4dd3649097b697830fcd8b22638ab",
     "hospital-003312": "75d4e626daf0db2c1e53cc903f3669d04339bbffb8891f92dd588c7fa3d0316f",
+    "hospital-004965": "a8a7ac615cb9d18e07dc9967fed29730d16bddee79221c6291f86d6b088e5df7",
+    "hospital-004977": "cfd65bf3bb5efc2b8f95d805436b72730f5e36b46cd526feddbdc8d034c9b2d7",
     "hospital-004979": "dee8d2ff24f723f64f41aa8c576ad18113657d7e11b0b59a392c58fd8acb765d",
     "hospital-005156": "180a1ae8dfcb952d7189c1c9ffb03ad121835699375b1e4ef9734c0764151192",
     "hospital-005608": "00f218c51149bc2237e87924d78a7e244607d53421e5cd18943a26a9f9e7c9c5",
     "hospital-005609": "00f218c51149bc2237e87924d78a7e244607d53421e5cd18943a26a9f9e7c9c5",
+    "hospital-005957": "a64e4900fd1c12cb9cb2837bca90a411dfaf72387cf4f2a135cfbd5922c0274c",
     "hospital-006053": "4d983a60e26bb91ee01c54bf194c91bc6a5d2b6215807af651dc96950ff55a6b",
     "hospital-006471": "dc7b9213c55ff2a6d9626a7841c532b5e7ebf1dce51e17efda59ead2c3f17de4",
     "hospital-006488": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
@@ -73,14 +76,13 @@ hospitals:
 def test_checked_in_registry_has_exact_source_neutral_shape():
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
-
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
     assert len(registry.hospital_hpt_registry_groups()) == 7_256
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
-    assert sum("locator_name" in entry for entry in hospitals) == 1_258
+    assert sum("locator_name" in entry for entry in hospitals) == 1_259
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 636
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 24
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 27
     assert {
         entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry
     } == set(_FALLBACK_URL_SHA256_BY_HOSPITAL_ID)
@@ -133,7 +135,6 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-
     assert len(aliases_by_id) == 100
     assert {
         hospital_id: aliases_by_id[hospital_id]
@@ -196,7 +197,6 @@ def test_duplicate_names_and_locators_are_preserved(tmp_path):
     cms_hpt_url: {locator}
 """,
     )
-
     assert [entry["cms_hpt_url"] for entry in hospitals] == [locator, locator]
     assert [entry["name"] for entry in hospitals] == [
         "Example Hospital",
