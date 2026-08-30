@@ -13,8 +13,8 @@ container_python_image='docker.io/library/python:3.14.6-slim-trixie@sha256:b921f
 
 capacity_test_paths=${CAPACITY_TEST_PATHS:-$'tests/test_ptg2_capacity_evidence.py\ntests/test_ptg2_v3_bounded_readers.py\ntests/test_ptg2_v3_capacity_gate.py\ntests/test_ptg2_v3_capacity_gate_adversarial.py\ntests/test_ptg2_v3_capacity_resources.py'}
 base_capacity_test_paths=$capacity_test_paths
-envelope_capacity_test_paths=$'tests/test_plan_pricing_projection_v3_census_envelope_admission.py\ntests/test_plan_pricing_projection_v3_census_envelope_interrupts.py\ntests/test_plan_pricing_projection_v3_census_envelope_runtime_safety.py\ntests/test_plan_pricing_projection_v3_census_envelope_safety.py'
-capacity_test_paths+=$'\n'"$envelope_capacity_test_paths"
+envelope_test_paths=$'tests/test_plan_pricing_projection_v3_census_envelope_admission.py\ntests/test_plan_pricing_projection_v3_census_envelope_interrupts.py\ntests/test_plan_pricing_projection_v3_census_envelope_runtime_safety.py\ntests/test_plan_pricing_projection_v3_census_envelope_safety.py'
+capacity_test_paths+=$'\n'"$envelope_test_paths"
 artifact_root=${PREPUSH_ARTIFACT_ROOT:-.}
 
 artifact_path() {
@@ -161,6 +161,12 @@ run_python_main() {
   fi
 
   mapfile -t capacity_tests <<< "$capacity_test_paths"
+  mapfile -t envelope_tests <<< "$envelope_test_paths"
+  [ "${#envelope_tests[@]}" -eq 4 ] || {
+    echo "expected one envelope suite for each python-main shard" >&2
+    exit 2
+  }
+  local envelope_test=${envelope_tests[$shard]}
   local collection_args=()
   local test_path
   for test_path in "${capacity_tests[@]}"; do
@@ -178,6 +184,11 @@ run_python_main() {
     --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main \
     --cov-branch --cov-report= \
     @"$shard_file"
+  timeout --foreground 295s python -m pytest -q -n 4 --dist worksteal --durations=20 \
+    --cov-config=test-coverage.ini \
+    --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main \
+    --cov-branch --cov-report= --cov-append \
+    "$envelope_test"
   require_base_sha
   timeout --foreground 295s python scripts/coverage_forecast.py write-shard-provenance \
     --base "$COVERAGE_BASE_SHA" \
@@ -190,18 +201,12 @@ run_python_main() {
 run_capacity() {
   install_python_dependencies
   mapfile -t capacity_tests <<< "$base_capacity_test_paths"
-  mapfile -t envelope_capacity_tests <<< "$envelope_capacity_test_paths"
   export COVERAGE_FILE=${COVERAGE_FILE:-$(artifact_path .coverage.capacity)}
   timeout --foreground 295s python -m pytest -q -n 4 --dist worksteal --durations=20 \
     --cov-config=test-coverage.ini \
     --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main \
     --cov-branch --cov-report= \
     "${capacity_tests[@]}"
-  timeout --foreground 295s python -m pytest -q -n 4 --dist worksteal --durations=20 \
-    --cov-config=test-coverage.ini \
-    --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main \
-    --cov-branch --cov-report= --cov-append \
-    "${envelope_capacity_tests[@]}"
   require_base_sha
   timeout --foreground 295s python scripts/coverage_forecast.py write-shard-provenance \
     --base "$COVERAGE_BASE_SHA" \

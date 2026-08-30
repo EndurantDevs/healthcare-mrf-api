@@ -101,5 +101,5 @@ def test_public_evidence_coverage_scope_is_ratcheted() -> None:
     assert "public_evidence" in python_scope["policy"]["source_dirs"]
     assert "public_evidence/*.py" in python_scope["include"]
     assert "public_evidence/**/*.py" in python_scope["include"]
-    assert prepush.count("--cov=public_evidence") == 3
+    assert prepush.count("--cov=public_evidence") == 4
     assert "compileall api process db public_evidence scripts main.py" in prepush
