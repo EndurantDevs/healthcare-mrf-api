@@ -1066,32 +1066,32 @@ def _npi_sort_key(global_id: bytes) -> bytes:
     return global_id[8:]
 
 
-def _build_shard_runs(
-    shard: _ValidatedShard,
+def _build_shard_edge_run(
+    artifact: _ValidatedArtifact,
+    suffix: str,
+    record_size: int,
+    encoder: Callable[[bytes, bytes], bytes],
     *,
-    shard_index: int,
+    prefix: str,
     directory: Path,
     chunk_bytes: int,
-) -> _ShardRuns:
-    """Validate reciprocal shard artifacts and build sorted edge and owner runs."""
+) -> tuple[Path, int, int]:
+    """Sort encoded edges and return the run path and record counts."""
 
-    prefix = f"shard-{shard_index:08d}"
+    return _external_sorted_records(
+        _artifact_records(artifact, encode=encoder),
+        record_size=record_size,
+        directory=directory,
+        prefix=f"{prefix}.{suffix}",
+        chunk_bytes=chunk_bytes,
+    )
 
-    def edge_run(
-        artifact: _ValidatedArtifact,
-        suffix: str,
-        record_size: int,
-        encoder: Callable[[bytes, bytes], bytes],
-    ) -> tuple[Path, int, int]:
-        """Sort encoded edges and return the run path and record counts."""
 
-        return _external_sorted_records(
-            _artifact_records(artifact, encode=encoder),
-            record_size=record_size,
-            directory=directory,
-            prefix=f"{prefix}.{suffix}",
-            chunk_bytes=chunk_bytes,
-        )
+def _build_group_npi_shard_runs(
+    shard: _ValidatedShard,
+    edge_run: Callable[..., tuple[Path, int, int]],
+) -> tuple[Path, Path, int]:
+    """Build and authenticate both group-NPI edge directions."""
 
     group_npi, group_npi_input, group_npi_unique = edge_run(
         shard.group_npi,
@@ -1116,6 +1116,14 @@ def _build_shard_runs(
         right_count=npi_group_unique,
         description=f"shared graph shard {shard.shard_id} group-npi",
     )
+    return group_npi, npi_group, group_npi_input
+
+
+def _build_group_provider_shard_runs(
+    shard: _ValidatedShard,
+    edge_run: Callable[..., tuple[Path, int, int]],
+) -> tuple[Path, Path, int]:
+    """Build and authenticate both group-provider-set edge directions."""
 
     group_provider, group_provider_input, group_provider_unique = edge_run(
         shard.group_provider_set,
@@ -1140,23 +1148,57 @@ def _build_shard_runs(
         right_count=provider_group_unique,
         description=f"shared graph shard {shard.shard_id} group-provider-set",
     )
+    return group_provider, provider_group, group_provider_input
 
-    def owner_run(
-        artifact: _ValidatedArtifact,
-        suffix: str,
-        width: int,
-        encoder: Callable[[bytes], bytes],
-    ) -> Path:
-        """Sort encoded owners and return their deduplicated run path."""
 
-        path, _input_count, _unique_count = _external_sorted_records(
-            _artifact_owner_records(artifact, encode=encoder),
-            record_size=width,
-            directory=directory,
-            prefix=f"{prefix}.{suffix}",
-            chunk_bytes=chunk_bytes,
-        )
-        return path
+def _build_shard_owner_run(
+    artifact: _ValidatedArtifact,
+    suffix: str,
+    width: int,
+    encoder: Callable[[bytes], bytes],
+    *,
+    prefix: str,
+    directory: Path,
+    chunk_bytes: int,
+) -> Path:
+    """Sort encoded owners and return their deduplicated run path."""
+
+    path, _input_count, _unique_count = _external_sorted_records(
+        _artifact_owner_records(artifact, encode=encoder),
+        record_size=width,
+        directory=directory,
+        prefix=f"{prefix}.{suffix}",
+        chunk_bytes=chunk_bytes,
+    )
+    return path
+
+
+def _build_shard_runs(
+    shard: _ValidatedShard,
+    *,
+    shard_index: int,
+    directory: Path,
+    chunk_bytes: int,
+) -> _ShardRuns:
+    """Validate reciprocal shard artifacts and build sorted edge and owner runs."""
+
+    prefix = f"shard-{shard_index:08d}"
+    edge_run = partial(
+        _build_shard_edge_run,
+        prefix=prefix, directory=directory, chunk_bytes=chunk_bytes,
+    )
+
+    group_npi, npi_group, group_npi_input = (
+        _build_group_npi_shard_runs(shard, edge_run)
+    )
+    group_provider, provider_group, group_provider_input = (
+        _build_group_provider_shard_runs(shard, edge_run)
+    )
+
+    owner_run = partial(
+        _build_shard_owner_run,
+        prefix=prefix, directory=directory, chunk_bytes=chunk_bytes,
+    )
 
     return _ShardRuns(
         group_npi=group_npi,

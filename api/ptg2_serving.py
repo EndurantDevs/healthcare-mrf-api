@@ -17050,6 +17050,44 @@ class _V4PatternTaxonomyRequest(_ProviderExpansionRequest):
 
 
 @dataclass(frozen=True)
+class _V4PatternContext:
+    """Sealed coordinates and caps for one pattern-quotient selection."""
+
+    request: _V4PatternTaxonomyRequest
+    normalized_target_count: int
+    maximum_occurrences: int
+    declared_occurrences: int
+    scan_budget: ForwardReadBudget
+    pattern_keys: tuple[int, ...]
+    snapshot_key: int
+
+
+@dataclass
+class _V4PatternPrefixState:
+    """Mutable state for the bounded pattern rate-prefix loop."""
+
+    rate_window: int
+    serving_rows: list[dict[str, Any]] = field(default_factory=list)
+    pattern_keys_by_set: dict[int, tuple[int, ...]] = field(default_factory=dict)
+    selected_occurrences: tuple[tuple[int, int], ...] = ()
+    is_candidate_prefix_exhausted: bool = False
+    is_source_exhausted: bool = False
+
+
+@dataclass(frozen=True)
+class _V4PatternPrefix:
+    """Authenticated pattern prefix and its selected completion scope."""
+
+    serving_rows: list[dict[str, Any]]
+    selected_occurrences: tuple[tuple[int, int], ...]
+    selected_npi_keys: tuple[int, ...]
+    completion_provider_set_keys: tuple[int, ...]
+    completion_pattern_keys_by_set: dict[int, tuple[int, ...]]
+    is_candidate_prefix_exhausted: bool
+    is_source_exhausted: bool
+
+
+@dataclass(frozen=True)
 class _V4TaxonomyRequest(_ProviderExpansionRequest):
     """Inputs for an exact inferred-taxonomy expansion."""
 
@@ -17174,280 +17212,272 @@ async def _v4_pattern_completion_rows(
     return completion_rows, provider_set_id_by_key
 
 
-async def _select_v4_pattern_taxonomy_expansion(
-    session,
+def _v4_pattern_context(
     serving_tables: PTG2ServingTables,
-    **request_options: Any,
-) -> _ProviderExpansionSelection:
-    """Serve one exact pattern quotient with bounded, target-first work."""
+    request: _V4PatternTaxonomyRequest,
+) -> _V4PatternContext | None:
+    """Validate one request and bind its immutable online-work limits."""
 
-    request = _V4PatternTaxonomyRequest(**request_options)
-    (
-        code_rows,
-        args,
-        snapshot_id,
-        source_trace_set_hash,
-        network_names,
-        target_count,
-        descending,
-        projection_rule,
-        candidates,
-    ) = (
-        request.code_rows,
-        request.args,
-        request.snapshot_id,
-        request.source_trace_set_hash,
-        request.network_names,
-        request.target_count,
-        request.descending,
-        request.projection_rule,
-        request.candidates,
-    )
-    normalized_target_count = max(int(target_count), 1)
+    normalized_target_count = max(int(request.target_count), 1)
     _v4_provider_expansion_request_caps(
         serving_tables,
         target_count=normalized_target_count,
     )
     maximum_occurrences = int(
-        projection_rule.max_online_filtered_reverse_code_occurrences
+        request.projection_rule.max_online_filtered_reverse_code_occurrences
     )
     if maximum_occurrences <= 0:
         raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
     declared_occurrences = sum(
         max(int(code_row.get("rate_count") or 0), 0)
-        for code_row in code_rows
+        for code_row in request.code_rows
     )
     if declared_occurrences == 0:
-        return _ProviderExpansionSelection([], {}, {}, True)
-    scan_budget = ForwardReadBudget(
-        maximum_fragments=int(
-            projection_rule.max_online_inferred_taxonomy_graph_pages
+        return None
+    return _V4PatternContext(
+        request=request,
+        normalized_target_count=normalized_target_count,
+        maximum_occurrences=maximum_occurrences,
+        declared_occurrences=declared_occurrences,
+        scan_budget=ForwardReadBudget(
+            maximum_fragments=int(
+                request.projection_rule.max_online_inferred_taxonomy_graph_pages
+            ),
+            maximum_raw_payload_bytes=int(
+                request.projection_rule.max_online_inferred_taxonomy_graph_bytes
+            ),
+            maximum_row_capacity=maximum_occurrences + 1,
         ),
-        maximum_raw_payload_bytes=int(
-            projection_rule.max_online_inferred_taxonomy_graph_bytes
+        pattern_keys=tuple(
+            sorted(request.candidates.npi_keys_by_pattern)
         ),
-        maximum_row_capacity=maximum_occurrences + 1,
+        snapshot_key=_required_shared_snapshot_key(serving_tables),
     )
-    rate_window = min(
-        maximum_occurrences,
-        PTG2_SERVING_BINARY_V3_PAGE_ROWS,
-        declared_occurrences,
+
+
+async def _v4_pattern_update_candidates(
+    session,
+    context: _V4PatternContext,
+    serving_rows: list[dict[str, Any]],
+    pattern_keys_by_set: dict[int, tuple[int, ...]],
+) -> None:
+    """Load and validate candidate patterns for newly reached rate sets."""
+
+    provider_set_keys = tuple(
+        sorted(_v4_rate_scope_set_ids(serving_rows, None))
     )
-    pattern_keys = tuple(sorted(candidates.npi_keys_by_pattern))
-    snapshot_key = _required_shared_snapshot_key(serving_tables)
-    serving_rows: list[dict[str, Any]] = []
-    provider_set_id_by_key: dict[int, str] = {}
-    pattern_keys_by_set: dict[int, tuple[int, ...]] = {}
-    selected_occurrences: tuple[tuple[int, int], ...] = ()
-    selected_npi_keys: tuple[int, ...] = ()
+    if len(provider_set_keys) > int(
+        context.request.projection_rule.max_online_filtered_reverse_code_sets
+    ):
+        raise PTG2OnlineWorkBudgetExceeded("code_sets")
+    new_provider_set_keys = tuple(
+        provider_set_key
+        for provider_set_key in provider_set_keys
+        if provider_set_key not in pattern_keys_by_set
+    )
+    if not new_provider_set_keys:
+        return
+    new_pattern_keys_by_set = await lookup_v4_relation_intersections(
+        session,
+        snapshot_key=context.snapshot_key,
+        relation="set_patterns",
+        owner_keys=new_provider_set_keys,
+        allowed_member_keys=context.pattern_keys,
+        schema_name=PTG2_SCHEMA,
+        max_members=None,
+    )
+    if set(new_pattern_keys_by_set) != set(new_provider_set_keys) or any(
+        not set(set_pattern_keys).issubset(context.pattern_keys)
+        for set_pattern_keys in new_pattern_keys_by_set.values()
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy set-pattern projection is incomplete"
+        )
+    pattern_keys_by_set.update(new_pattern_keys_by_set)
+
+
+async def _v4_pattern_read_window(
+    session,
+    serving_tables: PTG2ServingTables,
+    context: _V4PatternContext,
+    state: _V4PatternPrefixState,
+) -> None:
+    """Read, authenticate, and rank one bounded pattern rate window."""
+
+    request = context.request
+    serving_rows = await _merge_manifest_code_variant_rows(
+        session,
+        serving_tables,
+        code_rows=request.code_rows,
+        provider_set_keys=None,
+        source_trace_set_hash=request.source_trace_set_hash,
+        network_names=request.network_names,
+        limit=state.rate_window,
+        offset=0,
+        descending=request.descending,
+        scan_budget=context.scan_budget,
+    )
+    if serving_rows is None:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 filtered reverse rate rows are unavailable"
+        )
+    state.serving_rows = serving_rows
+    await _v4_pattern_update_candidates(
+        session,
+        context,
+        serving_rows,
+        state.pattern_keys_by_set,
+    )
+    (
+        state.selected_occurrences,
+        state.is_candidate_prefix_exhausted,
+    ) = _v4_pattern_candidate_prefix(
+        serving_rows,
+        state.pattern_keys_by_set,
+        request.candidates.npi_keys_by_pattern,
+        target_count=context.normalized_target_count,
+    )
+    state.is_source_exhausted = _is_v4_rate_prefix_exhausted(
+        request.code_rows,
+        serving_rows,
+        rate_window=state.rate_window,
+    )
+
+
+def _should_advance_v4_pattern_window(
+    context: _V4PatternContext,
+    state: _V4PatternPrefixState,
+) -> bool:
+    """Return completion or grow the next bounded rate window."""
+
+    if (
+        len(state.selected_occurrences) >= context.normalized_target_count
+        or state.is_source_exhausted
+    ):
+        return False
+    if state.rate_window >= context.maximum_occurrences:
+        raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
+    next_window = _next_pattern_rate_window(
+        state.rate_window,
+        target_count=context.normalized_target_count,
+        distinct_count=len(state.selected_occurrences),
+        declared_occurrences=context.declared_occurrences,
+        maximum_occurrences=context.maximum_occurrences,
+    )
+    if next_window <= state.rate_window:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy rate prefix did not make progress"
+        )
+    state.serving_rows.clear()
+    state.rate_window = next_window
+    return True
+
+
+async def _v4_pattern_ranked_prefix(
+    session,
+    serving_tables: PTG2ServingTables,
+    context: _V4PatternContext,
+) -> _V4PatternPrefix:
+    """Grow one authenticated prefix and resolve its selected patterns."""
+
+    state = _V4PatternPrefixState(
+        rate_window=min(
+            context.maximum_occurrences,
+            PTG2_SERVING_BINARY_V3_PAGE_ROWS,
+            context.declared_occurrences,
+        )
+    )
+    while True:
+        await _v4_pattern_read_window(
+            session,
+            serving_tables,
+            context,
+            state,
+        )
+        if not _should_advance_v4_pattern_window(context, state):
+            break
+    selected_npi_keys = tuple(
+        dict.fromkeys(
+            npi_key
+            for _row_index, npi_key in state.selected_occurrences
+        )
+    )
     completion_provider_set_keys: tuple[int, ...] = ()
     completion_pattern_keys_by_set: dict[int, tuple[int, ...]] = {}
-    is_candidate_prefix_exhausted = False
-    is_source_exhausted = False
-    with (
-        v4_graph_request_scope(),
-        v4_graph_taxonomy_projection_scope(
-            maximum_members=int(
-                projection_rule.max_online_candidate_pattern_projection_members
+    if selected_npi_keys:
+        (
+            completion_provider_set_keys,
+            completion_pattern_keys_by_set,
+        ) = await _v4_pattern_completion_projection(
+            session,
+            snapshot_key=context.snapshot_key,
+            selected_npi_keys=selected_npi_keys,
+            npi_keys_by_pattern=(
+                context.request.candidates.npi_keys_by_pattern
             ),
-            maximum_pages=int(
-                projection_rule.max_online_inferred_taxonomy_graph_pages
+            max_members=int(
+                context.request.projection_rule.max_online_inferred_taxonomy_retained_memberships
             ),
-            maximum_bytes=int(
-                projection_rule.max_online_inferred_taxonomy_graph_bytes
-            ),
-            maximum_batches=int(
-                projection_rule.max_online_inferred_taxonomy_graph_batches
-            ),
-        ),
-    ):
-        while True:
-            serving_rows = await _merge_manifest_code_variant_rows(
-                session,
-                serving_tables,
-                code_rows=code_rows,
-                provider_set_keys=None,
-                source_trace_set_hash=source_trace_set_hash,
-                network_names=network_names,
-                limit=rate_window,
-                offset=0,
-                descending=descending,
-                scan_budget=scan_budget,
-            )
-            if serving_rows is None:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 V4 filtered reverse rate rows are unavailable"
-                )
-            provider_set_id_by_key = _v4_rate_scope_set_ids(
-                serving_rows,
-                None,
-            )
-            provider_set_keys = tuple(sorted(provider_set_id_by_key))
-            if len(provider_set_keys) > int(
-                projection_rule.max_online_filtered_reverse_code_sets
-            ):
-                raise PTG2OnlineWorkBudgetExceeded("code_sets")
-            new_provider_set_keys = tuple(
-                provider_set_key
-                for provider_set_key in provider_set_keys
-                if provider_set_key not in pattern_keys_by_set
-            )
-            if new_provider_set_keys:
-                new_pattern_keys_by_set = (
-                    await lookup_v4_relation_intersections(
-                        session,
-                        snapshot_key=snapshot_key,
-                        relation="set_patterns",
-                        owner_keys=new_provider_set_keys,
-                        allowed_member_keys=pattern_keys,
-                        schema_name=PTG2_SCHEMA,
-                        max_members=None,
-                    )
-                )
-                if set(new_pattern_keys_by_set) != set(
-                    new_provider_set_keys
-                ) or any(
-                    not set(set_pattern_keys).issubset(pattern_keys)
-                    for set_pattern_keys in new_pattern_keys_by_set.values()
-                ):
-                    raise PTG2ManifestArtifactError(
-                        "PTG2 V4 inferred-taxonomy set-pattern projection is incomplete"
-                    )
-                pattern_keys_by_set.update(new_pattern_keys_by_set)
-            selected_occurrences, is_candidate_prefix_exhausted = (
-                _v4_pattern_candidate_prefix(
-                    serving_rows,
-                    pattern_keys_by_set,
-                    candidates.npi_keys_by_pattern,
-                    target_count=normalized_target_count,
-                )
-            )
-            is_source_exhausted = _is_v4_rate_prefix_exhausted(
-                code_rows,
-                serving_rows,
-                rate_window=rate_window,
-            )
-            if (
-                len(selected_occurrences) >= normalized_target_count
-                or is_source_exhausted
-            ):
-                break
-            if rate_window >= maximum_occurrences:
-                raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
-            next_window = _next_pattern_rate_window(
-                rate_window,
-                target_count=normalized_target_count,
-                distinct_count=len(selected_occurrences),
-                declared_occurrences=declared_occurrences,
-                maximum_occurrences=maximum_occurrences,
-            )
-            if next_window <= rate_window:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 V4 inferred-taxonomy rate prefix did not make progress"
-                )
-            serving_rows.clear()
-            rate_window = next_window
-        if selected_occurrences:
-            selected_npi_keys = tuple(
-                dict.fromkeys(
-                    npi_key
-                    for _row_index, npi_key in selected_occurrences
-                )
-            )
-            (
-                completion_provider_set_keys,
-                completion_pattern_keys_by_set,
-            ) = await _v4_pattern_completion_projection(
-                session,
-                snapshot_key=snapshot_key,
-                selected_npi_keys=selected_npi_keys,
-                npi_keys_by_pattern=candidates.npi_keys_by_pattern,
-                max_members=int(
-                    projection_rule.max_online_inferred_taxonomy_retained_memberships
-                ),
-            )
-    if not selected_occurrences:
-        return _ProviderExpansionSelection(
-            [],
-            {},
-            {},
-            is_source_exhausted and is_candidate_prefix_exhausted,
         )
+    return _V4PatternPrefix(
+        serving_rows=state.serving_rows,
+        selected_occurrences=state.selected_occurrences,
+        selected_npi_keys=selected_npi_keys,
+        completion_provider_set_keys=completion_provider_set_keys,
+        completion_pattern_keys_by_set=completion_pattern_keys_by_set,
+        is_candidate_prefix_exhausted=state.is_candidate_prefix_exhausted,
+        is_source_exhausted=state.is_source_exhausted,
+    )
+
+
+async def _v4_pattern_npi_identity(
+    session,
+    context: _V4PatternContext,
+    prefix: _V4PatternPrefix,
+) -> tuple[dict[int, int], dict[_ProviderExpansionKey, int]]:
+    """Resolve selected dense NPIs and restore their exact response ranks."""
+
     npi_by_key = await v4_npi_values_for_keys(
         session,
-        snapshot_key=snapshot_key,
-        npi_keys=selected_npi_keys,
+        snapshot_key=context.snapshot_key,
+        npi_keys=prefix.selected_npi_keys,
         schema_name=PTG2_SCHEMA,
     )
     if (
-        set(npi_by_key) != set(selected_npi_keys)
-        or len(set(npi_by_key.values())) != len(selected_npi_keys)
+        set(npi_by_key) != set(prefix.selected_npi_keys)
+        or len(set(npi_by_key.values())) != len(prefix.selected_npi_keys)
     ):
         raise PTG2ManifestArtifactError(
             "PTG2 V4 inferred-taxonomy NPI dictionary is incomplete"
         )
     rank_by_key = {
         _provider_expansion_key(
-            serving_rows[row_index],
+            prefix.serving_rows[row_index],
             npi=int(npi_by_key[npi_key]),
         ): rank
-        for rank, (row_index, npi_key) in enumerate(selected_occurrences)
+        for rank, (row_index, npi_key) in enumerate(
+            prefix.selected_occurrences
+        )
     }
-    if len(rank_by_key) != len(selected_occurrences):
+    if len(rank_by_key) != len(prefix.selected_occurrences):
         raise PTG2ManifestArtifactError(
             "PTG2 V4 inferred-taxonomy dense ranking is not unique"
         )
-    completion_rows, provider_set_id_by_key = (
-        await _v4_pattern_completion_rows(
-            session,
-            serving_tables,
-            _V4PatternCompletionRequest(
-                code_rows=code_rows,
-                prefix_rows=serving_rows,
-                candidate_provider_set_keys=completion_provider_set_keys,
-                source_trace_set_hash=source_trace_set_hash,
-                network_names=network_names,
-                descending=descending,
-                is_source_exhausted=is_source_exhausted,
-                maximum_occurrences=maximum_occurrences,
-                maximum_code_sets=int(
-                    projection_rule.max_online_filtered_reverse_code_sets
-                ),
-                scan_budget=scan_budget,
-            ),
-        )
-    )
-    memberships_by_npi_key = _v4_selected_pattern_memberships(
-        selected_npi_keys,
-        candidates.npi_keys_by_pattern,
-        {
-            provider_set_key: completion_pattern_keys_by_set[
-                provider_set_key
-            ]
-            for provider_set_key in provider_set_id_by_key
-        },
-        provider_set_id_by_key,
-        max_members=int(
-            projection_rule.max_online_inferred_taxonomy_retained_memberships
-        ),
-    )
-    _validate_v4_pattern_ranked_memberships(
-        selected_occurrences,
-        serving_rows,
-        memberships_by_npi_key,
-        provider_set_id_by_key,
-    )
-    selected_npis = tuple(int(npi_by_key[npi_key]) for npi_key in selected_npi_keys)
-    provider_set_ids_by_npi = {
-        int(npi_by_key[npi_key]): memberships_by_npi_key[npi_key]
-        for npi_key in selected_npi_keys
-    }
+    return npi_by_key, rank_by_key
+
+
+def _v4_pattern_retained_rows(
+    completion_rows: list[dict[str, Any]],
+    provider_set_ids_by_npi: Mapping[int, tuple[str, ...]],
+) -> list[dict[str, Any]]:
+    """Retain completion rates reached by at least one selected provider."""
+
     retained_provider_set_ids = {
         provider_set_id
         for provider_set_ids in provider_set_ids_by_npi.values()
         for provider_set_id in provider_set_ids
     }
-    completion_rows = [
+    return [
         serving_row
         for serving_row in completion_rows
         if _ptg2_manifest_id(
@@ -17455,13 +17485,121 @@ async def _select_v4_pattern_taxonomy_expansion(
         )
         in retained_provider_set_ids
     ]
+
+
+def _v4_pattern_memberships(
+    context: _V4PatternContext,
+    prefix: _V4PatternPrefix,
+    provider_set_id_by_key: Mapping[int, str],
+) -> dict[int, tuple[str, ...]]:
+    """Resolve and authenticate selected pattern memberships."""
+
+    memberships_by_npi_key = _v4_selected_pattern_memberships(
+        prefix.selected_npi_keys,
+        context.request.candidates.npi_keys_by_pattern,
+        {
+            provider_set_key: prefix.completion_pattern_keys_by_set[
+                provider_set_key
+            ]
+            for provider_set_key in provider_set_id_by_key
+        },
+        provider_set_id_by_key,
+        max_members=int(
+            context.request.projection_rule.max_online_inferred_taxonomy_retained_memberships
+        ),
+    )
+    _validate_v4_pattern_ranked_memberships(
+        prefix.selected_occurrences,
+        prefix.serving_rows,
+        memberships_by_npi_key,
+        provider_set_id_by_key,
+    )
+    return memberships_by_npi_key
+
+
+async def _v4_pattern_completion(
+    session,
+    serving_tables: PTG2ServingTables,
+    context: _V4PatternContext,
+    prefix: _V4PatternPrefix,
+    npi_by_key: Mapping[int, int],
+) -> tuple[list[dict[str, Any]], tuple[int, ...], dict[int, tuple[str, ...]]]:
+    """Complete exact rate memberships for the selected dense NPIs."""
+
+    request = context.request
+    completion_rows, provider_set_id_by_key = (
+        await _v4_pattern_completion_rows(
+            session,
+            serving_tables,
+            _V4PatternCompletionRequest(
+                code_rows=request.code_rows,
+                prefix_rows=prefix.serving_rows,
+                candidate_provider_set_keys=(
+                    prefix.completion_provider_set_keys
+                ),
+                source_trace_set_hash=request.source_trace_set_hash,
+                network_names=request.network_names,
+                descending=request.descending,
+                is_source_exhausted=prefix.is_source_exhausted,
+                maximum_occurrences=context.maximum_occurrences,
+                maximum_code_sets=int(
+                    request.projection_rule.max_online_filtered_reverse_code_sets
+                ),
+                scan_budget=context.scan_budget,
+            ),
+        )
+    )
+    memberships_by_npi_key = _v4_pattern_memberships(
+        context,
+        prefix,
+        provider_set_id_by_key,
+    )
+    selected_npis = tuple(
+        int(npi_by_key[npi_key]) for npi_key in prefix.selected_npi_keys
+    )
+    provider_set_ids_by_npi = {
+        int(npi_by_key[npi_key]): memberships_by_npi_key[npi_key]
+        for npi_key in prefix.selected_npi_keys
+    }
+    return (
+        _v4_pattern_retained_rows(
+            completion_rows,
+            provider_set_ids_by_npi,
+        ),
+        selected_npis,
+        provider_set_ids_by_npi,
+    )
+
+
+async def _v4_pattern_selection(
+    session,
+    serving_tables: PTG2ServingTables,
+    context: _V4PatternContext,
+    prefix: _V4PatternPrefix,
+) -> _ProviderExpansionSelection:
+    """Materialize one completed pattern-prefix provider selection."""
+
+    npi_by_key, rank_by_key = await _v4_pattern_npi_identity(
+        session,
+        context,
+        prefix,
+    )
+    completion_rows, selected_npis, provider_set_ids_by_npi = (
+        await _v4_pattern_completion(
+            session,
+            serving_tables,
+            context,
+            prefix,
+            npi_by_key,
+        )
+    )
     providers_by_set = await _selected_provider_rows_by_set(
         session,
         serving_tables,
         npis=selected_npis,
         provider_set_ids_by_npi=provider_set_ids_by_npi,
-        args=args,
-        snapshot_id=snapshot_id,
+        args=context.request.args,
+        snapshot_id=context.request.snapshot_id,
     )
     if providers_by_set is None:
         raise PTG2ManifestArtifactError(
@@ -17471,7 +17609,62 @@ async def _select_v4_pattern_taxonomy_expansion(
         row_data=completion_rows,
         providers_by_set=providers_by_set,
         rank_by_key=rank_by_key,
-        exhausted=is_source_exhausted and is_candidate_prefix_exhausted,
+        exhausted=(
+            prefix.is_source_exhausted
+            and prefix.is_candidate_prefix_exhausted
+        ),
+    )
+
+
+async def _select_v4_pattern_taxonomy_expansion(
+    session,
+    serving_tables: PTG2ServingTables,
+    **request_options: Any,
+) -> _ProviderExpansionSelection:
+    """Serve one exact pattern quotient with bounded, target-first work."""
+
+    context = _v4_pattern_context(
+        serving_tables,
+        _V4PatternTaxonomyRequest(**request_options),
+    )
+    if context is None:
+        return _ProviderExpansionSelection([], {}, {}, True)
+    request = context.request
+    with (
+        v4_graph_request_scope(),
+        v4_graph_taxonomy_projection_scope(
+            maximum_members=int(
+                request.projection_rule.max_online_candidate_pattern_projection_members
+            ),
+            maximum_pages=int(
+                request.projection_rule.max_online_inferred_taxonomy_graph_pages
+            ),
+            maximum_bytes=int(
+                request.projection_rule.max_online_inferred_taxonomy_graph_bytes
+            ),
+            maximum_batches=int(
+                request.projection_rule.max_online_inferred_taxonomy_graph_batches
+            ),
+        ),
+    ):
+        prefix = await _v4_pattern_ranked_prefix(
+            session,
+            serving_tables,
+            context,
+        )
+    if not prefix.selected_occurrences:
+        return _ProviderExpansionSelection(
+            [],
+            {},
+            {},
+            prefix.is_source_exhausted
+            and prefix.is_candidate_prefix_exhausted,
+        )
+    return await _v4_pattern_selection(
+        session,
+        serving_tables,
+        context,
+        prefix,
     )
 
 
