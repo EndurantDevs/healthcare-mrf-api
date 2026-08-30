@@ -19618,6 +19618,7 @@ async def _search_manifest_serving_table(
     )
     uses_local_exhaustive_rate_scope = bool(
         requested_npi is None
+        and location_requires_exhaustive
         and _uses_local_distance_rate_scope(
             serving_tables,
             args,

@@ -352,6 +352,51 @@ async def test_non_v4_exact_rate_geo_keeps_price_first_order(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_v4_distance_exact_rate_geo_keeps_price_first_order(monkeypatch):
+    events = []
+    _install_base_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        serving,
+        "_prices_for_price_sets",
+        AsyncMock(return_value={_PRICE_SET_ID: [{"negotiated_rate": "125.00"}]}),
+    )
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        AsyncMock(
+            side_effect=lambda *_args, **_kwargs: events.append("merge")
+            or [dict(_RATE_ROW)]
+        ),
+    )
+    location = AsyncMock(
+        side_effect=lambda *_args, **_kwargs: events.append("location")
+        or ({_PROVIDER_SET_ID}, {_PROVIDER_SET_ID: [_PROVIDER_ROW]})
+    )
+    monkeypatch.setattr(
+        serving,
+        "_ptg2_manifest_location_provider_matches",
+        location,
+    )
+
+    response, _session = await _search(
+        serving_tables=_production_tables(),
+        args=_query_args(
+            include_providers=True,
+            lat=41.8781,
+            long=-87.6298,
+            radius_miles=25,
+            order_by="distance",
+            negotiated_rate="125.00",
+        ),
+    )
+
+    assert response["items"][0]["prices"] == [{"negotiated_rate": 125}]
+    assert events == ["merge", "location"]
+    assert location.await_args.kwargs["provider_set_keys"] == {3}
+    assert location.await_args.kwargs["require_exhaustive"] is False
+
+
+@pytest.mark.asyncio
 async def test_manifest_distance_page_uses_deep_offset_sentinel(monkeypatch):
     _install_base_dependencies(monkeypatch)
     providers = [
