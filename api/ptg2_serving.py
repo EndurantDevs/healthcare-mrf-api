@@ -8946,15 +8946,16 @@ def _uses_oversized_cost_ordered_geo_gate(
 ) -> bool:
     """Identify cost lanes whose sealed size must be checked before geo work."""
 
+    order_by = str(
+        args.get("order_by")
+        or ("total_allowed_amount" if not include_providers else "")
+    ).strip().lower()
     return bool(
         serving_tables.uses_v4_graph
         and location_filter_requested
         and not price_filter_requested
         and requested_npi is None
-        and str(args.get("order_by") or "")
-        .strip()
-        .lower()
-        in _PTG2_COST_ORDER_FIELDS
+        and order_by in _PTG2_COST_ORDER_FIELDS
         and not (
             include_providers
             and not explicit_provider_filter_requested

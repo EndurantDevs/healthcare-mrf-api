@@ -100,7 +100,7 @@ async def test_manifest_cost_geo_uses_strict_rate_first_route(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("code", "query_overrides", "allows_distance_retry"),
-    (
+    [
         ("36415", {"include_providers": True}, True),
         ("88305", {"include_providers": True}, True),
         ("93000", {"include_providers": True}, True),
@@ -116,7 +116,7 @@ async def test_manifest_cost_geo_uses_strict_rate_first_route(monkeypatch):
             },
             False,
         ),
-    ),
+    ],
 )
 async def test_manifest_cost_geo_refuses_oversized_scope_before_geo(
     monkeypatch,
@@ -167,7 +167,7 @@ async def test_manifest_cost_geo_refuses_oversized_scope_before_geo(
 
 @pytest.mark.parametrize(
     ("args", "gate_overrides"),
-    (
+    [
         (
             _query_args(code="36415", order_by="total_allowed_amount", npi=str(_NPI)),
             {"requested_npi": _NPI},
@@ -186,10 +186,10 @@ async def test_manifest_cost_geo_refuses_oversized_scope_before_geo(
             {"price_filter_requested": True},
         ),
         (_query_args(code="27447", order_by="total_allowed_amount"), {}),
-    ),
+    ],
 )
 def test_oversized_cost_geo_gate_preserves_bounded_routes(args, gate_overrides):
-    gate_options = {
+    gate_options_by_name = {
         "include_providers": True,
         "price_filter_requested": False,
         "requested_npi": None,
@@ -200,7 +200,19 @@ def test_oversized_cost_geo_gate_preserves_bounded_routes(args, gate_overrides):
         _production_tables(),
         args,
         location_filter_requested=True,
-        **gate_options,
+        **gate_options_by_name,
+    )
+
+
+def test_oversized_cost_geo_gate_defaults_aggregate_to_cost_order():
+    assert serving._uses_oversized_cost_ordered_geo_gate(
+        _production_tables(),
+        _query_args(code="36415", include_providers=False),
+        location_filter_requested=True,
+        include_providers=False,
+        price_filter_requested=False,
+        requested_npi=None,
+        explicit_provider_filter_requested=False,
     )
 
 

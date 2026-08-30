@@ -2872,8 +2872,8 @@ async def test_geo_cost_order_requires_exhaustive_location_selection(
         pytest.param(
             {"classification": "Internal Medicine"},
             257,
-            False,
-            0,
+            True,
+            1,
             id="filtered-high",
         ),
         pytest.param({}, 256, False, 1, id="at-cap"),
@@ -2887,7 +2887,7 @@ async def test_geo_cost_order_rate_count_gate_precedes_location(
     should_reject,
     expected_code_queries,
 ):
-    """Reject only oversized default provider expansion before graph work."""
+    """Reject oversized cost-ordered geographic lanes before graph work."""
 
     location_call_arguments = []
 
@@ -2906,7 +2906,7 @@ async def test_geo_cost_order_rate_count_gate_precedes_location(
     error_context = (
         pytest.raises(
             ptg2_serving.PTG2LocationScopeError,
-            match="Narrow the ZIP radius",
+            match="exceeds the sealed online rate-row limit",
         )
         if should_reject
         else nullcontext()
