@@ -42,22 +42,18 @@ _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-007195": "4001360464d0b094a10df3bd688d3879f0bc0d6c07ee966021772d689f0aebf7",
     "hospital-007318": "923f885b47e27d492d193557d2cd671f0d0a63becb3c971ad9092f794fea2b36",
     "hospital-007340": "0e057fbfbc92c7cdfa98bfdd02a06c7f2ce7eb5fe9b48eddac785ed1686fe27c",
-}
+} | dict.fromkeys("hospital-002089 hospital-005970 hospital-005971 hospital-005972 hospital-005973 hospital-005974".split(), "7ba5d031cb09651b7e02fab6d11dadc423e561c6d2649835f276188521688ac1")
 
 _REVIEWED_ALIAS_SAMPLES = {
     f"hospital-{alias}": f"hospital-{canonical}"
-    for alias, canonical in (
-        ("000061", "000060"), ("000064", "000063"), ("000123", "000122"), ("000162", "000161"),
-        ("001486", "001483"), ("002520", "002519"), ("004667", "004666"), ("005329", "005328"),
-        ("005563", "001678"), ("005564", "001678"), ("005565", "001678"), ("006233", "005566"),
-        ("007207", "007206"), ("007272", "000586"), ("000121", "000120"), ("000342", "000343"),
-        ("000593", "000592"), ("000654", "000604"), ("000655", "000600"), ("000656", "000592"),
-        ("000657", "000606"), ("000745", "000744"), ("002911", "000189"), ("005797", "005798"),
-        ("005077", "005063"), ("006650", "006649"), ("003017", "003012"), ("003068", "003013"),
-        ("003069", "003014"), ("003070", "003015"), ("003071", "003016"), ("003072", "003019"),
-        ("003073", "003018"), ("003074", "003020"), ("003075", "003021"), ("003076", "003022"),
-        ("003077", "003023"), ("003078", "003024"), ("003079", "003025"), ("002432", "002433"), ("006299", "006300"),
-    )
+    for pair in (
+        "000061:000060 000064:000063 000123:000122 000162:000161 001486:001483 002520:002519 004667:004666 005329:005328 005563:001678 "
+        "005564:001678 005565:001678 006233:005566 007207:007206 007272:000586 000121:000120 000342:000343 000593:000592 000654:000604 "
+        "000655:000600 000656:000592 000657:000606 000745:000744 002911:000189 005797:005798 005077:005063 006650:006649 003017:003012 "
+        "003068:003013 003069:003014 003070:003015 003071:003016 003072:003019 003073:003018 003074:003020 003075:003021 003076:003022 "
+        "003077:003023 003078:003024 003079:003025 002432:002433 006299:006300 005971:005970 005973:005972"
+    ).split()
+    for alias, canonical in (pair.split(":"),)
 }
 
 
@@ -81,12 +77,12 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 7_112
+    assert len(registry.hospital_hpt_registry_groups()) == 7_110
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
-    assert sum("locator_name" in entry for entry in hospitals) == 1_412
+    assert sum("locator_name" in entry for entry in hospitals) == 1_416
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 644
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 31
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 37
     assert {entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry} == set(
         _FALLBACK_URL_SHA256_BY_HOSPITAL_ID
     )
@@ -142,7 +138,7 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 244
+    assert len(aliases_by_id) == 246
     assert {
         hospital_id: aliases_by_id[hospital_id] for hospital_id in _REVIEWED_ALIAS_SAMPLES
     } == _REVIEWED_ALIAS_SAMPLES
@@ -211,7 +207,7 @@ def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypat
     hospitals = _load(
         tmp_path,
         _document(locator).replace(
-            "    cms_hpt_url:", "    locator_mrf_url: https://f.test/a\n    cms_hpt_url:"
+            "    cms_hpt_url:", "    locator_mrf_url: https://f.test/a\n    fallback_mrf_url: https://f.test/fallback\n    cms_hpt_url:"
         )
         + f"""\
   - hospital_id: hospital-000002
@@ -224,6 +220,7 @@ def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypat
 
     assert hospitals[1]["locator_name"] == "Example Hospital"
     assert hospitals[1]["locator_mrf_url"] == "https://f.test/a"
+    assert hospitals[1]["fallback_mrf_url"] == "https://f.test/fallback"
     assert registry.hospital_hpt_registry_groups() == (hospitals,)
     assert registry.selected_hospital_hpt_registry(
         {"hospital_id": "hospital-000001"}
