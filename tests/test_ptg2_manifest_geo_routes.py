@@ -105,6 +105,10 @@ async def test_manifest_cost_geo_refuses_oversized_unfiltered_scope(monkeypatch)
         side_effect=AssertionError("oversized unfiltered scope must be refused")
     )
     monkeypatch.setattr(serving, "_strict_cost_provider_expansion_selection", selector)
+    location_lookup = AsyncMock()
+    monkeypatch.setattr(
+        serving, "_ptg2_manifest_location_provider_matches", location_lookup
+    )
     serving_tables = _production_tables()
     rate_count = (
         serving._v4_hot_prefix_limits(
@@ -132,6 +136,7 @@ async def test_manifest_cost_geo_refuses_oversized_unfiltered_scope(monkeypatch)
     assert exc_info.value.error_code == "ptg2_location_scope_too_broad"
     assert "order_by=distance" in str(exc_info.value)
     selector.assert_not_awaited()
+    location_lookup.assert_not_awaited()
 
 
 @pytest.mark.asyncio
