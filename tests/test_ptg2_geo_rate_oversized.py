@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from api import ptg2_serving as serving
+from api import ptg2_v4_graph as graph
 from tests.test_ptg2_geo_rate_prefix import (
     _code_rows,
     _install_geo_prefix_reads,
@@ -24,8 +25,20 @@ def _bounded_location_rows(local_npis, limit) -> list[dict[str, int | bool]]:
     ]
 
 
+def _install_graph_root(monkeypatch, representation="direct_v1"):
+    monkeypatch.setattr(
+        serving,
+        "load_v4_graph_root",
+        AsyncMock(return_value=graph.V4GraphRoot(17, representation, b"r" * 32)),
+    )
+
+
 def _install_local_scope_reads(monkeypatch, rate_rows, local_npis):
+    """Install the complete retained oversized-geo read shape."""
+
+    _install_graph_root(monkeypatch)
     local_provider_set_keys = tuple(range(1, 69))
+
     async def rate_read(*_args, **kwargs):
         provider_set_keys = kwargs["provider_set_keys"]
         matching_rates = (
@@ -67,9 +80,7 @@ def _install_local_scope_reads(monkeypatch, rate_rows, local_npis):
             side_effect=AssertionError("oversized selection decoded national rates")
         ),
     }
-    monkeypatch.setattr(
-        serving, "_merge_manifest_code_variant_rows", reads_by_kind["rates"]
-    )
+    monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", reads_by_kind["rates"])
     monkeypatch.setattr(serving, "_provider_npis_for_sets", reads_by_kind["members"])
     monkeypatch.setattr(serving, "_membership_npi_rows", reads_by_kind["locations"])
     monkeypatch.setattr(serving, "_v4_sets_by_npi", reads_by_kind["sets"])
@@ -84,7 +95,29 @@ def _install_local_scope_reads(monkeypatch, rate_rows, local_npis):
     return reads_by_kind
 
 
+def _install_charged_graph_read(monkeypatch, reads_by_kind, representation):
+    """Charge the exact retained direct-v1 graph work under one mocked root."""
+
+    _install_graph_root(monkeypatch, representation)
+    graph_read = reads_by_kind["sets"]
+
+    async def charged_graph_read(*_args, **_kwargs):
+        graph._charge_v4_taxonomy_projection_work(
+            member_count=198,
+            page_count=262,
+            byte_count=4_292_068,
+            batch_count=1,
+        )
+        return graph_read.return_value
+
+    graph_read.side_effect = charged_graph_read
+    projection_scope = Mock(wraps=serving.v4_graph_taxonomy_projection_scope)
+    monkeypatch.setattr(serving, "v4_graph_taxonomy_projection_scope", projection_scope)
+    return projection_scope
+
+
 def _install_single_set_scope(monkeypatch, rate_rows):
+    _install_graph_root(monkeypatch)
     reads_by_kind = {
         "locations": AsyncMock(
             return_value=[{"npi": 111, "_ptg_source_exhausted": True}]
@@ -111,11 +144,8 @@ async def test_oversized_geo_rate_finds_local_set_after_national_cap(monkeypatch
     rate_rows = [_rate_row(rank) for rank in range(65)]
     local_npis = tuple(range(358, 502))
     reads_by_kind = _install_local_scope_reads(monkeypatch, rate_rows, local_npis)
-    projection_scope = Mock(wraps=serving.v4_graph_taxonomy_projection_scope)
-    monkeypatch.setattr(
-        serving,
-        "v4_graph_taxonomy_projection_scope",
-        projection_scope,
+    projection_scope = _install_charged_graph_read(
+        monkeypatch, reads_by_kind, "direct_v1"
     )
 
     selection = await serving._select_geo_filtered_rate_prefix(
@@ -143,8 +173,8 @@ async def test_oversized_geo_rate_finds_local_set_after_national_cap(monkeypatch
     assert reads_by_kind["sets"].await_args.kwargs["max_projection_members"] == 131_072
     projection_scope.assert_called_once_with(
         maximum_members=131_072,
-        maximum_pages=256,
-        maximum_bytes=4 * 1024 * 1024,
+        maximum_pages=1_280,
+        maximum_bytes=20 * 1024 * 1024,
         maximum_batches=32,
     )
     assert reads_by_kind["codes"].await_args.args[2:] == (
@@ -169,8 +199,8 @@ async def test_oversized_geo_rate_rejects_graph_overflow_before_downstream_reads
     monkeypatch,
 ):
     reads_by_kind = _install_single_set_scope(monkeypatch, [])
-    reads_by_kind["sets"].side_effect = serving.PTG2OnlineWorkBudgetExceeded(
-        "graph_pages"
+    projection_scope = _install_charged_graph_read(
+        monkeypatch, reads_by_kind, "pattern_v1"
     )
 
     with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as exc_info:
@@ -185,6 +215,12 @@ async def test_oversized_geo_rate_rejects_graph_overflow_before_downstream_reads
         )
 
     assert exc_info.value.dimension == "candidate_members"
+    projection_scope.assert_called_once_with(
+        maximum_members=131_072,
+        maximum_pages=256,
+        maximum_bytes=4 * 1024 * 1024,
+        maximum_batches=32,
+    )
     reads_by_kind["sets"].assert_awaited_once()
     reads_by_kind["codes"].assert_not_awaited()
     reads_by_kind["rates"].assert_not_awaited()
@@ -192,6 +228,7 @@ async def test_oversized_geo_rate_rejects_graph_overflow_before_downstream_reads
 
 @pytest.mark.asyncio
 async def test_oversized_geo_rate_rejects_reverse_membership_overflow(monkeypatch):
+    _install_graph_root(monkeypatch)
     monkeypatch.setattr(
         serving,
         "_membership_npi_rows",
@@ -223,6 +260,7 @@ async def test_oversized_geo_rate_rejects_reverse_membership_overflow(monkeypatc
 
 @pytest.mark.asyncio
 async def test_oversized_geo_rate_rejects_more_than_sealed_local_sets(monkeypatch):
+    _install_graph_root(monkeypatch)
     local_set_keys = tuple(range(1, 258))
     monkeypatch.setattr(
         serving,

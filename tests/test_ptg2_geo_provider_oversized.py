@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import ptg2_serving as serving
+from api.ptg2_v4_graph import V4GraphRoot
 from tests.test_ptg2_geo_provider_expansion import (
     _MATCHING_NPI,
     _PROVIDER_SET_ID,
@@ -58,6 +59,11 @@ async def _read_local_set_keys(_session, _tables, candidate_npis, **_kwargs):
 
 
 def _install_local_after_cap(monkeypatch):
+    monkeypatch.setattr(
+        serving,
+        "load_v4_graph_root",
+        AsyncMock(return_value=V4GraphRoot(41, "direct_v1", b"r" * 32)),
+    )
     tables = _geo_tables(
         provider_expansion_rate_page_rows=4,
         max_online_provider_expansion_rate_rows=8,

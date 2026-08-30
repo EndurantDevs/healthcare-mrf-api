@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import ptg2_serving as serving
+from api.ptg2_v4_graph import V4GraphRoot
 from tests.test_ptg2_geo_rate_prefix import _production_tables, _tables
 
 
@@ -164,6 +165,11 @@ async def test_strict_geo_cost_rejects_unprovable_complete_set(monkeypatch):
 async def test_strict_geo_cost_rejects_local_rates_at_sealed_read_budget(monkeypatch):
     """Keep a cap-sized local scope typed without widening its rate read."""
 
+    monkeypatch.setattr(
+        serving,
+        "load_v4_graph_root",
+        AsyncMock(return_value=V4GraphRoot(41, "direct_v1", b"r" * 32)),
+    )
     rate_rows = [dict(_rate_row(_PROVIDER_SET_ID, 1, 1, 0)) for _ in range(65)]
     merge_rows = AsyncMock(
         side_effect=lambda *_args, **kwargs: rate_rows[
