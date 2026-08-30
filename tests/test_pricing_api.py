@@ -2252,6 +2252,39 @@ async def test_list_prescription_providers_success():
 
 
 @pytest.mark.asyncio
+async def test_list_prescription_providers_stops_when_table_is_unavailable():
+    request = make_request(
+        [FakeResult(scalar=None)],
+        args={"year": "2023", "order": "invalid-after-availability"},
+    )
+
+    response = await list_prescription_providers(request, "HP_RX_CODE", "12345")
+    pricing_response = json.loads(response.body)
+
+    assert pricing_response["items"] == []
+    assert pricing_response["query"]["data_status"] == "unavailable"
+    assert len(request.ctx.sa_session.executions) == 1
+
+
+@pytest.mark.asyncio
+async def test_list_prescription_providers_counts_before_ordering_page():
+    request = make_request(
+        [
+            FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=4),
+        ],
+        args={"year": "2023", "order": "sideways"},
+    )
+
+    with pytest.raises(pricing_module.InvalidUsage):
+        await list_prescription_providers(request, "HP_RX_CODE", "12345")
+
+    assert len(request.ctx.sa_session.executions) == 2
+    count_sql = str(request.ctx.sa_session.executions[1][0][0])
+    assert "count" in count_sql.lower()
+
+
+@pytest.mark.asyncio
 async def test_get_prescription_benchmarks_success():
     request = make_request(
         [
@@ -3258,6 +3291,39 @@ async def test_list_provider_specialties_filters_by_procedure_and_geo():
     assert {"code_system": pricing_module.INTERNAL_PROCEDURE_CODE_SYSTEM, "code": "1607056713"} in pricing_response["query"][
         "resolved_codes"
     ]
+
+
+@pytest.mark.asyncio
+async def test_provider_specialties_radius_dedupes_before_page_and_count(monkeypatch):
+    zip_rows = AsyncMock(
+        return_value=[
+            {"zip5": "10002", "distance_miles": 5.0},
+            {"zip5": "10001", "distance_miles": 3.0},
+            {"zip5": "10002", "distance_miles": 1.0},
+        ]
+    )
+    monkeypatch.setattr(pricing_module, "_zip_radius_rows", zip_rows)
+    request = make_request(
+        [FakeResult(rows=[]), FakeResult(scalar=0)],
+        args={
+            "year": "2023",
+            "zip5": "10001",
+            "zip_radius_miles": "25",
+            "city": "ignored-by-radius",
+        },
+    )
+
+    response = await list_provider_specialties(request)
+    pricing_response = json.loads(response.body)
+
+    assert pricing_response["query"]["zip_candidate_count"] == 2
+    assert len(request.ctx.sa_session.executions) == 2
+    page_sql = str(request.ctx.sa_session.executions[0][0][0])
+    count_sql = str(request.ctx.sa_session.executions[1][0][0])
+    assert "pricing_provider.zip5 IN" in page_sql
+    assert "lower(mrf.pricing_provider.city)" not in page_sql
+    assert page_sql.lower().startswith("select mrf.pricing_provider.provider_type")
+    assert count_sql.lower().startswith("select count(")
 
 
 @pytest.mark.asyncio

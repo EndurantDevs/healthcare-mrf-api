@@ -122,6 +122,7 @@ async def _select_geo(
     target_count,
     descending,
     request_args=None,
+    source_trace_set_hash=None,
 ):
     args_by_name = request_args or {
         "plan_id": "synthetic-plan",
@@ -133,7 +134,7 @@ async def _select_geo(
         code_rows=[{"code_key": 7, "rate_count": rate_count}],
         args=args_by_name,
         snapshot_id="synthetic-snapshot",
-        source_trace_set_hash=None,
+        source_trace_set_hash=source_trace_set_hash,
         network_names=[],
         target_count=target_count,
         descending=descending,
@@ -160,8 +161,8 @@ async def test_strict_geo_cost_rejects_unprovable_complete_set(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_strict_geo_cost_respects_sealed_rate_read_budget(monkeypatch):
-    """Do not let widening cost prefixes bypass the V4 rate-row cap."""
+async def test_strict_geo_cost_rejects_local_rates_at_sealed_read_budget(monkeypatch):
+    """Keep a cap-sized local scope typed without widening its rate read."""
 
     rate_rows = [dict(_rate_row(_PROVIDER_SET_ID, 1, 1, 0)) for _ in range(65)]
     merge_rows = AsyncMock(
@@ -172,12 +173,28 @@ async def test_strict_geo_cost_respects_sealed_rate_read_budget(monkeypatch):
     monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", merge_rows)
     monkeypatch.setattr(
         serving,
-        "_provider_npis_for_sets",
-        AsyncMock(return_value={_PROVIDER_SET_ID: ()}),
+        "_membership_npi_rows",
+        AsyncMock(
+            return_value=[{"npi": _MATCHING_NPI, "_ptg_source_exhausted": True}]
+        ),
     )
-    monkeypatch.setattr(serving, "_membership_location_rows", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        serving,
+        "_v4_sets_by_npi",
+        AsyncMock(return_value={_MATCHING_NPI: (1,)}),
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_shared_provider_code_intersections_from_db",
+        AsyncMock(return_value={1: (7,)}),
+    )
+    monkeypatch.setattr(
+        serving,
+        "_membership_location_rows",
+        AsyncMock(return_value=[]),
+    )
 
-    with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded):
+    with pytest.raises(serving.PTG2LocationScopeError) as exc_info:
         await _select_geo(
             _geo_tables(
                 provider_expansion_rate_page_rows=64,
@@ -188,7 +205,12 @@ async def test_strict_geo_cost_respects_sealed_rate_read_budget(monkeypatch):
             descending=False,
         )
 
+    assert exc_info.value.error_code == "ptg2_location_scope_too_broad"
     assert sum(call.kwargs["limit"] for call in merge_rows.await_args_list) == 64
+    assert all(
+        call.kwargs["provider_set_keys"] == (1,)
+        for call in merge_rows.await_args_list
+    )
 
 
 @pytest.mark.asyncio
