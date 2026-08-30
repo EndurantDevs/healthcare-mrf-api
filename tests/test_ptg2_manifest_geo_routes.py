@@ -98,12 +98,37 @@ async def test_manifest_cost_geo_uses_strict_rate_first_route(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_manifest_cost_geo_refuses_oversized_unfiltered_scope(monkeypatch):
-    """Refuse broad unfiltered work before the reverse-geo database scan."""
+@pytest.mark.parametrize(
+    ("code", "query_overrides", "allows_distance_retry"),
+    (
+        ("36415", {"include_providers": True}, True),
+        ("88305", {"include_providers": True}, True),
+        ("93000", {"include_providers": True}, True),
+        ("93306", {"include_providers": True}, True),
+        ("93458", {"include_providers": True}, True),
+        ("59400", {"include_providers": True}, True),
+        ("36415", {"include_providers": False}, True),
+        (
+            "36415",
+            {
+                "include_providers": True,
+                "taxonomy_code": "207R00000X",
+            },
+            False,
+        ),
+    ),
+)
+async def test_manifest_cost_geo_refuses_oversized_scope_before_geo(
+    monkeypatch,
+    code,
+    query_overrides,
+    allows_distance_retry,
+):
+    """Refuse each broad cost lane before reverse-geo or rate traversal."""
 
     _install_base_dependencies(monkeypatch)
     selector = AsyncMock(
-        side_effect=AssertionError("oversized unfiltered scope must be refused")
+        side_effect=AssertionError("oversized cost scope must be refused")
     )
     monkeypatch.setattr(serving, "_strict_cost_provider_expansion_selection", selector)
     location_lookup = AsyncMock()
@@ -121,23 +146,62 @@ async def test_manifest_cost_geo_refuses_oversized_unfiltered_scope(monkeypatch)
     with pytest.raises(serving.PTG2LocationScopeError) as exc_info:
         await _search(
             args=_query_args(
-                code="36415",
-                include_providers=True,
+                code=code,
                 lat=41.8781,
                 long=-87.6298,
                 radius_miles=25,
                 order_by="total_allowed_amount",
+                **query_overrides,
             ),
             code_rows=[
-                {**_CODE_ROW, "reported_code": "36415", "rate_count": rate_count}
+                {**_CODE_ROW, "reported_code": code, "rate_count": rate_count}
             ],
             serving_tables=serving_tables,
         )
 
     assert exc_info.value.error_code == "ptg2_location_scope_too_broad"
-    assert "order_by=distance" in str(exc_info.value)
+    assert exc_info.value.allows_distance_retry is allows_distance_retry
     selector.assert_not_awaited()
     location_lookup.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("args", "gate_overrides"),
+    (
+        (
+            _query_args(code="36415", order_by="total_allowed_amount", npi=str(_NPI)),
+            {"requested_npi": _NPI},
+        ),
+        (_query_args(code="36415", order_by="distance"), {}),
+        (
+            _query_args(code="36415", order_by="distance", include_providers=False),
+            {"include_providers": False},
+        ),
+        (
+            _query_args(
+                code="36415",
+                order_by="total_allowed_amount",
+                negotiated_rate="125.00",
+            ),
+            {"price_filter_requested": True},
+        ),
+        (_query_args(code="27447", order_by="total_allowed_amount"), {}),
+    ),
+)
+def test_oversized_cost_geo_gate_preserves_bounded_routes(args, gate_overrides):
+    gate_options = {
+        "include_providers": True,
+        "price_filter_requested": False,
+        "requested_npi": None,
+        "explicit_provider_filter_requested": False,
+        **gate_overrides,
+    }
+    assert not serving._uses_oversized_cost_ordered_geo_gate(
+        _production_tables(),
+        args,
+        location_filter_requested=True,
+        **gate_options,
+    )
 
 
 @pytest.mark.asyncio

@@ -3793,39 +3793,17 @@ async def test_plan_pricing_translates_only_online_work_budget_to_503(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("error_class", "error_code", "error_message"),
-    (
-        (
-            PTG2LocationScopeError,
-            "ptg2_location_scope_too_broad",
-            "Cost-ordered geographic provider search is too broad for exact "
-            "online expansion. Narrow the ZIP radius, add an NPI or provider "
-            "taxonomy filter, or set order_by=distance.",
-        ),
-        (
-            pricing_module.PTG2ProviderFilterScopeError,
-            "ptg2_provider_filter_scope_required",
-            "Provider filters with include_providers=false require an NPI or "
-            "supported cost-ordered geographic scope.",
-        ),
-        (
-            pricing_module.PTG2ProviderFilterUnsupportedError,
-            "ptg2_provider_filter_unsupported",
-            "Unsupported PTG2 provider filters: provider_type. Use specialty, "
-            "classification, taxonomy_code, or taxonomy_codes.",
-        ),
-    ),
-)
-async def test_plan_pricing_translates_provider_filter_errors_to_400(
+async def test_plan_pricing_translates_unsupported_provider_filter_to_400(
     monkeypatch,
-    error_class,
-    error_code,
-    error_message,
 ):
+    error_message = (
+        "Unsupported PTG2 provider filters: provider_type. Use specialty, "
+        "classification, taxonomy_code, or taxonomy_codes."
+    )
+
     async def rejected_search(*_args, **_kwargs):
         assert _args[1]["provider_type"] == "Unsupported provider type"
-        raise error_class(error_message)
+        raise pricing_module.PTG2ProviderFilterUnsupportedError(error_message)
 
     monkeypatch.setattr(
         pricing_module,
@@ -3849,25 +3827,49 @@ async def test_plan_pricing_translates_provider_filter_errors_to_400(
     assert endpoint_response.status == 400
     assert json.loads(endpoint_response.body) == {
         "error": {
-            "code": error_code,
+            "code": "ptg2_provider_filter_unsupported",
             "message": error_message,
         }
     }
 
 
 @pytest.mark.asyncio
-async def test_aggregate_geo_scope_error_returns_actionable_400(monkeypatch):
-    message = (
-        "Cost-ordered geographic aggregate search is too broad for exact "
-        "online execution. Narrow the ZIP radius, add an NPI, or use "
-        "view=card with a ready projection."
-    )
-
+@pytest.mark.parametrize(
+    ("rejected_error", "expected_code", "expected_retry_options"),
+    (
+        (
+            PTG2LocationScopeError(
+                "Internal detail must not escape.",
+                allows_distance_retry=True,
+            ),
+            "ptg2_location_scope_too_broad",
+            [{"order_by": "distance", "include_providers": True}],
+        ),
+        (
+            PTG2LocationScopeError("Internal detail must not escape."),
+            "ptg2_location_scope_too_broad",
+            [],
+        ),
+        (
+            pricing_module.PTG2ProviderFilterScopeError(
+                "Internal detail must not escape."
+            ),
+            "ptg2_provider_filter_scope_required",
+            [],
+        ),
+    ),
+)
+async def test_plan_pricing_translates_scope_refusal_to_structured_422(
+    monkeypatch,
+    rejected_error,
+    expected_code,
+    expected_retry_options,
+):
     async def rejected_search(_session, args, _pagination):
         assert args["code"] == "97110"
         assert args["zip5"] == "60611"
         assert args["include_providers"] == "false"
-        raise PTG2LocationScopeError(message)
+        raise rejected_error
 
     monkeypatch.setattr(
         pricing_module,
@@ -3900,13 +3902,13 @@ async def test_aggregate_geo_scope_error_returns_actionable_400(monkeypatch):
 
     endpoint_response = await list_providers_by_procedure(request)
 
-    assert endpoint_response.status == 400
-    assert json.loads(endpoint_response.body) == {
-        "error": {
-            "code": "ptg2_location_scope_too_broad",
-            "message": message,
-        }
-    }
+    assert endpoint_response.status == 422
+    error_document = json.loads(endpoint_response.body)
+    assert error_document["status"] == 422
+    assert error_document["code"] == expected_code
+    assert "error" not in error_document
+    assert "Internal detail" not in error_document["message"]
+    assert error_document["fix_it"]["retry_options"] == expected_retry_options
 
 
 @pytest.mark.asyncio

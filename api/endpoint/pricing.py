@@ -55,6 +55,7 @@ from api.ptg2_capacity_evidence import (
     maybe_attach_capacity_evidence_headers,
 )
 from api.ptg2_serving import (
+    PTG2LocationScopeError,
     PTG2ProviderFilterScopeError,
     PTG2ProviderFilterUnsupportedError,
     _is_unified_address_table,
@@ -12405,14 +12406,49 @@ async def list_providers_by_procedure(request):
                 pagination,
                 **release_selection_args_by_name,
             )
-        except (
-            PTG2ProviderFilterScopeError,
-            PTG2ProviderFilterUnsupportedError,
-        ) as exc:
+        except PTG2ProviderFilterUnsupportedError as exc:
             return _ptg_json_response(
                 request,
                 {"error": {"code": exc.error_code, "message": str(exc)}},
                 status=400,
+            )
+        except PTG2ProviderFilterScopeError as exc:
+            allows_distance_retry = bool(
+                isinstance(exc, PTG2LocationScopeError)
+                and exc.allows_distance_retry
+            )
+            return _ptg_json_response(
+                request,
+                {
+                    "status": 422,
+                    "code": exc.error_code,
+                    "message": (
+                        "This cost-ordered geographic procedure search exceeds "
+                        "the interactive scope limit."
+                        if isinstance(exc, PTG2LocationScopeError)
+                        else "This provider-filtered procedure search exceeds "
+                        "the supported interactive scope."
+                    ),
+                    "fix_it": {
+                        "reason": (
+                            "Use the bounded ascending-distance provider lane."
+                            if allows_distance_retry
+                            else "No verified interactive retry shape is available "
+                            "for this request."
+                        ),
+                        "retry_options": (
+                            [
+                                {
+                                    "order_by": "distance",
+                                    "include_providers": True,
+                                }
+                            ]
+                            if allows_distance_retry
+                            else []
+                        ),
+                    },
+                },
+                status=422,
             )
         except PlanPricingProjectionUnsupported as exc:
             raise InvalidUsage(str(exc)) from exc
