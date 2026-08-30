@@ -521,6 +521,49 @@ async def _assert_initial_archive_resolution(schema, stage_table, stamped, stats
     assert premise_keys == 2
 
 
+async def _assert_existing_archive_rows_skip_formatting(
+    schema,
+    stage_table,
+    monkeypatch,
+):
+    guard_function = "addr_formatted_address_existing_row_guard"
+    await db.status(
+        f"""
+        CREATE FUNCTION {schema}.{guard_function}(
+            first_line text,
+            second_line text,
+            city_name text,
+            state_name text,
+            postal_code text,
+            country_code text
+        )
+        RETURNS text
+        LANGUAGE plpgsql
+        IMMUTABLE
+        AS $function$
+        BEGIN
+            RAISE EXCEPTION 'existing archive row was formatted';
+        END
+        $function$;
+        """
+    )
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(address_canon, "ADDRESS_FORMAT_FUNCTION", guard_function)
+            stats = await resolve_into_archive(
+                stage_table,
+                {**_canonical_stage_field_map(), "country": "'US'"},
+                source_bit=2,
+                priority=1,
+                schema=schema,
+            )
+    finally:
+        await db.status(
+            f"DROP FUNCTION {schema}.{guard_function}(text, text, text, text, text, text);"
+        )
+    assert stats.inserted == stats.provenance_updates == 0
+
+
 async def _assert_archive_resolution_reruns(schema, stage_table, progress_events):
     field_map = {
         **_canonical_stage_field_map(),
@@ -594,6 +637,7 @@ async def test_stamp_and_resolve_addresses_into_archive_v2(monkeypatch):
         schema=schema,
     )
     await _assert_initial_archive_resolution(schema, stage_table, stamped, stats)
+    await _assert_existing_archive_rows_skip_formatting(schema, stage_table, monkeypatch)
     await _assert_archive_resolution_reruns(schema, stage_table, progress_events)
 
 
