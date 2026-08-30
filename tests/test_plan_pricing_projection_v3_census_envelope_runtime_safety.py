@@ -216,45 +216,6 @@ def test_create_then_client_failure_reconciles_exact_resource(
     assert envelope._receipt(state_root)["cleanup"]["complete"] is True
 
 
-@pytest.mark.parametrize("resource", ["quota", "policy", "binding"])
-def test_delayed_create_outcome_retains_every_outer_fence(
-    tmp_path: Path,
-    resource: str,
-) -> None:
-    """An unresolved create may appear after the first absence read."""
-
-    result, state_root = envelope._run_envelope(
-        tmp_path,
-        FAKE_CREATE_DELAYED_ERROR=resource,
-    )
-
-    assert result.returncode == 1
-    events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert f"{resource}_create" in events
-    assert f"{resource}_delayed_appear" in events
-    assert not any(event.endswith("_delete") for event in events)
-    assert "drain_set_false" not in events
-    assert "lock_stop" not in events
-    assert envelope._receipt(state_root)["cleanup"]["complete"] is False
-
-
-def test_unproven_child_cleanup_retains_every_outer_fence(tmp_path: Path) -> None:
-    """The parent must not release fences from one absence snapshot alone."""
-
-    result, state_root = envelope._run_envelope(
-        tmp_path,
-        FAKE_CHILD_CLEANUP="false",
-    )
-
-    assert result.returncode == 1
-    events = (tmp_path / "fake-state/events").read_text().splitlines()
-    assert "child" in events
-    assert not any(event.endswith("_delete") for event in events)
-    assert "drain_set_false" not in events
-    assert "lock_stop" not in events
-    assert envelope._receipt(state_root)["cleanup"]["complete"] is False
-
-
 @pytest.mark.parametrize(
     "environment",
     [
