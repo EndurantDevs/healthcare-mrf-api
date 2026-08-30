@@ -229,6 +229,12 @@ async def test_manifest_distance_page_uses_deep_offset_sentinel(monkeypatch):
 @pytest.mark.asyncio
 async def test_manifest_descending_distance_keeps_exhaustive_floor(monkeypatch):
     _install_base_dependencies(monkeypatch)
+    monkeypatch.delenv(
+        "HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER", raising=False
+    )
+    monkeypatch.delenv(
+        "HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_FLOOR", raising=False
+    )
     location_lookup = AsyncMock(return_value=(set(), {}))
     monkeypatch.setattr(
         serving, "_ptg2_manifest_location_provider_matches", location_lookup
@@ -247,3 +253,34 @@ async def test_manifest_descending_distance_keeps_exhaustive_floor(monkeypatch):
     assert response["items"] == []
     assert location_lookup.await_args.kwargs["candidate_limit"] == 100
     assert location_lookup.await_args.kwargs["require_exhaustive"] is True
+
+
+@pytest.mark.asyncio
+async def test_local_distance_converts_pattern_member_limit_to_budget(monkeypatch):
+    """Normalize pattern membership overflow to the sealed online budget."""
+
+    monkeypatch.setattr(
+        serving,
+        "_v4_sets_by_npi",
+        AsyncMock(
+            side_effect=serving.PTG2ManifestArtifactError(
+                "PTG2 V4 graph selection exceeds max_members"
+            )
+        ),
+    )
+    request = serving._LocalDistanceGraphRequest(
+        1,
+        [{"code_key": 7}],
+        serving._v4_geo_rate_forward_limits(_production_tables()),
+    )
+
+    with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as exc_info:
+        await serving._local_v4_memberships(
+            object(),
+            _production_tables(),
+            (1,),
+            request,
+            serving._LocalDistanceGraphState(),
+        )
+
+    assert exc_info.value.dimension == "retained_memberships"

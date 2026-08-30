@@ -840,7 +840,15 @@ def test_ascending_distance_location_window_stops_at_page_sentinel(order_args):
         {"order_by": "distance", "order": "desc"},
     ),
 )
-def test_nonascending_location_window_retains_density_floor(order_args):
+def test_nonascending_location_window_retains_density_floor(
+    order_args, monkeypatch
+):
+    monkeypatch.delenv(
+        "HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER", raising=False
+    )
+    monkeypatch.delenv(
+        "HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_FLOOR", raising=False
+    )
     pagination = SimpleNamespace(limit=10, offset=0)
 
     assert ptg2_serving._ptg2_manifest_rate_candidate_limit(

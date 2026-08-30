@@ -12712,7 +12712,7 @@ async def _local_v4_memberships(
             max_members=max(remaining, 0),
             max_projection_members=request.forward_limits.maximum_projection_members,
         )
-    except PTG2SharedBlockError as exc:
+    except (PTG2SharedBlockError, PTG2ManifestArtifactError) as exc:
         if not _is_v4_member_limit(exc):
             raise
         raise PTG2OnlineWorkBudgetExceeded("retained_memberships") from exc
