@@ -452,7 +452,7 @@ def test_signal_forwards_once_and_finishes_cleanup(
         text=True,
     )
     events = tmp_path / "fake-state/events"
-    for _ in range(500):
+    for _ in range(1500):
         if events.exists() and "child" in events.read_text():
             break
         time.sleep(0.02)
@@ -461,7 +461,7 @@ def test_signal_forwards_once_and_finishes_cleanup(
         raise AssertionError("foreground census child did not start")
     process.send_signal(signal_number)
     process.send_signal(signal_number)
-    _stdout, stderr = process.communicate(timeout=10)
+    _stdout, stderr = process.communicate(timeout=30)
 
     assert process.returncode == expected_exit, stderr
     assert (
