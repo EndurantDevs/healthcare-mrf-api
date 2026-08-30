@@ -16197,13 +16197,16 @@ hospitals:
   cms_hpt_url: https://www.allinahealth.org/cms-hpt.txt
 - hospital_id: hospital-004916
   name: Owensboro Health Muhlenberg Community Hospital
-  cms_hpt_url: https://www.owensborohealth.org/cms-hpt.txt
+  cms_hpt_url: https://webside.owensborohealth.org/cms-hpt.txt
+  fallback_mrf_url: https://webside.owensborohealth.org/sites/default/files/documents/473944197_owensboro-health-muhlenberg-community-hospital_standardcharges.zip
 - hospital_id: hospital-004917
   name: Owensboro Health Regional Hospital
-  cms_hpt_url: https://www.owensborohealth.org/cms-hpt.txt
+  cms_hpt_url: https://webside.owensborohealth.org/cms-hpt.txt
+  fallback_mrf_url: https://webside.owensborohealth.org/sites/default/files/documents/611286361_owensboro-health-regional-hospital_standardcharges.zip
 - hospital_id: hospital-004918
   name: Owensboro Health Twin Lakes Medical Center
-  cms_hpt_url: https://www.owensborohealth.org/cms-hpt.txt
+  cms_hpt_url: https://webside.owensborohealth.org/cms-hpt.txt
+  fallback_mrf_url: https://webside.owensborohealth.org/sites/default/files/documents/853033915_owensboro-health-twin-lakes-medical-center_standardcharges.zip
 - hospital_id: hospital-004919
   name: Pacific Grove Hospital
   cms_hpt_url: https://www.pacificgrovehospital.com/cms-hpt.txt
