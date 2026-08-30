@@ -15397,7 +15397,6 @@ async def _select_oversized_geo_rate_scope(
     budget.maximum_candidate_members = min(
         budget.maximum_candidate_members,
         _ptg2_manifest_location_match_limit(),
-        budget.caps.maximum_provider_sets,
     )
     local_provider_set_keys = await _oversized_geo_local_provider_sets(
         session,

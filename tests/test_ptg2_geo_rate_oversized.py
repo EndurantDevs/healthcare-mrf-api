@@ -16,7 +16,9 @@ from tests.test_ptg2_geo_rate_prefix import (
 )
 
 
-def _install_local_scope_reads(monkeypatch, rate_rows, local_npi):
+def _install_local_scope_reads(monkeypatch, rate_rows, local_npis):
+    local_provider_set_keys = tuple(range(1, 69))
+
     async def rate_read(*_args, **kwargs):
         provider_set_keys = kwargs["provider_set_keys"]
         matching_rates = (
@@ -40,10 +42,23 @@ def _install_local_scope_reads(monkeypatch, rate_rows, local_npi):
         "rates": AsyncMock(side_effect=rate_read),
         "members": AsyncMock(),
         "locations": AsyncMock(
-            return_value=[{"npi": local_npi, "_ptg_source_exhausted": True}]
+            return_value=[
+                {"npi": npi, "_ptg_source_exhausted": True}
+                for npi in local_npis
+            ]
         ),
-        "sets": AsyncMock(return_value={local_npi: (257,)}),
-        "codes": AsyncMock(return_value={257: (1,)}),
+        "sets": AsyncMock(
+            return_value={
+                npi: (local_provider_set_keys[index % 68],)
+                for index, npi in enumerate(local_npis)
+            }
+        ),
+        "codes": AsyncMock(
+            return_value={
+                provider_set_key: ((1,) if provider_set_key <= 65 else ())
+                for provider_set_key in local_provider_set_keys
+            }
+        ),
         "national": AsyncMock(
             side_effect=AssertionError("oversized selection decoded national rates")
         ),
@@ -89,9 +104,9 @@ def _install_single_set_scope(monkeypatch, rate_rows):
 
 @pytest.mark.asyncio
 async def test_oversized_geo_rate_finds_local_set_after_national_cap(monkeypatch):
-    rate_rows = [_rate_row(rank) for rank in range(257)]
-    local_npi = 358
-    reads_by_kind = _install_local_scope_reads(monkeypatch, rate_rows, local_npi)
+    rate_rows = [_rate_row(rank) for rank in range(65)]
+    local_npis = tuple(range(358, 502))
+    reads_by_kind = _install_local_scope_reads(monkeypatch, rate_rows, local_npis)
     projection_scope = Mock(wraps=serving.v4_graph_taxonomy_projection_scope)
     monkeypatch.setattr(
         serving,
@@ -102,20 +117,23 @@ async def test_oversized_geo_rate_finds_local_set_after_national_cap(monkeypatch
     selection = await serving._select_geo_filtered_rate_prefix(
         object(),
         _production_tables(),
-        code_rows=_code_rows(len(rate_rows)),
+        code_rows=_code_rows(257),
         args={"zip5": "48201", "zip_radius_miles": 30},
         network_names=[],
-        target_count=1,
+        target_count=256,
         descending=False,
     )
 
-    assert selection == serving._GeoRateSelection((rate_rows[-1],), True)
+    assert selection == serving._GeoRateSelection(tuple(rate_rows), True)
     reads_by_kind["locations"].assert_awaited_once()
     assert reads_by_kind["locations"].await_args.kwargs["limit"] == (
-        serving._geo_rate_selection_budget(_production_tables()).caps.maximum_provider_sets
+        serving._ptg2_manifest_location_match_limit()
     )
+    assert len(local_npis) > serving._geo_rate_selection_budget(
+        _production_tables()
+    ).caps.maximum_provider_sets
     reads_by_kind["sets"].assert_awaited_once()
-    assert reads_by_kind["sets"].await_args.args[2] == (local_npi,)
+    assert reads_by_kind["sets"].await_args.args[2] == local_npis
     assert reads_by_kind["sets"].await_args.kwargs["allowed_provider_set_keys"] is None
     assert reads_by_kind["sets"].await_args.kwargs["max_members"] == 65_536
     assert reads_by_kind["sets"].await_args.kwargs["max_projection_members"] == 131_072
@@ -125,10 +143,15 @@ async def test_oversized_geo_rate_finds_local_set_after_national_cap(monkeypatch
         maximum_bytes=4 * 1024 * 1024,
         maximum_batches=32,
     )
-    assert reads_by_kind["codes"].await_args.args[2:] == ((257,), (1,))
+    assert reads_by_kind["codes"].await_args.args[2:] == (
+        tuple(range(1, 69)),
+        (1,),
+    )
     assert reads_by_kind["codes"].await_args.kwargs["max_retained_memberships"] == 257
-    assert reads_by_kind["rates"].await_args.kwargs["provider_set_keys"] == (257,)
-    assert reads_by_kind["rates"].await_args.kwargs["limit"] == 2
+    assert reads_by_kind["rates"].await_args.kwargs["provider_set_keys"] == tuple(
+        range(1, 66)
+    )
+    assert reads_by_kind["rates"].await_args.kwargs["limit"] == 256
     scan_budget = reads_by_kind["rates"].await_args.kwargs["scan_budget"]
     assert scan_budget.maximum_fragments == 256
     assert scan_budget.maximum_raw_payload_bytes == 4 * 1024 * 1024
