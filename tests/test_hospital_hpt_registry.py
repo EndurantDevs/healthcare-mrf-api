@@ -21,6 +21,9 @@ _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-002491": "f7e5a19c5a44e85520da233d3d17025d9c834a8f7b817d9f5b7c4ef6596b6e64",
     "hospital-002911": "dff5b72c99a19b8989184eb65b37de4246c4dd3649097b697830fcd8b22638ab",
     "hospital-003312": "75d4e626daf0db2c1e53cc903f3669d04339bbffb8891f92dd588c7fa3d0316f",
+    "hospital-004916": "c8510071aef0cd3fe464130c0b560eb8fe1d9e54d7e64157d60e2249c476bb96",
+    "hospital-004917": "701e62e52bc2e8b7578ae2efcab4140721e5b79361bb215fcfc97c3e55decaeb",
+    "hospital-004918": "05e6d19688aebd5371f9d00e0e0294242fc39eeec04c4a3449f9c6da0f6cbff8",
     "hospital-004965": "a8a7ac615cb9d18e07dc9967fed29730d16bddee79221c6291f86d6b088e5df7",
     "hospital-004977": "cfd65bf3bb5efc2b8f95d805436b72730f5e36b46cd526feddbdc8d034c9b2d7",
     "hospital-004979": "dee8d2ff24f723f64f41aa8c576ad18113657d7e11b0b59a392c58fd8acb765d",
@@ -82,7 +85,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert "alias_of" not in hospital_by_id["hospital-005625"]
     assert sum("locator_name" in entry for entry in hospitals) == 1_416
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 644
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 37
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 40
     assert {entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry} == set(
         _FALLBACK_URL_SHA256_BY_HOSPITAL_ID
     )
