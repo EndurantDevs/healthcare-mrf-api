@@ -315,13 +315,34 @@ async def test_push_mrf_address_rows_uses_insert_do_nothing_when_enabled(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_push_mrf_duplicate_tolerant_rows_skips_copy_first(monkeypatch):
+async def test_push_mrf_duplicate_tolerant_rows_uses_staged_copy(monkeypatch):
     calls = []
+
+    async def fake_copy_ignore(rows, cls, **kwargs):
+        calls.append((rows, cls, kwargs))
+
+    monkeypatch.delenv("HLTHPRT_MRF_COPY_FIRST_DUPLICATE_TOLERANT_INSERTS", raising=False)
+    monkeypatch.setattr(process_initial, "_copy_ignore_objects", fake_copy_ignore)
+
+    cls = SimpleNamespace(__tablename__="plan_npi_raw_20260612")
+    rows = [{"npi": 1234567890, "checksum_network": 42}]
+    await process_initial._push_mrf_duplicate_tolerant_rows(rows, cls)
+
+    assert calls == [(rows, cls, {"bind_sqlalchemy_types": True})]
+
+
+@pytest.mark.asyncio
+async def test_push_mrf_duplicate_tolerant_rows_falls_back_without_copy(monkeypatch):
+    calls = []
+
+    async def unavailable_copy(*_args, **_kwargs):
+        raise NotImplementedError("copy unavailable")
 
     async def fake_push_objects(rows, cls, **kwargs):
         calls.append((rows, cls, kwargs))
 
     monkeypatch.delenv("HLTHPRT_MRF_COPY_FIRST_DUPLICATE_TOLERANT_INSERTS", raising=False)
+    monkeypatch.setattr(process_initial, "_copy_ignore_objects", unavailable_copy)
     monkeypatch.setattr(process_initial, "push_objects", fake_push_objects)
 
     cls = SimpleNamespace(__tablename__="plan_npi_raw_20260612")

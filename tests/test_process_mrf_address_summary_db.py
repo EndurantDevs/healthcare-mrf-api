@@ -1,12 +1,18 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import asyncio
 import importlib
 import os
 import uuid
 
 import pytest
 
-from db.models import MRFAddress, MRFAddressEvidence, PlanDrugStats
+from db.models import (
+    MRFAddress,
+    MRFAddressEvidence,
+    PlanBenefitsMarketplace,
+    PlanDrugStats,
+)
 from db.models import db
 from process.ext.utils import make_class
 
@@ -85,6 +91,115 @@ async def test_staging_primary_index_keeps_constraint_and_stable_name():
             )
             assert await db.scalar(f"SELECT count(*) FROM {qualified_table};") == 1
             await db.status(f"DROP TABLE {qualified_table};")
+    finally:
+        await db.status(f"DROP TABLE IF EXISTS {qualified_table};")
+
+
+def _marketplace_benefit_row(checksum, label):
+    return {
+        "plan_id": "11111TX0000001",
+        "year": 2026,
+        "issuer_id": 11111,
+        "benefit_position": checksum,
+        "benefit_name": f"Benefit {checksum}",
+        "benefit_label": label,
+        "benefit_value_json": None,
+        "benefit_item_json": {"label": label},
+        "checksum": checksum,
+    }
+
+
+async def _assert_mrf_copy_duplicate_semantics(stage_cls, qualified_table):
+    await process_initial._push_mrf_duplicate_tolerant_rows(
+        [
+            _marketplace_benefit_row(1, "Northstar Original"),
+            _marketplace_benefit_row(1, "Northstar Same Batch Duplicate"),
+        ],
+        stage_cls,
+    )
+    await process_initial._push_mrf_duplicate_tolerant_rows(
+        [
+            _marketplace_benefit_row(1, "Northstar Duplicate"),
+            _marketplace_benefit_row(2, "Bluebird New"),
+        ],
+        stage_cls,
+    )
+    initial_rows = await db.all(
+        f"""
+        SELECT checksum, benefit_label,
+               benefit_value_json::text AS value_json,
+               benefit_value_json IS NULL AS is_sql_null
+          FROM {qualified_table}
+      ORDER BY checksum;
+        """
+    )
+    assert [dict(database_row._mapping) for database_row in initial_rows] == [
+        {
+            "checksum": 1,
+            "benefit_label": "Northstar Original",
+            "value_json": "null",
+            "is_sql_null": False,
+        },
+        {
+            "checksum": 2,
+            "benefit_label": "Bluebird New",
+            "value_json": "null",
+            "is_sql_null": False,
+        },
+    ]
+
+
+async def _assert_mrf_copy_order_and_rollback(stage_cls, qualified_table):
+    ascending_rows = [
+        _marketplace_benefit_row(checksum, "Northstar Batch")
+        for checksum in range(10, 110)
+    ]
+    descending_rows = [
+        _marketplace_benefit_row(checksum, "Bluebird Batch")
+        for checksum in reversed(range(10, 110))
+    ]
+    await asyncio.wait_for(
+        asyncio.gather(
+            process_initial._push_mrf_duplicate_tolerant_rows(
+                ascending_rows, stage_cls
+            ),
+            process_initial._push_mrf_duplicate_tolerant_rows(
+                descending_rows, stage_cls
+            ),
+        ),
+        timeout=30,
+    )
+    assert await db.scalar(f"SELECT count(*) FROM {qualified_table};") == 102
+    await db.status(
+        f"ALTER TABLE {qualified_table} ADD CONSTRAINT copy_atomic_check "
+        "CHECK (checksum <> 999);"
+    )
+    with pytest.raises(Exception, match="copy_atomic_check"):
+        await process_initial._push_mrf_duplicate_tolerant_rows(
+            [
+                _marketplace_benefit_row(3, "Must Roll Back"),
+                _marketplace_benefit_row(999, "Reject"),
+            ],
+            stage_cls,
+        )
+    assert await db.scalar(f"SELECT count(*) FROM {qualified_table};") == 102
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_mrf_staged_copy_is_duplicate_tolerant_ordered_and_atomic(monkeypatch):
+    """Preserve first-writer semantics and rollback the whole staged merge."""
+
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+    suffix = f"copy_fixture_{uuid.uuid4().hex[:8]}"
+    stage_cls = make_class(PlanBenefitsMarketplace, suffix, schema_override=schema)
+    qualified_table = f"{schema}.{stage_cls.__tablename__}"
+    monkeypatch.delenv("HLTHPRT_MRF_COPY_FIRST_DUPLICATE_TOLERANT_INSERTS", raising=False)
+    await db.status(f"DROP TABLE IF EXISTS {qualified_table};")
+    try:
+        await db.create_table(stage_cls.__table__, checkfirst=True)
+        await _assert_mrf_copy_duplicate_semantics(stage_cls, qualified_table)
+        await _assert_mrf_copy_order_and_rollback(stage_cls, qualified_table)
     finally:
         await db.status(f"DROP TABLE IF EXISTS {qualified_table};")
 

@@ -50,6 +50,7 @@ from process.openaddresses import refresh_archive_geocodes_from_openaddresses
 from process.control_lifecycle import mark_control_run
 from process.live_progress import enqueue_live_progress
 from process.plan_summary import rebuild_plan_search_summary
+from process.ptg_parts.copy_load import _copy_ignore_objects
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -1210,7 +1211,11 @@ async def _push_mrf_duplicate_tolerant_rows(rows, cls) -> None:
     if _is_truthy(os.getenv("HLTHPRT_MRF_COPY_FIRST_DUPLICATE_TOLERANT_INSERTS"), ("yes", "y", "true", "1")):
         await push_objects(rows, cls)
         return
-    await push_objects(rows, cls, rewrite=False, use_copy=False)
+    try:
+        await _copy_ignore_objects(rows, cls, bind_sqlalchemy_types=True)
+    except NotImplementedError as exc:
+        logger.warning("MRF staged COPY fallback for %s: %s", cls.__tablename__, exc)
+        await push_objects(rows, cls, rewrite=False, use_copy=False)
 
 
 _MRF_ADDRESS_SUMMARY_UPSERT_SQL = """
@@ -1612,8 +1617,11 @@ async def process_plan(ctx, task):
                                 or len(marketplace_benefit_rows) >= plan_flush_rows
                             ):
                                 await asyncio.gather(
-                                    push_objects(plan_rows, myplan),
-                                    push_objects(marketplace_benefit_rows, myplanbenefitsmarketplace),
+                                    _push_mrf_duplicate_tolerant_rows(plan_rows, myplan),
+                                    _push_mrf_duplicate_tolerant_rows(
+                                        marketplace_benefit_rows,
+                                        myplanbenefitsmarketplace,
+                                    ),
                                 )
                                 plan_rows.clear()
                                 marketplace_benefit_rows.clear()
