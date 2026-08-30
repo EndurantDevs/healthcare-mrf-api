@@ -189,11 +189,7 @@ fn parse_wide_columns(
             }
             _ => continue,
         };
-        if payer_name.is_empty()
-            || plan_name.is_empty()
-            || is_wide_payer_placeholder(payer_name)
-            || is_wide_payer_placeholder(plan_name)
-        {
+        if is_wide_payer_placeholder(payer_name) || is_wide_payer_placeholder(plan_name) {
             return Err(invalid(
                 "wide CSV payer headers must replace payer and plan placeholders",
             ));

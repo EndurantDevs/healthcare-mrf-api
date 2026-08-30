@@ -161,9 +161,11 @@ fn parse_wide_modifier_payers(
         {
             continue;
         }
+        let payer_name = required_text(&payer.payer_name, "modifier payer_name")?.to_owned();
+        let plan_name = required_text(&payer.plan_name, "modifier plan_name")?.to_owned();
         payers.push(ModifierPayerRow {
-            payer_name: Some(payer.payer_name.clone()),
-            plan_name: Some(payer.plan_name.clone()),
+            payer_name: Some(payer_name),
+            plan_name: Some(plan_name),
             description: optional_text(description),
             standard_charge_dollar: optional_decimal(
                 csv_value(record, payer.standard_charge_dollar),
