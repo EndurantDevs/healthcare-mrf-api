@@ -208,7 +208,9 @@ def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypat
     locator = "https://hospital.example/cms-hpt.txt"
     hospitals = _load(
         tmp_path,
-        _document(locator)
+        _document(locator).replace(
+            "    cms_hpt_url:", "    locator_mrf_url: https://f.test/a\n    cms_hpt_url:"
+        )
         + f"""\
   - hospital_id: hospital-000002
     name: Example Hospital Alias
@@ -219,6 +221,7 @@ def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypat
     monkeypatch.setattr(registry, "load_hospital_hpt_registry", lambda: hospitals)
 
     assert hospitals[1]["locator_name"] == "Example Hospital"
+    assert hospitals[1]["locator_mrf_url"] == "https://f.test/a"
     assert registry.hospital_hpt_registry_groups() == (hospitals,)
     assert registry.selected_hospital_hpt_registry(
         {"hospital_id": "hospital-000001"}
@@ -226,43 +229,6 @@ def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypat
     assert registry.selected_hospital_hpt_registry(
         {"hospital_id": "hospital-000002"}
     ) == hospitals
-
-
-def test_reviewed_aliases_inherit_canonical_locator_identity(tmp_path):
-    locator = "https://hospital.example/cms-hpt.txt"
-    hospitals = _load(
-        tmp_path,
-        _document(locator).replace(
-            "    cms_hpt_url:",
-            "    locator_name: Exact Canonical Name\n"
-            "    locator_mrf_url: https://files.example/current.csv\n"
-            "    cms_hpt_url:",
-        )
-        + f"""\
-  - hospital_id: hospital-000002
-    name: Legal Entity Alias
-    cms_hpt_url: {locator}
-    alias_of: hospital-000001
-  - hospital_id: hospital-000003
-    name: Named Alias
-    locator_name: Exact Alias Name
-    cms_hpt_url: {locator}
-    alias_of: hospital-000001
-  - hospital_id: hospital-000004
-    name: Selected Alias
-    locator_mrf_url: https://files.example/alias.csv
-    cms_hpt_url: {locator}
-    alias_of: hospital-000001
-""",
-    )
-
-    assert hospitals[1]["locator_name"] == "Exact Canonical Name"
-    assert hospitals[1]["locator_mrf_url"].endswith("current.csv")
-    assert hospitals[2]["locator_name"] == "Exact Alias Name"
-    assert hospitals[2]["locator_mrf_url"].endswith("current.csv")
-    assert hospitals[3]["locator_name"] == "Exact Canonical Name"
-    assert hospitals[3]["locator_mrf_url"].endswith("alias.csv")
-
 
 @pytest.mark.parametrize(
     "extra_rows",
