@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import signal
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -139,25 +137,96 @@ async def test_checkpoint_precedes_the_first_code_failure(monkeypatch) -> None:
     )
     checkpoints = []
 
-    async def fail_first_code(*_args, **_kwargs):
+    observed_stages = []
+
+    async def fail_first_code(
+        _session,
+        _context,
+        _code_identity,
+        _metrics_by_field,
+        set_stage,
+    ):
+        await set_stage("price_hydration")
         raise RuntimeError("private failure detail")
+
+    async def set_stage(stage, code_ordinal):
+        observed_stages.append((stage, code_ordinal))
 
     monkeypatch.setattr(census, "_has_measured_code", fail_first_code)
 
     with pytest.raises(RuntimeError, match="private failure detail"):
-        await census._measure_codes(object(), context, checkpoints.append)
+        await census._measure_codes(
+            object(),
+            context,
+            checkpoints.append,
+            set_stage,
+        )
 
-    assert len(checkpoints) == 1
-    assert checkpoints[0]["code_identities_processed"] == 0
-    assert checkpoints[0]["codes_with_rates_measured"] == 0
-    assert checkpoints[0]["price_membership_metadata"] == {
+    assert len(checkpoints) == 2
+    assert checkpoints[1]["code_identity_ordinal"] == 1
+    assert checkpoints[1]["code_identity_boundary"] == "before"
+    assert checkpoints[1]["code_identities_processed"] == 0
+    assert checkpoints[1]["codes_with_rates_measured"] == 0
+    assert checkpoints[1]["price_membership_metadata"] == {
         "price_membership_cached_block_count": 0,
         "price_membership_identity_retained_bytes": 0,
         "price_membership_metadata_fragment_count": 0,
         "price_membership_maximum_fragments_per_block": 0,
         "price_membership_singleton_peak_bytes": 0,
     }
-    assert "private-code" not in json.dumps(checkpoints[0])
+    assert observed_stages == [("price_hydration", 1)]
+    assert "private-code" not in json.dumps(checkpoints)
+
+
+@pytest.mark.asyncio
+async def test_code_progress_closes_each_ordinal_without_aliasing(monkeypatch) -> None:
+    """Persist exact before/after progress without retaining code identities."""
+
+    context = SimpleNamespace(
+        state=census._BuildState(hashlib.sha256()),
+        code_identities=[("CPT", "private-one"), ("CPT", "private-two")],
+    )
+    checkpoints = []
+    measured_code_ordinals = []
+
+    async def has_measured_code(
+        _session,
+        _context,
+        _code_identity,
+        metrics_by_field,
+        _set_stage,
+    ):
+        measured_code_ordinals.append(len(measured_code_ordinals) + 1)
+        census._record_metric(metrics_by_field, "normalized_occurrence_rows", 3)
+        if len(measured_code_ordinals) == 2:
+            raise RuntimeError("private failure detail")
+        return True
+
+    monkeypatch.setattr(census, "_has_measured_code", has_measured_code)
+
+    with pytest.raises(RuntimeError, match="private failure detail"):
+        await census._measure_codes(object(), context, checkpoints.append)
+
+    assert [
+        (
+            progress_by_field.get("code_identity_ordinal"),
+            progress_by_field.get("code_identity_boundary"),
+            progress_by_field["code_identities_processed"],
+            progress_by_field["codes_with_rates_measured"],
+        )
+        for progress_by_field in checkpoints
+    ] == [
+        (None, None, 0, 0),
+        (1, "before", 0, 0),
+        (1, "after", 1, 1),
+        (2, "before", 1, 1),
+    ]
+    assert checkpoints[1]["work"]["normalized_occurrence_rows"] == {
+        "total": 0,
+        "maximum_per_code": 0,
+    }
+    assert "private-one" not in json.dumps(checkpoints)
+    assert "private-two" not in json.dumps(checkpoints)
 
 
 def test_failure_retains_only_privacy_safe_stage_and_error_type(
@@ -202,6 +271,62 @@ async def test_database_stage_is_closed_and_bound_to_application_name() -> None:
             transaction.census_database_application_name(run_token, "setup"),
         )
     session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_database_stage_marker_retains_progress_ordinal(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """A database checkpoint must keep the exact privacy-safe code boundary."""
+
+    run_token = "a" * 12
+    setup_name = transaction.census_database_application_name(run_token, "setup")
+    marker = transaction.census_database_application_name(
+        run_token,
+        "price_hydration",
+        19_201,
+    )
+    receipt_by_field = {
+        "database_backend_pid": 41,
+        "database_session_settings": {"application_name": setup_name},
+        "progress": {
+            "code_identity_ordinal": 19_201,
+            "code_identity_boundary": "before",
+        },
+    }
+    sample_by_field = {
+        "application_name": marker,
+        "backend_pid": 41,
+        "backend_memory_context_bytes": 1,
+        "temporary_relation_bytes": 0,
+    }
+    set_stage = AsyncMock(return_value=sample_by_field)
+    writes = []
+    monkeypatch.setattr(diagnostics, "set_census_database_stage", set_stage)
+    monkeypatch.setattr(
+        diagnostics,
+        "write_json",
+        lambda _path, value: writes.append(json.loads(json.dumps(value))),
+    )
+    stages = diagnostics.CensusDatabaseStages(
+        receipt_by_field,
+        tmp_path / "receipt.json",
+        run_token,
+    )
+    session = object()
+
+    assert await stages.checkpoint(session, "price_hydration", 19_201) == marker
+    set_stage.assert_awaited_once_with(
+        session,
+        run_token,
+        "price_hydration",
+        setup_name,
+        19_201,
+    )
+    assert writes[-1]["progress"] == receipt_by_field["progress"]
+    assert writes[-1]["database_application_name"] == marker
+    assert marker.endswith(":19201")
 
 
 def test_database_identity_binds_exact_runtime_and_postgresql_limit() -> None:
@@ -265,78 +390,3 @@ def test_failure_retains_allowlisted_limit_dimension(
         "dimension": error_dimension,
     }
     assert "private-limit-detail" not in receipt_text
-
-
-@pytest.mark.parametrize("signal_number", (signal.SIGINT, signal.SIGTERM))
-def test_process_signal_cancels_then_seals_after_cleanup(
-    monkeypatch,
-    tmp_path,
-    signal_number,
-) -> None:
-    receipt_path = tmp_path / f"signal-{signal_number}.json"
-    _set_census_argv(monkeypatch, receipt_path)
-    monkeypatch.setattr(census, "_source_identity", lambda _args: {})
-
-    async def wait_for_signal(_args, receipt_by_field):
-        census.asyncio.get_running_loop().call_soon(
-            os.kill,
-            os.getpid(),
-            signal_number,
-        )
-        try:
-            await census.asyncio.Event().wait()
-        finally:
-            os.kill(os.getpid(), signal_number)
-            receipt_by_field["rollback_complete"] = True
-            receipt_by_field["temporary_relations_after_rollback"] = []
-
-    monkeypatch.setattr(census, "run_census", wait_for_signal)
-    previous_handler = signal.getsignal(signal_number)
-
-    assert census.census_main() == 128 + signal_number
-    assert signal.getsignal(signal_number) == previous_handler
-    receipt_by_field = json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert receipt_by_field["rollback_complete"] is True
-    assert receipt_by_field["temporary_relations_after_rollback"] == []
-    assert receipt_by_field["error"] == {
-        "type": "_CensusInterrupted",
-        "signal": signal.Signals(signal_number).name,
-    }
-
-
-def test_process_signal_during_final_seal_rewrites_failed_receipt(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    receipt_path = tmp_path / "late-signal.json"
-    _set_census_argv(monkeypatch, receipt_path)
-
-    async def succeed(_args, receipt_by_field):
-        receipt_by_field.update(
-            status="complete",
-            accepted=True,
-            cap_calibration_admissible=True,
-            resource_proof_admissible=True,
-        )
-        return 0
-
-    writes = []
-
-    def signal_during_first_write(path, value):
-        writes.append(json.loads(json.dumps(value)))
-        if len(writes) == 1:
-            os.kill(os.getpid(), signal.SIGTERM)
-        path.write_text(json.dumps(value), encoding="utf-8")
-
-    monkeypatch.setattr(census, "run_census", succeed)
-    monkeypatch.setattr(diagnostics, "write_json", signal_during_first_write)
-
-    assert census.census_main() == 128 + signal.SIGTERM
-    assert len(writes) == 2
-    final_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert final_receipt["cap_calibration_admissible"] is False
-    assert final_receipt["resource_proof_admissible"] is False
-    assert final_receipt["error"] == {
-        "type": "_CensusInterrupted",
-        "signal": "SIGTERM",
-    }

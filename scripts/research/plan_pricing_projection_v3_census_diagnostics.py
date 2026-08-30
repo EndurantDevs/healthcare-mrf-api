@@ -29,6 +29,32 @@ ERROR_DIMENSION_BY_TYPE = {
 DATABASE_PHASE = "measuring database stage"
 DATABASE_MESSAGE = "executing bounded census database stage"
 _REQUIRED_DATABASE_STAGE_KEYS = CENSUS_DATABASE_STAGE_KEYS - {"taxonomy_filter"}
+_PROCESS_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+CENSUS_RECEIPT_CONTRACT = "healthporta.plan-pricing-v3-work-census.v1"
+CENSUS_ACCEPTANCE_AUTHORITY = "outer_envelope_with_zero_child_exit"
+
+
+def seal_source_only(
+    receipt_by_field: dict[str, Any],
+    source_identity: Mapping[str, Any],
+    finished_at: str,
+    elapsed_seconds: float,
+) -> int:
+    """Seal a successful source check as explicitly inadmissible evidence."""
+
+    receipt_by_field.update(
+        status="source_only",
+        mode="source_only",
+        accepted=False,
+        cap_calibration_admissible=False,
+        resource_proof_admissible=False,
+        proof_scope="source_identity_only",
+        finished_at=finished_at,
+        source_after=source_identity,
+        phase="complete",
+        elapsed_seconds=elapsed_seconds,
+    )
+    return 0
 
 
 class _CensusInterrupted(Exception):
@@ -77,7 +103,12 @@ class CensusDatabaseStages:
     previous_stage: str | None = None
     resources_by_stage: dict[str, dict[str, int]] = field(default_factory=dict)
 
-    async def checkpoint(self, session: Any, stage: str) -> str:
+    async def checkpoint(
+        self,
+        session: Any,
+        stage: str,
+        code_ordinal: int | None = None,
+    ) -> str:
         """Persist one closed substage after binding it to PostgreSQL."""
 
         if stage not in CENSUS_DATABASE_STAGE_KEYS:
@@ -92,6 +123,7 @@ class CensusDatabaseStages:
                     "application_name"
                 ]
             ),
+            code_ordinal,
         )
         if int(sample_by_field["backend_pid"]) != self.receipt_by_field.get(
             "database_backend_pid"
@@ -138,6 +170,8 @@ class _CensusSignalState:
         if self.number is not None:
             return
         self.number = number
+        if self.task is None or self.task.done():
+            raise _CensusInterrupted(number)
         if (
             self.loop is not None
             and not self.loop.is_closed()
@@ -212,6 +246,41 @@ def _seal_failure(
     return exc.exit_code if isinstance(exc, _CensusInterrupted) else 1
 
 
+def _write_final_receipt(
+    args: Any,
+    receipt_by_field: dict[str, Any],
+    signal_state: _CensusSignalState,
+    exit_code: int,
+    previous_handler_by_signal: Mapping[int, Any],
+) -> int:
+    """Commit acceptance only after prior signal handlers are restored."""
+
+    exit_code = signal_state.apply_interruption(exit_code)
+    final_receipt_by_field = dict(receipt_by_field)
+    provisional_receipt_by_field = {
+        **final_receipt_by_field,
+        "status": "finalizing",
+        "accepted": False,
+        "cap_calibration_admissible": False,
+        "resource_proof_admissible": False,
+    }
+    try:
+        write_json(args.receipt.resolve(), provisional_receipt_by_field)
+        exit_code = signal_state.apply_interruption(exit_code)
+        for number, previous_handler in previous_handler_by_signal.items():
+            signal.signal(number, previous_handler)
+        write_json(args.receipt.resolve(), final_receipt_by_field)
+        return exit_code
+    except (_CensusInterrupted, KeyboardInterrupt):
+        if signal_state.number is None:
+            signal_state.number = signal.SIGINT
+        for number in _PROCESS_SIGNALS:
+            signal.signal(number, signal_state.interrupt)
+        exit_code = signal_state.apply_interruption(exit_code)
+        write_json(args.receipt.resolve(), receipt_by_field)
+        return exit_code
+
+
 def run_census_process(
     args: Any,
     receipt_by_field: dict[str, Any],
@@ -222,25 +291,40 @@ def run_census_process(
 
     signal_state = _CensusSignalState(receipt_by_field)
     previous_handler_by_signal = {
-        number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)
+        number: signal.getsignal(number) for number in _PROCESS_SIGNALS
     }
     try:
         for number in previous_handler_by_signal:
             signal.signal(number, signal_state.interrupt)
-        exit_code = asyncio.run(signal_state.run(runner, args))
-    except BaseException as exc:
-        exit_code = _seal_failure(args, receipt_by_field, exc, source_identity)
-    exit_code = signal_state.apply_interruption(exit_code)
-    written_exit_code = exit_code
-    try:
+        try:
+            exit_code = asyncio.run(signal_state.run(runner, args))
+        except BaseException as exc:
+            exit_code = _seal_failure(args, receipt_by_field, exc, source_identity)
+        return _write_final_receipt(
+            args,
+            receipt_by_field,
+            signal_state,
+            exit_code,
+            previous_handler_by_signal,
+        )
+    except (_CensusInterrupted, KeyboardInterrupt):
+        if signal_state.number is None:
+            signal_state.number = signal.SIGINT
+        for number in _PROCESS_SIGNALS:
+            signal.signal(number, signal_state.interrupt)
+        interrupted = _CensusInterrupted(signal_state.number)
+        exit_code = _seal_failure(
+            args,
+            receipt_by_field,
+            interrupted,
+            source_identity,
+        )
         write_json(args.receipt.resolve(), receipt_by_field)
+        return exit_code
     finally:
         for number, previous_handler in previous_handler_by_signal.items():
-            signal.signal(number, previous_handler)
-    exit_code = signal_state.apply_interruption(exit_code)
-    if exit_code != written_exit_code:
-        write_json(args.receipt.resolve(), receipt_by_field)
-    return exit_code
+            if signal.getsignal(number) != previous_handler:
+                signal.signal(number, previous_handler)
 
 
 def is_database_receipt_valid(receipt_by_field: Mapping[str, Any]) -> bool:

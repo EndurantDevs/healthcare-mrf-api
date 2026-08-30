@@ -56,6 +56,15 @@ SOURCE_PATHS = tuple(f"api/{module_name}.py" for module_name in """
         ptg2_code_filters ptg2_geo_projection ptg2_serving_utils ptg2_tables
         ptg2_types ptg2_candidate_audit_capacity
     """.split())
+HARNESS_PATHS = tuple(f"scripts/research/{file_name}" for file_name in """
+        plan_pricing_projection_v3_census.py plan_pricing_projection_v3_census_support.py
+        plan_pricing_projection_v3_census_authority.py
+        plan_pricing_projection_v3_census_contract.py
+        plan_pricing_projection_v3_census_diagnostics.py
+        plan_pricing_projection_v3_census_identity.py
+        plan_pricing_projection_v3_census_transaction.py
+        run_plan_pricing_projection_v3_census_envelope.sh
+    """.split())
 PROJECTION_RELATIONS = (
     "plan_pricing_projection_candidate",
     "plan_pricing_card",
@@ -128,15 +137,11 @@ def capture_source_identity(
         observed_head is not None and observed_head != expected_source_sha
     ):
         raise RuntimeError("pricing projection census source identity changed")
-    harness_paths = (
-        driver_path,
-        Path(__file__).resolve(),
-        driver_path.with_name("plan_pricing_projection_v3_census_contract.py"),
-        driver_path.with_name("plan_pricing_projection_v3_census_diagnostics.py"),
-        driver_path.with_name("plan_pricing_projection_v3_census_transaction.py"),
-    )
+    if driver_path.relative_to(root).as_posix() != HARNESS_PATHS[0]:
+        raise RuntimeError("pricing projection census driver identity changed")
     harness_files = [
-        [str(path.relative_to(root)), _sha256_file(path)] for path in harness_paths
+        [relative_path, _sha256_file(root / relative_path)]
+        for relative_path in HARNESS_PATHS
     ]
     harness_manifest_sha256 = _canonical_sha256(harness_files)
     if harness_manifest_sha256 != expected_harness_manifest_sha256:
@@ -488,6 +493,7 @@ def runtime_identity(expected_image_digest: str) -> dict[str, Any]:
         raise RuntimeError("pricing projection census image identity changed")
     return {
         **identity_by_field,
+        "container_name": "census",
         "identity_contract": "immutable-image-plus-source-overlay-v1",
         "external_pod_image_id_attestation_required": True,
     }

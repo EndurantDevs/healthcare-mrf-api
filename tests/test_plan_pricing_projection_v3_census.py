@@ -273,37 +273,16 @@ def test_census_projects_the_four_executable_work_limits() -> None:
 
 def test_census_acceptance_requires_four_positive_work_limits() -> None:
     from tests.test_plan_pricing_projection_v3_census_contract import (
-        _database_receipt,
+        _accepted_inputs,
     )
 
-    receipt_by_field = {
-        **_database_receipt(),
-        "rollback_complete": True,
-        "temporary_relations_after_rollback": [],
-        "postflight": {"accepted": True},
-    }
-    work_by_field = census._empty_metrics()
-    work_by_field["membership_probe_rows"] = {
-        "total": 2,
-        "maximum_per_code": 1,
-    }
-    work_by_field["member_cell_rows"] = {
-        "total": 4,
-        "maximum_per_code": 3,
-    }
-    staged_by_field = _empty_staged_counts()
-    measurement_by_field = {
-        "work": work_by_field,
-        "staged": staged_by_field,
-        "fixed_cap_gates": contract.fixed_cap_gates(work_by_field, staged_by_field),
-        "observed_work_limits": contract.observed_work_limits(work_by_field),
-    }
+    receipt_by_field, measurement_by_field = _accepted_inputs()
 
-    assert contract.is_accepted(receipt_by_field, measurement_by_field, True)
+    assert census._is_accepted(receipt_by_field, measurement_by_field, True)
     measurement_by_field["observed_work_limits"][
         "maximum_code_membership_probe_rows"
     ] = 0
-    assert not contract.is_accepted(receipt_by_field, measurement_by_field, True)
+    assert not census._is_accepted(receipt_by_field, measurement_by_field, True)
 
 
 def test_census_runtime_binds_the_expected_image_digest(monkeypatch) -> None:
@@ -451,44 +430,3 @@ async def test_census_counts_declared_occurrences_without_staged_rates(
         "total": 0,
         "maximum_per_code": 0,
     }
-
-
-def test_census_source_overlay_includes_branch_runtime_dependencies() -> None:
-    assert {
-        "api/plan_pricing_projection_v3.py",
-        "api/plan_pricing_projection_v3_aggregate.py",
-        "api/plan_pricing_projection_v3_code.py",
-        "api/plan_pricing_projection_v3_price.py",
-        "api/plan_pricing_projection_v3_provider.py",
-        "api/plan_pricing_projection_v3_provider_cells.py",
-        "api/plan_pricing_projection_v3_work.py",
-        "api/ptg2_db_serving_v3.py",
-        "api/ptg2_db_sidecars.py",
-        "api/ptg2_serving.py",
-        "api/ptg2_snapshot.py",
-        "api/ptg2_v4_graph.py",
-    } <= set(support.SOURCE_PATHS)
-
-
-def test_census_rejects_a_changed_harness_manifest(monkeypatch) -> None:
-    file_digest = "e" * 64
-    hashed_paths = []
-    source_manifest = support._canonical_sha256(
-        [[source_path, file_digest] for source_path in support.SOURCE_PATHS]
-    )
-
-    def hash_file(path):
-        hashed_paths.append(Path(path).name)
-        return file_digest
-
-    monkeypatch.setattr(support, "_sha256_file", hash_file)
-    monkeypatch.setattr(support, "_observed_git_head", lambda _root: "0" * 40)
-
-    with pytest.raises(RuntimeError, match="harness identity changed"):
-        support.capture_source_identity(
-            Path(census.__file__),
-            "0" * 40,
-            source_manifest,
-            "f" * 64,
-        )
-    assert "plan_pricing_projection_v3_census_diagnostics.py" in hashed_paths

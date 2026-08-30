@@ -9,7 +9,6 @@ from pathlib import Path
 
 import yaml
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPOSITORY_ROOT / "scripts" / "ci" / "shard_pytest_nodeids.py"
 SPEC = importlib.util.spec_from_file_location("shard_pytest_nodeids", SCRIPT_PATH)
@@ -43,6 +42,90 @@ def test_collection_command_has_the_hard_test_process_limit() -> None:
     assert command[:3] == ["timeout", "--foreground", "295s"]
     assert command[3:7] == [sys.executable, "-m", "pytest", "--collect-only"]
     assert command[-2:] == ["--ignore", "tests/capacity.py"]
+
+
+def test_slow_envelope_suites_run_once_across_the_parallel_main_lanes() -> None:
+    """Assign one bounded envelope suite to each existing main lane."""
+
+    workflow = yaml.safe_load(
+        (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    prepush = (REPOSITORY_ROOT / "scripts" / "ci" / "prepush").read_text(
+        encoding="utf-8"
+    )
+    expected = (
+        "tests/test_plan_pricing_projection_v3_census_envelope_admission.py",
+        "tests/test_plan_pricing_projection_v3_census_envelope_interrupts.py",
+        "tests/test_plan_pricing_projection_v3_census_envelope_runtime_safety.py",
+        "tests/test_plan_pricing_projection_v3_census_envelope_safety.py",
+    )
+    base_capacity_paths = tuple(workflow["env"]["CAPACITY_TEST_PATHS"].splitlines())
+    expected_definition = "envelope_test_paths=$'" + "\\n".join(expected) + "'"
+    python_main = prepush.split("run_python_main() {", 1)[1].split(
+        "run_capacity() {", 1
+    )[0]
+    capacity = prepush.split("run_capacity() {", 1)[1].split(
+        "run_python_coverage() {", 1
+    )[0]
+    assert set(expected).isdisjoint(base_capacity_paths)
+    assert "base_capacity_test_paths=$capacity_test_paths" in prepush
+    assert expected_definition in prepush
+    assert "capacity_test_paths+=$'\\n'\"$envelope_test_paths\"" in prepush
+    assert 'collection_args+=(--ignore "$test_path")' in python_main
+    assert 'mapfile -t envelope_tests <<< "$envelope_test_paths"' in python_main
+    assert python_main.count("python scripts/ci/shard_pytest_nodeids.py") == 1
+    assert '"${#envelope_tests[@]}" -eq 4' in python_main
+    assert "local envelope_test=${envelope_tests[$shard]}" in python_main
+    assert python_main.count('"$envelope_test"') == 1
+    assert python_main.count("--cov-append") == 1
+    assert python_main.count("python -m pytest -q -n 4 --dist worksteal") == 1
+    assert python_main.count("export COVERAGE_FILE=") == 1
+    assert python_main.index('"$envelope_test"') < python_main.index(
+        "write-shard-provenance"
+    )
+    assert 'mapfile -t capacity_tests <<< "$base_capacity_test_paths"' in capacity
+    assert capacity.count("python -m pytest -q -n 4 --dist worksteal") == 1
+    assert "--cov-append" not in capacity
+    assert '"${capacity_tests[@]}"' in capacity
+    for test_path in expected:
+        assert prepush.count(test_path) == 1
+
+
+def test_capacity_lane_publishes_one_complete_coverage_artifact() -> None:
+    """Publish the original bounded capacity lane as one exact artifact."""
+
+    workflow = yaml.safe_load(
+        (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    prepush = (REPOSITORY_ROOT / "scripts" / "ci" / "prepush").read_text(
+        encoding="utf-8"
+    )
+    capacity = prepush.split("run_capacity() {", 1)[1].split(
+        "run_python_coverage() {", 1
+    )[0]
+    capacity_job = workflow["jobs"]["capacity-evidence"]
+    capacity_uploads = [
+        step
+        for step in capacity_job["steps"]
+        if step.get("uses", "").startswith("actions/upload-artifact@")
+    ]
+
+    assert capacity.count("export COVERAGE_FILE=") == 1
+    assert capacity.count("write-shard-provenance") == 1
+    assert capacity.index('"${capacity_tests[@]}"') < capacity.index(
+        "write-shard-provenance"
+    )
+    assert capacity_job["timeout-minutes"] == 10
+    assert len(capacity_uploads) == 1
+    assert capacity_uploads[0]["with"]["name"] == "mrf-python-coverage-capacity"
+    assert capacity_uploads[0]["with"]["path"].splitlines() == [
+        ".coverage.capacity",
+        ".coverage-provenance.capacity.json",
+    ]
 
 
 def test_cli_collects_and_assigns_each_temporary_test_once(tmp_path: Path) -> None:
@@ -135,6 +218,7 @@ def test_plan_pricing_projection_postgres_runs_in_core_with_its_dsn() -> None:
         "tests/test_plan_pricing_projection_v3_staging_postgres.py",
         "tests/test_plan_pricing_projection_v3_differential_postgres.py",
         "tests/test_plan_pricing_projection_v3_census_postgres.py",
+        "tests/test_plan_pricing_projection_v3_census_signal_postgres.py",
         "tests/test_plan_pricing_projection_v3_work_postgres.py",
         "tests/test_ptg2_factorized_card_postgres.py",
     ):
@@ -170,9 +254,12 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
     assert "scripts/ci/shard_pytest_nodeids.py" in prepush
     assert "mrf-python-coverage-main-${{ matrix.shard-index }}" in workflow
     assert "pattern: mrf-python-coverage-main-*" in workflow
-    assert yaml.safe_load(workflow)["jobs"]["address-canonical-db-tests"][
-        "timeout-minutes"
-    ] == 15
+    assert (
+        yaml.safe_load(workflow)["jobs"]["address-canonical-db-tests"][
+            "timeout-minutes"
+        ]
+        == 15
+    )
     assert "mrf-python-coverage-postgres-${{ matrix.shard }}" in workflow
     assert "pattern: mrf-python-coverage-postgres-*" in workflow
     assert 'scripts/ci/prepush postgres "${{ matrix.shard }}"' in workflow

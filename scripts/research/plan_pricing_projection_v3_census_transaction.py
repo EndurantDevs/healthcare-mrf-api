@@ -71,6 +71,18 @@ TEMP_RELATIONS = (
     "plan_pricing_eligible_member_cell_stage",
     "plan_pricing_set_cell_stage",
 )
+STAGED_PRICE_METRICS_SQL = """
+    WITH price_set_atoms AS MATERIALIZED (
+        SELECT binding_ordinal, price_set_id, SUM(rate_multiplicity)::bigint
+                   AS atom_count
+          FROM plan_pricing_price_rate_stage
+         GROUP BY binding_ordinal, price_set_id
+    )
+    SELECT COALESCE(SUM(atom_count), 0)::bigint AS staged_price_atom_membership_rows,
+           COALESCE(MAX(atom_count), 0)::bigint
+               AS maximum_price_key_atom_membership_rows
+      FROM price_set_atoms
+"""
 _Result = TypeVar("_Result")
 
 
@@ -86,14 +98,25 @@ def census_database_run_token(runtime_by_field: Mapping[str, Any]) -> str:
     return hashlib.sha256(identity.encode()).hexdigest()[:12]
 
 
-def census_database_application_name(run_token: str, stage: str) -> str:
+def census_database_application_name(
+    run_token: str,
+    stage: str,
+    code_ordinal: int | None = None,
+) -> str:
     """Return one PostgreSQL-safe exact-run stage marker."""
 
     if not CENSUS_DATABASE_RUN_TOKEN_PATTERN.fullmatch(run_token):
         raise ValueError("pricing projection census database identity is invalid")
     if stage not in CENSUS_DATABASE_STAGE_KEYS and stage != "setup":
         raise ValueError("pricing projection census database stage is invalid")
-    application_name = f"{CENSUS_DATABASE_APPLICATION_PREFIX}:{run_token}:{stage}"
+    if code_ordinal is not None and (
+        type(code_ordinal) is not int or code_ordinal <= 0
+    ):
+        raise ValueError("pricing projection census code ordinal is invalid")
+    ordinal_suffix = "" if code_ordinal is None else f":{code_ordinal}"
+    application_name = (
+        f"{CENSUS_DATABASE_APPLICATION_PREFIX}:{run_token}:{stage}{ordinal_suffix}"
+    )
     if len(application_name.encode()) > 63:
         raise ValueError("pricing projection census database stage is too long")
     return application_name
@@ -167,10 +190,15 @@ async def set_census_database_stage(
     run_token: str,
     stage: str,
     expected_previous_application_name: str,
+    code_ordinal: int | None = None,
 ) -> dict[str, int | str]:
     """Bind one exact-run substage and sample only the owning backend."""
 
-    application_name = census_database_application_name(run_token, stage)
+    application_name = census_database_application_name(
+        run_token,
+        stage,
+        code_ordinal,
+    )
     sample_result = await session.execute(text("""
             SELECT current_setting('application_name') AS application_name,
                    pg_backend_pid() AS backend_pid,

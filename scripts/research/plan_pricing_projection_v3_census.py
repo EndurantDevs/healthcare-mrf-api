@@ -30,15 +30,16 @@ from scripts.research.plan_pricing_projection_v3_census_contract import (
     census_parser as _census_parser,
     expected_target as _expected_target,
     fixed_cap_gates as _fixed_cap_gates,
-    is_accepted as _is_accepted,
+    is_cardinality_candidate_accepted as _is_accepted,
     observed_work_limits as _observed_work_limits,
     require_expected_target as _require_expected_target,
     seal_cardinality_census,
-    seal_source_only,
 )
 from scripts.research.plan_pricing_projection_v3_census_diagnostics import (
+    CENSUS_RECEIPT_CONTRACT,
     CensusDatabaseStages,
     run_census_process,
+    seal_source_only,
 )
 from scripts.research.plan_pricing_projection_v3_census_support import (
     ReleaseInput,
@@ -51,6 +52,7 @@ from scripts.research.plan_pricing_projection_v3_census_support import (
     runtime_identity,
 )
 from scripts.research.plan_pricing_projection_v3_census_transaction import (
+    STAGED_PRICE_METRICS_SQL as _STAGED_PRICE_METRICS_SQL,
     census_database_run_token,
     declared_occurrence_rows as _declared_occurrence_rows,
     price_membership_cache_counts as _price_membership_cache_counts,
@@ -58,25 +60,11 @@ from scripts.research.plan_pricing_projection_v3_census_transaction import (
     rollback_only,
 )
 
-RECEIPT_CONTRACT = "healthporta.plan-pricing-v3-work-census.v1"
 OPT_IN_ENV = "HLTHPRT_PLAN_PRICING_V3_CENSUS"
-CHECKPOINT_INTERVAL = 64
 MAX_CENSUS_RUNTIME_SECONDS = 12 * 60 * 60
 DIAGNOSTIC_CODE_MEMBERSHIP_LIMIT = 8_000_000
 DIAGNOSTIC_CODE_MEMBER_CELL_LIMIT = 8_000_000
 MEASURED_WORK_FIELDS = tuple(sorted(EXPECTED_WORK_FIELD_KEYS))
-_STAGED_PRICE_METRICS_SQL = """
-    WITH price_set_atoms AS MATERIALIZED (
-        SELECT binding_ordinal, price_set_id, SUM(rate_multiplicity)::bigint
-                   AS atom_count
-          FROM plan_pricing_price_rate_stage
-         GROUP BY binding_ordinal, price_set_id
-    )
-    SELECT COALESCE(SUM(atom_count), 0)::bigint AS staged_price_atom_membership_rows,
-           COALESCE(MAX(atom_count), 0)::bigint
-               AS maximum_price_key_atom_membership_rows
-      FROM price_set_atoms
-"""
 
 
 @dataclass(frozen=True)
@@ -243,39 +231,51 @@ async def _measure_codes(
 ) -> tuple[dict[str, dict[str, int]], int]:
     metrics_by_field = _empty_metrics()
     measured_code_count = 0
-    checkpoint(
-        {
+
+    def save_progress(
+        code_identity_ordinal: int | None,
+        code_identity_boundary: str | None,
+        code_identities_processed: int,
+    ) -> None:
+        """Persist one privacy-safe code boundary."""
+
+        progress_by_field: dict[str, Any] = {
             "code_identity_count": len(context.code_identities),
-            "code_identities_processed": 0,
-            "codes_with_rates_measured": 0,
-            "work": metrics_by_field,
+            "code_identities_processed": code_identities_processed,
+            "codes_with_rates_measured": measured_code_count,
+            "work": {
+                field_name: dict(metric_by_field)
+                for field_name, metric_by_field in metrics_by_field.items()
+            },
             "price_membership_metadata": _price_membership_cache_counts(context.state),
             "memory": memory_sample(),
         }
-    )
+        if code_identity_ordinal is not None:
+            progress_by_field.update(
+                code_identity_ordinal=code_identity_ordinal,
+                code_identity_boundary=code_identity_boundary,
+            )
+        checkpoint(progress_by_field)
+
+    save_progress(None, None, 0)
     for code_ordinal, code_identity in enumerate(context.code_identities, start=1):
+
+        async def code_stage(stage: str, ordinal: int = code_ordinal) -> Any:
+            """Bind one database stage to the active code ordinal."""
+
+            return await set_stage(stage, ordinal)
+
+        save_progress(code_ordinal, "before", code_ordinal - 1)
         measured_code_count += int(
             await _has_measured_code(
                 session,
                 context,
                 code_identity,
                 metrics_by_field,
-                set_stage,
+                code_stage if set_stage is not None else None,
             )
         )
-        if code_ordinal % CHECKPOINT_INTERVAL == 0:
-            checkpoint(
-                {
-                    "code_identity_count": len(context.code_identities),
-                    "code_identities_processed": code_ordinal,
-                    "codes_with_rates_measured": measured_code_count,
-                    "work": metrics_by_field,
-                    "price_membership_metadata": (
-                        _price_membership_cache_counts(context.state)
-                    ),
-                    "memory": memory_sample(),
-                }
-            )
+        save_progress(code_ordinal, "after", code_ordinal)
         await asyncio.sleep(0)
     return metrics_by_field, measured_code_count
 
@@ -408,7 +408,11 @@ async def _execute_census(
                 session,
                 args,
                 checkpoint,
-                lambda stage: database_stages.checkpoint(session, stage),
+                lambda stage, code_ordinal=None: database_stages.checkpoint(
+                    session,
+                    stage,
+                    code_ordinal,
+                ),
             )
             await database_stages.checkpoint(session, "measurement_complete")
             return measured_result
@@ -481,7 +485,7 @@ def census_main() -> int:
 
     args = _census_parser(__doc__).parse_args()
     receipt_by_field: dict[str, Any] = {
-        "contract": RECEIPT_CONTRACT,
+        "contract": CENSUS_RECEIPT_CONTRACT,
         "status": "failed",
         "accepted": False,
         "mode": "source_only" if args.source_only else "cardinality_census",

@@ -1,11 +1,13 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Fail-closed projection-row and postflight census support contracts."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from scripts.research import plan_pricing_projection_v3_census as census
 from scripts.research import plan_pricing_projection_v3_census_support as support
 
 
@@ -81,3 +83,46 @@ async def test_postflight_sets_a_bounded_statement_timeout(monkeypatch) -> None:
     assert "SET LOCAL statement_timeout = '20min'" in {
         str(call.args[0]) for call in session.execute.await_args_list
     }
+
+
+def test_census_source_overlay_includes_branch_runtime_dependencies() -> None:
+    assert {
+        "api/plan_pricing_projection_v3.py",
+        "api/plan_pricing_projection_v3_aggregate.py",
+        "api/plan_pricing_projection_v3_code.py",
+        "api/plan_pricing_projection_v3_price.py",
+        "api/plan_pricing_projection_v3_provider.py",
+        "api/plan_pricing_projection_v3_provider_cells.py",
+        "api/plan_pricing_projection_v3_work.py",
+        "api/ptg2_db_serving_v3.py",
+        "api/ptg2_db_sidecars.py",
+        "api/ptg2_serving.py",
+        "api/ptg2_snapshot.py",
+        "api/ptg2_v4_graph.py",
+    } <= set(support.SOURCE_PATHS)
+
+
+def test_census_rejects_a_changed_harness_manifest(monkeypatch) -> None:
+    file_digest = "e" * 64
+    hashed_paths = []
+    source_manifest = support._canonical_sha256(
+        [[source_path, file_digest] for source_path in support.SOURCE_PATHS]
+    )
+
+    def hash_file(path):
+        hashed_paths.append(Path(path).name)
+        return file_digest
+
+    monkeypatch.setattr(support, "_sha256_file", hash_file)
+    monkeypatch.setattr(support, "_observed_git_head", lambda _root: "0" * 40)
+
+    with pytest.raises(RuntimeError, match="harness identity changed"):
+        support.capture_source_identity(
+            Path(census.__file__),
+            "0" * 40,
+            source_manifest,
+            "f" * 64,
+        )
+    assert "plan_pricing_projection_v3_census_diagnostics.py" in hashed_paths
+    assert "plan_pricing_projection_v3_census_authority.py" in hashed_paths
+    assert "run_plan_pricing_projection_v3_census_envelope.sh" in hashed_paths
