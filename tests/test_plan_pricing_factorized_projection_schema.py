@@ -113,10 +113,10 @@ def test_factorized_downgrade_refuses_immutable_v3_candidates(monkeypatch) -> No
     assert "CHECK (contract_version = 'plan_pricing_card_v2')" in sql
 
 
-def test_factorized_projection_is_the_unique_repository_head() -> None:
+def test_factorized_projection_precedes_the_unique_repository_head() -> None:
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260828120000_plan_pricing_factorized_projection"
+        "20260830100000_provider_directory_rooted_partial_lineage"
     ]
     factorized = script.get_revision(
         "20260828120000_plan_pricing_factorized_projection"
