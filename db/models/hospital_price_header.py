@@ -52,9 +52,14 @@ class HospitalPriceVersion(Base, JSONOutputMixin):
         ),
         CheckConstraint(
             "version_id ~ '^[0-9a-f]{64}$' "
-            "AND parser_contract_sha256 ~ '^[0-9a-f]{64}$' "
             "AND semantic_sha256 ~ '^[0-9a-f]{64}$' "
             "AND source_format IN ('json', 'csv-tall', 'csv-wide') "
+            "AND ((parser_contract_sha256 IN ("
+            "'6de516d11a99e85c00b9fe6488698a2a165436bf39d4351a0c54f58729150a66', "
+            "'3857e492234361a91ebf6baa8c0c0d8832427b4bf5fce87729f15cd767c9be75') "
+            "AND npi_count > 0 AND attester_name IS NOT NULL) OR ("
+            "parser_contract_sha256 = "
+            "'0048bd71229567de7ab5cbed73e7547d6718140dd8c4c9e39e3816c9798b8699' "
             "AND ((source_format = 'json' AND template_version IN "
             "('2.2.0', '2.2.1', '3.0.0')) OR (source_format IN "
             "('csv-tall', 'csv-wide') AND template_version IN "
@@ -62,7 +67,7 @@ class HospitalPriceVersion(Base, JSONOutputMixin):
             "AND ((template_version = '3.0.0' AND npi_count > 0 "
             "AND attester_name IS NOT NULL) OR (template_version IN "
             "('2.0.0', '2.2.0', '2.2.1') AND npi_count = 0 "
-            "AND attester_name IS NULL)) "
+            "AND attester_name IS NULL)))) "
             "AND location_count > 0 AND license_count > 0 "
             "AND service_count > 0 AND charge_count > 0 "
             "AND payer_charge_count >= 0",
