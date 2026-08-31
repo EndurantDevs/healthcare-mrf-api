@@ -93,7 +93,14 @@ async def test_control_catalog_falls_back_on_optional_database_failures(
 
     catalog_map = await control_catalog.provider_directory_control_catalog()
 
-    assert catalog_map == static_map
+    assert catalog_map == (
+        enriched_map
+        if failed_operation == "selection"
+        else {
+            **static_map,
+            "profile_selection_request": selection_payload,
+        }
+    )
 
 
 @asynccontextmanager
