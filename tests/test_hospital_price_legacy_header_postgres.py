@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 import uuid
 
 import asyncpg
@@ -48,6 +49,10 @@ def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
     assert migration.down_revision == (
         "20260830100000_provider_directory_rooted_partial_lineage"
     )
+    migration_sql = inspect.getsource(migration.upgrade)
+    assert HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256 in migration_sql
+    assert HOSPITAL_MRF_PACKED_V2_PARSER_CONTRACT_SHA256 in migration_sql
+    assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in migration_sql
 
 
 async def _insert_header(
