@@ -35,6 +35,9 @@ from tests.test_provider_directory_profile_uhc_flex import (
     GRAPH_ENDPOINT_ID,
     OFFICIAL_SOURCE_ID,
 )
+from tests.provider_directory_profile_uhc_flex_test_support import (
+    _rooted_readiness_record,
+)
 from process.provider_directory_rooted_graph_source_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
 )
@@ -130,29 +133,6 @@ def test_dataset_row_readiness_accepts_date_projection_and_json_text() -> None:
 
     dataset_row["dataset_scoped_ready"] = False
     assert not flex_profile.is_uhc_flex_dataset_row_ready(dataset_row)
-
-
-def _rooted_readiness_record(**overrides: object) -> SimpleNamespace:
-    metadata = _rooted_metadata()
-    readiness_by_field: dict[str, object] = {
-        "dataset_id": GRAPH_DATASET_ID,
-        "endpoint_id": GRAPH_ENDPOINT_ID,
-        "source_id": PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
-        "source_authority_id": "unitedhealthcare",
-        "dataset_hash": "5" * 64,
-        "resource_count": 8,
-        "resource_counts": metadata["resource_counts"],
-        "semantic_projection_as_of": "2026-08-09",
-        "admission_id": metadata["admission_id"],
-        "operation_key": "6" * 64,
-        "publication_kind": "rooted_combined",
-        "cohort_complete": True,
-        "rooted_graph_complete": True,
-        "endpoint_collection_complete": False,
-        "endpoint_complete": False,
-    }
-    readiness_by_field.update(overrides)
-    return SimpleNamespace(**readiness_by_field)
 
 
 def test_rooted_metadata_accepts_legacy_distinct_or_rooted_equal_lineage() -> None:
@@ -265,6 +245,8 @@ def test_rooted_metadata_roundtrip_uses_exact_unordered_family_set() -> None:
     fence_dataset = SimpleNamespace(
         dataset_scoped_ready=True,
         dataset_scoped_variant=ROOTED_COMBINED_VARIANT,
+        dataset_scoped_cohort_complete=readiness.cohort_complete,
+        dataset_scoped_retry_exhausted_count=readiness.retry_exhausted_count,
         dataset_id=readiness.dataset_id,
         endpoint_id=readiness.endpoint_id,
         source_id=readiness.source_id,
@@ -421,6 +403,8 @@ def test_fence_readiness_rejects_closed_completion_drift() -> None:
     dataset = SimpleNamespace(
         dataset_scoped_ready=True,
         dataset_scoped_variant=LEGACY_PRACTITIONER_VARIANT,
+        dataset_scoped_cohort_complete=readiness.cohort_complete,
+        dataset_scoped_retry_exhausted_count=readiness.retry_exhausted_count,
         dataset_id=readiness.dataset_id,
         endpoint_id=readiness.endpoint_id,
         source_id=readiness.source_id,
@@ -433,6 +417,38 @@ def test_fence_readiness_rejects_closed_completion_drift() -> None:
     )
     assert flex_profile.is_uhc_flex_fence_dataset_ready(dataset, readiness)
     readiness.endpoint_complete = True
+    assert not flex_profile.is_uhc_flex_fence_dataset_ready(dataset, readiness)
+
+
+@pytest.mark.parametrize(
+    "dataset_cohort_complete, readiness_cohort_complete, retry_exhausted_count",
+    ((True, False, 1), (False, True, 0)),
+)
+def test_fence_readiness_rejects_cohort_completion_drift(
+    dataset_cohort_complete: bool,
+    readiness_cohort_complete: bool,
+    retry_exhausted_count: int,
+) -> None:
+    readiness = _readiness_record(
+        cohort_complete=readiness_cohort_complete,
+        retry_exhausted_count=retry_exhausted_count,
+    )
+    dataset = SimpleNamespace(
+        dataset_scoped_ready=True,
+        dataset_scoped_variant=LEGACY_PRACTITIONER_VARIANT,
+        dataset_scoped_cohort_complete=dataset_cohort_complete,
+        dataset_scoped_retry_exhausted_count=retry_exhausted_count,
+        dataset_id=readiness.dataset_id,
+        endpoint_id=readiness.endpoint_id,
+        source_id=readiness.source_id,
+        dataset_hash=readiness.dataset_hash,
+        resource_count=readiness.resource_count,
+        semantic_projection_as_of=readiness.semantic_projection_as_of,
+        source_authority_id=readiness.source_authority_id,
+        admission_id=readiness.admission_id,
+        operation_key=readiness.operation_key,
+        reviewed_root_policy=ReviewedRootPolicy(1),
+    )
     assert not flex_profile.is_uhc_flex_fence_dataset_ready(dataset, readiness)
 
 

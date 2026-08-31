@@ -6728,11 +6728,7 @@ def _scan_provider_directory_override(
     }
 
 
-def _source_row_from_seed(seed_row: dict[str, Any]) -> dict[str, Any]:
-    """Run the source row from seed step within provider-directory ingestion."""
-    now = _now()
-    api_base = _clean_text(seed_row.get("api_base"))
-    canonical_api_base = _canonical_base(api_base)
+def _source_seed_metadata(seed_row: dict[str, Any]) -> dict[str, Any]:
     metadata = {
         "external_seed_id": _clean_text(seed_row.get("id")),
         "note": _clean_text(seed_row.get("note")),
@@ -6747,30 +6743,42 @@ def _source_row_from_seed(seed_row: dict[str, Any]) -> dict[str, Any]:
             AMERIHEALTH_CARITAS_STALE_GENERIC_BASE
         ]
         metadata["provider_directory_confirmed_catalog_url"] = AMERIHEALTH_CARITAS_DOC_URL
-    override = (
-        _aetna_provider_directory_override(seed_row)
-        or _alohr_provider_directory_override(seed_row)
-        or _cigna_provider_directory_override(seed_row)
-        or _caresource_provider_directory_override(seed_row)
-        or _centene_provider_directory_override(seed_row)
-        or _amerihealth_caritas_provider_directory_override(seed_row)
-        or _molina_provider_directory_override(seed_row)
-        or _uhc_provider_directory_override(seed_row)
-        or _el_dorado_provider_directory_override(seed_row)
-        or _michigan_provider_directory_override(seed_row)
-        or _washington_provider_directory_override(seed_row)
-        or _state_public_provider_directory_override(seed_row)
-        or _maine_provider_directory_override(seed_row)
-        or _hap_provider_directory_override(seed_row)
-        or _humana_provider_directory_override(seed_row)
-        or _iehp_provider_directory_override(seed_row)
-        or _scan_provider_directory_override(seed_row)
+    return metadata
+
+
+def _source_seed_override(seed_row: dict[str, Any]) -> dict[str, Any] | None:
+    override_builders = (
+        _aetna_provider_directory_override,
+        _alohr_provider_directory_override,
+        _cigna_provider_directory_override,
+        _caresource_provider_directory_override,
+        _centene_provider_directory_override,
+        _amerihealth_caritas_provider_directory_override,
+        _molina_provider_directory_override,
+        _uhc_provider_directory_override,
+        _el_dorado_provider_directory_override,
+        _michigan_provider_directory_override,
+        _washington_provider_directory_override,
+        _state_public_provider_directory_override,
+        _maine_provider_directory_override,
+        _hap_provider_directory_override,
+        _humana_provider_directory_override,
+        _iehp_provider_directory_override,
+        _scan_provider_directory_override,
     )
-    if override:
-        api_base = override["api_base"]
-        canonical_api_base = override["canonical_api_base"]
-        metadata = {**metadata, **override["metadata"]}
-    endpoint_overrides = override.get("endpoints", {}) if override else {}
+    return next(
+        (override for builder in override_builders if (override := builder(seed_row))),
+        None,
+    )
+
+
+def _normalize_source_seed_base(
+    seed_row: dict[str, Any],
+    api_base: str | None,
+    canonical_api_base: str | None,
+    metadata: dict[str, Any],
+    endpoint_overrides: dict[str, Any],
+) -> tuple[str | None, str | None, dict[str, Any]]:
     parent_api_base = _resource_or_metadata_parent_base(api_base)
     if parent_api_base and _canonical_base(parent_api_base) != canonical_api_base:
         previous_api_base = api_base
@@ -6785,20 +6793,73 @@ def _source_row_from_seed(seed_row: dict[str, Any]) -> dict[str, Any]:
         )
         api_base = parent_api_base
         canonical_api_base = _canonical_base(parent_api_base)
-    source_identity_api_base = (
-        override.get("source_identity_api_base")
-        if override
-        else None
-    ) or api_base
-    source_id = _stable_source_id(
-        {
-            **seed_row,
-            "api_base": source_identity_api_base,
-        }
+    return api_base, canonical_api_base, endpoint_overrides
+
+
+def _source_seed_endpoint_fields(
+    seed_row: dict[str, Any], endpoint_overrides: dict[str, Any]
+) -> dict[str, str | None]:
+    endpoint_fields = (
+        "endpoint_insurance_plan",
+        "endpoint_practitioner",
+        "endpoint_practitioner_role",
+        "endpoint_organization",
+        "endpoint_organization_affiliation",
+        "endpoint_location",
+        "endpoint_healthcare_service",
+        "endpoint_network",
+        "endpoint_endpoint",
     )
     return {
-        "source_id": source_id,
-        "org_tin": _clean_text(seed_row.get("org_tin")),
+        field_name: _clean_text(
+            endpoint_overrides.get(field_name)
+            if field_name in endpoint_overrides
+            else seed_row.get(field_name)
+        )
+        for field_name in endpoint_fields
+    }
+
+
+def _source_seed_direct_fields(seed_row: dict[str, Any]) -> dict[str, Any]:
+    clean_field_by_output = {
+        "fhir_version": "fhir_version",
+        "compliance_flag": "compliance_flag",
+        "violation_type": "violation_type",
+        "violation_detail": "violation_detail",
+        "data_quality_flag": "data_quality_flag",
+        "data_quality_sample_npi": "data_quality_sample_npi",
+        "data_quality_practitioner_count": "data_quality_practitioner_count",
+        "data_quality_checked": "data_quality_checked",
+        "seed_source": "source",
+        "seed_source_detail": "source_detail",
+        "seed_source_url": "source_url",
+        "seed_source_date": "source_date",
+        "seed_row_id": "id",
+        "id_provider_alt": "id_provider_alt",
+        "team_status": "team_status",
+    }
+    bool_fields = (
+        "is_medicare_advantage",
+        "is_medicaid_mco",
+        "is_chip",
+        "is_qhp",
+    )
+    return {
+        **{
+            output_name: _clean_text(seed_row.get(seed_name))
+            for output_name, seed_name in clean_field_by_output.items()
+        },
+        **{
+            field_name: _bool_from_seed(seed_row.get(field_name))
+            for field_name in bool_fields
+        },
+    }
+
+
+def _source_seed_override_fields(
+    seed_row: dict[str, Any], override: dict[str, Any] | None
+) -> dict[str, Any]:
+    return {
         "org_name": (
             override.get("org_name")
             if override and "org_name" in override
@@ -6808,54 +6869,6 @@ def _source_row_from_seed(seed_row: dict[str, Any]) -> dict[str, Any]:
             override.get("plan_name")
             if override and "plan_name" in override
             else _clean_text(seed_row.get("plan_name"))
-        ),
-        "portal_url": _clean_text(seed_row.get("portal_url")),
-        "api_base": api_base,
-        "canonical_api_base": canonical_api_base,
-        "endpoint_insurance_plan": _clean_text(
-            endpoint_overrides.get("endpoint_insurance_plan")
-            if "endpoint_insurance_plan" in endpoint_overrides
-            else seed_row.get("endpoint_insurance_plan")
-        ),
-        "endpoint_practitioner": _clean_text(
-            endpoint_overrides.get("endpoint_practitioner")
-            if "endpoint_practitioner" in endpoint_overrides
-            else seed_row.get("endpoint_practitioner")
-        ),
-        "endpoint_practitioner_role": _clean_text(
-            endpoint_overrides.get("endpoint_practitioner_role")
-            if "endpoint_practitioner_role" in endpoint_overrides
-            else seed_row.get("endpoint_practitioner_role")
-        ),
-        "endpoint_organization": _clean_text(
-            endpoint_overrides.get("endpoint_organization")
-            if "endpoint_organization" in endpoint_overrides
-            else seed_row.get("endpoint_organization")
-        ),
-        "endpoint_organization_affiliation": _clean_text(
-            endpoint_overrides.get("endpoint_organization_affiliation")
-            if "endpoint_organization_affiliation" in endpoint_overrides
-            else seed_row.get("endpoint_organization_affiliation")
-        ),
-        "endpoint_location": _clean_text(
-            endpoint_overrides.get("endpoint_location")
-            if "endpoint_location" in endpoint_overrides
-            else seed_row.get("endpoint_location")
-        ),
-        "endpoint_healthcare_service": _clean_text(
-            endpoint_overrides.get("endpoint_healthcare_service")
-            if "endpoint_healthcare_service" in endpoint_overrides
-            else seed_row.get("endpoint_healthcare_service")
-        ),
-        "endpoint_network": _clean_text(
-            endpoint_overrides.get("endpoint_network")
-            if "endpoint_network" in endpoint_overrides
-            else seed_row.get("endpoint_network")
-        ),
-        "endpoint_endpoint": _clean_text(
-            endpoint_overrides.get("endpoint_endpoint")
-            if "endpoint_endpoint" in endpoint_overrides
-            else seed_row.get("endpoint_endpoint")
         ),
         "requires_registration": (
             bool(override["requires_registration"])
@@ -6872,35 +6885,50 @@ def _source_row_from_seed(seed_row: dict[str, Any]) -> dict[str, Any]:
             if override
             else _clean_text(seed_row.get("auth_type"))
         ),
-        "last_validated": _clean_text(seed_row.get("last_validated")),
         "last_validated_status": (
             _clean_text(override.get("last_validated_status"))
             if override and "last_validated_status" in override
             else _clean_text(seed_row.get("last_validated_status"))
         ),
-        "fhir_version": _clean_text(seed_row.get("fhir_version")),
-        "compliance_flag": _clean_text(seed_row.get("compliance_flag")),
-        "violation_type": _clean_text(seed_row.get("violation_type")),
-        "violation_detail": _clean_text(seed_row.get("violation_detail")),
-        "data_quality_flag": _clean_text(seed_row.get("data_quality_flag")),
-        "data_quality_sample_npi": _clean_text(seed_row.get("data_quality_sample_npi")),
-        "data_quality_practitioner_count": _clean_text(
-            seed_row.get("data_quality_practitioner_count")
-        ),
-        "data_quality_checked": _clean_text(seed_row.get("data_quality_checked")),
-        "is_medicare_advantage": _bool_from_seed(
-            seed_row.get("is_medicare_advantage")
-        ),
-        "is_medicaid_mco": _bool_from_seed(seed_row.get("is_medicaid_mco")),
-        "is_chip": _bool_from_seed(seed_row.get("is_chip")),
-        "is_qhp": _bool_from_seed(seed_row.get("is_qhp")),
-        "seed_source": _clean_text(seed_row.get("source")),
-        "seed_source_detail": _clean_text(seed_row.get("source_detail")),
-        "seed_source_url": _clean_text(seed_row.get("source_url")),
-        "seed_source_date": _clean_text(seed_row.get("source_date")),
-        "seed_row_id": _clean_text(seed_row.get("id")),
-        "id_provider_alt": _clean_text(seed_row.get("id_provider_alt")),
-        "team_status": _clean_text(seed_row.get("team_status")),
+    }
+
+
+def _source_row_from_seed(seed_row: dict[str, Any]) -> dict[str, Any]:
+    """Run the source row from seed step within provider-directory ingestion."""
+    now = _now()
+    api_base = _clean_text(seed_row.get("api_base"))
+    canonical_api_base = _canonical_base(api_base)
+    metadata = _source_seed_metadata(seed_row)
+    override = _source_seed_override(seed_row)
+    if override:
+        api_base = override["api_base"]
+        canonical_api_base = override["canonical_api_base"]
+        metadata = {**metadata, **override["metadata"]}
+    endpoint_overrides = override.get("endpoints", {}) if override else {}
+    api_base, canonical_api_base, endpoint_overrides = _normalize_source_seed_base(
+        seed_row, api_base, canonical_api_base, metadata, endpoint_overrides
+    )
+    source_identity_api_base = (
+        override.get("source_identity_api_base")
+        if override
+        else None
+    ) or api_base
+    source_id = _stable_source_id(
+        {
+            **seed_row,
+            "api_base": source_identity_api_base,
+        }
+    )
+    return {
+        "source_id": source_id,
+        "org_tin": _clean_text(seed_row.get("org_tin")),
+        **_source_seed_override_fields(seed_row, override),
+        "portal_url": _clean_text(seed_row.get("portal_url")),
+        "api_base": api_base,
+        "canonical_api_base": canonical_api_base,
+        **_source_seed_endpoint_fields(seed_row, endpoint_overrides),
+        "last_validated": _clean_text(seed_row.get("last_validated")),
+        **_source_seed_direct_fields(seed_row),
         "metadata_json": metadata,
         "created_at": now,
         "updated_at": now,
@@ -8012,6 +8040,266 @@ def _fhir_resource_base_fields(
     }
 
 
+def _parse_insurance_plan_resource(
+    resource: dict[str, Any], base: dict[str, Any]
+) -> tuple[type, dict[str, Any]]:
+    period_start, period_end = _period(resource)
+    plan = next(
+        (
+            resource_item
+            for resource_item in resource.get("plan") or []
+            if isinstance(resource_item, dict)
+        ),
+        {},
+    )
+    identifier = _identifier_value(
+        plan, "planid", "plan-id", "hios", allow_systemless=True
+    ) or _identifier_value(
+        resource, "plan", "hios", "formulary_id", allow_systemless=True
+    )
+    return ProviderDirectoryInsurancePlan, {
+        **base,
+        "plan_identifier": identifier,
+        "product_identifiers": _normalized_identifiers(resource.get("identifier")),
+        "plan_backbones": _normalized_insurance_plan_backbones(resource),
+        "coverage": _normalized_insurance_plan_coverage(resource),
+        "status": _clean_text(resource.get("status")),
+        "name": _clean_text(resource.get("name")),
+        "aliases": resource.get("alias") or [],
+        "type_codes": _codings(resource.get("type")),
+        "owned_by_ref": _first_reference(resource.get("ownedBy")),
+        "administered_by_ref": _first_reference(resource.get("administeredBy")),
+        "network_refs": _insurance_plan_network_references(resource),
+        "coverage_area_refs": _references(resource.get("coverageArea")),
+        "plan_json": plan or None,
+        "period_start": period_start,
+        "period_end": period_end,
+    }
+
+
+def _parse_practitioner_resource(
+    resource: dict[str, Any],
+    base: dict[str, Any],
+    acquisition: FHIRAcquisitionContext | None,
+) -> tuple[type, dict[str, Any]]:
+    family, given, full_name = _name(resource)
+    return ProviderDirectoryPractitioner, {
+        **base,
+        "npi": _resource_npi(resource),
+        "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
+        "identifiers": _normalized_identifiers(resource.get("identifier")),
+        "names": _normalized_human_names(resource.get("name")),
+        "family_name": family,
+        "given_names": given,
+        "full_name": full_name,
+        "administrative_gender": _administrative_gender(resource),
+        **_practitioner_derived_profile_fields(
+            resource,
+            as_of=(
+                acquisition.semantic_projection_as_of
+                if acquisition is not None
+                and acquisition.semantic_projection_as_of is not None
+                else base["observed_at"].date()
+            ),
+        ),
+        "telecom": _telecom(resource),
+        "addresses": _normalized_fhir_addresses(resource.get("address")),
+        "qualification_codes": _codings(
+            [
+                resource_item.get("code")
+                for resource_item in resource.get("qualification") or []
+                if isinstance(resource_item, dict)
+            ]
+        ),
+        "qualifications": _normalized_qualifications(resource.get("qualification")),
+        "communication_codes": _codings(resource.get("communication")),
+        "communications": _normalized_communications(resource.get("communication")),
+        "photos": _normalized_photo_metadata(resource.get("photo")),
+    }
+
+
+def _parse_organization_resource(
+    resource: dict[str, Any], base: dict[str, Any]
+) -> tuple[type, dict[str, Any]]:
+    return ProviderDirectoryOrganization, {
+        **base,
+        "npi": _resource_npi(resource),
+        "tax_id": _tin(resource),
+        "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
+        "identifiers": _normalized_identifiers(resource.get("identifier")),
+        "name": _clean_text(resource.get("name")),
+        "aliases": resource.get("alias") or [],
+        "type_codes": _codings(resource.get("type")),
+        "telecom": _telecom(resource),
+        "address_json": resource.get("address") or [],
+        "contacts": _normalized_organization_contacts(resource.get("contact")),
+        "part_of_ref": _first_reference(resource.get("partOf")),
+        "endpoint_refs": _references(resource.get("endpoint")),
+    }
+
+
+def _parse_location_resource(
+    resource: dict[str, Any],
+    base: dict[str, Any],
+    *,
+    normalize_location_contacts: bool,
+) -> tuple[type, dict[str, Any]]:
+    telecom = _telecom(resource)
+    address = _address(resource)
+    telephone_number = _phone(telecom)
+    fax_number = _fax(telecom)
+    resource_row_map = {
+        **base,
+        "status": _clean_text(resource.get("status")),
+        "name": _clean_text(resource.get("name")),
+        "description": _profile_text(resource.get("description")),
+        "mode": _clean_text(resource.get("mode")),
+        "type_codes": _codings(resource.get("type")),
+        "physical_type_codes": _codings(resource.get("physicalType")),
+        "managing_organization_ref": _first_reference(resource.get("managingOrganization")),
+        "telephone_number": telephone_number,
+        "fax_number": fax_number,
+        "telecom": telecom,
+        "addresses": _normalized_fhir_addresses(resource.get("address")),
+        "hours_of_operation": [
+            hours_entry
+            for hours_entry in resource.get("hoursOfOperation") or []
+            if isinstance(hours_entry, dict)
+        ],
+        "availability_exceptions": _profile_text(resource.get("availabilityExceptions")),
+        "photos": _normalized_photo_metadata(resource.get("photo")),
+        **{
+            key: address_value
+            for key, address_value in address.items()
+            if key != "address_json"
+        },
+    }
+    if normalize_location_contacts:
+        resource_row_map.update(
+            _location_contact_fields(telephone_number, fax_number, address.get("country_code"))
+        )
+    return ProviderDirectoryLocation, resource_row_map
+
+
+def _parse_practitioner_role_resource(
+    resource: dict[str, Any], base: dict[str, Any]
+) -> tuple[type, dict[str, Any]]:
+    period_start, period_end = _period(resource)
+    return ProviderDirectoryPractitionerRole, {
+        **base,
+        "npi": _npi(resource),
+        "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
+        "identifiers": _normalized_identifiers(resource.get("identifier")),
+        "practitioner_ref": _first_reference(resource.get("practitioner")),
+        "organization_ref": _first_reference(resource.get("organization")),
+        "location_refs": _references(resource.get("location")),
+        "healthcare_service_refs": _references(resource.get("healthcareService")),
+        "network_refs": _network_references(resource),
+        "insurance_plan_refs": _references(resource.get("insurancePlan")),
+        "endpoint_refs": _references(resource.get("endpoint")),
+        "specialty_codes": _codings(resource.get("specialty")),
+        "code_codes": _codings(resource.get("code")),
+        "telecom": _telecom(resource),
+        **_practitioner_role_completeness_fields(resource),
+        "period_start": period_start,
+        "period_end": period_end,
+    }
+
+
+def _parse_healthcare_service_resource(
+    resource: dict[str, Any], base: dict[str, Any]
+) -> tuple[type, dict[str, Any]]:
+    return ProviderDirectoryHealthcareService, {
+        **base,
+        "provided_by_ref": _first_reference(resource.get("providedBy")),
+        "accepting_patients": _plan_net_accepting_patients(resource),
+        "npi": _npi(resource),
+        "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
+        "identifiers": _normalized_identifiers(resource.get("identifier")),
+        "name": _clean_text(resource.get("name")),
+        "type_codes": _codings(resource.get("type")),
+        "category_codes": _codings(resource.get("category")),
+        "specialty_codes": _codings(resource.get("specialty")),
+        "program_codes": _codings(resource.get("program")),
+        "characteristic_codes": _codings(resource.get("characteristic")),
+        "communication_codes": _codings(resource.get("communication")),
+        "referral_method_codes": _codings(resource.get("referralMethod")),
+        "service_provision_codes": _codings(resource.get("serviceProvisionCode")),
+        "eligibility": _normalized_service_eligibility(resource.get("eligibility")),
+        "appointment_required": resource.get("appointmentRequired")
+        if isinstance(resource.get("appointmentRequired"), bool)
+        else None,
+        "location_refs": _references(resource.get("location")),
+        "endpoint_refs": _references(resource.get("endpoint")),
+        "telecom": _telecom(resource),
+        "coverage_area_refs": _references(resource.get("coverageArea")),
+        "available_time": [
+            availability_entry
+            for availability_entry in resource.get("availableTime") or []
+            if isinstance(availability_entry, dict)
+        ],
+        "not_available": [
+            exception_entry
+            for exception_entry in resource.get("notAvailable") or []
+            if isinstance(exception_entry, dict)
+        ],
+        "availability_exceptions": _profile_text(resource.get("availabilityExceptions")),
+        "extra_details": _profile_text(resource.get("extraDetails")),
+        "comment": _profile_text(resource.get("comment")),
+        "photos": _normalized_photo_metadata(resource.get("photo")),
+    }
+
+
+def _parse_organization_affiliation_resource(
+    resource: dict[str, Any], base: dict[str, Any]
+) -> tuple[type, dict[str, Any]]:
+    period_start, period_end = _period(resource)
+    return ProviderDirectoryOrganizationAffiliation, {
+        **base,
+        "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
+        "identifiers": _normalized_identifiers(resource.get("identifier")),
+        "organization_ref": _first_reference(resource.get("organization")),
+        "participating_organization_ref": _first_reference(resource.get("participatingOrganization")),
+        "network_refs": _references(resource.get("network")),
+        "location_refs": _references(resource.get("location")),
+        "healthcare_service_refs": _references(resource.get("healthcareService")),
+        "endpoint_refs": _references(resource.get("endpoint")),
+        "specialty_codes": _codings(resource.get("specialty")),
+        "code_codes": _codings(resource.get("code")),
+        "telecom": _telecom(resource),
+        "period_start": period_start,
+        "period_end": period_end,
+    }
+
+
+def _parse_endpoint_resource(
+    resource: dict[str, Any], base: dict[str, Any]
+) -> tuple[type, dict[str, Any]]:
+    period_start, period_end = _period(resource)
+    connection_type = resource.get("connectionType") if isinstance(resource.get("connectionType"), dict) else {}
+    contact = resource.get("contact") or []
+    return ProviderDirectoryEndpoint, {
+        **base,
+        "status": _clean_text(resource.get("status")),
+        "connection_type_system": _clean_text(connection_type.get("system")),
+        "connection_type_code": _clean_text(connection_type.get("code")),
+        "connection_type_display": _clean_text(connection_type.get("display")),
+        "name": _clean_text(resource.get("name")),
+        "managing_organization_ref": _first_reference(resource.get("managingOrganization")),
+        "contact": (
+            [item for item in contact if isinstance(item, dict)]
+            if isinstance(contact, list)
+            else []
+        ),
+        "period_start": period_start,
+        "period_end": period_end,
+        "payload_type_codes": _codings(resource.get("payloadType")),
+        "payload_mime_types": _string_list(resource.get("payloadMimeType")),
+        "address": _clean_text(resource.get("address")),
+        "header": _string_list(resource.get("header")),
+    }
+
+
 def parse_fhir_resource(
     source_id: str,
     resource: dict[str, Any],
@@ -8022,266 +8310,30 @@ def parse_fhir_resource(
     normalize_location_contacts: bool = True,
 ) -> tuple[type, dict[str, Any]] | None:
     """Parse fhir resource into normalized provider-directory records."""
-    resource_type = resource.get("resourceType")
     base = _fhir_resource_base_fields(
-        source_id,
-        resource,
-        resource_url,
-        acquisition,
-        run_id,
+        source_id, resource, resource_url, acquisition, run_id
     )
+    resource_type = resource.get("resourceType")
     if resource_type == "InsurancePlan":
-        period_start, period_end = _period(resource)
-        plan = next(
-            (
-                resource_item
-                for resource_item in resource.get("plan") or []
-                if isinstance(resource_item, dict)
-            ),
-            {},
-        )
-        identifier = _identifier_value(
-            plan,
-            "planid",
-            "plan-id",
-            "hios",
-            allow_systemless=True,
-        ) or _identifier_value(
-            resource,
-            "plan",
-            "hios",
-            "formulary_id",
-            allow_systemless=True,
-        )
-        resource_row_map = {
-            **base,
-            "plan_identifier": identifier,
-            "product_identifiers": _normalized_identifiers(
-                resource.get("identifier")
-            ),
-            "plan_backbones": _normalized_insurance_plan_backbones(resource),
-            "coverage": _normalized_insurance_plan_coverage(resource),
-            "status": _clean_text(resource.get("status")),
-            "name": _clean_text(resource.get("name")),
-            "aliases": resource.get("alias") or [],
-            "type_codes": _codings(resource.get("type")),
-            "owned_by_ref": _first_reference(resource.get("ownedBy")),
-            "administered_by_ref": _first_reference(resource.get("administeredBy")),
-            "network_refs": _insurance_plan_network_references(resource),
-            "coverage_area_refs": _references(resource.get("coverageArea")),
-            "plan_json": plan or None,
-            "period_start": period_start,
-            "period_end": period_end,
-        }
-        return ProviderDirectoryInsurancePlan, resource_row_map
+        return _parse_insurance_plan_resource(resource, base)
     if resource_type == "Practitioner":
-        family, given, full_name = _name(resource)
-        resource_row_map = {
-            **base,
-            "npi": _resource_npi(resource),
-            "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
-            "identifiers": _normalized_identifiers(resource.get("identifier")),
-            "names": _normalized_human_names(resource.get("name")),
-            "family_name": family,
-            "given_names": given,
-            "full_name": full_name,
-            "administrative_gender": _administrative_gender(resource),
-            **_practitioner_derived_profile_fields(
-                resource,
-                as_of=(
-                    acquisition.semantic_projection_as_of
-                    if acquisition is not None
-                    and acquisition.semantic_projection_as_of is not None
-                    else base["observed_at"].date()
-                ),
-            ),
-            "telecom": _telecom(resource),
-            "addresses": _normalized_fhir_addresses(resource.get("address")),
-            "qualification_codes": _codings(
-                [
-                    resource_item.get("code")
-                    for resource_item in resource.get("qualification") or []
-                    if isinstance(resource_item, dict)
-                ]
-            ),
-            "qualifications": _normalized_qualifications(
-                resource.get("qualification")
-            ),
-            "communication_codes": _codings(resource.get("communication")),
-            "communications": _normalized_communications(
-                resource.get("communication")
-            ),
-            "photos": _normalized_photo_metadata(resource.get("photo")),
-        }
-        return ProviderDirectoryPractitioner, resource_row_map
+        return _parse_practitioner_resource(resource, base, acquisition)
     if resource_type == "Organization":
-        resource_row_map = {
-            **base,
-            "npi": _resource_npi(resource),
-            "tax_id": _tin(resource),
-            "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
-            "identifiers": _normalized_identifiers(resource.get("identifier")),
-            "name": _clean_text(resource.get("name")),
-            "aliases": resource.get("alias") or [],
-            "type_codes": _codings(resource.get("type")),
-            "telecom": _telecom(resource),
-            "address_json": resource.get("address") or [],
-            "contacts": _normalized_organization_contacts(resource.get("contact")),
-            "part_of_ref": _first_reference(resource.get("partOf")),
-            "endpoint_refs": _references(resource.get("endpoint")),
-        }
-        return ProviderDirectoryOrganization, resource_row_map
+        return _parse_organization_resource(resource, base)
     if resource_type == "Location":
-        telecom = _telecom(resource)
-        address = _address(resource)
-        telephone_number = _phone(telecom)
-        fax_number = _fax(telecom)
-        resource_row_map = {
-            **base,
-            "status": _clean_text(resource.get("status")),
-            "name": _clean_text(resource.get("name")),
-            "description": _profile_text(resource.get("description")),
-            "mode": _clean_text(resource.get("mode")),
-            "type_codes": _codings(resource.get("type")),
-            "physical_type_codes": _codings(resource.get("physicalType")),
-            "managing_organization_ref": _first_reference(
-                resource.get("managingOrganization")
-            ),
-            "telephone_number": telephone_number,
-            "fax_number": fax_number,
-            "telecom": telecom,
-            "addresses": _normalized_fhir_addresses(resource.get("address")),
-            "hours_of_operation": [
-                resource_item
-                for resource_item in resource.get("hoursOfOperation") or []
-                if isinstance(resource_item, dict)
-            ],
-            "availability_exceptions": _profile_text(
-                resource.get("availabilityExceptions")
-            ),
-            "photos": _normalized_photo_metadata(resource.get("photo")),
-            **{
-                key: field_value
-                for key, field_value in address.items()
-                if key != "address_json"
-            },
-        }
-        if normalize_location_contacts:
-            resource_row_map.update(_location_contact_fields(telephone_number, fax_number, address.get("country_code")))
-        return ProviderDirectoryLocation, resource_row_map
+        return _parse_location_resource(
+            resource,
+            base,
+            normalize_location_contacts=normalize_location_contacts,
+        )
     if resource_type == "PractitionerRole":
-        period_start, period_end = _period(resource)
-        resource_row_map = {
-            **base,
-            "npi": _npi(resource),
-            "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
-            "identifiers": _normalized_identifiers(resource.get("identifier")),
-            "practitioner_ref": _first_reference(resource.get("practitioner")),
-            "organization_ref": _first_reference(resource.get("organization")),
-            "location_refs": _references(resource.get("location")),
-            "healthcare_service_refs": _references(resource.get("healthcareService")),
-            "network_refs": _network_references(resource),
-            "insurance_plan_refs": _references(resource.get("insurancePlan")),
-            "endpoint_refs": _references(resource.get("endpoint")),
-            "specialty_codes": _codings(resource.get("specialty")),
-            "code_codes": _codings(resource.get("code")),
-            "telecom": _telecom(resource),
-            **_practitioner_role_completeness_fields(resource),
-            "period_start": period_start,
-            "period_end": period_end,
-        }
-        return ProviderDirectoryPractitionerRole, resource_row_map
+        return _parse_practitioner_role_resource(resource, base)
     if resource_type == "HealthcareService":
-        resource_row_map = {
-            **base,
-            "provided_by_ref": _first_reference(resource.get("providedBy")),
-            "accepting_patients": _plan_net_accepting_patients(resource),
-            "npi": _npi(resource),
-            "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
-            "identifiers": _normalized_identifiers(resource.get("identifier")),
-            "name": _clean_text(resource.get("name")),
-            "type_codes": _codings(resource.get("type")),
-            "category_codes": _codings(resource.get("category")),
-            "specialty_codes": _codings(resource.get("specialty")),
-            "program_codes": _codings(resource.get("program")),
-            "characteristic_codes": _codings(resource.get("characteristic")),
-            "communication_codes": _codings(resource.get("communication")),
-            "referral_method_codes": _codings(resource.get("referralMethod")),
-            "service_provision_codes": _codings(
-                resource.get("serviceProvisionCode")
-            ),
-            "eligibility": _normalized_service_eligibility(
-                resource.get("eligibility")
-            ),
-            "appointment_required": resource.get("appointmentRequired")
-            if isinstance(resource.get("appointmentRequired"), bool)
-            else None,
-            "location_refs": _references(resource.get("location")),
-            "endpoint_refs": _references(resource.get("endpoint")),
-            "telecom": _telecom(resource),
-            "coverage_area_refs": _references(resource.get("coverageArea")),
-            "available_time": [
-                resource_item
-                for resource_item in resource.get("availableTime") or []
-                if isinstance(resource_item, dict)
-            ],
-            "not_available": [
-                resource_item
-                for resource_item in resource.get("notAvailable") or []
-                if isinstance(resource_item, dict)
-            ],
-            "availability_exceptions": _profile_text(
-                resource.get("availabilityExceptions")
-            ),
-            "extra_details": _profile_text(resource.get("extraDetails")),
-            "comment": _profile_text(resource.get("comment")),
-            "photos": _normalized_photo_metadata(resource.get("photo")),
-        }
-        return ProviderDirectoryHealthcareService, resource_row_map
+        return _parse_healthcare_service_resource(resource, base)
     if resource_type == "OrganizationAffiliation":
-        period_start, period_end = _period(resource)
-        resource_row_map = {
-            **base,
-            "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
-            "identifiers": _normalized_identifiers(resource.get("identifier")),
-            "organization_ref": _first_reference(resource.get("organization")),
-            "participating_organization_ref": _first_reference(resource.get("participatingOrganization")),
-            "network_refs": _references(resource.get("network")),
-            "location_refs": _references(resource.get("location")),
-            "healthcare_service_refs": _references(resource.get("healthcareService")),
-            "endpoint_refs": _references(resource.get("endpoint")),
-            "specialty_codes": _codings(resource.get("specialty")),
-            "code_codes": _codings(resource.get("code")),
-            "telecom": _telecom(resource),
-            "period_start": period_start,
-            "period_end": period_end,
-        }
-        return ProviderDirectoryOrganizationAffiliation, resource_row_map
+        return _parse_organization_affiliation_resource(resource, base)
     if resource_type == "Endpoint":
-        period_start, period_end = _period(resource)
-        connection_type = resource.get("connectionType") if isinstance(resource.get("connectionType"), dict) else {}
-        contact = resource.get("contact") or []
-        resource_row_map = {
-            **base,
-            "status": _clean_text(resource.get("status")),
-            "connection_type_system": _clean_text(connection_type.get("system")),
-            "connection_type_code": _clean_text(connection_type.get("code")),
-            "connection_type_display": _clean_text(connection_type.get("display")),
-            "name": _clean_text(resource.get("name")),
-            "managing_organization_ref": _first_reference(resource.get("managingOrganization")),
-            "contact": (
-                [resource_item for resource_item in contact if isinstance(resource_item, dict)]
-                if isinstance(contact, list)
-                else []
-            ),
-            "period_start": period_start,
-            "period_end": period_end,
-            "payload_type_codes": _codings(resource.get("payloadType")),
-            "payload_mime_types": _string_list(resource.get("payloadMimeType")),
-            "address": _clean_text(resource.get("address")),
-            "header": _string_list(resource.get("header")),
-        }
-        return ProviderDirectoryEndpoint, resource_row_map
+        return _parse_endpoint_resource(resource, base)
     return None
 
 
@@ -14664,6 +14716,8 @@ class ProviderDirectoryArtifactDataset:
     source_verification_contract_hash: str | None = None
     dataset_scoped_ready: bool = False
     dataset_scoped_variant: str | None = None
+    dataset_scoped_cohort_complete: bool | None = None
+    dataset_scoped_retry_exhausted_count: int | None = None
     semantic_projection_as_of: str | None = None
     source_authority_id: str | None = None
     admission_id: str | None = None
@@ -19819,6 +19873,17 @@ def _artifact_dataset_scoped_state_from_row(
         "dataset_scoped_variant": _clean_text(
             dataset_row_map.get("dataset_scoped_variant")
         ),
+        "dataset_scoped_cohort_complete": (
+            dataset_row_map.get("dataset_scoped_cohort_complete")
+            if type(dataset_row_map.get("dataset_scoped_cohort_complete")) is bool
+            else None
+        ),
+        "dataset_scoped_retry_exhausted_count": (
+            dataset_row_map.get("dataset_scoped_retry_exhausted_count")
+            if type(dataset_row_map.get("dataset_scoped_retry_exhausted_count"))
+            is int
+            else None
+        ),
         "semantic_projection_as_of": _clean_text(
             dataset_row_map.get("dataset_scoped_projection_as_of")
         ),
@@ -20158,6 +20223,8 @@ def _artifact_endpoint_selection_identity(
         dataset.source_verification_contract_hash,
         dataset.dataset_scoped_ready,
         dataset.dataset_scoped_variant,
+        dataset.dataset_scoped_cohort_complete,
+        dataset.dataset_scoped_retry_exhausted_count,
         dataset.semantic_projection_as_of,
         dataset.source_authority_id,
         dataset.admission_id,
@@ -41613,6 +41680,62 @@ async def _swap_network_catalog_stage(
     )
 
 
+def _empty_network_catalog_scope(target_ref: str) -> dict[str, Any]:
+    return {
+        "skipped": True,
+        "reason": "no_scoped_sources",
+        "source_ids": [],
+        "relation": target_ref,
+    }
+
+
+async def _populate_network_catalog_stage(
+    schema: str,
+    stage_table: str,
+    stage_ref: str,
+    target_ref: str,
+    run_id: str | None,
+    effective_source_ids: list[str],
+) -> dict[str, Any]:
+    columns = ", ".join(_provider_directory_network_catalog_columns())
+    query_param_dict: dict[str, Any] = {}
+    if run_id is not None:
+        query_param_dict["run_id"] = run_id
+    if effective_source_ids:
+        query_param_dict["source_ids"] = effective_source_ids
+    await db.status(
+        f"CREATE UNLOGGED TABLE {stage_ref} (LIKE {target_ref} INCLUDING DEFAULTS);"
+    )
+    copied_existing = await _copy_existing_network_catalog(
+        stage_ref,
+        target_ref,
+        columns,
+        effective_source_ids,
+    )
+    inserted = _coerce_rowcount(
+        await db.status(
+            provider_directory_network_catalog_insert_sql(
+                schema,
+                stage_table,
+                run_id=run_id,
+                source_ids=effective_source_ids,
+            ),
+            **query_param_dict,
+        )
+    )
+    stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
+    await _create_provider_directory_network_catalog_indexes(schema, stage_table)
+    await db.status(f"ANALYZE {stage_ref};")
+    return {
+        "published": True,
+        "rows": stage_rows,
+        "inserted": inserted,
+        "copied_existing": copied_existing,
+        "source_ids": effective_source_ids,
+        "relation": target_ref,
+    }
+
+
 async def publish_provider_directory_network_catalog(
     db_schema: str | None = None,
     *,
@@ -41633,56 +41756,23 @@ async def publish_provider_directory_network_catalog(
     )
     target_ref = _qt(schema, PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)
     if run_id is not None and not effective_source_ids:
-        return {
-            "skipped": True,
-            "reason": "no_scoped_sources",
-            "source_ids": [],
-            "relation": target_ref,
-        }
+        return _empty_network_catalog_scope(target_ref)
     async with _provider_directory_artifact_build_guard(
         schema,
         PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE,
     ) as build_fence:
         stage_table = _network_catalog_stage_table_name(run_id)
         stage_ref = _qt(schema, stage_table)
-        columns = ", ".join(_provider_directory_network_catalog_columns())
-        query_param_dict: dict[str, Any] = {}
-        if run_id is not None:
-            query_param_dict["run_id"] = run_id
-        if effective_source_ids:
-            query_param_dict["source_ids"] = effective_source_ids
-
         await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
         try:
-            await db.status(f"CREATE UNLOGGED TABLE {stage_ref} (LIKE {target_ref} INCLUDING DEFAULTS);")
-            copied_existing = await _copy_existing_network_catalog(
+            publish_metrics_by_field = await _populate_network_catalog_stage(
+                schema,
+                stage_table,
                 stage_ref,
                 target_ref,
-                columns,
+                run_id,
                 effective_source_ids,
             )
-            inserted = _coerce_rowcount(
-                await db.status(
-                    provider_directory_network_catalog_insert_sql(
-                        schema,
-                        stage_table,
-                        run_id=run_id,
-                        source_ids=effective_source_ids,
-                    ),
-                    **query_param_dict,
-                )
-            )
-            stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
-            await _create_provider_directory_network_catalog_indexes(schema, stage_table)
-            await db.status(f"ANALYZE {stage_ref};")
-            publish_metrics_by_field = {
-                "published": True,
-                "rows": stage_rows,
-                "inserted": inserted,
-                "copied_existing": copied_existing,
-                "source_ids": effective_source_ids,
-                "relation": target_ref,
-            }
             if defer_cutover:
                 await _prepare_provider_directory_artifact_stage(
                     schema,
@@ -51457,19 +51547,8 @@ def _bulk_output_completion_sql() -> str:
     """
 
 
-async def _record_bulk_export_output_error(
-    identity: BulkExportCheckpointIdentity,
-    output_id: str,
-    rows_written: int,
-    committed_bytes: int,
-    error: str,
-    *,
-    record_checkpoint: bool = True,
-) -> None:
-    """Persist output failure and its parent aggregate as one transaction."""
-    is_terminal = _is_bulk_export_error_terminal(error)
-    updated_count = await db.status(
-        f"""
+def _bulk_output_error_sql() -> str:
+    return f"""
         WITH failed_output AS (
             UPDATE {_bulk_output_checkpoint_table_ref()} AS output
                SET state = :state,
@@ -51526,7 +51605,22 @@ async def _record_bulk_export_output_error(
                 :checkpoint_complete_state,
                 :checkpoint_failed_state
            );
-        """,
+    """
+
+
+async def _record_bulk_export_output_error(
+    identity: BulkExportCheckpointIdentity,
+    output_id: str,
+    rows_written: int,
+    committed_bytes: int,
+    error: str,
+    *,
+    record_checkpoint: bool = True,
+) -> None:
+    """Persist output failure and its parent aggregate as one transaction."""
+    is_terminal = _is_bulk_export_error_terminal(error)
+    updated_count = await db.status(
+        _bulk_output_error_sql(),
         checkpoint_id=identity.checkpoint_id,
         output_id=output_id,
         owner_run_id=identity.owner_run_id,

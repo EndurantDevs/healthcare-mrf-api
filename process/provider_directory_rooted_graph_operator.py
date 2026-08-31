@@ -398,7 +398,9 @@ async def acquire_single_root_operation(
 
 def _publication_json(publication_result: Any) -> str:
     readiness = publication_result.readiness
-    if readiness.cohort_complete:
+    retry_exhausted_count = readiness.retry_exhausted_count
+    is_retry_exhausted = type(retry_exhausted_count) is int and retry_exhausted_count > 0
+    if readiness.cohort_complete is (not is_retry_exhausted):
         profile_dispatch_by_field = {
             **profile_followup_receipt_metadata(),
             "external_followup": (
@@ -436,7 +438,7 @@ def _publication_json(publication_result: Any) -> str:
     }
     if not readiness.cohort_complete:
         publication_by_field["cohort_complete"] = False
-        publication_by_field["retry_exhausted_count"] = readiness.retry_exhausted_count
+        publication_by_field["retry_exhausted_count"] = retry_exhausted_count
     return _canonical_json(publication_by_field)
 
 

@@ -11,6 +11,7 @@ from process.provider_directory_dataset_scoped_publication import (
     LEGACY_PRACTITIONER_VARIANT,
     ROOTED_COMBINED_VARIANT,
 )
+from process.provider_directory_fhir_root_policy import ReviewedRootPolicy
 from process.provider_directory_profile_uhc_flex_contract import (
     _clean_text,
     _is_rooted_resource_counts_valid,
@@ -56,7 +57,6 @@ def is_uhc_flex_dataset_row_ready(dataset_row: Mapping[str, Any]) -> bool:
         or ""
     )
     variant = uhc_flex_profile_dataset_variant(dataset_id)
-    source_id = metadata_by_field.get("source_id")
     projection_value = dataset_row.get("dataset_scoped_projection_as_of")
     projection_text = (
         projection_value.isoformat()
@@ -96,7 +96,8 @@ def _is_common_dataset_row_ready(
             endpoint_id=endpoint_id,
             evidence_run_id=evidence_run_id,
         )
-        and metadata_by_field.get("cohort_complete") is True
+        and metadata_by_field.get("cohort_complete")
+        is dataset_row.get("dataset_scoped_cohort_complete")
         and metadata_by_field.get("endpoint_collection_complete") is False
         and metadata_by_field.get("endpoint_complete") is False
         and metadata_by_field.get("semantic_projection_as_of") == projection_text
@@ -117,7 +118,7 @@ def _is_variant_dataset_row_ready(
 ) -> bool:
     if variant == LEGACY_PRACTITIONER_VARIANT:
         return bool(
-            dataset_row.get("dataset_scoped_cohort_complete") is True
+            type(dataset_row.get("dataset_scoped_cohort_complete")) is bool
             and dataset_row.get("dataset_scoped_endpoint_collection_complete") is False
             and dataset_row.get("dataset_scoped_endpoint_complete") is False
         )
@@ -125,7 +126,7 @@ def _is_variant_dataset_row_ready(
         variant == ROOTED_COMBINED_VARIANT
         and dataset_row.get("dataset_scoped_publication_kind")
         == ROOTED_COMBINED_VARIANT
-        and dataset_row.get("dataset_scoped_cohort_complete") is True
+        and type(dataset_row.get("dataset_scoped_cohort_complete")) is bool
         and dataset_row.get("dataset_scoped_rooted_graph_complete") is True
         and dataset_row.get("dataset_scoped_endpoint_collection_complete") is False
         and dataset_row.get("dataset_scoped_endpoint_complete") is False
@@ -148,6 +149,8 @@ def is_uhc_flex_dataset_readiness_matching(
     endpoint_id = _clean_text(dataset_row.get("endpoint_id")) or ""
     source_id = _clean_text(dataset_row.get("source_id")) or ""
     variant = uhc_flex_profile_dataset_variant(dataset_id)
+    readiness_retry_exhausted_count = getattr(readiness, "retry_exhausted_count", 0)
+    metadata_retry_exhausted_count = metadata_by_field.get("retry_exhausted_count", 0)
     readiness_resource_counts = getattr(readiness, "resource_counts", None)
     is_readiness_variant_ready = variant == LEGACY_PRACTITIONER_VARIANT or (
         variant == ROOTED_COMBINED_VARIANT
@@ -174,6 +177,9 @@ def is_uhc_flex_dataset_readiness_matching(
         == metadata_by_field.get("admission_id")
         and getattr(readiness, "operation_key", None)
         == metadata_by_field.get("operation_key")
+        and getattr(readiness, "cohort_complete", None)
+        is metadata_by_field.get("cohort_complete")
+        and readiness_retry_exhausted_count == metadata_retry_exhausted_count
         and is_uhc_flex_publication_metadata_valid(
             metadata_by_field,
             dataset_id=dataset_id,
@@ -209,6 +215,9 @@ def _readiness_annotation(readiness: Any, is_ready: bool) -> dict[str, Any]:
         ),
         "dataset_scoped_cohort_complete": (
             getattr(readiness, "cohort_complete", None) if is_ready else None
+        ),
+        "dataset_scoped_retry_exhausted_count": (
+            getattr(readiness, "retry_exhausted_count", 0) if is_ready else None
         ),
         "dataset_scoped_rooted_graph_complete": (
             getattr(readiness, "rooted_graph_complete", None) if is_ready else None
@@ -290,9 +299,36 @@ async def annotate_uhc_flex_profile_dataset_readiness(
 def is_uhc_flex_fence_dataset_ready(dataset: Any, readiness: Any) -> bool:
     """Return whether a locked dataset still matches exact cohort readiness."""
 
+    if readiness is None:
+        return False
+    retry_exhausted_count = getattr(readiness, "retry_exhausted_count", 0)
+    is_coverage_ready = bool(
+        type(retry_exhausted_count) is int
+        and retry_exhausted_count >= 0
+        and readiness.cohort_complete is (retry_exhausted_count == 0)
+        and readiness.cohort_complete
+        is getattr(dataset, "dataset_scoped_cohort_complete", None)
+        and retry_exhausted_count
+        == getattr(dataset, "dataset_scoped_retry_exhausted_count", None)
+        and (
+            retry_exhausted_count == 0
+            or getattr(dataset, "reviewed_root_policy", None)
+            == ReviewedRootPolicy(1)
+        )
+    )
+    is_legacy_ready = bool(
+        dataset.dataset_scoped_variant == LEGACY_PRACTITIONER_VARIANT
+        and is_coverage_ready
+    )
+    is_rooted_ready = bool(
+        dataset.dataset_scoped_variant == ROOTED_COMBINED_VARIANT
+        and is_coverage_ready
+        and readiness.publication_kind == ROOTED_COMBINED_VARIANT
+        and readiness.rooted_graph_complete is True
+        and _is_rooted_resource_counts_valid(readiness.resource_counts)
+    )
     return bool(
         dataset.dataset_scoped_ready
-        and readiness is not None
         and is_uhc_flex_dataset_variant_matching(
             dataset.source_id,
             dataset.dataset_id,
@@ -308,18 +344,9 @@ def is_uhc_flex_fence_dataset_ready(dataset: Any, readiness: Any) -> bool:
         and readiness.source_authority_id == dataset.source_authority_id
         and readiness.admission_id == dataset.admission_id
         and readiness.operation_key == dataset.operation_key
-        and readiness.cohort_complete is True
         and readiness.endpoint_collection_complete is False
         and readiness.endpoint_complete is False
-        and (
-            dataset.dataset_scoped_variant == LEGACY_PRACTITIONER_VARIANT
-            or (
-                dataset.dataset_scoped_variant == ROOTED_COMBINED_VARIANT
-                and readiness.publication_kind == ROOTED_COMBINED_VARIANT
-                and readiness.rooted_graph_complete is True
-                and _is_rooted_resource_counts_valid(readiness.resource_counts)
-            )
-        )
+        and (is_legacy_ready or is_rooted_ready)
     )
 
 

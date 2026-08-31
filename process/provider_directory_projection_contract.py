@@ -2190,19 +2190,12 @@ def _physical_source_summary_map(
     }
 
 
-def reduced_physical_projection_proof(
-    recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
-    raw_shards: Sequence[ProjectionProofShard],
-    *,
-    dataset_hash: str,
-    canonical_row_sha256: str,
+def _validated_reduced_resource_count_map(
+    recipe: PhysicalProjectionRecipeIdentity,
     resource_counts: Mapping[str, int],
-    reducer_proof: Mapping[str, Any],
-    outcome_proof: ProjectionSemanticOutcomeProof,
-) -> PhysicalProjectionProof:
-    """Seal deterministic reducer output while retaining raw shard lineage."""
+) -> dict[str, int]:
+    """Require exact selected and required counts for reduced output."""
 
-    recipe = validated_physical_projection_recipe_identity(recipe)
     if not isinstance(resource_counts, Mapping):
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_reduced_resource_mismatch"
@@ -2228,34 +2221,39 @@ def reduced_physical_projection_proof(
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_reduced_resource_mismatch"
         )
-    ordered_shards = sorted(
-        raw_shards,
-        key=lambda shard: (
-            shard.resource_type,
-            shard.partition_ordinal,
-            shard.partition_id,
-        ),
-    )
-    _resource_counts(recipe, ordered_shards)
-    normalized_row_hash = required_hash(
-        canonical_row_sha256,
-        "canonical_row_sha256",
-    )
-    validated_outcome_proof = validated_semantic_outcome_proof(outcome_proof)
-    positive_count_by_resource = {
-        resource_type: count
-        for resource_type, count in normalized_count_by_resource.items()
-        if count > 0
-    }
-    if (
-        validated_outcome_proof.canonical_row_sha256 != normalized_row_hash
-        or validated_outcome_proof.resource_count
-        != sum(normalized_count_by_resource.values())
-        or validated_outcome_proof.resource_counts != positive_count_by_resource
+    return normalized_count_by_resource
+
+
+def _require_reduced_counts_within_raw_shards(
+    recipe: PhysicalProjectionRecipeIdentity,
+    shards: Sequence[ProjectionProofShard],
+    reduced_count_by_resource: Mapping[str, int],
+) -> None:
+    if not shards:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_proof_shards_empty"
+        )
+    raw_count_by_resource = _resource_counts(recipe, shards)
+    if any(
+        count > raw_count_by_resource[resource_type]
+        for resource_type, count in reduced_count_by_resource.items()
     ):
         raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_semantic_outcome_reducer_mismatch"
+            "provider_directory_projection_reduced_resource_mismatch"
         )
+
+
+def _sealed_reduced_physical_projection_proof(
+    recipe: PhysicalProjectionRecipeIdentity,
+    ordered_shards: Sequence[ProjectionProofShard],
+    dataset_hash: str,
+    normalized_row_hash: str,
+    normalized_count_by_resource: dict[str, int],
+    reducer_proof: Mapping[str, Any],
+    validated_outcome_proof: ProjectionSemanticOutcomeProof,
+) -> PhysicalProjectionProof:
+    """Build one sealed proof from already-validated reduced output."""
+
     normalized_reducer_proof_map = _validated_reducer_proof_map(
         reducer_proof,
         normalized_row_hash,
@@ -2290,4 +2288,64 @@ def reduced_physical_projection_proof(
             "reducer": normalized_reducer_proof_map,
             "source_summary": normalized_source_summary_map,
         },
+    )
+
+
+def reduced_physical_projection_proof(
+    recipe: ProjectionRecipeIdentity | PhysicalProjectionRecipeIdentity,
+    raw_shards: Sequence[ProjectionProofShard],
+    *,
+    dataset_hash: str,
+    canonical_row_sha256: str,
+    resource_counts: Mapping[str, int],
+    reducer_proof: Mapping[str, Any],
+    outcome_proof: ProjectionSemanticOutcomeProof,
+) -> PhysicalProjectionProof:
+    """Seal deterministic reducer output while retaining raw shard lineage."""
+
+    recipe = validated_physical_projection_recipe_identity(recipe)
+    normalized_count_by_resource = _validated_reduced_resource_count_map(
+        recipe,
+        resource_counts,
+    )
+    ordered_shards = sorted(
+        raw_shards,
+        key=lambda shard: (
+            shard.resource_type,
+            shard.partition_ordinal,
+            shard.partition_id,
+        ),
+    )
+    _require_reduced_counts_within_raw_shards(
+        recipe,
+        ordered_shards,
+        normalized_count_by_resource,
+    )
+    normalized_row_hash = required_hash(
+        canonical_row_sha256,
+        "canonical_row_sha256",
+    )
+    validated_outcome_proof = validated_semantic_outcome_proof(outcome_proof)
+    positive_count_by_resource = {
+        resource_type: count
+        for resource_type, count in normalized_count_by_resource.items()
+        if count > 0
+    }
+    if (
+        validated_outcome_proof.canonical_row_sha256 != normalized_row_hash
+        or validated_outcome_proof.resource_count
+        != sum(normalized_count_by_resource.values())
+        or validated_outcome_proof.resource_counts != positive_count_by_resource
+    ):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_semantic_outcome_reducer_mismatch"
+        )
+    return _sealed_reduced_physical_projection_proof(
+        recipe,
+        ordered_shards,
+        dataset_hash,
+        normalized_row_hash,
+        normalized_count_by_resource,
+        reducer_proof,
+        validated_outcome_proof,
     )

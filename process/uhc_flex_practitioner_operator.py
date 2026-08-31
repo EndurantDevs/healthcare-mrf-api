@@ -206,7 +206,11 @@ def _single_root_acquisition_result_json(receipt: Any) -> str:
 
 def _publication_result_json(publication_result: Any) -> str:
     dataset_readiness = publication_result.readiness
-    if dataset_readiness.cohort_complete:
+    if dataset_readiness.cohort_complete is True or (
+        dataset_readiness.cohort_complete is False
+        and type(dataset_readiness.retry_exhausted_count) is int
+        and dataset_readiness.retry_exhausted_count > 0
+    ):
         profile_delta_dispatch_by_field = {
             **profile_followup_receipt_metadata(),
             "external_followup": (

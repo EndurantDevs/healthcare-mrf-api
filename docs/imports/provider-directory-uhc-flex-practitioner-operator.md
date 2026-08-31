@@ -106,13 +106,12 @@ Historical publication receipts do not dispatch the global Provider Directory
 Profile delta.
 The repository has a public Profile builder, but it is not a safe source-local
 dispatcher: it requires a complete global dataset-selection fence and a
-separately admitted capacity plan. Only a cohort-complete publication receipt
-embeds the exact external controller payload at
-`profile_delta_dispatch.external_followup`. An admitted retry-exhausted partial
-publication instead reports `cohort_complete=false`, the exact
-`retry_exhausted_count`, and `required_external_global_dispatch=false`; it is
-valid source-local evidence but is not a Profile follow-up authority. Extract a
-complete receipt's payload without changing any field:
+separately admitted capacity plan. A cohort-complete publication or an admitted
+retry-exhausted single-root publication embeds the exact external controller
+payload at `profile_delta_dispatch.external_followup`. The partial receipt keeps
+`cohort_complete=false` and its exact `retry_exhausted_count`; Profile serving
+does not turn that partial evidence into a completeness claim. Extract the
+eligible receipt's payload without changing any field:
 
 ```bash
 GLOBAL_PROFILE_FOLLOWUP_JSON="$(
@@ -143,13 +142,13 @@ metadata fields are not part of the controller payload. This extraction does
 not dispatch anything, and the Flex operator has no Profile-dispatch command.
 Do not infer Profile serving readiness from the controller observation receipt.
 
-For that reason, every cohort-complete publication receipt explicitly reports:
+For that reason, every Profile-eligible publication receipt explicitly reports:
 
 ```json
 {"operator_command_available":false,"required_external_global_dispatch":true,"status":"not_dispatched"}
 ```
 
-For a cohort-complete receipt, the production controller must submit the
+For an eligible receipt, the production controller must submit the
 embedded standard global Profile follow-up after verifying the published
 dataset receipt. Do not infer Profile serving readiness from this operator's
 publication result.

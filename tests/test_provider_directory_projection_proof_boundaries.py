@@ -201,3 +201,38 @@ def test_reducer_and_reduced_projection_reject_untyped_or_inconsistent_counts():
 def test_empty_selected_resource_set_is_never_a_valid_recipe_profile():
     with pytest.raises(ProviderDirectoryProjectionError, match="selected_resource_empty"):
         sorted_unique_texts((), "selected_resource", limit=64)
+
+
+def test_reduced_projection_cannot_exceed_raw_shard_counts():
+    recipe, shard, outcome_proof, resource_counts, reducer_proof = (
+        _candidate_inputs()
+    )
+    with pytest.raises(ProviderDirectoryProjectionError, match="shards_empty"):
+        reduced_physical_projection_proof(
+            recipe,
+            (),
+            dataset_hash=digest("dataset"),
+            canonical_row_sha256=outcome_proof.canonical_row_sha256,
+            resource_counts=resource_counts,
+            reducer_proof=reducer_proof,
+            outcome_proof=outcome_proof,
+        )
+
+    raw_proof = deepcopy(shard.proof)
+    raw_proof["resource_counts"]["InsurancePlan"] = 0
+    raw_shard = replace(
+        shard,
+        resource_count=shard.resource_count - 1,
+        proof=raw_proof,
+    )
+
+    with pytest.raises(ProviderDirectoryProjectionError, match="resource_mismatch"):
+        reduced_physical_projection_proof(
+            recipe,
+            (raw_shard,),
+            dataset_hash=digest("dataset"),
+            canonical_row_sha256=outcome_proof.canonical_row_sha256,
+            resource_counts=resource_counts,
+            reducer_proof=reducer_proof,
+            outcome_proof=outcome_proof,
+        )

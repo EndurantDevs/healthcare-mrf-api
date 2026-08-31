@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "release": "current-insurer-directories-v4",
-  "description": "All reviewed acquisition-capable insurer Provider Directory endpoints enabled for unified doctor profiles, plus the official-file source when published from one complete admitted retained semantic dataset and exactly one ready dataset-scoped enrichment generation: either the legacy exact-cohort Practitioner dataset or its separately acquired rooted combined successor. Endpoint sibling aliases are included automatically and remain evidence aliases, not inferred product membership. Generic probe-only endpoints remain excluded.",
+  "description": "All reviewed acquisition-capable insurer Provider Directory endpoints enabled for unified doctor profiles, plus the official-file source when published from one eligible admitted retained semantic dataset and exactly one ready dataset-scoped enrichment generation: either complete coverage or reviewed retry-exhausted single-root coverage from the legacy Practitioner dataset or its separately acquired rooted combined successor. Endpoint sibling aliases are included automatically and remain evidence aliases, not inferred product membership. Generic probe-only endpoints remain excluded.",
   "entry_ids": [
     "aetna-commercial-medicare",
     "alohr",
@@ -93,7 +93,7 @@
       "A6": {"resources": ["InsurancePlan", "Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]},
       "M5": {"resources": ["Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]},
       "P1_DATASET": {"transport": "fhir_rest_exact_identifier", "resources": ["Practitioner"], "endpoint_collection_complete": false},
-      "R8_DATASET": {"transport": "fhir_rest_rooted_reference_closure", "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "cohort_complete": true, "rooted_graph_complete": true, "endpoint_collection_complete": false, "endpoint_complete": false},
+      "R8_DATASET": {"transport": "fhir_rest_rooted_reference_closure", "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "coverage_authority": "complete_or_reviewed_retry_exhausted_single_root", "rooted_graph_complete": true, "endpoint_collection_complete": false, "endpoint_complete": false},
       "ALOHR_GRAPHQL_R4": {
         "transport": "graphql",
         "tenant": "alohr",
