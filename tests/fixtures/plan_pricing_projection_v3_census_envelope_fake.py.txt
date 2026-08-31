@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -S
 from __future__ import annotations
 
-import base64, json, os, signal, sys, time
+import atexit, base64, json, os, signal, sys, time
 from pathlib import Path
 name = Path(sys.argv[0]).name; args = sys.argv[1:]
 state = Path(os.environ["FAKE_STATE"]); events = state / "events"
@@ -131,6 +131,11 @@ elif name == "census-child":
     event("child")
     if args[:1] != ["--receipt"]: raise SystemExit("missing census receipt path")
     receipt_path = Path(args[1])
+    cleanup_mode = os.environ.get("FAKE_CHILD_CLEANUP", "true")
+    def write_cleanup_proof():
+        if cleanup_mode != "missing":
+            receipt_path.with_name("packet-cleanup-complete").write_text(cleanup_mode + "\n")
+    atexit.register(write_cleanup_proof)
     receipt_path.write_text(json.dumps({"accepted": False, "status": "provisional"}, indent=2, sort_keys=True) + "\n")
     attestation_path = receipt_path.with_name("runtime-attestation.json")
     attestation_mode = os.environ.get("FAKE_ATTESTATION_MODE", "valid")
@@ -252,8 +257,15 @@ elif name == "k3s":
             kind = "policy"
         else:
             raise SystemExit("unexpected manifest")
-        resource_path(kind).touch()
         event(kind + "_create")
+        if os.environ.get("FAKE_CREATE_DELAYED_ERROR") == kind:
+            if os.fork() == 0:
+                time.sleep(0.5)
+                resource_path(kind).touch()
+                event(kind + "_delayed_appear")
+                os._exit(0)
+            raise SystemExit(75)
+        resource_path(kind).touch()
         if os.environ.get("FAKE_CREATE_ERROR") == kind:
             raise SystemExit(75)
     elif operation == "delete":

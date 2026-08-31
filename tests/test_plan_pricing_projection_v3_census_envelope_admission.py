@@ -1,5 +1,6 @@
 """Admission and final cleanup checks for the census envelope."""
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -113,6 +114,57 @@ def test_labeled_census_residue_retains_every_outer_fence(
     assert "quota_delete" not in events
     assert "lock_stop" not in events
     assert envelope._receipt(state_root)["cleanup"]["complete"] is False
+
+
+@pytest.mark.parametrize("resource", ["quota", "policy", "binding"])
+def test_delayed_create_outcome_retains_every_outer_fence(
+    tmp_path: Path,
+    resource: str,
+) -> None:
+    """An unresolved create may appear after the first absence read."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        FAKE_CREATE_DELAYED_ERROR=resource,
+    )
+
+    assert result.returncode == 1
+    events = (tmp_path / "fake-state/events").read_text().splitlines()
+    assert f"{resource}_create" in events
+    assert f"{resource}_delayed_appear" in events
+    assert not any(event.endswith("_delete") for event in events)
+    assert "drain_set_false" not in events
+    assert "lock_stop" not in events
+    assert envelope._receipt(state_root)["cleanup"]["complete"] is False
+
+
+def test_unproven_child_cleanup_retains_every_outer_fence(tmp_path: Path) -> None:
+    """The parent must not release fences from one absence snapshot alone."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        FAKE_CHILD_CLEANUP="false",
+    )
+
+    assert result.returncode == 1
+    events = (tmp_path / "fake-state/events").read_text().splitlines()
+    assert "child" in events
+    assert not any(event.endswith("_delete") for event in events)
+    assert "drain_set_false" not in events
+    assert "lock_stop" not in events
+    receipt = envelope._receipt(state_root)
+    census_receipt = state_root / "run/census-receipt.json"
+    assert (
+        receipt["census_receipt_sha256"]
+        == hashlib.sha256(census_receipt.read_bytes()).hexdigest()
+    )
+    assert receipt["runtime_attestation"]["pod_uid"] == "pod-uid"
+    assert receipt["runtime_attestation"]["configmap_uid"] == "configmap-uid"
+    assert (
+        receipt["runtime_attestation"]["source_overlay_sha256"]
+        == envelope.OVERLAY_SHA256
+    )
+    assert receipt["cleanup"]["complete"] is False
 
 
 def test_seed_reappearance_retains_drain_quota_and_lock(tmp_path: Path) -> None:

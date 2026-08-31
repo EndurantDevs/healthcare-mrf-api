@@ -200,7 +200,7 @@ def test_nonzero_child_unlabeled_attested_pod_retains_fences(tmp_path: Path) -> 
     assert envelope._receipt(state_root)["cleanup"]["complete"] is False
 
 
-@pytest.mark.parametrize("resource", ("quota", "policy", "binding"))
+@pytest.mark.parametrize("resource", ["quota", "policy", "binding"])
 def test_create_then_client_failure_reconciles_exact_resource(
     tmp_path: Path,
     resource: str,
