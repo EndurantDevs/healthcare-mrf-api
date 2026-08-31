@@ -91,26 +91,35 @@ def _has_invalid_common_identity(
 ) -> bool:
     partition_attempt = identity_by_field.get("partition_attempt")
     return bool(
-        HASH_PATTERN.fullmatch(recipe_id) is None
+        not isinstance(recipe_id, str)
+        or HASH_PATTERN.fullmatch(recipe_id) is None
         or any(
             candidate_hash is not None
-            and HASH_PATTERN.fullmatch(candidate_hash) is None
+            and (
+                not isinstance(candidate_hash, str)
+                or HASH_PATTERN.fullmatch(candidate_hash) is None
+            )
             for candidate_hash in (
                 identity_by_field.get(field_name) for field_name in _HASH_FIELDS
             )
         )
+        or type(recipe_attempt) is not int
         or recipe_attempt < 1
-        or (partition_attempt is not None and partition_attempt < 0)
+        or (
+            partition_attempt is not None
+            and (type(partition_attempt) is not int or partition_attempt < 0)
+        )
     )
 
 
 def _has_invalid_admission_identity(
     identity_by_field: Mapping[str, Any],
 ) -> bool:
+    admission_attempt = identity_by_field.get("admission_attempt")
     return bool(
         identity_by_field.get("admission_id") is None
-        or identity_by_field.get("admission_attempt") is None
-        or identity_by_field["admission_attempt"] < 1
+        or type(admission_attempt) is not int
+        or admission_attempt < 1
         or identity_by_field.get("admission_lease_token") is None
         or any(
             identity_by_field.get(field_name) is not None
@@ -135,7 +144,7 @@ def _has_invalid_reference_identity(
     return bool(
         identity_by_field.get("physical_projection_id") is None
         or identity_by_field.get("reference_owner_kind")
-        not in {"dataset", "build", "artifact"}
+        not in ("dataset", "build", "artifact")
         or not isinstance(owner_id, str)
         or not owner_id
         or len(owner_id) > 128
@@ -148,6 +157,7 @@ def _has_invalid_reference_identity(
                 "partition_id",
                 "partition_attempt",
                 "shard_lease_token",
+                *_ADMISSION_FIELDS,
             )
         )
         or (previous_token is not None) != (action == "reference_reclaim")
