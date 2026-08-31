@@ -30,6 +30,7 @@
                 standard_charge_dollar: Some("1".to_owned()),
                 standard_charge_percentage: None,
                 standard_charge_algorithm: None,
+                estimated_amount: None,
                 median_amount: None,
                 percentile_10: None,
                 percentile_90: None,
@@ -175,25 +176,6 @@
                 format!("fixture-version\t0\t\\N\t\\N\t{text}\n")
             );
         }
-    }
-
-    #[test]
-    fn structurally_v3_json_preserves_declared_template_version() {
-        let mut payload: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
-        payload["version"] = json!("2.0.0");
-        let rows = run_fixture(
-            InputFormat::Json,
-            &serde_json::to_vec(&payload).unwrap(),
-            false,
-        );
-        assert_eq!(
-            String::from_utf8(rows["mrf"].clone())
-                .unwrap()
-                .trim_end()
-                .split('\t')
-                .nth(3),
-            Some("2.0.0")
-        );
     }
 
     #[test]
@@ -384,7 +366,12 @@
             })
             .collect::<Vec<_>>();
         let error =
-            parse_wide_columns(&StringRecord::from(placeholder_headers), 1).unwrap_err();
+            parse_wide_columns(
+                &StringRecord::from(placeholder_headers),
+                CmsProfile::V3,
+                1,
+            )
+            .unwrap_err();
         assert!(error
             .to_string()
             .contains("must replace payer and plan placeholders"));
@@ -400,7 +387,8 @@
                 }
             })
             .collect::<Vec<_>>();
-        let columns = parse_wide_columns(&StringRecord::from(headers.clone()), 1).unwrap();
+        let columns =
+            parse_wide_columns(&StringRecord::from(headers.clone()), CmsProfile::V3, 1).unwrap();
         assert_eq!(columns.payers.len(), 1);
         assert_eq!(columns.payers[0].payer_name, "Payer, Inc.");
         assert_eq!(columns.payers[0].plan_name, "Plan A");
@@ -409,7 +397,8 @@
         duplicate.push(
             "STANDARD_CHARGE|payer, inc.|PLAN A|NEGOTIATED_DOLLAR".to_owned(),
         );
-        let error = parse_wide_columns(&StringRecord::from(duplicate), 1).unwrap_err();
+        let error =
+            parse_wide_columns(&StringRecord::from(duplicate), CmsProfile::V3, 1).unwrap_err();
         assert!(error
             .to_string()
             .contains("duplicate wide CSV payer header"));
@@ -418,7 +407,8 @@
             .into_iter()
             .filter(|header| !header.to_ascii_lowercase().starts_with("additional_payer_notes|"))
             .collect::<Vec<_>>();
-        let error = parse_wide_columns(&StringRecord::from(missing_notes), 1).unwrap_err();
+        let error =
+            parse_wide_columns(&StringRecord::from(missing_notes), CmsProfile::V3, 1).unwrap_err();
         assert!(error.to_string().contains("is missing additional_payer_notes"));
 
         let payer_row = |methodology, count, payer_notes| {

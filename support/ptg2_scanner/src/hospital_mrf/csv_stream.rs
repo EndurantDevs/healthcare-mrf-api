@@ -43,9 +43,9 @@ fn parse_wide_records<R: Read>(
             continue;
         }
         service_row_count = service_row_count.saturating_add(1);
-        let service = parse_csv_service(&record, &columns.common)?;
+        let service = parse_csv_service(&record, &columns.common, columns.profile)?;
         let raw_charge = parse_csv_charge(&record, &columns.common, max_fanout_rows)?;
-        let payers = parse_wide_payers(&record, &columns.payers)?;
+        let payers = parse_wide_payers(&record, &columns.payers, columns.profile)?;
         let charge = validate_charge(raw_charge, &payers, true)?;
         if current_service.as_ref() != Some(&service) {
             flush_charge(&mut charge_accumulator, outputs, version_id)?;

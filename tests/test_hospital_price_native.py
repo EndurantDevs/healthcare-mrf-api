@@ -295,6 +295,7 @@ def test_native_summary_is_path_and_contract_bound(tmp_path):
 
     assert receipt.version_id == "a" * 64
     assert receipt.source_format == "json"
+    assert receipt.schema_version == "3.0.0"
     assert len(receipt.artifacts) == 10
     assert receipt.max_fanout_rows == 100_000
     assert receipt.artifact("mrf").kind == "mrf"

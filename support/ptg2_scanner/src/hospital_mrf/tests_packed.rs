@@ -31,6 +31,109 @@ fn import_packed_json(
     import_packed(InputFormat::Json, payload, max_output_bytes)
 }
 
+#[test]
+fn packed_v2_facts_keep_estimated_and_comparison_amounts_distinct() {
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&fixture_v2_json("2.2.1")).unwrap();
+    let charge = &mut payload["standard_charge_information"][0]["standard_charges"][0];
+    charge["minimum"] = json!(8);
+    charge["maximum"] = json!(10);
+    charge["payers_information"][0]["standard_charge_dollar"] = json!(8.5);
+    let payload = serde_json::to_vec(&payload).unwrap();
+    let (directory, summary) = import_packed_json(&payload, TEST_MAX_OUTPUT_BYTES);
+    assert_eq!(summary.schema_version, "2.2.1");
+    assert_eq!(summary.contract, "hospital-mrf-copy-v2-v3-packed-v3");
+    let payloads = super::packed_output_tests::payloads(
+        &directory.path().join("output/fact_block.copy"),
+    );
+    let facts = crate::hospital_price_block::decode_fact_block(
+        &payloads[0],
+        None,
+        None,
+        0,
+        crate::hospital_price_block::HOSPITAL_PRICE_FACT_BLOCK_MAX_ROWS,
+    )
+    .unwrap();
+    assert_eq!(facts[0].estimated_amount.as_deref(), Some("9.125"));
+    assert_eq!(facts[0].comparison_amount.as_deref(), Some("8.5"));
+
+    let zipped_directory = tempfile::tempdir().unwrap();
+    let input_path = zipped_directory.path().join("input.zip");
+    fs::write(
+        &input_path,
+        zip_bytes(&[("prices.json", &payload)], CompressionMethod::Deflated),
+    )
+    .unwrap();
+    let output_directory = zipped_directory.path().join("output");
+    fs::create_dir(&output_directory).unwrap();
+    let zipped = import_hospital_mrf_with_output_mode(
+        InputFormat::Json,
+        VERSION_ID,
+        &input_path,
+        &output_directory,
+        HospitalMrfLimits::new(
+            DEFAULT_MAX_FANOUT_ROWS,
+            TEST_MAX_DECOMPRESSED_BYTES,
+            TEST_MAX_OUTPUT_BYTES,
+        ),
+        HospitalMrfOutputMode::Packed,
+    )
+    .unwrap();
+    assert_eq!(zipped.schema_version, "2.2.1");
+    assert_eq!(zipped.contract, "hospital-mrf-copy-v2-v3-packed-v3");
+    assert_eq!(
+        summary
+            .artifacts
+            .iter()
+            .map(|artifact| (&artifact.kind, &artifact.sha256))
+            .collect::<Vec<_>>(),
+        zipped
+            .artifacts
+            .iter()
+            .map(|artifact| (&artifact.kind, &artifact.sha256))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn packed_csv_v2_tall_and_wide_keep_estimated_facts_identical() {
+    let (tall_directory, tall) = import_packed(
+        InputFormat::TallCsv,
+        &fixture_v2_csv(InputFormat::TallCsv, "2.0.0"),
+        TEST_MAX_OUTPUT_BYTES,
+    );
+    let (_, wide) = import_packed(
+        InputFormat::WideCsv,
+        &fixture_v2_csv(InputFormat::WideCsv, "2.0.0"),
+        TEST_MAX_OUTPUT_BYTES,
+    );
+    assert_eq!(tall.schema_version, "2.0.0");
+    assert_eq!(wide.schema_version, "2.0.0");
+    assert_eq!(
+        tall.artifacts
+            .iter()
+            .map(|artifact| (&artifact.kind, &artifact.sha256))
+            .collect::<Vec<_>>(),
+        wide.artifacts
+            .iter()
+            .map(|artifact| (&artifact.kind, &artifact.sha256))
+            .collect::<Vec<_>>()
+    );
+    let payloads = super::packed_output_tests::payloads(
+        &tall_directory.path().join("output/fact_block.copy"),
+    );
+    let facts = crate::hospital_price_block::decode_fact_block(
+        &payloads[0],
+        None,
+        None,
+        0,
+        crate::hospital_price_block::HOSPITAL_PRICE_FACT_BLOCK_MAX_ROWS,
+    )
+    .unwrap();
+    assert_eq!(facts[0].estimated_amount.as_deref(), Some("9.125"));
+    assert_eq!(facts[0].comparison_amount.as_deref(), Some("9.125"));
+}
+
 fn assert_packed_nul_rejected(payload: &serde_json::Value) {
     let directory = tempfile::tempdir().unwrap();
     let input_path = directory.path().join("input.json");
@@ -70,7 +173,7 @@ fn legacy_summary_contract_and_serialization_stay_unchanged() {
     )
     .unwrap();
     let value = serde_json::to_value(summary).unwrap();
-    assert_eq!(value["contract"], "hospital-mrf-copy-v3");
+    assert_eq!(value["contract"], "hospital-mrf-copy-v2-v3");
     assert_eq!(value["schema_revision"], HOSPITAL_MRF_SCHEMA_REVISION);
     assert_eq!(value["artifacts"].as_array().unwrap().len(), 11);
     assert!(value.get("root").is_none());
@@ -126,7 +229,7 @@ fn packed_mode_rejects_nul_in_each_packed_row_kind() {
 fn packed_mode_emits_ordered_artifacts_root_and_shared_budget() {
     let payload = fixture_json();
     let (directory, summary) = import_packed_json(&payload, TEST_MAX_OUTPUT_BYTES);
-    assert_eq!(summary.contract, "hospital-mrf-copy-v3-packed-v2");
+    assert_eq!(summary.contract, "hospital-mrf-copy-v2-v3-packed-v3");
     assert_eq!(summary.schema_revision, HOSPITAL_MRF_PACKED_SCHEMA_REVISION);
     assert_eq!(
         summary
@@ -300,7 +403,9 @@ fn output_collisions_preserve_unowned_symlinks() {
     .unwrap();
     let occupied = directory.path().join("mrf.copy");
     symlink(directory.path().join("missing"), &occupied).unwrap();
-    assert!(outputs.finish().is_err());
+    assert!(outputs
+        .finish(HOSPITAL_MRF_SCHEMA_VERSION.to_owned())
+        .is_err());
     assert!(fs::symlink_metadata(&occupied)
         .unwrap()
         .file_type()
@@ -379,6 +484,8 @@ fn packed_zip_matches_plain_and_late_finish_failure_cleans_everything() {
             .writer
             .take(),
     );
-    assert!(outputs.finish().is_err());
+    assert!(outputs
+        .finish(HOSPITAL_MRF_SCHEMA_VERSION.to_owned())
+        .is_err());
     assert_eq!(fs::read_dir(cleanup.path()).unwrap().count(), 0);
 }

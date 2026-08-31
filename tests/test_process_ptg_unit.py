@@ -1478,6 +1478,28 @@ def test_import_row_split_keeps_facade_helpers_stable():
     assert process_ptg._ptg2_plan_rows is ptg_import_rows._ptg2_plan_rows
 
 
+def test_ptg2_context_row_hashes_its_canonical_payload():
+    plan_by_field = {"plan_id": "plan-1", "plan_name": "Plan One"}
+    payload_by_field = {
+        "domain": ptg_domain.PTG2_DOMAIN_IN_NETWORK,
+        "plan": plan_by_field,
+        "import_month": "2026-08-01",
+        "source_file_version_id": None,
+    }
+
+    row = ptg_import_rows._ptg2_context_row(
+        plan_by_field,
+        datetime.date(2026, 8, 1),
+        None,
+    )
+
+    assert row["canonical_payload"] == payload_by_field
+    assert row["context_hash"] == ptg_canonical.semantic_hash(
+        payload_by_field,
+        domain="rate_set_context",
+    )
+
+
 def test_source_trace_uses_full_sha256_independent_of_compact_hash_mode(monkeypatch):
     source_url = "https://example.test/in-network-rates.json.gz"
 

@@ -109,9 +109,55 @@ fn parse_common_columns(
 
 fn parse_tall_columns(
     headers: &StringRecord,
+    profile: CmsProfile,
     max_fanout_rows: usize,
 ) -> io::Result<TallCsvColumns> {
+    let estimated_amount = find_optional_header(headers, &["estimated_amount"])?;
+    let median_amount = find_optional_header(headers, &["median_amount"])?;
+    let percentile_10 = find_optional_header(headers, &["10th_percentile"])?;
+    let percentile_90 = find_optional_header(headers, &["90th_percentile"])?;
+    let allowed_count = find_optional_header(headers, &["count"])?;
+    let (estimated_amount, median_amount, percentile_10, percentile_90, allowed_count) =
+        match profile {
+            CmsProfile::V2 => {
+                if median_amount.is_some()
+                    || percentile_10.is_some()
+                    || percentile_90.is_some()
+                    || allowed_count.is_some()
+                {
+                    return Err(invalid("CMS CSV data headers mix V2 and V3 payer profiles"));
+                }
+                (
+                    Some(
+                        estimated_amount.ok_or(invalid("missing CSV header estimated_amount"))?,
+                    ),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            CmsProfile::V3 => {
+                if estimated_amount.is_some() {
+                    return Err(invalid("CMS CSV data headers mix V2 and V3 payer profiles"));
+                }
+                (
+                    None,
+                    Some(
+                        median_amount.ok_or(invalid("missing CSV header median_amount"))?,
+                    ),
+                    Some(
+                        percentile_10.ok_or(invalid("missing CSV header 10th_percentile"))?,
+                    ),
+                    Some(
+                        percentile_90.ok_or(invalid("missing CSV header 90th_percentile"))?,
+                    ),
+                    Some(allowed_count.ok_or(invalid("missing CSV header count"))?),
+                )
+            }
+        };
     Ok(TallCsvColumns {
+        profile,
         common: parse_common_columns(headers, max_fanout_rows)?,
         payer_name: find_header(headers, &["payer_name"])?,
         plan_name: find_header(headers, &["plan_name"])?,
@@ -124,10 +170,11 @@ fn parse_tall_columns(
             headers,
             &["standard_charge", "negotiated_algorithm"],
         )?,
-        median_amount: find_header(headers, &["median_amount"])?,
-        percentile_10: find_header(headers, &["10th_percentile"])?,
-        percentile_90: find_header(headers, &["90th_percentile"])?,
-        allowed_count: find_header(headers, &["count"])?,
+        estimated_amount,
+        median_amount,
+        percentile_10,
+        percentile_90,
+        allowed_count,
         methodology: find_header(headers, &["standard_charge", "methodology"])?,
     })
 }
@@ -152,6 +199,7 @@ fn is_wide_payer_placeholder(value: &str) -> bool {
 
 fn parse_wide_columns(
     headers: &StringRecord,
+    profile: CmsProfile,
     max_fanout_rows: usize,
 ) -> io::Result<WideCsvColumns> {
     let mut payer_order = Vec::<(String, String)>::new();
@@ -178,7 +226,8 @@ fn parse_wide_columns(
             [field, _payer, _plan]
                 if matches!(
                     field.as_str(),
-                    "median_amount"
+                    "estimated_amount"
+                        | "median_amount"
                         | "10th_percentile"
                         | "90th_percentile"
                         | "count"
@@ -216,6 +265,7 @@ fn parse_wide_columns(
             "negotiated_dollar" => &mut builder.standard_charge_dollar,
             "negotiated_percentage" => &mut builder.standard_charge_percentage,
             "negotiated_algorithm" => &mut builder.standard_charge_algorithm,
+            "estimated_amount" => &mut builder.estimated_amount,
             "median_amount" => &mut builder.median_amount,
             "10th_percentile" => &mut builder.percentile_10,
             "90th_percentile" => &mut builder.percentile_90,
@@ -233,6 +283,24 @@ fn parse_wide_columns(
         .map(|key| {
             let builder = payers.remove(&key).expect("wide payer key exists");
             let payer_label = format!("{} / {}", builder.payer_name, builder.plan_name);
+            match profile {
+                CmsProfile::V2
+                    if builder.median_amount.is_some()
+                        || builder.percentile_10.is_some()
+                        || builder.percentile_90.is_some()
+                        || builder.allowed_count.is_some() =>
+                {
+                    return Err(invalid(
+                        "CMS CSV data headers mix V2 and V3 payer profiles",
+                    ));
+                }
+                CmsProfile::V3 if builder.estimated_amount.is_some() => {
+                    return Err(invalid(
+                        "CMS CSV data headers mix V2 and V3 payer profiles",
+                    ));
+                }
+                _ => {}
+            }
             Ok(WidePayerColumns {
                 payer_name: builder.payer_name,
                 plan_name: builder.plan_name,
@@ -251,26 +319,46 @@ fn parse_wide_columns(
                     &payer_label,
                     "negotiated_algorithm",
                 )?,
-                median_amount: required_wide_column(
-                    builder.median_amount,
-                    &payer_label,
-                    "median_amount",
-                )?,
-                percentile_10: required_wide_column(
-                    builder.percentile_10,
-                    &payer_label,
-                    "10th_percentile",
-                )?,
-                percentile_90: required_wide_column(
-                    builder.percentile_90,
-                    &payer_label,
-                    "90th_percentile",
-                )?,
-                allowed_count: required_wide_column(
-                    builder.allowed_count,
-                    &payer_label,
-                    "count",
-                )?,
+                estimated_amount: match profile {
+                    CmsProfile::V2 => Some(required_wide_column(
+                        builder.estimated_amount,
+                        &payer_label,
+                        "estimated_amount",
+                    )?),
+                    CmsProfile::V3 => None,
+                },
+                median_amount: match profile {
+                    CmsProfile::V2 => None,
+                    CmsProfile::V3 => Some(required_wide_column(
+                        builder.median_amount,
+                        &payer_label,
+                        "median_amount",
+                    )?),
+                },
+                percentile_10: match profile {
+                    CmsProfile::V2 => None,
+                    CmsProfile::V3 => Some(required_wide_column(
+                        builder.percentile_10,
+                        &payer_label,
+                        "10th_percentile",
+                    )?),
+                },
+                percentile_90: match profile {
+                    CmsProfile::V2 => None,
+                    CmsProfile::V3 => Some(required_wide_column(
+                        builder.percentile_90,
+                        &payer_label,
+                        "90th_percentile",
+                    )?),
+                },
+                allowed_count: match profile {
+                    CmsProfile::V2 => None,
+                    CmsProfile::V3 => Some(required_wide_column(
+                        builder.allowed_count,
+                        &payer_label,
+                        "count",
+                    )?),
+                },
                 methodology: required_wide_column(
                     builder.methodology,
                     &payer_label,
@@ -285,6 +373,7 @@ fn parse_wide_columns(
         })
         .collect::<io::Result<Vec<_>>>()?;
     Ok(WideCsvColumns {
+        profile,
         common: parse_common_columns(headers, max_fanout_rows)?,
         payers,
     })

@@ -55,7 +55,15 @@ class HospitalPriceVersion(Base, JSONOutputMixin):
             "AND parser_contract_sha256 ~ '^[0-9a-f]{64}$' "
             "AND semantic_sha256 ~ '^[0-9a-f]{64}$' "
             "AND source_format IN ('json', 'csv-tall', 'csv-wide') "
-            "AND location_count > 0 AND npi_count > 0 AND license_count > 0 "
+            "AND ((source_format = 'json' AND template_version IN "
+            "('2.2.0', '2.2.1', '3.0.0')) OR (source_format IN "
+            "('csv-tall', 'csv-wide') AND template_version IN "
+            "('2.0.0', '2.2.0', '2.2.1', '3.0.0'))) "
+            "AND ((template_version = '3.0.0' AND npi_count > 0 "
+            "AND attester_name IS NOT NULL) OR (template_version IN "
+            "('2.0.0', '2.2.0', '2.2.1') AND npi_count = 0 "
+            "AND attester_name IS NULL)) "
+            "AND location_count > 0 AND license_count > 0 "
             "AND service_count > 0 AND charge_count > 0 "
             "AND payer_charge_count >= 0",
             name="hospital_price_version_shape_check",
@@ -79,7 +87,7 @@ class HospitalPriceVersion(Base, JSONOutputMixin):
     template_version = Column(String(32), nullable=False)
     attestation_text = Column(TEXT, nullable=False)
     confirm_attestation = Column(Boolean, nullable=False)
-    attester_name = Column(TEXT, nullable=False)
+    attester_name = Column(TEXT)
     location_count = Column(Integer, nullable=False)
     npi_count = Column(Integer, nullable=False)
     license_count = Column(Integer, nullable=False)

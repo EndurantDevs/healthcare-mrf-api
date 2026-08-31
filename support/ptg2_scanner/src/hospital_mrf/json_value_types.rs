@@ -11,12 +11,19 @@ struct JsonCode {
 
 #[derive(Debug, Deserialize)]
 struct JsonDrug {
-    unit: Number,
+    unit: JsonDrugUnit,
     #[serde(
         rename = "type",
         deserialize_with = "deserialize_json_retained_string"
     )]
     drug_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum JsonDrugUnit {
+    Number(Number),
+    String(JsonRetainedString),
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +81,8 @@ struct JsonPayer {
         deserialize_with = "deserialize_optional_json_retained_string"
     )]
     standard_charge_algorithm: Option<String>,
+    #[serde(default)]
+    estimated_amount: Option<Number>,
     #[serde(default)]
     median_amount: Option<Number>,
     #[serde(default, rename = "10th_percentile")]

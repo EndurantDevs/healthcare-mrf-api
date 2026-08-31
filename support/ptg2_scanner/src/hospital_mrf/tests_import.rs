@@ -259,8 +259,8 @@
         let payer_charge = String::from_utf8(rows["payer_charge"].clone()).unwrap();
         let payer_fields = payer_charge.trim_end().split('\t').collect::<Vec<_>>();
         assert_eq!(payer_fields.len(), PAYER_CHARGE_COPY_COLUMNS.len());
-        assert_eq!(payer_fields[12], "1 through 10");
-        assert_eq!(payer_fields[14], "Tall payer note");
+        assert_eq!(payer_fields[13], "1 through 10");
+        assert_eq!(payer_fields[15], "Tall payer note");
     }
 
     #[test]
@@ -367,7 +367,7 @@
             .map(|line| line.split('\t').collect::<Vec<_>>())
             .collect::<Vec<_>>();
         assert_eq!(merged_payer_fields.len(), 2);
-        assert_eq!(merged_payer_fields[1][12], "1 through 10");
+        assert_eq!(merged_payer_fields[1][13], "1 through 10");
 
         let mut json_value: serde_json::Value = serde_json::from_slice(&fixture_json()).unwrap();
         json_value["standard_charge_information"][0]["standard_charges"][0]
@@ -405,7 +405,7 @@
         assert_eq!(payer_fields.len(), 2);
         assert_eq!(payer_fields[0][5], "A Plan");
         assert_eq!(payer_fields[1][5], "Plan A");
-        assert_eq!(payer_fields[1][12], "1 through 10");
+        assert_eq!(payer_fields[1][13], "1 through 10");
         assert_eq!(
             String::from_utf8(json_rows["modifier"].clone()).unwrap(),
             "fixture-version\t0\t25\tProfessional component\toutpatient\t\\N\n"

@@ -312,6 +312,10 @@ fn hospital_price_fact_payload<'py>(
                 hospital_price_py_value(py, fact.negotiated_algorithm.as_deref()),
             ),
             (
+                "estimated_amount",
+                hospital_price_py_value(py, fact.estimated_amount.as_deref()),
+            ),
+            (
                 "methodology",
                 hospital_price_py_value(py, fact.methodology.as_str()),
             ),

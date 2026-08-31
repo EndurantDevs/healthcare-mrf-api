@@ -2,7 +2,15 @@ fn csv_value(record: &StringRecord, column: usize) -> &str {
     record.get(column).unwrap_or("").trim()
 }
 
-fn parse_csv_service(record: &StringRecord, columns: &CommonCsvColumns) -> io::Result<ServiceRow> {
+fn csv_profile_value(record: &StringRecord, column: Option<usize>) -> &str {
+    column.map_or("", |column| csv_value(record, column))
+}
+
+fn parse_csv_service(
+    record: &StringRecord,
+    columns: &CommonCsvColumns,
+    profile: CmsProfile,
+) -> io::Result<ServiceRow> {
     let mut codes = Vec::new();
     for code_columns in &columns.codes {
         let code = csv_value(record, code_columns.code);
@@ -20,7 +28,7 @@ fn parse_csv_service(record: &StringRecord, columns: &CommonCsvColumns) -> io::R
     }
     let drug_unit = optional_decimal(csv_value(record, columns.drug_unit), "drug unit")?;
     let drug_type = optional_text(csv_value(record, columns.drug_type));
-    validate_service(
+    let service = validate_service(
         ServiceRow {
             description: csv_value(record, columns.description).to_owned(),
             codes,
@@ -28,7 +36,16 @@ fn parse_csv_service(record: &StringRecord, columns: &CommonCsvColumns) -> io::R
             drug_type,
         },
         true,
-    )
+    )?;
+    if profile == CmsProfile::V2
+        && service
+            .codes
+            .iter()
+            .any(|code| is_v3_only_code_type(&code.code_type))
+    {
+        return Err(invalid("CMS CSV V2 uses a V3-only code type"));
+    }
+    Ok(service)
 }
 
 fn parse_csv_charge(
@@ -190,36 +207,38 @@ fn parse_tall_payer(
     generic_notes: Option<&str>,
 ) -> io::Result<Option<PayerChargeRow>> {
     let relevant_columns = [
-        columns.payer_name,
-        columns.plan_name,
-        columns.standard_charge_dollar,
-        columns.standard_charge_percentage,
-        columns.standard_charge_algorithm,
+        Some(columns.payer_name),
+        Some(columns.plan_name),
+        Some(columns.standard_charge_dollar),
+        Some(columns.standard_charge_percentage),
+        Some(columns.standard_charge_algorithm),
+        columns.estimated_amount,
         columns.median_amount,
         columns.percentile_10,
         columns.percentile_90,
         columns.allowed_count,
-        columns.methodology,
+        Some(columns.methodology),
     ];
     if relevant_columns
         .iter()
-        .all(|column| csv_value(record, *column).is_empty())
+        .all(|column| csv_profile_value(record, *column).is_empty())
     {
         return Ok(None);
     }
     if [
-        columns.payer_name,
-        columns.plan_name,
-        columns.standard_charge_dollar,
-        columns.standard_charge_percentage,
-        columns.standard_charge_algorithm,
+        Some(columns.payer_name),
+        Some(columns.plan_name),
+        Some(columns.standard_charge_dollar),
+        Some(columns.standard_charge_percentage),
+        Some(columns.standard_charge_algorithm),
+        columns.estimated_amount,
         columns.median_amount,
         columns.percentile_10,
         columns.percentile_90,
     ]
     .iter()
-    .all(|column| csv_value(record, *column).trim().is_empty())
-        && csv_value(record, columns.allowed_count).trim() == "0"
+    .all(|column| csv_profile_value(record, *column).trim().is_empty())
+        && csv_profile_value(record, columns.allowed_count).trim() == "0"
         && generic_notes.is_some_and(|notes| !notes.trim().is_empty())
     {
         let methodology = csv_value(record, columns.methodology).trim();
@@ -228,7 +247,7 @@ fn parse_tall_payer(
         }
         return Ok(None);
     }
-    validate_payer(
+    validate_csv_payer(
         PayerChargeRow {
             payer_name: csv_value(record, columns.payer_name).to_owned(),
             plan_name: csv_value(record, columns.plan_name).to_owned(),
@@ -244,19 +263,23 @@ fn parse_tall_payer(
                 record,
                 columns.standard_charge_algorithm,
             )),
+            estimated_amount: optional_decimal(
+                csv_profile_value(record, columns.estimated_amount),
+                "estimated_amount",
+            )?,
             median_amount: optional_decimal(
-                csv_value(record, columns.median_amount),
+                csv_profile_value(record, columns.median_amount),
                 "median_amount",
             )?,
             percentile_10: optional_decimal(
-                csv_value(record, columns.percentile_10),
+                csv_profile_value(record, columns.percentile_10),
                 "10th_percentile",
             )?,
             percentile_90: optional_decimal(
-                csv_value(record, columns.percentile_90),
+                csv_profile_value(record, columns.percentile_90),
                 "90th_percentile",
             )?,
-            allowed_count: optional_text(csv_value(record, columns.allowed_count))
+            allowed_count: optional_text(csv_profile_value(record, columns.allowed_count))
                 .as_deref()
                 .map(|value| allowed_count(value, true))
                 .transpose()?,
@@ -265,6 +288,7 @@ fn parse_tall_payer(
         },
         generic_notes,
         true,
+        columns.profile,
     )
     .map(Some)
 }
@@ -272,22 +296,24 @@ fn parse_tall_payer(
 fn parse_wide_payers(
     record: &StringRecord,
     columns: &[WidePayerColumns],
+    profile: CmsProfile,
 ) -> io::Result<Vec<PayerChargeRow>> {
     let mut payers = Vec::new();
     for payer in columns {
         let relevant_columns = [
-            payer.standard_charge_dollar,
-            payer.standard_charge_percentage,
-            payer.standard_charge_algorithm,
+            Some(payer.standard_charge_dollar),
+            Some(payer.standard_charge_percentage),
+            Some(payer.standard_charge_algorithm),
+            payer.estimated_amount,
             payer.median_amount,
             payer.percentile_10,
             payer.percentile_90,
             payer.allowed_count,
-            payer.methodology,
+            Some(payer.methodology),
         ];
         if relevant_columns
             .iter()
-            .all(|column| csv_value(record, *column).is_empty())
+            .all(|column| csv_profile_value(record, *column).is_empty())
         {
             continue;
         }
@@ -306,19 +332,23 @@ fn parse_wide_payers(
                 record,
                 payer.standard_charge_algorithm,
             )),
+            estimated_amount: optional_decimal(
+                csv_profile_value(record, payer.estimated_amount),
+                "estimated_amount",
+            )?,
             median_amount: optional_decimal(
-                csv_value(record, payer.median_amount),
+                csv_profile_value(record, payer.median_amount),
                 "median_amount",
             )?,
             percentile_10: optional_decimal(
-                csv_value(record, payer.percentile_10),
+                csv_profile_value(record, payer.percentile_10),
                 "10th_percentile",
             )?,
             percentile_90: optional_decimal(
-                csv_value(record, payer.percentile_90),
+                csv_profile_value(record, payer.percentile_90),
                 "90th_percentile",
             )?,
-            allowed_count: optional_text(csv_value(record, payer.allowed_count))
+            allowed_count: optional_text(csv_profile_value(record, payer.allowed_count))
                 .as_deref()
                 .map(|value| allowed_count(value, true))
                 .transpose()?,
@@ -331,6 +361,7 @@ fn parse_wide_payers(
         if parsed.standard_charge_dollar.is_none()
             && parsed.standard_charge_percentage.is_none()
             && parsed.standard_charge_algorithm.is_none()
+            && !(profile == CmsProfile::V2 && parsed.estimated_amount.is_some())
         {
             let methodology = optional_text(&parsed.methodology)
                 .map(|value| canonical_methodology(&value, true))
@@ -344,7 +375,7 @@ fn parse_wide_payers(
             }
             continue;
         }
-        payers.push(validate_payer(parsed, None, true)?);
+        payers.push(validate_csv_payer(parsed, None, true, profile)?);
     }
     Ok(payers)
 }
@@ -405,7 +436,7 @@ fn parse_tall_records<R: Read>(
         }
         service_row_count = service_row_count.saturating_add(1);
         current_modifier = None;
-        let service = parse_csv_service(&record, &columns.common)?;
+        let service = parse_csv_service(&record, &columns.common, columns.profile)?;
         let mut raw_charge = parse_csv_charge(&record, &columns.common, max_fanout_rows)?;
         let payer = parse_tall_payer(
             &record,

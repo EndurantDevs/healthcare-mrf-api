@@ -76,6 +76,37 @@
         .unwrap()
     }
 
+    fn fixture_v2_json(version: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "hospital_name": "North, Hospital",
+            "last_updated_on": "2025-04-01",
+            "version": version,
+            "hospital_location": ["Main, Campus"],
+            "hospital_address": ["1 Main Street"],
+            "license_information": {"license_number": "A-1", "state": "CA"},
+            "affirmation": {
+                "affirmation": "To the best of its knowledge and belief, the hospital has included all applicable standard charge information in accordance with the requirements of 45 CFR 180.50, and the information encoded is true, accurate, and complete as of the date indicated.",
+                "confirm_affirmation": true
+            },
+            "standard_charge_information": [{
+                "description": "Drug",
+                "code_information": [{"code": "0001", "type": "NDC"}],
+                "drug_information": {"unit": "2.50", "type": "ML"},
+                "standard_charges": [{
+                    "setting": "outpatient",
+                    "payers_information": [{
+                        "payer_name": "Payer, Inc.",
+                        "plan_name": "Plan A",
+                        "standard_charge_percentage": 80,
+                        "estimated_amount": 9.125,
+                        "methodology": "fee schedule"
+                    }]
+                }]
+            }]
+        }))
+        .unwrap()
+    }
+
     fn general_rows(width: usize) -> (Vec<String>, Vec<String>) {
         let mut headers = vec![
             "hospital_name".to_owned(),
@@ -251,6 +282,14 @@
     }
 
     fn run_fixture(format: InputFormat, payload: &[u8], gzip: bool) -> BTreeMap<String, Vec<u8>> {
+        run_fixture_with_summary(format, payload, gzip).0
+    }
+
+    fn run_fixture_with_summary(
+        format: InputFormat,
+        payload: &[u8],
+        gzip: bool,
+    ) -> (BTreeMap<String, Vec<u8>>, HospitalMrfSummary) {
         let directory = tempfile::tempdir().unwrap();
         let input_path = directory
             .path()
@@ -274,7 +313,7 @@
         )
         .unwrap();
         assert_eq!(summary.version_id, VERSION_ID);
-        assert_eq!(summary.contract, "hospital-mrf-copy-v3");
+        assert_eq!(summary.contract, "hospital-mrf-copy-v2-v3");
         assert_eq!(
             summary.max_decompressed_bytes,
             DEFAULT_MAX_DECOMPRESSED_BYTES
@@ -285,7 +324,7 @@
             .artifacts
             .iter()
             .all(|artifact| artifact.path.ends_with(&format!("{}.copy", artifact.kind))));
-        CopyKind::ALL
+        let rows = CopyKind::ALL
             .into_iter()
             .map(|kind| {
                 (
@@ -293,7 +332,8 @@
                     fs::read(output_directory.join(format!("{}.copy", kind.name()))).unwrap(),
                 )
             })
-            .collect()
+            .collect();
+        (rows, summary)
     }
 
     fn zip_bytes(entries: &[(&str, &[u8])], method: CompressionMethod) -> Vec<u8> {

@@ -20,6 +20,7 @@ from api.hospital_price_serving_sql import SERVICE_BLOCK_SQL
 from api.hospital_price_serving_sql import VERSION_SQL
 from support.hospital_price_native_validation import (
     HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256,
+    HOSPITAL_MRF_PACKED_V2_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
 )
 
@@ -384,6 +385,12 @@ async def test_version_contract_and_cursor_generation_fail_closed(monkeypatch):
             parser_contract_sha256=HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256,
         ),
     ))["format_version"] == 1
+    assert serving._validated_version((
+        _version(
+            format_version=2,
+            parser_contract_sha256=HOSPITAL_MRF_PACKED_V2_PARSER_CONTRACT_SHA256,
+        ),
+    ))["format_version"] == 2
     assert serving._validated_version((
         _version(template_version="2.0.0"),
     ))["template_version"] == "2.0.0"

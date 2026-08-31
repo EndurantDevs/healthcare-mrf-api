@@ -78,7 +78,7 @@ def _receipt(native: Any, directory: Path) -> Any:
             )
         )
     return native.HospitalParserReceipt(
-        "a" * 64, "json", "b" * 64, 100_000, 2048, 1024,
+        "a" * 64, "json", "3.0.0", "b" * 64, 100_000, 2048, 1024,
         tuple(artifacts),
         native.HospitalPackedRoot(
             service_count=1,

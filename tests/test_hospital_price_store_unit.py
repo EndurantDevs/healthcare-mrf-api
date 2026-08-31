@@ -80,6 +80,7 @@ def _receipt(native: Any, directory: Path, *, row_count: int = 1) -> Any:
     return SimpleNamespace(
         version_id="a" * 64,
         source_format="json",
+        schema_version="3.0.0",
         semantic_sha256="b" * 64,
         artifacts=tuple(artifacts),
         root=SimpleNamespace(
@@ -205,7 +206,7 @@ async def test_copy_and_stage_validation_reject_drift(tmp_path: Path) -> None:
 
     good = _Connection(
         firsts=[(artifact.rows, 0) for artifact in receipt.artifacts],
-        scalars=[False] * 4,
+        scalars=[receipt.schema_version, False],
     )
     await store.validate_stages(good, receipt, stage_by_kind)
     assert sum("CREATE UNIQUE INDEX" in sql for sql in good.statements) == len(
@@ -224,10 +225,14 @@ async def test_copy_and_stage_validation_reject_drift(tmp_path: Path) -> None:
 
     unresolved = _Connection(
         firsts=[(artifact.rows, 0) for artifact in receipt.artifacts],
-        scalars=[True],
+        scalars=[receipt.schema_version, True],
     )
     with pytest.raises(RuntimeError, match="unresolved reference"):
         await store.validate_stages(unresolved, receipt, stage_by_kind)
+
+    wrong_schema = _Connection(firsts=[(1, 0)], scalars=["2.2.1"])
+    with pytest.raises(RuntimeError, match="template version conflicts"):
+        await store.validate_stages(wrong_schema, receipt, stage_by_kind)
 
 
 @pytest.mark.asyncio

@@ -60,57 +60,6 @@ fn validate_charge(
     Ok(charge)
 }
 
-fn validate_payer(
-    mut payer: PayerChargeRow,
-    generic_notes: Option<&str>,
-    normalize_case: bool,
-) -> io::Result<PayerChargeRow> {
-    payer.payer_name = required_text(&payer.payer_name, "payer_name")?.to_owned();
-    payer.plan_name = required_text(&payer.plan_name, "plan_name")?.to_owned();
-    payer.methodology = canonical_methodology(&payer.methodology, normalize_case)?;
-    payer.standard_charge_algorithm = payer
-        .standard_charge_algorithm
-        .as_deref()
-        .and_then(optional_text);
-    payer.additional_payer_notes = payer
-        .additional_payer_notes
-        .as_deref()
-        .and_then(optional_text);
-    if payer.standard_charge_dollar.is_none()
-        && payer.standard_charge_percentage.is_none()
-        && payer.standard_charge_algorithm.is_none()
-    {
-        return Err(invalid(
-            "payer information requires dollar, percentage, or algorithm charge",
-        ));
-    }
-    let derived_charge =
-        payer.standard_charge_percentage.is_some() || payer.standard_charge_algorithm.is_some();
-    if derived_charge {
-        let Some(count) = payer.allowed_count.as_deref() else {
-            return Err(invalid("percentage and algorithm charges require count"));
-        };
-        if count != "0"
-            && (payer.median_amount.is_none()
-                || payer.percentile_10.is_none()
-                || payer.percentile_90.is_none())
-        {
-            return Err(invalid(
-                "percentage and algorithm charges require median, 10th, and 90th percentile amounts",
-            ));
-        }
-    }
-    let has_notes = payer.additional_payer_notes.is_some()
-        || (normalize_case && generic_notes.is_some_and(|value| !value.trim().is_empty()));
-    if payer.methodology == "other" && !has_notes {
-        return Err(invalid("methodology other requires explanatory notes"));
-    }
-    if payer.allowed_count.as_deref() == Some("0") && !has_notes {
-        return Err(invalid("count 0 requires explanatory notes"));
-    }
-    Ok(payer)
-}
-
 fn emit_service(
     outputs: &mut CopyOutputs,
     version_id: &str,
@@ -248,6 +197,7 @@ fn emit_payer(
                 payer.standard_charge_dollar.as_deref(),
                 payer.standard_charge_percentage.as_deref(),
                 payer.standard_charge_algorithm.as_deref(),
+                payer.estimated_amount.as_deref(),
                 payer.median_amount.as_deref(),
                 payer.percentile_10.as_deref(),
                 payer.percentile_90.as_deref(),
@@ -270,6 +220,7 @@ fn emit_payer(
             payer.standard_charge_dollar.as_deref(),
             payer.standard_charge_percentage.as_deref(),
             payer.standard_charge_algorithm.as_deref(),
+            payer.estimated_amount.as_deref(),
             payer.median_amount.as_deref(),
             payer.percentile_10.as_deref(),
             payer.percentile_90.as_deref(),
