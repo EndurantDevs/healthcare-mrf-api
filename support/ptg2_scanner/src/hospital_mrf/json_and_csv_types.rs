@@ -409,7 +409,9 @@ fn emit_json_service(
                 generic_notes.as_deref(),
                 profile_evidence,
             )?;
-            payers.push(payer);
+            if let Some(payer) = payer {
+                payers.push(payer);
+            }
         }
         payers.sort_by(|left, right| {
             left.payer_name

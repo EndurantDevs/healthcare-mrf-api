@@ -48,7 +48,7 @@ fn validate_json_payer(
     payer: PayerChargeRow,
     generic_notes: Option<&str>,
     evidence: &mut JsonProfileEvidence,
-) -> io::Result<PayerChargeRow> {
+) -> io::Result<Option<PayerChargeRow>> {
     let payer = validate_payer_common(payer, generic_notes, false)?;
     if payer.estimated_amount.is_some() {
         evidence.v2("estimated_amount");
@@ -88,7 +88,20 @@ fn validate_json_payer(
     if payer.allowed_count.as_deref() == Some("0") && payer.additional_payer_notes.is_none() {
         evidence.invalidate_v3("count 0 requires explanatory notes");
     }
-    Ok(payer)
+    if !payer_has_charge(&payer) {
+        evidence.invalidate_v3(
+            "payer information requires dollar, percentage, algorithm, or estimated charge",
+        );
+        return Ok(None);
+    }
+    Ok(Some(payer))
+}
+
+fn payer_has_charge(payer: &PayerChargeRow) -> bool {
+    payer.standard_charge_dollar.is_some()
+        || payer.standard_charge_percentage.is_some()
+        || payer.standard_charge_algorithm.is_some()
+        || payer.estimated_amount.is_some()
 }
 
 fn validate_payer_common(
@@ -107,15 +120,6 @@ fn validate_payer_common(
         .additional_payer_notes
         .as_deref()
         .and_then(optional_text);
-    if payer.standard_charge_dollar.is_none()
-        && payer.standard_charge_percentage.is_none()
-        && payer.standard_charge_algorithm.is_none()
-        && payer.estimated_amount.is_none()
-    {
-        return Err(invalid(
-            "payer information requires dollar, percentage, algorithm, or estimated charge",
-        ));
-    }
     let has_notes = payer.additional_payer_notes.is_some()
         || (normalize_case && generic_notes.is_some_and(|value| !value.trim().is_empty()));
     if payer.methodology == "other" && !has_notes {
@@ -129,6 +133,11 @@ fn validate_v3_payer(
     generic_notes: Option<&str>,
     normalize_case: bool,
 ) -> io::Result<()> {
+    if !payer_has_charge(payer) {
+        return Err(invalid(
+            "payer information requires dollar, percentage, algorithm, or estimated charge",
+        ));
+    }
     if payer.estimated_amount.is_some() {
         return Err(invalid("estimated_amount is not valid for CMS V3"));
     }

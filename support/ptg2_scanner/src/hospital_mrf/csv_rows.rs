@@ -247,7 +247,7 @@ fn parse_tall_payer(
         }
         return Ok(None);
     }
-    validate_csv_payer(
+    let payer = validate_csv_payer(
         PayerChargeRow {
             payer_name: csv_value(record, columns.payer_name).to_owned(),
             plan_name: csv_value(record, columns.plan_name).to_owned(),
@@ -289,8 +289,8 @@ fn parse_tall_payer(
         generic_notes,
         true,
         columns.profile,
-    )
-    .map(Some)
+    )?;
+    Ok(payer_has_charge(&payer).then_some(payer))
 }
 
 fn parse_wide_payers(
@@ -358,11 +358,7 @@ fn parse_wide_payers(
                 payer.additional_payer_notes,
             )),
         };
-        if parsed.standard_charge_dollar.is_none()
-            && parsed.standard_charge_percentage.is_none()
-            && parsed.standard_charge_algorithm.is_none()
-            && !(profile == CmsProfile::V2 && parsed.estimated_amount.is_some())
-        {
+        if !payer_has_charge(&parsed) {
             let methodology = optional_text(&parsed.methodology)
                 .map(|value| canonical_methodology(&value, true))
                 .transpose()?;
