@@ -111,8 +111,12 @@ async def _start_signal_child(
     )
 
 
-async def _wait_for_marked_backend(observer, application_name: str) -> int:
-    async with asyncio.timeout(10):
+async def _wait_for_marked_backend(
+    observer,
+    process: asyncio.subprocess.Process,
+    application_name: str,
+) -> int:
+    async with asyncio.timeout(30):
         while True:
             backend_pid = await observer.fetchval(
                 "SELECT pid FROM pg_stat_activity "
@@ -123,6 +127,12 @@ async def _wait_for_marked_backend(observer, application_name: str) -> int:
             )
             if backend_pid is not None:
                 return int(backend_pid)
+            if process.returncode is not None:
+                _stdout, stderr = await process.communicate()
+                pytest.fail(
+                    f"signal child exited {process.returncode} before PostgreSQL "
+                    f"became active: {stderr.decode(errors='replace')}"
+                )
             await asyncio.sleep(0.01)
 
 
@@ -171,7 +181,11 @@ async def test_sigterm_cancels_sql_rolls_back_and_seals_receipt(tmp_path: Path) 
         )
         await observer.execute(f'INSERT INTO "{schema}".marker VALUES (1)')
         process = await _start_signal_child(receipt_path, run_token, schema)
-        backend_pid = await _wait_for_marked_backend(observer, application_name)
+        backend_pid = await _wait_for_marked_backend(
+            observer,
+            process,
+            application_name,
+        )
         process.send_signal(signal.SIGTERM)
         await asyncio.wait_for(process.communicate(), timeout=10)
         await _wait_for_backend_exit(observer, backend_pid)
