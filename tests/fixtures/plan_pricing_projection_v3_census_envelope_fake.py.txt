@@ -317,6 +317,21 @@ elif name == "k3s":
             print("ns1033171")
         elif kind == "namespace":
             pass
+        elif (
+            kind == "pods"
+            and "app.kubernetes.io/name=seed-import-nodes" in args
+        ):
+            if os.environ.get("FAKE_SEED_POD_LIST_ERROR") == "1":
+                raise SystemExit(75)
+            if (
+                os.environ.get("FAKE_SEED_REAPPEAR") == "preexisting-pod"
+                or (
+                    os.environ.get("FAKE_SEED_REAPPEAR") == "pod"
+                    and events.exists()
+                    and "child" in events.read_text()
+                )
+            ):
+                print("pod/seed-import-nodes-test")
         elif kind == "pods" and "-A" in args:
             items = []
             if os.environ.get("FAKE_ARC_LISTENER") == "1":
@@ -404,7 +419,7 @@ elif name == "k3s":
             if (
                 kind == "job"
                 and args[2] == "seed-import-nodes"
-                and os.environ.get("FAKE_SEED_REAPPEAR") == "cleanup"
+                and os.environ.get("FAKE_SEED_REAPPEAR") == "job"
                 and events.exists()
             ):
                 after_child = "child" in events.read_text()
