@@ -885,6 +885,70 @@ async def _activity_done_chunk_ids(redis, run_id: str, snapshot_id: str) -> set[
 async def _activity_completed_rows(redis, run_id: str, snapshot_id: str) -> int:
     return _safe_int(await redis.get(_state_key(run_id, snapshot_id, "activity_rows")), 0)
 
+
+def _emit_activity_chunk_progress(
+    run_id: str,
+    progress: ActivityChunkProgress,
+    max_total: int,
+) -> None:
+    """Publish one live activity-chunk progress observation."""
+
+    byte_message = ""
+    if progress.bytes_total > 0:
+        byte_message = (
+            f" bytes={_format_bytes(progress.bytes_done)}/"
+            f"{_format_bytes(progress.bytes_total)}"
+        )
+    enqueue_live_progress(
+        run_id=run_id,
+        importer="partd-formulary-network",
+        status="running",
+        phase="partd activity chunks running",
+        unit="chunks",
+        done=progress.done_chunks,
+        total=max_total,
+        pct=progress.pct(),
+        message=(
+            f"activity chunks done={progress.done_chunks}/{max_total} "
+            f"started={progress.started_chunks} rows={progress.row_count:,}"
+            f"{byte_message}"
+        ),
+    )
+
+
+def _emit_activity_chunk_fallback(
+    run_id: str,
+    snapshot_id: str,
+    progress: ActivityChunkProgress,
+    max_total: int,
+    stall_seconds: float,
+) -> None:
+    """Publish one stalled activity-chunk fallback observation."""
+
+    print(
+        f"[partd] activity chunk progress stalled snapshot={snapshot_id} "
+        f"done={progress.done_chunks}/{max_total} rows={progress.row_count} "
+        f"bytes={progress.bytes_done}/{progress.bytes_total} "
+        f"stall_seconds={int(stall_seconds)}; "
+        f"falling back to local processing for remaining chunks",
+        flush=True,
+    )
+    enqueue_live_progress(
+        run_id=run_id,
+        importer="partd-formulary-network",
+        status="running",
+        phase="partd activity chunk fallback",
+        unit="chunks",
+        done=progress.done_chunks,
+        total=max_total,
+        pct=progress.pct(),
+        message=(
+            f"activity chunk progress stalled; processing remaining "
+            f"{max_total - progress.done_chunks} chunk(s) locally"
+        ),
+    )
+
+
 async def _wait_for_activity_chunks(redis, run_id: str, snapshot_id: str, total_chunks: int) -> tuple[int, set[str]]:
     """Wait for all activity chunks while detecting stalled work."""
     if total_chunks <= 0:
@@ -914,51 +978,11 @@ async def _wait_for_activity_chunks(redis, run_id: str, snapshot_id: str, total_
         stall_seconds = (datetime.datetime.utcnow() - last_progress_at).total_seconds()
         now_monotonic = time.monotonic()
         if has_progress_advanced or now_monotonic - last_emit_at >= 30.0:
-            pct = progress.pct()
-            byte_message = ""
-            if progress.bytes_total > 0:
-                byte_message = (
-                    f" bytes={_format_bytes(progress.bytes_done)}/"
-                    f"{_format_bytes(progress.bytes_total)}"
-                )
-            enqueue_live_progress(
-                run_id=run_id,
-                importer="partd-formulary-network",
-                status="running",
-                phase="partd activity chunks running",
-                unit="chunks",
-                done=progress.done_chunks,
-                total=max_total,
-                pct=pct,
-                message=(
-                    f"activity chunks done={progress.done_chunks}/{max_total} "
-                    f"started={progress.started_chunks} rows={progress.row_count:,}"
-                    f"{byte_message}"
-                ),
-            )
+            _emit_activity_chunk_progress(run_id, progress, max_total)
             last_emit_at = now_monotonic
         if stall_seconds >= PARTD_CHUNK_STALL_SECONDS:
-            print(
-                f"[partd] activity chunk progress stalled snapshot={snapshot_id} "
-                f"done={progress.done_chunks}/{max_total} rows={progress.row_count} "
-                f"bytes={progress.bytes_done}/{progress.bytes_total} "
-                f"stall_seconds={int(stall_seconds)}; "
-                f"falling back to local processing for remaining chunks",
-                flush=True,
-            )
-            enqueue_live_progress(
-                run_id=run_id,
-                importer="partd-formulary-network",
-                status="running",
-                phase="partd activity chunk fallback",
-                unit="chunks",
-                done=progress.done_chunks,
-                total=max_total,
-                pct=progress.pct(),
-                message=(
-                    f"activity chunk progress stalled; processing remaining "
-                    f"{max_total - progress.done_chunks} chunk(s) locally"
-                ),
+            _emit_activity_chunk_fallback(
+                run_id, snapshot_id, progress, max_total, stall_seconds
             )
             return await _activity_completed_rows(redis, run_id, snapshot_id), await _activity_done_chunk_ids(
                 redis,
@@ -1929,72 +1953,78 @@ def _new_activity_stage_row(activity_fields: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _activity_stage_rows(
+    source_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Aggregate duplicate activity rows within one chunk."""
+
+    aggregate_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for activity_fields in source_rows:
+        plan_id = str(activity_fields.get("plan_id") or "").strip()
+        if not plan_id:
+            continue
+        key = _activity_stage_key(activity_fields)
+        aggregated_field_map = aggregate_by_key.get(key)
+        if aggregated_field_map is None:
+            aggregated_field_map = _new_activity_stage_row(activity_fields)
+            aggregate_by_key[key] = aggregated_field_map
+        else:
+            aggregated_field_map["address_observed_in_source"] = bool(
+                aggregated_field_map.get("address_observed_in_source")
+                or activity_fields.get("address_observed_in_source")
+            )
+        aggregated_field_map["_plans"].add(plan_id[:32])
+
+    aggregated_rows: list[dict[str, Any]] = []
+    for aggregated_field_map in aggregate_by_key.values():
+        plans = sorted(aggregated_field_map.pop("_plans"))
+        if not plans:
+            continue
+        aggregated_field_map["plan_ids"] = plans
+        aggregated_rows.append(aggregated_field_map)
+    return aggregated_rows
+
+
+def _pricing_stage_rows(
+    source_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Discard exact duplicate pricing rows within one chunk."""
+
+    seen_keys: set[tuple[Any, ...]] = set()
+    deduplicated_rows: list[dict[str, Any]] = []
+    for pricing_fields in source_rows:
+        key = (
+            pricing_fields.get("snapshot_id"),
+            pricing_fields.get("plan_id"),
+            pricing_fields.get("year"),
+            pricing_fields.get("code_system"),
+            pricing_fields.get("code"),
+            pricing_fields.get("normalized_code"),
+            pricing_fields.get("rxnorm_id"),
+            pricing_fields.get("ndc11"),
+            pricing_fields.get("days_supply"),
+            pricing_fields.get("drug_name"),
+            pricing_fields.get("tier"),
+            pricing_fields.get("pharmacy_type"),
+            pricing_fields.get("mail_order"),
+            pricing_fields.get("cost_type"),
+            pricing_fields.get("cost_amount"),
+            pricing_fields.get("effective_from"),
+            pricing_fields.get("effective_to"),
+            pricing_fields.get("source_type"),
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduplicated_rows.append(pricing_fields)
+    return deduplicated_rows
+
+
 async def _flush_batches(
     activity_batch_rows: list[dict[str, Any]],
     pricing_batch_rows: list[dict[str, Any]],
 ) -> None:
     """Flush normalized activity and pricing batches to staging."""
-    def _activity_stage_rows(
-        source_rows: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Aggregate duplicate activity rows within one chunk."""
-        # Chunk-level pre-aggregation to reduce stage footprint before COPY.
-        aggregate_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
-        for activity_fields in source_rows:
-            plan_id = str(activity_fields.get("plan_id") or "").strip()
-            if not plan_id:
-                continue
-            key = _activity_stage_key(activity_fields)
-            aggregated_field_map = aggregate_by_key.get(key)
-            if aggregated_field_map is None:
-                aggregated_field_map = _new_activity_stage_row(activity_fields)
-                aggregate_by_key[key] = aggregated_field_map
-            else:
-                aggregated_field_map["address_observed_in_source"] = bool(
-                    aggregated_field_map.get("address_observed_in_source")
-                    or activity_fields.get("address_observed_in_source")
-                )
-            aggregated_field_map["_plans"].add(plan_id[:32])
-
-        aggregated_rows: list[dict[str, Any]] = []
-        for aggregated_field_map in aggregate_by_key.values():
-            plans = sorted(aggregated_field_map.pop("_plans"))
-            if not plans:
-                continue
-            aggregated_field_map["plan_ids"] = plans
-            aggregated_rows.append(aggregated_field_map)
-        return aggregated_rows
-
-    def _pricing_stage_rows(source_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        seen_keys: set[tuple[Any, ...]] = set()
-        deduplicated_rows: list[dict[str, Any]] = []
-        for pricing_fields in source_rows:
-            key = (
-                pricing_fields.get("snapshot_id"),
-                pricing_fields.get("plan_id"),
-                pricing_fields.get("year"),
-                pricing_fields.get("code_system"),
-                pricing_fields.get("code"),
-                pricing_fields.get("normalized_code"),
-                pricing_fields.get("rxnorm_id"),
-                pricing_fields.get("ndc11"),
-                pricing_fields.get("days_supply"),
-                pricing_fields.get("drug_name"),
-                pricing_fields.get("tier"),
-                pricing_fields.get("pharmacy_type"),
-                pricing_fields.get("mail_order"),
-                pricing_fields.get("cost_type"),
-                pricing_fields.get("cost_amount"),
-                pricing_fields.get("effective_from"),
-                pricing_fields.get("effective_to"),
-                pricing_fields.get("source_type"),
-            )
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            deduplicated_rows.append(pricing_fields)
-        return deduplicated_rows
-
     tasks: list[Any] = []
     if activity_batch_rows:
         activity_rows = _activity_stage_rows(list(activity_batch_rows))

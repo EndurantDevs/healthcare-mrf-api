@@ -329,8 +329,13 @@ async def test_graph_request_short_circuits_proven_empty_scopes(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("code", ("73721", "93306"))
-async def test_distance_intersects_only_nearby_v4_sets(monkeypatch, code):
+@pytest.mark.parametrize(
+    ("code_system", "code"),
+    (("CPT", "73721"), ("CPT", "93306"), ("HCPCS", "G0439")),
+)
+async def test_distance_intersects_only_nearby_v4_sets(
+    monkeypatch, code_system, code
+):
     """Grow the ordered nearby prefix without materializing a national code scope."""
 
     location_limits, rate_sets = _install_local_distance_reads(monkeypatch)
@@ -340,12 +345,12 @@ async def test_distance_intersects_only_nearby_v4_sets(monkeypatch, code):
         _local_distance_tables(),
         {
             "code": code,
-            "code_system": "CPT",
+            "code_system": code_system,
             "lat": 41.9,
             "long": -87.65,
         },
         requested_code=code,
-        requested_system="CPT",
+        requested_system=code_system,
         plan_id="synthetic-plan",
         candidate_limit=2,
     )

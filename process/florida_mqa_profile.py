@@ -2644,16 +2644,9 @@ def _profile_master_facts(
     return facts
 
 
-def _state_license_fact_payload(
-    profile_source: FloridaSource,
-    source_row: Mapping[str, str],
-    *,
-    run_id: str,
-    record_id: str,
-    npi: int | None,
-    artifact: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Publish reviewed license fields while keeping contact/identity data raw-only."""
+def _state_license_fields_by_name(source_row: Mapping[str, str]) -> dict[str, Any]:
+    """Shape the reviewed source fields for one Florida license fact."""
+
     original_date, _ = _normalize_source_date(
         _first(source_row, "orig_dte", "original_date")
     )
@@ -2674,35 +2667,65 @@ def _state_license_fact_payload(
     )
     safe_indicators = _without_empty(
         {
-            "multi_state_license": source_row.get(
-                "multi_state_license_indicator",
-                "",
-            ),
+            "multi_state_license": source_row.get("multi_state_license_indicator", ""),
             "prescribing": source_row.get("prescribe_ind", ""),
             "dispensing": source_row.get("dispensing_ind", ""),
             "other_license": source_row.get("other_license", ""),
         }
     )
-    field_value = _without_empty(
-        {
-            "jurisdiction": "FL",
-            "profession_code": profession_code,
-            "profession": source_row.get("profession_name", ""),
-            "rank_code": rank_code,
-            "license_number": license_number,
-            "status": status,
-            "active_status": active_status,
-            "original_issue_date": original_date,
-            "expiration_date": expiration_date,
-            "status_effective_date": status_effective_date,
-            "modifiers": source_row.get("mod_cdes", ""),
-            "license_indicators": safe_indicators,
-        }
-    )
+    return {
+        "original_date": original_date,
+        "expiration_date": expiration_date,
+        "status_effective_date": status_effective_date,
+        "profession_code": profession_code,
+        "profession": source_row.get("profession_name", ""),
+        "rank_code": rank_code,
+        "license_number": license_number,
+        "status": status,
+        "active_status": active_status,
+        "value_json": _without_empty(
+            {
+                "jurisdiction": "FL",
+                "profession_code": profession_code,
+                "profession": source_row.get("profession_name", ""),
+                "rank_code": rank_code,
+                "license_number": license_number,
+                "status": status,
+                "active_status": active_status,
+                "original_issue_date": original_date,
+                "expiration_date": expiration_date,
+                "status_effective_date": status_effective_date,
+                "modifiers": source_row.get("mod_cdes", ""),
+                "license_indicators": safe_indicators,
+            }
+        ),
+    }
+
+
+def _state_license_fact_payload(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
+    *,
+    run_id: str,
+    record_id: str,
+    npi: int | None,
+    artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Publish reviewed license fields while keeping contact/identity data raw-only."""
+    license_fields_by_name = _state_license_fields_by_name(source_row)
+    field_value = license_fields_by_name["value_json"]
+    original_date = license_fields_by_name["original_date"]
+    expiration_date = license_fields_by_name["expiration_date"]
+    status_effective_date = license_fields_by_name["status_effective_date"]
+    profession_code = license_fields_by_name["profession_code"]
+    rank_code = license_fields_by_name["rank_code"]
+    license_number = license_fields_by_name["license_number"]
+    status = license_fields_by_name["status"]
+    active_status = license_fields_by_name["active_status"]
     display_parts = [
         field_value
         for field_value in (
-            source_row.get("profession_name", ""),
+            license_fields_by_name["profession"],
             license_number,
             status,
             active_status,
@@ -4429,6 +4452,45 @@ async def _delete_retained_payload_rows(
     return deleted_rows_by_key
 
 
+async def _protected_projection_run_ids(
+    schema: str,
+    live_name: str,
+    old_name: str,
+) -> set[str]:
+    """Return generation IDs referenced by live and rollback projections."""
+
+    protected_run_ids: set[str] = set()
+    projection_tables = await db.all(
+        text(
+            """
+            SELECT tablename
+              FROM pg_catalog.pg_tables
+             WHERE schemaname = :schema
+               AND tablename IN (:live_name, :old_name)
+            """
+        ),
+        schema=schema,
+        live_name=live_name,
+        old_name=old_name,
+    )
+    for projection_table in projection_tables:
+        table_name = str(projection_table._mapping["tablename"])
+        if table_name not in {live_name, old_name}:
+            continue
+        generation_rows = await db.all(
+            text(
+                f"SELECT DISTINCT generation_id "
+                f"FROM {schema}.{table_name}"
+            )
+        )
+        protected_run_ids.update(
+            str(source_row._mapping["generation_id"])
+            for source_row in generation_rows
+            if source_row._mapping["generation_id"]
+        )
+    return protected_run_ids
+
+
 async def _post_success_retention(
     *,
     run_id: str,
@@ -4439,7 +4501,7 @@ async def _post_success_retention(
     schema = ProviderProfileProjection.__table__.schema or "mrf"
     live_name = ProviderProfileProjection.__tablename__
     old_name = f"{live_name}_old"
-    protected_run_ids: set[str] = set()
+    protected_run_ids: set[str]
     eligible_run_ids: list[str] = []
     deleted_rows_by_key: dict[str, int] = {}
     failed_cutoff = _utcnow() - timedelta(days=failed_retention_days)
@@ -4449,34 +4511,7 @@ async def _post_success_retention(
             text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"),
             lock_name=f"{schema}.{live_name}.publication",
         )
-        projection_tables = await db.all(
-            text(
-                """
-                SELECT tablename
-                  FROM pg_catalog.pg_tables
-                 WHERE schemaname = :schema
-                   AND tablename IN (:live_name, :old_name)
-                """
-            ),
-            schema=schema,
-            live_name=live_name,
-            old_name=old_name,
-        )
-        for projection_table in projection_tables:
-            table_name = str(projection_table._mapping["tablename"])
-            if table_name not in {live_name, old_name}:
-                continue
-            generation_rows = await db.all(
-                text(
-                    f"SELECT DISTINCT generation_id "
-                    f"FROM {schema}.{table_name}"
-                )
-            )
-            protected_run_ids.update(
-                str(source_row._mapping["generation_id"])
-                for source_row in generation_rows
-                if source_row._mapping["generation_id"]
-            )
+        protected_run_ids = await _protected_projection_run_ids(schema, live_name, old_name)
         terminal_rows = await db.all(
             select(
                 ProviderProfileImportRun.run_id,

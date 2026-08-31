@@ -10192,7 +10192,13 @@ WITH scope_probe AS MATERIALIZED (
         {geo_evidence_level_sql} AS geo_evidence_level,
         candidate.candidate_distance_miles
     FROM candidate_keys candidate
-    JOIN {address_table} addr ON addr.location_key = candidate.location_key
+    CROSS JOIN LATERAL (
+        SELECT candidate_address.*
+        FROM {address_table} candidate_address
+        WHERE candidate_address.location_key = candidate.location_key
+        -- Fence the bounded candidates onto the location-key PK lookup.
+        OFFSET 0
+    ) addr
     JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
     WHERE {filter_sql}
 ), probe_stats AS MATERIALIZED (
