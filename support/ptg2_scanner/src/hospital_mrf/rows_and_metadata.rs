@@ -1,5 +1,6 @@
 #[derive(Clone, Debug)]
 struct GeneralMetadata {
+    profile: CmsProfile,
     hospital_name: String,
     last_updated_on: String,
     version: String,
@@ -9,7 +10,7 @@ struct GeneralMetadata {
     license: License,
     attestation_text: String,
     confirm_attestation: bool,
-    attester_name: String,
+    attester_name: Option<String>,
     financial_aid_policy: Option<String>,
 }
 
@@ -29,8 +30,23 @@ struct JsonAttestation {
     #[serde(deserialize_with = "deserialize_json_retained_string")]
     attestation: String,
     confirm_attestation: bool,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_json_retained_string"
+    )]
+    attester_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonAffirmation {
     #[serde(deserialize_with = "deserialize_json_retained_string")]
-    attester_name: String,
+    affirmation: String,
+    confirm_affirmation: bool,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_json_retained_string"
+    )]
+    attester_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,6 +102,7 @@ struct PayerChargeRow {
     standard_charge_dollar: Option<String>,
     standard_charge_percentage: Option<String>,
     standard_charge_algorithm: Option<String>,
+    estimated_amount: Option<String>,
     median_amount: Option<String>,
     percentile_10: Option<String>,
     percentile_90: Option<String>,
@@ -210,9 +227,20 @@ impl GeneralMetadata {
         self.hospital_name = required_text(&self.hospital_name, "hospital_name")?.to_owned();
         self.last_updated_on = required_text(&self.last_updated_on, "last_updated_on")?.to_owned();
         self.version = required_text(&self.version, "version")?.to_owned();
-        self.location_names = non_empty_text_list(self.location_names, "location_name")?;
+        let location_field = match self.profile {
+            CmsProfile::V2 => "hospital_location",
+            CmsProfile::V3 => "location_name",
+        };
+        self.location_names = non_empty_text_list(self.location_names, location_field)?;
         self.hospital_addresses = non_empty_text_list(self.hospital_addresses, "hospital_address")?;
-        self.type_2_npis = non_empty_text_list(self.type_2_npis, "type_2_npi")?;
+        self.type_2_npis = match self.profile {
+            CmsProfile::V2 => self
+                .type_2_npis
+                .into_iter()
+                .map(|value| required_text(&value, "type_2_npi").map(str::to_owned))
+                .collect::<io::Result<Vec<_>>>()?,
+            CmsProfile::V3 => non_empty_text_list(self.type_2_npis, "type_2_npi")?,
+        };
         self.license.state = if normalize_case {
             required_text(&self.license.state, "license state")?.to_ascii_uppercase()
         } else if self.license.state.is_empty() {
@@ -228,18 +256,31 @@ impl GeneralMetadata {
             .license_number
             .as_deref()
             .and_then(optional_text);
+        let expected_attestation = match self.profile {
+            CmsProfile::V2 => AFFIRMATION_TEXT,
+            CmsProfile::V3 => ATTESTATION_TEXT,
+        };
         let attestation_matches = if normalize_case {
-            self.attestation_text.trim() == ATTESTATION_TEXT
+            self.attestation_text.trim() == expected_attestation
         } else {
-            self.attestation_text == ATTESTATION_TEXT
+            self.attestation_text == expected_attestation
         };
         if !attestation_matches {
             return Err(invalid(
-                "attestation text does not match the V3.0.0 contract",
+                "attestation text does not match the declared CMS contract",
             ));
         }
-        self.attestation_text = ATTESTATION_TEXT.to_owned();
-        self.attester_name = required_text(&self.attester_name, "attester_name")?.to_owned();
+        self.attestation_text = expected_attestation.to_owned();
+        self.attester_name = match (self.profile, self.attester_name.as_deref()) {
+            (CmsProfile::V3, Some(value)) => {
+                Some(required_text(value, "attester_name")?.to_owned())
+            }
+            (CmsProfile::V3, None) => return Err(invalid("missing attester_name")),
+            (CmsProfile::V2, Some(value)) if optional_text(value).is_some() => {
+                return Err(invalid("attester_name is only valid for CMS V3"));
+            }
+            (CmsProfile::V2, _) => None,
+        };
         self.financial_aid_policy = self.financial_aid_policy.as_deref().and_then(optional_text);
         Ok(self)
     }
@@ -255,7 +296,7 @@ impl GeneralMetadata {
                 Some(&self.version),
                 Some(&self.attestation_text),
                 Some(&confirm_attestation),
-                Some(&self.attester_name),
+                self.attester_name.as_deref(),
                 self.financial_aid_policy.as_deref(),
             ],
         )?;

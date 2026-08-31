@@ -6,14 +6,18 @@ fn header_u32(block: &[u8], offset: usize) -> u32 {
     )
 }
 
-fn decode_frame(block: &[u8]) -> HospitalPriceBlockResult<(usize, Vec<u8>)> {
+fn decode_frame(block: &[u8]) -> HospitalPriceBlockResult<(u32, usize, Vec<u8>)> {
     if block.len() < HOSPITAL_PRICE_FACT_BLOCK_HEADER_BYTES {
         return Err(invalid("header is truncated"));
     }
     if &block[..8] != HOSPITAL_PRICE_FACT_BLOCK_MAGIC {
         return Err(invalid("magic is invalid"));
     }
-    if header_u32(block, 8) != HOSPITAL_PRICE_FACT_BLOCK_VERSION {
+    let version = header_u32(block, 8);
+    if !matches!(
+        version,
+        HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION | HOSPITAL_PRICE_FACT_BLOCK_VERSION
+    ) {
         return Err(invalid("version is unsupported"));
     }
     let row_count = header_u32(block, 12) as usize;
@@ -53,7 +57,7 @@ fn decode_frame(block: &[u8]) -> HospitalPriceBlockResult<(usize, Vec<u8>)> {
     if Sha256::digest(&raw).as_slice() != &block[24..56] {
         return Err(invalid("SHA-256 digest does not match"));
     }
-    Ok((row_count, raw))
+    Ok((version, row_count, raw))
 }
 
 struct SliceCursor<'a> {
@@ -112,16 +116,22 @@ impl<'a> SliceCursor<'a> {
     }
 }
 
-fn decode_lanes(raw: &[u8]) -> HospitalPriceBlockResult<[&[u8]; LANE_COUNT]> {
-    if raw.len() < RAW_HEADER_BYTES {
+fn decode_lanes(raw: &[u8], version: u32) -> HospitalPriceBlockResult<Vec<&[u8]>> {
+    let lane_count = match version {
+        HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION => LEGACY_LANE_COUNT,
+        HOSPITAL_PRICE_FACT_BLOCK_VERSION => LANE_COUNT,
+        _ => return Err(invalid("version is unsupported")),
+    };
+    let raw_header_bytes = 4 + lane_count * 8;
+    if raw.len() < raw_header_bytes {
         return Err(invalid("lane directory is truncated"));
     }
-    if header_u32(raw, 0) as usize != LANE_COUNT {
+    if header_u32(raw, 0) as usize != lane_count {
         return Err(invalid("lane count is invalid"));
     }
-    let mut lanes = [&[][..]; LANE_COUNT];
-    let mut expected_offset = RAW_HEADER_BYTES;
-    for (index, lane) in lanes.iter_mut().enumerate() {
+    let mut lanes = Vec::with_capacity(lane_count);
+    let mut expected_offset = raw_header_bytes;
+    for index in 0..lane_count {
         let entry = 4 + index * 8;
         let offset = header_u32(raw, entry) as usize;
         let length = header_u32(raw, entry + 4) as usize;
@@ -129,9 +139,10 @@ fn decode_lanes(raw: &[u8]) -> HospitalPriceBlockResult<[&[u8]; LANE_COUNT]> {
             return Err(invalid("lane offsets are not contiguous"));
         }
         let end = offset.saturating_add(length);
-        *lane = raw
+        let lane = raw
             .get(offset..end)
             .ok_or_else(|| invalid("lane is truncated"))?;
+        lanes.push(lane);
         expected_offset = end;
     }
     if expected_offset != raw.len() {
@@ -312,8 +323,8 @@ pub fn decode_fact_block(
     offset: usize,
     limit: usize,
 ) -> HospitalPriceBlockResult<Vec<HospitalPriceFactRow>> {
-    let (row_count, raw) = decode_frame(block)?;
-    let lanes = decode_lanes(&raw)?;
+    let (version, row_count, raw) = decode_frame(block)?;
+    let lanes = decode_lanes(&raw, version)?;
 
     // Resolve filters before parsing or materializing any other fact lane.
     let payer_plans = decode_payer_plan_dictionary(lanes[PAYER_PLAN_DICTIONARY])?;
@@ -404,6 +415,16 @@ pub fn decode_fact_block(
         &slots,
         selected_count,
     )?;
+    let estimated_amounts = if version == HOSPITAL_PRICE_FACT_BLOCK_VERSION {
+        decode_selected_optional_decimals(
+            lanes[ESTIMATED_AMOUNTS],
+            row_count,
+            &slots,
+            selected_count,
+        )?
+    } else {
+        vec![None; selected_count]
+    };
 
     let mut decoded_text_bytes = 0usize;
     for slot in 0..selected_count {
@@ -415,6 +436,7 @@ pub fn decode_fact_block(
             negotiated_dollars[slot].as_deref(),
             negotiated_percentages[slot].as_deref(),
             algorithm_ids[slot].map(|id| algorithms[id as usize]),
+            estimated_amounts[slot].as_deref(),
             Some(methodologies[methodology_ids[slot] as usize]),
             median_amounts[slot].as_deref(),
             percentile_10[slot].as_deref(),
@@ -445,6 +467,7 @@ pub fn decode_fact_block(
             negotiated_percentage: negotiated_percentages[slot].clone(),
             negotiated_algorithm: algorithm_ids[slot]
                 .map(|id| algorithms[id as usize].to_owned()),
+            estimated_amount: estimated_amounts[slot].clone(),
             methodology: methodologies[methodology_ids[slot] as usize].to_owned(),
             median_amount: median_amounts[slot].clone(),
             percentile_10: percentile_10[slot].clone(),

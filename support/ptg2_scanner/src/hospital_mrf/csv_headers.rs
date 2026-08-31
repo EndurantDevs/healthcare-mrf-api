@@ -4,7 +4,7 @@ fn parse_csv<R: Read>(
     wide: bool,
     max_fanout_rows: usize,
     outputs: &mut CopyOutputs,
-) -> io::Result<()> {
+) -> io::Result<String> {
     let mut csv_reader = ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
@@ -15,18 +15,21 @@ fn parse_csv<R: Read>(
     let data_headers = next_csv_record(&mut records, "data header row")?;
     let (metadata, contract_provision) =
         parse_csv_metadata(&general_headers, &general_values, max_fanout_rows)?;
+    let profile = metadata.profile;
+    let schema_version = metadata.version.clone();
     metadata.validate(true)?.emit(version_id, outputs)?;
     if let Some(contract_provision) = contract_provision {
         emit_contract_provision(outputs, version_id, 0, contract_provision)?;
     }
 
     if wide {
-        let columns = parse_wide_columns(&data_headers, max_fanout_rows)?;
-        parse_wide_records(records, version_id, &columns, max_fanout_rows, outputs)
+        let columns = parse_wide_columns(&data_headers, profile, max_fanout_rows)?;
+        parse_wide_records(records, version_id, &columns, max_fanout_rows, outputs)?;
     } else {
-        let columns = parse_tall_columns(&data_headers, max_fanout_rows)?;
-        parse_tall_records(records, version_id, &columns, max_fanout_rows, outputs)
+        let columns = parse_tall_columns(&data_headers, profile, max_fanout_rows)?;
+        parse_tall_records(records, version_id, &columns, max_fanout_rows, outputs)?;
     }
+    Ok(schema_version)
 }
 
 fn next_csv_record<R: Read>(
@@ -48,6 +51,7 @@ fn parse_csv_metadata(
     let mut license_state = None;
     let mut license_index = None;
     let mut attestation_index = None;
+    let mut affirmation_index = None;
     for (index, header) in headers.iter().enumerate() {
         let parts = header_parts(header);
         let key = match parts.as_slice() {
@@ -58,6 +62,7 @@ fn parse_csv_metadata(
                         | "last_updated_on"
                         | "version"
                         | "location_name"
+                        | "hospital_location"
                         | "hospital_address"
                         | "type_2_npi"
                         | "attester_name"
@@ -81,10 +86,14 @@ fn parse_csv_metadata(
                 return Err(invalid(format!("duplicate general CSV header {key}")));
             }
         }
-        if header.trim().eq_ignore_ascii_case(ATTESTATION_TEXT)
-            && attestation_index.replace(index).is_some()
+        if header.trim().eq_ignore_ascii_case(ATTESTATION_TEXT) {
+            if attestation_index.replace(index).is_some() {
+                return Err(invalid("duplicate attestation header"));
+            }
+        } else if header.trim().eq_ignore_ascii_case(AFFIRMATION_TEXT)
+            && affirmation_index.replace(index).is_some()
         {
-            return Err(invalid("duplicate attestation header"));
+            return Err(invalid("duplicate affirmation header"));
         }
     }
     let value = |name: &str| -> io::Result<&str> {
@@ -99,11 +108,31 @@ fn parse_csv_metadata(
             .and_then(|index| values.get(*index))
             .and_then(optional_text)
     };
-    let Some(attestation_index) = attestation_index else {
-        return Err(invalid("missing attestation header"));
+    let version = required_text(value("version")?, "version")?.to_owned();
+    let profile = CmsProfile::parse_csv(&version)?;
+    let mixed_field = match profile {
+        CmsProfile::V2 => fields
+            .contains_key("location_name")
+            .then_some("location_name")
+            .or_else(|| fields.contains_key("type_2_npi").then_some("type_2_npi"))
+            .or_else(|| fields.contains_key("attester_name").then_some("attester_name"))
+            .or_else(|| attestation_index.map(|_| "attestation")),
+        CmsProfile::V3 => fields
+            .contains_key("hospital_location")
+            .then_some("hospital_location")
+            .or_else(|| affirmation_index.map(|_| "affirmation")),
+    };
+    if let Some(field) = mixed_field {
+        return Err(invalid(format!(
+            "CMS CSV {version} headers mix V2 and V3 profiles at {field}"
+        )));
+    }
+    let confirmation_index = match profile {
+        CmsProfile::V2 => affirmation_index.ok_or_else(|| invalid("missing affirmation header"))?,
+        CmsProfile::V3 => attestation_index.ok_or_else(|| invalid("missing attestation header"))?,
     };
     let confirm_attestation = match values
-        .get(attestation_index)
+        .get(confirmation_index)
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase()
@@ -111,7 +140,12 @@ fn parse_csv_metadata(
     {
         "true" => true,
         "false" => false,
-        _ => return Err(invalid("attestation value must be true or false")),
+        _ => {
+            return Err(invalid(match profile {
+                CmsProfile::V2 => "affirmation value must be true or false",
+                CmsProfile::V3 => "attestation value must be true or false",
+            }));
+        }
     };
     let Some(license_index) = license_index else {
         return Err(invalid("missing license_number header"));
@@ -127,12 +161,19 @@ fn parse_csv_metadata(
         });
     Ok((
         GeneralMetadata {
+            profile,
             hospital_name: value("hospital_name")?.to_owned(),
             last_updated_on: canonical_csv_date(value("last_updated_on")?)?,
-            version: value("version")?.to_owned(),
+            version,
             location_names: split_pipe_bounded(
-                value("location_name")?,
-                "location_name",
+                value(match profile {
+                    CmsProfile::V2 => "hospital_location",
+                    CmsProfile::V3 => "location_name",
+                })?,
+                match profile {
+                    CmsProfile::V2 => "hospital_location",
+                    CmsProfile::V3 => "location_name",
+                },
                 max_fanout_rows,
             )?,
             hospital_addresses: split_pipe_bounded(
@@ -140,18 +181,28 @@ fn parse_csv_metadata(
                 "hospital_address",
                 max_fanout_rows,
             )?,
-            type_2_npis: split_pipe_bounded(
-                value("type_2_npi")?,
-                "type_2_npi",
-                max_fanout_rows,
-            )?,
+            type_2_npis: match profile {
+                CmsProfile::V2 => Vec::new(),
+                CmsProfile::V3 => split_pipe_bounded(
+                    value("type_2_npi")?,
+                    "type_2_npi",
+                    max_fanout_rows,
+                )?,
+            },
             license: License {
                 license_number: optional_text(values.get(license_index).unwrap_or("")),
                 state: license_state,
             },
-            attestation_text: ATTESTATION_TEXT.to_owned(),
+            attestation_text: match profile {
+                CmsProfile::V2 => AFFIRMATION_TEXT,
+                CmsProfile::V3 => ATTESTATION_TEXT,
+            }
+            .to_owned(),
             confirm_attestation,
-            attester_name: value("attester_name")?.to_owned(),
+            attester_name: match profile {
+                CmsProfile::V2 => None,
+                CmsProfile::V3 => Some(value("attester_name")?.to_owned()),
+            },
             financial_aid_policy: optional_value("financial_aid_policy"),
         },
         contract_provision,

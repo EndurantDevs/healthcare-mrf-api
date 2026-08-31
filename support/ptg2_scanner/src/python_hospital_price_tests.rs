@@ -328,6 +328,7 @@ fn python_hospital_price_decoders_return_normalized_rows() {
                 negotiated_dollar: Some("75.00".to_owned()),
                 negotiated_percentage: None,
                 negotiated_algorithm: None,
+                estimated_amount: Some("74.00".to_owned()),
                 methodology: "fee schedule".to_owned(),
                 median_amount: None,
                 percentile_10: None,
@@ -351,6 +352,16 @@ fn python_hospital_price_decoders_return_normalized_rows() {
                 .extract::<String>()
                 .unwrap(),
             "Synthetic payer",
+        );
+        assert_eq!(
+            facts
+                .get_item(0)
+                .unwrap()
+                .get_item("estimated_amount")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "74.00",
         );
         assert!(decode_services
             .call1((PyBytes::new(py, b"invalid"),))

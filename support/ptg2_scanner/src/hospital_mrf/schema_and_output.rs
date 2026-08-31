@@ -1,6 +1,5 @@
-pub const HOSPITAL_MRF_SCHEMA_VERSION: &str = "3.0.0";
 pub const HOSPITAL_MRF_SCHEMA_REVISION: &str = "5333564a710f80d7740180b9ffab8dbdcba9b502";
-const HOSPITAL_MRF_PACKED_SCHEMA_REVISION: &str = "hospital-mrf-packed-blocks-v2";
+const HOSPITAL_MRF_PACKED_SCHEMA_REVISION: &str = "hospital-mrf-packed-blocks-v3";
 
 pub const MRF_COPY_COLUMNS: &[&str] = &[
     "version_id",
@@ -60,6 +59,7 @@ pub const PAYER_CHARGE_COPY_COLUMNS: &[&str] = &[
     "standard_charge_dollar",
     "standard_charge_percentage",
     "standard_charge_algorithm",
+    "estimated_amount",
     "median_amount",
     "percentile_10",
     "percentile_90",
@@ -87,7 +87,6 @@ pub const MODIFIER_PAYER_COPY_COLUMNS: &[&str] = &[
     "standard_charge_algorithm",
 ];
 
-const ATTESTATION_TEXT: &str = "To the best of its knowledge and belief, this hospital has included all applicable standard charge information in accordance with the requirements of 45 CFR 180.50, and the information encoded is true, accurate, and complete as of the date in the file. This hospital has included all payer-specific negotiated charges in dollars that can be expressed as a dollar amount. For payer-specific negotiated charges that cannot be expressed as a dollar amount in the machine-readable file or not knowable in advance, the hospital attests that the payer-specific negotiated charge is based on a contractual algorithm, percentage or formula that precludes the provision of a dollar amount and has provided all necessary information available to the hospital for the public to be able to derive the dollar amount, including, but not limited to, the specific fee schedule or components referenced in such percentage, algorithm or formula.";
 const MAX_VERSION_ID_BYTES: usize = 64;
 const MAX_FANOUT_ROWS_ENV: &str = "HLTHPRT_HOSPITAL_MRF_MAX_FANOUT_ROWS";
 const DEFAULT_MAX_FANOUT_ROWS: usize = 100_000;
@@ -386,7 +385,7 @@ impl CopyOutputs {
             .write_fields(fields)
     }
 
-    fn finish(mut self) -> io::Result<HospitalMrfArtifacts> {
+    fn finish(mut self, schema_version: String) -> io::Result<HospitalMrfArtifacts> {
         let mut artifacts = Vec::with_capacity(self.sinks.len());
         for sink in self.sinks.iter_mut().flatten() {
             artifacts.push(sink.finish()?);
@@ -410,7 +409,11 @@ impl CopyOutputs {
                 packed.root
             });
         self.committed = true;
-        Ok(HospitalMrfArtifacts { artifacts, root })
+        Ok(HospitalMrfArtifacts {
+            artifacts,
+            root,
+            schema_version,
+        })
     }
 }
 

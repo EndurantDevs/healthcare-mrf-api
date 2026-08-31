@@ -6,7 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 
 pub const HOSPITAL_PRICE_FACT_BLOCK_MAGIC: &[u8; 8] = b"HPTFACT\0";
-pub const HOSPITAL_PRICE_FACT_BLOCK_VERSION: u32 = 1;
+const HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION: u32 = 1;
+pub const HOSPITAL_PRICE_FACT_BLOCK_VERSION: u32 = 2;
 pub const HOSPITAL_PRICE_FACT_BLOCK_HEADER_BYTES: usize = 56;
 pub const HOSPITAL_PRICE_FACT_BLOCK_MAX_ROWS: usize = 512;
 pub const HOSPITAL_PRICE_FACT_BLOCK_MAX_RAW_BYTES: usize = 4 * 1024 * 1024;
@@ -16,7 +17,8 @@ pub const HOSPITAL_PRICE_FACT_BLOCK_MAX_DECODED_TEXT_BYTES: usize = 64 * 1024 * 
 pub const HOSPITAL_PRICE_FACT_BLOCK_RAW_SIZE_ERROR: &str =
     "hospital price fact block raw payload exceeds 4 MiB";
 
-const LANE_COUNT: usize = 17;
+const LEGACY_LANE_COUNT: usize = 17;
+const LANE_COUNT: usize = 18;
 const RAW_HEADER_BYTES: usize = 4 + LANE_COUNT * 8;
 const NONE_LENGTH: u32 = u32::MAX;
 
@@ -37,6 +39,7 @@ const PERCENTILE_90_AMOUNTS: usize = 13;
 const ALLOWED_COUNT_IDS: usize = 14;
 const PAYER_NOTE_IDS: usize = 15;
 const COMPARISON_AMOUNTS: usize = 16;
+const ESTIMATED_AMOUNTS: usize = 17;
 
 pub type HospitalPriceBlockResult<T> = Result<T, String>;
 
@@ -49,6 +52,7 @@ pub struct HospitalPriceFactRow {
     pub negotiated_dollar: Option<String>,
     pub negotiated_percentage: Option<String>,
     pub negotiated_algorithm: Option<String>,
+    pub estimated_amount: Option<String>,
     pub methodology: String,
     pub median_amount: Option<String>,
     pub percentile_10: Option<String>,

@@ -40,6 +40,7 @@ mod packed_output_tests {
             standard_charge_dollar: Some(amount.to_owned()),
             standard_charge_percentage: None,
             standard_charge_algorithm: None,
+            estimated_amount: None,
             median_amount: Some("95.00".to_owned()),
             percentile_10: None,
             percentile_90: None,
@@ -153,6 +154,7 @@ mod packed_output_tests {
             negotiated_dollar: Some("90".to_owned()),
             negotiated_percentage: None,
             negotiated_algorithm: None,
+            estimated_amount: None,
             methodology: "fee schedule".to_owned(),
             median_amount: None,
             percentile_10: None,
@@ -232,7 +234,7 @@ mod packed_output_tests {
         i64::from_be_bytes(row[index].as_deref().unwrap().try_into().unwrap())
     }
 
-    fn payloads(path: &Path) -> Vec<Vec<u8>> {
+    pub(super) fn payloads(path: &Path) -> Vec<Vec<u8>> {
         copy_rows(path)
             .into_iter()
             .map(|row| {

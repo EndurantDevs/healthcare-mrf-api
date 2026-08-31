@@ -78,17 +78,21 @@ fn encode_optional_decimals<'a>(
     Ok(lane)
 }
 
-fn assemble_raw(lanes: &[Vec<u8>; LANE_COUNT]) -> HospitalPriceBlockResult<Vec<u8>> {
+fn assemble_raw(lanes: &[Vec<u8>]) -> HospitalPriceBlockResult<Vec<u8>> {
+    if !matches!(lanes.len(), LEGACY_LANE_COUNT | LANE_COUNT) {
+        return Err(invalid("lane count is invalid"));
+    }
     let payload_bytes = lanes
         .iter()
         .fold(0usize, |total, lane| total.saturating_add(lane.len()));
-    let raw_len = RAW_HEADER_BYTES.saturating_add(payload_bytes);
+    let raw_header_bytes = 4 + lanes.len() * 8;
+    let raw_len = raw_header_bytes.saturating_add(payload_bytes);
     if raw_len > HOSPITAL_PRICE_FACT_BLOCK_MAX_RAW_BYTES {
         return Err(HOSPITAL_PRICE_FACT_BLOCK_RAW_SIZE_ERROR.to_owned());
     }
     let mut raw = Vec::with_capacity(raw_len);
-    put_u32(&mut raw, LANE_COUNT as u32);
-    let mut offset = RAW_HEADER_BYTES;
+    put_u32(&mut raw, lanes.len() as u32);
+    let mut offset = raw_header_bytes;
     for lane in lanes {
         put_u32(&mut raw, offset as u32);
         put_u32(&mut raw, lane.len() as u32);
@@ -110,7 +114,7 @@ fn preflight_raw_bytes(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockResul
     let mut methodologies = HashSet::<&str>::new();
     let mut allowed_counts = HashSet::<&str>::new();
     let mut payer_notes = HashSet::<&str>::new();
-    let mut total = RAW_HEADER_BYTES + 5 * 2 + rows.len() * 8 + bitmap_bytes(rows.len()) * 9;
+    let mut total = RAW_HEADER_BYTES + 5 * 2 + rows.len() * 8 + bitmap_bytes(rows.len()) * 10;
     for row in rows {
         if payer_plans.insert((&row.payer_name, &row.plan_name)) {
             add_preflight_bytes(&mut total, 8);
@@ -133,6 +137,7 @@ fn preflight_raw_bytes(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockResul
         for value in [
             row.negotiated_dollar.as_deref(),
             row.negotiated_percentage.as_deref(),
+            row.estimated_amount.as_deref(),
             row.median_amount.as_deref(),
             row.percentile_10.as_deref(),
             row.percentile_90.as_deref(),
@@ -161,8 +166,22 @@ fn preflight_raw_bytes(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockResul
 }
 
 fn frame_raw(raw: &[u8], row_count: usize) -> HospitalPriceBlockResult<Vec<u8>> {
+    frame_raw_version(raw, row_count, HOSPITAL_PRICE_FACT_BLOCK_VERSION)
+}
+
+fn frame_raw_version(
+    raw: &[u8],
+    row_count: usize,
+    version: u32,
+) -> HospitalPriceBlockResult<Vec<u8>> {
     if raw.len() > HOSPITAL_PRICE_FACT_BLOCK_MAX_RAW_BYTES {
         return Err(HOSPITAL_PRICE_FACT_BLOCK_RAW_SIZE_ERROR.to_owned());
+    }
+    if !matches!(
+        version,
+        HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION | HOSPITAL_PRICE_FACT_BLOCK_VERSION
+    ) {
+        return Err(invalid("version is unsupported"));
     }
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(6));
     encoder
@@ -173,7 +192,7 @@ fn frame_raw(raw: &[u8], row_count: usize) -> HospitalPriceBlockResult<Vec<u8>> 
         .expect("Vec-backed zlib finalization cannot fail");
     let mut block = Vec::with_capacity(HOSPITAL_PRICE_FACT_BLOCK_HEADER_BYTES + compressed.len());
     block.extend_from_slice(HOSPITAL_PRICE_FACT_BLOCK_MAGIC);
-    put_u32(&mut block, HOSPITAL_PRICE_FACT_BLOCK_VERSION);
+    put_u32(&mut block, version);
     put_u32(&mut block, row_count as u32);
     put_u32(&mut block, raw.len() as u32);
     put_u32(&mut block, compressed.len() as u32);
@@ -292,6 +311,11 @@ pub fn encode_fact_block(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockRes
             rows.len(),
         )
         .expect("preflight validates comparison amounts"),
+        encode_optional_decimals(
+            rows.iter().map(|row| row.estimated_amount.as_deref()),
+            rows.len(),
+        )
+        .expect("preflight validates estimated amounts"),
     ];
     let raw = assemble_raw(&lanes).expect("preflight bounds assembled raw bytes");
     frame_raw(&raw, rows.len())

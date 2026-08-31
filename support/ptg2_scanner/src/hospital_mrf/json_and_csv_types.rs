@@ -3,7 +3,7 @@ fn parse_json<R: Read>(
     version_id: &str,
     max_fanout_rows: usize,
     outputs: &mut CopyOutputs,
-) -> io::Result<()> {
+) -> io::Result<String> {
     let _retained_budget = JsonRetainedBudget::new();
     let mut json_reader = JsonStreamReader::new(reader);
     let mut seen = BTreeSet::new();
@@ -15,9 +15,11 @@ fn parse_json<R: Read>(
     let mut type_2_npis = None;
     let mut license = None;
     let mut attestation: Option<JsonAttestation> = None;
+    let mut affirmation: Option<JsonAffirmation> = None;
     let mut financial_aid_policy = None;
     let mut service_count = None;
     let mut modifier_count = None;
+    let mut profile_evidence = JsonProfileEvidence::default();
 
     json_reader.begin_object().map_err(to_io_error)?;
     while json_reader.has_next().map_err(to_io_error)? {
@@ -42,6 +44,15 @@ fn parse_json<R: Read>(
             }
             "location_name" => {
                 mark_once(&mut seen, "location_name")?;
+                profile_evidence.v3("location_name");
+                let values: FanoutVec<JsonRetainedString> =
+                    with_json_fanout_budget(max_fanout_rows, || json_reader.deserialize_next())
+                        .map_err(to_io_error)?;
+                location_names = Some(values.0.into_iter().map(|value| value.0).collect());
+            }
+            "hospital_location" => {
+                mark_once(&mut seen, "hospital_location")?;
+                profile_evidence.v2("hospital_location");
                 let values: FanoutVec<JsonRetainedString> =
                     with_json_fanout_budget(max_fanout_rows, || json_reader.deserialize_next())
                         .map_err(to_io_error)?;
@@ -56,6 +67,7 @@ fn parse_json<R: Read>(
             }
             "type_2_npi" => {
                 mark_once(&mut seen, "type_2_npi")?;
+                profile_evidence.v3("type_2_npi");
                 let values: FanoutVec<JsonRetainedString> =
                     with_json_fanout_budget(max_fanout_rows, || json_reader.deserialize_next())
                         .map_err(to_io_error)?;
@@ -67,7 +79,18 @@ fn parse_json<R: Read>(
             }
             "attestation" => {
                 mark_once(&mut seen, "attestation")?;
+                profile_evidence.v3("attestation");
                 attestation = Some(json_reader.deserialize_next().map_err(to_io_error)?);
+            }
+            "affirmation" => {
+                mark_once(&mut seen, "affirmation")?;
+                profile_evidence.v2("affirmation");
+                let value: JsonAffirmation =
+                    json_reader.deserialize_next().map_err(to_io_error)?;
+                if value.attester_name.is_some() {
+                    profile_evidence.v3("affirmation.attester_name");
+                }
+                affirmation = Some(value);
             }
             "financial_aid_policy" => {
                 mark_once(&mut seen, "financial_aid_policy")?;
@@ -114,7 +137,13 @@ fn parse_json<R: Read>(
                     with_json_service_budgets(max_fanout_rows, || -> io::Result<()> {
                         let service: JsonService =
                             json_reader.deserialize_next().map_err(to_io_error)?;
-                        emit_json_service(outputs, version_id, count, service)
+                        emit_json_service(
+                            outputs,
+                            version_id,
+                            count,
+                            service,
+                            &mut profile_evidence,
+                        )
                     })?;
                     count = count.saturating_add(1);
                 }
@@ -137,7 +166,13 @@ fn parse_json<R: Read>(
                             || json_reader.deserialize_next(),
                         )
                         .map_err(to_io_error)?;
-                        emit_json_modifier(outputs, version_id, count, modifier)
+                        emit_json_modifier(
+                            outputs,
+                            version_id,
+                            count,
+                            modifier,
+                            &mut profile_evidence,
+                        )
                     })?;
                     count = count.saturating_add(1);
                 }
@@ -160,9 +195,6 @@ fn parse_json<R: Read>(
     let Some(_) = service_count else {
         return Err(invalid("missing standard_charge_information"));
     };
-    let Some(attestation) = attestation else {
-        return Err(invalid("missing attestation"));
-    };
     let Some(last_updated_on) = last_updated_on else {
         return Err(invalid("missing last_updated_on"));
     };
@@ -172,33 +204,65 @@ fn parse_json<R: Read>(
     let Some(version) = version else {
         return Err(invalid("missing version"));
     };
+    let version = required_text(&version, "version")?.to_owned();
+    let profile = CmsProfile::parse_json(&version)?;
+    profile_evidence.validate(profile, &version)?;
+    let (attestation_text, confirm_attestation, attester_name) = match profile {
+        CmsProfile::V2 => {
+            let Some(affirmation) = affirmation else {
+                return Err(invalid("missing affirmation"));
+            };
+            (
+                affirmation.affirmation,
+                affirmation.confirm_affirmation,
+                affirmation.attester_name,
+            )
+        }
+        CmsProfile::V3 => {
+            let Some(attestation) = attestation else {
+                return Err(invalid("missing attestation"));
+            };
+            (
+                attestation.attestation,
+                attestation.confirm_attestation,
+                attestation.attester_name,
+            )
+        }
+    };
     let Some(location_names) = location_names else {
-        return Err(invalid("missing location_name"));
+        return Err(invalid(match profile {
+            CmsProfile::V2 => "missing hospital_location",
+            CmsProfile::V3 => "missing location_name",
+        }));
     };
     let Some(hospital_addresses) = hospital_addresses else {
         return Err(invalid("missing hospital_address"));
     };
-    let Some(type_2_npis) = type_2_npis else {
-        return Err(invalid("missing type_2_npi"));
+    let type_2_npis = match (profile, type_2_npis) {
+        (CmsProfile::V2, values) => values.unwrap_or_default(),
+        (CmsProfile::V3, Some(values)) => values,
+        (CmsProfile::V3, None) => return Err(invalid("missing type_2_npi")),
     };
     let Some(license) = license else {
         return Err(invalid("missing license_information"));
     };
     GeneralMetadata {
+        profile,
         hospital_name,
         last_updated_on: canonical_json_date(&last_updated_on)?,
-        version,
+        version: version.clone(),
         location_names,
         hospital_addresses,
         type_2_npis,
         license,
-        attestation_text: attestation.attestation,
-        confirm_attestation: attestation.confirm_attestation,
-        attester_name: attestation.attester_name,
+        attestation_text,
+        confirm_attestation,
+        attester_name,
         financial_aid_policy,
     }
     .validate(false)?
-    .emit(version_id, outputs)
+    .emit(version_id, outputs)?;
+    Ok(version)
 }
 
 fn mark_once(seen: &mut BTreeSet<&'static str>, field: &'static str) -> io::Result<()> {
@@ -214,6 +278,7 @@ fn emit_json_service(
     version_id: &str,
     service_ordinal: u64,
     service: JsonService,
+    profile_evidence: &mut JsonProfileEvidence,
 ) -> io::Result<()> {
     let JsonService {
         description,
@@ -227,10 +292,21 @@ fn emit_json_service(
         return Err(invalid("standard_charges must contain at least one charge"));
     }
     let (drug_unit, drug_type) = match drug_information {
-        Some(drug) => (
-            Some(positive_decimal(drug.unit.as_str(), "drug unit")?),
-            Some(drug.drug_type),
-        ),
+        Some(drug) => {
+            let unit = match drug.unit {
+                JsonDrugUnit::Number(unit) => {
+                    profile_evidence
+                        .invalidate_v2("CMS JSON v2 drug unit must be a string");
+                    positive_decimal(unit.as_str(), "drug unit")?
+                }
+                JsonDrugUnit::String(unit) => {
+                    profile_evidence
+                        .invalidate_v3("CMS JSON v3 drug unit must be a number");
+                    positive_decimal(&unit.0, "drug unit")?
+                }
+            };
+            (Some(unit), Some(drug.drug_type))
+        }
         None => (None, None),
     };
     let service = validate_service(
@@ -248,6 +324,13 @@ fn emit_json_service(
         },
         false,
     )?;
+    if service
+        .codes
+        .iter()
+        .any(|code| is_v3_only_code_type(&code.code_type))
+    {
+        profile_evidence.v3("CMG or MS-LTC-DRG code type");
+    }
     emit_service(outputs, version_id, service_ordinal, &service)?;
 
     for (charge_ordinal, charge) in standard_charges.into_iter().enumerate() {
@@ -262,6 +345,9 @@ fn emit_json_service(
             additional_generic_notes,
             payers_information,
         } = charge;
+        if modifier_code.is_some() {
+            profile_evidence.v3("modifier_code");
+        }
         let modifier_code = match modifier_code {
             Some(codes) if codes.0.is_empty() => {
                 return Err(invalid(
@@ -283,7 +369,7 @@ fn emit_json_service(
         };
         let mut payers = Vec::with_capacity(raw_payers.len());
         for payer in raw_payers {
-            let payer = validate_payer(
+            let payer = validate_json_payer(
                 PayerChargeRow {
                     payer_name: payer.payer_name,
                     plan_name: payer.plan_name,
@@ -296,6 +382,10 @@ fn emit_json_service(
                         "standard_charge_percentage",
                     )?,
                     standard_charge_algorithm: payer.standard_charge_algorithm,
+                    estimated_amount: optional_json_decimal(
+                        payer.estimated_amount.as_ref(),
+                        "estimated_amount",
+                    )?,
                     median_amount: optional_json_decimal(
                         payer.median_amount.as_ref(),
                         "median_amount",
@@ -317,7 +407,7 @@ fn emit_json_service(
                     additional_payer_notes: payer.additional_payer_notes,
                 },
                 generic_notes.as_deref(),
-                false,
+                profile_evidence,
             )?;
             payers.push(payer);
         }
@@ -363,133 +453,4 @@ fn emit_json_service(
         }
     }
     Ok(())
-}
-
-fn emit_json_modifier(
-    outputs: &mut CopyOutputs,
-    version_id: &str,
-    modifier_ordinal: u64,
-    modifier: JsonModifier,
-) -> io::Result<()> {
-    let code = required_text(&modifier.code, "modifier code")?.to_owned();
-    let description = required_text(&modifier.description, "modifier description")?.to_owned();
-    let setting = modifier
-        .setting
-        .as_deref()
-        .map(|value| canonical_setting(value, false))
-        .transpose()?;
-    if modifier.modifier_payer_information.0.is_empty() {
-        return Err(invalid(
-            "modifier_payer_information must contain at least one payer",
-        ));
-    }
-    emit_modifier(
-        outputs,
-        version_id,
-        modifier_ordinal,
-        &ModifierRow {
-            code,
-            description,
-            setting,
-            additional_generic_notes: None,
-        },
-    )?;
-    for (payer_ordinal, payer) in modifier
-        .modifier_payer_information
-        .0
-        .into_iter()
-        .enumerate()
-    {
-        let payer = ModifierPayerRow {
-            payer_name: Some(required_text(&payer.payer_name, "modifier payer_name")?.to_owned()),
-            plan_name: Some(required_text(&payer.plan_name, "modifier plan_name")?.to_owned()),
-            description: Some(
-                required_text(&payer.description, "modifier payer description")?.to_owned(),
-            ),
-            standard_charge_dollar: None,
-            standard_charge_percentage: None,
-            standard_charge_algorithm: None,
-        };
-        emit_modifier_payer(
-            outputs,
-            version_id,
-            modifier_ordinal,
-            payer_ordinal as u64,
-            &payer,
-        )?;
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CodeColumns {
-    code: usize,
-    code_type: usize,
-}
-
-#[derive(Clone, Debug)]
-struct CommonCsvColumns {
-    description: usize,
-    codes: Vec<CodeColumns>,
-    modifiers: usize,
-    setting: usize,
-    billing_class: Option<usize>,
-    drug_unit: usize,
-    drug_type: usize,
-    gross_charge: usize,
-    discounted_cash: usize,
-    minimum: usize,
-    maximum: usize,
-    additional_generic_notes: usize,
-}
-
-#[derive(Clone, Debug)]
-struct TallCsvColumns {
-    common: CommonCsvColumns,
-    payer_name: usize,
-    plan_name: usize,
-    standard_charge_dollar: usize,
-    standard_charge_percentage: usize,
-    standard_charge_algorithm: usize,
-    median_amount: usize,
-    percentile_10: usize,
-    percentile_90: usize,
-    allowed_count: usize,
-    methodology: usize,
-}
-
-#[derive(Clone, Debug)]
-struct WidePayerColumns {
-    payer_name: String,
-    plan_name: String,
-    standard_charge_dollar: usize,
-    standard_charge_percentage: usize,
-    standard_charge_algorithm: usize,
-    median_amount: usize,
-    percentile_10: usize,
-    percentile_90: usize,
-    allowed_count: usize,
-    methodology: usize,
-    additional_payer_notes: usize,
-}
-
-#[derive(Clone, Debug)]
-struct WideCsvColumns {
-    common: CommonCsvColumns,
-    payers: Vec<WidePayerColumns>,
-}
-
-#[derive(Default)]
-struct WidePayerBuilder {
-    payer_name: String,
-    plan_name: String,
-    standard_charge_dollar: Option<usize>,
-    standard_charge_percentage: Option<usize>,
-    standard_charge_algorithm: Option<usize>,
-    median_amount: Option<usize>,
-    percentile_10: Option<usize>,
-    percentile_90: Option<usize>,
-    allowed_count: Option<usize>,
-    methodology: Option<usize>,
-    additional_payer_notes: Option<usize>,
 }

@@ -42,6 +42,7 @@ mod validation_tail_tests {
             standard_charge_dollar: Some("1".to_owned()),
             standard_charge_percentage: None,
             standard_charge_algorithm: None,
+            estimated_amount: None,
             median_amount: None,
             percentile_10: None,
             percentile_90: None,

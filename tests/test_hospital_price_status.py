@@ -128,6 +128,8 @@ async def test_page_keeps_latest_attempt_separate_from_last_good_publication():
             "payer_charge_count": 30,
             "npi_count": 2,
             "tax_identity_count": 1,
+            "template_version": "3.0.0",
+            "source_format": "json",
         },
         {
             "hospital_id": "hospital-000002",
@@ -153,6 +155,8 @@ async def test_page_keeps_latest_attempt_separate_from_last_good_publication():
         "succeeded": 1,
         "failed": 1,
         "unpublished": 2,
+        "template_versions": {"3.0.0": 1},
+        "source_formats": {"json": 1},
     }
 
 
@@ -180,6 +184,8 @@ async def test_reviewed_aliases_render_once_and_keep_latest_group_state(monkeypa
             "version_id": "a" * 64,
             "generation": 1,
             "last_success_at": dt.datetime(2026, 8, 24, tzinfo=dt.UTC),
+            "template_version": "2.2.1",
+            "source_format": "csv-wide",
         },
         {
             "hospital_id": "hospital-000002",
@@ -198,6 +204,10 @@ async def test_reviewed_aliases_render_once_and_keep_latest_group_state(monkeypa
     assert page["items"][0]["alias_hospital_ids"] == ["hospital-000002"]
     assert page["items"][0]["latest_attempt"]["attempt_id"] == "attempt-2"
     assert page["items"][0]["publication"]["generation"] == 1
+    assert page["items"][0]["publication"]["template_version"] == "2.2.1"
+    assert page["items"][0]["publication"]["source_format"] == "csv-wide"
+    assert page["summary"]["template_versions"] == {"2.2.1": 1}
+    assert page["summary"]["source_formats"] == {"csv-wide": 1}
     assert page["summary"]["total"] == 1
 
 

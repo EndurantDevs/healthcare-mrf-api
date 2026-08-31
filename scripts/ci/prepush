@@ -596,6 +596,7 @@ run_core_postgres() {
     tests/test_terminology_synonym_publication_postgres.py \
     tests/test_site_intelligence_fast_paths_postgres.py \
     tests/test_hospital_price_storage.py \
+    tests/test_hospital_price_legacy_header_postgres.py \
     tests/test_plan_pricing_projection_postgres.py \
     tests/test_plan_pricing_projection_v3_postgres.py \
     tests/test_plan_pricing_projection_v3_staging_postgres.py \

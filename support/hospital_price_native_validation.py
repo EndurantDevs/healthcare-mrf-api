@@ -23,8 +23,12 @@ HOSPITAL_MRF_LEGACY_PARSER_CONTRACT = (
 HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256 = hashlib.sha256(
     HOSPITAL_MRF_LEGACY_PARSER_CONTRACT.encode("ascii")
 ).hexdigest()
-HOSPITAL_MRF_SCHEMA_REVISION = "hospital-mrf-packed-blocks-v2"
-HOSPITAL_MRF_SUMMARY_CONTRACT = "hospital-mrf-copy-v3-packed-v2"
+HOSPITAL_MRF_PACKED_V2_PARSER_CONTRACT_SHA256 = hashlib.sha256(
+    b"hospital-mrf-copy-v3-packed-v2-resource-bounded:"
+    b"hospital-mrf-packed-blocks-v2"
+).hexdigest()
+HOSPITAL_MRF_SCHEMA_REVISION = "hospital-mrf-packed-blocks-v3"
+HOSPITAL_MRF_SUMMARY_CONTRACT = "hospital-mrf-copy-v2-v3-packed-v3"
 HOSPITAL_MRF_PARSER_CONTRACT = (
     f"{HOSPITAL_MRF_SUMMARY_CONTRACT}-resource-bounded:"
     f"{HOSPITAL_MRF_SCHEMA_REVISION}"
@@ -74,7 +78,12 @@ HOSPITAL_MRF_COPY_COLUMNS = {
         for kind in ("service_block", "fact_block", "selector_page")
     },
 }
-_REQUIRED_NONEMPTY_RELATIONS = frozenset({"mrf", "location", "npi", "license"})
+_REQUIRED_NONEMPTY_RELATIONS = frozenset({"mrf", "location", "license"})
+_SOURCE_SCHEMA_VERSIONS = {
+    "json": frozenset({"2.2.0", "2.2.1", "3.0.0"}),
+    "csv-tall": frozenset({"2.0.0", "2.2.0", "2.2.1", "3.0.0"}),
+    "csv-wide": frozenset({"2.0.0", "2.2.0", "2.2.1", "3.0.0"}),
+}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _U64_MAX = (1 << 64) - 1
 _PG_BINARY_COPY_HEADER = b"PGCOPY\n\xff\r\n\0" + b"\0" * 8
@@ -116,6 +125,7 @@ _PACKED_ROOT_FIELDS = tuple(HospitalPackedRoot.__dataclass_fields__)
 class HospitalParserReceipt:
     version_id: str
     source_format: str
+    schema_version: str
     semantic_sha256: str
     max_fanout_rows: int
     max_decompressed_bytes: int
@@ -202,7 +212,9 @@ def _is_parser_contract_valid(
     return (
         summary_fields["contract"] == HOSPITAL_MRF_SUMMARY_CONTRACT
         and summary_fields["version_id"] == version_id
-        and summary_fields["schema_version"] == "3.0.0"
+        and isinstance(summary_fields["schema_version"], str)
+        and summary_fields["schema_version"]
+        in _SOURCE_SCHEMA_VERSIONS.get(source_format, ())
         and summary_fields["schema_revision"] == HOSPITAL_MRF_SCHEMA_REVISION
         and summary_fields["format"] == source_format
         and source_format in {"json", "csv-tall", "csv-wide"}
@@ -422,12 +434,17 @@ def validate_hospital_parser_summary(
         raise ValueError("hospital parser summary contract is invalid")
     output_path = _validated_output_directory(output_directory)
     artifacts = _validated_artifact_tuple(summary_fields["artifacts"], output_path)
+    if summary_fields["schema_version"] == "3.0.0" and not next(
+        artifact.rows for artifact in artifacts if artifact.kind == "npi"
+    ):
+        raise ValueError("hospital parser v3 NPI artifact is empty")
     if _retained_artifact_bytes(artifacts) > max_output_bytes:
         raise ValueError("hospital parser artifacts exceed their output limit")
     packed_root = _packed_root(summary_fields["root"], artifacts, max_output_bytes)
     return HospitalParserReceipt(
         version_id=version_id,
         source_format=source_format,
+        schema_version=summary_fields["schema_version"],
         semantic_sha256=_semantic_sha256(artifacts, packed_root),
         max_fanout_rows=summary_fields["max_fanout_rows"],
         max_decompressed_bytes=summary_fields["max_decompressed_bytes"],

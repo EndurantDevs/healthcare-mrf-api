@@ -187,6 +187,7 @@ impl PackedOutputBuilder {
         let comparison_amount = row
             .standard_charge_dollar
             .as_ref()
+            .or(row.estimated_amount.as_ref())
             .or(row.median_amount.as_ref())
             .or(gross_charge.as_ref())
             .or(discounted_cash.as_ref())
@@ -202,6 +203,7 @@ impl PackedOutputBuilder {
                 negotiated_dollar: row.standard_charge_dollar.clone(),
                 negotiated_percentage: row.standard_charge_percentage.clone(),
                 negotiated_algorithm: row.standard_charge_algorithm.clone(),
+                estimated_amount: row.estimated_amount.clone(),
                 methodology: row.methodology.clone(),
                 median_amount: row.median_amount.clone(),
                 percentile_10: row.percentile_10.clone(),

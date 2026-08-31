@@ -31,6 +31,7 @@ from api.hospital_price_serving_support import _validated_selector_page
 from api.hospital_price_serving_support import validate_payer_page_coverage
 from support.hospital_price_native_validation import (
     HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256,
+    HOSPITAL_MRF_PACKED_V2_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
 )
 
@@ -48,6 +49,13 @@ _NATIVE_FUNCTIONS = (
     "hospital_price_decode_service_block", "hospital_price_decode_fact_block",
 )
 _READ_TRANSACTION_SQL = text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+_PARSER_CONTRACTS_BY_FORMAT = {
+    1: frozenset({HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256}),
+    2: frozenset({
+        HOSPITAL_MRF_PACKED_V2_PARSER_CONTRACT_SHA256,
+        HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
+    }),
+}
 
 
 def _native_module():
@@ -100,10 +108,9 @@ def _validated_version(
             for character in version_record_by_field["version_id"]
         )
         or version_record_by_field.get("parser_contract_sha256")
-        != {
-            1: HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256,
-            2: HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
-        }.get(version_record_by_field.get("format_version"))
+        not in _PARSER_CONTRACTS_BY_FORMAT.get(
+            version_record_by_field.get("format_version"), ()
+        )
         or version_record_by_field.get("source_format") not in _SOURCE_FORMATS
         or type(template_version) is not str
         or not template_version

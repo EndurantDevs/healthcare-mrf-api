@@ -1,4 +1,4 @@
-//! Streaming hospital machine-readable-file parser for the V3.0.0 contract.
+//! Streaming hospital machine-readable-file parser for CMS V2 and V3 contracts.
 
 use crate::copy_format::{pg_text_array_field, write_copy_text_fields};
 use crate::input::{open_full_scan_reader, RapidgzipConfig};
@@ -21,6 +21,7 @@ use std::sync::{
 };
 use struson::reader::{JsonReader, JsonStreamReader, ValueType};
 
+include!("hospital_mrf/profile_contract.rs");
 include!("hospital_mrf/schema_and_output.rs");
 include!("hospital_mrf/zip_input.rs");
 include!("hospital_mrf/resource_limits.rs");
@@ -28,8 +29,11 @@ include!("hospital_mrf/import_and_values.rs");
 include!("hospital_mrf/rows_and_metadata.rs");
 include!("hospital_mrf/json_code_budget.rs");
 include!("hospital_mrf/validation_and_json_types.rs");
+include!("hospital_mrf/payer_validation.rs");
 include!("hospital_mrf/json_value_types.rs");
 include!("hospital_mrf/json_and_csv_types.rs");
+include!("hospital_mrf/json_modifier.rs");
+include!("hospital_mrf/csv_column_types.rs");
 include!("hospital_mrf/csv_headers.rs");
 include!("hospital_mrf/csv_columns.rs");
 include!("hospital_mrf/csv_rows.rs");
@@ -42,6 +46,7 @@ mod tests {
     include!("hospital_mrf/tests_import.rs");
     include!("hospital_mrf/tests_csv_compatibility.rs");
     include!("hospital_mrf/tests_validation.rs");
+    include!("hospital_mrf/tests_profile_compatibility.rs");
     include!("hospital_mrf/tests_limits.rs");
     include!("hospital_mrf/tests_packed.rs");
 }

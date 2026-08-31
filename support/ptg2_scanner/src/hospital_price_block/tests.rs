@@ -10,6 +10,7 @@ mod tests {
             negotiated_dollar: service.is_multiple_of(2).then(|| format!("{service}.00")),
             negotiated_percentage: (service % 2 == 1).then(|| "87.125".to_owned()),
             negotiated_algorithm: service.is_multiple_of(3).then(|| "fee less 3%".to_owned()),
+            estimated_amount: Some(format!("{service}.25")),
             methodology: "fee schedule".to_owned(),
             median_amount: Some(format!("{service}.50")),
             percentile_10: Some(format!("{service}.00")),
@@ -21,7 +22,17 @@ mod tests {
     }
 
     fn raw_from(block: &[u8]) -> Vec<u8> {
-        decode_frame(block).unwrap().1
+        decode_frame(block).unwrap().2
+    }
+
+    fn current_lanes(raw: &[u8]) -> [Vec<u8>; LANE_COUNT] {
+        decode_lanes(raw, HOSPITAL_PRICE_FACT_BLOCK_VERSION)
+            .unwrap()
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("current fact lane count")
     }
 
     fn lane_offset(raw: &[u8], lane: usize) -> usize {
@@ -51,6 +62,7 @@ mod tests {
         ];
         let block = encode_fact_block(&rows).unwrap();
         let raw = raw_from(&block);
+        assert_eq!(header_u32(&block, 8), HOSPITAL_PRICE_FACT_BLOCK_VERSION);
         assert_eq!(header_u32(&block, 12) as usize, rows.len());
         assert_eq!(header_u32(&block, 16) as usize, raw.len());
         assert_eq!(
@@ -72,6 +84,23 @@ mod tests {
         assert!(decode_fact_block(&block, None, None, 0, 0)
             .unwrap()
             .is_empty());
+
+        let legacy_lanes = current_lanes(&raw);
+        let legacy_raw = assemble_raw(&legacy_lanes[..LEGACY_LANE_COUNT]).unwrap();
+        let legacy = frame_raw_version(
+            &legacy_raw,
+            rows.len(),
+            HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION,
+        )
+        .unwrap();
+        let mut expected_legacy = rows.clone();
+        for row in &mut expected_legacy {
+            row.estimated_amount = None;
+        }
+        assert_eq!(
+            decode_fact_block(&legacy, None, None, 0, 512).unwrap(),
+            expected_legacy
+        );
     }
 
     #[test]
@@ -93,7 +122,7 @@ mod tests {
 
         let compact = vec![row(2, "P", "One"); HOSPITAL_PRICE_FACT_BLOCK_MAX_ROWS];
         let raw = raw_from(&encode_fact_block(&compact).unwrap());
-        let mut lanes = decode_lanes(&raw).unwrap().map(|lane| lane.to_vec());
+        let mut lanes = current_lanes(&raw);
         let mut payer_plan = Vec::new();
         put_u16(&mut payer_plan, 1);
         put_text(&mut payer_plan, &"P".repeat(256 * 1024)).unwrap();
@@ -201,7 +230,8 @@ mod tests {
         bad_digest[24] ^= 1;
         assert!(decode_fact_block(&bad_digest, None, None, 0, 1).is_err());
         let mut bad_version = valid.clone();
-        bad_version[8..12].copy_from_slice(&2u32.to_le_bytes());
+        bad_version[8..12]
+            .copy_from_slice(&(HOSPITAL_PRICE_FACT_BLOCK_VERSION + 1).to_le_bytes());
         assert!(decode_fact_block(&bad_version, None, None, 0, 1).is_err());
         let mut bad_count = valid.clone();
         bad_count[12..16].copy_from_slice(&2u32.to_le_bytes());
@@ -261,16 +291,16 @@ mod tests {
     #[test]
     fn authenticated_lane_validation_matrix_fails_closed() {
         let valid = encode_fact_block(&[row(2, "A", "One")]).unwrap();
-        let base = decode_lanes(&raw_from(&valid)).unwrap().map(<[u8]>::to_vec);
+        let base = current_lanes(&raw_from(&valid));
 
-        assert!(decode_lanes(&[]).is_err());
+        assert!(decode_lanes(&[], HOSPITAL_PRICE_FACT_BLOCK_VERSION).is_err());
         assert!(decode_payer_plan_dictionary(&[]).is_err());
         let mut bad_lane_count = raw_from(&valid);
         bad_lane_count[..4].copy_from_slice(&0u32.to_le_bytes());
-        assert!(decode_lanes(&bad_lane_count).is_err());
+        assert!(decode_lanes(&bad_lane_count, HOSPITAL_PRICE_FACT_BLOCK_VERSION).is_err());
         let mut raw_trailing = raw_from(&valid);
         raw_trailing.push(0);
-        assert!(decode_lanes(&raw_trailing).is_err());
+        assert!(decode_lanes(&raw_trailing, HOSPITAL_PRICE_FACT_BLOCK_VERSION).is_err());
 
         let mut lane_directory = raw_from(&valid);
         lane_directory[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -311,6 +341,7 @@ mod tests {
             (PERCENTILE_10_AMOUNTS, Vec::new()),
             (PERCENTILE_90_AMOUNTS, Vec::new()),
             (COMPARISON_AMOUNTS, Vec::new()),
+            (ESTIMATED_AMOUNTS, Vec::new()),
             (ALGORITHM_DICTIONARY, 513u16.to_le_bytes().to_vec()),
             (PAYER_PLAN_DICTIONARY, 513u16.to_le_bytes().to_vec()),
         ] {
@@ -331,15 +362,11 @@ mod tests {
         ];
         assert_lanes_rejected(&duplicate_payer, 1);
 
-        let mut payer_plan_truncated = decode_lanes(&raw_from(&valid))
-            .unwrap()
-            .map(<[u8]>::to_vec);
+        let mut payer_plan_truncated = current_lanes(&raw_from(&valid));
         payer_plan_truncated[PAYER_PLAN_DICTIONARY] = vec![1, 0, 1, 0, 0, 0, b'A'];
         assert_lanes_rejected(&payer_plan_truncated, 1);
 
-        let mut payer_plan_trailing = decode_lanes(&raw_from(&valid))
-            .unwrap()
-            .map(<[u8]>::to_vec);
+        let mut payer_plan_trailing = current_lanes(&raw_from(&valid));
         payer_plan_trailing[PAYER_PLAN_DICTIONARY] =
             vec![1, 0, 1, 0, 0, 0, b'A', 3, 0, 0, 0, b'O', b'n', b'e', 0];
         assert_lanes_rejected(&payer_plan_trailing, 1);

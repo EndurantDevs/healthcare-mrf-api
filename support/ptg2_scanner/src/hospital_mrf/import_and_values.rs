@@ -11,7 +11,7 @@ pub struct CopyArtifactSummary {
 pub struct HospitalMrfSummary {
     contract: &'static str,
     version_id: String,
-    schema_version: &'static str,
+    schema_version: String,
     schema_revision: &'static str,
     format: &'static str,
     compressed_input_bytes: u64,
@@ -32,6 +32,7 @@ enum HospitalMrfOutputMode {
 struct HospitalMrfArtifacts {
     artifacts: Vec<CopyArtifactSummary>,
     root: Option<PackedRootSummary>,
+    schema_version: String,
 }
 
 pub fn run_hospital_mrf_cli(args: &[String]) -> io::Result<()> {
@@ -158,9 +159,12 @@ fn import_hospital_mrf_with_output_mode(
     };
 
     let (contract, schema_revision) = match output_mode {
-        HospitalMrfOutputMode::Legacy => ("hospital-mrf-copy-v3", HOSPITAL_MRF_SCHEMA_REVISION),
+        HospitalMrfOutputMode::Legacy => (
+            "hospital-mrf-copy-v2-v3",
+            HOSPITAL_MRF_SCHEMA_REVISION,
+        ),
         HospitalMrfOutputMode::Packed => (
-            "hospital-mrf-copy-v3-packed-v2",
+            "hospital-mrf-copy-v2-v3-packed-v3",
             HOSPITAL_MRF_PACKED_SCHEMA_REVISION,
         ),
     };
@@ -168,7 +172,7 @@ fn import_hospital_mrf_with_output_mode(
     Ok(HospitalMrfSummary {
         contract,
         version_id: version_id.to_owned(),
-        schema_version: HOSPITAL_MRF_SCHEMA_VERSION,
+        schema_version: outputs.schema_version,
         schema_revision,
         format: format.as_str(),
         compressed_input_bytes,
@@ -217,29 +221,33 @@ fn parse_hospital_payload_with_output_mode<R: Read>(
         reader,
         limits.max_decompressed_bytes,
     ));
-    match format {
+    let schema_version = match format {
         InputFormat::Json => parse_json(
             BoundedJsonStringReader::new(reader, limits.max_input_value_bytes),
             version_id,
             limits.max_fanout_rows,
             &mut outputs,
         )?,
-        InputFormat::TallCsv => parse_csv(
-            BoundedCsvRecordReader::new(reader, limits.max_input_value_bytes),
-            version_id,
-            false,
-            limits.max_fanout_rows,
-            &mut outputs,
-        )?,
-        InputFormat::WideCsv => parse_csv(
-            BoundedCsvRecordReader::new(reader, limits.max_input_value_bytes),
-            version_id,
-            true,
-            limits.max_fanout_rows,
-            &mut outputs,
-        )?,
-    }
-    outputs.finish()
+        InputFormat::TallCsv => {
+            parse_csv(
+                BoundedCsvRecordReader::new(reader, limits.max_input_value_bytes),
+                version_id,
+                false,
+                limits.max_fanout_rows,
+                &mut outputs,
+            )?
+        }
+        InputFormat::WideCsv => {
+            parse_csv(
+                BoundedCsvRecordReader::new(reader, limits.max_input_value_bytes),
+                version_id,
+                true,
+                limits.max_fanout_rows,
+                &mut outputs,
+            )?
+        }
+    };
+    outputs.finish(schema_version)
 }
 
 fn parse_max_output_bytes(value: &str) -> io::Result<u64> {

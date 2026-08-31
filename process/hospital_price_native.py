@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Pure-Python contract around the native CMS v3 hospital MRF parser."""
+"""Pure-Python contract around the native CMS hospital MRF parser."""
 
 from __future__ import annotations
 
@@ -220,4 +220,4 @@ def detect_hospital_mrf_format(
             "10th_percentile",
         }:
             return "csv-wide"
-    raise ValueError("hospital CSV payer layout is not CMS v3 tall or wide")
+    raise ValueError("hospital CSV payer layout is not CMS tall or wide")

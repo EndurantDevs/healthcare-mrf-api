@@ -42,13 +42,17 @@ SELECT hospital.hospital_id,
        current.charge_count,
        current.payer_charge_count,
        current.npi_count,
-       current.tax_identity_count
+       current.tax_identity_count,
+       version.template_version,
+       version.source_format
   FROM {_SCHEMA}.hospital_price_hospital AS hospital
   LEFT JOIN {_SCHEMA}.hospital_price_current AS current
     ON current.hospital_id = hospital.hospital_id
   LEFT JOIN {_SCHEMA}.hospital_price_import_attempt AS attempt
     ON attempt.hospital_id = current.hospital_id
    AND attempt.attempt_id = current.latest_attempt_id
+  LEFT JOIN {_SCHEMA}.hospital_price_version AS version
+    ON version.version_id = current.version_id
 """
 
 
@@ -92,6 +96,8 @@ def _publication_item(row: Mapping[str, Any]) -> dict[str, Any] | None:
         return None
     return {
         "version_id": row["version_id"],
+        "template_version": row.get("template_version"),
+        "source_format": row.get("source_format"),
         "generation": row.get("generation"),
         "last_success_at": _timestamp_text(row.get("last_success_at")),
         "service_count": row.get("service_count"),
@@ -161,19 +167,36 @@ def _is_status_match(item: Mapping[str, Any], status: str | None) -> bool:
     return _item_status(item) == status
 
 
-def _summary(items: list[dict[str, Any]]) -> dict[str, int]:
+def _summary(hospital_statuses: list[dict[str, Any]]) -> dict[str, Any]:
     count_by_status = {
         name: 0 for name in ("queued", "running", "succeeded", "failed", "unpublished")
     }
-    for item in items:
-        status = _item_status(item)
+    count_by_template_version: dict[str, int] = {}
+    count_by_source_format: dict[str, int] = {}
+    for hospital_status in hospital_statuses:
+        status = _item_status(hospital_status)
         if status in {"queued", "running", "failed"}:
             count_by_status[status] += 1
-        if item["publication"] is not None:
+        if hospital_status["publication"] is not None:
             count_by_status["succeeded"] += 1
+            version = hospital_status["publication"].get("template_version")
+            if isinstance(version, str) and version:
+                count_by_template_version[version] = (
+                    count_by_template_version.get(version, 0) + 1
+                )
+            source_format = hospital_status["publication"].get("source_format")
+            if isinstance(source_format, str) and source_format:
+                count_by_source_format[source_format] = (
+                    count_by_source_format.get(source_format, 0) + 1
+                )
         else:
             count_by_status["unpublished"] += 1
-    return {"total": len(items), **count_by_status}
+    return {
+        "total": len(hospital_statuses),
+        **count_by_status,
+        "template_versions": dict(sorted(count_by_template_version.items())),
+        "source_formats": dict(sorted(count_by_source_format.items())),
+    }
 
 
 async def list_hospital_price_status_page(

@@ -112,6 +112,10 @@ async def validate_stages(
             raise RuntimeError(f"hospital parser {artifact.kind} staging count is invalid")
         if kind == "mrf" and artifact.rows != 1:
             raise RuntimeError("hospital parser must produce one MRF header")
+        if kind == "mrf" and await connection.scalar(
+            f"SELECT template_version FROM {stage}"
+        ) != receipt.schema_version:
+            raise RuntimeError("hospital parser template version conflicts with its receipt")
         keys = ", ".join(map(_quote_ident, _KEYS[kind]))
         await connection.status(f"CREATE UNIQUE INDEX ON {stage} ({keys})")
         await connection.status(f"ANALYZE {stage}")
