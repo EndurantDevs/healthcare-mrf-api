@@ -16,11 +16,22 @@ from tests.test_ptg2_manifest_search_transitions import (
 
 
 @pytest.mark.asyncio
-async def test_manifest_cost_geo_budget_refusal_offers_distance_retry(monkeypatch):
+@pytest.mark.parametrize(
+    ("include_providers", "selector_name"),
+    [
+        (True, "_strict_cost_provider_expansion_selection"),
+        (False, "_select_geo_filtered_rate_prefix"),
+    ],
+)
+async def test_manifest_cost_geo_budget_refusal_offers_distance_retry(
+    monkeypatch,
+    include_providers,
+    selector_name,
+):
     _install_base_dependencies(monkeypatch)
     monkeypatch.setattr(
         serving,
-        "_strict_cost_provider_expansion_selection",
+        selector_name,
         AsyncMock(
             side_effect=serving.PTG2OnlineWorkBudgetExceeded("candidate_members")
         ),
@@ -30,7 +41,7 @@ async def test_manifest_cost_geo_budget_refusal_offers_distance_retry(monkeypatc
         await _search(
             args=_query_args(
                 code="74177",
-                include_providers=True,
+                include_providers=include_providers,
                 zip5="38103",
                 zip_radius_miles=25,
                 order_by="total_allowed_amount",

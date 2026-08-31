@@ -19908,15 +19908,24 @@ async def _search_manifest_serving_table(
     ) = None
     geo_rate_selection: _GeoRateSelection | None = None
     if use_geo_rate_prefix_selection:
-        geo_rate_selection = await _select_geo_filtered_rate_prefix(
-            session,
-            serving_tables,
-            code_rows=code_rows,
-            args=args,
-            network_names=network_names,
-            target_count=rate_candidate_limit,
-            descending=_is_cost_order_descending(args),
-        )
+        try:
+            geo_rate_selection = await _select_geo_filtered_rate_prefix(
+                session,
+                serving_tables,
+                code_rows=code_rows,
+                args=args,
+                network_names=network_names,
+                target_count=rate_candidate_limit,
+                descending=_is_cost_order_descending(args),
+            )
+        except PTG2OnlineWorkBudgetExceeded as exc:
+            if not location_filter_requested:
+                raise
+            raise PTG2LocationScopeError(
+                "Cost-ordered geographic procedure search exceeds the sealed "
+                "online work budget.",
+                allows_distance_retry=not explicit_provider_filter_requested,
+            ) from exc
         if geo_rate_selection is None:
             return None
         serving_rows = list(geo_rate_selection.row_data)
