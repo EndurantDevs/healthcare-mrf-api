@@ -31,9 +31,8 @@ from api.control_ptg_source_attempt_errors import (
 )
 from api.control_snapshot_rollback import register_source_snapshot_rollback_route
 from api.control_ptg_v4 import register_v4_control_routes
-from api.provider_directory_sources import provider_directory_source_catalog
-from api.provider_directory_source_outcomes import (
-    enrich_provider_directory_source_catalog,
+from api.provider_directory_control_catalog import (
+    provider_directory_control_catalog,
 )
 from api.provider_directory_profile_selection_attestation import (
     register_profile_selection_route,
@@ -98,15 +97,7 @@ async def control_importers(request):
 async def control_provider_directory_sources(request):
     """List reviewed FHIR sources from the deployed acquisition contract."""
     _require_control_auth(request)
-    catalog = provider_directory_source_catalog()
-    try:
-        catalog = await enrich_provider_directory_source_catalog(catalog)
-    except Exception:
-        logging.getLogger(__name__).warning(
-            "Provider Directory outcome enrichment failed; returning static catalog",
-            exc_info=True,
-        )
-    return response.json(catalog)
+    return response.json(await provider_directory_control_catalog())
 
 
 @blueprint.get("/health/node")

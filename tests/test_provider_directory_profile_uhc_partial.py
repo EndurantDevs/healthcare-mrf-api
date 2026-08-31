@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from process import provider_directory_profile_selection as selection
+from process import provider_directory_profile_selection_snapshot as snapshot
 from process import provider_directory_profile_uhc_flex as flex_profile
 from process.provider_directory_dataset_scoped_publication import (
     LEGACY_PRACTITIONER_VARIANT,
@@ -25,14 +27,17 @@ from process.uhc_flex_practitioner_single_root_contract import (
     UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
 )
 from tests.provider_directory_profile_uhc_flex_test_support import (
+    FLEX_DATASET_ID,
     GRAPH_DATASET_ID,
     GRAPH_ENDPOINT_ID,
+    _catalog,
     _dataset_rows,
     _flex_metadata,
     _readiness_record,
     _rooted_dataset_rows,
     _rooted_metadata,
     _rooted_readiness_record,
+    _source_rows,
 )
 
 
@@ -100,6 +105,25 @@ def test_retry_exhausted_flex_publication_is_profile_ready() -> None:
         readiness,
         dataset_row_by_field,
     )
+
+
+def test_retry_exhausted_flex_publication_reaches_selection_request() -> None:
+    dataset_row_by_field = _dataset_rows()[0]
+    dataset_row_by_field.update(
+        publication_metadata_json=_partial_flex_metadata(),
+        dataset_scoped_cohort_complete=False,
+    )
+
+    computed = snapshot._computed_selection_from_rows(
+        _catalog(),
+        node_id="test-node",
+        source_rows=_source_rows(),
+        dataset_rows=[dataset_row_by_field],
+    )
+
+    assert selection._expected_request(computed, "test-node")["datasets"] == [
+        {"source_id": UHC_FLEX_PRACTITIONER_SOURCE_ID, "dataset_id": FLEX_DATASET_ID}
+    ]
 
 
 @pytest.mark.parametrize(
