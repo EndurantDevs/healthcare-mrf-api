@@ -1581,6 +1581,28 @@ def test_inferred_taxonomy_knn_prefilter_is_exact():
     assert "2085R0202X" in str(params_by_name)
 
 
+def test_knn_prefilter_applies_requested_classification_before_raw_limit():
+    params_by_name = {}
+
+    sql = ptg2_serving._membership_knn_prefilter_sql(
+        {
+            "classification": "Orthopaedic Surgery",
+            "code": "66984",
+            "code_system": "CPT",
+        },
+        params_by_name,
+        "distance_expression",
+    )
+
+    assert "membership_location_specialty_nt" in sql
+    assert "membership_location_specialty_nucc" in sql
+    assert "membership_location_inferred_taxonomy_code_0" in sql
+    assert (
+        params_by_name["membership_location_specialty_classification"]
+        == "Orthopaedic Surgery"
+    )
+
+
 @pytest.mark.parametrize(
     ("code", "expected_taxonomy"),
     [

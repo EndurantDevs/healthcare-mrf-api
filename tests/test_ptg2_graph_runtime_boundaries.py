@@ -346,6 +346,7 @@ async def test_distance_intersects_only_nearby_v4_sets(
         {
             "code": code,
             "code_system": code_system,
+            "classification": "Family Medicine",
             "lat": 41.9,
             "long": -87.65,
         },
