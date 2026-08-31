@@ -60,6 +60,7 @@ def _fence_dataset(readiness: SimpleNamespace, variant: str) -> SimpleNamespace:
         dataset_scoped_ready=True,
         dataset_scoped_variant=variant,
         dataset_scoped_cohort_complete=readiness.cohort_complete,
+        dataset_scoped_retry_exhausted_count=readiness.retry_exhausted_count,
         dataset_id=readiness.dataset_id,
         endpoint_id=readiness.endpoint_id,
         source_id=readiness.source_id,
@@ -88,11 +89,13 @@ def test_retry_exhausted_flex_publication_is_profile_ready() -> None:
         readiness,
         dataset_row_by_field,
     )
-    assert flex_profile.is_uhc_flex_fence_dataset_ready(
-        _fence_dataset(readiness, LEGACY_PRACTITIONER_VARIANT),
+    fence_dataset = _fence_dataset(readiness, LEGACY_PRACTITIONER_VARIANT)
+    assert flex_profile.is_uhc_flex_fence_dataset_ready(fence_dataset, readiness)
+    readiness.retry_exhausted_count = 2
+    assert not flex_profile.is_uhc_flex_fence_dataset_ready(
+        fence_dataset,
         readiness,
     )
-    readiness.retry_exhausted_count = 2
     assert not flex_profile.is_uhc_flex_dataset_readiness_matching(
         readiness,
         dataset_row_by_field,

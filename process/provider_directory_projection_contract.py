@@ -2229,6 +2229,10 @@ def _require_reduced_counts_within_raw_shards(
     shards: Sequence[ProjectionProofShard],
     reduced_count_by_resource: Mapping[str, int],
 ) -> None:
+    if not shards:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_proof_shards_empty"
+        )
     raw_count_by_resource = _resource_counts(recipe, shards)
     if any(
         count > raw_count_by_resource[resource_type]

@@ -14712,6 +14712,7 @@ class ProviderDirectoryArtifactDataset:
     dataset_scoped_ready: bool = False
     dataset_scoped_variant: str | None = None
     dataset_scoped_cohort_complete: bool | None = None
+    dataset_scoped_retry_exhausted_count: int | None = None
     semantic_projection_as_of: str | None = None
     source_authority_id: str | None = None
     admission_id: str | None = None
@@ -19872,6 +19873,12 @@ def _artifact_dataset_scoped_state_from_row(
             if type(dataset_row_map.get("dataset_scoped_cohort_complete")) is bool
             else None
         ),
+        "dataset_scoped_retry_exhausted_count": (
+            dataset_row_map.get("dataset_scoped_retry_exhausted_count")
+            if type(dataset_row_map.get("dataset_scoped_retry_exhausted_count"))
+            is int
+            else None
+        ),
         "semantic_projection_as_of": _clean_text(
             dataset_row_map.get("dataset_scoped_projection_as_of")
         ),
@@ -20212,6 +20219,7 @@ def _artifact_endpoint_selection_identity(
         dataset.dataset_scoped_ready,
         dataset.dataset_scoped_variant,
         dataset.dataset_scoped_cohort_complete,
+        dataset.dataset_scoped_retry_exhausted_count,
         dataset.semantic_projection_as_of,
         dataset.source_authority_id,
         dataset.admission_id,

@@ -216,6 +216,9 @@ def _readiness_annotation(readiness: Any, is_ready: bool) -> dict[str, Any]:
         "dataset_scoped_cohort_complete": (
             getattr(readiness, "cohort_complete", None) if is_ready else None
         ),
+        "dataset_scoped_retry_exhausted_count": (
+            getattr(readiness, "retry_exhausted_count", 0) if is_ready else None
+        ),
         "dataset_scoped_rooted_graph_complete": (
             getattr(readiness, "rooted_graph_complete", None) if is_ready else None
         ),
@@ -305,6 +308,8 @@ def is_uhc_flex_fence_dataset_ready(dataset: Any, readiness: Any) -> bool:
         and readiness.cohort_complete is (retry_exhausted_count == 0)
         and readiness.cohort_complete
         is getattr(dataset, "dataset_scoped_cohort_complete", None)
+        and retry_exhausted_count
+        == getattr(dataset, "dataset_scoped_retry_exhausted_count", None)
         and (
             retry_exhausted_count == 0
             or getattr(dataset, "reviewed_root_policy", None)

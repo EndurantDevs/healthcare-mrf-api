@@ -207,6 +207,17 @@ def test_reduced_projection_cannot_exceed_raw_shard_counts():
     recipe, shard, outcome_proof, resource_counts, reducer_proof = (
         _candidate_inputs()
     )
+    with pytest.raises(ProviderDirectoryProjectionError, match="shards_empty"):
+        reduced_physical_projection_proof(
+            recipe,
+            (),
+            dataset_hash=digest("dataset"),
+            canonical_row_sha256=outcome_proof.canonical_row_sha256,
+            resource_counts=resource_counts,
+            reducer_proof=reducer_proof,
+            outcome_proof=outcome_proof,
+        )
+
     raw_proof = deepcopy(shard.proof)
     raw_proof["resource_counts"]["InsurancePlan"] = 0
     raw_shard = replace(
