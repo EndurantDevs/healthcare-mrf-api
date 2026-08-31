@@ -556,6 +556,7 @@ hospitals:
   name: Allen Parish Community Healthcare
   cms_hpt_url: https://www.allenhealth.org/cms-hpt.txt
 - hospital_id: hospital-000165
+  alias_of: hospital-000164
   name: Allen Parish Hospital
   cms_hpt_url: https://www.allenhealth.org/cms-hpt.txt
 - hospital_id: hospital-000166
@@ -2767,6 +2768,7 @@ hospitals:
   name: Beebe Medical Center Inc.
   cms_hpt_url: https://beebehealthcare.org/cms-hpt.txt
 - hospital_id: hospital-000836
+  alias_of: hospital-006391
   name: Behavioral Center of Michigan
   cms_hpt_url: https://www.behavioralcenter.com/cms-hpt.txt
 - hospital_id: hospital-000837
@@ -3645,6 +3647,7 @@ hospitals:
   name: Carlinville Area Hospital
   cms_hpt_url: https://www.cahcare.com/cms-hpt.txt
 - hospital_id: hospital-001102
+  alias_of: hospital-001101
   name: Carlinville Area Hospital & Clinics
   cms_hpt_url: https://www.cahcare.com/cms-hpt.txt
 - hospital_id: hospital-001103
@@ -5014,6 +5017,7 @@ hospitals:
   name: Community Care Hospital
   cms_hpt_url: https://communitycarehospital.com/cms-hpt.txt
 - hospital_id: hospital-001522
+  alias_of: hospital-001523
   name: COMMUNITY FIRST HEALTHCARE OF ILLINOIS INC
   cms_hpt_url: https://www.cfmedicalcenter.com/cms-hpt.txt
 - hospital_id: hospital-001523
@@ -7875,6 +7879,7 @@ hospitals:
 - hospital_id: hospital-002407
   name: Good Shepherd Specialty Hospital
   cms_hpt_url: https://www.goodshepherdrehab.org/cms-hpt.txt
+  locator_name: Allentown Specialty Hospital
 - hospital_id: hospital-002408
   name: Goodland Reginal Medical Center
   cms_hpt_url: https://goodlandregional.com/cms-hpt.txt
@@ -9960,6 +9965,7 @@ hospitals:
   name: 'HOSPITAL SERVICE DISTRICT #2 OF LASALLE PARISH'
   cms_hpt_url: https://www.lasallegeneralhospital.com/cms-hpt.txt
 - hospital_id: hospital-003029
+  alias_of: hospital-000811
   name: HOSPITAL SERVICE DISTRICT NO 1 OF THE PARISH OF ST MARY
   cms_hpt_url: https://bayoubendhealth.org/cms-hpt.txt
 - hospital_id: hospital-003030
@@ -10562,6 +10568,7 @@ hospitals:
 - hospital_id: hospital-003213
   name: Jefferson Community Health & Life
   cms_hpt_url: https://www.jchealthandlife.org/cms-hpt.txt
+  locator_name: Jefferson Community Health Center, Inc
 - hospital_id: hospital-003214
   name: Jefferson Community Health Center Inc.
   cms_hpt_url: https://www.jchealthandlife.org/cms-hpt.txt
@@ -10640,6 +10647,7 @@ hospitals:
   name: Jennie Stuart Medical Center
   cms_hpt_url: https://jenniestuarthealth.org/cms-hpt.txt
 - hospital_id: hospital-003238
+  alias_of: hospital-005914
   name: Jerold Phelps Community Hospital
   cms_hpt_url: https://sohumhealth.org/cms-hpt.txt
 - hospital_id: hospital-003239
@@ -12898,6 +12906,7 @@ hospitals:
   name: Memorial Health
   cms_hpt_url: https://www.memorialhealthswok.com/cms-hpt.txt
 - hospital_id: hospital-003926
+  alias_of: hospital-003946
   name: MEMORIAL HEALTH CARE SYSTEMS
   cms_hpt_url: https://mhcs.us/cms-hpt.txt
 - hospital_id: hospital-003927
@@ -14059,6 +14068,7 @@ hospitals:
   name: Minnie Hamilton Health System
   cms_hpt_url: https://www.mhhs.healthcare/cms-hpt.txt
 - hospital_id: hospital-004273
+  alias_of: hospital-004272
   name: Minnie Hamilton Health Systems
   cms_hpt_url: https://www.mhhs.healthcare/cms-hpt.txt
 - hospital_id: hospital-004274
@@ -14218,6 +14228,7 @@ hospitals:
   name: Montgomery County Memorial Hospital
   cms_hpt_url: https://www.mcmh.org/cms-hpt.txt
 - hospital_id: hospital-004322
+  alias_of: hospital-004323
   name: MONTROSE MEMORIAL HOSPITAL INC
   cms_hpt_url: https://montrosehealth.com/cms-hpt.txt
 - hospital_id: hospital-004323
@@ -17481,6 +17492,7 @@ hospitals:
   name: Redeemer Health
   cms_hpt_url: https://redeemerhealth.org/cms-hpt.txt
 - hospital_id: hospital-005321
+  alias_of: hospital-005322
   name: Redington-Fairview
   cms_hpt_url: https://www.rfgh.net/cms-hpt.txt
 - hospital_id: hospital-005322
@@ -17995,6 +18007,7 @@ hospitals:
   name: Rochelle Community Hospital
   cms_hpt_url: https://www.rochellehospital.com/cms-hpt.txt
 - hospital_id: hospital-005475
+  alias_of: hospital-005474
   name: Rochelle Community Hospital Association
   cms_hpt_url: https://www.rochellehospital.com/cms-hpt.txt
 - hospital_id: hospital-005476
@@ -18156,6 +18169,7 @@ hospitals:
 - hospital_id: hospital-005525
   name: Sagewest Health Care
   cms_hpt_url: https://www.sagewesthealthcare.com/cms-hpt.txt
+  locator_name: SageWest Health Care Riverton
 - hospital_id: hospital-005526
   name: SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
@@ -18393,6 +18407,7 @@ hospitals:
   name: Saline Health System
   cms_hpt_url: https://www.salinememorial.org/cms-hpt.txt
 - hospital_id: hospital-005599
+  alias_of: hospital-005598
   name: SALINE MEMORIAL HOSPITAL
   cms_hpt_url: https://www.salinememorial.org/cms-hpt.txt
 - hospital_id: hospital-005600
@@ -18637,6 +18652,7 @@ hospitals:
   name: Satanta District Hospital
   cms_hpt_url: https://www.satantahospital.net/cms-hpt.txt
 - hospital_id: hospital-005670
+  alias_of: hospital-005669
   name: SATANTA DISTRICT HOSPITAL AND LONG-TERM CARE
   cms_hpt_url: https://www.satantahospital.net/cms-hpt.txt
 - hospital_id: hospital-005671
@@ -18932,6 +18948,7 @@ hospitals:
   name: Shirley Ryan Abilitylab
   cms_hpt_url: https://www.sralab.org/cms-hpt.txt
 - hospital_id: hospital-005760
+  alias_of: hospital-004582
   name: SHOALS HOSPITAL
   cms_hpt_url: https://www.namcshoals.com/cms-hpt.txt
 - hospital_id: hospital-005761
@@ -19914,6 +19931,7 @@ hospitals:
   name: St Jude Medical Center
   cms_hpt_url: https://www.providence.org/cms-hpt.txt
 - hospital_id: hospital-006052
+  alias_of: hospital-006196
   name: St Luke Community Hospital and Nursing Home
   cms_hpt_url: https://stlukehealthcare.org/cms-hpt.txt
 - hospital_id: hospital-006053
@@ -21391,6 +21409,7 @@ hospitals:
   fallback_mrf_url: https://www.kennedykrieger.org/sites/default/files/library/documents/about-us/Financial%20Docs/520607971_kennedy-krieger-institute_standardcharges_0.csv
   locator_name: Kennedy Krieger Institute
 - hospital_id: hospital-006503
+  alias_of: hospital-003777
   name: THE MARY LANNING MEMORIAL HOSPITAL ASSOCIATION
   cms_hpt_url: https://marylanning.org/cms-hpt.txt
 - hospital_id: hospital-006504
