@@ -143,15 +143,16 @@ metadata fields are not part of the controller payload. This extraction does
 not dispatch anything, and the Flex operator has no Profile-dispatch command.
 Do not infer Profile serving readiness from the controller observation receipt.
 
-For that reason, every publication receipt explicitly reports:
+For that reason, every cohort-complete publication receipt explicitly reports:
 
 ```json
 {"operator_command_available":false,"required_external_global_dispatch":true,"status":"not_dispatched"}
 ```
 
-The production controller must submit the embedded standard global Profile
-follow-up after verifying the published dataset receipt. Do not infer Profile
-serving readiness from this operator's publication result.
+For a cohort-complete receipt, the production controller must submit the
+embedded standard global Profile follow-up after verifying the published
+dataset receipt. Do not infer Profile serving readiness from this operator's
+publication result.
 
 Do not schedule or run the retired twin phase. Reviewed single-root acquisition
 and exact-selector publication remain manual and default-off.
