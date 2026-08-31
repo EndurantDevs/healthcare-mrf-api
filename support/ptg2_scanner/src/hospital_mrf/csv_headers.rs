@@ -114,8 +114,6 @@ fn parse_csv_metadata(
         CmsProfile::V2 => fields
             .contains_key("location_name")
             .then_some("location_name")
-            .or_else(|| fields.contains_key("type_2_npi").then_some("type_2_npi"))
-            .or_else(|| fields.contains_key("attester_name").then_some("attester_name"))
             .or_else(|| attestation_index.map(|_| "attestation")),
         CmsProfile::V3 => fields
             .contains_key("hospital_location")
@@ -182,7 +180,10 @@ fn parse_csv_metadata(
                 max_fanout_rows,
             )?,
             type_2_npis: match profile {
-                CmsProfile::V2 => Vec::new(),
+                CmsProfile::V2 => optional_value("type_2_npi")
+                    .map(|value| split_pipe_bounded(&value, "type_2_npi", max_fanout_rows))
+                    .transpose()?
+                    .unwrap_or_default(),
                 CmsProfile::V3 => split_pipe_bounded(
                     value("type_2_npi")?,
                     "type_2_npi",
@@ -200,7 +201,7 @@ fn parse_csv_metadata(
             .to_owned(),
             confirm_attestation,
             attester_name: match profile {
-                CmsProfile::V2 => None,
+                CmsProfile::V2 => optional_value("attester_name"),
                 CmsProfile::V3 => Some(value("attester_name")?.to_owned()),
             },
             financial_aid_policy: optional_value("financial_aid_policy"),
