@@ -93,6 +93,29 @@ def test_preexisting_census_resource_fails_before_any_mutation(
     assert not (state_root / "run").exists()
 
 
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {"FAKE_SEED_REAPPEAR": "preexisting-pod"},
+        {"FAKE_SEED_POD_LIST_ERROR": "1"},
+    ],
+)
+def test_seed_pod_presence_or_unreadability_fails_before_mutation(
+    tmp_path: Path,
+    environment: dict[str, str],
+) -> None:
+    """Seed Pod presence or unreadability must fail before any outer fence."""
+
+    result, state_root = envelope._run_envelope(
+        tmp_path,
+        **environment,
+    )
+
+    assert result.returncode == 1
+    assert not (tmp_path / "fake-state/events").exists()
+    assert not (state_root / "run").exists()
+
+
 @pytest.mark.parametrize("kind", ["job", "pod", "configmap"])
 def test_labeled_census_residue_retains_every_outer_fence(
     tmp_path: Path,
@@ -167,18 +190,23 @@ def test_unproven_child_cleanup_retains_every_outer_fence(tmp_path: Path) -> Non
     assert receipt["cleanup"]["complete"] is False
 
 
-def test_seed_reappearance_retains_drain_quota_and_lock(tmp_path: Path) -> None:
+@pytest.mark.parametrize("kind", ["job", "pod"])
+def test_seed_reappearance_retains_drain_quota_and_lock(
+    tmp_path: Path,
+    kind: str,
+) -> None:
     """A reseed race must stop teardown before restoring the import lane."""
 
     result, state_root = envelope._run_envelope(
         tmp_path,
-        FAKE_SEED_REAPPEAR="cleanup",
+        FAKE_SEED_REAPPEAR=kind,
     )
 
     assert result.returncode == 1
     events = (tmp_path / "fake-state/events").read_text().splitlines()
     assert "binding_delete" not in events and "policy_delete" not in events
-    assert "drain_set_false" in events and "drain_set_true" in events
+    assert "drain_set_true" in events
+    assert ("drain_set_false" in events) is (kind == "job")
     assert (tmp_path / "fake-state/drain").read_text() == "true"
     assert "quota_delete" not in events
     assert "lock_stop" not in events

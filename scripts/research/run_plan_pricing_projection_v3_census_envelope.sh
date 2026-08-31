@@ -526,10 +526,20 @@ verify_absent() {
 
 verify_seed_absent() {
   verify_absent job seed-import-nodes "${DEV_NAMESPACE}"
+  seed_pods_are_absent \
+    || die "present or unreadable seed-import-nodes Pod blocks the envelope"
 }
 
 seed_is_absent() {
-  resource_is_absent job seed-import-nodes "${DEV_NAMESPACE}"
+  resource_is_absent job seed-import-nodes "${DEV_NAMESPACE}" \
+    && seed_pods_are_absent
+}
+
+seed_pods_are_absent() {
+  local observed
+  observed=$(kctl -n "${DEV_NAMESPACE}" get pods \
+    -l "app.kubernetes.io/name=seed-import-nodes" -o name) || return 1
+  [ -z "${observed}" ]
 }
 
 unit_load_state() {
