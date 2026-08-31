@@ -14895,9 +14895,9 @@ hospitals:
   name: Neosho Memorial Regional Medical Center
   cms_hpt_url: https://www.nmrmc.com/cms-hpt.txt
 - hospital_id: hospital-004513
-  alias_of: hospital-004514
   name: Nephi Medical Clinic
   cms_hpt_url: https://www.centralvalleymedicalcenter.com/cms-hpt.txt
+  locator_mrf_url: https://cvmc.goredde.com/Estimator/Files/87-0419324_Central_Valley_Medical_Center_Clinics_standardcharges.csv
 - hospital_id: hospital-004514
   name: Nephi Medical Clinic
   cms_hpt_url: https://www.centralvalleymedicalcenter.com/cms-hpt.txt
