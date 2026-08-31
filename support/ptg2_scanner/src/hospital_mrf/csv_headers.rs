@@ -128,8 +128,8 @@ fn parse_csv_metadata(
         )));
     }
     let confirmation_index = match profile {
-        CmsProfile::V2 => affirmation_index.ok_or_else(|| invalid("missing affirmation header"))?,
-        CmsProfile::V3 => attestation_index.ok_or_else(|| invalid("missing attestation header"))?,
+        CmsProfile::V2 => affirmation_index.ok_or(invalid("missing affirmation header"))?,
+        CmsProfile::V3 => attestation_index.ok_or(invalid("missing attestation header"))?,
     };
     let confirm_attestation = match values
         .get(confirmation_index)

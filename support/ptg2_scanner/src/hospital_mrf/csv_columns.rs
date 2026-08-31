@@ -129,8 +129,7 @@ fn parse_tall_columns(
                 }
                 (
                     Some(
-                        estimated_amount
-                            .ok_or_else(|| invalid("missing CSV header estimated_amount"))?,
+                        estimated_amount.ok_or(invalid("missing CSV header estimated_amount"))?,
                     ),
                     None,
                     None,
@@ -145,18 +144,15 @@ fn parse_tall_columns(
                 (
                     None,
                     Some(
-                        median_amount
-                            .ok_or_else(|| invalid("missing CSV header median_amount"))?,
+                        median_amount.ok_or(invalid("missing CSV header median_amount"))?,
                     ),
                     Some(
-                        percentile_10
-                            .ok_or_else(|| invalid("missing CSV header 10th_percentile"))?,
+                        percentile_10.ok_or(invalid("missing CSV header 10th_percentile"))?,
                     ),
                     Some(
-                        percentile_90
-                            .ok_or_else(|| invalid("missing CSV header 90th_percentile"))?,
+                        percentile_90.ok_or(invalid("missing CSV header 90th_percentile"))?,
                     ),
-                    Some(allowed_count.ok_or_else(|| invalid("missing CSV header count"))?),
+                    Some(allowed_count.ok_or(invalid("missing CSV header count"))?),
                 )
             }
         };

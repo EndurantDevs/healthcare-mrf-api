@@ -30,7 +30,7 @@ def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
         for constraint in HospitalPriceVersion.__table__.constraints
         if constraint.name == "hospital_price_version_shape_check"
     )
-    assert HospitalPriceVersion.attester_name.nullable is True
+    assert HospitalPriceVersion.__table__.c.attester_name.nullable is True
     model_sql = str(shape_check.sqltext)
     assert "template_version = '3.0.0' AND npi_count > 0" in model_sql
     assert "template_version IN ('2.0.0', '2.2.0', '2.2.1')" in model_sql

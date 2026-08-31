@@ -21,7 +21,7 @@ fn csv_fixture_index(headers: &[String], name: &str) -> usize {
     headers
         .iter()
         .position(|header| header == name)
-        .unwrap_or_else(|| panic!("missing CSV fixture header {name}"))
+        .expect("missing CSV fixture header")
 }
 
 fn fixture_v2_csv(format: InputFormat, version: &str) -> Vec<u8> {
