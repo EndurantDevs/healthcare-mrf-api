@@ -375,6 +375,24 @@ async def test_membership_location_rows_bounds_knn_and_restores_planner(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_large_exact_npi_scope_disables_location_jit(monkeypatch):
+    query = _location_query()
+    query.parameter_map["candidate_npis"] = list(range(4097))
+    enable = AsyncMock(return_value=("auto", "2", "on"))
+    restore = AsyncMock()
+    monkeypatch.setattr(serving, "_enable_serial_knn_planning", enable)
+    monkeypatch.setattr(serving, "_restore_knn_planning", restore)
+
+    location_rows = await serving._execute_membership_location_sql(
+        FakeSession([FakeResult([])]), query, "SELECT 1 WHERE FALSE", offset=0
+    )
+
+    assert location_rows == []
+    enable.assert_awaited_once()
+    restore.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_membership_location_rows_preserves_knn_query_failure(monkeypatch):
     monkeypatch.setattr(
         serving,

@@ -304,6 +304,34 @@ async def test_membership_location_query_uses_v4_local_npi_dictionary(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_exact_npi_scope_skips_redundant_taxonomy_index_union(monkeypatch):
+    monkeypatch.setattr(
+        serving,
+        "_ptg2_address_serving_table",
+        AsyncMock(return_value="mrf.entity_address_unified"),
+    )
+
+    query = await serving._membership_location_query(
+        object(),
+        strict_v3_tables(),
+        {
+            "classification": "Orthopaedic Surgery",
+            "code": "66984",
+            "code_system": "CPT",
+            "lat": "41.9",
+            "long": "-87.6",
+        },
+        candidate_npis=(1234567890,),
+        limit=10,
+    )
+
+    assert query is not None
+    assert query.taxonomy_index_sql is None
+    assert "membership_location_specialty_nt" in query.filter_sql
+    assert "membership_location_inferred_taxonomy_code_0" in query.filter_sql
+
+
+@pytest.mark.asyncio
 async def test_overlay_corroboration_passthrough_paths(monkeypatch):
     provider_rows = [{"npi": 11, "provider_name": "Eleven"}]
 

@@ -56,6 +56,9 @@ def _install_local_distance_reads(monkeypatch):
     replacement_by_name = {
         "_version_three_explicit_npi_graph_scope": AsyncMock(return_value=None),
         "_shared_rate_code_scope_rows": AsyncMock(return_value=[{"code_key": 7}]),
+        "_membership_exact_scope_npis": AsyncMock(
+            return_value=tuple(range(1, 202))
+        ),
         "load_v4_graph_root": AsyncMock(
             return_value=SimpleNamespace(representation="pattern_v1")
         ),
