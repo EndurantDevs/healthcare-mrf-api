@@ -732,9 +732,11 @@ hospitals:
   name: Antioch Medical Center
   cms_hpt_url: https://healthy.kaiserpermanente.org/cms-hpt.txt
 - hospital_id: hospital-000220
+  alias_of: hospital-000448
   name: AO Fox Hospital
   cms_hpt_url: https://www.bassett.org/cms-hpt.txt
 - hospital_id: hospital-000221
+  alias_of: hospital-000449
   name: AO Fox Hospital Tri Town Campus
   cms_hpt_url: https://www.bassett.org/cms-hpt.txt
 - hospital_id: hospital-000222
@@ -2414,6 +2416,7 @@ hospitals:
   name: Bartow Regional Medical Center
   cms_hpt_url: https://baycare.org/cms-hpt.txt
 - hospital_id: hospital-000726
+  alias_of: hospital-003776
   name: Bassett Medical Center
   cms_hpt_url: https://www.bassett.org/cms-hpt.txt
 - hospital_id: hospital-000727
@@ -3000,6 +3003,7 @@ hospitals:
   name: Blanchard Valley Health System
   cms_hpt_url: https://www.bvhealthsystem.org/cms-hpt.txt
 - hospital_id: hospital-000905
+  alias_of: hospital-000904
   name: Blanchard Valley Hospital
   cms_hpt_url: https://www.bvhealthsystem.org/cms-hpt.txt
 - hospital_id: hospital-000906
@@ -3025,6 +3029,7 @@ hospitals:
   name: Blue Mountain Hospital
   cms_hpt_url: https://www.bmhutah.org/cms-hpt.txt
 - hospital_id: hospital-000912
+  alias_of: hospital-000913
   name: Blue Mountain HOSPITAL
   cms_hpt_url: https://www.bluemountainhospital.org/cms-hpt.txt
 - hospital_id: hospital-000913
@@ -4152,6 +4157,7 @@ hospitals:
   name: CHI St. Alexius Health Devils Lake
   cms_hpt_url: https://www.chistalexiushealth.org/cms-hpt.txt
 - hospital_id: hospital-001257
+  alias_of: hospital-001221
   name: CHI St. Alexius Health Dickinson
   cms_hpt_url: https://www.chistalexiushealth.org/cms-hpt.txt
 - hospital_id: hospital-001258
@@ -5169,6 +5175,7 @@ hospitals:
   name: Conway Regional Rehab Hospital
   cms_hpt_url: https://www.conwayregional.org/cms-hpt.txt
 - hospital_id: hospital-001570
+  alias_of: hospital-001569
   name: Conway Regional Rehabilitation Hospital
   cms_hpt_url: https://www.conwayregional.org/cms-hpt.txt
 - hospital_id: hospital-001571
@@ -5196,6 +5203,7 @@ hospitals:
   name: Copper Queen Community Hospital
   cms_hpt_url: https://cqch.org/cms-hpt.txt
 - hospital_id: hospital-001579
+  alias_of: hospital-001580
   name: Copper Springs
   cms_hpt_url: https://coppersprings.com/cms-hpt.txt
 - hospital_id: hospital-001580
@@ -9348,6 +9356,7 @@ hospitals:
   name: HealthAlliance-Clinton, Leominster Campus
   cms_hpt_url: https://www.ummhealth.org/cms-hpt.txt
 - hospital_id: hospital-002844
+  alias_of: hospital-004555
   name: HEALTHBRIDGE CHILDREN'S HOSPITAL HOUSTON LTD
   cms_hpt_url: https://nexushealthsystems.com/cms-hpt.txt
 - hospital_id: hospital-002845
@@ -11632,6 +11641,7 @@ hospitals:
   cms_hpt_url: https://www.legenthealth.com/cms-hpt.txt
   locator_name: Legent Hospital Northwest Houston, LLC
 - hospital_id: hospital-003538
+  alias_of: hospital-002160
   name: Legent Orthopedic Hospital
   cms_hpt_url: https://www.legenthealth.com/cms-hpt.txt
   locator_name: Ethicus Hospital DFW
@@ -13227,6 +13237,7 @@ hospitals:
 - hospital_id: hospital-004023
   name: Mercy Hospital Downtown
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  locator_name: Mercy Hospitals – Bakersfield
 - hospital_id: hospital-004024
   name: Mercy Hospital Endoscopy Center
   cms_hpt_url: https://www.mercy.net/cms-hpt.txt
@@ -13326,6 +13337,7 @@ hospitals:
 - hospital_id: hospital-004052
   name: Mercy Hospital Southwest
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  locator_name: Mercy Hospitals – Bakersfield
 - hospital_id: hospital-004053
   name: Mercy Hospital Sports Medicine-EMER
   cms_hpt_url: https://www.mercy.net/cms-hpt.txt
@@ -13400,6 +13412,7 @@ hospitals:
   cms_hpt_url: https://www.mercy.net/cms-hpt.txt
   locator_name: Mercy Hospital St Louis
 - hospital_id: hospital-004073
+  alias_of: hospital-004007
   name: Mercy Medical Center
   cms_hpt_url: https://www.trinityhealthofne.org/cms-hpt.txt
 - hospital_id: hospital-004074
@@ -14361,6 +14374,7 @@ hospitals:
   cms_hpt_url: https://www.mtgraham.org/cms-hpt.txt
   locator_name: Mt Graham Regional Medical Center
 - hospital_id: hospital-004361
+  alias_of: hospital-005493
   name: Mount Pleasant Hospital
   cms_hpt_url: https://www.rsfh.com/cms-hpt.txt
 - hospital_id: hospital-004362
@@ -14881,9 +14895,9 @@ hospitals:
   name: Neosho Memorial Regional Medical Center
   cms_hpt_url: https://www.nmrmc.com/cms-hpt.txt
 - hospital_id: hospital-004513
+  alias_of: hospital-004514
   name: Nephi Medical Clinic
   cms_hpt_url: https://www.centralvalleymedicalcenter.com/cms-hpt.txt
-  locator_mrf_url: https://cvmc.goredde.com/Estimator/Files/87-0419324_Central_Valley_Medical_Center_Clinics_standardcharges.csv
 - hospital_id: hospital-004514
   name: Nephi Medical Clinic
   cms_hpt_url: https://www.centralvalleymedicalcenter.com/cms-hpt.txt
@@ -15023,9 +15037,11 @@ hospitals:
   name: Nexus Children's Hospital - Shenandoah
   cms_hpt_url: https://nexushealthsystems.com/cms-hpt.txt
 - hospital_id: hospital-004557
+  alias_of: hospital-004556
   name: Nexus Children's Hospital - Shenandoah Campus
   cms_hpt_url: https://nexushealthsystems.com/cms-hpt.txt
 - hospital_id: hospital-004558
+  alias_of: hospital-004553
   name: Nexus Children's Hospital - The Woodlands Campus
   cms_hpt_url: https://nexushealthsystems.com/cms-hpt.txt
 - hospital_id: hospital-004559
@@ -16230,6 +16246,7 @@ hospitals:
   name: Pacifica Hospital of the Valley
   cms_hpt_url: https://pacificahospital.com/cms-hpt.txt
 - hospital_id: hospital-004921
+  alias_of: hospital-000572
   name: Page Hospital
   cms_hpt_url: https://www.bannerhealth.com/cms-hpt.txt
 - hospital_id: hospital-004922
@@ -22608,6 +22625,7 @@ hospitals:
   name: UPMC Harrisburg
   cms_hpt_url: https://www.upmc.com/cms-hpt.txt
 - hospital_id: hospital-006874
+  alias_of: hospital-006876
   name: UPMC Horizon - Shenango Valley
   cms_hpt_url: https://www.upmc.com/cms-hpt.txt
 - hospital_id: hospital-006875
@@ -22629,6 +22647,7 @@ hospitals:
   name: UPMC Magee
   cms_hpt_url: https://www.upmc.com/cms-hpt.txt
 - hospital_id: hospital-006881
+  alias_of: hospital-006880
   name: UPMC Magee-Womens Hospital
   cms_hpt_url: https://www.upmc.com/cms-hpt.txt
 - hospital_id: hospital-006882
@@ -22658,6 +22677,8 @@ hospitals:
 - hospital_id: hospital-006890
   name: UPMC Pinnacle Hospitals
   cms_hpt_url: https://www.upmc.com/cms-hpt.txt
+  locator_name: UPMC Harrisburg
+  locator_mrf_url: https://dam.upmc.com/-/media/upmc/locations/hospitals/documents/cdm-json-files/machine-readable-csv-not-json/251778644_upmc-pinnacle-hospitals_standardcharges.csv
 - hospital_id: hospital-006891
   name: UPMC Presbyterian
   cms_hpt_url: https://www.upmc.com/cms-hpt.txt
@@ -22686,6 +22707,7 @@ hospitals:
   name: UPMC Western Psychiatric
   cms_hpt_url: https://www.upmc.com/cms-hpt.txt
 - hospital_id: hospital-006900
+  alias_of: hospital-006899
   name: UPMC Western Psychiatric Hospital
   cms_hpt_url: https://www.upmc.com/cms-hpt.txt
 - hospital_id: hospital-006901
