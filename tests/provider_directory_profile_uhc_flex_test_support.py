@@ -235,6 +235,29 @@ def _readiness_record(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**readiness_by_field)
 
 
+def _rooted_readiness_record(**overrides: object) -> SimpleNamespace:
+    metadata = _rooted_metadata()
+    readiness_by_field: dict[str, object] = {
+        "dataset_id": GRAPH_DATASET_ID,
+        "endpoint_id": GRAPH_ENDPOINT_ID,
+        "source_id": PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+        "source_authority_id": "unitedhealthcare",
+        "dataset_hash": "5" * 64,
+        "resource_count": 8,
+        "resource_counts": metadata["resource_counts"],
+        "semantic_projection_as_of": "2026-08-09",
+        "admission_id": metadata["admission_id"],
+        "operation_key": "6" * 64,
+        "publication_kind": "rooted_combined",
+        "cohort_complete": True,
+        "rooted_graph_complete": True,
+        "endpoint_collection_complete": False,
+        "endpoint_complete": False,
+    }
+    readiness_by_field.update(overrides)
+    return SimpleNamespace(**readiness_by_field)
+
+
 def _artifact_dataset_row() -> dict[str, object]:
     metadata = _flex_metadata()
     return {
@@ -261,6 +284,7 @@ __all__ = (
     "_dataset_rows",
     "_flex_metadata",
     "_readiness_record",
+    "_rooted_readiness_record",
     "_rooted_dataset_rows",
     "_rooted_metadata",
     "_source_rows",

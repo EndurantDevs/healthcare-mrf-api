@@ -95,11 +95,11 @@ The publication process does not statically load the HTTP acquisition runtime.
 A cohort-complete receipt reports Profile dispatch as `not_dispatched` and
 embeds the exact external controller payload at
 `profile_dispatch.external_followup`. A rooted publication over an admitted
-retry-exhausted Flex root instead carries `cohort_complete=false` and the exact
-`retry_exhausted_count`, remains available as source-local rooted evidence, and
-reports `required_external_global_dispatch=false`; it is not a Profile
-follow-up authority. Extract a complete receipt's immutable payload without
-changing any field:
+retry-exhausted Flex root carries `cohort_complete=false`, the exact
+`retry_exhausted_count`, and the same immutable Profile follow-up. The Profile
+selector accepts partial coverage only from the reviewed single-root policy;
+twin-root partial coverage fails closed. Extract the receipt's immutable
+payload without changing any field:
 
 ```bash
 GLOBAL_PROFILE_FOLLOWUP_JSON="$(

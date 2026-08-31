@@ -165,7 +165,7 @@ async def test_publication_uses_only_exact_receipt_and_serializes_replay(
     _assert_publication_receipt(publication_receipt_by_field, selector)
 
 
-def test_partial_publication_receipt_suppresses_profile_dispatch() -> None:
+def test_partial_publication_receipt_requires_profile_dispatch() -> None:
     readiness = SimpleNamespace(
         admission_id="pdrgad_" + "1" * 48,
         acquisition_root_run_id="pdrgpr_" + "5" * 48,
@@ -187,8 +187,8 @@ def test_partial_publication_receipt_suppresses_profile_dispatch() -> None:
 
     assert receipt["cohort_complete"] is False
     assert receipt["retry_exhausted_count"] == 8
-    assert receipt["profile_dispatch"] == {
-        "operator_command_available": False,
-        "required_external_global_dispatch": False,
-        "status": "not_applicable_incomplete_cohort",
-    }
+    assert receipt["profile_dispatch"]["status"] == "not_dispatched"
+    assert receipt["profile_dispatch"]["required_external_global_dispatch"] is True
+    assert receipt["profile_dispatch"]["external_followup"]["dataset_id"] == (
+        "pdrgpd_" + "3" * 48
+    )

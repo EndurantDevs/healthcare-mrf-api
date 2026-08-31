@@ -11,6 +11,7 @@ from process.provider_directory_dataset_scoped_publication import (
     LEGACY_PRACTITIONER_VARIANT,
     ROOTED_COMBINED_VARIANT,
 )
+from process.provider_directory_fhir_root_policy import ReviewedRootPolicy
 from process.provider_directory_profile_uhc_flex_contract import (
     _clean_text,
     _is_rooted_resource_counts_valid,
@@ -125,7 +126,7 @@ def _is_variant_dataset_row_ready(
         variant == ROOTED_COMBINED_VARIANT
         and dataset_row.get("dataset_scoped_publication_kind")
         == ROOTED_COMBINED_VARIANT
-        and dataset_row.get("dataset_scoped_cohort_complete") is True
+        and type(dataset_row.get("dataset_scoped_cohort_complete")) is bool
         and dataset_row.get("dataset_scoped_rooted_graph_complete") is True
         and dataset_row.get("dataset_scoped_endpoint_collection_complete") is False
         and dataset_row.get("dataset_scoped_endpoint_complete") is False
@@ -148,15 +149,8 @@ def is_uhc_flex_dataset_readiness_matching(
     endpoint_id = _clean_text(dataset_row.get("endpoint_id")) or ""
     source_id = _clean_text(dataset_row.get("source_id")) or ""
     variant = uhc_flex_profile_dataset_variant(dataset_id)
-    readiness_retry_exhausted_count = getattr(
-        readiness,
-        "retry_exhausted_count",
-        0,
-    )
-    metadata_retry_exhausted_count = metadata_by_field.get(
-        "retry_exhausted_count",
-        0,
-    )
+    readiness_retry_exhausted_count = getattr(readiness, "retry_exhausted_count", 0)
+    metadata_retry_exhausted_count = metadata_by_field.get("retry_exhausted_count", 0)
     readiness_resource_counts = getattr(readiness, "resource_counts", None)
     is_readiness_variant_ready = variant == LEGACY_PRACTITIONER_VARIANT or (
         variant == ROOTED_COMBINED_VARIANT
@@ -305,15 +299,23 @@ def is_uhc_flex_fence_dataset_ready(dataset: Any, readiness: Any) -> bool:
     if readiness is None:
         return False
     retry_exhausted_count = getattr(readiness, "retry_exhausted_count", 0)
-    is_legacy_ready = bool(
-        dataset.dataset_scoped_variant == LEGACY_PRACTITIONER_VARIANT
-        and type(retry_exhausted_count) is int
+    is_coverage_ready = bool(
+        type(retry_exhausted_count) is int
         and retry_exhausted_count >= 0
         and readiness.cohort_complete is (retry_exhausted_count == 0)
+        and (
+            retry_exhausted_count == 0
+            or getattr(dataset, "reviewed_root_policy", None)
+            == ReviewedRootPolicy(1)
+        )
+    )
+    is_legacy_ready = bool(
+        dataset.dataset_scoped_variant == LEGACY_PRACTITIONER_VARIANT
+        and is_coverage_ready
     )
     is_rooted_ready = bool(
         dataset.dataset_scoped_variant == ROOTED_COMBINED_VARIANT
-        and readiness.cohort_complete is True
+        and is_coverage_ready
         and readiness.publication_kind == ROOTED_COMBINED_VARIANT
         and readiness.rooted_graph_complete is True
         and _is_rooted_resource_counts_valid(readiness.resource_counts)

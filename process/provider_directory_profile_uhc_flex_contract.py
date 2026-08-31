@@ -237,11 +237,19 @@ def _is_flex_admission_metadata_valid(
     return False
 
 
-def _is_flex_cohort_metadata_valid(
+def _is_profile_cohort_metadata_valid(
     publication_metadata: Mapping[str, Any],
 ) -> bool:
     """Accept exact coverage or reviewed retry-exhausted single-root coverage."""
 
+    single_root_admission_contract_id = {
+        UHC_FLEX_PRACTITIONER_SOURCE_ID: (
+            UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID
+        ),
+        PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID: (
+            PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID
+        ),
+    }.get(publication_metadata.get("source_id"))
     retry_exhausted_count = publication_metadata.get("retry_exhausted_count")
     if publication_metadata.get("cohort_complete") is True:
         return "retry_exhausted_count" not in publication_metadata
@@ -250,7 +258,7 @@ def _is_flex_cohort_metadata_valid(
         and type(retry_exhausted_count) is int
         and retry_exhausted_count > 0
         and publication_metadata.get("admission_contract_id")
-        == UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID
+        == single_root_admission_contract_id
     )
 
 
@@ -345,7 +353,7 @@ def is_uhc_flex_publication_metadata_valid(
             publication_metadata.get("publication_contract_id")
             == UHC_FLEX_PRACTITIONER_DATASET_PUBLICATION_CONTRACT_ID
             and _is_flex_admission_metadata_valid(publication_metadata)
-            and _is_flex_cohort_metadata_valid(publication_metadata)
+            and _is_profile_cohort_metadata_valid(publication_metadata)
         )
     resource_counts = publication_metadata.get("resource_counts")
     return bool(
@@ -354,8 +362,7 @@ def is_uhc_flex_publication_metadata_valid(
         == PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID
         and publication_metadata.get("publication_kind")
         == PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND
-        and publication_metadata.get("cohort_complete") is True
-        and "retry_exhausted_count" not in publication_metadata
+        and _is_profile_cohort_metadata_valid(publication_metadata)
         and publication_metadata.get("rooted_graph_complete") is True
         and _is_rooted_admission_metadata_valid(publication_metadata)
         and _is_rooted_resource_counts_valid(resource_counts)
