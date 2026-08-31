@@ -8141,6 +8141,7 @@ def _parse_organization_resource(
 def _parse_location_resource(
     resource: dict[str, Any],
     base: dict[str, Any],
+    *,
     normalize_location_contacts: bool,
 ) -> tuple[type, dict[str, Any]]:
     telecom = _telecom(resource)
@@ -8320,7 +8321,11 @@ def parse_fhir_resource(
     if resource_type == "Organization":
         return _parse_organization_resource(resource, base)
     if resource_type == "Location":
-        return _parse_location_resource(resource, base, normalize_location_contacts)
+        return _parse_location_resource(
+            resource,
+            base,
+            normalize_location_contacts=normalize_location_contacts,
+        )
     if resource_type == "PractitionerRole":
         return _parse_practitioner_role_resource(resource, base)
     if resource_type == "HealthcareService":
