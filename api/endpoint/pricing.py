@@ -12411,6 +12411,17 @@ async def list_providers_by_procedure(request):
         except ValueError as exc:
             raise InvalidUsage(str(exc)) from exc
     if plan_id or plan_external_id or source_key or snapshot_id or plan_release_id:
+        ptg_order_by = order_by
+        if (
+            args.get("order_by") in (None, "", "null")
+            and ptg_code_system == "HCPCS"
+            and code[:1].isalpha()
+            and (zip5 or (latitude is not None and longitude is not None))
+            and _parse_bool(
+                args.get("include_providers"), "include_providers", default=True
+            )
+        ):
+            ptg_order_by = "distance"
         ptg_latitude = latitude
         ptg_longitude = longitude
         ptg_radius_miles = coordinate_radius_miles if latitude is not None else None
@@ -12454,7 +12465,7 @@ async def list_providers_by_procedure(request):
                 "taxonomy_classification": args.get("taxonomy_classification") or None,
                 "taxonomy_specialization": args.get("taxonomy_specialization") or None,
                 "taxonomy_section": args.get("taxonomy_section") or None,
-                "order_by": order_by or None,
+                "order_by": ptg_order_by or None,
                 "order": ptg_order or None,
                 "state": state or None,
                 "city": city or None,

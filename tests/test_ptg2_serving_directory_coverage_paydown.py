@@ -252,6 +252,9 @@ async def test_membership_location_query_does_not_let_exact_zip_bypass_assurance
     assert "exact_zip_candidates AS MATERIALIZED" in rendered_sql
     assert "candidate_keys AS MATERIALIZED" in rendered_sql
     assert "nearest_addresses AS MATERIALIZED" in rendered_sql
+    assert "CROSS JOIN LATERAL" in rendered_sql
+    assert "candidate_address.location_key = candidate.location_key" in rendered_sql
+    assert "JOIN mrf.entity_address_unified addr ON" not in rendered_sql
     assert "(SELECT ST_DWithin(" in rendered_sql
     assert "OFFSET 0)" in rendered_sql
     assert ":raw_probe_limit - geocoded_probe_stats.raw_probe_count" in rendered_sql

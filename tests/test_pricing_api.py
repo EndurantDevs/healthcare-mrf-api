@@ -3693,6 +3693,132 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
     assert seen_argument_map["radius_miles"] == 10.0
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("include_providers", "requested_order", "expected_order"),
+    (
+        (None, None, "distance"),
+        ("false", None, "total_allowed_amount"),
+        (None, "total_allowed_amount", "total_allowed_amount"),
+    ),
+)
+async def test_hcpcs_geo_defaults_to_indexed_distance_lane(
+    monkeypatch, include_providers, requested_order, expected_order
+):
+    seen_argument_map = {}
+
+    async def fake_search(_session, args, pagination):
+        seen_argument_map.update(args)
+        return {
+            "items": [{"npi": 1234567890}],
+            "pagination": {
+                "total": 1,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg2"},
+        }
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    request_arguments_by_name = {
+        "plan_id": "TESTPLAN001",
+        "market_type": "group",
+        "code": "G0439",
+        "code_system": "HCPCS",
+        "zip5": "60611",
+        "zip_radius_miles": "25",
+        "limit": "10",
+    }
+    if include_providers is not None:
+        request_arguments_by_name["include_providers"] = include_providers
+    if requested_order is not None:
+        request_arguments_by_name["order_by"] = requested_order
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "zip5": "60611",
+                        "state": "IL",
+                        "city_lower": "chicago",
+                        "latitude": 41.895,
+                        "longitude": -87.621,
+                    }
+                ]
+            )
+        ],
+        args=request_arguments_by_name,
+    )
+
+    response = await list_providers_by_procedure(request)
+
+    assert response.status == 200
+    assert seen_argument_map["order_by"] == expected_order
+    assert seen_argument_map["include_providers"] == include_providers
+
+
+@pytest.mark.asyncio
+async def test_non_plan_hcpcs_geo_keeps_legacy_cost_order(monkeypatch):
+    monkeypatch.setattr(
+        pricing_module,
+        "search_current_ptg2_index",
+        AsyncMock(side_effect=AssertionError("non-plan search entered PTG")),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_resolve_year",
+        AsyncMock(return_value=(2023, "request")),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_resolve_internal_codes_for_request",
+        AsyncMock(return_value=([43], None)),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_provider_type_filter_clause",
+        AsyncMock(return_value=(None, None)),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_enrich_provider_service_cost_indices",
+        AsyncMock(),
+    )
+    request = make_request(
+        [
+            FakeResult(scalar=1),
+            FakeResult(
+                rows=[
+                    {
+                        "npi": 1234567890,
+                        "provider_name": "Example Provider",
+                        "provider_type": "Clinic",
+                        "city": "Chicago",
+                        "state": "IL",
+                        "zip5": "60611",
+                        "total_services": 1,
+                        "total_allowed_amount": 100,
+                    }
+                ]
+            ),
+        ],
+        args={
+            "code": "G0439",
+            "code_system": "HCPCS",
+            "zip5": "60611",
+            "zip_radius_miles": "0",
+            "year": "2023",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+
+    assert json.loads(response.body)["query"]["order_by"] == (
+        "total_allowed_amount"
+    )
+
+
 def _public_billing_option_by_field():
     provider_set_ref = "11" * 16
     price_set_ref = "22" * 16

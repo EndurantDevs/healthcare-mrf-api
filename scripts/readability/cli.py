@@ -169,6 +169,24 @@ def _check_readability_ratchet(
         )
         return 1
 
+    return _readability_reduction_status(
+        snapshot,
+        ratchet_baseline,
+        new_by_category,
+        reset_active,
+        required_reduction_percent,
+    )
+
+
+def _readability_reduction_status(
+    snapshot: dict[str, Any],
+    ratchet_baseline: dict[str, Any],
+    new_by_category: dict[str, list[dict[str, Any]]],
+    reset_active: bool,
+    required_reduction_percent: float,
+) -> int:
+    """Report and enforce the base-anchored readability reduction."""
+
     base_total = _total_issue_count(ratchet_baseline)
     current_total = _total_issue_count(snapshot)
     if reset_active:
@@ -176,10 +194,13 @@ def _check_readability_ratchet(
         target_total = (
             base_total * (10_000 + ONE_TIME_DEBT_RESET_BASIS_POINTS)
         ) // 10_000
-        print(
-            "Readability ratchet: "
-            f"base={base_total} current={current_total} target<={target_total} "
+        target_description = (
             f"one_time_reset={ONE_TIME_DEBT_RESET_BASIS_POINTS / 100:.2f}%"
+        )
+        replacement_description = "are bounded by the one-time reset ceiling."
+        debt_message = (
+            "Readability debt exceeds the one-time base-anchored "
+            f"{ONE_TIME_DEBT_RESET_BASIS_POINTS / 100:.2f}% reset."
         )
     else:
         required_reduction = (
@@ -188,37 +209,27 @@ def _check_readability_ratchet(
             else 0
         )
         target_total = max(0, base_total - required_reduction)
-        print(
-            "Readability ratchet: "
-            f"base={base_total} current={current_total} target<={target_total} "
-            f"reduction={required_reduction_percent:g}%"
+        target_description = f"reduction={required_reduction_percent:g}%"
+        replacement_description = (
+            "must be offset by the required net debt reduction."
         )
+        debt_message = (
+            f"Readability debt must decrease by at least {required_reduction} finding(s)."
+        )
+    print(
+        "Readability ratchet: "
+        f"base={base_total} current={current_total} target<={target_total} "
+        f"{target_description}"
+    )
     ordinary_new_issue_count = _ordinary_new_issue_count(new_by_category)
     if ordinary_new_issue_count:
-        if reset_active:
-            print(
-                "Readability ratchet: "
-                f"{ordinary_new_issue_count} replacement finding(s) are bounded "
-                "by the one-time reset ceiling."
-            )
-        else:
-            print(
-                "Readability ratchet: "
-                f"{ordinary_new_issue_count} replacement finding(s) must be offset "
-                "by the required net debt reduction."
-            )
+        print(
+            "Readability ratchet: "
+            f"{ordinary_new_issue_count} replacement finding(s) "
+            f"{replacement_description}"
+        )
     if current_total > target_total:
-        if reset_active:
-            print(
-                "Readability debt exceeds the one-time base-anchored "
-                f"{ONE_TIME_DEBT_RESET_BASIS_POINTS / 100:.2f}% reset.",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"Readability debt must decrease by at least {required_reduction} finding(s).",
-                file=sys.stderr,
-            )
+        print(debt_message, file=sys.stderr)
         return 1
     print("Readability ratchet satisfied.")
     return 0
