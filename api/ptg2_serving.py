@@ -9647,20 +9647,47 @@ def _merge_provider_rates_for_request(
     )
 
 
-def _manifest_base_provider_predicates(
+def _manifest_provider_predicates(
     args: Mapping[str, Any],
     query_parameters_by_name: dict[str, Any],
+    *,
+    npi_sql: str = "source_npis.npi",
 ) -> list[str]:
-    """Return strict-V3 non-taxonomy provider predicates."""
+    """Return the canonical provider predicates for one NPI source."""
 
     provider_sex_predicate = provider_sex_exists_sql(
-        "source_npis.npi",
+        npi_sql,
         query_parameters_by_name,
         "manifest_provider_sex",
         args.get("provider_sex_code"),
         schema=PTG2_SCHEMA,
     )
-    return [provider_sex_predicate] if provider_sex_predicate else []
+    predicates = [provider_sex_predicate] if provider_sex_predicate else []
+    specialty_filter = resolve_provider_specialty_filter(args)
+    if specialty_filter.active:
+        predicates.append(
+            provider_specialty_taxonomy_exists_sql(
+                npi_sql,
+                query_parameters_by_name,
+                "manifest_provider_specialty",
+                specialty_filter,
+                schema=PTG2_SCHEMA,
+            )
+        )
+    inferred_sql = _inferred_provider_taxonomy_code_sql(
+        dict(args),
+        nt_alias="nt",
+        schema=PTG2_SCHEMA,
+        params=query_parameters_by_name,
+        param_prefix="manifest_provider_inferred_taxonomy",
+    )
+    if inferred_sql:
+        predicates.append(
+            f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt "
+            f"WHERE nt.npi = {npi_sql} AND {inferred_sql})"
+        )
+        predicates.append(_ptg2_individual_npi_exists_sql(npi_sql))
+    return predicates
 
 
 async def _filter_npis_by_taxonomy(
@@ -9674,33 +9701,13 @@ async def _filter_npis_by_taxonomy(
     candidate_npis = tuple(sorted({int(npi) for npi in npis if int(npi) > 0}))
     if not candidate_npis:
         return ()
-    specialty_filter = resolve_provider_specialty_filter(args)
     query_parameters_by_name: dict[str, Any] = {
         "npis": list(candidate_npis), "limit": max(int(limit), 1)
     }
-    predicates = _manifest_base_provider_predicates(args, query_parameters_by_name)
-    if specialty_filter.active:
-        predicates.append(
-            provider_specialty_taxonomy_exists_sql(
-                "source_npis.npi",
-                query_parameters_by_name,
-                "manifest_provider_specialty",
-                specialty_filter,
-                schema=PTG2_SCHEMA,
-            )
-        )
-    inferred_sql = _inferred_provider_taxonomy_code_sql(
+    predicates = _manifest_provider_predicates(
         args,
-        nt_alias="nt",
-        schema=PTG2_SCHEMA,
-        params=query_parameters_by_name,
-        param_prefix="manifest_provider_inferred_taxonomy",
+        query_parameters_by_name,
     )
-    if inferred_sql:
-        predicates.append(
-            f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = source_npis.npi AND {inferred_sql})"
-        )
-        predicates.append(_ptg2_individual_npi_exists_sql("source_npis.npi"))
     if not predicates:
         return candidate_npis[: max(int(limit), 1)]
     filtered_npi_query = await session.execute(
@@ -10055,6 +10062,7 @@ ORDER BY selected.distance_miles ASC NULLS LAST, addr.npi
 
 
 _MEMBERSHIP_KNN_SPARSE_SCOPE_LIMIT = 4096
+_MEMBERSHIP_EXACT_NPI_SCOPE_LIMIT = 16384
 
 
 _MEMBERSHIP_LOCATION_KNN_SQL = """
@@ -10547,6 +10555,106 @@ def _ptg2_npi_scope_table(
     return f"{schema_name}.{table_name}"
 
 
+def _uses_npi_search_taxonomy_projection() -> bool:
+    """Return whether startup attested the sealed taxonomy projection."""
+
+    return str(
+        os.getenv("HLTHPRT_NPI_SEARCH_TAXONOMY_PROJECTION_ENABLED") or ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _membership_scope_projection_sql(
+    args: Mapping[str, Any],
+    parameter_map: dict[str, Any],
+) -> str:
+    """Use the startup-attested NPI taxonomy GIN as coarse admission."""
+
+    if not _uses_npi_search_taxonomy_projection():
+        return "TRUE"
+    predicates = []
+    specialty_filter = resolve_provider_specialty_filter(args)
+    if specialty_filter.taxonomy_codes:
+        parameter_map["membership_scope_specialty_taxonomy_codes"] = list(
+            specialty_filter.taxonomy_codes
+        )
+        predicates.append(
+            "scope_provider.search_taxonomy_codes && "
+            "CAST(:membership_scope_specialty_taxonomy_codes AS varchar[])"
+        )
+    elif specialty_filter.classification:
+        parameter_map["membership_scope_specialty_classification"] = (
+            specialty_filter.classification
+        )
+        base_only_sql = (
+            "AND NULLIF(BTRIM(COALESCE(scope_nucc.specialization, '')), '') IS NULL"
+            if not specialty_filter.include_subspecialties
+            else ""
+        )
+        predicates.append(
+            "scope_provider.search_taxonomy_codes && ARRAY("
+            f"SELECT scope_nucc.code FROM {PTG2_SCHEMA}.nucc_taxonomy scope_nucc "
+            "WHERE LOWER(COALESCE(scope_nucc.classification, '')) = "
+            "LOWER(:membership_scope_specialty_classification) "
+            f"{base_only_sql})"
+        )
+    inferred_rule = _inferred_provider_taxonomy_rule(dict(args))
+    if inferred_rule is not None:
+        parameter_name = "membership_scope_inferred_taxonomy_codes"
+        parameter_map[parameter_name] = list(inferred_rule.taxonomy_codes)
+        predicates.append(
+            "scope_provider.search_taxonomy_codes "
+            f"&& CAST(:{parameter_name} AS varchar[])"
+        )
+    return " AND ".join(predicates) or "TRUE"
+
+
+async def _membership_exact_scope_npis(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: Mapping[str, Any],
+    *,
+    limit: int,
+) -> tuple[int, ...]:
+    """Filter an authoritative snapshot scope in PostgreSQL under one hard cap."""
+
+    query_parameters_by_name: dict[str, Any] = {
+        "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
+        "limit": max(int(limit), 1),
+    }
+    predicates = _manifest_provider_predicates(
+        args,
+        query_parameters_by_name,
+        npi_sql="scope_npis.npi",
+    )
+    predicate_sql = " AND ".join(predicates)
+    projection_sql = _membership_scope_projection_sql(
+        args, query_parameters_by_name
+    )
+    exact_scope = await session.execute(
+        text(
+            f"""
+            SELECT scope_npis.npi
+            FROM {PTG2_SCHEMA}.npi scope_provider
+            JOIN {_ptg2_npi_scope_table(serving_tables)} scope_npis
+              ON scope_npis.npi = scope_provider.npi
+            WHERE scope_npis.snapshot_key = :shared_snapshot_key
+              AND {projection_sql}
+              {"AND " + predicate_sql if predicate_sql else ""}
+            ORDER BY scope_npis.npi
+            LIMIT :limit
+            """
+        ),
+        query_parameters_by_name,
+    )
+    return tuple(
+        int(npi_by_field["npi"])
+        for npi_by_field in (
+            _row_mapping(npi_record) for npi_record in exact_scope
+        )
+        if npi_by_field.get("npi") is not None
+    )
+
+
 def _membership_address_assurance_sql(
     args: Mapping[str, Any], uses_unified_addresses: bool
 ) -> str:
@@ -10713,6 +10821,7 @@ def _membership_location_taxonomy_index_sql(
         not uses_unified_addresses
         or not include_taxonomy_filters
         or not has_spatial_filter
+        or "candidate_npis" in parameter_map
     ):
         return None
     return _membership_taxonomy_index_sql(args, parameter_map)
@@ -11580,7 +11689,11 @@ async def _execute_membership_location_sql(
     """Execute location SQL while containing temporary KNN planner settings."""
 
     prior_planner_settings = None
-    if query_context.knn_order_sql is not None and offset == 0:
+    candidate_npis = query_context.parameter_map.get("candidate_npis") or ()
+    uses_large_npi_scope = len(candidate_npis) > _MEMBERSHIP_KNN_SPARSE_SCOPE_LIMIT
+    if offset == 0 and (
+        query_context.knn_order_sql is not None or uses_large_npi_scope
+    ):
         prior_planner_settings = await _enable_serial_knn_planning(session)
     query_result = await session.execute(
         text(location_sql), query_context.parameter_map
@@ -12843,6 +12956,8 @@ async def _scan_local_distance_graph(
     request: _LocalDistanceGraphRequest,
     batch_size: int,
     max_candidates: int,
+    *,
+    candidate_npis: tuple[int, ...] | None = None,
 ) -> _GraphLocationCandidates | None:
     """Grow one stable distance prefix until its code-matched page is proven."""
 
@@ -12853,7 +12968,7 @@ async def _scan_local_distance_graph(
             session,
             serving_tables,
             args,
-            candidate_npis=None,
+            candidate_npis=candidate_npis,
             limit=probe_limit,
             offset=0,
         )
@@ -12874,6 +12989,9 @@ async def _scan_local_distance_graph(
             return state.candidates()
         if not locations or _is_graph_location_source_exhausted(
             locations, probe_limit
+        ) or (
+            candidate_npis is not None
+            and probe_limit >= len(candidate_npis)
         ):
             break
         if probe_limit >= max_candidates:
@@ -12890,6 +13008,36 @@ async def _scan_local_distance_graph(
     return state.candidates()
 
 
+async def _bounded_exact_distance_npis(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: Mapping[str, Any],
+    max_candidates: int,
+) -> tuple[int, ...] | None:
+    """Return a complete exact NPI scope, or None when KNN must stay broad."""
+
+    filter_args_by_name = dict(args)
+    has_taxonomy_filter = bool(
+        resolve_provider_specialty_filter(filter_args_by_name).active
+        or _inferred_provider_taxonomy_rule(filter_args_by_name) is not None
+    )
+    if not has_taxonomy_filter or not _uses_npi_search_taxonomy_projection():
+        return None
+    exact_npi_limit = min(
+        _MEMBERSHIP_EXACT_NPI_SCOPE_LIMIT,
+        max(int(max_candidates), 1),
+    )
+    exact_scope_npis = await _membership_exact_scope_npis(
+        session,
+        serving_tables,
+        args,
+        limit=exact_npi_limit + 1,
+    )
+    if len(exact_scope_npis) > exact_npi_limit:
+        return None
+    return exact_scope_npis
+
+
 async def _local_inferred_distance_graph_candidates(
     session,
     serving_tables: PTG2ServingTables,
@@ -12902,9 +13050,7 @@ async def _local_inferred_distance_graph_candidates(
 ) -> _GraphLocationCandidates | None:
     """Intersect one exact nearby taxonomy prefix with its bounded code sets."""
 
-    plan_market_type = str(
-        args.get("plan_market_type") or args.get("market_type") or ""
-    )
+    plan_market_type = str(args.get("plan_market_type") or args.get("market_type") or "")
     code_rows = await _shared_rate_code_scope_rows(
         session,
         serving_tables,
@@ -12916,6 +13062,16 @@ async def _local_inferred_distance_graph_candidates(
     if not code_rows:
         return _GraphLocationCandidates([], {}, taxonomy_filtered=True)
     forward_limits = _v4_geo_rate_forward_limits(serving_tables)
+    request = _LocalDistanceGraphRequest(candidate_limit, code_rows, forward_limits)
+    batch_size = _graph_location_probe_batch_size(
+        candidate_limit, taxonomy_filter_requested=False
+    )
+    max_candidates = max(_ptg2_manifest_location_match_limit() * 20, batch_size)
+    candidate_npis = await _bounded_exact_distance_npis(
+        session, serving_tables, args, max_candidates
+    )
+    if candidate_npis == ():
+        return _GraphLocationCandidates([], {}, taxonomy_filtered=True)
     graph_root = await load_v4_graph_root(
         session,
         _required_shared_snapshot_key(serving_tables),
@@ -12925,14 +13081,6 @@ async def _local_inferred_distance_graph_candidates(
         _v4_direct_io_multiplier(serving_tables)
         if graph_root.representation == "direct_v1"
         else 1
-    )
-    request = _LocalDistanceGraphRequest(
-        candidate_limit,
-        code_rows,
-        forward_limits,
-    )
-    batch_size = _graph_location_probe_batch_size(
-        candidate_limit, taxonomy_filter_requested=False
     )
     with v4_graph_taxonomy_projection_scope(
         maximum_members=forward_limits.maximum_projection_members,
@@ -12946,7 +13094,8 @@ async def _local_inferred_distance_graph_candidates(
             args,
             request,
             batch_size,
-            max(_ptg2_manifest_location_match_limit() * 20, batch_size),
+            max_candidates,
+            candidate_npis=candidate_npis,
         )
 
 
