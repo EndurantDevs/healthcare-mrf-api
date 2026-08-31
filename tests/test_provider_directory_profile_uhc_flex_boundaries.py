@@ -23,6 +23,9 @@ from process.uhc_flex_practitioner_contract import UHC_FLEX_PRACTITIONER_SOURCE_
 from process.uhc_flex_practitioner_single_root_contract import (
     UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
 )
+from process.uhc_flex_practitioner_twin_store_contract import (
+    UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID,
+)
 from tests.test_provider_directory_profile_uhc_flex import (
     _artifact_dataset_row,
     _catalog,
@@ -108,6 +111,92 @@ def test_flex_metadata_requires_disjoint_admission_evidence() -> None:
             endpoint_id=metadata_record["endpoint_id"],
             evidence_run_id=metadata_record["acquisition_root_run_id"],
         )
+
+
+def _partial_flex_metadata() -> dict[str, object]:
+    metadata_by_field = _flex_metadata()
+    metadata_by_field.update(
+        {
+            "admission_contract_id": (
+                UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID
+            ),
+            "cohort_complete": False,
+            "retry_exhausted_count": 1,
+            "provider_directory_reviewed_root_policy_v1": (
+                ReviewedRootPolicy(1).document()
+            ),
+        }
+    )
+    metadata_by_field.pop("baseline_acquisition_id")
+    metadata_by_field.pop("baseline_run_id")
+    return metadata_by_field
+
+
+def test_retry_exhausted_flex_publication_is_profile_ready() -> None:
+    metadata_by_field = _partial_flex_metadata()
+    dataset_row_by_field = _dataset_rows()[0]
+    dataset_row_by_field["source_id"] = UHC_FLEX_PRACTITIONER_SOURCE_ID
+    dataset_row_by_field["publication_metadata_json"] = metadata_by_field
+    dataset_row_by_field["dataset_scoped_cohort_complete"] = False
+    readiness = _readiness_record(cohort_complete=False, retry_exhausted_count=1)
+
+    assert flex_profile.is_uhc_flex_publication_metadata_valid(
+        metadata_by_field,
+        dataset_id=metadata_by_field["dataset_id"],
+        endpoint_id=metadata_by_field["endpoint_id"],
+        evidence_run_id=metadata_by_field["acquisition_root_run_id"],
+    )
+    assert flex_profile.is_uhc_flex_dataset_row_ready(dataset_row_by_field)
+    assert flex_profile.is_uhc_flex_dataset_readiness_matching(
+        readiness,
+        dataset_row_by_field,
+    )
+
+    fence_dataset = SimpleNamespace(
+        dataset_scoped_ready=True,
+        dataset_scoped_variant=LEGACY_PRACTITIONER_VARIANT,
+        dataset_id=readiness.dataset_id,
+        endpoint_id=readiness.endpoint_id,
+        source_id=readiness.source_id,
+        dataset_hash=readiness.dataset_hash,
+        resource_count=readiness.resource_count,
+        semantic_projection_as_of=readiness.semantic_projection_as_of,
+        source_authority_id=readiness.source_authority_id,
+        admission_id=readiness.admission_id,
+        operation_key=readiness.operation_key,
+    )
+    assert flex_profile.is_uhc_flex_fence_dataset_ready(fence_dataset, readiness)
+
+    readiness.retry_exhausted_count = 2
+    assert not flex_profile.is_uhc_flex_dataset_readiness_matching(
+        readiness,
+        dataset_row_by_field,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing_count", "zero_count", "twin_admission", "complete_with_count"),
+)
+def test_retry_exhausted_flex_profile_metadata_fails_closed(mutation: str) -> None:
+    metadata_by_field = _partial_flex_metadata()
+    if mutation == "missing_count":
+        metadata_by_field.pop("retry_exhausted_count")
+    elif mutation == "zero_count":
+        metadata_by_field["retry_exhausted_count"] = 0
+    elif mutation == "twin_admission":
+        metadata_by_field["admission_contract_id"] = (
+            UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID
+        )
+    else:
+        metadata_by_field["cohort_complete"] = True
+
+    assert not flex_profile.is_uhc_flex_publication_metadata_valid(
+        metadata_by_field,
+        dataset_id=metadata_by_field["dataset_id"],
+        endpoint_id=metadata_by_field["endpoint_id"],
+        evidence_run_id=metadata_by_field["acquisition_root_run_id"],
+    )
 
 
 @pytest.mark.asyncio

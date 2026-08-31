@@ -85,7 +85,7 @@ def _assert_external_profile_followup(receipt_by_field: dict[str, Any]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_publication_is_explicit_and_does_not_claim_profile_dispatch(
+async def test_publication_is_explicit_and_requires_profile_dispatch(
     monkeypatch,
 ) -> None:
     """Dataset publication remains separate from the unavailable dispatcher."""
@@ -115,11 +115,7 @@ async def test_publication_is_explicit_and_does_not_claim_profile_dispatch(
     assert receipt_by_field["replayed"] is True
     assert receipt_by_field["retry_exhausted_count"] == 1
     assert receipt_by_field["cohort_complete"] is False
-    assert receipt_by_field["profile_delta_dispatch"] == {
-        "operator_command_available": False,
-        "required_external_global_dispatch": False,
-        "status": "not_applicable_incomplete_cohort",
-    }
+    _assert_external_profile_followup(receipt_by_field)
 
     exact = publication_result_type()
     exact.readiness.cohort_complete = True
