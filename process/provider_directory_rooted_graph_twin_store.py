@@ -329,7 +329,11 @@ async def admit_provider_directory_rooted_graph_twins(
         _require_exact(stored_attempt, expected_attempt, _ATTEMPT_IDENTITY_COLUMNS)
         candidate = _candidate_root(roots)
         is_root_current = exact_current_matches_root(current, candidate)
-        if stored_attempt.matched and is_root_current:
+        if (
+            stored_attempt.matched
+            and is_root_current
+            and current.cohort_complete is True
+        ):
             expected_admission = build_provider_directory_rooted_graph_twin_admission(
                 stored_attempt,
                 candidate,

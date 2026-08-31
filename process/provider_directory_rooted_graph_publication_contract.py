@@ -115,6 +115,7 @@ class ProviderDirectoryRootedGraphDatasetReadiness:
     resource_counts: dict[str, int]
     publication_kind: str
     cohort_complete: bool
+    retry_exhausted_count: int
     rooted_graph_complete: bool
     endpoint_collection_complete: bool
     endpoint_complete: bool
@@ -168,7 +169,9 @@ class ProviderDirectoryRootedGraphDatasetReadiness:
             or counts.get("Practitioner") != self.practitioner_resource_count
             or sum(counts.values()) != self.resource_count
             or self.publication_kind != PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND
-            or self.cohort_complete is not True
+            or type(self.retry_exhausted_count) is not int
+            or self.retry_exhausted_count < 0
+            or self.cohort_complete is not (self.retry_exhausted_count == 0)
             or self.rooted_graph_complete is not True
             or self.endpoint_collection_complete is not False
             or self.endpoint_complete is not False

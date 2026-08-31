@@ -152,6 +152,7 @@ def _identity_header_by_field(
         "root_content_proof_sha256",
         "root_cohort_id",
         "root_practitioner_resource_count",
+        "cohort_complete",
     )
     identity_by_field = {
         field_name: getattr(identity, field_name) for field_name in field_names
@@ -276,12 +277,12 @@ async def _insert_rooted_header(
     return await database.status(
         f"""
         INSERT INTO {_table(_HEADER)} ({', '.join(columns)},
-            dataset_hash, resource_hash_contract, cohort_complete,
+            dataset_hash, resource_hash_contract,
             rooted_graph_complete, endpoint_collection_complete,
             endpoint_complete, status, is_current, created_at,
             validated_at, published_at, superseded_at
         ) VALUES ({', '.join(':' + column for column in columns)},
-            NULL, :resource_hash_contract, true, true, false, false,
+            NULL, :resource_hash_contract, true, false, false,
             'building', false, transaction_timestamp(), NULL, NULL, NULL
         );
         """,

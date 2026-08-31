@@ -269,6 +269,16 @@ async def test_admission_accepts_match_and_rejects_mismatch_or_stale(
 
 
 @pytest.mark.asyncio
+async def test_twin_admission_rejects_partial_current_root(monkeypatch) -> None:
+    with pytest.raises(ProviderDirectoryRootedGraphTwinError, match="state"):
+        await _exercise_admission(
+            monkeypatch,
+            current=exact_current(retry_exhausted_count=1),
+            roots=sealed_roots(),
+        )
+
+
+@pytest.mark.asyncio
 async def test_required_admission_rebuilds_or_maps_missing_evidence(
     monkeypatch,
 ) -> None:
@@ -320,6 +330,37 @@ def _single_root_candidate(current, operation_key):
             for field in fields(proof)
         }
     )
+
+
+def test_partial_single_root_intent_is_bound_without_changing_complete_identity() -> (
+    None
+):
+    operation_key = "f" * 64
+    complete = exact_current()
+    partial = replace(
+        complete,
+        cohort_complete=False,
+        retry_exhausted_count=8,
+    )
+
+    complete_identity = derive_single_root_identity(
+        complete,
+        operation_key=operation_key,
+    )
+    partial_identity = derive_single_root_identity(
+        partial,
+        operation_key=operation_key,
+    )
+    different_partial = derive_single_root_identity(
+        replace(partial, retry_exhausted_count=9),
+        operation_key=operation_key,
+    )
+
+    assert complete_identity.dataset_intent_id == (
+        "pdrgi_051f89ecd1ea11a695cc6ab36122a388ecf554bd7c13a45e"
+    )
+    assert partial_identity.dataset_intent_id != complete_identity.dataset_intent_id
+    assert different_partial.dataset_intent_id != partial_identity.dataset_intent_id
 
 
 @pytest.mark.asyncio

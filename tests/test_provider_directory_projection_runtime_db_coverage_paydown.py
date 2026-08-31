@@ -208,6 +208,80 @@ async def test_projection_action_rejects_identity_and_setting_drift() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_projection_reference_action_rejects_admission_coordinates() -> None:
+    """Keep reference and admission transaction identities disjoint."""
+
+    reference_identity_by_field = {
+        "physical_projection_id": _digest("projection"),
+        "reference_owner_kind": "dataset",
+        "reference_owner_id": "owner",
+        "reference_identity_hash": _digest("reference"),
+        "reference_lease_token": _digest("reference-lease"),
+    }
+    for field_name, field_value in (
+        ("admission_id", _digest("admission")),
+        ("admission_attempt", 1),
+        ("admission_lease_token", _digest("admission-lease")),
+    ):
+        with pytest.raises(ProviderDirectoryProjectionError, match="identity_invalid"):
+            await projection_db.set_local_projection_action(
+                _SettingsDatabase(),
+                "reference_insert",
+                recipe_id=_digest("recipe"),
+                recipe_attempt=1,
+                **reference_identity_by_field,
+                **{field_name: field_value},
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "recipe_id", "recipe_attempt", "identity_by_field"),
+    (
+        ("recipe_insert", 1, 1, {}),
+        ("recipe_insert", _digest("recipe"), "1", {}),
+        ("recipe_insert", _digest("recipe"), True, {}),
+        ("recipe_insert", _digest("recipe"), 1, {"partition_id": 1}),
+        ("recipe_insert", _digest("recipe"), 1, {"partition_attempt": "1"}),
+        ("recipe_insert", _digest("recipe"), 1, {"partition_attempt": True}),
+        (
+            "admission_insert",
+            _digest("recipe"),
+            1,
+            {
+                "admission_id": _digest("admission"),
+                "admission_attempt": "1",
+                "admission_lease_token": _digest("admission-lease"),
+            },
+        ),
+        (
+            "admission_insert",
+            _digest("recipe"),
+            1,
+            {
+                "admission_id": _digest("admission"),
+                "admission_attempt": True,
+                "admission_lease_token": _digest("admission-lease"),
+            },
+        ),
+    ),
+)
+async def test_projection_action_rejects_malformed_runtime_types(
+    action, recipe_id, recipe_attempt, identity_by_field
+) -> None:
+    """Convert malformed runtime types into the stable identity error."""
+
+    with pytest.raises(ProviderDirectoryProjectionError, match="identity_invalid"):
+        await projection_db.set_local_projection_action(
+            _SettingsDatabase(),
+            action,
+            recipe_id=recipe_id,
+            recipe_attempt=recipe_attempt,
+            **identity_by_field,
+        )
+
+
 def test_wal_compression_mode_is_explicit_and_bounded(monkeypatch) -> None:
     monkeypatch.setenv(
         "HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_WAL_COMPRESSION", "invalid"

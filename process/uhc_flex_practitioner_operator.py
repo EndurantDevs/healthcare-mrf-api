@@ -140,7 +140,9 @@ def _cohort_result_json(sync_result: Any) -> str:
 def _root_payload(root_receipt: Any) -> dict[str, Any]:
     return {
         "acquisition_id": root_receipt.acquisition_id,
+        "cohort_complete": root_receipt.cohort_complete,
         "elapsed_seconds": root_receipt.elapsed_seconds,
+        "error_count": root_receipt.error_count,
         "matched_count": root_receipt.matched_count,
         "resource_count": root_receipt.resource_count,
         "run_id": root_receipt.run_id,
@@ -204,40 +206,51 @@ def _single_root_acquisition_result_json(receipt: Any) -> str:
 
 def _publication_result_json(publication_result: Any) -> str:
     dataset_readiness = publication_result.readiness
-    return _json_text(
-        {
-            "admission_id": dataset_readiness.admission_id,
-            "candidate_acquisition_id": dataset_readiness.candidate_acquisition_id,
-            "cohort_complete": dataset_readiness.cohort_complete,
-            "cohort_id": dataset_readiness.cohort_id,
-            "dataset_hash": dataset_readiness.dataset_hash,
-            "dataset_id": dataset_readiness.dataset_id,
-            "dataset_intent_id": dataset_readiness.dataset_intent_id,
-            "endpoint_collection_complete": (
-                dataset_readiness.endpoint_collection_complete
+    if dataset_readiness.cohort_complete:
+        profile_delta_dispatch_by_field = {
+            **profile_followup_receipt_metadata(),
+            "external_followup": (
+                build_provider_directory_global_profile_followup(
+                    source_id=dataset_readiness.source_id,
+                    dataset_id=dataset_readiness.dataset_id,
+                    parent_run_id=dataset_readiness.acquisition_root_run_id,
+                )
             ),
-            "endpoint_complete": dataset_readiness.endpoint_complete,
-            "operation_key": dataset_readiness.operation_key,
-            "previous_dataset_id": dataset_readiness.previous_dataset_id,
-            "profile_delta_dispatch": {
-                **profile_followup_receipt_metadata(),
-                "external_followup": (
-                    build_provider_directory_global_profile_followup(
-                        source_id=dataset_readiness.source_id,
-                        dataset_id=dataset_readiness.dataset_id,
-                        parent_run_id=dataset_readiness.acquisition_root_run_id,
-                    )
-                ),
-                "operator_command_available": False,
-                "required_external_global_dispatch": True,
-                "status": "not_dispatched",
-            },
-            "replayed": publication_result.replayed,
-            "resource_count": dataset_readiness.resource_count,
-            "semantic_projection_as_of": (dataset_readiness.semantic_projection_as_of),
-            "status": "published",
+            "operator_command_available": False,
+            "required_external_global_dispatch": True,
+            "status": "not_dispatched",
         }
-    )
+    else:
+        profile_delta_dispatch_by_field = {
+            "operator_command_available": False,
+            "required_external_global_dispatch": False,
+            "status": "not_applicable_incomplete_cohort",
+        }
+    publication_by_field = {
+        "admission_id": dataset_readiness.admission_id,
+        "candidate_acquisition_id": dataset_readiness.candidate_acquisition_id,
+        "cohort_complete": dataset_readiness.cohort_complete,
+        "cohort_id": dataset_readiness.cohort_id,
+        "dataset_hash": dataset_readiness.dataset_hash,
+        "dataset_id": dataset_readiness.dataset_id,
+        "dataset_intent_id": dataset_readiness.dataset_intent_id,
+        "endpoint_collection_complete": (
+            dataset_readiness.endpoint_collection_complete
+        ),
+        "endpoint_complete": dataset_readiness.endpoint_complete,
+        "operation_key": dataset_readiness.operation_key,
+        "previous_dataset_id": dataset_readiness.previous_dataset_id,
+        "profile_delta_dispatch": profile_delta_dispatch_by_field,
+        "replayed": publication_result.replayed,
+        "resource_count": dataset_readiness.resource_count,
+        "semantic_projection_as_of": dataset_readiness.semantic_projection_as_of,
+        "status": "published",
+    }
+    if not dataset_readiness.cohort_complete:
+        publication_by_field["retry_exhausted_count"] = (
+            dataset_readiness.retry_exhausted_count
+        )
+    return _json_text(publication_by_field)
 
 
 def _operation_error(error: Exception, default_code: str) -> Exception:

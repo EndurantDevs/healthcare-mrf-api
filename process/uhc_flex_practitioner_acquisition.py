@@ -126,6 +126,8 @@ def _root_receipt(
         resource_count=summary.resource_count,
         terminal_set_sha256=summary.terminal_set_sha256,
         elapsed_seconds=elapsed_seconds,
+        error_count=summary.error_count,
+        cohort_complete=summary.cohort_complete,
     )
 
 

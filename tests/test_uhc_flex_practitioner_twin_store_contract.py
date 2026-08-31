@@ -46,6 +46,8 @@ def _root(
     terminal_set_sha256: str = "3" * 64,
     resource_count: int = 2,
     cohort_id: str = COHORT_ID,
+    error_count: int = 0,
+    cohort_complete: bool = True,
 ) -> UHCFlexPractitionerSealedRoot:
     intent_id = build_uhc_flex_practitioner_dataset_intent_id(
         COHORT_ID,
@@ -65,7 +67,38 @@ def _root(
         expected_npi_count=2,
         resource_count=resource_count,
         terminal_set_sha256=terminal_set_sha256,
+        error_count=error_count,
+        cohort_complete=cohort_complete,
     )
+
+
+def test_sealed_root_defaults_exact_and_carries_reviewed_partial_state() -> None:
+    exact = _root("candidate")
+    partial = _root(
+        "candidate",
+        error_count=1,
+        cohort_complete=False,
+    )
+
+    assert (exact.error_count, exact.cohort_complete) == (0, True)
+    assert (partial.error_count, partial.cohort_complete) == (1, False)
+    with pytest.raises(ValueError):
+        _root("candidate", error_count=1)
+    with pytest.raises(ValueError):
+        _root("candidate", error_count=3, cohort_complete=False)
+
+
+def test_twin_attempt_rejects_partial_roots() -> None:
+    with pytest.raises(UHCFlexPractitionerTwinStoreError) as error:
+        build_uhc_flex_practitioner_twin_attempt(
+            _root("baseline"),
+            _root("candidate", error_count=1, cohort_complete=False),
+            semantic_projection_as_of=PROJECTION_DATE,
+            operation_key=OPERATION_KEY,
+            attempted_at=TIMESTAMP,
+        )
+
+    assert error.value.code == "state"
 
 
 def test_restart_safe_intent_and_role_run_ids_match_contract_bytes() -> None:

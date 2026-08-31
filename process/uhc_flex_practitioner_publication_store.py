@@ -14,13 +14,8 @@ from process.provider_directory_dataset_scoped_publication import (
     ProviderDirectoryDatasetScopedPublicationError,
     supersede_exact_current_dataset,
 )
-from process.provider_directory_resource_hash import (
-    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-)
-from process.uhc_flex_official_cohort_contract import (
-    UHC_FLEX_OFFICIAL_AUTHORITY_ID,
-    UHC_FLEX_OFFICIAL_RESOURCE_TYPE,
-)
+from process.provider_directory_resource_hash import SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+from process.uhc_flex_official_cohort_contract import UHC_FLEX_OFFICIAL_AUTHORITY_ID, UHC_FLEX_OFFICIAL_RESOURCE_TYPE
 from process.uhc_flex_practitioner_contract import (
     UHC_FLEX_PRACTITIONER_CONNECTOR_ID,
     UHC_FLEX_PRACTITIONER_PUBLICATION_LOCK_IDENTITY,
@@ -45,18 +40,14 @@ from process.uhc_flex_practitioner_publication import (
     UHCFlexPractitionerPublicationError,
     UHCFlexPractitionerPublicationResult,
 )
-from process.uhc_flex_practitioner_publication_materialization import (
-    _materialize_candidate,
-    _validate_candidate,
-)
+from process.uhc_flex_practitioner_publication_materialization import _materialize_candidate, _validate_candidate
 from process.uhc_flex_practitioner_single_root_contract import (
     UHCFlexPractitionerAdmission,
     UHCFlexPractitionerSingleRootAdmission,
     UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
 )
-from process.uhc_flex_practitioner_twin_store import (
-    require_uhc_flex_practitioner_admission,
-)
+from process.uhc_flex_practitioner_store_support import ACQUISITION_TABLE
+from process.uhc_flex_practitioner_twin_store import require_uhc_flex_practitioner_admission
 from process.uhc_flex_practitioner_twin_store_contract import (
     UHCFlexPractitionerTwinAdmission,
     UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID,
@@ -90,6 +81,7 @@ def _readiness_from_row(database_row: Any) -> UHCFlexPractitionerDatasetReadines
                 "endpoint_collection_complete"
             ),
             endpoint_complete=database_fields.get("endpoint_complete"),
+            retry_exhausted_count=database_fields.get("retry_exhausted_count"),
         )
     except (TypeError, ValueError):
         raise UHCFlexPractitionerPublicationError("state") from None
@@ -105,8 +97,11 @@ def _readiness_select_sql(filter_sql: str) -> str:
                header.operation_key, header.dataset_hash,
                header.resource_count, header.source_id,
                header.source_authority_id, header.cohort_complete,
-               header.endpoint_collection_complete, header.endpoint_complete
+               header.endpoint_collection_complete, header.endpoint_complete,
+               candidate.error_count AS retry_exhausted_count
           FROM {_table(_HEADER)} AS header
+          JOIN {_table(ACQUISITION_TABLE)} AS candidate
+            ON candidate.acquisition_id = header.candidate_acquisition_id
          WHERE {filter_sql}
            AND header.status = 'published'
            AND header.is_current IS TRUE
@@ -119,7 +114,7 @@ async def load_dataset_readiness(
     *,
     database: Any = db,
 ) -> UHCFlexPractitionerDatasetReadiness | None:
-    """Read one exact dataset only when its database predicate is ready."""
+    """Read one dataset only when its database predicate is ready."""
     database_row = await database.first(
         _readiness_select_sql("header.dataset_id = :dataset_id"),
         dataset_id=dataset_id,
@@ -228,6 +223,7 @@ async def _insert_dedicated_header(
     identity: UHCFlexPractitionerDatasetIdentity,
     admission: UHCFlexPractitionerAdmission,
     previous_dataset_id: str | None,
+    retry_exhausted_count: int = 0,
 ) -> None:
     inserted = await database.status(
         f"""
@@ -248,7 +244,7 @@ async def _insert_dedicated_header(
             :semantic_projection_as_of, :operation_key, :source_authority_id,
             :terminal_set_sha256, :previous_dataset_id, NULL, :resource_count,
             :resource_hash_contract, :resource_type, :resource_type,
-            true, false, false, 'building', false,
+            :cohort_complete, false, false, 'building', false,
             transaction_timestamp(), NULL, NULL, NULL
         );
         """,
@@ -271,6 +267,7 @@ async def _insert_dedicated_header(
         resource_count=admission.resource_count,
         resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
         resource_type=UHC_FLEX_OFFICIAL_RESOURCE_TYPE,
+        cohort_complete=retry_exhausted_count == 0,
     )
     if inserted != 1:
         raise UHCFlexPractitionerPublicationError("state")
@@ -281,9 +278,14 @@ async def _insert_building_headers(
     identity: UHCFlexPractitionerDatasetIdentity,
     admission: UHCFlexPractitionerAdmission,
     previous_dataset_id: str | None,
+    retry_exhausted_count: int = 0,
 ) -> None:
     metadata_json = _canonical_json(
-        uhc_flex_practitioner_publication_metadata(identity, admission)
+        uhc_flex_practitioner_publication_metadata(
+            identity,
+            admission,
+            retry_exhausted_count,
+        )
     )
     await _insert_parent_header(
         database,
@@ -297,6 +299,7 @@ async def _insert_building_headers(
         identity,
         admission,
         previous_dataset_id,
+        retry_exhausted_count,
     )
 
 
@@ -365,7 +368,7 @@ async def _lock_admission(
     database: Any,
     candidate_acquisition_id: str,
     endpoint_id: str,
-) -> UHCFlexPractitionerAdmission:
+) -> tuple[UHCFlexPractitionerAdmission, int]:
     await database.scalar(
         "SELECT pg_catalog.pg_advisory_xact_lock("
         "pg_catalog.hashtextextended(:lock_identity, 0));",
@@ -392,7 +395,33 @@ async def _lock_admission(
     )
     if not _is_expected_admission(admission, candidate_acquisition_id):
         raise UHCFlexPractitionerPublicationError("admission")
-    return admission
+    candidate = _row_fields(
+        await database.first(
+            f"""
+            SELECT status, cohort_complete, error_count,
+                   terminal_set_sha256, resource_count
+              FROM {_table(ACQUISITION_TABLE)}
+             WHERE acquisition_id = :candidate_acquisition_id
+             FOR SHARE;
+            """,
+            candidate_acquisition_id=candidate_acquisition_id,
+        )
+    )
+    retry_exhausted_count = candidate.get("error_count")
+    if (
+        candidate.get("status") != "sealed"
+        or type(retry_exhausted_count) is not int
+        or retry_exhausted_count < 0
+        or candidate.get("cohort_complete") is not (retry_exhausted_count == 0)
+        or candidate.get("terminal_set_sha256") != admission.terminal_set_sha256
+        or candidate.get("resource_count") != admission.resource_count
+        or (
+            retry_exhausted_count > 0
+            and type(admission) is not UHCFlexPractitionerSingleRootAdmission
+        )
+    ):
+        raise UHCFlexPractitionerPublicationError("admission")
+    return admission, retry_exhausted_count
 
 
 async def _publish_admitted_dataset(
@@ -400,6 +429,7 @@ async def _publish_admitted_dataset(
     admission: UHCFlexPractitionerAdmission,
     endpoint_id: str,
     batch_size: int,
+    retry_exhausted_count: int = 0,
 ) -> UHCFlexPractitionerPublicationResult:
     identity = build_uhc_flex_practitioner_dataset_identity(
         admission,
@@ -423,6 +453,7 @@ async def _publish_admitted_dataset(
         identity,
         admission,
         previous_dataset_id,
+        retry_exhausted_count,
     )
     await _materialize_candidate(database, identity, admission, batch_size)
     await _validate_candidate(database, identity, admission, batch_size)
@@ -447,7 +478,7 @@ async def publish_registered_uhc_flex_dataset(
     """Publish within one lock-protected transaction after registration."""
 
     async with database.transaction():
-        admission = await _lock_admission(
+        admission, retry_exhausted_count = await _lock_admission(
             database,
             candidate_acquisition_id,
             endpoint_id,
@@ -457,6 +488,7 @@ async def publish_registered_uhc_flex_dataset(
             admission,
             endpoint_id,
             batch_size,
+            retry_exhausted_count,
         )
 
 

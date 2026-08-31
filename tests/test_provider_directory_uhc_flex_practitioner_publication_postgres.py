@@ -79,6 +79,9 @@ ROOTED_PUBLICATION_PATH = VERSIONS / (
 SINGLE_ROOT_PATH = VERSIONS / (
     "20260812030000_provider_directory_specialized_single_root_admission.py"
 )
+RETRY_EXHAUSTION_PATH = VERSIONS / (
+    "20260830090000_uhc_flex_retry_exhaustion.py"
+)
 PROJECTION_DATE = "2026-08-10"
 SOURCE_ID = "pdfhir_1ceb7c0986c320b7eb924881"
 ENDPOINT_ID = "ad53a7446514ed65b3a8ea7ab68ceb9a1ef85bf6c04fcb882219ecb50928bab5"
@@ -243,6 +246,10 @@ async def _publication_test_scope(monkeypatch):
         SINGLE_ROOT_PATH,
         "flex_publication_single_root",
     )
+    retry_exhaustion_migration = load_migration(
+        RETRY_EXHAUSTION_PATH,
+        "flex_publication_retry_exhaustion",
+    )
     try:
         await _prepare_publication_schema(
             engine,
@@ -259,8 +266,16 @@ async def _publication_test_scope(monkeypatch):
             await connection.close()
         await run_migration(engine, rooted_migration, "upgrade")
         await run_migration(engine, single_root_migration, "upgrade")
+        await run_migration(engine, retry_exhaustion_migration, "upgrade")
         await database.connect()
-        yield url, schema, database, engine, migrations[3]
+        yield (
+            url,
+            schema,
+            database,
+            engine,
+            migrations[3],
+            retry_exhaustion_migration,
+        )
     finally:
         await database.disconnect()
         await drop_schema(engine, schema_name)
@@ -444,7 +459,14 @@ async def test_flex_practitioner_publication_lifecycle_replay_and_removal(
     monkeypatch,
 ) -> None:
     async with _publication_test_scope(monkeypatch) as test_scope:
-        url, schema, database, engine, publication_migration = test_scope
+        (
+            url,
+            schema,
+            database,
+            engine,
+            publication_migration,
+            _retry_exhaustion_migration,
+        ) = test_scope
         monkeypatch.setattr(
             publication,
             "register_uhc_flex_practitioner_source",

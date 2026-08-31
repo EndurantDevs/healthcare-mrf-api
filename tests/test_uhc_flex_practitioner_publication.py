@@ -90,6 +90,40 @@ def _admission(resource_count: int = 1):
     )
 
 
+def _single_root_admission(error_count: int = 0):
+    intent_id = single_root_dataset_intent_id(
+        COHORT_ID, PROJECTION_DATE, OPERATION_KEY
+    )
+    candidate = UHCFlexPractitionerSealedRoot(
+        acquisition_id=_acquisition_id(
+            cohort_id=COHORT_ID,
+            acquisition_role="candidate",
+            run_id=single_root_run_id(intent_id),
+            dataset_intent_id=intent_id,
+            expected_npi_count=2,
+        ),
+        cohort_id=COHORT_ID,
+        acquisition_role="candidate",
+        source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
+        connector_id=UHC_FLEX_PRACTITIONER_CONNECTOR_ID,
+        query_contract_id=UHC_FLEX_PRACTITIONER_QUERY_CONTRACT_ID,
+        storage_contract_id=UHC_FLEX_PRACTITIONER_ACQUISITION_CONTRACT_ID,
+        run_id=single_root_run_id(intent_id),
+        dataset_intent_id=intent_id,
+        expected_npi_count=2,
+        resource_count=1,
+        terminal_set_sha256="c" * 64,
+        error_count=error_count,
+        cohort_complete=error_count == 0,
+    )
+    return build_single_root_admission(
+        candidate,
+        semantic_projection_as_of=PROJECTION_DATE,
+        operation_key=OPERATION_KEY,
+        admitted_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
+    )
+
+
 def test_dataset_identity_and_metadata_bind_the_exact_admission() -> None:
     admission = _admission()
     identity = build_uhc_flex_practitioner_dataset_identity(admission)
@@ -122,35 +156,7 @@ def test_dataset_identity_and_metadata_bind_the_exact_admission() -> None:
 
 
 def test_single_root_metadata_omits_twin_coordinates() -> None:
-    intent_id = single_root_dataset_intent_id(
-        COHORT_ID, PROJECTION_DATE, OPERATION_KEY
-    )
-    candidate = UHCFlexPractitionerSealedRoot(
-        acquisition_id=_acquisition_id(
-            cohort_id=COHORT_ID,
-            acquisition_role="candidate",
-            run_id=single_root_run_id(intent_id),
-            dataset_intent_id=intent_id,
-            expected_npi_count=2,
-        ),
-        cohort_id=COHORT_ID,
-        acquisition_role="candidate",
-        source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
-        connector_id=UHC_FLEX_PRACTITIONER_CONNECTOR_ID,
-        query_contract_id=UHC_FLEX_PRACTITIONER_QUERY_CONTRACT_ID,
-        storage_contract_id=UHC_FLEX_PRACTITIONER_ACQUISITION_CONTRACT_ID,
-        run_id=single_root_run_id(intent_id),
-        dataset_intent_id=intent_id,
-        expected_npi_count=2,
-        resource_count=1,
-        terminal_set_sha256="c" * 64,
-    )
-    admission = build_single_root_admission(
-        candidate,
-        semantic_projection_as_of=PROJECTION_DATE,
-        operation_key=OPERATION_KEY,
-        admitted_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
-    )
+    admission = _single_root_admission()
     metadata = uhc_flex_practitioner_publication_metadata(
         build_uhc_flex_practitioner_dataset_identity(admission), admission
     )
@@ -162,6 +168,26 @@ def test_single_root_metadata_omits_twin_coordinates() -> None:
     )
     with pytest.raises(ValueError, match="single-root admission"):
         replace(admission, admission_id="pdufpad_" + "f" * 48)
+
+
+def test_retry_exhausted_single_root_metadata_is_explicitly_partial() -> None:
+    admission = _single_root_admission(error_count=1)
+    metadata = uhc_flex_practitioner_publication_metadata(
+        build_uhc_flex_practitioner_dataset_identity(admission),
+        admission,
+        1,
+    )
+
+    assert metadata["retry_exhausted_count"] == 1
+    assert metadata["cohort_complete"] is False
+    assert metadata["endpoint_collection_complete"] is False
+    assert metadata["endpoint_complete"] is False
+    with pytest.raises(ValueError, match="publication identity"):
+        uhc_flex_practitioner_publication_metadata(
+            build_uhc_flex_practitioner_dataset_identity(_admission()),
+            _admission(),
+            1,
+        )
 
 
 def test_stored_resource_facade_revalidates_and_materializes_one_row() -> None:
@@ -228,6 +254,17 @@ def test_readiness_never_promotes_exact_cohort_to_endpoint_complete() -> None:
     )
     readiness = UHCFlexPractitionerDatasetReadiness(**readiness_by_field)
     assert readiness.resource_count == 0
+
+    partial = UHCFlexPractitionerDatasetReadiness(
+        **{
+            **readiness_by_field,
+            "cohort_complete": False,
+            "retry_exhausted_count": 1,
+        }
+    )
+    assert partial.retry_exhausted_count == 1
+    assert partial.endpoint_collection_complete is False
+    assert partial.endpoint_complete is False
 
     readiness_by_field["endpoint_complete"] = True
     with pytest.raises(ValueError, match="readiness"):

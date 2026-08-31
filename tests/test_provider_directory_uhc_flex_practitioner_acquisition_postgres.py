@@ -307,7 +307,7 @@ async def _complete_error_candidate(database, url, schema_name, candidate) -> No
         _unmatched(second_npi),
         database=database,
     )
-    with pytest.raises(DBAPIError, match="acquisition_incomplete"):
+    with pytest.raises(UHCFlexPractitionerStoreError, match="state is invalid"):
         await seal_uhc_flex_practitioner_acquisition(candidate, database=database)
 
 

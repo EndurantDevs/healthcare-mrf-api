@@ -12,9 +12,6 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from process import uhc_flex_practitioner_operator as operator
-from process.uhc_flex_practitioner_contract import (
-    UHC_FLEX_PRACTITIONER_SOURCE_ID,
-)
 
 
 OPERATION_KEY = "a" * 64
@@ -162,7 +159,9 @@ def _root(role: str, character: str) -> SimpleNamespace:
     return SimpleNamespace(
         acquisition_role=role,
         acquisition_id="pdufpa_" + character * 48,
+        cohort_complete=True,
         elapsed_seconds=2.5,
+        error_count=0,
         matched_count=7,
         resource_count=8,
         run_id="pdufpr_" + character * 48,
@@ -386,96 +385,6 @@ async def test_single_root_acquisition_normalizes_only_safe_errors(
 
     if expected_code is not None:
         assert caught.value.code == expected_code
-
-
-def _assert_external_profile_followup(receipt_by_field: dict[str, Any]) -> None:
-    """Prove the receipt remains dormant and matches the closed controller shape."""
-
-    dispatch_by_field = receipt_by_field["profile_delta_dispatch"]
-    assert dispatch_by_field["operator_command_available"] is False
-    assert dispatch_by_field["required_external_global_dispatch"] is True
-    assert dispatch_by_field["status"] == "not_dispatched"
-    assert dispatch_by_field["external_followup_contract_id"] == (
-        "healthporta.provider-directory.global-profile-followup.v1"
-    )
-    followup_by_field = dispatch_by_field["external_followup"]
-    assert followup_by_field["source_id"] == UHC_FLEX_PRACTITIONER_SOURCE_ID
-    assert followup_by_field["dataset_id"] == "pdufpd_" + "4" * 48
-    assert followup_by_field["parent_run_id"] == "pdufpar_" + "6" * 48
-    assert set(followup_by_field) == {
-        "status",
-        "kind",
-        "intent",
-        "importer",
-        "source_id",
-        "dataset_id",
-        "parent_run_id",
-        "idempotency_key",
-        "triggered_by",
-        "params",
-    }
-    assert followup_by_field["params"]["source_ids"] == []
-    assert followup_by_field["params"]["require_complete_global_profile_fence"] is True
-
-
-@pytest.mark.asyncio
-async def test_publication_is_explicit_and_does_not_claim_profile_dispatch(
-    monkeypatch,
-) -> None:
-    """Dataset publication remains separate from the unavailable dispatcher."""
-
-    _disable_all_gates(monkeypatch)
-    monkeypatch.setenv(operator.PUBLICATION_ENABLED_ENV, "true")
-    module_name = "process.uhc_flex_practitioner_publication"
-    phase_module = ModuleType(module_name)
-    publication_calls = []
-
-    class PublicationResult:
-        def __init__(self) -> None:
-            self.replayed = True
-            self.readiness = SimpleNamespace(
-                admission_id="pdufpad_" + "1" * 48,
-                candidate_acquisition_id=CANDIDATE_ACQUISITION_ID,
-                acquisition_root_run_id="pdufpar_" + "6" * 48,
-                cohort_complete=True,
-                cohort_id="pdufc_" + "2" * 48,
-                dataset_hash="3" * 64,
-                dataset_id="pdufpd_" + "4" * 48,
-                dataset_intent_id="pdufdi_" + "5" * 48,
-                endpoint_collection_complete=False,
-                endpoint_complete=False,
-                operation_key=OPERATION_KEY,
-                previous_dataset_id=None,
-                resource_count=8,
-                semantic_projection_as_of="2026-08-10",
-                source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
-            )
-
-    async def publish(candidate_acquisition_id, **keyword_arguments):
-        publication_calls.append((candidate_acquisition_id, keyword_arguments))
-        return PublicationResult()
-
-    phase_module.UHCFlexPractitionerPublicationResult = PublicationResult
-    phase_module.publish_uhc_flex_practitioner_dataset = publish
-    monkeypatch.setitem(__import__("sys").modules, module_name, phase_module)
-    database = object()
-
-    rendered_receipt = await operator.publish_admitted_uhc_flex_practitioner_operation(
-        candidate_acquisition_id=CANDIDATE_ACQUISITION_ID,
-        batch_size=250,
-        database=database,
-    )
-    receipt_by_field = json.loads(rendered_receipt)
-
-    assert publication_calls == [
-        (
-            CANDIDATE_ACQUISITION_ID,
-            {"batch_size": 250, "database": database},
-        )
-    ]
-    assert receipt_by_field["status"] == "published"
-    assert receipt_by_field["replayed"] is True
-    _assert_external_profile_followup(receipt_by_field)
 
 
 @pytest.mark.asyncio

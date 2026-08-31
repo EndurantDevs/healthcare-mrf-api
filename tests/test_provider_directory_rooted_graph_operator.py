@@ -71,6 +71,8 @@ def _legacy_current() -> ExactCurrentDataset:
         practitioner_resource_count=3,
         root_content_proof_sha256="3" * 64,
         root_cohort_id="synthetic-reviewed-cohort",
+        cohort_complete=True,
+        retry_exhausted_count=0,
         semantic_projection_as_of="2026-08-10",
         operation_key="4" * 64,
         acquisition_root_run_id="pdufpar_" + "5" * 48,

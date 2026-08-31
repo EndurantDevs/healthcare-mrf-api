@@ -232,7 +232,7 @@ def test_terminal_record_root_binds_each_comparable_outcome_field(
     assert drifted_root != baseline_root
 
 
-def test_manifest_row_and_terminal_summary_fail_closed() -> None:
+def test_manifest_row_and_terminal_summary_supports_retry_exhausted_partial() -> None:
     query_result = _matched_result()
     resource_fields = _canonical_resource_rows(query_result)[0]
     stored_resource = UHCFlexPractitionerResourceRow(
@@ -252,16 +252,47 @@ def test_manifest_row_and_terminal_summary_fail_closed() -> None:
             payload_json_text=stored_resource.payload_json_text,
         )
     identity = _identity()
+    partial = UHCFlexPractitionerAcquisitionSummary(
+        acquisition_id=identity.acquisition_id,
+        expected_npi_count=2,
+        matched_count=1,
+        unmatched_count=0,
+        error_count=1,
+        resource_count=1,
+        terminal_set_sha256="5" * 64,
+        cohort_complete=False,
+        endpoint_collection_complete=False,
+        endpoint_complete=False,
+    )
+    assert partial.error_count == 1
+    assert partial.cohort_complete is False
+
+
+@pytest.mark.parametrize(
+    ("matched_count", "unmatched_count", "error_count", "cohort_complete"),
+    (
+        (1, 0, 1, True),
+        (1, 1, 0, False),
+        (1, 0, 0, True),
+    ),
+)
+def test_terminal_summary_rejects_inconsistent_completion(
+    matched_count: int,
+    unmatched_count: int,
+    error_count: int,
+    cohort_complete: bool,
+) -> None:
+    identity = _identity()
     with pytest.raises(ValueError):
         UHCFlexPractitionerAcquisitionSummary(
             acquisition_id=identity.acquisition_id,
             expected_npi_count=2,
-            matched_count=1,
-            unmatched_count=0,
-            error_count=1,
+            matched_count=matched_count,
+            unmatched_count=unmatched_count,
+            error_count=error_count,
             resource_count=1,
             terminal_set_sha256="5" * 64,
-            cohort_complete=True,
+            cohort_complete=cohort_complete,
             endpoint_collection_complete=False,
             endpoint_complete=False,
         )

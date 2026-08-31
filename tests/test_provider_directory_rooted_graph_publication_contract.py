@@ -107,6 +107,14 @@ def test_twin_mismatch_attempt_is_durable_but_not_admissible() -> None:
         )
 
 
+def test_readiness_accepts_exact_partial_without_claiming_complete() -> None:
+    partial = readiness(retry_exhausted_count=8)
+    assert partial.cohort_complete is False
+    assert partial.retry_exhausted_count == 8
+    with pytest.raises(ValueError, match="dataset_readiness_invalid"):
+        replace(partial, retry_exhausted_count=0)
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     (

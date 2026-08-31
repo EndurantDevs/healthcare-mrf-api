@@ -5,8 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
-from datetime import date
-from datetime import datetime
+from datetime import date, datetime
 import json
 from typing import Any
 
@@ -30,11 +29,7 @@ from process.uhc_flex_practitioner_twin_store_contract import (
     UHCFlexPractitionerTwinAdmission,
     UHCFlexPractitionerTwinAttempt,
     UHCFlexPractitionerTwinStoreError,
-)
-from process.uhc_flex_practitioner_twin_store_contract import (
     UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID,
-)
-from process.uhc_flex_practitioner_twin_store_contract import (
     UHC_FLEX_PRACTITIONER_TWIN_ATTEMPT_CONTRACT_ID,
 )
 
@@ -92,12 +87,15 @@ def _timestamp(value: object) -> datetime:
 
 
 def _sealed_root(database_fields: dict[str, Any]) -> UHCFlexPractitionerSealedRoot:
+    error_count = database_fields.get("error_count")
+    cohort_complete = database_fields.get("cohort_complete")
     if (
         database_fields.get("status") != "sealed"
-        or database_fields.get("cohort_complete") is not True
         or database_fields.get("pending_count") != 0
         or database_fields.get("leased_count") != 0
-        or database_fields.get("error_count") != 0
+        or type(error_count) is not int
+        or error_count < 0
+        or cohort_complete is not (error_count == 0)
         or database_fields.get("endpoint_collection_complete") is not False
         or database_fields.get("endpoint_complete") is not False
         or database_fields.get("sealed_at") is None
@@ -117,6 +115,8 @@ def _sealed_root(database_fields: dict[str, Any]) -> UHCFlexPractitionerSealedRo
             expected_npi_count=database_fields.get("expected_npi_count"),
             resource_count=database_fields.get("resource_count"),
             terminal_set_sha256=database_fields.get("terminal_set_sha256"),
+            error_count=error_count,
+            cohort_complete=cohort_complete,
         )
     except ValueError as error:
         raise UHCFlexPractitionerTwinStoreError("state") from error

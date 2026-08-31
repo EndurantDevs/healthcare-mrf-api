@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 import inspect
@@ -14,6 +13,7 @@ from typing import Any, AsyncIterator
 
 import aiohttp
 
+from process.uhc_flex_practitioner_async_safety import drain_operation
 from process.uhc_flex_practitioner_acquisition_contract import (
     ProgressCallback,
     strict_nonnegative_seconds,
@@ -21,7 +21,9 @@ from process.uhc_flex_practitioner_acquisition_contract import (
     UHCFlexPractitionerAcquisitionDependencies,
     UHCFlexPractitionerAcquisitionError,
     UHCFlexPractitionerAcquisitionProgress,
+    UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_ATTEMPTS,
     UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_RETRY_SECONDS,
+    UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE,
 )
 from process.uhc_flex_official_cohort_store import (
     sync_uhc_flex_official_cohort,
@@ -97,30 +99,6 @@ def default_dependencies() -> UHCFlexPractitionerAcquisitionDependencies:
         session_scope=default_session_scope,
         admit_single_root=admit_uhc_flex_practitioner_single_root,
     )
-
-
-async def drain_operation(
-    operation: Awaitable[Any],
-    *,
-    preserve_cancellation: bool,
-) -> Any:
-    """Shield and drain one fence-changing operation through cancellation."""
-
-    operation_task = asyncio.create_task(operation)
-    cancellation: asyncio.CancelledError | None = None
-    while not operation_task.done():
-        try:
-            await asyncio.shield(operation_task)
-        except asyncio.CancelledError as error:
-            if cancellation is None:
-                cancellation = error
-        except BaseException:
-            break
-    if cancellation is not None and preserve_cancellation:
-        if not operation_task.cancelled():
-            operation_task.exception()
-        raise cancellation
-    return operation_task.result()
 
 
 @dataclass(slots=True)
@@ -378,6 +356,12 @@ class _RootRunner:
     ) -> tuple[int, float] | None:
         """Fetch and terminalize a claim or return its retry request."""
 
+        if claim.attempt > UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_ATTEMPTS:
+            await self.terminal_error(
+                claim,
+                UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE,
+            )
+            return None
         try:
             query_result = await self.dependencies.fetch(
                 session,
@@ -388,6 +372,12 @@ class _RootRunner:
             raise
         except UHCFlexPractitionerTransportError as error:
             if error.retryable:
+                if claim.attempt >= UHC_FLEX_PRACTITIONER_ACQUISITION_MAX_ATTEMPTS:
+                    await self.terminal_error(
+                        claim,
+                        UHC_FLEX_PRACTITIONER_RETRY_EXHAUSTED_ERROR_CODE,
+                    )
+                    return None
                 if invocation_attempt < self.config.max_attempts:
                     retry_delay = self.retry_delay(error, invocation_attempt)
                     await self.release_for_retry(claim)

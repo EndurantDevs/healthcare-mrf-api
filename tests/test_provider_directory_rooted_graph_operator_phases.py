@@ -71,6 +71,20 @@ def _assert_publication_receipt(
 
     assert publication_receipt_by_field["publication_acquisition_id"] == selector
     assert publication_receipt_by_field["replayed"] is True
+    assert set(publication_receipt_by_field) == {
+        "admission_id",
+        "dataset_hash",
+        "dataset_id",
+        "operator_contract_sha256",
+        "previous_dataset_id",
+        "profile_dispatch",
+        "publication_acquisition_id",
+        "replayed",
+        "resource_count",
+        "root_dataset_variant",
+        "rooted_graph_complete",
+        "status",
+    }
     dispatch_by_field = publication_receipt_by_field["profile_dispatch"]
     assert dispatch_by_field["status"] == "not_dispatched"
     followup_by_field = dispatch_by_field["external_followup"]
@@ -128,6 +142,8 @@ async def test_publication_uses_only_exact_receipt_and_serializes_replay(
             publication_acquisition_id=publication_acquisition_id,
             resource_count=10,
             root_dataset_variant="uhc_flex_practitioner",
+            cohort_complete=True,
+            retry_exhausted_count=0,
             rooted_graph_complete=True,
             source_id=PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
         )
@@ -147,3 +163,32 @@ async def test_publication_uses_only_exact_receipt_and_serializes_replay(
     publication_receipt_by_field = json.loads(rendered)
     assert calls == [(selector, marker_database, 4096)]
     _assert_publication_receipt(publication_receipt_by_field, selector)
+
+
+def test_partial_publication_receipt_suppresses_profile_dispatch() -> None:
+    readiness = SimpleNamespace(
+        admission_id="pdrgad_" + "1" * 48,
+        acquisition_root_run_id="pdrgpr_" + "5" * 48,
+        cohort_complete=False,
+        dataset_hash="2" * 64,
+        dataset_id="pdrgpd_" + "3" * 48,
+        previous_dataset_id="pdufpd_" + "4" * 48,
+        publication_acquisition_id="pdrga_" + "e" * 48,
+        resource_count=10,
+        retry_exhausted_count=8,
+        root_dataset_variant="uhc_flex_practitioner",
+        rooted_graph_complete=True,
+        source_id=PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+    )
+
+    receipt = json.loads(
+        operator._publication_json(SimpleNamespace(readiness=readiness, replayed=False))
+    )
+
+    assert receipt["cohort_complete"] is False
+    assert receipt["retry_exhausted_count"] == 8
+    assert receipt["profile_dispatch"] == {
+        "operator_command_available": False,
+        "required_external_global_dispatch": False,
+        "status": "not_applicable_incomplete_cohort",
+    }

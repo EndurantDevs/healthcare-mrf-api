@@ -860,6 +860,48 @@ def validated_physical_projection_recipe_identity(
     return rebuilt_recipe
 
 
+def _validated_input_block_summary(
+    record_start: int,
+    record_count: int,
+    payload_bytes: int,
+    summary_by_name: Mapping[str, int],
+) -> dict[str, int]:
+    integer_fields = (record_start, record_count, payload_bytes)
+    if any(
+        isinstance(coordinate_value, bool)
+        or not isinstance(coordinate_value, int)
+        for coordinate_value in integer_fields
+    ):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_input_block_coordinate_invalid"
+        )
+    if record_start < 0 or record_count < 1 or payload_bytes < 1:
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_input_block_coordinate_invalid"
+        )
+    summary_count_by_name = {
+        required_text(key, "summary_key", limit=64): int(summary_count)
+        for key, summary_count in summary_by_name.items()
+    }
+    if any(count < 0 for count in summary_count_by_name.values()):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_input_block_summary_invalid"
+        )
+    expanded_resource_count = int(
+        summary_count_by_name.get("resource_count", record_count)
+    )
+    if (
+        payload_bytes > PROJECTION_INPUT_BLOCK_MAX_BYTES
+        or record_count > PROJECTION_INPUT_BLOCK_MAX_DOCUMENTS
+        or expanded_resource_count < 1
+        or expanded_resource_count > PROJECTION_INPUT_BLOCK_MAX_RESOURCES
+    ):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_input_block_bound_exceeded"
+        )
+    return summary_count_by_name
+
+
 def projection_input_block(
     *,
     upstream_artifact_id: str,
@@ -875,43 +917,12 @@ def projection_input_block(
 ) -> ProjectionInputBlock:
     """Build one campaign-blind immutable retained-byte descriptor."""
 
-    integer_fields = (record_start, record_count, payload_bytes)
-    if any(
-        isinstance(coordinate_value, bool)
-        or not isinstance(coordinate_value, int)
-        for coordinate_value in integer_fields
-    ):
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_input_block_coordinate_invalid"
-        )
-    if (
-        record_start < 0
-        or record_count < 1
-        or payload_bytes < 1
-    ):
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_input_block_coordinate_invalid"
-        )
-    normalized_summary_count_map = {
-        required_text(key, "summary_key", limit=64): int(summary_count)
-        for key, summary_count in summary.items()
-    }
-    if any(count < 0 for count in normalized_summary_count_map.values()):
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_input_block_summary_invalid"
-        )
-    expanded_resource_count = int(
-        normalized_summary_count_map.get("resource_count", record_count)
+    normalized_summary_count_map = _validated_input_block_summary(
+        record_start,
+        record_count,
+        payload_bytes,
+        summary,
     )
-    if (
-        payload_bytes > PROJECTION_INPUT_BLOCK_MAX_BYTES
-        or record_count > PROJECTION_INPUT_BLOCK_MAX_DOCUMENTS
-        or expanded_resource_count < 1
-        or expanded_resource_count > PROJECTION_INPUT_BLOCK_MAX_RESOURCES
-    ):
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_input_block_bound_exceeded"
-        )
     block_descriptor_map = {
         "contract_id": PROJECTION_INPUT_BLOCK_CONTRACT_ID,
         "upstream_artifact_id": required_hash(

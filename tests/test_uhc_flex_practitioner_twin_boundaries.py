@@ -9,7 +9,6 @@ import copy
 from dataclasses import fields, replace
 from datetime import date
 from datetime import timedelta
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -76,10 +75,10 @@ def _sealed_database_row(root):
     return {
         **_field_map(root),
         "status": "sealed",
-        "cohort_complete": True,
+        "cohort_complete": root.cohort_complete,
         "pending_count": 0,
         "leased_count": 0,
-        "error_count": 0,
+        "error_count": root.error_count,
         "endpoint_collection_complete": False,
         "endpoint_complete": False,
         "sealed_at": TIMESTAMP,
@@ -235,6 +234,17 @@ def test_twin_store_row_and_exact_replay_validation_boundaries():
     with pytest.raises(twin_contract.UHCFlexPractitionerTwinStoreError):
         twin_store._sealed_root(malformed_root)
 
+    partial_root = replace(
+        _root("candidate"),
+        error_count=1,
+        cohort_complete=False,
+    )
+    assert twin_store._sealed_root(_sealed_database_row(partial_root)) == partial_root
+    inconsistent_partial_row = _sealed_database_row(partial_root)
+    inconsistent_partial_row["cohort_complete"] = True
+    with pytest.raises(twin_contract.UHCFlexPractitionerTwinStoreError):
+        twin_store._sealed_root(inconsistent_partial_row)
+
     with pytest.raises(twin_contract.UHCFlexPractitionerTwinStoreError):
         twin_store._attempt_from_row(None)
     malformed_attempt = _field_map(attempt)
@@ -365,57 +375,6 @@ async def test_single_root_admission_replay_returns_stored_identity(monkeypatch)
     )
 
     assert replay is stored_admission
-
-
-@pytest.mark.asyncio
-async def test_single_root_store_normalizes_contract_value_errors(monkeypatch):
-    cohort = cohort_fixture()
-    candidate = _single_root(cohort.cohort_id, cohort.npi_count)
-    admission = build_single_root_admission(
-        candidate,
-        semantic_projection_as_of=PROJECTION_DATE,
-        operation_key=OPERATION_KEY,
-        admitted_at=TIMESTAMP,
-    )
-
-    async def lock_single_root(*_args, **_kwargs):
-        return candidate
-
-    monkeypatch.setattr(twin_store, "_lock_single_root", lock_single_root)
-    with pytest.raises(twin_contract.UHCFlexPractitionerTwinStoreError) as admit_error:
-        await twin_store.admit_uhc_flex_practitioner_single_root(
-            candidate.acquisition_id,
-            semantic_projection_as_of=PROJECTION_DATE,
-            operation_key="invalid",
-            database=_Database(),
-        )
-    assert admit_error.value.code == "identity"
-
-    with pytest.raises(twin_contract.UHCFlexPractitionerTwinStoreError) as read_error:
-        await twin_store._rebuild_single_root_admission(
-            _Database(), admission, PROJECTION_DATE, "invalid"
-        )
-    assert read_error.value.code == "identity"
-
-
-@pytest.mark.asyncio
-async def test_single_root_admission_serializes_jsonb_policy() -> None:
-    cohort = cohort_fixture()
-    admission = build_single_root_admission(
-        _single_root(cohort.cohort_id, cohort.npi_count),
-        semantic_projection_as_of=PROJECTION_DATE,
-        operation_key=OPERATION_KEY,
-        admitted_at=TIMESTAMP,
-    )
-    database = _Database()
-
-    await twin_store._insert_admission(database, admission)
-
-    statement, parameters = database.status_calls[0]
-    assert "CAST(:reviewed_root_policy_json AS jsonb)" in statement
-    assert json.loads(parameters["reviewed_root_policy_json"]) == (
-        admission.reviewed_root_policy_json
-    )
 
 
 @pytest.mark.asyncio

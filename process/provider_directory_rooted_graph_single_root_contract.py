@@ -101,15 +101,21 @@ def _single_root_scope(current: Any) -> Any:
 
 
 def _single_root_intent_id(current: Any, operation_key: str, scope_id: str) -> str:
+    root_by_field = {
+        name: getattr(current, name) for name in _CURRENT_IDENTITY_FIELDS
+    }
+    if current.cohort_complete is not True:
+        root_by_field.update(
+            cohort_complete=False,
+            retry_exhausted_count=current.retry_exhausted_count,
+        )
     return _identity_digest(
         "pdrgi_",
         {
             "operation_key": operation_key,
             "operator_contract_sha256": SINGLE_ROOT_OPERATOR_CONTRACT_SHA256,
             "reviewed_root_policy": ReviewedRootPolicy(1).document(),
-            "root": {
-                name: getattr(current, name) for name in _CURRENT_IDENTITY_FIELDS
-            },
+            "root": root_by_field,
             "scope_id": scope_id,
         },
     )
@@ -162,7 +168,7 @@ def single_root_operation_payload(
 ) -> dict[str, Any]:
     """Project bounded manual-operation evidence without transport details."""
 
-    return {
+    operation_by_field = {
         "acquisition": {
             "acquisition_id": receipt.acquisition_id,
             "completed_count": receipt.completed_count,
@@ -183,6 +189,12 @@ def single_root_operation_payload(
         "rooted_graph_sha256": admission.rooted_graph_sha256,
         "status": "admitted",
     }
+    if current.cohort_complete is not True:
+        operation_by_field.update(
+            cohort_complete=False,
+            retry_exhausted_count=current.retry_exhausted_count,
+        )
+    return operation_by_field
 
 
 __all__ = (

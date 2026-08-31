@@ -33,17 +33,14 @@ from process.provider_directory_rooted_graph_publication_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND,
 )
+from process.provider_directory_rooted_graph_publication_metadata import (
+    rooted_graph_publication_metadata_sections,
+)
 from process.provider_directory_rooted_graph_store_contract import (
     ACQUISITION_PATTERN,
 )
 from process.uhc_flex_official_cohort_contract import (
     UHC_FLEX_OFFICIAL_AUTHORITY_ID,
-)
-from process.provider_directory_resource_hash import (
-    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-)
-from process.provider_directory_fhir_root_policy import (
-    REVIEWED_ROOT_POLICY_METADATA_KEY,
 )
 from process.provider_directory_rooted_graph_twin_contract import (
     ADMISSION_PATTERN,
@@ -51,9 +48,12 @@ from process.provider_directory_rooted_graph_twin_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ADMISSION_CONTRACT_ID,
 )
+
+
 def _identifier(prefix: str, values: tuple[object, ...]) -> str:
     content = "\x1f".join(str(value) for value in values)
     return prefix + hashlib.sha256(content.encode("utf-8")).hexdigest()[:48]
+
 
 def _dataset_identity_tail(candidate: object) -> tuple[object, ...]:
     return tuple(
@@ -81,6 +81,7 @@ def _dataset_identity_tail(candidate: object) -> tuple[object, ...]:
         )
     )
 
+
 def _has_valid_dataset_identity_types(candidate: object) -> bool:
     try:
         date.fromisoformat(candidate.semantic_projection_as_of)
@@ -103,7 +104,12 @@ def _has_valid_dataset_identity_types(candidate: object) -> bool:
         and 1 <= len(candidate.root_dataset_id) <= 96
         and type(candidate.root_cohort_id) is str
         and 1 <= len(candidate.root_cohort_id) <= 128
+        and type(candidate.cohort_complete) is bool
+        and type(candidate.retry_exhausted_count) is int
+        and candidate.retry_exhausted_count >= 0
+        and candidate.cohort_complete is (candidate.retry_exhausted_count == 0)
     )
+
 
 def _has_valid_dataset_identity_lineage(candidate: object) -> bool:
     pair = exact_uhc_dataset_pair()
@@ -136,6 +142,7 @@ def _has_valid_dataset_identity_lineage(candidate: object) -> bool:
         and exact_dataset_variant(candidate.root_dataset_id)
         == candidate.root_dataset_variant
     )
+
 
 def _has_valid_dataset_identity_content(candidate: object) -> bool:
     tail = _dataset_identity_tail(candidate)
@@ -174,6 +181,7 @@ def _has_valid_dataset_identity_content(candidate: object) -> bool:
         )
     )
 
+
 @dataclass(frozen=True, slots=True, repr=False)
 class ProviderDirectoryRootedGraphDatasetIdentity:
     """Deterministic generic-dataset and acquisition-root coordinates."""
@@ -194,6 +202,8 @@ class ProviderDirectoryRootedGraphDatasetIdentity:
     root_content_proof_sha256: str
     root_cohort_id: str
     root_practitioner_resource_count: int
+    cohort_complete: bool
+    retry_exhausted_count: int
     practitioner_origin_source_id: str
     practitioner_origin_endpoint_id: str
     semantic_projection_as_of: str
@@ -213,6 +223,7 @@ class ProviderDirectoryRootedGraphDatasetIdentity:
         ):
             raise ValueError("provider_directory_rooted_graph_dataset_identity_invalid")
 
+
 def _has_matching_admission_lineage(
     admission: object,
     current_root: object,
@@ -223,6 +234,26 @@ def _has_matching_admission_lineage(
     ):
         return False
     exact_pair = exact_uhc_dataset_pair()
+    has_single_root_identity = True
+    if (
+        admission.admission_contract_id
+        == PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID
+    ):
+        from process.provider_directory_rooted_graph_single_root_contract import (
+            derive_single_root_identity,
+        )
+
+        expected = derive_single_root_identity(
+            current_root,
+            operation_key=admission.acquisition_operation_key,
+        ).candidate
+        has_single_root_identity = (
+            admission.publication_acquisition_id == expected.acquisition_id
+            and admission.publication_run_id == expected.run_id
+            and admission.dataset_intent_id == expected.dataset_intent_id
+        )
+    elif current_root.cohort_complete is not True:
+        has_single_root_identity = False
     return bool(
         admission.admission_contract_id
         in {
@@ -248,7 +279,9 @@ def _has_matching_admission_lineage(
         == current_root.endpoint_signature_sha256
         and admission.acquisition_source_id == exact_pair.rooted_source_id
         and admission.acquisition_endpoint_id == exact_pair.rooted_endpoint_id
+        and has_single_root_identity
     )
+
 
 def _identity_tail_from_authority(
     admission: ProviderDirectoryRootedGraphTwinAdmission,
@@ -275,6 +308,7 @@ def _identity_tail_from_authority(
         current_root.operation_key,
         admission.rooted_graph_sha256,
     )
+
 
 def build_rooted_graph_dataset_identity(
     admission: ProviderDirectoryRootedGraphTwinAdmission,
@@ -308,6 +342,8 @@ def build_rooted_graph_dataset_identity(
         root_content_proof_sha256=current_root.root_content_proof_sha256,
         root_cohort_id=current_root.root_cohort_id,
         root_practitioner_resource_count=current_root.practitioner_resource_count,
+        cohort_complete=current_root.cohort_complete,
+        retry_exhausted_count=current_root.retry_exhausted_count,
         practitioner_origin_source_id=current_root.practitioner_origin_source_id,
         practitioner_origin_endpoint_id=current_root.practitioner_origin_endpoint_id,
         semantic_projection_as_of=current_root.semantic_projection_as_of,
@@ -315,9 +351,11 @@ def build_rooted_graph_dataset_identity(
         rooted_graph_sha256=admission.rooted_graph_sha256,
     )
 
+
 build_provider_directory_rooted_graph_dataset_identity = (
     build_rooted_graph_dataset_identity
 )
+
 
 def _has_valid_publication_metadata_inputs(
     identity: ProviderDirectoryRootedGraphDatasetIdentity,
@@ -355,107 +393,6 @@ def _has_valid_publication_metadata_inputs(
         and previous_dataset_id == identity.root_dataset_id
     )
 
-def _publication_lineage_metadata(
-    identity: ProviderDirectoryRootedGraphDatasetIdentity,
-    admission: ProviderDirectoryRootedGraphTwinAdmission,
-    previous_dataset_id: str,
-) -> dict[str, Any]:
-    metadata = {
-        "acquisition_root_run_id": identity.acquisition_root_run_id,
-        "admission_contract_id": admission.admission_contract_id,
-        "admission_id": admission.admission_id,
-        "attempt_id": admission.attempt_id,
-        "comparison_acquisition_id": admission.comparison_acquisition_id,
-        "publication_acquisition_id": admission.publication_acquisition_id,
-        "publication_run_id": admission.publication_run_id,
-        "publication_contract_id": identity.publication_contract_id,
-        "publication_kind": PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND,
-        "dataset_id": identity.dataset_id,
-        "previous_dataset_id": previous_dataset_id,
-        "dataset_intent_id": admission.dataset_intent_id,
-        "scope_id": admission.scope_id,
-        "root_source_id": identity.root_source_id,
-        "root_endpoint_id": identity.root_endpoint_id,
-        "acquisition_source_id": identity.source_id,
-        "acquisition_endpoint_id": identity.endpoint_id,
-        "endpoint_id": identity.endpoint_id,
-        "endpoint_signature_sha256": admission.endpoint_signature_sha256,
-        "source_id": identity.source_id,
-        "source_ids": [identity.source_id],
-        "source_authority_id": identity.source_authority_id,
-        "semantic_projection_as_of": identity.semantic_projection_as_of,
-        "operation_key": identity.operation_key,
-        "root_variant": identity.root_dataset_variant,
-        "root_publication_contract_id": identity.root_publication_contract_id,
-        "root_dataset_id": identity.root_dataset_id,
-        "root_dataset_hash": identity.root_dataset_hash,
-        "root_content_proof_sha256": identity.root_content_proof_sha256,
-        "root_cohort_id": identity.root_cohort_id,
-        "root_practitioner_resource_count": (identity.root_practitioner_resource_count),
-        "practitioner_origin_source_id": identity.practitioner_origin_source_id,
-        "practitioner_origin_endpoint_id": identity.practitioner_origin_endpoint_id,
-        "connector_id": admission.connector_id,
-        "storage_contract_id": admission.storage_contract_id,
-        "graph_contract_sha256": admission.graph_contract_sha256,
-        "query_contract_sha256": admission.query_contract_sha256,
-    }
-    if (
-        admission.admission_contract_id
-        == PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID
-    ):
-        metadata.update(
-            acquisition_operation_key=admission.acquisition_operation_key,
-        )
-        metadata[REVIEWED_ROOT_POLICY_METADATA_KEY] = (
-            admission.reviewed_root_policy_json
-        )
-    return metadata
-
-def _publication_proof_metadata(
-    admission: ProviderDirectoryRootedGraphTwinAdmission,
-) -> dict[str, Any]:
-    return {
-        **{
-            field_name: getattr(admission, field_name)
-            for field_name in (
-                "max_work_items",
-                "max_resource_rows",
-                "max_edge_rows",
-                "max_payload_bytes",
-                "used_work_items",
-                "used_resource_rows",
-                "used_edge_rows",
-                "used_payload_bytes",
-                "completed_count",
-                "resource_count",
-                "edge_count",
-                "insurance_plan_count",
-                "insurance_plan_page_count",
-                "terminal_set_sha256",
-                "resource_set_sha256",
-                "edge_set_sha256",
-                "rooted_graph_sha256",
-            )
-        },
-    }
-
-def _publication_resource_metadata(
-    resource_count_by_type: dict[str, int],
-) -> dict[str, Any]:
-    resource_types = list(PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_RESOURCES)
-    return {
-        "resource_hash_contract": SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-        "selected_resources": resource_types,
-        "expected_resources": resource_types,
-        "resource_counts": {
-            resource_type: resource_count_by_type[resource_type]
-            for resource_type in PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_RESOURCES
-        },
-        "cohort_complete": True,
-        "rooted_graph_complete": True,
-        "endpoint_collection_complete": False,
-        "endpoint_complete": False,
-    }
 
 def provider_directory_rooted_graph_publication_metadata(
     identity: ProviderDirectoryRootedGraphDatasetIdentity,
@@ -474,16 +411,19 @@ def provider_directory_rooted_graph_publication_metadata(
     ):
         raise ProviderDirectoryRootedGraphPublicationError("content")
     assert previous_dataset_id is not None
-    return {
-        **_publication_lineage_metadata(identity, admission, previous_dataset_id),
-        **_publication_proof_metadata(admission),
-        **_publication_resource_metadata(resource_counts),
-    }
+    return rooted_graph_publication_metadata_sections(
+        identity,
+        admission,
+        previous_dataset_id,
+        resource_counts,
+    )
+
 
 from process.provider_directory_rooted_graph_publication_facade import (
     load_provider_directory_rooted_graph_dataset_readiness,
     publish_provider_directory_rooted_graph_dataset,
 )
+
 __all__ = tuple(
     (
         "build_provider_directory_rooted_graph_dataset_identity canonical_json "
