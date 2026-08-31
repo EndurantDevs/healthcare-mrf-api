@@ -19922,20 +19922,29 @@ async def _search_manifest_serving_table(
         serving_rows = list(geo_rate_selection.row_data)
         is_location_selection_exhausted = geo_rate_selection.exhausted
     elif strict_cost_provider_expansion:
-        exact_provider_selection = await _strict_cost_provider_expansion_selection(
-            session,
-            serving_tables,
-            code_rows=code_rows,
-            args=args,
-            snapshot_id=snapshot_id,
-            source_trace_set_hash=None,
-            network_names=network_names,
-            target_count=max(
-                int(pagination.offset) + int(pagination.limit) + 1,
-                1,
-            ),
-            descending=_is_cost_order_descending(args),
-        )
+        try:
+            exact_provider_selection = await _strict_cost_provider_expansion_selection(
+                session,
+                serving_tables,
+                code_rows=code_rows,
+                args=args,
+                snapshot_id=snapshot_id,
+                source_trace_set_hash=None,
+                network_names=network_names,
+                target_count=max(
+                    int(pagination.offset) + int(pagination.limit) + 1,
+                    1,
+                ),
+                descending=_is_cost_order_descending(args),
+            )
+        except PTG2OnlineWorkBudgetExceeded as exc:
+            if not location_filter_requested:
+                raise
+            raise PTG2LocationScopeError(
+                "Cost-ordered geographic procedure search exceeds the sealed "
+                "online work budget.",
+                allows_distance_retry=not explicit_provider_filter_requested,
+            ) from exc
         if exact_provider_selection is None:
             return None
         exact_provider_materialization = (
