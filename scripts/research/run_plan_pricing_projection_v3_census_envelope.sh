@@ -1722,8 +1722,6 @@ run_child() {
   fi
   reap_child_group "${CHILD_PID}" \
     || die "census process group did not terminate"
-  child_cleanup_is_complete \
-    || die "census child cleanup was not proven complete"
   if [ -e "${CENSUS_RECEIPT}" ] || [ -L "${CENSUS_RECEIPT}" ]; then
     [ -f "${CENSUS_RECEIPT}" ] && [ ! -L "${CENSUS_RECEIPT}" ] \
       || die "census receipt is not a regular file"
@@ -1748,6 +1746,8 @@ run_child() {
   elif [ "${CHILD_EXIT_CODE}" -eq 0 ]; then
     die "successful census process did not write a regular runtime attestation"
   fi
+  child_cleanup_is_complete \
+    || die "census child cleanup was not proven complete"
   verify_child_fences || die "post-child envelope fence changed"
   POST_CHILD_FENCE_VERIFIED=true
 }

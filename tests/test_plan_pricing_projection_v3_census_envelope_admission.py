@@ -1,5 +1,6 @@
 """Admission and final cleanup checks for the census envelope."""
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -151,7 +152,19 @@ def test_unproven_child_cleanup_retains_every_outer_fence(tmp_path: Path) -> Non
     assert not any(event.endswith("_delete") for event in events)
     assert "drain_set_false" not in events
     assert "lock_stop" not in events
-    assert envelope._receipt(state_root)["cleanup"]["complete"] is False
+    receipt = envelope._receipt(state_root)
+    census_receipt = state_root / "run/census-receipt.json"
+    assert (
+        receipt["census_receipt_sha256"]
+        == hashlib.sha256(census_receipt.read_bytes()).hexdigest()
+    )
+    assert receipt["runtime_attestation"]["pod_uid"] == "pod-uid"
+    assert receipt["runtime_attestation"]["configmap_uid"] == "configmap-uid"
+    assert (
+        receipt["runtime_attestation"]["source_overlay_sha256"]
+        == envelope.OVERLAY_SHA256
+    )
+    assert receipt["cleanup"]["complete"] is False
 
 
 def test_seed_reappearance_retains_drain_quota_and_lock(tmp_path: Path) -> None:
