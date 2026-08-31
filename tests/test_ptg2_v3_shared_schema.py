@@ -153,7 +153,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260831100000_hospital_price_legacy_header"
+        "20260831180000_hospital_price_csv_transition_metadata"
     ]
 
 

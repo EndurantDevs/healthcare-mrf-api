@@ -227,7 +227,7 @@ fn run_case(
         String::from_utf8_lossy(&completed.stderr)
     );
     let summary: serde_json::Value = serde_json::from_slice(&completed.stdout).unwrap();
-    assert_eq!(summary["contract"], "hospital-mrf-copy-v2-v3");
+    assert_eq!(summary["contract"], "hospital-mrf-copy-v2-v3-v2");
     assert_eq!(summary["version_id"], VERSION_ID);
     assert_eq!(summary["format"], format);
     assert_eq!(summary["max_fanout_rows"], 128);
@@ -298,7 +298,7 @@ fn production_binary_imports_json_tall_wide_gzip_and_one_member_zip() {
     let packed_summary: serde_json::Value = serde_json::from_slice(&packed.stdout).unwrap();
     assert_eq!(
         packed_summary["contract"],
-        "hospital-mrf-copy-v2-v3-packed-v3"
+        "hospital-mrf-copy-v2-v3-packed-v4"
     );
     assert_eq!(packed_summary["artifacts"].as_array().unwrap().len(), 10);
     assert_eq!(packed_summary["root"]["fact_count"], 1);

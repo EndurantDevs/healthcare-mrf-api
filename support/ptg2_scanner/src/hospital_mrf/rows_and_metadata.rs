@@ -276,10 +276,8 @@ impl GeneralMetadata {
                 Some(required_text(value, "attester_name")?.to_owned())
             }
             (CmsProfile::V3, None) => return Err(invalid("missing attester_name")),
-            (CmsProfile::V2, Some(value)) if optional_text(value).is_some() => {
-                return Err(invalid("attester_name is only valid for CMS V3"));
-            }
-            (CmsProfile::V2, _) => None,
+            (CmsProfile::V2, Some(value)) => optional_text(value),
+            (CmsProfile::V2, None) => None,
         };
         self.financial_aid_policy = self.financial_aid_policy.as_deref().and_then(optional_text);
         Ok(self)

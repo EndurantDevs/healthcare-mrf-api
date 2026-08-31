@@ -216,6 +216,43 @@ fn cms_csv_v2_tall_and_wide_preserve_declared_version_and_estimated_amount() {
 }
 
 #[test]
+fn cms_csv_v2_preserves_optional_forward_metadata_without_changing_profile() {
+    let v3_records = csv_fixture_records(&fixture_tall_csv());
+    let npi_index = csv_fixture_index(&v3_records[0], "type_2_npi");
+    let attester_index = csv_fixture_index(&v3_records[0], "attester_name");
+    for format in [InputFormat::TallCsv, InputFormat::WideCsv] {
+        let mut records = csv_fixture_records(&fixture_v2_csv(format, "2.0.0"));
+        records[0][npi_index] = "type_2_npi".to_owned();
+        records[1][npi_index] = "1407430291".to_owned();
+        records[0][attester_index] = "attester_name".to_owned();
+        records[1][attester_index] = "Ben Levin".to_owned();
+
+        let (rows, summary) = run_fixture_with_summary(
+            format,
+            &csv_fixture_bytes(&records),
+            false,
+        );
+        assert_eq!(summary.schema_version, "2.0.0");
+        assert_eq!(
+            String::from_utf8(rows["npi"].clone()).unwrap(),
+            "fixture-version\t0\t1407430291\n"
+        );
+        let mrf = String::from_utf8(rows["mrf"].clone()).unwrap();
+        let mrf = mrf.trim_end().split('\t').collect::<Vec<_>>();
+        assert_eq!(mrf[3], "2.0.0");
+        assert_eq!(mrf[4], AFFIRMATION_TEXT);
+        assert_eq!(mrf[6], "Ben Levin");
+        let payer = String::from_utf8(rows["payer_charge"].clone()).unwrap();
+        let payer = payer.trim_end().split('\t').collect::<Vec<_>>();
+        let estimated = PAYER_CHARGE_COPY_COLUMNS
+            .iter()
+            .position(|column| *column == "estimated_amount")
+            .unwrap();
+        assert_eq!(payer[estimated], "9.125");
+    }
+}
+
+#[test]
 fn cms_csv_profiles_reject_mixed_and_unsupported_headers() {
     for format in [InputFormat::TallCsv, InputFormat::WideCsv] {
         let mut records = csv_fixture_records(&fixture_v2_csv(format, "2.0.0"));

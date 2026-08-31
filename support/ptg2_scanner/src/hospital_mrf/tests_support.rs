@@ -313,7 +313,7 @@
         )
         .unwrap();
         assert_eq!(summary.version_id, VERSION_ID);
-        assert_eq!(summary.contract, "hospital-mrf-copy-v2-v3");
+        assert_eq!(summary.contract, "hospital-mrf-copy-v2-v3-v2");
         assert_eq!(
             summary.max_decompressed_bytes,
             DEFAULT_MAX_DECOMPRESSED_BYTES
