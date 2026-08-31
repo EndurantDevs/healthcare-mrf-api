@@ -764,9 +764,11 @@ hospitals:
 - hospital_id: hospital-000229
   name: Arizona General Hospital - Laveen Hospital
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-000231
 - hospital_id: hospital-000230
   name: Arizona General Hospital - Mesa Hospital
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-000232
 - hospital_id: hospital-000231
   name: Arizona General Hospital Laveen
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
@@ -2677,6 +2679,7 @@ hospitals:
 - hospital_id: hospital-000806
   name: Baylor St. Luke's Medical Center - McNair Campus
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-000807
 - hospital_id: hospital-000807
   name: Baylor St. Luke's Medical Center (McNair)
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
@@ -4178,18 +4181,23 @@ hospitals:
 - hospital_id: hospital-001263
   name: CHI St. Joseph Health - College Station Hospital
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006172
 - hospital_id: hospital-001264
   name: CHI St. Joseph Health Burleson Hospital
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006171
 - hospital_id: hospital-001265
   name: CHI St. Joseph Health Grimes Hospital
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006173
 - hospital_id: hospital-001266
   name: CHI St. Joseph Health Madison Hospital
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006174
 - hospital_id: hospital-001267
   name: CHI St. Joseph Health Regional Hospital
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006175
 - hospital_id: hospital-001268
   name: CHI St. Joseph Health Rehabilitation Hospital, an affiliate of Encompass Health
   cms_hpt_url: https://www.encompasshealth.com/cms-hpt.txt
@@ -4199,24 +4207,31 @@ hospitals:
 - hospital_id: hospital-001270
   name: CHI St. Luke's Health - Baylor St. Luke's Medical Center
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-000805
 - hospital_id: hospital-001271
   name: CHI St. Luke's Health - Baylor St. Luke's Medical Center ER
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  locator_mrf_url: https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/finance/price-transparency/741161938-1184622847_chi-st-lukes-health-baylor-college-of-medicine-medical-center_standardcharges.json
 - hospital_id: hospital-001272
   name: CHI St. Luke's Health Brazosport
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006200
 - hospital_id: hospital-001273
   name: CHI St. Luke's Health Memorial Livingston
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006207
 - hospital_id: hospital-001274
   name: CHI St. Luke's Health Memorial Lufkin
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006208
 - hospital_id: hospital-001275
   name: CHI St. Luke's Health Memorial San Augustine
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006209
 - hospital_id: hospital-001276
   name: CHI St. Luke's Health Springwood Village
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006203
 - hospital_id: hospital-001277
   name: CHI St. Vincent
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
@@ -4229,6 +4244,7 @@ hospitals:
 - hospital_id: hospital-001280
   name: CHI St. Vincent Infirmary
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-001277
 - hospital_id: hospital-001281
   name: CHI St. Vincent Morrilton
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
@@ -5063,6 +5079,7 @@ hospitals:
 - hospital_id: hospital-001533
   name: Community Hospital of San Bernardino
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-001535
 - hospital_id: hospital-001534
   name: Community Hospital of Stokes
   cms_hpt_url: https://www.novanthealth.org/cms-hpt.txt
@@ -7600,6 +7617,7 @@ hospitals:
 - hospital_id: hospital-002319
   name: French Hospital Medical Center
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-002318
 - hospital_id: hospital-002320
   name: Fresno Heart and Surgical Hospital
   cms_hpt_url: https://communitymedical.org/cms-hpt.txt
@@ -7788,6 +7806,7 @@ hospitals:
 - hospital_id: hospital-002377
   name: Glendale Memorial Hospital and Health Center
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-002378
 - hospital_id: hospital-002378
   name: Glendale Memorial Hospital Health Center
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
@@ -20323,6 +20342,7 @@ hospitals:
 - hospital_id: hospital-006164
   name: St. John's Hospital Camarillo
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006161
 - hospital_id: hospital-006165
   name: St. John's Regional Medical Center
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
@@ -20409,6 +20429,7 @@ hospitals:
 - hospital_id: hospital-006190
   name: St. Joseph's Medical Center of Stockton
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006191
 - hospital_id: hospital-006191
   name: St. Joseph's Medical Center Stockton
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
@@ -20476,6 +20497,7 @@ hospitals:
 - hospital_id: hospital-006212
   name: St. Luke's Hospital at The Vintage
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006205
 - hospital_id: hospital-006213
   name: St. Luke's Jerome Medical Center
   cms_hpt_url: https://stlukesonline.org/cms-hpt.txt
@@ -20486,6 +20508,7 @@ hospitals:
 - hospital_id: hospital-006215
   name: St. Luke's Lakeside Hospital
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006201
 - hospital_id: hospital-006216
   name: St. Luke's Magic Valley Medical Center
   cms_hpt_url: https://stlukesonline.org/cms-hpt.txt
@@ -20521,9 +20544,11 @@ hospitals:
 - hospital_id: hospital-006225
   name: St. Luke's Sugar Land Hospital
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006204
 - hospital_id: hospital-006226
   name: St. Luke's The Woodlands Hospital
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006206
 - hospital_id: hospital-006227
   alias_of: hospital-006059
   name: St. Luke's Wood River Medical Center
@@ -20555,6 +20580,7 @@ hospitals:
 - hospital_id: hospital-006237
   name: St. Mary Medical Center - Long Beach
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-006234
 - hospital_id: hospital-006238
   name: St. Mary Outpatient Center Mid County
   cms_hpt_url: https://www.christushealth.org/cms-hpt.txt
@@ -20645,12 +20671,15 @@ hospitals:
 - hospital_id: hospital-006263
   name: St. Rose Dominican Hospital - Rose de Lima
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-005494
 - hospital_id: hospital-006264
   name: St. Rose Dominican Hospital - San Martin
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-005641
 - hospital_id: hospital-006265
   name: St. Rose Dominican Hospital - Siena
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-005787
 - hospital_id: hospital-006266
   name: St. Thomas Hospital for Specialty Surgery
   cms_hpt_url: http://www.sthspecialtysurgery.com/cms-hpt.txt
@@ -21583,6 +21612,7 @@ hospitals:
 - hospital_id: hospital-006549
   name: The Women's Hospital at Saint Joseph East
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-001253
 - hospital_id: hospital-006550
   name: Thomas H. Boyd Memorial Hospital
   cms_hpt_url: https://boydhcs.org/cms-hpt.txt
@@ -23747,9 +23777,11 @@ hospitals:
 - hospital_id: hospital-007234
   name: Yavapai Regional Medical Center
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-007237
 - hospital_id: hospital-007235
   name: Yavapai Regional Medical Center - East Campus
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
+  alias_of: hospital-007236
 - hospital_id: hospital-007236
   name: Yavapai Regional Medical Center (East)
   cms_hpt_url: https://www.commonspirit.org/cms-hpt.txt
