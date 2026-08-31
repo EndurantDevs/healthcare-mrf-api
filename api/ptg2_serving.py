@@ -10687,10 +10687,10 @@ def _membership_knn_prefilter_sql(
     parameter_map: dict[str, Any],
     knn_order_sql: str | None,
 ) -> str:
-    """Render the exact inferred-taxonomy predicate before raw KNN limits."""
+    """Render exact provider predicates before raw KNN limits."""
 
     return " AND ".join(
-        _membership_inferred_taxonomy_filters(args, parameter_map)
+        _membership_taxonomy_filters(dict(args), parameter_map)
         if knn_order_sql is not None
         else ()
     ) or "TRUE"
@@ -13046,7 +13046,7 @@ def _uses_local_distance_rate_scope(
     explicit_npi_scope: _ExplicitNpiGraphScope | None,
     candidate_limit: int,
 ) -> bool:
-    """Admit bounded V4 distance or exhaustive exact-rate location scopes."""
+    """Admit bounded V4 distance and legacy exhaustive exact-rate scopes."""
 
     requested_order = str(args.get("order_by") or "").strip().lower()
     requested_direction = str(args.get("order") or "asc").strip().lower()
@@ -13066,10 +13066,15 @@ def _uses_local_distance_rate_scope(
         and serving_tables.provider_graph_v4_inferred_taxonomy_candidates
         is not None
         and (
-            not _is_ptg2_provider_filter_requested(dict(args))
-            or _is_inferred_taxonomy_only_provider_filter(args)
+            uses_distance_order
+            or (
+                uses_exhaustive_rate_scope
+                and (
+                    not _is_ptg2_provider_filter_requested(dict(args))
+                    or _is_inferred_taxonomy_only_provider_filter(args)
+                )
+            )
         )
-        and (uses_distance_order or uses_exhaustive_rate_scope)
         and provider_set_keys is None
         and explicit_npi_scope is None
         and not request_options.get("require_provider_set_coverage", False)
