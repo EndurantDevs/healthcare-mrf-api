@@ -59,6 +59,7 @@ def _fence_dataset(readiness: SimpleNamespace, variant: str) -> SimpleNamespace:
     return SimpleNamespace(
         dataset_scoped_ready=True,
         dataset_scoped_variant=variant,
+        dataset_scoped_cohort_complete=readiness.cohort_complete,
         dataset_id=readiness.dataset_id,
         endpoint_id=readiness.endpoint_id,
         source_id=readiness.source_id,

@@ -303,6 +303,8 @@ def is_uhc_flex_fence_dataset_ready(dataset: Any, readiness: Any) -> bool:
         type(retry_exhausted_count) is int
         and retry_exhausted_count >= 0
         and readiness.cohort_complete is (retry_exhausted_count == 0)
+        and readiness.cohort_complete
+        is getattr(dataset, "dataset_scoped_cohort_complete", None)
         and (
             retry_exhausted_count == 0
             or getattr(dataset, "reviewed_root_policy", None)

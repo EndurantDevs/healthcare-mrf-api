@@ -228,6 +228,7 @@ def _readiness_record(**overrides: object) -> SimpleNamespace:
         "admission_id": metadata["admission_id"],
         "operation_key": metadata["operation_key"],
         "cohort_complete": True,
+        "retry_exhausted_count": 0,
         "endpoint_collection_complete": False,
         "endpoint_complete": False,
     }
@@ -250,6 +251,7 @@ def _rooted_readiness_record(**overrides: object) -> SimpleNamespace:
         "operation_key": "6" * 64,
         "publication_kind": "rooted_combined",
         "cohort_complete": True,
+        "retry_exhausted_count": 0,
         "rooted_graph_complete": True,
         "endpoint_collection_complete": False,
         "endpoint_complete": False,

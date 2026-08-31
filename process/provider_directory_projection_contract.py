@@ -2224,6 +2224,21 @@ def _validated_reduced_resource_count_map(
     return normalized_count_by_resource
 
 
+def _require_reduced_counts_within_raw_shards(
+    recipe: PhysicalProjectionRecipeIdentity,
+    shards: Sequence[ProjectionProofShard],
+    reduced_count_by_resource: Mapping[str, int],
+) -> None:
+    raw_count_by_resource = _resource_counts(recipe, shards)
+    if any(
+        count > raw_count_by_resource[resource_type]
+        for resource_type, count in reduced_count_by_resource.items()
+    ):
+        raise ProviderDirectoryProjectionError(
+            "provider_directory_projection_reduced_resource_mismatch"
+        )
+
+
 def _sealed_reduced_physical_projection_proof(
     recipe: PhysicalProjectionRecipeIdentity,
     ordered_shards: Sequence[ProjectionProofShard],
@@ -2297,7 +2312,11 @@ def reduced_physical_projection_proof(
             shard.partition_id,
         ),
     )
-    _resource_counts(recipe, ordered_shards)
+    _require_reduced_counts_within_raw_shards(
+        recipe,
+        ordered_shards,
+        normalized_count_by_resource,
+    )
     normalized_row_hash = required_hash(
         canonical_row_sha256,
         "canonical_row_sha256",

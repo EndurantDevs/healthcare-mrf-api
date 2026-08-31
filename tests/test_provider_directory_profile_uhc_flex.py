@@ -469,6 +469,7 @@ async def test_artifact_fence_rechecks_exact_flex_readiness(monkeypatch):
         resource_count=3,
         dataset_scoped_ready=True,
         dataset_scoped_variant=LEGACY_PRACTITIONER_VARIANT,
+        dataset_scoped_cohort_complete=True,
         semantic_projection_as_of="2026-08-09",
         source_authority_id="unitedhealthcare",
         admission_id="pdufpa_" + "e" * 48,

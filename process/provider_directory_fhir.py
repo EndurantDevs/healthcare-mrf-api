@@ -14711,6 +14711,7 @@ class ProviderDirectoryArtifactDataset:
     source_verification_contract_hash: str | None = None
     dataset_scoped_ready: bool = False
     dataset_scoped_variant: str | None = None
+    dataset_scoped_cohort_complete: bool | None = None
     semantic_projection_as_of: str | None = None
     source_authority_id: str | None = None
     admission_id: str | None = None
@@ -19866,6 +19867,11 @@ def _artifact_dataset_scoped_state_from_row(
         "dataset_scoped_variant": _clean_text(
             dataset_row_map.get("dataset_scoped_variant")
         ),
+        "dataset_scoped_cohort_complete": (
+            dataset_row_map.get("dataset_scoped_cohort_complete")
+            if type(dataset_row_map.get("dataset_scoped_cohort_complete")) is bool
+            else None
+        ),
         "semantic_projection_as_of": _clean_text(
             dataset_row_map.get("dataset_scoped_projection_as_of")
         ),
@@ -20205,6 +20211,7 @@ def _artifact_endpoint_selection_identity(
         dataset.source_verification_contract_hash,
         dataset.dataset_scoped_ready,
         dataset.dataset_scoped_variant,
+        dataset.dataset_scoped_cohort_complete,
         dataset.semantic_projection_as_of,
         dataset.source_authority_id,
         dataset.admission_id,
