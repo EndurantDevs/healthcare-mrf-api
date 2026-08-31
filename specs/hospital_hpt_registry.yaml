@@ -6093,7 +6093,7 @@ hospitals:
 - hospital_id: hospital-001851
   name: East Alabama
   cms_hpt_url: https://www.tanner.org/cms-hpt.txt
-  locator_mrf_url: https://www.tanner.org/upload/docs/PDFs/FinancialAssistance/475348597_Tanner-Medical-Center-East-Alabama_standardcharges.csv
+  alias_of: hospital-006405
 - hospital_id: hospital-001852
   name: East Alabama Medical Center
   cms_hpt_url: https://www.eastalabamahealth.org/cms-hpt.txt
@@ -21093,11 +21093,11 @@ hospitals:
 - hospital_id: hospital-006402
   name: Tanner Health System
   cms_hpt_url: https://www.tanner.org/cms-hpt.txt
-  locator_mrf_url: https://www.tanner.org/upload/docs/PDFs/FinancialAssistance/582414416_TMC-Higgins-General-Hospital_standardcharges.csv
+  alias_of: hospital-002912
 - hospital_id: hospital-006403
   name: Tanner Health System
   cms_hpt_url: https://www.tanner.org/cms-hpt.txt
-  locator_mrf_url: https://www.tanner.org/upload/docs/PDFs/FinancialAssistance/581790149_Tanner-Medical-Center-Carrollton_standardcharges.csv
+  alias_of: hospital-006404
 - hospital_id: hospital-006404
   name: Tanner Medical Center/Carrollton
   cms_hpt_url: https://www.tanner.org/cms-hpt.txt
@@ -22983,7 +22983,7 @@ hospitals:
 - hospital_id: hospital-006987
   name: Villa Rica
   cms_hpt_url: https://www.tanner.org/cms-hpt.txt
-  locator_mrf_url: https://www.tanner.org/upload/docs/PDFs/FinancialAssistance/582453303_Tanner-Medical-Center-Villa-Rica_standardcharges.csv
+  alias_of: hospital-006406
 - hospital_id: hospital-006988
   name: VIRGINIA GAY HOSPITAL
   cms_hpt_url: https://myvgh.org/cms-hpt.txt
@@ -23573,7 +23573,7 @@ hospitals:
 - hospital_id: hospital-007167
   name: Willowbrooke
   cms_hpt_url: https://www.tanner.org/cms-hpt.txt
-  locator_mrf_url: https://www.tanner.org/upload/docs/PDFs/FinancialAssistance/582453303_TMC-Willowbrooke-at-Tanner_standardcharges.csv
+  alias_of: hospital-007168
 - hospital_id: hospital-007168
   name: Willowbrooke at Tanner
   cms_hpt_url: https://www.tanner.org/cms-hpt.txt
