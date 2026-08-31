@@ -47,14 +47,7 @@ _FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
 } | dict.fromkeys("hospital-002089 hospital-005970 hospital-005971 hospital-005972 hospital-005973 hospital-005974".split(), "7ba5d031cb09651b7e02fab6d11dadc423e561c6d2649835f276188521688ac1")
 _REVIEWED_ALIAS_SAMPLES = {
     f"hospital-{alias}": f"hospital-{canonical}"
-    for pair in (
-        "000061:000060 000064:000063 000123:000122 000162:000161 001486:001483 002520:002519 004667:004666 005329:005328 005563:001678 "
-        "005564:001678 005565:001678 006233:005566 007207:007206 007272:000586 000121:000120 000342:000343 000593:000592 000654:000604 "
-        "000655:000600 000656:000592 000657:000606 000745:000744 002911:000189 005797:005798 005077:005063 006650:006649 003017:003012 "
-        "003068:003013 003069:003014 003070:003015 003071:003016 003072:003019 003073:003018 003074:003020 003075:003021 003076:003022 "
-        "003077:003023 003078:003024 003079:003025 002432:002433 006299:006300 005971:005970 005973:005972 001882:001881 005163:005162 003238:005914 002844:004555 006900:006899 000905:000904"
-    ).split()
-    for alias, canonical in (pair.split(":"),)
+    for alias, canonical in (pair.split(":") for pair in "000061:000060 000064:000063 000123:000122 000162:000161 001486:001483 002520:002519 004667:004666 005329:005328 005563:001678 005564:001678 005565:001678 006233:005566 007207:007206 007272:000586 000121:000120 000342:000343 000593:000592 000654:000604 000655:000600 000656:000592 000657:000606 000745:000744 002911:000189 005797:005798 005077:005063 006650:006649 003017:003012 003068:003013 003069:003014 003070:003015 003071:003016 003072:003019 003073:003018 003074:003020 003075:003021 003076:003022 003077:003023 003078:003024 003079:003025 002432:002433 006299:006300 005971:005970 005973:005972 001882:001881 005163:005162 003238:005914 002844:004555 006900:006899 000905:000904 001851:006405 006402:002912 006403:006404 006987:006406 007167:007168 000229:000231 000230:000232 000806:000807 001263:006172 001264:006171 001265:006173 001266:006174 001267:006175 001270:000805 001272:006200 001273:006207 001274:006208 001275:006209 001276:006203 001280:001277 001533:001535 002319:002318 002377:002378 006164:006161 006190:006191 006212:006205 006215:006201 006225:006204 006226:006206 006237:006234 006263:005494 006264:005641 006265:005787 006549:001253 007234:007237 007235:007236".split())
 }
 _REVIEWED_LOCATOR_NAMES = {
     "hospital-000047": "Adair County Memorial Hospital",
@@ -94,12 +87,18 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 7_074
+    assert len(registry.hospital_hpt_registry_groups()) == 7_038
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
-    assert sum("locator_name" in entry for entry in hospitals) == 1_464
-    assert sum("locator_mrf_url" in entry for entry in hospitals) == 645
+    assert sum("locator_name" in entry for entry in hospitals) == 1_500
+    assert sum("locator_mrf_url" in entry for entry in hospitals) == 641
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 40
+    assert "alias_of" not in hospital_by_id["hospital-001271"]
+    assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
+        "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
+        "finance/price-transparency/741161938-1184622847_chi-st-lukes-health-"
+        "baylor-college-of-medicine-medical-center_standardcharges.json"
+    )
     assert {entry["hospital_id"] for entry in hospitals if "fallback_mrf_url" in entry} == set(
         _FALLBACK_URL_SHA256_BY_HOSPITAL_ID
     )
@@ -142,7 +141,7 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 282
+    assert len(aliases_by_id) == 318
     assert {
         hospital_id: aliases_by_id[hospital_id] for hospital_id in _REVIEWED_ALIAS_SAMPLES
     } == _REVIEWED_ALIAS_SAMPLES
