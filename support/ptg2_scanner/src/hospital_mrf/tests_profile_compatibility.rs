@@ -253,6 +253,31 @@ fn cms_csv_v2_preserves_optional_forward_metadata_without_changing_profile() {
 }
 
 #[test]
+fn cms_csv_v2_label_accepts_a_complete_v3_profile() {
+    for format in [InputFormat::TallCsv, InputFormat::WideCsv] {
+        let payload = match format {
+            InputFormat::TallCsv => fixture_tall_csv(),
+            InputFormat::WideCsv => fixture_wide_csv(),
+            InputFormat::Json => unreachable!(),
+        };
+        let mut records = csv_fixture_records(&payload);
+        let version = csv_fixture_index(&records[0], "version");
+        records[1][version] = "2.0.0".to_owned();
+
+        let (rows, summary) = run_fixture_with_summary(
+            format,
+            &csv_fixture_bytes(&records),
+            false,
+        );
+        assert_eq!(summary.schema_version, "2.0.0");
+        let mrf = String::from_utf8(rows["mrf"].clone()).unwrap();
+        let mrf = mrf.trim_end().split('\t').collect::<Vec<_>>();
+        assert_eq!(mrf[3], "2.0.0");
+        assert_eq!(mrf[4], ATTESTATION_TEXT);
+    }
+}
+
+#[test]
 fn cms_csv_profiles_reject_mixed_and_unsupported_headers() {
     for format in [InputFormat::TallCsv, InputFormat::WideCsv] {
         let mut records = csv_fixture_records(&fixture_v2_csv(format, "2.0.0"));
