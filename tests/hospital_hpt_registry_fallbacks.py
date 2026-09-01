@@ -1,0 +1,57 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+"""Expected URL identities for reviewed hospital MRF fallbacks."""
+
+FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
+    "hospital-000188": "a6632acf6862be3c7ff2ae19b51a2fa0a5da283b7d6a0954ced59e323408f1bc",
+    "hospital-000189": "dff5b72c99a19b8989184eb65b37de4246c4dd3649097b697830fcd8b22638ab",
+    "hospital-000290": "6c50dd498f71ee43bf7c440e1af0d793fdd27a9c593e0adda4121df714cd7740",
+    "hospital-001163": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
+    "hospital-001503": "6c134e170f5dfe9aa4ac2ab2dae9f0523bfa17262bb97813e16f07d2bba14615",
+    "hospital-002432": "f7dde437cb02b9b9662f846b720a82322688a8b682ef402033fcec699e990e59",
+    "hospital-002433": "f7dde437cb02b9b9662f846b720a82322688a8b682ef402033fcec699e990e59",
+    "hospital-002491": "f7e5a19c5a44e85520da233d3d17025d9c834a8f7b817d9f5b7c4ef6596b6e64",
+    "hospital-002911": "dff5b72c99a19b8989184eb65b37de4246c4dd3649097b697830fcd8b22638ab",
+    "hospital-003312": "75d4e626daf0db2c1e53cc903f3669d04339bbffb8891f92dd588c7fa3d0316f",
+    "hospital-004916": "c8510071aef0cd3fe464130c0b560eb8fe1d9e54d7e64157d60e2249c476bb96",
+    "hospital-004917": "701e62e52bc2e8b7578ae2efcab4140721e5b79361bb215fcfc97c3e55decaeb",
+    "hospital-004918": "05e6d19688aebd5371f9d00e0e0294242fc39eeec04c4a3449f9c6da0f6cbff8",
+    "hospital-004965": "a8a7ac615cb9d18e07dc9967fed29730d16bddee79221c6291f86d6b088e5df7",
+    "hospital-004977": "cfd65bf3bb5efc2b8f95d805436b72730f5e36b46cd526feddbdc8d034c9b2d7",
+    "hospital-004979": "dee8d2ff24f723f64f41aa8c576ad18113657d7e11b0b59a392c58fd8acb765d",
+    "hospital-005156": "180a1ae8dfcb952d7189c1c9ffb03ad121835699375b1e4ef9734c0764151192",
+    "hospital-005608": "00f218c51149bc2237e87924d78a7e244607d53421e5cd18943a26a9f9e7c9c5",
+    "hospital-005609": "00f218c51149bc2237e87924d78a7e244607d53421e5cd18943a26a9f9e7c9c5",
+    "hospital-005957": "a64e4900fd1c12cb9cb2837bca90a411dfaf72387cf4f2a135cfbd5922c0274c",
+    "hospital-006053": "4d983a60e26bb91ee01c54bf194c91bc6a5d2b6215807af651dc96950ff55a6b",
+    "hospital-006299": "ec8f9399aa1d3a3664558303ab68213f7ee92dbc4c84ecbe39f675b54efee075",
+    "hospital-006300": "ec8f9399aa1d3a3664558303ab68213f7ee92dbc4c84ecbe39f675b54efee075",
+    "hospital-006471": "dc7b9213c55ff2a6d9626a7841c532b5e7ebf1dce51e17efda59ead2c3f17de4",
+    "hospital-006488": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
+    "hospital-006502": "75d4e626daf0db2c1e53cc903f3669d04339bbffb8891f92dd588c7fa3d0316f",
+    "hospital-006547": "4001360464d0b094a10df3bd688d3879f0bc0d6c07ee966021772d689f0aebf7",
+    "hospital-006620": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
+    "hospital-006621": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
+    "hospital-006622": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
+    "hospital-006635": "587c428f38fdc873612470c48e12b13a0405f0a63fe572f61a8c2702d208c6df",
+    "hospital-007195": "4001360464d0b094a10df3bd688d3879f0bc0d6c07ee966021772d689f0aebf7",
+    "hospital-007318": "923f885b47e27d492d193557d2cd671f0d0a63becb3c971ad9092f794fea2b36",
+    "hospital-007340": "0e057fbfbc92c7cdfa98bfdd02a06c7f2ce7eb5fe9b48eddac785ed1686fe27c",
+} | dict.fromkeys(
+    "hospital-002089 hospital-005970 hospital-005971 hospital-005972 "
+    "hospital-005973 hospital-005974".split(),
+    "7ba5d031cb09651b7e02fab6d11dadc423e561c6d2649835f276188521688ac1",
+) | dict.fromkeys(
+    "hospital-001160 hospital-001161 hospital-002121 hospital-002122".split(),
+    "e8f3b1e6b76fac20b1f8b2a8a5ed39fcd5ca386e82e23ecf66293563a1bc598b",
+) | dict.fromkeys(
+    "hospital-001891 hospital-002097 hospital-002098 hospital-002105 "
+    "hospital-006938".split(),
+    "0a909db3c58d68731aae3c199d2b700174d423154d92de161f1abcc54da188fc",
+) | dict.fromkeys(
+    "hospital-002093 hospital-002094 hospital-002103 hospital-002868".split(),
+    "5b1a8c6d0978a3aaaeb9764452d99a3a0c9a91a8bc4012f4972a6837aedbcca9",
+) | dict.fromkeys(
+    "hospital-002114 hospital-005881 hospital-006347".split(),
+    "baebd6bc7849ab39464dd0f201f872b0f20042f82092612c7309712ce861417f",
+)
