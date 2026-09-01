@@ -2766,6 +2766,7 @@ hospitals:
 - hospital_id: hospital-000833
   name: Beckett Springs Changes
   cms_hpt_url: https://www.beckettsprings.com/cms-hpt.txt
+  locator_name: Beckett Springs
 - hospital_id: hospital-000834
   name: Beebe Healthcare - Margaret H Rollins Lewes Campus
   cms_hpt_url: https://beebehealthcare.org/cms-hpt.txt
@@ -2999,6 +3000,7 @@ hospitals:
 - hospital_id: hospital-000902
   name: Blackberry Center Behavioral Hospital
   cms_hpt_url: https://www.theblackberrycenter.com/cms-hpt.txt
+  alias_of: hospital-000901
 - hospital_id: hospital-000903
   name: Bladen County Hospital
   cms_hpt_url: https://www.capefearvalley.com/cms-hpt.txt
@@ -3983,6 +3985,7 @@ hospitals:
 - hospital_id: hospital-001199
   name: Changes Cottonwood Springs
   cms_hpt_url: https://cottonwoodsprings.com/cms-hpt.txt
+  locator_name: Cottonwood Springs
 - hospital_id: hospital-001200
   name: Changes Denver Springs
   cms_hpt_url: https://denversprings.com/cms-hpt.txt
@@ -11240,6 +11243,7 @@ hospitals:
 - hospital_id: hospital-003410
   name: Klickitat Valley Hospital
   cms_hpt_url: https://kvhealth.net/cms-hpt.txt
+  alias_of: hospital-003409
 - hospital_id: hospital-003411
   name: Knapp Medical Center
   cms_hpt_url: https://knappmed.org/cms-hpt.txt
@@ -16099,6 +16103,7 @@ hospitals:
 - hospital_id: hospital-004869
   name: OSAGE BEACH
   cms_hpt_url: https://nhccare.com/cms-hpt.txt
+  alias_of: hospital-004870
 - hospital_id: hospital-004870
   name: Osage Beach Center for Behavioral Health
   cms_hpt_url: https://nhccare.com/cms-hpt.txt
@@ -17099,6 +17104,7 @@ hospitals:
 - hospital_id: hospital-005186
   name: Port St Lucie Behavioral Hospital
   cms_hpt_url: https://www.portstluciehospitalinc.com/cms-hpt.txt
+  alias_of: hospital-005187
 - hospital_id: hospital-005187
   name: Port St Lucie Hospital
   cms_hpt_url: https://www.portstluciehospitalinc.com/cms-hpt.txt
@@ -17649,6 +17655,7 @@ hospitals:
 - hospital_id: hospital-005357
   name: Rehabilitation Hospital of Indana
   cms_hpt_url: https://www.rhirehab.com/cms-hpt.txt
+  alias_of: hospital-005358
 - hospital_id: hospital-005358
   name: Rehabilitation Hospital of Indiana
   cms_hpt_url: https://www.rhirehab.com/cms-hpt.txt
@@ -20683,6 +20690,7 @@ hospitals:
 - hospital_id: hospital-006266
   name: St. Thomas Hospital for Specialty Surgery
   cms_hpt_url: http://www.sthspecialtysurgery.com/cms-hpt.txt
+  alias_of: hospital-005582
 - hospital_id: hospital-006267
   name: St. Thomas More Hospital
   cms_hpt_url: https://www.mountain.commonspirit.org/cms-hpt.txt
@@ -20742,6 +20750,7 @@ hospitals:
 - hospital_id: hospital-006285
   name: Starr Regional Medical Center - Athens
   cms_hpt_url: https://www.starrregional.com/cms-hpt.txt
+  alias_of: hospital-006284
 - hospital_id: hospital-006286
   name: STAT Emergency Center – Laredo South
   cms_hpt_url: https://statspecialtyhospital.com/cms-hpt.txt
@@ -20891,9 +20900,11 @@ hospitals:
 - hospital_id: hospital-006330
   name: STRHS Lawrenceburg
   cms_hpt_url: https://www.southerntnlawrenceburg.com/cms-hpt.txt
+  alias_of: hospital-005919
 - hospital_id: hospital-006331
   name: STRHS Pulaski
   cms_hpt_url: https://www.southerntnpulaski.com/cms-hpt.txt
+  alias_of: hospital-005920
 - hospital_id: hospital-006332
   name: STRHS Winchester
   cms_hpt_url: https://www.highpointhealthsystem.com/cms-hpt.txt
@@ -21954,6 +21965,7 @@ hospitals:
 - hospital_id: hospital-006651
   name: Twin County Regional Healthcare
   cms_hpt_url: https://www.tcrh.org/cms-hpt.txt
+  alias_of: hospital-006652
 - hospital_id: hospital-006652
   name: Twin County Regional Hospital
   cms_hpt_url: https://www.tcrh.org/cms-hpt.txt
