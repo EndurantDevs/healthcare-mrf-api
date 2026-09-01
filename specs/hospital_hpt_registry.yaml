@@ -10403,6 +10403,7 @@ hospitals:
 - hospital_id: hospital-003145
   name: INTERMOUNTAIN HEALTH GOOD SAMARITAN HOSPITAL
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
+  locator_name: Intermountain Health Good Samaritan Medical Center
 - hospital_id: hospital-003146
   name: Intermountain Health Good Samaritan Medical Center
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
@@ -10412,6 +10413,7 @@ hospitals:
 - hospital_id: hospital-003148
   name: INTERMOUNTAIN HEALTH HOLY ROSARY HOSPITAL
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
+  locator_name: Holy Rosary Healthcare
 - hospital_id: hospital-003149
   name: Intermountain Health Intermountain Medical Center
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
@@ -10439,13 +10441,21 @@ hospitals:
 - hospital_id: hospital-003157
   name: INTERMOUNTAIN HEALTH PLATTE VALLEY MEDICAL CENTER
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
-- hospital_ids:
-  - hospital-003158
-  - hospital-003159
-  - hospital-003160
+  locator_name: Platte Valley Medical Center
+- hospital_id: hospital-003158
   name: Intermountain Health Primary Children's Hospital
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
+  locator_mrf_url: https://intermountainhealthcare.org/-/media/files/intermountain-health/locations/hospital-prices/942854057_primary-childrens-hospital_lehi_standardcharges.ashx
+- hospital_id: hospital-003159
+  name: Intermountain Health Primary Children's Hospital
+  cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
+  locator_mrf_url: https://intermountainhealthcare.org/-/media/files/intermountain-health/locations/hospital-prices/942854057_primary-childrens-hospital_taylorsville_standardcharges.ashx
+- hospital_id: hospital-003160
+  name: Intermountain Health Primary Children's Hospital
+  cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
+  locator_mrf_url: https://intermountainhealthcare.org/-/media/files/intermountain-health/locations/hospital-prices/942854057_primary-childrens-hospital_standardcharges.ashx
 - hospital_id: hospital-003161
+  alias_of: hospital-003159
   name: Intermountain Health Primary Children's Hospital - Behavioral Health Center
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
 - hospital_id: hospital-003162
@@ -10454,6 +10464,7 @@ hospitals:
 - hospital_id: hospital-003163
   name: INTERMOUNTAIN HEALTH SAINT JOSEPH HOSPITAL
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
+  locator_name: Saint Joseph Hospital
 - hospital_id: hospital-003164
   name: Intermountain Health Sanpete Valley Hospital
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
@@ -10469,16 +10480,20 @@ hospitals:
 - hospital_id: hospital-003168
   name: INTERMOUNTAIN HEALTH ST. JAMES HOSPITAL
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
+  locator_name: St. James Healthcare
 - hospital_id: hospital-003169
   name: INTERMOUNTAIN HEALTH ST. MARY'S REGIONAL HOSPITAL
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
+  locator_name: St. Mary's Medical Center
 - hospital_id: hospital-003170
   name: INTERMOUNTAIN HEALTH ST. VINCENT REGIONAL HOSPITAL
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
+  locator_name: St. Vincent Healthcare
 - hospital_id: hospital-003171
   name: Intermountain Health Utah Valley Hospital
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
 - hospital_id: hospital-003172
+  alias_of: hospital-003160
   name: Intermountain Primary Children's Hospital
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
 - hospital_id: hospital-003173
