@@ -42,10 +42,33 @@ fn v2_charge_free_payers_are_omitted_and_v3_rejects_them() {
                 .unwrap();
             v2_records[3][index].clear();
         }
+        if format == InputFormat::TallCsv {
+            let methodology = v2_records[2]
+                .iter()
+                .position(|header| header.contains("methodology"))
+                .unwrap();
+            v2_records[3][methodology].clear();
+        }
         assert!(run_fixture(format, &csv_fixture_bytes(&v2_records), false)
             ["payer_charge"]
             .is_empty());
     }
+
+    let mut estimated_only_v2_tall =
+        csv_fixture_records(&fixture_v2_csv(InputFormat::TallCsv, "2.0.0"));
+    for header in ["negotiated_percentage", "methodology"] {
+        let index = estimated_only_v2_tall[2]
+            .iter()
+            .position(|candidate| candidate.contains(header))
+            .unwrap();
+        estimated_only_v2_tall[3][index].clear();
+    }
+    assert_import_error(
+        InputFormat::TallCsv,
+        &csv_fixture_bytes(&estimated_only_v2_tall),
+        DEFAULT_MAX_FANOUT_ROWS,
+        "invalid standard charge methodology",
+    );
 
     let mut v3_tall = csv_fixture_records(&fixture_tall_csv());
     let dollar = v3_tall[2]
