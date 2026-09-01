@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -101,6 +102,47 @@ async def test_control_catalog_falls_back_on_optional_database_failures(
             "profile_selection_request": selection_payload,
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_control_catalog_bounds_optional_outcome_enrichment(monkeypatch):
+    static_map = {"catalog_digest": "a" * 64, "items": []}
+    selection_payload = _profile_selection_request()
+    blocked = asyncio.Event()
+
+    async def blocked_enrichment(_static_map):
+        await blocked.wait()
+
+    monkeypatch.setattr(
+        control_catalog,
+        "provider_directory_source_catalog",
+        lambda: static_map,
+    )
+    monkeypatch.setattr(
+        control_catalog,
+        "current_profile_selection_request",
+        AsyncMock(return_value=selection_payload),
+    )
+    monkeypatch.setattr(
+        control_catalog,
+        "enrich_provider_directory_source_catalog",
+        blocked_enrichment,
+    )
+    monkeypatch.setattr(
+        control_catalog,
+        "_OUTCOME_ENRICHMENT_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    catalog_map = await asyncio.wait_for(
+        control_catalog.provider_directory_control_catalog(),
+        timeout=1,
+    )
+
+    assert catalog_map == {
+        **static_map,
+        "profile_selection_request": selection_payload,
+    }
 
 
 @asynccontextmanager
