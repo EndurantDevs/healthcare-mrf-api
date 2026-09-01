@@ -99,6 +99,10 @@ from api.plan_pricing_projection import (
     PlanPricingProjectionUnsupported,
     projection_result_type,
 )
+from api.plan_pricing_em_distance import (
+    em_distance_retry_option,
+    is_em_distance_projection_ready,
+)
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
 from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from api.provider_demographic_filters import (
@@ -1324,7 +1328,17 @@ def _reject_broad_group_plan_provider_expansion(
     has_bounded_location = bool(
         zip5 or (latitude is not None and longitude is not None)
     )
-    if has_taxonomy_scope and has_bounded_location:
+    if has_bounded_location and (
+        has_taxonomy_scope
+        or (
+            str(args.get("order_by") or "").strip().lower()
+            in {"distance", "distance_miles"}
+            and (
+                _request_value_or_none(args.get("order")) is None
+                or str(args.get("order")).strip().lower() == "asc"
+            )
+        )
+    ):
         return
     _raise_broad_group_plan_provider_expansion(has_taxonomy_scope=has_taxonomy_scope)
 
@@ -12291,7 +12305,7 @@ async def list_providers_by_procedure(request):
     specialty = str(args.get("specialty", "")).strip().lower()
     query_text = str(args.get("q", "")).strip().lower()
     code = str(args.get("code", "")).strip()
-    order = _normalize_order(args.get("order"))
+    order = _normalize_order(_request_value_or_none(args.get("order")))
     order_by = str(args.get("order_by") or "total_allowed_amount")
     ptg_code_system = args.get("code_system") or (_reported_procedure_code_system(code) if code else None)
     include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
@@ -12360,6 +12374,7 @@ async def list_providers_by_procedure(request):
             _raise_unresolved_specialty(specialty_probe)
     broad_expansion_market_type = plan_market_type
     release_selection = None
+    guard_release_selection = None
     release_selection_args_by_name = {}
     if plan_release_id and _is_broad_office_visit_cpt(
         ptg_code_system,
@@ -12372,24 +12387,65 @@ async def list_providers_by_procedure(request):
         broad_expansion_market_type = _release_market_type_for_guard(
             guard_release_selection
         )
-    _reject_broad_group_plan_provider_expansion(
-        args,
-        {
-            "code": code,
-            "code_system": ptg_code_system,
-            "plan_id": plan_id,
-            "plan_external_id": plan_external_id or plan_release_id,
-            "plan_market_type": broad_expansion_market_type,
-            "state": state,
-            "city": city,
-            "zip5": zip5,
-            "latitude": latitude,
-            "longitude": longitude,
-            "npi": npi,
-            "provider_sex_code": provider_sex_code,
-        },
-        specialty_filter=ptg_specialty_filter,
+    office_visit_retry_by_field = (
+        em_distance_retry_option(args, pagination)
+        if guard_release_selection is not None
+        else None
     )
+    is_broad_office_visit_refused = False
+    try:
+        _reject_broad_group_plan_provider_expansion(
+            args,
+            {
+                "code": code,
+                "code_system": ptg_code_system,
+                "plan_id": plan_id,
+                "plan_external_id": plan_external_id or plan_release_id,
+                "plan_market_type": broad_expansion_market_type,
+                "state": state,
+                "city": city,
+                "zip5": zip5,
+                "latitude": latitude,
+                "longitude": longitude,
+                "npi": npi,
+                "provider_sex_code": provider_sex_code,
+            },
+            specialty_filter=ptg_specialty_filter,
+        )
+    except InvalidUsage:
+        if guard_release_selection is None or office_visit_retry_by_field is None:
+            raise
+        is_broad_office_visit_refused = True
+    if is_broad_office_visit_refused:
+        is_projection_ready = await is_em_distance_projection_ready(
+            session,
+            guard_release_selection,
+        )
+        return _ptg_json_response(
+            request,
+            {
+                "status": 422,
+                "code": "ptg2_provider_scope_refused",
+                "message": (
+                    "This cost-ordered geographic procedure search exceeds "
+                    "the interactive scope limit."
+                ),
+                "fix_it": {
+                    "reason": (
+                        "Use the bounded ascending-distance provider lane."
+                        if is_projection_ready
+                        else "No verified interactive retry shape is available "
+                        "for this release."
+                    ),
+                    "retry_options": (
+                        [office_visit_retry_by_field]
+                        if is_projection_ready
+                        else []
+                    ),
+                },
+            },
+            status=422,
+        )
     if plan_release_id:
         if projected_result_type is not None:
             release_selection = await resolve_plan_release_serving(
@@ -12413,7 +12469,7 @@ async def list_providers_by_procedure(request):
     if plan_id or plan_external_id or source_key or snapshot_id or plan_release_id:
         ptg_order_by = order_by
         if (
-            args.get("order_by") in (None, "", "null")
+            _request_value_or_none(args.get("order_by")) is None
             and ptg_code_system == "HCPCS"
             and code[:1].isalpha()
             and (zip5 or (latitude is not None and longitude is not None))
@@ -12435,7 +12491,7 @@ async def list_providers_by_procedure(request):
                     ptg_longitude = zip_longitude
                     ptg_radius_miles = zip_radius_miles
         ptg_order = order
-        if args.get("order") in (None, "", "null"):
+        if _request_value_or_none(args.get("order")) is None:
             ptg_order = "asc"
         ptg_args_by_name = {
                 "plan_id": plan_id or None,
@@ -12513,6 +12569,32 @@ async def list_providers_by_procedure(request):
                 isinstance(exc, PTG2LocationScopeError)
                 and exc.allows_distance_retry
             )
+            is_office_visit = _is_broad_office_visit_cpt(
+                ptg_args_by_name.get("code_system"),
+                str(ptg_args_by_name.get("code") or ""),
+            )
+            retry_option = (
+                em_distance_retry_option(ptg_args_by_name, pagination)
+                if is_office_visit
+                else {
+                    "order_by": "distance",
+                    "order": "asc",
+                    "include_providers": True,
+                }
+            )
+            retry_ready = bool(
+                retry_option is not None
+                and (
+                    not is_office_visit
+                    or (
+                        release_selection is not None
+                        and await is_em_distance_projection_ready(
+                            session,
+                            release_selection,
+                        )
+                    )
+                )
+            )
             return _ptg_json_response(
                 request,
                 {
@@ -12533,13 +12615,8 @@ async def list_providers_by_procedure(request):
                             "for this request."
                         ),
                         "retry_options": (
-                            [
-                                {
-                                    "order_by": "distance",
-                                    "include_providers": True,
-                                }
-                            ]
-                            if allows_distance_retry
+                            [retry_option]
+                            if allows_distance_retry and retry_ready
                             else []
                         ),
                     },

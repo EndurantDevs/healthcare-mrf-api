@@ -62,6 +62,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
             "ptg-candidate-audit",
             "plan-pricing-projection",
             "plan-pricing-prewarm",
+            "plan-pricing-em-distance",
         ),
     ),
     WorkerSpec("arq:MRF", "process.MRF", ("mrf",)),
@@ -1353,6 +1354,7 @@ def _single_job_worker_target(
     projection_job_prefix_by_importer = {
         "plan-pricing-projection": "plan_pricing_projection",
         "plan-pricing-prewarm": "plan_pricing_prewarm",
+        "plan-pricing-em-distance": "plan_pricing_em_distance",
     }
     importer = str(payload.get("importer") or "").strip()
     if importer in projection_job_prefix_by_importer and run_id:

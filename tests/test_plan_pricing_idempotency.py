@@ -16,18 +16,22 @@ from db.models import ImportRun
 
 
 def _durable_import_request(importer: str, run_id: str) -> dict:
-    params_by_name = (
-        {
+    if importer == "plan-pricing-prewarm":
+        params_by_name = {
             "plan_release_id": "hprelease_" + "2" * 26,
             "serving_revision_id": "hpserve_" + "3" * 26,
             "projection_id": "a" * 64,
         }
-        if importer == "plan-pricing-prewarm"
-        else {
+    elif importer == "plan-pricing-em-distance":
+        params_by_name = {
+            "plan_release_id": "hprelease_" + "2" * 26,
+            "serving_revision_id": "hpserve_" + "3" * 26,
+        }
+    else:
+        params_by_name = {
             "binding_manifest_digest": "b" * 64,
             "bindings": [{"snapshot_id": "synthetic"}],
         }
-    )
     return {
         "run_id": run_id,
         "importer": importer,
@@ -41,7 +45,7 @@ def _projection_migration():
         Path(__file__).resolve().parents[1]
         / "alembic"
         / "versions"
-        / "20260825150000_plan_pricing_card_projection.py"
+        / "20260901103000_plan_pricing_em_distance.py"
     )
     module_spec = importlib.util.spec_from_file_location(
         "plan_pricing_idempotency_migration",
@@ -70,32 +74,36 @@ def test_plan_pricing_all_status_index_matches_model_and_migration(
         "unique": True,
         "where": (
             "importer IN ('plan-pricing-projection', "
-            "'plan-pricing-prewarm') AND idempotency_key IS NOT NULL"
+            "'plan-pricing-prewarm', 'plan-pricing-em-distance') "
+            "AND idempotency_key IS NOT NULL"
         ),
     }
     migration = _projection_migration()
     statements = []
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "projection_test")
-    monkeypatch.setattr(migration, "_create_zip_index", lambda _schema: None)
     monkeypatch.setattr(migration.op, "execute", statements.append)
 
     migration.upgrade()
 
     statement = " ".join(" ".join(statements).split())
-    assert "CREATE UNIQUE INDEX IF NOT EXISTS" in statement
+    assert "CREATE UNIQUE INDEX" in statement
     assert "import_run_plan_pricing_idempotency_idx" in statement
     assert (
         'ON "projection_test"."import_run" (importer, idempotency_key)'
         in statement
     )
-    assert "'plan-pricing-projection', 'plan-pricing-prewarm'" in statement
+    assert "'plan-pricing-em-distance'" in statement
     assert "AND idempotency_key IS NOT NULL" in statement
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "importer",
-    ("plan-pricing-projection", "plan-pricing-prewarm"),
+    (
+        "plan-pricing-projection",
+        "plan-pricing-prewarm",
+        "plan-pricing-em-distance",
+    ),
 )
 async def test_terminal_plan_pricing_idempotency_replays_succeeded_run(
     monkeypatch,
@@ -135,7 +143,11 @@ async def test_terminal_plan_pricing_idempotency_replays_succeeded_run(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "importer",
-    ("plan-pricing-projection", "plan-pricing-prewarm"),
+    (
+        "plan-pricing-projection",
+        "plan-pricing-prewarm",
+        "plan-pricing-em-distance",
+    ),
 )
 async def test_plan_pricing_integrity_race_replays_terminal_owner(
     monkeypatch,
