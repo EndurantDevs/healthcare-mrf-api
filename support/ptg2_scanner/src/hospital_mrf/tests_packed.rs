@@ -42,7 +42,7 @@ fn packed_v2_facts_keep_estimated_and_comparison_amounts_distinct() {
     let payload = serde_json::to_vec(&payload).unwrap();
     let (directory, summary) = import_packed_json(&payload, TEST_MAX_OUTPUT_BYTES);
     assert_eq!(summary.schema_version, "2.2.1");
-    assert_eq!(summary.contract, "hospital-mrf-copy-v2-v3-packed-v4");
+    assert_eq!(summary.contract, "hospital-mrf-copy-v2-v3-packed-v5");
     let payloads = super::packed_output_tests::payloads(
         &directory.path().join("output/fact_block.copy"),
     );
@@ -80,7 +80,7 @@ fn packed_v2_facts_keep_estimated_and_comparison_amounts_distinct() {
     )
     .unwrap();
     assert_eq!(zipped.schema_version, "2.2.1");
-    assert_eq!(zipped.contract, "hospital-mrf-copy-v2-v3-packed-v4");
+    assert_eq!(zipped.contract, "hospital-mrf-copy-v2-v3-packed-v5");
     assert_eq!(
         summary
             .artifacts
@@ -229,7 +229,7 @@ fn packed_mode_rejects_nul_in_each_packed_row_kind() {
 fn packed_mode_emits_ordered_artifacts_root_and_shared_budget() {
     let payload = fixture_json();
     let (directory, summary) = import_packed_json(&payload, TEST_MAX_OUTPUT_BYTES);
-    assert_eq!(summary.contract, "hospital-mrf-copy-v2-v3-packed-v4");
+    assert_eq!(summary.contract, "hospital-mrf-copy-v2-v3-packed-v5");
     assert_eq!(summary.schema_revision, HOSPITAL_MRF_PACKED_SCHEMA_REVISION);
     assert_eq!(
         summary

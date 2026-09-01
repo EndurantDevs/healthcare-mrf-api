@@ -24,14 +24,15 @@ def test_native_summary_accepts_supported_source_schema_versions(
     assert _validate_packed_summary(summary, tmp_path).schema_version == schema_version
 
 
+@pytest.mark.parametrize("schema_version", ("2", "2.0.0"))
 @pytest.mark.parametrize("source_format", ("csv-tall", "csv-wide"))
-def test_native_summary_accepts_csv_v20_without_admitting_json_v20(
-    tmp_path, source_format
+def test_native_summary_accepts_csv_v2_versions_without_admitting_json(
+    tmp_path, source_format, schema_version
 ):
     summary = _packed_summary(tmp_path)
-    summary.update(schema_version="2.0.0", format=source_format)
+    summary.update(schema_version=schema_version, format=source_format)
 
-    assert _validate_packed_summary(summary, tmp_path).schema_version == "2.0.0"
+    assert _validate_packed_summary(summary, tmp_path).schema_version == schema_version
 
     summary["format"] = "json"
     with pytest.raises(ValueError, match="contract"):

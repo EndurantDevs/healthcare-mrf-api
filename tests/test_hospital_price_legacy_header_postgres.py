@@ -17,9 +17,11 @@ from support.hospital_price_native_validation import (
     HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V2_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V3_PARSER_CONTRACT_SHA256,
+    HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
 )
 from tests.test_hospital_price_storage import (
+    CSV_SHORT_V2_MIGRATION_PATH,
     CSV_TRANSITION_MIGRATION_PATH,
     LEGACY_HEADER_MIGRATION_PATH,
     _database_url,
@@ -44,6 +46,7 @@ def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
     assert HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256 in model_sql
     assert HOSPITAL_MRF_PACKED_V2_PARSER_CONTRACT_SHA256 in model_sql
     assert HOSPITAL_MRF_PACKED_V3_PARSER_CONTRACT_SHA256 in model_sql
+    assert HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256 in model_sql
     assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in model_sql
     assert "template_version = '3.0.0' AND npi_count > 0" in model_sql
     assert "template_version IN ('2.0.0', '2.2.0', '2.2.1')" in model_sql
@@ -65,7 +68,15 @@ def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
     assert transition.down_revision == "20260831100000_hospital_price_legacy_header"
     transition_sql = inspect.getsource(transition.upgrade)
     assert HOSPITAL_MRF_PACKED_V3_PARSER_CONTRACT_SHA256 in transition_sql
-    assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in transition_sql
+    assert HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256 in transition_sql
+    short_v2 = _load_migration(CSV_SHORT_V2_MIGRATION_PATH)
+    assert short_v2.revision == "20260901000000_hospital_price_csv_short_v2"
+    assert short_v2.down_revision == (
+        "20260831180000_hospital_price_csv_transition_metadata"
+    )
+    short_v2_sql = inspect.getsource(short_v2.upgrade)
+    assert HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256 in short_v2_sql
+    assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in short_v2_sql
 
 
 async def _insert_header(
@@ -167,10 +178,22 @@ async def _assert_forward_metadata_constraints(
         "attester_name": "Ben Levin",
         "npi_count": 1,
     }
+    short_v2_record = await connection.fetchrow(
+        f"SELECT parser_contract_sha256, source_format, template_version "
+        f"FROM {quoted}.hospital_price_version WHERE version_id=$1",
+        "5" * 64,
+    )
+    assert dict(short_v2_record) == {
+        "parser_contract_sha256": HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
+        "source_format": "csv-wide",
+        "template_version": "2",
+    }
     for version_id, invalid_set in (
         ("c" * 64, "attester_name='   '"),
         ("6" * 64, "npi_count=1, attester_name='Unexpected'"),
         ("8" * 64, "npi_count=0"),
+        ("4" * 64, "template_version='2'"),
+        ("5" * 64, "source_format='json'"),
     ):
         with pytest.raises(asyncpg.CheckViolationError):
             await connection.execute(
@@ -241,6 +264,13 @@ async def _prove_current_headers(database_url, quoted: str) -> None:
     try:
         for fields in (
             {
+                "version_id": "5" * 64,
+                "source_format": "csv-wide",
+                "template_version": "2",
+                "attester_name": None,
+                "npi_count": 0,
+            },
+            {
                 "version_id": "c" * 64,
                 "source_format": "csv-tall",
                 "template_version": "2.0.0",
@@ -273,6 +303,25 @@ async def _prove_current_headers(database_url, quoted: str) -> None:
         await connection.close()
 
 
+async def _seed_packed_v4_header(database_url, quoted: str) -> None:
+    connection = await asyncpg.connect(
+        str(database_url.set(drivername="postgresql"))
+    )
+    try:
+        await _insert_header(
+            connection,
+            quoted,
+            version_id="4" * 64,
+            parser_contract_sha256=HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256,
+            source_format="csv-tall",
+            template_version="2.0.0",
+            attester_name=None,
+            npi_count=0,
+        )
+    finally:
+        await connection.close()
+
+
 @pytest.mark.asyncio
 async def test_postgres_legacy_header_keeps_absent_fields_absent(monkeypatch) -> None:
     """Keep deployed packed-v2 rows while enforcing the current contract."""
@@ -295,6 +344,10 @@ async def test_postgres_legacy_header_keeps_absent_fields_absent(monkeypatch) ->
         await _seed_packed_v3_headers(database_url, quoted)
         await _run_migration(
             engine, _load_migration(CSV_TRANSITION_MIGRATION_PATH), "upgrade"
+        )
+        await _seed_packed_v4_header(database_url, quoted)
+        await _run_migration(
+            engine, _load_migration(CSV_SHORT_V2_MIGRATION_PATH), "upgrade"
         )
         await _prove_current_headers(database_url, quoted)
     finally:

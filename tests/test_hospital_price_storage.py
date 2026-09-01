@@ -42,6 +42,9 @@ CSV_TRANSITION_MIGRATION_PATH = (
     ROOT
     / "alembic/versions/20260831180000_hospital_price_csv_transition_metadata.py"
 )
+CSV_SHORT_V2_MIGRATION_PATH = (
+    ROOT / "alembic/versions/20260901000000_hospital_price_csv_short_v2.py"
+)
 POSTGRES_DSN_ENV = "HLTHPRT_HOSPITAL_PRICE_MIGRATION_POSTGRES_DSN"
 DATABASE_RE = re.compile(
     r"^(?:hospital_price_schema_test_[a-z0-9_]+|ptg2_v3_lifecycle_test_ci_runner)$"

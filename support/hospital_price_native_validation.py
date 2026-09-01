@@ -31,8 +31,12 @@ HOSPITAL_MRF_PACKED_V3_PARSER_CONTRACT_SHA256 = hashlib.sha256(
     b"hospital-mrf-copy-v2-v3-packed-v3-resource-bounded:"
     b"hospital-mrf-packed-blocks-v3"
 ).hexdigest()
+HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256 = hashlib.sha256(
+    b"hospital-mrf-copy-v2-v3-packed-v4-resource-bounded:"
+    b"hospital-mrf-packed-blocks-v3"
+).hexdigest()
 HOSPITAL_MRF_SCHEMA_REVISION = "hospital-mrf-packed-blocks-v3"
-HOSPITAL_MRF_SUMMARY_CONTRACT = "hospital-mrf-copy-v2-v3-packed-v4"
+HOSPITAL_MRF_SUMMARY_CONTRACT = "hospital-mrf-copy-v2-v3-packed-v5"
 HOSPITAL_MRF_PARSER_CONTRACT = (
     f"{HOSPITAL_MRF_SUMMARY_CONTRACT}-resource-bounded:"
     f"{HOSPITAL_MRF_SCHEMA_REVISION}"
@@ -85,8 +89,8 @@ HOSPITAL_MRF_COPY_COLUMNS = {
 _REQUIRED_NONEMPTY_RELATIONS = frozenset({"mrf", "location", "license"})
 _SOURCE_SCHEMA_VERSIONS = {
     "json": frozenset({"2.2.0", "2.2.1", "3.0.0"}),
-    "csv-tall": frozenset({"2.0.0", "2.2.0", "2.2.1", "3.0.0"}),
-    "csv-wide": frozenset({"2.0.0", "2.2.0", "2.2.1", "3.0.0"}),
+    "csv-tall": frozenset({"2", "2.0.0", "2.2.0", "2.2.1", "3.0.0"}),
+    "csv-wide": frozenset({"2", "2.0.0", "2.2.0", "2.2.1", "3.0.0"}),
 }
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _U64_MAX = (1 << 64) - 1

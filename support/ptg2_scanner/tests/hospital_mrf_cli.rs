@@ -298,7 +298,7 @@ fn production_binary_imports_json_tall_wide_gzip_and_one_member_zip() {
     let packed_summary: serde_json::Value = serde_json::from_slice(&packed.stdout).unwrap();
     assert_eq!(
         packed_summary["contract"],
-        "hospital-mrf-copy-v2-v3-packed-v4"
+        "hospital-mrf-copy-v2-v3-packed-v5"
     );
     assert_eq!(packed_summary["artifacts"].as_array().unwrap().len(), 10);
     assert_eq!(packed_summary["root"]["fact_count"], 1);
