@@ -13,6 +13,7 @@ FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-002491": "f7e5a19c5a44e85520da233d3d17025d9c834a8f7b817d9f5b7c4ef6596b6e64",
     "hospital-002911": "dff5b72c99a19b8989184eb65b37de4246c4dd3649097b697830fcd8b22638ab",
     "hospital-003312": "75d4e626daf0db2c1e53cc903f3669d04339bbffb8891f92dd588c7fa3d0316f",
+    "hospital-004321": "de99971601eb08611b738e05ec8aee0b9eb0e3e17816a96b0f4acba037f3f84a",
     "hospital-004916": "c8510071aef0cd3fe464130c0b560eb8fe1d9e54d7e64157d60e2249c476bb96",
     "hospital-004917": "701e62e52bc2e8b7578ae2efcab4140721e5b79361bb215fcfc97c3e55decaeb",
     "hospital-004918": "05e6d19688aebd5371f9d00e0e0294242fc39eeec04c4a3449f9c6da0f6cbff8",
@@ -38,6 +39,9 @@ FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "hospital-007318": "923f885b47e27d492d193557d2cd671f0d0a63becb3c971ad9092f794fea2b36",
     "hospital-007340": "0e057fbfbc92c7cdfa98bfdd02a06c7f2ce7eb5fe9b48eddac785ed1686fe27c",
 } | dict.fromkeys(
+    "hospital-001479 hospital-001480 hospital-001481".split(),
+    "b3ef0b1c3281769a465777af55237151ebfb1bb95999133ad7be0a21d8e971fb",
+) | dict.fromkeys(
     "hospital-002089 hospital-005970 hospital-005971 hospital-005972 "
     "hospital-005973 hospital-005974".split(),
     "7ba5d031cb09651b7e02fab6d11dadc423e561c6d2649835f276188521688ac1",

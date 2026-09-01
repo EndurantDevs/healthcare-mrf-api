@@ -69,7 +69,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert "alias_of" not in hospital_by_id["hospital-005625"]
     assert sum("locator_name" in entry for entry in hospitals) == 1_522
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 646
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 56
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 60
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
