@@ -67,7 +67,7 @@ def _assert_receipt_columns_match_model(elements) -> None:
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260831180000_hospital_price_csv_transition_metadata"
+        "20260901000000_hospital_price_csv_short_v2"
     ]
     migration = load_capacity_v2_migration()
     assert migration.down_revision == "20260801010000_uhc_semantic_layout_identity"
