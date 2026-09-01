@@ -372,6 +372,7 @@ TOC_LEVEL_QUERY_EXPANSION_RESOLVERS = frozenset(
         "cigna_static_mrf_lookup",
         "kaiser_monthly_inventory",
         "monthly_toc_templates",
+        "uhc_blob_listing",
     }
 )
 SOURCE_QUERY_EXPANSION_PLATFORM_RANK = {
@@ -1505,6 +1506,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
     if host in {
         "sawus2prdticmrfhma.z5.web.core.windows.net",
         "sawus2prdticmrfhma.blob.core.windows.net",
+        "sawus2prdticmrfrgaut.z5.web.core.windows.net",
+        "sawus2prdticmrfrgaut.blob.core.windows.net",
     }:
         return "html_mrf_links"
     if (
@@ -11186,11 +11189,12 @@ def _plan_info_from_label(
     plan_id: str | None = None,
     plan_id_type: str | None = None,
     market_type: str | None = "group",
+    infer_ein: bool = False,
 ) -> list[dict[str, Any]]:
     clean_label = _clean_text(label)
     resolved_plan_id = str(plan_id or "").strip()
     resolved_plan_id_type = plan_id_type
-    if not resolved_plan_id:
+    if not resolved_plan_id and infer_ein:
         match = re.search(r"\b(?P<ein>\d{9})\b", clean_label)
         if match:
             resolved_plan_id = match.group("ein")
@@ -11618,7 +11622,7 @@ async def _healthcarebluebook_direct_target(
         "source_format": _healthcarebluebook_source_format(link_url),
         "healthcarebluebook_listing_url": listing_url,
         "healthcarebluebook_file_type": _clean_text(type_text),
-        "plan_info": _plan_info_from_label(label),
+        "plan_info": _plan_info_from_label(label, infer_ein=True),
     }
     return CrawlTarget(
         source=source_record,
@@ -15022,7 +15026,12 @@ def _matched_query_expansion_target(
         _crawl_target_search_values(crawl_target), query
     ):
         return None
-    match_scope = "resolver_context" if is_resolver_context_match else None
+    if is_resolver_context_match:
+        match_scope = "resolver_context"
+    elif _supports_toc_plan_query_scan(crawl_target):
+        match_scope = "toc_plan"
+    else:
+        match_scope = None
     return _with_query_expansion_match(
         crawl_target,
         query,

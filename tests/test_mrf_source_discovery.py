@@ -4088,6 +4088,9 @@ def _assert_master_list_candidate_contract_21(
     assert by_name["Independence Blue Cross"].benefit_lines == ("medical", "vision")
     assert "Medica Insurance Company" in by_name["Medica"].aliases
     assert "UTAH REGENCE BLUE CROSS BLUE SHIELD" in by_name["Regence"].aliases
+    assert by_name["Regence Group Administrators"].hosting_platform == (
+        "html_mrf_links"
+    )
     assert "First Choice Health Network" in aliases_by_name["First Choice Health"]
     assert "Health Plan of Nevada, Inc." in by_name["Health Plan of Nevada"].aliases
     assert by_name["Health Plan of Nevada"].status == "stale"
@@ -5155,6 +5158,7 @@ _HOSTING_PLATFORM_CASES = (
         "triples_mtt_api",
     ),
     ("https://sawus2prdticmrfhma.z5.web.core.windows.net/", "html_mrf_links"),
+    ("https://sawus2prdticmrfrgaut.z5.web.core.windows.net/", "html_mrf_links"),
     (
         "https://www.lacare.org/transparency-coverage-machine-readable-files",
         "html_delegated_mrf_links",
@@ -5677,6 +5681,51 @@ async def test_html_mrf_resolver_filters_query_before_target_limit(monkeypatch):
     assert [matched_target.url for matched_target in matched_targets] == [
         "https://example.test/sample-employer-a_in-network-rates.json.gz",
         "https://example.test/sample-employer-b_in-network-rates.json.gz",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rga_landing_projects_toc_and_plan_rows(monkeypatch):
+    landing_url = "https://sawus2prdticmrfrgaut.z5.web.core.windows.net/"
+    toc_url = (
+        "https://sawus2prdticmrfrgaut.blob.core.windows.net/"
+        "2026-09-01_example-hospice_index.json"
+    )
+    source = {
+        "source_id": "source_rga",
+        "payer_id": "payer_rga",
+        "display_name": "Regence Group Administrators",
+    }
+    monkeypatch.setattr(
+        discovery,
+        "_fetch_text",
+        AsyncMock(
+            return_value=f'<a href="{toc_url}">Table of Contents</a>'
+        ),
+    )
+
+    [toc_target] = await discovery._resolve_html_mrf_links(
+        source,
+        landing_url,
+        {"type": "html_mrf_links"},
+        session=None,
+    )
+    plan_rows, file_rows = discovery._toc_rows_from_content(
+        source,
+        toc_target.url,
+        _synthetic_toc_payload(
+            (
+                "Example Hospice Plan 1",
+                "111111111",
+                "https://example.test/example-hospice-rates.json.gz",
+            ),
+        ),
+    )
+
+    assert toc_target.metadata["target_file_type"] == "table-of-contents"
+    assert [plan_row["plan_id"] for plan_row in plan_rows] == ["111111111"]
+    assert [file_row["url"] for file_row in file_rows] == [
+        "https://example.test/example-hospice-rates.json.gz"
     ]
 
 
@@ -7962,6 +8011,11 @@ async def test_uhc_blob_query_finds_late_match_before_target_limit(monkeypatch):
         crawl_targets[0].metadata["blob_name"]
         == "2026-07-01_Sample-Employer-LLC_index.json"
     )
+    [matched_target] = discovery._filter_query_expansion_targets(
+        crawl_targets,
+        "Sample Employer",
+    )
+    assert matched_target.metadata["query_expansion_match_scope"] == "toc_plan"
 
 
 @pytest.mark.asyncio
@@ -11996,6 +12050,31 @@ def test_kaiser_inventory_parses_tocs_rate_files_and_allowed_amounts():
     )
     assert allowed_targets[0].metadata["target_file_type"] == "allowed-amounts"
     assert allowed_targets[0].url.endswith("KFHP_HI-40513_allowed-amounts.zip")
+
+
+def test_kaiser_inventory_does_not_treat_filename_digits_as_an_ein():
+    source_by_field = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Kaiser Permanente",
+    }
+    [target] = discovery._kaiser_inventory_targets_from_text(
+        source_by_field,
+        "/hi/2026-07-01_EXAMPLE-710986725-5_in-network-rates.zip 100",
+        inventory_url=(
+            "https://healthy.kaiserpermanente.org/pricing/"
+            "innetwork/2026-07_List.txt"
+        ),
+        inventory_month="2026-07",
+        category="innetwork",
+        resolver={
+            **discovery._source_config()["platform_resolvers"]["kaiser_mrf_inventory"],
+            "region_codes": ["hi"],
+        },
+    )
+
+    assert target.metadata["plan_info"][0]["plan_id"] is None
+    assert target.metadata["plan_info"][0]["plan_id_type"] is None
 
 
 @pytest.mark.asyncio
