@@ -10641,18 +10641,19 @@ async def _membership_exact_scope_npis(
             WHERE scope_npis.snapshot_key = :shared_snapshot_key
               AND {projection_sql}
               {"AND " + predicate_sql if predicate_sql else ""}
-            ORDER BY scope_npis.npi
             LIMIT :limit
             """
         ),
         query_parameters_by_name,
     )
     return tuple(
-        int(npi_by_field["npi"])
-        for npi_by_field in (
-            _row_mapping(npi_record) for npi_record in exact_scope
+        sorted(
+            int(npi_by_field["npi"])
+            for npi_by_field in (
+                _row_mapping(npi_record) for npi_record in exact_scope
+            )
+            if npi_by_field.get("npi") is not None
         )
-        if npi_by_field.get("npi") is not None
     )
 
 
@@ -10737,12 +10738,12 @@ async def _membership_location_query(
     args: dict[str, Any],
     *,
     candidate_npis: tuple[int, ...] | None,
+    coarse_taxonomy_knn: bool = False,
     limit: int,
     offset: int = 0,
 ) -> _MembershipLocationQuery | None:
     """Build one bounded address lookup against immutable snapshot membership."""
     _require_strict_shared_v3(serving_tables)
-    provider_npi_scope_table = _ptg2_npi_scope_table(serving_tables)
     address_table = await _membership_address_table_for_request(session, args)
     if not address_table:
         return None
@@ -10756,37 +10757,31 @@ async def _membership_location_query(
         uses_unified_addresses=uses_unified_addresses,
         offset=offset,
     )
-    include_taxonomy_filters = knn_order_sql is None
-    knn_prefilter_sql = _membership_knn_prefilter_sql(args, parameter_map, knn_order_sql)
-    filter_sql_parts = _membership_filter_sql(
+    filter_sql_parts, knn_prefilter_sql, taxonomy_index_sql = _membership_location_filter_plan(
         args,
+        parameter_map,
+        knn_order_sql,
         candidate_npis=candidate_npis,
+        coarse_taxonomy_knn=coarse_taxonomy_knn,
         uses_unified_addresses=uses_unified_addresses,
-        address_zip5_sql=_ptg2_address_zip5_sql("addr", unified=uses_unified_addresses),
-        parameter_map=parameter_map,
-        literal_service_address_types=uses_unified_addresses,
-        include_taxonomy_filters=include_taxonomy_filters,
     )
     if filter_sql_parts is None:
         return None
     address_filter_sql, distance_sql = filter_sql_parts
     parameter_map["shared_snapshot_key"] = _required_shared_snapshot_key(serving_tables)
-    filter_sql = (
-        "npi_scope.snapshot_key = :shared_snapshot_key "
-        f"AND ({address_filter_sql})"
-    )
     return _MembershipLocationQuery(
         address_table=address_table,
-        npi_scope_table=provider_npi_scope_table,
-        filter_sql=filter_sql,
+        npi_scope_table=_ptg2_npi_scope_table(serving_tables),
+        filter_sql=(
+            "npi_scope.snapshot_key = :shared_snapshot_key "
+            f"AND ({address_filter_sql})"
+        ),
         parameter_map=parameter_map,
         distance_sql=distance_sql,
         knn_order_sql=knn_order_sql,
         address_assurance_sql=_membership_address_assurance_sql(args, uses_unified_addresses),
         address_filter_sql=address_filter_sql,
-        taxonomy_index_sql=_membership_location_taxonomy_index_sql(
-            args, parameter_map, uses_unified_addresses, include_taxonomy_filters
-        ),
+        taxonomy_index_sql=taxonomy_index_sql,
         knn_prefilter_sql=knn_prefilter_sql,
     )
 
@@ -10803,6 +10798,30 @@ def _membership_knn_prefilter_sql(
         if knn_order_sql is not None
         else ()
     ) or "TRUE"
+
+
+def _membership_projection_knn_prefilter_sql(
+    args: Mapping[str, Any],
+    parameter_map: dict[str, Any],
+    knn_order_sql: str | None,
+) -> str:
+    """Render the attested taxonomy superset before broad raw KNN limits."""
+
+    if knn_order_sql is None:
+        return "TRUE"
+    if not _uses_npi_search_taxonomy_projection():
+        return _membership_knn_prefilter_sql(
+            args, parameter_map, knn_order_sql
+        )
+    projection_sql = _membership_scope_projection_sql(args, parameter_map)
+    if projection_sql == "TRUE":
+        return _membership_knn_prefilter_sql(
+            args, parameter_map, knn_order_sql
+        )
+    return (
+        f"addr.npi IN (SELECT scope_provider.npi FROM {PTG2_SCHEMA}.npi "
+        f"scope_provider WHERE {projection_sql})"
+    )
 
 
 def _membership_location_taxonomy_index_sql(
@@ -10826,6 +10845,54 @@ def _membership_location_taxonomy_index_sql(
     ):
         return None
     return _membership_taxonomy_index_sql(args, parameter_map)
+
+
+def _membership_location_filter_plan(
+    args: Mapping[str, Any],
+    parameter_map: dict[str, Any],
+    knn_order_sql: str | None,
+    *,
+    candidate_npis: tuple[int, ...] | None,
+    coarse_taxonomy_knn: bool,
+    uses_unified_addresses: bool,
+) -> tuple[tuple[str, str] | None, str, str | None]:
+    """Choose the pre-limit and exact predicates for one location query."""
+
+    uses_coarse_taxonomy_knn = bool(
+        coarse_taxonomy_knn and knn_order_sql is not None
+    )
+    include_taxonomy_filters = bool(
+        knn_order_sql is None or uses_coarse_taxonomy_knn
+    )
+    knn_prefilter_sql = (
+        _membership_projection_knn_prefilter_sql(
+            args, parameter_map, knn_order_sql
+        )
+        if uses_coarse_taxonomy_knn
+        else _membership_knn_prefilter_sql(args, parameter_map, knn_order_sql)
+    )
+    filter_sql_parts = _membership_filter_sql(
+        dict(args),
+        candidate_npis=candidate_npis,
+        uses_unified_addresses=uses_unified_addresses,
+        address_zip5_sql=_ptg2_address_zip5_sql(
+            "addr", unified=uses_unified_addresses
+        ),
+        parameter_map=parameter_map,
+        literal_service_address_types=uses_unified_addresses,
+        include_taxonomy_filters=include_taxonomy_filters,
+    )
+    taxonomy_index_sql = (
+        None
+        if knn_order_sql is not None or candidate_npis is not None
+        else _membership_location_taxonomy_index_sql(
+            args,
+            parameter_map,
+            uses_unified_addresses,
+            include_taxonomy_filters,
+        )
+    )
+    return filter_sql_parts, knn_prefilter_sql, taxonomy_index_sql
 
 
 async def _enable_serial_knn_planning(session) -> tuple[str, str, str]:
@@ -11772,6 +11839,7 @@ async def _membership_location_rows(
     args: dict[str, Any],
     *,
     candidate_npis: tuple[int, ...] | None,
+    coarse_taxonomy_knn: bool = False,
     limit: int,
     offset: int = 0,
     stored_address_provenance_only: bool = False,
@@ -11785,6 +11853,7 @@ async def _membership_location_rows(
         serving_tables,
         args,
         candidate_npis=candidate_npis,
+        coarse_taxonomy_knn=coarse_taxonomy_knn,
         limit=limit,
         offset=offset,
     )
@@ -12959,6 +13028,7 @@ async def _scan_local_distance_graph(
     max_candidates: int,
     *,
     candidate_npis: tuple[int, ...] | None = None,
+    coarse_taxonomy_knn: bool = False,
 ) -> _GraphLocationCandidates | None:
     """Grow one stable distance prefix until its code-matched page is proven."""
 
@@ -12970,6 +13040,7 @@ async def _scan_local_distance_graph(
             serving_tables,
             args,
             candidate_npis=candidate_npis,
+            coarse_taxonomy_knn=coarse_taxonomy_knn,
             limit=probe_limit,
             offset=0,
         )
@@ -13014,8 +13085,9 @@ async def _bounded_exact_distance_npis(
     serving_tables: PTG2ServingTables,
     args: Mapping[str, Any],
     max_candidates: int,
-) -> tuple[int, ...] | None:
-    """Return a complete exact NPI scope, or None when KNN must stay broad."""
+    candidate_limit: int,
+) -> tuple[tuple[int, ...] | None, bool]:
+    """Return an exact NPI scope or admit an attested coarse KNN prefix."""
 
     filter_args_by_name = dict(args)
     has_taxonomy_filter = bool(
@@ -13023,7 +13095,7 @@ async def _bounded_exact_distance_npis(
         or _inferred_provider_taxonomy_rule(filter_args_by_name) is not None
     )
     if not has_taxonomy_filter or not _uses_npi_search_taxonomy_projection():
-        return None
+        return None, False
     exact_npi_limit = min(
         _MEMBERSHIP_EXACT_NPI_SCOPE_LIMIT,
         max(int(max_candidates), 1),
@@ -13035,8 +13107,8 @@ async def _bounded_exact_distance_npis(
         limit=exact_npi_limit + 1,
     )
     if len(exact_scope_npis) > exact_npi_limit:
-        return None
-    return exact_scope_npis
+        return None, _uses_ascending_distance_order(args, candidate_limit)
+    return exact_scope_npis, False
 
 
 async def _local_inferred_distance_graph_candidates(
@@ -13068,8 +13140,8 @@ async def _local_inferred_distance_graph_candidates(
         candidate_limit, taxonomy_filter_requested=False
     )
     max_candidates = max(_ptg2_manifest_location_match_limit() * 20, batch_size)
-    candidate_npis = await _bounded_exact_distance_npis(
-        session, serving_tables, args, max_candidates
+    candidate_npis, coarse_taxonomy_knn = await _bounded_exact_distance_npis(
+        session, serving_tables, args, max_candidates, candidate_limit
     )
     if candidate_npis == ():
         return _GraphLocationCandidates([], {}, taxonomy_filtered=True)
@@ -13097,6 +13169,7 @@ async def _local_inferred_distance_graph_candidates(
             batch_size,
             max_candidates,
             candidate_npis=candidate_npis,
+            coarse_taxonomy_knn=coarse_taxonomy_knn,
         )
 
 
@@ -13198,14 +13271,8 @@ def _uses_local_distance_rate_scope(
 ) -> bool:
     """Admit bounded V4 distance and legacy exhaustive exact-rate scopes."""
 
-    requested_order = str(args.get("order_by") or "").strip().lower()
-    requested_direction = str(args.get("order") or "asc").strip().lower()
     configured_match_limit = _ptg2_manifest_location_match_limit()
-    uses_distance_order = bool(
-        requested_order in {"", "distance", "distance_miles"}
-        and requested_direction == "asc"
-        and candidate_limit <= configured_match_limit
-    )
+    uses_distance_order = _uses_ascending_distance_order(args, candidate_limit)
     uses_exhaustive_rate_scope = bool(
         request_options.get("require_exhaustive", False)
         and _uses_negotiated_rate_only_filter(args)
@@ -13228,6 +13295,19 @@ def _uses_local_distance_rate_scope(
         and provider_set_keys is None
         and explicit_npi_scope is None
         and not request_options.get("require_provider_set_coverage", False)
+    )
+
+
+def _uses_ascending_distance_order(
+    args: Mapping[str, Any], candidate_limit: int
+) -> bool:
+    """Identify the bounded ascending distance lane."""
+
+    return bool(
+        str(args.get("order_by") or "").strip().lower()
+        in {"", "distance", "distance_miles"}
+        and str(args.get("order") or "asc").strip().lower() == "asc"
+        and candidate_limit <= _ptg2_manifest_location_match_limit()
     )
 
 

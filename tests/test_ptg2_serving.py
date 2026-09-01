@@ -1570,7 +1570,9 @@ async def test_inferred_taxonomy_filter_requires_individual_npi():
 @pytest.mark.asyncio
 async def test_exact_scope_filters_snapshot_in_database(monkeypatch):
     monkeypatch.setenv("HLTHPRT_NPI_SEARCH_TAXONOMY_PROJECTION_ENABLED", "1")
-    session = FakeSession([FakeResult(result_rows=[{"npi": 1234567890}])])
+    session = FakeSession(
+        [FakeResult(result_rows=[{"npi": 1234567891}, {"npi": 1234567890}])]
+    )
 
     filtered = await ptg2_serving._membership_exact_scope_npis(
         session,
@@ -1583,12 +1585,13 @@ async def test_exact_scope_filters_snapshot_in_database(monkeypatch):
         limit=100,
     )
 
-    assert filtered == (1234567890,)
+    assert filtered == (1234567890, 1234567891)
     sql = str(session.calls[0][0][0])
     assert "scope_npis.npi" in sql
     assert "manifest_provider_specialty_nt" in sql
     assert "manifest_provider_inferred_taxonomy_code_0" in sql
     assert sql.count("scope_provider.search_taxonomy_codes") == 2
+    assert "ORDER BY scope_npis.npi" not in sql
     assert session.calls[0][0][1]["limit"] == 100
 
 
