@@ -127,6 +127,10 @@ def test_distance_card_item_uses_the_exact_code_slot():
     assert card_by_field["rate_count"] == 24
     assert card_by_field["distance_miles"] == 1.25
     assert PROJECTION_CONTRACT == "plan_pricing_em_distance_v1"
+    with pytest.raises(ValueError, match="rate arrays are invalid"):
+        _card_item({**card_row_by_field, "rate_counts": [21]}, 3)
+    with pytest.raises(ValueError, match="lost the requested code"):
+        _card_item({**card_row_by_field, "minimum_rates": [1, 2, 3, None, 5, 6]}, 3)
 
 
 @pytest.mark.asyncio
