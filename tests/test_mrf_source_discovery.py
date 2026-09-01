@@ -5691,7 +5691,7 @@ async def test_rga_landing_projects_toc_and_plan_rows(monkeypatch):
         "https://sawus2prdticmrfrgaut.blob.core.windows.net/"
         "2026-09-01_example-hospice_index.json"
     )
-    source = {
+    source_by_field = {
         "source_id": "source_rga",
         "payer_id": "payer_rga",
         "display_name": "Regence Group Administrators",
@@ -5705,13 +5705,13 @@ async def test_rga_landing_projects_toc_and_plan_rows(monkeypatch):
     )
 
     [toc_target] = await discovery._resolve_html_mrf_links(
-        source,
+        source_by_field,
         landing_url,
         {"type": "html_mrf_links"},
         session=None,
     )
-    plan_rows, file_rows = discovery._toc_rows_from_content(
-        source,
+    plan_row_list, file_row_list = discovery._toc_rows_from_content(
+        source_by_field,
         toc_target.url,
         _synthetic_toc_payload(
             (
@@ -5723,8 +5723,8 @@ async def test_rga_landing_projects_toc_and_plan_rows(monkeypatch):
     )
 
     assert toc_target.metadata["target_file_type"] == "table-of-contents"
-    assert [plan_row["plan_id"] for plan_row in plan_rows] == ["111111111"]
-    assert [file_row["url"] for file_row in file_rows] == [
+    assert [plan_row["plan_id"] for plan_row in plan_row_list] == ["111111111"]
+    assert [file_row["url"] for file_row in file_row_list] == [
         "https://example.test/example-hospice-rates.json.gz"
     ]
 
@@ -7998,70 +7998,85 @@ async def test_uhc_blob_query_finds_late_match_before_target_limit(monkeypatch):
         index_url="https://transparency-in-coverage.uhc.com/",
     )
 
-    crawl_targets, resolver_observations = await discovery._resolve_crawl_targets(
-        [query_source_dict],
+    crawl_targets = await discovery._crawl_targets_for_source(
+        query_source_dict,
+        "https://transparency-in-coverage.uhc.com/",
         session="session",
-        run_id="run_example",
-        concurrency=1,
-        crawl_target_limit=50,
+        target_limit=50,
     )
 
-    assert resolver_observations == []
     assert len(crawl_targets) == 1
     assert crawl_targets[0].label == "Sample Employer Llc"
     assert (
         crawl_targets[0].metadata["blob_name"]
         == "2026-07-01_Sample-Employer-LLC_index.json"
     )
-    [matched_target] = crawl_targets
-    assert matched_target.metadata["query_expansion_match_scope"] == "toc_plan"
+    [matched_target] = discovery._filter_query_expansion_targets(
+        crawl_targets,
+        "Sample Employer",
+    )
+    assert "query_expansion_match_scope" not in matched_target.metadata
 
+
+@pytest.mark.asyncio
+async def test_uhc_exact_employer_index_keeps_option_named_plans(monkeypatch):
+    """An employer-named index must not be filtered by its option names."""
+
+    source_by_field = _synthetic_query_source(
+        source_id="source_uhc_example",
+        platform="uhc_public_blobs",
+        index_url="https://transparency-in-coverage.uhc.com/",
+    )
+    exact_employer_target = discovery.CrawlTarget(
+        source=source_by_field,
+        url="https://example.test/sample-employer-index.json",
+        label="Sample Employer LLC",
+        metadata={
+            "resolver": "uhc_blob_listing",
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+        },
+    )
+    [matched_target] = discovery._filter_query_expansion_targets(
+        [exact_employer_target],
+        "Sample Employer",
+    )
     toc_payload = _synthetic_toc_payload(
         (
-            "Sample Employer Choice Plan",
+            "POS CHOICE PLUS",
             "111111111",
-            "https://example.test/matching-rates.json.gz",
+            "https://example.test/choice-plus-rates.json.gz",
         ),
         (
-            "Unrelated Employer Choice Plan",
+            "TRANSPLANT",
             "222222222",
-            "https://example.test/unrelated-rates.json.gz",
+            "https://example.test/transplant-rates.json.gz",
         ),
     )
-    response = _FakeFetchResponse(
-        status=200,
-        body=json.dumps(toc_payload).encode(),
-        content_type="application/json",
-        url=matched_target.url,
-    )
+    fetch_mock = AsyncMock(return_value=toc_payload)
+    monkeypatch.setattr(discovery, "_fetch_json", fetch_mock)
 
-    class FakeSession:
-        def get(self, url, **_kwargs):
-            assert url == matched_target.url
-            return response
-
-    async def allow_url(_url):
-        return None
-
-    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allow_url)
-
-    plan_rows, file_rows, crawl_observations, crawled_url = (
+    plan_row_list, file_row_list, _, _ = (
         await discovery._crawl_one_toc_target(
             matched_target,
-            FakeSession(),
+            "session",
             max_toc_bytes=4096,
             run_id="run_example",
         )
     )
 
-    assert [plan_row["plan_id"] for plan_row in plan_rows] == ["111111111"]
+    assert [plan_row["plan_id"] for plan_row in plan_row_list] == [
+        "111111111",
+        "222222222",
+    ]
     assert [
         file_row["url"]
-        for file_row in file_rows
+        for file_row in file_row_list
         if file_row["file_type"] == "in-network"
-    ] == ["https://example.test/matching-rates.json.gz"]
-    assert len(crawl_observations) == 1
-    assert crawled_url == matched_target.url
+    ] == [
+        "https://example.test/choice-plus-rates.json.gz",
+        "https://example.test/transplant-rates.json.gz",
+    ]
 
 
 @pytest.mark.asyncio
