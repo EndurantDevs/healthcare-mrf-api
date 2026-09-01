@@ -206,7 +206,7 @@ fn parse_tall_payer(
     columns: &TallCsvColumns,
     generic_notes: Option<&str>,
 ) -> io::Result<Option<PayerChargeRow>> {
-    let relevant_columns = [
+    let payer_columns = [
         Some(columns.payer_name),
         Some(columns.plan_name),
         Some(columns.standard_charge_dollar),
@@ -217,12 +217,15 @@ fn parse_tall_payer(
         columns.percentile_10,
         columns.percentile_90,
         columns.allowed_count,
-        Some(columns.methodology),
     ];
-    if relevant_columns
+    if payer_columns
         .iter()
         .all(|column| csv_profile_value(record, *column).is_empty())
     {
+        let methodology = csv_value(record, columns.methodology).trim();
+        if !methodology.is_empty() {
+            canonical_methodology(methodology, true)?;
+        }
         return Ok(None);
     }
     if [
