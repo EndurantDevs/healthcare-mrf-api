@@ -5416,6 +5416,34 @@ async def test_github_repo_resolver_expands_public_tree_to_raw_mrf_files(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_resolved_target_summary_survives_batch_list_draining(monkeypatch):
+    target = discovery.CrawlTarget(
+        source={"source_id": "source_1", "payer_id": "payer_1"},
+        url="https://example.test/plan_index.json",
+        label="Example Plan",
+    )
+    observation_dict = {"observation_id": "resolver_observation_1"}
+
+    async def fake_resolve_crawl_targets(*_args, **_kwargs):
+        return [target], [observation_dict]
+
+    async def fake_push_crawl_row_batches(_plan_rows, file_rows, observation_rows, **_kwargs):
+        file_rows.clear()
+        observation_rows.clear()
+
+    monkeypatch.setattr(discovery, "_resolve_crawl_targets", fake_resolve_crawl_targets)
+    monkeypatch.setattr(discovery, "_push_crawl_row_batches", fake_push_crawl_row_batches)
+
+    targets, file_count, observation_ids = await discovery._resolve_toc_crawl_targets(
+        [target.source], None, "run_1", None, 1, None, 0.0
+    )
+
+    assert targets == [target]
+    assert file_count == 1
+    assert observation_ids == {"resolver_observation_1"}
+
+
+@pytest.mark.asyncio
 async def test_crawl_target_limit_caps_persisted_target_rows(monkeypatch):
     catalog_source_dict = {
         "source_id": "source_1",
@@ -10939,9 +10967,9 @@ async def test_crawl_targets_for_source_delegates_plain_mrf_host_text(monkeypatc
 
     fake_session = object()
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
-    monkeypatch.setattr(
-        discovery,
-        "_resolve_healthcarebluebook_mrf",
+    monkeypatch.setitem(
+        discovery._ASYNC_CRAWL_RESOLVERS,
+        "healthcarebluebook_mrf",
         fake_resolve_healthcarebluebook_mrf,
     )
 
