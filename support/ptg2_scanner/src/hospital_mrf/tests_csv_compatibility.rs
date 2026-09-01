@@ -244,6 +244,42 @@
     }
 
     #[test]
+    fn gross_cash_only_tall_row_ignores_methodology_without_payer_evidence() {
+        let csv = append_csv_row(
+            &fixture_tall_csv(),
+            &[
+                ("description", "Gross and cash only service"),
+                ("code | 1", "10010"),
+                ("code | 1 | type", "CPT"),
+                ("setting", "outpatient"),
+                ("billing_class", "facility"),
+                ("standard_charge | gross", "1288"),
+                ("standard_charge | discounted_cash", "966"),
+                (
+                    "standard_charge | methodology",
+                    "percent of total billed charges",
+                ),
+            ],
+        );
+
+        let rows = run_fixture(InputFormat::TallCsv, &csv, false);
+        assert_eq!(
+            String::from_utf8(rows["charge"].clone())
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        assert_eq!(
+            String::from_utf8(rows["payer_charge"].clone())
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn wide_rows_omit_anonymous_ancillary_only_payer_groups() {
         let anonymous = String::from_utf8(fixture_wide_csv())
             .unwrap()
