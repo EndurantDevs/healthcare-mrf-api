@@ -109,7 +109,17 @@ fn parse_csv_metadata(
             .and_then(optional_text)
     };
     let version = required_text(value("version")?, "version")?.to_owned();
-    let profile = CmsProfile::parse_csv(&version)?;
+    let declared_profile = CmsProfile::parse_csv(&version)?;
+    let profile = if declared_profile == CmsProfile::V2
+        && fields.contains_key("location_name")
+        && attestation_index.is_some()
+        && !fields.contains_key("hospital_location")
+        && affirmation_index.is_none()
+    {
+        CmsProfile::V3
+    } else {
+        declared_profile
+    };
     let mixed_field = match profile {
         CmsProfile::V2 => fields
             .contains_key("location_name")
