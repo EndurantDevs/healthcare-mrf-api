@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Real-PostgreSQL proof for the bounded exact-distance taxonomy path."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -16,7 +17,6 @@ from tests.ptg2_serving_address_evidence_postgres_support import (
     _schema_sql,
     _temporary_schema,
 )
-from tests.ptg2_serving_coverage_paydown_support import strict_v3_tables
 from tests.test_ptg2_graph_runtime_boundaries import _local_distance_tables
 
 
@@ -172,6 +172,8 @@ def _recording_location_reader(location_probes: list[tuple[int, list[dict]]]):
     membership_location_rows = serving._membership_location_rows
 
     async def read(*args, limit, **kwargs):
+        assert kwargs["candidate_npis"] is None
+        assert kwargs["coarse_taxonomy_knn"] is True
         locations = await membership_location_rows(*args, limit=limit, **kwargs)
         location_probes.append((limit, locations))
         return locations
@@ -179,13 +181,32 @@ def _recording_location_reader(location_probes: list[tuple[int, list[dict]]]):
     return read
 
 
-async def _exact_memberships(_session, _tables, npis, _request, _state):
-    return {int(npi): (10,) for npi in npis}
+def _recording_v4_reader(membership_probes):
+    async def read(_session, _tables, npis, **_kwargs):
+        normalized_npis = tuple(int(npi) for npi in npis)
+        if normalized_npis:
+            membership_probes.append(normalized_npis)
+        return {npi: (10, 20) for npi in normalized_npis}
+
+    return read
 
 
-async def _classify_exact_sets(_session, _tables, memberships, _request, state):
-    if memberships:
-        state.code_sets.add(10)
+def _recording_forward_reader(code_scope_probes):
+    async def read(
+        _session,
+        _tables,
+        code_rows,
+        *,
+        provider_set_keys,
+        scan_budget,
+    ):
+        del scan_budget
+        code_scope_probes.append(
+            (tuple(row["code_key"] for row in code_rows), provider_set_keys)
+        )
+        return [SimpleNamespace(provider_set_key=10)]
+
+    return read
 
 
 def _assert_scan_result(exact_npis, location_probes, candidates) -> None:
@@ -209,7 +230,15 @@ def _assert_scan_result(exact_npis, location_probes, candidates) -> None:
     assert candidates.taxonomy_filtered is True
 
 
-def _configure_serving(monkeypatch, schema: str, location_probes) -> None:
+def _configure_serving(
+    monkeypatch,
+    schema: str,
+    location_probes,
+    membership_probes,
+    code_scope_probes,
+) -> None:
+    """Bind the production caller to one disposable PostgreSQL schema."""
+
     provenance_sql = _schema_sql(serving._ADDRESS_PROVENANCE_SQL, schema)
     monkeypatch.setenv("HLTHPRT_NPI_SEARCH_TAXONOMY_PROJECTION_ENABLED", "1")
     monkeypatch.setattr(serving, "PTG2_SCHEMA", schema)
@@ -235,11 +264,26 @@ def _configure_serving(monkeypatch, schema: str, location_probes) -> None:
         "_membership_location_rows",
         _recording_location_reader(location_probes),
     )
-    monkeypatch.setattr(serving, "_local_v4_memberships", _exact_memberships)
     monkeypatch.setattr(
         serving,
-        "_classify_local_code_sets",
-        _classify_exact_sets,
+        "_shared_rate_code_scope_rows",
+        AsyncMock(return_value=[{"code_key": 7}]),
+    )
+    monkeypatch.setattr(
+        serving,
+        "load_v4_graph_root",
+        AsyncMock(return_value=SimpleNamespace(representation="pattern_v1")),
+    )
+    monkeypatch.setattr(
+        serving, "_v4_sets_by_npi", _recording_v4_reader(membership_probes)
+    )
+    monkeypatch.setattr(
+        serving,
+        "_shared_forward_entries_for_code_rows",
+        _recording_forward_reader(code_scope_probes),
+    )
+    monkeypatch.setattr(
+        serving, "_graph_location_probe_batch_size", lambda *_args, **_kwargs: 1
     )
 
 
@@ -249,27 +293,29 @@ async def test_coarse_taxonomy_knn_executes_prefix_and_zip_recovery(monkeypatch)
         await _insert_spatial_reference_rows(database, schema)
         exact_npis = await _prepare_rows(database, schema)
         location_probes = []
-        _configure_serving(monkeypatch, schema, location_probes)
+        membership_probes = []
+        code_scope_probes = []
+        _configure_serving(
+            monkeypatch,
+            schema,
+            location_probes,
+            membership_probes,
+            code_scope_probes,
+        )
         request_by_field = _request_by_field()
-        tables = strict_v3_tables()
+        tables = _local_distance_tables()
         async with database.transaction() as session:
-            assert await serving._bounded_exact_distance_npis(
-                session, tables, request_by_field, 20, 1
-            ) == (None, True)
-            candidates = await serving._scan_local_distance_graph(
+            candidates = await serving._local_inferred_distance_graph_candidates(
                 session,
                 tables,
                 request_by_field,
-                serving._LocalDistanceGraphRequest(
-                    2,
-                    [{"code_key": 7}],
-                    serving._v4_geo_rate_forward_limits(_local_distance_tables()),
-                ),
-                1,
-                4,
-                candidate_npis=None,
-                coarse_taxonomy_knn=True,
+                plan_id="synthetic-plan",
+                requested_code="73721",
+                requested_system="CPT",
+                candidate_limit=2,
             )
 
     assert candidates is not None
+    assert membership_probes == [tuple(exact_npis)]
+    assert code_scope_probes == [((7,), (10, 20))]
     _assert_scan_result(exact_npis, location_probes, candidates)
