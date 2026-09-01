@@ -226,9 +226,7 @@ def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypat
     assert hospitals[1]["locator_mrf_url"] == "https://f.test/a"
     assert hospitals[1]["fallback_mrf_url"] == "https://f.test/fallback"
     assert registry.hospital_hpt_registry_groups() == (hospitals,)
-    assert registry.selected_hospital_hpt_registry(
-        {"hospital_id": "hospital-000001"}
-    ) == hospitals
+    assert registry.selected_hospital_hpt_registry({"hospital_id": "hospital-000001"}) == hospitals
     assert registry.selected_hospital_hpt_registry(
         {"hospital_id": "hospital-000002"}
     ) == hospitals
