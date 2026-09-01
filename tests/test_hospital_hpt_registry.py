@@ -143,7 +143,8 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 328 and not {"hospital-000833", "hospital-001199"} & aliases_by_id.keys()
+    assert len(aliases_by_id) == 328
+    assert not {"hospital-000833", "hospital-001199"} & aliases_by_id.keys()
     assert {hospital_id: aliases_by_id[hospital_id] for hospital_id in _REVIEWED_ALIAS_SAMPLES} == _REVIEWED_ALIAS_SAMPLES
     assert hospital_by_id["hospital-000063"]["name"] == "Advanced Specialty Hospitals of Toledo"
 
