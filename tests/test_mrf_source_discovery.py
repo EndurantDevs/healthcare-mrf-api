@@ -7998,24 +7998,70 @@ async def test_uhc_blob_query_finds_late_match_before_target_limit(monkeypatch):
         index_url="https://transparency-in-coverage.uhc.com/",
     )
 
-    crawl_targets = await discovery._crawl_targets_for_source(
-        query_source_dict,
-        "https://transparency-in-coverage.uhc.com/",
+    crawl_targets, resolver_observations = await discovery._resolve_crawl_targets(
+        [query_source_dict],
         session="session",
-        target_limit=50,
+        run_id="run_example",
+        concurrency=1,
+        crawl_target_limit=50,
     )
 
+    assert resolver_observations == []
     assert len(crawl_targets) == 1
     assert crawl_targets[0].label == "Sample Employer Llc"
     assert (
         crawl_targets[0].metadata["blob_name"]
         == "2026-07-01_Sample-Employer-LLC_index.json"
     )
-    [matched_target] = discovery._filter_query_expansion_targets(
-        crawl_targets,
-        "Sample Employer",
-    )
+    [matched_target] = crawl_targets
     assert matched_target.metadata["query_expansion_match_scope"] == "toc_plan"
+
+    toc_payload = _synthetic_toc_payload(
+        (
+            "Sample Employer Choice Plan",
+            "111111111",
+            "https://example.test/matching-rates.json.gz",
+        ),
+        (
+            "Unrelated Employer Choice Plan",
+            "222222222",
+            "https://example.test/unrelated-rates.json.gz",
+        ),
+    )
+    response = _FakeFetchResponse(
+        status=200,
+        body=json.dumps(toc_payload).encode(),
+        content_type="application/json",
+        url=matched_target.url,
+    )
+
+    class FakeSession:
+        def get(self, url, **_kwargs):
+            assert url == matched_target.url
+            return response
+
+    async def allow_url(_url):
+        return None
+
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allow_url)
+
+    plan_rows, file_rows, crawl_observations, crawled_url = (
+        await discovery._crawl_one_toc_target(
+            matched_target,
+            FakeSession(),
+            max_toc_bytes=4096,
+            run_id="run_example",
+        )
+    )
+
+    assert [plan_row["plan_id"] for plan_row in plan_rows] == ["111111111"]
+    assert [
+        file_row["url"]
+        for file_row in file_rows
+        if file_row["file_type"] == "in-network"
+    ] == ["https://example.test/matching-rates.json.gz"]
+    assert len(crawl_observations) == 1
+    assert crawled_url == matched_target.url
 
 
 @pytest.mark.asyncio
@@ -12060,7 +12106,7 @@ def test_kaiser_inventory_does_not_treat_filename_digits_as_an_ein():
     }
     [target] = discovery._kaiser_inventory_targets_from_text(
         source_by_field,
-        "/hi/2026-07-01_EXAMPLE-710986725-5_in-network-rates.zip 100",
+        "/hi/2026-07-01_EXAMPLE-111111111-5_in-network-rates.zip 100",
         inventory_url=(
             "https://healthy.kaiserpermanente.org/pricing/"
             "innetwork/2026-07_List.txt"
