@@ -328,6 +328,22 @@ def _expected_request(
     }
 
 
+async def current_profile_selection_request(
+    catalog_map: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the exact current selection used by the locked attestation."""
+
+    node_id = configured_node_id()
+    async with db.transaction():
+        await db.status("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+        computed_selection = await _compute_current_selection(
+            catalog_map,
+            node_id=node_id,
+            lock_selection=False,
+        )
+    return _expected_request(computed_selection, node_id)
+
+
 async def attest_profile_selection(
     request_payload: Any,
     catalog_map: Mapping[str, Any],

@@ -412,6 +412,19 @@ from scripts.provider_directory_support_contract import (
     validate_blocker_registry,
 )
 
+def _render_provider_directory_sql(
+    filename: str,
+    replacements_by_token: dict[str, Any],
+) -> str:
+    """Render one Provider Directory SQL template with legacy framing."""
+
+    return (
+        "\n"
+        + profile_artifact._render_sql_template(filename, replacements_by_token)
+        + "    "
+    )
+
+
 _PROFILE_EVIDENCE_INSERT_SQL_CONTRACT = (
     profile_artifact.profile_evidence_insert_sql
 )
@@ -8716,365 +8729,23 @@ def provider_directory_address_corroboration_sql(
     view_ref = _qt(schema, view_name)
     plan_ref_resource_id_expr = _sql_reference_resource_id("plan_ref.value", "InsurancePlan")
     network_ref_resource_id_expr = _sql_reference_resource_id("network_ref.value", "Organization")
-    return f"""
-    CREATE OR REPLACE VIEW {view_ref} AS
-    WITH address_candidates AS (
-        SELECT
-            overlay.source_record_id::varchar AS source_record_id,
-            overlay.source_id::varchar AS source_id,
-            overlay.resource_type::varchar AS resource_type,
-            overlay.resource_id::varchar AS resource_id,
-            CASE
-                WHEN overlay.resource_type IN ('PractitionerRole', 'OrganizationAffiliation')
-                    THEN NULLIF(split_part(overlay.source_record_id, ':', 5), '')
-                ELSE NULL::varchar
-            END AS location_resource_id,
-            overlay.npi::bigint AS npi,
-            NULL::varchar AS location_key,
-            overlay.address_key::uuid AS address_key,
-            NULLIF(LEFT(regexp_replace(COALESCE(overlay.postal_code, ''), '\\D', '', 'g'), 5), '')::varchar AS zip5,
-            overlay.state_code::varchar AS state_code,
-            NULLIF(regexp_replace(upper(BTRIM(COALESCE(overlay.city_name, ''))), '[^A-Z0-9]+', '', 'g'), '')::varchar AS city_norm,
-            overlay.telephone_number::varchar AS telephone_number,
-            overlay.phone_number::varchar AS phone_number,
-            overlay.fax_number::varchar AS fax_number,
-            overlay.fax_number_digits::varchar AS fax_number_digits,
-            overlay.source_updated_at AS source_updated_at
-          FROM {_qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)} overlay
-         WHERE overlay.npi IS NOT NULL
-           AND overlay.address_key IS NOT NULL
-           AND overlay.resource_type IN ('PractitionerRole', 'OrganizationAffiliation')
-    ),
-    practitioner_matches AS (
-        SELECT
-            NULL::varchar AS source_key,
-            NULL::varchar AS snapshot_id,
-            NULL::varchar AS plan_id,
-            NULL::varchar AS ptg_plan_id,
-            e.npi,
-            e.location_key,
-            e.address_key,
-            e.zip5,
-            e.state_code,
-            e.city_norm,
-            src.source_id AS provider_directory_source_id,
-            src.org_name AS provider_directory_org_name,
-            src.plan_name AS provider_directory_plan_name,
-            practitioner.resource_id AS provider_directory_provider_resource_id,
-            practitioner.full_name AS provider_directory_provider_name,
-            role.resource_id AS provider_directory_role_resource_id,
-            COALESCE(loc.resource_id, e.location_resource_id) AS provider_directory_location_resource_id,
-            loc.name AS provider_directory_location_name,
-            COALESCE(loc.telephone_number, e.telephone_number) AS provider_directory_telephone_number,
-            COALESCE(loc.phone_number, e.phone_number) AS provider_directory_phone_number,
-            loc.phone_extension AS provider_directory_phone_extension,
-            COALESCE(loc.fax_number, e.fax_number) AS provider_directory_fax_number,
-            COALESCE(loc.fax_number_digits, e.fax_number_digits) AS provider_directory_fax_number_digits,
-            loc.fax_extension AS provider_directory_fax_extension,
-            COALESCE(role.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs,
-            COALESCE(role.insurance_plan_refs::jsonb, '[]'::jsonb) AS provider_directory_insurance_plan_refs,
-            COALESCE(network_context.provider_directory_network_names, ARRAY[]::varchar[])
-                AS provider_directory_network_names,
-            COALESCE(network_context.provider_directory_network_matches, '[]'::jsonb)
-                AS provider_directory_network_matches,
-            false AS provider_directory_plan_context_matched,
-            COALESCE(network_context.provider_directory_network_context_present, false)
-                AS provider_directory_network_context_present,
-            COALESCE(plan_context.provider_directory_insurance_plan_matches, '[]'::jsonb)
-                AS provider_directory_insurance_plan_matches,
-            COALESCE(role.specialty_codes::jsonb, '[]'::jsonb) AS provider_directory_specialty_codes,
-            COALESCE(role.code_codes::jsonb, '[]'::jsonb) AS provider_directory_role_codes,
-            'practitioner_role'::varchar AS provider_directory_match_type,
-            (role.active IS DISTINCT FROM false) AS provider_directory_active_role,
-            (practitioner.active IS DISTINCT FROM false) AS provider_directory_active_provider,
-            (loc.resource_id IS NULL OR loc.status IS NULL OR lower(loc.status) <> 'inactive') AS provider_directory_active_location,
-            GREATEST(
-                COALESCE(e.source_updated_at, TIMESTAMP 'epoch'),
-                COALESCE(role.observed_at, TIMESTAMP 'epoch'),
-                COALESCE(practitioner.observed_at, TIMESTAMP 'epoch'),
-                COALESCE(loc.observed_at, TIMESTAMP 'epoch')
-            ) AS provider_directory_observed_at
-          FROM address_candidates e
-          JOIN {_qt(schema, "provider_directory_practitioner_role")} role
-            ON e.resource_type = 'PractitionerRole'
-           AND role.source_id = e.source_id
-           AND role.resource_id = e.resource_id
-          JOIN {_qt(schema, "provider_directory_practitioner")} practitioner
-            ON practitioner.source_id = role.source_id
-           AND practitioner.resource_id = NULLIF(regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''), '')
-           AND COALESCE(practitioner.npi, role.npi) = e.npi
-          LEFT JOIN {_qt(schema, "provider_directory_location")} loc
-            ON loc.source_id = e.source_id
-           AND loc.resource_id = e.location_resource_id
-          LEFT JOIN LATERAL (
-            SELECT
-                COALESCE(
-                    jsonb_agg(
-                        DISTINCT jsonb_build_object(
-                            'ref', plan_ref.value,
-                            'resource_id', insurance_plan.resource_id,
-                            'plan_identifier', insurance_plan.plan_identifier,
-                            'name', insurance_plan.name
-                        )
-                    ) FILTER (WHERE plan_ref.value IS NOT NULL),
-                    '[]'::jsonb
-                ) AS provider_directory_insurance_plan_matches
-              FROM jsonb_array_elements_text(
-                  COALESCE(role.insurance_plan_refs::jsonb, '[]'::jsonb)
-              ) AS plan_ref(value)
-              LEFT JOIN {_qt(schema, "provider_directory_insurance_plan")} insurance_plan
-                ON insurance_plan.source_id = role.source_id
-               AND insurance_plan.resource_id = {plan_ref_resource_id_expr}
-          ) plan_context ON TRUE
-          LEFT JOIN LATERAL (
-            WITH network_ref_values AS (
-                SELECT network_ref.value
-                  FROM jsonb_array_elements_text(
-                      COALESCE(role.network_refs::jsonb, '[]'::jsonb)
-                  ) AS network_ref(value)
-                UNION
-                SELECT plan_network_ref.value
-                  FROM jsonb_array_elements_text(
-                      COALESCE(role.insurance_plan_refs::jsonb, '[]'::jsonb)
-                  ) AS plan_ref(value)
-                  JOIN {_qt(schema, "provider_directory_insurance_plan")} insurance_plan
-                    ON insurance_plan.source_id = role.source_id
-                   AND insurance_plan.resource_id = {plan_ref_resource_id_expr}
-                  CROSS JOIN LATERAL jsonb_array_elements_text(
-                      COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)
-                  ) AS plan_network_ref(value)
-            )
-            SELECT
-                bool_or(network_ref.value IS NOT NULL) AS provider_directory_network_context_present,
-                COALESCE(
-                    array_agg(DISTINCT network_catalog.provider_directory_network_name)
-                        FILTER (WHERE NULLIF(BTRIM(network_catalog.provider_directory_network_name), '') IS NOT NULL),
-                    ARRAY[]::varchar[]
-                ) AS provider_directory_network_names,
-                COALESCE(
-                    jsonb_agg(
-                        DISTINCT jsonb_build_object(
-                            'ref', network_ref.value,
-                            'resource_id', network_catalog.network_resource_id,
-                            'name', network_catalog.provider_directory_network_name,
-                            'aliases', COALESCE(network_catalog.aliases::jsonb, '[]'::jsonb),
-                            'provider_directory_network_key', network_catalog.provider_directory_network_key,
-                            'provider_directory_source', 'provider_directory_fhir',
-                            'provider_directory_source_id', role.source_id,
-                            'provider_directory_org_name', network_catalog.source_org_name,
-                            'provider_directory_plan_name', network_catalog.source_plan_name,
-                            'provider_directory_issuer_key', network_catalog.provider_directory_issuer_key,
-                            'provider_directory_issuer_network_match_key',
-                                network_catalog.provider_directory_issuer_network_match_key
-                        )
-                    ) FILTER (WHERE network_catalog.network_resource_id IS NOT NULL),
-                    '[]'::jsonb
-                ) AS provider_directory_network_matches
-              FROM network_ref_values network_ref
-              LEFT JOIN {_qt(schema, PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)} network_catalog
-                ON network_catalog.source_id = role.source_id
-               AND network_catalog.network_resource_id = {network_ref_resource_id_expr}
-          ) network_context ON TRUE
-          JOIN {_qt(schema, "provider_directory_source")} src
-            ON src.source_id = role.source_id
-         WHERE e.npi IS NOT NULL
-           AND e.address_key IS NOT NULL
-    ),
-    organization_affiliation_matches AS (
-        SELECT
-            NULL::varchar AS source_key,
-            NULL::varchar AS snapshot_id,
-            NULL::varchar AS plan_id,
-            NULL::varchar AS ptg_plan_id,
-            e.npi,
-            e.location_key,
-            e.address_key,
-            e.zip5,
-            e.state_code,
-            e.city_norm,
-            src.source_id AS provider_directory_source_id,
-            src.org_name AS provider_directory_org_name,
-            src.plan_name AS provider_directory_plan_name,
-            organization.resource_id AS provider_directory_provider_resource_id,
-            organization.name AS provider_directory_provider_name,
-            affiliation.resource_id AS provider_directory_role_resource_id,
-            COALESCE(loc.resource_id, e.location_resource_id) AS provider_directory_location_resource_id,
-            loc.name AS provider_directory_location_name,
-            COALESCE(loc.telephone_number, e.telephone_number) AS provider_directory_telephone_number,
-            COALESCE(loc.phone_number, e.phone_number) AS provider_directory_phone_number,
-            loc.phone_extension AS provider_directory_phone_extension,
-            COALESCE(loc.fax_number, e.fax_number) AS provider_directory_fax_number,
-            COALESCE(loc.fax_number_digits, e.fax_number_digits) AS provider_directory_fax_number_digits,
-            loc.fax_extension AS provider_directory_fax_extension,
-            COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs,
-            '[]'::jsonb AS provider_directory_insurance_plan_refs,
-            COALESCE(network_context.provider_directory_network_names, ARRAY[]::varchar[])
-                AS provider_directory_network_names,
-            COALESCE(network_context.provider_directory_network_matches, '[]'::jsonb)
-                AS provider_directory_network_matches,
-            false AS provider_directory_plan_context_matched,
-            COALESCE(network_context.provider_directory_network_context_present, false)
-                AS provider_directory_network_context_present,
-            '[]'::jsonb AS provider_directory_insurance_plan_matches,
-            COALESCE(affiliation.specialty_codes::jsonb, '[]'::jsonb) AS provider_directory_specialty_codes,
-            COALESCE(affiliation.code_codes::jsonb, '[]'::jsonb) AS provider_directory_role_codes,
-            'organization_affiliation'::varchar AS provider_directory_match_type,
-            (affiliation.active IS DISTINCT FROM false) AS provider_directory_active_role,
-            (organization.active IS DISTINCT FROM false) AS provider_directory_active_provider,
-            (loc.resource_id IS NULL OR loc.status IS NULL OR lower(loc.status) <> 'inactive') AS provider_directory_active_location,
-            GREATEST(
-                COALESCE(e.source_updated_at, TIMESTAMP 'epoch'),
-                COALESCE(affiliation.observed_at, TIMESTAMP 'epoch'),
-                COALESCE(organization.observed_at, TIMESTAMP 'epoch'),
-                COALESCE(loc.observed_at, TIMESTAMP 'epoch')
-            ) AS provider_directory_observed_at
-          FROM address_candidates e
-          JOIN {_qt(schema, "provider_directory_organization_affiliation")} affiliation
-            ON e.resource_type = 'OrganizationAffiliation'
-           AND affiliation.source_id = e.source_id
-           AND affiliation.resource_id = e.resource_id
-          JOIN LATERAL (
-              SELECT DISTINCT normalized_ref AS resource_id
-                FROM (
-                    VALUES
-                        (NULLIF(regexp_replace(COALESCE(affiliation.organization_ref, ''), '^.*/', ''), '')),
-                        (NULLIF(regexp_replace(COALESCE(affiliation.participating_organization_ref, ''), '^.*/', ''), ''))
-                ) AS refs(normalized_ref)
-               WHERE normalized_ref IS NOT NULL
-          ) AS organization_ref ON TRUE
-          JOIN {_qt(schema, "provider_directory_organization")} organization
-            ON organization.source_id = affiliation.source_id
-           AND organization.resource_id = organization_ref.resource_id
-           AND organization.npi = e.npi
-          LEFT JOIN {_qt(schema, "provider_directory_location")} loc
-            ON loc.source_id = e.source_id
-           AND loc.resource_id = e.location_resource_id
-          LEFT JOIN LATERAL (
-            SELECT
-                bool_or(network_ref.value IS NOT NULL) AS provider_directory_network_context_present,
-                COALESCE(
-                    array_agg(DISTINCT network_catalog.provider_directory_network_name)
-                        FILTER (WHERE NULLIF(BTRIM(network_catalog.provider_directory_network_name), '') IS NOT NULL),
-                    ARRAY[]::varchar[]
-                ) AS provider_directory_network_names,
-                COALESCE(
-                    jsonb_agg(
-                        DISTINCT jsonb_build_object(
-                            'ref', network_ref.value,
-                            'resource_id', network_catalog.network_resource_id,
-                            'name', network_catalog.provider_directory_network_name,
-                            'aliases', COALESCE(network_catalog.aliases::jsonb, '[]'::jsonb),
-                            'provider_directory_network_key', network_catalog.provider_directory_network_key,
-                            'provider_directory_source', 'provider_directory_fhir',
-                            'provider_directory_source_id', affiliation.source_id,
-                            'provider_directory_org_name', network_catalog.source_org_name,
-                            'provider_directory_plan_name', network_catalog.source_plan_name,
-                            'provider_directory_issuer_key', network_catalog.provider_directory_issuer_key,
-                            'provider_directory_issuer_network_match_key',
-                                network_catalog.provider_directory_issuer_network_match_key
-                        )
-                    ) FILTER (WHERE network_catalog.network_resource_id IS NOT NULL),
-                    '[]'::jsonb
-                ) AS provider_directory_network_matches
-              FROM jsonb_array_elements_text(
-                  COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb)
-              ) AS network_ref(value)
-              LEFT JOIN {_qt(schema, PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)} network_catalog
-                ON network_catalog.source_id = affiliation.source_id
-               AND network_catalog.network_resource_id = {network_ref_resource_id_expr}
-          ) network_context ON TRUE
-          JOIN {_qt(schema, "provider_directory_source")} src
-            ON src.source_id = affiliation.source_id
-         WHERE e.npi IS NOT NULL
-           AND e.address_key IS NOT NULL
-    ),
-    matches AS (
-        SELECT * FROM practitioner_matches
-        UNION ALL
-        SELECT * FROM organization_affiliation_matches
+    return _render_provider_directory_sql(
+        "provider_directory_address_corroboration.sql",
+        {
+            "VIEW_REF": view_ref,
+            "ADDRESS_OVERLAY_REF": _qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE),
+            "PRACTITIONER_ROLE_REF": _qt(schema, 'provider_directory_practitioner_role'),
+            "PRACTITIONER_REF": _qt(schema, 'provider_directory_practitioner'),
+            "LOCATION_REF": _qt(schema, 'provider_directory_location'),
+            "INSURANCE_PLAN_REF": _qt(schema, 'provider_directory_insurance_plan'),
+            "PLAN_REF_RESOURCE_ID_SQL": plan_ref_resource_id_expr,
+            "NETWORK_CATALOG_REF": _qt(schema, PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE),
+            "NETWORK_REF_RESOURCE_ID_SQL": network_ref_resource_id_expr,
+            "SOURCE_REF": _qt(schema, 'provider_directory_source'),
+            "ORGANIZATION_AFFILIATION_REF": _qt(schema, 'provider_directory_organization_affiliation'),
+            "ORGANIZATION_REF": _qt(schema, 'provider_directory_organization'),
+        },
     )
-    SELECT
-        source_key,
-        snapshot_id,
-        plan_id,
-        ptg_plan_id,
-        npi,
-        location_key,
-        address_key,
-        zip5,
-        state_code,
-        city_norm,
-        provider_directory_source_id,
-        provider_directory_org_name,
-        provider_directory_plan_name,
-        provider_directory_provider_resource_id,
-        provider_directory_provider_name,
-        provider_directory_role_resource_id,
-        provider_directory_location_resource_id,
-        provider_directory_location_name,
-        provider_directory_telephone_number,
-        provider_directory_phone_number,
-        provider_directory_phone_extension,
-        provider_directory_fax_number,
-        provider_directory_fax_number_digits,
-        provider_directory_fax_extension,
-        provider_directory_network_refs,
-        provider_directory_insurance_plan_refs,
-        provider_directory_specialty_codes,
-        provider_directory_role_codes,
-        provider_directory_match_type,
-        provider_directory_active_role,
-        provider_directory_active_provider,
-        provider_directory_active_location,
-        provider_directory_observed_at,
-        (
-            provider_directory_active_role
-            AND provider_directory_active_provider
-            AND provider_directory_active_location
-        ) AS provider_directory_active_match,
-        CASE
-            WHEN provider_directory_active_role
-             AND provider_directory_active_provider
-             AND provider_directory_active_location
-             AND provider_directory_plan_context_matched
-                THEN 'payer_directory_corroborated_location'
-            WHEN provider_directory_active_role
-             AND provider_directory_active_provider
-             AND provider_directory_active_location
-                THEN 'provider_directory_address'
-            ELSE 'payer_directory_corroborated_location_inactive_or_unknown'
-        END::varchar AS address_network_binding,
-        jsonb_build_object(
-            'source', 'provider_directory_fhir',
-            'matched_on',
-                CASE
-                    WHEN provider_directory_plan_context_matched
-                        THEN 'npi_address_key_role_location_plan'
-                    ELSE 'npi_address_key_role_location'
-                END,
-            'source_id', provider_directory_source_id,
-            'org_name', provider_directory_org_name,
-            'plan_name', provider_directory_plan_name,
-            'provider_directory_source_id', provider_directory_source_id,
-            'provider_directory_org_name', provider_directory_org_name,
-            'provider_directory_plan_name', provider_directory_plan_name,
-            'provider_resource_id', provider_directory_provider_resource_id,
-            'role_resource_id', provider_directory_role_resource_id,
-            'location_resource_id', provider_directory_location_resource_id,
-            'match_type', provider_directory_match_type,
-            'plan_context_matched', provider_directory_plan_context_matched,
-            'network_context_present', provider_directory_network_context_present,
-            'network_names', provider_directory_network_names,
-            'network_matches', provider_directory_network_matches,
-            'insurance_plan_matches', provider_directory_insurance_plan_matches
-        ) AS address_verification_evidence,
-        provider_directory_plan_context_matched,
-        provider_directory_network_context_present,
-        provider_directory_insurance_plan_matches,
-        provider_directory_network_names,
-        provider_directory_network_matches
-      FROM matches;
-    """
 
 
 async def publish_provider_directory_address_corroboration_view(db_schema: str | None = None) -> None:
@@ -14173,6 +13844,62 @@ async def backfill_provider_directory_location_coordinates(
     return total_updated
 
 
+def _provider_directory_location_address_scope_sql(
+    schema: str,
+    *,
+    run_id: str | None,
+    source_ids: list[str] | tuple[str, ...] | None,
+    seen_table: str | None,
+) -> tuple[str, str]:
+    """Build the legacy unbounded Location source and scope clauses."""
+
+    source_alias = "loc_src"
+    location_ref = _qt(schema, "provider_directory_location")
+    raw_state_expr = (
+        f"COALESCE(NULLIF({source_alias}.state_name, ''), {source_alias}.state_code)"
+    )
+    normalized_country_expr = _country_restore_sql(f"{source_alias}.country_code")
+    needs_work_clauses = [
+        f"{source_alias}.address_key IS NULL",
+        f"{source_alias}.zip5 IS NULL",
+        f"{source_alias}.city_name IS NULL",
+        f"{source_alias}.state_code IS NULL",
+        f"{source_alias}.city_norm IS NULL",
+        f"{raw_state_expr} ~ '^[0-9]{{1,2}}$'",
+        f"(NULLIF({normalized_country_expr}, '') IS NOT NULL AND "
+        f"{source_alias}.country_code IS DISTINCT FROM {normalized_country_expr})",
+    ]
+    scope_clauses: list[str] = []
+    from_sql = f"FROM {location_ref} AS {source_alias}"
+    if run_id is not None and not seen_table:
+        scope_clauses.append(
+            f"{source_alias}.last_seen_run_id = CAST(:run_id AS varchar)"
+        )
+    if source_ids:
+        scope_clauses.append(
+            f"{source_alias}.source_id = ANY(CAST(:source_ids AS varchar[]))"
+        )
+    if seen_table:
+        seen_ref = _qt(schema, seen_table)
+        seen_run_filter = (
+            "AND seen.run_id = CAST(:run_id AS varchar)" if run_id is not None else ""
+        )
+        from_sql = f"""
+          FROM (
+                SELECT DISTINCT seen.source_id,
+                       seen.resource_id
+                  FROM {seen_ref} AS seen
+                 WHERE seen.resource_type = 'Location'
+                   {seen_run_filter}
+               ) AS seen_scope
+          JOIN {location_ref} AS {source_alias}
+            ON {source_alias}.source_id = seen_scope.source_id
+           AND {source_alias}.resource_id = seen_scope.resource_id
+        """
+    where_clauses = [f"({' OR '.join(needs_work_clauses)})", *scope_clauses]
+    return from_sql, " AND ".join(where_clauses)
+
+
 def provider_directory_location_address_key_sql(
     db_schema: str | None = None,
     *,
@@ -14187,14 +13914,14 @@ def provider_directory_location_address_key_sql(
     qschema = _q(schema)
     location_ref = _qt(schema, "provider_directory_location")
     source_alias = "loc_src"
-    raw_state_expr = f"COALESCE(NULLIF({source_alias}.state_name, ''), {source_alias}.state_code)"
+    raw_state_expr = (
+        f"COALESCE(NULLIF({source_alias}.state_name, ''), {source_alias}.state_code)"
+    )
     normalized_state_expr = _state_fips_restore_sql(raw_state_expr)
     normalized_country_expr = _country_restore_sql(f"{source_alias}.country_code")
-    needs_country_normalization_expr = (
-        f"(NULLIF({normalized_country_expr}, '') IS NOT NULL "
-        f"AND {source_alias}.country_code IS DISTINCT FROM {normalized_country_expr})"
+    zip_state_select = (
+        "geo.state::varchar" if restore_state_from_zip else "NULL::varchar"
     )
-    zip_state_select = "geo.state::varchar" if restore_state_from_zip else "NULL::varchar"
     zip_city_select = "geo.city::varchar" if restore_state_from_zip else "NULL::varchar"
     zip_state_join = (
         f"""
@@ -14204,133 +13931,28 @@ def provider_directory_location_address_key_sql(
         if restore_state_from_zip
         else ""
     )
-    needs_work_clauses = [
-        f"{source_alias}.address_key IS NULL",
-        f"{source_alias}.zip5 IS NULL",
-        f"{source_alias}.city_name IS NULL",
-        f"{source_alias}.state_code IS NULL",
-        f"{source_alias}.city_norm IS NULL",
-        f"{raw_state_expr} ~ '^[0-9]{{1,2}}$'",
-        needs_country_normalization_expr,
-    ]
-    scope_clauses: list[str] = []
-    from_sql = f"FROM {location_ref} AS {source_alias}"
-    if run_id is not None and not seen_table:
-        scope_clauses.append(f"{source_alias}.last_seen_run_id = CAST(:run_id AS varchar)")
-    if source_ids:
-        scope_clauses.append(f"{source_alias}.source_id = ANY(CAST(:source_ids AS varchar[]))")
-    if seen_table:
-        seen_ref = _qt(schema, seen_table)
-        seen_run_filter = "AND seen.run_id = CAST(:run_id AS varchar)" if run_id is not None else ""
-        from_sql = f"""
-          FROM (
-                SELECT DISTINCT seen.source_id,
-                       seen.resource_id
-                  FROM {seen_ref} AS seen
-                 WHERE seen.resource_type = 'Location'
-                   {seen_run_filter}
-               ) AS seen_scope
-          JOIN {location_ref} AS {source_alias}
-            ON {source_alias}.source_id = seen_scope.source_id
-           AND {source_alias}.resource_id = seen_scope.resource_id
-        """
-    where_clauses = [f"({' OR '.join(needs_work_clauses)})", *scope_clauses]
-    where_sql = " AND ".join(where_clauses)
-    return f"""
-    WITH normalized AS (
-        SELECT
-            {source_alias}.source_id,
-            {source_alias}.resource_id,
-            {source_alias}.first_line,
-            {source_alias}.second_line,
-            {source_alias}.city_name,
-            {source_alias}.state_name,
-            {source_alias}.state_code,
-            {source_alias}.postal_code,
-            {source_alias}.zip5,
-            {source_alias}.city_norm,
-            {source_alias}.country_code,
-            {source_alias}.address_key,
-            {qschema}.addr_zip5_norm_v1({source_alias}.postal_code)::varchar AS source_zip5,
-            {normalized_country_expr} AS normalized_country,
-            {raw_state_expr} AS raw_state,
-            {normalized_state_expr} AS normalized_state
-          {from_sql}
-         WHERE {where_sql}
-    ),
-    resolved AS (
-        SELECT
-            normalized.*,
-            CASE
-                WHEN NULLIF(BTRIM(COALESCE(normalized.normalized_state::varchar, '')), '') IS NULL
-                    THEN {zip_state_select}
-                ELSE NULL::varchar
-            END AS zip_restored_state,
-            CASE
-                WHEN NULLIF(BTRIM(COALESCE(normalized.city_name::varchar, '')), '') IS NULL
-                    THEN {zip_city_select}
-                ELSE NULL::varchar
-            END AS zip_restored_city,
-            COALESCE(NULLIF(BTRIM(normalized.normalized_state::varchar), ''), {zip_state_select}) AS resolved_state,
-            COALESCE(NULLIF(BTRIM(normalized.city_name::varchar), ''), {zip_city_select}) AS resolved_city
-          FROM normalized
-          {zip_state_join}
-    ),
-    keyed AS (
-        SELECT
-            source_id,
-            resource_id,
-            {qschema}.addr_key_v1(
-                first_line,
-                second_line,
-                resolved_city,
-                resolved_state,
-                postal_code,
-                COALESCE(NULLIF(normalized_country, ''), 'US')
-            ) AS computed_address_key,
-            source_zip5 AS computed_zip5,
-            {qschema}.addr_state_code_v1(resolved_state)::varchar AS computed_state_code,
-            {qschema}.addr_city_norm_v1(resolved_city)::varchar AS computed_city_norm,
-            CASE
-                WHEN NULLIF(BTRIM(COALESCE(city_name::varchar, '')), '') IS NULL
-                 AND zip_restored_city IS NOT NULL
-                    THEN zip_restored_city::varchar
-                ELSE NULL::varchar
-            END AS restored_city_name,
-            CASE
-                WHEN raw_state ~ '^[0-9]{{1,2}}$'
-                    THEN {qschema}.addr_state_code_v1(resolved_state)::varchar
-                WHEN NULLIF(BTRIM(COALESCE(raw_state::varchar, '')), '') IS NULL
-                 AND zip_restored_state IS NOT NULL
-                    THEN {qschema}.addr_state_code_v1(zip_restored_state)::varchar
-                ELSE NULL::varchar
-            END AS restored_state_name,
-            normalized_country
-          FROM resolved
+    from_sql, where_sql = _provider_directory_location_address_scope_sql(
+        schema,
+        run_id=run_id,
+        source_ids=source_ids,
+        seen_table=seen_table,
     )
-    UPDATE {location_ref} AS loc
-       SET address_key = keyed.computed_address_key::text,
-           zip5 = COALESCE(keyed.computed_zip5, loc.zip5),
-           city_name = COALESCE(keyed.restored_city_name, loc.city_name),
-           state_name = COALESCE(keyed.restored_state_name, loc.state_name),
-           state_code = COALESCE(keyed.computed_state_code, loc.state_code),
-           city_norm = COALESCE(keyed.computed_city_norm, loc.city_norm),
-           country_code = COALESCE(keyed.normalized_country, loc.country_code),
-           updated_at = now()
-      FROM keyed
-     WHERE loc.source_id = keyed.source_id
-       AND loc.resource_id = keyed.resource_id
-       AND keyed.computed_address_key IS NOT NULL
-       AND (
-            loc.address_key IS DISTINCT FROM keyed.computed_address_key::text
-         OR loc.zip5 IS DISTINCT FROM COALESCE(keyed.computed_zip5, loc.zip5)
-         OR loc.city_name IS DISTINCT FROM COALESCE(keyed.restored_city_name, loc.city_name)
-         OR loc.state_name IS DISTINCT FROM COALESCE(keyed.restored_state_name, loc.state_name)
-         OR loc.state_code IS DISTINCT FROM COALESCE(keyed.computed_state_code, loc.state_code)
-         OR loc.city_norm IS DISTINCT FROM COALESCE(keyed.computed_city_norm, loc.city_norm)
-         OR loc.country_code IS DISTINCT FROM COALESCE(keyed.normalized_country, loc.country_code)
-       );
-    """
+    return _render_provider_directory_sql(
+        "provider_directory_location_address_key.sql",
+        {
+            "SOURCE_ALIAS": source_alias,
+            "SCHEMA_REF": qschema,
+            "NORMALIZED_COUNTRY_SQL": normalized_country_expr,
+            "RAW_STATE_SQL": raw_state_expr,
+            "NORMALIZED_STATE_SQL": normalized_state_expr,
+            "FROM_SQL": from_sql,
+            "WHERE_SQL": where_sql,
+            "ZIP_STATE_SQL": zip_state_select,
+            "ZIP_CITY_SQL": zip_city_select,
+            "ZIP_STATE_JOIN_SQL": zip_state_join,
+            "LOCATION_REF": location_ref,
+        },
+    )
 
 
 def _location_worker_clauses(source_alias: str) -> tuple[str, str]:
@@ -40956,148 +40578,88 @@ def _location_archive_stage_table_name(run_id: str | None = None) -> str:
     return f"{PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_STAGE_PREFIX}_{digest}"
 
 
-def provider_directory_location_archive_stage_sql(
-    db_schema: str | None = None,
-    stage_table: str | None = None,
+def _provider_directory_location_archive_scope_sql(
+    schema: str,
     *,
-    run_id: str | None = None, source_ids: list[str] | tuple[str, ...] | None = None,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
     seen_table: str | None = None,
-) -> str:
-    """Build SQL for provider directory location archive stage."""
-    schema = db_schema or _schema()
-    stage = stage_table or _location_archive_stage_table_name()
-    stage_ref = _qt(schema, stage)
-    location_ref = _qt(schema, "provider_directory_location")
-    organization_ref = _qt(schema, "provider_directory_organization")
-    uuid_re = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+) -> tuple[str, str]:
+    """Build the optional Location and Organization archive scopes."""
+
     location_scope_clauses: list[str] = []
     organization_scope_clauses: list[str] = []
     if seen_table:
         seen_ref = _qt(schema, seen_table)
-        seen_run_filter = "AND seen.run_id = CAST(:run_id AS varchar)" if run_id is not None else ""
-        location_scope_clauses.append(
-            f"""EXISTS (
+        seen_run_filter = (
+            "AND seen.run_id = CAST(:run_id AS varchar)" if run_id is not None else ""
+        )
+        location_scope_clauses.append(f"""EXISTS (
                 SELECT 1
                   FROM {seen_ref} AS seen
                  WHERE seen.resource_type = 'Location'
                    {seen_run_filter}
                    AND seen.source_id = loc.source_id
                    AND seen.resource_id = loc.resource_id
-            )"""
-        )
-        organization_scope_clauses.append(
-            f"""EXISTS (
+            )""")
+        organization_scope_clauses.append(f"""EXISTS (
                 SELECT 1
                   FROM {seen_ref} AS seen
                  WHERE seen.resource_type = 'Organization'
                    {seen_run_filter}
                    AND seen.source_id = organization.source_id
                    AND seen.resource_id = organization.resource_id
-            )"""
-        )
+            )""")
     elif run_id is not None:
         location_scope_clauses.append("loc.last_seen_run_id = CAST(:run_id AS varchar)")
-        organization_scope_clauses.append("organization.last_seen_run_id = CAST(:run_id AS varchar)")
+        organization_scope_clauses.append(
+            "organization.last_seen_run_id = CAST(:run_id AS varchar)"
+        )
     if source_ids:
-        location_scope_clauses.append("loc.source_id = ANY(CAST(:source_ids AS varchar[]))")
-        organization_scope_clauses.append("organization.source_id = ANY(CAST(:source_ids AS varchar[]))")
-    location_scope_sql = "".join(f"\n           AND {clause}" for clause in location_scope_clauses)
-    organization_scope_sql = "".join(f"\n           AND {clause}" for clause in organization_scope_clauses)
-    return f"""
-    CREATE UNLOGGED TABLE {stage_ref} AS
-    WITH eligible AS (
-        SELECT
-            loc.address_key::uuid AS address_key,
-            NULLIF(BTRIM(loc.first_line), '')::text AS first_line,
-            NULLIF(BTRIM(loc.second_line), '')::text AS second_line,
-            NULLIF(BTRIM(loc.city_name), '')::text AS city_name,
-            NULLIF(BTRIM(COALESCE(NULLIF(loc.state_name, ''), loc.state_code)), '')::text AS state_name,
-            NULLIF(BTRIM(COALESCE(NULLIF(loc.postal_code, ''), loc.zip5)), '')::text AS postal_code,
-            COALESCE(NULLIF(BTRIM(loc.country_code), ''), 'US')::text AS country_code,
-            loc.updated_at,
-            loc.source_id,
-            loc.resource_id
-          FROM {location_ref} AS loc
-         WHERE loc.address_key ~* '{uuid_re}'
-           AND NULLIF(BTRIM(COALESCE(NULLIF(loc.state_name, ''), loc.state_code)), '') IS NOT NULL
-           AND UPPER(NULLIF(BTRIM(COALESCE(NULLIF(loc.state_name, ''), loc.state_code)), ''))
-                NOT IN ('UN', 'XX', 'ZZ', 'NULL', 'N/A')
-           AND NULLIF(BTRIM(COALESCE(NULLIF(loc.postal_code, ''), loc.zip5)), '') IS NOT NULL
-           AND (
-                NULLIF(BTRIM(loc.first_line), '') IS NOT NULL
-             OR NULLIF(BTRIM(loc.city_name), '') IS NOT NULL
-           )
-           AND COALESCE(
-                NULLIF(
-                    UPPER(regexp_replace(COALESCE(NULLIF(loc.country_code, ''), 'US'), '[^A-Z0-9]', '', 'g')),
-                    ''
-                ),
-                'US'
-           ) IN ('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA', '840', '001')
-           {location_scope_sql}
-        UNION ALL
-        SELECT
-            {_q(schema)}.addr_key_v1(
-                NULLIF(BTRIM(addr.value->'line'->>0), ''),
-                NULLIF(BTRIM(addr.value->'line'->>1), ''),
-                NULLIF(BTRIM(addr.value->>'city'), ''),
-                NULLIF(BTRIM(addr.value->>'state'), ''),
-                NULLIF(BTRIM(addr.value->>'postalCode'), ''),
-                COALESCE(NULLIF(BTRIM(addr.value->>'country'), ''), 'US')
-            ) AS address_key,
-            NULLIF(BTRIM(addr.value->'line'->>0), '')::text AS first_line,
-            NULLIF(BTRIM(addr.value->'line'->>1), '')::text AS second_line,
-            NULLIF(BTRIM(addr.value->>'city'), '')::text AS city_name,
-            NULLIF(BTRIM(addr.value->>'state'), '')::text AS state_name,
-            NULLIF(BTRIM(addr.value->>'postalCode'), '')::text AS postal_code,
-            COALESCE(NULLIF(BTRIM(addr.value->>'country'), ''), 'US')::text AS country_code,
-            organization.updated_at,
-            organization.source_id,
-            organization.resource_id
-          FROM {organization_ref} AS organization
-          JOIN LATERAL jsonb_array_elements(
-                COALESCE(organization.address_json::jsonb, '[]'::jsonb)
-          ) WITH ORDINALITY AS addr(value, ordinal) ON TRUE
-         WHERE organization.npi BETWEEN 1000000000 AND 9999999999
-           AND organization.active IS DISTINCT FROM false
-           AND NULLIF(BTRIM(addr.value->'line'->>0), '') IS NOT NULL
-           AND NULLIF(BTRIM(addr.value->>'postalCode'), '') IS NOT NULL
-           AND (
-                NULLIF(BTRIM(addr.value->'line'->>0), '') IS NOT NULL
-             OR NULLIF(BTRIM(addr.value->>'city'), '') IS NOT NULL
-           )
-           AND NULLIF(BTRIM(addr.value->>'state'), '') IS NOT NULL
-           AND UPPER(NULLIF(BTRIM(addr.value->>'state'), ''))
-                NOT IN ('UN', 'XX', 'ZZ', 'NULL', 'N/A')
-           AND COALESCE(
-                NULLIF(
-                    UPPER(regexp_replace(COALESCE(NULLIF(addr.value->>'country', ''), 'US'), '[^A-Z0-9]', '', 'g')),
-                    ''
-                ),
-                'US'
-           ) IN ('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA', '840', '001')
-           {organization_scope_sql}
+        location_scope_clauses.append(
+            "loc.source_id = ANY(CAST(:source_ids AS varchar[]))"
+        )
+        organization_scope_clauses.append(
+            "organization.source_id = ANY(CAST(:source_ids AS varchar[]))"
+        )
+    return (
+        "".join(f"\n           AND {clause}" for clause in location_scope_clauses),
+        "".join(f"\n           AND {clause}" for clause in organization_scope_clauses),
     )
-    SELECT DISTINCT ON (address_key)
-        address_key,
-        first_line,
-        second_line,
-        city_name,
-        state_name,
-        postal_code,
-        country_code
-      FROM eligible
-     WHERE address_key IS NOT NULL
-     ORDER BY
-        address_key,
-        first_line IS NULL,
-        length(COALESCE(first_line, '')) DESC,
-        city_name IS NULL,
-        length(COALESCE(city_name, '')) DESC,
-        updated_at DESC NULLS LAST,
-        source_id,
-        resource_id;
-    """
+
+
+def provider_directory_location_archive_stage_sql(
+    db_schema: str | None = None,
+    stage_table: str | None = None,
+    *,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+    seen_table: str | None = None,
+) -> str:
+    """Build SQL for provider directory location archive stage."""
+
+    schema = db_schema or _schema()
+    stage = stage_table or _location_archive_stage_table_name()
+    location_scope_sql, organization_scope_sql = (
+        _provider_directory_location_archive_scope_sql(
+            schema,
+            run_id=run_id,
+            source_ids=source_ids,
+            seen_table=seen_table,
+        )
+    )
+    return _render_provider_directory_sql(
+        "provider_directory_location_archive_stage.sql",
+        {
+            "STAGE_REF": _qt(schema, stage),
+            "LOCATION_REF": _qt(schema, "provider_directory_location"),
+            "UUID_RE": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "LOCATION_SCOPE_SQL": location_scope_sql,
+            "SCHEMA_REF": _q(schema),
+            "ORGANIZATION_REF": _qt(schema, "provider_directory_organization"),
+            "ORGANIZATION_SCOPE_SQL": organization_scope_sql,
+        },
+    )
 
 
 def _provider_directory_openaddresses_archive_backfill_sql(schema: str, stage_table: str) -> str:
@@ -41476,170 +41038,22 @@ def provider_directory_network_catalog_insert_sql(
         run_id=run_id,
         source_ids=source_ids,
     )
-    return f"""
-    INSERT INTO {stage_ref} ({", ".join(_provider_directory_network_catalog_columns())})
-    WITH refs_raw AS MATERIALIZED (
-        SELECT
-            insurance_plan.source_id::varchar AS source_id,
-            'InsurancePlan'::varchar AS source_resource_type,
-            insurance_plan.resource_id::varchar AS source_resource_id,
-            network_ref.value::varchar AS network_ref,
-            insurance_plan.last_seen_run_id::varchar AS last_seen_run_id,
-            insurance_plan.observed_at AS source_observed_at,
-            insurance_plan.updated_at AS source_updated_at
-          FROM {_qt(schema, "provider_directory_insurance_plan")} AS insurance_plan
-         CROSS JOIN LATERAL jsonb_array_elements_text(
-                COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)
-         ) AS network_ref(value)
-         WHERE NULLIF(BTRIM(network_ref.value), '') IS NOT NULL
-           {insurance_plan_scope}
-        UNION ALL
-        SELECT
-            role.source_id::varchar AS source_id,
-            'PractitionerRole'::varchar AS source_resource_type,
-            role.resource_id::varchar AS source_resource_id,
-            network_ref.value::varchar AS network_ref,
-            role.last_seen_run_id::varchar AS last_seen_run_id,
-            role.observed_at AS source_observed_at,
-            role.updated_at AS source_updated_at
-          FROM {_qt(schema, "provider_directory_practitioner_role")} AS role
-         CROSS JOIN LATERAL jsonb_array_elements_text(
-                COALESCE(role.network_refs::jsonb, '[]'::jsonb)
-         ) AS network_ref(value)
-         WHERE role.active IS DISTINCT FROM false
-           AND NULLIF(BTRIM(network_ref.value), '') IS NOT NULL
-           {practitioner_role_scope}
-        UNION ALL
-        SELECT
-            affiliation.source_id::varchar AS source_id,
-            'OrganizationAffiliation'::varchar AS source_resource_type,
-            affiliation.resource_id::varchar AS source_resource_id,
-            network_ref.value::varchar AS network_ref,
-            affiliation.last_seen_run_id::varchar AS last_seen_run_id,
-            affiliation.observed_at AS source_observed_at,
-            affiliation.updated_at AS source_updated_at
-          FROM {_qt(schema, "provider_directory_organization_affiliation")} AS affiliation
-         CROSS JOIN LATERAL jsonb_array_elements_text(
-                COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb)
-         ) AS network_ref(value)
-         WHERE affiliation.active IS DISTINCT FROM false
-           AND NULLIF(BTRIM(network_ref.value), '') IS NOT NULL
-           {affiliation_scope}
-    ), refs AS MATERIALIZED (
-        SELECT
-            refs_raw.source_id,
-            refs_raw.source_resource_type,
-            refs_raw.source_resource_id,
-            refs_raw.network_ref,
-            {ref_resource_id_expr}::varchar AS network_resource_id,
-            refs_raw.last_seen_run_id,
-            refs_raw.source_observed_at,
-            refs_raw.source_updated_at
-          FROM refs_raw
-         WHERE NULLIF(BTRIM(refs_raw.network_ref), '') IS NOT NULL
-    ), joined AS MATERIALIZED (
-        SELECT
-            refs.source_id,
-            refs.source_resource_type,
-            refs.source_resource_id,
-            refs.network_ref,
-            refs.network_resource_id,
-            refs.last_seen_run_id,
-            refs.source_observed_at,
-            refs.source_updated_at,
-            NULLIF(BTRIM(network_org.name), '')::varchar AS provider_directory_network_name,
-            COALESCE(network_org.aliases::jsonb, '[]'::jsonb) AS aliases,
-            NULLIF(regexp_replace(lower(COALESCE(network_org.name, '')), '[^a-z0-9]+', '', 'g'), '')
-                AS provider_directory_network_key,
-            NULLIF(regexp_replace(lower(COALESCE(NULLIF(src.org_name, ''), src.plan_name, '')), '[^a-z0-9]+', '', 'g'), '')
-                AS provider_directory_issuer_key,
-            src.org_name::varchar AS source_org_name,
-            src.plan_name::varchar AS source_plan_name,
-            src.canonical_api_base::text AS canonical_api_base,
-            GREATEST(
-                COALESCE(refs.source_observed_at, TIMESTAMP 'epoch'),
-                COALESCE(refs.source_updated_at, TIMESTAMP 'epoch'),
-                COALESCE(network_org.observed_at, TIMESTAMP 'epoch'),
-                COALESCE(network_org.updated_at, TIMESTAMP 'epoch'),
-                COALESCE(src.updated_at, TIMESTAMP 'epoch')
-            ) AS observed_at
-          FROM refs
-          JOIN {_qt(schema, "provider_directory_organization")} AS network_org
-            ON network_org.source_id = refs.source_id
-           AND network_org.resource_id = refs.network_resource_id
-          JOIN {_qt(schema, "provider_directory_source")} AS src
-            ON src.source_id = refs.source_id
-         WHERE refs.network_resource_id IS NOT NULL
-           AND network_org.active IS DISTINCT FROM false
-           AND NULLIF(BTRIM(network_org.name), '') IS NOT NULL
-    ), keyed AS MATERIALIZED (
-        SELECT
-            joined.*,
-            CASE
-                WHEN joined.provider_directory_issuer_key IS NOT NULL
-                 AND joined.provider_directory_network_key IS NOT NULL
-                    THEN joined.provider_directory_issuer_key || ':' || joined.provider_directory_network_key
-                ELSE NULL
-            END::varchar AS provider_directory_issuer_network_match_key
-          FROM joined
-         WHERE joined.provider_directory_network_key IS NOT NULL
+    return _render_provider_directory_sql(
+        "provider_directory_network_catalog_insert.sql",
+        {
+            "STAGE_REF": stage_ref,
+            "COLUMNS_SQL": ', '.join(_provider_directory_network_catalog_columns()),
+            "INSURANCE_PLAN_REF": _qt(schema, 'provider_directory_insurance_plan'),
+            "INSURANCE_PLAN_SCOPE_SQL": insurance_plan_scope,
+            "PRACTITIONER_ROLE_REF": _qt(schema, 'provider_directory_practitioner_role'),
+            "PRACTITIONER_ROLE_SCOPE_SQL": practitioner_role_scope,
+            "ORGANIZATION_AFFILIATION_REF": _qt(schema, 'provider_directory_organization_affiliation'),
+            "AFFILIATION_SCOPE_SQL": affiliation_scope,
+            "NETWORK_RESOURCE_ID_SQL": ref_resource_id_expr,
+            "ORGANIZATION_REF": _qt(schema, 'provider_directory_organization'),
+            "SOURCE_REF": _qt(schema, 'provider_directory_source'),
+        },
     )
-    SELECT
-        keyed.source_id,
-        keyed.network_resource_id,
-        keyed.provider_directory_network_name,
-        keyed.provider_directory_network_key,
-        keyed.provider_directory_issuer_key,
-        keyed.provider_directory_issuer_network_match_key,
-        keyed.aliases,
-        COALESCE(
-            jsonb_agg(
-                DISTINCT jsonb_build_object(
-                    'resource_type', keyed.source_resource_type,
-                    'resource_id', keyed.source_resource_id,
-                    'ref', keyed.network_ref,
-                    'last_seen_run_id', keyed.last_seen_run_id
-                )
-            ),
-            '[]'::jsonb
-        ) AS refs,
-        jsonb_build_object(
-            'InsurancePlan', COUNT(DISTINCT keyed.source_resource_id)
-                FILTER (WHERE keyed.source_resource_type = 'InsurancePlan'),
-            'PractitionerRole', COUNT(DISTINCT keyed.source_resource_id)
-                FILTER (WHERE keyed.source_resource_type = 'PractitionerRole'),
-            'OrganizationAffiliation', COUNT(DISTINCT keyed.source_resource_id)
-                FILTER (WHERE keyed.source_resource_type = 'OrganizationAffiliation')
-        ) AS source_resource_counts,
-        (COUNT(DISTINCT keyed.source_resource_id)
-            FILTER (WHERE keyed.source_resource_type = 'InsurancePlan'))::bigint
-            AS insurance_plan_ref_count,
-        (COUNT(DISTINCT keyed.source_resource_id)
-            FILTER (WHERE keyed.source_resource_type = 'PractitionerRole'))::bigint
-            AS practitioner_role_ref_count,
-        (COUNT(DISTINCT keyed.source_resource_id)
-            FILTER (WHERE keyed.source_resource_type = 'OrganizationAffiliation'))::bigint
-            AS organization_affiliation_ref_count,
-        COUNT(DISTINCT keyed.source_resource_type || ':' || keyed.source_resource_id || ':' || keyed.network_ref)::bigint
-            AS distinct_ref_count,
-        keyed.source_org_name,
-        keyed.source_plan_name,
-        keyed.canonical_api_base,
-        MAX(keyed.observed_at) AS observed_at,
-        now() AS published_at
-      FROM keyed
-  GROUP BY
-        keyed.source_id,
-        keyed.network_resource_id,
-        keyed.provider_directory_network_name,
-        keyed.provider_directory_network_key,
-        keyed.provider_directory_issuer_key,
-        keyed.provider_directory_issuer_network_match_key,
-        keyed.aliases,
-        keyed.source_org_name,
-        keyed.source_plan_name,
-        keyed.canonical_api_base;
-    """
 
 
 async def _copy_existing_network_catalog(
@@ -43830,106 +43244,30 @@ def _canonical_backfill_resource_sql(resource_type: str, table_name: str) -> tup
         "AND NULLIF(r.source_id, '') IS NOT NULL "
         "AND NULLIF(r.resource_id, '') IS NOT NULL"
     )
-    canonical_sql = f"""
-        INSERT INTO {canonical_ref} (
-            canonical_api_base,
-            resource_type,
-            resource_id,
-            resource_url,
-            fhir_meta,
-            fhir_self_url,
-            fhir_fetch_url,
-            fhir_fetch_mode,
-            payload_hash,
-            payload_json,
-            first_seen_run_id,
-            last_seen_run_id,
-            observed_at,
-            updated_at
-        )
-        SELECT canonical_api_base,
-               resource_type,
-               resource_id,
-               resource_url,
-               fhir_meta,
-               fhir_self_url,
-               fhir_fetch_url,
-               fhir_fetch_mode,
-               payload_hash,
-               payload_json,
-               first_seen_run_id,
-               last_seen_run_id,
-               observed_at,
-               updated_at
-          FROM (
-            SELECT DISTINCT ON ({base_sql}, r.resource_id)
-                   {base_sql} AS canonical_api_base,
-                   {resource_type_literal} AS resource_type,
-                   r.resource_id,
-                   r.resource_url,
-                   r.fhir_meta,
-                   r.fhir_self_url,
-                   r.fhir_fetch_url,
-                   r.fhir_fetch_mode,
-                   md5(({payload_sql})::text) AS payload_hash,
-                   {payload_sql} AS payload_json,
-                   r.last_seen_run_id AS first_seen_run_id,
-                   r.last_seen_run_id,
-                   r.observed_at,
-                   COALESCE(r.updated_at, r.observed_at) AS updated_at
-              FROM {resource_ref} AS r
-              JOIN {source_ref} AS src
-                ON src.source_id = r.source_id
-             WHERE {rows_where}
-             ORDER BY {base_sql},
-                      r.resource_id,
-                      r.updated_at DESC NULLS LAST,
-                      r.observed_at DESC NULLS LAST,
-                      r.source_id
-          ) AS ranked
-        ON CONFLICT (canonical_api_base, resource_type, resource_id) DO UPDATE
-            SET resource_url = EXCLUDED.resource_url,
-                fhir_meta = EXCLUDED.fhir_meta,
-                fhir_self_url = EXCLUDED.fhir_self_url,
-                fhir_fetch_url = EXCLUDED.fhir_fetch_url,
-                fhir_fetch_mode = EXCLUDED.fhir_fetch_mode,
-                payload_hash = EXCLUDED.payload_hash,
-                payload_json = EXCLUDED.payload_json,
-                first_seen_run_id = COALESCE(
-                    {canonical_target}.first_seen_run_id,
-                    EXCLUDED.first_seen_run_id
-                ),
-                last_seen_run_id = EXCLUDED.last_seen_run_id,
-                observed_at = EXCLUDED.observed_at,
-                updated_at = EXCLUDED.updated_at;
-    """
-    edge_sql = f"""
-        INSERT INTO {edge_ref} (
-            source_id,
-            canonical_api_base,
-            resource_type,
-            resource_id,
-            last_seen_run_id,
-            observed_at,
-            updated_at
-        )
-        SELECT DISTINCT r.source_id,
-               {base_sql} AS canonical_api_base,
-               {resource_type_literal} AS resource_type,
-               r.resource_id,
-               r.last_seen_run_id,
-               r.observed_at,
-               COALESCE(r.updated_at, r.observed_at) AS updated_at
-          FROM {resource_ref} AS r
-          JOIN {source_ref} AS src
-            ON src.source_id = r.source_id
-         WHERE {rows_where}
-        ON CONFLICT (source_id, resource_type, resource_id) DO UPDATE
-            SET canonical_api_base = EXCLUDED.canonical_api_base,
-                last_seen_run_id = EXCLUDED.last_seen_run_id,
-                observed_at = EXCLUDED.observed_at,
-                updated_at = EXCLUDED.updated_at;
-    """
+    canonical_sql = _render_provider_directory_sql(
+        "provider_directory_canonical_resource_backfill.sql",
+        {
+            "CANONICAL_REF": canonical_ref,
+            "BASE_SQL": base_sql,
+            "RESOURCE_TYPE_SQL": resource_type_literal,
+            "PAYLOAD_SQL": payload_sql,
+            "RESOURCE_REF": resource_ref,
+            "SOURCE_REF": source_ref,
+            "ROWS_WHERE_SQL": rows_where,
+            "CANONICAL_TARGET": canonical_target,
+        },
+    )
+    edge_sql = _render_provider_directory_sql(
+        "provider_directory_source_resource_backfill.sql",
+        {
+            "EDGE_REF": edge_ref,
+            "BASE_SQL": base_sql,
+            "RESOURCE_TYPE_SQL": resource_type_literal,
+            "RESOURCE_REF": resource_ref,
+            "SOURCE_REF": source_ref,
+            "ROWS_WHERE_SQL": rows_where,
+        },
+    )
     return canonical_sql, edge_sql
 
 
