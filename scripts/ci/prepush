@@ -906,6 +906,7 @@ run_provider_directory_postgres() {
     tests/test_entity_address_unified_publication_db.py \
     tests/test_entity_address_unified_cutover_dependencies_db.py \
     tests/test_ptg2_reverse_geo_npi_lookup_postgres.py \
+    tests/test_ptg2_distance_exact_scope_postgres.py \
     tests/test_npi_geo_evidence_search_db.py \
     tests/test_entity_address_unified_archive_coordinates_db.py \
     tests/test_npi_phone_evidence_search_db.py \

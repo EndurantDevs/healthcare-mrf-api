@@ -305,6 +305,20 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
             assert "timeout --foreground 295s" in workflow_line
 
 
+def test_distance_scope_postgres_proof_runs_once() -> None:
+    prepush = (REPOSITORY_ROOT / "scripts" / "ci" / "prepush").read_text(
+        encoding="utf-8"
+    )
+    lifecycle_step = prepush.split("run_provider_directory_postgres() {", 1)[1].split(
+        "run_provider_profile_postgres() {", 1
+    )[0]
+    _assert_single_lifecycle_test(
+        prepush,
+        lifecycle_step,
+        "tests/test_ptg2_distance_exact_scope_postgres.py",
+    )
+
+
 def test_provider_directory_enrichment_postgres_proofs_run_exactly_once() -> None:
     """Keep the lifecycle and Profile database proofs in their owned shards."""
 
