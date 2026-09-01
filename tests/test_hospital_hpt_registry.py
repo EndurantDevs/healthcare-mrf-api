@@ -92,8 +92,6 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert len(registry.hospital_hpt_registry_groups()) == 7_028
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
-    assert "alias_of" not in hospital_by_id["hospital-000833"]
-    assert "alias_of" not in hospital_by_id["hospital-001199"]
     assert sum("locator_name" in entry for entry in hospitals) == 1_512
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 641
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 40
@@ -145,10 +143,8 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 328
-    assert {
-        hospital_id: aliases_by_id[hospital_id] for hospital_id in _REVIEWED_ALIAS_SAMPLES
-    } == _REVIEWED_ALIAS_SAMPLES
+    assert len(aliases_by_id) == 328 and not {"hospital-000833", "hospital-001199"} & aliases_by_id.keys()
+    assert {hospital_id: aliases_by_id[hospital_id] for hospital_id in _REVIEWED_ALIAS_SAMPLES} == _REVIEWED_ALIAS_SAMPLES
     assert hospital_by_id["hospital-000063"]["name"] == "Advanced Specialty Hospitals of Toledo"
 
 
