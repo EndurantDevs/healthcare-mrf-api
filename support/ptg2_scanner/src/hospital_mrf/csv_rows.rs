@@ -250,45 +250,54 @@ fn parse_tall_payer(
         }
         return Ok(None);
     }
+    let payer = PayerChargeRow {
+        payer_name: csv_value(record, columns.payer_name).to_owned(),
+        plan_name: csv_value(record, columns.plan_name).to_owned(),
+        standard_charge_dollar: optional_decimal(
+            csv_value(record, columns.standard_charge_dollar),
+            "standard_charge_dollar",
+        )?,
+        standard_charge_percentage: optional_decimal(
+            csv_value(record, columns.standard_charge_percentage),
+            "standard_charge_percentage",
+        )?,
+        standard_charge_algorithm: optional_text(csv_value(
+            record,
+            columns.standard_charge_algorithm,
+        )),
+        estimated_amount: optional_decimal(
+            csv_profile_value(record, columns.estimated_amount),
+            "estimated_amount",
+        )?,
+        median_amount: optional_decimal(
+            csv_profile_value(record, columns.median_amount),
+            "median_amount",
+        )?,
+        percentile_10: optional_decimal(
+            csv_profile_value(record, columns.percentile_10),
+            "10th_percentile",
+        )?,
+        percentile_90: optional_decimal(
+            csv_profile_value(record, columns.percentile_90),
+            "90th_percentile",
+        )?,
+        allowed_count: optional_text(csv_profile_value(record, columns.allowed_count))
+            .as_deref()
+            .map(|value| allowed_count(value, true))
+            .transpose()?,
+        methodology: csv_value(record, columns.methodology).to_owned(),
+        additional_payer_notes: generic_notes.and_then(optional_text),
+    };
+    if columns.profile == CmsProfile::V2
+        && !payer.payer_name.is_empty()
+        && !payer.plan_name.is_empty()
+        && !payer_has_charge(&payer)
+        && payer.methodology.is_empty()
+    {
+        return Ok(None);
+    }
     let payer = validate_csv_payer(
-        PayerChargeRow {
-            payer_name: csv_value(record, columns.payer_name).to_owned(),
-            plan_name: csv_value(record, columns.plan_name).to_owned(),
-            standard_charge_dollar: optional_decimal(
-                csv_value(record, columns.standard_charge_dollar),
-                "standard_charge_dollar",
-            )?,
-            standard_charge_percentage: optional_decimal(
-                csv_value(record, columns.standard_charge_percentage),
-                "standard_charge_percentage",
-            )?,
-            standard_charge_algorithm: optional_text(csv_value(
-                record,
-                columns.standard_charge_algorithm,
-            )),
-            estimated_amount: optional_decimal(
-                csv_profile_value(record, columns.estimated_amount),
-                "estimated_amount",
-            )?,
-            median_amount: optional_decimal(
-                csv_profile_value(record, columns.median_amount),
-                "median_amount",
-            )?,
-            percentile_10: optional_decimal(
-                csv_profile_value(record, columns.percentile_10),
-                "10th_percentile",
-            )?,
-            percentile_90: optional_decimal(
-                csv_profile_value(record, columns.percentile_90),
-                "90th_percentile",
-            )?,
-            allowed_count: optional_text(csv_profile_value(record, columns.allowed_count))
-                .as_deref()
-                .map(|value| allowed_count(value, true))
-                .transpose()?,
-            methodology: csv_value(record, columns.methodology).to_owned(),
-            additional_payer_notes: generic_notes.and_then(optional_text),
-        },
+        payer,
         generic_notes,
         true,
         columns.profile,
