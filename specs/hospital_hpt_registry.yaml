@@ -3851,9 +3851,11 @@ hospitals:
 - hospital_id: hospital-001160
   name: Centennial Hills
   cms_hpt_url: https://www.centennialhillshospital.com/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/204993360_centennial-hills-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-001161
   name: Centennial Hills Hospital Medical Center
   cms_hpt_url: https://www.centennialhillshospital.com/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/204993360_centennial-hills-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-001162
   name: CENTENNIAL HOSPITAL A CAMPUS OF TMCA
   cms_hpt_url: https://www.healthonecares.com/cms-hpt.txt
@@ -6249,6 +6251,7 @@ hospitals:
 - hospital_id: hospital-001891
   name: Elite Medical Center
   cms_hpt_url: https://www.valleyhospital.net/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/232973511_valley-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-001892
   name: Elizabethtown Community Hospital
   cms_hpt_url: https://www.uvmhealth.org/cms-hpt.txt
@@ -6871,9 +6874,11 @@ hospitals:
 - hospital_id: hospital-002093
   name: ER at Cadence
   cms_hpt_url: https://www.hendersonhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/811112022_henderson-hospital_standardcharges.csv
 - hospital_id: hospital-002094
   name: ER at Cadence, an Extension of Henderson Hospital
   cms_hpt_url: https://www.hendersonhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/811112022_henderson-hospital_standardcharges.csv
 - hospital_id: hospital-002095
   name: ER at Damonte Ranch, an Extension of Sierra Medical Center
   cms_hpt_url: https://nnsierra.com/cms-hpt.txt
@@ -6883,9 +6888,11 @@ hospitals:
 - hospital_id: hospital-002097
   name: ER at Desert Springs an Ext of Valley Hospital
   cms_hpt_url: https://www.valleyhospital.net/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/232973511_valley-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-002098
   name: ER at Desert Springs, an extension of Valley Hospital
   cms_hpt_url: https://www.valleyhospital.net/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/232973511_valley-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-002099
   name: ER at Desert's Edge
   cms_hpt_url: https://www.sunrisehealthinfo.com/cms-hpt.txt
@@ -6903,12 +6910,14 @@ hospitals:
 - hospital_id: hospital-002103
   name: ER at Green Valley Ranch, an Extension of Henderson Hospital
   cms_hpt_url: https://www.hendersonhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/811112022_henderson-hospital_standardcharges.csv
 - hospital_id: hospital-002104
   name: ER at McCarran NW, an Extension of Northern Nevada Medical Center
   cms_hpt_url: https://www.nnmc.com/cms-hpt.txt
 - hospital_id: hospital-002105
   name: ER at North Las Vegas
   cms_hpt_url: https://www.valleyhospital.net/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/232973511_valley-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-002106
   name: ER at Palma Sola
   cms_hpt_url: https://www.manateememorial.com/cms-hpt.txt
@@ -6940,6 +6949,7 @@ hospitals:
 - hospital_id: hospital-002114
   name: ER at South Summerlin, an extension of Summerlin Hospital
   cms_hpt_url: https://www.summerlinhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/232939047_summerlin-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-002115
   name: ER at Spanish Springs - and Extension of Northern Nevada Medical Center
   cms_hpt_url: https://www.nnmc.com/cms-hpt.txt
@@ -6963,9 +6973,11 @@ hospitals:
 - hospital_id: hospital-002121
   name: ER at Valley Vista, an Extension of Centennial Hills Hospital
   cms_hpt_url: https://www.centennialhillshospital.com/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/204993360_centennial-hills-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-002122
   name: ER at West Craig
   cms_hpt_url: https://www.centennialhillshospital.com/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/204993360_centennial-hills-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-002123
   name: ER at Westlake
   cms_hpt_url: https://www.wellingtonregional.com/cms-hpt.txt
@@ -9459,6 +9471,7 @@ hospitals:
 - hospital_id: hospital-002868
   name: Henderson Hospital
   cms_hpt_url: https://www.hendersonhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/811112022_henderson-hospital_standardcharges.csv
 - hospital_id: hospital-002869
   name: Henderson Hospital
   cms_hpt_url: https://www.deaconess.com/cms-hpt.txt
@@ -19396,6 +19409,7 @@ hospitals:
 - hospital_id: hospital-005881
   name: South Summerlin FED
   cms_hpt_url: https://www.summerlinhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/232939047_summerlin-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-005882
   name: South Texas Health System Behavioral
   cms_hpt_url: https://www.southtexashealthsystem.com/cms-hpt.txt
@@ -20956,6 +20970,7 @@ hospitals:
 - hospital_id: hospital-006347
   name: Summerlin Hospital Medical Center
   cms_hpt_url: https://www.summerlinhospital.com/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/232939047_summerlin-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-006348
   name: Summersville Regional Medical Center
   cms_hpt_url: https://wvumedicine.org/cms-hpt.txt
@@ -22872,6 +22887,7 @@ hospitals:
 - hospital_id: hospital-006938
   name: Valley Hospital Medical Center
   cms_hpt_url: https://www.valleyhospital.net/cms-hpt.txt
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/232973511_valley-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-006939
   name: Valley Medical Center
   cms_hpt_url: https://www.valleymed.org/cms-hpt.txt
