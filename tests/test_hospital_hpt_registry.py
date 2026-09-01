@@ -13,7 +13,7 @@ from tests.hospital_hpt_registry_fallbacks import (
 )
 _REVIEWED_ALIAS_SAMPLES = {
     f"hospital-{alias}": f"hospital-{canonical}"
-    for alias, canonical in (pair.split(":") for pair in "000061:000060 000064:000063 000123:000122 000162:000161 001486:001483 002520:002519 004667:004666 005329:005328 005563:001678 005564:001678 005565:001678 006233:005566 007207:007206 007272:000586 000121:000120 000342:000343 000593:000592 000654:000604 000655:000600 000656:000592 000657:000606 000745:000744 002911:000189 005797:005798 005077:005063 006650:006649 003017:003012 003068:003013 003069:003014 003070:003015 003071:003016 003072:003019 003073:003018 003074:003020 003075:003021 003076:003022 003077:003023 003078:003024 003079:003025 002432:002433 006299:006300 005971:005970 005973:005972 001882:001881 005163:005162 003238:005914 002844:004555 006900:006899 000905:000904 001851:006405 006402:002912 006403:006404 006987:006406 007167:007168 000229:000231 000230:000232 000806:000807 001263:006172 001264:006171 001265:006173 001266:006174 001267:006175 001270:000805 001272:006200 001273:006207 001274:006208 001275:006209 001276:006203 001280:001277 001533:001535 002319:002318 002377:002378 006164:006161 006190:006191 006212:006205 006215:006201 006225:006204 006226:006206 006237:006234 006263:005494 006264:005641 006265:005787 006549:001253 007234:007237 007235:007236 000902:000901 003410:003409 004869:004870 005186:005187 005357:005358 006266:005582 006285:006284 006330:005919 006331:005920 006651:006652".split())
+    for alias, canonical in (pair.split(":") for pair in "000061:000060 000064:000063 000123:000122 000162:000161 001486:001483 002520:002519 004667:004666 005329:005328 005563:001678 005564:001678 005565:001678 006233:005566 007207:007206 007272:000586 000121:000120 000342:000343 000593:000592 000654:000604 000655:000600 000656:000592 000657:000606 000745:000744 002911:000189 005797:005798 005077:005063 006650:006649 003017:003012 003068:003013 003069:003014 003070:003015 003071:003016 003072:003019 003073:003018 003074:003020 003075:003021 003076:003022 003077:003023 003078:003024 003079:003025 002432:002433 006299:006300 005971:005970 005973:005972 001882:001881 005163:005162 003238:005914 002844:004555 006900:006899 000905:000904 001851:006405 006402:002912 006403:006404 006987:006406 007167:007168 000229:000231 000230:000232 000806:000807 001263:006172 001264:006171 001265:006173 001266:006174 001267:006175 001270:000805 001272:006200 001273:006207 001274:006208 001275:006209 001276:006203 001280:001277 001533:001535 002319:002318 002377:002378 006164:006161 006190:006191 006212:006205 006215:006201 006225:006204 006226:006206 006237:006234 006263:005494 006264:005641 006265:005787 006549:001253 007234:007237 007235:007236 000902:000901 003410:003409 004869:004870 005186:005187 005357:005358 006266:005582 006285:006284 006330:005919 006331:005920 006651:006652 003161:003159 003172:003160".split())
 }
 _REVIEWED_LOCATOR_NAMES = {
     "hospital-000047": "Adair County Memorial Hospital",
@@ -28,6 +28,13 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-002260": "Franciscan Health Orthopedic-Carmel",
     "hospital-002421": "Grady Health System",
     "hospital-003238": "Southern Humboldt Community Hospital",
+    "hospital-003145": "Intermountain Health Good Samaritan Medical Center",
+    "hospital-003148": "Holy Rosary Healthcare",
+    "hospital-003157": "Platte Valley Medical Center",
+    "hospital-003163": "Saint Joseph Hospital",
+    "hospital-003168": "St. James Healthcare",
+    "hospital-003169": "St. Mary's Medical Center",
+    "hospital-003170": "St. Vincent Healthcare",
     "hospital-003240": "Jersey Community Hospital",
     "hospital-003592": "Little River Medical Center, INC DBA Little River Memorial Hospital",
     "hospital-005162": "Pioneer Memorial Hospital & Health Services",
@@ -53,14 +60,15 @@ hospitals:
 
 
 def test_checked_in_registry_has_exact_source_neutral_shape():
+    """Keep the checked-in registry shape and reviewed counts stable."""
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 7_028
+    assert len(registry.hospital_hpt_registry_groups()) == 7_026
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
-    assert sum("locator_name" in entry for entry in hospitals) == 1_513
-    assert sum("locator_mrf_url" in entry for entry in hospitals) == 641
+    assert sum("locator_name" in entry for entry in hospitals) == 1_522
+    assert sum("locator_mrf_url" in entry for entry in hospitals) == 646
     assert sum("fallback_mrf_url" in entry for entry in hospitals) == 56
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
@@ -110,10 +118,36 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 328
+    assert len(aliases_by_id) == 330
     assert not {"hospital-000833", "hospital-001199"} & aliases_by_id.keys()
-    assert {hospital_id: aliases_by_id[hospital_id] for hospital_id in _REVIEWED_ALIAS_SAMPLES} == _REVIEWED_ALIAS_SAMPLES
-    assert hospital_by_id["hospital-000063"]["name"] == "Advanced Specialty Hospitals of Toledo"
+    assert {
+        hospital_id: aliases_by_id[hospital_id]
+        for hospital_id in _REVIEWED_ALIAS_SAMPLES
+    } == _REVIEWED_ALIAS_SAMPLES
+    assert hospital_by_id["hospital-000063"]["name"] == (
+        "Advanced Specialty Hospitals of Toledo"
+    )
+
+
+def test_primary_childrens_campuses_use_distinct_locator_records():
+    """Keep each reviewed campus bound to its own locator record."""
+    hospital_by_id = {
+        entry["hospital_id"]: entry for entry in registry.load_hospital_hpt_registry()
+    }
+    prefix = (
+        "https://intermountainhealthcare.org/-/media/files/intermountain-health/"
+        "locations/hospital-prices/"
+    )
+    assert {
+        suffix: hospital_by_id[f"hospital-0031{suffix}"]["locator_mrf_url"].removeprefix(prefix)
+        for suffix in ("58", "59", "60", "61", "72")
+    } == {
+        "58": "942854057_primary-childrens-hospital_lehi_standardcharges.ashx",
+        "59": "942854057_primary-childrens-hospital_taylorsville_standardcharges.ashx",
+        "60": "942854057_primary-childrens-hospital_standardcharges.ashx",
+        "61": "942854057_primary-childrens-hospital_taylorsville_standardcharges.ashx",
+        "72": "942854057_primary-childrens-hospital_standardcharges.ashx",
+    }
 
 
 def test_checked_in_registry_has_reviewed_wvu_legal_name_aliases():

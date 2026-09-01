@@ -120,6 +120,8 @@ def _line_field(
         return "mrf-url", stripped_line
     raw_key, separator, raw_value = line.partition(":")
     key = raw_key.strip().casefold()
+    if key == "location name":
+        key = "location-name"
     if not separator or not key:
         raise _locator_error("line")
     return key, raw_value.strip()
