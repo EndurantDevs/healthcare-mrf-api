@@ -165,17 +165,30 @@ async def test_selected_release_prefers_ready_em_distance_projection(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_em_distance_reader_falls_through_without_attachment():
+async def test_em_distance_reader_handles_attachment_boundary():
     class Result:
+        def __init__(self, ready):
+            self.ready = ready
+
         def mappings(self):
             return self
 
         def all(self):
-            return [{"projection_ready": False, "total": 0}]
+            return [
+                {
+                    "projection_ready": self.ready,
+                    "candidate_count": 0,
+                    "unique_count": 0,
+                    "npi": None,
+                }
+            ]
 
     class Session:
+        def __init__(self, ready=False):
+            self.ready = ready
+
         async def execute(self, *_args, **_kwargs):
-            return Result()
+            return Result(self.ready)
 
     selection = PlanReleaseServingSelection(
         serving_revision_id="hpserve_test",
@@ -210,6 +223,21 @@ async def test_em_distance_reader_falls_through_without_attachment():
         args_by_name,
         SimpleNamespace(limit=10, offset=191, page=20),
     ) is None
+
+    response = await search_plan_pricing_em_distance(
+        Session(ready=True),
+        selection,
+        args_by_name,
+        SimpleNamespace(limit=10, offset=0, page=1),
+    )
+
+    assert response is not None
+    assert (
+        response["result_state"],
+        response["items"],
+        response["pagination"]["total_is_exact"],
+        response["pagination"]["has_more"],
+    ) == ("no_match_in_radius", [], True, False)
 
 
 @pytest.mark.asyncio
