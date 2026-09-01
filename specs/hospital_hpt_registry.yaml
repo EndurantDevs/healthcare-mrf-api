@@ -7418,7 +7418,8 @@ hospitals:
   cms_hpt_url: https://www.franciscanhealth.org/cms-hpt.txt
 - hospital_id: hospital-002260
   name: Franciscan Health Indianapolis Orthopedic Hospital
-  cms_hpt_url: https://media.franciscanhealth.org/cms-hpt.txt
+  cms_hpt_url: https://www.franciscanhealth.org/cms-hpt.txt
+  locator_name: Franciscan Health Orthopedic-Carmel
 - hospital_id: hospital-002261
   name: Franciscan Health Lafayette
   cms_hpt_url: https://www.franciscanhealth.org/cms-hpt.txt
