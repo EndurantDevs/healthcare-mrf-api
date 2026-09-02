@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -55,6 +55,9 @@ async def test_authority_revision_observes_a_b_a_and_replays_latest_identically(
     revisions, latest, ensure_proof, store = _mock_authority_registry(
         monkeypatch
     )
+    ordered_calls = Mock()
+    ordered_calls.attach_mock(ensure_proof, "ensure_proof")
+    ordered_calls.attach_mock(latest, "latest_observation")
 
     first = await selection._register_selection_proof(computed_selection)
     latest.return_value = _observation(computed_selection, first)
@@ -70,5 +73,9 @@ async def test_authority_revision_observes_a_b_a_and_replays_latest_identically(
     assert third.proof_id == first.proof_id
     assert replay.payload == third.payload
     assert revisions.await_count == 3
-    assert ensure_proof.await_count == 3
+    assert ensure_proof.await_count == 4
     assert store.await_count == 3
+    assert [entry[0] for entry in ordered_calls.mock_calls] == [
+        "ensure_proof",
+        "latest_observation",
+    ] * 4

@@ -49,7 +49,6 @@ from process.provider_directory_profile_selection_snapshot import (
 
 
 _AUTHORITY_KEY = "global"
-_AUTHORITY_LOCK_KEY = "provider-directory-profile-selection-authority:v1"
 _REQUEST_FIELDS = {
     "contract_id",
     "node_id",
@@ -199,6 +198,15 @@ async def _next_authority_revision() -> int:
     return revision
 
 
+async def _lock_selection_authority() -> None:
+    """Serialize attestations before REPEATABLE READ freezes its snapshot."""
+
+    await db.status(
+        f"LOCK TABLE {_table_ref(ProviderDirectoryProfileSelectionProof)} "
+        "IN SHARE ROW EXCLUSIVE MODE;"
+    )
+
+
 def _attestation_payload(
     identity_map: Mapping[str, Any],
     authority_revision: int,
@@ -290,10 +298,7 @@ async def _register_selection_proof(
 
     identity_map = computed_selection.identity_payload
     identity_digest = _input_identity_digest(identity_map)
-    await db.scalar(
-        "SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0));",
-        lock_key=_AUTHORITY_LOCK_KEY,
-    )
+    await _ensure_selection_proof(identity_digest, identity_map)
     latest_observation = await _latest_registered_observation()
     if latest_observation is not None:
         latest_attestation = validated_profile_selection_attestation(
@@ -305,7 +310,6 @@ async def _register_selection_proof(
                     "provider_directory_profile_selection_registry_corrupt"
                 )
             return latest_attestation
-    await _ensure_selection_proof(identity_digest, identity_map)
     authority_revision = await _next_authority_revision()
     attestation_map = _attestation_payload(identity_map, authority_revision)
     if attestation_map["proof_id"] != _proof_id(identity_map):
@@ -331,7 +335,7 @@ def _expected_request(
 async def current_profile_selection_request(
     catalog_map: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Project the exact current selection used by the locked attestation."""
+    """Project a header-current proposal for the locked exact attestation."""
 
     node_id = configured_node_id()
     async with db.transaction():
@@ -340,6 +344,7 @@ async def current_profile_selection_request(
             catalog_map,
             node_id=node_id,
             lock_selection=False,
+            exact_readiness=False,
         )
     return _expected_request(computed_selection, node_id)
 
@@ -354,6 +359,7 @@ async def attest_profile_selection(
     node_id = configured_node_id()
     async with db.transaction():
         await db.status("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+        await _lock_selection_authority()
         computed_selection = await _compute_current_selection(
             catalog_map,
             node_id=node_id,
@@ -363,17 +369,7 @@ async def attest_profile_selection(
             raise ProviderDirectoryProfileSelectionDrift(
                 "provider_directory_profile_selection_drift"
             )
-    async with db.transaction():
         attestation = await _register_selection_proof(computed_selection)
-    try:
-        await assert_registered_profile_selection_current(
-            attestation,
-            catalog_map,
-        )
-    except ProviderDirectoryProfileSelectionStale as exc:
-        raise ProviderDirectoryProfileSelectionDrift(
-            "provider_directory_profile_selection_drift"
-        ) from exc
     return dict(attestation.payload)
 
 

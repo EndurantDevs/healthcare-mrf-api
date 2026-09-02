@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -172,6 +173,7 @@ async def test_register_selection_rejects_registry_and_proof_corruption(
         "payload_json": _attestation().payload,
     }
     monkeypatch.setattr(selection.db, "scalar", AsyncMock())
+    monkeypatch.setattr(selection, "_ensure_selection_proof", AsyncMock())
     monkeypatch.setattr(
         selection,
         "_latest_registered_observation",
@@ -186,7 +188,6 @@ async def test_register_selection_rejects_registry_and_proof_corruption(
         "_latest_registered_observation",
         AsyncMock(return_value=None),
     )
-    monkeypatch.setattr(selection, "_ensure_selection_proof", AsyncMock())
     monkeypatch.setattr(
         selection, "_next_authority_revision", AsyncMock(return_value=4)
     )
@@ -206,34 +207,32 @@ async def test_attest_profile_selection_maps_drift_and_returns_registered_proof(
 ):
     computed = _computed()
     attestation = _attestation()
+    active_transactions = []
+
+    @asynccontextmanager
+    async def tracked_transaction() -> AsyncIterator[None]:
+        active_transactions.append(True)
+        try:
+            yield
+        finally:
+            active_transactions.pop()
+
+    async def register_selection_proof(_computed: object) -> object:
+        assert active_transactions
+        return attestation
+
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
-    monkeypatch.setattr(selection.db, "transaction", lambda: _transaction())
+    monkeypatch.setattr(selection.db, "transaction", tracked_transaction)
     monkeypatch.setattr(selection.db, "status", AsyncMock())
-    monkeypatch.setattr(
-        selection,
-        "_compute_current_selection",
-        AsyncMock(return_value=computed),
-    )
-    monkeypatch.setattr(
-        selection,
-        "_register_selection_proof",
-        AsyncMock(return_value=attestation),
-    )
-    current = AsyncMock()
-    monkeypatch.setattr(
-        selection, "assert_registered_profile_selection_current", current
-    )
+    compute = AsyncMock(return_value=computed)
+    monkeypatch.setattr(selection, "_compute_current_selection", compute)
+    register = AsyncMock(side_effect=register_selection_proof)
+    monkeypatch.setattr(selection, "_register_selection_proof", register)
 
     drifted_request = _valid_request()
     drifted_request["selection_fingerprint"] = "c" * 64
     with pytest.raises(selection.ProviderDirectoryProfileSelectionDrift):
         await selection.attest_profile_selection(drifted_request, _catalog())
-
-    current.side_effect = selection.ProviderDirectoryProfileSelectionStale("stale")
-    with pytest.raises(selection.ProviderDirectoryProfileSelectionDrift):
-        await selection.attest_profile_selection(_valid_request(), _catalog())
-
-    current.side_effect = None
     assert (
         await selection.attest_profile_selection(
             _valid_request(),
@@ -241,6 +240,8 @@ async def test_attest_profile_selection_maps_drift_and_returns_registered_proof(
         )
         == attestation.payload
     )
+    assert compute.await_count == 2
+    register.assert_awaited_once_with(computed)
 
 
 @pytest.mark.asyncio
