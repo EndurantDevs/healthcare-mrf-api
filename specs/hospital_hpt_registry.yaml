@@ -4895,12 +4895,15 @@ hospitals:
 - hospital_id: hospital-001479
   name: College Medical Center
   cms_hpt_url: https://collegemedicalcenter.com/cms-hpt.txt
+  fallback_mrf_url: https://rca.elevatepfs.com/ptapp/api/cdm/export/oneclick?recno=c03ea0e53387f2e22f8262e5ee5ac871e45c53fb6ce9ca014b7159b7175da354
 - hospital_id: hospital-001480
   name: College Medical Center Hawthorne Campus
   cms_hpt_url: https://collegemedicalcenter.com/cms-hpt.txt
+  fallback_mrf_url: https://rca.elevatepfs.com/ptapp/api/cdm/export/oneclick?recno=c03ea0e53387f2e22f8262e5ee5ac871e45c53fb6ce9ca014b7159b7175da354
 - hospital_id: hospital-001481
   name: College Medical Center South Campus
   cms_hpt_url: https://collegemedicalcenter.com/cms-hpt.txt
+  fallback_mrf_url: https://rca.elevatepfs.com/ptapp/api/cdm/export/oneclick?recno=c03ea0e53387f2e22f8262e5ee5ac871e45c53fb6ce9ca014b7159b7175da354
 - hospital_id: hospital-001482
   name: COLLETON MEDICAL CENTER
   cms_hpt_url: https://colletonmedical.com/cms-hpt.txt
@@ -14292,6 +14295,7 @@ hospitals:
 - hospital_id: hospital-004321
   name: Montgomery County Memorial Hospital
   cms_hpt_url: https://www.mcmh.org/cms-hpt.txt
+  fallback_mrf_url: https://rca.elevatepfs.com/ptapp/api/cdm/export/oneclick?recno=7eed21b4b6892fee3239bc677deed8474eef32f00c7fe9fd76920a0bdc451d9e
 - hospital_id: hospital-004322
   alias_of: hospital-004323
   name: MONTROSE MEMORIAL HOSPITAL INC
