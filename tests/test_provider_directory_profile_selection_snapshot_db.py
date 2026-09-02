@@ -57,11 +57,8 @@ async def test_snapshot_current_selection_honors_optional_lock(monkeypatch):
         "_selection_source_rows",
         AsyncMock(return_value=[_source_row(), *_variant_registry_rows()]),
     )
-    monkeypatch.setattr(
-        snapshot,
-        "_selection_dataset_rows",
-        AsyncMock(return_value=[_dataset_row()]),
-    )
+    dataset_rows = AsyncMock(return_value=[_dataset_row()])
+    monkeypatch.setattr(snapshot, "_selection_dataset_rows", dataset_rows)
     unlocked = await snapshot._compute_current_selection(
         _catalog(),
         node_id="dev-node",
@@ -80,6 +77,11 @@ async def test_snapshot_current_selection_honors_optional_lock(monkeypatch):
     )
     assert unlocked == locked == proposal
     lock.assert_awaited_once_with()
+    assert [await_call.kwargs for await_call in dataset_rows.await_args_list] == [
+        {"exact_readiness": True},
+        {"exact_readiness": True},
+        {"exact_readiness": False},
+    ]
 
 
 def _variant_registry_rows() -> list[dict[str, object]]:
