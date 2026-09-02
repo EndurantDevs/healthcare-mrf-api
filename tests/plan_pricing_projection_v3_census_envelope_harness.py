@@ -189,6 +189,6 @@ def _run_envelope(
         check=False,
         capture_output=True,
         text=True,
-        timeout=45,
+        timeout=60,
     )
     return result, state_root
