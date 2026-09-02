@@ -1,5 +1,5 @@
 -r requirements.txt
-coverage==7.15.4
+coverage==7.16.0
 iniconfig>=2.3.0
 maturin>=1.15.0,<2
 pluggy>=1.6.0
