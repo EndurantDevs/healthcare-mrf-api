@@ -364,23 +364,6 @@ jobs:
           persist-credentials: false
       - name: Run shared pre-push gate
         run: scripts/ci/prepush container-package
-  generate-python-lock:
-    name: generate Python dependency lock
-    if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: Generate native Linux/amd64 lock
-        run: scripts/ci/compile_python_lock
-      - name: Upload generated lock
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: python-dependency-lock
-          path: requirements-ci.lock
-          retention-days: 1
   security:
     name: dependency and semgrep security
     runs-on: >-
