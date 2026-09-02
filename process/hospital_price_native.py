@@ -41,6 +41,7 @@ HOSPITAL_MRF_MAX_DECOMPRESSED_BYTES_ENV = (
 )
 DEFAULT_HOSPITAL_MRF_MAX_DECOMPRESSED_BYTES = 64 * 1024**3
 HOSPITAL_MRF_FORMAT_DETECTION_MAX_BYTES = 64 * 1024**2
+_CP1252_NBSP_SURROGATE = "\udca0"
 
 
 def hospital_price_version_id(content_sha256: str) -> str:
@@ -192,21 +193,31 @@ def detect_hospital_mrf_format(
     with _open_payload(Path(path), max_decompressed_bytes) as payload_stream, io.TextIOWrapper(
         payload_stream, encoding="utf-8-sig", errors="surrogateescape", newline=""
     ) as text_source:
-        text = text_source.read(4096)
-    first = text.lstrip()[:1]
+        first = ""
+        while not first:
+            text = text_source.read(4096)
+            if not text:
+                raise ValueError("hospital MRF input is empty")
+            first = text.lstrip()[:1]
     if first == "{":
         return "json"
-    if not first:
-        raise ValueError("hospital MRF input is empty")
 
     with _open_payload(Path(path), max_decompressed_bytes) as payload_stream, io.TextIOWrapper(
         payload_stream, encoding="utf-8-sig", errors="surrogateescape", newline=""
     ) as text_source:
         reader = csv.reader(text_source)
+        structural_rows = (
+            csv_record
+            for csv_record in reader
+            if any(
+                field.replace(_CP1252_NBSP_SURROGATE, " ").strip()
+                for field in csv_record
+            )
+        )
         try:
-            next(reader)
-            next(reader)
-            headers = next(reader)
+            next(structural_rows)
+            next(structural_rows)
+            headers = next(structural_rows)
         except (StopIteration, csv.Error) as exc:
             raise ValueError("hospital CSV is missing its three header rows") from exc
     normalized_headers = {header.strip().casefold() for header in headers}

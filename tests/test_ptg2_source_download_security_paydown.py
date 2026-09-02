@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from tests.ptg2_source_download_security_support import (
+    PTG2ArtifactStore,
+    asyncio,
+    pytest,
+    source_download,
+)
+
 from tests.ptg2_source_download_security_request_cases import (
     test_container_validation_covers_unreadable_corrupt_empty_and_size_skip,
     test_resume_offset_and_progress_coercion_failure_paths,
@@ -48,3 +55,22 @@ from tests.ptg2_source_download_security_edge_cases import (
     test_corrupt_reuse_candidate_is_recorded_before_fresh_download,
     test_fresh_truncated_gzip_fails_full_integrity_check,
 )
+
+
+def test_pre_request_failure_is_marked_as_zero_body(monkeypatch, tmp_path) -> None:
+    failure = OSError("resolver unavailable")
+
+    async def fail_before_request(_url: str) -> None:
+        raise failure
+
+    monkeypatch.setattr(source_download, "assert_safe_url", fail_before_request)
+
+    with pytest.raises(OSError, match="resolver unavailable"):
+        asyncio.run(
+            source_download.download_raw_artifact(
+                "https://hospital.example/cms-hpt.txt",
+                store=PTG2ArtifactStore(tmp_path / "store"),
+            )
+        )
+
+    assert failure._ptg2_response_body_started is False

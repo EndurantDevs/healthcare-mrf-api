@@ -36,10 +36,13 @@ fn next_csv_record<R: Read>(
     records: &mut csv::StringRecordsIter<'_, R>,
     name: &str,
 ) -> io::Result<StringRecord> {
-    match records.next() {
-        Some(record) => record.map_err(to_io_error),
-        None => Err(invalid(format!("missing {name}"))),
+    for record in records {
+        let record = record.map_err(to_io_error)?;
+        if record.iter().any(|value| !value.trim().is_empty()) {
+            return Ok(record);
+        }
     }
+    Err(invalid(format!("missing {name}")))
 }
 
 fn parse_csv_metadata(
