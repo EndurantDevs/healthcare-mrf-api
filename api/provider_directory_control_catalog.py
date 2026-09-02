@@ -17,6 +17,7 @@ from process.provider_directory_profile_selection import (
 )
 
 _OUTCOME_ENRICHMENT_TIMEOUT_SECONDS = 5.0
+_SELECTION_PROJECTION_TIMEOUT_SECONDS = 5.0
 
 
 async def provider_directory_control_catalog() -> dict[str, Any]:
@@ -25,7 +26,8 @@ async def provider_directory_control_catalog() -> dict[str, Any]:
     static_map = provider_directory_source_catalog()
     selection_payload = None
     try:
-        selection_payload = await current_profile_selection_request(static_map)
+        async with asyncio.timeout(_SELECTION_PROJECTION_TIMEOUT_SECONDS):
+            selection_payload = await current_profile_selection_request(static_map)
     except Exception:
         logging.getLogger(__name__).warning(
             "Provider Directory selection projection failed",

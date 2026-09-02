@@ -145,6 +145,44 @@ async def test_control_catalog_bounds_optional_outcome_enrichment(monkeypatch):
     }
 
 
+@pytest.mark.asyncio
+async def test_control_catalog_bounds_optional_selection_projection(monkeypatch):
+    static_map = {"catalog_digest": "a" * 64, "items": []}
+    enriched_map = {"catalog_digest": "a" * 64, "items": [{}]}
+    blocked = asyncio.Event()
+
+    async def blocked_selection(_static_map):
+        await blocked.wait()
+
+    monkeypatch.setattr(
+        control_catalog,
+        "provider_directory_source_catalog",
+        lambda: static_map,
+    )
+    monkeypatch.setattr(
+        control_catalog,
+        "current_profile_selection_request",
+        blocked_selection,
+    )
+    monkeypatch.setattr(
+        control_catalog,
+        "enrich_provider_directory_source_catalog",
+        AsyncMock(return_value=enriched_map),
+    )
+    monkeypatch.setattr(
+        control_catalog,
+        "_SELECTION_PROJECTION_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    catalog_map = await asyncio.wait_for(
+        control_catalog.provider_directory_control_catalog(),
+        timeout=1,
+    )
+
+    assert catalog_map == enriched_map
+
+
 @asynccontextmanager
 async def _transaction():
     yield
