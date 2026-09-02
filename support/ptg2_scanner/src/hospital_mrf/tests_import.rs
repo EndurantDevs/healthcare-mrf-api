@@ -300,11 +300,12 @@
         assert_eq!(tall_payer_fields.len(), 2);
         assert_eq!(
             &tall_payer_fields[0][5..],
-            &["Tall payer note", "150", "\\N", "\\N"]
+            &["\\N", "Tall payer note", "150", "\\N", "\\N"]
         );
         assert_eq!(
             &tall_payer_fields[1][3..],
             &[
+                "\\N",
                 "\\N",
                 "\\N",
                 "Applies,\\nwhen documented",
@@ -330,7 +331,10 @@
         let wide_payers = String::from_utf8(wide_rows["modifier_payer"].clone()).unwrap();
         let wide_payer_fields = wide_payers.trim_end().split('\t').collect::<Vec<_>>();
         assert_eq!(wide_payer_fields.len(), MODIFIER_PAYER_COPY_COLUMNS.len());
-        assert_eq!(&wide_payer_fields[5..], &["\\N", "\\N", "62.5", "\\N"]);
+        assert_eq!(
+            &wide_payer_fields[5..],
+            &["\\N", "\\N", "\\N", "62.5", "\\N"]
+        );
 
         let merged_wide = append_csv_row(
             &fixture_wide_csv(),
@@ -412,7 +416,7 @@
         );
         assert_eq!(
             String::from_utf8(json_rows["modifier_payer"].clone()).unwrap(),
-            "fixture-version\t0\t0\tPayer, Inc.\tPlan A\tContract note\t\\N\t\\N\t\\N\n"
+            "fixture-version\t0\t0\tPayer, Inc.\tPlan A\t\\N\tContract note\t\\N\t\\N\t\\N\n"
         );
     }
 
@@ -429,7 +433,7 @@
         let rows = run_fixture(InputFormat::TallCsv, &anonymous, false);
         let payer = String::from_utf8(rows["modifier_payer"].clone()).unwrap();
         let fields = payer.trim_end().split('\t').collect::<Vec<_>>();
-        assert_eq!(&fields[3..7], &["\\N", "\\N", "\\N", "150"]);
+        assert_eq!(&fields[3..8], &["\\N", "\\N", "\\N", "\\N", "150"]);
 
         let note_only = append_csv_row(
             &fixture_tall_csv(),
@@ -442,7 +446,10 @@
         let rows = run_fixture(InputFormat::TallCsv, &note_only, false);
         let payer = String::from_utf8(rows["modifier_payer"].clone()).unwrap();
         let fields = payer.trim_end().split('\t').collect::<Vec<_>>();
-        assert_eq!(&fields[3..7], &["\\N", "\\N", "Explain adjustment", "\\N"]);
+        assert_eq!(
+            &fields[3..8],
+            &["\\N", "\\N", "\\N", "Explain adjustment", "\\N"]
+        );
 
         for (payer_name, plan_name, expected) in [
             ("Payer", "", "modifier payer evidence requires plan_name"),

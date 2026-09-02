@@ -280,6 +280,7 @@ fn emit_modifier_payer(
                 Some(&payer_ordinal),
                 payer.payer_name.as_deref(),
                 payer.plan_name.as_deref(),
+                payer.negotiated_rate_term.as_deref(),
                 payer.description.as_deref(),
                 payer.standard_charge_dollar.as_deref(),
                 payer.standard_charge_percentage.as_deref(),
