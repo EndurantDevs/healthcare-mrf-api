@@ -193,25 +193,17 @@ def test_checked_in_registry_is_checksum_gated(tmp_path, monkeypatch):
 
 def test_shared_ids_expand_as_one_canonical_group(tmp_path, monkeypatch):
     locator = "http://hospital.example:8080/nonstandard/path?view=current"
-    hospitals = _load(
-        tmp_path,
-        _document(locator).replace(
-            "hospital_id: hospital-000001",
-            "hospital_ids:\n    - hospital-000001\n    - hospital-000002",
-        ),
+    document = _document(locator).replace(
+        "hospital_id: hospital-000001",
+        "hospital_ids:\n    - hospital-000001\n    - hospital-000002",
     )
-    assert [entry["cms_hpt_url"] for entry in hospitals] == [locator, locator]
-    assert [entry["name"] for entry in hospitals] == [
-        "Example Hospital",
-        "Example Hospital",
-    ]
-    assert "alias_of" not in hospitals[0]
-    assert hospitals[1]["alias_of"] == "hospital-000001"
+    hospitals = _load(tmp_path, document)
+    assert {entry["cms_hpt_url"] for entry in hospitals} == {locator}
+    assert {entry["name"] for entry in hospitals} == {"Example Hospital"}
+    assert [entry.get("alias_of") for entry in hospitals] == [None, "hospital-000001"]
     monkeypatch.setattr(registry, "load_hospital_hpt_registry", lambda: hospitals)
     assert registry.hospital_hpt_registry_groups() == (hospitals,)
-    assert registry.selected_hospital_hpt_registry(
-        {"hospital_id": "hospital-000002"}
-    ) == hospitals
+    assert registry.selected_hospital_hpt_registry({"hospital_id": "hospital-000002"}) == hospitals
 
 
 def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypatch):
