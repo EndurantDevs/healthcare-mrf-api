@@ -1859,91 +1859,142 @@ def _credential_template_rule_for_group(
     return credential_rule_dict
 
 
-def _credential_config_template_export(report: dict[str, Any]) -> dict[str, Any]:
-    """Build reviewable host and API-base credential rule templates."""
-    backlog = _credential_backlog_export(report)
-    backlog_groups = backlog.get("groups") or []
+def _credential_groups_by_host(
+    backlog_groups: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
     groups_by_host: dict[str, list[dict[str, Any]]] = {}
     for group in backlog_groups:
         source_host = _clean_text(group.get("source_host"))
         if source_host and source_host != "(missing host)":
             groups_by_host.setdefault(source_host, []).append(group)
+    return groups_by_host
+
+
+def _credential_host_rule(
+    group: dict[str, Any],
+    source_host: str,
+    host_groups: list[dict[str, Any]],
+    hosts_by_name: dict[str, dict[str, Any]],
+) -> list[str]:
+    host_rule_dict = hosts_by_name.setdefault(
+        source_host,
+        {
+            "_notes": [
+                "Review payer developer portal requirements before enabling.",
+                "Replace env placeholders with host-specific secret names in the deployment environment.",
+            ],
+        },
+    )
+    review_reasons = [
+        *_credential_template_review_reasons(group),
+        *_credential_template_host_review_reasons(host_groups),
+    ]
+    if review_reasons:
+        existing_review_reasons = list(host_rule_dict.get("_review") or [])
+        for reason in review_reasons:
+            if reason not in existing_review_reasons:
+                existing_review_reasons.append(reason)
+        host_rule_dict["_review"] = existing_review_reasons
+    for key, rule_value in _credential_template_rule_for_group(
+        group,
+        _credential_env_prefix(source_host),
+    ).items():
+        host_rule_dict.setdefault(key, rule_value)
+    return review_reasons
+
+
+def _credential_api_base_rule_samples(
+    group: dict[str, Any],
+    review_reasons: list[str],
+    api_bases_by_canonical_base: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    samples_by_base: dict[str, dict[str, Any]] = {}
+    if not review_reasons:
+        return samples_by_base
+    for api_base in _credential_template_api_base_candidates(group):
+        api_base_rule = api_bases_by_canonical_base.setdefault(
+            api_base,
+            {
+                "_notes": [
+                    "Path-scoped candidate generated because the host-level rule needs review.",
+                    "Confirm this exact FHIR base and credential scheme before enabling.",
+                ],
+            },
+        )
+        for key, rule_value in _credential_template_rule_for_group(
+            group,
+            _credential_api_base_env_prefix(api_base),
+        ).items():
+            api_base_rule.setdefault(key, rule_value)
+        samples_by_base[api_base] = api_base_rule
+    return samples_by_base
+
+
+def _credential_template_rule_summary(
+    group: dict[str, Any],
+    source_host: str,
+    api_base_rule_samples_by_base: dict[str, dict[str, Any]],
+    review_reasons: list[str],
+) -> dict[str, Any]:
+    return {
+        "source_host": source_host,
+        "auth_type": group.get("auth_type"),
+        "reason": group.get("reason"),
+        "missing_source_count": group.get("credential_config_missing_source_count"),
+        "secret_ready_source_count": group.get("credential_secret_ready_source_count"),
+        "secret_missing_source_count": group.get("credential_secret_missing_source_count"),
+        "credential_rule_candidate_source_count": group.get("credential_rule_candidate_source_count"),
+        "endpoint_discovery_needed_source_count": group.get("endpoint_discovery_needed_source_count"),
+        **_credential_market_counts(group),
+        "sample_missing_secret_env_vars": group.get("sample_missing_secret_env_vars") or [],
+        "sample_payers": group.get("sample_missing_credential_payers") or group.get("sample_payers") or [],
+        "sample_source_ids": group.get("sample_source_ids") or [],
+        "sample_api_bases": group.get("sample_api_bases") or [],
+        "sample_sources": group.get("sample_missing_credential_sources") or group.get("sample_sources") or [],
+        "sample_endpoint_discovery_sources": group.get("sample_endpoint_discovery_sources") or [],
+        "api_base_count": group.get("api_base_count"),
+        "sample_api_base_count": group.get("sample_api_base_count"),
+        "api_base_sample_complete": group.get("api_base_sample_complete"),
+        "api_base_rule_template_count": len(api_base_rule_samples_by_base),
+        "api_base_rule_templates": api_base_rule_samples_by_base,
+        "review_reasons": review_reasons,
+    }
+
+
+def _credential_config_template_export(report: dict[str, Any]) -> dict[str, Any]:
+    """Build reviewable host and API-base credential rule templates."""
+    backlog = _credential_backlog_export(report)
+    backlog_groups = backlog.get("groups") or []
+    groups_by_host = _credential_groups_by_host(backlog_groups)
     hosts_by_name: dict[str, dict[str, Any]] = {}
     api_bases_by_canonical_base: dict[str, dict[str, Any]] = {}
     rule_summaries: list[dict[str, Any]] = []
     for group in backlog_groups:
         source_host = _clean_text(group.get("source_host"))
-        if not source_host or source_host == "(missing host)" or not _int(group.get("credential_config_missing_source_count")):
+        if (
+            not source_host
+            or source_host == "(missing host)"
+            or not _int(group.get("credential_config_missing_source_count"))
+        ):
             continue
-        env_prefix = _credential_env_prefix(source_host)
-        host_rule_dict = hosts_by_name.setdefault(
-            source_host,
-            {
-                "_notes": [
-                    "Review payer developer portal requirements before enabling.",
-                    "Replace env placeholders with host-specific secret names in the deployment environment.",
-                ],
-            },
-        )
-        host_groups = groups_by_host.get(source_host, [])
-        review_reasons = [
-            *_credential_template_review_reasons(group),
-            *_credential_template_host_review_reasons(host_groups),
-        ]
-        if review_reasons:
-            existing_review_reasons = list(host_rule_dict.get("_review") or [])
-            for reason in review_reasons:
-                if reason not in existing_review_reasons:
-                    existing_review_reasons.append(reason)
-            host_rule_dict["_review"] = existing_review_reasons
-        for key, rule_value in _credential_template_rule_for_group(
+        review_reasons = _credential_host_rule(
             group,
-            env_prefix,
-        ).items():
-            host_rule_dict.setdefault(key, rule_value)
-        api_base_rule_samples_by_base: dict[str, dict[str, Any]] = {}
-        if review_reasons:
-            for api_base in _credential_template_api_base_candidates(group):
-                api_base_env_prefix = _credential_api_base_env_prefix(api_base)
-                api_base_rule = api_bases_by_canonical_base.setdefault(
-                    api_base,
-                    {
-                        "_notes": [
-                            "Path-scoped candidate generated because the host-level rule needs review.",
-                            "Confirm this exact FHIR base and credential scheme before enabling.",
-                        ],
-                    },
-                )
-                for key, rule_value in _credential_template_rule_for_group(
-                    group,
-                    api_base_env_prefix,
-                ).items():
-                    api_base_rule.setdefault(key, rule_value)
-                api_base_rule_samples_by_base[api_base] = api_base_rule
+            source_host,
+            groups_by_host.get(source_host, []),
+            hosts_by_name,
+        )
+        api_base_rule_samples_by_base = _credential_api_base_rule_samples(
+            group,
+            review_reasons,
+            api_bases_by_canonical_base,
+        )
         rule_summaries.append(
-            {
-                "source_host": source_host,
-                "auth_type": group.get("auth_type"),
-                "reason": group.get("reason"),
-                "missing_source_count": group.get("credential_config_missing_source_count"),
-                "secret_ready_source_count": group.get("credential_secret_ready_source_count"),
-                "secret_missing_source_count": group.get("credential_secret_missing_source_count"),
-                "credential_rule_candidate_source_count": group.get("credential_rule_candidate_source_count"),
-                "endpoint_discovery_needed_source_count": group.get("endpoint_discovery_needed_source_count"),
-                **_credential_market_counts(group),
-                "sample_missing_secret_env_vars": group.get("sample_missing_secret_env_vars") or [],
-                "sample_payers": group.get("sample_missing_credential_payers") or group.get("sample_payers") or [],
-                "sample_source_ids": group.get("sample_source_ids") or [],
-                "sample_api_bases": group.get("sample_api_bases") or [],
-                "sample_sources": group.get("sample_missing_credential_sources") or group.get("sample_sources") or [],
-                "sample_endpoint_discovery_sources": group.get("sample_endpoint_discovery_sources") or [],
-                "api_base_count": group.get("api_base_count"),
-                "sample_api_base_count": group.get("sample_api_base_count"),
-                "api_base_sample_complete": group.get("api_base_sample_complete"),
-                "api_base_rule_template_count": len(api_base_rule_samples_by_base),
-                "api_base_rule_templates": api_base_rule_samples_by_base,
-                "review_reasons": review_reasons,
-            }
+            _credential_template_rule_summary(
+                group,
+                source_host,
+                api_base_rule_samples_by_base,
+                review_reasons,
+            )
         )
     return {
         "generated_at": backlog.get("generated_at"),
@@ -2043,123 +2094,122 @@ def _extend_unique_samples(target: list[Any], values: list[Any], *, limit: int =
         target.append(value)
 
 
-def _credential_priority_export(report: dict[str, Any]) -> dict[str, Any]:
-    """Rank credential onboarding hosts by affected regulated sources."""
-    backlog = _credential_backlog_export(report)
-    template = _credential_config_template_export(report)
-    templates_by_host = (template.get("credential_config_template") or {}).get("hosts") or {}
-    hosts_by_name: dict[str, dict[str, Any]] = {}
+_CREDENTIAL_PRIORITY_COUNT_FIELDS = (
+    "source_count",
+    "credential_configured_source_count",
+    "credential_config_missing_source_count",
+    "credential_secret_ready_source_count",
+    "credential_secret_missing_source_count",
+    "credential_rule_candidate_source_count",
+    "endpoint_discovery_needed_source_count",
+    *PROVIDER_DIRECTORY_MARKET_COUNT_FIELDS,
+)
+_CREDENTIAL_PRIORITY_SAMPLE_FIELDS = (
+    "sample_payers",
+    "sample_missing_credential_payers",
+    "sample_missing_secret_payers",
+    "sample_missing_secret_env_vars",
+    "sample_source_ids",
+    "sample_api_bases",
+    "sample_sources",
+    "sample_missing_credential_sources",
+    "sample_missing_secret_sources",
+    "sample_endpoint_discovery_sources",
+)
 
+
+def _new_credential_priority_host(source_host: str) -> dict[str, Any]:
+    return {
+        "host": source_host,
+        "source_host": source_host,
+        **{field: 0 for field in _CREDENTIAL_PRIORITY_COUNT_FIELDS},
+        "probe_statuses": set(),
+        "auth_types": set(),
+        "reasons": set(),
+        **{field: [] for field in _CREDENTIAL_PRIORITY_SAMPLE_FIELDS},
+        "api_base_group_count": 0,
+        "groups": [],
+    }
+
+
+def _credential_priority_group_summary(group: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "probe_status": group.get("probe_status"),
+        "auth_type": group.get("auth_type"),
+        "reason": group.get("reason"),
+        "source_count": group.get("source_count"),
+        "credential_configured_source_count": group.get("credential_configured_source_count"),
+        "credential_config_missing_source_count": group.get("credential_config_missing_source_count"),
+        "credential_secret_ready_source_count": group.get("credential_secret_ready_source_count"),
+        "credential_secret_missing_source_count": group.get("credential_secret_missing_source_count"),
+        "credential_rule_candidate_source_count": group.get("credential_rule_candidate_source_count"),
+        "endpoint_discovery_needed_source_count": group.get("endpoint_discovery_needed_source_count"),
+        "api_base_count": group.get("api_base_count"),
+        "sample_api_base_count": group.get("sample_api_base_count"),
+        "api_base_sample_complete": group.get("api_base_sample_complete"),
+        "sample_payers": _list(group.get("sample_payers")),
+        "sample_source_ids": _list(group.get("sample_source_ids")),
+        "sample_api_bases": _list(group.get("sample_api_bases")),
+        "sample_sources": _list(group.get("sample_sources")),
+        "sample_missing_credential_sources": _list(group.get("sample_missing_credential_sources")),
+        "sample_missing_secret_sources": _list(group.get("sample_missing_secret_sources")),
+        "sample_endpoint_discovery_sources": _list(group.get("sample_endpoint_discovery_sources")),
+        **_credential_market_counts(group),
+    }
+
+
+def _accumulate_credential_priority_group(
+    host: dict[str, Any], group: dict[str, Any]
+) -> None:
+    for field in _CREDENTIAL_PRIORITY_COUNT_FIELDS:
+        host[field] += _int(group.get(field))
+    host["api_base_group_count"] += _int(group.get("api_base_count"))
+    for field, destination_field in (
+        ("probe_status", "probe_statuses"),
+        ("auth_type", "auth_types"),
+        ("reason", "reasons"),
+    ):
+        field_value = _clean_text(group.get(field))
+        if field_value:
+            host[destination_field].add(field_value)
+    for field in _CREDENTIAL_PRIORITY_SAMPLE_FIELDS:
+        _extend_unique_samples(host[field], _list(group.get(field)))
+    host["groups"].append(_credential_priority_group_summary(group))
+
+
+def _finalize_credential_priority_host(
+    host: dict[str, Any], templates_by_host: dict[str, dict[str, Any]]
+) -> None:
+    for field in ("probe_statuses", "auth_types", "reasons"):
+        host[field] = sorted(host[field])
+    host["market_flag_source_mentions"] = sum(
+        _int(host.get(field))
+        for field in (
+            "medicare_advantage_source_count",
+            "medicaid_mco_source_count",
+            "chip_source_count",
+            "qhp_source_count",
+        )
+    )
+    host["sample_api_base_count"] = len(host.get("sample_api_bases") or [])
+    if host["source_host"] in templates_by_host:
+        host["credential_rule_template"] = templates_by_host[host["source_host"]]
+
+
+def _credential_priority_hosts(
+    backlog: dict[str, Any], templates_by_host: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    hosts_by_name: dict[str, dict[str, Any]] = {}
     for group in backlog.get("groups") or []:
         source_host = _clean_text(group.get("source_host")) or "(missing host)"
         host = hosts_by_name.setdefault(
             source_host,
-            {
-                "host": source_host,
-                "source_host": source_host,
-                "source_count": 0,
-                "credential_configured_source_count": 0,
-                "credential_config_missing_source_count": 0,
-                "credential_secret_ready_source_count": 0,
-                "credential_secret_missing_source_count": 0,
-                "credential_rule_candidate_source_count": 0,
-                "endpoint_discovery_needed_source_count": 0,
-                "probe_statuses": set(),
-                "auth_types": set(),
-                "reasons": set(),
-                "sample_payers": [],
-                "sample_missing_credential_payers": [],
-                "sample_missing_secret_payers": [],
-                "sample_missing_secret_env_vars": [],
-                "sample_source_ids": [],
-                "sample_api_bases": [],
-                "sample_sources": [],
-                "sample_missing_credential_sources": [],
-                "sample_missing_secret_sources": [],
-                "sample_endpoint_discovery_sources": [],
-                "api_base_group_count": 0,
-                "groups": [],
-                **{field: 0 for field in PROVIDER_DIRECTORY_MARKET_COUNT_FIELDS},
-            },
+            _new_credential_priority_host(source_host),
         )
-        for field in (
-            "source_count",
-            "credential_configured_source_count",
-            "credential_config_missing_source_count",
-            "credential_secret_ready_source_count",
-            "credential_secret_missing_source_count",
-            "credential_rule_candidate_source_count",
-            "endpoint_discovery_needed_source_count",
-            *PROVIDER_DIRECTORY_MARKET_COUNT_FIELDS,
-        ):
-            host[field] += _int(group.get(field))
-        host["api_base_group_count"] += _int(group.get("api_base_count"))
-        for field, destination_field in (
-            ("probe_status", "probe_statuses"),
-            ("auth_type", "auth_types"),
-            ("reason", "reasons"),
-        ):
-            field_value = _clean_text(group.get(field))
-            if field_value:
-                host[destination_field].add(field_value)
-        for field in (
-            "sample_payers",
-            "sample_missing_credential_payers",
-            "sample_missing_secret_payers",
-            "sample_missing_secret_env_vars",
-            "sample_source_ids",
-            "sample_api_bases",
-            "sample_sources",
-            "sample_missing_credential_sources",
-            "sample_missing_secret_sources",
-            "sample_endpoint_discovery_sources",
-        ):
-            _extend_unique_samples(host[field], _list(group.get(field)))
-        host["groups"].append(
-            {
-                "probe_status": group.get("probe_status"),
-                "auth_type": group.get("auth_type"),
-                "reason": group.get("reason"),
-                "source_count": group.get("source_count"),
-                "credential_configured_source_count": group.get("credential_configured_source_count"),
-                "credential_config_missing_source_count": group.get("credential_config_missing_source_count"),
-                "credential_secret_ready_source_count": group.get("credential_secret_ready_source_count"),
-                "credential_secret_missing_source_count": group.get("credential_secret_missing_source_count"),
-                "credential_rule_candidate_source_count": group.get("credential_rule_candidate_source_count"),
-                "endpoint_discovery_needed_source_count": group.get("endpoint_discovery_needed_source_count"),
-                "api_base_count": group.get("api_base_count"),
-                "sample_api_base_count": group.get("sample_api_base_count"),
-                "api_base_sample_complete": group.get("api_base_sample_complete"),
-                "sample_payers": _list(group.get("sample_payers")),
-                "sample_source_ids": _list(group.get("sample_source_ids")),
-                "sample_api_bases": _list(group.get("sample_api_bases")),
-                "sample_sources": _list(group.get("sample_sources")),
-                "sample_missing_credential_sources": _list(group.get("sample_missing_credential_sources")),
-                "sample_missing_secret_sources": _list(group.get("sample_missing_secret_sources")),
-                "sample_endpoint_discovery_sources": _list(group.get("sample_endpoint_discovery_sources")),
-                **_credential_market_counts(group),
-            }
-        )
-
-    hosts = []
-    for host in hosts_by_name.values():
-        host["probe_statuses"] = sorted(host["probe_statuses"])
-        host["auth_types"] = sorted(host["auth_types"])
-        host["reasons"] = sorted(host["reasons"])
-        host["market_flag_source_mentions"] = sum(
-            _int(host.get(field))
-            for field in (
-                "medicare_advantage_source_count",
-                "medicaid_mco_source_count",
-                "chip_source_count",
-                "qhp_source_count",
-            )
-        )
-        host["sample_api_base_count"] = len(host.get("sample_api_bases") or [])
-        if host["source_host"] in templates_by_host:
-            host["credential_rule_template"] = templates_by_host[host["source_host"]]
-        hosts.append(host)
-
+        _accumulate_credential_priority_group(host, group)
+    hosts = list(hosts_by_name.values())
+    for host in hosts:
+        _finalize_credential_priority_host(host, templates_by_host)
     hosts.sort(
         key=lambda host_record: (
             -_int(host_record.get("credential_config_missing_source_count")),
@@ -2168,69 +2218,103 @@ def _credential_priority_export(report: dict[str, Any]) -> dict[str, Any]:
             str(host_record.get("source_host")),
         )
     )
+    return hosts
+
+
+def _rank_credential_priority_hosts(
+    hosts: list[dict[str, Any]], backlog: dict[str, Any]
+) -> None:
     total_missing_sources = _int(backlog.get("credential_config_missing_source_count"))
     total_candidate_sources = _int(backlog.get("credential_rule_candidate_source_count"))
-    total_endpoint_discovery_sources = _int(backlog.get("endpoint_discovery_needed_source_count"))
+    total_endpoint_sources = _int(backlog.get("endpoint_discovery_needed_source_count"))
     cumulative_missing_sources = 0
     cumulative_candidate_sources = 0
-    cumulative_endpoint_discovery_sources = 0
+    cumulative_endpoint_sources = 0
     cumulative_regulated_market_sources = 0
     for index, host in enumerate(hosts, start=1):
         host["priority_rank"] = index
         cumulative_missing_sources += _int(host.get("credential_config_missing_source_count"))
         cumulative_candidate_sources += _int(host.get("credential_rule_candidate_source_count"))
-        cumulative_endpoint_discovery_sources += _int(host.get("endpoint_discovery_needed_source_count"))
+        cumulative_endpoint_sources += _int(host.get("endpoint_discovery_needed_source_count"))
         cumulative_regulated_market_sources += _int(host.get("regulated_market_source_count"))
         host["cumulative_credential_config_missing_source_count"] = cumulative_missing_sources
         host["cumulative_credential_rule_candidate_source_count"] = cumulative_candidate_sources
-        host["cumulative_endpoint_discovery_needed_source_count"] = cumulative_endpoint_discovery_sources
+        host["cumulative_endpoint_discovery_needed_source_count"] = cumulative_endpoint_sources
         host["cumulative_regulated_market_source_count"] = cumulative_regulated_market_sources
         host["cumulative_missing_source_pct"] = _pct(cumulative_missing_sources, total_missing_sources)
         host["cumulative_candidate_source_pct"] = _pct(cumulative_candidate_sources, total_candidate_sources)
         host["cumulative_endpoint_discovery_source_pct"] = _pct(
-            cumulative_endpoint_discovery_sources,
-            total_endpoint_discovery_sources,
+            cumulative_endpoint_sources,
+            total_endpoint_sources,
         )
 
-    coverage_by_top_host_counts = []
+
+def _sum_credential_host_field(
+    hosts: list[dict[str, Any]], field: str
+) -> int:
+    return sum(_int(host.get(field)) for host in hosts)
+
+
+def _credential_top_host_coverage_row(
+    selected: list[dict[str, Any]],
+    top_n: int,
+    total_missing_sources: int,
+    total_candidate_sources: int,
+    total_endpoint_sources: int,
+) -> dict[str, Any]:
+    missing_sources = _sum_credential_host_field(
+        selected, "credential_config_missing_source_count"
+    )
+    candidate_sources = _sum_credential_host_field(
+        selected, "credential_rule_candidate_source_count"
+    )
+    endpoint_sources = _sum_credential_host_field(
+        selected, "endpoint_discovery_needed_source_count"
+    )
+    return {
+        "top_n": top_n,
+        "host_count": len(selected),
+        "credential_config_missing_source_count": missing_sources,
+        "credential_rule_candidate_source_count": candidate_sources,
+        "endpoint_discovery_needed_source_count": endpoint_sources,
+        "regulated_market_source_count": _sum_credential_host_field(
+            selected, "regulated_market_source_count"
+        ),
+        "missing_source_pct": _pct(missing_sources, total_missing_sources),
+        "candidate_source_pct": _pct(candidate_sources, total_candidate_sources),
+        "endpoint_discovery_source_pct": _pct(endpoint_sources, total_endpoint_sources),
+        "hosts": [host.get("source_host") for host in selected],
+    }
+
+
+def _credential_top_host_coverage(
+    hosts: list[dict[str, Any]], backlog: dict[str, Any]
+) -> list[dict[str, Any]]:
+    total_missing_sources = _int(backlog.get("credential_config_missing_source_count"))
+    total_candidate_sources = _int(backlog.get("credential_rule_candidate_source_count"))
+    total_endpoint_sources = _int(backlog.get("endpoint_discovery_needed_source_count"))
     top_n_values = sorted(
         {host_limit for host_limit in (1, 3, 5, 10, 25, len(hosts)) if 0 < host_limit <= len(hosts)}
     )
-    for top_n in top_n_values:
-        if not hosts:
-            break
-        selected = hosts[:top_n]
-        coverage_by_top_host_counts.append(
-            {
-                "top_n": top_n,
-                "host_count": len(selected),
-                "credential_config_missing_source_count": sum(
-                    _int(host.get("credential_config_missing_source_count")) for host in selected
-                ),
-                "credential_rule_candidate_source_count": sum(
-                    _int(host.get("credential_rule_candidate_source_count")) for host in selected
-                ),
-                "endpoint_discovery_needed_source_count": sum(
-                    _int(host.get("endpoint_discovery_needed_source_count")) for host in selected
-                ),
-                "regulated_market_source_count": sum(
-                    _int(host.get("regulated_market_source_count")) for host in selected
-                ),
-                "missing_source_pct": _pct(
-                    sum(_int(host.get("credential_config_missing_source_count")) for host in selected),
-                    total_missing_sources,
-                ),
-                "candidate_source_pct": _pct(
-                    sum(_int(host.get("credential_rule_candidate_source_count")) for host in selected),
-                    total_candidate_sources,
-                ),
-                "endpoint_discovery_source_pct": _pct(
-                    sum(_int(host.get("endpoint_discovery_needed_source_count")) for host in selected),
-                    total_endpoint_discovery_sources,
-                ),
-                "hosts": [host.get("source_host") for host in selected],
-            }
+    return [
+        _credential_top_host_coverage_row(
+            hosts[:top_n],
+            top_n,
+            total_missing_sources,
+            total_candidate_sources,
+            total_endpoint_sources,
         )
+        for top_n in top_n_values
+    ]
+
+
+def _credential_priority_export(report: dict[str, Any]) -> dict[str, Any]:
+    """Rank credential onboarding hosts by affected regulated sources."""
+    backlog = _credential_backlog_export(report)
+    template = _credential_config_template_export(report)
+    templates_by_host = (template.get("credential_config_template") or {}).get("hosts") or {}
+    hosts = _credential_priority_hosts(backlog, templates_by_host)
+    _rank_credential_priority_hosts(hosts, backlog)
 
     return {
         "generated_at": backlog.get("generated_at"),
@@ -2246,7 +2330,7 @@ def _credential_priority_export(report: dict[str, Any]) -> dict[str, Any]:
         "endpoint_discovery_needed_source_count": backlog.get("endpoint_discovery_needed_source_count"),
         "credential_missing_secret_env_vars": _list(backlog.get("credential_missing_secret_env_vars")),
         "host_count": len(hosts),
-        "top_host_coverage": coverage_by_top_host_counts,
+        "top_host_coverage": _credential_top_host_coverage(hosts, backlog),
         "hosts": hosts,
     }
 

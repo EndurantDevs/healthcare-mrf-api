@@ -459,9 +459,7 @@ def _parse_import_metrics(output: str) -> dict[str, Any]:
     return {}
 
 
-def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
-    """Run one local importer CLI case and capture its structured metrics."""
-    started = time.monotonic()
+def _cli_base_command(args: argparse.Namespace) -> list[str]:
     python = args.python or sys.executable
     command_parts = [
         python,
@@ -495,49 +493,61 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
         command_parts.append("--include-supplemental-catalogs")
     elif args.include_supplemental_catalogs is False:
         command_parts.append("--no-include-supplemental-catalogs")
-    if args.import_resources:
-        command_parts.append("--import-resources")
-        if args.full_refresh:
-            command_parts.append("--full-refresh")
-        if args.stale_cleanup is True:
-            command_parts.append("--stale-cleanup")
-        elif args.stale_cleanup is False:
-            command_parts.append("--no-stale-cleanup")
-        if args.resource_limit is not None:
-            command_parts.extend(["--resource-limit", str(args.resource_limit)])
-        if args.resource_deadline_seconds is not None:
-            command_parts.extend(["--resource-deadline-seconds", str(args.resource_deadline_seconds)])
-        if args.linked_resource_limit is not None:
-            command_parts.extend(["--linked-resource-limit", str(args.linked_resource_limit)])
-        if args.linked_resource_deadline_seconds is not None:
-            command_parts.extend(["--linked-resource-deadline-seconds", str(args.linked_resource_deadline_seconds)])
-        if args.page_limit is not None:
-            command_parts.extend(["--page-limit", str(args.page_limit)])
-        if args.page_count is not None:
-            command_parts.extend(["--page-count", str(args.page_count)])
-        if args.stream_batch_size is not None:
-            command_parts.extend(["--stream-batch-size", str(args.stream_batch_size)])
-        if args.source_concurrency is not None:
-            command_parts.extend(["--source-concurrency", str(args.source_concurrency)])
-        if args.resource_scan_concurrency is not None:
+    return command_parts
+
+
+def _add_cli_resource_options(
+    command_parts: list[str], args: argparse.Namespace
+) -> None:
+    if not args.import_resources:
+        return
+    command_parts.append("--import-resources")
+    if args.full_refresh:
+        command_parts.append("--full-refresh")
+    if args.stale_cleanup is True:
+        command_parts.append("--stale-cleanup")
+    elif args.stale_cleanup is False:
+        command_parts.append("--no-stale-cleanup")
+    for argument_name in (
+        "resource_limit",
+        "resource_deadline_seconds",
+        "linked_resource_limit",
+        "linked_resource_deadline_seconds",
+        "page_limit",
+        "page_count",
+        "stream_batch_size",
+        "source_concurrency",
+        "resource_scan_concurrency",
+    ):
+        argument_value = getattr(args, argument_name)
+        if argument_value is not None:
             command_parts.extend(
-                [
-                    "--resource-scan-concurrency",
-                    str(args.resource_scan_concurrency),
-                ]
+                [f"--{argument_name.replace('_', '-')}", str(argument_value)]
             )
-        if args.publish_artifacts is True:
-            command_parts.append("--publish-artifacts")
-        elif args.publish_artifacts is False:
-            command_parts.append("--no-publish-artifacts")
-        if args.resources:
-            command_parts.extend(["--resources", args.resources])
-        if args.include_credentialed:
-            command_parts.append("--include-credentialed")
+    if args.publish_artifacts is True:
+        command_parts.append("--publish-artifacts")
+    elif args.publish_artifacts is False:
+        command_parts.append("--no-publish-artifacts")
+    if args.resources:
+        command_parts.extend(["--resources", args.resources])
+    if args.include_credentialed:
+        command_parts.append("--include-credentialed")
+
+
+def _cli_command(args: argparse.Namespace) -> list[str]:
+    command_parts = _cli_base_command(args)
+    _add_cli_resource_options(command_parts, args)
     if args.seed_only:
         command_parts.append("--seed-only")
     if args.no_probe:
         command_parts.append("--no-probe")
+    return command_parts
+
+
+def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
+    """Run one local importer CLI case and capture its structured metrics."""
+    started = time.monotonic()
+    command_parts = _cli_command(args)
     env = os.environ.copy()
     env.update(
         {

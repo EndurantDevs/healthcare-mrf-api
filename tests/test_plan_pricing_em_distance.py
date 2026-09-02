@@ -17,7 +17,31 @@ from api.plan_pricing_em_distance import (
     is_em_distance_projection_ready,
     search_plan_pricing_em_distance,
 )
-from api.plan_release_serving import PlanReleaseServingSelection
+from api.plan_release_serving import (
+    PlanReleaseServingSelection,
+    PlanReleaseSnapshotBinding,
+)
+
+_EM_DISTANCE_RELEASE_BINDINGS = (
+    PlanReleaseSnapshotBinding(
+        binding_ordinal=0,
+        snapshot_id="ptg2:release-network",
+        source_key="aetna-network",
+        plan_id="99-0000001",
+        plan_market_type="group",
+        role="in_network",
+        required=True,
+    ),
+    PlanReleaseSnapshotBinding(
+        binding_ordinal=0,
+        snapshot_id="ptg2:release-allowed",
+        source_key="aetna-allowed",
+        plan_id="99-0000001",
+        plan_market_type="group",
+        role="allowed_amounts",
+        required=True,
+    ),
+)
 
 
 class _DistanceProjectionResult:
@@ -203,7 +227,7 @@ async def test_em_distance_reader_handles_attachment_boundary():
         release_month="2026-08",
         release_status="published",
         binding_set_digest="a" * 64,
-        bindings=(),
+        bindings=_EM_DISTANCE_RELEASE_BINDINGS,
     )
     args_by_name = {
         "code": "99213",
@@ -245,6 +269,14 @@ async def test_em_distance_reader_handles_attachment_boundary():
         response["pagination"]["total_is_exact"],
         response["pagination"]["has_more"],
     ) == ("no_match_in_radius", [], True, False)
+    assert response["query"]["snapshots"] == [
+        {
+            "source_key": "aetna-network",
+            "snapshot_id": "ptg2:release-network",
+            "plan_id": "99-0000001",
+            "plan_market_type": "group",
+        }
+    ]
 
 
 @pytest.mark.asyncio

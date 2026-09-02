@@ -328,6 +328,15 @@ def _projection_response(
         "projection_contract": PROJECTION_CONTRACT,
         "source": "plan_pricing_em_distance_projection",
         "status": "matched" if total else "no_match",
+        "snapshots": [
+            {
+                "source_key": binding.source_key,
+                "snapshot_id": binding.snapshot_id,
+                "plan_id": binding.plan_id,
+                "plan_market_type": binding.plan_market_type,
+            }
+            for binding in selection.in_network_bindings
+        ],
     }
     response_by_field = {
         "result_type": "provider_cards",

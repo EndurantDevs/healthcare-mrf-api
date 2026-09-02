@@ -17,60 +17,19 @@ from typing import Any
 _STALE_ACTIVITY_SECONDS_ENV = "HLTHPRT_PTG2_STALE_BUILD_SECONDS"
 _STALE_ACTIVITY_SECONDS_DEFAULT = 21_600
 _STALE_ACTIVITY_SECONDS_MINIMUM = 300
-
-
-def _bootstrap_import_path() -> None:
-    root = Path(__file__).resolve().parents[2]
-    for path in (root, Path("/opt")):
-        if path.exists():
-            sys.path.insert(0, str(path))
-
-
-_bootstrap_import_path()
-
-
-def _row_mapping(row: Any) -> Mapping[str, Any]:
-    if isinstance(row, Mapping):
-        return row
-    mapping = getattr(row, "_mapping", None)
-    if isinstance(mapping, Mapping):
-        return mapping
-    raise TypeError("cutover readiness query returned an unsupported row")
-
-
-def _quote_ident(value: str) -> str:
-    if not value or "\x00" in value:
-        raise ValueError("invalid database schema")
-    return '"' + value.replace('"', '""') + '"'
-
-
-def _stale_activity_seconds(value: int | None) -> int:
-    raw_value: Any = (
-        value
-        if value is not None
-        else os.getenv(
-            _STALE_ACTIVITY_SECONDS_ENV,
-            _STALE_ACTIVITY_SECONDS_DEFAULT,
-        )
-    )
-    try:
-        return max(int(raw_value), _STALE_ACTIVITY_SECONDS_MINIMUM)
-    except (TypeError, ValueError):
-        return _STALE_ACTIVITY_SECONDS_DEFAULT
-
-
-async def collect_cutover_readiness(
-    executor: Any,
-    *,
-    schema_name: str,
-    stale_activity_seconds: int | None = None,
-) -> dict[str, Any]:
-    """Collect fail-closed cutover counts for current pointers and active builds."""
-
-    schema = _quote_ident(schema_name)
-    stale_seconds = _stale_activity_seconds(stale_activity_seconds)
-    pointer_rows = await executor.all(
-        f"""
+_FAILURE_COUNT_FIELDS = (
+    "missing_snapshot_count",
+    "unpublished_snapshot_count",
+    "invalid_arch_count",
+    "invalid_manifest_generation_count",
+    "unsealed_source_set_count",
+    "unsealed_audit_sample_count",
+    "missing_binding_count",
+    "unsealed_layout_count",
+    "invalid_layout_generation_count",
+    "mismatched_binding_count",
+)
+_POINTER_READINESS_SQL = """
         WITH pointers AS (
             SELECT snapshot_id FROM {schema}.ptg2_current_snapshot
             UNION ALL
@@ -133,9 +92,7 @@ async def collect_cutover_readiness(
                    AS mismatched_binding_count
           FROM checked
         """
-    )
-    activity_rows = await executor.all(
-        f"""
+_ACTIVITY_READINESS_SQL = """
         WITH import_activity AS (
             SELECT import_run_id,
                    status,
@@ -182,28 +139,82 @@ async def collect_cutover_readiness(
                  WHERE NOT is_fresh
             ) AS stale_building_snapshot_count
           FROM import_activity
-        """,
+        """
+
+
+def _bootstrap_import_path() -> None:
+    root = Path(__file__).resolve().parents[2]
+    for path in (root, Path("/opt")):
+        if path.exists():
+            sys.path.insert(0, str(path))
+
+
+_bootstrap_import_path()
+
+
+def _row_mapping(row: Any) -> Mapping[str, Any]:
+    if isinstance(row, Mapping):
+        return row
+    mapping = getattr(row, "_mapping", None)
+    if isinstance(mapping, Mapping):
+        return mapping
+    raise TypeError("cutover readiness query returned an unsupported row")
+
+
+def _quote_ident(value: str) -> str:
+    if not value or "\x00" in value:
+        raise ValueError("invalid database schema")
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _stale_activity_seconds(value: int | None) -> int:
+    raw_value: Any = (
+        value
+        if value is not None
+        else os.getenv(
+            _STALE_ACTIVITY_SECONDS_ENV,
+            _STALE_ACTIVITY_SECONDS_DEFAULT,
+        )
+    )
+    try:
+        return max(int(raw_value), _STALE_ACTIVITY_SECONDS_MINIMUM)
+    except (TypeError, ValueError):
+        return _STALE_ACTIVITY_SECONDS_DEFAULT
+
+
+async def collect_cutover_readiness(
+    executor: Any,
+    *,
+    schema_name: str,
+    stale_activity_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Collect fail-closed cutover counts for current pointers and active builds."""
+
+    schema = _quote_ident(schema_name)
+    stale_seconds = _stale_activity_seconds(stale_activity_seconds)
+    pointer_rows = await executor.all(
+        _POINTER_READINESS_SQL.replace("{schema}", schema)
+    )
+    activity_rows = await executor.all(
+        _ACTIVITY_READINESS_SQL.replace("{schema}", schema),
         stale_activity_seconds=stale_seconds,
     )
     if len(pointer_rows) != 1 or len(activity_rows) != 1:
         raise RuntimeError("cutover readiness queries returned invalid cardinality")
-
-    pointer = _row_mapping(pointer_rows[0])
-    activity = _row_mapping(activity_rows[0])
-    failure_fields = (
-        "missing_snapshot_count",
-        "unpublished_snapshot_count",
-        "invalid_arch_count",
-        "invalid_manifest_generation_count",
-        "unsealed_source_set_count",
-        "unsealed_audit_sample_count",
-        "missing_binding_count",
-        "unsealed_layout_count",
-        "invalid_layout_generation_count",
-        "mismatched_binding_count",
+    return _readiness_payload(
+        _row_mapping(pointer_rows[0]),
+        _row_mapping(activity_rows[0]),
+        stale_seconds,
     )
+
+
+def _readiness_payload(
+    pointer: Mapping[str, Any],
+    activity: Mapping[str, Any],
+    stale_seconds: int,
+) -> dict[str, Any]:
     failure_count_by_field = {
-        field: int(pointer.get(field) or 0) for field in failure_fields
+        field: int(pointer.get(field) or 0) for field in _FAILURE_COUNT_FIELDS
     }
     pointer_count = int(pointer.get("pointer_count") or 0)
     active_import_run_count = int(activity.get("active_import_run_count") or 0)
