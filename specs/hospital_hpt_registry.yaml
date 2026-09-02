@@ -14483,21 +14483,28 @@ hospitals:
 - hospital_id: hospital-004362
   name: Mount Sinai Behavioral Health Center
   cms_hpt_url: https://www.mountsinai.org/cms-hpt.txt
+  fallback_mrf_url: https://www.mountsinai.org/files/mrf/135564934_mount-sinai-behavioral-health-center_standardcharges.json
 - hospital_id: hospital-004363
   name: Mount Sinai Brooklyn
   cms_hpt_url: https://www.mountsinai.org/cms-hpt.txt
-- hospital_id: hospital-004364
-  name: Mount Sinai Hospital
+  fallback_mrf_url: https://www.mountsinai.org/files/mrf/135564934_mount-sinai-brooklyn_standardcharges.json
+- hospital_ids:
+  - hospital-004364
+  - hospital-006514
+  name: The Mount Sinai Hospital
   cms_hpt_url: https://www.mountsinai.org/cms-hpt.txt
+  fallback_mrf_url: https://www.mountsinai.org/files/mrf/131624096_mount-sinai-hospital_standardcharges.json
 - hospital_id: hospital-004365
   name: Mount Sinai Medical Center of Florida
   cms_hpt_url: https://www.msmc.com/cms-hpt.txt
 - hospital_id: hospital-004366
   name: Mount Sinai Morningside
   cms_hpt_url: https://www.mountsinai.org/cms-hpt.txt
+  fallback_mrf_url: https://www.mountsinai.org/files/mrf/132997301_mount-sinai-morningside_standardcharges.json
 - hospital_id: hospital-004367
   name: Mount Sinai Queens
   cms_hpt_url: https://www.mountsinai.org/cms-hpt.txt
+  fallback_mrf_url: https://www.mountsinai.org/files/mrf/131624096_mount-sinai-queens_standardcharges.json
 - hospital_id: hospital-004368
   name: Mount Sinai Rehabilitation Hospital
   cms_hpt_url: https://www.trinityhealthofne.org/cms-hpt.txt
@@ -14508,9 +14515,11 @@ hospitals:
 - hospital_id: hospital-004370
   name: Mount Sinai South Nassau
   cms_hpt_url: https://www.mountsinai.org/cms-hpt.txt
+  fallback_mrf_url: https://www.mountsinai.org/files/mrf/111352310_mount-sinai-south-nassau_standardcharges.json
 - hospital_id: hospital-004371
   name: Mount Sinai West
   cms_hpt_url: https://www.mountsinai.org/cms-hpt.txt
+  fallback_mrf_url: https://www.mountsinai.org/files/mrf/132997301_mount-sinai-morningside_standardcharges.json
 - hospital_id: hospital-004372
   name: Mount St. Mary's Hospital
   cms_hpt_url: https://www.chsbuffalo.org/cms-hpt.txt
@@ -15087,6 +15096,7 @@ hospitals:
 - hospital_id: hospital-004537
   name: New York Eye and Ear Infirmary of Mount Sinai
   cms_hpt_url: https://www.mountsinai.org/cms-hpt.txt
+  fallback_mrf_url: https://www.mountsinai.org/files/mrf/135562304_new-york-eye-and-ear-infirmary-of-mount-sinai_standardcharges.json
 - hospital_id: hospital-004538
   name: Newark Beth Israel Medical Center
   cms_hpt_url: https://www.rwjbh.org/cms-hpt.txt
@@ -19442,6 +19452,7 @@ hospitals:
 - hospital_id: hospital-005869
   name: South Nassau Communities Hospital Off-Campus Emergency Department
   cms_hpt_url: https://www.mountsinai.org/cms-hpt.txt
+  fallback_mrf_url: https://www.mountsinai.org/files/mrf/111352310_mount-sinai-south-nassau_standardcharges.json
 - hospital_id: hospital-005870
   name: South Pediatric Outpatient Center
   locator_name: The Children's Hospital of Alabama - Children's South
@@ -21597,10 +21608,6 @@ hospitals:
 - hospital_id: hospital-006513
   name: The Miriam Hospital
   cms_hpt_url: https://www.brownhealth.org/cms-hpt.txt
-- hospital_id: hospital-006514
-  name: The Mount Sinai Hospital
-  cms_hpt_url: https://www.mountsinai.org/cms-hpt.txt
-  locator_name: Mount Sinai Hospital
 - hospital_id: hospital-006515
   name: The Ochsner West Campus Extended Care Hospital
   cms_hpt_url: https://www.ochsner.org/cms-hpt.txt

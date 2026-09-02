@@ -65,12 +65,12 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     hospitals = registry.load_hospital_hpt_registry()
     hospital_by_id = {hospital["hospital_id"]: hospital for hospital in hospitals}
     assert len(hospitals) == registry.EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT
-    assert len(registry.hospital_hpt_registry_groups()) == 6_966
+    assert len(registry.hospital_hpt_registry_groups()) == 6_965
     assert len({entry["hospital_id"] for entry in hospitals}) == len(hospitals)
     assert "alias_of" not in hospital_by_id["hospital-005625"]
     assert sum("locator_name" in entry for entry in hospitals) == 1_596
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 653
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 60
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 70
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -119,7 +119,7 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         for entry in hospitals
         if "alias_of" in entry
     }
-    assert len(aliases_by_id) == 390
+    assert len(aliases_by_id) == 391
     assert not {"hospital-000833", "hospital-001199"} & aliases_by_id.keys()
     assert {
         hospital_id: aliases_by_id[hospital_id]
