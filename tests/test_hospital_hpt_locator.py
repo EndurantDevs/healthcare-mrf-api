@@ -158,6 +158,14 @@ def test_parser_accepts_bare_absolute_mrf_url_line():
         b"https://files.example/mrf.json\n"
     ) == (_record("Hospital"),)
 
+    with pytest.raises(locator.HospitalHptLocatorError, match="line"):
+        locator.parse_hospital_hpt_locator(
+            b"location-name: Hospital\n"
+            b"source-page-url: https://hospital.example/prices\n"
+            b"https://files.example/one.json\n"
+            b"https://files.example/two.json\n"
+        )
+
     with pytest.raises(locator.HospitalHptLocatorError, match="mrf_url"):
         locator.parse_hospital_hpt_locator(
             b"location-name: Hospital\nhttps://files.example/mrf.json\n"
