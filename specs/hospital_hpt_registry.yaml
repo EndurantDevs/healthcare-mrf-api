@@ -3191,6 +3191,8 @@ hospitals:
 - hospital_id: hospital-000957
   name: Bournewood Hospital
   cms_hpt_url: https://www.bournewood.com/cms-hpt.txt
+  alias_of: hospital-000956
+  locator_name: Bournewood Health Systems
 - hospital_id: hospital-000958
   name: Bowdle Healthcare Center
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -20025,6 +20027,8 @@ hospitals:
 - hospital_id: hospital-006041
   name: St Joseph Regional Health Network
   cms_hpt_url: https://www.pennstatehealth.org/cms-hpt.txt
+  alias_of: hospital-005093
+  locator_name: Penn State Health St. Joseph Medical Center
 - hospital_id: hospital-006042
   name: St Joseph Warren Hospital
   cms_hpt_url: https://www.mercy.com/cms-hpt.txt
