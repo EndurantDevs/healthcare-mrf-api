@@ -33,6 +33,11 @@ from tests.test_hospital_price_storage import (
 )
 
 
+COUNT_INVARIANTS_MIGRATION_PATH = CSV_SHORT_V2_MIGRATION_PATH.with_name(
+    "20260902103500_hospital_price_count_invariants.py"
+)
+
+
 def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
     """Keep legacy-only successor fields absent without relaxing v3."""
 
@@ -77,6 +82,13 @@ def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
     short_v2_sql = inspect.getsource(short_v2.upgrade)
     assert HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256 in short_v2_sql
     assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in short_v2_sql
+    count_invariants = _load_migration(COUNT_INVARIANTS_MIGRATION_PATH)
+    assert count_invariants.revision == (
+        "20260902103500_hospital_price_count_invariants"
+    )
+    assert count_invariants.down_revision == (
+        "20260901103000_plan_pricing_em_distance"
+    )
 
 
 async def _insert_header(
@@ -115,9 +127,8 @@ async def _insert_header(
     )
 
 
-async def _assert_profile_constraints(
-    connection: asyncpg.Connection, quoted: str
-) -> None:
+async def _assert_profile_constraints(connection: asyncpg.Connection, quoted: str) -> None:
+    """Verify migrated header rows and every profile shape guard."""
     legacy_headers = await connection.fetch(
         f"SELECT template_version, attester_name, npi_count "
         f"FROM {quoted}.hospital_price_version "
@@ -161,6 +172,19 @@ async def _assert_profile_constraints(
                 "WHERE version_id=$1",
                 "a" * 64,
             )
+    for invalid_set in (
+        "location_count=0",
+        "license_count=0",
+        "service_count=0",
+        "charge_count=0",
+        "payer_charge_count=-1",
+    ):
+        with pytest.raises(asyncpg.CheckViolationError):
+            await connection.execute(
+                f"UPDATE {quoted}.hospital_price_version SET {invalid_set} "
+                "WHERE version_id=$1",
+                "a" * 64,
+            )
     await _assert_forward_metadata_constraints(connection, quoted)
 
 
@@ -194,6 +218,8 @@ async def _assert_forward_metadata_constraints(
         ("8" * 64, "npi_count=0"),
         ("4" * 64, "template_version='2'"),
         ("5" * 64, "source_format='json'"),
+        ("c" * 64, "semantic_sha256='not-a-hash'"),
+        ("5" * 64, "version_id='not-a-hash'"),
     ):
         with pytest.raises(asyncpg.CheckViolationError):
             await connection.execute(
@@ -348,6 +374,9 @@ async def test_postgres_legacy_header_keeps_absent_fields_absent(monkeypatch) ->
         await _seed_packed_v4_header(database_url, quoted)
         await _run_migration(
             engine, _load_migration(CSV_SHORT_V2_MIGRATION_PATH), "upgrade"
+        )
+        await _run_migration(
+            engine, _load_migration(COUNT_INVARIANTS_MIGRATION_PATH), "upgrade"
         )
         await _prove_current_headers(database_url, quoted)
     finally:
