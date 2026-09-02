@@ -430,7 +430,7 @@ async def test_match_candidates_returns_503_on_enrichment_timeout(monkeypatch):
         "_fetch_provider_enrichment_summary_map",
         slow_enrichment,
     )
-    monkeypatch.setattr(npi_module, "_MATCH_CANDIDATES_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(npi_module, "_MATCH_CANDIDATES_TIMEOUT_SECONDS", 0.05)
 
     with pytest.raises(
         sanic.exceptions.ServiceUnavailable,
