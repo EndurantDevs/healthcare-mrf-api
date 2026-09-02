@@ -13,13 +13,13 @@
     "global_state_usage": 0,
     "inline_suppressions": 1,
     "long_files": 143,
-    "long_functions": 169,
+    "long_functions": 167,
     "missing_contract_docstrings": 0,
     "pass_placeholders": 0,
     "single_letter_names": 0,
     "syntax_errors": 0,
-    "too_many_locals": 71,
-    "too_many_parameters": 32
+    "too_many_locals": 69,
+    "too_many_parameters": 31
   },
   "issue_ids": {
     "ambiguous_function_names": [],
@@ -214,9 +214,7 @@
       "long_function:api/endpoint/pharmacy_license.py:get_pharmacy_license_by_npi",
       "long_function:api/endpoint/plan.py:find_a_plan",
       "long_function:api/endpoint/plan.py:get_plan",
-      "long_function:api/endpoint/pricing.py:_enrich_provider_service_cost_indices",
       "long_function:api/endpoint/pricing.py:_load_procedure_taxonomy_evidence",
-      "long_function:api/endpoint/pricing.py:_load_provider_quality_profile",
       "long_function:api/endpoint/pricing.py:_provider_procedure_cost_level",
       "long_function:api/endpoint/pricing.py:autocomplete_prescriptions",
       "long_function:api/endpoint/pricing.py:autocomplete_procedures",
@@ -378,8 +376,6 @@
       "too_many_locals:api/endpoint/partd_formulary.py:get_pharmacy_medication_costs",
       "too_many_locals:api/endpoint/plan.py:find_a_plan",
       "too_many_locals:api/endpoint/plan.py:get_plan",
-      "too_many_locals:api/endpoint/pricing.py:_enrich_provider_service_cost_indices",
-      "too_many_locals:api/endpoint/pricing.py:_load_provider_quality_profile",
       "too_many_locals:api/endpoint/pricing.py:_provider_procedure_cost_level",
       "too_many_locals:api/endpoint/pricing.py:autocomplete_procedures",
       "too_many_locals:api/endpoint/pricing.py:get_pricing_provider_score",
@@ -441,7 +437,6 @@
     ],
     "too_many_parameters": [
       "too_many_parameters:api/endpoint/npi.py:_npi_detail_cache_key",
-      "too_many_parameters:api/endpoint/pricing.py:_build_provider_quality_response_payload",
       "too_many_parameters:api/endpoint/reports.py:_build_market_sql",
       "too_many_parameters:process/control_lifecycle.py:mark_control_run",
       "too_many_parameters:process/entity_address_unified.py:_run_sql_phase",

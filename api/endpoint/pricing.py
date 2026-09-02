@@ -1714,24 +1714,16 @@ def _geography_candidates(
     return ordered_candidates
 
 
-async def _enrich_provider_service_cost_indices(
-    session,
-    provider_service_rows: list[dict[str, Any]],
-    *,
-    year: int,
-    internal_codes: list[int],
-    fallback_state: str | None = None,
-    fallback_city: str | None = None,
-    fallback_zip5: str | None = None,
-) -> None:
-    """Populate provider service rows with peer-derived cost indices when profile tables exist."""
-    if not provider_service_rows or not internal_codes:
-        return
-    if not await _is_table_available(session, provider_procedure_cost_profile_table.name):
-        return
-    if not await _is_table_available(session, procedure_peer_stats_table.name):
-        return
+_ProviderCostPeerKey = tuple[int, int, str, str, str, str]
 
+
+def _provider_cost_geography_scope(
+    provider_service_rows: list[dict[str, Any]],
+    fallback_state: str | None,
+    fallback_city: str | None,
+    fallback_zip5: str | None,
+) -> tuple[dict[int, list[tuple[str, str]]], dict[str, set[str]]]:
+    """Collect valid provider NPIs and their ordered geography fallbacks."""
     geography_candidates_by_npi: dict[int, list[tuple[str, str]]] = {}
     geography_values_by_scope: dict[str, set[str]] = {"national": {"US"}}
     for provider_service_row in provider_service_rows:
@@ -1755,10 +1747,13 @@ async def _enrich_provider_service_cost_indices(
         geography_candidates_by_npi[npi] = geography_candidates
         for geography_scope, geography_value in geography_candidates:
             geography_values_by_scope.setdefault(geography_scope, set()).add(geography_value)
+    return geography_candidates_by_npi, geography_values_by_scope
 
-    if not geography_candidates_by_npi:
-        return
 
+def _provider_cost_geography_clauses(
+    geography_values_by_scope: Mapping[str, set[str]],
+) -> list[Any]:
+    """Build the bounded profile-geography predicates."""
     geography_clauses = []
     for geography_scope, geography_values in geography_values_by_scope.items():
         sanitized_values = sorted(
@@ -1776,9 +1771,18 @@ async def _enrich_provider_service_cost_indices(
                 provider_procedure_cost_profile_table.c.geography_value.in_(sanitized_values),
             )
         )
-    if not geography_clauses:
-        return
+    return geography_clauses
 
+
+async def _load_provider_cost_profiles(
+    session,
+    *,
+    year: int,
+    internal_codes: list[int],
+    geography_candidates_by_npi: Mapping[int, list[tuple[str, str]]],
+    geography_clauses: list[Any],
+) -> list[dict[str, Any]]:
+    """Load provider profiles admitted by the requested geography scope."""
     profile_result = await session.execute(
         select(provider_procedure_cost_profile_table).where(
             and_(
@@ -1792,13 +1796,14 @@ async def _enrich_provider_service_cost_indices(
             )
         )
     )
-    profile_rows = [
-        _row_to_dict(profile_row)
-        for profile_row in profile_result
-    ]
-    if not profile_rows:
-        return
+    return [_row_to_dict(profile_row) for profile_row in profile_result]
 
+
+def _select_provider_cost_profiles(
+    profile_rows: list[dict[str, Any]],
+    geography_candidates_by_npi: Mapping[int, list[tuple[str, str]]],
+) -> dict[int, dict[str, Any]]:
+    """Select the most specific, best-supported profile for each provider."""
     profiles_by_npi_and_geo: dict[tuple[int, str, str], list[dict[str, Any]]] = {}
     for profile_row in profile_rows:
         npi_raw = profile_row.get("npi")
@@ -1833,42 +1838,58 @@ async def _enrich_provider_service_cost_indices(
             break
         if selected is not None:
             selected_profile_by_npi[npi] = selected
+    return selected_profile_by_npi
 
-    if not selected_profile_by_npi:
-        return
 
-    peer_key_candidates: set[tuple[int, int, str, str, str, str]] = set()
+def _provider_cost_peer_key(
+    profile: Mapping[str, Any],
+    *,
+    default_setting_key: str = "all",
+) -> _ProviderCostPeerKey | None:
+    """Normalize one profile or peer row into its lookup key."""
+    geography_scope = str(profile.get("geography_scope") or "").strip()
+    geography_value = str(profile.get("geography_value") or "").strip()
+    if not geography_scope or not geography_value:
+        return None
+    try:
+        procedure_code = int(profile.get("procedure_code"))
+        profile_year = int(profile.get("year"))
+    except (TypeError, ValueError):
+        return None
+    normalized_specialty = str(profile.get("specialty_key") or "").strip().lower()
+    setting_key = (
+        str(profile.get("setting_key") or "").strip().lower()
+        or default_setting_key
+    )
+    return (
+        procedure_code,
+        profile_year,
+        geography_scope,
+        geography_value,
+        normalized_specialty,
+        setting_key,
+    )
+
+
+def _collect_provider_cost_peer_keys(
+    selected_profile_by_npi: Mapping[int, dict[str, Any]],
+) -> set[_ProviderCostPeerKey]:
+    """Return specialty-specific and all-specialty peer lookup keys."""
+    peer_key_candidates: set[_ProviderCostPeerKey] = set()
     for profile in selected_profile_by_npi.values():
-        procedure_code_raw = profile.get("procedure_code")
-        year_raw = profile.get("year")
-        geography_scope = str(profile.get("geography_scope") or "").strip()
-        geography_value = str(profile.get("geography_value") or "").strip()
-        specialty_key = str(profile.get("specialty_key") or "").strip().lower()
-        setting_key = str(profile.get("setting_key") or "all").strip().lower() or "all"
-        if not geography_scope or not geography_value:
+        peer_key = _provider_cost_peer_key(profile)
+        if peer_key is None:
             continue
-        try:
-            procedure_code = int(procedure_code_raw)
-            profile_year = int(year_raw)
-        except (TypeError, ValueError):
-            continue
-        specialty_candidates = [specialty_key] if specialty_key else []
-        specialty_candidates.append("__all__")
-        for peer_specialty in specialty_candidates:
-            peer_key_candidates.add(
-                (
-                    procedure_code,
-                    profile_year,
-                    geography_scope,
-                    geography_value,
-                    peer_specialty,
-                    setting_key,
-                )
-            )
+        if peer_key[4]:
+            peer_key_candidates.add(peer_key)
+        peer_key_candidates.add((*peer_key[:4], "__all__", peer_key[5]))
+    return peer_key_candidates
 
-    if not peer_key_candidates:
-        return
 
+async def _load_provider_cost_peers(
+    session, peer_key_candidates: set[_ProviderCostPeerKey]
+) -> list[dict[str, Any]]:
+    """Load peer thresholds for the selected provider profiles."""
     peer_clauses = [
         and_(
             procedure_peer_stats_table.c.procedure_code == procedure_code,
@@ -1888,28 +1909,29 @@ async def _enrich_provider_service_cost_indices(
         ) in peer_key_candidates
     ]
     peer_result = await session.execute(select(procedure_peer_stats_table).where(or_(*peer_clauses)))
-    peer_rows = [
-        _row_to_dict(peer_stats_row)
-        for peer_stats_row in peer_result
-    ]
-    if not peer_rows:
-        return
+    return [_row_to_dict(peer_stats_row) for peer_stats_row in peer_result]
 
-    peers_by_key: dict[tuple[int, int, str, str, str, str], dict[str, Any]] = {}
+
+def _provider_cost_peers_by_key(
+    peer_rows: list[dict[str, Any]],
+) -> dict[_ProviderCostPeerKey, dict[str, Any]]:
+    """Index valid peer rows by their normalized lookup key."""
+    peers_by_key: dict[_ProviderCostPeerKey, dict[str, Any]] = {}
     for peer_stats_row in peer_rows:
-        try:
-            key = (
-                int(peer_stats_row.get("procedure_code")),
-                int(peer_stats_row.get("year")),
-                str(peer_stats_row.get("geography_scope") or "").strip(),
-                str(peer_stats_row.get("geography_value") or "").strip(),
-                str(peer_stats_row.get("specialty_key") or "").strip().lower(),
-                str(peer_stats_row.get("setting_key") or "").strip().lower(),
-            )
-        except (TypeError, ValueError):
-            continue
-        peers_by_key[key] = peer_stats_row
+        peer_key = _provider_cost_peer_key(
+            peer_stats_row, default_setting_key=""
+        )
+        if peer_key is not None:
+            peers_by_key[peer_key] = peer_stats_row
+    return peers_by_key
 
+
+def _apply_provider_service_cost_indices(
+    provider_service_rows: list[dict[str, Any]],
+    selected_profile_by_npi: Mapping[int, dict[str, Any]],
+    peers_by_key: Mapping[_ProviderCostPeerKey, dict[str, Any]],
+) -> None:
+    """Apply peer-derived cost levels to provider service response rows."""
     for provider_service_row in provider_service_rows:
         npi_raw = provider_service_row.get("npi")
         if npi_raw is None:
@@ -1922,38 +1944,13 @@ async def _enrich_provider_service_cost_indices(
         profile = selected_profile_by_npi.get(npi)
         if profile is None:
             continue
-
-        try:
-            procedure_code = int(profile.get("procedure_code"))
-            profile_year = int(profile.get("year"))
-        except (TypeError, ValueError):
+        peer_key = _provider_cost_peer_key(profile)
+        if peer_key is None:
             continue
-
-        geography_scope = str(profile.get("geography_scope") or "").strip()
-        geography_value = str(profile.get("geography_value") or "").strip()
-        specialty_key = str(profile.get("specialty_key") or "").strip().lower()
-        setting_key = str(profile.get("setting_key") or "all").strip().lower() or "all"
-
-        peer_row = peers_by_key.get(
-            (
-                procedure_code,
-                profile_year,
-                geography_scope,
-                geography_value,
-                specialty_key,
-                setting_key,
-            )
-        )
+        peer_row = peers_by_key.get(peer_key)
         if peer_row is None:
             peer_row = peers_by_key.get(
-                (
-                    procedure_code,
-                    profile_year,
-                    geography_scope,
-                    geography_value,
-                    "__all__",
-                    setting_key,
-                )
+                (*peer_key[:4], "__all__", peer_key[5])
             )
         if peer_row is None:
             continue
@@ -1969,6 +1966,51 @@ async def _enrich_provider_service_cost_indices(
             continue
         provider_service_row["cost_index"] = estimated_cost_level
         provider_service_row["estimated_cost_level"] = estimated_cost_level
+
+
+async def _enrich_provider_service_cost_indices(
+    session,
+    provider_service_rows: list[dict[str, Any]],
+    *,
+    year: int,
+    internal_codes: list[int],
+    fallback_state: str | None = None,
+    fallback_city: str | None = None,
+    fallback_zip5: str | None = None,
+) -> None:
+    """Populate provider service rows with peer-derived cost indices when available."""
+    if not provider_service_rows or not internal_codes:
+        return
+    if not await _is_table_available(session, provider_procedure_cost_profile_table.name):
+        return
+    if not await _is_table_available(session, procedure_peer_stats_table.name):
+        return
+    geography_scope = _provider_cost_geography_scope(
+        provider_service_rows, fallback_state, fallback_city, fallback_zip5
+    )
+    geography_candidates_by_npi, geography_values_by_scope = geography_scope
+    geography_clauses = _provider_cost_geography_clauses(geography_values_by_scope)
+    if not geography_candidates_by_npi or not geography_clauses:
+        return
+    profile_rows = await _load_provider_cost_profiles(
+        session,
+        year=year,
+        internal_codes=internal_codes,
+        geography_candidates_by_npi=geography_candidates_by_npi,
+        geography_clauses=geography_clauses,
+    )
+    selected_profile_by_npi = _select_provider_cost_profiles(
+        profile_rows, geography_candidates_by_npi
+    )
+    peer_key_candidates = _collect_provider_cost_peer_keys(selected_profile_by_npi)
+    if not peer_key_candidates:
+        return
+    peer_rows = await _load_provider_cost_peers(session, peer_key_candidates)
+    _apply_provider_service_cost_indices(
+        provider_service_rows,
+        selected_profile_by_npi,
+        _provider_cost_peers_by_key(peer_rows),
+    )
 
 
 async def _default_year(session, table) -> int:
@@ -2869,11 +2911,15 @@ def _estimated_confidence_score(profile: dict[str, Any], peer_count: int) -> flo
     return round(min(confidence, 54.0), 2)
 
 
+class _ProviderQualityResponseIdentity(NamedTuple):
+    provider_npi: int
+    year_used: int
+    year_source: str
+
+
 def _build_provider_quality_response_payload(
     *,
-    provider_npi: int,
-    year_used: int,
-    year_source: str,
+    identity: _ProviderQualityResponseIdentity,
     selected_payload: dict[str, Any],
     selected_mode: str,
     scores_by_benchmark_mode: dict[str, dict[str, Any] | None],
@@ -2888,9 +2934,9 @@ def _build_provider_quality_response_payload(
         if scores_by_benchmark_mode.get(mode) is not None
     ]
     response_payload_map = {
-        "npi": provider_npi,
-        "year_used": year_used,
-        "year_source": year_source,
+        "npi": identity.provider_npi,
+        "year_used": identity.year_used,
+        "year_source": identity.year_source,
         "model_version": selected_payload.get("model_version"),
         "benchmark_mode": selected_mode,
         "tier": selected_payload.get("tier"),
@@ -3460,50 +3506,25 @@ def _aggregate_domain(measures: list[dict[str, float]]) -> dict[str, Any]:
     }
 
 
-async def _load_provider_quality_profile(
-    session,
-    *,
-    npi: int,
-    year: int | None,
-) -> dict[str, Any] | None:
-    """Load provider identity, location, taxonomy, and enrichment attributes for quality scoring."""
-    provider_year_filter = "AND p.year = :year" if year is not None else ""
-    claims_state_expr = _state_code_sql("p.state")
-    doctor_state_expr = _state_code_sql("d.state")
-    unified_state_expr = _state_code_sql("e.state_name")
-    npi_state_expr = _state_code_sql("a.state_name")
-    taxonomy_table_exists = await _is_table_available(session, NPIDataTaxonomy.__tablename__)
-    nucc_table_exists = await _is_table_available(session, NUCCTaxonomy.__tablename__)
-    provider_enrichment_exists = await _is_table_available(session, ProviderEnrichmentSummary.__tablename__)
-    doctor_clinician_exists = await _is_table_available(session, DoctorClinicianAddress.__tablename__)
-    unified_address_exists = await _is_table_available(session, EntityAddressUnified.__tablename__)
-    npi_address_exists = await _is_table_available(session, NPIAddress.__tablename__)
-    unified_address_columns = (
-        await _table_columns(session, EntityAddressUnified.__tablename__)
-        if unified_address_exists
-        else set()
-    )
-    nucc_columns = (
-        await _table_columns(session, NUCCTaxonomy.__tablename__)
-        if nucc_table_exists
-        else set()
-    )
-    unified_confirmed_order_sql = (
-        "CASE WHEN COALESCE(e.multi_source_confirmed, FALSE) THEN 0 ELSE 1 END,"
-        if "multi_source_confirmed" in unified_address_columns
-        else ""
-    )
-    unified_source_count_order_sql = (
-        "COALESCE(e.source_count, 0) DESC,"
-        if "source_count" in unified_address_columns
-        else ""
-    )
-    unified_checksum_order_sql = "e.checksum" if "checksum" in unified_address_columns else "COALESCE(e.entity_id, 0)"
-    provider_enrichment_cte = (
-        f"""
+def _provider_quality_enrichment_cte(is_available: bool) -> str:
+    if not is_available:
+        return """
             provider_enrichment_choice AS (
-                SELECT
-                    pe.npi::bigint AS npi,
+                SELECT NULL::bigint AS npi,
+                    FALSE::boolean AS has_any_enrollment,
+                    FALSE::boolean AS has_hospital_enrollment,
+                    FALSE::boolean AS has_hha_enrollment,
+                    FALSE::boolean AS has_hospice_enrollment,
+                    FALSE::boolean AS has_fqhc_enrollment,
+                    FALSE::boolean AS has_rhc_enrollment,
+                    FALSE::boolean AS has_snf_enrollment,
+                    FALSE::boolean AS has_medicare_claims
+                WHERE FALSE
+            ),
+        """
+    return f"""
+            provider_enrichment_choice AS (
+                SELECT pe.npi::bigint AS npi,
                     COALESCE(pe.has_any_enrollment, FALSE)::boolean AS has_any_enrollment,
                     COALESCE(pe.has_hospital_enrollment, FALSE)::boolean AS has_hospital_enrollment,
                     COALESCE(pe.has_hha_enrollment, FALSE)::boolean AS has_hha_enrollment,
@@ -3517,244 +3538,292 @@ async def _load_provider_quality_profile(
                 LIMIT 1
             ),
         """
-        if provider_enrichment_exists
-        else """
-            provider_enrichment_choice AS (
-                SELECT
-                    NULL::bigint AS npi,
-                    FALSE::boolean AS has_any_enrollment,
-                    FALSE::boolean AS has_hospital_enrollment,
-                    FALSE::boolean AS has_hha_enrollment,
-                    FALSE::boolean AS has_hospice_enrollment,
-                    FALSE::boolean AS has_fqhc_enrollment,
-                    FALSE::boolean AS has_rhc_enrollment,
-                    FALSE::boolean AS has_snf_enrollment,
-                    FALSE::boolean AS has_medicare_claims
-                WHERE FALSE
-            ),
-        """
-    )
-    taxonomy_cte = (
-        f"""
-            taxonomy_choice AS (
-                SELECT
-                    UPPER(NULLIF(BTRIM(COALESCE(t.healthcare_provider_taxonomy_code, '')), ''))::varchar AS taxonomy_code
-                FROM {PRICING_SCHEMA}.{NPIDataTaxonomy.__tablename__} t
-                WHERE t.npi = :npi
-                  AND NULLIF(BTRIM(COALESCE(t.healthcare_provider_taxonomy_code, '')), '') IS NOT NULL
-                ORDER BY
-                    CASE
-                        WHEN UPPER(COALESCE(t.healthcare_provider_primary_taxonomy_switch, '')) = 'Y' THEN 0
-                        ELSE 1
-                    END,
-                    t.checksum
-                LIMIT 1
-            ),
-        """
-        if taxonomy_table_exists
-        else """
+
+
+def _provider_quality_taxonomy_cte(is_available: bool) -> str:
+    if not is_available:
+        return """
             taxonomy_choice AS (
                 SELECT NULL::varchar AS taxonomy_code
                 WHERE FALSE
             ),
         """
-    )
-    doctor_address_cte = (
-        f"""
-            doctor_address_choice AS (
-                SELECT
-                    ({doctor_state_expr})::varchar AS state_key,
-                    NULLIF(LEFT(REGEXP_REPLACE(COALESCE(d.zip_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS zip5
-                FROM {PRICING_SCHEMA}.{DoctorClinicianAddress.__tablename__} d
-                WHERE d.npi = :npi
-                  AND (
-                        NULLIF(BTRIM(COALESCE(d.state, '')), '') IS NOT NULL
-                     OR NULLIF(BTRIM(COALESCE(d.zip_code, '')), '') IS NOT NULL
-                  )
-                ORDER BY
-                    CASE
-                        WHEN NULLIF(LEFT(REGEXP_REPLACE(COALESCE(d.zip_code, ''), '[^0-9]', '', 'g'), 5), '') IS NOT NULL
-                         AND NULLIF(BTRIM(COALESCE(d.state, '')), '') IS NOT NULL
-                        THEN 0
-                        ELSE 1
-                    END,
-                    d.address_checksum
+    return f"""
+            taxonomy_choice AS (
+                SELECT UPPER(NULLIF(BTRIM(COALESCE(
+                    t.healthcare_provider_taxonomy_code, '')), ''))::varchar AS taxonomy_code
+                FROM {PRICING_SCHEMA}.{NPIDataTaxonomy.__tablename__} t
+                WHERE t.npi = :npi
+                  AND NULLIF(BTRIM(COALESCE(
+                      t.healthcare_provider_taxonomy_code, '')), '') IS NOT NULL
+                ORDER BY CASE WHEN UPPER(COALESCE(
+                    t.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'
+                    THEN 0 ELSE 1 END, t.checksum
                 LIMIT 1
             ),
         """
-        if doctor_clinician_exists
-        else """
+
+
+def _provider_quality_doctor_address_cte(is_available: bool) -> str:
+    if not is_available:
+        return """
             doctor_address_choice AS (
                 SELECT NULL::varchar AS state_key, NULL::varchar AS zip5
                 WHERE FALSE
             ),
         """
-    )
-    unified_address_cte = (
-        f"""
+    return f"""
+            doctor_address_choice AS (
+                SELECT ({_state_code_sql("d.state")})::varchar AS state_key,
+                    NULLIF(LEFT(REGEXP_REPLACE(COALESCE(
+                        d.zip_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS zip5
+                FROM {PRICING_SCHEMA}.{DoctorClinicianAddress.__tablename__} d
+                WHERE d.npi = :npi
+                  AND (NULLIF(BTRIM(COALESCE(d.state, '')), '') IS NOT NULL
+                    OR NULLIF(BTRIM(COALESCE(d.zip_code, '')), '') IS NOT NULL)
+                ORDER BY CASE WHEN NULLIF(LEFT(REGEXP_REPLACE(COALESCE(
+                    d.zip_code, ''), '[^0-9]', '', 'g'), 5), '') IS NOT NULL
+                    AND NULLIF(BTRIM(COALESCE(d.state, '')), '') IS NOT NULL
+                    THEN 0 ELSE 1 END, d.address_checksum
+                LIMIT 1
+            ),
+        """
+
+
+def _provider_quality_unified_address_cte(
+    is_available: bool, available_columns: set[str]
+) -> str:
+    if not is_available:
+        return """
             unified_address_choice AS (
-                SELECT
-                    ({unified_state_expr})::varchar AS state_key,
-                    NULLIF(LEFT(REGEXP_REPLACE(COALESCE(e.postal_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS zip5
+                SELECT NULL::varchar AS state_key, NULL::varchar AS zip5
+                WHERE FALSE
+            ),
+        """
+    confirmed_order_sql = (
+        "CASE WHEN COALESCE(e.multi_source_confirmed, FALSE) THEN 0 ELSE 1 END,"
+        if "multi_source_confirmed" in available_columns else ""
+    )
+    source_count_order_sql = (
+        "COALESCE(e.source_count, 0) DESC,"
+        if "source_count" in available_columns else ""
+    )
+    checksum_order_sql = (
+        "e.checksum" if "checksum" in available_columns
+        else "COALESCE(e.entity_id, 0)"
+    )
+    return f"""
+            unified_address_choice AS (
+                SELECT ({_state_code_sql("e.state_name")})::varchar AS state_key,
+                    NULLIF(LEFT(REGEXP_REPLACE(COALESCE(
+                        e.postal_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS zip5
                 FROM {PRICING_SCHEMA}.{EntityAddressUnified.__tablename__} e
                 WHERE COALESCE(e.npi, e.inferred_npi) = :npi
                   AND e.type IN ('practice', 'primary', 'secondary', 'site')
-                  AND (
-                        NULLIF(BTRIM(COALESCE(e.state_name, '')), '') IS NOT NULL
-                     OR NULLIF(BTRIM(COALESCE(e.postal_code, '')), '') IS NOT NULL
-                  )
-                ORDER BY
-                    {unified_confirmed_order_sql}
-                    {unified_source_count_order_sql}
-                    CASE e.type
-                        WHEN 'practice' THEN 0
-                        WHEN 'primary' THEN 1
-                        WHEN 'secondary' THEN 2
-                        ELSE 3
-                    END,
-                    {unified_checksum_order_sql}
+                  AND (NULLIF(BTRIM(COALESCE(e.state_name, '')), '') IS NOT NULL
+                    OR NULLIF(BTRIM(COALESCE(e.postal_code, '')), '') IS NOT NULL)
+                ORDER BY {confirmed_order_sql} {source_count_order_sql}
+                    CASE e.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1
+                        WHEN 'secondary' THEN 2 ELSE 3 END, {checksum_order_sql}
                 LIMIT 1
             ),
         """
-        if unified_address_exists
-        else """
-            unified_address_choice AS (
+
+
+def _provider_quality_npi_address_cte(is_available: bool) -> str:
+    if not is_available:
+        return """
+            npi_address_choice AS (
                 SELECT NULL::varchar AS state_key, NULL::varchar AS zip5
                 WHERE FALSE
-            ),
+            )
         """
-    )
-    npi_address_cte = (
-        f"""
+    return f"""
             npi_address_choice AS (
-                SELECT
-                    ({npi_state_expr})::varchar AS state_key,
-                    NULLIF(LEFT(REGEXP_REPLACE(COALESCE(a.postal_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS zip5
+                SELECT ({_state_code_sql("a.state_name")})::varchar AS state_key,
+                    NULLIF(LEFT(REGEXP_REPLACE(COALESCE(
+                        a.postal_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS zip5
                 FROM {PRICING_SCHEMA}.{NPIAddress.__tablename__} a
                 WHERE a.npi = :npi
                   AND a.type IN ('practice', 'primary', 'secondary')
-                  AND (
-                        NULLIF(BTRIM(COALESCE(a.state_name, '')), '') IS NOT NULL
-                     OR NULLIF(BTRIM(COALESCE(a.postal_code, '')), '') IS NOT NULL
-                  )
-                ORDER BY
-                    CASE a.type
-                        WHEN 'practice' THEN 0
-                        WHEN 'primary' THEN 1
-                        WHEN 'secondary' THEN 2
-                        ELSE 3
-                    END,
-                    a.checksum
+                  AND (NULLIF(BTRIM(COALESCE(a.state_name, '')), '') IS NOT NULL
+                    OR NULLIF(BTRIM(COALESCE(a.postal_code, '')), '') IS NOT NULL)
+                ORDER BY CASE a.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1
+                    WHEN 'secondary' THEN 2 ELSE 3 END, a.checksum
                 LIMIT 1
             )
         """
-        if npi_address_exists
-        else """
-            npi_address_choice AS (
-                SELECT NULL::varchar AS state_key, NULL::varchar AS zip5
-                WHERE FALSE
-            )
-        """
-    )
-    nucc_cte = (
-        f"""
+
+
+def _provider_quality_classification_cte(
+    is_available: bool, available_columns: set[str]
+) -> str:
+    if not is_available or "classification" not in available_columns:
+        return """
             taxonomy_classification_choice AS (
-                SELECT
-                    LOWER(NULLIF(BTRIM(COALESCE(nt.classification, '')), ''))::varchar AS taxonomy_classification
+                SELECT NULL::varchar AS taxonomy_classification
+                WHERE FALSE
+            ),
+        """
+    return f"""
+            taxonomy_classification_choice AS (
+                SELECT LOWER(NULLIF(BTRIM(COALESCE(
+                    nt.classification, '')), ''))::varchar AS taxonomy_classification
                 FROM {PRICING_SCHEMA}.{NUCCTaxonomy.__tablename__} nt
                 JOIN taxonomy_choice tc
                   ON UPPER(BTRIM(COALESCE(nt.code, ''))) = tc.taxonomy_code
                 LIMIT 1
             ),
         """
-        if nucc_table_exists and "classification" in nucc_columns
-        else """
-            taxonomy_classification_choice AS (
-                SELECT NULL::varchar AS taxonomy_classification
-                WHERE FALSE
-            ),
-        """
+
+
+async def _provider_quality_profile_ctes(
+    session,
+) -> tuple[str, str, str, str, str, str]:
+    taxonomy_available = await _is_table_available(
+        session, NPIDataTaxonomy.__tablename__
     )
+    nucc_available = await _is_table_available(session, NUCCTaxonomy.__tablename__)
+    enrichment_available = await _is_table_available(
+        session, ProviderEnrichmentSummary.__tablename__
+    )
+    doctor_available = await _is_table_available(
+        session, DoctorClinicianAddress.__tablename__
+    )
+    unified_available = await _is_table_available(
+        session, EntityAddressUnified.__tablename__
+    )
+    npi_address_available = await _is_table_available(
+        session, NPIAddress.__tablename__
+    )
+    unified_columns = (
+        await _table_columns(session, EntityAddressUnified.__tablename__)
+        if unified_available else set()
+    )
+    nucc_columns = (
+        await _table_columns(session, NUCCTaxonomy.__tablename__)
+        if nucc_available else set()
+    )
+    return (
+        _provider_quality_taxonomy_cte(taxonomy_available),
+        _provider_quality_enrichment_cte(enrichment_available),
+        _provider_quality_classification_cte(nucc_available, nucc_columns),
+        _provider_quality_doctor_address_cte(doctor_available),
+        _provider_quality_unified_address_cte(unified_available, unified_columns),
+        _provider_quality_npi_address_cte(npi_address_available),
+    )
+
+
+_PROVIDER_QUALITY_PROFILE_QUERY_TEMPLATE = f"""
+    WITH provider_choice AS (
+        SELECT LOWER(NULLIF(BTRIM(COALESCE(
+                p.provider_type, '')), ''))::varchar AS specialty_key,
+            ({_state_code_sql("p.state")})::varchar AS claims_state,
+            NULLIF(BTRIM(COALESCE(p.zip5, '')), '')::varchar AS claims_zip5
+        FROM {PRICING_SCHEMA}.{PricingProvider.__tablename__} p
+        WHERE p.npi = :npi {{provider_year_filter}}
+        ORDER BY p.year DESC
+        LIMIT 1
+    ),
+    {{taxonomy_cte}}
+    {{enrichment_cte}}
+    {{classification_cte}}
+    {{doctor_address_cte}}
+    {{unified_address_cte}}
+    {{npi_address_cte}}
+    SELECT nd.npi, pc.specialty_key, tc.taxonomy_code,
+        tcc.taxonomy_classification,
+        COALESCE(da.zip5, ua.zip5, na.zip5, pc.claims_zip5)::varchar AS zip5,
+        COALESCE(da.state_key, ua.state_key, na.state_key,
+            pc.claims_state)::varchar AS state_key,
+        CASE
+            WHEN COALESCE(nd.entity_type_code, 0) = 1 THEN 'clinician'
+            WHEN COALESCE(pe.has_hospital_enrollment, FALSE)
+              OR COALESCE(pe.has_hha_enrollment, FALSE)
+              OR COALESCE(pe.has_hospice_enrollment, FALSE)
+              OR COALESCE(pe.has_fqhc_enrollment, FALSE)
+              OR COALESCE(pe.has_rhc_enrollment, FALSE)
+              OR COALESCE(pe.has_snf_enrollment, FALSE) THEN 'facility'
+            WHEN COALESCE(nd.entity_type_code, 0) = 2 THEN 'organization'
+            ELSE 'unknown'
+        END::varchar AS provider_class,
+        CASE
+            WHEN da.zip5 IS NOT NULL OR da.state_key IS NOT NULL
+                THEN 'doctor_clinician_address'
+            WHEN ua.zip5 IS NOT NULL OR ua.state_key IS NOT NULL
+                THEN 'entity_address_unified'
+            WHEN na.zip5 IS NOT NULL OR na.state_key IS NOT NULL
+                THEN 'npi_address'
+            WHEN pc.claims_zip5 IS NOT NULL OR pc.claims_state IS NOT NULL
+                THEN 'claims_pricing'
+            ELSE 'unknown'
+        END::varchar AS location_source,
+        COALESCE(pe.has_any_enrollment, FALSE)::boolean AS has_enrollment,
+        COALESCE(pe.has_medicare_claims, FALSE)::boolean AS has_medicare_claims
+    FROM {PRICING_SCHEMA}.{NPIData.__tablename__} nd
+    LEFT JOIN provider_choice pc ON TRUE
+    LEFT JOIN taxonomy_choice tc ON TRUE
+    LEFT JOIN taxonomy_classification_choice tcc ON TRUE
+    LEFT JOIN provider_enrichment_choice pe ON TRUE
+    LEFT JOIN doctor_address_choice da ON TRUE
+    LEFT JOIN unified_address_choice ua ON TRUE
+    LEFT JOIN npi_address_choice na ON TRUE
+    WHERE nd.npi = :npi
+    LIMIT 1
+"""
+
+
+def _provider_quality_profile_query(
+    year: int | None, ctes: tuple[str, str, str, str, str, str]
+) -> str:
+    cte_names = (
+        "taxonomy_cte", "enrichment_cte", "classification_cte",
+        "doctor_address_cte", "unified_address_cte", "npi_address_cte",
+    )
+    return _PROVIDER_QUALITY_PROFILE_QUERY_TEMPLATE.format(
+        provider_year_filter="AND p.year = :year" if year is not None else "",
+        **dict(zip(cte_names, ctes, strict=True)),
+    )
+
+
+def _provider_quality_profile_from_row(
+    npi: int, row_data: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "npi": npi,
+        "specialty_key": _parse_specialty_key(row_data.get("specialty_key")),
+        "taxonomy_code": str(row_data.get("taxonomy_code") or "").strip().upper() or None,
+        "taxonomy_classification": str(
+            row_data.get("taxonomy_classification") or ""
+        ).strip().lower() or None,
+        "zip5": str(row_data.get("zip5") or "").strip()[:5] or None,
+        "state_key": str(row_data.get("state_key") or "").strip().upper() or None,
+        "provider_class": _normalize_provider_class(row_data.get("provider_class"))
+        or "unknown",
+        "location_source": str(row_data.get("location_source") or "").strip()
+        or "unknown",
+        "has_enrollment": bool(_as_bool(row_data.get("has_enrollment"))),
+        "has_medicare_claims": bool(_as_bool(row_data.get("has_medicare_claims"))),
+    }
+
+
+async def _load_provider_quality_profile(
+    session,
+    *,
+    npi: int,
+    year: int | None,
+) -> dict[str, Any] | None:
+    """Load provider identity, location, taxonomy, and enrichment attributes."""
     profile_query_result = await session.execute(
-        text(
-            f"""
-            WITH provider_choice AS (
-                SELECT
-                    LOWER(NULLIF(BTRIM(COALESCE(p.provider_type, '')), ''))::varchar AS specialty_key,
-                    ({claims_state_expr})::varchar AS claims_state,
-                    NULLIF(BTRIM(COALESCE(p.zip5, '')), '')::varchar AS claims_zip5
-                FROM {PRICING_SCHEMA}.{PricingProvider.__tablename__} p
-                WHERE p.npi = :npi
-                  {provider_year_filter}
-                ORDER BY p.year DESC
-                LIMIT 1
-            ),
-            {taxonomy_cte}
-            {provider_enrichment_cte}
-            {nucc_cte}
-            {doctor_address_cte}
-            {unified_address_cte}
-            {npi_address_cte}
-            SELECT
-                nd.npi,
-                pc.specialty_key,
-                tc.taxonomy_code,
-                tcc.taxonomy_classification,
-                COALESCE(da.zip5, ua.zip5, na.zip5, pc.claims_zip5)::varchar AS zip5,
-                COALESCE(da.state_key, ua.state_key, na.state_key, pc.claims_state)::varchar AS state_key,
-                CASE
-                    WHEN COALESCE(nd.entity_type_code, 0) = 1 THEN 'clinician'
-                    WHEN COALESCE(pe.has_hospital_enrollment, FALSE)
-                      OR COALESCE(pe.has_hha_enrollment, FALSE)
-                      OR COALESCE(pe.has_hospice_enrollment, FALSE)
-                      OR COALESCE(pe.has_fqhc_enrollment, FALSE)
-                      OR COALESCE(pe.has_rhc_enrollment, FALSE)
-                      OR COALESCE(pe.has_snf_enrollment, FALSE)
-                    THEN 'facility'
-                    WHEN COALESCE(nd.entity_type_code, 0) = 2 THEN 'organization'
-                    ELSE 'unknown'
-                END::varchar AS provider_class,
-                CASE
-                    WHEN da.zip5 IS NOT NULL OR da.state_key IS NOT NULL THEN 'doctor_clinician_address'
-                    WHEN ua.zip5 IS NOT NULL OR ua.state_key IS NOT NULL THEN 'entity_address_unified'
-                    WHEN na.zip5 IS NOT NULL OR na.state_key IS NOT NULL THEN 'npi_address'
-                    WHEN pc.claims_zip5 IS NOT NULL OR pc.claims_state IS NOT NULL THEN 'claims_pricing'
-                    ELSE 'unknown'
-                END::varchar AS location_source,
-                COALESCE(pe.has_any_enrollment, FALSE)::boolean AS has_enrollment,
-                COALESCE(pe.has_medicare_claims, FALSE)::boolean AS has_medicare_claims
-            FROM {PRICING_SCHEMA}.{NPIData.__tablename__} nd
-            LEFT JOIN provider_choice pc ON TRUE
-            LEFT JOIN taxonomy_choice tc ON TRUE
-            LEFT JOIN taxonomy_classification_choice tcc ON TRUE
-            LEFT JOIN provider_enrichment_choice pe ON TRUE
-            LEFT JOIN doctor_address_choice da ON TRUE
-            LEFT JOIN unified_address_choice ua ON TRUE
-            LEFT JOIN npi_address_choice na ON TRUE
-            WHERE nd.npi = :npi
-            LIMIT 1
-            """
-        ),
+        text(_provider_quality_profile_query(
+            year, await _provider_quality_profile_ctes(session)
+        )),
         {"npi": npi, "year": year},
     )
     profile_row = profile_query_result.first()
     if profile_row is None:
         return None
-    row_data = _row_to_dict(profile_row)
-    specialty_key = _parse_specialty_key(row_data.get("specialty_key"))
-    taxonomy_code = str(row_data.get("taxonomy_code") or "").strip().upper() or None
-    return {
-        "npi": npi,
-        "specialty_key": specialty_key,
-        "taxonomy_code": taxonomy_code,
-        "taxonomy_classification": str(row_data.get("taxonomy_classification") or "").strip().lower() or None,
-        "zip5": str(row_data.get("zip5") or "").strip()[:5] or None,
-        "state_key": str(row_data.get("state_key") or "").strip().upper() or None,
-        "provider_class": _normalize_provider_class(row_data.get("provider_class")) or "unknown",
-        "location_source": str(row_data.get("location_source") or "").strip() or "unknown",
-        "has_enrollment": bool(_as_bool(row_data.get("has_enrollment"))),
-        "has_medicare_claims": bool(_as_bool(row_data.get("has_medicare_claims"))),
-    }
+    return _provider_quality_profile_from_row(npi, _row_to_dict(profile_row))
 
 
 def _provider_quality_unavailable_reasons(
@@ -9035,9 +9104,9 @@ async def get_pricing_provider_score(request, npi: str):
                 if selected_payload is not None:
                     return response.json(
                         _build_provider_quality_response_payload(
-                            provider_npi=provider_npi,
-                            year_used=year_used,
-                            year_source=year_source_value,
+                            identity=_ProviderQualityResponseIdentity(
+                                provider_npi, year_used, year_source_value
+                            ),
                             selected_payload=selected_payload,
                             selected_mode=benchmark_mode,
                             scores_by_benchmark_mode=scores_by_benchmark_mode,
@@ -9052,9 +9121,9 @@ async def get_pricing_provider_score(request, npi: str):
                 assert selected_payload is not None
                 return response.json(
                     _build_provider_quality_response_payload(
-                        provider_npi=provider_npi,
-                        year_used=year_used,
-                        year_source=year_source_value,
+                        identity=_ProviderQualityResponseIdentity(
+                            provider_npi, year_used, year_source_value
+                        ),
                         selected_payload=selected_payload,
                         selected_mode=selected_mode,
                         scores_by_benchmark_mode=scores_by_benchmark_mode,
@@ -9122,9 +9191,9 @@ async def get_pricing_provider_score(request, npi: str):
         )
         return response.json(
             _build_provider_quality_response_payload(
-                provider_npi=provider_npi,
-                year_used=year_used,
-                year_source=year_source_value,
+                identity=_ProviderQualityResponseIdentity(
+                    provider_npi, year_used, year_source_value
+                ),
                 selected_payload=selected_payload,
                 selected_mode=selected_mode,
                 scores_by_benchmark_mode=scores_by_benchmark_mode,
@@ -9222,9 +9291,9 @@ async def get_pricing_provider_score(request, npi: str):
 
         return response.json(
             _build_provider_quality_response_payload(
-                provider_npi=provider_npi,
-                year_used=year,
-                year_source=year_source,
+                identity=_ProviderQualityResponseIdentity(
+                    provider_npi, year, year_source
+                ),
                 selected_payload=selected_payload,
                 selected_mode=selected_mode,
                 scores_by_benchmark_mode=scores_by_benchmark_mode,
@@ -9348,9 +9417,9 @@ async def get_pricing_provider_score(request, npi: str):
 
     return response.json(
         _build_provider_quality_response_payload(
-            provider_npi=provider_npi,
-            year_used=year,
-            year_source=year_source,
+            identity=_ProviderQualityResponseIdentity(
+                provider_npi, year, year_source
+            ),
             selected_payload=selected_payload,
             selected_mode=selected_mode,
             scores_by_benchmark_mode=scores_by_benchmark_mode,
