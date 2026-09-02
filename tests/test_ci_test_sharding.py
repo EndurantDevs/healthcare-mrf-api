@@ -293,21 +293,12 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
         bounded_selection_step,
         "tests/test_provider_directory_dataset_selection_sealed_db.py",
     )
-    pytest_lines = [
-        line for line in prepush.splitlines() if "python -m pytest" in line
+    envelope_timeout = "timeout --foreground 360s python -m pytest -q -n 4 --dist worksteal"
+    command_lines = [
+        line for line in prepush.splitlines() if "python -m pytest" in line or "cargo llvm-cov --manifest-path" in line
     ]
-    assert sum("timeout --foreground 360s" in line for line in pytest_lines) == 1
-    assert (
-        "timeout --foreground 360s python -m pytest -q -n 4 --dist worksteal"
-        in prepush
-    )
-    for workflow_line in pytest_lines:
-        assert "timeout --foreground 295s" in workflow_line or (
-            "timeout --foreground 360s" in workflow_line
-        )
-    for workflow_line in prepush.splitlines():
-        if "cargo llvm-cov --manifest-path" in workflow_line:
-            assert "timeout --foreground 295s" in workflow_line
+    assert sum(envelope_timeout in line for line in command_lines) == 1
+    assert all("timeout --foreground 295s" in line or envelope_timeout in line for line in command_lines)
 
 
 def test_provider_directory_enrichment_postgres_proofs_run_exactly_once() -> None:
