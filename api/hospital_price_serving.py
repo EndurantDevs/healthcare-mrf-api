@@ -29,6 +29,7 @@ from api.hospital_price_serving_support import MAX_HOSPITAL_PRICE_PUBLIC_BYTES
 from api.hospital_price_serving_support import public_hospital_price_item
 from api.hospital_price_serving_support import _validated_selector_page
 from api.hospital_price_serving_support import validate_payer_page_coverage
+from process.hospital_hpt_registry import hospital_hpt_group_ids
 from support.hospital_price_native_validation import (
     HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V2_PARSER_CONTRACT_SHA256,
@@ -423,12 +424,13 @@ async def read_hospital_price_page(session: Any, query: HospitalPriceQuery) -> d
     """Return one source-version-bound page whose pagination unit is charges."""
 
     _native_module()
+    hospital_ids = await asyncio.to_thread(hospital_hpt_group_ids, query.hospital_id)
     public_byte_budgets = [HOSPITAL_PRICE_PUBLIC_DATA_BYTES]
     async with session.begin():
         await session.execute(_READ_TRANSACTION_SQL)
         version = _validated_version(_mappings(await session.execute(
             VERSION_SQL,
-            {"hospital_id": query.hospital_id, "version_id": query.version_id},
+            {"hospital_ids": hospital_ids, "version_id": query.version_id},
         )))
         version_id = str(version["version_id"])
         after_key = decode_hospital_price_cursor(query, version_id)

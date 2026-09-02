@@ -279,6 +279,21 @@ def hospital_hpt_registry_groups() -> tuple[tuple[dict[str, str], ...], ...]:
     )
 
 
+@lru_cache(maxsize=1)
+def _group_ids_by_hospital_id() -> dict[str, tuple[str, ...]]:
+    groups_by_id: dict[str, tuple[str, ...]] = {}
+    for hospitals in hospital_hpt_registry_groups():
+        group_ids = tuple(hospital["hospital_id"] for hospital in hospitals)
+        groups_by_id.update((hospital_id, group_ids) for hospital_id in group_ids)
+    return groups_by_id
+
+
+def hospital_hpt_group_ids(hospital_id: str) -> tuple[str, ...]:
+    """Return canonical-first IDs for one reviewed facility group."""
+
+    return _group_ids_by_hospital_id().get(hospital_id, ())
+
+
 def selected_hospital_hpt_registry(
     params: dict[str, Any], *, runtime: bool = False
 ) -> tuple[dict[str, str], ...]:

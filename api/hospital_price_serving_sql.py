@@ -28,7 +28,10 @@ VERSION_SQL = text(
     current.charge_count AS current_charge_count,
     current.payer_charge_count AS current_fact_count,
     root.format_version, root.service_count, root.charge_count, root.fact_count
-    FROM {_SCHEMA}.hospital_price_hospital hospital
+    FROM unnest(CAST(:hospital_ids AS varchar[])) WITH ORDINALITY
+      requested(hospital_id, group_ordinal)
+    JOIN {_SCHEMA}.hospital_price_hospital hospital
+      ON hospital.hospital_id=requested.hospital_id
     JOIN {_SCHEMA}.hospital_price_current current
       ON current.hospital_id=hospital.hospital_id
     JOIN {_SCHEMA}.hospital_price_version_hospital binding
@@ -38,11 +41,13 @@ VERSION_SQL = text(
       ON version.version_id=current.version_id
     LEFT JOIN {_SCHEMA}.hospital_price_packed_root root
       ON root.version_id=version.version_id
-    WHERE hospital.hospital_id=:hospital_id
-      AND (
+    WHERE (
         CAST(:version_id AS varchar) IS NULL
         OR version.version_id=CAST(:version_id AS varchar)
-      )"""
+      )
+    ORDER BY current.last_success_at DESC NULLS LAST,
+             requested.group_ordinal
+    LIMIT 1"""
 )
 CODE_SELECTOR_SQL = text(
     f"""WITH selector_format AS (
