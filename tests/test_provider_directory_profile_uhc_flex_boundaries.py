@@ -318,6 +318,19 @@ async def test_selection_dataset_loader_maps_rows_and_keeps_ready_join() -> None
     assert "provider_directory_rooted_graph_dataset_ready" in selection_sql
     assert "dataset_scoped_rooted_graph_complete" in selection_sql
     assert "dataset_scoped_endpoint_complete" in selection_sql
+    assert "(dataset.dataset_id)" in selection_sql
+
+    await flex_profile.load_profile_selection_dataset_rows(
+        database=database,
+        endpoint_dataset_ref='"fixture"."endpoint_dataset"',
+        schema_ref='"fixture"',
+        row_mapping=lambda row: {"dataset_id": row.dataset_id},
+        exact_readiness=False,
+    )
+    proposal_sql = database.all.await_args.args[0]
+    assert "legacy.status = 'published'" in proposal_sql
+    assert "rooted.status = 'published'" in proposal_sql
+    assert "(dataset.dataset_id)" not in proposal_sql
 
 
 def test_readiness_matching_uses_import_run_fallback_and_rejects_none() -> None:

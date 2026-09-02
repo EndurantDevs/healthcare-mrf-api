@@ -163,12 +163,16 @@ async def _selection_source_rows() -> list[Mapping[str, Any]]:
     return [_row_mapping(database_row) for database_row in database_rows]
 
 
-async def _selection_dataset_rows() -> list[Mapping[str, Any]]:
+async def _selection_dataset_rows(
+    *,
+    exact_readiness: bool = True,
+) -> list[Mapping[str, Any]]:
     return await load_profile_selection_dataset_rows(
         database=db,
         endpoint_dataset_ref=_table_ref(ProviderDirectoryEndpointDataset),
         schema_ref=_quote_identifier(_schema()),
         row_mapping=_row_mapping,
+        exact_readiness=exact_readiness,
     )
 
 
@@ -448,6 +452,7 @@ async def _compute_current_selection(
     *,
     node_id: str,
     lock_selection: bool,
+    exact_readiness: bool = True,
 ) -> _ComputedProfileSelection:
     if lock_selection:
         await _lock_profile_selection_tables()
@@ -455,5 +460,7 @@ async def _compute_current_selection(
         catalog_map,
         node_id=node_id,
         source_rows=await _selection_source_rows(),
-        dataset_rows=await _selection_dataset_rows(),
+        dataset_rows=await _selection_dataset_rows(
+            exact_readiness=exact_readiness,
+        ),
     )

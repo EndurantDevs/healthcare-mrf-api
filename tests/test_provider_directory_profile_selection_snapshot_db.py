@@ -72,7 +72,13 @@ async def test_snapshot_current_selection_honors_optional_lock(monkeypatch):
         node_id="dev-node",
         lock_selection=True,
     )
-    assert unlocked == locked
+    proposal = await snapshot._compute_current_selection(
+        _catalog(),
+        node_id="dev-node",
+        lock_selection=False,
+        exact_readiness=False,
+    )
+    assert unlocked == locked == proposal
     lock.assert_awaited_once_with()
 
 

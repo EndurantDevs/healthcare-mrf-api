@@ -18,9 +18,9 @@ SELECT dataset.endpoint_id, dataset.dataset_id,
        dataset.validated_at, dataset.published_at,
        dataset.superseded_at, dataset.publication_metadata_json,
        CASE WHEN legacy.dataset_id IS NOT NULL
-                 THEN {legacy_ready_ref}(dataset.dataset_id)
+                 THEN {legacy_ready_expression}
             WHEN rooted.dataset_id IS NOT NULL
-                 THEN {rooted_ready_ref}(dataset.dataset_id)
+                 THEN {rooted_ready_expression}
             ELSE false
        END AS dataset_scoped_ready,
        CASE WHEN legacy.dataset_id IS NOT NULL
@@ -72,6 +72,8 @@ SELECT dataset.endpoint_id, dataset.dataset_id,
 def _profile_selection_dataset_sql(
     endpoint_dataset_ref: str,
     schema_ref: str,
+    *,
+    exact_readiness: bool = True,
 ) -> str:
     legacy_header_ref = (
         f'{schema_ref}."provider_directory_uhc_flex_practitioner_dataset"'
@@ -84,10 +86,18 @@ def _profile_selection_dataset_sql(
     return _PROFILE_SELECTION_DATASET_SQL.format(
         endpoint_dataset_ref=endpoint_dataset_ref,
         legacy_header_ref=legacy_header_ref,
-        legacy_ready_ref=legacy_ready_ref,
+        legacy_ready_expression=(
+            f"{legacy_ready_ref}(dataset.dataset_id)"
+            if exact_readiness
+            else "legacy.status = 'published' AND legacy.is_current IS TRUE"
+        ),
         legacy_variant=LEGACY_PRACTITIONER_VARIANT,
         rooted_header_ref=rooted_header_ref,
-        rooted_ready_ref=rooted_ready_ref,
+        rooted_ready_expression=(
+            f"{rooted_ready_ref}(dataset.dataset_id)"
+            if exact_readiness
+            else "rooted.status = 'published' AND rooted.is_current IS TRUE"
+        ),
     )
 
 
@@ -97,11 +107,16 @@ async def load_profile_selection_dataset_rows(
     endpoint_dataset_ref: str,
     schema_ref: str,
     row_mapping: Callable[[Any], Mapping[str, Any]],
+    exact_readiness: bool = True,
 ) -> list[Mapping[str, Any]]:
-    """Load current parents with exact legacy/rooted readiness projections."""
+    """Load current parents with exact or proposal readiness projections."""
 
     database_rows = await database.all(
-        _profile_selection_dataset_sql(endpoint_dataset_ref, schema_ref)
+        _profile_selection_dataset_sql(
+            endpoint_dataset_ref,
+            schema_ref,
+            exact_readiness=exact_readiness,
+        )
     )
     return [row_mapping(database_row) for database_row in database_rows]
 
