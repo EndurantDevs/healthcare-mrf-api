@@ -261,6 +261,27 @@ async def _synthetic_em_scope_search(
     }
 
 
+async def _synthetic_legacy_distance_scope_search(
+    _session, args_by_name, _pagination, **_kwargs
+):
+    """Accept only the complete legacy ascending-distance retry."""
+
+    if (
+        pricing_module._parse_bool(
+            args_by_name.get("include_providers"),
+            "include_providers",
+            default=False,
+        )
+        and args_by_name["order_by"] == "distance"
+        and args_by_name["order"] == "asc"
+    ):
+        return {"items": [], "query": {"source": "ptg2"}}
+    raise PTG2LocationScopeError(
+        "Internal detail must not escape.",
+        allows_distance_retry=True,
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("param_name", ("clinical_intent", "intent"))
 async def test_raw_procedure_search_rejects_resolver_only_intent(param_name):
@@ -4165,6 +4186,84 @@ async def test_office_visit_scope_refusal_retry_options_are_servable(
             )
         )
         assert retry_response.status == 200
+
+
+@pytest.mark.asyncio
+async def test_office_visit_refusal_preserves_malformed_provider_flag(monkeypatch):
+    selection = _mixed_canonical_release_selection()
+    readiness = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_guard_selection",
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "is_em_distance_projection_ready",
+        readiness,
+    )
+
+    with pytest.raises(
+        pricing_module.InvalidUsage,
+        match="Parameter 'include_providers' must be boolean",
+    ):
+        await list_providers_by_procedure(
+            make_request(
+                [],
+                args={
+                    "plan_release_id": selection.plan_release_id,
+                    "code": "99213",
+                    "zip5": "60611",
+                    "include_providers": "maybe",
+                },
+            )
+        )
+
+    readiness.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_plan_id_office_visit_refusal_keeps_legacy_retry(monkeypatch):
+    """A non-release E&M retry remains the replayable legacy shape."""
+
+    monkeypatch.setattr(
+        pricing_module,
+        "search_current_ptg2_index",
+        _synthetic_legacy_distance_scope_search,
+    )
+    readiness = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        pricing_module,
+        "is_em_distance_projection_ready",
+        readiness,
+    )
+    request = make_request(
+        [],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "code": "99213",
+            "zip5": "60611",
+            "zip_radius_miles": "0",
+            "include_providers": "false",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+
+    retry_options = json.loads(response.body)["fix_it"]["retry_options"]
+    assert response.status == 422
+    assert retry_options == [
+        {"order_by": "distance", "include_providers": True}
+    ]
+    retry_response = await list_providers_by_procedure(
+        make_request(
+            [],
+            args={**dict(request.args), **retry_options[0]},
+        )
+    )
+    assert retry_response.status == 200
+    readiness.assert_not_awaited()
 
 
 @pytest.mark.asyncio

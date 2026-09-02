@@ -89,12 +89,24 @@ def test_openapi_documents_projection_response_shapes():
     assert "minimum_negotiated_rate" in schemas[
         "PricingProcedureProviderCardRecord"
     ]["properties"]
-    assert schemas["PricingProcedureProviderCardRecord"]["properties"][
-        "distance_miles"
-    ] == {"type": "number", "minimum": 0}
-    assert "distance_miles" in schemas["PricingProcedureProviderCardRecord"][
-        "required"
-    ]
     assert "median_negotiated_rate" in schemas[
         "PricingProcedureRateAggregateRecord"
     ]["properties"]
+
+
+def test_openapi_card_allows_projection_specific_optional_fields():
+    """Distance is lane-specific and coordinate cards may lack a ZIP."""
+
+    card_schema = _openapi_spec()["components"]["schemas"][
+        "PricingProcedureProviderCardRecord"
+    ]
+    assert card_schema["properties"]["distance_miles"] == {
+        "type": "number",
+        "minimum": 0,
+    }
+    assert "distance_miles" not in card_schema["required"]
+    assert card_schema["properties"]["zip5"] == {
+        "type": "string",
+        "nullable": True,
+        "pattern": "^[0-9]{5}$",
+    }

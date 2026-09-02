@@ -8685,7 +8685,7 @@ components:
     PricingProcedureProviderCardRecord:
       type: object
       required:
-        [npi, provider_name, zip5, distance_miles, minimum_negotiated_rate, maximum_negotiated_rate, rate_count]
+        [npi, provider_name, zip5, minimum_negotiated_rate, maximum_negotiated_rate, rate_count]
       properties:
         npi:
           type: integer
@@ -8714,6 +8714,7 @@ components:
           nullable: true
         zip5:
           type: string
+          nullable: true
           pattern: '^[0-9]{5}$'
         distance_miles:
           type: number

@@ -41,8 +41,10 @@ class _DistanceProjectionResult:
 class _DistanceProjectionSession:
     def __init__(self, ready=False):
         self.ready = ready
+        self.parameters = []
 
-    async def execute(self, *_args, **_kwargs):
+    async def execute(self, _statement, parameters):
+        self.parameters.append(parameters)
         return _DistanceProjectionResult(self.ready)
 
 
@@ -152,6 +154,7 @@ def test_distance_card_item_uses_the_exact_code_slot():
     assert card_by_field["maximum_negotiated_rate"] == Decimal("14")
     assert card_by_field["rate_count"] == 24
     assert card_by_field["distance_miles"] == 1.25
+    assert _card_item({**card_row_by_field, "zip5": None}, 3)["zip5"] is None
     assert PROJECTION_CONTRACT == "plan_pricing_em_distance_v1"
     with pytest.raises(ValueError, match="rate arrays are invalid"):
         _card_item({**card_row_by_field, "rate_counts": [21]}, 3)
@@ -226,14 +229,16 @@ async def test_em_distance_reader_handles_attachment_boundary():
         SimpleNamespace(limit=10, offset=191, page=20),
     ) is None
 
+    ready_session = _DistanceProjectionSession(ready=True)
     response = await search_plan_pricing_em_distance(
-        _DistanceProjectionSession(ready=True),
+        ready_session,
         selection,
         args_by_name,
         SimpleNamespace(limit=10, offset=0, page=1),
     )
 
     assert response is not None
+    assert ready_session.parameters[0]["code_bit"] == 1 << EM_CODES.index("99213")
     assert (
         response["result_state"],
         response["items"],

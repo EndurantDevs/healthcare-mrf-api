@@ -357,6 +357,7 @@ async def _progressive_page_rows(
     zip5: str | None,
     latitude: float | None,
     longitude: float | None,
+    code_index: int,
 ) -> tuple[list[Mapping[str, Any]], bool, bool, int] | None:
     """Read only enough nearest locations to prove the requested page."""
 
@@ -371,7 +372,7 @@ async def _progressive_page_rows(
                 "serving_revision_id": selection.serving_revision_id,
                 "binding_set_digest": selection.binding_set_digest,
                 "contract": PROJECTION_CONTRACT,
-                "code_bit": 1 << int(_request_code_index(args) or 0),
+                "code_bit": 1 << code_index,
                 "zip5": zip5,
                 "latitude": latitude,
                 "longitude": longitude,
@@ -420,7 +421,14 @@ async def search_plan_pricing_em_distance(
     except (TypeError, ValueError):
         return None
     page_window = await _progressive_page_rows(
-        session, selection, args, pagination, zip5, latitude, longitude
+        session,
+        selection,
+        args,
+        pagination,
+        zip5,
+        latitude,
+        longitude,
+        code_index,
     )
     if page_window is None:
         return None

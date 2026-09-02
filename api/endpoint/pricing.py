@@ -12392,6 +12392,7 @@ async def list_providers_by_procedure(request):
         if guard_release_selection is not None
         else None
     )
+    _parse_bool(args.get("include_providers"), "include_providers", default=True)
     is_broad_office_visit_refused = False
     try:
         _reject_broad_group_plan_provider_expansion(
@@ -12569,31 +12570,30 @@ async def list_providers_by_procedure(request):
                 isinstance(exc, PTG2LocationScopeError)
                 and exc.allows_distance_retry
             )
-            is_office_visit = _is_broad_office_visit_cpt(
-                ptg_args_by_name.get("code_system"),
-                str(ptg_args_by_name.get("code") or ""),
+            is_release_bound_office_visit = (
+                release_selection is not None
+                and _is_broad_office_visit_cpt(
+                    ptg_args_by_name.get("code_system"),
+                    str(ptg_args_by_name.get("code") or ""),
+                )
             )
-            retry_option = (
-                em_distance_retry_option(ptg_args_by_name, pagination)
-                if is_office_visit
-                else {
+            if is_release_bound_office_visit:
+                assert release_selection is not None
+                retry_option = em_distance_retry_option(
+                    ptg_args_by_name, pagination
+                )
+                retry_ready = bool(
+                    retry_option is not None
+                    and await is_em_distance_projection_ready(
+                        session, release_selection
+                    )
+                )
+            else:
+                retry_option = {
                     "order_by": "distance",
                     "include_providers": True,
                 }
-            )
-            retry_ready = bool(
-                retry_option is not None
-                and (
-                    not is_office_visit
-                    or (
-                        release_selection is not None
-                        and await is_em_distance_projection_ready(
-                            session,
-                            release_selection,
-                        )
-                    )
-                )
-            )
+                retry_ready = True
             return _ptg_json_response(
                 request,
                 {
