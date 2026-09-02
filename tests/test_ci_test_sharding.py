@@ -45,7 +45,7 @@ def test_collection_command_has_the_hard_test_process_limit() -> None:
 
 
 def test_slow_envelope_suites_run_once_across_the_parallel_main_lanes() -> None:
-    """Assign one bounded envelope suite to each existing main lane."""
+    """Shard every bounded envelope suite across the existing main lanes."""
 
     workflow = yaml.safe_load(
         (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
@@ -75,14 +75,18 @@ def test_slow_envelope_suites_run_once_across_the_parallel_main_lanes() -> None:
     assert "capacity_test_paths+=$'\\n'\"$envelope_test_paths\"" in prepush
     assert 'collection_args+=(--ignore "$test_path")' in python_main
     assert 'mapfile -t envelope_tests <<< "$envelope_test_paths"' in python_main
-    assert python_main.count("python scripts/ci/shard_pytest_nodeids.py") == 1
+    assert python_main.count("python scripts/ci/shard_pytest_nodeids.py") == 2
     assert '"${#envelope_tests[@]}" -eq 4' in python_main
-    assert "local envelope_test=${envelope_tests[$shard]}" in python_main
-    assert python_main.count('"$envelope_test"') == 1
+    assert (
+        'local envelope_shard_file="${RUNNER_TEMP:-/tmp}/'
+        'python-envelope-shard-${shard}.txt"' in python_main
+    )
+    assert '-- "${envelope_tests[@]}"' in python_main
+    assert python_main.count('@"$envelope_shard_file"') == 1
     assert python_main.count("--cov-append") == 1
     assert python_main.count("python -m pytest -q -n 4 --dist worksteal") == 1
     assert python_main.count("export COVERAGE_FILE=") == 1
-    assert python_main.index('"$envelope_test"') < python_main.index(
+    assert python_main.index('@"$envelope_shard_file"') < python_main.index(
         "write-shard-provenance"
     )
     assert 'mapfile -t capacity_tests <<< "$base_capacity_test_paths"' in capacity
