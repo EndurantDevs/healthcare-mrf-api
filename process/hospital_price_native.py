@@ -225,10 +225,15 @@ def detect_hospital_mrf_format(
         return "csv-tall"
     for header in headers:
         parts = [part.strip().casefold() for part in header.split("|")]
-        if len(parts) in {3, 4} and parts[0] in {
-            "standard_charge",
-            "median_amount",
-            "10th_percentile",
-        }:
+        valid_component_counts = {
+            "standard_charge": {3, 4, 5},
+            "estimated_amount": {3, 4},
+            "median_amount": {3, 4},
+            "10th_percentile": {3, 4},
+            "90th_percentile": {3, 4},
+            "count": {3, 4},
+            "additional_payer_notes": {3, 4},
+        }.get(parts[0])
+        if valid_component_counts and len(parts) in valid_component_counts:
             return "csv-wide"
     raise ValueError("hospital CSV payer layout is not CMS tall or wide")

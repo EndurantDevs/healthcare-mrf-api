@@ -23,6 +23,7 @@ from support.hospital_price_native_validation import (
     HOSPITAL_MRF_PACKED_V2_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V3_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256,
+    HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
 )
 
@@ -103,6 +104,7 @@ def _fact(charge_key, payer="Payer", plan="Plan"):
         "charge_key": charge_key,
         "payer_name": payer,
         "plan_name": plan,
+        "negotiated_rate_term": "JAN 2026-MAY 2026",
         "negotiated_dollar": f"{70 + charge_key}.00",
         "negotiated_percentage": None,
         "negotiated_algorithm": None,
@@ -295,6 +297,9 @@ async def test_populated_payer_page_is_charge_bounded_and_version_bound(monkeypa
     assert page["query"]["negotiated_prices_requested"] is True
     assert [item["charge"]["charge_ordinal"] for item in page["items"]] == [10]
     assert page["items"][0]["negotiated_prices"][0]["payer_name"] == "Payer"
+    assert page["items"][0]["negotiated_prices"][0]["negotiated_rate_term"] == (
+        "JAN 2026-MAY 2026"
+    )
     assert "charge_key" not in page["items"][0]["negotiated_prices"][0]
 
     next_page = await serving.read_hospital_price_page(
@@ -381,30 +386,18 @@ async def test_version_contract_and_cursor_generation_fail_closed(monkeypatch):
     with pytest.raises(serving.HospitalPriceServingUnavailableError):
         await serving.read_hospital_price_page(session, _query())
 
-    assert serving._validated_version((
-        _version(
-            format_version=1,
-            parser_contract_sha256=HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256,
-        ),
-    ))["format_version"] == 1
-    assert serving._validated_version((
-        _version(
-            format_version=2,
-            parser_contract_sha256=HOSPITAL_MRF_PACKED_V2_PARSER_CONTRACT_SHA256,
-        ),
-    ))["format_version"] == 2
-    assert serving._validated_version((
-        _version(
-            format_version=2,
-            parser_contract_sha256=HOSPITAL_MRF_PACKED_V3_PARSER_CONTRACT_SHA256,
-        ),
-    ))["format_version"] == 2
-    assert serving._validated_version((
-        _version(
-            format_version=2,
-            parser_contract_sha256=HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256,
-        ),
-    ))["format_version"] == 2
+    for format_version, parser_contract in (
+        (1, HOSPITAL_MRF_LEGACY_PARSER_CONTRACT_SHA256),
+        (2, HOSPITAL_MRF_PACKED_V2_PARSER_CONTRACT_SHA256),
+        (2, HOSPITAL_MRF_PACKED_V3_PARSER_CONTRACT_SHA256),
+        (2, HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256),
+        (2, HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256),
+    ):
+        version = _version(
+            format_version=format_version,
+            parser_contract_sha256=parser_contract,
+        )
+        assert serving._validated_version((version,))["format_version"] == format_version
     assert serving._validated_version((
         _version(template_version="2"),
     ))["template_version"] == "2"

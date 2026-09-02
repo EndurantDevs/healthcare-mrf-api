@@ -37,6 +37,7 @@ mod packed_output_tests {
         PayerChargeRow {
             payer_name: "Shared Payer".to_owned(),
             plan_name: "Shared Plan".to_owned(),
+            negotiated_rate_term: None,
             standard_charge_dollar: Some(amount.to_owned()),
             standard_charge_percentage: None,
             standard_charge_algorithm: None,
@@ -151,6 +152,7 @@ mod packed_output_tests {
             charge_key: 0,
             payer_name: "payer".to_owned(),
             plan_name: "plan".to_owned(),
+            negotiated_rate_term: None,
             negotiated_dollar: Some("90".to_owned()),
             negotiated_percentage: None,
             negotiated_algorithm: None,

@@ -1,5 +1,5 @@
 pub const HOSPITAL_MRF_SCHEMA_REVISION: &str = "5333564a710f80d7740180b9ffab8dbdcba9b502";
-const HOSPITAL_MRF_PACKED_SCHEMA_REVISION: &str = "hospital-mrf-packed-blocks-v3";
+const HOSPITAL_MRF_PACKED_SCHEMA_REVISION: &str = "hospital-mrf-packed-blocks-v4";
 
 pub const MRF_COPY_COLUMNS: &[&str] = &[
     "version_id",
@@ -81,6 +81,7 @@ pub const MODIFIER_PAYER_COPY_COLUMNS: &[&str] = &[
     "payer_ordinal",
     "payer_name",
     "plan_name",
+    "negotiated_rate_term",
     "description",
     "standard_charge_dollar",
     "standard_charge_percentage",

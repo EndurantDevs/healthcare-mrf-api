@@ -111,6 +111,10 @@ fn validate_payer_common(
 ) -> io::Result<PayerChargeRow> {
     payer.payer_name = required_text(&payer.payer_name, "payer_name")?.to_owned();
     payer.plan_name = required_text(&payer.plan_name, "plan_name")?.to_owned();
+    payer.negotiated_rate_term = payer
+        .negotiated_rate_term
+        .as_deref()
+        .and_then(optional_text);
     payer.methodology = canonical_methodology(&payer.methodology, normalize_case)?;
     payer.standard_charge_algorithm = payer
         .standard_charge_algorithm

@@ -170,7 +170,7 @@ async def test_copy_stages_use_exact_v3_columns_and_private_temp_tables(tmp_path
     )
     assert columns_by_stage["stage_modifier_payer"] == (
         "version_id", "modifier_ordinal", "payer_ordinal", "payer_name",
-        "plan_name", "description", "standard_charge_dollar",
+        "plan_name", "negotiated_rate_term", "description", "standard_charge_dollar",
         "standard_charge_percentage", "standard_charge_algorithm",
     )
     assert set(columns_by_stage) == {

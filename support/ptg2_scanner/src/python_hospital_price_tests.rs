@@ -325,6 +325,7 @@ fn python_hospital_price_decoders_return_normalized_rows() {
                 charge_key: 0,
                 payer_name: "Synthetic payer".to_owned(),
                 plan_name: "Synthetic plan".to_owned(),
+                negotiated_rate_term: Some("JAN 2026-MAY 2026".to_owned()),
                 negotiated_dollar: Some("75.00".to_owned()),
                 negotiated_percentage: None,
                 negotiated_algorithm: None,
@@ -352,6 +353,16 @@ fn python_hospital_price_decoders_return_normalized_rows() {
                 .extract::<String>()
                 .unwrap(),
             "Synthetic payer",
+        );
+        assert_eq!(
+            facts
+                .get_item(0)
+                .unwrap()
+                .get_item("negotiated_rate_term")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "JAN 2026-MAY 2026",
         );
         assert_eq!(
             facts

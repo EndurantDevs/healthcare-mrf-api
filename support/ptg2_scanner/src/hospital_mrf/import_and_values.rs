@@ -164,7 +164,7 @@ fn import_hospital_mrf_with_output_mode(
             HOSPITAL_MRF_SCHEMA_REVISION,
         ),
         HospitalMrfOutputMode::Packed => (
-            "hospital-mrf-copy-v2-v3-packed-v5",
+            "hospital-mrf-copy-v2-v3-packed-v6",
             HOSPITAL_MRF_PACKED_SCHEMA_REVISION,
         ),
     };

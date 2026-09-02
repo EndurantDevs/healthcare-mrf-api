@@ -14,6 +14,19 @@ fn put_text(output: &mut Vec<u8>, value: &str) -> HospitalPriceBlockResult<()> {
     Ok(())
 }
 
+fn put_optional_text(
+    output: &mut Vec<u8>,
+    value: Option<&str>,
+) -> HospitalPriceBlockResult<()> {
+    match value {
+        Some(value) => put_text(output, value),
+        None => {
+            put_u32(output, NONE_LENGTH);
+            Ok(())
+        }
+    }
+}
+
 fn valid_decimal(value: &str) -> bool {
     let bytes = value.as_bytes();
     let digits = if bytes.first() == Some(&b'-') {
@@ -109,17 +122,25 @@ fn add_preflight_bytes(total: &mut usize, bytes: usize) {
 }
 
 fn preflight_raw_bytes(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockResult<()> {
-    let mut payer_plans = HashSet::<(&str, &str)>::new();
+    let mut payer_plans = HashSet::<(&str, &str, Option<&str>)>::new();
     let mut algorithms = HashSet::<&str>::new();
     let mut methodologies = HashSet::<&str>::new();
     let mut allowed_counts = HashSet::<&str>::new();
     let mut payer_notes = HashSet::<&str>::new();
     let mut total = RAW_HEADER_BYTES + 5 * 2 + rows.len() * 8 + bitmap_bytes(rows.len()) * 10;
     for row in rows {
-        if payer_plans.insert((&row.payer_name, &row.plan_name)) {
-            add_preflight_bytes(&mut total, 8);
+        if payer_plans.insert((
+            &row.payer_name,
+            &row.plan_name,
+            row.negotiated_rate_term.as_deref(),
+        )) {
+            add_preflight_bytes(&mut total, 12);
             add_preflight_bytes(&mut total, row.payer_name.len());
             add_preflight_bytes(&mut total, row.plan_name.len());
+            add_preflight_bytes(
+                &mut total,
+                row.negotiated_rate_term.as_deref().map_or(0, str::len),
+            );
         }
         for (dictionary, value) in [
             (&mut algorithms, row.negotiated_algorithm.as_deref()),
@@ -179,7 +200,9 @@ fn frame_raw_version(
     }
     if !matches!(
         version,
-        HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION | HOSPITAL_PRICE_FACT_BLOCK_VERSION
+        HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION
+            | HOSPITAL_PRICE_FACT_BLOCK_PREVIOUS_VERSION
+            | HOSPITAL_PRICE_FACT_BLOCK_VERSION
     ) {
         return Err(invalid("version is unsupported"));
     }
@@ -219,7 +242,11 @@ pub fn encode_fact_block(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockRes
     for row in rows {
         payer_plan_ids.push(
             payer_plans
-                .intern(&row.payer_name, &row.plan_name)
+                .intern(
+                    &row.payer_name,
+                    &row.plan_name,
+                    row.negotiated_rate_term.as_deref(),
+                )
                 .expect("row cap bounds payer-plan dictionary IDs"),
         );
         algorithm_ids.push(
@@ -261,7 +288,7 @@ pub fn encode_fact_block(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockRes
     }
     let lanes = [
         payer_plans
-            .encode()
+            .encode(true)
             .expect("preflight bounds payer-plan dictionary bytes"),
         algorithms
             .encode()

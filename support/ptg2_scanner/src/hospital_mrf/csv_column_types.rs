@@ -41,6 +41,7 @@ struct TallCsvColumns {
 struct WidePayerColumns {
     payer_name: String,
     plan_name: String,
+    negotiated_rate_term: Option<String>,
     standard_charge_dollar: usize,
     standard_charge_percentage: usize,
     standard_charge_algorithm: usize,
@@ -64,6 +65,7 @@ struct WideCsvColumns {
 struct WidePayerBuilder {
     payer_name: String,
     plan_name: String,
+    negotiated_rate_term: Option<String>,
     standard_charge_dollar: Option<usize>,
     standard_charge_percentage: Option<usize>,
     standard_charge_algorithm: Option<usize>,

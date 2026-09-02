@@ -2252,6 +2252,10 @@ paths:
                           type: array
                           items:
                             type: object
+                            properties:
+                              negotiated_rate_term:
+                                type: string
+                                nullable: true
         '400':
           description: Invalid selector, cursor, or pagination input
         '404':

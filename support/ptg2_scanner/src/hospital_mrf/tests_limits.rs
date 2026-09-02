@@ -445,6 +445,7 @@
                 "payer_ordinal",
                 "payer_name",
                 "plan_name",
+                "negotiated_rate_term",
                 "description",
                 "standard_charge_dollar",
                 "standard_charge_percentage",

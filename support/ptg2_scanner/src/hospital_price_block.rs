@@ -7,7 +7,8 @@ use std::io::{Read, Write};
 
 pub const HOSPITAL_PRICE_FACT_BLOCK_MAGIC: &[u8; 8] = b"HPTFACT\0";
 const HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION: u32 = 1;
-pub const HOSPITAL_PRICE_FACT_BLOCK_VERSION: u32 = 2;
+const HOSPITAL_PRICE_FACT_BLOCK_PREVIOUS_VERSION: u32 = 2;
+pub const HOSPITAL_PRICE_FACT_BLOCK_VERSION: u32 = 3;
 pub const HOSPITAL_PRICE_FACT_BLOCK_HEADER_BYTES: usize = 56;
 pub const HOSPITAL_PRICE_FACT_BLOCK_MAX_ROWS: usize = 512;
 pub const HOSPITAL_PRICE_FACT_BLOCK_MAX_RAW_BYTES: usize = 4 * 1024 * 1024;
@@ -49,6 +50,7 @@ pub struct HospitalPriceFactRow {
     pub charge_key: u32,
     pub payer_name: String,
     pub plan_name: String,
+    pub negotiated_rate_term: Option<String>,
     pub negotiated_dollar: Option<String>,
     pub negotiated_percentage: Option<String>,
     pub negotiated_algorithm: Option<String>,
@@ -98,13 +100,22 @@ impl TextDictionary {
 
 #[derive(Default)]
 struct PayerPlanDictionary {
-    entries: Vec<(String, String)>,
-    ids: HashMap<(String, String), u16>,
+    entries: Vec<(String, String, Option<String>)>,
+    ids: HashMap<(String, String, Option<String>), u16>,
 }
 
 impl PayerPlanDictionary {
-    fn intern(&mut self, payer: &str, plan: &str) -> HospitalPriceBlockResult<u16> {
-        let key = (payer.to_owned(), plan.to_owned());
+    fn intern(
+        &mut self,
+        payer: &str,
+        plan: &str,
+        rate_term: Option<&str>,
+    ) -> HospitalPriceBlockResult<u16> {
+        let key = (
+            payer.to_owned(),
+            plan.to_owned(),
+            rate_term.map(str::to_owned),
+        );
         if let Some(id) = self.ids.get(&key) {
             return Ok(*id);
         }
@@ -117,12 +128,15 @@ impl PayerPlanDictionary {
         Ok(id)
     }
 
-    fn encode(&self) -> HospitalPriceBlockResult<Vec<u8>> {
+    fn encode(&self, include_rate_term: bool) -> HospitalPriceBlockResult<Vec<u8>> {
         let mut lane = Vec::new();
         put_u16(&mut lane, self.entries.len() as u16);
-        for (payer, plan) in &self.entries {
+        for (payer, plan, rate_term) in &self.entries {
             put_text(&mut lane, payer)?;
             put_text(&mut lane, plan)?;
+            if include_rate_term {
+                put_optional_text(&mut lane, rate_term.as_deref())?;
+            }
         }
         Ok(lane)
     }

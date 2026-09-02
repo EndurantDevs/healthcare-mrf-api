@@ -16,7 +16,9 @@ fn decode_frame(block: &[u8]) -> HospitalPriceBlockResult<(u32, usize, Vec<u8>)>
     let version = header_u32(block, 8);
     if !matches!(
         version,
-        HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION | HOSPITAL_PRICE_FACT_BLOCK_VERSION
+        HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION
+            | HOSPITAL_PRICE_FACT_BLOCK_PREVIOUS_VERSION
+            | HOSPITAL_PRICE_FACT_BLOCK_VERSION
     ) {
         return Err(invalid("version is unsupported"));
     }
@@ -99,6 +101,16 @@ impl<'a> SliceCursor<'a> {
             .map_err(|_| invalid("text contains invalid UTF-8"))
     }
 
+    fn optional_text(&mut self) -> HospitalPriceBlockResult<Option<&'a str>> {
+        let length = self.u32()?;
+        if length == NONE_LENGTH {
+            return Ok(None);
+        }
+        std::str::from_utf8(self.take(length as usize)?)
+            .map(Some)
+            .map_err(|_| invalid("text contains invalid UTF-8"))
+    }
+
     fn decimal(&mut self) -> HospitalPriceBlockResult<&'a str> {
         let value = self.text()?;
         if !valid_decimal(value) {
@@ -119,7 +131,9 @@ impl<'a> SliceCursor<'a> {
 fn decode_lanes(raw: &[u8], version: u32) -> HospitalPriceBlockResult<Vec<&[u8]>> {
     let lane_count = match version {
         HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION => LEGACY_LANE_COUNT,
-        HOSPITAL_PRICE_FACT_BLOCK_VERSION => LANE_COUNT,
+        HOSPITAL_PRICE_FACT_BLOCK_PREVIOUS_VERSION | HOSPITAL_PRICE_FACT_BLOCK_VERSION => {
+            LANE_COUNT
+        }
         _ => return Err(invalid("version is unsupported")),
     };
     let raw_header_bytes = 4 + lane_count * 8;
@@ -170,24 +184,7 @@ fn decode_text_dictionary(lane: &[u8]) -> HospitalPriceBlockResult<Vec<&str>> {
     Ok(entries)
 }
 
-fn decode_payer_plan_dictionary(lane: &[u8]) -> HospitalPriceBlockResult<Vec<(&str, &str)>> {
-    let mut cursor = SliceCursor::new(lane);
-    let count = cursor.u16()? as usize;
-    if count > HOSPITAL_PRICE_FACT_BLOCK_MAX_ROWS {
-        return Err(invalid("payer-plan dictionary has too many entries"));
-    }
-    let mut entries = Vec::with_capacity(count);
-    let mut unique = HashSet::with_capacity(count);
-    for _ in 0..count {
-        let value = (cursor.text()?, cursor.text()?);
-        if !unique.insert(value) {
-            return Err(invalid("payer-plan dictionary contains a duplicate entry"));
-        }
-        entries.push(value);
-    }
-    cursor.finish()?;
-    Ok(entries)
-}
+include!("decode_payer_plan.rs");
 
 fn checked_bitmap<'a>(
     cursor: &mut SliceCursor<'a>,
@@ -327,13 +324,16 @@ pub fn decode_fact_block(
     let lanes = decode_lanes(&raw, version)?;
 
     // Resolve filters before parsing or materializing any other fact lane.
-    let payer_plans = decode_payer_plan_dictionary(lanes[PAYER_PLAN_DICTIONARY])?;
+    let payer_plans = decode_payer_plan_dictionary(
+        lanes[PAYER_PLAN_DICTIONARY],
+        version == HOSPITAL_PRICE_FACT_BLOCK_VERSION,
+    )?;
     let payer_plan_ids =
         decode_all_required_ids(lanes[PAYER_PLAN_IDS], row_count, payer_plans.len())?;
     let mut matched = 0usize;
     let mut selected_rows = Vec::with_capacity(limit.min(row_count));
     for (row, id) in payer_plan_ids.iter().copied().enumerate() {
-        let (payer, plan) = payer_plans[id as usize];
+        let (payer, plan, _) = payer_plans[id as usize];
         if payer_name.is_none_or(|expected| expected == payer)
             && plan_name.is_none_or(|expected| expected == plan)
         {
@@ -415,7 +415,7 @@ pub fn decode_fact_block(
         &slots,
         selected_count,
     )?;
-    let estimated_amounts = if version == HOSPITAL_PRICE_FACT_BLOCK_VERSION {
+    let estimated_amounts = if version != HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION {
         decode_selected_optional_decimals(
             lanes[ESTIMATED_AMOUNTS],
             row_count,
@@ -429,10 +429,11 @@ pub fn decode_fact_block(
     let mut decoded_text_bytes = 0usize;
     for slot in 0..selected_count {
         let source_row = selected_rows[slot];
-        let (payer, plan) = payer_plans[payer_plan_ids[source_row] as usize];
+        let (payer, plan, rate_term) = payer_plans[payer_plan_ids[source_row] as usize];
         let values = [
             Some(payer),
             Some(plan),
+            rate_term,
             negotiated_dollars[slot].as_deref(),
             negotiated_percentages[slot].as_deref(),
             algorithm_ids[slot].map(|id| algorithms[id as usize]),
@@ -458,11 +459,12 @@ pub fn decode_fact_block(
     let mut output = Vec::with_capacity(selected_count);
     for slot in 0..selected_count {
         let source_row = selected_rows[slot];
-        let (payer, plan) = payer_plans[payer_plan_ids[source_row] as usize];
+        let (payer, plan, rate_term) = payer_plans[payer_plan_ids[source_row] as usize];
         output.push(HospitalPriceFactRow {
             charge_key: charge_keys[slot],
             payer_name: payer.to_owned(),
             plan_name: plan.to_owned(),
+            negotiated_rate_term: rate_term.map(str::to_owned),
             negotiated_dollar: negotiated_dollars[slot].clone(),
             negotiated_percentage: negotiated_percentages[slot].clone(),
             negotiated_algorithm: algorithm_ids[slot]

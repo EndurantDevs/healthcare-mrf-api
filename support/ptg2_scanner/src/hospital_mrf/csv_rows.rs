@@ -152,6 +152,7 @@ fn parse_tall_modifier_payer(
     Ok(Some(ModifierPayerRow {
         payer_name,
         plan_name,
+        negotiated_rate_term: None,
         description,
         standard_charge_dollar,
         standard_charge_percentage,
@@ -183,6 +184,7 @@ fn parse_wide_modifier_payers(
         payers.push(ModifierPayerRow {
             payer_name: Some(payer_name),
             plan_name: Some(plan_name),
+            negotiated_rate_term: payer.negotiated_rate_term.clone(),
             description: optional_text(description),
             standard_charge_dollar: optional_decimal(
                 csv_value(record, payer.standard_charge_dollar),
@@ -253,6 +255,7 @@ fn parse_tall_payer(
     let payer = PayerChargeRow {
         payer_name: csv_value(record, columns.payer_name).to_owned(),
         plan_name: csv_value(record, columns.plan_name).to_owned(),
+        negotiated_rate_term: None,
         standard_charge_dollar: optional_decimal(
             csv_value(record, columns.standard_charge_dollar),
             "standard_charge_dollar",
@@ -332,6 +335,7 @@ fn parse_wide_payers(
         let parsed = PayerChargeRow {
             payer_name: payer.payer_name.clone(),
             plan_name: payer.plan_name.clone(),
+            negotiated_rate_term: payer.negotiated_rate_term.clone(),
             standard_charge_dollar: optional_decimal(
                 csv_value(record, payer.standard_charge_dollar),
                 "standard_charge_dollar",
