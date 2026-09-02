@@ -7853,6 +7853,94 @@ async def test_magnacare_resolver_uses_target_payer_query(monkeypatch):
     assert len(resolved_targets) == 1
 
 
+def _allowed_only_toc_zip() -> bytes:
+    toc_by_field = {
+        "reporting_entity_name": "Example TPA",
+        "reporting_entity_type": "third_party_administrator",
+        "reporting_structure": [
+            {
+                "reporting_plans": [
+                    {
+                        "plan_id_type": "EIN",
+                        "plan_id": "TESTPLAN001",
+                        "plan_market_type": "group",
+                        "plan_name": "Example Employer Health Benefit Plan",
+                    }
+                ],
+                "in_network_files": [],
+                "allowed_amount_file": {
+                    "location": "https://files.example.test/allowed-amounts.json.gz"
+                },
+            }
+        ],
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("example_index.json", json.dumps(toc_by_field))
+    return buffer.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_magnacare_resolver_inspects_small_mislabeled_toc_zip(monkeypatch):
+    results_html = MAGNACARE_RESULTS_HTML.replace("24 MB", "553 Bytes")
+
+    async def fake_fetch_text(_url, **_kwargs):
+        return results_html
+
+    async def fake_fetch_json(_url, **_kwargs):
+        return {
+            "Data": "https://files.example.test/Example_In-Network.zip?sig=fixture"
+        }
+
+    async def fake_fetch_bytes(_url, *, max_bytes, session):
+        assert max_bytes == 2048
+        assert session == "session"
+        return _allowed_only_toc_zip()
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(discovery, "_fetch_bytes", fake_fetch_bytes)
+
+    resolved_targets = await discovery._resolve_magnacare_transparency_mrf(
+        {"source_id": "source_example", "payer_id": "payer_example"},
+        "https://clm.magnacare.com/transparency/",
+        {"type": "magnacare_transparency_mrf", "search_terms": ["example"], "max_bytes": 2048, "max_targets": 1},
+        session="session",
+    )
+    _plan_rows, file_rows, observed_file_count = await discovery._crawl_target_rows(
+        resolved_targets[0], "session", target_max_bytes=2048, should_filter_to_target_query=False,
+    )
+
+    assert resolved_targets[0].metadata["target_file_type"] == "table-of-contents"
+    assert observed_file_count == 1
+    assert [file_row["file_type"] for file_row in file_rows] == ["allowed-amounts"]
+
+
+@pytest.mark.asyncio
+async def test_magnacare_resolver_keeps_label_when_small_zip_sniff_fails(monkeypatch):
+    async def fake_fetch_text(_url, **_kwargs):
+        return MAGNACARE_RESULTS_HTML.replace("24 MB", "553 Bytes")
+
+    async def fake_fetch_json(_url, **_kwargs):
+        return {"Data": "https://files.example.test/Example_In-Network.zip?sig=fixture"}
+
+    async def fake_fetch_bytes(_url, **_kwargs):
+        raise ValueError("not a readable ZIP")
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(discovery, "_fetch_bytes", fake_fetch_bytes)
+
+    resolved_targets = await discovery._resolve_magnacare_transparency_mrf(
+        {"source_id": "source_example", "payer_id": "payer_example"},
+        "https://clm.magnacare.com/transparency/",
+        {"type": "magnacare_transparency_mrf", "search_terms": ["example"], "max_bytes": 2048, "max_targets": 1},
+        session="session",
+    )
+
+    assert resolved_targets[0].metadata["target_file_type"] == "in-network"
+
+
 def test_highmark_hmhs_script_expands_current_month_index_urls():
     script = """
     var fileArr = [

@@ -5388,6 +5388,37 @@ async def _magnacare_grouped_results(
     return grouped_by_target_key
 
 
+async def _magnacare_verified_file_type(
+    file_type: str,
+    file_url: str,
+    size_bytes: int | None,
+    max_bytes: int,
+    session: aiohttp.ClientSession,
+) -> str:
+    if (
+        file_type != "in-network"
+        or _container_format(file_url) != "zip"
+        or size_bytes is None
+        or size_bytes > max_bytes
+    ):
+        return file_type
+    try:
+        zip_values = await _fetch_zip_json_values(
+            file_url, max_bytes=max_bytes, session=session
+        )
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return file_type
+    return (
+        "table-of-contents"
+        if any(
+            isinstance(toc_document, dict)
+            and isinstance(toc_document.get("reporting_structure"), list)
+            for _member_name, toc_document in zip_values
+        )
+        else file_type
+    )
+
+
 async def _magnacare_crawl_target(
     source_record: dict[str, Any],
     url: str,
@@ -5400,19 +5431,17 @@ async def _magnacare_crawl_target(
     result_row = grouped_result["row"]
     run_history_id = _clean_text(result_row.get("run_history_id"))
     dynamic_download_url = _magnacare_download_url(url, run_history_id, ip_address)
-    download_payload = await _fetch_json(
-        dynamic_download_url, max_bytes=max_bytes, session=session
-    )
+    download_payload = await _fetch_json(dynamic_download_url, max_bytes=max_bytes, session=session)
     file_url = _clean_text(
         download_payload.get("Data") if isinstance(download_payload, dict) else ""
     )
     if not file_url.startswith(("http://", "https://")):
         return None
-    file_name = _clean_text(result_row.get("file_name")) or Path(
-        urlsplit(file_url).path
-    ).name
+    file_name = _clean_text(result_row.get("file_name")) or Path(urlsplit(file_url).path).name
     network_name = _clean_text(result_row.get("network_name"))
     file_type = grouped_result["file_type"]
+    size_bytes = _parse_size_bytes(result_row.get("file_size"))
+    file_type = await _magnacare_verified_file_type(file_type, file_url, size_bytes, max_bytes, session)
     label = " - ".join(
         part
         for part in (
@@ -5436,7 +5465,7 @@ async def _magnacare_crawl_target(
             "network_name": network_name or None,
             "file_name": file_name,
             "file_size": _clean_text(result_row.get("file_size")) or None,
-            "size_bytes": _parse_size_bytes(result_row.get("file_size")),
+            "size_bytes": size_bytes,
             "schema_version": _clean_text(result_row.get("file_version")) or None,
             "run_history_id": run_history_id,
             "dynamic_download_url": dynamic_download_url,
