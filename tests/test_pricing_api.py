@@ -4030,7 +4030,6 @@ async def test_plan_pricing_translates_unsupported_provider_filter_to_400(
             [
                 {
                     "order_by": "distance",
-                    "order": "asc",
                     "include_providers": True,
                 }
             ],

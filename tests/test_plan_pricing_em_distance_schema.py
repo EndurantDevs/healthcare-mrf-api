@@ -95,6 +95,8 @@ def test_em_distance_projection_schema_is_exact_immutable_and_additive(
     assert "address_precision <> 'city_zip'" in sql
     assert "receipt counts do not match rows" in sql
     assert "attachment requires an exact ready candidate" in sql
+    assert "content_digest IS NOT NULL" in sql
+    assert "build_seconds IS NOT NULL" in sql
     assert sql.count("BEFORE TRUNCATE ON") == 4
     assert "import_run_plan_pricing_idempotency_idx" in sql
     assert "'plan-pricing-em-distance'" in sql

@@ -12578,7 +12578,6 @@ async def list_providers_by_procedure(request):
                 if is_office_visit
                 else {
                     "order_by": "distance",
-                    "order": "asc",
                     "include_providers": True,
                 }
             )

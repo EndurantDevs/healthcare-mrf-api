@@ -20,6 +20,32 @@ from api.plan_pricing_em_distance import (
 from api.plan_release_serving import PlanReleaseServingSelection
 
 
+class _DistanceProjectionResult:
+    def __init__(self, ready):
+        self.ready = ready
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return [
+            {
+                "projection_ready": self.ready,
+                "candidate_count": 0,
+                "unique_count": 0,
+                "npi": None,
+            }
+        ]
+
+
+class _DistanceProjectionSession:
+    def __init__(self, ready=False):
+        self.ready = ready
+
+    async def execute(self, *_args, **_kwargs):
+        return _DistanceProjectionResult(self.ready)
+
+
 @pytest.mark.parametrize("code_index,code", enumerate(EM_CODES))
 @pytest.mark.parametrize("order", (None, "", "null", "asc"))
 def test_distance_card_request_is_closed_and_indexed(code_index, code, order):
@@ -166,30 +192,6 @@ async def test_selected_release_prefers_ready_em_distance_projection(monkeypatch
 
 @pytest.mark.asyncio
 async def test_em_distance_reader_handles_attachment_boundary():
-    class Result:
-        def __init__(self, ready):
-            self.ready = ready
-
-        def mappings(self):
-            return self
-
-        def all(self):
-            return [
-                {
-                    "projection_ready": self.ready,
-                    "candidate_count": 0,
-                    "unique_count": 0,
-                    "npi": None,
-                }
-            ]
-
-    class Session:
-        def __init__(self, ready=False):
-            self.ready = ready
-
-        async def execute(self, *_args, **_kwargs):
-            return Result(self.ready)
-
     selection = PlanReleaseServingSelection(
         serving_revision_id="hpserve_test",
         plan_release_id="hprelease_test",
@@ -211,21 +213,21 @@ async def test_em_distance_reader_handles_attachment_boundary():
     }
 
     assert await search_plan_pricing_em_distance(
-        Session(),
+        _DistanceProjectionSession(),
         selection,
         args_by_name,
         SimpleNamespace(limit=10, offset=0, page=1),
     ) is None
 
     assert await search_plan_pricing_em_distance(
-        Session(),
+        _DistanceProjectionSession(),
         selection,
         args_by_name,
         SimpleNamespace(limit=10, offset=191, page=20),
     ) is None
 
     response = await search_plan_pricing_em_distance(
-        Session(ready=True),
+        _DistanceProjectionSession(ready=True),
         selection,
         args_by_name,
         SimpleNamespace(limit=10, offset=0, page=1),

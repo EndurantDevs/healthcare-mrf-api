@@ -122,9 +122,11 @@ def upgrade() -> None:
                     AND completed_at IS NULL)
                 OR
                 (state = 'ready'
+                    AND content_digest IS NOT NULL
                     AND content_digest ~ '^[0-9a-f]{{64}}$'
                     AND rate_row_count > 0
                     AND location_row_count > 0
+                    AND build_seconds IS NOT NULL
                     AND build_seconds >= 0
                     AND completed_at IS NOT NULL)
             ),

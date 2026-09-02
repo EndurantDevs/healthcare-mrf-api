@@ -38,11 +38,19 @@ MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
     / "alembic/versions/20260828120000_plan_pricing_factorized_projection.py"
 )
+EM_DISTANCE_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic/versions/20260901103000_plan_pricing_em_distance.py"
+)
 
 
-def _factorized_migration_statements(monkeypatch, schema: str) -> list[str]:
+def _migration_statements_for(
+    monkeypatch,
+    schema: str,
+    migration_path: Path,
+) -> list[str]:
     module_spec = importlib.util.spec_from_file_location(
-        f"factorized_projection_{schema}", MIGRATION_PATH
+        f"{migration_path.stem}_{schema}", migration_path
     )
     assert module_spec is not None and module_spec.loader is not None
     migration = importlib.util.module_from_spec(module_spec)
@@ -249,6 +257,57 @@ async def _assert_ready_receipt_rejects_nulls(admin, schema: str) -> None:
             )
 
 
+async def _assert_em_distance_ready_nulls(
+    admin,
+    monkeypatch,
+    schema: str,
+) -> None:
+    await admin.execute(
+        f"""CREATE TABLE {schema}.plan_release_serving_revision (
+            serving_revision_id varchar(64) PRIMARY KEY,
+            plan_release_id varchar(64) NOT NULL,
+            binding_set_digest varchar(64) NOT NULL
+        )"""
+    )
+    await admin.execute(
+        f"INSERT INTO {schema}.plan_release_serving_revision VALUES ($1, $2, $3)",
+        f"hpserve_{'B' * 26}",
+        f"hprelease_{'A' * 26}",
+        "c" * 64,
+    )
+    for statement in _migration_statements_for(
+        monkeypatch, schema, EM_DISTANCE_MIGRATION_PATH
+    ):
+        await admin.execute(statement)
+    await admin.execute(
+        f"ALTER TABLE {schema}.plan_pricing_em_distance_candidate "
+        "DISABLE TRIGGER plan_pricing_em_distance_candidate_guard_trg"
+    )
+    insert_statement = f"""INSERT INTO {schema}.plan_pricing_em_distance_candidate (
+        projection_id, contract_version, plan_release_id, serving_revision_id,
+        binding_set_digest, provider_signature, state, content_digest,
+        rate_row_count, location_row_count, build_seconds, completed_at
+    ) VALUES (
+        $1, 'plan_pricing_em_distance_v1', $2, $3, $4, $5, 'ready',
+        $6, 1, 1, $7, transaction_timestamp()
+    )"""
+    for candidate_id, content_digest, build_seconds in (
+        ("a" * 64, None, 0),
+        ("b" * 64, "e" * 64, None),
+    ):
+        with pytest.raises(asyncpg.CheckViolationError):
+            await admin.execute(
+                insert_statement,
+                candidate_id,
+                f"hprelease_{'A' * 26}",
+                f"hpserve_{'B' * 26}",
+                "c" * 64,
+                "d" * 64,
+                content_digest,
+                build_seconds,
+            )
+
+
 async def _assert_bad_raw_count_rejected(
     admin,
     schema: str,
@@ -335,7 +394,9 @@ async def test_factorized_pack_receipt_is_sql_bound_and_immutable(monkeypatch):
         await _create_import_run_stub(admin, schema)
         for statement in _migration_statements(monkeypatch, schema):
             await admin.execute(statement)
-        for statement in _factorized_migration_statements(monkeypatch, schema):
+        for statement in _migration_statements_for(
+            monkeypatch, schema, MIGRATION_PATH
+        ):
             await admin.execute(statement)
         await _insert_candidate(admin, schema, projection_id, digest)
         await _assert_rate_profile_order_rejected(admin, schema, projection_id)
@@ -372,6 +433,26 @@ async def test_factorized_pack_receipt_is_sql_bound_and_immutable(monkeypatch):
         )
         await _assert_stored_size_boundary(admin, schema)
         await _assert_ready_receipt_rejects_nulls(admin, schema)
+    finally:
+        await admin.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_em_distance_ready_nulls_postgres(monkeypatch):
+    dsn = os.getenv(POSTGRES_DSN_ENV)
+    if not dsn:
+        pytest.skip(f"set {POSTGRES_DSN_ENV} for the PostgreSQL proof")
+    admin = await asyncpg.connect(dsn)
+    database_name = await admin.fetchval("SELECT current_database()")
+    if TEST_DATABASE_PATTERN.search(str(database_name)) is None:
+        await admin.close()
+        pytest.fail(f"{POSTGRES_DSN_ENV} must target an explicit test database")
+    schema = f"em_distance_ready_{uuid.uuid4().hex[:12]}"
+    try:
+        await admin.execute(f"CREATE SCHEMA {schema}")
+        await _create_import_run_stub(admin, schema)
+        await _assert_em_distance_ready_nulls(admin, monkeypatch, schema)
     finally:
         await admin.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
         await admin.close()

@@ -71,7 +71,11 @@ def test_openapi_documents_projection_response_shapes():
     ]["properties"]["projection_contract"] == {
         "type": "string",
         "nullable": True,
-        "enum": ["plan_pricing_card_v2", "plan_pricing_factorized_v3"],
+        "enum": [
+            "plan_pricing_card_v2",
+            "plan_pricing_factorized_v3",
+            "plan_pricing_em_distance_v1",
+        ],
     }
     item_refs = {
         variant["$ref"]
@@ -85,6 +89,12 @@ def test_openapi_documents_projection_response_shapes():
     assert "minimum_negotiated_rate" in schemas[
         "PricingProcedureProviderCardRecord"
     ]["properties"]
+    assert schemas["PricingProcedureProviderCardRecord"]["properties"][
+        "distance_miles"
+    ] == {"type": "number", "minimum": 0}
+    assert "distance_miles" in schemas["PricingProcedureProviderCardRecord"][
+        "required"
+    ]
     assert "median_negotiated_rate" in schemas[
         "PricingProcedureRateAggregateRecord"
     ]["properties"]
