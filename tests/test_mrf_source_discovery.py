@@ -10967,9 +10967,9 @@ async def test_crawl_targets_for_source_delegates_plain_mrf_host_text(monkeypatc
 
     fake_session = object()
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
-    monkeypatch.setitem(
-        discovery._ASYNC_CRAWL_RESOLVERS,
-        "healthcarebluebook_mrf",
+    monkeypatch.setattr(
+        discovery,
+        "_resolve_healthcarebluebook_mrf",
         fake_resolve_healthcarebluebook_mrf,
     )
 
