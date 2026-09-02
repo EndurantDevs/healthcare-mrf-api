@@ -1436,10 +1436,10 @@ async def download_raw_artifact(
     """Download or reuse one raw artifact under a URL-scoped cross-process lock."""
 
     store = store or PTG2ArtifactStore()
-    await assert_safe_url(url)
-    canonical_url = canonicalize_url(url)
-    download_key = semantic_hash(canonical_url, domain="ptg2_retained_download_lock")
     try:
+        await assert_safe_url(url)
+        canonical_url = canonicalize_url(url)
+        download_key = semantic_hash(canonical_url, domain="ptg2_retained_download_lock")
         async with async_named_artifact_lock(store, "download", download_key):
             return await _download_raw_artifact_locked(
                 url,
