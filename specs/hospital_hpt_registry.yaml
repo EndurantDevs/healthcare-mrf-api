@@ -1708,6 +1708,7 @@ hospitals:
   name: Avera McKennan
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000514
+  alias_of: hospital-000513
   name: Avera McKennan Hospital and University Health Center
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000515
@@ -4740,9 +4741,12 @@ hospitals:
 - hospital_id: hospital-001432
   name: ClearVista Behavioral Health
   cms_hpt_url: https://newvistahealth.com/cms-hpt.txt
-- hospital_ids:
-  - hospital-001433
-  - hospital-001434
+- hospital_id: hospital-001433
+  alias_of: hospital-001435
+  name: Clearwater Valley Health
+  cms_hpt_url: https://smh-cvh.org/cms-hpt.txt
+- hospital_id: hospital-001434
+  alias_of: hospital-006080
   name: Clearwater Valley Health
   cms_hpt_url: https://smh-cvh.org/cms-hpt.txt
 - hospital_id: hospital-001435
@@ -15052,9 +15056,11 @@ hospitals:
   name: New Orleans East Hospital
   cms_hpt_url: https://www.lcmchealth.org/cms-hpt.txt
 - hospital_id: hospital-004534
+  alias_of: hospital-000825
   name: New Orleans Hospital
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-004535
+  alias_of: hospital-000826
   name: New Orleans Westbank Hospital
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-004536
@@ -21175,9 +21181,12 @@ hospitals:
 - hospital_id: hospital-006395
   name: Tahoe Forest Health System
   cms_hpt_url: https://www.tfhd.com/cms-hpt.txt
-- hospital_ids:
-  - hospital-006396
-  - hospital-006397
+- hospital_id: hospital-006396
+  alias_of: hospital-003096
+  name: Tahoe Forest Hospital District
+  cms_hpt_url: https://www.tfhd.com/cms-hpt.txt
+- hospital_id: hospital-006397
+  alias_of: hospital-006395
   name: Tahoe Forest Hospital District
   cms_hpt_url: https://www.tfhd.com/cms-hpt.txt
 - hospital_id: hospital-006398
