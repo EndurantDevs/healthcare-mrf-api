@@ -6455,49 +6455,25 @@ def _example_postgresql(
     }
 
 
-def example_measurement() -> dict[str, Any]:
-    """Return an unsigned, non-release record with synthetic redacted raw rows."""
-
-    gigabyte = 1_000_000_000
-    contention_started_at = datetime(2026, 7, 13, 9, tzinfo=UTC)
+def _example_resource_observation(
+    contention_started_at: datetime,
+    contention_run_id: str,
+) -> dict[str, Any]:
     contention_ended_at = contention_started_at + timedelta(hours=1)
-    contention_run_id = _synthetic_digest("synthetic-contention-run")
-    peak_windows = _example_peak_windows(contention_started_at)
-    peak_import_events = _example_peak_import_events(contention_started_at)
-    peak_audit_events = _example_peak_audit_events(contention_started_at)
-    imports, audits, concurrent_builds, concurrent_audits = _example_lifecycle_rows(
-        contention_started_at, contention_run_id
-    )
-    http_rows = _example_http_rows(contention_started_at, contention_run_id)
-    resource_telemetry = _example_resource_telemetry(
-        contention_started_at,
-        contention_run_id,
-        imports,
-        gigabyte,
-    )
     return {
-        "schema_version": SCHEMA_VERSION,
-        "evidence_profile": EVIDENCE_PROFILE,
-        "release_evidence": False,
-        "objective": {"target_logical_imports_per_month": 2_000},
-        "raw_samples": {
-            "import_lifecycle": imports,
-            "audit_results": audits,
-            "peak_import_events": peak_import_events,
-            "peak_audit_events": peak_audit_events,
-            **http_rows,
-        },
-        "resource_telemetry": resource_telemetry,
-        "resource_observation": {
-            "contention_run_id": contention_run_id,
-            "contention_started_at": _timestamp_text(contention_started_at),
-            "contention_ended_at": _timestamp_text(contention_ended_at),
-            "storage_measured_at": _timestamp_text(contention_ended_at),
-            "gc_started_at": _timestamp_text(
-                contention_started_at - timedelta(hours=24)
-            ),
-            "gc_ended_at": _timestamp_text(contention_started_at),
-        },
+        "contention_run_id": contention_run_id,
+        "contention_started_at": _timestamp_text(contention_started_at),
+        "contention_ended_at": _timestamp_text(contention_ended_at),
+        "storage_measured_at": _timestamp_text(contention_ended_at),
+        "gc_started_at": _timestamp_text(
+            contention_started_at - timedelta(hours=24)
+        ),
+        "gc_ended_at": _timestamp_text(contention_started_at),
+    }
+
+
+def _example_import_capacity_sections() -> dict[str, Any]:
+    return {
         "end_to_end": {
             "sample_count": 60,
             "unique_build_samples": 30,
@@ -6538,6 +6514,15 @@ def example_measurement() -> dict[str, Any]:
             "failed_attempt_worker_minutes": 0,
         },
         "lanes": {"count": 2, "availability_factor": 0.9},
+    }
+
+
+def _example_contention_capacity_sections(
+    peak_windows: Sequence[Mapping[str, Any]],
+    concurrent_builds: int,
+    gigabyte: int,
+) -> dict[str, Any]:
+    return {
         "candidate_audit": {
             "sample_count": 60,
             "successful_audits": 60,
@@ -6578,6 +6563,112 @@ def example_measurement() -> dict[str, Any]:
             "cleanup_cycles": 30,
             "cleanup_failures": 0,
         },
+    }
+
+
+def _example_storage_summary(gigabyte: int) -> dict[str, Any]:
+    return {
+        "physical_unique_builds_observed": 30,
+        "physical_net_new_bytes_observed": 600 * gigabyte,
+        "physical_max_bytes_per_unique_build": 20 * gigabyte,
+        "logical_imports_observed": 60,
+        "logical_net_new_bytes_observed": 600_000_000,
+        "logical_max_bytes_per_import": 10_000_000,
+        "current_used_bytes": 100_600 * gigabyte + 600_000_000,
+        "capacity_bytes": 1_000_000 * gigabyte,
+        "reserve_bytes": 100_000 * gigabyte,
+        "physical_retention_months": 3,
+        "logical_retention_months": 12,
+    }
+
+
+def _example_gc_summary(gigabyte: int) -> dict[str, Any]:
+    return {
+        "window_hours": 24,
+        "cycles_observed": 24,
+        "executed_cycles": 24,
+        "overlap_count": 0,
+        "reference_recheck_failures": 0,
+        "starting_backlog_bytes": 100 * gigabyte,
+        "starting_backlog_layouts": 24,
+        "newly_eligible_bytes": 400 * gigabyte,
+        "deleted_bytes": 500 * gigabyte,
+        "ending_backlog_bytes": 0,
+        "ending_backlog_layouts": 0,
+        "max_backlog_bytes": 500 * gigabyte,
+        "max_clearance_hours": 48,
+        "eligible_layouts": 30,
+        "deleted_layouts": 54,
+    }
+
+
+def _example_api_summary(
+    contention_started_at: datetime,
+    contention_run_id: str,
+    concurrent_builds: int,
+    concurrent_audits: int,
+    http_rows: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> dict[str, Any]:
+    contention_ended_at = contention_started_at + timedelta(hours=1)
+    return {
+        "contention_run_id": contention_run_id,
+        "concurrent_unique_builds": concurrent_builds,
+        "concurrent_candidate_audits": concurrent_audits,
+        "contention_seconds": 3_600,
+        "contention_started_at": _timestamp_text(contention_started_at),
+        "contention_ended_at": _timestamp_text(contention_ended_at),
+        "fresh_processes": True,
+        "planned_requests": 3_600,
+        "attempted_requests": 3_600,
+        "succeeded_requests": 3_600,
+        "failed_requests": 0,
+        "retried_requests": 0,
+        "requests": 3_600,
+        "requests_while_imports_running": 3_600,
+        "candidate_audit_requests": 180_000,
+        "candidate_audit_requests_while_imports_running": 180_000,
+        "errors": 0,
+        "matched_positive": _example_api_class(http_rows["http_matched_positive"]),
+        "negative": _example_api_class(http_rows["http_negative"]),
+        "random": _example_api_class(http_rows["http_random"]),
+    }
+
+
+def example_measurement() -> dict[str, Any]:
+    """Return an unsigned, non-release record with synthetic redacted raw rows."""
+
+    gigabyte = 1_000_000_000
+    contention_started_at = datetime(2026, 7, 13, 9, tzinfo=UTC)
+    contention_run_id = _synthetic_digest("synthetic-contention-run")
+    peak_windows = _example_peak_windows(contention_started_at)
+    peak_import_events = _example_peak_import_events(contention_started_at)
+    peak_audit_events = _example_peak_audit_events(contention_started_at)
+    imports, audits, concurrent_builds, concurrent_audits = _example_lifecycle_rows(
+        contention_started_at, contention_run_id
+    )
+    http_rows = _example_http_rows(contention_started_at, contention_run_id)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "evidence_profile": EVIDENCE_PROFILE,
+        "release_evidence": False,
+        "objective": {"target_logical_imports_per_month": 2_000},
+        "raw_samples": {
+            "import_lifecycle": imports,
+            "audit_results": audits,
+            "peak_import_events": peak_import_events,
+            "peak_audit_events": peak_audit_events,
+            **http_rows,
+        },
+        "resource_telemetry": _example_resource_telemetry(
+            contention_started_at, contention_run_id, imports, gigabyte
+        ),
+        "resource_observation": _example_resource_observation(
+            contention_started_at, contention_run_id
+        ),
+        **_example_import_capacity_sections(),
+        **_example_contention_capacity_sections(
+            peak_windows, concurrent_builds, gigabyte
+        ),
         "postgresql": _example_postgresql(
             gigabyte,
             contention_run_id,
@@ -6585,58 +6676,15 @@ def example_measurement() -> dict[str, Any]:
             concurrent_builds,
             concurrent_audits,
         ),
-        "storage": {
-            "physical_unique_builds_observed": 30,
-            "physical_net_new_bytes_observed": 600 * gigabyte,
-            "physical_max_bytes_per_unique_build": 20 * gigabyte,
-            "logical_imports_observed": 60,
-            "logical_net_new_bytes_observed": 600_000_000,
-            "logical_max_bytes_per_import": 10_000_000,
-            "current_used_bytes": 100_600 * gigabyte + 600_000_000,
-            "capacity_bytes": 1_000_000 * gigabyte,
-            "reserve_bytes": 100_000 * gigabyte,
-            "physical_retention_months": 3,
-            "logical_retention_months": 12,
-        },
-        "gc": {
-            "window_hours": 24,
-            "cycles_observed": 24,
-            "executed_cycles": 24,
-            "overlap_count": 0,
-            "reference_recheck_failures": 0,
-            "starting_backlog_bytes": 100 * gigabyte,
-            "starting_backlog_layouts": 24,
-            "newly_eligible_bytes": 400 * gigabyte,
-            "deleted_bytes": 500 * gigabyte,
-            "ending_backlog_bytes": 0,
-            "ending_backlog_layouts": 0,
-            "max_backlog_bytes": 500 * gigabyte,
-            "max_clearance_hours": 48,
-            "eligible_layouts": 30,
-            "deleted_layouts": 54,
-        },
-        "api": {
-            "contention_run_id": contention_run_id,
-            "concurrent_unique_builds": concurrent_builds,
-            "concurrent_candidate_audits": concurrent_audits,
-            "contention_seconds": 3_600,
-            "contention_started_at": _timestamp_text(contention_started_at),
-            "contention_ended_at": _timestamp_text(contention_ended_at),
-            "fresh_processes": True,
-            "planned_requests": 3_600,
-            "attempted_requests": 3_600,
-            "succeeded_requests": 3_600,
-            "failed_requests": 0,
-            "retried_requests": 0,
-            "requests": 3_600,
-            "requests_while_imports_running": 3_600,
-            "candidate_audit_requests": 180_000,
-            "candidate_audit_requests_while_imports_running": 180_000,
-            "errors": 0,
-            "matched_positive": _example_api_class(http_rows["http_matched_positive"]),
-            "negative": _example_api_class(http_rows["http_negative"]),
-            "random": _example_api_class(http_rows["http_random"]),
-        },
+        "storage": _example_storage_summary(gigabyte),
+        "gc": _example_gc_summary(gigabyte),
+        "api": _example_api_summary(
+            contention_started_at,
+            contention_run_id,
+            concurrent_builds,
+            concurrent_audits,
+            http_rows,
+        ),
     }
 
 

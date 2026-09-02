@@ -265,16 +265,7 @@ async def _snapshot_and_root(
     return shape_snapshot_and_root(dict(database_record))
 
 
-async def _exact_counts(
-    connection: asyncpg.Connection,
-    schema_name: str,
-    snapshot_key: int,
-) -> dict[str, int]:
-    """Collect exact candidate, map, graph, and pricing counts."""
-
-    schema = _quote_identifier(schema_name)
-    count_record = await connection.fetchrow(
-        f"""
+_EXACT_COUNTS_SQL = """
         SELECT
           (SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack
             WHERE snapshot_key = $1)::bigint AS map_pack_count,
@@ -367,7 +358,19 @@ async def _exact_counts(
              FROM {schema}.ptg2_v4_inferred_taxonomy_candidate
             WHERE snapshot_key = $1)::bigint
             AS inferred_taxonomy_pattern_payload_byte_count
-        """,
+        """
+
+
+async def _exact_counts(
+    connection: asyncpg.Connection,
+    schema_name: str,
+    snapshot_key: int,
+) -> dict[str, int]:
+    """Collect exact candidate, map, graph, and pricing counts."""
+
+    schema = _quote_identifier(schema_name)
+    count_record = await connection.fetchrow(
+        _EXACT_COUNTS_SQL.replace("{schema}", schema),
         snapshot_key,
     )
     return {
