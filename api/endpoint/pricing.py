@@ -12579,21 +12579,21 @@ async def list_providers_by_procedure(request):
             )
             if is_release_bound_office_visit:
                 assert release_selection is not None
-                retry_option = em_distance_retry_option(
+                retry_option_by_field = em_distance_retry_option(
                     ptg_args_by_name, pagination
                 )
-                retry_ready = bool(
-                    retry_option is not None
+                is_retry_ready = bool(
+                    retry_option_by_field is not None
                     and await is_em_distance_projection_ready(
                         session, release_selection
                     )
                 )
             else:
-                retry_option = {
+                retry_option_by_field = {
                     "order_by": "distance",
                     "include_providers": True,
                 }
-                retry_ready = True
+                is_retry_ready = True
             return _ptg_json_response(
                 request,
                 {
@@ -12614,8 +12614,8 @@ async def list_providers_by_procedure(request):
                             "for this request."
                         ),
                         "retry_options": (
-                            [retry_option]
-                            if allows_distance_retry and retry_ready
+                            [retry_option_by_field]
+                            if allows_distance_retry and is_retry_ready
                             else []
                         ),
                     },
