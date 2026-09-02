@@ -163,10 +163,9 @@ run_python_main() {
   mapfile -t capacity_tests <<< "$capacity_test_paths"
   mapfile -t envelope_tests <<< "$envelope_test_paths"
   [ "${#envelope_tests[@]}" -eq 4 ] || {
-    echo "expected one envelope suite for each python-main shard" >&2
+    echo "expected four envelope suites" >&2
     exit 2
   }
-  local envelope_test=${envelope_tests[$shard]}
   local collection_args=()
   local test_path
   for test_path in "${capacity_tests[@]}"; do
@@ -178,6 +177,12 @@ run_python_main() {
     --shard-index "$shard" \
     --output "$shard_file" \
     -- "${collection_args[@]}"
+  local envelope_shard_file="${RUNNER_TEMP:-/tmp}/python-envelope-shard-${shard}.txt"
+  python scripts/ci/shard_pytest_nodeids.py \
+    --shard-count 4 \
+    --shard-index "$shard" \
+    --output "$envelope_shard_file" \
+    -- "${envelope_tests[@]}"
   export COVERAGE_FILE=${COVERAGE_FILE:-$(artifact_path ".coverage.main.${shard}")}
   timeout --foreground 295s python -m pytest -q -n 1 --dist loadscope --durations=20 \
     --cov-config=test-coverage.ini \
@@ -188,7 +193,7 @@ run_python_main() {
     --cov-config=test-coverage.ini \
     --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main \
     --cov-branch --cov-report= --cov-append \
-    "$envelope_test"
+    @"$envelope_shard_file"
   require_base_sha
   timeout --foreground 295s python scripts/coverage_forecast.py write-shard-provenance \
     --base "$COVERAGE_BASE_SHA" \

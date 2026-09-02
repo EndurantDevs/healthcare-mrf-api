@@ -71,7 +71,11 @@ def test_openapi_documents_projection_response_shapes():
     ]["properties"]["projection_contract"] == {
         "type": "string",
         "nullable": True,
-        "enum": ["plan_pricing_card_v2", "plan_pricing_factorized_v3"],
+        "enum": [
+            "plan_pricing_card_v2",
+            "plan_pricing_factorized_v3",
+            "plan_pricing_em_distance_v1",
+        ],
     }
     item_refs = {
         variant["$ref"]
@@ -88,3 +92,21 @@ def test_openapi_documents_projection_response_shapes():
     assert "median_negotiated_rate" in schemas[
         "PricingProcedureRateAggregateRecord"
     ]["properties"]
+
+
+def test_openapi_card_allows_projection_specific_optional_fields():
+    """Distance is lane-specific and coordinate cards may lack a ZIP."""
+
+    card_schema = _openapi_spec()["components"]["schemas"][
+        "PricingProcedureProviderCardRecord"
+    ]
+    assert card_schema["properties"]["distance_miles"] == {
+        "type": "number",
+        "minimum": 0,
+    }
+    assert "distance_miles" not in card_schema["required"]
+    assert card_schema["properties"]["zip5"] == {
+        "type": "string",
+        "nullable": True,
+        "pattern": "^[0-9]{5}$",
+    }

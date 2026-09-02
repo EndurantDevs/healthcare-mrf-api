@@ -138,7 +138,8 @@ class ImportRun(Base, JSONOutputMixin):
             "unique": True,
             "where": (
                 "importer IN ('plan-pricing-projection', "
-                "'plan-pricing-prewarm') AND idempotency_key IS NOT NULL"
+                "'plan-pricing-prewarm', 'plan-pricing-em-distance') "
+                "AND idempotency_key IS NOT NULL"
             ),
         },
         {"index_elements": ("schedule_id",), "name": "import_run_schedule_idx"},

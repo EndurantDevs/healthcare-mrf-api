@@ -8714,7 +8714,11 @@ components:
           nullable: true
         zip5:
           type: string
+          nullable: true
           pattern: '^[0-9]{5}$'
+        distance_miles:
+          type: number
+          minimum: 0
         minimum_negotiated_rate:
           type: number
           minimum: 0
@@ -8825,7 +8829,7 @@ components:
             projection_contract:
               type: string
               nullable: true
-              enum: [plan_pricing_card_v2, plan_pricing_factorized_v3]
+              enum: [plan_pricing_card_v2, plan_pricing_factorized_v3, plan_pricing_em_distance_v1]
             state:
               type: string
               nullable: true

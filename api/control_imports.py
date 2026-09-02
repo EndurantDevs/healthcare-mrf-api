@@ -106,7 +106,11 @@ ENGINE_NAME = "healthcare-mrf-api"
 ACTIVE_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "dead_letter"}
 ALL_STATUS_IDEMPOTENCY_IMPORTERS = frozenset(
-    {"plan-pricing-projection", "plan-pricing-prewarm"}
+    {
+        "plan-pricing-projection",
+        "plan-pricing-prewarm",
+        "plan-pricing-em-distance",
+    }
 )
 STALE_WORKER_RECONCILIATION_IMPORTERS = ALL_STATUS_IDEMPOTENCY_IMPORTERS
 STALE_WORKER_RECONCILIATION_MIN_AGE_SECONDS = 60
@@ -173,6 +177,14 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_module": "api.plan_pricing_prewarm",
         "target_function": "prewarm_plan_pricing",
         "job_prefix": "plan_pricing_prewarm",
+    },
+    "plan-pricing-em-distance": {
+        "queue": "arq:PTGCandidateAudit",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped_kwargs",
+        "target_module": "api.plan_pricing_em_distance_build",
+        "target_function": "build_plan_pricing_em_distance",
+        "job_prefix": "plan_pricing_em_distance",
     },
     "mrf": {"queue": "arq:MRF", "function": "init_file", "payload": "test_mode"},
     "npi": {
@@ -573,6 +585,29 @@ def _validate_plan_pricing_prewarm_params(
         raise ValueError("plan-pricing-prewarm params must be non-empty strings")
 
 
+def _validate_plan_pricing_em_distance_params(
+    importer: str,
+    params_by_name: dict[str, Any],
+) -> None:
+    if importer != "plan-pricing-em-distance":
+        return
+    required_names = {"plan_release_id", "serving_revision_id"}
+    if set(params_by_name) != required_names:
+        raise ValueError(
+            "plan-pricing-em-distance params must be exactly plan_release_id "
+            "and serving_revision_id"
+        )
+    if any(
+        type(params_by_name[name]) is not str
+        or not params_by_name[name]
+        or params_by_name[name] != params_by_name[name].strip()
+        for name in required_names
+    ):
+        raise ValueError(
+            "plan-pricing-em-distance params must be non-empty strings"
+        )
+
+
 def _plan_pricing_prewarm_registry_entry() -> dict[str, Any]:
     parameter_help_by_name = {
         "plan_release_id": "Exact current immutable plan release ID.",
@@ -611,6 +646,38 @@ def _plan_pricing_prewarm_registry_entry() -> dict[str, Any]:
     }
 
 
+def _plan_pricing_em_distance_registry_entry() -> dict[str, Any]:
+    return {
+        "name": "plan-pricing-em-distance",
+        "engine": ENGINE_NAME,
+        "family": "mrf",
+        "kind": "control",
+        "lifecycle": "single",
+        "schedulable": False,
+        "cancelable": False,
+        "retryable": True,
+        "enqueue_adapter": "arq_single_job",
+        "queue": "arq:PTGCandidateAudit",
+        "depends_on": [],
+        "params_schema": [
+            {
+                "name": name,
+                "opts": ["--" + name.replace("_", "-")],
+                "required": True,
+                "multiple": False,
+                "is_flag": False,
+                "type": "string",
+                "default": None,
+                "help": help_text,
+            }
+            for name, help_text in (
+                ("plan_release_id", "Exact current immutable plan release ID."),
+                ("serving_revision_id", "Exact current serving revision ID."),
+            )
+        ],
+    }
+
+
 def importer_registry() -> list[dict[str, Any]]:
     """Describe the importer commands exposed by the public control API."""
 
@@ -639,6 +706,7 @@ def importer_registry() -> list[dict[str, Any]]:
         (
             _plan_pricing_projection_registry_entry(),
             _plan_pricing_prewarm_registry_entry(),
+            _plan_pricing_em_distance_registry_entry(),
         )
     )
     return sorted(importers, key=lambda importer: importer["name"])
@@ -653,7 +721,7 @@ def importer_names() -> set[str]:
 def _importer_family(importer: str) -> str:
     if importer in {
         "ptg", "ptg-candidate-audit", "plan-pricing-projection",
-        "plan-pricing-prewarm", "mrf", "mrf-source-discovery",
+        "plan-pricing-prewarm", "plan-pricing-em-distance", "mrf", "mrf-source-discovery",
         "hospital-prices",
     }:
         return "mrf"
@@ -2945,6 +3013,10 @@ async def create_import_run(
         effective_params_by_name,
     )
     _validate_plan_pricing_prewarm_params(
+        importer,
+        effective_params_by_name,
+    )
+    _validate_plan_pricing_em_distance_params(
         importer,
         effective_params_by_name,
     )

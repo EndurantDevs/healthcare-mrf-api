@@ -237,6 +237,51 @@ def _autocomplete_prescription_row(total=1):
     }
 
 
+async def _synthetic_em_scope_search(
+    _session, args_by_name, _pagination, **_kwargs
+):
+    if (
+        not pricing_module._parse_bool(
+            args_by_name.get("include_providers"),
+            "include_providers",
+            default=False,
+        )
+        or args_by_name["order_by"] != "distance"
+        or args_by_name["order"] != "asc"
+        or args_by_name["view"] != "card"
+    ):
+        raise PTG2LocationScopeError(
+            "Synthetic sealed cost scope.",
+            allows_distance_retry=True,
+        )
+    return {
+        "items": [],
+        "pagination": {"total": 0, "limit": 25, "offset": 0, "page": 1},
+        "query": {"source": "ptg2"},
+    }
+
+
+async def _synthetic_legacy_distance_scope_search(
+    _session, args_by_name, _pagination, **_kwargs
+):
+    """Accept only the complete legacy ascending-distance retry."""
+
+    if (
+        pricing_module._parse_bool(
+            args_by_name.get("include_providers"),
+            "include_providers",
+            default=False,
+        )
+        and args_by_name["order_by"] == "distance"
+        and args_by_name["order"] == "asc"
+    ):
+        return {"items": [], "query": {"source": "ptg2"}}
+    raise PTG2LocationScopeError(
+        "Internal detail must not escape.",
+        allows_distance_retry=True,
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("param_name", ("clinical_intent", "intent"))
 async def test_raw_procedure_search_rejects_resolver_only_intent(param_name):
@@ -4003,7 +4048,12 @@ async def test_plan_pricing_translates_unsupported_provider_filter_to_400(
                 allows_distance_retry=True,
             ),
             "ptg2_location_scope_too_broad",
-            [{"order_by": "distance", "include_providers": True}],
+            [
+                {
+                    "order_by": "distance",
+                    "include_providers": True,
+                }
+            ],
         ),
         (
             PTG2LocationScopeError("Internal detail must not escape."),
@@ -4069,6 +4119,203 @@ async def test_plan_pricing_translates_scope_refusal_to_structured_422(
     assert "error" not in error_document
     assert "Internal detail" not in error_document["message"]
     assert error_document["fix_it"]["retry_options"] == expected_retry_options
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code", ("99203", "99204", "99205", "99213", "99214", "99215")
+)
+@pytest.mark.parametrize("raw_order", (None, "null", "desc"))
+@pytest.mark.parametrize("raw_include_providers", (None, "false"))
+async def test_office_visit_scope_refusal_retry_options_are_servable(
+    monkeypatch, code, raw_order, raw_include_providers
+):
+    """Every advertised E&M retry must override the refused request into a 200."""
+    selection = _mixed_canonical_release_selection()
+
+    monkeypatch.setattr(
+        pricing_module, "search_current_ptg2_index", _synthetic_em_scope_search
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_guard_selection",
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "is_em_distance_projection_ready",
+        AsyncMock(return_value=True),
+    )
+    base_args_by_name = {
+        "plan_release_id": selection.plan_release_id,
+        "code": code,
+        "code_system": "CPT",
+        "zip5": "60611",
+        "zip_radius_miles": "25",
+        "view": "full",
+    }
+    if raw_order is not None:
+        base_args_by_name["order"] = raw_order
+    if raw_include_providers is not None:
+        base_args_by_name["include_providers"] = raw_include_providers
+    zip_row_by_name = {
+        "zip5": "60611",
+        "state": "IL",
+        "city_lower": "chicago",
+        "latitude": 41.895,
+        "longitude": -87.621,
+    }
+
+    refused_response = await list_providers_by_procedure(
+        make_request([FakeResult(rows=[zip_row_by_name])], args=base_args_by_name)
+    )
+    retry_options = json.loads(refused_response.body)["fix_it"]["retry_options"]
+
+    assert refused_response.status == 422
+    assert retry_options
+    for retry_option in retry_options:
+        retry_response = await list_providers_by_procedure(
+            make_request(
+                [FakeResult(rows=[zip_row_by_name])],
+                args={**base_args_by_name, **retry_option},
+            )
+        )
+        assert retry_response.status == 200
+
+
+@pytest.mark.asyncio
+async def test_office_visit_refusal_preserves_malformed_provider_flag(monkeypatch):
+    selection = _mixed_canonical_release_selection()
+    readiness = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_guard_selection",
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "is_em_distance_projection_ready",
+        readiness,
+    )
+
+    with pytest.raises(
+        pricing_module.InvalidUsage,
+        match="Parameter 'include_providers' must be boolean",
+    ):
+        await list_providers_by_procedure(
+            make_request(
+                [],
+                args={
+                    "plan_release_id": selection.plan_release_id,
+                    "code": "99213",
+                    "zip5": "60611",
+                    "include_providers": "maybe",
+                },
+            )
+        )
+
+    readiness.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_plan_id_office_visit_refusal_keeps_legacy_retry(monkeypatch):
+    """A non-release E&M retry remains the replayable legacy shape."""
+
+    monkeypatch.setattr(
+        pricing_module,
+        "search_current_ptg2_index",
+        _synthetic_legacy_distance_scope_search,
+    )
+    readiness = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        pricing_module,
+        "is_em_distance_projection_ready",
+        readiness,
+    )
+    request = make_request(
+        [],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "code": "99213",
+            "zip5": "60611",
+            "zip_radius_miles": "0",
+            "include_providers": "false",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+
+    retry_options = json.loads(response.body)["fix_it"]["retry_options"]
+    assert response.status == 422
+    assert retry_options == [
+        {"order_by": "distance", "include_providers": True}
+    ]
+    retry_response = await list_providers_by_procedure(
+        make_request(
+            [],
+            args={**dict(request.args), **retry_options[0]},
+        )
+    )
+    assert retry_response.status == 200
+    readiness.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_office_visit_refusal_has_no_retry_without_ready_attachment(
+    monkeypatch,
+):
+    selection = _mixed_canonical_release_selection()
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_guard_selection",
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "is_em_distance_projection_ready",
+        AsyncMock(return_value=False),
+    )
+    request = make_request(
+        [],
+        args={
+            "plan_release_id": selection.plan_release_id,
+            "code": "99213",
+            "zip5": "60611",
+            "zip_radius_miles": "25",
+            "limit": "10",
+        },
+    )
+
+    refused_response = await list_providers_by_procedure(request)
+
+    assert refused_response.status == 422
+    refused_payload_by_field = json.loads(refused_response.body)
+    assert refused_payload_by_field["code"] == "ptg2_provider_scope_refused"
+    assert refused_payload_by_field["fix_it"]["retry_options"] == []
+
+
+def test_descending_distance_office_visit_keeps_broad_expansion_guard():
+    with pytest.raises(pricing_module.InvalidUsage, match="provider-directory request"):
+        pricing_module._reject_broad_group_plan_provider_expansion(
+            {
+                "include_providers": "true",
+                "order_by": "distance",
+                "order": "desc",
+            },
+            {
+                "plan_id": "TESTPLAN001",
+                "plan_market_type": "group",
+                "code": "99213",
+                "code_system": "CPT",
+                "zip5": "60611",
+            },
+        )
 
 
 @pytest.mark.asyncio
@@ -4537,7 +4784,7 @@ async def test_card_requires_plan_release_id():
 
 
 @pytest.mark.asyncio
-async def test_group_plan_99213_unscoped_card_and_full_keep_identical_guard(
+async def test_group_plan_99213_card_and_full_share_ready_refusal(
     monkeypatch,
 ):
     selection = replace(
@@ -4562,7 +4809,12 @@ async def test_group_plan_99213_unscoped_card_and_full_keep_identical_guard(
         "search_current_ptg2_index",
         strict_search,
     )
-    messages = []
+    monkeypatch.setattr(
+        pricing_module,
+        "is_em_distance_projection_ready",
+        AsyncMock(return_value=True),
+    )
+    refusal_payloads = []
     for view in ("full", "card"):
         request = make_request(
             [],
@@ -4574,14 +4826,19 @@ async def test_group_plan_99213_unscoped_card_and_full_keep_identical_guard(
                 "view": view,
             },
         )
-        with pytest.raises(
-            pricing_module.InvalidUsage,
-            match="provider-directory request",
-        ) as exc_info:
-            await list_providers_by_procedure(request)
-        messages.append(str(exc_info.value))
+        response = await list_providers_by_procedure(request)
+        assert response.status == 422
+        refusal_payloads.append(json.loads(response.body))
 
-    assert messages[0] == messages[1]
+    assert refusal_payloads[0] == refusal_payloads[1]
+    assert refusal_payloads[0]["fix_it"]["retry_options"] == [
+        {
+            "order_by": "distance",
+            "order": "asc",
+            "include_providers": True,
+            "view": "card",
+        }
+    ]
     assert guard_resolver.await_count == 2
     release_resolver.assert_not_awaited()
     strict_search.assert_not_awaited()

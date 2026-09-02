@@ -104,6 +104,7 @@ from api.plan_pricing_projection import (
     PlanPricingProjectionUnsupported,
     search_plan_pricing_projection,
 )
+from api.plan_pricing_em_distance import search_plan_pricing_em_distance
 from api.plan_pricing_projection_contract import (
     LEGACY_PROJECTION_CONTRACT as LEGACY_PLAN_PRICING_PROJECTION_CONTRACT,
     PROJECTION_CONTRACT as PLAN_PRICING_PROJECTION_CONTRACT,
@@ -23516,6 +23517,14 @@ async def _search_selected_plan_release(
 ) -> dict[str, Any] | None:
     if selected_release is None:
         return None
+    em_distance_response = await search_plan_pricing_em_distance(
+        session,
+        selected_release,
+        args,
+        pagination,
+    )
+    if em_distance_response is not None:
+        return em_distance_response
     projected_response = await search_plan_pricing_projection(
         session,
         selected_release,
