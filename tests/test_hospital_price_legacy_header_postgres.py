@@ -127,9 +127,8 @@ async def _insert_header(
     )
 
 
-async def _assert_profile_constraints(
-    connection: asyncpg.Connection, quoted: str
-) -> None:
+async def _assert_profile_constraints(connection: asyncpg.Connection, quoted: str) -> None:
+    """Verify migrated header rows and every profile shape guard."""
     legacy_headers = await connection.fetch(
         f"SELECT template_version, attester_name, npi_count "
         f"FROM {quoted}.hospital_price_version "
