@@ -20,7 +20,7 @@ HOSPITAL_HPT_REGISTRY_PATH = (
 )
 EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT = 7_356
 EXPECTED_HOSPITAL_HPT_REGISTRY_SHA256 = (
-    "1d32d8e501440bf7660bd5e010055f75df23eddf22277bb8c917897d573d27fa"
+    "7c56b7cfa084544ad2dcc5d8ab239161f36445ebaa1478f7c429306ece69adb0"
 )
 MAX_HOSPITAL_HPT_SELECTION = 200
 _DOCUMENT_FIELDS = frozenset({"version", "hospitals"})
@@ -148,7 +148,7 @@ def _validate_hospital_aliases(hospitals: list[dict[str, str]]) -> None:
 def _validated_hospital_entries(
     entry: Any, hospital_ids: set[str]
 ) -> tuple[dict[str, str], ...]:
-    """Validate one shared catalog entry and expand its stable IDs."""
+    """Expand one catalog entry, grouping shared IDs under its first ID."""
 
     fields = set(entry) if type(entry) is dict else set()
     if (
@@ -188,13 +188,25 @@ def _validated_hospital_entries(
         hospital_by_field["alias_of"] = _validated_hospital_id(
             entry["alias_of"], "alias_of"
         )
+    validated_ids = tuple(
+        _validated_hospital_id(raw_hospital_id) for raw_hospital_id in entry_ids
+    )
+    if len(set(validated_ids)) != len(validated_ids) or hospital_ids.intersection(
+        validated_ids
+    ):
+        raise _registry_error("duplicate_hospital_id")
+    hospital_ids.update(validated_ids)
+    implicit_canonical_id = (
+        validated_ids[0]
+        if "hospital_ids" in entry and "alias_of" not in entry
+        else None
+    )
     expanded_hospitals = []
-    for raw_hospital_id in entry_ids:
-        hospital_id = _validated_hospital_id(raw_hospital_id)
-        if hospital_id in hospital_ids:
-            raise _registry_error("duplicate_hospital_id")
-        hospital_ids.add(hospital_id)
-        expanded_hospitals.append({"hospital_id": hospital_id, **hospital_by_field})
+    for hospital_id in validated_ids:
+        hospital = {"hospital_id": hospital_id, **hospital_by_field}
+        if implicit_canonical_id is not None and hospital_id != implicit_canonical_id:
+            hospital["alias_of"] = implicit_canonical_id
+        expanded_hospitals.append(hospital)
     return tuple(expanded_hospitals)
 
 
