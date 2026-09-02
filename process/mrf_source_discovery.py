@@ -17548,7 +17548,7 @@ async def _store_discovery_sources(
     )
     try:
         await _retag_sources_for_discovery_run(source_rows, state.control_run_id)
-    except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+    except BaseException as exc:
         await _record_discovery_command_failure(state, exc)
         raise
     return source_rows
@@ -17581,7 +17581,7 @@ async def _execute_discovery_source_work(
             ),
             state.checkpoint_store,
         )
-    except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+    except BaseException as exc:
         if isinstance(exc, DiscoverySourceBatchIncomplete):
             state.result.source_batch_summary = exc.summary
         await _record_discovery_command_failure(state, exc)
@@ -17612,7 +17612,7 @@ async def _probe_discovery_files(
             progress_run_id=state.control_run_id,
             concurrency=state.concurrency,
         )
-    except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+    except BaseException as exc:
         await _record_discovery_command_failure(state, exc)
         raise
     state.result.files_probed = len(probe_observations)
