@@ -35,8 +35,12 @@ HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256 = hashlib.sha256(
     b"hospital-mrf-copy-v2-v3-packed-v4-resource-bounded:"
     b"hospital-mrf-packed-blocks-v3"
 ).hexdigest()
-HOSPITAL_MRF_SCHEMA_REVISION = "hospital-mrf-packed-blocks-v3"
-HOSPITAL_MRF_SUMMARY_CONTRACT = "hospital-mrf-copy-v2-v3-packed-v5"
+HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256 = hashlib.sha256(
+    b"hospital-mrf-copy-v2-v3-packed-v5-resource-bounded:"
+    b"hospital-mrf-packed-blocks-v3"
+).hexdigest()
+HOSPITAL_MRF_SCHEMA_REVISION = "hospital-mrf-packed-blocks-v4"
+HOSPITAL_MRF_SUMMARY_CONTRACT = "hospital-mrf-copy-v2-v3-packed-v6"
 HOSPITAL_MRF_PARSER_CONTRACT = (
     f"{HOSPITAL_MRF_SUMMARY_CONTRACT}-resource-bounded:"
     f"{HOSPITAL_MRF_SCHEMA_REVISION}"
@@ -67,7 +71,7 @@ HOSPITAL_MRF_TEXT_COPY_COLUMNS = {
     ),
     "modifier_payer": (
         "version_id", "modifier_ordinal", "payer_ordinal", "payer_name",
-        "plan_name", "description", "standard_charge_dollar",
+        "plan_name", "negotiated_rate_term", "description", "standard_charge_dollar",
         "standard_charge_percentage", "standard_charge_algorithm",
     ),
 }

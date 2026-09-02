@@ -7,6 +7,9 @@ mod tests {
             charge_key: service,
             payer_name: payer.to_owned(),
             plan_name: plan.to_owned(),
+            negotiated_rate_term: service
+                .is_multiple_of(2)
+                .then(|| "JAN 2026-MAY 2026".to_owned()),
             negotiated_dollar: service.is_multiple_of(2).then(|| format!("{service}.00")),
             negotiated_percentage: (service % 2 == 1).then(|| "87.125".to_owned()),
             negotiated_algorithm: service.is_multiple_of(3).then(|| "fee less 3%".to_owned()),
@@ -85,15 +88,42 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        let legacy_lanes = current_lanes(&raw);
-        let legacy_raw = assemble_raw(&legacy_lanes[..LEGACY_LANE_COUNT]).unwrap();
+        let mut previous_lanes = current_lanes(&raw);
+        let mut previous_payer_plans = PayerPlanDictionary::default();
+        let previous_payer_plan_ids = rows
+            .iter()
+            .map(|row| {
+                previous_payer_plans
+                    .intern(&row.payer_name, &row.plan_name, None)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        previous_lanes[PAYER_PLAN_DICTIONARY] = previous_payer_plans.encode(false).unwrap();
+        previous_lanes[PAYER_PLAN_IDS] = encode_required_ids(&previous_payer_plan_ids);
+        let previous_raw = assemble_raw(&previous_lanes).unwrap();
+        let previous = frame_raw_version(
+            &previous_raw,
+            rows.len(),
+            HOSPITAL_PRICE_FACT_BLOCK_PREVIOUS_VERSION,
+        )
+        .unwrap();
+        let mut expected_previous = rows.clone();
+        for row in &mut expected_previous {
+            row.negotiated_rate_term = None;
+        }
+        assert_eq!(
+            decode_fact_block(&previous, None, None, 0, 512).unwrap(),
+            expected_previous
+        );
+
+        let legacy_raw = assemble_raw(&previous_lanes[..LEGACY_LANE_COUNT]).unwrap();
         let legacy = frame_raw_version(
             &legacy_raw,
             rows.len(),
             HOSPITAL_PRICE_FACT_BLOCK_LEGACY_VERSION,
         )
         .unwrap();
-        let mut expected_legacy = rows.clone();
+        let mut expected_legacy = expected_previous;
         for row in &mut expected_legacy {
             row.estimated_amount = None;
         }
@@ -127,6 +157,7 @@ mod tests {
         put_u16(&mut payer_plan, 1);
         put_text(&mut payer_plan, &"P".repeat(256 * 1024)).unwrap();
         put_text(&mut payer_plan, "One").unwrap();
+        put_optional_text(&mut payer_plan, None).unwrap();
         lanes[PAYER_PLAN_DICTIONARY] = payer_plan;
         let block = frame_raw(
             &assemble_raw(&lanes).unwrap(),
@@ -182,14 +213,15 @@ mod tests {
         .encode()
         .is_err());
         for entry in [
-            (oversized.clone(), "plan".to_owned()),
-            ("payer".to_owned(), oversized.clone()),
+            (oversized.clone(), "plan".to_owned(), None),
+            ("payer".to_owned(), oversized.clone(), None),
+            ("payer".to_owned(), "plan".to_owned(), Some(oversized.clone())),
         ] {
             assert!(PayerPlanDictionary {
                 entries: vec![entry],
                 ids: HashMap::new(),
             }
-            .encode()
+            .encode(true)
             .is_err());
         }
 
@@ -210,12 +242,12 @@ mod tests {
         assert!(text.intern("new").is_err());
         let mut payer_plan = PayerPlanDictionary {
             entries: vec![
-                ("payer".to_owned(), "plan".to_owned());
+                ("payer".to_owned(), "plan".to_owned(), None);
                 HOSPITAL_PRICE_FACT_BLOCK_MAX_ROWS
             ],
             ids: HashMap::new(),
         };
-        assert!(payer_plan.intern("new payer", "new plan").is_err());
+        assert!(payer_plan.intern("new payer", "new plan", None).is_err());
     }
 
     #[test]
@@ -294,7 +326,7 @@ mod tests {
         let base = current_lanes(&raw_from(&valid));
 
         assert!(decode_lanes(&[], HOSPITAL_PRICE_FACT_BLOCK_VERSION).is_err());
-        assert!(decode_payer_plan_dictionary(&[]).is_err());
+        assert!(decode_payer_plan_dictionary(&[], true).is_err());
         let mut bad_lane_count = raw_from(&valid);
         bad_lane_count[..4].copy_from_slice(&0u32.to_le_bytes());
         assert!(decode_lanes(&bad_lane_count, HOSPITAL_PRICE_FACT_BLOCK_VERSION).is_err());
@@ -356,10 +388,13 @@ mod tests {
         assert_lanes_rejected(&duplicate_text, 1);
 
         let mut duplicate_payer = base;
-        duplicate_payer[PAYER_PLAN_DICTIONARY] = vec![
-            2, 0, 1, 0, 0, 0, b'A', 3, 0, 0, 0, b'O', b'n', b'e', 1, 0, 0, 0, b'A', 3,
-            0, 0, 0, b'O', b'n', b'e',
-        ];
+        let mut duplicated_entry = vec![2, 0];
+        for _ in 0..2 {
+            put_text(&mut duplicated_entry, "A").unwrap();
+            put_text(&mut duplicated_entry, "One").unwrap();
+            put_optional_text(&mut duplicated_entry, None).unwrap();
+        }
+        duplicate_payer[PAYER_PLAN_DICTIONARY] = duplicated_entry;
         assert_lanes_rejected(&duplicate_payer, 1);
 
         let mut payer_plan_truncated = current_lanes(&raw_from(&valid));
@@ -367,8 +402,12 @@ mod tests {
         assert_lanes_rejected(&payer_plan_truncated, 1);
 
         let mut payer_plan_trailing = current_lanes(&raw_from(&valid));
-        payer_plan_trailing[PAYER_PLAN_DICTIONARY] =
-            vec![1, 0, 1, 0, 0, 0, b'A', 3, 0, 0, 0, b'O', b'n', b'e', 0];
+        let mut trailing_entry = vec![1, 0];
+        put_text(&mut trailing_entry, "A").unwrap();
+        put_text(&mut trailing_entry, "One").unwrap();
+        put_optional_text(&mut trailing_entry, None).unwrap();
+        trailing_entry.push(0);
+        payer_plan_trailing[PAYER_PLAN_DICTIONARY] = trailing_entry;
         assert_lanes_rejected(&payer_plan_trailing, 1);
     }
 }

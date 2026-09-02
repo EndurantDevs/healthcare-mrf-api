@@ -39,6 +39,7 @@ mod validation_tail_tests {
         let payer = PayerChargeRow {
             payer_name: "payer".to_owned(),
             plan_name: "plan".to_owned(),
+            negotiated_rate_term: None,
             standard_charge_dollar: Some("1".to_owned()),
             standard_charge_percentage: None,
             standard_charge_algorithm: None,

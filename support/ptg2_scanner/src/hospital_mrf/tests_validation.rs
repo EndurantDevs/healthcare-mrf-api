@@ -27,6 +27,7 @@
             PayerChargeRow {
                 payer_name: "Payer".to_owned(),
                 plan_name: "Plan".to_owned(),
+                negotiated_rate_term: None,
                 standard_charge_dollar: Some("1".to_owned()),
                 standard_charge_percentage: None,
                 standard_charge_algorithm: None,

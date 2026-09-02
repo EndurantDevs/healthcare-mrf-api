@@ -477,13 +477,14 @@ class HospitalPriceModifierPayer(Base, JSONOutputMixin):
             "AND btrim(payer_name) <> '' AND btrim(plan_name) <> '')) "
             "AND (description IS NULL OR btrim(description) <> '') "
             "AND (standard_charge_dollar IS NULL OR standard_charge_dollar > 0) "
-            "AND (standard_charge_percentage IS NULL "
-            "OR standard_charge_percentage > 0) "
-            "AND (standard_charge_algorithm IS NULL "
-            "OR btrim(standard_charge_algorithm) <> '') "
+            "AND (standard_charge_percentage IS NULL OR standard_charge_percentage > 0) "
+            "AND (standard_charge_algorithm IS NULL OR btrim(standard_charge_algorithm) <> '') "
             "AND (description IS NOT NULL OR standard_charge_dollar IS NOT NULL "
             "OR standard_charge_percentage IS NOT NULL "
-            "OR standard_charge_algorithm IS NOT NULL)",
+            "OR standard_charge_algorithm IS NOT NULL) "
+            "AND (negotiated_rate_term IS NULL OR "
+            "(payer_name IS NOT NULL AND plan_name IS NOT NULL "
+            "AND btrim(negotiated_rate_term) <> ''))",
             name="hospital_price_modifier_payer_shape_check",
         ),
     )
@@ -494,6 +495,7 @@ class HospitalPriceModifierPayer(Base, JSONOutputMixin):
     payer_ordinal = Column(Integer, nullable=False)
     payer_name = Column(TEXT)
     plan_name = Column(TEXT)
+    negotiated_rate_term = Column(TEXT)
     description = Column(TEXT)
     standard_charge_dollar = Column(Numeric)
     standard_charge_percentage = Column(Numeric)

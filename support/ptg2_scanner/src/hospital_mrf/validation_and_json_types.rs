@@ -184,6 +184,11 @@ fn emit_payer(
     let service_ordinal_text = service_ordinal.to_string();
     let charge_ordinal_text = charge_ordinal.to_string();
     let payer_ordinal_text = payer_ordinal.to_string();
+    if outputs.packed.is_none() && payer.negotiated_rate_term.is_some() {
+        return Err(invalid(
+            "negotiated rate terms require packed hospital MRF output",
+        ));
+    }
     if let Some(packed) = outputs.packed.as_mut() {
         validate_copy_text_fields(
             CopyKind::PayerCharge,
@@ -194,6 +199,7 @@ fn emit_payer(
                 Some(&payer_ordinal_text),
                 Some(&payer.payer_name),
                 Some(&payer.plan_name),
+                payer.negotiated_rate_term.as_deref(),
                 payer.standard_charge_dollar.as_deref(),
                 payer.standard_charge_percentage.as_deref(),
                 payer.standard_charge_algorithm.as_deref(),
@@ -260,6 +266,27 @@ fn emit_modifier_payer(
 ) -> io::Result<()> {
     let modifier_ordinal = modifier_ordinal.to_string();
     let payer_ordinal = payer_ordinal.to_string();
+    if outputs.packed.is_none() {
+        if payer.negotiated_rate_term.is_some() {
+            return Err(invalid(
+                "negotiated rate terms require packed hospital MRF output",
+            ));
+        }
+        return outputs.write(
+            CopyKind::ModifierPayer,
+            &[
+                Some(version_id),
+                Some(&modifier_ordinal),
+                Some(&payer_ordinal),
+                payer.payer_name.as_deref(),
+                payer.plan_name.as_deref(),
+                payer.description.as_deref(),
+                payer.standard_charge_dollar.as_deref(),
+                payer.standard_charge_percentage.as_deref(),
+                payer.standard_charge_algorithm.as_deref(),
+            ],
+        );
+    }
     outputs.write(
         CopyKind::ModifierPayer,
         &[
@@ -268,6 +295,7 @@ fn emit_modifier_payer(
             Some(&payer_ordinal),
             payer.payer_name.as_deref(),
             payer.plan_name.as_deref(),
+            payer.negotiated_rate_term.as_deref(),
             payer.description.as_deref(),
             payer.standard_charge_dollar.as_deref(),
             payer.standard_charge_percentage.as_deref(),

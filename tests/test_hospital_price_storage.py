@@ -404,6 +404,7 @@ def test_models_use_lossless_types_and_optional_facility_anchor() -> None:
     modifier_payer = tables["mrf.hospital_price_modifier_payer"]
     assert isinstance(modifier_payer.c.standard_charge_percentage.type, sa.Numeric)
     assert modifier_payer.c.description.nullable
+    assert modifier_payer.c.negotiated_rate_term.nullable
     location = tables["mrf.hospital_price_version_location"]
     assert location.c.location_name.nullable and location.c.hospital_address.nullable
     attempt = tables["mrf.hospital_price_import_attempt"]

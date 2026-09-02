@@ -18,6 +18,7 @@ from support.hospital_price_native_validation import (
     HOSPITAL_MRF_PACKED_V2_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V3_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256,
+    HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256,
     HOSPITAL_MRF_PARSER_CONTRACT_SHA256,
 )
 from tests.test_hospital_price_storage import (
@@ -36,6 +37,9 @@ from tests.test_hospital_price_storage import (
 COUNT_INVARIANTS_MIGRATION_PATH = CSV_SHORT_V2_MIGRATION_PATH.with_name(
     "20260902103500_hospital_price_count_invariants.py"
 )
+RATE_TERM_MIGRATION_PATH = CSV_SHORT_V2_MIGRATION_PATH.with_name(
+    "20260902160000_hospital_price_rate_term.py"
+)
 
 
 def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
@@ -52,6 +56,7 @@ def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
     assert HOSPITAL_MRF_PACKED_V2_PARSER_CONTRACT_SHA256 in model_sql
     assert HOSPITAL_MRF_PACKED_V3_PARSER_CONTRACT_SHA256 in model_sql
     assert HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256 in model_sql
+    assert HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256 in model_sql
     assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in model_sql
     assert "template_version = '3.0.0' AND npi_count > 0" in model_sql
     assert "template_version IN ('2.0.0', '2.2.0', '2.2.1')" in model_sql
@@ -81,7 +86,7 @@ def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
     )
     short_v2_sql = inspect.getsource(short_v2.upgrade)
     assert HOSPITAL_MRF_PACKED_V4_PARSER_CONTRACT_SHA256 in short_v2_sql
-    assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in short_v2_sql
+    assert HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256 in short_v2_sql
     count_invariants = _load_migration(COUNT_INVARIANTS_MIGRATION_PATH)
     assert count_invariants.revision == (
         "20260902103500_hospital_price_count_invariants"
@@ -89,6 +94,19 @@ def test_legacy_header_schema_preserves_absent_profile_fields() -> None:
     assert count_invariants.down_revision == (
         "20260901103000_plan_pricing_em_distance"
     )
+
+
+def test_rate_term_migration_admits_current_contract_and_modifier_metadata() -> None:
+    rate_term = _load_migration(RATE_TERM_MIGRATION_PATH)
+    assert rate_term.revision == "20260902160000_hospital_price_rate_term"
+    assert rate_term.down_revision == "20260902103500_hospital_price_count_invariants"
+    rate_term_sql = inspect.getsource(rate_term.upgrade)
+    assert HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256 in rate_term_sql
+    assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in rate_term_sql
+    assert "ADD COLUMN negotiated_rate_term text" in rate_term_sql
+    assert "DROP CONSTRAINT hospital_price_modifier_payer_shape_check" in rate_term_sql
+    with pytest.raises(RuntimeError, match="cannot downgrade"):
+        rate_term.downgrade()
 
 
 async def _insert_header(
@@ -325,8 +343,50 @@ async def _prove_current_headers(database_url, quoted: str) -> None:
                 **fields,
             )
         await _assert_profile_constraints(connection, quoted)
+        await _assert_modifier_rate_term_storage(connection, quoted)
     finally:
         await connection.close()
+
+
+async def _assert_modifier_rate_term_storage(
+    connection: asyncpg.Connection, quoted: str
+) -> None:
+    await connection.execute(
+        f"INSERT INTO {quoted}.hospital_price_modifier "
+        "(version_id, modifier_ordinal, code, description) "
+        "VALUES ($1, 0, 'TC', 'Technical component')",
+        "5" * 64,
+    )
+    await connection.execute(
+        f"INSERT INTO {quoted}.hospital_price_modifier_payer "
+        "(version_id, modifier_ordinal, payer_ordinal, payer_name, plan_name, "
+        "negotiated_rate_term, standard_charge_percentage) "
+        "VALUES ($1, 0, 0, 'Payer', 'Plan', $2, 62.5)",
+        "5" * 64,
+        "JAN 2026-MAY 2026",
+    )
+    assert await connection.fetchval(
+        f"SELECT negotiated_rate_term FROM "
+        f"{quoted}.hospital_price_modifier_payer WHERE version_id=$1",
+        "5" * 64,
+    ) == "JAN 2026-MAY 2026"
+    assert await connection.fetchval(
+        "SELECT convalidated FROM pg_constraint WHERE conrelid=$1::regclass "
+        "AND conname='hospital_price_modifier_payer_shape_check'",
+        f"{quoted}.hospital_price_modifier_payer",
+    ) is True
+    with pytest.raises(asyncpg.CheckViolationError):
+        await connection.execute(
+            f"UPDATE {quoted}.hospital_price_modifier_payer "
+            "SET negotiated_rate_term='   ' WHERE version_id=$1",
+            "5" * 64,
+        )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await connection.execute(
+            f"UPDATE {quoted}.hospital_price_modifier_payer "
+            "SET payer_name=NULL, plan_name=NULL WHERE version_id=$1",
+            "5" * 64,
+        )
 
 
 async def _seed_packed_v4_header(database_url, quoted: str) -> None:
@@ -377,6 +437,9 @@ async def test_postgres_legacy_header_keeps_absent_fields_absent(monkeypatch) ->
         )
         await _run_migration(
             engine, _load_migration(COUNT_INVARIANTS_MIGRATION_PATH), "upgrade"
+        )
+        await _run_migration(
+            engine, _load_migration(RATE_TERM_MIGRATION_PATH), "upgrade"
         )
         await _prove_current_headers(database_url, quoted)
     finally:

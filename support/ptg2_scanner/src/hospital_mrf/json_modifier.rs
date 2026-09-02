@@ -40,6 +40,7 @@ fn emit_json_modifier(
         let payer = ModifierPayerRow {
             payer_name: Some(required_text(&payer.payer_name, "modifier payer_name")?.to_owned()),
             plan_name: Some(required_text(&payer.plan_name, "modifier plan_name")?.to_owned()),
+            negotiated_rate_term: None,
             description: Some(
                 required_text(&payer.description, "modifier payer description")?.to_owned(),
             ),

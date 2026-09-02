@@ -53,6 +53,9 @@ def test_hospital_price_response_publishes_nested_contract():
     }
     item_properties = item_schema["properties"]
     assert set(item_properties) >= {"service", "charge", "negotiated_prices"}
+    assert "negotiated_rate_term" in item_properties["negotiated_prices"][
+        "items"
+    ]["properties"]
     service_schema = item_properties["service"]
     assert set(service_schema["required"]) >= {"codes"}
     assert "codes" in service_schema["properties"]

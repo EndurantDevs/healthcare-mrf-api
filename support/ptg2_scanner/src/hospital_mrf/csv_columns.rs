@@ -197,20 +197,45 @@ fn is_wide_payer_placeholder(value: &str) -> bool {
         || value.eq_ignore_ascii_case("[plan_name]")
 }
 
+fn canonical_wide_rate_term(value: &str) -> io::Result<String> {
+    let value = required_text(value, "negotiated_rate_term")?;
+    if value.eq_ignore_ascii_case("[negotiated_rate_term]") {
+        return Err(invalid(
+            "wide CSV payer headers must replace the negotiated_rate_term placeholder",
+        ));
+    }
+    let unwrapped = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(value)
+        .trim();
+    let term = if unwrapped.eq_ignore_ascii_case("term") {
+        ""
+    } else {
+        unwrapped
+            .get(..5)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("term "))
+            .and_then(|_| unwrapped.get(5..))
+            .unwrap_or(unwrapped)
+            .trim()
+    };
+    Ok(required_text(term, "negotiated_rate_term")?.to_owned())
+}
+
 fn parse_wide_columns(
     headers: &StringRecord,
     profile: CmsProfile,
     max_fanout_rows: usize,
 ) -> io::Result<WideCsvColumns> {
-    let mut payer_order = Vec::<(String, String)>::new();
-    let mut payers = BTreeMap::<(String, String), WidePayerBuilder>::new();
+    let mut payer_order = Vec::<(String, String, Option<String>)>::new();
+    let mut payers = BTreeMap::<(String, String, Option<String>), WidePayerBuilder>::new();
     for (column, header) in headers.iter().enumerate() {
         let raw_parts = header.split('|').map(str::trim).collect::<Vec<_>>();
         let normalized_parts = raw_parts
             .iter()
             .map(|part| part.to_ascii_lowercase())
             .collect::<Vec<_>>();
-        let (payer_name, plan_name, field) = match normalized_parts.as_slice() {
+        let (payer_name, plan_name, rate_term, field) = match normalized_parts.as_slice() {
             [prefix, _payer, _plan, field]
                 if prefix == "standard_charge"
                     && matches!(
@@ -221,7 +246,19 @@ fn parse_wide_columns(
                             | "methodology"
                     ) =>
             {
-                (raw_parts[1], raw_parts[2], field.as_str())
+                (raw_parts[1], raw_parts[2], None, field.as_str())
+            }
+            [prefix, _payer, _plan, _term, field]
+                if prefix == "standard_charge"
+                    && matches!(
+                        field.as_str(),
+                        "negotiated_dollar"
+                            | "negotiated_percentage"
+                            | "negotiated_algorithm"
+                            | "methodology"
+                    ) =>
+            {
+                (raw_parts[1], raw_parts[2], Some(raw_parts[3]), field.as_str())
             }
             [field, _payer, _plan]
                 if matches!(
@@ -234,7 +271,46 @@ fn parse_wide_columns(
                         | "additional_payer_notes"
                 ) =>
             {
-                (raw_parts[1], raw_parts[2], field.as_str())
+                (raw_parts[1], raw_parts[2], None, field.as_str())
+            }
+            [field, _payer, _plan, _term]
+                if matches!(
+                    field.as_str(),
+                    "estimated_amount"
+                        | "median_amount"
+                        | "10th_percentile"
+                        | "90th_percentile"
+                        | "count"
+                        | "additional_payer_notes"
+                ) =>
+            {
+                (raw_parts[1], raw_parts[2], Some(raw_parts[3]), field.as_str())
+            }
+            _ if normalized_parts.first().is_some_and(|first| {
+                first == "standard_charge"
+                    && normalized_parts.iter().skip(1).any(|part| {
+                        matches!(
+                            part.as_str(),
+                            "negotiated_dollar"
+                                | "negotiated_percentage"
+                                | "negotiated_algorithm"
+                                | "methodology"
+                        )
+                    })
+            }) || normalized_parts.first().is_some_and(|first| {
+                matches!(
+                    first.as_str(),
+                    "estimated_amount"
+                        | "median_amount"
+                        | "10th_percentile"
+                        | "90th_percentile"
+                        | "count"
+                        | "additional_payer_notes"
+                )
+            }) => {
+                return Err(invalid(format!(
+                    "unsupported wide CSV payer header shape {header}"
+                )));
             }
             _ => continue,
         };
@@ -243,7 +319,14 @@ fn parse_wide_columns(
                 "wide CSV payer headers must replace payer and plan placeholders",
             ));
         }
-        let key = (payer_name.to_lowercase(), plan_name.to_lowercase());
+        let negotiated_rate_term = rate_term
+            .map(canonical_wide_rate_term)
+            .transpose()?;
+        let key = (
+            payer_name.to_lowercase(),
+            plan_name.to_lowercase(),
+            negotiated_rate_term.as_ref().map(|term| term.to_lowercase()),
+        );
         if !payers.contains_key(&key) {
             if payers.len() == max_fanout_rows {
                 return Err(invalid(format!(
@@ -256,6 +339,7 @@ fn parse_wide_columns(
                 WidePayerBuilder {
                     payer_name: payer_name.to_owned(),
                     plan_name: plan_name.to_owned(),
+                    negotiated_rate_term,
                     ..WidePayerBuilder::default()
                 },
             );
@@ -282,7 +366,10 @@ fn parse_wide_columns(
         .into_iter()
         .map(|key| {
             let builder = payers.remove(&key).expect("wide payer key exists");
-            let payer_label = format!("{} / {}", builder.payer_name, builder.plan_name);
+            let payer_label = match builder.negotiated_rate_term.as_deref() {
+                Some(term) => format!("{} / {} / {term}", builder.payer_name, builder.plan_name),
+                None => format!("{} / {}", builder.payer_name, builder.plan_name),
+            };
             match profile {
                 CmsProfile::V2
                     if builder.median_amount.is_some()
@@ -304,6 +391,7 @@ fn parse_wide_columns(
             Ok(WidePayerColumns {
                 payer_name: builder.payer_name,
                 plan_name: builder.plan_name,
+                negotiated_rate_term: builder.negotiated_rate_term,
                 standard_charge_dollar: required_wide_column(
                     builder.standard_charge_dollar,
                     &payer_label,

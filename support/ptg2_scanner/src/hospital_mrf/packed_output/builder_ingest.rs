@@ -200,6 +200,7 @@ impl PackedOutputBuilder {
                 charge_key,
                 payer_name: row.payer_name.clone(),
                 plan_name: row.plan_name.clone(),
+                negotiated_rate_term: row.negotiated_rate_term.clone(),
                 negotiated_dollar: row.standard_charge_dollar.clone(),
                 negotiated_percentage: row.standard_charge_percentage.clone(),
                 negotiated_algorithm: row.standard_charge_algorithm.clone(),

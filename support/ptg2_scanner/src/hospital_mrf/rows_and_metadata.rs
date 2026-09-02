@@ -99,6 +99,7 @@ struct ContractProvision {
 struct PayerChargeRow {
     payer_name: String,
     plan_name: String,
+    negotiated_rate_term: Option<String>,
     standard_charge_dollar: Option<String>,
     standard_charge_percentage: Option<String>,
     standard_charge_algorithm: Option<String>,
@@ -123,6 +124,7 @@ struct ModifierRow {
 struct ModifierPayerRow {
     payer_name: Option<String>,
     plan_name: Option<String>,
+    negotiated_rate_term: Option<String>,
     description: Option<String>,
     standard_charge_dollar: Option<String>,
     standard_charge_percentage: Option<String>,
@@ -175,6 +177,7 @@ impl ChargeAccumulator {
             left.payer_name
                 .cmp(&right.payer_name)
                 .then_with(|| left.plan_name.cmp(&right.plan_name))
+                .then_with(|| left.negotiated_rate_term.cmp(&right.negotiated_rate_term))
         });
         emit_charge(
             outputs,

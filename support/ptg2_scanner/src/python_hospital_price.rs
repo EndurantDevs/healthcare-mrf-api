@@ -300,6 +300,10 @@ fn hospital_price_fact_payload<'py>(
                 hospital_price_py_value(py, fact.plan_name.as_str()),
             ),
             (
+                "negotiated_rate_term",
+                hospital_price_py_value(py, fact.negotiated_rate_term.as_deref()),
+            ),
+            (
                 "negotiated_dollar",
                 hospital_price_py_value(py, fact.negotiated_dollar.as_deref()),
             ),
