@@ -39,6 +39,8 @@ def upgrade() -> None:
     modifier_payer = f'{schema}."hospital_price_modifier_payer"'
     op.execute(
         f"ALTER TABLE {modifier_payer} "
+        "ALTER COLUMN payer_name DROP NOT NULL, "
+        "ALTER COLUMN plan_name DROP NOT NULL, "
         "ADD COLUMN negotiated_rate_term text, "
         "DROP CONSTRAINT hospital_price_modifier_payer_shape_check, "
         "ADD CONSTRAINT hospital_price_modifier_payer_shape_check CHECK ("
@@ -121,6 +123,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Refuse to stamp a predecessor that cannot read v6 term data."""
+    """Preserve forward-compatible term data while moving the revision stamp."""
 
-    raise RuntimeError("hospital price negotiated-rate-term schema cannot downgrade")
+    return None

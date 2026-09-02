@@ -104,9 +104,10 @@ def test_rate_term_migration_admits_current_contract_and_modifier_metadata() -> 
     assert HOSPITAL_MRF_PACKED_V5_PARSER_CONTRACT_SHA256 in rate_term_sql
     assert HOSPITAL_MRF_PARSER_CONTRACT_SHA256 in rate_term_sql
     assert "ADD COLUMN negotiated_rate_term text" in rate_term_sql
+    assert "ALTER COLUMN payer_name DROP NOT NULL" in rate_term_sql
+    assert "ALTER COLUMN plan_name DROP NOT NULL" in rate_term_sql
     assert "DROP CONSTRAINT hospital_price_modifier_payer_shape_check" in rate_term_sql
-    with pytest.raises(RuntimeError, match="cannot downgrade"):
-        rate_term.downgrade()
+    assert rate_term.downgrade() is None
 
 
 async def _insert_header(

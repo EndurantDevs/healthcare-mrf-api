@@ -85,9 +85,7 @@ class HospitalPricePackedRoot(Base, JSONOutputMixin):
     __my_index_elements__ = ["version_id"]
 
     version_id = Column(String(64), nullable=False)
-    format_version = Column(
-        SmallInteger, nullable=False, server_default=text("1"),
-    )
+    format_version = Column(SmallInteger, nullable=False, server_default=text("1"))
     service_count = Column(BigInteger, nullable=False)
     charge_count = Column(BigInteger, nullable=False)
     fact_count = Column(BigInteger, nullable=False)
