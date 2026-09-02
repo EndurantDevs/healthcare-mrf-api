@@ -32,6 +32,12 @@ _LOCATOR_RECORD_FIELDS = frozenset(
         "source-page-url",
     }
 )
+_LOCATOR_FIELD_ALIASES = {
+    "location name": "location-name",
+    "mrf_url": "mrf-url",
+    "source-page_url": "source-page-url",
+}
+_LOCATOR_FIELD_PREFIXES = _LOCATOR_RECORD_FIELDS | _LOCATOR_FIELD_ALIASES.keys()
 
 
 class HospitalHptLocatorError(ValueError):
@@ -121,6 +127,45 @@ def _record(fields: Mapping[str, str]) -> HospitalHptLocatorRecord:
     )
 
 
+def _field_key(value: str) -> str:
+    key = value.strip().casefold()
+    return _LOCATOR_FIELD_ALIASES.get(key, key)
+
+
+def _has_reserved_field_prefix(value: str) -> bool:
+    candidate = value.strip().casefold()
+    return any(
+        candidate.startswith(field)
+        and len(candidate) > len(field)
+        and candidate[len(field)].isspace()
+        for field in _LOCATOR_FIELD_PREFIXES
+    )
+
+
+def _is_inter_record_heading(
+    lines: Sequence[str],
+    index: int,
+    fields_by_key: Mapping[str, str],
+    is_preceded_by_blank: bool,
+) -> bool:
+    """Accept one bare section heading only between complete records."""
+
+    if (
+        not is_preceded_by_blank
+        or not {"location-name", "mrf-url"} <= fields_by_key.keys()
+        or ":" in lines[index]
+        or _has_reserved_field_prefix(lines[index])
+        or _field_key(lines[index]) in _LOCATOR_RECORD_FIELDS
+    ):
+        return False
+    for next_line in lines[index + 1 :]:
+        if not next_line.strip():
+            continue
+        raw_key, separator, _raw_value = next_line.partition(":")
+        return bool(separator and _field_key(raw_key) == "location-name")
+    return False
+
+
 def _line_fields(
     line: str,
     fields_by_key: Mapping[str, str],
@@ -146,9 +191,9 @@ def _line_fields(
             raise _locator_error("mrf_url")
         raise _locator_error("line")
     raw_key, separator, raw_value = line.partition(":")
-    key = raw_key.strip().casefold()
-    if key == "location name":
-        key = "location-name"
+    if _has_reserved_field_prefix(raw_key):
+        raise _locator_error("line")
+    key = _field_key(raw_key)
     if not separator or not key:
         raise _locator_error("line")
     field_value = raw_value.strip()
@@ -177,37 +222,31 @@ def parse_hospital_hpt_locator(
     fields_by_key: dict[str, str] = {}
     has_records_started = False
     is_empty_mrf_continuation_allowed = False
-    for line in _decoded_locator(locator_payload).split("\n"):
+    lines = _decoded_locator(locator_payload).split("\n")
+    is_preceded_by_blank = False
+    for index, line in enumerate(lines):
         if not line.strip():
+            is_preceded_by_blank = True
+            continue
+        if has_records_started and _is_inter_record_heading(
+            lines, index, fields_by_key, is_preceded_by_blank
+        ):
+            is_preceded_by_blank = False
             continue
         if not has_records_started:
-            raw_key, separator, _raw_value = line.partition(":")
-            candidate_key = raw_key.strip().casefold()
-            is_location_marker = candidate_key in {
-                "location-name",
-                "location name",
-            }
-            is_malformed_location_marker = (
-                not separator
-                and candidate_key.startswith(
-                    ("location-name ", "location name ")
-                )
-            )
-            if not is_location_marker and not is_malformed_location_marker:
-                is_recognized_field = candidate_key in _LOCATOR_RECORD_FIELDS
-                is_malformed_field = not separator and any(
-                    candidate_key.startswith(f"{field} ")
-                    for field in _LOCATOR_RECORD_FIELDS
-                )
-                if is_recognized_field or is_malformed_field:
-                    raise _locator_error(
-                        "location_name" if separator else "line"
-                    )
+            raw_key, _separator, _raw_value = line.partition(":")
+            candidate_key = _field_key(raw_key)
+            if candidate_key != "location-name":
+                if candidate_key in _LOCATOR_RECORD_FIELDS:
+                    raise _locator_error("location_name")
+                if _has_reserved_field_prefix(raw_key):
+                    raise _locator_error("line")
                 continue
             has_records_started = True
         line_fields, replaces_empty_mrf_url = _line_fields(
             line, fields_by_key, is_empty_mrf_continuation_allowed
         )
+        is_preceded_by_blank = False
         is_empty_mrf_continuation_allowed = line_fields == (("mrf-url", ""),)
         for key, field_value in line_fields:
             if key == "location-name" and key in fields_by_key:

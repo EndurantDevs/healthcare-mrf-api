@@ -643,6 +643,7 @@ hospitals:
   name: American Family Children's Hospital
   cms_hpt_url: https://www.uwhealth.org/cms-hpt.txt
 - hospital_id: hospital-000191
+  alias_of: hospital-000190
   name: American Family Chilren's Hospital
   cms_hpt_url: https://www.uwhealth.org/cms-hpt.txt
 - hospital_id: hospital-000192
@@ -1842,9 +1843,11 @@ hospitals:
   name: Banner Churchill Community Hospital
   cms_hpt_url: https://www.bannerhealth.com/cms-hpt.txt
 - hospital_id: hospital-000556
+  alias_of: hospital-001528
   name: Banner Community Hospital
   cms_hpt_url: https://www.bannerhealth.com/cms-hpt.txt
 - hospital_id: hospital-000557
+  alias_of: hospital-000558
   name: Banner Del E Webb Medical Center
   cms_hpt_url: https://www.bannerhealth.com/cms-hpt.txt
 - hospital_id: hospital-000558
@@ -1865,6 +1868,7 @@ hospitals:
 - hospital_id: hospital-000563
   name: Banner Gateway Medical Center Banner MD Anderson Cancer Center
   cms_hpt_url: https://www.bannerhealth.com/cms-hpt.txt
+  locator_mrf_url: https://images.pricetransparency.healthcare/public-mrfs/banner/900220728_banner-gateway-medical-center_standardcharges.csv
 - hospital_id: hospital-000564
   name: Banner Goldfield Medical Center
   cms_hpt_url: https://www.bannerhealth.com/cms-hpt.txt
@@ -1887,6 +1891,7 @@ hospitals:
   name: Banner Ocotillo Medical Center
   cms_hpt_url: https://www.bannerhealth.com/cms-hpt.txt
 - hospital_id: hospital-000571
+  alias_of: hospital-004809
   name: Banner Ogallala Community Hospital
   cms_hpt_url: https://www.bannerhealth.com/cms-hpt.txt
 - hospital_id: hospital-000572
@@ -1899,6 +1904,7 @@ hospitals:
   name: Banner Thunderbird Medical Center
   cms_hpt_url: https://www.bannerhealth.com/cms-hpt.txt
 - hospital_id: hospital-000575
+  alias_of: hospital-000577
   name: Banner University Med Center South
   cms_hpt_url: https://www.bannerhealth.com/cms-hpt.txt
 - hospital_id: hospital-000576
@@ -1913,9 +1919,11 @@ hospitals:
 - hospital_id: hospital-000579
   name: Banner University Medical Center Tucson Campus Cancer Center
   cms_hpt_url: https://www.bannerhealth.com/cms-hpt.txt
+  locator_mrf_url: https://images.pricetransparency.healthcare/public-mrfs/banner/901074557_banner-university-medical-center-tucson_standardcharges.csv
 - hospital_id: hospital-000580
   name: Banner University Medical Center Tucson University of Arizona Cancer Center
   cms_hpt_url: https://www.bannerhealth.com/cms-hpt.txt
+  locator_mrf_url: https://images.pricetransparency.healthcare/public-mrfs/banner/901074557_banner-university-medical-center-tucson_standardcharges.csv
 - hospital_id: hospital-000581
   name: Banner Wyoming Medical Center
   cms_hpt_url: https://www.bannerhealth.com/cms-hpt.txt
@@ -3045,6 +3053,7 @@ hospitals:
   name: Blue Ridge Medical Center
   cms_hpt_url: https://www.blueridgemc.org/cms-hpt.txt
 - hospital_id: hospital-000915
+  alias_of: hospital-000916
   name: Blue Ridge Vista
   cms_hpt_url: https://newvistahealth.com/cms-hpt.txt
 - hospital_id: hospital-000916
@@ -4739,6 +4748,7 @@ hospitals:
   name: ClearSky Rehabilitation Hospital of Weatherford
   cms_hpt_url: https://clearskyhealth.com/cms-hpt.txt
 - hospital_id: hospital-001432
+  alias_of: hospital-001416
   name: ClearVista Behavioral Health
   cms_hpt_url: https://newvistahealth.com/cms-hpt.txt
 - hospital_id: hospital-001433
@@ -7129,6 +7139,7 @@ hospitals:
   name: Ethan Crossing Indianapolis
   cms_hpt_url: https://newvistahealth.com/cms-hpt.txt
 - hospital_id: hospital-002159
+  alias_of: hospital-002158
   name: Ethan Crossing of Indianapolis
   cms_hpt_url: https://newvistahealth.com/cms-hpt.txt
 - hospital_id: hospital-002160
@@ -14815,12 +14826,15 @@ hospitals:
   name: Muscogee Creek Nation Hospital & Clinics
   cms_hpt_url: https://creekhealth.org/cms-hpt.txt
 - hospital_id: hospital-004470
+  alias_of: hospital-004236
   name: MVH Austin Blvd Emergency Department
   cms_hpt_url: https://www.premierhealth.com/cms-hpt.txt
 - hospital_id: hospital-004471
+  alias_of: hospital-004237
   name: MVH Beavercreek Emergency Department
   cms_hpt_url: https://www.premierhealth.com/cms-hpt.txt
 - hospital_id: hospital-004472
+  alias_of: hospital-004238
   name: MVH Jamestown Emergency Department
   cms_hpt_url: https://www.premierhealth.com/cms-hpt.txt
 - hospital_id: hospital-004473
@@ -18065,6 +18079,7 @@ hospitals:
   name: Riverview Regional Medical Center
   cms_hpt_url: https://riverviewregional.com/cms-hpt.txt
 - hospital_id: hospital-005459
+  alias_of: hospital-005427
   name: RiverVista Behavioral Hospital
   cms_hpt_url: https://newvistahealth.com/cms-hpt.txt
 - hospital_id: hospital-005460
@@ -21074,6 +21089,7 @@ hospitals:
   alias_of: hospital-006360
   locator_mrf_url: https://stctrprodsnsvc00455826e6.blob.core.windows.net/pt-final-posting-files/62-1762537_SUNRISE-HOSPITAL-AND-MEDICAL-CENTER_standardcharges.json
 - hospital_id: hospital-006362
+  alias_of: hospital-006363
   name: Sunrise Vista Behavioral Hospital
   cms_hpt_url: https://newvistahealth.com/cms-hpt.txt
 - hospital_id: hospital-006363
