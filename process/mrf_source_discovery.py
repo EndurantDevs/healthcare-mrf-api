@@ -1505,6 +1505,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
     if host in {
         "sawus2prdticmrfhma.z5.web.core.windows.net",
         "sawus2prdticmrfhma.blob.core.windows.net",
+        "sawus2prdticmrfrgaut.z5.web.core.windows.net",
+        "sawus2prdticmrfrgaut.blob.core.windows.net",
     }:
         return "html_mrf_links"
     if (
@@ -11186,11 +11188,12 @@ def _plan_info_from_label(
     plan_id: str | None = None,
     plan_id_type: str | None = None,
     market_type: str | None = "group",
+    infer_ein: bool = False,
 ) -> list[dict[str, Any]]:
     clean_label = _clean_text(label)
     resolved_plan_id = str(plan_id or "").strip()
     resolved_plan_id_type = plan_id_type
-    if not resolved_plan_id:
+    if not resolved_plan_id and infer_ein:
         match = re.search(r"\b(?P<ein>\d{9})\b", clean_label)
         if match:
             resolved_plan_id = match.group("ein")
@@ -11618,7 +11621,7 @@ async def _healthcarebluebook_direct_target(
         "source_format": _healthcarebluebook_source_format(link_url),
         "healthcarebluebook_listing_url": listing_url,
         "healthcarebluebook_file_type": _clean_text(type_text),
-        "plan_info": _plan_info_from_label(label),
+        "plan_info": _plan_info_from_label(label, infer_ein=True),
     }
     return CrawlTarget(
         source=source_record,
@@ -14528,6 +14531,267 @@ async def _resolve_uhc_blob_listing(
     return crawl_targets
 
 
+_ASYNC_CRAWL_RESOLVER_NAMES = {
+    "kaiser_monthly_inventory": "_resolve_kaiser_monthly_inventory",
+    "azure_mrf_listing": "_resolve_azure_mrf_listing",
+    "triples_mtt_api": "_resolve_triples_mtt_api",
+    "s3_xml_listing": "_resolve_s3_xml_listing",
+    "cigna_static_mrf_lookup": "_resolve_cigna_static_mrf_lookup",
+    "bcbs_global_solutions_mrf": "_resolve_bcbs_global_solutions_mrf",
+    "bcbs_asomrf_filelist": "_resolve_bcbs_asomrf_filelist",
+    "meritain_mrf_search": "_resolve_meritain_mrf_search",
+    "healthcarebluebook_mrf": "_resolve_healthcarebluebook_mrf",
+    "ebms_caa_directory": "_resolve_ebms_caa_directory",
+    "html_mrf_with_healthcarebluebook": "_resolve_html_mrf_with_healthcarebluebook",
+    "healthgram_network_index": "_resolve_healthgram_network_index",
+    "anthem_s3_mrf": "_resolve_anthem_s3_mrf",
+    "hcsc_asomrf_landing": "_resolve_hcsc_asomrf_landing",
+    "point32_azure_mrf_directory": "_resolve_point32_azure_mrf_directory",
+    "html_delegated_mrf_links": "_resolve_html_delegated_mrf_links",
+    "midlandschoice_mrf": "_resolve_midlandschoice_mrf",
+    "wordpress_elfinder_mrf_links": "_resolve_wordpress_elfinder_mrf_links",
+    "html_mrf_links": "_resolve_html_mrf_links",
+    "socrata_data_json_mrf_catalog": "_resolve_socrata_data_json_mrf_catalog",
+    "json_mrf_directory_links": "_resolve_json_mrf_directory_links",
+    "healthspace_machine_readable_files": "_resolve_healthspace_machine_readable_files",
+    "humana_pct_file_list": "_resolve_humana_pct_file_list",
+    "fchn_payor_search": "_resolve_fchn_payor_search",
+    "viva_health_mrf": "_resolve_viva_health_mrf",
+    "healthez_benefits_mrf": "_resolve_healthez_benefits_mrf",
+    "payercompass_mrf": "_resolve_payercompass_mrf",
+    "webtpa_mrf_api": "_resolve_webtpa_mrf_api",
+    "cmstic_file_info": "_resolve_cmstic_file_info",
+    "cmstic_keyed_toc_redirect": "_resolve_cmstic_keyed_toc_redirect",
+    "github_repo_mrf_tree": "_resolve_github_repo_mrf",
+    "auxiant_wordpress_directory": "_resolve_auxiant_wordpress_directory",
+    "healthsparq_direct_metadata": "_resolve_healthsparq_direct_metadata",
+    "healthsparq_public_mrf": "_resolve_healthsparq_public_mrf",
+    "providence_mrf_api": "_resolve_providence_mrf_api",
+    "magnacare_transparency_mrf": "_resolve_magnacare_transparency_mrf",
+    "mymedicalshopper_talon_mrf": "_resolve_mymedicalshopper_talon_mrf",
+    "uhc_blob_listing": "_resolve_uhc_blob_listing",
+}
+_SYNC_CRAWL_RESOLVER_NAMES = {
+    "bcbsma_monthly_tocs": "_bcbsma_monthly_toc_targets",
+    "monthly_toc_templates": "_monthly_toc_targets",
+    "asr_health_benefits_mrf": "_resolve_asr_health_benefits_mrf",
+}
+
+
+async def _configured_crawl_targets(
+    source_row: dict[str, Any],
+    url: str,
+    session: aiohttp.ClientSession,
+    resolver_by_key: dict[str, Any],
+) -> list[CrawlTarget] | None:
+    resolver_type = str(resolver_by_key.get("type") or "").strip()
+    async_resolver_name = _ASYNC_CRAWL_RESOLVER_NAMES.get(resolver_type)
+    if async_resolver_name:
+        async_resolver = globals()[async_resolver_name]
+        return await async_resolver(source_row, url, resolver_by_key, session)
+    sync_resolver_name = _SYNC_CRAWL_RESOLVER_NAMES.get(resolver_type)
+    if sync_resolver_name:
+        sync_resolver = globals()[sync_resolver_name]
+        return sync_resolver(source_row, url, resolver_by_key)
+    if resolver_type == "direct_toc":
+        crawl_target = _direct_toc_crawl_target(
+            source_row,
+            url,
+            resolver=resolver_type,
+            target_max_bytes=_parse_size_bytes(resolver_by_key.get("toc_max_bytes")),
+        )
+        if crawl_target:
+            return [crawl_target]
+        raise ValueError(f"no direct MRF TOC target found for {url}")
+    if resolver_type == "direct_mrf_body":
+        crawl_target = _direct_mrf_body_crawl_target(
+            source_row, url, resolver=resolver_type
+        )
+        if crawl_target:
+            return [crawl_target]
+        raise ValueError(f"no direct MRF body target found for {url}")
+    return None
+
+
+async def _highmark_script_crawl_targets(
+    source_row: dict[str, Any],
+    url: str,
+    session: aiohttp.ClientSession,
+    resolver_by_key: dict[str, Any],
+) -> list[CrawlTarget]:
+    script_url = urljoin(
+        url, str(resolver_by_key.get("script_path") or "/js/script.js")
+    )
+    script_text = await _fetch_text(
+        script_url,
+        max_bytes=int(resolver_by_key.get("max_bytes") or 1024 * 1024),
+        session=session,
+    )
+    parsed_targets = _parse_highmark_hmhs_script(script_text, base_url=url)
+    if not parsed_targets:
+        raise ValueError(f"no Highmark HMHS index links found in {script_url}")
+    return [
+        CrawlTarget(
+            source=source_row,
+            url=str(parsed_target["url"]),
+            label=str(parsed_target.get("label") or source_row.get("display_name") or ""),
+            resolved_from_url=script_url,
+            metadata={
+                "resolver": "highmark_hmhs_script",
+                "region": parsed_target.get("region"),
+                "raw_path": parsed_target.get("raw_path"),
+                "rendered_path": parsed_target.get("rendered_path"),
+            },
+        )
+        for parsed_target in parsed_targets
+    ]
+
+
+async def _uhc_provider_crawl_targets(
+    source_row: dict[str, Any],
+    url: str,
+    session: aiohttp.ClientSession,
+    resolver_by_key: dict[str, Any],
+) -> list[CrawlTarget]:
+    listing_url = _uhc_provider_mrf_api_url(url)
+    listing = await _fetch_json(
+        listing_url,
+        max_bytes=int(resolver_by_key.get("max_bytes") or 10 * 1024 * 1024),
+        session=session,
+    )
+    crawl_targets = _uhc_provider_mrf_targets_from_payload(
+        source_row,
+        listing,
+        listing_url=listing_url,
+        resolver_type="uhc_provider_mrf_files",
+        max_targets=_as_int(resolver_by_key.get("max_targets")),
+    )
+    if not crawl_targets:
+        raise ValueError(f"no UHC provider MRF files found for {url}")
+    return crawl_targets
+
+
+async def _sapphire_html_crawl_targets(
+    source_row: dict[str, Any],
+    url: str,
+    session: aiohttp.ClientSession,
+    resolver_by_key: dict[str, Any],
+) -> list[CrawlTarget]:
+    if _is_direct_toc_url(url):
+        return [
+            CrawlTarget(
+                source=source_row,
+                url=url,
+                label=str(source_row.get("display_name") or ""),
+                resolved_from_url=url,
+                metadata={
+                    "resolver": "sapphire_html_tocs",
+                    "file_name": Path(urlsplit(url).path).name,
+                    "payer_name": source_row.get("display_name"),
+                },
+            )
+        ]
+    html_text = await _fetch_text(
+        url,
+        max_bytes=int(resolver_by_key.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
+    parsed_targets = _parse_sapphire_toc_links(html_text, base_url=url)
+    if not parsed_targets:
+        parsed_targets = await _resolve_sapphire_static_query_toc_links(
+            url, resolver_by_key, session
+        )
+    if not parsed_targets:
+        raise ValueError(f"no Sapphire TOC links found for {url}")
+    return [
+        CrawlTarget(
+            source=source_row,
+            url=str(parsed_target["url"]),
+            label=str(parsed_target.get("label") or source_row.get("display_name") or ""),
+            resolved_from_url=url,
+            metadata={
+                "resolver": "sapphire_html_tocs",
+                "file_name": parsed_target.get("file_name"),
+                "payer_name": parsed_target.get("payer_name"),
+            },
+        )
+        for parsed_target in parsed_targets
+    ]
+
+
+async def _delegated_crawl_targets(
+    source_row: dict[str, Any],
+    url: str,
+    html_text: str,
+    session: aiohttp.ClientSession,
+    target_limit: int | None,
+) -> list[CrawlTarget]:
+    delegated_targets: list[CrawlTarget] = []
+    for delegated_url in _delegated_mrf_source_urls_from_html(html_text, base_url=url):
+        delegated_platform = classify_hosting_platform(delegated_url)
+        if not delegated_platform:
+            continue
+        nested_targets = await _crawl_targets_for_source(
+            {**source_row, "hosting_platform": delegated_platform},
+            delegated_url,
+            session,
+            target_limit=target_limit,
+        )
+        for nested_target in nested_targets:
+            metadata = dict(nested_target.metadata or {})
+            metadata.setdefault("delegated_source_url", delegated_url)
+            metadata.setdefault("delegated_source_platform", delegated_platform)
+            delegated_targets.append(
+                CrawlTarget(
+                    source=source_row,
+                    url=nested_target.url,
+                    label=nested_target.label,
+                    resolved_from_url=url,
+                    metadata=metadata,
+                )
+            )
+            if target_limit and target_limit > 0 and len(delegated_targets) >= target_limit:
+                return delegated_targets[:target_limit]
+    return _dedupe_crawl_targets_by_url(delegated_targets)
+
+
+async def _fallback_crawl_targets(
+    source_row: dict[str, Any],
+    url: str,
+    session: aiohttp.ClientSession,
+    target_limit: int | None,
+) -> list[CrawlTarget]:
+    direct_target = _direct_toc_crawl_target(source_row, url)
+    if direct_target:
+        return [direct_target]
+    direct_target = _direct_mrf_body_crawl_target(source_row, url)
+    if direct_target:
+        return [direct_target]
+    html_text = await _fetch_text(url, max_bytes=5 * 1024 * 1024, session=session)
+    html_targets = [
+        CrawlTarget(
+            source=source_row,
+            url=str(parsed_target["url"]),
+            label=str(parsed_target.get("label") or source_row.get("display_name") or ""),
+            resolved_from_url=url,
+            metadata={
+                "resolver": parsed_target.get("resolver"),
+                "target_kind": parsed_target.get("target_kind"),
+                "target_file_type": parsed_target.get("target_file_type"),
+                "container_format": parsed_target.get("container_format"),
+                "html_attr": parsed_target.get("html_attr"),
+                "plan_info": parsed_target.get("plan_info"),
+            },
+        )
+        for parsed_target in _parse_html_mrf_links(html_text, base_url=url)
+    ]
+    if html_targets:
+        return html_targets
+    return await _delegated_crawl_targets(
+        source_row, url, html_text, session, target_limit
+    )
+
+
 async def _crawl_targets_for_source(
     source_row: dict[str, Any],
     url: str,
@@ -14546,278 +14810,25 @@ async def _crawl_targets_for_source(
             if existing_max_targets
             else target_limit
         )
+    configured_targets = await _configured_crawl_targets(
+        source_row, url, session, resolver_by_key
+    )
+    if configured_targets is not None:
+        return configured_targets
     resolver_type = str(resolver_by_key.get("type") or "").strip()
-    if resolver_type == "bcbsma_monthly_tocs":
-        return _bcbsma_monthly_toc_targets(source_row, url, resolver_by_key)
-    if resolver_type == "monthly_toc_templates":
-        return _monthly_toc_targets(source_row, url, resolver_by_key)
-    if resolver_type == "kaiser_monthly_inventory":
-        return await _resolve_kaiser_monthly_inventory(
-            source_row, url, resolver_by_key, session
-        )
-    if resolver_type == "azure_mrf_listing":
-        return await _resolve_azure_mrf_listing(source_row, url, resolver_by_key, session)
-    if resolver_type == "triples_mtt_api":
-        return await _resolve_triples_mtt_api(source_row, url, resolver_by_key, session)
-    if resolver_type == "s3_xml_listing":
-        return await _resolve_s3_xml_listing(source_row, url, resolver_by_key, session)
-    if resolver_type == "cigna_static_mrf_lookup":
-        return await _resolve_cigna_static_mrf_lookup(source_row, url, resolver_by_key, session)
-    if resolver_type == "bcbs_global_solutions_mrf":
-        return await _resolve_bcbs_global_solutions_mrf(source_row, url, resolver_by_key, session)
-    if resolver_type == "bcbs_asomrf_filelist":
-        return await _resolve_bcbs_asomrf_filelist(source_row, url, resolver_by_key, session)
-    if resolver_type == "meritain_mrf_search":
-        return await _resolve_meritain_mrf_search(source_row, url, resolver_by_key, session)
-    if resolver_type == "healthcarebluebook_mrf":
-        return await _resolve_healthcarebluebook_mrf(source_row, url, resolver_by_key, session)
-    if resolver_type == "ebms_caa_directory":
-        return await _resolve_ebms_caa_directory(source_row, url, resolver_by_key, session)
-    if resolver_type == "html_mrf_with_healthcarebluebook":
-        return await _resolve_html_mrf_with_healthcarebluebook(
-            source_row, url, resolver_by_key, session
-        )
-    if resolver_type == "healthgram_network_index":
-        return await _resolve_healthgram_network_index(source_row, url, resolver_by_key, session)
-    if resolver_type == "anthem_s3_mrf":
-        return await _resolve_anthem_s3_mrf(source_row, url, resolver_by_key, session)
-    if resolver_type == "hcsc_asomrf_landing":
-        return await _resolve_hcsc_asomrf_landing(source_row, url, resolver_by_key, session)
-    if resolver_type == "point32_azure_mrf_directory":
-        return await _resolve_point32_azure_mrf_directory(
-            source_row, url, resolver_by_key, session
-        )
-    if resolver_type == "html_delegated_mrf_links":
-        return await _resolve_html_delegated_mrf_links(source_row, url, resolver_by_key, session)
-    if resolver_type == "midlandschoice_mrf":
-        return await _resolve_midlandschoice_mrf(source_row, url, resolver_by_key, session)
-    if resolver_type == "wordpress_elfinder_mrf_links":
-        return await _resolve_wordpress_elfinder_mrf_links(
-            source_row, url, resolver_by_key, session
-        )
-    if resolver_type == "html_mrf_links":
-        return await _resolve_html_mrf_links(source_row, url, resolver_by_key, session)
-    if resolver_type == "socrata_data_json_mrf_catalog":
-        return await _resolve_socrata_data_json_mrf_catalog(
-            source_row, url, resolver_by_key, session
-        )
-    if resolver_type == "json_mrf_directory_links":
-        return await _resolve_json_mrf_directory_links(source_row, url, resolver_by_key, session)
-    if resolver_type == "healthspace_machine_readable_files":
-        return await _resolve_healthspace_machine_readable_files(
-            source_row, url, resolver_by_key, session
-        )
-    if resolver_type == "humana_pct_file_list":
-        return await _resolve_humana_pct_file_list(source_row, url, resolver_by_key, session)
-    if resolver_type == "fchn_payor_search":
-        return await _resolve_fchn_payor_search(source_row, url, resolver_by_key, session)
-    if resolver_type == "viva_health_mrf":
-        return await _resolve_viva_health_mrf(source_row, url, resolver_by_key, session)
-    if resolver_type == "healthez_benefits_mrf":
-        return await _resolve_healthez_benefits_mrf(source_row, url, resolver_by_key, session)
-    if resolver_type == "payercompass_mrf":
-        return await _resolve_payercompass_mrf(source_row, url, resolver_by_key, session)
-    if resolver_type == "webtpa_mrf_api":
-        return await _resolve_webtpa_mrf_api(source_row, url, resolver_by_key, session)
-    if resolver_type == "cmstic_file_info":
-        return await _resolve_cmstic_file_info(source_row, url, resolver_by_key, session)
-    if resolver_type == "cmstic_keyed_toc_redirect":
-        return await _resolve_cmstic_keyed_toc_redirect(
-            source_row, url, resolver_by_key, session
-        )
-    if resolver_type == "direct_toc":
-        crawl_target = _direct_toc_crawl_target(
-            source_row,
-            url,
-            resolver=resolver_type,
-            target_max_bytes=_parse_size_bytes(resolver_by_key.get("toc_max_bytes")),
-        )
-        if crawl_target:
-            return [crawl_target]
-        raise ValueError(f"no direct MRF TOC target found for {url}")
-    if resolver_type == "direct_mrf_body":
-        crawl_target = _direct_mrf_body_crawl_target(source_row, url, resolver=resolver_type)
-        if crawl_target:
-            return [crawl_target]
-        raise ValueError(f"no direct MRF body target found for {url}")
-    if resolver_type == "github_repo_mrf_tree":
-        return await _resolve_github_repo_mrf(source_row, url, resolver_by_key, session)
-    if resolver_type == "auxiant_wordpress_directory":
-        return await _resolve_auxiant_wordpress_directory(
-            source_row, url, resolver_by_key, session
-        )
-    if resolver_type == "healthsparq_direct_metadata":
-        return await _resolve_healthsparq_direct_metadata(source_row, url, resolver_by_key, session)
-    if resolver_type == "healthsparq_public_mrf":
-        return await _resolve_healthsparq_public_mrf(source_row, url, resolver_by_key, session)
-    if resolver_type == "providence_mrf_api":
-        return await _resolve_providence_mrf_api(source_row, url, resolver_by_key, session)
-    if resolver_type == "magnacare_transparency_mrf":
-        return await _resolve_magnacare_transparency_mrf(
-            source_row, url, resolver_by_key, session
-        )
-    if resolver_type == "mymedicalshopper_talon_mrf":
-        return await _resolve_mymedicalshopper_talon_mrf(source_row, url, resolver_by_key, session)
-    if resolver_type == "asr_health_benefits_mrf":
-        return _resolve_asr_health_benefits_mrf(source_row, url, resolver_by_key)
     if resolver_type == "highmark_hmhs_script":
-        script_path = str(resolver_by_key.get("script_path") or "/js/script.js")
-        script_url = urljoin(url, script_path)
-        script_text = await _fetch_text(
-            script_url,
-            max_bytes=int(resolver_by_key.get("max_bytes") or 1024 * 1024),
-            session=session,
+        return await _highmark_script_crawl_targets(
+            source_row, url, session, resolver_by_key
         )
-        crawl_targets = _parse_highmark_hmhs_script(script_text, base_url=url)
-        if not crawl_targets:
-            raise ValueError(f"no Highmark HMHS index links found in {script_url}")
-        return [
-            CrawlTarget(
-                source=source_row,
-                url=str(crawl_target["url"]),
-                label=str(crawl_target.get("label") or source_row.get("display_name") or ""),
-                resolved_from_url=script_url,
-                metadata={
-                    "resolver": resolver_type,
-                    "region": crawl_target.get("region"),
-                    "raw_path": crawl_target.get("raw_path"),
-                    "rendered_path": crawl_target.get("rendered_path"),
-                },
-            )
-            for crawl_target in crawl_targets
-        ]
     if resolver_type == "uhc_provider_mrf_files":
-        listing_url = _uhc_provider_mrf_api_url(url)
-        listing = await _fetch_json(
-            listing_url,
-            max_bytes=int(resolver_by_key.get("max_bytes") or 10 * 1024 * 1024),
-            session=session,
-        )
-        crawl_targets = _uhc_provider_mrf_targets_from_payload(
-            source_row,
-            listing,
-            listing_url=listing_url,
-            resolver_type=resolver_type,
-            max_targets=_as_int(resolver_by_key.get("max_targets")),
-        )
-        if not crawl_targets:
-            raise ValueError(f"no UHC provider MRF files found for {url}")
-        return crawl_targets
-    if resolver_type == "uhc_blob_listing":
-        return await _resolve_uhc_blob_listing(
-            source_row, url, resolver_by_key, session
+        return await _uhc_provider_crawl_targets(
+            source_row, url, session, resolver_by_key
         )
     if resolver_type == "sapphire_html_tocs":
-        if _is_direct_toc_url(url):
-            return [
-                CrawlTarget(
-                    source=source_row,
-                    url=url,
-                    label=str(source_row.get("display_name") or ""),
-                    resolved_from_url=url,
-                    metadata={
-                        "resolver": resolver_type,
-                        "file_name": Path(urlsplit(url).path).name,
-                        "payer_name": source_row.get("display_name"),
-                    },
-                )
-            ]
-        html_text = await _fetch_text(
-            url,
-            max_bytes=int(resolver_by_key.get("max_bytes") or 5 * 1024 * 1024),
-            session=session,
+        return await _sapphire_html_crawl_targets(
+            source_row, url, session, resolver_by_key
         )
-        crawl_targets = _parse_sapphire_toc_links(html_text, base_url=url)
-        if not crawl_targets:
-            crawl_targets = await _resolve_sapphire_static_query_toc_links(
-                url, resolver_by_key, session
-            )
-        if not crawl_targets:
-            raise ValueError(f"no Sapphire TOC links found for {url}")
-        return [
-            CrawlTarget(
-                source=source_row,
-                url=str(crawl_target["url"]),
-                label=str(crawl_target.get("label") or source_row.get("display_name") or ""),
-                resolved_from_url=url,
-                metadata={
-                    "resolver": resolver_type,
-                    "file_name": crawl_target.get("file_name"),
-                    "payer_name": crawl_target.get("payer_name"),
-                },
-            )
-            for crawl_target in crawl_targets
-        ]
-    direct_toc_target = _direct_toc_crawl_target(source_row, url)
-    if direct_toc_target:
-        return [direct_toc_target]
-    direct_body_target = _direct_mrf_body_crawl_target(source_row, url)
-    if direct_body_target:
-        return [direct_body_target]
-    if not _is_direct_toc_url(url):
-        html_text = await _fetch_text(url, max_bytes=5 * 1024 * 1024, session=session)
-        html_targets = _parse_html_mrf_links(html_text, base_url=url)
-        if html_targets:
-            return [
-                CrawlTarget(
-                    source=source_row,
-                    url=str(crawl_target["url"]),
-                    label=str(crawl_target.get("label") or source_row.get("display_name") or ""),
-                    resolved_from_url=url,
-                    metadata={
-                        "resolver": crawl_target.get("resolver"),
-                        "target_kind": crawl_target.get("target_kind"),
-                        "target_file_type": crawl_target.get("target_file_type"),
-                        "container_format": crawl_target.get("container_format"),
-                        "html_attr": crawl_target.get("html_attr"),
-                        "plan_info": crawl_target.get("plan_info"),
-                    },
-                )
-                for crawl_target in html_targets
-            ]
-        delegated_targets: list[CrawlTarget] = []
-        for delegated_url in _delegated_mrf_source_urls_from_html(
-            html_text, base_url=url
-        ):
-            delegated_platform = classify_hosting_platform(delegated_url)
-            if not delegated_platform:
-                continue
-            delegated_source_by_field = {
-                **source_row,
-                "hosting_platform": delegated_platform,
-            }
-            nested_targets = await _crawl_targets_for_source(
-                delegated_source_by_field,
-                delegated_url,
-                session,
-                target_limit=target_limit,
-            )
-            for crawl_target in nested_targets:
-                metadata = dict(crawl_target.metadata or {})
-                metadata.setdefault("delegated_source_url", delegated_url)
-                metadata.setdefault("delegated_source_platform", delegated_platform)
-                delegated_targets.append(
-                    CrawlTarget(
-                        source=source_row,
-                        url=crawl_target.url,
-                        label=crawl_target.label,
-                        resolved_from_url=url,
-                        metadata=metadata,
-                    )
-                )
-                if target_limit and target_limit > 0 and len(delegated_targets) >= target_limit:
-                    return delegated_targets[:target_limit]
-        if delegated_targets:
-            return _dedupe_crawl_targets_by_url(delegated_targets)
-        return []
-    return [
-        CrawlTarget(
-            source=source_row,
-            url=url,
-            label=str(source_row.get("display_name") or ""),
-            metadata={"resolver": None},
-        )
-    ]
+    return await _fallback_crawl_targets(source_row, url, session, target_limit)
 
 
 def _crawl_skipped_observation(
@@ -15022,7 +15033,12 @@ def _matched_query_expansion_target(
         _crawl_target_search_values(crawl_target), query
     ):
         return None
-    match_scope = "resolver_context" if is_resolver_context_match else None
+    if is_resolver_context_match:
+        match_scope = "resolver_context"
+    elif _supports_toc_plan_query_scan(crawl_target):
+        match_scope = "toc_plan"
+    else:
+        match_scope = None
     return _with_query_expansion_match(
         crawl_target,
         query,
@@ -16258,6 +16274,206 @@ async def _crawl_one_toc_target(
         return [], [], [observation], toc_target.url
 
 
+async def _resolve_toc_crawl_targets(
+    source_rows: list[dict[str, Any]],
+    session: aiohttp.ClientSession,
+    run_id: str | None,
+    progress_run_id: str | None,
+    concurrency: int,
+    crawl_target_limit: int | None,
+    row_write_timeout: float,
+) -> tuple[list[CrawlTarget], int, set[str]]:
+    crawl_source_rows = _dedupe_source_rows_for_crawl(source_rows)
+    toc_targets, resolver_observations = await _resolve_crawl_targets(
+        crawl_source_rows,
+        session=session,
+        run_id=run_id,
+        progress_run_id=progress_run_id,
+        concurrency=concurrency,
+        crawl_target_limit=crawl_target_limit,
+    )
+    toc_targets = sorted(toc_targets, key=_crawl_target_rank)
+    expanded_target_count = len(toc_targets)
+    if crawl_target_limit:
+        toc_targets = toc_targets[: max(1, int(crawl_target_limit))]
+    target_rows = [_toc_target_file_row(toc_target) for toc_target in toc_targets]
+    target_row_count = len(target_rows)
+    resolver_observation_ids = {
+        observation["observation_id"] for observation in resolver_observations
+    }
+    await _push_crawl_row_batches(
+        [],
+        target_rows,
+        resolver_observations,
+        batch_size=WRITE_BATCH_SIZE,
+        row_write_timeout=row_write_timeout,
+    )
+    if progress_run_id:
+        total = len(toc_targets)
+        message = (
+            f"resolved {expanded_target_count} TOC targets from "
+            f"{len(crawl_source_rows)} source pages"
+        )
+        if total != expanded_target_count:
+            message = f"{message}; crawling first {total}"
+        enqueue_live_progress(
+            run_id=progress_run_id,
+            importer="mrf-source-discovery",
+            status="running",
+            phase="resolved source TOCs",
+            unit="targets",
+            done=expanded_target_count,
+            total=expanded_target_count,
+            message=message,
+        )
+    return (
+        toc_targets,
+        target_row_count,
+        resolver_observation_ids,
+    )
+
+
+async def _crawl_toc_target_with_limits(
+    crawl_target: CrawlTarget,
+    session: aiohttp.ClientSession,
+    max_toc_bytes: int,
+    run_id: str | None,
+    target_crawl_timeout: float,
+    target_semaphore: asyncio.Semaphore | None,
+):
+    async def crawl_with_timeout():
+        """Crawl one target and translate its configured timeout into an observation."""
+        try:
+            crawl_request = _crawl_one_toc_target(
+                crawl_target,
+                session,
+                max_toc_bytes=max_toc_bytes,
+                run_id=run_id,
+            )
+            if target_crawl_timeout > 0:
+                return await asyncio.wait_for(
+                    crawl_request, timeout=target_crawl_timeout
+                )
+            return await crawl_request
+        except TimeoutError:
+            return (
+                [],
+                [],
+                [
+                    _crawl_failed_observation(
+                        crawl_target.source,
+                        crawl_target.url,
+                        TimeoutError(
+                            f"TOC target crawl timed out after {target_crawl_timeout:g}s"
+                        ),
+                        run_id,
+                    )
+                ],
+                crawl_target.url,
+            )
+
+    if target_semaphore is None:
+        return await crawl_with_timeout()
+    async with target_semaphore:
+        return await crawl_with_timeout()
+
+
+@dataclass
+class _TocCrawlAccumulator:
+    total: int
+    progress_run_id: str | None
+    row_write_timeout: float
+    plan_count: int = 0
+    file_count: int = 0
+    completed_target_count: int = 0
+    observation_ids: set[str] = field(default_factory=set)
+    pending_plan_rows: list[dict[str, Any]] = field(default_factory=list)
+    pending_file_rows: list[dict[str, Any]] = field(default_factory=list)
+    pending_observation_rows: list[dict[str, Any]] = field(default_factory=list)
+
+    def _emit_progress(self, phase: str, result_url: str | None = None) -> None:
+        if not self.progress_run_id:
+            return
+        message = (
+            f"writing rows for TOC target {self.completed_target_count}/{self.total}"
+            if phase.startswith("writing")
+            else f"crawled {self.completed_target_count}/{self.total} TOC targets"
+        )
+        enqueue_live_progress(
+            run_id=self.progress_run_id,
+            importer="mrf-source-discovery",
+            status="running",
+            phase=phase,
+            unit="targets",
+            done=self.completed_target_count,
+            total=self.total,
+            message=message,
+            label=str(result_url) if result_url is not None else None,
+        )
+
+    async def record_completed_target(self, target_result) -> None:
+        """Accumulate, checkpoint, and report one completed target result."""
+        plan_rows, file_rows, crawl_observations, result_url = target_result
+        self.completed_target_count += 1
+        self.plan_count += len(plan_rows)
+        self.file_count += len(file_rows)
+        self.observation_ids.update(
+            observation["observation_id"] for observation in crawl_observations
+        )
+        self.pending_plan_rows.extend(plan_rows)
+        self.pending_file_rows.extend(file_rows)
+        self.pending_observation_rows.extend(crawl_observations)
+        if any(
+            len(pending_rows) >= WRITE_BATCH_SIZE
+            for pending_rows in (
+                self.pending_plan_rows,
+                self.pending_file_rows,
+                self.pending_observation_rows,
+            )
+        ):
+            self._emit_progress("writing TOC metadata rows", result_url)
+            await self._push_pending_rows()
+        self._emit_progress("crawling TOC metadata", result_url)
+
+    async def _push_pending_rows(self) -> None:
+        await _push_crawl_row_batches(
+            self.pending_plan_rows,
+            self.pending_file_rows,
+            self.pending_observation_rows,
+            batch_size=WRITE_BATCH_SIZE,
+            row_write_timeout=self.row_write_timeout,
+        )
+
+    async def finish(self) -> None:
+        """Persist remaining rows after all target tasks have completed."""
+        if self.progress_run_id:
+            enqueue_live_progress(
+                run_id=self.progress_run_id,
+                importer="mrf-source-discovery",
+                status="running",
+                phase="writing final TOC metadata rows",
+                unit="targets",
+                done=self.completed_target_count,
+                total=self.total,
+                message=(
+                    f"writing final rows for {self.completed_target_count}/{self.total} "
+                    "TOC targets"
+                ),
+            )
+        await self._push_pending_rows()
+
+    def summary(self) -> tuple[int, int, list[dict[str, Any]]]:
+        """Return the persisted plan, file, and observation counts."""
+        return (
+            self.plan_count,
+            self.file_count,
+            [
+                {"observation_id": observation_id}
+                for observation_id in self.observation_ids
+            ],
+        )
+
+
 async def _crawl_toc_metadata(
     source_rows: list[dict[str, Any]],
     *,
@@ -16272,207 +16488,52 @@ async def _crawl_toc_metadata(
     """Crawl TOC targets, derive rows, and persist crawl observations."""
     if test_mode:
         return 0, 0, []
-    discovery_count_map = {"plans": 0, "files": 0}
-    observation_ids: set[str] = set()
     worker_count = max(1, int(concurrency or DEFAULT_CONCURRENCY))
-    write_batch_size = WRITE_BATCH_SIZE
+    active_context = execution_context or _CrawlExecutionContext()
     timeout = aiohttp.ClientTimeout(
         total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
     )
-    crawl_source_rows = _dedupe_source_rows_for_crawl(source_rows)
-    active_context = execution_context or _CrawlExecutionContext()
     target_crawl_timeout = _float_env("HLTHPRT_MRF_TOC_TARGET_TIMEOUT_SECONDS", 180.0)
     row_write_timeout = _float_env("HLTHPRT_MRF_CRAWL_ROW_WRITE_TIMEOUT_SECONDS", 0.0)
-
     async with _discovery_http_session(
         existing_session=active_context.session,
         timeout=timeout,
         connector_limit=worker_count * 2,
     ) as active_session:
-        toc_targets, resolver_observations = await _resolve_crawl_targets(
-            crawl_source_rows,
-            session=active_session,
-            run_id=run_id,
+        toc_targets, target_file_count, observation_ids = await _resolve_toc_crawl_targets(
+            source_rows,
+            active_session,
+            run_id,
+            progress_run_id,
+            concurrency,
+            crawl_target_limit,
+            row_write_timeout,
+        )
+        accumulator = _TocCrawlAccumulator(
+            total=len(toc_targets),
             progress_run_id=progress_run_id,
-            concurrency=concurrency,
-            crawl_target_limit=crawl_target_limit,
-        )
-        toc_targets = sorted(toc_targets, key=_crawl_target_rank)
-        expanded_target_count = len(toc_targets)
-        if crawl_target_limit:
-            toc_targets = toc_targets[: max(1, int(crawl_target_limit))]
-        target_rows: list[dict[str, Any]] = []
-        for toc_target in toc_targets:
-            metadata_row = _toc_target_file_row(toc_target)
-            target_rows.append(metadata_row)
-        discovery_count_map["files"] += len(target_rows)
-        for observation in resolver_observations:
-            observation_ids.add(observation["observation_id"])
-        await _push_crawl_row_batches(
-            [],
-            target_rows,
-            resolver_observations,
-            batch_size=write_batch_size,
             row_write_timeout=row_write_timeout,
+            file_count=target_file_count,
+            observation_ids=observation_ids,
         )
-        total = len(toc_targets)
-        if progress_run_id:
-            message = f"resolved {expanded_target_count} TOC targets from {len(crawl_source_rows)} source pages"
-            if total != expanded_target_count:
-                message = f"{message}; crawling first {total}"
-            enqueue_live_progress(
-                run_id=progress_run_id,
-                importer="mrf-source-discovery",
-                status="running",
-                phase="resolved source TOCs",
-                unit="targets",
-                done=expanded_target_count,
-                total=expanded_target_count,
-                message=message,
+        async def _crawl_target(crawl_target: CrawlTarget):
+            return await _crawl_toc_target_with_limits(
+                crawl_target,
+                active_session,
+                max_toc_bytes,
+                run_id,
+                target_crawl_timeout,
+                active_context.target_semaphore,
             )
-
-        async def crawl_bounded(
-            crawl_target: CrawlTarget,
-        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
-            """Crawl one target under the shared concurrency and timeout limits."""
-
-            async def crawl_with_timeout():
-                """Apply the per-target deadline inside the global work permit."""
-
-                try:
-                    if target_crawl_timeout > 0:
-                        return await asyncio.wait_for(
-                            _crawl_one_toc_target(
-                                crawl_target,
-                                active_session,
-                                max_toc_bytes=max_toc_bytes,
-                                run_id=run_id,
-                            ),
-                            timeout=target_crawl_timeout,
-                        )
-                    return await _crawl_one_toc_target(
-                        crawl_target,
-                        active_session,
-                        max_toc_bytes=max_toc_bytes,
-                        run_id=run_id,
-                    )
-                except TimeoutError:
-                    return (
-                        [],
-                        [],
-                        [
-                            _crawl_failed_observation(
-                                crawl_target.source,
-                                crawl_target.url,
-                                TimeoutError(
-                                    f"TOC target crawl timed out after {target_crawl_timeout:g}s"
-                                ),
-                                run_id,
-                            )
-                        ],
-                        crawl_target.url,
-                    )
-
-            if active_context.target_semaphore is None:
-                return await crawl_with_timeout()
-            async with active_context.target_semaphore:
-                return await crawl_with_timeout()
-
-        crawl_progress_by_name = {"completed_target_count": 0}
-        pending_plan_rows: list[dict[str, Any]] = []
-        pending_file_rows: list[dict[str, Any]] = []
-        pending_observation_rows: list[dict[str, Any]] = []
-
-        async def record_crawl_result(target_result) -> None:
-            """Accumulate and checkpoint one completed target result."""
-
-            plan_rows, file_rows, crawl_observations, result_url = target_result
-            crawl_progress_by_name["completed_target_count"] += 1
-            discovery_count_map["plans"] += len(plan_rows)
-            discovery_count_map["files"] += len(file_rows)
-            for metadata_row in crawl_observations:
-                observation_ids.add(metadata_row["observation_id"])
-            pending_plan_rows.extend(plan_rows)
-            pending_file_rows.extend(file_rows)
-            pending_observation_rows.extend(crawl_observations)
-            if (
-                len(pending_plan_rows) >= write_batch_size
-                or len(pending_file_rows) >= write_batch_size
-                or len(pending_observation_rows) >= write_batch_size
-            ):
-                if progress_run_id:
-                    enqueue_live_progress(
-                        run_id=progress_run_id,
-                        importer="mrf-source-discovery",
-                        status="running",
-                        phase="writing TOC metadata rows",
-                        unit="targets",
-                        done=crawl_progress_by_name["completed_target_count"],
-                        total=total,
-                        message=(
-                            "writing rows for TOC target "
-                            f"{crawl_progress_by_name['completed_target_count']}/{total}"
-                        ),
-                        label=str(result_url),
-                    )
-                await _push_crawl_row_batches(
-                    pending_plan_rows,
-                    pending_file_rows,
-                    pending_observation_rows,
-                    batch_size=write_batch_size,
-                    row_write_timeout=row_write_timeout,
-                )
-            if progress_run_id:
-                enqueue_live_progress(
-                    run_id=progress_run_id,
-                    importer="mrf-source-discovery",
-                    status="running",
-                    phase="crawling TOC metadata",
-                    unit="targets",
-                    done=crawl_progress_by_name["completed_target_count"],
-                    total=total,
-                    message=(
-                        "crawled "
-                        f"{crawl_progress_by_name['completed_target_count']}/{total} "
-                        "TOC targets"
-                    ),
-                    label=str(result_url),
-                )
 
         await _consume_bounded_crawl_targets(
             toc_targets,
             concurrency=worker_count,
-            crawl_target=crawl_bounded,
-            on_result=record_crawl_result,
+            crawl_target=_crawl_target,
+            on_result=accumulator.record_completed_target,
         )
-        if progress_run_id:
-            enqueue_live_progress(
-                run_id=progress_run_id,
-                importer="mrf-source-discovery",
-                status="running",
-                phase="writing final TOC metadata rows",
-                unit="targets",
-                done=crawl_progress_by_name["completed_target_count"],
-                total=total,
-                message=(
-                    "writing final rows for "
-                    f"{crawl_progress_by_name['completed_target_count']}/{total} "
-                    "TOC targets"
-                ),
-            )
-        final_write_coro = _push_crawl_row_batches(
-            pending_plan_rows,
-            pending_file_rows,
-            pending_observation_rows,
-            batch_size=write_batch_size,
-            row_write_timeout=row_write_timeout,
-        )
-        await final_write_coro
-    return (
-        discovery_count_map["plans"],
-        discovery_count_map["files"],
-        [{"observation_id": metadata_value} for metadata_value in observation_ids],
-    )
+        await accumulator.finish()
+    return accumulator.summary()
 
 
 async def _consume_completed_crawl_tasks(
@@ -17132,6 +17193,556 @@ async def _execute_shared_discovery_source_batch(
         )
 
 
+@dataclass
+class _DiscoveryCommandState:
+    test_mode: bool
+    provider: str | None
+    limit: int | None
+    source_entity_types: Any
+    source_payer_query: str | None
+    dry_run: bool
+    check_urls: bool
+    crawl: bool
+    probe_files: bool
+    file_probe_limit: int | None
+    file_probe_types: Any
+    file_probe_entity_types: Any
+    file_probe_payer_query: str | None
+    max_toc_bytes: int
+    concurrency: int
+    crawl_target_limit: int | None
+    run_id: str | None
+    retry_of_run_id: str | None
+    mrf_discovery_root_run_id: str | None
+    parsed_source_entity_types: tuple[str, ...] = field(init=False)
+    parsed_source_payer_query: str | None = field(init=False)
+    parsed_file_probe_types: tuple[str, ...] = field(init=False)
+    parsed_file_probe_entity_types: tuple[str, ...] = field(init=False)
+    parsed_file_probe_payer_query: str | None = field(init=False)
+    providers: list[str] = field(init=False)
+    bounded_limit: int | None = field(init=False)
+    process_workers: int = field(init=False)
+    target_concurrency: int = field(init=False)
+    source_http_connection_limit: int = field(init=False)
+    source_http_per_host_limit: int = field(init=False)
+    result: DiscoveryResult = field(init=False)
+    crawl_run_id: str = field(init=False)
+    control_run_id: str = field(init=False)
+    run_mode: str = field(init=False)
+    run_params_dict: dict[str, Any] = field(init=False)
+    run_context_dict: dict[str, Any] = field(init=False)
+    emit_standalone_control_events: bool = field(init=False)
+    retry_parent_run_id: str | None = field(init=False)
+    checkpoint_root_run_id: str = field(init=False)
+    checkpoint_store: DatabaseDiscoveryCheckpointStore = field(init=False)
+    resumed_source_rows: list[dict[str, Any]] | None = field(init=False, default=None)
+    recorded_failure_run_ids: set[str] = field(default_factory=set)
+    needs_source_load: bool = field(init=False)
+
+
+def _normalize_discovery_command_state(state: _DiscoveryCommandState) -> None:
+    state.max_toc_bytes = state.max_toc_bytes or MAX_TOC_BYTES_DEFAULT
+    state.concurrency = max(1, int(state.concurrency or DEFAULT_CONCURRENCY))
+    state.crawl_target_limit = (
+        max(1, int(state.crawl_target_limit)) if state.crawl_target_limit else None
+    )
+    state.parsed_source_entity_types = _parse_text_filter_values(
+        state.source_entity_types
+    )
+    state.parsed_source_payer_query = _normalize_text_query(state.source_payer_query)
+    state.file_probe_limit = (
+        max(1, int(state.file_probe_limit)) if state.file_probe_limit else None
+    )
+    state.parsed_file_probe_types = _parse_file_probe_types(state.file_probe_types)
+    state.parsed_file_probe_entity_types = _parse_text_filter_values(
+        state.file_probe_entity_types
+    )
+    state.parsed_file_probe_payer_query = _normalize_text_query(
+        state.file_probe_payer_query
+    )
+    state.providers = _parse_provider_list(state.provider, test_mode=state.test_mode)
+    state.bounded_limit = (
+        max(1, int(state.limit))
+        if state.limit
+        else (25 if state.test_mode else None)
+    )
+    state.process_workers = (
+        1
+        if state.test_mode or state.dry_run
+        else _discovery_process_worker_count(state.concurrency)
+    )
+    state.target_concurrency = 1 if state.test_mode else _discovery_target_concurrency()
+
+
+def _initialize_discovery_command_context(state: _DiscoveryCommandState) -> None:
+    global_connection_limit = _discovery_http_connection_limit(
+        state.concurrency, state.target_concurrency
+    )
+    global_per_host_limit = _discovery_http_per_host_limit()
+    state.source_http_connection_limit, state.source_http_per_host_limit = (
+        _discovery_process_http_limits(
+            global_connection_limit,
+            global_per_host_limit,
+            state.process_workers,
+        )
+    )
+    state.result = DiscoveryResult(
+        providers=state.providers,
+        process_workers=state.process_workers,
+    )
+    started_at = _utc_now()
+    state.crawl_run_id = _id(
+        "mrfcrawl",
+        {
+            "started_at": started_at.isoformat(),
+            "providers": state.providers,
+            "run_id": state.run_id,
+        },
+    )
+    state.run_mode = _discovery_run_mode(
+        crawl=state.crawl,
+        check_urls=state.check_urls,
+        probe_files=state.probe_files,
+    )
+    state.result.crawl_run_id = state.crawl_run_id
+    state.control_run_id = state.run_id or state.crawl_run_id
+    state.run_params_dict = _discovery_run_params(
+        state,
+        global_connection_limit,
+        global_per_host_limit,
+    )
+    state.run_context_dict = {
+        "crawl_run_id": state.crawl_run_id,
+        "control_run_id": state.control_run_id,
+        "providers": state.providers,
+        "run_mode": state.run_mode,
+        "started_at": started_at,
+        "run_params": state.run_params_dict,
+    }
+    state.emit_standalone_control_events = bool(not state.dry_run and not state.run_id)
+
+
+def _discovery_run_params(
+    state: _DiscoveryCommandState,
+    global_connection_limit: int,
+    global_per_host_limit: int,
+) -> dict[str, Any]:
+    return {
+        "test_mode": state.test_mode,
+        "provider": state.provider,
+        "limit": state.limit,
+        "source_entity_types": list(state.parsed_source_entity_types),
+        "source_payer_query": state.parsed_source_payer_query,
+        "check_urls": state.check_urls,
+        "crawl": state.crawl,
+        "probe_files": state.probe_files,
+        "file_probe_limit": state.file_probe_limit,
+        "file_probe_types": list(state.parsed_file_probe_types),
+        "file_probe_entity_types": list(state.parsed_file_probe_entity_types),
+        "file_probe_payer_query": state.parsed_file_probe_payer_query,
+        "max_toc_bytes": state.max_toc_bytes,
+        "concurrency": state.concurrency,
+        "crawl_target_limit": state.crawl_target_limit,
+        "retry_of_run_id": state.retry_of_run_id,
+        "mrf_discovery_root_run_id": state.mrf_discovery_root_run_id,
+        "process_workers": state.process_workers,
+        "target_concurrency": state.target_concurrency,
+        "http_connection_limit": state.source_http_connection_limit,
+        "http_per_host_limit": state.source_http_per_host_limit,
+        "http_limit_scope": "shared_session" if state.process_workers == 1 else "per_process",
+        "http_global_connection_budget": global_connection_limit,
+        "http_global_per_host_budget": global_per_host_limit,
+    }
+
+
+def _announce_discovery_run(state: _DiscoveryCommandState) -> None:
+    if state.emit_standalone_control_events:
+        _emit_discovery_control_event(
+            state.run_context_dict,
+            status="running",
+            phase_detail="loading source providers",
+            progress={
+                "unit": "providers",
+                "done": 0,
+                "total": len(state.providers),
+                "pct": 0,
+                "message": "loading source providers",
+                "phase": "loading source providers",
+            },
+            triggered_by="direct_cli" if not state.run_id else None,
+        )
+    if state.control_run_id and not state.dry_run:
+        enqueue_live_progress(
+            run_id=state.control_run_id,
+            importer="mrf-source-discovery",
+            status="running",
+            phase="loading source providers",
+            unit="providers",
+            done=0,
+            total=len(state.providers),
+            message="loading source providers",
+        )
+
+
+async def _record_discovery_command_failure(
+    state: _DiscoveryCommandState, exc: BaseException
+) -> None:
+    if state.control_run_id in state.recorded_failure_run_ids:
+        return
+    state.recorded_failure_run_ids.add(state.control_run_id)
+    finished_at = _utc_now()
+    message = str(exc).strip() or exc.__class__.__name__
+    await _record_failed_discovery_state(
+        {
+            "run_context_dict": state.run_context_dict,
+            "result": state.result,
+            "message": message,
+            "error_dict": {"code": "source_discovery_failed", "message": message},
+            "finished_at": finished_at,
+            "emit_standalone_control_events": state.emit_standalone_control_events,
+            "triggered_by": "direct_cli" if not state.run_id else None,
+        }
+    )
+
+
+async def _initialize_discovery_persistence(state: _DiscoveryCommandState) -> None:
+    state.retry_parent_run_id = str(state.retry_of_run_id or "").strip() or None
+    requested_root_run_id = str(
+        state.mrf_discovery_root_run_id
+        or state.retry_parent_run_id
+        or state.control_run_id
+    ).strip()
+    state.checkpoint_root_run_id = requested_root_run_id
+    state.checkpoint_store = DatabaseDiscoveryCheckpointStore()
+    if not state.dry_run:
+        try:
+            await init_db(db, asyncio.get_event_loop())
+            await ensure_database(state.test_mode)
+            await _ensure_catalog_tables()
+            await push_objects(
+                [_discovery_crawl_run_row(state.run_context_dict, status="running")],
+                MRFCrawlRun,
+                rewrite=True,
+                use_copy=False,
+            )
+            if state.retry_parent_run_id:
+                state.resumed_source_rows = await state.checkpoint_store.resume_batch(
+                    requested_root_run_id,
+                    state.control_run_id,
+                    state.retry_parent_run_id,
+                )
+                if state.resumed_source_rows is None:
+                    state.checkpoint_root_run_id = state.control_run_id
+        except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+            await _record_discovery_command_failure(state, exc)
+            raise
+    state.run_params_dict["mrf_discovery_root_run_id"] = state.checkpoint_root_run_id
+    state.needs_source_load = bool(
+        state.dry_run or state.check_urls or state.crawl or not state.probe_files
+    )
+
+
+async def _load_discovery_candidates(
+    state: _DiscoveryCommandState,
+) -> list[SourceCandidate]:
+    candidates: list[SourceCandidate] = []
+    if not state.needs_source_load or state.resumed_source_rows is not None:
+        return candidates
+    provider_load_limit = (
+        None
+        if state.parsed_source_entity_types or state.parsed_source_payer_query
+        else state.bounded_limit
+    )
+    for index, provider_name in enumerate(state.providers):
+        try:
+            candidates.extend(
+                await _load_candidates(
+                    provider_name,
+                    test_mode=state.test_mode,
+                    limit=provider_load_limit,
+                )
+            )
+        except Exception as exc:
+            state.result.errors.append(
+                {"provider": provider_name, "message": str(exc)}
+            )
+        if state.control_run_id and not state.dry_run:
+            enqueue_live_progress(
+                run_id=state.control_run_id,
+                importer="mrf-source-discovery",
+                status="running",
+                phase="loading source providers",
+                unit="providers",
+                done=index + 1,
+                total=len(state.providers),
+                message=f"loaded {index + 1}/{len(state.providers)} providers",
+            )
+    return candidates
+
+
+def _filter_discovery_candidates(
+    state: _DiscoveryCommandState, candidates: list[SourceCandidate]
+) -> list[SourceCandidate]:
+    candidates = _dedupe_candidates(candidates)
+    if state.parsed_source_entity_types or state.parsed_source_payer_query:
+        filtered_candidates: list[SourceCandidate] = []
+        expansion_candidates: list[SourceCandidate] = []
+        query_can_expand = bool(
+            state.parsed_source_payer_query
+            and sum(
+                len(token)
+                for token in _query_tokens(state.parsed_source_payer_query)
+            )
+            >= 3
+        )
+        for candidate in candidates:
+            if _is_candidate_text_filter_match(
+                candidate,
+                entity_types=state.parsed_source_entity_types,
+                payer_query=state.parsed_source_payer_query,
+            ):
+                filtered_candidates.append(candidate)
+            elif query_can_expand and _is_candidate_query_expansion_supported(candidate):
+                expansion_candidates.append(
+                    _candidate_with_target_payer_query(
+                        candidate, state.parsed_source_payer_query or ""
+                    )
+                )
+        candidates = _dedupe_candidates(
+            filtered_candidates + _rank_query_expansion_candidates(expansion_candidates)
+        )
+    candidates = [
+        candidate for candidate in candidates if _has_candidate_catalog_source(candidate)
+    ]
+    return candidates[: state.bounded_limit] if state.bounded_limit else candidates
+
+
+async def _store_discovery_sources(
+    state: _DiscoveryCommandState, candidates: list[SourceCandidate]
+) -> list[dict[str, Any]]:
+    if state.result.errors:
+        provider_error = RuntimeError(
+            "MRF discovery provider loading failed; source set was not frozen"
+        )
+        await _record_discovery_command_failure(state, provider_error)
+        raise provider_error
+    if state.resumed_source_rows is None:
+        try:
+            payer_rows, source_rows = await _store_candidates(
+                candidates,
+                discovery_run_id=state.control_run_id,
+            )
+        except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+            await _record_discovery_command_failure(state, exc)
+            raise
+        state.result.payers = len(payer_rows)
+        return source_rows
+    source_rows = state.resumed_source_rows
+    state.result.candidates = len(source_rows)
+    state.result.payers = len(
+        {
+            str(source_row.get("payer_id") or "").strip()
+            for source_row in source_rows
+            if str(source_row.get("payer_id") or "").strip()
+        }
+    )
+    try:
+        await _retag_sources_for_discovery_run(source_rows, state.control_run_id)
+    except BaseException as exc:
+        await _record_discovery_command_failure(state, exc)
+        raise
+    return source_rows
+
+
+async def _execute_discovery_source_work(
+    state: _DiscoveryCommandState, source_rows: list[dict[str, Any]]
+) -> None:
+    if not state.needs_source_load:
+        return
+    try:
+        source_batch_summary = await _execute_discovery_source_batch(
+            DiscoverySourceBatchContext(
+                root_run_id=state.checkpoint_root_run_id,
+                owner_run_id=state.control_run_id,
+                source_records=source_rows,
+                concurrency=state.concurrency,
+                process_workers=state.process_workers,
+                processing_options=DiscoverySourceProcessingOptions(
+                    test_mode=state.test_mode,
+                    check_urls=state.check_urls,
+                    crawl=state.crawl,
+                    observation_run_id=state.control_run_id,
+                    max_toc_bytes=state.max_toc_bytes,
+                    crawl_target_limit=state.crawl_target_limit,
+                    target_concurrency=state.target_concurrency,
+                    http_connection_limit=state.source_http_connection_limit,
+                    http_per_host_limit=state.source_http_per_host_limit,
+                ),
+            ),
+            state.checkpoint_store,
+        )
+    except BaseException as exc:
+        if isinstance(exc, DiscoverySourceBatchIncomplete):
+            state.result.source_batch_summary = exc.summary
+        await _record_discovery_command_failure(state, exc)
+        raise
+    state.result.source_batch_summary = source_batch_summary
+    state.result.urls_checked = source_batch_summary.urls_checked
+    state.result.plans = source_batch_summary.plans_discovered
+    state.result.files = source_batch_summary.files_discovered
+    if state.crawl and not state.test_mode:
+        await refresh_catalog_paging_manifests(
+            source_rows,
+            source_discovery_run_id=state.control_run_id,
+        )
+
+
+async def _probe_discovery_files(
+    state: _DiscoveryCommandState,
+) -> list[dict[str, Any]]:
+    if not state.probe_files:
+        return []
+    try:
+        probe_observations, ok_count = await _probe_mrf_file_heads(
+            file_types=state.parsed_file_probe_types,
+            limit=state.file_probe_limit,
+            entity_types=state.parsed_file_probe_entity_types,
+            payer_query=state.parsed_file_probe_payer_query,
+            run_id=state.control_run_id,
+            progress_run_id=state.control_run_id,
+            concurrency=state.concurrency,
+        )
+    except BaseException as exc:
+        await _record_discovery_command_failure(state, exc)
+        raise
+    state.result.files_probed = len(probe_observations)
+    state.result.file_probe_ok = ok_count
+    state.result.urls_checked += len(probe_observations)
+    return probe_observations
+
+
+async def _persist_discovery_success(
+    state: _DiscoveryCommandState, observations: list[dict[str, Any]]
+) -> tuple[str, dt.datetime, int]:
+    crawl_status = "succeeded" if not state.result.errors else "succeeded_with_errors"
+    finished_at = _utc_now()
+    bytes_streamed = sum(
+        int(observation.get("content_length") or 0) for observation in observations
+    )
+    if state.result.source_batch_summary is not None:
+        bytes_streamed += state.result.source_batch_summary.bytes_streamed
+    try:
+        await push_objects(
+            [
+                _discovery_crawl_run_row(
+                    state.run_context_dict,
+                    status=crawl_status,
+                    result=state.result,
+                    finished_at=finished_at,
+                    bytes_streamed=bytes_streamed,
+                    error_dicts=state.result.errors,
+                )
+            ],
+            MRFCrawlRun,
+            rewrite=True,
+            use_copy=False,
+        )
+    except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+        await _record_discovery_command_failure(state, exc)
+        raise
+    return crawl_status, finished_at, bytes_streamed
+
+
+async def _publish_discovery_success(
+    state: _DiscoveryCommandState,
+    crawl_status: str,
+    finished_at: dt.datetime,
+    bytes_streamed: int,
+) -> None:
+    if not state.control_run_id:
+        return
+    enqueue_live_progress(
+        run_id=state.control_run_id,
+        importer="mrf-source-discovery",
+        status="succeeded",
+        phase="mrf source discovery complete",
+        unit="sources",
+        done=state.result.sources,
+        total=state.result.sources,
+        pct=100,
+        message="mrf source discovery complete",
+    )
+    if state.emit_standalone_control_events:
+        _emit_discovery_control_event(
+            state.run_context_dict,
+            status=_control_status_from_crawl_status(crawl_status),
+            phase_detail="mrf source discovery complete",
+            progress={
+                "unit": "sources",
+                "done": state.result.sources,
+                "total": state.result.sources,
+                "pct": 100,
+                "message": "mrf source discovery complete",
+                "phase": "mrf source discovery complete",
+            },
+            metrics=_discovery_control_metrics(
+                state.result,
+                crawl_status=crawl_status,
+                crawl_run_id=state.crawl_run_id,
+                run_mode=state.run_mode,
+                bytes_streamed=bytes_streamed,
+            ),
+            finished_at=finished_at,
+        )
+        await _flush_discovery_control_events(state.control_run_id)
+
+
+async def _execute_discovery_command(state: _DiscoveryCommandState) -> dict[str, Any]:
+    _normalize_discovery_command_state(state)
+    _initialize_discovery_command_context(state)
+    _announce_discovery_run(state)
+    await _initialize_discovery_persistence(state)
+    candidates = _filter_discovery_candidates(
+        state, await _load_discovery_candidates(state)
+    )
+    state.result.candidates = len(candidates)
+    if state.dry_run:
+        state.result.payers = len(
+            {_clean_text(candidate.payer_name).lower() for candidate in candidates}
+        )
+        state.result.sources = len(
+            [
+                candidate
+                for candidate in candidates
+                if candidate.index_url or candidate.human_url
+            ]
+        )
+        return state.result.as_dict()
+    source_rows = await _store_discovery_sources(state, candidates)
+    if (
+        state.needs_source_load
+        and not source_rows
+        and state.bounded_limit is None
+        and not state.parsed_source_entity_types
+        and not state.parsed_source_payer_query
+    ):
+        empty_source_error = RuntimeError(
+            "unbounded MRF discovery resolved an empty source set"
+        )
+        await _record_discovery_command_failure(state, empty_source_error)
+        raise empty_source_error
+    state.result.sources = len(source_rows)
+    await _execute_discovery_source_work(state, source_rows)
+    observations = await _probe_discovery_files(state)
+    crawl_status, finished_at, bytes_streamed = await _persist_discovery_success(
+        state, observations
+    )
+    await _publish_discovery_success(
+        state, crawl_status, finished_at, bytes_streamed
+    )
+    return state.result.as_dict()
+
+
 async def run_mrf_source_discovery_command(
     test_mode: bool = False,
     provider: str | None = None,
@@ -17154,417 +17765,29 @@ async def run_mrf_source_discovery_command(
     mrf_discovery_root_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Run source discovery with optional crawling and file probing."""
-    max_toc_bytes = max_toc_bytes or MAX_TOC_BYTES_DEFAULT
-    concurrency = max(1, int(concurrency or DEFAULT_CONCURRENCY))
-    crawl_target_limit = max(1, int(crawl_target_limit)) if crawl_target_limit else None
-    parsed_source_entity_types = _parse_text_filter_values(source_entity_types)
-    parsed_source_payer_query = _normalize_text_query(source_payer_query)
-    file_probe_limit = max(1, int(file_probe_limit)) if file_probe_limit else None
-    parsed_file_probe_types = _parse_file_probe_types(file_probe_types)
-    parsed_file_probe_entity_types = _parse_text_filter_values(file_probe_entity_types)
-    parsed_file_probe_payer_query = _normalize_text_query(file_probe_payer_query)
-    providers = _parse_provider_list(provider, test_mode=test_mode)
-    bounded_limit = max(1, int(limit)) if limit else (25 if test_mode else None)
-    process_workers = (
-        1
-        if test_mode or dry_run
-        else _discovery_process_worker_count(concurrency)
+    return await _execute_discovery_command(
+        _DiscoveryCommandState(
+            test_mode=test_mode,
+            provider=provider,
+            limit=limit,
+            source_entity_types=source_entity_types,
+            source_payer_query=source_payer_query,
+            dry_run=dry_run,
+            check_urls=check_urls,
+            crawl=crawl,
+            probe_files=probe_files,
+            file_probe_limit=file_probe_limit,
+            file_probe_types=file_probe_types,
+            file_probe_entity_types=file_probe_entity_types,
+            file_probe_payer_query=file_probe_payer_query,
+            max_toc_bytes=max_toc_bytes,
+            concurrency=concurrency,
+            crawl_target_limit=crawl_target_limit,
+            run_id=run_id,
+            retry_of_run_id=retry_of_run_id,
+            mrf_discovery_root_run_id=mrf_discovery_root_run_id,
+        )
     )
-    target_concurrency = 1 if test_mode else _discovery_target_concurrency()
-    global_http_connection_limit = _discovery_http_connection_limit(
-        concurrency,
-        target_concurrency,
-    )
-    global_http_per_host_limit = _discovery_http_per_host_limit()
-    (
-        source_http_connection_limit,
-        source_http_per_host_limit,
-    ) = _discovery_process_http_limits(
-        global_http_connection_limit,
-        global_http_per_host_limit,
-        process_workers,
-    )
-    discovery_result = DiscoveryResult(
-        providers=providers,
-        process_workers=process_workers,
-    )
-    started_at = _utc_now()
-    crawl_run_id = _id(
-        "mrfcrawl",
-        {
-            "started_at": started_at.isoformat(),
-            "providers": providers,
-            "run_id": run_id,
-        },
-    )
-    run_mode = _discovery_run_mode(
-        crawl=crawl, check_urls=check_urls, probe_files=probe_files
-    )
-    discovery_result.crawl_run_id = crawl_run_id
-    control_run_id = run_id or crawl_run_id
-    run_params_dict = {
-        "test_mode": test_mode,
-        "provider": provider,
-        "limit": limit,
-        "source_entity_types": list(parsed_source_entity_types),
-        "source_payer_query": parsed_source_payer_query,
-        "check_urls": check_urls,
-        "crawl": crawl,
-        "probe_files": probe_files,
-        "file_probe_limit": file_probe_limit,
-        "file_probe_types": list(parsed_file_probe_types),
-        "file_probe_entity_types": list(parsed_file_probe_entity_types),
-        "file_probe_payer_query": parsed_file_probe_payer_query,
-        "max_toc_bytes": max_toc_bytes,
-        "concurrency": concurrency,
-        "crawl_target_limit": crawl_target_limit,
-        "retry_of_run_id": retry_of_run_id,
-        "mrf_discovery_root_run_id": mrf_discovery_root_run_id,
-    }
-    run_params_dict["process_workers"] = process_workers
-    run_params_dict["target_concurrency"] = target_concurrency
-    run_params_dict["http_connection_limit"] = source_http_connection_limit
-    run_params_dict["http_per_host_limit"] = source_http_per_host_limit
-    run_params_dict["http_limit_scope"] = (
-        "shared_session" if process_workers == 1 else "per_process"
-    )
-    run_params_dict["http_global_connection_budget"] = global_http_connection_limit
-    run_params_dict["http_global_per_host_budget"] = global_http_per_host_limit
-    run_context_dict = {
-        "crawl_run_id": crawl_run_id,
-        "control_run_id": control_run_id,
-        "providers": providers,
-        "run_mode": run_mode,
-        "started_at": started_at,
-        "run_params": run_params_dict,
-    }
-    emit_standalone_control_events = bool(not dry_run and not run_id)
-    if emit_standalone_control_events:
-        _emit_discovery_control_event(
-            run_context_dict,
-            status="running",
-            phase_detail="loading source providers",
-            progress={
-                "unit": "providers",
-                "done": 0,
-                "total": len(providers),
-                "pct": 0,
-                "message": "loading source providers",
-                "phase": "loading source providers",
-            },
-            triggered_by="direct_cli" if not run_id else None,
-        )
-    if control_run_id and not dry_run:
-        enqueue_live_progress(
-            run_id=control_run_id,
-            importer="mrf-source-discovery",
-            status="running",
-            phase="loading source providers",
-            unit="providers",
-            done=0,
-            total=len(providers),
-            message="loading source providers",
-        )
-
-    retry_parent_run_id = str(retry_of_run_id or "").strip() or None
-    requested_root_run_id = str(
-        mrf_discovery_root_run_id or retry_parent_run_id or control_run_id
-    ).strip()
-    checkpoint_root_run_id = requested_root_run_id
-    checkpoint_store = DatabaseDiscoveryCheckpointStore()
-    resumed_source_rows: list[dict[str, Any]] | None = None
-    recorded_failure_run_ids: set[str] = set()
-
-    async def record_discovery_failure(exc: BaseException) -> None:
-        """Persist and publish a terminal failure without suppressing the original exception."""
-        if control_run_id in recorded_failure_run_ids:
-            return
-        recorded_failure_run_ids.add(control_run_id)
-        finished_at = _utc_now()
-        message = str(exc).strip() or exc.__class__.__name__
-        error_dict = {"code": "source_discovery_failed", "message": message}
-        await _record_failed_discovery_state(
-            {
-                "run_context_dict": run_context_dict,
-                "result": discovery_result,
-                "message": message,
-                "error_dict": error_dict,
-                "finished_at": finished_at,
-                "emit_standalone_control_events": emit_standalone_control_events,
-                "triggered_by": "direct_cli" if not run_id else None,
-            }
-        )
-
-    if not dry_run:
-        try:
-            await init_db(db, asyncio.get_event_loop())
-            await ensure_database(test_mode)
-            await _ensure_catalog_tables()
-            await push_objects(
-                [_discovery_crawl_run_row(run_context_dict, status="running")],
-                MRFCrawlRun,
-                rewrite=True,
-                use_copy=False,
-            )
-            if retry_parent_run_id:
-                resumed_source_rows = await checkpoint_store.resume_batch(
-                    requested_root_run_id,
-                    control_run_id,
-                    retry_parent_run_id,
-                )
-                if resumed_source_rows is None:
-                    checkpoint_root_run_id = control_run_id
-        except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
-            await record_discovery_failure(exc)
-            raise
-    run_params_dict["mrf_discovery_root_run_id"] = checkpoint_root_run_id
-
-    needs_source_load = bool(dry_run or check_urls or crawl or not probe_files)
-    candidates: list[SourceCandidate] = []
-    if needs_source_load and resumed_source_rows is None:
-        provider_load_limit = (
-            None
-            if parsed_source_entity_types or parsed_source_payer_query
-            else bounded_limit
-        )
-        for index, provider_name in enumerate(providers):
-            try:
-                candidates.extend(
-                    await _load_candidates(
-                        provider_name, test_mode=test_mode, limit=provider_load_limit
-                    )
-                )
-            except Exception as exc:
-                discovery_result.errors.append(
-                    {"provider": provider_name, "message": str(exc)}
-                )
-            if control_run_id and not dry_run:
-                enqueue_live_progress(
-                    run_id=control_run_id,
-                    importer="mrf-source-discovery",
-                    status="running",
-                    phase="loading source providers",
-                    unit="providers",
-                    done=index + 1,
-                    total=len(providers),
-                    message=f"loaded {index + 1}/{len(providers)} providers",
-                )
-    candidates = _dedupe_candidates(candidates)
-    if parsed_source_entity_types or parsed_source_payer_query:
-        filtered_candidates: list[SourceCandidate] = []
-        query_expansion_candidates: list[SourceCandidate] = []
-        query_can_expand = bool(
-            parsed_source_payer_query
-            and sum(len(token) for token in _query_tokens(parsed_source_payer_query)) >= 3
-        )
-        for candidate in candidates:
-            if _is_candidate_text_filter_match(
-                candidate,
-                entity_types=parsed_source_entity_types,
-                payer_query=parsed_source_payer_query,
-            ):
-                filtered_candidates.append(candidate)
-                continue
-            if query_can_expand and _is_candidate_query_expansion_supported(candidate):
-                query_expansion_candidates.append(
-                    _candidate_with_target_payer_query(
-                        candidate, parsed_source_payer_query or ""
-                    )
-                )
-        candidates = _dedupe_candidates(
-            filtered_candidates
-            + _rank_query_expansion_candidates(query_expansion_candidates)
-        )
-    candidates = [
-        candidate
-        for candidate in candidates
-        if _has_candidate_catalog_source(candidate)
-    ]
-    if bounded_limit:
-        candidates = candidates[:bounded_limit]
-    discovery_result.candidates = len(candidates)
-
-    if dry_run:
-        discovery_result.payers = len(
-            {_clean_text(candidate.payer_name).lower() for candidate in candidates}
-        )
-        discovery_result.sources = len(
-            [
-                candidate
-                for candidate in candidates
-                if candidate.index_url or candidate.human_url
-            ]
-        )
-        return discovery_result.as_dict()
-
-    if discovery_result.errors:
-        provider_error = RuntimeError(
-            "MRF discovery provider loading failed; source set was not frozen"
-        )
-        await record_discovery_failure(provider_error)
-        raise provider_error
-
-    if resumed_source_rows is None:
-        try:
-            payer_rows, source_rows = await _store_candidates(
-                candidates,
-                discovery_run_id=control_run_id,
-            )
-        except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
-            await record_discovery_failure(exc)
-            raise
-        discovery_result.payers = len(payer_rows)
-    else:
-        source_rows = resumed_source_rows
-        discovery_result.candidates = len(source_rows)
-        discovery_result.payers = len(
-            {
-                str(source_row.get("payer_id") or "").strip()
-                for source_row in source_rows
-                if str(source_row.get("payer_id") or "").strip()
-            }
-        )
-        try:
-            await _retag_sources_for_discovery_run(source_rows, control_run_id)
-        except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
-            await record_discovery_failure(exc)
-            raise
-    if (
-        needs_source_load
-        and not source_rows
-        and bounded_limit is None
-        and not parsed_source_entity_types
-        and not parsed_source_payer_query
-    ):
-        empty_source_error = RuntimeError(
-            "unbounded MRF discovery resolved an empty source set"
-        )
-        await record_discovery_failure(empty_source_error)
-        raise empty_source_error
-    discovery_result.sources = len(source_rows)
-    observations: list[dict[str, Any]] = []
-    observation_run_id = control_run_id
-    progress_run_id = control_run_id
-
-    if needs_source_load:
-        try:
-            source_batch_summary = await _execute_discovery_source_batch(
-                DiscoverySourceBatchContext(
-                    root_run_id=checkpoint_root_run_id,
-                    owner_run_id=control_run_id,
-                    source_records=source_rows,
-                    concurrency=concurrency,
-                    process_workers=process_workers,
-                    processing_options=DiscoverySourceProcessingOptions(
-                        test_mode=test_mode,
-                        check_urls=check_urls,
-                        crawl=crawl,
-                        observation_run_id=observation_run_id,
-                        max_toc_bytes=max_toc_bytes,
-                        crawl_target_limit=crawl_target_limit,
-                        target_concurrency=target_concurrency,
-                        http_connection_limit=source_http_connection_limit,
-                        http_per_host_limit=source_http_per_host_limit,
-                    ),
-                ),
-                checkpoint_store,
-            )
-        except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
-            if isinstance(exc, DiscoverySourceBatchIncomplete):
-                discovery_result.source_batch_summary = exc.summary
-            await record_discovery_failure(exc)
-            raise
-        discovery_result.source_batch_summary = source_batch_summary
-        discovery_result.urls_checked = source_batch_summary.urls_checked
-        discovery_result.plans = source_batch_summary.plans_discovered
-        discovery_result.files = source_batch_summary.files_discovered
-        if crawl and not test_mode:
-            await refresh_catalog_paging_manifests(
-                source_rows,
-                source_discovery_run_id=control_run_id,
-            )
-    if probe_files:
-        try:
-            probe_observations, ok_count = await _probe_mrf_file_heads(
-                file_types=parsed_file_probe_types,
-                limit=file_probe_limit,
-                entity_types=parsed_file_probe_entity_types,
-                payer_query=parsed_file_probe_payer_query,
-                run_id=observation_run_id,
-                progress_run_id=progress_run_id,
-                concurrency=concurrency,
-            )
-        except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
-            await record_discovery_failure(exc)
-            raise
-        observations.extend(probe_observations)
-        discovery_result.files_probed = len(probe_observations)
-        discovery_result.file_probe_ok = ok_count
-        discovery_result.urls_checked += len(probe_observations)
-    crawl_status = (
-        "succeeded" if not discovery_result.errors else "succeeded_with_errors"
-    )
-    finished_at = _utc_now()
-    bytes_streamed = sum(
-        int(observation.get("content_length") or 0) for observation in observations
-    )
-    if discovery_result.source_batch_summary is not None:
-        bytes_streamed += discovery_result.source_batch_summary.bytes_streamed
-    try:
-        await push_objects(
-            [
-                _discovery_crawl_run_row(
-                    run_context_dict,
-                    status=crawl_status,
-                    result=discovery_result,
-                    finished_at=finished_at,
-                    bytes_streamed=bytes_streamed,
-                    error_dicts=discovery_result.errors,
-                )
-            ],
-            MRFCrawlRun,
-            rewrite=True,
-            use_copy=False,
-        )
-    except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
-        await record_discovery_failure(exc)
-        raise
-    if control_run_id:
-        enqueue_live_progress(
-            run_id=control_run_id,
-            importer="mrf-source-discovery",
-            status="succeeded",
-            phase="mrf source discovery complete",
-            unit="sources",
-            done=discovery_result.sources,
-            total=discovery_result.sources,
-            pct=100,
-            message="mrf source discovery complete",
-        )
-        if emit_standalone_control_events:
-            _emit_discovery_control_event(
-                run_context_dict,
-                status=_control_status_from_crawl_status(crawl_status),
-                phase_detail="mrf source discovery complete",
-                progress={
-                    "unit": "sources",
-                    "done": discovery_result.sources,
-                    "total": discovery_result.sources,
-                    "pct": 100,
-                    "message": "mrf source discovery complete",
-                    "phase": "mrf source discovery complete",
-                },
-                metrics=_discovery_control_metrics(
-                    discovery_result,
-                    crawl_status=crawl_status,
-                    crawl_run_id=crawl_run_id,
-                    run_mode=run_mode,
-                    bytes_streamed=bytes_streamed,
-                ),
-                finished_at=finished_at,
-            )
-            await _flush_discovery_control_events(control_run_id)
-    return discovery_result.as_dict()
 
 
 main = run_mrf_source_discovery_command
