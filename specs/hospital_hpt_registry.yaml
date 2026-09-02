@@ -1708,6 +1708,7 @@ hospitals:
   name: Avera McKennan
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000514
+  alias_of: hospital-000513
   name: Avera McKennan Hospital and University Health Center
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000515
@@ -4740,9 +4741,12 @@ hospitals:
 - hospital_id: hospital-001432
   name: ClearVista Behavioral Health
   cms_hpt_url: https://newvistahealth.com/cms-hpt.txt
-- hospital_ids:
-  - hospital-001433
-  - hospital-001434
+- hospital_id: hospital-001433
+  alias_of: hospital-001435
+  name: Clearwater Valley Health
+  cms_hpt_url: https://smh-cvh.org/cms-hpt.txt
+- hospital_id: hospital-001434
+  alias_of: hospital-006080
   name: Clearwater Valley Health
   cms_hpt_url: https://smh-cvh.org/cms-hpt.txt
 - hospital_id: hospital-001435
@@ -5251,98 +5255,126 @@ hospitals:
   name: Cordova Community Medical Center
   cms_hpt_url: https://www.cdvcmc.com/cms-hpt.txt
 - hospital_id: hospital-001586
+  alias_of: hospital-001587
   name: Corewell Health Big Rapids
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001587
   name: Corewell Health Big Rapids Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
+  locator_name: Corewell Health Big Rapids
 - hospital_id: hospital-001588
   name: Corewell Health Blodgett Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001589
+  alias_of: hospital-001590
   name: Corewell Health Gerber
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001590
   name: Corewell Health Gerber Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
+  locator_name: Corewell Health Gerber
 - hospital_id: hospital-001591
+  alias_of: hospital-001592
   name: Corewell Health Greenville
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001592
   name: Corewell Health Greenville Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
+  locator_name: Corewell Health Greenville
 - hospital_id: hospital-001593
+  alias_of: hospital-001594
   name: Corewell Health Gross Pointe
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001594
   name: Corewell Health Grosse Pointe Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
+  locator_name: Corewell Health Gross Pointe
 - hospital_id: hospital-001595
   name: Corewell Health Helen Devos Children’s Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001596
   name: Corewell Health Lakeland Hospitals Niles Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
+  locator_name: Corewell Health Lakeland Niles
 - hospital_id: hospital-001597
   name: Corewell Health Lakeland Hospitals St. Joseph Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
+  locator_name: Corewell Health Lakeland St. Joseph
 - hospital_id: hospital-001598
+  alias_of: hospital-001596
   name: Corewell Health Lakeland Niles
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001599
+  alias_of: hospital-001597
   name: Corewell Health Lakeland St. Joseph
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001600
+  alias_of: hospital-001612
   name: Corewell Health Lakeland Watervliet
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001601
+  alias_of: hospital-001602
   name: Corewell Health Ludington
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001602
   name: Corewell Health Ludington Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
+  locator_name: Corewell Health Ludington
 - hospital_id: hospital-001603
+  alias_of: hospital-001604
   name: Corewell Health Reed City
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001604
   name: Corewell Health Reed City Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
+  locator_name: Corewell Health Reed City
 - hospital_id: hospital-001605
   name: Corewell Health Royal Oak
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001606
+  alias_of: hospital-001607
   name: Corewell Health Taylor
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001607
   name: Corewell Health Taylor Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
+  locator_name: Corewell Health Taylor
 - hospital_id: hospital-001608
+  alias_of: hospital-001609
   name: Corewell Health Trenton
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001609
   name: Corewell Health Trenton Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
+  locator_name: Corewell Health Trenton
 - hospital_id: hospital-001610
+  alias_of: hospital-001611
   name: Corewell Health Troy
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001611
   name: Corewell Health Troy Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
+  locator_name: Corewell Health Troy
 - hospital_id: hospital-001612
   name: Corewell Health Watervliet Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
+  locator_name: Corewell Health Lakeland Watervliet
 - hospital_id: hospital-001613
+  alias_of: hospital-001614
   name: Corewell Health Wayne
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001614
   name: Corewell Health Wayne Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
+  locator_name: Corewell Health Wayne
 - hospital_id: hospital-001615
+  alias_of: hospital-001616
   name: Corewell Health Zeeland
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
 - hospital_id: hospital-001616
   name: Corewell Health Zeeland Community Hospital
   cms_hpt_url: https://corewellhealth.org/cms-hpt.txt
+  locator_name: Corewell Health Zeeland
 - hospital_id: hospital-001617
   name: Cornell Institute for Rehabilitation Medicine
   cms_hpt_url: https://baptisthealth.net/cms-hpt.txt
@@ -15024,9 +15056,11 @@ hospitals:
   name: New Orleans East Hospital
   cms_hpt_url: https://www.lcmchealth.org/cms-hpt.txt
 - hospital_id: hospital-004534
+  alias_of: hospital-000825
   name: New Orleans Hospital
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-004535
+  alias_of: hospital-000826
   name: New Orleans Westbank Hospital
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-004536
@@ -21147,9 +21181,12 @@ hospitals:
 - hospital_id: hospital-006395
   name: Tahoe Forest Health System
   cms_hpt_url: https://www.tfhd.com/cms-hpt.txt
-- hospital_ids:
-  - hospital-006396
-  - hospital-006397
+- hospital_id: hospital-006396
+  alias_of: hospital-003096
+  name: Tahoe Forest Hospital District
+  cms_hpt_url: https://www.tfhd.com/cms-hpt.txt
+- hospital_id: hospital-006397
+  alias_of: hospital-006395
   name: Tahoe Forest Hospital District
   cms_hpt_url: https://www.tfhd.com/cms-hpt.txt
 - hospital_id: hospital-006398

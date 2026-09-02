@@ -139,17 +139,25 @@ def test_parser_flushes_final_record_without_trailing_newline():
 
 
 def test_parser_accepts_bare_absolute_mrf_url_line():
-    assert locator.parse_hospital_hpt_locator(
+    record_prefix = (
         b"location-name: Hospital\n"
         b"source-page-url: https://hospital.example/prices\n"
-        b"https://files.example/mrf.json\n"
+    )
+    assert locator.parse_hospital_hpt_locator(
+        record_prefix + b"https://files.example/mrf.json\n"
     ) == (_record("Hospital"),)
-
     assert locator.parse_hospital_hpt_locator(
-        b"location-name: Hospital\n"
-        b"source-page-url: https://hospital.example/prices\n"
-        b"HTTPS://files.example/mrf.json\n"
+        record_prefix + b"HTTPS://files.example/mrf.json\n"
     ) == (_record("Hospital", "HTTPS://files.example/mrf.json"),)
+    assert locator.parse_hospital_hpt_locator(
+        record_prefix + b"mrf-url:\nhttps://files.example/mrf.json\n"
+    ) == (_record("Hospital"),)
+    with pytest.raises(locator.HospitalHptLocatorError, match="line"):
+        locator.parse_hospital_hpt_locator(
+            record_prefix
+            + b"https://files.example/one.json\n"
+            + b"https://files.example/two.json\n"
+        )
 
     with pytest.raises(locator.HospitalHptLocatorError, match="mrf_url"):
         locator.parse_hospital_hpt_locator(
@@ -161,6 +169,59 @@ def test_parser_accepts_bare_absolute_mrf_url_line():
             b"location-name: Hospital\n"
             b"source-page-url:\n"
             b"https://files.example/mrf.json\n"
+        )
+
+
+def test_parser_accepts_preamble_only_before_first_record():
+    payload = (
+        b"Hospital price transparency files\nDocumentation: https://hospital.example/prices\n* Updated monthly\n\nlocation-name: Hospital One\n"
+        b"source-page-url: https://hospital.example/one\nmrf-url: https://files.example/one.csv?download=1\n"
+        b"location-name: Hospital Two\nmrf-url: https://files.example/two.csv\n"
+    )
+    assert locator.parse_hospital_hpt_locator(payload) == (
+        _record("Hospital One", "https://files.example/one.csv?download=1"),
+        _record("Hospital Two", "https://files.example/two.csv"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        (b"banner only\n", "empty"),
+        (b"mrf-url: https://files.example/unbound.csv\nlocation-name: Hospital\nmrf-url: https://files.example/bound.csv\n", "location_name"),
+        (b"location-name: Hospital\nsource-page-url: https://hospital.example/prices\nmrf-url:\ncontact-email: team@example.com\nhttps://files.example/mrf.csv\n", "mrf_url"),
+        (b"banner\nlocation-name:\nmrf-url: https://files.example/mrf.csv\n", "location_name"),
+        (b"banner\nlocation-name: Hospital\nmalformed\n", "line"),
+        (
+            b"location-name: One\nmrf-url: https://files.example/one.csv\n"
+            b"separator\nlocation-name: Two\nmrf-url: https://files.example/two.csv\n",
+            "line",
+        ),
+    ],
+)
+def test_parser_keeps_strict_lines_after_preamble(payload, reason):
+    with pytest.raises(locator.HospitalHptLocatorError, match=reason):
+        locator.parse_hospital_hpt_locator(payload)
+
+
+def test_parser_accepts_contact_name_suffix_only_on_mrf_url():
+    assert locator.parse_hospital_hpt_locator(
+        b"location-name: Hospital\n"
+        b"mrf-url: https://files.example/mrf.csv contact-name: Price Team\n"
+    ) == (_record("Hospital", "https://files.example/mrf.csv"),)
+
+    for suffix in (b"contact-name:", b"contact-email: team@example.com"):
+        with pytest.raises(locator.HospitalHptLocatorError, match="mrf_url"):
+            locator.parse_hospital_hpt_locator(
+                b"location-name: Hospital\n"
+                b"mrf-url: https://files.example/mrf.csv " + suffix + b"\n"
+            )
+
+    with pytest.raises(locator.HospitalHptLocatorError, match="duplicate_field"):
+        locator.parse_hospital_hpt_locator(
+            b"location-name: Hospital\n"
+            b"mrf-url:\n"
+            b"mrf-url: https://files.example/mrf.csv\n"
         )
 
 
