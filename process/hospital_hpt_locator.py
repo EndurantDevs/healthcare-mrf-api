@@ -18,6 +18,20 @@ MAX_HOSPITAL_HPT_LOCATOR_BYTES = 1_000_000
 _HOSPITAL_MRF_CREDENTIAL_QUERY_KEYS = frozenset(
     PTG2_STRIPPED_QUERY_PARAMS
 ) | {"si", "sr"}
+_MRF_URL_WITH_CONTACT_NAME = re.compile(
+    r"(?P<url>https?://\S+)\s+contact-name:\s*(?P<name>\S(?:.*\S)?)",
+    re.IGNORECASE,
+)
+_LOCATOR_RECORD_FIELDS = frozenset(
+    {
+        "contact-email",
+        "contact-name",
+        "location name",
+        "location-name",
+        "mrf-url",
+        "source-page-url",
+    }
+)
 
 
 class HospitalHptLocatorError(ValueError):
@@ -107,48 +121,105 @@ def _record(fields: Mapping[str, str]) -> HospitalHptLocatorRecord:
     )
 
 
-def _line_field(
-    line: str, fields_by_key: Mapping[str, str]
-) -> tuple[str, str]:
+def _line_fields(
+    line: str,
+    fields_by_key: Mapping[str, str],
+    is_empty_mrf_continuation_allowed: bool,
+) -> tuple[tuple[tuple[str, str], ...], bool]:
     stripped_line = line.strip()
+    has_mrf_url = "mrf-url" in fields_by_key
     if (
         stripped_line.casefold().startswith(("http://", "https://"))
         and fields_by_key.get("location-name")
         and fields_by_key.get("source-page-url")
-        and "mrf-url" not in fields_by_key
+        and (
+            not has_mrf_url
+            or (
+                is_empty_mrf_continuation_allowed
+                and not fields_by_key["mrf-url"]
+            )
+        )
     ):
-        return "mrf-url", stripped_line
+        return (("mrf-url", stripped_line),), has_mrf_url
     raw_key, separator, raw_value = line.partition(":")
     key = raw_key.strip().casefold()
     if key == "location name":
         key = "location-name"
     if not separator or not key:
         raise _locator_error("line")
-    return key, raw_value.strip()
+    field_value = raw_value.strip()
+    contact_match = (
+        _MRF_URL_WITH_CONTACT_NAME.fullmatch(field_value)
+        if key == "mrf-url"
+        else None
+    )
+    if contact_match:
+        return (
+            (
+                ("mrf-url", contact_match.group("url")),
+                ("contact-name", contact_match.group("name")),
+            ),
+            False,
+        )
+    return ((key, field_value),), False
 
 
 def parse_hospital_hpt_locator(
-    payload: bytes,
+    locator_payload: bytes,
 ) -> tuple[HospitalHptLocatorRecord, ...]:
     """Parse a bounded UTF-8 locator into validated location records."""
 
-    records: list[HospitalHptLocatorRecord] = []
+    locator_records: list[HospitalHptLocatorRecord] = []
     fields_by_key: dict[str, str] = {}
-    for line in _decoded_locator(payload).split("\n"):
+    has_records_started = False
+    is_empty_mrf_continuation_allowed = False
+    for line in _decoded_locator(locator_payload).split("\n"):
         if not line.strip():
             continue
-        key, value = _line_field(line, fields_by_key)
-        if key == "location-name" and key in fields_by_key:
-            records.append(_record(fields_by_key))
-            fields_by_key = {}
-        if key in fields_by_key:
-            raise _locator_error("duplicate_field")
-        fields_by_key[key] = value
+        if not has_records_started:
+            raw_key, separator, _raw_value = line.partition(":")
+            candidate_key = raw_key.strip().casefold()
+            is_location_marker = candidate_key in {
+                "location-name",
+                "location name",
+            }
+            is_malformed_location_marker = (
+                not separator
+                and candidate_key.startswith(
+                    ("location-name ", "location name ")
+                )
+            )
+            if not is_location_marker and not is_malformed_location_marker:
+                is_recognized_field = candidate_key in _LOCATOR_RECORD_FIELDS
+                is_malformed_field = not separator and any(
+                    candidate_key.startswith(f"{field} ")
+                    for field in _LOCATOR_RECORD_FIELDS
+                )
+                if is_recognized_field or is_malformed_field:
+                    raise _locator_error(
+                        "location_name" if separator else "line"
+                    )
+                continue
+            has_records_started = True
+        line_fields, replaces_empty_mrf_url = _line_fields(
+            line, fields_by_key, is_empty_mrf_continuation_allowed
+        )
+        is_empty_mrf_continuation_allowed = line_fields == (("mrf-url", ""),)
+        for key, field_value in line_fields:
+            if key == "location-name" and key in fields_by_key:
+                locator_records.append(_record(fields_by_key))
+                fields_by_key = {}
+            if key in fields_by_key:
+                if replaces_empty_mrf_url and key == "mrf-url":
+                    fields_by_key[key] = field_value
+                    continue
+                raise _locator_error("duplicate_field")
+            fields_by_key[key] = field_value
     if fields_by_key:
-        records.append(_record(fields_by_key))
-    if not records:
+        locator_records.append(_record(fields_by_key))
+    if not locator_records:
         raise _locator_error("empty")
-    return tuple(records)
+    return tuple(locator_records)
 
 
 def normalized_hospital_location_name(value: str) -> str:
