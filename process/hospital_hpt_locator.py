@@ -142,6 +142,8 @@ def _line_fields(
     ):
         return (("mrf-url", stripped_line),), has_mrf_url
     if stripped_line.casefold().startswith(("http://", "https://")):
+        if not fields_by_key.get("mrf-url"):
+            raise _locator_error("mrf_url")
         raise _locator_error("line")
     raw_key, separator, raw_value = line.partition(":")
     key = raw_key.strip().casefold()

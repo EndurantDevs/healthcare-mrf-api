@@ -139,31 +139,24 @@ def test_parser_flushes_final_record_without_trailing_newline():
 
 
 def test_parser_accepts_bare_absolute_mrf_url_line():
-    assert locator.parse_hospital_hpt_locator(
+    record_prefix = (
         b"location-name: Hospital\n"
         b"source-page-url: https://hospital.example/prices\n"
-        b"https://files.example/mrf.json\n"
+    )
+    assert locator.parse_hospital_hpt_locator(
+        record_prefix + b"https://files.example/mrf.json\n"
     ) == (_record("Hospital"),)
-
     assert locator.parse_hospital_hpt_locator(
-        b"location-name: Hospital\n"
-        b"source-page-url: https://hospital.example/prices\n"
-        b"HTTPS://files.example/mrf.json\n"
+        record_prefix + b"HTTPS://files.example/mrf.json\n"
     ) == (_record("Hospital", "HTTPS://files.example/mrf.json"),)
-
     assert locator.parse_hospital_hpt_locator(
-        b"location-name: Hospital\n"
-        b"source-page-url: https://hospital.example/prices\n"
-        b"mrf-url:\n"
-        b"https://files.example/mrf.json\n"
+        record_prefix + b"mrf-url:\nhttps://files.example/mrf.json\n"
     ) == (_record("Hospital"),)
-
     with pytest.raises(locator.HospitalHptLocatorError, match="line"):
         locator.parse_hospital_hpt_locator(
-            b"location-name: Hospital\n"
-            b"source-page-url: https://hospital.example/prices\n"
-            b"https://files.example/one.json\n"
-            b"https://files.example/two.json\n"
+            record_prefix
+            + b"https://files.example/one.json\n"
+            + b"https://files.example/two.json\n"
         )
 
     with pytest.raises(locator.HospitalHptLocatorError, match="mrf_url"):
@@ -185,7 +178,6 @@ def test_parser_accepts_preamble_only_before_first_record():
         b"source-page-url: https://hospital.example/one\nmrf-url: https://files.example/one.csv?download=1\n"
         b"location-name: Hospital Two\nmrf-url: https://files.example/two.csv\n"
     )
-
     assert locator.parse_hospital_hpt_locator(payload) == (
         _record("Hospital One", "https://files.example/one.csv?download=1"),
         _record("Hospital Two", "https://files.example/two.csv"),
