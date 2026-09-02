@@ -70,5 +70,5 @@ async def test_authority_revision_observes_a_b_a_and_replays_latest_identically(
     assert third.proof_id == first.proof_id
     assert replay.payload == third.payload
     assert revisions.await_count == 3
-    assert ensure_proof.await_count == 3
+    assert ensure_proof.await_count == 4
     assert store.await_count == 3

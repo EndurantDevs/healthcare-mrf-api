@@ -263,7 +263,8 @@ async def test_attestation_rejects_stale_header_proposal(monkeypatch):
     register = AsyncMock()
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
     monkeypatch.setattr(selection.db, "transaction", _transaction)
-    monkeypatch.setattr(selection.db, "status", AsyncMock())
+    transaction_status = AsyncMock()
+    monkeypatch.setattr(selection.db, "status", transaction_status)
     monkeypatch.setattr(
         selection,
         "_compute_current_selection",
@@ -278,6 +279,13 @@ async def test_attestation_rejects_stale_header_proposal(monkeypatch):
         )
 
     register.assert_not_awaited()
+    assert transaction_status.await_count == 2
+    assert "REPEATABLE READ" in transaction_status.await_args_list[0].args[0]
+    assert (
+        "provider_directory_profile_selection_proof"
+        in transaction_status.await_args_list[1].args[0]
+    )
+    assert "SHARE ROW EXCLUSIVE" in transaction_status.await_args_list[1].args[0]
 
 
 @pytest.mark.asyncio
