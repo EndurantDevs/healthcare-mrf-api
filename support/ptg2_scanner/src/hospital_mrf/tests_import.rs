@@ -314,7 +314,6 @@
                 "\\N"
             ]
         );
-
         let wide = append_csv_row(
             &fixture_wide_csv(),
             &[
@@ -335,7 +334,6 @@
             &wide_payer_fields[5..],
             &["\\N", "\\N", "\\N", "62.5", "\\N"]
         );
-
         let merged_wide = append_csv_row(
             &fixture_wide_csv(),
             &[
@@ -434,7 +432,6 @@
         let payer = String::from_utf8(rows["modifier_payer"].clone()).unwrap();
         let fields = payer.trim_end().split('\t').collect::<Vec<_>>();
         assert_eq!(&fields[3..8], &["\\N", "\\N", "\\N", "\\N", "150"]);
-
         let note_only = append_csv_row(
             &fixture_tall_csv(),
             &[
