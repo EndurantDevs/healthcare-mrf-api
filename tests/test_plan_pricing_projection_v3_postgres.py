@@ -44,10 +44,10 @@ EM_DISTANCE_MIGRATION_PATH = (
 )
 
 
-def _migration_statements_for(
+def _factorized_migration_statements(
     monkeypatch,
     schema: str,
-    migration_path: Path,
+    migration_path: Path = MIGRATION_PATH,
 ) -> list[str]:
     module_spec = importlib.util.spec_from_file_location(
         f"{migration_path.stem}_{schema}", migration_path
@@ -275,7 +275,7 @@ async def _assert_em_distance_ready_nulls(
         f"hprelease_{'A' * 26}",
         "c" * 64,
     )
-    for statement in _migration_statements_for(
+    for statement in _factorized_migration_statements(
         monkeypatch, schema, EM_DISTANCE_MIGRATION_PATH
     ):
         await admin.execute(statement)
@@ -394,9 +394,7 @@ async def test_factorized_pack_receipt_is_sql_bound_and_immutable(monkeypatch):
         await _create_import_run_stub(admin, schema)
         for statement in _migration_statements(monkeypatch, schema):
             await admin.execute(statement)
-        for statement in _migration_statements_for(
-            monkeypatch, schema, MIGRATION_PATH
-        ):
+        for statement in _factorized_migration_statements(monkeypatch, schema):
             await admin.execute(statement)
         await _insert_candidate(admin, schema, projection_id, digest)
         await _assert_rate_profile_order_rejected(admin, schema, projection_id)
