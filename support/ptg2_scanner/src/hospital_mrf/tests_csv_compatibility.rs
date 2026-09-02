@@ -1,4 +1,22 @@
     #[test]
+    fn csv_skips_wholly_blank_records_around_structural_rows() {
+        let payload = fixture_tall_csv();
+        let expected = run_fixture(InputFormat::TallCsv, &payload, false);
+        let mut records = csv_fixture_records(&payload);
+        let width = records[0].len();
+        records.insert(1, vec![String::new(); width]);
+        let mut whitespace = vec![String::new(); width];
+        whitespace[0] = " ".to_owned();
+        records.insert(3, whitespace);
+        records.insert(5, vec![String::new(); width]);
+
+        assert_eq!(
+            expected,
+            run_fixture(InputFormat::TallCsv, &csv_fixture_bytes(&records), false)
+        );
+    }
+
+    #[test]
     fn gross_cash_only_csv_rows_ignore_zero_count_payer_fields() {
         let tall = append_csv_row(
             &fixture_tall_csv(),

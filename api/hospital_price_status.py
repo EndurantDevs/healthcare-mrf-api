@@ -44,7 +44,8 @@ SELECT hospital.hospital_id,
        current.npi_count,
        current.tax_identity_count,
        version.template_version,
-       version.source_format
+       version.source_format,
+       version.last_updated_on
   FROM {_SCHEMA}.hospital_price_hospital AS hospital
   LEFT JOIN {_SCHEMA}.hospital_price_current AS current
     ON current.hospital_id = hospital.hospital_id
@@ -75,7 +76,7 @@ def _row_mapping(row: Any) -> Mapping[str, Any]:
     return mapping if isinstance(mapping, Mapping) else {}
 
 
-def _timestamp_text(value: dt.datetime | None) -> str | None:
+def _timestamp_text(value: dt.date | dt.datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
@@ -98,6 +99,7 @@ def _publication_item(row: Mapping[str, Any]) -> dict[str, Any] | None:
         "version_id": row["version_id"],
         "template_version": row.get("template_version"),
         "source_format": row.get("source_format"),
+        "last_updated_on": _timestamp_text(row.get("last_updated_on")),
         "generation": row.get("generation"),
         "last_success_at": _timestamp_text(row.get("last_success_at")),
         "service_count": row.get("service_count"),

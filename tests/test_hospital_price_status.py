@@ -17,6 +17,7 @@ class _FakeDb:
 
     async def all(self, statement):
         assert "hospital_price_current" in statement
+        assert "version.last_updated_on" in statement
         return self.rows
 
 
@@ -130,6 +131,7 @@ async def test_page_keeps_latest_attempt_separate_from_last_good_publication():
             "tax_identity_count": 1,
             "template_version": "3.0.0",
             "source_format": "json",
+            "last_updated_on": dt.date(2026, 8, 23),
         },
         {
             "hospital_id": "hospital-000002",
@@ -146,6 +148,7 @@ async def test_page_keeps_latest_attempt_separate_from_last_good_publication():
     assert latest_attempt["started_at"] == "2026-08-25T17:11:18+00:00"
     assert latest_attempt["finished_at"] == "2026-08-25T17:11:19+00:00"
     assert publication["generation"] == 2
+    assert publication["last_updated_on"] == "2026-08-23"
     assert publication["last_success_at"] == "2026-08-24T12:00:00+00:00"
     assert page["next_cursor"] == "hospital-000001"
     assert page["summary"] == {

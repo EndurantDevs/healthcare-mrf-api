@@ -203,10 +203,15 @@ def detect_hospital_mrf_format(
         payload_stream, encoding="utf-8-sig", errors="surrogateescape", newline=""
     ) as text_source:
         reader = csv.reader(text_source)
+        structural_rows = (
+            csv_record
+            for csv_record in reader
+            if any(field.strip() for field in csv_record)
+        )
         try:
-            next(reader)
-            next(reader)
-            headers = next(reader)
+            next(structural_rows)
+            next(structural_rows)
+            headers = next(structural_rows)
         except (StopIteration, csv.Error) as exc:
             raise ValueError("hospital CSV is missing its three header rows") from exc
     normalized_headers = {header.strip().casefold() for header in headers}
