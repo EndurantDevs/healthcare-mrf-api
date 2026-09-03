@@ -720,6 +720,7 @@ hospitals:
 - hospital_id: hospital-000215
   name: Anna Jaques Hospital
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://ajh.org/832671600_anna-jaques-hospital_standardcharges.json
 - hospital_id: hospital-000216
   name: Annie Jeffrey Memorial County Health Center
   cms_hpt_url: http://www.ajhc.org/cms-hpt.txt
@@ -2920,6 +2921,7 @@ hospitals:
 - hospital_id: hospital-000872
   name: Beth Israel Deaconess Hospital-Milton Inc
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://bidmilton.org/042103604_beth-israel-deaconess-hospital-milton-inc_standardcharges.json
 - hospital_id: hospital-000873
   alias_of: hospital-000872
   name: Beth Israel Deaconess Hospital–Milton
@@ -2927,12 +2929,15 @@ hospitals:
 - hospital_id: hospital-000874
   name: Beth Israel Deaconess Hospital–Needham
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://bidneedham.org/043229679_beth-israel-deaconess-hospital---needham_standardcharges.json
 - hospital_id: hospital-000875
   name: Beth Israel Deaconess Hospital–Plymouth
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://bidplymouth.org/222667354_beth-israel-deaconess-hospital---plymouth_standardcharges.json
 - hospital_id: hospital-000876
   name: Beth Israel Deaconess Medical Center
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://bidmc.org/042103881_beth-israel-deaconess-medical-center_standardcharges.json
 - hospital_id: hospital-000877
   name: Bethany Children's Health Center
   cms_hpt_url: https://www.bethanychildrens.org/cms-hpt.txt
@@ -3123,6 +3128,7 @@ hospitals:
   name: BON AIR SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-000933
   name: Bon Secours Community Hospital
   cms_hpt_url: https://www.wmchealth.org/cms-hpt.txt
@@ -4072,6 +4078,7 @@ hospitals:
   name: CHESTER SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-001218
   name: Chestnut Hill Mental Health Center, Inc.
   cms_hpt_url: https://havenwoodbehavioral.com/cms-hpt.txt
@@ -7184,6 +7191,7 @@ hospitals:
 - hospital_id: hospital-002167
   name: Exeter Hospital
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://exeterhospital.org/222674014_exeter-hospital-standardcharges.json
 - hospital_id: hospital-002168
   alias_of: hospital-002167
   name: Exeter Hospital Inc
@@ -8377,6 +8385,7 @@ hospitals:
   name: HANOVER SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-002524
   name: Hansford County Hospital District
   cms_hpt_url: https://hchd.net/cms-hpt.txt
@@ -10269,6 +10278,7 @@ hospitals:
   name: HULL STREET SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-003084
   name: Humboldt County Memorial Hospital
   cms_hpt_url: https://www.humboldthospital.org/cms-hpt.txt
@@ -11383,6 +11393,7 @@ hospitals:
   name: LABURNUM SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-003425
   name: Lackey Memorial Hospital
   cms_hpt_url: https://lackeymemorialhospital.com/cms-hpt.txt
@@ -11411,12 +11422,15 @@ hospitals:
 - hospital_id: hospital-003432
   name: Lahey Hospital & Medical Center
   cms_hpt_url: https://www.lahey.org/cms-hpt.txt
+  fallback_mrf_url: https://www.lahey.org/042704686_lahey-hospital-medical-center-burlington_standardcharges.json
 - hospital_id: hospital-003433
   name: Lahey Hospital & Medical Center, Burlington
   cms_hpt_url: https://www.lahey.org/cms-hpt.txt
+  fallback_mrf_url: https://www.lahey.org/042704686_lahey-hospital-medical-center-burlington_standardcharges.json
 - hospital_id: hospital-003434
   name: Lahey Medical Center, Peabody
   cms_hpt_url: https://www.lahey.org/cms-hpt.txt
+  fallback_mrf_url: https://www.lahey.org/042704686_lahey-hospital-medical-center-burlington_standardcharges.json
 - hospital_id: hospital-003435
   name: Lake Behavioral Hospital
   cms_hpt_url: https://lakebehavioralhospital.com/cms-hpt.txt
@@ -14143,6 +14157,7 @@ hospitals:
   name: MIDTOWN SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-004256
   name: Midwest Medical Center
   cms_hpt_url: https://www.midwestmedicalcenter.org/cms-hpt.txt
@@ -14452,6 +14467,7 @@ hospitals:
 - hospital_id: hospital-004348
   name: Mount Auburn Hospital
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://mountauburnhospital.org/042103606_mount-auburn-hospital_standardcharges.json
 - hospital_id: hospital-004349
   name: Mount Carmel Behavioral Health
   cms_hpt_url: https://www.mountcarmelbehavioralhealth.com/cms-hpt.txt
@@ -15093,6 +15109,7 @@ hospitals:
 - hospital_id: hospital-004531
   name: New England Baptist Hospital
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://nebh.org/042103612_new-england-baptist-hospital_standardcharges.json
 - hospital_id: hospital-004532
   name: New England Rehabilitation Hospital of Portland, a Joint Venture of Maine Medical Center and Encompass Health
   cms_hpt_url: https://www.encompasshealth.com/cms-hpt.txt
@@ -17892,6 +17909,7 @@ hospitals:
   name: REYNOLDS SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-005392
   name: Rhode Island Hospital
   cms_hpt_url: https://www.brownhealth.org/cms-hpt.txt
@@ -18335,6 +18353,7 @@ hospitals:
   name: SAI OP
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
   locator_name: Sheltering Arms Institute
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-005527
   name: Saint Agnes Medical Center
   cms_hpt_url: https://www.samc.com/cms-hpt.txt
@@ -19072,6 +19091,7 @@ hospitals:
 - hospital_id: hospital-005748
   name: Sheltering Arms Institute
   cms_hpt_url: https://shelteringarmsinstitute.com/cms-hpt.txt
+  fallback_mrf_url: https://shelteringarmsinstitute.com/wp-content/uploads/2026/04/Price-Transparency-File-January-2026-SAI.csv
 - hospital_id: hospital-005749
   name: Shenandoah Medical Center
   cms_hpt_url: https://smchospital.com/cms-hpt.txt
@@ -23796,6 +23816,7 @@ hospitals:
 - hospital_id: hospital-007179
   name: Winchester Hospital
   cms_hpt_url: https://bilh.org/cms-hpt.txt
+  fallback_mrf_url: https://winchesterhospital.org/042104434_winchester-hospital_standardcharges.json
 - hospital_id: hospital-007180
   name: WINDHAM COMMUNITY MEMORIAL HOSPITAL
   cms_hpt_url: https://windhamhospital.org/cms-hpt.txt
