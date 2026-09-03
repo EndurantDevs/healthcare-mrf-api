@@ -11,6 +11,8 @@ from process.control_cancel import ImportCancelledError
 from process.ptg_parts.artifacts import PTG2ArtifactStore
 from process.ptg_parts.domain import PTG2RawArtifact
 
+_RUNTIME_USER_AGENT = "Python/3.12 aiohttp/3.11"
+
 
 async def download_hospital_source(
     download: Callable[..., Awaitable[PTG2RawArtifact]],
@@ -19,10 +21,11 @@ async def download_hospital_source(
     max_bytes: int,
     user_agent: str,
 ) -> PTG2RawArtifact:
-    """Retry an exact pre-body 403 once with the shared default user agent."""
+    """Retry an exact pre-body 403 with the approved source agents."""
 
     first_error: Exception | None = None
-    for user_agent_override in (user_agent, None):
+    user_agent_overrides = (user_agent, None, _RUNTIME_USER_AGENT)
+    for index, user_agent_override in enumerate(user_agent_overrides):
         try:
             return await download(
                 url, store=store, reuse_raw_artifacts=False,
@@ -35,7 +38,7 @@ async def download_hospital_source(
             if first_error is None:
                 first_error = exc
             if not (
-                user_agent_override is not None
+                index + 1 < len(user_agent_overrides)
                 and getattr(exc, "status", None) == 403
                 and getattr(exc, "_ptg2_response_body_started", None) is False
             ):

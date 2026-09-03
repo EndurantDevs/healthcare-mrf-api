@@ -257,6 +257,34 @@ async def test_source_download_retries_only_prebody_403_with_default_user_agent(
 
 
 @pytest.mark.asyncio
+async def test_source_download_tries_runtime_agent_after_two_prebody_403s(monkeypatch):
+    acquisition = _acquisition_module()
+    source_url = "https://a/mrf?sig=exact"
+    attempt = acquisition.Attempt("attempt", "a", "Hospital A", source_url, 1)
+    raw = SimpleNamespace(head=SimpleNamespace(url=source_url, status=206))
+    requests: list[tuple[str, dict[str, Any]]] = []
+
+    async def download(url, **kwargs):
+        requests.append((url, dict(kwargs)))
+        if len(requests) < 3:
+            error = _ServerError(403)
+            setattr(error, "_ptg2_response_body_started", False)
+            raise error
+        return raw
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", download)
+    downloaded_source = await acquisition.download_source(
+        (source_url, (attempt,)), object(), 1024
+    )
+
+    assert downloaded_source.raw is raw
+    assert [url for url, _kwargs in requests] == [source_url] * 3
+    assert requests[0][1]["user_agent"].startswith("Mozilla/5.0")
+    assert "user_agent" not in requests[1][1]
+    assert requests[2][1]["user_agent"] == "Python/3.12 aiohttp/3.11"
+
+
+@pytest.mark.asyncio
 async def test_source_download_marks_expired_authorization_and_exact_retry(monkeypatch):
     acquisition = _acquisition_module()
     expired_attempt = acquisition.Attempt(
