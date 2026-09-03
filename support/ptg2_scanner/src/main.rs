@@ -583,11 +583,11 @@ impl ProviderGroupDefinitionConflicts {
             left["provider_group_id_sha256"]
                 .as_str()
                 .cmp(&right["provider_group_id_sha256"].as_str())
-                .then_with(|| {
+                .then(
                     left["definition_sha256"]
                         .to_string()
-                        .cmp(&right["definition_sha256"].to_string())
-                })
+                        .cmp(&right["definition_sha256"].to_string()),
+                )
         });
         Ok(entries)
     }
@@ -32002,6 +32002,85 @@ mod tests {
             merge_provider_definitions_pairwise(vec![(1, reversed_right), (0, reversed_left)])
                 .unwrap();
         assert_eq!(reversed_merged.conflicts, merged.conflicts);
+        let mut sortable_conflicts = forward.conflicts.clone();
+        sortable_conflicts
+            .merge_key(
+                ProviderRefKey::from("8"),
+                BTreeSet::from(["a".repeat(64), "b".repeat(64)]),
+            )
+            .unwrap();
+        let sorted_payload = sortable_conflicts.payload().unwrap();
+        assert_eq!(sorted_payload.len(), 2);
+        assert!(sorted_payload.windows(2).all(|pair| {
+            pair[0]["provider_group_id_sha256"].as_str()
+                < pair[1]["provider_group_id_sha256"].as_str()
+        }));
+        let merged_quarantine = merge_provider_definitions_pairwise(vec![
+            (0, ProviderDefinitions::default()),
+            (1, forward),
+        ])
+        .unwrap();
+        assert_eq!(merged_quarantine.conflicts, merged.conflicts);
+    }
+
+    #[test]
+    fn retained_provider_definition_replay_rejects_locator_and_source_drift() {
+        let provider_ref = valid_provider_reference();
+        let raw_provider = serde_json::to_vec(&provider_ref).unwrap();
+        let (key, mut entry) = provider_ref_definition(&provider_ref).unwrap();
+        let source_witness = SourceWitnessCollector::new(&"ab".repeat(32)).unwrap();
+        source_witness.configure_provider_spools(1).unwrap();
+        let locator = source_witness
+            .store_provider_source(0, &raw_provider)
+            .unwrap();
+        source_witness.seal_provider_sources().unwrap();
+        let dedupe = SharedDedupe::new(1);
+        let paths = CopyPathConfig::default();
+        let context = ProviderRefBatchContext {
+            dedupe: &dedupe,
+            source_witness: &source_witness,
+            manifest_sidecars: None,
+            allow_empty_npi_tin_only: false,
+            defer_definition_outputs: false,
+        };
+
+        let error = emit_provider_definition_outputs(
+            &HashMap::from([(key.clone(), entry.clone())]),
+            1,
+            &paths,
+            0,
+            context,
+        )
+        .err()
+        .expect("missing source locator must fail closed");
+        assert!(error.to_string().contains("missing its source locator"));
+
+        entry.source_locator = Some(ProviderSourceLocator {
+            shard: 1,
+            ..locator
+        });
+        let error = emit_provider_definition_outputs(
+            &HashMap::from([(key.clone(), entry.clone())]),
+            1,
+            &paths,
+            0,
+            context,
+        )
+        .err()
+        .expect("out-of-range source shard must fail closed");
+        assert!(error.to_string().contains("source shard is out of range"));
+
+        entry.source_locator = Some(locator);
+        let error = emit_provider_definition_outputs(
+            &HashMap::from([(ProviderRefKey::from("8"), entry)]),
+            1,
+            &paths,
+            0,
+            context,
+        )
+        .err()
+        .expect("source identity drift must fail closed");
+        assert!(error.to_string().contains("differs from its source spool"));
     }
 
     #[test]
