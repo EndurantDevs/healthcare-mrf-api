@@ -149,18 +149,10 @@ def _download_session(
     timeout: aiohttp.ClientTimeout,
     user_agent: str | None = None,
 ) -> aiohttp.ClientSession:
-    headers = {"User-Agent": user_agent or _HTTP_USER_AGENT}
-    if user_agent and user_agent.startswith("Mozilla/5.0"):
-        headers.update({
-            "Accept-Language": "en-US,en;q=0.9",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-        })
     return aiohttp.ClientSession(
         timeout=timeout,
         connector=_public_connector(),
-        headers=headers,
+        headers={"User-Agent": user_agent or _HTTP_USER_AGENT},
         max_field_size=64 * 1024,
     )
 

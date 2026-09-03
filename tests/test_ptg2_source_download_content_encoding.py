@@ -41,13 +41,7 @@ def test_download_session_uses_stable_product_user_agent(monkeypatch) -> None:
         timeout,
         "Mozilla/5.0",
     )
-    assert session_options_by_name["headers"] == {
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "User-Agent": "Mozilla/5.0",
-    }
+    assert session_options_by_name["headers"] == {"User-Agent": "Mozilla/5.0"}
 
 
 def test_single_get_uses_decoded_byte_space_for_encoded_response(
