@@ -24,7 +24,7 @@ def test_native_summary_accepts_supported_source_schema_versions(
     assert _validate_packed_summary(summary, tmp_path).schema_version == schema_version
 
 
-@pytest.mark.parametrize("schema_version", ("2", "2.0.0"))
+@pytest.mark.parametrize("schema_version", ("1", "1.0.0", "2", "2.0.0"))
 @pytest.mark.parametrize("source_format", ("csv-tall", "csv-wide"))
 def test_native_summary_accepts_csv_v2_versions_without_admitting_json(
     tmp_path, source_format, schema_version
