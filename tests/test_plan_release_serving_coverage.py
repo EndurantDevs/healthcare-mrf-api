@@ -106,7 +106,7 @@ def test_release_selection_deduplicates_physical_reads_and_normalizes_metadata()
         distinct_network_binding,
     )
     assert selection.allowed_amount_bindings == (allowed_binding,)
-    assert selection.response_metadata()["resolved_snapshot_ids"] == [
+    assert selection.response_metadata()["in_network_snapshot_ids"] == [
         "ptg2:a-release-network",
         "ptg2:release-network"
     ]
@@ -127,6 +127,41 @@ def test_release_selection_deduplicates_physical_reads_and_normalizes_metadata()
     assert annotated is response_by_field
     assert annotated["resolved"] is False
     assert annotated["query"]["plan_release_id"] == PLAN_RELEASE_ID
+
+
+def test_release_annotation_keeps_snapshot_roles_distinct():
+    """Keep allowed evidence identity separate from in-network identity."""
+
+    selection = _selection(
+        _binding(),
+        _binding(role="allowed_amounts", snapshot_id="ptg2:release-allowed"),
+    )
+    negotiated_response_by_field = {"query": {}}
+    plan_release_serving.annotate_plan_release_response(
+        negotiated_response_by_field,
+        selection,
+    )
+    assert negotiated_response_by_field["in_network_snapshot_ids"] == [
+        "ptg2:release-network"
+    ]
+    assert negotiated_response_by_field["resolved_snapshot_ids"] == [
+        "ptg2:release-network"
+    ]
+
+    allowed_response_by_field = {
+        "pricing_scope": "plan_scoped_allowed_amounts",
+        "resolved_snapshot_ids": ["ptg2:release-allowed"],
+        "query": {},
+    }
+    plan_release_serving.annotate_plan_release_response(
+        allowed_response_by_field,
+        selection,
+    )
+    assert allowed_response_by_field["resolved_snapshot_ids"] == [
+        "ptg2:release-allowed"
+    ]
+    assert "in_network_snapshot_ids" not in allowed_response_by_field
+    assert "in_network_snapshot_ids" not in allowed_response_by_field["query"]
 
 
 def test_release_projection_rejects_malformed_counts_ordinals_and_empty_rows():

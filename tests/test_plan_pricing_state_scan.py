@@ -54,7 +54,7 @@ def _selection(*, contract: str = "plan_pricing_factorized_v4", **overrides):
     selection_by_field.update(overrides)
     selection = SimpleNamespace(**selection_by_field)
     selection.response_metadata = lambda: {
-        "resolved_snapshot_ids": sorted(
+        "in_network_snapshot_ids": sorted(
             {
                 str(binding.snapshot_id)
                 for binding in selection.in_network_bindings
@@ -168,7 +168,9 @@ async def test_state_scan_pages_by_npi_and_mints_bound_cursor(monkeypatch):
     assert page_response["pagination"]["total_lower_bound"] == 1
     assert page_response["pagination"]["scanned_npi_count"] == 2
     assert page_response["resolved_snapshot_ids"] == ["snapshot-1"]
+    assert page_response["in_network_snapshot_ids"] == ["snapshot-1"]
     assert page_response["query"]["resolved_snapshot_ids"] == ["snapshot-1"]
+    assert page_response["query"]["in_network_snapshot_ids"] == ["snapshot-1"]
     assert page_response["pagination"]["next_cursor"].startswith("bsc1_test_")
     assert len(page_response["pagination"]["next_cursor"]) <= 2048
     assert len(session.calls) == 2
@@ -409,6 +411,12 @@ def test_state_scan_sql_has_only_keyset_and_bounded_sentinels():
 def test_state_scan_requires_closed_release_shape_and_v4():
     assert scan.is_plan_pricing_state_scan(_args())
     assert not scan.is_plan_pricing_state_scan(_args(order_by="distance"))
+    assert not scan.is_plan_pricing_state_scan(
+        _args(include_allowed_amounts=None)
+    )
+    assert not scan.is_plan_pricing_state_scan(_args(specialty="cardiology"))
+    assert scan.is_plan_pricing_state_scan(_args(specialty="cardiology", cursor="opaque"))
+    assert scan.is_plan_pricing_state_scan(_args(state=None, cursor="opaque"))
     assert scan.validate_plan_pricing_state_scan(
         _args(include_unverified_addresses="true")
     ) == ("CPT", "93320", "MI")

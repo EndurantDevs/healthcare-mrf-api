@@ -126,6 +126,9 @@ def test_distance_retry_is_self_contained_and_closed():
         "include_providers": "false",
         "order_by": "cost",
         "order": "desc",
+        "page": "2",
+        "offset": "25",
+        "start": "25",
         "zip5": "60611",
         "zip_radius_miles": "25",
     }
@@ -136,6 +139,8 @@ def test_distance_retry_is_self_contained_and_closed():
         "include_providers": True,
         "view": "card",
         "offset": 0,
+        "start": 0,
+        "page": 1,
     }
     assert em_distance_retry_option(
         {**args_by_name, "classification": "Internal Medicine"}

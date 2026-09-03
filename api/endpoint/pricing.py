@@ -12553,8 +12553,15 @@ async def list_providers_by_procedure(request):
                 request, str(exc)
             )
         except (BillingSearchCursorKeyringError, PTG2ManifestArtifactError) as exc:
+            logger.warning(
+                "plan pricing state scan could not serve an exact page",
+                extra={
+                    "plan_pricing_state_scan_failure_class": type(exc).__name__
+                },
+            )
             return _state_scan_projection_unavailable_response(
-                request, str(exc)
+                request,
+                "The selected release is not ready for exact state-scan serving.",
             )
         return _ptg_json_response(request, state_scan_payload)
     if plan_release_id and _is_broad_office_visit_cpt(

@@ -75,11 +75,11 @@ class PlanPricingStateScanBudgetExceeded(RuntimeError):
 def is_plan_pricing_state_scan(args: Mapping[str, Any]) -> bool:
     """Select only the explicit additive NPI-ordered state scan lane."""
 
-    return bool(
-        str(args.get("plan_release_id") or "").strip()
-        and str(args.get("order_by") or "").strip().lower() == "npi"
-        and str(args.get("state") or "").strip()
-    )
+    try:
+        validate_plan_pricing_state_scan(args)
+    except PlanPricingProjectionUnsupported:
+        return _has_argument(args, "cursor")
+    return bool(str(args.get("plan_release_id") or "").strip())
 
 
 def _has_argument(args: Mapping[str, Any], field: str) -> bool:
@@ -99,6 +99,7 @@ def _is_explicit_false(value: Any) -> bool:
 
 def _validate_scan_options(args: Mapping[str, Any], state: str) -> None:
     view = str(args.get("view") or "full").strip().lower()
+    order_by = str(args.get("order_by") or "").strip().lower()
     order = str(args.get("order") or "asc").strip().lower()
     if _STATE.fullmatch(state) is None:
         raise PlanPricingProjectionUnsupported("state scan requires a two-letter state")
@@ -108,7 +109,7 @@ def _validate_scan_options(args: Mapping[str, Any], state: str) -> None:
         raise PlanPricingProjectionUnsupported(
             "state scan requires include_allowed_amounts=false"
         )
-    if order != "asc":
+    if order_by != "npi" or order != "asc":
         raise PlanPricingProjectionUnsupported("state scan requires order_by=npi and order=asc")
 
 

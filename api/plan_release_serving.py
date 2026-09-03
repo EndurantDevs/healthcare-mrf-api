@@ -203,7 +203,7 @@ class PlanReleaseServingSelection:
             "release_status": self.release_status,
             "is_current": True,
             "binding_set_digest": self.binding_set_digest,
-            "resolved_snapshot_ids": sorted(
+            "in_network_snapshot_ids": sorted(
                 {binding.snapshot_id for binding in self.in_network_bindings}
             ),
         }
@@ -425,6 +425,13 @@ def annotate_plan_release_response(
     if payload is None:
         return None
     metadata = selection.response_metadata()
+    if payload.get("pricing_scope") == "plan_scoped_allowed_amounts":
+        metadata.pop("in_network_snapshot_ids", None)
+    else:
+        # Preserve the established negotiated-response alias for API clients.
+        metadata["resolved_snapshot_ids"] = metadata[
+            "in_network_snapshot_ids"
+        ]
     payload.setdefault("resolved", True)
     payload.update(metadata)
     query_by_field = payload.get("query")

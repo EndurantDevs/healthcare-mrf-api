@@ -4152,7 +4152,7 @@ async def test_office_visit_scope_refusal_retry_options_are_servable(
         "code_system": "CPT",
         "zip5": "60611",
         "zip_radius_miles": "25",
-        "view": "full",
+        "view": "full", "limit": "25", "page": "2", "offset": "25", "start": "25",
     }
     if raw_order is not None:
         base_args_by_name["order"] = raw_order
@@ -4841,6 +4841,104 @@ async def test_release_state_scan_routes_before_legacy_ptg_expansion(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "legacy_args_by_name",
+    ({}, {"specialty": "cardiology", "include_allowed_amounts": "false"}),
+)
+async def test_release_npi_legacy_shapes_bypass_state_scan(
+    monkeypatch, legacy_args_by_name
+):
+    """Keep pre-existing NPI ordering shapes on the legacy PTG lane."""
+
+    selection = _mixed_canonical_release_selection()
+    state_scan = AsyncMock()
+    legacy_search = AsyncMock(return_value=_state_scan_response())
+    monkeypatch.setattr(
+        pricing_module,
+        "_resolve_ptg_specialty_or_raise",
+        AsyncMock(
+            return_value=types.SimpleNamespace(
+                unresolved_specialty=None,
+                taxonomy_codes=(),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(pricing_module, "search_plan_pricing_state_scan", state_scan)
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", legacy_search)
+
+    response = await list_providers_by_procedure(
+        make_request(
+            [],
+            args={
+                "plan_release_id": selection.plan_release_id,
+                "code_system": "CPT",
+                "code": "27447",
+                "state": "MI",
+                "order_by": "npi",
+                **legacy_args_by_name,
+            },
+        )
+    )
+
+    assert response.status == 200
+    state_scan.assert_not_awaited()
+    legacy_search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_release_state_cursor_cannot_downgrade_to_legacy(monkeypatch):
+    """Reject an invalid continuation through the state-scan validator."""
+
+    selection = _mixed_canonical_release_selection()
+    state_scan = AsyncMock(
+        side_effect=pricing_module.PlanPricingProjectionUnsupported(
+            "state scan requires a two-letter state"
+        )
+    )
+    legacy_search = AsyncMock()
+    monkeypatch.setattr(
+        pricing_module,
+        "_resolve_ptg_specialty_or_raise",
+        AsyncMock(
+            return_value=types.SimpleNamespace(
+                unresolved_specialty=None,
+                taxonomy_codes=(),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(pricing_module, "search_plan_pricing_state_scan", state_scan)
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", legacy_search)
+
+    with pytest.raises(pricing_module.InvalidUsage, match="two-letter state"):
+        await list_providers_by_procedure(
+            make_request(
+                [],
+                args={
+                    "plan_release_id": selection.plan_release_id,
+                    "code_system": "CPT",
+                    "code": "27447",
+                    "order_by": "npi",
+                    "include_allowed_amounts": "false",
+                    "cursor": "opaque",
+                },
+            )
+        )
+
+    state_scan.assert_awaited_once()
+    legacy_search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_release_state_scan_budget_refusal_is_deterministic_422(monkeypatch):
     selection = replace(
         _mixed_canonical_release_selection(),
@@ -4930,6 +5028,69 @@ async def test_release_state_scan_maps_stale_cursor_generation_to_409(monkeypatc
             "message": "Billing search cursor generation is no longer available.",
         }
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type",
+    (
+        pricing_module.BillingSearchCursorKeyringError,
+        pricing_module.PTG2ManifestArtifactError,
+    ),
+)
+async def test_release_state_scan_hides_internal_serving_errors(
+    monkeypatch, caplog, error_type
+):
+    selection = replace(
+        _mixed_canonical_release_selection(),
+        pricing_projection_id="f" * 64,
+        pricing_projection_contract="plan_pricing_factorized_v4",
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_resolve_ptg_specialty_or_raise",
+        AsyncMock(
+            return_value=types.SimpleNamespace(
+                unresolved_specialty=None,
+                taxonomy_codes=(),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "search_plan_pricing_state_scan",
+        AsyncMock(side_effect=error_type("private serving detail")),
+    )
+    caplog.set_level("WARNING", logger=pricing_module.__name__)
+
+    response = await list_providers_by_procedure(
+        make_request(
+            [],
+            args={
+                "plan_release_id": selection.plan_release_id,
+                "code_system": "CPT",
+                "code": "27447",
+                "state": "MI",
+                "order_by": "npi",
+                "include_allowed_amounts": "false",
+            },
+        )
+    )
+
+    assert response.status == 503
+    assert json.loads(response.body)["error"]["message"] == (
+        "The selected release is not ready for exact state-scan serving."
+    )
+    assert "private serving detail" not in response.body.decode()
+    assert "private serving detail" not in caplog.text
+    assert caplog.records[-1].plan_pricing_state_scan_failure_class == (
+        error_type.__name__
+    )
 
 
 @pytest.mark.asyncio
@@ -5051,7 +5212,7 @@ async def test_group_plan_99213_card_and_full_share_ready_refusal(
             "order": "asc",
             "include_providers": True,
             "view": "card",
-            "offset": 0,
+            "offset": 0, "start": 0, "page": 1,
         }
     ]
     assert guard_resolver.await_count == 2
