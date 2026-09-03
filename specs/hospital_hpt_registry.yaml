@@ -19822,6 +19822,7 @@ hospitals:
 - hospital_id: hospital-005975
   name: Spring Valley Specilty Hospital
   cms_hpt_url: https://www.springvalleyhospital.com/cms-hpt.txt
+  alias_of: hospital-006936
 - hospital_id: hospital-005976
   name: Spring View Hospital
   cms_hpt_url: https://www.springviewhospital.com/cms-hpt.txt
@@ -22968,6 +22969,7 @@ hospitals:
 - hospital_id: hospital-006936
   name: Valley Health Specialty Hospital
   cms_hpt_url: https://www.springvalleyhospital.com/cms-hpt.txt
+  locator_mrf_url: https://uhsfilecdn.eskycity.net/ac/721549752_spring-valley-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-006937
   name: Valley Health System
   cms_hpt_url: https://www.valleyhealth.com/cms-hpt.txt
