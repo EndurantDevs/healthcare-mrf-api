@@ -156,6 +156,52 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_partial_evidence_patch_is_bound_to_main_generation_swap(monkeypatch):
+    recording_db = _RecordingDB(
+        existing_names={
+            "entity_address_unified",
+            "entity_address_unified_stage",
+            "entity_address_evidence",
+            "entity_address_evidence_stage",
+            "affected_groups",
+        }
+    )
+    monkeypatch.setattr(entity_address_unified, "db", recording_db)
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_partial_support_patch_sql",
+        lambda *_args, **_kwargs: [
+            ("delete affected evidence", "DELETE FROM mrf.entity_address_evidence;"),
+            ("insert affected evidence", "INSERT INTO mrf.entity_address_evidence SELECT 1;"),
+        ],
+    )
+
+    await entity_address_unified._publish_staged_entity_address_tables(
+        "mrf",
+        _StageTable,
+        {_SupportLiveTable: _SupportStageTable},
+        partial_support_patch=True,
+        affected_group_table="affected_groups",
+        context={},
+    )
+
+    main_swap_at = recording_db.events.index(
+        "ALTER TABLE mrf.entity_address_unified_stage RENAME TO entity_address_unified;"
+    )
+    delete_at = recording_db.events.index("DELETE FROM mrf.entity_address_evidence;")
+    insert_at = recording_db.events.index(
+        "INSERT INTO mrf.entity_address_evidence SELECT 1;"
+    )
+    activation_at = next(
+        index
+        for index, statement in enumerate(recording_db.events)
+        if "entity_address_geo_assurance_state" in statement
+    )
+    assert recording_db.transaction_events == ["BEGIN", "COMMIT"]
+    assert main_swap_at < delete_at < insert_at < activation_at
+
+
+@pytest.mark.asyncio
 async def test_entity_address_cutover_converts_unlogged_stage_before_transaction(monkeypatch):
     recording_db = _RecordingDB(persistence_values=("u", "p"))
     monkeypatch.setattr(entity_address_unified, "db", recording_db)
