@@ -260,7 +260,7 @@ def test_matrix_fails_all_http_checks_when_latency_exceeds_slo():
     assert {checks[code]["state"] for code in ("A", "P", "G", "F", "V")} == {"fail"}
 
 
-def test_profile_source_matrix_selects_all_24_and_expresses_special_contracts():
+def test_profile_source_matrix_selects_all_25_and_expresses_special_contracts():
     root = Path(__file__).resolve().parents[1]
     manifest = json.loads(
         (root / "specs/provider_directory_endpoint_acquisition_manifest.json").read_text()
@@ -268,7 +268,18 @@ def test_profile_source_matrix_selects_all_24_and_expresses_special_contracts():
     profile_spec = matrix.load_matrix_source_spec()
     selections = matrix.resolve_matrix_source_selection(manifest, profile_spec)
 
-    assert len(selections) == 24
+    assert len(selections) == 25
+    michigan = next(
+        selection for selection in selections if selection.entry_id == "michigan"
+    )
+    assert michigan.resource_profile == "M5"
+    assert michigan.resources == (
+        "Location",
+        "Organization",
+        "OrganizationAffiliation",
+        "Practitioner",
+        "PractitionerRole",
+    )
     alohr = next(selection for selection in selections if selection.entry_id == "alohr")
     assert alohr.resource_profile == "ALOHR_GRAPHQL_R4"
     assert alohr.resources == (

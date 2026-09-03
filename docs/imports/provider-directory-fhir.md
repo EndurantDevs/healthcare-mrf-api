@@ -2136,14 +2136,15 @@ stored status/manifest checkpoint instead of creating a mixed snapshot.
 The importer may cap `_count` below the schedule-level `page_count` for a
 specific payer/resource when the live FHIR server is known to misbehave at
 larger page sizes. Aetna Commercial caps all seven supported collections at 30.
-Michigan InteropStation `PractitionerRole` returns rows and a next link at
-`_count=25`, but that canonical HAPI next link returns HTTP 403 through the
-relay. Synthetic `_getpagesoffset` continuation is disabled because live
-comparison proved that offset 25 skips canonical page two, and offset zero can
-return a false-empty Bundle. Michigan therefore remains probe-only until the
-vendor provides a byte-for-byte usable cursor, documented stable offset
-contract, or complete Bulk/file export. Future source-specific caps can also be carried
-in source `metadata_json.provider_directory_resource_page_count_caps` without
+Michigan's legacy InteropStation identity normalizes to the public MHB upstream.
+On 2026-09-03, `PractitionerRole?_count=25` and its exact advertised next link
+both returned 25 rows within the 20 MiB response cap. Acquisition replays each
+server-issued opaque link with durable checkpoints; it never synthesizes
+`_getpagesoffset`, because live comparison proved that a synthetic offset can
+skip rows or return a false-empty Bundle. The five verified M5 collections are
+acquisition-configured, while terminal exhaustive acquisition and publication
+proof remain separate gates. Future source-specific caps can also be carried in
+source `metadata_json.provider_directory_resource_page_count_caps` without
 changing the monthly schedule.
 The external scheduler also runs a follow-up artifact-only Provider Directory
 run after the monthly `entity-address-unified` Provider Directory partial

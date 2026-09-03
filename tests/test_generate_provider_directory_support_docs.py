@@ -28,6 +28,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     )
     assert "OAuth2 client credentials | Bulk" in rendered_document
     assert "Cigna (`cigna`) | Acquisition-configured | None | REST" in rendered_document
+    assert "Michigan (`michigan`) | Acquisition-configured | None | REST | Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole" in rendered_document
     assert "CareSource (`caresource`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint" in rendered_document
     assert "processed and unique candidate resource IDs equal unchanged post-scan census" in rendered_document
     assert "No product membership is inferred from the catalog row" in rendered_document
@@ -40,9 +41,9 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "clears plan_name and does not claim NH product membership" in rendered_document
     assert "Exhaustive equivalence with plan-code bases" in rendered_document
     assert "## Inventory Summary" in rendered_document
-    assert "| Acquisition-configured | 25 |" in rendered_document
+    assert "| Acquisition-configured | 26 |" in rendered_document
     assert "| Externally supported | 0 |" in rendered_document
-    assert "| Probe-only | 14 |" in rendered_document
+    assert "| Probe-only | 13 |" in rendered_document
     assert "| Known not importable | 3 |" in rendered_document
     assert "| Total tracked | 42 |" in rendered_document
     assert "### Credentialed Or Registered Access" in rendered_document
