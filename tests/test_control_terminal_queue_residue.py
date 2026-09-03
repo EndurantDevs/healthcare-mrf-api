@@ -360,20 +360,31 @@ async def test_reconcile_terminal_queue_residue_refuses_zero_remove(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_reconcile_terminal_queue_residue_maps_missing_and_unavailable(
-    monkeypatch,
-):
+async def test_reconcile_terminal_queue_residue_maps_missing_and_unavailable(monkeypatch):
+    unavailable = control_imports.StaleWorkerReconciliationUnavailable
     _install_dependencies(monkeypatch, None)
     assert await control_imports.reconcile_terminal_queue_residue(RUN_ID, BODY) is None
     control_imports.create_pool.assert_not_awaited()
 
     _install_dependencies(monkeypatch, _run())
     control_imports.create_pool.side_effect = RuntimeError("redis unavailable")
-    with pytest.raises(
-        control_imports.StaleWorkerReconciliationUnavailable,
-        match="queue residue proof is unavailable",
-    ):
+    with pytest.raises(unavailable, match="queue residue proof is unavailable"):
         await control_imports.reconcile_terminal_queue_residue(RUN_ID, BODY)
+    _, _, pipeline = _install_dependencies(monkeypatch, _run())
+    real_timeout = control_imports.asyncio.timeout
+    timeout = Mock(return_value=AsyncMock(**{"__aenter__.side_effect": TimeoutError}))
+    monkeypatch.setattr(control_imports.asyncio, "timeout", timeout)
+    with pytest.raises(unavailable):
+        await control_imports.reconcile_terminal_queue_residue(RUN_ID, BODY)
+    timeout.assert_called_once_with(control_imports.build_redis_settings().conn_timeout)
+    control_imports.create_pool.assert_not_awaited()
+    pipeline.watch.assert_not_awaited()
+    monkeypatch.setattr(control_imports.asyncio, "timeout", real_timeout)
+    _, redis_pool, pipeline = _install_dependencies(monkeypatch, _run())
+    pipeline.__aexit__.side_effect = TimeoutError
+    with pytest.raises(unavailable):
+        await control_imports.reconcile_terminal_queue_residue(RUN_ID, BODY)
+    redis_pool.aclose.assert_awaited_once_with(close_connection_pool=True)
 
 
 @pytest.mark.asyncio

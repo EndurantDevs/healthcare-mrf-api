@@ -126,6 +126,12 @@ _STALE_WORKER_RECONCILIATION_FIELDS = frozenset(
 _TERMINAL_QUEUE_RESIDUE_FIELDS = frozenset(
     {"expected_importer", "expected_status"}
 )
+_ARQ_EVIDENCE_KEY_PREFIXES = (
+    ("job", job_key_prefix),
+    ("retry", retry_key_prefix),
+    ("in_progress", in_progress_key_prefix),
+    ("result", result_key_prefix),
+)
 CANCEL_FLAG_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_IMPORT_RUN_LIST_LIMIT = 200
 MAX_TRIGGERED_BY_LENGTH = 32
@@ -1777,8 +1783,15 @@ def _stale_worker_receipt(
     }
 
 
+def _arq_evidence_keys(job_id: str) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (field, prefix + job_id) for field, prefix in _ARQ_EVIDENCE_KEY_PREFIXES
+    )
+
+
 async def _arq_worker_presence(run: dict[str, Any]) -> dict[str, Any]:
     _run_id, _importer, queue, job_id = _reconciliation_arq_identity(run)
+    arq_keys_by_field = _arq_evidence_keys(job_id)
     redis_pool = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,
@@ -1787,19 +1800,21 @@ async def _arq_worker_presence(run: dict[str, Any]) -> dict[str, Any]:
     try:
         async with redis_pool.pipeline(transaction=True) as pipe:
             pipe.zscore(queue, job_id)
-            pipe.exists(job_key_prefix + job_id)
-            pipe.exists(retry_key_prefix + job_id)
-            pipe.exists(in_progress_key_prefix + job_id)
-            pipe.exists(result_key_prefix + job_id)
-            queue_score, job, retry, in_progress, result = await pipe.execute()
+            for _field, key in arq_keys_by_field:
+                pipe.exists(key)
+            queue_score, *presence_flags = await pipe.execute()
     finally:
         await redis_pool.aclose(close_connection_pool=True)
     return {
         "queue_member": queue_score is not None,
-        "job": bool(job),
-        "retry": bool(retry),
-        "in_progress": bool(in_progress),
-        "result": bool(result),
+        **{
+            field: bool(is_present)
+            for (field, _key), is_present in zip(
+                arq_keys_by_field,
+                presence_flags,
+                strict=True,
+            )
+        },
     }
 
 
@@ -2134,19 +2149,22 @@ async def _reconcile_terminal_queue_member(
     run: dict[str, Any],
     queue: str,
     job_id: str,
-    arq_keys: tuple[str, ...],
+    arq_keys_by_field: tuple[tuple[str, str], ...],
 ) -> dict[str, Any]:
+    arq_keys = tuple(key for _field, key in arq_keys_by_field)
     await pipe.watch(queue, *arq_keys)
     has_queue_member = await pipe.zscore(queue, job_id) is not None
     arq_key_presence_flags = [bool(await pipe.exists(key)) for key in arq_keys]
     evidence_by_field = {
         "queue_member": has_queue_member,
-        **dict(
-            zip(
-                ("job", "retry", "in_progress", "result"),
+        **{
+            field: is_present
+            for (field, _key), is_present in zip(
+                arq_keys_by_field,
                 arq_key_presence_flags,
+                strict=True,
             )
-        ),
+        },
     }
     has_executable_arq_state = any(
         evidence_by_field[field] for field in ("job", "retry", "in_progress")
@@ -2186,6 +2204,23 @@ async def _reconcile_terminal_queue_member(
     )
 
 
+async def _reconcile_terminal_queue_member_from_pool(
+    redis_pool: Any,
+    run: dict[str, Any],
+    queue: str,
+    job_id: str,
+    arq_keys_by_field: tuple[tuple[str, str], ...],
+) -> dict[str, Any]:
+    async with redis_pool.pipeline(transaction=True) as pipe:
+        return await _reconcile_terminal_queue_member(
+            pipe,
+            run,
+            queue,
+            job_id,
+            arq_keys_by_field,
+        )
+
+
 async def _remove_terminal_queue_residue(
     run: dict[str, Any],
     expected: dict[str, str],
@@ -2193,27 +2228,30 @@ async def _remove_terminal_queue_residue(
     _run_id, _importer, queue, job_id = _terminal_queue_residue_identity(
         run, expected
     )
-    arq_keys = (
-        job_key_prefix + job_id,
-        retry_key_prefix + job_id,
-        in_progress_key_prefix + job_id,
-        result_key_prefix + job_id,
-    )
+    arq_keys_by_field = _arq_evidence_keys(job_id)
+    redis_settings = build_redis_settings()
     redis_pool = None
+    reconciliation_task = None
     try:
-        redis_pool = await create_pool(
-            build_redis_settings(),
-            job_serializer=serialize_job,
-            job_deserializer=deserialize_job,
-        )
-        async with redis_pool.pipeline(transaction=True) as pipe:
-            return await _reconcile_terminal_queue_member(
-                pipe,
-                run,
-                queue,
-                job_id,
-                arq_keys,
+        async with asyncio.timeout(redis_settings.conn_timeout):
+            redis_pool = await create_pool(
+                redis_settings,
+                job_serializer=serialize_job,
+                job_deserializer=deserialize_job,
             )
+            reconciliation_task = asyncio.create_task(
+                _reconcile_terminal_queue_member_from_pool(
+                    redis_pool,
+                    run,
+                    queue,
+                    job_id,
+                    arq_keys_by_field,
+                )
+            )
+            reconciliation_task.add_done_callback(
+                lambda task: None if task.cancelled() else task.exception()
+            )
+            return await asyncio.shield(reconciliation_task)
     except WatchError as exc:
         raise StaleWorkerReconciliationConflict(
             "ARQ state changed during reconciliation"
@@ -2225,9 +2263,12 @@ async def _remove_terminal_queue_residue(
             "queue residue proof is unavailable"
         ) from exc
     finally:
+        if reconciliation_task is not None and not reconciliation_task.done():
+            reconciliation_task.cancel()
         if redis_pool is not None:
             try:
-                await redis_pool.aclose(close_connection_pool=True)
+                async with asyncio.timeout(redis_settings.conn_timeout):
+                    await redis_pool.aclose(close_connection_pool=True)
             except Exception:
                 logger.warning("terminal queue residue Redis close failed", exc_info=True)
 
