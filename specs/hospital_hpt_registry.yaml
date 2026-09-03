@@ -1656,18 +1656,21 @@ hospitals:
 - hospital_id: hospital-000494
   name: Avera Dell Rapids
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Dells Area Hospital
 - hospital_id: hospital-000495
   name: Avera Dells Area Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000496
   name: Avera DeSmet
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera De Smet Memorial Hospital
 - hospital_id: hospital-000497
   name: Avera Eureka Health Care Center
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000498
   name: Avera Flandreau
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Flandreau Hospital
 - hospital_id: hospital-000499
   name: Avera Flandreau Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -1677,30 +1680,35 @@ hospitals:
 - hospital_id: hospital-000501
   name: Avera Gregory
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Gregory Hospital
 - hospital_id: hospital-000502
   name: Avera Gregory Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000503
   name: Avera Hand County
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Hand County Memorial Hospital
 - hospital_id: hospital-000504
   name: Avera Hand County Memorial Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000505
   name: Avera Heart
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Heart Hospital of South Dakota
 - hospital_id: hospital-000506
   name: Avera Heart Hospital of South Dakota
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000507
   name: Avera Holy Family
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Holy Family Hospital
 - hospital_id: hospital-000508
   name: Avera Holy Family Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000509
   name: Avera Marshall
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Marshall Regional Medical Center
 - hospital_id: hospital-000510
   name: Avera Marshall Regional Medical Center
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -1710,6 +1718,7 @@ hospitals:
   - hospital-000513
   name: Avera McKennan
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera McKennan Hospital and University Health Center
 - hospital_id: hospital-000514
   alias_of: hospital-000511
   name: Avera McKennan Hospital and University Health Center
@@ -1717,24 +1726,28 @@ hospitals:
 - hospital_id: hospital-000515
   name: Avera Merrill Pioneer
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Merrill Pioneer Hospital
 - hospital_id: hospital-000516
   name: Avera Merrill Pioneer Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000517
   name: Avera Milbank
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Milbank Area Health Care Campus
 - hospital_id: hospital-000518
   name: Avera Missouri River Health Center
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000519
   name: Avera Queen of Peace
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Queen of Peace Hospital
 - hospital_id: hospital-000520
   name: Avera Queen of Peace Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000521
   name: Avera Sacred Heart
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Sacred Heart Hospital
 - hospital_id: hospital-000522
   name: Avera Sacred Heart Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -1744,6 +1757,7 @@ hospitals:
 - hospital_id: hospital-000524
   name: Avera St. Anthony's
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera St. Anthony's Hospital
 - hospital_id: hospital-000525
   name: Avera St. Anthony's Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -1753,21 +1767,25 @@ hospitals:
 - hospital_id: hospital-000527
   name: Avera St. Benedicts
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera St. Benedict Health Center
 - hospital_id: hospital-000528
   name: Avera St. Luke's
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera St. Luke's Hospital
 - hospital_id: hospital-000529
   name: Avera St. Luke's Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000530
   name: Avera St. Mary's
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera St. Mary's Hospital
 - hospital_id: hospital-000531
   name: Avera St. Mary's Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
 - hospital_id: hospital-000532
   name: Avera Tyler
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Tyler Hospital
 - hospital_id: hospital-000533
   name: Avera Tyler Hospital
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -1777,6 +1795,7 @@ hospitals:
 - hospital_id: hospital-000535
   name: Avera Weskota Memorial Med Ctr
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Weskota Memorial Hospital
 - hospital_id: hospital-000536
   name: Avita Health Systems
   cms_hpt_url: https://avitahealth.org/cms-hpt.txt
@@ -3210,6 +3229,7 @@ hospitals:
 - hospital_id: hospital-000958
   name: Bowdle Healthcare Center
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Bowdle Healthcare Center Avera
 - hospital_id: hospital-000959
   name: Bowdle Healthcare Center Avera
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -5163,6 +5183,7 @@ hospitals:
 - hospital_id: hospital-001545
   name: Community Memorial Hospital - Redfield
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Community Memorial Hospital Avera
 - hospital_id: hospital-001546
   name: Community Memorial Hospital Association
   cms_hpt_url: https://cloquethospital.com/cms-hpt.txt
@@ -5580,6 +5601,7 @@ hospitals:
 - hospital_id: hospital-001668
   name: Creighton
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Creighton Hospital
 - hospital_id: hospital-001669
   name: Crenshaw Community Hospital
   cms_hpt_url: https://crenshawcommunityhospital.com/cms-hpt.txt
@@ -7175,6 +7197,7 @@ hospitals:
 - hospital_id: hospital-002162
   name: Eureka
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Avera Eureka Health Care Center
 - hospital_id: hospital-002163
   name: Evanston Hospital
   cms_hpt_url: https://www.northshore.org/cms-hpt.txt
@@ -7691,6 +7714,7 @@ hospitals:
 - hospital_id: hospital-002315
   name: Freeman Regional Health Svcs.
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Freeman Regional Health Services
 - hospital_id: hospital-002316
   name: Freestone Medical Center
   cms_hpt_url: https://freestonemc.com/cms-hpt.txt
@@ -9520,6 +9544,7 @@ hospitals:
 - hospital_id: hospital-002860
   name: Hegg Health Center
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Hegg Health Center Avera
 - hospital_id: hospital-002861
   name: Hegg Health Center Avera
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -11484,6 +11509,7 @@ hospitals:
 - hospital_id: hospital-003451
   name: Lakes Regional
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Lakes Regional Healthcare
 - hospital_id: hospital-003452
   name: Lakes Regional Healthcare
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -11541,6 +11567,7 @@ hospitals:
 - hospital_id: hospital-003469
   name: Landmann-Jungman
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Landmann-Jungman Memorial Hospital Avera
 - hospital_id: hospital-003470
   name: Landmann-Jungman Memorial Hospital Avera
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -12424,6 +12451,7 @@ hospitals:
 - hospital_id: hospital-003738
   name: Marshall County
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Marshall County Healthcare Center Avera
 - hospital_id: hospital-003739
   name: Marshall County Healthcare Center Avera
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -17211,6 +17239,7 @@ hospitals:
 - hospital_id: hospital-005178
   name: Platte Healthcare
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Platte Health Center Avera
 - hospital_id: hospital-005179
   name: Platte Valley Medical Center
   cms_hpt_url: https://intermountainhealthcare.org/cms-hpt.txt
@@ -19279,6 +19308,7 @@ hospitals:
 - hospital_id: hospital-005803
   name: Sioux Center Health
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Sioux Center Health Avera
 - hospital_id: hospital-005804
   name: Sioux Center Health Avera
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
@@ -20223,6 +20253,7 @@ hospitals:
 - hospital_id: hospital-006082
   name: St Michael's
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: St. Michael's Hospital Avera
 - hospital_id: hospital-006083
   name: ST NICHOLAS HOSPITAL
   cms_hpt_url: https://www.hshs.org/cms-hpt.txt
@@ -23235,6 +23266,7 @@ hospitals:
 - hospital_id: hospital-007003
   name: Wagner Community Memorial
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
+  locator_name: Wagner Community Memorial Hospital Avera
 - hospital_id: hospital-007004
   name: Wagner Community Memorial Hospital Avera
   cms_hpt_url: https://www.avera.org/cms-hpt.txt
