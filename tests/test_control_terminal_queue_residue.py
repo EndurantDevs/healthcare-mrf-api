@@ -133,8 +133,10 @@ async def test_reconcile_terminal_queue_residue_removes_only_exact_member(monkey
 
 
 @pytest.mark.asyncio
-async def test_preselected_arq_worker_cannot_invoke_importer_after_removal(monkeypatch):
-    """Model a worker retaining the job ID and score before the exact ZREM."""
+async def test_preselected_arq_worker_result_keeps_reconciliation_idempotent(
+    monkeypatch,
+):
+    """Replay cleanup after a preselected worker records the missing payload."""
     _connection, _redis_pool, cleanup_pipeline = _install_dependencies(
         monkeypatch,
         _run(),
@@ -146,32 +148,49 @@ async def test_preselected_arq_worker_cannot_invoke_importer_after_removal(monke
     cleanup_pipeline.zrem.assert_called_once_with(QUEUE, JOB_ID)
 
     importer = AsyncMock()
-    worker_pipeline = Mock()
-    worker_pipeline.__aenter__ = AsyncMock(return_value=worker_pipeline)
-    worker_pipeline.__aexit__ = AsyncMock(return_value=None)
-    worker_pipeline.get = Mock()
-    worker_pipeline.incr = Mock()
-    worker_pipeline.expire = Mock()
-    worker_pipeline.execute = AsyncMock(return_value=[None, 1, True])
+    claim_pipeline = Mock()
+    claim_pipeline.__aenter__ = AsyncMock(return_value=claim_pipeline)
+    claim_pipeline.__aexit__ = AsyncMock(return_value=None)
+    claim_pipeline.execute = AsyncMock(return_value=[None, 1, True])
+    finish_pipeline = Mock()
+    finish_pipeline.__aenter__ = AsyncMock(return_value=finish_pipeline)
+    finish_pipeline.__aexit__ = AsyncMock(return_value=None)
+    finish_pipeline.execute = AsyncMock(return_value=[])
     worker_pool = Mock()
-    worker_pool.pipeline.return_value = worker_pipeline
+    worker_pool.pipeline.side_effect = [claim_pipeline, finish_pipeline]
     worker = types.SimpleNamespace(
         pool=worker_pool,
         allow_abort_jobs=False,
         functions={IMPORTER: types.SimpleNamespace(coroutine=importer)},
         keep_result_forever=False,
-        keep_result_s=0,
+        keep_result_s=3600,
         jobs_failed=0,
         job_serializer=None,
         queue_name=QUEUE,
-        finish_failed_job=AsyncMock(),
     )
+    worker.finish_failed_job = types.MethodType(Worker.finish_failed_job, worker)
 
     await Worker.run_job(worker, JOB_ID, 1)
 
     importer.assert_not_awaited()
-    worker.finish_failed_job.assert_awaited_once()
     assert worker.jobs_failed == 1
+    finish_pipeline.set.assert_called_once()
+    assert finish_pipeline.set.call_args.args[0] == KEYS[-1]
+
+    _connection, _redis_pool, retry_pipeline = _install_dependencies(
+        monkeypatch,
+        _run(),
+        queue_score=None,
+        key_presence=(False, False, False, True),
+    )
+    retry_receipt = await control_imports.reconcile_terminal_queue_residue(
+        RUN_ID,
+        BODY,
+    )
+
+    assert retry_receipt["already_absent"] is True
+    assert retry_receipt["evidence"]["result"] is True
+    retry_pipeline.zrem.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -276,6 +295,30 @@ async def test_reconcile_terminal_queue_residue_refuses_any_arq_key(
 
     pipeline.multi.assert_not_called()
     pipeline.zrem.assert_not_called()
+    pipeline.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("present_index", range(3))
+async def test_already_absent_reconciliation_refuses_executable_arq_state(
+    monkeypatch,
+    present_index,
+):
+    key_presence_flags = tuple(index == present_index for index in range(4))
+    _, _, pipeline = _install_dependencies(
+        monkeypatch,
+        _run(),
+        queue_score=None,
+        key_presence=key_presence_flags,
+    )
+
+    with pytest.raises(
+        control_imports.StaleWorkerReconciliationConflict,
+        match="ARQ job state is present",
+    ):
+        await control_imports.reconcile_terminal_queue_residue(RUN_ID, BODY)
+
+    pipeline.multi.assert_not_called()
     pipeline.execute.assert_not_awaited()
 
 

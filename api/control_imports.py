@@ -2148,13 +2148,18 @@ async def _reconcile_terminal_queue_member(
             )
         ),
     }
-    if any(arq_key_presence_flags):
+    has_executable_arq_state = any(
+        evidence_by_field[field] for field in ("job", "retry", "in_progress")
+    )
+    if has_executable_arq_state or (
+        has_queue_member and evidence_by_field["result"]
+    ):
         raise StaleWorkerReconciliationConflict(
             "ARQ job state is present; refusing queue residue reconciliation"
         )
-    # A worker that selected the member before this ZREM still cannot invoke the
-    # importer: ARQ reads the watched job payload after claiming, and the exact
-    # job key is one of the proven-absent keys above.
+    # A worker that selected the member before this ZREM cannot invoke the
+    # importer without the job payload. It may record a terminal failure result;
+    # with no queue/job/retry/in-progress state, that is safe absent evidence.
     pipe.multi()
     if not has_queue_member:
         pipe.ping()
