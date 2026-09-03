@@ -10,6 +10,7 @@ from sanic.response import HTTPResponse
 
 from api.control_auth import require_control_auth
 from api.control_imports import (
+    reconcile_terminal_queue_residue,
     reconcile_stale_worker_failure,
     StaleWorkerReconciliationConflict,
     StaleWorkerReconciliationUnavailable,
@@ -42,6 +43,30 @@ async def control_reconcile_stale_worker(request, run_id: str) -> HTTPResponse:
     return response.json(receipt_by_field, default=str)
 
 
+async def control_reconcile_terminal_queue_residue(
+    request,
+    run_id: str,
+) -> HTTPResponse:
+    """Remove one exact orphaned queue member for a terminal import run."""
+
+    require_control_auth(request)
+    request_by_field = request.json if isinstance(request.json, dict) else {}
+    try:
+        receipt_by_field = await reconcile_terminal_queue_residue(
+            run_id,
+            request_by_field,
+        )
+    except StaleWorkerReconciliationConflict as exc:
+        raise SanicException(str(exc), status_code=409) from exc
+    except StaleWorkerReconciliationUnavailable as exc:
+        raise SanicException(str(exc), status_code=503) from exc
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    if receipt_by_field is None:
+        raise NotFound("import run not found")
+    return response.json(receipt_by_field, default=str)
+
+
 def register_control_routes(blueprint):
     """Register wave and hospital-price control routes."""
 
@@ -49,6 +74,11 @@ def register_control_routes(blueprint):
     blueprint.add_route(
         control_reconcile_stale_worker,
         "/imports/<run_id>/reconcile-stale-worker",
+        methods={"POST"},
+    )
+    blueprint.add_route(
+        control_reconcile_terminal_queue_residue,
+        "/imports/<run_id>/reconcile-terminal-queue-residue",
         methods={"POST"},
     )
 
