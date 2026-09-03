@@ -3287,8 +3287,7 @@ fn derive_npi_prefix_overrides(
                 .checked_add(pattern_groups[*pattern as usize].len())
                 .ok_or(invalid("V4 exact set/group degree overflows"))
         })?;
-        let group_unsafe = exact_group_degree > online_cap;
-        group_unsafe_set_count = group_unsafe_set_count.saturating_add(u64::from(group_unsafe));
+        let degree_over_cap = exact_group_degree > online_cap;
         let source_work = online_source_work(
             SourceWorkInputs {
                 set_index,
@@ -3373,7 +3372,7 @@ fn derive_npi_prefix_overrides(
                 .ok_or(invalid("V4 NPI prefix group merge visits overflow"))?;
             adjusted
         };
-        if group_unsafe && effective_target > 0 && bounded.source_exhausted {
+        if degree_over_cap && effective_target > 0 && bounded.source_exhausted {
             return Err(invalid(
                 "V4 factored set/group degree disagrees with merged source groups",
             ));
@@ -3408,6 +3407,8 @@ fn derive_npi_prefix_overrides(
             physical_unsafe_set_count.saturating_add(u64::from(physical_unsafe));
         let bounded_complete =
             bounded.members.len() >= effective_target || bounded.source_exhausted;
+        group_unsafe_set_count =
+            group_unsafe_set_count.saturating_add(u64::from(!bounded_complete));
         if !physical_unsafe && bounded_complete {
             let visited_groups = bounded.unique_groups_visited as u64;
             groups_to_target.push(visited_groups);
@@ -10390,6 +10391,41 @@ mod tests {
         assert!(high_plan.maximum_group_npi_batch_work >= high_plan.worst_group_npi_work.batches);
         assert_eq!(high_plan.worst_online_provider_set_key, None);
         assert!(high_plan.group_merge_member_visits > 4_096);
+    }
+
+    #[test]
+    fn early_complete_prefix_is_safe_despite_total_group_degree() {
+        let fixture = independent_fixture();
+        let options = ProviderGraphV4Options::default();
+        let mut admission = resource_admission_preflight(
+            std::slice::from_ref(&fixture.shard),
+            &fixture.provider_map,
+            &options,
+        )
+        .unwrap();
+        let groups = (0..4_097u32).collect::<Vec<_>>();
+        let group_npis = groups
+            .iter()
+            .map(|group| vec![group * 2, group * 2 + 1])
+            .collect::<Vec<_>>();
+        let plan = derive_npi_prefix_overrides(
+            NpiPrefixInputs {
+                set_base: 0,
+                set_components: &[vec![0]],
+                component_groups: std::slice::from_ref(&groups),
+                set_patterns: &[vec![0]],
+                pattern_groups: std::slice::from_ref(&groups),
+                group_npis: &group_npis,
+            },
+            &options,
+            &mut admission,
+        )
+        .unwrap();
+
+        assert_eq!(plan.groups_to_target, vec![101]);
+        assert_eq!(plan.group_unsafe_set_count, 0);
+        assert_eq!(plan.physical_unsafe_set_count, 0);
+        assert!(plan.metadata.is_empty());
     }
 
     #[test]
