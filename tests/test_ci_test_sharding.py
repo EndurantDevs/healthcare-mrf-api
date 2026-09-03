@@ -258,13 +258,9 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
     assert "scripts/ci/shard_pytest_nodeids.py" in prepush
     assert "mrf-python-coverage-main-${{ matrix.shard-index }}" in workflow
     assert "pattern: mrf-python-coverage-main-*" in workflow
-    assert yaml.safe_load(workflow)["jobs"]["python-tests"]["timeout-minutes"] == 20
-    assert (
-        yaml.safe_load(workflow)["jobs"]["address-canonical-db-tests"][
-            "timeout-minutes"
-        ]
-        == 15
-    )
+    workflow_jobs = yaml.safe_load(workflow)["jobs"]
+    assert workflow_jobs["python-tests"]["timeout-minutes"] == 20
+    assert workflow_jobs["address-canonical-db-tests"]["timeout-minutes"] == 15
     assert "mrf-python-coverage-postgres-${{ matrix.shard }}" in workflow
     assert "pattern: mrf-python-coverage-postgres-*" in workflow
     assert 'scripts/ci/prepush postgres "${{ matrix.shard }}"' in workflow
