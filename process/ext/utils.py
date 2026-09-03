@@ -423,15 +423,26 @@ async def _download_parallel_by_ranges(
         progress=_RangeDownloadProgress(0, start_time, start_time),
     )
 
+    is_complete = False
     try:
-        await asyncio.gather(
+        outcomes = await asyncio.gather(
             *(
                 _download_range(context, range_start, range_end)
                 for range_start, range_end in ranges
-            )
+            ),
+            return_exceptions=True,
         )
+        failure = next(
+            (outcome for outcome in outcomes if isinstance(outcome, BaseException)),
+            None,
+        )
+        if failure is not None:
+            raise failure
+        is_complete = True
     finally:
         os.close(file_fd)
+        if not is_complete:
+            Path(filepath).unlink(missing_ok=True)
 
 
 def _default_rows_per_insert() -> int:

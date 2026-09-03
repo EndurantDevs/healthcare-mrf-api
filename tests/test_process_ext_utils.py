@@ -157,6 +157,18 @@ async def test_head_download_info_respects_disabled_hosts(monkeypatch):
         client, "https://blocked.example/data"
     ) == (700, False)
     assert client.probe_headers is None
+
+    no_length_client = _Client(_Response({}))
+    assert await utils._head_download_info(
+        no_length_client, "https://blocked.example/data"
+    ) == (None, False)
+
+    failed_head_client = _Client(utils.aiohttp.ClientError("head failed"))
+    assert await utils._head_download_info(
+        failed_head_client, "https://blocked.example/data"
+    ) == (None, False)
+    assert failed_head_client.probe_headers is None
+
     assert utils._is_parallel_download_disabled_for_url(
         "https://child.suffix.example/data"
     )
