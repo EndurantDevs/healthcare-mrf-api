@@ -76,14 +76,25 @@
             ("description", "Modifier percentage"),
             ("modifiers", "TC"),
             ("setting", "outpatient"),
-            (
-                "standard_charge|[PAYER_NAME]|[PLAN_NAME]|negotiated_percentage",
-                "50",
-            ),
+            ("additional_generic_notes", "Generic modifier note"),
         ] {
             modifier[csv_fixture_index(&modifier_records[2], header)] = value.to_owned();
         }
-        modifier_records.push(modifier);
+        modifier_records.push(modifier.clone());
+        let rows = run_fixture(
+            InputFormat::WideCsv,
+            &csv_fixture_bytes(&modifier_records),
+            false,
+        );
+        assert!(!rows["modifier"].is_empty());
+        assert!(rows["modifier_payer"].is_empty());
+
+        let placeholder_percentage = csv_fixture_index(
+            &modifier_records[2],
+            "standard_charge|[PAYER_NAME]|[PLAN_NAME]|negotiated_percentage",
+        );
+        modifier[placeholder_percentage] = "50".to_owned();
+        *modifier_records.last_mut().unwrap() = modifier;
         assert_import_error(
             InputFormat::WideCsv,
             &csv_fixture_bytes(&modifier_records),
