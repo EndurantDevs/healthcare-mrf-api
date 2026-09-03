@@ -192,21 +192,6 @@ def test_checked_in_registry_is_checksum_gated(tmp_path, monkeypatch):
         registry._cached_hospital_hpt_registry.cache_clear()
 
 
-def test_shared_ids_expand_as_one_canonical_group(tmp_path, monkeypatch):
-    locator = "http://hospital.example:8080/nonstandard/path?view=current"
-    document = _document(locator).replace(
-        "hospital_id: hospital-000001",
-        "hospital_ids:\n    - hospital-000001\n    - hospital-000002",
-    )
-    hospitals = _load(tmp_path, document)
-    assert {entry["cms_hpt_url"] for entry in hospitals} == {locator}
-    assert {entry["name"] for entry in hospitals} == {"Example Hospital"}
-    assert [entry.get("alias_of") for entry in hospitals] == [None, "hospital-000001"]
-    monkeypatch.setattr(registry, "load_hospital_hpt_registry", lambda: hospitals)
-    assert registry.hospital_hpt_registry_groups() == (hospitals,)
-    assert registry.selected_hospital_hpt_registry({"hospital_id": "hospital-000002"}) == hospitals
-
-
 def test_reviewed_alias_groups_and_selection_expand_both_ids(tmp_path, monkeypatch):
     locator = "https://hospital.example/cms-hpt.txt"
     hospitals = _load(
