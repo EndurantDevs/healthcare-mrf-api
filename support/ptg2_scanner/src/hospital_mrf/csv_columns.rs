@@ -314,11 +314,6 @@ fn parse_wide_columns(
             }
             _ => continue,
         };
-        if is_wide_payer_placeholder(payer_name) || is_wide_payer_placeholder(plan_name) {
-            return Err(invalid(
-                "wide CSV payer headers must replace payer and plan placeholders",
-            ));
-        }
         let negotiated_rate_term = rate_term
             .map(canonical_wide_rate_term)
             .transpose()?;

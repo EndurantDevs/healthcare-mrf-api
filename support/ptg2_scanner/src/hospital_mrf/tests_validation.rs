@@ -399,26 +399,6 @@
             .unwrap()
             .contains("\t[Aetna]\t[MADV]\t"));
 
-        let placeholder_headers = records[2]
-            .iter()
-            .map(|header| {
-                header.replace(
-                    "Payer, Inc.|Plan A",
-                    "[PAYER_NAME]|[PLAN_NAME]",
-                )
-            })
-            .collect::<Vec<_>>();
-        let error =
-            parse_wide_columns(
-                &StringRecord::from(placeholder_headers),
-                CmsProfile::V3,
-                1,
-            )
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("must replace payer and plan placeholders"));
-
         let headers = records[2]
             .iter()
             .enumerate()
@@ -514,4 +494,34 @@
             ],
         );
         run_fixture(InputFormat::WideCsv, &note_only_payer, false);
+    }
+
+    #[test]
+    fn wide_payer_placeholders_are_ignored_only_when_empty() {
+        let mut records = csv_fixture_records(&fixture_wide_csv());
+        for column in 0..records[2].len() {
+            if records[2][column].contains("Payer, Inc.|Plan A") {
+                records[2][column] = records[2][column]
+                    .replace("Payer, Inc.|Plan A", "[PAYER_NAME]|[PLAN_NAME]");
+                records[3][column].clear();
+            }
+        }
+        let rows = run_fixture(
+            InputFormat::WideCsv,
+            &csv_fixture_bytes(&records),
+            false,
+        );
+        assert!(rows["payer_charge"].is_empty());
+
+        let negotiated_dollar = csv_fixture_index(
+            &records[2],
+            "standard_charge|[PAYER_NAME]|[PLAN_NAME]|negotiated_dollar",
+        );
+        records[3][negotiated_dollar] = "1".to_owned();
+        assert_import_error(
+            InputFormat::WideCsv,
+            &csv_fixture_bytes(&records),
+            DEFAULT_MAX_FANOUT_ROWS,
+            "wide CSV payer headers must replace payer and plan placeholders",
+        );
     }

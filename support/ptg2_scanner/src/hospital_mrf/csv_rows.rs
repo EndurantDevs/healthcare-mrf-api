@@ -166,6 +166,7 @@ fn parse_wide_modifier_payers(
 ) -> io::Result<Vec<ModifierPayerRow>> {
     let mut payers = Vec::new();
     for payer in columns {
+        reject_used_wide_payer_placeholder(record, payer)?;
         let adjustment_columns = [
             payer.standard_charge_dollar,
             payer.standard_charge_percentage,
@@ -315,6 +316,7 @@ fn parse_wide_payers(
 ) -> io::Result<Vec<PayerChargeRow>> {
     let mut payers = Vec::new();
     for payer in columns {
+        reject_used_wide_payer_placeholder(record, payer)?;
         let relevant_columns = [
             Some(payer.standard_charge_dollar),
             Some(payer.standard_charge_percentage),
@@ -390,6 +392,38 @@ fn parse_wide_payers(
         payers.push(validate_csv_payer(parsed, None, true, profile)?);
     }
     Ok(payers)
+}
+
+fn reject_used_wide_payer_placeholder(
+    record: &StringRecord,
+    payer: &WidePayerColumns,
+) -> io::Result<()> {
+    if !is_wide_payer_placeholder(&payer.payer_name)
+        && !is_wide_payer_placeholder(&payer.plan_name)
+    {
+        return Ok(());
+    }
+    let evidence_columns = [
+        Some(payer.standard_charge_dollar),
+        Some(payer.standard_charge_percentage),
+        Some(payer.standard_charge_algorithm),
+        payer.estimated_amount,
+        payer.median_amount,
+        payer.percentile_10,
+        payer.percentile_90,
+        payer.allowed_count,
+        Some(payer.methodology),
+        Some(payer.additional_payer_notes),
+    ];
+    if evidence_columns
+        .iter()
+        .any(|column| !csv_profile_value(record, *column).is_empty())
+    {
+        return Err(invalid(
+            "wide CSV payer headers must replace payer and plan placeholders",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_tall_records<R: Read>(
