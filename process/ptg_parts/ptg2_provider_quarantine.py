@@ -55,9 +55,11 @@ def _sha256_text(value: Any, field_name: str) -> str:
 def _provider_group_conflicts(
     conflicts: Iterable[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    canonical: list[dict[str, Any]] = []
+    canonical_conflicts: list[dict[str, Any]] = []
     definition_count = 0
     for conflict in conflicts:
+        if len(canonical_conflicts) >= _MAX_PROVIDER_GROUP_CONFLICTS:
+            raise ValueError("provider group conflicts exceed 1024 identifiers")
         if not isinstance(conflict, Mapping) or set(conflict) != {
             "provider_group_id_sha256",
             "definition_sha256",
@@ -69,33 +71,35 @@ def _provider_group_conflicts(
         raw_definitions = conflict.get("definition_sha256")
         if not isinstance(raw_definitions, (list, tuple)):
             raise ValueError("provider group conflict definitions must be an array")
-        definition_sha256 = [
-            _sha256_text(value, "definition digest") for value in raw_definitions
+        if (
+            len(raw_definitions)
+            > _MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS - definition_count
+        ):
+            raise ValueError("provider group conflicts exceed 4096 definitions")
+        definition_digests = [
+            _sha256_text(definition_digest, "definition digest")
+            for definition_digest in raw_definitions
         ]
-        if len(definition_sha256) < 2 or definition_sha256 != sorted(
-            set(definition_sha256)
+        if len(definition_digests) < 2 or definition_digests != sorted(
+            set(definition_digests)
         ):
             raise ValueError(
                 "provider group conflict definitions are not canonical"
             )
-        definition_count += len(definition_sha256)
-        canonical.append(
+        definition_count += len(definition_digests)
+        canonical_conflicts.append(
             {
                 "provider_group_id_sha256": provider_group_id_sha256,
-                "definition_sha256": definition_sha256,
+                "definition_sha256": definition_digests,
             }
         )
-    canonical.sort(
+    canonical_conflicts.sort(
         key=lambda conflict: (
             conflict["provider_group_id_sha256"],
             conflict["definition_sha256"],
         )
     )
-    if len(canonical) > _MAX_PROVIDER_GROUP_CONFLICTS:
-        raise ValueError("provider group conflicts exceed 1024 identifiers")
-    if definition_count > _MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS:
-        raise ValueError("provider group conflicts exceed 4096 definitions")
-    return canonical
+    return canonical_conflicts
 
 
 def _digest_v2(
@@ -167,6 +171,32 @@ def provider_identifier_quarantine_payload(
     }
 
 
+def _quarantined_identifier_counts(entries: list[Any]) -> Counter[int]:
+    counts_by_identifier: Counter[int] = Counter()
+    previous_identifier: int | None = None
+    for entry in entries:
+        if not isinstance(entry, Mapping) or set(entry) != {
+            "value",
+            "occurrence_count",
+        }:
+            raise ValueError("provider identifier quarantine entry is incompatible")
+        identifier_text = entry.get("value")
+        occurrence_count = entry.get("occurrence_count")
+        if not isinstance(identifier_text, str):
+            raise ValueError("quarantined provider identifier value must be text")
+        try:
+            identifier = int(identifier_text)
+        except ValueError as exc:
+            raise ValueError("quarantined provider identifier value is invalid") from exc
+        if str(identifier) != identifier_text:
+            raise ValueError("quarantined provider identifier value is not canonical")
+        if previous_identifier is not None and identifier <= previous_identifier:
+            raise ValueError("quarantined provider identifier values are not ordered")
+        previous_identifier = identifier
+        counts_by_identifier[identifier] = occurrence_count
+    return counts_by_identifier
+
+
 def validate_provider_identifier_quarantine(
     quarantine_payload: Any,
 ) -> dict[str, Any]:
@@ -198,40 +228,19 @@ def validate_provider_identifier_quarantine(
     entries = quarantine_payload.get("entries")
     if not isinstance(entries, list):
         raise ValueError("provider identifier quarantine entries must be an array")
-    counts: Counter[int] = Counter()
-    previous_value: int | None = None
-    for entry in entries:
-        if not isinstance(entry, Mapping) or set(entry) != {
-            "value",
-            "occurrence_count",
-        }:
-            raise ValueError("provider identifier quarantine entry is incompatible")
-        value_text = entry.get("value")
-        count = entry.get("occurrence_count")
-        if not isinstance(value_text, str):
-            raise ValueError("quarantined provider identifier value must be text")
-        try:
-            identifier = int(value_text)
-        except ValueError as exc:
-            raise ValueError("quarantined provider identifier value is invalid") from exc
-        if str(identifier) != value_text:
-            raise ValueError("quarantined provider identifier value is not canonical")
-        if previous_value is not None and identifier <= previous_value:
-            raise ValueError("quarantined provider identifier values are not ordered")
-        previous_value = identifier
-        counts[identifier] = count
+    counts_by_identifier = _quarantined_identifier_counts(entries)
     raw_conflicts = (
         quarantine_payload.get("provider_group_definition_conflicts", ())
         if contract == PTG2_PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT_V2
         else ()
     )
-    canonical = provider_identifier_quarantine_payload(
-        counts,
+    canonical_payload = provider_identifier_quarantine_payload(
+        counts_by_identifier,
         provider_group_definition_conflicts=raw_conflicts,
     )
-    if dict(quarantine_payload) != canonical:
+    if dict(quarantine_payload) != canonical_payload:
         raise ValueError("provider identifier quarantine digest or counts do not match")
-    return canonical
+    return canonical_payload
 
 
 def provider_identifier_quarantine_evidence(
@@ -263,7 +272,7 @@ def validate_provider_identifier_quarantine_evidence(
     evidence_fields = frozenset(evidence_by_field)
     if evidence_fields not in {_EVIDENCE_FIELDS_V1, _EVIDENCE_FIELDS_V2}:
         raise ValueError("provider identifier quarantine evidence is incompatible")
-    contract_is_valid = (
+    is_contract_valid = (
         evidence_fields == _EVIDENCE_FIELDS_V1
         and contract == PTG2_PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT
     ) or (
@@ -274,7 +283,7 @@ def validate_provider_identifier_quarantine_evidence(
     distinct_count = evidence_by_field.get("distinct_value_count")
     digest = evidence_by_field.get("sha256")
     if (
-        not contract_is_valid
+        not is_contract_valid
         or type(occurrence_count) is not int
         or occurrence_count < 0
         or occurrence_count >= 2**64
@@ -311,12 +320,24 @@ def combine_provider_identifier_quarantines(
     """Combine exact per-source quarantine payloads into one snapshot payload."""
 
     counts: Counter[int] = Counter()
-    conflicts: list[dict[str, Any]] = []
+    definition_digests_by_identifier: dict[str, set[str]] = {}
     for payload in payloads:
         canonical = validate_provider_identifier_quarantine(payload)
         for entry in canonical["entries"]:
             counts[int(entry["value"])] += int(entry["occurrence_count"])
-        conflicts.extend(canonical.get("provider_group_definition_conflicts", ()))
+        for conflict in canonical.get("provider_group_definition_conflicts", ()):
+            definition_digests_by_identifier.setdefault(
+                conflict["provider_group_id_sha256"], set()
+            ).update(conflict["definition_sha256"])
+    conflicts = [
+        {
+            "provider_group_id_sha256": identifier_digest,
+            "definition_sha256": sorted(definition_digests),
+        }
+        for identifier_digest, definition_digests in sorted(
+            definition_digests_by_identifier.items()
+        )
+    ]
     return provider_identifier_quarantine_payload(
         counts,
         provider_group_definition_conflicts=conflicts,

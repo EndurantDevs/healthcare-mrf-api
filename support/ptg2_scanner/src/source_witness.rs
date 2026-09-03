@@ -863,6 +863,18 @@ impl SourceWitnessCollector {
         .read_bounded(locator, SOURCE_WITNESS_MAX_DECODED_EVIDENCE_BYTES)
     }
 
+    pub fn read_provider_source_for_replay(
+        &self,
+        locator: ProviderSourceLocator,
+    ) -> io::Result<Vec<u8>> {
+        io_option(
+            self.provider_spools.get(),
+            io::ErrorKind::Other,
+            "provider source spools are not configured",
+        )?
+        .read_bounded(locator, usize::MAX)
+    }
+
     #[cfg(test)]
     pub fn rate_occurrence_candidates(
         &self,

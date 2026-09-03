@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process import ptg_control
+from process.ptg_parts.ptg2_shared_audit import ReusableLayoutAuditCorruption
 from process.ptg_parts.ptg2_source_witness_contract import (
     WitnessPayloadLimitError,
 )
@@ -223,7 +224,7 @@ async def test_ptg_control_classifies_corrupt_reusable_layout_audit(monkeypatch)
     marks = []
 
     async def fake_ptg_main(**_kwargs):
-        raise RuntimeError(
+        raise ReusableLayoutAuditCorruption(
             "reused shared PTG layout audit rows disagree with its manifest"
         )
 

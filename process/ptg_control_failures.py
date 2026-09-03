@@ -12,14 +12,12 @@ from process.ptg_singleton_direct_control import (
 from process.ptg_parts.ptg2_source_witness_contract import (
     WitnessPayloadLimitError,
 )
+from process.ptg_parts.ptg2_shared_audit import ReusableLayoutAuditCorruption
 
 
 _PROVIDER_GROUP_DEFINITION_ERROR_MARKERS = (
     "conflicting provider_group_id definition:",
     "duplicate provider_group_id definition:",
-)
-_REUSABLE_LAYOUT_AUDIT_ERROR_MARKER = (
-    "reused shared PTG layout audit rows disagree with its manifest"
 )
 
 
@@ -31,6 +29,23 @@ def _exception_leaves(error: BaseException) -> tuple[BaseException, ...]:
             for leaf in _exception_leaves(nested_error)
         )
     return (error,)
+
+
+def _fallback_failure_payload(
+    error: BaseException,
+    error_leaves: tuple[BaseException, ...],
+) -> dict[str, Any]:
+    leaf_messages = tuple(
+        dict.fromkeys(
+            str(error_leaf).strip()
+            for error_leaf in error_leaves
+            if str(error_leaf).strip()
+        )
+    )
+    return {
+        "code": "ptg_import_failed",
+        "message": "; ".join(leaf_messages) if leaf_messages else str(error),
+    }
 
 
 def ptg_failure_error(error: BaseException) -> dict[str, Any]:
@@ -71,7 +86,7 @@ def ptg_failure_error(error: BaseException) -> dict[str, Any]:
         (
             error_leaf
             for error_leaf in error_leaves
-            if _REUSABLE_LAYOUT_AUDIT_ERROR_MARKER in str(error_leaf)
+            if isinstance(error_leaf, ReusableLayoutAuditCorruption)
         ),
         None,
     )
@@ -87,19 +102,7 @@ def ptg_failure_error(error: BaseException) -> dict[str, Any]:
     direct_failure = singleton_direct_failure_payload(error_leaves)
     if direct_failure is not None:
         return direct_failure
-    leaf_messages = tuple(
-        dict.fromkeys(
-            str(error_leaf).strip()
-            for error_leaf in error_leaves
-            if str(error_leaf).strip()
-        )
-    )
-    return {
-        "code": "ptg_import_failed",
-        "message": (
-            "; ".join(leaf_messages) if leaf_messages else str(error)
-        ),
-    }
+    return _fallback_failure_payload(error, error_leaves)
 
 
 __all__ = ["ptg_failure_error"]

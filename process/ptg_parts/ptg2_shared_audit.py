@@ -61,6 +61,10 @@ _GRAPH_LAYOUT = {
 }
 
 
+class ReusableLayoutAuditCorruption(RuntimeError):
+    """A sealed reusable layout has invalid persisted audit state."""
+
+
 @dataclass(frozen=True)
 class AuditCandidate:
     code_key: int
@@ -666,10 +670,11 @@ async def _validate_snapshot_source_dictionary(
     logical_snapshot_id: str,
     source_count: int,
     required_source_keys: Iterable[int],
+    corruption_error: type[RuntimeError] = RuntimeError,
 ) -> None:
     normalized_source_count = int(source_count)
     if normalized_source_count <= 0:
-        raise RuntimeError("strict V3 audit requires a positive source_count")
+        raise corruption_error("strict V3 audit requires a positive source_count")
     schema = _quote_ident(schema_name)
     source_key_result = await session.execute(
         db.text(
@@ -682,20 +687,30 @@ async def _validate_snapshot_source_dictionary(
         ),
         {"snapshot_id": str(logical_snapshot_id)},
     )
-    observed_source_keys = tuple(
-        int(_row_mapping(database_row)["source_key"])
-        for database_row in source_key_result
-    )
+    try:
+        observed_source_keys = tuple(
+            int(_row_mapping(database_row)["source_key"])
+            for database_row in source_key_result
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise corruption_error(
+            "strict V3 audit snapshot source dictionary contains invalid source keys"
+        ) from exc
     expected_source_keys = tuple(range(normalized_source_count))
     if observed_source_keys != expected_source_keys:
-        raise RuntimeError(
+        raise corruption_error(
             "strict V3 audit snapshot source dictionary is not complete and dense"
         )
-    missing_source_keys = {
-        int(source_key) for source_key in required_source_keys
-    } - set(observed_source_keys)
+    try:
+        missing_source_keys = {
+            int(source_key) for source_key in required_source_keys
+        } - set(observed_source_keys)
+    except (TypeError, ValueError) as exc:
+        raise corruption_error(
+            "strict V3 audit occurrence source keys are invalid"
+        ) from exc
     if missing_source_keys:
-        raise RuntimeError(
+        raise corruption_error(
             "strict V3 audit occurrence source keys are absent from the snapshot source dictionary"
         )
 
@@ -1694,17 +1709,24 @@ async def sealed_audit_sample_metadata(
         len(audit_occurrences) != sample_count
         or _sample_digest(audit_occurrences).hex() != expected_digest
     ):
-        raise RuntimeError(
+        raise ReusableLayoutAuditCorruption(
             "reused shared PTG layout audit rows disagree with its manifest"
         )
+    try:
+        source_count = _integer(metadata.get("source_count"), "audit source_count")
+    except RuntimeError as exc:
+        raise ReusableLayoutAuditCorruption(
+            "reused strict V3 layout has an invalid audit source_count"
+        ) from exc
     await _validate_snapshot_source_dictionary(
         session,
         schema_name=schema_name,
         logical_snapshot_id=str(logical_snapshot_id),
-        source_count=_integer(metadata.get("source_count"), "audit source_count"),
+        source_count=source_count,
         required_source_keys=(
             occurrence.source_key for occurrence in audit_occurrences
         ),
+        corruption_error=ReusableLayoutAuditCorruption,
     )
     return metadata
 
@@ -1737,7 +1759,9 @@ async def _sealed_layout_manifest(
     )
     layout_manifest = layout_result.scalar()
     if not isinstance(layout_manifest, Mapping):
-        raise RuntimeError("reused strict V3 layout is missing its manifest")
+        raise ReusableLayoutAuditCorruption(
+            "reused strict V3 layout is missing its manifest"
+        )
     return layout_manifest
 
 
@@ -1751,7 +1775,7 @@ def _audit_metadata_from_layout(
         else None
     )
     if not isinstance(audit_sample, Mapping):
-        raise RuntimeError(
+        raise ReusableLayoutAuditCorruption(
             "reused strict V3 layout is missing its audit sample contract"
         )
     return dict(audit_sample)
@@ -1760,22 +1784,41 @@ def _audit_metadata_from_layout(
 def _validated_sealed_audit_contract(
     metadata: Mapping[str, Any],
 ) -> tuple[int, str]:
+    try:
+        format_version = _integer(
+            metadata.get("format_version"), "audit sample format version"
+        )
+    except RuntimeError as exc:
+        raise ReusableLayoutAuditCorruption(
+            "reused strict V3 layout has an incompatible audit sample contract"
+        ) from exc
     if (
         metadata.get("contract") != PTG2_V3_AUDIT_CONTRACT
-        or _integer(metadata.get("format_version"), "audit sample format version") != 2
+        or format_version != 2
         or metadata.get("method") != PTG2_V3_AUDIT_METHOD
         or metadata.get("serving_multiplicity_semantics")
         != PTG2_V3_SERVING_MULTIPLICITY_SEMANTICS
     ):
-        raise RuntimeError(
+        raise ReusableLayoutAuditCorruption(
             "reused strict V3 layout has an incompatible audit sample contract"
         )
-    sample_count = _integer(metadata.get("sample_count"), "audit sample count")
+    try:
+        sample_count = _integer(metadata.get("sample_count"), "audit sample count")
+    except RuntimeError as exc:
+        raise ReusableLayoutAuditCorruption(
+            "reused strict V3 layout has an invalid audit sample count"
+        ) from exc
     if sample_count > PTG2_V3_AUDIT_MAX_SAMPLE_ROWS:
-        raise RuntimeError("reused strict V3 layout exceeds the audit sample row cap")
+        raise ReusableLayoutAuditCorruption(
+            "reused strict V3 layout exceeds the audit sample row cap"
+        )
     expected_digest = str(metadata.get("sample_digest") or "").strip().lower()
-    if len(expected_digest) != 64:
-        raise RuntimeError("reused strict V3 layout has an invalid audit sample digest")
+    if len(expected_digest) != 64 or any(
+        character not in "0123456789abcdef" for character in expected_digest
+    ):
+        raise ReusableLayoutAuditCorruption(
+            "reused strict V3 layout has an invalid audit sample digest"
+        )
     return sample_count, expected_digest
 
 
@@ -1825,6 +1868,7 @@ def _stored_audit_occurrence(database_row: Mapping[str, Any]) -> AuditOccurrence
 __all__ = [
     "AuditCandidate",
     "AuditOccurrence",
+    "ReusableLayoutAuditCorruption",
     "SharedAuditPublication",
     "build_audit_occurrences",
     "load_audit_candidates",

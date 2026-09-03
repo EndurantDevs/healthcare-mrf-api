@@ -47,20 +47,20 @@ def test_quarantine_rejects_valid_npis_and_tampered_digest():
 
 
 def test_quarantine_v2_seals_and_combines_provider_group_definition_conflicts():
-    conflict = {
+    conflict_by_field = {
         "provider_group_id_sha256": "1" * 64,
         "definition_sha256": ["2" * 64, "3" * 64],
     }
     first = provider_identifier_quarantine_payload(
         {123456789: 2},
-        provider_group_definition_conflicts=(conflict,),
+        provider_group_definition_conflicts=(conflict_by_field,),
     )
     second = provider_identifier_quarantine_payload({})
 
     assert first["contract"] == "ptg2_provider_identifier_quarantine_v2"
     assert first["provider_group_conflict_count"] == 1
     assert first["provider_group_conflicting_definition_count"] == 2
-    assert first["provider_group_definition_conflicts"] == [conflict]
+    assert first["provider_group_definition_conflicts"] == [conflict_by_field]
     assert validate_provider_identifier_quarantine(first) == first
 
     combined = combine_provider_identifier_quarantines((second, first))
@@ -71,14 +71,82 @@ def test_quarantine_v2_seals_and_combines_provider_group_definition_conflicts():
     assert validate_provider_identifier_quarantine_evidence(evidence) == evidence
 
 
-def test_quarantine_v2_rejects_noncanonical_or_tampered_conflict_evidence():
-    conflict = {
+def test_quarantine_v2_combines_duplicate_conflict_evidence_once():
+    conflict_by_field = {
         "provider_group_id_sha256": "1" * 64,
         "definition_sha256": ["2" * 64, "3" * 64],
     }
     payload = provider_identifier_quarantine_payload(
         {},
-        provider_group_definition_conflicts=(conflict,),
+        provider_group_definition_conflicts=(conflict_by_field,),
+    )
+
+    combined = combine_provider_identifier_quarantines((payload, payload))
+
+    assert combined == payload
+    assert combined["provider_group_conflict_count"] == 1
+    assert combined["provider_group_conflicting_definition_count"] == 2
+
+
+def test_quarantine_v2_unions_conflict_definitions_deterministically():
+    first = provider_identifier_quarantine_payload(
+        {},
+        provider_group_definition_conflicts=(
+            {
+                "provider_group_id_sha256": "1" * 64,
+                "definition_sha256": ["2" * 64, "3" * 64],
+            },
+        ),
+    )
+    second = provider_identifier_quarantine_payload(
+        {},
+        provider_group_definition_conflicts=(
+            {
+                "provider_group_id_sha256": "1" * 64,
+                "definition_sha256": ["3" * 64, "4" * 64],
+            },
+        ),
+    )
+    third = provider_identifier_quarantine_payload(
+        {},
+        provider_group_definition_conflicts=(
+            {
+                "provider_group_id_sha256": "1" * 64,
+                "definition_sha256": ["4" * 64, "5" * 64],
+            },
+        ),
+    )
+
+    forward = combine_provider_identifier_quarantines((first, second, third))
+    reverse = combine_provider_identifier_quarantines((third, second, first))
+    partitioned = combine_provider_identifier_quarantines(
+        (combine_provider_identifier_quarantines((first, second)), third)
+    )
+
+    assert forward == reverse == partitioned
+    assert forward["provider_group_conflict_count"] == 1
+    assert forward["provider_group_conflicting_definition_count"] == 4
+    assert forward["provider_group_definition_conflicts"] == [
+        {
+            "provider_group_id_sha256": "1" * 64,
+            "definition_sha256": [
+                "2" * 64,
+                "3" * 64,
+                "4" * 64,
+                "5" * 64,
+            ],
+        }
+    ]
+
+
+def test_quarantine_v2_rejects_noncanonical_or_tampered_conflict_evidence():
+    conflict_by_field = {
+        "provider_group_id_sha256": "1" * 64,
+        "definition_sha256": ["2" * 64, "3" * 64],
+    }
+    payload = provider_identifier_quarantine_payload(
+        {},
+        provider_group_definition_conflicts=(conflict_by_field,),
     )
 
     payload["provider_group_definition_conflicts"][0]["definition_sha256"].reverse()
@@ -88,12 +156,38 @@ def test_quarantine_v2_rejects_noncanonical_or_tampered_conflict_evidence():
     evidence = provider_identifier_quarantine_evidence(
         provider_identifier_quarantine_payload(
             {},
-            provider_group_definition_conflicts=(conflict,),
+            provider_group_definition_conflicts=(conflict_by_field,),
         )
     )
     evidence["provider_group_conflicting_definition_count"] = 1
     with pytest.raises(ValueError, match="evidence"):
         validate_provider_identifier_quarantine_evidence(evidence)
+
+
+def test_quarantine_v2_rejects_conflicts_before_work_exceeds_bounds():
+    too_many_definitions = [f"{index:064x}" for index in range(4097)]
+    with pytest.raises(ValueError, match="exceed 4096 definitions"):
+        provider_identifier_quarantine_payload(
+            {},
+            provider_group_definition_conflicts=(
+                {
+                    "provider_group_id_sha256": "1" * 64,
+                    "definition_sha256": too_many_definitions,
+                },
+            ),
+        )
+
+    conflicts = (
+        {
+            "provider_group_id_sha256": f"{index:064x}",
+            "definition_sha256": ["a" * 64, "b" * 64],
+        }
+        for index in range(1025)
+    )
+    with pytest.raises(ValueError, match="exceed 1024 identifiers"):
+        provider_identifier_quarantine_payload(
+            {}, provider_group_definition_conflicts=conflicts
+        )
 
 
 def test_quarantine_v2_digest_matches_rust_scanner_contract():
