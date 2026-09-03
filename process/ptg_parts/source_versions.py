@@ -27,137 +27,121 @@ async def _push_ptg2_objects_from_facade(rows: list[dict[str, Any]], cls, *, rew
     await ptg_module._push_ptg2_objects(rows, cls, rewrite=rewrite)
 
 
-async def _record_source_version(
+def _source_identity_row(
     source_type: str,
     domain: str,
     raw_artifact: PTG2RawArtifact,
-    logical_artifact: PTG2LogicalArtifact,
-    import_run_id: str | None = None,
-) -> PTG2SourceVersion:
-    """Record one retained raw and logical source version."""
-    source_identity_hash = _source_identity_hash(source_type, raw_artifact.canonical_url)
-    logical_hash_deferred = bool(logical_artifact.logical_hash_deferred)
-    content_identity_kind = (
-        "raw_container_sha256_v1"
-        if logical_hash_deferred
-        else "logical_json_sha256_v1"
-    )
-    source_version_field_map = {
+    source_identity_hash: str,
+    now: Any,
+) -> dict[str, Any]:
+    return {
         "source_identity_hash": source_identity_hash,
+        "hash_prefix": hash_prefix(source_identity_hash),
+        "source_type": source_type,
+        "canonical_url": raw_artifact.canonical_url,
+        "original_url": raw_artifact.original_url,
+        "payload": {
+            "source_type": source_type,
+            "domain": domain,
+            "canonical_url": raw_artifact.canonical_url,
+            "original_url": raw_artifact.original_url,
+        },
+        "created_at": now,
+    }
+
+
+def _content_identity_row(
+    domain: str,
+    logical_artifact: PTG2LogicalArtifact,
+    logical_hash_deferred: bool,
+    content_identity_kind: str,
+    content_hash: str,
+    now: Any,
+) -> dict[str, Any]:
+    return {
+        "content_hash": content_hash,
+        "hash_prefix": hash_prefix(content_hash),
+        "domain": domain,
+        "logical_sha256": logical_artifact.logical_sha256,
+        "canonical_payload": {
+            "domain": domain,
+            "logical_sha256": logical_artifact.logical_sha256,
+            "compression": logical_artifact.compression,
+            "member_name": logical_artifact.member_name,
+            "logical_hash_deferred": logical_hash_deferred,
+            "identity_kind": content_identity_kind,
+        },
+        "created_at": now,
+    }
+
+
+def _source_file_version_row(
+    raw_artifact: PTG2RawArtifact,
+    logical_artifact: PTG2LogicalArtifact,
+    import_run_id: str | None,
+    source_identity_hash: str,
+    content_hash: str,
+    source_file_version_id: str,
+    logical_hash_deferred: bool,
+    now: Any,
+) -> dict[str, Any]:
+    return {
+        "source_file_version_id": source_file_version_id,
+        "source_identity_hash": source_identity_hash,
+        "content_hash": content_hash,
+        "raw_storage_uri": raw_artifact.raw_storage_uri,
         "raw_sha256": raw_artifact.raw_sha256,
         "logical_sha256": logical_artifact.logical_sha256,
-        "content_identity_kind": content_identity_kind,
-        "etag": raw_artifact.head.etag if raw_artifact.head else None,
         "content_length": raw_artifact.head.content_length if raw_artifact.head else raw_artifact.byte_count,
+        "etag": raw_artifact.head.etag if raw_artifact.head else None,
         "last_modified": raw_artifact.head.last_modified if raw_artifact.head else None,
-    }
-    source_file_version_id = semantic_hash(
-        source_version_field_map,
-        domain="source_file_version",
-    )[:32]
-    content_hash = semantic_hash(
-        {
-            "domain": domain,
-            "identity_kind": content_identity_kind,
-            "sha256": logical_artifact.logical_sha256,
+        "reuse_policy": "metadata_or_hash",
+        "verification_mode": raw_artifact.verification_mode,
+        "reused_from_source_file_version_id": raw_artifact.reused_from_source_file_version_id,
+        "verified_at": now,
+        "created_at": now,
+        "payload": {
+            "import_run_id": import_run_id,
+            "reused": raw_artifact.reused,
+            "logical_byte_count": logical_artifact.byte_count,
+            "raw_byte_count": raw_artifact.byte_count,
+            "logical_hash_deferred": logical_hash_deferred,
         },
-        domain="content_identity",
-    )
-    now = _utcnow()
-    await _push_ptg2_objects_from_facade(
-        [
-            {
-                "source_identity_hash": source_identity_hash,
-                "hash_prefix": hash_prefix(source_identity_hash),
-                "source_type": source_type,
-                "canonical_url": raw_artifact.canonical_url,
-                "original_url": raw_artifact.original_url,
-                "payload": {
-                    "source_type": source_type,
-                    "domain": domain,
-                    "canonical_url": raw_artifact.canonical_url,
-                    "original_url": raw_artifact.original_url,
-                },
-                "created_at": now,
-            }
-        ],
-        PTG2SourceIdentity,
-        rewrite=True,
-    )
-    await _push_ptg2_objects_from_facade(
-        [
-            {
-                "content_hash": content_hash,
-                "hash_prefix": hash_prefix(content_hash),
-                "domain": domain,
-                "logical_sha256": logical_artifact.logical_sha256,
-                "canonical_payload": {
-                    "domain": domain,
-                    "logical_sha256": logical_artifact.logical_sha256,
-                    "compression": logical_artifact.compression,
-                    "member_name": logical_artifact.member_name,
-                    "logical_hash_deferred": logical_hash_deferred,
-                    "identity_kind": content_identity_kind,
-                },
-                "created_at": now,
-            }
-        ],
-        PTG2ContentIdentity,
-        rewrite=True,
-    )
-    await _push_ptg2_objects_from_facade(
-        [
-            {
-                "source_file_version_id": source_file_version_id,
-                "source_identity_hash": source_identity_hash,
-                "content_hash": content_hash,
-                "raw_storage_uri": raw_artifact.raw_storage_uri,
-                "raw_sha256": raw_artifact.raw_sha256,
-                "logical_sha256": logical_artifact.logical_sha256,
-                "content_length": raw_artifact.head.content_length if raw_artifact.head else raw_artifact.byte_count,
-                "etag": raw_artifact.head.etag if raw_artifact.head else None,
-                "last_modified": raw_artifact.head.last_modified if raw_artifact.head else None,
-                "reuse_policy": "metadata_or_hash",
-                "verification_mode": raw_artifact.verification_mode,
-                "reused_from_source_file_version_id": raw_artifact.reused_from_source_file_version_id,
-                "verified_at": now,
-                "created_at": now,
-                "payload": {
-                    "import_run_id": import_run_id,
-                    "reused": raw_artifact.reused,
-                    "logical_byte_count": logical_artifact.byte_count,
-                    "raw_byte_count": raw_artifact.byte_count,
-                    "logical_hash_deferred": logical_hash_deferred,
-                },
-            }
-        ],
-        PTG2SourceFileVersion,
-        rewrite=True,
-    )
-    await _push_ptg2_objects_from_facade(
-        [
-            {
-                "artifact_id": semantic_hash(
-                    {"kind": PTG2_ARTIFACT_RAW, "storage_uri": raw_artifact.raw_storage_uri},
-                    domain="artifact_manifest",
-                )[:32],
-                "snapshot_id": None,
-                "import_run_id": import_run_id,
-                "artifact_kind": PTG2_ARTIFACT_RAW,
-                "storage_uri": raw_artifact.raw_storage_uri,
-                "sha256": raw_artifact.raw_sha256,
-                "byte_count": raw_artifact.byte_count,
-                "payload": {
-                    "canonical_url": raw_artifact.canonical_url,
-                    "verification_mode": raw_artifact.verification_mode,
-                    "reused": raw_artifact.reused,
-                },
-                "created_at": now,
-            }
-        ],
-        PTG2ArtifactManifest,
-        rewrite=True,
-    )
+    }
+
+
+def _artifact_manifest_row(
+    raw_artifact: PTG2RawArtifact,
+    import_run_id: str | None,
+    now: Any,
+) -> dict[str, Any]:
+    return {
+        "artifact_id": semantic_hash(
+            {"kind": PTG2_ARTIFACT_RAW, "storage_uri": raw_artifact.raw_storage_uri},
+            domain="artifact_manifest",
+        )[:32],
+        "snapshot_id": None,
+        "import_run_id": import_run_id,
+        "artifact_kind": PTG2_ARTIFACT_RAW,
+        "storage_uri": raw_artifact.raw_storage_uri,
+        "sha256": raw_artifact.raw_sha256,
+        "byte_count": raw_artifact.byte_count,
+        "payload": {
+            "canonical_url": raw_artifact.canonical_url,
+            "verification_mode": raw_artifact.verification_mode,
+            "reused": raw_artifact.reused,
+        },
+        "created_at": now,
+    }
+
+
+def _source_version_result(
+    raw_artifact: PTG2RawArtifact,
+    logical_artifact: PTG2LogicalArtifact,
+    source_identity_hash: str,
+    source_file_version_id: str,
+    logical_hash_deferred: bool,
+) -> PTG2SourceVersion:
     return PTG2SourceVersion(
         source_identity_hash=source_identity_hash,
         source_file_version_id=source_file_version_id,
@@ -173,4 +157,55 @@ async def _record_source_version(
         last_modified=raw_artifact.head.last_modified if raw_artifact.head else None,
         verification_mode=raw_artifact.verification_mode,
         reused_from_source_file_version_id=raw_artifact.reused_from_source_file_version_id,
+    )
+
+
+async def _record_source_version(
+    source_type: str,
+    domain: str,
+    raw_artifact: PTG2RawArtifact,
+    logical_artifact: PTG2LogicalArtifact,
+    import_run_id: str | None = None,
+) -> PTG2SourceVersion:
+    """Record one retained raw and logical source version."""
+    source_identity_hash = _source_identity_hash(source_type, raw_artifact.canonical_url)
+    logical_hash_deferred = bool(logical_artifact.logical_hash_deferred)
+    content_identity_kind = (
+        "raw_container_sha256_v1" if logical_hash_deferred else "logical_json_sha256_v1"
+    )
+    source_version_field_map = {
+        "source_identity_hash": source_identity_hash,
+        "raw_sha256": raw_artifact.raw_sha256,
+        "logical_sha256": logical_artifact.logical_sha256,
+        "content_identity_kind": content_identity_kind,
+        "etag": raw_artifact.head.etag if raw_artifact.head else None,
+        "content_length": raw_artifact.head.content_length if raw_artifact.head else raw_artifact.byte_count,
+        "last_modified": raw_artifact.head.last_modified if raw_artifact.head else None,
+    }
+    source_file_version_id = semantic_hash(
+        source_version_field_map, domain="source_file_version"
+    )[:32]
+    content_hash = semantic_hash(
+        {
+            "domain": domain,
+            "identity_kind": content_identity_kind,
+            "sha256": logical_artifact.logical_sha256,
+        },
+        domain="content_identity",
+    )
+    now = _utcnow()
+    rows_and_models = (
+        (_source_identity_row(source_type, domain, raw_artifact, source_identity_hash, now), PTG2SourceIdentity),
+        (_content_identity_row(domain, logical_artifact, logical_hash_deferred, content_identity_kind, content_hash, now), PTG2ContentIdentity),
+        (_source_file_version_row(raw_artifact, logical_artifact, import_run_id, source_identity_hash, content_hash, source_file_version_id, logical_hash_deferred, now), PTG2SourceFileVersion),
+        (_artifact_manifest_row(raw_artifact, import_run_id, now), PTG2ArtifactManifest),
+    )
+    for model_row, model in rows_and_models:
+        await _push_ptg2_objects_from_facade([model_row], model, rewrite=True)
+    return _source_version_result(
+        raw_artifact,
+        logical_artifact,
+        source_identity_hash,
+        source_file_version_id,
+        logical_hash_deferred,
     )

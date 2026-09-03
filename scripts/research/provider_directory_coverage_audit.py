@@ -4765,6 +4765,65 @@ def _ptg_network_name_overlap_cte_sql(schema: str, *, ptg_plan_filter: str) -> s
     """
 
 
+async def _ptg_network_overlap_rows(
+    conn: asyncpg.Connection,
+    cte_sql: str,
+    query_args: list[str | None],
+    sample_limit: int,
+) -> tuple[dict[str, Any], list[Any]]:
+    network_overlap_metrics = await _fetch_mapping(
+        conn,
+        f"""
+        {cte_sql}
+        SELECT
+            (SELECT count(*)::bigint FROM provider_directory_networks) AS provider_directory_plan_network_names,
+            (SELECT count(*)::bigint FROM ptg_networks) AS ptg_plan_network_names,
+            (SELECT count(DISTINCT (snapshot_id, plan_id))::bigint FROM provider_directory_networks)
+                AS plan_pairs_with_provider_directory_networks,
+            (SELECT count(DISTINCT (snapshot_id, plan_id))::bigint FROM ptg_networks)
+                AS plan_pairs_with_ptg_networks,
+            (SELECT count(DISTINCT (pd.snapshot_id, pd.plan_id))::bigint
+               FROM provider_directory_networks pd
+               JOIN ptg_networks ptg
+                 ON ptg.snapshot_id = pd.snapshot_id
+                AND ptg.plan_id = pd.plan_id)
+                AS plan_pairs_with_both_network_sets,
+            (SELECT count(*)::bigint FROM matched) AS matched_plan_network_names,
+            (SELECT count(DISTINCT (snapshot_id, plan_id))::bigint FROM matched) AS matched_plan_pairs
+        """,
+        *query_args,
+    )
+    sample_rows = await conn.fetch(
+        f"""
+        {cte_sql}
+        SELECT provider_directory_source_id,
+               provider_directory_org_name,
+               provider_directory_network_name,
+               count(DISTINCT (snapshot_id, plan_id))::bigint AS plan_pair_count,
+               array_agg(DISTINCT ptg_network_name ORDER BY ptg_network_name)
+                   FILTER (WHERE ptg_network_name IS NOT NULL)::varchar[] AS sample_ptg_network_names
+          FROM pairs
+         WHERE provider_directory_network_key <> ''
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM matched
+                 WHERE matched.snapshot_id = pairs.snapshot_id
+                   AND matched.plan_id = pairs.plan_id
+                   AND matched.provider_directory_source_id = pairs.provider_directory_source_id
+                   AND matched.provider_directory_network_key = pairs.provider_directory_network_key
+           )
+         GROUP BY provider_directory_source_id, provider_directory_org_name, provider_directory_network_name
+         ORDER BY count(DISTINCT (snapshot_id, plan_id)) DESC,
+                  provider_directory_org_name,
+                  provider_directory_network_name
+         LIMIT ${len(query_args) + 1}
+        """,
+        *query_args,
+        sample_limit,
+    )
+    return network_overlap_metrics, list(sample_rows)
+
+
 async def _ptg_network_name_overlap_summary(
     conn: asyncpg.Connection,
     schema: str,
@@ -4794,55 +4853,11 @@ async def _ptg_network_name_overlap_summary(
         else ""
     )
     cte_sql = _ptg_network_name_overlap_cte_sql(schema, ptg_plan_filter=ptg_plan_filter)
-    args = [ptg_plan_id] if ptg_plan_id is not None else []
-    network_overlap_metrics = await _fetch_mapping(
+    query_args = [ptg_plan_id] if ptg_plan_id is not None else []
+    network_overlap_metrics, sample_rows = await _ptg_network_overlap_rows(
         conn,
-        f"""
-        {cte_sql}
-        SELECT
-            (SELECT count(*)::bigint FROM provider_directory_networks) AS provider_directory_plan_network_names,
-            (SELECT count(*)::bigint FROM ptg_networks) AS ptg_plan_network_names,
-            (SELECT count(DISTINCT (snapshot_id, plan_id))::bigint FROM provider_directory_networks)
-                AS plan_pairs_with_provider_directory_networks,
-            (SELECT count(DISTINCT (snapshot_id, plan_id))::bigint FROM ptg_networks)
-                AS plan_pairs_with_ptg_networks,
-            (SELECT count(DISTINCT (pd.snapshot_id, pd.plan_id))::bigint
-               FROM provider_directory_networks pd
-               JOIN ptg_networks ptg
-                 ON ptg.snapshot_id = pd.snapshot_id
-                AND ptg.plan_id = pd.plan_id)
-                AS plan_pairs_with_both_network_sets,
-            (SELECT count(*)::bigint FROM matched) AS matched_plan_network_names,
-            (SELECT count(DISTINCT (snapshot_id, plan_id))::bigint FROM matched) AS matched_plan_pairs
-        """,
-        *args,
-    )
-    sample_rows = await conn.fetch(
-        f"""
-        {cte_sql}
-        SELECT provider_directory_source_id,
-               provider_directory_org_name,
-               provider_directory_network_name,
-               count(DISTINCT (snapshot_id, plan_id))::bigint AS plan_pair_count,
-               array_agg(DISTINCT ptg_network_name ORDER BY ptg_network_name)
-                   FILTER (WHERE ptg_network_name IS NOT NULL)::varchar[] AS sample_ptg_network_names
-          FROM pairs
-         WHERE provider_directory_network_key <> ''
-           AND NOT EXISTS (
-                SELECT 1
-                  FROM matched
-                 WHERE matched.snapshot_id = pairs.snapshot_id
-                   AND matched.plan_id = pairs.plan_id
-                   AND matched.provider_directory_source_id = pairs.provider_directory_source_id
-                   AND matched.provider_directory_network_key = pairs.provider_directory_network_key
-           )
-         GROUP BY provider_directory_source_id, provider_directory_org_name, provider_directory_network_name
-         ORDER BY count(DISTINCT (snapshot_id, plan_id)) DESC,
-                  provider_directory_org_name,
-                  provider_directory_network_name
-         LIMIT ${len(args) + 1}
-        """,
-        *args,
+        cte_sql,
+        query_args,
         sample_limit,
     )
     network_overlap_metrics["available"] = True
@@ -7046,9 +7061,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse database, evidence, output, and probe-scope options."""
-    parser = argparse.ArgumentParser(description=__doc__)
+def _add_connection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", default=os.getenv("HLTHPRT_DB_HOST") or "127.0.0.1")
     parser.add_argument("--port", type=int, default=_env_int("HLTHPRT_DB_PORT", 5440))
     parser.add_argument("--database", default=os.getenv("HLTHPRT_DB_DATABASE") or "healthporta")
@@ -7070,6 +7083,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "are covered by current provider_directory_source bases or known override redirects."
         ),
     )
+
+
+def _add_semantic_scope_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--ptg-plan-id",
         help=(
@@ -7127,6 +7143,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "omit it for exact reporting from a worker/dev host."
         ),
     )
+
+
+def _add_probe_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--pod-safe",
         action="store_true",
@@ -7172,6 +7191,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Allow exact PTG/FHIR aggregates against the live corroboration view. This can be slow on dev.",
     )
+
+
+def _add_output_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--skip-top-source-yield",
         action="store_true",
@@ -7204,17 +7226,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
         default="json",
     )
+
+
+def _apply_pod_safe_args(args: argparse.Namespace) -> None:
+    if not args.pod_safe:
+        return
+    args.skip_unified = True
+    args.fast_serving_readiness = True
+    args.skip_network_resolution = True
+    args.skip_practitioner_role_reimport_gap_summary = True
+    args.skip_ptg = True
+    args.skip_top_source_yield = True
+    args.skip_advertised_resource_gaps = True
+    args.skip_valid_zero_row_sources = True
+    args.skip_canonical_resource_summary = True
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse database, evidence, output, and probe-scope options."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    _add_connection_args(parser)
+    _add_semantic_scope_args(parser)
+    _add_probe_args(parser)
+    _add_output_args(parser)
     args = parser.parse_args(argv)
-    if args.pod_safe:
-        args.skip_unified = True
-        args.fast_serving_readiness = True
-        args.skip_network_resolution = True
-        args.skip_practitioner_role_reimport_gap_summary = True
-        args.skip_ptg = True
-        args.skip_top_source_yield = True
-        args.skip_advertised_resource_gaps = True
-        args.skip_valid_zero_row_sources = True
-        args.skip_canonical_resource_summary = True
+    _apply_pod_safe_args(args)
     return args
 
 
