@@ -2112,21 +2112,70 @@ def _terminal_queue_residue_receipt(
     *,
     queue: str,
     job_id: str,
-    evidence: dict[str, bool],
-    removed: bool,
+    evidence_by_field: dict[str, bool],
+    was_removed: bool,
 ) -> dict[str, Any]:
-    residue_found = evidence["queue_member"]
+    has_residue = evidence_by_field["queue_member"]
     return {
         "run_id": run["run_id"],
         "importer": run["importer"],
         "status": run["status"],
         "queue": queue,
         "job_id": job_id,
-        "residue_found": residue_found,
-        "removed": removed,
-        "already_absent": not residue_found,
-        "evidence": evidence,
+        "residue_found": has_residue,
+        "removed": was_removed,
+        "already_absent": not has_residue,
+        "evidence": evidence_by_field,
     }
+
+
+async def _reconcile_terminal_queue_member(
+    pipe: Any,
+    run: dict[str, Any],
+    queue: str,
+    job_id: str,
+    arq_keys: tuple[str, ...],
+) -> dict[str, Any]:
+    await pipe.watch(queue, *arq_keys)
+    has_queue_member = await pipe.zscore(queue, job_id) is not None
+    arq_key_presence_flags = [bool(await pipe.exists(key)) for key in arq_keys]
+    evidence_by_field = {
+        "queue_member": has_queue_member,
+        **dict(
+            zip(
+                ("job", "retry", "in_progress", "result"),
+                arq_key_presence_flags,
+            )
+        ),
+    }
+    if any(arq_key_presence_flags):
+        raise StaleWorkerReconciliationConflict(
+            "ARQ job state is present; refusing queue residue reconciliation"
+        )
+    pipe.multi()
+    if not has_queue_member:
+        pipe.ping()
+        await pipe.execute()
+        return _terminal_queue_residue_receipt(
+            run,
+            queue=queue,
+            job_id=job_id,
+            evidence_by_field=evidence_by_field,
+            was_removed=False,
+        )
+    pipe.zrem(queue, job_id)
+    transaction_results = await pipe.execute()
+    if transaction_results != [1]:
+        raise StaleWorkerReconciliationConflict(
+            "exact queue residue was not removed"
+        )
+    return _terminal_queue_residue_receipt(
+        run,
+        queue=queue,
+        job_id=job_id,
+        evidence_by_field=evidence_by_field,
+        was_removed=True,
+    )
 
 
 async def _remove_terminal_queue_residue(
@@ -2150,41 +2199,12 @@ async def _remove_terminal_queue_residue(
             job_deserializer=deserialize_job,
         )
         async with redis_pool.pipeline(transaction=True) as pipe:
-            await pipe.watch(queue, *arq_keys)
-            queue_member = await pipe.zscore(queue, job_id) is not None
-            key_presence = [bool(await pipe.exists(key)) for key in arq_keys]
-            evidence = {
-                "queue_member": queue_member,
-                **dict(zip(("job", "retry", "in_progress", "result"), key_presence)),
-            }
-            if any(key_presence):
-                raise StaleWorkerReconciliationConflict(
-                    "ARQ job state is present; refusing queue residue reconciliation"
-                )
-            if not queue_member:
-                pipe.multi()
-                pipe.ping()
-                await pipe.execute()
-                return _terminal_queue_residue_receipt(
-                    run,
-                    queue=queue,
-                    job_id=job_id,
-                    evidence=evidence,
-                    removed=False,
-                )
-            pipe.multi()
-            pipe.zrem(queue, job_id)
-            transaction_results = await pipe.execute()
-            if transaction_results != [1]:
-                raise StaleWorkerReconciliationConflict(
-                    "exact queue residue was not removed"
-                )
-            return _terminal_queue_residue_receipt(
+            return await _reconcile_terminal_queue_member(
+                pipe,
                 run,
-                queue=queue,
-                job_id=job_id,
-                evidence=evidence,
-                removed=True,
+                queue,
+                job_id,
+                arq_keys,
             )
     except WatchError as exc:
         raise StaleWorkerReconciliationConflict(

@@ -25,14 +25,14 @@ KEYS = (
 
 
 def _run(**overrides):
-    run = {
+    run_by_field = {
         "run_id": RUN_ID,
         "importer": IMPORTER,
         "status": "failed",
         "metrics": {"queue": QUEUE, "job_id": JOB_ID},
     }
-    run.update(overrides)
-    return run
+    run_by_field.update(overrides)
+    return run_by_field
 
 
 class _Row:
@@ -127,7 +127,7 @@ async def test_reconcile_terminal_queue_residue_removes_only_exact_member(monkey
         call.execute(),
         call.__aexit__(None, None, None),
     ]
-    assert not any(item[0] == "delete" for item in pipeline.mock_calls)
+    assert not any(mock_call[0] == "delete" for mock_call in pipeline.mock_calls)
     redis_pool.aclose.assert_awaited_once_with(close_connection_pool=True)
 
 
@@ -218,11 +218,11 @@ async def test_reconcile_terminal_queue_residue_refuses_any_arq_key(
     monkeypatch,
     present_index,
 ):
-    key_presence = tuple(index == present_index for index in range(4))
+    arq_key_presence_flags = tuple(index == present_index for index in range(4))
     _, _, pipeline = _install_dependencies(
         monkeypatch,
         _run(),
-        key_presence=key_presence,
+        key_presence=arq_key_presence_flags,
     )
 
     with pytest.raises(
@@ -369,7 +369,7 @@ async def test_reconcile_terminal_queue_residue_route_auth_and_error_mapping(mon
 
 @pytest.mark.asyncio
 async def test_reconcile_terminal_queue_residue_route_returns_stable_receipt(monkeypatch):
-    receipt = {
+    receipt_by_field = {
         "run_id": RUN_ID,
         "importer": IMPORTER,
         "status": "failed",
@@ -390,7 +390,7 @@ async def test_reconcile_terminal_queue_residue_route_returns_stable_receipt(mon
     monkeypatch.setattr(
         control_route_registration,
         "reconcile_terminal_queue_residue",
-        AsyncMock(return_value=receipt),
+        AsyncMock(return_value=receipt_by_field),
         raising=False,
     )
 
@@ -399,4 +399,4 @@ async def test_reconcile_terminal_queue_residue_route_returns_stable_receipt(mon
     )
 
     assert response.status == 200
-    assert json.loads(response.body) == receipt
+    assert json.loads(response.body) == receipt_by_field
