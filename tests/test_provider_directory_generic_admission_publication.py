@@ -362,6 +362,22 @@ async def test_sealed_refresh_recreates_receipt_from_admission_summary(
 
 
 @pytest.mark.asyncio
+async def test_unsealed_candidate_refresh_does_not_store_current_receipt(
+    monkeypatch,
+):
+    dataset, _, seal, _ = _sealed_refresh_context()
+    store_receipt = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", store_receipt)
+
+    await importer._record_current_dataset_selection_receipt(
+        replace(dataset, generic_admission_sealed=False),
+        seal.metadata_summary,
+    )
+
+    store_receipt.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_sealed_refresh_rejects_missing_admission_summary(monkeypatch):
     dataset, candidate, seal, relation_proofs = _sealed_refresh_context()
     metadata_summary = deepcopy(seal.metadata_summary)

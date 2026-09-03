@@ -386,41 +386,6 @@ async def test_current_repair_records_one_guarded_receipt(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_validated_candidate_refresh_does_not_record_current_receipt(
-    monkeypatch,
-):
-    async with _dataset_database(monkeypatch) as (database, schema):
-        await _insert_validated_shared_dataset(database, schema, seal=False)
-        metadata = _large_metadata_with_normalized_receipt()
-        await _set_shared_semantic_proof(
-            database,
-            schema,
-            metadata,
-            dataset_id="dataset_candidate",
-        )
-        fence = await importer._resolve_provider_directory_artifact_datasets(
-            ["source_primary"], should_select_validated_candidates=True
-        )
-
-        await importer._record_current_dataset_selection_receipt(
-            fence.datasets[0], metadata
-        )
-
-        stored_receipt = await database.scalar(
-            f"SELECT artifact_selection_receipt_json FROM {schema}."
-            "provider_directory_endpoint_dataset "
-            "WHERE dataset_id = 'dataset_candidate';"
-        )
-        refreshed_fence = (
-            await importer._resolve_provider_directory_artifact_datasets(
-                ["source_primary"], should_select_validated_candidates=True
-            )
-        )
-        assert stored_receipt is None
-        assert refreshed_fence.datasets[0].dataset_id == "dataset_candidate"
-
-
-@pytest.mark.asyncio
 async def test_receipt_only_candidate_remains_ineligible(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
         await _insert_validated_shared_dataset(database, schema, seal=False)
