@@ -258,6 +258,7 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
     assert "scripts/ci/shard_pytest_nodeids.py" in prepush
     assert "mrf-python-coverage-main-${{ matrix.shard-index }}" in workflow
     assert "pattern: mrf-python-coverage-main-*" in workflow
+    assert yaml.safe_load(workflow)["jobs"]["python-tests"]["timeout-minutes"] == 20
     assert (
         yaml.safe_load(workflow)["jobs"]["address-canonical-db-tests"][
             "timeout-minutes"
@@ -298,7 +299,9 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
         "tests/test_provider_directory_dataset_selection_sealed_db.py",
     )
     for workflow_line in prepush.splitlines():
-        if (
+        if "python -m pytest -q -n 1 --dist loadscope" in workflow_line:
+            assert "timeout --foreground 420s" in workflow_line
+        elif (
             "python -m pytest" in workflow_line
             or "cargo llvm-cov --manifest-path" in workflow_line
         ):
