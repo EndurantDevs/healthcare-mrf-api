@@ -25387,7 +25387,10 @@ async def _record_current_dataset_selection_receipt(
     dataset: ProviderDirectoryArtifactDataset,
     publication_metadata: Mapping[str, Any],
 ) -> None:
-    """Store one compact receipt under the exact locked dataset identity."""
+    """Store a compact receipt for a current row or sealed candidate."""
+
+    if not dataset.is_current and not dataset.generic_admission_sealed:
+        return
 
     sealed_proof_sha256 = (
         dataset.content_proof_admission_sha256
