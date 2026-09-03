@@ -253,11 +253,9 @@ async def fetch_locator(
     url, hospitals = locator_group
     locator, observation, raw = locator_id(url), uuid.uuid4().hex, None
     try:
-        raw = await download_raw_artifact(
-            url, store=store, reuse_raw_artifacts=False,
-            max_bytes=MAX_HOSPITAL_HPT_LOCATOR_BYTES,
-            keep_partial_artifacts=False, exact_get_evidence=True,
-            user_agent=_HOSPITAL_USER_AGENT,
+        raw = await download_hospital_source(
+            download_raw_artifact, url, store, MAX_HOSPITAL_HPT_LOCATOR_BYTES,
+            _HOSPITAL_USER_AGENT, exact_get_evidence=True,
         )
         locator_payload = await asyncio.to_thread(Path(raw.raw_path).read_bytes)
         locator_records = parse_hospital_hpt_locator(locator_payload)
