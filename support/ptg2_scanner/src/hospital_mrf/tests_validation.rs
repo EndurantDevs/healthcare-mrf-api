@@ -180,6 +180,48 @@
     }
 
     #[test]
+    fn repeated_csv_contract_provisions_preserve_nonblank_order() {
+        let mut records = csv_fixture_records(&fixture_tall_csv());
+        let first = csv_fixture_index(&records[0], "general_contract_provisions");
+        records[1][first] = "First provision".to_owned();
+        records[0][first + 1] = " GENERAL_CONTRACT_PROVISIONS ".to_owned();
+        records[1][first + 1] = "  ".to_owned();
+        records[0][first + 2] = "general_contract_provisions".to_owned();
+        records[1][first + 2] = "Second provision".to_owned();
+
+        let payload = csv_fixture_bytes(&records);
+        let rows = run_fixture(InputFormat::TallCsv, &payload, false);
+        assert_eq!(
+            String::from_utf8(rows["contract_provision"].clone()).unwrap(),
+            concat!(
+                "fixture-version\t0\t\\N\t\\N\tFirst provision\n",
+                "fixture-version\t1\t\\N\t\\N\tSecond provision\n",
+            )
+        );
+        assert_import_error(
+            InputFormat::TallCsv,
+            &payload,
+            1,
+            "general_contract_provisions fanout exceeds configured limit 1",
+        );
+    }
+
+    #[test]
+    fn repeated_ordinary_general_csv_header_remains_invalid() {
+        let mut records = csv_fixture_records(&fixture_tall_csv());
+        let duplicate = csv_fixture_index(&records[0], "general_contract_provisions") + 1;
+        records[0][duplicate] = " HOSPITAL_NAME ".to_owned();
+        records[1][duplicate] = "Other Hospital".to_owned();
+
+        assert_import_error(
+            InputFormat::TallCsv,
+            &csv_fixture_bytes(&records),
+            DEFAULT_MAX_FANOUT_ROWS,
+            "duplicate general CSV header hospital_name",
+        );
+    }
+
+    #[test]
     fn csv_billing_class_aliases_do_not_relax_json_validation() {
         for alias in ["hospital", "facilty"] {
             assert_eq!(canonical_billing_class(alias, true).unwrap(), "facility");
