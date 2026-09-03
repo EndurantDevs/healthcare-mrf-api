@@ -21502,13 +21502,14 @@ hospitals:
   locator_name: Texas Rehabilitation Hospital of Fort Worth
 - hospital_id: hospital-006475
   name: Texas Scottish Rite for Children Dallas Campus
-  cms_hpt_url: https://tsrh.org/cms-hpt.txt
+  cms_hpt_url: https://scottishriteforchildren.org/cms-hpt.txt
 - hospital_id: hospital-006476
   name: Texas Scottish Rite for Children Frisco Campus
-  cms_hpt_url: https://tsrh.org/cms-hpt.txt
+  cms_hpt_url: https://scottishriteforchildren.org/cms-hpt.txt
 - hospital_id: hospital-006477
   name: TEXAS SCOTTISH RITE HOSPITAL FOR CRIPPLED CHILDREN
   cms_hpt_url: https://scottishriteforchildren.org/cms-hpt.txt
+  alias_of: hospital-006475
   locator_name: Texas Scottish Rite for Children Dallas Campus
 - hospital_id: hospital-006478
   name: Texas Spine & Joint Hospital
