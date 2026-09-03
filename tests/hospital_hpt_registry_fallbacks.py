@@ -71,7 +71,7 @@ FALLBACK_URL_SHA256_BY_HOSPITAL_ID = {
     "262f8503160ded385a3025a1e22fc303afd38e70730e405cc8454bdef0720c1b",
 ) | dict.fromkeys(
     "hospital-002089 hospital-005970 hospital-005971 hospital-005972 "
-    "hospital-005973 hospital-005974".split(),
+    "hospital-005973 hospital-005974 hospital-005975 hospital-006936".split(),
     "7ba5d031cb09651b7e02fab6d11dadc423e561c6d2649835f276188521688ac1",
 ) | dict.fromkeys(
     "hospital-001160 hospital-001161 hospital-002121 hospital-002122".split(),

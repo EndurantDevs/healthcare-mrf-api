@@ -36,7 +36,7 @@ def test_content_only_locator_binding_preserves_unknown_location():
         "cms_hpt_url": locator_url,
         "locator_mrf_url": selector,
     }
-    result = acquisition.LocatorResult(
+    locator_result = acquisition.LocatorResult(
         locator_url,
         "locator-a",
         "observation-a",
@@ -51,37 +51,47 @@ def test_content_only_locator_binding_preserves_unknown_location():
         ),
     )
 
-    candidate = acquisition.candidates_from_locators((result,))[0]
+    candidate = acquisition.candidates_from_locators((locator_result,))[0]
 
     assert candidate.source_url == f"{selector}?sig=fresh"
     assert candidate.locator_name is None
 
 
-def test_matched_locator_uses_explicit_reviewed_fallback_source():
+@pytest.mark.parametrize(
+    "locator_record_names",
+    (("Hospital A",), ("Different Hospital",), ("Hospital A", "Hospital A")),
+)
+def test_locator_uses_explicit_reviewed_fallback_source(locator_record_names):
     acquisition = _acquisition_module()
     locator_url = "https://hospital.example/cms-hpt.txt"
+    is_ambiguous = len(locator_record_names) > 1
     hospital_by_field = {
         "hospital_id": "hospital-a",
         "name": "Hospital A",
         "cms_hpt_url": locator_url,
         "fallback_mrf_url": "https://files.example/current.json?sig=reviewed",
     }
-    result = acquisition.LocatorResult(
+    locator_result = acquisition.LocatorResult(
         locator_url,
         "locator-a",
         "observation-a",
         (hospital_by_field,),
-        (
+        tuple(
             acquisition.HospitalHptLocatorRecord(
-                "Hospital A", "https://files.example/current.json?sig=stale"
-            ),
+                locator_name, f"https://files.example/{index}.json?sig=stale"
+            )
+            for index, locator_name in enumerate(locator_record_names)
         ),
     )
 
-    candidate = acquisition.candidates_from_locators((result,))[0]
+    candidate = acquisition.candidates_from_locators((locator_result,))[0]
 
-    assert candidate.source_url == hospital_by_field["fallback_mrf_url"]
-    assert candidate.initial_error_code is None
+    assert candidate.source_url == (
+        locator_url if is_ambiguous else hospital_by_field["fallback_mrf_url"]
+    )
+    assert candidate.initial_error_code == (
+        "locator_ambiguous" if is_ambiguous else None
+    )
 
 
 def test_fetch_failure_uses_only_an_explicit_reviewed_fallback():
