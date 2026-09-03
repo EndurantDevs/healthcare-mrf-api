@@ -10,6 +10,7 @@ import orjson
 import pytest
 
 from api import plan_pricing_state_scan as scan
+from api import plan_pricing_state_scan_hydration as hydration
 
 
 PROVIDER_STATE_FRAGMENT_VERSION = "plan_pricing_provider_state_v1"
@@ -101,6 +102,7 @@ def _provider_fragment(
     address_by_field: dict,
     *,
     taxonomy_codes: list[str] | None = None,
+    entity_type_code: int = 1,
 ) -> bytes:
     return orjson.dumps(
         {
@@ -108,7 +110,7 @@ def _provider_fragment(
             "provider": {
                 "npi": npi,
                 "provider_name": "Frozen Synthetic Provider",
-                "entity_type_code": 1,
+                "entity_type_code": entity_type_code,
                 "credential": "MD",
                 "provider_sex_code": "U",
                 "taxonomy_codes": taxonomy_codes or ["207Q00000X"],
@@ -153,6 +155,9 @@ def test_state_scan_applies_inferred_taxonomy_to_frozen_witnesses():
     second_address = _address(
         "2 Family Street", "Lansing", "48933", "family-location"
     )
+    third_address = _address(
+        "3 GI Facility", "Detroit", "48201", "gi-facility-location"
+    )
 
     eligible_npis = scan._eligible_provider_npis(
         {
@@ -162,6 +167,12 @@ def test_state_scan_applies_inferred_taxonomy_to_frozen_witnesses():
                 taxonomy_codes=["207RG0100X"],
             ),
             1000000002: _provider_fragment(1000000002, second_address),
+            1000000003: _provider_fragment(
+                1000000003,
+                third_address,
+                taxonomy_codes=["207RG0100X"],
+                entity_type_code=2,
+            ),
         },
         {"code_system": "CPT", "code": "45378", "state": "MI"},
     )
@@ -325,4 +336,127 @@ async def test_state_scan_rejects_inconsistent_frozen_provider_witness(
             _args(),
             [_occurrence(1000000001)],
             {1000000001: _mutated_fragment(path, value)},
+        )
+
+
+def test_state_scan_witness_primitive_boundaries():
+    assert hydration._fragment_bytes(memoryview(b"{}")) == b"{}"
+    assert hydration._positive_source_id(True) is None
+    assert hydration._state_code("Michigan") is None
+
+    with pytest.raises(scan.PTG2ManifestArtifactError):
+        hydration._fragment_bytes(b"")
+
+
+@pytest.mark.parametrize(
+    "address",
+    (
+        {"lat": 42.0, "long": None},
+        {"lat": True, "long": -83.0},
+        {"lat": float("nan"), "long": -83.0},
+    ),
+)
+def test_state_scan_rejects_invalid_coordinate_pairs(address):
+    with pytest.raises(scan.PTG2ManifestArtifactError):
+        hydration._validated_coordinates(address)
+
+
+def test_state_scan_accepts_absent_coordinate_pair():
+    hydration._validated_coordinates({"lat": None, "long": None})
+
+
+def test_state_scan_rejects_invalid_hydration_references():
+    occurrence = _occurrence(1000000001)
+
+    with pytest.raises(scan.PTG2ManifestArtifactError):
+        hydration._validated_providers_by_npi({True: b"{}"}, _args(), object())
+    with pytest.raises(scan.PTG2ManifestArtifactError):
+        hydration._provider_payload_for_npi({}, 1000000001, object())
+    with pytest.raises(scan.PTG2ManifestArtifactError):
+        hydration._serving_row({**occurrence, "group_fragment": None}, _binding())
+    with pytest.raises(scan.PTG2ManifestArtifactError):
+        hydration._binding_scope(_selection(), _args(), [occurrence], 1)
+
+    selection = _selection()
+    selection.serving_tables_for_snapshot = lambda _snapshot_id: None
+    with pytest.raises(hydration.PlanPricingProjectionUnavailable):
+        hydration._binding_scope(selection, _args(), [occurrence], 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prices", "remaining_atoms", "error"),
+    (
+        ({}, 1, scan.PTG2ManifestArtifactError),
+        ({9: [{"negotiated_rate": "10.00"}]}, 0, hydration.PlanPricingStateScanBudgetExceeded),
+    ),
+)
+async def test_state_scan_rejects_incomplete_or_over_budget_prices(
+    prices,
+    remaining_atoms,
+    error,
+):
+    serving = SimpleNamespace(
+        _version_three_bounded_prices_by_key=AsyncMock(return_value=prices)
+    )
+    scope = hydration._BindingScope(
+        _binding(),
+        object(),
+        [_occurrence(1000000001)],
+        _args(),
+    )
+
+    with pytest.raises(error):
+        await hydration._prices_for_scope(object(), scope, remaining_atoms, serving)
+
+
+def test_state_scan_response_items_apply_available_source_and_provider_fields():
+    occurrence = _occurrence(1000000001)
+    serving_row = hydration._serving_row(occurrence, _binding())
+    serving = SimpleNamespace(
+        _request_local_provider_payload=lambda provider: provider,
+        _item_source_provenance=lambda provenance: {"source": provenance},
+        _catalog_key=lambda *_args: ("CPT", "27447"),
+        _ptg2_manifest_provider_procedure_item=lambda **kwargs: {
+            "npi": kwargs["npi"],
+            "source": kwargs["serving_data"].get("source"),
+        },
+    )
+    scope = hydration._BindingScope(_binding(), object(), [occurrence], _args())
+
+    response_items = hydration._response_items(
+        scope,
+        [serving_row],
+        {
+            1000000001: {
+                "entity_type_code": None,
+                "credential": "MD",
+                "provider_sex_code": "U",
+            }
+        },
+        {"2" * 32: [{"negotiated_rate": "10.00"}]},
+        {},
+        {11: "synthetic-source"},
+        serving,
+    )
+
+    assert response_items == [
+        {
+            "npi": 1000000001,
+            "source": "synthetic-source",
+            "credential": "MD",
+            "provider_sex_code": "U",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_state_scan_rejects_missing_provider_witness():
+    with pytest.raises(scan.PTG2ManifestArtifactError):
+        await scan._hydrate_selected_groups(
+            object(),
+            _selection(),
+            _args(),
+            [_occurrence(1000000001)],
+            {},
         )

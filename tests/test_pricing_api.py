@@ -4820,23 +4820,31 @@ async def test_release_state_scan_routes_before_legacy_ptg_expansion(monkeypatch
     monkeypatch.setattr(pricing_module, "search_current_ptg2_index", legacy_search)
     request = make_request(
         [],
-        args={
-            "plan_release_id": selection.plan_release_id,
-            "code_system": "CPT",
-            "code": "27447",
-            "state": "MI",
-            "order_by": "npi",
-            "order": "asc",
-            "view": "full",
-            "include_providers": "true",
-            "include_allowed_amounts": "false",
-        },
+        args=RequestParameters(
+            {
+                "plan_release_id": [selection.plan_release_id],
+                "mode": ["standard"],
+                "code_system": ["CPT"],
+                "code": ["27447"],
+                "state": ["MI"],
+                "order_by": ["npi"],
+                "order": ["asc"],
+                "view": ["full"],
+                "include_providers": ["true"],
+                "include_allowed_amounts": ["false"],
+            }
+        ),
     )
     response = await list_providers_by_procedure(request)
     assert response.status == 200
     assert response.headers["Cache-Control"] == "private, no-store"
     assert json.loads(response.body)["pagination"]["scanned_npi_count"] == 1
     state_scan.assert_awaited_once()
+    state_scan_args = state_scan.await_args.args[2]
+    assert {
+        field_name: state_scan_args[field_name]
+        for field_name in ("mode", "code_system", "code")
+    } == {"mode": "standard", "code_system": "CPT", "code": "27447"}
     legacy_search.assert_not_awaited()
 
 
@@ -5100,9 +5108,14 @@ async def test_release_state_scan_hides_internal_serving_errors(
         ),
     ),
 )
-async def test_release_state_scan_missing_generation_is_cursor_aware(
+async def test_release_state_scan_unavailable_projection_is_cursor_aware(
     monkeypatch, cursor, expected_status, expected_code
 ):
+    selection = replace(
+        _mixed_canonical_release_selection(),
+        pricing_projection_id="f" * 64,
+        pricing_projection_contract="plan_pricing_factorized_v4",
+    )
     monkeypatch.setattr(
         pricing_module,
         "_resolve_ptg_specialty_or_raise",
@@ -5116,7 +5129,14 @@ async def test_release_state_scan_missing_generation_is_cursor_aware(
     monkeypatch.setattr(
         pricing_module,
         "resolve_plan_release_serving",
-        AsyncMock(return_value=None),
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "search_plan_pricing_state_scan",
+        AsyncMock(
+            side_effect=pricing_module.PlanPricingProjectionUnavailable("not ready")
+        ),
     )
     state_scan_args_by_name = {
         "plan_release_id": "hprelease_01J00000000000000000000000",

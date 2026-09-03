@@ -65,6 +65,15 @@ def _candidate(**updates):
     return candidate_by_field
 
 
+def test_factorized_v3_receipt_omits_v4_counts():
+    built_receipt = projection_build.receipt(
+        _candidate(contract_version=projection_build.FACTORIZED_V3_PROJECTION_CONTRACT)
+    )
+
+    assert "provider_state_count" not in built_receipt
+    assert "rate_occurrence_count" not in built_receipt
+
+
 @pytest.mark.asyncio
 async def test_existing_projection_candidates_are_reused_or_replaced():
     binding_manifest_list = [{"snapshot_id": "snapshot"}]
@@ -256,6 +265,14 @@ async def test_materialize_all_codes_enforces_release_bounds(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_session_builder_reuses_authority_bound_candidate_under_lock(monkeypatch):
+    with pytest.raises(ValueError, match="contract is unsupported"):
+        await projection_build.build_in_session(
+            object(),
+            binding_manifest_digest="b" * 64,
+            bindings=[],
+            projection_contract="unknown",
+        )
+
     with pytest.raises(ValueError, match="digest is invalid"):
         await projection_build.build_in_session(
             object(), binding_manifest_digest="bad", bindings=[]

@@ -12504,6 +12504,7 @@ async def list_providers_by_procedure(request):
     guard_release_selection = None
     release_selection_args_by_name = {}
     if is_state_scan:
+        state_scan_args_by_name = {key: args.get(key) for key in args.keys()}
         release_selection = await resolve_plan_release_serving(
             session,
             plan_release_id,
@@ -12519,7 +12520,7 @@ async def list_providers_by_procedure(request):
             state_scan_payload = await search_plan_pricing_state_scan(
                 session,
                 release_selection,
-                args,
+                state_scan_args_by_name,
                 pagination,
             )
         except BillingSearchCursorGenerationExpired:

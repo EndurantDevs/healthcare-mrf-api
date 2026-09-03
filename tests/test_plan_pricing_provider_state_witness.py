@@ -128,6 +128,22 @@ async def test_provider_projection_keeps_each_zip_and_one_state_witness(
     )
 
 
+@pytest.mark.asyncio
+async def test_provider_state_provenance_hydration_boundaries(monkeypatch) -> None:
+    hydrate_provenance = AsyncMock(return_value="unavailable")
+    monkeypatch.setattr(serving, "_hydrate_address_provenance", hydrate_provenance)
+
+    await projection_source._hydrate_state_address_provenance(
+        object(), [_state_provider("48104", 2)]
+    )
+    hydrate_provenance.assert_not_awaited()
+
+    with pytest.raises(ValueError, match="provenance is incomplete"):
+        await projection_source._hydrate_state_address_provenance(
+            object(), [_state_provider("48104", 1)]
+        )
+
+
 def test_v4_provider_state_witness_is_single_bounded_and_digest_bound() -> None:
     providers = [_state_provider("48104", 1), _state_provider("48105", 2)]
     first_state = _BuildState(hashlib.sha256())
@@ -187,6 +203,14 @@ def test_v4_provider_state_witness_fails_closed(monkeypatch) -> None:
             {NPI: incomplete_providers},
         )
 
+    with pytest.raises(ValueError, match="witness is duplicated"):
+        provider_cells._provider_cell_rows(
+            PROJECTION_ID,
+            _BuildState(hashlib.sha256()),
+            [NPI],
+            {NPI: [_state_provider("48104", 1), _state_provider("48105", 1)]},
+        )
+
     monkeypatch.setattr(provider_cells, "MAX_PROVIDER_STATE_FRAGMENT_BYTES", 2)
     with pytest.raises(ValueError, match="fragment bound exceeded"):
         provider_cells._provider_cell_rows(
@@ -194,4 +218,57 @@ def test_v4_provider_state_witness_fails_closed(monkeypatch) -> None:
             _BuildState(hashlib.sha256()),
             [NPI],
             {NPI: [_state_provider("48104", 1)]},
+        )
+
+
+@pytest.mark.parametrize(
+    ("provider_update", "message"),
+    [
+        ({"address_payload": b"[]"}, "address is invalid"),
+        ({"state": "Michigan"}, "code is invalid"),
+        ({"state": ""}, "code is missing"),
+        ({"state_address_rank": 0}, "rank is invalid"),
+    ],
+)
+def test_v4_provider_state_witness_rejects_malformed_fields(
+    provider_update,
+    message,
+) -> None:
+    provider = _state_provider("48104", 1)
+    provider.update(provider_update)
+
+    with pytest.raises(ValueError, match=message):
+        provider_cells._provider_cell_rows(
+            PROJECTION_ID,
+            _BuildState(hashlib.sha256()),
+            [NPI],
+            {NPI: [provider]},
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "in_provenance"),
+    [
+        ("source_id", True, True),
+        ("lat", None, False),
+        ("lat", True, False),
+    ],
+)
+def test_v4_provider_state_witness_rejects_inconsistent_address(
+    field,
+    value,
+    in_provenance,
+) -> None:
+    provider = _state_provider("48104", 1)
+    address = orjson.loads(provider["address_payload"])
+    target = address["address_provenance"][0] if in_provenance else address
+    target[field] = value
+    provider["address_payload"] = orjson.dumps(address)
+
+    with pytest.raises(ValueError, match="address is inconsistent"):
+        provider_cells._provider_cell_rows(
+            PROJECTION_ID,
+            _BuildState(hashlib.sha256()),
+            [NPI],
+            {NPI: [provider]},
         )
