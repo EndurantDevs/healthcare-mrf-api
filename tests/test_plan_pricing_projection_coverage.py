@@ -56,6 +56,8 @@ def _candidate(**updates):
         "aggregate_raw_byte_count": 70,
         "aggregate_stored_byte_count": 60,
         "prewarm_shape_count": 1,
+        "provider_state_count": 2,
+        "rate_occurrence_count": 3,
         "build_seconds": 1.5,
         "state": "ready",
     }
@@ -121,7 +123,9 @@ async def test_projection_candidate_insert_and_seal_keep_receipt_counts():
         session,
         PROJECTION_ID,
         hashlib.sha256(b"content"),
-        projection_build.ProjectionV3Counts(3, 2, 80, 1, 1, 70, 60, 1, 4),
+        projection_build.ProjectionV3Counts(
+            3, 2, 80, 1, 1, 70, 60, 1, 4, 2, 3
+        ),
         1.5,
     )
     assert "INSERT INTO" in session.statements[0][0]
@@ -130,6 +134,8 @@ async def test_projection_candidate_insert_and_seal_keep_receipt_counts():
     )
     assert receipt["aggregate_entry_count"] == 1
     assert receipt["rate_profile_count"] == 4
+    assert receipt["provider_state_count"] == 2
+    assert receipt["rate_occurrence_count"] == 3
     assert session.statements[1][1] == {
         "projection_id": PROJECTION_ID,
         "content_digest": hashlib.sha256(b"content").hexdigest(),
@@ -142,6 +148,8 @@ async def test_projection_candidate_insert_and_seal_keep_receipt_counts():
         "aggregate_raw_byte_count": 70,
         "aggregate_stored_byte_count": 60,
         "prewarm_shape_count": 1,
+        "provider_state_count": 2,
+        "rate_occurrence_count": 3,
         "build_seconds": 1.5,
     }
 

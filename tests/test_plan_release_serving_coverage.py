@@ -80,6 +80,11 @@ def _selection(*bindings):
 def test_release_selection_deduplicates_physical_reads_and_normalizes_metadata():
     first_duplicate_binding = _binding(ordinal=0)
     second_duplicate_binding = _binding(ordinal=1)
+    distinct_network_binding = _binding(
+        ordinal=2,
+        snapshot_id="ptg2:a-release-network",
+        source_key="blue-network",
+    )
     allowed_binding = _binding(
         ordinal=0,
         role="allowed_amounts",
@@ -89,14 +94,22 @@ def test_release_selection_deduplicates_physical_reads_and_normalizes_metadata()
     selection = _selection(
         first_duplicate_binding,
         second_duplicate_binding,
+        distinct_network_binding,
         allowed_binding,
     )
 
     assert plan_release_serving._row_mapping(
         SimpleNamespace(_mapping={"source_key": "mapped"})
     ) == {"source_key": "mapped"}
-    assert selection.in_network_bindings == (first_duplicate_binding,)
+    assert selection.in_network_bindings == (
+        first_duplicate_binding,
+        distinct_network_binding,
+    )
     assert selection.allowed_amount_bindings == (allowed_binding,)
+    assert selection.response_metadata()["resolved_snapshot_ids"] == [
+        "ptg2:a-release-network",
+        "ptg2:release-network"
+    ]
     assert plan_release_serving._single_text_value(
         [{"value": "first"}, {"value": "second"}],
         "value",

@@ -537,6 +537,16 @@ def _plan_pricing_projection_registry_entry() -> dict[str, Any]:
         "depends_on": [],
         "params_schema": [
             {
+                "name": "projection_contract",
+                "opts": ["--projection-contract"],
+                "required": True,
+                "multiple": False,
+                "is_flag": False,
+                "type": "string",
+                "default": None,
+                "help": "Exact plan-pricing projection contract.",
+            },
+            {
                 "name": "binding_manifest_digest",
                 "opts": ["--binding-manifest-digest"],
                 "required": True,

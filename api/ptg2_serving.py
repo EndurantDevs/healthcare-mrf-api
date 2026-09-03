@@ -106,8 +106,8 @@ from api.plan_pricing_projection import (
 )
 from api.plan_pricing_em_distance import search_plan_pricing_em_distance
 from api.plan_pricing_projection_contract import (
+    FACTORIZED_PROJECTION_CONTRACTS as PLAN_PRICING_FACTORIZED_CONTRACTS,
     LEGACY_PROJECTION_CONTRACT as LEGACY_PLAN_PRICING_PROJECTION_CONTRACT,
-    PROJECTION_CONTRACT as PLAN_PRICING_PROJECTION_CONTRACT,
     projection_code_identity as _plan_pricing_projection_code_identity,
     table as _plan_pricing_projection_table,
 )
@@ -23140,7 +23140,7 @@ def _factorized_card_projection_id(
     ).strip()
     if (
         release_selection.pricing_projection_contract
-        != PLAN_PRICING_PROJECTION_CONTRACT
+        not in PLAN_PRICING_FACTORIZED_CONTRACTS
         or re.fullmatch(r"[0-9a-f]{64}", projection_id) is None
     ):
         raise PlanPricingProjectionUnavailable(
@@ -23170,7 +23170,7 @@ def _factorized_card_response(
     query_by_field.update(
         view="card",
         include_providers=True,
-        projection_contract=PLAN_PRICING_PROJECTION_CONTRACT,
+        projection_contract=release_selection.pricing_projection_contract,
         source="plan_pricing_projection",
         status=(
             "matched"
@@ -23537,7 +23537,7 @@ async def _search_plan_release_index(
             args.get("include_providers"), default=True
         )
     )
-    if projection_contract == PLAN_PRICING_PROJECTION_CONTRACT and (
+    if projection_contract in PLAN_PRICING_FACTORIZED_CONTRACTS and (
         _uses_factorized_release_cards(args, pagination)
     ):
         return await _search_factorized_plan_release_cards(
@@ -23549,6 +23549,7 @@ async def _search_plan_release_index(
     if is_provider_card_request and projection_contract not in {
         None,
         LEGACY_PLAN_PRICING_PROJECTION_CONTRACT,
+        *PLAN_PRICING_FACTORIZED_CONTRACTS,
     }:
         raise PlanPricingProjectionUnavailable(
             "the selected pricing projection contract is unsupported"
@@ -23615,7 +23616,7 @@ async def _search_selected_plan_release(
         return projected_response
     if (
         selected_release.pricing_projection_contract
-        == PLAN_PRICING_PROJECTION_CONTRACT
+        in PLAN_PRICING_FACTORIZED_CONTRACTS
         and _uses_factorized_release_cards(args, pagination)
     ):
         return await _search_plan_release_index(

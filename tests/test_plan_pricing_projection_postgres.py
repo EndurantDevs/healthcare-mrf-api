@@ -310,8 +310,12 @@ async def test_ready_seal_serializes_against_child_writes(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_provider_generation_lock_blocks_zip_relation_replacement(
+@pytest.mark.parametrize(
+    "replacement_relation", ("geo_zip_lookup", "entity_address_evidence")
+)
+async def test_provider_generation_lock_blocks_relation_replacement(
     monkeypatch,
+    replacement_relation,
 ):
     dsn = os.getenv(POSTGRES_DSN_ENV)
     if not dsn:
@@ -345,7 +349,7 @@ async def test_provider_generation_lock_blocks_zip_relation_replacement(
             await projection_contract.lock_provider_generation(lock_connection)
             replacement_task = asyncio.create_task(
                 replacement.execute(
-                    f"ALTER TABLE {quoted_schema}.geo_zip_lookup "
+                    f"ALTER TABLE {quoted_schema}.{replacement_relation} "
                     "ADD COLUMN replacement_marker integer"
                 )
             )

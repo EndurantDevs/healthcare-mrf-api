@@ -10,8 +10,8 @@ from typing import Any
 from sqlalchemy import text
 
 from api.plan_pricing_projection_contract import (
+    FACTORIZED_PROJECTION_CONTRACTS,
     LEGACY_PROJECTION_CONTRACT,
-    PROJECTION_CONTRACT,
     ZIP5,
     projection_code_identity,
     row_mapping,
@@ -40,7 +40,7 @@ def is_broad_em_shape(shape: PrewarmShape) -> bool:
 
 
 def _shape_source(contract: str) -> tuple[str, str, str, str]:
-    if contract == PROJECTION_CONTRACT:
+    if contract in FACTORIZED_PROJECTION_CONTRACTS:
         return "plan_pricing_prewarm_shape", ", shape_rank", "", "shape_rank"
     if contract == LEGACY_PROJECTION_CONTRACT:
         return (
@@ -78,7 +78,7 @@ def _validated_shape(
         or type(provider_count) is not int
         or provider_count <= 0
         or (
-            contract == PROJECTION_CONTRACT
+            contract in FACTORIZED_PROJECTION_CONTRACTS
             and shape_row_by_field.get("shape_rank") != expected_rank
         )
     ):

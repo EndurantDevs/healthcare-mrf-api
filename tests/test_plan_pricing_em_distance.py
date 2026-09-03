@@ -135,6 +135,7 @@ def test_distance_retry_is_self_contained_and_closed():
         "order": "asc",
         "include_providers": True,
         "view": "card",
+        "offset": 0,
     }
     assert em_distance_retry_option(
         {**args_by_name, "classification": "Internal Medicine"}

@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from sqlalchemy import text
 
 from api.plan_pricing_projection_contract import (
+    FACTORIZED_V3_PROJECTION_CONTRACT,
     HEX_DIGEST,
     LEGACY_PROJECTION_CONTRACT,
     PROJECTION_CONTRACT,
@@ -54,7 +55,10 @@ def receipt(candidate_by_field: Mapping[str, Any]) -> dict[str, Any]:
             aggregate_row_count=int(candidate_by_field["aggregate_row_count"]),
             fragment_byte_count=int(candidate_by_field["fragment_byte_count"]),
         )
-    elif contract == PROJECTION_CONTRACT:
+    elif contract in {
+        FACTORIZED_V3_PROJECTION_CONTRACT,
+        PROJECTION_CONTRACT,
+    }:
         receipt_by_field.update(
             provider_membership_count=int(
                 candidate_by_field["provider_membership_count"]
@@ -76,6 +80,15 @@ def receipt(candidate_by_field: Mapping[str, Any]) -> dict[str, Any]:
             ),
             prewarm_shape_count=int(candidate_by_field["prewarm_shape_count"]),
         )
+        if contract == PROJECTION_CONTRACT:
+            receipt_by_field.update(
+                provider_state_count=int(
+                    candidate_by_field["provider_state_count"]
+                ),
+                rate_occurrence_count=int(
+                    candidate_by_field["rate_occurrence_count"]
+                ),
+            )
     else:
         raise ValueError("pricing projection contract is unsupported")
     return receipt_by_field
@@ -215,6 +228,8 @@ async def _seal_candidate(
                    aggregate_raw_byte_count = :aggregate_raw_byte_count,
                    aggregate_stored_byte_count = :aggregate_stored_byte_count,
                    prewarm_shape_count = :prewarm_shape_count,
+                   provider_state_count = :provider_state_count,
+                   rate_occurrence_count = :rate_occurrence_count,
                    build_seconds = :build_seconds,
                    completed_at = transaction_timestamp()
              WHERE projection_id = :projection_id
@@ -239,6 +254,8 @@ async def _seal_candidate(
                 row_counts.aggregate_stored_byte_count
             ),
             "prewarm_shape_count": row_counts.prewarm_shape_count,
+            "provider_state_count": row_counts.provider_state_count,
+            "rate_occurrence_count": row_counts.rate_occurrence_count,
             "build_seconds": build_seconds,
         },
     )
@@ -250,9 +267,12 @@ async def build_in_session(
     *,
     binding_manifest_digest: str,
     bindings: Any,
+    projection_contract: str = PROJECTION_CONTRACT,
 ) -> dict[str, Any]:
     """Build or reuse one candidate inside the caller's transaction."""
 
+    if projection_contract != PROJECTION_CONTRACT:
+        raise ValueError("pricing projection contract is unsupported")
     if not HEX_DIGEST.fullmatch(binding_manifest_digest):
         raise ValueError("pricing projection binding digest is invalid")
     binding_manifest = normalized_bindings(bindings)
@@ -305,6 +325,7 @@ async def build_plan_pricing_projection(
     *,
     binding_manifest_digest: str,
     bindings: Any,
+    projection_contract: str = PROJECTION_CONTRACT,
 ) -> dict[str, Any]:
     """Build or reuse one complete invisible candidate atomically."""
 
@@ -314,4 +335,5 @@ async def build_plan_pricing_projection(
             session,
             binding_manifest_digest=binding_manifest_digest,
             bindings=bindings,
+            projection_contract=projection_contract,
         )

@@ -26,6 +26,7 @@ from api.plan_pricing_projection_v3_code import (
     _code_occurrences,
     _exact_numeric_rates,
     _manifest_id,
+    _store_rate_occurrences as _store_rate_occurrences_impl,
     _store_rate_profiles as _store_rate_profiles_impl,
 )
 from api.plan_pricing_projection_v3_provider import (
@@ -131,6 +132,20 @@ async def _store_rate_profiles(
     state: _BuildState,
 ) -> None:
     await _store_rate_profiles_impl(
+        session,
+        projection_id,
+        code_identity,
+        state,
+    )
+
+
+async def _store_rate_occurrences(
+    session: Any,
+    projection_id: str,
+    code_identity: tuple[str, str],
+    state: _BuildState,
+) -> None:
+    await _store_rate_occurrences_impl(
         session,
         projection_id,
         code_identity,
@@ -274,6 +289,9 @@ async def _store_admitted_codes(
             state.provider_fragment_byte_count,
         ):
             raise ValueError("pricing projection code admission changed")
+        await _store_rate_occurrences(
+            session, projection_id, code_identity, state
+        )
         await _store_rate_profiles(
             session, projection_id, code_identity, state
         )
@@ -311,7 +329,7 @@ async def materialize_factorized_projection(
     admitted_work_by_code = await _preflight_code_work(
         session, projection_id, code_identities, bindings, state
     )
-    await _persist_provider_projection(session, projection_id)
+    await _persist_provider_projection(session, projection_id, state)
     await _store_admitted_codes(
         session, projection_id, bindings, admitted_work_by_code, state
     )
@@ -328,4 +346,6 @@ async def materialize_factorized_projection(
         state.aggregate_stored_byte_count,
         prewarm_shape_count,
         state.rate_profile_count,
+        state.provider_state_count,
+        state.rate_occurrence_count,
     )

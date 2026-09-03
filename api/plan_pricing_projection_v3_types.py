@@ -34,6 +34,8 @@ class ProjectionV3Counts:
     aggregate_stored_byte_count: int
     prewarm_shape_count: int
     rate_profile_count: int = 0
+    provider_state_count: int = 0
+    rate_occurrence_count: int = 0
 
     def __post_init__(self) -> None:
         counts = (
@@ -46,6 +48,8 @@ class ProjectionV3Counts:
             self.aggregate_stored_byte_count,
             self.prewarm_shape_count,
             self.rate_profile_count,
+            self.provider_state_count,
+            self.rate_occurrence_count,
         )
         if any(type(count) is not int or count < 0 for count in counts):
             raise ValueError("factorized projection counts are invalid")
@@ -66,6 +70,14 @@ class ProjectionV3Counts:
             or (
                 self.rate_profile_count > 0
                 and self.provider_membership_count == 0
+            )
+            or (
+                self.provider_state_count > 0
+                and self.provider_cell_count == 0
+            )
+            or (
+                self.rate_occurrence_count > 0
+                and self.rate_profile_count == 0
             )
         ):
             raise ValueError("factorized projection counts are inconsistent")
@@ -110,6 +122,8 @@ class _BuildState:
     aggregate_raw_byte_count: int = 0
     aggregate_stored_byte_count: int = 0
     rate_profile_count: int = 0
+    provider_state_count: int = 0
+    rate_occurrence_count: int = 0
     membership_probe_work_rows: int = 0
     member_cell_work_rows: int = 0
     rate_profile_work_rows: int = 0

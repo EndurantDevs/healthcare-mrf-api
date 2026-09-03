@@ -151,6 +151,7 @@ def test_projection_build_uses_existing_durable_single_job_worker():
             "family": "mrf",
         },
         {
+            "projection_contract": "plan_pricing_factorized_v4",
             "binding_manifest_digest": "b" * 64,
             "bindings": [{"snapshot_id": "synthetic"}],
         },
@@ -160,11 +161,15 @@ def test_projection_build_uses_existing_durable_single_job_worker():
     assert contract["queue"] == "arq:PTGCandidateAudit"
     assert [field["type"] for field in contract["params_schema"]] == [
         "string",
+        "string",
         "array",
     ]
     assert worker_payload["target_module"] == "api.plan_pricing_projection"
     assert worker_payload["target_function"] == "build_plan_pricing_projection"
     assert worker_payload["call_style"] == "kwargs"
+    assert worker_payload["task"]["projection_contract"] == (
+        "plan_pricing_factorized_v4"
+    )
     assert worker_payload["task"]["bindings"] == [{"snapshot_id": "synthetic"}]
     worker = control_workers._BY_IMPORTER_ROLE[
         ("plan-pricing-projection", "start")
@@ -327,20 +332,28 @@ async def test_provider_signature_checks_relations_without_rejecting_strings():
         "taxonomy": [2, 12],
         "vocabulary": [3, 13],
         "address": [4, 14],
+        "address_evidence": [6, 16, 4, 14],
         "zip": [5, 15],
         "geo_assurance": {"version": "annulled-name-is-still-valid"},
         "geo_assurance_ready": True,
     }
 
-    result = await projection._provider_signature(
+    signature_digest = await projection._provider_signature(
         _ScalarSession(orjson.dumps(signature_dict).decode())
     )
 
-    assert result == projection.hashlib.sha256(
+    assert signature_digest == projection.hashlib.sha256(
         projection._canonical_json(signature_dict).encode()
     ).hexdigest()
 
     signature_dict["zip"] = [None, None]
+    with pytest.raises(ValueError, match="relations are incomplete"):
+        await projection._provider_signature(
+            _ScalarSession(orjson.dumps(signature_dict).decode())
+        )
+
+    signature_dict["zip"] = [5, 15]
+    signature_dict["address_evidence"] = [6, 16]
     with pytest.raises(ValueError, match="relations are incomplete"):
         await projection._provider_signature(
             _ScalarSession(orjson.dumps(signature_dict).decode())
@@ -361,5 +374,6 @@ async def test_provider_generation_is_repeatable_and_locked_before_signature():
     assert "mrf.doctor_clinician_address" in session.statements[1][0]
     assert "tiger.zcta5" in session.statements[1][0]
     assert '"mrf"."entity_address_unified"' in session.statements[2][0]
+    assert '"mrf"."entity_address_evidence"' in session.statements[2][0]
     assert '"mrf"."geo_zip_lookup"' in session.statements[2][0]
     assert session.statements[2][0].strip().endswith("IN ACCESS SHARE MODE")

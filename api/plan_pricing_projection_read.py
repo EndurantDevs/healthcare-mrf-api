@@ -11,6 +11,7 @@ from sqlalchemy import text
 
 from api.plan_pricing_projection_contract import (
     COST_ORDER_FIELDS,
+    FACTORIZED_PROJECTION_CONTRACTS,
     LEGACY_PROJECTION_CONTRACT,
     MAX_GEO_CELLS,
     PROJECTION_CONTRACT,
@@ -277,7 +278,10 @@ def _validated_projection_request(
             "the selected release has no ready card projection"
         )
     contract = selection.pricing_projection_contract or LEGACY_PROJECTION_CONTRACT
-    if contract not in {LEGACY_PROJECTION_CONTRACT, PROJECTION_CONTRACT}:
+    if contract not in {
+        LEGACY_PROJECTION_CONTRACT,
+        *FACTORIZED_PROJECTION_CONTRACTS,
+    }:
         raise PlanPricingProjectionUnavailable(
             "the selected pricing projection contract is unsupported"
         )

@@ -4048,12 +4048,7 @@ async def test_plan_pricing_translates_unsupported_provider_filter_to_400(
                 allows_distance_retry=True,
             ),
             "ptg2_location_scope_too_broad",
-            [
-                {
-                    "order_by": "distance",
-                    "include_providers": True,
-                }
-            ],
+            [],
         ),
         (
             PTG2LocationScopeError("Internal detail must not escape."),
@@ -4223,8 +4218,8 @@ async def test_office_visit_refusal_preserves_malformed_provider_flag(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_plan_id_office_visit_refusal_keeps_legacy_retry(monkeypatch):
-    """A non-release E&M retry remains the replayable legacy shape."""
+async def test_plan_id_office_visit_refusal_removes_unanchored_retry(monkeypatch):
+    """A non-release refusal does not advertise coordinate-free distance."""
 
     monkeypatch.setattr(
         pricing_module,
@@ -4253,16 +4248,7 @@ async def test_plan_id_office_visit_refusal_keeps_legacy_retry(monkeypatch):
 
     retry_options = json.loads(response.body)["fix_it"]["retry_options"]
     assert response.status == 422
-    assert retry_options == [
-        {"order_by": "distance", "include_providers": True}
-    ]
-    retry_response = await list_providers_by_procedure(
-        make_request(
-            [],
-            args={**dict(request.args), **retry_options[0]},
-        )
-    )
-    assert retry_response.status == 200
+    assert retry_options == []
     readiness.assert_not_awaited()
 
 
@@ -4769,6 +4755,215 @@ def _mixed_canonical_release_selection():
     )
 
 
+def _state_scan_response():
+    return {
+        "items": [{"npi": 1000000001, "rate_options": []}],
+        "pagination": {
+            "total": 1,
+            "total_is_exact": True,
+            "total_lower_bound": 1,
+            "limit": 25,
+            "offset": 0,
+            "page": 1,
+            "has_more": False,
+            "next_cursor": None,
+            "scanned_npi_count": 1,
+        },
+        "query": {"source": "plan_pricing_projection"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_release_state_scan_routes_before_legacy_ptg_expansion(monkeypatch):
+    selection = replace(
+        _mixed_canonical_release_selection(),
+        pricing_projection_id="f" * 64,
+        pricing_projection_contract="plan_pricing_factorized_v4",
+    )
+    state_scan = AsyncMock(return_value=_state_scan_response())
+    legacy_search = AsyncMock()
+    monkeypatch.setattr(
+        pricing_module,
+        "_resolve_ptg_specialty_or_raise",
+        AsyncMock(
+            return_value=types.SimpleNamespace(
+                unresolved_specialty=None,
+                taxonomy_codes=(),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=selection),
+    )
+    monkeypatch.setattr(pricing_module, "search_plan_pricing_state_scan", state_scan)
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", legacy_search)
+    request = make_request(
+        [],
+        args={
+            "plan_release_id": selection.plan_release_id,
+            "code_system": "CPT",
+            "code": "27447",
+            "state": "MI",
+            "order_by": "npi",
+            "order": "asc",
+            "view": "full",
+            "include_providers": "true",
+            "include_allowed_amounts": "false",
+        },
+    )
+    response = await list_providers_by_procedure(request)
+    assert response.status == 200
+    assert response.headers["Cache-Control"] == "private, no-store"
+    assert json.loads(response.body)["pagination"]["scanned_npi_count"] == 1
+    state_scan.assert_awaited_once()
+    legacy_search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_release_state_scan_budget_refusal_is_deterministic_422(monkeypatch):
+    selection = replace(
+        _mixed_canonical_release_selection(),
+        pricing_projection_id="f" * 64,
+        pricing_projection_contract="plan_pricing_factorized_v4",
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_resolve_ptg_specialty_or_raise",
+        AsyncMock(return_value=types.SimpleNamespace(unresolved_specialty=None, taxonomy_codes=())),
+    )
+    monkeypatch.setattr(
+        pricing_module, "resolve_plan_release_serving", AsyncMock(return_value=selection)
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "search_plan_pricing_state_scan",
+        AsyncMock(side_effect=pricing_module.PlanPricingStateScanBudgetExceeded()),
+    )
+    request = make_request(
+        [],
+        args={
+            "plan_release_id": selection.plan_release_id,
+            "code_system": "CPT",
+            "code": "27447",
+            "state": "MI",
+            "order_by": "npi",
+            "view": "full",
+            "include_allowed_amounts": "false",
+        },
+    )
+    response = await list_providers_by_procedure(request)
+    problem_by_field = json.loads(response.body)
+    assert response.status == 422
+    assert problem_by_field == {
+        "status": 422,
+        "code": "ptg2_online_work_budget_exceeded",
+        "message": "This NPI page exceeds the fixed complete-rate-group budget.",
+        "fix_it": {
+            "reason": "No verified interactive retry shape is available for this page.",
+            "retry_options": [],
+        },
+    }
+    assert "Retry-After" not in response.headers
+    assert response.headers["Cache-Control"] == "private, no-store"
+
+
+@pytest.mark.asyncio
+async def test_release_state_scan_maps_stale_cursor_generation_to_409(monkeypatch):
+    selection = replace(
+        _mixed_canonical_release_selection(),
+        pricing_projection_id="f" * 64,
+        pricing_projection_contract="plan_pricing_factorized_v4",
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_resolve_ptg_specialty_or_raise",
+        AsyncMock(return_value=types.SimpleNamespace(unresolved_specialty=None, taxonomy_codes=())),
+    )
+    monkeypatch.setattr(
+        pricing_module, "resolve_plan_release_serving", AsyncMock(return_value=selection)
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "search_plan_pricing_state_scan",
+        AsyncMock(side_effect=pricing_module.BillingSearchCursorGenerationExpired()),
+    )
+    request = make_request(
+        [],
+        args={
+            "plan_release_id": selection.plan_release_id,
+            "code_system": "CPT",
+            "code": "27447",
+            "state": "MI",
+            "order_by": "npi",
+            "view": "full",
+            "cursor": "bsc1_test_valid",
+            "include_allowed_amounts": "false",
+        },
+    )
+    response = await list_providers_by_procedure(request)
+    assert response.status == 409
+    assert response.headers["Cache-Control"] == "private, no-store"
+    assert json.loads(response.body) == {
+        "error": {
+            "code": "billing_search_cursor_generation_expired",
+            "message": "Billing search cursor generation is no longer available.",
+        }
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cursor", "expected_status", "expected_code"),
+    (
+        (None, 503, "pricing_projection_unavailable"),
+        (
+            "bsc1_test_valid",
+            409,
+            "billing_search_cursor_generation_expired",
+        ),
+    ),
+)
+async def test_release_state_scan_missing_generation_is_cursor_aware(
+    monkeypatch, cursor, expected_status, expected_code
+):
+    monkeypatch.setattr(
+        pricing_module,
+        "_resolve_ptg_specialty_or_raise",
+        AsyncMock(
+            return_value=types.SimpleNamespace(
+                unresolved_specialty=None,
+                taxonomy_codes=(),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "resolve_plan_release_serving",
+        AsyncMock(return_value=None),
+    )
+    state_scan_args_by_name = {
+        "plan_release_id": "hprelease_01J00000000000000000000000",
+        "code_system": "CPT",
+        "code": "27447",
+        "state": "MI",
+        "order_by": "npi",
+        "view": "full",
+        "include_allowed_amounts": "false",
+    }
+    if cursor is not None:
+        state_scan_args_by_name["cursor"] = cursor
+
+    response = await list_providers_by_procedure(
+        make_request([], args=state_scan_args_by_name)
+    )
+
+    assert response.status == expected_status
+    assert json.loads(response.body)["error"]["code"] == expected_code
+    assert response.headers["Cache-Control"] == "private, no-store"
+
+
 @pytest.mark.asyncio
 async def test_card_requires_plan_release_id():
     request = make_request(
@@ -4837,6 +5032,7 @@ async def test_group_plan_99213_card_and_full_share_ready_refusal(
             "order": "asc",
             "include_providers": True,
             "view": "card",
+            "offset": 0,
         }
     ]
     assert guard_resolver.await_count == 2

@@ -12,7 +12,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import aiohttp
 from aiofile import async_open
@@ -710,6 +710,41 @@ async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mod
     _print_row_progress("qpp_provider", row_number, accepted, progress_start, final=True)
 
 
+def _svi_entry(
+    svi_csv_fields: Mapping[str, Any], reporting_year: int
+) -> dict[str, Any] | None:
+    zcta = _normalize_zcta(
+        _pick_first(
+            svi_csv_fields, "zcta", "ZCTA", "ZCTA5", "ZIP", "zip", "FIPS",
+            "fips", "LOCATION", "location",
+        )
+    )
+    if not zcta:
+        return None
+    year = max(_to_int(_pick_first(svi_csv_fields, "year", "Year")) or reporting_year, 2013)
+    return {
+        "zcta": zcta,
+        "year": year,
+        "svi_overall": _to_float(_pick_first(svi_csv_fields, "svi_overall", "RPL_THEMES", "SVI Overall")),
+        "svi_socioeconomic": _to_float(_pick_first(svi_csv_fields, "svi_socioeconomic", "RPL_THEME1", "SVI Theme 1")),
+        "svi_household": _to_float(_pick_first(svi_csv_fields, "svi_household", "RPL_THEME2", "SVI Theme 2")),
+        "svi_minority": _to_float(_pick_first(svi_csv_fields, "svi_minority", "RPL_THEME3", "SVI Theme 3")),
+        "svi_housing": _to_float(_pick_first(svi_csv_fields, "svi_housing", "RPL_THEME4", "SVI Theme 4")),
+        "updated_at": datetime.datetime.utcnow(),
+    }
+
+
+async def _flush_svi_entries(svi_entries: list[dict[str, Any]], svi_cls: type) -> None:
+    if not svi_entries:
+        return
+    svi_entry_by_identity = {
+        (svi_entry.get("zcta"), svi_entry.get("year")): svi_entry
+        for svi_entry in svi_entries
+    }
+    await _push_objects_with_retry(list(svi_entry_by_identity.values()), svi_cls)
+    svi_entries.clear()
+
+
 async def _load_svi_rows(path: str, svi_cls: type, reporting_year: int, test_mode: bool) -> None:
     """Load normalized social-vulnerability rows from one source artifact."""
     svi_entries: list[dict[str, Any]] = []
@@ -732,60 +767,23 @@ async def _load_svi_rows(path: str, svi_cls: type, reporting_year: int, test_mod
                 _print_row_progress("svi_zcta", row_number, accepted, progress_start)
                 progress_last = now
 
-            zcta = _normalize_zcta(
-                _pick_first(
-                    svi_csv_fields,
-                    "zcta",
-                    "ZCTA",
-                    "ZCTA5",
-                    "ZIP",
-                    "zip",
-                    "FIPS",
-                    "fips",
-                    "LOCATION",
-                    "location",
-                )
-            )
-            if not zcta:
+            svi_entry_by_field = _svi_entry(svi_csv_fields, reporting_year)
+            if svi_entry_by_field is None:
                 skipped_missing_zcta += 1
                 if len(missing_zcta_examples) < 3:
                     missing_zcta_examples.append(
                         _missing_svi_zcta_example(svi_csv_fields)
                     )
                 continue
-            year = _to_int(_pick_first(svi_csv_fields, "year", "Year"))
-            year = max(year or reporting_year, 2013)
-
-            svi_entries.append(
-                {
-                    "zcta": zcta,
-                    "year": year,
-                    "svi_overall": _to_float(_pick_first(svi_csv_fields, "svi_overall", "RPL_THEMES", "SVI Overall")),
-                    "svi_socioeconomic": _to_float(_pick_first(svi_csv_fields, "svi_socioeconomic", "RPL_THEME1", "SVI Theme 1")),
-                    "svi_household": _to_float(_pick_first(svi_csv_fields, "svi_household", "RPL_THEME2", "SVI Theme 2")),
-                    "svi_minority": _to_float(_pick_first(svi_csv_fields, "svi_minority", "RPL_THEME3", "SVI Theme 3")),
-                    "svi_housing": _to_float(_pick_first(svi_csv_fields, "svi_housing", "RPL_THEME4", "SVI Theme 4")),
-                    "updated_at": datetime.datetime.utcnow(),
-                }
-            )
+            svi_entries.append(svi_entry_by_field)
             accepted += 1
             if len(svi_entries) >= IMPORT_BATCH_SIZE:
-                svi_entry_by_identity = {
-                    (svi_entry.get("zcta"), svi_entry.get("year")): svi_entry
-                    for svi_entry in svi_entries
-                }
-                await _push_objects_with_retry(list(svi_entry_by_identity.values()), svi_cls)
-                svi_entries.clear()
+                await _flush_svi_entries(svi_entries, svi_cls)
 
             if test_mode and accepted >= PROVIDER_QUALITY_TEST_SVI_ROWS:
                 break
 
-    if svi_entries:
-        svi_entry_by_identity = {
-            (svi_entry.get("zcta"), svi_entry.get("year")): svi_entry
-            for svi_entry in svi_entries
-        }
-        await _push_objects_with_retry(list(svi_entry_by_identity.values()), svi_cls)
+    await _flush_svi_entries(svi_entries, svi_cls)
     _print_row_progress("svi_zcta", row_number, accepted, progress_start, final=True)
     logger.info(
         "SVI ingest summary: path=%s year=%s parsed=%s accepted=%s skipped_missing_zcta=%s",

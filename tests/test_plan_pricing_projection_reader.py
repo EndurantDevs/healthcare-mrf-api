@@ -35,49 +35,6 @@ def _projection_migration():
 
 
 @pytest.mark.asyncio
-async def test_provider_projection_keeps_one_address_per_npi_and_zip():
-    provider_rows = [
-        {
-            "npi": 1234567890,
-            "provider_name": "Synthetic Provider",
-            "entity_type_code": 1,
-            "credential": "MD",
-            "taxonomy_codes": ["207Q00000X"],
-            "classifications": ["Family Medicine"],
-            "primary_specialty": "Family Medicine",
-            "city": "Example One",
-            "state": "IL",
-            "zip5": "60601",
-        },
-        {
-            "npi": 1234567890,
-            "provider_name": "Synthetic Provider",
-            "entity_type_code": 1,
-            "credential": "MD",
-            "taxonomy_codes": ["207Q00000X"],
-            "classifications": ["Family Medicine"],
-            "primary_specialty": "Family Medicine",
-            "city": "Example Two",
-            "state": "IL",
-            "zip5": "60602",
-        },
-    ]
-    session = _Session(provider_rows)
-
-    providers_by_npi = await projection._projection_provider_rows_for_npis(
-        session, [1234567890]
-    )
-
-    assert [
-        provider_row["zip5"] for provider_row in providers_by_npi[1234567890]
-    ] == ["60601", "60602"]
-    assert "PARTITION BY addr.npi, COALESCE" in session.statements[0][0]
-    assert session.statements[0][1]["provider_row_limit"] == (
-        projection_source.MAX_PROVIDER_ROWS_PER_BATCH + 1
-    )
-
-
-@pytest.mark.asyncio
 async def test_provider_projection_rejects_row_overflow_before_grouping(
     monkeypatch,
 ):

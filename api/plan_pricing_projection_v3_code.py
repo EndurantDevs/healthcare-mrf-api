@@ -13,6 +13,11 @@ from sqlalchemy import text
 from api.plan_pricing_projection_contract import row_mapping, table
 from api.plan_pricing_projection_materialize import digest_row, rate_fragment
 from api.plan_pricing_projection_source import BindingProjection
+from api.plan_pricing_projection_v4_occurrence import (
+    insert_rate_occurrences as _insert_rate_occurrences,
+    rate_occurrence_rows as _rate_occurrence_rows,
+    store_rate_occurrences as _store_rate_occurrences,
+)
 from api.plan_pricing_projection_v3_provider import (
     _binding_ordinal,
     _stage_code_provider_sets,
@@ -122,27 +127,17 @@ async def _binding_code_rows(
         raise ValueError("pricing projection could not read a bounded rate layout")
     price_key_by_set_id: dict[str, int] = {}
     for serving_row in serving_rows:
-        price_set_id = _manifest_id(
-            serving, serving_row.get("price_set_global_id_128")
-        )
+        price_set_id = _manifest_id(serving, serving_row.get("price_set_global_id_128"))
         raw_price_key = serving_row.get("price_key")
         raw_provider_set_key = serving_row.get("_ptg_provider_set_key")
-        if (
-            not price_set_id
-            or isinstance(raw_price_key, bool)
-            or isinstance(raw_provider_set_key, bool)
-        ):
+        if not price_set_id or isinstance(raw_price_key, bool) or isinstance(raw_provider_set_key, bool):
             raise ValueError("pricing projection rate identity is incomplete")
         try:
             price_key = int(raw_price_key)
             int(raw_provider_set_key)
         except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                "pricing projection rate identity is incomplete"
-            ) from exc
-        existing_price_key = price_key_by_set_id.setdefault(
-            price_set_id, price_key
-        )
+            raise ValueError("pricing projection rate identity is incomplete") from exc
+        existing_price_key = price_key_by_set_id.setdefault(price_set_id, price_key)
         if existing_price_key != price_key:
             raise ValueError("pricing projection price identity is inconsistent")
     return serving_rows, price_key_by_set_id
@@ -155,9 +150,7 @@ def _code_occurrences(
     occurrences: Counter[tuple[int, str]] = Counter()
     for serving_row in serving_rows:
         provider_set_key = int(serving_row["_ptg_provider_set_key"])
-        price_set_id = _manifest_id(
-            serving, serving_row["price_set_global_id_128"]
-        )
+        price_set_id = _manifest_id(serving, serving_row["price_set_global_id_128"])
         if price_set_id is None:
             raise ValueError("pricing projection rate identity is incomplete")
         occurrences[(provider_set_key, price_set_id)] += 1
@@ -188,9 +181,7 @@ async def _insert_code_occurrences(
                 "price_set_id": price_set_id,
                 "occurrence_count": occurrence_count,
             }
-            for (provider_set_key, price_set_id), occurrence_count in sorted(
-                occurrences.items()
-            )
+            for (provider_set_key, price_set_id), occurrence_count in sorted(occurrences.items())
         ),
     )
 
@@ -203,9 +194,7 @@ async def _has_staged_code_inputs(
     *,
     binding_code_rows: Any = _binding_code_rows,
     stage_code_provider_sets: Any = _stage_code_provider_sets,
-    preflight_price_membership_aliases: Any = (
-        _preflight_price_membership_aliases_from_db
-    ),
+    preflight_price_membership_aliases: Any = (_preflight_price_membership_aliases_from_db),
     diagnostic_stage: Callable[[str], Awaitable[str | None]] | None = None,
 ) -> bool:
     """Stage every bounded binding that contributes the requested code."""
@@ -213,17 +202,13 @@ async def _has_staged_code_inputs(
     from api import ptg2_serving as serving
 
     normalized_occurrence_count = sum(
-        serving._declared_geo_rate_count(
-            binding.code_rows_by_identity.get(code_identity) or ()
-        )
-        for binding in bindings
+        serving._declared_geo_rate_count(binding.code_rows_by_identity.get(code_identity) or ()) for binding in bindings
     )
     if normalized_occurrence_count > MAX_CODE_OCCURRENCES:
-        raise ValueError(
-            "pricing projection normalized occurrence bound exceeded"
-        )
+        raise ValueError("pricing projection normalized occurrence bound exceeded")
     await _diagnostic_checkpoint(diagnostic_stage, "reset_code_inputs")
     await session.execute(text("TRUNCATE plan_pricing_code_occurrence_stage"))
+    await session.execute(text("TRUNCATE plan_pricing_rate_occurrence_stage"))
     await session.execute(text("TRUNCATE plan_pricing_price_rate_stage"))
     has_staged_rates = False
     remaining_atom_count = MAX_CODE_STAGED_PRICE_ATOMS
@@ -276,24 +261,16 @@ async def _stage_bounded_binding_input(
         raise _PriceMembershipMetadataReadLimitError(str(exc)) from exc
     try:
         await _diagnostic_checkpoint(diagnostic_stage, "price_hydration")
-        retained_price_ids, consumed_atom_count = (
-            await _stage_binding_price_rates(
-                session,
-                binding,
-                price_key_by_set_id,
-                maximum_atom_count=remaining_atom_count,
-                block_span=block_span,
-            )
+        retained_price_ids, consumed_atom_count = await _stage_binding_price_rates(
+            session,
+            binding,
+            price_key_by_set_id,
+            maximum_atom_count=remaining_atom_count,
+            block_span=block_span,
         )
     except ManifestReadLimitError as exc:
         raise _PriceHydrationReadLimitError(str(exc)) from exc
-    occurrences = Counter(
-        {
-            key: count
-            for key, count in occurrences.items()
-            if key[1] in retained_price_ids
-        }
-    )
+    occurrences = _retained_occurrences(occurrences, retained_price_ids)
     if not occurrences:
         return False, consumed_atom_count
     await _diagnostic_checkpoint(diagnostic_stage, "provider_set_staging")
@@ -305,10 +282,21 @@ async def _stage_bounded_binding_input(
         state,
     )
     await _diagnostic_checkpoint(diagnostic_stage, "code_occurrence_staging")
-    await _insert_code_occurrences(
-        session, _binding_ordinal(binding), occurrences
+    await _insert_code_occurrences(session, _binding_ordinal(binding), occurrences)
+    await _insert_rate_occurrences(
+        session,
+        binding,
+        serving_rows,
+        set(retained_price_ids),
     )
     return True, consumed_atom_count
+
+
+def _retained_occurrences(
+    occurrences: Counter[tuple[int, str]],
+    retained_price_ids: set[str],
+) -> Counter[tuple[int, str]]:
+    return Counter({key: count for key, count in occurrences.items() if key[1] in retained_price_ids})
 
 
 async def _preflight_binding_price_memberships(
@@ -346,22 +334,19 @@ async def _bounded_binding_code_input(
     code_rows = binding.code_rows_by_identity.get(code_identity)
     if not code_rows:
         return None
-    serving_rows, price_key_by_set_id = await binding_code_rows(
-        session, binding, code_rows
-    )
+    serving_rows, price_key_by_set_id = await binding_code_rows(session, binding, code_rows)
     from api import ptg2_serving as serving
 
     occurrences = _code_occurrences(serving, serving_rows)
     selected_price_ids = {price_set_id for _, price_set_id in occurrences}
-    if any(
-        price_set_id not in price_key_by_set_id
-        for price_set_id in selected_price_ids
-    ):
+    if any(price_set_id not in price_key_by_set_id for price_set_id in selected_price_ids):
         raise ValueError("pricing projection price hydration is incomplete")
-    return binding, serving_rows, occurrences, {
-        price_set_id: price_key_by_set_id[price_set_id]
-        for price_set_id in selected_price_ids
-    }
+    return (
+        binding,
+        serving_rows,
+        occurrences,
+        {price_set_id: price_key_by_set_id[price_set_id] for price_set_id in selected_price_ids},
+    )
 
 
 def _rate_profile_fragment(
@@ -369,20 +354,14 @@ def _rate_profile_fragment(
     multiplicities: tuple[int, ...],
 ) -> bytes:
     return orjson.dumps(
-        [
-            (rate_fragment(rate), multiplicity)
-            for rate, multiplicity in zip(rates, multiplicities, strict=True)
-        ]
+        [(rate_fragment(rate), multiplicity) for rate, multiplicity in zip(rates, multiplicities, strict=True)]
     )
 
 
 def _validated_rate_profile(raw_profile: Mapping[str, Any]) -> tuple[Any, ...]:
     profile_by_field = row_mapping(raw_profile)
     rates = tuple(Decimal(rate) for rate in profile_by_field["negotiated_rates"])
-    multiplicities = tuple(
-        int(multiplicity)
-        for multiplicity in profile_by_field["rate_multiplicities"]
-    )
+    multiplicities = tuple(int(multiplicity) for multiplicity in profile_by_field["rate_multiplicities"])
     membership_count = int(profile_by_field["membership_count"])
     rate_count = int(profile_by_field["rate_count"])
     if (

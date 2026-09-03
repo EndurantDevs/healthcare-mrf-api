@@ -169,6 +169,7 @@ async def test_materializer_validates_bindings_and_yields_per_code(monkeypatch) 
     restage_code_work = AsyncMock(return_value=admitted_work)
     persist_provider = AsyncMock()
     store_rate_profiles = AsyncMock()
+    store_rate_occurrences = AsyncMock()
     aggregate_records = AsyncMock(return_value=())
     store_aggregate_packs = AsyncMock()
     store_prewarm = AsyncMock(return_value=0)
@@ -185,6 +186,9 @@ async def test_materializer_validates_bindings_and_yields_per_code(monkeypatch) 
     )
     monkeypatch.setattr(
         projection, "_store_rate_profiles", store_rate_profiles
+    )
+    monkeypatch.setattr(
+        projection, "_store_rate_occurrences", store_rate_occurrences
     )
     monkeypatch.setattr(projection, "_aggregate_records", aggregate_records)
     monkeypatch.setattr(
@@ -203,11 +207,12 @@ async def test_materializer_validates_bindings_and_yields_per_code(monkeypatch) 
     prepare_code_work.assert_awaited_once_with(
         ANY, PROJECTION_ID, ("CPT", "27447"), ANY
     )
-    persist_provider.assert_awaited_once_with(ANY, PROJECTION_ID)
+    persist_provider.assert_awaited_once_with(ANY, PROJECTION_ID, ANY)
     restage_code_work.assert_awaited_once_with(
         ANY, PROJECTION_ID, ("CPT", "27447"), 1, 1, 1
     )
     store_rate_profiles.assert_awaited_once()
+    store_rate_occurrences.assert_awaited_once()
     store_aggregate_packs.assert_awaited_once()
 
 

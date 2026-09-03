@@ -203,6 +203,9 @@ class PlanReleaseServingSelection:
             "release_status": self.release_status,
             "is_current": True,
             "binding_set_digest": self.binding_set_digest,
+            "resolved_snapshot_ids": sorted(
+                {binding.snapshot_id for binding in self.in_network_bindings}
+            ),
         }
 
 

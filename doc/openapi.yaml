@@ -4959,6 +4959,21 @@ paths:
         256 exact price atoms, 64 KiB of emitted text, and a 256 KiB serialized
         body; larger source results fail closed without truncation. Billing
         responses use `Cache-Control: private, no-store`.
+
+        A release-bound state scan is selected with
+        `plan_release_id`, `code_system`, `code`, a two-letter `state`,
+        `order_by=npi`, `order=asc`, `view=full`, and
+        `include_providers=true`, with `include_allowed_amounts=false`
+        supplied explicitly. It requires the release's exact
+        `plan_pricing_factorized_v4` projection and hydrates provider identity,
+        taxonomy, and source-assured address evidence from that immutable
+        projection. `limit` is a maximum state-NPI window; the server may emit
+        a shorter complete NPI prefix to remain within 2,048 provider-set
+        memberships, 256 rate occurrences, 256 emitted price atoms, and the
+        256-KiB response ceiling. A single indivisible NPI exceeding a sealed
+        budget is refused with 422 rather than truncated. A page may
+        legitimately return no items while advancing `pagination.next_cursor`.
+        State alone is not a geographic distance anchor.
       parameters:
         - name: page
           in: query
@@ -5191,6 +5206,9 @@ paths:
           description: |
             When true or omitted, returns best-known PTG provider addresses
             when available. Set false to suppress unverified address fields.
+            The release-bound state scan applies the same default to its frozen,
+            source-assured address witness; this does not imply that an inferred
+            provider address is bound to the priced plan or network.
             Allowed-amount fallback never returns provider address, distance,
             or contact fields; requested location filters still apply
             internally, and explicit no-address-binding metadata remains.
@@ -5219,6 +5237,8 @@ paths:
             applied to allowed evidence. Requests with negotiated rate or
             rate-tolerance predicates do not fall back because allowed amounts
             are evidence, not negotiated rates.
+            The release-bound state scan has no allowed-amount fallback and
+            requires this parameter to be supplied explicitly as false.
         - name: include_details
           in: query
           schema: { type: boolean }
@@ -5260,13 +5280,20 @@ paths:
             pattern: '^bsc1_[a-z0-9][a-z0-9-]{0,31}_[A-Za-z0-9_-]+$'
           description: |
             Confidential generation-bound keyset cursor for an exact billing
-            search. A syntactically valid sealed cursor that fails authenticated
-            cursor processing returns 400. Malformed cursor syntax fails closed
-            as the same generic 404 used for other inaccessible billing inputs.
+            search or release-bound NPI-ordered state scan. For a state scan,
+            replay all semantic query fields and use the cursor instead of a
+            nonzero offset; compatibility `offset=0` is allowed. A
+            syntactically valid sealed cursor that fails authenticated cursor
+            processing returns 400. Malformed cursor syntax in the billing
+            branch fails closed as the same generic 404 used for other
+            inaccessible billing inputs.
         - name: offset
           in: query
           schema: { type: integer, minimum: 0, default: 0 }
-          description: Zero-based provider-row offset for deterministic paging.
+          description: |
+            Zero-based provider-row offset for deterministic paging. A state
+            scan starts at zero and continues with its opaque cursor; nonzero
+            offsets are rejected for that lane.
       responses:
         '200':
           description: Paginated provider matches by procedure
@@ -5329,6 +5356,15 @@ paths:
                 error:
                   code: billing_search_cursor_generation_expired
                   message: Billing search cursor generation is no longer available.
+        '422':
+          description: A fixed state-scan page cannot retain every complete rate group.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/BillingSearchCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanPricingStateScanBudgetRefusal'
         '503':
           description: |
             Billing-search keys, serving generation, projection, or database
@@ -5349,6 +5385,11 @@ paths:
                     error:
                       code: billing_search_serving_unavailable
                       message: Billing search is temporarily unavailable.
+                pricingProjectionUnavailable:
+                  value:
+                    error:
+                      code: pricing_projection_unavailable
+                      message: The selected release is not ready for exact state-scan serving.
                 legacyOnlineWorkBudgetExceeded:
                   value:
                     error:
@@ -6755,6 +6796,16 @@ components:
           type: integer
           minimum: 0
           description: Optional proven lower bound when an exact total would require exhaustive expansion.
+        next_cursor:
+          type: string
+          nullable: true
+          maxLength: 2048
+          pattern: '^bsc1_[a-z0-9][a-z0-9-]{0,31}_[A-Za-z0-9_-]+$'
+          description: Opaque continuation for a generation-bound keyset page.
+        scanned_npi_count:
+          type: integer
+          minimum: 0
+          description: Cumulative state-NPI keys examined by an exhaustive state scan.
     PtgPricingPaginationMeta:
       allOf:
         - $ref: '#/components/schemas/PaginationMeta'
@@ -7520,7 +7571,7 @@ components:
         code:
           type: string
           enum:
-            [billing_search_cursor_invalid, resource_not_found, billing_search_cursor_generation_expired, billing_search_serving_unavailable]
+            [billing_search_cursor_invalid, resource_not_found, billing_search_cursor_generation_expired, billing_search_serving_unavailable, pricing_projection_unavailable]
         message:
           type: string
     PricingProcedureProviderBudgetErrorResponse:
@@ -7545,6 +7596,31 @@ components:
           type: string
           minLength: 1
           maxLength: 64
+    PlanPricingStateScanBudgetRefusal:
+      type: object
+      additionalProperties: false
+      required: [status, code, message, fix_it]
+      properties:
+        status:
+          type: integer
+          enum: [422]
+        code:
+          type: string
+          enum: [ptg2_online_work_budget_exceeded]
+        message:
+          type: string
+        fix_it:
+          type: object
+          additionalProperties: false
+          required: [reason, retry_options]
+          properties:
+            reason:
+              type: string
+            retry_options:
+              type: array
+              maxItems: 0
+              items:
+                type: object
     PtgNegotiatedPrice:
       type: object
       properties:
@@ -8833,7 +8909,7 @@ components:
             projection_contract:
               type: string
               nullable: true
-              enum: [plan_pricing_card_v2, plan_pricing_factorized_v3, plan_pricing_em_distance_v1]
+              enum: [plan_pricing_card_v2, plan_pricing_factorized_v3, plan_pricing_factorized_v4, plan_pricing_em_distance_v1]
             state:
               type: string
               nullable: true
