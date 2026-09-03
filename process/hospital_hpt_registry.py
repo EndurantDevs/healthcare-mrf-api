@@ -20,7 +20,7 @@ HOSPITAL_HPT_REGISTRY_PATH = (
 )
 EXPECTED_HOSPITAL_HPT_REGISTRY_COUNT = 7_356
 EXPECTED_HOSPITAL_HPT_REGISTRY_SHA256 = (
-    "1d32d8e501440bf7660bd5e010055f75df23eddf22277bb8c917897d573d27fa"
+    "4c64ca63237314900ce86fa0ea6287ee5adc999bc1017fe6b7584943afc44703"
 )
 MAX_HOSPITAL_HPT_SELECTION = 200
 _DOCUMENT_FIELDS = frozenset({"version", "hospitals"})
@@ -145,10 +145,8 @@ def _validate_hospital_aliases(hospitals: list[dict[str, str]]) -> None:
             )
 
 
-def _validated_hospital_entries(
-    entry: Any, hospital_ids: set[str]
-) -> tuple[dict[str, str], ...]:
-    """Validate one shared catalog entry and expand its stable IDs."""
+def _validated_hospital_entries(entry: Any, hospital_ids: set[str]) -> tuple[dict[str, str], ...]:
+    """Expand one catalog entry, grouping shared IDs under its first ID."""
 
     fields = set(entry) if type(entry) is dict else set()
     if (
@@ -188,13 +186,23 @@ def _validated_hospital_entries(
         hospital_by_field["alias_of"] = _validated_hospital_id(
             entry["alias_of"], "alias_of"
         )
+    validated_ids = tuple(map(_validated_hospital_id, entry_ids))
+    if len(set(validated_ids)) != len(validated_ids) or hospital_ids.intersection(
+        validated_ids
+    ):
+        raise _registry_error("duplicate_hospital_id")
+    hospital_ids.update(validated_ids)
+    implicit_canonical_id = (
+        validated_ids[0]
+        if "hospital_ids" in entry and "alias_of" not in entry
+        else None
+    )
     expanded_hospitals = []
-    for raw_hospital_id in entry_ids:
-        hospital_id = _validated_hospital_id(raw_hospital_id)
-        if hospital_id in hospital_ids:
-            raise _registry_error("duplicate_hospital_id")
-        hospital_ids.add(hospital_id)
-        expanded_hospitals.append({"hospital_id": hospital_id, **hospital_by_field})
+    for hospital_id in validated_ids:
+        expanded_hospital_by_field = {"hospital_id": hospital_id, **hospital_by_field}
+        if implicit_canonical_id is not None and hospital_id != implicit_canonical_id:
+            expanded_hospital_by_field["alias_of"] = implicit_canonical_id
+        expanded_hospitals.append(expanded_hospital_by_field)
     return tuple(expanded_hospitals)
 
 
@@ -269,6 +277,21 @@ def hospital_hpt_registry_groups() -> tuple[tuple[dict[str, str], ...], ...]:
         )
         for canonical_id in sorted(groups_by_canonical_id)
     )
+
+
+@lru_cache(maxsize=1)
+def _group_ids_by_hospital_id() -> dict[str, tuple[str, ...]]:
+    groups_by_id: dict[str, tuple[str, ...]] = {}
+    for hospitals in hospital_hpt_registry_groups():
+        group_ids = tuple(hospital["hospital_id"] for hospital in hospitals)
+        groups_by_id.update((hospital_id, group_ids) for hospital_id in group_ids)
+    return groups_by_id
+
+
+def hospital_hpt_group_ids(hospital_id: str) -> tuple[str, ...]:
+    """Return canonical-first IDs for one reviewed facility group."""
+
+    return _group_ids_by_hospital_id().get(hospital_id, ())
 
 
 def selected_hospital_hpt_registry(
