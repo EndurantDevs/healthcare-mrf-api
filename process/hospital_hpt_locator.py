@@ -86,7 +86,11 @@ def _decoded_locator(payload: bytes) -> str:
         text = payload.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise _locator_error("utf8") from exc
-    text = re.sub(r"\r+\n", "\n", text).replace("\t", " ")
+    if "\n" not in text:
+        text = text.replace("\r", "\n")
+    else:
+        text = re.sub(r"\r+\n", "\n", text)
+    text = text.replace("\t", " ")
     if "\r" in text or "\ufeff" in text:
         raise _locator_error("control_character")
     if any(
@@ -197,6 +201,8 @@ def _line_fields(
     if not separator or not key:
         raise _locator_error("line")
     field_value = raw_value.strip()
+    if key == "mrf-url" and field_value.startswith("mrf-url:"):
+        field_value = field_value.removeprefix("mrf-url:").strip()
     contact_match = (
         _MRF_URL_WITH_CONTACT_NAME.fullmatch(field_value)
         if key == "mrf-url"
@@ -213,6 +219,27 @@ def _line_fields(
     return ((key, field_value),), False
 
 
+def _is_locator_compatibility_line_consumed(
+    line: str,
+    previous_field_key: str | None,
+    fields_by_key: dict[str, str],
+) -> bool:
+    if (
+        line == ".csv"
+        and previous_field_key == "mrf-url"
+        and fields_by_key.get("mrf-url", "").endswith(".csv")
+    ):
+        return True
+    if (
+        previous_field_key == "source-page-url"
+        and fields_by_key.get("source-page-url")
+        and line.strip().startswith("/")
+    ):
+        fields_by_key["source-page-url"] += line.strip()
+        return True
+    return False
+
+
 def parse_hospital_hpt_locator(
     locator_payload: bytes,
 ) -> tuple[HospitalHptLocatorRecord, ...]:
@@ -222,11 +249,16 @@ def parse_hospital_hpt_locator(
     fields_by_key: dict[str, str] = {}
     has_records_started = False
     is_empty_mrf_continuation_allowed = False
+    previous_field_key: str | None = None
     lines = _decoded_locator(locator_payload).split("\n")
     is_preceded_by_blank = False
     for index, line in enumerate(lines):
         if not line.strip():
             is_preceded_by_blank = True
+            previous_field_key = None
+            continue
+        if _is_locator_compatibility_line_consumed(line, previous_field_key, fields_by_key):
+            previous_field_key = None
             continue
         if has_records_started and _is_inter_record_heading(
             lines, index, fields_by_key, is_preceded_by_blank
@@ -258,6 +290,10 @@ def parse_hospital_hpt_locator(
                     continue
                 raise _locator_error("duplicate_field")
             fields_by_key[key] = field_value
+        raw_key, separator, _raw_value = line.partition(":")
+        previous_field_key = (
+            _field_key(raw_key) if separator and len(line_fields) == 1 else None
+        )
     if fields_by_key:
         locator_records.append(_record(fields_by_key))
     if not locator_records:
