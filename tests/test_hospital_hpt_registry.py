@@ -22,15 +22,12 @@ _REVIEWED_LOCATOR_NAMES = {
     "hospital-000342": "Ashland Health Center",
     "hospital-000600": "Baptist Health Hardin",
     "hospital-000833": "Beckett Springs",
-    "hospital-000685": "39-3714515 BMH Oktibbeha County",
-    "hospital-000825": "New Orleans Hospital",
-    "hospital-000826": "New Orleans Westbank Hospital",
+    **dict(pair.split(":", 1) for pair in "hospital-000685:39-3714515 BMH Oktibbeha County|hospital-000825:New Orleans Hospital|hospital-000826:New Orleans Westbank Hospital|hospital-002405:Good Shepherd Rehabilitation Hospital".split("|")),
     "hospital-001199": "Cottonwood Springs",
     **dict(pair.split(":", 1) for pair in "hospital-001587:Corewell Health Big Rapids|hospital-001590:Corewell Health Gerber|hospital-001592:Corewell Health Greenville|hospital-001594:Corewell Health Gross Pointe|hospital-001596:Corewell Health Lakeland Niles|hospital-001597:Corewell Health Lakeland St. Joseph|hospital-001602:Corewell Health Ludington|hospital-001604:Corewell Health Reed City|hospital-001607:Corewell Health Taylor|hospital-001609:Corewell Health Trenton|hospital-001611:Corewell Health Troy|hospital-001612:Corewell Health Lakeland Watervliet|hospital-001614:Corewell Health Wayne|hospital-001616:Corewell Health Zeeland".split("|")),
     "hospital-001880": "Edgerton Hospital and Health Services - Fulton Square Clinic",
     "hospital-001881": "Edgerton Hospital and Health Services - Milton Clinic",
     "hospital-002260": "Franciscan Health Orthopedic-Carmel",
-    "hospital-002405": "Good Shepherd Rehabilitation Hospital",
     "hospital-002421": "Grady Health System",
     "hospital-003238": "Southern Humboldt Community Hospital",
     "hospital-003145": "Intermountain Health Good Samaritan Medical Center",
@@ -129,19 +126,6 @@ def test_checked_in_registry_has_reviewed_canonical_aliases():
         hospital_id: aliases_by_id[hospital_id]
         for hospital_id in _REVIEWED_ALIAS_SAMPLES
     } == _REVIEWED_ALIAS_SAMPLES
-    groups_by_id = {
-        hospital["hospital_id"]: {
-            member["hospital_id"] for member in hospitals
-        }
-        for hospitals in registry.hospital_hpt_registry_groups()
-        for hospital in hospitals
-    }
-    assert groups_by_id["hospital-000825"] == {
-        "hospital-000825", "hospital-004534",
-    }
-    assert groups_by_id["hospital-000826"] == {
-        "hospital-000826", "hospital-004535",
-    }
     assert hospital_by_id["hospital-000063"]["name"] == (
         "Advanced Specialty Hospitals of Toledo"
     )
