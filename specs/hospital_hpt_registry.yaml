@@ -23663,9 +23663,11 @@ hospitals:
 - hospital_id: hospital-007140
   name: White River Medical Center
   cms_hpt_url: https://whiteriverhealth.org/cms-hpt.txt
+  fallback_mrf_url: https://whiteriverhealth.slicedhealth.io/pricer/71-0411459-1710943881_WhiteRiverHealth_standardcharges.CSV
 - hospital_id: hospital-007141
-  name: WhiteRiverHealth
+  name: Stone County Medical Center
   cms_hpt_url: https://whiteriverhealth.org/cms-hpt.txt
+  fallback_mrf_url: https://whiteriverhealth.slicedhealth.io/pricer/71-0411459-1417913419_WhiteRiverHealth_standardcharges.CSV
 - hospital_id: hospital-007142
   name: Whitfield Regional Hospital
   cms_hpt_url: https://tkn.816.myftpupload.com/cms-hpt.txt

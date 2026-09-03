@@ -71,7 +71,7 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert "alias_of" not in hospital_by_id["hospital-005625"]
     assert sum("locator_name" in entry for entry in hospitals) == 1_627
     assert sum("locator_mrf_url" in entry for entry in hospitals) == 655
-    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 71
+    assert sum("fallback_mrf_url" in entry for entry in hospitals) == 73
     assert "alias_of" not in hospital_by_id["hospital-001271"]
     assert hospital_by_id["hospital-001271"]["locator_mrf_url"] == (
         "https://www.commonspirit.org/content/dam/commonspiritorg/en/bslmc/soho/"
@@ -88,7 +88,8 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
     assert [hospital_by_id[hospital_id]["cms_hpt_url"] for hospital_id in (
         "hospital-000047", "hospital-000188", "hospital-000600",
         "hospital-005162", "hospital-005163", "hospital-006475",
-        "hospital-006476", "hospital-006477",
+        "hospital-006476", "hospital-006477", "hospital-007140",
+        "hospital-007141",
     )] == [
         "https://www.achsiowa.org/cms-hpt.txt",
         "https://amberwellhealth.org/cms-hpt.txt",
@@ -98,7 +99,12 @@ def test_checked_in_registry_has_exact_source_neutral_shape():
         "https://scottishriteforchildren.org/cms-hpt.txt",
         "https://scottishriteforchildren.org/cms-hpt.txt",
         "https://scottishriteforchildren.org/cms-hpt.txt",
+        "https://whiteriverhealth.org/cms-hpt.txt",
+        "https://whiteriverhealth.org/cms-hpt.txt",
     ]
+    assert hospital_by_id["hospital-007141"]["name"] == (
+        "Stone County Medical Center"
+    )
     assert {
         hospital_id: hashlib.sha256(
             hospital_by_id[hospital_id]["fallback_mrf_url"].encode()
