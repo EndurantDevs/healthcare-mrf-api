@@ -70,7 +70,7 @@ if str(_REPOSITORY_ROOT) not in sys.path:
 from api import ptg2_capacity_evidence as capacity_evidence
 
 
-SCRIPT_VERSION = "2.13.0"
+SCRIPT_VERSION = "2.14.0"
 EXPECTED_ARCHITECTURE = "postgres_binary_v3"
 EXPECTED_STORAGE_GENERATION = "shared_blocks_v3"
 EXPECTED_DATABASE_BACKEND = "postgresql"
@@ -201,7 +201,7 @@ CODE_SYSTEM_ALIASES = {
     "SNOMEDCT": "SNOMEDCT_US",
 }
 CANONICALIZATION = {
-    "version": 7,
+    "version": 8,
     "nulls": "price-field JSON null and stripped empty scalar strings canonicalize to null",
     "strings": "trim Unicode surrounding whitespace; otherwise preserve case and content",
     "source_metadata": (
@@ -215,8 +215,9 @@ CANONICALIZATION = {
     ),
     "codes": "trim and uppercase; apply documented API aliases and catalog widths",
     "npi": (
-        "canonical integral JSON number or exact ASCII ten-digit source string in "
-        "inclusive range 1000000000..9999999999; exact string 0 is the TIN-only marker"
+        "canonical signed-64 JSON integer or unsigned ASCII integer string within the "
+        "signed-64 range; values in 1000000000..9999999999 are NPIs, exact 0 is the "
+        "TIN-only marker, and other representable values are quarantined"
     ),
     "provider_tin": (
         "a provider-group TIN object or nested TIN field marks its enclosing reference or rate; "
@@ -2080,21 +2081,23 @@ def strict_source_npi(event: str, value: Any) -> int | None:
 
 
 def strict_source_npi_value(event: str, value: Any) -> int | None:
-    """Return an integral number or the exact string NPI/TIN-only representation."""
+    """Return an integral number or its canonical unsigned string representation."""
 
     integer = strict_source_integer(event, value)
     if integer is not None:
-        return integer
+        return integer if -(2**63) <= integer <= 2**63 - 1 else None
     if event != "string" or type(value) is not str:
         return None
     if value == "0":
         return 0
     if (
-        len(value) == 10
+        value
+        and len(value) <= 19
         and value[0] in "123456789"
         and all("0" <= character <= "9" for character in value[1:])
     ):
-        return int(value)
+        integer = int(value)
+        return integer if integer <= 2**63 - 1 else None
     return None
 
 
@@ -2875,13 +2878,13 @@ class SourceIndex:
         assert state.current_ordinal is not None
         npi = strict_source_npi(event, raw_npi)
         if npi is None:
-            invalid_integer = strict_source_integer(event, raw_npi)
+            invalid_integer = strict_source_npi_value(event, raw_npi)
             if invalid_integer == 0:
                 return
             self.metrics["invalid_provider_npis"] += 1
             if invalid_integer is not None:
                 self.quarantined_provider_identifiers[invalid_integer] += 1
-            if event != "number":
+            if invalid_integer is None:
                 self.metrics["invalid_field_types"] += 1
             return
         cursor = self.connection.execute(
@@ -3129,13 +3132,13 @@ class SourceIndex:
     ) -> None:
         npi = strict_source_npi(event, value)
         if npi is None:
-            invalid_integer = strict_source_integer(event, value)
+            invalid_integer = strict_source_npi_value(event, value)
             if invalid_integer == 0:
                 return
             self.metrics["invalid_inline_npis"] += 1
             if invalid_integer is not None:
                 self.quarantined_provider_identifiers[invalid_integer] += 1
-            if event != "number":
+            if invalid_integer is None:
                 self.metrics["invalid_field_types"] += 1
             return
         cursor = self.connection.execute(
