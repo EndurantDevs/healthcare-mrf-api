@@ -31,6 +31,8 @@ HIDDEN_RUNTIME_ALIASES = {
     ("get", "/pricing/physicians/{npi}/prescriptions/{rx_code_system}/{rx_code}"),
 }
 ROUTE_QUERY_PARAM_ADDITIONS = {
+    # The taxonomy filter helper parses these outside the decorated route's AST.
+    ("get", "/nucc/all"): {"code", "q"},
     # The source-hidden request helper validates the bounded query outside the
     # decorated hospital-price route's AST.
     ("get", "/hospital-prices/facilities/{hospital_id}/prices"): {
