@@ -1234,6 +1234,7 @@ hospitals:
   name: Aspirus Wisconsin Rapids Hospital
   cms_hpt_url: https://www.aspirus.org/cms-hpt.txt
 - hospital_id: hospital-000369
+  alias_of: hospital-004907
   name: ASSUMPTION COMMUNITY HOSPITAL
   cms_hpt_url: https://fmolhs.org/cms-hpt.txt
 - hospital_id: hospital-000370
@@ -2293,6 +2294,7 @@ hospitals:
 - hospital_id: hospital-000685
   name: BAPTIST MEMORIAL HOSPITAL-OKTIBBEHA COUNTY, INC.
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
+  locator_name: 39-3714515 BMH Oktibbeha County
 - hospital_id: hospital-000686
   name: Baptist Memorial Hospital-Tipton
   cms_hpt_url: https://www.baptistonline.org/cms-hpt.txt
@@ -2640,6 +2642,7 @@ hospitals:
   name: BAYLOR SCOTT & WHITE MEDICAL CENTER - WAXAHACHIE
   cms_hpt_url: https://www.bswhealth.com/cms-hpt.txt
 - hospital_id: hospital-000791
+  alias_of: hospital-000790
   name: Baylor Scott & White Medical Center at Waxahachie
   cms_hpt_url: https://www.bswhealth.com/cms-hpt.txt
 - hospital_id: hospital-000792
@@ -2748,11 +2751,14 @@ hospitals:
 - hospital_id: hospital-000824
   name: Beacon Behavioral Hospital LLC
   cms_hpt_url: https://www.perimeterhealthcare.com/cms-hpt.txt
-- hospital_ids:
-  - hospital-000825
-  - hospital-000826
+- hospital_id: hospital-000825
   name: Beacon Behavioral Hospital New Orleans
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
+  locator_name: New Orleans Hospital
+- hospital_id: hospital-000826
+  name: Beacon Behavioral Hospital New Orleans Westbank
+  cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
+  locator_name: New Orleans Westbank Hospital
 - hospital_id: hospital-000827
   name: Beacon Behavioral Hospital Northshore-Lacombe
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
@@ -3994,6 +4000,7 @@ hospitals:
   name: Changepoint Psychiatric Hospital
   cms_hpt_url: https://www.mychangepoint.org/cms-hpt.txt
 - hospital_id: hospital-001198
+  alias_of: hospital-007129
   name: Changes - Westpark Springs
   cms_hpt_url: https://www.westparksprings.com/cms-hpt.txt
 - hospital_id: hospital-001199
@@ -4001,18 +4008,22 @@ hospitals:
   cms_hpt_url: https://cottonwoodsprings.com/cms-hpt.txt
   locator_name: Cottonwood Springs
 - hospital_id: hospital-001200
+  alias_of: hospital-001773
   name: Changes Denver Springs
   cms_hpt_url: https://denversprings.com/cms-hpt.txt
 - hospital_id: hospital-001201
   name: Changes Dublin Springs
   cms_hpt_url: https://columbussprings.com/cms-hpt.txt
 - hospital_id: hospital-001202
+  alias_of: hospital-002924
   name: Changes Highland Springs
   cms_hpt_url: https://www.highlandspringshealth.com/cms-hpt.txt
 - hospital_id: hospital-001203
+  alias_of: hospital-005479
   name: Changes Rock Springs
   cms_hpt_url: https://rockspringshealth.com/cms-hpt.txt
 - hospital_id: hospital-001204
+  alias_of: hospital-006589
   name: Changes Triangle Springs
   cms_hpt_url: https://trianglesprings.com/cms-hpt.txt
 - hospital_id: hospital-001205
@@ -4816,6 +4827,7 @@ hospitals:
   name: Cleveland Heights Medical Center
   cms_hpt_url: https://www.metrohealth.org/cms-hpt.txt
 - hospital_id: hospital-001451
+  alias_of: hospital-001452
   name: Clifton Springs Hospital & Clinic
   cms_hpt_url: https://www.rochesterregional.org/cms-hpt.txt
 - hospital_id: hospital-001452
@@ -7964,6 +7976,7 @@ hospitals:
 - hospital_id: hospital-002405
   name: Good Shepherd Rehabilitation
   cms_hpt_url: https://pennrehab.org/cms-hpt.txt
+  locator_name: Good Shepherd Rehabilitation Hospital
 - hospital_id: hospital-002406
   name: Good Shepherd Rehabilitation Hospital
   cms_hpt_url: https://www.goodshepherdrehab.org/cms-hpt.txt
@@ -15087,7 +15100,7 @@ hospitals:
   name: New Orleans Hospital
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-004535
-  alias_of: hospital-000825
+  alias_of: hospital-000826
   name: New Orleans Westbank Hospital
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-004536
@@ -16963,6 +16976,7 @@ hospitals:
   name: Phillips County Hospital
   cms_hpt_url: https://pchospital.us/cms-hpt.txt
 - hospital_id: hospital-005113
+  alias_of: hospital-005116
   name: Phoebe North Campus
   cms_hpt_url: https://phoebehealth.com/cms-hpt.txt
 - hospital_id: hospital-005114
@@ -18136,6 +18150,7 @@ hospitals:
   name: Robert Wood Johnson University Hospital Hamilton
   cms_hpt_url: https://www.rwjbh.org/cms-hpt.txt
 - hospital_id: hospital-005471
+  alias_of: hospital-005469
   name: Robert Wood Johnson University Hospital New Brunswick
   cms_hpt_url: https://www.rwjbh.org/cms-hpt.txt
 - hospital_id: hospital-005472
@@ -21197,6 +21212,7 @@ hospitals:
   name: Syracuse Area Health
   cms_hpt_url: https://www.syracuseareahealth.com/cms-hpt.txt
 - hospital_id: hospital-006390
+  alias_of: hospital-006573
   name: T J SAMSON COMMUNITY HOSPITAL
   cms_hpt_url: https://www.tjregionalhealth.org/cms-hpt.txt
 - hospital_id: hospital-006391
@@ -21508,6 +21524,7 @@ hospitals:
   name: The Brooklyn Hospital Center
   cms_hpt_url: https://www.tbh.org/cms-hpt.txt
 - hospital_id: hospital-006484
+  alias_of: hospital-001013
   name: The Bryn Mawr Hospital
   cms_hpt_url: https://www.mainlinehealth.org/cms-hpt.txt
 - hospital_id: hospital-006485
@@ -21870,12 +21887,14 @@ hospitals:
   name: Trinitas Regional Medical Center - New Point Campus
   cms_hpt_url: https://www.rwjbh.org/cms-hpt.txt
 - hospital_id: hospital-006595
+  alias_of: hospital-006613
   name: Trinity East
   cms_hpt_url: https://trinityhealth.com/cms-hpt.txt
 - hospital_id: hospital-006596
   name: Trinity Health Ann Arbor
   cms_hpt_url: https://www.trinityhealthmichigan.org/cms-hpt.txt
 - hospital_id: hospital-006597
+  alias_of: hospital-006598
   name: Trinity Health Grand Haven
   cms_hpt_url: https://www.trinityhealthmichigan.org/cms-hpt.txt
 - hospital_id: hospital-006598
@@ -21920,6 +21939,7 @@ hospitals:
   name: Trinity Hospitals
   cms_hpt_url: https://trinityhealth.org/cms-hpt.txt
 - hospital_id: hospital-006611
+  alias_of: hospital-006608
   name: Trinity Hospitals St Josephs
   cms_hpt_url: https://trinityhealth.org/cms-hpt.txt
 - hospital_id: hospital-006612
@@ -21939,6 +21959,7 @@ hospitals:
   cms_hpt_url: https://jpshealthnet.org/cms-hpt.txt
   locator_mrf_url: https://www.jpshealthnet.org/price-transparency/75-6000439_jps-health-network_standardcharges.csv
 - hospital_id: hospital-006617
+  alias_of: hospital-006614
   name: Trinity West
   cms_hpt_url: https://trinityhealth.com/cms-hpt.txt
 - hospital_id: hospital-006618
@@ -22205,6 +22226,7 @@ hospitals:
   name: UK Good Samaritan Hospital
   cms_hpt_url: https://ukhealthcare.uky.edu/cms-hpt.txt
 - hospital_id: hospital-006694
+  alias_of: hospital-006693
   name: UK HealthCare Good Samaritan Hospital
   cms_hpt_url: https://ukhealthcare.uky.edu/cms-hpt.txt
 - hospital_id: hospital-006695
@@ -22370,6 +22392,7 @@ hospitals:
   name: Unity Health - White County Medical Center
   cms_hpt_url: https://www.unity-health.org/cms-hpt.txt
 - hospital_id: hospital-006747
+  alias_of: hospital-006538
   name: Unity Hospital
   cms_hpt_url: https://www.rochesterregional.org/cms-hpt.txt
 - hospital_id: hospital-006748
@@ -22744,6 +22767,7 @@ hospitals:
   name: UPMC Childrens
   cms_hpt_url: https://www.chp.edu/cms-hpt.txt
 - hospital_id: hospital-006865
+  alias_of: hospital-006864
   name: UPMC Childrens Hospital of Pittsburgh
   cms_hpt_url: https://www.chp.edu/cms-hpt.txt
 - hospital_id: hospital-006866
@@ -22759,6 +22783,7 @@ hospitals:
   name: UPMC Green
   cms_hpt_url: https://whs.org/cms-hpt.txt
 - hospital_id: hospital-006870
+  alias_of: hospital-006869
   name: UPMC Greene
   cms_hpt_url: https://whs.org/cms-hpt.txt
 - hospital_id: hospital-006871
@@ -23190,6 +23215,7 @@ hospitals:
   name: Wagoner Community Hospital
   cms_hpt_url: https://wagonerhospital.com/cms-hpt.txt
 - hospital_id: hospital-007006
+  alias_of: hospital-007005
   name: Wagoner Hospital
   cms_hpt_url: https://wagonerhospital.com/cms-hpt.txt
 - hospital_id: hospital-007007
@@ -23752,6 +23778,7 @@ hospitals:
   name: Wilson Medical Center
   cms_hpt_url: https://wmcrc.org/cms-hpt.txt
 - hospital_id: hospital-007177
+  alias_of: hospital-006691
   name: Wilson Medical Center
   cms_hpt_url: https://www.nyuhs.org/cms-hpt.txt
 - hospital_id: hospital-007178
