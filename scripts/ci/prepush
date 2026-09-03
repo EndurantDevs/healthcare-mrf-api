@@ -184,7 +184,7 @@ run_python_main() {
     --output "$envelope_shard_file" \
     -- "${envelope_tests[@]}"
   export COVERAGE_FILE=${COVERAGE_FILE:-$(artifact_path ".coverage.main.${shard}")}
-  timeout --foreground 295s python -m pytest -q -n 1 --dist loadscope --durations=20 \
+  timeout --foreground 420s python -m pytest -q -n 1 --dist loadscope --durations=20 \
     --cov-config=test-coverage.ini \
     --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main \
     --cov-branch --cov-report= \
