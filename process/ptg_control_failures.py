@@ -18,6 +18,9 @@ _PROVIDER_GROUP_DEFINITION_ERROR_MARKERS = (
     "conflicting provider_group_id definition:",
     "duplicate provider_group_id definition:",
 )
+_REUSABLE_LAYOUT_AUDIT_ERROR_MARKER = (
+    "reused shared PTG layout audit rows disagree with its manifest"
+)
 
 
 def _exception_leaves(error: BaseException) -> tuple[BaseException, ...]:
@@ -63,6 +66,20 @@ def ptg_failure_error(error: BaseException) -> dict[str, Any]:
         return {
             "code": "ptg_provider_group_definition_conflict",
             "message": str(provider_group_error),
+        }
+    reusable_layout_audit_error = next(
+        (
+            error_leaf
+            for error_leaf in error_leaves
+            if _REUSABLE_LAYOUT_AUDIT_ERROR_MARKER in str(error_leaf)
+        ),
+        None,
+    )
+    if reusable_layout_audit_error is not None:
+        return {
+            "code": "ptg_reusable_layout_audit_corrupt",
+            "message": str(reusable_layout_audit_error),
+            "retryable": False,
         }
     frozen_failure = frozen_rate_failure_payload(error_leaves)
     if frozen_failure is not None:

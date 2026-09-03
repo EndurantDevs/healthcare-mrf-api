@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 
@@ -289,9 +289,26 @@ async def test_sealed_layout_requires_manifest():
         )
 
 
+@pytest.mark.parametrize("failure", ("missing", "partial", "digest"))
 @pytest.mark.asyncio
-async def test_sealed_sample_requires_matching_rows(monkeypatch):
-    metadata = {**_sealed_metadata(), "source_count": 1}
+async def test_v4_reused_sealed_sample_requires_matching_rows(monkeypatch, failure):
+    occurrences = (
+        audit.AuditOccurrence(b"a" * 32, 1, 2, 3, 4, 5, 6, 7, 0),
+        audit.AuditOccurrence(b"b" * 32, 8, 9, 10, 11, 12, 13, 14, 1),
+    )
+    metadata = {
+        **_sealed_metadata(),
+        "source_count": 1,
+        "sample_count": len(occurrences),
+        "sample_digest": audit._sample_digest(occurrences).hex(),
+    }
+    persisted = occurrences
+    if failure == "missing":
+        persisted = ()
+    elif failure == "partial":
+        persisted = occurrences[:1]
+    else:
+        metadata["sample_digest"] = "f" * 64
     monkeypatch.setattr(
         audit,
         "_sealed_layout_manifest",
@@ -302,7 +319,7 @@ async def test_sealed_sample_requires_matching_rows(monkeypatch):
     monkeypatch.setattr(
         audit,
         "_sealed_audit_occurrences",
-        AsyncMock(return_value=()),
+        AsyncMock(return_value=persisted),
     )
 
     with pytest.raises(RuntimeError, match="rows disagree"):
@@ -311,7 +328,14 @@ async def test_sealed_sample_requires_matching_rows(monkeypatch):
             schema_name="mrf",
             snapshot_key=1,
             logical_snapshot_id="snapshot",
+            expected_generation=audit.PTG2_V4_SHARED_GENERATION,
         )
+    audit._sealed_layout_manifest.assert_awaited_once_with(
+        ANY,
+        schema_name="mrf",
+        snapshot_key=1,
+        expected_generation=audit.PTG2_V4_SHARED_GENERATION,
+    )
 
 
 @pytest.mark.parametrize(

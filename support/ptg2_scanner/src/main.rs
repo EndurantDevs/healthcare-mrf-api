@@ -102,7 +102,7 @@ use source_witness_spool::ProviderSourceLocator;
 use std::any::Any;
 use std::cell::Cell;
 use std::cmp::{Ordering as CmpOrdering, Reverse};
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::fmt::Display;
 use std::fs::File;
@@ -422,6 +422,14 @@ impl PartialEq for ProviderEntry {
 
 impl Eq for ProviderEntry {}
 
+const PROVIDER_GROUP_CONFLICT_HASH_DOMAIN: &[u8] = b"PTG2_PROVIDER_GROUP_CONFLICT_ID_V1\0";
+const PROVIDER_GROUP_DEFINITION_HASH_DOMAIN: &[u8] =
+    b"PTG2_PROVIDER_GROUP_CONFLICT_DEFINITION_V1\0";
+const PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN: &[u8] =
+    b"PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V2\0";
+const MAX_PROVIDER_GROUP_CONFLICTS: usize = 1024;
+const MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS: usize = 4096;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ProviderRefKey {
     Signed(i64),
@@ -467,6 +475,147 @@ impl std::fmt::Display for ProviderRefKey {
             Self::Unsigned(value) => value.fmt(formatter),
             Self::Text(value) => value.fmt(formatter),
         }
+    }
+}
+
+fn domain_sha256_hex(domain: &[u8], payload: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(payload);
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn provider_ref_key_sha256(key: &ProviderRefKey) -> String {
+    domain_sha256_hex(
+        PROVIDER_GROUP_CONFLICT_HASH_DOMAIN,
+        key.to_string().as_bytes(),
+    )
+}
+
+fn provider_entry_definition_sha256(entry: &ProviderEntry) -> io::Result<String> {
+    let payload = serde_json::to_vec(&json!({
+        "entry_hash": entry.entry_hash,
+        "network_names": entry.network_names,
+        "npi": entry.npi,
+        "provider_count": entry.provider_count,
+        "provider_group_hashes": entry.provider_group_hashes,
+        "quarantined_npi": entry.quarantined_npi,
+    }))
+    .map_err(to_io_error)?;
+    Ok(domain_sha256_hex(
+        PROVIDER_GROUP_DEFINITION_HASH_DOMAIN,
+        &payload,
+    ))
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ProviderGroupDefinitionConflicts {
+    definitions_by_key: HashMap<ProviderRefKey, BTreeSet<String>>,
+    definition_count: usize,
+}
+
+impl ProviderGroupDefinitionConflicts {
+    fn contains(&self, key: &ProviderRefKey) -> bool {
+        self.definitions_by_key.contains_key(key)
+    }
+
+    fn record_digest(&mut self, key: ProviderRefKey, digest: String) -> io::Result<()> {
+        if !self.definitions_by_key.contains_key(&key)
+            && self.definitions_by_key.len() >= MAX_PROVIDER_GROUP_CONFLICTS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider group conflicts exceed 1024 identifiers",
+            ));
+        }
+        let definitions = self.definitions_by_key.entry(key).or_default();
+        if !definitions.contains(&digest)
+            && self.definition_count >= MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider group conflicts exceed 4096 definitions",
+            ));
+        }
+        if definitions.insert(digest) {
+            self.definition_count += 1;
+        }
+        Ok(())
+    }
+
+    fn record_entry(&mut self, key: ProviderRefKey, entry: &ProviderEntry) -> io::Result<()> {
+        self.record_digest(key, provider_entry_definition_sha256(entry)?)
+    }
+
+    fn merge_key(&mut self, key: ProviderRefKey, definitions: BTreeSet<String>) -> io::Result<()> {
+        for definition in definitions {
+            self.record_digest(key.clone(), definition)?;
+        }
+        Ok(())
+    }
+
+    fn keys(&self) -> HashSet<ProviderRefKey> {
+        self.definitions_by_key.keys().cloned().collect()
+    }
+
+    fn payload(&self) -> io::Result<Vec<Value>> {
+        let mut entries = self
+            .definitions_by_key
+            .iter()
+            .map(|(key, definitions)| -> io::Result<Value> {
+                if definitions.len() < 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "provider group conflict has fewer than two definitions",
+                    ));
+                }
+                Ok(json!({
+                    "provider_group_id_sha256": provider_ref_key_sha256(key),
+                    "definition_sha256": definitions,
+                }))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        entries.sort_unstable_by(|left, right| {
+            left["provider_group_id_sha256"]
+                .as_str()
+                .cmp(&right["provider_group_id_sha256"].as_str())
+                .then_with(|| {
+                    left["definition_sha256"]
+                        .to_string()
+                        .cmp(&right["definition_sha256"].to_string())
+                })
+        });
+        Ok(entries)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ProviderDefinitions {
+    provider_map: HashMap<ProviderRefKey, ProviderEntry>,
+    conflicts: ProviderGroupDefinitionConflicts,
+}
+
+impl ProviderDefinitions {
+    fn insert(&mut self, key: ProviderRefKey, entry: ProviderEntry) -> io::Result<()> {
+        if self.conflicts.contains(&key) {
+            return self.conflicts.record_entry(key, &entry);
+        }
+        if let Some(existing) = self.provider_map.get(&key) {
+            if existing == &entry {
+                return Ok(());
+            }
+            let existing = existing.clone();
+            self.provider_map.remove(&key);
+            self.conflicts.record_entry(key.clone(), &existing)?;
+            self.conflicts.record_entry(key, &entry)?;
+            return Ok(());
+        }
+        self.provider_map.insert(key, entry);
+        Ok(())
     }
 }
 
@@ -2188,12 +2337,36 @@ fn provider_ref_definition_audited(
 fn provider_identifier_quarantine_payload(
     provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
     inline_quarantine: ProviderIdentifierQuarantine,
+    provider_group_conflicts: &ProviderGroupDefinitionConflicts,
 ) -> io::Result<Value> {
     let mut quarantine = inline_quarantine;
     for entry in provider_map.values() {
         quarantine.record(&entry.quarantined_npi)?;
     }
-    quarantine.payload()
+    let v1_payload = quarantine.payload()?;
+    if provider_group_conflicts.definitions_by_key.is_empty() {
+        return Ok(v1_payload);
+    }
+    let conflicts = provider_group_conflicts.payload()?;
+    let entries = v1_payload["entries"].clone();
+    let digest_payload = json!({
+        "entries": entries,
+        "provider_group_definition_conflicts": conflicts,
+    });
+    let digest_payload = serde_json::to_vec(&digest_payload).map_err(to_io_error)?;
+    Ok(json!({
+        "contract": "ptg2_provider_identifier_quarantine_v2",
+        "occurrence_count": v1_payload["occurrence_count"],
+        "distinct_value_count": v1_payload["distinct_value_count"],
+        "entries": v1_payload["entries"],
+        "provider_group_conflict_count": provider_group_conflicts.definitions_by_key.len(),
+        "provider_group_conflicting_definition_count": provider_group_conflicts.definition_count,
+        "provider_group_definition_conflicts": provider_group_conflicts.payload()?,
+        "sha256": domain_sha256_hex(
+            PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN,
+            &digest_payload,
+        ),
+    }))
 }
 
 fn empty_npi_tin_only_normalization_payload(occurrence_count: u64) -> Value {
@@ -2234,6 +2407,7 @@ fn scanner_summary_with_v4_empty_npi_audit(
     summary
 }
 
+#[cfg(test)]
 fn insert_provider_definition(
     provider_map: &mut HashMap<ProviderRefKey, ProviderEntry>,
     key: ProviderRefKey,
@@ -8133,7 +8307,7 @@ impl CompactWorkerMetrics {
 }
 
 struct ProviderRefWorkerOutput {
-    provider_map: HashMap<ProviderRefKey, ProviderEntry>,
+    provider_definitions: ProviderDefinitions,
     events: Vec<CopyFileEvent>,
     metrics: ProviderRefWorkerMetrics,
 }
@@ -8174,7 +8348,7 @@ struct ProviderRefBatchContext<'a> {
 
 fn process_provider_ref_raw_batch_with_metrics(
     raw_refs: &RawRateChunk,
-    provider_map: &mut HashMap<ProviderRefKey, ProviderEntry>,
+    provider_definitions: &mut ProviderDefinitions,
     dictionary_copy_sinks: &mut DictionaryCopySinks,
     context: ProviderRefBatchContext<'_>,
     metrics: &mut ProviderRefWorkerMetrics,
@@ -8214,7 +8388,7 @@ fn process_provider_ref_raw_batch_with_metrics(
             lock_manifest_sidecars(sidecars)
                 .record_provider_component(entry.entry_hash, &entry.provider_group_hashes)?;
         }
-        insert_provider_definition(provider_map, key, entry)?;
+        provider_definitions.insert(key, entry)?;
         context
             .dedupe
             .record_empty_npi_tin_only_normalizations(empty_npi_tin_only_normalization_count);
@@ -8243,9 +8417,13 @@ fn process_provider_ref_raw_batch(
     let mut metrics = ProviderRefWorkerMetrics::default();
     let source_witness = SourceWitnessCollector::new(&"00".repeat(32))?;
     source_witness.configure_provider_spools(1)?;
-    process_provider_ref_raw_batch_with_metrics(
+    let mut provider_definitions = ProviderDefinitions {
+        provider_map: std::mem::take(provider_map),
+        ..ProviderDefinitions::default()
+    };
+    let result = process_provider_ref_raw_batch_with_metrics(
         raw_refs,
-        provider_map,
+        &mut provider_definitions,
         dictionary_copy_sinks,
         ProviderRefBatchContext {
             dedupe,
@@ -8254,7 +8432,9 @@ fn process_provider_ref_raw_batch(
             allow_empty_npi_tin_only,
         },
         &mut metrics,
-    )?;
+    );
+    *provider_map = provider_definitions.provider_map;
+    result?;
     Ok(metrics.provider_refs)
 }
 
@@ -8279,7 +8459,7 @@ fn provider_ref_worker_loop(
     let worker_paths = config.copy_paths.for_worker(worker_id);
     let mut dictionary_copy_sinks =
         DictionaryCopySinks::from_paths(&worker_paths, config.rotate_bytes)?;
-    let mut provider_map = HashMap::new();
+    let mut provider_definitions = ProviderDefinitions::default();
     let mut events = Vec::new();
     let mut metrics = ProviderRefWorkerMetrics {
         worker_id,
@@ -8292,7 +8472,7 @@ fn provider_ref_worker_loop(
         metrics.raw_bytes = metrics.raw_bytes.saturating_add(raw_refs.byte_len() as u64);
         process_provider_ref_raw_batch_with_metrics(
             &raw_refs,
-            &mut provider_map,
+            &mut provider_definitions,
             &mut dictionary_copy_sinks,
             ProviderRefBatchContext {
                 dedupe: &config.dedupe,
@@ -8320,7 +8500,7 @@ fn provider_ref_worker_loop(
     metrics.elapsed_micros = started_at.elapsed().as_micros();
 
     Ok(ProviderRefWorkerOutput {
-        provider_map,
+        provider_definitions,
         events,
         metrics,
     })
@@ -8845,52 +9025,53 @@ fn validate_compact_rate_object_suffix<R: Read>(reader: R) -> io::Result<()> {
 
 struct JoinedProviderRefs {
     provider_map: HashMap<ProviderRefKey, ProviderEntry>,
+    provider_group_conflicts: ProviderGroupDefinitionConflicts,
     events: Vec<CopyFileEvent>,
     worker_metrics: Vec<ProviderRefWorkerMetrics>,
     worker_join_seconds: f64,
     map_merge_seconds: f64,
 }
 
-fn merge_ordered_provider_map_pair(
-    mut left: HashMap<ProviderRefKey, ProviderEntry>,
-    right: HashMap<ProviderRefKey, ProviderEntry>,
-) -> io::Result<HashMap<ProviderRefKey, ProviderEntry>> {
-    if left.len() >= right.len() {
-        for (key, entry) in right {
-            insert_provider_definition(&mut left, key, entry)?;
+fn merge_provider_definition_pair(
+    mut left: ProviderDefinitions,
+    right: ProviderDefinitions,
+) -> io::Result<ProviderDefinitions> {
+    for (key, definitions) in right.conflicts.definitions_by_key {
+        if let Some(entry) = left.provider_map.remove(&key) {
+            left.conflicts.record_entry(key.clone(), &entry)?;
         }
-        return Ok(left);
+        left.conflicts.merge_key(key, definitions)?;
     }
-
-    let mut right = right;
-    for (key, entry) in left {
-        insert_provider_definition(&mut right, key, entry)?;
+    for (key, entry) in right.provider_map {
+        left.insert(key, entry)?;
     }
-    Ok(right)
+    Ok(left)
 }
 
-fn merge_provider_maps_pairwise(
-    mut provider_maps: Vec<(usize, HashMap<ProviderRefKey, ProviderEntry>)>,
-) -> io::Result<HashMap<ProviderRefKey, ProviderEntry>> {
-    provider_maps.sort_unstable_by_key(|(worker_id, _provider_map)| *worker_id);
-    while provider_maps.len() > 1 {
-        provider_maps = provider_maps
+fn merge_provider_definitions_pairwise(
+    mut provider_definitions: Vec<(usize, ProviderDefinitions)>,
+) -> io::Result<ProviderDefinitions> {
+    provider_definitions.sort_unstable_by_key(|(worker_id, _definitions)| *worker_id);
+    while provider_definitions.len() > 1 {
+        provider_definitions = provider_definitions
             .into_par_iter()
             .chunks(2)
             .map(|chunk| {
                 let mut maps = chunk.into_iter();
                 let left = maps.next().expect("provider map chunk is non-empty");
                 match maps.next() {
-                    Some(right) => merge_ordered_provider_map_pair(left.1, right.1)
-                        .map(|provider_map| (right.0, provider_map)),
+                    Some(right) => merge_provider_definition_pair(left.1, right.1)
+                        .map(|definitions| (right.0, definitions)),
                     None => Ok(left),
                 }
             })
             .collect::<io::Result<Vec<_>>>()?;
     }
-    Ok(provider_maps
+    Ok(provider_definitions
         .pop()
-        .map_or_else(HashMap::new, |(_worker_id, provider_map)| provider_map))
+        .map_or_else(ProviderDefinitions::default, |(_worker_id, definitions)| {
+            definitions
+        }))
 }
 
 fn join_provider_ref_workers<W: Write>(
@@ -8899,13 +9080,13 @@ fn join_provider_ref_workers<W: Write>(
 ) -> io::Result<JoinedProviderRefs> {
     let worker_join_started_at = Instant::now();
     let mut provider_worker_error: Option<io::Error> = None;
-    let mut provider_maps = Vec::with_capacity(provider_handles.len());
+    let mut provider_definitions = Vec::with_capacity(provider_handles.len());
     let mut copy_file_events = Vec::new();
     let mut worker_metrics = Vec::new();
     for (worker_id, handle) in provider_handles {
         match handle.join() {
             Ok(Ok(output)) => {
-                provider_maps.push((worker_id, output.provider_map));
+                provider_definitions.push((worker_id, output.provider_definitions));
                 copy_file_events.extend(output.events);
                 worker_metrics.push(output.metrics);
             }
@@ -8932,11 +9113,12 @@ fn join_provider_ref_workers<W: Write>(
     }
     let worker_join_seconds = worker_join_started_at.elapsed().as_secs_f64();
     let map_merge_started_at = Instant::now();
-    let provider_map = merge_provider_maps_pairwise(provider_maps)?;
+    let provider_definitions = merge_provider_definitions_pairwise(provider_definitions)?;
     let map_merge_seconds = map_merge_started_at.elapsed().as_secs_f64();
     worker_metrics.sort_unstable_by_key(|metrics| metrics.worker_id);
     Ok(JoinedProviderRefs {
-        provider_map,
+        provider_map: provider_definitions.provider_map,
+        provider_group_conflicts: provider_definitions.conflicts,
         events: copy_file_events,
         worker_metrics,
         worker_join_seconds,
@@ -9373,6 +9555,26 @@ fn process_compact_rate_lites_worker_with_grouping<W: Write>(
         group_negotiated_rate_chunks,
         None,
     )
+}
+
+fn validate_unreferenced_provider_group_conflicts(
+    rates: &[RateLite],
+    provider_group_conflicts: &HashSet<ProviderRefKey>,
+) -> io::Result<()> {
+    if provider_group_conflicts.is_empty() {
+        return Ok(());
+    }
+    if let Some(referenced_conflict) = rates.iter().find_map(|rate| {
+        rate.provider_refs
+            .iter()
+            .find(|key| provider_group_conflicts.contains(*key))
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("referenced conflicting provider_group_id definition: {referenced_conflict}"),
+        ));
+    }
+    Ok(())
 }
 
 fn process_compact_rate_lites_worker_inner<W: Write>(
@@ -11209,6 +11411,7 @@ fn finish_worker_outputs(
 struct CompactWorkerConfig {
     event_tx: Sender<CopyFileEvent>,
     provider_map: Arc<HashMap<ProviderRefKey, ProviderEntry>>,
+    provider_group_conflicts: Arc<HashSet<ProviderRefKey>>,
     dedupe: Arc<SharedDedupe>,
     manifest_sidecars: Option<Arc<Mutex<ManifestSidecarCollector>>>,
     queue_bytes: Arc<QueueByteMetrics>,
@@ -11298,6 +11501,10 @@ fn compact_worker_loop(
                 if let Some(semantic_progress) = semantic_progress.as_ref() {
                     semantic_progress.record_negotiated_rates_parsed(rates.len() as u64);
                 }
+                validate_unreferenced_provider_group_conflicts(
+                    &rates,
+                    &config.provider_group_conflicts,
+                )?;
                 let procedure_value = Value::Object(procedure);
                 let write_micros_before = compact_sink_write_micros(
                     &compact_copy_writer,
@@ -11383,6 +11590,10 @@ fn compact_worker_loop(
                     .parse_micros
                     .saturating_add(parse_started_at.elapsed().as_micros());
                 metrics.rates_parsed = metrics.rates_parsed.saturating_add(rates.len() as u64);
+                validate_unreferenced_provider_group_conflicts(
+                    &rates,
+                    &config.provider_group_conflicts,
+                )?;
                 let procedure_value = Value::Object(procedure);
                 let write_micros_before = compact_sink_write_micros(
                     &compact_copy_writer,
@@ -12526,12 +12737,16 @@ fn scan_compact_byte_top_level_parallel(
                     }
                     writer.flush()?;
 
+                    let provider_group_conflicts = joined_provider_refs.provider_group_conflicts;
+                    let conflicting_provider_refs = Arc::new(provider_group_conflicts.keys());
                     let provider_map = Arc::new(joined_provider_refs.provider_map);
                     let mut handles = Vec::with_capacity(worker_count);
                     for worker_id in 0..worker_count {
                         let worker_rx = rx.clone();
                         let worker_event_tx = event_tx.clone();
                         let worker_provider_map = Arc::clone(&provider_map);
+                        let worker_provider_group_conflicts =
+                            Arc::clone(&conflicting_provider_refs);
                         let worker_dedupe = Arc::clone(&dedupe);
                         let worker_manifest_sidecars = manifest_sidecars.as_ref().map(Arc::clone);
                         let worker_copy_paths = copy_paths.clone();
@@ -12551,6 +12766,8 @@ fn scan_compact_byte_top_level_parallel(
                                         CompactWorkerConfig {
                                             event_tx: worker_event_tx,
                                             provider_map: worker_provider_map,
+                                            provider_group_conflicts:
+                                                worker_provider_group_conflicts,
                                             dedupe: worker_dedupe,
                                             manifest_sidecars: worker_manifest_sidecars,
                                             queue_bytes: worker_queue_bytes,
@@ -13123,6 +13340,7 @@ fn scan_compact_byte_top_level_parallel(
                                 "provider_identifier_quarantine": provider_identifier_quarantine_payload(
                                     &provider_map,
                                     dedupe.provider_identifier_quarantine()?,
+                                    &provider_group_conflicts,
                                 )?,
                                 "worker_count": worker_count,
                                 "work_queue": bounded_queue_size,
@@ -28059,6 +28277,54 @@ mod tests {
         std::fs::write(path, payload).unwrap();
     }
 
+    fn write_provider_group_conflict_fixture(
+        path: &Path,
+        reversed: bool,
+        referenced_conflict: bool,
+    ) {
+        let provider_references = json!([
+            {
+                "provider_group_id": 7,
+                "provider_groups": [{
+                    "tin": {"type": "ein", "value": "111111111"},
+                    "npi": [1111111111_i64]
+                }]
+            },
+            {
+                "provider_group_id": 7,
+                "provider_groups": [{
+                    "tin": {"type": "ein", "value": "222222222"},
+                    "npi": [2222222222_i64]
+                }]
+            },
+            {
+                "provider_group_id": 8,
+                "provider_groups": [{
+                    "tin": {"type": "ein", "value": "333333333"},
+                    "npi": [3333333333_i64]
+                }]
+            }
+        ]);
+        let in_network = json!([{
+            "billing_code_type": "CPT",
+            "billing_code": "99213",
+            "negotiation_arrangement": "ffs",
+            "negotiated_rates": [{
+                "provider_references": [if referenced_conflict { 7 } else { 8 }],
+                "negotiated_prices": [{
+                    "negotiated_type": "negotiated",
+                    "negotiated_rate": 123.45
+                }]
+            }]
+        }]);
+        let payload = if reversed {
+            format!("{{\"in_network\":{in_network},\"provider_references\":{provider_references}}}")
+        } else {
+            format!("{{\"provider_references\":{provider_references},\"in_network\":{in_network}}}")
+        };
+        std::fs::write(path, payload).unwrap();
+    }
+
     fn read_worker_copy_text(base_path: &Path) -> io::Result<String> {
         let parent = base_path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "COPY path has no parent")
@@ -31384,6 +31650,7 @@ mod tests {
         let payload = provider_identifier_quarantine_payload(
             &provider_map,
             ProviderIdentifierQuarantine::default(),
+            &ProviderGroupDefinitionConflicts::default(),
         )
         .unwrap();
         assert_eq!(payload["occurrence_count"], 2);
@@ -31527,50 +31794,104 @@ mod tests {
     }
 
     #[test]
-    fn identical_provider_group_ids_are_idempotent_and_conflicts_fail_closed() {
-        let provider_ref = valid_provider_reference();
+    fn provider_group_conflicts_are_quarantined_deterministically_across_workers() {
+        let provider_ref = json!({
+            "provider_group_id": 7,
+            "provider_groups": [{
+                "tin": {"type": "ein", "value": "111111111"},
+                "npi": [1111111111_i64]
+            }]
+        });
         let (key, entry) = provider_ref_definition(&provider_ref).unwrap();
-        let mut provider_map = HashMap::new();
-        insert_provider_definition(&mut provider_map, key.clone(), entry.clone()).unwrap();
-        insert_provider_definition(&mut provider_map, key.clone(), entry.clone()).unwrap();
-        assert_eq!(provider_map.len(), 1);
-
         let mut conflicting_ref = provider_ref.clone();
+        conflicting_ref["provider_groups"][0]["tin"]["value"] = json!("222222222");
         conflicting_ref["provider_groups"][0]["npi"] = json!([2222222222_i64]);
         let conflicting_entry = build_provider_entry(&conflicting_ref).unwrap();
-        let error =
-            insert_provider_definition(&mut provider_map, key.clone(), conflicting_entry.clone())
-                .unwrap_err();
+
+        let mut forward = ProviderDefinitions::default();
+        forward.insert(key.clone(), entry.clone()).unwrap();
+        forward.insert(key.clone(), entry.clone()).unwrap();
+        forward
+            .insert(key.clone(), conflicting_entry.clone())
+            .unwrap();
+        assert!(!forward.provider_map.contains_key(&key));
+        assert!(forward.conflicts.contains(&key));
+
+        let mut reverse = ProviderDefinitions::default();
+        reverse
+            .insert(key.clone(), conflicting_entry.clone())
+            .unwrap();
+        reverse.insert(key.clone(), entry.clone()).unwrap();
+        let forward_payload = provider_identifier_quarantine_payload(
+            &forward.provider_map,
+            ProviderIdentifierQuarantine::default(),
+            &forward.conflicts,
+        )
+        .unwrap();
+        let reverse_payload = provider_identifier_quarantine_payload(
+            &reverse.provider_map,
+            ProviderIdentifierQuarantine::default(),
+            &reverse.conflicts,
+        )
+        .unwrap();
+        assert_eq!(forward_payload, reverse_payload);
+        assert_eq!(
+            forward_payload["contract"],
+            "ptg2_provider_identifier_quarantine_v2"
+        );
+        assert_eq!(forward_payload["provider_group_conflict_count"], 1);
+        assert_eq!(
+            forward_payload["provider_group_conflicting_definition_count"],
+            2
+        );
+        assert_eq!(
+            forward_payload["sha256"],
+            "ac84df86ede681fcfca903a30bb00a23ec4f13d4564f4297d5be88f5f448d264"
+        );
+
+        let mut left = ProviderDefinitions::default();
+        left.insert(key.clone(), entry.clone()).unwrap();
+        let mut right = ProviderDefinitions::default();
+        right
+            .insert(key.clone(), conflicting_entry.clone())
+            .unwrap();
+        let merged = merge_provider_definitions_pairwise(vec![(0, left), (1, right)]).unwrap();
+        assert!(!merged.provider_map.contains_key(&key));
+        assert_eq!(
+            merged.conflicts.payload().unwrap(),
+            forward.conflicts.payload().unwrap()
+        );
+
+        let mut reversed_left = ProviderDefinitions::default();
+        reversed_left
+            .insert(key.clone(), conflicting_entry)
+            .unwrap();
+        let mut reversed_right = ProviderDefinitions::default();
+        reversed_right.insert(key, entry).unwrap();
+        let reversed_merged =
+            merge_provider_definitions_pairwise(vec![(1, reversed_right), (0, reversed_left)])
+                .unwrap();
+        assert_eq!(reversed_merged.conflicts, merged.conflicts);
+    }
+
+    #[test]
+    fn referenced_provider_group_conflicts_fail_closed() {
+        let key = ProviderRefKey::from("7");
+        let rates = vec![RateLite {
+            provider_refs: vec![key.clone()],
+            provider_groups: Vec::new(),
+            provider_groups_raw: None,
+            network_names: Vec::new(),
+            prices: vec![test_price_lite("100.00")],
+            prepared_price_set: None,
+        }];
+        let conflicts = HashSet::from([key]);
+
+        let error = validate_unreferenced_provider_group_conflicts(&rates, &conflicts).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error
             .to_string()
-            .contains("conflicting provider_group_id definition: 7"));
-        assert_eq!(provider_map.len(), 1);
-        assert_eq!(provider_map.get(&key), Some(&entry));
-
-        let mut left = HashMap::new();
-        left.insert(key.clone(), entry.clone());
-        let mut right = HashMap::new();
-        right.insert(key.clone(), entry.clone());
-        let merged = merge_provider_maps_pairwise(vec![(0, left), (1, right)]).unwrap();
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged.get(&key), Some(&entry));
-
-        let mut right = HashMap::new();
-        right.insert(key.clone(), entry.clone());
-        let merged = merge_provider_maps_pairwise(vec![(0, HashMap::new()), (1, right)]).unwrap();
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged.get(&key), Some(&entry));
-
-        let mut left = HashMap::new();
-        left.insert(key.clone(), entry.clone());
-        let mut right = HashMap::new();
-        right.insert(key, conflicting_entry);
-        let error = merge_provider_maps_pairwise(vec![(0, left), (1, right)]).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error
-            .to_string()
-            .contains("conflicting provider_group_id definition: 7"));
+            .contains("referenced conflicting provider_group_id definition: 7"));
     }
 
     #[test]
@@ -32269,6 +32590,67 @@ mod tests {
         );
         assert_eq!(provider_member_rows.lines().count(), 1);
         assert!(provider_member_rows.ends_with("\t1234567890\n"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn reversed_top_level_order_quarantines_unreferenced_provider_group_conflict() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-reversed-provider-conflict-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&base);
+        let input_path = base.join("input.json");
+        let serving_run_directory = base.join("serving-runs");
+        write_provider_group_conflict_fixture(&input_path, true, false);
+        let _strict_env = strict_scan_env(&serving_run_directory);
+        let _env = [
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_WORKERS", "2"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS", "2"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS", "1"),
+            TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES", "0"),
+            TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS", "0"),
+        ];
+
+        scan_compact_struson(&input_path).unwrap();
+
+        let serving_run_bytes = std::fs::read_dir(&serving_run_directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("-partition-"))
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum::<u64>();
+        assert_eq!(serving_run_bytes, SERVING_RUN_RECORD_BYTES as u64);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn referenced_provider_group_conflict_fails_closed_end_to_end() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-referenced-provider-conflict-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&base);
+        let input_path = base.join("input.json");
+        let serving_run_directory = base.join("serving-runs");
+        write_provider_group_conflict_fixture(&input_path, false, true);
+        let _strict_env = strict_scan_env(&serving_run_directory);
+        let _env = [
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_WORKERS", "2"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS", "2"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS", "1"),
+            TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES", "0"),
+            TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS", "0"),
+        ];
+
+        let error = scan_compact_struson(&input_path).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("referenced conflicting provider_group_id definition: 7"));
         let _ = std::fs::remove_dir_all(base);
     }
 

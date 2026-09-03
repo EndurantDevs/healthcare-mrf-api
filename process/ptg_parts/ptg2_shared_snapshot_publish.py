@@ -5802,7 +5802,17 @@ async def _publish_prepared_shared_layout(
                     layout_manifest={"serving_index": provisional_serving_index},
                     progress_callback=seal_progress.add,
                 )
-                sealed_audit_metadata_map = dict(audit_publication.metadata)
+                sealed_audit_metadata_map = (
+                    await sealed_audit_sample_metadata(
+                        session,
+                        schema_name=schema_name,
+                        snapshot_key=int(sealed.snapshot_key),
+                        logical_snapshot_id=str(logical_snapshot_id),
+                        expected_generation=PTG2_V4_SHARED_GENERATION,
+                    )
+                    if sealed.reused
+                    else dict(audit_publication.metadata)
+                )
             else:
                 sealed = await seal_shared_layout(
                     session,

@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -214,6 +215,37 @@ async def test_ptg_control_classifies_provider_group_definition_failures(
             "PTG2 Rust compact scanner failed with exit code 1: "
             + scanner_message
         ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_ptg_control_classifies_corrupt_reusable_layout_audit(monkeypatch):
+    marks = []
+
+    async def fake_ptg_main(**_kwargs):
+        raise RuntimeError(
+            "reused shared PTG layout audit rows disagree with its manifest"
+        )
+
+    async def has_fake_marked_control_run(*args, **kwargs):
+        marks.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
+    monkeypatch.setattr(ptg_control, "mark_control_run", has_fake_marked_control_run)
+    monkeypatch.setattr(ptg_control, "_flush_terminal_status_events", AsyncMock())
+    monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
+
+    with pytest.raises(RuntimeError, match="audit rows disagree"):
+        await ptg_control.ptg_control_start(
+            {},
+            {"run_id": "", "params": {"source_key": "demo_source"}},
+        )
+
+    assert marks[-1][1]["error"] == {
+        "code": "ptg_reusable_layout_audit_corrupt",
+        "message": "reused shared PTG layout audit rows disagree with its manifest",
+        "retryable": False,
     }
 
 

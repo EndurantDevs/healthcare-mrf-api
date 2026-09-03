@@ -1695,7 +1695,7 @@ async def sealed_audit_sample_metadata(
         or _sample_digest(audit_occurrences).hex() != expected_digest
     ):
         raise RuntimeError(
-            "reused strict V3 layout audit rows disagree with its manifest"
+            "reused shared PTG layout audit rows disagree with its manifest"
         )
     await _validate_snapshot_source_dictionary(
         session,
