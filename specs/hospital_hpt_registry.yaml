@@ -2760,9 +2760,11 @@ hospitals:
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
   locator_name: New Orleans Westbank Hospital
 - hospital_id: hospital-000827
+  alias_of: hospital-004573
   name: Beacon Behavioral Hospital Northshore-Lacombe
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-000828
+  alias_of: hospital-003656
   name: Beacon Behavioral Hospital, Lutcher
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-000829
@@ -3425,6 +3427,7 @@ hospitals:
   name: Bunkie Hospital
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-001025
+  alias_of: hospital-001024
   name: Bunkie, Louisiana
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-001026
@@ -13805,6 +13808,7 @@ hospitals:
   name: Mesquite Specialty Hospital, LP
   cms_hpt_url: https://msh.ernesthealth.com/cms-hpt.txt
 - hospital_id: hospital-004155
+  alias_of: hospital-004156
   name: Metaire IOP
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-004156
@@ -19302,6 +19306,7 @@ hospitals:
   name: Sleepy Eye Medical Center
   cms_hpt_url: https://semedicalcenter.org/cms-hpt.txt
 - hospital_id: hospital-005819
+  alias_of: hospital-005820
   name: Slidel IOP
   cms_hpt_url: https://www.beaconbh.com/cms-hpt.txt
 - hospital_id: hospital-005820
