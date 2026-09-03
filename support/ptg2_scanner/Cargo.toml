@@ -18,7 +18,7 @@ codegen-units = 1
 [dependencies]
 crossbeam-channel = "0.5"
 csv = "1.3"
-flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+flate2 = { version = "1.1", default-features = false, features = ["runtime_detection", "zlib-rs"] }
 itoa = "1.0"
 libc = "0.2"
 memchr = "2.7"
