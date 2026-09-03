@@ -89,11 +89,16 @@ def _install_transport(monkeypatch, response):
     monkeypatch.setattr(source_download, "resolve_safe_url", resolve)
 
 
-async def _download(path, *, max_bytes=100):
+async def _download(
+    path,
+    *,
+    max_bytes=100,
+    url="https://www.avera.org/cms-hpt.txt",
+):
     return await source_download._download_raw_artifact_browser(
-        url="https://www.avera.org/cms-hpt.txt",
+        url=url,
         path=path,
-        head=PTG2HeadMetadata(url="https://www.avera.org/cms-hpt.txt"),
+        head=PTG2HeadMetadata(url=url),
         max_bytes=max_bytes,
         started_at=0,
         browser_profile="chrome136",
@@ -244,7 +249,7 @@ async def test_browser_download_is_pinned_streamed_and_exact(tmp_path, monkeypat
     assert download_result[1:4] == (15, None, 15)
     assert download_result[5:7] == (response.url, 200)
     assert session.curl_options[CurlOpt.RESOLVE] == [
-        "www.avera.org:443:8.8.8.8"
+        "www.avera.org:443:8.8.8.8,[2001:4860:4860::8888]"
     ]
     assert session.curl_options[CurlOpt.NOPROXY] == "*"
     assert session.curl_options[CurlOpt.MAXFILESIZE_LARGE] == 100
@@ -262,6 +267,24 @@ async def test_browser_download_is_pinned_streamed_and_exact(tmp_path, monkeypat
         },
     )
     assert response.exited and session.exited
+
+
+@pytest.mark.asyncio
+async def test_browser_download_accepts_equivalent_root_url_and_validated_ipv6(
+    tmp_path, monkeypatch
+):
+    response = _Response(
+        url="https://www.avera.org/",
+        primary_ip="2001:4860:4860::8888",
+    )
+    _install_transport(monkeypatch, response)
+
+    await _download(
+        tmp_path / "artifact.part",
+        url="https://www.avera.org",
+    )
+
+    assert response.exited and _Session.instances[0].exited
 
 
 @pytest.mark.parametrize(

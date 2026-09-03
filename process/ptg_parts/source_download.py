@@ -1411,9 +1411,20 @@ class _BrowserDownloadStatusError(RuntimeError):
         self.status = status
 
 
-def _curl_resolve_target(hostname: str, port: int, address: str) -> str:
-    pinned_address = f"[{address}]" if ipaddress.ip_address(address).version == 6 else address
-    return f"{hostname}:{port}:{pinned_address}"
+def _curl_resolve_target(hostname: str, port: int, addresses: tuple[str, ...]) -> str:
+    pinned_addresses = ",".join(
+        f"[{address}]" if ipaddress.ip_address(address).version == 6 else address
+        for address in addresses
+    )
+    return f"{hostname}:{port}:{pinned_addresses}"
+
+
+def _is_browser_response_url_match(request_url: str, response_url: str) -> bool:
+    requested = urlsplit(request_url)
+    returned = urlsplit(response_url)
+    return returned == requested or (
+        not requested.path and returned == requested._replace(path="/")
+    )
 
 
 def _prepare_browser_response(
@@ -1421,7 +1432,7 @@ def _prepare_browser_response(
     *,
     state: _SingleGetDownloadState,
     url: str,
-    pinned_address: str,
+    pinned_addresses: tuple[str, ...],
     port: int,
     max_bytes: int | None,
 ) -> None:
@@ -1430,9 +1441,14 @@ def _prepare_browser_response(
     state.response_status = status
     state.content_encoding = response.headers.get("Content-Encoding")
     state.content_type = response.headers.get("Content-Type")
-    if response.redirect_count or state.response_url != url:
+    if response.redirect_count or not _is_browser_response_url_match(
+        url, state.response_url
+    ):
         raise UnsafeUrlError("browser source redirects require separate validation")
-    if ipaddress.ip_address(str(response.primary_ip)) != ipaddress.ip_address(pinned_address):
+    response_address = ipaddress.ip_address(str(response.primary_ip))
+    if response_address not in {
+        ipaddress.ip_address(address) for address in pinned_addresses
+    }:
         raise UnsafeUrlError("browser source connected to an unpinned address")
     if int(response.primary_port) != port:
         raise UnsafeUrlError("browser source connected to an unpinned port")
@@ -1487,14 +1503,14 @@ async def _consume_browser_response(
     *,
     state: _SingleGetDownloadState,
     url: str,
-    pinned_address: str,
+    pinned_addresses: tuple[str, ...],
     port: int,
     max_bytes: int | None,
     started_at: float,
 ) -> None:
     try:
         _prepare_browser_response(
-            response, state=state, url=url, pinned_address=pinned_address,
+            response, state=state, url=url, pinned_addresses=pinned_addresses,
             port=port, max_bytes=max_bytes,
         )
         await _stream_browser_response(
@@ -1525,12 +1541,11 @@ async def _download_raw_artifact_browser_once(
     if urlsplit(url).scheme != "https":
         raise UnsafeUrlError("browser source transport requires HTTPS")
     hostname, port, addresses = await resolve_safe_url(url)
-    pinned_address = next(
-        (address for address in addresses if ipaddress.ip_address(address).version == 4),
-        addresses[0],
+    pinned_addresses = tuple(
+        sorted(addresses, key=lambda address: ipaddress.ip_address(address).version)
     )
     curl_option_map: dict[Any, Any] = {
-        CurlOpt.RESOLVE: [_curl_resolve_target(hostname, port, pinned_address)],
+        CurlOpt.RESOLVE: [_curl_resolve_target(hostname, port, pinned_addresses)],
         CurlOpt.NOPROXY: "*",
     }
     if max_bytes is not None:
@@ -1546,7 +1561,7 @@ async def _download_raw_artifact_browser_once(
                 timeout=(_BROWSER_CONNECT_TIMEOUT_SECONDS, _BROWSER_READ_TIMEOUT_SECONDS),
             ) as response:
                 await _consume_browser_response(
-                    response, state=state, url=url, pinned_address=pinned_address,
+                    response, state=state, url=url, pinned_addresses=pinned_addresses,
                     port=port, max_bytes=max_bytes, started_at=started_at,
                 )
         if state.total_bytes is not None and state.byte_count != state.total_bytes:
