@@ -18,10 +18,13 @@ fn parse_csv<R: Read>(
     let profile = metadata.profile;
     let schema_version = metadata.version.clone();
     metadata.validate(true)?.emit(version_id, outputs)?;
-    let mut provision_ordinal = 0;
-    for contract_provision in contract_provisions {
-        emit_contract_provision(outputs, version_id, provision_ordinal, contract_provision)?;
-        provision_ordinal += 1;
+    for (provision_ordinal, contract_provision) in contract_provisions.into_iter().enumerate() {
+        emit_contract_provision(
+            outputs,
+            version_id,
+            provision_ordinal as u64,
+            contract_provision,
+        )?;
     }
 
     if wide {
