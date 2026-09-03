@@ -19,6 +19,12 @@ from scripts.validation import ptg2_v3_source_api_audit as audit
 
 
 NPIS = (1111111111, 2222222222, 3333333333)
+MALFORMED_NPI_STRING_FIXTURE = (
+    "111111111",
+    "222222222",
+    "333333333",
+    "444444444",
+)
 DEFAULT_RAW_SHA256 = "b" * 64
 DEFAULT_SOURCE_SET = audit.source_set_evidence([DEFAULT_RAW_SHA256])
 
@@ -498,28 +504,55 @@ def test_source_index_rejects_non_singleton_zero_npi_marker(
 
 
 def test_source_index_quarantines_malformed_integer_but_keeps_valid_npi(tmp_path):
-    payload = _source_document(references_before=True, duplicate_price=False)
-    payload["provider_references"][0]["provider_groups"] = [
+    source_document = _source_document(references_before=True, duplicate_price=False)
+    source_document["provider_references"][0]["provider_groups"] = [
         {
-            "npi": [NPIS[0], 123456789],
+            "npi": [NPIS[0], 123456789, *MALFORMED_NPI_STRING_FIXTURE],
             "tin": {"type": "ein", "value": "000000001"},
         }
     ]
+    source_document["in_network"][1]["negotiated_rates"][0]["provider_groups"][0][
+        "npi"
+    ].extend(MALFORMED_NPI_STRING_FIXTURE)
     source_path = _write_source_fixture(
         tmp_path / "mixed-valid-malformed-npi.json",
         references_before=True,
         gzip_encoded=False,
-        source_document=payload,
+        source_document=source_document,
     )
 
     with _open_source_index(tmp_path, source_path) as index:
-        assert index.metrics["invalid_provider_npis"] == 1
+        assert index.metrics["invalid_provider_npis"] == 5
+        assert index.metrics["invalid_inline_npis"] == 4
+        assert index.metrics.get("invalid_field_types", 0) == 0
         assert index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0]))
+        assert index.expected_tuples(audit.QueryKey("HCPCS", "A1234", NPIS[2]))
+        assert not index.expected_tuples(audit.QueryKey("CPT", "99213", 123456789))
+        for malformed_npi in map(int, MALFORMED_NPI_STRING_FIXTURE):
+            assert not index.expected_tuples(audit.QueryKey("CPT", "99213", malformed_npi))
+            assert not index.expected_tuples(audit.QueryKey("HCPCS", "A1234", malformed_npi))
         quarantine = index.source_report()["provider_identifier_quarantine"]
-        assert quarantine["occurrence_count"] == 1
+        assert quarantine["occurrence_count"] == 9
         assert quarantine["entries"] == [
-            {"value": "123456789", "occurrence_count": 1}
+            {"value": "111111111", "occurrence_count": 2},
+            {"value": "123456789", "occurrence_count": 1},
+            {"value": "222222222", "occurrence_count": 2},
+            {"value": "333333333", "occurrence_count": 2},
+            {"value": "444444444", "occurrence_count": 2},
         ]
+
+
+@pytest.mark.parametrize(
+    ("raw_npi", "expected"),
+    [
+        (-(2**63), -(2**63)),
+        (-(2**63) - 1, None),
+        (2**63 - 1, 2**63 - 1),
+        (2**63, None),
+    ],
+)
+def test_source_npi_value_enforces_signed_int64_for_json_numbers(raw_npi, expected):
+    assert audit.strict_source_npi_value("number", raw_npi) == expected
 
 
 @pytest.mark.parametrize(
@@ -531,12 +564,11 @@ def test_source_index_quarantines_malformed_integer_but_keeps_valid_npi(tmp_path
         "+1111111111",
         "1e9",
         "1111111111.0",
-        "111111111",
-        "11111111111",
+        "9223372036854775808",
         "１１１１１１１１１１",
     ],
 )
-def test_source_npi_rejects_noncanonical_strings(raw_npi):
+def test_source_npi_rejects_unsupported_strings(raw_npi):
     assert audit.strict_source_npi("string", raw_npi) is None
 
 

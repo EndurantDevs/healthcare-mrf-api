@@ -196,13 +196,18 @@ pub fn strict_npi_integer(value: &Value, field_name: &str) -> io::Result<i64> {
     if let Value::String(text) = value {
         let bytes = text.as_bytes();
         if text == "0"
-            || (bytes.len() == 10 && bytes[0] != b'0' && bytes.iter().all(u8::is_ascii_digit))
+            || (!bytes.is_empty() && bytes[0] != b'0' && bytes.iter().all(u8::is_ascii_digit))
         {
-            return Ok(text.parse().expect("validated NPI string must fit in i64"));
+            return text.parse().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{field_name} is outside the supported integer range"),
+                )
+            });
         }
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{field_name} must be a JSON integer or an exact NPI string"),
+            format!("{field_name} must be a JSON integer or a canonical unsigned integer string"),
         ));
     }
     strict_integer(value, field_name)
@@ -235,14 +240,14 @@ fn strict_npi_partition_with_policy(
     let Some(Value::Array(items)) = value else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "provider group npi must be an array of JSON integers or exact NPI strings",
+            "provider group npi must be an array of JSON integers or canonical unsigned integer strings",
         ));
     };
     let empty_array_normalized = items.is_empty();
     if empty_array_normalized && !allow_empty_tin_only {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "provider group npi must contain at least one JSON integer or exact NPI string",
+            "provider group npi must contain at least one JSON integer or canonical unsigned integer string",
         ));
     }
     let mut valid = Vec::with_capacity(items.len());
@@ -692,6 +697,21 @@ mod tests {
             }
         );
         assert_eq!(
+            strict_npi_partition(Some(&json!([
+                "111111111",
+                "222222222",
+                "333333333",
+                "444444444",
+                1234567890
+            ])))
+            .unwrap(),
+            StrictNpiList {
+                valid: vec![1234567890],
+                quarantined: vec![111111111, 222222222, 333333333, 444444444],
+                empty_array_normalized: false,
+            }
+        );
+        assert_eq!(
             strict_npi_partition(Some(&json!([0, 1234567890, 0]))).unwrap(),
             StrictNpiList {
                 valid: vec![1234567890],
@@ -732,8 +752,7 @@ mod tests {
             "+1234567890",
             "1e9",
             "1234567890.0",
-            "123456789",
-            "12345678901",
+            "9223372036854775808",
             "１２３４５６７８９０",
         ] {
             assert!(strict_npi_list(Some(&json!([invalid_text]))).is_err());
