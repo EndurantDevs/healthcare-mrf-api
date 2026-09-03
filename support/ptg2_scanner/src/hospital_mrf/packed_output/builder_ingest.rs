@@ -171,8 +171,14 @@ impl PackedOutputBuilder {
             ));
         }
         let charge_key = charge.charge_key;
-        let gross_charge = charge.row.gross_charge.clone();
-        let discounted_cash = charge.row.discounted_cash.clone();
+        let comparison_amount = row
+            .standard_charge_dollar
+            .as_ref()
+            .or(row.estimated_amount.as_ref())
+            .or(row.median_amount.as_ref())
+            .or(charge.row.gross_charge.as_ref())
+            .or(charge.row.discounted_cash.as_ref())
+            .cloned();
         let fact_ordinal = self.next_fact_ordinal;
         self.next_fact_ordinal = or_invalid(
             self.next_fact_ordinal.checked_add(1),
@@ -184,14 +190,6 @@ impl PackedOutputBuilder {
                 plan_name: row.plan_name.clone(),
             };
         self.write_selector_ref(selector_key, fact_ordinal)?;
-        let comparison_amount = row
-            .standard_charge_dollar
-            .as_ref()
-            .or(row.estimated_amount.as_ref())
-            .or(row.median_amount.as_ref())
-            .or(gross_charge.as_ref())
-            .or(discounted_cash.as_ref())
-            .cloned();
         if self.fact_rows.is_empty() {
             self.fact_first_ordinal = fact_ordinal;
         }
