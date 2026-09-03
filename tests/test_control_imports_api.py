@@ -4296,15 +4296,12 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         runnable_by_id["uhc-provider-files"]["resources"]
         == _UHC_PROVIDER_DIRECTORY_RESOURCE_SURFACE
     )
-    assert runnable_by_id["michigan"]["resource_profile"] == "M5"
-    assert runnable_by_id["michigan"]["resources"] == [
+    michigan = runnable_by_id["michigan"]
+    assert michigan["resource_profile"] == "M5"
+    assert michigan["resources"] == michigan["supported_resources"] == [
         "Location", "Organization", "OrganizationAffiliation", "Practitioner",
         "PractitionerRole",
     ]
-    assert (
-        runnable_by_id["michigan"]["supported_resources"]
-        == runnable_by_id["michigan"]["resources"]
-    )
     assert probe_by_id["scan"]["resources"] == []
     assert (
         probe_by_id["scan"]["supported_resources"]
