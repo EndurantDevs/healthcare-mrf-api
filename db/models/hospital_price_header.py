@@ -93,7 +93,12 @@ class HospitalPriceVersion(Base, JSONOutputMixin):
             "((source_format = 'json' AND npi_count = 0 "
             "AND attester_name IS NULL) OR (source_format IN "
             "('csv-tall', 'csv-wide') AND npi_count >= 0 "
-            "AND (attester_name IS NULL OR btrim(attester_name) <> '')))))))) "
+            "AND (attester_name IS NULL OR btrim(attester_name) <> ''))))))) "
+            "OR (parser_contract_sha256 = "
+            "'d2725216821ac8aa9b9405f2a95e50e3899c524eb23b0663bdce15279498ad39' "
+            "AND source_format IN ('csv-tall', 'csv-wide') "
+            "AND template_version = '4.0.0' AND npi_count > 0 "
+            "AND attester_name IS NOT NULL)) "
             "AND location_count > 0 AND license_count > 0 "
             "AND service_count > 0 AND charge_count > 0 "
             "AND payer_charge_count >= 0",

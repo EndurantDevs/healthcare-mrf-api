@@ -25,9 +25,11 @@ impl CmsProfile {
             "1" | "1.0.0" | "2" | "2.0.0" | "2.2.0" | "2.2.1" => {
                 Ok(Self::V2)
             }
-            HOSPITAL_MRF_SCHEMA_VERSION => Ok(Self::V3),
+            // Some producers label V3-shaped CSV files as 4.0.0. The existing
+            // V3 header and row checks still reject any incompatible shape.
+            HOSPITAL_MRF_SCHEMA_VERSION | "4.0.0" => Ok(Self::V3),
             _ => Err(invalid(format!(
-                "unsupported CMS CSV version {version:?}; expected 1, 1.0.0, 2, 2.0.0, 2.2.0, 2.2.1, or 3.0.0"
+                "unsupported CMS CSV version {version:?}; expected 1, 1.0.0, 2, 2.0.0, 2.2.0, 2.2.1, 3.0.0, or producer-compatible 4.0.0"
             ))),
         }
     }

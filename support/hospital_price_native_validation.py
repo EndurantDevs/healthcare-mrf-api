@@ -93,8 +93,8 @@ HOSPITAL_MRF_COPY_COLUMNS = {
 _REQUIRED_NONEMPTY_RELATIONS = frozenset({"mrf", "location", "license"})
 _SOURCE_SCHEMA_VERSIONS = {
     "json": frozenset({"2.2.0", "2.2.1", "3.0.0"}),
-    "csv-tall": frozenset({"2", "2.0.0", "2.2.0", "2.2.1", "3.0.0"}),
-    "csv-wide": frozenset({"2", "2.0.0", "2.2.0", "2.2.1", "3.0.0"}),
+    "csv-tall": frozenset({"2", "2.0.0", "2.2.0", "2.2.1", "3.0.0", "4.0.0"}),
+    "csv-wide": frozenset({"2", "2.0.0", "2.2.0", "2.2.1", "3.0.0", "4.0.0"}),
 }
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _U64_MAX = (1 << 64) - 1
@@ -446,7 +446,7 @@ def validate_hospital_parser_summary(
         raise ValueError("hospital parser summary contract is invalid")
     output_path = _validated_output_directory(output_directory)
     artifacts = _validated_artifact_tuple(summary_fields["artifacts"], output_path)
-    if summary_fields["schema_version"] == "3.0.0" and not next(
+    if summary_fields["schema_version"] in {"3.0.0", "4.0.0"} and not next(
         artifact.rows for artifact in artifacts if artifact.kind == "npi"
     ):
         raise ValueError("hospital parser v3 NPI artifact is empty")

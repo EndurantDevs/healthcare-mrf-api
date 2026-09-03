@@ -39,6 +39,20 @@ def test_native_summary_accepts_csv_v2_versions_without_admitting_json(
         _validate_packed_summary(summary, tmp_path)
 
 
+@pytest.mark.parametrize("source_format", ("csv-tall", "csv-wide"))
+def test_native_summary_accepts_producer_declared_v4_csv_only(
+    tmp_path, source_format
+):
+    summary = _packed_summary(tmp_path)
+    summary.update(schema_version="4.0.0", format=source_format)
+
+    assert _validate_packed_summary(summary, tmp_path).schema_version == "4.0.0"
+
+    summary["format"] = "json"
+    with pytest.raises(ValueError, match="contract"):
+        _validate_packed_summary(summary, tmp_path)
+
+
 def test_native_summary_allows_legacy_without_npi_but_keeps_v3_strict(tmp_path):
     summary = _packed_summary(tmp_path)
     npi = next(artifact for artifact in summary["artifacts"] if artifact["kind"] == "npi")
@@ -52,6 +66,10 @@ def test_native_summary_allows_legacy_without_npi_but_keeps_v3_strict(tmp_path):
     with pytest.raises(ValueError, match="v3 NPI"):
         _validate_packed_summary(summary, tmp_path)
 
-    summary["schema_version"] = "2.0.0"
+    summary.update(schema_version="4.0.0", format="csv-tall")
+    with pytest.raises(ValueError, match="v3 NPI"):
+        _validate_packed_summary(summary, tmp_path)
+
+    summary.update(schema_version="2.0.0", format="json")
     with pytest.raises(ValueError, match="contract"):
         _validate_packed_summary(summary, tmp_path)
