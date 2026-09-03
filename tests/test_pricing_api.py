@@ -4892,14 +4892,9 @@ async def test_release_npi_legacy_shapes_bypass_state_scan(
 
 @pytest.mark.asyncio
 async def test_release_state_cursor_cannot_downgrade_to_legacy(monkeypatch):
-    """Reject an invalid continuation through the state-scan validator."""
+    """Reject an incomplete continuation before the legacy PTG lane."""
 
-    selection = _mixed_canonical_release_selection()
-    state_scan = AsyncMock(
-        side_effect=pricing_module.PlanPricingProjectionUnsupported(
-            "state scan requires a two-letter state"
-        )
-    )
+    state_scan = AsyncMock()
     legacy_search = AsyncMock()
     monkeypatch.setattr(
         pricing_module,
@@ -4914,27 +4909,27 @@ async def test_release_state_cursor_cannot_downgrade_to_legacy(monkeypatch):
     monkeypatch.setattr(
         pricing_module,
         "resolve_plan_release_serving",
-        AsyncMock(return_value=selection),
+        AsyncMock(return_value=None),
     )
     monkeypatch.setattr(pricing_module, "search_plan_pricing_state_scan", state_scan)
     monkeypatch.setattr(pricing_module, "search_current_ptg2_index", legacy_search)
 
-    with pytest.raises(pricing_module.InvalidUsage, match="two-letter state"):
-        await list_providers_by_procedure(
-            make_request(
-                [],
-                args={
-                    "plan_release_id": selection.plan_release_id,
-                    "code_system": "CPT",
-                    "code": "27447",
-                    "order_by": "npi",
-                    "include_allowed_amounts": "false",
-                    "cursor": "opaque",
-                },
-            )
+    response = await list_providers_by_procedure(
+        make_request(
+            [],
+            args={
+                "code_system": "CPT",
+                "code": "27447",
+                "state": "MI",
+                "order_by": "npi",
+                "include_allowed_amounts": "false",
+                "cursor": "opaque",
+            },
         )
+    )
 
-    state_scan.assert_awaited_once()
+    assert response.status == 409
+    state_scan.assert_not_awaited()
     legacy_search.assert_not_awaited()
 
 

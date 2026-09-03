@@ -75,10 +75,12 @@ class PlanPricingStateScanBudgetExceeded(RuntimeError):
 def is_plan_pricing_state_scan(args: Mapping[str, Any]) -> bool:
     """Select only the explicit additive NPI-ordered state scan lane."""
 
+    if _has_argument(args, "cursor"):
+        return True
     try:
         validate_plan_pricing_state_scan(args)
     except PlanPricingProjectionUnsupported:
-        return _has_argument(args, "cursor")
+        return False
     return bool(str(args.get("plan_release_id") or "").strip())
 
 

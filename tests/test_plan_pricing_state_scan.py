@@ -417,6 +417,9 @@ def test_state_scan_requires_closed_release_shape_and_v4():
     assert not scan.is_plan_pricing_state_scan(_args(specialty="cardiology"))
     assert scan.is_plan_pricing_state_scan(_args(specialty="cardiology", cursor="opaque"))
     assert scan.is_plan_pricing_state_scan(_args(state=None, cursor="opaque"))
+    assert scan.is_plan_pricing_state_scan(
+        _args(plan_release_id=None, cursor="opaque")
+    )
     assert scan.validate_plan_pricing_state_scan(
         _args(include_unverified_addresses="true")
     ) == ("CPT", "93320", "MI")
