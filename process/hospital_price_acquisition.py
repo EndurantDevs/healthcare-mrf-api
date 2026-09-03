@@ -394,17 +394,31 @@ async def download_source(
         else tuple(dict.fromkeys((url, *(attempt.source_url for attempt in attempts))))
     )
     for request_url in request_urls:
-        try:
-            raw = await download_raw_artifact(
-                request_url, store=store, reuse_raw_artifacts=False,
-                max_bytes=max_bytes, keep_partial_artifacts=False,
-                user_agent=_HOSPITAL_USER_AGENT,
-            )
-        except (ImportCancelledError, asyncio.CancelledError):
-            raise
-        except Exception as exc:
-            last_error = error_details(exc)
-            status = getattr(exc, "status", None)
+        raw = None
+        download_error: Exception | None = None
+        for user_agent in (_HOSPITAL_USER_AGENT, None):
+            try:
+                raw = await download_raw_artifact(
+                    request_url, store=store, reuse_raw_artifacts=False,
+                    max_bytes=max_bytes, keep_partial_artifacts=False,
+                    **({"user_agent": user_agent} if user_agent else {}),
+                )
+                break
+            except (ImportCancelledError, asyncio.CancelledError):
+                raise
+            except Exception as exc:
+                if download_error is None:
+                    download_error = exc
+                if not (
+                    user_agent is not None
+                    and getattr(exc, "status", None) == 403
+                    and getattr(exc, "_ptg2_response_body_started", None) is False
+                ):
+                    break
+        if raw is None:
+            assert download_error is not None
+            last_error = error_details(download_error)
+            status = getattr(download_error, "status", None)
             if type(status) is int and 100 <= status <= 599:
                 affected_attempts = (
                     attempts

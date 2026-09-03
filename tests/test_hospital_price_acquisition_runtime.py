@@ -209,6 +209,53 @@ async def test_source_download_updates_shared_attempts_and_reports_errors(monkey
         await acquisition.download_source(("https://a/mrf", (attempt,)), object(), 1024)
 
 
+@pytest.mark.parametrize(
+    ("status", "body_started", "fallback_status", "expected_calls"),
+    (
+        (403, False, None, 2),
+        (403, False, 500, 2),
+        (403, True, None, 1),
+        (500, False, None, 1),
+    ),
+)
+@pytest.mark.asyncio
+async def test_source_download_retries_only_prebody_403_with_default_user_agent(
+    monkeypatch, status, body_started, fallback_status, expected_calls
+):
+    acquisition = _acquisition_module()
+    source_url = "https://a/mrf?sig=exact"
+    attempt = acquisition.Attempt("attempt", "a", "Hospital A", source_url, 1)
+    raw = SimpleNamespace(head=SimpleNamespace(url=source_url, status=200))
+    requests: list[tuple[str, dict[str, Any]]] = []
+
+    async def download(url, **kwargs):
+        requests.append((url, dict(kwargs)))
+        if len(requests) == 1 or fallback_status is not None:
+            error = _ServerError(
+                status if len(requests) == 1 else fallback_status
+            )
+            setattr(error, "_ptg2_response_body_started", body_started)
+            raise error
+        return raw
+
+    monkeypatch.setattr(acquisition, "download_raw_artifact", download)
+    result = await acquisition.download_source(
+        (source_url, (attempt,)), object(), 1024
+    )
+
+    assert [url for url, _kwargs in requests] == [source_url] * expected_calls
+    assert requests[0][1]["user_agent"].startswith("Mozilla/5.0")
+    if expected_calls == 2:
+        assert "user_agent" not in requests[1][1]
+    if expected_calls == 2 and fallback_status is None:
+        assert result.raw is raw
+    else:
+        assert result.raw is None
+    if fallback_status is not None:
+        assert result.auth_refresh_required is True
+        assert attempt.source_http_status == 403
+
+
 @pytest.mark.asyncio
 async def test_source_download_marks_expired_authorization_and_exact_retry(monkeypatch):
     acquisition = _acquisition_module()

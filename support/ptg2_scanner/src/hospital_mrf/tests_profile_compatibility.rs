@@ -177,7 +177,7 @@ fn json_2_0_remains_unsupported() {
 
 #[test]
 fn cms_csv_v2_tall_and_wide_preserve_declared_version_and_estimated_amount() {
-    for version in ["2", "2.0.0", "2.2.0", "2.2.1"] {
+    for version in ["1", "1.0.0", "2", "2.0.0", "2.2.0", "2.2.1"] {
         let (tall, tall_summary) = run_fixture_with_summary(
             InputFormat::TallCsv,
             &fixture_v2_csv(InputFormat::TallCsv, version),
