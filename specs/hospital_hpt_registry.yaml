@@ -14383,6 +14383,7 @@ hospitals:
   name: Montefiore New Rochelle
   cms_hpt_url: https://montefiorenewrochelle.org/cms-hpt.txt
 - hospital_id: hospital-004316
+  alias_of: hospital-004315
   name: Montefiore New Rochelle Hospital
   cms_hpt_url: https://montefiorenewrochelle.org/cms-hpt.txt
 - hospital_id: hospital-004317
@@ -16640,6 +16641,7 @@ hospitals:
   name: Paris Regional Health
   cms_hpt_url: https://www.parisregionalhealth.com/cms-hpt.txt
 - hospital_id: hospital-004988
+  alias_of: hospital-004987
   name: PARIS REGIONAL MEDICAL CENTER
   cms_hpt_url: https://www.parisregionalhealth.com/cms-hpt.txt
 - hospital_id: hospital-004989
@@ -23053,6 +23055,7 @@ hospitals:
   name: Valley Health Specialty Hospital
   cms_hpt_url: https://www.springvalleyhospital.com/cms-hpt.txt
   locator_mrf_url: https://uhsfilecdn.eskycity.net/ac/721549752_spring-valley-hospital-medical-center_standardcharges.csv
+  fallback_mrf_url: https://uhsfilecdn.eskycity.net/ac/721549752_spring-valley-hospital-medical-center_standardcharges.csv
 - hospital_id: hospital-006937
   name: Valley Health System
   cms_hpt_url: https://www.valleyhealth.com/cms-hpt.txt
