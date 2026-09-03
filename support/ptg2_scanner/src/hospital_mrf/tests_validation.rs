@@ -512,6 +512,7 @@
             false,
         );
         assert!(rows["payer_charge"].is_empty());
+        let blank_records = records.clone();
 
         let negotiated_dollar = csv_fixture_index(
             &records[2],
@@ -521,6 +522,27 @@
         assert_import_error(
             InputFormat::WideCsv,
             &csv_fixture_bytes(&records),
+            DEFAULT_MAX_FANOUT_ROWS,
+            "wide CSV payer headers must replace payer and plan placeholders",
+        );
+
+        let mut modifier_records = blank_records;
+        let mut modifier = vec![String::new(); modifier_records[2].len()];
+        for (header, value) in [
+            ("description", "Modifier percentage"),
+            ("modifiers", "TC"),
+            ("setting", "outpatient"),
+            (
+                "standard_charge|[PAYER_NAME]|[PLAN_NAME]|negotiated_percentage",
+                "50",
+            ),
+        ] {
+            modifier[csv_fixture_index(&modifier_records[2], header)] = value.to_owned();
+        }
+        modifier_records.push(modifier);
+        assert_import_error(
+            InputFormat::WideCsv,
+            &csv_fixture_bytes(&modifier_records),
             DEFAULT_MAX_FANOUT_ROWS,
             "wide CSV payer headers must replace payer and plan placeholders",
         );
