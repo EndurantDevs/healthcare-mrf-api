@@ -78,6 +78,11 @@ struct WidePayerBuilder {
     additional_payer_notes: Option<usize>,
 }
 
+fn is_wide_payer_placeholder(value: &str) -> bool {
+    value.eq_ignore_ascii_case("[payer_name]")
+        || value.eq_ignore_ascii_case("[plan_name]")
+}
+
 fn reject_used_wide_payer_placeholder(
     record: &StringRecord,
     payer: &WidePayerColumns,

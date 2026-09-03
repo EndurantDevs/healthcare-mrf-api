@@ -192,11 +192,6 @@ fn required_wide_column(
     }
 }
 
-fn is_wide_payer_placeholder(value: &str) -> bool {
-    value.eq_ignore_ascii_case("[payer_name]")
-        || value.eq_ignore_ascii_case("[plan_name]")
-}
-
 fn canonical_wide_rate_term(value: &str) -> io::Result<String> {
     let value = required_text(value, "negotiated_rate_term")?;
     if value.eq_ignore_ascii_case("[negotiated_rate_term]") {
