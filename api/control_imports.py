@@ -2152,6 +2152,9 @@ async def _reconcile_terminal_queue_member(
         raise StaleWorkerReconciliationConflict(
             "ARQ job state is present; refusing queue residue reconciliation"
         )
+    # A worker that selected the member before this ZREM still cannot invoke the
+    # importer: ARQ reads the watched job payload after claiming, and the exact
+    # job key is one of the proven-absent keys above.
     pipe.multi()
     if not has_queue_member:
         pipe.ping()

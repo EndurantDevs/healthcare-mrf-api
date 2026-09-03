@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
+from arq.worker import Worker
 from sanic.exceptions import SanicException, Unauthorized
 
 from api import control_imports, control_route_registration
@@ -129,6 +130,48 @@ async def test_reconcile_terminal_queue_residue_removes_only_exact_member(monkey
     ]
     assert not any(mock_call[0] == "delete" for mock_call in pipeline.mock_calls)
     redis_pool.aclose.assert_awaited_once_with(close_connection_pool=True)
+
+
+@pytest.mark.asyncio
+async def test_preselected_arq_worker_cannot_invoke_importer_after_removal(monkeypatch):
+    """Model a worker retaining the job ID and score before the exact ZREM."""
+    _connection, _redis_pool, cleanup_pipeline = _install_dependencies(
+        monkeypatch,
+        _run(),
+    )
+
+    receipt = await control_imports.reconcile_terminal_queue_residue(RUN_ID, BODY)
+
+    assert receipt["removed"] is True
+    cleanup_pipeline.zrem.assert_called_once_with(QUEUE, JOB_ID)
+
+    importer = AsyncMock()
+    worker_pipeline = Mock()
+    worker_pipeline.__aenter__ = AsyncMock(return_value=worker_pipeline)
+    worker_pipeline.__aexit__ = AsyncMock(return_value=None)
+    worker_pipeline.get = Mock()
+    worker_pipeline.incr = Mock()
+    worker_pipeline.expire = Mock()
+    worker_pipeline.execute = AsyncMock(return_value=[None, 1, True])
+    worker_pool = Mock()
+    worker_pool.pipeline.return_value = worker_pipeline
+    worker = types.SimpleNamespace(
+        pool=worker_pool,
+        allow_abort_jobs=False,
+        functions={IMPORTER: types.SimpleNamespace(coroutine=importer)},
+        keep_result_forever=False,
+        keep_result_s=0,
+        jobs_failed=0,
+        job_serializer=None,
+        queue_name=QUEUE,
+        finish_failed_job=AsyncMock(),
+    )
+
+    await Worker.run_job(worker, JOB_ID, 1)
+
+    importer.assert_not_awaited()
+    worker.finish_failed_job.assert_awaited_once()
+    assert worker.jobs_failed == 1
 
 
 @pytest.mark.asyncio
