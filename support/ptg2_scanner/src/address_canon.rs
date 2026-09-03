@@ -1,6 +1,6 @@
 //! Address-canonical materialization helpers.
 
-use crate::copy_format::{pg_text_copy_field, write_copy_fields};
+use crate::copy_format::write_copy_text_fields;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -912,8 +912,8 @@ fn replace_po_box(raw: &str) -> String {
     out.join(" ")
 }
 
-fn street_tokens(line1: Option<&str>, line2: Option<&str>) -> Vec<String> {
-    let raw = replace_po_box(&unit_decision(line1, line2).street_text);
+fn street_tokens_from_text(street_text: &str) -> Vec<String> {
+    let raw = replace_po_box(street_text);
     let mut tokens = Vec::new();
     let mut token = String::new();
     for ch in raw.chars().flat_map(|ch| ch.to_lowercase()) {
@@ -928,6 +928,10 @@ fn street_tokens(line1: Option<&str>, line2: Option<&str>) -> Vec<String> {
         tokens.push(token);
     }
     tokens
+}
+
+fn street_tokens(line1: Option<&str>, line2: Option<&str>) -> Vec<String> {
+    street_tokens_from_text(&unit_decision(line1, line2).street_text)
 }
 
 fn normalized_tokens(tokens: &[String]) -> Vec<String> {
@@ -966,8 +970,8 @@ fn edge_direction_index(tokens: &[String]) -> Option<usize> {
         .map(|_| tokens.len() - 1)
 }
 
-fn street_norm(line1: Option<&str>, line2: Option<&str>) -> Option<String> {
-    let tokens = street_tokens(line1, line2);
+fn street_norm_from_text(street_text: &str) -> Option<String> {
+    let tokens = street_tokens_from_text(street_text);
     let mut out = String::new();
     for token in normalized_tokens(&tokens) {
         out.push_str(&token);
@@ -977,6 +981,11 @@ fn street_norm(line1: Option<&str>, line2: Option<&str>) -> Option<String> {
     } else {
         Some(out)
     }
+}
+
+#[cfg(test)]
+fn street_norm(line1: Option<&str>, line2: Option<&str>) -> Option<String> {
+    street_norm_from_text(&unit_decision(line1, line2).street_text)
 }
 
 fn nonempty(value: String) -> Option<String> {
@@ -1069,15 +1078,13 @@ fn key_from_identity(identity: Option<&str>) -> Option<String> {
 }
 
 fn identity_key_v1(
-    first_line: Option<&str>,
-    second_line: Option<&str>,
+    street: Option<&str>,
+    unit: &str,
     city: Option<&str>,
     state: Option<&str>,
     zip: Option<&str>,
     country: Option<&str>,
 ) -> Option<String> {
-    let street = street_norm(first_line, second_line);
-    let unit = unit_norm(first_line, second_line);
     let city_value = city_norm(city);
     let state_value = state_code(state)?;
     let zip_value = zip5_norm(zip)?;
@@ -1112,14 +1119,12 @@ fn identity_key_v1(
 }
 
 fn premise_identity_key_v1(
-    first_line: Option<&str>,
-    second_line: Option<&str>,
-    _city: Option<&str>,
+    street: Option<&str>,
     state: Option<&str>,
     zip: Option<&str>,
     country: Option<&str>,
 ) -> Option<String> {
-    let street = street_norm(first_line, second_line)?;
+    let street = street?;
     let state_value = state_code(state)?;
     let zip_value = zip5_norm(zip)?;
     let country_value = country_code(country);
@@ -1167,16 +1172,17 @@ pub fn canonicalize_address(
     zip: Option<&str>,
     country: Option<&str>,
 ) -> CanonicalAddress {
-    let identity_key = identity_key_v1(first_line, second_line, city, state, zip, country);
-    let premise_identity_key =
-        premise_identity_key_v1(first_line, second_line, city, state, zip, country);
+    let unit = unit_decision(first_line, second_line);
+    let street = street_norm_from_text(&unit.street_text);
+    let identity_key = identity_key_v1(street.as_deref(), &unit.unit, city, state, zip, country);
+    let premise_identity_key = premise_identity_key_v1(street.as_deref(), state, zip, country);
     CanonicalAddress {
         address_key: key_from_identity(identity_key.as_deref()),
         identity_key,
         premise_key: key_from_identity(premise_identity_key.as_deref()),
         premise_identity_key,
-        line1_norm: street_norm(first_line, second_line),
-        unit_norm: unit_norm(first_line, second_line),
+        line1_norm: street,
+        unit_norm: unit.unit,
         city_norm: city_norm(city),
         state_code: state_code(state).map(|value| value.chars().take(32).collect()),
         zip5: zip5_norm(zip),
@@ -1211,11 +1217,7 @@ pub(crate) fn decode_copy_field(value: &str) -> Option<String> {
     Some(out)
 }
 
-fn copy_field_ref(value: &Option<String>) -> Option<&str> {
-    value.as_deref()
-}
-
-fn canonicalize_copy_line(line: &str) -> io::Result<Vec<String>> {
+fn canonicalize_copy_line<W: Write>(writer: &mut W, line: &str) -> io::Result<()> {
     let fields: Vec<Option<String>> = line
         .trim_end_matches(['\r', '\n'])
         .split('\t')
@@ -1230,47 +1232,39 @@ fn canonicalize_copy_line(line: &str) -> io::Result<Vec<String>> {
             ),
         ));
     }
-    let rn = fields[0].clone();
-    let source_ctid = fields[1].clone();
-    let staged_address_key = fields[2].clone();
-    let first_line = fields[3].clone();
-    let second_line = fields[4].clone();
-    let city_name = fields[5].clone();
-    let state_name = fields[6].clone();
-    let postal_code = fields[7].clone();
-    let country = fields[8].clone();
     let canonical = canonicalize_address(
-        copy_field_ref(&first_line),
-        copy_field_ref(&second_line),
-        copy_field_ref(&city_name),
-        copy_field_ref(&state_name),
-        copy_field_ref(&postal_code),
-        copy_field_ref(&country),
+        fields[3].as_deref(),
+        fields[4].as_deref(),
+        fields[5].as_deref(),
+        fields[6].as_deref(),
+        fields[7].as_deref(),
+        fields[8].as_deref(),
     );
-    let address_key = staged_address_key
-        .clone()
-        .or_else(|| canonical.address_key.clone());
-    Ok(vec![
-        pg_text_copy_field(copy_field_ref(&rn)),
-        pg_text_copy_field(copy_field_ref(&source_ctid)),
-        pg_text_copy_field(copy_field_ref(&staged_address_key)),
-        pg_text_copy_field(address_key.as_deref()),
-        pg_text_copy_field(canonical.address_key.as_deref()),
-        pg_text_copy_field(canonical.identity_key.as_deref()),
-        pg_text_copy_field(canonical.premise_key.as_deref()),
-        pg_text_copy_field(canonical.line1_norm.as_deref()),
-        pg_text_copy_field(Some(&canonical.unit_norm)),
-        pg_text_copy_field(canonical.city_norm.as_deref()),
-        pg_text_copy_field(canonical.state_code.as_deref()),
-        pg_text_copy_field(canonical.zip5.as_deref()),
-        pg_text_copy_field(canonical.zip4.as_deref()),
-        pg_text_copy_field(Some(&canonical.country_code)),
-        pg_text_copy_field(copy_field_ref(&first_line)),
-        pg_text_copy_field(copy_field_ref(&second_line)),
-        pg_text_copy_field(copy_field_ref(&city_name)),
-        pg_text_copy_field(copy_field_ref(&state_name)),
-        pg_text_copy_field(copy_field_ref(&postal_code)),
-    ])
+    let address_key = fields[2].as_deref().or(canonical.address_key.as_deref());
+    write_copy_text_fields(
+        writer,
+        &[
+            fields[0].as_deref(),
+            fields[1].as_deref(),
+            fields[2].as_deref(),
+            address_key,
+            canonical.address_key.as_deref(),
+            canonical.identity_key.as_deref(),
+            canonical.premise_key.as_deref(),
+            canonical.line1_norm.as_deref(),
+            Some(&canonical.unit_norm),
+            canonical.city_norm.as_deref(),
+            canonical.state_code.as_deref(),
+            canonical.zip5.as_deref(),
+            canonical.zip4.as_deref(),
+            Some(&canonical.country_code),
+            fields[3].as_deref(),
+            fields[4].as_deref(),
+            fields[5].as_deref(),
+            fields[6].as_deref(),
+            fields[7].as_deref(),
+        ],
+    )
 }
 
 pub fn canonicalize_copy_file(input_path: &Path, output_path: &Path) -> io::Result<()> {
@@ -1279,8 +1273,7 @@ pub fn canonicalize_copy_file(input_path: &Path, output_path: &Path) -> io::Resu
     let mut writer = BufWriter::new(output);
     for line in input.lines() {
         let line = line?;
-        let fields = canonicalize_copy_line(&line)?;
-        write_copy_fields(&mut writer, &fields)?;
+        canonicalize_copy_line(&mut writer, &line)?;
     }
     writer.flush()
 }
@@ -1347,7 +1340,10 @@ mod tests {
     fn canonicalizes_postgres_copy_line() {
         let line =
             "1\t(0,1)\t\\N\t27 Dr Mellichamp Dr\u{00a0}Ste 100\t\\N\tBLUFFTON\tSC\t29910\tUS";
-        let fields = canonicalize_copy_line(line).unwrap();
+        let mut output = Vec::new();
+        canonicalize_copy_line(&mut output, line).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let fields: Vec<&str> = output.trim_end().split('\t').collect();
         assert_eq!(fields[0], "1");
         assert_eq!(fields[1], "(0,1)");
         assert_eq!(fields[3], "3e3ea29f-8c26-17ba-dcc8-74424e66fd32");
